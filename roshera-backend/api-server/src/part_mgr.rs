@@ -618,8 +618,7 @@ mod tests {
 
     #[test]
     fn rename_part_request_parses_name() {
-        let req: RenamePartRequest =
-            serde_json::from_str(r#"{"name":"Updated"}"#).expect("parse");
+        let req: RenamePartRequest = serde_json::from_str(r#"{"name":"Updated"}"#).expect("parse");
         assert_eq!(req.name, "Updated");
     }
 
@@ -689,8 +688,8 @@ mod tests {
         let mgr = PartManager::new();
         let id = mgr.create("Routed").await;
         let header = id.to_string();
-        let resolved = resolve_active_model(&legacy, &mgr, Some(&header))
-            .expect("known id must resolve");
+        let resolved =
+            resolve_active_model(&legacy, &mgr, Some(&header)).expect("known id must resolve");
         let expected = mgr.get(&id).expect("part missing after create");
         assert!(Arc::ptr_eq(&expected, &resolved));
         // And it must NOT be the legacy model.
@@ -730,8 +729,8 @@ mod tests {
         let id = mgr.create("Doomed").await;
         let header = id.to_string();
         mgr.delete(&id);
-        let err = resolve_active_model(&legacy, &mgr, Some(&header))
-            .expect_err("deleted id must reject");
+        let err =
+            resolve_active_model(&legacy, &mgr, Some(&header)).expect_err("deleted id must reject");
         assert_eq!(err.code, ErrorCode::PartNotFound);
     }
 
@@ -743,10 +742,10 @@ mod tests {
         let mgr = PartManager::new();
         let a = mgr.create("A").await;
         let b = mgr.create("B").await;
-        let resolved_a = resolve_active_model(&legacy, &mgr, Some(&a.to_string()))
-            .expect("id a must resolve");
-        let resolved_b = resolve_active_model(&legacy, &mgr, Some(&b.to_string()))
-            .expect("id b must resolve");
+        let resolved_a =
+            resolve_active_model(&legacy, &mgr, Some(&a.to_string())).expect("id a must resolve");
+        let resolved_b =
+            resolve_active_model(&legacy, &mgr, Some(&b.to_string())).expect("id b must resolve");
         assert!(Arc::ptr_eq(&mgr.get(&a).expect("a"), &resolved_a));
         assert!(Arc::ptr_eq(&mgr.get(&b).expect("b"), &resolved_b));
         assert!(!Arc::ptr_eq(&resolved_a, &resolved_b));

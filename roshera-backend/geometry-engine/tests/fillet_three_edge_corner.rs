@@ -68,9 +68,7 @@
 #[path = "blend_fixtures/mod.rs"]
 mod blend_fixtures;
 
-use blend_fixtures::{
-    edges_at_vertex, faces_referencing_edge, make_cube, shell_census, vertex_at,
-};
+use blend_fixtures::{edges_at_vertex, faces_referencing_edge, make_cube, shell_census, vertex_at};
 
 use geometry_engine::operations::fillet::{FilletType, PropagationMode};
 use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions};

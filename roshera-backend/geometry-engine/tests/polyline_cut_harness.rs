@@ -247,7 +247,10 @@ fn build_box_solid(model: &mut BRepModel, dx: f64, dy: f64, dz: f64) -> SolidId 
 
 /// Translate a planar polygon (z=0) in the XY plane.
 fn translate_xy(verts: &[Point3], dx: f64, dy: f64) -> Vec<Point3> {
-    verts.iter().map(|p| z_at(p.x + dx, p.y + dy, p.z)).collect()
+    verts
+        .iter()
+        .map(|p| z_at(p.x + dx, p.y + dy, p.z))
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -267,11 +270,13 @@ fn dump_non_manifold_edges(mesh: &TriangleMesh, ctx: &str) {
             *counts.entry(key).or_insert(0) += 1;
         }
     }
-    eprintln!("{} dump_non_manifold_edges: {} verts {} tris", ctx, mesh.vertices.len(), mesh.triangles.len());
-    let mut bad: Vec<_> = counts
-        .iter()
-        .filter(|&(_, &c)| c != 2)
-        .collect();
+    eprintln!(
+        "{} dump_non_manifold_edges: {} verts {} tris",
+        ctx,
+        mesh.vertices.len(),
+        mesh.triangles.len()
+    );
+    let mut bad: Vec<_> = counts.iter().filter(|&(_, &c)| c != 2).collect();
     bad.sort_by_key(|(k, _)| **k);
     let has_face_map = mesh.face_map.len() == mesh.triangles.len();
     for (key_ref, count_ref) in &bad {
@@ -290,11 +295,17 @@ fn dump_non_manifold_edges(mesh: &TriangleMesh, ctx: &str) {
                 let x = tri[k];
                 let y = tri[(k + 1) % 3];
                 let tkey = if x < y { (x, y) } else { (y, x) };
-                if tkey == (a, b) { hit = true; break; }
+                if tkey == (a, b) {
+                    hit = true;
+                    break;
+                }
             }
             if hit {
                 let fid = if has_face_map { mesh.face_map[ti] } else { 0 };
-                eprintln!("    tri[{}] = [{}, {}, {}] face={}", ti, tri[0], tri[1], tri[2], fid);
+                eprintln!(
+                    "    tri[{}] = [{}, {}, {}] face={}",
+                    ti, tri[0], tri[1], tri[2], fid
+                );
             }
         }
     }
@@ -308,13 +319,19 @@ fn dump_face_topology(model: &BRepModel, solid_id: SolidId, ctx: &str) {
     eprintln!("{} dump_face_topology:", ctx);
     let solid = match model.solids.get(solid_id) {
         Some(s) => s,
-        None => { eprintln!("  <no such solid {:?}>", solid_id); return; }
+        None => {
+            eprintln!("  <no such solid {:?}>", solid_id);
+            return;
+        }
     };
     let shell_id = solid.outer_shell;
     drop(solid);
     let shell = match model.shells.get(shell_id) {
         Some(s) => s,
-        None => { eprintln!("  <no shell {:?}>", shell_id); return; }
+        None => {
+            eprintln!("  <no shell {:?}>", shell_id);
+            return;
+        }
     };
     let face_ids: Vec<FaceId> = shell.faces.clone();
     drop(shell);
@@ -330,7 +347,10 @@ fn dump_face_topology(model: &BRepModel, solid_id: SolidId, ctx: &str) {
         let dump_loop = |label: &str, lid| {
             let lp = match model.loops.get(lid) {
                 Some(l) => l,
-                None => { eprintln!("    {} <missing loop {:?}>", label, lid); return; }
+                None => {
+                    eprintln!("    {} <missing loop {:?}>", label, lid);
+                    return;
+                }
             };
             let edges = lp.edges.clone();
             let orients = lp.orientations.clone();
@@ -339,13 +359,24 @@ fn dump_face_topology(model: &BRepModel, solid_id: SolidId, ctx: &str) {
             for (i, eid) in edges.iter().enumerate() {
                 let edge = match model.edges.get(*eid) {
                     Some(e) => e,
-                    None => { eprintln!("      [{}] edge={:?} <missing>", i, eid); continue; }
+                    None => {
+                        eprintln!("      [{}] edge={:?} <missing>", i, eid);
+                        continue;
+                    }
                 };
                 let s_vid = edge.start_vertex;
                 let e_vid = edge.end_vertex;
                 drop(edge);
-                let sp = model.vertices.get(s_vid).map(|v| v.position).unwrap_or([0.0; 3].into());
-                let ep = model.vertices.get(e_vid).map(|v| v.position).unwrap_or([0.0; 3].into());
+                let sp = model
+                    .vertices
+                    .get(s_vid)
+                    .map(|v| v.position)
+                    .unwrap_or([0.0; 3].into());
+                let ep = model
+                    .vertices
+                    .get(e_vid)
+                    .map(|v| v.position)
+                    .unwrap_or([0.0; 3].into());
                 let fwd = orients.get(i).copied().unwrap_or(true);
                 eprintln!(
                     "      [{}] edge={:?} fwd={} ({:.4},{:.4},{:.4})->({:.4},{:.4},{:.4})",
@@ -388,7 +419,11 @@ fn assert_mesh_finite(mesh: &TriangleMesh, ctx: &str) {
         assert!(
             v.position.x.is_finite() && v.position.y.is_finite() && v.position.z.is_finite(),
             "{}: mesh vertex {} non-finite: ({}, {}, {})",
-            ctx, i, v.position.x, v.position.y, v.position.z,
+            ctx,
+            i,
+            v.position.x,
+            v.position.y,
+            v.position.z,
         );
     }
 }
@@ -429,10 +464,7 @@ fn outer_shell_face_count(model: &BRepModel, solid_id: SolidId) -> usize {
 /// helper translates it to (3, 3) so it sits inside the box footprint
 /// with ≥1-unit margin from each side. Cutter is extruded 3 units in
 /// +Z so the Difference produces a clean through-cut from z=0 to z=1.
-fn polyline_cut_box(
-    model: &mut BRepModel,
-    cutter_centred_verts: Vec<Point3>,
-) -> SolidId {
+fn polyline_cut_box(model: &mut BRepModel, cutter_centred_verts: Vec<Point3>) -> SolidId {
     let target = build_box_solid(model, 6.0, 6.0, 1.0);
     let cutter_verts = translate_xy(&cutter_centred_verts, 3.0, 3.0);
     let cutter_edges = build_polyline_loop_edges(model, &cutter_verts);
@@ -450,10 +482,7 @@ fn polyline_cut_box(
 
 /// Same as `polyline_cut_box` but with per-edge `Line` cutter edges
 /// (the trusted control representation).
-fn per_edge_line_cut_box(
-    model: &mut BRepModel,
-    cutter_centred_verts: Vec<Point3>,
-) -> SolidId {
+fn per_edge_line_cut_box(model: &mut BRepModel, cutter_centred_verts: Vec<Point3>) -> SolidId {
     let target = build_box_solid(model, 6.0, 6.0, 1.0);
     let cutter_verts = translate_xy(&cutter_centred_verts, 3.0, 3.0);
     let cutter_edges = build_per_edge_line_loop_edges(model, &cutter_verts);
@@ -514,7 +543,10 @@ fn assert_polyline_cut_mesh_quality(
     assert!(
         n_tri >= 3 && n_vert >= 3,
         "[{}/{}] empty/degenerate mesh: triangles={}, vertices={}",
-        name, regime, n_tri, n_vert,
+        name,
+        regime,
+        n_tri,
+        n_vert,
     );
 
     assert_mesh_finite(&mesh, &format!("[{}/{}]", name, regime));
@@ -531,18 +563,25 @@ fn assert_polyline_cut_mesh_quality(
     assert!(
         lo.x <= 1e-6 && lo.y <= 1e-6 && lo.z <= 1e-6,
         "[{}/{}] mesh bbox lo {:?} does not enclose target origin corner",
-        name, regime, (lo.x, lo.y, lo.z),
+        name,
+        regime,
+        (lo.x, lo.y, lo.z),
     );
     assert!(
         hi.x >= 6.0 - 1e-6 && hi.y >= 6.0 - 1e-6 && hi.z >= 1.0 - 1e-6,
         "[{}/{}] mesh bbox hi {:?} does not enclose target far corner",
-        name, regime, (hi.x, hi.y, hi.z),
+        name,
+        regime,
+        (hi.x, hi.y, hi.z),
     );
 
     assert!(
         n_tri <= triangle_ceiling,
         "[{}/{}] triangle count {} exceeds ceiling {} (tessellator runaway?)",
-        name, regime, n_tri, triangle_ceiling,
+        name,
+        regime,
+        n_tri,
+        triangle_ceiling,
     );
 }
 
@@ -658,7 +697,11 @@ fn quality_lshape_cut_coarse() {
         // in each axis ⇒ centre at (2, 2).
         let l = translate_xy(&lshape(), -2.0, -2.0);
         assert_polyline_cut_mesh_quality(
-            "lshape", l, TessellationParams::coarse(), "coarse", 2_000,
+            "lshape",
+            l,
+            TessellationParams::coarse(),
+            "coarse",
+            2_000,
         );
     });
 }
@@ -668,7 +711,11 @@ fn quality_lshape_cut_default() {
     run_with_watchdog("quality_lshape_cut_default", 20_000, || {
         let l = translate_xy(&lshape(), -2.0, -2.0);
         assert_polyline_cut_mesh_quality(
-            "lshape", l, TessellationParams::default(), "default", 5_000,
+            "lshape",
+            l,
+            TessellationParams::default(),
+            "default",
+            5_000,
         );
     });
 }
@@ -677,9 +724,7 @@ fn quality_lshape_cut_default() {
 fn quality_lshape_cut_fine() {
     run_with_watchdog("quality_lshape_cut_fine", 30_000, || {
         let l = translate_xy(&lshape(), -2.0, -2.0);
-        assert_polyline_cut_mesh_quality(
-            "lshape", l, TessellationParams::fine(), "fine", 50_000,
-        );
+        assert_polyline_cut_mesh_quality("lshape", l, TessellationParams::fine(), "fine", 50_000);
     });
 }
 
@@ -688,7 +733,11 @@ fn quality_lshape_cut_realtime() {
     run_with_watchdog("quality_lshape_cut_realtime", 15_000, || {
         let l = translate_xy(&lshape(), -2.0, -2.0);
         assert_polyline_cut_mesh_quality(
-            "lshape", l, TessellationParams::realtime(), "realtime", 1_000,
+            "lshape",
+            l,
+            TessellationParams::realtime(),
+            "realtime",
+            1_000,
         );
     });
 }
@@ -727,7 +776,12 @@ fn assert_volume_invariant(
     assert!(
         rel < 0.01,
         "[{}] V(box-hole) = {:.6}, expected {:.6} ({:.6} - {:.6}), rel-err = {:.4}%",
-        name, v_result, v_expected, v_box, v_hole, rel * 100.0,
+        name,
+        v_result,
+        v_expected,
+        v_box,
+        v_hole,
+        rel * 100.0,
     );
 }
 
@@ -806,7 +860,10 @@ fn assert_cross_representation_equivalence(name: &str, cutter_centred_verts: Vec
     assert!(
         rel < 1e-9,
         "[{}] volume differs: polyline={:.12}, per-edge-line={:.12}, rel-err={:.3e}",
-        name, v_polyline, v_line, rel,
+        name,
+        v_polyline,
+        v_line,
+        rel,
     );
 }
 
@@ -895,9 +952,12 @@ fn run_sequential_cut_chain(n_cuts: usize, name: &'static str) {
                 dump_face_topology(&model, current, &format!("[{}/cut={}]", name, i + 1));
             }
             assert_eq!(
-                nm, 0,
+                nm,
+                0,
                 "[{}/cut={}] non-manifold mesh edges = {}",
-                name, i + 1, nm,
+                name,
+                i + 1,
+                nm,
             );
         }
 
@@ -908,13 +968,18 @@ fn run_sequential_cut_chain(n_cuts: usize, name: &'static str) {
             assert!(
                 w[1] > w[0],
                 "[{}] face count did not grow across a cut: {} -> {}",
-                name, w[0], w[1],
+                name,
+                w[0],
+                w[1],
             );
         }
         assert!(
             face_counts.last().copied().unwrap_or(0) >= 6 + n_cuts,
             "[{}] expected ≥ {} faces after {} cuts, got {}",
-            name, 6 + n_cuts, n_cuts, face_counts.last().copied().unwrap_or(0),
+            name,
+            6 + n_cuts,
+            n_cuts,
+            face_counts.last().copied().unwrap_or(0),
         );
     });
 }
@@ -992,7 +1057,10 @@ fn repeat_stability_pentagon_cut() {
             assert!(
                 rel < 1e-9,
                 "run {}: volume {:.18} ≠ first-run {:.18} (rel={:.3e})",
-                i, v, first_vol, rel,
+                i,
+                v,
+                first_vol,
+                rel,
             );
         }
     });
@@ -1023,10 +1091,24 @@ fn build_polyline_prism(model: &mut BRepModel, verts: Vec<Point3>, height: f64) 
 fn union_disjoint_polyline_hexagons() {
     run_with_watchdog("union_disjoint_polyline_hexagons", 20_000, || {
         let mut model = BRepModel::new();
-        let a = build_polyline_prism(&mut model, translate_xy(&regular_ngon(6, 1.0), 0.0, 0.0), 1.0);
-        let b = build_polyline_prism(&mut model, translate_xy(&regular_ngon(6, 1.0), 4.0, 0.0), 1.0);
-        let u = boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default())
-            .expect("disjoint Union");
+        let a = build_polyline_prism(
+            &mut model,
+            translate_xy(&regular_ngon(6, 1.0), 0.0, 0.0),
+            1.0,
+        );
+        let b = build_polyline_prism(
+            &mut model,
+            translate_xy(&regular_ngon(6, 1.0), 4.0, 0.0),
+            1.0,
+        );
+        let u = boolean_operation(
+            &mut model,
+            a,
+            b,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("disjoint Union");
         let solid = model.solids.get(u).expect("union solid");
         let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
         assert_mesh_finite(&mesh, "union_disjoint_polyline_hexagons");
@@ -1047,12 +1129,26 @@ fn union_disjoint_polyline_hexagons() {
 fn union_overlapping_polyline_hexagons() {
     run_with_watchdog("union_overlapping_polyline_hexagons", 30_000, || {
         let mut model = BRepModel::new();
-        let a = build_polyline_prism(&mut model, translate_xy(&regular_ngon(6, 1.0), 0.0, 0.0), 1.0);
+        let a = build_polyline_prism(
+            &mut model,
+            translate_xy(&regular_ngon(6, 1.0), 0.0, 0.0),
+            1.0,
+        );
         // Translate by 1.0 in x: hexagons overlap (centre-to-centre 1.0
         // < 2.0 = sum of circumradii), bottom faces coplanar at z=0.
-        let b = build_polyline_prism(&mut model, translate_xy(&regular_ngon(6, 1.0), 1.0, 0.0), 1.0);
-        let u = boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default())
-            .expect("overlapping Union");
+        let b = build_polyline_prism(
+            &mut model,
+            translate_xy(&regular_ngon(6, 1.0), 1.0, 0.0),
+            1.0,
+        );
+        let u = boolean_operation(
+            &mut model,
+            a,
+            b,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("overlapping Union");
         let solid = model.solids.get(u).expect("union solid");
         let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
         assert_mesh_finite(&mesh, "union_overlapping_polyline_hexagons");
@@ -1118,7 +1214,9 @@ fn intersect_polyline_hexagon_into_box() {
         assert!(
             rel < 0.01,
             "intersect volume {:.6} differs from expected {:.6} (rel={:.3}%)",
-            v, hex_area, rel * 100.0,
+            v,
+            hex_area,
+            rel * 100.0,
         );
     });
 }
@@ -1158,9 +1256,7 @@ fn union_commutative_polyline_hexagons() {
         )
         .expect("A ∪ B");
         let faces_ab = outer_shell_face_count(&model_ab, u_ab);
-        let v_ab = model_ab
-            .calculate_solid_volume(u_ab)
-            .expect("vol(A ∪ B)");
+        let v_ab = model_ab.calculate_solid_volume(u_ab).expect("vol(A ∪ B)");
 
         // B ∪ A
         let mut model_ba = BRepModel::new();
@@ -1183,9 +1279,7 @@ fn union_commutative_polyline_hexagons() {
         )
         .expect("B ∪ A");
         let faces_ba = outer_shell_face_count(&model_ba, u_ba);
-        let v_ba = model_ba
-            .calculate_solid_volume(u_ba)
-            .expect("vol(B ∪ A)");
+        let v_ba = model_ba.calculate_solid_volume(u_ba).expect("vol(B ∪ A)");
 
         assert_eq!(
             faces_ab, faces_ba,
@@ -1196,7 +1290,9 @@ fn union_commutative_polyline_hexagons() {
         assert!(
             rel < 1e-9,
             "Union not commutative on volume: {:.12} vs {:.12} (rel={:.3e})",
-            v_ab, v_ba, rel,
+            v_ab,
+            v_ba,
+            rel,
         );
     });
 }
@@ -1214,14 +1310,19 @@ fn helper_polygon_area_xy_regular_hexagon_matches_closed_form() {
     assert!(
         (a - expected).abs() < 1e-9,
         "polygon_area_xy(hexagon r=1) = {}, expected {}",
-        a, expected,
+        a,
+        expected,
     );
 }
 
 #[test]
 fn helper_polygon_area_xy_lshape_is_12() {
     let a = polygon_area_xy(&lshape());
-    assert!((a - 12.0).abs() < 1e-9, "L-shape area = {}, expected 12.0", a);
+    assert!(
+        (a - 12.0).abs() < 1e-9,
+        "L-shape area = {}, expected 12.0",
+        a
+    );
 }
 
 #[test]

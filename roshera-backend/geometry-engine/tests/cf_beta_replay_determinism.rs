@@ -40,9 +40,7 @@ use geometry_engine::operations::chamfer::{
     chamfer_edges, ChamferOptions, ChamferType, PropagationMode as ChamferProp,
 };
 use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletProp};
-use geometry_engine::operations::recorder::{
-    OperationRecorder, RecordedOperation, RecorderError,
-};
+use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
 use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions};
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::solid::SolidId;
@@ -135,7 +133,11 @@ fn corner_edges(model: &BRepModel) -> Vec<EdgeId> {
     let corner = vertex_at(model, HALF_BOX, HALF_BOX, HALF_BOX);
     let mut edges = edges_at_vertex(model, corner);
     edges.sort_unstable();
-    assert_eq!(edges.len(), 3, "box corner must have exactly 3 incident edges");
+    assert_eq!(
+        edges.len(),
+        3,
+        "box corner must have exactly 3 incident edges"
+    );
     edges
 }
 
@@ -168,11 +170,7 @@ fn run_chamfer_first() -> (u64, Vec<String>) {
     .expect("finalize-pass fillet succeeds");
 
     let hash = topology_hash(&model, solid_id);
-    let op_kinds: Vec<String> = recorder
-        .snapshot()
-        .into_iter()
-        .map(|op| op.kind)
-        .collect();
+    let op_kinds: Vec<String> = recorder.snapshot().into_iter().map(|op| op.kind).collect();
     (hash, op_kinds)
 }
 
@@ -204,11 +202,7 @@ fn run_fillet_first() -> (u64, Vec<String>) {
     .expect("finalize-pass chamfer succeeds");
 
     let hash = topology_hash(&model, solid_id);
-    let op_kinds: Vec<String> = recorder
-        .snapshot()
-        .into_iter()
-        .map(|op| op.kind)
-        .collect();
+    let op_kinds: Vec<String> = recorder.snapshot().into_iter().map(|op| op.kind).collect();
     (hash, op_kinds)
 }
 

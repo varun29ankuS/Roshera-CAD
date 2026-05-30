@@ -1213,7 +1213,7 @@ mod tests {
     #[test]
     fn knot_vector_find_span_endpoint_returns_n() {
         let kv = KnotVector::open_uniform(3, 5); // n=5
-        // u_max = 1.0; expected span = num_control_points - 1 = 4.
+                                                 // u_max = 1.0; expected span = num_control_points - 1 = 4.
         let span = kv.find_span(1.0, 3, 5);
         assert_eq!(span, 4);
     }
@@ -1309,10 +1309,7 @@ mod tests {
     #[test]
     fn bspline_linear_evaluate_lerps_exactly() {
         // Degree 1 with two control points reduces to a line.
-        let cps = vec![
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(10.0, 0.0, 0.0),
-        ];
+        let cps = vec![Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0)];
         let knots = vec![0.0, 0.0, 1.0, 1.0];
         let curve = BSplineCurve::new(1, cps, knots).expect("curve");
         let mid = curve.evaluate(0.5).expect("mid");
@@ -1511,13 +1508,25 @@ mod tests {
             assert!((ders[0].y - u * u).abs() < 1e-9, "pos.y at u={u}");
 
             // First derivative C'(u) = (1, 2u, 0).
-            assert!((ders[1].x - 1.0).abs() < 1e-9, "d1.x at u={u}: {}", ders[1].x);
-            assert!((ders[1].y - 2.0 * u).abs() < 1e-9, "d1.y at u={u}: {}", ders[1].y);
+            assert!(
+                (ders[1].x - 1.0).abs() < 1e-9,
+                "d1.x at u={u}: {}",
+                ders[1].x
+            );
+            assert!(
+                (ders[1].y - 2.0 * u).abs() < 1e-9,
+                "d1.y at u={u}: {}",
+                ders[1].y
+            );
             assert!(ders[1].z.abs() < 1e-9, "d1.z at u={u}");
 
             // Second derivative C''(u) = (0, 2, 0) — constant.
             assert!(ders[2].x.abs() < 1e-9, "d2.x at u={u}: {}", ders[2].x);
-            assert!((ders[2].y - 2.0).abs() < 1e-9, "d2.y at u={u}: {}", ders[2].y);
+            assert!(
+                (ders[2].y - 2.0).abs() < 1e-9,
+                "d2.y at u={u}: {}",
+                ders[2].y
+            );
             assert!(ders[2].z.abs() < 1e-9, "d2.z at u={u}");
         }
     }

@@ -33,11 +33,7 @@
 use std::collections::HashMap;
 
 use geometry_engine::primitives::{
-    edge::EdgeId,
-    face::FaceId,
-    r#loop::LoopId,
-    shell::ShellId,
-    topology_builder::BRepModel,
+    edge::EdgeId, face::FaceId, r#loop::LoopId, shell::ShellId, topology_builder::BRepModel,
 };
 
 use crate::formats::step::{
@@ -172,6 +168,9 @@ pub fn emit_manifold_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geometry_engine::math::{Point3, Vector3};
+    use geometry_engine::primitives::curve::{Line, ParameterRange};
+    use geometry_engine::primitives::surface::Plane;
     use geometry_engine::primitives::{
         edge::Edge,
         face::{Face, FaceOrientation},
@@ -179,9 +178,6 @@ mod tests {
         shell::{Shell, ShellType},
         topology_builder::BRepModel,
     };
-    use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::surface::Plane;
-    use geometry_engine::math::{Point3, Vector3};
 
     /// Build a minimal closed quad: one face with one loop of four
     /// edges where every edge is used twice (once forward via this
@@ -199,18 +195,22 @@ mod tests {
         let v01 = model.vertices.add(0.0, 1.0, 0.0);
 
         // 4 edge curves (lines between adjacent corners).
-        let c_b = model.curves.add(Box::new(
-            Line::new(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)),
-        ));
-        let c_r = model.curves.add(Box::new(
-            Line::new(Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)),
-        ));
-        let c_t = model.curves.add(Box::new(
-            Line::new(Point3::new(1.0, 1.0, 0.0), Point3::new(0.0, 1.0, 0.0)),
-        ));
-        let c_l = model.curves.add(Box::new(
-            Line::new(Point3::new(0.0, 1.0, 0.0), Point3::new(0.0, 0.0, 0.0)),
-        ));
+        let c_b = model.curves.add(Box::new(Line::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        )));
+        let c_r = model.curves.add(Box::new(Line::new(
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        )));
+        let c_t = model.curves.add(Box::new(Line::new(
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        )));
+        let c_l = model.curves.add(Box::new(Line::new(
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+        )));
 
         let e_b = model.edges.add(Edge::new(
             0,
@@ -271,8 +271,12 @@ mod tests {
             )
             .unwrap(),
         ));
-        let fa = model.faces.add(Face::new(0, plane, lid_a, FaceOrientation::Forward));
-        let fb = model.faces.add(Face::new(0, plane, lid_b, FaceOrientation::Backward));
+        let fa = model
+            .faces
+            .add(Face::new(0, plane, lid_a, FaceOrientation::Forward));
+        let fb = model
+            .faces
+            .add(Face::new(0, plane, lid_b, FaceOrientation::Backward));
 
         let mut shell = Shell::new(0, ShellType::Closed);
         shell.faces.push(fa);

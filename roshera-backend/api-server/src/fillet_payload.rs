@@ -209,12 +209,9 @@ impl FilletRadii {
         // `parse_fillet_radii`), the fallback yields a Constant(0.0)
         // that the kernel rejects at `validate_fillet_inputs`.
         let default_dto = self.profiles.first();
-        let mut out: HashMap<EdgeId, EdgeFilletProfile> =
-            HashMap::with_capacity(edges.len());
+        let mut out: HashMap<EdgeId, EdgeFilletProfile> = HashMap::with_capacity(edges.len());
         for &eid in edges {
-            let dto = overrides
-                .and_then(|m| m.get(&eid))
-                .or(default_dto);
+            let dto = overrides.and_then(|m| m.get(&eid)).or(default_dto);
             let profile = match dto {
                 Some(dto) => blend_radius_dto_to_edge_profile(dto),
                 None => EdgeFilletProfile::Radius(BlendRadius::Constant(0.0)),
@@ -230,10 +227,7 @@ impl FilletRadii {
     /// endpoint calls this after [`parse_fillet_radii`] and before
     /// the kernel dispatch. Returns `Ok(())` when overrides are
     /// `None` or every key is a member of `edges`.
-    pub fn validate_overrides_against_edges(
-        &self,
-        edges: &[EdgeId],
-    ) -> Result<(), ApiError> {
+    pub fn validate_overrides_against_edges(&self, edges: &[EdgeId]) -> Result<(), ApiError> {
         let overrides = match self.per_edge_overrides.as_ref() {
             None => return Ok(()),
             Some(m) => m,
@@ -285,10 +279,7 @@ fn blend_radius_dto_to_edge_profile(dto: &BlendRadiusDto) -> EdgeFilletProfile {
 /// `edge_count` is the already-parsed length of the `edges` array —
 /// passed in rather than re-derived so the parser has no JSON-key
 /// dependencies beyond the radius fields it owns.
-pub fn parse_fillet_radii(
-    payload: &Value,
-    edge_count: usize,
-) -> Result<FilletRadii, ApiError> {
+pub fn parse_fillet_radii(payload: &Value, edge_count: usize) -> Result<FilletRadii, ApiError> {
     let radius_field = payload.get("radius");
     let radii_field = payload.get("radii");
     let overrides_field = payload.get("per_edge_overrides");
@@ -631,7 +622,10 @@ mod tests {
         for dto in &r.profiles {
             assert_constant(dto, 2.5);
         }
-        assert!(r.uniform_constant, "all-equal Constant must set uniform flag");
+        assert!(
+            r.uniform_constant,
+            "all-equal Constant must set uniform flag"
+        );
     }
 
     #[test]

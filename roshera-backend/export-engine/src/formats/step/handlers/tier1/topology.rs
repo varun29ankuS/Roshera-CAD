@@ -134,7 +134,9 @@ impl EntityHandler for EdgeCurveHandler {
             Ok(f) => f,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad record shape".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad record shape".into(),
+                };
             }
         };
         if fields.len() < 5 {
@@ -145,81 +147,109 @@ impl EntityHandler for EdgeCurveHandler {
                 "expected (label, start_vertex, end_vertex, edge_geometry, same_sense)",
             );
         }
-        let start_ref = match params::as_entity_ref(&fields[1], names::EDGE_CURVE, instance, "start_vertex") {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad start_vertex ref".into() };
-            }
-        };
-        let end_ref = match params::as_entity_ref(&fields[2], names::EDGE_CURVE, instance, "end_vertex") {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad end_vertex ref".into() };
-            }
-        };
-        let geom_ref = match params::as_entity_ref(&fields[3], names::EDGE_CURVE, instance, "edge_geometry") {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad edge_geometry ref".into() };
-            }
-        };
-        let same_sense = match params::as_bool(&fields[4], names::EDGE_CURVE, instance, "same_sense") {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                // `.U.` — unknown sense, default to true and warn.
-                ctx.report.push_warning(Warning {
-                    severity: Severity::Warn,
-                    entity: names::EDGE_CURVE.into(),
-                    instance: Some(instance),
-                    message: "same_sense was .U.; defaulting to .T.".into(),
-                });
-                true
-            }
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad same_sense".into() };
-            }
-        };
+        let start_ref =
+            match params::as_entity_ref(&fields[1], names::EDGE_CURVE, instance, "start_vertex") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad start_vertex ref".into(),
+                    };
+                }
+            };
+        let end_ref =
+            match params::as_entity_ref(&fields[2], names::EDGE_CURVE, instance, "end_vertex") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad end_vertex ref".into(),
+                    };
+                }
+            };
+        let geom_ref =
+            match params::as_entity_ref(&fields[3], names::EDGE_CURVE, instance, "edge_geometry") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad edge_geometry ref".into(),
+                    };
+                }
+            };
+        let same_sense =
+            match params::as_bool(&fields[4], names::EDGE_CURVE, instance, "same_sense") {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    // `.U.` — unknown sense, default to true and warn.
+                    ctx.report.push_warning(Warning {
+                        severity: Severity::Warn,
+                        entity: names::EDGE_CURVE.into(),
+                        instance: Some(instance),
+                        message: "same_sense was .U.; defaulting to .T.".into(),
+                    });
+                    true
+                }
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad same_sense".into(),
+                    };
+                }
+            };
 
         let start_vid = match resolve_vertex(start_ref, registry, dispatch, ctx) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "start_vertex unresolved".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "start_vertex unresolved".into(),
+                }
+            }
         };
         let end_vid = match resolve_vertex(end_ref, registry, dispatch, ctx) {
             Some(v) => v,
-            None => return HandlerOutcome::Failed { message: "end_vertex unresolved".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "end_vertex unresolved".into(),
+                }
+            }
         };
 
         // Force the underlying geometry record to be dispatched so the
         // template is in step_lines / step_circles.
-        let _ = ensure_resolved(
-            geom_ref,
-            &["LINE", "CIRCLE"],
-            registry,
-            dispatch,
-            ctx,
-        );
+        let _ = ensure_resolved(geom_ref, &["LINE", "CIRCLE"], registry, dispatch, ctx);
 
         // Vertex positions for curve construction + snap-check.
         let start_pos = match ctx.model.vertices.get_position(start_vid) {
             Some(p) => p,
-            None => return HandlerOutcome::Failed { message: "start vertex missing position".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "start vertex missing position".into(),
+                }
+            }
         };
         let end_pos = match ctx.model.vertices.get_position(end_vid) {
             Some(p) => p,
-            None => return HandlerOutcome::Failed { message: "end vertex missing position".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "end vertex missing position".into(),
+                }
+            }
         };
 
         // Dispatch on the underlying geometry template.
-        let curve_box: Box<dyn Curve> = if let Some(line_geom) = ctx.caches.step_lines.get(&geom_ref).copied() {
+        let curve_box: Box<dyn Curve> = if let Some(line_geom) =
+            ctx.caches.step_lines.get(&geom_ref).copied()
+        {
             build_line_curve(line_geom, start_pos, end_pos)
         } else if let Some(circle_geom) = ctx.caches.step_circles.get(&geom_ref).copied() {
             match build_circle_curve(circle_geom, start_pos, end_pos, instance, ctx) {
                 Some(c) => c,
-                None => return HandlerOutcome::Failed { message: "kernel rejected circle/arc".into() },
+                None => {
+                    return HandlerOutcome::Failed {
+                        message: "kernel rejected circle/arc".into(),
+                    }
+                }
             }
         } else {
             ctx.report.push_warning(Warning {
@@ -230,7 +260,9 @@ impl EntityHandler for EdgeCurveHandler {
                     "edge_geometry #{geom_ref} did not resolve to a tier-1 LINE or CIRCLE; tier-2 (NURBS) is not yet supported"
                 ),
             });
-            return HandlerOutcome::Failed { message: "unsupported edge_geometry".into() };
+            return HandlerOutcome::Failed {
+                message: "unsupported edge_geometry".into(),
+            };
         };
 
         // Per-edge snap check between the curve's endpoint evaluation
@@ -297,8 +329,16 @@ fn build_circle_curve(
     instance: u64,
     ctx: &mut ImportContext<'_>,
 ) -> Option<Box<dyn Curve>> {
-    let center = Point3::new(circle.placement.origin[0], circle.placement.origin[1], circle.placement.origin[2]);
-    let normal = Vector3::new(circle.placement.z[0], circle.placement.z[1], circle.placement.z[2]);
+    let center = Point3::new(
+        circle.placement.origin[0],
+        circle.placement.origin[1],
+        circle.placement.origin[2],
+    );
+    let normal = Vector3::new(
+        circle.placement.z[0],
+        circle.placement.z[1],
+        circle.placement.z[2],
+    );
 
     // Seam edge: start == end → full circle.
     let dx = start[0] - end[0];
@@ -338,7 +378,11 @@ fn build_circle_curve(
     let n_unit = probe.normal;
     let y_axis = n_unit.cross(&x_axis);
 
-    let s_local = Vector3::new(start[0] - center.x, start[1] - center.y, start[2] - center.z);
+    let s_local = Vector3::new(
+        start[0] - center.x,
+        start[1] - center.y,
+        start[2] - center.z,
+    );
     let e_local = Vector3::new(end[0] - center.x, end[1] - center.y, end[2] - center.z);
 
     let start_angle = s_local.dot(&y_axis).atan2(s_local.dot(&x_axis));
@@ -395,11 +439,14 @@ impl EntityHandler for OrientedEdgeHandler {
         dispatch: &EntityDispatch,
         ctx: &mut ImportContext<'_>,
     ) -> HandlerOutcome {
-        let fields = match params::record_fields(&record.parameter, names::ORIENTED_EDGE, instance) {
+        let fields = match params::record_fields(&record.parameter, names::ORIENTED_EDGE, instance)
+        {
             Ok(f) => f,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad record shape".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad record shape".into(),
+                };
             }
         };
         if fields.len() < 5 {
@@ -410,35 +457,48 @@ impl EntityHandler for OrientedEdgeHandler {
                 "expected (label, *, *, edge_element, orientation)",
             );
         }
-        let edge_ref = match params::as_entity_ref(&fields[3], names::ORIENTED_EDGE, instance, "edge_element") {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad edge_element ref".into() };
-            }
-        };
-        let orientation = match params::as_bool(&fields[4], names::ORIENTED_EDGE, instance, "orientation") {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                ctx.report.push_warning(Warning {
-                    severity: Severity::Warn,
-                    entity: names::ORIENTED_EDGE.into(),
-                    instance: Some(instance),
-                    message: "orientation was .U.; defaulting to .T.".into(),
-                });
-                true
-            }
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad orientation".into() };
-            }
-        };
+        let edge_ref =
+            match params::as_entity_ref(&fields[3], names::ORIENTED_EDGE, instance, "edge_element")
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad edge_element ref".into(),
+                    };
+                }
+            };
+        let orientation =
+            match params::as_bool(&fields[4], names::ORIENTED_EDGE, instance, "orientation") {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    ctx.report.push_warning(Warning {
+                        severity: Severity::Warn,
+                        entity: names::ORIENTED_EDGE.into(),
+                        instance: Some(instance),
+                        message: "orientation was .U.; defaulting to .T.".into(),
+                    });
+                    true
+                }
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad orientation".into(),
+                    };
+                }
+            };
 
         let edge_id = match resolve_edge(edge_ref, registry, dispatch, ctx) {
             Some(e) => e,
-            None => return HandlerOutcome::Failed { message: "edge_element unresolved".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "edge_element unresolved".into(),
+                }
+            }
         };
-        ctx.caches.oriented_edges.insert(instance, (edge_id, orientation));
+        ctx.caches
+            .oriented_edges
+            .insert(instance, (edge_id, orientation));
         HandlerOutcome::Resolved
     }
 }
@@ -479,7 +539,9 @@ impl EntityHandler for EdgeLoopHandler {
             Ok(f) => f,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad record shape".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad record shape".into(),
+                };
             }
         };
         if fields.len() < 2 {
@@ -490,18 +552,16 @@ impl EntityHandler for EdgeLoopHandler {
                 "expected (label, (oriented_edges))",
             );
         }
-        let oe_refs = match params::as_entity_ref_list(
-            &fields[1],
-            names::EDGE_LOOP,
-            instance,
-            "edge_list",
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad edge_list".into() };
-            }
-        };
+        let oe_refs =
+            match params::as_entity_ref_list(&fields[1], names::EDGE_LOOP, instance, "edge_list") {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad edge_list".into(),
+                    };
+                }
+            };
         if oe_refs.is_empty() {
             ctx.report.push_warning(Warning {
                 severity: Severity::Warn,
@@ -509,7 +569,9 @@ impl EntityHandler for EdgeLoopHandler {
                 instance: Some(instance),
                 message: "empty edge_list".into(),
             });
-            return HandlerOutcome::Failed { message: "empty edge_list".into() };
+            return HandlerOutcome::Failed {
+                message: "empty edge_list".into(),
+            };
         }
 
         let mut entries: Vec<(EdgeId, bool)> = Vec::with_capacity(oe_refs.len());
@@ -534,7 +596,9 @@ impl EntityHandler for EdgeLoopHandler {
             };
             let s = ctx.model.vertices.get_position(edge.start_vertex);
             let e = ctx.model.vertices.get_position(edge.end_vertex);
-            let (Some(sp), Some(ep)) = (s, e) else { continue };
+            let (Some(sp), Some(ep)) = (s, e) else {
+                continue;
+            };
             if forward {
                 chain.push((sp, ep));
             } else {
@@ -623,22 +687,35 @@ fn handle_face_bound(
     dispatch: &EntityDispatch,
     ctx: &mut ImportContext<'_>,
 ) -> HandlerOutcome {
-    let entity_name = if is_outer { names::FACE_OUTER_BOUND } else { names::FACE_BOUND };
+    let entity_name = if is_outer {
+        names::FACE_OUTER_BOUND
+    } else {
+        names::FACE_BOUND
+    };
     let fields = match params::record_fields(&record.parameter, entity_name, instance) {
         Ok(f) => f,
         Err(e) => {
             ctx.report.push_warning(e.into_warning());
-            return HandlerOutcome::Failed { message: "bad record shape".into() };
+            return HandlerOutcome::Failed {
+                message: "bad record shape".into(),
+            };
         }
     };
     if fields.len() < 3 {
-        return field_count_error(ctx, entity_name, instance, "expected (label, bound, orientation)");
+        return field_count_error(
+            ctx,
+            entity_name,
+            instance,
+            "expected (label, bound, orientation)",
+        );
     }
     let loop_ref = match params::as_entity_ref(&fields[1], entity_name, instance, "bound") {
         Ok(r) => r,
         Err(e) => {
             ctx.report.push_warning(e.into_warning());
-            return HandlerOutcome::Failed { message: "bad bound ref".into() };
+            return HandlerOutcome::Failed {
+                message: "bad bound ref".into(),
+            };
         }
     };
     let forward = match params::as_bool(&fields[2], entity_name, instance, "orientation") {
@@ -654,15 +731,23 @@ fn handle_face_bound(
         }
         Err(e) => {
             ctx.report.push_warning(e.into_warning());
-            return HandlerOutcome::Failed { message: "bad orientation".into() };
+            return HandlerOutcome::Failed {
+                message: "bad orientation".into(),
+            };
         }
     };
 
     let loop_id = match resolve_loop(loop_ref, registry, dispatch, ctx) {
         Some(l) => l,
-        None => return HandlerOutcome::Failed { message: "bound unresolved".into() },
+        None => {
+            return HandlerOutcome::Failed {
+                message: "bound unresolved".into(),
+            }
+        }
     };
-    ctx.caches.face_bounds.insert(instance, (loop_id, is_outer, forward));
+    ctx.caches
+        .face_bounds
+        .insert(instance, (loop_id, is_outer, forward));
     HandlerOutcome::Resolved
 }
 
@@ -697,11 +782,14 @@ impl EntityHandler for AdvancedFaceHandler {
         dispatch: &EntityDispatch,
         ctx: &mut ImportContext<'_>,
     ) -> HandlerOutcome {
-        let fields = match params::record_fields(&record.parameter, names::ADVANCED_FACE, instance) {
+        let fields = match params::record_fields(&record.parameter, names::ADVANCED_FACE, instance)
+        {
             Ok(f) => f,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad record shape".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad record shape".into(),
+                };
             }
         };
         if fields.len() < 4 {
@@ -721,7 +809,9 @@ impl EntityHandler for AdvancedFaceHandler {
             Ok(r) => r,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad bounds list".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad bounds list".into(),
+                };
             }
         };
         let surf_ref = match params::as_entity_ref(
@@ -733,25 +823,30 @@ impl EntityHandler for AdvancedFaceHandler {
             Ok(r) => r,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad face_geometry ref".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad face_geometry ref".into(),
+                };
             }
         };
-        let same_sense = match params::as_bool(&fields[3], names::ADVANCED_FACE, instance, "same_sense") {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                ctx.report.push_warning(Warning {
-                    severity: Severity::Warn,
-                    entity: names::ADVANCED_FACE.into(),
-                    instance: Some(instance),
-                    message: "same_sense was .U.; defaulting to .T.".into(),
-                });
-                true
-            }
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad same_sense".into() };
-            }
-        };
+        let same_sense =
+            match params::as_bool(&fields[3], names::ADVANCED_FACE, instance, "same_sense") {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    ctx.report.push_warning(Warning {
+                        severity: Severity::Warn,
+                        entity: names::ADVANCED_FACE.into(),
+                        instance: Some(instance),
+                        message: "same_sense was .U.; defaulting to .T.".into(),
+                    });
+                    true
+                }
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad same_sense".into(),
+                    };
+                }
+            };
 
         // Resolve the surface (Plane / Cylinder cached by IMP2.3).
         let _ = ensure_resolved(
@@ -772,7 +867,9 @@ impl EntityHandler for AdvancedFaceHandler {
                         "face_geometry #{surf_ref} did not resolve to a tier-1 surface"
                     ),
                 });
-                return HandlerOutcome::Failed { message: "surface unresolved".into() };
+                return HandlerOutcome::Failed {
+                    message: "surface unresolved".into(),
+                };
             }
         };
 
@@ -832,7 +929,9 @@ impl EntityHandler for AdvancedFaceHandler {
                         instance: Some(instance),
                         message: "no bounds supplied".into(),
                     });
-                    return HandlerOutcome::Failed { message: "no bounds".into() };
+                    return HandlerOutcome::Failed {
+                        message: "no bounds".into(),
+                    };
                 }
             },
         };
@@ -895,7 +994,9 @@ impl EntityHandler for ClosedShellHandler {
             Ok(f) => f,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad record shape".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad record shape".into(),
+                };
             }
         };
         if fields.len() < 2 {
@@ -915,7 +1016,9 @@ impl EntityHandler for ClosedShellHandler {
             Ok(r) => r,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad face list".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad face list".into(),
+                };
             }
         };
         if face_refs.is_empty() {
@@ -925,7 +1028,9 @@ impl EntityHandler for ClosedShellHandler {
                 instance: Some(instance),
                 message: "empty face list".into(),
             });
-            return HandlerOutcome::Failed { message: "empty face list".into() };
+            return HandlerOutcome::Failed {
+                message: "empty face list".into(),
+            };
         }
 
         let mut face_ids = Vec::with_capacity(face_refs.len());
@@ -982,13 +1087,16 @@ impl EntityHandler for ManifoldSolidBrepHandler {
         dispatch: &EntityDispatch,
         ctx: &mut ImportContext<'_>,
     ) -> HandlerOutcome {
-        let fields = match params::record_fields(&record.parameter, names::MANIFOLD_SOLID_BREP, instance) {
-            Ok(f) => f,
-            Err(e) => {
-                ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad record shape".into() };
-            }
-        };
+        let fields =
+            match params::record_fields(&record.parameter, names::MANIFOLD_SOLID_BREP, instance) {
+                Ok(f) => f,
+                Err(e) => {
+                    ctx.report.push_warning(e.into_warning());
+                    return HandlerOutcome::Failed {
+                        message: "bad record shape".into(),
+                    };
+                }
+            };
         if fields.len() < 2 {
             return field_count_error(
                 ctx,
@@ -1006,12 +1114,18 @@ impl EntityHandler for ManifoldSolidBrepHandler {
             Ok(r) => r,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
-                return HandlerOutcome::Failed { message: "bad outer ref".into() };
+                return HandlerOutcome::Failed {
+                    message: "bad outer ref".into(),
+                };
             }
         };
         let shell_id = match resolve_shell(shell_ref, registry, dispatch, ctx) {
             Some(s) => s,
-            None => return HandlerOutcome::Failed { message: "outer shell unresolved".into() },
+            None => {
+                return HandlerOutcome::Failed {
+                    message: "outer shell unresolved".into(),
+                }
+            }
         };
         let solid = Solid::new(0, shell_id);
         let solid_id = ctx.model.solids.add(solid);
@@ -1250,12 +1364,12 @@ mod tests {
         s += "#41=LINE('',#1,#31);"; // along +X from origin (parametric form only)
         s += "#42=LINE('',#1,#32);"; // along +Y
         s += "#43=LINE('',#1,#33);"; // along +Z
-        // EDGE_CURVEs — bottom square z=0.
+                                     // EDGE_CURVEs — bottom square z=0.
         s += "#51=EDGE_CURVE('',#11,#12,#41,.T.);"; // (0,0,0)→(1,0,0)
         s += "#52=EDGE_CURVE('',#12,#13,#42,.T.);"; // (1,0,0)→(1,1,0)
         s += "#53=EDGE_CURVE('',#14,#13,#41,.T.);"; // (0,1,0)→(1,1,0)
         s += "#54=EDGE_CURVE('',#11,#14,#42,.T.);"; // (0,0,0)→(0,1,0)
-        // Top square z=1.
+                                                    // Top square z=1.
         s += "#55=EDGE_CURVE('',#15,#16,#41,.T.);";
         s += "#56=EDGE_CURVE('',#16,#17,#42,.T.);";
         s += "#57=EDGE_CURVE('',#18,#17,#41,.T.);";
@@ -1317,7 +1431,7 @@ mod tests {
         s += "#124=AXIS2_PLACEMENT_3D('',#2,#21,#22);"; // right: normal +X
         s += "#125=AXIS2_PLACEMENT_3D('',#4,#22,#21);"; // back: normal +Y
         s += "#126=AXIS2_PLACEMENT_3D('',#1,#24,#22);"; // left: normal -X
-        // Planes.
+                                                        // Planes.
         s += "#131=PLANE('',#121);";
         s += "#132=PLANE('',#122);";
         s += "#133=PLANE('',#123);";
@@ -1341,16 +1455,14 @@ mod tests {
 
     #[test]
     fn edge_curve_line_happy_path() {
-        let (model, _r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (model, _r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #12=VERTEX_POINT('',#2);\
              #21=DIRECTION('',(1.,0.,0.));\
              #31=VECTOR('',#21,1.);\
              #41=LINE('',#1,#31);\
-             #51=EDGE_CURVE('',#11,#12,#41,.T.);",
-        );
+             #51=EDGE_CURVE('',#11,#12,#41,.T.);");
         let eid = c.edges.get(&51).copied().expect("edge cached");
         let edge = model.edges.get(eid).expect("edge stored");
         assert_eq!(edge.orientation, EdgeOrientation::Forward);
@@ -1358,16 +1470,14 @@ mod tests {
 
     #[test]
     fn edge_curve_reverse_sense_yields_backward_orientation() {
-        let (model, _r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (model, _r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #12=VERTEX_POINT('',#2);\
              #21=DIRECTION('',(1.,0.,0.));\
              #31=VECTOR('',#21,1.);\
              #41=LINE('',#1,#31);\
-             #51=EDGE_CURVE('',#11,#12,#41,.F.);",
-        );
+             #51=EDGE_CURVE('',#11,#12,#41,.F.);");
         let eid = c.edges.get(&51).unwrap();
         let edge = model.edges.get(*eid).unwrap();
         assert_eq!(edge.orientation, EdgeOrientation::Backward);
@@ -1375,25 +1485,21 @@ mod tests {
 
     #[test]
     fn edge_curve_wrong_arity_warns() {
-        let (_m, r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (_m, r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
-             #51=EDGE_CURVE('',#11);",
-        );
+             #51=EDGE_CURVE('',#11);");
         assert!(!c.edges.contains_key(&51));
         assert!(r.warnings.iter().any(|w| w.entity == "EDGE_CURVE"));
     }
 
     #[test]
     fn edge_curve_unknown_geometry_warns() {
-        let (_m, r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (_m, r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #12=VERTEX_POINT('',#2);\
              #41=CARTESIAN_POINT('',(0.,0.,0.));\
-             #51=EDGE_CURVE('',#11,#12,#41,.T.);",
-        );
+             #51=EDGE_CURVE('',#11,#12,#41,.T.);");
         assert!(!c.edges.contains_key(&51));
         assert!(r.warnings.iter().any(|w| w.entity == "EDGE_CURVE"));
     }
@@ -1401,16 +1507,14 @@ mod tests {
     #[test]
     fn edge_curve_seam_circle_is_full_circle() {
         // Start == end → full circle.
-        let (model, _r, c) = run(
-            "#1=CARTESIAN_POINT('',(1.,0.,0.));\
+        let (model, _r, c) = run("#1=CARTESIAN_POINT('',(1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #2=CARTESIAN_POINT('',(0.,0.,0.));\
              #21=DIRECTION('',(0.,0.,1.));\
              #22=DIRECTION('',(1.,0.,0.));\
              #31=AXIS2_PLACEMENT_3D('',#2,#21,#22);\
              #41=CIRCLE('',#31,1.);\
-             #51=EDGE_CURVE('',#11,#11,#41,.T.);",
-        );
+             #51=EDGE_CURVE('',#11,#11,#41,.T.);");
         let eid = c.edges.get(&51).expect("seam edge cached");
         let edge = model.edges.get(*eid).expect("seam edge stored");
         // The kernel curve should evaluate to vertex pos at t=0 *and* t=1.
@@ -1423,8 +1527,7 @@ mod tests {
     #[test]
     fn edge_curve_half_arc_yields_pi_sweep() {
         // Start (1,0,0), end (-1,0,0) about (0,0,0) normal +Z → π sweep.
-        let (model, _r, c) = run(
-            "#1=CARTESIAN_POINT('',(1.,0.,0.));\
+        let (model, _r, c) = run("#1=CARTESIAN_POINT('',(1.,0.,0.));\
              #2=CARTESIAN_POINT('',(-1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #12=VERTEX_POINT('',#2);\
@@ -1433,8 +1536,7 @@ mod tests {
              #22=DIRECTION('',(1.,0.,0.));\
              #31=AXIS2_PLACEMENT_3D('',#3,#21,#22);\
              #41=CIRCLE('',#31,1.);\
-             #51=EDGE_CURVE('',#11,#12,#41,.T.);",
-        );
+             #51=EDGE_CURVE('',#11,#12,#41,.T.);");
         let eid = c.edges.get(&51).expect("arc edge cached");
         let edge = model.edges.get(*eid).unwrap();
         let curve_box = model.curves.get(edge.curve_id).unwrap();
@@ -1450,16 +1552,14 @@ mod tests {
         // curve we build still goes (0,0,0)→(1,0,0) (kernel curve is sized
         // from the *vertices*), so the snap deviation is zero. The handler
         // does not warn in the happy path.
-        let (_m, r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (_m, r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #12=VERTEX_POINT('',#2);\
              #21=DIRECTION('',(1.,0.,0.));\
              #31=VECTOR('',#21,1.);\
              #41=LINE('',#1,#31);\
-             #51=EDGE_CURVE('',#11,#12,#41,.T.);",
-        );
+             #51=EDGE_CURVE('',#11,#12,#41,.T.);");
         assert!(c.edges.contains_key(&51));
         assert!(!r
             .healings
@@ -1471,8 +1571,7 @@ mod tests {
 
     #[test]
     fn oriented_edge_happy_path() {
-        let (_m, _r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (_m, _r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #12=VERTEX_POINT('',#2);\
@@ -1480,16 +1579,14 @@ mod tests {
              #31=VECTOR('',#21,1.);\
              #41=LINE('',#1,#31);\
              #51=EDGE_CURVE('',#11,#12,#41,.T.);\
-             #71=ORIENTED_EDGE('',*,*,#51,.T.);",
-        );
+             #71=ORIENTED_EDGE('',*,*,#51,.T.);");
         let pair = c.oriented_edges.get(&71).expect("oriented edge cached");
         assert!(pair.1);
     }
 
     #[test]
     fn oriented_edge_reverse_caches_false() {
-        let (_m, _r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (_m, _r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #11=VERTEX_POINT('',#1);\
              #12=VERTEX_POINT('',#2);\
@@ -1497,8 +1594,7 @@ mod tests {
              #31=VECTOR('',#21,1.);\
              #41=LINE('',#1,#31);\
              #51=EDGE_CURVE('',#11,#12,#41,.T.);\
-             #71=ORIENTED_EDGE('',*,*,#51,.F.);",
-        );
+             #71=ORIENTED_EDGE('',*,*,#51,.F.);");
         let (_eid, forward) = c.oriented_edges.get(&71).unwrap();
         assert!(!*forward);
     }
@@ -1515,8 +1611,7 @@ mod tests {
     #[test]
     fn edge_loop_happy_path_closed_chain() {
         // Square loop in XY.
-        let (model, _r, c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (model, _r, c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #3=CARTESIAN_POINT('',(1.,1.,0.));\
              #4=CARTESIAN_POINT('',(0.,1.,0.));\
@@ -1538,8 +1633,7 @@ mod tests {
              #72=ORIENTED_EDGE('',*,*,#52,.T.);\
              #73=ORIENTED_EDGE('',*,*,#53,.F.);\
              #74=ORIENTED_EDGE('',*,*,#54,.F.);\
-             #101=EDGE_LOOP('',(#71,#72,#73,#74));",
-        );
+             #101=EDGE_LOOP('',(#71,#72,#73,#74));");
         let lid = c.loops.get(&101).expect("loop cached");
         let lp = model.loops.get(*lid).expect("loop stored");
         assert_eq!(lp.edges.len(), 4);
@@ -1549,8 +1643,7 @@ mod tests {
     #[test]
     fn edge_loop_open_chain_emits_healing() {
         // 11→12 + 13→14: chain doesn't close.
-        let (_m, r, _c) = run(
-            "#1=CARTESIAN_POINT('',(0.,0.,0.));\
+        let (_m, r, _c) = run("#1=CARTESIAN_POINT('',(0.,0.,0.));\
              #2=CARTESIAN_POINT('',(1.,0.,0.));\
              #3=CARTESIAN_POINT('',(5.,5.,5.));\
              #4=CARTESIAN_POINT('',(6.,6.,6.));\
@@ -1565,8 +1658,7 @@ mod tests {
              #52=EDGE_CURVE('',#13,#14,#41,.T.);\
              #71=ORIENTED_EDGE('',*,*,#51,.T.);\
              #72=ORIENTED_EDGE('',*,*,#52,.T.);\
-             #101=EDGE_LOOP('',(#71,#72));",
-        );
+             #101=EDGE_LOOP('',(#71,#72));");
         assert!(r
             .healings
             .iter()
@@ -1617,7 +1709,10 @@ mod tests {
 
     #[test]
     fn face_bound_caches_inner_flag() {
-        let body = format!("{}#111=FACE_BOUND('',#101,.T.);", make_unit_square_loop_body());
+        let body = format!(
+            "{}#111=FACE_BOUND('',#101,.T.);",
+            make_unit_square_loop_body()
+        );
         let (_m, _r, c) = run(&body);
         let (_lid, is_outer, forward) = *c.face_bounds.get(&111).unwrap();
         assert!(!is_outer);
@@ -1686,8 +1781,10 @@ mod tests {
         let fid = c.faces.get(&141).unwrap();
         let face = model.faces.get(*fid).unwrap();
         assert_eq!(face.inner_loops.len(), 0);
-        assert!(r.warnings.iter().any(|w| w.entity == "ADVANCED_FACE"
-            && w.message.contains("no FACE_OUTER_BOUND")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.entity == "ADVANCED_FACE" && w.message.contains("no FACE_OUTER_BOUND")));
     }
 
     #[test]

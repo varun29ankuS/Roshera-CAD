@@ -48,8 +48,7 @@ use super::resolver::ensure_resolved;
 /// strings and the dispatcher agree on capitalisation.
 mod names {
     pub const SHAPE_REPRESENTATION: &str = "SHAPE_REPRESENTATION";
-    pub const ADVANCED_BREP_SHAPE_REPRESENTATION: &str =
-        "ADVANCED_BREP_SHAPE_REPRESENTATION";
+    pub const ADVANCED_BREP_SHAPE_REPRESENTATION: &str = "ADVANCED_BREP_SHAPE_REPRESENTATION";
     pub const MANIFOLD_SOLID_BREP: &str = "MANIFOLD_SOLID_BREP";
     pub const AXIS2_PLACEMENT_3D: &str = "AXIS2_PLACEMENT_3D";
 }
@@ -64,8 +63,7 @@ mod names {
 /// kernel solid ids of every `MANIFOLD_SOLID_BREP` item.
 pub struct ShapeRepresentationHandler;
 /// Static binding consumed by [`register`].
-pub static SHAPE_REPRESENTATION_HANDLER: ShapeRepresentationHandler =
-    ShapeRepresentationHandler;
+pub static SHAPE_REPRESENTATION_HANDLER: ShapeRepresentationHandler = ShapeRepresentationHandler;
 
 impl EntityHandler for ShapeRepresentationHandler {
     fn names(&self) -> &'static [&'static str] {
@@ -113,8 +111,7 @@ impl EntityHandler for ShapeRepresentationHandler {
         }
 
         // Items list.
-        let items = match params::as_entity_ref_list(&fields[1], entity, instance, "items")
-        {
+        let items = match params::as_entity_ref_list(&fields[1], entity, instance, "items") {
             Ok(v) => v,
             Err(e) => {
                 ctx.report.push_warning(e.into_warning());
@@ -139,7 +136,15 @@ impl EntityHandler for ShapeRepresentationHandler {
         // model is tolerated with an informational warning.
         let mut root_solids: Vec<SolidId> = Vec::with_capacity(items.len());
         for item_ref in &items {
-            collect_root_item(*item_ref, entity, instance, &mut root_solids, registry, dispatch, ctx);
+            collect_root_item(
+                *item_ref,
+                entity,
+                instance,
+                &mut root_solids,
+                registry,
+                dispatch,
+                ctx,
+            );
         }
 
         ctx.caches.roots.insert(instance, root_solids);
@@ -184,10 +189,7 @@ fn collect_root_item(
     // Slow path: force resolution.
     let _ = ensure_resolved(
         item_ref,
-        &[
-            names::MANIFOLD_SOLID_BREP,
-            names::AXIS2_PLACEMENT_3D,
-        ],
+        &[names::MANIFOLD_SOLID_BREP, names::AXIS2_PLACEMENT_3D],
         registry,
         dispatch,
         ctx,
@@ -212,9 +214,7 @@ fn collect_root_item(
         severity: Severity::Info,
         entity: entity.to_string(),
         instance: Some(instance),
-        message: format!(
-            "item #{item_ref} is not a tier-1 representation_item; dropped from root"
-        ),
+        message: format!("item #{item_ref} is not a tier-1 representation_item; dropped from root"),
     });
 }
 
@@ -414,10 +414,10 @@ mod tests {
         // No structured error-severity warnings — only Info-level
         // skips for the unsupported context are acceptable.
         assert!(
-            !report
-                .warnings
-                .iter()
-                .any(|w| matches!(w.severity, super::super::super::super::diagnostics::Severity::Error)),
+            !report.warnings.iter().any(|w| matches!(
+                w.severity,
+                super::super::super::super::diagnostics::Severity::Error
+            )),
             "no Error-severity warnings: {:?}",
             report.warnings
         );
@@ -447,7 +447,10 @@ mod tests {
         );
         assert!(
             r.warnings.iter().any(|w| w.entity == "SHAPE_REPRESENTATION"
-                && matches!(w.severity, super::super::super::super::diagnostics::Severity::Warn)),
+                && matches!(
+                    w.severity,
+                    super::super::super::super::diagnostics::Severity::Warn
+                )),
             "wrong-arity warning expected: {:?}",
             r.warnings
         );
@@ -483,9 +486,9 @@ mod tests {
         let roots = c.roots.get(&301).expect("root cached");
         assert_eq!(roots.len(), 1, "only the cube solid counts");
         assert!(
-            r.warnings.iter().any(|w| w
-                .message
-                .contains("not a tier-1 representation_item")),
+            r.warnings
+                .iter()
+                .any(|w| w.message.contains("not a tier-1 representation_item")),
             "expected Info-skip for #299"
         );
     }

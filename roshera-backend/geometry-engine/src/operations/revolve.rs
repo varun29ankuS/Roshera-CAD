@@ -1240,8 +1240,8 @@ mod tests {
         let edges = make_offset_rectangle(&mut model);
         let face_id = create_face_from_profile(&mut model, edges).expect("face");
         let face = model.faces.get(face_id).expect("face").clone();
-        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
-            .expect("intersect query");
+        let result =
+            face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z).expect("intersect query");
         assert!(!result, "offset rectangle should not touch the Z axis");
     }
 
@@ -1251,8 +1251,8 @@ mod tests {
         let edges = make_on_axis_rectangle(&mut model);
         let face_id = create_face_from_profile(&mut model, edges).expect("face");
         let face = model.faces.get(face_id).expect("face").clone();
-        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
-            .expect("intersect query");
+        let result =
+            face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z).expect("intersect query");
         assert!(result, "rectangle with vertices on Z axis must register");
     }
 
@@ -1272,8 +1272,8 @@ mod tests {
         ];
         let face_id = create_face_from_profile(&mut model, edges).expect("face");
         let face = model.faces.get(face_id).expect("face").clone();
-        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
-            .expect("intersect query");
+        let result =
+            face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z).expect("intersect query");
         assert!(result, "Z axis pierces the centered XY rectangle");
     }
 
@@ -1293,9 +1293,12 @@ mod tests {
         ];
         let face_id = create_face_from_profile(&mut model, edges).expect("face");
         let face = model.faces.get(face_id).expect("face").clone();
-        let result = face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z)
-            .expect("intersect query");
-        assert!(!result, "offset XY rectangle far from axis should not intersect");
+        let result =
+            face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z).expect("intersect query");
+        assert!(
+            !result,
+            "offset XY rectangle far from axis should not intersect"
+        );
     }
 
     // -------------------------------------------------------------------

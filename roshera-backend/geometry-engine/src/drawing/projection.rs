@@ -102,20 +102,29 @@ pub fn view_matrix_for_projection(projection: ProjectionType) -> Matrix4 {
         }
         ProjectionType::Custom { rotation } => {
             return Matrix4::new(
-                rotation[0], rotation[1], rotation[2], 0.0,
-                rotation[3], rotation[4], rotation[5], 0.0,
-                rotation[6], rotation[7], rotation[8], 0.0,
-                0.0, 0.0, 0.0, 1.0,
+                rotation[0],
+                rotation[1],
+                rotation[2],
+                0.0,
+                rotation[3],
+                rotation[4],
+                rotation[5],
+                0.0,
+                rotation[6],
+                rotation[7],
+                rotation[8],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
             );
         }
     };
     // Pack (u, v, w) as the three rows of the 4×4 rotation. The
     // resulting `transform_point` performs world→view directly.
     Matrix4::new(
-        u.x, u.y, u.z, 0.0,
-        v.x, v.y, v.z, 0.0,
-        w.x, w.y, w.z, 0.0,
-        0.0, 0.0, 0.0, 1.0,
+        u.x, u.y, u.z, 0.0, v.x, v.y, v.z, 0.0, w.x, w.y, w.z, 0.0, 0.0, 0.0, 0.0, 1.0,
     )
 }
 
@@ -175,8 +184,7 @@ pub fn project_solid_edges(
                 // budget for everything else. We treat a curve as
                 // linear via the trait predicate so non-trivial Lines
                 // with offset/rotation are still recognised.
-                let is_linear = curve
-                    .is_linear(crate::math::Tolerance::default());
+                let is_linear = curve.is_linear(crate::math::Tolerance::default());
                 let n_samples = if is_linear {
                     2
                 } else {

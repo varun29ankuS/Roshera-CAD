@@ -183,7 +183,8 @@ mod tests {
     fn all_edge_ids(model: &BRepModel, solid_id: crate::primitives::solid::SolidId) -> Vec<EdgeId> {
         let mut edges = Vec::new();
         let solid = model.solids.get(solid_id).expect("solid present");
-        let shell_ids = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        let shell_ids =
+            std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
         for shell_id in shell_ids {
             let shell = model.shells.get(shell_id).expect("shell present");
             for &face_id in &shell.faces {
@@ -250,9 +251,7 @@ mod tests {
         let result = validate_radius_against_curvature(&model, &edges, 2.0);
         match result {
             Err(BlendFailure::RadiusExceedsCurvature {
-                r_requested,
-                r_max,
-                ..
+                r_requested, r_max, ..
             }) => {
                 assert_eq!(r_requested, 2.0);
                 assert!(
@@ -261,9 +260,7 @@ mod tests {
                     r_max
                 );
             }
-            Ok(()) => panic!(
-                "r=2.0 against cylinder radius=1.0 must be rejected by F6-α"
-            ),
+            Ok(()) => panic!("r=2.0 against cylinder radius=1.0 must be rejected by F6-α"),
             Err(other) => panic!("expected RadiusExceedsCurvature, got {:?}", other),
         }
     }

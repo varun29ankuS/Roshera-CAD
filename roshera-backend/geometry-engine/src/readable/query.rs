@@ -164,10 +164,7 @@ impl BRepModel {
     /// placeholders (for solids without an explicit name) participate
     /// in matching verbatim.
     pub fn list_parts_filtered(&self, filter: &ListPartsFilter) -> Vec<PartSummary> {
-        let needle_lower = filter
-            .name_contains
-            .as_ref()
-            .map(|s| s.to_lowercase());
+        let needle_lower = filter.name_contains.as_ref().map(|s| s.to_lowercase());
 
         let mut summaries: Vec<PartSummary> = self
             .solids
@@ -179,10 +176,7 @@ impl BRepModel {
                     }
                 }
                 let location = self.solid_location_descriptor_cached(id)?;
-                let name = solid
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("solid_{id}"));
+                let name = solid.name.clone().unwrap_or_else(|| format!("solid_{id}"));
                 if let Some(needle) = needle_lower.as_deref() {
                     if !name.to_lowercase().contains(needle) {
                         return None;
@@ -263,10 +257,7 @@ impl BRepModel {
                 let bbox = self.solid_world_bbox(id)?;
                 let distance = distance_from_datum(&datum, &bbox.center());
                 if distance <= radius {
-                    let name = solid
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("solid_{id}"));
+                    let name = solid.name.clone().unwrap_or_else(|| format!("solid_{id}"));
                     Some(PartProximity {
                         id,
                         name,
@@ -321,9 +312,15 @@ impl BRepModel {
         // AABB-gap surface-to-surface lower bound. Each axis
         // contributes `max(0, lhs.min - rhs.max, rhs.min - lhs.max)`,
         // i.e. zero when intervals overlap and otherwise the gap.
-        let gx = (bb_a.min.x - bb_b.max.x).max(bb_b.min.x - bb_a.max.x).max(0.0);
-        let gy = (bb_a.min.y - bb_b.max.y).max(bb_b.min.y - bb_a.max.y).max(0.0);
-        let gz = (bb_a.min.z - bb_b.max.z).max(bb_b.min.z - bb_a.max.z).max(0.0);
+        let gx = (bb_a.min.x - bb_b.max.x)
+            .max(bb_b.min.x - bb_a.max.x)
+            .max(0.0);
+        let gy = (bb_a.min.y - bb_b.max.y)
+            .max(bb_b.min.y - bb_a.max.y)
+            .max(0.0);
+        let gz = (bb_a.min.z - bb_b.max.z)
+            .max(bb_b.min.z - bb_a.max.z)
+            .max(0.0);
         let surface_to_surface = (gx * gx + gy * gy + gz * gz).sqrt();
 
         // Direction unit vector. Numerical floor of 1e-12 — anything
@@ -453,11 +450,27 @@ impl BRepModel {
     /// does (cache-warming).
     pub fn oriented_bbox_for(&mut self, solid_id: SolidId) -> Option<OrientedBBox> {
         let mp = self.mass_properties_for(solid_id)?;
-        let com = Point3::new(mp.center_of_mass[0], mp.center_of_mass[1], mp.center_of_mass[2]);
+        let com = Point3::new(
+            mp.center_of_mass[0],
+            mp.center_of_mass[1],
+            mp.center_of_mass[2],
+        );
         let axes_world = [
-            Vector3::new(mp.principal_axes[0][0], mp.principal_axes[0][1], mp.principal_axes[0][2]),
-            Vector3::new(mp.principal_axes[1][0], mp.principal_axes[1][1], mp.principal_axes[1][2]),
-            Vector3::new(mp.principal_axes[2][0], mp.principal_axes[2][1], mp.principal_axes[2][2]),
+            Vector3::new(
+                mp.principal_axes[0][0],
+                mp.principal_axes[0][1],
+                mp.principal_axes[0][2],
+            ),
+            Vector3::new(
+                mp.principal_axes[1][0],
+                mp.principal_axes[1][1],
+                mp.principal_axes[1][2],
+            ),
+            Vector3::new(
+                mp.principal_axes[2][0],
+                mp.principal_axes[2][1],
+                mp.principal_axes[2][2],
+            ),
         ];
 
         // Walk every vertex referenced by the outer shell and project
@@ -506,9 +519,7 @@ impl BRepModel {
         }
 
         // No vertices reachable → OBB undefined.
-        if min_proj.iter().any(|v| !v.is_finite())
-            || max_proj.iter().any(|v| !v.is_finite())
-        {
+        if min_proj.iter().any(|v| !v.is_finite()) || max_proj.iter().any(|v| !v.is_finite()) {
             return None;
         }
 
@@ -560,8 +571,7 @@ impl BRepModel {
 
         // Adjacent faces are tracked on `Face::adjacent_faces` keyed by
         // shared edge.
-        let neighbour_face_ids: Vec<u32> =
-            face_clone.adjacent_faces.values().copied().collect();
+        let neighbour_face_ids: Vec<u32> = face_clone.adjacent_faces.values().copied().collect();
 
         // Find host solid by scanning shells. O(N · F) on first call
         // but face-querying is rare and the model has hundreds of
@@ -624,8 +634,7 @@ impl BRepModel {
             .map(|v| v.point())
             .unwrap_or(Point3::ORIGIN);
 
-        let tolerance =
-            crate::math::tolerance::Tolerance::from_distance(edge_clone.tolerance);
+        let tolerance = crate::math::tolerance::Tolerance::from_distance(edge_clone.tolerance);
         let edge = self.edges.get_mut(edge_id)?;
         let length = edge.length(&self.curves, tolerance).ok();
 
@@ -805,12 +814,7 @@ impl BRepModel {
     /// Collect the K nearest other solids, ordered by ascending bbox-
     /// center distance. Self is excluded; ties are broken by ascending
     /// solid id for deterministic output.
-    fn compute_neighbors(
-        &self,
-        self_id: SolidId,
-        center: &Point3,
-        k: usize,
-    ) -> Vec<PartProximity> {
+    fn compute_neighbors(&self, self_id: SolidId, center: &Point3, k: usize) -> Vec<PartProximity> {
         if k == 0 {
             return Vec::new();
         }
@@ -1028,7 +1032,9 @@ mod tests {
         // the analytical answer is 24. Volume-correctness tests at
         // tighter tolerances belong in the kernel volume code and
         // in `tests/kernel_workflow_regression.rs`.
-        let v = report.volume.expect("volume should be defined for closed box");
+        let v = report
+            .volume
+            .expect("volume should be defined for closed box");
         assert!(
             (v - 24.0).abs() < 1e-6,
             "expected box(2,3,4) volume = 24, got {}",
@@ -1066,7 +1072,12 @@ mod tests {
         }
         // Pick the first box; neighbors should be the other two,
         // distance-sorted (5 < 10).
-        let first_id = model.solids.iter().map(|(id, _)| id).min().expect("first id");
+        let first_id = model
+            .solids
+            .iter()
+            .map(|(id, _)| id)
+            .min()
+            .expect("first id");
         let report = model.query_part(first_id).expect("part report");
         assert!(report.neighbors.iter().all(|n| n.id != first_id));
         assert_eq!(report.neighbors.len(), 2);
@@ -1120,7 +1131,9 @@ mod tests {
             tolerance: None,
         };
         let second = BoxPrimitive::create(params, &mut model).expect("second box");
-        model.reanchor_part(second, front_id, None).expect("reanchor");
+        model
+            .reanchor_part(second, front_id, None)
+            .expect("reanchor");
 
         let filter_origin = ListPartsFilter {
             anchor_datum_id: Some(0),
@@ -1185,10 +1198,7 @@ mod tests {
         assert_eq!(front.kind, "plane");
         assert_eq!(front.subkind, "xy");
         // Z-Axis subkind is "z".
-        let z_axis = datums
-            .iter()
-            .find(|d| d.name == "Z-Axis")
-            .expect("Z-Axis");
+        let z_axis = datums.iter().find(|d| d.name == "Z-Axis").expect("Z-Axis");
         assert_eq!(z_axis.kind, "axis");
         assert_eq!(z_axis.subkind, "z");
     }
@@ -1198,7 +1208,12 @@ mod tests {
         let model = BRepModel::new();
         let datums = model.list_datums();
         for w in datums.windows(2) {
-            assert!(w[0].id < w[1].id, "datums not sorted: {} >= {}", w[0].id, w[1].id);
+            assert!(
+                w[0].id < w[1].id,
+                "datums not sorted: {} >= {}",
+                w[0].id,
+                w[1].id
+            );
         }
     }
 
@@ -1328,8 +1343,7 @@ mod tests {
                 transform: Some(translation),
                 tolerance: None,
             };
-            BoxPrimitive::create(params, &mut model)
-                .unwrap_or_else(|_| panic!("box {}", i));
+            BoxPrimitive::create(params, &mut model).unwrap_or_else(|_| panic!("box {}", i));
         }
         let hits = model.parts_near_datum(0, 10.0);
         assert_eq!(hits.len(), 3);
@@ -1543,15 +1557,7 @@ mod tests {
     #[test]
     fn reanchor_part_changes_anchor_datum_id() {
         let (mut model, id) = fresh_model_with_box();
-        assert_eq!(
-            model
-                .solids
-                .get(id)
-                .expect("solid")
-                .anchor
-                .datum_id,
-            0
-        );
+        assert_eq!(model.solids.get(id).expect("solid").anchor.datum_id, 0);
 
         let front_id = model
             .datums
@@ -1563,12 +1569,7 @@ mod tests {
 
         model.reanchor_part(id, front_id, None).expect("reanchor");
         assert_eq!(
-            model
-                .solids
-                .get(id)
-                .expect("solid")
-                .anchor
-                .datum_id,
+            model.solids.get(id).expect("solid").anchor.datum_id,
             front_id
         );
     }
@@ -1576,12 +1577,7 @@ mod tests {
     #[test]
     fn reanchor_part_preserves_local_transform_when_offset_none() {
         let (mut model, id) = fresh_model_with_box();
-        let original_local = model
-            .solids
-            .get(id)
-            .expect("solid")
-            .anchor
-            .local_transform;
+        let original_local = model.solids.get(id).expect("solid").anchor.local_transform;
 
         let front_id = model
             .datums
@@ -1592,12 +1588,7 @@ mod tests {
             .id;
 
         model.reanchor_part(id, front_id, None).expect("reanchor");
-        let after = model
-            .solids
-            .get(id)
-            .expect("solid")
-            .anchor
-            .local_transform;
+        let after = model.solids.get(id).expect("solid").anchor.local_transform;
         for r in 0..4 {
             for c in 0..4 {
                 let lhs = original_local.get(r, c);
@@ -1623,12 +1614,7 @@ mod tests {
             .reanchor_part(id, front_id, Some(offset))
             .expect("reanchor with offset");
 
-        let after = model
-            .solids
-            .get(id)
-            .expect("solid")
-            .anchor
-            .local_transform;
+        let after = model.solids.get(id).expect("solid").anchor.local_transform;
         assert!((after.get(0, 3) - 1.0).abs() < 1e-9);
         assert!((after.get(1, 3) - 2.0).abs() < 1e-9);
         assert!((after.get(2, 3) - 3.0).abs() < 1e-9);

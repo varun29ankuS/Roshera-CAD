@@ -17,12 +17,9 @@
 use std::sync::{Arc, Mutex};
 
 use geometry_engine::math::{BBox, Matrix4, Point3, Tolerance, Vector3};
-use geometry_engine::operations::recorder::{
-    OperationRecorder, RecordedOperation, RecorderError,
-};
+use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
 use geometry_engine::operations::{
-    boolean_operation, transform_solid, BooleanOp, BooleanOptions, OperationError,
-    TransformOptions,
+    boolean_operation, transform_solid, BooleanOp, BooleanOptions, OperationError, TransformOptions,
 };
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
@@ -591,12 +588,7 @@ fn reanchor_solid_updates_anchor_metadata() {
 fn reanchor_to_unknown_datum_returns_error_and_preserves_anchor() {
     let mut model = BRepModel::new();
     let id = make_box(&mut model, 1.0, 1.0, 1.0);
-    let original_datum = model
-        .solids
-        .get(id)
-        .expect("solid present")
-        .anchor
-        .datum_id;
+    let original_datum = model.solids.get(id).expect("solid present").anchor.datum_id;
 
     let result = model.reanchor_solid(id, 9999, None);
     assert!(result.is_err(), "reanchor to nonexistent datum must fail");
@@ -727,8 +719,7 @@ fn cone_inertia_matches_analytical_formula() {
 
     let m = mp.mass;
     let i_axial = 0.3 * m * radius * radius;
-    let i_radial =
-        (3.0 / 20.0) * m * radius * radius + (3.0 / 80.0) * m * height * height;
+    let i_radial = (3.0 / 20.0) * m * radius * radius + (3.0 / 80.0) * m * height * height;
     // Principal moments sorted DESCENDING; expected too.
     let mut expected = [i_radial, i_radial, i_axial];
     expected.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
@@ -758,15 +749,11 @@ fn principal_axes_are_orthonormal_for_every_primitive() {
         ),
         (
             "cylinder",
-            Box::new(|m: &mut BRepModel| {
-                make_cylinder(m, Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
-            }),
+            Box::new(|m: &mut BRepModel| make_cylinder(m, Point3::ORIGIN, Vector3::Z, 2.0, 5.0)),
         ),
         (
             "cone",
-            Box::new(|m: &mut BRepModel| {
-                make_cone(m, Point3::ORIGIN, Vector3::Z, 2.0, 6.0)
-            }),
+            Box::new(|m: &mut BRepModel| make_cone(m, Point3::ORIGIN, Vector3::Z, 2.0, 6.0)),
         ),
     ];
 
@@ -832,15 +819,11 @@ fn principal_axes_and_moments_satisfy_eigenequation() {
         ),
         (
             "cylinder",
-            Box::new(|m: &mut BRepModel| {
-                make_cylinder(m, Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
-            }),
+            Box::new(|m: &mut BRepModel| make_cylinder(m, Point3::ORIGIN, Vector3::Z, 2.0, 5.0)),
         ),
         (
             "cone",
-            Box::new(|m: &mut BRepModel| {
-                make_cone(m, Point3::ORIGIN, Vector3::Z, 2.0, 6.0)
-            }),
+            Box::new(|m: &mut BRepModel| make_cone(m, Point3::ORIGIN, Vector3::Z, 2.0, 6.0)),
         ),
     ];
 
@@ -929,10 +912,7 @@ fn mass_props_method_discriminates_analytical_vs_tessellated() {
         .mass_properties_for(sphere_id)
         .expect("sphere mass props must resolve");
     assert!(
-        matches!(
-            sphere_mp.method,
-            MassPropertiesMethod::Tessellated { .. }
-        ),
+        matches!(sphere_mp.method, MassPropertiesMethod::Tessellated { .. }),
         "sphere must use the tessellated path, got {:?}",
         sphere_mp.method
     );

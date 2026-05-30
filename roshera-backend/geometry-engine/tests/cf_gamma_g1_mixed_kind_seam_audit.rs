@@ -326,8 +326,8 @@ fn audit_documents_residual_for_legacy_c0_path() {
 fn audit_returns_empty_for_unblended_box() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
-    let report = audit_mixed_kind_seam_continuity(&model, solid_id)
-        .expect("unblended box audit succeeds");
+    let report =
+        audit_mixed_kind_seam_continuity(&model, solid_id).expect("unblended box audit succeeds");
     assert!(
         report.is_empty(),
         "unblended box must yield zero seam residual records; got {}",

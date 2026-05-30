@@ -638,17 +638,25 @@ mod tests {
 
         // Soft mode (REQUIRE_AUTH unset): always permitted, even
         // for anonymous identities. Preserves dev-frontend compat.
-        assert!(enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok());
+        assert!(
+            enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok()
+        );
         assert!(enforce_permission(&anon, Permission::ModifyGeometry, "modify_geometry").is_ok());
 
         // Strict mode (REQUIRE_AUTH=1): permission must be present.
         std::env::set_var("ROSHERA_REQUIRE_AUTH", "1");
-        assert!(enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok());
+        assert!(
+            enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok()
+        );
         let denied = enforce_permission(&anon, Permission::ModifyGeometry, "modify_geometry");
-        assert!(denied.is_err(), "strict mode must reject anonymous mutation");
+        assert!(
+            denied.is_err(),
+            "strict mode must reject anonymous mutation"
+        );
         // Mismatched permission also rejects: holding ModifyGeometry
         // does not grant DeleteGeometry.
-        let mismatched = enforce_permission(&granted, Permission::DeleteGeometry, "delete_geometry");
+        let mismatched =
+            enforce_permission(&granted, Permission::DeleteGeometry, "delete_geometry");
         assert!(
             mismatched.is_err(),
             "strict mode must reject when the held scope differs from the required scope"

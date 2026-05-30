@@ -34,9 +34,7 @@
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::blend_graph::{self, BlendRadius};
 use geometry_engine::operations::edge_classification::find_adjacent_faces;
-use geometry_engine::operations::spine_solver::{
-    solve_spine_for_chain, SolverKind, SpineOptions,
-};
+use geometry_engine::operations::spine_solver::{solve_spine_for_chain, SolverKind, SpineOptions};
 use geometry_engine::primitives::curve::{Arc, Line};
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::face::FaceId;

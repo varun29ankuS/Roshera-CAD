@@ -167,10 +167,7 @@ pub fn intersect_polygons(
             if contour.len() < 3 {
                 continue;
             }
-            let region: Vec<Point2d> = contour
-                .iter()
-                .map(|p| Point2d::new(p[0], p[1]))
-                .collect();
+            let region: Vec<Point2d> = contour.iter().map(|p| Point2d::new(p[0], p[1])).collect();
             regions.push(region);
         }
     }

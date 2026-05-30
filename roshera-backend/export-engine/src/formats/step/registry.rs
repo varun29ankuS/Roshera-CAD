@@ -47,10 +47,7 @@ impl EntityKind {
     pub fn primary_name(&self) -> &str {
         match self {
             EntityKind::Simple(rec) => rec.name.as_str(),
-            EntityKind::Complex(recs) => recs
-                .first()
-                .map(|r| r.name.as_str())
-                .unwrap_or(""),
+            EntityKind::Complex(recs) => recs.first().map(|r| r.name.as_str()).unwrap_or(""),
         }
     }
 }

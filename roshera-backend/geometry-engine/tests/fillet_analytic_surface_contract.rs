@@ -322,13 +322,19 @@ fn explicit_tolerance_override_changes_classification() {
     let rail = solve_single_edge(&mut model, edge_id, schedule, &options);
 
     // Permissive tolerance (10× the gap) → constant → Cylindrical.
-    let permissive = Tolerance::new(options.tolerance.distance() * 100.0, options.tolerance.angle());
+    let permissive = Tolerance::new(
+        options.tolerance.distance() * 100.0,
+        options.tolerance.angle(),
+    );
     assert_eq!(
         BlendSurfaceCarrier::from_spine_rail(&rail, &permissive),
         BlendSurfaceCarrier::Cylindrical
     );
     // Strict tolerance (1/100 of the gap) → variable → GeneralNurbs.
-    let strict = Tolerance::new(options.tolerance.distance() / 100.0, options.tolerance.angle());
+    let strict = Tolerance::new(
+        options.tolerance.distance() / 100.0,
+        options.tolerance.angle(),
+    );
     assert_eq!(
         BlendSurfaceCarrier::from_spine_rail(&rail, &strict),
         BlendSurfaceCarrier::GeneralNurbs

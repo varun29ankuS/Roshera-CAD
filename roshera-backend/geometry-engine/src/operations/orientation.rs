@@ -181,10 +181,7 @@ mod tests {
             .expect("plane construction must succeed");
         // Both targets point +Z — caller bug.
         let result = orient_complementary_pair(&plane_a, Vector3::Z, &plane_b, Vector3::Z);
-        assert!(matches!(
-            result,
-            Err(OperationError::InvalidGeometry(_))
-        ));
+        assert!(matches!(result, Err(OperationError::InvalidGeometry(_))));
     }
 
     #[test]
@@ -193,9 +190,8 @@ mod tests {
             .expect("plane construction must succeed");
         let plane_b = Plane::from_point_normal(Point3::ZERO, Vector3::Z)
             .expect("plane construction must succeed");
-        let (a, b) =
-            orient_complementary_pair(&plane_a, Vector3::Z, &plane_b, -Vector3::Z)
-                .expect("opposite targets must be accepted");
+        let (a, b) = orient_complementary_pair(&plane_a, Vector3::Z, &plane_b, -Vector3::Z)
+            .expect("opposite targets must be accepted");
         assert_eq!(a, FaceOrientation::Forward);
         assert_eq!(b, FaceOrientation::Backward);
     }

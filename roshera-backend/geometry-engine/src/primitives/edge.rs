@@ -914,7 +914,9 @@ impl EdgeStore {
         // the cylinder-rim fillet to leave the retired rim edge
         // visible to topology queries even though `remove` had been
         // called.
-        self.edges.get(id as usize).filter(|e| e.id != INVALID_EDGE_ID)
+        self.edges
+            .get(id as usize)
+            .filter(|e| e.id != INVALID_EDGE_ID)
     }
 
     /// Get mutable edge by ID
@@ -1187,8 +1189,14 @@ mod tests {
 
     #[test]
     fn orientation_flipped_swaps_direction() {
-        assert_eq!(EdgeOrientation::Forward.flipped(), EdgeOrientation::Backward);
-        assert_eq!(EdgeOrientation::Backward.flipped(), EdgeOrientation::Forward);
+        assert_eq!(
+            EdgeOrientation::Forward.flipped(),
+            EdgeOrientation::Backward
+        );
+        assert_eq!(
+            EdgeOrientation::Backward.flipped(),
+            EdgeOrientation::Forward
+        );
     }
 
     #[test]
@@ -1265,14 +1273,7 @@ mod tests {
 
     #[test]
     fn edge_new_with_tolerance_auto_range_preserves_tolerance() {
-        let e = Edge::new_with_tolerance_auto_range(
-            0,
-            1,
-            2,
-            0,
-            EdgeOrientation::Forward,
-            3e-7,
-        );
+        let e = Edge::new_with_tolerance_auto_range(0, 1, 2, 0, EdgeOrientation::Forward, 3e-7);
         assert_eq!(e.tolerance, 3e-7);
         assert_eq!(e.param_range.start, 0.0);
         assert_eq!(e.param_range.end, 1.0);
@@ -1285,14 +1286,7 @@ mod tests {
         // Pinning this stops a future refactor of the shim from
         // silently changing the value at the ~90 call sites that have
         // not yet been migrated to new_with_tolerance.
-        let e_via_shim = Edge::new(
-            0,
-            1,
-            2,
-            0,
-            EdgeOrientation::Forward,
-            ParameterRange::unit(),
-        );
+        let e_via_shim = Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit());
         let e_explicit = Edge::new_with_tolerance(
             0,
             1,
@@ -1374,7 +1368,12 @@ mod tests {
         for &t in &[0.0, 0.25, 0.5, 0.75, 1.0] {
             let u = e.edge_to_curve_parameter(t);
             let round_trip = e.curve_to_edge_parameter(u);
-            assert!((round_trip - t).abs() < 1e-12, "t={} round trip={}", t, round_trip);
+            assert!(
+                (round_trip - t).abs() < 1e-12,
+                "t={} round trip={}",
+                t,
+                round_trip
+            );
         }
     }
 
@@ -1399,7 +1398,14 @@ mod tests {
     #[test]
     fn edge_evaluate_forward_line_matches_lerp() {
         let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let p_start = e.evaluate(0.0, &cs).expect("eval");
         let p_mid = e.evaluate(0.5, &cs).expect("eval");
         let p_end = e.evaluate(1.0, &cs).expect("eval");
@@ -1411,7 +1417,14 @@ mod tests {
     #[test]
     fn edge_evaluate_backward_line_reverses_endpoints() {
         let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Backward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Backward,
+            ParameterRange::unit(),
+        );
         let p0 = e.evaluate(0.0, &cs).expect("eval");
         let p1 = e.evaluate(1.0, &cs).expect("eval");
         assert!((p0.x - 10.0).abs() < 1e-12);
@@ -1421,14 +1434,28 @@ mod tests {
     #[test]
     fn edge_evaluate_returns_err_for_invalid_curve_id() {
         let cs = CurveStore::new();
-        let e = Edge::new(0, 1, 2, 99, EdgeOrientation::Forward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            99,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         assert!(e.evaluate(0.5, &cs).is_err());
     }
 
     #[test]
     fn edge_tangent_at_forward_line_points_along_direction() {
         let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let tan = e.tangent_at(0.5, &cs).expect("tan");
         // Curve::tangent_at returns the unit tangent of the underlying curve.
         // Line is along +x, so unit tangent = (1, 0, 0).
@@ -1440,7 +1467,14 @@ mod tests {
     #[test]
     fn edge_tangent_at_backward_line_reverses_sign() {
         let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 0.0, 0.0));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Backward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Backward,
+            ParameterRange::unit(),
+        );
         let tan = e.tangent_at(0.5, &cs).expect("tan");
         assert!((tan.x + 1.0).abs() < 1e-12, "got {}", tan.x);
     }
@@ -1450,7 +1484,14 @@ mod tests {
     #[test]
     fn edge_length_of_unit_line_segment_is_segment_length() {
         let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(3.0, 4.0, 0.0));
-        let mut e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let mut e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let len = e.length(&cs, Tolerance::from_distance(1e-6)).expect("len");
         assert!((len - 5.0).abs() < 1e-6, "got {}", len);
     }
@@ -1458,7 +1499,14 @@ mod tests {
     #[test]
     fn edge_length_caches_result() {
         let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0));
-        let mut e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let mut e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let _ = e.length(&cs, Tolerance::from_distance(1e-6)).expect("len");
         // After first call, cached_length should be non-NaN.
         assert!(!e.cached_length.is_nan());
@@ -1480,7 +1528,14 @@ mod tests {
         .expect("arc");
         let mut cs = CurveStore::new();
         let cid = cs.add(Box::new(arc));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let arc_len = e
             .compute_arc_length(&cs, Tolerance::from_distance(1e-6))
             .expect("arc len");
@@ -1489,15 +1544,18 @@ mod tests {
 
     #[test]
     fn edge_compute_arc_length_full_circle_is_two_pi() {
-        let circle = Arc::circle(
-            Point3::new(0.0, 0.0, 0.0),
-            Vector3::new(0.0, 0.0, 1.0),
-            1.0,
-        )
-        .expect("circle");
+        let circle = Arc::circle(Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0), 1.0)
+            .expect("circle");
         let mut cs = CurveStore::new();
         let cid = cs.add(Box::new(circle));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let len = e
             .compute_arc_length(&cs, Tolerance::from_distance(1e-6))
             .expect("len");
@@ -1572,31 +1630,48 @@ mod tests {
     #[test]
     fn edge_tessellate_line_returns_two_endpoints() {
         let (cs, cid) = line_store(Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let pts = e
             .tessellate(&cs, Tolerance::from_distance(1e-3), FRAC_PI_2)
             .expect("tess");
-        assert!(pts.len() >= 2, "tessellation must produce at least the endpoints");
+        assert!(
+            pts.len() >= 2,
+            "tessellation must produce at least the endpoints"
+        );
         assert!((pts.first().expect("first").x - 0.0).abs() < 1e-6);
         assert!((pts.last().expect("last").x - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn edge_tessellate_arc_subdivides_for_curvature() {
-        let arc = Arc::circle(
-            Point3::new(0.0, 0.0, 0.0),
-            Vector3::new(0.0, 0.0, 1.0),
-            1.0,
-        )
-        .expect("circle");
+        let arc = Arc::circle(Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0), 1.0)
+            .expect("circle");
         let mut cs = CurveStore::new();
         let cid = cs.add(Box::new(arc));
-        let e = Edge::new(0, 1, 2, cid, EdgeOrientation::Forward, ParameterRange::unit());
+        let e = Edge::new(
+            0,
+            1,
+            2,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let pts = e
             .tessellate(&cs, Tolerance::from_distance(1e-2), 0.1)
             .expect("tess");
         // Tight angle tolerance forces many subdivisions.
-        assert!(pts.len() > 8, "expected multi-segment circle tessellation, got {}", pts.len());
+        assert!(
+            pts.len() > 8,
+            "expected multi-segment circle tessellation, got {}",
+            pts.len()
+        );
     }
 
     // ---- compute_continuity ------------------------------------------------
@@ -1604,8 +1679,22 @@ mod tests {
     #[test]
     fn compute_continuity_returns_unknown_for_unknown_curve_ids() {
         let cs = CurveStore::new();
-        let a = Edge::new(0, 1, 2, 99, EdgeOrientation::Forward, ParameterRange::unit());
-        let b = Edge::new(1, 2, 3, 99, EdgeOrientation::Forward, ParameterRange::unit());
+        let a = Edge::new(
+            0,
+            1,
+            2,
+            99,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
+        let b = Edge::new(
+            1,
+            2,
+            3,
+            99,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         let c = a.compute_continuity(&b, 2, &cs, Tolerance::from_distance(1e-6));
         assert!(matches!(c, Continuity::Unknown));
     }
@@ -1622,8 +1711,22 @@ mod tests {
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
         )));
-        let a = Edge::new(0, 1, 2, cid_a, EdgeOrientation::Forward, ParameterRange::unit());
-        let b = Edge::new(1, 2, 3, cid_b, EdgeOrientation::Forward, ParameterRange::unit());
+        let a = Edge::new(
+            0,
+            1,
+            2,
+            cid_a,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
+        let b = Edge::new(
+            1,
+            2,
+            3,
+            cid_b,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        );
         // Shared vertex = vertex 2; edge a ends at it, edge b starts at it.
         let c = a.compute_continuity(&b, 2, &cs, Tolerance::new(1e-6, 1e-3));
         assert!(matches!(c, Continuity::G0), "got {:?}", c);
@@ -1641,8 +1744,22 @@ mod tests {
     #[test]
     fn edge_store_add_assigns_sequential_ids() {
         let mut s = EdgeStore::new();
-        let a = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
-        let b = s.add(Edge::new(0, 2, 3, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let a = s.add(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let b = s.add(Edge::new(
+            0,
+            2,
+            3,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         assert_eq!(s.len(), 2);
@@ -1652,7 +1769,14 @@ mod tests {
     #[test]
     fn edge_store_get_returns_added_edge() {
         let mut s = EdgeStore::new();
-        let id = s.add(Edge::new(0, 5, 7, 11, EdgeOrientation::Backward, ParameterRange::unit()));
+        let id = s.add(Edge::new(
+            0,
+            5,
+            7,
+            11,
+            EdgeOrientation::Backward,
+            ParameterRange::unit(),
+        ));
         let e = s.get(id).expect("edge");
         assert_eq!(e.start_vertex, 5);
         assert_eq!(e.end_vertex, 7);
@@ -1669,7 +1793,14 @@ mod tests {
     #[test]
     fn edge_store_get_mut_allows_mutation() {
         let mut s = EdgeStore::new();
-        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let id = s.add(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         if let Some(e) = s.get_mut(id) {
             e.tolerance = 5e-9;
         }
@@ -1713,16 +1844,37 @@ mod tests {
     fn edge_store_find_edge_between_none_for_unindexed() {
         let mut s = EdgeStore::new();
         // add() bypasses indexing, so cache is empty.
-        s.add(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        s.add(Edge::new(
+            0,
+            5,
+            7,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         assert_eq!(s.find_edge_between(5, 7), None);
     }
 
     #[test]
     fn edge_store_add_or_find_dedups_on_same_vertex_pair() {
         let mut s = EdgeStore::new();
-        let a = s.add_or_find(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let a = s.add_or_find(Edge::new(
+            0,
+            5,
+            7,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         // Reverse vertex order also matches.
-        let b = s.add_or_find(Edge::new(0, 7, 5, 0, EdgeOrientation::Backward, ParameterRange::unit()));
+        let b = s.add_or_find(Edge::new(
+            0,
+            7,
+            5,
+            0,
+            EdgeOrientation::Backward,
+            ParameterRange::unit(),
+        ));
         assert_eq!(a, b);
         assert_eq!(s.len(), 1);
     }
@@ -1730,8 +1882,22 @@ mod tests {
     #[test]
     fn edge_store_add_or_find_creates_new_for_distinct_pair() {
         let mut s = EdgeStore::new();
-        let a = s.add_or_find(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
-        let b = s.add_or_find(Edge::new(0, 5, 9, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let a = s.add_or_find(Edge::new(
+            0,
+            5,
+            7,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let b = s.add_or_find(Edge::new(
+            0,
+            5,
+            9,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         assert_ne!(a, b);
         assert_eq!(s.len(), 2);
     }
@@ -1778,9 +1944,30 @@ mod tests {
     #[test]
     fn edge_store_iter_skips_removed_edges() {
         let mut s = EdgeStore::new();
-        let a = s.add_with_indexing(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
-        let b = s.add_with_indexing(Edge::new(0, 2, 3, 0, EdgeOrientation::Forward, ParameterRange::unit()));
-        let _c = s.add_with_indexing(Edge::new(0, 3, 4, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let a = s.add_with_indexing(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let b = s.add_with_indexing(Edge::new(
+            0,
+            2,
+            3,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let _c = s.add_with_indexing(Edge::new(
+            0,
+            3,
+            4,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         s.remove(b);
         let live: Vec<EdgeId> = s.iter().map(|(_, e)| e.id).collect();
         assert!(live.contains(&a));
@@ -1791,8 +1978,22 @@ mod tests {
     #[test]
     fn edge_store_edges_on_curve_indexed() {
         let mut s = EdgeStore::new();
-        let a = s.add_with_indexing(Edge::new(0, 1, 2, 7, EdgeOrientation::Forward, ParameterRange::unit()));
-        let b = s.add_with_indexing(Edge::new(0, 2, 3, 7, EdgeOrientation::Forward, ParameterRange::unit()));
+        let a = s.add_with_indexing(Edge::new(
+            0,
+            1,
+            2,
+            7,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let b = s.add_with_indexing(Edge::new(
+            0,
+            2,
+            3,
+            7,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         let edges = s.edges_on_curve(7);
         assert!(edges.contains(&a));
         assert!(edges.contains(&b));
@@ -1807,7 +2008,14 @@ mod tests {
     #[test]
     fn edge_store_set_tolerance_persists() {
         let mut s = EdgeStore::new();
-        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let id = s.add(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         assert!(s.set_tolerance(id, 1e-10));
         assert!((s.get(id).expect("edge").tolerance - 1e-10).abs() < 1e-22);
     }
@@ -1828,8 +2036,22 @@ mod tests {
     fn edge_store_edges_at_vertex_falls_back_to_linear_scan() {
         let mut s = EdgeStore::new();
         // Use add() which skips indexing.
-        let a = s.add(Edge::new(0, 5, 7, 0, EdgeOrientation::Forward, ParameterRange::unit()));
-        let _b = s.add(Edge::new(0, 8, 9, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let a = s.add(Edge::new(
+            0,
+            5,
+            7,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        let _b = s.add(Edge::new(
+            0,
+            8,
+            9,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         let hits = s.edges_at_vertex(5);
         assert_eq!(hits, vec![a]);
     }
@@ -1871,8 +2093,8 @@ mod tests {
 
     #[test]
     fn edge_pcurve_for_face_returns_match() {
-        use crate::primitives::p_curve::{PCurve, PCurve2dKind, PCurveStore};
         use crate::math::Point2;
+        use crate::primitives::p_curve::{PCurve, PCurve2dKind, PCurveStore};
 
         let mut store = PCurveStore::new();
         let pid_a = store
@@ -1920,7 +2142,14 @@ mod tests {
     #[test]
     fn edge_store_attach_pcurve_succeeds_on_valid_edge() {
         let mut s = EdgeStore::new();
-        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let id = s.add(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         assert!(s.attach_pcurve(id, 42));
         assert_eq!(s.get(id).expect("edge").pcurves, vec![42]);
     }
@@ -1950,7 +2179,14 @@ mod tests {
     #[test]
     fn edge_store_set_pcurves_replaces_entire_list() {
         let mut s = EdgeStore::new();
-        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let id = s.add(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         assert!(s.attach_pcurve(id, 1));
         assert!(s.attach_pcurve(id, 2));
         assert!(s.set_pcurves(id, vec![10, 20, 30]));
@@ -1960,7 +2196,14 @@ mod tests {
     #[test]
     fn edge_store_clear_pcurves_empties_list() {
         let mut s = EdgeStore::new();
-        let id = s.add(Edge::new(0, 1, 2, 0, EdgeOrientation::Forward, ParameterRange::unit()));
+        let id = s.add(Edge::new(
+            0,
+            1,
+            2,
+            0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
         assert!(s.attach_pcurve(id, 1));
         assert!(s.clear_pcurves(id));
         assert!(s.get(id).expect("edge").pcurves.is_empty());

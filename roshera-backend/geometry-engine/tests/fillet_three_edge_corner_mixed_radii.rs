@@ -85,9 +85,7 @@ use blend_fixtures::{edges_at_vertex, make_cube, shell_census, vertex_at};
 
 use geometry_engine::operations::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
 use geometry_engine::operations::fillet::{FilletType, PropagationMode};
-use geometry_engine::operations::{
-    fillet_edges, CommonOptions, FilletOptions, OperationError,
-};
+use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions, OperationError};
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
@@ -186,7 +184,8 @@ fn drive_corner_fillet(
         ..Default::default()
     };
 
-    fillet_edges(&mut model, solid_id, corner_edges, opts).map(|face_ids| (model, solid_id, face_ids))
+    fillet_edges(&mut model, solid_id, corner_edges, opts)
+        .map(|face_ids| (model, solid_id, face_ids))
 }
 
 /// Drive `fillet_edges` at the (+x,+y,+z) corner with one radius per
@@ -322,9 +321,7 @@ fn equal_radii_corner_tessellates_to_finite_mesh() {
     // Every vertex coordinate must be finite (no NaN, no ±∞).
     for (idx, v) in mesh.vertices.iter().enumerate() {
         assert!(
-            v.position.x.is_finite()
-                && v.position.y.is_finite()
-                && v.position.z.is_finite(),
+            v.position.x.is_finite() && v.position.y.is_finite() && v.position.z.is_finite(),
             "mesh vertex {} has non-finite position {:?}",
             idx,
             v.position

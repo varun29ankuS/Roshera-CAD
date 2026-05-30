@@ -97,11 +97,7 @@ impl ChunkType {
     pub fn should_encrypt(&self) -> bool {
         matches!(
             self,
-            ChunkType::GEOM
-                | ChunkType::TOPO
-                | ChunkType::FEAT
-                | ChunkType::HIST
-                | ChunkType::PROV
+            ChunkType::GEOM | ChunkType::TOPO | ChunkType::FEAT | ChunkType::HIST | ChunkType::PROV
         )
     }
 }

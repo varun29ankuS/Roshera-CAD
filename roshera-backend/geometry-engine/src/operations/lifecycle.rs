@@ -96,10 +96,7 @@ pub enum OpSpec<'a> {
         partial_corner_vertices: &'a [VertexId],
     },
     /// `boolean_operation(solid_a, solid_b, …)`.
-    Boolean {
-        solid_a: SolidId,
-        solid_b: SolidId,
-    },
+    Boolean { solid_a: SolidId, solid_b: SolidId },
     /// `extrude_face(face_id, …)`.
     ExtrudeFace { face_id: FaceId },
     /// `extrude_profile(profile_edges, …)`.
@@ -171,12 +168,7 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             // explicit opt-in.
             let effective_partial =
                 effective_partial_corner_vertices(model, solid_id, partial_corner_vertices);
-            validate_corner_compatibility(
-                model,
-                edges,
-                BlendOpKind::Fillet,
-                &effective_partial,
-            )
+            validate_corner_compatibility(model, edges, BlendOpKind::Fillet, &effective_partial)
         }
         OpSpec::ChamferEdges {
             solid_id,
@@ -192,12 +184,7 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             // see the FilletEdges arm for the rationale.
             let effective_partial =
                 effective_partial_corner_vertices(model, solid_id, partial_corner_vertices);
-            validate_corner_compatibility(
-                model,
-                edges,
-                BlendOpKind::Chamfer,
-                &effective_partial,
-            )
+            validate_corner_compatibility(model, edges, BlendOpKind::Chamfer, &effective_partial)
         }
         OpSpec::Boolean { solid_a, solid_b } => {
             check_solid_exists(model, solid_a)?;
@@ -481,19 +468,18 @@ fn validate_mixed_kind_corner_feasibility(
         return Ok(());
     }
 
-    Err(OperationError::from(
-        BlendFailure::VertexBlendUnsupported {
-            vertex,
-            kind: crate::operations::blend_graph::BlendVertexKind::ConvexCorner { degree },
-            reason: crate::operations::diagnostics::VertexBlendUnsupportedReason::MixedKindUnsupported {
+    Err(OperationError::from(BlendFailure::VertexBlendUnsupported {
+        vertex,
+        kind: crate::operations::blend_graph::BlendVertexKind::ConvexCorner { degree },
+        reason:
+            crate::operations::diagnostics::VertexBlendUnsupportedReason::MixedKindUnsupported {
                 existing,
                 requested,
                 detail: crate::operations::diagnostics::MixedKindRejectDetail::DegreeUnsupported {
                     degree,
                 },
             },
-        },
-    ))
+    }))
 }
 
 /// CF-β.5.2-B — union the caller's explicit
@@ -666,9 +652,7 @@ fn validate_corner_compatibility(
     // correct rejection layer, not this pre-flight.
     match (op_kind, vertex_kind) {
         (_, Some(BlendVertexKind::ConvexCorner { degree: 3 })) => return Ok(()),
-        (BlendOpKind::Chamfer, Some(BlendVertexKind::ConvexCorner { degree }))
-            if degree >= 4 =>
-        {
+        (BlendOpKind::Chamfer, Some(BlendVertexKind::ConvexCorner { degree })) if degree >= 4 => {
             return Ok(());
         }
         _ => {}
@@ -760,7 +744,8 @@ mod tests {
         let before = topology_counts(&model);
         let result = with_rollback(&mut model, |m| {
             let mut builder = TopologyBuilder::new(m);
-            builder.create_box_3d(2.0, 2.0, 2.0)
+            builder
+                .create_box_3d(2.0, 2.0, 2.0)
                 .map_err(|e| OperationError::InternalError(format!("{:?}", e)))?;
             Ok(())
         });
@@ -790,9 +775,8 @@ mod tests {
     #[test]
     fn with_rollback_propagates_specific_error() {
         let mut model = build_unit_box();
-        let result: OperationResult<()> = with_rollback(&mut model, |_m| {
-            Err(OperationError::InvalidRadius(0.0))
-        });
+        let result: OperationResult<()> =
+            with_rollback(&mut model, |_m| Err(OperationError::InvalidRadius(0.0)));
         match result {
             Err(OperationError::InvalidRadius(r)) => assert_eq!(r, 0.0),
             other => panic!("expected InvalidRadius, got {:?}", other),
@@ -881,7 +865,12 @@ mod tests {
             .map(|(id, _)| id)
             .expect("box edge");
         let profiles = vec![vec![edge_id]];
-        let result = validate_can_apply(&model, OpSpec::LoftProfiles { profiles: &profiles });
+        let result = validate_can_apply(
+            &model,
+            OpSpec::LoftProfiles {
+                profiles: &profiles,
+            },
+        );
         assert!(matches!(result, Err(OperationError::InvalidInput { .. })));
     }
 
@@ -1094,16 +1083,10 @@ mod tests {
                     assert_eq!(requested, BlendKind::Fillet);
                     match detail {
                         MixedKindRejectDetail::DegreeUnsupported { .. } => {}
-                        other => panic!(
-                            "β.2 stub must carry DegreeUnsupported, got {:?}",
-                            other
-                        ),
+                        other => panic!("β.2 stub must carry DegreeUnsupported, got {:?}", other),
                     }
                 }
-                other => panic!(
-                    "expected MixedKindUnsupported reason, got {:?}",
-                    other
-                ),
+                other => panic!("expected MixedKindUnsupported reason, got {:?}", other),
             },
             other => panic!(
                 "expected BlendFailed carrying MixedKindUnsupported, got {:?}",
@@ -1145,8 +1128,7 @@ mod tests {
         // clears the conflict gate". Downstream validators may still
         // reject for unrelated reasons; that's not what's being
         // tested here.
-        let result =
-            validate_blend_conflict(&model, solid_id, &[edge], BlendKind::Fillet);
+        let result = validate_blend_conflict(&model, solid_id, &[edge], BlendKind::Fillet);
         assert!(
             result.is_ok(),
             "same-kind shared-vertex must clear validate_blend_conflict; \
@@ -1201,8 +1183,7 @@ mod tests {
             solid.record_blended_vertex(apex, BlendKind::Fillet);
         }
 
-        let result =
-            validate_blend_conflict(&model, solid_id, &[edge_id], BlendKind::Chamfer);
+        let result = validate_blend_conflict(&model, solid_id, &[edge_id], BlendKind::Chamfer);
         assert!(
             matches!(result, Err(OperationError::BlendFailed(_))),
             "end-vertex conflict must surface as BlendFailed; got {:?}",
@@ -1266,13 +1247,8 @@ mod tests {
             solid.record_blended_vertex(apex, BlendKind::Fillet);
         }
 
-        let err = validate_blend_conflict(
-            &model,
-            solid_id,
-            &[trigger_edge],
-            BlendKind::Chamfer,
-        )
-        .expect_err("cross-kind at degree-4 corner must reject");
+        let err = validate_blend_conflict(&model, solid_id, &[trigger_edge], BlendKind::Chamfer)
+            .expect_err("cross-kind at degree-4 corner must reject");
 
         let degree_at_apex = model
             .edges
@@ -1375,9 +1351,8 @@ mod tests {
         if let Some(solid) = model.solids.get_mut(solid_id) {
             solid.record_blended_edge(edge_id, BlendKind::Chamfer);
         }
-        let err =
-            validate_blend_conflict(&model, solid_id, &[edge_id], BlendKind::Fillet)
-                .expect_err("same-edge cross-kind must still reject");
+        let err = validate_blend_conflict(&model, solid_id, &[edge_id], BlendKind::Fillet)
+            .expect_err("same-edge cross-kind must still reject");
         match err {
             OperationError::InvalidInput { received, .. } => {
                 // Same-edge keeps the CF-α wording verbatim — "existing
@@ -1425,17 +1400,14 @@ mod tests {
         let degree_at_corner = model
             .edges
             .iter()
-            .filter(|(_, e)| {
-                e.start_vertex == corner_vertex || e.end_vertex == corner_vertex
-            })
+            .filter(|(_, e)| e.start_vertex == corner_vertex || e.end_vertex == corner_vertex)
             .count();
         assert_eq!(
             degree_at_corner, 3,
             "box corner is degree 3 by construction"
         );
         let trigger_edge = edge_incident_to(&model, corner_vertex);
-        let existing =
-            crate::primitives::solid::VertexBlendKindSet::single(BlendKind::Chamfer);
+        let existing = crate::primitives::solid::VertexBlendKindSet::single(BlendKind::Chamfer);
 
         validate_mixed_kind_corner_feasibility(
             &model,
@@ -1499,8 +1471,7 @@ mod tests {
             .find(|(_, e)| e.start_vertex == apex)
             .map(|(id, _)| id)
             .expect("apex has incident edges");
-        let existing =
-            crate::primitives::solid::VertexBlendKindSet::single(BlendKind::Chamfer);
+        let existing = crate::primitives::solid::VertexBlendKindSet::single(BlendKind::Chamfer);
 
         let err = validate_mixed_kind_corner_feasibility(
             &model,
@@ -1571,13 +1542,8 @@ mod tests {
         // All 3 corner edges in the selection: F5-α opens the gate
         // for a degree-3 convex corner without any partial-mixed
         // opt-in. This pins the baseline.
-        validate_corner_compatibility(
-            &model,
-            &corner_edges,
-            BlendOpKind::Fillet,
-            &[],
-        )
-        .expect("F5-α admits degree-3 convex corner without opt-in");
+        validate_corner_compatibility(&model, &corner_edges, BlendOpKind::Fillet, &[])
+            .expect("F5-α admits degree-3 convex corner without opt-in");
     }
 
     /// With `partial_corner_vertices` populated for the shared
@@ -1614,13 +1580,9 @@ mod tests {
         // Opt-in for an unrelated vertex → carve-out does NOT fire,
         // the gate hits the F2-γ.1 setback path and rejects with
         // NotImplemented (the standing F5-γ / F5-δ TODO).
-        let err = validate_corner_compatibility(
-            &model,
-            &pair,
-            BlendOpKind::Fillet,
-            &[other_vertex],
-        )
-        .expect_err("unrelated opt-in must not short-circuit the loop");
+        let err =
+            validate_corner_compatibility(&model, &pair, BlendOpKind::Fillet, &[other_vertex])
+                .expect_err("unrelated opt-in must not short-circuit the loop");
         assert!(
             matches!(err, OperationError::NotImplemented(_)),
             "expected NotImplemented from the setback path, got: {:?}",
@@ -1629,13 +1591,8 @@ mod tests {
 
         // Opt-in for the actual shared vertex → carve-out fires,
         // gate returns Ok early without touching the graph builder.
-        validate_corner_compatibility(
-            &model,
-            &pair,
-            BlendOpKind::Fillet,
-            &[shared_vertex],
-        )
-        .expect("opt-in for the shared vertex carves out the clash");
+        validate_corner_compatibility(&model, &pair, BlendOpKind::Fillet, &[shared_vertex])
+            .expect("opt-in for the shared vertex carves out the clash");
     }
 
     /// The opt-in is per-vertex: opting in for one corner does not
@@ -1665,22 +1622,12 @@ mod tests {
         // Opt-in for the shared vertex; the 3-edge selection clears
         // pre-flight because every shared-vertex pair targets the
         // opted-in vertex.
-        validate_corner_compatibility(
-            &model,
-            &corner_edges,
-            BlendOpKind::Fillet,
-            &[shared_vertex],
-        )
-        .expect("3-edge selection with all clashes at opted-in vertex clears");
+        validate_corner_compatibility(&model, &corner_edges, BlendOpKind::Fillet, &[shared_vertex])
+            .expect("3-edge selection with all clashes at opted-in vertex clears");
 
         // Same call with empty opt-in: F5-α returns Ok for degree-3
         // convex — pin that the contract is symmetric on this case.
-        validate_corner_compatibility(
-            &model,
-            &corner_edges,
-            BlendOpKind::Fillet,
-            &[],
-        )
-        .expect("F5-α admits 3-edge degree-3 convex selection without opt-in");
+        validate_corner_compatibility(&model, &corner_edges, BlendOpKind::Fillet, &[])
+            .expect("F5-α admits 3-edge degree-3 convex selection without opt-in");
     }
 }

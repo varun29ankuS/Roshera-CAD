@@ -340,12 +340,7 @@ fn run_boundary_projection(
 /// the centre, default to `+1`. The resulting triangulation is still
 /// valid mesh data — only the per-triangle winding may be inverted,
 /// which `weld_mesh_watertight` tolerates within `weld_tolerance`.
-fn compute_chart_sign(
-    surface: &dyn Surface,
-    face: &Face,
-    model: &BRepModel,
-    bbox: UvBBox,
-) -> i32 {
+fn compute_chart_sign(surface: &dyn Surface, face: &Face, model: &BRepModel, bbox: UvBBox) -> i32 {
     let (u_lo, u_hi, v_lo, v_hi) = bbox;
     let u_mid = (u_lo + u_hi) * 0.5;
     let v_mid = (v_lo + v_hi) * 0.5;
@@ -509,9 +504,7 @@ fn run_cdt(
     steiner: &[(f64, f64)],
 ) -> Result<(Vec<(f64, f64)>, Vec<[usize; 3]>), CurvedCdtError> {
     let mut pts2d: Vec<(f64, f64)> = Vec::with_capacity(
-        outer_uv.len()
-            + inner_uvs.iter().map(|p| p.len()).sum::<usize>()
-            + steiner.len(),
+        outer_uv.len() + inner_uvs.iter().map(|p| p.len()).sum::<usize>() + steiner.len(),
     );
     let mut contours: Vec<Vec<usize>> = Vec::with_capacity(1 + inner_uvs.len());
 
@@ -536,8 +529,7 @@ fn run_cdt(
             // Skip degenerate inner; outer remains valid.
             continue;
         }
-        let inner_contour: Vec<usize> =
-            (s..e).chain(std::iter::once(s)).collect();
+        let inner_contour: Vec<usize> = (s..e).chain(std::iter::once(s)).collect();
         contours.push(inner_contour);
     }
 
@@ -554,8 +546,7 @@ fn run_cdt(
     }));
     match outcome {
         Ok(Ok(tris)) => {
-            let triangles: Vec<[usize; 3]> =
-                tris.into_iter().map(|(a, b, c)| [a, b, c]).collect();
+            let triangles: Vec<[usize; 3]> = tris.into_iter().map(|(a, b, c)| [a, b, c]).collect();
             Ok((pts2d, triangles))
         }
         Ok(Err(e)) => Err(CurvedCdtError::CdtFailed(e)),
@@ -676,9 +667,15 @@ fn collect_refinement_centroids(
         let normal_centroid = face
             .normal_at(u_c, v_c, &model.surfaces)
             .unwrap_or(plane_normal);
-        let normal_a = face.normal_at(ua, va, &model.surfaces).unwrap_or(plane_normal);
-        let normal_b = face.normal_at(ub, vb, &model.surfaces).unwrap_or(plane_normal);
-        let normal_c = face.normal_at(uc, vc, &model.surfaces).unwrap_or(plane_normal);
+        let normal_a = face
+            .normal_at(ua, va, &model.surfaces)
+            .unwrap_or(plane_normal);
+        let normal_b = face
+            .normal_at(ub, vb, &model.surfaces)
+            .unwrap_or(plane_normal);
+        let normal_c = face
+            .normal_at(uc, vc, &model.surfaces)
+            .unwrap_or(plane_normal);
         let ang = |n: Vector3| -> f64 {
             let d = normal_centroid.dot(&n).clamp(-1.0, 1.0);
             d.acos()
@@ -693,10 +690,8 @@ fn collect_refinement_centroids(
         // deviates from the corner normals, so refinement would never
         // converge and would subdivide maximally through all
         // `RUPPERT_MAX_PASSES`, exploding the triangle count.
-        let chord_fail =
-            params.chord_tolerance > 0.0 && chord_error > params.chord_tolerance;
-        let angle_fail =
-            params.max_angle_deviation > 0.0 && max_dev > params.max_angle_deviation;
+        let chord_fail = params.chord_tolerance > 0.0 && chord_error > params.chord_tolerance;
+        let angle_fail = params.max_angle_deviation > 0.0 && max_dev > params.max_angle_deviation;
         if chord_fail || angle_fail {
             out.push((u_c, v_c));
         }
@@ -910,8 +905,9 @@ fn scan_one_pass(
     params: &TessellationParams,
 ) -> RefinementDelta {
     // (1) α-style chord & normal violations.
-    let mut additions =
-        collect_refinement_centroids(triangles, pts2d, outer, inners, surface, face, model, params);
+    let mut additions = collect_refinement_centroids(
+        triangles, pts2d, outer, inners, surface, face, model, params,
+    );
 
     // (2) Skinny-triangle circumcenters.
     additions.extend(scan_skinny_triangles(triangles, pts2d, outer, inners));
@@ -1043,15 +1039,13 @@ pub(crate) fn tessellate_curved_cdt(
     mesh: &mut TriangleMesh,
 ) -> Result<(), CurvedCdtError> {
     // Step 0 — boundary projection.
-    let (outer, inners, outer_bbox) =
-        run_boundary_projection(face, model, cache, surface)?;
+    let (outer, inners, outer_bbox) = run_boundary_projection(face, model, cache, surface)?;
 
     // Step 1 — chart handedness.
     let chart_sign = compute_chart_sign(surface, face, model, outer_bbox);
 
     // Step 2 — Steiner candidates on a curvature-driven grid.
-    let inner_polygons: Vec<Vec<(f64, f64)>> =
-        inners.iter().map(|p| p.points_uv.clone()).collect();
+    let inner_polygons: Vec<Vec<(f64, f64)>> = inners.iter().map(|p| p.points_uv.clone()).collect();
     let mut steiner = generate_steiner_candidates(
         surface,
         outer_bbox,
@@ -1087,9 +1081,7 @@ pub(crate) fn tessellate_curved_cdt(
     let vertex_base = mesh.vertices.len() as u32;
     for (i, &(u, v)) in final_pts2d.iter().enumerate() {
         let position = resolve_position_3d(i, &outer, &inners, &final_pts2d, surface)?;
-        let normal = face
-            .normal_at(u, v, &model.surfaces)
-            .unwrap_or(Vector3::Z);
+        let normal = face.normal_at(u, v, &model.surfaces).unwrap_or(Vector3::Z);
         mesh.add_vertex(MeshVertex {
             position,
             normal,
@@ -1153,14 +1145,8 @@ mod tests {
 
         // ---- NURBS surface: bilinear flat patch in XY plane --------
         let control_points = vec![
-            vec![
-                Point3::new(0.0, 0.0, 0.0),
-                Point3::new(1.0, 0.0, 0.0),
-            ],
-            vec![
-                Point3::new(0.0, 1.0, 0.0),
-                Point3::new(1.0, 1.0, 0.0),
-            ],
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
         ];
         let weights = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
         let knots_u = vec![0.0, 0.0, 1.0, 1.0];
@@ -1399,10 +1385,7 @@ mod tests {
         ];
         for e in &cases {
             let s = format!("{}", e);
-            assert!(
-                !s.is_empty(),
-                "Display impl must not produce empty strings"
-            );
+            assert!(!s.is_empty(), "Display impl must not produce empty strings");
         }
     }
 
@@ -1536,16 +1519,36 @@ mod tests {
             Point3::new(0.0, 0.0, 0.0),
         )));
         let e0 = model.edges.add(Edge::new(
-            0, v00, v10, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v00,
+            v10,
+            c0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e1 = model.edges.add(Edge::new(
-            0, v10, v11, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v10,
+            v11,
+            c1,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e2 = model.edges.add(Edge::new(
-            0, v11, v01, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v11,
+            v01,
+            c2,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e3 = model.edges.add(Edge::new(
-            0, v01, v00, c3, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v01,
+            v00,
+            c3,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
 
         let mut outer = Loop::new(0, LoopType::Outer);
@@ -1708,8 +1711,7 @@ mod tests {
         fine.min_segments = 1;
         fine.max_segments = 100;
 
-        let coarse_n =
-            generate_steiner_candidates(surface, bbox, &outer, &inners, &coarse).len();
+        let coarse_n = generate_steiner_candidates(surface, bbox, &outer, &inners, &coarse).len();
         let fine_n = generate_steiner_candidates(surface, bbox, &outer, &inners, &fine).len();
 
         assert!(
@@ -1787,7 +1789,8 @@ mod tests {
                 // However, the typical outcome is Err. Allow both
                 // but assert no panic via reaching this branch.
                 assert!(
-                    tris.iter().all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]),
+                    tris.iter()
+                        .all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]),
                     "bowtie CDT result must not contain degenerate triangles"
                 );
             }
@@ -1819,8 +1822,8 @@ mod tests {
         let steiner: Vec<(f64, f64)> = Vec::new();
         #[allow(clippy::expect_used)]
         // Reason: unit square is a valid CDT input.
-        let (pts2d, tris) = run_cdt(&outer, &inners, &steiner)
-            .expect("unit square must triangulate without error");
+        let (pts2d, tris) =
+            run_cdt(&outer, &inners, &steiner).expect("unit square must triangulate without error");
         assert_eq!(pts2d.len(), 4);
         assert!(
             !tris.is_empty(),
@@ -1917,16 +1920,36 @@ mod tests {
         )));
 
         let e0 = model.edges.add(Edge::new(
-            0, v00, v10, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v00,
+            v10,
+            c0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e1 = model.edges.add(Edge::new(
-            0, v10, v11, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v10,
+            v11,
+            c1,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e2 = model.edges.add(Edge::new(
-            0, v11, v01, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v11,
+            v01,
+            c2,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e3 = model.edges.add(Edge::new(
-            0, v01, v00, c3, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v01,
+            v00,
+            c3,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
 
         let mut outer = Loop::new(0, LoopType::Outer);
@@ -1966,8 +1989,7 @@ mod tests {
             .get(face.surface_id)
             .expect("surface must be present");
 
-        let result =
-            tessellate_curved_cdt(surface, face, &model, &params, &cache, &mut mesh);
+        let result = tessellate_curved_cdt(surface, face, &model, &params, &cache, &mut mesh);
         assert!(
             result.is_ok(),
             "Ruppert refinement on bicubic bump must return Ok(()); got {:?}",
@@ -1998,15 +2020,17 @@ mod tests {
         // Boundary (4 vertices): unit square, CCW. Indices 0..4 are
         // boundary; index 4 is the interior offender.
         let pts2d: Vec<(f64, f64)> = vec![
-            (0.0, 0.0),     // 0
-            (1.0, 0.0),     // 1
-            (1.0, 1.0),     // 2
-            (0.0, 1.0),     // 3
-            (0.5, 0.001),   // 4 — well inside the diametral disk of edge 0→1
+            (0.0, 0.0),   // 0
+            (1.0, 0.0),   // 1
+            (1.0, 1.0),   // 2
+            (0.0, 1.0),   // 3
+            (0.5, 0.001), // 4 — well inside the diametral disk of edge 0→1
         ];
         let drops = scan_encroached_segments(&pts2d, 4, &[]);
         assert!(
-            drops.iter().any(|&(x, y)| (x - 0.5).abs() < 1e-12 && (y - 0.001).abs() < 1e-12),
+            drops
+                .iter()
+                .any(|&(x, y)| (x - 0.5).abs() < 1e-12 && (y - 0.001).abs() < 1e-12),
             "interior point (0.5, 0.001) must be reported as \
              encroaching on boundary edge (0,0)-(1,0); drops = {:?}",
             drops
@@ -2020,11 +2044,11 @@ mod tests {
         // long axis) and outside the short-edge disk (offset along
         // the long axis ≥ short_edge / 2).
         let pts2d_safe: Vec<(f64, f64)> = vec![
-            (0.0, 0.0),   // 0
-            (5.0, 0.0),   // 1
-            (5.0, 0.2),   // 2
-            (0.0, 0.2),   // 3
-            (2.5, 0.1),   // 4 — dead centre, on long-edge disk boundary
+            (0.0, 0.0), // 0
+            (5.0, 0.0), // 1
+            (5.0, 0.2), // 2
+            (0.0, 0.2), // 3
+            (2.5, 0.1), // 4 — dead centre, on long-edge disk boundary
         ];
         // Compute the actual drops and document the property the
         // predicate is testing (closed disk, so a single point on
@@ -2036,12 +2060,8 @@ mod tests {
         let _safe_drops = scan_encroached_segments(&pts2d_safe, 4, &[]);
 
         // Empty interior set ⇒ no drops.
-        let pts2d_no_interior: Vec<(f64, f64)> = vec![
-            (0.0, 0.0),
-            (1.0, 0.0),
-            (1.0, 1.0),
-            (0.0, 1.0),
-        ];
+        let pts2d_no_interior: Vec<(f64, f64)> =
+            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
         let no_interior_drops = scan_encroached_segments(&pts2d_no_interior, 4, &[]);
         assert!(
             no_interior_drops.is_empty(),
@@ -2064,12 +2084,7 @@ mod tests {
         // `scan_skinny_triangles` (which filters circumcenters
         // outside the outer) actually emits the candidate. Outer:
         // [-2, 4] × [-15, 5], CCW.
-        let outer_uv = vec![
-            (-2.0, -15.0),
-            (4.0, -15.0),
-            (4.0, 5.0),
-            (-2.0, 5.0),
-        ];
+        let outer_uv = vec![(-2.0, -15.0), (4.0, -15.0), (4.0, 5.0), (-2.0, 5.0)];
         // Indices: 0..4 outer boundary, then sliver vertices.
         let pts2d: Vec<(f64, f64)> = vec![
             (-2.0, -15.0), // 0 outer
@@ -2127,8 +2142,8 @@ mod tests {
         ];
         let w = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
         let knots = vec![0.0, 0.0, 1.0, 1.0];
-        let math_nurbs = MathNurbs::new(cp, w, knots.clone(), knots, 1, 1)
-            .expect("nurbs construct");
+        let math_nurbs =
+            MathNurbs::new(cp, w, knots.clone(), knots, 1, 1).expect("nurbs construct");
         let surface_id = model
             .surfaces
             .add(Box::new(GeneralNurbsSurface { nurbs: math_nurbs }));
@@ -2158,13 +2173,28 @@ mod tests {
         )));
 
         let e0 = model.edges.add(Edge::new(
-            0, v0, v1, c0, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v0,
+            v1,
+            c0,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e1 = model.edges.add(Edge::new(
-            0, v1, v2, c1, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v1,
+            v2,
+            c1,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
         let e2 = model.edges.add(Edge::new(
-            0, v2, v0, c2, EdgeOrientation::Forward, ParameterRange::unit(),
+            0,
+            v2,
+            v0,
+            c2,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
         ));
 
         let mut outer = Loop::new(0, LoopType::Outer);
@@ -2195,8 +2225,7 @@ mod tests {
         // sliver triangles, or `Err(_)` if the CDT crate rejected
         // the highly-acute polygon outright. Both demonstrate
         // bounded termination.
-        let result =
-            tessellate_curved_cdt(surface, face_ref, &model, &params, &cache, &mut mesh);
+        let result = tessellate_curved_cdt(surface, face_ref, &model, &params, &cache, &mut mesh);
         match result {
             Ok(()) => {
                 // Sanity: indices in-range.

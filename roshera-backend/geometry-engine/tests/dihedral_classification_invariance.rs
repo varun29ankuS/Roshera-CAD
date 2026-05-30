@@ -88,7 +88,9 @@ fn no_box_edge_classifies_as_g1_or_concave() {
     // A convex polyhedron has no smooth or concave edges anywhere.
     let model = classified_box(3.0, 1.0, 2.0);
     for (eid, _) in model.edges.iter() {
-        let class = classify_dihedral(&model, eid).expect("classify").expect("dihedral");
+        let class = classify_dihedral(&model, eid)
+            .expect("classify")
+            .expect("dihedral");
         assert!(
             !matches!(class, DihedralClass::G1Smooth | DihedralClass::Concave),
             "edge {eid} of a convex box must not be G1/concave, got {class:?}"

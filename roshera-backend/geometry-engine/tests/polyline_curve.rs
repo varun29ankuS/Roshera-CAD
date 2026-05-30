@@ -304,8 +304,8 @@ fn closest_point_to_outside_uses_perpendicular_foot() {
 
 #[test]
 fn closest_point_clamps_to_segment_endpoint() {
-    let p = Polyline::new(vec![point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)])
-        .expect("single segment");
+    let p =
+        Polyline::new(vec![point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)]).expect("single segment");
     // (5, 0, 0) projects beyond the segment, clamps to (1, 0, 0).
     let (_, q) = p
         .closest_point(&point(5.0, 0.0, 0.0), NORMAL_TOLERANCE)
@@ -467,10 +467,14 @@ fn intersect_plane_returns_segment_crossings() {
     let sq = unit_square();
     // Plane x = 0.5, normal +X. Segments 0 and 2 cross x = 0.5 at their
     // midpoints (t = 0.125 and t = 0.625 in polyline parameter space).
-    let plane = Plane::from_point_normal(point(0.5, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0))
-        .expect("plane");
+    let plane =
+        Plane::from_point_normal(point(0.5, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0)).expect("plane");
     let ts = sq.intersect_plane(&plane, NORMAL_TOLERANCE);
-    assert!(ts.len() >= 2, "expected ≥2 plane crossings, got {}", ts.len());
+    assert!(
+        ts.len() >= 2,
+        "expected ≥2 plane crossings, got {}",
+        ts.len()
+    );
     let mut sorted = ts.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     assert!((sorted[0] - 0.125).abs() < 1e-6);
@@ -483,8 +487,7 @@ fn intersect_plane_returns_segment_crossings() {
 fn offset_open_segment_displaces_by_distance() {
     // Single horizontal segment along +X; offset along normal +Z by 1
     // moves the line by 1 in the +Y direction (Z × X = Y).
-    let p = Polyline::new(vec![point(0.0, 0.0, 0.0), point(2.0, 0.0, 0.0)])
-        .expect("open polyline");
+    let p = Polyline::new(vec![point(0.0, 0.0, 0.0), point(2.0, 0.0, 0.0)]).expect("open polyline");
     let normal = Vector3::new(0.0, 0.0, 1.0);
     let off = p.offset(1.0, &normal).expect("offset");
     let q0 = off.evaluate(0.0).unwrap().position;
@@ -525,10 +528,8 @@ fn offset_l_shape_uses_miter_at_corner() {
 
 #[test]
 fn continuity_matches_meeting_endpoints_g0_or_better() {
-    let a = Polyline::new(vec![point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)])
-        .expect("a");
-    let b = Polyline::new(vec![point(1.0, 0.0, 0.0), point(2.0, 0.0, 0.0)])
-        .expect("b");
+    let a = Polyline::new(vec![point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)]).expect("a");
+    let b = Polyline::new(vec![point(1.0, 0.0, 0.0), point(2.0, 0.0, 0.0)]).expect("b");
     // Same direction polylines meeting at (1, 0, 0). Tangents agree, so
     // we expect ≥ G0; polylines have zero curvature so the
     // implementation may report G2 (no curvature mismatch).
@@ -546,10 +547,8 @@ fn continuity_matches_meeting_endpoints_g0_or_better() {
 
 #[test]
 fn continuity_at_separated_endpoints_returns_g0_at_worst() {
-    let a = Polyline::new(vec![point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)])
-        .expect("a");
-    let b = Polyline::new(vec![point(5.0, 0.0, 0.0), point(6.0, 0.0, 0.0)])
-        .expect("b");
+    let a = Polyline::new(vec![point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)]).expect("a");
+    let b = Polyline::new(vec![point(5.0, 0.0, 0.0), point(6.0, 0.0, 0.0)]).expect("b");
     // Endpoints far apart → G0 (positional discontinuity).
     let cont = a.check_continuity(&b, true, NORMAL_TOLERANCE);
     assert!(matches!(cont, Continuity::G0));

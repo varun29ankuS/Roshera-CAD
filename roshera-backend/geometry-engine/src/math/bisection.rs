@@ -244,15 +244,8 @@ mod tests {
     #[test]
     fn newton_converges_on_smooth_root() {
         // f(x) = x² − 2, root at √2 ≈ 1.41421356…
-        let r = newton_with_bisection_fallback(
-            |x| x * x - 2.0,
-            |x| 2.0 * x,
-            1.0,
-            0.5,
-            2.0,
-            1e-12,
-            40,
-        );
+        let r =
+            newton_with_bisection_fallback(|x| x * x - 2.0, |x| 2.0 * x, 1.0, 0.5, 2.0, 1e-12, 40);
         assert!((r - 2_f64.sqrt()).abs() < 1e-10);
     }
 

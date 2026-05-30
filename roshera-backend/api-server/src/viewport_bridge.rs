@@ -651,8 +651,7 @@ mod tests {
 
     #[test]
     fn pending_guard_removes_entry_on_drop() {
-        let pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>> = Arc::new(DashMap::new());
         let request_id = Uuid::new_v4();
         let (tx, _rx) = oneshot::channel::<ResponseValue>();
         pending.insert(request_id, tx);
@@ -673,8 +672,7 @@ mod tests {
     fn pending_guard_is_noop_when_entry_already_taken() {
         // Happy path: `deliver()` removed the entry first; the guard's
         // subsequent remove is a harmless no-op.
-        let pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>> = Arc::new(DashMap::new());
         let request_id = Uuid::new_v4();
         let guard = PendingGuard {
             pending: pending.clone(),
@@ -746,9 +744,6 @@ mod tests {
             }
         }
         let slot = bridge.sender.lock().await;
-        assert!(
-            slot.is_none(),
-            "solo socket teardown must clear the slot"
-        );
+        assert!(slot.is_none(), "solo socket teardown must clear the slot");
     }
 }

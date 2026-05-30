@@ -289,9 +289,7 @@ impl SolidAnchor {
 /// single-source: `use crate::operations::diagnostics::BlendKind;`.
 ///
 /// [`BlendFailure::ConflictingBlendKind`]: crate::operations::diagnostics::BlendFailure::ConflictingBlendKind
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlendKind {
     /// Smooth (G1) rolling-ball / spine-marched blend.
@@ -324,9 +322,7 @@ impl std::fmt::Display for BlendKind {
 /// pulling a new dependency for a two-element domain. `Copy` so the
 /// existing `Solid::deep_copy` clones it for free; serde-derived so
 /// the field round-trips through any serialiser that touches `Solid`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct VertexBlendKindSet {
     /// Whether a fillet has been applied at this vertex.
     pub has_fillet: bool,
@@ -634,7 +630,10 @@ impl Solid {
     /// order); each call inserts its kind into the per-vertex
     /// [`VertexBlendKindSet`], leaving the other slot untouched.
     pub(crate) fn record_blended_vertex(&mut self, vertex: VertexId, kind: BlendKind) {
-        self.blended_vertices.entry(vertex).or_default().insert(kind);
+        self.blended_vertices
+            .entry(vertex)
+            .or_default()
+            .insert(kind);
     }
 
     /// CF-α — look up the previously-applied blend kind at `edge`, if
@@ -731,10 +730,7 @@ impl Solid {
     /// (every kind together) so callers can partition by kind in a
     /// single pass. `None` when the vertex has never carried a
     /// partial-mixed cap rim.
-    pub fn corner_cap_edges(
-        &self,
-        vertex: VertexId,
-    ) -> Option<&[(EdgeId, BlendKind)]> {
+    pub fn corner_cap_edges(&self, vertex: VertexId) -> Option<&[(EdgeId, BlendKind)]> {
         self.corner_cap_rim_edges.get(&vertex).map(|v| v.as_slice())
     }
 
@@ -768,7 +764,8 @@ impl Solid {
         vertex: VertexId,
         original_degree: usize,
     ) {
-        self.pending_mixed_kind_corners.insert(vertex, original_degree);
+        self.pending_mixed_kind_corners
+            .insert(vertex, original_degree);
     }
 
     /// CF-β.4 — clear `vertex` from the pending map once the matching
@@ -1981,10 +1978,9 @@ mod vertex_blend_kind_set_tests {
                 has_chamfer: true,
             },
         ] {
-            let json = serde_json::to_string(&set)
-                .expect("VertexBlendKindSet serialises");
-            let back: VertexBlendKindSet = serde_json::from_str(&json)
-                .expect("VertexBlendKindSet deserialises");
+            let json = serde_json::to_string(&set).expect("VertexBlendKindSet serialises");
+            let back: VertexBlendKindSet =
+                serde_json::from_str(&json).expect("VertexBlendKindSet deserialises");
             assert_eq!(set, back, "round-trip mismatch for {set}");
         }
     }

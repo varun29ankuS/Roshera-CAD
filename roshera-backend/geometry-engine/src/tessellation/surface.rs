@@ -656,7 +656,10 @@ pub(crate) fn triangulate_planar_polygon(
             if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
                 eprintln!(
                     "[tess] cdt failed: {:?}  outer=[{},{}) holes={}",
-                    e, outer_range.0, outer_range.1, inner_ranges.len()
+                    e,
+                    outer_range.0,
+                    outer_range.1,
+                    inner_ranges.len()
                 );
                 for (i, c) in contours.iter().enumerate() {
                     eprintln!("  contour[{}] len={} indices={:?}", i, c.len(), c);
@@ -1506,9 +1509,9 @@ fn tessellate_nurbs_face(
     // the contract is now "this face emits zero triangles" —
     // the shell-level `tessellate_shell` proceeds with the rest
     // of the shell.
-    if let Err(e) = super::curved_cdt::tessellate_curved_cdt(
-        surface, face, model, params, cache, mesh,
-    ) {
+    if let Err(e) =
+        super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
+    {
         tracing::warn!(
             "curved_cdt failed for NURBS face {:?}: {:?}; emitting empty \
              mesh (CDT-β.2: legacy quadtree fallback retired)",
@@ -1777,8 +1780,7 @@ fn tessellate_fillet_face_grid_fallback(
             }
             if len > longest_edge_len {
                 longest_edge_len = len;
-                longest_edge_n =
-                    compute_curve_sample_count(curve, t_start, t_end, params);
+                longest_edge_n = compute_curve_sample_count(curve, t_start, t_end, params);
             }
         }
         if longest_edge_n > u_steps {
@@ -1803,8 +1805,7 @@ fn tessellate_fillet_face_grid_fallback(
         } else {
             params.min_segments
         };
-        n.max(params.min_segments.max(3))
-            .min(params.max_segments)
+        n.max(params.min_segments.max(3)).min(params.max_segments)
     };
 
     let mut vertex_grid: Vec<Vec<Option<u32>>> = Vec::with_capacity(v_steps + 1);
@@ -2678,10 +2679,7 @@ mod tests {
         let params = TessellationParams::default();
         let n = arc_steps_for_quality(2.0 * std::f64::consts::PI, 1.0, &params);
         assert!(n >= 70, "expected ≥70 steps at default quality, got {n}");
-        assert!(
-            n <= params.max_segments,
-            "expected ≤max_segments, got {n}"
-        );
+        assert!(n <= params.max_segments, "expected ≤max_segments, got {n}");
     }
 
     /// Chord-height is the primary driver: tightening `chord_tolerance`
@@ -2690,7 +2688,7 @@ mod tests {
     fn arc_steps_monotonic_in_chord_tolerance() {
         let mk = |tol: f64| TessellationParams {
             chord_tolerance: tol,
-            max_edge_length: 0.0,   // disable chord-length cap
+            max_edge_length: 0.0,     // disable chord-length cap
             max_angle_deviation: 0.0, // disable angle cap
             min_segments: 3,
             max_segments: 10_000, // raise cap so monotonicity is observable
@@ -2749,7 +2747,7 @@ mod tests {
     #[test]
     fn arc_steps_respects_segment_clamps() {
         let params = TessellationParams {
-            chord_tolerance: 1e-6,    // would request enormous step count
+            chord_tolerance: 1e-6, // would request enormous step count
             max_edge_length: 1e-6,
             max_angle_deviation: 1e-6,
             min_segments: 3,
@@ -2774,17 +2772,29 @@ mod tests {
     #[test]
     fn arc_steps_degenerate_inputs() {
         let params = TessellationParams::default();
-        assert_eq!(arc_steps_for_quality(0.0, 1.0, &params), params.min_segments);
-        assert_eq!(arc_steps_for_quality(-1.0, 1.0, &params), params.min_segments);
-        assert_eq!(arc_steps_for_quality(1.0, 0.0, &params), params.min_segments);
-        assert_eq!(arc_steps_for_quality(1.0, -1.0, &params), params.min_segments);
+        assert_eq!(
+            arc_steps_for_quality(0.0, 1.0, &params),
+            params.min_segments
+        );
+        assert_eq!(
+            arc_steps_for_quality(-1.0, 1.0, &params),
+            params.min_segments
+        );
+        assert_eq!(
+            arc_steps_for_quality(1.0, 0.0, &params),
+            params.min_segments
+        );
+        assert_eq!(
+            arc_steps_for_quality(1.0, -1.0, &params),
+            params.min_segments
+        );
     }
 
     /// linear_steps: zero-curvature axis only uses chord-length.
     #[test]
     fn linear_steps_basic_chord_length() {
         let params = TessellationParams {
-            chord_tolerance: 0.001,    // ignored on linear axis
+            chord_tolerance: 0.001, // ignored on linear axis
             max_edge_length: 0.1,
             max_angle_deviation: 0.01, // ignored on linear axis
             min_segments: 1,

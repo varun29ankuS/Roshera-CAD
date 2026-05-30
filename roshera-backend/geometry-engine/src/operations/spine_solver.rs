@@ -328,7 +328,10 @@ fn schedule_constant_value(schedule: &BlendRadius) -> Option<f64> {
                 return None;
             }
             let first = samples[0].1;
-            if samples.iter().all(|(_, r)| (*r - first).abs() < f64::EPSILON) {
+            if samples
+                .iter()
+                .all(|(_, r)| (*r - first).abs() < f64::EPSILON)
+            {
                 Some(first)
             } else {
                 None
@@ -630,18 +633,24 @@ pub fn solve_spine_for_edge_with_schedule(
                 let plane = effective_plane_a.as_ref().ok_or_else(|| {
                     OperationError::InternalError("Effective plane A missing".into())
                 })?;
-                let cylinder = surface_b.as_any().downcast_ref::<Cylinder>().ok_or_else(
-                    || OperationError::InternalError("Cylinder downcast failed".into()),
-                )?;
+                let cylinder = surface_b
+                    .as_any()
+                    .downcast_ref::<Cylinder>()
+                    .ok_or_else(|| {
+                        OperationError::InternalError("Cylinder downcast failed".into())
+                    })?;
                 solve_plane_cylinder(
                     model, &edge, edge_id, face_a, face_b, plane, cylinder,
                     /*plane_is_a=*/ true, schedule, options,
                 )
             }
             (SurfaceType::Cylinder, SurfaceType::Plane) => {
-                let cylinder = surface_a.as_any().downcast_ref::<Cylinder>().ok_or_else(
-                    || OperationError::InternalError("Cylinder downcast failed".into()),
-                )?;
+                let cylinder = surface_a
+                    .as_any()
+                    .downcast_ref::<Cylinder>()
+                    .ok_or_else(|| {
+                        OperationError::InternalError("Cylinder downcast failed".into())
+                    })?;
                 let plane = effective_plane_b.as_ref().ok_or_else(|| {
                     OperationError::InternalError("Effective plane B missing".into())
                 })?;
@@ -682,8 +691,7 @@ pub fn solve_spine_for_edge_with_schedule(
         Ok(None) => {
             if options.enable_marching {
                 solve_marching(
-                    model, &edge, edge_id, face_a, face_b, surface_a, surface_b, schedule,
-                    options,
+                    model, &edge, edge_id, face_a, face_b, surface_a, surface_b, schedule, options,
                 )
                 .map(Some)
             } else {
@@ -1037,9 +1045,7 @@ fn evaluate_plane_cyl_geometry(
     })?;
     let edge_tan_in_loop = raw_tangent * loop_sign;
     let dihedral = robust_face_angle(&n_plane, &n_cyl, &edge_tan_in_loop, &options.tolerance)
-        .map_err(|e| {
-            OperationError::NumericalError(format!("Dihedral compute failed: {:?}", e))
-        })?;
+        .map_err(|e| OperationError::NumericalError(format!("Dihedral compute failed: {:?}", e)))?;
 
     Ok((n_plane, n_cyl, radial_dir, dihedral, edge_mid))
 }
@@ -1090,8 +1096,9 @@ fn solve_plane_cylinder(
         (face_b, face_a)
     };
 
-    let (n_plane, n_cyl, radial_dir, dihedral, _edge_mid) =
-        evaluate_plane_cyl_geometry(model, edge, edge_id, plane_face, cyl_face, cylinder, options)?;
+    let (n_plane, n_cyl, radial_dir, dihedral, _edge_mid) = evaluate_plane_cyl_geometry(
+        model, edge, edge_id, plane_face, cyl_face, cylinder, options,
+    )?;
 
     let abs_dihedral = dihedral.abs();
     if abs_dihedral < 0.1 || (std::f64::consts::PI - abs_dihedral) < 0.1 {
@@ -1117,8 +1124,20 @@ fn solve_plane_cylinder(
         // Perpendicular: spine is a circular arc for constant
         // radius, a more general curve for variable schedules.
         solve_plane_cyl_perpendicular(
-            model, edge, plane, cylinder, plane_face, cyl_face, plane_is_a, n_plane, n_cyl,
-            radial_dir, axis_alignment, offset_sign, schedule, options,
+            model,
+            edge,
+            plane,
+            cylinder,
+            plane_face,
+            cyl_face,
+            plane_is_a,
+            n_plane,
+            n_cyl,
+            radial_dir,
+            axis_alignment,
+            offset_sign,
+            schedule,
+            options,
         )
         .map(Some)
     } else if abs_alignment < PLANE_CYL_ALIGNMENT_TOL {
@@ -1128,8 +1147,19 @@ fn solve_plane_cylinder(
         let radial_alignment = n_plane.dot(&radial_dir).abs();
         if (radial_alignment - 1.0).abs() < PLANE_CYL_ALIGNMENT_TOL {
             solve_plane_cyl_parallel_tangent(
-                model, edge, plane, cylinder, plane_face, cyl_face, plane_is_a, n_plane, n_cyl,
-                radial_dir, offset_sign, schedule, options,
+                model,
+                edge,
+                plane,
+                cylinder,
+                plane_face,
+                cyl_face,
+                plane_is_a,
+                n_plane,
+                n_cyl,
+                radial_dir,
+                offset_sign,
+                schedule,
+                options,
             )
             .map(Some)
         } else {
@@ -1227,9 +1257,7 @@ fn solve_plane_cyl_perpendicular(
         let radial_vec_t = p_off - cylinder.axis * axial_t;
         // Normalise locally — guard against drift but don't fail
         // hard, the angle only needs a stable atan2.
-        let angle = radial_vec_t
-            .dot(&ref_y)
-            .atan2(radial_vec_t.dot(&ref_x));
+        let angle = radial_vec_t.dot(&ref_y).atan2(radial_vec_t.dot(&ref_x));
         edge_angles.push(angle);
 
         let radial_t = ref_x * angle.cos() + ref_y * angle.sin();
@@ -1239,8 +1267,7 @@ fn solve_plane_cyl_perpendicular(
         let contact_plane = center - n_plane * (offset_sign * r_t);
         // Contact on cylinder: same angle as centre, axial position
         // matches centre, radial r_cyl.
-        let contact_cyl =
-            cylinder.origin + cylinder.axis * z_spine_t + radial_t * cylinder.radius;
+        let contact_cyl = cylinder.origin + cylinder.axis * z_spine_t + radial_t * cylinder.radius;
 
         if let Some(prev) = prev_center {
             cumulative_arc += (center - prev).magnitude();
@@ -1283,8 +1310,7 @@ fn solve_plane_cyl_perpendicular(
         // is true, since the spine is intentionally retracted from
         // at least one end.
         let closed_for_arc = edge.is_loop() && options.edge_param_trim.is_full();
-        let (start_angle, sweep_angle) =
-            resolve_arc_parameters(&edge_angles, closed_for_arc);
+        let (start_angle, sweep_angle) = resolve_arc_parameters(&edge_angles, closed_for_arc);
 
         let spine_arc = Arc::new(
             cylinder.origin + cylinder.axis * z_spine,
@@ -1293,9 +1319,7 @@ fn solve_plane_cyl_perpendicular(
             start_angle,
             sweep_angle,
         )
-        .map_err(|e| {
-            OperationError::NumericalError(format!("Spine arc construction: {:?}", e))
-        })?;
+        .map_err(|e| OperationError::NumericalError(format!("Spine arc construction: {:?}", e)))?;
 
         let rail_plane_arc = Arc::new(
             cylinder.origin + cylinder.axis * z_plane,
@@ -1462,8 +1486,7 @@ fn solve_plane_cyl_parallel_tangent(
         // r_spine_t.
         let center = cylinder.origin + cylinder.axis * axial_t + radial_dir * r_spine_t;
         let contact_plane = center - n_plane * (offset_sign * r_t);
-        let contact_cyl =
-            cylinder.origin + cylinder.axis * axial_t + radial_dir * cylinder.radius;
+        let contact_cyl = cylinder.origin + cylinder.axis * axial_t + radial_dir * cylinder.radius;
 
         if let Some(prev) = prev_center {
             cumulative_arc += (center - prev).magnitude();
@@ -1603,9 +1626,7 @@ fn solve_plane_sphere(
     })?;
     let edge_tan_in_loop = raw_tangent * loop_sign;
     let dihedral = robust_face_angle(&n_plane, &n_sphere, &edge_tan_in_loop, &options.tolerance)
-        .map_err(|e| {
-            OperationError::NumericalError(format!("Dihedral compute failed: {:?}", e))
-        })?;
+        .map_err(|e| OperationError::NumericalError(format!("Dihedral compute failed: {:?}", e)))?;
 
     let abs_dihedral = dihedral.abs();
     if abs_dihedral < 0.1 || (std::f64::consts::PI - abs_dihedral) < 0.1 {
@@ -1689,8 +1710,7 @@ fn solve_plane_sphere(
         // angular position in the (basis_x, basis_y) basis around
         // spine_centre.
         let p_offset = edge_point - spine_centre;
-        let p_in_plane =
-            p_offset - n_plane * p_offset.dot(&n_plane);
+        let p_in_plane = p_offset - n_plane * p_offset.dot(&n_plane);
         let angle = p_in_plane.dot(&basis_y).atan2(p_in_plane.dot(&basis_x));
         edge_angles.push(angle);
 
@@ -1701,10 +1721,7 @@ fn solve_plane_sphere(
         // Contact on sphere: project centre onto sphere surface
         // along the line from sphere.centre through the centre.
         let c_to_sphere = (center - sphere.center).normalize().map_err(|e| {
-            OperationError::NumericalError(format!(
-                "Centre coincides with sphere centre: {:?}",
-                e
-            ))
+            OperationError::NumericalError(format!("Centre coincides with sphere centre: {:?}", e))
         })?;
         let contact_sphere = sphere.center + c_to_sphere * sphere.radius;
 
@@ -1731,8 +1748,7 @@ fn solve_plane_sphere(
     // F3-δ.3: setback-retracted edges are no longer "closed" for
     // arc-parameter reconstruction; see solve_plane_cyl_perpendicular.
     let closed_for_arc = edge.is_loop() && options.edge_param_trim.is_full();
-    let (start_angle, sweep_angle) =
-        resolve_arc_parameters(&edge_angles, closed_for_arc);
+    let (start_angle, sweep_angle) = resolve_arc_parameters(&edge_angles, closed_for_arc);
 
     let spine_arc = Arc::new(
         spine_centre,
@@ -2155,10 +2171,7 @@ fn solve_marching(
     //    `NurbsCurve::fit_to_points` degrades degree gracefully below
     //    that — we still enforce a hard floor of 4 so the frame
     //    sequence is non-trivial.
-    let n_samples = options
-        .min_samples
-        .max(4)
-        .min(options.max_samples.max(4));
+    let n_samples = options.min_samples.max(4).min(options.max_samples.max(4));
 
     // 3. March along the edge. Uniform-parameter sampling — adaptive
     //    arc-length refinement is an F3-γ.1 follow-up; for the
@@ -2216,11 +2229,7 @@ fn solve_marching(
                 ))
             })?;
             let dot_a = bisector.dot(&n_a);
-            let offset_dist = if dot_a.abs() > 1e-9 {
-                r_t / dot_a
-            } else {
-                r_t
-            };
+            let offset_dist = if dot_a.abs() > 1e-9 { r_t / dot_a } else { r_t };
             edge_point + bisector * (offset_sign * offset_dist)
         };
 
@@ -2417,9 +2426,7 @@ mod tests {
     /// Find the first edge that is incident to exactly two faces and
     /// both faces have planar surfaces. Returns `(edge_id, face_a,
     /// face_b)`.
-    fn first_manifold_plane_plane_edge(
-        model: &BRepModel,
-    ) -> Option<(EdgeId, FaceId, FaceId)> {
+    fn first_manifold_plane_plane_edge(model: &BRepModel) -> Option<(EdgeId, FaceId, FaceId)> {
         for (edge_id, _edge) in model.edges.iter() {
             let faces = find_adjacent_faces(model, edge_id);
             if faces.len() != 2 {
@@ -2516,8 +2523,7 @@ mod tests {
         // spine centre at every sample.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let radius = 0.4;
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, radius, &opts)
@@ -2544,8 +2550,7 @@ mod tests {
         // exactly.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.2, &opts)
             .expect("solve")
@@ -2571,8 +2576,7 @@ mod tests {
         // fitted through colinear samples.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.2, &opts)
             .expect("solve")
@@ -2591,8 +2595,7 @@ mod tests {
         // Spine is parallel to the edge for two planar faces.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.2, &opts)
             .expect("solve")
@@ -2621,8 +2624,7 @@ mod tests {
     fn plane_plane_min_samples_honoured() {
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let mut opts = SpineOptions::default();
         opts.min_samples = 17;
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.1, &opts)
@@ -2636,9 +2638,7 @@ mod tests {
     /// plane_face_is_a)`. Used as the canonical plane/cylinder
     /// perpendicular test fixture: every cylinder primitive's top
     /// and bottom rim qualifies.
-    fn first_plane_cyl_edge(
-        model: &BRepModel,
-    ) -> Option<(EdgeId, FaceId, FaceId, bool)> {
+    fn first_plane_cyl_edge(model: &BRepModel) -> Option<(EdgeId, FaceId, FaceId, bool)> {
         for (edge_id, _e) in model.edges.iter() {
             let faces = find_adjacent_faces(model, edge_id);
             if faces.len() != 2 {
@@ -2688,8 +2688,7 @@ mod tests {
         let _ = builder
             .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
             .expect("cylinder creation");
-        let (edge_id, face_a, face_b, _) =
-            first_plane_cyl_edge(&model).expect("plane/cyl rim");
+        let (edge_id, face_a, face_b, _) = first_plane_cyl_edge(&model).expect("plane/cyl rim");
         let radius = 0.4;
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, radius, &opts)
@@ -2718,8 +2717,7 @@ mod tests {
         let _ = builder
             .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
             .expect("cylinder creation");
-        let (edge_id, face_a, face_b, _) =
-            first_plane_cyl_edge(&model).expect("plane/cyl rim");
+        let (edge_id, face_a, face_b, _) = first_plane_cyl_edge(&model).expect("plane/cyl rim");
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.3, &opts)
             .expect("solve")
@@ -2751,8 +2749,7 @@ mod tests {
         let _ = builder
             .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
             .expect("cylinder creation");
-        let (edge_id, face_a, face_b, _) =
-            first_plane_cyl_edge(&model).expect("plane/cyl rim");
+        let (edge_id, face_a, face_b, _) = first_plane_cyl_edge(&model).expect("plane/cyl rim");
         let r_cyl = 2.0;
         let radius = 0.5;
         let opts = SpineOptions::default();
@@ -2791,8 +2788,7 @@ mod tests {
         let _ = builder
             .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
             .expect("cylinder creation");
-        let (edge_id, face_a, face_b, _) =
-            first_plane_cyl_edge(&model).expect("plane/cyl rim");
+        let (edge_id, face_a, face_b, _) = first_plane_cyl_edge(&model).expect("plane/cyl rim");
         let radius = 0.5;
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, radius, &opts)
@@ -2895,8 +2891,7 @@ mod tests {
         let _ = builder
             .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
             .expect("cylinder creation");
-        let (edge_id, face_a, face_b, _) =
-            first_plane_cyl_edge(&model).expect("plane/cyl rim");
+        let (edge_id, face_a, face_b, _) = first_plane_cyl_edge(&model).expect("plane/cyl rim");
         let mut opts = SpineOptions::default();
         opts.min_samples = 19;
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.1, &opts)
@@ -2916,8 +2911,7 @@ mod tests {
         let _ = builder
             .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
             .expect("cylinder creation");
-        let (edge_id, face_a, face_b, _) =
-            first_plane_cyl_edge(&model).expect("plane/cyl rim");
+        let (edge_id, face_a, face_b, _) = first_plane_cyl_edge(&model).expect("plane/cyl rim");
         let opts = SpineOptions::default();
         // r = 2.0 == r_cyl → r_spine = 0; r = 2.5 > r_cyl → r_spine < 0.
         for bad_r in [2.0, 2.5] {
@@ -2933,8 +2927,7 @@ mod tests {
     fn solve_errors_on_non_positive_radius() {
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let opts = SpineOptions::default();
 
         for bad_r in [0.0, -0.5, f64::NAN, f64::INFINITY] {
@@ -2964,8 +2957,7 @@ mod tests {
         // so the caller falls through to the legacy bisector path.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id_a, _, _) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id_a, _, _) = first_manifold_plane_plane_edge(&model).expect("box edges");
         // Find a second distinct edge from the model to populate
         // a synthetic two-edge chain.
         let edge_id_b = model
@@ -3072,8 +3064,7 @@ mod tests {
         // vertical edges are length = height = 2.0).
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, _, _) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, _, _) = first_manifold_plane_plane_edge(&model).expect("box edges");
 
         let edge = model.edges.get(edge_id).expect("edge").clone();
         let length = edge
@@ -3126,8 +3117,7 @@ mod tests {
         // computation.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, _, _) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, _, _) = first_manifold_plane_plane_edge(&model).expect("box edges");
 
         let graph = single_edge_graph(edge_id, 0.25, None, None);
         let opts = SpineOptions::default();
@@ -3138,11 +3128,7 @@ mod tests {
         let first = rail.samples.first().expect("samples").edge_parameter;
         let last = rail.samples.last().expect("samples").edge_parameter;
         assert!(first.abs() < 1e-12, "first edge_parameter = {}", first);
-        assert!(
-            (last - 1.0).abs() < 1e-12,
-            "last edge_parameter = {}",
-            last
-        );
+        assert!((last - 1.0).abs() < 1e-12, "last edge_parameter = {}", last);
     }
 
     #[test]
@@ -3153,8 +3139,7 @@ mod tests {
         // F2-γ retraction (preview paths, debug rails).
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, _, _) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, _, _) = first_manifold_plane_plane_edge(&model).expect("box edges");
 
         let edge = model.edges.get(edge_id).expect("edge").clone();
         let length = edge
@@ -3185,8 +3170,7 @@ mod tests {
         // zero-length or inverted trim.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, _, _) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, _, _) = first_manifold_plane_plane_edge(&model).expect("box edges");
 
         let edge = model.edges.get(edge_id).expect("edge").clone();
         let length = edge
@@ -3207,8 +3191,7 @@ mod tests {
         // perpendicular to the edge tangent.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let radius = 0.25;
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, radius, &opts)
@@ -3254,7 +3237,11 @@ mod tests {
         edge_id: EdgeId,
         face_a: FaceId,
         face_b: FaceId,
-    ) -> (Edge, crate::primitives::surface::SurfaceId, crate::primitives::surface::SurfaceId) {
+    ) -> (
+        Edge,
+        crate::primitives::surface::SurfaceId,
+        crate::primitives::surface::SurfaceId,
+    ) {
         let edge = model.edges.get(edge_id).expect("edge").clone();
         let surface_a_id = model.faces.get(face_a).expect("face a").surface_id;
         let surface_b_id = model.faces.get(face_b).expect("face b").surface_id;
@@ -3265,8 +3252,7 @@ mod tests {
     fn marching_box_edge_converges() {
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
         let surface_a = model.surfaces.get(sa_id).expect("surface a");
         let surface_b = model.surfaces.get(sb_id).expect("surface b");
@@ -3292,8 +3278,7 @@ mod tests {
     fn marching_solver_kind_is_marched() {
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
         let surface_a = model.surfaces.get(sa_id).expect("surface a");
         let surface_b = model.surfaces.get(sb_id).expect("surface b");
@@ -3332,8 +3317,7 @@ mod tests {
     fn marching_contact_distance_equals_radius() {
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
         let surface_a = model.surfaces.get(sa_id).expect("surface a");
         let surface_b = model.surfaces.get(sb_id).expect("surface b");
@@ -3376,8 +3360,7 @@ mod tests {
         // within tolerance of the analytic closed-form solution.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let radius = 0.25;
         let opts = SpineOptions::default();
 
@@ -3433,8 +3416,7 @@ mod tests {
         // fixture is in scope.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
         let surface_a = model.surfaces.get(sa_id).expect("surface a");
         let surface_b = model.surfaces.get(sb_id).expect("surface b");
@@ -3470,8 +3452,7 @@ mod tests {
         // collinear control points.
         let mut model = BRepModel::new();
         let _solid = make_box(&mut model, 4.0, 3.0, 2.0);
-        let (edge_id, face_a, face_b) =
-            first_manifold_plane_plane_edge(&model).expect("box edges");
+        let (edge_id, face_a, face_b) = first_manifold_plane_plane_edge(&model).expect("box edges");
         let (edge, sa_id, sb_id) = marching_inputs(&model, edge_id, face_a, face_b);
         let surface_a = model.surfaces.get(sa_id).expect("surface a");
         let surface_b = model.surfaces.get(sb_id).expect("surface b");
@@ -3512,10 +3493,26 @@ mod tests {
         // Pin the collinearity helper directly so a regression in
         // the tolerance envelope doesn't manifest only through
         // marching's downstream behaviour.
-        let p0 = Point3 { x: 0.0, y: 0.0, z: 0.0 };
-        let p1 = Point3 { x: 1.0, y: 0.0, z: 0.0 };
-        let p2 = Point3 { x: 2.0, y: 0.0, z: 0.0 };
-        let p_off = Point3 { x: 1.0, y: 0.1, z: 0.0 };
+        let p0 = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let p1 = Point3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let p2 = Point3 {
+            x: 2.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let p_off = Point3 {
+            x: 1.0,
+            y: 0.1,
+            z: 0.0,
+        };
 
         assert!(points_are_collinear(&[p0, p1, p2], 1e-6));
         assert!(!points_are_collinear(&[p0, p_off, p2], 1e-6));
@@ -3523,7 +3520,11 @@ mod tests {
         assert!(points_are_collinear(&[p0], 1e-6));
         assert!(points_are_collinear(&[p0, p1], 1e-6));
         // Within-noise drift (1e-7 perpendicular) accepted at tol = 1e-6.
-        let p_noisy = Point3 { x: 1.0, y: 1e-7, z: 0.0 };
+        let p_noisy = Point3 {
+            x: 1.0,
+            y: 1e-7,
+            z: 0.0,
+        };
         assert!(points_are_collinear(&[p0, p_noisy, p2], 1e-6));
     }
 
@@ -3577,8 +3578,14 @@ mod tests {
         // and extrude (Z) — i.e. ±Y.
         let dot_x = plane.normal.dot(&Vector3::X).abs();
         let dot_z = plane.normal.dot(&Vector3::Z).abs();
-        assert!(dot_x < 1e-9, "plane normal must be ⊥ edge tangent: dot_x={dot_x}");
-        assert!(dot_z < 1e-9, "plane normal must be ⊥ extrude dir: dot_z={dot_z}");
+        assert!(
+            dot_x < 1e-9,
+            "plane normal must be ⊥ edge tangent: dot_x={dot_x}"
+        );
+        assert!(
+            dot_z < 1e-9,
+            "plane normal must be ⊥ extrude dir: dot_z={dot_z}"
+        );
         // Corners lie on the plane (zero signed distance).
         for p in [p1, p2, p3, p4] {
             let signed = (p - plane.origin).dot(&plane.normal).abs();
@@ -3610,9 +3617,14 @@ mod tests {
         let p1 = Point3::new(0.0, 0.0, 0.0);
         let p2 = Point3::new(1.0, 0.0, 0.0);
         let line1 = Box::new(Line::new(p1, p2));
-        let arc =
-            Arc::new(Point3::new(0.5, 0.5, 0.0), Vector3::Z, 0.5, 0.0, std::f64::consts::PI)
-                .expect("arc construction");
+        let arc = Arc::new(
+            Point3::new(0.5, 0.5, 0.0),
+            Vector3::Z,
+            0.5,
+            0.0,
+            std::f64::consts::PI,
+        )
+        .expect("arc construction");
         let ruled = RuledSurface::new(line1, Box::new(arc));
         let tol = Tolerance::from_distance(1e-6);
         assert!(
@@ -3687,8 +3699,7 @@ mod tests {
     #[test]
     fn effective_plane_returns_none_for_cylinder() {
         // Non-plane, non-ruled surfaces fall through to None.
-        let cyl =
-            Cylinder::new(Point3::ORIGIN, Vector3::Z, 1.0).expect("cylinder construction");
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 1.0).expect("cylinder construction");
         let tol = Tolerance::from_distance(1e-6);
         assert!(effective_plane(&cyl, &tol).is_none());
     }

@@ -188,10 +188,7 @@ pub enum DatumSource {
     TwoPointsAxis { p0: VertexId, p1: VertexId },
     /// Axis perpendicular to a plane datum, passing through a vertex.
     /// Origin is the vertex position; direction is the plane's normal.
-    NormalAxis {
-        plane: DatumId,
-        point: VertexId,
-    },
+    NormalAxis { plane: DatumId, point: VertexId },
     /// Point datum at a vertex.
     VertexPoint { vertex: VertexId },
     /// Point datum at the midpoint of an edge.
@@ -357,14 +354,22 @@ pub fn frame_from_origin_and_z(origin: Point3, z_dir: Vector3) -> Result<Matrix4
 /// "out" direction without unpacking the full matrix.
 #[inline]
 pub fn frame_z_axis(transform: &Matrix4) -> Vector3 {
-    Vector3::new(transform.get(0, 2), transform.get(1, 2), transform.get(2, 2))
+    Vector3::new(
+        transform.get(0, 2),
+        transform.get(1, 2),
+        transform.get(2, 2),
+    )
 }
 
 /// Extract the translation (column 3) of a 4×4 transform as a
 /// `Point3`. Mirrors the denormalized `Datum::origin` field.
 #[inline]
 pub fn frame_origin(transform: &Matrix4) -> Point3 {
-    Point3::new(transform.get(0, 3), transform.get(1, 3), transform.get(2, 3))
+    Point3::new(
+        transform.get(0, 3),
+        transform.get(1, 3),
+        transform.get(2, 3),
+    )
 }
 
 /// A first-class reference entity in the kernel.

@@ -70,12 +70,26 @@ pub enum EntityReference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AIOperationParameter {
-    Number { value: f64, unit: Option<String> },
+    Number {
+        value: f64,
+        unit: Option<String>,
+    },
     Boolean(bool),
     Text(String),
-    Vector { x: f64, y: f64, z: f64 },
-    Point { x: f64, y: f64, z: f64 },
-    Enum { value: String, options: Vec<String> },
+    Vector {
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+    Point {
+        x: f64,
+        y: f64,
+        z: f64,
+    },
+    Enum {
+        value: String,
+        options: Vec<String>,
+    },
     EntityRef(EntityReference),
     /// F5-β.5.4 — parallel-array slot used to feed per-edge
     /// radii into `execute_fillet`. The element at index `i`
@@ -606,13 +620,14 @@ impl OperationsRegistry {
             1.0
         };
 
-        let radii_vec: Option<Vec<f64>> = command
-            .parameters
-            .get("radii")
-            .and_then(|param| match param.value() {
-                AIOperationParameter::NumberArray(values) => Some(values.clone()),
-                _ => None,
-            });
+        let radii_vec: Option<Vec<f64>> =
+            command
+                .parameters
+                .get("radii")
+                .and_then(|param| match param.value() {
+                    AIOperationParameter::NumberArray(values) => Some(values.clone()),
+                    _ => None,
+                });
 
         // Get target edges
         let mut edge_ids = Vec::new();
@@ -690,8 +705,7 @@ impl OperationsRegistry {
             preserve_edges: true,
             quality: crate::operations::fillet::FilletQuality::Standard,
             partial_corner_vertices: Vec::new(),
-            seam_continuity:
-                crate::operations::mixed_kind_corner_cap::SeamContinuity::C0,
+            seam_continuity: crate::operations::mixed_kind_corner_cap::SeamContinuity::C0,
         };
         // Get the solid_id from the first edge's parent face
         let solid_id = if !edge_ids.is_empty() {
@@ -789,8 +803,7 @@ impl OperationsRegistry {
             propagation: crate::operations::chamfer::PropagationMode::None,
             preserve_edges: false,
             partial_corner_vertices: Vec::new(),
-            seam_continuity:
-                crate::operations::mixed_kind_corner_cap::SeamContinuity::C0,
+            seam_continuity: crate::operations::mixed_kind_corner_cap::SeamContinuity::C0,
         };
 
         // Get the solid_id from the first edge's parent face
@@ -1756,10 +1769,8 @@ mod fillet_per_edge_radii_tests {
         }
 
         // Round-trip: serialised form is the bare array.
-        let back = serde_json::to_value(AIOperationParameter::NumberArray(vec![
-            0.5, 0.75, 1.0,
-        ]))
-        .expect("serialise NumberArray");
+        let back = serde_json::to_value(AIOperationParameter::NumberArray(vec![0.5, 0.75, 1.0]))
+            .expect("serialise NumberArray");
         assert_eq!(back, serde_json::json!([0.5, 0.75, 1.0]));
 
         // Negative: bare numbers and objects must still take the
@@ -1784,11 +1795,7 @@ mod fillet_per_edge_radii_tests {
             .operations
             .get("fillet")
             .expect("fillet must be registered");
-        let names: Vec<&str> = info
-            .parameters
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect();
+        let names: Vec<&str> = info.parameters.iter().map(|p| p.name.as_str()).collect();
         assert!(
             names.contains(&"radius"),
             "fillet must advertise `radius`, got {names:?}"

@@ -378,14 +378,7 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
         .first()
         .map(|v| format_scale(v.scale))
         .unwrap_or_else(|| "1:1".to_string());
-    emit_grid_cell(
-        dxf,
-        right_x,
-        grid_mid,
-        cell_h,
-        "SCALE",
-        &scale_label,
-    );
+    emit_grid_cell(dxf, right_x, grid_mid, cell_h, "SCALE", &scale_label);
     emit_grid_cell(dxf, col_mid, grid_mid, cell_h, "SIZE", &sheet.label());
     let sheet_label = format!(
         "{} OF {}",

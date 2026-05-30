@@ -137,10 +137,16 @@ fn split_u_partitions_parent_domain_contiguously() {
     // parent parameter mid = domain.0 + t·(domain.1−domain.0).
     let (a, b) = patch.domain_u;
     let mid = a + t * (b - a);
-    assert!((left.domain_u.0 - a).abs() < 1e-12, "left start = parent start");
+    assert!(
+        (left.domain_u.0 - a).abs() < 1e-12,
+        "left start = parent start"
+    );
     assert!((left.domain_u.1 - mid).abs() < 1e-12, "left end = mid");
     assert!((right.domain_u.0 - mid).abs() < 1e-12, "right start = mid");
-    assert!((right.domain_u.1 - b).abs() < 1e-12, "right end = parent end");
+    assert!(
+        (right.domain_u.1 - b).abs() < 1e-12,
+        "right end = parent end"
+    );
     // v-domain untouched by a u-split.
     assert_eq!(left.domain_v, patch.domain_v);
     assert_eq!(right.domain_v, patch.domain_v);

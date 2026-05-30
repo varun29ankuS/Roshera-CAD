@@ -152,13 +152,8 @@ fn cylinder_all_rims_succeed_with_cone_blend() {
 
     for which in 0..2 {
         let mut working_model = BRepModel::new();
-        let working_solid = make_cylinder(
-            &mut working_model,
-            Point3::ORIGIN,
-            Vector3::Z,
-            5.0,
-            10.0,
-        );
+        let working_solid =
+            make_cylinder(&mut working_model, Point3::ORIGIN, Vector3::Z, 5.0, 10.0);
         // Each model has its own EdgeIds — recompute the closed-edge
         // list per iteration. Cylinder construction is deterministic,
         // so index `which` selects the same rim across runs.
@@ -358,9 +353,7 @@ fn chamfer_closed_edge_cone_blend() {
         } else if curve.as_any().downcast_ref::<Line>().is_some() {
             line_refs += 1;
         } else {
-            panic!(
-                "edge {eid} in blend loop has unsupported curve type for a cone blend"
-            );
+            panic!("edge {eid} in blend loop has unsupported curve type for a cone blend");
         }
     }
     assert_eq!(
@@ -400,8 +393,7 @@ fn chamfer_closed_edge_cone_blend() {
     let v0 = PI * big_r * big_r * height;
     let r_small = big_r - d;
     let v_ring = PI * big_r * big_r * d;
-    let v_frustum =
-        (PI * d / 3.0) * (big_r * big_r + big_r * r_small + r_small * r_small);
+    let v_frustum = (PI * d / 3.0) * (big_r * big_r + big_r * r_small + r_small * r_small);
     let v_removed = v_ring - v_frustum;
     let expected = v0 - v_removed;
     let actual = model

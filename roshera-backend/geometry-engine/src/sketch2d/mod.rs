@@ -82,12 +82,12 @@ pub use sketch_solver::{
     DofReport, DofStatus, DragTarget, SketchSolveError, SketchSolveReport, SolveOptions,
 };
 
-pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
-pub use sketch_plane::{PlaneOrientation, SketchPlane};
-pub use snap::{SnapCandidate, SnapKind};
 pub use inference::{
     infer_constraints, DraftEntity, DraftSlot, InferenceTolerance, ProposedConstraint,
 };
+pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
+pub use sketch_plane::{PlaneOrientation, SketchPlane};
+pub use snap::{SnapCandidate, SnapKind};
 
 // Error types for 2D operations
 use thiserror::Error;

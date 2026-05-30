@@ -15,10 +15,10 @@
 
 use super::blend_graph::{self, BlendGraph, BlendRadius, BlendVertexKind, EdgeFilletProfile};
 use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
-use super::mixed_kind_corner_cap::SeamContinuity;
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::feasibility;
 use super::lifecycle::{self, OpSpec};
+use super::mixed_kind_corner_cap::SeamContinuity;
 use super::orientation::orient_face_for_outward;
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};
@@ -305,19 +305,15 @@ pub fn fillet_edges(
             // `validate_fillet_inputs`; here we treat it as 0.0 so
             // F6-α is a no-op and the input validator owns the
             // rejection.
-            FilletType::VariableStations(samples) => samples
-                .iter()
-                .map(|&(_, r)| r)
-                .fold(0.0_f64, f64::max),
+            FilletType::VariableStations(samples) => {
+                samples.iter().map(|&(_, r)| r).fold(0.0_f64, f64::max)
+            }
             // F5-β.5: per-edge map's largest constant radius. Empty
             // / missing-edge cases are rejected by
             // `validate_fillet_inputs`; treating the empty fold
             // identity as 0.0 keeps F6-α a no-op and lets the input
             // validator own the rejection.
-            FilletType::PerEdgeConstant(map) => map
-                .values()
-                .copied()
-                .fold(0.0_f64, f64::max),
+            FilletType::PerEdgeConstant(map) => map.values().copied().fold(0.0_f64, f64::max),
             // F5-β.5.6/.7: per-edge profile's largest *sample* radius
             // across every profile shape. `EdgeFilletProfile::
             // max_radius_bound` normalises Radius(Constant/Linear/
@@ -411,9 +407,7 @@ pub fn fillet_edges(
             let radii_to_check: Vec<f64> = match &options.fillet_type {
                 FilletType::Constant(r) => vec![*r],
                 FilletType::Variable(r1, r2) => vec![*r1, *r2],
-                FilletType::VariableStations(samples) => {
-                    samples.iter().map(|&(_, r)| r).collect()
-                }
+                FilletType::VariableStations(samples) => samples.iter().map(|&(_, r)| r).collect(),
                 // F5-β.5: pick this edge's per-edge radius out of the
                 // map for half-edge-length bounds-checking. Missing
                 // keys are rejected by `validate_fillet_inputs`
@@ -468,10 +462,9 @@ pub fn fillet_edges(
             // full curve has already been bounds-checked above; this
             // path only guards against the `radius <= 0` rejection
             // that comes next.
-            FilletType::VariableStations(samples) => samples
-                .first()
-                .map(|&(_, r)| r)
-                .unwrap_or(0.0),
+            FilletType::VariableStations(samples) => {
+                samples.first().map(|&(_, r)| r).unwrap_or(0.0)
+            }
             // F5-β.5: pick the smallest per-edge radius as the
             // representative for the legacy `radius > 0.0` gate.
             // Smallest, not largest, so a single zero / negative
@@ -568,13 +561,10 @@ pub fn fillet_edges(
         // this fillet arc terminates at a chamfer face, not at a
         // smooth-closure tangent / apex-sphere.
         {
-            let mut partial_corners: Vec<VertexId> =
-                options.partial_corner_vertices.clone();
+            let mut partial_corners: Vec<VertexId> = options.partial_corner_vertices.clone();
             if let Some(solid) = model.solids.get(solid_id) {
                 for vid in blend_graph.vertices.keys() {
-                    if solid.is_mixed_kind_corner_pending(*vid)
-                        && !partial_corners.contains(vid)
-                    {
+                    if solid.is_mixed_kind_corner_pending(*vid) && !partial_corners.contains(vid) {
                         partial_corners.push(*vid);
                     }
                 }
@@ -631,18 +621,10 @@ pub fn fillet_edges(
         if let Some(solid) = model.solids.get_mut(solid_id) {
             for s in &surgeries {
                 if s.original_v0_corner_shared {
-                    solid.record_corner_cap_edge(
-                        s.original_v0,
-                        s.cap_v0_edge,
-                        BlendKind::Fillet,
-                    );
+                    solid.record_corner_cap_edge(s.original_v0, s.cap_v0_edge, BlendKind::Fillet);
                 }
                 if s.original_v1_corner_shared {
-                    solid.record_corner_cap_edge(
-                        s.original_v1,
-                        s.cap_v1_edge,
-                        BlendKind::Fillet,
-                    );
+                    solid.record_corner_cap_edge(s.original_v1, s.cap_v1_edge, BlendKind::Fillet);
                 }
             }
         }
@@ -654,8 +636,14 @@ pub fn fillet_edges(
         // equal radius + concurrent axes). Other corner kinds pass
         // through; supported kinds outside today's MVP surface as
         // typed BlendFailure::VertexBlendUnsupported.
-        let corner_faces =
-            create_fillet_transitions(model, solid_id, &blend_graph, &edge_to_face, &corner_positions, options.seam_continuity)?;
+        let corner_faces = create_fillet_transitions(
+            model,
+            solid_id,
+            &blend_graph,
+            &edge_to_face,
+            &corner_positions,
+            options.seam_continuity,
+        )?;
         fillet_faces.extend(corner_faces);
 
         // CF-β.5.2-A — register every opt-in partial-mixed corner
@@ -887,10 +875,7 @@ fn validate_variable_stations(samples: &[(f64, f64)]) -> OperationResult<()> {
 /// names the offending edge (e.g.
 /// `fillet_type.PerEdgeProfile[42].Variable[3].station`) rather
 /// than the generic VariableStations label.
-fn validate_variable_stations_labelled(
-    samples: &[(f64, f64)],
-    label: &str,
-) -> OperationResult<()> {
+fn validate_variable_stations_labelled(samples: &[(f64, f64)], label: &str) -> OperationResult<()> {
     if samples.is_empty() {
         return Err(OperationError::InvalidInput {
             parameter: label.into(),
@@ -1151,11 +1136,17 @@ fn create_fillet_chain(
                 }
             }
             FilletType::Function(f) => create_function_radius_fillet(
-                model, edge_id, face1_id, face2_id, f, blend_graph, tol,
+                model,
+                edge_id,
+                face1_id,
+                face2_id,
+                f,
+                blend_graph,
+                tol,
             )?,
-            FilletType::Chord(chord) => create_chord_fillet(
-                model, edge_id, face1_id, face2_id, *chord, blend_graph, tol,
-            )?,
+            FilletType::Chord(chord) => {
+                create_chord_fillet(model, edge_id, face1_id, face2_id, *chord, blend_graph, tol)?
+            }
         };
 
         edge_faces.push((edge_id, fillet_face));
@@ -1200,12 +1191,8 @@ fn create_fillet_chain(
             // the prior-chamfer auto-detect so the stamp fires
             // whether the partial-mixed corner is opt-in (first
             // call of two) or auto-detected on the closing call.
-            let v0_partial_opt_in = options
-                .partial_corner_vertices
-                .contains(&s.original_v0);
-            let v1_partial_opt_in = options
-                .partial_corner_vertices
-                .contains(&s.original_v1);
+            let v0_partial_opt_in = options.partial_corner_vertices.contains(&s.original_v0);
+            let v1_partial_opt_in = options.partial_corner_vertices.contains(&s.original_v1);
             s.original_v0_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v0)
                 || v0_prior_chamfer
                 || v0_partial_opt_in;
@@ -1305,18 +1292,22 @@ fn create_constant_radius_fillet(
     let (trim_curve1, trim_curve2) =
         compute_fillet_trim_curves(model, &rolling_ball_data, face1_id, face2_id)?;
 
-    let cap_v0_center = *rolling_ball_data.centers.first().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
-    })?;
-    let cap_v1_center = *rolling_ball_data.centers.last().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
-    })?;
-    let cap_v0_radius = *rolling_ball_data.radii.first().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
-    })?;
-    let cap_v1_radius = *rolling_ball_data.radii.last().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
-    })?;
+    let cap_v0_center = *rolling_ball_data
+        .centers
+        .first()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball centers empty".to_string()))?;
+    let cap_v1_center = *rolling_ball_data
+        .centers
+        .last()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball centers empty".to_string()))?;
+    let cap_v0_radius = *rolling_ball_data
+        .radii
+        .first()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball radii empty".to_string()))?;
+    let cap_v1_radius = *rolling_ball_data
+        .radii
+        .last()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball radii empty".to_string()))?;
 
     // Create fillet face with proper trimming. Constant-radius rolling
     // balls trace cylindrical or toroidal surfaces whose natural u=const
@@ -1402,12 +1393,9 @@ fn create_variable_radius_fillet(
     // v_t1_start (contact1[0]) — i.e. v_max → v_min at u_min — and
     // cap_V1 to go from v_t1_end (contact1[N]) to v_t2_end
     // (contact2[N]) — i.e. v_min → v_max at u_max.
-    let ((surf_u_min, surf_u_max), (surf_v_min, surf_v_max)) =
-        fillet_surface.parameter_bounds();
-    let cap_v0_curve =
-        sample_cap_iso_curve(&*fillet_surface, surf_u_min, surf_v_max, surf_v_min)?;
-    let cap_v1_curve =
-        sample_cap_iso_curve(&*fillet_surface, surf_u_max, surf_v_min, surf_v_max)?;
+    let ((surf_u_min, surf_u_max), (surf_v_min, surf_v_max)) = fillet_surface.parameter_bounds();
+    let cap_v0_curve = sample_cap_iso_curve(&*fillet_surface, surf_u_min, surf_v_max, surf_v_min)?;
+    let cap_v1_curve = sample_cap_iso_curve(&*fillet_surface, surf_u_max, surf_v_min, surf_v_max)?;
 
     let surface_id = model.surfaces.add(fillet_surface);
 
@@ -1415,18 +1403,22 @@ fn create_variable_radius_fillet(
     let (trim_curve1, trim_curve2) =
         compute_fillet_trim_curves(model, &rolling_ball_data, face1_id, face2_id)?;
 
-    let cap_v0_center = *rolling_ball_data.centers.first().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
-    })?;
-    let cap_v1_center = *rolling_ball_data.centers.last().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
-    })?;
-    let cap_v0_radius = *rolling_ball_data.radii.first().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
-    })?;
-    let cap_v1_radius = *rolling_ball_data.radii.last().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
-    })?;
+    let cap_v0_center = *rolling_ball_data
+        .centers
+        .first()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball centers empty".to_string()))?;
+    let cap_v1_center = *rolling_ball_data
+        .centers
+        .last()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball centers empty".to_string()))?;
+    let cap_v0_radius = *rolling_ball_data
+        .radii
+        .first()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball radii empty".to_string()))?;
+    let cap_v1_radius = *rolling_ball_data
+        .radii
+        .last()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball radii empty".to_string()))?;
 
     // Create fillet face with surface-sampled cap NURBS
     create_trimmed_fillet_face(
@@ -1718,9 +1710,7 @@ fn cylinder_rim_fillet(
         }
         (
             rim_idx.ok_or_else(|| {
-                OperationError::InvalidGeometry(
-                    "Rim edge not found in lateral loop".to_string(),
-                )
+                OperationError::InvalidGeometry("Rim edge not found in lateral loop".to_string())
             })?,
             seam_id.ok_or_else(|| {
                 OperationError::InvalidGeometry(
@@ -1888,9 +1878,10 @@ fn cylinder_rim_fillet(
         })?
     };
     {
-        let cap_loop = model.loops.get_mut(cap_loop_id).ok_or_else(|| {
-            OperationError::InvalidGeometry("Cap loop missing (mut)".to_string())
-        })?;
+        let cap_loop = model
+            .loops
+            .get_mut(cap_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap loop missing (mut)".to_string()))?;
         for (i, edge) in cap_loop.edges.iter_mut().enumerate() {
             if *edge == rim_edge_id {
                 *edge = cap_trim_edge_id;
@@ -1922,9 +1913,7 @@ fn cylinder_rim_fillet(
         .get(lat_face_id)
         .map(|f| f.surface_id)
         .ok_or_else(|| {
-            OperationError::InvalidGeometry(
-                "Lateral face missing for surface swap".to_string(),
-            )
+            OperationError::InvalidGeometry("Lateral face missing for surface swap".to_string())
         })?;
     let new_height = new_height_limits[1] - new_height_limits[0];
     let new_origin = origin + axis * new_height_limits[0];
@@ -2161,30 +2150,31 @@ fn create_function_radius_fillet(
     // A non-constant radius profile (function radius) makes the
     // surface's cross-section plane tilt with `dr/du`, so the
     // perpendicular-plane Arc cap drifts off the surface.
-    let ((surf_u_min, surf_u_max), (surf_v_min, surf_v_max)) =
-        fillet_surface.parameter_bounds();
-    let cap_v0_curve =
-        sample_cap_iso_curve(&*fillet_surface, surf_u_min, surf_v_max, surf_v_min)?;
-    let cap_v1_curve =
-        sample_cap_iso_curve(&*fillet_surface, surf_u_max, surf_v_min, surf_v_max)?;
+    let ((surf_u_min, surf_u_max), (surf_v_min, surf_v_max)) = fillet_surface.parameter_bounds();
+    let cap_v0_curve = sample_cap_iso_curve(&*fillet_surface, surf_u_min, surf_v_max, surf_v_min)?;
+    let cap_v1_curve = sample_cap_iso_curve(&*fillet_surface, surf_u_max, surf_v_min, surf_v_max)?;
 
     let surface_id = model.surfaces.add(fillet_surface);
 
     let (trim_curve1, trim_curve2) =
         compute_fillet_trim_curves(model, &rolling_ball_data, face1_id, face2_id)?;
 
-    let cap_v0_center = *rolling_ball_data.centers.first().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
-    })?;
-    let cap_v1_center = *rolling_ball_data.centers.last().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball centers empty".to_string())
-    })?;
-    let cap_v0_radius = *rolling_ball_data.radii.first().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
-    })?;
-    let cap_v1_radius = *rolling_ball_data.radii.last().ok_or_else(|| {
-        OperationError::InvalidGeometry("Rolling-ball radii empty".to_string())
-    })?;
+    let cap_v0_center = *rolling_ball_data
+        .centers
+        .first()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball centers empty".to_string()))?;
+    let cap_v1_center = *rolling_ball_data
+        .centers
+        .last()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball centers empty".to_string()))?;
+    let cap_v0_radius = *rolling_ball_data
+        .radii
+        .first()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball radii empty".to_string()))?;
+    let cap_v1_radius = *rolling_ball_data
+        .radii
+        .last()
+        .ok_or_else(|| OperationError::InvalidGeometry("Rolling-ball radii empty".to_string()))?;
 
     create_trimmed_fillet_face(
         model,
@@ -2539,7 +2529,7 @@ fn find_cap_arc_edge_by_cylinder_axis(
     corner_apex: Point3,
 ) -> Option<EdgeId> {
     const NORMAL_PARALLEL_TOL_SQ: f64 = 1.0e-18; // (1e-9)^2
-    const AXIS_DISTANCE_TOL_SQ: f64 = 1.0e-14;   // (1e-7)^2
+    const AXIS_DISTANCE_TOL_SQ: f64 = 1.0e-14; // (1e-7)^2
 
     let face = model.faces.get(fillet_face_id)?;
     let outer_loop = model.loops.get(face.outer_loop)?;
@@ -2700,13 +2690,8 @@ fn intersect_two_caps(
     let s_plus = -b_half + sqrt_disc;
     let s_minus = -b_half - sqrt_disc;
 
-    let make_candidate = |s: f64| -> Point3 {
-        Point3::new(
-            p0.x + s * d_ij.x,
-            p0.y + s * d_ij.y,
-            p0.z + s * d_ij.z,
-        )
-    };
+    let make_candidate =
+        |s: f64| -> Point3 { Point3::new(p0.x + s * d_ij.x, p0.y + s * d_ij.y, p0.z + s * d_ij.z) };
     let on_second_circle = |x: Point3| -> bool {
         let dx = x.x - c_j.x;
         let dy = x.y - c_j.y;
@@ -2763,14 +2748,15 @@ pub(crate) fn verify_cap_arcs_form_closed_triangle(
 ) -> Result<([VertexId; 3], [bool; 3]), BlendFailure> {
     let mut endpoints = [(0u32, 0u32); 3];
     for (i, &edge_id) in cap_arc_edges.iter().enumerate() {
-        let edge = model.edges.get(edge_id).ok_or_else(|| {
-            BlendFailure::TopologyViolation {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| BlendFailure::TopologyViolation {
                 detail: format!(
                     "cap-arc edge {:?} missing from model during corner-blend cycle check",
                     edge_id
                 ),
-            }
-        })?;
+            })?;
         endpoints[i] = (edge.start_vertex, edge.end_vertex);
     }
 
@@ -2854,13 +2840,11 @@ fn compute_concurrent_axes_center(
     let mut b = Vector3::new(0.0, 0.0, 0.0);
 
     for incident in filleted {
-        let blend = incident
-            .blend
-            .as_ref()
-            .ok_or_else(|| OperationError::InvalidGeometry(
-                "compute_concurrent_axes_center received an unclassified incident edge"
-                    .to_string(),
-            ))?;
+        let blend = incident.blend.as_ref().ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "compute_concurrent_axes_center received an unclassified incident edge".to_string(),
+            )
+        })?;
         let u = blend.axis;
         let q = blend.axis_origin;
 
@@ -2972,8 +2956,8 @@ fn apply_apex_sphere_corner(
     // Step 1 — locate the three V-side cap arcs.
     let mut cap_arc_edges: [EdgeId; 3] = [0; 3];
     for (i, &face_id) in fillet_face_ids.iter().enumerate() {
-        cap_arc_edges[i] = find_cap_arc_edge_at_vertex(model, face_id, sphere_center)
-            .ok_or_else(|| {
+        cap_arc_edges[i] =
+            find_cap_arc_edge_at_vertex(model, face_id, sphere_center).ok_or_else(|| {
                 OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
                     vertex: vertex_id,
                     kind: BlendVertexKind::ConvexCorner { degree: 3 },
@@ -3252,12 +3236,7 @@ fn apply_triangular_nurbs_corner(
             )?;
         }
         if old_beta != new_beta {
-            reanchor_seam_edges_at_cap_arc_endpoint(
-                model,
-                fillet_face_ids[i],
-                old_beta,
-                new_beta,
-            )?;
+            reanchor_seam_edges_at_cap_arc_endpoint(model, fillet_face_ids[i], old_beta, new_beta)?;
         }
     }
 
@@ -3353,10 +3332,7 @@ fn apply_triangular_nurbs_corner(
         2,
     )
     .map_err(|e| {
-        OperationError::NumericalError(format!(
-            "F5-β triangular NURBS construction failed: {}",
-            e
-        ))
+        OperationError::NumericalError(format!("F5-β triangular NURBS construction failed: {}", e))
     })?;
     let corner_surface = GeneralNurbsSurface { nurbs };
 
@@ -3365,14 +3341,13 @@ fn apply_triangular_nurbs_corner(
     // The parametric midpoint (u=0.5, v=0.5) is well-defined for
     // this patch (away from the u=1 degenerate column) and gives
     // a reliable interior normal sample.
-    let orientation =
-        crate::operations::orientation::orient_face_for_outward_at(
-            &corner_surface,
-            vertex_outward,
-            0.5,
-            0.5,
-        )
-        .unwrap_or(FaceOrientation::Forward);
+    let orientation = crate::operations::orientation::orient_face_for_outward_at(
+        &corner_surface,
+        vertex_outward,
+        0.5,
+        0.5,
+    )
+    .unwrap_or(FaceOrientation::Forward);
 
     let (_corner_vertices, loop_forwards) =
         verify_cap_arcs_form_closed_triangle(model, &cap_arc_edges)
@@ -3425,9 +3400,7 @@ fn apply_triangular_nurbs_corner(
     for vid in to_drop {
         // Only drop if no edge references it AND it wasn't reused
         // by add_or_find for one of the new endpoints.
-        let reused = new_vertex_pairs
-            .iter()
-            .any(|(a, b)| *a == vid || *b == vid);
+        let reused = new_vertex_pairs.iter().any(|(a, b)| *a == vid || *b == vid);
         if reused {
             continue;
         }
@@ -3751,9 +3724,7 @@ fn reanchor_seam_edges_at_cap_arc_endpoint(
 /// helper guards instead of splitting. Callers see
 /// `Err(OperationError::InvalidGeometry)` when the precondition
 /// fails.
-fn arc_to_rational_quadratic_controls(
-    arc: &Arc,
-) -> OperationResult<([Point3; 3], [f64; 3])> {
+fn arc_to_rational_quadratic_controls(arc: &Arc) -> OperationResult<([Point3; 3], [f64; 3])> {
     let sweep = arc.sweep_angle;
     if !sweep.is_finite() || sweep.abs() >= std::f64::consts::PI {
         return Err(OperationError::InvalidGeometry(format!(
@@ -4494,13 +4465,14 @@ fn create_nurbs_fillet_surface(data: &RollingBallData) -> OperationResult<Box<dy
     // every sample independently.
     let resampled_radii = resample_radii_uniform(&data.radii, 20);
 
-    let fillet = VariableRadiusFillet::with_radius_profile(spine, resampled_radii, contact1, contact2)
-        .map_err(|e| {
-            OperationError::NumericalError(format!(
-                "Failed to create variable radius fillet: {:?}",
-                e
-            ))
-        })?;
+    let fillet =
+        VariableRadiusFillet::with_radius_profile(spine, resampled_radii, contact1, contact2)
+            .map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "Failed to create variable radius fillet: {:?}",
+                    e
+                ))
+            })?;
 
     Ok(Box::new(fillet))
 }
@@ -4885,30 +4857,22 @@ fn create_trimmed_fillet_face(
         // The returned `BlendEdgeSurgery` carries every new ID so
         // `update_adjacent_faces` can re-stitch F1, F2, F3, F4 around
         // the freshly-built blend face.
-        let v_t1_start = model.vertices.add_or_find(
-            trim1_first.x,
-            trim1_first.y,
-            trim1_first.z,
-            endpoint_tol,
-        );
-        let v_t1_end = model.vertices.add_or_find(
-            trim1_last.x,
-            trim1_last.y,
-            trim1_last.z,
-            endpoint_tol,
-        );
-        let v_t2_start = model.vertices.add_or_find(
-            trim2_first.x,
-            trim2_first.y,
-            trim2_first.z,
-            endpoint_tol,
-        );
-        let v_t2_end = model.vertices.add_or_find(
-            trim2_last.x,
-            trim2_last.y,
-            trim2_last.z,
-            endpoint_tol,
-        );
+        let v_t1_start =
+            model
+                .vertices
+                .add_or_find(trim1_first.x, trim1_first.y, trim1_first.z, endpoint_tol);
+        let v_t1_end =
+            model
+                .vertices
+                .add_or_find(trim1_last.x, trim1_last.y, trim1_last.z, endpoint_tol);
+        let v_t2_start =
+            model
+                .vertices
+                .add_or_find(trim2_first.x, trim2_first.y, trim2_first.z, endpoint_tol);
+        let v_t2_end =
+            model
+                .vertices
+                .add_or_find(trim2_last.x, trim2_last.y, trim2_last.z, endpoint_tol);
 
         let edge_trim1 = Edge::new(
             0,
@@ -4947,13 +4911,15 @@ fn create_trimmed_fillet_face(
                     - Point3::new(start_pos[0], start_pos[1], start_pos[2]))
                 .normalize()
                 .map_err(|e| {
-                    OperationError::NumericalError(format!(
-                        "Edge axis normalize failed: {:?}",
-                        e
-                    ))
+                    OperationError::NumericalError(format!("Edge axis normalize failed: {:?}", e))
                 })?;
-                let v1_arc =
-                    build_cap_arc(cap_v1_center, axis_dir, cap_v1_radius, trim1_last, trim2_last)?;
+                let v1_arc = build_cap_arc(
+                    cap_v1_center,
+                    axis_dir,
+                    cap_v1_radius,
+                    trim1_last,
+                    trim2_last,
+                )?;
                 let v0_arc = build_cap_arc(
                     cap_v0_center,
                     axis_dir,
@@ -5062,10 +5028,8 @@ fn create_trimmed_fillet_face(
             0.5 * (start_pos[1] + end_pos[1]),
             0.5 * (start_pos[2] + end_pos[2]),
         );
-        let n1 = get_face_oriented_normal(model, face1_id, &edge_mid)
-            .unwrap_or(Vector3::Z);
-        let n2 = get_face_oriented_normal(model, face2_id, &edge_mid)
-            .unwrap_or(Vector3::Z);
+        let n1 = get_face_oriented_normal(model, face1_id, &edge_mid).unwrap_or(Vector3::Z);
+        let n2 = get_face_oriented_normal(model, face2_id, &edge_mid).unwrap_or(Vector3::Z);
         let bisector = n1 + n2;
         if bisector.magnitude_squared() > 1e-20 {
             bisector
@@ -5273,13 +5237,11 @@ fn create_fillet_transitions(
                 BlendKind::Chamfer,
             );
 
-            let mut cap_edges_with_kind: Vec<(
-                EdgeId,
-                super::mixed_kind_corner_cap::RimKind,
-            )> = fillet_rim_arcs
-                .iter()
-                .map(|&e| (e, super::mixed_kind_corner_cap::RimKind::ArcRim))
-                .collect();
+            let mut cap_edges_with_kind: Vec<(EdgeId, super::mixed_kind_corner_cap::RimKind)> =
+                fillet_rim_arcs
+                    .iter()
+                    .map(|&e| (e, super::mixed_kind_corner_cap::RimKind::ArcRim))
+                    .collect();
             for line_eid in &chamfer_rim_lines {
                 cap_edges_with_kind
                     .push((*line_eid, super::mixed_kind_corner_cap::RimKind::LinearRim));
@@ -5478,8 +5440,7 @@ fn create_fillet_transitions(
                     let u = d.axis;
                     let v = corner_apex - q;
                     let dot = v.x * u.x + v.y * u.y + v.z * u.z;
-                    let perp =
-                        Vector3::new(v.x - dot * u.x, v.y - dot * u.y, v.z - dot * u.z);
+                    let perp = Vector3::new(v.x - dot * u.x, v.y - dot * u.y, v.z - dot * u.z);
                     (perp.x * perp.x + perp.y * perp.y + perp.z * perp.z).sqrt()
                 })
                 .fold(0.0_f64, f64::max);
@@ -5539,8 +5500,8 @@ fn create_fillet_transitions(
             // by centre-coincidence and picks exactly the V-side cap.
             let mut fillet_rim_arcs: Vec<EdgeId> = Vec::with_capacity(face_ids.len());
             for fid in face_ids.iter() {
-                let arc = find_cap_arc_edge_at_vertex(model, *fid, corner_apex).ok_or_else(
-                    || {
+                let arc =
+                    find_cap_arc_edge_at_vertex(model, *fid, corner_apex).ok_or_else(|| {
                         OperationError::BlendFailed(Box::new(
                             BlendFailure::VertexBlendUnsupported {
                                 vertex: corner.id,
@@ -5548,24 +5509,20 @@ fn create_fillet_transitions(
                                 reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
                             },
                         ))
-                    },
-                )?;
+                    })?;
                 fillet_rim_arcs.push(arc);
             }
-            let chamfer_rim_lines =
-                super::mixed_kind_corner_cap::find_blend_cap_edges_at_vertex(
-                    model,
-                    solid_id,
-                    corner.id,
-                    BlendKind::Chamfer,
-                );
-            let mut cap_edges_with_kind: Vec<(
-                EdgeId,
-                super::mixed_kind_corner_cap::RimKind,
-            )> = fillet_rim_arcs
-                .iter()
-                .map(|&e| (e, super::mixed_kind_corner_cap::RimKind::ArcRim))
-                .collect();
+            let chamfer_rim_lines = super::mixed_kind_corner_cap::find_blend_cap_edges_at_vertex(
+                model,
+                solid_id,
+                corner.id,
+                BlendKind::Chamfer,
+            );
+            let mut cap_edges_with_kind: Vec<(EdgeId, super::mixed_kind_corner_cap::RimKind)> =
+                fillet_rim_arcs
+                    .iter()
+                    .map(|&e| (e, super::mixed_kind_corner_cap::RimKind::ArcRim))
+                    .collect();
             for line_eid in &chamfer_rim_lines {
                 cap_edges_with_kind
                     .push((*line_eid, super::mixed_kind_corner_cap::RimKind::LinearRim));
@@ -6413,10 +6370,7 @@ fn validate_fillet_inputs(
                                     "fillet_type.PerEdgeProfile[{}].Constant",
                                     edge_id
                                 ),
-                                expected: format!(
-                                    "finite radius > tolerance ({:.3e})",
-                                    tol
-                                ),
+                                expected: format!("finite radius > tolerance ({:.3e})", tol),
                                 received: format!("{r}"),
                             });
                         }
@@ -6428,10 +6382,7 @@ fn validate_fillet_inputs(
                                     "fillet_type.PerEdgeProfile[{}].Linear.start",
                                     edge_id
                                 ),
-                                expected: format!(
-                                    "finite radius > tolerance ({:.3e})",
-                                    tol
-                                ),
+                                expected: format!("finite radius > tolerance ({:.3e})", tol),
                                 received: format!("{start}"),
                             });
                         }
@@ -6441,32 +6392,20 @@ fn validate_fillet_inputs(
                                     "fillet_type.PerEdgeProfile[{}].Linear.end",
                                     edge_id
                                 ),
-                                expected: format!(
-                                    "finite radius > tolerance ({:.3e})",
-                                    tol
-                                ),
+                                expected: format!("finite radius > tolerance ({:.3e})", tol),
                                 received: format!("{end}"),
                             });
                         }
                     }
                     EdgeFilletProfile::Radius(BlendRadius::Variable(samples)) => {
-                        let label = format!(
-                            "fillet_type.PerEdgeProfile[{}].Variable",
-                            edge_id
-                        );
+                        let label = format!("fillet_type.PerEdgeProfile[{}].Variable", edge_id);
                         validate_variable_stations_labelled(samples, &label)?;
                     }
                     EdgeFilletProfile::Chord(c) => {
                         if !c.is_finite() || *c <= tol {
                             return Err(OperationError::InvalidInput {
-                                parameter: format!(
-                                    "fillet_type.PerEdgeProfile[{}].Chord",
-                                    edge_id
-                                ),
-                                expected: format!(
-                                    "finite chord length > tolerance ({:.3e})",
-                                    tol
-                                ),
+                                parameter: format!("fillet_type.PerEdgeProfile[{}].Chord", edge_id),
+                                expected: format!("finite chord length > tolerance ({:.3e})", tol),
                                 received: format!("{c}"),
                             });
                         }
@@ -6742,7 +6681,11 @@ mod tests {
         let samples = vec![(0.0, 0.0), (1.0, 1.0)];
         let err = validate_variable_stations(&samples).unwrap_err();
         match err {
-            OperationError::InvalidInput { parameter, expected, .. } => {
+            OperationError::InvalidInput {
+                parameter,
+                expected,
+                ..
+            } => {
                 assert!(parameter.contains("radius"));
                 assert_eq!(expected, "> 0");
             }
@@ -7054,15 +6997,27 @@ mod tests {
         let c1 = model.curves.add(Box::new(l1));
         let c2 = model.curves.add(Box::new(l2));
         let c3 = model.curves.add(Box::new(l3));
-        let e1 = model
-            .edges
-            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
-        let e2 = model
-            .edges
-            .add(Edge::new_auto_range(0, v1, v2, c2, EdgeOrientation::Forward));
-        let e3 = model
-            .edges
-            .add(Edge::new_auto_range(0, v2, v3, c3, EdgeOrientation::Forward));
+        let e1 = model.edges.add(Edge::new_auto_range(
+            0,
+            v0,
+            v1,
+            c1,
+            EdgeOrientation::Forward,
+        ));
+        let e2 = model.edges.add(Edge::new_auto_range(
+            0,
+            v1,
+            v2,
+            c2,
+            EdgeOrientation::Forward,
+        ));
+        let e3 = model.edges.add(Edge::new_auto_range(
+            0,
+            v2,
+            v3,
+            c3,
+            EdgeOrientation::Forward,
+        ));
         let chains = group_edges_into_chains(&model, &[e1, e2, e3]).expect("group");
         assert_eq!(chains.len(), 1);
         assert_eq!(chains[0].len(), 3);
@@ -7089,12 +7044,20 @@ mod tests {
         let l2 = Line::new(Point3::new(1.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0));
         let c1 = model.curves.add(Box::new(l1));
         let c2 = model.curves.add(Box::new(l2));
-        let e1 = model
-            .edges
-            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
-        let e2 = model
-            .edges
-            .add(Edge::new_auto_range(0, v1, v2, c2, EdgeOrientation::Forward));
+        let e1 = model.edges.add(Edge::new_auto_range(
+            0,
+            v0,
+            v1,
+            c1,
+            EdgeOrientation::Forward,
+        ));
+        let e2 = model.edges.add(Edge::new_auto_range(
+            0,
+            v1,
+            v2,
+            c2,
+            EdgeOrientation::Forward,
+        ));
         assert!(are_edges_tangent(&model, e1, e2).expect("tangent"));
     }
 
@@ -7108,12 +7071,20 @@ mod tests {
         let l2 = Line::new(Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0));
         let c1 = model.curves.add(Box::new(l1));
         let c2 = model.curves.add(Box::new(l2));
-        let e1 = model
-            .edges
-            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
-        let e2 = model
-            .edges
-            .add(Edge::new_auto_range(0, v1, v2, c2, EdgeOrientation::Forward));
+        let e1 = model.edges.add(Edge::new_auto_range(
+            0,
+            v0,
+            v1,
+            c1,
+            EdgeOrientation::Forward,
+        ));
+        let e2 = model.edges.add(Edge::new_auto_range(
+            0,
+            v1,
+            v2,
+            c2,
+            EdgeOrientation::Forward,
+        ));
         assert!(!are_edges_tangent(&model, e1, e2).expect("tangent"));
     }
 
@@ -7151,12 +7122,20 @@ mod tests {
         let l2 = Line::new(Point3::ORIGIN, Point3::new(0.0, 1.0, 0.0));
         let c1 = model.curves.add(Box::new(l1));
         let c2 = model.curves.add(Box::new(l2));
-        let e1 = model
-            .edges
-            .add(Edge::new_auto_range(0, v0, v1, c1, EdgeOrientation::Forward));
-        let e2 = model
-            .edges
-            .add(Edge::new_auto_range(0, v0, v2, c2, EdgeOrientation::Forward));
+        let e1 = model.edges.add(Edge::new_auto_range(
+            0,
+            v0,
+            v1,
+            c1,
+            EdgeOrientation::Forward,
+        ));
+        let e2 = model.edges.add(Edge::new_auto_range(
+            0,
+            v0,
+            v2,
+            c2,
+            EdgeOrientation::Forward,
+        ));
         let edges = find_edges_at_vertex(&model, v0).expect("edges");
         assert!(edges.contains(&e1));
         assert!(edges.contains(&e2));
@@ -7484,8 +7463,7 @@ mod tests {
             "axes must span ℝ³ with |det| > 0.1",
             |(u, v, w)| {
                 // Determinant of the matrix [u | v | w] (column-stacked).
-                let det = u.x * (v.y * w.z - v.z * w.y)
-                    - u.y * (v.x * w.z - v.z * w.x)
+                let det = u.x * (v.y * w.z - v.z * w.y) - u.y * (v.x * w.z - v.z * w.x)
                     + u.z * (v.x * w.y - v.y * w.x);
                 det.abs() > 0.1
             },
@@ -7689,10 +7667,7 @@ mod tests {
     #[test]
     fn signs_indicate_inflection_all_positive_returns_false() {
         // A consistently convex edge: every sample is > +threshold.
-        assert!(!signs_indicate_inflection(
-            &[0.5, 1.0, 1.2, 0.8, 0.3],
-            0.05
-        ));
+        assert!(!signs_indicate_inflection(&[0.5, 1.0, 1.2, 0.8, 0.3], 0.05));
     }
 
     #[test]
@@ -7726,10 +7701,7 @@ mod tests {
         // The other side is below threshold → indeterminate, not a
         // sign flip. Without this gate, floating-point noise around
         // a tangent-coincident region would generate false positives.
-        assert!(!signs_indicate_inflection(
-            &[0.4, 0.3, -0.01, -0.02],
-            0.05
-        ));
+        assert!(!signs_indicate_inflection(&[0.4, 0.3, -0.01, -0.02], 0.05));
         assert!(!signs_indicate_inflection(&[0.02, 0.01, -0.4, -0.3], 0.05));
     }
 
@@ -7751,10 +7723,7 @@ mod tests {
         // at the boundary should be deterministic, not flicker.
         assert!(!signs_indicate_inflection(&[0.05, -0.05], 0.05));
         // A hair past the threshold on both sides DOES count.
-        assert!(signs_indicate_inflection(
-            &[0.051, -0.051],
-            0.05
-        ));
+        assert!(signs_indicate_inflection(&[0.051, -0.051], 0.05));
     }
 
     #[test]
@@ -7764,31 +7733,15 @@ mod tests {
         // model. We use a bogus EdgeId/FaceId because the function
         // must return before any lookups.
         let model = BRepModel::new();
-        let edge = Edge::new_auto_range(
-            0,
-            0,
-            1,
-            0,
-            EdgeOrientation::Forward,
+        let edge = Edge::new_auto_range(0, 0, 1, 0, EdgeOrientation::Forward);
+        assert!(
+            !detect_dihedral_inflection(&model, &edge, 999_u32, 999_u32, 999_u32, 0)
+                .expect("sample_count = 0 must short-circuit to Ok(false)")
         );
-        assert!(!detect_dihedral_inflection(
-            &model,
-            &edge,
-            999_u32,
-            999_u32,
-            999_u32,
-            0
-        )
-        .expect("sample_count = 0 must short-circuit to Ok(false)"));
-        assert!(!detect_dihedral_inflection(
-            &model,
-            &edge,
-            999_u32,
-            999_u32,
-            999_u32,
-            1
-        )
-        .expect("sample_count = 1 must short-circuit to Ok(false)"));
+        assert!(
+            !detect_dihedral_inflection(&model, &edge, 999_u32, 999_u32, 999_u32, 1)
+                .expect("sample_count = 1 must short-circuit to Ok(false)")
+        );
     }
 
     // -------------------------------------------------------------------
@@ -7902,8 +7855,8 @@ mod tests {
             pt(0.0, 0.0, 0.0),
             vec3(1.0, 0.0, 0.0),
             1.0,
-            pt(0.0, 0.0, 2.0),     // vertex along +z
-            vec3(0.0, 0.0, 1.0),   // outward +z
+            pt(0.0, 0.0, 2.0),   // vertex along +z
+            vec3(0.0, 0.0, 1.0), // outward +z
         )
         .expect("two unit caps must intersect");
         assert!(
@@ -8053,9 +8006,9 @@ mod tests {
     /// the loop's curves, not the surface.
     fn build_face_with_arcs(model: &mut BRepModel, arcs: Vec<Arc>) -> FaceId {
         use crate::primitives::face::FaceOrientation;
-        let surface_id = model
-            .surfaces
-            .add(Box::new(Sphere::new(pt(0.0, 0.0, 0.0), 1.0).expect("sphere")));
+        let surface_id = model.surfaces.add(Box::new(
+            Sphere::new(pt(0.0, 0.0, 0.0), 1.0).expect("sphere"),
+        ));
         let mut lp = Loop::new(0, LoopType::Outer);
         for arc in arcs {
             let v0 = model.vertices.add(0.0, 0.0, 0.0);
@@ -8221,14 +8174,8 @@ mod tests {
     /// start / end positions so the edge is geometrically consistent
     /// from the outset.
     fn build_single_arc_edge(model: &mut BRepModel, arc: Arc) -> EdgeId {
-        let start_pt = arc
-            .evaluate(0.0)
-            .expect("arc start evaluable")
-            .position;
-        let end_pt = arc
-            .evaluate(1.0)
-            .expect("arc end evaluable")
-            .position;
+        let start_pt = arc.evaluate(0.0).expect("arc start evaluable").position;
+        let end_pt = arc.evaluate(1.0).expect("arc end evaluable").position;
         let v0 = model.vertices.add(start_pt.x, start_pt.y, start_pt.z);
         let v1 = model.vertices.add(end_pt.x, end_pt.y, end_pt.z);
         let curve_id = model.curves.add(Box::new(arc));
@@ -8267,7 +8214,11 @@ mod tests {
             new_start,
             new_end,
             pt(1.0, 1.0, 0.0),
-            vec3(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2, 0.0),
+            vec3(
+                std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+            ),
             1.0e-9,
         )
         .expect("trim succeeds");
@@ -8375,14 +8326,8 @@ mod tests {
         // evaluates the arc directly and uses VertexStore::add — which
         // is fine, but we hand-build here for explicit control over
         // the start / end positions.
-        let start = original
-            .evaluate(0.0)
-            .expect("start eval")
-            .position;
-        let end = original
-            .evaluate(1.0)
-            .expect("end eval")
-            .position;
+        let start = original.evaluate(0.0).expect("start eval").position;
+        let end = original.evaluate(1.0).expect("end eval").position;
         let v0 = model.vertices.add(start.x, start.y, start.z);
         let v1 = model.vertices.add(end.x, end.y, end.z);
         let curve_id = model.curves.add(Box::new(original));
@@ -8395,7 +8340,11 @@ mod tests {
             start,
             end,
             pt(1.0, 1.0, 0.0),
-            vec3(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2, 0.0),
+            vec3(
+                std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+            ),
             1.0e-9,
         )
         .expect("trim succeeds (same endpoints)");
@@ -8441,7 +8390,11 @@ mod tests {
             pt(1.0, 0.0, 0.0),
             pt(0.5, 0.5, 0.0), // |·| = √0.5 ≠ 1, off the circle
             pt(1.0, 1.0, 0.0),
-            vec3(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2, 0.0),
+            vec3(
+                std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+            ),
             1.0e-9,
         );
         match result {
@@ -8499,12 +8452,9 @@ mod tests {
         let u = 0.5;
         let b = [(1.0 - u) * (1.0 - u), 2.0 * u * (1.0 - u), u * u];
         let denom = ws[0] * b[0] + ws[1] * b[1] + ws[2] * b[2];
-        let num_x =
-            ws[0] * b[0] * pts[0].x + ws[1] * b[1] * pts[1].x + ws[2] * b[2] * pts[2].x;
-        let num_y =
-            ws[0] * b[0] * pts[0].y + ws[1] * b[1] * pts[1].y + ws[2] * b[2] * pts[2].y;
-        let num_z =
-            ws[0] * b[0] * pts[0].z + ws[1] * b[1] * pts[1].z + ws[2] * b[2] * pts[2].z;
+        let num_x = ws[0] * b[0] * pts[0].x + ws[1] * b[1] * pts[1].x + ws[2] * b[2] * pts[2].x;
+        let num_y = ws[0] * b[0] * pts[0].y + ws[1] * b[1] * pts[1].y + ws[2] * b[2] * pts[2].y;
+        let num_z = ws[0] * b[0] * pts[0].z + ws[1] * b[1] * pts[1].z + ws[2] * b[2] * pts[2].z;
         let mid = pt(num_x / denom, num_y / denom, num_z / denom);
         let expected = pt(
             std::f64::consts::FRAC_1_SQRT_2,
@@ -8692,10 +8642,7 @@ mod tests {
         let result = validate_fillet_inputs(&model, solid_id, &edges[..1], &opts);
         match result {
             Err(OperationError::InvalidInput { received, .. }) => {
-                assert!(
-                    received.contains("not in the selection"),
-                    "{received}"
-                );
+                assert!(received.contains("not in the selection"), "{received}");
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
@@ -8822,8 +8769,14 @@ mod tests {
         // entries in ascending edge-id order so replay diffs of
         // recorded-operation JSON are stable.
         let mut a = HashMap::new();
-        a.insert(11_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(3.0)));
-        a.insert(2_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)));
+        a.insert(
+            11_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(3.0)),
+        );
+        a.insert(
+            2_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)),
+        );
         a.insert(
             5_u32 as EdgeId,
             EdgeFilletProfile::Radius(BlendRadius::Linear {
@@ -8835,10 +8788,19 @@ mod tests {
         let mut b = HashMap::new();
         b.insert(
             5_u32 as EdgeId,
-            EdgeFilletProfile::Radius(BlendRadius::Linear { start: 0.5, end: 2.0 }),
+            EdgeFilletProfile::Radius(BlendRadius::Linear {
+                start: 0.5,
+                end: 2.0,
+            }),
         );
-        b.insert(2_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)));
-        b.insert(11_u32 as EdgeId, EdgeFilletProfile::Radius(BlendRadius::Constant(3.0)));
+        b.insert(
+            2_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)),
+        );
+        b.insert(
+            11_u32 as EdgeId,
+            EdgeFilletProfile::Radius(BlendRadius::Constant(3.0)),
+        );
 
         assert_eq!(
             format!("{:?}", FilletType::PerEdgeProfile(a)),
@@ -8882,7 +8844,10 @@ mod tests {
     fn validate_per_edge_profile_accepts_mixed_kinds() {
         let (model, solid_id, edges) = build_n_edge_model(3);
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(0.5))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(0.5)),
+            ),
             (
                 edges[1],
                 EdgeFilletProfile::Radius(BlendRadius::Linear {
@@ -8920,8 +8885,14 @@ mod tests {
         let (model, solid_id, edges) = build_n_edge_model(3);
         // Three edges selected, only two in the map.
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(0.5))),
-            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(0.75))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(0.5)),
+            ),
+            (
+                edges[1],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(0.75)),
+            ),
         ]);
         let opts = opts_with_per_edge_profile(map);
         match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
@@ -8936,8 +8907,14 @@ mod tests {
     fn validate_per_edge_profile_rejects_extra_entry() {
         let (model, solid_id, edges) = build_n_edge_model(3);
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(0.5))),
-            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(0.75))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(0.5)),
+            ),
+            (
+                edges[1],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(0.75)),
+            ),
         ]);
         let opts = opts_with_per_edge_profile(map);
         match validate_fillet_inputs(&model, solid_id, &edges[..1], &opts) {
@@ -8952,8 +8929,14 @@ mod tests {
     fn validate_per_edge_profile_rejects_negative_constant() {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
-            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(-0.5))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)),
+            ),
+            (
+                edges[1],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(-0.5)),
+            ),
         ]);
         let opts = opts_with_per_edge_profile(map);
         match validate_fillet_inputs(&model, solid_id, &edges, &opts) {
@@ -8969,7 +8952,10 @@ mod tests {
     fn validate_per_edge_profile_rejects_zero_linear_endpoint() {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)),
+            ),
             (
                 edges[1],
                 EdgeFilletProfile::Radius(BlendRadius::Linear {
@@ -9122,7 +9108,10 @@ mod tests {
     fn validate_per_edge_profile_rejects_negative_chord() {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)),
+            ),
             (edges[1], EdgeFilletProfile::Chord(-0.5)),
         ]);
         let opts = opts_with_per_edge_profile(map);
@@ -9139,7 +9128,10 @@ mod tests {
     fn validate_per_edge_profile_rejects_zero_chord() {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)),
+            ),
             (edges[1], EdgeFilletProfile::Chord(0.0)),
         ]);
         let opts = opts_with_per_edge_profile(map);
@@ -9156,7 +9148,10 @@ mod tests {
     fn validate_per_edge_profile_rejects_non_finite_chord() {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
-            (edges[0], EdgeFilletProfile::Radius(BlendRadius::Constant(1.0))),
+            (
+                edges[0],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(1.0)),
+            ),
             (edges[1], EdgeFilletProfile::Chord(f64::NAN)),
         ]);
         let opts = opts_with_per_edge_profile(map);
@@ -9174,7 +9169,10 @@ mod tests {
         let (model, solid_id, edges) = build_n_edge_model(2);
         let map = per_edge_profile_map(&[
             (edges[0], EdgeFilletProfile::Chord(0.4)),
-            (edges[1], EdgeFilletProfile::Radius(BlendRadius::Constant(0.3))),
+            (
+                edges[1],
+                EdgeFilletProfile::Radius(BlendRadius::Constant(0.3)),
+            ),
         ]);
         let opts = opts_with_per_edge_profile(map);
         assert!(validate_fillet_inputs(&model, solid_id, &edges, &opts).is_ok());
@@ -9255,11 +9253,7 @@ mod tests {
         match kind % 3 {
             0 => BlendRadius::Constant(r0),
             1 => BlendRadius::Linear { start: r0, end: r1 },
-            _ => BlendRadius::Variable(vec![
-                (0.0, r0),
-                (0.5, r1),
-                (1.0, r2),
-            ]),
+            _ => BlendRadius::Variable(vec![(0.0, r0), (0.5, r1), (1.0, r2)]),
         }
     }
 
@@ -10124,9 +10118,7 @@ mod tests {
         let corner_apex = Point3::new(0.0, 0.0, 8.0);
         let vertex_pos = Point3::new(3.0, 2.0, 4.0);
         let vertex_outward = Vector3::new(0.0, 0.0, -1.0);
-        let corner_vertex = model
-            .vertices
-            .add(vertex_pos.x, vertex_pos.y, vertex_pos.z);
+        let corner_vertex = model.vertices.add(vertex_pos.x, vertex_pos.y, vertex_pos.z);
 
         // Register the three cylindrical surfaces.
         let mut fillet_face_ids = [0u32; 3];
@@ -10347,9 +10339,7 @@ mod tests {
             let (q, u, _r) = cylinder_axes[i];
             let edge_id =
                 find_cap_arc_edge_by_cylinder_axis(&model, fillet_face_ids[i], q, u, corner_apex)
-                    .unwrap_or_else(|| {
-                        panic!("cap arc lookup failed on synthetic face {}", i)
-                    });
+                    .unwrap_or_else(|| panic!("cap arc lookup failed on synthetic face {}", i));
             // The picked arc's centre must be the V-side cap centre
             // (= q, since we placed q at C_i), not the far-side one
             // (q + 100·u).
@@ -10435,7 +10425,9 @@ mod tests {
             .get(new_face.surface_id)
             .expect("new face surface exists");
         assert!(
-            surf.as_any().downcast_ref::<GeneralNurbsSurface>().is_some(),
+            surf.as_any()
+                .downcast_ref::<GeneralNurbsSurface>()
+                .is_some(),
             "corner face must be backed by GeneralNurbsSurface"
         );
 
@@ -10463,4 +10455,3 @@ mod tests {
         );
     }
 }
-

@@ -147,12 +147,10 @@ fn fillet_with_mixed_kind_overrides_round_trips_losslessly() {
         per_edge_overrides: Some(overrides.clone()),
     };
     let blob = serde_json::to_string(&op).expect("serialise mixed-kind override");
-    let back: Operation =
-        serde_json::from_str(&blob).expect("deserialise mixed-kind override");
+    let back: Operation = serde_json::from_str(&blob).expect("deserialise mixed-kind override");
     match back {
         Operation::Fillet {
-            per_edge_overrides,
-            ..
+            per_edge_overrides, ..
         } => {
             let map = per_edge_overrides.expect("mixed-kind must preserve overrides");
             assert_eq!(map, overrides);

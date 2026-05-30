@@ -33,8 +33,8 @@
 
 use crate::formats::step::{
     context::ImportContext,
-    dispatch::{EntityDispatch, HandlerOutcome},
     diagnostics::{Severity, Warning},
+    dispatch::{EntityDispatch, HandlerOutcome},
     registry::{EntityKind, EntityRegistry},
 };
 
@@ -55,7 +55,10 @@ pub enum ResolveOutcome {
     NotFound,
     /// The entity exists but its name doesn't match `expected`. The
     /// caller is referencing the wrong kind of entity.
-    WrongKind { found: String, expected: Vec<String> },
+    WrongKind {
+        found: String,
+        expected: Vec<String>,
+    },
     /// No handler is registered for the entity's name. Logged on the
     /// first encounter via the normal dispatch path; here we just
     /// short-circuit so the caller can emit its own contextual
@@ -274,7 +277,11 @@ mod tests {
         // No second dispatch occurred.
         assert!(!ctx.caches.points.contains_key(&1));
         // Cycle warning was logged.
-        assert!(ctx.report.warnings.iter().any(|w| w.message.contains("cycle")));
+        assert!(ctx
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("cycle")));
     }
 
     #[test]

@@ -106,9 +106,7 @@
 //!   per-rim neighbour-surface downcast.
 
 use super::blend_graph::BlendVertexKind;
-use super::diagnostics::{
-    BlendFailure, MixedKindRejectDetail, VertexBlendUnsupportedReason,
-};
+use super::diagnostics::{BlendFailure, MixedKindRejectDetail, VertexBlendUnsupportedReason};
 use super::mixed_kind_corner_cap::{
     finalize_mixed_kind_cap_face, verify_mixed_cap_loop, CapSubFace, RimKind,
 };
@@ -202,8 +200,7 @@ pub(crate) const N_TIKHONOV_ROWS: usize = N_FREE_DOF;
 
 /// Total row count of the CF-γ.6.3 assembled system:
 /// rim-G1 (12) + internal-C1 (18) + Tikhonov (54) = 84.
-pub(crate) const N_TOTAL_ROWS: usize =
-    N_RIM_G1_ROWS + N_INTERNAL_C1_ROWS + N_TIKHONOV_ROWS;
+pub(crate) const N_TOTAL_ROWS: usize = N_RIM_G1_ROWS + N_INTERNAL_C1_ROWS + N_TIKHONOV_ROWS;
 
 /// Synthesize a G1 NURBS cap at a degree-3 mixed-kind corner as
 /// three bicubic sub-patches sharing a central apex vertex.
@@ -314,9 +311,8 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
     // with `cap_edges_with_kind[i]` (which is in input order).
     // Instead, every per-rim quantity is anchored on vertex IDs
     // derived from `loop_forwards[i]` ∘ `cap_edges_with_kind[i]`.
-    let (_corner_vertices_walk, loop_forwards) =
-        verify_mixed_cap_loop(model, cap_edges_with_kind)
-            .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
+    let (_corner_vertices_walk, loop_forwards) = verify_mixed_cap_loop(model, cap_edges_with_kind)
+        .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
     if loop_forwards.len() != 3 {
         return Err(OperationError::BlendFailed(Box::new(
             BlendFailure::TopologyViolation {
@@ -337,10 +333,7 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         let (edge_id, _) = cap_edges_with_kind[i];
         let edge = model.edges.get(edge_id).ok_or_else(|| {
             OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ.6 G1 cap: rim edge {:?} missing from model",
-                    edge_id
-                ),
+                detail: format!("CF-γ.6 G1 cap: rim edge {:?} missing from model", edge_id),
             }))
         })?;
         rim_walk_vids[i] = if loop_forwards[i] {
@@ -395,10 +388,7 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         }
         Err(OperationError::BlendFailed(Box::new(
             BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ.6 G1 cap: vertex {:?} not in distinct corner set",
-                    vid
-                ),
+                detail: format!("CF-γ.6 G1 cap: vertex {:?} not in distinct corner set", vid),
             },
         )))
     };
@@ -445,10 +435,7 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         }
         Err(OperationError::BlendFailed(Box::new(
             BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ.6 G1 cap: vertex {:?} has no spoke edge",
-                    vid
-                ),
+                detail: format!("CF-γ.6 G1 cap: vertex {:?} has no spoke edge", vid),
             },
         )))
     };
@@ -458,8 +445,7 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
     // of twice per sub-patch guarantees byte-identical shared
     // columns and therefore exact C0 (and degenerate-collinear C1)
     // across the shared internal seam.
-    let mut spoke_cps_for_vid_idx: [[Point3; 4]; 3] =
-        [[Point3::new(0.0, 0.0, 0.0); 4]; 3];
+    let mut spoke_cps_for_vid_idx: [[Point3; 4]; 3] = [[Point3::new(0.0, 0.0, 0.0); 4]; 3];
     for k in 0..3 {
         let c = distinct_positions[k];
         let d = apex - c;
@@ -481,10 +467,7 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         }
         Err(OperationError::BlendFailed(Box::new(
             BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ.6 G1 cap: vertex {:?} has no spoke CPs",
-                    vid
-                ),
+                detail: format!("CF-γ.6 G1 cap: vertex {:?} has no spoke CPs", vid),
             },
         )))
     };
@@ -559,8 +542,8 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         let (start_vid, end_vid) = rim_walk_vids[i];
         let grid = sub_grids[i].clone();
         let weights = sub_weights[i].clone();
-        let nurbs = NurbsSurface::new(grid, weights, knots.clone(), knots.clone(), 3, 3)
-            .map_err(|e| {
+        let nurbs =
+            NurbsSurface::new(grid, weights, knots.clone(), knots.clone(), 3, 3).map_err(|e| {
                 OperationError::NumericalError(format!(
                     "CF-γ.6 G1 cap: NurbsSurface::new rejected sub-patch {} control net: {}",
                     i, e
@@ -570,13 +553,9 @@ pub fn synthesize_mixed_kind_corner_cap_g1(
         // Sample orientation at (u=0.3, v=0.5) — biased toward the
         // u=0 rim and away from the u=1 apex degeneracy where the
         // surface normal is undefined.
-        let orientation = super::orientation::orient_face_for_outward_at(
-            &cap_surface,
-            vertex_outward,
-            0.3,
-            0.5,
-        )
-        .unwrap_or(FaceOrientation::Forward);
+        let orientation =
+            super::orientation::orient_face_for_outward_at(&cap_surface, vertex_outward, 0.3, 0.5)
+                .unwrap_or(FaceOrientation::Forward);
         let surface_id = model.surfaces.add(Box::new(cap_surface));
         // Sub-patch loop: rim_i in cap-loop direction, then spoke
         // from walk_end → apex (forward — the spoke's natural
@@ -735,15 +714,14 @@ fn upgrade_spoke_edges_to_nurbs(
     for k in 0..3 {
         let cps: Vec<Point3> = polished_spoke_cps[k].to_vec();
         let weights = vec![1.0_f64; 4];
-        let nurbs =
-            crate::primitives::curve::NurbsCurve::new(3, cps, weights, knots.clone())
-                .map_err(|e| {
-                    OperationError::NumericalError(format!(
-                        "CF-γ.6.3 spoke-NURBS upgrade: NurbsCurve::new failed \
+        let nurbs = crate::primitives::curve::NurbsCurve::new(3, cps, weights, knots.clone())
+            .map_err(|e| {
+                OperationError::NumericalError(format!(
+                    "CF-γ.6.3 spoke-NURBS upgrade: NurbsCurve::new failed \
                          on spoke {}: {}",
-                        k, e
-                    ))
-                })?;
+                    k, e
+                ))
+            })?;
         let edge = model.edges.get(spoke_edges[k]).ok_or_else(|| {
             OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
                 detail: format!(
@@ -800,10 +778,7 @@ fn build_rim_lifts(
         }
         Err(OperationError::BlendFailed(Box::new(
             BlendFailure::TopologyViolation {
-                detail: format!(
-                    "CF-γ.6 G1 cap: vertex {:?} not in distinct corner set",
-                    vid
-                ),
+                detail: format!("CF-γ.6 G1 cap: vertex {:?} not in distinct corner set", vid),
             },
         )))
     };
@@ -839,8 +814,7 @@ fn build_rim_lifts(
                         "CF-γ.6 G1 cap: rim edge {:?} (kind {:?}) endpoint mismatch \
                          — lift produced ({:?}, {:?}) but cap loop expects \
                          ({:?}, {:?}) within tol {:.3e}",
-                        edge_id, kind, lift_start, lift_end, want_start, want_end,
-                        endpoint_tol
+                        edge_id, kind, lift_start, lift_end, want_start, want_end, endpoint_tol
                     ),
                 },
             )));
@@ -1007,7 +981,11 @@ fn line_to_cubic_bezier_controls(line: &Line) -> ([Point3; 4], [f64; 4]) {
     let two_thirds = Vector3::new(2.0 * dir.x / 3.0, 2.0 * dir.y / 3.0, 2.0 * dir.z / 3.0);
     let p0 = line.start;
     let p1 = Point3::new(p0.x + third.x, p0.y + third.y, p0.z + third.z);
-    let p2 = Point3::new(p0.x + two_thirds.x, p0.y + two_thirds.y, p0.z + two_thirds.z);
+    let p2 = Point3::new(
+        p0.x + two_thirds.x,
+        p0.y + two_thirds.y,
+        p0.z + two_thirds.z,
+    );
     let p3 = line.end;
     ([p0, p1, p2, p3], [1.0, 1.0, 1.0, 1.0])
 }
@@ -1103,9 +1081,8 @@ fn arc_to_cubic_bezier_controls(arc: &Arc) -> OperationResult<([Point3; 4], [f64
         (2.0 / 3.0) * h1.1 + (1.0 / 3.0) * h2.1,
     );
 
-    let to_point = |h: (Vector3, f64)| -> Point3 {
-        Point3::new(h.0.x / h.1, h.0.y / h.1, h.0.z / h.1)
-    };
+    let to_point =
+        |h: (Vector3, f64)| -> Point3 { Point3::new(h.0.x / h.1, h.0.y / h.1, h.0.z / h.1) };
     let pts = [
         to_point(h_pr_0),
         to_point(h_pr_1),
@@ -1236,10 +1213,7 @@ fn existing_kind_set_or_default(
 /// Locate the 0-based index of `vid` inside the `distinct_corner_vids`
 /// fan, used to translate a per-corner vertex ID into a spoke-column
 /// offset in the global 54-DoF unknown vector.
-fn vid_idx_for(
-    distinct_corner_vids: &[VertexId],
-    vid: VertexId,
-) -> OperationResult<usize> {
+fn vid_idx_for(distinct_corner_vids: &[VertexId], vid: VertexId) -> OperationResult<usize> {
     for (i, &cv) in distinct_corner_vids.iter().enumerate() {
         if cv == vid {
             return Ok(i);
@@ -1314,8 +1288,7 @@ fn compute_neighbour_normals_per_rim(
     stations: &[f64; K_STATIONS],
     tolerance: f64,
 ) -> OperationResult<[[Vector3; K_STATIONS]; 3]> {
-    let mut normals: [[Vector3; K_STATIONS]; 3] =
-        [[Vector3::new(0.0, 0.0, 0.0); K_STATIONS]; 3];
+    let mut normals: [[Vector3; K_STATIONS]; 3] = [[Vector3::new(0.0, 0.0, 0.0); K_STATIONS]; 3];
     let tol = Tolerance::new(tolerance, tolerance);
     for i in 0..3 {
         let (edge_id, _kind) = cap_edges_with_kind[i];
@@ -1433,8 +1406,7 @@ fn apply_global_solution(
     for k in 0..3 {
         let base = 36 + 6 * k;
         spoke_cps_for_vid_idx[k][1] = Point3::new(x[base], x[base + 1], x[base + 2]);
-        spoke_cps_for_vid_idx[k][2] =
-            Point3::new(x[base + 3], x[base + 4], x[base + 5]);
+        spoke_cps_for_vid_idx[k][2] = Point3::new(x[base + 3], x[base + 4], x[base + 5]);
     }
     // Re-sync each sub-patch's v=0 and v=1 boundary columns from the
     // (now-solved) shared spoke CPs. Endpoints (rim corners + apex)
@@ -1815,13 +1787,13 @@ fn polish_g1_newton(
 ) -> OperationResult<(f64, usize, usize)> {
     const MAX_ITERS: usize = 6;
     const TARGET: f64 = G1_TOLERANCE * 0.1; // 1e-7 — well below the gate.
-    // Central-difference step. Optimal `h` for central FD is
-    // `(3ε / |f'''/f|)^(1/3) · |x|` ≈ ε^(1/3)·|x| ≈ 1e-5·10 ≈ 1e-4
-    // for double precision and `O(10)` CP magnitudes on the box
-    // fixtures. Truncation error is then `O(h²) ≈ 1e-10`, which
-    // gives us two orders of magnitude of headroom below the
-    // `1e-6` G1 gate — forward differences (`O(h) ≈ 1e-7`) ran
-    // into a floor at `~1.3e-6` rad on the 1C2F fixtures.
+                                            // Central-difference step. Optimal `h` for central FD is
+                                            // `(3ε / |f'''/f|)^(1/3) · |x|` ≈ ε^(1/3)·|x| ≈ 1e-5·10 ≈ 1e-4
+                                            // for double precision and `O(10)` CP magnitudes on the box
+                                            // fixtures. Truncation error is then `O(h²) ≈ 1e-10`, which
+                                            // gives us two orders of magnitude of headroom below the
+                                            // `1e-6` G1 gate — forward differences (`O(h) ≈ 1e-7`) ran
+                                            // into a floor at `~1.3e-6` rad on the 1C2F fixtures.
     const FD_H: f64 = 1.0e-5;
     // LM damping must be small relative to the residual scale we
     // are chasing. With `√λ = 1e-8` and target residual `1e-7`,
@@ -1858,12 +1830,7 @@ fn polish_g1_newton(
 
     for _iter in 0..MAX_ITERS {
         let x_curr = pack_seed_vector(sub_grids, spoke_cps);
-        let r0 = evaluate_geometric_residuals(
-            sub_grids,
-            sub_weights,
-            neighbour_normals,
-            stations,
-        )?;
+        let r0 = evaluate_geometric_residuals(sub_grids, sub_weights, neighbour_normals, stations)?;
         let worst0 = worst_sin_theta(&r0);
         if trace {
             eprintln!(
@@ -1881,8 +1848,7 @@ fn polish_g1_newton(
         // orders of magnitude tighter than forward differences at
         // the same `h`, which is what lets the 1C2F fixtures cross
         // the 1e-6 gate.
-        let mut jacobian: Vec<Vec<f64>> =
-            vec![vec![0.0_f64; N_FREE_DOF]; n_rows];
+        let mut jacobian: Vec<Vec<f64>> = vec![vec![0.0_f64; N_FREE_DOF]; n_rows];
         for j in 0..N_FREE_DOF {
             let mut x_plus = x_curr.clone();
             x_plus[j] += FD_H;
@@ -1936,13 +1902,12 @@ fn polish_g1_newton(
         let mut errors = r0.clone();
         errors.extend(std::iter::repeat(0.0_f64).take(N_FREE_DOF));
 
-        let dx = solve_least_squares(&jacobian, &errors, ls_pivot_tol)
-            .map_err(|e| {
-                OperationError::NumericalError(format!(
-                    "CF-γ.6.3 G1 polish: solve_least_squares failed: {:?}",
-                    e
-                ))
-            })?;
+        let dx = solve_least_squares(&jacobian, &errors, ls_pivot_tol).map_err(|e| {
+            OperationError::NumericalError(format!(
+                "CF-γ.6.3 G1 polish: solve_least_squares failed: {:?}",
+                e
+            ))
+        })?;
         if dx.len() != N_FREE_DOF {
             return Err(OperationError::NumericalError(format!(
                 "CF-γ.6.3 G1 polish: solve_least_squares returned \
@@ -1965,9 +1930,7 @@ fn polish_g1_newton(
         let mut step = 1.0_f64;
         let mut accepted = false;
         for bt in 0..MAX_BACKTRACK {
-            let x_new: Vec<f64> = (0..N_FREE_DOF)
-                .map(|j| x_curr[j] + step * dx[j])
-                .collect();
+            let x_new: Vec<f64> = (0..N_FREE_DOF).map(|j| x_curr[j] + step * dx[j]).collect();
             let mut grids_new = sub_grids.clone();
             let mut spokes_new = *spoke_cps;
             apply_global_solution(
@@ -1977,12 +1940,8 @@ fn polish_g1_newton(
                 distinct_corner_vids,
                 rim_walk_vids,
             )?;
-            let r_new = evaluate_geometric_residuals(
-                &grids_new,
-                sub_weights,
-                neighbour_normals,
-                stations,
-            )?;
+            let r_new =
+                evaluate_geometric_residuals(&grids_new, sub_weights, neighbour_normals, stations)?;
             let worst_new = worst_sin_theta(&r_new);
             if trace {
                 eprintln!(
@@ -1992,7 +1951,11 @@ fn polish_g1_newton(
                     step,
                     worst_new,
                     worst0,
-                    if worst_new < worst0 { "ACCEPT" } else { "reject" }
+                    if worst_new < worst0 {
+                        "ACCEPT"
+                    } else {
+                        "reject"
+                    }
                 );
             }
             if worst_new < worst0 {
@@ -2074,8 +2037,7 @@ fn solve_coupled_g1(
         let end_idx = vid_idx_for(distinct_corner_vids, end_vid)?;
         let spoke_v0 = spoke_cps_for_vid_idx[start_idx];
         let spoke_v1 = spoke_cps_for_vid_idx[end_idx];
-        let (grid, weights) =
-            build_subpatch_control_net(&rim_lifts[i], &spoke_v0, &spoke_v1, apex);
+        let (grid, weights) = build_subpatch_control_net(&rim_lifts[i], &spoke_v0, &spoke_v1, apex);
         sub_grids[i] = grid;
         sub_weights[i] = weights;
     }
@@ -2106,13 +2068,12 @@ fn solve_coupled_g1(
     // magnitude while still flagging genuinely singular structure if
     // a bug in the assembler ever zeros the Tikhonov band.
     let ls_pivot_tol = Tolerance::new(TIKHONOV_LAMBDA / 100.0, 1.0e-6);
-    let solution = solve_least_squares(&jacobian, &errors, ls_pivot_tol)
-        .map_err(|e| {
-            OperationError::NumericalError(format!(
-                "CF-γ.6.3 G1 solver: solve_least_squares failed: {:?}",
-                e
-            ))
-        })?;
+    let solution = solve_least_squares(&jacobian, &errors, ls_pivot_tol).map_err(|e| {
+        OperationError::NumericalError(format!(
+            "CF-γ.6.3 G1 solver: solve_least_squares failed: {:?}",
+            e
+        ))
+    })?;
     if solution.len() != N_FREE_DOF {
         return Err(OperationError::NumericalError(format!(
             "CF-γ.6.3 G1 solver: solve_least_squares returned {} unknowns, expected {}",
@@ -2152,7 +2113,14 @@ fn solve_coupled_g1(
         stations,
     )?;
 
-    Ok((sub_grids, sub_weights, spoke_cps, worst, worst_rim, worst_station))
+    Ok((
+        sub_grids,
+        sub_weights,
+        spoke_cps,
+        worst,
+        worst_rim,
+        worst_station,
+    ))
 }
 
 #[cfg(test)]

@@ -460,11 +460,7 @@ impl SketchManager {
     /// The new shape starts with no points; clients then drop points
     /// onto it via the legacy `/point` endpoint (which targets the
     /// active shape) or via the explicit `/shape/{idx}/point` route.
-    pub fn add_shape(
-        &self,
-        id: &Uuid,
-        tool: SketchTool,
-    ) -> Result<SketchSession, SketchError> {
+    pub fn add_shape(&self, id: &Uuid, tool: SketchTool) -> Result<SketchSession, SketchError> {
         self.mutate(id, |s| {
             s.shapes.push(SketchShape::new(tool));
             Ok(())
@@ -502,14 +498,14 @@ impl SketchManager {
         let session_id = *id;
         self.mutate(id, |s| {
             let len = s.shapes.len();
-            let shape =
-                s.shapes
-                    .get_mut(index)
-                    .ok_or(SketchError::ShapeIndexOutOfRange {
-                        id: session_id,
-                        index,
-                        len,
-                    })?;
+            let shape = s
+                .shapes
+                .get_mut(index)
+                .ok_or(SketchError::ShapeIndexOutOfRange {
+                    id: session_id,
+                    index,
+                    len,
+                })?;
             if shape.tool != tool {
                 shape.tool = tool;
                 shape.points.clear();
@@ -532,14 +528,14 @@ impl SketchManager {
         let session_id = *id;
         self.mutate(id, |s| {
             let len = s.shapes.len();
-            let shape =
-                s.shapes
-                    .get_mut(index)
-                    .ok_or(SketchError::ShapeIndexOutOfRange {
-                        id: session_id,
-                        index,
-                        len,
-                    })?;
+            let shape = s
+                .shapes
+                .get_mut(index)
+                .ok_or(SketchError::ShapeIndexOutOfRange {
+                    id: session_id,
+                    index,
+                    len,
+                })?;
             shape.points.push(point);
             Ok(())
         })
@@ -758,18 +754,13 @@ pub(crate) fn build_loop_edges(
     for i in 0..n {
         let p_start = lifted[i];
         let p_end = lifted[(i + 1) % n];
-        let v_start = model.vertices.add_or_find(
-            p_start.x,
-            p_start.y,
-            p_start.z,
-            tolerance.distance(),
-        );
-        let v_end = model.vertices.add_or_find(
-            p_end.x,
-            p_end.y,
-            p_end.z,
-            tolerance.distance(),
-        );
+        let v_start =
+            model
+                .vertices
+                .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
+        let v_end = model
+            .vertices
+            .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
         if v_start == v_end {
             return Err(ApiError::new(
                 ErrorCode::InvalidParameter,
@@ -788,7 +779,10 @@ pub(crate) fn build_loop_edges(
             ),
             None => {
                 let line = Line::new(p_start, p_end);
-                (model.curves.add(Box::new(line)), ParameterRange::new(0.0, 1.0))
+                (
+                    model.curves.add(Box::new(line)),
+                    ParameterRange::new(0.0, 1.0),
+                )
             }
         };
         let edge = Edge::new(
@@ -857,7 +851,10 @@ pub fn detect_regions(polygons: &[&Vec<[f64; 2]>]) -> Result<Vec<Region>, Region
             return Err(RegionError::PolygonTooShort(i));
         }
     }
-    let areas: Vec<f64> = polygons.iter().map(|p| polygon_signed_area(p).abs()).collect();
+    let areas: Vec<f64> = polygons
+        .iter()
+        .map(|p| polygon_signed_area(p).abs())
+        .collect();
 
     // Smallest-containing-parent: for each i, j such that polygon j
     // contains polygon i and has the smallest area among such j.
@@ -964,19 +961,18 @@ fn point_in_polygon(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     for i in 0..n {
         let (xi, yi) = (polygon[i][0], polygon[i][1]);
         let (xj, yj) = (polygon[j][0], polygon[j][1]);
-        let crosses = (yi > py) != (yj > py)
-            && {
-                // Avoid divide-by-zero when yi == yj — that case is
-                // already excluded by the != predicate above, but be
-                // defensive against degenerate input.
-                let denom = yj - yi;
-                if denom.abs() < f64::EPSILON {
-                    false
-                } else {
-                    let x_intersect = (xj - xi) * (py - yi) / denom + xi;
-                    px < x_intersect
-                }
-            };
+        let crosses = (yi > py) != (yj > py) && {
+            // Avoid divide-by-zero when yi == yj — that case is
+            // already excluded by the != predicate above, but be
+            // defensive against degenerate input.
+            let denom = yj - yi;
+            if denom.abs() < f64::EPSILON {
+                false
+            } else {
+                let x_intersect = (xj - xi) * (py - yi) / denom + xi;
+                px < x_intersect
+            }
+        };
         if crosses {
             inside = !inside;
         }
@@ -1477,9 +1473,7 @@ pub async fn extrude_sketch(
     Json(body): Json<ExtrudeSketchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::math::Tolerance;
-    use geometry_engine::operations::boolean::{
-        boolean_operation, BooleanOp, BooleanOptions,
-    };
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use geometry_engine::operations::extrude::{
         create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
     };
@@ -1558,11 +1552,9 @@ pub async fn extrude_sketch(
     // containment. Even-depth polygons are outer; the odd-depth
     // polygons directly inside them are their holes. Disjoint outers
     // produce independent regions that are unioned at the end.
-    let polygons_2d: Vec<&Vec<[f64; 2]>> =
-        shape_polygons.iter().map(|(_, _, p, _)| p).collect();
-    let regions = detect_regions(&polygons_2d).map_err(|e| {
-        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
-    })?;
+    let polygons_2d: Vec<&Vec<[f64; 2]>> = shape_polygons.iter().map(|(_, _, p, _)| p).collect();
+    let regions = detect_regions(&polygons_2d)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
     if regions.is_empty() {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
@@ -1620,13 +1612,8 @@ pub async fn extrude_sketch(
             for &hole_idx in &region.hole_shape_idxs {
                 let hole_tool = shape_polygons[hole_idx].1;
                 let hole_lifted = &shape_polygons[hole_idx].3;
-                let hole_edges = build_loop_edges(
-                    &mut model,
-                    hole_idx,
-                    hole_tool,
-                    hole_lifted,
-                    tolerance,
-                )?;
+                let hole_edges =
+                    build_loop_edges(&mut model, hole_idx, hole_tool, hole_lifted, tolerance)?;
                 let mut inner_loop = Loop::new(0, LoopType::Inner);
                 for edge_id in &hole_edges {
                     inner_loop.add_edge(*edge_id, true);
@@ -1827,9 +1814,7 @@ pub async fn extrude_cut_sketch(
     Json(body): Json<ExtrudeCutSketchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::math::Tolerance;
-    use geometry_engine::operations::boolean::{
-        boolean_operation, BooleanOp, BooleanOptions,
-    };
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
@@ -1892,11 +1877,9 @@ pub async fn extrude_cut_sketch(
         ));
     }
 
-    let polygons_2d: Vec<&Vec<[f64; 2]>> =
-        shape_polygons.iter().map(|(_, _, p, _)| p).collect();
-    let regions = detect_regions(&polygons_2d).map_err(|e| {
-        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
-    })?;
+    let polygons_2d: Vec<&Vec<[f64; 2]>> = shape_polygons.iter().map(|(_, _, p, _)| p).collect();
+    let regions = detect_regions(&polygons_2d)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
     if regions.is_empty() {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
@@ -1914,11 +1897,9 @@ pub async fn extrude_cut_sketch(
         // one solid per shape, then fold outer-minus-holes per region,
         // then union regions.
         let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
-        for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in
-            shape_polygons.iter().enumerate()
+        for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in shape_polygons.iter().enumerate()
         {
-            let profile_edges =
-                build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
+            let profile_edges = build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
             let options = ExtrudeOptions {
                 direction,
                 distance: body.distance,
@@ -2072,9 +2053,7 @@ pub async fn revolve_sketch(
     Json(body): Json<RevolveSketchBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::math::Tolerance;
-    use geometry_engine::operations::boolean::{
-        boolean_operation, BooleanOp, BooleanOptions,
-    };
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
@@ -2115,10 +2094,7 @@ pub async fn revolve_sketch(
     if !body.angle.is_finite() || body.angle.abs() < 1e-9 {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            format!(
-                "angle must be non-zero and finite (got {} rad)",
-                body.angle
-            ),
+            format!("angle must be non-zero and finite (got {} rad)", body.angle),
         ));
     }
     if body.segments < 3 {
@@ -2157,11 +2133,9 @@ pub async fn revolve_sketch(
         ));
     }
 
-    let polygons_2d: Vec<&Vec<[f64; 2]>> =
-        shape_polygons.iter().map(|(_, _, p, _)| p).collect();
-    let regions = detect_regions(&polygons_2d).map_err(|e| {
-        ApiError::new(ErrorCode::InvalidParameter, e.to_string())
-    })?;
+    let polygons_2d: Vec<&Vec<[f64; 2]>> = shape_polygons.iter().map(|(_, _, p, _)| p).collect();
+    let regions = detect_regions(&polygons_2d)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
     if regions.is_empty() {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
@@ -2176,11 +2150,9 @@ pub async fn revolve_sketch(
         // shapes are revolved into hole solids and subtracted from
         // their outer in the region fold below.
         let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
-        for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in
-            shape_polygons.iter().enumerate()
+        for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in shape_polygons.iter().enumerate()
         {
-            let profile_edges =
-                build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
+            let profile_edges = build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
             let options = RevolveOptions {
                 axis_origin,
                 axis_direction,
@@ -2661,8 +2633,7 @@ mod tests {
         mgr.add_point(&s.id, [1.0, 2.0]).expect("add");
         // Add a second shape with its own points so we can prove the
         // plane swap clears all of them, not just the active one.
-        mgr.add_shape(&s.id, SketchTool::Circle)
-            .expect("add shape");
+        mgr.add_shape(&s.id, SketchTool::Circle).expect("add shape");
         mgr.add_point(&s.id, [0.0, 0.0]).expect("centre");
         mgr.add_point(&s.id, [1.0, 0.0]).expect("edge");
         let after = mgr.set_plane(&s.id, SketchPlane::YZ).expect("plane");
@@ -2700,9 +2671,7 @@ mod tests {
     fn add_shape_appends_and_makes_active() {
         let mgr = SketchManager::new();
         let s = mgr.create(SketchPlane::XY, SketchTool::Polyline);
-        let after = mgr
-            .add_shape(&s.id, SketchTool::Circle)
-            .expect("add shape");
+        let after = mgr.add_shape(&s.id, SketchTool::Circle).expect("add shape");
         assert_eq!(after.shapes.len(), 2);
         assert_eq!(after.shapes[1].tool, SketchTool::Circle);
         // Active = last; legacy /point now flows to the new circle.
@@ -2935,7 +2904,10 @@ mod tests {
         assert!(resp.region_error.is_none());
         assert_eq!(resp.regions.len(), 2);
         for region in &resp.regions {
-            assert!(region.hole_shape_idxs.is_empty(), "disjoint outers have no holes");
+            assert!(
+                region.hole_shape_idxs.is_empty(),
+                "disjoint outers have no holes"
+            );
         }
     }
 
@@ -3070,7 +3042,10 @@ mod tests {
         };
         let v = serde_json::to_value(&resp).expect("serialise");
         assert_eq!(v["regions"][0]["outer_shape_idx"], 0);
-        assert_eq!(v["regions"][0]["hole_shape_idxs"], serde_json::json!([1, 2]));
+        assert_eq!(
+            v["regions"][0]["hole_shape_idxs"],
+            serde_json::json!([1, 2])
+        );
         assert_eq!(v["regions"][0]["area"], 42.0);
         assert!(v["region_error"].is_null());
 
@@ -3185,10 +3160,16 @@ mod tests {
         for i in 0..lifted.len() {
             let p_start = lifted[i];
             let p_end = lifted[(i + 1) % lifted.len()];
-            let v_start =
-                model.vertices.add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
-            let v_end = model.vertices.add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
-            assert_ne!(v_start, v_end, "polygon must not self-collapse under tolerance");
+            let v_start = model
+                .vertices
+                .add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
+            let v_end = model
+                .vertices
+                .add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
+            assert_ne!(
+                v_start, v_end,
+                "polygon must not self-collapse under tolerance"
+            );
             let line = Line::new(p_start, p_end);
             let curve_id = model.curves.add(Box::new(line));
             let edge = Edge::new(
@@ -3215,10 +3196,8 @@ mod tests {
     ) -> (BRepModel, u32) {
         let tolerance = geometry_engine::math::Tolerance::default();
 
-        let mut shape_polygons: Vec<Vec<Point3>> =
-            Vec::with_capacity(session.shapes.len());
-        let mut shape_polygons_2d: Vec<Vec<[f64; 2]>> =
-            Vec::with_capacity(session.shapes.len());
+        let mut shape_polygons: Vec<Vec<Point3>> = Vec::with_capacity(session.shapes.len());
+        let mut shape_polygons_2d: Vec<Vec<[f64; 2]>> = Vec::with_capacity(session.shapes.len());
         for shape in session.shapes.iter().filter(|s| !s.points.is_empty()) {
             let polygon_2d =
                 materialise_shape(shape, session.circle_segments).expect("materialise");
@@ -3269,8 +3248,7 @@ mod tests {
                 },
                 ..ExtrudeOptions::default()
             };
-            let solid_id =
-                extrude_face(&mut model, face_id, options).expect("extrude_face");
+            let solid_id = extrude_face(&mut model, face_id, options).expect("extrude_face");
             region_solids.push(solid_id);
         }
 
@@ -3313,8 +3291,7 @@ mod tests {
             updated_at: 0,
         };
 
-        let (model, solid_id) =
-            extrude_session_via_kernel(&session, Vector3::Z, 5.0);
+        let (model, solid_id) = extrude_session_via_kernel(&session, Vector3::Z, 5.0);
         let solid = model.solids.get(solid_id).expect("solid stored");
         let shell = model.shells.get(solid.outer_shell).expect("shell stored");
 
@@ -3355,8 +3332,7 @@ mod tests {
             updated_at: 0,
         };
 
-        let (model, solid_id) =
-            extrude_session_via_kernel(&session, Vector3::Z, 2.0);
+        let (model, solid_id) = extrude_session_via_kernel(&session, Vector3::Z, 2.0);
         let solid = model.solids.get(solid_id).expect("solid stored");
         let shell = model.shells.get(solid.outer_shell).expect("shell stored");
         assert_eq!(shell.faces.len(), 6, "single rectangle extrudes to 6 faces");
@@ -3399,8 +3375,7 @@ mod tests {
             updated_at: 0,
         };
 
-        let (model, solid_id) =
-            extrude_session_via_kernel(&session, Vector3::Z, 3.0);
+        let (model, solid_id) = extrude_session_via_kernel(&session, Vector3::Z, 3.0);
         let solid = model.solids.get(solid_id).expect("solid stored");
         let shell = model.shells.get(solid.outer_shell).expect("shell stored");
         // 4 outer + 4 + 4 inner walls + bottom + top = 14 faces.
@@ -3412,5 +3387,4 @@ mod tests {
             .expect("top face");
         assert_eq!(top_face.inner_loops.len(), 2, "top cap carries both holes");
     }
-
 }

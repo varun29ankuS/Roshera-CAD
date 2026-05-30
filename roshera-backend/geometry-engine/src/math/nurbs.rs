@@ -684,7 +684,11 @@ impl NurbsCurve {
                     }
 
                     let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                    let j2 = if (r as i32 - 1) <= pk { k - 1 } else { self.degree - r };
+                    let j2 = if (r as i32 - 1) <= pk {
+                        k - 1
+                    } else {
+                        self.degree - r
+                    };
 
                     for j in j1..=j2 {
                         let idx = (rk + j as i32) as usize;
@@ -1020,7 +1024,11 @@ impl NurbsCurve {
                 }
 
                 let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                let j2 = if (r as i32 - 1) <= pk { k - 1 } else { self.degree - r };
+                let j2 = if (r as i32 - 1) <= pk {
+                    k - 1
+                } else {
+                    self.degree - r
+                };
 
                 for j in j1..=j2 {
                     let idx = (rk + j as i32) as usize;
@@ -2125,7 +2133,11 @@ impl NurbsSurface {
                 }
 
                 let j1 = if rk >= -1 { 1 } else { (-rk) as usize };
-                let j2 = if (r as i32 - 1) <= pk { k - 1 } else { degree - r };
+                let j2 = if (r as i32 - 1) <= pk {
+                    k - 1
+                } else {
+                    degree - r
+                };
 
                 for j in j1..=j2 {
                     let idx = (rk + j as i32) as usize;
@@ -2844,8 +2856,7 @@ mod tests {
             weights.push(wrow);
         }
         let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        let surf =
-            NurbsSurface::new(control_points, weights, knots.clone(), knots, 2, 2).unwrap();
+        let surf = NurbsSurface::new(control_points, weights, knots.clone(), knots, 2, 2).unwrap();
 
         for &(u, v) in &[(0.25, 0.4), (0.5, 0.5), (0.8, 0.2), (0.1, 0.9)] {
             let d = surf.evaluate_derivatives(u, v, 2, 2);
@@ -2916,9 +2927,18 @@ mod tests {
             - surf.evaluate(u - h, v + h).point.to_vec()
             + surf.evaluate(u - h, v - h).point.to_vec())
             / (4.0 * h * h);
-        assert!((d.duu.unwrap() - fd_uu).magnitude() < 1e-2, "duu vs finite diff");
-        assert!((d.dvv.unwrap() - fd_vv).magnitude() < 1e-2, "dvv vs finite diff");
-        assert!((d.duv.unwrap() - fd_uv).magnitude() < 1e-2, "duv vs finite diff");
+        assert!(
+            (d.duu.unwrap() - fd_uu).magnitude() < 1e-2,
+            "duu vs finite diff"
+        );
+        assert!(
+            (d.dvv.unwrap() - fd_vv).magnitude() < 1e-2,
+            "dvv vs finite diff"
+        );
+        assert!(
+            (d.duv.unwrap() - fd_uv).magnitude() < 1e-2,
+            "duv vs finite diff"
+        );
     }
 
     /// Build a degree-2×2 rational NURBS surface with one interior knot in
@@ -2982,8 +3002,12 @@ mod tests {
             ((0.5, 1.0), (0.5, 1.0)),
         ];
         for (patch, (du, dv)) in patches.iter().zip(expected.iter()) {
-            assert!((patch.domain_u.0 - du.0).abs() < 1e-12 && (patch.domain_u.1 - du.1).abs() < 1e-12);
-            assert!((patch.domain_v.0 - dv.0).abs() < 1e-12 && (patch.domain_v.1 - dv.1).abs() < 1e-12);
+            assert!(
+                (patch.domain_u.0 - du.0).abs() < 1e-12 && (patch.domain_u.1 - du.1).abs() < 1e-12
+            );
+            assert!(
+                (patch.domain_v.0 - dv.0).abs() < 1e-12 && (patch.domain_v.1 - dv.1).abs() < 1e-12
+            );
             assert_eq!(patch.degree_u, 2);
             assert_eq!(patch.degree_v, 2);
             assert_eq!(patch.control_points.len(), 3);

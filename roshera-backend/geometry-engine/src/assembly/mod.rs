@@ -2696,7 +2696,10 @@ mod tests {
 
         a.add_mate(MateType::Coincident, c1, "a1", c2, "a2")
             .expect("coincident accepted");
-        assert!(a.gear_neutrals.is_empty(), "non-gear mates must not seed neutrals");
+        assert!(
+            a.gear_neutrals.is_empty(),
+            "non-gear mates must not seed neutrals"
+        );
 
         a.add_mate(MateType::Gear { ratio: 1.5 }, c1, "a1", c2, "a2")
             .expect("gear accepted");
@@ -3127,11 +3130,9 @@ mod tests {
         let mut a = Assembly::new("motion_r");
         let _ = a.add_part(Arc::new(BRepModel::new()), "p1");
         let c2 = a.add_part(Arc::new(BRepModel::new()), "p2");
-        let q = Quaternion::from_axis_angle(
-            &Vector3::new(0.0, 0.0, 1.0),
-            std::f64::consts::FRAC_PI_2,
-        )
-        .expect("axis-angle valid");
+        let q =
+            Quaternion::from_axis_angle(&Vector3::new(0.0, 0.0, 1.0), std::f64::consts::FRAC_PI_2)
+                .expect("axis-angle valid");
         a.simulate_motion(c2, Vector3::new(0.0, 0.0, 0.0), Some(q))
             .expect("ok");
         let v = a
@@ -3188,7 +3189,10 @@ mod tests {
         a.add_part(Arc::new(BRepModel::new()), "p1");
         let _ = a.create_exploded_view(false);
         let c2 = a.create_exploded_view(true);
-        assert_eq!(a.exploded_config.as_ref().unwrap().auto_explode, c2.auto_explode);
+        assert_eq!(
+            a.exploded_config.as_ref().unwrap().auto_explode,
+            c2.auto_explode
+        );
     }
 
     // ---------- Interferences / bounding box ----------
@@ -3347,27 +3351,19 @@ mod tests {
 
     #[test]
     fn signed_rotation_about_axis_measures_z_rotation() {
-        let q = Quaternion::from_axis_angle(
-            &Vector3::new(0.0, 0.0, 1.0),
-            std::f64::consts::FRAC_PI_3,
-        )
-        .expect("axis-angle valid");
+        let q =
+            Quaternion::from_axis_angle(&Vector3::new(0.0, 0.0, 1.0), std::f64::consts::FRAC_PI_3)
+                .expect("axis-angle valid");
         let m = q.to_matrix4();
         let r = signed_rotation_about_axis(&m, Vector3::new(0.0, 0.0, 1.0)).expect("ok");
-        assert!(
-            (r - std::f64::consts::FRAC_PI_3).abs() < 1e-9,
-            "r={}",
-            r
-        );
+        assert!((r - std::f64::consts::FRAC_PI_3).abs() < 1e-9, "r={}", r);
     }
 
     #[test]
     fn signed_rotation_about_axis_sign_flips_with_axis_negation() {
-        let q = Quaternion::from_axis_angle(
-            &Vector3::new(0.0, 0.0, 1.0),
-            std::f64::consts::FRAC_PI_4,
-        )
-        .expect("axis-angle valid");
+        let q =
+            Quaternion::from_axis_angle(&Vector3::new(0.0, 0.0, 1.0), std::f64::consts::FRAC_PI_4)
+                .expect("axis-angle valid");
         let m = q.to_matrix4();
         let r_pos = signed_rotation_about_axis(&m, Vector3::new(0.0, 0.0, 1.0)).expect("ok");
         let r_neg = signed_rotation_about_axis(&m, Vector3::new(0.0, 0.0, -1.0)).expect("ok");
@@ -3386,11 +3382,9 @@ mod tests {
 
     #[test]
     fn matrix_to_correction_recovers_rotation_angle() {
-        let q = Quaternion::from_axis_angle(
-            &Vector3::new(0.0, 0.0, 1.0),
-            std::f64::consts::FRAC_PI_2,
-        )
-        .expect("axis-angle valid");
+        let q =
+            Quaternion::from_axis_angle(&Vector3::new(0.0, 0.0, 1.0), std::f64::consts::FRAC_PI_2)
+                .expect("axis-angle valid");
         let m = q.to_matrix4();
         let c = matrix_to_correction(&m).expect("ok");
         assert!((c.rotation_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-6);

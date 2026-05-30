@@ -689,8 +689,7 @@ fn create_interior_offset_faces(
         let offset_surface = create_offset_surface(model, &face, thickness)?;
         let surface_id = model.surfaces.add(offset_surface);
 
-        let (offset_loop, edge_map) =
-            create_offset_loop(model, &face, thickness, &offset_options)?;
+        let (offset_loop, edge_map) = create_offset_loop(model, &face, thickness, &offset_options)?;
         let loop_id = model.loops.add(offset_loop);
 
         let offset_face_obj = Face::new(
@@ -771,15 +770,12 @@ fn create_shell_walls(
         // faces). Using a global-axis cross product as in the previous
         // implementation produced walls perpendicular to the wrong plane
         // for any face that wasn't axis-aligned.
-        let removed_surface = model
-            .surfaces
-            .get(face.surface_id)
-            .ok_or_else(|| {
-                OperationError::InvalidGeometry(format!(
-                    "create_shell_walls: surface {} of removed face {} not found",
-                    face.surface_id, face_id
-                ))
-            })?;
+        let removed_surface = model.surfaces.get(face.surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_shell_walls: surface {} of removed face {} not found",
+                face.surface_id, face_id
+            ))
+        })?;
         let mut removed_normal = removed_surface.normal_at(0.5, 0.5)?;
         if matches!(
             face.orientation,
@@ -1177,9 +1173,7 @@ mod tests {
     // future direction regression cannot silently land.
     // ------------------------------------------------------------------
 
-    use crate::operations::recorder::{
-        OperationRecorder, RecordedOperation, RecorderError,
-    };
+    use crate::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
     use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
     use std::sync::{Arc, Mutex};
 
@@ -1199,7 +1193,11 @@ mod tests {
         // The +Z face is identified by surface normal ≈ (0,0,1) AND the
         // face plane evaluating at +hd on Z. Iterating faces directly
         // avoids depending on the box-face index ordering.
-        let solid = model.solids.get(solid_id).expect("solid must exist").clone();
+        let solid = model
+            .solids
+            .get(solid_id)
+            .expect("solid must exist")
+            .clone();
         let shell = model
             .shells
             .get(solid.outer_shell)
@@ -1233,10 +1231,7 @@ mod tests {
             let edge = model.edges.get(edge_id).expect("edge");
             for vid in [edge.start_vertex, edge.end_vertex] {
                 if seen.insert(vid) {
-                    let p = model
-                        .vertices
-                        .get_position(vid)
-                        .expect("vertex position");
+                    let p = model.vertices.get_position(vid).expect("vertex position");
                     positions.push(Point3::new(p[0], p[1], p[2]));
                 }
             }
@@ -1268,14 +1263,8 @@ mod tests {
             max_deviation: 1e-3,
         };
 
-        let hollow_id = offset_solid(
-            &mut model,
-            solid_id,
-            thickness,
-            vec![top_face_id],
-            options,
-        )
-        .expect("offset_solid on top-removed cube must succeed");
+        let hollow_id = offset_solid(&mut model, solid_id, thickness, vec![top_face_id], options)
+            .expect("offset_solid on top-removed cube must succeed");
 
         // Identify wall faces in the resulting hollow solid:
         // - Their surface normal is parallel to the removed face's
@@ -1292,9 +1281,7 @@ mod tests {
         for &face_id in &hollow_shell.faces {
             let face = model.faces.get(face_id).expect("face");
             let surface = model.surfaces.get(face.surface_id).expect("surface");
-            let n = surface
-                .normal_at(0.5, 0.5)
-                .expect("planar surface normal");
+            let n = surface.normal_at(0.5, 0.5).expect("planar surface normal");
             // Only consider faces parallel to the removed-face plane.
             if !(n.x.abs() < 1e-6 && n.y.abs() < 1e-6 && (n.z.abs() - 1.0).abs() < 1e-6) {
                 continue;
@@ -1350,14 +1337,8 @@ mod tests {
             max_deviation: 1e-3,
         };
 
-        let hollow_id = offset_solid(
-            &mut model,
-            solid_id,
-            thickness,
-            vec![top_face_id],
-            options,
-        )
-        .expect("offset_solid must succeed");
+        let hollow_id = offset_solid(&mut model, solid_id, thickness, vec![top_face_id], options)
+            .expect("offset_solid must succeed");
 
         let hollow = model.solids.get(hollow_id).expect("hollow").clone();
         let hollow_shell = model.shells.get(hollow.outer_shell).expect("shell").clone();
@@ -1444,21 +1425,11 @@ mod tests {
             max_deviation: 1e-3,
         };
 
-        let hollow_id = offset_solid(
-            &mut model,
-            solid_id,
-            thickness,
-            vec![top_face_id],
-            options,
-        )
-        .expect("offset_solid must succeed");
+        let hollow_id = offset_solid(&mut model, solid_id, thickness, vec![top_face_id], options)
+            .expect("offset_solid must succeed");
 
         let hollow = model.solids.get(hollow_id).expect("hollow").clone();
-        let hollow_shell = model
-            .shells
-            .get(hollow.outer_shell)
-            .expect("shell")
-            .clone();
+        let hollow_shell = model.shells.get(hollow.outer_shell).expect("shell").clone();
 
         // Build edge → faces adjacency over every face in the hollow
         // shell. A manifold rim edge appears in exactly 2 of these.
@@ -1492,10 +1463,8 @@ mod tests {
             if !on_top_plane {
                 continue;
             }
-            let s_on_inset =
-                (s[0].abs() - inset).abs() < 1e-6 || (s[1].abs() - inset).abs() < 1e-6;
-            let e_on_inset =
-                (e[0].abs() - inset).abs() < 1e-6 || (e[1].abs() - inset).abs() < 1e-6;
+            let s_on_inset = (s[0].abs() - inset).abs() < 1e-6 || (s[1].abs() - inset).abs() < 1e-6;
+            let e_on_inset = (e[0].abs() - inset).abs() < 1e-6 || (e[1].abs() - inset).abs() < 1e-6;
             if s_on_inset && e_on_inset {
                 rim_edges.push((edge_id, faces.clone()));
             }
@@ -1620,24 +1589,14 @@ mod tests {
             max_deviation: 1e-3,
         };
 
-        let hollow_id = offset_solid(
-            &mut model,
-            solid_id,
-            thickness,
-            vec![top_face_id],
-            options,
-        )
-        .expect("offset_solid must succeed");
+        let hollow_id = offset_solid(&mut model, solid_id, thickness, vec![top_face_id], options)
+            .expect("offset_solid must succeed");
 
         // The +X kept face's interior offset is the (single) face in
         // the result with surface normal ±X whose face center is at
         // x = inset. Find it via face-vertex inspection.
         let hollow = model.solids.get(hollow_id).expect("hollow").clone();
-        let hollow_shell = model
-            .shells
-            .get(hollow.outer_shell)
-            .expect("shell")
-            .clone();
+        let hollow_shell = model.shells.get(hollow.outer_shell).expect("shell").clone();
 
         let mut x_offset_faces = Vec::new();
         for &face_id in &hollow_shell.faces {
@@ -1653,9 +1612,7 @@ mod tests {
             // Inward-offset -X face: every vertex sits at x = -inset.
             // Original kept faces are at x = ±half_extent.
             let all_at_pos_inset = positions.iter().all(|p| (p.x - inset).abs() < 1e-6);
-            let all_at_neg_inset = positions
-                .iter()
-                .all(|p| (p.x - (-inset)).abs() < 1e-6);
+            let all_at_neg_inset = positions.iter().all(|p| (p.x - (-inset)).abs() < 1e-6);
             if all_at_pos_inset || all_at_neg_inset {
                 x_offset_faces.push((face_id, positions));
             }

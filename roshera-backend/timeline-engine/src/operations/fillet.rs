@@ -233,8 +233,7 @@ impl OperationImpl for FilletOp {
                 if let Some(overrides) = per_edge_overrides {
                     obj.insert(
                         "last_fillet_per_edge_overrides".to_string(),
-                        serde_json::to_value(overrides)
-                            .unwrap_or(serde_json::Value::Null),
+                        serde_json::to_value(overrides).unwrap_or(serde_json::Value::Null),
                     );
                 }
             }
@@ -347,17 +346,16 @@ pub(crate) fn build_fillet_type_from_overrides(
     // spec is still all-Constant and packs as the cheap
     // `PerEdgeConstant(HashMap<EdgeId, f64>)` shape.
     let default_is_constant = matches!(default_radius, BlendRadiusDto::Constant(_));
-    let every_entity_resolves_to_constant = entity_to_edge.keys().all(|entity_id| {
-        match overrides.get(entity_id) {
-            Some(BlendRadiusDto::Constant(_)) => true,
-            Some(_) => false,
-            None => default_is_constant,
-        }
+    let every_entity_resolves_to_constant = entity_to_edge.keys().all(|entity_id| match overrides
+        .get(entity_id)
+    {
+        Some(BlendRadiusDto::Constant(_)) => true,
+        Some(_) => false,
+        None => default_is_constant,
     });
 
     if every_entity_resolves_to_constant {
-        let mut per_edge: HashMap<EdgeId, f64> =
-            HashMap::with_capacity(entity_to_edge.len());
+        let mut per_edge: HashMap<EdgeId, f64> = HashMap::with_capacity(entity_to_edge.len());
         for (entity_id, edge_id) in entity_to_edge {
             let dto = overrides.get(entity_id).unwrap_or(default_radius);
             // `dto` is guaranteed Constant by the resolve check
@@ -458,12 +456,8 @@ mod per_edge_overrides_tests {
         let edges = vec![EntityId::new()];
         let edge_ids: Vec<EdgeId> = vec![1];
         let mapping = make_entity_to_edge(&edges, &edge_ids);
-        let ty = build_fillet_type_from_overrides(
-            &BlendRadiusDto::Constant(0.5),
-            &None,
-            &mapping,
-        )
-        .expect("none-overrides must succeed");
+        let ty = build_fillet_type_from_overrides(&BlendRadiusDto::Constant(0.5), &None, &mapping)
+            .expect("none-overrides must succeed");
         match ty {
             FilletType::Constant(r) => assert_eq!(r, 0.5),
             other => panic!("expected Constant(0.5), got {other:?}"),
@@ -649,12 +643,8 @@ mod per_edge_overrides_tests {
         overrides.insert(e1, BlendRadiusDto::Constant(0.6));
         // e2 falls through to the Variable default.
         let default = BlendRadiusDto::Variable(vec![(0.0, 0.5), (1.0, 0.7)]);
-        let ty = build_fillet_type_from_overrides(
-            &default,
-            &Some(overrides),
-            &mapping,
-        )
-        .expect("Variable default with mixed overrides must build");
+        let ty = build_fillet_type_from_overrides(&default, &Some(overrides), &mapping)
+            .expect("Variable default with mixed overrides must build");
         match ty {
             FilletType::PerEdgeProfile(map) => {
                 assert_eq!(
@@ -750,12 +740,9 @@ mod per_edge_overrides_tests {
 
     #[test]
     fn chord_default_with_no_overrides_yields_fillet_type_chord() {
-        let result = build_fillet_type_from_overrides(
-            &BlendRadiusDto::Chord(0.5),
-            &None,
-            &HashMap::new(),
-        )
-        .expect("Chord default with no overrides must succeed");
+        let result =
+            build_fillet_type_from_overrides(&BlendRadiusDto::Chord(0.5), &None, &HashMap::new())
+                .expect("Chord default with no overrides must succeed");
         match result {
             FilletType::Chord(c) => assert!((c - 0.5).abs() < 1e-12),
             other => panic!("expected FilletType::Chord, got {other:?}"),

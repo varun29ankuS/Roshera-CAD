@@ -1979,9 +1979,7 @@ mod tests {
 
         // force=true: this test exercises the cascade machinery on main,
         // which is the protected branch.
-        let removed = timeline
-            .truncate_branch(BranchId::main(), 2, true)
-            .unwrap();
+        let removed = timeline.truncate_branch(BranchId::main(), 2, true).unwrap();
         assert_eq!(removed, 1, "exactly one event removed from main (key 2)");
 
         // Cascade: child's fork_point.event_index (2) >= cut_index (2),

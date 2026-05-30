@@ -99,9 +99,8 @@ mod fixtures {
                 other => panic!("expected solid, got {:?}", other),
             }
         };
-        let rim = find_top_rim_edge(&model, height).expect(
-            "cylinder kernel build must expose the top rim as a closed topological edge",
-        );
+        let rim = find_top_rim_edge(&model, height)
+            .expect("cylinder kernel build must expose the top rim as a closed topological edge");
         (model, solid_id, rim)
     }
 

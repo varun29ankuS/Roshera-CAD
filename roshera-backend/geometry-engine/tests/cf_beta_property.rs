@@ -131,14 +131,20 @@ fn corner_edges(model: &BRepModel) -> Vec<EdgeId> {
     let corner = vertex_at(model, HALF_BOX, HALF_BOX, HALF_BOX);
     let mut edges = edges_at_vertex(model, corner);
     edges.sort_unstable();
-    assert_eq!(edges.len(), 3, "box corner must have exactly 3 incident edges");
+    assert_eq!(
+        edges.len(),
+        3,
+        "box corner must have exactly 3 incident edges"
+    );
     edges
 }
 
 /// Build a fresh box and apply the chamfer-first-then-fillet ordering
 /// at the (+x,+y,+z) corner with `d = r = displacement`. Returns the
 /// resulting `(model, solid_id)` pair so callers can hash or census.
-fn build_chamfer_first(displacement: f64) -> (BRepModel, geometry_engine::primitives::solid::SolidId) {
+fn build_chamfer_first(
+    displacement: f64,
+) -> (BRepModel, geometry_engine::primitives::solid::SolidId) {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -164,7 +170,9 @@ fn build_chamfer_first(displacement: f64) -> (BRepModel, geometry_engine::primit
 }
 
 /// Mirror of [`build_chamfer_first`] for the fillet-first ordering.
-fn build_fillet_first(displacement: f64) -> (BRepModel, geometry_engine::primitives::solid::SolidId) {
+fn build_fillet_first(
+    displacement: f64,
+) -> (BRepModel, geometry_engine::primitives::solid::SolidId) {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);

@@ -462,10 +462,7 @@ fn sample_face_normal_at(
     tolerance: Tolerance,
 ) -> OperationResult<Vector3> {
     let face = model.faces.get(face_id).ok_or_else(|| {
-        OperationError::InternalError(format!(
-            "seam audit: face {} missing from model",
-            face_id
-        ))
+        OperationError::InternalError(format!("seam audit: face {} missing from model", face_id))
     })?;
     let surface = model.surfaces.get(face.surface_id).ok_or_else(|| {
         OperationError::InternalError(format!(
@@ -538,10 +535,7 @@ mod tests {
     fn vertex_at(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
         for (id, vertex) in model.vertices.iter() {
             let p = vertex.position;
-            if (p[0] - x).abs() < 1.0e-9
-                && (p[1] - y).abs() < 1.0e-9
-                && (p[2] - z).abs() < 1.0e-9
-            {
+            if (p[0] - x).abs() < 1.0e-9 && (p[1] - y).abs() < 1.0e-9 && (p[2] - z).abs() < 1.0e-9 {
                 return id;
             }
         }
@@ -606,8 +600,8 @@ mod tests {
     fn audit_returns_empty_for_missing_solid() {
         let model = BRepModel::new();
         let stale = SolidId::default();
-        let report = audit_mixed_kind_seam_continuity(&model, stale)
-            .expect("stale solid is a no-op");
+        let report =
+            audit_mixed_kind_seam_continuity(&model, stale).expect("stale solid is a no-op");
         assert!(report.is_empty());
     }
 
@@ -667,8 +661,8 @@ mod tests {
         )
         .expect("1C2F fillet-second closes corner with G1 cap");
 
-        let report = audit_mixed_kind_seam_continuity(&model, solid_id)
-            .expect("G1 1C2F audit succeeds");
+        let report =
+            audit_mixed_kind_seam_continuity(&model, solid_id).expect("G1 1C2F audit succeeds");
         assert!(
             !report.is_empty(),
             "G1 1C2F must yield at least one cap-rim seam record at the mixed corner"

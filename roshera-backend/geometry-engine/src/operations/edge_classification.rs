@@ -458,7 +458,12 @@ mod tests {
             let class = classify_dihedral(&model, eid)
                 .expect("classify_dihedral should succeed")
                 .expect("a box edge has a defined dihedral");
-            assert_eq!(class, DihedralClass::Convex, "box edge {} should be convex", eid);
+            assert_eq!(
+                class,
+                DihedralClass::Convex,
+                "box edge {} should be convex",
+                eid
+            );
         }
     }
 

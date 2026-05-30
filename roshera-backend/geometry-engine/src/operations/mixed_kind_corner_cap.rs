@@ -191,14 +191,16 @@ pub fn verify_mixed_cap_loop(
                     edge_id
                 ),
             })?;
-        let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
-            BlendFailure::TopologyViolation {
-                detail: format!(
-                    "mixed cap edge {:?} references missing curve {:?}",
-                    edge_id, edge.curve_id
-                ),
-            }
-        })?;
+        let curve =
+            model
+                .curves
+                .get(edge.curve_id)
+                .ok_or_else(|| BlendFailure::TopologyViolation {
+                    detail: format!(
+                        "mixed cap edge {:?} references missing curve {:?}",
+                        edge_id, edge.curve_id
+                    ),
+                })?;
 
         let matches = match declared_kind {
             RimKind::LinearRim => curve.as_any().downcast_ref::<Line>().is_some(),
@@ -302,20 +304,15 @@ pub fn synthesize_mixed_kind_corner_cap(
                             .unwrap_or([f64::NAN; 3]);
                         dump.push_str(&format!(
                             "\n    edge {:?} ({:?}): start v{:?}={:?}, end v{:?}={:?}",
-                            eid,
-                            kind,
-                            edge.start_vertex,
-                            sp,
-                            edge.end_vertex,
-                            ep,
+                            eid, kind, edge.start_vertex, sp, edge.end_vertex, ep,
                         ));
                     } else {
                         dump.push_str(&format!("\n    edge {:?} ({:?}): MISSING", eid, kind));
                     }
                 }
-                return OperationError::BlendFailed(Box::new(
-                    BlendFailure::TopologyViolation { detail: dump },
-                ));
+                return OperationError::BlendFailed(Box::new(BlendFailure::TopologyViolation {
+                    detail: dump,
+                }));
             }
             OperationError::BlendFailed(Box::new(e))
         })?;
@@ -772,8 +769,7 @@ pub(crate) fn filter_pending_corner_errors(
         .iter()
         .filter(|(lid, _)| {
             model.faces.iter().any(|(fid, f)| {
-                v_faces.contains(&fid)
-                    && (f.outer_loop == *lid || f.inner_loops.contains(lid))
+                v_faces.contains(&fid) && (f.outer_loop == *lid || f.inner_loops.contains(lid))
             })
         })
         .flat_map(|(_, lp)| lp.edges.iter().copied())
@@ -841,9 +837,7 @@ pub(crate) fn filter_pending_corner_errors(
             // corner. Match the validator's wording ("Boundary edge
             // {} detected") to keep the predicate narrow.
             if let Some(fid) = location.face_id {
-                if v_adjacent_faces.contains(&fid)
-                    && message.starts_with("Boundary edge")
-                {
+                if v_adjacent_faces.contains(&fid) && message.starts_with("Boundary edge") {
                     return false;
                 }
             }
@@ -973,8 +967,7 @@ mod tests {
                     let perp = Vector3::new(-chord.y, chord.x, 0.0)
                         .normalize()
                         .expect("polygon chord non-zero in synthetic fixture");
-                    let sagitta =
-                        (big_r * big_r - (0.5 * chord_len) * (0.5 * chord_len)).sqrt();
+                    let sagitta = (big_r * big_r - (0.5 * chord_len) * (0.5 * chord_len)).sqrt();
                     let centre = Point3::new(
                         mid.x - perp.x * sagitta,
                         mid.y - perp.y * sagitta,
@@ -994,8 +987,7 @@ mod tests {
                 }
             };
 
-            let edge =
-                Edge::new_auto_range(0, v0, v1, curve_id, EdgeOrientation::Forward);
+            let edge = Edge::new_auto_range(0, v0, v1, curve_id, EdgeOrientation::Forward);
             let edge_id = model.edges.add(edge);
             cap_edges.push((edge_id, kinds[i]));
         }
@@ -1047,8 +1039,8 @@ mod tests {
         // length-prefilter in `verify_cap_edges_form_closed_polygon`
         // does NOT trip; the failure surfaces from the running-vertex
         // chain walk instead.
-        let err = verify_mixed_cap_loop(&model, &cap)
-            .expect_err("dropping an edge must open the loop");
+        let err =
+            verify_mixed_cap_loop(&model, &cap).expect_err("dropping an edge must open the loop");
         assert!(
             matches!(err, BlendFailure::TopologyViolation { .. }),
             "expected TopologyViolation, got {:?}",
@@ -1072,8 +1064,7 @@ mod tests {
         let mut cap = build_synthetic_cap_loop(&mut model, 6, 1.0, &real_kinds);
         cap[0].1 = RimKind::ArcRim; // lie about the curve type
 
-        let err = verify_mixed_cap_loop(&model, &cap)
-            .expect_err("rim-kind mismatch must reject");
+        let err = verify_mixed_cap_loop(&model, &cap).expect_err("rim-kind mismatch must reject");
         assert!(
             matches!(err, BlendFailure::TopologyViolation { .. }),
             "expected TopologyViolation, got {:?}",
@@ -1316,9 +1307,13 @@ mod tests {
                 crate::math::Point3::new(1.0, 0.0, 0.0),
             );
             let cid = model.curves.add(Box::new(line));
-            let eid = model
-                .edges
-                .add(Edge::new_auto_range(0, v0, v1, cid, EdgeOrientation::Forward));
+            let eid = model.edges.add(Edge::new_auto_range(
+                0,
+                v0,
+                v1,
+                cid,
+                EdgeOrientation::Forward,
+            ));
 
             let pending: HashSet<u32> = [v0].into_iter().collect();
             let errors = vec![
@@ -1435,8 +1430,8 @@ mod tests {
             1.0,
             &[RimKind::LinearRim, RimKind::ArcRim, RimKind::LinearRim],
         );
-        let (_verts, forwards) = verify_mixed_cap_loop(&model, &cap_edges)
-            .expect("triangle synthetic cap closes");
+        let (_verts, forwards) =
+            verify_mixed_cap_loop(&model, &cap_edges).expect("triangle synthetic cap closes");
 
         // Take a free vertex (no edges referencing it) as the "corner"
         // — finalize's Step-7 orphan-cleanup must drop it.
@@ -1508,8 +1503,8 @@ mod tests {
             1.0,
             &[RimKind::LinearRim, RimKind::ArcRim, RimKind::LinearRim],
         );
-        let (_verts, forwards) = verify_mixed_cap_loop(&model, &cap_edges)
-            .expect("triangle synthetic cap closes");
+        let (_verts, forwards) =
+            verify_mixed_cap_loop(&model, &cap_edges).expect("triangle synthetic cap closes");
 
         let corner = model.vertices.add(0.0, 0.0, 5.0);
 
@@ -1588,14 +1583,9 @@ mod tests {
         let (mut model, solid_id, _shell_id) = fresh_solid_with_outer_shell();
         let corner = model.vertices.add(0.0, 0.0, 0.0);
 
-        let err = finalize_mixed_kind_cap_face(
-            &mut model,
-            solid_id,
-            corner,
-            &[],
-            BlendKind::Chamfer,
-        )
-        .expect_err("zero sub-faces must reject");
+        let err =
+            finalize_mixed_kind_cap_face(&mut model, solid_id, corner, &[], BlendKind::Chamfer)
+                .expect_err("zero sub-faces must reject");
 
         match err {
             OperationError::InvalidGeometry(msg) => {

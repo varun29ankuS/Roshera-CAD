@@ -315,11 +315,7 @@ fn build_random_surface(
 ) -> Result<NurbsSurface, &'static str> {
     let control_points: Vec<Vec<Point3>> = coords
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|&(x, y, z)| Point3::new(x, y, z))
-                .collect()
-        })
+        .map(|row| row.iter().map(|&(x, y, z)| Point3::new(x, y, z)).collect())
         .collect();
     let weight_grid: Vec<Vec<f64>> = weights.iter().map(|row| row.to_vec()).collect();
 

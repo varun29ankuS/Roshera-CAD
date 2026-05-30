@@ -197,9 +197,7 @@ pub fn infer_constraints(
 ) -> Vec<ProposedConstraint> {
     match draft {
         DraftEntity::Line { start, end } => infer_for_line(sketch, *start, *end, tol),
-        DraftEntity::Circle { center, radius } => {
-            infer_for_circle(sketch, *center, *radius, tol)
-        }
+        DraftEntity::Circle { center, radius } => infer_for_circle(sketch, *center, *radius, tol),
         DraftEntity::Point { position } => infer_for_point(sketch, *position, tol),
     }
 }
@@ -224,15 +222,7 @@ fn infer_for_line(
         &mut out,
         /*is_line_endpoint=*/ true,
     );
-    propose_for_endpoint(
-        sketch,
-        end,
-        start,
-        DraftSlot::LineEnd,
-        tol,
-        &mut out,
-        true,
-    );
+    propose_for_endpoint(sketch, end, start, DraftSlot::LineEnd, tol, &mut out, true);
 
     // Direction: Horizontal, Vertical.
     let dx = end.x - start.x;
@@ -412,10 +402,7 @@ fn infer_for_circle(
                 constraint: GeometricConstraint::Equal,
                 draft_slot: DraftSlot::CircleSelf,
                 target: Some(EntityRef::Circle(cid)),
-                confidence: confidence_from_misalign(
-                    (r - radius).abs(),
-                    tol.equal_radius_tol,
-                ),
+                confidence: confidence_from_misalign((r - radius).abs(), tol.equal_radius_tol),
                 reason: "equal radius to existing circle",
             });
         }
@@ -428,10 +415,7 @@ fn infer_for_circle(
                 constraint: GeometricConstraint::Equal,
                 draft_slot: DraftSlot::CircleSelf,
                 target: Some(EntityRef::Arc(aid)),
-                confidence: confidence_from_misalign(
-                    (r - radius).abs(),
-                    tol.equal_radius_tol,
-                ),
+                confidence: confidence_from_misalign((r - radius).abs(), tol.equal_radius_tol),
                 reason: "equal radius to existing arc",
             });
         }
@@ -533,7 +517,8 @@ mod tests {
     }
 
     fn has(out: &[ProposedConstraint], c: GeometricConstraint, slot: DraftSlot) -> bool {
-        out.iter().any(|p| p.constraint == c && p.draft_slot == slot)
+        out.iter()
+            .any(|p| p.constraint == c && p.draft_slot == slot)
     }
 
     // ── Empty sketch ──────────────────────────────────────────────
@@ -547,10 +532,20 @@ mod tests {
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
         // Horizontal must be present; Vertical must not.
-        assert!(has(&out, GeometricConstraint::Horizontal, DraftSlot::LineSelf));
-        assert!(!has(&out, GeometricConstraint::Vertical, DraftSlot::LineSelf));
+        assert!(has(
+            &out,
+            GeometricConstraint::Horizontal,
+            DraftSlot::LineSelf
+        ));
+        assert!(!has(
+            &out,
+            GeometricConstraint::Vertical,
+            DraftSlot::LineSelf
+        ));
         // No coincidence proposals on empty sketch.
-        assert!(!out.iter().any(|p| p.constraint == GeometricConstraint::Coincident));
+        assert!(!out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Coincident));
     }
 
     #[test]
@@ -576,7 +571,11 @@ mod tests {
             end: Point2d::new(10.0 * theta.cos(), 10.0 * theta.sin()),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(has(&out, GeometricConstraint::Horizontal, DraftSlot::LineSelf));
+        assert!(has(
+            &out,
+            GeometricConstraint::Horizontal,
+            DraftSlot::LineSelf
+        ));
     }
 
     #[test]
@@ -588,8 +587,16 @@ mod tests {
             end: Point2d::new(10.0 * theta.cos(), 10.0 * theta.sin()),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(!has(&out, GeometricConstraint::Horizontal, DraftSlot::LineSelf));
-        assert!(!has(&out, GeometricConstraint::Vertical, DraftSlot::LineSelf));
+        assert!(!has(
+            &out,
+            GeometricConstraint::Horizontal,
+            DraftSlot::LineSelf
+        ));
+        assert!(!has(
+            &out,
+            GeometricConstraint::Vertical,
+            DraftSlot::LineSelf
+        ));
     }
 
     #[test]
@@ -600,8 +607,16 @@ mod tests {
             end: Point2d::new(0.0, 10.0),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(has(&out, GeometricConstraint::Vertical, DraftSlot::LineSelf));
-        assert!(!has(&out, GeometricConstraint::Horizontal, DraftSlot::LineSelf));
+        assert!(has(
+            &out,
+            GeometricConstraint::Vertical,
+            DraftSlot::LineSelf
+        ));
+        assert!(!has(
+            &out,
+            GeometricConstraint::Horizontal,
+            DraftSlot::LineSelf
+        ));
     }
 
     // ── Parallel / Perpendicular ──────────────────────────────────
@@ -619,8 +634,10 @@ mod tests {
             end: Point2d::new(10.0, 105.0),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Parallel
-            && p.target == Some(EntityRef::Line(existing))));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Parallel
+                && p.target == Some(EntityRef::Line(existing))));
     }
 
     #[test]
@@ -635,8 +652,10 @@ mod tests {
             end: Point2d::new(-5.0, 110.0),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Perpendicular
-            && p.target == Some(EntityRef::Line(existing))));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Perpendicular
+                && p.target == Some(EntityRef::Line(existing))));
     }
 
     // ── Endpoint coincidence ──────────────────────────────────────
@@ -651,9 +670,11 @@ mod tests {
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
         // LineStart should be Coincident with the target point.
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Coincident
-            && p.draft_slot == DraftSlot::LineStart
-            && p.target == Some(EntityRef::Point(target))));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Coincident
+                && p.draft_slot == DraftSlot::LineStart
+                && p.target == Some(EntityRef::Point(target))));
     }
 
     // ── Tangent ───────────────────────────────────────────────────
@@ -680,8 +701,10 @@ mod tests {
             end: p_on_circle,
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Tangent
-            && p.target == Some(EntityRef::Circle(cid))));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Tangent
+                && p.target == Some(EntityRef::Circle(cid))));
     }
 
     #[test]
@@ -697,9 +720,13 @@ mod tests {
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
         // Coincident with the quadrant target (CircleQuadrant is
         // discrete priority 1) is what fires here, NOT Tangent.
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Coincident
-            && p.target == Some(EntityRef::Circle(cid))));
-        assert!(!out.iter().any(|p| p.constraint == GeometricConstraint::Tangent));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Coincident
+                && p.target == Some(EntityRef::Circle(cid))));
+        assert!(!out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Tangent));
     }
 
     // ── Circle inference ──────────────────────────────────────────
@@ -713,33 +740,42 @@ mod tests {
             radius: 10.0,
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Concentric
-            && p.target == Some(EntityRef::Circle(cid))));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Concentric
+                && p.target == Some(EntityRef::Circle(cid))));
     }
 
     #[test]
     fn draft_circle_with_matching_radius_infers_equal() {
         let s = fresh();
-        let cid = s.add_circle(Point2d::new(100.0, 100.0), 3.0).expect("circle");
+        let cid = s
+            .add_circle(Point2d::new(100.0, 100.0), 3.0)
+            .expect("circle");
         let draft = DraftEntity::Circle {
             center: Point2d::new(200.0, 200.0),
             radius: 3.1, // within 0.5 tolerance
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Equal
-            && p.target == Some(EntityRef::Circle(cid))));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Equal
+                && p.target == Some(EntityRef::Circle(cid))));
     }
 
     #[test]
     fn draft_circle_with_distant_radius_does_not_infer_equal() {
         let s = fresh();
-        s.add_circle(Point2d::new(100.0, 100.0), 3.0).expect("circle");
+        s.add_circle(Point2d::new(100.0, 100.0), 3.0)
+            .expect("circle");
         let draft = DraftEntity::Circle {
             center: Point2d::new(200.0, 200.0),
             radius: 7.0,
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(!out.iter().any(|p| p.constraint == GeometricConstraint::Equal));
+        assert!(!out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Equal));
     }
 
     // ── Point inference ───────────────────────────────────────────
@@ -777,9 +813,11 @@ mod tests {
             position: Point2d::new(3.01, 4.01),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        assert!(out.iter().any(|p| p.constraint == GeometricConstraint::Coincident
-            && p.draft_slot == DraftSlot::PointSelf
-            && p.target == Some(EntityRef::Point(target))));
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Coincident
+                && p.draft_slot == DraftSlot::PointSelf
+                && p.target == Some(EntityRef::Point(target))));
     }
 
     // ── Confidence helper ─────────────────────────────────────────

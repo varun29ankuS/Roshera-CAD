@@ -349,10 +349,9 @@ mod imp1_tests {
 
     #[tokio::test]
     async fn rejects_missing_file() {
-        let result = import_step_to_brep_with_report(Path::new(
-            "/definitely/not/a/real/file/abc.step",
-        ))
-        .await;
+        let result =
+            import_step_to_brep_with_report(Path::new("/definitely/not/a/real/file/abc.step"))
+                .await;
         assert!(result.is_err(), "missing file must hard-fail");
     }
 
@@ -448,11 +447,7 @@ mod imp1_tests {
         // unconditionally), but `roots_resolved` stays 0.
         let mut body = unit_cube_with_root("SHAPE_REPRESENTATION");
         // Strip the root entity — keep only the geometry/topology.
-        body = body
-            .replace(
-                "#301=SHAPE_REPRESENTATION('cube',(#161,#204),#904);",
-                "",
-            );
+        body = body.replace("#301=SHAPE_REPRESENTATION('cube',(#161,#204),#904);", "");
         let src = ap242_step(&body);
         let f = write_tmp(&src);
         let (model, report) = import_step_to_brep_with_report(f.path()).await.unwrap();
@@ -481,12 +476,10 @@ mod imp1_tests {
         assert!(report.ok);
         assert_eq!(report.roots_resolved, 1);
         assert!(report.counts.unsupported.contains_key("STYLED_ITEM"));
-        assert!(
-            report
-                .counts
-                .unsupported
-                .contains_key("PRESENTATION_LAYER_ASSIGNMENT")
-        );
+        assert!(report
+            .counts
+            .unsupported
+            .contains_key("PRESENTATION_LAYER_ASSIGNMENT"));
     }
 
     #[tokio::test]

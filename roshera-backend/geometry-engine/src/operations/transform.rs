@@ -787,11 +787,7 @@ mod tests {
     }
 
     fn collect_positions(model: &BRepModel) -> Vec<[f64; 3]> {
-        model
-            .vertices
-            .iter()
-            .map(|(_, v)| v.position)
-            .collect()
+        model.vertices.iter().map(|(_, v)| v.position).collect()
     }
 
     // ────────── A. TransformOptions ──────────
@@ -990,8 +986,7 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let res =
-            translate(&mut model, vec![sid], Vector3::Z, 1.0, opts).expect("translate");
+        let res = translate(&mut model, vec![sid], Vector3::Z, 1.0, opts).expect("translate");
         assert_eq!(res.transformed_ids, vec![sid]);
     }
 
@@ -1008,15 +1003,8 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let _ = rotate(
-            &mut model,
-            vec![sid],
-            Point3::ORIGIN,
-            Vector3::Z,
-            0.0,
-            opts,
-        )
-        .expect("rotate");
+        let _ =
+            rotate(&mut model, vec![sid], Point3::ORIGIN, Vector3::Z, 0.0, opts).expect("rotate");
         let after = collect_positions(&model);
         for (a, b) in before.iter().zip(after.iter()) {
             assert!(approx_pos(*a, *b));
@@ -1096,15 +1084,8 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let _ = rotate(
-            &mut model,
-            vec![sid],
-            Point3::ORIGIN,
-            Vector3::X,
-            PI,
-            opts,
-        )
-        .expect("rotate");
+        let _ =
+            rotate(&mut model, vec![sid], Point3::ORIGIN, Vector3::X, PI, opts).expect("rotate");
         let after = collect_positions(&model);
         // (x,y,z) → (x,-y,-z) under 180° about X.
         // Multisets must match between `before` and `(x,-y,-z)` of after.
@@ -1222,14 +1203,7 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let _ = mirror(
-            &mut model,
-            vec![sid],
-            Point3::ORIGIN,
-            Vector3::Z,
-            opts,
-        )
-        .expect("mirror");
+        let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::Z, opts).expect("mirror");
         let after = collect_positions(&model);
         // Multiset {(x,y,-z)} of before should equal multiset {(x,y,z)} of after.
         let expected: Vec<[f64; 3]> = before.iter().map(|p| [p[0], p[1], -p[2]]).collect();
@@ -1251,14 +1225,7 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let _ = mirror(
-            &mut model,
-            vec![sid],
-            Point3::ORIGIN,
-            Vector3::X,
-            opts,
-        )
-        .expect("mirror");
+        let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::X, opts).expect("mirror");
         let after = collect_positions(&model);
         let expected: Vec<[f64; 3]> = before.iter().map(|p| [-p[0], p[1], p[2]]).collect();
         for p in &after {
@@ -1279,14 +1246,7 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let _ = mirror(
-            &mut model,
-            vec![sid],
-            Point3::ORIGIN,
-            Vector3::Y,
-            opts,
-        )
-        .expect("mirror");
+        let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::Y, opts).expect("mirror");
         let after = collect_positions(&model);
         let expected: Vec<[f64; 3]> = before.iter().map(|p| [p[0], -p[1], p[2]]).collect();
         for p in &after {
@@ -1318,14 +1278,7 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let _ = mirror(
-            &mut model,
-            vec![sid],
-            Point3::ORIGIN,
-            Vector3::Z,
-            opts,
-        )
-        .expect("mirror");
+        let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::Z, opts).expect("mirror");
         for (fid, orig) in before_orients {
             let new = model.faces.get(fid).expect("face").orientation;
             assert_eq!(new, orig.flipped());
@@ -1383,9 +1336,8 @@ mod tests {
             },
             update_parameterization: false,
         };
-        let _ =
-            transform_solid(&mut model, sid, Matrix4::translation(1.0, 0.0, 0.0), opts)
-                .expect("transform");
+        let _ = transform_solid(&mut model, sid, Matrix4::translation(1.0, 0.0, 0.0), opts)
+            .expect("transform");
         let kinds = captured_kinds(&rec);
         assert!(kinds.iter().any(|k| k == "transform_solid"));
     }
@@ -1586,11 +1538,7 @@ mod tests {
         use crate::primitives::edge::{Edge, EdgeOrientation};
         use crate::primitives::r#loop::{Loop, LoopType};
 
-        let shell_id = model
-            .solids
-            .get(solid_id)
-            .expect("solid")
-            .outer_shell;
+        let shell_id = model.solids.get(solid_id).expect("solid").outer_shell;
         let face_id = *model
             .shells
             .get(shell_id)
@@ -1621,18 +1569,34 @@ mod tests {
             Point3::new(10.0, 10.0, 10.0),
         )));
 
-        let e0 = model
-            .edges
-            .add(Edge::new_auto_range(0, h0, h1, c0, EdgeOrientation::Forward));
-        let e1 = model
-            .edges
-            .add(Edge::new_auto_range(0, h1, h2, c1, EdgeOrientation::Forward));
-        let e2 = model
-            .edges
-            .add(Edge::new_auto_range(0, h2, h3, c2, EdgeOrientation::Forward));
-        let e3 = model
-            .edges
-            .add(Edge::new_auto_range(0, h3, h0, c3, EdgeOrientation::Forward));
+        let e0 = model.edges.add(Edge::new_auto_range(
+            0,
+            h0,
+            h1,
+            c0,
+            EdgeOrientation::Forward,
+        ));
+        let e1 = model.edges.add(Edge::new_auto_range(
+            0,
+            h1,
+            h2,
+            c1,
+            EdgeOrientation::Forward,
+        ));
+        let e2 = model.edges.add(Edge::new_auto_range(
+            0,
+            h2,
+            h3,
+            c2,
+            EdgeOrientation::Forward,
+        ));
+        let e3 = model.edges.add(Edge::new_auto_range(
+            0,
+            h3,
+            h0,
+            c3,
+            EdgeOrientation::Forward,
+        ));
 
         let mut inner = Loop::new(0, LoopType::Inner);
         inner.add_edge(e0, true);
@@ -1684,17 +1648,8 @@ mod tests {
         let (hole_verts, hole_edges) = attach_synthetic_inner_loop(&mut model, sid);
 
         let face_ids: Vec<FaceId> = {
-            let shell = model
-                .solids
-                .get(sid)
-                .expect("solid")
-                .outer_shell;
-            model
-                .shells
-                .get(shell)
-                .expect("shell")
-                .faces
-                .clone()
+            let shell = model.solids.get(sid).expect("solid").outer_shell;
+            model.shells.get(shell).expect("shell").faces.clone()
         };
 
         let entities = get_faces_entities(&model, &face_ids).expect("get_faces_entities");

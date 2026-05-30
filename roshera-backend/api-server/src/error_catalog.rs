@@ -439,9 +439,7 @@ impl ApiError {
     /// curvature, setback too long, mixed convexity, …). Retrying the
     /// same request will fail identically; the agent must change its
     /// inputs before retrying.
-    pub fn blend_failed(
-        failure: &geometry_engine::operations::diagnostics::BlendFailure,
-    ) -> Self {
+    pub fn blend_failed(failure: &geometry_engine::operations::diagnostics::BlendFailure) -> Self {
         // `BlendFailure: Display` carries an actionable human summary
         // (e.g. "blend radius 2 at edge 7 station 0.420 exceeds local
         // curvature limit r_max=1.25"). Surface it on the `error`
@@ -495,15 +493,12 @@ impl ApiError {
     /// `PartManager` registry. The detail carries the offending id
     /// so the frontend can drop a stale tab.
     pub fn part_not_found(part_id: uuid::Uuid) -> Self {
-        Self::new(
-            ErrorCode::PartNotFound,
-            format!("part {part_id} not found"),
-        )
-        .with_hint(
-            "Create a part with POST /api/parts and use the returned \
+        Self::new(ErrorCode::PartNotFound, format!("part {part_id} not found"))
+            .with_hint(
+                "Create a part with POST /api/parts and use the returned \
              id in the X-Roshera-Part-Id header.",
-        )
-        .with_details(serde_json::json!({ "part_id": part_id }))
+            )
+            .with_details(serde_json::json!({ "part_id": part_id }))
     }
 
     /// Caller is authenticated but lacks the required permission for
@@ -841,8 +836,7 @@ mod tests {
     fn blend_failed_wire_shape_carries_mixed_kind_unsupported_payload() {
         use geometry_engine::operations::blend_graph::BlendVertexKind;
         use geometry_engine::operations::diagnostics::{
-            BlendFailure, MixedKindRejectDetail, VertexBlendKindSet,
-            VertexBlendUnsupportedReason,
+            BlendFailure, MixedKindRejectDetail, VertexBlendKindSet, VertexBlendUnsupportedReason,
         };
         use geometry_engine::operations::OperationError;
         use geometry_engine::primitives::solid::BlendKind;
@@ -890,8 +884,7 @@ mod tests {
     fn blend_failed_wire_shape_carries_nested_mixed_displacements_detail() {
         use geometry_engine::operations::blend_graph::BlendVertexKind;
         use geometry_engine::operations::diagnostics::{
-            BlendFailure, MixedKindRejectDetail, VertexBlendKindSet,
-            VertexBlendUnsupportedReason,
+            BlendFailure, MixedKindRejectDetail, VertexBlendKindSet, VertexBlendUnsupportedReason,
         };
         use geometry_engine::operations::OperationError;
         use geometry_engine::primitives::solid::BlendKind;
@@ -970,9 +963,7 @@ mod tests {
                 kind: BlendVertexKind::Cliff,
                 reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
             },
-            BlendFailure::TopologyViolation {
-                detail: "x".into(),
-            },
+            BlendFailure::TopologyViolation { detail: "x".into() },
         ];
         for failure in variants {
             let api_err: ApiError = OperationError::BlendFailed(Box::new(failure.clone())).into();

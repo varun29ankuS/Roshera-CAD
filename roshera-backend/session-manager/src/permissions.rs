@@ -508,7 +508,6 @@ impl PermissionManager {
             .map(|entry| entry.value().clone())
             .collect())
     }
-
 }
 
 impl Default for PermissionManager {

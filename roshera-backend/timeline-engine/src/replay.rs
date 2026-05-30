@@ -425,11 +425,12 @@ fn dispatch_generic(
                     reason: "empty inputs[]".to_string(),
                 });
             }
-            let solid_raw = parse_entity_ref(&inputs[0], "solid")
-                .ok_or_else(|| ReplayError::InvalidParameters {
+            let solid_raw = parse_entity_ref(&inputs[0], "solid").ok_or_else(|| {
+                ReplayError::InvalidParameters {
                     kind: kind.to_string(),
                     reason: "inputs[0] expected `solid:<id>`".to_string(),
-                })?;
+                }
+            })?;
             let edge_ids: Vec<EdgeId> = inputs
                 .iter()
                 .skip(1)
@@ -470,11 +471,12 @@ fn dispatch_generic(
                     reason: "empty inputs[]".to_string(),
                 });
             }
-            let solid_raw = parse_entity_ref(&inputs[0], "solid")
-                .ok_or_else(|| ReplayError::InvalidParameters {
+            let solid_raw = parse_entity_ref(&inputs[0], "solid").ok_or_else(|| {
+                ReplayError::InvalidParameters {
                     kind: kind.to_string(),
                     reason: "inputs[0] expected `solid:<id>`".to_string(),
-                })?;
+                }
+            })?;
             let edge_ids: Vec<EdgeId> = inputs
                 .iter()
                 .skip(1)

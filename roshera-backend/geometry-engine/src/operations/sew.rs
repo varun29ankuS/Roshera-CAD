@@ -841,8 +841,7 @@ mod tests {
         let solid = model.solids.get(solid_id).expect("solid");
         let shell = model.shells.get(solid.outer_shell).expect("shell");
         let faces: Vec<FaceId> = shell.faces.clone();
-        verify_edge_geometric_continuity(&model, &faces)
-            .expect("box faces share consistent edges");
+        verify_edge_geometric_continuity(&model, &faces).expect("box faces share consistent edges");
     }
 
     /// Single face has no shared edges with itself — the function
@@ -868,12 +867,7 @@ mod tests {
         let mut model = BRepModel::new();
         let solid_id = make_box(&mut model, 2.0, 2.0, 2.0);
         let shell_id = model.solids.get(solid_id).expect("solid").outer_shell;
-        let faces: Vec<FaceId> = model
-            .shells
-            .get(shell_id)
-            .expect("shell")
-            .faces
-            .clone();
+        let faces: Vec<FaceId> = model.shells.get(shell_id).expect("shell").faces.clone();
 
         // Inject a plane 100 units away from the origin and rewire
         // the first face to use it. The face's loop edges still live

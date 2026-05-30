@@ -9,9 +9,9 @@ use export_engine::formats::ros::{
     export_brep_to_ros, import_ros, HistData, RosExportOptions, RosExportPayload,
 };
 use export_engine::formats::timeline_chunk::BranchManifest;
-use ros_format::{AICommandTracker, ChunkType, FileHeader, PrivacySettings, TrackingLevel};
 use export_engine::ExportEngine;
 use geometry_engine::primitives::topology_builder::BRepModel;
+use ros_format::{AICommandTracker, ChunkType, FileHeader, PrivacySettings, TrackingLevel};
 use std::io::Cursor;
 use tempfile::TempDir;
 use timeline_engine::{
@@ -209,7 +209,9 @@ async fn test_ros_v31_hist_prov_roundtrip() {
         .await
         .expect("export should succeed");
 
-    let imported = import_ros(&path, None).await.expect("import should succeed");
+    let imported = import_ros(&path, None)
+        .await
+        .expect("import should succeed");
 
     assert_eq!(imported.timeline.len(), 3);
     assert_eq!(imported.branches.len(), 2);
@@ -339,7 +341,9 @@ async fn test_ros_v31_empty_timeline_still_valid() {
     .await
     .expect("empty-timeline export");
 
-    let imported = import_ros(&path, None).await.expect("empty-timeline import");
+    let imported = import_ros(&path, None)
+        .await
+        .expect("empty-timeline import");
     assert!(imported.timeline.is_empty());
     assert!(imported.branches.is_empty());
     assert!(imported.aipr.commands.is_empty());

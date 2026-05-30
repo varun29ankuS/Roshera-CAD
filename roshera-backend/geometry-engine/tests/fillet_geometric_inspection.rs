@@ -34,12 +34,12 @@ fn print_fillet_geometry_for_every_box_edge() {
     let mut bad = 0usize;
     for (i, edge_id) in edges_to_test.iter().enumerate() {
         let mut model = BRepModel::new();
-        let solid_id = match TopologyBuilder::new(&mut model).create_box_3d(box_size, box_size, box_size) {
-            Ok(GeometryId::Solid(id)) => id,
-            _ => panic!("box"),
-        };
-        let edges_for_this_run: Vec<EdgeId> =
-            model.edges.iter().map(|(id, _)| id).collect();
+        let solid_id =
+            match TopologyBuilder::new(&mut model).create_box_3d(box_size, box_size, box_size) {
+                Ok(GeometryId::Solid(id)) => id,
+                _ => panic!("box"),
+            };
+        let edges_for_this_run: Vec<EdgeId> = model.edges.iter().map(|(id, _)| id).collect();
         let edge = edges_for_this_run[i];
 
         let opts = FilletOptions {
@@ -87,21 +87,11 @@ fn print_fillet_geometry_for_every_box_edge() {
         // coordinate goes negative or exceeds box_size, the fillet is
         // on the wrong side.
         let slack = 1e-6;
-        let outside = (0..3).any(|k| {
-            bb_min[k] < -slack || bb_max[k] > box_size + slack
-        });
+        let outside = (0..3).any(|k| bb_min[k] < -slack || bb_max[k] > box_size + slack);
         let tag = if outside { "OUTSIDE" } else { "inside " };
         println!(
             "  edge#{:2} ({:?}) → bbox [{:6.3},{:6.3},{:6.3}] - [{:6.3},{:6.3},{:6.3}]  {}",
-            i,
-            edge,
-            bb_min[0],
-            bb_min[1],
-            bb_min[2],
-            bb_max[0],
-            bb_max[1],
-            bb_max[2],
-            tag,
+            i, edge, bb_min[0], bb_min[1], bb_min[2], bb_max[0], bb_max[1], bb_max[2], tag,
         );
         if outside {
             bad += 1;

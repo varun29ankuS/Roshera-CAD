@@ -723,7 +723,12 @@ impl Sketch {
             .iter()
             .map(|e| (*e.key(), e.value().circle))
             .collect();
-        SketchGeometrySnapshot { points, lines, arcs, circles }
+        SketchGeometrySnapshot {
+            points,
+            lines,
+            arcs,
+            circles,
+        }
     }
 
     /// Restore a snapshot taken by

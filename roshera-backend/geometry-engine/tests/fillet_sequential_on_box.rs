@@ -173,9 +173,7 @@ fn assert_mesh_manifold_with_params(
     // No degenerate / NaN / inf vertices.
     for (idx, v) in mesh.vertices.iter().enumerate() {
         assert!(
-            v.position[0].is_finite()
-                && v.position[1].is_finite()
-                && v.position[2].is_finite(),
+            v.position[0].is_finite() && v.position[1].is_finite() && v.position[2].is_finite(),
             "{label}: vertex {idx} has non-finite position {:?}",
             v.position
         );
@@ -271,12 +269,7 @@ fn second_fillet_on_opposite_top_edge_produces_valid_solid() {
          (its endpoints don't share vertices with the first edge)",
     );
 
-    let second_result = fillet_edges(
-        &mut model,
-        solid,
-        vec![second_edge],
-        fillet_opts(1.0),
-    );
+    let second_result = fillet_edges(&mut model, solid, vec![second_edge], fillet_opts(1.0));
 
     match second_result {
         Ok(_) => assert_solid_valid(&model, solid, "after second fillet (Ok)"),
@@ -448,9 +441,7 @@ fn first_fillet_on_extruded_rect_top_edge_produces_valid_solid() {
             }
             let v0 = model.vertices.get(edge.start_vertex).expect("v0");
             let v1 = model.vertices.get(edge.end_vertex).expect("v1");
-            if (v0.position[2] - z_top).abs() < EPS
-                && (v1.position[2] - z_top).abs() < EPS
-            {
+            if (v0.position[2] - z_top).abs() < EPS && (v1.position[2] - z_top).abs() < EPS {
                 found.push((
                     eid,
                     0.5 * (v0.position[0] + v1.position[0]),
@@ -491,9 +482,7 @@ fn second_fillet_on_extruded_rect_top_edge_does_not_corrupt() {
             let Some(v1) = m.vertices.get(edge.end_vertex) else {
                 continue;
             };
-            if (v0.position[2] - z_top).abs() < EPS
-                && (v1.position[2] - z_top).abs() < EPS
-            {
+            if (v0.position[2] - z_top).abs() < EPS && (v1.position[2] - z_top).abs() < EPS {
                 found.push((
                     eid,
                     0.5 * (v0.position[0] + v1.position[0]),
@@ -542,10 +531,7 @@ fn second_fillet_on_extruded_rect_top_edge_does_not_corrupt() {
         Err(e) => assert_solid_valid(
             &model,
             solid,
-            &format!(
-                "after second fillet on extruded rect rolled back ({:?})",
-                e
-            ),
+            &format!("after second fillet on extruded rect rolled back ({:?})", e),
         ),
     }
 }
@@ -567,9 +553,7 @@ fn second_fillet_on_extruded_rect_adjacent_top_edge_does_not_corrupt() {
         }
         let v0 = model.vertices.get(edge.start_vertex).expect("v0");
         let v1 = model.vertices.get(edge.end_vertex).expect("v1");
-        if (v0.position[2] - z_top).abs() < EPS
-            && (v1.position[2] - z_top).abs() < EPS
-        {
+        if (v0.position[2] - z_top).abs() < EPS && (v1.position[2] - z_top).abs() < EPS {
             initial_top.push((
                 eid,
                 0.5 * (v0.position[0] + v1.position[0]),
@@ -607,9 +591,7 @@ fn second_fillet_on_extruded_rect_adjacent_top_edge_does_not_corrupt() {
         }
         let v0 = model.vertices.get(edge.start_vertex).expect("v0");
         let v1 = model.vertices.get(edge.end_vertex).expect("v1");
-        if (v0.position[2] - z_top).abs() < EPS
-            && (v1.position[2] - z_top).abs() < EPS
-        {
+        if (v0.position[2] - z_top).abs() < EPS && (v1.position[2] - z_top).abs() < EPS {
             let mx = 0.5 * (v0.position[0] + v1.position[0]);
             let my = 0.5 * (v0.position[1] + v1.position[1]);
             if (mx - ax).hypot(my - ay) < 1.5 {
@@ -711,9 +693,7 @@ fn second_fillet_on_extruded_rect_top_edge_tessellation_manifold() {
             let Some(v1) = m.vertices.get(edge.end_vertex) else {
                 continue;
             };
-            if (v0.position[2] - z_top).abs() < EPS
-                && (v1.position[2] - z_top).abs() < EPS
-            {
+            if (v0.position[2] - z_top).abs() < EPS && (v1.position[2] - z_top).abs() < EPS {
                 found.push((
                     eid,
                     0.5 * (v0.position[0] + v1.position[0]),
@@ -745,11 +725,7 @@ fn second_fillet_on_extruded_rect_top_edge_tessellation_manifold() {
         .map(|(id, _, _)| *id)
         .expect("opposite top edge survives the first fillet");
     let _ = fillet_edges(&mut model, solid, vec![second], fillet_opts(1.0));
-    assert_mesh_manifold(
-        &model,
-        solid,
-        "after second fillet on extruded rect — mesh",
-    );
+    assert_mesh_manifold(&model, solid, "after second fillet on extruded rect — mesh");
 }
 
 // =====================================================================
@@ -837,9 +813,7 @@ fn second_fillet_on_extruded_rect_top_edge_tessellation_manifold_across_toleranc
             let Some(v1) = m.vertices.get(edge.end_vertex) else {
                 continue;
             };
-            if (v0.position[2] - z_top).abs() < EPS
-                && (v1.position[2] - z_top).abs() < EPS
-            {
+            if (v0.position[2] - z_top).abs() < EPS && (v1.position[2] - z_top).abs() < EPS {
                 found.push((
                     eid,
                     0.5 * (v0.position[0] + v1.position[0]),

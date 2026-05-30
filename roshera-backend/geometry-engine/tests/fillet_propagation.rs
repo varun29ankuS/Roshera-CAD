@@ -100,8 +100,13 @@ fn none_propagation_adds_exactly_one_face_per_requested_edge() {
     let edge = first_open_edge(&model);
     let face_count_before = model.faces.len();
 
-    fillet_edges(&mut model, solid, vec![edge], make_opts(0.4, PropagationMode::None))
-        .expect("fillet with None propagation must succeed on a box edge");
+    fillet_edges(
+        &mut model,
+        solid,
+        vec![edge],
+        make_opts(0.4, PropagationMode::None),
+    )
+    .expect("fillet with None propagation must succeed on a box edge");
 
     assert_eq!(
         model.faces.len(),

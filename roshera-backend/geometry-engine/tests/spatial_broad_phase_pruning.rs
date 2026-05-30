@@ -115,9 +115,14 @@ fn disjoint_unit_boxes_brute_force_path() {
     let b = make_box(&mut model, 1.0, 1.0, 1.0);
     translate(&mut model, b, Vector3::new(100.0, 0.0, 0.0));
 
-    let result =
-        boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default())
-            .expect("disjoint union must succeed");
+    let result = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("disjoint union must succeed");
 
     let v = volume(&mut model, result);
     assert!(
@@ -158,9 +163,14 @@ fn disjoint_cylinders_broad_phase_path() {
     let v_b = volume(&mut model, b);
     let expected = v_a + v_b;
 
-    let result =
-        boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default())
-            .expect("disjoint cylinder union must succeed");
+    let result = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("disjoint cylinder union must succeed");
 
     let v = volume(&mut model, result);
     assert!(
@@ -189,9 +199,14 @@ fn overlapping_boxes_union_correct_volume() {
     let b = make_box(&mut model, 1.0, 1.0, 1.0);
     translate(&mut model, b, Vector3::new(0.5, 0.0, 0.0));
 
-    let result =
-        boolean_operation(&mut model, a, b, BooleanOp::Union, BooleanOptions::default())
-            .expect("overlapping union must succeed");
+    let result = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("overlapping union must succeed");
 
     let v = volume(&mut model, result);
     assert!(

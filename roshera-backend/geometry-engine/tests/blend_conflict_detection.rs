@@ -104,12 +104,7 @@ fn chamfer_opts() -> ChamferOptions {
 /// `BlendFailure::ConflictingBlendKind` →
 /// `OperationError::InvalidInput { parameter = "blend", received =
 /// failure.to_string() }` (see `operations::diagnostics::From`).
-fn assert_conflict(
-    err: OperationError,
-    edge: EdgeId,
-    existing: BlendKind,
-    requested: BlendKind,
-) {
+fn assert_conflict(err: OperationError, edge: EdgeId, existing: BlendKind, requested: BlendKind) {
     match err {
         OperationError::InvalidInput {
             parameter,

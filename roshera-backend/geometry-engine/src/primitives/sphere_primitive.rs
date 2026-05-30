@@ -203,30 +203,32 @@ impl Primitive for SpherePrimitive {
         // the result is stable under any future change to the sphere
         // parameterisation. Slice 3 of the comprehensive
         // face-orientation fix.
-        let face_orientation = {
-            let surface = model.surfaces.get(surface_id).ok_or_else(|| {
-                PrimitiveError::GeometryError {
-                    operation: "Sphere surface lookup".to_string(),
-                    details: "sphere surface missing from store".to_string(),
-                }
-            })?;
-            let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
-            let u_mid = 0.5 * (u_min + u_max);
-            let v_mid = 0.5 * (v_min + v_max);
-            let mid_point = surface.point_at(u_mid, v_mid).map_err(|e| {
-                PrimitiveError::GeometryError {
-                    operation: "Sphere mid-point evaluation".to_string(),
-                    details: format!("{e:?}"),
-                }
-            })?;
-            let radial_target = mid_point - params.center;
-            orient_face_for_outward(surface, radial_target).map_err(|e| {
-                PrimitiveError::GeometryError {
-                    operation: "Sphere face orientation".to_string(),
-                    details: format!("{e:?}"),
-                }
-            })?
-        };
+        let face_orientation =
+            {
+                let surface = model.surfaces.get(surface_id).ok_or_else(|| {
+                    PrimitiveError::GeometryError {
+                        operation: "Sphere surface lookup".to_string(),
+                        details: "sphere surface missing from store".to_string(),
+                    }
+                })?;
+                let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+                let u_mid = 0.5 * (u_min + u_max);
+                let v_mid = 0.5 * (v_min + v_max);
+                let mid_point =
+                    surface
+                        .point_at(u_mid, v_mid)
+                        .map_err(|e| PrimitiveError::GeometryError {
+                            operation: "Sphere mid-point evaluation".to_string(),
+                            details: format!("{e:?}"),
+                        })?;
+                let radial_target = mid_point - params.center;
+                orient_face_for_outward(surface, radial_target).map_err(|e| {
+                    PrimitiveError::GeometryError {
+                        operation: "Sphere face orientation".to_string(),
+                        details: format!("{e:?}"),
+                    }
+                })?
+            };
         let face = crate::primitives::face::Face::new(0, surface_id, loop_id, face_orientation);
         let face_id = model.faces.add(face);
 

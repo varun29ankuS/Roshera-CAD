@@ -979,15 +979,10 @@ fn build_feature_tree(mut events: Vec<EventSummary>) -> Vec<FeatureNode> {
             .push(node.event.id.clone());
     }
 
-    let mut nodes_by_id: HashMap<String, FeatureNode> = flat
-        .into_iter()
-        .map(|n| (n.event.id.clone(), n))
-        .collect();
+    let mut nodes_by_id: HashMap<String, FeatureNode> =
+        flat.into_iter().map(|n| (n.event.id.clone(), n)).collect();
 
-    let root_ids = children_by_parent
-        .get(&None)
-        .cloned()
-        .unwrap_or_default();
+    let root_ids = children_by_parent.get(&None).cloned().unwrap_or_default();
 
     let mut roots: Vec<FeatureNode> = Vec::with_capacity(root_ids.len());
     for id in root_ids {

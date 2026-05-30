@@ -130,7 +130,10 @@ mod tests {
                      ENDSEC;\n\
                      END-ISO-10303-21;\n";
         let parsed = parse_step(input, "test").expect("minimal exchange should parse");
-        assert!(!parsed.data.is_empty(), "expected at least one DATA section");
+        assert!(
+            !parsed.data.is_empty(),
+            "expected at least one DATA section"
+        );
         let entities = &parsed.data[0].entities;
         assert_eq!(entities.len(), 1, "expected one entity");
     }

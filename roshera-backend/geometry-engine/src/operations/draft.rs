@@ -139,10 +139,7 @@ pub fn apply_draft(
     options: DraftOptions,
 ) -> OperationResult<Vec<FaceId>> {
     if options.common.validate_before {
-        lifecycle::validate_can_apply(
-            model,
-            OpSpec::Draft { face_ids: &faces },
-        )?;
+        lifecycle::validate_can_apply(model, OpSpec::Draft { face_ids: &faces })?;
     }
     lifecycle::with_rollback(model, move |model| {
         apply_draft_body(model, solid_id, faces, options)

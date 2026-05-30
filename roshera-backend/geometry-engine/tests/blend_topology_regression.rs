@@ -23,11 +23,9 @@
 use std::collections::HashMap;
 
 use geometry_engine::math::Tolerance;
-use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletPropagation};
-use geometry_engine::operations::{
-    chamfer_edges, fillet_edges, ChamferOptions, FilletOptions,
-};
 use geometry_engine::operations::chamfer::{ChamferType, PropagationMode as ChamferPropagation};
+use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletPropagation};
+use geometry_engine::operations::{chamfer_edges, fillet_edges, ChamferOptions, FilletOptions};
 use geometry_engine::primitives::curve::Arc;
 use geometry_engine::primitives::edge::{EdgeId, EdgeOrientation};
 use geometry_engine::primitives::face::FaceId;
@@ -229,8 +227,12 @@ fn assert_edges_geometrically_coherent(model: &BRepModel, context: &str) {
                  labelled low-param vertex {low_param_vertex} is at \
                  ({:.6}, {:.6}, {:.6}) — Δ = {:.3e}",
                 edge.param_range.start,
-                p_low.x, p_low.y, p_low.z,
-                v_low[0], v_low[1], v_low[2],
+                p_low.x,
+                p_low.y,
+                p_low.z,
+                v_low[0],
+                v_low[1],
+                v_low[2],
                 d_low,
             ));
         }
@@ -240,8 +242,12 @@ fn assert_edges_geometrically_coherent(model: &BRepModel, context: &str) {
                  labelled high-param vertex {high_param_vertex} is at \
                  ({:.6}, {:.6}, {:.6}) — Δ = {:.3e}",
                 edge.param_range.end,
-                p_high.x, p_high.y, p_high.z,
-                v_high[0], v_high[1], v_high[2],
+                p_high.x,
+                p_high.y,
+                p_high.z,
+                v_high[0],
+                v_high[1],
+                v_high[2],
                 d_high,
             ));
         }

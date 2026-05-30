@@ -24,9 +24,9 @@ use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, Boolean
 use geometry_engine::operations::{extrude_face, ExtrudeOptions, OperationError};
 use geometry_engine::primitives::{
     curve::Line,
-    edge::{Edge, EdgeOrientation, EdgeId},
+    edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceOrientation},
-    r#loop::{Loop, LoopType, LoopId},
+    r#loop::{Loop, LoopId, LoopType},
     surface::Plane,
     topology_builder::BRepModel,
     vertex::VertexId,
@@ -232,10 +232,9 @@ fn coincident_planes_disjoint_extrusions_union_succeeds() {
         ..Default::default()
     };
 
-    let solid_a = extrude_face(&mut model, face_a, extrude_opts.clone())
-        .expect("extrude rect A succeeds");
-    let solid_b =
-        extrude_face(&mut model, face_b, extrude_opts).expect("extrude rect B succeeds");
+    let solid_a =
+        extrude_face(&mut model, face_a, extrude_opts.clone()).expect("extrude rect A succeeds");
+    let solid_b = extrude_face(&mut model, face_b, extrude_opts).expect("extrude rect B succeeds");
 
     let result = boolean_operation(
         &mut model,

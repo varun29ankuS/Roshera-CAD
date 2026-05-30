@@ -102,15 +102,12 @@ fn cylindrical_kpart_fires_on_live_box_edge_fillet() {
         .get(face.surface_id)
         .expect("blend face's surface exists");
 
-    let cyl = surface
-        .as_any()
-        .downcast_ref::<CylindricalFillet>()
-        .expect(
-            "plane/plane constant-radius fillet must route through \
+    let cyl = surface.as_any().downcast_ref::<CylindricalFillet>().expect(
+        "plane/plane constant-radius fillet must route through \
              BlendSurfaceCarrier::Cylindrical → from_analytic_kpart \
              (an unexpected surface type here means the F4-α.2 \
              dispatcher silently fell back to the legacy or NURBS arm)",
-        );
+    );
 
     assert_eq!(
         cyl.axis_field.len(),

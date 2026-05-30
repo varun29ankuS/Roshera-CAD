@@ -17,13 +17,13 @@
 
 use crate::formats::ros_snapshot::BRepSnapshot;
 use crate::formats::timeline_chunk::{BranchManifest, HistChunk};
+use geometry_engine::primitives::topology_builder::BRepModel;
 use ros_format::keys::{KeyManager, SoftwareKeyManager};
 use ros_format::util::current_time_ms;
 use ros_format::{
     self, AICommandTracker, Chunk, ChunkType, PrivacySettings, ProvChunk, TrackingLevel,
     CHUNK_INDEX_ENTRY_SIZE,
 };
-use geometry_engine::primitives::topology_builder::BRepModel;
 use shared_types::*;
 use std::io::Cursor;
 use std::path::Path;
@@ -163,11 +163,11 @@ pub async fn export_brep_to_ros(
                     reason: "random_bytes(8) did not return 8 bytes".to_string(),
                 })?;
         let key_manager = SoftwareKeyManager::default();
-        let key_set = key_manager
-            .generate_key_set(password, &salt)
-            .map_err(|e| ExportError::ExportFailed {
+        let key_set = key_manager.generate_key_set(password, &salt).map_err(|e| {
+            ExportError::ExportFailed {
                 reason: format!("Key generation failed: {}", e),
-            })?;
+            }
+        })?;
         (Some(key_set), salt, file_iv)
     } else {
         (None, [0u8; 16], [0u8; 8])
@@ -209,9 +209,7 @@ pub async fn export_brep_to_ros(
         Some(data) => HistChunk::new(data.branches, data.events),
         None => HistChunk::empty(),
     };
-    let hist_bytes = hist_chunk
-        .serialize()
-        .map_err(ros_err)?;
+    let hist_bytes = hist_chunk.serialize().map_err(ros_err)?;
     chunks.push(encrypt_if_enabled(
         Chunk::new(ChunkType::HIST, hist_bytes),
         key_set.as_ref(),
@@ -224,9 +222,7 @@ pub async fn export_brep_to_ros(
         Some(tracker) => ProvChunk::from_tracker(tracker),
         None => ProvChunk::empty(options.tracking_level, PrivacySettings::default()),
     };
-    let prov_bytes = prov_chunk
-        .serialize()
-        .map_err(ros_err)?;
+    let prov_bytes = prov_chunk.serialize().map_err(ros_err)?;
     chunks.push(encrypt_if_enabled(
         Chunk::new(ChunkType::PROV, prov_bytes),
         key_set.as_ref(),
@@ -237,11 +233,10 @@ pub async fn export_brep_to_ros(
     // GEOM chunk (optional cache) -------------------------------------
     if options.include_snapshot {
         let snapshot = BRepSnapshot::from_model(payload.model);
-        let geom_bytes = rmp_serde::to_vec_named(&snapshot).map_err(|e| {
-            ExportError::ExportFailed {
+        let geom_bytes =
+            rmp_serde::to_vec_named(&snapshot).map_err(|e| ExportError::ExportFailed {
                 reason: format!("Failed to serialize geometry: {}", e),
-            }
-        })?;
+            })?;
         chunks.push(encrypt_if_enabled(
             Chunk::new(ChunkType::GEOM, geom_bytes),
             key_set.as_ref(),
@@ -310,7 +305,12 @@ fn encrypt_if_enabled(
             file_iv,
         );
         let encrypted = encryptor
-            .encrypt_chunk(&chunk.index.chunk_type, &chunk.data, chunk_index as u32, None)
+            .encrypt_chunk(
+                &chunk.index.chunk_type,
+                &chunk.data,
+                chunk_index as u32,
+                None,
+            )
             .map_err(|e| ExportError::ExportFailed {
                 reason: format!("Encryption failed: {}", e),
             })?;
@@ -501,10 +501,6 @@ fn read_chunk_payload<T: serde::de::DeserializeOwned>(
     }
 
     rmp_serde::from_slice(&data).map_err(|e| ExportError::ExportFailed {
-        reason: format!(
-            "Failed to deserialize {} chunk: {}",
-            chunk_type.as_str(),
-            e
-        ),
+        reason: format!("Failed to deserialize {} chunk: {}", chunk_type.as_str(), e),
     })
 }

@@ -268,7 +268,10 @@ async fn per_edge_radii_array_round_trips_to_kernel_constants() {
     let radii = parse_frontend_payload(&payload);
 
     assert_eq!(radii.profiles.len(), 1);
-    assert!(radii.uniform_constant, "single-element array of equal Constants is still uniform");
+    assert!(
+        radii.uniform_constant,
+        "single-element array of equal Constants is still uniform"
+    );
     match radii.to_fillet_type(0) {
         FilletType::Constant(r) => assert!((r - 1.25).abs() < 1e-12),
         other => panic!("expected Constant(1.25), got {other:?}"),

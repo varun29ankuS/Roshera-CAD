@@ -103,7 +103,9 @@ async fn run(steps: Vec<Step>) {
                 }
                 // Proptest filters out main above; non-main branches are
                 // unprotected and accept abandon without force.
-                let _ = h.timeline().abandon_branch(b, "proptest".to_string(), false);
+                let _ = h
+                    .timeline()
+                    .abandon_branch(b, "proptest".to_string(), false);
                 live.remove(i);
             }
             Step::Truncate {

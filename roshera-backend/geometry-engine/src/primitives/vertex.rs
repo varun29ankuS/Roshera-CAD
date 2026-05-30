@@ -535,9 +535,7 @@ impl VertexStore {
                     self.v_params[write_idx] = self.v_params[read_idx];
                     self.flags[write_idx] = self.flags[read_idx];
                     let src_tol = self.tolerances.get(read_idx).copied();
-                    if let (Some(src), Some(slot)) =
-                        (src_tol, self.tolerances.get_mut(write_idx))
-                    {
+                    if let (Some(src), Some(slot)) = (src_tol, self.tolerances.get_mut(write_idx)) {
                         *slot = src;
                     }
                 }
@@ -1005,7 +1003,10 @@ mod tests {
         let keep = s.add_or_find_with_dedup(0.0, 0.0, 0.0, 1e-3);
         let remove = s.add_or_find_with_dedup(1.0, 0.0, 0.0, 1e-3);
         assert!(s.merge_vertices(keep, remove));
-        assert!(s.get(remove).is_none(), "removed vertex must not be retrievable");
+        assert!(
+            s.get(remove).is_none(),
+            "removed vertex must not be retrievable"
+        );
         assert!(s.get(keep).is_some());
     }
 

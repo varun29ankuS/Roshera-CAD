@@ -527,14 +527,13 @@ impl Primitive for BoxPrimitive {
                     euler_characteristic: None,
                 }
             })?;
-            let orientation =
-                orient_face_for_outward(plane_ref, outward_normals[face_idx]).map_err(|e| {
-                    PrimitiveError::TopologyError {
-                        message: format!("Failed to orient box face: {e:?}"),
-                        euler_characteristic: None,
-                    }
+            let orientation = orient_face_for_outward(plane_ref, outward_normals[face_idx])
+                .map_err(|e| PrimitiveError::TopologyError {
+                    message: format!("Failed to orient box face: {e:?}"),
+                    euler_characteristic: None,
                 })?;
-            let face = crate::primitives::face::Face::new(0, surfaces[face_idx], loop_id, orientation);
+            let face =
+                crate::primitives::face::Face::new(0, surfaces[face_idx], loop_id, orientation);
             faces.push(model.faces.add(face));
         }
 
