@@ -38,7 +38,7 @@ use crate::primitives::surface::SurfaceType;
 use crate::primitives::topology_builder::BRepModel;
 use crate::readable::part::{
     format_datum_kind, format_datum_subkind, format_location_oneliner, DatumSummary,
-    DistanceReport, EdgeReport, FaceReport, ListPartsFilter, MassPropertiesReport,
+    DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter, MassPropertiesReport,
     MaterialSummary, OrientedBBox, PartProximity, PartReport, PartSummary, TopologyFingerprint,
 };
 
@@ -635,6 +635,47 @@ impl BRepModel {
             length,
             start: [start.x, start.y, start.z],
             end: [end.x, end.y, end.z],
+        })
+    }
+
+    /// Resolve a hovered face id into an agent-facing [`HoverReport`].
+    ///
+    /// This is the "what is the cursor pointing at" query — the kernel
+    /// side of the HOVER-α signal pipe. The viewport resolves a raycast
+    /// to a `FaceId` (via the tessellation mesh's per-triangle
+    /// `face_map`); this joins that face's [`FaceReport`] with its host
+    /// part's name and datum-anchored one-line location so an agent
+    /// learns *which part, anchored where* in a single call (per the
+    /// `readable/` "address by part + anchor datum" rule).
+    ///
+    /// Returns `None` only when the face id itself is unknown. When the
+    /// face exists but has no host solid (transient construction state),
+    /// the `face` is populated and the host fields are `None`.
+    pub fn query_hover(&mut self, face_id: u32) -> Option<HoverReport> {
+        let face = self.query_face(face_id)?;
+
+        // Join the host part's identity + datum-anchored summary. Both
+        // are best-effort: a face attached to a solid whose location
+        // descriptor can't be resolved still yields a useful `face`.
+        let (host_part_name, location_oneliner) = match face.host_solid {
+            Some(solid_id) => {
+                let name = self
+                    .solids
+                    .get(solid_id)
+                    .and_then(|s| s.name.clone())
+                    .unwrap_or_else(|| format!("solid_{solid_id}"));
+                let oneliner = self
+                    .solid_location_descriptor_cached(solid_id)
+                    .map(|loc| format_location_oneliner(&loc));
+                (Some(name), oneliner)
+            }
+            None => (None, None),
+        };
+
+        Some(HoverReport {
+            face,
+            host_part_name,
+            location_oneliner,
         })
     }
 
