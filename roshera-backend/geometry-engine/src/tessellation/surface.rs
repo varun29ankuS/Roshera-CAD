@@ -1046,9 +1046,27 @@ fn tessellate_conical_face(
             face, model, surface, cache, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
         );
     } else {
-        tessellate_conical_regular(
-            face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
-        );
+        // CDT-γ.2: a frustum lateral is u-periodic with NO seam edge (outer
+        // = bottom circle, inner = top circle, joined by u-periodicity), and
+        // the two circles have different radii → different cache sample
+        // counts, so a uniform grid cannot match both caps. Route through
+        // curved-CDT, whose periodic-wrap path synthesises a virtual seam
+        // and bridges the differing ring counts. Empty-mesh-on-Err contract.
+        if let Err(e) =
+            super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
+        {
+            tracing::warn!(
+                "curved_cdt failed for cone frustum face {:?}: {:?}; emitting empty mesh",
+                face.id,
+                e
+            );
+            // Fall back to the legacy grid so a curved-CDT regression
+            // degrades to the (non-watertight but non-empty) grid mesh
+            // rather than a hole.
+            tessellate_conical_regular(
+                face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
+            );
+        }
     }
 }
 

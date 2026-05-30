@@ -221,6 +221,31 @@ fn cone_solid_tessellation_is_watertight() {
     assert_watertight_closed_manifold(&mesh, "closed cone solid", 2);
 }
 
+// CDT-γ.2 (cone frustum). A truncated cone (both radii > 0) has a
+// u-periodic lateral with NO seam edge: outer loop = bottom circle, inner
+// loop = top circle, joined by u-periodicity. The two circles have
+// different radii → different cache sample counts, so a uniform grid
+// cannot match both caps. The curved-CDT periodic-wrap path synthesises a
+// virtual seam and bridges the differing ring counts.
+#[test]
+fn cone_frustum_solid_tessellation_is_watertight() {
+    let mut model = BRepModel::new();
+    let solid_id = {
+        let mut b = TopologyBuilder::new(&mut model);
+        match b
+            .create_cone_3d(Point3::ORIGIN, Vector3::Z, 1.0, 0.5, 2.0)
+            .expect("frustum must construct for valid dimensions")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("create_cone_3d must return a Solid, got {other:?}"),
+        }
+    };
+    let params = TessellationParams::default();
+    let solid = model.solids.get(solid_id).expect("solid present");
+    let mesh = tessellate_solid(solid, &model, &params);
+    assert_watertight_closed_manifold(&mesh, "closed cone frustum solid", 2);
+}
+
 // CDT-γ.3 baseline (torus). A torus is a single closed, doubly-periodic
 // face. Pins whether the grid path closes both the major and minor seams.
 #[test]
