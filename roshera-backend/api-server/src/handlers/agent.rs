@@ -42,8 +42,8 @@ use geometry_engine::math::Matrix4;
 use geometry_engine::primitives::datum::DatumId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::readable::{
-    DatumSummary, DistanceReport, EdgeReport, FaceReport, ListPartsFilter, MassPropertiesReport,
-    OrientedBBox, PartProximity, PartReport, PartSummary,
+    DatumSummary, DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter,
+    MassPropertiesReport, OrientedBBox, PartProximity, PartReport, PartSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -296,4 +296,21 @@ pub async fn query_edge(
 ) -> Result<Json<EdgeReport>, StatusCode> {
     let mut model = model_handle.write().await;
     model.query_edge(id).map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// `GET /api/agent/hover/{id}` — resolve a hovered face id into a
+/// [`HoverReport`]: the face's report joined with its host part's name and
+/// datum-anchored one-liner. The kernel side of the HOVER-α signal pipe —
+/// the viewport resolves a raycast to a `FaceId` via the mesh's
+/// per-triangle `face_map`, then this turns it into agent-addressable
+/// context (which part, anchored where) in one round-trip. Pure query: no
+/// model mutation, no timeline event. Cache-warming, so `&mut` like
+/// `query_face`. `404` on unknown id.
+pub async fn query_hover(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<HoverReport>, StatusCode> {
+    let mut model = model_handle.write().await;
+    model.query_hover(id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }

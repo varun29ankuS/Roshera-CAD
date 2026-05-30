@@ -5934,6 +5934,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/api/agent/faces/{id}", get(handlers::agent::query_face))
         .route("/api/agent/edges/{id}", get(handlers::agent::query_edge))
+        .route("/api/agent/hover/{id}", get(handlers::agent::query_hover))
         // Session endpoints
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
