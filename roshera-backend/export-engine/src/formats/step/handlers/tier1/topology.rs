@@ -1380,36 +1380,49 @@ mod tests {
         s += "#61=EDGE_CURVE('',#13,#17,#43,.T.);";
         s += "#62=EDGE_CURVE('',#14,#18,#43,.T.);";
         // Oriented edges for the six face loops.
-        // Bottom face (z=0, normal -Z): 11→12→13→14→11.
-        s += "#71=ORIENTED_EDGE('',*,*,#51,.T.);";
-        s += "#72=ORIENTED_EDGE('',*,*,#52,.T.);";
-        s += "#73=ORIENTED_EDGE('',*,*,#53,.F.);";
-        s += "#74=ORIENTED_EDGE('',*,*,#54,.F.);";
-        // Top face (z=1, normal +Z): 15→16→17→18→15.
-        s += "#75=ORIENTED_EDGE('',*,*,#55,.T.);";
-        s += "#76=ORIENTED_EDGE('',*,*,#56,.T.);";
-        s += "#77=ORIENTED_EDGE('',*,*,#57,.F.);";
-        s += "#78=ORIENTED_EDGE('',*,*,#58,.F.);";
-        // Front face (y=0): 11→12→16→15→11.
-        s += "#79=ORIENTED_EDGE('',*,*,#51,.T.);";
-        s += "#80=ORIENTED_EDGE('',*,*,#60,.T.);";
-        s += "#81=ORIENTED_EDGE('',*,*,#55,.F.);";
-        s += "#82=ORIENTED_EDGE('',*,*,#59,.F.);";
-        // Right face (x=1): 12→13→17→16→12.
-        s += "#83=ORIENTED_EDGE('',*,*,#52,.T.);";
-        s += "#84=ORIENTED_EDGE('',*,*,#61,.T.);";
-        s += "#85=ORIENTED_EDGE('',*,*,#56,.F.);";
-        s += "#86=ORIENTED_EDGE('',*,*,#60,.F.);";
-        // Back face (y=1): 14→13→17→18→14.
-        s += "#87=ORIENTED_EDGE('',*,*,#53,.T.);";
-        s += "#88=ORIENTED_EDGE('',*,*,#61,.T.);";
-        s += "#89=ORIENTED_EDGE('',*,*,#57,.F.);";
-        s += "#90=ORIENTED_EDGE('',*,*,#62,.F.);";
-        // Left face (x=0): 11→14→18→15→11.
-        s += "#91=ORIENTED_EDGE('',*,*,#54,.T.);";
-        s += "#92=ORIENTED_EDGE('',*,*,#62,.T.);";
-        s += "#93=ORIENTED_EDGE('',*,*,#58,.F.);";
-        s += "#94=ORIENTED_EDGE('',*,*,#59,.F.);";
+        //
+        // MANIFOLD WINDING INVARIANT: every EDGE_CURVE is shared by exactly
+        // two faces, and for a closed solid with consistent outward normals
+        // the two faces must traverse that shared edge in OPPOSITE
+        // directions (one .T., one .F.). The manifold checker
+        // (`validate_closed_shell`) tallies fwd/bwd uses per edge and flags
+        // any edge used twice the same way as `OrientationMismatch`. The
+        // cycles below are all CCW viewed from OUTSIDE the cube, which makes
+        // every shared edge once-forward / once-backward by construction.
+        // (A previous version of this fixture wound several faces
+        // inconsistently — 6 of 12 edges came out fwd-twice/bwd-twice — so
+        // the cube tripped 6 orientation mismatches.)
+        //
+        // Bottom face (z=0, outward normal -Z), CCW from below: 11→14→13→12.
+        s += "#71=ORIENTED_EDGE('',*,*,#54,.T.);"; // 11→14
+        s += "#72=ORIENTED_EDGE('',*,*,#53,.T.);"; // 14→13
+        s += "#73=ORIENTED_EDGE('',*,*,#52,.F.);"; // 13→12
+        s += "#74=ORIENTED_EDGE('',*,*,#51,.F.);"; // 12→11
+        // Top face (z=1, +Z), CCW from above: 15→16→17→18.
+        s += "#75=ORIENTED_EDGE('',*,*,#55,.T.);"; // 15→16
+        s += "#76=ORIENTED_EDGE('',*,*,#56,.T.);"; // 16→17
+        s += "#77=ORIENTED_EDGE('',*,*,#57,.F.);"; // 17→18
+        s += "#78=ORIENTED_EDGE('',*,*,#58,.F.);"; // 18→15
+        // Front face (y=0, -Y), CCW from front: 11→12→16→15.
+        s += "#79=ORIENTED_EDGE('',*,*,#51,.T.);"; // 11→12
+        s += "#80=ORIENTED_EDGE('',*,*,#60,.T.);"; // 12→16
+        s += "#81=ORIENTED_EDGE('',*,*,#55,.F.);"; // 16→15
+        s += "#82=ORIENTED_EDGE('',*,*,#59,.F.);"; // 15→11
+        // Right face (x=1, +X), CCW from the right: 12→13→17→16.
+        s += "#83=ORIENTED_EDGE('',*,*,#52,.T.);"; // 12→13
+        s += "#84=ORIENTED_EDGE('',*,*,#61,.T.);"; // 13→17
+        s += "#85=ORIENTED_EDGE('',*,*,#56,.F.);"; // 17→16
+        s += "#86=ORIENTED_EDGE('',*,*,#60,.F.);"; // 16→12
+        // Back face (y=1, +Y), CCW from behind: 13→14→18→17.
+        s += "#87=ORIENTED_EDGE('',*,*,#53,.F.);"; // 13→14
+        s += "#88=ORIENTED_EDGE('',*,*,#62,.T.);"; // 14→18
+        s += "#89=ORIENTED_EDGE('',*,*,#57,.T.);"; // 18→17
+        s += "#90=ORIENTED_EDGE('',*,*,#61,.F.);"; // 17→13
+        // Left face (x=0, -X), CCW from the left: 14→11→15→18.
+        s += "#91=ORIENTED_EDGE('',*,*,#54,.F.);"; // 14→11
+        s += "#92=ORIENTED_EDGE('',*,*,#59,.T.);"; // 11→15
+        s += "#93=ORIENTED_EDGE('',*,*,#58,.T.);"; // 15→18
+        s += "#94=ORIENTED_EDGE('',*,*,#62,.F.);"; // 18→14
         // Loops.
         s += "#101=EDGE_LOOP('',(#71,#72,#73,#74));";
         s += "#102=EDGE_LOOP('',(#75,#76,#77,#78));";
