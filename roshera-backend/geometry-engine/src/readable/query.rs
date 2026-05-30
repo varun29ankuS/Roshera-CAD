@@ -1491,6 +1491,37 @@ mod tests {
     }
 
     #[test]
+    fn query_hover_joins_face_with_host_part_location() {
+        let (mut model, solid_id) = fresh_model_with_box();
+        let face_id = model.faces.iter().next().expect("at least one face").0;
+        let report = model.query_hover(face_id).expect("hover report");
+        // The embedded face report matches a direct query_face.
+        assert_eq!(report.face.id, face_id);
+        assert_eq!(report.face.surface_type, "plane");
+        assert_eq!(report.face.host_solid, Some(solid_id));
+        // The hover join surfaces the host part identity + a datum-anchored
+        // one-liner so an agent learns *which part, anchored where* in one
+        // call — the readable/ "address by part + anchor datum" rule.
+        assert!(report.host_part_name.is_some(), "host part name resolved");
+        let oneliner = report
+            .location_oneliner
+            .expect("host part location one-liner");
+        assert!(
+            !oneliner.is_empty(),
+            "one-liner must be non-empty, got {oneliner:?}"
+        );
+    }
+
+    #[test]
+    fn query_hover_unknown_face_returns_none() {
+        let mut model = BRepModel::new();
+        assert!(
+            model.query_hover(9999).is_none(),
+            "an unknown face id must yield None"
+        );
+    }
+
+    #[test]
     fn query_edge_returns_line_for_box_edge() {
         let (mut model, _) = fresh_model_with_box();
         let edge_id = model.edges.iter().next().expect("edge").0;
