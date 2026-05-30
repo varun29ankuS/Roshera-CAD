@@ -1006,7 +1006,7 @@ fn tessellate_conical_face(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
-    _cache: &EdgeSampleCache,
+    cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) {
     let surface = match model.surfaces.get(face.surface_id) {
@@ -1043,7 +1043,7 @@ fn tessellate_conical_face(
 
     if includes_apex {
         tessellate_conical_with_apex(
-            face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
+            face, model, surface, cache, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
         );
     } else {
         tessellate_conical_regular(
@@ -1057,6 +1057,7 @@ fn tessellate_conical_with_apex(
     face: &Face,
     model: &BRepModel,
     surface: &dyn Surface,
+    cache: &EdgeSampleCache,
     u_min: f64,
     u_max: f64,
     v_min: f64,
@@ -1127,26 +1128,84 @@ fn tessellate_conical_with_apex(
     // rectangle is, by construction, inside the face. Trimmed cones
     // (e.g. boolean output) carry seam edges that fix the loop
     // projection, and can re-introduce a trim test in a later pass.
+    // Base-circle row uses the EdgeSampleCache for the lateral's single
+    // boundary edge (the wide-end circle) so the lateral and the base cap
+    // — which samples the same edge via the cache (`sample_loop_3d_polygon`)
+    // — share that seam bit-exactly. Without it the lateral picks its own
+    // `u`-resolution (`arc_steps_for_quality`) and the circle T-junctions
+    // against the cap: the cone analogue of the pre-fix cylinder. An apex
+    // cone's lateral loop is a single degenerate-domain edge (the apex is a
+    // point, not an edge), so curved-CDT is N/A and the grid is made
+    // cache-coherent instead. (CDT-γ.3)
+    let base_circle: Option<Vec<Point3>> = model
+        .loops
+        .get(face.outer_loop)
+        .and_then(|lp| lp.edges.first().copied())
+        .map(|eid| (*cache.get_or_compute(eid, model)).clone())
+        .filter(|s| s.len() >= 2);
+
+    // Anchor each column to the cone-`u` of its cached base point so the
+    // ring sits directly above that point (columns stay vertical — no
+    // twist) and the grid width matches the cache (so the quad strips and
+    // the u-seam line up). `point_at`/`normal_at` are periodic in `u`, so
+    // the branch `closest_point` returns is immaterial — only the position
+    // it maps to matters.
+    let base_us: Option<Vec<f64>> = base_circle.as_ref().map(|s| {
+        s.iter()
+            .map(|p| {
+                surface
+                    .closest_point(p, Tolerance::default())
+                    .map(|(u, _)| u)
+                    .unwrap_or(u_min)
+            })
+            .collect()
+    });
+    let u_steps = match &base_circle {
+        Some(s) => s.len() - 1,
+        None => u_steps,
+    };
+
     let v_start = if v_min.abs() < 1e-6 { 1 } else { 0 };
     for v_idx in v_start..=v_steps {
         let v = v_min + (v_idx as f64) * (v_max - v_min) / (v_steps as f64);
+        let is_base = v_idx == v_steps;
         let mut row = Vec::new();
 
         for u_idx in 0..=u_steps {
-            let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
+            // Column `u`: the cached base point's cone-`u` when available
+            // (keeps the column vertical), else an even sweep.
+            let u = match &base_us {
+                Some(us) => us.get(u_idx).copied().unwrap_or(u_min),
+                None => u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64),
+            };
 
-            if let (Ok(point), Ok(normal)) = (
-                surface.point_at(u, v),
-                face.normal_at(u, v, &model.surfaces),
-            ) {
-                let index = mesh.add_vertex(MeshVertex {
-                    position: point,
-                    normal,
-                    uv: Some((u, v)),
-                });
-                row.push(Some(index));
+            // The base row takes its 3D verbatim from the cache (bit-exact
+            // with the cap); interior rows lift through the surface.
+            let cached = if is_base {
+                base_circle.as_ref().and_then(|s| s.get(u_idx).copied())
             } else {
-                row.push(None);
+                None
+            };
+            let vertex = match cached {
+                Some(p) => face.normal_at(u, v, &model.surfaces).ok().map(|n| (p, n)),
+                None => match (
+                    surface.point_at(u, v),
+                    face.normal_at(u, v, &model.surfaces),
+                ) {
+                    (Ok(p), Ok(n)) => Some((p, n)),
+                    _ => None,
+                },
+            };
+            match vertex {
+                Some((position, normal)) => {
+                    let index = mesh.add_vertex(MeshVertex {
+                        position,
+                        normal,
+                        uv: Some((u, v)),
+                    });
+                    row.push(Some(index));
+                }
+                None => row.push(None),
             }
         }
         vertex_grid.push(row);
