@@ -1017,8 +1017,12 @@ fn tessellate_conical_face(
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
-    // Detect if we include the apex (v = 0 for typical cone parameterization)
-    let includes_apex = v_min.abs() < 1e-6;
+    // Distinguish a true apex cone from a frustum by TOPOLOGY, not a v≈0
+    // test: the `Cone` surface's v-origin is the (possibly extrapolated)
+    // apex, so a frustum's `v_min` can also be ~0. An apex cone's lateral
+    // has a SINGLE base-circle loop (the apex is a point, not an edge); a
+    // frustum's lateral additionally carries an inner loop (the top circle).
+    let is_apex_cone = face.inner_loops.is_empty();
 
     // Radial subdivision uses the MAXIMUM cross-section radius (at the
     // wide end) because chord-height demands more steps as radius grows.
@@ -1041,32 +1045,21 @@ fn tessellate_conical_face(
     let cone_height = estimate_cone_height(surface, v_min, v_max);
     let v_steps = linear_steps_for_quality(cone_height, params).max(3);
 
-    if includes_apex {
+    if is_apex_cone {
         tessellate_conical_with_apex(
             face, model, surface, cache, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
         );
     } else {
-        // CDT-γ.2: a frustum lateral is u-periodic with NO seam edge (outer
-        // = bottom circle, inner = top circle, joined by u-periodicity), and
-        // the two circles have different radii → different cache sample
-        // counts, so a uniform grid cannot match both caps. Route through
-        // curved-CDT, whose periodic-wrap path synthesises a virtual seam
-        // and bridges the differing ring counts. Empty-mesh-on-Err contract.
-        if let Err(e) =
-            super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
-        {
-            tracing::warn!(
-                "curved_cdt failed for cone frustum face {:?}: {:?}; emitting empty mesh",
-                face.id,
-                e
-            );
-            // Fall back to the legacy grid so a curved-CDT regression
-            // degrades to the (non-watertight but non-empty) grid mesh
-            // rather than a hole.
-            tessellate_conical_regular(
-                face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
-            );
-        }
+        // A cone face carrying an inner loop (e.g. a boolean-trimmed cone)
+        // is tessellated by the generic grid. NOTE: `create_cone_3d` does
+        // NOT produce a true two-ring frustum B-Rep — `create_cone_topology`
+        // approximates a frustum as an apex cone, so the seamless two-ring
+        // periodic case does not arise from the primitive path. If a real
+        // two-ring periodic frustum lands later it should route through a
+        // curved-CDT periodic-wrap path (CDT-γ.2; design in memory).
+        tessellate_conical_regular(
+            face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
+        );
     }
 }
 
