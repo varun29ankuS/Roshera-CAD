@@ -1795,15 +1795,26 @@ fn polish_g1_newton(
                                             // `1e-6` G1 gate — forward differences (`O(h) ≈ 1e-7`) ran
                                             // into a floor at `~1.3e-6` rad on the 1C2F fixtures.
     const FD_H: f64 = 1.0e-5;
-    // LM damping must be small relative to the residual scale we
-    // are chasing. With `√λ = 1e-8` and target residual `1e-7`,
-    // the damping contributes at most `1e-8` of bias — comfortably
-    // below the target. The 12-row geometric block is rank ~9 (3
-    // rims × 3 free directions per row-1 set after partition-of-
-    // unity collinearity), so the 36-DoF Tikhonov rows in the
-    // *initial* linear LS already fixed the nullspace; the polish
-    // only needs LM as a fallback if the FD Jacobian rank-drops.
-    const LM_LAMBDA: f64 = 1.0e-16;
+    // LM damping must clear two thresholds at once:
+    //   (a) bias: `√λ` is the damping-row magnitude, so it bounds the
+    //       solution bias. It must stay below the `1e-6` G1 gate.
+    //   (b) regularisation floor: `solve_least_squares` forms the normal
+    //       equations `JᵀJ`, where the `√λ·I` rows contribute `λ` (NOT
+    //       `√λ`) to each diagonal. Gaussian elimination then grinds that
+    //       floor down further along near-rank-deficient directions, so the
+    //       *surviving* pivot in a nullspace column is `≪ λ`.
+    // The previous `λ = 1e-16` gave a `1e-16` JᵀJ floor that elimination
+    // drove to `~2e-25`/`5e-19` (instrumented on the 2C1F fixtures) —
+    // below the `λ/100` pivot gate → spurious `SingularMatrix`. The FD
+    // Jacobian on anisotropic mixed chamfer↔fillet corners is genuinely
+    // rank-deficient (the geometric block is rank ~9), so the damping is
+    // load-bearing here, not just a fallback.
+    //
+    // `λ = 1e-12` ⇒ `√λ = 1e-6` bias (at the gate, well below the O(10)
+    // geometry scale) and a `1e-12` JᵀJ floor that stays comfortably above
+    // the `λ/100 = 1e-14` pivot gate after elimination. Matches the order
+    // of the Step-4 coupled solve's `TIKHONOV_LAMBDA = 1e-10`.
+    const LM_LAMBDA: f64 = 1.0e-12;
     const MAX_BACKTRACK: usize = 4;
 
     // Residual layout: 3 rims × K_STATIONS stations × 3 cross-product
