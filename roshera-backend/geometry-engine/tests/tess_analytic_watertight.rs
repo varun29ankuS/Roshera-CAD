@@ -194,15 +194,15 @@ fn assert_watertight_closed_manifold(mesh: &TriangleMesh, label: &str, expected_
     );
 }
 
-// CDT-γ.3 target (cone with apex). A true cone (top_radius = 0) has an
-// apex degeneracy on the lateral plus a planar base cap. The grid path
-// leaves 135 non-2 edges — the lateral samples its base-circle boundary
-// independently of the cap (same class as the pre-fix cylinder), plus the
-// apex fan. `#[ignore]`d as the next tracked target; routing the lateral
-// through curved-CDT needs a `closest_point`-at-apex fix first (the apex
-// row collapses to a point, so UV-`u` there is ill-defined).
+// CDT-γ.3 (cone with apex). A true cone (top_radius = 0) has an apex
+// degeneracy on the lateral plus a planar base cap. The lateral's outer
+// loop is a single edge — the base circle (the apex is a point, not an
+// edge) — so its boundary does not enclose the UV domain and curved-CDT
+// is N/A. Instead the grid `tessellate_conical_with_apex` now drives its
+// base row from the base edge's `EdgeSampleCache` samples, bit-exact with
+// the base cap (which samples the same edge via the cache). Was 135 non-2
+// edges; now watertight.
 #[test]
-#[ignore = "CDT-γ.3: cone non-watertight (135 non-2 edges) pending apex-aware lateral migration"]
 fn cone_solid_tessellation_is_watertight() {
     let mut model = BRepModel::new();
     let solid_id = {
