@@ -1398,32 +1398,32 @@ mod tests {
         s += "#72=ORIENTED_EDGE('',*,*,#53,.T.);"; // 14→13
         s += "#73=ORIENTED_EDGE('',*,*,#52,.F.);"; // 13→12
         s += "#74=ORIENTED_EDGE('',*,*,#51,.F.);"; // 12→11
-        // Top face (z=1, +Z), CCW from above: 15→16→17→18.
+                                                   // Top face (z=1, +Z), CCW from above: 15→16→17→18.
         s += "#75=ORIENTED_EDGE('',*,*,#55,.T.);"; // 15→16
         s += "#76=ORIENTED_EDGE('',*,*,#56,.T.);"; // 16→17
         s += "#77=ORIENTED_EDGE('',*,*,#57,.F.);"; // 17→18
         s += "#78=ORIENTED_EDGE('',*,*,#58,.F.);"; // 18→15
-        // Front face (y=0, -Y), CCW from front: 11→12→16→15.
+                                                   // Front face (y=0, -Y), CCW from front: 11→12→16→15.
         s += "#79=ORIENTED_EDGE('',*,*,#51,.T.);"; // 11→12
         s += "#80=ORIENTED_EDGE('',*,*,#60,.T.);"; // 12→16
         s += "#81=ORIENTED_EDGE('',*,*,#55,.F.);"; // 16→15
         s += "#82=ORIENTED_EDGE('',*,*,#59,.F.);"; // 15→11
-        // Right face (x=1, +X), CCW from the right: 12→13→17→16.
+                                                   // Right face (x=1, +X), CCW from the right: 12→13→17→16.
         s += "#83=ORIENTED_EDGE('',*,*,#52,.T.);"; // 12→13
         s += "#84=ORIENTED_EDGE('',*,*,#61,.T.);"; // 13→17
         s += "#85=ORIENTED_EDGE('',*,*,#56,.F.);"; // 17→16
         s += "#86=ORIENTED_EDGE('',*,*,#60,.F.);"; // 16→12
-        // Back face (y=1, +Y), CCW from behind: 13→14→18→17.
+                                                   // Back face (y=1, +Y), CCW from behind: 13→14→18→17.
         s += "#87=ORIENTED_EDGE('',*,*,#53,.F.);"; // 13→14
         s += "#88=ORIENTED_EDGE('',*,*,#62,.T.);"; // 14→18
         s += "#89=ORIENTED_EDGE('',*,*,#57,.T.);"; // 18→17
         s += "#90=ORIENTED_EDGE('',*,*,#61,.F.);"; // 17→13
-        // Left face (x=0, -X), CCW from the left: 14→11→15→18.
+                                                   // Left face (x=0, -X), CCW from the left: 14→11→15→18.
         s += "#91=ORIENTED_EDGE('',*,*,#54,.F.);"; // 14→11
         s += "#92=ORIENTED_EDGE('',*,*,#59,.T.);"; // 11→15
         s += "#93=ORIENTED_EDGE('',*,*,#58,.T.);"; // 15→18
         s += "#94=ORIENTED_EDGE('',*,*,#62,.F.);"; // 18→14
-        // Loops.
+                                                   // Loops.
         s += "#101=EDGE_LOOP('',(#71,#72,#73,#74));";
         s += "#102=EDGE_LOOP('',(#75,#76,#77,#78));";
         s += "#103=EDGE_LOOP('',(#79,#80,#81,#82));";
