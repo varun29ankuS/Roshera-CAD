@@ -14,7 +14,12 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    
+    # Bound a hung or runaway test run to 30 min instead of GitHub's 6h
+    # default. The full workspace suite normally finishes in ~10-15 min;
+    # a single deadlocked test (e.g. the verify_api_key DashMap self-deadlock)
+    # otherwise burns the entire 6h job limit before being cancelled.
+    timeout-minutes: 30
+
     steps:
     - uses: actions/checkout@v4
     
@@ -66,7 +71,12 @@ jobs:
       working-directory: ./roshera-backend
 
     - name: Run tests
-      run: cargo test --workspace
+      # --no-fail-fast runs every test binary even if an earlier one fails, so
+      # a single CI run surfaces ALL failures at once instead of stopping at
+      # the first failing crate. libtest still prints a "has been running for
+      # over 60 seconds" line naming any stuck test; with the job timeout above
+      # that pinpoints a hang within ~60s and bounds the cost to 30 min.
+      run: cargo test --workspace --no-fail-fast
       working-directory: ./roshera-backend
 
     - name: Run kernel demo regression suite
@@ -93,6 +103,7 @@ jobs:
   frontend:
     name: Frontend Build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
     - uses: actions/checkout@v4
@@ -123,7 +134,8 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 20
+
     steps:
     - uses: actions/checkout@v4
     
@@ -147,7 +159,8 @@ jobs:
     name: Run Benchmarks
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    
+    timeout-minutes: 45
+
     steps:
     - uses: actions/checkout@v4
     
@@ -182,7 +195,8 @@ jobs:
     name: Performance Regression
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    
+    timeout-minutes: 45
+
     steps:
     - uses: actions/checkout@v4
       with:
@@ -240,7 +254,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test, frontend, security]
     if: github.ref == 'refs/heads/main'
-    
+    timeout-minutes: 45
+
     steps:
     - uses: actions/checkout@v4
     
