@@ -710,45 +710,64 @@ impl AuthManager {
         hasher.update(raw_key.as_bytes());
         let key_hash = format!("{:x}", hasher.finalize());
 
-        // Find matching key
-        for entry in self.api_keys.iter() {
-            let api_key = entry.value();
-
-            if api_key.key_hash == key_hash {
-                // Check if active
-                if !api_key.active {
-                    return Err(SessionError::AccessDenied);
+        // Resolve the matching key's id, then DROP the iterator before any
+        // further access to `api_keys`. DashMap locks per shard: the matched
+        // key lives in the very shard the iterator is holding, so a nested
+        // `get_mut` on it (to stamp `last_used`) blocks that shard against
+        // itself and hangs forever. Find-then-mutate with non-overlapping
+        // guards avoids the re-entrant deadlock.
+        let key_id = {
+            let mut found = None;
+            for entry in self.api_keys.iter() {
+                if entry.value().key_hash == key_hash {
+                    found = Some(entry.key().clone());
+                    break;
                 }
+            }
+            found.ok_or(SessionError::AccessDenied)?
+        };
 
-                // Check expiration
-                if let Some(expires_at) = api_key.expires_at {
-                    if expires_at < Utc::now() {
-                        return Err(SessionError::Expired {
-                            id: api_key.id.clone(),
-                        });
-                    }
-                }
+        // Read + clone under a short-lived guard, released at block end.
+        let mut api_key = {
+            let entry = self
+                .api_keys
+                .get(&key_id)
+                .ok_or(SessionError::AccessDenied)?;
+            entry.value().clone()
+        };
 
-                // AUDIT-H9: enforce the per-key configured rate limit
-                // *before* marking the key as used. If the window is
-                // exhausted, reject without recording last_used or
-                // bumping the request counter — otherwise a hammering
-                // caller could keep extending the window out from
-                // under itself. The check is keyed by the API key's
-                // UUID, so it scopes per credential, not per client IP.
-                self.enforce_api_key_rate_limit(api_key)?;
+        // Check if active
+        if !api_key.active {
+            return Err(SessionError::AccessDenied);
+        }
 
-                // Update last used
-                drop(api_key);
-                if let Some(mut key) = self.api_keys.get_mut(&entry.key().clone()) {
-                    key.last_used = Some(Utc::now());
-                }
-
-                return Ok(entry.value().clone());
+        // Check expiration
+        if let Some(expires_at) = api_key.expires_at {
+            if expires_at < Utc::now() {
+                return Err(SessionError::Expired {
+                    id: api_key.id.clone(),
+                });
             }
         }
 
-        Err(SessionError::AccessDenied)
+        // AUDIT-H9: enforce the per-key configured rate limit *before*
+        // marking the key as used. If the window is exhausted, reject
+        // without recording last_used or bumping the request counter —
+        // otherwise a hammering caller could keep extending the window out
+        // from under itself. The check is keyed by the API key's UUID, so
+        // it scopes per credential, not per client IP. (It touches the
+        // separate `rate_limits` map, never `api_keys`, so it is free of
+        // the deadlock noted above.)
+        self.enforce_api_key_rate_limit(&api_key)?;
+
+        // Update last used under its own guard (no iterator held).
+        let now = Utc::now();
+        if let Some(mut key) = self.api_keys.get_mut(&key_id) {
+            key.last_used = Some(now);
+        }
+        api_key.last_used = Some(now);
+
+        Ok(api_key)
     }
 
     /// Record login attempt
