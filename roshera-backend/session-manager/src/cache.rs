@@ -653,9 +653,11 @@ mod tests {
             Some("value3".to_string())
         );
 
-        // Test stats
+        // Test stats. Three successful gets (key1 before eviction, then
+        // key2 and key3) count as hits; the single post-eviction get of
+        // key1 is the only miss.
         let stats = cache.stats().await;
-        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.hits, 3);
         assert_eq!(stats.misses, 1);
     }
 
@@ -716,9 +718,10 @@ mod tests {
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().name, "Test Session");
 
-        // Test stats
+        // Test stats. The single get_session above is a successful
+        // lookup, so it counts as one session-cache hit and zero misses.
         let stats = manager.get_stats().await;
-        assert_eq!(stats.sessions.hits, 0);
+        assert_eq!(stats.sessions.hits, 1);
         assert_eq!(stats.sessions.misses, 0);
         assert_eq!(stats.sessions.entry_count, 1);
     }
