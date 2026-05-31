@@ -631,8 +631,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_primitive() {
+        use timeline_engine::{BranchId, SessionId};
+
         let timeline = Arc::new(RwLock::new(Timeline::new(Default::default())));
-        let processor = CommandProcessor::new(timeline);
+
+        // process_command records every command to the timeline, which
+        // rejects an unregistered session (record_operation →
+        // SessionNotFound). Seed this session's position on the main branch
+        // first — and use a real UUID, since process_command parses the
+        // session id as a uuid::Uuid — mirroring how the server initialises a
+        // session's timeline position at creation.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        timeline
+            .read()
+            .await
+            .update_session_position(SessionId::new(session_id.clone()), BranchId::main(), 0)
+            .expect("register session position on main branch");
+
+        let processor = CommandProcessor::new(Arc::clone(&timeline));
 
         let command = AICommand::CreatePrimitive {
             shape_type: PrimitiveType::Box,
@@ -642,7 +658,7 @@ mod tests {
         };
 
         let result = processor
-            .process_command("test-session", command, "user1")
+            .process_command(&session_id, command, "user1")
             .await;
         assert!(result.is_ok());
 
@@ -656,10 +672,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_boolean_operation() {
-        let timeline = Arc::new(RwLock::new(Timeline::new(Default::default())));
-        let processor = CommandProcessor::new(timeline);
+        use timeline_engine::{BranchId, SessionId};
 
-        // Create two objects first
+        let timeline = Arc::new(RwLock::new(Timeline::new(Default::default())));
+
+        // Register the session on the main branch so the timeline accepts the
+        // recorded operation (see test_create_primitive for the rationale).
+        let session_id = uuid::Uuid::new_v4().to_string();
+        timeline
+            .read()
+            .await
+            .update_session_position(SessionId::new(session_id.clone()), BranchId::main(), 0)
+            .expect("register session position on main branch");
+
+        let processor = CommandProcessor::new(Arc::clone(&timeline));
+
+        // Two synthetic object ids: boolean_operation accepts the command and
+        // records it regardless (it returns Ok with a fresh result object),
+        // so this exercises the command/record path, not geometry resolution.
         let obj1 = ObjectId::new_v4();
         let obj2 = ObjectId::new_v4();
 
@@ -670,7 +700,7 @@ mod tests {
         };
 
         let result = processor
-            .process_command("test-session", command, "user1")
+            .process_command(&session_id, command, "user1")
             .await;
         assert!(result.is_ok());
     }
