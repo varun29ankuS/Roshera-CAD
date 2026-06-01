@@ -160,13 +160,13 @@ fn rotation_preserves_sphere_volume() {
     }
 }
 
-// Repro for a suspected mass-property bug: a rigid (det = 1) transform of a
-// cylinder must preserve volume, but after rotating the cylinder off the Z
-// axis the reported volume collapses to exactly 1/3 of the original (the cone
-// value), implying an axis-aligned assumption in the tessellation or mass
-// integration for cylinders. Un-ignore once rotated-cylinder mass properties
-// are correct.
-#[ignore = "rigid transform of a cylinder reports 1/3 volume after rotation off-axis; suspected axis-aligned assumption in cylinder mass-props"]
+// Regression guard for the rotated-cylinder volume bug: a rigid (det = 1)
+// transform must preserve volume, but rotating a cylinder off the Z axis used
+// to collapse the reported volume to exactly 1/3 (the cone value). Root cause:
+// the transform desyncs the lateral seam from the cap circles' t=0, so
+// curved-CDT fails with CdtFailed(PointOnFixedEdge) and the old empty-mesh
+// fallback dropped the entire lateral wall. Fixed by falling back to an
+// un-trimmed analytic grid (tessellation/surface.rs).
 #[test]
 fn rigid_preserves_cylinder_volume() {
     for &(ang, tx) in &[(0.4, 5.0), (1.7, -3.0), (2.9, 10.0)] {
