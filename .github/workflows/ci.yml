@@ -14,11 +14,13 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    # Bound a hung or runaway test run to 30 min instead of GitHub's 6h
-    # default. The full workspace suite normally finishes in ~10-15 min;
-    # a single deadlocked test (e.g. the verify_api_key DashMap self-deadlock)
-    # otherwise burns the entire 6h job limit before being cancelled.
-    timeout-minutes: 30
+    # Bound a hung or runaway test run instead of GitHub's 6h default. A single
+    # deadlocked test (e.g. the verify_api_key DashMap self-deadlock) would
+    # otherwise burn the entire 6h job limit before being cancelled. 40 min
+    # leaves headroom for the one-time recompile when the optimized test
+    # profile (Cargo.toml [profile.test]/[profile.dev.package."*"]) is cold;
+    # warm runs finish far faster thanks to nextest + the optimized math.
+    timeout-minutes: 40
 
     steps:
     - uses: actions/checkout@v4
@@ -40,8 +42,14 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    
+        # The `-opt2` marker is bumped whenever the test/dev opt-level profile
+        # changes. Without it an exact Cargo.lock hit restores the old (opt-0)
+        # target and Cargo recompiles at the new opt-level every run WITHOUT
+        # ever saving it (actions/cache skips the save on an exact hit). Bumping
+        # the key forces a one-time clean miss that builds and caches the
+        # optimized artifacts; subsequent runs hit them.
+        key: ${{ runner.os }}-cargo-opt2-${{ hashFiles('**/Cargo.lock') }}
+
     - name: Enforce API-only AI provider policy (no local models)
       # CLAUDE.md mandates hosted-API providers only. This guard fails the
       # build if Ollama / LLaMA / Whisper / Candle identifiers are
@@ -70,13 +78,21 @@ jobs:
       run: cargo clippy --all-targets --workspace 2>&1 | tee /dev/stderr | (! grep -q 'error\[E')
       working-directory: ./roshera-backend
 
-    - name: Run tests
-      # --no-fail-fast runs every test binary even if an earlier one fails, so
-      # a single CI run surfaces ALL failures at once instead of stopping at
-      # the first failing crate. libtest still prints a "has been running for
-      # over 60 seconds" line naming any stuck test; with the job timeout above
-      # that pinpoints a hang within ~60s and bounds the cost to 30 min.
-      run: cargo test --workspace --no-fail-fast
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+
+    - name: Run tests (nextest)
+      # nextest runs each test in its own process under a work-stealing
+      # scheduler — substantially faster than libtest on a suite this size and
+      # it prints a clean per-test failure summary. --no-fail-fast surfaces
+      # every failing crate in one run; a slow/hung test is reported and the
+      # 40 min job timeout bounds the cost. nextest does NOT execute doctests,
+      # so they run separately afterwards.
+      run: |
+        cargo nextest run --workspace --no-fail-fast
+        cargo test --workspace --doc
       working-directory: ./roshera-backend
 
     - name: Run kernel demo regression suite
