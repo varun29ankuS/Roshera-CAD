@@ -24,17 +24,29 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    
+
+    - name: Free disk space
+      # The optimized test/dev profile produces larger artifacts; on a cold
+      # (cache-miss) build the workspace + all deps + every nextest binary
+      # overran the runner's ~14 GB root disk ("No space left on device").
+      # Remove the preinstalled toolchains we don't use (~25-30 GB) up front.
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+          /usr/local/lib/node_modules 2>/dev/null || true
+        sudo docker image prune -af 2>/dev/null || true
+        df -h /
+
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y pkg-config
-    
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
-    
+
     - name: Cache cargo dependencies
       uses: actions/cache@v3
       with:
