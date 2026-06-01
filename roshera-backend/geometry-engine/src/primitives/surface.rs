@@ -942,20 +942,28 @@ impl Plane {
             normal.normalize()?
         };
 
-        // Use fast u_dir selection - avoid normalize() calls
-        let u_dir = if normalized_normal.x.abs() < 0.9 {
-            Vector3::X // Already normalized
+        // Build an ORTHONORMAL in-plane frame. A world seed axis is only
+        // guaranteed non-parallel to the normal — it is NOT in general
+        // perpendicular to it — so it cannot be used directly as `u_dir`:
+        // a tilted normal would leave `u_dir` with a component along the
+        // normal, and `point_at(u, v) = origin + u·u_dir + v·v_dir` would
+        // then drift OFF the plane in the u direction. Project the seed into
+        // the plane via two cross products so both basis vectors are unit and
+        // perpendicular to the normal (and to each other).
+        let seed = if normalized_normal.x.abs() < 0.9 {
+            Vector3::X
         } else {
-            Vector3::Y // Already normalized
+            Vector3::Y
         };
+        let u_dir = normalized_normal.cross(&seed).normalize()?; // ⟂ normal, unit
+        let v_dir = normalized_normal.cross(&u_dir); // ⟂ normal and ⟂ u_dir, unit
 
-        // Fast plane creation - avoid expensive Self::new() validation
         Ok(Self {
             origin: point,
             normal: normalized_normal,
             u_dir,
-            v_dir: normalized_normal.cross(&u_dir), // Cross product is fast
-            bounds: None,                           // No bounds by default
+            v_dir,
+            bounds: None, // No bounds by default
         })
     }
 
