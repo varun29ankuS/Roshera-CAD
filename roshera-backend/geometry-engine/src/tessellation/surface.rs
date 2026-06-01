@@ -131,10 +131,59 @@ pub fn tessellate_face(
             if let Err(e) =
                 super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
             {
+                // curved-CDT can fail on a transformed (e.g. rotated) cylinder:
+                // once the lateral seam no longer coincides with the cap
+                // circles' t=0, a projected boundary sample can land exactly on
+                // a constraint edge (`CdtFailed(PointOnFixedEdge)`). Emitting an
+                // empty mesh there silently drops the whole lateral wall,
+                // leaving a non-watertight caps-only shell whose divergence-
+                // theorem volume collapses to ~1/3 of the truth (cone value) —
+                // a silent mass-property/export corruption for any non-axis-
+                // aligned cylinder. Fall back to the analytic grid, exactly as
+                // the cone-frustum path does, so the lateral is present and
+                // mass properties stay correct (at the cost of possible seam
+                // T-junctions on export, far less harmful than a 3× volume
+                // error).
                 tracing::warn!(
-                    "curved_cdt failed for cylinder face {:?}: {:?}; emitting empty mesh",
+                    "curved_cdt failed for cylinder face {:?}: {:?}; falling back to grid",
                     face.id,
                     e
+                );
+                // Grid over the cylinder's INTRINSIC parameter domain (full
+                // angular sweep + its own height limits) rather than
+                // `get_face_parameter_bounds`: once the seam is desynced the
+                // face-edge-derived u-range collapses, which would grid an
+                // empty wall. `evaluate_full(u, v)` traces the correct lateral
+                // from the surface's stored (rotated) frame regardless of seam.
+                let cyl = surface
+                    .as_any()
+                    .downcast_ref::<crate::primitives::surface::Cylinder>();
+                let (radius, (u_min, u_max), (v_min, v_max)) = match cyl {
+                    Some(c) => {
+                        let (u0, u1) = c
+                            .angle_limits
+                            .map_or((0.0, std::f64::consts::TAU), |[a, b]| (a, b));
+                        // height_limits are the v-domain; fall back to the
+                        // face-derived v-range only if the surface is infinite.
+                        let (v0, v1) = c.height_limits.map_or_else(
+                            || {
+                                let (_, _, vlo, vhi) = get_face_parameter_bounds(face, model);
+                                (vlo, vhi)
+                            },
+                            |[a, b]| (a, b),
+                        );
+                        (c.radius, (u0, u1), (v0, v1))
+                    }
+                    None => {
+                        let (u0, u1, v0, v1) = get_face_parameter_bounds(face, model);
+                        (1.0, (u0, u1), (v0, v1))
+                    }
+                };
+                let u_steps =
+                    arc_steps_for_quality(u_max - u_min, radius, params).max(params.min_segments);
+                let v_steps = linear_steps_for_quality((v_max - v_min).abs(), params).max(3);
+                tessellate_surface_grid_untrimmed(
+                    face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
                 );
             }
         }
@@ -1469,6 +1518,73 @@ fn tessellate_surface_grid(
     }
 
     // Generate triangles
+    for v_idx in 0..v_steps {
+        for u_idx in 0..u_steps {
+            if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (
+                vertex_grid[v_idx].get(u_idx).and_then(|&v| v),
+                vertex_grid[v_idx].get(u_idx + 1).and_then(|&v| v),
+                vertex_grid[v_idx + 1].get(u_idx).and_then(|&v| v),
+                vertex_grid[v_idx + 1].get(u_idx + 1).and_then(|&v| v),
+            ) {
+                if face.orientation == crate::primitives::face::FaceOrientation::Forward {
+                    mesh.add_triangle(v0, v1, v2);
+                    mesh.add_triangle(v1, v3, v2);
+                } else {
+                    mesh.add_triangle(v0, v2, v1);
+                    mesh.add_triangle(v1, v2, v3);
+                }
+            }
+        }
+    }
+}
+
+/// Grid-tessellate a full surface patch over `[u_min,u_max]×[v_min,v_max]`
+/// WITHOUT the per-vertex `is_point_inside_face` trim.
+///
+/// This is the cylinder-lateral fallback when curved-CDT fails on a
+/// transformed (e.g. rotated) cylinder. A closed cylinder's lateral face
+/// covers its entire parameter rectangle with no interior holes, so the UV
+/// point-in-face trim used by [`tessellate_surface_grid`] is unnecessary —
+/// and actively harmful here: once a transform desyncs the seam from the cap
+/// circles' `t=0`, the trim's UV classification rejects the whole wall,
+/// dropping the lateral and leaving a caps-only shell whose volume collapses
+/// to ~1/3 of the truth. Winding, normals and `face_map` match
+/// [`tessellate_surface_grid`]; only the trim is removed.
+fn tessellate_surface_grid_untrimmed(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    u_min: f64,
+    u_max: f64,
+    v_min: f64,
+    v_max: f64,
+    u_steps: usize,
+    v_steps: usize,
+    mesh: &mut TriangleMesh,
+) {
+    let mut vertex_grid = Vec::new();
+    for v_idx in 0..=v_steps {
+        let v = v_min + (v_idx as f64) * (v_max - v_min) / (v_steps as f64);
+        let mut row = Vec::new();
+        for u_idx in 0..=u_steps {
+            let u = u_min + (u_idx as f64) * (u_max - u_min) / (u_steps as f64);
+            if let (Ok(point), Ok(normal)) = (
+                surface.point_at(u, v),
+                face.normal_at(u, v, &model.surfaces),
+            ) {
+                let index = mesh.add_vertex(MeshVertex {
+                    position: point,
+                    normal,
+                    uv: Some((u, v)),
+                });
+                row.push(Some(index));
+            } else {
+                row.push(None);
+            }
+        }
+        vertex_grid.push(row);
+    }
+
     for v_idx in 0..v_steps {
         for u_idx in 0..u_steps {
             if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (
