@@ -591,6 +591,19 @@ impl ParallelValidator {
             let f = face_count;
             let euler = v - e + f;
 
+            // A closed analytic surface can be modelled as one (or more) fully
+            // periodic faces carrying no bounding B-Rep edges — e.g. a sphere
+            // as a single seamless face (V=0, E=0, F=1). That is a valid solid
+            // but NOT a polyhedral 2-cell complex, so the combinatorial Euler
+            // formula V-E+F=2 does not apply (the lone sphere yields 1, which
+            // this check would otherwise reject — and which broke
+            // transform_solid on spheres). Polyhedral solids (box) and seamed
+            // analytic ones (cylinder V2/E3/F3, torus) all have edges and are
+            // validated normally below.
+            if e == 0 {
+                return;
+            }
+
             // For a simple closed solid, Euler characteristic should be 2
             // Allow for some tolerance due to genus (holes)
             if euler != 2 {

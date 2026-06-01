@@ -133,13 +133,11 @@ rigid_preserves_area_box!(rigid_area_pure_rot, 6.0, 4.0, 5.0, 2.2, 0.0, 0.0, 0.0
 // Rotation preserves volume on curved solids (5% tessellation ceiling).
 // =====================================================================
 
-// Repro for a kernel validation gap: `transform_solid` runs a post-transform
-// Euler-characteristic check that expects χ=2, but a sphere modelled as a
-// single periodic face has V(0)-E(0)+F(1)=1 and is rejected with InvalidBRep.
-// The volume invariant itself is sound; the transform validator is too strict
-// for single-face closed surfaces. Un-ignore once that check accounts for
-// periodic/seam topology.
-#[ignore = "transform_solid rejects single-face sphere on Euler-characteristic check (expects 2, sphere is 1); kernel validation gap"]
+// Regression guard: `transform_solid`'s post-transform validation used to
+// reject a single-face sphere on the polyhedral Euler-characteristic check
+// (V(0)-E(0)+F(1)=1 vs expected 2). That formula doesn't apply to a seamless
+// periodic face with no bounding edges; the validator now skips the check when
+// E==0 (see validation.rs::validate_euler_characteristic_for_solid).
 #[test]
 fn rotation_preserves_sphere_volume() {
     for &ang in &[0.5, 1.5, 3.0] {
