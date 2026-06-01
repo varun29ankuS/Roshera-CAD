@@ -67,7 +67,12 @@ fn interpolates_simple_cubic() {
         p(7.0, 2.0, 0.0),
     ];
     assert_interpolates(&pts, 3, ParameterizationType::ChordLength, "cubic chord");
-    assert_interpolates(&pts, 3, ParameterizationType::Centripetal, "cubic centripetal");
+    assert_interpolates(
+        &pts,
+        3,
+        ParameterizationType::Centripetal,
+        "cubic centripetal",
+    );
     assert_interpolates(&pts, 3, ParameterizationType::Uniform, "cubic uniform");
 }
 
@@ -107,7 +112,8 @@ fn endpoints_are_first_and_last_point() {
         p(3.0, -2.0, 4.0),
         p(5.0, 1.0, 2.0),
     ];
-    let curve = interpolate_nurbs_curve(&pts, 3, ParameterizationType::ChordLength).expect("interp");
+    let curve =
+        interpolate_nurbs_curve(&pts, 3, ParameterizationType::ChordLength).expect("interp");
     assert!((curve.evaluate(0.0).point - pts[0]).magnitude() < 1e-9);
     assert!((curve.evaluate(1.0).point - pts[pts.len() - 1]).magnitude() < 1e-9);
 }

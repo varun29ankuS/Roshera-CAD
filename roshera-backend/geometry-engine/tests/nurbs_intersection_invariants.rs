@@ -114,7 +114,10 @@ fn intersection_is_order_independent() {
     let ba = b.intersect_curve(&a, tol);
     assert_eq!(ab.len(), ba.len(), "A∩B and B∩A disagree on count");
     assert_eq!(ab.len(), 1);
-    assert!((ab[0].point - ba[0].point).magnitude() < 1e-6, "points differ");
+    assert!(
+        (ab[0].point - ba[0].point).magnitude() < 1e-6,
+        "points differ"
+    );
     // The crossing is the origin.
     assert!((ab[0].point - p(0.0, 0.0, 0.0)).magnitude() < 1e-6);
 }
