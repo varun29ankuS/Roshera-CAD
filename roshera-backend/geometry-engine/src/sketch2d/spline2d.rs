@@ -500,41 +500,40 @@ impl NurbsCurve2d {
             end = start + 2.0 * std::f64::consts::PI;
         }
 
-        // For arcs <= 90 degrees, use single segment
-        // For larger arcs, split into multiple segments
+        // One rational-quadratic Bézier segment per ≤90° span. The standard
+        // exact construction (Piegl & Tiller §7.3): each segment's boundary
+        // control points lie on the circle with weight 1, and the per-segment
+        // middle control point is the intersection of the endpoint tangents —
+        // along the segment bisector at radius/cos(Δ/2) — with weight cos(Δ/2).
+        // This handles full circles and arbitrarily large sweeps, not just the
+        // single ≤90° segment the previous code supported.
         let segments = ((sweep / (std::f64::consts::PI / 2.0)).ceil() as usize).max(1);
         let segment_angle = sweep / segments as f64;
+        let w = (segment_angle / 2.0).cos();
 
-        // For single segment arc
-        if segments == 1 {
-            let cos_half = (segment_angle / 2.0).cos();
-            let _sin_half = (segment_angle / 2.0).sin();
-
-            // Three control points for arc
-            let p0 = Point2d::new(
-                center.x + radius * start.cos(),
-                center.y + radius * start.sin(),
-            );
-
-            let p2 = Point2d::new(center.x + radius * end.cos(), center.y + radius * end.sin());
-
-            let mid_angle = (start + end) / 2.0;
-            let p1 = Point2d::new(
-                center.x + radius * mid_angle.cos() / cos_half,
-                center.y + radius * mid_angle.sin() / cos_half,
-            );
-
-            let control_points = vec![p0, p1, p2];
-            let weights = vec![1.0, cos_half, 1.0];
-            let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-
-            return Self::new(2, control_points, weights, knots);
+        let mut control_points = Vec::with_capacity(2 * segments + 1);
+        let mut weights = Vec::with_capacity(2 * segments + 1);
+        for i in 0..=2 * segments {
+            let angle = start + (i as f64) * segment_angle / 2.0;
+            // Middle (odd-i) points push out to the tangent intersection; w is
+            // bounded below by cos(45°) > 0 since every segment spans ≤90°.
+            let r_i = if i % 2 == 0 { radius } else { radius / w };
+            control_points.push(Point2d::new(
+                center.x + r_i * angle.cos(),
+                center.y + r_i * angle.sin(),
+            ));
+            weights.push(if i % 2 == 0 { 1.0 } else { w });
         }
 
-        // Multiple segments - not implemented yet
-        Err(Sketch2dError::NumericalError {
-            description: "Multi-segment circular arcs not implemented".to_string(),
-        })
+        let mut knots = vec![0.0, 0.0, 0.0];
+        for k in 1..segments {
+            let v = k as f64 / segments as f64;
+            knots.push(v);
+            knots.push(v);
+        }
+        knots.extend([1.0, 1.0, 1.0]);
+
+        Self::new(2, control_points, weights, knots)
     }
 
     /// Evaluate the NURBS curve at parameter u
