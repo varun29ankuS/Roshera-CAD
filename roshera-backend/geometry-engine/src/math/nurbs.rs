@@ -2923,8 +2923,7 @@ pub fn interpolate_nurbs_curve(
     let ys = solve_axis(&|p| p.y)?;
     let zs = solve_axis(&|p| p.z)?;
 
-    let control_points: Vec<Point3> =
-        (0..num).map(|i| Point3::new(xs[i], ys[i], zs[i])).collect();
+    let control_points: Vec<Point3> = (0..num).map(|i| Point3::new(xs[i], ys[i], zs[i])).collect();
 
     NurbsCurve::new(control_points, weights, knots, degree)
 }

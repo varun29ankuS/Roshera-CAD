@@ -1376,7 +1376,11 @@ impl Curve for Arc {
             // 2·cos(Δ/2)/(1+cos(Δ/2)) at each segment midpoint (≈17 % for a
             // 90° segment). `w ≥ cos(π/4) > 0` because every segment spans at
             // most 90°, so the division is always safe.
-            let r_i = if i % 2 == 0 { self.radius } else { self.radius / w };
+            let r_i = if i % 2 == 0 {
+                self.radius
+            } else {
+                self.radius / w
+            };
             let local_pos = self.x_axis * (r_i * cos_a) + y_axis * (r_i * sin_a);
             control_points.push(self.center + local_pos);
 
@@ -2887,8 +2891,7 @@ impl NurbsCurve {
         fn param_bbox(curve: &dyn Curve, lo: f64, hi: f64, pad: f64) -> Option<BBox> {
             const SAMPLES: usize = 12;
             let mut min_pt = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-            let mut max_pt =
-                Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            let mut max_pt = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
             for i in 0..=SAMPLES {
                 let t = lo + (hi - lo) * (i as f64 / SAMPLES as f64);
                 if let Ok(cp) = curve.evaluate(t) {
@@ -4048,7 +4051,7 @@ impl Curve for Ellipse {
         // (the previous behaviour) is only a piecewise-parabola approximation
         // — the implicit residual reaches ~0.27 for a 4×2 ellipse.
         const W: f64 = std::f64::consts::FRAC_1_SQRT_2; // cos 45° = √2/2
-        // Unit-circle control net in (cos, sin) coordinates.
+                                                        // Unit-circle control net in (cos, sin) coordinates.
         let net: [(f64, f64); 9] = [
             (1.0, 0.0),
             (1.0, 1.0),

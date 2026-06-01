@@ -179,8 +179,15 @@ fn torus_mass_props_rigid_invariant() {
 #[test]
 fn principal_moments_invariant_under_rotation() {
     for (name, build) in [
-        ("box", &(|m: &mut BRepModel| build_box(m, 2.0, 3.0, 4.0)) as &dyn Fn(&mut BRepModel) -> SolidId),
-        ("cylinder", &(|m: &mut BRepModel| build_cylinder(m, 2.0, 6.0))),
+        (
+            "box",
+            &(|m: &mut BRepModel| build_box(m, 2.0, 3.0, 4.0))
+                as &dyn Fn(&mut BRepModel) -> SolidId,
+        ),
+        (
+            "cylinder",
+            &(|m: &mut BRepModel| build_cylinder(m, 2.0, 6.0)),
+        ),
         ("sphere", &(|m: &mut BRepModel| build_sphere(m, 2.5))),
     ] {
         let mut model = BRepModel::new();
@@ -245,7 +252,10 @@ fn rotated_box_union_is_watertight_and_bounded() {
             va.max(vb)
         );
         assert!(vu <= (va + vb) * 1.05, "union {vu} exceeds sum {}", va + vb);
-        assert!(wt, "rotated-box union mesh is not watertight (volume mismatch)");
+        assert!(
+            wt,
+            "rotated-box union mesh is not watertight (volume mismatch)"
+        );
     }
 }
 
@@ -311,14 +321,27 @@ fn transform_then_boolean_then_mass_props_is_finite_and_watertight() {
         * Matrix4::from_axis_angle(&Vector3::X, 0.3).expect("rot");
     transform_solid(&mut model, b, m, TransformOptions::default()).expect("transform cylinder");
 
-    if let Ok(result) = boolean_operation(&mut model, a, b, BooleanOp::Difference, BooleanOptions::default())
-    {
+    if let Ok(result) = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    ) {
         let mp = model
             .mass_properties_for(result)
             .expect("mass props of bored box");
-        assert!(mp.volume.is_finite() && mp.volume > 0.0, "bad volume {}", mp.volume);
+        assert!(
+            mp.volume.is_finite() && mp.volume > 0.0,
+            "bad volume {}",
+            mp.volume
+        );
         // Boring a hole removes material: result < solid box (27).
-        assert!(mp.volume < 27.0 * 1.01, "bored box {} not less than 27", mp.volume);
+        assert!(
+            mp.volume < 27.0 * 1.01,
+            "bored box {} not less than 27",
+            mp.volume
+        );
         assert!(
             mp.center_of_mass.iter().all(|c| c.is_finite()),
             "non-finite centroid"
