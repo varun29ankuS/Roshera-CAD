@@ -2264,9 +2264,14 @@ impl Curve for NurbsCurve {
     }
 
     fn intersect_curve(&self, other: &dyn Curve, tolerance: Tolerance) -> Vec<CurveIntersection> {
-        // Check for specific curve types first for optimized intersections
-        if let Some(other_nurbs) = other.as_any().downcast_ref::<NurbsCurve>() {
-            return self.intersect_nurbs_bezier_clipping(other_nurbs, tolerance);
+        // Check for specific curve types first for optimized intersections.
+        // NURBS×NURBS goes through the general recursive bounding-box
+        // subdivision intersector: the former Bézier-clipping path formed its
+        // squared-distance polynomial incorrectly (see the retired
+        // `to_polynomial`) and silently returned no intersections even for
+        // curves that obviously cross.
+        if other.as_any().downcast_ref::<NurbsCurve>().is_some() {
+            return self.intersect_curve_adaptive(other, tolerance);
         }
 
         if let Some(line) = other.as_any().downcast_ref::<Line>() {
@@ -2831,85 +2836,11 @@ impl NurbsCurve {
         intersections
     }
 
-    /// Adaptive curve intersection using subdivision
-    fn intersect_curve_adaptive(
-        &self,
-        other: &dyn Curve,
-        tolerance: Tolerance,
-    ) -> Vec<CurveIntersection> {
-        let mut intersections = Vec::new();
-        let mut curve_pairs = vec![((0.0, 1.0), (0.0, 1.0))];
-
-        const MAX_ITERATIONS: usize = 20;
-        const MIN_SEGMENT_SIZE: f64 = 1e-12;
-
-        for _ in 0..MAX_ITERATIONS {
-            let mut new_pairs = Vec::new();
-            let mut converged = true;
-
-            for ((t1_min, t1_max), (t2_min, t2_max)) in curve_pairs {
-                let size1 = t1_max - t1_min;
-                let size2 = t2_max - t2_min;
-
-                if size1 < MIN_SEGMENT_SIZE || size2 < MIN_SEGMENT_SIZE {
-                    // Check for intersection
-                    let t1 = (t1_min + t1_max) * 0.5;
-                    let t2 = (t2_min + t2_max) * 0.5;
-
-                    if let (Ok(p1), Ok(p2)) = (self.evaluate(t1), other.evaluate(t2)) {
-                        let distance = (p1.position - p2.position).magnitude();
-                        if distance < tolerance.distance() {
-                            intersections.push(CurveIntersection {
-                                t1,
-                                t2,
-                                point: (p1.position + p2.position) * 0.5,
-                                intersection_type: IntersectionType::Transverse,
-                            });
-                        }
-                    }
-                    continue;
-                }
-
-                // Check if bounding boxes intersect
-                let bbox1 = match self.compute_parameter_bbox(t1_min, t1_max) {
-                    Some(bbox) => bbox,
-                    None => continue,
-                };
-                let (bbox2_min, bbox2_max) = other.bounding_box();
-                let bbox2 = crate::math::BBox::new(bbox2_min, bbox2_max);
-
-                if bbox1.intersects(&bbox2) {
-                    // Subdivide both curves
-                    let t1_mid = (t1_min + t1_max) * 0.5;
-                    let t2_mid = (t2_min + t2_max) * 0.5;
-
-                    new_pairs.push(((t1_min, t1_mid), (t2_min, t2_mid)));
-                    new_pairs.push(((t1_min, t1_mid), (t2_mid, t2_max)));
-                    new_pairs.push(((t1_mid, t1_max), (t2_min, t2_mid)));
-                    new_pairs.push(((t1_mid, t1_max), (t2_mid, t2_max)));
-
-                    converged = false;
-                }
-            }
-
-            if converged || new_pairs.is_empty() {
-                break;
-            }
-
-            curve_pairs = new_pairs;
-        }
-
-        // Remove duplicates
-        self.deduplicate_intersections(&mut intersections, tolerance);
-        intersections
-    }
-
-    /// Compute bounding box for parameter interval
+    /// Sampled bounding box of `self` over a parameter interval.
     fn compute_parameter_bbox(&self, t_start: f64, t_end: f64) -> Option<BBox> {
         let samples = 20;
         let mut min_pt = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
         let mut max_pt = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-
         for i in 0..=samples {
             let t = t_start + (t_end - t_start) * (i as f64 / samples as f64);
             if let Ok(curve_point) = self.evaluate(t) {
@@ -2922,9 +2853,206 @@ impl NurbsCurve {
                 max_pt.z = max_pt.z.max(p.z);
             }
         }
-
         if min_pt.x.is_finite() && max_pt.x.is_finite() {
             Some(BBox::new(min_pt, max_pt))
+        } else {
+            None
+        }
+    }
+
+    /// General curve–curve intersection by recursive bounding-box
+    /// subdivision, refined by Gauss–Newton.
+    ///
+    /// A parameter-interval pair `(I1, I2)` is discarded as soon as the
+    /// sampled bounding boxes of `self` over `I1` and `other` over `I2` are
+    /// disjoint (each inflated by the distance tolerance so touching/near-
+    /// tangent crossings survive). Surviving pairs are subdivided — both
+    /// intervals, four children — until both are below a parameter threshold,
+    /// at which point the midpoint pair seeds a Gauss–Newton polish that
+    /// drives `C1(t1) − C2(t2)` to zero. Confirmed roots within tolerance are
+    /// recorded and de-duplicated.
+    ///
+    /// Unlike the previous implementation this tightens BOTH curves' boxes
+    /// (the old code compared each sub-interval of `self` against the WHOLE
+    /// bounding box of `other`) and reaches its acceptance test within the
+    /// iteration budget (the old `1e-12` threshold was unreachable in 20
+    /// halvings of `[0,1]`), so it actually finds intersections.
+    fn intersect_curve_adaptive(
+        &self,
+        other: &dyn Curve,
+        tolerance: Tolerance,
+    ) -> Vec<CurveIntersection> {
+        // Sampled bounding box of an arbitrary curve over [lo, hi], inflated by
+        // `pad` so the disjointness test is conservative.
+        fn param_bbox(curve: &dyn Curve, lo: f64, hi: f64, pad: f64) -> Option<BBox> {
+            const SAMPLES: usize = 12;
+            let mut min_pt = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut max_pt =
+                Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for i in 0..=SAMPLES {
+                let t = lo + (hi - lo) * (i as f64 / SAMPLES as f64);
+                if let Ok(cp) = curve.evaluate(t) {
+                    let p = cp.position;
+                    min_pt.x = min_pt.x.min(p.x);
+                    min_pt.y = min_pt.y.min(p.y);
+                    min_pt.z = min_pt.z.min(p.z);
+                    max_pt.x = max_pt.x.max(p.x);
+                    max_pt.y = max_pt.y.max(p.y);
+                    max_pt.z = max_pt.z.max(p.z);
+                }
+            }
+            if !min_pt.x.is_finite() || !max_pt.x.is_finite() {
+                return None;
+            }
+            let pad_v = Vector3::new(pad, pad, pad);
+            Some(BBox::new(min_pt - pad_v, max_pt + pad_v))
+        }
+
+        let dist_tol = tolerance.distance();
+        // Inflate boxes by a hair more than the accept tolerance so that a true
+        // tangential contact (whose boxes only just touch) is never pruned.
+        let pad = dist_tol.max(1e-9);
+        // Accept a cell once both curve pieces are smaller than this geometric
+        // size, then let Gauss–Newton drive to full accuracy. Tying the
+        // recursion floor to geometry (chord length) rather than parameter span
+        // bounds the cell count by the distance scale: a transverse crossing
+        // collapses to a thin (t1,t2) corridor that terminates in a handful of
+        // levels, instead of subdividing a long straight piece down to 1e-7.
+        let geo_eps = dist_tol.max(1e-4);
+        const PARAM_FLOOR: f64 = 1e-9; // guard against infinite recursion
+        const MAX_PAIRS: usize = 200_000;
+        const MAX_HITS: usize = 4096; // bail out on degenerate overlapping contact
+
+        // Cheap geometric size of a curve piece (two-chord polyline length).
+        let chord = |curve: &dyn Curve, lo: f64, hi: f64| -> f64 {
+            match (
+                curve.evaluate(lo),
+                curve.evaluate((lo + hi) * 0.5),
+                curve.evaluate(hi),
+            ) {
+                (Ok(a), Ok(m), Ok(b)) => {
+                    (m.position - a.position).magnitude() + (b.position - m.position).magnitude()
+                }
+                _ => f64::INFINITY,
+            }
+        };
+
+        let mut intersections: Vec<CurveIntersection> = Vec::new();
+        let mut stack: Vec<(f64, f64, f64, f64)> = vec![(0.0, 1.0, 0.0, 1.0)];
+        let mut processed = 0usize;
+
+        while let Some((a1, b1, a2, b2)) = stack.pop() {
+            processed += 1;
+            if processed > MAX_PAIRS || intersections.len() > MAX_HITS {
+                break;
+            }
+
+            let bbox1 = match param_bbox(self, a1, b1, pad) {
+                Some(b) => b,
+                None => continue,
+            };
+            let bbox2 = match param_bbox(other, a2, b2, pad) {
+                Some(b) => b,
+                None => continue,
+            };
+            if !bbox1.intersects(&bbox2) {
+                continue;
+            }
+
+            // A piece is "small" once its chord is below the geometric floor or
+            // its parameter span hits the recursion guard.
+            let small1 = chord(self, a1, b1) < geo_eps || (b1 - a1) < PARAM_FLOOR;
+            let small2 = chord(other, a2, b2) < geo_eps || (b2 - a2) < PARAM_FLOOR;
+            if small1 && small2 {
+                // Converged: polish the midpoint pair to full accuracy.
+                if let Some(hit) =
+                    self.refine_intersection(other, (a1 + b1) * 0.5, (a2 + b2) * 0.5, tolerance)
+                {
+                    intersections.push(hit);
+                }
+                continue;
+            }
+
+            // Subdivide the geometrically-large side(s). Splitting only the
+            // larger side keeps the surviving-pair count near-linear for
+            // transverse intersections instead of blowing up 4× per level.
+            let m1 = (a1 + b1) * 0.5;
+            let m2 = (a2 + b2) * 0.5;
+            let split1 = !small1;
+            let split2 = !small2;
+            match (split1, split2) {
+                (true, true) => {
+                    stack.push((a1, m1, a2, m2));
+                    stack.push((a1, m1, m2, b2));
+                    stack.push((m1, b1, a2, m2));
+                    stack.push((m1, b1, m2, b2));
+                }
+                (true, false) => {
+                    stack.push((a1, m1, a2, b2));
+                    stack.push((m1, b1, a2, b2));
+                }
+                (false, true) => {
+                    stack.push((a1, b1, a2, m2));
+                    stack.push((a1, b1, m2, b2));
+                }
+                (false, false) => unreachable!("handled by the converged branch above"),
+            }
+        }
+
+        self.deduplicate_intersections(&mut intersections, tolerance);
+        intersections
+    }
+
+    /// Gauss–Newton refinement of an intersection seed: minimise
+    /// `‖C1(t1) − C2(t2)‖` by solving the 2×2 normal equations of the 3×2
+    /// Jacobian `[C1′(t1), −C2′(t2)]` each step. Returns a confirmed
+    /// intersection only if the residual falls within the distance tolerance.
+    fn refine_intersection(
+        &self,
+        other: &dyn Curve,
+        mut t1: f64,
+        mut t2: f64,
+        tolerance: Tolerance,
+    ) -> Option<CurveIntersection> {
+        let dist_tol = tolerance.distance();
+        let mut p1 = self.evaluate(t1).ok()?;
+        let mut p2 = other.evaluate(t2).ok()?;
+
+        for _ in 0..16 {
+            let r = p1.position - p2.position;
+            if r.magnitude() <= dist_tol * 0.5 {
+                break;
+            }
+            let d1 = p1.derivative1;
+            let d2 = p2.derivative1;
+            // Normal equations J^T J Δ = -J^T r, J = [d1, -d2].
+            let a = d1.dot(&d1);
+            let b = -d1.dot(&d2);
+            let c = d2.dot(&d2);
+            let det = a * c - b * b;
+            if det.abs() < 1e-18 {
+                break; // parallel tangents — Gauss–Newton step undefined
+            }
+            let g1 = -d1.dot(&r);
+            let g2 = d2.dot(&r);
+            let delta1 = (c * g1 - b * g2) / det;
+            let delta2 = (a * g2 - b * g1) / det;
+            t1 = (t1 + delta1).clamp(0.0, 1.0);
+            t2 = (t2 + delta2).clamp(0.0, 1.0);
+            p1 = self.evaluate(t1).ok()?;
+            p2 = other.evaluate(t2).ok()?;
+            if delta1.abs() < 1e-12 && delta2.abs() < 1e-12 {
+                break;
+            }
+        }
+
+        if (p1.position - p2.position).magnitude() <= dist_tol {
+            Some(CurveIntersection {
+                t1,
+                t2,
+                point: (p1.position + p2.position) * 0.5,
+                intersection_type: self.classify_intersection_type(&p1, &p2, tolerance),
+            })
         } else {
             None
         }
