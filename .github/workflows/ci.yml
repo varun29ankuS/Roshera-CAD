@@ -14,6 +14,12 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
+    # Link every crate + the ~100 integration-test binaries with mold instead
+    # of GNU ld. Linking (each test binary statically links the large
+    # geometry-engine rlib) was the dominant cost of the cold build; mold is
+    # 5-10x faster, which is what brings a cold build back inside the timeout.
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     # Bound a hung or runaway test run instead of GitHub's 6h default. A single
     # deadlocked test (e.g. the verify_api_key DashMap self-deadlock) would
     # otherwise burn the entire 6h job limit before being cancelled.
@@ -45,7 +51,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y pkg-config
+        sudo apt-get install -y pkg-config mold
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
