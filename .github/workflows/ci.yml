@@ -16,11 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     # Bound a hung or runaway test run instead of GitHub's 6h default. A single
     # deadlocked test (e.g. the verify_api_key DashMap self-deadlock) would
-    # otherwise burn the entire 6h job limit before being cancelled. 40 min
-    # leaves headroom for the one-time recompile when the optimized test
-    # profile (Cargo.toml [profile.test]/[profile.dev.package."*"]) is cold;
-    # warm runs finish far faster thanks to nextest + the optimized math.
-    timeout-minutes: 40
+    # otherwise burn the entire 6h job limit before being cancelled. The suite
+    # runs ~10 min at opt-level 0; 30 min leaves comfortable headroom for a cold
+    # (cache-miss) build plus the nextest run.
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v4
@@ -54,13 +53,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        # The `-opt2` marker is bumped whenever the test/dev opt-level profile
-        # changes. Without it an exact Cargo.lock hit restores the old (opt-0)
-        # target and Cargo recompiles at the new opt-level every run WITHOUT
-        # ever saving it (actions/cache skips the save on an exact hit). Bumping
-        # the key forces a one-time clean miss that builds and caches the
-        # optimized artifacts; subsequent runs hit them.
-        key: ${{ runner.os }}-cargo-opt2-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Enforce API-only AI provider policy (no local models)
       # CLAUDE.md mandates hosted-API providers only. This guard fails the

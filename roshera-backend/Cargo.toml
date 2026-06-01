@@ -41,29 +41,17 @@ opt-level = 3
 [profile.bench]
 debug = true
 
-# Test/dev runtime is dominated by floating-point geometry math — NURBS
-# evaluation, tessellation, mass-property integration, proptest fuzzing. At the
-# default `opt-level = 0` that math runs unoptimized, so the suite is slow.
-#
-# Profile selection under `cargo test`: test/bench TARGETS use `[profile.test]`,
-# every other target (the workspace libs an integration test links against)
-# uses `[profile.dev]`, and third-party crates use the `package."*"` override.
-# So the geometry math an integration test exercises lives in the *lib*, built
-# with `[profile.dev]` — hence dev needs the opt-level too, not just test.
-#
-# `opt-level = 1` keeps dev/local builds (incl. `cargo run`) compiling fast
-# while giving the math a large speed-up; tests go a notch higher; dependencies
-# are fully optimised once and cached. Debug assertions stay on (so the kpart /
-# topology `debug_assert!` invariants still fire), and no fast-math is enabled,
-# so float results are unchanged — only the runtime drops.
-[profile.dev]
-opt-level = 1
-
-[profile.test]
-opt-level = 2
-
-[profile.dev.package."*"]
-opt-level = 3
+# NOTE: a test/dev `opt-level` profile (dev=1/test=2/deps=3) was trialled to
+# speed the float-heavy suite — it cut the local geometry-engine lib run 8.4s →
+# 1.68s. It was REVERTED because on the 2-core GitHub runner the cold
+# (cache-miss) optimized build of the whole workspace + deps + every nextest
+# binary exceeded the 40-min Test-Suite budget AND overran the runner disk, and
+# the run was cancelled before it could warm the cache — so it could never
+# converge. CI speed is delivered by cargo-nextest instead (parallel exec, no
+# compile-time cost); the suite already runs ~10 min at opt-level 0. Devs who
+# want faster LOCAL tests can opt in with a scoped override in a personal
+# `.cargo/config.toml` or `[profile.dev.package.geometry-engine] opt-level = 2`
+# (one crate ≈ the whole compile cost, recovers most of the win).
 
 # Workspace-wide clippy lint policy.
 #
