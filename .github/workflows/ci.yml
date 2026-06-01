@@ -16,10 +16,16 @@ jobs:
     runs-on: ubuntu-latest
     # Bound a hung or runaway test run instead of GitHub's 6h default. A single
     # deadlocked test (e.g. the verify_api_key DashMap self-deadlock) would
-    # otherwise burn the entire 6h job limit before being cancelled. The suite
-    # runs ~10 min at opt-level 0; 30 min leaves comfortable headroom for a cold
-    # (cache-miss) build plus the nextest run.
-    timeout-minutes: 30
+    # otherwise burn the entire 6h job limit before being cancelled.
+    #
+    # 60 min (not 30): the cargo cache had gone cold (LRU-evicted while CI was
+    # red on the fmt gate for days), so the workspace + every test binary must
+    # compile from scratch — that alone is ~30-40 min on the 2-core runner,
+    # plus the nextest run. A 30-min cap was cancelled before the build even
+    # finished, so the cache never SAVED and every run stayed cold. This higher
+    # cap lets one cold run complete and warm the cache; warm runs finish in
+    # ~10-15 min (revisit/lower this once green is observed).
+    timeout-minutes: 60
 
     steps:
     - uses: actions/checkout@v4
