@@ -1122,8 +1122,32 @@ fn tessellate_conical_face(
                 face.id,
                 e
             );
-            tessellate_conical_regular(
-                face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
+            // Grid over the cone's INTRINSIC parameter domain (full angular
+            // sweep + its own height limits) through the UNTRIMMED grid —
+            // exactly the cylinder fallback. Once the seam desyncs (the usual
+            // cause of the curved-CDT failure on a transformed/rotated cone)
+            // the face-edge-derived u-range collapses, so a trimmed grid
+            // (point-in-face) would drop the entire
+            // lateral wall and the divergence-theorem volume loses the cone
+            // term — a silent mass-property/export corruption for any
+            // non-axis-aligned frustum (observed: 68.06 → 29.86 after a rigid
+            // motion). `evaluate_full(u, v)` traces the correct lateral from
+            // the surface's stored (rotated) frame regardless of seam state.
+            let cone = surface
+                .as_any()
+                .downcast_ref::<crate::primitives::surface::Cone>();
+            let (cu_min, cu_max, cv_min, cv_max) = match cone {
+                Some(c) => {
+                    let (u0, u1) = c
+                        .angle_limits
+                        .map_or((0.0, std::f64::consts::TAU), |[a, b]| (a, b));
+                    let (v0, v1) = c.height_limits.map_or((v_min, v_max), |[a, b]| (a, b));
+                    (u0, u1, v0, v1)
+                }
+                None => (u_min, u_max, v_min, v_max),
+            };
+            tessellate_surface_grid_untrimmed(
+                face, model, surface, cu_min, cu_max, cv_min, cv_max, u_steps, v_steps, mesh,
             );
         }
     }
@@ -1328,25 +1352,6 @@ fn tessellate_conical_with_apex(
             }
         }
     }
-}
-
-/// Regular conical tessellation (truncated cone)
-fn tessellate_conical_regular(
-    face: &Face,
-    model: &BRepModel,
-    surface: &dyn Surface,
-    u_min: f64,
-    u_max: f64,
-    v_min: f64,
-    v_max: f64,
-    u_steps: usize,
-    v_steps: usize,
-    mesh: &mut TriangleMesh,
-) {
-    // Standard grid tessellation
-    tessellate_surface_grid(
-        face, model, surface, u_min, u_max, v_min, v_max, u_steps, v_steps, mesh,
-    );
 }
 
 /// Estimate cone height from v parameter range
