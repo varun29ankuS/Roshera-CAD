@@ -1182,50 +1182,119 @@ impl NurbsCurve {
     }
 
     /// Elevate degree of curve
+    /// Raise the curve's degree by `times`, preserving its shape exactly.
+    ///
+    /// Works by Bézier decomposition: every interior knot is first inserted to
+    /// full multiplicity `p`, splitting the curve into Bézier segments; each
+    /// segment is degree-elevated `p → p + times` in homogeneous (weighted)
+    /// coordinates via the closed-form Bézier elevation coefficients; the
+    /// elevated segments are then re-assembled (sharing breakpoint endpoints)
+    /// into a clamped degree-`(p + times)` curve. The resulting curve
+    /// evaluates identically to the original at every parameter — it is the
+    /// same curve in a higher-degree representation (interior knots carry
+    /// multiplicity `p + times`; no knot-removal minimisation is performed).
+    ///
+    /// Assumes a clamped knot vector (end multiplicity `p + 1`), which is the
+    /// kernel's invariant for all NURBS curves it constructs.
     pub fn elevate_degree(&mut self, times: usize) -> Result<(), &'static str> {
         if times == 0 {
             return Ok(());
         }
 
-        // Degree elevation algorithm (simplified)
-        let n = self.control_points.len() - 1;
-        let new_degree = self.degree + times;
+        let p = self.degree;
+        let q = p + times;
 
-        // New control points (more needed for higher degree)
-        let mut new_control_points = Vec::with_capacity(n + times + 1);
-        let mut new_weights = Vec::with_capacity(n + times + 1);
-
-        // This is a simplified implementation
-        // Full implementation would use the degree elevation formulas
-        for i in 0..=n {
-            new_control_points.push(self.control_points[i]);
-            new_weights.push(self.weights[i]);
+        // Binomial coefficient C(n, k) as f64 (degrees are small).
+        fn binomial(n: usize, k: usize) -> f64 {
+            if k > n {
+                return 0.0;
+            }
+            let k = k.min(n - k);
+            let mut r = 1.0_f64;
+            for i in 0..k {
+                r = r * (n - i) as f64 / (i + 1) as f64;
+            }
+            r
         }
 
-        // Add new control points
-        for _ in 0..times {
-            let idx = new_control_points.len() / 2;
-            new_control_points.insert(idx, new_control_points[idx]);
-            new_weights.insert(idx, new_weights[idx]);
+        // ---- 1. Distinct interior breakpoints + their current multiplicity,
+        //         read from the *current* knot vector before any mutation. ----
+        let knots = self.knots.values().to_vec();
+        let u_min = knots[p];
+        let u_max = knots[knots.len() - p - 1];
+        let n_end = knots.len() - p - 1;
+        let mut interior: Vec<f64> = Vec::new();
+        let mut i = p + 1;
+        while i < n_end {
+            let val = knots[i];
+            let mut mult = 0;
+            while i < n_end && (knots[i] - val).abs() < 1e-12 {
+                mult += 1;
+                i += 1;
+            }
+            // Raise this interior knot to full multiplicity p (Bézier split).
+            if mult < p {
+                self.insert_knot(val, p - mult)?;
+            } else if mult > p {
+                return Err("interior knot multiplicity exceeds degree");
+            }
+            interior.push(val);
         }
 
-        // Update knot vector
-        let mut new_knots = Vec::new();
-        for &knot in self.knots.values() {
-            new_knots.push(knot);
-            // Add multiplicity for degree elevation
-            if knot > self.knots.values()[0] && knot < self.knots.values()[self.knots.len() - 1] {
-                for _ in 0..times {
-                    new_knots.push(knot);
+        // ---- 2. After full insertion the control points are contiguous
+        //         Bézier segments: segment `seg` owns indices [seg*p ..= seg*p+p]
+        //         (adjacent segments share the breakpoint control point). ----
+        let s = interior.len() + 1; // number of Bézier segments
+        let cps = self.control_points.clone();
+        let ws = self.weights.clone();
+        if cps.len() != s * p + 1 {
+            return Err("Bézier decomposition produced an unexpected control-point count");
+        }
+
+        let mut new_cps: Vec<Point3> = Vec::with_capacity(s * q + 1);
+        let mut new_ws: Vec<f64> = Vec::with_capacity(s * q + 1);
+
+        for seg in 0..s {
+            let base = seg * p;
+            // Elevate this segment p → q with the closed-form coefficients,
+            // accumulating in homogeneous coordinates (w·P, w).
+            for out in 0..=q {
+                let lo = out.saturating_sub(times);
+                let hi = out.min(p);
+                let denom = binomial(q, out);
+                let (mut wx, mut wy, mut wz, mut w) = (0.0, 0.0, 0.0, 0.0);
+                for j in lo..=hi {
+                    let coef = binomial(p, j) * binomial(times, out - j) / denom;
+                    let wj = ws[base + j];
+                    let pj = cps[base + j];
+                    wx += coef * wj * pj.x;
+                    wy += coef * wj * pj.y;
+                    wz += coef * wj * pj.z;
+                    w += coef * wj;
                 }
+                // Drop the shared first point of every non-initial segment —
+                // it coincides with the previous segment's last point.
+                if seg > 0 && out == 0 {
+                    continue;
+                }
+                new_cps.push(Point3::new(wx / w, wy / w, wz / w));
+                new_ws.push(w);
             }
         }
 
-        self.control_points = new_control_points;
-        self.weights = new_weights;
+        // ---- 3. Clamped degree-q knot vector: ends at multiplicity q+1,
+        //         each interior breakpoint at multiplicity q. ----
+        let mut new_knots = vec![u_min; q + 1];
+        for &iv in &interior {
+            new_knots.extend(std::iter::repeat(iv).take(q));
+        }
+        new_knots.extend(std::iter::repeat(u_max).take(q + 1));
+
+        self.control_points = new_cps;
+        self.weights = new_ws;
         self.knots = KnotVector::new(new_knots)
             .map_err(|_| "degree elevation produced an invalid knot vector")?;
-        self.degree = new_degree;
+        self.degree = q;
 
         Ok(())
     }

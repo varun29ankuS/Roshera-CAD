@@ -207,21 +207,19 @@ knot_insertion_test!(knot_insert_bspline3_6b, "bspline3_6", 0.7);
 // Degree elevation preserves the curve.
 // =====================================================================
 
-// Repros for a real bug in NurbsCurve::elevate_degree: degree elevation must
-// preserve the curve exactly, but the elevated curve does NOT match the
-// original — evaluate(0) returns a mid control point instead of cp0, and for
-// Bézier inputs it builds an invalid/NaN knot vector (a `min > max` panic
-// inside the knot handling). The identical harness for knot insertion passes,
-// so this is elevate_degree, not the test. Un-ignore when degree elevation is
-// fixed. (Knot insertion — the other refinement op — is verified above.)
+// Degree elevation must preserve the curve exactly (the point set is
+// unchanged; only the representation grows). Now verified after the
+// Bézier-decomposition rewrite of NurbsCurve::elevate_degree.
 macro_rules! degree_elevation_test {
     ($name:ident, $cfg:expr) => {
-        #[ignore = "NurbsCurve::elevate_degree produces a curve that doesn't match the original (and NaN knots for Bezier); repro for the fix"]
         #[test]
         fn $name() {
             let (cps, deg) = config($cfg);
             let original = clamped(cps.clone(), deg);
-            let before: Vec<Point3> = sample_params().iter().map(|&u| original.evaluate(u).point).collect();
+            let before: Vec<Point3> = sample_params()
+                .iter()
+                .map(|&u| original.evaluate(u).point)
+                .collect();
             let mut elevated = clamped(cps, deg);
             elevated.elevate_degree(1).expect("degree elevation");
             for (i, &u) in sample_params().iter().enumerate() {
