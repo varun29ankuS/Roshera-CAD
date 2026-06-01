@@ -1367,7 +1367,17 @@ impl Curve for Arc {
             let angle = self.start_angle + (i as f64 * segment_angle / 2.0);
             let (sin_a, cos_a) = angle.sin_cos();
 
-            let local_pos = self.x_axis * (self.radius * cos_a) + y_axis * (self.radius * sin_a);
+            // Segment-boundary control points (even i) sit on the circle with
+            // weight 1; the per-segment middle control point (odd i) is the
+            // intersection of the endpoint tangents — along the segment
+            // bisector at radius / cos(Δ/2) — with weight cos(Δ/2). Placing
+            // the middle point *on* the circle (the previous behaviour) is not
+            // exact: it pulls the rational curve inward by the factor
+            // 2·cos(Δ/2)/(1+cos(Δ/2)) at each segment midpoint (≈17 % for a
+            // 90° segment). `w ≥ cos(π/4) > 0` because every segment spans at
+            // most 90°, so the division is always safe.
+            let r_i = if i % 2 == 0 { self.radius } else { self.radius / w };
+            let local_pos = self.x_axis * (r_i * cos_a) + y_axis * (r_i * sin_a);
             control_points.push(self.center + local_pos);
 
             // Weights: 1 for end points, w for mid points
@@ -3897,30 +3907,47 @@ impl Curve for Ellipse {
         }
     }
 
-    #[allow(clippy::expect_used)] // fallback uses literal-validated linear NURBS inputs
+    #[allow(clippy::expect_used)] // net below is a fixed, always-valid degree-2 rational ellipse
     fn to_nurbs(&self) -> NurbsCurve {
-        // Convert ellipse to NURBS representation
-        // This is a complex conversion - for now return a simple approximation
-        let num_points = 9; // Standard ellipse control points
-        let mut control_points = Vec::with_capacity(num_points);
-        let mut weights = Vec::with_capacity(num_points);
-
-        // Create control points for ellipse
-        for i in 0..num_points {
-            let angle = (i as f64) * consts::TWO_PI / ((num_points - 1) as f64);
-            let point = self.center
-                + self.major_axis * (self.major_length * angle.cos())
-                + self.minor_axis * (self.minor_length * angle.sin());
-            control_points.push(point);
-            weights.push(1.0);
-        }
-
+        // Exact rational representation of the full ellipse. An ellipse is the
+        // affine image of the unit circle, and NURBS are affine-invariant, so
+        // we map the standard 4-segment rational-quadratic unit-circle control
+        // net through  c ↦ center + major_axis·(major_length·c.x)
+        //                        + minor_axis·(minor_length·c.y).
+        // The four segment-boundary points (weight 1) land on the ellipse; the
+        // four "corner" points (weight cos 45° = √2/2) are the tangent
+        // intersections. Sampling 9 points *on* the ellipse with unit weights
+        // (the previous behaviour) is only a piecewise-parabola approximation
+        // — the implicit residual reaches ~0.27 for a 4×2 ellipse.
+        const W: f64 = std::f64::consts::FRAC_1_SQRT_2; // cos 45° = √2/2
+        // Unit-circle control net in (cos, sin) coordinates.
+        let net: [(f64, f64); 9] = [
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, 0.0),
+            (-1.0, -1.0),
+            (0.0, -1.0),
+            (1.0, -1.0),
+            (1.0, 0.0),
+        ];
+        let control_points: Vec<Point3> = net
+            .iter()
+            .map(|&(cx, cy)| {
+                self.center
+                    + self.major_axis * (self.major_length * cx)
+                    + self.minor_axis * (self.minor_length * cy)
+            })
+            .collect();
+        let weights = vec![1.0, W, 1.0, W, 1.0, W, 1.0, W, 1.0];
         let knots = vec![
             0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
         ];
 
         NurbsCurve::new(2, control_points, weights, knots).unwrap_or_else(|_| {
-            // Fallback: simple linear approximation
+            // Unreachable: the net above is a fixed valid degree-2 NURBS.
+            // A linear two-point fallback keeps the function total.
             NurbsCurve::new(
                 1,
                 vec![
