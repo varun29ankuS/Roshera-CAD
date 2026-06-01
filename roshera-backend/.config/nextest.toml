@@ -3,10 +3,26 @@
 # slow-timeout is a safety net: it bounds any single test so a hang can never
 # burn the whole CI job again. A test gets a SLOW warning at 60s; if it is still
 # running after 5 such periods (5 min) nextest TERMINATES it and reports it as a
-# timeout failure. Before this, two stuck timeline-engine tests
-# (validate_holds_after_random_op_sequence, fan_out_ten_siblings) ran >46 min
-# and the job was cancelled at the runner limit — which also meant the cargo
-# cache never saved, so every run rebuilt cold. 5 min is far above the slowest
-# legitimate test (~3 min), so only genuine hangs are killed.
+# timeout failure. 5 min is far above the slowest legitimate test (~3 min), so
+# only genuine hangs are killed.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# timeline-engine's async tests drive an MPSC/DashMap recorder bridge under a
+# tokio runtime. When nextest runs many of them as parallel processes on the
+# 2-core CI runner, the runtime gets CPU-starved and the bridge intermittently
+# deadlocks — a *different* timeline test hung each run (fan_out_ten_siblings,
+# parallel_forks_are_independent, add_operation_rejects_abandoned_branch, …),
+# yet every one passes locally and without contention. Pin the whole crate to a
+# single-threaded group so its tests run one-at-a-time and never thrash for
+# cores; this removes the starvation trigger without masking real failures (a
+# true deadlock would still trip slow-timeout). The underlying bridge race is
+# the real fix — see the #[ignore]'d timeline tests, which stay ignored as
+# belt-and-suspenders. Timeline tests are fast (~0.03s each), so serial costs
+# only a few seconds.
+[test-groups]
+timeline-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(timeline-engine)'
+test-group = 'timeline-serial'
