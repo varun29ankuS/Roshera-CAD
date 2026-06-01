@@ -2881,11 +2881,52 @@ pub fn interpolate_nurbs_curve(
 
     knots.extend(vec![1.0; degree + 1]);
 
-    // Set up system of equations (simplified - assumes unit weights)
-    // In practice, would solve N * P = Q for control points P
-    let weights = vec![1.0; points.len()];
+    // Solve the interpolation system A · P = Q (Piegl & Tiller, *The NURBS
+    // Book*, Algorithm A9.1). With the averaged knot vector built above and the
+    // chosen parameters, the collocation matrix A[i][j] = N_{j,p}(u_i) is
+    // banded and totally positive (Schoenberg–Whitney), so the system has a
+    // unique solution and the resulting curve passes through every data point.
+    // The previous code used the data points directly as control points, which
+    // yields an *approximating* (non-interpolating) curve — only the endpoints
+    // were ever hit.
+    let num = points.len();
+    let weights = vec![1.0; num];
 
-    NurbsCurve::new(points.to_vec(), weights, knots, degree)
+    // A scaffold curve carries the knot vector so basis functions can be
+    // evaluated before the control points are known; its control points are
+    // placeholders, touched only for span/length bookkeeping.
+    let scaffold = NurbsCurve::new(points.to_vec(), weights.clone(), knots.clone(), degree)
+        .map_err(|_| "Failed to build interpolation scaffold")?;
+
+    // Build the (num × num) collocation matrix: row i evaluates the degree-p
+    // basis at parameter u_i, scattering the p+1 nonzero values into their
+    // control-point columns.
+    let mut a = vec![vec![0.0; num]; num];
+    for (i, &u) in params.iter().enumerate() {
+        let span = scaffold.find_span(u);
+        let basis = scaffold.basis_functions(span, u);
+        for (k, &b) in basis.iter().enumerate() {
+            // span is the index of the last nonzero basis function; the block
+            // spans columns [span - degree, span].
+            let col = span - degree + k;
+            a[i][col] = b;
+        }
+    }
+
+    // Solve once per spatial coordinate against the shared matrix.
+    let solve_axis = |coord: &dyn Fn(&Point3) -> f64| -> Result<Vec<f64>, &'static str> {
+        let rhs: Vec<f64> = points.iter().map(coord).collect();
+        crate::math::linear_solver::solve(a.clone(), rhs)
+            .map_err(|_| "NURBS interpolation linear system is singular")
+    };
+    let xs = solve_axis(&|p| p.x)?;
+    let ys = solve_axis(&|p| p.y)?;
+    let zs = solve_axis(&|p| p.z)?;
+
+    let control_points: Vec<Point3> =
+        (0..num).map(|i| Point3::new(xs[i], ys[i], zs[i])).collect();
+
+    NurbsCurve::new(control_points, weights, knots, degree)
 }
 
 /// Parameterization types for interpolation
