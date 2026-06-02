@@ -17,6 +17,7 @@
 
 pub mod boolean;
 pub mod cd;
+pub mod fillet;
 pub mod tessellation;
 
 /// One stage of a measured pipeline. `input`/`output` are candidate counts
