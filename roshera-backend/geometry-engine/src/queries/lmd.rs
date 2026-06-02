@@ -53,11 +53,13 @@ pub struct Lmd {
     pub distance: f64,
 }
 
-/// Closed-form LMDs between two surfaces, dispatched on their canonical kinds.
+/// LMDs between two surfaces, dispatched on canonical kind: an exact closed
+/// form where one exists, otherwise the universal numerical engine. Ordered
+/// nearest-first.
 ///
-/// Returns an empty vector for kinds not yet wired (φ.4.2/4.3/φ.5) and for
-/// degenerate configurations (concentric spheres, intersecting planes) where no
-/// isolated local minimum exists.
+/// Returns empty only for genuinely degenerate configurations — concentric
+/// spheres, intersecting planes, a sphere centred on a cylinder axis — and for
+/// unbounded raw surfaces (no surface-level nearest point; use [`face_lmds`]).
 pub fn surface_lmds(a: &dyn Surface, b: &dyn Surface, tol: Tolerance) -> Vec<Lmd> {
     use SurfaceType::{Cylinder as Cyl, Plane as P, Sphere as S};
     match (a.surface_type(), b.surface_type()) {
