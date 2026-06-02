@@ -118,6 +118,11 @@ fn loft_profiles_body(
 
     // Convert edge profiles to face profiles if needed
     let face_profiles = create_face_profiles(model, profiles)?;
+    // The profile faces are scratch: correspondence + caps are built from the
+    // (possibly densified) vertex rings, not these faces. Remember their IDs so
+    // they can be removed after the solid is built — otherwise they linger as
+    // orphaned single-use boundary edges that the whole-model validator flags.
+    let scratch_profile_faces = face_profiles.clone();
 
     // Establish vertex correspondence between profiles
     let correspondence = match options.vertex_correspondence {
@@ -138,6 +143,10 @@ fn loft_profiles_body(
         }
         LoftType::Guided => create_guided_loft(model, face_profiles, correspondence, &options)?,
     };
+
+    // Drop the scratch profile faces (and any of their edges not shared with
+    // the result solid) so the model is a clean manifold.
+    remove_scratch_profile_faces(model, &scratch_profile_faces, solid_id);
 
     // Validate result if requested
     if options.common.validate_result {
@@ -179,7 +188,7 @@ fn create_linear_loft(
         let c0 = face_centroid(model, profiles[0])?;
         let c1 = face_centroid(model, profiles[1])?;
         let outward_target = c0 - c1;
-        let bottom_cap = create_cap_face_outward_oriented(model, &profiles[0], outward_target)?;
+        let bottom_cap = build_loft_cap(model, &correspondence[0], outward_target)?;
         shell_faces.push(bottom_cap);
     }
 
@@ -211,7 +220,7 @@ fn create_linear_loft(
         let c_last = face_centroid(model, last_profile)?;
         let c_prev = face_centroid(model, profiles[num_profiles - 2])?;
         let outward_target = c_last - c_prev;
-        let top_cap = create_cap_face_outward_oriented(model, &last_profile, outward_target)?;
+        let top_cap = build_loft_cap(model, &correspondence[num_profiles - 1], outward_target)?;
         shell_faces.push(top_cap);
     }
 
@@ -382,7 +391,7 @@ fn create_cubic_loft(
         let c0 = face_centroid(model, profiles[0])?;
         let c1 = ring_centroid(model, &rings[1])?;
         let outward_target = c0 - c1;
-        let bottom_cap = create_cap_face_outward_oriented(model, &profiles[0], outward_target)?;
+        let bottom_cap = build_loft_cap(model, &rings[0], outward_target)?;
         shell_faces.push(bottom_cap);
     }
 
@@ -482,7 +491,7 @@ fn create_cubic_loft(
         let c_last = face_centroid(model, last_profile)?;
         let c_prev = ring_centroid(model, &rings[total_rings - 2])?;
         let outward_target = c_last - c_prev;
-        let top_cap = create_cap_face_outward_oriented(model, &last_profile, outward_target)?;
+        let top_cap = build_loft_cap(model, &rings[total_rings - 1], outward_target)?;
         shell_faces.push(top_cap);
     }
 
@@ -743,7 +752,7 @@ fn create_guided_loft(
         let c0 = face_centroid(model, profiles[0])?;
         let c1 = face_centroid(model, profiles[1])?;
         let outward_target = c0 - c1;
-        let bottom_cap = create_cap_face_outward_oriented(model, &profiles[0], outward_target)?;
+        let bottom_cap = build_loft_cap(model, &snapped_correspondence[0], outward_target)?;
         shell_faces.push(bottom_cap);
     }
 
@@ -771,7 +780,11 @@ fn create_guided_loft(
         let c_last = face_centroid(model, last_profile)?;
         let c_prev = face_centroid(model, profiles[num_profiles - 2])?;
         let outward_target = c_last - c_prev;
-        let top_cap = create_cap_face_outward_oriented(model, &last_profile, outward_target)?;
+        let top_cap = build_loft_cap(
+            model,
+            &snapped_correspondence[num_profiles - 1],
+            outward_target,
+        )?;
         shell_faces.push(top_cap);
     }
 
@@ -1296,36 +1309,103 @@ fn create_reversed_face(model: &mut BRepModel, face_id: &FaceId) -> OperationRes
     Ok(model.faces.add(reversed_face))
 }
 
-/// Clone a profile face into a new face whose orientation is picked so
-/// that the oriented outward normal aligns with `outward_target`.
+/// Build a loft end-cap from a densified correspondence RING (not the original
+/// profile face).
 ///
-/// The profile face was created by `create_planar_face_from_edges` with
-/// a (default) `FaceOrientation::Forward` stamp that does not encode
-/// outward direction — the planar surface's intrinsic normal comes from
-/// Newell's-method winding and depends on the profile vertex ordering.
-/// This helper samples the surface normal at its parametric midpoint
-/// and returns a fresh face whose orientation makes
-/// `surface.normal_at × orientation.sign()` align with the caller's
-/// geometric outward target.
-fn create_cap_face_outward_oriented(
+/// The cap's boundary is built from the SAME shared line edges
+/// (`create_or_find_edge`) that the adjacent ring of lateral ruled faces uses,
+/// so every ring edge is incident to exactly two faces (cap + lateral) — a
+/// watertight seal. The previous approach cloned the original profile face;
+/// for a circle that face's boundary is a single self-closing arc edge, but the
+/// loft densifies the ring to N points and the laterals connect them with N
+/// line chords — so the cap's arc and the laterals' chords were all single-use,
+/// leaving the cap unstitched (the demo's circle→square→circle loft reported 20
+/// boundary edges). The cap surface is the best-fit plane through the ring;
+/// `outward_target` selects the face orientation.
+fn build_loft_cap(
     model: &mut BRepModel,
-    profile_face_id: &FaceId,
+    ring: &[VertexId],
     outward_target: Vector3,
 ) -> OperationResult<FaceId> {
-    let face = model
+    let n = ring.len();
+    if n < 3 {
+        return Err(OperationError::InvalidGeometry(
+            "loft cap ring needs at least 3 vertices".to_string(),
+        ));
+    }
+    // Same shared edges the lateral ruled faces use (create_or_find_edge
+    // deduplicates), so each is incident to cap + lateral = 2 faces.
+    let mut cap_edges = Vec::with_capacity(n);
+    for i in 0..n {
+        cap_edges.push(create_or_find_edge(model, ring[i], ring[(i + 1) % n])?);
+    }
+    let mut fl = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+    for &e in &cap_edges {
+        fl.add_edge(e, true);
+    }
+    let loop_id = model.loops.add(fl);
+
+    let surface = compute_planar_surface(model, &cap_edges)?;
+    let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
+    let surface_id = model.surfaces.add(surface);
+    Ok(model
         .faces
-        .get(*profile_face_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Profile face not found".to_string()))?
-        .clone();
-    let surface = model
-        .surfaces
-        .get(face.surface_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Profile surface not found".to_string()))?;
-    let orientation = orient_face_for_outward(surface, outward_target)?;
-    let mut cap_face = face;
-    cap_face.id = 0; // ID will be assigned by store
-    cap_face.orientation = orientation;
-    Ok(model.faces.add(cap_face))
+        .add(Face::new(0, surface_id, loop_id, orientation)))
+}
+
+/// Remove the scratch profile faces (the loft INPUT) from the model after the
+/// result solid is built. Each profile face's loop + edges are removed unless an
+/// edge is also used by the result solid's shell (a profile that was NOT
+/// densified shares its line edges with the lateral faces). Without this, the
+/// orphaned profile edges remain single-use and the whole-model validator
+/// (which `validate_lofted_solid` runs) flags them as boundary-edge gaps.
+fn remove_scratch_profile_faces(
+    model: &mut BRepModel,
+    profile_faces: &[FaceId],
+    solid_id: SolidId,
+) {
+    use std::collections::HashSet;
+
+    // Edges referenced by the result solid's shell faces.
+    let mut solid_edges: HashSet<EdgeId> = HashSet::new();
+    if let Some(solid) = model.solids.get(solid_id) {
+        let shell_faces: Vec<FaceId> = model
+            .shells
+            .get(solid.outer_shell)
+            .map(|s| s.faces.clone())
+            .unwrap_or_default();
+        for fid in shell_faces {
+            if let Some(face) = model.faces.get(fid) {
+                let mut loops = vec![face.outer_loop];
+                loops.extend(face.inner_loops.iter().copied());
+                for lid in loops {
+                    if let Some(lp) = model.loops.get(lid) {
+                        for &e in &lp.edges {
+                            solid_edges.insert(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for &pf in profile_faces {
+        let (outer, inner) = match model.faces.get(pf) {
+            Some(f) => (f.outer_loop, f.inner_loops.clone()),
+            None => continue,
+        };
+        for lid in std::iter::once(outer).chain(inner) {
+            if let Some(lp) = model.loops.get(lid).cloned() {
+                for e in lp.edges {
+                    if !solid_edges.contains(&e) {
+                        model.edges.remove(e);
+                    }
+                }
+            }
+            model.loops.remove(lid);
+        }
+        model.faces.remove(pf);
+    }
 }
 
 /// Compute the centroid of a face by averaging its outer loop's vertex
@@ -1968,14 +2048,11 @@ mod tests {
         let mut model = BRepModel::new();
         let p1 = make_square_at_z(&mut model, 0.0);
         let p2 = make_square_at_z(&mut model, 2.0);
-        let opts = LoftOptions {
-            common: CommonOptions {
-                validate_result: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let solid_id = loft_profiles(&mut model, vec![p1, p2], opts).expect("loft");
+        // validate_result defaults true: the loft must be a valid manifold
+        // (caps share the densified ring edges with the laterals; scratch
+        // profile faces are removed).
+        let solid_id =
+            loft_profiles(&mut model, vec![p1, p2], LoftOptions::default()).expect("loft");
         assert!(model.solids.get(solid_id).is_some());
     }
 }
