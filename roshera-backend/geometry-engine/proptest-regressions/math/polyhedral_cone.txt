@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 02ecdc6591a16435a4fe8725d7c9c1e53bb20b422f38f7c17073d39b6fca25ca # shrinks to (cone, _gens) = (PolyhedralCone { generators: [Vector3 { x: 0.0, y: 0.0, z: 1.0 }, Vector3 { x: 0.8418674121480023, y: -0.39884453293848504, z: 0.3635688365472315 }, Vector3 { x: 0.0, y: -0.3474737772219697, z: 0.937689700350333 }, Vector3 { x: 0.0, y: -0.9102185320143956, z: 0.41412826995697727 }], supports: [Vector3 { x: 0.4281435357591843, y: 0.9037107461946129, z: -0.0 }, Vector3 { x: -1.0, y: -0.0, z: 0.0 }, Vector3 { x: 0.19318010434747032, y: -0.4063274654649778, z: -0.8930730306604874 }] }, [Vector3 { x: 0.0, y: 0.0, z: 1.0 }, Vector3 { x: 0.8418674121480021, y: -0.39884453293848493, z: 0.36356883654723143 }, Vector3 { x: 0.0, y: -0.34747377722196965, z: 0.9376897003503328 }, Vector3 { x: 0.0, y: -0.9102185320143954, z: 0.41412826995697716 }])
