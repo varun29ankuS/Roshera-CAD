@@ -147,3 +147,29 @@ fn sweep_volume_scales_linearly_with_path_length() {
         "doubling path length must double swept volume: {v1} -> {v2}"
     );
 }
+
+use proptest::prelude::*;
+
+proptest! {
+    // 16 cases keeps wall-clock well under the nextest slow-timeout backstop:
+    // each sweep case runs full result validation + a fine tessellation
+    // (~2.5 s), so the case count is deliberately modest (the fixed-size cases
+    // above already pin specific shapes; this fuzzes the space around them).
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// Prism oracle over a wide, randomized range of profile sizes and path
+    /// lengths — the comprehensive complement to the fixed-size cases above.
+    /// Every case is validated at construction (via `swept_prism`), checked
+    /// against the analytic prism volume, and checked for watertightness.
+    #[test]
+    fn prop_sweep_prism_volume(
+        w in 0.3f64..8.0,
+        h in 0.3f64..8.0,
+        l in 0.5f64..12.0,
+    ) {
+        let (tess, mass) = swept_prism(w, h, l);
+        let expected = w * h * l;
+        prop_assert!(rel_close(tess, expected, 0.03), "tess {tess} vs prism {expected}");
+        prop_assert!(rel_close(tess, mass, 0.03), "tess {tess} vs mass-props {mass}");
+    }
+}
