@@ -121,8 +121,19 @@ impl PolyhedralCone {
         if self.is_full_space() {
             return true;
         }
+        // A cone with no generators is the trivial cone {0}: only the apex
+        // lies in it. (Without this guard the `all()` over empty supports below
+        // would vacuously accept every direction.)
+        if self.generators.is_empty() {
+            return d.magnitude() < CONE_EPS;
+        }
         let scale = d.magnitude().max(1.0);
         self.supports.iter().all(|s| d.dot(s) <= CONE_EPS * scale)
+    }
+
+    /// True iff the cone is the trivial `{0}` (apex only).
+    pub fn is_zero(&self) -> bool {
+        self.generators.is_empty() && self.supports.is_empty()
     }
 }
 
@@ -289,6 +300,521 @@ mod tests {
             prop_assert_eq!(back.generators().len(), cone.generators().len());
             for g in cone.generators() {
                 prop_assert!(back.generators().iter().any(|h| (*h - *g).magnitude() < 1e-9));
+            }
+        }
+    }
+
+    // ---- helpers --------------------------------------------------------
+
+    fn nrm(x: f64, y: f64, z: f64) -> Vector3 {
+        Vector3::new(x, y, z).normalize().expect("nonzero")
+    }
+    fn has_vec(set: &[Vector3], v: Vector3) -> bool {
+        set.iter().any(|s| (*s - v).magnitude() < 1e-9)
+    }
+
+    // ---- more known closed-form cases -----------------------------------
+
+    #[test]
+    fn cube_vertex_neg_corner_supports() {
+        let c = PolyhedralCone::normal_cone(&[-Vector3::X, -Vector3::Y, -Vector3::Z]);
+        assert_eq!(c.supports().len(), 3);
+        for s in [Vector3::X, Vector3::Y, Vector3::Z] {
+            assert!(has_vec(c.supports(), s), "missing {s:?}");
+        }
+    }
+
+    #[test]
+    fn square_pyramid_apex_has_four_supports() {
+        let g = [
+            nrm(1.0, 1.0, 1.0),
+            nrm(1.0, -1.0, 1.0),
+            nrm(-1.0, -1.0, 1.0),
+            nrm(-1.0, 1.0, 1.0),
+        ];
+        let c = PolyhedralCone::from_generators(&g);
+        assert_eq!(c.generators().len(), 4, "four extreme rays");
+        assert_eq!(c.supports().len(), 4, "four faces");
+        assert!(c.contains(&Vector3::Z), "axis is interior");
+        assert!(!c.contains(&(-Vector3::Z)), "anti-axis outside");
+    }
+
+    #[test]
+    fn pentagonal_pyramid_apex_has_five_supports() {
+        let g: Vec<Vector3> = (0..5)
+            .map(|k| {
+                let a = std::f64::consts::TAU * (k as f64) / 5.0;
+                nrm(a.cos(), a.sin(), 1.0)
+            })
+            .collect();
+        let c = PolyhedralCone::from_generators(&g);
+        assert_eq!(c.generators().len(), 5);
+        assert_eq!(c.supports().len(), 5);
+        assert!(c.contains(&Vector3::Z));
+    }
+
+    #[test]
+    fn tetra_apex_three_supports() {
+        let g = [
+            nrm(1.0, 1.0, 1.0),
+            nrm(1.0, -1.0, -1.0),
+            nrm(-1.0, 1.0, -1.0),
+        ];
+        let c = PolyhedralCone::from_generators(&g);
+        assert_eq!(c.supports().len(), 3);
+    }
+
+    // ---- canonicalization / cleaning ------------------------------------
+
+    #[test]
+    fn redundant_interior_generator_dropped() {
+        // (1,1,1) is interior to cone(X,Y,Z) — not extreme.
+        let c = PolyhedralCone::from_generators(&[
+            Vector3::X,
+            Vector3::Y,
+            Vector3::Z,
+            Vector3::new(1.0, 1.0, 1.0),
+        ]);
+        assert_eq!(c.generators().len(), 3, "redundant ray removed");
+        assert_eq!(c.supports().len(), 3);
+    }
+
+    #[test]
+    fn duplicate_generators_deduped() {
+        let c = PolyhedralCone::from_generators(&[Vector3::X, Vector3::Y, Vector3::Z, Vector3::X]);
+        assert_eq!(c.generators().len(), 3);
+    }
+
+    #[test]
+    fn zero_rays_dropped() {
+        let c =
+            PolyhedralCone::from_generators(&[Vector3::X, Vector3::Y, Vector3::Z, Vector3::ZERO]);
+        assert_eq!(c.generators().len(), 3);
+    }
+
+    #[test]
+    fn non_unit_rays_are_normalized() {
+        let c = PolyhedralCone::from_generators(&[
+            Vector3::X * 5.0,
+            Vector3::Y * 3.0,
+            Vector3::Z * 0.1,
+        ]);
+        for g in c.generators() {
+            assert!(
+                (g.magnitude() - 1.0).abs() < 1e-9,
+                "generator not unit: {g:?}"
+            );
+        }
+        for s in c.supports() {
+            assert!(
+                (s.magnitude() - 1.0).abs() < 1e-9,
+                "support not unit: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permutation_invariant_supports() {
+        let a = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        let b = PolyhedralCone::normal_cone(&[Vector3::Z, Vector3::X, Vector3::Y]);
+        assert_eq!(a.supports().len(), b.supports().len());
+        for s in a.supports() {
+            assert!(
+                has_vec(b.supports(), *s),
+                "support {s:?} not permutation-stable"
+            );
+        }
+    }
+
+    // ---- membership edge cases ------------------------------------------
+
+    #[test]
+    fn apex_is_in_every_cone() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        assert!(c.contains(&Vector3::ZERO));
+    }
+
+    #[test]
+    fn membership_is_scale_invariant() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        let d = Vector3::new(1.0, 2.0, 3.0);
+        assert_eq!(c.contains(&d), c.contains(&(d * 10.0)));
+        assert_eq!(c.contains(&d), c.contains(&(d * 0.01)));
+    }
+
+    #[test]
+    fn just_inside_and_outside_a_face() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        assert!(
+            c.contains(&Vector3::new(0.01, 1.0, 1.0)),
+            "just inside +x face"
+        );
+        assert!(
+            !c.contains(&Vector3::new(-0.01, 1.0, 1.0)),
+            "just outside +x face"
+        );
+    }
+
+    #[test]
+    fn midpoint_of_two_generators_is_contained() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        assert!(c.contains(&(Vector3::X + Vector3::Y)));
+        assert!(c.contains(&(Vector3::X + Vector3::Z)));
+    }
+
+    #[test]
+    fn negated_support_is_inside_the_octant() {
+        // For the octant, supports are −X,−Y,−Z; negating one gives a boundary
+        // generator (X / Y / Z), which is contained.
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        for s in c.supports() {
+            assert!(
+                c.contains(&(-*s)),
+                "negated support {:?} should be inside",
+                -*s
+            );
+        }
+    }
+
+    // ---- full space / zero cone -----------------------------------------
+
+    #[test]
+    fn full_space_contains_everything() {
+        let c = PolyhedralCone::full_space();
+        assert!(c.is_full_space());
+        assert!(c.contains(&Vector3::new(7.0, -3.0, 2.0)));
+        assert!(c.contains(&(-Vector3::Z)));
+    }
+
+    #[test]
+    fn generators_spanning_r3_is_full_space() {
+        // Six axis directions positively span R³.
+        let c = PolyhedralCone::from_generators(&[
+            Vector3::X,
+            -Vector3::X,
+            Vector3::Y,
+            -Vector3::Y,
+            Vector3::Z,
+            -Vector3::Z,
+        ]);
+        assert!(c.supports().is_empty(), "spanning cone has no supports");
+        assert!(c.contains(&Vector3::new(1.0, -1.0, 1.0)));
+    }
+
+    #[test]
+    fn empty_cone_contains_only_apex() {
+        let c = PolyhedralCone::from_generators(&[]);
+        assert!(c.is_zero());
+        assert!(c.contains(&Vector3::ZERO));
+        assert!(!c.contains(&Vector3::X));
+    }
+
+    // ---- polar / tangent relationships ----------------------------------
+
+    #[test]
+    fn polar_swaps_generators_and_supports() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        let p = c.polar();
+        assert_eq!(p.generators().len(), c.supports().len());
+        for s in c.supports() {
+            assert!(has_vec(p.generators(), *s));
+        }
+        for g in c.generators() {
+            assert!(has_vec(p.supports(), *g));
+        }
+    }
+
+    #[test]
+    fn tangent_cone_contains_inward_axis() {
+        let tangent = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]).polar();
+        assert!(tangent.contains(&Vector3::new(-1.0, -1.0, -1.0)));
+        assert!(!tangent.contains(&Vector3::new(1.0, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn narrow_cone_excludes_side_directions() {
+        // Three rays bunched near +Z.
+        let c = PolyhedralCone::from_generators(&[
+            nrm(0.1, 0.0, 1.0),
+            nrm(-0.05, 0.087, 1.0),
+            nrm(-0.05, -0.087, 1.0),
+        ]);
+        assert!(c.contains(&Vector3::Z), "axis inside narrow cone");
+        assert!(!c.contains(&Vector3::X), "side direction outside");
+        assert!(!c.contains(&(-Vector3::Z)), "anti-axis outside");
+    }
+
+    #[test]
+    fn supports_are_outward_on_octant() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        for g in c.generators() {
+            for s in c.supports() {
+                assert!(
+                    g.dot(s) <= 1e-9,
+                    "generator {g:?} not on inner side of {s:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn centroid_direction_is_strictly_interior() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        let centroid = Vector3::X + Vector3::Y + Vector3::Z;
+        assert!(c.contains(&centroid));
+        for s in c.supports() {
+            assert!(
+                centroid.dot(s) < -1e-6,
+                "centroid not strictly inside {s:?}"
+            );
+        }
+    }
+
+    // ---- more property tests --------------------------------------------
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Membership is invariant to positive scaling of the query direction.
+        #[test]
+        fn prop_scale_invariance(
+            (cone, _gens) in pointed_cone(),
+            x in -3.0f64..3.0, y in -3.0f64..3.0, z in -3.0f64..3.0,
+            k in 0.01f64..100.0,
+        ) {
+            let d = Vector3::new(x, y, z);
+            if d.magnitude() < 1e-6 { return Ok(()); }
+            prop_assert_eq!(cone.contains(&d), cone.contains(&(d * k)));
+        }
+
+        /// Every support is unit length and outward (non-positive on all generators).
+        #[test]
+        fn prop_supports_unit_and_outward((cone, _gens) in pointed_cone()) {
+            for s in cone.supports() {
+                prop_assert!((s.magnitude() - 1.0).abs() < 1e-9, "support not unit");
+                for g in cone.generators() {
+                    prop_assert!(g.dot(s) <= 1e-7, "generator on wrong side of support");
+                }
+            }
+        }
+
+        /// Every generator is unit length.
+        #[test]
+        fn prop_generators_unit((cone, _gens) in pointed_cone()) {
+            for g in cone.generators() {
+                prop_assert!((g.magnitude() - 1.0).abs() < 1e-9);
+            }
+        }
+
+        /// The apex (origin) is in every cone.
+        #[test]
+        fn prop_apex_contained((cone, _gens) in pointed_cone()) {
+            prop_assert!(cone.contains(&Vector3::ZERO));
+        }
+
+        /// Building the cone from a permutation of the input rays yields the
+        /// same support set.
+        #[test]
+        fn prop_permutation_invariance((_cone, gens) in pointed_cone()) {
+            let mut rev = gens.clone();
+            rev.reverse();
+            let a = PolyhedralCone::from_generators(&gens);
+            let b = PolyhedralCone::from_generators(&rev);
+            prop_assert_eq!(a.supports().len(), b.supports().len());
+            for s in a.supports() {
+                prop_assert!(b.supports().iter().any(|t| (*t - *s).magnitude() < 1e-7));
+            }
+        }
+
+        /// Convexity: the sum (a conic combination) of any two generators is
+        /// contained.
+        #[test]
+        fn prop_sum_of_two_generators_contained((cone, _gens) in pointed_cone()) {
+            let gens = cone.generators();
+            if gens.len() >= 2 {
+                let d = gens[0] + gens[1];
+                prop_assert!(cone.contains(&d), "sum of two generators not contained");
+            }
+        }
+
+        /// The centroid (sum) of all generators is contained.
+        #[test]
+        fn prop_centroid_contained((cone, _gens) in pointed_cone()) {
+            let mut d = Vector3::ZERO;
+            for g in cone.generators() {
+                d = d + *g;
+            }
+            if d.magnitude() > 1e-6 {
+                prop_assert!(cone.contains(&d));
+            }
+        }
+
+        /// Canonicalization is idempotent: rebuilding from the canonical
+        /// generators reproduces the same cone.
+        #[test]
+        fn prop_canonicalization_idempotent((cone, _gens) in pointed_cone()) {
+            let rebuilt = PolyhedralCone::from_generators(cone.generators());
+            prop_assert_eq!(rebuilt.generators().len(), cone.generators().len());
+            prop_assert_eq!(rebuilt.supports().len(), cone.supports().len());
+            for g in cone.generators() {
+                prop_assert!(rebuilt.generators().iter().any(|h| (*h - *g).magnitude() < 1e-7));
+            }
+        }
+
+        /// The polar's supports are exactly the original generators.
+        #[test]
+        fn prop_polar_supports_are_generators((cone, _gens) in pointed_cone()) {
+            let p = cone.polar();
+            prop_assert_eq!(p.supports().len(), cone.generators().len());
+            for g in cone.generators() {
+                prop_assert!(p.supports().iter().any(|s| (*s - *g).magnitude() < 1e-9));
+            }
+        }
+
+        /// A direction strictly inside (the generator centroid, nudged) stays
+        /// contained; its antipode does not.
+        #[test]
+        fn prop_interior_and_antipode((cone, _gens) in pointed_cone()) {
+            let mut c = Vector3::ZERO;
+            for g in cone.generators() { c = c + *g; }
+            if c.magnitude() < 1e-6 { return Ok(()); }
+            prop_assert!(cone.contains(&c));
+            prop_assert!(!cone.contains(&(-c)), "antipode of interior in pointed cone");
+        }
+    }
+
+    // ---- batch 3: more configurations + structural invariants -----------
+
+    #[test]
+    fn obtuse_three_face_corner() {
+        // Three faces tilted up, 120° apart in the xy plane — a wide corner.
+        let c = PolyhedralCone::from_generators(&[
+            nrm(1.0, 0.0, 0.3),
+            nrm(-0.5, 0.866, 0.3),
+            nrm(-0.5, -0.866, 0.3),
+        ]);
+        assert_eq!(c.supports().len(), 3);
+        assert!(c.contains(&Vector3::Z));
+        assert!(!c.contains(&(-Vector3::Z)));
+    }
+
+    #[test]
+    fn acute_three_face_corner() {
+        let c = PolyhedralCone::from_generators(&[
+            nrm(0.2, 0.0, 1.0),
+            nrm(-0.1, 0.17, 1.0),
+            nrm(-0.1, -0.17, 1.0),
+        ]);
+        assert_eq!(c.supports().len(), 3);
+        assert!(c.contains(&Vector3::Z));
+    }
+
+    #[test]
+    fn hexagonal_fan_has_six_supports() {
+        let g: Vec<Vector3> = (0..6)
+            .map(|k| {
+                let a = std::f64::consts::TAU * (k as f64) / 6.0;
+                nrm(a.cos(), a.sin(), 1.0)
+            })
+            .collect();
+        let c = PolyhedralCone::from_generators(&g);
+        assert_eq!(c.generators().len(), 6);
+        assert_eq!(c.supports().len(), 6);
+    }
+
+    #[test]
+    fn octant_supports_are_distinct() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        let s = c.supports();
+        for i in 0..s.len() {
+            for j in (i + 1)..s.len() {
+                assert!((s[i] - s[j]).magnitude() > 1e-6, "duplicate support");
+            }
+        }
+    }
+
+    #[test]
+    fn polar_of_full_space_is_zero_cone() {
+        let z = PolyhedralCone::full_space().polar();
+        assert!(z.contains(&Vector3::ZERO));
+        assert!(!z.contains(&Vector3::X), "polar of R³ is {{0}}");
+    }
+
+    #[test]
+    fn different_corners_have_different_supports() {
+        let a = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        let b = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, -Vector3::Z]);
+        // The −Z-flipped corner must differ in at least one support.
+        assert!(
+            a.supports().iter().any(|s| !has_vec(b.supports(), *s)),
+            "distinct corners share all supports"
+        );
+    }
+
+    #[test]
+    fn cone_edge_direction_is_on_boundary() {
+        // X+Y is the edge of the octant between the −X and −Y faces (and on the
+        // −Z face plane) — contained, on the boundary.
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        assert!(c.contains(&(Vector3::X + Vector3::Y)));
+    }
+
+    #[test]
+    fn mixed_sign_corner_three_supports() {
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, -Vector3::Z]);
+        assert_eq!(c.supports().len(), 3);
+        assert!(
+            c.contains(&Vector3::new(1.0, 1.0, -1.0)),
+            "interior of mixed corner"
+        );
+    }
+
+    #[test]
+    fn each_octant_generator_lies_on_two_faces() {
+        // Every extreme ray is the intersection of ≥2 supporting planes.
+        let c = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z]);
+        for g in c.generators() {
+            let on = c
+                .supports()
+                .iter()
+                .filter(|s| g.dot(s).abs() < 1e-9)
+                .count();
+            assert!(on >= 2, "generator {g:?} on only {on} faces");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// No two supports are near-duplicates.
+        #[test]
+        fn prop_supports_distinct((cone, _gens) in pointed_cone()) {
+            let s = cone.supports();
+            for i in 0..s.len() {
+                for j in (i + 1)..s.len() {
+                    prop_assert!((s[i] - s[j]).magnitude() > 1e-7, "duplicate support");
+                }
+            }
+        }
+
+        /// No two generators are near-duplicates.
+        #[test]
+        fn prop_generators_distinct((cone, _gens) in pointed_cone()) {
+            let g = cone.generators();
+            for i in 0..g.len() {
+                for j in (i + 1)..g.len() {
+                    prop_assert!((g[i] - g[j]).magnitude() > 1e-7, "duplicate generator");
+                }
+            }
+        }
+
+        /// Structural: every extreme ray (generator) is the intersection of at
+        /// least two supporting planes.
+        #[test]
+        fn prop_generator_on_two_faces((cone, _gens) in pointed_cone()) {
+            for g in cone.generators() {
+                let on = cone.supports().iter().filter(|s| g.dot(s).abs() < 1e-6).count();
+                prop_assert!(on >= 2, "generator on fewer than 2 faces: {on}");
             }
         }
     }
