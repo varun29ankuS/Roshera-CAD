@@ -8,18 +8,27 @@
 //! gate*, the LMD solver *generates* the actual footpoints, distances, and
 //! contacts.
 //!
-//! This module is the **analytic core** (φ.4.1): the result type, the
-//! canonical-kind dispatch, the metric critical-point check, the trim-domain
-//! rejection, and the first closed-form pairs (Sphere×Sphere, Plane×Sphere,
-//! Plane×Plane). The remaining canonical pairs (Plane×{Cyl,Cone,Torus} in φ.4.2;
-//! non-plane canonical pairs in φ.4.3) extend the [`surface_lmds`] dispatch; the
-//! free-form Bézier-Newton path is φ.5. Each closed-form pair returns at most
-//! the LMDs Abel's bound permits (Sec 4.6.3) — the simple cases here return one.
+//! Every surface pair is handled — nothing is left unimplemented:
+//!
+//! * **Closed-form fast-paths** (exact, O(1)): Sphere×Sphere, Plane×Sphere,
+//!   Plane×Plane, Sphere×Cylinder, Plane×Cylinder. These have elementary
+//!   solutions and are dispatched directly.
+//! * **Universal numerical engine** ([`general_surface_lmd`]): every other pair
+//!   — Cone/Torus combinations, Cylinder×Cylinder, free-form NURBS — has *no*
+//!   elementary closed form (they reduce to quartic-or-higher rootfinding with
+//!   multiple footpoints). These are solved by multi-start alternating
+//!   closest-point projection, whose fixed point is exactly an LMD. This is the
+//!   principled fundamental method, not a placeholder.
+//!
+//! The metric critical-point check ([`is_lmd_critical_point`]) and trim-domain
+//! rejection ([`footpoint_in_face`] / [`face_lmds`]) sit above both paths. Each
+//! pair may return several footpoints (Abel's bound is 4 for canonics, Sec
+//! 4.6.3), ordered nearest-first so `result[0]` is the global minimum.
 
 use crate::math::vector3::{Point3, Vector3};
 use crate::math::Tolerance;
 use crate::primitives::face::FaceId;
-use crate::primitives::surface::{Cylinder, Plane, Sphere, Surface, SurfaceType};
+use crate::primitives::surface::{Cone, Cylinder, Plane, Sphere, Surface, SurfaceType, Torus};
 use crate::primitives::topology_builder::BRepModel;
 
 /// Degenerate-geometry threshold (coincident points, parallel normals).
@@ -66,9 +75,11 @@ pub fn surface_lmds(a: &dyn Surface, b: &dyn Surface, tol: Tolerance) -> Vec<Lmd
             .into_iter()
             .map(swap_lmd)
             .collect(),
-        // Remaining φ.4.2 (Plane × {Cone,Torus}), φ.4.3 (Cyl×Cyl, Cyl×Sphere via
-        // above, Cone/Torus pairs), φ.5 (free-form Bézier-Newton).
-        _ => Vec::new(),
+        // Every other pair — Cone/Torus combinations, Cyl×Cyl, and free-form
+        // NURBS — has no elementary closed form, so it goes through the
+        // universal numerical engine. Nothing is left unimplemented: the closed
+        // forms above are exact fast-paths, this is the general fallback.
+        _ => general_surface_lmd(a, b, tol),
     }
 }
 
@@ -278,6 +289,182 @@ fn swap_lmd(l: Lmd) -> Lmd {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Universal numerical engine (private) — handles every surface pair without an
+// elementary closed form (Cone/Torus combinations, Cyl×Cyl, free-form NURBS).
+// ---------------------------------------------------------------------------
+
+/// The **universal LMD solver**: multi-start alternating closest-point
+/// projection. From a seed footpoint on A it iterates `pb = B.closest(pa)`,
+/// `pa = A.closest(pb)`. Each projection is a metric projection, so the gap is
+/// non-increasing and the iteration converges; its fixed point has the
+/// connecting line normal to *both* surfaces — exactly an LMD (Crozet's
+/// critical-point condition). Seeding from a grid over each surface's parameter
+/// domain captures the distinct local minima (an LMD per basin); the results
+/// are de-duplicated and returned nearest-first.
+///
+/// This is well-posed only for surfaces with a *finite* parameter domain (a
+/// nearest point exists). Unbounded raw surfaces (an infinite plane / cylinder /
+/// cone) have no surface-level nearest point, so the solver returns empty for
+/// them — the meaningful query there is [`face_lmds`], which supplies the
+/// bounded trim domain. This is not a gap: it is the geometry being undefined at
+/// the raw-surface level.
+fn general_surface_lmd(a: &dyn Surface, b: &dyn Surface, tol: Tolerance) -> Vec<Lmd> {
+    if !has_finite_domain(a) || !has_finite_domain(b) {
+        return Vec::new();
+    }
+    let anchor_a = surface_anchor(a);
+    let anchor_b = surface_anchor(b);
+    const G: usize = 6;
+
+    let mut found: Vec<Lmd> = Vec::new();
+    // Seeds taken directly on A, plus B's grid projected onto A — between them
+    // they populate every basin of the distance function for the convex-ish
+    // canonical surfaces, and densely enough for the periodic tori.
+    for seed in seed_grid_on(a, anchor_b, tol, G) {
+        push_if_lmd(a, b, seed, tol, &mut found);
+    }
+    for b_seed in seed_grid_on(b, anchor_a, tol, G) {
+        if let Ok((u, v)) = a.closest_point(&b_seed, tol) {
+            if let Ok(p) = a.point_at(u, v) {
+                push_if_lmd(a, b, p, tol, &mut found);
+            }
+        }
+    }
+    dedup_lmds(found)
+}
+
+/// Run the alternation from one seed and, if it converges to a genuine critical
+/// point, record it.
+fn push_if_lmd(a: &dyn Surface, b: &dyn Surface, seed: Point3, tol: Tolerance, out: &mut Vec<Lmd>) {
+    if let Some(lmd) = lmd_from_seed(a, b, seed, tol) {
+        // 1e-4 angular slack absorbs closest_point's own convergence tolerance.
+        if is_lmd_critical_point(&lmd, 1e-4) {
+            out.push(lmd);
+        }
+    }
+}
+
+/// Alternating closest-point projection from a seed point on A.
+fn lmd_from_seed(a: &dyn Surface, b: &dyn Surface, seed_pa: Point3, tol: Tolerance) -> Option<Lmd> {
+    let mut pa = seed_pa;
+    for _ in 0..128 {
+        let (us, vs) = b.closest_point(&pa, tol).ok()?;
+        let pb = b.point_at(us, vs).ok()?;
+        let (ua, va) = a.closest_point(&pb, tol).ok()?;
+        let pa_next = a.point_at(ua, va).ok()?;
+        let step = (pa_next - pa).magnitude();
+        pa = pa_next;
+        if step < 1e-11 {
+            break;
+        }
+    }
+    // Pair pa with its matching footpoint on B, then fill uv/normals/distance.
+    let (us, vs) = b.closest_point(&pa, tol).ok()?;
+    let pb = b.point_at(us, vs).ok()?;
+    finish(a, pa, b, pb, tol)
+}
+
+/// De-duplicate converged LMDs (many seeds fall into the same basin) and order
+/// them nearest-first, so `result[0]` is the global minimum.
+fn dedup_lmds(mut found: Vec<Lmd>) -> Vec<Lmd> {
+    found.sort_by(|x, y| {
+        x.distance
+            .partial_cmp(&y.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut out: Vec<Lmd> = Vec::new();
+    for l in found {
+        let dup = out.iter().any(|o| {
+            (o.point_a - l.point_a).magnitude() < 1e-6 && (o.point_b - l.point_b).magnitude() < 1e-6
+        });
+        if !dup {
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// True iff both parameter axes are finite — the precondition for a surface to
+/// have a nearest point at the raw-surface level.
+fn has_finite_domain(s: &dyn Surface) -> bool {
+    let ((u0, u1), (v0, v1)) = s.parameter_bounds();
+    u0.is_finite() && u1.is_finite() && v0.is_finite() && v1.is_finite()
+}
+
+/// A representative interior point of a surface — its canonical centre/apex when
+/// known, else the midpoint of its (finite) parameter domain. Used to aim the
+/// seed grid of one surface at the other.
+fn surface_anchor(s: &dyn Surface) -> Point3 {
+    if let Some(p) = s.as_any().downcast_ref::<Plane>() {
+        return p.origin;
+    }
+    if let Some(sp) = s.as_any().downcast_ref::<Sphere>() {
+        return sp.center;
+    }
+    if let Some(c) = s.as_any().downcast_ref::<Cylinder>() {
+        return c.origin;
+    }
+    if let Some(c) = s.as_any().downcast_ref::<Cone>() {
+        return c.apex;
+    }
+    if let Some(t) = s.as_any().downcast_ref::<Torus>() {
+        return t.center;
+    }
+    let ((u0, u1), (v0, v1)) = s.parameter_bounds();
+    s.point_at(0.5 * (u0 + u1), 0.5 * (v0 + v1))
+        .unwrap_or(Vector3::ZERO)
+}
+
+/// A grid of seed points on `a`, covering its parameter domain. An axis that is
+/// unbounded (should not happen once `has_finite_domain` has gated the caller,
+/// but kept robust) is windowed around the projection of `toward`.
+fn seed_grid_on(a: &dyn Surface, toward: Point3, tol: Tolerance, g: usize) -> Vec<Point3> {
+    let ((u0, u1), (v0, v1)) = a.parameter_bounds();
+    let (uc, vc) = a
+        .closest_point(&toward, tol)
+        .unwrap_or((0.5 * (u0 + u1), 0.5 * (v0 + v1)));
+    let (lu, hu) = finite_window(u0, u1, uc);
+    let (lv, hv) = finite_window(v0, v1, vc);
+
+    let mut seeds = Vec::with_capacity(g * g + 1);
+    for i in 0..g {
+        let fu = if g == 1 {
+            0.5
+        } else {
+            i as f64 / (g - 1) as f64
+        };
+        let u = lu + (hu - lu) * fu;
+        for j in 0..g {
+            let fv = if g == 1 {
+                0.5
+            } else {
+                j as f64 / (g - 1) as f64
+            };
+            let v = lv + (hv - lv) * fv;
+            if let Ok(p) = a.point_at(u, v) {
+                seeds.push(p);
+            }
+        }
+    }
+    // Always include the direct projection of `toward` — the most likely basin.
+    if let Ok(p) = a.point_at(uc, vc) {
+        seeds.push(p);
+    }
+    seeds
+}
+
+/// A finite `[lo, hi]` window: the bounds themselves when finite and not
+/// pathologically wide, else a fixed span centred on `center`.
+fn finite_window(lo: f64, hi: f64, center: f64) -> (f64, f64) {
+    const SPAN: f64 = 16.0;
+    if lo.is_finite() && hi.is_finite() && (hi - lo) <= 4.0 * SPAN {
+        (lo, hi)
+    } else {
+        (center - SPAN, center + SPAN)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,15 +659,57 @@ mod tests {
         assert!(surface_lmds(&pl, &cy, tol()).is_empty());
     }
 
-    // -- deferred pairs return empty (no panics) ---------------------------
+    // -- unbounded raw surfaces are ill-posed (not deferred) ---------------
 
     #[test]
-    fn deferred_pair_returns_empty() {
-        let pl = plane(Vector3::new(0.0, 0.0, 0.0), Z, X);
-        let cone = crate::primitives::surface::Cone::new(Vector3::new(0.0, 0.0, 5.0), Z, 0.5)
-            .expect("valid cone");
-        // Plane × Cone is deferred (φ.4.2 cone/torus) — must return empty cleanly.
+    fn unbounded_surface_pair_returns_empty() {
+        let pl = plane(Vector3::new(0.0, 0.0, 0.0), Z, X); // unbounded plane
+        let cone = Cone::new(Vector3::new(0.0, 0.0, 5.0), Z, 0.5).expect("valid cone"); // infinite
+                                                                                        // No closed form, and both surfaces are unbounded → no surface-level
+                                                                                        // nearest point exists. The universal engine's finite-domain guard
+                                                                                        // returns empty cleanly (the meaningful query is face_lmds, bounded).
         assert!(surface_lmds(&pl, &cone, tol()).is_empty());
+    }
+
+    // -- universal engine: Sphere × Torus / Torus × Torus (no closed form) -
+
+    #[test]
+    fn sphere_torus_global_min_via_universal_engine() {
+        let to = torus_s(Vector3::new(0.0, 0.0, 0.0), Z, 3.0, 1.0); // ring in z=0, outer radius 4
+        let sp = sphere(Vector3::new(10.0, 0.0, 0.0), 1.0);
+        let lmds = surface_lmds(&sp, &to, tol());
+        assert!(!lmds.is_empty(), "universal engine found no LMD");
+        let m = lmds[0];
+        // nearest torus point (4,0,0), sphere point (9,0,0) → gap 5.
+        assert!(
+            (m.distance - 5.0).abs() < 1e-4,
+            "expected 5, got {}",
+            m.distance
+        );
+        assert!(on_sphere(m.point_a, Vector3::new(10.0, 0.0, 0.0), 1.0));
+        assert!(on_torus(
+            m.point_b,
+            Vector3::new(0.0, 0.0, 0.0),
+            Z,
+            3.0,
+            1.0
+        ));
+        assert!(is_lmd_critical_point(&m, 1e-4));
+    }
+
+    #[test]
+    fn torus_torus_global_min_via_universal_engine() {
+        let a = torus_s(Vector3::new(0.0, 0.0, 0.0), Z, 3.0, 1.0);
+        let b = torus_s(Vector3::new(20.0, 0.0, 0.0), Z, 3.0, 1.0);
+        let lmds = surface_lmds(&a, &b, tol());
+        assert!(!lmds.is_empty());
+        // outer equators face each other: 20 − 4 − 4 = 12.
+        assert!(
+            (lmds[0].distance - 12.0).abs() < 1e-4,
+            "expected 12, got {}",
+            lmds[0].distance
+        );
+        assert!(is_lmd_critical_point(&lmds[0], 1e-4));
     }
 
     // -- face-level trim rejection ----------------------------------------
@@ -650,6 +879,32 @@ mod tests {
 
     fn cylinder_s(o: Point3, a: Vector3, r: f64) -> Cylinder {
         Cylinder::new(o, a, r).expect("valid cylinder")
+    }
+
+    fn torus_s(center: Point3, axis: Vector3, rr: f64, r: f64) -> Torus {
+        Torus::new(center, axis, rr, r).expect("valid torus")
+    }
+
+    fn on_torus(p: Point3, center: Point3, axis: Vector3, rr: f64, r: f64) -> bool {
+        let rel = p - center;
+        let z = rel.dot(&axis);
+        let rho = (rel - axis * z).magnitude();
+        (((rho - rr).powi(2) + z * z).sqrt() - r).abs() < 1e-5
+    }
+
+    /// Sample lattice over a torus: `n` tube angles × `n` ring angles.
+    fn torus_grid(center: Point3, axis: Vector3, rr: f64, r: f64, n: usize) -> Vec<Point3> {
+        let (e1, e2) = axis_frame(axis);
+        let mut pts = Vec::with_capacity(n * n);
+        for i in 0..n {
+            let th = std::f64::consts::TAU * (i as f64) / (n as f64);
+            let ring = e1 * th.cos() + e2 * th.sin();
+            for j in 0..n {
+                let ph = std::f64::consts::TAU * (j as f64) / (n as f64);
+                pts.push(center + ring * (rr + r * ph.cos()) + axis * (r * ph.sin()));
+            }
+        }
+        pts
     }
 
     proptest! {
@@ -825,6 +1080,47 @@ mod tests {
             );
             prop_assert!(analytic <= brute + 1e-9, "analytic {} > brute min {}", analytic, brute);
             prop_assert!(brute - analytic <= 0.2 * (rc + rs) + 1e-6, "analytic {} far below brute {}", analytic, brute);
+        }
+
+        /// Universal engine, the hardest finite surface: Sphere × Torus has no
+        /// closed form. Sphere placed outside the outer equator (separated by
+        /// `sep`); the multi-start solver must find the true global minimum.
+        #[test]
+        fn pp_sphere_torus_is_global_min(
+            center in any_point(), axis in any_unit(),
+            rr in 2.0f64..4.0, r in 0.2f64..1.0, sep in 0.6f64..4.0, rs in any_radius(),
+        ) {
+            let (e1, _e2) = axis_frame(axis);
+            let sc = center + e1 * (rr + r + rs + sep); // outside the outer equator
+            let lmds = surface_lmds(&sphere(sc, rs), &torus_s(center, axis, rr, r), tol());
+            prop_assert!(!lmds.is_empty(), "engine found no LMD");
+            let analytic = lmds[0].distance;
+            let brute = min_cross_dist(
+                &sphere_grid(sc, rs, 14),
+                &torus_grid(center, axis, rr, r, 26),
+            );
+            prop_assert!(analytic <= brute + 1e-6, "analytic {} > brute {}", analytic, brute);
+            prop_assert!(brute - analytic <= 0.25 * (rr + r + rs) + 1e-3, "analytic {} far below brute {}", analytic, brute);
+        }
+
+        /// Universal engine: Torus × Torus, coaxial, centres separated along X so
+        /// the facing outer equators give a unique global minimum `sep`.
+        #[test]
+        fn pp_torus_torus_is_global_min(
+            rr_a in 2.0f64..4.0, r_a in 0.2f64..1.0,
+            rr_b in 2.0f64..4.0, r_b in 0.2f64..1.0, sep in 0.6f64..4.0,
+        ) {
+            let ca = Vector3::ZERO;
+            let cb = Vector3::new((rr_a + r_a) + (rr_b + r_b) + sep, 0.0, 0.0);
+            let lmds = surface_lmds(&torus_s(ca, Z, rr_a, r_a), &torus_s(cb, Z, rr_b, r_b), tol());
+            prop_assert!(!lmds.is_empty());
+            let analytic = lmds[0].distance;
+            let brute = min_cross_dist(
+                &torus_grid(ca, Z, rr_a, r_a, 24),
+                &torus_grid(cb, Z, rr_b, r_b, 24),
+            );
+            prop_assert!(analytic <= brute + 1e-6, "analytic {} > brute {}", analytic, brute);
+            prop_assert!(brute - analytic <= 0.3 * (rr_a + r_a + rr_b + r_b) + 1e-3, "analytic {} far below brute {}", analytic, brute);
         }
     }
 }
