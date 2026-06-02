@@ -3608,11 +3608,24 @@ fn compute_split_face_interior_points(
     // outside every child polygon.
     let nudge_fractions = [0.05f64, 0.1, 0.2, 0.35, 0.5];
     for i in 0..n {
-        if children[i].is_empty() {
-            continue;
-        }
         let poly_i = &loop_vertices_2d[i];
         let (cx, cy) = loop_centroids_2d[i];
+
+        // Correct the interior point when the naive boundary centroid is a bad
+        // classify sample. Two cases:
+        //   * the loop encloses a sibling hole (children) — annular face; the
+        //     centroid can land inside the hole;
+        //   * the loop is NON-CONVEX and its own centroid falls OUTSIDE it (a
+        //     concave "notch"). This is the rotated-box intersection bug (#34):
+        //     cutting a wedge out of a cap leaves a notched remainder whose
+        //     boundary centroid lands in the notch — which sits inside the
+        //     OTHER solid — so the straddling fragment classified OnBoundary and
+        //     was wrongly kept, over-including the part outside the other solid.
+        // A convex loop with an interior centroid needs no correction.
+        let centroid_inside = point_in_polygon_2d(cx, cy, poly_i);
+        if children[i].is_empty() && centroid_inside {
+            continue;
+        }
         let n_edges = poly_i.len();
         let mut found: Option<(f64, f64)> = None;
         'outer: for &f_nudge in &nudge_fractions {
