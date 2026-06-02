@@ -100,16 +100,158 @@ pub fn gaussian_elimination(
     Ok(x)
 }
 
-/// Solve the (possibly over-determined) least-squares problem
-/// `min ||J x + e||` via the normal equations `J^T J x = -J^T e`.
+/// Solve the linear least-squares problem `min ‖A x − b‖₂` for a square or
+/// over-determined system (`rows ≥ cols`) by **Householder QR**.
 ///
-/// Returns the update vector `x` of length `cols(J)`. When `J` has more
-/// columns than rows the system is under-determined and the returned vector
-/// is the minimum-residual solution to the normal equations — caller must
-/// regularize if a unique solution is required.
+/// This is numerically superior to forming the normal equations `AᵀA x = Aᵀb`:
+/// QR factors `A` directly, so it does **not** square the condition number the
+/// way `AᵀA` does. For a Jacobian of condition number κ, the normal-equations
+/// solution loses ≈ 2·log₁₀κ digits while QR loses only ≈ log₁₀κ — the
+/// difference between a usable and a garbage update on a stiff sketch/blend
+/// Jacobian (and `AᵀA` can be numerically singular when `A` is merely
+/// ill-conditioned).
+///
+/// `a` (`rows × cols`, `rows ≥ cols`) and `b` (length `rows`) are consumed.
+/// Returns `x` of length `cols`.
+///
+/// # Method
+/// For each column `k`, a Householder reflector `H = I − 2 v vᵀ / (vᵀv)` zeroes
+/// `A[k+1.., k]` and is applied to the trailing columns and to `b`. After the
+/// sweep `A[0..cols]` is the upper-triangular factor `R` and `b[0..cols]` holds
+/// the relevant part of `Qᵀb`; back-substitution on `R` yields `x`. The
+/// reflector sign is chosen to avoid cancellation. `Q` is never formed.
 ///
 /// # Errors
-/// * [`MathError::SingularMatrix`] if `J^T J` is singular.
+/// * [`MathError::DimensionMismatch`] if shapes disagree or `rows < cols`.
+/// * [`MathError::SingularMatrix`] if `A` is rank-deficient (a pivot column has
+///   sub-`tolerance.distance()` norm).
+///
+/// # References
+/// Golub & Van Loan, *Matrix Computations* (4th ed.), §5.2 (Householder QR),
+/// §5.3.2 (full-rank LSQ via QR).
+pub fn householder_qr_solve(
+    mut a: Vec<Vec<f64>>,
+    mut b: Vec<f64>,
+    tolerance: Tolerance,
+) -> MathResult<Vec<f64>> {
+    let rows = a.len();
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+    if b.len() != rows {
+        return Err(MathError::DimensionMismatch {
+            expected: rows,
+            actual: b.len(),
+        });
+    }
+    let cols = a[0].len();
+    for row in &a {
+        if row.len() != cols {
+            return Err(MathError::DimensionMismatch {
+                expected: cols,
+                actual: row.len(),
+            });
+        }
+    }
+    if cols == 0 {
+        return Ok(Vec::new());
+    }
+    if rows < cols {
+        // Under-determined: QR on A does not give the minimum-norm solution.
+        return Err(MathError::DimensionMismatch {
+            expected: cols,
+            actual: rows,
+        });
+    }
+
+    let tol = tolerance.distance();
+
+    for k in 0..cols {
+        // ‖A[k.., k]‖ — the magnitude of the resulting R[k][k].
+        let mut norm_sq = 0.0_f64;
+        for i in k..rows {
+            norm_sq += a[i][k] * a[i][k];
+        }
+        let norm = norm_sq.sqrt();
+        if norm < tol {
+            // Pivot column adds no independent direction → rank-deficient.
+            return Err(MathError::SingularMatrix);
+        }
+        // Sign chosen so v[k] grows in magnitude (avoids cancellation).
+        let alpha = if a[k][k] >= 0.0 { -norm } else { norm };
+
+        // Householder vector v: v[k] = A[k][k] − alpha, v[i>k] = A[i][k].
+        let mut v = vec![0.0_f64; rows];
+        v[k] = a[k][k] - alpha;
+        for i in (k + 1)..rows {
+            v[i] = a[i][k];
+        }
+        let mut vtv = 0.0_f64;
+        for i in k..rows {
+            vtv += v[i] * v[i];
+        }
+        if vtv <= 0.0 {
+            // Unreachable once norm ≥ tol (v[k] = A[k][k] − alpha is then ≠ 0),
+            // but guard the division defensively.
+            continue;
+        }
+
+        // Apply H to the trailing columns of A.
+        for j in k..cols {
+            let mut s = 0.0_f64;
+            for i in k..rows {
+                s += v[i] * a[i][j];
+            }
+            let beta = 2.0 * s / vtv;
+            for i in k..rows {
+                a[i][j] -= beta * v[i];
+            }
+        }
+        // Apply the same reflection to b.
+        let mut s = 0.0_f64;
+        for i in k..rows {
+            s += v[i] * b[i];
+        }
+        let beta = 2.0 * s / vtv;
+        for i in k..rows {
+            b[i] -= beta * v[i];
+        }
+    }
+
+    // Back-substitute R x = (Qᵀb)[0..cols].
+    let mut x = vec![0.0_f64; cols];
+    for i in (0..cols).rev() {
+        let diag = a[i][i];
+        if diag.abs() < tol {
+            return Err(MathError::SingularMatrix);
+        }
+        let mut sum = b[i];
+        for j in (i + 1)..cols {
+            sum -= a[i][j] * x[j];
+        }
+        x[i] = sum / diag;
+    }
+    Ok(x)
+}
+
+/// Solve the (possibly over-determined) least-squares problem
+/// `min ||J x + e||` (i.e. `J x ≈ -e`).
+///
+/// Returns the update vector `x` of length `cols(J)`.
+///
+/// * **Square / over-determined (`rows ≥ cols`)** — the Gauss-Newton case —
+///   is solved by [`householder_qr_solve`] directly on `J`. This is the
+///   accuracy-critical path and QR avoids the condition-number squaring of the
+///   normal equations.
+/// * **Under-determined (`rows < cols`)** falls back to the normal equations
+///   `JᵀJ x = -Jᵀe`. Note `JᵀJ` is `cols × cols` with rank ≤ `rows < cols`, so
+///   it is necessarily singular and this path returns [`MathError::SingularMatrix`]
+///   — the minimum-norm solution requires the SVD pseudo-inverse (forthcoming).
+///   Callers needing the under-determined case should regularize the system.
+///
+/// # Errors
+/// * [`MathError::SingularMatrix`] if `J` (over-determined) is rank-deficient
+///   or `JᵀJ` (under-determined) is singular.
 /// * [`MathError::DimensionMismatch`] if row counts disagree between `J` and
 ///   `e`.
 pub fn solve_least_squares(
@@ -140,7 +282,14 @@ pub fn solve_least_squares(
         }
     }
 
-    // Normal equations: A = J^T J, b = -J^T e.
+    // Over-determined / square: solve J x ≈ -e by Householder QR directly on J
+    // (no condition-number squaring).
+    if m >= n {
+        let b: Vec<f64> = errors.iter().map(|&e| -e).collect();
+        return householder_qr_solve(jacobian.to_vec(), b, tolerance);
+    }
+
+    // Under-determined fallback — normal equations: A = J^T J, b = -J^T e.
     let mut ata = vec![vec![0.0_f64; n]; n];
     for i in 0..n {
         for j in 0..n {
@@ -224,10 +373,98 @@ mod tests {
     #[test]
     fn lsq_over_determined() {
         // J = [[1],[1],[1]], e = [-1,-2,-3] -> min ||1·x + [-1,-2,-3]||
-        // Normal equations: 3x = 1+2+3 -> x = 2
+        // x = 2 (now solved via the Householder-QR path, since rows >= cols).
         let j = vec![vec![1.0], vec![1.0], vec![1.0]];
         let e = vec![-1.0, -2.0, -3.0];
         let x = solve_least_squares(&j, &e, STRICT_TOLERANCE).expect("lsq");
         assert!((x[0] - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn qr_square_matches_gaussian() {
+        // A square system solved via QR must match Gaussian elimination.
+        let a = vec![
+            vec![2.0, 1.0, 1.0],
+            vec![1.0, 3.0, 2.0],
+            vec![1.0, 0.0, 0.0],
+        ];
+        let b = vec![4.0, 5.0, 1.0];
+        let xq = householder_qr_solve(a.clone(), b.clone(), STRICT_TOLERANCE).expect("qr");
+        let xg = gaussian_elimination(a, b, STRICT_TOLERANCE).expect("gauss");
+        for (q, g) in xq.iter().zip(xg.iter()) {
+            assert!((q - g).abs() < 1e-9, "QR {q} vs Gaussian {g}");
+        }
+    }
+
+    #[test]
+    fn qr_over_determined_line_fit() {
+        // Fit y = a + b·x to exactly-collinear points (a=1, b=2): residual 0.
+        // Columns: [1, x]. Points x=0,1,2,3 → y=1,3,5,7.
+        let a = vec![
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+            vec![1.0, 2.0],
+            vec![1.0, 3.0],
+        ];
+        let b = vec![1.0, 3.0, 5.0, 7.0];
+        let x = householder_qr_solve(a, b, STRICT_TOLERANCE).expect("line fit");
+        assert!((x[0] - 1.0).abs() < 1e-10, "intercept {}", x[0]);
+        assert!((x[1] - 2.0).abs() < 1e-10, "slope {}", x[1]);
+    }
+
+    #[test]
+    fn qr_beats_normal_equations_on_ill_conditioned() {
+        // Läuchli matrix: A = [[1,1],[ε,0],[0,ε]] with ε so small that the
+        // normal-equations Gram matrix AᵀA = [[1+ε²,1],[1,1+ε²]] rounds to the
+        // SINGULAR [[1,1],[1,1]] in f64 (1+ε² == 1 when ε² < ½ ulp). True LSQ
+        // solution for b = A·[1,1]ᵀ = [2,ε,ε] is x = [1,1].
+        let eps = 1e-9_f64; // ε² = 1e-18 ≪ machine eps ⇒ 1+ε² == 1.0
+        let a = vec![vec![1.0, 1.0], vec![eps, 0.0], vec![0.0, eps]];
+        let b = vec![2.0, eps, eps];
+
+        // QR works directly on A and recovers x = [1,1].
+        let xq = householder_qr_solve(a.clone(), b.clone(), STRICT_TOLERANCE)
+            .expect("QR must solve the ill-conditioned full-rank system");
+        assert!((xq[0] - 1.0).abs() < 1e-4, "QR x0 {}", xq[0]);
+        assert!((xq[1] - 1.0).abs() < 1e-4, "QR x1 {}", xq[1]);
+
+        // The normal-equations Gram matrix is numerically singular: 1+ε² == 1.
+        let gram = vec![vec![1.0 + eps * eps, 1.0], vec![1.0, 1.0 + eps * eps]];
+        assert_eq!(gram[0][0], 1.0, "ε² must vanish in f64 for this test");
+        let normal_eq = gaussian_elimination(gram, vec![2.0 + eps * eps, 2.0], STRICT_TOLERANCE);
+        assert!(
+            matches!(normal_eq, Err(MathError::SingularMatrix)),
+            "normal equations should collapse to singular where QR succeeds"
+        );
+    }
+
+    #[test]
+    fn qr_rank_deficient_reported() {
+        // Column 2 = column 1 ⇒ rank 1 < 2 ⇒ SingularMatrix.
+        let a = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]];
+        let b = vec![1.0, 2.0, 3.0];
+        let err = householder_qr_solve(a, b, STRICT_TOLERANCE).expect_err("rank deficient");
+        assert!(matches!(err, MathError::SingularMatrix));
+    }
+
+    #[test]
+    fn qr_rejects_underdetermined() {
+        // rows < cols is not handled by QR-on-A.
+        let a = vec![vec![1.0, 2.0, 3.0]];
+        let b = vec![1.0];
+        let err = householder_qr_solve(a, b, STRICT_TOLERANCE).expect_err("under-determined");
+        assert!(matches!(err, MathError::DimensionMismatch { .. }));
+    }
+
+    #[test]
+    fn solve_least_squares_underdetermined_is_singular_pending_svd() {
+        // m < n: JᵀJ (n×n) has rank ≤ m < n, so it is singular and the
+        // normal-equations fallback reports SingularMatrix. The min-norm
+        // solution will come from the SVD pseudo-inverse (forthcoming).
+        let j = vec![vec![1.0, 1.0]];
+        let e = vec![-2.0];
+        let err = solve_least_squares(&j, &e, STRICT_TOLERANCE)
+            .expect_err("under-determined normal equations are singular");
+        assert!(matches!(err, MathError::SingularMatrix));
     }
 }
