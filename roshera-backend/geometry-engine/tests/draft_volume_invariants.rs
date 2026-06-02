@@ -1,18 +1,46 @@
-//! Watertightness + validity invariants for the draft operation.
+//! Volume + watertightness + validity invariants for the draft operation.
 //!
-//! Drafting tilts a face about a neutral plane by a pull angle. The exact
-//! volume change is convention-dependent (neutral plane, pull direction), but
-//! two things must always hold for a valid result: it must be watertight
-//! (tessellated divergence volume == reported mass-properties volume) and the
-//! volume must stay finite and positive. Draft currently has NO behavioural
-//! test coverage (the in-module test module is commented out), so even these
-//! basic invariants are net-new.
+//! Drafting tilts a face about a neutral plane by a pull angle. For the
+//! prismatic-planar case the kernel now drafts IN PLACE (shears the face's
+//! off-neutral vertices along the face normal by `distance·tanθ`), so:
+//!   * the result is a VALID MANIFOLD B-Rep (no boundary edges),
+//!   * it is watertight (tessellated divergence == reported mass-properties),
+//!   * drafting about the face's mid-plane is volume-neutral (the wedge added
+//!     above the neutral plane equals the wedge removed below), and
+//!   * drafting about an off-centre neutral plane changes the volume by the
+//!     wedge `tanθ · W · H²/2` (a clean analytic oracle).
+//!
+//! Draft had NO behavioural coverage before this (its in-module test module is
+//! commented out) — and the first version of these tests is what surfaced the
+//! original non-manifold bug (now fixed). The volume checks also guard against
+//! the operation silently no-op'ing.
 
+use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::operations::draft::NeutralElement;
 use geometry_engine::operations::{apply_draft, CommonOptions, DraftOptions};
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams, TriangleMesh};
+
+/// Largest x-coordinate over all vertices of the solid's outer shell — used to
+/// witness that draft actually deformed the geometry (not a silent no-op).
+fn max_x(model: &BRepModel, solid_id: SolidId) -> f64 {
+    let solid = model.solids.get(solid_id).expect("solid");
+    let shell = model.shells.get(solid.outer_shell).expect("shell");
+    let mut mx = f64::MIN;
+    for &face_id in &shell.faces {
+        let face = model.faces.get(face_id).expect("face");
+        let lp = model.loops.get(face.outer_loop).expect("loop");
+        for &eid in &lp.edges {
+            let e = model.edges.get(eid).expect("edge");
+            for vid in [e.start_vertex, e.end_vertex] {
+                mx = mx.max(model.vertices.get(vid).expect("v").position[0]);
+            }
+        }
+    }
+    mx
+}
 
 fn mesh_volume(mesh: &TriangleMesh) -> f64 {
     let mut v = 0.0;
@@ -73,15 +101,12 @@ fn rel_close(a: f64, b: f64, tol: f64) -> bool {
 #[test]
 fn draft_about_midplane_preserves_volume_and_is_watertight() {
     let (mut model, solid_id, face) = box_with_plus_x_face();
+    let mx_before = max_x(&model, solid_id);
     let opts = DraftOptions {
         common: CommonOptions {
-            // NOTE: validate_result is OFF here because draft currently leaves
-            // boundary edges on the drafted face (see the #[ignore]d
-            // `draft_produces_a_valid_manifold_brep` below for the tracked
-            // B-Rep bug). The GEOMETRY it produces is nonetheless mesh-
-            // watertight and volume-neutral, which is what this test pins;
-            // those checks are independent of the B-Rep validator.
-            validate_result: false,
+            // The in-place prismatic draft produces a valid manifold B-Rep, so
+            // full result validation is ON.
+            validate_result: true,
             ..Default::default()
         },
         ..Default::default()
@@ -100,7 +125,13 @@ fn draft_about_midplane_preserves_volume_and_is_watertight() {
         &TessellationParams::default(),
     ));
 
-    // Volume-neutral about the mid-plane.
+    // The draft must actually deform the solid — the +X face tilts, so its top
+    // corners push past x = 5 (guards against a silent no-op).
+    assert!(
+        max_x(&model, solid_id) > mx_before + 0.1,
+        "draft must deform the solid: max-x stayed at {mx_before}"
+    );
+    // Volume-neutral about the mid-plane (wedge added above = wedge removed below).
     assert!(
         rel_close(mass_vol, 1000.0, 0.01),
         "mid-plane draft of a symmetric box must preserve volume: {mass_vol} vs 1000"
@@ -109,6 +140,37 @@ fn draft_about_midplane_preserves_volume_and_is_watertight() {
     assert!(
         rel_close(tess_vol, mass_vol, 0.02),
         "drafted box not watertight: tess {tess_vol} vs mass-props {mass_vol}"
+    );
+}
+
+/// Drafting the +X face about a neutral plane at the BOTTOM (z = -5) tilts the
+/// whole face one way, so the volume changes by the analytic wedge
+/// `tanθ · W · H²/2` (W = 10 face width in y, H = 10 height). For the default
+/// 5° angle that is `tan5° · 10 · 100/2 ≈ 43.7`.
+#[test]
+fn draft_off_midplane_changes_volume_by_wedge_oracle() {
+    let (mut model, solid_id, face) = box_with_plus_x_face();
+    let angle = 5.0_f64.to_radians();
+    let opts = DraftOptions {
+        common: CommonOptions {
+            validate_result: true,
+            ..Default::default()
+        },
+        neutral: NeutralElement::Plane(Point3::new(0.0, 0.0, -5.0), Vector3::Z),
+        pull_direction: Vector3::Z,
+        ..Default::default()
+    };
+    apply_draft(&mut model, solid_id, vec![face], opts).expect("off-centre draft must succeed");
+
+    let vol = model
+        .mass_properties_for(solid_id)
+        .expect("mass props")
+        .volume;
+    let wedge = angle.tan() * 10.0 * 100.0 / 2.0; // tanθ · W · H²/2
+    let expected = 1000.0 + wedge; // +X face shears outward ⇒ volume grows
+    assert!(
+        rel_close(vol, expected, 0.03),
+        "off-centre draft volume {vol} vs wedge oracle {expected} (wedge {wedge})"
     );
 }
 
@@ -148,21 +210,15 @@ fn draft_result_is_watertight_and_finite() {
     );
 }
 
-// BUG REPRO (documented, not yet fixed) — discovered 2026-06-02 by this very
-// invariant. Draft had NO behavioural test coverage (its in-module test module
-// is commented out). Running it with `validate_result: true` shows that
-// `apply_draft` leaves the drafted solid non-manifold: the Standard validator
-// reports three BOUNDARY EDGES (single-use edges 13/14/15) on the drafted
-// face's loop. So draft's topology surgery tilts the face but never re-stitches
-// its new boundary edges to the adjacent faces — the adjacent faces still
-// reference the OLD edges, leaving the drafted face's new edges used only once.
-// This is the same single-use-edge / boundary-edge class as the torus, revolve
-// and loft bugs fixed earlier. The tessellated MESH is still closed (volume
-// neutral, watertight — see the two passing tests above), which is why nothing
-// caught it before. Tracked for a focused draft-restitch fix; un-ignore when
-// the drafted face's edges are shared with their neighbours.
+// REGRESSION GUARD (was a bug, now FIXED 2026-06-02). The first version of this
+// test surfaced that `apply_draft` left the drafted solid non-manifold — three
+// boundary edges (single-use edges) on the drafted face, because the legacy
+// path minted orphan geometry and never re-stitched neighbours (the explicit
+// `update_adjacent_faces_for_draft` stub). The fix drafts prismatic-planar
+// faces IN PLACE (shear the existing off-neutral vertices), so all shared
+// topology is preserved by construction — manifold with no boundary edges.
+// This test now PASSES; keep it as the guard that the in-place path stays valid.
 #[test]
-#[ignore = "draft leaves boundary edges on the drafted face (non-manifold B-Rep) — documented bug repro"]
 fn draft_produces_a_valid_manifold_brep() {
     let (mut model, solid_id, face) = box_with_plus_x_face();
     let opts = DraftOptions {
