@@ -24,7 +24,11 @@
 //! Slice 2 — cone **intersection** ([`PolyhedralCone::intersects`],
 //! [`PolyhedralCone::intersection`], [`PolyhedralCone::separating_plane`]) for
 //! feature-pair culling and the critical-point gate.
-//! Next — angular dilation by α, and planar (2-generator edge) cones.
+//! Slice 3 — conservative angular **dilation** ([`PolyhedralCone::dilate`]):
+//! the α-neighborhood over-approximation that makes a point-wise normal cone
+//! valid over a curved feature area.
+//! Next — planar (2-generator edge) cones, then the B-Rep bridge (tangent cones
+//! from a vertex/edge of a `BRepModel`) and the critical-point gate itself.
 //!
 //! # References
 //! Crozet, *Efficient contact determination between B-Rep solids*, §3.2–3.4;
@@ -191,6 +195,42 @@ impl PolyhedralCone {
             ConeIntersectionResult::Overlapping
         }
     }
+
+    /// Angularly dilate the cone by `half_angle` (radians) — the conservative
+    /// over-approximation of the α-neighborhood `{ d : angle(d, C) ≤ α }`.
+    ///
+    /// This is how a point-wise normal cone is made valid over a curved feature
+    /// *area*: `half_angle` bounds how far the surface normal can turn across
+    /// the patch, and the dilated cone contains every such normal.
+    ///
+    /// The α-neighborhood of a convex cone is the conic hull of the α-caps
+    /// around its generators, so each generator is ringed with `K` rays at
+    /// half-angle `α / cos(π/K)` — a polygon whose *inscribed* circle is exactly
+    /// `α`, guaranteeing the result **contains** the true α-neighborhood (it
+    /// never under-covers; over-covering is safe for culling). A wide enough
+    /// dilation becomes the full space.
+    pub fn dilate(&self, half_angle: f64) -> PolyhedralCone {
+        if half_angle <= CONE_EPS || self.is_full_space() || self.is_zero() {
+            return self.clone();
+        }
+        const K: usize = 8;
+        let alpha = half_angle.min(std::f64::consts::FRAC_PI_2 - CONE_EPS);
+        let circum = alpha / (std::f64::consts::PI / K as f64).cos();
+        let (cos_a, sin_a) = (circum.cos(), circum.sin());
+
+        let mut rim: Vec<Vector3> = Vec::with_capacity(self.generators.len() * (K + 1));
+        for g in &self.generators {
+            let e1 = unit_perp(*g);
+            let e2 = g.cross(&e1).normalize().unwrap_or(e1);
+            rim.push(*g);
+            for k in 0..K {
+                let phi = std::f64::consts::TAU * (k as f64) / (K as f64);
+                let radial = e1 * phi.cos() + e2 * phi.sin();
+                rim.push(*g * cos_a + radial * sin_a);
+            }
+        }
+        PolyhedralCone::from_generators(&rim)
+    }
 }
 
 /// Outcome of [`PolyhedralCone::intersects`].
@@ -242,6 +282,16 @@ fn dual_extreme_rays(vecs: &[Vector3]) -> Vec<Vector3> {
         }
     }
     rays
+}
+
+/// A unit vector perpendicular to `v` (`v` assumed nonzero/unit).
+fn unit_perp(v: Vector3) -> Vector3 {
+    let seed = if v.x.abs() < 0.9 {
+        Vector3::X
+    } else {
+        Vector3::Y
+    };
+    (seed - v * seed.dot(&v)).normalize().unwrap_or(Vector3::X)
 }
 
 /// Normalize each ray and drop near-duplicates and zeros.
@@ -1086,6 +1136,126 @@ mod tests {
                     ConeIntersectionResult::Overlapping,
                     "a sampled direction is in both but verdict is Disjoint"
                 );
+            }
+        }
+    }
+
+    // ===== slice 3: angular dilation =====================================
+
+    /// Rotate unit `v` by `theta` toward the perpendicular direction at angle
+    /// `phi` (in the plane perpendicular to `v`).
+    fn rotate(v: Vector3, phi: f64, theta: f64) -> Vector3 {
+        let e1 = super::unit_perp(v);
+        let e2 = v.cross(&e1).normalize().unwrap_or(e1);
+        let radial = e1 * phi.cos() + e2 * phi.sin();
+        v * theta.cos() + radial * theta.sin()
+    }
+
+    #[test]
+    fn dilate_by_zero_is_identity() {
+        let c = octant();
+        let d = c.dilate(0.0);
+        assert_eq!(d.supports().len(), c.supports().len());
+        assert!(d.contains(&Vector3::X) && !d.contains(&(-Vector3::X)));
+    }
+
+    #[test]
+    fn dilate_contains_original_generators() {
+        let c = octant();
+        let d = c.dilate(0.2);
+        for g in c.generators() {
+            assert!(d.contains(g), "dilated cone lost generator {g:?}");
+        }
+    }
+
+    #[test]
+    fn dilate_full_space_stays_full_space() {
+        assert!(PolyhedralCone::full_space().dilate(0.3).is_full_space());
+    }
+
+    #[test]
+    fn dilate_zero_cone_stays_zero() {
+        assert!(PolyhedralCone::from_generators(&[]).dilate(0.3).is_zero());
+    }
+
+    #[test]
+    fn dilate_widens_a_narrow_cone() {
+        // A narrow cone around +Z; a direction 0.1 rad off a generator is
+        // outside the original but inside the cone dilated by 0.3.
+        let c = PolyhedralCone::from_generators(&[
+            nrm(0.05, 0.0, 1.0),
+            nrm(-0.025, 0.043, 1.0),
+            nrm(-0.025, -0.043, 1.0),
+        ]);
+        let g = c.generators()[0];
+        let just_outside = rotate(g, 0.0, 0.1);
+        assert!(
+            !c.contains(&just_outside),
+            "should start outside the narrow cone"
+        );
+        assert!(
+            c.dilate(0.3).contains(&just_outside),
+            "dilation should admit it"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Dilation never drops an original generator.
+        #[test]
+        fn prop_dilate_contains_original(c in any_cone(), alpha in 0.0f64..0.5) {
+            let d = c.dilate(alpha);
+            for g in c.generators() {
+                prop_assert!(d.contains(g));
+            }
+        }
+
+        /// CONSERVATIVENESS: any generator rotated by θ ≤ α lands inside the
+        /// cone dilated by α. (The safety property — dilation never misses a
+        /// direction within α of the cone.)
+        #[test]
+        fn prop_dilate_is_conservative(
+            c in any_cone(),
+            alpha in 0.05f64..0.5,
+            gi in 0usize..8,
+            phi in 0.0f64..std::f64::consts::TAU,
+            frac in 0.0f64..1.0,
+        ) {
+            let g = c.generators()[gi % c.generators().len()];
+            let theta = alpha * frac; // θ ≤ α
+            let d = c.dilate(alpha);
+            prop_assert!(
+                d.contains(&rotate(g, phi, theta)),
+                "direction within α of a generator not in dilate(α)"
+            );
+        }
+
+        /// Conservativeness on an INTERIOR direction (a conic combination),
+        /// not just a generator.
+        #[test]
+        fn prop_dilate_conservative_interior(
+            c in any_cone(),
+            alpha in 0.05f64..0.4,
+            phi in 0.0f64..std::f64::consts::TAU,
+            frac in 0.0f64..1.0,
+        ) {
+            let g = c.generators();
+            let mut interior = Vector3::ZERO;
+            for r in g { interior = interior + *r; }
+            if interior.magnitude() < 1e-6 { return Ok(()); }
+            let interior = interior.normalize().unwrap();
+            let d = c.dilate(alpha);
+            prop_assert!(d.contains(&rotate(interior, phi, alpha * frac)));
+        }
+
+        /// Monotonicity: a smaller dilation is contained in a larger one.
+        #[test]
+        fn prop_dilate_monotone(c in any_cone(), a in 0.05f64..0.25, extra in 0.05f64..0.25) {
+            let small = c.dilate(a);
+            let large = c.dilate(a + extra);
+            for g in small.generators() {
+                prop_assert!(large.contains(g), "dilate(α) ⊄ dilate(β) for α<β");
             }
         }
     }
