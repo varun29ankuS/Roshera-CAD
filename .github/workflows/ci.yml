@@ -126,22 +126,16 @@ jobs:
       # See plans/steady-sauteeing-nova.md Phase 3 ("demos become regression
       # tests").
       #
-      # demo_extrude_revolve and demo_sweep_loft are TEMPORARILY EXCLUDED: each
-      # exposes a PRE-EXISTING kernel bug unrelated to any current change (the
-      # revolve and loft B-Rep construction paths are untouched). This demo step
-      # had NEVER run in CI before — it was skipped whenever earlier gates
-      # failed — so neither bug had ever been surfaced:
-      #   * revolve: a full 360° revolve of a rectangle profile builds a faceted
-      #     solid that fails validation (~8x duplicated vertices + boundary
-      #     edges + broken Euler V1020-E512+F128=636, expected 2) — the faceting
-      #     does not stitch shared vertices into a closed manifold.
-      #   * loft: a circle->square->circle loft fails validation with boundary
-      #     edges (non-manifold gaps between sections).
-      # NEEDS TRIAGE — re-add each demo once its operation produces a valid
-      # closed manifold. The other 5 demos remain a live regression gate.
+      # demo_sweep_loft is TEMPORARILY EXCLUDED: it exposes a PRE-EXISTING loft
+      # bug (a circle->square->circle loft fails validation with boundary edges —
+      # non-manifold gaps between sections). This demo step had NEVER run in CI
+      # before (it was skipped whenever earlier gates failed), so the bug was
+      # never surfaced. NEEDS TRIAGE — re-add once loft stitches a valid
+      # manifold. (demo_extrude_revolve was likewise broken and is now FIXED:
+      # revolve builds a watertight-topology grid, so it is back in the gate.)
       run: |
         set -e
-        for demo in demo_primitives demo_booleans \
+        for demo in demo_primitives demo_booleans demo_extrude_revolve \
                     demo_features demo_transforms demo_pattern_draft; do
           echo "==> $demo"
           cargo run --release --example "$demo" -p geometry-engine
