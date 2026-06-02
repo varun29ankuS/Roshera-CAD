@@ -45,6 +45,9 @@ pub mod linear_solver;
 // Thin SVD (one-sided Jacobi): rank, null-space, best-fit, min-norm LSQ
 pub mod svd;
 
+// Convex polyhedral cones in R³ — substrate for smooth-B-Rep contact determination
+pub mod polyhedral_cone;
+
 // Tensor-product Bézier patch evaluation for G2 blending surfaces
 pub mod bezier_patch;
 
