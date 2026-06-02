@@ -15,6 +15,7 @@
 use crate::harness::{AblationReport, StageMetric};
 use crate::math::bbox::BBox;
 use crate::math::vector3::Vector3;
+use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use crate::primitives::face::FaceId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
@@ -97,6 +98,101 @@ fn solid_face_ids(model: &BRepModel, solid_id: SolidId) -> Vec<FaceId> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Boolean CORRECTNESS harness — the algebraic invariants every boolean must
+// satisfy, checked by volume. This is the iron-clad core: a violation is a hard
+// over/under-inclusion bug, not a performance question.
+// ---------------------------------------------------------------------------
+
+/// Operand and result volumes of a boolean scene, plus a verdict on each
+/// algebraic law. A correct boolean satisfies all of them for *any* two solids.
+#[derive(Debug, Clone)]
+pub struct BooleanInvariants {
+    pub vol_a: Option<f64>,
+    pub vol_b: Option<f64>,
+    pub vol_union: Option<f64>,
+    pub vol_intersection: Option<f64>,
+    pub vol_difference: Option<f64>,
+    /// `V(A∪B) + V(A∩B) == V(A) + V(B)` — the master inclusion–exclusion law.
+    pub inclusion_exclusion: bool,
+    /// `V(A∖B) == V(A) − V(A∩B)`.
+    pub difference_consistent: bool,
+    /// `max(V(A),V(B)) ≤ V(A∪B) ≤ V(A) + V(B)`.
+    pub union_bounded: bool,
+    /// `0 ≤ V(A∩B) ≤ min(V(A),V(B))`.
+    pub intersection_bounded: bool,
+    /// Every invariant held and every volume was computable.
+    pub all_hold: bool,
+}
+
+/// Check the boolean algebraic invariants for a scene. `build` constructs the two
+/// operand solids in a fresh model; it is called once per measurement so a
+/// boolean that mutates its inputs cannot corrupt a later one. `rel_tol` is the
+/// relative volume tolerance.
+pub fn check_boolean_invariants<F>(build: F, rel_tol: f64) -> BooleanInvariants
+where
+    F: Fn(&mut BRepModel) -> Option<(SolidId, SolidId)>,
+{
+    let operand = |take_a: bool| -> Option<f64> {
+        let mut model = BRepModel::new();
+        let (a, b) = build(&mut model)?;
+        model.calculate_solid_volume(if take_a { a } else { b })
+    };
+    let run = |op: BooleanOp| -> Option<f64> {
+        let mut model = BRepModel::new();
+        let (a, b) = build(&mut model)?;
+        let result = boolean_operation(&mut model, a, b, op, BooleanOptions::default()).ok()?;
+        model.calculate_solid_volume(result)
+    };
+
+    let vol_a = operand(true);
+    let vol_b = operand(false);
+    let vol_union = run(BooleanOp::Union);
+    let vol_intersection = run(BooleanOp::Intersection);
+    let vol_difference = run(BooleanOp::Difference);
+
+    let inclusion_exclusion = match (vol_a, vol_b, vol_union, vol_intersection) {
+        (Some(a), Some(b), Some(u), Some(i)) => within_rel(u + i, a + b, rel_tol),
+        _ => false,
+    };
+    let difference_consistent = match (vol_a, vol_intersection, vol_difference) {
+        (Some(a), Some(i), Some(d)) => within_rel(d, a - i, rel_tol),
+        _ => false,
+    };
+    let union_bounded = match (vol_a, vol_b, vol_union) {
+        (Some(a), Some(b), Some(u)) => {
+            u >= a.max(b) * (1.0 - rel_tol) - 1e-9 && u <= (a + b) * (1.0 + rel_tol) + 1e-9
+        }
+        _ => false,
+    };
+    let intersection_bounded = match (vol_a, vol_b, vol_intersection) {
+        (Some(a), Some(b), Some(i)) => i >= -1e-9 && i <= a.min(b) * (1.0 + rel_tol) + 1e-9,
+        _ => false,
+    };
+    let all_hold =
+        inclusion_exclusion && difference_consistent && union_bounded && intersection_bounded;
+
+    BooleanInvariants {
+        vol_a,
+        vol_b,
+        vol_union,
+        vol_intersection,
+        vol_difference,
+        inclusion_exclusion,
+        difference_consistent,
+        union_bounded,
+        intersection_bounded,
+        all_hold,
+    }
+}
+
+/// Relative-difference check with a `max(_, 1.0)` floor against tiny-volume false
+/// alarms.
+fn within_rel(a: f64, b: f64, tol: f64) -> bool {
+    let scale = a.abs().max(b.abs()).max(1.0);
+    (a - b).abs() / scale <= tol
 }
 
 #[cfg(test)]
@@ -191,5 +287,173 @@ mod tests {
             report.stages[1].output, 0,
             "far apart → no overlapping face-pairs"
         );
+    }
+
+    // -- boolean correctness invariants (iron-clad) ------------------------
+
+    use crate::operations::transform::{rotate, translate};
+
+    fn make_box(model: &mut BRepModel, size: f64) -> Option<SolidId> {
+        TopologyBuilder::new(model)
+            .create_box_3d(size, size, size)
+            .ok()?;
+        model.solids.iter().last().map(|(id, _)| id)
+    }
+
+    /// Two `size³` boxes centred at the origin; B shifted `dx` along +X.
+    fn shifted_boxes(size: f64, dx: f64) -> impl Fn(&mut BRepModel) -> Option<(SolidId, SolidId)> {
+        move |m| {
+            let a = make_box(m, size)?;
+            let b = make_box(m, size)?;
+            if dx.abs() > 1e-9 {
+                translate(m, vec![b], X, dx, Default::default()).ok()?;
+            }
+            Some((a, b))
+        }
+    }
+
+    /// Two `size³` boxes centred at the origin; B rotated `angle` about +Z (still
+    /// concentric, so they overlap heavily — a rotated-intersection stress case).
+    fn rotated_boxes(
+        size: f64,
+        angle: f64,
+    ) -> impl Fn(&mut BRepModel) -> Option<(SolidId, SolidId)> {
+        move |m| {
+            let a = make_box(m, size)?;
+            let b = make_box(m, size)?;
+            rotate(
+                m,
+                vec![b],
+                Vector3::ZERO,
+                Vector3::Z,
+                angle,
+                Default::default(),
+            )
+            .ok()?;
+            Some((a, b))
+        }
+    }
+
+    #[test]
+    fn axis_aligned_partial_overlap_satisfies_all_invariants() {
+        // 4³ boxes, B shifted 2 along x → exactly half overlap.
+        let inv = check_boolean_invariants(shifted_boxes(4.0, 2.0), 1e-3);
+        assert!(inv.all_hold, "invariants violated: {inv:?}");
+        // Ground truth: V(A)=V(B)=64, overlap = 2·4·4 = 32, union = 96.
+        assert!(
+            (inv.vol_intersection.unwrap() - 32.0).abs() < 0.1,
+            "{inv:?}"
+        );
+        assert!((inv.vol_union.unwrap() - 96.0).abs() < 0.1, "{inv:?}");
+        assert!((inv.vol_difference.unwrap() - 32.0).abs() < 0.1, "{inv:?}");
+    }
+
+    #[test]
+    fn containment_satisfies_invariants() {
+        // Small box fully inside a big one: ∪ = big, ∩ = small.
+        let build = |m: &mut BRepModel| -> Option<(SolidId, SolidId)> {
+            let big = make_box(m, 10.0)?;
+            let small = make_box(m, 4.0)?;
+            Some((big, small))
+        };
+        let inv = check_boolean_invariants(build, 1e-3);
+        assert!(inv.all_hold, "{inv:?}");
+        assert!((inv.vol_union.unwrap() - 1000.0).abs() < 0.5, "{inv:?}");
+        assert!(
+            (inv.vol_intersection.unwrap() - 64.0).abs() < 0.5,
+            "{inv:?}"
+        );
+    }
+
+    /// B rotated about Z **and** shifted along +X so the overlap is a small,
+    /// non-axis-aligned sliver — the regime where intersection over-inclusion was
+    /// historically observed.
+    fn rotated_shifted_boxes(
+        size: f64,
+        angle: f64,
+        dx: f64,
+    ) -> impl Fn(&mut BRepModel) -> Option<(SolidId, SolidId)> {
+        move |m| {
+            let a = make_box(m, size)?;
+            let b = make_box(m, size)?;
+            rotate(
+                m,
+                vec![b],
+                Vector3::ZERO,
+                Vector3::Z,
+                angle,
+                Default::default(),
+            )
+            .ok()?;
+            translate(m, vec![b], X, dx, Default::default()).ok()?;
+            Some((a, b))
+        }
+    }
+
+    /// B rotated about a tilted (1,1,1) axis — fully 3D, no face stays
+    /// axis-aligned. The hardest face-split regime for the boolean.
+    fn tilted_rotated_boxes(
+        size: f64,
+        angle: f64,
+    ) -> impl Fn(&mut BRepModel) -> Option<(SolidId, SolidId)> {
+        move |m| {
+            let a = make_box(m, size)?;
+            let b = make_box(m, size)?;
+            let axis = Vector3::new(1.0, 1.0, 1.0).normalize().ok()?;
+            rotate(m, vec![b], Vector3::ZERO, axis, angle, Default::default()).ok()?;
+            Some((a, b))
+        }
+    }
+
+    #[test]
+    fn rotated_overlap_satisfies_inclusion_exclusion() {
+        // Two concentric 4³ boxes, B rotated 30° about Z. Whatever the
+        // intersection's exact shape, V(∪)+V(∩) must equal V(A)+V(B)=128.
+        let inv = check_boolean_invariants(rotated_boxes(4.0, std::f64::consts::PI / 6.0), 1e-2);
+        assert!(
+            inv.inclusion_exclusion,
+            "rotated inclusion-exclusion violated: {inv:?}"
+        );
+        assert!(inv.intersection_bounded, "rotated ∩ out of bounds: {inv:?}");
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+
+        /// Inclusion–exclusion holds for any axis-aligned partial overlap.
+        #[test]
+        fn pp_axis_aligned_inclusion_exclusion(dx in 0.5f64..3.5) {
+            let inv = check_boolean_invariants(shifted_boxes(4.0, dx), 1e-2);
+            prop_assert!(inv.inclusion_exclusion, "dx={dx}: {inv:?}");
+            prop_assert!(inv.difference_consistent, "dx={dx}: {inv:?}");
+        }
+
+        /// Inclusion–exclusion holds for any rotation of one operand. This is the
+        /// adversarial case that exercises non-axis-aligned face splits.
+        #[test]
+        fn pp_rotated_inclusion_exclusion(angle in 0.15f64..1.4) {
+            let inv = check_boolean_invariants(rotated_boxes(4.0, angle), 2e-2);
+            prop_assert!(inv.inclusion_exclusion, "angle={angle}: {inv:?}");
+        }
+
+        /// The hardest regime: B rotated AND shifted so the overlap is a small,
+        /// non-axis-aligned region. `dx ≤ 2` keeps the operands genuinely
+        /// overlapping (the rotated box's half-diagonal is ~2.83). This is the
+        /// configuration historically associated with intersection over-inclusion.
+        #[test]
+        fn pp_rotated_shifted_inclusion_exclusion(angle in 0.2f64..1.2, dx in 1.0f64..2.0) {
+            let inv = check_boolean_invariants(rotated_shifted_boxes(4.0, angle, dx), 3e-2);
+            prop_assert!(inv.inclusion_exclusion, "angle={angle} dx={dx}: {inv:?}");
+            prop_assert!(inv.intersection_bounded, "angle={angle} dx={dx}: {inv:?}");
+        }
+
+        /// Tilted-axis (fully 3D) rotation — no face stays axis-aligned.
+        #[test]
+        fn pp_tilted_rotation_inclusion_exclusion(angle in 0.2f64..1.2) {
+            let inv = check_boolean_invariants(tilted_rotated_boxes(4.0, angle), 3e-2);
+            prop_assert!(inv.inclusion_exclusion, "angle={angle}: {inv:?}");
+        }
     }
 }
