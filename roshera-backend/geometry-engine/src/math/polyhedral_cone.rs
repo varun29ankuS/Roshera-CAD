@@ -27,8 +27,11 @@
 //! Slice 3 — conservative angular **dilation** ([`PolyhedralCone::dilate`]):
 //! the α-neighborhood over-approximation that makes a point-wise normal cone
 //! valid over a curved feature area.
-//! Next — planar (2-generator edge) cones, then the B-Rep bridge (tangent cones
-//! from a vertex/edge of a `BRepModel`) and the critical-point gate itself.
+//! Slice 4 — **all ranks**: rank-1 ray cones (smooth-point normal cones) and
+//! rank-2 planar wedges (edge cones) join the rank-3 vertex cones, so
+//! `from_generators` is correct for every boundary feature.
+//! Next — the B-Rep bridge (tangent/normal cones from a vertex/edge of a
+//! `BRepModel`) and the critical-point gate itself.
 //!
 //! # References
 //! Crozet, *Efficient contact determination between B-Rep solids*, §3.2–3.4;
@@ -76,10 +79,29 @@ impl PolyhedralCone {
     /// are dropped.
     pub fn from_generators(rays: &[Vector3]) -> Self {
         let raw = normalize_dedup(rays);
+        // Rank 0 — the trivial {0} cone.
+        if raw.is_empty() {
+            return Self {
+                generators: Vec::new(),
+                supports: Vec::new(),
+            };
+        }
+        // Rank 1 — a single ray (smooth-surface-point normal cone).
+        if raw.len() == 1 {
+            return ray_cone(raw[0]);
+        }
+        // Rank 2 — all generators coplanar ⇒ a planar wedge (the edge-cone
+        // case). `dual_extreme_rays` cannot find a wedge's in-plane edge
+        // supports (coplanar generators' cross products are all the plane
+        // normal), so this case is handled explicitly.
+        if let Some(normal) = coplanar_normal(&raw) {
+            return planar_wedge(&raw, normal);
+        }
+        // Rank 3 — pointed / space-spanning cone (the vertex-cone case).
         let supports = dual_extreme_rays(&raw);
         // The extreme rays are determined by the faces; recovering them from
-        // the supports yields the minimal generator set. (When `supports` is
-        // empty the cone is the full space / degenerate — keep the raw rays.)
+        // the supports yields the minimal generator set. (Empty supports here
+        // ⇒ the generators positively span R³ ⇒ full space.)
         let generators = if supports.is_empty() {
             raw
         } else {
@@ -282,6 +304,98 @@ fn dual_extreme_rays(vecs: &[Vector3]) -> Vec<Vector3> {
         }
     }
     rays
+}
+
+/// The cone of a single ray `g` (rank 1). Its supports pin a direction to the
+/// ray: two orthonormal in-plane normals (forcing `x ⟂ g`) plus `−g` (forcing
+/// `x·g ≥ 0`). `contains(λg)` is true for `λ ≥ 0` only.
+fn ray_cone(g: Vector3) -> PolyhedralCone {
+    let a = unit_perp(g);
+    let b = g.cross(&a).normalize().unwrap_or(a);
+    PolyhedralCone {
+        generators: vec![g],
+        supports: vec![a, -a, b, -b, -g],
+    }
+}
+
+/// If every ray lies in a common plane through the origin, return that plane's
+/// unit normal; otherwise `None` (the rays span 3D, or are all parallel).
+fn coplanar_normal(gens: &[Vector3]) -> Option<Vector3> {
+    // The first non-parallel pair defines a candidate plane. If any generator
+    // lies off it, the set spans 3D (rank 3); otherwise they are coplanar.
+    for i in 0..gens.len() {
+        for j in (i + 1)..gens.len() {
+            if let Ok(n) = gens[i].cross(&gens[j]).normalize() {
+                if gens.iter().all(|g| g.dot(&n).abs() < CONE_EPS) {
+                    return Some(n);
+                }
+                return None; // an off-plane generator ⇒ rank 3
+            }
+        }
+    }
+    None // all parallel ⇒ rank ≤ 1 (handled elsewhere)
+}
+
+/// A planar wedge: the convex sector of coplanar rays (in the plane with unit
+/// normal `n`). Generators are the two angular extremes; supports are the two
+/// plane normals `±n` (pinning `x` into the plane) plus the two in-plane edge
+/// normals (pinning `x` to the sector).
+fn planar_wedge(gens: &[Vector3], n: Vector3) -> PolyhedralCone {
+    use std::f64::consts::{PI, TAU};
+    // Angle of each ray in an in-plane basis (u, v).
+    let u = gens[0];
+    let v = match n.cross(&u).normalize() {
+        Ok(v) => v,
+        Err(_) => return PolyhedralCone::from_generators(&[gens[0]]),
+    };
+    let mut ang: Vec<(f64, Vector3)> = gens
+        .iter()
+        .map(|g| (g.dot(&v).atan2(g.dot(&u)), *g))
+        .collect();
+    ang.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // The convex sector is the complement of the LARGEST circular gap; its
+    // bounding rays are the extremes.
+    let m = ang.len();
+    let (mut max_gap, mut gap_at) = (-1.0_f64, 0usize);
+    for i in 0..m {
+        let next = (i + 1) % m;
+        let mut gap = ang[next].0 - ang[i].0;
+        if next == 0 {
+            gap += TAU;
+        }
+        if gap > max_gap {
+            max_gap = gap;
+            gap_at = i;
+        }
+    }
+    let e_lo = ang[(gap_at + 1) % m].1; // ray just after the gap
+    let e_hi = ang[gap_at].1; // ray just before the gap
+
+    // If the rays span ≥ π the convex cone is a half-plane (or larger): fall
+    // back to just the plane constraints (a conservative over-approximation).
+    if max_gap <= PI + CONE_EPS {
+        return PolyhedralCone {
+            generators: gens.to_vec(),
+            supports: vec![n, -n],
+        };
+    }
+
+    // In-plane outward edge normals (pointing out of the sector).
+    let edge_support = |edge: Vector3, other: Vector3| -> Vector3 {
+        let c = n.cross(&edge).normalize().unwrap_or(edge);
+        if other.dot(&c) <= 0.0 {
+            c
+        } else {
+            -c
+        }
+    };
+    let s_lo = edge_support(e_lo, e_hi);
+    let s_hi = edge_support(e_hi, e_lo);
+    PolyhedralCone {
+        generators: vec![e_lo, e_hi],
+        supports: vec![n, -n, s_lo, s_hi],
+    }
 }
 
 /// A unit vector perpendicular to `v` (`v` assumed nonzero/unit).
@@ -1257,6 +1371,117 @@ mod tests {
             for g in small.generators() {
                 prop_assert!(large.contains(g), "dilate(α) ⊄ dilate(β) for α<β");
             }
+        }
+    }
+
+    // ===== slice 4: planar (edge) cones + ray cones ======================
+
+    #[test]
+    fn box_edge_normal_cone_is_a_quarter() {
+        // A convex box edge where the x=const and y=const faces meet: outward
+        // normals X and Y. The normal cone is the +X+Y quarter in the z=0 plane.
+        let c = PolyhedralCone::from_generators(&[Vector3::X, Vector3::Y]);
+        assert_eq!(c.generators().len(), 2);
+        assert!(
+            c.contains(&(Vector3::X + Vector3::Y)),
+            "interior of quarter"
+        );
+        assert!(c.contains(&Vector3::X), "boundary ray X");
+        assert!(!c.contains(&(Vector3::X - Vector3::Y)), "below the quarter");
+        assert!(!c.contains(&Vector3::Z), "out of plane");
+        assert!(!c.contains(&(-Vector3::X - Vector3::Y)), "opposite quarter");
+    }
+
+    #[test]
+    fn box_edge_tangent_cone_is_a_dihedral_wedge() {
+        // Polar of the edge normal cone = the inward dihedral wedge
+        // {x ≤ 0, y ≤ 0, z free}.
+        let tangent = PolyhedralCone::from_generators(&[Vector3::X, Vector3::Y]).polar();
+        assert!(
+            tangent.contains(&Vector3::new(-1.0, -1.0, 5.0)),
+            "inward, any z"
+        );
+        assert!(
+            tangent.contains(&Vector3::new(-1.0, -1.0, -5.0)),
+            "inward, any z"
+        );
+        assert!(!tangent.contains(&Vector3::new(1.0, 1.0, 0.0)), "outward");
+    }
+
+    #[test]
+    fn edge_wedge_three_coplanar_rays_keeps_extremes() {
+        // Three coplanar rays (in the z=0 plane); the wedge is the sector
+        // between the two angular extremes.
+        let c = PolyhedralCone::from_generators(&[
+            nrm(1.0, 0.0, 0.0),
+            nrm(1.0, 1.0, 0.0),
+            nrm(0.0, 1.0, 0.0),
+        ]);
+        assert_eq!(c.generators().len(), 2, "extreme rays only");
+        assert!(c.contains(&nrm(1.0, 1.0, 0.0)), "middle ray inside");
+        assert!(!c.contains(&nrm(1.0, -0.2, 0.0)), "just outside one edge");
+        assert!(!c.contains(&Vector3::Z), "out of plane");
+    }
+
+    #[test]
+    fn ray_cone_contains_only_its_own_direction() {
+        let c = PolyhedralCone::from_generators(&[Vector3::Z]);
+        assert!(c.contains(&(Vector3::Z * 3.0)), "forward along the ray");
+        assert!(c.contains(&Vector3::ZERO), "apex");
+        assert!(!c.contains(&(-Vector3::Z)), "backward");
+        assert!(!c.contains(&Vector3::X), "perpendicular");
+        assert!(!c.contains(&Vector3::new(0.1, 0.0, 1.0)), "off the ray");
+    }
+
+    /// A random planar wedge: two rays < π apart in a random plane.
+    fn planar_wedge_strategy() -> impl Strategy<Value = (PolyhedralCone, Vector3, Vector3, Vector3)>
+    {
+        (
+            unit_vec(),
+            0.0f64..std::f64::consts::TAU,
+            0.2f64..2.8, // sweep < π
+        )
+            .prop_filter_map("wedge", |(n, a0, sweep)| {
+                let u = super::unit_perp(n);
+                let v = n.cross(&u).normalize().ok()?;
+                let g1 = (u * a0.cos() + v * a0.sin()).normalize().ok()?;
+                let a1 = a0 + sweep;
+                let g2 = (u * a1.cos() + v * a1.sin()).normalize().ok()?;
+                let c = PolyhedralCone::from_generators(&[g1, g2]);
+                if c.generators().len() != 2 {
+                    return None;
+                }
+                Some((c, n, g1, g2))
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Wedge membership: conic combinations of the two edge rays are
+        /// inside; pushing out of the plane leaves it; the antipode is out.
+        #[test]
+        fn prop_planar_wedge_membership(
+            (c, n, g1, g2) in planar_wedge_strategy(),
+            l in 0.0f64..1.0, m in 0.0f64..1.0,
+        ) {
+            let inside = g1 * l + g2 * m;
+            if inside.magnitude() > 1e-6 {
+                prop_assert!(c.contains(&inside), "conic combo not in wedge");
+                prop_assert!(!c.contains(&(inside + n * 0.3)), "out-of-plane accepted");
+                prop_assert!(!c.contains(&(inside - n * 0.3)), "out-of-plane accepted");
+                prop_assert!(!c.contains(&(-inside)), "antipode in wedge");
+            }
+        }
+
+        /// Ray-cone membership: forward multiples in, backward/perpendicular out.
+        #[test]
+        fn prop_ray_cone(g in unit_vec(), k in 0.1f64..10.0) {
+            let c = PolyhedralCone::from_generators(&[g]);
+            prop_assert!(c.contains(&(g * k)));
+            prop_assert!(!c.contains(&(g * -k)));
+            let perp = super::unit_perp(g);
+            prop_assert!(!c.contains(&perp));
         }
     }
 }
