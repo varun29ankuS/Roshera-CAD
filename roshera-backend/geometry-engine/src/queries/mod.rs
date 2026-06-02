@@ -10,3 +10,4 @@ pub mod features;
 pub mod kinematics;
 pub mod lmd;
 pub mod newton;
+pub mod trim;
