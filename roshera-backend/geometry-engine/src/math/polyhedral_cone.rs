@@ -18,10 +18,13 @@
 //! normal cones) and feature-pair culling (two cones with no common ray cannot
 //! contact).
 //!
-//! # Scope (slice 1)
-//! Correct for pointed cones whose generators span ≥ 3 dimensions (the vertex-
-//! cone case) and for the full-space cone. Planar (2-generator edge) cones and
-//! the cone-intersection / dilation operations are the next slices.
+//! # Scope
+//! Slice 1 — pointed cones (generators spanning ≥ 3D, the vertex-cone case),
+//! the full-space and zero cones: construction, polar, membership.
+//! Slice 2 — cone **intersection** ([`PolyhedralCone::intersects`],
+//! [`PolyhedralCone::intersection`], [`PolyhedralCone::separating_plane`]) for
+//! feature-pair culling and the critical-point gate.
+//! Next — angular dilation by α, and planar (2-generator edge) cones.
 //!
 //! # References
 //! Crozet, *Efficient contact determination between B-Rep solids*, §3.2–3.4;
@@ -135,6 +138,80 @@ impl PolyhedralCone {
     pub fn is_zero(&self) -> bool {
         self.generators.is_empty() && self.supports.is_empty()
     }
+
+    /// The intersection cone `A ∩ B`.
+    ///
+    /// `A ∩ B = { x : sⱼ·x ≤ 0 for every support of either cone }`, so its
+    /// supports are the union of the two support sets and its extreme rays are
+    /// `dual_extreme_rays(union)`. The result is canonicalized (minimal rep).
+    /// An empty result is the trivial `{0}` cone (the two cones share only the
+    /// apex).
+    pub fn intersection(&self, other: &Self) -> PolyhedralCone {
+        if self.is_full_space() {
+            return other.clone();
+        }
+        if other.is_full_space() {
+            return self.clone();
+        }
+        if self.is_zero() || other.is_zero() {
+            return PolyhedralCone::from_generators(&[]);
+        }
+        let mut union = self.supports.clone();
+        union.extend(other.supports.iter().copied());
+        let union = dedup_unit(union);
+        let rays = dual_extreme_rays(&union);
+        // Canonicalize: rebuild from the extreme rays (empty ⇒ {0} cone).
+        PolyhedralCone::from_generators(&rays)
+    }
+
+    /// A unit normal `p` of a plane through the origin that separates the two
+    /// cones (`A ⊆ {x·p ≤ 0}`, `B ⊆ {x·p ≥ 0}`), or `None` if they share a
+    /// non-zero ray.
+    ///
+    /// The separating normals are exactly `A° ∩ (−B°)`, whose extreme rays are
+    /// `dual_extreme_rays(A.generators ∪ −B.generators)` — the slice-1 workhorse
+    /// applied to the dual problem. Any such ray is a valid separator.
+    pub fn separating_plane(&self, other: &Self) -> Option<Vector3> {
+        let mut combined = self.generators.clone();
+        combined.extend(other.generators.iter().map(|g| -*g));
+        let combined = dedup_unit(combined);
+        dual_extreme_rays(&combined).into_iter().next()
+    }
+
+    /// Do the two cones share a non-zero ray? On disjoint, carries a separating
+    /// plane normal. (Sharing only the apex counts as `Disjoint` — there is no
+    /// common contact *direction*.)
+    pub fn intersects(&self, other: &Self) -> ConeIntersectionResult {
+        if self.intersection(other).is_zero() {
+            let p = self.separating_plane(other).unwrap_or(Vector3::Z); // unreachable for genuinely disjoint cones
+            ConeIntersectionResult::Disjoint {
+                separating_plane: p,
+            }
+        } else {
+            ConeIntersectionResult::Overlapping
+        }
+    }
+}
+
+/// Outcome of [`PolyhedralCone::intersects`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConeIntersectionResult {
+    /// The cones share a non-zero ray (a common contact direction exists).
+    Overlapping,
+    /// The cones meet only at the apex; `separating_plane` is a unit normal `p`
+    /// with `A ⊆ {x·p ≤ 0}` and `B ⊆ {x·p ≥ 0}`.
+    Disjoint { separating_plane: Vector3 },
+}
+
+/// Dedup a set of (already unit-length) vectors by angular proximity.
+fn dedup_unit(mut vecs: Vec<Vector3>) -> Vec<Vector3> {
+    let mut out: Vec<Vector3> = Vec::new();
+    for v in vecs.drain(..) {
+        if !out.iter().any(|e| (*e - v).magnitude() < CONE_EPS) {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// Extreme rays of the dual cone `{ y : vᵢ·y ≤ 0 ∀ i }`.
@@ -815,6 +892,200 @@ mod tests {
             for g in cone.generators() {
                 let on = cone.supports().iter().filter(|s| g.dot(s).abs() < 1e-6).count();
                 prop_assert!(on >= 2, "generator on fewer than 2 faces: {on}");
+            }
+        }
+    }
+
+    // ===== slice 2: cone intersection ====================================
+
+    fn octant() -> PolyhedralCone {
+        PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, Vector3::Z])
+    }
+
+    #[test]
+    fn cone_intersects_itself() {
+        assert_eq!(
+            octant().intersects(&octant()),
+            ConeIntersectionResult::Overlapping
+        );
+    }
+
+    #[test]
+    fn opposite_octants_are_disjoint() {
+        let pos = octant();
+        let neg = PolyhedralCone::normal_cone(&[-Vector3::X, -Vector3::Y, -Vector3::Z]);
+        match pos.intersects(&neg) {
+            ConeIntersectionResult::Disjoint {
+                separating_plane: p,
+            } => {
+                for g in pos.generators() {
+                    assert!(g.dot(&p) <= 1e-7, "A-gen {g:?} not on ≤0 side");
+                }
+                for h in neg.generators() {
+                    assert!(h.dot(&p) >= -1e-7, "B-gen {h:?} not on ≥0 side");
+                }
+            }
+            ConeIntersectionResult::Overlapping => panic!("opposite octants overlap?"),
+        }
+    }
+
+    #[test]
+    fn octant_intersects_full_space() {
+        assert_eq!(
+            octant().intersects(&PolyhedralCone::full_space()),
+            ConeIntersectionResult::Overlapping
+        );
+    }
+
+    #[test]
+    fn zero_cone_is_disjoint_from_octant() {
+        let zero = PolyhedralCone::from_generators(&[]);
+        assert!(matches!(
+            zero.intersects(&octant()),
+            ConeIntersectionResult::Disjoint { .. }
+        ));
+    }
+
+    #[test]
+    fn normal_cone_disjoint_from_its_tangent_cone() {
+        let normal = octant();
+        let tangent = normal.polar(); // −−− octant; shares only the apex
+        assert!(matches!(
+            normal.intersects(&tangent),
+            ConeIntersectionResult::Disjoint { .. }
+        ));
+    }
+
+    #[test]
+    fn corners_sharing_a_quarter_plane_overlap() {
+        // cone(X,Y,Z) and cone(X,Y,−Z) share the z=0, x,y≥0 quarter.
+        let a = octant();
+        let b = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, -Vector3::Z]);
+        assert_eq!(a.intersects(&b), ConeIntersectionResult::Overlapping);
+        // the witness: X+Y is in both.
+        let inter = a.intersection(&b);
+        assert!(!inter.is_zero());
+        for g in inter.generators() {
+            assert!(a.contains(g), "intersection gen {g:?} not in A");
+            assert!(b.contains(g), "intersection gen {g:?} not in B");
+        }
+    }
+
+    #[test]
+    fn disjoint_intersection_is_the_zero_cone() {
+        let pos = octant();
+        let neg = PolyhedralCone::normal_cone(&[-Vector3::X, -Vector3::Y, -Vector3::Z]);
+        assert!(pos.intersection(&neg).is_zero());
+    }
+
+    #[test]
+    fn intersection_is_symmetric_on_known_cases() {
+        let a = octant();
+        let b = PolyhedralCone::normal_cone(&[Vector3::X, Vector3::Y, -Vector3::Z]);
+        assert_eq!(a.intersects(&b), b.intersects(&a));
+    }
+
+    // ---- property tests over random cones around arbitrary axes ----------
+
+    fn unit_vec() -> impl Strategy<Value = Vector3> {
+        (-1.0f64..1.0, -1.0f64..1.0, -1.0f64..1.0).prop_filter_map("nonzero", |(x, y, z)| {
+            Vector3::new(x, y, z).normalize().ok()
+        })
+    }
+
+    fn perp(a: Vector3) -> Vector3 {
+        let t = if a.x.abs() < 0.9 {
+            Vector3::X
+        } else {
+            Vector3::Y
+        };
+        (t - a * t.dot(&a)).normalize().unwrap_or(Vector3::X)
+    }
+
+    /// A pointed cone around a random axis (so two of them may or may not meet).
+    fn any_cone() -> impl Strategy<Value = PolyhedralCone> {
+        (
+            unit_vec(),
+            prop::collection::vec((-0.6f64..0.6, -0.6f64..0.6), 3..6),
+        )
+            .prop_filter_map("pointed cone", |(axis, offs)| {
+                let e1 = perp(axis);
+                let e2 = axis.cross(&e1).normalize().ok()?;
+                let gens: Vec<Vector3> = offs
+                    .iter()
+                    .filter_map(|&(a, b)| (axis + e1 * a + e2 * b).normalize().ok())
+                    .collect();
+                if gens.len() < 3 {
+                    return None;
+                }
+                let c = PolyhedralCone::from_generators(&gens);
+                if c.supports().is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// A returned separating plane genuinely separates the two cones.
+        #[test]
+        fn prop_separating_plane_separates(a in any_cone(), b in any_cone()) {
+            if let ConeIntersectionResult::Disjoint { separating_plane: p } = a.intersects(&b) {
+                for g in a.generators() {
+                    prop_assert!(g.dot(&p) <= 1e-6, "A-gen {g:?} on wrong side of {p:?}");
+                }
+                for h in b.generators() {
+                    prop_assert!(h.dot(&p) >= -1e-6, "B-gen {h:?} on wrong side of {p:?}");
+                }
+            }
+        }
+
+        /// Overlapping carries a witness: the intersection cone is non-trivial
+        /// and every one of its generators lies in BOTH cones.
+        #[test]
+        fn prop_overlap_has_witness(a in any_cone(), b in any_cone()) {
+            if a.intersects(&b) == ConeIntersectionResult::Overlapping {
+                let inter = a.intersection(&b);
+                prop_assert!(!inter.is_zero(), "overlap but empty intersection");
+                for g in inter.generators() {
+                    prop_assert!(a.contains(g), "intersection gen not in A");
+                    prop_assert!(b.contains(g), "intersection gen not in B");
+                }
+            }
+        }
+
+        /// The intersection verdict is symmetric.
+        #[test]
+        fn prop_intersection_symmetric(a in any_cone(), b in any_cone()) {
+            let ab = matches!(a.intersects(&b), ConeIntersectionResult::Overlapping);
+            let ba = matches!(b.intersects(&a), ConeIntersectionResult::Overlapping);
+            prop_assert_eq!(ab, ba);
+        }
+
+        /// Every cone overlaps itself.
+        #[test]
+        fn prop_self_overlap(a in any_cone()) {
+            prop_assert_eq!(a.intersects(&a), ConeIntersectionResult::Overlapping);
+        }
+
+        /// Brute-force agreement: if any sampled direction lies in both cones,
+        /// the verdict must be Overlapping.
+        #[test]
+        fn prop_bruteforce_overlap(
+            a in any_cone(),
+            b in any_cone(),
+            samples in prop::collection::vec(unit_vec(), 64),
+        ) {
+            let common = samples.iter().any(|d| a.contains(d) && b.contains(d));
+            if common {
+                prop_assert_eq!(
+                    a.intersects(&b),
+                    ConeIntersectionResult::Overlapping,
+                    "a sampled direction is in both but verdict is Disjoint"
+                );
             }
         }
     }
