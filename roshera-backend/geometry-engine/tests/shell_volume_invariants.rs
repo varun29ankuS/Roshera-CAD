@@ -18,14 +18,14 @@
 //! divergence volume must equal both the analytic shell volume AND the kernel's
 //! reported mass-properties volume (the watertightness witness).
 //!
-//! STATUS: these `#[ignore]`d on first run — they immediately caught a real,
-//! pre-existing shell bug (the inner cavity faces are untrimmed copies of the
-//! outer faces, so a 10×10×10 box shelled at t=1 encloses 1640 instead of 424;
-//! see the detailed root-cause comment on `shell_material_less_than_solid_box`
-//! below). They are kept as a precise, tracked repro until the shell-trim fix
-//! lands, at which point the `#[ignore]`s come off. The result is watertight
-//! and self-consistent, so this is a face-trimming geometry bug, not a
-//! tessellation or validator bug.
+//! STATUS: these caught a real, pre-existing shell bug on first run (the inner
+//! cavity faces were untrimmed copies of the outer faces — a 10×10×10 box
+//! shelled at t=1 enclosed 1640 instead of 424) and now GUARD the fix. The fix
+//! (offset.rs): `compute_vertex_insets` places each inner vertex at the
+//! intersection of the inward-offset planes meeting there (so the cavity is
+//! correctly inset), and the interior faces are orientation-flipped to face the
+//! void (so the divergence subtracts the cavity). 10×10×10 now gives exactly
+//! 424, watertight.
 
 use geometry_engine::operations::{offset_solid, CommonOptions, OffsetOptions};
 use geometry_engine::primitives::face::FaceId;
@@ -117,7 +117,6 @@ fn open_shell_volume(a: f64, b: f64, c: f64, t: f64) -> f64 {
 macro_rules! shell_volume_test {
     ($name:ident, $a:expr, $b:expr, $c:expr, $t:expr) => {
         #[test]
-        #[ignore = "shell inner-offset faces not trimmed to inset cavity → enclosed volume wrong (documented bug repro)"]
         fn $name() {
             let (tess_vol, mass_vol) = shelled_open_box($a, $b, $c, $t);
             let expected = open_shell_volume($a, $b, $c, $t);
@@ -172,7 +171,6 @@ shell_volume_test!(shell_12_12_4_t1, 12.0, 12.0, 4.0, 1.0);
 // `validate_result:false`, never the enclosed volume. Tracked for a focused
 // shell-trim fix; these tests pin the exact failing numbers.
 #[test]
-#[ignore = "shell inner-offset faces not trimmed to inset cavity → encloses 1640 vs analytic 424 (documented bug repro)"]
 fn shell_material_less_than_solid_box() {
     let (tess_vol, _) = shelled_open_box(10.0, 10.0, 10.0, 1.0);
     assert!(

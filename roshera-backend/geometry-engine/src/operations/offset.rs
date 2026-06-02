@@ -22,7 +22,9 @@ use crate::primitives::{
     solid::{Solid, SolidId},
     surface::Surface,
     topology_builder::BRepModel,
+    vertex::VertexId,
 };
+use std::collections::HashMap;
 
 /// Options for offset operations
 #[derive(Debug)]
@@ -110,9 +112,12 @@ pub fn offset_face(
         let surface_id = model.surfaces.add(offset_surface);
 
         // Create offset edges. The standalone offset_face surface does not
-        // need the per-edge map — only the shell operation does — so
-        // discard it here.
-        let (offset_loop, _edge_map) = create_offset_loop(model, &face, distance, &options)?;
+        // need the per-edge map (only the shell operation does) nor the
+        // corner insets (those trim a shell cavity, not a lone face), so pass
+        // an empty inset map and discard the edge map.
+        let no_insets: HashMap<VertexId, Point3> = HashMap::new();
+        let (offset_loop, _edge_map) =
+            create_offset_loop(model, &face, distance, &no_insets, &options)?;
         let loop_id = model.loops.add(offset_loop);
 
         // Create new face
@@ -161,14 +166,29 @@ fn offset_solid_body(
         .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?
         .clone();
 
+    // Pre-compute the inset position of every original vertex by intersecting
+    // the inward-offset planes of the faces meeting there (planar shells only;
+    // see `compute_vertex_insets`). Using these shared corner positions in BOTH
+    // the interior offset edges and the wall rims is what trims the inner faces
+    // to the cavity footprint and makes their corners coincide (dedup-merge)
+    // instead of self-intersecting. Vertices on any non-planar face are absent
+    // from the map and fall back to the per-face normal offset.
+    let vertex_insets = compute_vertex_insets(model, &solid, &faces_to_remove, thickness.abs())?;
+
     // Create offset faces for interior. Capture the per-edge map so
     // that walls erected over removed faces can reuse the offset edges
     // these interior faces just created — that's what gives the
     // resulting shell shared topology (manifold) instead of a stack of
     // disjoint surfaces that just happen to dedup at their corner
     // vertices.
-    let (interior_faces, original_to_offset_edge) =
-        create_interior_offset_faces(model, &solid, -thickness.abs(), &faces_to_remove, &options)?;
+    let (interior_faces, original_to_offset_edge) = create_interior_offset_faces(
+        model,
+        &solid,
+        -thickness.abs(),
+        &faces_to_remove,
+        &vertex_insets,
+        &options,
+    )?;
 
     // Create side walls for removed faces
     let wall_faces = create_shell_walls(
@@ -177,6 +197,7 @@ fn offset_solid_body(
         thickness,
         &faces_to_remove,
         &original_to_offset_edge,
+        &vertex_insets,
         &options,
     )?;
 
@@ -376,6 +397,7 @@ fn create_offset_loop(
     model: &mut BRepModel,
     face: &Face,
     distance: f64,
+    vertex_insets: &HashMap<VertexId, Point3>,
     options: &OffsetOptions,
 ) -> OperationResult<(Loop, Vec<(EdgeId, EdgeId)>)> {
     let original_loop = model
@@ -401,8 +423,14 @@ fn create_offset_loop(
     // loop so traversal stays consistent.
     for (i, &edge_id) in original_loop.edges.iter().enumerate() {
         let forward = original_loop.orientations[i];
-        let offset_edge_id =
-            create_offset_edge(model, edge_id, face.surface_id, distance, options)?;
+        let offset_edge_id = create_offset_edge(
+            model,
+            edge_id,
+            face.surface_id,
+            distance,
+            vertex_insets,
+            options,
+        )?;
         offset_edges.push((offset_edge_id, forward));
         edge_map.push((edge_id, offset_edge_id));
     }
@@ -433,13 +461,42 @@ fn create_offset_edge(
     edge_id: EdgeId,
     surface_id: u32,
     distance: f64,
+    vertex_insets: &HashMap<VertexId, Point3>,
     options: &OffsetOptions,
 ) -> OperationResult<EdgeId> {
+    let tol = options.common.tolerance.distance();
+
+    // Planar-shell fast path: when both endpoints have a pre-computed corner
+    // inset, the offset edge is the straight segment between the two inset
+    // corners (the intersection lines of the inward-offset planes). Using these
+    // shared corners — identical to the ones the wall rims use — is what trims
+    // the inner face to the cavity footprint and lets adjacent inner edges and
+    // walls dedup-merge at the corner. (Falls through to the per-face normal
+    // offset below when either endpoint is on a non-planar face.)
+    {
+        let edge = model.edges.get(edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("create_offset_edge: edge {edge_id} not found"))
+        })?;
+        let (sv, ev, orient, prange) = (
+            edge.start_vertex,
+            edge.end_vertex,
+            edge.orientation,
+            edge.param_range,
+        );
+        if let (Some(&sp), Some(&ep)) = (vertex_insets.get(&sv), vertex_insets.get(&ev)) {
+            use crate::primitives::curve::Line;
+            let vs = model.vertices.add_or_find(sp.x, sp.y, sp.z, tol);
+            let ve = model.vertices.add_or_find(ep.x, ep.y, ep.z, tol);
+            let curve_id = model.curves.add(Box::new(Line::new(sp, ep)));
+            let offset_edge = Edge::new(0, vs, ve, curve_id, orient, prange);
+            return Ok(model.edges.add(offset_edge));
+        }
+    }
+
     // Validate that the requested offset distance is geometrically meaningful
     // relative to the user-supplied tolerance. A near-zero offset would
     // produce vertices coincident with the source edge, generating a
     // numerical artifact rather than a real offset.
-    let tol = options.common.tolerance.distance();
     if !distance.is_finite() {
         return Err(OperationError::InvalidGeometry(format!(
             "create_offset_edge: distance {} is not finite",
@@ -636,6 +693,133 @@ fn detect_offset_self_intersection(
     None
 }
 
+/// Compute the inset position of each original vertex for a PLANAR shell.
+///
+/// A shelled solid's inner faces must be inset to the cavity footprint — each
+/// inner vertex sits at the intersection of the inward-offset planes of the
+/// faces meeting at the original vertex. Offsetting each face's boundary along
+/// only that face's own normal (the historical behaviour) reaches the right
+/// plane but never insets in-plane, so the inner faces were the wrong size and
+/// self-intersected (the "10×10×10 shell encloses 1640 vs 424" bug). Solving
+/// the per-vertex plane intersection is what trims them.
+///
+/// Returns a map `original_vertex → inset_point`, covering only vertices whose
+/// incident faces are ALL planar (and there are ≥ 3 of them). Vertices touching
+/// any non-planar face are omitted; callers fall back to the per-face normal
+/// offset there, preserving the previous behaviour for curved shells.
+///
+/// Removed faces (the shell openings) contribute their ORIGINAL plane rather
+/// than the inset plane, so a rim vertex stays at the opening along the
+/// removed-face normal while still insetting in the other directions.
+fn compute_vertex_insets(
+    model: &BRepModel,
+    solid: &Solid,
+    faces_to_remove: &[FaceId],
+    thickness: f64,
+) -> OperationResult<HashMap<VertexId, Point3>> {
+    use crate::math::{linear_solver, svd, STRICT_TOLERANCE};
+    use crate::primitives::surface::SurfaceType;
+
+    let shell = model
+        .shells
+        .get(solid.outer_shell)
+        .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
+
+    // vertex → the distinct faces of the outer shell that touch it.
+    let mut vertex_faces: HashMap<VertexId, Vec<FaceId>> = HashMap::new();
+    for &face_id in &shell.faces {
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
+        let lp = model
+            .loops
+            .get(face.outer_loop)
+            .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
+        let mut seen = std::collections::HashSet::new();
+        for &edge_id in &lp.edges {
+            let edge = match model.edges.get(edge_id) {
+                Some(e) => e,
+                None => continue,
+            };
+            for v in [edge.start_vertex, edge.end_vertex] {
+                if seen.insert(v) {
+                    vertex_faces.entry(v).or_default().push(face_id);
+                }
+            }
+        }
+    }
+
+    let removed: std::collections::HashSet<FaceId> = faces_to_remove.iter().copied().collect();
+    let mut insets = HashMap::new();
+
+    for (&vid, faces) in &vertex_faces {
+        if faces.len() < 3 {
+            continue;
+        }
+        let vpos = match model.vertices.get(vid) {
+            Some(v) => v.point(),
+            None => continue,
+        };
+
+        // One plane constraint per incident face:
+        //   non-removed: n·x = n·V − t   (inset plane)
+        //   removed:     n·x = n·V       (original plane — pins the rim)
+        let mut a: Vec<Vec<f64>> = Vec::with_capacity(faces.len());
+        let mut b: Vec<f64> = Vec::with_capacity(faces.len());
+        let mut all_planar = true;
+        for &face_id in faces {
+            let face = match model.faces.get(face_id) {
+                Some(f) => f,
+                None => {
+                    all_planar = false;
+                    break;
+                }
+            };
+            let surface = match model.surfaces.get(face.surface_id) {
+                Some(s) => s,
+                None => {
+                    all_planar = false;
+                    break;
+                }
+            };
+            if surface.surface_type() != SurfaceType::Plane {
+                all_planar = false;
+                break;
+            }
+            let n = compute_surface_normal_at_point(surface, vpos)?;
+            let n_dot_v = n.x * vpos.x + n.y * vpos.y + n.z * vpos.z;
+            let rhs = if removed.contains(&face_id) {
+                n_dot_v
+            } else {
+                n_dot_v - thickness
+            };
+            a.push(vec![n.x, n.y, n.z]);
+            b.push(rhs);
+        }
+        if !all_planar {
+            continue;
+        }
+
+        // Exactly three planes → exact 3×3 solve; more (rare high-valence
+        // vertex) → least-squares best-fit corner via the SVD pseudo-inverse.
+        let solved = if a.len() == 3 {
+            linear_solver::gaussian_elimination(a, b, STRICT_TOLERANCE)
+        } else {
+            svd::solve_least_squares_svd(a, &b, STRICT_TOLERANCE)
+        };
+        if let Ok(x) = solved {
+            if x.len() == 3 && x.iter().all(|c| c.is_finite()) {
+                insets.insert(vid, Point3::new(x[0], x[1], x[2]));
+            }
+        }
+        // A singular system (degenerate/parallel planes) just omits the vertex
+        // → caller falls back to the per-face normal offset there.
+    }
+
+    Ok(insets)
+}
+
 /// Create interior offset faces for shell.
 ///
 /// Returns the new face IDs alongside a `(source_edge_id ->
@@ -654,6 +838,7 @@ fn create_interior_offset_faces(
     solid: &Solid,
     thickness: f64,
     faces_to_remove: &[FaceId],
+    vertex_insets: &HashMap<VertexId, Point3>,
     options: &OffsetOptions,
 ) -> OperationResult<(Vec<FaceId>, std::collections::HashMap<EdgeId, EdgeId>)> {
     let shell = model
@@ -689,14 +874,27 @@ fn create_interior_offset_faces(
         let offset_surface = create_offset_surface(model, &face, thickness)?;
         let surface_id = model.surfaces.add(offset_surface);
 
-        let (offset_loop, edge_map) = create_offset_loop(model, &face, thickness, &offset_options)?;
+        let (offset_loop, edge_map) =
+            create_offset_loop(model, &face, thickness, vertex_insets, &offset_options)?;
         let loop_id = model.loops.add(offset_loop);
 
+        // The interior face bounds the cavity, so its outward-from-MATERIAL
+        // normal points INTO the void — the opposite of the source face's
+        // outward normal. The offset surface keeps the source normal direction,
+        // so flip the face orientation to invert the effective normal (and the
+        // tessellation winding). Without this the inner faces face outward like
+        // the originals and the divergence adds the cavity instead of
+        // subtracting it (the "1362 vs 424" residual after the inset trim).
+        use crate::primitives::face::FaceOrientation;
+        let inner_orientation = match face.orientation {
+            FaceOrientation::Forward => FaceOrientation::Backward,
+            FaceOrientation::Backward => FaceOrientation::Forward,
+        };
         let offset_face_obj = Face::new(
             0, // ID assigned by store
             surface_id,
             loop_id,
-            face.orientation,
+            inner_orientation,
         );
         let offset_face_id = model.faces.add(offset_face_obj);
         interior_faces.push(offset_face_id);
@@ -722,6 +920,7 @@ fn create_shell_walls(
     thickness: f64,
     faces_to_remove: &[FaceId],
     original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
+    vertex_insets: &HashMap<VertexId, Point3>,
     options: &OffsetOptions,
 ) -> OperationResult<Vec<FaceId>> {
     // Confirm every face being removed lives on this solid's outer shell.
@@ -799,6 +998,7 @@ fn create_shell_walls(
                 removed_normal,
                 tol,
                 original_to_offset_edge,
+                vertex_insets,
             )?;
             wall_faces.push(wall_face);
         }
@@ -821,6 +1021,7 @@ fn create_wall_face(
     removed_face_outward_normal: Vector3,
     tol: f64,
     original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
+    vertex_insets: &HashMap<VertexId, Point3>,
 ) -> OperationResult<FaceId> {
     use crate::primitives::curve::Line;
     use crate::primitives::edge::EdgeOrientation;
@@ -892,9 +1093,20 @@ fn create_wall_face(
         .cross(&loop_edge_dir)
         .normalize()?;
 
+    // Rim corners. Prefer the shared corner insets (intersection of the inward-
+    // offset planes meeting at each vertex) so the rim is correctly mitered AND
+    // its corners coincide with the interior offset edges (dedup-merge). The
+    // in-plane single-edge offset is the fallback for vertices without an inset
+    // (e.g. on a non-planar face).
     let offset = offset_dir * thickness.abs();
-    let p3 = p2 + offset;
-    let p4 = p1 + offset;
+    let p3 = match vertex_insets.get(&outer_edge.end_vertex) {
+        Some(&p) => Vector3::new(p.x, p.y, p.z),
+        None => p2 + offset,
+    };
+    let p4 = match vertex_insets.get(&outer_edge.start_vertex) {
+        Some(&p) => Vector3::new(p.x, p.y, p.z),
+        None => p1 + offset,
+    };
 
     // The wall plane's normal is perpendicular to both the edge
     // direction and the in-plane offset direction; this is the same
@@ -1343,9 +1555,14 @@ mod tests {
         let hollow = model.solids.get(hollow_id).expect("hollow").clone();
         let hollow_shell = model.shells.get(hollow.outer_shell).expect("shell").clone();
 
-        // For each wall face (recognised as in the previous test), the
-        // 4 corners split into two outer (on the cube boundary) and two
-        // inner (inset by `thickness`). Verify both pairs.
+        // Each rim (top-frame) wall is a quad: 2 OUTER corners on the cube
+        // rim (the original box top corners, |x| = |y| = half_extent) and 2
+        // INNER corners that are MITERED — inset by `thickness` on BOTH axes
+        // (|x| = |y| = half_extent − thickness), where the two inner side walls
+        // meet. (The corners are the shared `compute_vertex_insets` corners;
+        // before that fix they were inset on only one axis, which left the
+        // inner faces untrimmed — the 1640-vs-424 bug.)
+        let inset = half_extent - thickness;
         let mut walls_checked = 0usize;
         for &face_id in &hollow_shell.faces {
             let face = model.faces.get(face_id).expect("face");
@@ -1358,27 +1575,17 @@ mod tests {
             if !positions.iter().all(|p| (p.z - half_extent).abs() < 1e-6) {
                 continue;
             }
-            // A vertex is "outer" iff it sits exactly on the cube
-            // boundary (|x| ≈ hw or |y| ≈ hh). Inner vertices have BOTH
-            // |x| < hw AND |y| < hh, inset by `thickness` along one of
-            // those axes.
             let mut outer = 0;
             let mut inner = 0;
             for p in &positions {
-                let on_x_boundary = (p.x.abs() - half_extent).abs() < 1e-6;
-                let on_y_boundary = (p.y.abs() - half_extent).abs() < 1e-6;
-                if on_x_boundary || on_y_boundary {
-                    // Could be inner or outer depending on the other coord.
-                    // For an outer vertex of a wall edge, BOTH axes lie
-                    // on the original top-face rim; for an inner vertex,
-                    // exactly one axis is inset by thickness.
-                    let inset_x = (p.x.abs() - (half_extent - thickness)).abs() < 1e-6;
-                    let inset_y = (p.y.abs() - (half_extent - thickness)).abs() < 1e-6;
-                    if (on_x_boundary && inset_y) || (on_y_boundary && inset_x) {
-                        inner += 1;
-                    } else {
-                        outer += 1;
-                    }
+                let on_x_rim = (p.x.abs() - half_extent).abs() < 1e-6;
+                let on_y_rim = (p.y.abs() - half_extent).abs() < 1e-6;
+                let inset_x = (p.x.abs() - inset).abs() < 1e-6;
+                let inset_y = (p.y.abs() - inset).abs() < 1e-6;
+                if on_x_rim && on_y_rim {
+                    outer += 1; // a box top corner
+                } else if inset_x && inset_y {
+                    inner += 1; // a mitered inner corner
                 }
             }
             assert_eq!(
@@ -1388,7 +1595,7 @@ mod tests {
             );
             assert_eq!(
                 inner, 2,
-                "wall face {} should have 2 inner corners inset by thickness, got {}",
+                "wall face {} should have 2 mitered inner corners (inset on both axes), got {}",
                 face_id, inner
             );
             walls_checked += 1;
