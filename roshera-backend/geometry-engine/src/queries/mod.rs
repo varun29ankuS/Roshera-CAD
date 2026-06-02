@@ -5,3 +5,4 @@
 //! into the polyhedral-cone algebra.
 
 pub mod cd;
+pub mod lmd;
