@@ -287,50 +287,47 @@ fn rotated_box_difference_is_watertight_and_bounded() {
     assert!(wt, "rotated-box difference mesh is not watertight");
 }
 
-// BUG REPRO (documented, not yet fixed) — root cause isolated by Monte-Carlo
-// ground truth (4M samples) AND a per-face dissection of the result solid.
-// Two 2×2×2 boxes (va = vb = 8), B rotated 45° about Z + shifted +1 in x.
-// TRUE values: intersection = 3.67, union = 12.33, A − B = 4.33. Kernel:
-// union = 12.34 (CORRECT), intersection = 5.10 (WRONG, +39 %), difference =
-// 2.90 (WRONG — exactly 8 − 5.10, inheriting the bad intersection).
+// FIXED 2026-06-02 (boolean #34). Two 2×2×2 boxes (va = vb = 8), B rotated 45°
+// about Z + shifted +1 in x. The EXACT intersection is a prism: pentagon
+// cross-section (1−√2,0)→(0.586,±1)→(1,±1), area = 1.82843, × height 2 =
+// 3.65685. (The earlier "3.67" was a Monte-Carlo estimate; 3.65685 is exact.)
 //
-// Precise root cause (2026-06-02): the intersection result has the 5 correct
-// SIDE walls (they tile the true pentagon cross-section (-0.41,0)→(0.59,±1)→
-// (1,±1) exactly) plus the 2 z = ±1 caps it should have — but ALSO 2 spurious
-// extra caps. A's planar cap (z = ±1) is cut by B's two rotated diagonal walls,
-// but the cap–wall intersection segments do NOT fully partition the cap into
-// inside-B / outside-B regions: the resulting fragments STRADDLE B's boundary
-// (one fragment spans x∈[-1, 0.59], crossing B's left tip at x = -0.41). The
-// centroid-based classifier then evaluates each straddling fragment at a single
-// interior point that happens to land inside B's cap footprint → OnBoundary →
-// the whole fragment (including its outside-B part) is kept. So the defect is
-// face-SPLITTING COMPLETENESS for a coplanar cap cut by the other solid's
-// transverse (non-axis-aligned) walls — NOT selection and NOT classification
-// per se (every side-wall verdict and every genuinely-outside fragment is
-// classified correctly). Union is immune because it drops Inside/OnBoundary
-// fragments. A separate, real-but-here-inert degeneracy also exists: the
-// other solid's cap-overhang fragments sit on a coincident plane and ray-cast
-// degenerately; a ±surface-normal offset classifier fixes those but does not
-// move this volume, because the dominant error is the straddling A-cap pieces.
-// Fixing it needs the cap–wall split to emit the full inside/outside partition
-// (or the classifier to reject straddling fragments) — a focused split-path
-// change, tracked separately. The axis-aligned inclusion–exclusion test
-// (operations_volume_invariants.rs) still guards the common case, which is
-// correct (coplanar caps there share footprints and partition cleanly).
+// The bug: A's planar cap, after a wedge was cut out of it by B's rotated walls,
+// left a NON-CONVEX notched remainder. `get_face_interior_point` used the
+// boundary-edge-midpoint centroid, which for that notched fragment landed in the
+// concave notch — inside B's coplanar cap footprint — so the straddling fragment
+// classified OnBoundary and was kept whole, over-including its outside-B part
+// (kernel reported 5.10, +39%). Union was immune (it drops Inside/OnBoundary).
+// Fix: `compute_split_face_interior_points` now also corrects loops whose own
+// centroid falls OUTSIDE the polygon (non-convex), via the existing
+// edge-midpoint-nudge guaranteed-interior search — so the notched remainder gets
+// a true interior point, classifies Outside, and is dropped. The result is now
+// the exact 3.65685.
 #[test]
-#[ignore = "boolean INTERSECTION over-reports on rotated input (MC truth 3.67 vs kernel 5.10); union correct — documented bug repro"]
+fn rotated_intersection_matches_exact_pentagon_prism() {
+    let (_, _, vi, wt) =
+        rotated_boolean(PI / 4.0, 1.0, BooleanOp::Intersection).expect(ROTATED_BOOL_MUST_SUCCEED);
+    // Exact analytic intersection volume (pentagon prism), not the MC estimate.
+    let exact = 3.656854;
+    assert!(
+        rel_close(vi, exact, 0.01),
+        "rotated-box intersection {vi} vs exact pentagon-prism {exact}"
+    );
+    assert!(wt, "rotated-box intersection mesh is not watertight");
+}
+
+#[test]
 fn rotated_union_inclusion_exclusion() {
     // vol(A∪B) = vol(A) + vol(B) − vol(A∩B), independent of B's orientation.
-    if let (Some((va, vb, vu, _)), Some((_, _, vi, _))) = (
-        rotated_boolean(PI / 4.0, 1.0, BooleanOp::Union),
-        rotated_boolean(PI / 4.0, 1.0, BooleanOp::Intersection),
-    ) {
-        assert!(
-            rel_close(vu, va + vb - vi, 0.06),
-            "inclusion-exclusion on rotated boxes: {vu} vs {}",
-            va + vb - vi
-        );
-    }
+    let (va, vb, vu, _) =
+        rotated_boolean(PI / 4.0, 1.0, BooleanOp::Union).expect(ROTATED_BOOL_MUST_SUCCEED);
+    let (_, _, vi, _) =
+        rotated_boolean(PI / 4.0, 1.0, BooleanOp::Intersection).expect(ROTATED_BOOL_MUST_SUCCEED);
+    assert!(
+        rel_close(vu, va + vb - vi, 0.02),
+        "inclusion-exclusion on rotated boxes: {vu} vs {}",
+        va + vb - vi
+    );
 }
 
 // --------------------------------------------------------------------------
