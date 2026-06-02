@@ -19,6 +19,7 @@ pub mod boolean;
 pub mod cd;
 pub mod fillet;
 pub mod tessellation;
+pub mod watertight;
 
 /// One stage of a measured pipeline. `input`/`output` are candidate counts
 /// (e.g. feature-pairs), and `cost` is the work the stage performed in whatever
