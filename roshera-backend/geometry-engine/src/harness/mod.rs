@@ -17,6 +17,7 @@
 
 pub mod boolean;
 pub mod cd;
+pub mod tessellation;
 
 /// One stage of a measured pipeline. `input`/`output` are candidate counts
 /// (e.g. feature-pairs), and `cost` is the work the stage performed in whatever
