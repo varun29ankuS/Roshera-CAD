@@ -36,17 +36,13 @@ async fn linear_100_events_on_main() {
 /// inherits the 5 trunk events; appending on each sibling does not
 /// disturb the others.
 ///
-/// IGNORED (pre-existing intermittent hang, surfaced 2026-06-01): passes in
-/// ~0ms when run alone locally, but on the loaded 2-core CI runner it hung for
-/// >46 min under nextest and was never observed to complete. The harness
-/// drives the async timeline through an MPSC-bridged recorder + DashMaps;
-/// rapidly creating 10 forks appears to hit a race/deadlock in that bridge
-/// (same class as the verify_api_key DashMap self-deadlock). Until the bridge
-/// race is fixed, this test is ignored so it cannot wedge CI; the
-/// slow-timeout in .config/nextest.toml is the backstop for any other hang.
-/// NEEDS TRIAGE — do not delete.
+/// (Previously `#[ignore]`d for an intermittent hang under load — now FIXED.
+/// Root cause was a DashMap shard self-deadlock in `Timeline::create_branch`,
+/// which held the parent's `branch_events` shard-read guard across the child
+/// insert into the same map; it deadlocked whenever the random child BranchId
+/// hashed to the parent's shard. Forking 10 siblings off `main` made that
+/// near-certain. Fixed by collecting then dropping the guard before inserting.)
 #[tokio::test]
-#[ignore = "pre-existing: intermittent concurrency hang on loaded runners (timeline MPSC/DashMap bridge) — needs triage"]
 async fn fan_out_ten_siblings() {
     let h = TimelineHarness::new();
     h.add_n(BranchId::main(), 5).await;
@@ -166,14 +162,10 @@ async fn truncate_at_zero_clears_main() {
 /// Two parallel forks from different fork points must remain
 /// independent: an FF on one does not touch the other.
 ///
-/// IGNORED (pre-existing intermittent hang, surfaced 2026-06-01): same class as
-/// `fan_out_ten_siblings` — passes locally but hung on the loaded CI runner
-/// (killed by the nextest 5-min slow-timeout). The async MPSC/DashMap recorder
-/// bridge races/deadlocks under concurrent fork traffic. NEEDS TRIAGE — do not
-/// delete; the timeline-bridge concurrency bug it (and `fan_out_ten_siblings`,
-/// `validate_holds_after_random_op_sequence`) exposes is the real fix.
+/// (Previously `#[ignore]`d for the same intermittent hang as
+/// `fan_out_ten_siblings` — now FIXED by the `Timeline::create_branch` DashMap
+/// shard self-deadlock fix.)
 #[tokio::test]
-#[ignore = "pre-existing: intermittent concurrency hang on loaded runners (timeline MPSC/DashMap bridge) — needs triage"]
 async fn parallel_forks_are_independent() {
     let h = TimelineHarness::new();
     h.add_n(BranchId::main(), 2).await;

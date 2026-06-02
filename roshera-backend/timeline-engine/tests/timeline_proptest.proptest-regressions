@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3301ce1aee497d89dabfd1bad1fd3c77ef36a9148aac124a15e88a22e940f6bc # shrinks to steps = [Append { branch_idx: 0 }, Append { branch_idx: 0 }, Fork { parent_idx: 2948296132 }, Append { branch_idx: 16484185794388206231 }, Abandon { branch_idx: 8639774344469928019 }, Abandon { branch_idx: 18313515205053360857 }, Append { branch_idx: 4942315732366235049 }, Fork { parent_idx: 6109831324644862634 }, Truncate { branch_idx: 5523874099522091757, cut_index: 123 }]
