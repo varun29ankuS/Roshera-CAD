@@ -149,3 +149,28 @@ fn chamfer_removes_material_monotonically_in_setback() {
         "larger chamfer setback must remove more material: d=2 gave {large} !< d=1 {small}"
     );
 }
+
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Wedge oracle over randomized box sizes and setbacks. Box dims are kept
+    /// ≥ 4 and the setback ≤ 1.2, so the chamfer of the first edge stays a
+    /// clean triangular prism (setback ≪ edge/2 ⇒ no corner interaction).
+    /// Every case is validated at construction (via `chamfer_first_edge`,
+    /// `validate_result:true`), checked against the wedge volume, and checked
+    /// for watertightness.
+    #[test]
+    fn prop_chamfer_wedge_volume(
+        w in 4.0f64..10.0,
+        h in 4.0f64..10.0,
+        d in 4.0f64..10.0,
+        dist in 0.2f64..1.2,
+    ) {
+        let (length, tess, mass) = chamfer_first_edge(w, h, d, dist);
+        let expected = w * h * d - 0.5 * dist * dist * length;
+        prop_assert!(rel_close(tess, expected, 0.03), "tess {tess} vs wedge {expected}");
+        prop_assert!(rel_close(tess, mass, 0.03), "tess {tess} vs mass-props {mass}");
+    }
+}

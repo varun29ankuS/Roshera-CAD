@@ -16,7 +16,7 @@
 //! the operation silently no-op'ing.
 
 use geometry_engine::math::{Point3, Vector3};
-use geometry_engine::operations::draft::NeutralElement;
+use geometry_engine::operations::draft::{DraftType, NeutralElement};
 use geometry_engine::operations::{apply_draft, CommonOptions, DraftOptions};
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
@@ -57,9 +57,15 @@ fn mesh_volume(mesh: &TriangleMesh) -> f64 {
 
 /// Build a 10×10×10 box and return it with the FaceId of its +X face.
 fn box_with_plus_x_face() -> (BRepModel, SolidId, FaceId) {
+    box_with_plus_x_face_dims(10.0, 10.0, 10.0)
+}
+
+/// Build a `w×h×d` box (centred at origin) and return it with the FaceId of its
+/// +X face, located by surface normal rather than face ordering.
+fn box_with_plus_x_face_dims(w: f64, h: f64, d: f64) -> (BRepModel, SolidId, FaceId) {
     let mut model = BRepModel::new();
     let solid_id = match TopologyBuilder::new(&mut model)
-        .create_box_3d(10.0, 10.0, 10.0)
+        .create_box_3d(w, h, d)
         .expect("create_box_3d")
     {
         GeometryId::Solid(id) => id,
@@ -230,4 +236,50 @@ fn draft_produces_a_valid_manifold_brep() {
     };
     apply_draft(&mut model, solid_id, vec![face], opts)
         .expect("drafted box must be a valid manifold B-Rep (no boundary edges)");
+}
+
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(40))]
+
+    /// Off-centre draft (neutral plane at the box bottom, z = -d/2) over a
+    /// randomized range of angles and box sizes. The +X face shears outward,
+    /// so the volume grows by the analytic wedge `tanθ · W · H²/2`, where for
+    /// `create_box_3d(w, h, d)` the +X face has width `W = h` (its y-extent)
+    /// and shear height `H = d` (its z-extent, the full distance from the
+    /// bottom neutral plane). Every case is validated (manifold) at
+    /// construction.
+    #[test]
+    fn prop_draft_offcentre_wedge_volume(
+        angle_deg in 1.0f64..12.0,
+        w in 4.0f64..12.0,
+        h in 4.0f64..12.0,
+        d in 4.0f64..12.0,
+    ) {
+        let (mut model, solid_id, face) = box_with_plus_x_face_dims(w, h, d);
+        let angle = angle_deg.to_radians();
+        let opts = DraftOptions {
+            common: CommonOptions {
+                validate_result: true,
+                ..Default::default()
+            },
+            draft_type: DraftType::Angle(angle),
+            neutral: NeutralElement::Plane(Point3::new(0.0, 0.0, -d / 2.0), Vector3::Z),
+            pull_direction: Vector3::Z,
+            ..Default::default()
+        };
+        apply_draft(&mut model, solid_id, vec![face], opts)
+            .expect("off-centre prismatic draft must produce a valid manifold solid");
+
+        let vol = model
+            .mass_properties_for(solid_id)
+            .expect("mass props")
+            .volume;
+        let expected = w * h * d + angle.tan() * h * d * d / 2.0;
+        prop_assert!(
+            rel_close(vol, expected, 0.02),
+            "draft {w}x{h}x{d} @ {angle_deg}°: volume {vol} vs wedge oracle {expected}"
+        );
+    }
 }
