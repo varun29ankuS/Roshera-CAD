@@ -398,6 +398,69 @@ impl BezierPatch {
             .collect()
     }
 
+    /// Half-angle (radians) of a cone bounding all unit normals over the patch —
+    /// the **flatness measure** for the CD subdivision loop (thesis §1.5.1.4).
+    ///
+    /// The patch normal `S_u × S_v` is a convex combination of the cross products
+    /// of the hodograph control vectors: `S_u = Σ aᵢⱼ huᵢⱼ`, `S_v = Σ bₖₗ hvₖₗ`
+    /// with `aᵢⱼ, bₖₗ ≥ 0` summing to 1, so by bilinearity `S_u × S_v =
+    /// Σ aᵢⱼ bₖₗ (huᵢⱼ × hvₖₗ)` — a conic combination of `{huᵢⱼ × hvₖₗ}`. The
+    /// returned angle is the worst-case spread of that set about its mean
+    /// direction; a small value means the patch is nearly planar and subdivision
+    /// can stop (dispatch to a non-iterative LMD method).
+    ///
+    /// `None` when no normal is resolvable: a direction of degree 0 (a ruled /
+    /// degenerate patch) or an all-zero control net. A value of `π` signals the
+    /// normals span more than a hemisphere (a folded patch — maximally non-flat).
+    pub fn normal_cone_half_angle(&self) -> Option<f64> {
+        let hu = self.hodograph_u();
+        let hv = self.hodograph_v();
+        if hu.is_empty() || hv.is_empty() {
+            return None;
+        }
+        let mut normals: Vec<Vector3> = Vec::new();
+        for row in &hu {
+            for tu in row {
+                for vrow in &hv {
+                    for tv in vrow {
+                        if let Ok(n) = tu.cross(tv).normalize() {
+                            normals.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        if normals.is_empty() {
+            return None;
+        }
+        let mut sum = Vector3::ZERO;
+        for n in &normals {
+            sum = sum + *n;
+        }
+        let axis = match sum.normalize() {
+            Ok(a) => a,
+            Err(_) => return Some(std::f64::consts::PI), // normals cancel → folded
+        };
+        let mut half = 0.0_f64;
+        for n in &normals {
+            let ang = n.dot(&axis).clamp(-1.0, 1.0).acos();
+            if ang > half {
+                half = ang;
+            }
+        }
+        Some(half)
+    }
+
+    /// Is the patch flat enough — its normal cone no wider than `angle_tol`?
+    /// A degenerate patch (no resolvable normal) counts as flat so the
+    /// subdivision loop terminates rather than recursing forever.
+    pub fn is_flat(&self, angle_tol: f64) -> bool {
+        match self.normal_cone_half_angle() {
+            Some(half) => half <= angle_tol,
+            None => true,
+        }
+    }
+
     /// Axis-aligned bounding box of the control net. The convex-hull property of
     /// the Bézier form guarantees the patch lies inside it. `None` only if the
     /// control net is empty.
@@ -787,5 +850,102 @@ mod tests {
         assert!((e10.position - cps[4][0]).magnitude() < tol);
         assert!((e01.position - cps[0][4]).magnitude() < tol);
         assert!((e11.position - cps[4][4]).magnitude() < tol);
+    }
+
+    // -- φ.5.1 flatness test -----------------------------------------------
+
+    /// A degree-(1,1) bilinear patch from its four corners (`control_points[i][j]`,
+    /// i in u, j in v).
+    fn bilinear(p00: Point3, p10: Point3, p01: Point3, p11: Point3) -> BezierPatch {
+        BezierPatch {
+            degree_u: 1,
+            degree_v: 1,
+            control_points: vec![vec![p00, p01], vec![p10, p11]],
+            weights: vec![vec![1.0; 2]; 2],
+            domain_u: (0.0, 1.0),
+            domain_v: (0.0, 1.0),
+        }
+    }
+
+    #[test]
+    fn planar_patch_is_flat() {
+        // Four coplanar corners (z = 0) → constant normal → zero spread.
+        let patch = bilinear(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        );
+        let half = patch.normal_cone_half_angle().expect("planar normal cone");
+        assert!(half < 1e-9, "planar patch spread should be ~0, got {half}");
+        assert!(patch.is_flat(1e-6));
+    }
+
+    #[test]
+    fn twisted_patch_is_not_flat_but_subdivision_flattens_it() {
+        // Lift one corner → the normal rotates across the patch (a saddle).
+        let patch = bilinear(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 1.0),
+        );
+        let parent = patch.normal_cone_half_angle().expect("twisted normal cone");
+        assert!(
+            parent > 1e-3,
+            "twisted patch should have real spread, got {parent}"
+        );
+        assert!(!patch.is_flat(1e-3));
+
+        // Subdividing in u strictly tightens the normal cone of each half.
+        let (left, right) = patch.split_u(0.5);
+        let lh = left.normal_cone_half_angle().expect("left");
+        let rh = right.normal_cone_half_angle().expect("right");
+        assert!(
+            lh < parent,
+            "left half {lh} not tighter than parent {parent}"
+        );
+        assert!(
+            rh < parent,
+            "right half {rh} not tighter than parent {parent}"
+        );
+
+        // Repeated subdivision drives the spread toward zero. Each split-pair
+        // shrinks the sub-rectangle by half in each direction; the conservative
+        // control-vector cone shrinks ~linearly, so the half-angle decays
+        // geometrically — deep subdivision is well under any tolerance.
+        let mut p = patch.clone();
+        let mut prev = parent;
+        for _ in 0..8 {
+            p = p.split_u(0.5).0.split_v(0.5).0;
+            let h = p.normal_cone_half_angle().expect("deep");
+            assert!(
+                h <= prev + 1e-12,
+                "each subdivision is no wider: {h} vs {prev}"
+            );
+            prev = h;
+        }
+        assert!(prev < 1e-2, "subdivision converges toward flat, got {prev}");
+    }
+
+    #[test]
+    fn degree_zero_direction_has_no_resolvable_normal() {
+        // A patch that is a line in v (degree_v = 0): no surface normal to bound.
+        let patch = BezierPatch {
+            degree_u: 1,
+            degree_v: 0,
+            control_points: vec![
+                vec![Point3::new(0.0, 0.0, 0.0)],
+                vec![Point3::new(1.0, 0.0, 0.0)],
+            ],
+            weights: vec![vec![1.0], vec![1.0]],
+            domain_u: (0.0, 1.0),
+            domain_v: (0.0, 1.0),
+        };
+        assert!(patch.normal_cone_half_angle().is_none());
+        assert!(
+            patch.is_flat(1e-6),
+            "degenerate patch counts as flat (terminates recursion)"
+        );
     }
 }
