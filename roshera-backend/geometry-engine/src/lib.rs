@@ -4,6 +4,7 @@
 
 pub mod assembly;
 pub mod drawing;
+pub mod harness;
 pub mod math;
 pub mod operations;
 pub mod performance;
