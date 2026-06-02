@@ -4,6 +4,7 @@
 //! is [`cd`], the contact-determination bridge that lifts a solid's boundary
 //! into the polyhedral-cone algebra.
 
+pub mod bvh;
 pub mod cd;
 pub mod features;
 pub mod lmd;
