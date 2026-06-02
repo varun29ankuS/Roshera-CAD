@@ -217,9 +217,23 @@ pub fn tessellate_shell(
     // multi-shell solids in `tessellate_solid`) don't have their
     // earlier shell's vertex indices invalidated.
     if mesh.vertices.len() > weld_start_vertices && mesh.triangles.len() > weld_start_triangles {
+        // The weld merges *coincident* seam vertices — shared B-Rep edges emit
+        // bit-exact duplicate 3D points via the EdgeSampleCache — so its
+        // threshold is a geometric-coincidence distance, NOT the visual chord
+        // tolerance. Using the raw `chord_tolerance` over-merges at coarse
+        // settings: when surface curvature drives the triangle density (e.g. a
+        // sphere's angle-limited grid), the edge length can be ~`chord_tolerance`
+        // itself, so welding at that distance collapses every vertex and deletes
+        // the whole mesh (a coarse-LOD sphere came out invisible — found by the
+        // tessellation ablation harness). Cap it well below any realistic edge
+        // spacing; the cap equals the default chord so fine tessellation (the
+        // production path) is byte-for-byte unchanged, and bit-exact seams still
+        // merge at any positive distance.
+        const MAX_WELD_DISTANCE: f64 = 1e-3;
+        let weld_distance = params.chord_tolerance.min(MAX_WELD_DISTANCE);
         surface::weld_mesh_watertight_range(
             mesh,
-            params.chord_tolerance,
+            weld_distance,
             weld_start_vertices,
             weld_start_triangles,
         );
