@@ -23,6 +23,7 @@ use crate::primitives::{
     solid::SolidId,
     surface::Surface,
     topology_builder::BRepModel,
+    vertex::VertexId,
 };
 
 /// Options for draft operations
@@ -353,6 +354,22 @@ fn draft_single_face(
     match &options.draft_type {
         DraftType::Angle(angle) => {
             let draft_angle = *angle;
+            // Prismatic in-place fast path: when the face is planar, the
+            // neutral element is a plane, and every edge touching the face is a
+            // straight line (the common molding case on prismatic parts), draft
+            // by shearing the face's off-neutral vertices ALONG THE FACE NORMAL
+            // proportional to their distance from the neutral plane. This moves
+            // the existing vertices in place, so every shared edge / vertex /
+            // adjacent face follows automatically — the result is manifold by
+            // construction, with no orphan faces and no boundary edges. The
+            // legacy orphan path below is reached only for the non-prismatic
+            // cases the in-place path declines (it never re-stitched neighbours,
+            // so it produced a non-manifold result — see the draft B-Rep bug).
+            if let Some(face_id) =
+                try_draft_planar_inplace(model, face_id, &face, draft_angle, options)?
+            {
+                return Ok(face_id);
+            }
             let drafted_surface = create_drafted_surface(
                 model,
                 face.surface_id,
@@ -397,6 +414,182 @@ fn draft_single_face(
             )
         }
     }
+}
+
+/// Prismatic in-place draft (planar face, planar neutral, line edges).
+///
+/// Drafts the face by shearing its off-neutral vertices ALONG THE FACE NORMAL
+/// by `distance_from_neutral · tan(angle)`. Because it moves the EXISTING
+/// vertices, every shared edge / vertex / adjacent face follows automatically,
+/// so the result is manifold by construction — no orphan faces, no boundary
+/// edges (the failure mode of the legacy orphan-creation path). Returns
+/// `Some(face_id)` when it drafts the face, or `None` when the face is outside
+/// the prismatic-planar class it handles (caller falls back to the legacy
+/// path). Performs NO mutation on the `None` path: all preconditions are
+/// checked before any vertex moves.
+fn try_draft_planar_inplace(
+    model: &mut BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    draft_angle: f64,
+    options: &DraftOptions,
+) -> OperationResult<Option<FaceId>> {
+    use crate::primitives::curve::Line;
+    use crate::primitives::surface::Plane;
+
+    // Precondition 1: neutral element is a plane.
+    let (neutral_origin, neutral_normal_raw) = match &options.neutral {
+        NeutralElement::Plane(o, n) => (*o, *n),
+        _ => return Ok(None),
+    };
+    let neutral_normal = match neutral_normal_raw.normalize() {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+
+    // Precondition 2: the face surface is a plane; capture its outward normal.
+    let face_normal = {
+        let surface = model.surfaces.get(face.surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("draft: face surface missing".to_string())
+        })?;
+        match surface.as_any().downcast_ref::<Plane>() {
+            Some(p) => p.normal,
+            None => return Ok(None),
+        }
+    };
+
+    // Collect the face's outer-loop vertices (unique, in walk order).
+    let outer = model
+        .loops
+        .get(face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("draft: face loop missing".to_string()))?
+        .clone();
+    let mut face_vertices: Vec<VertexId> = Vec::new();
+    for &edge_id in &outer.edges {
+        let edge = model.edges.get(edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("draft: face edge missing".to_string())
+        })?;
+        for vid in [edge.start_vertex, edge.end_vertex] {
+            if !face_vertices.contains(&vid) {
+                face_vertices.push(vid);
+            }
+        }
+    }
+
+    // Orient the neutral normal toward the pull direction so a positive signed
+    // distance `h` is the pulled side — a stable, documented sign convention.
+    let pull = options.pull_direction.normalize().unwrap_or(neutral_normal);
+    let n_neutral = if neutral_normal.dot(&pull) < 0.0 {
+        -neutral_normal
+    } else {
+        neutral_normal
+    };
+    let tan = draft_angle.tan();
+
+    // Compute new positions for vertices off the neutral plane (these move);
+    // vertices on the parting line (h ≈ 0) stay fixed.
+    let neutral_eps = 1e-6_f64;
+    let mut to_move: Vec<(VertexId, Point3)> = Vec::new();
+    for &vid in &face_vertices {
+        let p = model
+            .vertices
+            .get(vid)
+            .ok_or_else(|| OperationError::InvalidGeometry("draft: vertex missing".to_string()))?
+            .point();
+        let h = (p - neutral_origin).dot(&n_neutral);
+        if h.abs() <= neutral_eps {
+            continue;
+        }
+        to_move.push((vid, p + face_normal * (h * tan)));
+    }
+    if to_move.is_empty() {
+        // Entire face lies on the neutral plane → drafting is a geometric
+        // no-op; report handled so no orphan geometry is created.
+        return Ok(Some(face_id));
+    }
+
+    // Precondition 3: every edge in the model incident to a moving vertex must
+    // be a straight line, so we can rebuild it exactly from its endpoints.
+    // Checked BEFORE any mutation so a decline leaves the model untouched.
+    let moving: std::collections::HashSet<VertexId> = to_move.iter().map(|(v, _)| *v).collect();
+    let mut incident_edges: Vec<EdgeId> = Vec::new();
+    for (eid, edge) in model.edges.iter() {
+        if moving.contains(&edge.start_vertex) || moving.contains(&edge.end_vertex) {
+            let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("draft: incident edge curve missing".to_string())
+            })?;
+            if curve.as_any().downcast_ref::<Line>().is_none() {
+                return Ok(None);
+            }
+            incident_edges.push(eid);
+        }
+    }
+
+    // --- All preconditions met; mutate in place. ---
+
+    // 1. Move the off-neutral vertices.
+    for (vid, np) in &to_move {
+        model.vertices.set_position(*vid, np.x, np.y, np.z);
+    }
+
+    // 2. Rebuild every incident line edge through its (now moved) endpoints.
+    for &eid in &incident_edges {
+        let (sv, ev) = {
+            let e = model.edges.get(eid).ok_or_else(|| {
+                OperationError::InvalidGeometry("draft: incident edge vanished".to_string())
+            })?;
+            (e.start_vertex, e.end_vertex)
+        };
+        let sp = model
+            .vertices
+            .get(sv)
+            .ok_or_else(|| {
+                OperationError::InvalidGeometry("draft: edge start missing".to_string())
+            })?
+            .point();
+        let ep = model
+            .vertices
+            .get(ev)
+            .ok_or_else(|| OperationError::InvalidGeometry("draft: edge end missing".to_string()))?
+            .point();
+        let curve_id = model.curves.add(Box::new(Line::new(sp, ep)));
+        if let Some(edge) = model.edges.get_mut(eid) {
+            edge.curve_id = curve_id;
+        }
+    }
+
+    // 3. Refit the drafted face's plane from its updated boundary vertices so
+    //    the surface matches the moved geometry exactly, oriented to agree with
+    //    the original outward normal.
+    let pts: Vec<Point3> = face_vertices
+        .iter()
+        .filter_map(|&vid| model.vertices.get(vid).map(|v| v.point()))
+        .collect();
+    if pts.len() >= 3 {
+        let mut new_normal = None;
+        for i in 1..pts.len() - 1 {
+            let n = (pts[i] - pts[0]).cross(&(pts[i + 1] - pts[0]));
+            if n.magnitude() > 1e-9 {
+                new_normal = Some(n);
+                break;
+            }
+        }
+        if let Some(n) = new_normal {
+            let mut n = n.normalize().map_err(|e| {
+                OperationError::NumericalError(format!("draft plane normal: {e:?}"))
+            })?;
+            if n.dot(&face_normal) < 0.0 {
+                n = -n;
+            }
+            let new_plane = Plane::from_point_normal(pts[0], n)?;
+            let sid = model.surfaces.add(Box::new(new_plane));
+            if let Some(f) = model.faces.get_mut(face_id) {
+                f.surface_id = sid;
+            }
+        }
+    }
+
+    Ok(Some(face_id))
 }
 
 /// Create drafted surface
