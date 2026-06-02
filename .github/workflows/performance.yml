@@ -106,7 +106,10 @@ jobs:
     - name: Install Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '18'
+        # Node 20+ required: recent artillery (via undici) references the
+        # `File` global, which only exists from Node 20. On Node 18 the load
+        # test died with `ReferenceError: File is not defined` on every run.
+        node-version: '20'
 
     - name: Install load test tools
       run: npm install -g artillery
