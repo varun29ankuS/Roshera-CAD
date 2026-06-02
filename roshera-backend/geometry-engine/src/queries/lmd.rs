@@ -19,7 +19,7 @@
 use crate::math::vector3::{Point3, Vector3};
 use crate::math::Tolerance;
 use crate::primitives::face::FaceId;
-use crate::primitives::surface::{Plane, Sphere, Surface, SurfaceType};
+use crate::primitives::surface::{Cylinder, Plane, Sphere, Surface, SurfaceType};
 use crate::primitives::topology_builder::BRepModel;
 
 /// Degenerate-geometry threshold (coincident points, parallel normals).
@@ -50,13 +50,24 @@ pub struct Lmd {
 /// degenerate configurations (concentric spheres, intersecting planes) where no
 /// isolated local minimum exists.
 pub fn surface_lmds(a: &dyn Surface, b: &dyn Surface, tol: Tolerance) -> Vec<Lmd> {
-    use SurfaceType::{Plane as P, Sphere as S};
+    use SurfaceType::{Cylinder as Cyl, Plane as P, Sphere as S};
     match (a.surface_type(), b.surface_type()) {
         (S, S) => sphere_sphere(a, b, tol),
         (P, S) => plane_sphere(a, b, tol),
         (S, P) => plane_sphere(b, a, tol).into_iter().map(swap_lmd).collect(),
         (P, P) => plane_plane(a, b, tol),
-        // φ.4.2 (Plane × {Cyl,Cone,Torus}), φ.4.3 (non-plane), φ.5 (free-form).
+        (P, Cyl) => plane_cylinder(a, b, tol),
+        (Cyl, P) => plane_cylinder(b, a, tol)
+            .into_iter()
+            .map(swap_lmd)
+            .collect(),
+        (S, Cyl) => sphere_cylinder(a, b, tol),
+        (Cyl, S) => sphere_cylinder(b, a, tol)
+            .into_iter()
+            .map(swap_lmd)
+            .collect(),
+        // Remaining φ.4.2 (Plane × {Cone,Torus}), φ.4.3 (Cyl×Cyl, Cyl×Sphere via
+        // above, Cone/Torus pairs), φ.5 (free-form Bézier-Newton).
         _ => Vec::new(),
     }
 }
@@ -179,6 +190,59 @@ fn plane_plane(a: &dyn Surface, b: &dyn Surface, tol: Tolerance) -> Vec<Lmd> {
     let s = (pa.origin - pb.origin).dot(&pb.normal);
     let foot_b = pa.origin - pb.normal * s;
     finish(a, pa.origin, b, foot_b, tol).into_iter().collect()
+}
+
+/// Sphere × Cylinder (infinite cylinder): the LMD lies along the radial line
+/// from the sphere centre perpendicular to the cylinder axis. Degenerate when
+/// the sphere centre lies on the axis (a whole circle is equidistant) or on the
+/// cylinder surface.
+fn sphere_cylinder(a: &dyn Surface, b: &dyn Surface, tol: Tolerance) -> Vec<Lmd> {
+    let (Some(sp), Some(cy)) = (
+        a.as_any().downcast_ref::<Sphere>(),
+        b.as_any().downcast_ref::<Cylinder>(),
+    ) else {
+        return Vec::new();
+    };
+    let h = (sp.center - cy.origin).dot(&cy.axis);
+    let foot = cy.origin + cy.axis * h; // sphere centre projected onto the axis
+    let radial = sp.center - foot;
+    let d_axis = radial.magnitude();
+    if d_axis < LMD_EPS {
+        return Vec::new(); // centre on the axis → degenerate equidistant circle
+    }
+    let u = radial * (1.0 / d_axis);
+    let pc = foot + u * cy.radius; // nearest cylinder point, at the sphere's height
+    let to_pc = pc - sp.center;
+    let l = to_pc.magnitude();
+    if l < LMD_EPS {
+        return Vec::new(); // sphere centre exactly on the cylinder surface
+    }
+    let ps = sp.center + to_pc * (sp.radius / l); // sphere point toward the cylinder
+    finish(a, ps, b, pc, tol).into_iter().collect()
+}
+
+/// Plane × Cylinder (infinite cylinder). Only the axis-parallel-to-plane case
+/// has an isolated LMD (a degenerate ruling line; one representative pair is
+/// returned). A tilted axis makes the infinite cylinder cross the plane →
+/// distance 0, no isolated LMD (the finite cap-rim contact is an edge feature,
+/// handled elsewhere).
+fn plane_cylinder(a: &dyn Surface, b: &dyn Surface, tol: Tolerance) -> Vec<Lmd> {
+    let (Some(pl), Some(cy)) = (
+        a.as_any().downcast_ref::<Plane>(),
+        b.as_any().downcast_ref::<Cylinder>(),
+    ) else {
+        return Vec::new();
+    };
+    if cy.axis.dot(&pl.normal).abs() > LMD_EPS {
+        return Vec::new(); // axis not parallel to plane → infinite cylinder intersects
+    }
+    let c0 = (cy.origin - pl.origin).dot(&pl.normal); // signed axis-to-plane distance
+    let sign = if c0 >= 0.0 { 1.0 } else { -1.0 };
+    // The plane normal is ⊥ the axis (parallel case), so −sign·normal is a valid
+    // radial direction on the cylinder: the lateral point nearest the plane.
+    let pc = cy.origin - pl.normal * (sign * cy.radius);
+    let foot = pc - pl.normal * (pc - pl.origin).dot(&pl.normal); // project onto plane
+    finish(a, foot, b, pc, tol).into_iter().collect()
 }
 
 /// Fill the parameter/normal/distance fields of an LMD from its two 3D
@@ -348,15 +412,75 @@ mod tests {
         assert!(!is_lmd_critical_point(&bogus, 1e-6));
     }
 
-    // -- unimplemented pairs return empty (no panics) ----------------------
+    // -- Sphere × Cylinder / Plane × Cylinder ------------------------------
+
+    fn cylinder(o: Point3, a: Vector3, r: f64) -> Cylinder {
+        Cylinder::new(o, a, r).expect("valid cylinder")
+    }
 
     #[test]
-    fn unwired_pair_returns_empty() {
+    fn sphere_cylinder_lmd_along_radial() {
+        let cy = cylinder(Vector3::new(0.0, 0.0, 0.0), Z, 1.0); // axis +Z, r=1
+        let sp = sphere(Vector3::new(5.0, 0.0, 0.0), 1.0);
+        let lmds = surface_lmds(&sp, &cy, tol());
+        assert_eq!(lmds.len(), 1);
+        let l = lmds[0];
+        assert!(approx(l.distance, 3.0), "5 − 1(cyl) − 1(sph)");
+        assert!(
+            approx_pt(l.point_a, Vector3::new(4.0, 0.0, 0.0)),
+            "sphere footpoint"
+        );
+        assert!(
+            approx_pt(l.point_b, Vector3::new(1.0, 0.0, 0.0)),
+            "cylinder footpoint"
+        );
+        assert!(is_lmd_critical_point(&l, 1e-9));
+    }
+
+    #[test]
+    fn cylinder_sphere_swap_consistent() {
+        let cy = cylinder(Vector3::new(0.0, 0.0, 0.0), Z, 1.0);
+        let sp = sphere(Vector3::new(5.0, 0.0, 0.0), 1.0);
+        let sphere_first = surface_lmds(&sp, &cy, tol());
+        let cyl_first = surface_lmds(&cy, &sp, tol());
+        assert_eq!(sphere_first.len(), cyl_first.len());
+        assert!(approx_pt(sphere_first[0].point_a, cyl_first[0].point_b));
+        assert!(approx_pt(sphere_first[0].point_b, cyl_first[0].point_a));
+    }
+
+    #[test]
+    fn sphere_on_cylinder_axis_is_degenerate() {
+        let cy = cylinder(Vector3::new(0.0, 0.0, 0.0), Z, 1.0);
+        let sp = sphere(Vector3::new(0.0, 0.0, 3.0), 0.5); // centre on the axis
+        assert!(surface_lmds(&sp, &cy, tol()).is_empty());
+    }
+
+    #[test]
+    fn plane_cylinder_parallel_axis_gives_one_lmd() {
+        let pl = plane(Vector3::new(0.0, 0.0, 0.0), Z, X); // z = 0
+        let cy = cylinder(Vector3::new(0.0, 0.0, 3.0), X, 1.0); // axis +X ∥ plane, at z = 3
+        let lmds = surface_lmds(&pl, &cy, tol());
+        assert_eq!(lmds.len(), 1);
+        assert!(approx(lmds[0].distance, 2.0), "3 − 1");
+        assert!(is_lmd_critical_point(&lmds[0], 1e-9));
+    }
+
+    #[test]
+    fn plane_cylinder_tilted_axis_intersects_empty() {
         let pl = plane(Vector3::new(0.0, 0.0, 0.0), Z, X);
-        let cyl = crate::primitives::surface::Cylinder::new(Vector3::new(0.0, 0.0, 0.0), Z, 1.0)
-            .expect("valid cylinder");
-        // Plane × Cylinder is φ.4.2 — not wired yet, must return empty cleanly.
-        assert!(surface_lmds(&pl, &cyl, tol()).is_empty());
+        let cy = cylinder(Vector3::new(0.0, 0.0, 3.0), Z, 1.0); // axis +Z ⟂ plane → intersects
+        assert!(surface_lmds(&pl, &cy, tol()).is_empty());
+    }
+
+    // -- deferred pairs return empty (no panics) ---------------------------
+
+    #[test]
+    fn deferred_pair_returns_empty() {
+        let pl = plane(Vector3::new(0.0, 0.0, 0.0), Z, X);
+        let cone = crate::primitives::surface::Cone::new(Vector3::new(0.0, 0.0, 5.0), Z, 0.5)
+            .expect("valid cone");
+        // Plane × Cone is deferred (φ.4.2 cone/torus) — must return empty cleanly.
+        assert!(surface_lmds(&pl, &cone, tol()).is_empty());
     }
 
     // -- face-level trim rejection ----------------------------------------
@@ -495,6 +619,39 @@ mod tests {
         m
     }
 
+    fn on_cylinder(p: Point3, o: Point3, a: Vector3, r: f64) -> bool {
+        let h = (p - o).dot(&a);
+        let rad = (p - o - a * h).magnitude();
+        (rad - r).abs() < 1e-7
+    }
+
+    /// An orthonormal pair spanning the plane perpendicular to unit axis `a`.
+    fn axis_frame(a: Vector3) -> (Vector3, Vector3) {
+        let seed = if a.dot(&X).abs() < 0.9 { X } else { Y };
+        let e1 = (seed - a * seed.dot(&a)).normalize().expect("perp");
+        let e2 = a.cross(&e1);
+        (e1, e2)
+    }
+
+    /// Sample lattice over a finite window of an (infinite) cylinder's lateral
+    /// surface — `n` heights across `[h_lo, h_hi]` × `n` angles.
+    fn cyl_grid(o: Point3, a: Vector3, r: f64, h_lo: f64, h_hi: f64, n: usize) -> Vec<Point3> {
+        let (e1, e2) = axis_frame(a);
+        let mut pts = Vec::with_capacity(n * n);
+        for i in 0..n {
+            let h = h_lo + (h_hi - h_lo) * (i as f64) / ((n - 1) as f64);
+            for j in 0..n {
+                let th = std::f64::consts::TAU * (j as f64) / (n as f64);
+                pts.push(o + a * h + (e1 * th.cos() + e2 * th.sin()) * r);
+            }
+        }
+        pts
+    }
+
+    fn cylinder_s(o: Point3, a: Vector3, r: f64) -> Cylinder {
+        Cylinder::new(o, a, r).expect("valid cylinder")
+    }
+
     proptest! {
         /// Sphere × Sphere, every configuration: the LMD is critical, both
         /// footpoints lie exactly on their spheres, the `distance` field is
@@ -586,6 +743,24 @@ mod tests {
             prop_assert!((base[0].point_a + t - moved[0].point_a).magnitude() < 1e-7);
             prop_assert!((base[0].point_b + t - moved[0].point_b).magnitude() < 1e-7);
         }
+
+        /// Sphere × Cylinder, random sphere and random-axis cylinder: at most one
+        /// LMD (zero only in the degenerate on-axis / on-surface case), and when
+        /// present it is critical with both footpoints exactly on their surfaces.
+        #[test]
+        fn pp_sphere_cylinder_invariants(
+            co in any_point(), ax in any_unit(), rc in any_radius(),
+            sc in any_point(), rs in any_radius(),
+        ) {
+            let lmds = surface_lmds(&sphere(sc, rs), &cylinder_s(co, ax, rc), tol());
+            prop_assert!(lmds.len() <= 1);
+            if let Some(m) = lmds.first() {
+                prop_assert!(on_sphere(m.point_a, sc, rs), "pa off sphere");
+                prop_assert!(on_cylinder(m.point_b, co, ax, rc), "pb off cylinder");
+                prop_assert!((m.distance - (m.point_a - m.point_b).magnitude()).abs() < 1e-9);
+                prop_assert!(is_lmd_critical_point(m, 1e-6), "LMD not critical");
+            }
+        }
     }
 
     proptest! {
@@ -628,6 +803,28 @@ mod tests {
                 .fold(f64::INFINITY, f64::min);
             prop_assert!(analytic <= brute + 1e-9, "analytic {} > brute min {}", analytic, brute);
             prop_assert!(brute - analytic <= 0.15 * r + 1e-6, "analytic {} far below brute {}", analytic, brute);
+        }
+
+        /// Global-min oracle for Sphere × Cylinder: the sphere is placed radially
+        /// outside the cylinder (separated by `sep`), and the analytic distance
+        /// must be ≤ every sampled sphere/cylinder pair, and not grossly below it.
+        #[test]
+        fn pp_sphere_cylinder_is_global_min(
+            co in any_point(), ax in any_unit(), rc in any_radius(),
+            h0 in -3.0f64..3.0, sep in 0.6f64..5.0, rs in any_radius(),
+        ) {
+            let (e1, _e2) = axis_frame(ax);
+            let foot = co + ax * h0;
+            let sc = foot + e1 * (rc + rs + sep); // sphere centre, radially separated
+            let lmds = surface_lmds(&sphere(sc, rs), &cylinder_s(co, ax, rc), tol());
+            prop_assert_eq!(lmds.len(), 1);
+            let analytic = lmds[0].distance;
+            let brute = min_cross_dist(
+                &sphere_grid(sc, rs, 14),
+                &cyl_grid(co, ax, rc, h0 - 2.0, h0 + 2.0, 18),
+            );
+            prop_assert!(analytic <= brute + 1e-9, "analytic {} > brute min {}", analytic, brute);
+            prop_assert!(brute - analytic <= 0.2 * (rc + rs) + 1e-6, "analytic {} far below brute {}", analytic, brute);
         }
     }
 }
