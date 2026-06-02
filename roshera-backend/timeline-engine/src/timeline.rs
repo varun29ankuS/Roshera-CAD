@@ -490,20 +490,28 @@ impl Timeline {
             hidden: false,
         };
 
-        // Copy events up to fork point
+        // Copy events up to the fork point into a fresh map, THEN insert it.
+        //
+        // CRITICAL — DashMap shard self-deadlock: `parent_events` is a `Ref`
+        // into the `branch_events` DashMap (a read guard on the parent's
+        // shard). The child's entry is inserted into that SAME map. Holding the
+        // parent's shard-read guard across the child insert deadlocks whenever
+        // the child `BranchId` hashes to the parent's shard. Because the child
+        // id is a fresh random `BranchId::new()`, the collision is
+        // probabilistic — so this hung INTERMITTENTLY (a different fork each
+        // run), which is exactly why the timeline tests timed out under load.
+        // Collecting first and dropping the guard before the insert removes the
+        // overlap. (Same bug class as the verify_api_key DashMap deadlock.)
+        let new_branch_events = DashMap::new();
         if let Some(parent_events) = self.branch_events.get(&parent_branch) {
-            let new_branch_events = DashMap::new();
-
             for entry in parent_events.iter() {
                 let idx = *entry.key();
-                let event_id = *entry.value();
                 if idx <= fork_index {
-                    new_branch_events.insert(idx, event_id);
+                    new_branch_events.insert(idx, *entry.value());
                 }
             }
-
-            self.branch_events.insert(branch_id, new_branch_events);
         }
+        self.branch_events.insert(branch_id, new_branch_events);
 
         self.branches.insert(branch_id, branch);
 
@@ -1159,9 +1167,6 @@ impl Timeline {
             }
         }
 
-        let dropped: std::collections::HashSet<EventId> =
-            to_remove.iter().map(|(_, id)| *id).collect();
-
         // Scrub inherited copies of dropped events from each cascaded
         // child's branch_events. (Their own post-fork events stay; only
         // the inherited prefix is invalid.) We mutate before flipping
@@ -1175,17 +1180,32 @@ impl Timeline {
             }
         }
 
-        // Now safe to remove from the global event table — no branch
-        // index still references these IDs (modulo branches not
-        // descended from `branch_id`, which by construction don't share
-        // the dropped events).
+        // Purge from the GLOBAL event table only events that NO branch index
+        // still references. Inherited events are SHARED across branches —
+        // `create_branch` copies the parent's `branch_events` entries, so the
+        // same EventId appears in the parent's and every descendant's index —
+        // hence a truncate on one branch must not delete an event a sibling or
+        // ancestor still points at. The previous code removed every dropped
+        // event unconditionally; the surviving references then dangled and
+        // `validate()` caught "branch … references missing event id …". The
+        // per-branch indices for `branch_id` and its cascaded children were
+        // already scrubbed above, so a remaining reference is a genuinely
+        // shared event that must stay.
+        let mut purged: std::collections::HashSet<EventId> = std::collections::HashSet::new();
         for (_, event_id) in &to_remove {
-            self.events.remove(event_id);
+            let still_referenced = self
+                .branch_events
+                .iter()
+                .any(|be| be.value().iter().any(|e| *e.value() == *event_id));
+            if !still_referenced {
+                self.events.remove(event_id);
+                purged.insert(*event_id);
+            }
         }
 
-        if !dropped.is_empty() {
+        if !purged.is_empty() {
             for mut entry in self.entity_events.iter_mut() {
-                entry.value_mut().retain(|eid| !dropped.contains(eid));
+                entry.value_mut().retain(|eid| !purged.contains(eid));
             }
         }
 

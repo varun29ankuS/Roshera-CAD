@@ -144,18 +144,13 @@ proptest! {
     /// ~30 steps — empirically enough to exercise multi-branch
     /// interleavings while keeping each case fast.
     ///
-    /// IGNORED (pre-existing bug, surfaced 2026-06-01): this proptest is BOTH
-    /// slow (>60s for the 64-case run) AND fails intermittently — it finds an
-    /// op sequence after which `timeline().validate()` returns Err (the
-    /// `panic!` at the bottom of `run`). The sequences include
-    /// `truncate_branch(.., force=true)` on `main`, so either force-truncating
-    /// main can drive the DAG into a state `validate()` rejects (a real
-    /// timeline bug) or the test should not assert validity after a forced
-    /// main-truncate. It was never validated before now because CI never
-    /// reached the test step (fmt gate, then the auth deadlock). NEEDS TRIAGE
-    /// — do not delete; it encodes a real reproducer.
+    /// (Previously `#[ignore]`d. It exposed TWO real pre-existing bugs, both now
+    /// fixed: (1) an intermittent hang — the `create_branch` DashMap shard
+    /// self-deadlock; (2) a `validate()` failure "branch … references missing
+    /// event id …" after a truncate — `truncate_branch` purged events from the
+    /// GLOBAL store that were still SHARED with a sibling/ancestor branch. Both
+    /// fixed in `Timeline`.)
     #[test]
-    #[ignore = "pre-existing: validate() fails after random force-truncate sequences + slow — needs triage"]
     fn validate_holds_after_random_op_sequence(
         steps in proptest::collection::vec(step_strategy(), 1..30usize),
     ) {

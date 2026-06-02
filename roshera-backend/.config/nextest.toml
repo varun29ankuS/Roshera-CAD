@@ -1,21 +1,10 @@
 # cargo-nextest configuration.
 #
-# slow-timeout bounds any single test so a hang can never burn the whole CI job.
-# A test warns at 60s and is TERMINATED after 5 such periods (5 min). 5 min is
-# far above the slowest legitimate single test, so only genuine hangs are killed.
+# slow-timeout is a backstop: any test still running after 5 min (60s warn ×
+# terminate-after 5) is terminated and reported, so a hang can never burn the
+# whole CI job. It was added when timeline-engine's tests intermittently
+# deadlocked (a `Timeline::create_branch` DashMap shard self-deadlock — now
+# fixed); it stays as cheap insurance against any future hang. 5 min is far
+# above the slowest legitimate single test.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
-
-# timeline-engine's async tests drive an MPSC/DashMap recorder bridge under
-# tokio and intermittently DEADLOCK — a different test hangs roughly 1 run in
-# N, even when run alone and single-threaded (so it is a genuine timing-
-# dependent race in the bridge, not just CPU starvation). The bridge race is
-# the real fix (see the #[ignore]'d timeline tests). Until then, CI runs
-# timeline-engine under this profile: a hung test is killed fast (60s) and
-# RETRIED up to twice. Because the hang is intermittent, a retry almost always
-# passes; a DETERMINISTIC failure still fails all 3 attempts, so this masks
-# flakiness, not real regressions. Timeline tests are ~0.03s each, so the only
-# thing that ever hits 60s is an actual hang.
-[profile.timeline]
-retries = 2
-slow-timeout = { period = "30s", terminate-after = 2 }
