@@ -143,16 +143,20 @@ macro_rules! partial_revolve_test {
     ($name:ident, $x0:expr, $x1:expr, $z0:expr, $z1:expr, $angle:expr) => {
         #[test]
         fn $name() {
-            if let Some(vol) = revolve_volume($x0, $x1, $z0, $z1, $angle) {
-                let expected = pappus_volume($x0, $x1, $z0, $z1, $angle);
-                assert!(
-                    rel_close(vol, expected, 0.06),
-                    "revolve angle {}: vol {} vs Pappus {}",
-                    $angle,
-                    vol,
-                    expected
-                );
-            }
+            // Partial revolves (≤180°) tessellate watertight and MUST succeed
+            // for these fixed known-good profiles — a `None` here means revolve
+            // regressed into an outright failure, which must fail the test
+            // rather than silently skip it (the vacuous-pass trap).
+            let vol = revolve_volume($x0, $x1, $z0, $z1, $angle)
+                .expect("partial revolve (≤180°) of a known-good profile must succeed");
+            let expected = pappus_volume($x0, $x1, $z0, $z1, $angle);
+            assert!(
+                rel_close(vol, expected, 0.06),
+                "revolve angle {}: vol {} vs Pappus {}",
+                $angle,
+                vol,
+                expected
+            );
         }
     };
 }

@@ -6,11 +6,13 @@
 //! at 3 %.
 //!
 //! Boolean volume relations (inclusion–exclusion, difference, idempotence) are
-//! checked on axis-aligned boxes. Per the kernel's documented numerical-rigor
-//! contract (see boolean_proptest.rs), a boolean may return any typed `Err`
-//! until it hardens further; these tests therefore treat `Err` as a skip and
-//! only assert the relation when the op succeeds — so they add coverage
-//! without flaking.
+//! checked on axis-aligned boxes. These are the common, known-correct case, so
+//! the op MUST succeed for these fixed inputs: each case `.expect()`s a result
+//! (a `None`/`Err` is a kernel regression that fails the test) rather than
+//! silently passing when the op fails — which would be a vacuous pass that
+//! hides exactly the kind of regression these tests exist to catch. (The
+//! "Err ⇒ skip" allowance is reserved for genuinely hard, non-axis-aligned or
+//! curved inputs elsewhere; see operation_composition_invariants.rs.)
 
 use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::operations::{
@@ -142,6 +144,14 @@ fn vol(model: &mut BRepModel, id: SolidId) -> Option<f64> {
     model.mass_properties_for(id).map(|mp| mp.volume)
 }
 
+/// Axis-aligned box booleans are the common, known-correct case: for these
+/// fixed known-good inputs the op MUST succeed. A `None`/`Err` here is a
+/// kernel regression, not a hard-input skip — so call sites `.expect()` this
+/// rather than silently passing the test when the operation fails to produce a
+/// result (the vacuous-pass trap).
+const AXIS_BOOL_MUST_SUCCEED: &str =
+    "axis-aligned box boolean on known-good input must succeed (Err/None here is a kernel regression)";
+
 /// Build A (2³ box at origin) and B (2³ box shifted +x by `shift`), run
 /// `op`, and return (vol_a, vol_b, vol_result) when the op succeeds.
 fn boolean_box_case(shift: f64, op: BooleanOp) -> Option<(f64, f64, f64)> {
@@ -166,74 +176,65 @@ fn boolean_box_case(shift: f64, op: BooleanOp) -> Option<(f64, f64, f64)> {
 fn boolean_union_inclusion_exclusion() {
     // A = [-1,1]³, B shifted +1 in x = [0,2]×[-1,1]². Overlap = 1×2×2 = 4,
     // so vol(A∪B) = 8 + 8 - 4 = 12.
-    if let (Some((va, vb, vu)), Some((_, _, vi))) = (
-        boolean_box_case(1.0, BooleanOp::Union),
-        boolean_box_case(1.0, BooleanOp::Intersection),
-    ) {
-        assert!(
-            rel_close(vu, va + vb - vi, 0.05),
-            "inclusion-exclusion: vol(A∪B)={vu} vs va+vb-vi={}",
-            va + vb - vi
-        );
-    }
+    let (va, vb, vu) = boolean_box_case(1.0, BooleanOp::Union).expect(AXIS_BOOL_MUST_SUCCEED);
+    let (_, _, vi) = boolean_box_case(1.0, BooleanOp::Intersection).expect(AXIS_BOOL_MUST_SUCCEED);
+    assert!(
+        rel_close(vu, va + vb - vi, 0.05),
+        "inclusion-exclusion: vol(A∪B)={vu} vs va+vb-vi={}",
+        va + vb - vi
+    );
 }
 
 #[test]
 fn boolean_union_between_max_and_sum() {
-    if let Some((va, vb, vu)) = boolean_box_case(1.0, BooleanOp::Union) {
-        assert!(vu >= va.max(vb) * 0.95, "union {vu} below max input");
-        assert!(vu <= (va + vb) * 1.05, "union {vu} above sum of inputs");
-    }
+    let (va, vb, vu) = boolean_box_case(1.0, BooleanOp::Union).expect(AXIS_BOOL_MUST_SUCCEED);
+    assert!(vu >= va.max(vb) * 0.95, "union {vu} below max input");
+    assert!(vu <= (va + vb) * 1.05, "union {vu} above sum of inputs");
 }
 
 #[test]
 fn boolean_intersection_at_most_min() {
-    if let Some((va, vb, vi)) = boolean_box_case(1.0, BooleanOp::Intersection) {
-        assert!(
-            vi <= va.min(vb) * 1.05,
-            "intersection {vi} exceeds min input"
-        );
-        assert!(
-            vi > 0.0,
-            "overlapping boxes must intersect in positive volume"
-        );
-    }
+    let (va, vb, vi) =
+        boolean_box_case(1.0, BooleanOp::Intersection).expect(AXIS_BOOL_MUST_SUCCEED);
+    assert!(
+        vi <= va.min(vb) * 1.05,
+        "intersection {vi} exceeds min input"
+    );
+    assert!(
+        vi > 0.0,
+        "overlapping boxes must intersect in positive volume"
+    );
 }
 
 #[test]
 fn boolean_difference_at_most_minuend() {
-    if let Some((va, _vb, vd)) = boolean_box_case(1.0, BooleanOp::Difference) {
-        assert!(vd <= va * 1.05, "A−B volume {vd} exceeds A {va}");
-        assert!(vd > 0.0, "A−B of partially overlapping boxes is non-empty");
-    }
+    let (va, _vb, vd) = boolean_box_case(1.0, BooleanOp::Difference).expect(AXIS_BOOL_MUST_SUCCEED);
+    assert!(vd <= va * 1.05, "A−B volume {vd} exceeds A {va}");
+    assert!(vd > 0.0, "A−B of partially overlapping boxes is non-empty");
 }
 
 #[test]
 fn boolean_difference_equals_a_minus_intersection() {
-    if let (Some((va, _, vd)), Some((_, _, vi))) = (
-        boolean_box_case(1.0, BooleanOp::Difference),
-        boolean_box_case(1.0, BooleanOp::Intersection),
-    ) {
-        assert!(
-            rel_close(vd, va - vi, 0.05),
-            "vol(A−B)={vd} vs vol(A)-vol(A∩B)={}",
-            va - vi
-        );
-    }
+    let (va, _, vd) = boolean_box_case(1.0, BooleanOp::Difference).expect(AXIS_BOOL_MUST_SUCCEED);
+    let (_, _, vi) = boolean_box_case(1.0, BooleanOp::Intersection).expect(AXIS_BOOL_MUST_SUCCEED);
+    assert!(
+        rel_close(vd, va - vi, 0.05),
+        "vol(A−B)={vd} vs vol(A)-vol(A∩B)={}",
+        va - vi
+    );
 }
 
 #[test]
 fn boolean_intersection_smaller_with_less_overlap() {
     // Less overlap (larger shift) ⇒ smaller intersection volume.
-    if let (Some((_, _, vi_near)), Some((_, _, vi_far))) = (
-        boolean_box_case(0.5, BooleanOp::Intersection),
-        boolean_box_case(1.5, BooleanOp::Intersection),
-    ) {
-        assert!(
-            vi_far <= vi_near * 1.05,
-            "more-separated overlap not smaller: {vi_far} vs {vi_near}"
-        );
-    }
+    let (_, _, vi_near) =
+        boolean_box_case(0.5, BooleanOp::Intersection).expect(AXIS_BOOL_MUST_SUCCEED);
+    let (_, _, vi_far) =
+        boolean_box_case(1.5, BooleanOp::Intersection).expect(AXIS_BOOL_MUST_SUCCEED);
+    assert!(
+        vi_far <= vi_near * 1.05,
+        "more-separated overlap not smaller: {vi_far} vs {vi_near}"
+    );
 }
 
 proptest! {
