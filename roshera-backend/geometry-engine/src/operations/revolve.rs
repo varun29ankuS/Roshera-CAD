@@ -154,65 +154,377 @@ pub fn revolve_profile(
     })
 }
 
-/// Create a pure revolution (no helical component)
+/// Create a pure revolution (no helical component) as a watertight B-Rep.
+///
+/// Builds a SHARED vertex/edge grid rather than independent per-quad islands:
+///   * one ring of vertices per profile vertex (station 0 reuses the original
+///     profile vertex; a full revolution wraps station `segments` back to 0; a
+///     profile vertex on the axis collapses to a single shared apex),
+///   * shared meridian arcs between angular stations, and
+///   * shared profile-arc edges at each station.
+/// Every quad face then shares all four borders with its neighbours, so the
+/// shell is a closed 2-manifold. For a partial revolution the start/end caps
+/// are rebuilt from the SAME station-0 / station-`segments` arcs (not fresh
+/// geometry) so the caps seal watertight too.
+///
+/// The previous implementation created fresh vertices/edges for every quad,
+/// leaving every edge single-use — a non-manifold shell with a broken Euler
+/// characteristic. It only ever "passed" because the call sites set
+/// `validate_result = false`.
 fn create_revolution(
     model: &mut BRepModel,
     base_face: &Face,
     base_face_id: FaceId,
     options: &RevolveOptions,
 ) -> OperationResult<SolidId> {
-    let mut shell_faces = Vec::new();
-    let is_full_revolution = (options.angle - std::f64::consts::TAU).abs() < 1e-10;
+    use crate::primitives::r#loop::LoopType;
+    use std::collections::HashMap;
 
-    // Create revolved surfaces for each edge of the face
+    let is_full = (options.angle - std::f64::consts::TAU).abs() < 1e-10;
+    let segments = options.segments.max(3);
+    let axis_origin = options.axis_origin;
+    let axis = options.axis_direction.normalize()?;
+    let seg_angle = options.angle / segments as f64;
+
     let base_loop = model
         .loops
         .get(base_face.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
+    let base_surface_id = base_face.surface_id;
 
-    // For each edge in the profile, create a surface of revolution
-    for &edge_id in &base_loop.edges {
-        let surface_faces = create_revolved_edge_surface(
+    // Rotation about the axis line (through axis_origin), reused throughout.
+    let rot_about_axis = |angle: f64| -> OperationResult<Matrix4> {
+        let to_origin = Matrix4::from_translation(&-axis_origin);
+        let from_origin = Matrix4::from_translation(&axis_origin);
+        Ok(from_origin * Matrix4::from_axis_angle(&axis, angle)? * to_origin)
+    };
+
+    // Profile edges in loop order, endpoints honouring loop orientation.
+    let mut prof: Vec<(u32, VertexId, VertexId)> = Vec::new();
+    for (idx, &eid) in base_loop.edges.iter().enumerate() {
+        let e = model.edges.get(eid).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "revolve: profile edge {eid} (slot {idx}) not found"
+            ))
+        })?;
+        let fwd = base_loop.orientations.get(idx).copied().unwrap_or(true);
+        let (s, en) = if fwd {
+            (e.start_vertex, e.end_vertex)
+        } else {
+            (e.end_vertex, e.start_vertex)
+        };
+        prof.push((e.curve_id, s, en));
+    }
+
+    // Unique profile vertices, first-seen order.
+    let mut uniq: Vec<VertexId> = Vec::new();
+    for &(_, s, en) in &prof {
+        if !uniq.contains(&s) {
+            uniq.push(s);
+        }
+        if !uniq.contains(&en) {
+            uniq.push(en);
+        }
+    }
+
+    // Distinct angular stations: full wraps (segments), partial is open (segments+1).
+    let n_stations = if is_full { segments } else { segments + 1 };
+
+    // Vertex ring per profile vertex (single shared apex when on the axis).
+    let mut rings: HashMap<VertexId, Vec<VertexId>> = HashMap::new();
+    let mut apex: HashMap<VertexId, bool> = HashMap::new();
+    for &pv in &uniq {
+        let pos = model.vertices.get_position(pv).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!("revolve: profile vertex {pv} not found"))
+        })?;
+        let p = Vector3::new(pos[0], pos[1], pos[2]);
+        let rel = p - axis_origin;
+        let radial = rel - axis * rel.dot(&axis);
+        if radial.magnitude() < 1e-9 {
+            apex.insert(pv, true);
+            rings.insert(pv, vec![pv]);
+        } else {
+            apex.insert(pv, false);
+            let mut ring = Vec::with_capacity(n_stations as usize);
+            ring.push(pv);
+            for s in 1..n_stations {
+                let rp = rot_about_axis(seg_angle * s as f64)?.transform_point(&p);
+                ring.push(model.vertices.add(rp.x, rp.y, rp.z));
+            }
+            rings.insert(pv, ring);
+        }
+    }
+
+    let vid_at = |pv: VertexId, s: u32| -> VertexId {
+        if apex[&pv] {
+            return rings[&pv][0];
+        }
+        let ring = &rings[&pv];
+        let idx = if is_full {
+            (s % segments) as usize
+        } else {
+            s as usize
+        };
+        ring[idx]
+    };
+
+    // Meridian arcs per (profile vertex, segment). Apex vertices contribute none
+    // (their faces degenerate to triangles).
+    let mut merid: HashMap<(VertexId, u32), EdgeId> = HashMap::new();
+    for &pv in &uniq {
+        if apex[&pv] {
+            continue;
+        }
+        for s in 0..segments {
+            let a = vid_at(pv, s);
+            let b = vid_at(pv, s + 1);
+            let eid = create_meridian_edge(
+                model,
+                a,
+                b,
+                axis_origin,
+                axis,
+                seg_angle * s as f64,
+                seg_angle * (s + 1) as f64,
+            )?;
+            merid.insert((pv, s), eid);
+        }
+    }
+
+    // Profile-arc edges: a rotated copy of each profile edge at each station,
+    // sharing the ring vertices. Full revolution wraps station `segments` → 0.
+    let mut arcs: HashMap<(usize, u32), EdgeId> = HashMap::new();
+    for (e_idx, &(curve_id, sp, ep)) in prof.iter().enumerate() {
+        for s in 0..n_stations {
+            let xf = rot_about_axis(seg_angle * s as f64)?;
+            let curve = model.curves.get(curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: profile curve not found".to_string())
+            })?;
+            let rotated = curve.transform(&xf);
+            let new_cid = model.curves.add(rotated);
+            let edge = Edge::new_auto_range(
+                0,
+                vid_at(sp, s),
+                vid_at(ep, s),
+                new_cid,
+                EdgeOrientation::Forward,
+            );
+            arcs.insert((e_idx, s), model.edges.add(edge));
+        }
+    }
+    let arc_at = |e_idx: usize, s: u32| -> EdgeId {
+        let st = if is_full { s % segments } else { s };
+        arcs[&(e_idx, st)]
+    };
+
+    // Side faces: one per (profile edge, angular segment), boundary
+    // bottom-arc(fwd) · right-meridian(fwd) · top-arc(bwd) · left-meridian(bwd).
+    let mut shell_faces: Vec<FaceId> = Vec::new();
+    for (e_idx, &(curve_id, sp, ep)) in prof.iter().enumerate() {
+        // Outward normal of this profile edge at angle 0 = the right-hand
+        // normal of the (CCW) profile loop, which points OUT of the solid.
+        // edge dir d, profile-plane normal n_p = axis × r̂ (the angular tangent
+        // at angle 0); outward = n_p × d. (Using `radial` for every edge — the
+        // old behaviour — inverts the inner wall and the caps, which is why the
+        // divergence-theorem volume came out at ⅓.) Per segment it is rotated
+        // to the segment's mid-angle.
+        let sp0 = model.vertices.get_position(vid_at(sp, 0)).ok_or_else(|| {
+            OperationError::InvalidGeometry("revolve: profile start vertex not found".to_string())
+        })?;
+        let ep0 = model.vertices.get_position(vid_at(ep, 0)).ok_or_else(|| {
+            OperationError::InvalidGeometry("revolve: profile end vertex not found".to_string())
+        })?;
+        let sp0 = Vector3::new(sp0[0], sp0[1], sp0[2]);
+        let ep0 = Vector3::new(ep0[0], ep0[1], ep0[2]);
+        let d = ep0 - sp0;
+        let mid = (sp0 + ep0) * 0.5;
+        let mrel = mid - axis_origin;
+        let rhat = mrel - axis * mrel.dot(&axis);
+        let outward0 = if rhat.magnitude_squared() > 1e-20 {
+            let n_p = axis.cross(&rhat.normalize()?);
+            n_p.cross(&d).normalize().unwrap_or(rhat)
+        } else {
+            // Edge centroid on the axis (apex-touching): fall back to ±axis
+            // by the edge's axial direction.
+            axis
+        };
+
+        for s in 0..segments {
+            let mid_angle = seg_angle * (s as f64 + 0.5);
+            let outward_target =
+                Matrix4::from_axis_angle(&axis, mid_angle)?.transform_vector(&outward0);
+
+            let mut fl = Loop::new(0, LoopType::Outer);
+            fl.add_edge(arc_at(e_idx, s), true);
+            if !apex[&ep] {
+                fl.add_edge(merid[&(ep, s)], true);
+            }
+            fl.add_edge(arc_at(e_idx, s + 1), false);
+            if !apex[&sp] {
+                fl.add_edge(merid[&(sp, s)], false);
+            }
+            let loop_id = model.loops.add(fl);
+
+            // Surface for THIS segment patch only: the profile rotated to the
+            // segment's start angle, swept by `seg_angle`. SurfaceOfRevolution
+            // always spans u ∈ [0, angle] from the given profile, so a single
+            // full-TAU surface shared by every segment makes the tessellator
+            // re-mesh the entire revolution per face (~32× overdraw + wrong
+            // divergence volume). A per-segment surface whose domain is exactly
+            // the wedge meshes only the wedge.
+            let start_xf = rot_about_axis(seg_angle * s as f64)?;
+            let rotated_profile = model
+                .curves
+                .get(curve_id)
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry("revolve: profile curve not found".to_string())
+                })?
+                .clone_box()
+                .transform(&start_xf);
+            let surface: Box<dyn Surface> = Box::new(
+                crate::primitives::surface::SurfaceOfRevolution::new(
+                    axis_origin,
+                    axis,
+                    rotated_profile,
+                    seg_angle,
+                )
+                .map_err(|e| OperationError::NumericalError(format!("revolution surface: {e}")))?,
+            );
+            let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
+            let surf_id = model.surfaces.add(surface);
+            shell_faces.push(model.faces.add(Face::new(0, surf_id, loop_id, orientation)));
+        }
+    }
+
+    // Caps for a partial revolution: the profile face at station 0 and at
+    // station `segments`, rebuilt from the shared station arcs so they seal.
+    if !is_full && options.cap_ends {
+        shell_faces.push(build_revolution_cap(
             model,
-            edge_id,
-            true, // Assuming forward orientation
-            options.axis_origin,
-            options.axis_direction,
-            options.angle,
-            options.segments,
-        )?;
-        shell_faces.extend(surface_faces);
+            &prof,
+            &arcs,
+            0,
+            base_surface_id,
+            axis_origin,
+            axis,
+            &rot_about_axis(0.0)?,
+            true, // start cap faces back along -sweep
+        )?);
+        shell_faces.push(build_revolution_cap(
+            model,
+            &prof,
+            &arcs,
+            segments,
+            base_surface_id,
+            axis_origin,
+            axis,
+            &rot_about_axis(seg_angle * segments as f64)?,
+            false, // end cap faces along +sweep
+        )?);
     }
 
-    // Add end caps for partial revolutions
-    if !is_full_revolution && options.cap_ends {
-        // Start cap (original face)
-        shell_faces.push(base_face_id);
-
-        // End cap (rotated face)
-        let end_rotation = Matrix4::from_axis_angle(&options.axis_direction, options.angle)?;
-        let end_face = create_transformed_face(model, base_face, end_rotation)?;
-        shell_faces.push(end_face);
+    // Remove the scratch profile face (the revolve INPUT). It is not part of
+    // the result — the caps are rebuilt from the shared station arcs — so left
+    // in place it would linger as an orphaned, single-use boundary that the
+    // whole-model validator flags. Its vertices are retained: they are reused
+    // as the station-0 ring. The original profile edges are not reused (fresh
+    // station arcs replace them), so they are removed too.
+    for &eid in &base_loop.edges {
+        model.edges.remove(eid);
     }
+    for &il in &base_face.inner_loops {
+        if let Some(l) = model.loops.get(il).cloned() {
+            for &eid in &l.edges {
+                model.edges.remove(eid);
+            }
+        }
+        model.loops.remove(il);
+    }
+    model.loops.remove(base_face.outer_loop);
+    model.faces.remove(base_face_id);
 
-    // Create shell and solid
-    let shell_type = if is_full_revolution || options.cap_ends {
+    let shell_type = if is_full || options.cap_ends {
         ShellType::Closed
     } else {
         ShellType::Open
     };
-
-    let mut shell = Shell::new(0, shell_type); // ID will be assigned by store
-    for face_id in &shell_faces {
-        shell.add_face(*face_id);
+    let mut shell = Shell::new(0, shell_type);
+    for &fid in &shell_faces {
+        shell.add_face(fid);
     }
     let shell_id = model.shells.add(shell);
+    let solid = Solid::new(0, shell_id);
+    Ok(model.solids.add(solid))
+}
 
-    let solid = Solid::new(0, shell_id); // ID will be assigned by store
-    let solid_id = model.solids.add(solid);
+/// Build a revolution end-cap face at a given angular `station`, reusing the
+/// shared profile-arc edges so it shares its boundary with the adjacent ring of
+/// side faces (watertight). The cap surface is the base profile surface rotated
+/// to the station; orientation is chosen so the normal points out of the body
+/// (opposite the sweep at the start cap, along it at the end cap).
+#[allow(clippy::too_many_arguments)]
+fn build_revolution_cap(
+    model: &mut BRepModel,
+    prof: &[(u32, VertexId, VertexId)],
+    arcs: &std::collections::HashMap<(usize, u32), EdgeId>,
+    station: u32,
+    base_surface_id: u32,
+    axis_origin: Point3,
+    axis: Vector3,
+    station_xform: &Matrix4,
+    is_start: bool,
+) -> OperationResult<FaceId> {
+    use crate::primitives::r#loop::LoopType;
 
-    Ok(solid_id)
+    // Closed loop of the profile arcs at this station (profile order).
+    let mut fl = Loop::new(0, LoopType::Outer);
+    let mut centroid = Vector3::ZERO;
+    let mut n = 0.0;
+    for (e_idx, &(_, sp, _)) in prof.iter().enumerate() {
+        let eid = *arcs.get(&(e_idx, station)).ok_or_else(|| {
+            OperationError::InvalidGeometry("revolve: cap arc not found".to_string())
+        })?;
+        fl.add_edge(eid, true);
+        let _ = sp;
+        if let Some(q) = model.edges.get(eid).and_then(|e| {
+            let v = e.start_vertex;
+            model.vertices.get_position(v)
+        }) {
+            centroid = centroid + Vector3::new(q[0], q[1], q[2]);
+            n += 1.0;
+        }
+    }
+    if n > 0.0 {
+        centroid = centroid * (1.0 / n);
+    }
+    let loop_id = model.loops.add(fl);
+
+    // Cap surface: base profile surface rotated to this station.
+    let base_surf = model
+        .surfaces
+        .get(base_surface_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("revolve: base surface not found".into()))?;
+    let cap_surface = base_surf.transform(station_xform);
+
+    // Outward = ± the angular tangent (axis × radial) at the cap centroid.
+    let rel = centroid - axis_origin;
+    let radial = rel - axis * rel.dot(&axis);
+    let tangent = axis.cross(&radial);
+    let outward_target = if tangent.magnitude_squared() > 1e-20 {
+        if is_start {
+            tangent * -1.0
+        } else {
+            tangent
+        }
+    } else if is_start {
+        axis * -1.0
+    } else {
+        axis
+    };
+    let orientation = orient_face_for_outward(cap_surface.as_ref(), outward_target)?;
+    let surf_id = model.surfaces.add(cap_surface);
+    Ok(model.faces.add(Face::new(0, surf_id, loop_id, orientation)))
 }
 
 /// Create a helical sweep — revolve with axial translation (pitch per revolution)
@@ -1309,13 +1621,11 @@ mod tests {
     fn revolve_profile_full_revolution_creates_solid() {
         let mut model = BRepModel::new();
         let edges = make_offset_rectangle(&mut model);
-        let opts = RevolveOptions {
-            common: CommonOptions {
-                validate_result: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        // validate_result defaults to true: the result must be a VALID manifold
+        // (the grid revolve produces a watertight-topology shell; the old
+        // island-per-quad shell was non-manifold and only "passed" with
+        // validation disabled).
+        let opts = RevolveOptions::default();
         let solid_id = revolve_profile(&mut model, edges, opts).expect("revolve");
         assert!(model.solids.get(solid_id).is_some());
     }
@@ -1327,11 +1637,7 @@ mod tests {
         let opts = RevolveOptions {
             angle: std::f64::consts::PI, // half revolution
             cap_ends: true,
-            common: CommonOptions {
-                validate_result: false,
-                ..Default::default()
-            },
-            ..Default::default()
+            ..Default::default() // validate_result defaults true → manifold check
         };
         let solid_id = revolve_profile(&mut model, edges, opts).expect("revolve");
         let solid = model.solids.get(solid_id).expect("solid");
