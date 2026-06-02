@@ -144,6 +144,19 @@ impl PolyhedralCone {
         }
     }
 
+    /// The reflected cone `-C = { -x : x ∈ C }`. Negating every generator and
+    /// every support yields `-C`: a supporting constraint `x·s ≤ 0` of `C`
+    /// becomes `(-x)·(-s) ≤ 0`, so `-s` supports `-C` and `-g` is an extreme
+    /// ray of it. The full-space sentinel and the trivial `{0}` cone are both
+    /// fixed points. Used by feature-pair culling: two features can touch iff
+    /// `A`'s normal cone and the *reflection* of `B`'s normal cone share a ray.
+    pub fn negated(&self) -> PolyhedralCone {
+        PolyhedralCone {
+            generators: self.generators.iter().map(|g| -*g).collect(),
+            supports: self.supports.iter().map(|s| -*s).collect(),
+        }
+    }
+
     /// Does direction `d` (need not be unit; the zero vector is the apex, in
     /// every cone) lie inside the cone? Tested against the H-rep.
     pub fn contains(&self, d: &Vector3) -> bool {
