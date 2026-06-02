@@ -1,10 +1,13 @@
 //! Dense linear-system solvers shared across the kernel.
 //!
-//! These routines are intentionally simple (Gaussian elimination with partial
-//! pivoting, normal-equations LSQ) so that modules which need a small dense
-//! solve — the 2D sketch constraint solver and the G2 Bézier blend
-//! construction — can share a single implementation without pulling in a
-//! full linear-algebra crate.
+//! Dense `f64` solvers shared across the kernel — Gaussian elimination with
+//! partial pivoting for square systems, and **Householder QR** least-squares
+//! (with an **SVD minimum-norm** fallback for rank-deficient / under-determined
+//! systems) — so modules that need a small dense solve (the 2D sketch
+//! constraint solver, the G2 Bézier blend construction) share one
+//! implementation without pulling in a full linear-algebra crate. The QR/SVD
+//! pair replaced the old normal-equations LSQ, which squared the condition
+//! number and was singular for every under-determined system.
 //!
 //! # Numerical scope
 //!
@@ -239,19 +242,18 @@ pub fn householder_qr_solve(
 ///
 /// Returns the update vector `x` of length `cols(J)`.
 ///
-/// * **Square / over-determined (`rows ≥ cols`)** — the Gauss-Newton case —
-///   is solved by [`householder_qr_solve`] directly on `J`. This is the
-///   accuracy-critical path and QR avoids the condition-number squaring of the
-///   normal equations.
-/// * **Under-determined (`rows < cols`)** falls back to the normal equations
-///   `JᵀJ x = -Jᵀe`. Note `JᵀJ` is `cols × cols` with rank ≤ `rows < cols`, so
-///   it is necessarily singular and this path returns [`MathError::SingularMatrix`]
-///   — the minimum-norm solution requires the SVD pseudo-inverse (forthcoming).
-///   Callers needing the under-determined case should regularize the system.
+/// * **Square / over-determined (`rows ≥ cols`), full rank** — the Gauss-Newton
+///   case — is solved by [`householder_qr_solve`] directly on `J` (fast, and no
+///   condition-number squaring).
+/// * **Rank-deficient or under-determined (`rows < cols`)** is solved by the
+///   SVD pseudo-inverse ([`crate::math::svd::solve_least_squares_svd`]), giving
+///   the **minimum-norm** least-squares solution for every shape and rank.
+///
+/// So this never spuriously fails on a rank-deficient Jacobian (which
+/// Gauss-Newton can hit near singularities) — it degrades to the min-norm
+/// update instead.
 ///
 /// # Errors
-/// * [`MathError::SingularMatrix`] if `J` (over-determined) is rank-deficient
-///   or `JᵀJ` (under-determined) is singular.
 /// * [`MathError::DimensionMismatch`] if row counts disagree between `J` and
 ///   `e`.
 pub fn solve_least_squares(
@@ -282,34 +284,26 @@ pub fn solve_least_squares(
         }
     }
 
-    // Over-determined / square: solve J x ≈ -e by Householder QR directly on J
-    // (no condition-number squaring).
+    // Target: J x ≈ -e.
+    let b: Vec<f64> = errors.iter().map(|&e| -e).collect();
+
+    // Over-determined / square full-rank → Householder QR (fast, no
+    // condition-number squaring). If J is rank-deficient, QR reports
+    // SingularMatrix and we fall through to the SVD minimum-norm solve.
     if m >= n {
-        let b: Vec<f64> = errors.iter().map(|&e| -e).collect();
-        return householder_qr_solve(jacobian.to_vec(), b, tolerance);
-    }
-
-    // Under-determined fallback — normal equations: A = J^T J, b = -J^T e.
-    let mut ata = vec![vec![0.0_f64; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            let mut s = 0.0_f64;
-            for k in 0..m {
-                s += jacobian[k][i] * jacobian[k][j];
+        match householder_qr_solve(jacobian.to_vec(), b.clone(), tolerance) {
+            Ok(x) => return Ok(x),
+            Err(MathError::SingularMatrix) => {
+                // Rank-deficient over-determined → SVD minimum-norm LSQ.
             }
-            ata[i][j] = s;
+            Err(e) => return Err(e),
         }
-    }
-    let mut atb = vec![0.0_f64; n];
-    for i in 0..n {
-        let mut s = 0.0_f64;
-        for k in 0..m {
-            s -= jacobian[k][i] * errors[k];
-        }
-        atb[i] = s;
     }
 
-    gaussian_elimination(ata, atb, tolerance)
+    // Under-determined or rank-deficient → SVD pseudo-inverse gives the
+    // minimum-norm least-squares solution for every shape and rank (replaces
+    // the old normal-equations fallback, which was singular whenever m < n).
+    crate::math::svd::solve_least_squares_svd(jacobian.to_vec(), &b, tolerance)
 }
 
 /// Convenience: solve `A x = b` using the strict tolerance pivot threshold.
@@ -457,14 +451,32 @@ mod tests {
     }
 
     #[test]
-    fn solve_least_squares_underdetermined_is_singular_pending_svd() {
-        // m < n: JᵀJ (n×n) has rank ≤ m < n, so it is singular and the
-        // normal-equations fallback reports SingularMatrix. The min-norm
-        // solution will come from the SVD pseudo-inverse (forthcoming).
+    fn solve_least_squares_underdetermined_is_minimum_norm() {
+        // m < n: now solved via the SVD pseudo-inverse. J x ≈ 2 with J = [[1,1]]
+        // ⇒ x0 + x1 = 2; the minimum-norm solution is x = [1, 1].
         let j = vec![vec![1.0, 1.0]];
         let e = vec![-2.0];
-        let err = solve_least_squares(&j, &e, STRICT_TOLERANCE)
-            .expect_err("under-determined normal equations are singular");
-        assert!(matches!(err, MathError::SingularMatrix));
+        let x = solve_least_squares(&j, &e, STRICT_TOLERANCE).expect("min-norm via SVD");
+        assert!((x[0] + x[1] - 2.0).abs() < 1e-9, "constraint: {x:?}");
+        assert!(
+            (x[0] - 1.0).abs() < 1e-9 && (x[1] - 1.0).abs() < 1e-9,
+            "min-norm: {x:?}"
+        );
+    }
+
+    #[test]
+    fn solve_least_squares_rank_deficient_overdetermined_degrades_to_minnorm() {
+        // Over-determined but rank-deficient (both columns identical): QR
+        // reports singular, and the solver degrades to the SVD min-norm update
+        // instead of failing. J·x ≈ -e with e = [-2,-4,-6] ⇒ J x ≈ [2,4,6];
+        // column = [1,2,3], so x0+x1 = 2 with min-norm ⇒ x = [1,1].
+        let j = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]];
+        let e = vec![-2.0, -4.0, -6.0];
+        let x = solve_least_squares(&j, &e, STRICT_TOLERANCE).expect("min-norm degrade");
+        assert!((x[0] + x[1] - 2.0).abs() < 1e-9, "{x:?}");
+        assert!(
+            (x[0] - 1.0).abs() < 1e-9 && (x[1] - 1.0).abs() < 1e-9,
+            "{x:?}"
+        );
     }
 }
