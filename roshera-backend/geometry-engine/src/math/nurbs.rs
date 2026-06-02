@@ -1421,21 +1421,55 @@ impl NurbsCurve {
     /// Returns `None` if all control points are collinear (no plane is
     /// uniquely defined). The origin is the first control point; the
     /// normal is the first non-degenerate cross product found.
+    /// Total-least-squares best-fit plane through the control net.
+    ///
+    /// Returns `(centroid, unit_normal)` of the plane minimizing the sum of
+    /// squared point-to-plane distances over **all** control points — the
+    /// normal is the right singular vector of the centered point matrix with
+    /// the smallest singular value (the direction of least variance). Returns
+    /// `None` when no plane is well-defined: fewer than 3 points, or the points
+    /// are (near-)collinear so the normal direction is ambiguous.
+    ///
+    /// (Previously this took the cross product of the first three non-collinear
+    /// control points — an arbitrary triangle that ignored every other point
+    /// and gave a poor fit for noisy near-planar nets.)
     pub fn best_fit_plane(&self) -> Option<(Point3, Vector3)> {
-        if self.control_points.len() < 3 {
+        let pts = &self.control_points;
+        if pts.len() < 3 {
             return None;
         }
-        let p0 = self.control_points[0];
-        for i in 1..self.control_points.len() - 1 {
-            let v1 = self.control_points[i] - p0;
-            for j in (i + 1)..self.control_points.len() {
-                let v2 = self.control_points[j] - p0;
-                if let Ok(n) = v1.cross(&v2).normalize() {
-                    return Some((p0, n));
-                }
-            }
+        // Centroid of the control net.
+        let n = pts.len() as f64;
+        let (mut cx, mut cy, mut cz) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for p in pts {
+            cx += p.x;
+            cy += p.y;
+            cz += p.z;
         }
-        None
+        let centroid = Point3::new(cx / n, cy / n, cz / n);
+
+        // SVD of the centered point matrix (rows = p − centroid).
+        let rows: Vec<Vec<f64>> = pts
+            .iter()
+            .map(|p| vec![p.x - centroid.x, p.y - centroid.y, p.z - centroid.z])
+            .collect();
+        let svd = crate::math::svd::svd_jacobi(rows, crate::math::STRICT_TOLERANCE).ok()?;
+        if svd.singular_values.len() < 3 {
+            return None;
+        }
+        // A unique plane needs a 2D spread: if the second singular value is
+        // negligible the points are (near-)collinear ⇒ no well-defined normal.
+        let s0 = svd.singular_values[0];
+        let s1 = svd.singular_values[1];
+        if s0 <= 0.0 || s1 <= 1e-12 * s0 {
+            return None;
+        }
+        // Smallest-σ right singular vector (V is sorted descending ⇒ last col).
+        let last = svd.v[0].len() - 1;
+        let normal = Vector3::new(svd.v[0][last], svd.v[1][last], svd.v[2][last])
+            .normalize()
+            .ok()?;
+        Some((centroid, normal))
     }
 
     /// Test whether all control points lie within `tolerance_distance` of
