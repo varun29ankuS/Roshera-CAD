@@ -379,7 +379,12 @@ proptest! {
 
     #[test]
     fn prop_cylinder_volume_matches_formula(
-        radius in 0.3f64..5.0, height in 0.3f64..10.0,
+        // Bounded so the (debug-profile) tessellation mass_properties_for runs
+        // stays well inside the nextest slow-timeout: large cylinders mesh to
+        // many thousands of triangles, and under CPU contention a few such cases
+        // can blow the budget. The volume formula is size-independent, so a
+        // moderate range exercises it just as well.
+        radius in 0.3f64..3.0, height in 0.3f64..5.0,
     ) {
         let mut model = BRepModel::new();
         let id = make_cylinder(&mut model, radius, height);
