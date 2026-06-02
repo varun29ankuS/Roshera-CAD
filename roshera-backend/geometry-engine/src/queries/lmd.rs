@@ -435,4 +435,199 @@ mod tests {
             &Vector3::new(1.0, 50.0, 0.0)
         ));
     }
+
+    // -- property tests (adversarial: oracles that should FAIL on a wrong
+    //    closed form, not vacuously pass) -----------------------------------
+
+    use proptest::prelude::*;
+
+    fn any_unit() -> impl Strategy<Value = Vector3> {
+        (-1.0f64..1.0, -1.0f64..1.0, -1.0f64..1.0).prop_filter_map("nonzero", |(x, y, z)| {
+            Vector3::new(x, y, z).normalize().ok()
+        })
+    }
+    fn any_point() -> impl Strategy<Value = Vector3> {
+        (-8.0f64..8.0, -8.0f64..8.0, -8.0f64..8.0).prop_map(|(x, y, z)| Vector3::new(x, y, z))
+    }
+    fn any_radius() -> impl Strategy<Value = f64> {
+        0.3f64..3.5
+    }
+
+    /// A plane through `origin` with unit `normal`; `Plane::new` orthogonalises
+    /// the seed, so any non-parallel seed yields a valid frame.
+    fn make_plane(origin: Point3, normal: Vector3) -> Plane {
+        let seed = if normal.dot(&X).abs() < 0.9 { X } else { Y };
+        Plane::new(origin, normal, seed).expect("valid plane")
+    }
+
+    fn on_sphere(p: Point3, c: Point3, r: f64) -> bool {
+        ((p - c).magnitude() - r).abs() < 1e-7
+    }
+    fn on_plane(p: Point3, o: Point3, n: Vector3) -> bool {
+        (p - o).dot(&n).abs() < 1e-7
+    }
+
+    /// Lat/long sample lattice over a sphere, in world axes (frame-independent —
+    /// we only need the point set for a brute-force minimum).
+    fn sphere_grid(c: Point3, r: f64, n: usize) -> Vec<Point3> {
+        let mut pts = Vec::with_capacity(n * (n + 1));
+        for i in 0..n {
+            let theta = std::f64::consts::TAU * (i as f64) / (n as f64);
+            for j in 0..=n {
+                let phi = std::f64::consts::PI * (j as f64) / (n as f64);
+                let dir = Vector3::new(phi.sin() * theta.cos(), phi.sin() * theta.sin(), phi.cos());
+                pts.push(c + dir * r);
+            }
+        }
+        pts
+    }
+
+    fn min_cross_dist(a: &[Point3], b: &[Point3]) -> f64 {
+        let mut m = f64::INFINITY;
+        for pa in a {
+            for pb in b {
+                let d = (*pa - *pb).magnitude();
+                if d < m {
+                    m = d;
+                }
+            }
+        }
+        m
+    }
+
+    proptest! {
+        /// Sphere × Sphere, every configuration: the LMD is critical, both
+        /// footpoints lie exactly on their spheres, the `distance` field is
+        /// self-consistent, and it equals the analytic gap |L − rA − rB|.
+        #[test]
+        fn pp_sphere_sphere_invariants(
+            ca in any_point(), cb in any_point(), ra in any_radius(), rb in any_radius(),
+        ) {
+            let a = sphere(ca, ra);
+            let b = sphere(cb, rb);
+            let l = (cb - ca).magnitude();
+            let lmds = surface_lmds(&a, &b, tol());
+            if l < LMD_EPS {
+                prop_assert!(lmds.is_empty(), "concentric → degenerate");
+            } else {
+                prop_assert_eq!(lmds.len(), 1);
+                let m = lmds[0];
+                prop_assert!(on_sphere(m.point_a, ca, ra), "pa off sphere A");
+                prop_assert!(on_sphere(m.point_b, cb, rb), "pb off sphere B");
+                prop_assert!((m.distance - (m.point_a - m.point_b).magnitude()).abs() < 1e-9);
+                prop_assert!((m.distance - (l - ra - rb).abs()).abs() < 1e-7, "distance ≠ analytic gap");
+                prop_assert!(is_lmd_critical_point(&m, 1e-6), "LMD not critical");
+            }
+        }
+
+        /// Plane × Sphere, every orientation: critical, footpoints on their
+        /// surfaces, distance equals ||s| − r| where s is the centre's signed
+        /// distance from the plane.
+        #[test]
+        fn pp_plane_sphere_invariants(
+            o in any_point(), n in any_unit(), c in any_point(), r in any_radius(),
+        ) {
+            let pl = make_plane(o, n);
+            let sp = sphere(c, r);
+            let lmds = surface_lmds(&pl, &sp, tol());
+            prop_assert_eq!(lmds.len(), 1);
+            let m = lmds[0];
+            let s = (c - o).dot(&pl.normal);
+            prop_assert!(on_plane(m.point_a, o, pl.normal), "pa off plane");
+            prop_assert!(on_sphere(m.point_b, c, r), "pb off sphere");
+            prop_assert!((m.distance - (m.point_a - m.point_b).magnitude()).abs() < 1e-9);
+            prop_assert!((m.distance - (s.abs() - r).abs()).abs() < 1e-7, "distance ≠ ||s|−r|");
+            prop_assert!(is_lmd_critical_point(&m, 1e-6), "LMD not critical");
+        }
+
+        /// Argument order is a labelling, not a result: swapping A and B swaps
+        /// the footpoints and preserves the distance (sphere × sphere).
+        #[test]
+        fn pp_swap_symmetry_sphere_sphere(
+            ca in any_point(), cb in any_point(), ra in any_radius(), rb in any_radius(),
+        ) {
+            prop_assume!((cb - ca).magnitude() >= LMD_EPS);
+            let ab = surface_lmds(&sphere(ca, ra), &sphere(cb, rb), tol());
+            let ba = surface_lmds(&sphere(cb, rb), &sphere(ca, ra), tol());
+            prop_assert_eq!(ab.len(), ba.len());
+            prop_assert!((ab[0].distance - ba[0].distance).abs() < 1e-9);
+            prop_assert!((ab[0].point_a - ba[0].point_b).magnitude() < 1e-7);
+            prop_assert!((ab[0].point_b - ba[0].point_a).magnitude() < 1e-7);
+        }
+
+        /// Cross-kind swap: Plane×Sphere and Sphere×Plane agree under role swap.
+        #[test]
+        fn pp_swap_symmetry_plane_sphere(
+            o in any_point(), n in any_unit(), c in any_point(), r in any_radius(),
+        ) {
+            let pl = make_plane(o, n);
+            let sp = sphere(c, r);
+            let ps = surface_lmds(&pl, &sp, tol());
+            let sp_pl = surface_lmds(&sp, &pl, tol());
+            prop_assert_eq!(ps.len(), sp_pl.len());
+            prop_assert!((ps[0].distance - sp_pl[0].distance).abs() < 1e-9);
+            prop_assert!((ps[0].point_a - sp_pl[0].point_b).magnitude() < 1e-7);
+            prop_assert!((ps[0].point_b - sp_pl[0].point_a).magnitude() < 1e-7);
+        }
+
+        /// Rigid translation invariance: moving both spheres by t leaves the
+        /// distance unchanged and shifts both footpoints by t. Catches any
+        /// frame-origin-dependent error.
+        #[test]
+        fn pp_translation_invariance(
+            ca in any_point(), cb in any_point(), ra in any_radius(), rb in any_radius(),
+            t in any_point(),
+        ) {
+            prop_assume!((cb - ca).magnitude() >= LMD_EPS);
+            let base = surface_lmds(&sphere(ca, ra), &sphere(cb, rb), tol());
+            let moved = surface_lmds(&sphere(ca + t, ra), &sphere(cb + t, rb), tol());
+            prop_assert_eq!(base.len(), moved.len());
+            prop_assert!((base[0].distance - moved[0].distance).abs() < 1e-9);
+            prop_assert!((base[0].point_a + t - moved[0].point_a).magnitude() < 1e-7);
+            prop_assert!((base[0].point_b + t - moved[0].point_b).magnitude() < 1e-7);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The headline bug-finder: the analytic Sphere×Sphere distance must be
+        /// the TRUE global minimum — no sampled pair on the two surfaces is
+        /// closer (catches "returned the antipodal/maximum pair"), and it is not
+        /// grossly below the sampled minimum (catches a wrong-small distance).
+        /// Spheres are constructed guaranteed-separated so the gap is exactly
+        /// `sep`.
+        #[test]
+        fn pp_sphere_sphere_is_global_min(
+            ca in any_point(), dir in any_unit(), sep in 0.6f64..6.0,
+            ra in any_radius(), rb in any_radius(),
+        ) {
+            let cb = ca + dir * (ra + rb + sep);
+            let lmds = surface_lmds(&sphere(ca, ra), &sphere(cb, rb), tol());
+            prop_assert_eq!(lmds.len(), 1);
+            let analytic = lmds[0].distance;
+            let brute = min_cross_dist(&sphere_grid(ca, ra, 16), &sphere_grid(cb, rb, 16));
+            prop_assert!(analytic <= brute + 1e-9, "analytic {} > brute min {}", analytic, brute);
+            prop_assert!(brute - analytic <= 0.15 * (ra + rb) + 1e-6, "analytic {} far below brute {}", analytic, brute);
+        }
+
+        /// Same global-min oracle for Plane × Sphere: perpendicular distance from
+        /// every sphere sample to the plane is ≥ the analytic LMD distance.
+        #[test]
+        fn pp_plane_sphere_is_global_min(
+            o in any_point(), n in any_unit(), gap in 0.6f64..6.0, r in any_radius(),
+        ) {
+            let c = o + n * (r + gap); // sphere on +normal side, separated
+            let pl = make_plane(o, n);
+            let lmds = surface_lmds(&pl, &sphere(c, r), tol());
+            prop_assert_eq!(lmds.len(), 1);
+            let analytic = lmds[0].distance;
+            let brute = sphere_grid(c, r, 16)
+                .iter()
+                .map(|p| (*p - o).dot(&pl.normal).abs())
+                .fold(f64::INFINITY, f64::min);
+            prop_assert!(analytic <= brute + 1e-9, "analytic {} > brute min {}", analytic, brute);
+            prop_assert!(brute - analytic <= 0.15 * r + 1e-6, "analytic {} far below brute {}", analytic, brute);
+        }
+    }
 }
