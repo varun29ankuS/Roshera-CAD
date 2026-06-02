@@ -15,6 +15,7 @@
 //! The first complete study is [`cd`] (the contact-determination pipeline). Other
 //! kernel areas plug in by producing their own `AblationReport`s the same way.
 
+pub mod boolean;
 pub mod cd;
 
 /// One stage of a measured pipeline. `input`/`output` are candidate counts
