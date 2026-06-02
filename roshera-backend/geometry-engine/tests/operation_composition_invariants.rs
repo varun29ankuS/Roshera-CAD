@@ -277,18 +277,35 @@ fn rotated_box_difference_is_watertight_and_bounded() {
 }
 
 // BUG REPRO (documented, not yet fixed) — root cause isolated by Monte-Carlo
-// ground truth (4M samples). Two 2×2×2 boxes (va = vb = 8), B rotated 45° about
-// Z + shifted +1 in x. TRUE values: intersection = 3.67, union = 12.33,
-// A − B = 4.33. Kernel: union = 12.34 (CORRECT), intersection = 5.10 (WRONG,
-// +39 %), difference = 2.90 (WRONG — it is exactly 8 − 5.10, inheriting the bad
-// intersection). So union and face-SPLITTING are correct; the defect is
-// specific to boolean INTERSECTION's Inside-fragment selection on non-axis-
-// aligned input (it keeps fragments that lie outside the other solid, so the
-// intersection — and the difference derived from it — over-/under-shoots).
-// Each result is independently watertight. This is a deep boolean-robustness
-// issue in the (large) intersection/classification path; tracked for a focused
-// fix. The axis-aligned inclusion–exclusion test (operations_volume_invariants.rs)
-// still guards the common case, which is correct.
+// ground truth (4M samples) AND a per-face dissection of the result solid.
+// Two 2×2×2 boxes (va = vb = 8), B rotated 45° about Z + shifted +1 in x.
+// TRUE values: intersection = 3.67, union = 12.33, A − B = 4.33. Kernel:
+// union = 12.34 (CORRECT), intersection = 5.10 (WRONG, +39 %), difference =
+// 2.90 (WRONG — exactly 8 − 5.10, inheriting the bad intersection).
+//
+// Precise root cause (2026-06-02): the intersection result has the 5 correct
+// SIDE walls (they tile the true pentagon cross-section (-0.41,0)→(0.59,±1)→
+// (1,±1) exactly) plus the 2 z = ±1 caps it should have — but ALSO 2 spurious
+// extra caps. A's planar cap (z = ±1) is cut by B's two rotated diagonal walls,
+// but the cap–wall intersection segments do NOT fully partition the cap into
+// inside-B / outside-B regions: the resulting fragments STRADDLE B's boundary
+// (one fragment spans x∈[-1, 0.59], crossing B's left tip at x = -0.41). The
+// centroid-based classifier then evaluates each straddling fragment at a single
+// interior point that happens to land inside B's cap footprint → OnBoundary →
+// the whole fragment (including its outside-B part) is kept. So the defect is
+// face-SPLITTING COMPLETENESS for a coplanar cap cut by the other solid's
+// transverse (non-axis-aligned) walls — NOT selection and NOT classification
+// per se (every side-wall verdict and every genuinely-outside fragment is
+// classified correctly). Union is immune because it drops Inside/OnBoundary
+// fragments. A separate, real-but-here-inert degeneracy also exists: the
+// other solid's cap-overhang fragments sit on a coincident plane and ray-cast
+// degenerately; a ±surface-normal offset classifier fixes those but does not
+// move this volume, because the dominant error is the straddling A-cap pieces.
+// Fixing it needs the cap–wall split to emit the full inside/outside partition
+// (or the classifier to reject straddling fragments) — a focused split-path
+// change, tracked separately. The axis-aligned inclusion–exclusion test
+// (operations_volume_invariants.rs) still guards the common case, which is
+// correct (coplanar caps there share footprints and partition cleanly).
 #[test]
 #[ignore = "boolean INTERSECTION over-reports on rotated input (MC truth 3.67 vs kernel 5.10); union correct — documented bug repro"]
 fn rotated_union_inclusion_exclusion() {
