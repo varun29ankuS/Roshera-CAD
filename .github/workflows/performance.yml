@@ -126,6 +126,13 @@ jobs:
           - name: "WebSocket connections"
             engine: ws
             weight: 100
+            # Artillery requires every scenario to declare a `flow`; without it
+            # the run aborts with `"scenarios[0].flow" is required` (this job had
+            # never actually run). The ws engine opens the connection to
+            # config.target at scenario start, so a single `think` holds the
+            # socket open — a pure connection-load scenario matching the name.
+            flow:
+              - think: 5
         EOF
 
     - name: Run load test
