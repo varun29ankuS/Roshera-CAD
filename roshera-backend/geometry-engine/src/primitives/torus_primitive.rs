@@ -268,11 +268,21 @@ impl TorusPrimitive {
             );
             let edge2_id = model.edges.add(edge2);
 
-            // Create loop with both seam edges
-            // V=1, E=2, F=1 → χ = 1 - 2 + 1 = 0 ✓ (genus-1 torus)
+            // The single torus face is the canonical CW 2-cell whose boundary
+            // word is the commutator a·b·a⁻¹·b⁻¹ (Massey, *Algebraic Topology*,
+            // §I.7): each seam edge is traversed once forward and once backward,
+            // so every edge is used EXACTLY TWICE → manifold-consistent. Using
+            // each seam edge only once (the previous code) left both edges
+            // single-use, which the connectivity validator (correctly) flags as
+            // "boundary edge — potential gap", making every freshly-built torus
+            // invalid as-built. Edge entities are still V=1, E=2, F=1 →
+            // χ = 1 - 2 + 1 = 0 ✓ (genus-1 torus); only the loop's edge-use
+            // multiplicity changes.
             let mut outer_loop = Loop::new(0, LoopType::Outer);
-            outer_loop.add_edge(edge1_id, true);
-            outer_loop.add_edge(edge2_id, true);
+            outer_loop.add_edge(edge1_id, true); // a    (u-seam, forward)
+            outer_loop.add_edge(edge2_id, true); // b    (v-seam, forward)
+            outer_loop.add_edge(edge1_id, false); // a⁻¹ (u-seam, reversed)
+            outer_loop.add_edge(edge2_id, false); // b⁻¹ (v-seam, reversed)
             let outer_loop_id = model.loops.add(outer_loop);
 
             let torus_orientation = orient_torus_outward(

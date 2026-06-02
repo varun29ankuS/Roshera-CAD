@@ -159,23 +159,11 @@ fn cylinder_mass_props_rigid_invariant() {
 fn cone_mass_props_rigid_invariant() {
     assert_rigid_invariance(|m| build_cone(m, 3.0, 1.0, 5.0), "frustum", 0.04);
 }
-// BUG REPRO (documented, not yet fixed). ROOT CAUSE (isolated): the torus is
-// invalid AS BUILT — `validate_model_enhanced(Standard)` on a freshly
-// constructed torus reports 2 `ConnectivityError`s, "Boundary edge {0,1}
-// detected - potential gap", i.e. its two seam edges are referenced only ONCE
-// by the single periodic face loop instead of twice. A closed (doubly-periodic)
-// torus needs each seam edge used twice; `TorusPrimitive::create` builds them
-// single-use. `create_torus_3d` does not run Standard validation, so the
-// invalid topology is accepted at build time; `transform_solid` is simply the
-// first operation that runs `validate_result`, which is why it *looks* like a
-// transform bug (it fails for every transform, including pure translation — and
-// a cylinder, single-seam, validates clean). The torus still tessellates
-// watertight and its untransformed mass properties are correct, so it is
-// functionally usable; the fix is structural torus-loop topology (seam-edge
-// doubling) and is left for a dedicated change. Ignored so it records the repro
-// without reddening CI.
+// FIXED (was: torus invalid as-built — 2 single-use seam edges flagged as
+// boundary-edge gaps). TorusPrimitive::create now closes the single face's
+// boundary as the commutator a·b·a⁻¹·b⁻¹ so each seam edge is used twice
+// (manifold). Transform + mass-props therefore hold under rigid motion.
 #[test]
-#[ignore = "torus is invalid as-built: 2 single-use seam edges fail Standard connectivity validation — documented bug repro"]
 fn torus_mass_props_rigid_invariant() {
     assert_rigid_invariance(|m| build_torus(m, 4.0, 1.0), "torus", 0.04);
 }
