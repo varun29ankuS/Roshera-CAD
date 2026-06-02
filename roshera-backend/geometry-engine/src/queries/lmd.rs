@@ -142,6 +142,21 @@ pub fn face_lmds(model: &BRepModel, face_a: FaceId, face_b: FaceId) -> Vec<Lmd> 
         .collect()
 }
 
+/// **Warm-start an LMD** from a known seed footpoint on `a` — e.g. last frame's
+/// contact point. Runs the alternating closest-point projection from that single
+/// seed instead of the cold multi-start, so for small frame-to-frame motion it
+/// converges in a few iterations and lands in the *same* basin as before. This
+/// is the narrow-phase temporal-coherence entry used by contact tracking
+/// ([`crate::queries::kinematics`]). `None` if projection fails.
+pub fn refine_lmd_from(
+    a: &dyn Surface,
+    b: &dyn Surface,
+    seed_a: Point3,
+    tol: Tolerance,
+) -> Option<Lmd> {
+    lmd_from_seed(a, b, seed_a, tol)
+}
+
 // ---------------------------------------------------------------------------
 // Closed-form canonical pairs (private)
 // ---------------------------------------------------------------------------

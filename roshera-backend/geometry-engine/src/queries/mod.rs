@@ -7,4 +7,5 @@
 pub mod bvh;
 pub mod cd;
 pub mod features;
+pub mod kinematics;
 pub mod lmd;
