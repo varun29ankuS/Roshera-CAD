@@ -116,7 +116,7 @@ jobs:
         # them).
         cargo nextest run --workspace --exclude timeline-engine --no-fail-fast
         cargo nextest run -p timeline-engine --profile timeline --test-threads=1
-        cargo test --workspace --doc
+        cargo test --workspace --doc --no-fail-fast
       working-directory: ./roshera-backend
 
     - name: Run kernel demo regression suite

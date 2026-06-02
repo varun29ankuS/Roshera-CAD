@@ -61,10 +61,15 @@ fn create_query_result(message: impl Into<String>, data: serde_json::Value) -> C
 }
 
 impl AIProcessor {
-    /// Create new AI processor
+    /// Create new AI processor.
     ///
     /// # Example
-    /// ```
+    ///
+    /// Construction needs a live [`ProviderManager`] (a configured LLM
+    /// provider) and a [`CommandExecutor`] bound to a geometry session, so the
+    /// snippet is illustrative rather than a sandbox-runnable doctest:
+    ///
+    /// ```ignore
     /// let processor = AIProcessor::new(provider_manager, executor);
     /// ```
     pub fn new(
