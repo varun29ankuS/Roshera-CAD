@@ -276,18 +276,21 @@ fn rotated_box_difference_is_watertight_and_bounded() {
     }
 }
 
-// BUG REPRO (documented, not yet fixed): inclusion–exclusion is violated for
-// booleans on a 45°-rotated box. With two 2×2×2 boxes (va = vb = 8) and B
-// rotated 45° about Z + shifted +1 in x, the kernel reports union = 12.34 and
-// intersection = 5.10, but vol(A∪B) must equal va + vb − vi = 10.90 — a 13 %
-// inconsistency in the WRONG direction (the union over-reports). Each result is
-// internally watertight (the bounded/watertight rotated-box tests pass), so the
-// two ops are individually plausible but mutually inconsistent: a boolean
-// robustness gap on non-axis-aligned input. Ignored so it stands as a repro
-// without reddening CI; the axis-aligned inclusion–exclusion test (in
-// operations_volume_invariants.rs) still guards the common case.
+// BUG REPRO (documented, not yet fixed) — root cause isolated by Monte-Carlo
+// ground truth (4M samples). Two 2×2×2 boxes (va = vb = 8), B rotated 45° about
+// Z + shifted +1 in x. TRUE values: intersection = 3.67, union = 12.33,
+// A − B = 4.33. Kernel: union = 12.34 (CORRECT), intersection = 5.10 (WRONG,
+// +39 %), difference = 2.90 (WRONG — it is exactly 8 − 5.10, inheriting the bad
+// intersection). So union and face-SPLITTING are correct; the defect is
+// specific to boolean INTERSECTION's Inside-fragment selection on non-axis-
+// aligned input (it keeps fragments that lie outside the other solid, so the
+// intersection — and the difference derived from it — over-/under-shoots).
+// Each result is independently watertight. This is a deep boolean-robustness
+// issue in the (large) intersection/classification path; tracked for a focused
+// fix. The axis-aligned inclusion–exclusion test (operations_volume_invariants.rs)
+// still guards the common case, which is correct.
 #[test]
-#[ignore = "boolean inclusion-exclusion violated on rotated boxes (12.34 vs 10.90) — documented bug repro"]
+#[ignore = "boolean INTERSECTION over-reports on rotated input (MC truth 3.67 vs kernel 5.10); union correct — documented bug repro"]
 fn rotated_union_inclusion_exclusion() {
     // vol(A∪B) = vol(A) + vol(B) − vol(A∩B), independent of B's orientation.
     if let (Some((va, vb, vu, _)), Some((_, _, vi, _))) = (
