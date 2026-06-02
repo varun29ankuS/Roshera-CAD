@@ -6,10 +6,13 @@
 //!
 //! All are oracle-free: rigid motions preserve volume / surface area / inertia
 //! and map the centroid; boolean results must be watertight (mesh divergence
-//! volume = reported volume) and respect inclusion–exclusion. Per the kernel's
-//! numerical-rigor contract a boolean may return a typed `Err` on hard inputs;
-//! those cases are skipped, but a *successful* op that returns a wrong answer
-//! still fails the test.
+//! volume = reported volume) and respect inclusion–exclusion. The fixed
+//! rotated-box fixtures DO produce a result today, so they `.expect()` one (a
+//! `None` is a regression that fails the test, not a silent skip). Only
+//! genuinely hard curved inputs (the tilted-cylinder bore) may return a typed
+//! `Err` per the kernel's numerical-rigor contract — and there the skip is
+//! LOGGED, never silent, so it can't masquerade as a real pass. A *successful*
+//! op that returns a wrong answer always fails the test.
 
 use std::f64::consts::PI;
 
@@ -216,6 +219,14 @@ fn vol(model: &mut BRepModel, id: SolidId) -> Option<f64> {
     model.mass_properties_for(id).map(|mp| mp.volume)
 }
 
+/// These rotated-box boolean fixtures use fixed, known-good inputs that the
+/// kernel does produce a result for today (union/intersection/difference all
+/// succeed — the rotated INTERSECTION bug is a wrong *volume*, not a failure).
+/// So `None` here means the op regressed into an outright failure, which must
+/// fail the test rather than silently skip it (the vacuous-pass trap).
+const ROTATED_BOOL_MUST_SUCCEED: &str =
+    "rotated-box boolean on fixed known-good input must produce a result (None here is a kernel regression)";
+
 /// Two unit-ish boxes, the second rotated about Z by `angle` and shifted, then
 /// combined. Returns (vol_a, vol_b, vol_result, watertight_ok) on success.
 fn rotated_boolean(angle: f64, shift: f64, op: BooleanOp) -> Option<(f64, f64, f64, bool)> {
@@ -239,41 +250,41 @@ fn rotated_boolean(angle: f64, shift: f64, op: BooleanOp) -> Option<(f64, f64, f
 
 #[test]
 fn rotated_box_union_is_watertight_and_bounded() {
-    if let Some((va, vb, vu, wt)) = rotated_boolean(PI / 4.0, 1.0, BooleanOp::Union) {
-        assert!(vu > 0.0, "rotated union empty");
-        assert!(
-            vu >= va.max(vb) * 0.9,
-            "union {vu} below larger input {}",
-            va.max(vb)
-        );
-        assert!(vu <= (va + vb) * 1.05, "union {vu} exceeds sum {}", va + vb);
-        assert!(
-            wt,
-            "rotated-box union mesh is not watertight (volume mismatch)"
-        );
-    }
+    let (va, vb, vu, wt) =
+        rotated_boolean(PI / 4.0, 1.0, BooleanOp::Union).expect(ROTATED_BOOL_MUST_SUCCEED);
+    assert!(vu > 0.0, "rotated union empty");
+    assert!(
+        vu >= va.max(vb) * 0.9,
+        "union {vu} below larger input {}",
+        va.max(vb)
+    );
+    assert!(vu <= (va + vb) * 1.05, "union {vu} exceeds sum {}", va + vb);
+    assert!(
+        wt,
+        "rotated-box union mesh is not watertight (volume mismatch)"
+    );
 }
 
 #[test]
 fn rotated_box_intersection_is_watertight_and_bounded() {
-    if let Some((va, vb, vi, wt)) = rotated_boolean(PI / 6.0, 0.8, BooleanOp::Intersection) {
-        assert!(vi > 0.0, "overlapping rotated boxes must intersect");
-        assert!(
-            vi <= va.min(vb) * 1.05,
-            "intersection {vi} exceeds smaller input {}",
-            va.min(vb)
-        );
-        assert!(wt, "rotated-box intersection mesh is not watertight");
-    }
+    let (va, vb, vi, wt) =
+        rotated_boolean(PI / 6.0, 0.8, BooleanOp::Intersection).expect(ROTATED_BOOL_MUST_SUCCEED);
+    assert!(vi > 0.0, "overlapping rotated boxes must intersect");
+    assert!(
+        vi <= va.min(vb) * 1.05,
+        "intersection {vi} exceeds smaller input {}",
+        va.min(vb)
+    );
+    assert!(wt, "rotated-box intersection mesh is not watertight");
 }
 
 #[test]
 fn rotated_box_difference_is_watertight_and_bounded() {
-    if let Some((va, _vb, vd, wt)) = rotated_boolean(PI / 5.0, 1.0, BooleanOp::Difference) {
-        assert!(vd > 0.0, "A−B of partially overlapping boxes is non-empty");
-        assert!(vd <= va * 1.05, "A−B volume {vd} exceeds A {va}");
-        assert!(wt, "rotated-box difference mesh is not watertight");
-    }
+    let (va, _vb, vd, wt) =
+        rotated_boolean(PI / 5.0, 1.0, BooleanOp::Difference).expect(ROTATED_BOOL_MUST_SUCCEED);
+    assert!(vd > 0.0, "A−B of partially overlapping boxes is non-empty");
+    assert!(vd <= va * 1.05, "A−B volume {vd} exceeds A {va}");
+    assert!(wt, "rotated-box difference mesh is not watertight");
 }
 
 // BUG REPRO (documented, not yet fixed) — root cause isolated by Monte-Carlo
@@ -336,38 +347,51 @@ fn transform_then_boolean_then_mass_props_is_finite_and_watertight() {
         * Matrix4::from_axis_angle(&Vector3::X, 0.3).expect("rot");
     transform_solid(&mut model, b, m, TransformOptions::default()).expect("transform cylinder");
 
-    if let Ok(result) = boolean_operation(
+    // A tilted-cylinder bore is a curved-surface difference: per the kernel's
+    // numerical-rigor contract this MAY return a typed Err on hard input, so a
+    // hard unwrap would risk flaky red. But a silent skip is the vacuous-pass
+    // trap — so the Err arm is LOGGED, making any skip visible in CI output
+    // instead of masquerading as a real pass.
+    match boolean_operation(
         &mut model,
         a,
         b,
         BooleanOp::Difference,
         BooleanOptions::default(),
     ) {
-        let mp = model
-            .mass_properties_for(result)
-            .expect("mass props of bored box");
-        assert!(
-            mp.volume.is_finite() && mp.volume > 0.0,
-            "bad volume {}",
-            mp.volume
-        );
-        // Boring a hole removes material: result < solid box (27).
-        assert!(
-            mp.volume < 27.0 * 1.01,
-            "bored box {} not less than 27",
-            mp.volume
-        );
-        assert!(
-            mp.center_of_mass.iter().all(|c| c.is_finite()),
-            "non-finite centroid"
-        );
-        let solid = model.solids.get(result).expect("result solid");
-        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
-        assert!(
-            rel_close(mesh_volume(&mesh), mp.volume, 0.05),
-            "bored-box mesh volume {} vs reported {}",
-            mesh_volume(&mesh),
-            mp.volume
-        );
+        Err(e) => {
+            eprintln!(
+                "SKIP transform_then_boolean_then_mass_props: tilted-cylinder bore \
+                 returned a typed Err (acceptable per contract): {e}"
+            );
+        }
+        Ok(result) => {
+            let mp = model
+                .mass_properties_for(result)
+                .expect("mass props of bored box");
+            assert!(
+                mp.volume.is_finite() && mp.volume > 0.0,
+                "bad volume {}",
+                mp.volume
+            );
+            // Boring a hole removes material: result < solid box (27).
+            assert!(
+                mp.volume < 27.0 * 1.01,
+                "bored box {} not less than 27",
+                mp.volume
+            );
+            assert!(
+                mp.center_of_mass.iter().all(|c| c.is_finite()),
+                "non-finite centroid"
+            );
+            let solid = model.solids.get(result).expect("result solid");
+            let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+            assert!(
+                rel_close(mesh_volume(&mesh), mp.volume, 0.05),
+                "bored-box mesh volume {} vs reported {}",
+                mesh_volume(&mesh),
+                mp.volume
+            );
+        }
     }
 }
