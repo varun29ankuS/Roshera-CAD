@@ -268,6 +268,132 @@ mod tests {
     const IN_UNIT4: fn(f64, f64, f64) -> bool =
         |x, y, z| x.abs() <= 2.0 && y.abs() <= 2.0 && z.abs() <= 2.0;
 
+    /// MC over a larger box (operands may extend past ±2).
+    fn mc_truth_wide<A, B>(in_a: A, in_b: B, half: f64, n: usize) -> (f64, f64, f64)
+    where
+        A: Fn(f64, f64, f64) -> bool,
+        B: Fn(f64, f64, f64) -> bool,
+    {
+        mc_truth_analytic(in_a, in_b, half, n)
+    }
+
+    /// A cylinder fully inside the box (no poke-through) is a clean curved
+    /// boolean — ∪/∩/∖ all match the MC truth. Regression guard.
+    #[test]
+    fn cylinder_inside_box_all_ops_match_mc() {
+        let build = |m: &mut BRepModel| {
+            let a = mkbox(m, 4.0);
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Vector3::new(0.0, 0.0, -1.0), Vector3::Z, 1.5, 2.0)
+                .expect("cyl");
+            (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+        };
+        let in_cyl = |x: f64, y: f64, z: f64| x * x + y * y <= 1.5 * 1.5 && z.abs() <= 1.0;
+        assert_mc(build, in_cyl, 4e-2);
+    }
+
+    /// Curved-boolean frontier map (BOOL-CURVED-* tracking). Runs many hard
+    /// configs through the independent analytic MC oracle and prints which the
+    /// kernel still gets wrong — sphere cavities and curved poke-throughs are
+    /// the open frontier. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "frontier map (run with --nocapture to see curved-boolean status)"]
+    fn diag_curved_boolean_stress() {
+        use crate::operations::transform::translate;
+        let box4 = |m: &mut BRepModel| mkbox(m, 4.0);
+        let report = |name: &str,
+                      build: &dyn Fn(&mut BRepModel) -> (SolidId, SolidId),
+                      in_a: &dyn Fn(f64, f64, f64) -> bool,
+                      in_b: &dyn Fn(f64, f64, f64) -> bool,
+                      half: f64| {
+            let (mu, mi, md) = mc_truth_wide(in_a, in_b, half, 100);
+            let fmt = |k: Option<f64>, t: f64| match k {
+                Some(v) if (v - t).abs() <= 0.04 * t.max(1.0) => format!("OK({v:.2})"),
+                Some(v) => format!("**{v:.2}/{t:.2}**"),
+                None => "**None**".to_string(),
+            };
+            eprintln!(
+                "{name:>24}: ∪ {} | ∩ {} | ∖ {}",
+                fmt(kernel_vol(&build, BooleanOp::Union), mu),
+                fmt(kernel_vol(&build, BooleanOp::Intersection), mi),
+                fmt(kernel_vol(&build, BooleanOp::Difference), md),
+            );
+        };
+
+        // sphere fully inside box (r=1.5)
+        report(
+            "sphere1.5 in box",
+            &|m| {
+                let a = box4(m);
+                TopologyBuilder::new(m)
+                    .create_sphere_3d(Vector3::ZERO, 1.5)
+                    .expect("sph");
+                (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+            },
+            &IN_UNIT4,
+            &|x, y, z| x * x + y * y + z * z <= 1.5 * 1.5,
+            4.0,
+        );
+        // sphere poking out of box faces (r=2.5; box half 2)
+        report(
+            "sphere2.5 thru box",
+            &|m| {
+                let a = box4(m);
+                TopologyBuilder::new(m)
+                    .create_sphere_3d(Vector3::ZERO, 2.5)
+                    .expect("sph");
+                (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+            },
+            &IN_UNIT4,
+            &|x, y, z| x * x + y * y + z * z <= 2.5 * 2.5,
+            4.0,
+        );
+        // cylinder fully inside box (no poke-through): z∈[-1,1]
+        report(
+            "cyl inside box",
+            &|m| {
+                let a = box4(m);
+                TopologyBuilder::new(m)
+                    .create_cylinder_3d(Vector3::new(0.0, 0.0, -1.0), Vector3::Z, 1.5, 2.0)
+                    .expect("cyl");
+                (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+            },
+            &IN_UNIT4,
+            &|x, y, z| x * x + y * y <= 1.5 * 1.5 && z.abs() <= 1.0,
+            4.0,
+        );
+        // off-axis cylinder: shifted +X so it pokes the +X box wall AND ±Z caps
+        report(
+            "cyl off-axis +x",
+            &|m| {
+                let a = box4(m);
+                TopologyBuilder::new(m)
+                    .create_cylinder_3d(Vector3::new(0.0, 0.0, -3.0), Vector3::Z, 1.0, 6.0)
+                    .expect("cyl");
+                let b = m.solids.iter().last().map(|(id, _)| id).expect("b");
+                translate(m, vec![b], Vector3::X, 1.5, Default::default()).unwrap();
+                (a, b)
+            },
+            &IN_UNIT4,
+            &|x, y, z| (x - 1.5) * (x - 1.5) + y * y <= 1.0 && z.abs() <= 3.0,
+            4.0,
+        );
+        // horizontal cylinder (axis +X) through two box side walls
+        report(
+            "cyl horizontal X",
+            &|m| {
+                let a = box4(m);
+                TopologyBuilder::new(m)
+                    .create_cylinder_3d(Vector3::new(-3.0, 0.0, 0.0), Vector3::X, 1.0, 6.0)
+                    .expect("cyl");
+                (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+            },
+            &IN_UNIT4,
+            &|x, y, z| y * y + z * z <= 1.0 && x.abs() <= 3.0,
+            4.0,
+        );
+    }
+
     /// Assert all three booleans match the independent analytic MC truth.
     fn assert_mc<F, B>(build: F, in_b: B, tol: f64)
     where
