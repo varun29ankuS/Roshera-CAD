@@ -4232,7 +4232,19 @@ fn clip_circle_to_planar_face(
 
     let (cu, cv) = project(center3);
 
-    let mut poly_uv: Vec<(f64, f64)> = Vec::with_capacity(boundary_edges.len());
+    // Build the boundary polygon from the loop's ORDERED vertices (walked by
+    // shared endpoints), NOT from each edge's intrinsic `start` — the boundary
+    // edges are not stored in a head-to-tail chain and an edge's intrinsic
+    // direction need not match the loop traversal, so projecting `edge.start`
+    // per edge yields a SCRAMBLED, self-intersecting polygon. The 2D
+    // point-in-polygon test then gives orientation-dependent garbage (e.g. a
+    // box +X cap rejecting its own concentric cutting circle while the −X cap
+    // accepts it), dropping the cutting curve and corrupting the boolean.
+    let edge_ids: Vec<EdgeId> = boundary_edges.iter().map(|&(e, _)| e).collect();
+    let poly_uv: Vec<(f64, f64)> = extract_cycle_vertices_3d(&edge_ids, model)
+        .iter()
+        .map(|p| project(*p))
+        .collect();
     let mut hits_theta: Vec<f64> = Vec::new();
 
     let r2 = radius * radius;
@@ -4268,7 +4280,6 @@ fn clip_circle_to_planar_face(
 
         let (eu0, ev0) = project(edge_line.start);
         let (eu1, ev1) = project(edge_line.end);
-        poly_uv.push((eu0, ev0));
 
         // Solve `|(E0 + s·dE) - C|² = r²` for `s ∈ [0, 1]` in the plane's
         // 2D frame. With `dE = (edu, edv)`, `q = (eu0-cu, ev0-cv)`:

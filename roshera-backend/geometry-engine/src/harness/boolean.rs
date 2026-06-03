@@ -277,6 +277,26 @@ mod tests {
         mc_truth_analytic(in_a, in_b, half, n)
     }
 
+    /// A HORIZONTAL cylinder (axis +X) poking through the box's ±X SIDE walls —
+    /// ∪/∩/∖ all match the MC truth. Regression guard for the circle-clip
+    /// boundary-polygon ordering bug: `clip_circle_to_planar_face` built its
+    /// point-in-polygon test from each edge's intrinsic `start` (ignoring loop
+    /// order), so a box +X cap rejected its own concentric cutting circle
+    /// (orientation-dependent), dropping the +X intersection and leaving the
+    /// cylinder lateral unclipped + the box +X face unsplit.
+    #[test]
+    fn horizontal_cylinder_through_box_all_ops_match_mc() {
+        let build = |m: &mut BRepModel| {
+            let a = mkbox(m, 4.0);
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Vector3::new(-3.0, 0.0, 0.0), Vector3::X, 1.0, 6.0)
+                .expect("cyl");
+            (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+        };
+        let in_cyl = |x: f64, y: f64, z: f64| y * y + z * z <= 1.0 && x.abs() <= 3.0;
+        assert_mc(build, in_cyl, 3e-2);
+    }
+
     /// A cylinder fully inside the box (no poke-through) is a clean curved
     /// boolean — ∪/∩/∖ all match the MC truth. Regression guard.
     #[test]
