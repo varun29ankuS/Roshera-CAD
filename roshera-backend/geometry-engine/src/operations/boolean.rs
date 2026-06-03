@@ -7154,6 +7154,61 @@ fn ray_surface_all_intersections(
             }
             Ok(results)
         }
+        SurfaceType::Cone => {
+            // Ray-cone: quadratic in t against the infinite double cone, then
+            // keep only the nappe that opens along the cone's axis (v ≥ 0).
+            // A general surface fallback (`ray_surface_numerical`) returns at
+            // most ONE hit, so a ray that pierces the lateral twice (enter +
+            // exit) was undercounted — flipping the parity in
+            // `ray_cast_classification` and misclassifying box faces below a
+            // contained cone as Inside. `is_point_in_face` bounds the hit to
+            // the face's actual height afterwards.
+            use crate::primitives::surface::Cone;
+            let cone = surface.as_any().downcast_ref::<Cone>().ok_or_else(|| {
+                OperationError::InternalError("Failed to downcast cone".to_string())
+            })?;
+
+            let cos_a = cone.half_angle.cos();
+            let cos2 = cos_a * cos_a;
+            let co = *origin - cone.apex; // O − apex
+            let d_a = direction.dot(&cone.axis);
+            let co_a = co.dot(&cone.axis);
+
+            // (A·w)² − cos²α (w·w) = 0 with w = co + t·direction.
+            let a = d_a * d_a - cos2 * direction.dot(direction);
+            let b = 2.0 * (d_a * co_a - cos2 * direction.dot(&co));
+            let c = co_a * co_a - cos2 * co.dot(&co);
+
+            let mut results: Vec<f64> = Vec::new();
+            let mut push_if_valid = |t: f64, results: &mut Vec<f64>| {
+                // Forward along the ray, on the axis-facing nappe (v ≥ 0), and
+                // not a duplicate of an existing (tangent) root.
+                let v = co_a + t * d_a;
+                if t > tolerance.distance()
+                    && v >= -tolerance.distance()
+                    && !results
+                        .iter()
+                        .any(|&r| (r - t).abs() <= tolerance.distance())
+                {
+                    results.push(t);
+                }
+            };
+
+            if a.abs() < 1e-15 {
+                // Degenerate quadratic (ray parallel to a generator): linear.
+                if b.abs() > 1e-15 {
+                    push_if_valid(-c / b, &mut results);
+                }
+            } else {
+                let disc = b * b - 4.0 * a * c;
+                if disc >= 0.0 {
+                    let sqrt_disc = disc.sqrt();
+                    push_if_valid((-b - sqrt_disc) / (2.0 * a), &mut results);
+                    push_if_valid((-b + sqrt_disc) / (2.0 * a), &mut results);
+                }
+            }
+            Ok(results)
+        }
         _ => {
             // Fall back to single intersection for other types
             match ray_surface_intersection(origin, direction, surface, tolerance)? {

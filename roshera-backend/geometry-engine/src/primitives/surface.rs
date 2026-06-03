@@ -3068,8 +3068,18 @@ impl Surface for Cone {
             + x_dir * (self.half_angle.tan() * cos_u)
             + y_dir * (self.half_angle.tan() * sin_u);
 
-        // Normal (outward)
-        let normal = du.cross(&dv).normalize()?;
+        // Normal (outward). A cone is a ruled surface whose normal is constant
+        // along each generator and therefore independent of `v`: `du = radius·tθ`
+        // where `tθ = -sin u·x + cos u·y` is the UNIT angular tangent, so
+        // `du × dv = radius·(tθ × dv)` and the normalized normal equals
+        // `(tθ × dv).normalized()` for every `v > 0`. Using `tθ` directly keeps
+        // that exact value while staying well-defined at the apex (`v = 0`,
+        // `radius = 0`, `du = 0`), where `du × dv` collapses to the zero vector
+        // and `normalize()` would return `DivisionByZero` — the singularity that
+        // made every cone Boolean fail the moment classification sampled the
+        // lateral face at its apex row.
+        let t_theta = x_dir * (-sin_u) + y_dir * cos_u;
+        let normal = t_theta.cross(&dv).normalize()?;
 
         // Second derivatives
         let duu = x_dir * (-radius * cos_u) + y_dir * (-radius * sin_u);
