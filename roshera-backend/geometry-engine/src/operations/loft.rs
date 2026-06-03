@@ -902,21 +902,23 @@ fn create_ruled_face(
     v2_end: VertexId,
     outward_target: Vector3,
 ) -> OperationResult<FaceId> {
-    // Create edges
-    let edge1 = create_or_find_edge(model, v1_start, v1_end)?;
-    let edge2 = create_or_find_edge(model, v1_end, v2_end)?;
-    let edge3 = create_or_find_edge(model, v2_end, v2_start)?;
-    let edge4 = create_or_find_edge(model, v2_start, v1_start)?;
+    // Create edges, recording each one's true direction relative to the loop
+    // traversal (a reused shared edge may run backwards — see
+    // `directed_loop_edge`).
+    let (edge1, f1) = directed_loop_edge(model, v1_start, v1_end)?;
+    let (edge2, f2) = directed_loop_edge(model, v1_end, v2_end)?;
+    let (edge3, f3) = directed_loop_edge(model, v2_end, v2_start)?;
+    let (edge4, f4) = directed_loop_edge(model, v2_start, v1_start)?;
 
     // Create loop
     let mut face_loop = Loop::new(
         0, // ID will be assigned by store
         crate::primitives::r#loop::LoopType::Outer,
     );
-    face_loop.add_edge(edge1, true);
-    face_loop.add_edge(edge2, true);
-    face_loop.add_edge(edge3, true);
-    face_loop.add_edge(edge4, true);
+    face_loop.add_edge(edge1, f1);
+    face_loop.add_edge(edge2, f2);
+    face_loop.add_edge(edge3, f3);
+    face_loop.add_edge(edge4, f4);
     let loop_id = model.loops.add(face_loop);
 
     // Create ruled surface
@@ -987,6 +989,31 @@ fn create_or_find_edge(
     let edge_id = model.edges.add(edge);
 
     Ok(edge_id)
+}
+
+/// Find-or-create the edge between `from` and `to`, and report whether the
+/// returned edge runs in the requested `from → to` direction.
+///
+/// `create_or_find_edge` reuses a stored edge in *either* direction (loft shares
+/// rails and rungs across adjacent lateral faces and caps), so a reused edge may
+/// run `to → start`. Callers building a loop must record that as the per-edge
+/// orientation flag — otherwise the loop traverses the edge backwards while
+/// claiming it is forward, yielding a topologically inconsistent boundary
+/// (head-to-tail chaining breaks), a malformed face, and downstream a degenerate
+/// tessellation / lost volume.
+fn directed_loop_edge(
+    model: &mut BRepModel,
+    from: VertexId,
+    to: VertexId,
+) -> OperationResult<(EdgeId, bool)> {
+    let edge_id = create_or_find_edge(model, from, to)?;
+    let forward = model
+        .edges
+        .get(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+        .start_vertex
+        == from;
+    Ok((edge_id, forward))
 }
 
 /// Create a bilinear surface between four corner vertices
@@ -1334,14 +1361,19 @@ fn build_loft_cap(
         ));
     }
     // Same shared edges the lateral ruled faces use (create_or_find_edge
-    // deduplicates), so each is incident to cap + lateral = 2 faces.
+    // deduplicates), so each is incident to cap + lateral = 2 faces. A shared
+    // edge may be stored in the opposite direction, so record each one's true
+    // orientation relative to the cap traversal (see `directed_loop_edge`).
     let mut cap_edges = Vec::with_capacity(n);
+    let mut cap_dirs = Vec::with_capacity(n);
     for i in 0..n {
-        cap_edges.push(create_or_find_edge(model, ring[i], ring[(i + 1) % n])?);
+        let (e, fwd) = directed_loop_edge(model, ring[i], ring[(i + 1) % n])?;
+        cap_edges.push(e);
+        cap_dirs.push(fwd);
     }
     let mut fl = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
-    for &e in &cap_edges {
-        fl.add_edge(e, true);
+    for (&e, &fwd) in cap_edges.iter().zip(cap_dirs.iter()) {
+        fl.add_edge(e, fwd);
     }
     let loop_id = model.loops.add(fl);
 
