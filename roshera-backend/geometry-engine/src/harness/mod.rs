@@ -21,6 +21,7 @@ pub mod chamfer;
 pub mod extrude;
 pub mod fillet;
 pub mod loft;
+pub mod poke_matrix;
 pub mod revolve;
 pub mod shell;
 pub mod sweep;
