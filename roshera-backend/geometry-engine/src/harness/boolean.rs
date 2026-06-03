@@ -292,6 +292,24 @@ mod tests {
         assert_mc(build, in_cyl, 4e-2);
     }
 
+    /// A sphere fully inside the box: ∪/∩/∖ all match the MC truth. The ∖ case
+    /// (box with a spherical void) is the regression guard for the spherical
+    /// tessellation winding fix — the sphere void must SUBTRACT (was added:
+    /// 78 vs 49.85, because a Forward sphere wound inward and the Backward void
+    /// wound outward).
+    #[test]
+    fn sphere_inside_box_all_ops_match_mc() {
+        let build = |m: &mut BRepModel| {
+            let a = mkbox(m, 4.0);
+            TopologyBuilder::new(m)
+                .create_sphere_3d(Vector3::ZERO, 1.5)
+                .expect("sph");
+            (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+        };
+        let in_sph = |x: f64, y: f64, z: f64| x * x + y * y + z * z <= 1.5 * 1.5;
+        assert_mc(build, in_sph, 4e-2);
+    }
+
     /// Curved-boolean frontier map (BOOL-CURVED-* tracking). Runs many hard
     /// configs through the independent analytic MC oracle and prints which the
     /// kernel still gets wrong — sphere cavities and curved poke-throughs are

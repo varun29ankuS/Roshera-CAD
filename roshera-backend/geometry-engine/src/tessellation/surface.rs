@@ -923,11 +923,15 @@ fn tessellate_spherical_with_poles(
         vertex_grid.push(row);
     }
 
-    // Generate triangles with special handling for poles. Winding
-    // follows `face.orientation` for the same reason as the
-    // cylindrical path — a backward face must emit reversed CCW so
-    // the geometric normal agrees with the stored vertex normal.
-    let forward = face.orientation.is_forward();
+    // Generate triangles with special handling for poles. The sphere's
+    // (u = longitude, v = colatitude) grid winds the base `(a, b, c)` order
+    // INWARD under the surface's outward normal, so a geometrically Forward
+    // (outward) face needs the REVERSED branch — hence the `!` here. Without
+    // it a Forward sphere tessellates inward (signed volume negative; masked
+    // by the `.abs()` in mass-props for a standalone solid) and, fatally, a
+    // Backward sphere void (e.g. box − interior sphere) winds OUTWARD and the
+    // void is ADDED instead of subtracted (V_box + V_sphere).
+    let forward = !face.orientation.is_forward();
     for v_idx in 0..v_steps {
         let at_south_pole = near_south_pole && v_idx == 0;
         let at_north_pole = near_north_pole && v_idx == v_steps - 1;
@@ -1066,10 +1070,11 @@ fn tessellate_spherical_regular(
         }
     }
 
-    // Add triangles with mapping. Winding follows `face.orientation`
-    // so the geometric normal agrees with the stored vertex normal
-    // (`Face::normal_at` already flips for backward faces).
-    let forward = face.orientation.is_forward();
+    // Add triangles with mapping. The sphere's (longitude, colatitude) grid
+    // winds the base order INWARD under the outward normal, so a Forward
+    // (outward) face needs the reversed branch — see the with-poles path for
+    // the full rationale and the void-subtraction failure it fixes.
+    let forward = !face.orientation.is_forward();
     for triangle in &temp_mesh.triangles {
         if let (Some(v0), Some(v1), Some(v2)) = (
             vertex_map.get(triangle[0] as usize).and_then(|&v| v),
