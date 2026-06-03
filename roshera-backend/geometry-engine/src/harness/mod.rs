@@ -17,6 +17,7 @@
 
 pub mod boolean;
 pub mod cd;
+pub mod chamfer;
 pub mod extrude;
 pub mod fillet;
 pub mod revolve;
