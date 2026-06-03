@@ -945,10 +945,22 @@ fn tessellate_spherical_with_poles(
                     vertex_grid[1].get(u_idx).and_then(|&v| v),
                     vertex_grid[1].get(u_idx + 1).and_then(|&v| v),
                 ) {
+                    // The first ring (row 1) is the BOTTOM row of the band
+                    // directly above this fan, so that band traverses the
+                    // ring edge `v1->v2`. For a consistently-oriented closed
+                    // mesh the fan must traverse the shared ring edge the
+                    // OTHER way (`v2->v1`); hence the fan apex triangle is
+                    // `(pole, v2, v1)` under `forward`, the mirror of the
+                    // north-pole fan (which uses the ring as its TOP row and
+                    // is naturally opposite). Emitting `(pole, v1, v2)` here
+                    // duplicates the ring edge direction and leaves
+                    // `u_steps` orientation-inconsistent edges around the
+                    // south pole — invisible to a signed-volume check but
+                    // caught by the manifold oracle.
                     if forward {
-                        mesh.add_triangle(pole_vertex, v1, v2);
-                    } else {
                         mesh.add_triangle(pole_vertex, v2, v1);
+                    } else {
+                        mesh.add_triangle(pole_vertex, v1, v2);
                     }
                 }
             }
@@ -1373,7 +1385,14 @@ fn tessellate_conical_with_apex(
     let forward = face.orientation.is_forward();
     for v_idx in 0..vertex_grid.len() - 1 {
         if v_idx == 0 && vertex_grid[0].len() == 1 {
-            // Triangles from apex
+            // Triangles from apex. Row 1 is the BOTTOM row of the band above
+            // this fan, which traverses each ring edge `v1->v2`; for a
+            // consistently-oriented mesh the apex fan must traverse the shared
+            // edge `v2->v1`, so the apex triangle is `(apex, v2, v1)` under
+            // `forward` (the mirror of a top-row fan). Emitting `(apex, v1, v2)`
+            // duplicates the ring-edge direction and leaves `u_steps`
+            // orientation-inconsistent edges around the apex — invisible to a
+            // signed-volume check, caught by the manifold oracle.
             if let Some(apex) = vertex_grid[0][0] {
                 for u_idx in 0..u_steps {
                     if let (Some(v1), Some(v2)) = (
@@ -1381,9 +1400,9 @@ fn tessellate_conical_with_apex(
                         vertex_grid[1].get(u_idx + 1).and_then(|&v| v),
                     ) {
                         if forward {
-                            mesh.add_triangle(apex, v1, v2);
-                        } else {
                             mesh.add_triangle(apex, v2, v1);
+                        } else {
+                            mesh.add_triangle(apex, v1, v2);
                         }
                     }
                 }
