@@ -17,6 +17,7 @@
 
 pub mod boolean;
 pub mod cd;
+pub mod extrude;
 pub mod fillet;
 pub mod tessellation;
 pub mod watertight;
