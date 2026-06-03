@@ -21,6 +21,7 @@ pub mod extrude;
 pub mod fillet;
 pub mod revolve;
 pub mod tessellation;
+pub mod transform;
 pub mod watertight;
 
 /// One stage of a measured pipeline. `input`/`output` are candidate counts
