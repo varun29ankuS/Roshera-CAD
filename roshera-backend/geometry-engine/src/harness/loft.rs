@@ -8,12 +8,15 @@
 //! [`crate::harness::watertight::is_watertight`] check, building the solid with
 //! `create_solid: true` (an open shell tessellates into degenerate geometry).
 //!
-//! The top section is XY-sheared by `(dx, dy)` away from the bottom on purpose:
-//! lofting two *identical, axis-aligned* stacked rectangles collapses a lateral
-//! wall to a zero-area face (mesh volume 40 vs 60 on 3×4×5, and a `cdt`
-//! triangulation panic) — tracked as task LOFT-ALIGNED-DEGENERACY. A non-zero
-//! shear is the robust regime and still has an exact volume oracle. (Loft
-//! manifold-gap hardening is task #33.)
+//! This harness found and pins the fix for LOFT-RECT-VOLUME-LOSS (#48): lofting
+//! rectangle profiles previously dropped ⅓ of the volume (40 vs 60 on 3×4×5)
+//! and built a degenerate zero-area lateral face that panicked `cdt`. Root
+//! cause was in `operations/loft.rs`: `create_ruled_face` / `build_loft_cap`
+//! recorded every loop edge as forward, but `create_or_find_edge` reuses shared
+//! rails/rungs in *either* direction, so a reversed reused edge made the face
+//! loop chain head-to-head instead of head-to-tail. Fixed by recording each
+//! edge's true orientation (`directed_loop_edge`). Both axis-aligned and
+//! XY-sheared congruent sections are now exact.
 
 use crate::harness::watertight::{is_watertight, mesh_volume};
 use crate::math::vector3::Point3;
@@ -119,29 +122,48 @@ fn within_rel(a: f64, b: f64, tol: f64) -> bool {
 mod tests {
     use super::*;
 
-    /// HARNESS-FOUND BUG (task LOFT-RECT-VOLUME-LOSS): lofting two rectangle
-    /// profiles produces a solid with only ⅔ of the correct volume (40 vs 60 on
-    /// 3×4×5) and a degenerate zero-area lateral face that panics the `cdt`
-    /// triangulator. `densify_correspondence` force-resamples every profile to a
-    /// floor of 8 points (`max(count, 8)`); the resampled rings drive
-    /// `create_ruled_surfaces_between_profiles` to build a collapsed wall quad
-    /// (`(0,0),(-5,2),(-5,2),(0,0)` in its tangent plane). The existing loft
-    /// tests only assert topological validity (`validate_model_enhanced`), which
-    /// does not catch a zero-area face, so this slipped through.
-    ///
-    /// Pinned as `#[ignore]` (run with `--ignored` to reproduce) until the loft
-    /// densify/correspondence path is fixed in the op-finetuning phase. The
-    /// universal tessellation pass is now panic-safe regardless (see
-    /// `tessellation::surface::triangulate_planar_polygon`).
+    /// Regression for LOFT-RECT-VOLUME-LOSS (#48): a sheared rectangle loft is
+    /// an oblique prism of volume w·h·dz. Before the `directed_loop_edge` fix
+    /// this yielded volume 40 vs 60 with a degenerate face; now exact.
     #[test]
-    #[ignore = "LOFT-RECT-VOLUME-LOSS: loft drops ⅓ volume + degenerate face (harness-found)"]
     fn loft_sheared_sections_is_an_oblique_prism_and_watertight() {
         // 3×4 rectangles separated by 5, top sheared by (1,1) → oblique-prism
-        // volume w·h·dz = 60 (shear-independent, Cavalieri). Currently fails:
-        // the loft yields volume 40, prism_ok = false.
+        // volume w·h·dz = 60 (shear-independent, Cavalieri).
         let c = loft_prism_invariants(3.0, 4.0, 5.0, 1.0, 1.0, 2e-2);
         assert!(c.prism_ok, "{c:?}");
         assert!(c.watertight, "lofted prism not watertight: {c:?}");
         assert!((c.expected_volume - 60.0).abs() < 1e-9);
+    }
+
+    /// The identical, axis-aligned stacked-rectangle case (zero shear) — the
+    /// original degeneracy — is now a clean right prism too.
+    #[test]
+    fn loft_aligned_sections_is_a_right_prism_and_watertight() {
+        let c = loft_prism_invariants(3.0, 4.0, 5.0, 0.0, 0.0, 2e-2);
+        assert!(c.prism_ok, "{c:?}");
+        assert!(c.watertight, "lofted prism not watertight: {c:?}");
+        assert!((c.expected_volume - 60.0).abs() < 1e-9);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        // Two tessellations per case → keep the count modest for CI speed.
+        #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+
+        /// Loft between congruent sections (any XY shear, including none) is a
+        /// prism of volume w·h·dz, watertight, for any rectangle and separation.
+        #[test]
+        fn pp_loft_prism_volume(
+            w in 1.0f64..8.0,
+            h in 1.0f64..8.0,
+            l in 1.0f64..10.0,
+            dx in 0.0f64..3.0,
+            dy in 0.0f64..3.0,
+        ) {
+            let c = loft_prism_invariants(w, h, l, dx, dy, 3e-2);
+            prop_assert!(c.prism_ok, "w={w} h={h} l={l} dx={dx} dy={dy}: {c:?}");
+            prop_assert!(c.watertight, "not watertight: {c:?}");
+        }
     }
 }
