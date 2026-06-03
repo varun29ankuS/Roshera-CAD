@@ -171,7 +171,7 @@ pub fn manifold_report(
         }
         x
     }
-    let mut union = |parent: &mut Vec<u32>, a: u32, b: u32| {
+    let union = |parent: &mut Vec<u32>, a: u32, b: u32| {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
