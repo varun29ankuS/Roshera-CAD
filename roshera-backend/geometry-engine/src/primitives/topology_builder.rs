@@ -3734,16 +3734,27 @@ impl<'a> TopologyBuilder<'a> {
             });
         }
 
-        // Calculate apex and half angle from base/top radii
-        let (apex, half_angle, actual_height) = if base_radius == 0.0 {
-            // Cone with apex at base
+        // Calculate apex, cone axis (apex→wide-end), and half angle from the
+        // base/top radii. The cone surface evaluates as `apex + cone_axis·v`,
+        // so `cone_axis` must point from the apex toward the WIDE end for the
+        // body to land in the right place.
+        let (apex, cone_axis, half_angle, actual_height) = if base_radius == 0.0 {
+            // Apex at the base; the body opens along +axis toward the wide top.
             let half_angle = (top_radius / height).atan();
-            (base_center, half_angle, height)
+            (base_center, axis, half_angle, height)
         } else if top_radius == 0.0 {
-            // Cone with apex at top
+            // Apex at the TOP (`base_center + axis·height`); the body opens
+            // DOWNWARD, back toward `base_center`, so the cone's apex→base axis
+            // is `-axis`. Without the flip the wide base circle is placed at
+            // `apex + axis·height` — mirrored ABOVE the apex — so the whole
+            // cone sits in the wrong location. That is invisible to standalone
+            // volume (position-independent) and manifold (topology-only) checks
+            // but fatal for Booleans, which then classify the cone's faces
+            // against the wrong region (interior point landed at z=4.5 for a
+            // cone whose base should be at z=-1.5).
             let half_angle = (base_radius / height).atan();
             let apex = base_center + axis * height;
-            (apex, half_angle, height)
+            (apex, -axis, half_angle, height)
         } else {
             // True frustum (both radii positive). A near-equal pair is a
             // cylinder; otherwise build a real two-end frustum B-Rep (shared
@@ -3764,7 +3775,7 @@ impl<'a> TopologyBuilder<'a> {
         };
 
         // Create cone parameters
-        let params = ConeParameters::new(apex, axis, half_angle, actual_height)?;
+        let params = ConeParameters::new(apex, cone_axis, half_angle, actual_height)?;
 
         // Use the full cone implementation
         use crate::primitives::cone_primitive::ConePrimitive;
