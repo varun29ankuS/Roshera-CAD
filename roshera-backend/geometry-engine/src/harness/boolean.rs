@@ -203,6 +203,166 @@ mod tests {
 
     const X: Vector3 = Vector3::X;
 
+    // ---- independent Monte-Carlo volume oracle (diagnostic) --------------
+    // Tests a boolean RESULT against the ORIGINAL operands by point sampling:
+    // p ∈ A∩B ⟺ in(A) ∧ in(B), etc. This is independent of mass-props AND of
+    // the result B-Rep, so it catches over/under-inclusion that the all-mass-
+    // props inclusion-exclusion identity can mask.
+
+    /// Analytic MC truth from explicit in-A / in-B predicates (independent of
+    /// the kernel entirely). Returns (V_union, V_intersection, V_difference).
+    fn mc_truth_analytic<A, B>(in_a: A, in_b: B, half: f64, n: usize) -> (f64, f64, f64)
+    where
+        A: Fn(f64, f64, f64) -> bool,
+        B: Fn(f64, f64, f64) -> bool,
+    {
+        let lo = -half;
+        let span = 2.0 * half;
+        let cell = span / n as f64;
+        let off = cell * 0.4365; // off the face planes
+        let (mut u, mut i, mut d) = (0usize, 0usize, 0usize);
+        for ix in 0..n {
+            for iy in 0..n {
+                for iz in 0..n {
+                    let (x, y, z) = (
+                        lo + off + ix as f64 * cell,
+                        lo + off + iy as f64 * cell,
+                        lo + off + iz as f64 * cell,
+                    );
+                    let (ina, inb) = (in_a(x, y, z), in_b(x, y, z));
+                    if ina || inb {
+                        u += 1;
+                    }
+                    if ina && inb {
+                        i += 1;
+                    }
+                    if ina && !inb {
+                        d += 1;
+                    }
+                }
+            }
+        }
+        let cellv = cell * cell * cell;
+        (u as f64 * cellv, i as f64 * cellv, d as f64 * cellv)
+    }
+
+    /// Run one boolean and return the result's mass-properties volume.
+    fn kernel_vol<F>(build: &F, op: BooleanOp) -> Option<f64>
+    where
+        F: Fn(&mut BRepModel) -> (SolidId, SolidId),
+    {
+        let mut m = BRepModel::new();
+        let (a, b) = build(&mut m);
+        boolean_operation(&mut m, a, b, op, BooleanOptions::default())
+            .ok()
+            .and_then(|r| m.calculate_solid_volume(r))
+    }
+
+    fn mkbox(m: &mut BRepModel, sz: f64) -> SolidId {
+        TopologyBuilder::new(m)
+            .create_box_3d(sz, sz, sz)
+            .expect("box");
+        m.solids.iter().last().map(|(id, _)| id).expect("s")
+    }
+
+    const IN_UNIT4: fn(f64, f64, f64) -> bool =
+        |x, y, z| x.abs() <= 2.0 && y.abs() <= 2.0 && z.abs() <= 2.0;
+
+    /// Assert all three booleans match the independent analytic MC truth.
+    fn assert_mc<F, B>(build: F, in_b: B, tol: f64)
+    where
+        F: Fn(&mut BRepModel) -> (SolidId, SolidId),
+        B: Fn(f64, f64, f64) -> bool,
+    {
+        let (mu, mi, md) = mc_truth_analytic(IN_UNIT4, in_b, 4.0, 120);
+        let close = |k: Option<f64>, truth: f64, what: &str| {
+            let v = k.unwrap_or_else(|| panic!("{what} returned None (op failed)"));
+            assert!(
+                (v - truth).abs() <= tol * truth.max(1.0),
+                "{what}: kernel {v:.3} vs MC truth {truth:.3}"
+            );
+        };
+        close(kernel_vol(&build, BooleanOp::Union), mu, "union");
+        close(
+            kernel_vol(&build, BooleanOp::Intersection),
+            mi,
+            "intersection",
+        );
+        close(kernel_vol(&build, BooleanOp::Difference), md, "difference");
+    }
+
+    /// Independent-oracle check: rotating one box about Z gives ∩/∪/∖ matching
+    /// the analytic Monte-Carlo truth (not just the inclusion-exclusion identity,
+    /// which can mask compensating errors). Confirms the rotated-box
+    /// over-inclusion bug (task #34) is genuinely gone.
+    #[test]
+    fn rotated_box_booleans_match_mc_truth() {
+        let ang = 0.5236; // 30°
+        let build = move |m: &mut BRepModel| {
+            let a = mkbox(m, 4.0);
+            let b = mkbox(m, 4.0);
+            rotate(
+                m,
+                vec![b],
+                Vector3::ZERO,
+                Vector3::Z,
+                ang,
+                Default::default(),
+            )
+            .unwrap();
+            (a, b)
+        };
+        let in_b = move |x: f64, y: f64, z: f64| {
+            let (c, s) = ((-ang).cos(), (-ang).sin());
+            IN_UNIT4(c * x - s * y, s * x + c * y, z)
+        };
+        assert_mc(build, in_b, 2e-2);
+    }
+
+    /// Tilted-axis (fully 3D) rotation matches the analytic MC truth.
+    #[test]
+    fn tilted_box_booleans_match_mc_truth() {
+        let ang = 0.5236;
+        let ax = Vector3::new(1.0, 1.0, 1.0).normalize().unwrap();
+        let build = move |m: &mut BRepModel| {
+            let a = mkbox(m, 4.0);
+            let b = mkbox(m, 4.0);
+            rotate(m, vec![b], Vector3::ZERO, ax, ang, Default::default()).unwrap();
+            (a, b)
+        };
+        let in_b = move |x: f64, y: f64, z: f64| {
+            let p = crate::math::vector3::Point3::new(x, y, z);
+            let q = crate::math::matrix4::Matrix4::from_axis_angle(&ax, -ang)
+                .unwrap()
+                .transform_point(&p);
+            IN_UNIT4(q.x, q.y, q.z)
+        };
+        assert_mc(build, in_b, 2e-2);
+    }
+
+    /// HARNESS-FOUND BUG (task BOOL-CURVED-STITCH): a cylinder poking through a
+    /// box's ±Z caps produces wrong booleans — union fails outright
+    /// (`build_shells_from_faces: component has only 1 planar face`), the
+    /// intersection has only 2 faces and is invalid (vol 23.6 vs MC truth 28.3),
+    /// the difference over-reports (45.2 vs 35.7). The boolean orphans/drops
+    /// faces when stitching curved (cylinder) operands. The MC oracle above
+    /// confirms box-box booleans are correct, so the defect is specific to the
+    /// curved-surface face-split/stitch path. Pinned `#[ignore]` until fixed.
+    #[test]
+    #[ignore = "BOOL-CURVED-STITCH: cylinder∩box drops faces — union fails, ∩/∖ wrong (harness-found)"]
+    fn cylinder_box_booleans_match_mc_truth() {
+        let build = |m: &mut BRepModel| {
+            let a = mkbox(m, 4.0);
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Vector3::new(0.0, 0.0, -3.0), Vector3::Z, 1.5, 6.0)
+                .expect("cyl");
+            let b = m.solids.iter().last().map(|(id, _)| id).expect("b");
+            (a, b)
+        };
+        let in_cyl = |x: f64, y: f64, z: f64| x * x + y * y <= 1.5 * 1.5 && z.abs() <= 3.0;
+        assert_mc(build, in_cyl, 3e-2);
+    }
+
     fn box_solid(model: &mut BRepModel) -> SolidId {
         TopologyBuilder::new(model)
             .create_box_3d(2.0, 2.0, 2.0)
