@@ -7180,7 +7180,7 @@ fn ray_surface_all_intersections(
             let c = co_a * co_a - cos2 * co.dot(&co);
 
             let mut results: Vec<f64> = Vec::new();
-            let mut push_if_valid = |t: f64, results: &mut Vec<f64>| {
+            let push_if_valid = |t: f64, results: &mut Vec<f64>| {
                 // Forward along the ray, on the axis-facing nappe (v ≥ 0), and
                 // not a duplicate of an existing (tangent) root.
                 let v = co_a + t * d_a;
