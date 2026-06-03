@@ -21,6 +21,7 @@ pub mod chamfer;
 pub mod extrude;
 pub mod fillet;
 pub mod revolve;
+pub mod shell;
 pub mod sweep;
 pub mod tessellation;
 pub mod transform;
