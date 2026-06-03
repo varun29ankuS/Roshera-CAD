@@ -5518,6 +5518,51 @@ fn presplit_closed_loop_edges(
                 .incident_edges
                 .insert(eid);
         }
+
+        // Propagate the split into any OTHER face loop that references this
+        // same boundary edge. A closed boundary self-loop is almost always a
+        // shared rim — a cylinder/cone cap rim circle bounds both the cap face
+        // and the lateral face. We are splitting it here so the LATERAL's DCEL
+        // arrangement can close its region cycles; the sibling cap face still
+        // holds the undivided edge and would tessellate the shared rim with a
+        // DIFFERENT discretisation (the cap samples the whole circle; the
+        // lateral samples three sub-arcs), leaving an open seam where the two
+        // meet. That is invisible to the signed-volume check (the volume is
+        // still right) but the manifold oracle flags it: a cylinder poking
+        // through a box gave the correct Union volume with ~190 boundary edges
+        // around each protruding cap rim. Rewriting every referencing loop to
+        // the same three sub-edges makes both faces share one discretisation,
+        // so the seam welds. Orientation is preserved: a loop traversing the
+        // rim backwards gets the sub-edges in reverse order, each reversed.
+        let subs = [first_id, second_id, third_id];
+        let affected: Vec<crate::primitives::r#loop::LoopId> = model
+            .loops
+            .iter()
+            .filter(|(_, lp)| lp.edges.contains(&edge_id))
+            .map(|(id, _)| id)
+            .collect();
+        for lid in affected {
+            if let Some(lp) = model.loops.get_mut(lid) {
+                let old_edges = std::mem::take(&mut lp.edges);
+                let old_or = std::mem::take(&mut lp.orientations);
+                // `add_edge` re-pushes and invalidates the cached stats.
+                for (e, o) in old_edges.iter().zip(old_or.iter()) {
+                    if *e == edge_id {
+                        if *o {
+                            for &s in &subs {
+                                lp.add_edge(s, true);
+                            }
+                        } else {
+                            for &s in subs.iter().rev() {
+                                lp.add_edge(s, false);
+                            }
+                        }
+                    } else {
+                        lp.add_edge(*e, *o);
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
