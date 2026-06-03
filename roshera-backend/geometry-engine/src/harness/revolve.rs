@@ -10,10 +10,15 @@
 //! mesh watertightness (a leaky mesh's divergence volume would not match Pappus).
 //! Mass-properties volume is deliberately NOT used — it has a documented residual
 //! disagreement with the tessellation for `SurfaceOfRevolution` solids (so the
-//! universal `is_watertight`, which compares the two, does not apply here). Full
-//! (2π) revolutions also leave a documented boundary-edge tessellation gap
-//! (CDT-γ class), so this harness exercises the watertight *partial*-revolution
-//! regime; the residuals are tracked separately.
+//! universal `is_watertight`, which compares the two, does not apply here).
+//!
+//! This harness previously had to restrict itself to partial (≤ π) revolutions:
+//! beyond π, and at full 2π, the per-segment revolution wall faces were dropped
+//! by the generic curved-CDT tessellator (REVOLVE-ROBUSTNESS #47), collapsing
+//! the mesh volume. That is fixed — those faces now tessellate as structured
+//! grids (`tessellation::surface::tessellate_revolution_wedge`) — so the harness
+//! exercises the full angular range (arbitrary angle, > π, and 2π) plus
+//! near-axis profiles.
 
 use crate::harness::watertight::mesh_volume;
 use crate::math::vector3::{Point3, Vector3};
@@ -130,25 +135,49 @@ mod tests {
         assert!((c.pappus_volume - 3.0 * PI).abs() < 1e-9);
     }
 
+    #[test]
+    fn beyond_half_turn_matches_pappus() {
+        // Angles > π were the REVOLVE-ROBUSTNESS regression (#47): the past-π
+        // wall wedges were dropped, collapsing the volume. Now exact.
+        let c = revolve_rect_invariants(2.0, 4.0, 0.0, 1.0, 0.52 * 2.0 * PI, 3e-2);
+        assert!(c.pappus_ok, "{c:?}");
+    }
+
+    #[test]
+    fn full_revolution_matches_pappus() {
+        // A full 2π revolution: V = π·(x1²−x0²)·(z1−z0) = π·12 = 12π. Previously
+        // both under-reported AND panicked the cdt triangulator.
+        let c = revolve_rect_invariants(2.0, 4.0, 0.0, 1.0, 2.0 * PI, 3e-2);
+        assert!(c.pappus_ok, "{c:?}");
+        assert!((c.pappus_volume - 12.0 * PI).abs() < 1e-9);
+    }
+
+    #[test]
+    fn near_axis_profile_matches_pappus() {
+        let c = revolve_rect_invariants(0.5, 1.0, 0.0, 1.0, PI / 2.0, 3e-2);
+        assert!(c.pappus_ok, "{c:?}");
+    }
+
     use proptest::prelude::*;
 
     proptest! {
         #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
 
         /// Pappus holds (mesh watertight + correct) for any healthy rectangle
-        /// revolved a clean quarter-turn. The angle is fixed: arbitrary-angle
-        /// partial revolutions, full (2π) revolutions, and tiny/near-axis
-        /// profiles all have tracked tessellation residuals (REVOLVE-ROBUSTNESS),
-        /// so this harness pins the robust regime the existing suite relies on.
+        /// revolved through ANY angle in (0, 2π] — partial, past-π, and full
+        /// revolutions alike, now that the wall wedges tessellate as structured
+        /// grids (REVOLVE-ROBUSTNESS #47 fixed).
         #[test]
-        fn pp_quarter_revolve_profile_matches_pappus(
+        fn pp_revolve_profile_matches_pappus(
             x0 in 1.5f64..4.0,
             w in 1.0f64..2.5,
             z0 in 0.0f64..2.0,
             h in 1.0f64..2.5,
+            frac in 0.1f64..1.0,
         ) {
-            let c = revolve_rect_invariants(x0, x0 + w, z0, z0 + h, PI / 2.0, 4e-2);
-            prop_assert!(c.pappus_ok, "x0={x0} w={w} z0={z0} h={h}: {c:?}");
+            let angle = frac * 2.0 * PI;
+            let c = revolve_rect_invariants(x0, x0 + w, z0, z0 + h, angle, 4e-2);
+            prop_assert!(c.pappus_ok, "x0={x0} w={w} z0={z0} h={h} angle={angle}: {c:?}");
         }
     }
 }

@@ -23,9 +23,9 @@ use geometry_engine::tessellation::{tessellate_solid, TessellationParams, Triang
 // Divergence-theorem volume of the WATERTIGHT tessellated solid. NOTE: this is
 // used instead of `mass_properties_for`, whose volume path disagrees with the
 // tessellation for revolved (generic SurfaceOfRevolution) solids — a separate
-// documented residual. Partial revolutions tessellate watertight, so this is
-// exact for them; the full-revolution cases (tessellation leaves boundary-edge
-// gaps — the CDT-γ-class residual) are #[ignore]'d below.
+// documented residual. Both partial and full revolutions now tessellate
+// watertight (the wall wedges are structured-grid tessellated — REVOLVE-
+// ROBUSTNESS #47), so this divergence volume is exact across the full range.
 fn mesh_volume(mesh: &TriangleMesh) -> f64 {
     let mut v = 0.0;
     for t in &mesh.triangles {
@@ -101,29 +101,27 @@ fn rel_close(a: f64, b: f64, tol: f64) -> bool {
 // Full 360° revolve → annular ring volume = π(x1²−x0²)(z1−z0).
 // =====================================================================
 
-// IGNORED: full-revolution tessellation of generic SurfaceOfRevolution patches
-// is not yet trimmed to the angular wedge, leaving boundary-edge gaps, so the
-// divergence volume under-counts (the B-Rep is valid — see
-// revolve_validity_invariants.rs — but the tessellation has a documented
-// residual). Partial revolutions (below) are watertight and exact.
+// Full 360° revolves now tessellate watertight: the per-segment wall wedges are
+// tessellated as structured grids (REVOLVE-ROBUSTNESS #47 fixed), so the
+// divergence volume matches Pappus exactly. A `None` here would mean revolve
+// regressed into an outright failure and must fail the test, not skip it.
 macro_rules! full_revolve_test {
     ($name:ident, $x0:expr, $x1:expr, $z0:expr, $z1:expr) => {
         #[test]
-        #[ignore = "full-revolution tessellation residual (boundary-edge gaps) — B-Rep is valid; partial revolves are exact"]
         fn $name() {
-            if let Some(vol) = revolve_volume($x0, $x1, $z0, $z1, 2.0 * PI) {
-                let expected = pappus_volume($x0, $x1, $z0, $z1, 2.0 * PI);
-                assert!(
-                    rel_close(vol, expected, 0.05),
-                    "full revolve [{},{}]x[{},{}]: vol {} vs Pappus {}",
-                    $x0,
-                    $x1,
-                    $z0,
-                    $z1,
-                    vol,
-                    expected
-                );
-            }
+            let vol = revolve_volume($x0, $x1, $z0, $z1, 2.0 * PI)
+                .expect("full revolve of a known-good profile must tessellate");
+            let expected = pappus_volume($x0, $x1, $z0, $z1, 2.0 * PI);
+            assert!(
+                rel_close(vol, expected, 0.05),
+                "full revolve [{},{}]x[{},{}]: vol {} vs Pappus {}",
+                $x0,
+                $x1,
+                $z0,
+                $z1,
+                vol,
+                expected
+            );
         }
     };
 }
@@ -170,20 +168,16 @@ partial_revolve_test!(
     1.0,
     std::f64::consts::FRAC_PI_2
 );
-// 270° (> 180°) hits the same generic-SurfaceOfRevolution tessellation residual
-// as the full-revolution cases (the wedge patches at some angles under-mesh),
-// so it is ignored; sweeps ≤ 180° tessellate watertight and stay asserted.
-#[test]
-#[ignore = "partial revolve >180° hits the full-revolution tessellation residual — ≤180° sweeps are exact"]
-fn three_quarter_2_4_0_1() {
-    if let Some(vol) = revolve_volume(2.0, 4.0, 0.0, 1.0, 3.0 * std::f64::consts::FRAC_PI_2) {
-        let expected = pappus_volume(2.0, 4.0, 0.0, 1.0, 3.0 * std::f64::consts::FRAC_PI_2);
-        assert!(
-            rel_close(vol, expected, 0.06),
-            "vol {vol} vs Pappus {expected}"
-        );
-    }
-}
+// 270° (> 180°): the past-π wall wedges now tessellate as structured grids
+// (REVOLVE-ROBUSTNESS #47), so this is watertight and exact like the ≤180° cases.
+partial_revolve_test!(
+    three_quarter_2_4_0_1,
+    2.0,
+    4.0,
+    0.0,
+    1.0,
+    3.0 * std::f64::consts::FRAC_PI_2
+);
 partial_revolve_test!(half_1_3_0_2, 1.0, 3.0, 0.0, 2.0, std::f64::consts::PI);
 partial_revolve_test!(
     third_3_5_0_2,
@@ -227,15 +221,14 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
     #[test]
-    #[ignore = "full-revolution tessellation residual (boundary-edge gaps) — partial revolves are exact"]
     fn prop_full_revolve_matches_pappus(
         x0 in 0.5f64..6.0, width in 0.5f64..3.0,
         z0 in 0.0f64..3.0, height in 0.5f64..3.0,
     ) {
         let (x1, z1) = (x0 + width, z0 + height);
-        if let Some(vol) = revolve_volume(x0, x1, z0, z1, 2.0 * PI) {
-            let expected = pappus_volume(x0, x1, z0, z1, 2.0 * PI);
-            prop_assert!(rel_close(vol, expected, 0.05), "{vol} vs {expected}");
-        }
+        let vol = revolve_volume(x0, x1, z0, z1, 2.0 * PI)
+            .expect("full revolve must tessellate");
+        let expected = pappus_volume(x0, x1, z0, z1, 2.0 * PI);
+        prop_assert!(rel_close(vol, expected, 0.05), "{vol} vs {expected}");
     }
 }
