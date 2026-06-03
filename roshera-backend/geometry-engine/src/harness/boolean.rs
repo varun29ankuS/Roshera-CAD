@@ -291,6 +291,29 @@ mod tests {
         close(kernel_vol(&build, BooleanOp::Difference), md, "difference");
     }
 
+    /// Like `assert_mc` but only the intersection + difference (used while the
+    /// curved-Union poke-through stitch is still being completed).
+    fn assert_mc_id<F, B>(build: F, in_b: B, tol: f64)
+    where
+        F: Fn(&mut BRepModel) -> (SolidId, SolidId),
+        B: Fn(f64, f64, f64) -> bool,
+    {
+        let (_mu, mi, md) = mc_truth_analytic(IN_UNIT4, in_b, 4.0, 120);
+        let close = |k: Option<f64>, truth: f64, what: &str| {
+            let v = k.unwrap_or_else(|| panic!("{what} returned None (op failed)"));
+            assert!(
+                (v - truth).abs() <= tol * truth.max(1.0),
+                "{what}: kernel {v:.3} vs MC truth {truth:.3}"
+            );
+        };
+        close(
+            kernel_vol(&build, BooleanOp::Intersection),
+            mi,
+            "intersection",
+        );
+        close(kernel_vol(&build, BooleanOp::Difference), md, "difference");
+    }
+
     /// Independent-oracle check: rotating one box about Z gives ∩/∪/∖ matching
     /// the analytic Monte-Carlo truth (not just the inclusion-exclusion identity,
     /// which can mask compensating errors). Confirms the rotated-box
@@ -340,27 +363,39 @@ mod tests {
         assert_mc(build, in_b, 2e-2);
     }
 
-    /// HARNESS-FOUND BUG (task BOOL-CURVED-STITCH): a cylinder poking through a
-    /// box's ±Z caps produces wrong booleans — union fails outright
-    /// (`build_shells_from_faces: component has only 1 planar face`), the
-    /// intersection has only 2 faces and is invalid (vol 23.6 vs MC truth 28.3),
-    /// the difference over-reports (45.2 vs 35.7). The boolean orphans/drops
-    /// faces when stitching curved (cylinder) operands. The MC oracle above
-    /// confirms box-box booleans are correct, so the defect is specific to the
-    /// curved-surface face-split/stitch path. Pinned `#[ignore]` until fixed.
+    fn cyl_through_box(m: &mut BRepModel) -> (SolidId, SolidId) {
+        let a = mkbox(m, 4.0);
+        TopologyBuilder::new(m)
+            .create_cylinder_3d(Vector3::new(0.0, 0.0, -3.0), Vector3::Z, 1.5, 6.0)
+            .expect("cyl");
+        let b = m.solids.iter().last().map(|(id, _)| id).expect("b");
+        (a, b)
+    }
+    fn in_cyl_through(x: f64, y: f64, z: f64) -> bool {
+        x * x + y * y <= 1.5 * 1.5 && z.abs() <= 3.0
+    }
+
+    /// A cylinder poking through a box's ±Z caps. The intersection and difference
+    /// now match the independent MC truth — fixed by the periodic-face
+    /// `is_point_in_face` bug (a point on a full cylinder lateral was judged
+    /// outside, mis-classifying every cap fragment) plus self-loop (cap-circle)
+    /// adjacency in shell assembly. Regression guard for BOOL-CURVED-STITCH (#50).
     #[test]
-    #[ignore = "BOOL-CURVED-STITCH: cylinder∩box drops faces — union fails, ∩/∖ wrong (harness-found)"]
-    fn cylinder_box_booleans_match_mc_truth() {
-        let build = |m: &mut BRepModel| {
-            let a = mkbox(m, 4.0);
-            TopologyBuilder::new(m)
-                .create_cylinder_3d(Vector3::new(0.0, 0.0, -3.0), Vector3::Z, 1.5, 6.0)
-                .expect("cyl");
-            let b = m.solids.iter().last().map(|(id, _)| id).expect("b");
-            (a, b)
-        };
-        let in_cyl = |x: f64, y: f64, z: f64| x * x + y * y <= 1.5 * 1.5 && z.abs() <= 3.0;
-        assert_mc(build, in_cyl, 3e-2);
+    fn cylinder_box_intersection_difference_match_mc_truth() {
+        assert_mc_id(cyl_through_box, in_cyl_through, 3e-2);
+    }
+
+    /// The UNION of a poke-through cylinder still fails: the shared intersection
+    /// circles (box-cap hole ↔ cylinder-stub rim) receive incompatible edge
+    /// decompositions across the two operands' splits, so the box body and the
+    /// two cylinder stubs land in disjoint shells. Tracked as the remaining half
+    /// of BOOL-CURVED-STITCH (#50) — an imprint edge-sharing consistency issue.
+    #[test]
+    #[ignore = "BOOL-CURVED-STITCH (union): poke-through union splits into disjoint shells (harness-found)"]
+    fn cylinder_box_union_matches_mc_truth() {
+        let (mu, _, _) = mc_truth_analytic(IN_UNIT4, in_cyl_through, 4.0, 120);
+        let v = kernel_vol(&cyl_through_box, BooleanOp::Union).expect("union None");
+        assert!((v - mu).abs() <= 3e-2 * mu, "union {v:.3} vs MC {mu:.3}");
     }
 
     fn box_solid(model: &mut BRepModel) -> SolidId {

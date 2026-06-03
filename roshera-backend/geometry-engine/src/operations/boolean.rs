@@ -7405,6 +7405,30 @@ fn is_point_in_face(
         return Ok(true);
     }
 
+    // Degenerate UV polygon (near-zero area) ⇒ the loop collapsed to a line in
+    // parameter space. The canonical case is a **full untrimmed periodic face**
+    // (e.g. a closed cylinder/cone/sphere lateral) whose only boundary loop is
+    // the seam: every boundary vertex maps to the same `u` (the seam angle), so
+    // the polygon is a zero-width sliver and the point-in-polygon test below
+    // would reject every point off the seam line — making ray-cast
+    // classification miss every crossing of the lateral and misclassify
+    // interior points as Outside. Such a face has no real trim in the collapsed
+    // direction, so an on-surface point already inside the parameter bounds
+    // (verified above) is inside the face.
+    let poly_area2 = {
+        let mut a = 0.0;
+        let n = uv_polygon.len();
+        for i in 0..n {
+            let (x1, y1) = uv_polygon[i];
+            let (x2, y2) = uv_polygon[(i + 1) % n];
+            a += x1 * y2 - x2 * y1;
+        }
+        a.abs() * 0.5
+    };
+    if poly_area2 < tolerance.distance() * tolerance.distance() {
+        return Ok(true);
+    }
+
     // 2D ray-casting point-in-polygon test
     let test_u = u;
     let test_v = v;
@@ -8094,6 +8118,63 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
         }
     }
 
+    // Self-loop edge adjacency (closed seam / cap circles).
+    //
+    // A closed circular edge (cylinder/cone/sphere cap rim, periodic seam)
+    // has `start_vertex == end_vertex`, so it is skipped by both vertex-pair
+    // passes above. But a cap face and the lateral wall it bounds frequently
+    // share ONLY such a circle — and after splitting, the un-split end cap
+    // keeps its full-circle self-loop while the lateral stub carries a
+    // geometrically identical circle. Without matching them, the two land in
+    // disjoint components and `build_shells_from_faces` rejects the result as
+    // "component has only 1 face". Key each self-loop by a quantised,
+    // rotation-invariant circle signature: its centre and radius. The seam
+    // vertex and the edge midpoint (the half-period point, diametrically
+    // opposite on a closed circle) average to the centre and span the diameter,
+    // so the key is independent of WHERE the seam sits — two copies of the same
+    // rim with seams at different angles still match (a seam-vertex key would
+    // not, which is why the cap↔stub stitch still failed before this).
+    let q1 = |x: f64| -> i64 { (x * 1e6).round() as i64 };
+    let quant = |p: [f64; 3]| -> (i64, i64, i64) { (q1(p[0]), q1(p[1]), q1(p[2])) };
+    let mut selfloop_to_faces: HashMap<((i64, i64, i64), i64), Vec<usize>> = HashMap::new();
+    for (idx, face) in faces.iter().enumerate() {
+        for eid in all_edges(face) {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let a = edge.start_vertex;
+            if a == crate::primitives::vertex::INVALID_VERTEX_ID || a != edge.end_vertex {
+                continue; // only closed self-loop edges
+            }
+            let Some(vpos) = model.vertices.get_position(a) else {
+                continue;
+            };
+            let mid = model.curves.get(edge.curve_id).and_then(|c| {
+                let t = (edge.param_range.start + edge.param_range.end) * 0.5;
+                c.evaluate(t)
+                    .ok()
+                    .map(|cp| [cp.position.x, cp.position.y, cp.position.z])
+            });
+            if let Some(midp) = mid {
+                let center = [
+                    0.5 * (vpos[0] + midp[0]),
+                    0.5 * (vpos[1] + midp[1]),
+                    0.5 * (vpos[2] + midp[2]),
+                ];
+                let radius = {
+                    let dx = vpos[0] - midp[0];
+                    let dy = vpos[1] - midp[1];
+                    let dz = vpos[2] - midp[2];
+                    0.5 * (dx * dx + dy * dy + dz * dz).sqrt()
+                };
+                selfloop_to_faces
+                    .entry((quant(center), q1(radius)))
+                    .or_default()
+                    .push(idx);
+            }
+        }
+    }
+
     // Also group by original face (faces from the same original face are related)
     let mut orig_to_faces: HashMap<FaceId, Vec<usize>> = HashMap::new();
     for (idx, face) in faces.iter().enumerate() {
@@ -8141,6 +8222,13 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
     // operand solids (see comment block above the `touched_vids`
     // collection for the motivating failure mode).
     for face_indices in pos_pair_to_faces.values() {
+        for i in 1..face_indices.len() {
+            union(&mut parent, face_indices[0], face_indices[i]);
+        }
+    }
+
+    // Union faces that share a closed self-loop circle (cap rim / seam).
+    for face_indices in selfloop_to_faces.values() {
         for i in 1..face_indices.len() {
             union(&mut parent, face_indices[0], face_indices[i]);
         }
