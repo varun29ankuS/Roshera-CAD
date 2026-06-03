@@ -307,16 +307,23 @@ mod tests {
                       in_b: &dyn Fn(f64, f64, f64) -> bool,
                       half: f64| {
             let (mu, mi, md) = mc_truth_wide(in_a, in_b, half, 100);
-            let fmt = |k: Option<f64>, t: f64| match k {
-                Some(v) if (v - t).abs() <= 0.04 * t.max(1.0) => format!("OK({v:.2})"),
-                Some(v) => format!("**{v:.2}/{t:.2}**"),
-                None => "**None**".to_string(),
+            let run = |op: BooleanOp, t: f64| -> String {
+                let mut m = BRepModel::new();
+                let (a, b) = build(&mut m);
+                match boolean_operation(&mut m, a, b, op, BooleanOptions::default()) {
+                    Ok(r) => match m.calculate_solid_volume(r) {
+                        Some(v) if (v - t).abs() <= 0.04 * t.max(1.0) => format!("OK({v:.2})"),
+                        Some(v) => format!("**{v:.2}/{t:.2}**"),
+                        None => "**novol**".to_string(),
+                    },
+                    Err(e) => format!("**ERR:{e:?}**"),
+                }
             };
             eprintln!(
-                "{name:>24}: ∪ {} | ∩ {} | ∖ {}",
-                fmt(kernel_vol(&build, BooleanOp::Union), mu),
-                fmt(kernel_vol(&build, BooleanOp::Intersection), mi),
-                fmt(kernel_vol(&build, BooleanOp::Difference), md),
+                "{name:>24}:\n   ∪ {}\n   ∩ {}\n   ∖ {}",
+                run(BooleanOp::Union, mu),
+                run(BooleanOp::Intersection, mi),
+                run(BooleanOp::Difference, md),
             );
         };
 
