@@ -191,6 +191,40 @@ pub fn tessellate_face(
         "Cone" => tessellate_conical_face(face, model, params, cache, mesh),
         "Torus" => tessellate_toroidal_face(face, model, params, cache, mesh),
         "NURBS" => tessellate_nurbs_face(face, model, params, cache, mesh),
+        // Revolve emits each curved wall as thin per-segment SurfaceOfRevolution
+        // wedge faces; the generic curved-CDT path fails on these high-aspect
+        // slivers at fine chord (REVOLVE-ROBUSTNESS #47). A wedge is a tensor-
+        // product quad, so tessellate it as a structured grid with cache-sampled
+        // boundaries (watertight, no cdt). Fall back to curved-CDT for the rare
+        // non-rectangular wedge (apex triangle / unequal-radius slanted patch).
+        "SurfaceOfRevolution" => {
+            // Try the structured wedge grid first: it only succeeds for a clean
+            // rectangular wedge (equal-count opposite boundaries), which is
+            // exactly the curved constant-radius wall the generic curved-CDT
+            // path chokes on at fine chord. A thin curved wedge can read as
+            // "nearly planar", so a planarity test FIRST would wrongly route it
+            // to the planar cdt path (same failure) — hence grid-first.
+            //
+            // Anything the grid declines (a flat radial rim sector, an apex
+            // triangle, a slanted unequal-radius wedge) falls back to the
+            // generic planar-or-curved-CDT routing the `_` arm uses.
+            if !tessellate_revolution_wedge(face, model, cache, mesh) {
+                let planar_tol = Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
+                if surface.is_planar(planar_tol)
+                    || is_face_loop_planar_in_3d(face, model, cache, planar_tol)
+                {
+                    tessellate_planar_face(face, model, params, cache, mesh);
+                } else if let Err(e) = super::curved_cdt::tessellate_curved_cdt(
+                    surface, face, model, params, cache, mesh,
+                ) {
+                    tracing::warn!(
+                        "revolution wedge: grid declined and curved_cdt failed for face {:?}: {:?}",
+                        face.id,
+                        e
+                    );
+                }
+            }
+        }
         "CylindricalFillet" | "ToroidalFillet" | "SphericalFillet" | "VariableRadiusFillet" => {
             tessellate_fillet_face(face, model, params, cache, mesh)
         }
@@ -1558,6 +1592,167 @@ fn tessellate_surface_grid(
             }
         }
     }
+}
+
+/// Tessellate a single `SurfaceOfRevolution` wedge face as a structured grid
+/// whose four boundary edges are sampled from the `EdgeSampleCache` (so shared
+/// seams are bit-exact with neighbours) and whose interior is a transfinite
+/// (Coons) blend of those boundaries — never invoking `cdt`.
+///
+/// Revolve builds each curved wall as 32 thin per-segment `SurfaceOfRevolution`
+/// faces. Each is a four-sided patch: two profile rails and two angular arcs. At
+/// fine chord tolerance the generic curved-CDT path fails on these high-aspect
+/// slivers (`PointOnFixedEdge` / `WedgeEscape` from collinear straight rails +
+/// dense interior Steiner points), drops the face, and leaves the solid
+/// non-watertight — the revolve volume then collapses (REVOLVE-ROBUSTNESS #47).
+/// A wedge is a tensor-product patch, so a structured grid is exact and robust.
+///
+/// The grid indexing is driven by the loop *cycle*: consecutive edges share a
+/// corner by construction, so the four chains `A,B,C,D` (each an oriented run of
+/// cache samples) tile the patch without any `closest_point` classification or
+/// fuzzy corner matching. Opposite chains must have equal sample counts
+/// (`|A|=|C|`, `|B|=|D|`); when they don't — a flat radial rim sector, an apex
+/// triangle, or a slanted unequal-radius wedge — the function returns `false`
+/// having emitted nothing, and the caller falls back to the generic path.
+fn tessellate_revolution_wedge(
+    face: &Face,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let loop_data = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return false,
+    };
+    if loop_data.edges.len() != 4 {
+        return false;
+    }
+
+    // Walk the loop, collecting each edge's cache samples oriented in
+    // loop-traversal direction. The chains then form a continuous ring
+    // c0→c1→c2→c3→c0, each consecutive pair sharing a corner vertex.
+    let mut chains: Vec<Vec<Point3>> = Vec::with_capacity(4);
+    for (k, &eid) in loop_data.edges.iter().enumerate() {
+        let samples = cache.get_or_compute(eid, model);
+        if samples.len() < 2 {
+            return false;
+        }
+        let mut c: Vec<Point3> = samples.iter().copied().collect();
+        if !loop_data.orientations.get(k).copied().unwrap_or(true) {
+            c.reverse();
+        }
+        chains.push(c);
+    }
+    let (a, b, c, d) = (&chains[0], &chains[1], &chains[2], &chains[3]);
+    // Opposite chains must tile a rectangular grid.
+    if a.len() != c.len() || b.len() != d.len() {
+        return false;
+    }
+    let n = a.len(); // i index: 0..n along A (c0→c1) and C (c2→c3)
+    let m = b.len(); // j index: 0..m along B (c1→c2) and D (c3→c0)
+    if n < 2 || m < 2 {
+        return false;
+    }
+    // Corner continuity (chains belong to one loop, so these hold exactly for a
+    // clean quad; a mismatch means the loop is not a 4-corner patch).
+    let close = |p: Point3, q: Point3| (p - q).magnitude() < 1e-6;
+    if !close(a[n - 1], b[0])
+        || !close(b[m - 1], c[0])
+        || !close(c[n - 1], d[0])
+        || !close(d[m - 1], a[0])
+    {
+        return false;
+    }
+
+    // Position at grid node (i, j): boundary nodes come verbatim from the cache
+    // chains (so shared seams are bit-exact); interior nodes are a bilinear
+    // Coons blend of the four boundaries — purely boundary-driven, no surface
+    // re-evaluation, and exact for the developable wedge.
+    let c0 = a[0];
+    let c1 = a[n - 1];
+    let c2 = b[m - 1];
+    let c3 = c[n - 1];
+    let node = |i: usize, j: usize| -> Point3 {
+        if j == 0 {
+            return a[i]; // c0 → c1
+        }
+        if j == m - 1 {
+            return c[n - 1 - i]; // c3 → c2
+        }
+        if i == 0 {
+            return d[m - 1 - j]; // c0 → c3
+        }
+        if i == n - 1 {
+            return b[j]; // c1 → c2
+        }
+        let s = i as f64 / (n - 1) as f64;
+        let t = j as f64 / (m - 1) as f64;
+        let bottom = a[i];
+        let top = c[n - 1 - i];
+        let left = d[m - 1 - j];
+        let right = b[j];
+        // Coons bilinear transfinite interpolation.
+        left * (1.0 - s) + right * s + bottom * (1.0 - t) + top * t
+            - (c0 * ((1.0 - s) * (1.0 - t))
+                + c1 * (s * (1.0 - t))
+                + c2 * (s * t)
+                + c3 * ((1.0 - s) * t))
+    };
+
+    // Emit grid vertices. Shading normals are taken from local grid tangents
+    // (positions are what matter for watertightness; normals need only be
+    // smooth), oriented to agree with the face's outward triangle winding.
+    let pos: Vec<Vec<Point3>> = (0..n)
+        .map(|i| (0..m).map(|j| node(i, j)).collect())
+        .collect();
+    let normal_at = |i: usize, j: usize| -> Vector3 {
+        let ip = pos[(i + 1).min(n - 1)][j];
+        let im = pos[i.saturating_sub(1)][j];
+        let jp = pos[i][(j + 1).min(m - 1)];
+        let jm = pos[i][j.saturating_sub(1)];
+        (ip - im)
+            .cross(&(jp - jm))
+            .normalize()
+            .unwrap_or(Vector3::Z)
+    };
+    let mut grid: Vec<Vec<u32>> = vec![vec![0u32; m]; n];
+    for i in 0..n {
+        for j in 0..m {
+            grid[i][j] = mesh.add_vertex(MeshVertex {
+                position: pos[i][j],
+                normal: normal_at(i, j),
+                uv: None,
+            });
+        }
+    }
+
+    // Emit two triangles per cell. The loop is walked CCW about the surface's
+    // NATURAL normal, and with i along chain A and j along chain D-reversed we
+    // have (i+)×(j+) = +natural. The mesh must wind CCW about the OUTWARD normal
+    // (= natural · orientation.sign): a Forward face (outward = +natural) needs
+    // triangle normal +natural, i.e. winding (v00, v10, v01); a Backward face
+    // takes the mirror.
+    for i in 0..n - 1 {
+        for j in 0..m - 1 {
+            let (v00, v10, v01, v11) = (
+                grid[i][j],
+                grid[i + 1][j],
+                grid[i][j + 1],
+                grid[i + 1][j + 1],
+            );
+            if face.orientation == crate::primitives::face::FaceOrientation::Forward {
+                mesh.add_triangle(v00, v10, v01);
+                mesh.add_triangle(v10, v11, v01);
+            } else {
+                mesh.add_triangle(v00, v01, v10);
+                mesh.add_triangle(v10, v01, v11);
+            }
+        }
+    }
+    true
 }
 
 /// Grid-tessellate a full surface patch over `[u_min,u_max]×[v_min,v_max]`
