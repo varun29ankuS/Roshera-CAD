@@ -1005,6 +1005,7 @@ fn surface_surface_intersection(
         (Planar, Sphere) | (Sphere, Planar) => {
             plane_sphere_intersection(surface_a, surface_b, tolerance)
         }
+        (Planar, Cone) | (Cone, Planar) => plane_cone_intersection(surface_a, surface_b, tolerance),
         _ => {
             // No closed-form handler covers this pair (e.g. NURBS,
             // RuledSurface that isn't planar). Marching solver is the
@@ -1026,6 +1027,7 @@ enum AnalyticalSurfaceKind {
     Planar,
     Cylinder,
     Sphere,
+    Cone,
     Other,
 }
 
@@ -1035,6 +1037,7 @@ fn analytical_surface_kind(surface: &dyn Surface, tolerance: &Tolerance) -> Anal
         SurfaceType::Plane => AnalyticalSurfaceKind::Planar,
         SurfaceType::Cylinder => AnalyticalSurfaceKind::Cylinder,
         SurfaceType::Sphere => AnalyticalSurfaceKind::Sphere,
+        SurfaceType::Cone => AnalyticalSurfaceKind::Cone,
         _ => {
             if surface.is_planar(*tolerance) {
                 AnalyticalSurfaceKind::Planar
@@ -2296,6 +2299,117 @@ fn plane_sphere_intersection(
     };
 
     Ok(vec![curve])
+}
+
+/// Closed-form plane–cone intersection.
+///
+/// For a plane PERPENDICULAR to the cone axis the section is a circle of radius
+/// `v·tan(α)` centred on the axis, where `v` is the signed axial distance from
+/// the apex to the plane and `α` is the half-angle. This is the axis-aligned
+/// Boolean case (a cone poking through a box cap) — without it the pair routes
+/// to the marching solver, whose grid sampling misses the thin circular section
+/// and returns zero curves, so the Boolean silently skips the cut (cone faces
+/// never imprint the box; the result is box + cone as disjoint shells).
+///
+/// Oblique planes cut the cone in a general conic (ellipse / parabola /
+/// hyperbola); those fall back to the marching solver, which is acceptable for
+/// the non-perpendicular case and avoids emitting a wrong circle.
+fn plane_cone_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::surface::{Cone, SurfaceType};
+
+    let (plane, cone_surf, plane_is_a) = match (surface_a.surface_type(), surface_b.surface_type())
+    {
+        (SurfaceType::Plane, SurfaceType::Cone) => (surface_a, surface_b, true),
+        (SurfaceType::Cone, SurfaceType::Plane) => (surface_b, surface_a, false),
+        _ => {
+            return Err(OperationError::InternalError(
+                "Invalid surface types for plane-cone intersection".to_string(),
+            ))
+        }
+    };
+
+    let cone = cone_surf
+        .as_any()
+        .downcast_ref::<Cone>()
+        .ok_or_else(|| OperationError::InternalError("Failed to downcast cone".to_string()))?;
+
+    let plane_eval = plane.evaluate_full(0.0, 0.0)?;
+    let plane_normal = plane_eval.normal;
+    let plane_point = plane_eval.position;
+
+    // Perpendicular plane ⇔ its normal is parallel to the cone axis.
+    let n_dot_axis = plane_normal.dot(&cone.axis);
+    if (n_dot_axis.abs() - 1.0).abs() > tolerance.parallel_threshold() {
+        // Oblique cut → general conic; let the marching solver handle it.
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+
+    // Signed axial distance apex→plane. `n_dot_axis` is ±1, so projecting the
+    // apex-to-plane vector onto the axis is equivalent to onto the normal up to
+    // that sign.
+    let v = (plane_point - cone.apex).dot(&cone.axis);
+
+    // The plane must cross the cone's finite extent to produce a section.
+    let (v_lo, v_hi) = match cone.height_limits {
+        Some([lo, hi]) => (lo, hi),
+        None => (0.0, f64::INFINITY),
+    };
+    let slack = tolerance.distance();
+    if v < v_lo - slack || v > v_hi + slack || v <= slack {
+        return Ok(vec![]);
+    }
+
+    let radius = v * cone.half_angle.tan();
+    if radius <= slack {
+        return Ok(vec![]); // section degenerates to the apex point
+    }
+    let center = cone.apex + cone.axis * v;
+
+    use crate::primitives::curve::Circle;
+    let circle = Circle::new(center, cone.axis, radius)?;
+
+    let params_plane = compute_circle_plane_parameters(&circle, plane_point, plane_normal)?;
+    let params_cone = compute_circle_cone_parameters(&circle, cone)?;
+
+    // Keep the parametric curves aligned with the (a, b) operand order.
+    let (on_surface_a, on_surface_b) = if plane_is_a {
+        (
+            create_parametric_curve(&params_plane),
+            create_parametric_curve(&params_cone),
+        )
+    } else {
+        (
+            create_parametric_curve(&params_cone),
+            create_parametric_curve(&params_plane),
+        )
+    };
+
+    Ok(vec![SurfaceIntersectionCurve {
+        curve: Box::new(circle),
+        on_surface_a,
+        on_surface_b,
+    }])
+}
+
+/// UV samples of a circular section on a cone, via the cone's `closest_point`
+/// (u = angle around the axis, v = axial distance from the apex).
+fn compute_circle_cone_parameters(
+    circle: &crate::primitives::curve::Circle,
+    cone: &crate::primitives::surface::Cone,
+) -> OperationResult<Vec<(f64, f64)>> {
+    let mut params = Vec::new();
+    const NUM_SAMPLES: usize = 32;
+    for i in 0..NUM_SAMPLES {
+        let angle = 2.0 * std::f64::consts::PI * (i as f64) / (NUM_SAMPLES as f64);
+        let point = circle.evaluate(angle)?;
+        let (u, v) = cone.closest_point(&point.position, Tolerance::default())?;
+        params.push((u, v));
+    }
+    Ok(params)
 }
 
 /// Find initial intersection points between surfaces
