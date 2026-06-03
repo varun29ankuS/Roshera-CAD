@@ -349,6 +349,7 @@ mod tests {
         ("cylinder/contained", 0),
         ("cylinder/contained", 1),
         ("cylinder/contained", 2),
+        ("cylinder/axial-poke", 0),
         ("cylinder/axial-poke", 1),
         ("cylinder/axial-poke", 2),
         ("cylinder/horizontal-poke", 0),
