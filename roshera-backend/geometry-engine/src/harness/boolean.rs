@@ -419,6 +419,36 @@ mod tests {
         );
     }
 
+    /// Harsh EXACT-analytic judge for a B operand fully CONTAINED in the 4³ box:
+    /// ∩ = V(shape), ∪ = 64, ∖ = 64 − V(shape). No Monte-Carlo noise, so the
+    /// only slack is the kernel's own faceting.
+    fn assert_contained<F>(build: &F, v_shape: f64, tol: f64)
+    where
+        F: Fn(&mut BRepModel) -> (SolidId, SolidId),
+    {
+        let box_vol = 64.0;
+        // Fast result volume via a coarse tessellation (divergence sum). For a
+        // contained operand each result is a single solid possibly with one
+        // void, so |signed mesh volume| is the magnitude (∪=box, ∩=shape,
+        // ∖=box−shape) — ~10× cheaper than the fine-tessellation mass-props.
+        let vol = |op: BooleanOp| -> Option<f64> {
+            let mut m = BRepModel::new();
+            let (a, b) = build(&mut m);
+            let r = boolean_operation(&mut m, a, b, op, BooleanOptions::default()).ok()?;
+            crate::harness::watertight::mesh_volume(&m, r, 0.02)
+        };
+        let close = |k: Option<f64>, truth: f64, what: &str| {
+            let v = k.unwrap_or_else(|| panic!("{what} returned None (op failed)"));
+            assert!(
+                (v - truth).abs() <= tol * truth.max(1.0),
+                "{what}: kernel {v:.4} vs analytic truth {truth:.4} (V_shape={v_shape:.4})"
+            );
+        };
+        close(vol(BooleanOp::Union), box_vol, "union");
+        close(vol(BooleanOp::Intersection), v_shape, "intersection");
+        close(vol(BooleanOp::Difference), box_vol - v_shape, "difference");
+    }
+
     /// Assert all three booleans match the independent analytic MC truth.
     fn assert_mc<F, B>(build: F, in_b: B, tol: f64)
     where
@@ -800,6 +830,52 @@ mod tests {
         fn pp_tilted_rotation_inclusion_exclusion(angle in 0.2f64..1.2) {
             let inv = check_boolean_invariants(tilted_rotated_boxes(4.0, angle), 3e-2);
             prop_assert!(inv.inclusion_exclusion, "angle={angle}: {inv:?}");
+        }
+
+        // ---- HARSH curved-boolean judgement (independent MC oracle) --------
+        // Nothing less than the analytic truth: ALL THREE of ∪/∩/∖ must match
+        // the Monte-Carlo ground truth (which owes nothing to the kernel) to a
+        // few percent, for any contained sphere/cylinder across the parameter
+        // space. These exercise the now-fixed periodic-classification and
+        // spherical-winding paths over random configs, not just one example.
+
+        /// A sphere fully inside the box at ANY offset/radius. For a CONTAINED
+        /// operand the truth is EXACT and analytic — no Monte-Carlo noise:
+        /// ∩ = V(sphere), ∪ = V(box), ∖ = V(box) − V(sphere). Judged hard
+        /// (2.5%, faceting only).
+        #[test]
+        fn pp_contained_sphere_all_ops(
+            cx in -0.6f64..0.6, cy in -0.6f64..0.6, cz in -0.6f64..0.6,
+            r in 0.5f64..1.2,
+        ) {
+            let build = move |m: &mut BRepModel| {
+                let a = mkbox(m, 4.0);
+                TopologyBuilder::new(m)
+                    .create_sphere_3d(Vector3::new(cx, cy, cz), r)
+                    .expect("sph");
+                (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+            };
+            let v_shape = 4.0 / 3.0 * std::f64::consts::PI * r * r * r;
+            assert_contained(&build, v_shape, 2.5e-2);
+        }
+
+        /// A cylinder fully inside the box at ANY offset/radius/height. Exact
+        /// analytic truth (∩ = πr²h, ∪ = 64, ∖ = 64 − πr²h), judged hard.
+        #[test]
+        fn pp_contained_cylinder_all_ops(
+            cx in -0.5f64..0.5, cy in -0.5f64..0.5,
+            r in 0.5f64..1.0, zc in -0.5f64..0.5, hh in 0.5f64..1.2,
+        ) {
+            let (z0, z1) = (zc - hh, zc + hh);
+            let build = move |m: &mut BRepModel| {
+                let a = mkbox(m, 4.0);
+                TopologyBuilder::new(m)
+                    .create_cylinder_3d(Vector3::new(cx, cy, z0), Vector3::Z, r, z1 - z0)
+                    .expect("cyl");
+                (a, m.solids.iter().last().map(|(id, _)| id).expect("b"))
+            };
+            let v_shape = std::f64::consts::PI * r * r * (z1 - z0);
+            assert_contained(&build, v_shape, 2.5e-2);
         }
     }
 }
