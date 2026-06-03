@@ -18,7 +18,7 @@ use crate::primitives::{
     r#loop::{Loop, LoopId, LoopStore, LoopType},
     shell::{Shell, ShellId, ShellStore, ShellType},
     solid::{Solid, SolidId, SolidStore},
-    surface::{Cylinder, Plane, Sphere, SurfaceStore},
+    surface::{Cylinder, Plane, Sphere, Surface, SurfaceStore},
     vertex::{VertexId, VertexStore},
 };
 use dashmap::DashMap;
@@ -2578,6 +2578,16 @@ impl<'a> TopologyBuilder<'a> {
 
         // Create sphere surface
         let sphere = Sphere::new(center, radius)?;
+        // Capture the surface's true parameter domain before boxing it; the
+        // face must carry these bounds (azimuth ∈ [0, 2π], polar ∈ [0, π]),
+        // not the `Face::new` default of [0,1]². The sphere face has a
+        // degenerate (empty) boundary loop, so every UV-domain consumer —
+        // `compute_bbox_and_centroid`, the broad-phase Boolean culler,
+        // `contains_uv_point` — relies on `uv_bounds` being the real domain.
+        // With the [0,1]² default the bbox collapses to a single octant
+        // patch, and the Boolean broad phase prunes 4 of the 6 plane-sphere
+        // intersections on a poke-through, silently dropping faces.
+        let ((u_min, u_max), (v_min, v_max)) = sphere.parameter_bounds();
         let surface_id = self.model.surfaces.add(Box::new(sphere));
 
         // Sphere is a special case - single face, no edges, no vertices
@@ -2588,6 +2598,7 @@ impl<'a> TopologyBuilder<'a> {
         // Create face
         let mut face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
         face.outer_loop = loop_id;
+        face.set_uv_bounds(u_min, u_max, v_min, v_max);
         let face_id = self.model.faces.add(face);
 
         // Create shell
