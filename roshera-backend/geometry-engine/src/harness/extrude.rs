@@ -10,7 +10,6 @@ use crate::math::vector3::Point3;
 use crate::operations::extrude::{extrude_profile, ExtrudeOptions};
 use crate::primitives::curve::Line;
 use crate::primitives::edge::{Edge, EdgeId, EdgeOrientation};
-use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 
 /// Result of an extrude invariant check.
