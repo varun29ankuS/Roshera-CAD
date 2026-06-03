@@ -699,28 +699,45 @@ pub(crate) fn triangulate_planar_polygon(
         contours.push(hole_contour);
     }
 
-    match cdt::triangulate_contours(&pts2d, &contours) {
-        Ok(tris) => tris.into_iter().map(|(a, b, c)| [a, b, c]).collect(),
-        Err(e) => {
-            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
-                eprintln!(
-                    "[tess] cdt failed: {:?}  outer=[{},{}) holes={}",
-                    e,
-                    outer_range.0,
-                    outer_range.1,
-                    inner_ranges.len()
-                );
-                for (i, c) in contours.iter().enumerate() {
-                    eprintln!("  contour[{}] len={} indices={:?}", i, c.len(), c);
-                }
-                for (i, p) in pts2d.iter().enumerate() {
-                    eprintln!("  pt[{}] = ({:.6}, {:.6})", i, p.0, p.1);
-                }
+    // The `cdt` crate `assert!`s on some degenerate inputs (e.g. a contour
+    // vertex coincident with another so its deduplicated point index is empty)
+    // rather than returning `Err`. Catch the unwind so a third-party panic
+    // degrades to a recoverable per-face "emit no triangles" instead of
+    // aborting the entire tessellation pass — the same contract the curved-CDT
+    // path enforces in `curved_cdt::run_cdt`.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cdt::triangulate_contours(&pts2d, &contours)
+    }));
+    let trace = |what: &str| {
+        if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+            eprintln!(
+                "[tess] cdt {}: outer=[{},{}) holes={}",
+                what,
+                outer_range.0,
+                outer_range.1,
+                inner_ranges.len()
+            );
+            for (i, c) in contours.iter().enumerate() {
+                eprintln!("  contour[{}] len={} indices={:?}", i, c.len(), c);
             }
+            for (i, p) in pts2d.iter().enumerate() {
+                eprintln!("  pt[{}] = ({:.6}, {:.6})", i, p.0, p.1);
+            }
+        }
+    };
+    match outcome {
+        Ok(Ok(tris)) => tris.into_iter().map(|(a, b, c)| [a, b, c]).collect(),
+        Ok(Err(e)) => {
+            trace(&format!("failed: {e:?}"));
             tracing::warn!(
                 "triangulate_planar_polygon: cdt failed ({:?}); emitting no triangles",
                 e
             );
+            Vec::new()
+        }
+        Err(_) => {
+            trace("panicked");
+            tracing::warn!("triangulate_planar_polygon: cdt panicked; emitting no triangles");
             Vec::new()
         }
     }
