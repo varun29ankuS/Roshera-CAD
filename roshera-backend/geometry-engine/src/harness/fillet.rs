@@ -218,6 +218,49 @@ mod tests {
     use super::*;
     use crate::primitives::topology_builder::TopologyBuilder;
 
+    /// HARNESS-FOUND BUG (task FILLET-MULTIEDGE-VOLUME): filleting ALL 12 edges
+    /// of a cube at once returns `Ok` with a topologically-valid-looking 26-face
+    /// rounded cube, but the geometry is grossly wrong — mesh AND mass-props
+    /// volume both ≈16.4 vs the Minkowski-sum truth 55.04 (it removes ~5× too
+    /// much material). Small shared-corner selections (2–4 edges) instead return
+    /// a clean `NotImplemented` (degree-2 corner synthesis is deferred — Task
+    /// #82). So the all-edges path silently produces wrong geometry where the
+    /// few-edge path correctly refuses; the partially-implemented degree-3
+    /// corner synthesis is the culprit. Pinned `#[ignore]` until the multi-edge
+    /// corner fillet (F5-γ/δ, #82) is completed or the path fails loudly.
+    ///
+    /// Exact rounded-cube volume (Minkowski sum of the (s−2r)³ core box with a
+    /// ball of radius r): `(s−2r)³ + 6r(s−2r)² + 3πr²(s−2r) + (4/3)πr³`.
+    #[test]
+    #[ignore = "FILLET-MULTIEDGE-VOLUME: all-12-edge fillet silently wrong (16.4 vs 55.04) (harness-found)"]
+    fn all_edges_fillet_matches_minkowski_volume() {
+        use crate::harness::watertight::mesh_volume as mv;
+        use std::f64::consts::PI;
+        let (side, r) = (4.0_f64, 1.0_f64);
+        let core = side - 2.0 * r;
+        let mink = core.powi(3)
+            + 6.0 * r * core.powi(2)
+            + 3.0 * PI * r * r * core
+            + (4.0 / 3.0) * PI * r.powi(3);
+        let mut model = BRepModel::new();
+        TopologyBuilder::new(&mut model)
+            .create_box_3d(side, side, side)
+            .expect("box");
+        let solid = model.solids.iter().last().map(|(id, _)| id).expect("s");
+        let edges: Vec<_> = model.edges.iter().map(|(id, _)| id).collect();
+        let options = FilletOptions {
+            fillet_type: FilletType::Constant(r),
+            radius: r,
+            ..Default::default()
+        };
+        fillet_edges(&mut model, solid, edges, options).expect("all-edge fillet");
+        let vol = mv(&model, solid, 0.01).expect("mesh");
+        assert!(
+            (vol - mink).abs() < 0.05 * mink,
+            "rounded cube volume {vol:.3} vs Minkowski truth {mink:.3}"
+        );
+    }
+
     fn box_solid(model: &mut BRepModel) -> SolidId {
         TopologyBuilder::new(model)
             .create_box_3d(2.0, 2.0, 2.0)

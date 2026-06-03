@@ -123,6 +123,47 @@ fn within_rel(a: f64, b: f64, tol: f64) -> bool {
 mod tests {
     use super::*;
 
+    /// HARNESS-FOUND BUG (task CHAMFER-MULTIEDGE-VOLUME): chamfering ALL 12 edges
+    /// of a cube at once returns `Ok` with a valid-looking 26-face beveled cube,
+    /// but the geometry is wrong — mesh AND mass-props volume both ≈43.33 vs the
+    /// truth 45.99 (it over-removes ~6%). Few-edge shared-corner selections
+    /// (2–4) instead return a clean `NotImplemented` (degree-2 corner synthesis
+    /// deferred — Task #82). The all-edges path routes through the
+    /// partially-implemented degree-3 `ConvexCorner` synthesis, which mis-sizes
+    /// the corner facets. Same class as FILLET-MULTIEDGE-VOLUME (#51), milder.
+    /// Single-edge chamfers are correct. Pinned `#[ignore]`.
+    ///
+    /// Truth: an equal 45° chamfer (setback d) of all edges keeps exactly the
+    /// points satisfying `|x|≤s/2 ∧ |y|≤s/2 ∧ |z|≤s/2` and the three pairwise
+    /// bevel half-spaces `|x|+|y| ≤ s/2+d`, `|x|+|z| ≤ …`, `|y|+|z| ≤ …`; its
+    /// volume is 45.99 for s=4, d=1 (Monte-Carlo).
+    #[test]
+    #[ignore = "CHAMFER-MULTIEDGE-VOLUME: all-12-edge chamfer over-removes (43.33 vs 45.99) (harness-found)"]
+    fn all_edges_chamfer_matches_bevel_volume() {
+        use crate::harness::watertight::mesh_volume as mv;
+        let (side, d) = (4.0_f64, 1.0_f64);
+        let mut model = BRepModel::new();
+        TopologyBuilder::new(&mut model)
+            .create_box_3d(side, side, side)
+            .expect("box");
+        let solid = model.solids.iter().last().map(|(id, _)| id).expect("s");
+        let edges: Vec<_> = model.edges.iter().map(|(id, _)| id).collect();
+        let options = ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(d),
+            distance1: d,
+            distance2: d,
+            symmetric: true,
+            ..Default::default()
+        };
+        chamfer_edges(&mut model, solid, edges, options).expect("all-edge chamfer");
+        let vol = mv(&model, solid, 0.01).expect("mesh");
+        let truth = 45.99; // MC of {|·|≤2, pairwise sums ≤3}
+        assert!(
+            (vol - truth).abs() < 0.05 * truth,
+            "beveled cube volume {vol:.3} vs truth {truth:.3}"
+        );
+    }
+
     #[test]
     fn chamfered_box_edge_removes_the_wedge_and_stays_watertight() {
         // 4×4×4 box, edge length 4, setback 1 → wedge ½·1·4 = 2; V = 64 − 2 = 62.
