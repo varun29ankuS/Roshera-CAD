@@ -3164,6 +3164,137 @@ fn split_sphere_face_by_circles(
     Some(result)
 }
 
+/// Cone analogue of [`split_sphere_face_by_circles`]: a cone lateral cut by
+/// axis-perpendicular circles is partitioned into AXIAL BANDS. The DCEL walker
+/// drops them (iso-parametric circles have zero `(u, v)` area, and an apex cone
+/// has no seam to connect them). The cut circles plus the cone's base-rim circle
+/// are sorted by axial distance from the apex; each consecutive pair bounds a
+/// frustum band, and the apex-most circle bounds the tip cap. `None` unless the
+/// face is a cone lateral actually cut by ≥1 circle beyond its base rim.
+fn split_cone_face_by_circles(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::Cone;
+
+    let surface = model.surfaces.get(surface_id)?;
+    let cone = surface.as_any().downcast_ref::<Cone>()?;
+    let apex = cone.apex;
+    let axis = cone.axis;
+    let ref_dir = cone.ref_dir;
+    let tan = cone.half_angle.tan();
+
+    let mut by_curve: std::collections::BTreeMap<CurveId, Vec<EdgeId>> =
+        std::collections::BTreeMap::new();
+    for &eid in graph.edges.keys() {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        if let Some(curve) = model.curves.get(edge.curve_id) {
+            if curve.as_any().downcast_ref::<Circle>().is_some() {
+                by_curve.entry(edge.curve_id).or_default().push(eid);
+            }
+        }
+    }
+    // Need the base rim plus at least one cut circle (≥2 circles) to band.
+    if by_curve.len() < 2 {
+        return None;
+    }
+
+    let order_loop = |eids: &[EdgeId]| -> Vec<(EdgeId, bool)> {
+        let mut remaining: Vec<EdgeId> = eids.to_vec();
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        if remaining.is_empty() {
+            return out;
+        }
+        let first = remaining.remove(0);
+        let mut cur_end = match model.edges.get(first) {
+            Some(e) => e.end_vertex,
+            None => return out,
+        };
+        out.push((first, true));
+        while !remaining.is_empty() {
+            let mut found = None;
+            for (i, &eid) in remaining.iter().enumerate() {
+                if let Some(e) = model.edges.get(eid) {
+                    if e.start_vertex == cur_end {
+                        found = Some((i, eid, e.end_vertex, true));
+                        break;
+                    } else if e.end_vertex == cur_end {
+                        found = Some((i, eid, e.start_vertex, false));
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some((i, eid, next_end, fwd)) => {
+                    remaining.remove(i);
+                    out.push((eid, fwd));
+                    cur_end = next_end;
+                }
+                None => {
+                    for eid in remaining.drain(..) {
+                        out.push((eid, true));
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    // (axial v, ordered loop) per circle, sorted apex→base.
+    let mut circles: Vec<(f64, Vec<(EdgeId, bool)>)> = Vec::new();
+    for (&cid, eids) in &by_curve {
+        let Some(circle) = model
+            .curves
+            .get(cid)
+            .and_then(|c| c.as_any().downcast_ref::<Circle>())
+        else {
+            continue;
+        };
+        let v = (circle.center() - apex).dot(&axis);
+        circles.push((v, order_loop(eids)));
+    }
+    circles.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if circles.len() < 2 {
+        return None;
+    }
+
+    // Point on the cone at axial distance v (u=0 generator).
+    let cone_point = |v: f64| apex + axis * v + ref_dir * (v * tan);
+
+    let mut faces = Vec::new();
+    // Apex tip band: apex .. circles[0]. One boundary loop.
+    faces.push(SplitFace {
+        original_face: face_id,
+        surface: surface_id,
+        boundary_edges: circles[0].1.clone(),
+        classification: FaceClassification::OnBoundary,
+        from_solid: origin_solid,
+        interior_point: Some(cone_point(circles[0].0 * 0.5)),
+        inner_loops: Vec::new(),
+    });
+    // Frustum bands between consecutive circles (the last pair is the base band).
+    for i in 0..circles.len() - 1 {
+        let (v_lo, lo_loop) = (&circles[i].0, &circles[i].1);
+        let (v_hi, hi_loop) = (&circles[i + 1].0, &circles[i + 1].1);
+        faces.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: lo_loop.clone(),
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(cone_point((v_lo + v_hi) * 0.5)),
+            inner_loops: vec![hi_loop.clone()],
+        });
+    }
+    Some(faces)
+}
+
 /// Split a single face by multiple curves.
 ///
 /// `origin_solid` identifies which of the two boolean operands this face
@@ -3495,6 +3626,20 @@ fn split_face_by_curves(
             );
         }
         return Ok(sphere_faces);
+    }
+
+    // Cone lateral cut by axis-perpendicular circles → axial bands (same DCEL
+    // degeneracy as the sphere; bands are 1-D ordered, no multi-hole).
+    if let Some(cone_faces) =
+        split_cone_face_by_circles(model, surface_id, face_id, origin_solid, &graph)
+    {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   cone band split: face={face_id:?} → {} fragments",
+                cone_faces.len()
+            );
+        }
+        return Ok(cone_faces);
     }
 
     // Build face loops via DCEL planar arrangement.
@@ -7721,6 +7866,80 @@ pub(crate) fn spherical_circular_membership(
     Some(true)
 }
 
+/// Robust membership for a CONE lateral band, trimmed by coplanar circles
+/// perpendicular to the axis (a cone poking through box caps). A cut circle on
+/// a cone is iso-parametric (constant axial distance), so the `(u, v)` polygon
+/// test degenerates exactly as on the sphere. Instead we test the AXIAL range:
+/// the band is the cone region whose axial distance from the apex lies between
+/// its bounding circles. Two boundary circles → a frustum band (between them);
+/// one boundary circle → the apex tip band (apex .. circle). An untrimmed cone
+/// lateral has its single base-rim circle, giving the whole `[0, base]` range.
+///
+/// Returns `None` when the surface is not a cone or any boundary loop is not a
+/// single coplanar circle, so the caller falls back to the legacy test.
+fn conical_band_membership(
+    model: &BRepModel,
+    face: &crate::primitives::face::Face,
+    surface: &dyn Surface,
+    point: &Point3,
+    tolerance: &Tolerance,
+) -> Option<bool> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::Cone;
+
+    let cone = surface.as_any().downcast_ref::<Cone>()?;
+    let apex = cone.apex;
+    let axis = cone.axis;
+    let tol = tolerance.distance();
+
+    let loop_circle_v = |lid: crate::primitives::r#loop::LoopId| -> Option<f64> {
+        let lp = model.loops.get(lid)?;
+        if lp.edges.is_empty() {
+            return None;
+        }
+        let mut center: Option<Point3> = None;
+        for &eid in &lp.edges {
+            let edge = model.edges.get(eid)?;
+            let curve = model.curves.get(edge.curve_id)?;
+            let circle = curve.as_any().downcast_ref::<Circle>()?;
+            match center {
+                None => center = Some(circle.center()),
+                Some(c) => {
+                    if (circle.center() - c).magnitude() > tol * 10.0 {
+                        return None;
+                    }
+                }
+            }
+        }
+        center.map(|c| (c - apex).dot(&axis))
+    };
+
+    let mut vs: Vec<f64> = Vec::new();
+    if let Some(l) = model.loops.get(face.outer_loop) {
+        if !l.edges.is_empty() {
+            vs.push(loop_circle_v(face.outer_loop)?);
+        }
+    }
+    for &il in &face.inner_loops {
+        vs.push(loop_circle_v(il)?);
+    }
+    if vs.is_empty() {
+        return Some(true);
+    }
+
+    let v_p = (*point - apex).dot(&axis);
+    let (v_lo, v_hi) = if vs.len() >= 2 {
+        (
+            vs.iter().cloned().fold(f64::INFINITY, f64::min),
+            vs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        )
+    } else {
+        // Single circle ⇒ the apex tip band (apex at v=0 up to the circle).
+        (0.0_f64.min(vs[0]), 0.0_f64.max(vs[0]))
+    };
+    Some(v_p >= v_lo - tol && v_p <= v_hi + tol)
+}
+
 /// Check if a 3D point lies inside a face's boundary.
 ///
 /// Projects the point to UV parameter space, then uses a 2D ray-casting
@@ -7902,6 +8121,11 @@ fn is_point_in_face(
     // have no circular loops and resolve to `Some(true)` here, matching the
     // legacy behaviour; non-sphere surfaces return `None` and fall through.
     if let Some(inside) = spherical_circular_membership(model, face, surface, point, tolerance) {
+        return Ok(inside);
+    }
+    // Same degeneracy for a cone lateral cut by axis-perpendicular circles: test
+    // the axial band range instead of the `(u, v)` polygon.
+    if let Some(inside) = conical_band_membership(model, face, surface, point, tolerance) {
         return Ok(inside);
     }
 
