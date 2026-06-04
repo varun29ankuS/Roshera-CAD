@@ -3303,6 +3303,185 @@ fn split_cone_face_by_circles(
     Some(faces)
 }
 
+/// Cylinder analogue of the sphere/cone curved-Boolean fast paths, for the
+/// OFF-AXIS poke: the lateral is cut by a closed "window" loop — cap arcs at
+/// constant height joined by vertical wall lines — that does NOT span the full
+/// angular sweep. The DCEL arrangement drops the seam-wrapping complement
+/// (the angular lobe plus the two end bands), so the cylinder's caps lose the
+/// band that bridges them to the body and `build_shells_from_faces` rejects the
+/// orphaned <4-face component.
+///
+/// We build the two fragments explicitly:
+///   * the **window** region (the lateral patch enclosed by the cut loop, which
+///     lies inside the cutting solid) as a simple patch, and
+///   * its **complement** = the ORIGINAL lateral boundary (rims + seam) carrying
+///     the window as an inner hole loop, so the boundary-conforming CDT
+///     tessellator meshes lateral-minus-window directly and the end bands stay
+///     welded to the caps through the shared rim edges.
+///
+/// Returns `None` (→ fall back to the DCEL arrangement) unless the splitting
+/// edges form a single closed loop with a genuine height span (a vertical wall
+/// line). That span is the signature distinguishing an off-axis window from the
+/// axis-perpendicular full-ring cuts of the axial poke — which have NO vertical
+/// segment and which the DCEL already partitions into clean rings correctly.
+fn split_cylinder_lateral_by_window(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+    boundary_edges: &[(EdgeId, bool)],
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::surface::Cylinder;
+
+    let surface = model.surfaces.get(surface_id)?;
+    let cyl = surface.as_any().downcast_ref::<Cylinder>()?;
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let radius = cyl.radius;
+    let height = cyl
+        .height_limits
+        .map(|h| (h[1] - h[0]).abs())
+        .unwrap_or(0.0);
+    if height <= 0.0 {
+        return None;
+    }
+
+    // Axial coordinate (height parameter from the base) of a vertex.
+    let v_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        Some((Point3::new(p[0], p[1], p[2]) - origin).dot(&axis))
+    };
+
+    // Collect the splitting (cut) edges; require a vertical wall line.
+    let span_tol = (height * 1.0e-3).max(1.0e-6);
+    let mut split_eids: Vec<EdgeId> = Vec::new();
+    let mut has_vertical = false;
+    let (mut v_min, mut v_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for ge in graph.edges.values() {
+        if ge.edge_type != EdgeType::Splitting {
+            continue;
+        }
+        let e = model.edges.get(ge.edge_id)?;
+        let (va, vb) = (v_of(e.start_vertex)?, v_of(e.end_vertex)?);
+        if (va - vb).abs() > span_tol {
+            has_vertical = true;
+        }
+        v_min = v_min.min(va).min(vb);
+        v_max = v_max.max(va).max(vb);
+        split_eids.push(ge.edge_id);
+    }
+    if !has_vertical || split_eids.len() < 3 {
+        return None;
+    }
+
+    // Order the splitting edges into a single closed walk. Bail (→ DCEL) if
+    // they don't form exactly one closed loop — the window invariant.
+    let order_loop = |eids: &[EdgeId]| -> Option<Vec<(EdgeId, bool)>> {
+        let mut remaining: Vec<EdgeId> = eids.to_vec();
+        let first = remaining.remove(0);
+        let first_edge = model.edges.get(first)?;
+        let start_v = first_edge.start_vertex;
+        let mut cur_end = first_edge.end_vertex;
+        let mut out: Vec<(EdgeId, bool)> = vec![(first, true)];
+        while !remaining.is_empty() {
+            let mut found = None;
+            for (i, &eid) in remaining.iter().enumerate() {
+                if let Some(e) = model.edges.get(eid) {
+                    if e.start_vertex == cur_end {
+                        found = Some((i, eid, e.end_vertex, true));
+                        break;
+                    } else if e.end_vertex == cur_end {
+                        found = Some((i, eid, e.start_vertex, false));
+                        break;
+                    }
+                }
+            }
+            let (i, eid, next_end, fwd) = found?;
+            remaining.remove(i);
+            out.push((eid, fwd));
+            cur_end = next_end;
+        }
+        // Must close back to the starting vertex.
+        if cur_end != start_v {
+            return None;
+        }
+        Some(out)
+    };
+    let window_loop = order_loop(&split_eids)?;
+
+    // Interior reference for the window patch. The enclosed generator is the
+    // one the cap ARCS bulge toward — their geometric midpoints sit on the far
+    // (enclosed) side, while the wall-line endpoints all sit on the cutting
+    // plane. Averaging the WHOLE loop barely clears the axis and the radial
+    // projection then flips to the wrong generator. So take the radial
+    // direction from the HORIZONTAL (≈constant-height) cap-arc midpoints only,
+    // and centre the height at the cut span. A non-vertical edge is a cap arc;
+    // a vertical edge is a wall line.
+    let mut acc = Point3::new(0.0, 0.0, 0.0);
+    let mut n_arc = 0u32;
+    for &(eid, _) in &window_loop {
+        let edge = model.edges.get(eid)?;
+        let (va, vb) = (v_of(edge.start_vertex)?, v_of(edge.end_vertex)?);
+        if (va - vb).abs() > span_tol {
+            continue; // wall line — skip
+        }
+        let curve = model.curves.get(edge.curve_id)?;
+        let t_mid = 0.5 * (edge.param_range.start + edge.param_range.end);
+        if let Ok(p) = curve.evaluate(t_mid) {
+            acc.x += p.position.x;
+            acc.y += p.position.y;
+            acc.z += p.position.z;
+            n_arc += 1;
+        }
+    }
+    if n_arc == 0 {
+        return None;
+    }
+    let inv = 1.0 / n_arc as f64;
+    let arc_centre = Point3::new(acc.x * inv, acc.y * inv, acc.z * inv);
+    let to_c = arc_centre - origin;
+    let radial = (to_c - axis * to_c.dot(&axis)).normalize().ok()?;
+    let v_mid = 0.5 * (v_min + v_max);
+    let mid_point = origin + axis * v_mid + radial * radius;
+
+    // Complement interior point: a point on an END BAND (a height outside the
+    // cut's [v_min, v_max] span), which lies outside the cutting solid. Prefer
+    // the band that actually exists.
+    let v_band = if v_min > span_tol {
+        v_min * 0.5
+    } else if v_max < height - span_tol {
+        0.5 * (v_max + height)
+    } else {
+        return None;
+    };
+    let band_point = origin + axis * v_band + radial * radius;
+
+    Some(vec![
+        // The window patch (interior of the cut loop, inside the cutting solid).
+        SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: window_loop.clone(),
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(mid_point),
+            inner_loops: Vec::new(),
+        },
+        // The complement: full original lateral boundary with the window as a
+        // hole. CDT meshes lateral-minus-window; bands stay welded to the caps.
+        SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: boundary_edges.to_vec(),
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(band_point),
+            inner_loops: vec![window_loop],
+        },
+    ])
+}
+
 /// Split a single face by multiple curves.
 ///
 /// `origin_solid` identifies which of the two boolean operands this face
@@ -3648,6 +3827,28 @@ fn split_face_by_curves(
             );
         }
         return Ok(cone_faces);
+    }
+
+    // Cylinder lateral cut by an off-axis "window" loop (cap arcs + vertical
+    // wall lines that don't span the full sweep) → explicit window + complement
+    // fragments. The DCEL drops the seam-wrapping complement, orphaning the
+    // caps; this keeps the end bands welded to them. Inert for the axial poke
+    // (full-ring cuts have no vertical wall line → returns None → DCEL).
+    if let Some(cyl_faces) = split_cylinder_lateral_by_window(
+        model,
+        surface_id,
+        face_id,
+        origin_solid,
+        &graph,
+        &boundary_edges,
+    ) {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   cylinder window split: face={face_id:?} → {} fragments",
+                cyl_faces.len()
+            );
+        }
+        return Ok(cyl_faces);
     }
 
     // Build face loops via DCEL planar arrangement.
