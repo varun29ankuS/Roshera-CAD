@@ -1607,17 +1607,25 @@ fn create_line_intersection_curve_bounded(
 ) -> OperationResult<SurfaceIntersectionCurve> {
     use crate::primitives::curve::Line;
 
-    // Determine line bounds based on cylinder height limits
-    let extent = if let Some(height_limits) = cylinder.height_limits {
-        (height_limits[1] - height_limits[0]) * 0.5
+    // Span the line over the cylinder's ACTUAL axial extent, not a symmetric
+    // range centered on `point`. `point` lies at the cylinder's axis-origin
+    // level (the radial/tangential offset that produced it is ⊥ axis), and a
+    // finite cylinder occupies axis-param [h_min, h_max] FROM the origin —
+    // which for the production base-origin cylinder is [0, height], i.e. the
+    // body lies entirely on one side of `point`. The previous symmetric
+    // `point ± (h_max − h_min)/2` placed the line over [origin − h/2,
+    // origin + h/2], truncating it at the cylinder midpoint whenever the
+    // origin sits at one end — the off-axis wall-poke case, where the axis-
+    // parallel +X wall cut a vertical line that stopped at z = 0 (the axial
+    // midpoint) and left the imprint rectangle open, collapsing the split.
+    let line = if let Some(height_limits) = cylinder.height_limits {
+        let start_point = point + direction * height_limits[0];
+        let end_point = point + direction * height_limits[1];
+        Line::new(start_point, end_point)
     } else {
-        cylinder.radius * 10.0 // Scale extent proportional to cylinder size
+        let extent = cylinder.radius * 10.0; // Scale extent proportional to cylinder size
+        Line::new(point - direction * extent, point + direction * extent)
     };
-
-    let start_point = point - direction * extent;
-    let end_point = point + direction * extent;
-
-    let line = Line::new(start_point, end_point);
 
     // Create parametric representations
     let params_a = compute_line_surface_parameters_bounded(&line, plane_normal, plane_point)?;
