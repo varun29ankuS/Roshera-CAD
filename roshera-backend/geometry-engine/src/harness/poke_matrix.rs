@@ -346,6 +346,7 @@ mod tests {
         ("sphere/contained", 0),
         ("sphere/contained", 1),
         ("sphere/contained", 2),
+        ("sphere/face-poke", 0),
         ("cylinder/contained", 0),
         ("cylinder/contained", 1),
         ("cylinder/contained", 2),
