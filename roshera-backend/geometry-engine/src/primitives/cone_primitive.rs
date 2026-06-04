@@ -252,7 +252,14 @@ impl ConePrimitive {
         // bit-identical to the lateral band's rim (mirrors the cylinder
         // primitive's shared-rim topology). Each holder carries the lateral's
         // own use-orientation; the cap uses its negation.
+        //
+        // Reason: the `None` initializer is the sector-cone fallback (caps build
+        // a standalone rim edge). Full cones overwrite it before the cap reads
+        // it, and sector cones return early above, so the initial value is dead
+        // on every path that reaches a read — silence the spurious lint.
+        #[allow(unused_assignments)]
         let mut lateral_top_edge: Option<(EdgeId, bool)> = None;
+        #[allow(unused_assignments)]
         let mut lateral_bottom_edge: Option<(EdgeId, bool)> = None;
 
         // Conical surface face
