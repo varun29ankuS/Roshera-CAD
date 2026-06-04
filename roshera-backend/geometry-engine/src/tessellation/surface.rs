@@ -798,6 +798,175 @@ fn polygon_signed_area_2d(vertices_2d: &[(f64, f64)], polygon: &[usize]) -> f64 
 }
 
 /// Tessellate a spherical face with adaptive refinement
+/// Spherical interpolation between two unit vectors.
+fn slerp_unit(a: Vector3, b: Vector3, t: f64) -> Vector3 {
+    let dot = a.dot(&b).clamp(-1.0, 1.0);
+    let theta = dot.acos();
+    if theta < 1e-9 {
+        return a;
+    }
+    let s = theta.sin();
+    a * (((1.0 - t) * theta).sin() / s) + b * ((t * theta).sin() / s)
+}
+
+/// Extract the single coplanar circle `(centre, unit axis)` shared by every
+/// edge of a loop, or `None` if the loop is not such a circle.
+fn loop_cut_circle(
+    loop_data: &crate::primitives::r#loop::Loop,
+    model: &BRepModel,
+) -> Option<(Point3, Vector3)> {
+    use crate::primitives::curve::Circle;
+    if loop_data.edges.is_empty() {
+        return None;
+    }
+    let mut plane: Option<(Point3, Vector3)> = None;
+    for &eid in &loop_data.edges {
+        let edge = model.edges.get(eid)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let circle = curve.as_any().downcast_ref::<Circle>()?;
+        let c = circle.center();
+        let n = circle.normal().normalize().ok()?;
+        match plane {
+            None => plane = Some((c, n)),
+            Some((pc, pn)) => {
+                if (c - pc).dot(&pn).abs() > 1e-5 || pn.cross(&n).magnitude() > 1e-4 {
+                    return None;
+                }
+            }
+        }
+    }
+    plane
+}
+
+/// Boundary-conforming tessellation of a spherical CAP: a sphere region bounded
+/// by a single cut circle, filled from the rim to the cap apex.
+///
+/// The rim vertices are taken VERBATIM from the cut-circle boundary edges'
+/// `EdgeSampleCache` samples — identical (same curve id + param ranges) to the
+/// samples the adjoining planar face uses for its matching hole, so the seam
+/// welds by position. The interior is a structured set of rings slerped from
+/// the rim toward the cap apex (the far pole on the circle's axis), so the cap
+/// is watertight by construction — unlike the analytic grid, whose
+/// membership-gated boundary is an open stair-step.
+///
+/// Returns `true` when it handled the face (single circular outer loop, no
+/// inner loops, on a sphere); `false` to fall through to the grid path.
+fn tessellate_spherical_cap(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Sphere;
+
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() else {
+        return false;
+    };
+    let o = sphere.center;
+    let r = sphere.radius;
+    let Some(outer) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    let Some((c_center, c_axis)) = loop_cut_circle(outer, model) else {
+        return false;
+    };
+
+    // Rim: concatenate the loop edges' cache samples in loop order + orientation,
+    // dropping the duplicate vertex shared at each edge join.
+    let mut rim: Vec<Point3> = Vec::new();
+    for (i, &eid) in outer.edges.iter().enumerate() {
+        let samples = cache.get_or_compute(eid, model);
+        let fwd = outer.orientations.get(i).copied().unwrap_or(true);
+        let ordered: Vec<Point3> = if fwd {
+            samples.iter().copied().collect()
+        } else {
+            samples.iter().rev().copied().collect()
+        };
+        for p in ordered {
+            if rim.last().map_or(true, |&q| (q - p).magnitude() > 1e-9) {
+                rim.push(p);
+            }
+        }
+    }
+    if rim.len() >= 2 && (rim[0] - *rim.last().unwrap()).magnitude() < 1e-9 {
+        rim.pop();
+    }
+    if rim.len() < 3 {
+        return false;
+    }
+    let m = rim.len();
+
+    // Cap apex = far pole on the circle's axis (the side away from the centre).
+    let h = (c_center - o).dot(&c_axis);
+    let a_dir = if h >= 0.0 { c_axis } else { -c_axis };
+    let apex = o + a_dir * r;
+
+    let dirs: Vec<Vector3> = rim
+        .iter()
+        .map(|&p| (p - o).normalize().unwrap_or(a_dir))
+        .collect();
+    // Angular span rim→apex sets the ring count.
+    let alpha = dirs[0].dot(&a_dir).clamp(-1.0, 1.0).acos();
+    let rings = arc_steps_for_quality(alpha.abs(), r, params).max(1);
+
+    let osign = face.orientation.sign();
+    let mut ring_idx: Vec<Vec<u32>> = Vec::with_capacity(rings);
+    for s in 0..rings {
+        let t = s as f64 / rings as f64;
+        let mut row = Vec::with_capacity(m);
+        for i in 0..m {
+            let pos = if s == 0 {
+                rim[i]
+            } else {
+                o + slerp_unit(dirs[i], a_dir, t) * r
+            };
+            let normal = (pos - o).normalize().unwrap_or(a_dir) * osign;
+            row.push(mesh.add_vertex(MeshVertex {
+                position: pos,
+                normal,
+                uv: None,
+            }));
+        }
+        ring_idx.push(row);
+    }
+    let apex_id = mesh.add_vertex(MeshVertex {
+        position: apex,
+        normal: a_dir * osign,
+        uv: None,
+    });
+
+    let forward = face.orientation.is_forward();
+    for s in 0..rings - 1 {
+        let a = &ring_idx[s];
+        let b = &ring_idx[s + 1];
+        for i in 0..m {
+            let j = (i + 1) % m;
+            if forward {
+                mesh.add_triangle(a[i], a[j], b[i]);
+                mesh.add_triangle(a[j], b[j], b[i]);
+            } else {
+                mesh.add_triangle(a[i], b[i], a[j]);
+                mesh.add_triangle(a[j], b[i], b[j]);
+            }
+        }
+    }
+    let last = &ring_idx[rings - 1];
+    for i in 0..m {
+        let j = (i + 1) % m;
+        if forward {
+            mesh.add_triangle(last[i], last[j], apex_id);
+        } else {
+            mesh.add_triangle(last[j], last[i], apex_id);
+        }
+    }
+    true
+}
+
 fn tessellate_spherical_face(
     face: &Face,
     model: &BRepModel,
@@ -809,6 +978,14 @@ fn tessellate_spherical_face(
         Some(s) => s,
         None => return,
     };
+
+    // Boundary-conforming cap path: a sphere region bounded by a single cut
+    // circle welds to its adjoining planar hole and is watertight, unlike the
+    // membership-gated grid below. Falls through for untrimmed / multi-loop
+    // sphere faces.
+    if tessellate_spherical_cap(face, model, surface, _cache, params, mesh) {
+        return;
+    }
 
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
