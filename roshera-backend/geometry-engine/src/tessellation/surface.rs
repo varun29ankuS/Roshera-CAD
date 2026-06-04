@@ -1258,7 +1258,8 @@ fn tessellate_spherical_central(
         if signed(&rim) * b_dir < 0.0 {
             rim.reverse();
         }
-        stitch_rings(&b, &rim, o, osign, mesh);
+        let outward = |c: Point3| (c - o) * osign;
+        stitch_rings(&b, &rim, &outward, mesh);
     }
     true
 }
@@ -1272,8 +1273,7 @@ fn tessellate_spherical_central(
 fn stitch_rings(
     bound: &[(Point3, u32)],
     rim: &[(Point3, u32)],
-    sphere_center: Point3,
-    osign: f64,
+    outward_at: &dyn Fn(Point3) -> Vector3,
     mesh: &mut TriangleMesh,
 ) {
     let (nb, nr) = (bound.len(), rim.len());
@@ -1292,12 +1292,10 @@ fn stitch_rings(
 
     let mut i = 0usize; // steps taken along bound
     let mut k = 0usize; // steps taken along rim
-                        // Wind each triangle CCW under its OUTWARD normal (radial × osign). By the
+                        // Wind each triangle CCW under its OUTWARD normal (`outward_at`). By the
                         // manifold-orientation theorem this is automatically consistent with the grid
-                        // bulk AND the adjoining planar disks/annuli (all wound CCW under their own
-                        // outward normals), regardless of the rings' traversal direction — so the
-                        // central twins whatever box fragment the operation kept (disk for ∩, annulus
-                        // for ∖).
+                        // bulk AND the adjoining planar faces (all wound CCW under their own outward
+                        // normals), regardless of the rings' traversal direction.
     let mut emit =
         |a: (Point3, u32), b: (Point3, u32), c: (Point3, u32), mesh: &mut TriangleMesh| {
             let centroid = Point3::new(
@@ -1305,7 +1303,7 @@ fn stitch_rings(
                 (a.0.y + b.0.y + c.0.y) / 3.0,
                 (a.0.z + b.0.z + c.0.z) / 3.0,
             );
-            let outward = (centroid - sphere_center) * osign;
+            let outward = outward_at(centroid);
             let n = (b.0 - a.0).cross(&(c.0 - a.0));
             if n.dot(&outward) >= 0.0 {
                 mesh.add_triangle(a.1, b.1, c.1);
@@ -1674,6 +1672,162 @@ fn estimate_sphere_radius(surface: &dyn Surface) -> f64 {
 }
 
 /// Tessellate a conical face with special handling for apex
+/// Boundary-conforming tessellation of a CONE lateral band produced by a
+/// curved Boolean. One circular boundary loop ⇒ an apex tip cap (fan
+/// apex→rim); two ⇒ a frustum band (the cone is ruled, so a direct stitch of
+/// the two rim circles is exact). Rims are the cut-circle `EdgeSampleCache`
+/// samples, so they weld to the adjoining planar box caps. Returns `true` when
+/// handled (a cone face whose every boundary loop is a single circle).
+fn tessellate_conical_cut(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Cone;
+    let Some(cone) = surface.as_any().downcast_ref::<Cone>() else {
+        return false;
+    };
+    let apex = cone.apex;
+    let axis = cone.axis;
+    let osign = face.orientation.sign();
+    let outward = |c: Point3| {
+        let w = c - apex;
+        (w - axis * w.dot(&axis)) * osign
+    };
+    let vnorm = |p: Point3| outward(p).normalize().unwrap_or(axis);
+
+    let mut rims: Vec<Vec<Point3>> = Vec::new();
+    if let Some(l) = model.loops.get(face.outer_loop) {
+        if !l.edges.is_empty() {
+            if loop_cut_circle(l, model).is_none() {
+                return false;
+            }
+            let r = loop_rim_samples(l, model, cache);
+            if r.len() >= 3 {
+                rims.push(r);
+            }
+        }
+    }
+    for &il in &face.inner_loops {
+        let Some(l) = model.loops.get(il) else {
+            return false;
+        };
+        if loop_cut_circle(l, model).is_none() {
+            return false;
+        }
+        let r = loop_rim_samples(l, model, cache);
+        if r.len() >= 3 {
+            rims.push(r);
+        }
+    }
+
+    match rims.len() {
+        1 => {
+            let rim = &rims[0];
+            let apex_id = mesh.add_vertex(MeshVertex {
+                position: apex,
+                normal: axis * -osign,
+                uv: None,
+            });
+            let ids: Vec<u32> = rim
+                .iter()
+                .map(|&p| {
+                    mesh.add_vertex(MeshVertex {
+                        position: p,
+                        normal: vnorm(p),
+                        uv: None,
+                    })
+                })
+                .collect();
+            let m = rim.len();
+            for i in 0..m {
+                let j = (i + 1) % m;
+                let cen = Point3::new(
+                    (apex.x + rim[i].x + rim[j].x) / 3.0,
+                    (apex.y + rim[i].y + rim[j].y) / 3.0,
+                    (apex.z + rim[i].z + rim[j].z) / 3.0,
+                );
+                let n = (rim[i] - apex).cross(&(rim[j] - apex));
+                if n.dot(&outward(cen)) >= 0.0 {
+                    mesh.add_triangle(apex_id, ids[i], ids[j]);
+                } else {
+                    mesh.add_triangle(apex_id, ids[j], ids[i]);
+                }
+            }
+            true
+        }
+        2 => {
+            // Align the two rim circles to the same angular direction about the
+            // axis so the greedy stitch walks them coherently.
+            let helper = if axis.x.abs() <= axis.y.abs() && axis.x.abs() <= axis.z.abs() {
+                Vector3::X
+            } else if axis.y.abs() <= axis.z.abs() {
+                Vector3::Y
+            } else {
+                Vector3::Z
+            };
+            let e1 = (helper - axis * helper.dot(&axis))
+                .normalize()
+                .unwrap_or(Vector3::X);
+            let e2 = axis.cross(&e1);
+            let wrap = |mut d: f64| {
+                let tau = std::f64::consts::TAU;
+                while d > std::f64::consts::PI {
+                    d -= tau;
+                }
+                while d < -std::f64::consts::PI {
+                    d += tau;
+                }
+                d
+            };
+            let signed = |r: &[Point3]| -> f64 {
+                let ang = |p: Point3| {
+                    let w = p - apex;
+                    w.dot(&e2).atan2(w.dot(&e1))
+                };
+                (0..r.len())
+                    .map(|i| wrap(ang(r[(i + 1) % r.len()]) - ang(r[i])))
+                    .sum::<f64>()
+            };
+            let mut r1 = rims[1].clone();
+            if signed(&rims[0]) * signed(&r1) < 0.0 {
+                r1.reverse();
+            }
+            let r0v: Vec<(Point3, u32)> = rims[0]
+                .iter()
+                .map(|&p| {
+                    (
+                        p,
+                        mesh.add_vertex(MeshVertex {
+                            position: p,
+                            normal: vnorm(p),
+                            uv: None,
+                        }),
+                    )
+                })
+                .collect();
+            let r1v: Vec<(Point3, u32)> = r1
+                .iter()
+                .map(|&p| {
+                    (
+                        p,
+                        mesh.add_vertex(MeshVertex {
+                            position: p,
+                            normal: vnorm(p),
+                            uv: None,
+                        }),
+                    )
+                })
+                .collect();
+            stitch_rings(&r0v, &r1v, &outward, mesh);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn tessellate_conical_face(
     face: &Face,
     model: &BRepModel,
@@ -1685,6 +1839,13 @@ fn tessellate_conical_face(
         Some(s) => s,
         None => return,
     };
+
+    // Boundary-conforming path for cone faces cut into bands by a curved
+    // Boolean (apex tip cap / frustum band). Falls through for the analytic
+    // grid otherwise.
+    if tessellate_conical_cut(face, model, surface, cache, mesh) {
+        return;
+    }
 
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
