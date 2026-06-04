@@ -364,6 +364,7 @@ mod tests {
         ("cone/axial-poke", 0),
         ("cone/axial-poke", 1),
         ("cone/axial-poke", 2),
+        ("cylinder/off-axis", 2),
         ("torus/contained", 0),
         ("torus/contained", 1),
         ("torus/contained", 2),

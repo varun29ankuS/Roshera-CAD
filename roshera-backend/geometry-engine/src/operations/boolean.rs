@@ -3777,7 +3777,7 @@ fn split_face_by_curves(
     // and silently drops the face. The original
     // `coincides_with_boundary` filter at the top of this function
     // ran before the pre-split and couldn't see the new sub-edge.
-    drop_cuts_coincident_with_boundary(&mut graph);
+    drop_cuts_coincident_with_boundary(&mut graph, model, &options.common.tolerance);
 
     // Pre-split closed self-loop edges (full circles, periodic curves)
     // before crossing detection. The DCEL planar arrangement filters
@@ -6497,36 +6497,76 @@ fn presplit_boundary_t_junctions(
 /// cut-creation loop catches the same situation for cuts that fully
 /// overlap a single boundary edge that existed PRIOR to T-junction
 /// splitting; this function is its post-split counterpart.
-fn drop_cuts_coincident_with_boundary(graph: &mut IntersectionGraph) {
-    let boundary_pairs: HashSet<(VertexId, VertexId)> = graph
-        .edges
-        .iter()
-        .filter(|(_, ge)| ge.edge_type == EdgeType::Boundary)
-        .filter_map(|(_, ge)| {
-            let a = ge.start_vertex;
-            let b = ge.end_vertex;
-            if a == u32::MAX || b == u32::MAX || a == b {
-                None
-            } else if a < b {
-                Some((a, b))
-            } else {
-                Some((b, a))
-            }
-        })
-        .collect();
+///
+/// Coincidence is GEOMETRIC, not merely endpoint-sharing. A cut that shares
+/// BOTH endpoints with a boundary sub-edge yet bulges into the face interior
+/// — the canonical case being an arc whose two ends land on the same straight
+/// boundary edge (a "bite", e.g. a cylinder cross-section imprinted on a box
+/// cap) — is a genuine splitting curve that must be kept: dropping it by
+/// vertex pair alone leaves the face unsplit (no hole where the tool passes
+/// through). We therefore compare interior sample points and drop the cut only
+/// when it actually retraces the boundary edge within tolerance.
+fn drop_cuts_coincident_with_boundary(
+    graph: &mut IntersectionGraph,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) {
+    let mut boundary_by_pair: HashMap<(VertexId, VertexId), Vec<EdgeId>> = HashMap::new();
+    for (&eid, ge) in &graph.edges {
+        if ge.edge_type != EdgeType::Boundary {
+            continue;
+        }
+        let (a, b) = (ge.start_vertex, ge.end_vertex);
+        if a == u32::MAX || b == u32::MAX || a == b {
+            continue;
+        }
+        let pair = if a < b { (a, b) } else { (b, a) };
+        boundary_by_pair.entry(pair).or_default().push(eid);
+    }
+
+    let tol_sq = tolerance.distance() * tolerance.distance();
+    // Three interior samples of an edge's underlying curve (¼, ½, ¾ of its
+    // parametric range). For a circular arc vs its chord the deviation is
+    // maximal at the midpoint, so this reliably separates a real bite from a
+    // true retrace; arcs whose sagitta is below tolerance are within the
+    // boundary and correctly treated as coincident.
+    let samples = |eid: EdgeId| -> Option<[Point3; 3]> {
+        let e = model.edges.get(eid)?;
+        let c = model.curves.get(e.curve_id)?;
+        let (t0, t1) = (e.param_range.start, e.param_range.end);
+        let at = |f: f64| c.evaluate(t0 + (t1 - t0) * f).ok().map(|p| p.position);
+        Some([at(0.25)?, at(0.5)?, at(0.75)?])
+    };
 
     let redundant: Vec<EdgeId> = graph
         .edges
         .iter()
         .filter(|(_, ge)| ge.edge_type == EdgeType::Splitting)
         .filter_map(|(&eid, ge)| {
-            let a = ge.start_vertex;
-            let b = ge.end_vertex;
+            let (a, b) = (ge.start_vertex, ge.end_vertex);
             if a == u32::MAX || b == u32::MAX || a == b {
                 return None;
             }
             let pair = if a < b { (a, b) } else { (b, a) };
-            if boundary_pairs.contains(&pair) {
+            let bnd = boundary_by_pair.get(&pair)?;
+            let cut = samples(eid)?;
+            // Drop only if the cut retraces SOME boundary edge with the same
+            // endpoints at every interior sample (a genuine duplicate), not a
+            // chord/arc that merely shares endpoints.
+            let coincident = bnd.iter().any(|&beid| {
+                // A boundary edge may be parameterised start→end opposite to
+                // the cut; compare against both sample orders.
+                samples(beid).is_some_and(|bs| {
+                    let near = |p: Point3, q: Point3| {
+                        let d = p - q;
+                        d.x * d.x + d.y * d.y + d.z * d.z <= tol_sq
+                    };
+                    let fwd = near(cut[0], bs[0]) && near(cut[1], bs[1]) && near(cut[2], bs[2]);
+                    let rev = near(cut[0], bs[2]) && near(cut[1], bs[1]) && near(cut[2], bs[0]);
+                    fwd || rev
+                })
+            });
+            if coincident {
                 Some(eid)
             } else {
                 None
