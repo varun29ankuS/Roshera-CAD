@@ -7418,6 +7418,118 @@ fn ray_surface_numerical(
     Ok(best_t)
 }
 
+/// Robust membership for a **spherical** face trimmed only by coplanar circles
+/// (a sphere cut by box-face planes — the curved-Boolean poke-through case).
+///
+/// Returns `Some(inside)` when the test applies, or `None` when the surface is
+/// not a sphere or any trim loop is not a single coplanar circle — in which
+/// case the caller falls back to the legacy `(u, v)` polygon test.
+///
+/// Why this is needed: a cut circle on a sphere sits at constant surface
+/// parameter, so its `(u, v)` footprint is a zero-area line and the winding /
+/// shoelace tests degenerate (a cap renders as the whole sphere; a multi-hole
+/// central region can't be expressed at all). We test each circle's PLANE
+/// half-space instead. Each cutting plane splits the sphere into two caps; the
+/// face keeps a definite side per loop:
+///
+/// * an **outer** circle loop keeps the cap FAR from the sphere centre (the
+///   smaller cap the surface bulges away into — the part that pokes out), and
+/// * an **inner** circle loop (a hole) keeps the NEAR side (the hole is the far
+///   cap, so the face is everything on the centre side of it).
+///
+/// This is exact for planar circular trims and handles caps (one outer loop)
+/// and central regions (N inner-loop holes) uniformly. The sphere centre gives
+/// an orientation-free reference, so there is no winding sign to mis-calibrate.
+pub(crate) fn spherical_circular_membership(
+    model: &BRepModel,
+    face: &crate::primitives::face::Face,
+    surface: &dyn Surface,
+    point: &Point3,
+    tolerance: &Tolerance,
+) -> Option<bool> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::Sphere;
+
+    let sphere = surface.as_any().downcast_ref::<Sphere>()?;
+    let center = sphere.center;
+    let tol = tolerance.distance();
+
+    // Pull a single coplanar circle (centre C, axis n) out of a loop's edges,
+    // or `None` if the loop is not such a circle.
+    let loop_circle = |lid: crate::primitives::r#loop::LoopId| -> Option<(Point3, Vector3)> {
+        let lp = model.loops.get(lid)?;
+        if lp.edges.is_empty() {
+            return None;
+        }
+        let mut plane: Option<(Point3, Vector3)> = None;
+        for &eid in &lp.edges {
+            let edge = model.edges.get(eid)?;
+            let curve = model.curves.get(edge.curve_id)?;
+            let circle = curve.as_any().downcast_ref::<Circle>()?;
+            let c = circle.center();
+            let n = circle.normal().normalize().ok()?;
+            match plane {
+                None => plane = Some((c, n)),
+                Some((pc, pn)) => {
+                    if (c - pc).dot(&pn).abs() > tol * 10.0 || pn.cross(&n).magnitude() > 1e-4 {
+                        return None;
+                    }
+                }
+            }
+        }
+        plane
+    };
+
+    // `keep_far` = true for an outer cap loop, false for an inner hole loop.
+    // The point must lie on the kept side of the circle's plane (on-plane
+    // counts as inside / boundary).
+    let on_kept_side = |c: Point3, n: Vector3, keep_far: bool| -> bool {
+        let p = (*point - c).dot(&n);
+        let o = (center - c).dot(&n);
+        if p.abs() <= tol {
+            return true; // on the cutting plane → boundary
+        }
+        // Far side = opposite sign to the centre's projection.
+        let on_far = p * o < 0.0;
+        if keep_far {
+            on_far
+        } else {
+            !on_far
+        }
+    };
+
+    // Outer loop (if it is a circle): keep the far cap. A non-circular or empty
+    // outer loop is allowed only when the surface is otherwise circle-trimmed
+    // (the central region has an empty outer loop) — but if the outer loop has
+    // edges that are NOT a circle, bail to the legacy path.
+    if let Some(l) = model.loops.get(face.outer_loop) {
+        if !l.edges.is_empty() {
+            match loop_circle(face.outer_loop) {
+                Some((c, n)) => {
+                    if !on_kept_side(c, n, true) {
+                        return Some(false);
+                    }
+                }
+                None => return None,
+            }
+        }
+    }
+
+    // Inner loops (holes): keep the near side of each.
+    for &il in &face.inner_loops {
+        match loop_circle(il) {
+            Some((c, n)) => {
+                if !on_kept_side(c, n, false) {
+                    return Some(false);
+                }
+            }
+            None => return None,
+        }
+    }
+
+    Some(true)
+}
+
 /// Check if a 3D point lies inside a face's boundary.
 ///
 /// Projects the point to UV parameter space, then uses a 2D ray-casting
@@ -7591,6 +7703,15 @@ fn is_point_in_face(
         || v > v_max + tolerance.distance()
     {
         return Ok(false);
+    }
+
+    // Robust path for a sphere trimmed by coplanar cut circles: the `(u, v)`
+    // polygon test degenerates (an iso-parametric cut circle has zero area), so
+    // test the circle-plane half-spaces instead. Untrimmed sphere operand faces
+    // have no circular loops and resolve to `Some(true)` here, matching the
+    // legacy behaviour; non-sphere surfaces return `None` and fall through.
+    if let Some(inside) = spherical_circular_membership(model, face, surface, point, tolerance) {
+        return Ok(inside);
     }
 
     // Project face boundary edges to UV space and use 2D point-in-polygon test.
@@ -8470,6 +8591,93 @@ mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::surface::{Cylinder, Plane, Sphere};
     use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+    // =============================================
+    // Spherical circular-trim membership calibration
+    // =============================================
+
+    /// Lock the geometry of `spherical_circular_membership` in isolation: a
+    /// sphere (centre origin, r=2.5) cut by the plane z=2 (circle r=1.5). The
+    /// CAP face (outer = that circle) keeps the far cap z>2; the CENTRAL face
+    /// (inner-loop hole = that circle) keeps the near side z<2.
+    #[test]
+    fn spherical_circular_membership_calibration() {
+        use crate::primitives::curve::{Circle, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        use crate::primitives::face::{Face, FaceOrientation};
+        use crate::primitives::r#loop::{Loop, LoopType};
+
+        let mut m = BRepModel::new();
+        let sid = m
+            .surfaces
+            .add(Box::new(Sphere::new(Point3::ORIGIN, 2.5).unwrap()));
+        let circle = Circle::new(Point3::new(0.0, 0.0, 2.0), Vector3::Z, 1.5).unwrap();
+        let cid = m.curves.add(Box::new(circle));
+        let vid = m.vertices.add(1.5, 0.0, 2.0);
+        let eid = m.edges.add(Edge::new(
+            0,
+            vid,
+            vid,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+
+        // Build BOTH faces (all mutations) before borrowing the model.
+        let mut cap_loop = Loop::new(0, LoopType::Outer);
+        cap_loop.add_edge(eid, true);
+        let cap_loop_id = m.loops.add(cap_loop);
+        let cap_fid = m
+            .faces
+            .add(Face::new(0, sid, cap_loop_id, FaceOrientation::Forward));
+
+        let empty_loop_id = m.loops.add(Loop::new(0, LoopType::Outer));
+        let mut inner = Loop::new(0, LoopType::Inner);
+        inner.add_edge(eid, true);
+        let inner_id = m.loops.add(inner);
+        let mut central = Face::new(0, sid, empty_loop_id, FaceOrientation::Forward);
+        central.inner_loops.push(inner_id);
+        let central_fid = m.faces.add(central);
+
+        let tol = Tolerance::default();
+        let surf = m.surfaces.get(sid).unwrap();
+        let cap_face = m.faces.get(cap_fid).unwrap();
+        let central_face = m.faces.get(central_fid).unwrap();
+
+        let cap = |p: Point3| spherical_circular_membership(&m, cap_face, surf, &p, &tol);
+        assert_eq!(
+            cap(Point3::new(0.0, 0.0, 2.5)),
+            Some(true),
+            "north pole in cap"
+        );
+        assert_eq!(
+            cap(Point3::new(0.0, 0.0, -2.5)),
+            Some(false),
+            "south pole not in cap"
+        );
+        assert_eq!(
+            cap(Point3::new(2.5, 0.0, 0.0)),
+            Some(false),
+            "equator not in cap"
+        );
+
+        let cen = |p: Point3| spherical_circular_membership(&m, central_face, surf, &p, &tol);
+        assert_eq!(
+            cen(Point3::new(0.0, 0.0, 2.5)),
+            Some(false),
+            "north pole in hole"
+        );
+        assert_eq!(
+            cen(Point3::new(0.0, 0.0, -2.5)),
+            Some(true),
+            "south pole in central"
+        );
+        assert_eq!(
+            cen(Point3::new(2.5, 0.0, 0.0)),
+            Some(true),
+            "equator in central"
+        );
+    }
 
     // =============================================
     // Ray-surface intersection tests
