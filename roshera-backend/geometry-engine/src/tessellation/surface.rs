@@ -2363,6 +2363,26 @@ pub(crate) fn point_inside_face_uv(u: f64, v: f64, face: &Face, model: &BRepMode
 
 /// Check if a parameter point is inside face boundaries using winding number algorithm
 fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool {
+    // Robust path for a sphere trimmed by coplanar cut circles: an
+    // iso-parametric cut circle has zero `(u, v)` area, so the winding test
+    // below degenerates (a cap renders as the whole sphere; a multi-hole
+    // central region cannot be expressed). Test the circle-plane half-spaces
+    // instead. `None` (non-sphere, or non-circular trims) falls through to the
+    // legacy winding test, so existing faces are unaffected.
+    if let Some(surface) = model.surfaces.get(face.surface_id) {
+        if let Ok(p) = surface.point_at(u, v) {
+            if let Some(inside) = crate::operations::boolean::spherical_circular_membership(
+                model,
+                face,
+                surface,
+                &p,
+                &crate::math::Tolerance::default(),
+            ) {
+                return inside;
+            }
+        }
+    }
+
     // First check outer loop - point must be inside
     if !is_point_inside_loop(u, v, face.outer_loop, face, model) {
         return false;
