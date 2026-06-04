@@ -2994,6 +2994,176 @@ fn add_non_intersecting_faces(
     Ok(())
 }
 
+/// Sphere-specific region builder for the closed-surface curved-Boolean case.
+///
+/// A sphere (untrimmed — `boundary_edges` empty) cut by N coplanar circles
+/// divides into N "caps" (one per circle, the side FAR from the sphere centre)
+/// plus one "central" region (everything on the NEAR side of every circle,
+/// carrying the N circles as inner-loop holes). The general DCEL walker cannot
+/// produce these: an iso-parametric cut circle projects to a zero-area line in
+/// `(u, v)`, so every cycle is discarded by the signed-area filter, and a
+/// closed surface has no outer boundary for the multi-hole central face.
+///
+/// We build the regions directly from the pre-split cut circles and rely on
+/// [`spherical_circular_membership`] (geometric plane half-spaces) for coverage
+/// during classification and tessellation. Returns `None` when the face is not
+/// an untrimmed sphere cut by circles, so the caller uses the normal path.
+fn split_sphere_face_by_circles(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+    boundary_empty: bool,
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::Sphere;
+
+    if !boundary_empty {
+        return None;
+    }
+    let surface = model.surfaces.get(surface_id)?;
+    let sphere = surface.as_any().downcast_ref::<Sphere>()?;
+    let center = sphere.center;
+    let radius = sphere.radius;
+
+    // Group the graph's circle edges by curve id — a cut circle's pre-split
+    // sub-edges all reference the same `Circle` curve. BTreeMap for determinism.
+    let mut by_curve: std::collections::BTreeMap<CurveId, Vec<EdgeId>> =
+        std::collections::BTreeMap::new();
+    for &eid in graph.edges.keys() {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        if let Some(curve) = model.curves.get(edge.curve_id) {
+            if curve.as_any().downcast_ref::<Circle>().is_some() {
+                by_curve.entry(edge.curve_id).or_default().push(eid);
+            }
+        }
+    }
+    if by_curve.is_empty() {
+        return None;
+    }
+
+    // Order one circle's sub-edges into a connected (edge, forward) loop by
+    // walking shared endpoints.
+    let order_loop = |eids: &[EdgeId]| -> Vec<(EdgeId, bool)> {
+        let mut remaining: Vec<EdgeId> = eids.to_vec();
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        if remaining.is_empty() {
+            return out;
+        }
+        let first = remaining.remove(0);
+        let mut cur_end = match model.edges.get(first) {
+            Some(e) => e.end_vertex,
+            None => return out,
+        };
+        out.push((first, true));
+        while !remaining.is_empty() {
+            let mut found = None;
+            for (i, &eid) in remaining.iter().enumerate() {
+                if let Some(e) = model.edges.get(eid) {
+                    if e.start_vertex == cur_end {
+                        found = Some((i, eid, e.end_vertex, true));
+                        break;
+                    } else if e.end_vertex == cur_end {
+                        found = Some((i, eid, e.start_vertex, false));
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some((i, eid, next_end, fwd)) => {
+                    remaining.remove(i);
+                    out.push((eid, fwd));
+                    cur_end = next_end;
+                }
+                None => {
+                    for eid in remaining.drain(..) {
+                        out.push((eid, true));
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    let mut cap_faces: Vec<SplitFace> = Vec::new();
+    let mut circle_loops: Vec<Vec<(EdgeId, bool)>> = Vec::new();
+    let mut planes: Vec<(Point3, Vector3)> = Vec::new();
+
+    for (&cid, eids) in &by_curve {
+        let Some(circle) = model
+            .curves
+            .get(cid)
+            .and_then(|c| c.as_any().downcast_ref::<Circle>())
+        else {
+            continue;
+        };
+        let c_center = circle.center();
+        let c_axis = circle.normal().normalize().unwrap_or(Vector3::Z);
+        let ordered = order_loop(eids);
+        circle_loops.push(ordered.clone());
+        planes.push((c_center, c_axis));
+
+        // Cap interior = the far pole: sphere centre + radius along the
+        // direction from the sphere centre to the circle's centre.
+        let dir = (c_center - center).normalize().unwrap_or(c_axis);
+        let cap_interior = center + dir * radius;
+        cap_faces.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: ordered,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(cap_interior),
+            inner_loops: Vec::new(),
+        });
+    }
+
+    // Central region interior: a sphere point on the near side of every cut
+    // plane. Probe the ±axis and corner-diagonal directions.
+    let near_side = |p: Point3| -> bool {
+        planes.iter().all(|&(c, n)| {
+            let pp = (p - c).dot(&n);
+            let oo = (center - c).dot(&n);
+            pp * oo >= 0.0
+        })
+    };
+    let mut dirs: Vec<Vector3> = Vec::new();
+    for &s in &[-1.0_f64, 1.0] {
+        dirs.push(Vector3::new(s, 0.0, 0.0));
+        dirs.push(Vector3::new(0.0, s, 0.0));
+        dirs.push(Vector3::new(0.0, 0.0, s));
+    }
+    for &sx in &[-1.0_f64, 1.0] {
+        for &sy in &[-1.0_f64, 1.0] {
+            for &sz in &[-1.0_f64, 1.0] {
+                dirs.push(Vector3::new(sx, sy, sz));
+            }
+        }
+    }
+    let central_interior = dirs.into_iter().find_map(|d| {
+        let dn = d.normalize().ok()?;
+        let p = center + dn * radius;
+        near_side(p).then_some(p)
+    });
+
+    let mut result = cap_faces;
+    if let Some(ci) = central_interior {
+        result.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: Vec::new(),
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(ci),
+            inner_loops: circle_loops,
+        });
+    }
+    Some(result)
+}
+
 /// Split a single face by multiple curves.
 ///
 /// `origin_solid` identifies which of the two boolean operands this face
@@ -3305,6 +3475,27 @@ fn split_face_by_curves(
 
     // Re-resolve vertices after edge splitting to ensure consistency
     graph.resolve_vertices(model);
+
+    // Closed-surface (sphere) curved-Boolean fast path: a sphere cut by
+    // coplanar circles is partitioned into caps + a central multi-hole region
+    // directly (the DCEL walker drops iso-parametric cut circles — zero (u, v)
+    // area — and cannot assemble the no-outer-boundary central face).
+    if let Some(sphere_faces) = split_sphere_face_by_circles(
+        model,
+        surface_id,
+        face_id,
+        origin_solid,
+        &graph,
+        boundary_edges.is_empty(),
+    ) {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   sphere closed-surface split: face={face_id:?} → {} fragments",
+                sphere_faces.len()
+            );
+        }
+        return Ok(sphere_faces);
+    }
 
     // Build face loops via DCEL planar arrangement.
     //
