@@ -8,7 +8,7 @@ use crate::{
     operations::orientation::orient_face_for_outward,
     primitives::{
         curve::{Arc, Circle, ParameterRange},
-        edge::{Edge, EdgeOrientation},
+        edge::{Edge, EdgeId, EdgeOrientation},
         face::{Face, FaceOrientation},
         primitive_traits::PrimitiveError,
         r#loop::{Loop, LoopType},
@@ -244,6 +244,17 @@ impl ConePrimitive {
         // Create edges and faces
         let mut faces = Vec::new();
 
+        // The lateral face owns the rim edges; the cap faces reuse the SAME
+        // EdgeId (traversed in the opposite direction) so the rim is a single
+        // shared manifold edge — not two coincident edges with distinct
+        // curve_ids. Sharing is what lets a boolean cut's presplit/imprint of a
+        // rim propagate to the cap loop, keeping the cap's tessellated rim
+        // bit-identical to the lateral band's rim (mirrors the cylinder
+        // primitive's shared-rim topology). Each holder carries the lateral's
+        // own use-orientation; the cap uses its negation.
+        let mut lateral_top_edge: Option<(EdgeId, bool)> = None;
+        let mut lateral_bottom_edge: Option<(EdgeId, bool)> = None;
+
         // Conical surface face
         let cone_face = if is_full_cone {
             if has_apex {
@@ -266,6 +277,7 @@ impl ConePrimitive {
 
                 let mut loop_ = Loop::new(0, LoopType::Outer);
                 loop_.add_edge(top_edge_id, true);
+                lateral_top_edge = Some((top_edge_id, true));
                 let loop_id = model.loops.add(loop_);
 
                 // Stamp orientation so the cone lateral's oriented outward
@@ -311,10 +323,12 @@ impl ConePrimitive {
 
                 let mut outer_loop = Loop::new(0, LoopType::Outer);
                 outer_loop.add_edge(bottom_edge_id, true);
+                lateral_bottom_edge = Some((bottom_edge_id, true));
                 let outer_loop_id = model.loops.add(outer_loop);
 
                 let mut inner_loop = Loop::new(0, LoopType::Inner);
                 inner_loop.add_edge(top_edge_id, false);
+                lateral_top_edge = Some((top_edge_id, false));
                 let inner_loop_id = model.loops.add(inner_loop);
 
                 let cone_orientation =
@@ -349,24 +363,31 @@ impl ConePrimitive {
         })?;
         let top_plane_id = model.surfaces.add(Box::new(top_plane));
 
-        let top_circle = Arc::circle(top_center, params.axis, top_radius)?;
-        let top_start = top_center + ref_dir * top_radius;
-        let top_vertex = model.vertices.add(top_start.x, top_start.y, top_start.z);
-        let top_curve_id = model.curves.add(Box::new(top_circle));
-        let top_circle_edge = Edge::new(
-            0, // id will be set by store
-            top_vertex,
-            top_vertex, // closed curve
-            top_curve_id,
-            EdgeOrientation::Forward,
-            // Match `Circle`'s normalized [0, 1] parameterization — the
-            // underlying `Arc::evaluate(t)` clamps `t` to `[0, 1]`.
-            ParameterRange::new(0.0, 1.0),
-        );
-        let top_circle_edge_id = model.edges.add_or_find(top_circle_edge);
+        // Reuse the lateral's rim edge (shared manifold edge) when the lateral
+        // produced one; otherwise build a standalone rim edge (sector cones).
+        let (top_circle_edge_id, top_cap_use) = match lateral_top_edge {
+            Some((eid, lateral_use)) => (eid, !lateral_use),
+            None => {
+                let top_circle = Arc::circle(top_center, params.axis, top_radius)?;
+                let top_start = top_center + ref_dir * top_radius;
+                let top_vertex = model.vertices.add(top_start.x, top_start.y, top_start.z);
+                let top_curve_id = model.curves.add(Box::new(top_circle));
+                let top_circle_edge = Edge::new(
+                    0, // id will be set by store
+                    top_vertex,
+                    top_vertex, // closed curve
+                    top_curve_id,
+                    EdgeOrientation::Forward,
+                    // Match `Circle`'s normalized [0, 1] parameterization — the
+                    // underlying `Arc::evaluate(t)` clamps `t` to `[0, 1]`.
+                    ParameterRange::new(0.0, 1.0),
+                );
+                (model.edges.add_or_find(top_circle_edge), true)
+            }
+        };
 
         let mut top_loop = Loop::new(0, LoopType::Outer);
-        top_loop.add_edge(top_circle_edge_id, true);
+        top_loop.add_edge(top_circle_edge_id, top_cap_use);
         let top_loop_id = model.loops.add(top_loop);
         // Top cap outward target = +params.axis (the cone's axis points
         // from apex toward the base, so the top cap faces +axis).
@@ -400,25 +421,33 @@ impl ConePrimitive {
                 })?;
             let bottom_plane_id = model.surfaces.add(Box::new(bottom_plane));
 
-            let bottom_circle = Arc::circle(bottom_center, -params.axis, bottom_radius)?;
-            let bottom_start = bottom_center + ref_dir * bottom_radius;
-            let bottom_vertex = model
-                .vertices
-                .add(bottom_start.x, bottom_start.y, bottom_start.z);
-            let bottom_curve_id = model.curves.add(Box::new(bottom_circle));
-            let bottom_circle_edge = Edge::new(
-                0, // id will be set by store
-                bottom_vertex,
-                bottom_vertex, // closed curve
-                bottom_curve_id,
-                EdgeOrientation::Forward,
-                // Match `Circle`'s normalized [0, 1] parameterization.
-                ParameterRange::new(0.0, 1.0),
-            );
-            let bottom_circle_edge_id = model.edges.add_or_find(bottom_circle_edge);
+            // Reuse the lateral's bottom rim edge (shared manifold edge) when
+            // present; otherwise build a standalone one (sector cones).
+            let (bottom_circle_edge_id, bottom_cap_use) = match lateral_bottom_edge {
+                Some((eid, lateral_use)) => (eid, !lateral_use),
+                None => {
+                    let bottom_circle = Arc::circle(bottom_center, -params.axis, bottom_radius)?;
+                    let bottom_start = bottom_center + ref_dir * bottom_radius;
+                    let bottom_vertex =
+                        model
+                            .vertices
+                            .add(bottom_start.x, bottom_start.y, bottom_start.z);
+                    let bottom_curve_id = model.curves.add(Box::new(bottom_circle));
+                    let bottom_circle_edge = Edge::new(
+                        0, // id will be set by store
+                        bottom_vertex,
+                        bottom_vertex, // closed curve
+                        bottom_curve_id,
+                        EdgeOrientation::Forward,
+                        // Match `Circle`'s normalized [0, 1] parameterization.
+                        ParameterRange::new(0.0, 1.0),
+                    );
+                    (model.edges.add_or_find(bottom_circle_edge), true)
+                }
+            };
 
             let mut bottom_loop = Loop::new(0, LoopType::Outer);
-            bottom_loop.add_edge(bottom_circle_edge_id, true);
+            bottom_loop.add_edge(bottom_circle_edge_id, bottom_cap_use);
             let bottom_loop_id = model.loops.add(bottom_loop);
             // Bottom cap outward target = -params.axis (away from apex).
             let bottom_orientation = {

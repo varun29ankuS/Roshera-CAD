@@ -361,6 +361,7 @@ mod tests {
         ("cone/contained", 0),
         ("cone/contained", 1),
         ("cone/contained", 2),
+        ("cone/axial-poke", 0),
         ("cone/axial-poke", 1),
         ("cone/axial-poke", 2),
         ("torus/contained", 0),
