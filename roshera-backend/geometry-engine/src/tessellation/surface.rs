@@ -967,6 +967,349 @@ fn tessellate_spherical_cap(
     true
 }
 
+/// Sample a loop's cut-circle rim verbatim from its boundary edges' cache.
+fn loop_rim_samples(
+    loop_data: &crate::primitives::r#loop::Loop,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+) -> Vec<Point3> {
+    let mut rim: Vec<Point3> = Vec::new();
+    for (i, &eid) in loop_data.edges.iter().enumerate() {
+        let samples = cache.get_or_compute(eid, model);
+        let fwd = loop_data.orientations.get(i).copied().unwrap_or(true);
+        let ordered: Vec<Point3> = if fwd {
+            samples.iter().copied().collect()
+        } else {
+            samples.iter().rev().copied().collect()
+        };
+        for p in ordered {
+            if rim.last().map_or(true, |&q| (q - p).magnitude() > 1e-9) {
+                rim.push(p);
+            }
+        }
+    }
+    if rim.len() >= 2 && (rim[0] - *rim.last().unwrap()).magnitude() < 1e-9 {
+        rim.pop();
+    }
+    rim
+}
+
+/// Boundary-conforming tessellation of a spherical CENTRAL region (sphere minus
+/// N caps). A full lat-long grid is gated by membership; the OPEN boundary of
+/// the kept triangles is walked into ordered loops, each loop matched to the
+/// hole it surrounds and stitched to that hole's rim ring (cut-circle edge
+/// samples, so it welds to the adjoining planar disk by position).
+///
+/// Returns `true` when handled (a sphere face with inner-loop holes).
+fn tessellate_spherical_central(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Sphere;
+    use std::collections::HashMap;
+
+    if face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() else {
+        return false;
+    };
+    let o = sphere.center;
+    let r = sphere.radius;
+    let osign = face.orientation.sign();
+    // The lat-long grid quad `(a,b,c)` = (+u,+v) winds INWARD under the radial
+    // normal (same handedness issue as the analytic sphere path), so a Forward
+    // (outward) central face needs the reversed winding — hence the `!`. The
+    // stitch twins the grid by construction, so this one flip orients the whole
+    // central consistently with the adjoining planar disks.
+    let forward = !face.orientation.is_forward();
+
+    // Holes: plane (centre, axis), an in-plane frame, and the rim verts already
+    // added to the mesh (positions kept for angular sort).
+    struct Hole {
+        center: Point3,
+        axis: Vector3,
+        e1: Vector3,
+        e2: Vector3,
+        rim: Vec<(f64, u32, Point3)>, // (angle, mesh id, pos)
+    }
+    let mut holes: Vec<Hole> = Vec::new();
+    for &lid in &face.inner_loops {
+        let Some(lp) = model.loops.get(lid) else {
+            return false;
+        };
+        let Some((c, n)) = loop_cut_circle(lp, model) else {
+            return false;
+        };
+        let rim_pos = loop_rim_samples(lp, model, cache);
+        if rim_pos.len() < 3 {
+            return false;
+        }
+        let helper = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+            Vector3::X
+        } else if n.y.abs() <= n.z.abs() {
+            Vector3::Y
+        } else {
+            Vector3::Z
+        };
+        let e1 = (helper - n * helper.dot(&n))
+            .normalize()
+            .unwrap_or(Vector3::X);
+        let e2 = n.cross(&e1);
+        let mut rim: Vec<(f64, u32, Point3)> = rim_pos
+            .iter()
+            .map(|&p| {
+                let d = p - c;
+                let ang = d.dot(&e2).atan2(d.dot(&e1));
+                let normal = (p - o).normalize().unwrap_or(n) * osign;
+                let id = mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal,
+                    uv: None,
+                });
+                (ang, id, p)
+            })
+            .collect();
+        rim.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        holes.push(Hole {
+            center: c,
+            axis: n,
+            e1,
+            e2,
+            rim,
+        });
+    }
+
+    let in_central = |p: Point3| -> bool {
+        holes.iter().all(|h| {
+            let pp = (p - h.center).dot(&h.axis);
+            let oo = (o - h.center).dot(&h.axis);
+            pp * oo >= 0.0
+        })
+    };
+
+    let tau = std::f64::consts::TAU;
+    let pi = std::f64::consts::PI;
+    let n_u = arc_steps_for_quality(tau, r, params).max(12);
+    let n_v = arc_steps_for_quality(pi, r, params).max(6);
+    let key = |i: usize, j: usize| -> u32 { (i * (n_v + 1) + j) as u32 };
+    let mut gpos = vec![vec![Point3::ORIGIN; n_v + 1]; n_u];
+    let mut gid = vec![vec![None::<u32>; n_v + 1]; n_u];
+    let mut gcen = vec![vec![false; n_v + 1]; n_u];
+    for i in 0..n_u {
+        let u = tau * (i as f64) / (n_u as f64);
+        for j in 0..=n_v {
+            let v = pi * (j as f64) / (n_v as f64);
+            let Ok(p) = surface.point_at(u, v) else {
+                continue;
+            };
+            gpos[i][j] = p;
+            if in_central(p) {
+                gcen[i][j] = true;
+                let normal = (p - o).normalize().unwrap_or(Vector3::Z) * osign;
+                gid[i][j] = Some(mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal,
+                    uv: None,
+                }));
+            }
+        }
+    }
+
+    // Emit central grid quads; record directed (i,j)-key edges for boundary
+    // extraction. A directed edge with no reverse twin is on the open boundary.
+    let mut dir_edges: HashMap<(u32, u32), i32> = HashMap::new();
+    let mut tri_keyed = |ka: u32, kb: u32, kc: u32| {
+        for &(x, y) in &[(ka, kb), (kb, kc), (kc, ka)] {
+            *dir_edges.entry((x, y)).or_insert(0) += 1;
+        }
+    };
+    for i in 0..n_u {
+        let i2 = (i + 1) % n_u;
+        for j in 0..n_v {
+            if let (Some(a), Some(b), Some(c), Some(d)) =
+                (gid[i][j], gid[i2][j], gid[i][j + 1], gid[i2][j + 1])
+            {
+                let (ka, kb, kc, kd) = (key(i, j), key(i2, j), key(i, j + 1), key(i2, j + 1));
+                if forward {
+                    mesh.add_triangle(a, b, c);
+                    mesh.add_triangle(b, d, c);
+                    tri_keyed(ka, kb, kc);
+                    tri_keyed(kb, kd, kc);
+                } else {
+                    mesh.add_triangle(a, c, b);
+                    mesh.add_triangle(b, c, d);
+                    tri_keyed(ka, kc, kb);
+                    tri_keyed(kb, kc, kd);
+                }
+            }
+        }
+    }
+
+    // Open boundary directed edges (no reverse twin) → next-vertex chain.
+    let mut next: HashMap<u32, u32> = HashMap::new();
+    for (&(a, b), &cnt) in &dir_edges {
+        if cnt > 0 && !dir_edges.contains_key(&(b, a)) {
+            next.insert(a, b);
+        }
+    }
+    // Decode a key back to (mesh id, 3D pos).
+    let decode = |k: u32| -> (u32, Point3) {
+        let i = (k as usize) / (n_v + 1);
+        let j = (k as usize) % (n_v + 1);
+        (gid[i][j].unwrap_or(0), gpos[i][j])
+    };
+
+    // Walk boundary loops.
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut loops: Vec<Vec<u32>> = Vec::new();
+    for &start in next.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut loop_keys = Vec::new();
+        let mut cur = start;
+        let mut guard = 0;
+        loop {
+            if !visited.insert(cur) {
+                break;
+            }
+            loop_keys.push(cur);
+            cur = match next.get(&cur) {
+                Some(&n) => n,
+                None => break,
+            };
+            guard += 1;
+            if guard > n_u * (n_v + 1) + 4 {
+                break;
+            }
+            if cur == start {
+                break;
+            }
+        }
+        if loop_keys.len() >= 3 {
+            loops.push(loop_keys);
+        }
+    }
+
+    // Stitch each boundary loop to its matching hole's rim.
+    for loop_keys in &loops {
+        let pts: Vec<(u32, Point3)> = loop_keys.iter().map(|&k| decode(k)).collect();
+        // Match the hole whose plane the loop hugs: min mean |dist to plane|.
+        let Some(h) = holes.iter().min_by(|h1, h2| {
+            let d = |h: &Hole| {
+                pts.iter()
+                    .map(|&(_, p)| ((p - h.center).dot(&h.axis)).abs())
+                    .sum::<f64>()
+            };
+            d(h1)
+                .partial_cmp(&d(h2))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
+            continue;
+        };
+        // Boundary loop in WALK ORDER (a ring around the hole). Keep order;
+        // only normalise winding to CCW about the hole axis (total signed
+        // angle ≈ +2π) so it matches the rim's CCW order.
+        let angle = |p: Point3| -> f64 {
+            let d = p - h.center;
+            d.dot(&h.e2).atan2(d.dot(&h.e1))
+        };
+        let wrap = |mut d: f64| {
+            let tau = std::f64::consts::TAU;
+            while d > std::f64::consts::PI {
+                d -= tau;
+            }
+            while d < -std::f64::consts::PI {
+                d += tau;
+            }
+            d
+        };
+        // Keep `b` in GRID open-boundary (chain) order — that order is
+        // consistent with the solid's orientation. Align the rim's angular
+        // direction to `b` so the greedy stitch walks both the same way.
+        let b: Vec<(Point3, u32)> = pts.iter().map(|&(id, p)| (p, id)).collect();
+        let signed = |ring: &[(Point3, u32)]| -> f64 {
+            (0..ring.len())
+                .map(|i| wrap(angle(ring[(i + 1) % ring.len()].0) - angle(ring[i].0)))
+                .sum()
+        };
+        let b_dir = signed(&b);
+        let mut rim: Vec<(Point3, u32)> = h.rim.iter().map(|&(_, id, p)| (p, id)).collect();
+        if signed(&rim) * b_dir < 0.0 {
+            rim.reverse();
+        }
+        stitch_rings(&b, &rim, forward, mesh);
+    }
+    true
+}
+
+/// Triangulate the band between two closed rings — OUTER `bound` and INNER
+/// `rim` — each an ordered `(pos, mesh_id)` loop going the SAME direction (CCW
+/// about the hole axis). Greedy shortest-diagonal advance: at each step pick the
+/// triangle that adds the shorter new diagonal, so it is robust to a jagged
+/// boundary (no reliance on angular monotonicity). Winding is set for the
+/// outward normal, flipped by `forward`.
+fn stitch_rings(
+    bound: &[(Point3, u32)],
+    rim: &[(Point3, u32)],
+    forward: bool,
+    mesh: &mut TriangleMesh,
+) {
+    let (nb, nr) = (bound.len(), rim.len());
+    if nb < 2 || nr < 2 {
+        return;
+    }
+    // Align: rim index closest in 3D to bound[0].
+    let k0 = (0..nr)
+        .min_by(|&a, &b| {
+            (rim[a].0 - bound[0].0)
+                .magnitude()
+                .partial_cmp(&(rim[b].0 - bound[0].0).magnitude())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(0);
+
+    let mut i = 0usize; // steps taken along bound
+    let mut k = 0usize; // steps taken along rim
+                        // The bound ring is walked in the grid's open-boundary order, so a stitch
+                        // triangle must traverse a shared bound edge as its TWIN — the opposite
+                        // winding to the grid quads, hence the inverted branch vs the grid emit.
+    let mut emit = |a: u32, b: u32, c: u32, mesh: &mut TriangleMesh| {
+        if forward {
+            mesh.add_triangle(a, c, b);
+        } else {
+            mesh.add_triangle(a, b, c);
+        }
+    };
+    while i < nb || k < nr {
+        let bi = bound[i % nb];
+        let rk = rim[(k0 + k) % nr];
+        let advance_bound = if i >= nb {
+            false
+        } else if k >= nr {
+            true
+        } else {
+            let b_next = bound[(i + 1) % nb].0;
+            let r_next = rim[(k0 + k + 1) % nr].0;
+            (b_next - rk.0).magnitude() <= (bi.0 - r_next).magnitude()
+        };
+        if advance_bound {
+            let b_next = bound[(i + 1) % nb];
+            emit(bi.1, b_next.1, rk.1, mesh);
+            i += 1;
+        } else {
+            let r_next = rim[(k0 + k + 1) % nr];
+            emit(bi.1, r_next.1, rk.1, mesh);
+            k += 1;
+        }
+    }
+}
+
 fn tessellate_spherical_face(
     face: &Face,
     model: &BRepModel,
@@ -984,6 +1327,11 @@ fn tessellate_spherical_face(
     // membership-gated grid below. Falls through for untrimmed / multi-loop
     // sphere faces.
     if tessellate_spherical_cap(face, model, surface, _cache, params, mesh) {
+        return;
+    }
+    // Multi-hole central region: sphere minus N caps, grid + boundary-loop
+    // stitch to each hole's rim.
+    if tessellate_spherical_central(face, model, surface, _cache, params, mesh) {
         return;
     }
 
