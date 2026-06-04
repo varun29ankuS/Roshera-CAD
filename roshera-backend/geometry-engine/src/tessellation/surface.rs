@@ -516,7 +516,22 @@ fn tessellate_planar_face(
     // midpoint — at that point the loop is degenerate so any normal
     // is acceptable; the ear-clipper will reject the polygon anyway.
     let newell_n = newell_normal(&all_vertices[outer_start..outer_end]);
-    let normal = if let Some(n) = newell_n {
+    let normal = if let Some(mut n) = newell_n {
+        // Newell's normal flips with the outer loop's stored CCW/CW winding.
+        // For a face whose entire outer loop is a single CUT circle (a boolean
+        // inner-disk fragment), that stored direction is arbitrary, so Newell
+        // can point inward — flipping the disk and breaking the weld with the
+        // adjoining curved face. A true `Plane` surface has a reliable constant
+        // normal, so align Newell to it before applying the orientation sign.
+        // (RuledSurface-planar faces keep the Newell-only path — their
+        // analytic normal at a UV midpoint is the unreliable one.)
+        if surface.type_name() == "Plane" {
+            if let Ok(eval) = surface.evaluate_full(0.0, 0.0) {
+                if n.dot(&eval.normal) < 0.0 {
+                    n = -n;
+                }
+            }
+        }
         n * face.orientation.sign()
     } else {
         let (u_range, v_range) = surface.parameter_bounds();
@@ -1243,7 +1258,7 @@ fn tessellate_spherical_central(
         if signed(&rim) * b_dir < 0.0 {
             rim.reverse();
         }
-        stitch_rings(&b, &rim, forward, mesh);
+        stitch_rings(&b, &rim, o, osign, mesh);
     }
     true
 }
@@ -1257,7 +1272,8 @@ fn tessellate_spherical_central(
 fn stitch_rings(
     bound: &[(Point3, u32)],
     rim: &[(Point3, u32)],
-    forward: bool,
+    sphere_center: Point3,
+    osign: f64,
     mesh: &mut TriangleMesh,
 ) {
     let (nb, nr) = (bound.len(), rim.len());
@@ -1276,16 +1292,27 @@ fn stitch_rings(
 
     let mut i = 0usize; // steps taken along bound
     let mut k = 0usize; // steps taken along rim
-                        // The bound ring is walked in the grid's open-boundary order, so a stitch
-                        // triangle must traverse a shared bound edge as its TWIN — the opposite
-                        // winding to the grid quads, hence the inverted branch vs the grid emit.
-    let mut emit = |a: u32, b: u32, c: u32, mesh: &mut TriangleMesh| {
-        if forward {
-            mesh.add_triangle(a, c, b);
-        } else {
-            mesh.add_triangle(a, b, c);
-        }
-    };
+                        // Wind each triangle CCW under its OUTWARD normal (radial × osign). By the
+                        // manifold-orientation theorem this is automatically consistent with the grid
+                        // bulk AND the adjoining planar disks/annuli (all wound CCW under their own
+                        // outward normals), regardless of the rings' traversal direction — so the
+                        // central twins whatever box fragment the operation kept (disk for ∩, annulus
+                        // for ∖).
+    let mut emit =
+        |a: (Point3, u32), b: (Point3, u32), c: (Point3, u32), mesh: &mut TriangleMesh| {
+            let centroid = Point3::new(
+                (a.0.x + b.0.x + c.0.x) / 3.0,
+                (a.0.y + b.0.y + c.0.y) / 3.0,
+                (a.0.z + b.0.z + c.0.z) / 3.0,
+            );
+            let outward = (centroid - sphere_center) * osign;
+            let n = (b.0 - a.0).cross(&(c.0 - a.0));
+            if n.dot(&outward) >= 0.0 {
+                mesh.add_triangle(a.1, b.1, c.1);
+            } else {
+                mesh.add_triangle(a.1, c.1, b.1);
+            }
+        };
     while i < nb || k < nr {
         let bi = bound[i % nb];
         let rk = rim[(k0 + k) % nr];
@@ -1300,11 +1327,11 @@ fn stitch_rings(
         };
         if advance_bound {
             let b_next = bound[(i + 1) % nb];
-            emit(bi.1, b_next.1, rk.1, mesh);
+            emit(bi, b_next, rk, mesh);
             i += 1;
         } else {
             let r_next = rim[(k0 + k + 1) % nr];
-            emit(bi.1, r_next.1, rk.1, mesh);
+            emit(bi, r_next, rk, mesh);
             k += 1;
         }
     }
