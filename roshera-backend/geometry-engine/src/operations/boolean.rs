@@ -3041,9 +3041,19 @@ fn split_faces_along_curves(
     }
 
     // Split each face, carrying its origin solid through to the SplitFace.
+    // Iterate in SORTED face-id order: `face_curves` is a HashMap whose order is
+    // seeded per process, and that order becomes the order of the `split_faces`
+    // Vec — which every downstream order-sensitive pass (T-junction healing,
+    // edge canonicalisation, adjacency grouping) consumes. A non-deterministic
+    // face order makes a fragile weld resolve differently run-to-run (the sphere
+    // corner-poke ∪ occasionally detaching a box corner, comp=2). Sorting makes
+    // the whole Boolean reproducible.
     let intersected_faces: HashSet<FaceId> = face_curves.keys().copied().collect();
     let intersected_count = intersected_faces.len();
-    for (face_id, (origin_solid, curves)) in face_curves {
+    let mut ordered_face_curves: Vec<(FaceId, (SolidId, Vec<CurveId>))> =
+        face_curves.into_iter().collect();
+    ordered_face_curves.sort_by_key(|(fid, _)| *fid);
+    for (face_id, (origin_solid, curves)) in ordered_face_curves {
         let before = split_faces.len();
         let faces = split_face_by_curves(model, face_id, origin_solid, &curves, options)?;
         let produced = faces.len();
@@ -3152,6 +3162,170 @@ fn add_non_intersecting_faces(
     Ok(())
 }
 
+/// Walk the arrangement of MUTUALLY-INTERSECTING cut circles on a sphere into
+/// its face loops (a spherical DCEL traversal).
+///
+/// When the cut circles intersect (e.g. a sphere poking a box CORNER: the three
+/// face planes meeting at each corner cut three circles that cross), the circles
+/// are pre-split into arcs at their mutual intersection vertices. Those arcs tile
+/// the sphere into spherical polygons; the simple "cap + central" builder cannot
+/// represent them (its caps would be whole circles that overlap). This walks the
+/// arcs into oriented face loops the same way a planar DCEL does, but measuring
+/// turn angles in the SPHERE'S TANGENT PLANE at each shared vertex (the only
+/// place the planar `(u, v)` arrangement fails — circles cross the seam/poles).
+///
+/// At each vertex the next arc in a face is the one immediately clockwise from
+/// the reverse of the arriving arc, in the tangent frame oriented by the outward
+/// radial normal — so every loop is wound CCW seen from outside the sphere.
+/// Returns one `(EdgeId, forward)` loop per arrangement face.
+fn sphere_arrangement_faces(
+    model: &BRepModel,
+    center: Point3,
+    arc_edges: &[EdgeId],
+) -> Vec<Vec<(EdgeId, bool)>> {
+    use crate::primitives::curve::Circle;
+
+    let pos = |vid: VertexId| -> Option<Point3> {
+        model
+            .vertices
+            .get_position(vid)
+            .map(|p| Point3::new(p[0], p[1], p[2]))
+    };
+    // Circle tangent at point `p` (unit, +parameter direction): axis × (p − cc).
+    let tangent_at = |cid: CurveId, p: Point3| -> Option<Vector3> {
+        let circle = model.curves.get(cid)?.as_any().downcast_ref::<Circle>()?;
+        circle
+            .normal()
+            .cross(&(p - circle.center()))
+            .normalize()
+            .ok()
+    };
+
+    // Each arc contributes two directed half-edges. For a half-edge we record its
+    // start vertex and the angle of its OUTGOING tangent in the start vertex's
+    // tangent frame (frame ⟂ to the outward radial normal there).
+    #[derive(Clone, Copy)]
+    struct HEdge {
+        eid: EdgeId,
+        fwd: bool,
+        start: VertexId,
+        end: VertexId,
+        ang: f64,
+    }
+    let frame = |v: Point3| -> (Vector3, Vector3) {
+        let n = (v - center).normalize().unwrap_or(Vector3::Z);
+        let helper = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+            Vector3::X
+        } else if n.y.abs() <= n.z.abs() {
+            Vector3::Y
+        } else {
+            Vector3::Z
+        };
+        let t1 = (helper - n * helper.dot(&n))
+            .normalize()
+            .unwrap_or(Vector3::X);
+        (t1, n.cross(&t1))
+    };
+
+    let mut hedges: Vec<HEdge> = Vec::new();
+    for &eid in arc_edges {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        let (a, b) = (edge.start_vertex, edge.end_vertex);
+        let (Some(pa), Some(pb)) = (pos(a), pos(b)) else {
+            continue;
+        };
+        // Forward half-edge a→b: outgoing tangent at a is +circle_tangent(a).
+        if let Some(t) = tangent_at(edge.curve_id, pa) {
+            let (t1, t2) = frame(pa);
+            hedges.push(HEdge {
+                eid,
+                fwd: true,
+                start: a,
+                end: b,
+                ang: t.dot(&t2).atan2(t.dot(&t1)),
+            });
+        }
+        // Backward half-edge b→a: outgoing tangent at b is −circle_tangent(b).
+        if let Some(t) = tangent_at(edge.curve_id, pb) {
+            let (t1, t2) = frame(pb);
+            let td = t * -1.0;
+            hedges.push(HEdge {
+                eid,
+                fwd: false,
+                start: b,
+                end: a,
+                ang: td.dot(&t2).atan2(td.dot(&t1)),
+            });
+        }
+    }
+    if hedges.is_empty() {
+        return Vec::new();
+    }
+
+    // Outgoing half-edges per vertex, sorted CCW by angle.
+    let mut out_by_v: HashMap<VertexId, Vec<usize>> = HashMap::new();
+    for (i, h) in hedges.iter().enumerate() {
+        out_by_v.entry(h.start).or_default().push(i);
+    }
+    for v in out_by_v.values_mut() {
+        v.sort_by(|&i, &j| {
+            hedges[i]
+                .ang
+                .partial_cmp(&hedges[j].ang)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    let half_index = |eid: EdgeId, fwd: bool| -> Option<usize> {
+        hedges.iter().position(|h| h.eid == eid && h.fwd == fwd)
+    };
+
+    // Face walk: from half-edge H (u→v), the next is the outgoing edge at v that
+    // is immediately CLOCKWISE from H's reverse twin (v→u) — the predecessor in
+    // the CCW-sorted ring.
+    let mut visited = vec![false; hedges.len()];
+    let mut faces: Vec<Vec<(EdgeId, bool)>> = Vec::new();
+    for start_h in 0..hedges.len() {
+        if visited[start_h] {
+            continue;
+        }
+        let mut loop_edges: Vec<(EdgeId, bool)> = Vec::new();
+        let mut cur = start_h;
+        let mut guard = 0usize;
+        loop {
+            if visited[cur] {
+                break;
+            }
+            visited[cur] = true;
+            loop_edges.push((hedges[cur].eid, hedges[cur].fwd));
+            // Reverse twin starts at cur.end.
+            let v = hedges[cur].end;
+            let Some(twin) = half_index(hedges[cur].eid, !hedges[cur].fwd) else {
+                break;
+            };
+            let ring = match out_by_v.get(&v) {
+                Some(r) if !r.is_empty() => r,
+                _ => break,
+            };
+            let twin_pos = match ring.iter().position(|&i| i == twin) {
+                Some(p) => p,
+                None => break,
+            };
+            let next = ring[(twin_pos + ring.len() - 1) % ring.len()];
+            cur = next;
+            guard += 1;
+            if cur == start_h || guard > hedges.len() * 2 + 4 {
+                break;
+            }
+        }
+        if loop_edges.len() >= 2 {
+            faces.push(loop_edges);
+        }
+    }
+    faces
+}
+
 /// Sphere-specific region builder for the closed-surface curved-Boolean case.
 ///
 /// A sphere (untrimmed — `boundary_edges` empty) cut by N coplanar circles
@@ -3187,9 +3361,13 @@ fn split_sphere_face_by_circles(
 
     // Group the graph's circle edges by curve id — a cut circle's pre-split
     // sub-edges all reference the same `Circle` curve. BTreeMap for determinism.
+    // Sorted edge iteration so the per-curve arc lists (and the arrangement walk
+    // seeded from them) are deterministic regardless of the HashMap seed.
+    let mut sorted_eids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+    sorted_eids.sort_unstable();
     let mut by_curve: std::collections::BTreeMap<CurveId, Vec<EdgeId>> =
         std::collections::BTreeMap::new();
-    for &eid in graph.edges.keys() {
+    for eid in sorted_eids {
         let Some(edge) = model.edges.get(eid) else {
             continue;
         };
@@ -3201,6 +3379,65 @@ fn split_sphere_face_by_circles(
     }
     if by_curve.is_empty() {
         return None;
+    }
+
+    // Detect MUTUALLY-INTERSECTING circles: a vertex touched by arcs of two or
+    // more distinct cut circles is a circle–circle crossing. The disjoint-cap
+    // builder below is only valid for non-crossing circles; when circles cross
+    // (corner poke), walk the full spherical arrangement instead.
+    {
+        let mut vid_curves: HashMap<VertexId, std::collections::BTreeSet<CurveId>> = HashMap::new();
+        for (&cid, eids) in &by_curve {
+            for &eid in eids {
+                if let Some(edge) = model.edges.get(eid) {
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        vid_curves.entry(vid).or_default().insert(cid);
+                    }
+                }
+            }
+        }
+        let intersecting = vid_curves.values().any(|s| s.len() >= 2);
+        if intersecting {
+            let arc_edges: Vec<EdgeId> = by_curve.values().flatten().copied().collect();
+            let face_loops = sphere_arrangement_faces(model, center, &arc_edges);
+            if face_loops.len() < 2 {
+                return None;
+            }
+            let mut faces: Vec<SplitFace> = Vec::new();
+            for loop_edges in face_loops {
+                // Interior point: mean of the loop's arc midpoints, projected to
+                // the sphere.
+                let mut acc = Vector3::ZERO;
+                let mut cnt = 0.0;
+                for &(eid, _) in &loop_edges {
+                    if let Some(edge) = model.edges.get(eid) {
+                        if let Some(curve) = model.curves.get(edge.curve_id) {
+                            let t = 0.5 * (edge.param_range.start + edge.param_range.end);
+                            if let Ok(p) = curve.evaluate(t) {
+                                acc = acc + (p.position - Point3::ORIGIN);
+                                cnt += 1.0;
+                            }
+                        }
+                    }
+                }
+                if cnt == 0.0 {
+                    continue;
+                }
+                let mean = Point3::ORIGIN + acc * (1.0 / cnt);
+                let dir = (mean - center).normalize().unwrap_or(Vector3::Z);
+                let interior = center + dir * radius;
+                faces.push(SplitFace {
+                    original_face: face_id,
+                    surface: surface_id,
+                    boundary_edges: loop_edges,
+                    classification: FaceClassification::OnBoundary,
+                    from_solid: origin_solid,
+                    interior_point: Some(interior),
+                    inner_loops: Vec::new(),
+                });
+            }
+            return (!faces.is_empty()).then_some(faces);
+        }
     }
 
     // Order one circle's sub-edges into a connected (edge, forward) loop by
@@ -4151,6 +4388,63 @@ fn split_face_by_curves(
             );
         }
         return Ok(torus_faces);
+    }
+
+    // Clip cut arcs to the face boundary (planar faces only).
+    //
+    // A CLOSED cut curve (e.g. a sphere–plane section circle) that crosses this
+    // face's boundary is split at the crossings by `compute_edge_intersections`,
+    // leaving arcs that run OUTSIDE the face. Those spurious arcs spawn extra
+    // DCEL regions whose centroid interior point lands outside the face, so the
+    // downstream classification flickers Inside/Outside and the Boolean
+    // over-includes (the sphere corner-poke ∩ + non-determinism). Drop every
+    // Splitting edge whose midpoint lies outside the face's (unmodified-until-
+    // reconstruction) outer boundary. A legitimately-imprinted cut always lies
+    // inside the face, so only the out-of-face arcs are removed.
+    if model
+        .surfaces
+        .get(surface_id)
+        .map(|s| {
+            matches!(
+                s.surface_type(),
+                crate::primitives::surface::SurfaceType::Plane
+            )
+        })
+        .unwrap_or(false)
+    {
+        let mut to_drop: Vec<EdgeId> = Vec::new();
+        for (&eid, ge) in graph.edges.iter() {
+            if ge.edge_type != EdgeType::Splitting {
+                continue;
+            }
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let t_mid = 0.5 * (edge.param_range.start + edge.param_range.end);
+            let Ok(mp) = curve.evaluate(t_mid) else {
+                continue;
+            };
+            if let Ok(false) =
+                is_point_in_face(model, face_id, &mp.position, &options.common.tolerance)
+            {
+                to_drop.push(eid);
+            }
+        }
+        if pipeline_trace_enabled() && !to_drop.is_empty() {
+            eprintln!(
+                "[bool]     clip-to-face: dropped {} out-of-face cut arcs on face={face_id:?}",
+                to_drop.len()
+            );
+        }
+        for eid in to_drop {
+            graph.edges.remove(&eid);
+            for node in graph.nodes.values_mut() {
+                node.incident_edges.remove(&eid);
+            }
+        }
     }
 
     // Build face loops via DCEL planar arrangement.
@@ -6898,8 +7192,14 @@ pub(super) fn compute_edge_intersections(
     // Resolve vertex references from model for existing edges
     graph.resolve_vertices(model);
 
-    // Collect edge IDs to iterate (avoid borrow issues)
-    let edge_ids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+    // Collect edge IDs to iterate (avoid borrow issues). SORTED so the
+    // intersection vertices and split sub-edges are created in a deterministic
+    // order: `graph.edges` is a HashMap whose iteration order is seeded per
+    // process, and downstream edge ids flow into heal/canonicalise/weld, where
+    // an order difference can flip a fragile weld (the sphere corner-poke ∪
+    // occasionally detaching the box corners across runs).
+    let mut edge_ids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+    edge_ids.sort_unstable();
 
     // Find intersections between all edge pairs that share no vertex.
     // The trailing `f64` is the geometric residual from
@@ -7268,9 +7568,17 @@ fn find_curve_curve_intersections(
         let mut best_t_b = j as f64 / N as f64;
         let mut best_dist = grid[i][j];
 
+        // Pattern search: halve the step ONLY when no neighbour improves;
+        // keep walking at the current step while it does. Halving every
+        // iteration (the previous behaviour) shrinks the reach geometrically,
+        // so a transversal crossing more than ~2× the initial step away in
+        // (s, t) — common when one curve is much "faster" than the other, e.g.
+        // a circle crossing a straight box edge — never converges below
+        // tolerance and is silently dropped, leaving the cut un-imprinted.
         let mut step = 0.5 / N as f64;
         let min_step = 1e-14_f64;
-        for _ in 0..60 {
+        for _ in 0..400 {
+            let mut improved = false;
             for &(dt_a, dt_b) in &[
                 (step, 0.0),
                 (-step, 0.0),
@@ -7290,12 +7598,18 @@ fn find_curve_curve_intersections(
                     best_dist = dist;
                     best_t_a = t_a;
                     best_t_b = t_b;
+                    improved = true;
                 }
             }
-            if best_dist < tolerance.distance() * 0.1 || step < min_step {
+            if best_dist < tolerance.distance() * 0.1 {
                 break;
             }
-            step *= 0.5;
+            if !improved {
+                if step < min_step {
+                    break;
+                }
+                step *= 0.5;
+            }
         }
 
         refined.push((best_t_a, best_t_b, best_dist));
@@ -7568,6 +7882,24 @@ fn merge_same_origin_fragments(
             None => continue,
         };
 
+        // Skip closed-surface (sphere) splits. `split_sphere_face_by_circles`
+        // already emits a COMPLETE partition — either disjoint caps + a central
+        // region, or, for mutually-intersecting cut circles (corner poke), the
+        // full spherical arrangement. Those faces tile the sphere; none is a
+        // hole of another. The UV-polygon containment test below is meant for
+        // planar face-with-hole nesting (e.g. a hex cut in a box cap) and
+        // misfires on sphere faces (their (u, v) projections wrap and overlap),
+        // wrongly nesting several arrangement faces as inner loops of one —
+        // which then falls to the non-conforming fallback mesher and leaves an
+        // open seam (sphere corner-poke ∪).
+        if surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Sphere>()
+            .is_some()
+        {
+            continue;
+        }
+
         // 2. Project each fragment's boundary cycle to UV. The merge
         // test below is polygon-in-polygon (every inner vertex inside
         // outer), so the projected polygon is the only artifact we
@@ -7788,6 +8120,60 @@ fn point_inside_torus_solid(
     })
 }
 
+/// Exact analytic point-membership for a solid that is a SINGLE sphere face.
+/// The ray-cast classifier is numerically borderline for a point lying just
+/// outside the sphere (a corner-poke box-corner sliver sits only ~0.02 beyond
+/// the surface), so its majority vote flickers Inside/Outside run-to-run,
+/// leaving the Boolean non-deterministic. `|p − centre|² ⪋ r²` is exact and
+/// stable. `None` ⇒ not a lone sphere, so the caller falls through.
+fn point_inside_sphere_solid(
+    model: &BRepModel,
+    solid: SolidId,
+    p: &Point3,
+    tolerance: &Tolerance,
+) -> Option<FaceClassification> {
+    use crate::primitives::surface::Sphere;
+    let faces = get_solid_faces(model, solid).ok()?;
+    if faces.is_empty() {
+        return None;
+    }
+    // A sphere solid may be ONE face (seam loop) or several (UV patches / pole
+    // caps); all share the same underlying sphere. Accept the solid only when
+    // every face is a sphere with a common centre + radius.
+    let mut centre = None;
+    let mut radius = 0.0_f64;
+    for &fid in &faces {
+        let surf = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))?;
+        let sphere = surf.as_any().downcast_ref::<Sphere>()?;
+        match centre {
+            None => {
+                centre = Some(sphere.center);
+                radius = sphere.radius;
+            }
+            Some(c) => {
+                if (sphere.center - c).magnitude() > tolerance.distance()
+                    || (sphere.radius - radius).abs() > tolerance.distance()
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    let centre = centre?;
+    let d = (*p - centre).magnitude();
+    let band = tolerance.distance() * radius.max(1.0);
+    Some(if (d - radius).abs() <= band {
+        FaceClassification::OnBoundary
+    } else if d < radius {
+        FaceClassification::Inside
+    } else {
+        FaceClassification::Outside
+    })
+}
+
 fn classify_face_relative_to_solid(
     model: &BRepModel,
     face: &SplitFace,
@@ -7800,6 +8186,11 @@ fn classify_face_relative_to_solid(
     // ray-cast below is unreliable against a torus and drops the box-wall disk
     // caps of a rim poke.
     if let Some(cls) = point_inside_torus_solid(model, solid, &test_point, tolerance) {
+        return Ok(cls);
+    }
+    // Likewise a lone sphere: the ray-cast flickers for near-tangent corner
+    // slivers; the implicit test is exact and deterministic.
+    if let Some(cls) = point_inside_sphere_solid(model, solid, &test_point, tolerance) {
         return Ok(cls);
     }
 
@@ -9828,6 +10219,43 @@ mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::surface::{Cylinder, Plane, Sphere};
     use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+    /// A circle that crosses a straight line transversally must report BOTH
+    /// crossings. Regression guard for the pattern-search refinement in
+    /// `find_curve_curve_intersections`: the previous step-halving-every-iteration
+    /// refinement converged only for crossings within ~2× the seed step, so a
+    /// circle crossing a box edge (the sphere corner-poke case) refined to a
+    /// non-zero residual and was dropped, leaving the planar face un-imprinted.
+    #[test]
+    fn circle_line_transversal_crossings_found() {
+        use crate::primitives::curve::{Circle, Line};
+        // Circle centre (0,2,0), normal +Y, r=2.75 in the x-z plane; line at
+        // x=2, y=2, z∈[-2,2]. Cross at (2,2,±1.887).
+        let circle = Circle::new(
+            Point3::new(0.0, 2.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            2.75,
+        )
+        .expect("circle");
+        let line = Line::new(Point3::new(2.0, 2.0, -2.0), Point3::new(2.0, 2.0, 2.0));
+        let tol = Tolerance::default();
+        let hits = find_curve_curve_intersections(&circle, &line, &tol).expect("xsect");
+        assert_eq!(hits.len(), 2, "both transversal crossings must be found");
+        for (ta, _tb, d) in &hits {
+            assert!(
+                *d < tol.distance(),
+                "crossing residual {d:.2e} above tolerance"
+            );
+            let p = circle.point_at(*ta).unwrap();
+            assert!(
+                (p.x - 2.0).abs() < 1e-4 && (p.z.abs() - 1.887).abs() < 1e-2,
+                "crossing at unexpected point ({:.3},{:.3},{:.3})",
+                p.x,
+                p.y,
+                p.z
+            );
+        }
+    }
 
     // =============================================
     // Spherical circular-trim membership calibration

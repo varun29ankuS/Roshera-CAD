@@ -373,6 +373,9 @@ mod tests {
         ("torus/rim-poke", 0),
         ("torus/rim-poke", 1),
         ("torus/rim-poke", 2),
+        ("sphere/corner-poke", 0),
+        ("sphere/corner-poke", 1),
+        ("sphere/corner-poke", 2),
     ];
 
     /// Enforced regression gate: every cell in [`GREEN_CELLS`] passes BOTH
