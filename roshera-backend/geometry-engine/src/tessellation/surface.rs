@@ -189,7 +189,14 @@ pub fn tessellate_face(
         }
         "Sphere" => tessellate_spherical_face(face, model, params, cache, mesh),
         "Cone" => tessellate_conical_face(face, model, params, cache, mesh),
-        "Torus" => tessellate_toroidal_face(face, model, params, cache, mesh),
+        "Torus" => {
+            // Trimmed torus (boolean rim-poke main body / bump) → conforming
+            // grid+stitch mesher; untrimmed full torus falls through to the fast
+            // structured grid.
+            if !tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
+                tessellate_toroidal_face(face, model, params, cache, mesh);
+            }
+        }
         "NURBS" => tessellate_nurbs_face(face, model, params, cache, mesh),
         // Revolve emits each curved wall as thin per-segment SurfaceOfRevolution
         // wedge faces; the generic curved-CDT path fails on these high-aspect
@@ -1292,25 +1299,23 @@ fn stitch_rings(
 
     let mut i = 0usize; // steps taken along bound
     let mut k = 0usize; // steps taken along rim
-                        // Wind each triangle CCW under its OUTWARD normal (`outward_at`). By the
-                        // manifold-orientation theorem this is automatically consistent with the grid
-                        // bulk AND the adjoining planar faces (all wound CCW under their own outward
-                        // normals), regardless of the rings' traversal direction.
-    let mut emit =
-        |a: (Point3, u32), b: (Point3, u32), c: (Point3, u32), mesh: &mut TriangleMesh| {
-            let centroid = Point3::new(
-                (a.0.x + b.0.x + c.0.x) / 3.0,
-                (a.0.y + b.0.y + c.0.y) / 3.0,
-                (a.0.z + b.0.z + c.0.z) / 3.0,
-            );
-            let outward = outward_at(centroid);
-            let n = (b.0 - a.0).cross(&(c.0 - a.0));
-            if n.dot(&outward) >= 0.0 {
-                mesh.add_triangle(a.1, b.1, c.1);
-            } else {
-                mesh.add_triangle(a.1, c.1, b.1);
-            }
-        };
+
+    // Collect the strip triangles in a fixed "natural" vertex order first, then
+    // wind them all by ONE band-wide decision. A per-triangle geometric flip
+    // (`n·outward`) is numerically unstable when the two rings are very unequal
+    // in length (e.g. a torus bump: ~140 grid-boundary points vs ~700 rim
+    // points) — the greedy match then emits thin sliver triangles whose normal
+    // is tiny and direction-noisy, so the sign of `n·outward` is effectively
+    // random and adjacent slivers disagree, leaving inconsistent directed edges.
+    // The strip between two consistently-oriented rings has a single correct
+    // winding, so we vote: sum the UNNORMALISED `n·outward` over every triangle
+    // (slivers carry near-zero weight, well-shaped triangles decide the sign),
+    // then apply that one flip uniformly. Adjacent triangles share a diagonal
+    // traversed in opposite directions under the common natural order, so a
+    // single flip keeps the whole strip consistent — and consistent with the
+    // grid bulk and the adjoining planar faces by the manifold-orientation
+    // theorem.
+    let mut tris: Vec<[(Point3, u32); 3]> = Vec::with_capacity(nb + nr);
     while i < nb || k < nr {
         let bi = bound[i % nb];
         let rk = rim[(k0 + k) % nr];
@@ -1325,12 +1330,31 @@ fn stitch_rings(
         };
         if advance_bound {
             let b_next = bound[(i + 1) % nb];
-            emit(bi, b_next, rk, mesh);
+            tris.push([bi, b_next, rk]);
             i += 1;
         } else {
             let r_next = rim[(k0 + k + 1) % nr];
-            emit(bi, r_next, rk, mesh);
+            tris.push([bi, r_next, rk]);
             k += 1;
+        }
+    }
+
+    let mut vote = 0.0;
+    for t in &tris {
+        let centroid = Point3::new(
+            (t[0].0.x + t[1].0.x + t[2].0.x) / 3.0,
+            (t[0].0.y + t[1].0.y + t[2].0.y) / 3.0,
+            (t[0].0.z + t[1].0.z + t[2].0.z) / 3.0,
+        );
+        let n = (t[1].0 - t[0].0).cross(&(t[2].0 - t[0].0));
+        vote += n.dot(&outward_at(centroid));
+    }
+    let flip = vote < 0.0;
+    for t in &tris {
+        if flip {
+            mesh.add_triangle(t[0].1, t[2].1, t[1].1);
+        } else {
+            mesh.add_triangle(t[0].1, t[1].1, t[2].1);
         }
     }
 }
@@ -2152,6 +2176,362 @@ fn estimate_cone_height(surface: &dyn Surface, v_min: f64, v_max: f64) -> f64 {
 }
 
 /// Tessellate a toroidal face with proper handling of both parameters
+/// Conforming tessellation of a TRIMMED torus face produced by a boolean rim-
+/// poke — the main body (torus minus the bumps, carrying the cut ovals as inner
+/// holes) or a single bump (bounded by one oval). Mirrors
+/// [`tessellate_spherical_central`]: a grid over the DOUBLY-periodic (u, v)
+/// domain gated by [`is_point_inside_face`] (so the oval holes are excluded),
+/// periodic quads wound CCW under the torus's true outward normal, then each
+/// open grid-boundary loop is stitched to the matching oval rim sampled VERBATIM
+/// from the `EdgeSampleCache` — so the torus rim is bit-identical to the box-
+/// wall hole's rim and welds. Returns `false` (→ caller falls back to the naive
+/// grid) when the face carries no cut oval to stitch (the untrimmed full torus).
+fn tessellate_toroidal_trimmed(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Torus;
+    use std::collections::{HashMap, HashSet};
+
+    let Some(torus) = surface.as_any().downcast_ref::<Torus>() else {
+        return false;
+    };
+    // Only the boolean split path sets a non-default param window / inner loops;
+    // an untrimmed full torus (commutator outer loop, no inner loops, default
+    // domain) has no oval to stitch — let the fast grid handle it.
+    if torus.param_limits.is_some() {
+        return false;
+    }
+    let center = torus.center;
+    let axis = torus.axis;
+    let big_r = torus.major_radius;
+    let small_r = torus.minor_radius;
+    let ref_dir = torus.ref_dir;
+    let osign = face.orientation.sign();
+
+    // Rim loops to STITCH: a bump (no inner loops) stitches its single outer
+    // oval; the main body stitches its inner-loop ovals. The torus's own
+    // commutator seam (the main body's OUTER loop) is internal to the periodic
+    // grid — never a rim.
+    let rim_loop_ids: Vec<crate::primitives::r#loop::LoopId> = if face.inner_loops.is_empty() {
+        vec![face.outer_loop]
+    } else {
+        face.inner_loops.clone()
+    };
+
+    // True outward normal at p (away from the tube-centre circle), flipped by
+    // the face orientation so a Difference cavity winds inward.
+    let outward_at = move |p: Point3| -> Vector3 {
+        let rel = p - center;
+        let equ = rel - axis * rel.dot(&axis);
+        let major_pt = center + equ.normalize().unwrap_or(ref_dir) * big_r;
+        (p - major_pt).normalize().unwrap_or(axis) * osign
+    };
+
+    // Cache-sampled rim vertices added to the mesh, one ring per oval.
+    let mut rims: Vec<Vec<(Point3, u32)>> = Vec::new();
+    for &lid in &rim_loop_ids {
+        let Some(lp) = model.loops.get(lid) else {
+            return false;
+        };
+        let rim_pos = loop_rim_samples(lp, model, cache);
+        if rim_pos.len() < 3 {
+            return false;
+        }
+        // Reject the full-torus commutator masquerading as an "oval": its rim
+        // wraps the whole tube (spans the major circle), so its xy-extent is the
+        // full 2(R+r). A real oval is local (extent ≲ 2(s_max)).
+        let span = |f: &dyn Fn(&Point3) -> f64| -> f64 {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for p in &rim_pos {
+                let x = f(p);
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+            hi - lo
+        };
+        let ex = span(&|p| p.x).max(span(&|p| p.y));
+        if ex > 1.8 * big_r {
+            return false;
+        }
+        let pts: Vec<(Point3, u32)> = rim_pos
+            .iter()
+            .map(|&p| {
+                let normal = outward_at(p);
+                let id = mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal,
+                    uv: None,
+                });
+                (p, id)
+            })
+            .collect();
+        rims.push(pts);
+    }
+    if rims.is_empty() {
+        return false;
+    }
+
+    // Grid over [0, 2π]² (both u and v periodic), gated by membership.
+    let tau = std::f64::consts::TAU;
+    let n_u = arc_steps_for_quality(tau, big_r + small_r, params).max(24);
+    let n_v = arc_steps_for_quality(tau, small_r, params).max(12);
+    // Precompute the loop UV polygons ONCE — `is_point_inside_face` reprojects
+    // every loop per call, which over the grid is O(n_u·n_v · loops · samples ·
+    // closest_point) and dominated tessellation time (~80 s). The membership
+    // logic is identical (inside the outer loop, outside every inner hole;
+    // a degenerate loop = whole domain), just hoisted.
+    // Plane-side membership — exact and period-free.
+    //
+    // Each oval is the intersection of the torus with a FLAT cutting face, so it
+    // lies in a plane that cleanly separates the small "bump" cap (on the side
+    // away from the torus centre) from the body. Critically, the torus surface
+    // only ever crosses one of these planes WITHIN that oval's cap, so a global
+    // half-space test needs no in-polygon qualifier. Being purely 3-D it
+    // sidesteps the doubly-periodic (u, v) seam/branch wrapping that made a
+    // winding test either merge the four holes (single-branch miss) or punch a
+    // phantom hole into the body (a multi-translate grazing a neighbour's
+    // corner). The rim loops carried in `rims` are exactly these ovals: fit a
+    // plane to each, orient its normal away from the torus centre (toward the
+    // bump), then a BUMP face (no inner loops) keeps the cap PAST its single oval
+    // wall, while the BODY face keeps points on the body side (NOT past) of EVERY
+    // oval wall.
+    let oval_planes: Vec<(Point3, Vector3)> = rims
+        .iter()
+        .filter_map(|r| {
+            let pts: Vec<Point3> = r.iter().map(|&(p, _)| p).collect();
+            if pts.len() < 3 {
+                return None;
+            }
+            let np = pts.len() as f64;
+            let sum = pts.iter().fold(Point3::ORIGIN, |a, &p| {
+                Point3::new(a.x + p.x, a.y + p.y, a.z + p.z)
+            });
+            let c = Point3::new(sum.x / np, sum.y / np, sum.z / np);
+            let mut n = newell_normal(&pts)?;
+            if (c - center).dot(&n) < 0.0 {
+                n = n * -1.0;
+            }
+            Some((c, n))
+        })
+        .collect();
+    if oval_planes.is_empty() {
+        return false;
+    }
+    let is_body = !face.inner_loops.is_empty();
+    let inside = move |p: Point3| -> bool {
+        if is_body {
+            oval_planes.iter().all(|&(c, n)| (p - c).dot(&n) < 0.0)
+        } else {
+            oval_planes.iter().all(|&(c, n)| (p - c).dot(&n) >= 0.0)
+        }
+    };
+
+    let key = |i: usize, j: usize| -> u32 { (i * n_v + j) as u32 };
+    let mut gpos = vec![vec![Point3::ORIGIN; n_v]; n_u];
+    let mut gid = vec![vec![None::<u32>; n_v]; n_u];
+    for i in 0..n_u {
+        let u = tau * (i as f64) / (n_u as f64);
+        for j in 0..n_v {
+            let v = tau * (j as f64) / (n_v as f64);
+            let Ok(p) = surface.point_at(u, v) else {
+                continue;
+            };
+            gpos[i][j] = p;
+            if inside(p) {
+                let normal = outward_at(p);
+                gid[i][j] = Some(mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal,
+                    uv: None,
+                }));
+            }
+        }
+    }
+
+    // Emit periodic quads where all four corners are inside; record directed
+    // (i,j)-key edges in the EMITTED winding so the open boundary (a directed
+    // edge with no reverse twin) can be walked.
+    let mut dir_edges: HashMap<(u32, u32), i32> = HashMap::new();
+    for i in 0..n_u {
+        let i2 = (i + 1) % n_u;
+        for j in 0..n_v {
+            let j2 = (j + 1) % n_v;
+            if let (Some(a), Some(b), Some(d), Some(e)) =
+                (gid[i][j], gid[i2][j], gid[i][j2], gid[i2][j2])
+            {
+                let (ka, kb, kd, ke) = (key(i, j), key(i2, j), key(i, j2), key(i2, j2));
+                // Triangle vertices use MESH ids (`a`,`b`,…); the directed-edge
+                // map uses grid KEYS (`ka`,…) — distinct index spaces. Winding is
+                // FIXED, not per-triangle geometric (which was numerically noisy
+                // and made the mesh disagree with itself everywhere — 14k
+                // inconsistent edges): the (i,j),(i+1,j),(i,j+1) quad normal is
+                // ∂u×∂v, the torus's intrinsic OUTWARD normal, so the natural CCW
+                // order is outward for `osign > 0` (Union/Intersection) and is
+                // flipped for the `osign < 0` Difference cavity. The stitch band
+                // uses geometric winding and agrees by the manifold theorem.
+                let fwd = osign > 0.0;
+                let mut tri = |id: [u32; 3],
+                               kk: [u32; 3],
+                               de: &mut HashMap<(u32, u32), i32>,
+                               m: &mut TriangleMesh| {
+                    let (oid, ok) = if fwd {
+                        (id, kk)
+                    } else {
+                        ([id[0], id[2], id[1]], [kk[0], kk[2], kk[1]])
+                    };
+                    m.add_triangle(oid[0], oid[1], oid[2]);
+                    for w in 0..3 {
+                        *de.entry((ok[w], ok[(w + 1) % 3])).or_insert(0) += 1;
+                    }
+                };
+                tri([a, b, d], [ka, kb, kd], &mut dir_edges, mesh);
+                tri([b, e, d], [kb, ke, kd], &mut dir_edges, mesh);
+            }
+        }
+    }
+
+    // Open boundary: directed edges with no reverse twin → next-vertex chain.
+    let mut next: HashMap<u32, u32> = HashMap::new();
+    for (&(a, b), &cnt) in &dir_edges {
+        if cnt > 0 && !dir_edges.contains_key(&(b, a)) {
+            next.insert(a, b);
+        }
+    }
+    let decode = |k: u32| -> (Point3, u32) {
+        let i = (k as usize) / n_v;
+        let j = (k as usize) % n_v;
+        (gpos[i][j], gid[i][j].unwrap_or(0))
+    };
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut loops: Vec<Vec<u32>> = Vec::new();
+    for &start in next.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut cur = start;
+        let mut guard = 0;
+        loop {
+            if !visited.insert(cur) {
+                break;
+            }
+            chain.push(cur);
+            cur = match next.get(&cur) {
+                Some(&n) => n,
+                None => break,
+            };
+            guard += 1;
+            if guard > n_u * n_v + 4 || cur == start {
+                break;
+            }
+        }
+        if chain.len() >= 3 {
+            loops.push(chain);
+        }
+    }
+
+    // Pair each grid-boundary loop with its oval rim as a BIJECTION. A per-loop
+    // independent nearest-centroid pick is not injective: two boundary loops can
+    // both choose the same rim, so that rim is stitched twice (its edges then
+    // border the disk cap PLUS two stitch bands → non-manifold) while another
+    // rim is stitched by a far-away loop, dragging a band across the torus.
+    // Greedy global assignment over all (loop, rim) centroid distances, smallest
+    // first, each rim used once, fixes both: every hole stitches to the rim that
+    // actually bounds it.
+    let centroid = |pts: &[(Point3, u32)]| -> Point3 {
+        let n = pts.len().max(1) as f64;
+        let s = pts.iter().fold(Point3::ORIGIN, |a, &(p, _)| {
+            Point3::new(a.x + p.x, a.y + p.y, a.z + p.z)
+        });
+        Point3::new(s.x / n, s.y / n, s.z / n)
+    };
+    let bounds: Vec<Vec<(Point3, u32)>> = loops
+        .iter()
+        .map(|chain| chain.iter().map(|&k| decode(k)).collect())
+        .collect();
+    let bound_cen: Vec<Point3> = bounds.iter().map(|b| centroid(b)).collect();
+    let rim_cen: Vec<Point3> = rims.iter().map(|r| centroid(r)).collect();
+    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+    for (bi, bc) in bound_cen.iter().enumerate() {
+        for (ri, rc) in rim_cen.iter().enumerate() {
+            pairs.push(((*rc - *bc).magnitude(), bi, ri));
+        }
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut assign: Vec<Option<usize>> = vec![None; bounds.len()];
+    let mut rim_used = vec![false; rims.len()];
+    for (_, bi, ri) in pairs {
+        if assign[bi].is_none() && !rim_used[ri] {
+            assign[bi] = Some(ri);
+            rim_used[ri] = true;
+        }
+    }
+
+    for (bidx, bound) in bounds.iter().enumerate() {
+        let bcen = bound_cen[bidx];
+        let Some(rim) = assign[bidx].and_then(|ri| rims.get(ri)) else {
+            continue;
+        };
+        // Align rim direction to the bound: best-fit oval-plane normal, compare
+        // signed angle sums; reverse the rim if opposite (greedy stitch assumes
+        // both rings advance the same way).
+        let plane_n = {
+            let mut nrm = Vector3::ZERO;
+            let n = rim.len();
+            for i in 0..n {
+                let a = rim[i].0 - bcen;
+                let b = rim[(i + 1) % n].0 - bcen;
+                nrm = nrm + a.cross(&b);
+            }
+            nrm.normalize().unwrap_or(axis)
+        };
+        let (e1, e2) = {
+            let helper = if plane_n.x.abs() <= plane_n.y.abs() && plane_n.x.abs() <= plane_n.z.abs()
+            {
+                Vector3::X
+            } else if plane_n.y.abs() <= plane_n.z.abs() {
+                Vector3::Y
+            } else {
+                Vector3::Z
+            };
+            let e1 = (helper - plane_n * helper.dot(&plane_n))
+                .normalize()
+                .unwrap_or(Vector3::X);
+            (e1, plane_n.cross(&e1))
+        };
+        let ang = |p: Point3| -> f64 {
+            let d = p - bcen;
+            d.dot(&e2).atan2(d.dot(&e1))
+        };
+        let wrap = |mut d: f64| {
+            while d > std::f64::consts::PI {
+                d -= tau;
+            }
+            while d < -std::f64::consts::PI {
+                d += tau;
+            }
+            d
+        };
+        let signed = |ring: &[(Point3, u32)]| -> f64 {
+            (0..ring.len())
+                .map(|i| wrap(ang(ring[(i + 1) % ring.len()].0) - ang(ring[i].0)))
+                .sum()
+        };
+        let mut rim_ord: Vec<(Point3, u32)> = rim.clone();
+        if signed(&bound) * signed(&rim_ord) < 0.0 {
+            rim_ord.reverse();
+        }
+        stitch_rings(&bound, &rim_ord, &outward_at, mesh);
+    }
+    true
+}
+
 fn tessellate_toroidal_face(
     face: &Face,
     model: &BRepModel,
