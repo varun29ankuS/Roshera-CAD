@@ -1359,6 +1359,146 @@ fn stitch_rings(
     }
 }
 
+/// Tessellate an arc-bounded spherical POLYGON (a face of a mutually-intersecting
+/// cut-circle arrangement — the corner-poke case, where the region is a spherical
+/// triangle/quad bounded by circle arcs with no inner holes).
+///
+/// The boundary is sampled VERBATIM from the `EdgeSampleCache` (so it welds by
+/// position to the adjoining planar box faces that share those arc edges), then
+/// the interior is filled by a concentric-ring fan from the region's spherical
+/// centroid: ring 0 is the rim, successive rings slerp inward to the centroid,
+/// and quads between rings are split into triangles wound CCW under the outward
+/// radial normal. Crack-free (every ring carries the same point count until the
+/// final collapse to the centroid) and curvature-following (ring vertices lie on
+/// the sphere). Returns `false` for non-sphere / holed / seam-loop faces so the
+/// caller falls through.
+fn tessellate_spherical_polygon(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Sphere;
+    let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() else {
+        return false;
+    };
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(lp) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if lp.edges.is_empty() {
+        return false;
+    }
+    let o = sphere.center;
+    let r = sphere.radius;
+    let osign = face.orientation.sign();
+
+    let rim = loop_rim_samples(lp, model, cache);
+    let m = rim.len();
+    if m < 3 {
+        return false;
+    }
+    // Unit radial directions of the rim, and the spherical centroid direction.
+    let dirs: Vec<Vector3> = rim
+        .iter()
+        .map(|&p| (p - o).normalize().unwrap_or(Vector3::Z))
+        .collect();
+    let mut cdir = dirs.iter().fold(Vector3::ZERO, |a, &d| a + d);
+    cdir = match cdir.normalize() {
+        Ok(v) => v,
+        // Degenerate (rim wraps a great circle / antipodal spread): not a simple
+        // polygon — let another path handle it.
+        Err(_) => return false,
+    };
+    // The concentric-ring fan slerps every rim point toward the centroid, so it
+    // fills any star-shaped (from the centroid) spherical polygon whose rim sits
+    // strictly within the open hemisphere antipodal to NONE of it — i.e. every
+    // rim point is < π from the centroid. The arrangement faces are convex
+    // circle-arc polygons (hence star-shaped from their centroid), so the only
+    // genuine failure is a rim point near-antipodal to the centroid (a face
+    // wrapping more than a hemisphere, where the centroid direction degenerates).
+    // Reject only that. The earlier π/2 cap wrongly bounced the large sphere-
+    // OUTSIDE union faces to a non-conforming fallback mesher, so their arc rims
+    // didn't weld to the box-corner caps and the corner detached in the mesh.
+    let max_ang = dirs
+        .iter()
+        .map(|&d| d.dot(&cdir).clamp(-1.0, 1.0).acos())
+        .fold(0.0_f64, f64::max);
+    if max_ang >= std::f64::consts::PI * 0.95 {
+        return false;
+    }
+
+    // slerp on the sphere from rim direction `d` toward the centroid `cdir`.
+    let slerp = |d: Vector3, t: f64| -> Vector3 {
+        let dot = d.dot(&cdir).clamp(-1.0, 1.0);
+        let w = dot.acos();
+        if w < 1e-9 {
+            return cdir;
+        }
+        let s = w.sin();
+        (d * ((1.0 - t) * w).sin() / s + cdir * (t * w).sin() / s)
+            .normalize()
+            .unwrap_or(cdir)
+    };
+
+    let n_rings = arc_steps_for_quality(max_ang, r, params).max(2);
+    let mk = |dir: Vector3, mesh: &mut TriangleMesh| -> u32 {
+        let p = o + dir * r;
+        mesh.add_vertex(MeshVertex {
+            position: p,
+            normal: dir * osign,
+            uv: None,
+        })
+    };
+
+    // Ring 0 = rim (verbatim cache positions so the weld is bit-exact).
+    let ring0: Vec<u32> = rim
+        .iter()
+        .zip(dirs.iter())
+        .map(|(&p, &d)| {
+            mesh.add_vertex(MeshVertex {
+                position: p,
+                normal: d * osign,
+                uv: None,
+            })
+        })
+        .collect();
+    let mut prev = ring0;
+
+    let fwd = osign >= 0.0;
+    let mut tri = |a: u32, b: u32, c: u32, mesh: &mut TriangleMesh| {
+        if fwd {
+            mesh.add_triangle(a, b, c);
+        } else {
+            mesh.add_triangle(a, c, b);
+        }
+    };
+
+    for j in 1..n_rings {
+        let t = j as f64 / n_rings as f64;
+        let cur_dirs: Vec<Vector3> = dirs.iter().map(|&d| slerp(d, t)).collect();
+        let cur: Vec<u32> = cur_dirs.iter().map(|&d| mk(d, mesh)).collect();
+        for i in 0..m {
+            let i2 = (i + 1) % m;
+            // Quad (prev[i], prev[i2], cur[i2], cur[i]) → two triangles, outward.
+            tri(prev[i], prev[i2], cur[i], mesh);
+            tri(prev[i2], cur[i2], cur[i], mesh);
+        }
+        prev = cur;
+    }
+    // Cap the innermost ring to the centroid.
+    let apex = mk(cdir, mesh);
+    for i in 0..m {
+        let i2 = (i + 1) % m;
+        tri(prev[i], prev[i2], apex, mesh);
+    }
+    true
+}
+
 fn tessellate_spherical_face(
     face: &Face,
     model: &BRepModel,
@@ -1381,6 +1521,11 @@ fn tessellate_spherical_face(
     // Multi-hole central region: sphere minus N caps, grid + boundary-loop
     // stitch to each hole's rim.
     if tessellate_spherical_central(face, model, surface, _cache, params, mesh) {
+        return;
+    }
+    // Arc-bounded spherical polygon (a face of a mutually-intersecting cut-circle
+    // arrangement — e.g. a corner-poke spherical triangle).
+    if tessellate_spherical_polygon(face, model, surface, _cache, params, mesh) {
         return;
     }
 
