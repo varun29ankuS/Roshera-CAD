@@ -8623,12 +8623,27 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
         canon_v.insert(vid, canon);
     }
 
+    // Edge geometric midpoint (curve evaluated at its parametric centre).
+    // Two edges sharing both endpoints are the SAME edge only if they also
+    // share this midpoint — an arc and its chord (a "lune" from imprinting an
+    // arc cut whose ends land on one straight boundary edge) have identical
+    // endpoints but different midpoints and MUST NOT be merged, or the lune
+    // collapses to a degenerate two-copies-of-one-edge face.
+    let edge_mid = |eid: EdgeId| -> Option<Point3> {
+        let edge = model.edges.get(eid)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let t = 0.5 * (edge.param_range.start + edge.param_range.end);
+        curve.evaluate(t).ok().map(|p| p.position)
+    };
+    let mid_tol_sq = 1.0e-12;
+
     // Step 3: build the canonical-edge map. Key is the unordered
-    // (canonical_vid, canonical_vid) pair; value records the chosen
-    // canonical EdgeId AND the canonical direction (which endpoint
-    // it considers `start`) so we can decide whether to flip the
-    // `forward` bit when remapping a duplicate.
-    let mut canon_e: HashMap<(VertexId, VertexId), (EdgeId, VertexId, VertexId)> = HashMap::new();
+    // (canonical_vid, canonical_vid) pair; because DISTINCT curves can share a
+    // vertex pair, each key maps to a LIST of (EdgeId, midpoint, canonical
+    // start) discriminated by geometry. The first edge at a given (pair,
+    // midpoint) wins; later geometric duplicates remap to it.
+    let mut canon_e: HashMap<(VertexId, VertexId), Vec<(EdgeId, Point3, VertexId)>> =
+        HashMap::new();
     {
         let mut seen_e: HashSet<EdgeId> = HashSet::new();
         for face in faces.iter() {
@@ -8649,7 +8664,17 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
                         continue;
                     }
                     let key = if cs < ce { (cs, ce) } else { (ce, cs) };
-                    canon_e.entry(key).or_insert((eid, cs, ce));
+                    let Some(mid) = edge_mid(eid) else {
+                        continue;
+                    };
+                    let bucket = canon_e.entry(key).or_default();
+                    let dup = bucket.iter().any(|(_, m, _)| {
+                        let d = *m - mid;
+                        d.x * d.x + d.y * d.y + d.z * d.z <= mid_tol_sq
+                    });
+                    if !dup {
+                        bucket.push((eid, mid, cs));
+                    }
                 }
             }
         }
@@ -8657,7 +8682,8 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
 
     // Step 4: rewrite each face's boundary_edges and inner_loops to
     // point to the canonical edge. Orientation flip handled per the
-    // contract above.
+    // contract above. The canonical edge is the bucket entry whose midpoint
+    // matches this edge's — so an arc and its chord remap independently.
     let remap = |entry: (EdgeId, bool), model: &BRepModel| -> (EdgeId, bool) {
         let (eid, forward) = entry;
         let edge = match model.edges.get(eid) {
@@ -8672,7 +8698,14 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
             return entry;
         }
         let key = if cs < ce { (cs, ce) } else { (ce, cs) };
-        if let Some(&(canon_eid, canon_cs, _canon_ce)) = canon_e.get(&key) {
+        let (Some(bucket), Some(mid)) = (canon_e.get(&key), edge_mid(eid)) else {
+            return entry;
+        };
+        let matched = bucket.iter().find(|(_, m, _)| {
+            let d = *m - mid;
+            d.x * d.x + d.y * d.y + d.z * d.z <= mid_tol_sq
+        });
+        if let Some(&(canon_eid, _, canon_cs)) = matched {
             if canon_eid == eid {
                 return entry;
             }

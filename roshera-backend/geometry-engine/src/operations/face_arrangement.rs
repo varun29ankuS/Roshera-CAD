@@ -336,7 +336,16 @@ pub(super) fn extract_regions(
         // degree 1). Repeatedly collapse such pairs.
         let trimmed = strip_dangling_pairs(&he_cycle, arr);
 
-        if trimmed.len() < 3 {
+        // A ≥3-edge cycle is the normal polygonal face. A 2-edge cycle is a
+        // valid "lune" — a region bounded by a curved edge and a chord that
+        // share both endpoints (the inside-arc piece when an arc cut is
+        // imprinted on a planar face, e.g. a cylinder section on a box cap that
+        // the intersection must keep) — ONLY when its two edges are DISTINCT;
+        // a 2-edge cycle of one edge traversed both ways is a degenerate
+        // lollipop. Anything below 2 is dropped.
+        let is_lune =
+            trimmed.len() == 2 && arr.get(trimmed[0]).edge_id != arr.get(trimmed[1]).edge_id;
+        if trimmed.len() < 3 && !is_lune {
             tracing::debug!(
                 "extract_regions: cycle of {} stripped to {} (<3) — discarded",
                 he_cycle.len(),
@@ -348,8 +357,13 @@ pub(super) fn extract_regions(
         // Compute signed area in the tangent plane of the cycle's
         // centroid. Outer face (CW under normal) has negative signed
         // area and is discarded. Zero-area cycles (pure lollipops) are
-        // also discarded.
-        let signed = signed_area_of_cycle(&trimmed, arr, model, surface, tol);
+        // also discarded. The lune samples its curved edge to recover the
+        // bulge area its two shared vertices alone would report as zero.
+        let signed = if is_lune {
+            densified_cycle_area(&trimmed, arr, model, surface, tol)
+        } else {
+            signed_area_of_cycle(&trimmed, arr, model, surface, tol)
+        };
         tracing::debug!(
             "extract_regions: cycle of {} (trimmed {}) signed_area={:.4}",
             he_cycle.len(),
@@ -378,7 +392,10 @@ pub(super) fn extract_regions(
         if edges.first().map(|(e, _)| *e) == edges.last().map(|(e, _)| *e) && edges.len() > 1 {
             edges.pop();
         }
-        if edges.len() < 3 {
+        // ≥3 edges normally; a 2-edge lune survives (its two distinct edges and
+        // positive sampled area were already validated above).
+        let min_edges = if is_lune { 2 } else { 3 };
+        if edges.len() < min_edges {
             continue;
         }
 
@@ -510,6 +527,63 @@ fn strip_dangling_pairs(cycle: &[HalfEdgeId], arr: &Arrangement) -> Vec<HalfEdge
 /// makes the midpoint lie on the linear path between the two endpoint
 /// `u` values. This walks the cycle continuously around the seam
 /// without ambiguity.
+/// Signed area of a cycle whose edges may be CURVED, computed by sampling each
+/// half-edge's underlying curve (in walk order) into a dense polyline and
+/// shoelacing it in the tangent plane at the centroid. Unlike
+/// [`signed_area_of_cycle`] — which uses only the cycle's corner vertices, so a
+/// 2-edge lune (an arc and its chord share both endpoints) reports zero — this
+/// recovers the bulge area. Used for the 2-edge lune; the ≥3-edge path keeps
+/// the cheaper vertex polygon.
+fn densified_cycle_area(
+    cycle: &[HalfEdgeId],
+    arr: &Arrangement,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    tol: Tolerance,
+) -> f64 {
+    const SAMPLES_PER_EDGE: usize = 8;
+    let mut pts: Vec<Vector3> = Vec::new();
+    for &h in cycle {
+        let he = arr.get(h);
+        let Some(edge) = model.edges.get(he.edge_id) else {
+            return 0.0;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            return 0.0;
+        };
+        let (t0, t1) = (edge.param_range.start, edge.param_range.end);
+        // Walk the edge in the half-edge's direction; drop the final point
+        // (shared with the next edge's first sample) to avoid duplicates.
+        for k in 0..SAMPLES_PER_EDGE {
+            let f = k as f64 / SAMPLES_PER_EDGE as f64;
+            let t = if he.forward {
+                t0 + (t1 - t0) * f
+            } else {
+                t1 + (t0 - t1) * f
+            };
+            if let Ok(p) = curve.evaluate(t) {
+                pts.push(Vector3::new(p.position.x, p.position.y, p.position.z));
+            }
+        }
+    }
+    if pts.len() < 3 {
+        return 0.0;
+    }
+    let n = pts.len() as f64;
+    let centroid = pts.iter().fold(Vector3::ZERO, |acc, p| acc + *p) / n;
+    let (e1, e2) = match tangent_frame_at(surface, &centroid, tol) {
+        Some(f) => f,
+        None => return 0.0,
+    };
+    let mut area2 = 0.0;
+    for i in 0..pts.len() {
+        let a = pts[i] - centroid;
+        let b = pts[(i + 1) % pts.len()] - centroid;
+        area2 += a.dot(&e1) * b.dot(&e2) - b.dot(&e1) * a.dot(&e2);
+    }
+    0.5 * area2
+}
+
 fn signed_area_of_cycle(
     cycle: &[HalfEdgeId],
     arr: &Arrangement,
