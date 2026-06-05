@@ -480,14 +480,13 @@ mod tests {
     }
 
     /// The oracle is strict enough to FAIL on a known-broken result: the
-    /// sphere-poke-through (sphere r=2.5 through a 4-box) still mis-partitions
-    /// the spherical face (tracked #53/#54). `is_watertight` is fooled because
-    /// the mis-stitched mesh's signed volume is self-consistent, but the
-    /// manifold oracle catches the open/duplicated edges. When #53/#54 land,
-    /// flip this to `assert!(r.is_valid_solid())` and drop the `#[ignore]`.
+    /// sphere-poke-through (sphere r=2.5 through a 4-box). Once mis-stitched the
+    /// spherical face (tracked #53/#54); the curved-Boolean poke-matrix work
+    /// (#53/#59/#60, 33/33) fixed the partition. This now asserts the intersection
+    /// is a valid closed/manifold/oriented solid, so any regression of that work
+    /// is caught by the fast lib-test gate (not only the heavy poke-matrix run).
     #[test]
-    #[ignore = "#53/#54: sphere poke-through still mis-stitches; oracle correctly rejects it"]
-    fn sphere_poke_through_is_not_yet_manifold() {
+    fn sphere_poke_through_is_manifold() {
         let mut model = BRepModel::new();
         TopologyBuilder::new(&mut model)
             .create_box_3d(4.0, 4.0, 4.0)
@@ -506,11 +505,9 @@ mod tests {
         )
         .expect("intersection");
         let r = manifold_report(&model, result, 0.05, 1e-6).expect("mesh");
-        eprintln!("sphere-poke ∩ manifold report: {r:?}");
         assert!(
-            !r.is_valid_solid(),
-            "sphere poke-through unexpectedly became a valid manifold — \
-             if #53/#54 are fixed, invert this assertion: {r:?}"
+            r.is_valid_solid(),
+            "sphere poke-through ∩ must be a valid closed/manifold/oriented solid: {r:?}"
         );
     }
 }
