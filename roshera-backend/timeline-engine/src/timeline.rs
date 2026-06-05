@@ -910,6 +910,9 @@ impl Timeline {
         };
 
         // Already up-to-date: target already contains every event source has.
+        // The event-sequence prefix IS the git commit-DAG ancestry test: if
+        // source's sequence is a prefix of target's, then source's head event is
+        // an ancestor of target's head, so target already incorporates source.
         if source_seq.len() <= target_seq.len()
             && source_seq
                 .iter()
@@ -939,7 +942,11 @@ impl Timeline {
             });
         }
 
-        // Fast-forward case: target_seq is a strict prefix of source_seq.
+        // Fast-forward case: target_seq is a strict prefix of source_seq — i.e.
+        // target's head event is an ancestor of source's head in the commit DAG,
+        // which is exactly git's fast-forward precondition. (Two branches that
+        // merely share a common base but have each advanced are NOT a prefix of
+        // one another and fall through to the divergent path below.)
         let ff =
             target_seq.len() < source_seq.len() && source_seq[..target_seq.len()] == target_seq[..];
         if ff {
@@ -1376,30 +1383,49 @@ impl Timeline {
             }
         }
 
-        // Helper: is `descendant` a (transitive) descendant of `ancestor`,
-        // including the case `descendant == ancestor`?
-        let is_descendant = |descendant: BranchId, ancestor: BranchId| -> bool {
-            if descendant == ancestor {
-                return true;
+        // Reverse-merge edges: target `W` → branches `Z` that were Merged into W.
+        let mut merged_in: std::collections::HashMap<BranchId, Vec<BranchId>> =
+            std::collections::HashMap::new();
+        for entry in self.branches.iter() {
+            if let BranchState::Merged { into, .. } = entry.value().state {
+                merged_in.entry(into).or_default().push(entry.value().id);
             }
-            let mut current = self.branches.get(&descendant).and_then(|b| b.parent);
-            // Cap at 1024 hops to avoid pathological cycles.
-            for _ in 0..1024 {
-                match current {
-                    Some(p) if p == ancestor => return true,
-                    Some(p) => {
-                        current = self.branches.get(&p).and_then(|b| b.parent);
-                    }
-                    None => return false,
-                }
-            }
-            false
-        };
+        }
 
-        // 2 + 3. Every entry in any branch_events resolves to an event
-        // and the host-branch / event-branch relationship is consistent.
+        // 2 + 3. Every entry in any branch_events resolves to an event, its
+        // stored key equals the event's sequence number, and the event's origin
+        // branch is REACHABLE from the host. Reachability is git's commit
+        // reachability: walk both the fork-PARENT chain (a branch incorporates
+        // its ancestors' events) AND MERGE edges (a branch merged into something
+        // already incorporated brings its entire reachable history). A
+        // fast-forward records a merge edge, so a chain of fast-forwards A→B→C
+        // transitively makes C incorporate A — exactly as a commit reachable
+        // through merge parents in git is reachable from the merged-into ref.
         for branch_entry in self.branch_events.iter() {
             let host = *branch_entry.key();
+
+            // Incorporated set: the reachability closure from `host` over
+            // parent + reverse-merge edges.
+            let mut incorporated: std::collections::HashSet<BranchId> =
+                std::collections::HashSet::new();
+            let mut stack = vec![host];
+            let mut guard = 0usize;
+            while let Some(b) = stack.pop() {
+                guard += 1;
+                if guard > 8192 {
+                    break; // pathological-cycle backstop
+                }
+                if !incorporated.insert(b) {
+                    continue;
+                }
+                if let Some(p) = self.branches.get(&b).and_then(|x| x.parent) {
+                    stack.push(p);
+                }
+                if let Some(zs) = merged_in.get(&b) {
+                    stack.extend(zs.iter().copied());
+                }
+            }
+
             for ev_entry in branch_entry.value().iter() {
                 let key = *ev_entry.key();
                 let event_id = *ev_entry.value();
@@ -1415,40 +1441,8 @@ impl Timeline {
                         host, event_id, key, event.sequence_number
                     )));
                 }
-                // Accept the event in this host iff the event's
-                // origin branch is reachable from `host` by walking
-                // either parent edges (inherited prefix) or merge
-                // edges (the origin branch was merged into something
-                // in host's ancestor chain). The latter is the
-                // post-FF-merge case: events that originated on a
-                // merged branch legitimately appear in the merge
-                // target and its descendants.
                 let origin = event.metadata.branch_id;
-                let mut accepted = is_descendant(host, origin);
-                if !accepted {
-                    // Follow the origin branch's merge chain forward.
-                    // If origin was Merged into X, then anything that
-                    // descends from X (or further-merged successor)
-                    // is a valid host. Cap at 1024 hops.
-                    let mut cur = origin;
-                    for _ in 0..1024 {
-                        let next = self.branches.get(&cur).and_then(|b| match b.state {
-                            BranchState::Merged { into, .. } => Some(into),
-                            _ => None,
-                        });
-                        match next {
-                            Some(into) => {
-                                if is_descendant(host, into) {
-                                    accepted = true;
-                                    break;
-                                }
-                                cur = into;
-                            }
-                            None => break,
-                        }
-                    }
-                }
-                if !accepted {
+                if !incorporated.contains(&origin) {
                     return Err(TimelineError::Internal(format!(
                         "branch {} hosts event {} whose branch_id={} is neither an ancestor nor merged into one",
                         host, event_id, origin
