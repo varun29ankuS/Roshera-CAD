@@ -401,6 +401,22 @@ fn is_inside_uv_polygon(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
 ///    every inner.
 ///
 /// Returns the filtered Steiner set in (u, v) coordinates.
+/// Euclidean distance from a UV point to a UV segment `[a, b]`.
+fn point_segment_distance_uv(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (px, py) = p;
+    let (ax, ay) = a;
+    let (bx, by) = b;
+    let (dx, dy) = (bx - ax, by - ay);
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq <= f64::EPSILON {
+        0.0
+    } else {
+        (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0)
+    };
+    let (cx, cy) = (ax + t * dx, ay + t * dy);
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
 fn generate_steiner_candidates(
     surface: &dyn Surface,
     bbox: UvBBox,
@@ -448,6 +464,27 @@ fn generate_steiner_candidates(
     let nu = nu_raw.max(params.min_segments).min(params.max_segments);
     let nv = nv_raw.max(params.min_segments).min(params.max_segments);
 
+    // Keep-out band around every constraint edge: a Steiner point that lands
+    // ON a fixed (boundary) segment makes the `cdt` crate reject the whole
+    // triangulation as `PointOnFixedEdge`. The bbox-boundary skip below guards
+    // the axis-aligned outer trim, but an INNER loop (a hole — e.g. an off-axis
+    // cylinder's window) sits in the bbox interior, so a grid row/column
+    // coincident with a hole edge would collide. Reject any candidate within a
+    // quarter-cell of any inner-polygon edge.
+    let u_cell = u_span / (nu as f64);
+    let v_cell = v_span / (nv as f64);
+    let keepout = 0.25 * u_cell.min(v_cell);
+    let near_inner_edge = |u: f64, v: f64| -> bool {
+        inner_polygons.iter().any(|poly| {
+            let m = poly.len();
+            (0..m).any(|k| {
+                let (ax, ay) = poly[k];
+                let (bx, by) = poly[(k + 1) % m];
+                point_segment_distance_uv((u, v), (ax, ay), (bx, by)) < keepout
+            })
+        })
+    };
+
     // Generate interior grid (skip the four corners so we don't
     // collide with boundary samples that may sit on the bbox edge).
     let mut candidates: Vec<(f64, f64)> = Vec::with_capacity((nu + 1) * (nv + 1));
@@ -481,6 +518,9 @@ fn generate_steiner_candidates(
                 .iter()
                 .any(|p| is_inside_uv_polygon((u, v), p))
             {
+                continue;
+            }
+            if near_inner_edge(u, v) {
                 continue;
             }
             candidates.push((u, v));
