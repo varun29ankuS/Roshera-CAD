@@ -370,6 +370,9 @@ mod tests {
         ("torus/contained", 0),
         ("torus/contained", 1),
         ("torus/contained", 2),
+        ("torus/rim-poke", 0),
+        ("torus/rim-poke", 1),
+        ("torus/rim-poke", 2),
     ];
 
     /// Enforced regression gate: every cell in [`GREEN_CELLS`] passes BOTH

@@ -511,10 +511,29 @@ fn compute_face_intersections(
     let use_broad_phase = total_pairs > BROAD_PHASE_PAIR_THRESHOLD;
 
     let bbox_for = |model: &BRepModel, face_id: FaceId| -> BBox {
-        model
-            .faces
-            .get(face_id)
-            .and_then(|f| f.bbox(&model.loops, &model.edges, &model.vertices, &model.surfaces))
+        let Some(f) = model.faces.get(face_id) else {
+            return BBox::INFINITE;
+        };
+        // A full torus's only boundary is a seam commutator that does NOT bound
+        // its 3D extent, and `Face::bbox`'s surface-sampling under-covers the
+        // doubly-periodic domain — so the loop-derived bbox is a partial sliver
+        // that wrongly prunes torus×wall pairs (only 2 of 4 walls survive a rim
+        // poke). Treat a torus face as INFINITE (broad-phase passthrough) so all
+        // candidate pairs reach `intersect_faces`; the per-pair test is cheap.
+        if model
+            .surfaces
+            .get(f.surface_id)
+            .map(|s| {
+                matches!(
+                    s.surface_type(),
+                    crate::primitives::surface::SurfaceType::Torus
+                )
+            })
+            .unwrap_or(false)
+        {
+            return BBox::INFINITE;
+        }
+        f.bbox(&model.loops, &model.edges, &model.vertices, &model.surfaces)
             .unwrap_or(BBox::INFINITE)
     };
 
@@ -547,6 +566,21 @@ fn compute_face_intersections(
             .iter()
             .map(|&fb| (fb, bbox_for(model, fb)))
             .collect();
+        if pipeline_trace_enabled() {
+            for &fa in &faces_a {
+                let bb = bbox_for(model, fa);
+                eprintln!(
+                    "[bool]   bbox A face={fa}: min=({:.2},{:.2},{:.2}) max=({:.2},{:.2},{:.2})",
+                    bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z
+                );
+            }
+            for (fb, bb) in &bboxes_b {
+                eprintln!(
+                    "[bool]   bbox B face={fb}: min=({:.2},{:.2},{:.2}) max=({:.2},{:.2},{:.2})",
+                    bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z
+                );
+            }
+        }
         let tol = options.common.tolerance;
         let mut pairs = Vec::with_capacity(total_pairs);
         for &face_a in &faces_a {
@@ -861,6 +895,22 @@ fn intersect_faces(
                     expected: "valid surface ID".to_string(),
                     received: format!("{:?}", surface_b_id),
                 })?;
+        if pipeline_trace_enabled() {
+            use crate::primitives::surface::SurfaceType;
+            if matches!(
+                (surface_a.surface_type(), surface_b.surface_type()),
+                (SurfaceType::Plane, SurfaceType::Torus) | (SurfaceType::Torus, SurfaceType::Plane)
+            ) {
+                let pn = surface_a
+                    .evaluate_full(0.0, 0.0)
+                    .map(|e| e.normal)
+                    .unwrap_or(Vector3::ZERO);
+                eprintln!(
+                    "[bool]   intersect_faces Plane×Torus: plane_n=({:.1},{:.1},{:.1})",
+                    pn.x, pn.y, pn.z
+                );
+            }
+        }
         surface_surface_intersection(surface_a, surface_b, &options.common.tolerance)
     };
 
@@ -1007,6 +1057,13 @@ fn surface_surface_intersection(
         }
         (Planar, Cone) | (Cone, Planar) => plane_cone_intersection(surface_a, surface_b, tolerance),
         _ => {
+            use crate::primitives::surface::SurfaceType;
+            if matches!(
+                (surface_a.surface_type(), surface_b.surface_type()),
+                (SurfaceType::Plane, SurfaceType::Torus) | (SurfaceType::Torus, SurfaceType::Plane)
+            ) {
+                return plane_torus_intersection(surface_a, surface_b, tolerance);
+            }
             // No closed-form handler covers this pair (e.g. NURBS,
             // RuledSurface that isn't planar). Marching solver is the
             // last resort.
@@ -2421,6 +2478,99 @@ fn compute_circle_cone_parameters(
 }
 
 /// Find initial intersection points between surfaces
+/// Plane–torus intersection, sampled analytically (the marcher hangs on the
+/// torus oval — no iteration cap, never closes). For a plane PARALLEL to the
+/// torus axis (box side-wall, rim-poke) the section is a quartic OVAL: in the
+/// in-plane frame `m = axis × n`, a plane point is `c + d·n + s·m + t·axis` with
+/// equatorial radius `√(d²+s²)` and height `t = ±√(r² − (√(d²+s²) − R)²)`.
+/// Trace top then bottom branch → closed loop → NURBS-fit. `d = (p0 − c)·n`;
+/// valid single-oval regime `R − r ≤ |d| ≤ R + r`. Oblique/perpendicular and
+/// the two-loop `|d| < R − r` regime fall back to the marcher / empty.
+fn plane_torus_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::surface::{SurfaceType, Torus};
+
+    let torus = match (surface_a.surface_type(), surface_b.surface_type()) {
+        (SurfaceType::Plane, SurfaceType::Torus) => surface_b.as_any().downcast_ref::<Torus>(),
+        (SurfaceType::Torus, SurfaceType::Plane) => surface_a.as_any().downcast_ref::<Torus>(),
+        _ => None,
+    };
+    let (plane, torus) = match torus {
+        Some(t) if surface_a.surface_type() == SurfaceType::Plane => (surface_a, t),
+        Some(t) => (surface_b, t),
+        None => return march_surface_intersection(surface_a, surface_b, tolerance),
+    };
+
+    let pe = plane.evaluate_full(0.0, 0.0)?;
+    let (n, p0) = (pe.normal, pe.position);
+    let c = torus.center;
+    let axis = torus.axis;
+    let (big_r, small_r) = (torus.major_radius, torus.minor_radius);
+
+    if n.dot(&axis).abs() > tolerance.parallel_threshold() {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+    let d = (p0 - c).dot(&n);
+    let dd = d.abs();
+    if dd < big_r - small_r || dd > big_r + small_r {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+    let m = match axis.cross(&n).normalize() {
+        Ok(v) => v,
+        Err(_) => return march_surface_intersection(surface_a, surface_b, tolerance),
+    };
+    let s_max_sq = (big_r + small_r) * (big_r + small_r) - d * d;
+    if s_max_sq <= tolerance.distance() * tolerance.distance() {
+        return Ok(vec![]);
+    }
+    let s_max = s_max_sq.sqrt();
+
+    const N: usize = 48;
+    let sample = |s: f64, top: bool| -> Option<IntersectionPoint> {
+        let req = (d * d + s * s).sqrt();
+        let inner = small_r * small_r - (req - big_r) * (req - big_r);
+        let t = if inner <= 0.0 { 0.0 } else { inner.sqrt() };
+        let t = if top { t } else { -t };
+        let pos = c + n * d + m * s + axis * t;
+        let pa = surface_a.closest_point(&pos, *tolerance).ok()?;
+        let pb = surface_b.closest_point(&pos, *tolerance).ok()?;
+        Some(IntersectionPoint {
+            position: pos,
+            params_a: pa,
+            params_b: pb,
+        })
+    };
+    let mut points: Vec<IntersectionPoint> = Vec::with_capacity(2 * N);
+    for i in 0..=N {
+        let s = -s_max + 2.0 * s_max * (i as f64) / (N as f64);
+        if let Some(p) = sample(s, true) {
+            points.push(p);
+        }
+    }
+    for i in 1..N {
+        let s = s_max - 2.0 * s_max * (i as f64) / (N as f64);
+        if let Some(p) = sample(s, false) {
+            points.push(p);
+        }
+    }
+    if points.len() < 8 {
+        return Ok(vec![]);
+    }
+    points.push(points[0].clone());
+
+    let curve = fit_curve_to_points(&points, tolerance)?;
+    let params_a: Vec<(f64, f64)> = points.iter().map(|p| p.params_a).collect();
+    let params_b: Vec<(f64, f64)> = points.iter().map(|p| p.params_b).collect();
+    Ok(vec![SurfaceIntersectionCurve {
+        curve,
+        on_surface_a: create_parametric_curve(&params_a),
+        on_surface_b: create_parametric_curve(&params_b),
+    }])
+}
+
 fn find_initial_intersection_points(
     surface_a: &dyn Surface,
     surface_b: &dyn Surface,
@@ -3482,6 +3632,139 @@ fn split_cylinder_lateral_by_window(
     ])
 }
 
+/// Torus analogue of the sphere/cone/cylinder curved-Boolean fast paths, for a
+/// RIM-POKE: the tube pokes box side-walls, each wall imprinting a closed quartic
+/// oval on the torus near the outer equator (v≈0). The DCEL arrangement on the
+/// doubly-periodic torus drops the seam-wrapping main body, so we build the
+/// fragments explicitly: one **bump** per oval (the tube cap poking OUTSIDE the
+/// box, bounded by that oval) plus one **main body** = the torus's original
+/// commutator boundary carrying every oval as a hole.
+fn split_torus_face_by_ovals(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+    boundary_edges: &[(EdgeId, bool)],
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::surface::Torus;
+
+    let surface = model.surfaces.get(surface_id)?;
+    let torus = surface.as_any().downcast_ref::<Torus>()?;
+
+    let mut by_curve: std::collections::BTreeMap<CurveId, Vec<EdgeId>> =
+        std::collections::BTreeMap::new();
+    for ge in graph.edges.values() {
+        if ge.edge_type != EdgeType::Splitting {
+            continue;
+        }
+        if let Some(edge) = model.edges.get(ge.edge_id) {
+            by_curve.entry(edge.curve_id).or_default().push(ge.edge_id);
+        }
+    }
+    if by_curve.is_empty() {
+        return None;
+    }
+
+    let order_loop = |eids: &[EdgeId]| -> Vec<(EdgeId, bool)> {
+        let mut remaining: Vec<EdgeId> = eids.to_vec();
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        if remaining.is_empty() {
+            return out;
+        }
+        let first = remaining.remove(0);
+        let mut cur_end = match model.edges.get(first) {
+            Some(e) => e.end_vertex,
+            None => return out,
+        };
+        out.push((first, true));
+        while !remaining.is_empty() {
+            let mut found = None;
+            for (i, &eid) in remaining.iter().enumerate() {
+                if let Some(e) = model.edges.get(eid) {
+                    if e.start_vertex == cur_end {
+                        found = Some((i, eid, e.end_vertex, true));
+                        break;
+                    } else if e.end_vertex == cur_end {
+                        found = Some((i, eid, e.start_vertex, false));
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some((i, eid, next_end, fwd)) => {
+                    remaining.remove(i);
+                    out.push((eid, fwd));
+                    cur_end = next_end;
+                }
+                None => {
+                    for eid in remaining.drain(..) {
+                        out.push((eid, true));
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    let tol = crate::math::Tolerance::default();
+    let mut faces: Vec<SplitFace> = Vec::new();
+    let mut ovals: Vec<Vec<(EdgeId, bool)>> = Vec::new();
+    for (_cid, eids) in &by_curve {
+        let oval = order_loop(eids);
+        if oval.len() < 2 {
+            continue;
+        }
+        let (mut su, mut cu) = (0.0_f64, 0.0_f64);
+        let mut cnt = 0u32;
+        for &(eid, _) in &oval {
+            let Some(e) = model.edges.get(eid) else {
+                continue;
+            };
+            for vid in [e.start_vertex, e.end_vertex] {
+                if let Some(p) = model.vertices.get_position(vid) {
+                    if let Ok((u, _v)) = torus.closest_point(&Point3::new(p[0], p[1], p[2]), tol) {
+                        su += u.sin();
+                        cu += u.cos();
+                        cnt += 1;
+                    }
+                }
+            }
+        }
+        if cnt == 0 {
+            return None;
+        }
+        let u_center = su.atan2(cu);
+        let bump_pt = torus.point_at(u_center, 0.0).ok()?;
+        faces.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: oval.clone(),
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(bump_pt),
+            inner_loops: Vec::new(),
+        });
+        ovals.push(oval);
+    }
+    if ovals.is_empty() {
+        return None;
+    }
+
+    let main_pt = torus.point_at(0.0, std::f64::consts::PI).ok()?;
+    faces.push(SplitFace {
+        original_face: face_id,
+        surface: surface_id,
+        boundary_edges: boundary_edges.to_vec(),
+        classification: FaceClassification::OnBoundary,
+        from_solid: origin_solid,
+        interior_point: Some(main_pt),
+        inner_loops: ovals,
+    });
+
+    Some(faces)
+}
+
 /// Split a single face by multiple curves.
 ///
 /// `origin_solid` identifies which of the two boolean operands this face
@@ -3849,6 +4132,25 @@ fn split_face_by_curves(
             );
         }
         return Ok(cyl_faces);
+    }
+
+    // Torus rim-poke: torus cut by closed ovals near its outer equator →
+    // explicit bumps + main body (commutator boundary, ovals as holes).
+    if let Some(torus_faces) = split_torus_face_by_ovals(
+        model,
+        surface_id,
+        face_id,
+        origin_solid,
+        &graph,
+        &boundary_edges,
+    ) {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   torus oval split: face={face_id:?} → {} fragments",
+                torus_faces.len()
+            );
+        }
+        return Ok(torus_faces);
     }
 
     // Build face loops via DCEL planar arrangement.
@@ -7449,6 +7751,43 @@ fn uv_point_in_polygon(polygon: &[(f64, f64)], (u, v): (f64, f64)) -> bool {
 ///
 /// A single ray can give wrong results if it passes through an edge or vertex.
 /// Using 3 non-aligned directions and taking the majority vote is robust.
+/// Analytic point-in-solid membership for a solid that is a SINGLE torus face.
+/// The ray-cast classifier is unreliable against a torus (ray↔torus is a quartic
+/// whose roots are numerically delicate), which mis-classifies the box-wall
+/// disk fragments of a rim poke (a disk-centre point is the tube centre, deep
+/// inside, yet ray-casts as Outside). The implicit test
+/// `(√(x²+y²)−R)² + z² ⪋ r²` in the torus frame is exact. `None` ⇒ the solid is
+/// not a lone torus, so the caller falls through to the ray-cast.
+fn point_inside_torus_solid(
+    model: &BRepModel,
+    solid: SolidId,
+    p: &Point3,
+    tolerance: &Tolerance,
+) -> Option<FaceClassification> {
+    let faces = get_solid_faces(model, solid).ok()?;
+    if faces.len() != 1 {
+        return None;
+    }
+    let face = model.faces.get(faces[0])?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    let torus = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Torus>()?;
+    let rel = *p - torus.center;
+    let z = rel.dot(&torus.axis);
+    let rho = (rel - torus.axis * z).magnitude();
+    let q = rho - torus.major_radius;
+    let f = q * q + z * z - torus.minor_radius * torus.minor_radius;
+    let band = tolerance.distance() * torus.minor_radius.max(1.0);
+    Some(if f.abs() <= band {
+        FaceClassification::OnBoundary
+    } else if f < 0.0 {
+        FaceClassification::Inside
+    } else {
+        FaceClassification::Outside
+    })
+}
+
 fn classify_face_relative_to_solid(
     model: &BRepModel,
     face: &SplitFace,
@@ -7456,6 +7795,13 @@ fn classify_face_relative_to_solid(
     tolerance: &Tolerance,
 ) -> OperationResult<FaceClassification> {
     let test_point = get_face_interior_point(model, face)?;
+
+    // Exact analytic membership when the reference solid is a lone torus — the
+    // ray-cast below is unreliable against a torus and drops the box-wall disk
+    // caps of a rim poke.
+    if let Some(cls) = point_inside_torus_solid(model, solid, &test_point, tolerance) {
+        return Ok(cls);
+    }
 
     // Coincident-boundary detection: if the face's interior point lies on any
     // face of the test solid, the split face is coincident with a face of the
@@ -8571,6 +8917,199 @@ fn reconstruct_topology(
 /// the canonical edge for a duplicate that ran in the opposite
 /// direction, we flip `forward` so the loop's geometric walk is
 /// unchanged.
+/// Resolve T-junctions left by *asymmetric* per-face splitting before
+/// canonicalisation.
+///
+/// When a cut curve crosses a periodic surface's parametric seam, the periodic
+/// face (e.g. a torus) is forced to split that curve at the seam — minting an
+/// interior vertex `vB` and two short arcs — while a non-periodic neighbour
+/// (e.g. a planar box wall) imprints the same geometric curve as a single long
+/// arc with no `vB`. The two faces then disagree on segmentation: the torus
+/// references `[…(vA,vB),(vB,vC)…]` and the box references `[…(vA,vC)…]`,
+/// sharing no edge across that span. `canonicalise_face_edges_by_position`
+/// keys on the canonical vertex pair, so it cannot reconcile a long arc against
+/// two short ones — the rim then samples at different points per face and the
+/// tessellation fails to weld (open boundary at that oval).
+///
+/// This pass heals the asymmetry: for every edge referenced by any face, it
+/// finds *foreign* vertices (endpoints contributed by other faces) lying on the
+/// edge's curve **interior**, and splits the edge at each — reusing the foreign
+/// `VertexId` as the split vertex so both sides now share it. After healing,
+/// every face along a shared curve carries the identical fine segmentation and
+/// `canonicalise` unifies the arcs by vertex pair. The seam vertex does not
+/// exist until the periodic face is split, so this must run post-split (it
+/// cannot be hoisted to the graph-level `presplit_boundary_t_junctions`).
+fn heal_t_junctions_across_faces(
+    model: &mut BRepModel,
+    faces: &mut [SplitFace],
+    tolerance: &Tolerance,
+) {
+    // Candidate split vertices: every vertex any face's loops touch, deduped by
+    // VertexId, with its 3D position read once.
+    let mut candidates: Vec<(VertexId, Point3)> = Vec::new();
+    {
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        for face in faces.iter() {
+            for &(eid, _) in face
+                .boundary_edges
+                .iter()
+                .chain(face.inner_loops.iter().flatten())
+            {
+                if let Some(edge) = model.edges.get(eid) {
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if vid == crate::primitives::vertex::INVALID_VERTEX_ID {
+                            continue;
+                        }
+                        if !seen.insert(vid) {
+                            continue;
+                        }
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            candidates.push((vid, Point3::new(p[0], p[1], p[2])));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Unique edges referenced by any loop.
+    let mut edge_ids: Vec<EdgeId> = Vec::new();
+    {
+        let mut seen: HashSet<EdgeId> = HashSet::new();
+        for face in faces.iter() {
+            for &(eid, _) in face
+                .boundary_edges
+                .iter()
+                .chain(face.inner_loops.iter().flatten())
+            {
+                if seen.insert(eid) {
+                    edge_ids.push(eid);
+                }
+            }
+        }
+    }
+
+    let tol = tolerance.distance();
+    let tol_sq = tol * tol;
+    const ENDPOINT_EPS: f64 = 1e-9;
+
+    // For each edge, the ordered (forward curve-param) sub-edge sequence it was
+    // split into. Edges with no interior foreign vertex are absent.
+    let mut split_map: HashMap<EdgeId, Vec<EdgeId>> = HashMap::new();
+
+    for &eid in &edge_ids {
+        let original = match model.edges.get(eid) {
+            Some(e) => e.clone(),
+            None => continue,
+        };
+        let curve = match model.curves.get(original.curve_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        let range_len = original.param_range.end - original.param_range.start;
+        if range_len.abs() < 1e-15 {
+            continue;
+        }
+
+        // Collect interior split points: foreign vertices on this curve.
+        let mut splits: Vec<(f64, VertexId)> = Vec::new();
+        for &(vid, pos) in &candidates {
+            if vid == original.start_vertex || vid == original.end_vertex {
+                continue;
+            }
+            let (t_curve, projected) = match curve.closest_point(&pos, *tolerance) {
+                Ok(hit) => hit,
+                Err(_) => continue,
+            };
+            let d = projected - pos;
+            if d.x * d.x + d.y * d.y + d.z * d.z > tol_sq {
+                continue;
+            }
+            let local_t = (t_curve - original.param_range.start) / range_len;
+            if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&local_t) {
+                continue;
+            }
+            splits.push((t_curve, vid));
+        }
+        if splits.is_empty() {
+            continue;
+        }
+        splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        splits.dedup_by(|a, b| a.1 == b.1 || (a.0 - b.0).abs() < ENDPOINT_EPS);
+
+        // Materialise the sub-edges, reusing each foreign VertexId as the split
+        // vertex so both sides share it. Mirror `presplit_boundary_t_junctions`.
+        let mut sub_ids: Vec<EdgeId> = Vec::new();
+        let mut remaining = original.clone();
+        for (curve_t, split_vid) in &splits {
+            let rlen = remaining.param_range.end - remaining.param_range.start;
+            if rlen.abs() < 1e-15 {
+                continue;
+            }
+            let lt = (*curve_t - remaining.param_range.start) / rlen;
+            if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&lt) {
+                continue;
+            }
+            if *split_vid == remaining.start_vertex || *split_vid == remaining.end_vertex {
+                continue;
+            }
+            let (mut first_half, mut second_half) = remaining.split_at(lt);
+            first_half.end_vertex = *split_vid;
+            second_half.start_vertex = *split_vid;
+            sub_ids.push(model.edges.add(first_half));
+            remaining = second_half;
+        }
+        if sub_ids.is_empty() {
+            continue;
+        }
+        sub_ids.push(model.edges.add(remaining));
+        split_map.insert(eid, sub_ids);
+    }
+
+    if split_map.is_empty() {
+        return;
+    }
+
+    // Rewrite every loop entry referencing a split edge into its ordered
+    // sub-edge sequence. Forward traversal walks the sub-edges in curve-param
+    // order (all forward); reverse traversal walks them last-to-first (all
+    // reversed).
+    let rewrite = |entries: &mut Vec<(EdgeId, bool)>| {
+        let mut out: Vec<(EdgeId, bool)> = Vec::with_capacity(entries.len());
+        for &(eid, fwd) in entries.iter() {
+            match split_map.get(&eid) {
+                Some(subs) => {
+                    if fwd {
+                        for &s in subs {
+                            out.push((s, true));
+                        }
+                    } else {
+                        for &s in subs.iter().rev() {
+                            out.push((s, false));
+                        }
+                    }
+                }
+                None => out.push((eid, fwd)),
+            }
+        }
+        *entries = out;
+    };
+
+    for face in faces.iter_mut() {
+        rewrite(&mut face.boundary_edges);
+        for inner in face.inner_loops.iter_mut() {
+            rewrite(inner);
+        }
+    }
+
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool] stage=heal_t_junctions split_edges={}",
+            split_map.len()
+        );
+    }
+}
+
 fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace]) {
     // Step 1: collect every vertex touched by any face's edges, with
     // its 3D position. De-duplicate by VertexId so positions are read
@@ -8796,6 +9335,7 @@ fn build_shells_from_faces(
     // within tolerance). Orientation is preserved: when the canonical
     // edge runs against the face's traversal direction, flip the
     // `forward` bit.
+    heal_t_junctions_across_faces(model, &mut faces, &options.common.tolerance);
     canonicalise_face_edges_by_position(model, &mut faces);
 
     // Group faces into connected components by shared edges
