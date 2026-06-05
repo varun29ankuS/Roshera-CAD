@@ -3281,7 +3281,27 @@ fn tessellate_fillet_face(
         vertex_grid.push(row);
     }
 
-    let forward = face.orientation.is_forward();
+    // Winding reconciliation. The grid quad winds (v0,v1,v2) CCW in the
+    // (u, v) lattice, so its 3D geometric normal is +(∂P/∂u × ∂P/∂v). That
+    // is NOT guaranteed to agree with the face's oriented outward normal: a
+    // fillet surface's parametric chart can be left- or right-handed
+    // relative to its own `normal` field. `CylindricalFillet` in particular
+    // sign-flips its frame_y to keep the blend arc the MINOR arc (see
+    // fillet_surfaces.rs frame construction), so du×dv points *opposite* the
+    // outward radial normal for ~half the edges of an all-edges box fillet —
+    // winding on `orientation` alone then tessellates those faces inward
+    // (FILLET-MULTIEDGE-VOLUME: half the cylinders cancelled in the
+    // divergence-theorem volume). The curved-CDT path already corrects this
+    // via `compute_chart_sign`; fillet faces route here instead, so apply
+    // the same correction: keep the CCW grid winding iff the chart handedness
+    // `sign(du×dv · normal)` matches the face orientation, making the emitted
+    // 3D normal equal `surface.normal · orientation.sign()`.
+    let ((cu_min, cu_max), (cv_min, cv_max)) = surface.parameter_bounds();
+    let chart_sign = match surface.evaluate_full(0.5 * (cu_min + cu_max), 0.5 * (cv_min + cv_max)) {
+        Ok(sp) if sp.du.cross(&sp.dv).dot(&sp.normal) < 0.0 => -1i32,
+        _ => 1i32,
+    };
+    let keep = (chart_sign == 1) == face.orientation.is_forward();
     for v_idx in 0..v_steps {
         for u_idx in 0..u_steps {
             let v0 = vertex_grid[v_idx][u_idx];
@@ -3289,7 +3309,7 @@ fn tessellate_fillet_face(
             let v2 = vertex_grid[v_idx + 1][u_idx];
             let v3 = vertex_grid[v_idx + 1][u_idx + 1];
             if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (v0, v1, v2, v3) {
-                if forward {
+                if keep {
                     mesh.add_triangle(v0, v1, v2);
                     mesh.add_triangle(v1, v3, v2);
                 } else {
@@ -3426,7 +3446,27 @@ fn tessellate_fillet_face_grid_fallback(
         vertex_grid.push(row);
     }
 
-    let forward = face.orientation.is_forward();
+    // Winding reconciliation. The grid quad winds (v0,v1,v2) CCW in the
+    // (u, v) lattice, so its 3D geometric normal is +(∂P/∂u × ∂P/∂v). That
+    // is NOT guaranteed to agree with the face's oriented outward normal: a
+    // fillet surface's parametric chart can be left- or right-handed
+    // relative to its own `normal` field. `CylindricalFillet` in particular
+    // sign-flips its frame_y to keep the blend arc the MINOR arc (see
+    // fillet_surfaces.rs frame construction), so du×dv points *opposite* the
+    // outward radial normal for ~half the edges of an all-edges box fillet —
+    // winding on `orientation` alone then tessellates those faces inward
+    // (FILLET-MULTIEDGE-VOLUME: half the cylinders cancelled in the
+    // divergence-theorem volume). The curved-CDT path already corrects this
+    // via `compute_chart_sign`; fillet faces route here instead, so apply
+    // the same correction: keep the CCW grid winding iff the chart handedness
+    // `sign(du×dv · normal)` matches the face orientation, making the emitted
+    // 3D normal equal `surface.normal · orientation.sign()`.
+    let ((cu_min, cu_max), (cv_min, cv_max)) = surface.parameter_bounds();
+    let chart_sign = match surface.evaluate_full(0.5 * (cu_min + cu_max), 0.5 * (cv_min + cv_max)) {
+        Ok(sp) if sp.du.cross(&sp.dv).dot(&sp.normal) < 0.0 => -1i32,
+        _ => 1i32,
+    };
+    let keep = (chart_sign == 1) == face.orientation.is_forward();
     for v_idx in 0..v_steps {
         for u_idx in 0..u_steps {
             let v0 = vertex_grid[v_idx][u_idx];
@@ -3434,7 +3474,7 @@ fn tessellate_fillet_face_grid_fallback(
             let v2 = vertex_grid[v_idx + 1][u_idx];
             let v3 = vertex_grid[v_idx + 1][u_idx + 1];
             if let (Some(v0), Some(v1), Some(v2), Some(v3)) = (v0, v1, v2, v3) {
-                if forward {
+                if keep {
                     mesh.add_triangle(v0, v1, v2);
                     mesh.add_triangle(v1, v3, v2);
                 } else {
