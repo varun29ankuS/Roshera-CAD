@@ -10,7 +10,7 @@
 use super::blend_graph::BlendVertexKind;
 use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
-use super::fillet::edge_orientation_in_face;
+use super::fillet::{edge_orientation_in_face, get_face_oriented_normal};
 use super::lifecycle::{self, OpSpec};
 use super::mixed_kind_corner_cap::SeamContinuity;
 use super::orientation::orient_face_for_outward;
@@ -1655,20 +1655,55 @@ fn create_chamfer_face(
     chamfer_loop.add_edge(cap_v0_edge, true);
     let loop_id = model.loops.add(chamfer_loop);
 
-    // Orientation: FaceOrientation::Forward is preserved here pending
-    // the Slice-4 consumer-side cleanup. The chamfer flat-bisector
-    // ruled surface's intrinsic u × v normal is constructed in
-    // `create_ruled_chamfer_surface` such that downstream consumers
-    // (mass-properties divergence integral, fillet's
-    // get_face_oriented_normal, shell solid_angle) compensate via
-    // `face.orientation.sign()` workarounds, and the historical
-    // Forward stamping happens to produce geometrically consistent
-    // results for convex AND concave reflex edges (see
-    // `fillet_chamfer_dihedral_matrix::fillet_and_chamfer_agree_on_concave_l_shape_reflex_edge`).
-    // Switching to an orient_face_for_outward(n1+n2) check would flip
-    // the orientation on reflex edges and break that regression pin
-    // before the consumer-side workarounds are removed in Slice 4.
-    let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
+    // Orientation: pick the FaceOrientation whose oriented outward normal
+    // points away from the solid material. The geometric outward target is
+    // the sum of the two adjacent faces' outward normals at the edge
+    // midpoint (n1 + n2): it points out of the dihedral for a convex edge
+    // and into the open notch for a reflex edge — in both cases the side the
+    // chamfer's exposed bevel must face.
+    //
+    // Previously this was hardcoded `FaceOrientation::Forward`, relying on the
+    // `create_ruled_chamfer_surface` u × v normal plus `orientation.sign()`
+    // workarounds in the *analytical* mass-properties divergence integral.
+    // That path is no longer the volume source — `compute_solid_mass_
+    // properties` always routes through the mesh — so the bevel's intrinsic
+    // normal pointing inward for non-right dihedrals (e.g. a 108° pentagon
+    // edge) made the tessellation render it inverted, over-reporting removed
+    // volume ~22× (CHAMFER-MULTIEDGE-VOLUME). Orienting outward at
+    // construction, like every other blend face, fixes the mesh volume;
+    // reflex behaviour is preserved because n1 + n2 already flips into the
+    // notch there.
+    let orientation = {
+        let target = match (
+            model.vertices.get(original_v0).map(|v| v.position),
+            model.vertices.get(original_v1).map(|v| v.position),
+        ) {
+            (Some(a), Some(b)) => {
+                let mid = Point3::new(
+                    0.5 * (a[0] + b[0]),
+                    0.5 * (a[1] + b[1]),
+                    0.5 * (a[2] + b[2]),
+                );
+                match (
+                    get_face_oriented_normal(model, face1_id, &mid).ok(),
+                    get_face_oriented_normal(model, face2_id, &mid).ok(),
+                ) {
+                    (Some(n1), Some(n2)) => Some(n1 + n2),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match target {
+            Some(t) if t.magnitude_squared() > 1e-20 => model
+                .surfaces
+                .get(surface_id)
+                .and_then(|s| orient_face_for_outward(s, t).ok())
+                .unwrap_or(FaceOrientation::Forward),
+            _ => FaceOrientation::Forward,
+        }
+    };
+    let face = Face::new(0, surface_id, loop_id, orientation);
     let face_id = model.faces.add(face);
 
     let surgery = BlendEdgeSurgery {
