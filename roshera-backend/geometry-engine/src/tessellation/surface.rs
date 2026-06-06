@@ -1403,7 +1403,8 @@ fn tessellate_spherical_polygon(
         return false;
     }
     // Unit radial directions of the rim, and the spherical centroid direction.
-    let dirs: Vec<Vector3> = rim
+    let mut rim = rim;
+    let mut dirs: Vec<Vector3> = rim
         .iter()
         .map(|&p| (p - o).normalize().unwrap_or(Vector3::Z))
         .collect();
@@ -1414,6 +1415,40 @@ fn tessellate_spherical_polygon(
         // polygon — let another path handle it.
         Err(_) => return false,
     };
+
+    // Order the rim by azimuth around the centroid so the fan always sees a
+    // SIMPLE (non-self-crossing) boundary, independent of the order/handedness
+    // in which the boundary arcs were concatenated into the loop. The faces
+    // this path handles — boolean cut-circle arrangement cells and fillet
+    // corner-octant patches — are convex / star-shaped from their centroid, so
+    // azimuthal order IS their true boundary order. Without this, a corner
+    // octant assembled from three cap arcs of mixed parametric handedness (the
+    // `CylindricalFillet` frame_y sign flip) yielded a vertex-connected but
+    // geometrically self-crossing rim that the centroid fan double-covered —
+    // rendering a quarter-sphere (2× area) instead of an octant, the count of
+    // affected corners varying run-to-run with HashMap order
+    // (FILLET-MULTIEDGE-VOLUME). Sorting also makes the triangulation
+    // deterministic. Rim 3D positions are unchanged (only reordered), so the
+    // bit-exact seam weld to the neighbouring faces is preserved.
+    {
+        let seed = if cdir.x.abs() < 0.9 {
+            Vector3::X
+        } else {
+            Vector3::Y
+        };
+        let e1 = (seed - cdir * seed.dot(&cdir))
+            .normalize()
+            .unwrap_or(Vector3::X);
+        let e2 = cdir.cross(&e1);
+        let mut order: Vec<usize> = (0..m).collect();
+        order.sort_by(|&i, &j| {
+            let ai = dirs[i].dot(&e2).atan2(dirs[i].dot(&e1));
+            let aj = dirs[j].dot(&e2).atan2(dirs[j].dot(&e1));
+            ai.partial_cmp(&aj).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rim = order.iter().map(|&i| rim[i]).collect();
+        dirs = order.iter().map(|&i| dirs[i]).collect();
+    }
     // The concentric-ring fan slerps every rim point toward the centroid, so it
     // fills any star-shaped (from the centroid) spherical polygon whose rim sits
     // strictly within the open hemisphere antipodal to NONE of it — i.e. every
@@ -1469,9 +1504,23 @@ fn tessellate_spherical_polygon(
         .collect();
     let mut prev = ring0;
 
-    let fwd = osign >= 0.0;
-    let mut tri = |a: u32, b: u32, c: u32, mesh: &mut TriangleMesh| {
-        if fwd {
+    // Wind each triangle by its GEOMETRIC normal rather than `osign` alone.
+    // The fan winding also depends on the rim's chirality (the loop edge order
+    // / orientations), which is NOT guaranteed consistent across faces: a
+    // fillet corner-octant loop is assembled from three cap arcs in an order
+    // that varies, so winding on `osign` alone flipped ~half the corner patches
+    // inward and made the all-edges fillet's spherical volume cancel to ~0
+    // (non-deterministically, via sub-ulp drift near the orientation threshold).
+    // The sphere's outward normal at any point is radial (`pos − centre`), so
+    // emit each triangle with its geometric normal aligned to `radial · osign`
+    // (the face's oriented outward normal) — robust to loop chirality.
+    let tri = |a: u32, b: u32, c: u32, mesh: &mut TriangleMesh| {
+        let pa = mesh.vertices[a as usize].position;
+        let pb = mesh.vertices[b as usize].position;
+        let pc = mesh.vertices[c as usize].position;
+        let gnormal = (pb - pa).cross(&(pc - pa));
+        let radial = (pa + pb + pc) / 3.0 - o;
+        if gnormal.dot(&radial) * osign >= 0.0 {
             mesh.add_triangle(a, b, c);
         } else {
             mesh.add_triangle(a, c, b);

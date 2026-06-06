@@ -19,7 +19,7 @@ use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::feasibility;
 use super::lifecycle::{self, OpSpec};
 use super::mixed_kind_corner_cap::SeamContinuity;
-use super::orientation::orient_face_for_outward;
+use super::orientation::{orient_face_for_outward, orient_face_for_outward_at};
 use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Matrix3, Point3, Tolerance, Vector3};
 use crate::primitives::{
@@ -2978,7 +2978,21 @@ fn apply_apex_sphere_corner(
         OperationError::NumericalError(format!("corner sphere construction failed: {:?}", e))
     })?;
 
-    let orientation = orient_face_for_outward(&sphere, vertex_outward)?;
+    // Orient by sampling the sphere normal AT the octant patch — the point in
+    // the `vertex_outward` direction from the centre — NOT at the full-sphere
+    // parameter midpoint. The midpoint lands on an unrelated part of the sphere
+    // whose radial normal is ~perpendicular to `vertex_outward` (the corner
+    // diagonal), so `normal · vertex_outward` sat near zero and flipped sign
+    // under the sub-ulp FP drift in `sphere_center` (descriptor summation
+    // order) — making the corner-patch orientation NON-DETERMINISTIC and wrong
+    // for ~half the corners, so the all-edges fillet's spherical-octant volume
+    // cancelled to ~0 (FILLET-MULTIEDGE-VOLUME). At the octant the dot is ±1, so
+    // the pick is robust and run-to-run stable.
+    let octant_point = sphere_center + vertex_outward * sphere_radius;
+    let (u_oct, v_oct) = sphere
+        .closest_point(&octant_point, Tolerance::default())
+        .unwrap_or((0.0, 0.0));
+    let orientation = orient_face_for_outward_at(&sphere, vertex_outward, u_oct, v_oct)?;
     let surface_id = model.surfaces.add(Box::new(sphere));
 
     let mut blend_loop = Loop::new(0, LoopType::Outer);
