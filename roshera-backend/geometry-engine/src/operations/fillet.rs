@@ -2966,9 +2966,9 @@ fn apply_apex_sphere_corner(
             })?;
     }
 
-    // Step 2 — verify the cap arcs close a triangle and recover the
-    // per-arc forward/backward flag for the sphere-face loop.
-    let (_corner_vertices, loop_forwards) =
+    // Step 2 — verify the cap arcs close a triangle and recover the corner
+    // vertices in TRAVERSAL (cycle) order.
+    let (corner_vertices, _loop_forwards) =
         verify_cap_arcs_form_closed_triangle(model, &cap_arc_edges)
             .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
 
@@ -2995,9 +2995,40 @@ fn apply_apex_sphere_corner(
     let orientation = orient_face_for_outward_at(&sphere, vertex_outward, u_oct, v_oct)?;
     let surface_id = model.surfaces.add(Box::new(sphere));
 
+    // Build the loop in TRAVERSAL (cycle) order recovered by
+    // `verify_cap_arcs_form_closed_triangle` (`corner_vertices`), NOT in the
+    // arbitrary `cap_arc_edges` input order — the input order is not the
+    // boundary walk, so adding edges by index yields a B-Rep loop that is not a
+    // single closed cycle (the spherical-polygon tessellator's azimuthal rim
+    // sort masked it, but the B-Rep was malformed). Reconstruct each loop edge
+    // from the consecutive corner-vertex pair it joins.
     let mut blend_loop = Loop::new(0, LoopType::Outer);
-    for i in 0..3 {
-        blend_loop.add_edge(cap_arc_edges[i], loop_forwards[i]);
+    for k in 0..3 {
+        let va = corner_vertices[k];
+        let vb = corner_vertices[(k + 1) % 3];
+        let joined = cap_arc_edges.iter().copied().find_map(|ce| {
+            let e = model.edges.get(ce)?;
+            if e.start_vertex == va && e.end_vertex == vb {
+                Some((ce, true))
+            } else if e.start_vertex == vb && e.end_vertex == va {
+                Some((ce, false))
+            } else {
+                None
+            }
+        });
+        match joined {
+            Some((ce, fwd)) => blend_loop.add_edge(ce, fwd),
+            None => {
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::TopologyViolation {
+                        detail: format!(
+                            "corner sphere loop: no cap arc joins consecutive corner \
+                             vertices {va} -> {vb}"
+                        ),
+                    },
+                )))
+            }
+        }
     }
     let loop_id = model.loops.add(blend_loop);
 

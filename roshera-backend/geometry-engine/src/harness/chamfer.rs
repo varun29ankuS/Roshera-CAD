@@ -123,24 +123,26 @@ fn within_rel(a: f64, b: f64, tol: f64) -> bool {
 mod tests {
     use super::*;
 
-    /// HARNESS-FOUND BUG (task CHAMFER-MULTIEDGE-VOLUME): chamfering ALL 12 edges
-    /// of a cube at once returns `Ok` with a valid-looking 26-face beveled cube,
-    /// but the geometry is wrong — mesh AND mass-props volume both ≈43.33 vs the
-    /// truth 45.99 (it over-removes ~6%). Few-edge shared-corner selections
-    /// (2–4) instead return a clean `NotImplemented` (degree-2 corner synthesis
-    /// deferred — Task #82). The all-edges path routes through the
-    /// partially-implemented degree-3 `ConvexCorner` synthesis, which mis-sizes
-    /// the corner facets. Same class as FILLET-MULTIEDGE-VOLUME (#51), milder.
-    /// Single-edge chamfers are correct. Pinned `#[ignore]`.
+    /// HARNESS-FOUND BUG (CHAMFER-MULTIEDGE-VOLUME #52), now FIXED: chamfering
+    /// all 12 edges of a cube at once must produce the exact beveled cube — a
+    /// closed, oriented manifold whose volume matches the Monte-Carlo truth.
+    ///
+    /// The defect was a malformed B-Rep that still tessellated into *something*:
+    /// the `brep_integrity` harness pinpointed 8 OPEN LOOPS (the 6 box faces +
+    /// corner caps). Two causes: (1) the degree-3 trim edges were NOT mitered, so
+    /// each box face's four trim lines formed an unclosed "#" instead of a square
+    /// (fixed by extending `compute_corner_miter_overrides` to degree-3); (2) the
+    /// corner-cap loop was assembled in `cap_edges` *input* order rather than the
+    /// boundary-walk order, which is only cyclic by cube-symmetry coincidence
+    /// (fixed in `apply_planar_chamfer_cap`).
     ///
     /// Truth: an equal 45° chamfer (setback d) of all edges keeps exactly the
     /// points satisfying `|x|≤s/2 ∧ |y|≤s/2 ∧ |z|≤s/2` and the three pairwise
     /// bevel half-spaces `|x|+|y| ≤ s/2+d`, `|x|+|z| ≤ …`, `|y|+|z| ≤ …`; its
     /// volume is 45.99 for s=4, d=1 (Monte-Carlo).
     #[test]
-    #[ignore = "CHAMFER-MULTIEDGE-VOLUME: all-12-edge chamfer over-removes (43.33 vs 45.99) (harness-found)"]
     fn all_edges_chamfer_matches_bevel_volume() {
-        use crate::harness::watertight::mesh_volume as mv;
+        use crate::harness::watertight::{manifold_report, mesh_volume as mv};
         let (side, d) = (4.0_f64, 1.0_f64);
         let mut model = BRepModel::new();
         TopologyBuilder::new(&mut model)
@@ -156,10 +158,21 @@ mod tests {
             ..Default::default()
         };
         chamfer_edges(&mut model, solid, edges, options).expect("all-edge chamfer");
+
+        let report = manifold_report(&model, solid, 0.02, 1e-6).expect("mesh");
+        assert!(
+            report.is_valid_solid(),
+            "beveled cube not a valid closed/oriented manifold: {report:?}"
+        );
+        assert_eq!(
+            report.euler_characteristic, 2,
+            "beveled cube χ≠2: {report:?}"
+        );
+
         let vol = mv(&model, solid, 0.01).expect("mesh");
         let truth = 45.99; // MC of {|·|≤2, pairwise sums ≤3}
         assert!(
-            (vol - truth).abs() < 0.05 * truth,
+            (vol - truth).abs() < 0.02 * truth,
             "beveled cube volume {vol:.3} vs truth {truth:.3}"
         );
     }
