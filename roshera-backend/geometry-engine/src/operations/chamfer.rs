@@ -3290,6 +3290,26 @@ fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationRe
             summary
         )));
     }
+
+    // CHAMFER-GUARD (#71) — geometric self-overlap. `validate_model_enhanced` is
+    // topological and passes on a chamfer whose cut crosses an existing fillet:
+    // the result's edges are all shared twice and its loops close, but a planar
+    // end-face's boundary carries the fillet arc, which bulges past the new
+    // chamfer edge so the face self-intersects (the #70 class — surfaces only as
+    // a silent tessellation hole otherwise). Reject it here so the op never emits
+    // a geometrically self-overlapping solid; the rollback wrapper restores the
+    // pre-chamfer model, so the caller sees a clean failure instead of garbage.
+    let overlapping = super::geometry_validity::self_overlapping_planar_faces(model, solid_id);
+    if !overlapping.is_empty() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "chamfer produced a geometrically self-overlapping solid: {} planar face(s) \
+             {:?} have a self-intersecting boundary (the chamfer cut crosses an adjacent \
+             feature, e.g. a fillet). Chamfer a non-crossing edge, reduce the distance, \
+             or apply the chamfer before the crossed feature.",
+            overlapping.len(),
+            &overlapping[..overlapping.len().min(6)]
+        )));
+    }
     Ok(())
 }
 
