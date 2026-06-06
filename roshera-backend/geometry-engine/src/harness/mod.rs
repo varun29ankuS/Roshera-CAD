@@ -21,6 +21,7 @@ pub mod cd;
 pub mod chamfer;
 pub mod extrude;
 pub mod fillet;
+pub mod integration;
 pub mod loft;
 pub mod math_oracle;
 pub mod poke_matrix;
