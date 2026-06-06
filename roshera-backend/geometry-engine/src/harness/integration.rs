@@ -467,27 +467,21 @@ mod tests {
         m.edges.iter().next().map(|(id, _)| id).expect("edge")
     }
 
-    /// PINNED FINDING — CHAMFER-CROSSES-FILLET self-overlap (#70). Chamfering an
-    /// edge that *crosses* an existing fillet (here `edge 1` of the filleted box,
-    /// which abuts the fillet) makes the chamfer plane cut THROUGH the fillet
-    /// region. The result is topologically clean (brep_integrity passes, edges
-    /// shared twice, loops close) and volume-approximately-correct, but
-    /// GEOMETRICALLY SELF-OVERLAPPING: a planar end-face's boundary loop carries
-    /// the fillet's quarter-circle arc, whose densified samples bulge past the new
-    /// chamfer edge (arc tip y≈0.50 vs chamfer edge y≈0.10), so the projected
-    /// contour self-intersects → the planar CDT rejects it (`CrossingFixedEdge`) →
-    /// that face emits 0 triangles → the mesh leaks (163 boundary edges, euler −6).
-    ///
-    /// This is NOT a tessellation/integration defect: the disjoint composition
-    /// (chamfer an edge FAR from the fillet) passes the FULL contract — see
-    /// `chain_fillet_then_chamfer_passes_contract`. It is a chamfer
-    /// geometry-VALIDITY gap: the op silently produces a self-overlapping solid on
-    /// a fillet-crossing edge instead of trimming the overlap or rejecting it
-    /// (brep_integrity is a topological check and cannot see geometric overlap).
-    /// Un-ignore once chamfer trims/validates against crossed fillet faces.
+    /// CHAMFER-GUARD (#71) — the chamfer-crosses-fillet case (#70) must be
+    /// REJECTED, not silently emitted. Chamfering `edge 1` of the filleted box
+    /// (which abuts the fillet) makes the chamfer cut cross the fillet region; the
+    /// result would be topologically clean (edges shared twice, loops close) but
+    /// GEOMETRICALLY SELF-OVERLAPPING — a planar end-face's boundary carries the
+    /// fillet arc, which bulges past the new chamfer edge so the face's loop
+    /// self-intersects (surfacing otherwise only as a silent tessellation hole:
+    /// 163 boundary edges, euler −6). The guard's `self_overlapping_planar_faces`
+    /// check fires, `chamfer_edges` returns Err, and the rollback wrapper leaves
+    /// the model unchanged (the valid box→fillet). The disjoint composition still
+    /// succeeds and passes the FULL contract — see
+    /// `chain_fillet_then_chamfer_passes_contract`. (The deep fix — trimming the
+    /// chamfer against the fillet so it *succeeds* validly — is #72.)
     #[test]
-    #[ignore = "#70 CHAMFER-CROSSES-FILLET: chamfer over a fillet yields a self-overlapping solid (topologically clean, geometrically invalid)"]
-    fn chamfer_crossing_fillet_is_valid_geometry_pinned_70() {
+    fn chamfer_crossing_fillet_is_rejected_guard_70() {
         let mut m = BRepModel::new();
         TopologyBuilder::new(&mut m)
             .create_box_3d(6.0, 6.0, 6.0)
@@ -505,9 +499,10 @@ mod tests {
             },
         )
         .expect("fillet");
+        let faces_before = m.faces.iter().count();
         // `edge 1` of the filleted solid abuts the fillet — the crossing case.
         let e1 = m.edges.iter().next().map(|(id, _)| id).expect("edge2");
-        chamfer_edges(
+        let res = chamfer_edges(
             &mut m,
             s,
             vec![e1],
@@ -518,9 +513,18 @@ mod tests {
                 symmetric: true,
                 ..Default::default()
             },
-        )
-        .expect("chamfer");
-        assert_contract(&mut m, s, "box→fillet→chamfer(crossing) (FULL — #70)");
+        );
+        assert!(
+            res.is_err(),
+            "chamfer crossing a fillet must be rejected (self-overlapping solid), got Ok"
+        );
+        // Rollback: the model is the untouched, still-valid box→fillet.
+        assert_eq!(
+            m.faces.iter().count(),
+            faces_before,
+            "rejected chamfer must roll back to the pre-chamfer model"
+        );
+        assert_structural(&mut m, s, "box→fillet (after rejected crossing chamfer)");
     }
 
     /// CHAIN: union two overlapping boxes → fillet an edge of the union. Booleans
