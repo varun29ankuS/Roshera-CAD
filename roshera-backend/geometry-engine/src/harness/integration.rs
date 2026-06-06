@@ -285,6 +285,12 @@ mod tests {
                 distance1: 0.4,
                 distance2: 0.4,
                 symmetric: true,
+                // Bypass the #71 guard so the self-overlapping solid is BUILT for
+                // diagnosis (the trim #72 needs to see the exact bad geometry).
+                common: crate::operations::CommonOptions {
+                    validate_result: false,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -371,24 +377,41 @@ mod tests {
                 }
             }
         }
-        // Dump the 0-triangle / suspicious faces' loops.
-        for fid in [5u32, 7] {
-            if let Some(face) = m.faces.get(fid) {
-                if let Some(lp) = m.loops.get(face.outer_loop) {
-                    eprintln!("--- face {fid} outer loop: {} edges ---", lp.edges.len());
-                    for (i, &eid) in lp.edges.iter().enumerate() {
-                        let fwd = lp.orientations.get(i).copied().unwrap_or(true);
-                        if let Some(e) = m.edges.get(eid) {
-                            let (a, b) = if fwd {
-                                (e.start_vertex, e.end_vertex)
-                            } else {
-                                (e.end_vertex, e.start_vertex)
-                            };
-                            let pa = m.vertices.get(a).map(|v| v.position).unwrap_or([0.0; 3]);
-                            let pb = m.vertices.get(b).map(|v| v.position).unwrap_or([0.0; 3]);
-                            eprintln!("    e{eid} fwd={fwd} v{a}({:.2},{:.2},{:.2})->v{b}({:.2},{:.2},{:.2})",
-                                pa[0],pa[1],pa[2],pb[0],pb[1],pb[2]);
-                        }
+        // Dump EVERY face's outer loop with per-edge curve type.
+        let overlap = crate::operations::geometry_validity::self_overlapping_planar_faces(&m, s);
+        eprintln!("--- self_overlapping_planar_faces = {overlap:?} ---");
+        if let Some(shell) = m.shells.get(solid_ref2.outer_shell) {
+            for &fid in &shell.faces {
+                let Some(face) = m.faces.get(fid) else {
+                    continue;
+                };
+                let st = m.surfaces.get(face.surface_id).map(|s| s.type_name());
+                let Some(lp) = m.loops.get(face.outer_loop) else {
+                    continue;
+                };
+                eprintln!(
+                    "--- face {fid} {st:?} outer loop: {} edges ---",
+                    lp.edges.len()
+                );
+                for (i, &eid) in lp.edges.iter().enumerate() {
+                    let fwd = lp.orientations.get(i).copied().unwrap_or(true);
+                    if let Some(e) = m.edges.get(eid) {
+                        let (a, b) = if fwd {
+                            (e.start_vertex, e.end_vertex)
+                        } else {
+                            (e.end_vertex, e.start_vertex)
+                        };
+                        let pa = m.vertices.get(a).map(|v| v.position).unwrap_or([0.0; 3]);
+                        let pb = m.vertices.get(b).map(|v| v.position).unwrap_or([0.0; 3]);
+                        let ct = m
+                            .curves
+                            .get(e.curve_id)
+                            .map(|c| c.type_name())
+                            .unwrap_or("?");
+                        eprintln!(
+                            "    e{eid} [{ct}] fwd={fwd} v{a}({:.2},{:.2},{:.2})->v{b}({:.2},{:.2},{:.2})",
+                            pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]
+                        );
                     }
                 }
             }
