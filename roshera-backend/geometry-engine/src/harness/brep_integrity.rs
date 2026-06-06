@@ -394,17 +394,16 @@ mod tests {
     /// faces, no unmerged vertices, no coincident edges). This is the universal
     /// structural contract — the dual of the watertight/manifold output oracle.
     ///
-    /// KNOWN_OPEN lists operations whose B-Rep is currently malformed (their mesh
-    /// is still watertight by position-welding, so the watertight oracle misses
-    /// it). The sweep found by THIS harness: `sweep_profile` over-segments the
-    /// path (~`num_sections` sections even for a straight rail) and emits the
-    /// sections unstitched — coincident-but-distinct edges, open loops — tracked
-    /// as #64. The assertion pins the exact known-open set: a NEW dirty operation
-    /// fails it (regression / new bug), and fixing sweep also fails it (a nudge to
-    /// drop the entry).
+    /// KNOWN_OPEN lists operations whose B-Rep is *expected* to be malformed
+    /// (none today). The assertion pins the exact known-open set: a NEW dirty
+    /// operation fails it (regression / new bug), and an op that becomes clean
+    /// while still listed also fails it (a nudge to drop the entry). The sweep
+    /// (#64 — over-segmented, unstitched sections) was the last entry and is now
+    /// fixed (vertex/edge sharing in `pattern::transform_loop` + sweep's
+    /// `create_or_find_edge` + walk-order quad loops), so the list is empty.
     #[test]
     fn every_operation_brep_is_structurally_clean() {
-        const KNOWN_OPEN: &[&str] = &["sweep/prism"]; // #64
+        const KNOWN_OPEN: &[&str] = &[];
         let mut unexpected_dirty = Vec::new();
         let mut clean_but_listed = Vec::new();
         for (name, rep, model) in run_sweep() {
