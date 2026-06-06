@@ -2354,7 +2354,7 @@ fn compute_corner_miter_overrides(
     let mut overrides: MiterOverrideMap = HashMap::new();
 
     for corner in &corner_set.corners {
-        if corner.edge_indices.len() < 4 {
+        if corner.edge_indices.len() < 3 {
             continue;
         }
         let cyclic = match cyclic_order_at_corner(model, solid_id, corner, selected_edges) {
@@ -2588,7 +2588,7 @@ fn apply_planar_chamfer_cap(
     // `BlendEdgeSurgery::cap_v{0,1}_edge` so no geometric search is
     // performed here; mitered (Chamfer-β) and raw-perpendicular
     // (Chamfer-α) endpoints flow through the same path.
-    let (corner_vertices, loop_forwards) = verify_cap_edges_form_closed_polygon(model, cap_edges)
+    let (corner_vertices, _loop_forwards) = verify_cap_edges_form_closed_polygon(model, cap_edges)
         .map_err(|e| OperationError::BlendFailed(Box::new(e)))?;
 
     // Step 2 — read the N corner vertex positions in traversal order
@@ -2644,9 +2644,44 @@ fn apply_planar_chamfer_cap(
     let orientation = orient_face_for_outward(&plane, vertex_outward)?;
     let surface_id = model.surfaces.add(Box::new(plane));
 
+    // Build the cap loop in the TRAVERSAL (cyclic) order that
+    // `verify_cap_edges_form_closed_polygon` recovered (`corner_vertices`), NOT
+    // in the arbitrary input order of `cap_edges`. The input order only happens
+    // to be cyclic by coincidence (e.g. unmitered cube symmetry); once the trim
+    // edges are mitered at degree-3 corners the input order no longer matches
+    // the boundary walk, so building in input order produced a non-closed loop
+    // (open box-face / cap loops → non-conforming, leaky tessellation —
+    // CHAMFER-MULTIEDGE-VOLUME). Reconstruct each loop edge from the consecutive
+    // corner-vertex pair it joins, deriving the loop-forward flag from the
+    // edge's own start/end so it is correct regardless of input order.
     let mut cap_loop = Loop::new(0, LoopType::Outer);
-    for (i, &cap_edge) in cap_edges.iter().enumerate() {
-        cap_loop.add_edge(cap_edge, loop_forwards[i]);
+    let n = corner_vertices.len();
+    for k in 0..n {
+        let va = corner_vertices[k];
+        let vb = corner_vertices[(k + 1) % n];
+        let joined = cap_edges.iter().copied().find_map(|ce| {
+            let e = model.edges.get(ce)?;
+            if e.start_vertex == va && e.end_vertex == vb {
+                Some((ce, true))
+            } else if e.start_vertex == vb && e.end_vertex == va {
+                Some((ce, false))
+            } else {
+                None
+            }
+        });
+        match joined {
+            Some((ce, fwd)) => cap_loop.add_edge(ce, fwd),
+            None => {
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::TopologyViolation {
+                        detail: format!(
+                            "chamfer corner cap loop: no cap edge joins consecutive \
+                             corner vertices {va} -> {vb}"
+                        ),
+                    },
+                )))
+            }
+        }
     }
     let loop_id = model.loops.add(cap_loop);
 

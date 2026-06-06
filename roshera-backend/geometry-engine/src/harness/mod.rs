@@ -16,6 +16,7 @@
 //! kernel areas plug in by producing their own `AblationReport`s the same way.
 
 pub mod boolean;
+pub mod brep_integrity;
 pub mod cd;
 pub mod chamfer;
 pub mod extrude;
