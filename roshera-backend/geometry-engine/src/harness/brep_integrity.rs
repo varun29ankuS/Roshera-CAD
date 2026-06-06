@@ -258,17 +258,28 @@ pub fn brep_integrity(model: &BRepModel, solid: SolidId, eps: f64) -> BRepIntegr
         }
     }
 
-    // Coincident edges: distinct edges whose endpoint POSITIONS match (as an
-    // unordered pair). Two faces stitched to coincident-but-distinct edges read
-    // as a closed shell yet never weld.
-    let mut edge_pos_groups: BTreeMap<[(i64, i64, i64); 2], Vec<EdgeId>> = BTreeMap::new();
+    // Coincident edges: distinct edges that occupy the same curve in space.
+    // Keyed by the (unordered endpoint pair, midpoint) so two faces stitched to
+    // coincident-but-distinct edges are caught — while two DIFFERENT seam curves
+    // of a periodic surface that merely share their endpoints (e.g. a torus's u
+    // and v seams meeting at the parameter-rectangle corner) are NOT, since
+    // their midpoints differ.
+    let mut edge_pos_groups: BTreeMap<[(i64, i64, i64); 3], Vec<EdgeId>> = BTreeMap::new();
     for adj in &r.adjacency {
         let pa = model.vertices.get(adj.start).map(|v| v.position);
         let pb = model.vertices.get(adj.end).map(|v| v.position);
-        if let (Some(pa), Some(pb)) = (pa, pb) {
+        let mid = model.edges.get(adj.edge).and_then(|e| {
+            let c = model.curves.get(e.curve_id)?;
+            let t = 0.5 * (e.param_range.start + e.param_range.end);
+            c.point_at(t).ok().map(|p| [p.x, p.y, p.z])
+        });
+        if let (Some(pa), Some(pb), Some(mid)) = (pa, pb, mid) {
             let (ka, kb) = (key(pa, eps), key(pb, eps));
-            let pair = if ka <= kb { [ka, kb] } else { [kb, ka] };
-            edge_pos_groups.entry(pair).or_default().push(adj.edge);
+            let (lo, hi) = if ka <= kb { (ka, kb) } else { (kb, ka) };
+            edge_pos_groups
+                .entry([lo, hi, key(mid, eps)])
+                .or_default()
+                .push(adj.edge);
         }
     }
     for g in edge_pos_groups.into_values() {
@@ -286,7 +297,9 @@ pub fn brep_integrity(model: &BRepModel, solid: SolidId, eps: f64) -> BRepIntegr
 fn loop_closes(lp: &crate::primitives::r#loop::Loop, model: &BRepModel) -> bool {
     let n = lp.edges.len();
     if n == 0 {
-        return false;
+        // A face with no boundary edges is a CLOSED surface patch (e.g. a full
+        // sphere represented as a single seamless face) — not an open loop.
+        return true;
     }
     let endpoints = |eid: EdgeId, fwd: bool| -> Option<(VertexId, VertexId)> {
         let e = model.edges.get(eid)?;
@@ -319,9 +332,314 @@ fn loop_closes(lp: &crate::primitives::r#loop::Loop, model: &BRepModel) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::{Point3, Vector3};
+    use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use crate::operations::chamfer::{chamfer_edges, ChamferOptions, ChamferType};
+    use crate::operations::extrude::{extrude_profile, ExtrudeOptions};
     use crate::operations::fillet::{fillet_edges, FilletOptions, FilletType};
+    use crate::operations::revolve::{revolve_profile, RevolveOptions};
+    use crate::operations::transform::translate;
+    use crate::operations::{loft_profiles, sweep_profile, LoftOptions, SweepOptions};
+    use crate::primitives::curve::Line;
+    use crate::primitives::edge::{Edge, EdgeOrientation};
     use crate::primitives::topology_builder::TopologyBuilder;
+
+    /// Add a straight edge between two existing vertices.
+    fn line_edge(m: &mut BRepModel, a: VertexId, b: VertexId) -> EdgeId {
+        let pa = m.vertices.get(a).expect("va").position;
+        let pb = m.vertices.get(b).expect("vb").position;
+        let cid = m.curves.add(Box::new(Line::new(
+            Point3::new(pa[0], pa[1], pa[2]),
+            Point3::new(pb[0], pb[1], pb[2]),
+        )));
+        m.edges
+            .add(Edge::new_auto_range(0, a, b, cid, EdgeOrientation::Forward))
+    }
+
+    /// Closed CCW rectangle profile in the z=`z` plane (xy rectangle).
+    fn rect_xy(m: &mut BRepModel, w: f64, h: f64, ox: f64, oy: f64, z: f64) -> Vec<EdgeId> {
+        let v = [
+            m.vertices.add(ox, oy, z),
+            m.vertices.add(ox + w, oy, z),
+            m.vertices.add(ox + w, oy + h, z),
+            m.vertices.add(ox, oy + h, z),
+        ];
+        (0..4).map(|i| line_edge(m, v[i], v[(i + 1) % 4])).collect()
+    }
+
+    /// The last solid built in `m`.
+    fn last(m: &BRepModel) -> SolidId {
+        m.solids.iter().last().map(|(id, _)| id).expect("solid")
+    }
+
+    /// STRUCTURAL-INTEGRITY SWEEP across every solid-producing operation. Builds
+    /// each operation's canonical result and reports whether its B-Rep is a clean
+    /// closed 2-manifold shell — surfacing latent loop/weld/duplicate defects the
+    /// tessellated watertight oracle cannot see (exactly how the fillet #51 and
+    /// chamfer #52 corner loops were caught). Diagnostic: prints a table; the
+    /// asserting sibling `every_operation_brep_is_structurally_clean` pins it.
+    #[test]
+    #[ignore = "diagnostic: brep_integrity across every operation harness"]
+    fn diag_integrity_sweep() {
+        for (name, rep, model) in run_sweep() {
+            eprintln!("{name:>22}: clean={}", rep.is_clean());
+            if !rep.is_clean() {
+                eprintln!("{}", rep.render(&model));
+            }
+        }
+    }
+
+    /// Every solid-producing operation must yield a structurally clean B-Rep
+    /// (closed 2-manifold: all loops close, every edge shared by exactly two
+    /// faces, no unmerged vertices, no coincident edges). This is the universal
+    /// structural contract — the dual of the watertight/manifold output oracle.
+    ///
+    /// KNOWN_OPEN lists operations whose B-Rep is currently malformed (their mesh
+    /// is still watertight by position-welding, so the watertight oracle misses
+    /// it). The sweep found by THIS harness: `sweep_profile` over-segments the
+    /// path (~`num_sections` sections even for a straight rail) and emits the
+    /// sections unstitched — coincident-but-distinct edges, open loops — tracked
+    /// as #64. The assertion pins the exact known-open set: a NEW dirty operation
+    /// fails it (regression / new bug), and fixing sweep also fails it (a nudge to
+    /// drop the entry).
+    #[test]
+    fn every_operation_brep_is_structurally_clean() {
+        const KNOWN_OPEN: &[&str] = &["sweep/prism"]; // #64
+        let mut unexpected_dirty = Vec::new();
+        let mut clean_but_listed = Vec::new();
+        for (name, rep, model) in run_sweep() {
+            let listed = KNOWN_OPEN.contains(&name);
+            match (rep.is_clean(), listed) {
+                (false, false) => unexpected_dirty.push(format!("{name}:\n{}", rep.render(&model))),
+                (true, true) => clean_but_listed.push(name),
+                _ => {}
+            }
+        }
+        assert!(
+            unexpected_dirty.is_empty(),
+            "operations with NEWLY malformed B-Reps (not in KNOWN_OPEN):\n{}",
+            unexpected_dirty.join("\n")
+        );
+        assert!(
+            clean_but_listed.is_empty(),
+            "operations are now clean — remove from KNOWN_OPEN: {clean_but_listed:?}"
+        );
+    }
+
+    /// Build every operation's canonical result and its integrity report.
+    /// Returns `(name, report, model)` so a failing case can render detail.
+    fn run_sweep() -> Vec<(&'static str, BRepIntegrityReport, BRepModel)> {
+        let mut out: Vec<(&'static str, BRepIntegrityReport, BRepModel)> = Vec::new();
+        let mut push = |name: &'static str, model: BRepModel, solid: SolidId| {
+            let rep = brep_integrity(&model, solid, 1e-6);
+            out.push((name, rep, model));
+        };
+
+        // ── Primitives ──────────────────────────────────────────────────────
+        for (name, build) in [
+            (
+                "prim/box",
+                Box::new(|m: &mut BRepModel| {
+                    TopologyBuilder::new(m).create_box_3d(2.0, 3.0, 4.0).ok();
+                }) as Box<dyn Fn(&mut BRepModel)>,
+            ),
+            (
+                "prim/sphere",
+                Box::new(|m: &mut BRepModel| {
+                    TopologyBuilder::new(m)
+                        .create_sphere_3d(Vector3::ZERO, 2.0)
+                        .ok();
+                }),
+            ),
+            (
+                "prim/cylinder",
+                Box::new(|m: &mut BRepModel| {
+                    TopologyBuilder::new(m)
+                        .create_cylinder_3d(Vector3::ZERO, Vector3::Z, 2.0, 5.0)
+                        .ok();
+                }),
+            ),
+            (
+                "prim/cone",
+                Box::new(|m: &mut BRepModel| {
+                    TopologyBuilder::new(m)
+                        .create_cone_3d(Vector3::ZERO, Vector3::Z, 2.0, 0.0, 5.0)
+                        .ok();
+                }),
+            ),
+            (
+                "prim/cone-frustum",
+                Box::new(|m: &mut BRepModel| {
+                    TopologyBuilder::new(m)
+                        .create_cone_3d(Vector3::ZERO, Vector3::Z, 2.0, 1.0, 5.0)
+                        .ok();
+                }),
+            ),
+            (
+                "prim/torus",
+                Box::new(|m: &mut BRepModel| {
+                    TopologyBuilder::new(m)
+                        .create_torus_3d(Vector3::ZERO, Vector3::Z, 3.0, 1.0)
+                        .ok();
+                }),
+            ),
+        ] {
+            let mut m = BRepModel::new();
+            build(&mut m);
+            let s = last(&m);
+            push(name, m, s);
+        }
+
+        // ── Extrude ─────────────────────────────────────────────────────────
+        {
+            let mut m = BRepModel::new();
+            let prof = rect_xy(&mut m, 2.0, 3.0, 0.0, 0.0, 0.0);
+            if let Ok(s) = extrude_profile(
+                &mut m,
+                prof,
+                ExtrudeOptions {
+                    distance: 4.0,
+                    ..Default::default()
+                },
+            ) {
+                push("extrude/box", m, s);
+            }
+        }
+
+        // ── Revolve (full 2π) ───────────────────────────────────────────────
+        {
+            let mut m = BRepModel::new();
+            let v = [
+                m.vertices.add(1.0, 0.0, 0.0),
+                m.vertices.add(2.0, 0.0, 0.0),
+                m.vertices.add(2.0, 0.0, 3.0),
+                m.vertices.add(1.0, 0.0, 3.0),
+            ];
+            let prof: Vec<EdgeId> = (0..4)
+                .map(|i| line_edge(&mut m, v[i], v[(i + 1) % 4]))
+                .collect();
+            if let Ok(s) = revolve_profile(
+                &mut m,
+                prof,
+                RevolveOptions {
+                    axis_origin: Point3::ZERO,
+                    axis_direction: Vector3::Z,
+                    angle: std::f64::consts::TAU,
+                    ..Default::default()
+                },
+            ) {
+                push("revolve/tube-2pi", m, s);
+            }
+        }
+
+        // ── Sweep ───────────────────────────────────────────────────────────
+        {
+            let mut m = BRepModel::new();
+            let prof = rect_xy(&mut m, 2.0, 2.0, 0.0, 0.0, 0.0);
+            let a = m.vertices.add(0.0, 0.0, 0.0);
+            let b = m.vertices.add(0.0, 0.0, 5.0);
+            let path = line_edge(&mut m, a, b);
+            if let Ok(s) = sweep_profile(&mut m, prof, path, SweepOptions::default()) {
+                push("sweep/prism", m, s);
+            }
+        }
+
+        // ── Loft ────────────────────────────────────────────────────────────
+        {
+            let mut m = BRepModel::new();
+            let p0 = rect_xy(&mut m, 2.0, 2.0, 0.0, 0.0, 0.0);
+            let p1 = rect_xy(&mut m, 2.0, 2.0, 0.5, 0.5, 4.0);
+            if let Ok(s) = loft_profiles(
+                &mut m,
+                vec![p0, p1],
+                LoftOptions {
+                    create_solid: true,
+                    ..Default::default()
+                },
+            ) {
+                push("loft/prism", m, s);
+            }
+        }
+
+        // ── Transform (translate a box) ─────────────────────────────────────
+        {
+            let mut m = BRepModel::new();
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(2.0, 2.0, 2.0)
+                .ok();
+            let s = last(&m);
+            translate(&mut m, vec![s], Vector3::X, 3.0, Default::default()).ok();
+            push("transform/translate", m, s);
+        }
+
+        // ── Boolean union / intersection / difference (overlapping boxes) ───
+        for (name, op) in [
+            ("boolean/union", BooleanOp::Union),
+            ("boolean/intersection", BooleanOp::Intersection),
+            ("boolean/difference", BooleanOp::Difference),
+        ] {
+            let mut m = BRepModel::new();
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(4.0, 4.0, 4.0)
+                .ok();
+            let a = last(&m);
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(4.0, 4.0, 4.0)
+                .ok();
+            let b = last(&m);
+            translate(&mut m, vec![b], Vector3::X, 2.0, Default::default()).ok();
+            if let Ok(s) = boolean_operation(&mut m, a, b, op, BooleanOptions::default()) {
+                push(name, m, s);
+            }
+        }
+
+        // ── Fillet single + all-12 ──────────────────────────────────────────
+        for (name, all) in [("fillet/single-edge", false), ("fillet/all-12-edge", true)] {
+            let (mut m, s, edges) = box_all_edges(4.0);
+            let sel = if all { edges } else { vec![edges[0]] };
+            if fillet_edges(
+                &mut m,
+                s,
+                sel,
+                FilletOptions {
+                    fillet_type: FilletType::Constant(0.5),
+                    radius: 0.5,
+                    ..Default::default()
+                },
+            )
+            .is_ok()
+            {
+                push(name, m, s);
+            }
+        }
+
+        // ── Chamfer single + all-12 ─────────────────────────────────────────
+        for (name, all) in [
+            ("chamfer/single-edge", false),
+            ("chamfer/all-12-edge", true),
+        ] {
+            let (mut m, s, edges) = box_all_edges(4.0);
+            let sel = if all { edges } else { vec![edges[0]] };
+            if chamfer_edges(
+                &mut m,
+                s,
+                sel,
+                ChamferOptions {
+                    chamfer_type: ChamferType::EqualDistance(0.5),
+                    distance1: 0.5,
+                    distance2: 0.5,
+                    symmetric: true,
+                    ..Default::default()
+                },
+            )
+            .is_ok()
+            {
+                push(name, m, s);
+            }
+        }
+
+        out
+    }
 
     fn box_all_edges(side: f64) -> (BRepModel, SolidId, Vec<EdgeId>) {
         let mut model = BRepModel::new();
