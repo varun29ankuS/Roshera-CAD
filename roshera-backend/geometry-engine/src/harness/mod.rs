@@ -28,6 +28,7 @@ pub mod revolve;
 pub mod shell;
 pub mod sweep;
 pub mod tessellation;
+pub mod tessellation_oracle;
 pub mod transform;
 pub mod watertight;
 
