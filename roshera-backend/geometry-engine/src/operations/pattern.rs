@@ -17,6 +17,7 @@ use crate::primitives::{
     face::{Face, FaceId},
     r#loop::Loop,
     topology_builder::BRepModel,
+    vertex::VertexId,
 };
 
 /// Type of pattern
@@ -563,77 +564,75 @@ fn transform_loop(
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
 
-    let mut transformed_edges = Vec::new();
-
-    for (i, &edge_id) in loop_data.edges.iter().enumerate() {
-        let forward = loop_data.orientations[i];
-        let transformed_edge = transform_edge(model, edge_id, transform)?;
-        transformed_edges.push((transformed_edge, forward));
-    }
-
+    // Transform each UNIQUE original vertex once and SHARE it across the loop's
+    // edges, so a corner shared by two consecutive edges stays a single
+    // transformed VertexId. The previous per-edge `transform_edge` minted a
+    // fresh vertex for every endpoint, so every shared corner became two
+    // coincident-but-distinct vertices and the transformed loop was a non-closed
+    // chain — the source of sweep's open cap loops + duplicate cap vertices
+    // (SWEEP-BREP-UNSTITCHED #64), and a latent malformation in every pattern
+    // copy's faces.
+    let mut vmap: std::collections::HashMap<VertexId, VertexId> = std::collections::HashMap::new();
     let mut new_loop = Loop::new(
         0, // Will be assigned by store
         loop_data.loop_type,
     );
-    for (edge_id, forward) in transformed_edges {
-        new_loop.add_edge(edge_id, forward);
+
+    for (i, &edge_id) in loop_data.edges.iter().enumerate() {
+        let forward = loop_data.orientations[i];
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+            .clone();
+
+        let new_start = transform_vertex_shared(model, &mut vmap, edge.start_vertex, transform)?;
+        let new_end = transform_vertex_shared(model, &mut vmap, edge.end_vertex, transform)?;
+
+        let curve = model
+            .curves
+            .get(edge.curve_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+        let new_curve_id = model.curves.add(curve.transform(transform));
+
+        let new_edge = Edge::new(
+            0,
+            new_start,
+            new_end,
+            new_curve_id,
+            edge.orientation,
+            edge.param_range,
+        );
+        new_loop.add_edge(model.edges.add(new_edge), forward);
     }
 
     Ok(new_loop)
 }
 
-/// Transform an edge
-fn transform_edge(
+/// Transform one vertex through `transform`, reusing the result for any later
+/// edge that shares the same original vertex (so a loop's shared corners stay a
+/// single transformed VertexId).
+fn transform_vertex_shared(
     model: &mut BRepModel,
-    edge_id: EdgeId,
+    vmap: &mut std::collections::HashMap<VertexId, VertexId>,
+    vid: VertexId,
     transform: &Matrix4,
-) -> OperationResult<EdgeId> {
-    let edge = model
-        .edges
-        .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
-        .clone();
-
-    // Transform curve
-    let curve = model
-        .curves
-        .get(edge.curve_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
-    let transformed_curve = curve.transform(transform);
-    let new_curve_id = model.curves.add(transformed_curve);
-
-    // Transform vertices
-    let start_vertex = model
+) -> OperationResult<VertexId> {
+    if let Some(&nv) = vmap.get(&vid) {
+        return Ok(nv);
+    }
+    let pos = model
         .vertices
-        .get(edge.start_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?;
-    let end_vertex = model
-        .vertices
-        .get(edge.end_vertex)
-        .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?;
-
-    let new_start_pos = transform.transform_point(&Point3::from(start_vertex.position));
-    let new_end_pos = transform.transform_point(&Point3::from(end_vertex.position));
-
-    let new_start = model
-        .vertices
-        .add(new_start_pos.x, new_start_pos.y, new_start_pos.z);
-    let new_end = model
-        .vertices
-        .add(new_end_pos.x, new_end_pos.y, new_end_pos.z);
-
-    // Create new edge
-    let new_edge = Edge::new(
-        0, // Will be assigned by store
-        new_start,
-        new_end,
-        new_curve_id,
-        edge.orientation,
-        edge.param_range,
-    );
-
-    Ok(model.edges.add(new_edge))
+        .get(vid)
+        .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?
+        .position;
+    let np = transform.transform_point(&Point3::from(pos));
+    let nv = model.vertices.add(np.x, np.y, np.z);
+    vmap.insert(vid, nv);
+    Ok(nv)
 }
+
+/// Transform an edge
 
 /// Check for interference between instances using face vertex bounding-box
 /// overlap.

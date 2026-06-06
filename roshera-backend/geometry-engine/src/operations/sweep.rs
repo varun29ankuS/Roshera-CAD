@@ -893,15 +893,23 @@ fn create_quad_face(
     let e3 = create_or_find_edge(model, v3, v4)?;
     let e4 = create_or_find_edge(model, v4, v1)?;
 
-    // Create loop
+    // Create loop walking v1→v2→v3→v4→v1. Each edge may be a SHARED edge
+    // recovered (by `create_or_find_edge`) in either stored direction, so the
+    // per-edge loop-forward flag must be derived from the edge's actual
+    // start_vertex — hardcoding `true` left the loop a non-closed chain whenever
+    // a shared seam edge happened to be stored reversed (#64).
     let mut quad_loop = Loop::new(
         0, // ID will be assigned by store
         crate::primitives::r#loop::LoopType::Outer,
     );
-    quad_loop.add_edge(e1, true);
-    quad_loop.add_edge(e2, true);
-    quad_loop.add_edge(e3, true);
-    quad_loop.add_edge(e4, true);
+    for (edge_id, from) in [(e1, v1), (e2, v2), (e3, v3), (e4, v4)] {
+        let fwd = model
+            .edges
+            .get(edge_id)
+            .map(|e| e.start_vertex == from)
+            .unwrap_or(true);
+        quad_loop.add_edge(edge_id, fwd);
+    }
     let loop_id = model.loops.add(quad_loop);
 
     // Create surface (bilinear patch)
@@ -927,6 +935,23 @@ fn create_or_find_edge(
     end: VertexId,
 ) -> OperationResult<EdgeId> {
     use crate::primitives::curve::Line;
+
+    // FIND first: reuse an existing edge joining these two vertices (in either
+    // direction) so adjacent sweep faces SHARE their seam instead of each
+    // minting a coincident duplicate. Without this the function only ever
+    // created, so every lateral panel and cap built its own edges and the swept
+    // B-Rep was a pile of unstitched, coincident-edged sections that only
+    // tessellated watertight by position-welding (SWEEP-BREP-UNSTITCHED #64).
+    // The sweep's vertices are shared by id across consecutive sections, so an
+    // id match recovers the genuine shared seam (the section ring edge and the
+    // neighbouring panel's edge).
+    for (eid, edge) in model.edges.iter() {
+        if (edge.start_vertex == start && edge.end_vertex == end)
+            || (edge.start_vertex == end && edge.end_vertex == start)
+        {
+            return Ok(eid);
+        }
+    }
 
     let start_vertex = model
         .vertices
