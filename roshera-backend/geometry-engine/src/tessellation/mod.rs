@@ -288,12 +288,38 @@ mod watertight_tests {
         (mesh, model)
     }
 
-    /// Count how many times each undirected edge appears across the
-    /// mesh's triangles. Returns a map from sorted (u32, u32) to count.
+    /// Count how many times each undirected edge appears across the mesh's
+    /// triangles, **welding vertices by quantised position first**. Tessellation
+    /// intentionally keeps coincident-but-sharp-edged samples as distinct mesh
+    /// vertices so each face retains its own shading normal (see
+    /// `weld_mesh_watertight_range`'s normal-aware gate), so raw triangle indices
+    /// do NOT share across a sharp seam. The meaningful watertightness invariant
+    /// is geometric — every *position* edge borders exactly two triangles — so we
+    /// re-weld by position here, exactly as the manifold oracle / STL export do.
     fn edge_use_counts(mesh: &TriangleMesh) -> HashMap<(u32, u32), u32> {
+        // Position-weld to canonical indices (1e-6 lattice, well under any edge).
+        let eps = 1e-6;
+        let key3 = |p: crate::math::Point3| {
+            (
+                (p.x / eps).round() as i64,
+                (p.y / eps).round() as i64,
+                (p.z / eps).round() as i64,
+            )
+        };
+        let mut canon: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        let mut remap: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+        for v in &mesh.vertices {
+            let next = canon.len() as u32;
+            remap.push(*canon.entry(key3(v.position)).or_insert(next));
+        }
         let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
         for tri in &mesh.triangles {
-            for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let (t0, t1, t2) = (
+                remap[tri[0] as usize],
+                remap[tri[1] as usize],
+                remap[tri[2] as usize],
+            );
+            for &(a, b) in &[(t0, t1), (t1, t2), (t2, t0)] {
                 let key = if a < b { (a, b) } else { (b, a) };
                 *counts.entry(key).or_insert(0) += 1;
             }
@@ -321,10 +347,13 @@ mod watertight_tests {
         );
     }
 
-    /// Assert that no two distinct vertex indices used in any triangle
-    /// share the same 3D position within `tol`. Orphaned vertices in
-    /// `mesh.vertices` (un-referenced by any triangle) are ignored —
-    /// the welding pass leaves them in place by design.
+    /// Assert that no two distinct vertex indices used in any triangle share the
+    /// same 3D position within `tol` **AND the same normal**. Two referenced
+    /// vertices at one position with *different* normals are expected and correct
+    /// — they are a sharp seam intentionally split so each face keeps its own
+    /// shading normal (the normal-aware weld). A true welding failure is a
+    /// position+normal duplicate (a smooth seam that should have collapsed to one
+    /// vertex but didn't). Orphaned (un-referenced) vertices are ignored.
     fn assert_no_referenced_duplicates(mesh: &TriangleMesh, tol: f64) {
         use std::collections::HashSet;
         let mut referenced: HashSet<u32> = HashSet::new();
@@ -337,16 +366,24 @@ mod watertight_tests {
         let tol_sq = tol * tol;
         for i in 0..referenced.len() {
             for j in i + 1..referenced.len() {
-                let pa = mesh.vertices[referenced[i] as usize].position;
-                let pb = mesh.vertices[referenced[j] as usize].position;
-                let d = pa - pb;
+                let va = mesh.vertices[referenced[i] as usize];
+                let vb = mesh.vertices[referenced[j] as usize];
+                let d = va.position - vb.position;
                 let d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+                // Same position AND near-identical normal ⇒ a genuine unwelded
+                // smooth-seam duplicate. Same position, divergent normal ⇒ an
+                // intended sharp-edge split (allowed).
+                let same_normal = va.normal.dot(&vb.normal) >= 0.999;
                 assert!(
-                    d2 > tol_sq,
-                    "referenced vertices {a} and {b} share position {pa:?} ≈ {pb:?} \
-                     (distance² = {d2:e}, tol² = {tol_sq:e}) — welding failed",
+                    d2 > tol_sq || !same_normal,
+                    "referenced vertices {a} and {b} share position {pa:?} ≈ {pb:?} AND normal \
+                     {na:?} ≈ {nb:?} (distance² = {d2:e}, tol² = {tol_sq:e}) — welding failed",
                     a = referenced[i],
                     b = referenced[j],
+                    pa = va.position,
+                    pb = vb.position,
+                    na = va.normal,
+                    nb = vb.normal,
                 );
             }
         }
@@ -704,10 +741,12 @@ mod watertight_tests {
         );
     }
 
-    /// K14 — G1 sharp-edge preservation. Two coincident vertices
-    /// with normals 90° apart (the box-corner case) must NOT be
-    /// averaged — averaging would smear the shading discontinuity
-    /// the renderer needs at sharp B-Rep edges.
+    /// K14 — sharp-edge normal preservation. Two coincident vertices with
+    /// normals 90° apart (the box-corner case) must NOT be welded into one — the
+    /// normal-aware gate keeps them as distinct vertices so EACH face retains its
+    /// own correct shading normal. (Welding them would force one shared vertex to
+    /// carry a single normal, shading one face as if it faced the wrong way — the
+    /// box-side-face bug the tessellation normal-agreement oracle catches.)
     #[test]
     fn weld_mesh_watertight_g1_preserves_sharp_normals() {
         use crate::math::Vector3;
@@ -751,15 +790,24 @@ mod watertight_tests {
 
         surface::weld_mesh_watertight(&mut mesh, 1e-6);
 
-        // Canonical normal should remain `n_top` (the lower-index
-        // contributor) — averaging two 90° normals gives |avg| ≈
-        // 0.707 < 0.95 threshold → no overwrite.
-        let nv = mesh.vertices[v_top as usize].normal;
+        // The two coincident sharp-edge vertices must stay DISTINCT, each keeping
+        // its own face normal — the side triangle still references `v_side`
+        // (normal +X), the top triangle still references `v_top` (normal +Z).
         assert!(
-            (nv.x - n_top.x).abs() < 1e-12
-                && (nv.y - n_top.y).abs() < 1e-12
-                && (nv.z - n_top.z).abs() < 1e-12,
-            "sharp-edge canonical normal should be preserved (= {n_top:?}), got {nv:?}"
+            mesh.triangles[1].contains(&v_side),
+            "sharp-edge vertex must not weld into the other face: triangle {:?} \
+             should still reference v_side {v_side}",
+            mesh.triangles[1]
+        );
+        let n_top_kept = mesh.vertices[v_top as usize].normal;
+        let n_side_kept = mesh.vertices[v_side as usize].normal;
+        assert!(
+            (n_top_kept - n_top).magnitude() < 1e-12,
+            "top-face normal must be preserved (= {n_top:?}), got {n_top_kept:?}"
+        );
+        assert!(
+            (n_side_kept - n_side).magnitude() < 1e-12,
+            "side-face normal must be preserved (= {n_side:?}), got {n_side_kept:?}"
         );
     }
 }

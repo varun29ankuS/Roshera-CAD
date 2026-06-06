@@ -4095,6 +4095,29 @@ pub(crate) fn weld_mesh_watertight_range(
             .push(i as u32);
     }
 
+    // Two coincident samples weld into one mesh vertex only when their
+    // surface normals also agree — i.e. they sit on a SMOOTH seam (a
+    // cylinder/sphere/NURBS u- or v-wrap, or two G1-adjacent faces),
+    // where a single shared vertex with one (averaged) normal is exactly
+    // right. At a SHARP feature edge — a box edge, a cone/cylinder cap rim,
+    // any dihedral — the two faces' normals diverge, so welding them would
+    // force the shared vertex to carry ONE face's normal and shade the other
+    // face's triangles as if they faced the wrong way (a box's four side
+    // faces inheriting a cap's ±axis normal — the bug the tessellation
+    // normal-agreement oracle catches). Keeping the coincident samples as
+    // distinct vertices there preserves each face's correct normal; the mesh
+    // stays *geometrically* watertight (the samples are bit-exact coincident),
+    // and every consumer that needs shared-index topology — the manifold
+    // oracle, STL export (triangle soup), BVH — re-welds by position anyway,
+    // so nothing downstream depends on the sharp seam being index-welded.
+    //
+    // `cos 60°`: a smooth seam's adjacent normals are near-parallel (dot ≈ 1);
+    // a genuine feature edge is ≥ 60° (a box edge is 90°, dot 0; a cap rim is
+    // obtuse, dot < 0). The gate splits the latter and merges the former,
+    // leaving every smooth-seam weld (the watertight curved-primitive path)
+    // bit-for-bit unchanged.
+    const WELD_NORMAL_DOT_MIN: f64 = 0.5;
+
     // remap[i] = canonical index for vertex i, only meaningful for
     // i >= v_start. Earlier vertices are identity-mapped (we don't
     // touch them).
@@ -4102,13 +4125,14 @@ pub(crate) fn weld_mesh_watertight_range(
 
     for i in v_start..n {
         let pos = mesh.vertices[i].position;
+        let ni = mesh.vertices[i].normal;
         let (cx, cy, cz) = to_cell(pos);
 
         // Scan the 3×3×3 neighbourhood. Stop at the first vertex with
         // a strictly-smaller original index (still inside the welding
-        // range — `cand >= v_start`) that is within tolerance — we
-        // keep the lowest index as canonical, which gives a
-        // deterministic mapping regardless of insertion order.
+        // range — `cand >= v_start`) that is within tolerance AND whose
+        // normal agrees (smooth seam) — we keep the lowest such index as
+        // canonical, a deterministic mapping regardless of insertion order.
         let mut canonical = i as u32;
         'scan: for dx in -1..=1 {
             for dy in -1..=1 {
@@ -4119,7 +4143,10 @@ pub(crate) fn weld_mesh_watertight_range(
                                 continue;
                             }
                             let dp = mesh.vertices[cand as usize].position - pos;
-                            if dp.dot(&dp) <= tol_sq {
+                            if dp.dot(&dp) <= tol_sq
+                                && ni.dot(&mesh.vertices[cand as usize].normal)
+                                    >= WELD_NORMAL_DOT_MIN
+                            {
                                 canonical = remap[cand as usize];
                                 break 'scan;
                             }
