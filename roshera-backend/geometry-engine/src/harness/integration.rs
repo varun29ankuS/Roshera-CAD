@@ -380,6 +380,40 @@ mod tests {
         // Dump EVERY face's outer loop with per-edge curve type.
         let overlap = crate::operations::geometry_validity::self_overlapping_planar_faces(&m, s);
         eprintln!("--- self_overlapping_planar_faces = {overlap:?} ---");
+        // Evaluate the Arc edges along their length: does the edge geometry stay
+        // between its declared endpoints, or overshoot (stale param range)?
+        for (eid, edge) in m.edges.iter() {
+            let is_arc = m
+                .curves
+                .get(edge.curve_id)
+                .map(|c| c.type_name() == "Arc")
+                .unwrap_or(false);
+            if !is_arc {
+                continue;
+            }
+            let pa = m
+                .vertices
+                .get(edge.start_vertex)
+                .map(|v| v.position)
+                .unwrap_or([0.0; 3]);
+            let pb = m
+                .vertices
+                .get(edge.end_vertex)
+                .map(|v| v.position)
+                .unwrap_or([0.0; 3]);
+            eprint!(
+                "  ARC e{eid} ends v{}({:.2},{:.2},{:.2})->v{}({:.2},{:.2},{:.2}) range={:?} samples:",
+                edge.start_vertex, pa[0], pa[1], pa[2], edge.end_vertex, pb[0], pb[1], pb[2],
+                edge.param_range
+            );
+            for k in 0..=4 {
+                let t = k as f64 / 4.0;
+                if let Ok(p) = edge.evaluate(t, &m.curves) {
+                    eprint!(" t{t:.2}=({:.2},{:.2},{:.2})", p.x, p.y, p.z);
+                }
+            }
+            eprintln!();
+        }
         if let Some(shell) = m.shells.get(solid_ref2.outer_shell) {
             for &fid in &shell.faces {
                 let Some(face) = m.faces.get(fid) else {
