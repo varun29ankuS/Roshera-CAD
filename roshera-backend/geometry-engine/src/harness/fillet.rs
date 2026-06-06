@@ -218,23 +218,29 @@ mod tests {
     use super::*;
     use crate::primitives::topology_builder::TopologyBuilder;
 
-    /// HARNESS-FOUND BUG (task FILLET-MULTIEDGE-VOLUME): filleting ALL 12 edges
-    /// of a cube at once returns `Ok` with a topologically-valid-looking 26-face
-    /// rounded cube, but the geometry is grossly wrong — mesh AND mass-props
-    /// volume both ≈16.4 vs the Minkowski-sum truth 55.04 (it removes ~5× too
-    /// much material). Small shared-corner selections (2–4 edges) instead return
-    /// a clean `NotImplemented` (degree-2 corner synthesis is deferred — Task
-    /// #82). So the all-edges path silently produces wrong geometry where the
-    /// few-edge path correctly refuses; the partially-implemented degree-3
-    /// corner synthesis is the culprit. Pinned `#[ignore]` until the multi-edge
-    /// corner fillet (F5-γ/δ, #82) is completed or the path fails loudly.
+    /// HARNESS-FOUND BUG (FILLET-MULTIEDGE-VOLUME #51), now FIXED: filleting all
+    /// 12 edges of a cube at once must produce the exact rounded cube — a closed,
+    /// oriented manifold whose volume matches the Minkowski-sum truth.
+    ///
+    /// The bug had three layered causes, each found by decomposing the mesh by
+    /// surface family + signed divergence: (1) the fillet-cylinder faces wound
+    /// off `face.orientation` alone, so the left-handed-chart half tessellated
+    /// inward (`tessellate_fillet_face` chart-sign reconciliation); (2) the
+    /// degree-3 corner sphere was oriented by sampling the full-sphere parameter
+    /// midpoint — an unrelated point whose normal sat near-perpendicular to the
+    /// corner diagonal, flipping sign under sub-ulp drift (now sampled AT the
+    /// octant, `apply_apex_sphere_corner`); (3) the corner-octant loop, built
+    /// from three cap arcs of mixed parametric handedness, was a vertex-valid but
+    /// self-crossing rim that the centroid fan double-covered into a quarter-
+    /// sphere — fixed by ordering the spherical-polygon rim by azimuth around its
+    /// centroid (`tessellate_spherical_polygon`), which also makes it
+    /// deterministic. A flaky volume was the determinism tell.
     ///
     /// Exact rounded-cube volume (Minkowski sum of the (s−2r)³ core box with a
     /// ball of radius r): `(s−2r)³ + 6r(s−2r)² + 3πr²(s−2r) + (4/3)πr³`.
     #[test]
-    #[ignore = "FILLET-MULTIEDGE-VOLUME: all-12-edge fillet silently wrong (16.4 vs 55.04) (harness-found)"]
     fn all_edges_fillet_matches_minkowski_volume() {
-        use crate::harness::watertight::mesh_volume as mv;
+        use crate::harness::watertight::{manifold_report, mesh_volume as mv};
         use std::f64::consts::PI;
         let (side, r) = (4.0_f64, 1.0_f64);
         let core = side - 2.0 * r;
@@ -254,9 +260,22 @@ mod tests {
             ..Default::default()
         };
         fillet_edges(&mut model, solid, edges, options).expect("all-edge fillet");
+
+        // Closed, oriented, genus-0 manifold (an inward-wound or double-covered
+        // corner patch fails `oriented` / leaves boundary edges).
+        let report = manifold_report(&model, solid, 0.02, 1e-6).expect("mesh");
+        assert!(
+            report.is_valid_solid(),
+            "rounded cube not a valid closed/oriented manifold: {report:?}"
+        );
+        assert_eq!(
+            report.euler_characteristic, 2,
+            "rounded cube χ≠2: {report:?}"
+        );
+
         let vol = mv(&model, solid, 0.01).expect("mesh");
         assert!(
-            (vol - mink).abs() < 0.05 * mink,
+            (vol - mink).abs() < 0.02 * mink,
             "rounded cube volume {vol:.3} vs Minkowski truth {mink:.3}"
         );
     }

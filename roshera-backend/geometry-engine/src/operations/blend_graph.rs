@@ -241,14 +241,27 @@ impl BlendGraph {
     /// Iterate over every `ConvexCorner` / `ConcaveCorner` vertex.
     /// F2-γ's setback solver feeds on this iterator.
     pub fn corners(&self) -> impl Iterator<Item = &BlendVertex> + '_ {
-        self.vertices.values().filter(|v| {
-            matches!(
-                v.kind,
-                BlendVertexKind::ConvexCorner { .. }
-                    | BlendVertexKind::ConcaveCorner { .. }
-                    | BlendVertexKind::Mixed
-            )
-        })
+        // Sorted by vertex id so the iteration order is deterministic across
+        // runs. `vertices` is a HashMap (per-process RandomState seed), so the
+        // raw `.values()` order varies run-to-run; downstream corner synthesis
+        // (`create_fillet_transitions`) mutates the shell per corner, so a
+        // non-deterministic order made the all-edges fillet flaky (corner-patch
+        // volume drifted ±2 between runs). Determinism first — then the
+        // remaining geometry error is reproducible and debuggable.
+        let mut corners: Vec<&BlendVertex> = self
+            .vertices
+            .values()
+            .filter(|v| {
+                matches!(
+                    v.kind,
+                    BlendVertexKind::ConvexCorner { .. }
+                        | BlendVertexKind::ConcaveCorner { .. }
+                        | BlendVertexKind::Mixed
+                )
+            })
+            .collect();
+        corners.sort_by_key(|v| v.id);
+        corners.into_iter()
     }
 }
 
