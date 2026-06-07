@@ -443,3 +443,80 @@ fn sphere_poke_intersection_82() {
         "box-sphere(poke) = {first:.3}, truth {g_int:.3} (kernel returns the unclipped sphere ~4.19)"
     );
 }
+
+type VolFn = Box<dyn Fn() -> f64>;
+
+/// Determinism net for the boolean pipeline (P0). Each config is run 8 times in
+/// ONE process — `std::HashMap` reseeds per map per process, so every run
+/// shuffles internal iteration order — and every run must produce an identical
+/// volume. This locks the determinism fixes (graph→BTreeMap, component/vertex/
+/// sphere-split sorting; commit 5ee5845) across the configs that exercise the
+/// rotated, offset, sphere, and cylinder paths. The degenerate face-straddle
+/// poke has its own dedicated determinism test (`sphere_poke_intersection_82`).
+#[test]
+fn boolean_results_are_deterministic() {
+    let r45 = std::f64::consts::FRAC_PI_4;
+    let r30 = 30.0_f64 * std::f64::consts::PI / 180.0;
+    let cases: Vec<(&str, VolFn)> = vec![
+        (
+            "rot45 ∩",
+            Box::new(move || kernel_volume(BooleanOp::Intersection, r45).expect("v")),
+        ),
+        (
+            "rot45 ∪",
+            Box::new(move || kernel_volume(BooleanOp::Union, r45).expect("v")),
+        ),
+        (
+            "offset30 ∩",
+            Box::new(move || {
+                kernel_volume_offset(BooleanOp::Intersection, r30, [0.6, 0.4, 0.0]).expect("v")
+            }),
+        ),
+        (
+            "offset30 ∪",
+            Box::new(move || {
+                kernel_volume_offset(BooleanOp::Union, r30, [0.6, 0.4, 0.0]).expect("v")
+            }),
+        ),
+        (
+            "sphere ∩",
+            Box::new(|| {
+                kernel_box_op(BooleanOp::Intersection, &|m| {
+                    sphere(m, [0.0, 0.0, 0.0], 1.2)
+                })
+                .expect("v")
+            }),
+        ),
+        (
+            "sphere ∪",
+            Box::new(|| {
+                kernel_box_op(BooleanOp::Union, &|m| sphere(m, [0.0, 0.0, 0.0], 1.2)).expect("v")
+            }),
+        ),
+    ];
+
+    // Threshold catches *gross / topological* non-determinism — a dropped face,
+    // a kept-vs-discarded fragment, the whole-vs-half flip — which moves the
+    // volume by percent-level amounts. Sub-1e-6 drift is floating-point
+    // summation-order noise (e.g. triangle order in the volume integral) and is
+    // tolerated by design: making reordered float sums byte-identical everywhere
+    // is a deep, low-value chase. Residual noted: `sphere ∩` drifts ~4e-8 from
+    // order-dependent summation (P2 follow-up, not a logic fault).
+    const REL: f64 = 1e-6;
+    let mut nondet: Vec<String> = Vec::new();
+    for (label, f) in &cases {
+        let runs: Vec<f64> = (0..8).map(|_| f()).collect();
+        let first = runs[0];
+        if runs
+            .iter()
+            .any(|v| (v - first).abs() / first.abs().max(1.0) >= REL)
+        {
+            nondet.push(format!("{label}: {runs:?}"));
+        }
+    }
+    assert!(
+        nondet.is_empty(),
+        "gross/topological boolean non-determinism (run-to-run volume drift):\n  {}",
+        nondet.join("\n  ")
+    );
+}
