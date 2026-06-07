@@ -3949,6 +3949,156 @@ fn split_cylinder_lateral_by_window(
     ])
 }
 
+/// Cylinder lateral cut by axis-PARALLEL generator lines — the RADIAL poke: a
+/// wall pokes the cylinder side where radius exceeds the wall offset, so each box
+/// side face imprints a full-height vertical generator. The lateral then splits
+/// into angular θ-sectors between consecutive generators.
+///
+/// `split_cylinder_lateral_by_window` handles only a single off-axis window
+/// (returns None on multiple generators), and the DCEL can't partition the
+/// PERIODIC lateral (seam-wrapping) — the same degeneracy sphere/cone/torus each
+/// dodge with a dedicated handler. This is the cylinder's.
+///
+/// By this point the arrangement is already complete: the rims have been split at
+/// every generator endpoint (`presplit_boundary_t_junctions`), and the seam is a
+/// full-height boundary edge. So the verticals (generators + seam) and the rim
+/// arcs between them are ALL present — we walk them into sector loops, creating no
+/// edges. Each sector loop is [left-vertical ↑, top-arc →, right-vertical ↓,
+/// bottom-arc ←]; its interior point sits on the lateral at the sector's mid
+/// angle so downstream classification keeps the in-box sectors and drops the
+/// poking-out bulges (or vice-versa per op).
+///
+/// Returns None (→ DCEL) unless the lateral presents ≥3 full-height verticals
+/// with a single rim arc closing each side of every sector — anything else is a
+/// shape this handler doesn't own.
+fn split_cylinder_lateral_by_sectors(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::surface::Cylinder;
+    let surface = model.surfaces.get(surface_id)?;
+    let cyl = surface.as_any().downcast_ref::<Cylinder>()?;
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let radius = cyl.radius;
+    let [h0, h1] = cyl.height_limits?;
+    let span = (h1 - h0).abs();
+    if span <= 0.0 {
+        return None;
+    }
+    let span_tol = (span * 1.0e-3).max(1.0e-6);
+
+    // Orthonormal frame perpendicular to the axis for angular ordering.
+    let seed = if axis.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u1 = axis.cross(&seed).normalize().ok()?;
+    let u2 = axis.cross(&u1);
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let theta_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        let d = Point3::new(p[0], p[1], p[2]) - origin;
+        Some(d.dot(&u2).atan2(d.dot(&u1)).rem_euclid(two_pi))
+    };
+    let axial_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        Some((Point3::new(p[0], p[1], p[2]) - origin).dot(&axis))
+    };
+
+    // Full-height verticals (generators + seam): (theta@bottom, bottom_vid, top_vid, edge_id).
+    let mut verticals: Vec<(f64, VertexId, VertexId, EdgeId)> = Vec::new();
+    for (&eid, _) in graph.edges.iter() {
+        let e = model.edges.get(eid)?;
+        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+        if (sa - ea).abs() < span - span_tol {
+            continue; // rim arc or partial — not a full-height vertical
+        }
+        let (bv, tv) = if sa <= ea {
+            (e.start_vertex, e.end_vertex)
+        } else {
+            (e.end_vertex, e.start_vertex)
+        };
+        verticals.push((theta_of(bv)?, bv, tv, eid));
+    }
+    if verticals.len() < 3 {
+        return None;
+    }
+    verticals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Non-vertical boundary edges = rim arcs, indexed by unordered endpoint pair.
+    let mut arc_by_pair: HashMap<(VertexId, VertexId), EdgeId> = HashMap::new();
+    for (&eid, ge) in graph.edges.iter() {
+        if ge.edge_type != EdgeType::Boundary {
+            continue;
+        }
+        let e = model.edges.get(eid)?;
+        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+        if (sa - ea).abs() >= span - span_tol {
+            continue; // skip the vertical seam
+        }
+        let key = if e.start_vertex < e.end_vertex {
+            (e.start_vertex, e.end_vertex)
+        } else {
+            (e.end_vertex, e.start_vertex)
+        };
+        arc_by_pair.insert(key, eid);
+    }
+
+    let pair = |a: VertexId, b: VertexId| if a < b { (a, b) } else { (b, a) };
+    let oriented = |eid: EdgeId, from: VertexId| -> Option<(EdgeId, bool)> {
+        let e = model.edges.get(eid)?;
+        if e.start_vertex == from {
+            Some((eid, true))
+        } else if e.end_vertex == from {
+            Some((eid, false))
+        } else {
+            None
+        }
+    };
+
+    let n = verticals.len();
+    let mut faces = Vec::with_capacity(n);
+    for i in 0..n {
+        let (th_i, bi, ti, ei) = verticals[i];
+        let (th_j, bj, tj, ej) = verticals[(i + 1) % n];
+        let top_arc = *arc_by_pair.get(&pair(ti, tj))?;
+        let bot_arc = *arc_by_pair.get(&pair(bi, bj))?;
+        // Sector loop: bi→ti (left vertical), ti→tj (top arc), tj→bj (right
+        // vertical), bj→bi (bottom arc).
+        let loop_edges = vec![
+            oriented(ei, bi)?,
+            oriented(top_arc, ti)?,
+            oriented(ej, tj)?,
+            oriented(bot_arc, bj)?,
+        ];
+        // Interior point on the lateral at the sector mid-angle (handle wrap) and
+        // mid-height.
+        let th_mid = if th_j >= th_i {
+            0.5 * (th_i + th_j)
+        } else {
+            (0.5 * (th_i + th_j + two_pi)).rem_euclid(two_pi)
+        };
+        let mid_axial = 0.5 * (h0 + h1);
+        let radial = u1 * th_mid.cos() + u2 * th_mid.sin();
+        let interior = origin + axis * mid_axial + radial * radius;
+        faces.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: loop_edges,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(interior),
+            inner_loops: Vec::new(),
+        });
+    }
+    Some(faces)
+}
+
 /// Torus analogue of the sphere/cone/cylinder curved-Boolean fast paths, for a
 /// RIM-POKE: the tube pokes box side-walls, each wall imprinting a closed quartic
 /// oval on the torus near the outer equator (v≈0). The DCEL arrangement on the
@@ -4445,6 +4595,23 @@ fn split_face_by_curves(
         if pipeline_trace_enabled() {
             eprintln!(
                 "[bool]   cylinder window split: face={face_id:?} → {} fragments",
+                cyl_faces.len()
+            );
+        }
+        return Ok(cyl_faces);
+    }
+
+    // Cylinder lateral RADIAL poke: ≥3 full-height generators (box side walls
+    // poking the cylinder side) split the lateral into angular θ-sectors. The
+    // window handler above only covers a single off-axis window; the DCEL can't
+    // partition the periodic lateral. Walk the (already complete) arrangement
+    // into sectors. Returns None for any other shape → DCEL.
+    if let Some(cyl_faces) =
+        split_cylinder_lateral_by_sectors(model, surface_id, face_id, origin_solid, &graph)
+    {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   cylinder sector split: face={face_id:?} → {} fragments",
                 cyl_faces.len()
             );
         }
