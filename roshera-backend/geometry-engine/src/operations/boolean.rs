@@ -9458,50 +9458,60 @@ fn is_point_in_face(
         if outer_loop.edges.is_empty() {
             return Ok(true);
         }
-        let cycle_vertices = extract_cycle_vertices_3d(&outer_loop.edges, model);
-        let polygon: Vec<(f64, f64)> = if cycle_vertices.len() >= 3 {
-            cycle_vertices.iter().map(project).collect()
-        } else {
-            // Boundary has fewer than 3 corner vertices — typical for
-            // cap faces bounded by a single closed seam edge (e.g.
-            // cylinder caps, where the lone boundary edge is a closed
-            // circle with start_vertex == end_vertex). Falling through
-            // to `return Ok(true)` here was a load-bearing bug: every
-            // point on the cap's plane was reported "inside" any other
-            // cap face that shared the same plane, so the coincident-
-            // boundary check at the top of
-            // `classify_face_relative_to_solid` fired OnBoundary for
-            // disjoint-cylinder Union (two coplanar caps at z=0 that
-            // are geometrically 50 units apart in x) and the boolean
-            // dropped the cap fragments. Densely sample each boundary
-            // edge's curve to build a real polygon footprint instead.
-            let mut samples: Vec<(f64, f64)> = Vec::new();
-            const SAMPLES_PER_EDGE: u32 = 32;
-            for &edge_id in &outer_loop.edges {
-                let edge = match model.edges.get(edge_id) {
-                    Some(e) => e,
-                    None => return Ok(false),
-                };
-                let curve = match model.curves.get(edge.curve_id) {
-                    Some(c) => c,
-                    None => return Ok(false),
-                };
-                let span = edge.param_range.end - edge.param_range.start;
-                for i in 0..SAMPLES_PER_EDGE {
-                    let t = edge.param_range.start + span * (i as f64) / (SAMPLES_PER_EDGE as f64);
-                    if let Ok(pt) = curve.point_at(t) {
-                        samples.push(project(&pt));
-                    }
+        // Build the polygon footprint by densely sampling each boundary edge's
+        // CURVE in loop-traversal order (respecting each edge's orientation),
+        // NOT just its corner vertices. Sampling is load-bearing for CURVED
+        // boundaries:
+        //   * A cap bounded by a single closed seam edge (a circle with
+        //     start_vertex == end_vertex) has <3 corner vertices; using corners
+        //     reported every coplanar point "inside", so disjoint-cylinder
+        //     Union fired a spurious OnBoundary and dropped the cap.
+        //   * A cap whose circle has been PRESPLIT into arcs (the coincident-
+        //     cap case: a fat cylinder's cap clipped by the box side planes)
+        //     has ≥3 corner vertices, so the corner-only polygon is the
+        //     INSCRIBED chord polygon — and a cut-chord midpoint lying on a
+        //     square edge falls exactly on an inscribed-polygon edge, making
+        //     the even-odd crossing test flicker. The clip-to-face pass then
+        //     wrongly drops 3 of the 4 legitimate petal chords and the cap
+        //     never splits into petals (#81 coincident-cap Union deficit).
+        // Sampling the arc captures its outward bulge so such midpoints test
+        // strictly inside. Straight edges sample to collinear points, so
+        // polygonal faces are unchanged.
+        let mut polygon: Vec<(f64, f64)> = Vec::new();
+        const SAMPLES_PER_EDGE: u32 = 24;
+        for (idx, &edge_id) in outer_loop.edges.iter().enumerate() {
+            let edge = match model.edges.get(edge_id) {
+                Some(e) => e,
+                None => return Ok(false),
+            };
+            let curve = match model.curves.get(edge.curve_id) {
+                Some(c) => c,
+                None => return Ok(false),
+            };
+            // Traverse this edge in the loop's direction so consecutive samples
+            // form a connected closed path. `orientations[idx] == false` means
+            // the loop walks the edge end→start, so sweep the curve param
+            // backward.
+            let forward = outer_loop.orientations.get(idx).copied().unwrap_or(true);
+            let (p_from, p_to) = if forward {
+                (edge.param_range.start, edge.param_range.end)
+            } else {
+                (edge.param_range.end, edge.param_range.start)
+            };
+            // Sample [p_from, p_to) — drop the endpoint; the next edge supplies
+            // it as its own start, avoiding a duplicate at each shared vertex.
+            for i in 0..SAMPLES_PER_EDGE {
+                let t = p_from + (p_to - p_from) * (i as f64) / (SAMPLES_PER_EDGE as f64);
+                if let Ok(pt) = curve.point_at(t) {
+                    polygon.push(project(&pt));
                 }
             }
-            if samples.len() < 3 {
-                // Boundary genuinely unrecoverable — fall back to
-                // "not in face" so caller doesn't get a spurious
-                // OnBoundary.
-                return Ok(false);
-            }
-            samples
-        };
+        }
+        if polygon.len() < 3 {
+            // Boundary genuinely unrecoverable — fall back to "not in face" so
+            // the caller doesn't get a spurious OnBoundary.
+            return Ok(false);
+        }
         let (test_x, test_y) = project(point);
 
         let mut crossings = 0;
