@@ -403,24 +403,43 @@ fn cylinder_box_boolean_81() {
     );
 }
 
-/// PINNED KNOWN BUG (#82): box ∩ sphere with the sphere straddling a box face is
-/// wrong and non-deterministic. Sphere r=1 centred at (1,0,0) is exactly half
-/// inside the box, so V(box ∩ sphere) = ½·(4/3·π) ≈ 2.094. The kernel instead
-/// returns the *whole* sphere (~4.189) on some runs and a near-correct value on
-/// others — it sometimes fails to clip B by A at all. The run-to-run variation
-/// points at shared global state in the boolean/tessellation path (cf. #26). A
-/// flaky boolean is a determinism bug: make it reproducible first, then the clip
-/// bug is debuggable. Un-ignore when fixed.
+/// KNOWN BUG (#82): box ∩ sphere with the sphere straddling a box face is both
+/// non-deterministic and wrong. Sphere r=1 centred at (1,0,0) is exactly half
+/// inside the box, so V(box ∩ sphere) = ½·(4/3·π) ≈ 2.094; the kernel sometimes
+/// returns the *whole* sphere (~4.189) instead, failing to clip B by A.
+///
+/// This is asserted as a DETERMINISM test, not a flaky single-shot: it runs the
+/// same boolean 8 times in one process (`std::HashMap` reseeds per map per
+/// process, so each run shuffles internal iteration order) and requires every
+/// run to agree — AND to match the independent grid oracle. A non-deterministic
+/// boolean therefore fails *reliably* here, not 2-out-of-10. Four determinism
+/// sources are already fixed (graph→BTreeMap etc., commit 5ee5845); a residual
+/// source remains in the degenerate great-circle-on-cut-plane classification.
 #[test]
 fn sphere_poke_intersection_82() {
     let in_b = |p: [f64; 3]| ((p[0] - 1.0).powi(2) + p[1] * p[1] + p[2] * p[2]).sqrt() <= 1.0;
     let (g_int, _g_uni) = grid_core(2.1, &in_b);
-    let k_int = kernel_box_op(BooleanOp::Intersection, &|m| {
-        sphere(m, [1.0, 0.0, 0.0], 1.0)
-    })
-    .expect("∩");
+
+    let runs: Vec<f64> = (0..8)
+        .map(|_| {
+            kernel_box_op(BooleanOp::Intersection, &|m| {
+                sphere(m, [1.0, 0.0, 0.0], 1.0)
+            })
+            .expect("∩")
+        })
+        .collect();
+
+    // Determinism: every run must produce the same volume.
+    let first = runs[0];
+    for (i, &v) in runs.iter().enumerate() {
+        assert!(
+            (v - first).abs() < 1e-9,
+            "non-deterministic box∩sphere: run 0 = {first:.4}, run {i} = {v:.4} (runs = {runs:?})"
+        );
+    }
+    // Correctness: the (now stable) value must be the clipped half, not the whole sphere.
     assert!(
-        rel_err(k_int, g_int) <= 0.05,
-        "box-sphere(poke) = {k_int:.3}, truth {g_int:.3} (kernel returns the unclipped sphere ~4.19)"
+        rel_err(first, g_int) <= 0.05,
+        "box-sphere(poke) = {first:.3}, truth {g_int:.3} (kernel returns the unclipped sphere ~4.19)"
     );
 }
