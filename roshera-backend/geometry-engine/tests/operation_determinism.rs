@@ -107,3 +107,106 @@ fn cylinder_tessellation_is_deterministic() {
     let s = cylinder_solid(&mut model);
     assert_tessellation_deterministic("cylinder", &model, s);
 }
+
+// --- Fillet / chamfer determinism --------------------------------------------
+//
+// These ops mutate the model, so each run rebuilds a fresh cube, picks the same
+// (deterministically chosen) edge, blends it, and measures the result volume.
+// 8 runs in one process exercise 8 internal hash seeds; the volume must be
+// stable to 1e-6 relative (gross/topological non-determinism — a different blend
+// result — moves it far more; sub-1e-6 FP-summation noise is tolerated).
+
+#[path = "blend_fixtures/mod.rs"]
+mod blend_fixtures;
+use blend_fixtures::{make_cube, vertex_at};
+use geometry_engine::operations::chamfer::{
+    chamfer_edges, ChamferOptions, ChamferType, PropagationMode as ChamferProp,
+};
+use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletProp};
+use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions};
+use geometry_engine::primitives::edge::EdgeId;
+use geometry_engine::primitives::vertex::VertexId;
+
+const BOX_SIZE: f64 = 10.0;
+const HALF_BOX: f64 = BOX_SIZE / 2.0;
+const RADIUS: f64 = 0.5;
+const OFFSET: f64 = 0.5;
+
+/// Min-id edge incident to `vertex` — deterministic by construction so the same
+/// edge is blended on every run; any run-to-run drift is then the blend's fault.
+fn pick_one_edge_at_vertex(model: &BRepModel, vertex: VertexId) -> EdgeId {
+    model
+        .edges
+        .iter()
+        .filter_map(|(id, edge)| {
+            if edge.start_vertex == vertex || edge.end_vertex == vertex {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .min()
+        .expect("at least one edge incident to vertex")
+}
+
+fn fillet_opts() -> FilletOptions {
+    FilletOptions {
+        fillet_type: FilletType::Constant(RADIUS),
+        radius: RADIUS,
+        propagation: FilletProp::None,
+        common: CommonOptions {
+            validate_result: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn chamfer_opts() -> ChamferOptions {
+    ChamferOptions {
+        chamfer_type: ChamferType::EqualDistance(OFFSET),
+        distance1: OFFSET,
+        distance2: OFFSET,
+        symmetric: true,
+        propagation: ChamferProp::None,
+        common: CommonOptions {
+            validate_result: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn blended_volume(blend: impl Fn(&mut BRepModel, SolidId, EdgeId)) -> f64 {
+    let mut model = BRepModel::new();
+    let solid = make_cube(&mut model, BOX_SIZE);
+    let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
+    let edge = pick_one_edge_at_vertex(&model, corner);
+    blend(&mut model, solid, edge);
+    model.calculate_solid_volume(solid).expect("volume")
+}
+
+fn assert_blend_deterministic(label: &str, blend: impl Fn(&mut BRepModel, SolidId, EdgeId)) {
+    let runs: Vec<f64> = (0..8).map(|_| blended_volume(&blend)).collect();
+    let first = runs[0];
+    for (i, &v) in runs.iter().enumerate() {
+        assert!(
+            (v - first).abs() / first.abs().max(1.0) < 1e-6,
+            "{label} non-deterministic: run 0 = {first}, run {i} = {v} (all = {runs:?})"
+        );
+    }
+}
+
+#[test]
+fn fillet_is_deterministic() {
+    assert_blend_deterministic("fillet", |m, s, e| {
+        fillet_edges(m, s, vec![e], fillet_opts()).expect("fillet");
+    });
+}
+
+#[test]
+fn chamfer_is_deterministic() {
+    assert_blend_deterministic("chamfer", |m, s, e| {
+        chamfer_edges(m, s, vec![e], chamfer_opts()).expect("chamfer");
+    });
+}
