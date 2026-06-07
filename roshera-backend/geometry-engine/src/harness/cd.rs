@@ -379,4 +379,93 @@ mod tests {
         // cheaper than brute force.
         assert!(full.lmd_solves < baseline.lmd_solves);
     }
+
+    /// Analytic closest-boundary-face distance for two axis-aligned unit boxes
+    /// (half-extent 1) on a pure X-translation `tx`. The CD pipeline measures the
+    /// distance between the nearest pair of *boundary faces*, not solid
+    /// separation: for face-on poses the nearest parallel faces sit
+    /// `min(|tx-2|, |tx|)` apart (0 when touching at tx=2 or coincident at tx=0;
+    /// the trailing faces close the gap once the boxes overlap). Independent of
+    /// the kernel.
+    fn face_on_truth(tx: f64) -> f64 {
+        (tx - 2.0).abs().min(tx.abs())
+    }
+
+    /// Face-on CD proximity vs analytic truth: two boxes approaching face-to-face
+    /// along X across overlapping, touching, and separated poses. The all-pairs
+    /// face LMD minimum (baseline = no broad-phase cull) must equal the analytic
+    /// nearest-parallel-face distance. This is the regime the face-pair LMD covers
+    /// exactly, and it validates the narrow phase against an independent oracle.
+    #[test]
+    fn cd_face_proximity_matches_analytic() {
+        let xs = [0.0, 1.5, 2.0, 2.5, 3.0, 5.0];
+        let mut failures: Vec<String> = Vec::new();
+        for tx in xs {
+            let mut model = BRepModel::new();
+            let a = box_solid(&mut model);
+            let b = box_solid(&mut model);
+            if tx > 1e-12 {
+                crate::operations::transform::translate(
+                    &mut model,
+                    vec![b],
+                    Vector3::X,
+                    tx,
+                    Default::default(),
+                )
+                .expect("translate");
+            }
+            let r = run_cd_ablation(&model, a, b, CdAblationConfig::baseline());
+            let truth = face_on_truth(tx);
+            if (r.min_distance - truth).abs() > 1e-5 {
+                failures.push(format!(
+                    "tx={tx}: kernel d={:.5} vs truth {:.5}",
+                    r.min_distance, truth
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "face-on CD distance disagreements with independent oracle:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// PINNED OPEN FINDING (#83): the face-pair LMD min-distance (the narrow phase
+    /// exercised by `run_cd_ablation`) returns ∞ when the closest approach between
+    /// two solids is edge-edge or vertex-vertex rather than face-face. Two unit
+    /// boxes touching along an edge (t=[2,2,0]) or at a corner (t=[2,2,2]) report
+    /// NO contact — a false negative for those approaches, while face-on contact
+    /// works. Open question: is CD meant to catch edge/vertex contact via the
+    /// supermaximal-feature / cone machinery (and this ablation path simply
+    /// under-exercises it), or is the face-pair narrow phase genuinely missing
+    /// non-face features? Un-ignore once edge/corner contact is covered.
+    #[test]
+    #[ignore = "OPEN #83: face-pair LMD misses edge/corner closest-approach (returns inf)"]
+    fn cd_edge_corner_contact_pinned_83() {
+        const TAU: f64 = 1e-6;
+        for (label, t) in [
+            ("edge", [2.0_f64, 2.0, 0.0]),
+            ("corner", [2.0_f64, 2.0, 2.0]),
+        ] {
+            let mut model = BRepModel::new();
+            let a = box_solid(&mut model);
+            let b = box_solid(&mut model);
+            let mag = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+            let axis = Vector3::new(t[0] / mag, t[1] / mag, t[2] / mag);
+            crate::operations::transform::translate(
+                &mut model,
+                vec![b],
+                axis,
+                mag,
+                Default::default(),
+            )
+            .expect("translate");
+            let r = run_cd_ablation(&model, a, b, CdAblationConfig::baseline());
+            assert!(
+                r.min_distance <= TAU,
+                "{label}-touch should register contact, got d={}",
+                r.min_distance
+            );
+        }
+    }
 }
