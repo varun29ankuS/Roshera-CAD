@@ -533,6 +533,41 @@ fn compute_face_intersections(
         {
             return BBox::INFINITE;
         }
+        // Cylinder lateral: its boundary loop (two rim circles + seam) under-
+        // samples the periodic surface, so `f.bbox()` returns a partial sliver
+        // covering only a wedge near the seam — which wrongly prunes the box side
+        // faces on the far half of the cylinder (#81: only +x/+y survive, -x/-y
+        // dropped → half the cuts missing → ∩ over-includes, ∪ can't stitch).
+        // Same partial-sliver class the torus dodges with INFINITE above, but the
+        // cylinder gets its EXACT analytic AABB so far-apart cylinders are still
+        // pruned (no phantom-circle regression — see the brute-force note below).
+        if let Some(cyl) = model.surfaces.get(f.surface_id).and_then(|s| {
+            s.as_any()
+                .downcast_ref::<crate::primitives::surface::Cylinder>()
+        }) {
+            if let Some([h0, h1]) = cyl.height_limits {
+                let a = cyl.axis;
+                let p0 = cyl.origin + a * h0;
+                let p1 = cyl.origin + a * h1;
+                let r = cyl.radius;
+                // Radial spread of the lateral along each world axis: r·√(1−aᵢ²).
+                let kx = (1.0 - a.x * a.x).max(0.0).sqrt();
+                let ky = (1.0 - a.y * a.y).max(0.0).sqrt();
+                let kz = (1.0 - a.z * a.z).max(0.0).sqrt();
+                let lo = Point3::new(
+                    p0.x.min(p1.x) - r * kx,
+                    p0.y.min(p1.y) - r * ky,
+                    p0.z.min(p1.z) - r * kz,
+                );
+                let hi = Point3::new(
+                    p0.x.max(p1.x) + r * kx,
+                    p0.y.max(p1.y) + r * ky,
+                    p0.z.max(p1.z) + r * kz,
+                );
+                return BBox::new_validated(lo, hi);
+            }
+            return BBox::INFINITE;
+        }
         f.bbox(&model.loops, &model.edges, &model.vertices, &model.surfaces)
             .unwrap_or(BBox::INFINITE)
     };
