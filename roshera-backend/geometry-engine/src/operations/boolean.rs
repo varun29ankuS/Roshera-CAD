@@ -3763,6 +3763,46 @@ fn split_cylinder_lateral_by_window(
     // makes the loop traversal — and the resulting face split — non-deterministic
     // (#82). Sort to a stable starting point.
     split_eids.sort_unstable();
+
+    // Instrumentation (ROSHERA_BOOL_TRACE): dump the cylinder-lateral edge set so
+    // the radial θ-sector partition (#81) can be designed against the real graph
+    // — how many wall/arc split edges, how they connect into loops, the original
+    // boundary. Inert in production.
+    if pipeline_trace_enabled() {
+        let pos = |vid: VertexId| model.vertices.get_position(vid);
+        eprintln!(
+            "[bool] cyl-lateral face={face_id:?}: {} splitting + {} boundary edges; origin={origin:?} axis={axis:?} r={radius} h={height} has_vertical={has_vertical}",
+            split_eids.len(),
+            boundary_edges.len()
+        );
+        for &eid in &split_eids {
+            if let Some(e) = model.edges.get(eid) {
+                eprintln!(
+                    "  SPLIT e{eid}: v{} {:?} -> v{} {:?} | axial {:?}->{:?}",
+                    e.start_vertex,
+                    pos(e.start_vertex),
+                    e.end_vertex,
+                    pos(e.end_vertex),
+                    v_of(e.start_vertex),
+                    v_of(e.end_vertex),
+                );
+            }
+        }
+        for &(eid, fwd) in boundary_edges {
+            if let Some(e) = model.edges.get(eid) {
+                eprintln!(
+                    "  BNDRY e{eid} fwd={fwd}: v{} {:?} -> v{} {:?} | axial {:?}->{:?}",
+                    e.start_vertex,
+                    pos(e.start_vertex),
+                    e.end_vertex,
+                    pos(e.end_vertex),
+                    v_of(e.start_vertex),
+                    v_of(e.end_vertex),
+                );
+            }
+        }
+    }
+
     if !has_vertical || split_eids.len() < 3 {
         return None;
     }
