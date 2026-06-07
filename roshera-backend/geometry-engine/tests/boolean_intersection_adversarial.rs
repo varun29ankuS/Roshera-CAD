@@ -520,3 +520,50 @@ fn boolean_results_are_deterministic() {
         nondet.join("\n  ")
     );
 }
+
+/// Isolation of #81 from the coincident-cap degeneracy: a RADIAL poke where the
+/// cylinder is SHORTER than the box (half-height 0.7 < box half-extent 1.0), so
+/// the caps sit strictly inside the box and the box ±z faces never touch the
+/// cylinder — only the four box SIDE planes cut it, in vertical generators,
+/// producing the four θ-sector bulges. If the union still drops them here, the
+/// bug is the radial sector partition itself, not the cap coincidence (#81/#85).
+#[test]
+fn cylinder_box_radial_poke_nondegenerate() {
+    let rc = 1.2_f64;
+    let hh = 0.7_f64;
+    let in_b = |p: [f64; 3]| (p[0] * p[0] + p[1] * p[1]).sqrt() <= rc && p[2].abs() <= hh;
+    let (g_int, g_uni) = grid_core(1.8, &in_b);
+    let k_int = kernel_box_op(BooleanOp::Intersection, &|m| z_cylinder(m, rc, hh));
+    let k_uni = kernel_box_op(BooleanOp::Union, &|m| z_cylinder(m, rc, hh));
+    eprintln!("radial-nondegen: ∩ {k_int:?} (truth {g_int:.3}) | ∪ {k_uni:?} (truth {g_uni:.3})");
+    // ISOLATED FINDINGS (cap degeneracy ruled out — caps interior to the box):
+    // the radial θ-sector partition of the cylinder lateral corrupts BOTH ops.
+    //   ∩ over-includes (returns ~box volume, exceeding even the cylinder's own
+    //     volume — impossible, since A∩B ≤ min(|A|,|B|)): it barely clips the cyl.
+    //   ∪ ERRORS (None): the four bulge sectors are not stitched into a closed
+    //     shell, so build_shells_from_faces rejects the result.
+    let mut fails: Vec<String> = Vec::new();
+    let v_cyl = std::f64::consts::PI * rc * rc * (2.0 * hh);
+    match k_int {
+        None => fails.push("∩ errored".into()),
+        Some(v) if v > v_cyl + 1e-6 => fails.push(format!(
+            "∩ = {v:.3} EXCEEDS cylinder volume {v_cyl:.3} (A∩B must be ≤ min(|A|,|B|))"
+        )),
+        Some(v) if rel_err(v, g_int) > 0.05 => {
+            fails.push(format!("∩ = {v:.3} vs truth {g_int:.3}"))
+        }
+        Some(_) => {}
+    }
+    match k_uni {
+        None => fails.push("∪ ERRORED — 4 bulge sectors not stitched into a closed shell".into()),
+        Some(v) if rel_err(v, g_uni) > 0.05 => {
+            fails.push(format!("∪ = {v:.3} vs truth {g_uni:.3}"))
+        }
+        Some(_) => {}
+    }
+    assert!(
+        fails.is_empty(),
+        "radial fat-cylinder boolean broken — radial θ-sector partition (#81/#85):\n  {}",
+        fails.join("\n  ")
+    );
+}
