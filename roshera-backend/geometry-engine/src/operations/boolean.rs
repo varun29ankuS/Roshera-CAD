@@ -568,8 +568,37 @@ fn compute_face_intersections(
             }
             return BBox::INFINITE;
         }
-        f.bbox(&model.loops, &model.edges, &model.vertices, &model.surfaces)
-            .unwrap_or(BBox::INFINITE)
+        // A planar cap bounded by a CLOSED circular edge (cylinder/cone cap)
+        // has only the seam vertex on that edge, so the vertex/surface-sampled
+        // `f.bbox()` collapses to that single point and the broad phase wrongly
+        // prunes every cap×wall pair (#81: the cap×box-side window edges are
+        // never imprinted, so a fat short cylinder poking the box leaves the box
+        // side faces unsplit, and a full-height cylinder's caps are never clipped
+        // to the box). Union `f.bbox()` with the analytic bounding box of every
+        // boundary edge's CURVE: for a circle that yields the full disk extent;
+        // for a straight polygon edge it equals the endpoints, so polygonal
+        // faces are unchanged.
+        let mut bb = f.bbox(&model.loops, &model.edges, &model.vertices, &model.surfaces);
+        for loop_id in f.all_loops() {
+            let Some(lp) = model.loops.get(loop_id) else {
+                continue;
+            };
+            for &eid in &lp.edges {
+                let Some(edge) = model.edges.get(eid) else {
+                    continue;
+                };
+                let Some(curve) = model.curves.get(edge.curve_id) else {
+                    continue;
+                };
+                let (lo, hi) = curve.bounding_box();
+                let cbb = BBox::new_validated(lo, hi);
+                bb = Some(match bb {
+                    Some(existing) => existing.union(&cbb),
+                    None => cbb,
+                });
+            }
+        }
+        bb.unwrap_or(BBox::INFINITE)
     };
 
     let candidate_pairs: Vec<(FaceId, FaceId)> = if use_broad_phase {
@@ -4030,26 +4059,42 @@ fn split_cylinder_lateral_by_sectors(
     }
     verticals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Non-vertical boundary edges = rim arcs, indexed by unordered endpoint pair.
-    let mut arc_by_pair: HashMap<(VertexId, VertexId), EdgeId> = HashMap::new();
-    for (&eid, ge) in graph.edges.iter() {
-        if ge.edge_type != EdgeType::Boundary {
+    // Rim arcs = every NON-vertical, non-degenerate edge lying on a rim (both
+    // endpoints at the same axial height, ≈ h0 or ≈ h1), regardless of
+    // edge_type. The rim is frequently subdivided into MANY small arcs: when an
+    // adjacent cap face's boundary circle is imprinted onto the lateral (the
+    // cap-circle self-coincidence), the rim is densified with `Splitting` arcs
+    // well beyond the vertical crossings. So a sector side is a CHAIN of arcs,
+    // not a single edge — build per-rim adjacency and walk it.
+    let mut bottom_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    let mut top_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    let mut seen_arc: HashSet<EdgeId> = HashSet::new();
+    for (&eid, _) in graph.edges.iter() {
+        let e = model.edges.get(eid)?;
+        if e.start_vertex == e.end_vertex {
+            continue; // closed circle / degenerate — not a chain arc
+        }
+        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+        if (sa - ea).abs() > span_tol {
+            continue; // a vertical (generator/seam) or a slanted edge — not a flat rim arc
+        }
+        if !seen_arc.insert(eid) {
             continue;
         }
-        let e = model.edges.get(eid)?;
-        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
-        if (sa - ea).abs() >= span - span_tol {
-            continue; // skip the vertical seam
-        }
-        let key = if e.start_vertex < e.end_vertex {
-            (e.start_vertex, e.end_vertex)
+        let mid = 0.5 * (sa + ea);
+        let adj = if (mid - h0).abs() <= (mid - h1).abs() {
+            &mut bottom_adj
         } else {
-            (e.end_vertex, e.start_vertex)
+            &mut top_adj
         };
-        arc_by_pair.insert(key, eid);
+        adj.entry(e.start_vertex)
+            .or_default()
+            .push((e.end_vertex, eid));
+        adj.entry(e.end_vertex)
+            .or_default()
+            .push((e.start_vertex, eid));
     }
 
-    let pair = |a: VertexId, b: VertexId| if a < b { (a, b) } else { (b, a) };
     let oriented = |eid: EdgeId, from: VertexId| -> Option<(EdgeId, bool)> {
         let e = model.edges.get(eid)?;
         if e.start_vertex == from {
@@ -4061,21 +4106,64 @@ fn split_cylinder_lateral_by_sectors(
         }
     };
 
+    // Walk a rim CCW (increasing θ) from `start` to `end`, returning the arc
+    // chain oriented start→…→end. At each vertex pick the unvisited neighbour
+    // with the smallest positive CCW angular gap, so densification vertices
+    // between two verticals are traversed in order.
+    let walk_ccw = |start: VertexId,
+                    end: VertexId,
+                    adj: &HashMap<VertexId, Vec<(VertexId, EdgeId)>>|
+     -> Option<Vec<(EdgeId, bool)>> {
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        let mut cur = start;
+        let mut prev: Option<VertexId> = None;
+        let mut guard = 0usize;
+        let limit = adj.len() + 4;
+        while cur != end {
+            guard += 1;
+            if guard > limit {
+                return None;
+            }
+            let cur_th = theta_of(cur)?;
+            let neighbours = adj.get(&cur)?;
+            let mut best: Option<(f64, VertexId, EdgeId)> = None;
+            for &(nb, eid) in neighbours.iter() {
+                if Some(nb) == prev {
+                    continue;
+                }
+                let gap = (theta_of(nb)? - cur_th).rem_euclid(two_pi);
+                if gap <= 1.0e-9 {
+                    continue;
+                }
+                if best.map_or(true, |(g, _, _)| gap < g) {
+                    best = Some((gap, nb, eid));
+                }
+            }
+            let (_, nb, eid) = best?;
+            out.push(oriented(eid, cur)?);
+            prev = Some(cur);
+            cur = nb;
+        }
+        Some(out)
+    };
+
     let n = verticals.len();
     let mut faces = Vec::with_capacity(n);
     for i in 0..n {
         let (th_i, bi, ti, ei) = verticals[i];
         let (th_j, bj, tj, ej) = verticals[(i + 1) % n];
-        let top_arc = *arc_by_pair.get(&pair(ti, tj))?;
-        let bot_arc = *arc_by_pair.get(&pair(bi, bj))?;
-        // Sector loop: bi→ti (left vertical), ti→tj (top arc), tj→bj (right
-        // vertical), bj→bi (bottom arc).
-        let loop_edges = vec![
-            oriented(ei, bi)?,
-            oriented(top_arc, ti)?,
-            oriented(ej, tj)?,
-            oriented(bot_arc, bj)?,
-        ];
+        // Top side: ti → tj CCW. Bottom side: bi → bj CCW, then reversed into
+        // the loop as bj → bi.
+        let top_chain = walk_ccw(ti, tj, &top_adj)?;
+        let bot_chain = walk_ccw(bi, bj, &bottom_adj)?;
+        let mut loop_edges: Vec<(EdgeId, bool)> =
+            Vec::with_capacity(top_chain.len() + bot_chain.len() + 2);
+        loop_edges.push(oriented(ei, bi)?); // left vertical bi → ti
+        loop_edges.extend(top_chain); // top arc chain ti → tj
+        loop_edges.push(oriented(ej, tj)?); // right vertical tj → bj
+        for &(eid, fwd) in bot_chain.iter().rev() {
+            loop_edges.push((eid, !fwd)); // bottom arc chain bj → bi
+        }
         // Interior point on the lateral at the sector mid-angle (handle wrap) and
         // mid-height.
         let th_mid = if th_j >= th_i {
@@ -8431,6 +8519,92 @@ fn point_inside_sphere_solid(
     })
 }
 
+/// Exact analytic point-membership for a solid that is a SINGLE finite cylinder
+/// (one lateral `Cylinder` face plus two perpendicular planar caps). The
+/// ray-cast classifier counts crossings against the solid's ORIGINAL cap faces,
+/// but a Boolean that imprints cut-chords on those caps (e.g. a fat cylinder
+/// poking the box, whose cap disk is clipped by the box side planes) leaves the
+/// cap loops carrying extra edges; the ray↔cap-face test then misses cap
+/// crossings asymmetrically and a point just BEYOND a cap (radially inside but
+/// axially past `h0`/`h1`) is wrongly called Inside — treating the finite
+/// cylinder as if it were infinite (#81: cylinder∩box over-includes the strips
+/// below/above the caps; ∪ under-stitches by the same volume). The implicit
+/// test `radial ⪋ r ∧ axial ∈ [h0,h1]` is exact, deterministic, and immune to
+/// the imprinted cap topology. `None` ⇒ not a lone finite cylinder, so the
+/// caller falls through to the ray cast.
+fn point_inside_cylinder_solid(
+    model: &BRepModel,
+    solid: SolidId,
+    p: &Point3,
+    tolerance: &Tolerance,
+) -> Option<FaceClassification> {
+    use crate::primitives::surface::{Cylinder, Plane};
+    let faces = get_solid_faces(model, solid).ok()?;
+    if faces.is_empty() {
+        return None;
+    }
+    // Identify the (single) finite cylinder shared by every lateral face and
+    // confirm every other face is a planar cap perpendicular to its axis.
+    let mut params: Option<(Point3, Vector3, f64, f64, f64)> = None;
+    for &fid in &faces {
+        let surf = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))?;
+        if let Some(cyl) = surf.as_any().downcast_ref::<Cylinder>() {
+            let [a0, a1] = cyl.height_limits?;
+            let (h0, h1) = (a0.min(a1), a0.max(a1));
+            match params {
+                None => params = Some((cyl.origin, cyl.axis, cyl.radius, h0, h1)),
+                Some((o, a, r, _, _)) => {
+                    if (cyl.origin - o).magnitude() > tolerance.distance()
+                        || cyl.axis.dot(&a).abs() < 1.0 - 1.0e-6
+                        || (cyl.radius - r).abs() > tolerance.distance()
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    let (origin, axis, radius, h0, h1) = params?;
+    // Every planar face must be a cap perpendicular to the axis; any oblique
+    // plane means this is not a simple finite cylinder.
+    for &fid in &faces {
+        let surf = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))?;
+        if let Some(plane) = surf.as_any().downcast_ref::<Plane>() {
+            if plane.normal.dot(&axis).abs() < 1.0 - 1.0e-6 {
+                return None;
+            }
+        } else if surf.as_any().downcast_ref::<Cylinder>().is_none() {
+            return None; // some other surface type → not a lone cylinder
+        }
+    }
+
+    let d = *p - origin;
+    let axial = d.dot(&axis);
+    let radial = (d - axis * axial).magnitude();
+    let r_band = tolerance.distance() * radius.max(1.0);
+    let a_band = tolerance.distance();
+    let on_lateral =
+        (radial - radius).abs() <= r_band && axial >= h0 - a_band && axial <= h1 + a_band;
+    let on_cap =
+        ((axial - h0).abs() <= a_band || (axial - h1).abs() <= a_band) && radial <= radius + r_band;
+    if on_lateral || on_cap {
+        return Some(FaceClassification::OnBoundary);
+    }
+    Some(
+        if radial < radius - r_band && axial > h0 + a_band && axial < h1 - a_band {
+            FaceClassification::Inside
+        } else {
+            FaceClassification::Outside
+        },
+    )
+}
+
 fn classify_face_relative_to_solid(
     model: &BRepModel,
     face: &SplitFace,
@@ -8448,6 +8622,12 @@ fn classify_face_relative_to_solid(
     // Likewise a lone sphere: the ray-cast flickers for near-tangent corner
     // slivers; the implicit test is exact and deterministic.
     if let Some(cls) = point_inside_sphere_solid(model, solid, &test_point, tolerance) {
+        return Ok(cls);
+    }
+    // Likewise a lone finite cylinder: once its caps carry imprinted cut-chords
+    // the ray-cast misses cap crossings and treats it as infinite, so points
+    // just past a cap classify Inside. The implicit radial∧axial test is exact.
+    if let Some(cls) = point_inside_cylinder_solid(model, solid, &test_point, tolerance) {
         return Ok(cls);
     }
 
