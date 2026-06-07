@@ -18,7 +18,7 @@
 //! Prior diagnosis (task #34): the kernel over-includes on rotated input. This
 //! harness pins that quantitatively; the fix lands under #80.
 
-use geometry_engine::math::{Matrix4, Vector3};
+use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::operations::{
     boolean_operation, transform_solid, BooleanOp, BooleanOptions, TransformOptions,
 };
@@ -277,5 +277,152 @@ fn offset_rotated_cube_intersection_matches_independent_oracle() {
         failures.is_empty(),
         "offset+rotated boolean disagreements with independent oracle:\n  {}",
         failures.join("\n  ")
+    );
+}
+
+// --- Curved intersections (sphere / cylinder vs the unit box) ------------
+
+type Membership = Box<dyn Fn([f64; 3]) -> bool>;
+type Builder = Box<dyn Fn(&mut BRepModel) -> SolidId>;
+
+/// Kernel `A op B` where A is the unit box and B is built by `build_b`.
+fn kernel_box_op(op: BooleanOp, build_b: &dyn Fn(&mut BRepModel) -> SolidId) -> Option<f64> {
+    let mut model = BRepModel::new();
+    let a = unit_cube(&mut model);
+    let b = build_b(&mut model);
+    let result = boolean_operation(&mut model, a, b, op, BooleanOptions::default()).ok()?;
+    model.calculate_solid_volume(result)
+}
+
+fn sphere(model: &mut BRepModel, center: [f64; 3], r: f64) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_sphere_3d(Point3::new(center[0], center[1], center[2]), r)
+        .expect("sphere creation succeeds")
+    {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected solid, got {other:?}"),
+    }
+}
+
+fn z_cylinder(model: &mut BRepModel, r: f64, half_h: f64) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_cylinder_3d(
+            Point3::new(0.0, 0.0, -half_h),
+            Vector3::new(0.0, 0.0, 1.0),
+            r,
+            2.0 * half_h,
+        )
+        .expect("cylinder creation succeeds")
+    {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected solid, got {other:?}"),
+    }
+}
+
+/// Curved ∩/∪ against the box, checked against analytic membership. Curved
+/// results carry tessellation-volume error (~1%) on top of the grid's ~1%, so
+/// the tolerance is looser than the polyhedral cases — still tight enough to
+/// catch the dropped-face / open-mesh failures the curved boolean path is prone
+/// to (those run to tens of percent).
+#[test]
+fn curved_intersection_matches_independent_oracle() {
+    const TOL_C: f64 = 0.05;
+    let rs = 1.2_f64; // sphere radius
+
+    // Only the stable, correct curved cases run here. The offset sphere-poke and
+    // the cylinder are pinned as #[ignore]'d known bugs below (#81, #82).
+    let cases: Vec<(&str, f64, Membership, Builder)> = vec![(
+        "sphere r1.2 ∩ box",
+        1.8,
+        Box::new(move |p: [f64; 3]| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() <= rs),
+        Box::new(move |m: &mut BRepModel| sphere(m, [0.0, 0.0, 0.0], rs)),
+    )];
+
+    let mut failures: Vec<String> = Vec::new();
+    eprintln!("  case                  | ∩ kernel  ∩ truth  err   | ∪ kernel  ∪ truth  err");
+    for (name, region, in_b, build_b) in &cases {
+        let (g_int, g_uni) = grid_core(*region, in_b.as_ref());
+        let k_int = kernel_box_op(BooleanOp::Intersection, build_b.as_ref());
+        let k_uni = kernel_box_op(BooleanOp::Union, build_b.as_ref());
+        let k_int_s = k_int.map_or("ERR".to_string(), |v| format!("{v:7.3}"));
+        let k_uni_s = k_uni.map_or("ERR".to_string(), |v| format!("{v:7.3}"));
+        let e_int = k_int.map_or(f64::INFINITY, |v| rel_err(v, g_int));
+        let e_uni = k_uni.map_or(f64::INFINITY, |v| rel_err(v, g_uni));
+        eprintln!(
+            "  {name:21} | {k_int_s}  {g_int:7.3}  {ei:5.1}% | {k_uni_s}  {g_uni:7.3}  {eu:5.1}%",
+            ei = e_int * 100.0,
+            eu = e_uni * 100.0
+        );
+        if e_int > TOL_C {
+            failures.push(format!(
+                "{name}: ∩ {k_int_s} vs {g_int:.3} ({:.1}%)",
+                e_int * 100.0
+            ));
+        }
+        if e_uni > TOL_C {
+            failures.push(format!(
+                "{name}: ∪ {k_uni_s} vs {g_uni:.3} ({:.1}%)",
+                e_uni * 100.0
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "curved boolean disagreements with independent oracle:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// PINNED KNOWN BUG (#81): cylinder ∩/∪ box is wrong on the curved side-bulge
+/// case. With cylinder radius 1.2 > box half-extent 1, the cylinder pokes past
+/// all four box side faces. The kernel reports V(∪) < V(∩) — impossible — and
+/// loses ~30% of the union, i.e. the four side-bulge regions are dropped or left
+/// unstitched. Same class as the curved-union face-drop bugs (#50/#58), on a
+/// config they didn't cover. Verified against an independent grid oracle whose
+/// own ∩+∪ matches V(box)+V(cyl) to <0.1%, so the fault is the kernel.
+/// Un-ignore when the cylinder-box boolean is fixed.
+#[test]
+#[ignore = "KNOWN BUG #81: cylinder∩/∪box drops curved side-bulge faces (V(∪)<V(∩))"]
+fn cylinder_box_boolean_pinned_81() {
+    let rc = 1.2_f64;
+    let in_b = |p: [f64; 3]| (p[0] * p[0] + p[1] * p[1]).sqrt() <= rc && p[2].abs() <= 1.0;
+    let (g_int, g_uni) = grid_core(1.8, &in_b);
+    let k_int = kernel_box_op(BooleanOp::Intersection, &|m| z_cylinder(m, rc, 1.0)).expect("∩");
+    let k_uni = kernel_box_op(BooleanOp::Union, &|m| z_cylinder(m, rc, 1.0)).expect("∪");
+    assert!(
+        k_uni >= k_int,
+        "union must be ≥ intersection (got ∪={k_uni:.3} < ∩={k_int:.3})"
+    );
+    assert!(
+        rel_err(k_int, g_int) <= 0.05,
+        "∩ {k_int:.3} vs truth {g_int:.3}"
+    );
+    assert!(
+        rel_err(k_uni, g_uni) <= 0.05,
+        "∪ {k_uni:.3} vs truth {g_uni:.3}"
+    );
+}
+
+/// PINNED KNOWN BUG (#82): box ∩ sphere with the sphere straddling a box face is
+/// wrong and non-deterministic. Sphere r=1 centred at (1,0,0) is exactly half
+/// inside the box, so V(box ∩ sphere) = ½·(4/3·π) ≈ 2.094. The kernel instead
+/// returns the *whole* sphere (~4.189) on some runs and a near-correct value on
+/// others — it sometimes fails to clip B by A at all. The run-to-run variation
+/// points at shared global state in the boolean/tessellation path (cf. #26). A
+/// flaky boolean is a determinism bug: make it reproducible first, then the clip
+/// bug is debuggable. Un-ignore when fixed.
+#[test]
+#[ignore = "KNOWN BUG #82: box-sphere face-straddle returns full sphere; non-deterministic"]
+fn sphere_poke_intersection_pinned_82() {
+    let in_b = |p: [f64; 3]| ((p[0] - 1.0).powi(2) + p[1] * p[1] + p[2] * p[2]).sqrt() <= 1.0;
+    let (g_int, _g_uni) = grid_core(2.1, &in_b);
+    let k_int = kernel_box_op(BooleanOp::Intersection, &|m| {
+        sphere(m, [1.0, 0.0, 0.0], 1.0)
+    })
+    .expect("∩");
+    assert!(
+        rel_err(k_int, g_int) <= 0.05,
+        "box-sphere(poke) = {k_int:.3}, truth {g_int:.3} (kernel returns the unclipped sphere ~4.19)"
     );
 }
