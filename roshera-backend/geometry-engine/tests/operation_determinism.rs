@@ -265,3 +265,123 @@ fn extrude_is_deterministic() {
         );
     }
 }
+
+// --- Revolve / Sweep / Loft determinism --------------------------------------
+//
+// These ops mutate the model and build SHARED vertex/edge grids (revolve rings,
+// sweep stations, loft correspondence) whose assembly walks internal maps. Each
+// run rebuilds a fresh model, runs the op, and measures the result volume; 8
+// in-process runs (8 internal hash seeds) must agree to 1e-6 relative. A
+// different grid assembly or a dropped face moves the volume far more than that;
+// sub-1e-6 FP-summation noise is tolerated.
+
+use geometry_engine::operations::{
+    loft_profiles, revolve_profile, sweep_profile, LoftOptions, RevolveOptions, SweepOptions,
+};
+
+fn line_edge_between(model: &mut BRepModel, a: VertexId, b: VertexId) -> EdgeId {
+    let pa = model.vertices.get(a).expect("a").position;
+    let pb = model.vertices.get(b).expect("b").position;
+    let cid = model
+        .curves
+        .add(Box::new(Line::new(Point3::from(pa), Point3::from(pb))));
+    model
+        .edges
+        .add(Edge::new_auto_range(0, a, b, cid, EdgeOrientation::Forward))
+}
+
+fn assert_volume_run_deterministic(label: &str, run: impl Fn() -> f64) {
+    let runs: Vec<f64> = (0..8).map(|_| run()).collect();
+    let first = runs[0];
+    for (i, &v) in runs.iter().enumerate() {
+        assert!(
+            (v - first).abs() / first.abs().max(1.0) < 1e-6,
+            "{label} non-deterministic: run 0 = {first}, run {i} = {v} (all = {runs:?})"
+        );
+    }
+}
+
+/// Revolve a rectangle (x ∈ [1,2], z ∈ [0,3]) a half-turn about the Z axis.
+/// The half revolution exercises both the swept walls and the two end caps.
+fn revolve_volume_run() -> f64 {
+    let mut model = BRepModel::new();
+    let v0 = model.vertices.add(1.0, 0.0, 0.0);
+    let v1 = model.vertices.add(2.0, 0.0, 0.0);
+    let v2 = model.vertices.add(2.0, 0.0, 3.0);
+    let v3 = model.vertices.add(1.0, 0.0, 3.0);
+    let edges = vec![
+        line_edge_between(&mut model, v0, v1),
+        line_edge_between(&mut model, v1, v2),
+        line_edge_between(&mut model, v2, v3),
+        line_edge_between(&mut model, v3, v0),
+    ];
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::PI,
+        ..RevolveOptions::default()
+    };
+    let solid = revolve_profile(&mut model, edges, opts).expect("revolve");
+    model.calculate_solid_volume(solid).expect("volume")
+}
+
+/// Sweep a 2×3 rectangle along +Z by 4.
+fn sweep_volume_run() -> f64 {
+    let mut model = BRepModel::new();
+    let v0 = model.vertices.add(0.0, 0.0, 0.0);
+    let v1 = model.vertices.add(2.0, 0.0, 0.0);
+    let v2 = model.vertices.add(2.0, 3.0, 0.0);
+    let v3 = model.vertices.add(0.0, 3.0, 0.0);
+    let profile = vec![
+        line_edge_between(&mut model, v0, v1),
+        line_edge_between(&mut model, v1, v2),
+        line_edge_between(&mut model, v2, v3),
+        line_edge_between(&mut model, v3, v0),
+    ];
+    let pa = model.vertices.add(0.0, 0.0, 0.0);
+    let pb = model.vertices.add(0.0, 0.0, 4.0);
+    let path = line_edge_between(&mut model, pa, pb);
+    let solid = sweep_profile(&mut model, profile, path, SweepOptions::default()).expect("sweep");
+    model.calculate_solid_volume(solid).expect("volume")
+}
+
+/// Loft between two axis-aligned squares of different size at z = 0 and z = 20.
+fn loft_volume_run() -> f64 {
+    let mut model = BRepModel::new();
+    let square = |model: &mut BRepModel, z: f64, side: f64| -> Vec<EdgeId> {
+        let h = side / 2.0;
+        let v0 = model.vertices.add(-h, -h, z);
+        let v1 = model.vertices.add(h, -h, z);
+        let v2 = model.vertices.add(h, h, z);
+        let v3 = model.vertices.add(-h, h, z);
+        vec![
+            line_edge_between(model, v0, v1),
+            line_edge_between(model, v1, v2),
+            line_edge_between(model, v2, v3),
+            line_edge_between(model, v3, v0),
+        ]
+    };
+    let p0 = square(&mut model, 0.0, 10.0);
+    let p1 = square(&mut model, 20.0, 6.0);
+    let opts = LoftOptions {
+        create_solid: true,
+        ..Default::default()
+    };
+    let solid = loft_profiles(&mut model, vec![p0, p1], opts).expect("loft");
+    model.calculate_solid_volume(solid).expect("volume")
+}
+
+#[test]
+fn revolve_is_deterministic() {
+    assert_volume_run_deterministic("revolve", revolve_volume_run);
+}
+
+#[test]
+fn sweep_is_deterministic() {
+    assert_volume_run_deterministic("sweep", sweep_volume_run);
+}
+
+#[test]
+fn loft_is_deterministic() {
+    assert_volume_run_deterministic("loft", loft_volume_run);
+}
