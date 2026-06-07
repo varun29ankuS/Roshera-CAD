@@ -53,7 +53,7 @@ use crate::primitives::{
     vertex::VertexId,
 };
 use crate::spatial::{RstarIndex, SpatialIndex};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tracing::debug;
 
 /// Pipeline-stage tracing, gated on the `ROSHERA_BOOL_TRACE`
@@ -3758,6 +3758,11 @@ fn split_cylinder_lateral_by_window(
         v_max = v_max.max(va).max(vb);
         split_eids.push(ge.edge_id);
     }
+    // `graph.edges.values()` is hash-ordered (random per process); `order_loop`
+    // below starts its greedy walk at `split_eids[0]`, so an unsorted collection
+    // makes the loop traversal — and the resulting face split — non-deterministic
+    // (#82). Sort to a stable starting point.
+    split_eids.sort_unstable();
     if !has_vertical || split_eids.len() < 3 {
         return None;
     }
@@ -4951,15 +4956,20 @@ fn extract_cycle_vertices_3d(cycle: &[EdgeId], model: &BRepModel) -> Vec<Point3>
 
 /// Intersection graph for face splitting
 pub(super) struct IntersectionGraph {
-    pub(super) nodes: HashMap<VertexId, GraphNode>,
-    pub(super) edges: HashMap<EdgeId, GraphEdge>,
+    // BTreeMap (not HashMap): every traversal of the graph — node/edge iteration
+    // during splitting, loop ordering, vertex merge, shell assembly — must be a
+    // pure function of the topology, not of the per-process hash seed, or the
+    // boolean result is non-deterministic across runs (#82). Sorted keys give
+    // that determinism by construction.
+    pub(super) nodes: BTreeMap<VertexId, GraphNode>,
+    pub(super) edges: BTreeMap<EdgeId, GraphEdge>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct GraphNode {
-    // The owning HashMap key is the vertex id; storing it again would
-    // duplicate state with no consumer.
-    pub(super) incident_edges: HashSet<EdgeId>,
+    // The owning map key is the vertex id; storing it again would duplicate
+    // state with no consumer. BTreeSet for the same determinism reason as above.
+    pub(super) incident_edges: BTreeSet<EdgeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -4979,8 +4989,8 @@ pub(super) enum EdgeType {
 impl IntersectionGraph {
     pub(super) fn new() -> Self {
         Self {
-            nodes: HashMap::new(),
-            edges: HashMap::new(),
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
         }
     }
 
@@ -5014,7 +5024,7 @@ impl IntersectionGraph {
         for (&edge_id, graph_edge) in &self.edges {
             for &vid in &[graph_edge.start_vertex, graph_edge.end_vertex] {
                 let node = self.nodes.entry(vid).or_insert_with(|| GraphNode {
-                    incident_edges: HashSet::new(),
+                    incident_edges: BTreeSet::new(),
                 });
                 node.incident_edges.insert(edge_id);
             }
@@ -6768,7 +6778,7 @@ fn presplit_closed_loop_edges(
                 .nodes
                 .entry(vid)
                 .or_insert_with(|| GraphNode {
-                    incident_edges: HashSet::new(),
+                    incident_edges: BTreeSet::new(),
                 })
                 .incident_edges
                 .insert(eid);
@@ -7030,7 +7040,7 @@ fn presplit_boundary_t_junctions(
                     .nodes
                     .entry(sv)
                     .or_insert_with(|| GraphNode {
-                        incident_edges: HashSet::new(),
+                        incident_edges: BTreeSet::new(),
                     })
                     .incident_edges
                     .insert(first_id);
@@ -7039,7 +7049,7 @@ fn presplit_boundary_t_junctions(
                 .nodes
                 .entry(*split_vid)
                 .or_insert_with(|| GraphNode {
-                    incident_edges: HashSet::new(),
+                    incident_edges: BTreeSet::new(),
                 })
                 .incident_edges
                 .insert(first_id);
@@ -7063,7 +7073,7 @@ fn presplit_boundary_t_junctions(
                     .nodes
                     .entry(vid)
                     .or_insert_with(|| GraphNode {
-                        incident_edges: HashSet::new(),
+                        incident_edges: BTreeSet::new(),
                     })
                     .incident_edges
                     .insert(final_id);
@@ -7299,7 +7309,7 @@ pub(super) fn compute_edge_intersections(
 
         // Register vertex in node map
         let node = graph.nodes.entry(vid).or_insert_with(|| GraphNode {
-            incident_edges: HashSet::new(),
+            incident_edges: BTreeSet::new(),
         });
         node.incident_edges.insert(*eid_a);
         node.incident_edges.insert(*eid_b);
@@ -7416,7 +7426,7 @@ pub(super) fn compute_edge_intersections(
                     .nodes
                     .entry(sv)
                     .or_insert_with(|| GraphNode {
-                        incident_edges: HashSet::new(),
+                        incident_edges: BTreeSet::new(),
                     })
                     .incident_edges
                     .insert(first_id);
@@ -7425,7 +7435,7 @@ pub(super) fn compute_edge_intersections(
                 .nodes
                 .entry(*split_vid)
                 .or_insert_with(|| GraphNode {
-                    incident_edges: HashSet::new(),
+                    incident_edges: BTreeSet::new(),
                 })
                 .incident_edges
                 .insert(first_id);
@@ -7453,7 +7463,7 @@ pub(super) fn compute_edge_intersections(
                     .nodes
                     .entry(vid)
                     .or_insert_with(|| GraphNode {
-                        incident_edges: HashSet::new(),
+                        incident_edges: BTreeSet::new(),
                     })
                     .incident_edges
                     .insert(final_id);
@@ -7684,7 +7694,12 @@ fn find_or_create_intersection_vertex(
     // global tolerance never narrows an already-loose vertex.
     let global_tol = tolerance.distance();
     let residual = geometric_residual.max(0.0);
-    for &vid in graph.nodes.keys() {
+    // Iterate vertices in a stable (sorted) order: `HashMap::keys()` is randomized
+    // per process, so returning the *first* within-tolerance match made the chosen
+    // canonical vertex — and therefore the whole clip — non-deterministic (#82).
+    let mut candidate_vids: Vec<VertexId> = graph.nodes.keys().copied().collect();
+    candidate_vids.sort_unstable();
+    for vid in candidate_vids {
         if vid == 0 || vid == u32::MAX {
             continue;
         }
@@ -10203,14 +10218,23 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
         return vec![(0..n).collect()];
     }
 
-    // Collect components
+    // Collect components. The union-find *partition* is independent of union
+    // order, but `HashMap::into_values()` would emit the groups in a per-process
+    // random order, and downstream shell assembly treats the first group as the
+    // outer shell — so the boolean became non-deterministic across runs (#82).
+    // Order each group's members and the groups themselves by smallest member so
+    // the output is a pure function of the topology, never the hash seed.
     let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..n {
         let root = find(&mut parent, i);
         components.entry(root).or_default().push(i);
     }
-
-    components.into_values().collect()
+    let mut out: Vec<Vec<usize>> = components.into_values().collect();
+    for group in &mut out {
+        group.sort_unstable();
+    }
+    out.sort_unstable_by_key(|group| group[0]);
+    out
 }
 
 #[cfg(test)]
@@ -12446,7 +12470,7 @@ mod tests {
         graph.nodes.insert(
             existing,
             GraphNode {
-                incident_edges: HashSet::new(),
+                incident_edges: BTreeSet::new(),
             },
         );
 
