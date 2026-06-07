@@ -210,3 +210,58 @@ fn chamfer_is_deterministic() {
         chamfer_edges(m, s, vec![e], chamfer_opts()).expect("chamfer");
     });
 }
+
+// --- Extrude determinism -----------------------------------------------------
+
+use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
+use geometry_engine::primitives::curve::Line;
+use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+
+/// Extrude a unit square profile into a box, return its volume. Fresh model per
+/// call (extrude mutates).
+fn extrude_box_volume() -> f64 {
+    let mut model = BRepModel::new();
+    let verts = [
+        Point3::new(-1.0, -1.0, 0.0),
+        Point3::new(1.0, -1.0, 0.0),
+        Point3::new(1.0, 1.0, 0.0),
+        Point3::new(-1.0, 1.0, 0.0),
+    ];
+    let v_ids: Vec<VertexId> = verts
+        .iter()
+        .map(|p| model.vertices.add(p.x, p.y, p.z))
+        .collect();
+    let mut edges = Vec::with_capacity(4);
+    for i in 0..4 {
+        let line = Line::new(verts[i], verts[(i + 1) % 4]);
+        let cid = model.curves.add(Box::new(line));
+        let e = Edge::new_auto_range(
+            0,
+            v_ids[i],
+            v_ids[(i + 1) % 4],
+            cid,
+            EdgeOrientation::Forward,
+        );
+        edges.push(model.edges.add(e));
+    }
+    let opts = ExtrudeOptions {
+        direction: Vector3::Z,
+        distance: 3.0,
+        cap_ends: true,
+        ..ExtrudeOptions::default()
+    };
+    let solid = extrude_profile(&mut model, edges, opts).expect("extrude");
+    model.calculate_solid_volume(solid).expect("volume")
+}
+
+#[test]
+fn extrude_is_deterministic() {
+    let runs: Vec<f64> = (0..8).map(|_| extrude_box_volume()).collect();
+    let first = runs[0];
+    for (i, &v) in runs.iter().enumerate() {
+        assert!(
+            (v - first).abs() / first.abs().max(1.0) < 1e-6,
+            "extrude non-deterministic: run 0 = {first}, run {i} = {v} (all = {runs:?})"
+        );
+    }
+}
