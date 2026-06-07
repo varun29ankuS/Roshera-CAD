@@ -440,8 +440,7 @@ mod tests {
     /// under-exercises it), or is the face-pair narrow phase genuinely missing
     /// non-face features? Un-ignore once edge/corner contact is covered.
     #[test]
-    #[ignore = "OPEN #83: face-pair LMD misses edge/corner closest-approach (returns inf)"]
-    fn cd_edge_corner_contact_pinned_83() {
+    fn cd_edge_corner_contact_83() {
         const TAU: f64 = 1e-6;
         for (label, t) in [
             ("edge", [2.0_f64, 2.0, 0.0]),

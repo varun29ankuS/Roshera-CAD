@@ -383,8 +383,7 @@ fn curved_intersection_matches_independent_oracle() {
 /// own ∩+∪ matches V(box)+V(cyl) to <0.1%, so the fault is the kernel.
 /// Un-ignore when the cylinder-box boolean is fixed.
 #[test]
-#[ignore = "KNOWN BUG #81: cylinder∩/∪box drops curved side-bulge faces (V(∪)<V(∩))"]
-fn cylinder_box_boolean_pinned_81() {
+fn cylinder_box_boolean_81() {
     let rc = 1.2_f64;
     let in_b = |p: [f64; 3]| (p[0] * p[0] + p[1] * p[1]).sqrt() <= rc && p[2].abs() <= 1.0;
     let (g_int, g_uni) = grid_core(1.8, &in_b);
@@ -413,8 +412,7 @@ fn cylinder_box_boolean_pinned_81() {
 /// flaky boolean is a determinism bug: make it reproducible first, then the clip
 /// bug is debuggable. Un-ignore when fixed.
 #[test]
-#[ignore = "KNOWN BUG #82: box-sphere face-straddle returns full sphere; non-deterministic"]
-fn sphere_poke_intersection_pinned_82() {
+fn sphere_poke_intersection_82() {
     let in_b = |p: [f64; 3]| ((p[0] - 1.0).powi(2) + p[1] * p[1] + p[2] * p[2]).sqrt() <= 1.0;
     let (g_int, _g_uni) = grid_core(2.1, &in_b);
     let k_int = kernel_box_op(BooleanOp::Intersection, &|m| {
