@@ -143,14 +143,36 @@ fn assert_mesh_manifold_with_params(
         "{label}: tessellation must produce at least one triangle"
     );
 
-    // Build half-edge usage map. Each undirected edge {a, b} (a<b)
-    // must appear in exactly two triangles.
+    // Weld vertices by quantized position first. Tessellation intentionally keeps
+    // coincident-but-sharp-edged samples as DISTINCT mesh vertices so each face
+    // retains its own shading normal (the normal-aware weld, #69). So raw triangle
+    // indices do not share across a sharp seam, and a raw-index manifold check sees
+    // false count-1 boundary edges. The meaningful invariant is geometric — every
+    // *position* edge borders exactly two triangles — so re-weld by position here.
+    let weld_eps = 1e-6_f64;
+    let pkey = |p: Point3| {
+        (
+            (p.x / weld_eps).round() as i64,
+            (p.y / weld_eps).round() as i64,
+            (p.z / weld_eps).round() as i64,
+        )
+    };
+    let mut canon: std::collections::HashMap<(i64, i64, i64), u32> =
+        std::collections::HashMap::new();
+    let mut remap: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+    for v in &mesh.vertices {
+        let next = canon.len() as u32;
+        remap.push(*canon.entry(pkey(v.position)).or_insert(next));
+    }
+
+    // Build half-edge usage map over welded indices. Each undirected edge {a, b}
+    // (a<b) must appear in exactly two triangles.
     let mut edge_count: std::collections::HashMap<(u32, u32), usize> =
         std::collections::HashMap::new();
     for tri in &mesh.triangles {
-        let a = tri[0];
-        let b = tri[1];
-        let c = tri[2];
+        let a = remap[tri[0] as usize];
+        let b = remap[tri[1] as usize];
+        let c = remap[tri[2] as usize];
         for (u, v) in [(a, b), (b, c), (c, a)] {
             let key = if u < v { (u, v) } else { (v, u) };
             *edge_count.entry(key).or_insert(0) += 1;
