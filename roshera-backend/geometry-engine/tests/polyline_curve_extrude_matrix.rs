@@ -267,11 +267,33 @@ fn standard_extrude_opts(height: f64) -> ExtrudeOptions {
 /// Watertight closed manifold ⇒ every undirected edge has valence 2.
 fn count_mesh_non_manifold_edges(mesh: &geometry_engine::tessellation::TriangleMesh) -> usize {
     use std::collections::HashMap;
+    // Weld by quantized position first: the normal-aware tessellation weld (#69)
+    // keeps sharp-edge samples as DISTINCT mesh vertices (so each face keeps its
+    // own shading normal), so raw triangle indices don't share across a sharp seam
+    // and a raw-index check sees false count-1 boundary edges. The meaningful
+    // invariant is geometric — every *position* edge borders exactly two triangles.
+    let eps = 1e-6_f64;
+    let mut canon: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut remap: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+    for v in &mesh.vertices {
+        let next = canon.len() as u32;
+        let key = (
+            (v.position.x / eps).round() as i64,
+            (v.position.y / eps).round() as i64,
+            (v.position.z / eps).round() as i64,
+        );
+        remap.push(*canon.entry(key).or_insert(next));
+    }
     let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
     for tri in &mesh.triangles {
+        let idx = [
+            remap[tri[0] as usize],
+            remap[tri[1] as usize],
+            remap[tri[2] as usize],
+        ];
         for k in 0..3 {
-            let a = tri[k];
-            let b = tri[(k + 1) % 3];
+            let a = idx[k];
+            let b = idx[(k + 1) % 3];
             let key = if a < b { (a, b) } else { (b, a) };
             *counts.entry(key).or_insert(0) += 1;
         }

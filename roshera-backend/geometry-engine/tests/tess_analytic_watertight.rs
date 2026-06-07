@@ -20,15 +20,56 @@ use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, Topol
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams, TriangleMesh};
 
 /// Undirected-edge multiplicity histogram of a triangle mesh.
+/// Map every mesh vertex to a canonical index by quantized position. The
+/// normal-aware tessellation weld (#69) keeps coincident sharp-edge samples as
+/// DISTINCT vertices (so each face keeps its own shading normal), so a raw-index
+/// manifold/Euler count sees false count-1 boundary edges and over-counts
+/// vertices. Re-welding by position recovers the geometrically-meaningful counts.
+fn weld_remap(mesh: &TriangleMesh) -> Vec<u32> {
+    use std::collections::HashMap;
+    let eps = 1e-6_f64;
+    let mut canon: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut remap: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+    for v in &mesh.vertices {
+        let next = canon.len() as u32;
+        let key = (
+            (v.position.x / eps).round() as i64,
+            (v.position.y / eps).round() as i64,
+            (v.position.z / eps).round() as i64,
+        );
+        remap.push(*canon.entry(key).or_insert(next));
+    }
+    remap
+}
+
 fn edge_count_histogram(mesh: &TriangleMesh) -> std::collections::HashMap<(u32, u32), u32> {
+    let remap = weld_remap(mesh);
     let mut h: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
     for tri in &mesh.triangles {
-        for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+        let idx = [
+            remap[tri[0] as usize],
+            remap[tri[1] as usize],
+            remap[tri[2] as usize],
+        ];
+        for &(a, b) in &[(idx[0], idx[1]), (idx[1], idx[2]), (idx[2], idx[0])] {
             let key = if a < b { (a, b) } else { (b, a) };
             *h.entry(key).or_insert(0) += 1;
         }
     }
     h
+}
+
+/// Count of distinct *welded* vertex positions referenced by triangles — the V
+/// for an Euler check consistent with the welded `edge_count_histogram` (E).
+fn welded_vertex_count(mesh: &TriangleMesh) -> i64 {
+    let remap = weld_remap(mesh);
+    let mut referenced = std::collections::HashSet::new();
+    for tri in &mesh.triangles {
+        referenced.insert(remap[tri[0] as usize]);
+        referenced.insert(remap[tri[1] as usize]);
+        referenced.insert(remap[tri[2] as usize]);
+    }
+    referenced.len() as i64
 }
 
 /// Build a closed cylinder solid (lateral + two planar caps) and return
@@ -85,13 +126,7 @@ fn cylinder_solid_tessellation_is_watertight() {
     // vertices actually referenced by triangles — the shared-edge weld
     // remaps indices but leaves the merged-away vertex slots in
     // `mesh.vertices`, so the raw length over-counts.
-    let mut referenced = std::collections::HashSet::new();
-    for tri in &mesh.triangles {
-        referenced.insert(tri[0]);
-        referenced.insert(tri[1]);
-        referenced.insert(tri[2]);
-    }
-    let v = referenced.len() as i64;
+    let v = welded_vertex_count(&mesh);
     let e = hist.len() as i64;
     let f = mesh.triangles.len() as i64;
     assert_eq!(
@@ -146,13 +181,7 @@ fn sphere_solid_tessellation_is_watertight() {
         non_manifold.len()
     );
 
-    let mut referenced = std::collections::HashSet::new();
-    for tri in &mesh.triangles {
-        referenced.insert(tri[0]);
-        referenced.insert(tri[1]);
-        referenced.insert(tri[2]);
-    }
-    let v = referenced.len() as i64;
+    let v = welded_vertex_count(&mesh);
     let e = hist.len() as i64;
     let f = mesh.triangles.len() as i64;
     assert_eq!(
@@ -178,13 +207,7 @@ fn assert_watertight_closed_manifold(mesh: &TriangleMesh, label: &str, expected_
         non_manifold, 0,
         "{label} must be a closed 2-manifold; found {non_manifold} non-2 edges"
     );
-    let mut referenced = std::collections::HashSet::new();
-    for tri in &mesh.triangles {
-        referenced.insert(tri[0]);
-        referenced.insert(tri[1]);
-        referenced.insert(tri[2]);
-    }
-    let v = referenced.len() as i64;
+    let v = welded_vertex_count(mesh);
     let e = hist.len() as i64;
     let f = mesh.triangles.len() as i64;
     assert_eq!(
