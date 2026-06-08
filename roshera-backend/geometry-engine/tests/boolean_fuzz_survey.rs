@@ -1238,3 +1238,134 @@ fn hang_isolation_survey() {
     }
     println!("=== end ===\n");
 }
+
+// ===========================================================================
+// CLEAN-CELL reporter (#91 ratchet step 1). The surveys print only FAILURES;
+// to promote conquered ground into a hard CI gate we must know exactly which
+// (placement, r) cells pass ALL THREE ops cleanly (volume within tol, watertight,
+// manifold). This prints that set so the gate is built from measured fact, not
+// assumption. Hung cells (the 26 from hang_isolation_survey) are skipped via the
+// timeout runner so one infinite loop can't block the report.
+// ===========================================================================
+
+#[test]
+#[ignore = "fuzz survey — prints box∘sphere cells that pass all 3 ops cleanly"]
+fn survey_box_sphere_clean_cells() {
+    let vol_tol = 0.03;
+    let ops = [
+        BooleanOp::Intersection,
+        BooleanOp::Union,
+        BooleanOp::Difference,
+    ];
+    let picks: [fn(&GridTruth) -> f64; 3] = [|g| g.intersection, |g| g.union, |g| g.difference];
+
+    let mut configs: Vec<([f64; 3], &'static str, f64)> = Vec::new();
+    for (c, label) in placements() {
+        for &r in radii() {
+            configs.push((c, label, r));
+        }
+    }
+
+    let clean: Vec<String> = configs
+        .par_iter()
+        .filter_map(|&(c, label, r)| {
+            let truth = grid_truth(c, r);
+            let mut all_clean = true;
+            let mut any_checked = false;
+            for (oi, &op) in ops.iter().enumerate() {
+                let t = picks[oi](&truth);
+                if t < 1e-3 {
+                    continue; // empty/whole — no boundary to test
+                }
+                any_checked = true;
+                match run_op_timed(op, move |m| sphere(m, c, r)) {
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol || f.open_edges != 0 || f.nonmanifold_edges != 0 {
+                            all_clean = false;
+                        }
+                    }
+                    _ => all_clean = false,
+                }
+            }
+            if any_checked && all_clean {
+                Some(format!("{label} r={r}"))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut clean = clean;
+    clean.sort();
+    println!("\n=== #91 box∘sphere CLEAN cells (pass ∩/∪/∖: vol≤3%, watertight, manifold) ===");
+    println!("clean_cells={}", clean.len());
+    for c in &clean {
+        println!("  OK {c}");
+    }
+    println!("=== end ===\n");
+}
+
+// ===========================================================================
+// RATCHET GATE (#91) — NON-ignored. Locks the box∘sphere cells that currently
+// pass all three booleans cleanly, derived from survey_box_sphere_clean_cells
+// (not assumed). If a future kernel change regresses one of these — e.g. the
+// curved-cut path starts returning a whole operand again (the dominant failure
+// mode the surveys catalogue) — THIS test goes red in CI. The 471 still-failing
+// cells stay in the #[ignore] surveys as the work queue; this gate is the floor
+// of conquered ground that must never drop.
+//
+// Oracle = the same 96³ grid truth the surveys use, asserted at a looser 5% tol
+// (these cells pass the survey at 3%, so ≥2% margin keeps the gate non-flaky)
+// plus watertight + manifold. Volume is deterministic (determinism harness #84),
+// so the 5% band can only be crossed by a real regression, never by noise.
+// ===========================================================================
+
+#[test]
+fn box_sphere_conquered_band_gate() {
+    // (centre, r) — the exact cells survey_box_sphere_clean_cells reported clean.
+    let cells: [([f64; 3], f64); 6] = [
+        ([0.0, 0.0, 0.0], 0.5),  // interior-centre r=0.5
+        ([0.0, 0.0, 0.0], 0.8),  // interior-centre r=0.8
+        ([0.5, 0.3, 0.0], 0.25), // interior-offset r=0.25
+        ([0.5, 0.3, 0.0], 0.5),  // interior-offset r=0.5
+        ([1.4, 0.0, 0.0], 0.25), // poke+x r=0.25 (disjoint — sphere fully outside)
+        ([1.4, 0.5, 0.0], 0.25), // poke+x-off r=0.25 (disjoint)
+    ];
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let tol = 0.05;
+    for (c, r) in cells {
+        let truth = grid_truth(c, r);
+        for &(op, sym, pick) in &ops {
+            let t = pick(&truth);
+            if t < 1e-3 {
+                continue; // empty result — no boundary
+            }
+            let facts = run_op(op, move |m| sphere(m, c, r)).unwrap_or_else(|| {
+                panic!("box∘sphere {sym} at c={c:?} r={r} returned no solid (kernel error)")
+            });
+            let rel = (facts.vol - t).abs() / t.max(1e-3);
+            assert!(
+                rel <= tol,
+                "REGRESSION: box∘sphere {sym} c={c:?} r={r}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+                facts.vol,
+                100.0 * (facts.vol - t) / t,
+                100.0 * tol
+            );
+            assert_eq!(
+                facts.open_edges, 0,
+                "REGRESSION: box∘sphere {sym} c={c:?} r={r}: {} open edges (not watertight)",
+                facts.open_edges
+            );
+            assert_eq!(
+                facts.nonmanifold_edges, 0,
+                "REGRESSION: box∘sphere {sym} c={c:?} r={r}: {} non-manifold edges",
+                facts.nonmanifold_edges
+            );
+        }
+    }
+}
