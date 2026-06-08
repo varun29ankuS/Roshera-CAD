@@ -1369,3 +1369,168 @@ fn box_sphere_conquered_band_gate() {
         }
     }
 }
+
+// ===========================================================================
+// box ∘ TORUS survey — second solid is a z-axis torus. A torus is genus-1: the
+// central hole plus the doubly-curved tube exercise the rim-imprint path (#57)
+// and the multi-face rim-poke case the other curved surveys don't reach.
+// ===========================================================================
+
+fn torus(model: &mut BRepModel, c: [f64; 3], rmaj: f64, rmin: f64) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_torus_3d(Point3::new(c[0], c[1], c[2]), Vector3::Z, rmaj, rmin)
+        .expect("torus")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("torus: {o:?}"),
+    }
+}
+
+/// Inside a z-axis torus: distance from the tube centre-circle (radius `rmaj`
+/// in the z=c_z plane) is ≤ tube radius `rmin`.
+fn in_torus(p: [f64; 3], c: [f64; 3], rmaj: f64, rmin: f64) -> bool {
+    let (dx, dy, dz) = (p[0] - c[0], p[1] - c[1], p[2] - c[2]);
+    let radial = (dx * dx + dy * dy).sqrt();
+    let q = radial - rmaj;
+    q * q + dz * dz <= rmin * rmin
+}
+
+fn torus_grid_truth(c: [f64; 3], rmaj: f64, rmin: f64) -> GridTruth {
+    let reach = [
+        c[0].abs() + rmaj + rmin,
+        c[1].abs() + rmaj + rmin,
+        c[2].abs() + rmin,
+    ]
+    .into_iter()
+    .fold(BOX_HALF, f64::max)
+        + 0.05;
+    const N: usize = 96;
+    let cell = 2.0 * reach / N as f64;
+    let cv = cell * cell * cell;
+    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
+    for i in 0..N {
+        let x = -reach + (i as f64 + 0.5) * cell;
+        let in_bx = x.abs() <= BOX_HALF;
+        for j in 0..N {
+            let y = -reach + (j as f64 + 0.5) * cell;
+            let in_by = in_bx && y.abs() <= BOX_HALF;
+            for k in 0..N {
+                let z = -reach + (k as f64 + 0.5) * cell;
+                let in_box = in_by && z.abs() <= BOX_HALF;
+                let in_t = in_torus([x, y, z], c, rmaj, rmin);
+                if in_box && in_t {
+                    i_n += 1;
+                }
+                if in_box || in_t {
+                    u_n += 1;
+                }
+                if in_box && !in_t {
+                    d_n += 1;
+                }
+            }
+        }
+    }
+    GridTruth {
+        intersection: i_n as f64 * cv,
+        union: u_n as f64 * cv,
+        difference: d_n as f64 * cv,
+    }
+}
+
+/// (centre, major_r, minor_r, label) — z-axis tori vs box [-1,1]³.
+fn torus_configs() -> Vec<([f64; 3], f64, f64, &'static str)> {
+    vec![
+        ([0.0, 0.0, 0.0], 0.6, 0.25, "centered"),
+        ([0.0, 0.0, 0.0], 0.6, 0.4, "centered-fat"),
+        ([0.0, 0.0, 0.0], 0.5, 0.15, "thin-contained"),
+        ([0.3, 0.0, 0.0], 0.6, 0.25, "offset-x"),
+        ([0.6, 0.6, 0.0], 0.5, 0.2, "corner"),
+        ([0.0, 0.0, 0.0], 0.9, 0.3, "rim-through-4faces"),
+        ([0.0, 0.0, 0.0], 1.0, 0.3, "rim-on-faces"),
+        ([0.0, 0.0, 0.8], 0.5, 0.3, "axial-poke+z"),
+        ([0.0, 0.0, 0.0], 0.7, 0.2, "ring-hole"),
+    ]
+}
+
+#[test]
+#[ignore = "fuzz survey — run with --ignored --nocapture"]
+fn boolean_box_torus_fuzz_survey() {
+    let vol_tol = 0.03;
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let configs = torus_configs();
+    let n_cfg = configs.len();
+    let n_checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let fails: Vec<Failure> = configs
+        .par_iter()
+        .flat_map(|&(c, rmaj, rmin, label)| {
+            let truth = torus_grid_truth(c, rmaj, rmin);
+            let mut out: Vec<Failure> = Vec::new();
+            for &(op, sym, pick) in &ops {
+                let t = pick(&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lab = format!("{label} R={rmaj} r={rmin}");
+                match run_op_timed(op, move |m| torus(m, c, rmaj, rmin)) {
+                    Outcome::Hang => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "HANG",
+                        detail: format!("op did not return within budget (truth {t:.3})"),
+                    }),
+                    Outcome::Err => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "ERROR",
+                        detail: format!("op errored (truth {t:.3})"),
+                    }),
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "VOLUME",
+                                detail: format!(
+                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                    f.vol,
+                                    100.0 * (f.vol - t) / t
+                                ),
+                            });
+                        }
+                        if f.open_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "WATERTIGHT",
+                                detail: format!("open_edges={}", f.open_edges),
+                            });
+                        }
+                        if f.nonmanifold_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "MANIFOLD",
+                                detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    print_catalog(
+        "box ∘ torus",
+        &fails,
+        n_cfg,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
