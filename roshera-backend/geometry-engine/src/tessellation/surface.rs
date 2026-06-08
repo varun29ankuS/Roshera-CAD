@@ -962,7 +962,15 @@ fn tessellate_spherical_cap(
         uv: None,
     });
 
-    let forward = face.orientation.is_forward();
+    // Triangle (cross-product) winding must agree with the radial-outward vertex
+    // normals. The rim→apex ring traversal reverses handedness when the apex sits
+    // on the -c_axis side (h < 0), so the winding has to flip WITH the apex side,
+    // not key on face.orientation alone. Without this, a cap whose supporting
+    // sphere centre is on the far side of the cut plane (e.g. the second operand
+    // of a sphere-sphere lens) meshes inward while its vertex normals point
+    // outward; the Tonon signed-tet volume then sums the two cap fluxes with
+    // opposite sign and the lens collapses 5π/12 → π/4.
+    let forward = face.orientation.is_forward() ^ (h < 0.0);
     for s in 0..rings - 1 {
         let a = &ring_idx[s];
         let b = &ring_idx[s + 1];
