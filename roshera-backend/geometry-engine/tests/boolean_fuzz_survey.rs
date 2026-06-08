@@ -2754,3 +2754,250 @@ fn boolean_random_fuzz_survey() {
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
+
+// ===========================================================================
+// #89 LENS DISSECTION — dumps the geometry of the equal-lens ∩ RESULT so we can
+// decide WHERE the 0.785-vs-1.309 volume error lives. For two unit spheres at
+// distance d=1 the lens is two spherical caps of height h=0.5. Each cap's curved
+// area is 2πrh = π, so a CORRECT result has total surface area ≈ 2π ≈ 6.2832 and
+// volume = 5π/12 ≈ 1.30900.
+//
+// We tessellate the result, bucket triangles by their B-Rep FaceId (face_map),
+// and per face report: surface type, mesh area, area-weighted outward-normal
+// sample, and the centroid. Then total mesh area + kernel analytic area + volume.
+//
+// DECISION RULE:
+//   total area ≈ 6.28  → the two caps are the RIGHT SIZE; the wrong volume is an
+//                        ORIENTATION/assembly defect (caps face wrong way, or the
+//                        divergence integral signs/flat-disk closure is off).
+//   total area ≠ 6.28  → the caps are the WRONG SIZE; tessellation is filling the
+//                        wrong UV region of the sphere (e.g. the far spherical
+//                        cap instead of the near lens cap), so the surface itself
+//                        does not bound the lens.
+// ===========================================================================
+#[test]
+#[ignore = "diagnostic — dissect the equal-lens INT result geometry (#89)"]
+fn diag_equal_lens_geometry_dump() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    // Build sphere([0,0,0],1) ∩ sphere([1,0,0],1) once, keep the model alive so
+    // we can interrogate the RESULT solid's faces / surfaces / mesh.
+    let mut model = BRepModel::new();
+    let a = sphere(&mut model, [0.0, 0.0, 0.0], 1.0);
+    let b = sphere(&mut model, [1.0, 0.0, 0.0], 1.0);
+    let res = boolean_operation(
+        &mut model,
+        a,
+        b,
+        BooleanOp::Intersection,
+        BooleanOptions::default(),
+    )
+    .expect("equal-lens INT must produce a result");
+
+    // (1) number of faces + the face id list of the result's outer shell.
+    let face_ids: Vec<u32> = {
+        let solid = model.get_solid(res).expect("result solid");
+        let shell = model.shells.get(solid.outer_shell).expect("outer shell");
+        shell.faces.clone()
+    };
+    println!("\n========== #89 EQUAL-LENS ∩ RESULT GEOMETRY DUMP ==========");
+    println!(
+        "truth: volume = 5π/12 = {:.5} ; total surface area (two h=0.5 caps) = 2π = {:.5}",
+        5.0 * std::f64::consts::PI / 12.0,
+        2.0 * std::f64::consts::PI
+    );
+    println!(
+        "(1) result outer-shell faces = {} : ids {:?}",
+        face_ids.len(),
+        face_ids
+    );
+
+    // (2) per-face surface type.
+    println!("(2) per-face surface type:");
+    for &fid in &face_ids {
+        let ty = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .map(|s| s.type_name())
+            .unwrap_or("?");
+        println!("    face {fid}: {ty}");
+    }
+
+    // Tessellate the WHOLE result (welded mesh, fine params so areas converge),
+    // then bucket triangles by FaceId via face_map.
+    let params = TessellationParams::fine();
+    let mesh = {
+        let solid = model.get_solid(res).expect("result solid");
+        tessellate_solid(solid, &model, &params)
+    };
+    assert_eq!(
+        mesh.face_map.len(),
+        mesh.triangles.len(),
+        "face_map must be parallel to triangles"
+    );
+
+    // Per-face accumulators: area, area-weighted normal, area-weighted centroid.
+    use std::collections::BTreeMap;
+    let mut per_face: BTreeMap<u32, (f64, [f64; 3], [f64; 3])> = BTreeMap::new();
+    let mut total_area = 0.0_f64;
+    for (tri, &fid) in mesh.triangles.iter().zip(mesh.face_map.iter()) {
+        let p0 = mesh.vertices[tri[0] as usize].position;
+        let p1 = mesh.vertices[tri[1] as usize].position;
+        let p2 = mesh.vertices[tri[2] as usize].position;
+        let e1 = [p1.x - p0.x, p1.y - p0.y, p1.z - p0.z];
+        let e2 = [p2.x - p0.x, p2.y - p0.y, p2.z - p0.z];
+        // cross(e1,e2)
+        let cx = e1[1] * e2[2] - e1[2] * e2[1];
+        let cy = e1[2] * e2[0] - e1[0] * e2[2];
+        let cz = e1[0] * e2[1] - e1[1] * e2[0];
+        let twice = (cx * cx + cy * cy + cz * cz).sqrt();
+        let area = 0.5 * twice;
+        total_area += area;
+        // geometric (winding) outward normal of this triangle, unit.
+        let n = if twice > 1e-15 {
+            [cx / twice, cy / twice, cz / twice]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+        let centroid = [
+            (p0.x + p1.x + p2.x) / 3.0,
+            (p0.y + p1.y + p2.y) / 3.0,
+            (p0.z + p1.z + p2.z) / 3.0,
+        ];
+        let e = per_face.entry(fid).or_insert((0.0, [0.0; 3], [0.0; 3]));
+        e.0 += area;
+        for k in 0..3 {
+            e.1[k] += n[k] * area;
+            e.2[k] += centroid[k] * area;
+        }
+    }
+
+    // (3) per-face tessellated area + outward-normal sample (+ centroid).
+    println!("(3) per-face tessellated area + area-weighted outward-normal winding sample:");
+    for (fid, (area, nsum, csum)) in &per_face {
+        let nlen = (nsum[0] * nsum[0] + nsum[1] * nsum[1] + nsum[2] * nsum[2]).sqrt();
+        let n = if nlen > 1e-12 {
+            [nsum[0] / nlen, nsum[1] / nlen, nsum[2] / nlen]
+        } else {
+            [0.0; 3]
+        };
+        let c = if *area > 1e-12 {
+            [csum[0] / area, csum[1] / area, csum[2] / area]
+        } else {
+            [0.0; 3]
+        };
+        let ty = model
+            .faces
+            .get(*fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .map(|s| s.type_name())
+            .unwrap_or("?");
+        println!(
+            "    face {fid} ({ty}): area={:.5}  winding_normal=({:+.3},{:+.3},{:+.3})  centroid=({:+.3},{:+.3},{:+.3})",
+            area, n[0], n[1], n[2], c[0], c[1], c[2]
+        );
+    }
+
+    // (4) total surface area: mesh sum vs kernel analytic.
+    let analytic_area = model
+        .calculate_solid_surface_area(res)
+        .expect("analytic surface area");
+    println!(
+        "(4) TOTAL surface area: mesh_sum={:.5}  kernel_analytic={:.5}  (expected 2π={:.5})",
+        total_area,
+        analytic_area,
+        2.0 * std::f64::consts::PI
+    );
+
+    // (5) volume.
+    let vol = model.calculate_solid_volume(res).expect("volume");
+    println!(
+        "(5) VOLUME: kernel={:.5}  (truth 5π/12={:.5})",
+        vol,
+        5.0 * std::f64::consts::PI / 12.0
+    );
+
+    // VERDICT line — compare mesh area to 2π.
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let area_err = (total_area - two_pi) / two_pi;
+    println!(
+        "VERDICT: mesh_area={:.4} vs 2π={:.4} ({:+.1}%) → caps are {}",
+        total_area,
+        two_pi,
+        100.0 * area_err,
+        if area_err.abs() < 0.05 {
+            "RIGHT SIZE  ⇒ volume error is ORIENTATION/ASSEMBLY"
+        } else {
+            "WRONG SIZE  ⇒ tessellation fills the wrong UV region"
+        }
+    );
+    println!("===========================================================\n");
+}
+
+// ===========================================================================
+// RATCHET GATE (#89 lens) — NON-ignored. Pins the two-part sphere∘sphere fix:
+// the closed-form (Sphere,Sphere) intersection arm (db170f5) + the cap mesh
+// winding fix (tessellate_spherical_cap apex-side handedness). A proper-overlap
+// sphere∩sphere must produce the analytic lens volume, NOT the whole operand
+// (4.19) and NOT the half-wound π/4 (0.785). Uses the exact analytic lens
+// formula as an independent oracle (no grid).
+// ===========================================================================
+
+#[test]
+fn sphere_sphere_lens_gate() {
+    // Exact lens (intersection) volume of two spheres r0,r1 at centre distance d.
+    fn lens_vol(r0: f64, r1: f64, d: f64) -> f64 {
+        use std::f64::consts::PI;
+        // proper overlap assumed: |r0-r1| < d < r0+r1
+        PI * (r0 + r1 - d).powi(2) * (d * d + 2.0 * d * (r0 + r1) - 3.0 * (r0 - r1).powi(2))
+            / (12.0 * d)
+    }
+    // (ca, ra, cb, rb, d) proper-overlap lenses.
+    let cases: [([f64; 3], f64, [f64; 3], f64); 3] = [
+        ([0.0, 0.0, 0.0], 1.0, [1.0, 0.0, 0.0], 1.0), // equal-lens d=1 → 5π/12
+        ([0.0, 0.0, 0.0], 1.0, [0.8, 0.0, 0.0], 0.8), // offset-overlap
+        ([0.0, 0.0, 0.0], 1.0, [0.5, 0.5, 0.5], 0.9), // diag-overlap
+    ];
+    for (ca, ra, cb, rb) in cases {
+        let d =
+            ((cb[0] - ca[0]).powi(2) + (cb[1] - ca[1]).powi(2) + (cb[2] - ca[2]).powi(2)).sqrt();
+        let truth = lens_vol(ra, rb, d);
+        let f = match run_pair_timed(
+            BooleanOp::Intersection,
+            move |m| sphere(m, ca, ra),
+            move |m| sphere(m, cb, rb),
+        ) {
+            Outcome::Ok(f) => f,
+            Outcome::Err => panic!("sphere∩sphere a={ca:?}/{ra} b={cb:?}/{rb}: kernel error"),
+            Outcome::Hang => panic!("sphere∩sphere a={ca:?}/{ra} b={cb:?}/{rb}: did not return"),
+        };
+        let rel = (f.vol - truth).abs() / truth;
+        assert!(
+            rel <= 0.02,
+            "REGRESSION (#89 lens): sphere∩sphere a={ca:?}/{ra} b={cb:?}/{rb}: vol={:.5} analytic-lens={:.5} ({:+.1}%)",
+            f.vol,
+            truth,
+            100.0 * (f.vol - truth) / truth
+        );
+        // Guard the two specific historical wrong answers.
+        assert!(
+            (f.vol - 4.18879).abs() > 0.1,
+            "REGRESSION: returned a whole sphere (4.19) — #89 whole-operand bug is back"
+        );
+        assert!(
+            (f.vol - 0.78540).abs() > 0.05 || rel <= 0.02,
+            "REGRESSION: returned π/4 (0.785) — cap mesh winding bug is back"
+        );
+        assert_eq!(
+            f.open_edges, 0,
+            "lens not watertight: {} open edges",
+            f.open_edges
+        );
+        assert_eq!(
+            f.nonmanifold_edges, 0,
+            "lens non-manifold: {} edges",
+            f.nonmanifold_edges
+        );
+    }
+}
