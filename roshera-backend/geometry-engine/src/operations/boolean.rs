@@ -5131,16 +5131,21 @@ fn compute_split_face_interior_points(
         None => return result,
     };
 
-    // Extract ordered 3D vertices per cycle. Orientations are not needed
-    // for interior-point sampling (it's purely geometric — find shared
-    // vertices between consecutive edges and project to a tangent plane),
-    // so strip them before calling `extract_cycle_vertices_3d`. If any
-    // cycle is malformed we abandon the whole correction pass — falling
-    // back is always safe.
+    // Build a densified 3D containment polygon per cycle, then project to a
+    // tangent plane. If any cycle is malformed we abandon the whole correction
+    // pass — falling back to the boundary-midpoint centroid is always safe.
     let mut loop_vertices_3d: Vec<Vec<Point3>> = Vec::with_capacity(loops.len());
     for cycle in loops {
-        let edge_only: Vec<EdgeId> = cycle.iter().map(|(e, _)| *e).collect();
-        let verts = extract_cycle_vertices_3d(&edge_only, model);
+        // Densify: sample every edge's CURVE in walk order, not just its shared
+        // endpoints. A cut circle bounding a near-tangent disk is split into only
+        // a few arcs, so its endpoint polygon is a coarse inscribed triangle —
+        // point-in-polygon containment then mis-reports the circle-minus-triangle
+        // gap as "outside the hole", so the annular face's interior point is
+        // placed inside its own hole and the face mis-classifies (the near-tangent
+        // box∩sphere #86 failure). Sampling each arc approximates the true curve,
+        // making containment geometrically faithful. Straight edges sample to
+        // collinear points (harmless).
+        let verts = densified_cycle_polygon_3d(cycle, model);
         if verts.len() < 3 {
             return result;
         }
@@ -5227,8 +5232,13 @@ fn compute_split_face_interior_points(
     }
 
     // For each loop with children, find a point inside the loop but
-    // outside every child polygon.
-    let nudge_fractions = [0.05f64, 0.1, 0.2, 0.35, 0.5];
+    // outside every child polygon. Small-first so the chosen point sits as close
+    // to the OUTER boundary as a valid annulus point can — i.e. as far from the
+    // hole as possible, giving the downstream classify maximal clearance from the
+    // cut curve. The leading sub-0.01 steps reach a THIN near-tangent annulus
+    // (e.g. a cut circle 0.03 inside the host edge) that 0.05 would overshoot
+    // straight into the hole.
+    let nudge_fractions = [0.002f64, 0.008, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5];
     for i in 0..n {
         let poly_i = &loop_vertices_2d[i];
         let (cx, cy) = loop_centroids_2d[i];
@@ -5281,6 +5291,42 @@ fn compute_split_face_interior_points(
     }
 
     result
+}
+
+/// A densified containment polygon for a DCEL cycle: each edge's carrier curve
+/// is sampled at several interior parameters in walk order (not just the shared
+/// endpoints), so a curved boundary — a cut circle split into a handful of arcs —
+/// is approximated closely enough that point-in-polygon containment is
+/// geometrically faithful rather than reducing the curve to its inscribed
+/// chord polygon. Straight edges sample to collinear points (harmless). Returns
+/// empty if any edge or curve is missing, so the caller falls back safely.
+fn densified_cycle_polygon_3d(cycle: &[(EdgeId, bool)], model: &BRepModel) -> Vec<Point3> {
+    const SAMPLES_PER_EDGE: usize = 8;
+    let mut pts = Vec::with_capacity(cycle.len() * SAMPLES_PER_EDGE);
+    for &(eid, fwd) in cycle {
+        let Some(edge) = model.edges.get(eid) else {
+            return Vec::new();
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            return Vec::new();
+        };
+        let (s, e) = (edge.param_range.start, edge.param_range.end);
+        // Sample [0, SAMPLES) in walk direction; the trailing endpoint is the
+        // next edge's leading sample, so omit it to avoid duplicate vertices.
+        for k in 0..SAMPLES_PER_EDGE {
+            let frac = k as f64 / SAMPLES_PER_EDGE as f64;
+            let t = if fwd {
+                s + (e - s) * frac
+            } else {
+                e + (s - e) * frac
+            };
+            match curve.point_at(t) {
+                Ok(p) => pts.push(p),
+                Err(_) => return Vec::new(),
+            }
+        }
+    }
+    pts
 }
 
 /// Walk a cycle of EdgeIds in walk order and return the shared vertex

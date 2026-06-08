@@ -14,14 +14,18 @@
 //! confirmed by the per-fragment classification trace (ROSHERA_BOOL_TRACE=1):
 //!
 //!   * NEAR-TANGENT band, r ∈ [0.95, 0.995] (circle inside the face, gap ≤ 0.05
-//!     to the box edges) → boolean ERRORS ("component 0 has only 1 planar face").
-//!     The square-minus-circle arrangement mis-walks: the poked face splits into
-//!     TWO chord-split pieces BOTH inside the circle, and the annulus (outside-
-//!     circle) cell is DROPPED. With no exterior planar cell, the curved
-//!     hemisphere can't close against a disk cap → invalid shell. Topology is
-//!     identical to r ≤ 0.9 (which is exact + watertight), so this is a DCEL
-//!     robustness failure triggered purely by the circle's proximity to the host
-//!     edges, not a change of case.
+//!     to the box edges) → **FIXED** (commit after `4c900e3`). Was: boolean
+//!     ERRORED ("component 0 has only 1 planar face"). The arrangement is in fact
+//!     correct (square + interior circle); the bug was in
+//!     `compute_split_face_interior_points` — it approximated the cut circle by
+//!     its few arc *endpoints* (a coarse inscribed polygon), so the
+//!     point-in-polygon containment mis-read the circle-minus-polygon gap as
+//!     "outside the hole" and placed the annular face's interior point inside its
+//!     own hole → the annulus mis-classified Inside → two coplanar Inside planar
+//!     faces → invalid shell. Fix: densify the containment polygons (sample each
+//!     arc) + small-first nudge fractions so a THIN annulus still yields an
+//!     interior point near the outer boundary. Now exact + watertight; gated in
+//!     `curved_boolean_poke_envelope.rs`.
 //!
 //!   * EXACT-TANGENT, r = 1 (great circle radius = box half-width ⇒ tangent to
 //!     all 4 box edges at their midpoints) → wrong volume 3.070, open seam. At
