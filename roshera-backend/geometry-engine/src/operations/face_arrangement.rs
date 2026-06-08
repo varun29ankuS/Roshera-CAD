@@ -196,8 +196,8 @@ pub(super) fn build_arrangement(
             }
         };
 
-        // Build (angle, edge_id, half_edge_id) tuples and sort.
-        let mut keyed: Vec<(f64, EdgeId, HalfEdgeId)> = hes
+        // Build (angle, curvature-angle, edge_id, half_edge_id) tuples and sort.
+        let mut keyed: Vec<(f64, f64, EdgeId, HalfEdgeId)> = hes
             .iter()
             .copied()
             .filter_map(|h| {
@@ -209,22 +209,36 @@ pub(super) fn build_arrangement(
                 // tangents above via `curve.tangent_at` failure. If both
                 // components are infinitesimal we still get a finite
                 // angle (atan2(0,0) == 0 on IEEE 754), which is harmless.
-                Some((b.atan2(a), he.edge_id, h))
+                let angle = b.atan2(a);
+                // Second-order (curvature) tie-break for EXACT tangencies: two
+                // half-edges can leave this vertex with a BIT-IDENTICAL first-
+                // order tangent — e.g. a circle arc inscribed-tangent to a
+                // straight boundary edge at an axis-aligned point, where both
+                // tangents are exactly (0,0,±1) (#82). The primary `angle` is
+                // then equal and the sort would fall through to `edge_id`, which
+                // is assigned in non-deterministic edge-creation order, shuffling
+                // the ring and the extracted loops run-to-run. Disambiguate by
+                // the direction to a point a small parameter-step INTO the edge:
+                // a straight edge keeps the same angle, a curved one rotates by
+                // its curvature — separating them GEOMETRICALLY and id-invariantly.
+                let angle2 = half_edge_offset_angle(he, model, pos, &e1, &e2).unwrap_or(angle);
+                Some((angle, angle2, he.edge_id, h))
             })
             .collect();
         keyed.sort_by(|a, b| {
             a.0.partial_cmp(&b.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
+                .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.2.cmp(&b.2))
         });
 
         if keyed.len() == hes.len() {
-            *hes = keyed.into_iter().map(|(_, _, h)| h).collect();
+            *hes = keyed.into_iter().map(|(_, _, _, h)| h).collect();
         } else {
             // Some half-edges failed to produce a tangent (degenerate
             // curve at vertex). Keep the sortable prefix and append the
             // unsortable suffix deterministically by edge id.
-            let sorted: Vec<HalfEdgeId> = keyed.into_iter().map(|(_, _, h)| h).collect();
+            let sorted: Vec<HalfEdgeId> = keyed.into_iter().map(|(_, _, _, h)| h).collect();
             let mut rest: Vec<HalfEdgeId> = hes
                 .iter()
                 .copied()
@@ -457,6 +471,39 @@ fn half_edge_tangent(he: &HalfEdge, model: &BRepModel) -> Option<Vector3> {
     } else {
         Some(-tan)
     }
+}
+
+/// Angle (in the vertex's `(e1, e2)` tangent frame) of the direction from the
+/// vertex to a point a small parameter-step INTO this half-edge. Used as the
+/// second-order tie-break in the angular sort: when two half-edges share a
+/// bit-identical first-order tangent (an exact tangency), this curvature-aware
+/// direction separates them geometrically — a straight edge keeps the tangent
+/// angle, a curved one rotates by its curvature. Deterministic and independent
+/// of edge-id assignment order. `origin` is the vertex position.
+fn half_edge_offset_angle(
+    he: &HalfEdge,
+    model: &BRepModel,
+    origin: Vector3,
+    e1: &Vector3,
+    e2: &Vector3,
+) -> Option<f64> {
+    let edge = model.edges.get(he.edge_id)?;
+    let curve = model.curves.get(edge.curve_id)?;
+    let (t0, t1) = (edge.param_range.start, edge.param_range.end);
+    let delta = 1.0e-3_f64;
+    let t = if he.forward {
+        t0 + (t1 - t0) * delta
+    } else {
+        t1 - (t1 - t0) * delta
+    };
+    let p = curve.point_at(t).ok()?;
+    let dir = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+    let a = dir.dot(e1);
+    let b = dir.dot(e2);
+    if a.abs() < 1.0e-15 && b.abs() < 1.0e-15 {
+        return None; // offset point coincides with the vertex — no information
+    }
+    Some(b.atan2(a))
 }
 
 /// Remove consecutive dangling-edge pairs (h, twin(h)) from a half-edge
