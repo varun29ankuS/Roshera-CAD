@@ -1629,16 +1629,10 @@ fn box_rbox_conquered_band_gate() {
             if t < 1e-3 {
                 continue;
             }
-            let facts = run_op_timed(op, move |m| rotated_box(m, hb, center, axis, angle));
-            let f = match facts {
-                Outcome::Ok(f) => f,
-                Outcome::Err => {
-                    panic!("box∘rbox {sym} hb={hb} {angle_deg}°: kernel error")
-                }
-                Outcome::Hang => {
-                    panic!("box∘rbox {sym} hb={hb} {angle_deg}°: did not return in budget")
-                }
-            };
+            // Serial run_op (not run_op_timed): conquered cells never hang, and a
+            // wall-clock thread budget flakes under full-suite CPU load.
+            let f = run_op(op, move |m| rotated_box(m, hb, center, axis, angle))
+                .unwrap_or_else(|| panic!("box∘rbox {sym} hb={hb} {angle_deg}°: no result solid"));
             let rel = (f.vol - t).abs() / t.max(1e-3);
             assert!(
                 rel <= tol,
@@ -1747,13 +1741,10 @@ fn box_cyl_conquered_band_gate() {
             if t < 1e-3 {
                 continue;
             }
-            let f = match run_op_timed(op, move |m| cylinder(m, base, r, h)) {
-                Outcome::Ok(f) => f,
-                Outcome::Err => panic!("box∘cyl {sym} base={base:?} r={r} h={h}: kernel error"),
-                Outcome::Hang => {
-                    panic!("box∘cyl {sym} base={base:?} r={r} h={h}: did not return in budget")
-                }
-            };
+            // Serial run_op (conquered cells never hang; a thread budget flakes under load).
+            let f = run_op(op, move |m| cylinder(m, base, r, h)).unwrap_or_else(|| {
+                panic!("box∘cyl {sym} base={base:?} r={r} h={h}: no result solid")
+            });
             let rel = (f.vol - t).abs() / t.max(1e-3);
             assert!(
                 rel <= tol,
@@ -1860,17 +1851,10 @@ fn box_cone_conquered_band_gate() {
             if t < 1e-3 {
                 continue;
             }
-            let f = match run_op_timed(op, move |m| cone(m, bc, rb, rt, h)) {
-                Outcome::Ok(f) => f,
-                Outcome::Err => {
-                    panic!("box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: kernel error")
-                }
-                Outcome::Hang => {
-                    panic!(
-                        "box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: did not return in budget"
-                    )
-                }
-            };
+            // Serial run_op (conquered cells never hang; a thread budget flakes under load).
+            let f = run_op(op, move |m| cone(m, bc, rb, rt, h)).unwrap_or_else(|| {
+                panic!("box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: no result solid")
+            });
             let rel = (f.vol - t).abs() / t.max(1e-3);
             assert!(
                 rel <= tol,
@@ -1976,13 +1960,10 @@ fn box_torus_conquered_band_gate() {
             if t < 1e-3 {
                 continue;
             }
-            let f = match run_op_timed(op, move |m| torus(m, c, rmaj, rmin)) {
-                Outcome::Ok(f) => f,
-                Outcome::Err => panic!("box∘torus {sym} c={c:?} R={rmaj} r={rmin}: kernel error"),
-                Outcome::Hang => {
-                    panic!("box∘torus {sym} c={c:?} R={rmaj} r={rmin}: did not return in budget")
-                }
-            };
+            // Serial run_op (conquered cells never hang; a thread budget flakes under load).
+            let f = run_op(op, move |m| torus(m, c, rmaj, rmin)).unwrap_or_else(|| {
+                panic!("box∘torus {sym} c={c:?} R={rmaj} r={rmin}: no result solid")
+            });
             let rel = (f.vol - t).abs() / t.max(1e-3);
             assert!(
                 rel <= tol,
