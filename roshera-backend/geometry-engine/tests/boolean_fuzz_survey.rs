@@ -38,7 +38,7 @@
 //! clip, tangency, near-tangency, containment, disjoint in one sweep.
 
 use geometry_engine::harness::brep_integrity::brep_integrity;
-use geometry_engine::math::Point3;
+use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
@@ -126,11 +126,13 @@ struct Facts {
     euler_residual: i64,
 }
 
-/// Run one box∘sphere boolean fresh; `None` on kernel error.
-fn run_op(op: BooleanOp, c: [f64; 3], r: f64) -> Option<Facts> {
+/// Run one box∘B boolean fresh (`build_b` makes the second solid); `None` on
+/// kernel error. Generic over the second solid so the same machinery surveys
+/// box∘sphere, box∘cylinder, box∘cone, …
+fn run_op<F: Fn(&mut BRepModel) -> SolidId>(op: BooleanOp, build_b: F) -> Option<Facts> {
     let mut model = BRepModel::new();
     let bx = the_box(&mut model);
-    let sp = sphere(&mut model, c, r);
+    let sp = build_b(&mut model);
     let res = boolean_operation(&mut model, bx, sp, op, BooleanOptions::default()).ok()?;
     let vol = model.calculate_solid_volume(res)?;
     let rep = brep_integrity(&model, res, 1e-6);
@@ -153,11 +155,14 @@ enum Outcome {
 /// survey. Run it on a detached thread and give up after `OP_TIMEOUT`. The hung
 /// thread leaks — acceptable for an occasional survey, and the catalog records
 /// the offending config so it becomes a fixable HANG, not a frozen run.
-fn run_op_timed(op: BooleanOp, c: [f64; 3], r: f64) -> Outcome {
+fn run_op_timed<F: Fn(&mut BRepModel) -> SolidId + Send + 'static>(
+    op: BooleanOp,
+    build_b: F,
+) -> Outcome {
     const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(run_op(op, c, r));
+        let _ = tx.send(run_op(op, build_b));
     });
     match rx.recv_timeout(OP_TIMEOUT) {
         Ok(Some(f)) => Outcome::Ok(f),
@@ -264,7 +269,7 @@ fn boolean_box_sphere_fuzz_survey() {
                 }
                 n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let lab = format!("{label} r={r}");
-                match run_op_timed(op, c, r) {
+                match run_op_timed(op, move |m| sphere(m, c, r)) {
                     Outcome::Hang => out.push(Failure {
                         label: lab,
                         op: sym,
@@ -322,28 +327,29 @@ fn boolean_box_sphere_fuzz_survey() {
         })
         .collect();
 
-    // HARD = trustworthy classes that flag a real Boolean bug. SOFT = classes
-    // that over-report and must be verified in isolation before acting:
-    //   HANG  — leaked-thread core-burn under rayon → false timeouts.
-    //   EULER — the UV-sphere primitive carries an intrinsic genus-0 residual of
-    //           -1 (periodic seam + 2 poles), so ANY sphere-bearing result fails
-    //           the residual==0 check without a real bug (confirmed by
-    //           survey_euler_baseline: bare sphere = -1, bare box = 0).
-    let is_soft = |k: &str| k == "HANG" || k == "EULER";
+    print_catalog(
+        "box ∘ sphere",
+        &fails,
+        n_cfg,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
 
+/// Print a ranked failure catalog. HARD = trustworthy real-bug classes (VOLUME,
+/// WATERTIGHT, MANIFOLD, ERROR) — the work queue. SOFT = over-report (HANG =
+/// leaked-thread core-burn under rayon; EULER = the UV-sphere primitive's
+/// intrinsic -1 genus residual, see survey_euler_baseline) — verify in isolation.
+fn print_catalog(title: &str, fails: &[Failure], n_cfg: usize, n_checks: usize) {
+    let is_soft = |k: &str| k == "HANG" || k == "EULER";
     use std::collections::BTreeMap;
     let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
-    for f in &fails {
+    for f in fails {
         *by_kind.entry(f.kind).or_default() += 1;
     }
     let hard: usize = fails.iter().filter(|f| !is_soft(f.kind)).count();
-    let soft: usize = fails.len() - hard;
-
-    println!("\n========== BOOLEAN FUZZ SURVEY: box ∘ sphere ==========");
-    println!(
-        "configs={n_cfg}  checks={}  HARD failures={hard}  (soft={soft})",
-        n_checks.load(std::sync::atomic::Ordering::Relaxed),
-    );
+    let soft = fails.len() - hard;
+    println!("\n========== BOOLEAN FUZZ SURVEY: {title} ==========");
+    println!("configs={n_cfg}  checks={n_checks}  HARD failures={hard}  (soft={soft})");
     println!("by kind: {by_kind:?}   [HARD: VOLUME WATERTIGHT MANIFOLD ERROR | soft: HANG EULER]");
     println!("====== HARD (real bugs — the work queue) ======");
     for (kind, _) in by_kind.iter().filter(|(k, _)| !is_soft(k)) {
@@ -363,4 +369,176 @@ fn boolean_box_sphere_fuzz_survey() {
         println!("--- {kind} ({n}) ---");
     }
     println!("======================================================\n");
+}
+
+// ===========================================================================
+// box ∘ CYLINDER survey — same machinery, second solid is a z-axis cylinder.
+// Maps whether the multi-face curved-Boolean breakage generalises beyond the
+// sphere (it should — the side wall + cap circles cross box faces the same way).
+// ===========================================================================
+
+fn cylinder(model: &mut BRepModel, base: [f64; 3], r: f64, h: f64) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_cylinder_3d(Point3::new(base[0], base[1], base[2]), Vector3::Z, r, h)
+        .expect("cylinder")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("cylinder: {o:?}"),
+    }
+}
+
+/// Inside a finite z-axis cylinder: radial ≤ r and axial ∈ [0, h] from `base`.
+fn in_cylinder(p: [f64; 3], base: [f64; 3], r: f64, h: f64) -> bool {
+    let axial = p[2] - base[2];
+    if axial < 0.0 || axial > h {
+        return false;
+    }
+    let (dx, dy) = (p[0] - base[0], p[1] - base[1]);
+    dx * dx + dy * dy <= r * r
+}
+
+fn cyl_grid_truth(base: [f64; 3], r: f64, h: f64) -> GridTruth {
+    let reach = [
+        base[0].abs() + r,
+        base[1].abs() + r,
+        base[2].abs().max((base[2] + h).abs()),
+    ]
+    .into_iter()
+    .fold(BOX_HALF, f64::max)
+        + 0.05;
+    const N: usize = 96;
+    let cell = 2.0 * reach / N as f64;
+    let cv = cell * cell * cell;
+    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
+    for i in 0..N {
+        let x = -reach + (i as f64 + 0.5) * cell;
+        let in_bx = x.abs() <= BOX_HALF;
+        for j in 0..N {
+            let y = -reach + (j as f64 + 0.5) * cell;
+            let in_by = in_bx && y.abs() <= BOX_HALF;
+            for k in 0..N {
+                let z = -reach + (k as f64 + 0.5) * cell;
+                let in_box = in_by && z.abs() <= BOX_HALF;
+                let in_cyl = in_cylinder([x, y, z], base, r, h);
+                if in_box && in_cyl {
+                    i_n += 1;
+                }
+                if in_box || in_cyl {
+                    u_n += 1;
+                }
+                if in_box && !in_cyl {
+                    d_n += 1;
+                }
+            }
+        }
+    }
+    GridTruth {
+        intersection: i_n as f64 * cv,
+        union: u_n as f64 * cv,
+        difference: d_n as f64 * cv,
+    }
+}
+
+/// (base, radius, height, label) — z-axis cylinder placements vs box [-1,1]³.
+fn cyl_configs() -> Vec<([f64; 3], f64, f64, &'static str)> {
+    vec![
+        ([0.0, 0.0, -1.5], 0.5, 3.0, "axial-through"),
+        ([0.0, 0.0, -1.5], 0.9, 3.0, "axial-through-fat"),
+        ([0.0, 0.0, 0.0], 0.5, 1.0, "axial-poke+z"),
+        ([0.0, 0.0, -0.5], 0.3, 1.0, "contained"),
+        ([0.5, 0.3, -0.5], 0.3, 1.0, "contained-offset"),
+        ([1.0, 0.0, -0.5], 0.5, 1.0, "radial-face+x"),
+        ([0.0, 1.0, -0.5], 0.5, 1.0, "radial-face+y"),
+        ([1.0, 1.0, -0.5], 0.5, 1.0, "radial-edge"),
+        ([1.0, 1.0, 0.6], 0.5, 1.0, "corner"),
+        ([0.0, 0.0, -1.5], 1.5, 3.0, "wider-than-box"),
+        ([0.5, 0.3, -1.5], 0.6, 3.0, "offset-through"),
+        ([1.4, 0.0, -0.5], 0.6, 1.0, "radial-poke-past"),
+    ]
+}
+
+#[test]
+#[ignore = "fuzz survey — run with --ignored --nocapture"]
+fn boolean_box_cylinder_fuzz_survey() {
+    let vol_tol = 0.03;
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let configs = cyl_configs();
+    let n_cfg = configs.len();
+    let n_checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let fails: Vec<Failure> = configs
+        .par_iter()
+        .flat_map(|&(base, r, h, label)| {
+            let truth = cyl_grid_truth(base, r, h);
+            let mut out: Vec<Failure> = Vec::new();
+            for &(op, sym, pick) in &ops {
+                let t = pick(&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lab = format!("{label} r={r} h={h}");
+                match run_op_timed(op, move |m| cylinder(m, base, r, h)) {
+                    Outcome::Hang => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "HANG",
+                        detail: format!("op did not return within budget (truth {t:.3})"),
+                    }),
+                    Outcome::Err => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "ERROR",
+                        detail: format!("op errored (truth {t:.3})"),
+                    }),
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "VOLUME",
+                                detail: format!(
+                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                    f.vol,
+                                    100.0 * (f.vol - t) / t
+                                ),
+                            });
+                        }
+                        if f.open_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "WATERTIGHT",
+                                detail: format!("open_edges={}", f.open_edges),
+                            });
+                        }
+                        if f.nonmanifold_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "MANIFOLD",
+                                detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                            });
+                        }
+                        // EULER deliberately not checked for cylinder yet (the
+                        // cylinder primitive's intrinsic residual is uncalibrated;
+                        // VOLUME+WATERTIGHT+MANIFOLD are the trusted classes).
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    print_catalog(
+        "box ∘ cylinder",
+        &fails,
+        n_cfg,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
 }
