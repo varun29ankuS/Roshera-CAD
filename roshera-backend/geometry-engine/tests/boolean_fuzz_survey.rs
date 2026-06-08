@@ -13,15 +13,17 @@
 //! Speed: parallel over configs (rayon); topology via `brep_integrity` (a B-Rep
 //! walk, no tessellation). The only per-config tessellation is the volume.
 //!
-//! KNOWN LIMITATION (HANG count is a SOFT signal, over-reports). A hung boolean
-//! cannot be killed from safe Rust, so `run_op_timed` leaks the thread; under
-//! rayon every real hang permanently burns a core, so later configs run
-//! CPU-starved and a legitimately-slow-but-finite op can blow the wall-clock
-//! budget and be mis-flagged HANG. Treat HANG as "did not finish in budget under
-//! load" — verify a flagged config in isolation before trusting it. The
-//! post-completion classes (VOLUME / WATERTIGHT / MANIFOLD / EULER / ERROR) carry
-//! no timing and ARE reliable. A subprocess-isolated runner (kill on timeout) is
-//! the fix for a trustworthy HANG count.
+//! HARD vs SOFT classes. HARD = real Boolean bugs: VOLUME, WATERTIGHT, MANIFOLD,
+//! ERROR — trust these; they are the work queue. SOFT = over-reporting classes,
+//! verify in isolation before acting:
+//!   * HANG — a hung boolean can't be killed from safe Rust, so `run_op_timed`
+//!     leaks the thread; under rayon every real hang burns a core, starving later
+//!     configs so a slow-but-finite op blows the budget and mis-flags HANG. Fix:
+//!     subprocess-isolated runner (kill on timeout).
+//!   * EULER — the UV-sphere primitive carries an INTRINSIC genus-0 Euler residual
+//!     of -1 (periodic seam + 2 poles; see `survey_euler_baseline`), so any
+//!     sphere-bearing result fails the residual==0 check with no real bug. Fix:
+//!     baseline against the operands' residual and flag only deltas.
 //!
 //! Invariants per (config, op):
 //!   * VOLUME    — |kernel − grid_oracle| / max(truth,ε) ≤ tol
@@ -200,6 +202,36 @@ struct Failure {
     detail: String,
 }
 
+/// #91 calibration: does a BARE (un-cut) sphere / box already carry a nonzero
+/// genus-0 Euler-Poincaré residual? If so the survey's EULER class is a false
+/// positive on the primitive's own representation, not a Boolean bug, and must
+/// be baselined (flag only DELTAS from the operands).
+#[test]
+#[ignore = "calibration — run with --ignored --nocapture"]
+fn survey_euler_baseline() {
+    let mut m = BRepModel::new();
+    let bx = the_box(&mut m);
+    let sp = sphere(&mut m, [0.0, 0.0, 0.0], 0.5);
+    let rb = brep_integrity(&m, bx, 1e-6);
+    let rs = brep_integrity(&m, sp, 1e-6);
+    println!("\n=== #91 EULER baseline (bare primitives) ===");
+    println!(
+        "box:    euler_residual={}  open_edges={}  nonmanifold={}  clean={}",
+        rb.euler_poincare_genus0_residual(),
+        rb.edges_used_once.len(),
+        rb.edges_used_3plus.len(),
+        rb.is_clean()
+    );
+    println!(
+        "sphere: euler_residual={}  open_edges={}  nonmanifold={}  clean={}",
+        rs.euler_poincare_genus0_residual(),
+        rs.edges_used_once.len(),
+        rs.edges_used_3plus.len(),
+        rs.is_clean()
+    );
+    println!("=== end ===\n");
+}
+
 #[test]
 #[ignore = "fuzz survey — run with --ignored --nocapture"]
 fn boolean_box_sphere_fuzz_survey() {
@@ -290,20 +322,31 @@ fn boolean_box_sphere_fuzz_survey() {
         })
         .collect();
 
+    // HARD = trustworthy classes that flag a real Boolean bug. SOFT = classes
+    // that over-report and must be verified in isolation before acting:
+    //   HANG  — leaked-thread core-burn under rayon → false timeouts.
+    //   EULER — the UV-sphere primitive carries an intrinsic genus-0 residual of
+    //           -1 (periodic seam + 2 poles), so ANY sphere-bearing result fails
+    //           the residual==0 check without a real bug (confirmed by
+    //           survey_euler_baseline: bare sphere = -1, bare box = 0).
+    let is_soft = |k: &str| k == "HANG" || k == "EULER";
+
     use std::collections::BTreeMap;
     let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
     for f in &fails {
         *by_kind.entry(f.kind).or_default() += 1;
     }
+    let hard: usize = fails.iter().filter(|f| !is_soft(f.kind)).count();
+    let soft: usize = fails.len() - hard;
+
     println!("\n========== BOOLEAN FUZZ SURVEY: box ∘ sphere ==========");
     println!(
-        "configs={n_cfg}  checks={}  failures={}",
+        "configs={n_cfg}  checks={}  HARD failures={hard}  (soft={soft})",
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
-        fails.len()
     );
-    println!("by kind: {by_kind:?}");
-    println!("------------------------------------------------------");
-    for (kind, _) in &by_kind {
+    println!("by kind: {by_kind:?}   [HARD: VOLUME WATERTIGHT MANIFOLD ERROR | soft: HANG EULER]");
+    println!("====== HARD (real bugs — the work queue) ======");
+    for (kind, _) in by_kind.iter().filter(|(k, _)| !is_soft(k)) {
         println!("--- {kind} ---");
         let mut lines: Vec<String> = fails
             .iter()
@@ -314,6 +357,10 @@ fn boolean_box_sphere_fuzz_survey() {
         for l in lines {
             println!("{l}");
         }
+    }
+    println!("------ soft (verify in isolation; over-report) ------");
+    for (kind, n) in by_kind.iter().filter(|(k, _)| is_soft(k)) {
+        println!("--- {kind} ({n}) ---");
     }
     println!("======================================================\n");
 }
