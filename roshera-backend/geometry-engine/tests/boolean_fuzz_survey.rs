@@ -1111,3 +1111,130 @@ fn boolean_sphere_sphere_fuzz_survey() {
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
+
+// ===========================================================================
+// SUBPROCESS-ISOLATED HANG count (#91). `run_op_timed` budgets a config on a
+// detached thread and LEAKS it on timeout. Under the rayon survey, a few leaked
+// threads burn cores and starve healthy configs, which then also miss their
+// budget — so the in-process HANG class massively OVER-reports (box∘sphere
+// showed 332, which cannot be 332 genuine infinite loops). The only trustworthy
+// way to know whether a single config truly never returns is to run it in its
+// OWN process and wall-clock it there: an OS-scheduled sibling process can't be
+// starved by a hung one the way a thread in a shared pool can.
+//
+// `fuzz_single_shot` runs exactly ONE box∘sphere (cfg,op) selected by env, with
+// NO internal timeout — it returns fast or hangs the process. `hang_isolation_
+// survey` spawns it per (cfg,op), wall-clocks each child, and kills + records
+// the ones that exceed budget. Both are #[ignore] (manual surveys); neither is
+// part of the green gate, so a slow/again-flaky child can never break CI.
+// ===========================================================================
+
+/// One box∘sphere config in its own process. Env: FUZZ_CFG (flat index into
+/// placements×radii), FUZZ_OP (0=∩,1=∪,2=∖). No timeout — hangs if the op hangs.
+#[test]
+#[ignore = "internal single-shot spawned by hang_isolation_survey"]
+fn fuzz_single_shot() {
+    let cfg = match std::env::var("FUZZ_CFG")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(c) => c,
+        // Run en-masse with `-- --ignored` and no env: no-op so the suite stays
+        // green; this test only does work when the driver sets FUZZ_CFG.
+        None => {
+            println!("fuzz_single_shot: FUZZ_CFG unset — skipping");
+            return;
+        }
+    };
+    let opi = std::env::var("FUZZ_OP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let mut configs: Vec<([f64; 3], &'static str, f64)> = Vec::new();
+    for (c, label) in placements() {
+        for &r in radii() {
+            configs.push((c, label, r));
+        }
+    }
+    let (center, _label, r) = configs[cfg];
+    let op = [
+        BooleanOp::Intersection,
+        BooleanOp::Union,
+        BooleanOp::Difference,
+    ][opi];
+
+    // Direct call — no timeout thread. The parent owns the wall-clock budget.
+    let facts = run_op(op, move |m| sphere(m, center, r));
+    println!("SINGLE_SHOT_DONE cfg={cfg} op={opi} ok={}", facts.is_some());
+}
+
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated true HANG count (slow; spawns processes)"]
+fn hang_isolation_survey() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let n_cfg = placements().len() * radii().len();
+    let budget = Duration::from_secs(6);
+    let mut hangs: Vec<(usize, usize)> = Vec::new();
+    let mut proc_errs = 0usize;
+    let total = n_cfg * 3;
+
+    for cfg in 0..n_cfg {
+        for opi in 0..3usize {
+            let mut child = Command::new(&exe)
+                .args(["fuzz_single_shot", "--exact", "--ignored"])
+                .env("FUZZ_CFG", cfg.to_string())
+                .env("FUZZ_OP", opi.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn single-shot");
+            let start = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if !status.success() {
+                            proc_errs += 1;
+                        }
+                        break;
+                    }
+                    Ok(None) => {
+                        if start.elapsed() > budget {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            hangs.push((cfg, opi));
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => {
+                        proc_errs += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let sym = ["∩", "∪", "∖"];
+    println!("\n=== #91 subprocess-isolated HANG count (box∘sphere) ===");
+    println!(
+        "total={total}  TRUE_HANGS={}  process-errs={}  (in-process survey reported HANG≈332 — false positives from leaked-thread starvation)",
+        hangs.len(),
+        proc_errs
+    );
+    let mut configs: Vec<([f64; 3], &'static str, f64)> = Vec::new();
+    for (c, label) in placements() {
+        for &r in radii() {
+            configs.push((c, label, r));
+        }
+    }
+    for (cfg, opi) in &hangs {
+        let (_, label, r) = configs[*cfg];
+        println!("  HANG [{}] {label} r={r}", sym[*opi]);
+    }
+    println!("=== end ===\n");
+}
