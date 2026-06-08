@@ -163,6 +163,94 @@ fn diag_box_sphere_poke_radius_sweep() {
     println!("=== end sweep ===\n");
 }
 
+/// #88: dump the box∩sphere(r=1.05) result face structure. Expected for r>1:
+/// the +x cap is a squircle (great circle clipped by the 4 box edges), the
+/// sphere pokes through the 4 SIDE faces (±y,±z) in a small circle each → 4 disk
+/// caps, plus the clipped spherical surface.
+///
+/// FINDING (2026-06-08): all 6 expected faces ARE produced — 4 side-face disk
+/// caps (faces on ±y,±z), the +x squircle cap (10 edges), and the spherical
+/// surface (11 edges). So #88 is NOT dropped caps. It is a CROSS-FACE WELD
+/// failure: the sphere surface and the 5 planar caps do not share their seam
+/// edges, so the result is non-watertight (boundary_e≈149, euler=-2 vs the
+/// expected 2) and the divergence-theorem volume reads ~7% low. This is the
+/// multi-face generalisation of the original #82 seam-weld problem (the cut
+/// circle now crosses the box edges onto 5 adjacent faces at once). The fix
+/// lives in the cross-face heal/canonicalise stage, hardened for the multi-cap
+/// curved seam — a substantial, regression-sensitive effort.
+#[test]
+#[ignore = "diagnostic, not a gate"]
+fn diag_dump_r105() {
+    let mut model = BRepModel::new();
+    let result = build_r(&mut model, 1.05);
+    let truth = box_sphere_grid_truth([1.0, 0.0, 0.0], 1.05);
+    let vol = model.calculate_solid_volume(result).unwrap_or(f64::NAN);
+    println!("\n=== #88 box∩sphere r=1.05 ===");
+    println!(
+        "vol={vol:.4} grid_truth={truth:.4} err={:+.1}%",
+        100.0 * (vol - truth) / truth
+    );
+    if let Some(m) = manifold_report(&model, result, 0.04, 1e-6) {
+        println!(
+            "mesh: boundary_e={} nonmanifold_e={} closed={} euler={}",
+            m.boundary_edges, m.nonmanifold_edges, m.closed, m.euler_characteristic
+        );
+    }
+    if let Some(solid) = model.solids.get(result) {
+        let mut shells = vec![solid.outer_shell];
+        shells.extend(solid.inner_shells.iter().copied());
+        let mut by_type: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for sid in shells {
+            if let Some(shell) = model.shells.get(sid) {
+                for &fid in &shell.faces {
+                    if let Some(face) = model.faces.get(fid) {
+                        let stype = model
+                            .surfaces
+                            .get(face.surface_id)
+                            .map(|s| format!("{:?}", s.surface_type()))
+                            .unwrap_or_else(|| "?".into());
+                        let outer = model
+                            .loops
+                            .get(face.outer_loop)
+                            .map(|l| l.edges.len())
+                            .unwrap_or(0);
+                        // Centroid-ish: average of edge start vertices.
+                        let c = face_center(&model, fid);
+                        println!("  face {fid:?} [{stype}] outer_edges={outer} center=({:+.2},{:+.2},{:+.2})", c[0], c[1], c[2]);
+                        *by_type.entry(stype).or_default() += 1;
+                    }
+                }
+            }
+        }
+        println!("face counts by type: {by_type:?}");
+    }
+    println!("=== end ===\n");
+}
+
+fn face_center(model: &BRepModel, fid: geometry_engine::primitives::face::FaceId) -> [f64; 3] {
+    let (mut sx, mut sy, mut sz, mut n) = (0.0, 0.0, 0.0, 0.0);
+    if let Some(face) = model.faces.get(fid) {
+        if let Some(lp) = model.loops.get(face.outer_loop) {
+            for &eid in &lp.edges {
+                if let Some(e) = model.edges.get(eid) {
+                    if let Some(p) = model.vertices.get_position(e.start_vertex) {
+                        sx += p[0];
+                        sy += p[1];
+                        sz += p[2];
+                        n += 1.0;
+                    }
+                }
+            }
+        }
+    }
+    if n == 0.0 {
+        [f64::NAN; 3]
+    } else {
+        [sx / n, sy / n, sz / n]
+    }
+}
+
 #[test]
 #[ignore = "trace, run with ROSHERA_BOOL_TRACE=1"]
 fn diag_trace_minus_z() {
