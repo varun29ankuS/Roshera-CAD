@@ -1775,3 +1775,120 @@ fn box_cyl_conquered_band_gate() {
         }
     }
 }
+
+// ===========================================================================
+// CLEAN-CELL reporter for box∘cone (#91 ratchet). Cone is the most broken
+// curved survey (24/30 HARD), so the clean set is small — but whatever passes
+// is conquered ground worth locking against further regression.
+// ===========================================================================
+
+#[test]
+#[ignore = "fuzz survey — prints box∘cone cells that pass all 3 ops cleanly"]
+fn survey_box_cone_clean_cells() {
+    let vol_tol = 0.03;
+    let ops = [
+        BooleanOp::Intersection,
+        BooleanOp::Union,
+        BooleanOp::Difference,
+    ];
+    let picks: [fn(&GridTruth) -> f64; 3] = [|g| g.intersection, |g| g.union, |g| g.difference];
+
+    let clean: Vec<String> = cone_configs()
+        .par_iter()
+        .filter_map(|&(bc, rb, rt, h, label)| {
+            let truth = cone_grid_truth(bc, rb, rt, h);
+            let mut all_clean = true;
+            let mut any_checked = false;
+            for (oi, &op) in ops.iter().enumerate() {
+                let t = picks[oi](&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                any_checked = true;
+                match run_op_timed(op, move |m| cone(m, bc, rb, rt, h)) {
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol || f.open_edges != 0 || f.nonmanifold_edges != 0 {
+                            all_clean = false;
+                        }
+                    }
+                    _ => all_clean = false,
+                }
+            }
+            if any_checked && all_clean {
+                Some(format!("{label} rb={rb} rt={rt} h={h}"))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut clean = clean;
+    clean.sort();
+    println!("\n=== #91 box∘cone CLEAN cells (pass ∩/∪/∖: vol≤3%, watertight, manifold) ===");
+    println!("clean_cells={}", clean.len());
+    for c in &clean {
+        println!("  OK {c}");
+    }
+    println!("=== end ===\n");
+}
+
+// ===========================================================================
+// RATCHET GATE (#91) — NON-ignored. Cone is the most broken curved survey
+// (24/30); only 3 cells survive all three booleans cleanly. Lock them so the
+// conquered apex/contained cases can't regress. 96³ grid truth, 5% + topology.
+// ===========================================================================
+
+#[test]
+fn box_cone_conquered_band_gate() {
+    // (base_centre, base_r, top_r, h) — the cells survey_box_cone_clean_cells found clean.
+    let cells: [([f64; 3], f64, f64, f64); 3] = [
+        ([0.0, 0.0, -1.5], 0.9, 0.0, 3.0), // apex-through
+        ([0.0, 0.0, -0.5], 0.4, 0.0, 1.0), // contained-apex
+        ([0.5, 0.3, -0.5], 0.4, 0.2, 1.0), // contained-frustum-off
+    ];
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let tol = 0.05;
+    for (bc, rb, rt, h) in cells {
+        let truth = cone_grid_truth(bc, rb, rt, h);
+        for &(op, sym, pick) in &ops {
+            let t = pick(&truth);
+            if t < 1e-3 {
+                continue;
+            }
+            let f = match run_op_timed(op, move |m| cone(m, bc, rb, rt, h)) {
+                Outcome::Ok(f) => f,
+                Outcome::Err => {
+                    panic!("box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: kernel error")
+                }
+                Outcome::Hang => {
+                    panic!(
+                        "box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: did not return in budget"
+                    )
+                }
+            };
+            let rel = (f.vol - t).abs() / t.max(1e-3);
+            assert!(
+                rel <= tol,
+                "REGRESSION: box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+                f.vol,
+                100.0 * (f.vol - t) / t,
+                100.0 * tol
+            );
+            assert_eq!(
+                f.open_edges, 0,
+                "REGRESSION: box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: {} open edges",
+                f.open_edges
+            );
+            assert_eq!(
+                f.nonmanifold_edges, 0,
+                "REGRESSION: box∘cone {sym} bc={bc:?} rb={rb} rt={rt} h={h}: {} non-manifold edges",
+                f.nonmanifold_edges
+            );
+        }
+    }
+}
