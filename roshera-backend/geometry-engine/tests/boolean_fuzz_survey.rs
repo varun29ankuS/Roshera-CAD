@@ -2079,3 +2079,206 @@ fn boolean_pipeline_determinism_gate() {
         }
     }
 }
+
+// ===========================================================================
+// box ∘ TILTED-CYLINDER survey — every curved second-operand above uses the Z
+// axis. An arbitrary-axis cylinder drives the curved cut against the box faces
+// at an oblique angle to the surface's own parameterisation, exercising the
+// axis-handling path (frame construction, seam placement) the Z-aligned surveys
+// never reach. Predicate projects onto the axis instead of reading p.z.
+// ===========================================================================
+
+fn norm3(v: [f64; 3]) -> [f64; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    [v[0] / n, v[1] / n, v[2] / n]
+}
+
+fn tilted_cylinder(
+    model: &mut BRepModel,
+    base: [f64; 3],
+    axis: [f64; 3],
+    r: f64,
+    h: f64,
+) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_cylinder_3d(
+            Point3::new(base[0], base[1], base[2]),
+            Vector3::new(axis[0], axis[1], axis[2]),
+            r,
+            h,
+        )
+        .expect("tilted cylinder")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("tilted cylinder: {o:?}"),
+    }
+}
+
+/// Inside a finite cylinder of arbitrary axis: project (p−base) onto the unit
+/// axis for the axial coord t∈[0,h]; the perpendicular residual must be ≤ r.
+fn in_tilted_cyl(p: [f64; 3], base: [f64; 3], axis_unit: [f64; 3], r: f64, h: f64) -> bool {
+    let d = [p[0] - base[0], p[1] - base[1], p[2] - base[2]];
+    let t = d[0] * axis_unit[0] + d[1] * axis_unit[1] + d[2] * axis_unit[2];
+    if t < 0.0 || t > h {
+        return false;
+    }
+    let perp = [
+        d[0] - t * axis_unit[0],
+        d[1] - t * axis_unit[1],
+        d[2] - t * axis_unit[2],
+    ];
+    perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2] <= r * r
+}
+
+fn tcyl_grid_truth(base: [f64; 3], axis: [f64; 3], r: f64, h: f64) -> GridTruth {
+    let u = norm3(axis);
+    let end = [base[0] + u[0] * h, base[1] + u[1] * h, base[2] + u[2] * h];
+    let reach = (0..3)
+        .map(|i| base[i].abs().max(end[i].abs()) + r)
+        .fold(BOX_HALF, f64::max)
+        + 0.05;
+    const N: usize = 96;
+    let cell = 2.0 * reach / N as f64;
+    let cv = cell * cell * cell;
+    let (mut i_n, mut un, mut d_n) = (0u64, 0u64, 0u64);
+    for i in 0..N {
+        let x = -reach + (i as f64 + 0.5) * cell;
+        let in_bx = x.abs() <= BOX_HALF;
+        for j in 0..N {
+            let y = -reach + (j as f64 + 0.5) * cell;
+            let in_by = in_bx && y.abs() <= BOX_HALF;
+            for k in 0..N {
+                let z = -reach + (k as f64 + 0.5) * cell;
+                let in_box = in_by && z.abs() <= BOX_HALF;
+                let in_c = in_tilted_cyl([x, y, z], base, u, r, h);
+                if in_box && in_c {
+                    i_n += 1;
+                }
+                if in_box || in_c {
+                    un += 1;
+                }
+                if in_box && !in_c {
+                    d_n += 1;
+                }
+            }
+        }
+    }
+    GridTruth {
+        intersection: i_n as f64 * cv,
+        union: un as f64 * cv,
+        difference: d_n as f64 * cv,
+    }
+}
+
+/// (base, axis, r, h, label) — arbitrary-axis cylinders vs box [-1,1]³.
+fn tcyl_configs() -> Vec<([f64; 3], [f64; 3], f64, f64, &'static str)> {
+    vec![
+        (
+            [-0.7, -0.7, -0.7],
+            [1.0, 1.0, 1.0],
+            0.3,
+            2.4,
+            "diag-through",
+        ),
+        (
+            [-1.0, -0.6, 0.0],
+            [1.0, 1.0, 0.0],
+            0.3,
+            2.0,
+            "tilt-xy-horizontal",
+        ),
+        (
+            [-0.3, 0.0, -0.3],
+            [1.0, 0.0, 1.0],
+            0.2,
+            0.85,
+            "tilt-contained",
+        ),
+        ([0.0, 0.0, -1.0], [0.3, 0.0, 1.0], 0.3, 2.0, "tilt-poke+z"),
+        ([0.0, -1.0, -0.5], [0.0, 1.0, 1.0], 0.3, 2.0, "tilt-edge-yz"),
+        ([-0.5, -0.5, -1.2], [0.5, 0.5, 1.0], 0.25, 2.0, "tilt-skew"),
+    ]
+}
+
+#[test]
+#[ignore = "fuzz survey — run with --ignored --nocapture"]
+fn boolean_box_tilted_cylinder_fuzz_survey() {
+    let vol_tol = 0.03;
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let configs = tcyl_configs();
+    let n_cfg = configs.len();
+    let n_checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let fails: Vec<Failure> = configs
+        .par_iter()
+        .flat_map(|&(base, axis, r, h, label)| {
+            let truth = tcyl_grid_truth(base, axis, r, h);
+            let mut out: Vec<Failure> = Vec::new();
+            for &(op, sym, pick) in &ops {
+                let t = pick(&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lab = format!("{label} r={r} h={h}");
+                match run_op_timed(op, move |m| tilted_cylinder(m, base, axis, r, h)) {
+                    Outcome::Hang => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "HANG",
+                        detail: format!("op did not return within budget (truth {t:.3})"),
+                    }),
+                    Outcome::Err => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "ERROR",
+                        detail: format!("op errored (truth {t:.3})"),
+                    }),
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "VOLUME",
+                                detail: format!(
+                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                    f.vol,
+                                    100.0 * (f.vol - t) / t
+                                ),
+                            });
+                        }
+                        if f.open_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "WATERTIGHT",
+                                detail: format!("open_edges={}", f.open_edges),
+                            });
+                        }
+                        if f.nonmanifold_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "MANIFOLD",
+                                detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    print_catalog(
+        "box ∘ tilted-cylinder",
+        &fails,
+        n_cfg,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
