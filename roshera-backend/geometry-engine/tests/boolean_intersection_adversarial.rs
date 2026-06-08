@@ -404,18 +404,21 @@ fn cylinder_box_boolean_81() {
     );
 }
 
-/// KNOWN BUG (#82): box ∩ sphere with the sphere straddling a box face is both
-/// non-deterministic and wrong. Sphere r=1 centred at (1,0,0) is exactly half
-/// inside the box, so V(box ∩ sphere) = ½·(4/3·π) ≈ 2.094; the kernel sometimes
-/// returns the *whole* sphere (~4.189) instead, failing to clip B by A.
+/// #82 — FIXED. box ∩ sphere with the sphere straddling a box face, the single
+/// hardest curved-Boolean degeneracy in this suite. Sphere r=1 centred at (1,0,0)
+/// is exactly half inside the box, so V(box ∩ sphere) = ½·(4/3·π) ≈ 2.094. This
+/// is doubly degenerate: the cut is a GREAT circle (sphere centre on the cut
+/// plane) AND its radius equals the box half-width, so the circle is tangent to
+/// all four box edges at their midpoints.
 ///
-/// This is asserted as a DETERMINISM test, not a flaky single-shot: it runs the
-/// same boolean 8 times in one process (`std::HashMap` reseeds per map per
-/// process, so each run shuffles internal iteration order) and requires every
-/// run to agree — AND to match the independent grid oracle. A non-deterministic
-/// boolean therefore fails *reliably* here, not 2-out-of-10. Four determinism
-/// sources are already fixed (graph→BTreeMap etc., commit 5ee5845); a residual
-/// source remains in the degenerate great-circle-on-cut-plane classification.
+/// Asserted as a DETERMINISM test (not a flaky single-shot): the same Boolean
+/// runs 8× in one process — `std::HashMap` reseeds per map per process, so each
+/// run shuffles internal iteration order — and every run must agree AND match the
+/// independent grid oracle. The fixes that closed it: determinism hardening
+/// (graph→BTreeMap + curvature tie-break + sphere two-cap split), the densified
+/// interior-point containment for the annular cap, and tangential-contact
+/// rejection in the planar arrangement (a tangency does not subdivide a face, so
+/// the four touch points must not be split into degenerate vertices).
 #[test]
 fn sphere_poke_intersection_82() {
     let in_b = |p: [f64; 3]| ((p[0] - 1.0).powi(2) + p[1] * p[1] + p[2] * p[2]).sqrt() <= 1.0;
