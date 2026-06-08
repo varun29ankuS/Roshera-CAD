@@ -280,6 +280,72 @@ fn face_center(model: &BRepModel, fid: geometry_engine::primitives::face::FaceId
     }
 }
 
+/// #89: box ∪ sphere at a corner. Survey says kernel=7.80 < box(8.0) — union is
+/// REMOVING the box's corner cut-bits but NOT ADDING the sphere's external bulge.
+/// Dump the result faces + (with ROSHERA_BOOL_TRACE=1) the classify/select
+/// stages to confirm the sphere's outside-box fragments are dropped.
+#[test]
+#[ignore = "diagnostic, run with ROSHERA_BOOL_TRACE=1 --nocapture"]
+fn diag_union_corner() {
+    let mut model = BRepModel::new();
+    let bx = match TopologyBuilder::new(&mut model)
+        .create_box_3d(2.0, 2.0, 2.0)
+        .expect("box")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("{o:?}"),
+    };
+    let sp = match TopologyBuilder::new(&mut model)
+        .create_sphere_3d(Point3::new(1.0, 1.0, 1.0), 0.5)
+        .expect("sphere")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("{o:?}"),
+    };
+    let res = boolean_operation(
+        &mut model,
+        bx,
+        sp,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    );
+    println!("\n=== #89 box ∪ sphere(1,1,1; r=0.5) ===");
+    match res {
+        Ok(result) => {
+            let vol = model.calculate_solid_volume(result).unwrap_or(f64::NAN);
+            println!("vol={vol:.4}  (box=8.0, truth≈8.48 = box + protruding octant ≈0.48)");
+            if let Some(solid) = model.solids.get(result) {
+                let mut shells = vec![solid.outer_shell];
+                shells.extend(solid.inner_shells.iter().copied());
+                let mut by_type: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                for sid in shells {
+                    if let Some(shell) = model.shells.get(sid) {
+                        for &fid in &shell.faces {
+                            if let Some(face) = model.faces.get(fid) {
+                                let st = model
+                                    .surfaces
+                                    .get(face.surface_id)
+                                    .map(|s| format!("{:?}", s.surface_type()))
+                                    .unwrap_or_else(|| "?".into());
+                                let c = face_center(&model, fid);
+                                println!(
+                                    "  face {fid:?} [{st}] center=({:+.2},{:+.2},{:+.2})",
+                                    c[0], c[1], c[2]
+                                );
+                                *by_type.entry(st).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                println!("face counts by type: {by_type:?}  (expect 6 Plane + 1 Sphere for a corner bulge)");
+            }
+        }
+        Err(e) => println!("ERROR {e:?}"),
+    }
+    println!("=== end ===\n");
+}
+
 #[test]
 #[ignore = "trace, run with ROSHERA_BOOL_TRACE=1"]
 fn diag_trace_minus_z() {
