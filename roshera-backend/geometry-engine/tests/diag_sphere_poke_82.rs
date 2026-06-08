@@ -169,15 +169,27 @@ fn diag_box_sphere_poke_radius_sweep() {
 /// caps, plus the clipped spherical surface.
 ///
 /// FINDING (2026-06-08): all 6 expected faces ARE produced — 4 side-face disk
-/// caps (faces on ±y,±z), the +x squircle cap (10 edges), and the spherical
-/// surface (11 edges). So #88 is NOT dropped caps. It is a CROSS-FACE WELD
-/// failure: the sphere surface and the 5 planar caps do not share their seam
-/// edges, so the result is non-watertight (boundary_e≈149, euler=-2 vs the
-/// expected 2) and the divergence-theorem volume reads ~7% low. This is the
-/// multi-face generalisation of the original #82 seam-weld problem (the cut
-/// circle now crosses the box edges onto 5 adjacent faces at once). The fix
-/// lives in the cross-face heal/canonicalise stage, hardened for the multi-cap
-/// curved seam — a substantial, regression-sensitive effort.
+/// caps (±y,±z), the +x squircle cap (10 edges), and the spherical surface
+/// (11 edges). The great-circle arcs on +x DO weld (sphere shares 6 arcs with
+/// the squircle). Non-watertight (boundary_e≈149, euler=-2; 9 B-Rep edges used
+/// once) from TWO distinct sub-bugs, both in the SPHERE multi-circle split:
+///
+///   A. POLAR CAP NOT CLIPPED. The sphere's +y pole (1, 1.05, 0) is OUTSIDE the
+///      box, yet sphere edges run out to it (…→(1,1.05,0)→…), so the sphere face
+///      keeps the bulge poking past the y=1 face instead of being clipped to it.
+///      The other 3 sides (z=±1, y=-1) ARE clipped (seam arcs sit on the box
+///      faces). `split_sphere_face_by_circles` mishandles the cut circle that
+///      encloses a parametric pole — the polar cap escapes the side-face clip.
+///   B. COINCIDENT-BUT-DISTINCT SEAM ARCS. Where the sphere IS clipped, its seam
+///      arc and the matching side-cap arc are SEPARATE edges on the same circle
+///      (sphere e69↔cap e12 on -z, e66↔e16 on +z, e76↔e20 on -y) — never welded,
+///      so each is used once. The cross-face weld (canonicalise/heal) doesn't
+///      unify a planar-cap arc with the coincident sphere-surface arc.
+///
+/// Fix order: A first (correct the sphere's clipped boundary so all 4 side seams
+/// are real), then B (weld the sphere↔cap coincident arcs). Substantial,
+/// regression-sensitive (touches `split_sphere_face_by_circles` + the weld stage,
+/// both used by every sphere Boolean) — budget the full boolean-suite verify.
 #[test]
 #[ignore = "diagnostic, not a gate"]
 fn diag_dump_r105() {
@@ -218,6 +230,21 @@ fn diag_dump_r105() {
                         // Centroid-ish: average of edge start vertices.
                         let c = face_center(&model, fid);
                         println!("  face {fid:?} [{stype}] outer_edges={outer} center=({:+.2},{:+.2},{:+.2})", c[0], c[1], c[2]);
+                        if let Some(lp) = model.loops.get(face.outer_loop) {
+                            for &eid in &lp.edges {
+                                if let Some(e) = model.edges.get(eid) {
+                                    let s = model.vertices.get_position(e.start_vertex);
+                                    let en = model.vertices.get_position(e.end_vertex);
+                                    let f = |o: Option<[f64; 3]>| {
+                                        o.map(|p| {
+                                            format!("({:+.3},{:+.3},{:+.3})", p[0], p[1], p[2])
+                                        })
+                                        .unwrap_or_else(|| "?".into())
+                                    };
+                                    println!("      e{eid:?} {} → {}", f(s), f(en));
+                                }
+                            }
+                        }
                         *by_type.entry(stype).or_default() += 1;
                     }
                 }
@@ -225,6 +252,8 @@ fn diag_dump_r105() {
         }
         println!("face counts by type: {by_type:?}");
     }
+    println!("--- brep integrity ---");
+    println!("{}", brep_integrity(&model, result, 1e-6).render(&model));
     println!("=== end ===\n");
 }
 
