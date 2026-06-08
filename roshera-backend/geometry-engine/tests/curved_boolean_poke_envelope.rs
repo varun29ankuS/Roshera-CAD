@@ -7,13 +7,15 @@
 //! few face/axis placements — the regression lock for the curved classify +
 //! side-wall stitch that the #82 diagnosis proved already works here.
 //!
-//! Coverage includes the NEAR-TANGENT band (cut circle up to 0.995 of the box
-//! half-width, i.e. a 0.005 gap to the host edges) — fixed by the densified
-//! interior-point containment in `compute_split_face_interior_points`. Only the
-//! measure-zero EXACT tangency (r = box half-width, circle tangent to all 4
-//! edges) and the beyond-tangent regime (circle exceeds the face) remain open —
-//! the #86 (exact-tangent predicates) frontier, characterised (not gated) by the
-//! ignored `diag_sphere_poke_82` diagnostic.
+//! Coverage runs up to and INCLUDING the EXACT edge-tangency (r = box
+//! half-width: the cut circle tangent to all four host edges) — fixed by the
+//! densified interior-point containment in `compute_split_face_interior_points`
+//! plus the tangential-contact rejection in `compute_edge_intersections` (a
+//! tangency does not separate cells, so it must not split the arrangement). Only
+//! the BEYOND-tangent regime (circle radius > box half-width, so it genuinely
+//! crosses the host edges and the sphere is clipped by the adjacent box faces)
+//! remains open — a multi-face transversal clip, not a tangency degeneracy,
+//! tracked by the ignored `diag_sphere_poke_82` diagnostic.
 
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::Matrix4;
@@ -92,9 +94,12 @@ fn assert_poke_exact(center: [f64; 3], r: f64, label: &str) {
 #[test]
 fn sphere_poke_plus_x_face_radius_sweep_is_exact_and_watertight() {
     // Centre on the +x face (x=1); cut circle of radius r. The sweep runs from a
-    // clear gap up through the NEAR-TANGENT band (r=0.995 ⇒ a 0.005 gap to the
-    // box edge) — every one must be volume-exact and watertight.
-    for &r in &[0.3_f64, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99, 0.995] {
+    // clear gap, through the near-tangent band, up to and INCLUDING the exact
+    // edge-tangency r=1.0 (circle tangent to all four box edges) — every one must
+    // be volume-exact and watertight.
+    for &r in &[
+        0.3_f64, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99, 0.995, 1.0,
+    ] {
         assert_poke_exact([1.0, 0.0, 0.0], r, &format!("+x poke r={r}"));
     }
 }

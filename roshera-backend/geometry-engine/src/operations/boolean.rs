@@ -7788,6 +7788,31 @@ pub(super) fn compute_edge_intersections(
             // loop below produces one T-junction per crossing per edge.
             let hits = find_curve_curve_intersections(curve_a, curve_b, tolerance)?;
             for (t_a, t_b, dist) in hits {
+                // Skip TANGENTIAL contacts. Where two curves touch but do not
+                // cross, their tangents are parallel; such a point does not
+                // separate the face into distinct cells, so splitting there only
+                // manufactures a degenerate arrangement vertex (two edges sharing
+                // one tangent line) that fractures the cell walk. The canonical
+                // case is a cut circle whose radius exactly equals a host edge's
+                // half-extent — tangent to all four box edges (#86): splitting at
+                // the four touch points shatters the clean interior-loop
+                // arrangement that a radius a hair smaller handles correctly,
+                // leaving a non-watertight cap. Only TRANSVERSAL crossings, whose
+                // unit tangents are non-parallel, genuinely subdivide a face.
+                if let (Ok(ta), Ok(tb)) = (curve_a.tangent_at(t_a), curve_b.tangent_at(t_b)) {
+                    let (na, nb) = (ta.magnitude(), tb.magnitude());
+                    if na > 1e-12 && nb > 1e-12 {
+                        // |sin θ| between the unit tangents. Below ~0.57° the
+                        // contact is a tangency, not a crossing. The threshold is
+                        // tight enough that even a shallow genuine crossing (a
+                        // circle just past tangent, radius ≳ 1.0001× the edge
+                        // half-extent) clears it and still splits.
+                        let sin_theta = ta.cross(&tb).magnitude() / (na * nb);
+                        if sin_theta < 1e-2 {
+                            continue;
+                        }
+                    }
+                }
                 let point = curve_a.point_at(t_a)?;
                 new_intersections.push((eid_a, eid_b, point, t_a, t_b, dist));
             }

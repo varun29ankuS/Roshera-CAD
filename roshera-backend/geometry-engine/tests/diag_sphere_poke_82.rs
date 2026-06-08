@@ -28,17 +28,22 @@
 //!     `curved_boolean_poke_envelope.rs`.
 //!
 //!   * EXACT-TANGENT, r = 1 (great circle radius = box half-width ⇒ tangent to
-//!     all 4 box edges at their midpoints) → wrong volume 3.070, open seam. At
-//!     each tangent point the circle's tangent line equals the edge's tangent
-//!     line (a degenerate arrangement vertex with collinear incident edges), so
-//!     the cell walk keeps a CORNER SLIVER (bounded by 2 box edges + 2 arcs,
-//!     incl. a box corner OUTSIDE the sphere) in place of the disk cap. The kept
-//!     planar fragment then carries 4 arcs vs the hemisphere's 5 → 5 unweldable
-//!     seam edges → non-watertight.
+//!     all 4 box edges at their midpoints) → **FIXED**. Was: wrong volume 3.070,
+//!     open seam. `find_curve_curve_intersections` reported each tangent TOUCH
+//!     point (distance 0) as an intersection, so the circle was split at the 4
+//!     touch points and each box edge at its midpoint, fracturing the clean
+//!     interior-loop arrangement into degenerate vertices (circle tangent line =
+//!     edge tangent line). Fix: reject TANGENTIAL contacts in
+//!     `compute_edge_intersections` — a tangency does not separate a face into
+//!     cells, so only transversal crossings split. The circle then behaves as the
+//!     clean interior loop that r just-under-1 already handles. Now exact +
+//!     watertight; gated to r=1.0 in `curved_boolean_poke_envelope.rs`.
 //!
-//! Both need robust handling in the planar DCEL arrangement near tangency
-//! (degenerate/near-degenerate vertices). General (non-tangent) curved poke is
-//! correct + watertight — gated by `tests/curved_boolean_poke_envelope.rs`.
+//! REMAINING (open): BEYOND-tangent r > 1 (circle radius > box half-width ⇒ it
+//! genuinely CROSSES the box edges, and the sphere is clipped by the adjacent
+//! box faces). This is a multi-face transversal clip, NOT a tangency — a
+//! different, more general problem. General curved poke r ∈ [0..1] is correct +
+//! watertight, gated by `tests/curved_boolean_poke_envelope.rs`.
 
 use geometry_engine::harness::brep_integrity::brep_integrity;
 use geometry_engine::harness::watertight::manifold_report;
