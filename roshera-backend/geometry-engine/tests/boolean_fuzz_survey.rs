@@ -1534,3 +1534,129 @@ fn boolean_box_torus_fuzz_survey() {
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
+
+// ===========================================================================
+// CLEAN-CELL reporter for box∘rotated-box (#91 ratchet). Planar∘planar is the
+// healthy path (the survey found only volume noise, zero topology breakage), so
+// most rotated-box cells are lockable — a far bigger conquered region than the
+// curved surveys. This prints the cells passing all 3 ops cleanly so the gate is
+// built from measured fact.
+// ===========================================================================
+
+#[test]
+#[ignore = "fuzz survey — prints box∘rotated-box cells that pass all 3 ops cleanly"]
+fn survey_box_rbox_clean_cells() {
+    let vol_tol = 0.03;
+    let ops = [
+        BooleanOp::Intersection,
+        BooleanOp::Union,
+        BooleanOp::Difference,
+    ];
+    let picks: [fn(&GridTruth) -> f64; 3] = [|g| g.intersection, |g| g.union, |g| g.difference];
+
+    let clean: Vec<String> = rbox_configs()
+        .par_iter()
+        .filter_map(|&(hb, center, axis, angle_deg, label)| {
+            let angle = angle_deg.to_radians();
+            let truth = rbox_grid_truth(hb, center, axis, angle);
+            let mut all_clean = true;
+            let mut any_checked = false;
+            for (oi, &op) in ops.iter().enumerate() {
+                let t = picks[oi](&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                any_checked = true;
+                match run_op_timed(op, move |m| rotated_box(m, hb, center, axis, angle)) {
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol || f.open_edges != 0 || f.nonmanifold_edges != 0 {
+                            all_clean = false;
+                        }
+                    }
+                    _ => all_clean = false,
+                }
+            }
+            if any_checked && all_clean {
+                Some(format!("{label} hb={hb} {angle_deg}"))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut clean = clean;
+    clean.sort();
+    println!(
+        "\n=== #91 box∘rotated-box CLEAN cells (pass ∩/∪/∖: vol≤3%, watertight, manifold) ==="
+    );
+    println!("clean_cells={}", clean.len());
+    for c in &clean {
+        println!("  OK {c}");
+    }
+    println!("=== end ===\n");
+}
+
+// ===========================================================================
+// RATCHET GATE (#91) — NON-ignored. Locks the box∘rotated-box cells that pass
+// all three booleans cleanly, per survey_box_rbox_clean_cells. The planar
+// oblique-clip path is the kernel's healthiest cut path; these four centered
+// rotations are the conquered floor for it and must never regress to the #34/#80
+// over-inclusion class. Oracle = 96³ grid truth at 5% tol + watertight + manifold.
+// ===========================================================================
+
+#[test]
+fn box_rbox_conquered_band_gate() {
+    // (half-extent, centre, axis, angle_deg) — exactly the cells the reporter
+    // measured clean (all origin-centred).
+    let cells: [(f64, [f64; 3], [f64; 3], f64); 4] = [
+        (0.7, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 45.0), // diag-45-centered
+        (0.4, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 20.0), // contained-tilt
+        (1.0, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 45.0), // big-diag
+        (0.5, [0.0, 0.0, 0.0], [1.0, 2.0, 0.0], 35.0), // tilt-through
+    ];
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let tol = 0.05;
+    for (hb, center, axis, angle_deg) in cells {
+        let angle = angle_deg.to_radians();
+        let truth = rbox_grid_truth(hb, center, axis, angle);
+        for &(op, sym, pick) in &ops {
+            let t = pick(&truth);
+            if t < 1e-3 {
+                continue;
+            }
+            let facts = run_op_timed(op, move |m| rotated_box(m, hb, center, axis, angle));
+            let f = match facts {
+                Outcome::Ok(f) => f,
+                Outcome::Err => {
+                    panic!("box∘rbox {sym} hb={hb} {angle_deg}°: kernel error")
+                }
+                Outcome::Hang => {
+                    panic!("box∘rbox {sym} hb={hb} {angle_deg}°: did not return in budget")
+                }
+            };
+            let rel = (f.vol - t).abs() / t.max(1e-3);
+            assert!(
+                rel <= tol,
+                "REGRESSION: box∘rbox {sym} hb={hb} {angle_deg}°: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+                f.vol,
+                100.0 * (f.vol - t) / t,
+                100.0 * tol
+            );
+            assert_eq!(
+                f.open_edges, 0,
+                "REGRESSION: box∘rbox {sym} hb={hb} {angle_deg}°: {} open edges",
+                f.open_edges
+            );
+            assert_eq!(
+                f.nonmanifold_edges, 0,
+                "REGRESSION: box∘rbox {sym} hb={hb} {angle_deg}°: {} non-manifold edges",
+                f.nonmanifold_edges
+            );
+        }
+    }
+}
