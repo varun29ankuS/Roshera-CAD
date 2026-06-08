@@ -3608,6 +3608,38 @@ fn split_sphere_face_by_circles(
         near_side(p).then_some(p)
     });
 
+    // A SINGLE cut circle splits the sphere into exactly TWO caps (two spherical
+    // regions, each bounded by that circle). The generic "central region carries
+    // every circle as an inner-loop hole" representation is DEGENERATE for a GREAT
+    // circle (sphere centre on the cut plane): the central region is then a full
+    // hemisphere, and a hemisphere represented as an empty outer loop + a circle
+    // hole tessellates ambiguously — the mesh resolves to a different hemisphere
+    // (or the whole sphere) run-to-run, so the volume flickers (#82). Build the
+    // second region as a proper cap instead: the same circle reversed (CCW from
+    // the opposite side), interior at the opposite pole. For ≥2 disjoint circles
+    // the central region is a genuine multiply-connected band, so keep the holes
+    // representation there.
+    if by_curve.len() == 1 {
+        let (c_center, c_axis) = planes[0];
+        let dir0 = (c_center - center).normalize().unwrap_or(c_axis);
+        let reversed: Vec<(EdgeId, bool)> = circle_loops[0]
+            .iter()
+            .rev()
+            .map(|&(e, f)| (e, !f))
+            .collect();
+        let mut result = cap_faces;
+        result.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: reversed,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(center - dir0 * radius),
+            inner_loops: Vec::new(),
+        });
+        return Some(result);
+    }
+
     let mut result = cap_faces;
     if let Some(ci) = central_interior {
         result.push(SplitFace {
