@@ -83,15 +83,46 @@ fn build(model: &mut BRepModel) -> SolidId {
     build_r(model, 1.0)
 }
 
-/// Scope: does the failure depend on the degenerate edge-tangency (r=1 ⇒ great
-/// circle tangent to all 4 box edges), or do non-tangent radii also fail? The
-/// sphere centre sits ON the box face x=1, so exactly half is inside regardless
-/// of r: truth = (2/3)π·r³.
+/// Grid-integrated truth for box[-1,1]³ ∩ sphere(centre, r): count cell centres
+/// that lie inside BOTH. Because the integration domain IS the box, box
+/// membership is implicit and EVERY box face clips the sphere correctly — so
+/// this is valid for r > box-half-width (the sphere bulging past the host face's
+/// edges, clipped by the adjacent faces), where the closed-form (2/3)π·r³ is an
+/// over-estimate. N=240 cells/axis ⇒ ~1.4e7 samples, ~0.1% accurate.
+fn box_sphere_grid_truth(centre: [f64; 3], r: f64) -> f64 {
+    const N: usize = 240;
+    let cell = 2.0 / N as f64;
+    let cell_vol = cell * cell * cell;
+    let r2 = r * r;
+    let mut count = 0u64;
+    for i in 0..N {
+        let x = -1.0 + (i as f64 + 0.5) * cell;
+        let dx = x - centre[0];
+        for j in 0..N {
+            let y = -1.0 + (j as f64 + 0.5) * cell;
+            let dy = y - centre[1];
+            for k in 0..N {
+                let z = -1.0 + (k as f64 + 0.5) * cell;
+                let dz = z - centre[2];
+                if dx * dx + dy * dy + dz * dz <= r2 {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count as f64 * cell_vol
+}
+
+/// Scope sweep: sphere centre sits ON the box face x=1. Truth is the GRID
+/// oracle (valid for r>1, where the sphere bulges past the face edges and is
+/// clipped by the adjacent box faces — the closed-form (2/3)π·r³ over-estimates
+/// there). #82/#86 (r ≤ 1) are now fixed; this characterises the open #88
+/// (r > 1 multi-face clip).
 #[test]
 #[ignore = "diagnostic, not a gate"]
 fn diag_box_sphere_poke_radius_sweep() {
-    println!("\n=== #82 radius sweep (sphere centre on box face x=1) ===");
-    for &r in &[0.9_f64, 0.95, 0.97, 0.98, 0.99, 0.995, 1.0, 1.005, 1.05] {
+    println!("\n=== box∩sphere radius sweep (centre on box face x=1) ===");
+    for &r in &[0.9_f64, 0.95, 1.0, 1.02, 1.05, 1.1, 1.2, 1.3, 1.41] {
         let mut model = BRepModel::new();
         let bx = match TopologyBuilder::new(&mut model)
             .create_box_3d(2.0, 2.0, 2.0)
@@ -107,7 +138,8 @@ fn diag_box_sphere_poke_radius_sweep() {
             GeometryId::Solid(id) => id,
             o => panic!("{o:?}"),
         };
-        let truth = 2.0 / 3.0 * std::f64::consts::PI * r * r * r;
+        let truth = box_sphere_grid_truth([1.0, 0.0, 0.0], r);
+        let analytic = 2.0 / 3.0 * std::f64::consts::PI * r * r * r;
         match boolean_operation(
             &mut model,
             bx,
@@ -121,11 +153,11 @@ fn diag_box_sphere_poke_radius_sweep() {
                     .map(|m| format!("boundary_e={} closed={}", m.boundary_edges, m.closed))
                     .unwrap_or_else(|| "<empty>".into());
                 println!(
-                    "  r={r:.3}: vol={vol:.4} truth={truth:.4} err={:+.1}%  {wt}",
+                    "  r={r:.3}: vol={vol:.4} grid_truth={truth:.4} (½sphere={analytic:.4}) err={:+.1}%  {wt}",
                     100.0 * (vol - truth) / truth
                 );
             }
-            Err(e) => println!("  r={r:.3}: ERROR {e:?}  (truth {truth:.4})"),
+            Err(e) => println!("  r={r:.3}: ERROR {e:?}  (grid_truth {truth:.4})"),
         }
     }
     println!("=== end sweep ===\n");
