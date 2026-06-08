@@ -2004,3 +2004,78 @@ fn box_torus_conquered_band_gate() {
         }
     }
 }
+
+// ===========================================================================
+// DETERMINISM GATE (#91) — NON-ignored. The survey runs booleans in parallel
+// (rayon) and a recurring kernel lesson is "a flaky test is a determinism bug".
+// This locks that the boolean pipeline is BIT-reproducible: the same op on the
+// same operands yields f64-identical volume and identical topology counts across
+// two independent runs. A regression that introduced order-dependence (a HashMap
+// iteration, an unsorted merge) would flip a low bit here and fail CI before it
+// could surface as an intermittent survey flake.
+// ===========================================================================
+
+#[test]
+fn boolean_pipeline_determinism_gate() {
+    // Representative conquered cells across primitives — clean + fast + varied.
+    let ops = [
+        BooleanOp::Intersection,
+        BooleanOp::Union,
+        BooleanOp::Difference,
+    ];
+    // Each entry runs both passes through `run_op` and must agree bit-for-bit.
+    let builders: [(&str, Box<dyn Fn(&mut BRepModel) -> SolidId>); 4] = [
+        (
+            "sphere-contained",
+            Box::new(|m: &mut BRepModel| sphere(m, [0.0, 0.0, 0.0], 0.8)),
+        ),
+        (
+            "cyl-contained",
+            Box::new(|m: &mut BRepModel| cylinder(m, [0.0, 0.0, -0.5], 0.3, 1.0)),
+        ),
+        (
+            "cone-contained-apex",
+            Box::new(|m: &mut BRepModel| cone(m, [0.0, 0.0, -0.5], 0.4, 0.0, 1.0)),
+        ),
+        (
+            "rbox-diag45",
+            Box::new(|m: &mut BRepModel| {
+                rotated_box(
+                    m,
+                    0.7,
+                    [0.0, 0.0, 0.0],
+                    [1.0, 1.0, 1.0],
+                    45.0_f64.to_radians(),
+                )
+            }),
+        ),
+    ];
+
+    for (name, build) in &builders {
+        for &op in &ops {
+            let a = run_op(op, |m| build(m)).unwrap_or_else(|| {
+                panic!("determinism gate: {name} {op:?} pass 1 returned no solid")
+            });
+            let b = run_op(op, |m| build(m)).unwrap_or_else(|| {
+                panic!("determinism gate: {name} {op:?} pass 2 returned no solid")
+            });
+            assert_eq!(
+                a.vol.to_bits(),
+                b.vol.to_bits(),
+                "NON-DETERMINISTIC: {name} {op:?} volume differs across runs: {} vs {}",
+                a.vol,
+                b.vol
+            );
+            assert_eq!(
+                a.open_edges, b.open_edges,
+                "NON-DETERMINISTIC: {name} {op:?} open_edges {} vs {}",
+                a.open_edges, b.open_edges
+            );
+            assert_eq!(
+                a.nonmanifold_edges, b.nonmanifold_edges,
+                "NON-DETERMINISTIC: {name} {op:?} nonmanifold_edges {} vs {}",
+                a.nonmanifold_edges, b.nonmanifold_edges
+            );
+        }
+    }
+}
