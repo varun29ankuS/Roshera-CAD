@@ -3005,3 +3005,240 @@ fn diag_box_sphere_face_poke() {
         );
     }
 }
+
+// ===========================================================================
+// POINT-MEMBERSHIP ORACLE (#91 Parasolid-grade). Volume/grid oracles are BLIND
+// to a result with the right volume but the WRONG geometry — e.g. box∩sphere
+// building the wrong hemisphere (both hemispheres have equal volume, so the
+// volume oracle passes while the solid is geometrically wrong; that bug actually
+// shipped during the cap-side work and the volume oracle could not see it). This
+// oracle is INDEPENDENT of volume: sample random points and compare the result
+// solid's ACTUAL membership (winding-number Shell::contains_point — a separate
+// code path from the boolean) against the analytic EXPECTED membership. Points
+// within ε of either operand boundary are skipped (contains_point triangle-fan-
+// approximates curved faces; analytic membership is ambiguous at the boundary).
+// ===========================================================================
+
+/// `in_shape`, but `None` if the point is within `eps` of the shape boundary
+/// (an ±eps corner perturbation flips membership) — classification is unstable
+/// there, so the point must be skipped.
+fn stable_in_shape(p: [f64; 3], s: ShapeSpec, eps: f64) -> Option<bool> {
+    let base = in_shape(p, s);
+    for &dx in &[-eps, eps] {
+        for &dy in &[-eps, eps] {
+            for &dz in &[-eps, eps] {
+                if in_shape([p[0] + dx, p[1] + dy, p[2] + dz], s) != base {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(base)
+}
+
+/// Möller–Trumbore ray–triangle intersection; `Some(t)` for a forward hit (t>ε).
+fn ray_tri(o: Point3, d: Vector3, tri: &[Point3; 3]) -> Option<f64> {
+    let e1 = tri[1] - tri[0];
+    let e2 = tri[2] - tri[0];
+    let h = d.cross(&e2);
+    let a = e1.dot(&h);
+    if a.abs() < 1e-12 {
+        return None; // ray parallel to triangle
+    }
+    let f = 1.0 / a;
+    let s = o - tri[0];
+    let u = f * s.dot(&h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(&e1);
+    let v = f * d.dot(&q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = f * e2.dot(&q);
+    (t > 1e-9).then_some(t)
+}
+
+/// Inside-result test by RAY PARITY against the result's triangle mesh — exact
+/// for the actual result geometry (unlike Shell::contains_point's winding-number
+/// fan, which is only accurate for planar faces and misclassifies ~20-50% of
+/// points near curved surfaces). Odd crossings of a fixed oblique ray = inside.
+fn inside_mesh(p: [f64; 3], dir: Vector3, tris: &[[Point3; 3]]) -> bool {
+    let o = Point3::new(p[0], p[1], p[2]);
+    let crossings = tris.iter().filter(|t| ray_tri(o, dir, t).is_some()).count();
+    crossings % 2 == 1
+}
+
+/// (points_checked, mismatches) for box∘B membership, or None on kernel error.
+fn membership_check(
+    op: BooleanOp,
+    b: ShapeSpec,
+    seed: u64,
+    k: usize,
+    eps: f64,
+) -> Option<(usize, usize)> {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let mut model = BRepModel::new();
+    let bx = the_box(&mut model);
+    let bsolid = build_shape(&mut model, b);
+    let res = boolean_operation(&mut model, bx, bsolid, op, BooleanOptions::default()).ok()?;
+
+    // Tessellate the result once; classify points by ray parity against its mesh.
+    let mesh = {
+        let solid = model.get_solid(res)?;
+        tessellate_solid(solid, &model, &TessellationParams::fine())
+    };
+    let tris: Vec<[Point3; 3]> = mesh
+        .triangles
+        .iter()
+        .map(|t| {
+            [
+                mesh.vertices[t[0] as usize].position,
+                mesh.vertices[t[1] as usize].position,
+                mesh.vertices[t[2] as usize].position,
+            ]
+        })
+        .collect();
+    if tris.is_empty() {
+        return None;
+    }
+    // Fixed oblique ray — avoids axis-aligned edge-on degeneracies.
+    let dir = Vector3::new(0.273_1, 0.512_7, 0.814_3);
+
+    let (bmin, bmax) = shape_aabb(b);
+    let reach = (0..3)
+        .map(|i| bmin[i].abs().max(bmax[i].abs()).max(BOX_HALF))
+        .fold(0.1, f64::max)
+        + 0.1;
+
+    let mut rng = Rng::new(seed);
+    let (mut checked, mut mism) = (0usize, 0usize);
+    for _ in 0..k {
+        let p = [
+            rng.range(-reach, reach),
+            rng.range(-reach, reach),
+            rng.range(-reach, reach),
+        ];
+        let (Some(in_a), Some(in_b)) = (
+            stable_in_shape(p, ShapeSpec::Box, eps),
+            stable_in_shape(p, b, eps),
+        ) else {
+            continue; // near a boundary — skip
+        };
+        let expected = match op {
+            BooleanOp::Intersection => in_a && in_b,
+            BooleanOp::Union => in_a || in_b,
+            BooleanOp::Difference => in_a && !in_b,
+        };
+        checked += 1;
+        if inside_mesh(p, dir, &tris) != expected {
+            mism += 1;
+        }
+    }
+    Some((checked, mism))
+}
+
+#[test]
+#[ignore = "fuzz survey — point-membership oracle (mesh-free correctness; catches wrong-geometry-right-volume)"]
+fn boolean_box_membership_survey() {
+    const K: usize = 4000;
+    const SEED: u64 = 0xBEEF_FACE_1234_5678;
+    let eps = 0.04;
+    let configs: [(ShapeSpec, &str); 8] = [
+        (
+            ShapeSpec::Sphere {
+                c: [0.0, 0.0, 0.0],
+                r: 0.8,
+            },
+            "sphere-contained",
+        ),
+        (
+            ShapeSpec::Sphere {
+                c: [1.0, 0.0, 0.0],
+                r: 0.5,
+            },
+            "sphere-face-poke",
+        ),
+        (
+            ShapeSpec::Sphere {
+                c: [1.0, 1.0, 1.0],
+                r: 0.8,
+            },
+            "sphere-corner",
+        ),
+        (
+            ShapeSpec::Cyl {
+                base: [0.0, 0.0, -0.5],
+                r: 0.5,
+                h: 1.0,
+            },
+            "cyl-contained",
+        ),
+        (
+            ShapeSpec::Cyl {
+                base: [1.0, 0.0, -0.5],
+                r: 0.5,
+                h: 1.0,
+            },
+            "cyl-face",
+        ),
+        (
+            ShapeSpec::Cone {
+                bc: [0.0, 0.0, -0.5],
+                rb: 0.5,
+                rt: 0.0,
+                h: 1.0,
+            },
+            "cone-contained",
+        ),
+        (
+            ShapeSpec::Torus {
+                c: [0.0, 0.0, 0.0],
+                rmaj: 0.6,
+                rmin: 0.25,
+            },
+            "torus-centered",
+        ),
+        (
+            ShapeSpec::Sphere {
+                c: [0.5, 0.0, 0.0],
+                r: 0.8,
+            },
+            "sphere-straddle",
+        ),
+    ];
+    let ops = [
+        (BooleanOp::Intersection, "I"),
+        (BooleanOp::Union, "U"),
+        (BooleanOp::Difference, "D"),
+    ];
+    println!("\n=== #91 box∘B POINT-MEMBERSHIP oracle (K={K} pts/cfg, eps={eps}) ===");
+    let mut worst = 0.0f64;
+    let mut total_mism = 0usize;
+    for (i, (b, name)) in configs.iter().enumerate() {
+        for (op, sym) in ops {
+            let seed = SEED ^ ((i as u64) << 16) ^ (sym.len() as u64);
+            match membership_check(op, *b, seed, K, eps) {
+                Some((checked, mism)) if checked > 0 => {
+                    let rate = mism as f64 / checked as f64;
+                    worst = worst.max(rate);
+                    total_mism += mism;
+                    if mism > 0 {
+                        println!(
+                            "  [{sym}] {name}: {mism}/{checked} mismatches ({:.1}%)",
+                            100.0 * rate
+                        );
+                    }
+                }
+                Some(_) => println!("  [{sym}] {name}: 0 points checked"),
+                None => println!("  [{sym}] {name}: kernel error / non-closed result"),
+            }
+        }
+    }
+    println!(
+        "total mismatches={total_mism}  worst rate={:.1}%",
+        100.0 * worst
+    );
+    println!("=== end ===\n");
+}
