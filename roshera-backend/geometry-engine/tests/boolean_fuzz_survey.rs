@@ -542,3 +542,172 @@ fn boolean_box_cylinder_fuzz_survey() {
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
+
+// ===========================================================================
+// box ∘ CONE survey — second solid is a z-axis cone/frustum. Apex + slanted
+// lateral cross box faces, so the same multi-face curved-cut breakage applies.
+// ===========================================================================
+
+fn cone(model: &mut BRepModel, bc: [f64; 3], rb: f64, rt: f64, h: f64) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_cone_3d(Point3::new(bc[0], bc[1], bc[2]), Vector3::Z, rb, rt, h)
+        .expect("cone")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("cone: {o:?}"),
+    }
+}
+
+/// Inside a finite z-axis cone/frustum: radial ≤ r(axial), axial ∈ [0,h], where
+/// r interpolates base_radius `rb` (axial 0) → top_radius `rt` (axial h).
+fn in_cone(p: [f64; 3], bc: [f64; 3], rb: f64, rt: f64, h: f64) -> bool {
+    let axial = p[2] - bc[2];
+    if axial < 0.0 || axial > h {
+        return false;
+    }
+    let r_at = rb + (rt - rb) * (axial / h);
+    let (dx, dy) = (p[0] - bc[0], p[1] - bc[1]);
+    dx * dx + dy * dy <= r_at * r_at
+}
+
+fn cone_grid_truth(bc: [f64; 3], rb: f64, rt: f64, h: f64) -> GridTruth {
+    let rmax = rb.max(rt);
+    let reach = [
+        bc[0].abs() + rmax,
+        bc[1].abs() + rmax,
+        bc[2].abs().max((bc[2] + h).abs()),
+    ]
+    .into_iter()
+    .fold(BOX_HALF, f64::max)
+        + 0.05;
+    const N: usize = 96;
+    let cell = 2.0 * reach / N as f64;
+    let cv = cell * cell * cell;
+    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
+    for i in 0..N {
+        let x = -reach + (i as f64 + 0.5) * cell;
+        let in_bx = x.abs() <= BOX_HALF;
+        for j in 0..N {
+            let y = -reach + (j as f64 + 0.5) * cell;
+            let in_by = in_bx && y.abs() <= BOX_HALF;
+            for k in 0..N {
+                let z = -reach + (k as f64 + 0.5) * cell;
+                let in_box = in_by && z.abs() <= BOX_HALF;
+                let in_cn = in_cone([x, y, z], bc, rb, rt, h);
+                if in_box && in_cn {
+                    i_n += 1;
+                }
+                if in_box || in_cn {
+                    u_n += 1;
+                }
+                if in_box && !in_cn {
+                    d_n += 1;
+                }
+            }
+        }
+    }
+    GridTruth {
+        intersection: i_n as f64 * cv,
+        union: u_n as f64 * cv,
+        difference: d_n as f64 * cv,
+    }
+}
+
+/// (base_center, base_r, top_r, height, label) — z-axis cones vs box [-1,1]³.
+fn cone_configs() -> Vec<([f64; 3], f64, f64, f64, &'static str)> {
+    vec![
+        ([0.0, 0.0, -1.5], 0.9, 0.0, 3.0, "apex-through"),
+        ([0.0, 0.0, -1.0], 0.8, 0.4, 2.0, "frustum-through"),
+        ([0.0, 0.0, -0.5], 0.4, 0.0, 1.0, "contained-apex"),
+        ([0.5, 0.3, -0.5], 0.4, 0.2, 1.0, "contained-frustum-off"),
+        ([1.0, 0.0, -0.5], 0.5, 0.3, 1.0, "radial-face+x"),
+        ([1.0, 1.0, -0.5], 0.5, 0.3, 1.0, "radial-edge"),
+        ([1.0, 1.0, 0.5], 0.5, 0.0, 1.0, "corner"),
+        ([0.0, 0.0, -1.5], 1.5, 0.5, 3.0, "wider-than-box"),
+        ([0.0, 0.0, 0.0], 0.6, 0.0, 1.0, "apex-poke+z"),
+        ([1.4, 0.0, -0.5], 0.6, 0.4, 1.0, "radial-poke-past"),
+    ]
+}
+
+#[test]
+#[ignore = "fuzz survey — run with --ignored --nocapture"]
+fn boolean_box_cone_fuzz_survey() {
+    let vol_tol = 0.03;
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let configs = cone_configs();
+    let n_cfg = configs.len();
+    let n_checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let fails: Vec<Failure> = configs
+        .par_iter()
+        .flat_map(|&(bc, rb, rt, h, label)| {
+            let truth = cone_grid_truth(bc, rb, rt, h);
+            let mut out: Vec<Failure> = Vec::new();
+            for &(op, sym, pick) in &ops {
+                let t = pick(&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lab = format!("{label} rb={rb} rt={rt} h={h}");
+                match run_op_timed(op, move |m| cone(m, bc, rb, rt, h)) {
+                    Outcome::Hang => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "HANG",
+                        detail: format!("op did not return within budget (truth {t:.3})"),
+                    }),
+                    Outcome::Err => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "ERROR",
+                        detail: format!("op errored (truth {t:.3})"),
+                    }),
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "VOLUME",
+                                detail: format!(
+                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                    f.vol,
+                                    100.0 * (f.vol - t) / t
+                                ),
+                            });
+                        }
+                        if f.open_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "WATERTIGHT",
+                                detail: format!("open_edges={}", f.open_edges),
+                            });
+                        }
+                        if f.nonmanifold_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "MANIFOLD",
+                                detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    print_catalog(
+        "box ∘ cone",
+        &fails,
+        n_cfg,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
