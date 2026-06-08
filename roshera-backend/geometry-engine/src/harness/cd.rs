@@ -18,6 +18,8 @@
 
 use crate::harness::{AblationReport, StageMetric};
 use crate::math::polyhedral_cone::PolyhedralCone;
+use crate::math::Point3;
+use crate::primitives::edge::EdgeId;
 use crate::primitives::face::FaceId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
@@ -104,10 +106,9 @@ pub fn run_cd_ablation(
         for &fa in &entities_a[i] {
             for &fb in &entities_b[j] {
                 lmd_solves += 1;
-                for lmd in face_lmds(model, fa, fb) {
-                    if lmd.distance < min_distance {
-                        min_distance = lmd.distance;
-                    }
+                let d = face_pair_min_distance(model, fa, fb);
+                if d < min_distance {
+                    min_distance = d;
                 }
             }
         }
@@ -236,14 +237,152 @@ fn brute_force_min(model: &BRepModel, faces_a: &[FaceId], faces_b: &[FaceId]) ->
     let mut min = f64::INFINITY;
     for &fa in faces_a {
         for &fb in faces_b {
-            for lmd in face_lmds(model, fa, fb) {
-                if lmd.distance < min {
-                    min = lmd.distance;
-                }
+            let d = face_pair_min_distance(model, fa, fb);
+            if d < min {
+                min = d;
             }
         }
     }
     min
+}
+
+/// Minimum distance between two faces, accounting for BOTH face-interior contact
+/// (the surface LMD) and BOUNDARY contact (edge–edge / vertex). The LMD's
+/// `footpoint_in_face` filter discards any critical point that lands on a face's
+/// boundary, so a contact that occurs on the shared boundary of two faces — two
+/// coplanar faces meeting along an edge, or a box corner touching a face — is
+/// invisible to `face_lmds` alone (it returns inf). The minimum distance between
+/// the two faces' boundary edges recovers exactly those edge/vertex contacts
+/// (#83). The overall face-pair distance is the min of the two.
+fn face_pair_min_distance(model: &BRepModel, fa: FaceId, fb: FaceId) -> f64 {
+    let mut min = f64::INFINITY;
+    for lmd in face_lmds(model, fa, fb) {
+        if lmd.distance < min {
+            min = lmd.distance;
+        }
+    }
+    let ea_ids = boundary_edge_ids(model, fa);
+    let eb_ids = boundary_edge_ids(model, fb);
+    for &ea in &ea_ids {
+        for &eb in &eb_ids {
+            let d = edge_pair_min_distance(model, ea, eb);
+            if d < min {
+                min = d;
+            }
+        }
+    }
+    min
+}
+
+/// Every edge id on a face's outer and inner loops.
+fn boundary_edge_ids(model: &BRepModel, face_id: FaceId) -> Vec<EdgeId> {
+    let mut out = Vec::new();
+    let Some(face) = model.faces.get(face_id) else {
+        return out;
+    };
+    let mut loop_ids = vec![face.outer_loop];
+    loop_ids.extend(face.inner_loops.iter().copied());
+    for lid in loop_ids {
+        if let Some(lp) = model.loops.get(lid) {
+            out.extend(lp.edges.iter().copied());
+        }
+    }
+    out
+}
+
+/// Sample an edge's carrier curve into a polyline of `n` segments over the
+/// edge's parameter sub-range.
+fn sample_edge(model: &BRepModel, edge_id: EdgeId, n: usize) -> Vec<Point3> {
+    let mut pts = Vec::new();
+    let Some(edge) = model.edges.get(edge_id) else {
+        return pts;
+    };
+    let Some(curve) = model.curves.get(edge.curve_id) else {
+        return pts;
+    };
+    let (s, e) = (edge.param_range.start, edge.param_range.end);
+    for k in 0..=n {
+        let t = s + (e - s) * (k as f64) / (n as f64);
+        if let Ok(p) = curve.point_at(t) {
+            pts.push(p);
+        }
+    }
+    pts
+}
+
+/// Minimum 3D distance between two B-Rep edges, via polyline sampling +
+/// segment-segment distance. Exact for straight (line) edges (the polyline is
+/// collinear, so the segment-segment minimum is the true minimum); a close
+/// approximation for curved edges at the sample density used — sufficient for
+/// contact determination (`distance <= TAU`).
+fn edge_pair_min_distance(model: &BRepModel, ea: EdgeId, eb: EdgeId) -> f64 {
+    const N: usize = 4;
+    let pa = sample_edge(model, ea, N);
+    let pb = sample_edge(model, eb, N);
+    if pa.len() < 2 || pb.len() < 2 {
+        return f64::INFINITY;
+    }
+    let mut min = f64::INFINITY;
+    for i in 0..pa.len() - 1 {
+        for j in 0..pb.len() - 1 {
+            let d = seg_seg_distance(pa[i], pa[i + 1], pb[j], pb[j + 1]);
+            if d < min {
+                min = d;
+            }
+        }
+    }
+    min
+}
+
+/// Closest distance between two 3D segments [p1,q1] and [p2,q2] (Ericson,
+/// *Real-Time Collision Detection* §5.1.9): clamp the unconstrained
+/// line-line closest parameters to each segment, re-projecting when a clamp
+/// moves off the other segment. Handles parallel and degenerate (point)
+/// segments.
+fn seg_seg_distance(p1: Point3, q1: Point3, p2: Point3, q2: Point3) -> f64 {
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let a = d1.dot(&d1);
+    let e = d2.dot(&d2);
+    let f = d2.dot(&r);
+    let eps = 1e-18;
+    let (s, t);
+    if a <= eps && e <= eps {
+        return r.magnitude();
+    }
+    if a <= eps {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.dot(&r);
+        if e <= eps {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = d1.dot(&d2);
+            let denom = a * e - b * b;
+            let s0 = if denom.abs() > eps {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let t0 = (b * s0 + f) / e;
+            if t0 < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t0 > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            } else {
+                t = t0;
+                s = s0;
+            }
+        }
+    }
+    let c1 = p1 + d1 * s;
+    let c2 = p2 + d2 * t;
+    (c1 - c2).magnitude()
 }
 
 fn approx_eq(a: f64, b: f64) -> bool {
@@ -380,22 +519,25 @@ mod tests {
         assert!(full.lmd_solves < baseline.lmd_solves);
     }
 
-    /// Analytic closest-boundary-face distance for two axis-aligned unit boxes
-    /// (half-extent 1) on a pure X-translation `tx`. The CD pipeline measures the
-    /// distance between the nearest pair of *boundary faces*, not solid
-    /// separation: for face-on poses the nearest parallel faces sit
-    /// `min(|tx-2|, |tx|)` apart (0 when touching at tx=2 or coincident at tx=0;
-    /// the trailing faces close the gap once the boxes overlap). Independent of
-    /// the kernel.
+    /// Analytic solid-to-solid contact distance for two axis-aligned unit boxes
+    /// (half-extent 1) on a pure X-translation `tx`. With edge/vertex closest-
+    /// approach in the narrow phase (#83) the CD pipeline reports the true
+    /// boundary contact distance: 0 while the boxes overlap or touch
+    /// (0 ≤ tx ≤ 2 — they share volume or a face/edge, so their boundaries meet),
+    /// and the face gap `tx − 2` once separated (tx > 2). Independent of the
+    /// kernel. (Before #83 the narrow phase saw only face-interior LMDs and
+    /// reported the nearest *parallel-face* gap `min(|tx-2|,|tx|)`, which read a
+    /// non-zero "distance" for overlapping solids — superseded.)
     fn face_on_truth(tx: f64) -> f64 {
-        (tx - 2.0).abs().min(tx.abs())
+        (tx - 2.0).max(0.0)
     }
 
     /// Face-on CD proximity vs analytic truth: two boxes approaching face-to-face
     /// along X across overlapping, touching, and separated poses. The all-pairs
-    /// face LMD minimum (baseline = no broad-phase cull) must equal the analytic
-    /// nearest-parallel-face distance. This is the regime the face-pair LMD covers
-    /// exactly, and it validates the narrow phase against an independent oracle.
+    /// narrow-phase minimum (baseline = no broad-phase cull), now including edge/
+    /// vertex closest approach, must equal the true contact distance: 0 while the
+    /// boxes overlap/touch, the face gap once separated. Validates the narrow
+    /// phase against an independent oracle.
     #[test]
     fn cd_face_proximity_matches_analytic() {
         let xs = [0.0, 1.5, 2.0, 2.5, 3.0, 5.0];
@@ -430,15 +572,14 @@ mod tests {
         );
     }
 
-    /// PINNED OPEN FINDING (#83): the face-pair LMD min-distance (the narrow phase
-    /// exercised by `run_cd_ablation`) returns ∞ when the closest approach between
-    /// two solids is edge-edge or vertex-vertex rather than face-face. Two unit
-    /// boxes touching along an edge (t=[2,2,0]) or at a corner (t=[2,2,2]) report
-    /// NO contact — a false negative for those approaches, while face-on contact
-    /// works. Open question: is CD meant to catch edge/vertex contact via the
-    /// supermaximal-feature / cone machinery (and this ablation path simply
-    /// under-exercises it), or is the face-pair narrow phase genuinely missing
-    /// non-face features? Un-ignore once edge/corner contact is covered.
+    /// #83 (FIXED): the face-pair LMD min-distance returned ∞ when the closest
+    /// approach between two solids is edge-edge or vertex-vertex rather than
+    /// face-face — the `footpoint_in_face` filter discards any critical point on a
+    /// face boundary. Two unit boxes touching along an edge (t=[2,2,0]) or at a
+    /// corner (t=[2,2,2]) reported NO contact (a false negative). Fixed by adding
+    /// edge-edge / vertex closest approach to the narrow phase
+    /// (`face_pair_min_distance` → `edge_pair_min_distance` → segment-segment
+    /// distance over the faces' boundary edges). Both poses now register contact.
     #[test]
     fn cd_edge_corner_contact_83() {
         const TAU: f64 = 1e-6;
