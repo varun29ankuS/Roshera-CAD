@@ -8,6 +8,33 @@
 //! mismatched arc counts on the two sides of the shared circle?).
 //!
 //! Run: `cargo test -p geometry-engine --test diag_sphere_poke_82 -- --ignored --nocapture`
+//!
+//! ROOT-CAUSE MAP (#86 exact-tangent predicates) — two distinct mechanisms,
+//! both in the PLANAR face arrangement of the box face cut by the great circle,
+//! confirmed by the per-fragment classification trace (ROSHERA_BOOL_TRACE=1):
+//!
+//!   * NEAR-TANGENT band, r ∈ [0.95, 0.995] (circle inside the face, gap ≤ 0.05
+//!     to the box edges) → boolean ERRORS ("component 0 has only 1 planar face").
+//!     The square-minus-circle arrangement mis-walks: the poked face splits into
+//!     TWO chord-split pieces BOTH inside the circle, and the annulus (outside-
+//!     circle) cell is DROPPED. With no exterior planar cell, the curved
+//!     hemisphere can't close against a disk cap → invalid shell. Topology is
+//!     identical to r ≤ 0.9 (which is exact + watertight), so this is a DCEL
+//!     robustness failure triggered purely by the circle's proximity to the host
+//!     edges, not a change of case.
+//!
+//!   * EXACT-TANGENT, r = 1 (great circle radius = box half-width ⇒ tangent to
+//!     all 4 box edges at their midpoints) → wrong volume 3.070, open seam. At
+//!     each tangent point the circle's tangent line equals the edge's tangent
+//!     line (a degenerate arrangement vertex with collinear incident edges), so
+//!     the cell walk keeps a CORNER SLIVER (bounded by 2 box edges + 2 arcs,
+//!     incl. a box corner OUTSIDE the sphere) in place of the disk cap. The kept
+//!     planar fragment then carries 4 arcs vs the hemisphere's 5 → 5 unweldable
+//!     seam edges → non-watertight.
+//!
+//! Both need robust handling in the planar DCEL arrangement near tangency
+//! (degenerate/near-degenerate vertices). General (non-tangent) curved poke is
+//! correct + watertight — gated by `tests/curved_boolean_poke_envelope.rs`.
 
 use geometry_engine::harness::brep_integrity::brep_integrity;
 use geometry_engine::harness::watertight::manifold_report;
@@ -122,6 +149,39 @@ fn diag_trace_minus_z() {
     );
     println!(
         "MINUS-Z RESULT: {:?}",
+        r.map(|id| model.calculate_solid_volume(id))
+    );
+}
+
+#[test]
+#[ignore = "trace, run with ROSHERA_BOOL_TRACE=1"]
+fn diag_trace_near_tangent_097() {
+    // Near-tangent: circle radius 0.97 is entirely inside the box face (gap 0.03
+    // to the edges), topologically identical to r=0.8 (which works) — yet errors.
+    let mut model = BRepModel::new();
+    let bx = match TopologyBuilder::new(&mut model)
+        .create_box_3d(2.0, 2.0, 2.0)
+        .expect("box")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("{o:?}"),
+    };
+    let sp = match TopologyBuilder::new(&mut model)
+        .create_sphere_3d(Point3::new(1.0, 0.0, 0.0), 0.97)
+        .expect("sphere")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("{o:?}"),
+    };
+    let r = boolean_operation(
+        &mut model,
+        bx,
+        sp,
+        BooleanOp::Intersection,
+        BooleanOptions::default(),
+    );
+    println!(
+        "R=0.97 RESULT: {:?}",
         r.map(|id| model.calculate_solid_volume(id))
     );
 }
