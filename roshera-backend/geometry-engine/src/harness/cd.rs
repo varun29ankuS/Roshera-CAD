@@ -114,14 +114,31 @@ pub fn run_cd_ablation(
         }
     }
 
+    const TAU: f64 = 1e-6;
+
+    // Penetration: the narrow phase reports the nearest BOUNDARY-feature distance
+    // (face/edge/vertex LMD), which is correct for separated solids but POSITIVE
+    // for two interpenetrating solids that share no touching feature. A contact
+    // query must report 0 whenever the solid INTERIORS overlap. Detect overlap
+    // (winding-number containment in BOTH closed shells, sampled along the
+    // centroid-to-centroid segment, which threads any convex overlap lens), and
+    // clamp the distance to 0. Applied to the pipeline AND the brute-force oracle
+    // so they agree.
+    let overlapping = solids_overlap(model, solid_a, solid_b);
+    if overlapping && min_distance > TAU {
+        min_distance = 0.0;
+    }
+
     // The broad phase is a *contact* cull (AABB-overlap), so for separated
     // solids it legitimately prunes every pair and reports no contact. The
     // oracle is therefore a contact predicate: the pipeline must agree with
     // brute force on whether a contact exists, and — when it does — on where
     // (the minimum distance). It may differ on the gap of *separated* solids,
     // which is not a contact query.
-    const TAU: f64 = 1e-6;
-    let brute_min = brute_force_min(model, &faces_a, &faces_b);
+    let mut brute_min = brute_force_min(model, &faces_a, &faces_b);
+    if overlapping && brute_min > TAU {
+        brute_min = 0.0;
+    }
     let brute_contact = brute_min <= TAU;
     let pipeline_contact = min_distance <= TAU;
     let correct = (brute_contact == pipeline_contact)
@@ -402,6 +419,121 @@ fn solid_face_ids(model: &BRepModel, solid_id: SolidId) -> Vec<FaceId> {
         }
     }
     out
+}
+
+/// A point guaranteed to lie inside a CONVEX solid: the analytic centre of a
+/// canonical curved face (sphere centre / cylinder axis-midpoint) if present —
+/// robust where a sphere/cylinder carries no usable boundary vertices — else the
+/// average of the boundary vertices (their convex hull ⊆ the solid). A seed for
+/// the overlap probe.
+fn solid_interior_point(model: &BRepModel, solid: SolidId) -> Option<Point3> {
+    use crate::primitives::surface::{Cylinder, Sphere};
+    use std::collections::HashSet;
+
+    for fid in solid_face_ids(model, solid) {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(surf) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if let Some(s) = surf.as_any().downcast_ref::<Sphere>() {
+            return Some(s.center);
+        }
+        if let Some(c) = surf.as_any().downcast_ref::<Cylinder>() {
+            if let Some([h0, h1]) = c.height_limits {
+                return Some(c.origin + c.axis * (0.5 * (h0 + h1)));
+            }
+        }
+    }
+
+    let mut seen: HashSet<u32> = HashSet::new();
+    let (mut sx, mut sy, mut sz, mut n) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    for fid in solid_face_ids(model, solid) {
+        for eid in boundary_edge_ids(model, fid) {
+            if let Some(e) = model.edges.get(eid) {
+                for vid in [e.start_vertex, e.end_vertex] {
+                    if seen.insert(vid) {
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            sx += p[0];
+                            sy += p[1];
+                            sz += p[2];
+                            n += 1.0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if n == 0.0 {
+        return None;
+    }
+    Some(Point3::new(sx / n, sy / n, sz / n))
+}
+
+/// Convex point-in-solid: `p` is inside a convex solid iff it lies on the INNER
+/// side of every bounding face — the signed distance from `p` to the face's
+/// surface along the OUTWARD normal is ≤ 0. The surface normal is oriented
+/// outward by the solid's `interior` centroid (away from it), so this is
+/// independent of stored face orientation and works for curved convex solids
+/// (sphere / cylinder / cone), where the winding-number shell test under-resolves
+/// a seam-bounded curved face's solid angle. (Assumes convex operands — the
+/// standard CD regime.)
+fn point_in_solid(model: &BRepModel, solid: SolidId, interior: &Point3, p: &Point3) -> bool {
+    let tol = crate::math::Tolerance::default();
+    let tol_d = tol.distance();
+    let mut tested = false;
+    for fid in solid_face_ids(model, solid) {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(surf) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        let Ok((u, v)) = surf.closest_point(p, tol) else {
+            continue;
+        };
+        let Ok(eval) = surf.evaluate_full(u, v) else {
+            continue;
+        };
+        let sp = eval.position;
+        // Orient the surface normal to point AWAY from the solid interior.
+        let outward = if eval.normal.dot(&(sp - *interior)) < 0.0 {
+            eval.normal * -1.0
+        } else {
+            eval.normal
+        };
+        tested = true;
+        if (*p - sp).dot(&outward) > tol_d {
+            return false; // p is on the outer side of this face → outside the solid
+        }
+    }
+    tested
+}
+
+/// Do the two solids' INTERIORS overlap? Sample the segment between an interior
+/// point of each (which threads the lens of any convex overlap) and report true
+/// if any sample is inside BOTH closed shells. Robust + cheap for the convex CD
+/// primitives; gracefully returns false when no interior seed is available.
+fn solids_overlap(model: &BRepModel, a: SolidId, b: SolidId) -> bool {
+    let (Some(pa), Some(pb)) = (
+        solid_interior_point(model, a),
+        solid_interior_point(model, b),
+    ) else {
+        return false;
+    };
+    for k in 0..=4 {
+        let t = k as f64 / 4.0;
+        let p = Point3::new(
+            pa.x + (pb.x - pa.x) * t,
+            pa.y + (pb.y - pa.y) * t,
+            pa.z + (pb.z - pa.z) * t,
+        );
+        if point_in_solid(model, a, &pa, &p) && point_in_solid(model, b, &pb, &p) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

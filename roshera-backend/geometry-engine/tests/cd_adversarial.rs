@@ -476,21 +476,21 @@ fn cd_contact_predicate_matches_truth() {
 
 // ---------------------------------------------------------------------------
 // Pinned gaps this harness found (#79). Each asserts the CORRECT behaviour and
-// is therefore RED until the gap is fixed — the visible CD backlog, mirroring
-// the #81/#82 pins in the boolean-∩ harness.
+// were the two gaps this harness FOUND; both are now FIXED by the solid-level
+// overlap clamp (`solids_overlap` in harness/cd.rs), so they are regression
+// guards rather than pins.
 // ---------------------------------------------------------------------------
 
-/// GAP (#79): PENETRATION without a surface-touching feature is not detected.
-/// The narrow phase reports the nearest-FEATURE distance (face/edge/vertex LMD),
-/// which is correct for separated solids but for two INTERPENETRATING solids
-/// that share no coincident/touching feature returns a positive value instead of
-/// 0. Two overlapping spheres (centres 1.5 apart, r=1 → overlap 0.5) report 0.5;
-/// two diagonally-overlapping boxes report a face gap. A collision query must
-/// return 0 (contact) whenever the solids share volume. Fix = an overlap test
-/// (e.g. a vertex of one strictly inside the other, or a non-empty boolean
-/// intersection) that clamps the distance to 0.
+/// FIXED (#79, found by this harness): PENETRATION without a surface-touching
+/// feature. The narrow phase reports the nearest-FEATURE distance (face/edge/
+/// vertex LMD), correct for separated solids but POSITIVE for two
+/// interpenetrating solids that share no touching feature (overlapping spheres,
+/// diagonally-overlapping boxes). A collision query must return 0 whenever the
+/// solids share volume. Fixed by a solid-level overlap test (winding-free convex
+/// containment, sampled along the centroid segment) that clamps the distance to 0
+/// when the interiors overlap.
 #[test]
-fn penetration_without_touching_feature_GAP_79() {
+fn penetration_is_detected_as_contact() {
     let cases: Vec<(&str, Build)> = vec![
         (
             "spheres overlapping by 0.5",
@@ -523,14 +523,16 @@ fn penetration_without_touching_feature_GAP_79() {
     );
 }
 
-/// GAP (#79): the broad phase OVER-PRUNES some genuine contacts. For a smooth
-/// sphere-box face touch and a coincident-same-normal box overlap, the BVH and
-/// cone-cull configurations prune the contact-hosting pair and report `inf`,
-/// while the brute-force baseline finds the contact. The optimisations must only
-/// drop pairs that CANNOT host the closest approach, so every config must
-/// reproduce the baseline contact distance.
+/// FIXED (#79, found by this harness): the broad phase used to OVER-PRUNE some
+/// genuine contacts — for a smooth sphere-box face touch and a coincident-same-
+/// normal box overlap the BVH / cone-cull configs pruned the contact-hosting pair
+/// and reported `inf` while the baseline found the contact. The solid-level
+/// overlap/contact clamp now runs regardless of broad-phase pruning, so every
+/// config reproduces the baseline contact distance (0). (The underlying prune is
+/// masked by the clamp; tightening the cone-cull to keep these pairs is tracked
+/// separately, but the CD OUTPUT is now correct.)
 #[test]
-fn broad_phase_prunes_some_contacts_GAP_79() {
+fn broad_phase_contacts_are_not_lost() {
     let cases: Vec<(&str, Build)> = vec![
         (
             "sphere-box face touch",
