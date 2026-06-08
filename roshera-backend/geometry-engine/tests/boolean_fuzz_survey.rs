@@ -2282,3 +2282,210 @@ fn boolean_box_tilted_cylinder_fuzz_survey() {
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
+
+// ===========================================================================
+// PARASOLID-GRADE ORACLES (#91 / harness rigor). The grid oracle measures one
+// thing (voxel volume). Production kernels are validated against MANY independent
+// oracles + algebraic laws that need no mesh. This block adds the mesh-free layer.
+//
+// `ShapeSpec` is a Copy descriptor of any operand — the foundation both for these
+// algebraic surveys and for the seeded random fuzzer (later iteration). It carries
+// an exact closed-form volume, so booleans can be cross-checked against ALGEBRA,
+// not just a discretised grid.
+// ===========================================================================
+
+#[derive(Clone, Copy, Debug)]
+enum ShapeSpec {
+    Box,
+    Sphere {
+        c: [f64; 3],
+        r: f64,
+    },
+    Cyl {
+        base: [f64; 3],
+        r: f64,
+        h: f64,
+    },
+    Cone {
+        bc: [f64; 3],
+        rb: f64,
+        rt: f64,
+        h: f64,
+    },
+    Torus {
+        c: [f64; 3],
+        rmaj: f64,
+        rmin: f64,
+    },
+}
+
+fn build_shape(model: &mut BRepModel, s: ShapeSpec) -> SolidId {
+    match s {
+        ShapeSpec::Box => the_box(model),
+        ShapeSpec::Sphere { c, r } => sphere(model, c, r),
+        ShapeSpec::Cyl { base, r, h } => cylinder(model, base, r, h),
+        ShapeSpec::Cone { bc, rb, rt, h } => cone(model, bc, rb, rt, h),
+        ShapeSpec::Torus { c, rmaj, rmin } => torus(model, c, rmaj, rmin),
+    }
+}
+
+/// Exact closed-form volume of the primitive — the mesh-free truth for one operand.
+fn analytic_vol(s: ShapeSpec) -> f64 {
+    use std::f64::consts::PI;
+    match s {
+        ShapeSpec::Box => 8.0, // (2·BOX_HALF)³
+        ShapeSpec::Sphere { r, .. } => 4.0 / 3.0 * PI * r * r * r,
+        ShapeSpec::Cyl { r, h, .. } => PI * r * r * h,
+        ShapeSpec::Cone { rb, rt, h, .. } => PI * h / 3.0 * (rb * rb + rb * rt + rt * rt),
+        ShapeSpec::Torus { rmaj, rmin, .. } => 2.0 * PI * PI * rmaj * rmin * rmin,
+    }
+}
+
+/// IDEMPOTENCE + COMMUTATIVITY survey (#91 Parasolid-grade). These are EXACT laws,
+/// independent of any grid:
+///   A∩A = A,  A∪A = A,  A∖A = ∅   (and the result must stay watertight+manifold)
+///   A∩B = B∩A,  A∪B = B∪A          (volume-equal under operand swap)
+/// A∩A is the worst coincident-face degeneracy a kernel faces — two solids sharing
+/// every face. A kernel that mis-handles it is unsound at the most basic level.
+#[test]
+#[ignore = "fuzz survey — run with --ignored --nocapture"]
+fn boolean_idempotence_commutativity_survey() {
+    let tol = 0.03;
+    let shapes: [(&str, ShapeSpec); 5] = [
+        ("box", ShapeSpec::Box),
+        (
+            "sphere",
+            ShapeSpec::Sphere {
+                c: [0.0, 0.0, 0.0],
+                r: 0.8,
+            },
+        ),
+        (
+            "cyl",
+            ShapeSpec::Cyl {
+                base: [0.0, 0.0, -0.5],
+                r: 0.5,
+                h: 1.0,
+            },
+        ),
+        (
+            "cone",
+            ShapeSpec::Cone {
+                bc: [0.0, 0.0, -0.5],
+                rb: 0.5,
+                rt: 0.0,
+                h: 1.0,
+            },
+        ),
+        (
+            "torus",
+            ShapeSpec::Torus {
+                c: [0.0, 0.0, 0.0],
+                rmaj: 0.6,
+                rmin: 0.25,
+            },
+        ),
+    ];
+    let mut fails: Vec<Failure> = Vec::new();
+    let mut n_checks = 0usize;
+
+    // --- self-operation idempotence (coincident-face stress) ---
+    for (name, spec) in shapes {
+        let va = analytic_vol(spec);
+        let cases: [(BooleanOp, &str, f64); 3] = [
+            (BooleanOp::Intersection, "∩", va),
+            (BooleanOp::Union, "∪", va),
+            (BooleanOp::Difference, "∖", 0.0),
+        ];
+        for (op, sym, exp) in cases {
+            n_checks += 1;
+            match run_pair_timed(
+                op,
+                move |m| build_shape(m, spec),
+                move |m| build_shape(m, spec),
+            ) {
+                Outcome::Ok(f) => {
+                    if (f.vol - exp).abs() / va.max(1e-3) > tol {
+                        fails.push(Failure {
+                            label: format!("{name} A{sym}A"),
+                            op: sym,
+                            kind: "VOLUME",
+                            detail: format!("IDEMPOTENCE vol={:.4} expected={exp:.4}", f.vol),
+                        });
+                    }
+                    if f.open_edges != 0 {
+                        fails.push(Failure {
+                            label: format!("{name} A{sym}A"),
+                            op: sym,
+                            kind: "WATERTIGHT",
+                            detail: format!("open_edges={}", f.open_edges),
+                        });
+                    }
+                    if f.nonmanifold_edges != 0 {
+                        fails.push(Failure {
+                            label: format!("{name} A{sym}A"),
+                            op: sym,
+                            kind: "MANIFOLD",
+                            detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                        });
+                    }
+                }
+                Outcome::Err => fails.push(Failure {
+                    label: format!("{name} A{sym}A"),
+                    op: sym,
+                    kind: "ERROR",
+                    detail: "op errored".into(),
+                }),
+                Outcome::Hang => fails.push(Failure {
+                    label: format!("{name} A{sym}A"),
+                    op: sym,
+                    kind: "HANG",
+                    detail: "op did not return".into(),
+                }),
+            }
+        }
+    }
+
+    // --- commutativity of ∩ and ∪ over box∘sphere placements ---
+    let comm_cfgs: [([f64; 3], f64, &str); 4] = [
+        ([0.0, 0.0, 0.0], 0.5, "interior"),
+        ([1.0, 0.0, 0.0], 0.5, "face"),
+        ([1.0, 1.0, 0.0], 0.5, "edge"),
+        ([0.5, 0.3, 0.0], 0.5, "offset"),
+    ];
+    for (c, r, label) in comm_cfgs {
+        for (op, sym) in [(BooleanOp::Intersection, "∩"), (BooleanOp::Union, "∪")] {
+            n_checks += 1;
+            let ab = run_pair_timed(op, the_box, move |m| sphere(m, c, r));
+            let ba = run_pair_timed(op, move |m| sphere(m, c, r), the_box);
+            if let (Outcome::Ok(a), Outcome::Ok(b)) = (&ab, &ba) {
+                let denom = a.vol.abs().max(1e-3);
+                if (a.vol - b.vol).abs() / denom > tol {
+                    fails.push(Failure {
+                        label: format!("{label} r={r}"),
+                        op: sym,
+                        kind: "VOLUME",
+                        detail: format!(
+                            "COMMUTATIVITY box{sym}sph={:.4} sph{sym}box={:.4}",
+                            a.vol, b.vol
+                        ),
+                    });
+                }
+            } else {
+                fails.push(Failure {
+                    label: format!("{label} r={r}"),
+                    op: sym,
+                    kind: "ERROR",
+                    detail: "COMMUTATIVITY one order errored/hung".into(),
+                });
+            }
+        }
+    }
+
+    print_catalog(
+        "idempotence + commutativity (mesh-free algebraic laws)",
+        &fails,
+        shapes.len() + comm_cfgs.len(),
+        n_checks,
+    );
+}
