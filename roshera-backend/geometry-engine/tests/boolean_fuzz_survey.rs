@@ -909,3 +909,205 @@ fn boolean_box_rotated_box_fuzz_survey() {
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
+
+// ===========================================================================
+// SPHERE ∘ SPHERE survey — both operands curved. No planar faces at all, so
+// every cut is curve-on-curve (a circle where two spheres meet). Exercises the
+// curved∩curved arrangement that box∘sphere only hits on one operand.
+//
+// Generic two-solid runner (the box surveys hardcode `the_box` as operand A).
+// Tolerance is looser (0.05) than the box surveys: BOTH the grid oracle and the
+// kernel's tessellated volume discretize two curved operands, so a few-percent
+// gap is grid noise, not a kernel bug. Catastrophic failures (wrong solid,
+// dropped lens, open mesh) dwarf that band and still register.
+// ===========================================================================
+
+fn run_pair<A, B>(op: BooleanOp, build_a: A, build_b: B) -> Option<Facts>
+where
+    A: Fn(&mut BRepModel) -> SolidId,
+    B: Fn(&mut BRepModel) -> SolidId,
+{
+    let mut model = BRepModel::new();
+    let a = build_a(&mut model);
+    let b = build_b(&mut model);
+    let res = boolean_operation(&mut model, a, b, op, BooleanOptions::default()).ok()?;
+    let vol = model.calculate_solid_volume(res)?;
+    let rep = brep_integrity(&model, res, 1e-6);
+    Some(Facts {
+        vol,
+        open_edges: rep.edges_used_once.len(),
+        nonmanifold_edges: rep.edges_used_3plus.len(),
+        euler_residual: rep.euler_poincare_genus0_residual(),
+    })
+}
+
+fn run_pair_timed<A, B>(op: BooleanOp, build_a: A, build_b: B) -> Outcome
+where
+    A: Fn(&mut BRepModel) -> SolidId + Send + 'static,
+    B: Fn(&mut BRepModel) -> SolidId + Send + 'static,
+{
+    const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_pair(op, build_a, build_b));
+    });
+    match rx.recv_timeout(OP_TIMEOUT) {
+        Ok(Some(f)) => Outcome::Ok(f),
+        Ok(None) => Outcome::Err,
+        Err(_) => Outcome::Hang,
+    }
+}
+
+fn in_ball(p: [f64; 3], c: [f64; 3], r: f64) -> bool {
+    let (dx, dy, dz) = (p[0] - c[0], p[1] - c[1], p[2] - c[2]);
+    dx * dx + dy * dy + dz * dz <= r * r
+}
+
+fn ss_grid_truth(ca: [f64; 3], ra: f64, cb: [f64; 3], rb: f64) -> GridTruth {
+    let reach = (0..3)
+        .map(|i| (ca[i].abs() + ra).max(cb[i].abs() + rb))
+        .fold(0.1, f64::max)
+        + 0.05;
+    const N: usize = 96;
+    let cell = 2.0 * reach / N as f64;
+    let cv = cell * cell * cell;
+    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
+    for i in 0..N {
+        let x = -reach + (i as f64 + 0.5) * cell;
+        for j in 0..N {
+            let y = -reach + (j as f64 + 0.5) * cell;
+            for k in 0..N {
+                let z = -reach + (k as f64 + 0.5) * cell;
+                let p = [x, y, z];
+                let in_a = in_ball(p, ca, ra);
+                let in_b = in_ball(p, cb, rb);
+                if in_a && in_b {
+                    i_n += 1;
+                }
+                if in_a || in_b {
+                    u_n += 1;
+                }
+                if in_a && !in_b {
+                    d_n += 1;
+                }
+            }
+        }
+    }
+    GridTruth {
+        intersection: i_n as f64 * cv,
+        union: u_n as f64 * cv,
+        difference: d_n as f64 * cv,
+    }
+}
+
+/// (centre_a, r_a, centre_b, r_b, label) — sphere∖sphere is A∖B (order matters).
+fn ss_configs() -> Vec<([f64; 3], f64, [f64; 3], f64, &'static str)> {
+    vec![
+        ([0.0, 0.0, 0.0], 1.0, [0.0, 0.0, 0.0], 0.6, "concentric"),
+        ([0.0, 0.0, 0.0], 1.0, [0.8, 0.0, 0.0], 0.8, "offset-overlap"),
+        ([0.0, 0.0, 0.0], 1.0, [1.0, 0.0, 0.0], 1.0, "equal-lens"),
+        ([0.0, 0.0, 0.0], 1.0, [0.7, 0.7, 0.0], 0.7, "corner-overlap"),
+        (
+            [0.0, 0.0, 0.0],
+            1.2,
+            [0.3, 0.0, 0.0],
+            0.4,
+            "small-inside-big",
+        ),
+        ([0.0, 0.0, 0.0], 0.9, [0.0, 0.0, 1.0], 0.9, "offset-z"),
+        (
+            [0.0, 0.0, 0.0],
+            0.8,
+            [1.55, 0.0, 0.0],
+            0.8,
+            "near-tangent-ext",
+        ),
+        ([0.0, 0.0, 0.0], 0.6, [2.0, 0.0, 0.0], 0.6, "disjoint"),
+        ([0.0, 0.0, 0.0], 1.0, [0.5, 0.5, 0.5], 0.9, "diag-overlap"),
+    ]
+}
+
+#[test]
+#[ignore = "fuzz survey — run with --ignored --nocapture"]
+fn boolean_sphere_sphere_fuzz_survey() {
+    let vol_tol = 0.05;
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let configs = ss_configs();
+    let n_cfg = configs.len();
+    let n_checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let fails: Vec<Failure> = configs
+        .par_iter()
+        .flat_map(|&(ca, ra, cb, rb, label)| {
+            let truth = ss_grid_truth(ca, ra, cb, rb);
+            let mut out: Vec<Failure> = Vec::new();
+            for &(op, sym, pick) in &ops {
+                let t = pick(&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lab = format!("{label} ra={ra} rb={rb}");
+                let build_a = move |m: &mut BRepModel| sphere(m, ca, ra);
+                let build_b = move |m: &mut BRepModel| sphere(m, cb, rb);
+                match run_pair_timed(op, build_a, build_b) {
+                    Outcome::Hang => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "HANG",
+                        detail: format!("op did not return within budget (truth {t:.3})"),
+                    }),
+                    Outcome::Err => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "ERROR",
+                        detail: format!("op errored (truth {t:.3})"),
+                    }),
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "VOLUME",
+                                detail: format!(
+                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                    f.vol,
+                                    100.0 * (f.vol - t) / t
+                                ),
+                            });
+                        }
+                        if f.open_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "WATERTIGHT",
+                                detail: format!("open_edges={}", f.open_edges),
+                            });
+                        }
+                        if f.nonmanifold_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "MANIFOLD",
+                                detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    print_catalog(
+        "sphere ∘ sphere",
+        &fails,
+        n_cfg,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
