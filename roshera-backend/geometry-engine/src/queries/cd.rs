@@ -30,6 +30,7 @@ use crate::primitives::face::FaceId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::primitives::vertex::VertexId;
+use crate::queries::lmd::face_lmds;
 
 /// Outward unit normal of `face_id` at the 3D point `p` lying on (or nearest to)
 /// it.
@@ -228,6 +229,429 @@ fn face_edge_ids(model: &BRepModel, face_id: FaceId) -> Vec<EdgeId> {
         }
     }
     out
+}
+
+// ===========================================================================
+// Contact-manifold extraction — the narrow-phase output a physics engine reads.
+//
+// The LMD layer ([`crate::queries::lmd`]) and the feature culling above answer
+// "what is the closest approach between two boundary features." A rigid-body
+// solver (parry/rapier, #41/#42) needs more than a scalar: for every active
+// contact it needs the *point on each solid*, the *unit contact normal*, and a
+// *signed* gap (negative = interpenetrating, magnitude = penetration depth).
+// That is exactly parry's `Contact { point1, point2, normal1, dist }`, so this
+// module is the seam the roshera-parry `QueryDispatcher` will hand to parry.
+//
+// Candidate generation reuses the *same* face-LMD + edge-edge enumeration the
+// CD ablation oracle validates against brute force, so the reported minimum is
+// the true minimum. The only additions are (a) keeping the contact *points and
+// normals*, not just the distance, and (b) a signed-distance / penetration-depth
+// pass driven by the convex interior-overlap test, so penetration is reported as
+// a negative gap along a real separation axis rather than a positive nearest-
+// feature distance. Read-only throughout.
+// ===========================================================================
+
+/// A single contact between two solids: the witness point on each solid's
+/// boundary, the unit contact normal, and the SIGNED gap.
+///
+/// `normal` is the unit separation direction measured *on solid A*: it points
+/// out of A toward B — the direction B must travel to break contact. This is
+/// parry's `Contact::normal1`; the normal on B is simply `-normal`. `distance`
+/// is positive when the solids are apart (the witnesses are `distance` apart),
+/// zero at grazing contact, and **negative when the solids interpenetrate**, its
+/// magnitude being the penetration depth along `normal`.
+#[derive(Debug, Clone, Copy)]
+pub struct Contact {
+    pub point_a: Point3,
+    pub point_b: Point3,
+    pub normal: Vector3,
+    pub distance: f64,
+}
+
+/// A contact manifold between two solids: every contact within the `prediction`
+/// margin, most-penetrating / nearest first, plus whether the interiors overlap.
+/// A solver consumes `points` as the contact set and `penetrating` as the sign
+/// of the principal gap.
+#[derive(Debug, Clone)]
+pub struct ContactManifold {
+    pub points: Vec<Contact>,
+    pub penetrating: bool,
+}
+
+#[inline]
+fn proj(p: Point3, d: &Vector3) -> f64 {
+    p.x * d.x + p.y * d.y + p.z * d.z
+}
+
+#[inline]
+fn unit(v: Vector3) -> Option<Vector3> {
+    let m = v.magnitude();
+    if m > 1e-12 {
+        Some(v * (1.0 / m))
+    } else {
+        None
+    }
+}
+
+/// Sample an edge's carrier curve into `n` segments over its parameter sub-range
+/// (line edges land their two true endpoints; curved edges are densified).
+fn sample_edge_pts(model: &BRepModel, edge_id: EdgeId, n: usize) -> Vec<Point3> {
+    let mut pts = Vec::new();
+    let Some(edge) = model.edges.get(edge_id) else {
+        return pts;
+    };
+    let Some(curve) = model.curves.get(edge.curve_id) else {
+        return pts;
+    };
+    let (s, e) = (edge.param_range.start, edge.param_range.end);
+    for k in 0..=n {
+        let t = s + (e - s) * (k as f64) / (n as f64);
+        if let Ok(p) = curve.point_at(t) {
+            pts.push(p);
+        }
+    }
+    pts
+}
+
+/// Closest points between two 3D segments (Ericson, *Real-Time Collision
+/// Detection* §5.1.9): returns `(distance, witness on [p1,q1], witness on
+/// [p2,q2])`. Exact for straight edges; the polyline approximation for curved
+/// edges is within contact tolerance at the sample density used.
+fn seg_seg_closest(p1: Point3, q1: Point3, p2: Point3, q2: Point3) -> (f64, Point3, Point3) {
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let a = d1.dot(&d1);
+    let e = d2.dot(&d2);
+    let f = d2.dot(&r);
+    let eps = 1e-18;
+    let (s, t);
+    if a <= eps && e <= eps {
+        return (r.magnitude(), p1, p2);
+    }
+    if a <= eps {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.dot(&r);
+        if e <= eps {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = d1.dot(&d2);
+            let denom = a * e - b * b;
+            let s0 = if denom.abs() > eps {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let t0 = (b * s0 + f) / e;
+            if t0 < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t0 > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            } else {
+                t = t0;
+                s = s0;
+            }
+        }
+    }
+    let c1 = p1 + d1 * s;
+    let c2 = p2 + d2 * t;
+    ((c1 - c2).magnitude(), c1, c2)
+}
+
+/// Nearest approach between two B-Rep edges with witness points, or `None` if an
+/// edge degenerates below two samples.
+fn edge_pair_contact(model: &BRepModel, ea: EdgeId, eb: EdgeId) -> Option<(f64, Point3, Point3)> {
+    const N: usize = 4;
+    let pa = sample_edge_pts(model, ea, N);
+    let pb = sample_edge_pts(model, eb, N);
+    if pa.len() < 2 || pb.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(f64, Point3, Point3)> = None;
+    for i in 0..pa.len() - 1 {
+        for j in 0..pb.len() - 1 {
+            let (d, c1, c2) = seg_seg_closest(pa[i], pa[i + 1], pb[j], pb[j + 1]);
+            if best.map_or(true, |(bd, _, _)| d < bd) {
+                best = Some((d, c1, c2));
+            }
+        }
+    }
+    best
+}
+
+/// Support value of a CONVEX solid along `dir`: `max over the boundary of p·dir`.
+/// Analytic for the canonical curved faces (sphere centre + radius; cylinder rim
+/// circles) and the boundary-edge sample cloud otherwise — together exact for
+/// boxes (line edges hit the true vertices) and the canonical curved primitives,
+/// a tight bound for cones (base-rim circle sampled). Used only to size a
+/// penetration depth along a known axis.
+fn support_max(model: &BRepModel, solid: SolidId, dir: &Vector3) -> f64 {
+    use crate::primitives::surface::{Cylinder, Sphere};
+    let mut m = f64::NEG_INFINITY;
+    for fid in solid_face_ids(model, solid) {
+        if let Some(face) = model.faces.get(fid) {
+            if let Some(surf) = model.surfaces.get(face.surface_id) {
+                if let Some(s) = surf.as_any().downcast_ref::<Sphere>() {
+                    m = m.max(proj(s.center, dir) + s.radius);
+                } else if let Some(c) = surf.as_any().downcast_ref::<Cylinder>() {
+                    if let Some([h0, h1]) = c.height_limits {
+                        let along = dir.dot(&c.axis);
+                        let perp = (1.0 - along * along).max(0.0).sqrt();
+                        for h in [h0, h1] {
+                            let end = c.origin + c.axis * h;
+                            m = m.max(proj(end, dir) + c.radius * perp);
+                        }
+                    }
+                }
+            }
+        }
+        for eid in face_edge_ids(model, fid) {
+            for p in sample_edge_pts(model, eid, 4) {
+                m = m.max(proj(p, dir));
+            }
+        }
+    }
+    m
+}
+
+/// `min over the boundary of p·dir` = `-support_max(-dir)`.
+fn support_min(model: &BRepModel, solid: SolidId, dir: &Vector3) -> f64 {
+    -support_max(model, solid, &(*dir * -1.0))
+}
+
+/// A point guaranteed inside a CONVEX solid: the analytic centre of a canonical
+/// curved face (sphere centre / cylinder axis-midpoint) — robust where a curved
+/// solid carries no usable boundary vertex — else the boundary-vertex average
+/// (their hull ⊆ the solid).
+fn interior_point(model: &BRepModel, solid: SolidId) -> Option<Point3> {
+    use crate::primitives::surface::{Cylinder, Sphere};
+    use std::collections::HashSet;
+
+    for fid in solid_face_ids(model, solid) {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(surf) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if let Some(s) = surf.as_any().downcast_ref::<Sphere>() {
+            return Some(s.center);
+        }
+        if let Some(c) = surf.as_any().downcast_ref::<Cylinder>() {
+            if let Some([h0, h1]) = c.height_limits {
+                return Some(c.origin + c.axis * (0.5 * (h0 + h1)));
+            }
+        }
+    }
+
+    let mut seen: HashSet<u32> = HashSet::new();
+    let (mut sx, mut sy, mut sz, mut n) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    for fid in solid_face_ids(model, solid) {
+        for eid in face_edge_ids(model, fid) {
+            if let Some(e) = model.edges.get(eid) {
+                for vid in [e.start_vertex, e.end_vertex] {
+                    if seen.insert(vid) {
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            sx += p[0];
+                            sy += p[1];
+                            sz += p[2];
+                            n += 1.0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if n == 0.0 {
+        return None;
+    }
+    Some(Point3::new(sx / n, sy / n, sz / n))
+}
+
+/// Convex point-in-solid: inside iff on the inner side of every bounding face
+/// (signed distance along the OUTWARD-oriented surface normal ≤ tol). The normal
+/// is oriented away from `interior`, so this is independent of stored face
+/// orientation and robust for curved convex solids where a winding-number shell
+/// test under-resolves a seam-bounded face's solid angle.
+fn point_in_convex_solid(model: &BRepModel, solid: SolidId, interior: &Point3, p: &Point3) -> bool {
+    let tol = crate::math::Tolerance::default();
+    let tol_d = tol.distance();
+    let mut tested = false;
+    for fid in solid_face_ids(model, solid) {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(surf) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        let Ok((u, v)) = surf.closest_point(p, tol) else {
+            continue;
+        };
+        let Ok(eval) = surf.evaluate_full(u, v) else {
+            continue;
+        };
+        let sp = eval.position;
+        let outward = if eval.normal.dot(&(sp - *interior)) < 0.0 {
+            eval.normal * -1.0
+        } else {
+            eval.normal
+        };
+        tested = true;
+        if (*p - sp).dot(&outward) > tol_d {
+            return false;
+        }
+    }
+    tested
+}
+
+/// Do the two solids' interiors overlap? Sample the segment between an interior
+/// point of each (threading any convex overlap lens) and report true if a sample
+/// lies inside both closed shells.
+fn interiors_overlap(model: &BRepModel, a: SolidId, b: SolidId, ia: &Point3, ib: &Point3) -> bool {
+    for k in 0..=4 {
+        let t = k as f64 / 4.0;
+        let p = Point3::new(
+            ia.x + (ib.x - ia.x) * t,
+            ia.y + (ib.y - ia.y) * t,
+            ia.z + (ib.z - ia.z) * t,
+        );
+        if point_in_convex_solid(model, a, ia, &p) && point_in_convex_solid(model, b, ib, &p) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The full contact manifold between two solids within `prediction`.
+///
+/// Enumerates every face-pair LMD and edge-edge nearest approach (the candidate
+/// set the CD ablation oracle proves complete), keeps the witnesses and normals,
+/// dedups near-coincident contacts, and orders them nearest-first. When the
+/// interiors overlap, the manifold reports a single shared separation axis
+/// (interior-to-interior) with a **negative** signed distance equal to the
+/// directional penetration depth (`support_max(A) − support_min(B)` along that
+/// axis) — the sign and depth a position-based solver needs. When the solids are
+/// apart, each contact carries its own A→B normal and its positive gap, and any
+/// candidate beyond `prediction` is dropped.
+pub fn solid_contact_manifold(
+    model: &BRepModel,
+    a: SolidId,
+    b: SolidId,
+    prediction: f64,
+) -> ContactManifold {
+    let faces_a = solid_face_ids(model, a);
+    let faces_b = solid_face_ids(model, b);
+
+    // Candidate witnesses: (distance, point on A, point on B).
+    let mut cands: Vec<(f64, Point3, Point3)> = Vec::new();
+    for &fa in &faces_a {
+        let ea_ids = face_edge_ids(model, fa);
+        for &fb in &faces_b {
+            for lmd in face_lmds(model, fa, fb) {
+                cands.push((lmd.distance, lmd.point_a, lmd.point_b));
+            }
+            for &ea in &ea_ids {
+                for &eb in &face_edge_ids(model, fb) {
+                    if let Some((d, pa, pb)) = edge_pair_contact(model, ea, eb) {
+                        cands.push((d, pa, pb));
+                    }
+                }
+            }
+        }
+    }
+    cands.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let ia = interior_point(model, a);
+    let ib = interior_point(model, b);
+    let penetrating = match (ia, ib) {
+        (Some(pa), Some(pb)) => interiors_overlap(model, a, b, &pa, &pb),
+        _ => false,
+    };
+
+    // Penetration axis + depth (only meaningful when overlapping).
+    let pen_axis = match (ia, ib) {
+        (Some(pa), Some(pb)) => unit(pb - pa),
+        _ => None,
+    }
+    .unwrap_or(Vector3::Z);
+    let pen_depth = if penetrating {
+        (support_max(model, a, &pen_axis) - support_min(model, b, &pen_axis)).max(0.0)
+    } else {
+        0.0
+    };
+
+    const MERGE_TOL: f64 = 1e-4;
+    let mut points: Vec<Contact> = Vec::new();
+    for (d, pa, pb) in cands {
+        // When apart, honour the prediction margin. When penetrating, always
+        // admit at least the principal (nearest-feature) contact.
+        if !penetrating && d > prediction {
+            continue;
+        }
+        if penetrating && d > prediction && !points.is_empty() {
+            continue;
+        }
+        if points.iter().any(|c| {
+            (c.point_a - pa).magnitude() < MERGE_TOL && (c.point_b - pb).magnitude() < MERGE_TOL
+        }) {
+            continue;
+        }
+        let (normal, distance) = if penetrating {
+            (pen_axis, -pen_depth)
+        } else {
+            let n = unit(pb - pa)
+                .or_else(|| match (ia, ib) {
+                    (Some(p), Some(q)) => unit(q - p),
+                    _ => None,
+                })
+                .unwrap_or(Vector3::Z);
+            (n, d)
+        };
+        points.push(Contact {
+            point_a: pa,
+            point_b: pb,
+            normal,
+            distance,
+        });
+    }
+
+    ContactManifold {
+        points,
+        penetrating,
+    }
+}
+
+/// The single principal contact between two solids within `prediction`: the
+/// most-penetrating (or nearest) witness pair, normal, and signed gap — the
+/// minimal datum parry's `QueryDispatcher::contact` returns. `None` when the
+/// solids are farther apart than `prediction` and not interpenetrating.
+pub fn solid_contact(
+    model: &BRepModel,
+    a: SolidId,
+    b: SolidId,
+    prediction: f64,
+) -> Option<Contact> {
+    solid_contact_manifold(model, a, b, prediction)
+        .points
+        .into_iter()
+        .next()
+}
+
+/// Boolean intersection test: do the two solids' interiors overlap? This is the
+/// `QueryDispatcher::intersection_test` half of the parry surface (the cheap
+/// yes/no a broad phase confirms before asking for a full contact manifold). It
+/// is the convex interior-overlap probe, so it answers true for genuine volume
+/// overlap (penetration / containment) and false for mere surface grazing.
+pub fn solids_intersect(model: &BRepModel, a: SolidId, b: SolidId) -> bool {
+    match (interior_point(model, a), interior_point(model, b)) {
+        (Some(pa), Some(pb)) => interiors_overlap(model, a, b, &pa, &pb),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
