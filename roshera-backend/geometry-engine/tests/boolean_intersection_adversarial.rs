@@ -374,14 +374,15 @@ fn curved_intersection_matches_independent_oracle() {
     );
 }
 
-/// PINNED KNOWN BUG (#81): cylinder ∩/∪ box is wrong on the curved side-bulge
-/// case. With cylinder radius 1.2 > box half-extent 1, the cylinder pokes past
-/// all four box side faces. The kernel reports V(∪) < V(∩) — impossible — and
-/// loses ~30% of the union, i.e. the four side-bulge regions are dropped or left
-/// unstitched. Same class as the curved-union face-drop bugs (#50/#58), on a
-/// config they didn't cover. Verified against an independent grid oracle whose
-/// own ∩+∪ matches V(box)+V(cyl) to <0.1%, so the fault is the kernel.
-/// Un-ignore when the cylinder-box boolean is fixed.
+/// #81 (FIXED): cylinder ∩/∪ box, curved side-bulge case. Cylinder radius
+/// 1.2 > box half-extent 1 pokes past all four box side faces; here the cylinder
+/// height EXACTLY equals the box height, so the caps are coplanar-coincident with
+/// the box caps (the hardest sub-case). Was: V(∪) < V(∩) (impossible), ~30% of
+/// the union lost. Fixed by (a) the cylinder lateral sector chain-walk + analytic
+/// cap AABB + analytic cylinder point-membership, and (b) the coplanar imprint
+/// clipping the box square against the cap's ANALYTIC circle (not its tessellated
+/// inscribed polygon) so the coincident cap splits into centre + petals. Verified
+/// against an independent grid oracle whose ∩+∪ matches V(box)+V(cyl) to <0.1%.
 #[test]
 fn cylinder_box_boolean_81() {
     let rc = 1.2_f64;

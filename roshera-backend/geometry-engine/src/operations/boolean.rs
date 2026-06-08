@@ -6573,6 +6573,29 @@ fn imprint_merge_coplanar_overlap(
         .collect();
     let partition = polygon_clip::partition_boundaries(&poly_a, &poly_b, tolerance)?;
 
+    // 3b. Analytic circle override for a CAP DISK coplanar partner.
+    //
+    // `partition_boundaries` clips against the TESSELLATED inscribed polygon of
+    // each face (`face_outer_polyline_2d` samples a circle into 16 chords). When
+    // one coplanar face is a cap disk (circular boundary), the other face's edges
+    // are therefore clipped to a polygon strictly INSIDE the true circle, so the
+    // cut segments end at r·cos(π/16) < r — they float free of the disk's
+    // analytic boundary and never T-split it, leaving the cap unpartitioned (the
+    // #81 coincident-cap Union loses its petals). Re-clip the OTHER face's edges
+    // against the analytic circle so the cut ends land exactly on the disk's
+    // boundary. Untouched when neither face is a disk (the all-polygon case the
+    // tessellated clip already handles exactly).
+    let circle_a = face_boundary_circle_2d(model, face_a, &project);
+    let circle_b = face_boundary_circle_2d(model, face_b, &project);
+    let b_inside_a = match circle_a {
+        Some((ca, ra)) => clip_polygon_edges_to_circle(&poly_b, ca, ra),
+        None => partition.b_inside_a.clone(),
+    };
+    let a_inside_b = match circle_b {
+        Some((cb, rb)) => clip_polygon_edges_to_circle(&poly_a, cb, rb),
+        None => partition.a_inside_b.clone(),
+    };
+
     // 4. Lift each 2D segment back to a 3D Line on the shared plane,
     //    register it as a model curve, and tag it for the face it cuts.
     //    Per-face routing: B's boundary inside A cuts FACE A (= cuts_a);
@@ -6580,13 +6603,13 @@ fn imprint_merge_coplanar_overlap(
     let lift = |p: Point2d| -> Point3 { origin + u_dir * p.x + v_dir * p.y };
 
     let mut coplanar_curves_a: Vec<IntersectionCurve> = Vec::new();
-    for (s, e) in &partition.b_inside_a {
+    for (s, e) in &b_inside_a {
         let line = Line::new(lift(*s), lift(*e));
         let curve_id = model.curves.add(Box::new(line));
         coplanar_curves_a.push(IntersectionCurve { curve_id });
     }
     let mut coplanar_curves_b: Vec<IntersectionCurve> = Vec::new();
-    for (s, e) in &partition.a_inside_b {
+    for (s, e) in &a_inside_b {
         let line = Line::new(lift(*s), lift(*e));
         let curve_id = model.curves.add(Box::new(line));
         coplanar_curves_b.push(IntersectionCurve { curve_id });
@@ -6606,6 +6629,95 @@ fn imprint_merge_coplanar_overlap(
         coplanar_curves_a,
         coplanar_curves_b,
     }))
+}
+
+/// If `face`'s outer boundary is a single circle (a cap disk) — or arcs of one
+/// and the same circle — return its centre and radius in the 2D `project`ed
+/// frame. The projection is orthonormal in the face's plane, so the circle's
+/// radius is preserved. `None` when any boundary edge is not a circular arc, or
+/// the arcs belong to different circles (→ not a simple disk; caller keeps the
+/// tessellated clip).
+fn face_boundary_circle_2d(
+    model: &BRepModel,
+    face_id: FaceId,
+    project: &impl Fn(Point3) -> (f64, f64),
+) -> Option<(super::polygon_clip::Point2d, f64)> {
+    use crate::primitives::curve::Circle;
+    let face = model.faces.get(face_id)?;
+    let lp = model.loops.get(face.outer_loop)?;
+    if lp.edges.is_empty() {
+        return None;
+    }
+    let mut center3: Option<Point3> = None;
+    let mut radius = 0.0_f64;
+    for &eid in &lp.edges {
+        let edge = model.edges.get(eid)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let circ = curve.as_any().downcast_ref::<Circle>()?;
+        match center3 {
+            None => {
+                center3 = Some(circ.center());
+                radius = circ.radius();
+            }
+            Some(c) => {
+                if (circ.center() - c).magnitude() > 1.0e-9
+                    || (circ.radius() - radius).abs() > 1.0e-9
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    let (cx, cy) = project(center3?);
+    Some((super::polygon_clip::Point2d::new(cx, cy), radius))
+}
+
+/// Clip each edge of the closed polygon `poly` to the INTERIOR of the analytic
+/// circle (`center`, `radius`), returning the inside sub-segments with endpoints
+/// landing exactly on the circle wherever an edge crosses it. Used to imprint a
+/// coplanar partner's boundary onto a cap disk against the disk's TRUE boundary
+/// (not its tessellated inscribed polygon), so the cut chords reach the disk
+/// edge and can partition it.
+fn clip_polygon_edges_to_circle(
+    poly: &[super::polygon_clip::Point2d],
+    center: super::polygon_clip::Point2d,
+    radius: f64,
+) -> Vec<(super::polygon_clip::Point2d, super::polygon_clip::Point2d)> {
+    use super::polygon_clip::Point2d;
+    let n = poly.len();
+    let r2 = radius * radius;
+    let mut out: Vec<(Point2d, Point2d)> = Vec::new();
+    for i in 0..n {
+        let p0 = poly[i];
+        let p1 = poly[(i + 1) % n];
+        let dx = p1.x - p0.x;
+        let dy = p1.y - p0.y;
+        // Solve |p0 + t·d − center|² = r² for t; the segment is INSIDE the
+        // circle on the interval between the two roots (the quadratic opens
+        // upward and is negative inside).
+        let a = dx * dx + dy * dy;
+        if a < 1.0e-18 {
+            continue;
+        }
+        let fx = p0.x - center.x;
+        let fy = p0.y - center.y;
+        let b = 2.0 * (fx * dx + fy * dy);
+        let c = fx * fx + fy * fy - r2;
+        let disc = b * b - 4.0 * a * c;
+        if disc <= 0.0 {
+            continue; // edge misses (or grazes) the circle → no interior chord
+        }
+        let sq = disc.sqrt();
+        let t_lo = ((-b - sq) / (2.0 * a)).max(0.0);
+        let t_hi = ((-b + sq) / (2.0 * a)).min(1.0);
+        if t_hi - t_lo <= 1.0e-9 {
+            continue; // no meaningful portion of this edge lies inside
+        }
+        let s = Point2d::new(p0.x + t_lo * dx, p0.y + t_lo * dy);
+        let e = Point2d::new(p0.x + t_hi * dx, p0.y + t_hi * dy);
+        out.push((s, e));
+    }
+    out
 }
 
 /// Trim a plane-plane `SurfaceIntersectionCurve` to the overlap of both
