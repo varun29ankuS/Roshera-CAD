@@ -1119,6 +1119,7 @@ fn surface_surface_intersection(
         (Planar, Sphere) | (Sphere, Planar) => {
             plane_sphere_intersection(surface_a, surface_b, tolerance)
         }
+        (Sphere, Sphere) => sphere_sphere_intersection(surface_a, surface_b, tolerance),
         (Planar, Cone) | (Cone, Planar) => plane_cone_intersection(surface_a, surface_b, tolerance),
         _ => {
             use crate::primitives::surface::SurfaceType;
@@ -2420,6 +2421,85 @@ fn plane_sphere_intersection(
     // Create parametric representations
     let params_a = compute_circle_plane_parameters(&circle, plane_point, plane_normal)?;
     let params_b = compute_circle_sphere_parameters(&circle, sphere_impl)?;
+
+    let curve = SurfaceIntersectionCurve {
+        curve: Box::new(circle),
+        on_surface_a: create_parametric_curve(&params_a),
+        on_surface_b: create_parametric_curve(&params_b),
+    };
+
+    Ok(vec![curve])
+}
+
+/// Closed-form sphere–sphere intersection.
+///
+/// Two spheres that properly overlap meet in a circle lying on their radical
+/// plane (perpendicular to the line of centres). Emitting that intersection as
+/// an exact `Circle` primitive — rather than letting the marching solver fit it
+/// as a `NurbsCurve` — is what lets `split_sphere_face_by_circles` recognise and
+/// imprint the cut (its region builder keys on `Circle`); without this, the
+/// marched NURBS fails the `Circle` downcast, the cut is dropped, and the
+/// boolean silently returns a whole operand (the #89 root cause).
+///
+/// Degenerate configurations (concentric, externally separate or tangent,
+/// one-inside-the-other or internally tangent) carry no proper cutting circle
+/// and return empty, mirroring `plane_sphere_intersection`'s tangent handling.
+fn sphere_sphere_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::Sphere;
+
+    let sphere_a = surface_a
+        .as_any()
+        .downcast_ref::<Sphere>()
+        .ok_or_else(|| OperationError::InternalError("Failed to downcast sphere A".to_string()))?;
+    let sphere_b = surface_b
+        .as_any()
+        .downcast_ref::<Sphere>()
+        .ok_or_else(|| OperationError::InternalError("Failed to downcast sphere B".to_string()))?;
+
+    let c0 = sphere_a.center;
+    let r0 = sphere_a.radius;
+    let c1 = sphere_b.center;
+    let r1 = sphere_b.radius;
+
+    let axis_vec = c1 - c0;
+    let d = axis_vec.magnitude();
+    let tol = tolerance.distance();
+
+    // Concentric: no unique radical plane.
+    if d < tol {
+        return Ok(vec![]);
+    }
+    // Externally separate or externally tangent: no proper lens.
+    if d > r0 + r1 - tol {
+        return Ok(vec![]);
+    }
+    // One sphere inside the other, or internally tangent: no proper lens.
+    if d < (r0 - r1).abs() + tol {
+        return Ok(vec![]);
+    }
+
+    let axis = axis_vec * (1.0 / d);
+    // Signed distance from c0, along the centre line, to the radical plane:
+    //   a = (d² + r0² − r1²) / (2d)
+    let a = (d * d + r0 * r0 - r1 * r1) / (2.0 * d);
+    let r_sq = r0 * r0 - a * a;
+    if r_sq <= tol * tol {
+        // Numerically degenerate lens (circle radius → 0): treat as tangent.
+        return Ok(vec![]);
+    }
+    let circle_radius = r_sq.sqrt();
+    let circle_center = c0 + axis * a;
+
+    let circle = Circle::new(circle_center, axis, circle_radius)?;
+
+    // Parametric image of the cut circle on each sphere's UV domain.
+    let params_a = compute_circle_sphere_parameters(&circle, sphere_a)?;
+    let params_b = compute_circle_sphere_parameters(&circle, sphere_b)?;
 
     let curve = SurfaceIntersectionCurve {
         curve: Box::new(circle),
