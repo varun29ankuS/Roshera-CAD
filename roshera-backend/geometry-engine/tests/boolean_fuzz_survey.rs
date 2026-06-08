@@ -2489,3 +2489,268 @@ fn boolean_idempotence_commutativity_survey() {
         n_checks,
     );
 }
+
+// ===========================================================================
+// SEEDED RANDOM FUZZER (#91 Parasolid-grade). The per-pair surveys above use
+// hand-picked configs (~10 each). A production kernel is fuzzed over the
+// CONTINUOUS parameter space with thousands of randomized cases. This drives
+// random ShapeSpec pairs (any primitive x any primitive, random position/size)
+// through the grid oracle. Every case is reproducible: case #N is derived
+// deterministically from BASE_SEED via splitmix64, so a failing case#N
+// regenerates byte-identically — no flaky, non-reproducible fuzz.
+// ===========================================================================
+
+/// splitmix64 — a deterministic, seedable PRNG (no external dep, no nondeterminism).
+struct Rng {
+    state: u64,
+}
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng { state: seed }
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.unit()
+    }
+    fn pick(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+fn rand_center(rng: &mut Rng) -> [f64; 3] {
+    [
+        rng.range(-1.0, 1.0),
+        rng.range(-1.0, 1.0),
+        rng.range(-1.0, 1.0),
+    ]
+}
+fn rand_base(rng: &mut Rng) -> [f64; 3] {
+    // axial shapes: bias the base downward so the body straddles the box.
+    [
+        rng.range(-1.0, 1.0),
+        rng.range(-1.0, 1.0),
+        rng.range(-1.5, 0.3),
+    ]
+}
+
+/// A random primitive with valid (non-degenerate, non-self-intersecting) params.
+fn rand_shape(rng: &mut Rng) -> ShapeSpec {
+    match rng.pick(5) {
+        0 => ShapeSpec::Box,
+        1 => ShapeSpec::Sphere {
+            c: rand_center(rng),
+            r: rng.range(0.3, 1.2),
+        },
+        2 => ShapeSpec::Cyl {
+            base: rand_base(rng),
+            r: rng.range(0.3, 1.0),
+            h: rng.range(0.8, 2.5),
+        },
+        3 => ShapeSpec::Cone {
+            bc: rand_base(rng),
+            rb: rng.range(0.35, 1.0),
+            rt: rng.range(0.0, 0.6),
+            h: rng.range(0.8, 2.5),
+        },
+        // torus: rmin < rmaj guaranteed (no self-intersection).
+        _ => ShapeSpec::Torus {
+            c: rand_center(rng),
+            rmaj: rng.range(0.45, 0.9),
+            rmin: rng.range(0.12, 0.35),
+        },
+    }
+}
+
+fn in_shape(p: [f64; 3], s: ShapeSpec) -> bool {
+    match s {
+        ShapeSpec::Box => {
+            p[0].abs() <= BOX_HALF && p[1].abs() <= BOX_HALF && p[2].abs() <= BOX_HALF
+        }
+        ShapeSpec::Sphere { c, r } => in_ball(p, c, r),
+        ShapeSpec::Cyl { base, r, h } => in_cylinder(p, base, r, h),
+        ShapeSpec::Cone { bc, rb, rt, h } => in_cone(p, bc, rb, rt, h),
+        ShapeSpec::Torus { c, rmaj, rmin } => in_torus(p, c, rmaj, rmin),
+    }
+}
+
+fn shape_aabb(s: ShapeSpec) -> ([f64; 3], [f64; 3]) {
+    match s {
+        ShapeSpec::Box => ([-BOX_HALF; 3], [BOX_HALF; 3]),
+        ShapeSpec::Sphere { c, r } => (
+            [c[0] - r, c[1] - r, c[2] - r],
+            [c[0] + r, c[1] + r, c[2] + r],
+        ),
+        ShapeSpec::Cyl { base, r, h } => (
+            [base[0] - r, base[1] - r, base[2]],
+            [base[0] + r, base[1] + r, base[2] + h],
+        ),
+        ShapeSpec::Cone { bc, rb, rt, h } => {
+            let rr = rb.max(rt);
+            (
+                [bc[0] - rr, bc[1] - rr, bc[2]],
+                [bc[0] + rr, bc[1] + rr, bc[2] + h],
+            )
+        }
+        ShapeSpec::Torus { c, rmaj, rmin } => {
+            let rr = rmaj + rmin;
+            (
+                [c[0] - rr, c[1] - rr, c[2] - rmin],
+                [c[0] + rr, c[1] + rr, c[2] + rmin],
+            )
+        }
+    }
+}
+
+fn shape_name(s: ShapeSpec) -> &'static str {
+    match s {
+        ShapeSpec::Box => "box",
+        ShapeSpec::Sphere { .. } => "sphere",
+        ShapeSpec::Cyl { .. } => "cyl",
+        ShapeSpec::Cone { .. } => "cone",
+        ShapeSpec::Torus { .. } => "torus",
+    }
+}
+
+/// Generic grid oracle for an arbitrary pair (coarser N for fuzzing throughput).
+fn grid_truth_pair(a: ShapeSpec, b: ShapeSpec) -> GridTruth {
+    let (amin, amax) = shape_aabb(a);
+    let (bmin, bmax) = shape_aabb(b);
+    let reach = (0..3)
+        .map(|i| {
+            amin[i]
+                .abs()
+                .max(amax[i].abs())
+                .max(bmin[i].abs())
+                .max(bmax[i].abs())
+        })
+        .fold(0.1, f64::max)
+        + 0.05;
+    const N: usize = 48;
+    let cell = 2.0 * reach / N as f64;
+    let cv = cell * cell * cell;
+    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
+    for i in 0..N {
+        let x = -reach + (i as f64 + 0.5) * cell;
+        for j in 0..N {
+            let y = -reach + (j as f64 + 0.5) * cell;
+            for k in 0..N {
+                let z = -reach + (k as f64 + 0.5) * cell;
+                let p = [x, y, z];
+                let ina = in_shape(p, a);
+                let inb = in_shape(p, b);
+                if ina && inb {
+                    i_n += 1;
+                }
+                if ina || inb {
+                    u_n += 1;
+                }
+                if ina && !inb {
+                    d_n += 1;
+                }
+            }
+        }
+    }
+    GridTruth {
+        intersection: i_n as f64 * cv,
+        union: u_n as f64 * cv,
+        difference: d_n as f64 * cv,
+    }
+}
+
+#[test]
+#[ignore = "fuzz survey — seeded random pairs; run with --ignored --nocapture"]
+fn boolean_random_fuzz_survey() {
+    const N_CASES: usize = 400; // tunable; each case reproducible from BASE_SEED
+    const BASE_SEED: u64 = 0x00C0_FFEE_1234_5678;
+    // coarse N=48 grid + two arbitrary operands -> loose tol; only catastrophes register.
+    let vol_tol = 0.06;
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "I", |g| g.intersection),
+        (BooleanOp::Union, "U", |g| g.union),
+        (BooleanOp::Difference, "D", |g| g.difference),
+    ];
+    let n_checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let fails: Vec<Failure> = (0..N_CASES)
+        .into_par_iter()
+        .flat_map(|case| {
+            let mut rng = Rng::new(BASE_SEED ^ (case as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let a = rand_shape(&mut rng);
+            let b = rand_shape(&mut rng);
+            let truth = grid_truth_pair(a, b);
+            let mut out: Vec<Failure> = Vec::new();
+            for &(op, sym, pick) in &ops {
+                let t = pick(&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lab = format!("case#{case} {}-{}", shape_name(a), shape_name(b));
+                match run_pair_timed(op, move |m| build_shape(m, a), move |m| build_shape(m, b)) {
+                    Outcome::Hang => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "HANG",
+                        detail: "op did not return".into(),
+                    }),
+                    Outcome::Err => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "ERROR",
+                        detail: format!("op errored (truth {t:.3})"),
+                    }),
+                    Outcome::Ok(f) => {
+                        if (f.vol - t).abs() / t.max(1e-3) > vol_tol {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "VOLUME",
+                                detail: format!(
+                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                    f.vol,
+                                    100.0 * (f.vol - t) / t
+                                ),
+                            });
+                        }
+                        if f.open_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "WATERTIGHT",
+                                detail: format!("open_edges={}", f.open_edges),
+                            });
+                        }
+                        if f.nonmanifold_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "MANIFOLD",
+                                detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    println!(
+        "\n[random fuzz] BASE_SEED={BASE_SEED:#018x} — reproduce a failure by rebuilding case#N from this seed"
+    );
+    print_catalog(
+        &format!("random fuzz (seeded, N_CASES={N_CASES})"),
+        &fails,
+        N_CASES,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
