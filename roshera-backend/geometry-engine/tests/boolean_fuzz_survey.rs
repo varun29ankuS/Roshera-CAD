@@ -1660,3 +1660,118 @@ fn box_rbox_conquered_band_gate() {
         }
     }
 }
+
+// ===========================================================================
+// CLEAN-CELL reporter for box∘cylinder (#91 ratchet). box∘cylinder had the
+// fewest HARD failures of the curved surveys (8 of 35), so its conquered region
+// is the largest unlocked one. Prints cells passing all 3 ops cleanly.
+// ===========================================================================
+
+#[test]
+#[ignore = "fuzz survey — prints box∘cylinder cells that pass all 3 ops cleanly"]
+fn survey_box_cyl_clean_cells() {
+    let vol_tol = 0.03;
+    let ops = [
+        BooleanOp::Intersection,
+        BooleanOp::Union,
+        BooleanOp::Difference,
+    ];
+    let picks: [fn(&GridTruth) -> f64; 3] = [|g| g.intersection, |g| g.union, |g| g.difference];
+
+    let clean: Vec<String> = cyl_configs()
+        .par_iter()
+        .filter_map(|&(base, r, h, label)| {
+            let truth = cyl_grid_truth(base, r, h);
+            let mut all_clean = true;
+            let mut any_checked = false;
+            for (oi, &op) in ops.iter().enumerate() {
+                let t = picks[oi](&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                any_checked = true;
+                match run_op_timed(op, move |m| cylinder(m, base, r, h)) {
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol || f.open_edges != 0 || f.nonmanifold_edges != 0 {
+                            all_clean = false;
+                        }
+                    }
+                    _ => all_clean = false,
+                }
+            }
+            if any_checked && all_clean {
+                Some(format!("{label} r={r} h={h}"))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut clean = clean;
+    clean.sort();
+    println!("\n=== #91 box∘cylinder CLEAN cells (pass ∩/∪/∖: vol≤3%, watertight, manifold) ===");
+    println!("clean_cells={}", clean.len());
+    for c in &clean {
+        println!("  OK {c}");
+    }
+    println!("=== end ===\n");
+}
+
+// ===========================================================================
+// RATCHET GATE (#91) — NON-ignored. Locks the box∘cylinder cells that pass all
+// three booleans cleanly, per survey_box_cyl_clean_cells. Cylinder has the
+// fewest curved-survey failures; these four (contained / offset / edge / corner)
+// are its conquered floor. Oracle = 96³ grid truth at 5% + watertight + manifold.
+// ===========================================================================
+
+#[test]
+fn box_cyl_conquered_band_gate() {
+    // (base, r, h) — exactly the cells survey_box_cyl_clean_cells reported clean.
+    let cells: [([f64; 3], f64, f64); 4] = [
+        ([0.0, 0.0, -0.5], 0.3, 1.0), // contained
+        ([0.5, 0.3, -0.5], 0.3, 1.0), // contained-offset
+        ([1.0, 1.0, -0.5], 0.5, 1.0), // radial-edge
+        ([1.0, 1.0, 0.6], 0.5, 1.0),  // corner
+    ];
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let tol = 0.05;
+    for (base, r, h) in cells {
+        let truth = cyl_grid_truth(base, r, h);
+        for &(op, sym, pick) in &ops {
+            let t = pick(&truth);
+            if t < 1e-3 {
+                continue;
+            }
+            let f = match run_op_timed(op, move |m| cylinder(m, base, r, h)) {
+                Outcome::Ok(f) => f,
+                Outcome::Err => panic!("box∘cyl {sym} base={base:?} r={r} h={h}: kernel error"),
+                Outcome::Hang => {
+                    panic!("box∘cyl {sym} base={base:?} r={r} h={h}: did not return in budget")
+                }
+            };
+            let rel = (f.vol - t).abs() / t.max(1e-3);
+            assert!(
+                rel <= tol,
+                "REGRESSION: box∘cyl {sym} base={base:?} r={r} h={h}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+                f.vol,
+                100.0 * (f.vol - t) / t,
+                100.0 * tol
+            );
+            assert_eq!(
+                f.open_edges, 0,
+                "REGRESSION: box∘cyl {sym} base={base:?} r={r} h={h}: {} open edges",
+                f.open_edges
+            );
+            assert_eq!(
+                f.nonmanifold_edges, 0,
+                "REGRESSION: box∘cyl {sym} base={base:?} r={r} h={h}: {} non-manifold edges",
+                f.nonmanifold_edges
+            );
+        }
+    }
+}
