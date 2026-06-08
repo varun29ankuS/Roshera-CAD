@@ -8789,11 +8789,32 @@ fn classify_face_relative_to_solid(
         }
     }
 
-    // Three non-aligned ray directions (no two are coplanar with common edges)
+    // Three GENERIC ray directions for even-odd point-in-solid classification.
+    //
+    // The directions must be *incommensurate with axis-aligned geometry*: every
+    // component is nonzero (so no ray lies in a coordinate plane and grazes an
+    // axis-aligned face) and the three |components| within each ray are pairwise
+    // distinct (so from an on-axis test point the ray never reaches two
+    // coordinate planes at the same parameter t — i.e. never strikes a box
+    // edge/vertex, where the hit point is on the shared boundary of two faces and
+    // `is_point_in_face` double-counts it, flipping the parity). The earlier
+    // triple — (1,1,1), (-1,1,0), (0,-1,√5) — violated both rules: equal
+    // components and zero components made a ray from a pole on the symmetry axis
+    // (e.g. a hemisphere cap centre at (0,0,±h)) hit a box edge exactly, so the
+    // genuinely-inside cap classified Outside (the −z sphere-poke #85 failure).
+    // The three are mutually linearly independent (a non-degenerate basis), so a
+    // feature that grazes one ray cannot graze all three. Values are arbitrary
+    // generic constants, not derived from the operands.
     let rays = [
-        Vector3::new(0.577, 0.577, 0.577), // (1,1,1) normalized
-        Vector3::new(-0.707, 0.707, 0.0),  // (-1,1,0) normalized
-        Vector3::new(0.0, -0.408, 0.913),  // (0,-1,√5) normalized
+        Vector3::new(0.183, 0.437, 0.881)
+            .normalize()
+            .unwrap_or(Vector3::Z),
+        Vector3::new(-0.733, 0.211, 0.646)
+            .normalize()
+            .unwrap_or(Vector3::Z),
+        Vector3::new(0.519, -0.829, 0.210)
+            .normalize()
+            .unwrap_or(Vector3::Z),
     ];
 
     let mut inside_votes = 0u32;
