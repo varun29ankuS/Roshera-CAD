@@ -711,3 +711,201 @@ fn boolean_box_cone_fuzz_survey() {
         n_checks.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
+
+// ===========================================================================
+// box ∘ ROTATED-BOX survey — second solid is a unit-ish box rotated by an
+// arbitrary axis/angle. All-planar, but the rotated faces cut the axis-aligned
+// box obliquely: exercises the polygon-clip / split-face path that the curved
+// surveys don't, and is the classic #34/#80 over-inclusion regression surface.
+// ===========================================================================
+
+use geometry_engine::math::Matrix4;
+use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+
+/// A box of half-extent `hb`, rotated `angle` rad about `axis`, then centered
+/// at `center`. Transform applied to vertices is M = T(center)·R(axis,angle),
+/// so a local corner v maps to R·v + center.
+fn rotated_box(
+    model: &mut BRepModel,
+    hb: f64,
+    center: [f64; 3],
+    axis: [f64; 3],
+    angle: f64,
+) -> SolidId {
+    let id = match TopologyBuilder::new(model)
+        .create_box_3d(2.0 * hb, 2.0 * hb, 2.0 * hb)
+        .expect("rbox")
+    {
+        GeometryId::Solid(id) => id,
+        o => panic!("rbox: {o:?}"),
+    };
+    let r = Matrix4::from_axis_angle(&Vector3::new(axis[0], axis[1], axis[2]), angle)
+        .expect("axis-angle");
+    let m = Matrix4::translation(center[0], center[1], center[2]) * r;
+    transform_solid(model, id, m, TransformOptions::default()).expect("transform rbox");
+    id
+}
+
+/// Inside the rotated box iff the inverse-rotated, de-centered point lies in the
+/// axis-aligned box [-hb,hb]³. `r` is the SAME rotation used by `rotated_box`;
+/// R is orthonormal so R⁻¹ = Rᵀ, and `transform_vector` drops translation.
+fn in_rotated_box(p: [f64; 3], hb: f64, center: [f64; 3], r: &Matrix4) -> bool {
+    let local = r.transpose().transform_vector(&Vector3::new(
+        p[0] - center[0],
+        p[1] - center[1],
+        p[2] - center[2],
+    ));
+    local.x.abs() <= hb && local.y.abs() <= hb && local.z.abs() <= hb
+}
+
+fn rbox_grid_truth(hb: f64, center: [f64; 3], axis: [f64; 3], angle: f64) -> GridTruth {
+    let r = Matrix4::from_axis_angle(&Vector3::new(axis[0], axis[1], axis[2]), angle)
+        .expect("axis-angle");
+    let diag = hb * 3.0_f64.sqrt();
+    let reach = (0..3)
+        .map(|i| center[i].abs() + diag)
+        .fold(BOX_HALF, f64::max)
+        + 0.05;
+    const N: usize = 96;
+    let cell = 2.0 * reach / N as f64;
+    let cv = cell * cell * cell;
+    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
+    for i in 0..N {
+        let x = -reach + (i as f64 + 0.5) * cell;
+        let in_bx = x.abs() <= BOX_HALF;
+        for j in 0..N {
+            let y = -reach + (j as f64 + 0.5) * cell;
+            let in_by = in_bx && y.abs() <= BOX_HALF;
+            for k in 0..N {
+                let z = -reach + (k as f64 + 0.5) * cell;
+                let in_box = in_by && z.abs() <= BOX_HALF;
+                let in_rb = in_rotated_box([x, y, z], hb, center, &r);
+                if in_box && in_rb {
+                    i_n += 1;
+                }
+                if in_box || in_rb {
+                    u_n += 1;
+                }
+                if in_box && !in_rb {
+                    d_n += 1;
+                }
+            }
+        }
+    }
+    GridTruth {
+        intersection: i_n as f64 * cv,
+        union: u_n as f64 * cv,
+        difference: d_n as f64 * cv,
+    }
+}
+
+/// (half-extent, center, axis, angle_deg, label) — rotated boxes vs box [-1,1]³.
+fn rbox_configs() -> Vec<(f64, [f64; 3], [f64; 3], f64, &'static str)> {
+    vec![
+        (
+            0.7,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            45.0,
+            "diag-45-centered",
+        ),
+        (
+            0.4,
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            20.0,
+            "contained-tilt",
+        ),
+        (0.9, [0.5, 0.0, 0.0], [0.0, 0.0, 1.0], 30.0, "z-rot-offset"),
+        (0.6, [0.8, 0.8, 0.8], [1.0, 1.0, 0.0], 30.0, "corner-rot"),
+        (0.7, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 40.0, "edge-straddle"),
+        (1.0, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 45.0, "big-diag"),
+        (0.5, [0.6, 0.6, 0.0], [0.0, 0.0, 1.0], 45.0, "spin-off"),
+        (0.5, [0.0, 0.0, 0.0], [1.0, 2.0, 0.0], 35.0, "tilt-through"),
+        (0.8, [0.3, 0.3, 0.3], [1.0, 1.0, 1.0], 60.0, "diag-60-off"),
+    ]
+}
+
+#[test]
+#[ignore = "fuzz survey — run with --ignored --nocapture"]
+fn boolean_box_rotated_box_fuzz_survey() {
+    let vol_tol = 0.03;
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let configs = rbox_configs();
+    let n_cfg = configs.len();
+    let n_checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let fails: Vec<Failure> = configs
+        .par_iter()
+        .flat_map(|&(hb, center, axis, angle_deg, label)| {
+            let angle = angle_deg.to_radians();
+            let truth = rbox_grid_truth(hb, center, axis, angle);
+            let mut out: Vec<Failure> = Vec::new();
+            for &(op, sym, pick) in &ops {
+                let t = pick(&truth);
+                if t < 1e-3 {
+                    continue;
+                }
+                n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let lab = format!("{label} hb={hb} {angle_deg}°");
+                match run_op_timed(op, move |m| rotated_box(m, hb, center, axis, angle)) {
+                    Outcome::Hang => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "HANG",
+                        detail: format!("op did not return within budget (truth {t:.3})"),
+                    }),
+                    Outcome::Err => out.push(Failure {
+                        label: lab,
+                        op: sym,
+                        kind: "ERROR",
+                        detail: format!("op errored (truth {t:.3})"),
+                    }),
+                    Outcome::Ok(f) => {
+                        let rel = (f.vol - t).abs() / t.max(1e-3);
+                        if rel > vol_tol {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "VOLUME",
+                                detail: format!(
+                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                    f.vol,
+                                    100.0 * (f.vol - t) / t
+                                ),
+                            });
+                        }
+                        if f.open_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "WATERTIGHT",
+                                detail: format!("open_edges={}", f.open_edges),
+                            });
+                        }
+                        if f.nonmanifold_edges != 0 {
+                            out.push(Failure {
+                                label: lab.clone(),
+                                op: sym,
+                                kind: "MANIFOLD",
+                                detail: format!("nonmanifold_edges={}", f.nonmanifold_edges),
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+
+    print_catalog(
+        "box ∘ rotated-box",
+        &fails,
+        n_cfg,
+        n_checks.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
