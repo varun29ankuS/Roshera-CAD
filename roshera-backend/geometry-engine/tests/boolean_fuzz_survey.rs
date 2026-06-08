@@ -2963,15 +2963,15 @@ fn sphere_sphere_lens_gate() {
         let d =
             ((cb[0] - ca[0]).powi(2) + (cb[1] - ca[1]).powi(2) + (cb[2] - ca[2]).powi(2)).sqrt();
         let truth = lens_vol(ra, rb, d);
-        let f = match run_pair_timed(
+        // Serial run_pair (not run_pair_timed): these clean proper-overlap lenses
+        // never hang, and the 4s thread budget of run_pair_timed produced false
+        // "did not return" failures when this gate ran under full-suite CPU load.
+        let f = run_pair(
             BooleanOp::Intersection,
             move |m| sphere(m, ca, ra),
             move |m| sphere(m, cb, rb),
-        ) {
-            Outcome::Ok(f) => f,
-            Outcome::Err => panic!("sphere∩sphere a={ca:?}/{ra} b={cb:?}/{rb}: kernel error"),
-            Outcome::Hang => panic!("sphere∩sphere a={ca:?}/{ra} b={cb:?}/{rb}: did not return"),
-        };
+        )
+        .unwrap_or_else(|| panic!("sphere∩sphere a={ca:?}/{ra} b={cb:?}/{rb}: no result solid"));
         let rel = (f.vol - truth).abs() / truth;
         assert!(
             rel <= 0.02,
@@ -2998,6 +2998,29 @@ fn sphere_sphere_lens_gate() {
             f.nonmanifold_edges, 0,
             "lens non-manifold: {} edges",
             f.nonmanifold_edges
+        );
+    }
+}
+
+#[test]
+#[ignore = "diagnostic — box-sphere single-face poke (box DIFF sphere = 8.26, should be 7.74)"]
+fn diag_box_sphere_face_poke() {
+    // sphere(center=[1,0,0], r=0.5) pokes the +x box face. The inside cap (sphere
+    // surface inside the box) has volume = half of (4/3)pi(0.5)^3 = pi/12 = 0.2618.
+    //   box INT   sphere = inside hemisphere ~ 0.2618
+    //   box UNION sphere = 8 + outside hemisphere ~ 8.2618
+    //   box DIFF  sphere = 8 - inside hemisphere ~ 7.7382   (kernel gives 8.2618 = UNION, WRONG)
+    let c = [1.0, 0.0, 0.0];
+    let r = 0.5;
+    for (op, name) in [
+        (BooleanOp::Intersection, "INT   (~0.262)"),
+        (BooleanOp::Union, "UNION (~8.262)"),
+        (BooleanOp::Difference, "DIFF  (~7.738)"),
+    ] {
+        let v = run_op(op, |m| sphere(m, c, r));
+        println!(
+            "box {name}: vol = {:?}",
+            v.map(|f| (f.vol, f.open_edges, f.nonmanifold_edges))
         );
     }
 }
