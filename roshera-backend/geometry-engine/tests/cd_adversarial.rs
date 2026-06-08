@@ -568,3 +568,194 @@ fn broad_phase_contacts_are_not_lost() {
         failures.join("\n  ")
     );
 }
+
+// ===========================================================================
+// Tougher battery — containment, corner approaches, monotonicity, rotated OBBs,
+// cones, and a wider primitive matrix. The goal is to capture as many CD bugs
+// as possible.
+// ===========================================================================
+
+fn box_size(model: &mut BRepModel, side: f64) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_box_3d(side, side, side)
+        .expect("box")
+    {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected solid, got {other:?}"),
+    }
+}
+
+fn box_rot_z_at(model: &mut BRepModel, angle: f64, c: [f64; 3]) -> SolidId {
+    let id = unit_box(model);
+    let t = Matrix4::from_translation(&Vector3::new(c[0], c[1], c[2])) * Matrix4::rotation_z(angle);
+    transform_solid(model, id, t, TransformOptions::default()).expect("rot+translate");
+    id
+}
+
+fn cone_at(model: &mut BRepModel, base: [f64; 3], base_r: f64, top_r: f64, h: f64) -> SolidId {
+    match TopologyBuilder::new(model)
+        .create_cone_3d(
+            Point3::new(base[0], base[1], base[2]),
+            Vector3::Z,
+            base_r,
+            top_r,
+            h,
+        )
+        .expect("cone")
+    {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected solid, got {other:?}"),
+    }
+}
+
+#[test]
+fn cd_containment_is_contact() {
+    // One solid fully inside another → interiors overlap → distance 0 (contact).
+    let cases: Vec<(&str, Build)> = vec![
+        (
+            "small sphere inside unit box",
+            Box::new(|m| (unit_box(m), sphere_at(m, [0.0, 0.0, 0.0], 0.5))),
+        ),
+        (
+            "unit box inside big box",
+            Box::new(|m| (box_size(m, 4.0), unit_box(m))),
+        ),
+        (
+            "small cylinder inside box",
+            Box::new(|m| (unit_box(m), z_cylinder_at(m, [0.0, 0.0, -0.4], 0.3, 0.8))),
+        ),
+        (
+            "sphere inside sphere",
+            Box::new(|m| {
+                (
+                    sphere_at(m, [0.0, 0.0, 0.0], 1.5),
+                    sphere_at(m, [0.2, 0.0, 0.0], 0.4),
+                )
+            }),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, build) in cases {
+        let (model, a, b) = pair(&build);
+        let d = cd_dist(&model, a, b);
+        if d > TAU {
+            failures.push(format!(
+                "{label}: contained solid reports d={d:.5} (should be 0)"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "CD does not report containment as contact:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+#[test]
+fn cd_distance_monotone_in_separation() {
+    // Slide a unit box away from another along +x; the distance must be the exact
+    // face gap (t-2) and strictly increase. Catches a distance that plateaus,
+    // jumps, or regresses.
+    let mut prev = -1.0_f64;
+    let mut failures = Vec::new();
+    for step in 0..=12 {
+        let t = 2.0 + step as f64 * 0.5; // 2.0 .. 8.0
+        let mut model = BRepModel::new();
+        let a = unit_box(&mut model);
+        let b = box_at(&mut model, [t, 0.0, 0.0]);
+        let d = cd_dist(&model, a, b);
+        let truth = (t - 2.0).max(0.0);
+        if !rel_or_abs_close(d, truth) {
+            failures.push(format!("t={t}: d={d:.5} vs truth {truth:.5}"));
+        }
+        if d + 1e-9 < prev {
+            failures.push(format!("t={t}: distance regressed {prev:.5} -> {d:.5}"));
+        }
+        prev = d;
+    }
+    assert!(
+        failures.is_empty(),
+        "box separation distance not monotone/exact:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// A wider primitive matrix exercised for the pose-invariant guarantees
+/// (symmetry, determinism, ablation agreement) — rotated boxes, cones,
+/// cylinder-cylinder, sphere-cylinder, and nested pairs. No analytic value
+/// oracle (OBB/cone min-distance is awkward closed-form); these catch crashes,
+/// asymmetry, non-determinism, and broad-phase disagreement on the harder
+/// shapes.
+fn tough_pairs() -> Vec<(&'static str, Build)> {
+    let r35 = 35.0_f64 * std::f64::consts::PI / 180.0;
+    vec![
+        (
+            "rot box vs box separated",
+            Box::new(move |m| (unit_box(m), box_rot_z_at(m, r35, [3.0, 0.5, 0.0]))),
+        ),
+        (
+            "rot box vs box edge",
+            Box::new(move |m| (unit_box(m), box_rot_z_at(m, r35, [2.2, 0.0, 0.0]))),
+        ),
+        (
+            "cone vs box separated",
+            Box::new(|m| (unit_box(m), cone_at(m, [3.5, 0.0, -0.5], 0.6, 0.0, 1.0))),
+        ),
+        (
+            "cone vs box touching",
+            Box::new(|m| (unit_box(m), cone_at(m, [1.0, 0.0, -0.5], 0.6, 0.0, 1.0))),
+        ),
+        (
+            "cyl vs cyl side-by-side",
+            Box::new(|m| {
+                (
+                    z_cylinder_at(m, [0.0, 0.0, -0.5], 0.5, 1.0),
+                    z_cylinder_at(m, [2.0, 0.0, -0.5], 0.5, 1.0),
+                )
+            }),
+        ),
+        (
+            "sphere vs cylinder separated",
+            Box::new(|m| {
+                (
+                    sphere_at(m, [0.0, 0.0, 0.0], 1.0),
+                    z_cylinder_at(m, [3.0, 0.0, -0.5], 0.5, 1.0),
+                )
+            }),
+        ),
+        (
+            "nested sphere in box",
+            Box::new(|m| (unit_box(m), sphere_at(m, [0.0, 0.0, 0.0], 0.5))),
+        ),
+    ]
+}
+
+#[test]
+fn cd_tough_pairs_are_symmetric_and_deterministic() {
+    let mut failures = Vec::new();
+    for (label, build) in tough_pairs() {
+        let (model, a, b) = pair(&build);
+        // symmetry
+        let dab = cd_dist(&model, a, b);
+        let dba = cd_dist(&model, b, a);
+        if (dab - dba).abs() > VAL_TOL {
+            failures.push(format!(
+                "{label}: asymmetric d(a,b)={dab:.5} d(b,a)={dba:.5}"
+            ));
+        }
+        // determinism
+        let runs: Vec<f64> = (0..6).map(|_| cd_dist(&model, a, b)).collect();
+        if runs.iter().any(|&v| (v - runs[0]).abs() > 1e-9) {
+            failures.push(format!("{label}: non-deterministic {runs:?}"));
+        }
+        // sanity: finite and non-negative
+        if !(dab.is_finite() && dab >= -1e-9) {
+            failures.push(format!("{label}: d={dab} not finite/non-negative"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "tough-pair CD invariant failures:\n  {}",
+        failures.join("\n  ")
+    );
+}
