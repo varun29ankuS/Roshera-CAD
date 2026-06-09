@@ -3340,3 +3340,58 @@ fn box_minus_sphere_face_poke_gate() {
         );
     }
 }
+
+// ===========================================================================
+// SPHERE-CORNER ∪ DIAGNOSTIC — next-worst cap-side target after BOOL-90-FIX.
+// Sphere centred EXACTLY on the +++ box corner vertex (1,1,1), r=0.8: by
+// symmetry exactly 1/8 of the sphere sits inside the box, so
+//   box ∪ sphere = 8 + 7/8·(4/3·π·0.8³) ≈ 9.877
+//   box ∩ sphere =       1/8·(4/3·π·0.8³) ≈ 0.268
+//   box ∖ sphere = 8   − 1/8·(...)        ≈ 7.732
+// The membership oracle flags this ∪ cell at 7.6% point-mismatch — right-ish
+// volume, WRONG geometry (the sphere pokes 3 faces at once → a 3-cut corner
+// cap arrangement; a wrong-hemisphere / dropped-petal cap mis-meshes). Run
+// with `--ignored --nocapture` to read volume + watertight + membership.
+// ===========================================================================
+#[test]
+#[ignore = "diagnostic — sphere-corner ∪ membership 7.6% (run with --ignored --nocapture)"]
+fn diag_sphere_corner_union() {
+    let c = [1.0, 1.0, 1.0];
+    let r = 0.8_f64;
+    let cap_in = (4.0 / 3.0 * std::f64::consts::PI * r * r * r) / 8.0; // inside octant
+    let expect = [
+        (BooleanOp::Intersection, "∩", cap_in),
+        (BooleanOp::Union, "∪", 8.0 + 7.0 * cap_in),
+        (BooleanOp::Difference, "∖", 8.0 - cap_in),
+    ];
+    for (op, sym, want) in expect {
+        let facts = run_op(op, |m| sphere(m, c, r));
+        match facts {
+            Some(f) => println!(
+                "sphere-corner {sym}: vol={:.4} (want {:.4}, Δ={:+.4})  open={}  nonmanifold={}  euler_res={}",
+                f.vol,
+                want,
+                f.vol - want,
+                f.open_edges,
+                f.nonmanifold_edges,
+                f.euler_residual
+            ),
+            None => println!("sphere-corner {sym}: kernel ERROR (None)"),
+        }
+    }
+    // Point-membership: independent of volume — catches wrong-hemisphere.
+    let b = ShapeSpec::Sphere { c, r };
+    for (op, sym) in [
+        (BooleanOp::Intersection, "∩"),
+        (BooleanOp::Union, "∪"),
+        (BooleanOp::Difference, "∖"),
+    ] {
+        match membership_check(op, b, 0x5125_E000 ^ sym.len() as u64, 4000, 0.04) {
+            Some((checked, mism)) => println!(
+                "sphere-corner {sym}: membership {mism}/{checked} mismatches ({:.1}%)",
+                100.0 * mism as f64 / checked.max(1) as f64
+            ),
+            None => println!("sphere-corner {sym}: membership None"),
+        }
+    }
+}
