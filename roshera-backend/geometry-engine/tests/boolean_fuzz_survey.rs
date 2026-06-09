@@ -273,45 +273,52 @@ fn boolean_box_sphere_fuzz_survey() {
     }
     let n_cfg = configs.len();
 
+    let v_box = (2.0 * BOX_HALF).powi(3);
     let n_checks = std::sync::atomic::AtomicUsize::new(0);
     let fails: Vec<Failure> = configs
         .par_iter()
         .flat_map(|&(c, label, r)| {
             let truth = grid_truth(c, r);
+            let v_sph = 4.0 / 3.0 * std::f64::consts::PI * r * r * r;
+            let lab = format!("{label} r={r}");
             let mut out: Vec<Failure> = Vec::new();
-            for &(op, sym, pick) in &ops {
+            // Kernel volumes per op (∩, ∪, ∖), in `ops` order — for the
+            // oracle-free cross-op invariants below.
+            let mut kvol: [Option<f64>; 3] = [None; 3];
+            for (idx, &(op, sym, pick)) in ops.iter().enumerate() {
                 let t = pick(&truth);
-                if t < 1e-3 {
-                    continue; // empty/whole result — no boundary to test
-                }
                 n_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let lab = format!("{label} r={r}");
                 match run_op_timed(op, move |m| sphere(m, c, r)) {
                     Outcome::Hang => out.push(Failure {
-                        label: lab,
+                        label: lab.clone(),
                         op: sym,
                         kind: "HANG",
                         detail: format!("op did not return within budget (truth {t:.3})"),
                     }),
                     Outcome::Err => out.push(Failure {
-                        label: lab,
+                        label: lab.clone(),
                         op: sym,
                         kind: "ERROR",
                         detail: format!("op errored (truth {t:.3})"),
                     }),
                     Outcome::Ok(f) => {
-                        let rel = (f.vol - t).abs() / t.max(1e-3);
-                        if rel > vol_tol {
-                            out.push(Failure {
-                                label: lab.clone(),
-                                op: sym,
-                                kind: "VOLUME",
-                                detail: format!(
-                                    "kernel={:.4} truth={t:.4} ({:+.1}%)",
-                                    f.vol,
-                                    100.0 * (f.vol - t) / t
-                                ),
-                            });
+                        kvol[idx] = Some(f.vol);
+                        // Volume-vs-oracle only when the result has a boundary;
+                        // an empty/whole region (t≈0) carries no volume signal.
+                        if t >= 1e-3 {
+                            let rel = (f.vol - t).abs() / t.max(1e-3);
+                            if rel > vol_tol {
+                                out.push(Failure {
+                                    label: lab.clone(),
+                                    op: sym,
+                                    kind: "VOLUME",
+                                    detail: format!(
+                                        "kernel={:.4} truth={t:.4} ({:+.1}%)",
+                                        f.vol,
+                                        100.0 * (f.vol - t) / t
+                                    ),
+                                });
+                            }
                         }
                         if f.open_edges != 0 {
                             out.push(Failure {
@@ -338,6 +345,73 @@ fn boolean_box_sphere_fuzz_survey() {
                             });
                         }
                     }
+                }
+            }
+
+            // ─── ORACLE-FREE INVARIANTS (kernel's own three volumes) ───
+            // These need NO grid: they are exact algebraic facts about ANY
+            // valid Boolean. They catch wrong-volume results the grid oracle's
+            // tolerance might tolerate, and are immune to oracle error.
+            if let [Some(vi), Some(vu), Some(vd)] = kvol {
+                // Inclusion–exclusion: V(A∩B) + V(A∪B) = V(A) + V(B), exactly.
+                // (A = box = 8, B = sphere = 4/3·π·r³, both analytic.) Loosened
+                // to 5% only to absorb the sphere-cap tessellation discretisation
+                // shared by ∩ and ∪; a real petal-drop breaks it by 20–90%.
+                let ie_rhs = v_box + v_sph;
+                let ie_err = (vi + vu - ie_rhs).abs() / ie_rhs;
+                if ie_err > 0.05 {
+                    out.push(Failure {
+                        label: lab.clone(),
+                        op: "∩∪",
+                        kind: "INCL-EXCL",
+                        detail: format!(
+                            "V(∩)+V(∪)={:.4} ≠ V(box)+V(sph)={:.4} ({:+.1}%)",
+                            vi + vu,
+                            ie_rhs,
+                            100.0 * (vi + vu - ie_rhs) / ie_rhs
+                        ),
+                    });
+                }
+                // Difference identity: V(A∖B) = V(A) − V(A∩B) (kernel-only).
+                let did_err = (vd - (v_box - vi)).abs() / v_box;
+                if did_err > 0.03 {
+                    out.push(Failure {
+                        label: lab.clone(),
+                        op: "∖",
+                        kind: "DIFF-ID",
+                        detail: format!("V(∖)={vd:.4} ≠ V(box)−V(∩)={:.4}", v_box - vi),
+                    });
+                }
+                // Hard bounds — inequalities that cannot false-positive from
+                // small discretisation unless a result is grossly wrong.
+                let eps = 0.02 * v_box; // absolute slack
+                let bound_hit = |name: &'static str, detail: String| Failure {
+                    label: lab.clone(),
+                    op: name,
+                    kind: "BOUNDS",
+                    detail,
+                };
+                if vi < -eps || vi > v_box.min(v_sph) + eps {
+                    out.push(bound_hit(
+                        "∩",
+                        format!("V(∩)={vi:.4} ∉ [0, min(box,sph)={:.4}]", v_box.min(v_sph)),
+                    ));
+                }
+                if vu < v_box.max(v_sph) - eps || vu > v_box + v_sph + eps {
+                    out.push(bound_hit(
+                        "∪",
+                        format!(
+                            "V(∪)={vu:.4} ∉ [max(box,sph)={:.4}, box+sph={:.4}]",
+                            v_box.max(v_sph),
+                            v_box + v_sph
+                        ),
+                    ));
+                }
+                if vd < -eps || vd > v_box + eps {
+                    out.push(bound_hit(
+                        "∖",
+                        format!("V(∖)={vd:.4} ∉ [0, box={v_box:.4}]"),
+                    ));
                 }
             }
             out
