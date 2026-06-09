@@ -9148,12 +9148,12 @@ fn classify_point_relative_to_solid(
 /// every sample on the boundary, a tangency leaves the rest of the face strictly
 /// Inside or Outside.
 ///
-/// KNOWN-INCOMPLETE (#90, WIP): the unanimous-vote rule below mis-handles a face
-/// that is PARTIALLY coincident (coincident over part of its area, free over the
-/// rest — common in box∩box overlaps), because boundary samples reach outside the
-/// overlap and out-vote the genuine OnBoundary. Tracked: 10 box∘box overlap lib
-/// tests regress. The follow-up gates the reclassification to provably-ISOLATED
-/// (point/edge) contacts only. Committed deliberately as fix-forward WIP.
+/// Reclassification is gated to ISOLATED contacts — it fires only when NO boundary
+/// sample (beyond the representative point) is itself OnBoundary. A face that is
+/// PARTIALLY coincident (coincident over part of its area, free over the rest —
+/// common in box∩box overlaps) has some boundary samples OnBoundary, so its
+/// OnBoundary verdict stands; only a measure-zero point/edge tangency, where every
+/// other sample is strictly Inside/Outside, is reclassified.
 fn classify_face_relative_to_solid(
     model: &BRepModel,
     face: &SplitFace,
@@ -9172,23 +9172,30 @@ fn classify_face_relative_to_solid(
     if extras.is_empty() {
         return Ok(FaceClassification::OnBoundary);
     }
-    let (mut inside, mut outside) = (0u32, 0u32);
+    let (mut inside, mut outside, mut boundary) = (0u32, 0u32, 0u32);
     for p in extras {
         match classify_point_relative_to_solid(model, p, solid, tolerance) {
             Ok(FaceClassification::Inside) => inside += 1,
             Ok(FaceClassification::Outside) => outside += 1,
-            Ok(FaceClassification::OnBoundary) => {}
+            Ok(FaceClassification::OnBoundary) => boundary += 1,
             Err(_) => {}
         }
     }
-    // A non-intersecting face lies entirely on ONE side of the other solid except
-    // at measure-zero tangent contacts (which read OnBoundary). So:
-    //   - all samples OnBoundary  ⇒ genuine area-coincidence ⇒ keep OnBoundary
-    //     (two boxes sharing a plane — every sample sits on the shared face).
-    //   - off-boundary samples UNANIMOUS Inside / Outside ⇒ that is the face's
-    //     side; the OnBoundary reads were isolated tangent points.
-    //   - mixed Inside AND Outside ⇒ ambiguous (should not happen for a
-    //     non-intersecting face) ⇒ stay conservative on OnBoundary.
+    // Reclassify ONLY when the boundary contact is ISOLATED — i.e. NO sample other
+    // than the representative point lands on the boundary. That is the signature of
+    // a measure-zero point/edge tangency (a sphere inscribed in a box touches each
+    // face only at its centre; every other face point is strictly Inside/Outside).
+    //
+    // If ANY extra sample is also OnBoundary, the contact spans an AREA — a full OR
+    // PARTIAL face coincidence (two boxes overlapping part of a shared plane) — and
+    // the OnBoundary verdict must stand. Sampling outside a partial overlap would
+    // otherwise out-vote the genuine coincidence and corrupt box∩box selection.
+    if boundary > 0 {
+        return Ok(FaceClassification::OnBoundary);
+    }
+    // Isolated contact: the off-boundary samples decide the side. They should be
+    // unanimous for a non-intersecting face; a mixed Inside/Outside vote is
+    // ambiguous (should not happen) and stays conservatively OnBoundary.
     match (inside > 0, outside > 0) {
         (true, false) => Ok(FaceClassification::Inside),
         (false, true) => Ok(FaceClassification::Outside),
