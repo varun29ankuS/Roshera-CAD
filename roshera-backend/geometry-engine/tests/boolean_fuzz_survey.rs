@@ -3918,3 +3918,48 @@ fn diag_sphere_corner_union_open_edges() {
         }
     }
 }
+
+// #90 BOOL-∩-CONTAINMENT diag: the interior-sphere HARD cluster. Surfaces the
+// ACTUAL error string (run_op swallows it to None) + the wrong volume per op for
+// each interior/engulf cell, so the root cause is read from data, not guessed.
+// Box is [-1,1]^3 (vol 8). r=1 → sphere tangent to all 6 faces (contained);
+// r=1.8/2.2 → sphere engulfs the box (corner dist √3≈1.73); r=1.05/1.2 →
+// poke-through. Run with `--ignored --nocapture` (set ROSHERA_BOOL_TRACE=1 for the
+// pipeline stage trace on the cell of interest).
+#[test]
+#[ignore = "diagnostic — interior/containment ∩/∖ errors (run with --ignored --nocapture)"]
+fn diag_sphere_interior_containment() {
+    let cases: [([f64; 3], f64, &str); 5] = [
+        ([0.0, 0.0, 0.0], 1.0, "interior-centre-r1-tangent"),
+        ([0.0, 0.0, 0.0], 1.8, "interior-centre-r1.8-engulf"),
+        ([0.0, 0.0, 0.0], 2.2, "interior-centre-r2.2-engulf"),
+        ([0.5, 0.3, 0.0], 1.05, "interior-offset-r1.05-poke"),
+        ([0.5, 0.3, 0.0], 1.2, "interior-offset-r1.2-poke"),
+    ];
+    let pi = std::f64::consts::PI;
+    for (c, r, name) in cases {
+        let vsphere = 4.0 / 3.0 * pi * r * r * r;
+        println!("\n=== {name}  c={c:?} r={r}  (V_sphere={vsphere:.4}) ===");
+        for (op, sym) in [
+            (BooleanOp::Intersection, "∩"),
+            (BooleanOp::Union, "∪"),
+            (BooleanOp::Difference, "∖"),
+        ] {
+            let mut model = BRepModel::new();
+            let bx = the_box(&mut model);
+            let sp = sphere(&mut model, c, r);
+            match boolean_operation(&mut model, bx, sp, op, BooleanOptions::default()) {
+                Ok(res) => {
+                    let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+                    let rep = brep_integrity(&model, res, 1e-6);
+                    println!(
+                        "  {sym}: OK vol={vol:.4} open={} nonman={}",
+                        rep.edges_used_once.len(),
+                        rep.edges_used_3plus.len()
+                    );
+                }
+                Err(e) => println!("  {sym}: ERR {e:?}"),
+            }
+        }
+    }
+}
