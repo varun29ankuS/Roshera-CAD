@@ -640,6 +640,19 @@ impl ConstraintSolver {
                     vec![0.0, 0.0, 0.0]
                 }
             }
+            GeometricConstraint::IntersectionAngle(target_angle) => {
+                // Entities are [line1, line2, intersection_point]; the
+                // constrained quantity is the angle between the two line
+                // directions (the point only locates where they meet, so it
+                // does not enter the residual). See `angle_residual` for why
+                // this is a single-valued vector residual rather than a
+                // scalar cross/dot.
+                if entities.len() >= 2 {
+                    self.angle_residual(&entities[0], &entities[1], *target_angle)
+                } else {
+                    vec![0.0, 0.0]
+                }
+            }
             _ => vec![0.0], // Other advanced constraints
         }
     }
@@ -703,6 +716,14 @@ impl ConstraintSolver {
                     vec![0.0]
                 }
             }
+            DimensionalConstraint::Angle(target_angle) => {
+                // Fixed angle (radians) between two line directions.
+                if entities.len() >= 2 {
+                    self.angle_residual(&entities[0], &entities[1], *target_angle)
+                } else {
+                    vec![0.0, 0.0]
+                }
+            }
             _ => vec![0.0], // Other constraints need full implementation
         }
     }
@@ -728,6 +749,65 @@ impl ConstraintSolver {
                 Vector2d::UNIT_X
             }
         })
+    }
+
+    /// Single-valued angle residual between two line directions — the
+    /// constraint "the signed rotation from `line1` to `line2` is
+    /// `target_angle`".
+    ///
+    /// Form:
+    /// ```text
+    ///     r = d2_hat - R(θ)·d1_hat
+    /// ```
+    /// where `R(θ)` is rotation by `target_angle`. This is the single-valued
+    /// vector form KittyCAD/ezpz adopted for `PointsAtAngle` (issue #244): a
+    /// scalar residual built from the cross or dot product (`|d1 × d2|`,
+    /// `sin(Δ − θ)`) vanishes at BOTH θ and θ+π, so a solve can slip to the
+    /// antiparallel branch — the exact failure ezpz hit with its old
+    /// `LinesAtAngle`. Comparing the full **unit** vectors makes the residual
+    /// zero **only** when `d2` is `d1` rotated by exactly θ.
+    ///
+    /// ezpz scales their residual by `(|u| + |v|) / 2`, because their arms are
+    /// point-to-point vectors whose lengths are real, pinned geometry — the
+    /// prefactor then both scales the residual with the sketch and cancels the
+    /// `1/|v|` from normalisation. We deliberately **do not** scale: our
+    /// "arms" are line *direction* parameters with a free magnitude, so a
+    /// magnitude prefactor would let the solver satisfy the constraint by
+    /// collapsing a direction toward zero length instead of rotating it (the
+    /// residual would shrink with `|d|` while the angle stayed wrong). The
+    /// unit-difference form is invariant to `|d|`, so it cannot be cheated
+    /// that way; because it is invariant, the magnitude column of the Jacobian
+    /// is ~0 and the solver leaves `|d|` near its initial ~1, keeping the
+    /// normalisation gradient bounded in practice.
+    ///
+    /// Returns two rows. They are rank 1 at the solution (both encode the one
+    /// angular relation `∠d2 = ∠d1 + θ`), so the constraint removes exactly
+    /// one DOF — consistent with `degrees_of_freedom_removed`. The
+    /// rank-deficiency is absorbed by the Tikhonov fallback in
+    /// [`solve_linear_system`].
+    fn angle_residual(&self, line1: &EntityRef, line2: &EntityRef, target_angle: f64) -> Vec<f64> {
+        let (Some(d1), Some(d2)) = (
+            self.get_line_direction(line1),
+            self.get_line_direction(line2),
+        ) else {
+            return vec![0.0, 0.0];
+        };
+        let n1 = d1.magnitude();
+        let n2 = d2.magnitude();
+        // A zero-length direction has no defined angle; emit no pull rather
+        // than a NaN from the division.
+        if n1 < STRICT_TOLERANCE.distance() || n2 < STRICT_TOLERANCE.distance() {
+            return vec![0.0, 0.0];
+        }
+        let d1_hat = Vector2d::new(d1.x / n1, d1.y / n1);
+        let d2_hat = Vector2d::new(d2.x / n2, d2.y / n2);
+        let (sin_t, cos_t) = target_angle.sin_cos();
+        // R(θ) · d1_hat
+        let r_d1 = Vector2d::new(
+            d1_hat.x * cos_t - d1_hat.y * sin_t,
+            d1_hat.x * sin_t + d1_hat.y * cos_t,
+        );
+        vec![d2_hat.x - r_d1.x, d2_hat.y - r_d1.y]
     }
 
     /// Get circle radius from entity state
@@ -1030,8 +1110,13 @@ impl ConstraintSolver {
                         1
                     }
                 }
+                // The angle residual (`angle_residual`) is a 2-vector.
+                GeometricConstraint::IntersectionAngle(_) => 2,
                 _ => 1,
             },
+            // `DimensionalConstraint::Angle` shares the 2-vector angle
+            // residual; every other dimensional constraint is scalar.
+            ConstraintType::Dimensional(DimensionalConstraint::Angle(_)) => 2,
             ConstraintType::Dimensional(_) => 1,
         }
     }
@@ -2462,6 +2547,157 @@ mod tests {
         );
         let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Perpendicular, &[l1, l2]);
         assert!(approx_eq(errs[0], 0.0, 1e-12));
+    }
+
+    // ──────────── Angle constraint residual (KittyCAD/ezpz #244) ────────────
+    // The residual must be SINGLE-VALUED — zero only at the target angle θ,
+    // not at θ+π. A scalar cross/dot residual (`sin(Δ−θ)`) is zero at both
+    // and lets a solve slip to the antiparallel branch (the bug ezpz fixed in
+    // `PointsAtAngle`). We mirror their magnitude-scaled vector residual
+    // `(|d1|+|d2|)/2 · (d2_hat − R(θ)·d1_hat)`.
+
+    #[test]
+    fn intersection_angle_residual_zero_at_target() {
+        let mut s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        // d1 at 0°, d2 at 90°, target 90° → satisfied.
+        s.add_entity(
+            l1,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.0), false, false),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(0.0, 1.0), false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::IntersectionAngle(std::f64::consts::FRAC_PI_2),
+            &[l1, l2],
+        );
+        assert_eq!(errs.len(), 2);
+        assert!(
+            approx_eq(errs[0], 0.0, 1e-12) && approx_eq(errs[1], 0.0, 1e-12),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn intersection_angle_rejects_antiparallel_branch() {
+        // d1 at 0°, d2 at −90° (flipped), target +90°. The true signed
+        // separation is −90°, NOT +90°, so the residual MUST be large. A
+        // naive sin(Δ−θ) scalar reads sin(−180°)=0 here (false-satisfied);
+        // the vector residual reads ‖(0,−2)‖ = 2.
+        let mut s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        s.add_entity(
+            l1,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.0), false, false),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(0.0, -1.0), false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(
+            &GeometricConstraint::IntersectionAngle(std::f64::consts::FRAC_PI_2),
+            &[l1, l2],
+        );
+        let norm = (errs[0] * errs[0] + errs[1] * errs[1]).sqrt();
+        assert!(
+            norm > 1.0,
+            "antiparallel must not read as satisfied: {errs:?} (norm {norm})"
+        );
+    }
+
+    #[test]
+    fn dimensional_angle_residual_agrees_with_intersection_angle() {
+        let mut s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        // Non-unit directions to exercise the magnitude scaling; d2 is at 45°.
+        s.add_entity(
+            l1,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(2.0, 0.0), false, false),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 1.0), false, false),
+        );
+        let theta = std::f64::consts::FRAC_PI_4;
+        let g = s.evaluate_geometric_constraint(
+            &GeometricConstraint::IntersectionAngle(theta),
+            &[l1, l2],
+        );
+        let d = s.evaluate_dimensional_constraint(&DimensionalConstraint::Angle(theta), &[l1, l2]);
+        assert_eq!(g.len(), 2);
+        assert_eq!(d.len(), 2);
+        assert!(approx_eq(g[0], d[0], 1e-12) && approx_eq(g[1], d[1], 1e-12));
+        // d1 at 0°, d2 at 45°, target 45° → satisfied.
+        assert!(
+            approx_eq(g[0], 0.0, 1e-12) && approx_eq(g[1], 0.0, 1e-12),
+            "{g:?}"
+        );
+    }
+
+    #[test]
+    fn angle_constraint_error_count_matches_evaluator() {
+        let s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        let ia = Constraint::new_geometric(
+            GeometricConstraint::IntersectionAngle(1.0),
+            vec![l1, l2],
+            ConstraintPriority::Required,
+        );
+        let da = Constraint::new_dimensional(
+            DimensionalConstraint::Angle(1.0),
+            vec![l1, l2],
+            ConstraintPriority::Required,
+        );
+        assert_eq!(
+            s.constraint_error_count(&ia),
+            s.evaluate_constraint_error(&ia).len()
+        );
+        assert_eq!(
+            s.constraint_error_count(&da),
+            s.evaluate_constraint_error(&da).len()
+        );
+        assert_eq!(s.constraint_error_count(&ia), 2);
+        assert_eq!(s.constraint_error_count(&da), 2);
+    }
+
+    #[test]
+    fn angle_constraint_solves_to_target_not_supplement() {
+        // Free line nudged from ~6° toward a 60° angle against a pinned
+        // reference line. A single-valued residual converges to 60° — not the
+        // antiparallel 240° (which a cross/dot residual would also accept).
+        let mut s = ConstraintSolver::new();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        s.add_entity(
+            l1,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.0), true, true),
+        );
+        // Point pinned, direction free: the angle is the only free DOF.
+        s.add_entity(
+            l2,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.1), true, false),
+        );
+        let target = std::f64::consts::FRAC_PI_3; // 60°
+        let c = Constraint::new_dimensional(
+            DimensionalConstraint::Angle(target),
+            vec![l1, l2],
+            ConstraintPriority::Required,
+        );
+        s.set_constraints(vec![c]);
+        let _ = s.solve();
+        let d1 = s.get_line_direction(&l1).expect("l1 dir");
+        let d2 = s.get_line_direction(&l2).expect("l2 dir");
+        let solved = d1.signed_angle_to(&d2).expect("signed angle");
+        assert!(
+            approx_eq(solved, target, 1e-3),
+            "solved angle {solved} rad, expected {target}"
+        );
     }
 
     #[test]
