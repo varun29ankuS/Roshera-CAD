@@ -3625,6 +3625,49 @@ fn sphere_corner_union_gate() {
 }
 
 // ===========================================================================
+// SPHERE-NEAR-VERTEX RATCHET GATE — NON-ignored. BOOL-CORNER-FIX generalised
+// beyond the exact corner vertex: a sphere just INSIDE the corner ([0.9,0.9,0.9])
+// or straddling an edge with an offset ([1,1,0.3]) cuts 3 NON-great circles that
+// still mutually intersect, and the complement-aware interior point + region-
+// centroid fan handle them too. These cells were broken pre-fix (∪ dropped the
+// petal) and are now exact — lock them at grid truth (5% tol) + watertight.
+// ===========================================================================
+#[test]
+fn sphere_near_vertex_union_gate() {
+    let cells: [([f64; 3], f64, &str); 2] = [
+        ([0.9, 0.9, 0.9], 0.8, "corner-inside"),
+        ([1.0, 1.0, 0.3], 0.8, "edge+x+y-off"),
+    ];
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let tol = 0.05;
+    for (c, r, name) in cells {
+        let truth = grid_truth(c, r);
+        for &(op, sym, pick) in &ops {
+            let t = pick(&truth);
+            let f = run_op(op, move |m| sphere(m, c, r))
+                .unwrap_or_else(|| panic!("near-vertex {name} {sym}: kernel None"));
+            let rel = (f.vol - t).abs() / t.max(1e-3);
+            assert!(
+                rel <= tol,
+                "REGRESSION (near-vertex): {name} {sym}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+                f.vol,
+                100.0 * (f.vol - t) / t,
+                100.0 * tol
+            );
+            assert!(
+                f.open_edges == 0 && f.nonmanifold_edges == 0,
+                "REGRESSION (near-vertex): {name} {sym}: not watertight ({} open)",
+                f.open_edges
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // SPHERE-CORNER ∪ DIAGNOSTIC — next-worst cap-side target after BOOL-90-FIX.
 // Sphere centred EXACTLY on the +++ box corner vertex (1,1,1), r=0.8: by
 // symmetry exactly 1/8 of the sphere sits inside the box, so
@@ -3675,6 +3718,43 @@ fn diag_sphere_corner_union() {
                 100.0 * mism as f64 / checked.max(1) as f64
             ),
             None => println!("sphere-corner {sym}: membership None"),
+        }
+    }
+}
+
+// NEXT-WORST after BOOL-CORNER-FIX: the NEAR-vertex union cells the corner-vertex
+// fix does NOT cover (cuts are non-great circles). Reports vol vs grid truth +
+// watertight + membership for each (centre, r) across the 3 ops.
+#[test]
+#[ignore = "diagnostic — near-vertex union (run with --ignored --nocapture)"]
+fn diag_sphere_near_vertex() {
+    let cases: [([f64; 3], f64, &str); 3] = [
+        ([0.9, 0.9, 0.9], 0.8, "corner-inside"),
+        ([1.6, 1.6, 0.0], 0.95, "poke-edge"),
+        ([1.0, 1.0, 0.3], 0.8, "edge+x+y-off"),
+    ];
+    for (c, r, name) in cases {
+        let truth = grid_truth(c, r);
+        let b = ShapeSpec::Sphere { c, r };
+        for (op, sym, t) in [
+            (BooleanOp::Intersection, "∩", truth.intersection),
+            (BooleanOp::Union, "∪", truth.union),
+            (BooleanOp::Difference, "∖", truth.difference),
+        ] {
+            let v = run_op(op, |m| sphere(m, c, r));
+            let mem = membership_check(op, b, 0x9A7E ^ sym.len() as u64, 3000, 0.04);
+            match v {
+                Some(f) => println!(
+                    "{name} {sym}: vol={:.4} truth={t:.4} ({:+.1}%) open={} nonman={} | membership={}",
+                    f.vol,
+                    100.0 * (f.vol - t) / t.max(1e-3),
+                    f.open_edges,
+                    f.nonmanifold_edges,
+                    mem.map(|(ch, mi)| format!("{:.1}%", 100.0 * mi as f64 / ch.max(1) as f64))
+                        .unwrap_or_else(|| "None".into())
+                ),
+                None => println!("{name} {sym}: kernel ERROR (None)"),
+            }
         }
     }
 }
