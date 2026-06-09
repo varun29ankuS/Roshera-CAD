@@ -3242,3 +3242,74 @@ fn boolean_box_membership_survey() {
     );
     println!("=== end ===\n");
 }
+
+// ===========================================================================
+// MEMBERSHIP RATCHET GATE (#91) — NON-ignored. Locks the point-membership
+// oracle's verdict on the CONQUERED-correct cells: their result geometry is
+// right, so ray-parity membership must match the analytic expectation. This
+// catches a wrong-geometry-RIGHT-volume regression (e.g. the cap-side hemisphere
+// bug) on conquered ground — which the volume gates are structurally blind to.
+// ===========================================================================
+
+#[test]
+fn box_membership_conquered_gate() {
+    let cells: [(ShapeSpec, &str); 4] = [
+        (
+            ShapeSpec::Sphere {
+                c: [0.0, 0.0, 0.0],
+                r: 0.8,
+            },
+            "sphere-contained",
+        ),
+        (
+            ShapeSpec::Cyl {
+                base: [0.0, 0.0, -0.5],
+                r: 0.5,
+                h: 1.0,
+            },
+            "cyl-contained",
+        ),
+        (
+            ShapeSpec::Cone {
+                bc: [0.0, 0.0, -0.5],
+                rb: 0.5,
+                rt: 0.0,
+                h: 1.0,
+            },
+            "cone-contained",
+        ),
+        (
+            ShapeSpec::Torus {
+                c: [0.0, 0.0, 0.0],
+                rmaj: 0.6,
+                rmin: 0.25,
+            },
+            "torus-centered",
+        ),
+    ];
+    let ops = [
+        BooleanOp::Intersection,
+        BooleanOp::Union,
+        BooleanOp::Difference,
+    ];
+    const K: usize = 1500;
+    let eps = 0.04;
+    for (i, (b, name)) in cells.iter().enumerate() {
+        for (j, op) in ops.iter().enumerate() {
+            let seed = 0x6A7E_5EED_0000_0000 ^ ((i as u64) << 8) ^ (j as u64);
+            let (checked, mism) = membership_check(*op, *b, seed, K, eps)
+                .unwrap_or_else(|| panic!("box∘{name} op#{j}: membership_check returned None"));
+            assert!(
+                checked > 100,
+                "box∘{name} op#{j}: too few points checked ({checked})"
+            );
+            let rate = mism as f64 / checked as f64;
+            assert!(
+                rate <= 0.015,
+                "REGRESSION (membership): box∘{name} op#{j}: {mism}/{checked} point-membership \
+                 mismatches ({:.1}%) — the result GEOMETRY is wrong (a right volume can hide this)",
+                100.0 * rate
+            );
+        }
+    }
+}
