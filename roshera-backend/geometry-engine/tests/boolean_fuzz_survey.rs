@@ -3290,3 +3290,53 @@ fn box_membership_conquered_gate() {
         }
     }
 }
+
+// ===========================================================================
+// BOOL-90 RATCHET GATE — NON-ignored. Pins the box∖sphere single-face-poke
+// (BOOL-90-FIX): sphere(center=[1,0,0], r=0.5) pokes the +x box face, so the
+// sphere surface inside the box is exactly a hemisphere of volume
+// (2/3)π r³ = 0.2618. Before the cap-winding fix the spherical-cap apex/winding
+// desynced at the great circle (h=0) and the cap flux cancelled to 0, so DIFF
+// reported 8.262 (the UNION value) instead of 7.738. Locks all three ops + the
+// watertight invariant on this exact config. Serial run_op (correctness gates
+// do NOT run under a wall-clock thread budget — that races and false-fails).
+// ===========================================================================
+
+#[test]
+fn box_minus_sphere_face_poke_gate() {
+    let c = [1.0, 0.0, 0.0];
+    let r = 0.5;
+    let cap = 2.0 / 3.0 * std::f64::consts::PI * r * r * r; // inside hemisphere ≈ 0.2618
+    let box_vol = (2.0 * BOX_HALF).powi(3); // 8.0
+    let tol = 0.05; // tessellation discretization; the bug swings a full ±cap (0.26 ≫ tol)
+    let cases: [(BooleanOp, &str, f64); 3] = [
+        (BooleanOp::Intersection, "∩ (inside hemisphere)", cap),
+        (
+            BooleanOp::Union,
+            "∪ (box + outside hemisphere)",
+            box_vol + cap,
+        ),
+        (
+            BooleanOp::Difference,
+            "∖ (box − inside hemisphere)",
+            box_vol - cap,
+        ),
+    ];
+    for (op, name, expect) in cases {
+        let f = run_op(op, |m| sphere(m, c, r))
+            .unwrap_or_else(|| panic!("box {name}: kernel returned None (boolean error)"));
+        assert!(
+            (f.vol - expect).abs() <= tol,
+            "REGRESSION (BOOL-90): box {name}: vol={:.4}, expected {:.4} (±{tol}) — \
+             spherical-cap apex/winding desync (great-circle h=0) collapses the cap flux",
+            f.vol,
+            expect
+        );
+        assert!(
+            f.open_edges == 0 && f.nonmanifold_edges == 0,
+            "REGRESSION (BOOL-90): box {name}: not watertight ({} open, {} non-manifold edges)",
+            f.open_edges,
+            f.nonmanifold_edges
+        );
+    }
+}
