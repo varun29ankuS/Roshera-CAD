@@ -9018,14 +9018,15 @@ fn point_inside_cylinder_solid(
     )
 }
 
-fn classify_face_relative_to_solid(
+/// Classify a single point relative to a solid (Inside / Outside / OnBoundary).
+/// The face-level [`classify_face_relative_to_solid`] wraps this with multi-point
+/// sampling to tell a true coincident-area contact from a measure-zero tangency.
+fn classify_point_relative_to_solid(
     model: &BRepModel,
-    face: &SplitFace,
+    test_point: Point3,
     solid: SolidId,
     tolerance: &Tolerance,
 ) -> OperationResult<FaceClassification> {
-    let test_point = get_face_interior_point(model, face)?;
-
     // Exact analytic membership when the reference solid is a lone torus — the
     // ray-cast below is unreliable against a torus and drops the box-wall disk
     // caps of a rim poke.
@@ -9128,6 +9129,116 @@ fn classify_face_relative_to_solid(
             inside_votes, outside_votes, total_votes
         )))
     }
+}
+
+/// Classify a split face relative to a solid.
+///
+/// Classifies the face's representative interior point. A definitive
+/// Inside/Outside is returned directly — multi-sampling activates ONLY on an
+/// OnBoundary verdict, so non-coincident faces keep identical behaviour.
+///
+/// An OnBoundary verdict from a single point is correct when the face is
+/// genuinely COINCIDENT with a face of the other solid (area contact — two boxes
+/// sharing a plane). But it is WRONG when the face merely TOUCHES the other solid
+/// at an isolated point: a sphere inscribed in a box is tangent to each face at
+/// that face's centre, and the representative interior point IS that centre, so
+/// every face read OnBoundary and `select_faces_for_operation` returned the wrong
+/// operand (box∩sphere → box, box∖sphere → empty). Distinguish the two by sampling
+/// additional points along the face boundary: an area contact leaves (nearly)
+/// every sample on the boundary, a tangency leaves the rest of the face strictly
+/// Inside or Outside.
+///
+/// KNOWN-INCOMPLETE (#90, WIP): the unanimous-vote rule below mis-handles a face
+/// that is PARTIALLY coincident (coincident over part of its area, free over the
+/// rest — common in box∩box overlaps), because boundary samples reach outside the
+/// overlap and out-vote the genuine OnBoundary. Tracked: 10 box∘box overlap lib
+/// tests regress. The follow-up gates the reclassification to provably-ISOLATED
+/// (point/edge) contacts only. Committed deliberately as fix-forward WIP.
+fn classify_face_relative_to_solid(
+    model: &BRepModel,
+    face: &SplitFace,
+    solid: SolidId,
+    tolerance: &Tolerance,
+) -> OperationResult<FaceClassification> {
+    let primary = get_face_interior_point(model, face)?;
+    let cls = classify_point_relative_to_solid(model, primary, solid, tolerance)?;
+    if !matches!(cls, FaceClassification::OnBoundary) {
+        return Ok(cls);
+    }
+
+    // Representative point is on the boundary — verify it is an AREA contact and
+    // not a point/edge tangency by sampling more points along the face boundary.
+    let extras = face_boundary_samples(model, face);
+    if extras.is_empty() {
+        return Ok(FaceClassification::OnBoundary);
+    }
+    let (mut inside, mut outside) = (0u32, 0u32);
+    for p in extras {
+        match classify_point_relative_to_solid(model, p, solid, tolerance) {
+            Ok(FaceClassification::Inside) => inside += 1,
+            Ok(FaceClassification::Outside) => outside += 1,
+            Ok(FaceClassification::OnBoundary) => {}
+            Err(_) => {}
+        }
+    }
+    // A non-intersecting face lies entirely on ONE side of the other solid except
+    // at measure-zero tangent contacts (which read OnBoundary). So:
+    //   - all samples OnBoundary  ⇒ genuine area-coincidence ⇒ keep OnBoundary
+    //     (two boxes sharing a plane — every sample sits on the shared face).
+    //   - off-boundary samples UNANIMOUS Inside / Outside ⇒ that is the face's
+    //     side; the OnBoundary reads were isolated tangent points.
+    //   - mixed Inside AND Outside ⇒ ambiguous (should not happen for a
+    //     non-intersecting face) ⇒ stay conservative on OnBoundary.
+    match (inside > 0, outside > 0) {
+        (true, false) => Ok(FaceClassification::Inside),
+        (false, true) => Ok(FaceClassification::Outside),
+        _ => Ok(FaceClassification::OnBoundary),
+    }
+}
+
+/// Additional sample points along a split face's boundary edges (parameters
+/// 0.25 / 0.5 / 0.75 per edge), used to tell an area contact from a tangency in
+/// [`classify_face_relative_to_solid`]. Boundary-edge samples are always on the
+/// face's closure, so they are valid for trimmed fragments and curved faces alike
+/// without needing a UV point-in-face test.
+fn face_boundary_samples(model: &BRepModel, face: &SplitFace) -> Vec<Point3> {
+    let mut pts = Vec::new();
+    for &(edge_id, _) in &face.boundary_edges {
+        let Some(edge) = model.edges.get(edge_id) else {
+            continue;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            continue;
+        };
+        let (a, b) = (edge.param_range.start, edge.param_range.end);
+        for frac in [0.25, 0.5, 0.75] {
+            if let Ok(p) = curve.point_at(a + (b - a) * frac) {
+                pts.push(p);
+            }
+        }
+    }
+    // A closed full-surface face (e.g. an untrimmed sphere inscribed in the box)
+    // has NO boundary edges, so it yields no edge samples — and its single
+    // representative point is exactly the tangent point. Sample the surface
+    // directly on a small interior UV grid. Safe precisely because there are no
+    // boundary edges: the whole parameter domain lies in the face (no trim). The
+    // fractions avoid 0 / 0.5 / 1 so the grid dodges seams, poles, and the axis
+    // tangent points.
+    if pts.is_empty() {
+        if let Some(surface) = model.surfaces.get(face.surface) {
+            let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+            for fu in [0.2, 0.45, 0.7, 0.9] {
+                for fv in [0.3, 0.55, 0.8] {
+                    let u = u0 + (u1 - u0) * fu;
+                    let v = v0 + (v1 - v0) * fv;
+                    if let Ok(p) = surface.point_at(u, v) {
+                        pts.push(p);
+                    }
+                }
+            }
+        }
+    }
+    pts
 }
 
 /// Get a point in the interior of a face.
