@@ -68,46 +68,108 @@ fn grid_truth(center: [f64; 3], r: f64) -> GridTruth {
     // the exact box (8.0), so union/difference land well inside the survey's 3%.
     let box_vol = (2.0 * BOX_HALF).powi(3);
     let sphere_vol = 4.0 / 3.0 * std::f64::consts::PI * r * r * r;
-    // Overlap AABB = box ∩ sphere-bounding-box, clipped per axis to the box.
+    let intersection = box_sphere_intersection_grid(center, r, 96);
+    GridTruth {
+        intersection,
+        union: box_vol + sphere_vol - intersection,
+        difference: box_vol - intersection,
+    }
+}
+
+/// Monte-Carlo estimate of V(box ∩ sphere) with `n` samples/axis over the
+/// box∩sphere overlap AABB (every sample is in-box by construction, so only the
+/// sphere test matters). Exposed for the convergence self-test
+/// (`grid_oracle_converges`): a trustworthy oracle's estimate must stabilise as
+/// `n` doubles; a drifting estimate would mean the truth it feeds the survey is
+/// itself unreliable.
+fn box_sphere_intersection_grid(center: [f64; 3], r: f64, n: usize) -> f64 {
     let mut lo = [0.0_f64; 3];
     let mut hi = [0.0_f64; 3];
     for a in 0..3 {
         lo[a] = (center[a] - r).max(-BOX_HALF);
         hi[a] = (center[a] + r).min(BOX_HALF);
     }
-    let intersection = if (0..3).any(|a| hi[a] <= lo[a]) {
-        0.0 // disjoint: sphere bbox does not meet the box on some axis
-    } else {
-        const N: usize = 96; // cells/axis over the (small) overlap box
-        let cell = [
-            (hi[0] - lo[0]) / N as f64,
-            (hi[1] - lo[1]) / N as f64,
-            (hi[2] - lo[2]) / N as f64,
-        ];
-        let cv = cell[0] * cell[1] * cell[2];
-        let r2 = r * r;
-        let mut n = 0u64;
-        for i in 0..N {
-            let x = lo[0] + (i as f64 + 0.5) * cell[0];
-            for j in 0..N {
-                let y = lo[1] + (j as f64 + 0.5) * cell[1];
-                for k in 0..N {
-                    let z = lo[2] + (k as f64 + 0.5) * cell[2];
-                    // Every sample lies inside the box by construction (the AABB
-                    // is clipped to the box), so only the sphere test matters.
-                    let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
-                    if dx * dx + dy * dy + dz * dz <= r2 {
-                        n += 1;
-                    }
+    if (0..3).any(|a| hi[a] <= lo[a]) {
+        return 0.0; // disjoint on some axis
+    }
+    let cell = [
+        (hi[0] - lo[0]) / n as f64,
+        (hi[1] - lo[1]) / n as f64,
+        (hi[2] - lo[2]) / n as f64,
+    ];
+    let cv = cell[0] * cell[1] * cell[2];
+    let r2 = r * r;
+    let mut count = 0u64;
+    for i in 0..n {
+        let x = lo[0] + (i as f64 + 0.5) * cell[0];
+        for j in 0..n {
+            let y = lo[1] + (j as f64 + 0.5) * cell[1];
+            for k in 0..n {
+                let z = lo[2] + (k as f64 + 0.5) * cell[2];
+                let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
+                if dx * dx + dy * dy + dz * dz <= r2 {
+                    count += 1;
                 }
             }
         }
-        n as f64 * cv
-    };
-    GridTruth {
-        intersection,
-        union: box_vol + sphere_vol - intersection,
-        difference: box_vol - intersection,
+    }
+    count as f64 * cv
+}
+
+// ===========================================================================
+// ORACLE SELF-TEST (non-ignored gate). The survey trusts `grid_truth`; this
+// proves the trust is earned. For three configs with a CLOSED-FORM box∩sphere
+// volume, the grid estimate must (a) land within 1% of the exact value at the
+// production resolution and (b) CONVERGE — doubling samples/axis must not move
+// it away from exact. A drifting or biased oracle would silently corrupt every
+// VOLUME verdict in the survey; this catches that at the source.
+// ===========================================================================
+#[test]
+fn grid_oracle_converges() {
+    let pi = std::f64::consts::PI;
+    // (centre, r, exact V(box∩sphere), name)
+    let cases: [([f64; 3], f64, f64, &str); 3] = [
+        // sphere fully inside the box → ∩ = the whole sphere
+        (
+            [0.0, 0.0, 0.0],
+            0.5,
+            4.0 / 3.0 * pi * 0.5_f64.powi(3),
+            "contained (full sphere)",
+        ),
+        // centre ON the +x face plane → ∩ = inside-box hemisphere = half sphere
+        (
+            [1.0, 0.0, 0.0],
+            0.5,
+            2.0 / 3.0 * pi * 0.5_f64.powi(3),
+            "face (hemisphere)",
+        ),
+        // centre ON the +++ corner vertex → ∩ = one octant = 1/8 sphere
+        (
+            [1.0, 1.0, 1.0],
+            0.8,
+            (4.0 / 3.0 * pi * 0.8_f64.powi(3)) / 8.0,
+            "corner (octant)",
+        ),
+    ];
+    for (c, r, exact, name) in cases {
+        let e48 = box_sphere_intersection_grid(c, r, 48);
+        let e96 = box_sphere_intersection_grid(c, r, 96);
+        let e192 = box_sphere_intersection_grid(c, r, 192);
+        // (a) accuracy at production resolution.
+        let rel96 = (e96 - exact).abs() / exact;
+        assert!(
+            rel96 <= 0.01,
+            "oracle inaccurate for {name}: grid(96)={e96:.5} exact={exact:.5} ({:.2}%)",
+            100.0 * rel96
+        );
+        // (b) convergence: the finest grid is at least as close to exact as the
+        // coarsest (a 1e-9 slack absorbs floating-point noise at the boundary).
+        let d48 = (e48 - exact).abs();
+        let d192 = (e192 - exact).abs();
+        assert!(
+            d192 <= d48 + 1e-9,
+            "oracle NOT converging for {name}: |grid(48)-exact|={d48:.6} |grid(192)-exact|={d192:.6}"
+        );
     }
 }
 
