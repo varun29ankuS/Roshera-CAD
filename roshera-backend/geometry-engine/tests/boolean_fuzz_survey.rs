@@ -556,6 +556,57 @@ fn cylinder(model: &mut BRepModel, base: [f64; 3], r: f64, h: f64) -> SolidId {
 }
 
 /// Inside a finite z-axis cylinder: radial ≤ r and axial ∈ [0, h] from `base`.
+/// Honest box∘shape grid truth: box (8.0) and the shape (`shape_vol`) are exact;
+/// only their intersection is Monte-Carlo'd over the box∩shape-AABB overlap
+/// (clipped to the box, so every sample is in-box — only `in_shape` is tested).
+/// Eliminates the box-over-count bias of gridding the whole box+shape over a
+/// shape-sized reach (see `grid_truth` for the full rationale). `shape_lo/hi` is
+/// any AABB that CONTAINS the shape; a loose one only adds zero-weight samples.
+fn box_shape_grid_truth(
+    shape_vol: f64,
+    shape_lo: [f64; 3],
+    shape_hi: [f64; 3],
+    in_shape: impl Fn([f64; 3]) -> bool,
+) -> GridTruth {
+    let box_vol = (2.0 * BOX_HALF).powi(3);
+    let mut lo = [0.0_f64; 3];
+    let mut hi = [0.0_f64; 3];
+    for a in 0..3 {
+        lo[a] = shape_lo[a].max(-BOX_HALF);
+        hi[a] = shape_hi[a].min(BOX_HALF);
+    }
+    let intersection = if (0..3).any(|a| hi[a] <= lo[a]) {
+        0.0
+    } else {
+        const N: usize = 96;
+        let cell = [
+            (hi[0] - lo[0]) / N as f64,
+            (hi[1] - lo[1]) / N as f64,
+            (hi[2] - lo[2]) / N as f64,
+        ];
+        let cv = cell[0] * cell[1] * cell[2];
+        let mut count = 0u64;
+        for i in 0..N {
+            let x = lo[0] + (i as f64 + 0.5) * cell[0];
+            for j in 0..N {
+                let y = lo[1] + (j as f64 + 0.5) * cell[1];
+                for k in 0..N {
+                    let z = lo[2] + (k as f64 + 0.5) * cell[2];
+                    if in_shape([x, y, z]) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count as f64 * cv
+    };
+    GridTruth {
+        intersection,
+        union: box_vol + shape_vol - intersection,
+        difference: box_vol - intersection,
+    }
+}
+
 fn in_cylinder(p: [f64; 3], base: [f64; 3], r: f64, h: f64) -> bool {
     let axial = p[2] - base[2];
     if axial < 0.0 || axial > h {
@@ -566,45 +617,11 @@ fn in_cylinder(p: [f64; 3], base: [f64; 3], r: f64, h: f64) -> bool {
 }
 
 fn cyl_grid_truth(base: [f64; 3], r: f64, h: f64) -> GridTruth {
-    let reach = [
-        base[0].abs() + r,
-        base[1].abs() + r,
-        base[2].abs().max((base[2] + h).abs()),
-    ]
-    .into_iter()
-    .fold(BOX_HALF, f64::max)
-        + 0.05;
-    const N: usize = 96;
-    let cell = 2.0 * reach / N as f64;
-    let cv = cell * cell * cell;
-    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
-    for i in 0..N {
-        let x = -reach + (i as f64 + 0.5) * cell;
-        let in_bx = x.abs() <= BOX_HALF;
-        for j in 0..N {
-            let y = -reach + (j as f64 + 0.5) * cell;
-            let in_by = in_bx && y.abs() <= BOX_HALF;
-            for k in 0..N {
-                let z = -reach + (k as f64 + 0.5) * cell;
-                let in_box = in_by && z.abs() <= BOX_HALF;
-                let in_cyl = in_cylinder([x, y, z], base, r, h);
-                if in_box && in_cyl {
-                    i_n += 1;
-                }
-                if in_box || in_cyl {
-                    u_n += 1;
-                }
-                if in_box && !in_cyl {
-                    d_n += 1;
-                }
-            }
-        }
-    }
-    GridTruth {
-        intersection: i_n as f64 * cv,
-        union: u_n as f64 * cv,
-        difference: d_n as f64 * cv,
-    }
+    // Finite z-axis cylinder → V = π r² h exact; AABB = disk±r in xy, [base_z, +h].
+    let vol = std::f64::consts::PI * r * r * h;
+    let lo = [base[0] - r, base[1] - r, base[2].min(base[2] + h)];
+    let hi = [base[0] + r, base[1] + r, base[2].max(base[2] + h)];
+    box_shape_grid_truth(vol, lo, hi, |p| in_cylinder(p, base, r, h))
 }
 
 /// (base, radius, height, label) — z-axis cylinder placements vs box [-1,1]³.
@@ -739,46 +756,13 @@ fn in_cone(p: [f64; 3], bc: [f64; 3], rb: f64, rt: f64, h: f64) -> bool {
 }
 
 fn cone_grid_truth(bc: [f64; 3], rb: f64, rt: f64, h: f64) -> GridTruth {
+    // Truncated z-cone → V = (1/3)π h (rb²+rb·rt+rt²) exact; AABB = max-radius
+    // disk in xy over [bc_z, bc_z+h].
     let rmax = rb.max(rt);
-    let reach = [
-        bc[0].abs() + rmax,
-        bc[1].abs() + rmax,
-        bc[2].abs().max((bc[2] + h).abs()),
-    ]
-    .into_iter()
-    .fold(BOX_HALF, f64::max)
-        + 0.05;
-    const N: usize = 96;
-    let cell = 2.0 * reach / N as f64;
-    let cv = cell * cell * cell;
-    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
-    for i in 0..N {
-        let x = -reach + (i as f64 + 0.5) * cell;
-        let in_bx = x.abs() <= BOX_HALF;
-        for j in 0..N {
-            let y = -reach + (j as f64 + 0.5) * cell;
-            let in_by = in_bx && y.abs() <= BOX_HALF;
-            for k in 0..N {
-                let z = -reach + (k as f64 + 0.5) * cell;
-                let in_box = in_by && z.abs() <= BOX_HALF;
-                let in_cn = in_cone([x, y, z], bc, rb, rt, h);
-                if in_box && in_cn {
-                    i_n += 1;
-                }
-                if in_box || in_cn {
-                    u_n += 1;
-                }
-                if in_box && !in_cn {
-                    d_n += 1;
-                }
-            }
-        }
-    }
-    GridTruth {
-        intersection: i_n as f64 * cv,
-        union: u_n as f64 * cv,
-        difference: d_n as f64 * cv,
-    }
+    let vol = std::f64::consts::PI * h * (rb * rb + rb * rt + rt * rt) / 3.0;
+    let lo = [bc[0] - rmax, bc[1] - rmax, bc[2].min(bc[2] + h)];
+    let hi = [bc[0] + rmax, bc[1] + rmax, bc[2].max(bc[2] + h)];
+    box_shape_grid_truth(vol, lo, hi, |p| in_cone(p, bc, rb, rt, h))
 }
 
 /// (base_center, base_r, top_r, height, label) — z-axis cones vs box [-1,1]³.
@@ -927,44 +911,16 @@ fn in_rotated_box(p: [f64; 3], hb: f64, center: [f64; 3], r: &Matrix4) -> bool {
 }
 
 fn rbox_grid_truth(hb: f64, center: [f64; 3], axis: [f64; 3], angle: f64) -> GridTruth {
+    // Rotated cube → V = (2·hb)³ exact (rotation-invariant). Conservative AABB
+    // uses the cube circumradius hb·√3; loose-but-containing is fine (extra empty
+    // samples weigh 0).
     let r = Matrix4::from_axis_angle(&Vector3::new(axis[0], axis[1], axis[2]), angle)
         .expect("axis-angle");
     let diag = hb * 3.0_f64.sqrt();
-    let reach = (0..3)
-        .map(|i| center[i].abs() + diag)
-        .fold(BOX_HALF, f64::max)
-        + 0.05;
-    const N: usize = 96;
-    let cell = 2.0 * reach / N as f64;
-    let cv = cell * cell * cell;
-    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
-    for i in 0..N {
-        let x = -reach + (i as f64 + 0.5) * cell;
-        let in_bx = x.abs() <= BOX_HALF;
-        for j in 0..N {
-            let y = -reach + (j as f64 + 0.5) * cell;
-            let in_by = in_bx && y.abs() <= BOX_HALF;
-            for k in 0..N {
-                let z = -reach + (k as f64 + 0.5) * cell;
-                let in_box = in_by && z.abs() <= BOX_HALF;
-                let in_rb = in_rotated_box([x, y, z], hb, center, &r);
-                if in_box && in_rb {
-                    i_n += 1;
-                }
-                if in_box || in_rb {
-                    u_n += 1;
-                }
-                if in_box && !in_rb {
-                    d_n += 1;
-                }
-            }
-        }
-    }
-    GridTruth {
-        intersection: i_n as f64 * cv,
-        union: u_n as f64 * cv,
-        difference: d_n as f64 * cv,
-    }
+    let vol = (2.0 * hb).powi(3);
+    let lo = [center[0] - diag, center[1] - diag, center[2] - diag];
+    let hi = [center[0] + diag, center[1] + diag, center[2] + diag];
+    box_shape_grid_truth(vol, lo, hi, |p| in_rotated_box(p, hb, center, &r))
 }
 
 /// (half-extent, center, axis, angle_deg, label) — rotated boxes vs box [-1,1]³.
@@ -1726,45 +1682,13 @@ fn in_torus(p: [f64; 3], c: [f64; 3], rmaj: f64, rmin: f64) -> bool {
 }
 
 fn torus_grid_truth(c: [f64; 3], rmaj: f64, rmin: f64) -> GridTruth {
-    let reach = [
-        c[0].abs() + rmaj + rmin,
-        c[1].abs() + rmaj + rmin,
-        c[2].abs() + rmin,
-    ]
-    .into_iter()
-    .fold(BOX_HALF, f64::max)
-        + 0.05;
-    const N: usize = 96;
-    let cell = 2.0 * reach / N as f64;
-    let cv = cell * cell * cell;
-    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
-    for i in 0..N {
-        let x = -reach + (i as f64 + 0.5) * cell;
-        let in_bx = x.abs() <= BOX_HALF;
-        for j in 0..N {
-            let y = -reach + (j as f64 + 0.5) * cell;
-            let in_by = in_bx && y.abs() <= BOX_HALF;
-            for k in 0..N {
-                let z = -reach + (k as f64 + 0.5) * cell;
-                let in_box = in_by && z.abs() <= BOX_HALF;
-                let in_t = in_torus([x, y, z], c, rmaj, rmin);
-                if in_box && in_t {
-                    i_n += 1;
-                }
-                if in_box || in_t {
-                    u_n += 1;
-                }
-                if in_box && !in_t {
-                    d_n += 1;
-                }
-            }
-        }
-    }
-    GridTruth {
-        intersection: i_n as f64 * cv,
-        union: u_n as f64 * cv,
-        difference: d_n as f64 * cv,
-    }
+    // z-axis torus → V = 2π²·rmaj·rmin² exact; AABB = (rmaj+rmin) disk in xy,
+    // ±rmin in z.
+    let vol = 2.0 * std::f64::consts::PI * std::f64::consts::PI * rmaj * rmin * rmin;
+    let ro = rmaj + rmin;
+    let lo = [c[0] - ro, c[1] - ro, c[2] - rmin];
+    let hi = [c[0] + ro, c[1] + ro, c[2] + rmin];
+    box_shape_grid_truth(vol, lo, hi, |p| in_torus(p, c, rmaj, rmin))
 }
 
 /// (centre, major_r, minor_r, label) — z-axis tori vs box [-1,1]³.
@@ -2442,43 +2366,22 @@ fn in_tilted_cyl(p: [f64; 3], base: [f64; 3], axis_unit: [f64; 3], r: f64, h: f6
 }
 
 fn tcyl_grid_truth(base: [f64; 3], axis: [f64; 3], r: f64, h: f64) -> GridTruth {
+    // Tilted finite cylinder → V = π r² h exact. Conservative AABB: the two cap
+    // centres (base, base+u·h) expanded by r on every axis contain the cylinder.
     let u = norm3(axis);
     let end = [base[0] + u[0] * h, base[1] + u[1] * h, base[2] + u[2] * h];
-    let reach = (0..3)
-        .map(|i| base[i].abs().max(end[i].abs()) + r)
-        .fold(BOX_HALF, f64::max)
-        + 0.05;
-    const N: usize = 96;
-    let cell = 2.0 * reach / N as f64;
-    let cv = cell * cell * cell;
-    let (mut i_n, mut un, mut d_n) = (0u64, 0u64, 0u64);
-    for i in 0..N {
-        let x = -reach + (i as f64 + 0.5) * cell;
-        let in_bx = x.abs() <= BOX_HALF;
-        for j in 0..N {
-            let y = -reach + (j as f64 + 0.5) * cell;
-            let in_by = in_bx && y.abs() <= BOX_HALF;
-            for k in 0..N {
-                let z = -reach + (k as f64 + 0.5) * cell;
-                let in_box = in_by && z.abs() <= BOX_HALF;
-                let in_c = in_tilted_cyl([x, y, z], base, u, r, h);
-                if in_box && in_c {
-                    i_n += 1;
-                }
-                if in_box || in_c {
-                    un += 1;
-                }
-                if in_box && !in_c {
-                    d_n += 1;
-                }
-            }
-        }
-    }
-    GridTruth {
-        intersection: i_n as f64 * cv,
-        union: un as f64 * cv,
-        difference: d_n as f64 * cv,
-    }
+    let vol = std::f64::consts::PI * r * r * h;
+    let lo = [
+        base[0].min(end[0]) - r,
+        base[1].min(end[1]) - r,
+        base[2].min(end[2]) - r,
+    ];
+    let hi = [
+        base[0].max(end[0]) + r,
+        base[1].max(end[1]) + r,
+        base[2].max(end[2]) + r,
+    ];
+    box_shape_grid_truth(vol, lo, hi, |p| in_tilted_cyl(p, base, u, r, h))
 }
 
 /// (base, axis, r, h, label) — arbitrary-axis cylinders vs box [-1,1]³.
