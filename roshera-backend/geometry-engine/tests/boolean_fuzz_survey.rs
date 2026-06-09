@@ -224,6 +224,82 @@ struct Failure {
     detail: String,
 }
 
+/// Oracle-free Boolean invariants from the kernel's OWN (∩, ∪, ∖) volumes.
+/// `v_a` = box (8.0), `v_b` = the second solid's analytic volume. These are
+/// exact algebraic facts for ANY valid Boolean, so a violation is a guaranteed
+/// kernel bug — no grid oracle is consulted, making them immune to oracle error
+/// and sharper than a volume-vs-oracle tolerance band. One `Failure` per
+/// violated invariant; empty when any op did not return (HANG/ERROR).
+fn boolean_invariant_failures(
+    lab: &str,
+    v_a: f64,
+    v_b: f64,
+    kvol: [Option<f64>; 3],
+) -> Vec<Failure> {
+    let mut out: Vec<Failure> = Vec::new();
+    let [Some(vi), Some(vu), Some(vd)] = kvol else {
+        return out;
+    };
+    // Inclusion–exclusion: V(A∩B) + V(A∪B) = V(A) + V(B), exactly. Loosened to
+    // 5% only to absorb the curved-cap tessellation discretisation shared by ∩
+    // and ∪; a real petal-drop breaks it by 20–90%.
+    let ie_rhs = v_a + v_b;
+    if (vi + vu - ie_rhs).abs() / ie_rhs > 0.05 {
+        out.push(Failure {
+            label: lab.to_string(),
+            op: "∩∪",
+            kind: "INCL-EXCL",
+            detail: format!(
+                "V(∩)+V(∪)={:.4} ≠ V(A)+V(B)={:.4} ({:+.1}%)",
+                vi + vu,
+                ie_rhs,
+                100.0 * (vi + vu - ie_rhs) / ie_rhs
+            ),
+        });
+    }
+    // Difference identity: V(A∖B) = V(A) − V(A∩B).
+    if (vd - (v_a - vi)).abs() / v_a > 0.03 {
+        out.push(Failure {
+            label: lab.to_string(),
+            op: "∖",
+            kind: "DIFF-ID",
+            detail: format!("V(∖)={vd:.4} ≠ V(A)−V(∩)={:.4}", v_a - vi),
+        });
+    }
+    // Hard bounds — inequalities that cannot false-positive from small
+    // discretisation unless a result is grossly wrong.
+    let eps = 0.02 * v_a;
+    if vi < -eps || vi > v_a.min(v_b) + eps {
+        out.push(Failure {
+            label: lab.to_string(),
+            op: "∩",
+            kind: "BOUNDS",
+            detail: format!("V(∩)={vi:.4} ∉ [0, min(A,B)={:.4}]", v_a.min(v_b)),
+        });
+    }
+    if vu < v_a.max(v_b) - eps || vu > v_a + v_b + eps {
+        out.push(Failure {
+            label: lab.to_string(),
+            op: "∪",
+            kind: "BOUNDS",
+            detail: format!(
+                "V(∪)={vu:.4} ∉ [max(A,B)={:.4}, A+B={:.4}]",
+                v_a.max(v_b),
+                v_a + v_b
+            ),
+        });
+    }
+    if vd < -eps || vd > v_a + eps {
+        out.push(Failure {
+            label: lab.to_string(),
+            op: "∖",
+            kind: "BOUNDS",
+            detail: format!("V(∖)={vd:.4} ∉ [0, A={v_a:.4}]"),
+        });
+    }
+    out
+}
+
 /// #91 calibration: does a BARE (un-cut) sphere / box already carry a nonzero
 /// genus-0 Euler-Poincaré residual? If so the survey's EULER class is a false
 /// positive on the primitive's own representation, not a Boolean bug, and must
@@ -352,68 +428,7 @@ fn boolean_box_sphere_fuzz_survey() {
             // These need NO grid: they are exact algebraic facts about ANY
             // valid Boolean. They catch wrong-volume results the grid oracle's
             // tolerance might tolerate, and are immune to oracle error.
-            if let [Some(vi), Some(vu), Some(vd)] = kvol {
-                // Inclusion–exclusion: V(A∩B) + V(A∪B) = V(A) + V(B), exactly.
-                // (A = box = 8, B = sphere = 4/3·π·r³, both analytic.) Loosened
-                // to 5% only to absorb the sphere-cap tessellation discretisation
-                // shared by ∩ and ∪; a real petal-drop breaks it by 20–90%.
-                let ie_rhs = v_box + v_sph;
-                let ie_err = (vi + vu - ie_rhs).abs() / ie_rhs;
-                if ie_err > 0.05 {
-                    out.push(Failure {
-                        label: lab.clone(),
-                        op: "∩∪",
-                        kind: "INCL-EXCL",
-                        detail: format!(
-                            "V(∩)+V(∪)={:.4} ≠ V(box)+V(sph)={:.4} ({:+.1}%)",
-                            vi + vu,
-                            ie_rhs,
-                            100.0 * (vi + vu - ie_rhs) / ie_rhs
-                        ),
-                    });
-                }
-                // Difference identity: V(A∖B) = V(A) − V(A∩B) (kernel-only).
-                let did_err = (vd - (v_box - vi)).abs() / v_box;
-                if did_err > 0.03 {
-                    out.push(Failure {
-                        label: lab.clone(),
-                        op: "∖",
-                        kind: "DIFF-ID",
-                        detail: format!("V(∖)={vd:.4} ≠ V(box)−V(∩)={:.4}", v_box - vi),
-                    });
-                }
-                // Hard bounds — inequalities that cannot false-positive from
-                // small discretisation unless a result is grossly wrong.
-                let eps = 0.02 * v_box; // absolute slack
-                let bound_hit = |name: &'static str, detail: String| Failure {
-                    label: lab.clone(),
-                    op: name,
-                    kind: "BOUNDS",
-                    detail,
-                };
-                if vi < -eps || vi > v_box.min(v_sph) + eps {
-                    out.push(bound_hit(
-                        "∩",
-                        format!("V(∩)={vi:.4} ∉ [0, min(box,sph)={:.4}]", v_box.min(v_sph)),
-                    ));
-                }
-                if vu < v_box.max(v_sph) - eps || vu > v_box + v_sph + eps {
-                    out.push(bound_hit(
-                        "∪",
-                        format!(
-                            "V(∪)={vu:.4} ∉ [max(box,sph)={:.4}, box+sph={:.4}]",
-                            v_box.max(v_sph),
-                            v_box + v_sph
-                        ),
-                    ));
-                }
-                if vd < -eps || vd > v_box + eps {
-                    out.push(bound_hit(
-                        "∖",
-                        format!("V(∖)={vd:.4} ∉ [0, box={v_box:.4}]"),
-                    ));
-                }
-            }
+            out.extend(boolean_invariant_failures(&lab, v_box, v_sph, kvol));
             out
         })
         .collect();
@@ -1257,6 +1272,19 @@ fn fuzz_single_shot() {
 
     // Direct call — no timeout thread. The parent owns the wall-clock budget.
     let facts = run_op(op, move |m| sphere(m, center, r));
+    // When the driver passes FUZZ_OUT, write the full facts so the parent can
+    // run the oracle + invariants on an ISOLATED result (no leaked-thread
+    // starvation). Format: "OK <vol> <open> <nonmanifold> <euler>" or "ERR".
+    if let Ok(path) = std::env::var("FUZZ_OUT") {
+        let line = match facts {
+            Some(f) => format!(
+                "OK {} {} {} {}",
+                f.vol, f.open_edges, f.nonmanifold_edges, f.euler_residual
+            ),
+            None => "ERR".to_string(),
+        };
+        let _ = std::fs::write(path, line);
+    }
     println!("SINGLE_SHOT_DONE cfg={cfg} op={opi} ok={}", facts.is_some());
 }
 
@@ -1328,6 +1356,155 @@ fn hang_isolation_survey() {
         println!("  HANG [{}] {label} r={r}", sym[*opi]);
     }
     println!("=== end ===\n");
+}
+
+// ===========================================================================
+// HONEST (HANG-isolated) box∘sphere survey — the trustworthy variant.
+//
+// The in-process `boolean_box_sphere_fuzz_survey` runs configs under rayon and
+// budgets each op on a LEAKED detached thread; a few true hangs burn cores and
+// starve healthy configs, so their ops also miss the budget — inflating the HANG
+// class AND masking the volume/invariant failures of the starved configs (a hung
+// op yields no volume, so its checks are skipped). This driver runs every
+// (cfg,op) in its OWN process: a hung child is KILLED (not leaked), so it cannot
+// starve its siblings, and every healthy config's full facts are collected and
+// checked. Same grid oracle + same oracle-free invariants, but no masking.
+// Slow (spawns 3·|cfg| processes); #[ignore], never part of the green gate.
+// ===========================================================================
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
+fn boolean_box_sphere_survey_isolated() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut configs: Vec<([f64; 3], &'static str, f64)> = Vec::new();
+    for (c, label) in placements() {
+        for &r in radii() {
+            configs.push((c, label, r));
+        }
+    }
+    let budget = Duration::from_secs(6);
+    let tmp = std::env::temp_dir();
+    let v_box = (2.0 * BOX_HALF).powi(3);
+    let vol_tol = 0.03;
+    let sym = ["∩", "∪", "∖"];
+
+    let mut fails: Vec<Failure> = Vec::new();
+    let mut n_checks = 0usize;
+    let mut true_hangs = 0usize;
+
+    for (cfg, &(center, label, r)) in configs.iter().enumerate() {
+        let truth = grid_truth(center, r);
+        let v_sph = 4.0 / 3.0 * std::f64::consts::PI * r * r * r;
+        let t_for = [truth.intersection, truth.union, truth.difference];
+        let lab = format!("{label} r={r}");
+        let mut kvol: [Option<f64>; 3] = [None; 3];
+
+        for opi in 0..3usize {
+            let out_path = tmp.join(format!("rosh_fuzz_{cfg}_{opi}.txt"));
+            let _ = std::fs::remove_file(&out_path);
+            let mut child = Command::new(&exe)
+                .args(["fuzz_single_shot", "--exact", "--ignored"])
+                .env("FUZZ_CFG", cfg.to_string())
+                .env("FUZZ_OP", opi.to_string())
+                .env("FUZZ_OUT", out_path.to_string_lossy().to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn single-shot");
+            let start = Instant::now();
+            let mut hung = false;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if start.elapsed() > budget {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            hung = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            n_checks += 1;
+            if hung {
+                true_hangs += 1;
+                fails.push(Failure {
+                    label: lab.clone(),
+                    op: sym[opi],
+                    kind: "HANG",
+                    detail: format!("TRUE hang (isolated process, >{}s)", budget.as_secs()),
+                });
+                continue;
+            }
+            let content = std::fs::read_to_string(&out_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&out_path);
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            if parts.first() == Some(&"OK") && parts.len() >= 5 {
+                let vol: f64 = parts[1].parse().unwrap_or(f64::NAN);
+                let open: usize = parts[2].parse().unwrap_or(0);
+                let nonman: usize = parts[3].parse().unwrap_or(0);
+                let euler: i64 = parts[4].parse().unwrap_or(0);
+                kvol[opi] = Some(vol);
+                let t = t_for[opi];
+                if t >= 1e-3 && (vol - t).abs() / t.max(1e-3) > vol_tol {
+                    fails.push(Failure {
+                        label: lab.clone(),
+                        op: sym[opi],
+                        kind: "VOLUME",
+                        detail: format!(
+                            "kernel={vol:.4} truth={t:.4} ({:+.1}%)",
+                            100.0 * (vol - t) / t
+                        ),
+                    });
+                }
+                if open != 0 {
+                    fails.push(Failure {
+                        label: lab.clone(),
+                        op: sym[opi],
+                        kind: "WATERTIGHT",
+                        detail: format!("open_edges={open}"),
+                    });
+                }
+                if nonman != 0 {
+                    fails.push(Failure {
+                        label: lab.clone(),
+                        op: sym[opi],
+                        kind: "MANIFOLD",
+                        detail: format!("nonmanifold_edges={nonman}"),
+                    });
+                }
+                if euler != 0 {
+                    fails.push(Failure {
+                        label: lab.clone(),
+                        op: sym[opi],
+                        kind: "EULER",
+                        detail: format!("euler_residual={euler}"),
+                    });
+                }
+            } else {
+                fails.push(Failure {
+                    label: lab.clone(),
+                    op: sym[opi],
+                    kind: "ERROR",
+                    detail: "op errored (isolated)".to_string(),
+                });
+            }
+        }
+        fails.extend(boolean_invariant_failures(&lab, v_box, v_sph, kvol));
+    }
+
+    print_catalog(
+        "box ∘ sphere (subprocess-isolated)",
+        &fails,
+        configs.len(),
+        n_checks,
+    );
+    println!("TRUE HANGS (isolated) = {true_hangs}  — vs the in-process survey's HANG≈330 (leaked-thread starvation)\n");
 }
 
 // ===========================================================================
