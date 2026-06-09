@@ -3395,3 +3395,157 @@ fn diag_sphere_corner_union() {
         }
     }
 }
+
+// Instrument the 3 OPEN (single-use) edges of the sphere-corner UNION: dump
+// each open edge's endpoints, midpoint (arc vs chord ⇒ Circle vs Line), curve
+// id, and param range. Confirms whether the unwelded edges are great-circle
+// arcs and whether two of them are coincident-but-distinct (subdivision
+// mismatch) vs genuinely single-use. READ-ONLY (no kernel mutation).
+#[test]
+#[ignore = "diagnostic — dump sphere-corner ∪ open edges (run with --ignored --nocapture)"]
+fn diag_sphere_corner_union_open_edges() {
+    let mut model = BRepModel::new();
+    let bx = the_box(&mut model);
+    let sp = sphere(&mut model, [1.0, 1.0, 1.0], 0.8);
+    let res = match boolean_operation(
+        &mut model,
+        bx,
+        sp,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("union errored: {e:?}");
+            return;
+        }
+    };
+    let rep = brep_integrity(&model, res, 1e-6);
+    println!(
+        "\n=== sphere-corner ∪ open edges: {} single-use, {} non-manifold ===",
+        rep.edges_used_once.len(),
+        rep.edges_used_3plus.len()
+    );
+    let pos = |m: &BRepModel, vid| {
+        m.vertices
+            .get_position(vid)
+            .map(|p| [p[0], p[1], p[2]])
+            .unwrap_or([f64::NAN; 3])
+    };
+    for &eid in &rep.edges_used_once {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        let s = pos(&model, edge.start_vertex);
+        let e = pos(&model, edge.end_vertex);
+        let chord_mid = [
+            0.5 * (s[0] + e[0]),
+            0.5 * (s[1] + e[1]),
+            0.5 * (s[2] + e[2]),
+        ];
+        let (kind, mid) = match model.curves.get(edge.curve_id) {
+            Some(curve) => {
+                let t = 0.5 * (edge.param_range.start + edge.param_range.end);
+                match curve.evaluate(t) {
+                    Ok(p) => {
+                        let m = [p.position.x, p.position.y, p.position.z];
+                        let bow = ((m[0] - chord_mid[0]).powi(2)
+                            + (m[1] - chord_mid[1]).powi(2)
+                            + (m[2] - chord_mid[2]).powi(2))
+                        .sqrt();
+                        (if bow > 1e-6 { "ARC" } else { "LINE" }, m)
+                    }
+                    Err(_) => ("?", [f64::NAN; 3]),
+                }
+            }
+            None => ("?", [f64::NAN; 3]),
+        };
+        println!(
+            "  edge {:?} curve {:?} {kind}: start={:.3?} end={:.3?} mid={:.3?} range=[{:.3},{:.3}]",
+            eid, edge.curve_id, s, e, mid, edge.param_range.start, edge.param_range.end
+        );
+    }
+
+    // Face walk: for every face touching the corner triangle (any edge endpoint
+    // near A=(0.2,1,1), B=(1,0.2,1), C=(1,1,0.2)), print its surface type + the
+    // edges it owns. This shows whether a box PLANE face carries a partner bite
+    // arc at A-B-C (so the weld merely failed) or the box faces were never bitten.
+    let corners = [[0.2, 1.0, 1.0], [1.0, 0.2, 1.0], [1.0, 1.0, 0.2]];
+    let near_corner = |p: [f64; 3]| {
+        corners.iter().any(|q| {
+            (p[0] - q[0]).abs() < 0.02 && (p[1] - q[1]).abs() < 0.02 && (p[2] - q[2]).abs() < 0.02
+        })
+    };
+    let Some(solid) = model.solids.get(res) else {
+        return;
+    };
+    let mut shells = vec![solid.outer_shell];
+    shells.extend(solid.inner_shells.iter().copied());
+    // Surface-type tally: 7 external octants expected on the sphere; fewer ⇒
+    // corner-adjacent octants were dropped (classification), equal ⇒ unwelded.
+    {
+        let mut by_ty: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for &sh in &shells {
+            if let Some(shell) = model.shells.get(sh) {
+                for &fid in &shell.faces {
+                    if let Some(face) = model.faces.get(fid) {
+                        let ty = model
+                            .surfaces
+                            .get(face.surface_id)
+                            .map(|s| s.type_name())
+                            .unwrap_or("?");
+                        *by_ty.entry(ty).or_default() += 1;
+                    }
+                }
+            }
+        }
+        println!("--- result faces by surface type: {by_ty:?} ---");
+    }
+    println!("--- faces touching the A/B/C corner triangle ---");
+    for sh in shells {
+        let Some(shell) = model.shells.get(sh) else {
+            continue;
+        };
+        for &fid in &shell.faces {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            let sty = model
+                .surfaces
+                .get(face.surface_id)
+                .map(|s| s.type_name())
+                .unwrap_or("?");
+            let mut lids = vec![face.outer_loop];
+            lids.extend(face.inner_loops.iter().copied());
+            let mut touches = false;
+            let mut edge_descs: Vec<String> = Vec::new();
+            for lid in &lids {
+                let Some(lp) = model.loops.get(*lid) else {
+                    continue;
+                };
+                for &eid in &lp.edges {
+                    let Some(edge) = model.edges.get(eid) else {
+                        continue;
+                    };
+                    let s = pos(&model, edge.start_vertex);
+                    let e = pos(&model, edge.end_vertex);
+                    if near_corner(s) || near_corner(e) {
+                        touches = true;
+                        edge_descs.push(format!(
+                            "e{:?}(c{:?}) {:.2?}->{:.2?}",
+                            eid, edge.curve_id, s, e
+                        ));
+                    }
+                }
+            }
+            if touches {
+                println!(
+                    "  face {:?} surf={sty} loops={} corner_edges=[{}]",
+                    fid,
+                    lids.len(),
+                    edge_descs.join(", ")
+                );
+            }
+        }
+    }
+}
