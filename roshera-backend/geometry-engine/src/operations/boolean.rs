@@ -3327,7 +3327,7 @@ fn sphere_arrangement_faces(
     center: Point3,
     arc_edges: &[EdgeId],
 ) -> Vec<Vec<(EdgeId, bool)>> {
-    use crate::primitives::curve::Circle;
+    use crate::primitives::curve::{Arc, Circle};
 
     let pos = |vid: VertexId| -> Option<Point3> {
         model
@@ -3335,14 +3335,20 @@ fn sphere_arrangement_faces(
             .get_position(vid)
             .map(|p| Point3::new(p[0], p[1], p[2]))
     };
-    // Circle tangent at point `p` (unit, +parameter direction): axis × (p − cc).
+    // Circular tangent at point `p` (unit, +parameter direction): axis × (p − cc).
+    // A cut may be a full `Circle` or an `Arc` sub-edge (a great circle from a
+    // plane through the sphere centre splits into arcs); both carry (centre,
+    // normal).
     let tangent_at = |cid: CurveId, p: Point3| -> Option<Vector3> {
-        let circle = model.curves.get(cid)?.as_any().downcast_ref::<Circle>()?;
-        circle
-            .normal()
-            .cross(&(p - circle.center()))
-            .normalize()
-            .ok()
+        let curve = model.curves.get(cid)?;
+        let (cc, normal) = if let Some(circle) = curve.as_any().downcast_ref::<Circle>() {
+            (circle.center(), circle.normal())
+        } else if let Some(arc) = curve.as_any().downcast_ref::<Arc>() {
+            (arc.center, arc.normal)
+        } else {
+            return None;
+        };
+        normal.cross(&(p - cc)).normalize().ok()
     };
 
     // Each arc contributes two directed half-edges. For a half-edge we record its
@@ -3492,7 +3498,7 @@ fn split_sphere_face_by_circles(
     graph: &IntersectionGraph,
     boundary_empty: bool,
 ) -> Option<Vec<SplitFace>> {
-    use crate::primitives::curve::Circle;
+    use crate::primitives::curve::{Arc, Circle};
     use crate::primitives::surface::Sphere;
 
     if !boundary_empty {
@@ -3516,7 +3522,14 @@ fn split_sphere_face_by_circles(
             continue;
         };
         if let Some(curve) = model.curves.get(edge.curve_id) {
-            if curve.as_any().downcast_ref::<Circle>().is_some() {
+            // Accept both full `Circle` cuts and `Arc` sub-edges. A plane through
+            // the sphere CENTRE (sphere centred exactly on a box corner) cuts a
+            // great circle that, pre-split at its crossings, is materialised as
+            // `Arc`s, not sub-ranges of a shared `Circle` — a Circle-only filter
+            // left `by_curve` empty and the whole sphere went unsplit.
+            let circular = curve.as_any().downcast_ref::<Circle>().is_some()
+                || curve.as_any().downcast_ref::<Arc>().is_some();
+            if circular {
                 by_curve.entry(edge.curve_id).or_default().push(eid);
             }
         }
@@ -3547,13 +3560,40 @@ fn split_sphere_face_by_circles(
             if face_loops.len() < 2 {
                 return None;
             }
-            let mut faces: Vec<SplitFace> = Vec::new();
-            for loop_edges in face_loops {
-                // Interior point: mean of the loop's arc midpoints, projected to
-                // the sphere.
+            // Interior point per region. DEFAULT = mean of the loop's arc
+            // midpoints (robust for the normal case where every region has its
+            // OWN distinct arcs — e.g. the off-centre corner poke's many cells).
+            // EXCEPTION = a region and its COMPLEMENT that share ALL their arcs
+            // (a spherical triangle and "the rest of the sphere", e.g. the
+            // sphere-on-corner-vertex 2-region split): the mean lands on the SAME
+            // side for both and mis-classifies one, so place those by loop
+            // ORIENTATION (left of the directed boundary). Detect them as loops
+            // whose unordered edge-set is shared by ≥2 loops.
+            let edge_set = |lp: &[(EdgeId, bool)]| -> Vec<EdgeId> {
+                let mut k: Vec<EdgeId> = lp.iter().map(|&(e, _)| e).collect();
+                k.sort_unstable();
+                k.dedup();
+                k
+            };
+            let mut set_count: std::collections::BTreeMap<Vec<EdgeId>, usize> =
+                std::collections::BTreeMap::new();
+            for lp in &face_loops {
+                *set_count.entry(edge_set(lp)).or_default() += 1;
+            }
+            let circ_geom = |cid: CurveId| -> Option<(Point3, Vector3)> {
+                let c = model.curves.get(cid)?;
+                if let Some(ci) = c.as_any().downcast_ref::<Circle>() {
+                    Some((ci.center(), ci.normal()))
+                } else {
+                    c.as_any()
+                        .downcast_ref::<Arc>()
+                        .map(|ar| (ar.center, ar.normal))
+                }
+            };
+            let mean_interior = |lp: &[(EdgeId, bool)]| -> Option<Point3> {
                 let mut acc = Vector3::ZERO;
                 let mut cnt = 0.0;
-                for &(eid, _) in &loop_edges {
+                for &(eid, _) in lp {
                     if let Some(edge) = model.edges.get(eid) {
                         if let Some(curve) = model.curves.get(edge.curve_id) {
                             let t = 0.5 * (edge.param_range.start + edge.param_range.end);
@@ -3565,11 +3605,74 @@ fn split_sphere_face_by_circles(
                     }
                 }
                 if cnt == 0.0 {
-                    continue;
+                    return None;
                 }
-                let mean = Point3::ORIGIN + acc * (1.0 / cnt);
-                let dir = (mean - center).normalize().unwrap_or(Vector3::Z);
-                let interior = center + dir * radius;
+                let dir = ((Point3::ORIGIN + acc * (1.0 / cnt)) - center)
+                    .normalize()
+                    .unwrap_or(Vector3::Z);
+                Some(center + dir * radius)
+            };
+            let oriented_interior = |lp: &[(EdgeId, bool)]| -> Option<Point3> {
+                // Rim-centroid direction (always on the SMALL side of the shared
+                // boundary).
+                let mut acc = Vector3::ZERO;
+                let mut cnt = 0.0;
+                for &(eid, _) in lp {
+                    let edge = model.edges.get(eid)?;
+                    let curve = model.curves.get(edge.curve_id)?;
+                    let t = 0.5 * (edge.param_range.start + edge.param_range.end);
+                    if let Ok(p) = curve.evaluate(t) {
+                        acc = acc + (p.position - center);
+                        cnt += 1.0;
+                    }
+                }
+                if cnt == 0.0 {
+                    return None;
+                }
+                let cdir0 = (acc * (1.0 / cnt)).normalize().ok()?;
+                // Which side is THIS loop's interior? The LEFT of the first
+                // directed edge (tangent to the sphere). If it points toward
+                // cdir0 the face is the small (cdir0) side; otherwise it is the
+                // COMPLEMENT, whose interior is the antipode −cdir0 (deep in the
+                // 7/8 petal). Place the interior point DECISIVELY at ±cdir0·r so
+                // it drives BOTH the in/out classification AND the tessellation
+                // fan apex (a 0.1r nudge sits too near the rim to do either).
+                let &(eid, fwd) = lp.first()?;
+                let edge = model.edges.get(eid)?;
+                let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
+                let mp = model
+                    .curves
+                    .get(edge.curve_id)?
+                    .evaluate(tmid)
+                    .ok()?
+                    .position;
+                let (cc, normal) = circ_geom(edge.curve_id)?;
+                let mut tang = normal.cross(&(mp - cc)).normalize().ok()?;
+                if !fwd {
+                    tang = tang * -1.0;
+                }
+                let nout = (mp - center).normalize().ok()?;
+                let into_face = nout.cross(&tang);
+                let cdir0_tan = cdir0 - nout * cdir0.dot(&nout);
+                let side = if into_face.dot(&cdir0_tan) >= 0.0 {
+                    cdir0
+                } else {
+                    cdir0 * -1.0
+                };
+                Some(center + side * radius)
+            };
+            let mut faces: Vec<SplitFace> = Vec::new();
+            for loop_edges in face_loops {
+                let is_complement_pair =
+                    set_count.get(&edge_set(&loop_edges)).copied().unwrap_or(0) >= 2;
+                let interior = if is_complement_pair {
+                    oriented_interior(&loop_edges).or_else(|| mean_interior(&loop_edges))
+                } else {
+                    mean_interior(&loop_edges)
+                };
+                let Some(interior) = interior else {
+                    continue;
+                };
                 faces.push(SplitFace {
                     original_face: face_id,
                     surface: surface_id,
@@ -3582,6 +3685,21 @@ fn split_sphere_face_by_circles(
             }
             return (!faces.is_empty()).then_some(faces);
         }
+    }
+
+    // The disjoint-cap builder below assumes each cut is a full `Circle` (one cap
+    // per circle, on the side far from the centre). A non-intersecting `Arc` cut
+    // has no closed circle to cap, so defer to the generic splitter rather than
+    // mis-build a cap from an arc.
+    let all_full_circles = by_curve.keys().all(|&cid| {
+        model
+            .curves
+            .get(cid)
+            .map(|c| c.as_any().downcast_ref::<Circle>().is_some())
+            .unwrap_or(false)
+    });
+    if !all_full_circles {
+        return None;
     }
 
     // Order one circle's sub-edges into a connected (edge, forward) loop by
