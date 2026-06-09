@@ -283,6 +283,14 @@ pub struct BRepModel {
     /// anchor reassignment, and datum moves that walk the graph back
     /// to an anchored solid.
     pub location_cache: crate::primitives::datum::LocationDescriptorCache,
+    /// Per-face apex hint for spherical-cap tessellation, keyed by `FaceId`.
+    /// A cap bounded by a single cut circle has two valid hemispheres;
+    /// `(c_center - sphere_centre)·axis` cannot tell them apart at a great circle
+    /// (sphere centre on the cut plane). The boolean records the kept cap's apex
+    /// (its `SplitFace.interior_point`) here so `tessellate_spherical_cap` picks
+    /// the correct side. Populated per boolean result face; absent caps fall back
+    /// to the geometric test.
+    pub cap_apex_hint: DashMap<FaceId, Point3>,
     /// Optional recorder receiving one event per successful operation.
     /// `None` by default — tests and unattached models incur zero overhead.
     /// Attached via `attach_recorder` by the orchestration layer
@@ -353,6 +361,7 @@ impl BRepModel {
             datums,
             datum_graph: crate::primitives::datum::DatumGraph::new(),
             location_cache: crate::primitives::datum::LocationDescriptorCache::new(),
+            cap_apex_hint: DashMap::new(),
             recorder: None,
             tolerance,
         }
