@@ -1447,6 +1447,17 @@ fn tessellate_spherical_polygon(
         // polygon — let another path handle it.
         Err(_) => return false,
     };
+    // A region and its COMPLEMENT share the same rim, so the rim centroid sits on
+    // the SMALL side for BOTH — fanning from it would fill the small triangle even
+    // for the large complement (the 7/8 petal of a sphere-corner union). When the
+    // boolean recorded the face's own interior point (its region centroid), fan
+    // from THAT instead: for the complement it is the antipode −cdir, from which
+    // the 7/8 region is star-shaped.
+    if let Some(hint) = model.cap_apex_hint.get(&face.id) {
+        if let Ok(d) = (*hint.value() - o).normalize() {
+            cdir = d;
+        }
+    }
 
     // Order the rim by azimuth around the centroid so the fan always sees a
     // SIMPLE (non-self-crossing) boundary, independent of the order/handedness

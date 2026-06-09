@@ -3575,6 +3575,56 @@ fn box_minus_sphere_face_poke_gate() {
 }
 
 // ===========================================================================
+// SPHERE-CORNER RATCHET GATE — NON-ignored. Pins box ∘ sphere([1,1,1], r=0.8):
+// the sphere sits EXACTLY on the +++ corner vertex, so all 3 cut circles are
+// great circles through the centre — the degenerate 3-great-circle arrangement
+// that (a) only splits if `split_sphere_face_by_circles` accepts `Arc` cuts,
+// (b) needs a complement-aware interior point so the 7/8 petal classifies
+// Outside, and (c) needs `tessellate_spherical_polygon` to fan from the region
+// centroid (not the rim centroid) so the >hemisphere petal meshes outward. Locks
+// ∩≈0.268 / ∪≈9.877 / ∖≈7.732 + watertight. Serial `run_op` (correctness gates
+// never run under a wall-clock thread budget).
+// ===========================================================================
+#[test]
+fn sphere_corner_union_gate() {
+    let c = [1.0, 1.0, 1.0];
+    let r = 0.8_f64;
+    let cap_in = (4.0 / 3.0 * std::f64::consts::PI * r * r * r) / 8.0; // inside octant
+    let box_vol = (2.0 * BOX_HALF).powi(3);
+    let tol = 0.05;
+    let cases: [(BooleanOp, &str, f64); 3] = [
+        (BooleanOp::Intersection, "∩ (inside octant)", cap_in),
+        (
+            BooleanOp::Union,
+            "∪ (box + 7/8 sphere)",
+            box_vol + 7.0 * cap_in,
+        ),
+        (
+            BooleanOp::Difference,
+            "∖ (box − inside octant)",
+            box_vol - cap_in,
+        ),
+    ];
+    for (op, name, expect) in cases {
+        let f = run_op(op, |m| sphere(m, c, r))
+            .unwrap_or_else(|| panic!("sphere-corner {name}: kernel returned None"));
+        assert!(
+            (f.vol - expect).abs() <= tol,
+            "REGRESSION (sphere-corner): {name}: vol={:.4}, expected {:.4} (±{tol}) — the \
+             3-great-circle corner arrangement dropped/mis-meshed the 7/8 petal",
+            f.vol,
+            expect
+        );
+        assert!(
+            f.open_edges == 0 && f.nonmanifold_edges == 0,
+            "REGRESSION (sphere-corner): {name}: not watertight ({} open, {} non-manifold)",
+            f.open_edges,
+            f.nonmanifold_edges
+        );
+    }
+}
+
+// ===========================================================================
 // SPHERE-CORNER ∪ DIAGNOSTIC — next-worst cap-side target after BOOL-90-FIX.
 // Sphere centred EXACTLY on the +++ box corner vertex (1,1,1), r=0.8: by
 // symmetry exactly 1/8 of the sphere sits inside the box, so
