@@ -1391,6 +1391,296 @@ fn stitch_rings(
     }
 }
 
+/// Tessellate a LARGE spherical region bounded by a single outer arc-loop whose
+/// rim sits near-antipodal to the region's own centroid — the "sphere minus a
+/// small lens/cap" case. The driving example is box∪sphere where the sphere pokes
+/// a box EDGE: the kept (outside-the-box) region is most of the sphere, ringed by
+/// the two cut arcs that bound the small poked-in lens. `tessellate_spherical_-
+/// polygon`'s centroid fan correctly REJECTS this — the rim is ~π from the region
+/// centroid, so the geodesics from the centroid to the rim graze the hole and the
+/// region is NOT star-shaped from the centroid (the centroid's antipode lies
+/// inside the hole). Here we instead grid the whole sphere, keep the grid points
+/// on the region side via a spherical winding-number test against the rim, and
+/// stitch the grid's open boundary to the verbatim rim samples (bit-exact weld to
+/// the adjoining planar box faces). Same grid+stitch spine as
+/// `tessellate_spherical_central`, but the hole is a single OUTER arc-loop and the
+/// membership is plane-free, so it covers non-coplanar (multi-cut) rims that
+/// `loop_cut_circle` cannot describe. Returns `false` (falls through) for non-
+/// sphere / holed / small / hint-less faces, so it never contends with the
+/// centroid-fan or central paths that run before it.
+fn tessellate_spherical_large_region(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Sphere;
+    use std::collections::HashMap;
+
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() else {
+        return false;
+    };
+    // The boolean's region-interior point both proves this is an arrangement face
+    // and anchors the winding membership. Absent ⇒ not our case.
+    let Some(hint) = model.cap_apex_hint.get(&face.id) else {
+        return false;
+    };
+    let Some(lp) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if lp.edges.is_empty() {
+        return false;
+    }
+    let o = sphere.center;
+    let r = sphere.radius;
+    let osign = face.orientation.sign();
+
+    let rim_pos = loop_rim_samples(lp, model, cache);
+    if rim_pos.len() < 3 {
+        return false;
+    }
+    let rim_dirs: Vec<Vector3> = rim_pos
+        .iter()
+        .map(|&p| (p - o).normalize().unwrap_or(Vector3::Z))
+        .collect();
+    let Ok(apex) = (*hint.value() - o).normalize() else {
+        return false;
+    };
+    // Only the LARGE region: the rim must reach near-antipodal to the region
+    // centroid. Otherwise the centroid fan (`tessellate_spherical_polygon`, which
+    // runs first) already handles it correctly — don't duplicate or contend.
+    let max_ang = rim_dirs
+        .iter()
+        .map(|&d| d.dot(&apex).clamp(-1.0, 1.0).acos())
+        .fold(0.0_f64, f64::max);
+    if max_ang < std::f64::consts::PI * 0.95 {
+        return false;
+    }
+    // Rim centroid direction `rc` — points toward the SMALL cap (lens) the rim
+    // bounds, ≈ antipodal to the region apex. The lens is a small cap around `rc`;
+    // the large region is everything else.
+    let rc = rim_dirs
+        .iter()
+        .fold(Vector3::ZERO, |acc, &d| acc + d)
+        .normalize()
+        .unwrap_or(-apex);
+
+    // Spherical winding number of the rim polygon as seen from a unit direction
+    // `p`: the sum of signed angles ∠(R_i, p, R_{i+1}) measured about `p`. Its
+    // magnitude is ≈ 2π when the loop encircles `p` OR its antipode `−p` (the
+    // tangent-plane projection cannot tell `p` from `−p`), and ≈ 0 otherwise. So
+    // `|winding| > π` flags BOTH the small lens cap (around `rc`) and the antipodal
+    // cap (around `−rc ≈ apex`). We disambiguate with the `rc` hemisphere: a point
+    // is in the LENS iff the loop encircles it AND it sits on the rim-centroid
+    // side. The large region is the complement of the lens — this is robust even
+    // though the large region spans more than a hemisphere (the per-point winding
+    // alone cannot classify a >hemisphere region, but the small lens it can).
+    let winding = |p: Vector3| -> f64 {
+        let n = rim_dirs.len();
+        let mut sum = 0.0;
+        for i in 0..n {
+            let a = rim_dirs[i];
+            let b = rim_dirs[(i + 1) % n];
+            let ta = (a - p * a.dot(&p)).normalize();
+            let tb = (b - p * b.dot(&p)).normalize();
+            if let (Ok(ta), Ok(tb)) = (ta, tb) {
+                let cross = ta.cross(&tb).dot(&p);
+                let dot = ta.dot(&tb).clamp(-1.0, 1.0);
+                sum += cross.atan2(dot);
+            }
+        }
+        sum
+    };
+    let pi = std::f64::consts::PI;
+    let in_region = |p: Vector3| -> bool { !(winding(p).abs() > pi && p.dot(&rc) > 0.0) };
+
+    // Same lat-long grid + open-boundary extraction + rim stitch as
+    // `tessellate_spherical_central`. The (+u,+v) quad winds INWARD under the
+    // radial normal, so a Forward (outward) face needs the reversed winding.
+    let forward = !face.orientation.is_forward();
+    let tau = std::f64::consts::TAU;
+    let n_u = arc_steps_for_quality(tau, r, params).max(12);
+    let n_v = arc_steps_for_quality(pi, r, params).max(6);
+    let key = |i: usize, j: usize| -> u32 { (i * (n_v + 1) + j) as u32 };
+    let mut gpos = vec![vec![Point3::ORIGIN; n_v + 1]; n_u];
+    let mut gid = vec![vec![None::<u32>; n_v + 1]; n_u];
+    for i in 0..n_u {
+        let u = tau * (i as f64) / (n_u as f64);
+        for j in 0..=n_v {
+            let v = pi * (j as f64) / (n_v as f64);
+            let Ok(p) = surface.point_at(u, v) else {
+                continue;
+            };
+            gpos[i][j] = p;
+            let dir = (p - o).normalize().unwrap_or(Vector3::Z);
+            if in_region(dir) {
+                let normal = dir * osign;
+                gid[i][j] = Some(mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal,
+                    uv: None,
+                }));
+            }
+        }
+    }
+
+    let mut dir_edges: HashMap<(u32, u32), i32> = HashMap::new();
+    let mut tri_keyed = |ka: u32, kb: u32, kc: u32| {
+        for &(x, y) in &[(ka, kb), (kb, kc), (kc, ka)] {
+            *dir_edges.entry((x, y)).or_insert(0) += 1;
+        }
+    };
+    for i in 0..n_u {
+        let i2 = (i + 1) % n_u;
+        for j in 0..n_v {
+            if let (Some(a), Some(b), Some(c), Some(d)) =
+                (gid[i][j], gid[i2][j], gid[i][j + 1], gid[i2][j + 1])
+            {
+                let (ka, kb, kc, kd) = (key(i, j), key(i2, j), key(i, j + 1), key(i2, j + 1));
+                if forward {
+                    mesh.add_triangle(a, b, c);
+                    mesh.add_triangle(b, d, c);
+                    tri_keyed(ka, kb, kc);
+                    tri_keyed(kb, kd, kc);
+                } else {
+                    mesh.add_triangle(a, c, b);
+                    mesh.add_triangle(b, c, d);
+                    tri_keyed(ka, kc, kb);
+                    tri_keyed(kb, kc, kd);
+                }
+            }
+        }
+    }
+
+    // Open boundary directed edges (no reverse twin) → next-vertex chain.
+    let mut next: HashMap<u32, u32> = HashMap::new();
+    for (&(a, b), &cnt) in &dir_edges {
+        if cnt > 0 && !dir_edges.contains_key(&(b, a)) {
+            next.insert(a, b);
+        }
+    }
+    let decode = |k: u32| -> (u32, Point3) {
+        let i = (k as usize) / (n_v + 1);
+        let j = (k as usize) % (n_v + 1);
+        (gid[i][j].unwrap_or(0), gpos[i][j])
+    };
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut loops: Vec<Vec<u32>> = Vec::new();
+    for &start in next.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut loop_keys = Vec::new();
+        let mut cur = start;
+        let mut guard = 0;
+        loop {
+            if !visited.insert(cur) {
+                break;
+            }
+            loop_keys.push(cur);
+            cur = match next.get(&cur) {
+                Some(&n) => n,
+                None => break,
+            };
+            guard += 1;
+            if guard > n_u * (n_v + 1) + 4 {
+                break;
+            }
+            if cur == start {
+                break;
+            }
+        }
+        if loop_keys.len() >= 3 {
+            loops.push(loop_keys);
+        }
+    }
+    // A single outer-loop hole yields ONE real boundary ring; stitch the largest
+    // walked loop to the rim (a degenerate pole-row aliasing artefact, if any,
+    // is a tiny loop and is dropped). Stitching only the largest avoids double-
+    // covering the rim.
+    // The lat-long grid collapses both poles to a point, so each pole row emits a
+    // spurious zero-extent `n_u`-cycle of degenerate edges that the open-boundary
+    // walk reports as a "loop". The genuine boundary is the lens hole — pick the
+    // loop with the largest spatial extent (bbox diagonal); pole loops have ≈0.
+    let extent = |l: &[u32]| -> f64 {
+        let ps: Vec<Point3> = l.iter().map(|&k| decode(k).1).collect();
+        let (mut lo, mut hi) = (ps[0], ps[0]);
+        for p in &ps {
+            lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+            hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        }
+        (hi - lo).magnitude()
+    };
+    let Some(best) = loops.iter().max_by(|a, b| {
+        extent(a)
+            .partial_cmp(&extent(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        // No open boundary: the region wrapped the whole sphere — let the caller
+        // fall through (should not happen given max_ang ≥ 0.95π, but stay safe).
+        return false;
+    };
+    let b: Vec<(Point3, u32)> = best
+        .iter()
+        .map(|&k| decode(k))
+        .map(|(id, p)| (p, id))
+        .collect();
+
+    // Rim vertices (verbatim cache positions → bit-exact seam weld). Orient the
+    // rim ring the SAME rotational direction as the grid boundary so `stitch_rings`
+    // walks both consistently. Centre the angular frame on the rim centroid `rc`.
+    let seed = if rc.x.abs() < 0.9 {
+        Vector3::X
+    } else {
+        Vector3::Y
+    };
+    let e1 = (seed - rc * seed.dot(&rc))
+        .normalize()
+        .unwrap_or(Vector3::X);
+    let e2 = rc.cross(&e1);
+    let angle = |p: Point3| -> f64 {
+        let d = (p - o).normalize().unwrap_or(rc);
+        d.dot(&e2).atan2(d.dot(&e1))
+    };
+    let wrap = |mut d: f64| {
+        while d > pi {
+            d -= tau;
+        }
+        while d < -pi {
+            d += tau;
+        }
+        d
+    };
+    let signed = |ring: &[(Point3, u32)]| -> f64 {
+        (0..ring.len())
+            .map(|i| wrap(angle(ring[(i + 1) % ring.len()].0) - angle(ring[i].0)))
+            .sum()
+    };
+    let mut rim: Vec<(Point3, u32)> = rim_pos
+        .iter()
+        .zip(rim_dirs.iter())
+        .map(|(&p, &d)| {
+            let id = mesh.add_vertex(MeshVertex {
+                position: p,
+                normal: d * osign,
+                uv: None,
+            });
+            (p, id)
+        })
+        .collect();
+    if signed(&rim) * signed(&b) < 0.0 {
+        rim.reverse();
+    }
+    let outward = |c: Point3| (c - o) * osign;
+    stitch_rings(&b, &rim, &outward, mesh);
+    true
+}
+
 /// Tessellate an arc-bounded spherical POLYGON (a face of a mutually-intersecting
 /// cut-circle arrangement — the corner-poke case, where the region is a spherical
 /// triangle/quad bounded by circle arcs with no inner holes).
@@ -1618,6 +1908,12 @@ fn tessellate_spherical_face(
     // Arc-bounded spherical polygon (a face of a mutually-intersecting cut-circle
     // arrangement — e.g. a corner-poke spherical triangle).
     if tessellate_spherical_polygon(face, model, surface, _cache, params, mesh) {
+        return;
+    }
+    // Large region bounded by a single small outer arc-loop (sphere minus a small
+    // lens — the edge-poke union complement). The centroid fan above rejects it
+    // (rim near-antipodal to the centroid); grid + winding membership + rim stitch.
+    if tessellate_spherical_large_region(face, model, surface, _cache, params, mesh) {
         return;
     }
 
