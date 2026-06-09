@@ -39,7 +39,7 @@
 
 use geometry_engine::harness::brep_integrity::brep_integrity;
 use geometry_engine::math::{Point3, Vector3};
-use geometry_engine::operations::{boolean_operation, BooleanOp, BooleanOptions};
+use geometry_engine::operations::{boolean_operation, BooleanOp, BooleanOptions, OperationError};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use rayon::prelude::*;
@@ -212,7 +212,23 @@ fn run_op<F: Fn(&mut BRepModel) -> SolidId>(op: BooleanOp, build_b: F) -> Option
     let mut model = BRepModel::new();
     let bx = the_box(&mut model);
     let sp = build_b(&mut model);
-    let res = boolean_operation(&mut model, bx, sp, op, BooleanOptions::default()).ok()?;
+    let res = match boolean_operation(&mut model, bx, sp, op, BooleanOptions::default()) {
+        Ok(res) => res,
+        // A typed empty result is the volume-0 solid (A∖B with A⊆B, or a disjoint
+        // A∩B). Report it as such so the VOLUME oracle ACCEPTS it when truth≈0
+        // (engulf / disjoint — legitimately empty) and still flags it HARD when
+        // truth>0 (faces wrongly dropped, e.g. the tangent A∖B bug). This keeps
+        // real bugs loud while no longer counting a correct empty as a failure.
+        Err(OperationError::EmptyResult) => {
+            return Some(Facts {
+                vol: 0.0,
+                open_edges: 0,
+                nonmanifold_edges: 0,
+                euler_residual: 0,
+            })
+        }
+        Err(_) => return None,
+    };
     let vol = model.calculate_solid_volume(res)?;
     let rep = brep_integrity(&model, res, 1e-6);
     Some(Facts {

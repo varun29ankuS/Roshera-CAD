@@ -10577,11 +10577,14 @@ fn build_shells_from_faces(
     solid_b: SolidId,
 ) -> OperationResult<Vec<ShellId>> {
     if faces.is_empty() {
-        return Err(OperationError::InvalidBRep(format!(
-            "No faces to build shell from (tolerance={:.3e}, allow_non_manifold={})",
-            options.common.tolerance.distance(),
-            options.allow_non_manifold,
-        )));
+        // An empty face selection is a geometrically valid empty result — the
+        // whole of A was removed (A ∖ B with A ⊆ B) or A and B are disjoint
+        // (A ∩ B). Report it as the typed `EmptyResult` so callers can tell
+        // "the answer is nothing" apart from a malformed-B-Rep failure. (The
+        // kernel cannot itself decide whether the emptiness is the *intended*
+        // answer — a face-dropping bug also lands here — but the contract is
+        // honest: the selection produced no faces.)
+        return Err(OperationError::EmptyResult);
     }
 
     // Canonicalise geometrically coincident edges across operand solids.
