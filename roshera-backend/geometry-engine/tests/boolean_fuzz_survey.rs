@@ -58,39 +58,56 @@ struct GridTruth {
 }
 
 fn grid_truth(center: [f64; 3], r: f64) -> GridTruth {
-    let reach = (0..3).map(|i| center[i].abs() + r).fold(BOX_HALF, f64::max) + 0.05;
-    const N: usize = 96; // cells/axis; ~0.9M samples — ample for a 3% check
-    let cell = 2.0 * reach / N as f64;
-    let cv = cell * cell * cell;
-    let r2 = r * r;
-    let (mut i_n, mut u_n, mut d_n) = (0u64, 0u64, 0u64);
-    for i in 0..N {
-        let x = -reach + (i as f64 + 0.5) * cell;
-        let in_bx = x.abs() <= BOX_HALF;
-        for j in 0..N {
-            let y = -reach + (j as f64 + 0.5) * cell;
-            let in_by = in_bx && y.abs() <= BOX_HALF;
-            for k in 0..N {
-                let z = -reach + (k as f64 + 0.5) * cell;
-                let in_box = in_by && z.abs() <= BOX_HALF;
-                let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
-                let in_sph = dx * dx + dy * dy + dz * dz <= r2;
-                if in_box && in_sph {
-                    i_n += 1;
-                }
-                if in_box || in_sph {
-                    u_n += 1;
-                }
-                if in_box && !in_sph {
-                    d_n += 1;
+    // Box and sphere volumes are EXACT analytically; only their INTERSECTION is
+    // Monte-Carlo'd. Gridding the whole box+sphere over a sphere-sized `reach`
+    // biased the BOX estimate: a symmetric grid whose cell size rarely divides
+    // the 2.0 box edge over-counts the box by up to ~4.5% (e.g. poke+x r=0.5
+    // reported a UNION truth of 8.886, exceeding the true maximum box+sphere =
+    // 8.524, false-flagging a CORRECT kernel result). Estimating only the
+    // compact box∩sphere overlap keeps the discretised quantity small against
+    // the exact box (8.0), so union/difference land well inside the survey's 3%.
+    let box_vol = (2.0 * BOX_HALF).powi(3);
+    let sphere_vol = 4.0 / 3.0 * std::f64::consts::PI * r * r * r;
+    // Overlap AABB = box ∩ sphere-bounding-box, clipped per axis to the box.
+    let mut lo = [0.0_f64; 3];
+    let mut hi = [0.0_f64; 3];
+    for a in 0..3 {
+        lo[a] = (center[a] - r).max(-BOX_HALF);
+        hi[a] = (center[a] + r).min(BOX_HALF);
+    }
+    let intersection = if (0..3).any(|a| hi[a] <= lo[a]) {
+        0.0 // disjoint: sphere bbox does not meet the box on some axis
+    } else {
+        const N: usize = 96; // cells/axis over the (small) overlap box
+        let cell = [
+            (hi[0] - lo[0]) / N as f64,
+            (hi[1] - lo[1]) / N as f64,
+            (hi[2] - lo[2]) / N as f64,
+        ];
+        let cv = cell[0] * cell[1] * cell[2];
+        let r2 = r * r;
+        let mut n = 0u64;
+        for i in 0..N {
+            let x = lo[0] + (i as f64 + 0.5) * cell[0];
+            for j in 0..N {
+                let y = lo[1] + (j as f64 + 0.5) * cell[1];
+                for k in 0..N {
+                    let z = lo[2] + (k as f64 + 0.5) * cell[2];
+                    // Every sample lies inside the box by construction (the AABB
+                    // is clipped to the box), so only the sphere test matters.
+                    let (dx, dy, dz) = (x - center[0], y - center[1], z - center[2]);
+                    if dx * dx + dy * dy + dz * dz <= r2 {
+                        n += 1;
+                    }
                 }
             }
         }
-    }
+        n as f64 * cv
+    };
     GridTruth {
-        intersection: i_n as f64 * cv,
-        union: u_n as f64 * cv,
-        difference: d_n as f64 * cv,
+        intersection,
+        union: box_vol + sphere_vol - intersection,
+        difference: box_vol - intersection,
     }
 }
 
