@@ -10683,6 +10683,12 @@ fn build_shells_from_faces(
             // `add_inner_loop` fires on the live face.
             let face = Face::new(0, split_face.surface, loop_id, inherited_orientation);
             let face_id = model.faces.add(face);
+            // Record the kept cap's apex (its interior point) so
+            // `tessellate_spherical_cap` picks the correct hemisphere — the
+            // geometric c_center test is degenerate for a great-circle cut.
+            if let Some(ip) = split_face.interior_point {
+                model.cap_apex_hint.insert(face_id, ip);
+            }
             if !inner_loop_ids.is_empty() {
                 if let Some(face_mut) = model.faces.get_mut(face_id) {
                     for inner_id in inner_loop_ids {

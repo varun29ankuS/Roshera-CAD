@@ -923,9 +923,23 @@ fn tessellate_spherical_cap(
     }
     let m = rim.len();
 
-    // Cap apex = far pole on the circle's axis (the side away from the centre).
-    let h = (c_center - o).dot(&c_axis);
-    let a_dir = if h >= 0.0 { c_axis } else { -c_axis };
+    // Cap apex side = which hemisphere this face covers. Prefer the boolean's
+    // recorded hint (the kept cap's interior/apex point) — authoritative, and
+    // robust where the geometric (c_center-o)·c_axis test is DEGENERATE: a great
+    // circle (sphere centre on the cut plane, e.g. a box-face poke) gives h=0, and
+    // for the large/near-centre cap the c_center side is the wrong hemisphere.
+    // Falls back to the c_center test for non-boolean sphere caps (no hint).
+    let a_dir = if let Some(hint) = model.cap_apex_hint.get(&face.id) {
+        if (*hint.value() - o).dot(&c_axis) >= 0.0 {
+            c_axis
+        } else {
+            -c_axis
+        }
+    } else if (c_center - o).dot(&c_axis) >= 0.0 {
+        c_axis
+    } else {
+        -c_axis
+    };
     let apex = o + a_dir * r;
 
     let dirs: Vec<Vector3> = rim
@@ -962,15 +976,25 @@ fn tessellate_spherical_cap(
         uv: None,
     });
 
-    // Triangle (cross-product) winding must agree with the radial-outward vertex
-    // normals. The rim→apex ring traversal reverses handedness when the apex sits
-    // on the -c_axis side (h < 0), so the winding has to flip WITH the apex side,
-    // not key on face.orientation alone. Without this, a cap whose supporting
-    // sphere centre is on the far side of the cut plane (e.g. the second operand
-    // of a sphere-sphere lens) meshes inward while its vertex normals point
-    // outward; the Tonon signed-tet volume then sums the two cap fluxes with
-    // opposite sign and the lens collapses 5π/12 → π/4.
-    let forward = face.orientation.is_forward() ^ (h < 0.0);
+    // Self-correcting triangle winding: keep the candidate "forward" order iff its
+    // geometric (cross-product) normal already agrees with the radial vertex
+    // normals (× osign); else flip. Robust for any apex side / orientation — and
+    // critically, it CANNOT desync from a_dir the way an h-keyed flip does. (The
+    // old `is_forward() ^ (h<0)` flipped on h, but a hint that moves a_dir at a
+    // great circle leaves h=0 unchanged, so the cap meshed inward and its flux
+    // cancelled the opposing cap to 0.)
+    let forward = {
+        let p_i = rim[0];
+        let p_j = rim[1 % m];
+        let p_b = if rings >= 2 {
+            o + slerp_unit(dirs[0], a_dir, 1.0 / rings as f64) * r
+        } else {
+            apex
+        };
+        let g = (p_j - p_i).cross(&(p_b - p_i));
+        let desired = (p_i - o) * osign;
+        g.dot(&desired) >= 0.0
+    };
     for s in 0..rings - 1 {
         let a = &ring_idx[s];
         let b = &ring_idx[s + 1];
