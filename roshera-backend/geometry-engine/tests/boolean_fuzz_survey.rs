@@ -3634,9 +3634,15 @@ fn sphere_corner_union_gate() {
 // ===========================================================================
 #[test]
 fn sphere_near_vertex_union_gate() {
-    let cells: [([f64; 3], f64, &str); 2] = [
+    let cells: [([f64; 3], f64, &str); 3] = [
         ([0.9, 0.9, 0.9], 0.8, "corner-inside"),
         ([1.0, 1.0, 0.3], 0.8, "edge+x+y-off"),
+        // BOOL-EDGE-POKE-MESH (#92): sphere pokes a box EDGE — the kept ∪ region is
+        // most of the sphere ringed by a small two-arc lens (sphere-minus-lens). The
+        // centroid fan rejects it (rim near-antipodal to the region centroid); the
+        // large-region grid+winding+stitch path meshes it watertight + exact. Was
+        // 7.91 vs 11.59 (−32%) before the fix.
+        ([1.6, 1.6, 0.0], 0.95, "poke-edge"),
     ];
     let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
         (BooleanOp::Intersection, "∩", |g| g.intersection),
