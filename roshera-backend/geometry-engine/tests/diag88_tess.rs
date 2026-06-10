@@ -32,6 +32,27 @@ fn sphere(model: &mut BRepModel, c: [f64; 3], r: f64) -> SolidId {
 }
 
 #[test]
+#[ignore = "diagnostic — LAST survey HARD cell: face+x-offset r=1.2 ∪ (run with --ignored --nocapture)"]
+fn diag88_face_x_offset() {
+    for (op, sym) in [
+        (BooleanOp::Union, "U"),
+        (BooleanOp::Intersection, "I"),
+        (BooleanOp::Difference, "D"),
+    ] {
+        let mut model = BRepModel::new();
+        let bx = the_box(&mut model);
+        let sp = sphere(&mut model, [1.0, 0.3, -0.2], 1.2);
+        match boolean_operation(&mut model, bx, sp, op, BooleanOptions::default()) {
+            Ok(res) => {
+                let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+                println!("== face+x-offset r=1.2 {sym}: vol={vol:.4} ==");
+            }
+            Err(e) => println!("== face+x-offset r=1.2 {sym}: ERR {e:?} =="),
+        }
+    }
+}
+
+#[test]
 #[ignore = "diagnostic — #88 r=1.2 crossing-presplit routing (run with --ignored --nocapture)"]
 fn diag88_r12_presplit() {
     for (op, sym) in [(BooleanOp::Intersection, "I"), (BooleanOp::Union, "U")] {

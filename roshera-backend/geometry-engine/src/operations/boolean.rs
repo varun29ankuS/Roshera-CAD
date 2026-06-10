@@ -4104,8 +4104,16 @@ fn split_sphere_face_by_circles(
                 }
                 (!hs.is_empty()).then_some(hs)
             };
-            let passes = |hs: &[(Point3, Vector3)], p: Point3| -> bool {
-                hs.iter().all(|&(cc, n)| (p - cc).dot(&n) >= 0.0)
+            // Positive clearance required: a GREAT-circle cut (sphere centred
+            // on the host plane) gives a hemisphere fragment whose boundary
+            // lies entirely IN the cut plane — its mean-of-midpoints interior
+            // lands exactly ON the plane, classifies OnBoundary, and Union
+            // drops the whole external hemisphere (face+x-offset r=1.2:
+            // ∪ 6.01 vs 12.29). An on-plane point must FAIL so the nudged
+            // verified sample (clearly off-plane) replaces it.
+            let pass_margin = (radius * 1e-4).max(1e-9);
+            let passes = move |hs: &[(Point3, Vector3)], p: Point3| -> bool {
+                hs.iter().all(|&(cc, n)| (p - cc).dot(&n) >= pass_margin)
             };
             let verified_interior = |lp: &[(EdgeId, bool)]| -> Option<Point3> {
                 let hs = loop_halfspaces(lp)?;
