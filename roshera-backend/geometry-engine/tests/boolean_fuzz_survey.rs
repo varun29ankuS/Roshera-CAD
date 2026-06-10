@@ -1566,6 +1566,14 @@ fn boolean_box_sphere_survey_isolated() {
 // what keeps the indices in sync. The box∘sphere driver above predates this
 // machinery and is kept verbatim (same child protocol, FUZZ_FAMILY unset).
 // Slow (spawns 3·|cfg| processes); all #[ignore], never part of the green gate.
+//
+// RUN THE DRIVERS ONE AT A TIME (or with --test-threads=1). A wall-clock
+// budget is only meaningful when the child owns the machine: running several
+// drivers as concurrent libtest threads multiplies child processes and the
+// CPU contention pushed legitimate ~9s cells (cyl axial-through ∩, torus
+// corner ∩ — both verified FINITE in solo runs) over the old 10s budget,
+// recreating the false-HANG class subprocess isolation exists to kill.
+// Budget is 30s for the same reason: TRUE hang must mean "not slow".
 // ===========================================================================
 
 /// `run_pair` with `run_op`'s EmptyResult honesty: a typed empty result is the
@@ -1886,25 +1894,25 @@ fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: 
 #[test]
 #[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
 fn boolean_box_cyl_survey_isolated() {
-    isolated_matrix_survey("cyl", "box ∘ cylinder (subprocess-isolated)", 0.03, 10);
+    isolated_matrix_survey("cyl", "box ∘ cylinder (subprocess-isolated)", 0.03, 30);
 }
 
 #[test]
 #[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
 fn boolean_box_cone_survey_isolated() {
-    isolated_matrix_survey("cone", "box ∘ cone (subprocess-isolated)", 0.03, 10);
+    isolated_matrix_survey("cone", "box ∘ cone (subprocess-isolated)", 0.03, 30);
 }
 
 #[test]
 #[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
 fn boolean_box_rbox_survey_isolated() {
-    isolated_matrix_survey("rbox", "box ∘ rotated-box (subprocess-isolated)", 0.03, 10);
+    isolated_matrix_survey("rbox", "box ∘ rotated-box (subprocess-isolated)", 0.03, 30);
 }
 
 #[test]
 #[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
 fn boolean_box_torus_survey_isolated() {
-    isolated_matrix_survey("torus", "box ∘ torus (subprocess-isolated)", 0.03, 10);
+    isolated_matrix_survey("torus", "box ∘ torus (subprocess-isolated)", 0.03, 30);
 }
 
 #[test]
@@ -1914,14 +1922,14 @@ fn boolean_box_tcyl_survey_isolated() {
         "tcyl",
         "box ∘ tilted-cylinder (subprocess-isolated)",
         0.03,
-        10,
+        30,
     );
 }
 
 #[test]
 #[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
 fn boolean_sphere_sphere_survey_isolated() {
-    isolated_matrix_survey("ss", "sphere ∘ sphere (subprocess-isolated)", 0.05, 10);
+    isolated_matrix_survey("ss", "sphere ∘ sphere (subprocess-isolated)", 0.05, 30);
 }
 
 // ===========================================================================
