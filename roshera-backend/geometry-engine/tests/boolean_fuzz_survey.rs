@@ -3690,6 +3690,50 @@ fn sphere_near_vertex_union_gate() {
 }
 
 // ===========================================================================
+// SPHERE-CONTAINMENT RATCHET GATE — NON-ignored. Locks the #90 tangent/contained
+// fix: a sphere strictly INSIDE the box (r=0.8) and a sphere TANGENT to all 6
+// faces (r=1.0) must give exact ∩/∪/∖ + watertight. The tangent case was the
+// face-drop bug (box∩sphere → box 8.0 not 4.19; box∖sphere → dropped faces),
+// fixed by the isolated-contact multi-sample classifier (50f0480). The contained
+// case guards the un-touched strict-interior path. Inclusion-exclusion
+// (V(∩)+V(∪)=V(A)+V(B)) is implied by all three matching grid truth.
+// ===========================================================================
+#[test]
+fn sphere_containment_gate() {
+    let cells: [([f64; 3], f64, &str); 2] = [
+        ([0.0, 0.0, 0.0], 0.8, "contained"),
+        ([0.0, 0.0, 0.0], 1.0, "tangent-6face"),
+    ];
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let tol = 0.05;
+    for (c, r, name) in cells {
+        let truth = grid_truth(c, r);
+        for &(op, sym, pick) in &ops {
+            let t = pick(&truth);
+            let f = run_op(op, move |m| sphere(m, c, r))
+                .unwrap_or_else(|| panic!("containment {name} {sym}: kernel None"));
+            let rel = (f.vol - t).abs() / t.max(1e-3);
+            assert!(
+                rel <= tol,
+                "REGRESSION (containment): {name} {sym}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+                f.vol,
+                100.0 * (f.vol - t) / t,
+                100.0 * tol
+            );
+            assert!(
+                f.open_edges == 0 && f.nonmanifold_edges == 0,
+                "REGRESSION (containment): {name} {sym}: not watertight ({} open)",
+                f.open_edges
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // SPHERE-CORNER ∪ DIAGNOSTIC — next-worst cap-side target after BOOL-90-FIX.
 // Sphere centred EXACTLY on the +++ box corner vertex (1,1,1), r=0.8: by
 // symmetry exactly 1/8 of the sphere sits inside the box, so
