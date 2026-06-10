@@ -1391,6 +1391,323 @@ fn stitch_rings(
     }
 }
 
+/// Tessellate a spherical region bounded by an OUTER arc-loop AND ≥1 cut-circle
+/// inner-loop holes — the multi-component poke-through face (#88): e.g. a sphere
+/// poking two opposite box faces (two small circle holes) AND a box edge (the
+/// 2-arc lens whose complement is this region's outer boundary).
+///
+/// Neither existing path covers it: `tessellate_spherical_central` ignores the
+/// outer loop entirely (it would mesh over the lens), and
+/// `tessellate_spherical_large_region` requires no holes. This combines them:
+/// lat-long grid, membership = (outer-plane half-spaces, signed by the boolean's
+/// region-interior hint) ∧ (hole-plane half-spaces, sphere-centre side), then
+/// each open grid-boundary ring is matched to its nearest rim (hole rims + the
+/// outer rim, verbatim cache samples → bit-exact weld) and stitched.
+///
+/// The half-space ∧ membership is exact when the region is the INTERSECTION
+/// side of its outer planes (true for the poke-through family, where the kept
+/// region is the sphere minus per-plane protrusions). The interior hint is
+/// verified against the membership before committing; any mismatch falls
+/// through to the other paths.
+fn tessellate_spherical_holed_region(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::curve::{Arc, Circle};
+    use crate::primitives::surface::Sphere;
+    use std::collections::HashMap;
+
+    if face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(sphere) = surface.as_any().downcast_ref::<Sphere>() else {
+        return false;
+    };
+    let Some(outer) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if outer.edges.len() < 2 {
+        return false;
+    }
+    let Some(hint) = model.cap_apex_hint.get(&face.id) else {
+        return false;
+    };
+    let hint = *hint.value();
+    let o = sphere.center;
+    let r = sphere.radius;
+    let osign = face.orientation.sign();
+
+    // Outer-loop cut planes, deduped; the face side of each is the hint's side.
+    let mut planes: Vec<(Point3, Vector3, f64)> = Vec::new(); // (cc, n, sign)
+    for &eid in &outer.edges {
+        let Some(edge) = model.edges.get(eid) else {
+            return false;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            return false;
+        };
+        let (cc, n_raw) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
+            (ci.center(), ci.normal())
+        } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
+            (ar.center, ar.normal)
+        } else {
+            return false;
+        };
+        let Ok(n) = n_raw.normalize() else {
+            return false;
+        };
+        let dup = planes
+            .iter()
+            .any(|&(pc, pn, _)| n.dot(&pn).abs() > 1.0 - 1e-9 && (cc - pc).dot(&pn).abs() < 1e-9);
+        if !dup {
+            let side = (hint - cc).dot(&n);
+            if side.abs() < 1e-12 {
+                return false; // hint on a cut plane — ambiguous
+            }
+            planes.push((cc, n, side.signum()));
+        }
+    }
+    // Single-plane outers belong to the cap/central/large paths.
+    if planes.len() < 2 {
+        return false;
+    }
+
+    // Hole planes (cut circles), kept side = sphere-centre side.
+    struct Hole {
+        center: Point3,
+        axis: Vector3,
+        rim: Vec<Point3>,
+    }
+    let mut holes: Vec<Hole> = Vec::new();
+    for &lid in &face.inner_loops {
+        let Some(lp) = model.loops.get(lid) else {
+            return false;
+        };
+        let Some((c, n)) = loop_cut_circle(lp, model) else {
+            return false;
+        };
+        let rim = loop_rim_samples(lp, model, cache);
+        if rim.len() < 3 {
+            return false;
+        }
+        holes.push(Hole {
+            center: c,
+            axis: n,
+            rim,
+        });
+    }
+
+    let in_region = |p: Point3| -> bool {
+        planes.iter().all(|&(cc, n, s)| (p - cc).dot(&n) * s >= 0.0)
+            && holes.iter().all(|h| {
+                let pp = (p - h.center).dot(&h.axis);
+                let oo = (o - h.center).dot(&h.axis);
+                pp * oo >= 0.0
+            })
+    };
+    if !in_region(hint) {
+        return false; // membership model contradicts the interior hint
+    }
+
+    let outer_rim = loop_rim_samples(outer, model, cache);
+    if outer_rim.len() < 3 {
+        return false;
+    }
+
+    // Lat-long grid, kept where in_region (same spine as central/large_region).
+    let forward = !face.orientation.is_forward();
+    let pi = std::f64::consts::PI;
+    let tau = std::f64::consts::TAU;
+    let n_u = arc_steps_for_quality(tau, r, params).max(12);
+    let n_v = arc_steps_for_quality(pi, r, params).max(6);
+    let key = |i: usize, j: usize| -> u32 { (i * (n_v + 1) + j) as u32 };
+    let mut gpos = vec![vec![Point3::ORIGIN; n_v + 1]; n_u];
+    let mut gid = vec![vec![None::<u32>; n_v + 1]; n_u];
+    for i in 0..n_u {
+        let u = tau * (i as f64) / (n_u as f64);
+        for j in 0..=n_v {
+            let v = pi * (j as f64) / (n_v as f64);
+            let Ok(p) = surface.point_at(u, v) else {
+                continue;
+            };
+            gpos[i][j] = p;
+            if in_region(p) {
+                let normal = (p - o).normalize().unwrap_or(Vector3::Z) * osign;
+                gid[i][j] = Some(mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal,
+                    uv: None,
+                }));
+            }
+        }
+    }
+
+    let mut dir_edges: HashMap<(u32, u32), i32> = HashMap::new();
+    let mut tri_keyed = |ka: u32, kb: u32, kc: u32| {
+        for &(x, y) in &[(ka, kb), (kb, kc), (kc, ka)] {
+            *dir_edges.entry((x, y)).or_insert(0) += 1;
+        }
+    };
+    for i in 0..n_u {
+        let i2 = (i + 1) % n_u;
+        for j in 0..n_v {
+            if let (Some(a), Some(b), Some(c), Some(d)) =
+                (gid[i][j], gid[i2][j], gid[i][j + 1], gid[i2][j + 1])
+            {
+                let (ka, kb, kc, kd) = (key(i, j), key(i2, j), key(i, j + 1), key(i2, j + 1));
+                if forward {
+                    mesh.add_triangle(a, b, c);
+                    mesh.add_triangle(b, d, c);
+                    tri_keyed(ka, kb, kc);
+                    tri_keyed(kb, kd, kc);
+                } else {
+                    mesh.add_triangle(a, c, b);
+                    mesh.add_triangle(b, c, d);
+                    tri_keyed(ka, kc, kb);
+                    tri_keyed(kb, kc, kd);
+                }
+            }
+        }
+    }
+
+    let mut next: HashMap<u32, u32> = HashMap::new();
+    for (&(a, b), &cnt) in &dir_edges {
+        if cnt > 0 && !dir_edges.contains_key(&(b, a)) {
+            next.insert(a, b);
+        }
+    }
+    let decode = |k: u32| -> (u32, Point3) {
+        let i = (k as usize) / (n_v + 1);
+        let j = (k as usize) % (n_v + 1);
+        (gid[i][j].unwrap_or(0), gpos[i][j])
+    };
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut loops: Vec<Vec<u32>> = Vec::new();
+    for &start in next.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut loop_keys = Vec::new();
+        let mut cur = start;
+        let mut guard = 0;
+        loop {
+            if !visited.insert(cur) {
+                break;
+            }
+            loop_keys.push(cur);
+            cur = match next.get(&cur) {
+                Some(&n) => n,
+                None => break,
+            };
+            guard += 1;
+            if guard > n_u * (n_v + 1) + 4 {
+                break;
+            }
+            if cur == start {
+                break;
+            }
+        }
+        if loop_keys.len() >= 3 {
+            loops.push(loop_keys);
+        }
+    }
+
+    // Match each walked grid-boundary ring to its nearest rim (mean nearest-
+    // sample distance — plane-free, works for the multi-plane outer rim), and
+    // stitch with the rim's centroid-direction angular frame. Each rim is
+    // stitched at most once (best-matching ring wins); spurious pole-row rings
+    // have huge mean distance to every rim and lose the match.
+    let mut rims: Vec<Vec<Point3>> = holes.iter().map(|h| h.rim.clone()).collect();
+    rims.push(outer_rim);
+    let mean_dist = |ring: &[u32], rim: &[Point3]| -> f64 {
+        let mut total = 0.0;
+        for &k in ring {
+            let p = decode(k).1;
+            let d = rim
+                .iter()
+                .map(|&q| (q - p).magnitude())
+                .fold(f64::INFINITY, f64::min);
+            total += d;
+        }
+        total / (ring.len() as f64)
+    };
+    let wrap = |mut d: f64| {
+        while d > pi {
+            d -= tau;
+        }
+        while d < -pi {
+            d += tau;
+        }
+        d
+    };
+    let mut used: Vec<bool> = vec![false; loops.len()];
+    for rim_pos in &rims {
+        let Some(bi) = (0..loops.len()).filter(|&i| !used[i]).min_by(|&a, &b| {
+            mean_dist(&loops[a], rim_pos)
+                .partial_cmp(&mean_dist(&loops[b], rim_pos))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
+            continue;
+        };
+        used[bi] = true;
+        let best = &loops[bi];
+        let b: Vec<(Point3, u32)> = best
+            .iter()
+            .map(|&k| decode(k))
+            .map(|(id, p)| (p, id))
+            .collect();
+        let rim_dirs: Vec<Vector3> = rim_pos
+            .iter()
+            .map(|&p| (p - o).normalize().unwrap_or(Vector3::Z))
+            .collect();
+        let rc = rim_dirs
+            .iter()
+            .fold(Vector3::ZERO, |acc, &d| acc + d)
+            .normalize()
+            .unwrap_or(Vector3::Z);
+        let seed = if rc.x.abs() < 0.9 {
+            Vector3::X
+        } else {
+            Vector3::Y
+        };
+        let e1 = (seed - rc * seed.dot(&rc))
+            .normalize()
+            .unwrap_or(Vector3::X);
+        let e2 = rc.cross(&e1);
+        let angle = |p: Point3| -> f64 {
+            let d = (p - o).normalize().unwrap_or(rc);
+            d.dot(&e2).atan2(d.dot(&e1))
+        };
+        let signed = |ring: &[(Point3, u32)]| -> f64 {
+            (0..ring.len())
+                .map(|i| wrap(angle(ring[(i + 1) % ring.len()].0) - angle(ring[i].0)))
+                .sum()
+        };
+        let mut rim: Vec<(Point3, u32)> = rim_pos
+            .iter()
+            .zip(rim_dirs.iter())
+            .map(|(&p, &d)| {
+                let id = mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal: d * osign,
+                    uv: None,
+                });
+                (p, id)
+            })
+            .collect();
+        if signed(&rim) * signed(&b) < 0.0 {
+            rim.reverse();
+        }
+        let outward = |c: Point3| (c - o) * osign;
+        stitch_rings(&b, &rim, &outward, mesh);
+    }
+    true
+}
+
 /// Tessellate a LARGE spherical region bounded by a single outer arc-loop whose
 /// rim sits near-antipodal to the region's own centroid — the "sphere minus a
 /// small lens/cap" case. The driving example is box∪sphere where the sphere pokes
@@ -1898,6 +2215,12 @@ fn tessellate_spherical_face(
     // membership-gated grid below. Falls through for untrimmed / multi-loop
     // sphere faces.
     if tessellate_spherical_cap(face, model, surface, _cache, params, mesh) {
+        return;
+    }
+    // Outer arc-loop + cut-circle holes (#88 multi-component poke-through):
+    // must run before `central`, which ignores the outer loop and would mesh
+    // over the lens region the outer boundary excludes.
+    if tessellate_spherical_holed_region(face, model, surface, _cache, params, mesh) {
         return;
     }
     // Multi-hole central region: sphere minus N caps, grid + boundary-loop
