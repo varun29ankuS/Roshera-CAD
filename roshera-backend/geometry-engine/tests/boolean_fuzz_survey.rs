@@ -1269,10 +1269,12 @@ fn boolean_sphere_sphere_fuzz_survey() {
 // part of the green gate, so a slow/again-flaky child can never break CI.
 // ===========================================================================
 
-/// One box∘sphere config in its own process. Env: FUZZ_CFG (flat index into
-/// placements×radii), FUZZ_OP (0=∩,1=∪,2=∖). No timeout — hangs if the op hangs.
+/// One matrix config in its own process. Env: FUZZ_FAMILY (sphere|cyl|cone|
+/// rbox|torus|tcyl|ss; default sphere — the original box∘sphere protocol),
+/// FUZZ_CFG (index into that family's config table), FUZZ_OP (0=∩,1=∪,2=∖).
+/// No timeout — hangs if the op hangs.
 #[test]
-#[ignore = "internal single-shot spawned by hang_isolation_survey"]
+#[ignore = "internal single-shot spawned by the isolated survey drivers"]
 fn fuzz_single_shot() {
     let cfg = match std::env::var("FUZZ_CFG")
         .ok()
@@ -1290,14 +1292,7 @@ fn fuzz_single_shot() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-
-    let mut configs: Vec<([f64; 3], &'static str, f64)> = Vec::new();
-    for (c, label) in placements() {
-        for &r in radii() {
-            configs.push((c, label, r));
-        }
-    }
-    let (center, _label, r) = configs[cfg];
+    let family = std::env::var("FUZZ_FAMILY").unwrap_or_else(|_| "sphere".to_string());
     let op = [
         BooleanOp::Intersection,
         BooleanOp::Union,
@@ -1305,7 +1300,13 @@ fn fuzz_single_shot() {
     ][opi];
 
     // Direct call — no timeout thread. The parent owns the wall-clock budget.
-    let facts = run_op(op, move |m| sphere(m, center, r));
+    let facts = match run_matrix_cell(&family, cfg, op) {
+        Some(f) => f,
+        None => {
+            println!("fuzz_single_shot: unknown family/cfg {family}/{cfg} — skipping");
+            return;
+        }
+    };
     // When the driver passes FUZZ_OUT, write the full facts so the parent can
     // run the oracle + invariants on an ISOLATED result (no leaked-thread
     // starvation). Format: "OK <vol> <open> <nonmanifold> <euler>" or "ERR".
@@ -1319,7 +1320,10 @@ fn fuzz_single_shot() {
         };
         let _ = std::fs::write(path, line);
     }
-    println!("SINGLE_SHOT_DONE cfg={cfg} op={opi} ok={}", facts.is_some());
+    println!(
+        "SINGLE_SHOT_DONE family={family} cfg={cfg} op={opi} ok={}",
+        facts.is_some()
+    );
 }
 
 #[test]
@@ -1539,6 +1543,376 @@ fn boolean_box_sphere_survey_isolated() {
         n_checks,
     );
     println!("TRUE HANGS (isolated) = {true_hangs}  — vs the in-process survey's HANG≈330 (leaked-thread starvation)\n");
+}
+
+// ===========================================================================
+// #91 GENERALIZATION — subprocess isolation for the WHOLE primitive matrix.
+//
+// The in-process pair surveys share `run_op_timed`/`run_pair_timed`'s
+// leaked-thread weakness: every true hang burns a core for the rest of the
+// run, starving healthy configs into false HANGs AND masking their volume /
+// invariant failures (a hung op yields no volume, so its checks are skipped —
+// the 2026-06-10 face-great-circle ∩ +35% bug hid under a HANG bin exactly
+// this way; the 2026-06-10 re-run flagged 463/480 box∘sphere checks HANG on a
+// loaded host while the serial gates were green). These drivers run every
+// (config, op) in its own KILLED-on-timeout process: a hung child cannot
+// starve siblings, and every healthy config's full facts are checked.
+//
+// Child protocol (`fuzz_single_shot`): FUZZ_FAMILY selects the config table,
+// FUZZ_CFG the cell, FUZZ_OP the op, FUZZ_OUT the facts file. The parent
+// (`isolated_matrix_survey`) owns the wall-clock budget and the oracle.
+// `matrix_cells` (parent metadata) and `run_matrix_cell` (child build+run)
+// MUST walk the same config fns in the same order — that shared iteration is
+// what keeps the indices in sync. The box∘sphere driver above predates this
+// machinery and is kept verbatim (same child protocol, FUZZ_FAMILY unset).
+// Slow (spawns 3·|cfg| processes); all #[ignore], never part of the green gate.
+// ===========================================================================
+
+/// `run_pair` with `run_op`'s EmptyResult honesty: a typed empty result is the
+/// volume-0 solid, so the VOLUME oracle accepts it when truth≈0 (disjoint ∩,
+/// engulfed ∖) and still flags it HARD when truth>0 (faces wrongly dropped).
+fn run_pair_empty_ok<A, B>(op: BooleanOp, build_a: A, build_b: B) -> Option<Facts>
+where
+    A: Fn(&mut BRepModel) -> SolidId,
+    B: Fn(&mut BRepModel) -> SolidId,
+{
+    let mut model = BRepModel::new();
+    let a = build_a(&mut model);
+    let b = build_b(&mut model);
+    let res = match boolean_operation(&mut model, a, b, op, BooleanOptions::default()) {
+        Ok(res) => res,
+        Err(OperationError::EmptyResult) => {
+            return Some(Facts {
+                vol: 0.0,
+                open_edges: 0,
+                nonmanifold_edges: 0,
+                euler_residual: 0,
+            })
+        }
+        Err(_) => return None,
+    };
+    let vol = model.calculate_solid_volume(res)?;
+    let rep = brep_integrity(&model, res, 1e-6);
+    Some(Facts {
+        vol,
+        open_edges: rep.edges_used_once.len(),
+        nonmanifold_edges: rep.edges_used_3plus.len(),
+        euler_residual: rep.euler_poincare_genus0_residual(),
+    })
+}
+
+/// Parent-side cell metadata for `family`: display label, grid truth, exact
+/// operand volumes (for the oracle-free INCL-EXCL/BOUNDS/DIFF-ID invariants).
+struct MatrixCell {
+    label: String,
+    truth: GridTruth,
+    v_a: f64,
+    v_b: f64,
+}
+
+fn matrix_cells(family: &str) -> Vec<MatrixCell> {
+    use std::f64::consts::PI;
+    let v_box = (2.0 * BOX_HALF).powi(3);
+    match family {
+        "sphere" => {
+            let mut out = Vec::new();
+            for (c, label) in placements() {
+                for &r in radii() {
+                    out.push(MatrixCell {
+                        label: format!("{label} r={r}"),
+                        truth: grid_truth(c, r),
+                        v_a: v_box,
+                        v_b: 4.0 / 3.0 * PI * r * r * r,
+                    });
+                }
+            }
+            out
+        }
+        "cyl" => cyl_configs()
+            .into_iter()
+            .map(|(base, r, h, label)| MatrixCell {
+                label: format!("{label} r={r} h={h}"),
+                truth: cyl_grid_truth(base, r, h),
+                v_a: v_box,
+                v_b: PI * r * r * h,
+            })
+            .collect(),
+        "cone" => cone_configs()
+            .into_iter()
+            .map(|(bc, rb, rt, h, label)| MatrixCell {
+                label: format!("{label} rb={rb} rt={rt} h={h}"),
+                truth: cone_grid_truth(bc, rb, rt, h),
+                v_a: v_box,
+                v_b: PI * h * (rb * rb + rb * rt + rt * rt) / 3.0,
+            })
+            .collect(),
+        "rbox" => rbox_configs()
+            .into_iter()
+            .map(|(hb, center, axis, angle_deg, label)| MatrixCell {
+                label: format!("{label} hb={hb} {angle_deg}°"),
+                truth: rbox_grid_truth(hb, center, axis, angle_deg.to_radians()),
+                v_a: v_box,
+                v_b: (2.0 * hb).powi(3),
+            })
+            .collect(),
+        "torus" => torus_configs()
+            .into_iter()
+            .map(|(c, rmaj, rmin, label)| MatrixCell {
+                label: format!("{label} R={rmaj} r={rmin}"),
+                truth: torus_grid_truth(c, rmaj, rmin),
+                v_a: v_box,
+                v_b: 2.0 * PI * PI * rmaj * rmin * rmin,
+            })
+            .collect(),
+        "tcyl" => tcyl_configs()
+            .into_iter()
+            .map(|(base, axis, r, h, label)| MatrixCell {
+                label: format!("{label} r={r} h={h}"),
+                truth: tcyl_grid_truth(base, axis, r, h),
+                v_a: v_box,
+                v_b: PI * r * r * h,
+            })
+            .collect(),
+        "ss" => ss_configs()
+            .into_iter()
+            .map(|(ca, ra, cb, rb, label)| MatrixCell {
+                label: format!("{label} ra={ra} rb={rb}"),
+                truth: ss_grid_truth(ca, ra, cb, rb),
+                v_a: 4.0 / 3.0 * PI * ra * ra * ra,
+                v_b: 4.0 / 3.0 * PI * rb * rb * rb,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Child-side: build and run `family` cell `idx` under `op`, serially with no
+/// timeout thread (the parent owns the wall-clock budget). Outer `None` =
+/// unknown family / out-of-range index; inner Option is the op outcome.
+fn run_matrix_cell(family: &str, idx: usize, op: BooleanOp) -> Option<Option<Facts>> {
+    match family {
+        "sphere" => {
+            let mut cfgs = Vec::new();
+            for (c, _label) in placements() {
+                for &r in radii() {
+                    cfgs.push((c, r));
+                }
+            }
+            let &(c, r) = cfgs.get(idx)?;
+            Some(run_pair_empty_ok(op, the_box, move |m| sphere(m, c, r)))
+        }
+        "cyl" => {
+            let (base, r, h, _) = *cyl_configs().get(idx)?;
+            Some(run_pair_empty_ok(op, the_box, move |m| {
+                cylinder(m, base, r, h)
+            }))
+        }
+        "cone" => {
+            let (bc, rb, rt, h, _) = *cone_configs().get(idx)?;
+            Some(run_pair_empty_ok(op, the_box, move |m| {
+                cone(m, bc, rb, rt, h)
+            }))
+        }
+        "rbox" => {
+            let (hb, center, axis, angle_deg, _) = *rbox_configs().get(idx)?;
+            Some(run_pair_empty_ok(op, the_box, move |m| {
+                rotated_box(m, hb, center, axis, angle_deg.to_radians())
+            }))
+        }
+        "torus" => {
+            let (c, rmaj, rmin, _) = *torus_configs().get(idx)?;
+            Some(run_pair_empty_ok(op, the_box, move |m| {
+                torus(m, c, rmaj, rmin)
+            }))
+        }
+        "tcyl" => {
+            let (base, axis, r, h, _) = *tcyl_configs().get(idx)?;
+            Some(run_pair_empty_ok(op, the_box, move |m| {
+                tilted_cylinder(m, base, axis, r, h)
+            }))
+        }
+        "ss" => {
+            let (ca, ra, cb, rb, _) = *ss_configs().get(idx)?;
+            Some(run_pair_empty_ok(
+                op,
+                move |m| sphere(m, ca, ra),
+                move |m| sphere(m, cb, rb),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The generic HANG-honest driver: every (config, op) of `family` in its own
+/// killed-on-timeout process; full oracle + invariant battery on the survivors.
+fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: u64) {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().expect("current_exe");
+    let cells = matrix_cells(family);
+    let budget = Duration::from_secs(budget_secs);
+    let tmp = std::env::temp_dir();
+    let sym = ["∩", "∪", "∖"];
+
+    let mut fails: Vec<Failure> = Vec::new();
+    let mut n_checks = 0usize;
+    let mut true_hangs = 0usize;
+
+    for (cfg, cell) in cells.iter().enumerate() {
+        let t_for = [
+            cell.truth.intersection,
+            cell.truth.union,
+            cell.truth.difference,
+        ];
+        let mut kvol: [Option<f64>; 3] = [None; 3];
+
+        for opi in 0..3usize {
+            let out_path = tmp.join(format!("rosh_fuzz_{family}_{cfg}_{opi}.txt"));
+            let _ = std::fs::remove_file(&out_path);
+            let mut child = Command::new(&exe)
+                .args(["fuzz_single_shot", "--exact", "--ignored"])
+                .env("FUZZ_FAMILY", family)
+                .env("FUZZ_CFG", cfg.to_string())
+                .env("FUZZ_OP", opi.to_string())
+                .env("FUZZ_OUT", out_path.to_string_lossy().to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn single-shot");
+            let start = Instant::now();
+            let mut hung = false;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if start.elapsed() > budget {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            hung = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            n_checks += 1;
+            if hung {
+                true_hangs += 1;
+                fails.push(Failure {
+                    label: cell.label.clone(),
+                    op: sym[opi],
+                    kind: "HANG",
+                    detail: format!("TRUE hang (isolated process, >{}s)", budget.as_secs()),
+                });
+                continue;
+            }
+            let content = std::fs::read_to_string(&out_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&out_path);
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            if parts.first() == Some(&"OK") && parts.len() >= 5 {
+                let vol: f64 = parts[1].parse().unwrap_or(f64::NAN);
+                let open: usize = parts[2].parse().unwrap_or(0);
+                let nonman: usize = parts[3].parse().unwrap_or(0);
+                let euler: i64 = parts[4].parse().unwrap_or(0);
+                kvol[opi] = Some(vol);
+                let t = t_for[opi];
+                if t >= 1e-3 && (vol - t).abs() / t.max(1e-3) > vol_tol {
+                    fails.push(Failure {
+                        label: cell.label.clone(),
+                        op: sym[opi],
+                        kind: "VOLUME",
+                        detail: format!(
+                            "kernel={vol:.4} truth={t:.4} ({:+.1}%)",
+                            100.0 * (vol - t) / t
+                        ),
+                    });
+                }
+                if open != 0 {
+                    fails.push(Failure {
+                        label: cell.label.clone(),
+                        op: sym[opi],
+                        kind: "WATERTIGHT",
+                        detail: format!("open_edges={open}"),
+                    });
+                }
+                if nonman != 0 {
+                    fails.push(Failure {
+                        label: cell.label.clone(),
+                        op: sym[opi],
+                        kind: "MANIFOLD",
+                        detail: format!("nonmanifold_edges={nonman}"),
+                    });
+                }
+                if euler != 0 {
+                    fails.push(Failure {
+                        label: cell.label.clone(),
+                        op: sym[opi],
+                        kind: "EULER",
+                        detail: format!("euler_residual={euler}"),
+                    });
+                }
+            } else {
+                fails.push(Failure {
+                    label: cell.label.clone(),
+                    op: sym[opi],
+                    kind: "ERROR",
+                    detail: "op errored (isolated)".to_string(),
+                });
+            }
+        }
+        fails.extend(boolean_invariant_failures(
+            &cell.label,
+            cell.v_a,
+            cell.v_b,
+            kvol,
+        ));
+    }
+
+    print_catalog(title, &fails, cells.len(), n_checks);
+    println!("TRUE HANGS (isolated) = {true_hangs}\n");
+}
+
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
+fn boolean_box_cyl_survey_isolated() {
+    isolated_matrix_survey("cyl", "box ∘ cylinder (subprocess-isolated)", 0.03, 10);
+}
+
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
+fn boolean_box_cone_survey_isolated() {
+    isolated_matrix_survey("cone", "box ∘ cone (subprocess-isolated)", 0.03, 10);
+}
+
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
+fn boolean_box_rbox_survey_isolated() {
+    isolated_matrix_survey("rbox", "box ∘ rotated-box (subprocess-isolated)", 0.03, 10);
+}
+
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
+fn boolean_box_torus_survey_isolated() {
+    isolated_matrix_survey("torus", "box ∘ torus (subprocess-isolated)", 0.03, 10);
+}
+
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
+fn boolean_box_tcyl_survey_isolated() {
+    isolated_matrix_survey(
+        "tcyl",
+        "box ∘ tilted-cylinder (subprocess-isolated)",
+        0.03,
+        10,
+    );
+}
+
+#[test]
+#[ignore = "fuzz survey — subprocess-isolated, HANG-honest (slow; spawns processes)"]
+fn boolean_sphere_sphere_survey_isolated() {
+    isolated_matrix_survey("ss", "sphere ∘ sphere (subprocess-isolated)", 0.05, 10);
 }
 
 // ===========================================================================
