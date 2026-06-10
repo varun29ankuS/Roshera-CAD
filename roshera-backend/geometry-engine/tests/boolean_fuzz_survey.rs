@@ -3734,6 +3734,48 @@ fn sphere_containment_gate() {
 }
 
 // ===========================================================================
+// MULTI-COMPONENT POKE-THROUGH RATCHET GATE — NON-ignored. Locks the #88
+// interior-offset fix (`assemble_multi_component_sphere_regions` +
+// `tessellate_spherical_holed_region`): sphere c=[0.5,0.3,0] r=1.05 pokes both
+// z faces (two DISJOINT cut circles) AND the x=1/y=1 edge (a 2-arc lens) — a
+// 3-component cut graph whose regions must be nested as holes, deduped, and
+// tessellated with hint-signed half-space membership. Before the fix: ∩
+// hard-errored ("component 0 has only 1 planar face"), ∪ had 6 non-manifold
+// edges at +52% volume. All three ops must match grid truth + be watertight.
+// ===========================================================================
+#[test]
+fn sphere_multi_component_poke_gate() {
+    let c = [0.5, 0.3, 0.0];
+    let r = 1.05_f64;
+    let truth = grid_truth(c, r);
+    let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
+        (BooleanOp::Intersection, "∩", |g| g.intersection),
+        (BooleanOp::Union, "∪", |g| g.union),
+        (BooleanOp::Difference, "∖", |g| g.difference),
+    ];
+    let tol = 0.05;
+    for &(op, sym, pick) in &ops {
+        let t = pick(&truth);
+        let f = run_op(op, move |m| sphere(m, c, r))
+            .unwrap_or_else(|| panic!("multi-component poke {sym}: kernel None"));
+        let rel = (f.vol - t).abs() / t.max(1e-3);
+        assert!(
+            rel <= tol,
+            "REGRESSION (multi-component poke): {sym}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+            f.vol,
+            100.0 * (f.vol - t) / t,
+            100.0 * tol
+        );
+        assert!(
+            f.open_edges == 0 && f.nonmanifold_edges == 0,
+            "REGRESSION (multi-component poke): {sym}: not watertight ({} open, {} nonmanifold)",
+            f.open_edges,
+            f.nonmanifold_edges
+        );
+    }
+}
+
+// ===========================================================================
 // SPHERE-CORNER ∪ DIAGNOSTIC — next-worst cap-side target after BOOL-90-FIX.
 // Sphere centred EXACTLY on the +++ box corner vertex (1,1,1), r=0.8: by
 // symmetry exactly 1/8 of the sphere sits inside the box, so

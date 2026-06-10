@@ -1441,81 +1441,69 @@ fn tessellate_spherical_holed_region(
     let r = sphere.radius;
     let osign = face.orientation.sign();
 
-    // Outer-loop cut planes, deduped; the face side of each is the hint's side.
+    // Collect cut planes + rim samples from EVERY loop (outer + inners),
+    // treated uniformly: the boolean's region assembly may pick ANY of a
+    // multi-loop region's boundary cycles as the "outer" (e.g. a z-circle
+    // anti-cap as outer with the edge-straddling lens as an inner hole), so
+    // the outer/inner distinction carries no geometric meaning here. The
+    // face side of each distinct cut plane is the interior hint's side; the
+    // region is the intersection of those half-spaces (exact for the
+    // poke-through family, where the kept region is the sphere minus
+    // per-plane protrusions).
     let mut planes: Vec<(Point3, Vector3, f64)> = Vec::new(); // (cc, n, sign)
-    for &eid in &outer.edges {
-        let Some(edge) = model.edges.get(eid) else {
-            return false;
-        };
-        let Some(curve) = model.curves.get(edge.curve_id) else {
-            return false;
-        };
-        let (cc, n_raw) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
-            (ci.center(), ci.normal())
-        } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
-            (ar.center, ar.normal)
-        } else {
-            return false;
-        };
-        let Ok(n) = n_raw.normalize() else {
-            return false;
-        };
-        let dup = planes
-            .iter()
-            .any(|&(pc, pn, _)| n.dot(&pn).abs() > 1.0 - 1e-9 && (cc - pc).dot(&pn).abs() < 1e-9);
-        if !dup {
-            let side = (hint - cc).dot(&n);
-            if side.abs() < 1e-12 {
-                return false; // hint on a cut plane — ambiguous
-            }
-            planes.push((cc, n, side.signum()));
-        }
-    }
-    // Single-plane outers belong to the cap/central/large paths.
-    if planes.len() < 2 {
-        return false;
-    }
-
-    // Hole planes (cut circles), kept side = sphere-centre side.
-    struct Hole {
-        center: Point3,
-        axis: Vector3,
-        rim: Vec<Point3>,
-    }
-    let mut holes: Vec<Hole> = Vec::new();
-    for &lid in &face.inner_loops {
+    let mut rims: Vec<Vec<Point3>> = Vec::new();
+    let mut loop_ids = vec![face.outer_loop];
+    loop_ids.extend(face.inner_loops.iter().copied());
+    for lid in loop_ids {
         let Some(lp) = model.loops.get(lid) else {
             return false;
         };
-        let Some((c, n)) = loop_cut_circle(lp, model) else {
+        if lp.edges.is_empty() {
             return false;
-        };
+        }
+        for &eid in &lp.edges {
+            let Some(edge) = model.edges.get(eid) else {
+                return false;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                return false;
+            };
+            let (cc, n_raw) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
+                (ci.center(), ci.normal())
+            } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
+                (ar.center, ar.normal)
+            } else {
+                return false;
+            };
+            let Ok(n) = n_raw.normalize() else {
+                return false;
+            };
+            let dup = planes.iter().any(|&(pc, pn, _)| {
+                n.dot(&pn).abs() > 1.0 - 1e-9 && (cc - pc).dot(&pn).abs() < 1e-9
+            });
+            if !dup {
+                let side = (hint - cc).dot(&n);
+                if side.abs() < 1e-12 {
+                    return false; // hint on a cut plane — ambiguous
+                }
+                planes.push((cc, n, side.signum()));
+            }
+        }
         let rim = loop_rim_samples(lp, model, cache);
         if rim.len() < 3 {
             return false;
         }
-        holes.push(Hole {
-            center: c,
-            axis: n,
-            rim,
-        });
+        rims.push(rim);
+    }
+    // Single-plane faces belong to the cap/central/large paths.
+    if planes.len() < 2 {
+        return false;
     }
 
-    let in_region = |p: Point3| -> bool {
-        planes.iter().all(|&(cc, n, s)| (p - cc).dot(&n) * s >= 0.0)
-            && holes.iter().all(|h| {
-                let pp = (p - h.center).dot(&h.axis);
-                let oo = (o - h.center).dot(&h.axis);
-                pp * oo >= 0.0
-            })
-    };
+    let in_region =
+        |p: Point3| -> bool { planes.iter().all(|&(cc, n, s)| (p - cc).dot(&n) * s >= 0.0) };
     if !in_region(hint) {
         return false; // membership model contradicts the interior hint
-    }
-
-    let outer_rim = loop_rim_samples(outer, model, cache);
-    if outer_rim.len() < 3 {
-        return false;
     }
 
     // Lat-long grid, kept where in_region (same spine as central/large_region).
@@ -1621,8 +1609,6 @@ fn tessellate_spherical_holed_region(
     // stitch with the rim's centroid-direction angular frame. Each rim is
     // stitched at most once (best-matching ring wins); spurious pole-row rings
     // have huge mean distance to every rim and lose the match.
-    let mut rims: Vec<Vec<Point3>> = holes.iter().map(|h| h.rim.clone()).collect();
-    rims.push(outer_rim);
     let mean_dist = |ring: &[u32], rim: &[Point3]| -> f64 {
         let mut total = 0.0;
         for &k in ring {
