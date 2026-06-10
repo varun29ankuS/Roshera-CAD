@@ -138,7 +138,7 @@ export function CADViewport() {
   const handlePointerMissed = useCallback(() => {
     deselectAll()
     // An empty-space click during a mate-pick flow is the cleanest
-    // "cancel" gesture in the SolidWorks / Fusion vocabulary — drop
+    // "cancel" gesture in the standard CAD vocabulary — drop
     // both legs of the pending mate so the next pick starts fresh.
     useAssemblyStore.getState().clearPendingMate()
   }, [deselectAll])

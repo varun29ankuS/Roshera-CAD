@@ -1290,8 +1290,7 @@ pub enum StepApplicationProtocol {
 impl StepApplicationProtocol {
     /// Schema name written into the STEP `FILE_SCHEMA` header for
     /// this protocol. Matches the canonical short-form schema
-    /// identifier emitted by mainstream CAD systems (e.g. NX,
-    /// CATIA, SolidWorks).
+    /// identifier emitted by mainstream CAD systems.
     pub fn schema_name(self) -> &'static str {
         match self {
             Self::AP203 => "CONFIG_CONTROL_DESIGN",

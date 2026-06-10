@@ -15,8 +15,8 @@
 //! different:
 //!
 //!   * "Quickly outline a profile and extrude it" → `sketch.rs`.
-//!   * "Constrain a parametric sketch the way Fusion / Onshape /
-//!     SolidWorks would" → this module.
+//!   * "Constrain a parametric sketch the way mainstream parametric
+//!     CAD tools would" → this module.
 //!
 //! A future slice will bridge them — a `SketchSession` will be able
 //! to materialise into a `CSketch` and back. For now they are
