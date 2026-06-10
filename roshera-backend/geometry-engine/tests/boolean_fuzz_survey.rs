@@ -1757,7 +1757,7 @@ fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: 
 
     let mut fails: Vec<Failure> = Vec::new();
     let mut n_checks = 0usize;
-    let mut true_hangs = 0usize;
+    let mut hang_cells: Vec<(usize, String, &str)> = Vec::new();
 
     for (cfg, cell) in cells.iter().enumerate() {
         let t_for = [
@@ -1799,7 +1799,7 @@ fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: 
             }
             n_checks += 1;
             if hung {
-                true_hangs += 1;
+                hang_cells.push((cfg, cell.label.clone(), sym[opi]));
                 fails.push(Failure {
                     label: cell.label.clone(),
                     op: sym[opi],
@@ -1871,7 +1871,16 @@ fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: 
     }
 
     print_catalog(title, &fails, cells.len(), n_checks);
-    println!("TRUE HANGS (isolated) = {true_hangs}\n");
+    // TRUE hangs are verified-real here (a killed child, not starvation), so
+    // name every cell — the repro is `fuzz_single_shot` with FUZZ_FAMILY=
+    // {family} FUZZ_CFG=<idx> FUZZ_OP={0|1|2}. print_catalog keeps soft kinds
+    // count-only because the IN-PROCESS surveys over-report them; this list is
+    // the trustworthy variant.
+    println!("TRUE HANGS (isolated) = {}", hang_cells.len());
+    for (cfg, label, op) in &hang_cells {
+        println!("  HANG [{op}] {label}   (FUZZ_FAMILY={family} FUZZ_CFG={cfg})");
+    }
+    println!();
 }
 
 #[test]
