@@ -5,7 +5,7 @@ import { useThree, type ThreeEvent } from '@react-three/fiber'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
 
 /**
- * Fusion-style face-pull gizmo. Visible whenever exactly one face is
+ * Direct-modeling face-pull gizmo. Visible whenever exactly one face is
  * selected (sub-element selection mode `face`). Renders an arrow at the
  * face centroid pointing along the average face normal; dragging the
  * arrow translates that face along its normal and, on release, fires

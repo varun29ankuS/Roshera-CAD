@@ -207,8 +207,8 @@ pub enum SketchTool {
 /// carry many of these — e.g., one rectangle plus several circles
 /// inside it. Roles (which loop is an outer boundary, which is a
 /// hole) are *not* tagged at draw time: they are derived geometrically
-/// at extrude time by `detect_regions`, mirroring the SolidWorks /
-/// Fusion convention. A shape is just curves on the plane; the
+/// at extrude time by `detect_regions`, mirroring the standard
+/// parametric-CAD convention. A shape is just curves on the plane; the
 /// extrude step decides what they mean.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SketchShape {
@@ -800,7 +800,7 @@ pub(crate) fn build_loop_edges(
 
 // ─── Region detection ───────────────────────────────────────────────
 //
-// Geometric outer/hole classification, SolidWorks-style: the user
+// Geometric outer/hole classification, industry-standard: the user
 // draws closed loops on the plane, and the system decides which is a
 // boundary and which is a hole based on point-in-polygon containment.
 //
@@ -1546,7 +1546,7 @@ pub async fn extrude_sketch(
         ));
     }
 
-    // Geometric region detection (SolidWorks/Fusion model): the user
+    // Geometric region detection (mainstream-CAD model): the user
     // draws closed loops and the system decides which is an outer
     // boundary and which is a hole based on point-in-polygon
     // containment. Even-depth polygons are outer; the odd-depth

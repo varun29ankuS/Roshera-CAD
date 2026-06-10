@@ -45,7 +45,7 @@ import {
  * the strong half — borderline direction proposals at >50% of the
  * angle tolerance get dropped to avoid surprising the user.
  *
- * Mirrors the Fusion / SolidWorks default of "apply confident
+ * Mirrors the mainstream parametric-CAD default of "apply confident
  * proposals silently, never the marginal ones".
  */
 const AUTO_APPLY_CONFIDENCE_THRESHOLD = 0.5

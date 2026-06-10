@@ -607,7 +607,7 @@ export function SketchPanel() {
           loops via point-in-polygon containment. Surfacing them as
           shape pills makes the sketch feel like a sequence of
           disjoint mini-canvases ("draw shape 1, now draw shape 2");
-          Fusion / SolidWorks present a single continuous 2D design
+          Mainstream CAD sketchers present a single continuous 2D design
           space and let the user keep adding geometry. We match that
           by hiding the pill row entirely — every closed polyline /
           completed rectangle / circle still rolls into its own

@@ -1407,7 +1407,7 @@ async fn mirror_solid(
 /// and the user-visible name (e.g. "Box 1") survive the operation.
 /// Frontends receive a single `ObjectUpdated` frame with the new
 /// tessellation; the feature tree nests `Fillet-N` as a child of
-/// the body event, matching SolidWorks / Fusion behaviour.
+/// the body event, matching mainstream CAD behaviour.
 ///
 /// CF-β.5.2-C — optional `partial_corner_vertices` (an array of
 /// Upper bound on the number of EdgeIds in a single fillet/chamfer
@@ -2667,7 +2667,7 @@ async fn create_extrude(
     })))
 }
 
-/// POST /api/geometry/face/extrude — Fusion-style face-pull. Pick a face
+/// POST /api/geometry/face/extrude — direct-modeling face-pull. Pick a face
 /// of an existing solid + a distance + (optional) direction; the kernel
 /// extrudes that face into the parent solid.
 ///
@@ -4458,7 +4458,7 @@ pub fn geometry_broadcaster() -> &'static broadcast::Sender<String> {
 /// triangle, length = `indices.len() / 3`). The `face_ids` payload is
 /// what the frontend uses to resolve a Three.js raycast hit (which
 /// gives a triangle index) back to the kernel `FaceId` — the unlock
-/// for Fusion-style face picking. `face_map` is sized by tessellation
+/// for interactive face picking. `face_map` is sized by tessellation
 /// per the kernel's contract; if it ever comes back shorter than the
 /// triangle count we pad with `0` rather than panic — the frontend
 /// just won't be able to face-pick those triangles.
@@ -4623,7 +4623,7 @@ pub(crate) async fn current_scene_frames(state: &AppState) -> Vec<String> {
 /// `face_ids` is the per-triangle B-Rep `FaceId` array from
 /// `TriangleMesh::face_map`. Length is `indices.len() / 3`. Frontend uses
 /// it to map a Three.js raycast hit (which gives a triangle index) back
-/// to a kernel face — that's what unlocks Fusion-style face picking.
+/// to a kernel face — that's what unlocks interactive face picking.
 ///
 /// Bounding box and center are computed from the vertex array; volume
 /// and surface area remain zero until the kernel exposes a per-solid
