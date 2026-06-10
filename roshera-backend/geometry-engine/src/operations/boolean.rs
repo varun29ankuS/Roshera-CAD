@@ -5259,6 +5259,30 @@ fn split_face_by_curves(
     // Re-resolve vertices after edge splitting to ensure consistency
     graph.resolve_vertices(model);
 
+    // Closed-surface pre-pass (#88 r=1.2): materialise CUT×CUT circle
+    // crossings as shared vertices before the sphere region builders run.
+    // A cut circle that weaves through its host face's boundary (4+
+    // crossings) arrives UNCLIPPED (split only at `presplit_closed_loop_
+    // edges`' arbitrary thirds), so its crossings with the OTHER cut
+    // circles are never edge endpoints — the sphere splitter then sees no
+    // mutually-intersecting circles and mis-routes to the disjoint-cap
+    // builder. Conquered configurations already carry their crossings as
+    // arc ENDPOINTS (face-clipped cuts), where this pass is a no-op (it
+    // only splits at STRICTLY INTERIOR crossings).
+    if boundary_edges.is_empty()
+        && model
+            .surfaces
+            .get(surface_id)
+            .map(|s| {
+                s.as_any()
+                    .downcast_ref::<crate::primitives::surface::Sphere>()
+                    .is_some()
+            })
+            .unwrap_or(false)
+    {
+        presplit_sphere_cut_crossings(&mut graph, model, &options.common.tolerance)?;
+    }
+
     // Closed-surface (sphere) curved-Boolean fast path: a sphere cut by
     // coplanar circles is partitioned into caps + a central multi-hole region
     // directly (the DCEL walker drops iso-parametric cut circles — zero (u, v)
@@ -7945,6 +7969,349 @@ fn presplit_closed_loop_edges(
         }
     }
 
+    Ok(())
+}
+
+/// Materialise CUT×CUT circle crossings on an untrimmed closed surface
+/// (sphere) as shared graph vertices (#88 r=1.2 poke-through).
+///
+/// `compute_edge_intersections` imprints cuts against BOUNDARY edges; on a
+/// closed surface there are none, so two cut circles that cross each other
+/// only share a vertex if their materialised arcs happen to END at the
+/// crossing (true for face-clipped cuts — every conquered configuration).
+/// A cut circle that weaves through its host face's boundary (4+ crossings)
+/// arrives UNCLIPPED — a full circle subdivided only at `presplit_closed_
+/// loop_edges`' arbitrary thirds — so its crossings with the other cut
+/// circles are strictly INTERIOR to its sub-edges. The sphere splitter's
+/// mutually-intersecting detection (a vertex touched by ≥2 distinct cut
+/// curves) then sees nothing, mis-routes to the disjoint-cap builder, and
+/// the result is open/non-manifold.
+///
+/// This pass solves each distinct cut-plane pair against the circles
+/// analytically (`A·cosθ + B·sinθ = C` on circle 1, verified on circle 2),
+/// keeps crossings that lie ON materialised arcs of BOTH planes, and splits
+/// any edge holding a crossing strictly inside its span — `add_or_find`
+/// dedup makes the new vertex SHARED across all circles through it.
+/// Near-tangent contacts are skipped entirely (the #86 lesson: splitting at
+/// a tangency mints degenerate vertices). Edge-endpoint crossings are
+/// no-ops, so already-clipped configurations are untouched by construction.
+fn presplit_sphere_cut_crossings(
+    graph: &mut IntersectionGraph,
+    model: &mut BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<()> {
+    use crate::primitives::curve::{Arc, Circle};
+
+    graph.resolve_vertices(model);
+    let tol = tolerance.distance();
+    let on_tol = (tol * 10.0).max(1e-9);
+
+    // 0. Canonicalise endpoint vertices by POSITION. `compute_edge_
+    // intersections` splits each cut curve at a crossing independently,
+    // minting a DISTINCT VertexId per curve at the same 3D point; the
+    // sphere splitter's shared-vertex crossing detection and the
+    // arrangement walker both key on VertexId, so the duplicates hide
+    // every crossing (the r=1.2 mis-route). Remap each edge endpoint to
+    // `add_or_find`'s canonical vertex; already-shared endpoints map to
+    // themselves, so correctly-built configurations are untouched.
+    let mut canon_eids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+    canon_eids.sort_unstable();
+    let mut remapped = 0usize;
+    for eid in canon_eids {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        let (sv, ev) = (edge.start_vertex, edge.end_vertex);
+        let sp = model.vertices.get_position(sv);
+        let ep = model.vertices.get_position(ev);
+        let csv = sp.map(|p| model.vertices.add_or_find(p[0], p[1], p[2], tol));
+        let cev = ep.map(|p| model.vertices.add_or_find(p[0], p[1], p[2], tol));
+        let (Some(csv), Some(cev)) = (csv, cev) else {
+            continue;
+        };
+        if csv == sv && cev == ev {
+            continue;
+        }
+        if let Some(em) = model.edges.get_mut(eid) {
+            em.start_vertex = csv;
+            em.end_vertex = cev;
+        }
+        if let Some(ge) = graph.edges.get_mut(&eid) {
+            ge.start_vertex = csv;
+            ge.end_vertex = cev;
+        }
+        for (old, new) in [(sv, csv), (ev, cev)] {
+            if old == new {
+                continue;
+            }
+            if let Some(node) = graph.nodes.get_mut(&old) {
+                node.incident_edges.remove(&eid);
+            }
+            graph
+                .nodes
+                .entry(new)
+                .or_insert_with(|| GraphNode {
+                    incident_edges: BTreeSet::new(),
+                })
+                .incident_edges
+                .insert(eid);
+        }
+        remapped += 1;
+    }
+    if pipeline_trace_enabled() && remapped > 0 {
+        pipeline_trace(format_args!(
+            "  presplit canonicalised endpoints on {remapped} edges"
+        ));
+    }
+
+    // Snapshot the cut edges' circular geometry, sorted for determinism.
+    struct CutGeom {
+        eid: EdgeId,
+        cc: Point3,
+        n: Vector3,
+        r: f64,
+    }
+    let mut eids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+    eids.sort_unstable();
+    let mut cuts: Vec<CutGeom> = Vec::new();
+    for eid in eids {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            continue;
+        };
+        let (cc, n_raw, r) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
+            (ci.center(), ci.normal(), ci.radius())
+        } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
+            (ar.center, ar.normal, ar.radius)
+        } else {
+            continue;
+        };
+        let Ok(n) = n_raw.normalize() else {
+            continue;
+        };
+        cuts.push(CutGeom { eid, cc, n, r });
+    }
+    if pipeline_trace_enabled() {
+        pipeline_trace(format_args!(
+            "stage=presplit_sphere_cut_crossings graph_edges={} circular_cuts={}",
+            graph.edges.len(),
+            cuts.len(),
+        ));
+    }
+    if cuts.len() < 2 {
+        return Ok(());
+    }
+
+    // Group the cut edges by distinct cut plane.
+    let mut planes: Vec<(Point3, Vector3, f64, Vec<usize>)> = Vec::new();
+    for (i, c) in cuts.iter().enumerate() {
+        let mut joined = false;
+        for p in planes.iter_mut() {
+            if c.n.dot(&p.1).abs() > 1.0 - 1e-9 && (c.cc - p.0).dot(&p.1).abs() < 1e-9 {
+                p.3.push(i);
+                joined = true;
+                break;
+            }
+        }
+        if !joined {
+            planes.push((c.cc, c.n, c.r, vec![i]));
+        }
+    }
+    if planes.len() < 2 {
+        return Ok(());
+    }
+
+    // Nearest (edge_param, distance) of point `p` on edge `eid`: coarse
+    // sample + ternary refinement. Curve-type agnostic.
+    let invert = |eid: EdgeId, p: Point3, model: &BRepModel| -> Option<(f64, f64)> {
+        let edge = model.edges.get(eid)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let pos_at =
+            |s: f64| -> Option<Point3> { curve.point_at(edge.edge_to_curve_parameter(s)).ok() };
+        const N: usize = 48;
+        let mut best = (0.0_f64, f64::INFINITY);
+        for k in 0..=N {
+            let s = k as f64 / N as f64;
+            if let Some(q) = pos_at(s) {
+                let d = (q - p).magnitude();
+                if d < best.1 {
+                    best = (s, d);
+                }
+            }
+        }
+        let step = 1.0 / N as f64;
+        let (mut lo, mut hi) = ((best.0 - step).max(0.0), (best.0 + step).min(1.0));
+        for _ in 0..40 {
+            let m1 = lo + (hi - lo) / 3.0;
+            let m2 = hi - (hi - lo) / 3.0;
+            let d1 = pos_at(m1)
+                .map(|q| (q - p).magnitude())
+                .unwrap_or(f64::INFINITY);
+            let d2 = pos_at(m2)
+                .map(|q| (q - p).magnitude())
+                .unwrap_or(f64::INFINITY);
+            if d1 <= d2 {
+                hi = m2;
+            } else {
+                lo = m1;
+            }
+        }
+        let s = 0.5 * (lo + hi);
+        let d = pos_at(s)
+            .map(|q| (q - p).magnitude())
+            .unwrap_or(f64::INFINITY);
+        Some((s, d))
+    };
+
+    // Crossing points per distinct plane pair → strictly-interior splits.
+    let mut splits: std::collections::BTreeMap<EdgeId, Vec<(f64, Point3)>> =
+        std::collections::BTreeMap::new();
+    for i in 0..planes.len() {
+        for j in (i + 1)..planes.len() {
+            let (cc1, n1, r1) = (planes[i].0, planes[i].1, planes[i].2);
+            let (cc2, n2, r2) = (planes[j].0, planes[j].1, planes[j].2);
+            let helper = if n1.x.abs() <= n1.y.abs() && n1.x.abs() <= n1.z.abs() {
+                Vector3::X
+            } else if n1.y.abs() <= n1.z.abs() {
+                Vector3::Y
+            } else {
+                Vector3::Z
+            };
+            let Ok(u1) = (helper - n1 * helper.dot(&n1)).normalize() else {
+                continue;
+            };
+            let v1 = n1.cross(&u1);
+            let a = u1.dot(&n2);
+            let b = v1.dot(&n2);
+            let c = (cc2 - cc1).dot(&n2) / r1;
+            let rr = (a * a + b * b).sqrt();
+            if rr < 1e-12 {
+                continue; // parallel cut planes
+            }
+            let ratio = c / rr;
+            // Near-tangent or no contact: never split at a tangency (#86).
+            if ratio.abs() > 1.0 - 1e-7 {
+                continue;
+            }
+            let phi = b.atan2(a);
+            let dth = ratio.clamp(-1.0, 1.0).acos();
+            for theta in [phi + dth, phi - dth] {
+                let p = cc1 + (u1 * theta.cos() + v1 * theta.sin()) * r1;
+                if ((p - cc2).magnitude() - r2).abs() > on_tol {
+                    continue;
+                }
+                // The crossing must lie ON a materialised arc of BOTH
+                // planes (inclusive) to be an arrangement vertex.
+                let hits_of = |members: &[usize], model: &BRepModel| -> Vec<(EdgeId, f64)> {
+                    members
+                        .iter()
+                        .filter_map(|&k| {
+                            invert(cuts[k].eid, p, model)
+                                .and_then(|(s, d)| (d <= on_tol).then_some((cuts[k].eid, s)))
+                        })
+                        .collect()
+                };
+                let on_1 = hits_of(&planes[i].3, model);
+                let on_2 = hits_of(&planes[j].3, model);
+                if on_1.is_empty() || on_2.is_empty() {
+                    continue;
+                }
+                for (eid, s) in on_1.into_iter().chain(on_2) {
+                    if s > 1e-6 && s < 1.0 - 1e-6 {
+                        splits.entry(eid).or_default().push((s, p));
+                    }
+                }
+            }
+        }
+    }
+    if splits.is_empty() {
+        return Ok(());
+    }
+
+    // Apply the splits per edge (ascending param, sequential split_at),
+    // rewriting the graph exactly like `presplit_closed_loop_edges`.
+    let mut total_subs = 0usize;
+    for (eid, mut pts) in splits {
+        pts.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        pts.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-6);
+        let Some(original) = model.edges.get(eid).cloned() else {
+            continue;
+        };
+        let Some((g_type, g_sv, g_ev)) = graph
+            .edges
+            .get(&eid)
+            .map(|g| (g.edge_type, g.start_vertex, g.end_vertex))
+        else {
+            continue;
+        };
+        let mut vids: Vec<(f64, VertexId)> = Vec::new();
+        for &(s, p) in &pts {
+            let vid = model.vertices.add_or_find(p.x, p.y, p.z, tol);
+            if vid != g_sv && vid != g_ev && !vids.iter().any(|&(_, v)| v == vid) {
+                vids.push((s, vid));
+            }
+        }
+        if vids.is_empty() {
+            continue;
+        }
+        let mut sub_edges: Vec<(crate::primitives::edge::Edge, VertexId, VertexId)> = Vec::new();
+        let mut remaining = original;
+        let mut prev_s = 0.0_f64;
+        let mut prev_vid = g_sv;
+        for &(s, vid) in &vids {
+            let denom = 1.0 - prev_s;
+            if denom <= 1e-12 {
+                break;
+            }
+            let s_rel = ((s - prev_s) / denom).clamp(1e-9, 1.0 - 1e-9);
+            let (mut head, mut tail) = remaining.split_at(s_rel);
+            head.start_vertex = prev_vid;
+            head.end_vertex = vid;
+            tail.start_vertex = vid;
+            sub_edges.push((head, prev_vid, vid));
+            remaining = tail;
+            prev_s = s;
+            prev_vid = vid;
+        }
+        remaining.start_vertex = prev_vid;
+        remaining.end_vertex = g_ev;
+        sub_edges.push((remaining, prev_vid, g_ev));
+
+        graph.edges.remove(&eid);
+        for node in graph.nodes.values_mut() {
+            node.incident_edges.remove(&eid);
+        }
+        for (e, sv, ev) in sub_edges {
+            let nid = model.edges.add(e);
+            graph.edges.insert(
+                nid,
+                GraphEdge {
+                    edge_id: nid,
+                    edge_type: g_type,
+                    start_vertex: sv,
+                    end_vertex: ev,
+                },
+            );
+            for vv in [sv, ev] {
+                graph
+                    .nodes
+                    .entry(vv)
+                    .or_insert_with(|| GraphNode {
+                        incident_edges: BTreeSet::new(),
+                    })
+                    .incident_edges
+                    .insert(nid);
+            }
+            total_subs += 1;
+        }
+    }
+    if pipeline_trace_enabled() && total_subs > 0 {
+        pipeline_trace(format_args!(
+            "stage=presplit_sphere_cut_crossings sub_edges={total_subs}"
+        ));
+    }
     Ok(())
 }
 
