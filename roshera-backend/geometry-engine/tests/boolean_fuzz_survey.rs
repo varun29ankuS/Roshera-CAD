@@ -3751,15 +3751,14 @@ fn sphere_multi_component_poke_gate() {
     // by 3 satellite arcs, 5 regions) — pins the verified-interior fallback
     // (the inside-box region's mean-of-midpoints lands outside the region
     // and classified Outside before the fix: ∩/∖ open=8, ∪ nonman=8).
-    // NOT yet pinned: face-great-circle ([1.0,0.3,-0.2] r=1.2) — the
-    // pass-margin fix recovered ∪ 6.01→11.14 (hemisphere no longer dropped)
-    // but ∩ reads 3.9906 vs grid truth 2.9509 (+35%): the partial 3-circle
-    // web (one in-domain crossing per pair) splits into only 3 fragments and
-    // the inside fragment keeps its y/z bites. Open frontier; add the cell
-    // here once conquered.
-    let cells: [([f64; 3], f64, &str); 2] = [
+    let cells: [([f64; 3], f64, &str); 3] = [
         ([0.5, 0.3, 0.0], 1.05, "multi-component"),
         ([0.5, 0.3, 0.0], 1.2, "hub-satellites"),
+        // Sphere centred ON the +x face: great-circle cut + a chord-chain
+        // bite — a UNION-type region ((y>1 ∨ z<−1) ∧ x<1) whose mean interior
+        // lands in-box and whose hemisphere twin's mean lands ON the cut
+        // plane. Pins the parity-membership interior verification.
+        ([1.0, 0.3, -0.2], 1.2, "face-great-circle"),
     ];
     let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
         (BooleanOp::Intersection, "∩", |g| g.intersection),

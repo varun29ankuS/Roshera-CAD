@@ -4058,91 +4058,165 @@ fn split_sphere_face_by_circles(
                 };
                 Some(center + side * radius)
             };
-            // Verified-interior fallback for the MEAN path (#88 r=1.2): a
-            // region bounded by arcs of several planes (e.g. the inside-box
-            // region of a hub-and-satellites arrangement: 6 hub pieces + 3
-            // satellite arcs) can have its mean-of-midpoints land OUTSIDE
-            // the region (the hub midpoints tip the average across the hub
-            // plane) — the fragment then classifies Outside and every op
-            // drops it. Each directed boundary arc defines the region's
-            // side of its cut plane (`into_face·normal`); for the
-            // intersection-type regions these arrangements produce, the
-            // region is exactly the conjunction of those half-spaces. When
-            // the mean point FAILS its own loop's conjunction, replace it
-            // with the max-clearance nudged sample that passes; when the
-            // mean passes (every conquered cell) nothing changes.
-            let loop_halfspaces = |lp: &[(EdgeId, bool)]| -> Option<Vec<(Point3, Vector3)>> {
-                let mut hs: Vec<(Point3, Vector3)> = Vec::new();
+            // Verified-interior fallback for the MEAN path (#88): a region
+            // bounded by arcs of several planes can have its mean-of-
+            // midpoints land OUTSIDE the region (hub-and-satellites: the hub
+            // midpoints tip the mean across the hub plane) or exactly ON its
+            // own boundary (a great-circle hemisphere: every boundary
+            // midpoint lies in the cut plane). Verification must be SHAPE-
+            // AGNOSTIC — a half-space conjunction is wrong for union-type
+            // regions like the bite between a chord-chain and the great
+            // circle ((y>1 ∨ z<−1) ∧ x<1) — so membership is geodesic
+            // CROSSING-PARITY against the region's own directed loop, with a
+            // small `into_face` nudge as the locally-inside reference. When
+            // the mean verifies inside (every conquered cell) nothing
+            // changes; otherwise the largest parity-verified nudge replaces
+            // it, falling back to the smallest nudge (locally inside by the
+            // loop's orientation).
+            struct ASeg {
+                cc: Point3,
+                n: Vector3,
+                u: Vector3,
+                v: Vector3,
+                theta_end: f64,
+                mid_low: bool,
+                p_mid: Point3,
+                into_face: Vector3,
+            }
+            let build_segs = |lp: &[(EdgeId, bool)]| -> Option<Vec<ASeg>> {
+                let tau = std::f64::consts::TAU;
+                let mut segs = Vec::with_capacity(lp.len());
                 for &(eid, fwd) in lp {
                     let edge = model.edges.get(eid)?;
-                    let (cc, normal) = circ_geom(edge.curve_id)?;
-                    let n = normal.normalize().ok()?;
+                    let (cc, n_raw) = circ_geom(edge.curve_id)?;
+                    let n = n_raw.normalize().ok()?;
+                    let sp = model.vertices.get_position(edge.start_vertex)?;
+                    let ep = model.vertices.get_position(edge.end_vertex)?;
+                    let p_start = Point3::new(sp[0], sp[1], sp[2]);
+                    let p_end = Point3::new(ep[0], ep[1], ep[2]);
                     let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
-                    let mp = model
+                    let p_mid = model
                         .curves
                         .get(edge.curve_id)?
                         .evaluate(tmid)
                         .ok()?
                         .position;
-                    let mut tang = n.cross(&(mp - cc)).normalize().ok()?;
+                    let u = (p_start - cc).normalize().ok()?;
+                    let v = n.cross(&u);
+                    let theta = |x: Point3| -> f64 {
+                        let d = x - cc;
+                        let t = d.dot(&v).atan2(d.dot(&u));
+                        if t < 0.0 {
+                            t + tau
+                        } else {
+                            t
+                        }
+                    };
+                    let dse = p_end - p_start;
+                    let closed = dse.dot(&dse) < 1e-18;
+                    let theta_end = if closed { tau } else { theta(p_end) };
+                    let mid_low = closed || theta(p_mid) <= theta_end;
+                    let mut tang = n.cross(&(p_mid - cc)).normalize().ok()?;
                     if !fwd {
                         tang = tang * -1.0;
                     }
-                    let nout = (mp - center).normalize().ok()?;
-                    let into_face = nout.cross(&tang);
-                    let side = into_face.dot(&n);
-                    if side.abs() < 1e-9 {
-                        continue; // arc tangent to its own plane direction — skip
-                    }
-                    let ns = n * side.signum();
-                    let dup = hs.iter().any(|&(pc, pn)| {
-                        ns.dot(&pn) > 1.0 - 1e-9 && (cc - pc).dot(&pn).abs() < 1e-9
+                    let nout = (p_mid - center).normalize().ok()?;
+                    let into_face = nout.cross(&tang).normalize().ok()?;
+                    segs.push(ASeg {
+                        cc,
+                        n,
+                        u,
+                        v,
+                        theta_end,
+                        mid_low,
+                        p_mid,
+                        into_face,
                     });
-                    if !dup {
-                        hs.push((cc, ns));
+                }
+                (!segs.is_empty()).then_some(segs)
+            };
+            let seg_seed = |s: &ASeg, e: f64| -> Option<Point3> {
+                let dir = ((s.p_mid - center) * (1.0 / radius) + s.into_face * e)
+                    .normalize()
+                    .ok()?;
+                Some(center + dir * radius)
+            };
+            // Parity of geodesic p→q crossings with the loop's arcs; `None`
+            // on a degenerate configuration (crossing at an arc endpoint or
+            // at p/q, geodesic in an arc's plane, p≈±q).
+            let parity_inside = |segs: &[ASeg], p: Point3, q: Point3| -> Option<bool> {
+                let tau = std::f64::consts::TAU;
+                let p_hat = (p - center).normalize().ok()?;
+                let q_hat = (q - center).normalize().ok()?;
+                let ngv = p_hat.cross(&q_hat);
+                if ngv.dot(&ngv) < 1e-16 {
+                    return None;
+                }
+                let ng = ngv.normalize().ok()?;
+                let mut crossings = 0usize;
+                for a in segs {
+                    let m = a.n.dot(&ng);
+                    let denom = 1.0 - m * m;
+                    let h = (center - a.cc).dot(&a.n);
+                    if denom < 1e-12 {
+                        if h.abs() < 1e-9 {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let y0 = a.n * (-h / denom) + ng * (h * m / denom);
+                    let d = a.n.cross(&ng);
+                    let t2 = (radius * radius - y0.dot(&y0)) / denom;
+                    if t2 < 1e-14 {
+                        if t2 > -1e-14 {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let t = t2.sqrt();
+                    for s in [center + y0 + d * t, center + y0 - d * t] {
+                        let ds = s - a.cc;
+                        let th = {
+                            let t0 = ds.dot(&a.v).atan2(ds.dot(&a.u));
+                            if t0 < 0.0 {
+                                t0 + tau
+                            } else {
+                                t0
+                            }
+                        };
+                        const END_BAND: f64 = 1e-6;
+                        let span_low = th <= a.theta_end;
+                        let on = if a.mid_low { span_low } else { !span_low };
+                        let near_end = th < END_BAND
+                            || th > tau - END_BAND
+                            || (th - a.theta_end).abs() < END_BAND;
+                        if near_end {
+                            return None;
+                        }
+                        if !on {
+                            continue;
+                        }
+                        let s_hat = (s - center).normalize().ok()?;
+                        let c1 = p_hat.cross(&s_hat).dot(&ng);
+                        let c2 = s_hat.cross(&q_hat).dot(&ng);
+                        if c1.abs() < 1e-9 || c2.abs() < 1e-9 {
+                            return None;
+                        }
+                        if c1 > 0.0 && c2 > 0.0 {
+                            crossings += 1;
+                        }
                     }
                 }
-                (!hs.is_empty()).then_some(hs)
+                Some(crossings % 2 == 0)
             };
-            // Positive clearance required: a GREAT-circle cut (sphere centred
-            // on the host plane) gives a hemisphere fragment whose boundary
-            // lies entirely IN the cut plane — its mean-of-midpoints interior
-            // lands exactly ON the plane, classifies OnBoundary, and Union
-            // drops the whole external hemisphere (face+x-offset r=1.2:
-            // ∪ 6.01 vs 12.29). An on-plane point must FAIL so the nudged
-            // verified sample (clearly off-plane) replaces it.
-            let pass_margin = (radius * 1e-4).max(1e-9);
-            let passes = move |hs: &[(Point3, Vector3)], p: Point3| -> bool {
-                hs.iter().all(|&(cc, n)| (p - cc).dot(&n) >= pass_margin)
-            };
-            let verified_interior = |lp: &[(EdgeId, bool)]| -> Option<Point3> {
-                let hs = loop_halfspaces(lp)?;
-                // Max-clearance first: nudge from each arc midpoint into the
-                // face by decreasing offsets, take the first passing sample.
-                for &e in &[1.6_f64, 0.7, 0.25, 0.08, 0.02] {
-                    for &(eid, fwd) in lp {
-                        let edge = model.edges.get(eid)?;
-                        let (cc, normal) = circ_geom(edge.curve_id)?;
-                        let n = normal.normalize().ok()?;
-                        let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
-                        let mp = model
-                            .curves
-                            .get(edge.curve_id)?
-                            .evaluate(tmid)
-                            .ok()?
-                            .position;
-                        let mut tang = n.cross(&(mp - cc)).normalize().ok()?;
-                        if !fwd {
-                            tang = tang * -1.0;
-                        }
-                        let nout = (mp - center).normalize().ok()?;
-                        let into_face = nout.cross(&tang).normalize().ok()?;
-                        let dir = ((mp - center) * (1.0 / radius) + into_face * e)
-                            .normalize()
-                            .ok()?;
-                        let cand = center + dir * radius;
-                        if passes(&hs, cand) {
-                            return Some(cand);
+            let region_contains = |segs: &[ASeg], p: Point3| -> Option<bool> {
+                for &e in &[0.02_f64, 0.08, 0.25] {
+                    for s in segs {
+                        let Some(q) = seg_seed(s, e) else {
+                            continue;
+                        };
+                        if let Some(inside) = parity_inside(segs, p, q) {
+                            return Some(inside);
                         }
                     }
                 }
@@ -4156,9 +4230,29 @@ fn split_sphere_face_by_circles(
                     oriented_interior(&loop_edges).or_else(|| mean_interior(&loop_edges))
                 } else {
                     let mean = mean_interior(&loop_edges);
-                    match (mean, loop_halfspaces(&loop_edges)) {
-                        (Some(mp), Some(hs)) if !passes(&hs, mp) => {
-                            verified_interior(&loop_edges).or(Some(mp))
+                    match (mean, build_segs(&loop_edges)) {
+                        (Some(mp), Some(segs)) => {
+                            if region_contains(&segs, mp) == Some(true) {
+                                Some(mp)
+                            } else {
+                                // Largest parity-verified nudge wins; the
+                                // smallest nudge is locally inside by loop
+                                // orientation and is the final fallback.
+                                let mut found: Option<Point3> = None;
+                                'cand: for &e in &[1.6_f64, 0.7, 0.25, 0.08] {
+                                    for s in &segs {
+                                        if let Some(c) = seg_seed(s, e) {
+                                            if region_contains(&segs, c) == Some(true) {
+                                                found = Some(c);
+                                                break 'cand;
+                                            }
+                                        }
+                                    }
+                                }
+                                found
+                                    .or_else(|| segs.iter().find_map(|s| seg_seed(s, 0.02)))
+                                    .or(Some(mp))
+                            }
                         }
                         (m, _) => m,
                     }
