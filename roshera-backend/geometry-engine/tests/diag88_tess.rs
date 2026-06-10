@@ -32,6 +32,23 @@ fn sphere(model: &mut BRepModel, c: [f64; 3], r: f64) -> SolidId {
 }
 
 #[test]
+#[ignore = "diagnostic — #88 r=1.2 crossing-presplit routing (run with --ignored --nocapture)"]
+fn diag88_r12_presplit() {
+    for (op, sym) in [(BooleanOp::Intersection, "I"), (BooleanOp::Union, "U")] {
+        let mut model = BRepModel::new();
+        let bx = the_box(&mut model);
+        let sp = sphere(&mut model, [0.5, 0.3, 0.0], 1.2);
+        match boolean_operation(&mut model, bx, sp, op, BooleanOptions::default()) {
+            Ok(res) => {
+                let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+                println!("== r=1.2 {sym}: vol={vol:.4} ==");
+            }
+            Err(e) => println!("== r=1.2 {sym}: ERR {e:?} =="),
+        }
+    }
+}
+
+#[test]
 #[ignore = "diagnostic — #88 holed-region tessellation routing (run with --ignored --nocapture)"]
 fn diag88_tess_routing() {
     for (op, sym) in [(BooleanOp::Intersection, "I"), (BooleanOp::Difference, "D")] {
