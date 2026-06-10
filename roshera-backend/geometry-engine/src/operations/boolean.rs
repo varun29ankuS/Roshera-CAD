@@ -4058,6 +4058,88 @@ fn split_sphere_face_by_circles(
                 };
                 Some(center + side * radius)
             };
+            // Verified-interior fallback for the MEAN path (#88 r=1.2): a
+            // region bounded by arcs of several planes (e.g. the inside-box
+            // region of a hub-and-satellites arrangement: 6 hub pieces + 3
+            // satellite arcs) can have its mean-of-midpoints land OUTSIDE
+            // the region (the hub midpoints tip the average across the hub
+            // plane) — the fragment then classifies Outside and every op
+            // drops it. Each directed boundary arc defines the region's
+            // side of its cut plane (`into_face·normal`); for the
+            // intersection-type regions these arrangements produce, the
+            // region is exactly the conjunction of those half-spaces. When
+            // the mean point FAILS its own loop's conjunction, replace it
+            // with the max-clearance nudged sample that passes; when the
+            // mean passes (every conquered cell) nothing changes.
+            let loop_halfspaces = |lp: &[(EdgeId, bool)]| -> Option<Vec<(Point3, Vector3)>> {
+                let mut hs: Vec<(Point3, Vector3)> = Vec::new();
+                for &(eid, fwd) in lp {
+                    let edge = model.edges.get(eid)?;
+                    let (cc, normal) = circ_geom(edge.curve_id)?;
+                    let n = normal.normalize().ok()?;
+                    let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
+                    let mp = model
+                        .curves
+                        .get(edge.curve_id)?
+                        .evaluate(tmid)
+                        .ok()?
+                        .position;
+                    let mut tang = n.cross(&(mp - cc)).normalize().ok()?;
+                    if !fwd {
+                        tang = tang * -1.0;
+                    }
+                    let nout = (mp - center).normalize().ok()?;
+                    let into_face = nout.cross(&tang);
+                    let side = into_face.dot(&n);
+                    if side.abs() < 1e-9 {
+                        continue; // arc tangent to its own plane direction — skip
+                    }
+                    let ns = n * side.signum();
+                    let dup = hs.iter().any(|&(pc, pn)| {
+                        ns.dot(&pn) > 1.0 - 1e-9 && (cc - pc).dot(&pn).abs() < 1e-9
+                    });
+                    if !dup {
+                        hs.push((cc, ns));
+                    }
+                }
+                (!hs.is_empty()).then_some(hs)
+            };
+            let passes = |hs: &[(Point3, Vector3)], p: Point3| -> bool {
+                hs.iter().all(|&(cc, n)| (p - cc).dot(&n) >= 0.0)
+            };
+            let verified_interior = |lp: &[(EdgeId, bool)]| -> Option<Point3> {
+                let hs = loop_halfspaces(lp)?;
+                // Max-clearance first: nudge from each arc midpoint into the
+                // face by decreasing offsets, take the first passing sample.
+                for &e in &[1.6_f64, 0.7, 0.25, 0.08, 0.02] {
+                    for &(eid, fwd) in lp {
+                        let edge = model.edges.get(eid)?;
+                        let (cc, normal) = circ_geom(edge.curve_id)?;
+                        let n = normal.normalize().ok()?;
+                        let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
+                        let mp = model
+                            .curves
+                            .get(edge.curve_id)?
+                            .evaluate(tmid)
+                            .ok()?
+                            .position;
+                        let mut tang = n.cross(&(mp - cc)).normalize().ok()?;
+                        if !fwd {
+                            tang = tang * -1.0;
+                        }
+                        let nout = (mp - center).normalize().ok()?;
+                        let into_face = nout.cross(&tang).normalize().ok()?;
+                        let dir = ((mp - center) * (1.0 / radius) + into_face * e)
+                            .normalize()
+                            .ok()?;
+                        let cand = center + dir * radius;
+                        if passes(&hs, cand) {
+                            return Some(cand);
+                        }
+                    }
+                }
+                None
+            };
             let mut faces: Vec<SplitFace> = Vec::new();
             for loop_edges in face_loops {
                 let is_complement_pair =
@@ -4065,7 +4147,13 @@ fn split_sphere_face_by_circles(
                 let interior = if is_complement_pair {
                     oriented_interior(&loop_edges).or_else(|| mean_interior(&loop_edges))
                 } else {
-                    mean_interior(&loop_edges)
+                    let mean = mean_interior(&loop_edges);
+                    match (mean, loop_halfspaces(&loop_edges)) {
+                        (Some(mp), Some(hs)) if !passes(&hs, mp) => {
+                            verified_interior(&loop_edges).or(Some(mp))
+                        }
+                        (m, _) => m,
+                    }
                 };
                 let Some(interior) = interior else {
                     continue;
@@ -8311,6 +8399,191 @@ fn presplit_sphere_cut_crossings(
         pipeline_trace(format_args!(
             "stage=presplit_sphere_cut_crossings sub_edges={total_subs}"
         ));
+    }
+
+    // 3. HARMONIZE COVERAGE per cut plane (#88 r=1.2): each cut curve can
+    // be materialised TWICE in the graph — the host box face's clipped arc
+    // AND the sphere's own copy (full circle, thirds-split) — with
+    // mismatched subdivision. The overlapping duplicate coverage corrupts
+    // the arrangement walk (duplicate tangent angles → degenerate twin
+    // pairs; r=1.2's 4-circle web walks to 5 fragments where Euler demands
+    // 8) and the cross-face weld (the "long arc vs sub-arc chain"
+    // canonicalise weakness). Reduce each plane to SINGLE coverage by an
+    // exact-fit greedy over atomic angular intervals, preferring LOWEST
+    // EdgeIds — the box-side pieces, which the box-face fragments already
+    // reference, so the sphere fragments share their EdgeIds and weld by
+    // construction. Planes whose copies don't decompose exactly (a member
+    // partially overlaps selected coverage) are left untouched.
+    {
+        use std::f64::consts::TAU;
+        // Recompute member geometry from the CURRENT graph (edges may have
+        // been split above).
+        let mut cur_eids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+        cur_eids.sort_unstable();
+        struct Span {
+            eid: EdgeId,
+            theta_s: f64,
+            // Arc covers [theta_s, theta_e] going +θ; theta_e > theta_s and
+            // may exceed TAU (wrap).
+            theta_e: f64,
+        }
+        let mut by_plane: Vec<(Point3, Vector3, f64, Vec<Span>)> = Vec::new();
+        for eid in cur_eids {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (cc, n_raw, r) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
+                (ci.center(), ci.normal(), ci.radius())
+            } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
+                (ar.center, ar.normal, ar.radius)
+            } else {
+                continue;
+            };
+            let Ok(n) = n_raw.normalize() else {
+                continue;
+            };
+            let helper = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+                Vector3::X
+            } else if n.y.abs() <= n.z.abs() {
+                Vector3::Y
+            } else {
+                Vector3::Z
+            };
+            let Ok(u1) = (helper - n * helper.dot(&n)).normalize() else {
+                continue;
+            };
+            let v1 = n.cross(&u1);
+            let ang = |p: Point3| -> f64 {
+                let d = p - cc;
+                let t = d.dot(&v1).atan2(d.dot(&u1));
+                if t < 0.0 {
+                    t + TAU
+                } else {
+                    t
+                }
+            };
+            let sp = model.vertices.get_position(edge.start_vertex);
+            let ep = model.vertices.get_position(edge.end_vertex);
+            let (Some(sp), Some(ep)) = (sp, ep) else {
+                continue;
+            };
+            let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
+            let Ok(mp) = curve.point_at(tmid) else {
+                continue;
+            };
+            let a = ang(Point3::new(sp[0], sp[1], sp[2]));
+            let b = ang(Point3::new(ep[0], ep[1], ep[2]));
+            let mid = ang(mp);
+            let closed = edge.start_vertex == edge.end_vertex;
+            let (theta_s, theta_e) = if closed {
+                (a, a + TAU)
+            } else {
+                // The span runs between the endpoints THROUGH the midpoint.
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                if mid >= lo && mid <= hi {
+                    (lo, hi)
+                } else {
+                    (hi, lo + TAU)
+                }
+            };
+            let span = Span {
+                eid,
+                theta_s,
+                theta_e,
+            };
+            let mut joined = false;
+            for p in by_plane.iter_mut() {
+                if n.dot(&p.1).abs() > 1.0 - 1e-9 && (cc - p.0).dot(&p.1).abs() < 1e-9 {
+                    p.3.push(span);
+                    joined = true;
+                    break;
+                }
+            }
+            if !joined {
+                by_plane.push((
+                    cc,
+                    n,
+                    r,
+                    vec![Span {
+                        eid,
+                        theta_s,
+                        theta_e,
+                    }],
+                ));
+            }
+        }
+        let mut dropped = 0usize;
+        for (_cc, _n, r, spans) in &by_plane {
+            if spans.len() < 2 {
+                continue;
+            }
+            let eps = (tol / r).max(1e-9);
+            // Atomic interval boundaries: all span endpoints, mod TAU.
+            let mut cuts: Vec<f64> = Vec::new();
+            for s in spans {
+                cuts.push(s.theta_s.rem_euclid(TAU));
+                cuts.push(s.theta_e.rem_euclid(TAU));
+            }
+            cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            cuts.dedup_by(|a, b| (*a - *b).abs() < eps);
+            if cuts.len() < 2 {
+                continue;
+            }
+            let m = cuts.len();
+            let covers = |s: &Span, k: usize| -> bool {
+                let lo = cuts[k];
+                let hi = if k + 1 == m {
+                    cuts[0] + TAU
+                } else {
+                    cuts[k + 1]
+                };
+                let mid = (0.5 * (lo + hi)).rem_euclid(TAU);
+                let rel = (mid - s.theta_s).rem_euclid(TAU);
+                rel < (s.theta_e - s.theta_s) - eps || (s.theta_e - s.theta_s) >= TAU - eps
+            };
+            let orig_cov: Vec<bool> = (0..m).map(|k| spans.iter().any(|s| covers(s, k))).collect();
+            // Exact-fit greedy by ascending EdgeId (box-side pieces first).
+            let mut order: Vec<usize> = (0..spans.len()).collect();
+            order.sort_by_key(|&i| spans[i].eid);
+            let mut covered = vec![false; m];
+            let mut selected = vec![false; spans.len()];
+            for &i in &order {
+                let ivs: Vec<usize> = (0..m).filter(|&k| covers(&spans[i], k)).collect();
+                if ivs.is_empty() {
+                    continue;
+                }
+                if ivs.iter().any(|&k| covered[k]) {
+                    continue; // redundant or conflicting — never double-cover
+                }
+                for &k in &ivs {
+                    covered[k] = true;
+                }
+                selected[i] = true;
+            }
+            // The selection must reproduce the original coverage exactly; a
+            // partial-overlap conflict leaves a gap → leave this plane alone.
+            if (0..m).any(|k| orig_cov[k] != covered[k]) {
+                continue;
+            }
+            for (i, s) in spans.iter().enumerate() {
+                if selected[i] {
+                    continue;
+                }
+                graph.edges.remove(&s.eid);
+                for node in graph.nodes.values_mut() {
+                    node.incident_edges.remove(&s.eid);
+                }
+                dropped += 1;
+            }
+        }
+        if pipeline_trace_enabled() && dropped > 0 {
+            pipeline_trace(format_args!(
+                "  presplit harmonized coverage: dropped {dropped} redundant cut edges"
+            ));
+        }
     }
     Ok(())
 }

@@ -3745,33 +3745,43 @@ fn sphere_containment_gate() {
 // ===========================================================================
 #[test]
 fn sphere_multi_component_poke_gate() {
-    let c = [0.5, 0.3, 0.0];
-    let r = 1.05_f64;
-    let truth = grid_truth(c, r);
+    // r=1.05: 3-component cut graph (2 lone z circles + an edge lens) —
+    // pins the multi-component region assembly + holed tessellation.
+    // r=1.2: single-component hub-and-satellites web (x=1 hub circle crossed
+    // by 3 satellite arcs, 5 regions) — pins the verified-interior fallback
+    // (the inside-box region's mean-of-midpoints lands outside the region
+    // and classified Outside before the fix: ∩/∖ open=8, ∪ nonman=8).
+    let cells: [([f64; 3], f64, &str); 2] = [
+        ([0.5, 0.3, 0.0], 1.05, "multi-component"),
+        ([0.5, 0.3, 0.0], 1.2, "hub-satellites"),
+    ];
     let ops: [(BooleanOp, &str, fn(&GridTruth) -> f64); 3] = [
         (BooleanOp::Intersection, "∩", |g| g.intersection),
         (BooleanOp::Union, "∪", |g| g.union),
         (BooleanOp::Difference, "∖", |g| g.difference),
     ];
     let tol = 0.05;
-    for &(op, sym, pick) in &ops {
-        let t = pick(&truth);
-        let f = run_op(op, move |m| sphere(m, c, r))
-            .unwrap_or_else(|| panic!("multi-component poke {sym}: kernel None"));
-        let rel = (f.vol - t).abs() / t.max(1e-3);
-        assert!(
-            rel <= tol,
-            "REGRESSION (multi-component poke): {sym}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
-            f.vol,
-            100.0 * (f.vol - t) / t,
-            100.0 * tol
-        );
-        assert!(
-            f.open_edges == 0 && f.nonmanifold_edges == 0,
-            "REGRESSION (multi-component poke): {sym}: not watertight ({} open, {} nonmanifold)",
-            f.open_edges,
-            f.nonmanifold_edges
-        );
+    for (c, r, name) in cells {
+        let truth = grid_truth(c, r);
+        for &(op, sym, pick) in &ops {
+            let t = pick(&truth);
+            let f = run_op(op, move |m| sphere(m, c, r))
+                .unwrap_or_else(|| panic!("poke-through {name} {sym}: kernel None"));
+            let rel = (f.vol - t).abs() / t.max(1e-3);
+            assert!(
+                rel <= tol,
+                "REGRESSION (poke-through): {name} {sym}: vol={:.4} truth={t:.4} ({:+.1}%, tol {:.0}%)",
+                f.vol,
+                100.0 * (f.vol - t) / t,
+                100.0 * tol
+            );
+            assert!(
+                f.open_edges == 0 && f.nonmanifold_edges == 0,
+                "REGRESSION (poke-through): {name} {sym}: not watertight ({} open, {} nonmanifold)",
+                f.open_edges,
+                f.nonmanifold_edges
+            );
+        }
     }
 }
 
