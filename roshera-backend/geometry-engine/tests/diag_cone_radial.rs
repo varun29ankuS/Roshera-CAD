@@ -67,6 +67,52 @@ fn surface_tally(model: &BRepModel, solid: SolidId) -> std::collections::BTreeMa
     tally
 }
 
+/// Ratchet gate (NON-ignored): the cone CORNER cell conquered by the
+/// `plane_cone_parallel_intersection` arm (plane through the cone axis →
+/// two exact generator lines; previously the marcher dropped the cuts and
+/// ∩ errored / ∪∖ left open+nonmanifold edges). Apex cone rb=0.5 rt=0 h=1
+/// based on the (1,1,0.5) corner: ∩ 0.0573 / ∪ 8.1531 / ∖ 7.9427 vs grid
+/// truths 0.057 / 8.205 / 7.943, all watertight. ∪ pinned at 1% of the
+/// MEASURED conquered value (8.1531) rather than the grid truth (−0.6%
+/// off) so the gate is a regression floor, not an accuracy claim.
+#[test]
+fn cone_corner_gate() {
+    let cases = [
+        (BooleanOp::Intersection, "I", 0.0573),
+        (BooleanOp::Union, "U", 8.1531),
+        (BooleanOp::Difference, "D", 7.9427),
+    ];
+    for (op, sym, pinned) in cases {
+        let mut model = BRepModel::new();
+        let bx = the_box(&mut model);
+        let cn = cone(&mut model, [1.0, 1.0, 0.5], 0.5, 0.0, 1.0);
+        let res = match boolean_operation(&mut model, bx, cn, op, BooleanOptions::default()) {
+            Ok(res) => res,
+            Err(e) => {
+                assert!(false, "[{sym}] cone corner errored: {e:?}");
+                return;
+            }
+        };
+        let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+        let rel = (vol - pinned).abs() / pinned;
+        assert!(
+            rel < 0.01,
+            "[{sym}] cone corner volume {vol:.4} vs pinned {pinned:.4} (rel {rel:.4})"
+        );
+        let rep = brep_integrity(&model, res, 1e-6);
+        assert!(
+            rep.edges_used_once.is_empty(),
+            "[{sym}] cone corner open edges: {:?}",
+            rep.edges_used_once
+        );
+        assert!(
+            rep.edges_used_3plus.is_empty(),
+            "[{sym}] cone corner non-manifold edges: {:?}",
+            rep.edges_used_3plus
+        );
+    }
+}
+
 /// The six survey-HARD box∘cone cells (box [-1,1]³, z-axis cones), with the
 /// grid-oracle truth volumes from the 2026-06-10 catalog for in-place reading.
 /// (base_center, rb, rt, h, label, [truth ∩, truth ∪, truth ∖])
