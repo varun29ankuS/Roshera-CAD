@@ -2558,6 +2558,20 @@ fn plane_cone_intersection(
     // Perpendicular plane ⇔ its normal is parallel to the cone axis.
     let n_dot_axis = plane_normal.dot(&cone.axis);
     if (n_dot_axis.abs() - 1.0).abs() > tolerance.parallel_threshold() {
+        if n_dot_axis.abs() <= tolerance.parallel_threshold() {
+            // Plane PARALLEL to the cone axis → two generator lines (plane
+            // through the axis) or hyperbola arcs (offset plane). The
+            // marcher's 20×20 grid seeding drops these cuts — the entire
+            // cone RADIAL fuzz family (∩ errored, ∖/∪ open + nonmanifold).
+            return plane_cone_parallel_intersection(
+                cone,
+                surface_a,
+                surface_b,
+                plane_normal,
+                plane_point,
+                tolerance,
+            );
+        }
         // Oblique cut → general conic; let the marching solver handle it.
         return march_surface_intersection(surface_a, surface_b, tolerance);
     }
@@ -2607,6 +2621,144 @@ fn plane_cone_intersection(
         on_surface_a,
         on_surface_b,
     }])
+}
+
+/// Plane–cone intersection for a plane PARALLEL to the cone axis, sampled
+/// analytically. In the apex frame with x̂ = the plane normal projected ⊥
+/// axis (signed toward the plane) and m̂ = axis × x̂, a cone point is
+/// `apex + v·axis + v·k·(cosφ·x̂ + sinφ·m̂)` with `k = tan(half_angle)`. The
+/// plane constraint `v·k·cosφ = |d|` (`d` = signed axis→plane distance at
+/// the apex) makes the section, in in-plane coordinates (s = lateral along
+/// m̂, v = axial), the hyperbola branch
+///   `v(s) = √(d² + s²) / k`   (vertex at v = |d|/k, x̂-offset constant |d|)
+/// clipped to the cone's height band [v_lo, v_hi]:
+///   * |d| ≈ 0 (plane through the axis) → two generator LINES,
+///   * branch vertex inside the band     → ONE arc through the vertex,
+///   * branch vertex below the band      → TWO arcs (left/right).
+/// Exact endpoints on the v_lo/v_hi rim circles; one curve object with both
+/// parametric images, so downstream welding is consistent by construction.
+fn plane_cone_parallel_intersection(
+    cone: &crate::primitives::surface::Cone,
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    plane_normal: Vector3,
+    plane_point: Point3,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    let k = cone.half_angle.tan();
+    if !k.is_finite() || k <= tolerance.distance() {
+        // Degenerate (cylinder-like or invalid) half-angle — not this arm's
+        // geometry; let the marcher decide.
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+    let (v_lo, v_hi) = match cone.height_limits {
+        Some([lo, hi]) => (lo, hi),
+        // Unbounded cone: no finite rim to clip the branch against — rare
+        // outside synthetic input; the marcher is the safe path.
+        None => return march_surface_intersection(surface_a, surface_b, tolerance),
+    };
+    let slack = tolerance.distance();
+
+    // Axis→plane distance measured perpendicular to the axis, signed via the
+    // projected plane normal (NOT via plane_point's radial component — the
+    // uv-origin lesson from the cylinder chord fix).
+    let n_perp = (plane_normal - cone.axis * plane_normal.dot(&cone.axis)).normalize()?;
+    let d_signed = (plane_point - cone.apex).dot(&n_perp);
+    let dd = d_signed.abs();
+
+    // Sample positions → (u, v) images on both operand surfaces.
+    let sampled_params =
+        |positions: &[Point3], surface: &dyn Surface| -> OperationResult<Vec<(f64, f64)>> {
+            let mut params = Vec::with_capacity(positions.len());
+            for p in positions {
+                let (u, v) = surface.closest_point(p, *tolerance)?;
+                params.push((u, v));
+            }
+            Ok(params)
+        };
+
+    if dd < slack {
+        // Plane through the axis — two generator lines, clipped to the
+        // height band. m̂ = the in-plane direction ⊥ axis.
+        use crate::primitives::curve::Line;
+        let m_hat = cone.axis.cross(&plane_normal).normalize()?;
+        let mut curves = Vec::with_capacity(2);
+        for side in [1.0_f64, -1.0] {
+            let dir = cone.axis + m_hat * (k * side);
+            let start = cone.apex + dir * v_lo;
+            let end = cone.apex + dir * v_hi;
+            let line = Line::new(start, end);
+            const LINE_SAMPLES: usize = 21;
+            let positions: Vec<Point3> = (0..=LINE_SAMPLES)
+                .map(|i| start + (end - start) * (i as f64 / LINE_SAMPLES as f64))
+                .collect();
+            let params_a = sampled_params(&positions, surface_a)?;
+            let params_b = sampled_params(&positions, surface_b)?;
+            curves.push(SurfaceIntersectionCurve {
+                curve: Box::new(line),
+                on_surface_a: create_parametric_curve(&params_a),
+                on_surface_b: create_parametric_curve(&params_b),
+            });
+        }
+        return Ok(curves);
+    }
+
+    let v_vertex = dd / k;
+    if v_vertex > v_hi - slack {
+        // Branch vertex at/beyond the far rim — tangency or miss.
+        return Ok(vec![]);
+    }
+    let x_hat = if d_signed >= 0.0 { n_perp } else { -n_perp };
+    let m_hat = cone.axis.cross(&x_hat);
+
+    let s_at = |v: f64| -> f64 {
+        let inner = (v * k) * (v * k) - dd * dd;
+        if inner <= 0.0 {
+            0.0
+        } else {
+            inner.sqrt()
+        }
+    };
+    let s_hi = s_at(v_hi);
+    if s_hi <= slack {
+        return Ok(vec![]);
+    }
+
+    // Trace one hyperbola arc over signed lateral range [s_start, s_end].
+    let trace_arc = |s_start: f64, s_end: f64| -> OperationResult<SurfaceIntersectionCurve> {
+        const N: usize = 48;
+        let mut points: Vec<IntersectionPoint> = Vec::with_capacity(N + 1);
+        for i in 0..=N {
+            let s = s_start + (s_end - s_start) * (i as f64) / (N as f64);
+            let v = (dd * dd + s * s).sqrt() / k;
+            let pos = cone.apex + x_hat * dd + m_hat * s + cone.axis * v;
+            let pa = surface_a.closest_point(&pos, *tolerance)?;
+            let pb = surface_b.closest_point(&pos, *tolerance)?;
+            points.push(IntersectionPoint {
+                position: pos,
+                params_a: pa,
+                params_b: pb,
+            });
+        }
+        let curve = fit_curve_to_points(&points, tolerance)?;
+        let params_a: Vec<(f64, f64)> = points.iter().map(|p| p.params_a).collect();
+        let params_b: Vec<(f64, f64)> = points.iter().map(|p| p.params_b).collect();
+        Ok(SurfaceIntersectionCurve {
+            curve,
+            on_surface_a: create_parametric_curve(&params_a),
+            on_surface_b: create_parametric_curve(&params_b),
+        })
+    };
+
+    if v_vertex >= v_lo - slack {
+        // Vertex inside the band — one arc through it, rim-to-rim.
+        Ok(vec![trace_arc(-s_hi, s_hi)?])
+    } else {
+        // Vertex below the band — the near-rim circle clips out the middle:
+        // two arcs, one per side.
+        let s_lo = s_at(v_lo);
+        Ok(vec![trace_arc(s_lo, s_hi)?, trace_arc(-s_hi, -s_lo)?])
+    }
 }
 
 /// UV samples of a circular section on a cone, via the cone's `closest_point`
