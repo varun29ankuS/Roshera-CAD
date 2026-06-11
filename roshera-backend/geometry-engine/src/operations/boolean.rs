@@ -1495,12 +1495,7 @@ fn plane_cylinder_intersection(
             create_cylinder_axis_intersection_lines(cylinder_impl, &plane_normal, plane_point)
         } else {
             // Plane parallel to axis but offset — two parallel chord lines.
-            create_cylinder_parallel_intersection_lines(
-                cylinder_impl,
-                plane_normal,
-                plane_point,
-                axis_to_plane_dist,
-            )
+            create_cylinder_parallel_intersection_lines(cylinder_impl, plane_normal, plane_point)
         }
     } else {
         // PERPENDICULAR or OBLIQUE — the infinite plane always meets the
@@ -1602,16 +1597,26 @@ fn create_cylinder_parallel_intersection_lines(
     cylinder: &crate::primitives::surface::Cylinder,
     plane_normal: Vector3,
     plane_point: Point3,
-    distance: f64,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    // Calculate the angle of intersection points on the cylinder
-    let chord_half_angle = (distance / cylinder.radius).acos();
-
-    // Find directions to intersection points
-    let radial_to_plane = (plane_point - cylinder.origin)
-        - cylinder.axis * (plane_point - cylinder.origin).dot(&cylinder.axis);
-    let radial_dir = radial_to_plane.normalize()?;
+    // Direction from the axis toward the plane. This MUST be the plane's
+    // NORMAL direction (projected perpendicular to the axis and signed
+    // toward the plane) — NOT the radial component of
+    // (plane_point − origin): `plane_point` is the plane surface's
+    // uv-origin, an arbitrary point ON the plane, so its radial component
+    // carries an arbitrary tangential offset that rotates BOTH chord
+    // generators off the plane. Box x=1 face vs offset cylinder produced
+    // generator lines at θ≈2.6°/−64.5° instead of ±33.6°; clip-to-face
+    // then dropped them as out-of-face and the box face never split
+    // (offset-through ∖ lost the whole x=1 face, −36.8% volume).
+    let n_perp = (plane_normal - cylinder.axis * plane_normal.dot(&cylinder.axis)).normalize()?;
+    let d_signed = (plane_point - cylinder.origin).dot(&n_perp);
+    let radial_dir = if d_signed >= 0.0 { n_perp } else { -n_perp };
     let tangent_dir = cylinder.axis.cross(&radial_dir);
+
+    // Chord half-angle from the perpendicular axis→plane distance measured
+    // along n_perp (the geometrically exact value; the caller's chord
+    // criterion distance matches it up to the near-parallel tolerance band).
+    let chord_half_angle = (d_signed.abs() / cylinder.radius).acos();
 
     // Calculate intersection points
     let cos_angle = chord_half_angle.cos();
