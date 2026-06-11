@@ -9823,6 +9823,11 @@ fn merge_same_origin_fragments(
 
     let mut absorbed: HashSet<usize> = HashSet::new();
     let mut nesting: HashMap<usize, Vec<Vec<(EdgeId, bool)>>> = HashMap::new();
+    // Kept islands whose rim has already been attached as a hole to some
+    // kept outer (see the both-kept branch below). Ensures a single
+    // attachment when several nested outers could contain the island —
+    // first containing outer wins, mirroring the `absorbed` semantics.
+    let mut attached_kept: HashSet<usize> = HashSet::new();
 
     for indices in groups.values() {
         if indices.len() < 2 {
@@ -9916,9 +9921,31 @@ fn merge_same_origin_fragments(
                     continue;
                 }
                 if keep_under_operation(operation, &faces[inner_idx], solid_a, solid_b) {
-                    // Both fragments survive selection — they're not a
-                    // hole / outer pair under this operation. Leave
-                    // them as separate faces.
+                    // Both fragments survive selection. Geometrically they
+                    // are STILL an outer-with-hole + island pair: the outer
+                    // must carry the island's rim as an inner loop (same
+                    // EdgeIds, reversed winding) or the island shares no
+                    // edges with the rest of the shell and strands in its
+                    // own disconnected component — box∪cylinder with the
+                    // cap flush on a box face (axial-poke ∪) failed exactly
+                    // this way (`component 1 has only 1 planar face`).
+                    // Attach the hole but do NOT absorb the island: both
+                    // faces are kept and each rim edge ends up used twice
+                    // (outer's hole + island's boundary) = manifold.
+                    if !attached_kept.contains(&inner_idx) {
+                        if let Some(inner_poly) = polygons.get(&inner_idx) {
+                            if uv_polygon_strictly_contains(outer_poly, inner_poly) {
+                                let reversed: Vec<(EdgeId, bool)> = faces[inner_idx]
+                                    .boundary_edges
+                                    .iter()
+                                    .rev()
+                                    .map(|(e, fwd)| (*e, !*fwd))
+                                    .collect();
+                                nesting.entry(outer_idx).or_default().push(reversed);
+                                attached_kept.insert(inner_idx);
+                            }
+                        }
+                    }
                     continue;
                 }
                 let inner_poly = match polygons.get(&inner_idx) {
@@ -15510,13 +15537,16 @@ mod tests {
 
     /// Two same-origin fragments both classified `Outside` — under
     /// `Difference`, both survive selection (`from_a` solids' outside
-    /// fragments are kept). The merge pass therefore must NOT nest
-    /// them: nesting only fires when the outer is kept AND the inner
-    /// is dropped. This guards against the merge pass over-eagerly
-    /// absorbing legitimate sibling rings produced by non-cutter
-    /// face-face intersections.
+    /// fragments are kept). The merge pass must NOT absorb the inner
+    /// (both faces stay), but it MUST attach the inner's reversed rim
+    /// to the outer as a hole loop: in a DCEL partition a fragment
+    /// strictly inside another's UV polygon is by construction the
+    /// outer's hole region, and without the shared rim EdgeIds the two
+    /// kept faces land in disconnected shell components (box∪cylinder
+    /// with the cap flush on a box face failed exactly this way —
+    /// `component 1 has only 1 planar face`).
     #[test]
-    fn merge_pass_skips_when_both_fragments_survive_difference() {
+    fn merge_pass_attaches_hole_when_both_fragments_survive_difference() {
         let mut model = BRepModel::new();
         let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
 
@@ -15555,12 +15585,24 @@ mod tests {
         assert_eq!(
             merged.len(),
             2,
-            "both fragments survive selection — merge must not fire",
+            "both fragments survive selection — the island must NOT be absorbed",
         );
-        assert!(
-            merged.iter().all(|f| f.inner_loops.is_empty()),
-            "no fragment should carry an inner_loops hint",
+        let outer = merged
+            .iter()
+            .find(|f| !f.inner_loops.is_empty())
+            .expect("the containing outer must carry the island's rim as a hole loop");
+        assert_eq!(
+            outer.inner_loops.len(),
+            1,
+            "exactly one hole loop (the kept island's reversed rim)",
         );
+        assert_eq!(
+            outer.inner_loops[0].len(),
+            4,
+            "the hole must be the island's 4-edge square loop",
+        );
+        let islands: Vec<_> = merged.iter().filter(|f| f.inner_loops.is_empty()).collect();
+        assert_eq!(islands.len(), 1, "the island itself carries no holes");
     }
 
     /// Mirror of the Difference case under Union: outer Outside is
