@@ -113,6 +113,53 @@ fn cone_corner_gate() {
     }
 }
 
+/// Ratchet gate (NON-ignored): the radial-poke-past cell — frustum poking
+/// the +x box face from outside, cut = one hyperbola arc (offset plane,
+/// vertex inside the band). Conquered by the banding-path guard in
+/// `split_cone_face_by_circles`: the axial band path fired on the rim
+/// circles alone and IGNORED the hyperbola cut (both lateral fragments got
+/// garbage interior points → Outside → ∩ lost the cone wall). With mixed
+/// cuts routed to the generic splitter: ∩ 0.0477 / ∪ 8.7481 / ∖ 7.9523 vs
+/// grid truths 0.048 / 8.690 / 7.952, all watertight. Pinned at measured
+/// values (regression floor).
+#[test]
+fn cone_poke_past_gate() {
+    let cases = [
+        (BooleanOp::Intersection, "I", 0.0477),
+        (BooleanOp::Union, "U", 8.7481),
+        (BooleanOp::Difference, "D", 7.9523),
+    ];
+    for (op, sym, pinned) in cases {
+        let mut model = BRepModel::new();
+        let bx = the_box(&mut model);
+        let cn = cone(&mut model, [1.4, 0.0, -0.5], 0.6, 0.4, 1.0);
+        let res = match boolean_operation(&mut model, bx, cn, op, BooleanOptions::default()) {
+            Ok(res) => res,
+            Err(e) => {
+                assert!(false, "[{sym}] cone poke-past errored: {e:?}");
+                return;
+            }
+        };
+        let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+        let rel = (vol - pinned).abs() / pinned;
+        assert!(
+            rel < 0.01,
+            "[{sym}] cone poke-past volume {vol:.4} vs pinned {pinned:.4} (rel {rel:.4})"
+        );
+        let rep = brep_integrity(&model, res, 1e-6);
+        assert!(
+            rep.edges_used_once.is_empty(),
+            "[{sym}] cone poke-past open edges: {:?}",
+            rep.edges_used_once
+        );
+        assert!(
+            rep.edges_used_3plus.is_empty(),
+            "[{sym}] cone poke-past non-manifold edges: {:?}",
+            rep.edges_used_3plus
+        );
+    }
+}
+
 /// The six survey-HARD box∘cone cells (box [-1,1]³, z-axis cones), with the
 /// grid-oracle truth volumes from the 2026-06-10 catalog for in-place reading.
 /// (base_center, rb, rt, h, label, [truth ∩, truth ∪, truth ∖])

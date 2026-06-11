@@ -4621,16 +4621,43 @@ fn split_cone_face_by_circles(
     let ref_dir = cone.ref_dir;
     let tan = cone.half_angle.tan();
 
+    // This banding path is only valid when EVERY cut on the lateral face is
+    // an axis-perpendicular circle (the axial family). A mixed cut — e.g.
+    // the plane-parallel hyperbola from `plane_cone_parallel_intersection`
+    // — must fall to the generic splitter: banding by the rim circles alone
+    // ignores the real cut and emits fragments with garbage interior points
+    // (cone radial-poke-past ∩ dropped the inside-box lateral sliver; both
+    // band fragments classified Outside). Boundary edges of the face itself
+    // (rims + seam) are exempt from the check.
+    let face_boundary: std::collections::HashSet<EdgeId> = model
+        .faces
+        .get(face_id)
+        .map(|face| {
+            std::iter::once(face.outer_loop)
+                .chain(face.inner_loops.iter().copied())
+                .filter_map(|lid| model.loops.get(lid))
+                .flat_map(|l| l.edges.iter().copied())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut by_curve: std::collections::BTreeMap<CurveId, Vec<EdgeId>> =
         std::collections::BTreeMap::new();
     for &eid in graph.edges.keys() {
         let Some(edge) = model.edges.get(eid) else {
             continue;
         };
-        if let Some(curve) = model.curves.get(edge.curve_id) {
-            if curve.as_any().downcast_ref::<Circle>().is_some() {
-                by_curve.entry(edge.curve_id).or_default().push(eid);
-            }
+        let is_axis_perp_circle = model
+            .curves
+            .get(edge.curve_id)
+            .and_then(|c| c.as_any().downcast_ref::<Circle>())
+            .map(|c| c.normal().cross(&axis).magnitude() <= 1e-9)
+            .unwrap_or(false);
+        if is_axis_perp_circle {
+            by_curve.entry(edge.curve_id).or_default().push(eid);
+        } else if !face_boundary.contains(&eid) {
+            // Non-banding CUT curve present — not this path's geometry.
+            return None;
         }
     }
     // Need the base rim plus at least one cut circle (≥2 circles) to band.
