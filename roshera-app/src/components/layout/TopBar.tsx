@@ -69,7 +69,7 @@ async function exportGeometry(format: string) {
   }
 }
 
-// Workspace switcher. Mirrors SolidWorks's File-menu pattern: the user
+// Workspace switcher. Mirrors the standard CAD File-menu pattern: the user
 // is *always* in a workspace; the chip on the right of the TopBar names
 // the current one and the dropdown lets you switch. All three modes
 // (Modeling / Assembly / Drawing) are exposed now that the Assembly

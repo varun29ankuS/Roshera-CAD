@@ -183,7 +183,7 @@ export function DrawingsWorkspace() {
   // wrapper's overflow extent, which kept clipping access to the
   // right/bottom of the sheet at high zoom. Translating instead lets
   // the user drag the sheet to any position — same model used by
-  // every production CAD viewer (Fusion, SolidWorks, Onshape).
+  // every production CAD viewer.
   const [zoomMode, setZoomMode] = useState<'fit' | 'manual'>('fit')
   const [zoom, setZoom] = useState<number>(1)
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 })

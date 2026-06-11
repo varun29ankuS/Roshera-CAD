@@ -190,6 +190,14 @@ pub enum OperationError {
     /// Operation would create invalid B-Rep
     InvalidBRep(String),
 
+    /// The operation's result is the empty solid — a geometrically valid
+    /// outcome that this kernel does not materialise as a zero-shell body.
+    /// Raised by a Boolean whose face selection is empty: `A ∖ B` where
+    /// `A ⊆ B` (the whole of A is removed), or `A ∩ B` where A and B are
+    /// disjoint. Callers should treat this as "the result is nothing",
+    /// distinct from a malformed-input / failed-construction error.
+    EmptyResult,
+
     /// Feature too small for tolerance
     FeatureTooSmall,
 
@@ -255,6 +263,7 @@ impl std::fmt::Display for OperationError {
                 write!(f, "Operation would create self-intersection")
             }
             OperationError::InvalidBRep(msg) => write!(f, "Invalid B-Rep: {}", msg),
+            OperationError::EmptyResult => write!(f, "Operation result is the empty solid"),
             OperationError::FeatureTooSmall => write!(f, "Feature too small for current tolerance"),
             OperationError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
             OperationError::InternalError(msg) => write!(f, "Internal error: {}", msg),

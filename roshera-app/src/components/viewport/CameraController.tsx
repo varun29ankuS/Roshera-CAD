@@ -286,7 +286,7 @@ export function CameraController() {
         // Sketch mode shares the left button with OrbitControls:
         // click-without-drag places a sketch point (SketchOverlay
         // implements a movement threshold on pointerup), drag-beyond-
-        // threshold orbits the camera. The Fusion/Onshape pattern —
+        // threshold orbits the camera. The standard parametric-CAD pattern —
         // and the only way to give the user an orbit affordance while
         // sketching without burning a separate modifier key.
         // Gizmo drags still fully suppress orbit (the arrow owns the

@@ -9,7 +9,7 @@
 //!
 //! Until now the api-server held a single `Arc<RwLock<BRepModel>>` in
 //! `AppState.model`. That worked for a one-document UI but blocks
-//! the Fusion / SolidWorks / Onshape pattern the demo is moving to:
+//! the standard multi-document CAD pattern the demo is moving to:
 //! the user opens multiple Part tabs and each must have its own
 //! solids, sketches, and undo stack. A `DashMap<Uuid,
 //! Arc<RwLock<BRepModel>>>` gives every tab an isolated model with

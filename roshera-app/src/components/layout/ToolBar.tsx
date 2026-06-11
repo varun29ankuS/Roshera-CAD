@@ -1271,7 +1271,7 @@ export function ToolBar() {
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
   const [openId, setOpenId] = useState<string | null>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
-  // Fusion-style modify panel — fillet / chamfer / shell. Single state
+  // Industry-standard modify panel — fillet / chamfer / shell. Single state
   // because the three operations are mutually exclusive (one panel at
   // a time); the dialog renders nothing when `null`.
   const [modifyMode, setModifyMode] = useState<ModifyMode | null>(null)
