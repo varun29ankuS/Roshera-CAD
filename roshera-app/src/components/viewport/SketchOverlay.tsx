@@ -55,7 +55,7 @@ const PLANE_SIZE = 400 // world units; large enough that the user
 // D-2-c snap-search radius in plane (u, v) units. Matches the
 // visual scale of `CSKETCH_GLYPH_SIZE` so the snap engine only
 // engages within a glyph-width of an existing entity — the same
-// "feel" as Fusion's hover-on-vertex magnetism.
+// "feel" as mainstream CAD hover-on-vertex magnetism.
 const CSKETCH_SNAP_RADIUS = 1.5
 
 /** Project a world-space `THREE.Vector3` onto the chosen sketch plane. */
@@ -256,7 +256,7 @@ function snapToGeometry(
  * being perfectly horizontal or vertical relative to `anchor`, lock
  * the off-axis coordinate to the anchor's so the user can place the
  * next point on a clean H/V line through the previous one. Mimics
- * Fusion's "Horizontal" / "Vertical" inference cues.
+ * the standard "Horizontal" / "Vertical" inference cues.
  */
 function snapToInference(
   uv: [number, number],
@@ -557,8 +557,8 @@ export function SketchOverlay() {
   // points. We replace it with a manual pointerdown handler that
   // registers a one-shot window-level pointerup listener and only
   // places a point when total pointer travel stays under the 4 px
-  // budget desktop UIs use for "click vs. drag" (matches Fusion /
-  // Onshape behaviour). pointerup is registered on `window` rather
+  // budget desktop UIs use for "click vs. drag" (matches mainstream
+  // CAD behaviour). pointerup is registered on `window` rather
   // than the mesh so the gesture is resilient to the camera moving
   // mid-drag — by the time the user releases, the raycaster may have
   // long lost the plane.
@@ -1659,7 +1659,7 @@ function sketchPlaneAsThreePlane(plane: SketchPlane): THREE.Plane {
  *      record pointer-down NDC, install window pointermove + pointerup.
  *   2. pointermove → raycast cursor onto the sketch plane, project to
  *      (u, v). Only fires the backend call once travel exceeds the
- *      4-px click-vs-drag budget (matches Fusion / Onshape).
+ *      4-px click-vs-drag budget (matches mainstream CAD).
  *   3. Backend call is throttled to "one in flight at a time"; later
  *      moves overwrite a `pendingUV` so the final position is always
  *      delivered, but we never stack requests on a slow solver.

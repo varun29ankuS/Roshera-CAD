@@ -9,9 +9,9 @@
 //! handlers in [`super::handlers`].
 //!
 //! Pre-processing: this module strips `/* ... */` block comments from
-//! the input before handing it to the underlying parser. Open CASCADE
-//! emits a non-conforming `META-MATIC-ID` comment near the top of
-//! every exported file; while most STEP toolchains tolerate this,
+//! the input before handing it to the underlying parser. A widely
+//! deployed exporter emits a non-conforming `META-MATIC-ID` comment
+//! near the top of every file; while most STEP toolchains tolerate this,
 //! ruststep's grammar is strict to ISO 10303-21 and rejects it. The
 //! comment carries no geometric meaning, so stripping is the
 //! pragmatic move.

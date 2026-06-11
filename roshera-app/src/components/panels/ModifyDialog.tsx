@@ -1,5 +1,5 @@
 /**
- * Fusion 360-style modify dialog for fillet / chamfer / shell.
+ * Industry-standard modify dialog for fillet / chamfer / shell.
  *
  * Replaces the old `window.prompt` flow (Task #81). Three behaviours:
  *
@@ -13,7 +13,7 @@
  *     currently selected solid. The "edges (N)" row is suppressed.
  *
  * Numeric input: text field with up/down steppers and a "mm" suffix,
- * matching Fusion's distance fields. The OK button is disabled while
+ * matching mainstream CAD distance fields. The OK button is disabled while
  * the value isn't a positive finite number, or (fillet/chamfer) while
  * no edges are picked.
  *
@@ -207,8 +207,8 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   // Remember the prior selection mode so we can restore it on close —
-  // matches Fusion's behaviour where leaving the modify command drops
-  // you back into whatever selection filter you had before.
+  // matches mainstream CAD behaviour where leaving the modify command
+  // drops you back into whatever selection filter you had before.
   const priorModeRef = useRef<SelectionMode | null>(null)
 
   // Reset numeric value + flip to edge mode on each open. We intentionally

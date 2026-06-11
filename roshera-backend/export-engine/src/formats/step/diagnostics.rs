@@ -84,8 +84,8 @@ pub struct Warning {
 /// quite reach the declared vertex positions, loops that don't close
 /// to floating-point tolerance, or oriented edges whose start/end
 /// vertex assignments are inverted relative to the underlying curve
-/// parameterisation. Production importers (OCC, ACIS, Parasolid)
-/// silently heal these in the obvious way; we heal *and log* so the
+/// parameterisation. Mainstream production importers silently heal
+/// these in the obvious way; we heal *and log* so the
 /// caller can decide whether the deviations are acceptable for their
 /// downstream task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

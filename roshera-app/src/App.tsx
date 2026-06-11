@@ -83,7 +83,7 @@ export function App() {
           <>
             <ToolBar />
 
-            {/* Viewport + Fusion-style floating overlays */}
+            {/* Viewport + floating overlays in the standard CAD layout */}
             <div className="relative flex-1 overflow-hidden">
               <CADViewport />
               <AIChatPanel />

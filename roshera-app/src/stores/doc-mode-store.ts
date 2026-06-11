@@ -3,7 +3,7 @@
  *
  * Roshera supports three top-level document types — Part, Assembly,
  * Drawing — and the user picks one at the start of every session
- * (mirrors SolidWorks / Fusion / Onshape). The chosen mode decides
+ * (mirrors mainstream parametric CAD). The chosen mode decides
  * which toolset, which panels, and which workspace layout are
  * presented; the kernel itself is mode-agnostic.
  *

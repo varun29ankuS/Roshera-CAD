@@ -103,33 +103,19 @@ fn calculate_primitive_efficiency() {
 }
 
 fn compare_with_industry() {
-    println!("\n🏭 INDUSTRY COMPARISON:");
-    
-    // Industry estimates (conservative)
-    let parasolid_box_kb = 2; // Estimated
-    let acis_box_kb = 3;      // Estimated  
-    let opencascade_box_kb = 4; // Estimated
-    
+    // Internal memory-budget report (no third-party comparisons; see the
+    // performance-targets policy in CLAUDE.md).
     let roshera_box_bytes = calculate_estimated_box_size();
     let roshera_box_kb = (roshera_box_bytes as f64 / 1024.0).ceil() as u32;
-    
-    println!("  Memory per box primitive:");
-    println!("    Parasolid (est):     ~{} KB", parasolid_box_kb);
-    println!("    ACIS (est):          ~{} KB", acis_box_kb);
-    println!("    Open CASCADE (est):  ~{} KB", opencascade_box_kb);
-    println!("    Roshera:             ~{} KB ({} bytes)", roshera_box_kb, roshera_box_bytes);
-    
-    let savings_vs_parasolid = ((parasolid_box_kb - roshera_box_kb) as f64 / parasolid_box_kb as f64) * 100.0;
-    let savings_vs_acis = ((acis_box_kb - roshera_box_kb) as f64 / acis_box_kb as f64) * 100.0;
-    let savings_vs_opencascade = ((opencascade_box_kb - roshera_box_kb) as f64 / opencascade_box_kb as f64) * 100.0;
-    
-    println!("\n💰 MEMORY SAVINGS:");
-    println!("  vs Parasolid:        {:.1}% smaller", savings_vs_parasolid);
-    println!("  vs ACIS:             {:.1}% smaller", savings_vs_acis);
-    println!("  vs Open CASCADE:     {:.1}% smaller", savings_vs_opencascade);
-    
+
+    println!("\nMEMORY BUDGET:");
+    println!(
+        "  Per box primitive:   ~{} KB ({} bytes)",
+        roshera_box_kb, roshera_box_bytes
+    );
+
     // Memory scaling analysis
-    println!("\n📈 SCALING ANALYSIS:");
+    println!("\nSCALING ANALYSIS:");
     let million_boxes_mb = (roshera_box_bytes * 1_000_000) / (1024 * 1024);
     println!("  1M boxes:            {} MB", million_boxes_mb);
     println!("  10M boxes:           {} GB", (million_boxes_mb * 10) / 1024);

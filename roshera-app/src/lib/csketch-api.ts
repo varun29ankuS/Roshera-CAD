@@ -6,7 +6,7 @@
  * solver — distinct from the click-to-place `sketch` system this
  * directory's `sketch-api.ts` wraps. The two coexist by design: the
  * click-to-place path is a fast "outline-and-extrude" workflow,
- * while csketch is the Fusion / Onshape / SolidWorks-style
+ * while csketch is the industry-standard
  * fully-constrained sketcher. See `roshera-backend/api-server/src/
  * csketch.rs` for the canonical wire-shape definitions.
  *

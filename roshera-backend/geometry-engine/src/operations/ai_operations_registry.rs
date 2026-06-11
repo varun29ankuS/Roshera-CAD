@@ -1670,6 +1670,7 @@ impl OperationError {
             OperationError::InvalidInput { .. } => "invalid_input",
             OperationError::CoplanarFaces(_) => "coplanar_faces",
             OperationError::BlendFailed(_) => "blend_failed",
+            OperationError::EmptyResult => "empty_result",
         }
     }
 

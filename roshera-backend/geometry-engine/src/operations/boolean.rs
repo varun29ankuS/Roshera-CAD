@@ -3476,6 +3476,385 @@ fn sphere_arrangement_faces(
     faces
 }
 
+/// Assemble the TRUE regions of a MULTI-COMPONENT spherical cut arrangement
+/// (#88 poke-through).
+///
+/// [`sphere_arrangement_faces`] walks each connected component of the arc
+/// graph independently, so a sphere cut by DISJOINT loop systems — e.g. the
+/// interior-offset poke: two small full circles (z-face pokes) plus a 2-arc
+/// lens straddling a box edge — yields one region PAIR per component, where
+/// each "rest of the sphere" member silently ignores every other component's
+/// cuts. Those fragments overlap (the two anti-caps and the lens complement
+/// each cover almost the whole sphere), the kept region never carries the
+/// other components' cut loops as holes (→ disconnected shells / open edges),
+/// and the complement-pair antipode interior point lands OUTSIDE through the
+/// opposite box face (→ misclassification).
+///
+/// This pass nests the components into each other:
+///
+///   1. Group the walked cycles into connected components (shared vertices).
+///      Returns `None` for <2 components so the single-component path (the
+///      conquered corner/near-vertex/poke-edge cells) is untouched.
+///   2. Per directed cycle ℓ, define R(ℓ) = the spherical region to its left.
+///      Membership: exact plane half-space test when every arc of ℓ lies on
+///      one cut plane; otherwise geodesic crossing-parity against a seed
+///      point nudged just inside ℓ.
+///   3. Face(ℓ) = R(ℓ) minus every other component nested inside it; each
+///      nested component contributes its ℓ-facing cycle as an inner-loop
+///      hole (that cycle already winds with the face on its left).
+///   4. A region with k boundary cycles is produced k times (once per
+///      cycle); dedupe by the sorted multiset of directed edges.
+///   5. Interior point = the max-clearance nudged sample verified inside the
+///      outer cycle and inside every hole cycle's region.
+///
+/// Any geometric failure (non-circular arc, degenerate normalize, no
+/// verifiable membership) aborts with `None`, falling back to the previous
+/// behaviour.
+fn assemble_multi_component_sphere_regions(
+    model: &BRepModel,
+    center: Point3,
+    radius: f64,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    face_loops: &[Vec<(EdgeId, bool)>],
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::curve::{Arc, Circle};
+    use std::f64::consts::TAU;
+
+    // ---- 1. component labeling over cycles via shared vertices ----
+    let nl = face_loops.len();
+    if nl < 2 {
+        return None;
+    }
+    let mut loop_verts: Vec<std::collections::BTreeSet<VertexId>> = Vec::with_capacity(nl);
+    for lp in face_loops {
+        let mut s = std::collections::BTreeSet::new();
+        for &(eid, _) in lp {
+            let edge = model.edges.get(eid)?;
+            s.insert(edge.start_vertex);
+            s.insert(edge.end_vertex);
+        }
+        loop_verts.push(s);
+    }
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..nl).collect();
+    for i in 0..nl {
+        for j in (i + 1)..nl {
+            if loop_verts[i].iter().any(|v| loop_verts[j].contains(v)) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[rj] = ri;
+                }
+            }
+        }
+    }
+    let comp_of: Vec<usize> = (0..nl).map(|i| find(&mut parent, i)).collect();
+    let mut comp_ids: Vec<usize> = comp_of.clone();
+    comp_ids.sort_unstable();
+    comp_ids.dedup();
+    if comp_ids.len() < 2 {
+        return None;
+    }
+
+    // ---- 2. per-cycle region geometry ----
+    struct ArcSeg {
+        cc: Point3,
+        n: Vector3,
+        u: Vector3,
+        v: Vector3,
+        theta_end: f64,
+        mid_low: bool,
+        p_mid: Point3,
+        into_face: Vector3,
+    }
+    let build_arc = |eid: EdgeId, fwd: bool| -> Option<ArcSeg> {
+        let edge = model.edges.get(eid)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let (cc, n_raw) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
+            (ci.center(), ci.normal())
+        } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
+            (ar.center, ar.normal)
+        } else {
+            return None;
+        };
+        let n = n_raw.normalize().ok()?;
+        let sp = model.vertices.get_position(edge.start_vertex)?;
+        let ep = model.vertices.get_position(edge.end_vertex)?;
+        let p_start = Point3::new(sp[0], sp[1], sp[2]);
+        let p_end = Point3::new(ep[0], ep[1], ep[2]);
+        let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
+        let p_mid = curve.evaluate(tmid).ok()?.position;
+        let u = (p_start - cc).normalize().ok()?;
+        let v = n.cross(&u);
+        let theta = |x: Point3| -> f64 {
+            let d = x - cc;
+            let t = d.dot(&v).atan2(d.dot(&u));
+            if t < 0.0 {
+                t + TAU
+            } else {
+                t
+            }
+        };
+        let dse = p_end - p_start;
+        let closed = dse.dot(&dse) < 1e-18;
+        let theta_end = if closed { TAU } else { theta(p_end) };
+        let mid_low = closed || theta(p_mid) <= theta_end;
+        let mut tang = n.cross(&(p_mid - cc)).normalize().ok()?;
+        if !fwd {
+            tang = tang * -1.0;
+        }
+        let nout = (p_mid - center).normalize().ok()?;
+        let into_face = nout.cross(&tang).normalize().ok()?;
+        Some(ArcSeg {
+            cc,
+            n,
+            u,
+            v,
+            theta_end,
+            mid_low,
+            p_mid,
+            into_face,
+        })
+    };
+    struct LoopRegion {
+        arcs: Vec<ArcSeg>,
+        /// `Some((cc, n_signed))` when every arc lies on one plane:
+        /// inside ⟺ (x − cc)·n_signed > 0. Exact and global.
+        single_plane: Option<(Point3, Vector3)>,
+    }
+    let mut regions: Vec<LoopRegion> = Vec::with_capacity(nl);
+    for lp in face_loops {
+        let mut arcs = Vec::with_capacity(lp.len());
+        for &(eid, fwd) in lp {
+            arcs.push(build_arc(eid, fwd)?);
+        }
+        let first = arcs.first()?;
+        let coplanar = arcs.iter().all(|a| {
+            a.n.dot(&first.n).abs() > 1.0 - 1e-9 && (a.cc - first.cc).dot(&first.n).abs() < 1e-9
+        });
+        let single_plane = if coplanar {
+            let side = first.into_face.dot(&first.n);
+            if side.abs() < 1e-9 {
+                None
+            } else {
+                Some((first.cc, first.n * side.signum()))
+            }
+        } else {
+            None
+        };
+        regions.push(LoopRegion { arcs, single_plane });
+    }
+
+    // Seed points nudged into a loop's region, ordered near-rim → far.
+    const NUDGE: [f64; 5] = [0.02, 0.08, 0.25, 0.7, 1.6];
+    let seed = |lr: &LoopRegion, arc_idx: usize, e: f64| -> Option<Point3> {
+        let a = lr.arcs.get(arc_idx)?;
+        let dir = ((a.p_mid - center) * (1.0 / radius) + a.into_face * e)
+            .normalize()
+            .ok()?;
+        Some(center + dir * radius)
+    };
+
+    // Crossing-parity membership for a multi-plane cycle. Counts transversal
+    // crossings of the geodesic p→q (q nudged inside) with the cycle's arcs;
+    // even parity ⟺ p on q's (inside) side. `None` = this q gave a
+    // degenerate/near-endpoint configuration — caller tries the next seed.
+    let parity_with_seed = |lr: &LoopRegion, p: Point3, q: Point3| -> Option<bool> {
+        let p_hat = (p - center).normalize().ok()?;
+        let q_hat = (q - center).normalize().ok()?;
+        let ngv = p_hat.cross(&q_hat);
+        if ngv.dot(&ngv) < 1e-16 {
+            return None;
+        }
+        let ng = ngv.normalize().ok()?;
+        let mut crossings = 0usize;
+        for a in &lr.arcs {
+            let m = a.n.dot(&ng);
+            let denom = 1.0 - m * m;
+            let h = (center - a.cc).dot(&a.n);
+            if denom < 1e-12 {
+                if h.abs() < 1e-9 {
+                    return None; // geodesic lies in the arc's plane
+                }
+                continue; // parallel planes, no sphere intersection
+            }
+            let y0 = a.n * (-h / denom) + ng * (h * m / denom);
+            let d = a.n.cross(&ng);
+            let t2 = (radius * radius - y0.dot(&y0)) / denom;
+            if t2 < 1e-14 {
+                if t2 > -1e-14 {
+                    return None; // tangential touch
+                }
+                continue;
+            }
+            let t = t2.sqrt();
+            for s in [center + y0 + d * t, center + y0 - d * t] {
+                // on the arc's angular span?
+                let ds = s - a.cc;
+                let th = {
+                    let t0 = ds.dot(&a.v).atan2(ds.dot(&a.u));
+                    if t0 < 0.0 {
+                        t0 + TAU
+                    } else {
+                        t0
+                    }
+                };
+                const END_BAND: f64 = 1e-6;
+                let span_low = th <= a.theta_end;
+                let on = if a.mid_low { span_low } else { !span_low };
+                let near_end =
+                    th < END_BAND || th > TAU - END_BAND || (th - a.theta_end).abs() < END_BAND;
+                if near_end {
+                    return None; // crossing at a cycle vertex — ambiguous
+                }
+                if !on {
+                    continue;
+                }
+                // within the geodesic segment p→q?
+                let s_hat = (s - center).normalize().ok()?;
+                let c1 = p_hat.cross(&s_hat).dot(&ng);
+                let c2 = s_hat.cross(&q_hat).dot(&ng);
+                if c1.abs() < 1e-9 || c2.abs() < 1e-9 {
+                    return None; // crossing at p or q — ambiguous
+                }
+                if c1 > 0.0 && c2 > 0.0 {
+                    crossings += 1;
+                }
+            }
+        }
+        Some(crossings % 2 == 0)
+    };
+    let point_in_region = |lr: &LoopRegion, p: Point3| -> Option<bool> {
+        if let Some((cc, ns)) = lr.single_plane {
+            return Some((p - cc).dot(&ns) > 0.0);
+        }
+        for arc_idx in 0..lr.arcs.len() {
+            for &e in &NUDGE {
+                let Some(q) = seed(lr, arc_idx, e) else {
+                    continue;
+                };
+                if let Some(inside) = parity_with_seed(lr, p, q) {
+                    return Some(inside);
+                }
+            }
+        }
+        None
+    };
+
+    // ---- 3.+4. nest components, dedupe multi-cycle regions ----
+    // One on-boundary sample point per component (a point ON its arcs is
+    // strictly inside or outside every OTHER component's regions).
+    let mut comp_sample: HashMap<usize, Point3> = HashMap::new();
+    for (li, lr) in regions.iter().enumerate() {
+        comp_sample
+            .entry(comp_of[li])
+            .or_insert(lr.arcs.first()?.p_mid);
+    }
+    let mut out: Vec<SplitFace> = Vec::new();
+    let mut seen: std::collections::BTreeSet<Vec<(EdgeId, bool)>> =
+        std::collections::BTreeSet::new();
+    for (li, lp) in face_loops.iter().enumerate() {
+        // A verified point just inside this cycle (smallest workable nudge).
+        let q_self = (0..regions[li].arcs.len())
+            .flat_map(|ai| NUDGE.iter().map(move |&e| (ai, e)))
+            .find_map(|(ai, e)| {
+                let q = seed(&regions[li], ai, e)?;
+                point_in_region(&regions[li], q)?.then_some(q)
+            })?;
+        let mut holes: Vec<Vec<(EdgeId, bool)>> = Vec::new();
+        let mut hole_idx: Vec<usize> = Vec::new();
+        let mut ok = true;
+        for &cj in &comp_ids {
+            if cj == comp_of[li] {
+                continue;
+            }
+            let Some(&sample) = comp_sample.get(&cj) else {
+                ok = false;
+                break;
+            };
+            match point_in_region(&regions[li], sample) {
+                Some(true) => {
+                    // The cycle of component cj whose region contains q_self
+                    // faces this region — it is the correctly-wound hole loop.
+                    let host = (0..nl)
+                        .filter(|&k| comp_of[k] == cj)
+                        .find(|&k| point_in_region(&regions[k], q_self) == Some(true));
+                    match host {
+                        Some(k) => {
+                            holes.push(face_loops[k].clone());
+                            hole_idx.push(k);
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                Some(false) => {}
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            return None;
+        }
+        let mut key: Vec<(EdgeId, bool)> = lp
+            .iter()
+            .copied()
+            .chain(holes.iter().flatten().copied())
+            .collect();
+        key.sort_unstable();
+        if !seen.insert(key) {
+            continue;
+        }
+        // ---- 5. interior point: max clearance, inside outer + every hole ----
+        let interior = NUDGE
+            .iter()
+            .rev()
+            .flat_map(|&e| (0..regions[li].arcs.len()).map(move |ai| (ai, e)))
+            .find_map(|(ai, e)| {
+                let c = seed(&regions[li], ai, e)?;
+                let in_outer = point_in_region(&regions[li], c)?;
+                if !in_outer {
+                    return None;
+                }
+                for &hk in &hole_idx {
+                    if !point_in_region(&regions[hk], c)? {
+                        return None;
+                    }
+                }
+                Some(c)
+            })?;
+        out.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: lp.clone(),
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(interior),
+            inner_loops: holes,
+        });
+    }
+    if pipeline_trace_enabled() {
+        pipeline_trace(format_args!(
+            "  sphere multi-component arrangement: cycles={} comps={} regions={}",
+            nl,
+            comp_ids.len(),
+            out.len(),
+        ));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Sphere-specific region builder for the closed-surface curved-Boolean case.
 ///
 /// A sphere (untrimmed — `boundary_edges` empty) cut by N coplanar circles
@@ -3559,6 +3938,24 @@ fn split_sphere_face_by_circles(
             let face_loops = sphere_arrangement_faces(model, center, &arc_edges);
             if face_loops.len() < 2 {
                 return None;
+            }
+            // MULTI-COMPONENT cut graph (#88 poke-through): disjoint loop
+            // systems (e.g. two lone poke circles + an edge-straddling lens)
+            // are walked per-component above, so their "rest of the sphere"
+            // sides overlap and ignore each other's cuts. Assemble the true
+            // nested regions instead. Single-component arrangements (corner
+            // poke #60, near-vertex, poke-edge #92) return `None` here and
+            // use the unchanged path below.
+            if let Some(faces) = assemble_multi_component_sphere_regions(
+                model,
+                center,
+                radius,
+                surface_id,
+                face_id,
+                origin_solid,
+                &face_loops,
+            ) {
+                return Some(faces);
             }
             // Interior point per region. DEFAULT = mean of the loop's arc
             // midpoints (robust for the normal case where every region has its
@@ -3661,6 +4058,170 @@ fn split_sphere_face_by_circles(
                 };
                 Some(center + side * radius)
             };
+            // Verified-interior fallback for the MEAN path (#88): a region
+            // bounded by arcs of several planes can have its mean-of-
+            // midpoints land OUTSIDE the region (hub-and-satellites: the hub
+            // midpoints tip the mean across the hub plane) or exactly ON its
+            // own boundary (a great-circle hemisphere: every boundary
+            // midpoint lies in the cut plane). Verification must be SHAPE-
+            // AGNOSTIC — a half-space conjunction is wrong for union-type
+            // regions like the bite between a chord-chain and the great
+            // circle ((y>1 ∨ z<−1) ∧ x<1) — so membership is geodesic
+            // CROSSING-PARITY against the region's own directed loop, with a
+            // small `into_face` nudge as the locally-inside reference. When
+            // the mean verifies inside (every conquered cell) nothing
+            // changes; otherwise the largest parity-verified nudge replaces
+            // it, falling back to the smallest nudge (locally inside by the
+            // loop's orientation).
+            struct ASeg {
+                cc: Point3,
+                n: Vector3,
+                u: Vector3,
+                v: Vector3,
+                theta_end: f64,
+                mid_low: bool,
+                p_mid: Point3,
+                into_face: Vector3,
+            }
+            let build_segs = |lp: &[(EdgeId, bool)]| -> Option<Vec<ASeg>> {
+                let tau = std::f64::consts::TAU;
+                let mut segs = Vec::with_capacity(lp.len());
+                for &(eid, fwd) in lp {
+                    let edge = model.edges.get(eid)?;
+                    let (cc, n_raw) = circ_geom(edge.curve_id)?;
+                    let n = n_raw.normalize().ok()?;
+                    let sp = model.vertices.get_position(edge.start_vertex)?;
+                    let ep = model.vertices.get_position(edge.end_vertex)?;
+                    let p_start = Point3::new(sp[0], sp[1], sp[2]);
+                    let p_end = Point3::new(ep[0], ep[1], ep[2]);
+                    let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
+                    let p_mid = model
+                        .curves
+                        .get(edge.curve_id)?
+                        .evaluate(tmid)
+                        .ok()?
+                        .position;
+                    let u = (p_start - cc).normalize().ok()?;
+                    let v = n.cross(&u);
+                    let theta = |x: Point3| -> f64 {
+                        let d = x - cc;
+                        let t = d.dot(&v).atan2(d.dot(&u));
+                        if t < 0.0 {
+                            t + tau
+                        } else {
+                            t
+                        }
+                    };
+                    let dse = p_end - p_start;
+                    let closed = dse.dot(&dse) < 1e-18;
+                    let theta_end = if closed { tau } else { theta(p_end) };
+                    let mid_low = closed || theta(p_mid) <= theta_end;
+                    let mut tang = n.cross(&(p_mid - cc)).normalize().ok()?;
+                    if !fwd {
+                        tang = tang * -1.0;
+                    }
+                    let nout = (p_mid - center).normalize().ok()?;
+                    let into_face = nout.cross(&tang).normalize().ok()?;
+                    segs.push(ASeg {
+                        cc,
+                        n,
+                        u,
+                        v,
+                        theta_end,
+                        mid_low,
+                        p_mid,
+                        into_face,
+                    });
+                }
+                (!segs.is_empty()).then_some(segs)
+            };
+            let seg_seed = |s: &ASeg, e: f64| -> Option<Point3> {
+                let dir = ((s.p_mid - center) * (1.0 / radius) + s.into_face * e)
+                    .normalize()
+                    .ok()?;
+                Some(center + dir * radius)
+            };
+            // Parity of geodesic p→q crossings with the loop's arcs; `None`
+            // on a degenerate configuration (crossing at an arc endpoint or
+            // at p/q, geodesic in an arc's plane, p≈±q).
+            let parity_inside = |segs: &[ASeg], p: Point3, q: Point3| -> Option<bool> {
+                let tau = std::f64::consts::TAU;
+                let p_hat = (p - center).normalize().ok()?;
+                let q_hat = (q - center).normalize().ok()?;
+                let ngv = p_hat.cross(&q_hat);
+                if ngv.dot(&ngv) < 1e-16 {
+                    return None;
+                }
+                let ng = ngv.normalize().ok()?;
+                let mut crossings = 0usize;
+                for a in segs {
+                    let m = a.n.dot(&ng);
+                    let denom = 1.0 - m * m;
+                    let h = (center - a.cc).dot(&a.n);
+                    if denom < 1e-12 {
+                        if h.abs() < 1e-9 {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let y0 = a.n * (-h / denom) + ng * (h * m / denom);
+                    let d = a.n.cross(&ng);
+                    let t2 = (radius * radius - y0.dot(&y0)) / denom;
+                    if t2 < 1e-14 {
+                        if t2 > -1e-14 {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let t = t2.sqrt();
+                    for s in [center + y0 + d * t, center + y0 - d * t] {
+                        let ds = s - a.cc;
+                        let th = {
+                            let t0 = ds.dot(&a.v).atan2(ds.dot(&a.u));
+                            if t0 < 0.0 {
+                                t0 + tau
+                            } else {
+                                t0
+                            }
+                        };
+                        const END_BAND: f64 = 1e-6;
+                        let span_low = th <= a.theta_end;
+                        let on = if a.mid_low { span_low } else { !span_low };
+                        let near_end = th < END_BAND
+                            || th > tau - END_BAND
+                            || (th - a.theta_end).abs() < END_BAND;
+                        if near_end {
+                            return None;
+                        }
+                        if !on {
+                            continue;
+                        }
+                        let s_hat = (s - center).normalize().ok()?;
+                        let c1 = p_hat.cross(&s_hat).dot(&ng);
+                        let c2 = s_hat.cross(&q_hat).dot(&ng);
+                        if c1.abs() < 1e-9 || c2.abs() < 1e-9 {
+                            return None;
+                        }
+                        if c1 > 0.0 && c2 > 0.0 {
+                            crossings += 1;
+                        }
+                    }
+                }
+                Some(crossings % 2 == 0)
+            };
+            let region_contains = |segs: &[ASeg], p: Point3| -> Option<bool> {
+                for &e in &[0.02_f64, 0.08, 0.25] {
+                    for s in segs {
+                        let Some(q) = seg_seed(s, e) else {
+                            continue;
+                        };
+                        if let Some(inside) = parity_inside(segs, p, q) {
+                            return Some(inside);
+                        }
+                    }
+                }
+                None
+            };
             let mut faces: Vec<SplitFace> = Vec::new();
             for loop_edges in face_loops {
                 let is_complement_pair =
@@ -3668,7 +4229,33 @@ fn split_sphere_face_by_circles(
                 let interior = if is_complement_pair {
                     oriented_interior(&loop_edges).or_else(|| mean_interior(&loop_edges))
                 } else {
-                    mean_interior(&loop_edges)
+                    let mean = mean_interior(&loop_edges);
+                    match (mean, build_segs(&loop_edges)) {
+                        (Some(mp), Some(segs)) => {
+                            if region_contains(&segs, mp) == Some(true) {
+                                Some(mp)
+                            } else {
+                                // Largest parity-verified nudge wins; the
+                                // smallest nudge is locally inside by loop
+                                // orientation and is the final fallback.
+                                let mut found: Option<Point3> = None;
+                                'cand: for &e in &[1.6_f64, 0.7, 0.25, 0.08] {
+                                    for s in &segs {
+                                        if let Some(c) = seg_seed(s, e) {
+                                            if region_contains(&segs, c) == Some(true) {
+                                                found = Some(c);
+                                                break 'cand;
+                                            }
+                                        }
+                                    }
+                                }
+                                found
+                                    .or_else(|| segs.iter().find_map(|s| seg_seed(s, 0.02)))
+                                    .or(Some(mp))
+                            }
+                        }
+                        (m, _) => m,
+                    }
                 };
                 let Some(interior) = interior else {
                     continue;
@@ -4861,6 +5448,30 @@ fn split_face_by_curves(
 
     // Re-resolve vertices after edge splitting to ensure consistency
     graph.resolve_vertices(model);
+
+    // Closed-surface pre-pass (#88 r=1.2): materialise CUT×CUT circle
+    // crossings as shared vertices before the sphere region builders run.
+    // A cut circle that weaves through its host face's boundary (4+
+    // crossings) arrives UNCLIPPED (split only at `presplit_closed_loop_
+    // edges`' arbitrary thirds), so its crossings with the OTHER cut
+    // circles are never edge endpoints — the sphere splitter then sees no
+    // mutually-intersecting circles and mis-routes to the disjoint-cap
+    // builder. Conquered configurations already carry their crossings as
+    // arc ENDPOINTS (face-clipped cuts), where this pass is a no-op (it
+    // only splits at STRICTLY INTERIOR crossings).
+    if boundary_edges.is_empty()
+        && model
+            .surfaces
+            .get(surface_id)
+            .map(|s| {
+                s.as_any()
+                    .downcast_ref::<crate::primitives::surface::Sphere>()
+                    .is_some()
+            })
+            .unwrap_or(false)
+    {
+        presplit_sphere_cut_crossings(&mut graph, model, &options.common.tolerance)?;
+    }
 
     // Closed-surface (sphere) curved-Boolean fast path: a sphere cut by
     // coplanar circles is partitioned into caps + a central multi-hole region
@@ -6863,31 +7474,89 @@ fn imprint_merge_coplanar_overlap(
     // tessellated clip already handles exactly).
     let circle_a = face_boundary_circle_2d(model, face_a, &project);
     let circle_b = face_boundary_circle_2d(model, face_b, &project);
-    let b_inside_a = match circle_a {
-        Some((ca, ra)) => clip_polygon_edges_to_circle(&poly_b, ca, ra),
+    let b_inside_a = match &circle_a {
+        Some((ca, ra)) => clip_polygon_edges_to_circle(&poly_b, *ca, *ra),
         None => partition.b_inside_a.clone(),
     };
-    let a_inside_b = match circle_b {
-        Some((cb, rb)) => clip_polygon_edges_to_circle(&poly_a, cb, rb),
+    let a_inside_b = match &circle_b {
+        Some((cb, rb)) => clip_polygon_edges_to_circle(&poly_a, *cb, *rb),
         None => partition.a_inside_b.clone(),
     };
 
-    // 4. Lift each 2D segment back to a 3D Line on the shared plane,
+    // 4. Lift each 2D segment back to a 3D curve on the shared plane,
     //    register it as a model curve, and tag it for the face it cuts.
     //    Per-face routing: B's boundary inside A cuts FACE A (= cuts_a);
     //    A's boundary inside B cuts FACE B (= cuts_b).
+    //
+    //    A segment that is a sampled chord of the SOURCE face's analytic
+    //    boundary circle (both endpoints on the circle) lifts as the TRUE
+    //    ARC of that circle, not the chord. The downstream position-weld
+    //    discriminates same-endpoint edges by geometric midpoint, so a
+    //    chord-lifted hole rim can never reconcile with the partner body's
+    //    analytic arc rim — a coplanar cap (cylinder cap on a box face)
+    //    left 2×16 coincident-endpoint Line/Circle chains all single-use
+    //    (open), plus the chord-vs-arc sagitta volume error. Clip-created
+    //    endpoints (off the source circle) keep the chord lift.
     let lift = |p: Point2d| -> Point3 { origin + u_dir * p.x + v_dir * p.y };
+    let plane_n = {
+        let n = u_dir.cross(&v_dir);
+        n.normalize().unwrap_or(n)
+    };
+    let lift_curve = |s: Point2d,
+                      e: Point2d,
+                      source_circle: &Option<(Point2d, f64)>|
+     -> Box<dyn crate::primitives::curve::Curve> {
+        if let Some((c2, r)) = source_circle {
+            let tol_d = tolerance.distance();
+            let on_circle = |p: &Point2d| {
+                let d = ((p.x - c2.x).powi(2) + (p.y - c2.y).powi(2)).sqrt();
+                (d - r).abs() <= tol_d
+            };
+            if on_circle(&s) && on_circle(&e) {
+                let a_s = (s.y - c2.y).atan2(s.x - c2.x);
+                let a_e = (e.y - c2.y).atan2(e.x - c2.x);
+                let mut sweep = a_e - a_s;
+                while sweep > std::f64::consts::PI {
+                    sweep -= 2.0 * std::f64::consts::PI;
+                }
+                while sweep <= -std::f64::consts::PI {
+                    sweep += 2.0 * std::f64::consts::PI;
+                }
+                // Shortest-way arc; sampled chords are well under π. Keep a
+                // positive sweep (Arc::contains_angle assumes one) by
+                // starting at whichever endpoint makes the sweep CCW.
+                let (start_angle, sweep_angle) = if sweep >= 0.0 {
+                    (a_s, sweep)
+                } else {
+                    (a_e, -sweep)
+                };
+                if sweep_angle > 1e-12 {
+                    let arc = crate::primitives::curve::Arc {
+                        center: lift(*c2),
+                        normal: plane_n,
+                        // x_axis = the projection frame's u axis, so the 2D
+                        // atan2 angles above are exactly the arc's angles.
+                        x_axis: u_dir,
+                        radius: *r,
+                        start_angle,
+                        sweep_angle,
+                        range: crate::primitives::curve::ParameterRange::unit(),
+                    };
+                    return Box::new(arc);
+                }
+            }
+        }
+        Box::new(Line::new(lift(s), lift(e)))
+    };
 
     let mut coplanar_curves_a: Vec<IntersectionCurve> = Vec::new();
     for (s, e) in &b_inside_a {
-        let line = Line::new(lift(*s), lift(*e));
-        let curve_id = model.curves.add(Box::new(line));
+        let curve_id = model.curves.add(lift_curve(*s, *e, &circle_b));
         coplanar_curves_a.push(IntersectionCurve { curve_id });
     }
     let mut coplanar_curves_b: Vec<IntersectionCurve> = Vec::new();
     for (s, e) in &a_inside_b {
-        let line = Line::new(lift(*s), lift(*e));
-        let curve_id = model.curves.add(Box::new(line));
+        let curve_id = model.curves.add(lift_curve(*s, *e, &circle_a));
         coplanar_curves_b.push(IntersectionCurve { curve_id });
     }
 
@@ -7548,6 +8217,534 @@ fn presplit_closed_loop_edges(
         }
     }
 
+    Ok(())
+}
+
+/// Materialise CUT×CUT circle crossings on an untrimmed closed surface
+/// (sphere) as shared graph vertices (#88 r=1.2 poke-through).
+///
+/// `compute_edge_intersections` imprints cuts against BOUNDARY edges; on a
+/// closed surface there are none, so two cut circles that cross each other
+/// only share a vertex if their materialised arcs happen to END at the
+/// crossing (true for face-clipped cuts — every conquered configuration).
+/// A cut circle that weaves through its host face's boundary (4+ crossings)
+/// arrives UNCLIPPED — a full circle subdivided only at `presplit_closed_
+/// loop_edges`' arbitrary thirds — so its crossings with the other cut
+/// circles are strictly INTERIOR to its sub-edges. The sphere splitter's
+/// mutually-intersecting detection (a vertex touched by ≥2 distinct cut
+/// curves) then sees nothing, mis-routes to the disjoint-cap builder, and
+/// the result is open/non-manifold.
+///
+/// This pass solves each distinct cut-plane pair against the circles
+/// analytically (`A·cosθ + B·sinθ = C` on circle 1, verified on circle 2),
+/// keeps crossings that lie ON materialised arcs of BOTH planes, and splits
+/// any edge holding a crossing strictly inside its span — `add_or_find`
+/// dedup makes the new vertex SHARED across all circles through it.
+/// Near-tangent contacts are skipped entirely (the #86 lesson: splitting at
+/// a tangency mints degenerate vertices). Edge-endpoint crossings are
+/// no-ops, so already-clipped configurations are untouched by construction.
+fn presplit_sphere_cut_crossings(
+    graph: &mut IntersectionGraph,
+    model: &mut BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<()> {
+    use crate::primitives::curve::{Arc, Circle};
+
+    graph.resolve_vertices(model);
+    let tol = tolerance.distance();
+    let on_tol = (tol * 10.0).max(1e-9);
+
+    // 0. Canonicalise endpoint vertices by POSITION. `compute_edge_
+    // intersections` splits each cut curve at a crossing independently,
+    // minting a DISTINCT VertexId per curve at the same 3D point; the
+    // sphere splitter's shared-vertex crossing detection and the
+    // arrangement walker both key on VertexId, so the duplicates hide
+    // every crossing (the r=1.2 mis-route). Remap each edge endpoint to
+    // `add_or_find`'s canonical vertex; already-shared endpoints map to
+    // themselves, so correctly-built configurations are untouched.
+    let mut canon_eids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+    canon_eids.sort_unstable();
+    let mut remapped = 0usize;
+    for eid in canon_eids {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        let (sv, ev) = (edge.start_vertex, edge.end_vertex);
+        let sp = model.vertices.get_position(sv);
+        let ep = model.vertices.get_position(ev);
+        let csv = sp.map(|p| model.vertices.add_or_find(p[0], p[1], p[2], tol));
+        let cev = ep.map(|p| model.vertices.add_or_find(p[0], p[1], p[2], tol));
+        let (Some(csv), Some(cev)) = (csv, cev) else {
+            continue;
+        };
+        if csv == sv && cev == ev {
+            continue;
+        }
+        if let Some(em) = model.edges.get_mut(eid) {
+            em.start_vertex = csv;
+            em.end_vertex = cev;
+        }
+        if let Some(ge) = graph.edges.get_mut(&eid) {
+            ge.start_vertex = csv;
+            ge.end_vertex = cev;
+        }
+        for (old, new) in [(sv, csv), (ev, cev)] {
+            if old == new {
+                continue;
+            }
+            if let Some(node) = graph.nodes.get_mut(&old) {
+                node.incident_edges.remove(&eid);
+            }
+            graph
+                .nodes
+                .entry(new)
+                .or_insert_with(|| GraphNode {
+                    incident_edges: BTreeSet::new(),
+                })
+                .incident_edges
+                .insert(eid);
+        }
+        remapped += 1;
+    }
+    if pipeline_trace_enabled() && remapped > 0 {
+        pipeline_trace(format_args!(
+            "  presplit canonicalised endpoints on {remapped} edges"
+        ));
+    }
+
+    // Snapshot the cut edges' circular geometry, sorted for determinism.
+    struct CutGeom {
+        eid: EdgeId,
+        cc: Point3,
+        n: Vector3,
+        r: f64,
+    }
+    let mut eids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+    eids.sort_unstable();
+    let mut cuts: Vec<CutGeom> = Vec::new();
+    for eid in eids {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            continue;
+        };
+        let (cc, n_raw, r) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
+            (ci.center(), ci.normal(), ci.radius())
+        } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
+            (ar.center, ar.normal, ar.radius)
+        } else {
+            continue;
+        };
+        let Ok(n) = n_raw.normalize() else {
+            continue;
+        };
+        cuts.push(CutGeom { eid, cc, n, r });
+    }
+    if pipeline_trace_enabled() {
+        pipeline_trace(format_args!(
+            "stage=presplit_sphere_cut_crossings graph_edges={} circular_cuts={}",
+            graph.edges.len(),
+            cuts.len(),
+        ));
+    }
+    if cuts.len() < 2 {
+        return Ok(());
+    }
+
+    // Group the cut edges by distinct cut plane.
+    let mut planes: Vec<(Point3, Vector3, f64, Vec<usize>)> = Vec::new();
+    for (i, c) in cuts.iter().enumerate() {
+        let mut joined = false;
+        for p in planes.iter_mut() {
+            if c.n.dot(&p.1).abs() > 1.0 - 1e-9 && (c.cc - p.0).dot(&p.1).abs() < 1e-9 {
+                p.3.push(i);
+                joined = true;
+                break;
+            }
+        }
+        if !joined {
+            planes.push((c.cc, c.n, c.r, vec![i]));
+        }
+    }
+    if planes.len() < 2 {
+        return Ok(());
+    }
+
+    // Nearest (edge_param, distance) of point `p` on edge `eid`: coarse
+    // sample + ternary refinement. Curve-type agnostic.
+    let invert = |eid: EdgeId, p: Point3, model: &BRepModel| -> Option<(f64, f64)> {
+        let edge = model.edges.get(eid)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let pos_at =
+            |s: f64| -> Option<Point3> { curve.point_at(edge.edge_to_curve_parameter(s)).ok() };
+        const N: usize = 48;
+        let mut best = (0.0_f64, f64::INFINITY);
+        for k in 0..=N {
+            let s = k as f64 / N as f64;
+            if let Some(q) = pos_at(s) {
+                let d = (q - p).magnitude();
+                if d < best.1 {
+                    best = (s, d);
+                }
+            }
+        }
+        let step = 1.0 / N as f64;
+        let (mut lo, mut hi) = ((best.0 - step).max(0.0), (best.0 + step).min(1.0));
+        for _ in 0..40 {
+            let m1 = lo + (hi - lo) / 3.0;
+            let m2 = hi - (hi - lo) / 3.0;
+            let d1 = pos_at(m1)
+                .map(|q| (q - p).magnitude())
+                .unwrap_or(f64::INFINITY);
+            let d2 = pos_at(m2)
+                .map(|q| (q - p).magnitude())
+                .unwrap_or(f64::INFINITY);
+            if d1 <= d2 {
+                hi = m2;
+            } else {
+                lo = m1;
+            }
+        }
+        let s = 0.5 * (lo + hi);
+        let d = pos_at(s)
+            .map(|q| (q - p).magnitude())
+            .unwrap_or(f64::INFINITY);
+        Some((s, d))
+    };
+
+    // Crossing points per distinct plane pair → strictly-interior splits.
+    let mut splits: std::collections::BTreeMap<EdgeId, Vec<(f64, Point3)>> =
+        std::collections::BTreeMap::new();
+    for i in 0..planes.len() {
+        for j in (i + 1)..planes.len() {
+            let (cc1, n1, r1) = (planes[i].0, planes[i].1, planes[i].2);
+            let (cc2, n2, r2) = (planes[j].0, planes[j].1, planes[j].2);
+            let helper = if n1.x.abs() <= n1.y.abs() && n1.x.abs() <= n1.z.abs() {
+                Vector3::X
+            } else if n1.y.abs() <= n1.z.abs() {
+                Vector3::Y
+            } else {
+                Vector3::Z
+            };
+            let Ok(u1) = (helper - n1 * helper.dot(&n1)).normalize() else {
+                continue;
+            };
+            let v1 = n1.cross(&u1);
+            let a = u1.dot(&n2);
+            let b = v1.dot(&n2);
+            let c = (cc2 - cc1).dot(&n2) / r1;
+            let rr = (a * a + b * b).sqrt();
+            if rr < 1e-12 {
+                continue; // parallel cut planes
+            }
+            let ratio = c / rr;
+            // Near-tangent or no contact: never split at a tangency (#86).
+            if ratio.abs() > 1.0 - 1e-7 {
+                continue;
+            }
+            let phi = b.atan2(a);
+            let dth = ratio.clamp(-1.0, 1.0).acos();
+            for theta in [phi + dth, phi - dth] {
+                let p = cc1 + (u1 * theta.cos() + v1 * theta.sin()) * r1;
+                if ((p - cc2).magnitude() - r2).abs() > on_tol {
+                    continue;
+                }
+                // The crossing must lie ON a materialised arc of BOTH
+                // planes (inclusive) to be an arrangement vertex.
+                let hits_of = |members: &[usize], model: &BRepModel| -> Vec<(EdgeId, f64)> {
+                    members
+                        .iter()
+                        .filter_map(|&k| {
+                            invert(cuts[k].eid, p, model)
+                                .and_then(|(s, d)| (d <= on_tol).then_some((cuts[k].eid, s)))
+                        })
+                        .collect()
+                };
+                let on_1 = hits_of(&planes[i].3, model);
+                let on_2 = hits_of(&planes[j].3, model);
+                if on_1.is_empty() || on_2.is_empty() {
+                    continue;
+                }
+                for (eid, s) in on_1.into_iter().chain(on_2) {
+                    if s > 1e-6 && s < 1.0 - 1e-6 {
+                        splits.entry(eid).or_default().push((s, p));
+                    }
+                }
+            }
+        }
+    }
+    if splits.is_empty() {
+        return Ok(());
+    }
+
+    // Apply the splits per edge (ascending param, sequential split_at),
+    // rewriting the graph exactly like `presplit_closed_loop_edges`.
+    let mut total_subs = 0usize;
+    for (eid, mut pts) in splits {
+        pts.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        pts.dedup_by(|x, y| (x.0 - y.0).abs() < 1e-6);
+        let Some(original) = model.edges.get(eid).cloned() else {
+            continue;
+        };
+        let Some((g_type, g_sv, g_ev)) = graph
+            .edges
+            .get(&eid)
+            .map(|g| (g.edge_type, g.start_vertex, g.end_vertex))
+        else {
+            continue;
+        };
+        let mut vids: Vec<(f64, VertexId)> = Vec::new();
+        for &(s, p) in &pts {
+            let vid = model.vertices.add_or_find(p.x, p.y, p.z, tol);
+            if vid != g_sv && vid != g_ev && !vids.iter().any(|&(_, v)| v == vid) {
+                vids.push((s, vid));
+            }
+        }
+        if vids.is_empty() {
+            continue;
+        }
+        let mut sub_edges: Vec<(crate::primitives::edge::Edge, VertexId, VertexId)> = Vec::new();
+        let mut remaining = original;
+        let mut prev_s = 0.0_f64;
+        let mut prev_vid = g_sv;
+        for &(s, vid) in &vids {
+            let denom = 1.0 - prev_s;
+            if denom <= 1e-12 {
+                break;
+            }
+            let s_rel = ((s - prev_s) / denom).clamp(1e-9, 1.0 - 1e-9);
+            let (mut head, mut tail) = remaining.split_at(s_rel);
+            head.start_vertex = prev_vid;
+            head.end_vertex = vid;
+            tail.start_vertex = vid;
+            sub_edges.push((head, prev_vid, vid));
+            remaining = tail;
+            prev_s = s;
+            prev_vid = vid;
+        }
+        remaining.start_vertex = prev_vid;
+        remaining.end_vertex = g_ev;
+        sub_edges.push((remaining, prev_vid, g_ev));
+
+        graph.edges.remove(&eid);
+        for node in graph.nodes.values_mut() {
+            node.incident_edges.remove(&eid);
+        }
+        for (e, sv, ev) in sub_edges {
+            let nid = model.edges.add(e);
+            graph.edges.insert(
+                nid,
+                GraphEdge {
+                    edge_id: nid,
+                    edge_type: g_type,
+                    start_vertex: sv,
+                    end_vertex: ev,
+                },
+            );
+            for vv in [sv, ev] {
+                graph
+                    .nodes
+                    .entry(vv)
+                    .or_insert_with(|| GraphNode {
+                        incident_edges: BTreeSet::new(),
+                    })
+                    .incident_edges
+                    .insert(nid);
+            }
+            total_subs += 1;
+        }
+    }
+    if pipeline_trace_enabled() && total_subs > 0 {
+        pipeline_trace(format_args!(
+            "stage=presplit_sphere_cut_crossings sub_edges={total_subs}"
+        ));
+    }
+
+    // 3. HARMONIZE COVERAGE per cut plane (#88 r=1.2): each cut curve can
+    // be materialised TWICE in the graph — the host box face's clipped arc
+    // AND the sphere's own copy (full circle, thirds-split) — with
+    // mismatched subdivision. The overlapping duplicate coverage corrupts
+    // the arrangement walk (duplicate tangent angles → degenerate twin
+    // pairs; r=1.2's 4-circle web walks to 5 fragments where Euler demands
+    // 8) and the cross-face weld (the "long arc vs sub-arc chain"
+    // canonicalise weakness). Reduce each plane to SINGLE coverage by an
+    // exact-fit greedy over atomic angular intervals, preferring LOWEST
+    // EdgeIds — the box-side pieces, which the box-face fragments already
+    // reference, so the sphere fragments share their EdgeIds and weld by
+    // construction. Planes whose copies don't decompose exactly (a member
+    // partially overlaps selected coverage) are left untouched.
+    {
+        use std::f64::consts::TAU;
+        // Recompute member geometry from the CURRENT graph (edges may have
+        // been split above).
+        let mut cur_eids: Vec<EdgeId> = graph.edges.keys().copied().collect();
+        cur_eids.sort_unstable();
+        struct Span {
+            eid: EdgeId,
+            theta_s: f64,
+            // Arc covers [theta_s, theta_e] going +θ; theta_e > theta_s and
+            // may exceed TAU (wrap).
+            theta_e: f64,
+        }
+        let mut by_plane: Vec<(Point3, Vector3, f64, Vec<Span>)> = Vec::new();
+        for eid in cur_eids {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (cc, n_raw, r) = if let Some(ci) = curve.as_any().downcast_ref::<Circle>() {
+                (ci.center(), ci.normal(), ci.radius())
+            } else if let Some(ar) = curve.as_any().downcast_ref::<Arc>() {
+                (ar.center, ar.normal, ar.radius)
+            } else {
+                continue;
+            };
+            let Ok(n) = n_raw.normalize() else {
+                continue;
+            };
+            let helper = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+                Vector3::X
+            } else if n.y.abs() <= n.z.abs() {
+                Vector3::Y
+            } else {
+                Vector3::Z
+            };
+            let Ok(u1) = (helper - n * helper.dot(&n)).normalize() else {
+                continue;
+            };
+            let v1 = n.cross(&u1);
+            let ang = |p: Point3| -> f64 {
+                let d = p - cc;
+                let t = d.dot(&v1).atan2(d.dot(&u1));
+                if t < 0.0 {
+                    t + TAU
+                } else {
+                    t
+                }
+            };
+            let sp = model.vertices.get_position(edge.start_vertex);
+            let ep = model.vertices.get_position(edge.end_vertex);
+            let (Some(sp), Some(ep)) = (sp, ep) else {
+                continue;
+            };
+            let tmid = 0.5 * (edge.param_range.start + edge.param_range.end);
+            let Ok(mp) = curve.point_at(tmid) else {
+                continue;
+            };
+            let a = ang(Point3::new(sp[0], sp[1], sp[2]));
+            let b = ang(Point3::new(ep[0], ep[1], ep[2]));
+            let mid = ang(mp);
+            let closed = edge.start_vertex == edge.end_vertex;
+            let (theta_s, theta_e) = if closed {
+                (a, a + TAU)
+            } else {
+                // The span runs between the endpoints THROUGH the midpoint.
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                if mid >= lo && mid <= hi {
+                    (lo, hi)
+                } else {
+                    (hi, lo + TAU)
+                }
+            };
+            let span = Span {
+                eid,
+                theta_s,
+                theta_e,
+            };
+            let mut joined = false;
+            for p in by_plane.iter_mut() {
+                if n.dot(&p.1).abs() > 1.0 - 1e-9 && (cc - p.0).dot(&p.1).abs() < 1e-9 {
+                    p.3.push(span);
+                    joined = true;
+                    break;
+                }
+            }
+            if !joined {
+                by_plane.push((
+                    cc,
+                    n,
+                    r,
+                    vec![Span {
+                        eid,
+                        theta_s,
+                        theta_e,
+                    }],
+                ));
+            }
+        }
+        let mut dropped = 0usize;
+        for (_cc, _n, r, spans) in &by_plane {
+            if spans.len() < 2 {
+                continue;
+            }
+            let eps = (tol / r).max(1e-9);
+            // Atomic interval boundaries: all span endpoints, mod TAU.
+            let mut cuts: Vec<f64> = Vec::new();
+            for s in spans {
+                cuts.push(s.theta_s.rem_euclid(TAU));
+                cuts.push(s.theta_e.rem_euclid(TAU));
+            }
+            cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            cuts.dedup_by(|a, b| (*a - *b).abs() < eps);
+            if cuts.len() < 2 {
+                continue;
+            }
+            let m = cuts.len();
+            let covers = |s: &Span, k: usize| -> bool {
+                let lo = cuts[k];
+                let hi = if k + 1 == m {
+                    cuts[0] + TAU
+                } else {
+                    cuts[k + 1]
+                };
+                let mid = (0.5 * (lo + hi)).rem_euclid(TAU);
+                let rel = (mid - s.theta_s).rem_euclid(TAU);
+                rel < (s.theta_e - s.theta_s) - eps || (s.theta_e - s.theta_s) >= TAU - eps
+            };
+            let orig_cov: Vec<bool> = (0..m).map(|k| spans.iter().any(|s| covers(s, k))).collect();
+            // Exact-fit greedy by ascending EdgeId (box-side pieces first).
+            let mut order: Vec<usize> = (0..spans.len()).collect();
+            order.sort_by_key(|&i| spans[i].eid);
+            let mut covered = vec![false; m];
+            let mut selected = vec![false; spans.len()];
+            for &i in &order {
+                let ivs: Vec<usize> = (0..m).filter(|&k| covers(&spans[i], k)).collect();
+                if ivs.is_empty() {
+                    continue;
+                }
+                if ivs.iter().any(|&k| covered[k]) {
+                    continue; // redundant or conflicting — never double-cover
+                }
+                for &k in &ivs {
+                    covered[k] = true;
+                }
+                selected[i] = true;
+            }
+            // The selection must reproduce the original coverage exactly; a
+            // partial-overlap conflict leaves a gap → leave this plane alone.
+            if (0..m).any(|k| orig_cov[k] != covered[k]) {
+                continue;
+            }
+            for (i, s) in spans.iter().enumerate() {
+                if selected[i] {
+                    continue;
+                }
+                graph.edges.remove(&s.eid);
+                for node in graph.nodes.values_mut() {
+                    node.incident_edges.remove(&s.eid);
+                }
+                dropped += 1;
+            }
+        }
+        if pipeline_trace_enabled() && dropped > 0 {
+            pipeline_trace(format_args!(
+                "  presplit harmonized coverage: dropped {dropped} redundant cut edges"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -8626,6 +9823,11 @@ fn merge_same_origin_fragments(
 
     let mut absorbed: HashSet<usize> = HashSet::new();
     let mut nesting: HashMap<usize, Vec<Vec<(EdgeId, bool)>>> = HashMap::new();
+    // Kept islands whose rim has already been attached as a hole to some
+    // kept outer (see the both-kept branch below). Ensures a single
+    // attachment when several nested outers could contain the island —
+    // first containing outer wins, mirroring the `absorbed` semantics.
+    let mut attached_kept: HashSet<usize> = HashSet::new();
 
     for indices in groups.values() {
         if indices.len() < 2 {
@@ -8719,9 +9921,31 @@ fn merge_same_origin_fragments(
                     continue;
                 }
                 if keep_under_operation(operation, &faces[inner_idx], solid_a, solid_b) {
-                    // Both fragments survive selection — they're not a
-                    // hole / outer pair under this operation. Leave
-                    // them as separate faces.
+                    // Both fragments survive selection. Geometrically they
+                    // are STILL an outer-with-hole + island pair: the outer
+                    // must carry the island's rim as an inner loop (same
+                    // EdgeIds, reversed winding) or the island shares no
+                    // edges with the rest of the shell and strands in its
+                    // own disconnected component — box∪cylinder with the
+                    // cap flush on a box face (axial-poke ∪) failed exactly
+                    // this way (`component 1 has only 1 planar face`).
+                    // Attach the hole but do NOT absorb the island: both
+                    // faces are kept and each rim edge ends up used twice
+                    // (outer's hole + island's boundary) = manifold.
+                    if !attached_kept.contains(&inner_idx) {
+                        if let Some(inner_poly) = polygons.get(&inner_idx) {
+                            if uv_polygon_strictly_contains(outer_poly, inner_poly) {
+                                let reversed: Vec<(EdgeId, bool)> = faces[inner_idx]
+                                    .boundary_edges
+                                    .iter()
+                                    .rev()
+                                    .map(|(e, fwd)| (*e, !*fwd))
+                                    .collect();
+                                nesting.entry(outer_idx).or_default().push(reversed);
+                                attached_kept.insert(inner_idx);
+                            }
+                        }
+                    }
                     continue;
                 }
                 let inner_poly = match polygons.get(&inner_idx) {
@@ -9018,14 +10242,15 @@ fn point_inside_cylinder_solid(
     )
 }
 
-fn classify_face_relative_to_solid(
+/// Classify a single point relative to a solid (Inside / Outside / OnBoundary).
+/// The face-level [`classify_face_relative_to_solid`] wraps this with multi-point
+/// sampling to tell a true coincident-area contact from a measure-zero tangency.
+fn classify_point_relative_to_solid(
     model: &BRepModel,
-    face: &SplitFace,
+    test_point: Point3,
     solid: SolidId,
     tolerance: &Tolerance,
 ) -> OperationResult<FaceClassification> {
-    let test_point = get_face_interior_point(model, face)?;
-
     // Exact analytic membership when the reference solid is a lone torus — the
     // ray-cast below is unreliable against a torus and drops the box-wall disk
     // caps of a rim poke.
@@ -9128,6 +10353,123 @@ fn classify_face_relative_to_solid(
             inside_votes, outside_votes, total_votes
         )))
     }
+}
+
+/// Classify a split face relative to a solid.
+///
+/// Classifies the face's representative interior point. A definitive
+/// Inside/Outside is returned directly — multi-sampling activates ONLY on an
+/// OnBoundary verdict, so non-coincident faces keep identical behaviour.
+///
+/// An OnBoundary verdict from a single point is correct when the face is
+/// genuinely COINCIDENT with a face of the other solid (area contact — two boxes
+/// sharing a plane). But it is WRONG when the face merely TOUCHES the other solid
+/// at an isolated point: a sphere inscribed in a box is tangent to each face at
+/// that face's centre, and the representative interior point IS that centre, so
+/// every face read OnBoundary and `select_faces_for_operation` returned the wrong
+/// operand (box∩sphere → box, box∖sphere → empty). Distinguish the two by sampling
+/// additional points along the face boundary: an area contact leaves (nearly)
+/// every sample on the boundary, a tangency leaves the rest of the face strictly
+/// Inside or Outside.
+///
+/// Reclassification is gated to ISOLATED contacts — it fires only when NO boundary
+/// sample (beyond the representative point) is itself OnBoundary. A face that is
+/// PARTIALLY coincident (coincident over part of its area, free over the rest —
+/// common in box∩box overlaps) has some boundary samples OnBoundary, so its
+/// OnBoundary verdict stands; only a measure-zero point/edge tangency, where every
+/// other sample is strictly Inside/Outside, is reclassified.
+fn classify_face_relative_to_solid(
+    model: &BRepModel,
+    face: &SplitFace,
+    solid: SolidId,
+    tolerance: &Tolerance,
+) -> OperationResult<FaceClassification> {
+    let primary = get_face_interior_point(model, face)?;
+    let cls = classify_point_relative_to_solid(model, primary, solid, tolerance)?;
+    if !matches!(cls, FaceClassification::OnBoundary) {
+        return Ok(cls);
+    }
+
+    // Representative point is on the boundary — verify it is an AREA contact and
+    // not a point/edge tangency by sampling more points along the face boundary.
+    let extras = face_boundary_samples(model, face);
+    if extras.is_empty() {
+        return Ok(FaceClassification::OnBoundary);
+    }
+    let (mut inside, mut outside, mut boundary) = (0u32, 0u32, 0u32);
+    for p in extras {
+        match classify_point_relative_to_solid(model, p, solid, tolerance) {
+            Ok(FaceClassification::Inside) => inside += 1,
+            Ok(FaceClassification::Outside) => outside += 1,
+            Ok(FaceClassification::OnBoundary) => boundary += 1,
+            Err(_) => {}
+        }
+    }
+    // Reclassify ONLY when the boundary contact is ISOLATED — i.e. NO sample other
+    // than the representative point lands on the boundary. That is the signature of
+    // a measure-zero point/edge tangency (a sphere inscribed in a box touches each
+    // face only at its centre; every other face point is strictly Inside/Outside).
+    //
+    // If ANY extra sample is also OnBoundary, the contact spans an AREA — a full OR
+    // PARTIAL face coincidence (two boxes overlapping part of a shared plane) — and
+    // the OnBoundary verdict must stand. Sampling outside a partial overlap would
+    // otherwise out-vote the genuine coincidence and corrupt box∩box selection.
+    if boundary > 0 {
+        return Ok(FaceClassification::OnBoundary);
+    }
+    // Isolated contact: the off-boundary samples decide the side. They should be
+    // unanimous for a non-intersecting face; a mixed Inside/Outside vote is
+    // ambiguous (should not happen) and stays conservatively OnBoundary.
+    match (inside > 0, outside > 0) {
+        (true, false) => Ok(FaceClassification::Inside),
+        (false, true) => Ok(FaceClassification::Outside),
+        _ => Ok(FaceClassification::OnBoundary),
+    }
+}
+
+/// Additional sample points along a split face's boundary edges (parameters
+/// 0.25 / 0.5 / 0.75 per edge), used to tell an area contact from a tangency in
+/// [`classify_face_relative_to_solid`]. Boundary-edge samples are always on the
+/// face's closure, so they are valid for trimmed fragments and curved faces alike
+/// without needing a UV point-in-face test.
+fn face_boundary_samples(model: &BRepModel, face: &SplitFace) -> Vec<Point3> {
+    let mut pts = Vec::new();
+    for &(edge_id, _) in &face.boundary_edges {
+        let Some(edge) = model.edges.get(edge_id) else {
+            continue;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            continue;
+        };
+        let (a, b) = (edge.param_range.start, edge.param_range.end);
+        for frac in [0.25, 0.5, 0.75] {
+            if let Ok(p) = curve.point_at(a + (b - a) * frac) {
+                pts.push(p);
+            }
+        }
+    }
+    // A closed full-surface face (e.g. an untrimmed sphere inscribed in the box)
+    // has NO boundary edges, so it yields no edge samples — and its single
+    // representative point is exactly the tangent point. Sample the surface
+    // directly on a small interior UV grid. Safe precisely because there are no
+    // boundary edges: the whole parameter domain lies in the face (no trim). The
+    // fractions avoid 0 / 0.5 / 1 so the grid dodges seams, poles, and the axis
+    // tangent points.
+    if pts.is_empty() {
+        if let Some(surface) = model.surfaces.get(face.surface) {
+            let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+            for fu in [0.2, 0.45, 0.7, 0.9] {
+                for fv in [0.3, 0.55, 0.8] {
+                    let u = u0 + (u1 - u0) * fu;
+                    let v = v0 + (v1 - v0) * fv;
+                    if let Ok(p) = surface.point_at(u, v) {
+                        pts.push(p);
+                    }
+                }
+            }
+        }
+    }
+    pts
 }
 
 /// Get a point in the interior of a face.
@@ -10577,11 +11919,14 @@ fn build_shells_from_faces(
     solid_b: SolidId,
 ) -> OperationResult<Vec<ShellId>> {
     if faces.is_empty() {
-        return Err(OperationError::InvalidBRep(format!(
-            "No faces to build shell from (tolerance={:.3e}, allow_non_manifold={})",
-            options.common.tolerance.distance(),
-            options.allow_non_manifold,
-        )));
+        // An empty face selection is a geometrically valid empty result — the
+        // whole of A was removed (A ∖ B with A ⊆ B) or A and B are disjoint
+        // (A ∩ B). Report it as the typed `EmptyResult` so callers can tell
+        // "the answer is nothing" apart from a malformed-B-Rep failure. (The
+        // kernel cannot itself decide whether the emptiness is the *intended*
+        // answer — a face-dropping bug also lands here — but the contract is
+        // honest: the selection produced no faces.)
+        return Err(OperationError::EmptyResult);
     }
 
     // Canonicalise geometrically coincident edges across operand solids.
@@ -14192,13 +15537,16 @@ mod tests {
 
     /// Two same-origin fragments both classified `Outside` — under
     /// `Difference`, both survive selection (`from_a` solids' outside
-    /// fragments are kept). The merge pass therefore must NOT nest
-    /// them: nesting only fires when the outer is kept AND the inner
-    /// is dropped. This guards against the merge pass over-eagerly
-    /// absorbing legitimate sibling rings produced by non-cutter
-    /// face-face intersections.
+    /// fragments are kept). The merge pass must NOT absorb the inner
+    /// (both faces stay), but it MUST attach the inner's reversed rim
+    /// to the outer as a hole loop: in a DCEL partition a fragment
+    /// strictly inside another's UV polygon is by construction the
+    /// outer's hole region, and without the shared rim EdgeIds the two
+    /// kept faces land in disconnected shell components (box∪cylinder
+    /// with the cap flush on a box face failed exactly this way —
+    /// `component 1 has only 1 planar face`).
     #[test]
-    fn merge_pass_skips_when_both_fragments_survive_difference() {
+    fn merge_pass_attaches_hole_when_both_fragments_survive_difference() {
         let mut model = BRepModel::new();
         let (surface_id, outer_edges, inner_edges) = make_rect_in_rect_fixture(&mut model);
 
@@ -14237,12 +15585,24 @@ mod tests {
         assert_eq!(
             merged.len(),
             2,
-            "both fragments survive selection — merge must not fire",
+            "both fragments survive selection — the island must NOT be absorbed",
         );
-        assert!(
-            merged.iter().all(|f| f.inner_loops.is_empty()),
-            "no fragment should carry an inner_loops hint",
+        let outer = merged
+            .iter()
+            .find(|f| !f.inner_loops.is_empty())
+            .expect("the containing outer must carry the island's rim as a hole loop");
+        assert_eq!(
+            outer.inner_loops.len(),
+            1,
+            "exactly one hole loop (the kept island's reversed rim)",
         );
+        assert_eq!(
+            outer.inner_loops[0].len(),
+            4,
+            "the hole must be the island's 4-edge square loop",
+        );
+        let islands: Vec<_> = merged.iter().filter(|f| f.inner_loops.is_empty()).collect();
+        assert_eq!(islands.len(), 1, "the island itself carries no holes");
     }
 
     /// Mirror of the Difference case under Union: outer Outside is

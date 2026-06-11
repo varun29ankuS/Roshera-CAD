@@ -35,7 +35,7 @@ export const meshDataSchema = z.object({
   // Per-triangle B-Rep `FaceId` array. Length = `indices.length / 3`.
   // Frontend uses it to map a Three.js raycast hit (which gives a
   // triangle index) back to a kernel face — that's what unlocks
-  // Fusion-style face picking and face-extrude.
+  // interactive face picking and face-extrude.
   face_ids: z.array(z.number()).optional(),
 })
 
