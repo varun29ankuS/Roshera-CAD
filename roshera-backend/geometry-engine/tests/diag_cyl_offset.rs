@@ -86,6 +86,51 @@ fn failing_cells() -> Vec<([f64; 3], f64, f64, &'static str, [f64; 3])> {
     ]
 }
 
+/// Ratchet gate (NON-ignored): the axial-poke+z ∩/∖ cells conquered by the
+/// coplanar-cap arc-lift fix (chord-lifted cap rims could never weld to the
+/// partner body's analytic arc rim — open=32 both ops, now 0). Cylinder
+/// r=0.5 h=1 base origin sits fully inside the box, cap flush with z=1:
+/// analytic ∩ = πr²h = π/4, ∖ = 8 − π/4. Serial run (correctness gates never
+/// run under a wall-clock thread budget). ∪ is NOT pinned — still errors
+/// (lone 1-planar-face component, coplanar cap disk unmerged under union).
+#[test]
+fn cyl_axial_poke_gate() {
+    let truth_i = std::f64::consts::PI * 0.25;
+    let cases = [
+        (BooleanOp::Intersection, "I", truth_i),
+        (BooleanOp::Difference, "D", 8.0 - truth_i),
+    ];
+    for (op, sym, truth) in cases {
+        let mut model = BRepModel::new();
+        let bx = the_box(&mut model);
+        let cy = cylinder(&mut model, [0.0, 0.0, 0.0], 0.5, 1.0);
+        let res = match boolean_operation(&mut model, bx, cy, op, BooleanOptions::default()) {
+            Ok(res) => res,
+            Err(e) => {
+                assert!(false, "[{sym}] axial-poke errored: {e:?}");
+                return;
+            }
+        };
+        let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+        let rel = (vol - truth).abs() / truth;
+        assert!(
+            rel < 0.01,
+            "[{sym}] axial-poke volume {vol:.4} vs analytic {truth:.4} (rel {rel:.4})"
+        );
+        let rep = brep_integrity(&model, res, 1e-6);
+        assert!(
+            rep.edges_used_once.is_empty(),
+            "[{sym}] axial-poke open edges: {:?}",
+            rep.edges_used_once
+        );
+        assert!(
+            rep.edges_used_3plus.is_empty(),
+            "[{sym}] axial-poke non-manifold edges: {:?}",
+            rep.edges_used_3plus
+        );
+    }
+}
+
 #[test]
 #[ignore = "diagnostic — box∘cylinder offset-through + axial-poke (run with --ignored --nocapture)"]
 fn diag_cyl_offset_family() {
