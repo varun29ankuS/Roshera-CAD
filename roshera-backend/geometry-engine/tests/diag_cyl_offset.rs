@@ -103,14 +103,42 @@ fn cyl_axial_poke_gate() {
         (BooleanOp::Union, "U", 8.0),
         (BooleanOp::Difference, "D", 8.0 - truth_i),
     ];
-    for (op, sym, truth) in cases {
+    run_cyl_cell_gate([0.0, 0.0, 0.0], 0.5, 1.0, &cases, "axial-poke");
+}
+
+/// Ratchet gate (NON-ignored): offset-through — cylinder through the box,
+/// axis offset so it also breaches the x=1 face (3-face transversal).
+/// Conquered by the radial-dir fix in
+/// `create_cylinder_parallel_intersection_lines`: the chord generators were
+/// derived from the plane's arbitrary uv-origin instead of the plane normal,
+/// rotating both cut lines off the face (clip-to-face dropped them; the box
+/// x=1 face never split and ∖ lost −36.8% volume). Grid truths from the
+/// isolated baseline; diag output matches to 4 decimals.
+#[test]
+fn cyl_offset_through_gate() {
+    let cases = [
+        (BooleanOp::Intersection, "I", 2.172),
+        (BooleanOp::Union, "U", 9.220),
+        (BooleanOp::Difference, "D", 5.828),
+    ];
+    run_cyl_cell_gate([0.5, 0.3, -1.5], 0.6, 3.0, &cases, "offset-through");
+}
+
+fn run_cyl_cell_gate(
+    base: [f64; 3],
+    r: f64,
+    h: f64,
+    cases: &[(BooleanOp, &str, f64)],
+    label: &str,
+) {
+    for &(op, sym, truth) in cases {
         let mut model = BRepModel::new();
         let bx = the_box(&mut model);
-        let cy = cylinder(&mut model, [0.0, 0.0, 0.0], 0.5, 1.0);
+        let cy = cylinder(&mut model, base, r, h);
         let res = match boolean_operation(&mut model, bx, cy, op, BooleanOptions::default()) {
             Ok(res) => res,
             Err(e) => {
-                assert!(false, "[{sym}] axial-poke errored: {e:?}");
+                assert!(false, "[{sym}] {label} errored: {e:?}");
                 return;
             }
         };
@@ -118,17 +146,17 @@ fn cyl_axial_poke_gate() {
         let rel = (vol - truth).abs() / truth;
         assert!(
             rel < 0.01,
-            "[{sym}] axial-poke volume {vol:.4} vs analytic {truth:.4} (rel {rel:.4})"
+            "[{sym}] {label} volume {vol:.4} vs truth {truth:.4} (rel {rel:.4})"
         );
         let rep = brep_integrity(&model, res, 1e-6);
         assert!(
             rep.edges_used_once.is_empty(),
-            "[{sym}] axial-poke open edges: {:?}",
+            "[{sym}] {label} open edges: {:?}",
             rep.edges_used_once
         );
         assert!(
             rep.edges_used_3plus.is_empty(),
-            "[{sym}] axial-poke non-manifold edges: {:?}",
+            "[{sym}] {label} non-manifold edges: {:?}",
             rep.edges_used_3plus
         );
     }
