@@ -90,14 +90,17 @@ fn failing_cells() -> Vec<([f64; 3], f64, f64, &'static str, [f64; 3])> {
 /// coplanar-cap arc-lift fix (chord-lifted cap rims could never weld to the
 /// partner body's analytic arc rim — open=32 both ops, now 0). Cylinder
 /// r=0.5 h=1 base origin sits fully inside the box, cap flush with z=1:
-/// analytic ∩ = πr²h = π/4, ∖ = 8 − π/4. Serial run (correctness gates never
-/// run under a wall-clock thread budget). ∪ is NOT pinned — still errors
-/// (lone 1-planar-face component, coplanar cap disk unmerged under union).
+/// analytic ∩ = πr²h = π/4, ∖ = 8 − π/4, ∪ = 8 (cylinder fully inside; the
+/// flush cap adds nothing). Serial run (correctness gates never run under a
+/// wall-clock thread budget). ∪ is pinned by the same-origin merge-pass
+/// hole-attachment fix (kept island's rim attached to the kept ring so the
+/// imprinted cap welds instead of stranding in its own component).
 #[test]
 fn cyl_axial_poke_gate() {
     let truth_i = std::f64::consts::PI * 0.25;
     let cases = [
         (BooleanOp::Intersection, "I", truth_i),
+        (BooleanOp::Union, "U", 8.0),
         (BooleanOp::Difference, "D", 8.0 - truth_i),
     ];
     for (op, sym, truth) in cases {
