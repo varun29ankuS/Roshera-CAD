@@ -7474,31 +7474,89 @@ fn imprint_merge_coplanar_overlap(
     // tessellated clip already handles exactly).
     let circle_a = face_boundary_circle_2d(model, face_a, &project);
     let circle_b = face_boundary_circle_2d(model, face_b, &project);
-    let b_inside_a = match circle_a {
-        Some((ca, ra)) => clip_polygon_edges_to_circle(&poly_b, ca, ra),
+    let b_inside_a = match &circle_a {
+        Some((ca, ra)) => clip_polygon_edges_to_circle(&poly_b, *ca, *ra),
         None => partition.b_inside_a.clone(),
     };
-    let a_inside_b = match circle_b {
-        Some((cb, rb)) => clip_polygon_edges_to_circle(&poly_a, cb, rb),
+    let a_inside_b = match &circle_b {
+        Some((cb, rb)) => clip_polygon_edges_to_circle(&poly_a, *cb, *rb),
         None => partition.a_inside_b.clone(),
     };
 
-    // 4. Lift each 2D segment back to a 3D Line on the shared plane,
+    // 4. Lift each 2D segment back to a 3D curve on the shared plane,
     //    register it as a model curve, and tag it for the face it cuts.
     //    Per-face routing: B's boundary inside A cuts FACE A (= cuts_a);
     //    A's boundary inside B cuts FACE B (= cuts_b).
+    //
+    //    A segment that is a sampled chord of the SOURCE face's analytic
+    //    boundary circle (both endpoints on the circle) lifts as the TRUE
+    //    ARC of that circle, not the chord. The downstream position-weld
+    //    discriminates same-endpoint edges by geometric midpoint, so a
+    //    chord-lifted hole rim can never reconcile with the partner body's
+    //    analytic arc rim — a coplanar cap (cylinder cap on a box face)
+    //    left 2×16 coincident-endpoint Line/Circle chains all single-use
+    //    (open), plus the chord-vs-arc sagitta volume error. Clip-created
+    //    endpoints (off the source circle) keep the chord lift.
     let lift = |p: Point2d| -> Point3 { origin + u_dir * p.x + v_dir * p.y };
+    let plane_n = {
+        let n = u_dir.cross(&v_dir);
+        n.normalize().unwrap_or(n)
+    };
+    let lift_curve = |s: Point2d,
+                      e: Point2d,
+                      source_circle: &Option<(Point2d, f64)>|
+     -> Box<dyn crate::primitives::curve::Curve> {
+        if let Some((c2, r)) = source_circle {
+            let tol_d = tolerance.distance();
+            let on_circle = |p: &Point2d| {
+                let d = ((p.x - c2.x).powi(2) + (p.y - c2.y).powi(2)).sqrt();
+                (d - r).abs() <= tol_d
+            };
+            if on_circle(&s) && on_circle(&e) {
+                let a_s = (s.y - c2.y).atan2(s.x - c2.x);
+                let a_e = (e.y - c2.y).atan2(e.x - c2.x);
+                let mut sweep = a_e - a_s;
+                while sweep > std::f64::consts::PI {
+                    sweep -= 2.0 * std::f64::consts::PI;
+                }
+                while sweep <= -std::f64::consts::PI {
+                    sweep += 2.0 * std::f64::consts::PI;
+                }
+                // Shortest-way arc; sampled chords are well under π. Keep a
+                // positive sweep (Arc::contains_angle assumes one) by
+                // starting at whichever endpoint makes the sweep CCW.
+                let (start_angle, sweep_angle) = if sweep >= 0.0 {
+                    (a_s, sweep)
+                } else {
+                    (a_e, -sweep)
+                };
+                if sweep_angle > 1e-12 {
+                    let arc = crate::primitives::curve::Arc {
+                        center: lift(*c2),
+                        normal: plane_n,
+                        // x_axis = the projection frame's u axis, so the 2D
+                        // atan2 angles above are exactly the arc's angles.
+                        x_axis: u_dir,
+                        radius: *r,
+                        start_angle,
+                        sweep_angle,
+                        range: crate::primitives::curve::ParameterRange::unit(),
+                    };
+                    return Box::new(arc);
+                }
+            }
+        }
+        Box::new(Line::new(lift(s), lift(e)))
+    };
 
     let mut coplanar_curves_a: Vec<IntersectionCurve> = Vec::new();
     for (s, e) in &b_inside_a {
-        let line = Line::new(lift(*s), lift(*e));
-        let curve_id = model.curves.add(Box::new(line));
+        let curve_id = model.curves.add(lift_curve(*s, *e, &circle_b));
         coplanar_curves_a.push(IntersectionCurve { curve_id });
     }
     let mut coplanar_curves_b: Vec<IntersectionCurve> = Vec::new();
     for (s, e) in &a_inside_b {
-        let line = Line::new(lift(*s), lift(*e));
-        let curve_id = model.curves.add(Box::new(line));
+        let curve_id = model.curves.add(lift_curve(*s, *e, &circle_a));
         coplanar_curves_b.push(IntersectionCurve { curve_id });
     }
 
