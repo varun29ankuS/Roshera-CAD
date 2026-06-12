@@ -3,9 +3,22 @@ import { parseServerMessage, type ServerMessage } from './ws-schemas'
 
 type MessageHandler = (msg: ServerMessage) => void
 
-const MAX_RECONNECT_ATTEMPTS = 10
 const BASE_DELAY_MS = 1000
+// Cap the backoff instead of capping the ATTEMPTS: a dev-server rebuild
+// takes minutes, and the old 10-attempt limit gave up mid-rebuild and
+// permanently stranded the tab (stale scene, dead UUIDs, deletes that
+// silently no-op — the 2026-06-12 live-session failure). Retry forever,
+// at most every MAX_DELAY_MS.
+const MAX_DELAY_MS = 10_000
 const HEARTBEAT_INTERVAL_MS = 30_000
+
+/// Installed by ws-bridge: full scene refetch from `/api/scene/snapshot`.
+/// Called on every RE-connect (not the first connect) because the server
+/// may have restarted — everything the client holds could be stale.
+let resyncHook: (() => void) | null = null
+export function setResyncHook(hook: () => void) {
+  resyncHook = hook
+}
 
 class WSClient {
   private ws: WebSocket | null = null
@@ -49,9 +62,15 @@ class WSClient {
 
     ws.onopen = () => {
       const s = useWSStore.getState()
+      const wasReconnect = s.reconnectAttempt > 0
       s.setStatus('connected')
       s.resetReconnect()
       this.startHeartbeat()
+      // After a reconnect the server may be a NEW process: resync the
+      // whole scene rather than trusting anything broadcast-accumulated.
+      if (wasReconnect) {
+        resyncHook?.()
+      }
     }
 
     ws.onmessage = (event) => {
@@ -135,12 +154,11 @@ class WSClient {
   private scheduleReconnect() {
     this.clearReconnect()
     const store = useWSStore.getState()
-    if (store.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
-      store.setError(`Failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts`)
-      return
-    }
     store.incrementReconnect()
-    const delay = BASE_DELAY_MS * Math.pow(2, Math.min(store.reconnectAttempt, 6))
+    const delay = Math.min(
+      BASE_DELAY_MS * Math.pow(2, Math.min(store.reconnectAttempt, 6)),
+      MAX_DELAY_MS,
+    )
     this.reconnectTimer = setTimeout(() => this.connect(), delay)
   }
 

@@ -3803,6 +3803,64 @@ async fn clear_all_geometry(
     })))
 }
 
+/// `GET /api/scene/snapshot` — the full scene for (re)connecting clients.
+///
+/// The viewport's scene state is otherwise populated ONLY by WS
+/// broadcasts, so a client that connects late — or reconnects after a
+/// server restart — could never recover the model (stale scenes, dead
+/// UUIDs, "deletes do nothing": the 2026-06-12 live-session strand).
+/// Returns every mapped solid in the same payload shape as the
+/// `ObjectCreated` broadcast so the frontend reuses its existing
+/// conversion path. Orphan solids (no public UUID) are skipped — they
+/// have no client-addressable identity.
+async fn scene_snapshot(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+) -> Json<serde_json::Value> {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let model = model_handle.read().await;
+    let params = TessellationParams::default();
+    let mut objects: Vec<serde_json::Value> = Vec::new();
+
+    for (solid_id, solid) in model.solids.iter() {
+        let Some(uuid) = state
+            .local_to_uuid
+            .get(&solid_id)
+            .map(|entry| *entry.value())
+        else {
+            continue;
+        };
+        let mesh = tessellate_solid(solid, &model, &params).to_threejs();
+        let name = solid
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("solid_{solid_id}"));
+        objects.push(serde_json::json!({
+            "id": uuid.to_string(),
+            "name": name,
+            "mesh": {
+                "vertices": mesh.positions,
+                "indices":  mesh.indices,
+                "normals":  mesh.normals,
+                "face_ids": mesh.face_map.unwrap_or_default(),
+            },
+            "analytical_geometry": {
+                "solid_id": solid_id,
+                "primitive_type": "snapshot",
+                "parameters": serde_json::Value::Null,
+            },
+            "transform": {
+                "translation": [0.0, 0.0, 0.0],
+                "rotation":    [0.0, 0.0, 0.0, 1.0],
+                "scale":       [1.0, 1.0, 1.0],
+            },
+        }));
+    }
+
+    Json(serde_json::json!({ "objects": objects }))
+}
+
 async fn process_enhanced_ai_command(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
@@ -5944,6 +6002,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/pointer",
             get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),
         )
+        .route("/api/scene/snapshot", get(scene_snapshot))
         .route(
             "/api/agent/parts/{id}/reanchor",
             post(handlers::agent::reanchor_part),
