@@ -310,7 +310,13 @@ impl Sketch {
             })?;
 
         let line = LineSegment2d::new(start_point, end_point)?;
-        let param_line = ParametricLine2d::new_segment(line);
+        let mut param_line = ParametricLine2d::new_segment(line);
+        // Shared-variable model: remember WHICH points define this
+        // segment, not just where they were at creation time. The
+        // solver derives the line's geometry from these points (zero
+        // own DOF) and the post-solve sync rebuilds the segment from
+        // their solved positions.
+        param_line.endpoints = Some((start, end));
         let id = param_line.id;
 
         let (min, max) = param_line.bounding_box();

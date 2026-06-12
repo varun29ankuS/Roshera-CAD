@@ -220,6 +220,19 @@ pub struct EntityState {
     /// sets at most one), but the struct does not enforce that — the
     /// invariant is held by the constructor surface.
     polyline: Option<PolylineMetadata>,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM A.2): when `Some((start, end))`,
+    /// this entity is a segment line DERIVED from two point entities.
+    /// It owns NO parameters of its own (`parameters` is empty, so the
+    /// Jacobian sees zero columns from it); every geometric accessor
+    /// (`get_line_point` / `get_line_direction` / `get_line_end` /
+    /// `get_line_length`) computes from the endpoint points' live
+    /// state. This is the D-Cubed-style coupling that makes a
+    /// Horizontal constraint on a line and a Distance constraint on
+    /// its endpoints pull on the SAME unknowns — previously lines
+    /// carried a private (point, direction) copy, so solved sketches
+    /// came apart (lines detached from their points) and DOF counts
+    /// were inflated by 4 per line.
+    derived_segment: Option<(EntityRef, EntityRef)>,
 }
 
 /// Decode the flat `[x0, y0, x1, y1, …]` spline-control-point pack
@@ -739,8 +752,20 @@ impl ConstraintSolver {
         })
     }
 
+    /// Endpoint refs when `entity` is a derived segment line.
+    fn derived_segment_of(&self, entity: &EntityRef) -> Option<(EntityRef, EntityRef)> {
+        self.entity_state
+            .get(entity)
+            .and_then(|state| state.derived_segment)
+    }
+
     /// Get line direction from entity state
     fn get_line_direction(&self, entity: &EntityRef) -> Option<Vector2d> {
+        if let Some((start, end)) = self.derived_segment_of(entity) {
+            let a = self.get_point_position(&start)?;
+            let b = self.get_point_position(&end)?;
+            return Some(Vector2d::new(b.x - a.x, b.y - a.y));
+        }
         self.entity_state.get(entity).map(|state| {
             if state.parameters.len() >= 4 {
                 // Parameters: point.x, point.y, dir.x, dir.y
@@ -1286,10 +1311,20 @@ impl ConstraintSolver {
                 EntityRef::Point(_) => {
                     EntityUpdate::Point(Point2d::new(state.parameters[0], state.parameters[1]))
                 }
-                EntityRef::Line(_) => EntityUpdate::Line(
-                    Point2d::new(state.parameters[0], state.parameters[1]),
-                    Vector2d::new(state.parameters[2], state.parameters[3]),
-                ),
+                EntityRef::Line(_) => {
+                    if state.derived_segment.is_some() {
+                        // Derived segments own no parameters; their
+                        // geometry is synced from the endpoint points
+                        // by the sketch bridge after point updates
+                        // land. Reading parameters[0..4] here would
+                        // index an empty vec.
+                        continue;
+                    }
+                    EntityUpdate::Line(
+                        Point2d::new(state.parameters[0], state.parameters[1]),
+                        Vector2d::new(state.parameters[2], state.parameters[3]),
+                    )
+                }
                 EntityRef::Circle(_) => EntityUpdate::Circle(
                     Point2d::new(state.parameters[0], state.parameters[1]),
                     state.parameters[2],
@@ -1775,9 +1810,16 @@ impl ConstraintSolver {
 
     fn get_line_point(&self, entity: &EntityRef) -> Option<Point2d> {
         if let EntityRef::Line(_id) = entity {
-            self.entity_state
-                .get(entity)
-                .map(|state| Point2d::new(state.parameters[0], state.parameters[1]))
+            if let Some((start, _end)) = self.derived_segment_of(entity) {
+                return self.get_point_position(&start);
+            }
+            self.entity_state.get(entity).and_then(|state| {
+                if state.parameters.len() >= 2 {
+                    Some(Point2d::new(state.parameters[0], state.parameters[1]))
+                } else {
+                    None
+                }
+            })
         } else {
             None
         }
@@ -1790,19 +1832,28 @@ impl ConstraintSolver {
     }
 
     fn get_line_end(&self, entity: &EntityRef) -> Option<Point2d> {
-        // Calculate based on line direction and length
+        if let Some((_start, end)) = self.derived_segment_of(entity) {
+            return self.get_point_position(&end);
+        }
+        // Legacy (point, direction) parameterisation has no length —
+        // fabricate one. Real segments take the derived path above.
         if let (Some(start), Some(dir)) =
             (self.get_line_point(entity), self.get_line_direction(entity))
         {
             let scaled_dir = dir.scale(100.0);
-            Some(Point2d::new(start.x + scaled_dir.x, start.y + scaled_dir.y)) // Default length, should be stored
+            Some(Point2d::new(start.x + scaled_dir.x, start.y + scaled_dir.y))
         } else {
             None
         }
     }
 
-    fn get_line_length(&self, _entity: &EntityRef) -> Option<f64> {
-        // Should be stored as parameter, using default for now
+    fn get_line_length(&self, entity: &EntityRef) -> Option<f64> {
+        if let Some((start, end)) = self.derived_segment_of(entity) {
+            let a = self.get_point_position(&start)?;
+            let b = self.get_point_position(&end)?;
+            return Some(a.distance_to(&b));
+        }
+        // Legacy (point, direction) lines carry no real length.
         Some(100.0)
     }
 
@@ -1916,6 +1967,7 @@ impl EntityState {
             fixed_mask: vec![fixed, fixed],
             spline: None,
             polyline: None,
+            derived_segment: None,
         }
     }
 
@@ -1926,6 +1978,21 @@ impl EntityState {
             fixed_mask: vec![point_fixed, point_fixed, dir_fixed, dir_fixed],
             spline: None,
             polyline: None,
+            derived_segment: None,
+        }
+    }
+
+    /// Create state for a segment line DERIVED from two point
+    /// entities (shared-variable model). Contributes ZERO degrees of
+    /// freedom: its geometry is a pure function of the endpoint
+    /// points' parameters.
+    pub fn segment_between(start: EntityRef, end: EntityRef) -> Self {
+        Self {
+            parameters: Vec::new(),
+            fixed_mask: Vec::new(),
+            spline: None,
+            polyline: None,
+            derived_segment: Some((start, end)),
         }
     }
 
@@ -1936,6 +2003,7 @@ impl EntityState {
             fixed_mask: vec![center_fixed, center_fixed, radius_fixed],
             spline: None,
             polyline: None,
+            derived_segment: None,
         }
     }
 
@@ -1977,6 +2045,7 @@ impl EntityState {
             ],
             spline: None,
             polyline: None,
+            derived_segment: None,
         }
     }
 
@@ -2019,6 +2088,7 @@ impl EntityState {
             ],
             spline: None,
             polyline: None,
+            derived_segment: None,
         }
     }
 
@@ -2070,6 +2140,7 @@ impl EntityState {
             ],
             spline: None,
             polyline: None,
+            derived_segment: None,
         }
     }
 
@@ -2123,6 +2194,7 @@ impl EntityState {
                 weights: None,
             }),
             polyline: None,
+            derived_segment: None,
         }
     }
 
@@ -2165,6 +2237,7 @@ impl EntityState {
                 weights: Some(weights),
             }),
             polyline: None,
+            derived_segment: None,
         }
     }
 
@@ -2202,6 +2275,7 @@ impl EntityState {
             fixed_mask,
             spline: None,
             polyline: Some(PolylineMetadata { is_closed }),
+            derived_segment: None,
         }
     }
 }

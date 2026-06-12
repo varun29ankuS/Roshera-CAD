@@ -904,6 +904,28 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     for entry in sketch.lines().iter() {
         let id = *entry.key();
         let line: &ParametricLine2d = entry.value();
+        // SHARED-VARIABLE MODEL (SKETCH-DCM A.2): a segment that knows
+        // its endpoint points registers as a DERIVED entity — zero own
+        // DOF, geometry computed from the points' live solver state.
+        // This is what couples Horizontal(line) to Distance(point,
+        // point): both now differentiate against the same variables.
+        // Guard on both points still existing; a segment whose points
+        // were deleted degrades to the legacy private-geometry path.
+        if let (LineGeometry::Segment(_), Some((start_id, end_id))) =
+            (&line.geometry, line.endpoints)
+        {
+            if sketch.points().contains_key(&start_id) && sketch.points().contains_key(&end_id) {
+                solver.add_entity(
+                    EntityRef::Line(id),
+                    EntityState::segment_between(
+                        EntityRef::Point(start_id),
+                        EntityRef::Point(end_id),
+                    ),
+                );
+                registered += 1;
+                continue;
+            }
+        }
         let (point, direction) = line_to_point_direction(&line.geometry);
         // Lines have no per-DOF fix flags today; pass `false` so the
         // solver treats all four params as free unless an explicit
@@ -1286,6 +1308,28 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
             // floor rather than panicking — the unsolved entity
             // retains its prior geometry.
             _ => {}
+        }
+    }
+
+    // SHARED-VARIABLE MODEL (SKETCH-DCM A.2): after every point update
+    // has landed, rebuild each endpoint-linked segment's geometry from
+    // its points' SOLVED positions. Derived lines emit no
+    // EntityUpdate::Line (they own no parameters), so this pass is the
+    // single writer of their geometry — the line cannot disagree with
+    // its endpoints, which is the accuracy contract the csketch
+    // extrude bridge and every downstream consumer rely on.
+    for mut entry in sketch.lines().iter_mut() {
+        let Some((start_id, end_id)) = entry.value().endpoints else {
+            continue;
+        };
+        let (Some(a), Some(b)) = (
+            sketch.points().get(&start_id).map(|p| p.value().position),
+            sketch.points().get(&end_id).map(|p| p.value().position),
+        ) else {
+            continue;
+        };
+        if let Ok(segment) = LineSegment2d::new(a, b) {
+            entry.value_mut().geometry = LineGeometry::Segment(segment);
         }
     }
 }
@@ -2686,6 +2730,105 @@ mod tests {
                 }
             }
             Spline2d::Nurbs(_) => panic!("BSpline must round-trip as BSpline"),
+        }
+    }
+
+    #[test]
+    fn dcm_plate_squares_from_sloppy_input_with_shared_variables() {
+        // SKETCH-DCM A.2 acceptance. Four deliberately sloppy corners,
+        // four endpoint-linked lines, H/V on the lines plus two driving
+        // distances on the points, one pinned corner. Pre-A.2 the lines
+        // carried PRIVATE (point, direction) geometry, so Horizontal /
+        // Vertical pulled on the lines' copies while Distance pulled on
+        // the points: the live run reported under-constrained with ~16
+        // phantom DOFs and the "solved" sketch was incoherent. With the
+        // shared-variable model the line constraints differentiate
+        // against the point variables and the plate squares exactly.
+        let sketch = fresh_sketch();
+        let p1 = sketch.add_point(Point2d::new(0.0, 0.0));
+        let p2 = sketch.add_point(Point2d::new(82.0, 3.0));
+        let p3 = sketch.add_point(Point2d::new(79.0, 48.0));
+        let p4 = sketch.add_point(Point2d::new(-2.0, 51.0));
+        sketch
+            .points()
+            .get_mut(&p1)
+            .expect("p1 exists")
+            .value_mut()
+            .fix();
+        let bottom = sketch.add_line(p1, p2).expect("bottom line");
+        let right = sketch.add_line(p2, p3).expect("right line");
+        let top = sketch.add_line(p3, p4).expect("top line");
+        let left = sketch.add_line(p4, p1).expect("left line");
+
+        for line in [bottom, top] {
+            sketch.add_constraint(Constraint::new_geometric(
+                GeometricConstraint::Horizontal,
+                vec![EntityRef::Line(line)],
+                ConstraintPriority::High,
+            ));
+        }
+        for line in [right, left] {
+            sketch.add_constraint(Constraint::new_geometric(
+                GeometricConstraint::Vertical,
+                vec![EntityRef::Line(line)],
+                ConstraintPriority::High,
+            ));
+        }
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(80.0),
+            vec![EntityRef::Point(p1), EntityRef::Point(p2)],
+            ConstraintPriority::High,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(50.0),
+            vec![EntityRef::Point(p1), EntityRef::Point(p4)],
+            ConstraintPriority::High,
+        ));
+
+        let report = solve(&sketch).expect("solve");
+        assert!(
+            report.converged(),
+            "plate must converge, got {:?}",
+            report.status
+        );
+
+        let pos = |id| sketch.points().get(&id).expect("point").value().position;
+        let tol = 1e-6;
+        let (q1, q2, q3, q4) = (pos(p1), pos(p2), pos(p3), pos(p4));
+        assert!(
+            q1.x.abs() < tol && q1.y.abs() < tol,
+            "p1 pinned, got {q1:?}"
+        );
+        assert!(
+            (q2.x - 80.0).abs() < tol && q2.y.abs() < tol,
+            "p2 must square to (80, 0), got {q2:?}"
+        );
+        assert!(
+            (q3.x - 80.0).abs() < tol && (q3.y - 50.0).abs() < tol,
+            "p3 must square to (80, 50), got {q3:?}"
+        );
+        assert!(
+            (q4.x.abs() < tol) && (q4.y - 50.0).abs() < tol,
+            "p4 must square to (0, 50), got {q4:?}"
+        );
+
+        // Coherence contract: every line's stored geometry must agree
+        // EXACTLY with its endpoint points after the solve (the bridge
+        // sync pass is the single writer of derived-segment geometry).
+        for (line_id, a, b) in [
+            (bottom, q1, q2),
+            (right, q2, q3),
+            (top, q3, q4),
+            (left, q4, q1),
+        ] {
+            let entry = sketch.lines().get(&line_id).expect("line exists");
+            let LineGeometry::Segment(seg) = entry.value().geometry else {
+                panic!("expected segment geometry");
+            };
+            assert!(
+                seg.start.distance_to(&a) < 1e-12 && seg.end.distance_to(&b) < 1e-12,
+                "line {line_id:?} geometry detached from its points: {seg:?} vs ({a:?}, {b:?})"
+            );
         }
     }
 }

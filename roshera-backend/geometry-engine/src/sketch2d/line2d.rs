@@ -434,6 +434,15 @@ pub struct ParametricLine2d {
     constraint_count: usize,
     /// Construction geometry flag
     pub is_construction: bool,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM A.2): the point entities this
+    /// segment derives from. `Some` for every line built via
+    /// `Sketch::add_line(start_id, end_id)`; the solver then treats
+    /// the line as a zero-DOF derived entity whose geometry is a pure
+    /// function of the two points, and the post-solve bridge re-syncs
+    /// `geometry` from the solved point positions — the line CANNOT
+    /// disagree with its endpoints. `None` for infinite lines, rays,
+    /// and standalone segments (legacy private-geometry behaviour).
+    pub endpoints: Option<(super::point2d::Point2dId, super::point2d::Point2dId)>,
 }
 
 /// Types of line geometry
@@ -455,6 +464,7 @@ impl ParametricLine2d {
             geometry: LineGeometry::Infinite(line),
             constraint_count: 0,
             is_construction: false,
+            endpoints: None,
         }
     }
 
@@ -465,6 +475,7 @@ impl ParametricLine2d {
             geometry: LineGeometry::Ray(ray),
             constraint_count: 0,
             is_construction: false,
+            endpoints: None,
         }
     }
 
@@ -475,6 +486,7 @@ impl ParametricLine2d {
             geometry: LineGeometry::Segment(segment),
             constraint_count: 0,
             is_construction: false,
+            endpoints: None,
         }
     }
 
@@ -570,6 +582,11 @@ impl SketchEntity2d for ParametricLine2d {
             geometry: self.geometry,
             constraint_count: 0, // Constraints don't copy
             is_construction: self.is_construction,
+            // Endpoint links don't copy either: the clone references
+            // the ORIGINAL points, and a derived line whose points
+            // belong to another lineage would silently couple the two.
+            // A standalone clone owns its geometry.
+            endpoints: None,
         })
     }
 }
