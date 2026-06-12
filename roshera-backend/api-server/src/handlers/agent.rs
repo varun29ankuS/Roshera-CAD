@@ -309,3 +309,106 @@ pub async fn query_hover(
     let mut model = model_handle.write().await;
     model.query_hover(id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
+
+// ───────────────────── render (agent eyes) ──────────────────────────
+
+/// Query parameters for `GET /api/agent/parts/{id}/render`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RenderQuery {
+    /// `iso` (default) | `front` | `top` | `right`.
+    pub view: Option<String>,
+    /// `shaded` (default) | `ids` | `depth` | `normals`.
+    pub mode: Option<String>,
+    /// Square output size in pixels, clamped to 64..=2048. Default 512.
+    pub size: Option<usize>,
+}
+
+/// One legend row: which RGB in an `ids`-mode image is which face.
+#[derive(Debug, Clone, Serialize)]
+pub struct FaceLegendEntry {
+    pub face_id: u32,
+    pub rgb: [u8; 3],
+}
+
+/// Wire shape for a rendered view.
+#[derive(Debug, Clone, Serialize)]
+pub struct RenderResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub view: String,
+    pub mode: String,
+    /// Populated in `ids` mode: exact color → face mapping (flat colors,
+    /// so the mapping survives image resampling).
+    pub face_legend: Vec<FaceLegendEntry>,
+}
+
+/// `GET /api/agent/parts/{id}/render` — the agent's eye.
+///
+/// Renders the solid through the kernel's deterministic software
+/// rasterizer (no GPU, no display). `mode=ids` is set-of-marks for
+/// topology: every face a distinct flat color plus a legend, so a
+/// vision model can ADDRESS what it sees ("the red face is face 12").
+/// `depth`/`normals` are the G-buffer channels — exact depth and
+/// orientation, no stereo inference needed.
+///
+/// Read lock only: rendering tessellates into a scratch mesh and never
+/// mutates the model. `404` unknown id / empty tessellation, `400`
+/// unknown view or mode.
+pub async fn render_part(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<RenderQuery>,
+) -> Result<Json<RenderResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::render::{render_solid, CanonicalView, RenderMode, RenderOptions};
+
+    let view_name = q.view.as_deref().unwrap_or("iso");
+    let view = match view_name {
+        "iso" => CanonicalView::Isometric,
+        "front" => CanonicalView::Front,
+        "top" => CanonicalView::Top,
+        "right" => CanonicalView::Right,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let mode_name = q.mode.as_deref().unwrap_or("shaded");
+    let mode = match mode_name {
+        "shaded" => RenderMode::Shaded,
+        "ids" => RenderMode::FaceIds,
+        "depth" => RenderMode::Depth,
+        "normals" => RenderMode::Normals,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let size = q.size.unwrap_or(512).clamp(64, 2048);
+
+    let model = model_handle.read().await;
+    let frame = render_solid(
+        &model,
+        id as SolidId,
+        &RenderOptions {
+            width: size,
+            height: size,
+            view,
+            mode,
+            ..Default::default()
+        },
+    )
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(RenderResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        view: view_name.to_string(),
+        mode: mode_name.to_string(),
+        face_legend: frame
+            .face_legend
+            .iter()
+            .map(|&(face_id, rgb)| FaceLegendEntry { face_id, rgb })
+            .collect(),
+    }))
+}
