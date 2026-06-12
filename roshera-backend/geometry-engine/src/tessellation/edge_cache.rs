@@ -85,6 +85,15 @@ const COLLINEAR_TOL: f64 = 1e-9;
 pub struct EdgeSampleCache {
     params: TessellationParams,
     samples: DashMap<EdgeId, Arc<Vec<Point3>>>,
+    /// Edge → adjacent-faces index, built lazily on the first
+    /// `compute_samples` call and reused for every edge thereafter.
+    /// The previous per-edge `adjacent_faces_of` walked EVERY shell,
+    /// face, and loop in the model for EVERY edge — O(model) × edges,
+    /// degrading further as the session's model accumulates solids
+    /// (profiled 2026-06-12 as the bulk of a 38 ms first-face stall on
+    /// a 64-gon prism). One full walk amortised across all edges is
+    /// the same cost as a single old lookup.
+    adjacency: parking_lot::RwLock<Option<Arc<std::collections::HashMap<EdgeId, Vec<FaceId>>>>>,
 }
 
 impl EdgeSampleCache {
@@ -95,7 +104,51 @@ impl EdgeSampleCache {
         Self {
             params: params.clone(),
             samples: DashMap::new(),
+            adjacency: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// The lazily-built edge→faces index. First caller pays one full
+    /// model walk; everyone else gets the shared map. Double-checked
+    /// under the write lock so concurrent rayon workers build it once.
+    fn adjacency_index(
+        &self,
+        model: &BRepModel,
+    ) -> Arc<std::collections::HashMap<EdgeId, Vec<FaceId>>> {
+        if let Some(map) = self.adjacency.read().as_ref() {
+            return Arc::clone(map);
+        }
+        let mut guard = self.adjacency.write();
+        if let Some(map) = guard.as_ref() {
+            return Arc::clone(map);
+        }
+        let mut index: std::collections::HashMap<EdgeId, Vec<FaceId>> =
+            std::collections::HashMap::new();
+        for (_shell_id, shell) in model.shells.iter() {
+            for &face_id in &shell.faces {
+                let face = match model.faces.get(face_id) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let mut push_loop_edges = |loop_id| {
+                    if let Some(l) = model.loops.get(loop_id) {
+                        for &e in &l.edges {
+                            let faces = index.entry(e).or_default();
+                            if !faces.contains(&face_id) {
+                                faces.push(face_id);
+                            }
+                        }
+                    }
+                };
+                push_loop_edges(face.outer_loop);
+                for &il in &face.inner_loops {
+                    push_loop_edges(il);
+                }
+            }
+        }
+        let map = Arc::new(index);
+        *guard = Some(Arc::clone(&map));
+        map
     }
 
     /// Fetch the canonical sample sequence for `edge_id`, computing it
@@ -185,7 +238,9 @@ impl EdgeSampleCache {
         // ruled-along-the-edge faces contribute zero, so straight edges
         // keep their two-sample collapse.
         let mut n = n_curve;
-        for face_id in adjacent_faces_of(model, edge_id) {
+        let adjacency = self.adjacency_index(model);
+        let adjacent: &[FaceId] = adjacency.get(&edge_id).map(Vec::as_slice).unwrap_or(&[]);
+        for &face_id in adjacent {
             if let Some(face) = model.faces.get(face_id) {
                 if let Some(surface) = model.surfaces.get(face.surface_id) {
                     n = n.max(compute_face_boundary_sample_count(
@@ -364,6 +419,37 @@ fn compute_face_boundary_sample_count(
     const PROBE: usize = 16;
     let tol = Tolerance::default();
 
+    // Cheap pre-probe: the expensive part of this function is
+    // `surface.closest_point` (an iterative solve) at 17 stations. But
+    // the dominant call pattern is a straight edge bounding flat or
+    // ruled-along-the-edge faces, where the answer is "0 — no
+    // curvature demand". Detect that with 3 stations first: if the
+    // surface normal is constant along start/mid/end, skip the full
+    // scan. A surface whose normal varies along the edge but agrees
+    // exactly at these 3 stations would be aliased — the same class of
+    // aliasing the 17-uniform-probe scan itself accepts at higher
+    // frequency, and the watertight/tessellation gates bound the blast
+    // radius.
+    {
+        let mut pre_normals: [Option<Vector3>; 3] = [None, None, None];
+        for (slot, frac) in [(0usize, 0.0f64), (1, 0.5), (2, 1.0)] {
+            let t = t_start + frac * (t_end - t_start);
+            if let Ok(p) = curve.point_at(t) {
+                pre_normals[slot] = surface
+                    .closest_point(&p, tol)
+                    .ok()
+                    .and_then(|(u, v)| surface.normal_at(u, v).ok());
+            }
+        }
+        if let [Some(a), Some(b), Some(c)] = pre_normals {
+            let angle_ab = a.dot(&b).clamp(-1.0, 1.0).acos();
+            let angle_bc = b.dot(&c).clamp(-1.0, 1.0).acos();
+            if angle_ab + angle_bc <= 1e-9 {
+                return 0;
+            }
+        }
+    }
+
     let mut pts: Vec<Option<Point3>> = Vec::with_capacity(PROBE + 1);
     let mut normals: Vec<Option<Vector3>> = Vec::with_capacity(PROBE + 1);
     for i in 0..=PROBE {
@@ -422,40 +508,6 @@ fn compute_face_boundary_sample_count(
         0
     };
     n_angle.max(n_sag).min(params.max_segments)
-}
-
-/// Faces whose outer or inner loop references `edge_id`, found by walking
-/// the model's shells. Kept local so the tessellation layer needs no
-/// dependency on `operations`; mirrors the model-wide adjacency walk used
-/// by edge classification.
-fn adjacent_faces_of(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
-    let mut faces: Vec<FaceId> = Vec::with_capacity(2);
-    for shell_entry in model.shells.iter() {
-        let (_shell_id, shell) = shell_entry;
-        for &face_id in &shell.faces {
-            if faces.contains(&face_id) {
-                continue;
-            }
-            let face = match model.faces.get(face_id) {
-                Some(f) => f,
-                None => continue,
-            };
-            let touches = model
-                .loops
-                .get(face.outer_loop)
-                .map_or(false, |l| l.edges.iter().any(|&e| e == edge_id))
-                || face.inner_loops.iter().any(|&il| {
-                    model
-                        .loops
-                        .get(il)
-                        .map_or(false, |l| l.edges.iter().any(|&e| e == edge_id))
-                });
-            if touches {
-                faces.push(face_id);
-            }
-        }
-    }
-    faces
 }
 
 #[cfg(test)]
@@ -618,13 +670,17 @@ mod tests {
         let circle =
             Circle::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, r).expect("circle must construct");
         let params = TessellationParams::default();
-        let n = compute_face_boundary_sample_count(
-            &circle,
-            0.0,
-            std::f64::consts::TAU,
-            &sphere,
-            &params,
-        );
+        // Circle/Arc parameterise the full sweep over t ∈ [0, 1]
+        // (`ParameterRange::unit()` in `Arc::new`) — NOT [0, 2π]. This
+        // test originally passed `t_end = TAU`; every probe parameter
+        // above 1 clamps to the wrap point, so a sparse probe sees one
+        // repeated point and reports zero curvature. Production always
+        // passes `edge.param_range`, which is in the curve's own
+        // convention, so only the test was affected. Probe the real
+        // range.
+        let range = circle.parameter_range();
+        let n =
+            compute_face_boundary_sample_count(&circle, range.start, range.end, &sphere, &params);
         assert!(
             n > 0,
             "a curved edge on a sphere should request surface-curvature densification, got {n}"

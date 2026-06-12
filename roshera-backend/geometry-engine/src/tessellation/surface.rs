@@ -293,8 +293,21 @@ pub fn tessellate_face(
             // matters post-β.2 because `tessellate_planar_face`
             // ear-clips a 4-vertex polygon in microseconds, skipping
             // the full CDT pipeline for trivially planar side walls.
-            if surface.is_planar(planar_tolerance)
-                || is_face_loop_planar_in_3d(face, model, cache, planar_tolerance)
+            // Test order matters for latency, not semantics: the `||`
+            // accepts either test, but their costs are wildly asymmetric.
+            // `is_face_loop_planar_in_3d` reads the loop's cached edge
+            // samples (microseconds); the default `Surface::is_planar`
+            // scans an 11×11 grid of `normal_at` evaluations over the
+            // FULL host-surface parameter bounds. For the dominant case
+            // — a polyline-extruded side wall, whose host
+            // RuledSurface(Polyline, Polyline) carries every kink of the
+            // profile — the surface-global test always FAILS after all
+            // 121 evaluations (each a polyline segment search), ~1.9 ms
+            // per face, ×N side walls per extrude (profiled 2026-06-12:
+            // 120 ms of a 64-gon prism's 163 ms tessellation). Loop-first
+            // short-circuits that scan for every flat wall.
+            if is_face_loop_planar_in_3d(face, model, cache, planar_tolerance)
+                || surface.is_planar(planar_tolerance)
             {
                 tessellate_planar_face(face, model, params, cache, mesh);
             } else {
@@ -717,6 +730,66 @@ fn sample_loop_3d_polygon(
 /// new collinearities that defeated the strict/closed point-in-triangle
 /// test in a new way. CDT is set-based, not walk-based, so the same
 /// failure mode is mathematically impossible.
+/// Fan-triangulate `pts2d[range.0..range.1]` if it is a strictly
+/// convex simple polygon; `None` sends the caller to the CDT path.
+///
+/// Strictness is the safety contract: every consecutive edge pair must
+/// turn the same way with a cross product decisively above a
+/// scale-relative threshold. Collinear vertices are REJECTED rather
+/// than skipped — a collinear boundary vertex dropped from this face's
+/// triangulation while the neighbouring face keeps it would be a
+/// T-junction, which the watertight oracle counts as an open edge.
+/// For a polygon that passes, a fan from the first vertex is a valid
+/// triangulation by convexity, and emitting it in the polygon's CCW
+/// direction satisfies the caller's winding contract (CCW in the
+/// `u_axis × v_axis = normal` basis).
+fn fan_strictly_convex_polygon(
+    pts2d: &[(f64, f64)],
+    range: (usize, usize),
+) -> Option<Vec<[usize; 3]>> {
+    let (s, e) = range;
+    let n = e - s;
+    if n < 3 || e > pts2d.len() {
+        return None;
+    }
+    // Scale-relative degeneracy threshold: cross products compare
+    // against the squared bounding-box extent so the test is invariant
+    // under uniform scaling of the model.
+    let mut max_extent: f64 = 0.0;
+    for &(x, y) in &pts2d[s..e] {
+        max_extent = max_extent.max(x.abs()).max(y.abs());
+    }
+    let eps = 1e-12 * max_extent * max_extent;
+
+    let mut sign = 0.0f64;
+    for i in 0..n {
+        let (ax, ay) = pts2d[s + i];
+        let (bx, by) = pts2d[s + (i + 1) % n];
+        let (cx, cy) = pts2d[s + (i + 2) % n];
+        let cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if cross.abs() <= eps {
+            return None; // collinear or duplicate vertex — CDT path
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return None; // reflex vertex — CDT path
+        }
+    }
+
+    let mut tris = Vec::with_capacity(n - 2);
+    for i in 1..n - 1 {
+        if sign > 0.0 {
+            // Polygon is CCW in the projected basis — fan as-is.
+            tris.push([s, s + i, s + i + 1]);
+        } else {
+            // CW polygon — reverse each triangle to emit CCW.
+            tris.push([s, s + i + 1, s + i]);
+        }
+    }
+    Some(tris)
+}
+
 pub(crate) fn triangulate_planar_polygon(
     vertices: &[Point3],
     loop_boundaries: &[(usize, usize, bool)],
@@ -742,6 +815,23 @@ pub(crate) fn triangulate_planar_polygon(
             (r.dot(&u_axis), r.dot(&v_axis))
         })
         .collect();
+
+    // FAST PATH: a strictly convex, hole-free polygon needs no
+    // Delaunay machinery — a fan from its first vertex is a valid
+    // triangulation that keeps every boundary vertex (no T-junctions
+    // against neighbouring faces) and costs O(n). This is the planar
+    // workhorse case: every side wall of an extruded polygon and every
+    // convex cap (e.g. the 64-gon caps of a sketched circle) lands
+    // here. Profiled 2026-06-12: routing these through
+    // `cdt::triangulate_contours` (exact Shewchuk predicates + full
+    // CDT setup) dominated interactive extrude latency. Reflex,
+    // collinear-vertex, and holed polygons — boolean scar faces — fall
+    // through to the robust CDT path unchanged.
+    if inner_ranges.is_empty() {
+        if let Some(tris) = fan_strictly_convex_polygon(&pts2d, outer_range) {
+            return tris;
+        }
+    }
 
     // Build closed contours. cdt requires each contour's last index
     // to equal its first.

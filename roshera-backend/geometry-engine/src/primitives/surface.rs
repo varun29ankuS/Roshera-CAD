@@ -5592,24 +5592,78 @@ impl Surface for RuledSurface {
     }
 
     fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)> {
+        // For fixed u the surface point is `c1(u) + v·(c2(u) − c1(u))`
+        // — a straight ruling — so the optimal v is the CLOSED-FORM
+        // projection of `point` onto that segment. The search is
+        // therefore one-dimensional in u. This replaced a brute-force
+        // 31×11 grid of `point_at` evaluations (each costing two curve
+        // evaluations) that profiled as the dominant kernel cost of
+        // interactive extrude: the tessellation edge cache probes
+        // surface normals via `closest_point` for every boundary edge,
+        // and polyline-ruled prism walls paid the full grid per probe.
+        //
+        // u resolution: 64 samples resolves every segment of the
+        // polyline rails the sketch pipeline produces (≤ 64-gon
+        // circles); a ternary refinement around the best sample then
+        // converges within the winning bracket, where the distance is
+        // piecewise-smooth.
+        let ruling_proj = |u: f64| -> Option<(f64, f64)> {
+            let p1 = self.curve1.point_at(u).ok()?;
+            let p2 = self.curve2.point_at(u).ok()?;
+            let d = p2 - p1;
+            let dd = d.dot(&d);
+            let v = if dd > 0.0 {
+                ((*point - p1).dot(&d) / dd).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let q = p1 + d * v;
+            Some((v, (*point - q).magnitude_squared()))
+        };
+
+        const U_SAMPLES: usize = 64;
         let mut best_u = 0.0;
         let mut best_v = 0.0;
-        let mut best_dist = f64::MAX;
-
-        const U_SAMPLES: usize = 30;
-        const V_SAMPLES: usize = 10;
+        let mut best_d2 = f64::MAX;
         for i in 0..=U_SAMPLES {
-            for j in 0..=V_SAMPLES {
-                let u = i as f64 / U_SAMPLES as f64;
-                let v = j as f64 / V_SAMPLES as f64;
-                if let Ok(pt) = self.point_at(u, v) {
-                    let dist = (*point - pt).magnitude();
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_u = u;
-                        best_v = v;
+            let u = i as f64 / U_SAMPLES as f64;
+            if let Some((v, d2)) = ruling_proj(u) {
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_u = u;
+                    best_v = v;
+                }
+            }
+        }
+
+        // Ternary refinement in the bracket around the winning sample.
+        let h = 1.0 / U_SAMPLES as f64;
+        let mut lo = (best_u - h).max(0.0);
+        let mut hi = (best_u + h).min(1.0);
+        for _ in 0..24 {
+            let m1 = lo + (hi - lo) / 3.0;
+            let m2 = hi - (hi - lo) / 3.0;
+            let d1 = ruling_proj(m1);
+            let d2 = ruling_proj(m2);
+            match (d1, d2) {
+                (Some((v1, e1)), Some((v2, e2))) => {
+                    if e1 < e2 {
+                        hi = m2;
+                        if e1 < best_d2 {
+                            best_d2 = e1;
+                            best_u = m1;
+                            best_v = v1;
+                        }
+                    } else {
+                        lo = m1;
+                        if e2 < best_d2 {
+                            best_d2 = e2;
+                            best_u = m2;
+                            best_v = v2;
+                        }
                     }
                 }
+                _ => break,
             }
         }
 

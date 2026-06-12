@@ -200,17 +200,38 @@ pub fn tessellate_shell(
 ) {
     let weld_start_vertices = mesh.vertices.len();
     let weld_start_triangles = mesh.triangles.len();
+    // Per-face timing trace, gated on ROSHERA_TESS_TRACE. Used to find
+    // where wall-clock goes when a solid tessellates slower than its
+    // triangle count justifies: prints surface type, triangle yield and
+    // microseconds per face, plus the shell weld at the end.
+    let trace = std::env::var("ROSHERA_TESS_TRACE").is_ok();
     for &face_id in &shell.faces {
         if let Some(face) = model.faces.get(face_id) {
             let tri_start = mesh.triangles.len();
+            let t0 = trace.then(std::time::Instant::now);
             surface::tessellate_face(face, model, params, cache, mesh);
             let tri_end = mesh.triangles.len();
+            if let Some(t0) = t0 {
+                let surface_kind = model
+                    .surfaces
+                    .get(face.surface_id)
+                    .map(|s| s.type_name())
+                    .unwrap_or("?");
+                eprintln!(
+                    "[tess] face {} {} tris={} {}us",
+                    face_id,
+                    surface_kind,
+                    tri_end - tri_start,
+                    t0.elapsed().as_micros()
+                );
+            }
             // Record which B-Rep face each new triangle came from
             for _ in tri_start..tri_end {
                 mesh.face_map.push(face_id);
             }
         }
     }
+    let weld_t0 = trace.then(std::time::Instant::now);
 
     // Run welding only over the vertices/triangles produced by THIS
     // shell call so that callers passing a pre-populated mesh (e.g.
@@ -236,6 +257,14 @@ pub fn tessellate_shell(
             weld_distance,
             weld_start_vertices,
             weld_start_triangles,
+        );
+    }
+    if let Some(t0) = weld_t0 {
+        eprintln!(
+            "[tess] shell weld: {} verts {} tris {}us",
+            mesh.vertices.len() - weld_start_vertices,
+            mesh.triangles.len() - weld_start_triangles,
+            t0.elapsed().as_micros()
         );
     }
 }
