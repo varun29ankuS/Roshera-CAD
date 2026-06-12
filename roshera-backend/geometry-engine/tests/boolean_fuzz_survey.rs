@@ -553,6 +553,20 @@ fn print_catalog(title: &str, fails: &[Failure], n_cfg: usize, n_checks: usize) 
     println!("------ soft (verify in isolation; over-report) ------");
     for (kind, n) in by_kind.iter().filter(|(k, _)| is_soft(k)) {
         println!("--- {kind} ({n}) ---");
+        // HANG and SLOW identities ARE the work queue (#91 true-hang
+        // investigation, L4 profiling targets) — print them; EULER stays
+        // count-only (seam baseline noise).
+        if *kind == "HANG" || *kind == "SLOW" {
+            let mut lines: Vec<String> = fails
+                .iter()
+                .filter(|f| &f.kind == kind)
+                .map(|f| format!("  [{}] {} : {}", f.op, f.label, f.detail))
+                .collect();
+            lines.sort();
+            for l in lines {
+                println!("{l}");
+            }
+        }
     }
     println!("======================================================\n");
 }
