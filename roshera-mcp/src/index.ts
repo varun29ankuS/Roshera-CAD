@@ -40,7 +40,13 @@ async function api(
 ): Promise<any> {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    headers: {
+      // Timeline attribution: the backend's agent_author_layer records
+      // every kernel op from this request as Author::AIAgent("Claude"),
+      // so agent-built features show amber Ⓒ in the Timeline strip.
+      "X-Roshera-Agent": "Claude",
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+    },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();

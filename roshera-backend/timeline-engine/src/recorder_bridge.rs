@@ -54,8 +54,31 @@ pub const RECORDER_CHANNEL_CAPACITY: usize = 16_384;
 /// stale head from before the kernel's last few ops were drained).
 #[derive(Debug)]
 enum RecorderCmd {
-    Op(RecordedOperation),
+    Op {
+        record: RecordedOperation,
+        /// Author snapshotted at `record()` time (task-local override or
+        /// the recorder's default). Carried with the op rather than read
+        /// by the worker so attribution is exact even when ops from
+        /// differently-authored request tasks interleave in the channel.
+        author: Author,
+    },
     Flush(oneshot::Sender<()>),
+}
+
+tokio::task_local! {
+    /// Per-task author override consulted by [`TimelineRecorder::record`].
+    ///
+    /// The recorder is a single process-wide instance attached to the
+    /// `BRepModel`, constructed with one default author (`System`). But
+    /// the *actual* author of a kernel op is whoever issued the HTTP
+    /// request that triggered it — a human in the viewport or an AI
+    /// agent driving the REST API. The api-server wraps agent-tagged
+    /// requests in `AUTHOR_OVERRIDE.scope(Author::AIAgent { .. }, handler)`;
+    /// every kernel op recorded synchronously inside that task then
+    /// carries the agent's identity. Task-locals are per-task, so
+    /// concurrent requests with different authors cannot mislabel each
+    /// other — this is why the override is NOT a field on the recorder.
+    pub static AUTHOR_OVERRIDE: Author;
 }
 
 /// Shared, lock-protected handle to a [`Timeline`].
@@ -129,9 +152,12 @@ struct StagingState {
     /// `with_rollback`). Only when depth returns to zero do we
     /// flush or discard the buffer.
     depth: u32,
-    /// Events recorded while `depth > 0`. Drained to the MPSC on
-    /// commit; cleared on abort.
-    buffer: Vec<RecordedOperation>,
+    /// Events recorded while `depth > 0`, each paired with the author
+    /// snapshotted at `record()` time (the commit drain may run on a
+    /// different task than the records, so resolving the author at
+    /// drain time would lose the per-request override). Drained to the
+    /// MPSC on commit; cleared on abort.
+    buffer: Vec<(RecordedOperation, Author)>,
 }
 
 impl TimelineRecorder {
@@ -166,22 +192,19 @@ impl TimelineRecorder {
         let (tx, mut rx) = mpsc::channel::<RecorderCmd>(capacity);
         let branch_id = Arc::new(PlRwLock::new(branch_id));
 
-        let worker_author = author.clone();
         let worker_branch = Arc::clone(&branch_id);
         let worker_timeline = timeline;
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    RecorderCmd::Op(record) => {
+                    RecorderCmd::Op { record, author } => {
                         let op = to_timeline_operation(&record);
                         // Snapshot the active branch *per event* so a swap via
                         // `set_branch_id` takes effect on the next op without
                         // restarting the worker.
                         let target = *worker_branch.read();
                         let guard = worker_timeline.read().await;
-                        if let Err(err) =
-                            guard.add_operation(op, worker_author.clone(), target).await
-                        {
+                        if let Err(err) = guard.add_operation(op, author, target).await {
                             tracing::warn!(
                                 target: "timeline.recorder_bridge",
                                 kind = %record.kind,
@@ -219,9 +242,16 @@ impl TimelineRecorder {
     /// Push a record into the MPSC channel without consulting the
     /// staging buffer. Shared between the immediate-record path and
     /// the `commit_pending` drain path.
-    fn try_send_op(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+    fn try_send_op(
+        &self,
+        operation: RecordedOperation,
+        author: Author,
+    ) -> Result<(), RecorderError> {
         self.tx
-            .try_send(RecorderCmd::Op(operation))
+            .try_send(RecorderCmd::Op {
+                record: operation,
+                author,
+            })
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => RecorderError::Unavailable(format!(
                     "TimelineRecorder channel saturated (capacity={}); worker may be stalled",
@@ -289,6 +319,15 @@ impl TimelineRecorder {
 
 impl OperationRecorder for TimelineRecorder {
     fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+        // Resolve the author NOW, on the recording task: the task-local
+        // override (set by the api-server for agent-tagged requests)
+        // wins; otherwise fall back to the recorder's default. `record`
+        // is called synchronously inside the request's task, so the
+        // scope is guaranteed live here even though the op is applied
+        // later on the worker.
+        let author = AUTHOR_OVERRIDE
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| self.author.clone());
         // Inside a staging window, divert into the buffer. This is the
         // H10 bridge contract: a `with_rollback` body that fails must
         // not leave partial events on the timeline. Lock scope kept
@@ -297,7 +336,7 @@ impl OperationRecorder for TimelineRecorder {
         {
             let mut state = self.staging.write();
             if state.depth > 0 {
-                state.buffer.push(operation);
+                state.buffer.push((operation, author));
                 return Ok(());
             }
         }
@@ -308,7 +347,7 @@ impl OperationRecorder for TimelineRecorder {
         // behind) and `Closed` if the worker has exited. Both surface
         // as `Unavailable` so the kernel's `record_operation` helper
         // logs loudly and continues; silent event loss is forbidden.
-        self.try_send_op(operation)
+        self.try_send_op(operation, author)
     }
 
     fn begin_pending(&self) {
@@ -340,8 +379,8 @@ impl OperationRecorder for TimelineRecorder {
                 Vec::new()
             }
         };
-        for op in drained {
-            if let Err(err) = self.try_send_op(op) {
+        for (op, author) in drained {
+            if let Err(err) = self.try_send_op(op, author) {
                 tracing::warn!(
                     target: "timeline.recorder_bridge",
                     error = %err,

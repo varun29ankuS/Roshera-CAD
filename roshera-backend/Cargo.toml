@@ -41,6 +41,21 @@ opt-level = 3
 [profile.bench]
 debug = true
 
+# Live-server profile: `cargo run -p api-server --profile demo`.
+#
+# The interactive dev servers were running the plain dev profile, and the
+# unoptimized float-heavy tessellator dominated every interactive op
+# (measured 2026-06-12: a 64-segment circle extrude spent 1110 ms of its
+# 1131 ms server total inside `tessellate_solid` — the kernel extrude
+# itself was ~20 ms). `demo` keeps dev's fast incremental semantics but
+# optimizes codegen, recovering most of the release-profile speedup
+# without LTO link cost. It is OPT-IN and never used by CI (which builds
+# dev/test — see the NOTE below for why CI must stay at opt-level 0), so
+# the 2-core runner budget is untouched.
+[profile.demo]
+inherits = "dev"
+opt-level = 2
+
 # NOTE: a test/dev `opt-level` profile (dev=1/test=2/deps=3) was trialled to
 # speed the float-heavy suite — it cut the local geometry-engine lib run 8.4s →
 # 1.68s. It was REVERTED because on the 2-core GitHub runner the cold
