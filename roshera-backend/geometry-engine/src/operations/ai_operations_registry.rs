@@ -714,8 +714,10 @@ impl OperationsRegistry {
             let mut found_solid_id = None;
 
             // Search through all solids to find which one contains this edge
-            for solid_id in 0..model.solids.len() as u32 {
-                if let Some(solid) = model.solids.get(solid_id) {
+            // Ids are STABLE (holes after deletion) — iterate the store,
+            // never `0..len()` as an id range.
+            for (solid_id, solid) in model.solids.iter() {
+                {
                     // Check if this solid contains the edge
                     // Check outer shell
                     let mut shells_to_check = vec![solid.outer_shell];
@@ -813,8 +815,10 @@ impl OperationsRegistry {
             let mut found_solid_id = None;
 
             // Search through all solids to find which one contains this edge
-            for solid_id in 0..model.solids.len() as u32 {
-                if let Some(solid) = model.solids.get(solid_id) {
+            // Ids are STABLE (holes after deletion) — iterate the store,
+            // never `0..len()` as an id range.
+            for (solid_id, solid) in model.solids.iter() {
+                {
                     // Check if this solid contains the edge
                     // Check outer shell
                     let mut shells_to_check = vec![solid.outer_shell];

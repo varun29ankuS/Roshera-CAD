@@ -1519,13 +1519,24 @@ pub(crate) fn principal_axes_from_origin_moments(
 /// Solid storage with feature indexing
 #[derive(Debug)]
 pub struct SolidStore {
-    /// Solid data
-    solids: Vec<Solid>,
+    /// Solid data, keyed by STABLE id. This was a `Vec` indexed by
+    /// position while `add` stamped ids from the monotonic `next_id`
+    /// counter — the two diverge after any removal, which produced two
+    /// live-session bugs at once (2026-06-12): every delete silently
+    /// RENUMBERED all higher solids (agent references broke), and after
+    /// deleting the last solid the counter exceeded the Vec length so
+    /// each freshly-created solid was unreachable by its own id
+    /// ("Solid not found" from validate_extruded_solid — the clear-all
+    /// wedge, task #26). Keyed storage makes ids stable for the life of
+    /// the model: deletes leave holes, lookups never shift. Ordered map
+    /// so iteration stays deterministic (the determinism gates rely on
+    /// stable iteration order).
+    solids: std::collections::BTreeMap<SolidId, Solid>,
     /// Name to solid mapping
     name_map: HashMap<String, SolidId>,
     /// Shell to solids mapping
     shell_to_solids: HashMap<ShellId, Vec<SolidId>>,
-    /// Next available ID
+    /// Next available ID (monotonic; never reused within a model)
     next_id: SolidId,
     /// Statistics
     pub stats: SolidStoreStats,
@@ -1544,9 +1555,9 @@ impl SolidStore {
         Self::with_capacity(0)
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(_capacity: usize) -> Self {
         Self {
-            solids: Vec::with_capacity(capacity),
+            solids: std::collections::BTreeMap::new(),
             name_map: HashMap::new(),
             shell_to_solids: HashMap::new(),
             next_id: 0,
@@ -1560,7 +1571,11 @@ impl SolidStore {
     /// the note on `Solid::deep_copy`.
     pub(crate) fn deep_copy(&self) -> Self {
         Self {
-            solids: self.solids.iter().map(Solid::deep_copy).collect(),
+            solids: self
+                .solids
+                .iter()
+                .map(|(&id, s)| (id, Solid::deep_copy(s)))
+                .collect(),
             name_map: self.name_map.clone(),
             shell_to_solids: self.shell_to_solids.clone(),
             next_id: self.next_id,
@@ -1576,11 +1591,12 @@ impl SolidStore {
         // FAST PATH: Skip expensive DashMap operations
         // The shell_to_solids and name_map DashMap operations are too expensive for primitive creation
 
-        self.solids.push(solid);
+        let id = self.next_id;
+        self.solids.insert(id, solid);
         self.next_id += 1;
         self.stats.total_created += 1;
 
-        self.next_id - 1
+        id
     }
 
     /// Add solid with full indexing (use when queries are needed)
@@ -1599,51 +1615,44 @@ impl SolidStore {
                 .push(solid.id);
         }
 
-        self.solids.push(solid);
+        let id = self.next_id;
+        self.solids.insert(id, solid);
         self.next_id += 1;
         self.stats.total_created += 1;
 
-        self.next_id - 1
+        id
     }
 
     #[inline(always)]
     pub fn get(&self, id: SolidId) -> Option<&Solid> {
-        self.solids.get(id as usize)
+        self.solids.get(&id)
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, id: SolidId) -> Option<&mut Solid> {
-        self.solids.get_mut(id as usize)
+        self.solids.get_mut(&id)
     }
 
-    /// Remove a solid from the store
+    /// Remove a solid from the store.
+    ///
+    /// Ids are STABLE: removal leaves a hole, surviving solids keep
+    /// their ids forever. (The previous positional implementation
+    /// renumbered every higher solid on each delete and desynced from
+    /// the monotonic id counter — the 2026-06-12 clear-all wedge.)
     pub fn remove(&mut self, id: SolidId) -> Option<Solid> {
-        // Check bounds first
-        if (id as usize) >= self.solids.len() {
-            return None;
-        }
-
-        // Get solid data before removal to avoid borrowing issues
-        let solid_name = self.solids[id as usize].name.clone();
-        let outer_shell = self.solids[id as usize].outer_shell;
+        let solid = self.solids.remove(&id)?;
 
         // Remove from name mapping
-        if let Some(name) = &solid_name {
+        if let Some(name) = &solid.name {
             self.name_map.remove(name);
         }
 
         // Remove from shell mapping
-        self.shell_to_solids.entry(outer_shell).and_modify(|v| {
-            v.retain(|&x| x != id);
-        });
-
-        // Remove the actual solid
-        let solid = self.solids.remove(id as usize);
-
-        // Update IDs of remaining solids
-        for (i, solid) in self.solids.iter_mut().enumerate().skip(id as usize) {
-            solid.id = i as SolidId;
-        }
+        self.shell_to_solids
+            .entry(solid.outer_shell)
+            .and_modify(|v| {
+                v.retain(|&x| x != id);
+            });
 
         Some(solid)
     }
@@ -1671,13 +1680,12 @@ impl SolidStore {
         self.solids.is_empty()
     }
 
-    /// Iterate over all solids
+    /// Iterate over all solids in stable-id order.
     pub fn iter(&self) -> impl Iterator<Item = (SolidId, &Solid)> + '_ {
         self.solids
             .iter()
-            .enumerate()
             .filter(|(_, s)| s.id != INVALID_SOLID_ID)
-            .map(|(idx, s)| (idx as SolidId, s))
+            .map(|(&id, s)| (id, s))
     }
 }
 
