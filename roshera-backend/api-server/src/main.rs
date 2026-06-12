@@ -5869,6 +5869,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::part_oriented_bbox),
         )
         .route(
+            "/api/agent/parts/{id}/render",
+            get(handlers::agent::render_part),
+        )
+        .route(
             "/api/agent/parts/{id}/reanchor",
             post(handlers::agent::reanchor_part),
         )
