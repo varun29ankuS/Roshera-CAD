@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "roshera": {
+      "command": "node",
+      "args": ["roshera-mcp/dist/index.js"],
+      "env": {
+        "ROSHERA_URL": "http://localhost:8081"
+      }
+    }
+  }
+}
