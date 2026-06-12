@@ -249,3 +249,84 @@ fn list_parts_grows_as_solids_are_added() {
     shift_x(&mut model, b, 10.0);
     assert_eq!(model.list_parts().len(), 2);
 }
+
+// =====================================================================
+// query_face principal curvatures: exact analytic values per surface
+// class — flat [0,0], sphere r → [±1/r, ±1/r], cylinder r → [±1/r, 0].
+// =====================================================================
+
+#[test]
+fn face_principal_curvatures_match_analytic() {
+    let mut model = BRepModel::new();
+    let bx = make_box(&mut model, 2.0, 2.0, 2.0);
+    let sph = {
+        let mut b = TopologyBuilder::new(&mut model);
+        match b
+            .create_sphere_3d(Point3::new(10.0, 0.0, 0.0), 1.0)
+            .expect("sphere")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {other:?}"),
+        }
+    };
+    let cyl = {
+        let mut b = TopologyBuilder::new(&mut model);
+        match b
+            .create_cylinder_3d(Point3::new(20.0, 0.0, 0.0), Vector3::Z, 0.5, 2.0)
+            .expect("cylinder")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {other:?}"),
+        }
+    };
+
+    let faces_of = |model: &BRepModel, id: SolidId| -> Vec<u32> {
+        let solid = model.solids.get(id).expect("solid");
+        model
+            .shells
+            .get(solid.outer_shell)
+            .expect("shell")
+            .faces
+            .clone()
+    };
+
+    // Every box face is flat: [0, 0].
+    for fid in faces_of(&model, bx) {
+        let r = model.query_face(fid).expect("box face report");
+        let [k1, k2] = r.principal_curvatures.expect("box face curvatures");
+        assert!(
+            k1.abs() < 1e-9 && k2.abs() < 1e-9,
+            "box face {fid}: expected flat, got [{k1}, {k2}]"
+        );
+    }
+
+    // Sphere r=1: |k1| = |k2| = 1, equal signs (umbilic).
+    for fid in faces_of(&model, sph) {
+        let r = model.query_face(fid).expect("sphere face report");
+        let [k1, k2] = r.principal_curvatures.expect("sphere face curvatures");
+        assert!(
+            rel_close(k1.abs(), 1.0, 1e-6) && rel_close(k2.abs(), 1.0, 1e-6),
+            "sphere face {fid}: expected |k|=1 umbilic, got [{k1}, {k2}]"
+        );
+    }
+
+    // Cylinder r=0.5: lateral face [±2, 0]; caps are flat [0, 0].
+    let mut saw_lateral = false;
+    for fid in faces_of(&model, cyl) {
+        let r = model.query_face(fid).expect("cyl face report");
+        let [k1, k2] = r.principal_curvatures.expect("cyl face curvatures");
+        if r.surface_type == "cylinder" {
+            saw_lateral = true;
+            assert!(
+                rel_close(k1.abs(), 2.0, 1e-6) && k2.abs() < 1e-9,
+                "cyl lateral {fid}: expected [±2, 0], got [{k1}, {k2}]"
+            );
+        } else {
+            assert!(
+                k1.abs() < 1e-9 && k2.abs() < 1e-9,
+                "cyl cap {fid}: expected flat, got [{k1}, {k2}]"
+            );
+        }
+    }
+    assert!(saw_lateral, "no cylindrical lateral face found");
+}

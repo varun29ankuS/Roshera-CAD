@@ -585,6 +585,30 @@ impl BRepModel {
             }
         });
 
+        // Principal curvatures at the face's parametric midpoint —
+        // the cheapest faithful "how curved is this face" signal
+        // (exact for analytic surfaces, since the kernel's
+        // `evaluate_full` computes k1/k2 from the fundamental forms).
+        // Ordered |k1| ≥ |k2| so agents can pattern-match
+        // flat / single-curved / double-curved without caring which
+        // parametric direction carries the curvature.
+        let principal_curvatures = {
+            let [u_min, u_max, v_min, v_max] = face_clone.uv_bounds;
+            self.surfaces
+                .get(face_clone.surface_id)
+                .and_then(|s| {
+                    s.evaluate_full((u_min + u_max) * 0.5, (v_min + v_max) * 0.5)
+                        .ok()
+                })
+                .map(|sp| {
+                    if sp.k1.abs() >= sp.k2.abs() {
+                        [sp.k1, sp.k2]
+                    } else {
+                        [sp.k2, sp.k1]
+                    }
+                })
+        };
+
         // Compute area. `Face::area` requires &mut. Tolerance taken
         // from the face's own value.
         let tolerance = crate::math::tolerance::Tolerance::from_distance(face_clone.tolerance);
@@ -607,6 +631,7 @@ impl BRepModel {
             area,
             edge_ids,
             neighbour_face_ids,
+            principal_curvatures,
         })
     }
 
