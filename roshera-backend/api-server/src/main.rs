@@ -6165,6 +6165,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // then idempotency intercepts mutating verbs, then the inner
     // router dispatches to the handler.
     app.with_state(state)
+        .layer(axum::middleware::from_fn(agent_author_layer))
         .layer(axum::middleware::from_fn_with_state(
             idempotency_store,
             idempotency::idempotency_layer,
@@ -6174,6 +6175,44 @@ pub(crate) fn build_router(state: AppState) -> Router {
             auth_middleware::auth_middleware,
         ))
         .layer(build_cors_layer())
+}
+
+/// Attribute kernel ops to the requesting agent on the timeline.
+///
+/// The `TimelineRecorder` attached to the `BRepModel` is a single
+/// process-wide instance whose default author is `System` — so every
+/// REST-driven kernel op used to land on the timeline as an anonymous
+/// system event, and the Timeline strip could not show *who* built
+/// what. Requests carrying an `X-Roshera-Agent: <name>` header (sent by
+/// the MCP server and any direct agent caller) run inside a
+/// `AUTHOR_OVERRIDE` task-local scope; `TimelineRecorder::record`
+/// snapshots that author synchronously on the request task, so
+/// attribution is exact even under concurrent human + agent traffic.
+/// Header absent → zero-cost passthrough (human/UI requests keep the
+/// recorder's default author).
+async fn agent_author_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let agent = request
+        .headers()
+        .get("x-roshera-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    match agent {
+        Some(name) if !name.is_empty() => {
+            timeline_engine::recorder_bridge::AUTHOR_OVERRIDE
+                .scope(
+                    timeline_engine::Author::AIAgent {
+                        id: name.clone(),
+                        model: name,
+                    },
+                    next.run(request),
+                )
+                .await
+        }
+        _ => next.run(request).await,
+    }
 }
 
 /// Construct the outermost CORS layer.
