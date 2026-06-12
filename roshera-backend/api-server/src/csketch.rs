@@ -1028,6 +1028,578 @@ pub async fn infer_constraints_handler(
     Ok(Json(infer_constraints(&sketch, &req.draft, tol)))
 }
 
+// ── Phase-A entity routes (SKETCH-DCM campaign) ─────────────────────
+//
+// Arc / rectangle / ellipse / polyline existed in the kernel from day
+// one but had no API routes, so most real mechanical profiles (slots,
+// brackets, cams) were impossible to express parametrically. These
+// handlers follow the add_point/add_circle conventions above.
+
+/// Request body for `POST /api/csketch/{id}/arc` — centre + radius +
+/// CCW angle span (radians).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddArcRequest {
+    pub cx: f64,
+    pub cy: f64,
+    pub radius: f64,
+    pub start_angle: f64,
+    pub end_angle: f64,
+}
+
+/// Request body for `POST /api/csketch/{id}/rectangle` — two opposite
+/// corners, axis-aligned.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddRectangleRequest {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
+
+/// Request body for `POST /api/csketch/{id}/ellipse`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddEllipseRequest {
+    pub cx: f64,
+    pub cy: f64,
+    pub semi_major: f64,
+    pub semi_minor: f64,
+    #[serde(default)]
+    pub rotation: f64,
+}
+
+/// Request body for `POST /api/csketch/{id}/polyline`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddPolylineRequest {
+    pub points: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub closed: bool,
+}
+
+/// `POST /api/csketch/{id}/arc` — add an arc by centre, radius, and
+/// CCW start/end angles (radians).
+pub async fn add_arc(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddArcRequest>,
+) -> Result<Json<EntityIdResponse>, ApiError> {
+    for (label, v) in [
+        ("cx", req.cx),
+        ("cy", req.cy),
+        ("radius", req.radius),
+        ("start_angle", req.start_angle),
+        ("end_angle", req.end_angle),
+    ] {
+        if !v.is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("{label} must be finite"),
+            ));
+        }
+    }
+    if req.radius <= 0.0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("arc radius must be > 0 (got {})", req.radius),
+        ));
+    }
+    let sketch = require_sketch(&state, id)?;
+    let aid = sketch
+        .add_arc_center_angles(
+            Point2d::new(req.cx, req.cy),
+            req.radius,
+            req.start_angle,
+            req.end_angle,
+        )
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    Ok(Json(EntityIdResponse { id: aid.0 }))
+}
+
+/// `POST /api/csketch/{id}/rectangle` — add an axis-aligned rectangle
+/// by two opposite corners.
+pub async fn add_rectangle(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddRectangleRequest>,
+) -> Result<Json<EntityIdResponse>, ApiError> {
+    for (label, v) in [
+        ("x1", req.x1),
+        ("y1", req.y1),
+        ("x2", req.x2),
+        ("y2", req.y2),
+    ] {
+        if !v.is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("{label} must be finite"),
+            ));
+        }
+    }
+    let sketch = require_sketch(&state, id)?;
+    let rid = sketch
+        .add_rectangle(Point2d::new(req.x1, req.y1), Point2d::new(req.x2, req.y2))
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    Ok(Json(EntityIdResponse { id: rid.0 }))
+}
+
+/// `POST /api/csketch/{id}/ellipse` — add an ellipse by centre,
+/// semi-axes, and rotation (radians).
+pub async fn add_ellipse(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddEllipseRequest>,
+) -> Result<Json<EntityIdResponse>, ApiError> {
+    for (label, v) in [
+        ("cx", req.cx),
+        ("cy", req.cy),
+        ("semi_major", req.semi_major),
+        ("semi_minor", req.semi_minor),
+        ("rotation", req.rotation),
+    ] {
+        if !v.is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("{label} must be finite"),
+            ));
+        }
+    }
+    if req.semi_major <= 0.0 || req.semi_minor <= 0.0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "ellipse semi-axes must be > 0",
+        ));
+    }
+    let sketch = require_sketch(&state, id)?;
+    let eid = sketch
+        .add_ellipse(
+            Point2d::new(req.cx, req.cy),
+            req.semi_major,
+            req.semi_minor,
+            req.rotation,
+        )
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    Ok(Json(EntityIdResponse { id: eid.0 }))
+}
+
+/// `POST /api/csketch/{id}/polyline` — add a polyline (open or closed).
+pub async fn add_polyline(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AddPolylineRequest>,
+) -> Result<Json<EntityIdResponse>, ApiError> {
+    for (i, p) in req.points.iter().enumerate() {
+        if !p[0].is_finite() || !p[1].is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("points[{i}] must be finite"),
+            ));
+        }
+    }
+    let sketch = require_sketch(&state, id)?;
+    let vertices: Vec<Point2d> = req
+        .points
+        .iter()
+        .map(|p| Point2d::new(p[0], p[1]))
+        .collect();
+    let pid = sketch
+        .add_polyline(vertices, req.closed)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    Ok(Json(EntityIdResponse { id: pid.0 }))
+}
+
+// ── Phase-A csketch → solid bridge (SKETCH-DCM campaign) ────────────
+
+/// Request body for `POST /api/csketch/{id}/extrude`.
+///
+/// `plane` accepts the same wire shape as the click-draft sketch's
+/// plane setter ("xy" / "xz" / "yz" / custom frame); the kernel sketch
+/// is 2D so the plane decides where in the world the profile lives.
+/// Defaults to XY.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtrudeCSketchRequest {
+    pub distance: f64,
+    #[serde(default)]
+    pub direction: Option<[f64; 3]>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub plane: Option<crate::sketch::SketchPlane>,
+}
+
+/// `POST /api/csketch/{id}/extrude` — materialise the sketch's closed
+/// regions and extrude them into a solid.
+///
+/// This is the bridge that turns the parametric sketcher from a demo
+/// into a workflow: before it existed, a fully constrained, solved
+/// csketch had no path to a solid at all. The pipeline:
+///
+/// 1. `SketchTopology::analyze` — entity soup → vertices/edges/loops/
+///    regions, with gap / T-junction / self-intersection diagnosis.
+/// 2. `ProfileExtractor::extract_for_extrusion` — outer loop + holes
+///    per region. Invalid topology returns 422 with the issue list AND
+///    the open endpoints, so an agent can fix its sketch surgically.
+/// 3. Each loop is sampled to a plane-local polygon (lines pass
+///    through; arcs/circles/splines/ellipses are chord-sampled at the
+///    click-draft circle resolution). Phase D of the SKETCH-DCM
+///    campaign replaces this sampling with analytic Arc/NURBS edges so
+///    extruded bores become true cylindrical faces.
+/// 4. The same face-construction + `extrude_face` + Union pipeline the
+///    click-draft extrude uses, then tessellate + broadcast.
+pub async fn extrude_csketch(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ExtrudeCSketchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use geometry_engine::operations::extrude::{
+        create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
+    };
+    use geometry_engine::primitives::r#loop::{Loop, LoopType};
+    use geometry_engine::sketch2d::sketch_topology::{ProfileExtractor, SketchTopology};
+    use geometry_engine::sketch2d::Tolerance2d;
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    if !req.distance.is_finite() || req.distance.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "distance must be non-zero and finite (got {})",
+                req.distance
+            ),
+        ));
+    }
+    let plane = req.plane.unwrap_or(crate::sketch::SketchPlane::XY);
+    let direction = match req.direction {
+        Some([x, y, z]) => {
+            let v = geometry_engine::math::Vector3::new(x, y, z);
+            if !v.x.is_finite() || !v.y.is_finite() || !v.z.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "direction components must all be finite",
+                ));
+            }
+            v
+        }
+        None => plane.normal(),
+    };
+
+    let sketch = require_sketch(&state, id)?;
+    let tol2d = Tolerance2d::default();
+    let topology = SketchTopology::analyze(&sketch, &tol2d)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    if !topology.is_valid_for_extrusion() {
+        // Agent-grade diagnosis: name every connectivity issue and
+        // every dangling endpoint so the caller can repair the sketch
+        // without rendering it.
+        let issues: Vec<String> = topology.issues().iter().map(|i| format!("{i:?}")).collect();
+        let open: Vec<[f64; 2]> = topology
+            .open_endpoints()
+            .iter()
+            .map(|p| [p.x, p.y])
+            .collect();
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch topology is not valid for extrusion (profiles must be closed, non-self-intersecting regions)",
+        )
+        .with_details(serde_json::json!({
+            "profile_type": format!("{:?}", topology.profile_type()),
+            "issues": issues,
+            "open_endpoints": open,
+        })));
+    }
+    let profiles = ProfileExtractor::extract_for_extrusion(&topology)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    if profiles.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch contains no closed regions to extrude",
+        ));
+    }
+
+    // Sample every region's loops into plane-local polygons up front
+    // (no kernel mutation yet — input errors must not leave orphan
+    // topology behind).
+    let mut regions_2d: Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> =
+        Vec::with_capacity(profiles.len());
+    for profile in &profiles {
+        let outer = sample_topology_loop(&sketch, &topology, &profile.outer_boundary)?;
+        let mut holes = Vec::with_capacity(profile.holes.len());
+        for hole in &profile.holes {
+            holes.push(sample_topology_loop(&sketch, &topology, hole)?);
+        }
+        regions_2d.push((outer, holes));
+    }
+
+    let result_solid_id = {
+        let mut model = model_handle.write().await;
+        let tolerance = Tolerance::default();
+        let plane_origin = plane.lift(0.0, 0.0);
+        let plane_normal = plane.normal();
+
+        let mut region_solids: Vec<u32> = Vec::with_capacity(regions_2d.len());
+        for (region_idx, (outer, holes)) in regions_2d.iter().enumerate() {
+            let outer_lifted: Vec<geometry_engine::math::Point3> =
+                outer.iter().map(|p| plane.lift(p[0], p[1])).collect();
+            let outer_edges = crate::sketch::build_loop_edges(
+                &mut model,
+                region_idx,
+                crate::sketch::SketchTool::Polyline,
+                &outer_lifted,
+                tolerance,
+            )?;
+            let face_id = create_face_from_profile_with_plane(
+                &mut model,
+                outer_edges,
+                plane_origin,
+                plane_normal,
+            )
+            .map_err(ApiError::kernel_error)?;
+
+            for hole in holes {
+                let hole_lifted: Vec<geometry_engine::math::Point3> =
+                    hole.iter().map(|p| plane.lift(p[0], p[1])).collect();
+                let hole_edges = crate::sketch::build_loop_edges(
+                    &mut model,
+                    region_idx,
+                    crate::sketch::SketchTool::Polyline,
+                    &hole_lifted,
+                    tolerance,
+                )?;
+                let mut inner_loop = Loop::new(0, LoopType::Inner);
+                for edge_id in &hole_edges {
+                    inner_loop.add_edge(*edge_id, true);
+                }
+                let inner_loop_id = model.loops.add(inner_loop);
+                let face = model.faces.get_mut(face_id).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("face {face_id} disappeared between create_face_from_profile and add_inner_loop"),
+                    )
+                })?;
+                face.add_inner_loop(inner_loop_id);
+            }
+
+            let options = ExtrudeOptions {
+                direction,
+                distance: req.distance,
+                ..ExtrudeOptions::default()
+            };
+            let region_solid_id =
+                extrude_face(&mut model, face_id, options).map_err(ApiError::kernel_error)?;
+            region_solids.push(region_solid_id);
+        }
+
+        let mut accumulator = region_solids[0];
+        for &sid in &region_solids[1..] {
+            accumulator = boolean_operation(
+                &mut model,
+                accumulator,
+                sid,
+                BooleanOp::Union,
+                BooleanOptions::default(),
+            )
+            .map_err(ApiError::kernel_error)?;
+        }
+        accumulator
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+    let display_name = req
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("CSketch {result_solid_id}"));
+
+    let parameters = serde_json::json!({
+        "csketch_id": id.to_string(),
+        "regions":    regions_2d.len(),
+        "distance":   req.distance,
+        "direction":  [direction.x, direction.y, direction.z],
+    });
+    crate::broadcast_object_created(
+        &result_id_str,
+        &display_name,
+        result_solid_id,
+        "extrude",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":    true,
+        "csketch_id": id.to_string(),
+        "solid_id":   result_solid_id,
+        "object": {
+            "id":   result_id_str,
+            "name": display_name,
+            "objectType": "extrude",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+            "regions":         regions_2d.len(),
+        }
+    })))
+}
+
+/// Materialise a topology loop into an ordered plane-local polygon.
+///
+/// Each directed edge contributes its samples start-inclusive /
+/// end-exclusive, so concatenating edges closes the polygon without
+/// duplicate joints. Curve sampling matches the click-draft circle
+/// resolution (64 segments per full turn) so welds against any
+/// adjacent click-draft geometry stay consistent.
+///
+/// Parameter conventions per `SketchTopology::analyze`: lines and
+/// splines carry `param_range` in their native parameter; arcs carry
+/// ANGLES (start_angle, end_angle); circles carry (0, 2π); polyline
+/// segments carry (vertex_index, next_index) and are straight.
+fn sample_topology_loop(
+    sketch: &Sketch,
+    topology: &geometry_engine::sketch2d::sketch_topology::SketchTopology,
+    sketch_loop: &geometry_engine::sketch2d::sketch_topology::SketchLoop,
+) -> Result<Vec<[f64; 2]>, ApiError> {
+    use geometry_engine::sketch2d::sketch_topology::EdgeType;
+
+    const SEGMENTS_PER_TURN: f64 = 64.0;
+    let edges = topology.edges();
+    let mut polygon: Vec<[f64; 2]> = Vec::new();
+
+    for (k, &edge_idx) in sketch_loop.edges.iter().enumerate() {
+        // Walk orientation from the topology loop (NOT the edge's
+        // entity-relative `forward` flag): the loop walker may traverse
+        // any edge end->start, and emitting its samples un-reversed
+        // would fold the polygon back on itself.
+        let walk_forward = sketch_loop.orientations.get(k).copied().unwrap_or(true);
+        let edge = edges.get(edge_idx).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("topology loop references missing edge {edge_idx}"),
+            )
+        })?;
+        match (&edge.edge_type, &edge.entity) {
+            (EdgeType::Line, _) | (EdgeType::PolylineSegment(_), _) => {
+                let p = if walk_forward { edge.start } else { edge.end };
+                polygon.push([p.x, p.y]);
+            }
+            (EdgeType::Arc, EntityRef::Arc(arc_id)) => {
+                let arc_entry = sketch.arcs().get(arc_id).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("loop references missing arc {arc_id}"),
+                    )
+                })?;
+                let arc = &arc_entry.value().arc;
+                let sweep = arc.sweep_angle().abs();
+                let n = ((sweep / std::f64::consts::TAU) * SEGMENTS_PER_TURN)
+                    .ceil()
+                    .max(2.0) as usize;
+                // Sample in the arc's own [0, 1] parameter, then orient
+                // to the directed edge. Emit start-inclusive,
+                // end-exclusive.
+                for j in 0..n {
+                    let frac = j as f64 / n as f64;
+                    let t = if walk_forward { frac } else { 1.0 - frac };
+                    let p = arc
+                        .point_at(t)
+                        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+                    polygon.push([p.x, p.y]);
+                }
+            }
+            (EdgeType::Circle, EntityRef::Circle(circle_id)) => {
+                let circle_entry = sketch.circles().get(circle_id).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("loop references missing circle {circle_id}"),
+                    )
+                })?;
+                let circle = &circle_entry.value().circle;
+                let n = SEGMENTS_PER_TURN as usize;
+                for j in 0..n {
+                    let angle = (j as f64 / n as f64) * std::f64::consts::TAU;
+                    let angle = if walk_forward { angle } else { -angle };
+                    let p = circle.point_at_angle(angle);
+                    polygon.push([p.x, p.y]);
+                }
+            }
+            (EdgeType::Spline, EntityRef::Spline(spline_id)) => {
+                let spline_entry = sketch.splines().get(spline_id).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("loop references missing spline {spline_id}"),
+                    )
+                })?;
+                let (t0, t1) = edge.param_range.unwrap_or((0.0, 1.0));
+                let n = 32usize;
+                for j in 0..n {
+                    let frac = j as f64 / n as f64;
+                    let frac = if walk_forward { frac } else { 1.0 - frac };
+                    let u = t0 + frac * (t1 - t0);
+                    let p =
+                        spline_entry.value().spline.evaluate(u).map_err(|e| {
+                            ApiError::new(ErrorCode::InvalidParameter, e.to_string())
+                        })?;
+                    polygon.push([p.x, p.y]);
+                }
+            }
+            (edge_type, entity) => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(
+                        "unsupported loop edge combination {edge_type:?} on {entity} — \
+                         cannot materialise this profile yet"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if polygon.len() < 3 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("materialised loop has {} points; need >= 3", polygon.len()),
+        ));
+    }
+    Ok(polygon)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Does the sketch contain the entity referenced by `entity_ref`?
