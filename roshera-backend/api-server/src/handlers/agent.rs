@@ -412,3 +412,53 @@ pub async fn render_part(
             .collect(),
     }))
 }
+
+// ───────────────────── pointer (the user's attention) ───────────────
+
+/// Wire shape for `GET /api/agent/pointer`: the user's latest viewport
+/// interaction joined with the kernel's hover report for the touched
+/// face. `hover` is `None` when the pointer event carried no face id
+/// or the face has since been consumed by an operation.
+#[derive(Debug, Serialize)]
+pub struct PointerReport {
+    pub event: crate::viewport_bridge::PointerEvent,
+    pub hover: Option<HoverReport>,
+}
+
+/// `POST /api/agent/pointer` — the viewport reports what the user is
+/// pointing at (click or hover-dwell). Fire-and-forget from the
+/// frontend; latest-wins storage (attention has no backlog).
+pub async fn set_pointer(
+    State(state): State<AppState>,
+    Json(event): Json<crate::viewport_bridge::PointerEvent>,
+) -> StatusCode {
+    *state.viewport_bridge.pointer.lock() = Some(event);
+    StatusCode::NO_CONTENT
+}
+
+/// `GET /api/agent/pointer` — what is the user pointing at right now?
+///
+/// The HUMAN→AGENT half of shared perception: an agent in conversation
+/// reads this to ground deixis ("this hole", "that face") against real
+/// topology. Joins the stored pointer event with `query_hover` so the
+/// agent gets surface type, area, and host part in one call. `404`
+/// when no pointer event has been reported yet.
+pub async fn get_pointer(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+) -> Result<Json<PointerReport>, StatusCode> {
+    let event = state
+        .viewport_bridge
+        .pointer
+        .lock()
+        .clone()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let hover = match event.face_id {
+        Some(fid) => {
+            let mut model = model_handle.write().await;
+            model.query_hover(fid)
+        }
+        None => None,
+    };
+    Ok(Json(PointerReport { event, hover }))
+}

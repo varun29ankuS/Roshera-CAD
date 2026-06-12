@@ -142,6 +142,30 @@ pub struct ViewportBridge {
     /// can hold its own clone and remove its entry on drop (including
     /// cancellation of the `dispatch` future).
     pending: Arc<DashMap<Uuid, oneshot::Sender<ResponseValue>>>,
+    /// The user's most recent pointer interaction in the viewport —
+    /// the HUMAN→AGENT half of the shared perception loop. The
+    /// frontend POSTs `/api/agent/pointer` on click/hover-dwell; agents
+    /// GET it (joined with the kernel's `HoverReport`) to know what the
+    /// user is pointing at while they speak ("this hole — bigger").
+    /// Deliberately a single latest-wins slot, not a queue: pointer
+    /// state is attention, and attention has no backlog.
+    pub pointer: parking_lot::Mutex<Option<PointerEvent>>,
+}
+
+/// One pointer interaction reported by the viewport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerEvent {
+    /// "click" | "hover".
+    pub kind: String,
+    /// Public object UUID of the part under the cursor, if resolved.
+    pub object_id: Option<String>,
+    /// Kernel face id under the cursor (from the mesh face_map raycast).
+    pub face_id: Option<u32>,
+    /// World-space hit position.
+    pub position: Option<[f64; 3]>,
+    /// Frontend timestamp, ms since epoch (client clock; ordering hint
+    /// only).
+    pub at_ms: Option<f64>,
 }
 
 impl ViewportBridge {

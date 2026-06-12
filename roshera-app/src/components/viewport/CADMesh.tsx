@@ -11,6 +11,30 @@ import type { ThreeEvent } from '@react-three/fiber'
 
 const ASM_OBJ_PREFIX = 'asm-comp:'
 
+// Shared-perception bridge (HOVER-α.3): report the user's pointer
+// interactions to the server so agents in conversation know what the
+// user is pointing at ("this hole — bigger"). Fire-and-forget; errors
+// are deliberately swallowed — a dropped pointer report must never
+// affect the UI.
+const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
+function reportPointer(
+  objectId: string,
+  faceId: number | undefined,
+  position: [number, number, number],
+) {
+  void fetch(`${API_BASE}/agent/pointer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind: 'click',
+      object_id: objectId,
+      face_id: faceId ?? null,
+      position,
+      at_ms: Date.now(),
+    }),
+  }).catch(() => {})
+}
+
 interface CADMeshProps {
   object: CADObject
   isSelected: boolean
@@ -158,6 +182,7 @@ export function CADMesh({ object, isHovered }: CADMeshProps) {
 
       if (selectionMode === 'object') {
         selectObject(object.id, e.shiftKey)
+        reportPointer(object.id, undefined, e.point.toArray() as [number, number, number])
         return
       }
 
@@ -217,6 +242,13 @@ export function CADMesh({ object, isHovered }: CADMeshProps) {
         type: subType,
         index: elementIndex,
       })
+
+      // Shared-perception bridge: tell the server (and through it, any
+      // agent in conversation) what the user just pointed at. Fire and
+      // forget — pointer state is attention, not a transaction.
+      if (subType === 'face') {
+        reportPointer(object.id, elementIndex, point)
+      }
 
       // Send pick request to backend for authoritative topology resolution.
       // Backend responds with a SubElementResult message handled by ws-bridge.

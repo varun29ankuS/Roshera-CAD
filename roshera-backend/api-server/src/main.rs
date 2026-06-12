@@ -3650,32 +3650,29 @@ async fn delete_geometry(
     // Two id forms accepted: canonical UUID (the form the WS frame
     // ships under `payload.id`) and the legacy numeric local solid id
     // (CLI / debugging path). Try UUID first; fall through to numeric.
-    let (uuid, solid_id) = if let Ok(parsed) = Uuid::parse_str(&id) {
+    let (uuid, solid_id): (Option<Uuid>, u32) = if let Ok(parsed) = Uuid::parse_str(&id) {
         let solid_id = state.get_local_id(&parsed).ok_or_else(|| {
             ApiError::new(
                 ErrorCode::SolidNotFound,
                 format!("no kernel solid registered for {parsed}"),
             )
         })?;
-        (parsed, solid_id)
+        (Some(parsed), solid_id)
     } else if let Ok(numeric) = id.parse::<u32>() {
         let model = model_handle.read().await;
         if model.solids.get(numeric).is_none() {
             return Err(ApiError::solid_not_found(numeric));
         }
         drop(model);
-        // Numeric form: derive the UUID via the reverse mapping so the
-        // broadcast frame still references the canonical id viewers know.
+        // Numeric form: derive the UUID via the reverse mapping when one
+        // exists. ORPHAN solids (no mapping — cascade residue or
+        // unregistered intermediates) are still deletable; the deletion
+        // core skips tombstone/broadcast for them. Refusing here made
+        // orphans permanently undeletable through the API.
         let uuid = state
             .local_to_uuid
             .get(&numeric)
-            .map(|entry| *entry.value())
-            .ok_or_else(|| {
-                ApiError::new(
-                    ErrorCode::SolidNotFound,
-                    format!("solid {numeric} has no UUID mapping; cannot broadcast"),
-                )
-            })?;
+            .map(|entry| *entry.value());
         (uuid, numeric)
     } else {
         return Err(ApiError::new(
@@ -3698,6 +3695,37 @@ async fn delete_geometry(
     // tombstone and resurrects `uuid` against the restored kernel
     // solid — without it the resurrected solid would appear under a
     // fresh v4 UUID, losing selection / outliner / AI references.
+    delete_solid_core(&state, &model_handle, uuid, solid_id).await;
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "id":       uuid.map(|u| u.to_string()),
+        "solid_id": solid_id,
+    })))
+}
+
+/// The canonical solid-deletion sequence, shared by `DELETE
+/// /api/geometry/{id}`, its `/api/agent/parts/{id}` alias, and the
+/// clear-all endpoint: kernel cascade delete → timeline record →
+/// tombstone the (solid, uuid) binding against the recorded event (so
+/// Ctrl-Z resurrects the original UUID) → unregister the id mapping →
+/// broadcast `ObjectDeleted`.
+///
+/// `uuid` is `None` for ORPHAN solids — kernel solids with no public
+/// UUID mapping (delete-cascade residue, unregistered intermediates).
+/// Orphans are still deleted and timeline-recorded; the tombstone,
+/// mapping removal, and broadcast are skipped because there is no
+/// public identity to tombstone or announce. Refusing to delete them
+/// (the previous behaviour of the numeric path) made them permanently
+/// undeletable through the API.
+async fn delete_solid_core(
+    state: &AppState,
+    model_handle: &Arc<
+        tokio::sync::RwLock<geometry_engine::primitives::topology_builder::BRepModel>,
+    >,
+    uuid: Option<Uuid>,
+    solid_id: u32,
+) {
     {
         let mut model = model_handle.write().await;
         if let Err(e) = geometry_engine::operations::delete::delete_solid(
@@ -3712,7 +3740,7 @@ async fn delete_geometry(
         model.record_operation(
             geometry_engine::operations::recorder::RecordedOperation::new("delete_solid")
                 .with_parameters(serde_json::json!({
-                    "uuid":     uuid.to_string(),
+                    "uuid":     uuid.map(|u| u.to_string()),
                     "solid_id": solid_id,
                     "cascade":  true,
                 }))
@@ -3720,24 +3748,58 @@ async fn delete_geometry(
         );
     }
 
-    if let Some(event_id) = handlers::timeline::latest_event_id_on_active_branch(&state).await {
-        state.tombstone_consumed_uuids(event_id, [(solid_id, uuid)]);
+    if let Some(uuid) = uuid {
+        if let Some(event_id) = handlers::timeline::latest_event_id_on_active_branch(&state).await {
+            state.tombstone_consumed_uuids(event_id, [(solid_id, uuid)]);
+        }
+
+        state.unregister_id_mapping(&uuid);
+
+        broadcast_object_deleted(&uuid.to_string());
     }
-
-    state.unregister_id_mapping(&uuid);
-
-    broadcast_object_deleted(&uuid.to_string());
 
     tracing::info!(
         solid_id = solid_id,
-        uuid = %uuid,
-        "DELETE /api/geometry/:id — kernel solid deleted, recorded, ObjectDeleted broadcast"
+        uuid = ?uuid,
+        "solid deleted and recorded (broadcast skipped for orphans)"
     );
+}
+
+/// `DELETE /api/agent/parts` — clear the model: delete every part
+/// through the canonical deletion sequence (timeline-recorded,
+/// tombstoned, broadcast — NOT a silent wipe). The agent's "clean the
+/// viewport" verb as one call.
+async fn clear_all_geometry(
+    Extension(auth_info): Extension<auth_middleware::AuthInfo>,
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    auth_middleware::enforce_permission(
+        &auth_info,
+        Permission::DeleteGeometry,
+        "clear_all_geometry",
+    )?;
+
+    // Sweep the KERNEL store, not the uuid mapping — orphan solids
+    // (no public uuid) must be cleared too, or "clear" leaves invisible
+    // residue an agent can list but never remove.
+    let solid_ids: Vec<u32> = {
+        let model = model_handle.read().await;
+        model.solids.iter().map(|(id, _)| id).collect()
+    };
+    let mut deleted = 0usize;
+    for solid_id in solid_ids {
+        let uuid = state
+            .local_to_uuid
+            .get(&solid_id)
+            .map(|entry| *entry.value());
+        delete_solid_core(&state, &model_handle, uuid, solid_id).await;
+        deleted += 1;
+    }
 
     Ok(Json(serde_json::json!({
-        "success":  true,
-        "id":       uuid.to_string(),
-        "solid_id": solid_id,
+        "success": true,
+        "deleted": deleted,
     })))
 }
 
@@ -5854,8 +5916,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // `/edges/{id}`) and the mutating reanchor take `model.write()`
         // because the kernel populates per-entity caches on first call
         // (volume integral, face area, edge length).
-        .route("/api/agent/parts", get(handlers::agent::list_parts))
-        .route("/api/agent/parts/{id}", get(handlers::agent::query_part))
+        .route(
+            "/api/agent/parts",
+            get(handlers::agent::list_parts).delete(clear_all_geometry),
+        )
+        .route(
+            "/api/agent/parts/{id}",
+            get(handlers::agent::query_part).delete(delete_geometry),
+        )
         .route(
             "/api/agent/parts/{id}/mass",
             get(handlers::agent::part_mass_properties),
@@ -5871,6 +5939,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/{id}/render",
             get(handlers::agent::render_part),
+        )
+        .route(
+            "/api/agent/pointer",
+            get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),
         )
         .route(
             "/api/agent/parts/{id}/reanchor",
