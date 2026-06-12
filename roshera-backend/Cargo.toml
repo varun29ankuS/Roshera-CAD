@@ -55,6 +55,27 @@ debug = true
 [profile.demo]
 inherits = "dev"
 opt-level = 2
+# Line-tables-only debug info: dev's full PDBs dominated demo link time
+# and contributed to LNK1318 pressure; backtraces stay readable.
+debug = 1
+
+# The interactive hot path lives entirely in geometry-engine (and the
+# deps it leans on, which keep the profile's opt-level 2 above). The
+# crates below are orchestration glue — handlers, event plumbing,
+# providers, exporters — whose codegen time at opt2 dominated every
+# server rebuild (~8-12 min per kernel change at 2 jobs) for zero
+# measurable runtime benefit. opt0 here cut the rebuild roughly in
+# half while keeping kernel ops at full speed.
+[profile.demo.package.api-server]
+opt-level = 0
+[profile.demo.package.timeline-engine]
+opt-level = 0
+[profile.demo.package.session-manager]
+opt-level = 0
+[profile.demo.package.ai-integration]
+opt-level = 0
+[profile.demo.package.export-engine]
+opt-level = 0
 
 # NOTE: a test/dev `opt-level` profile (dev=1/test=2/deps=3) was trialled to
 # speed the float-heavy suite — it cut the local geometry-engine lib run 8.4s →
