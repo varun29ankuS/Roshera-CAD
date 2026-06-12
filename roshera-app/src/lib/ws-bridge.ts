@@ -3,7 +3,7 @@
  * Connects on mount, routes incoming ServerMessages to the appropriate stores,
  * and converts backend CADObject format to the scene store format.
  */
-import { wsClient } from './ws-client'
+import { wsClient, setResyncHook } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
@@ -362,6 +362,36 @@ function hydrateSketchesOnce() {
     })
 }
 
+// ─── Reconnect resync ───────────────────────────────────────────────
+
+/// Full scene refetch after a WS RE-connect. The server may be a brand
+/// new process (dev rebuild/restart), in which case every object the
+/// client holds is stale — wrong UUIDs, ghost geometry, deletes that
+/// silently no-op. Replace the scene wholesale from
+/// `GET /api/scene/snapshot` (same payload shape as `ObjectCreated`,
+/// so `convertCADObject` is reused verbatim). Sketch hydration is also
+/// reset so the model tree refills against the new server.
+const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
+async function resyncSceneFromServer(): Promise<void> {
+  try {
+    const res = await fetch(`${API_BASE}/scene/snapshot`)
+    if (!res.ok) return
+    const snap = (await res.json()) as { objects?: ProtocolCADObject[] }
+    const scene = useSceneStore.getState()
+    scene.clearScene()
+    for (const proto of snap.objects ?? []) {
+      scene.addObject(convertCADObject(proto))
+    }
+    sketchesHydrated = false
+    hydrateSketchesOnce()
+    console.info(
+      `[ws-bridge] scene resynced after reconnect: ${snap.objects?.length ?? 0} object(s)`,
+    )
+  } catch (err) {
+    console.warn('[ws-bridge] scene resync failed:', err)
+  }
+}
+
 // ─── Lifecycle ──────────────────────────────────────────────────────
 
 let initialized = false
@@ -372,6 +402,7 @@ export function initWebSocket() {
 
   initialized = true
   unsubscribe = wsClient.onMessage(handleServerMessage)
+  setResyncHook(() => void resyncSceneFromServer())
   wsClient.connect()
 
   // The backend emits `Welcome` on connect carrying the per-connection
