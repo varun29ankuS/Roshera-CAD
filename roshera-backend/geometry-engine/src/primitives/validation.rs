@@ -374,8 +374,11 @@ impl ParallelValidator {
     ) -> TopologyValidationResults {
         use rayon::prelude::*;
 
-        // Validate solids in parallel
-        let solid_results: Vec<_> = (0..model.solids.len() as u32)
+        // Validate solids in parallel. Ids are STABLE (holes after
+        // deletion) — collect the real id set first; `0..len()` is not
+        // the id range.
+        let solid_ids: Vec<u32> = model.solids.iter().map(|(id, _)| id).collect();
+        let solid_results: Vec<_> = solid_ids
             .into_par_iter()
             .filter_map(|id| {
                 model.solids.get(id).map(|solid| {

@@ -269,22 +269,20 @@ fn create_top_face_shared(
 
 /// Find the solid that contains the given face
 fn find_parent_solid(model: &BRepModel, face_id: FaceId) -> Option<SolidId> {
-    // Iterate through all solids by index
-    for solid_id in 0..model.solids.len() {
-        let solid_id = solid_id as SolidId;
-        if let Some(solid) = model.solids.get(solid_id) {
-            // Check outer shell
-            if let Some(shell) = model.shells.get(solid.outer_shell) {
+    // Iterate the store directly — solid ids are STABLE (holes after
+    // deletion), so `0..len()` is NOT the id range.
+    for (solid_id, solid) in model.solids.iter() {
+        // Check outer shell
+        if let Some(shell) = model.shells.get(solid.outer_shell) {
+            if shell.faces.contains(&face_id) {
+                return Some(solid_id);
+            }
+        }
+        // Also check inner shells (for solids with holes)
+        for &inner_shell_id in &solid.inner_shells {
+            if let Some(shell) = model.shells.get(inner_shell_id) {
                 if shell.faces.contains(&face_id) {
                     return Some(solid_id);
-                }
-            }
-            // Also check inner shells (for solids with holes)
-            for &inner_shell_id in &solid.inner_shells {
-                if let Some(shell) = model.shells.get(inner_shell_id) {
-                    if shell.faces.contains(&face_id) {
-                        return Some(solid_id);
-                    }
                 }
             }
         }
