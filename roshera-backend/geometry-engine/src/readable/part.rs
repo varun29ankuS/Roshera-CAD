@@ -203,6 +203,15 @@ pub struct FaceReport {
     /// kernel-internal hash-map order — agents should treat this as a
     /// set, not a sequence.
     pub neighbour_face_ids: Vec<u32>,
+    /// Principal curvatures `[k1, k2]` with `|k1| ≥ |k2|`, in
+    /// 1/length units, evaluated at the face's parametric midpoint.
+    /// Lets an agent distinguish "flat" (`[0, 0]`), "single-curved /
+    /// hole wall" (cylinder of radius r → `[±1/r, 0]`), and
+    /// "double-curved" (sphere of radius r → `[±1/r, ±1/r]`) without a
+    /// second round-trip. Sign follows the surface normal (positive =
+    /// curving toward it). `None` when surface evaluation fails at the
+    /// midpoint (degenerate parameterization).
+    pub principal_curvatures: Option<[f64; 2]>,
 }
 
 /// Agent-facing "what is the cursor pointing at" record for
