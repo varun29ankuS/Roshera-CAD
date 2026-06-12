@@ -67,6 +67,14 @@ pub enum RenderMode {
     /// Flat distinct color per `FaceId` + legend. No shading, so the
     /// color → face mapping survives image resampling exactly.
     FaceIds,
+    /// Depth map: nearer geometry darker (40), farthest lighter (220),
+    /// background white (255). The z-buffer emitted as an image — the
+    /// "binocular" channel without the inference: we own the world, so
+    /// depth is read off, not reconstructed from disparity.
+    Depth,
+    /// Per-triangle world-space normal encoded as RGB ((n+1)/2 · 255).
+    /// Surface-orientation channel of the G-buffer.
+    Normals,
 }
 
 /// Render request.
@@ -239,7 +247,7 @@ pub fn render_solid(
             .enumerate()
             .map(|(n, &fid)| (fid, face_color(n)))
             .collect(),
-        RenderMode::Shaded => Vec::new(),
+        RenderMode::Shaded | RenderMode::Depth | RenderMode::Normals => Vec::new(),
     };
     let color_of_face = |fid: u32| -> [u8; 3] {
         match face_legend.binary_search_by_key(&fid, |&(f, _)| f) {
@@ -263,28 +271,39 @@ pub fn render_solid(
             continue;
         }
 
+        // World-space triangle normal (unit, or zero for degenerate) —
+        // used by Shaded (lambert) and Normals (RGB encoding) modes.
+        let tri_normal = {
+            let p0 = &mesh.vertices[tri[0] as usize].position;
+            let p1 = &mesh.vertices[tri[1] as usize].position;
+            let p2 = &mesh.vertices[tri[2] as usize].position;
+            let e1 = Vector3::new(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+            let e2 = Vector3::new(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
+            let n = e1.cross(&e2);
+            let mag = n.magnitude();
+            if mag > 1e-15 {
+                Vector3::new(n.x / mag, n.y / mag, n.z / mag)
+            } else {
+                Vector3::new(0.0, 0.0, 0.0)
+            }
+        };
         let shade_color = match opts.mode {
             RenderMode::FaceIds => {
                 color_of_face(mesh.face_map.get(ti).copied().unwrap_or(u32::MAX))
             }
             RenderMode::Shaded => {
-                // World-space triangle normal vs the headlight (= view
-                // direction): orientation-independent via abs().
-                let p0 = &mesh.vertices[tri[0] as usize].position;
-                let p1 = &mesh.vertices[tri[1] as usize].position;
-                let p2 = &mesh.vertices[tri[2] as usize].position;
-                let e1 = Vector3::new(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
-                let e2 = Vector3::new(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
-                let n = e1.cross(&e2);
-                let mag = n.magnitude();
-                let lambert = if mag > 1e-15 {
-                    (n.dot(&dir) / mag).abs()
-                } else {
-                    0.0
-                };
-                let g = (60.0 + 175.0 * lambert) as u8;
+                // Headlight lambert, orientation-independent via abs().
+                let g = (60.0 + 175.0 * tri_normal.dot(&dir).abs()) as u8;
                 [g, g, g]
             }
+            RenderMode::Normals => [
+                ((tri_normal.x + 1.0) * 127.5) as u8,
+                ((tri_normal.y + 1.0) * 127.5) as u8,
+                ((tri_normal.z + 1.0) * 127.5) as u8,
+            ],
+            // Depth pixels are filled by the post-pass from the z-buffer;
+            // the raster pass only needs to win the depth test.
+            RenderMode::Depth => [0, 0, 0],
         };
 
         // Raster the triangle over its pixel bbox with edge functions.
@@ -315,6 +334,30 @@ pub fn render_solid(
                     pixels[p + 1] = shade_color[1];
                     pixels[p + 2] = shade_color[2];
                 }
+            }
+        }
+    }
+
+    // Depth post-pass: emit the z-buffer as grayscale. Nearer = darker
+    // (40), farthest geometry = lighter (220), background = white (255).
+    // Normalized over the FINITE depth range so the channel always uses
+    // its full contrast regardless of scene scale.
+    if opts.mode == RenderMode::Depth {
+        let (mut z_min, mut z_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &z in &zbuf {
+            if z.is_finite() {
+                z_min = z_min.min(z);
+                z_max = z_max.max(z);
+            }
+        }
+        let span = (z_max - z_min).max(1e-12);
+        for (idx, &z) in zbuf.iter().enumerate() {
+            let p = idx * 3;
+            if z.is_finite() {
+                let g = (40.0 + 180.0 * (z - z_min) / span) as u8;
+                pixels[p] = g;
+                pixels[p + 1] = g;
+                pixels[p + 2] = g;
             }
         }
     }

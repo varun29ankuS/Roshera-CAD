@@ -113,6 +113,70 @@ fn face_id_render_labels_topology() {
 
 #[test]
 #[allow(clippy::expect_used)]
+fn depth_and_normal_channels_are_sane() {
+    let mut model = BRepModel::new();
+    let id = union_box_cylinder(&mut model);
+
+    // Depth: grayscale, foreground within the documented 40..=220 band,
+    // and an iso view of a 3D solid must show depth VARIATION.
+    let depth = render_solid(
+        &model,
+        id,
+        &RenderOptions {
+            view: CanonicalView::Isometric,
+            mode: RenderMode::Depth,
+            ..Default::default()
+        },
+    )
+    .expect("depth render");
+    let mut depth_values = std::collections::BTreeSet::new();
+    for px in depth.pixels.chunks_exact(3) {
+        if px != [255, 255, 255] {
+            assert!(
+                px[0] == px[1] && px[1] == px[2],
+                "depth pixel not grayscale: {px:?}"
+            );
+            assert!(
+                (40..=220).contains(&px[0]),
+                "depth value {} outside documented band",
+                px[0]
+            );
+            depth_values.insert(px[0]);
+        }
+    }
+    assert!(
+        depth_values.len() >= 8,
+        "iso depth map of a 3D solid should vary, saw {} levels",
+        depth_values.len()
+    );
+
+    // Normals: iso view of a box∪cylinder shows ≥3 distinct surface
+    // orientations as distinct RGB encodings.
+    let normals = render_solid(
+        &model,
+        id,
+        &RenderOptions {
+            view: CanonicalView::Isometric,
+            mode: RenderMode::Normals,
+            ..Default::default()
+        },
+    )
+    .expect("normals render");
+    let mut normal_colors = std::collections::BTreeSet::new();
+    for px in normals.pixels.chunks_exact(3) {
+        if px != [255, 255, 255] {
+            normal_colors.insert([px[0], px[1], px[2]]);
+        }
+    }
+    assert!(
+        normal_colors.len() >= 3,
+        "iso normal map should show ≥3 orientations, saw {}",
+        normal_colors.len()
+    );
+}
+
+#[test]
+#[allow(clippy::expect_used)]
 fn render_is_deterministic() {
     let mk = || {
         let mut model = BRepModel::new();

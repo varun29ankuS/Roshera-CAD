@@ -135,3 +135,8 @@ roshera-app/.vite/
 
 # Pending peer-review artifacts (not for commit until reviewed)
 CD_API_DESIGN_SKETCH.md
+
+# Agent-render diagnostic output (regenerate: cargo test --test diag_render -- --ignored)
+roshera-backend/geometry-engine/render_out/
+# Survey/diagnostic run logs
+roshera-backend/*.log
