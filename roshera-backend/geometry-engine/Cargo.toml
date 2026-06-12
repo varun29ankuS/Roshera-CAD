@@ -50,6 +50,13 @@ rstar = "0.12"
 svg2pdf = "0.13"
 dxf = "0.6"
 
+# Agent-facing render output (AGENT-RENDER-α). Pure-Rust PNG encoder for
+# the software rasterizer in `render/` — the "screenshot for agents"
+# endpoint that lets VLM agents (and our own diagnostics) SEE solids
+# instead of inferring shape from volume numbers and edge counts. Encoder
+# use only; no image decoding anywhere in the kernel.
+png = "0.17"
+
 # SIMD optimizations
 wide = "0.7"              # Portable SIMD operations
 simdeez = "1.0"          # Cross-platform SIMD
