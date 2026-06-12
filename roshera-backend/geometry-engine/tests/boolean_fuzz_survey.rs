@@ -524,7 +524,7 @@ fn boolean_box_sphere_fuzz_survey() {
 /// leaked-thread core-burn under rayon; EULER = the UV-sphere primitive's
 /// intrinsic -1 genus residual, see survey_euler_baseline) — verify in isolation.
 fn print_catalog(title: &str, fails: &[Failure], n_cfg: usize, n_checks: usize) {
-    let is_soft = |k: &str| k == "HANG" || k == "EULER";
+    let is_soft = |k: &str| k == "HANG" || k == "EULER" || k == "SLOW";
     use std::collections::BTreeMap;
     let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
     for f in fails {
@@ -534,7 +534,9 @@ fn print_catalog(title: &str, fails: &[Failure], n_cfg: usize, n_checks: usize) 
     let soft = fails.len() - hard;
     println!("\n========== BOOLEAN FUZZ SURVEY: {title} ==========");
     println!("configs={n_cfg}  checks={n_checks}  HARD failures={hard}  (soft={soft})");
-    println!("by kind: {by_kind:?}   [HARD: VOLUME WATERTIGHT MANIFOLD ERROR | soft: HANG EULER]");
+    println!(
+        "by kind: {by_kind:?}   [HARD: VOLUME WATERTIGHT MANIFOLD ERROR | soft: HANG SLOW EULER]"
+    );
     println!("====== HARD (real bugs — the work queue) ======");
     for (kind, _) in by_kind.iter().filter(|(k, _)| !is_soft(k)) {
         println!("--- {kind} ---");
@@ -1452,12 +1454,15 @@ fn boolean_box_sphere_survey_isolated() {
                 .spawn()
                 .expect("spawn single-shot");
             let start = Instant::now();
+            // Two-tier timing (see isolated_matrix_survey): kill at 5× the
+            // slow threshold so slow cells are MEASURED, not binned HANG.
+            let kill_budget = budget * 5;
             let mut hung = false;
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) => {
-                        if start.elapsed() > budget {
+                        if start.elapsed() > kill_budget {
                             let _ = child.kill();
                             let _ = child.wait();
                             hung = true;
@@ -1468,6 +1473,7 @@ fn boolean_box_sphere_survey_isolated() {
                     Err(_) => break,
                 }
             }
+            let elapsed = start.elapsed();
             n_checks += 1;
             if hung {
                 true_hangs += 1;
@@ -1475,9 +1481,24 @@ fn boolean_box_sphere_survey_isolated() {
                     label: lab.clone(),
                     op: sym[opi],
                     kind: "HANG",
-                    detail: format!("TRUE hang (isolated process, >{}s)", budget.as_secs()),
+                    detail: format!(
+                        "TRUE hang (isolated process, killed >{}s)",
+                        kill_budget.as_secs()
+                    ),
                 });
                 continue;
+            }
+            if elapsed > budget {
+                fails.push(Failure {
+                    label: lab.clone(),
+                    op: sym[opi],
+                    kind: "SLOW",
+                    detail: format!(
+                        "finished in {:.1}s (slow threshold {}s; incl. process spawn)",
+                        elapsed.as_secs_f64(),
+                        budget.as_secs()
+                    ),
+                });
             }
             let content = std::fs::read_to_string(&out_path).unwrap_or_default();
             let _ = std::fs::remove_file(&out_path);
@@ -1789,12 +1810,22 @@ fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: 
                 .spawn()
                 .expect("spawn single-shot");
             let start = Instant::now();
+            // Two-tier timing: `budget` is the SLOW threshold (a finished
+            // shot past it is reported soft-SLOW with its elapsed time —
+            // L4 input); the KILL budget is 5× that, so genuinely slow
+            // cells get MEASURED instead of binned as HANG. The isolated
+            // box∘sphere run that motivated this read HANG=183 at a 6s
+            // kill while cyl/cone read ≈0 at the same budget — those were
+            // slow arrangement cells plus ~seconds of process-spawn
+            // overhead, not infinite loops, and every one of them was an
+            // unmeasured oracle hole.
+            let kill_budget = budget * 5;
             let mut hung = false;
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) => {
-                        if start.elapsed() > budget {
+                        if start.elapsed() > kill_budget {
                             let _ = child.kill();
                             let _ = child.wait();
                             hung = true;
@@ -1805,6 +1836,7 @@ fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: 
                     Err(_) => break,
                 }
             }
+            let elapsed = start.elapsed();
             n_checks += 1;
             if hung {
                 hang_cells.push((cfg, cell.label.clone(), sym[opi]));
@@ -1812,9 +1844,24 @@ fn isolated_matrix_survey(family: &str, title: &str, vol_tol: f64, budget_secs: 
                     label: cell.label.clone(),
                     op: sym[opi],
                     kind: "HANG",
-                    detail: format!("TRUE hang (isolated process, >{}s)", budget.as_secs()),
+                    detail: format!(
+                        "TRUE hang (isolated process, killed >{}s)",
+                        kill_budget.as_secs()
+                    ),
                 });
                 continue;
+            }
+            if elapsed > budget {
+                fails.push(Failure {
+                    label: cell.label.clone(),
+                    op: sym[opi],
+                    kind: "SLOW",
+                    detail: format!(
+                        "finished in {:.1}s (slow threshold {}s; incl. process spawn)",
+                        elapsed.as_secs_f64(),
+                        budget.as_secs()
+                    ),
+                });
             }
             let content = std::fs::read_to_string(&out_path).unwrap_or_default();
             let _ = std::fs::remove_file(&out_path);
