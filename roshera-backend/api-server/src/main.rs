@@ -5783,6 +5783,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/csketch/{id}/line", post(csketch::add_line))
         .route("/api/csketch/{id}/circle", post(csketch::add_circle))
         .route("/api/csketch/{id}/spline", post(csketch::add_spline))
+        .route("/api/csketch/{id}/arc", post(csketch::add_arc))
+        .route("/api/csketch/{id}/rectangle", post(csketch::add_rectangle))
+        .route("/api/csketch/{id}/ellipse", post(csketch::add_ellipse))
+        .route("/api/csketch/{id}/polyline", post(csketch::add_polyline))
+        .route("/api/csketch/{id}/extrude", post(csketch::extrude_csketch))
         .route(
             "/api/csketch/{id}/constraint",
             post(csketch::add_constraint),

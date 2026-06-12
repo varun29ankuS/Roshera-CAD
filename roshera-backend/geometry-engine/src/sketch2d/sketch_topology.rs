@@ -19,7 +19,7 @@
 
 use super::constraints::EntityRef;
 use super::line2d::LineGeometry;
-use super::{Point2d, Sketch2dError, Sketch2dResult, Tolerance2d, Vector2d};
+use super::{Point2d, Sketch2dError, Sketch2dResult, SketchEntity2d, Tolerance2d, Vector2d};
 use dashmap::DashMap;
 use std::sync::Arc;
 
@@ -48,6 +48,12 @@ pub struct TopologyEdge {
     pub forward: bool,
     /// Parameter range on entity [t_start, t_end]
     pub param_range: Option<(f64, f64)>,
+    /// Entity-extent bounding box, for edge types whose true extent is
+    /// not spanned by their endpoints. A full circle's start and end
+    /// are the SAME point (degenerate bounds, zero area, broken
+    /// containment); an arc bulges past its chord by the sagitta.
+    /// `None` for line/polyline edges, whose endpoints are exact.
+    pub bounds_hint: Option<(Point2d, Point2d)>,
 }
 
 /// A vertex in the topology graph
@@ -64,6 +70,13 @@ pub struct TopologyVertex {
 pub struct SketchLoop {
     /// Edges forming the loop (in order)
     pub edges: Vec<usize>,
+    /// Per-edge traversal direction along the walk: `true` when the
+    /// loop traverses `edges[i]` start→end, `false` end→start. A walk
+    /// can legitimately consume edges either way (two lines meeting at
+    /// their shared START, a polyline drawn clockwise, …), so loop
+    /// order alone is not enough to materialise the boundary —
+    /// consumers MUST orient each edge's samples by this flag.
+    pub orientations: Vec<bool>,
     /// Whether the loop is oriented counter-clockwise
     pub is_ccw: bool,
     /// Area enclosed by the loop (positive for CCW)
@@ -195,6 +208,7 @@ impl SketchTopology {
                         end: seg.end,
                         forward: true,
                         param_range: Some((0.0, 1.0)),
+                        bounds_hint: None,
                     });
                 }
             }
@@ -213,6 +227,7 @@ impl SketchTopology {
                 end,
                 forward: true,
                 param_range: Some((arc.arc.start_angle, arc.arc.end_angle)),
+                bounds_hint: Some(arc.bounding_box()),
             });
         }
 
@@ -236,6 +251,7 @@ impl SketchTopology {
                 end: start, // Closed
                 forward: true,
                 param_range: Some((0.0, 2.0 * std::f64::consts::PI)),
+                bounds_hint: Some(circle.bounding_box()),
             });
         }
 
@@ -253,6 +269,7 @@ impl SketchTopology {
                     end: corners[next],
                     forward: true,
                     param_range: Some((i as f64, next as f64)),
+                    bounds_hint: None,
                 });
             }
         }
@@ -278,6 +295,7 @@ impl SketchTopology {
                     end: vertices[next],
                     forward: true,
                     param_range: Some((i as f64, next as f64)),
+                    bounds_hint: None,
                 });
             }
         }
@@ -329,26 +347,55 @@ impl SketchTopology {
         Ok(())
     }
 
-    /// Find all closed loops using DFS
+    /// Find all closed loops by oriented boundary walking.
+    ///
+    /// History: the original implementation alternated between an
+    /// edge's `end` and `start` by PATH-LENGTH PARITY rather than by
+    /// the direction the walk actually traversed each edge. On the
+    /// most ordinary input imaginable — a rectangle of four
+    /// head-to-tail edges — the cursor reversed after the first hop,
+    /// dead-ended, and found nothing; a lone circle (start == end,
+    /// degree-2 self-vertex) couldn't seed a loop either. The module
+    /// compiled, looked finished, and had never extracted a loop from
+    /// a normal profile — discovered 2026-06-12 when the csketch →
+    /// solid bridge became its first production caller.
     fn find_loops(&mut self) -> Sketch2dResult<()> {
         let mut visited_edges = vec![false; self.edges.len()];
         let mut loops = Vec::new();
 
-        // Try to find loops starting from each unvisited edge
         for start_edge in 0..self.edges.len() {
             if visited_edges[start_edge] {
                 continue;
             }
 
-            // Try to form a loop starting from this edge
-            if let Some(loop_edges) = self.find_loop_from_edge(start_edge, &mut visited_edges) {
-                // Calculate loop properties
-                let area = self.calculate_loop_area(&loop_edges);
+            // Single-edge closed loop: a full circle (or closed spline
+            // edge) closes onto itself and needs no walk.
+            let e = &self.edges[start_edge];
+            if e.start.distance_to(&e.end) < 1e-6 {
+                visited_edges[start_edge] = true;
+                let edges = vec![start_edge];
+                let orientations = vec![true];
+                let area = self.calculate_loop_area(&edges, &orientations);
+                let bounds = self.calculate_loop_bounds(&edges);
+                loops.push(SketchLoop {
+                    edges,
+                    orientations,
+                    is_ccw: area > 0.0,
+                    area: area.abs(),
+                    bounds,
+                });
+                continue;
+            }
+
+            if let Some((loop_edges, orientations)) =
+                self.find_loop_from_edge(start_edge, &mut visited_edges)
+            {
+                let area = self.calculate_loop_area(&loop_edges, &orientations);
                 let bounds = self.calculate_loop_bounds(&loop_edges);
                 let is_ccw = area > 0.0;
-
                 loops.push(SketchLoop {
                     edges: loop_edges,
+                    orientations,
                     is_ccw,
                     area: area.abs(),
                     bounds,
@@ -360,72 +407,58 @@ impl SketchTopology {
         Ok(())
     }
 
-    /// Try to find a loop starting from given edge
-    fn find_loop_from_edge(&self, start_edge: usize, visited: &mut [bool]) -> Option<Vec<usize>> {
+    /// Walk from `start_edge` (traversed start→end) following oriented
+    /// endpoint connectivity until the cursor returns to the walk's
+    /// origin. Returns the edge sequence and the per-edge traversal
+    /// direction, or `None` (with `visited` rolled back) on a dead end.
+    fn find_loop_from_edge(
+        &self,
+        start_edge: usize,
+        visited: &mut [bool],
+    ) -> Option<(Vec<usize>, Vec<bool>)> {
+        const TOL: f64 = 1e-6;
+        let origin = self.edges[start_edge].start;
+        let mut cursor = self.edges[start_edge].end;
         let mut path = vec![start_edge];
-        let mut current_edge = start_edge;
+        let mut orientations = vec![true];
         visited[start_edge] = true;
 
         loop {
-            // Get end vertex of current edge
-            let current = &self.edges[current_edge];
-            let end_pos = if path.len() % 2 == 1 {
-                current.end
-            } else {
-                current.start
-            };
+            if cursor.distance_to(&origin) < TOL {
+                return Some((path, orientations));
+            }
 
-            // Find next edge connected to this vertex
-            let mut next_edge = None;
-
-            for vertex in self.vertices.iter() {
-                if vertex.position.distance_to(&end_pos) < 1e-6 {
-                    for &(edge_idx, outgoing) in &vertex.edges {
-                        if edge_idx != current_edge && !visited[edge_idx] {
-                            let edge = &self.edges[edge_idx];
-                            let connects = if outgoing {
-                                edge.start.distance_to(&end_pos) < 1e-6
-                            } else {
-                                edge.end.distance_to(&end_pos) < 1e-6
-                            };
-
-                            if connects {
-                                next_edge = Some(edge_idx);
-                                break;
-                            }
-                        }
-                    }
+            // Next unvisited edge incident to the cursor, traversed
+            // away from it. Direction is decided by WHICH endpoint
+            // touches the cursor — not by parity, not by the edge's
+            // stored entity-relative `forward` flag.
+            let mut next: Option<(usize, bool)> = None;
+            for (edge_idx, edge) in self.edges.iter().enumerate() {
+                if visited[edge_idx] {
+                    continue;
                 }
-
-                if next_edge.is_some() {
+                if edge.start.distance_to(&cursor) < TOL {
+                    next = Some((edge_idx, true));
+                    break;
+                }
+                if edge.end.distance_to(&cursor) < TOL {
+                    next = Some((edge_idx, false));
                     break;
                 }
             }
 
-            match next_edge {
-                Some(edge_idx) => {
-                    // Check if we've completed a loop
-                    let next = &self.edges[edge_idx];
-                    let next_end = if path.len() % 2 == 0 {
-                        next.end
-                    } else {
-                        next.start
-                    };
-
-                    if next_end.distance_to(&self.edges[start_edge].start) < 1e-6 {
-                        // Loop completed
-                        path.push(edge_idx);
-                        return Some(path);
-                    }
-
-                    // Continue path
+            match next {
+                Some((edge_idx, forward)) => {
                     visited[edge_idx] = true;
+                    cursor = if forward {
+                        self.edges[edge_idx].end
+                    } else {
+                        self.edges[edge_idx].start
+                    };
                     path.push(edge_idx);
-                    current_edge = edge_idx;
+                    orientations.push(forward);
                 }
                 None => {
-                    // Dead end - not a loop
-                    // Unmark visited edges
                     for &edge in &path {
                         visited[edge] = false;
                     }
@@ -433,44 +466,46 @@ impl SketchTopology {
                 }
             }
 
-            // Prevent infinite loops
             if path.len() > self.edges.len() {
+                for &edge in &path {
+                    visited[edge] = false;
+                }
                 return None;
             }
         }
     }
 
-    /// Calculate signed area of a loop
-    fn calculate_loop_area(&self, loop_edges: &[usize]) -> f64 {
+    /// Calculate signed area of a loop from its ORIENTED traversal.
+    ///
+    /// Every edge contributes its chord to the shoelace sum in the
+    /// direction the walk traversed it (`orientations[i]`); summing the
+    /// stored start→end direction regardless of traversal produced a
+    /// meaningless sign for any loop containing a reversed edge. Arc /
+    /// spline chords incur a bounded sagitta error which is acceptable
+    /// for the CCW classification this area drives; it is NOT a
+    /// substitute for analytic area. A single-edge closed loop (full
+    /// circle) has a zero chord sum — fall back to its bounding box to
+    /// get a usable positive magnitude (sign irrelevant: region
+    /// nesting is decided by containment, not winding).
+    fn calculate_loop_area(&self, loop_edges: &[usize], orientations: &[bool]) -> f64 {
         let mut area = 0.0;
-
-        for &edge_idx in loop_edges {
+        for (k, &edge_idx) in loop_edges.iter().enumerate() {
             let edge = &self.edges[edge_idx];
-
-            match edge.edge_type {
-                EdgeType::Line => {
-                    // Shoelace formula contribution
-                    area += (edge.end.x - edge.start.x) * (edge.end.y + edge.start.y) / 2.0;
-                }
-                EdgeType::Arc => {
-                    // Chord-only contribution. The exact arc-circular-segment
-                    // correction is `± (r²/2)·(θ − sinθ)` (sign depends on
-                    // sweep direction), but the Arc edge here only stores
-                    // start/end — radius and sweep are not threaded through.
-                    // Loops dominated by short arcs incur a bounded
-                    // O(r·sagitta) error which is acceptable for the
-                    // CCW-orientation classification this area drives;
-                    // it is NOT a substitute for analytic surface area.
-                    area += (edge.end.x - edge.start.x) * (edge.end.y + edge.start.y) / 2.0;
-                }
-                _ => {
-                    // Polyline / spline / ellipse segments are walked as
-                    // chords for the same reason as Arc.
-                    area += (edge.end.x - edge.start.x) * (edge.end.y + edge.start.y) / 2.0;
-                }
-            }
+            let forward = orientations.get(k).copied().unwrap_or(true);
+            let (a, b) = if forward {
+                (edge.start, edge.end)
+            } else {
+                (edge.end, edge.start)
+            };
+            area += (b.x - a.x) * (b.y + a.y) / 2.0;
         }
-
+        if area.abs() < 1e-12 && loop_edges.len() == 1 {
+            // Full circle: π·rx·ry from the bounds (= πr² for a circle).
+            let (min, max) = self.calculate_loop_bounds(loop_edges);
+            let rx = (max.x - min.x) / 2.0;
+            let ry = (max.y - min.y) / 2.0;
+            return std::f64::consts::PI * rx * ry;
+        }
         area
     }
 
@@ -488,6 +523,12 @@ impl SketchTopology {
             min_y = min_y.min(edge.start.y).min(edge.end.y);
             max_x = max_x.max(edge.start.x).max(edge.end.x);
             max_y = max_y.max(edge.start.y).max(edge.end.y);
+            if let Some((hmin, hmax)) = edge.bounds_hint {
+                min_x = min_x.min(hmin.x);
+                min_y = min_y.min(hmin.y);
+                max_x = max_x.max(hmax.x);
+                max_y = max_y.max(hmax.y);
+            }
         }
 
         (Point2d::new(min_x, min_y), Point2d::new(max_x, max_y))
@@ -510,42 +551,45 @@ impl SketchTopology {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Build containment hierarchy
-        let mut regions = Vec::new();
-        let mut assigned = vec![false; self.loops.len()];
-
-        for &i in &loop_indices {
-            if assigned[i] {
-                continue;
-            }
-
-            let loop_i = &self.loops[i];
-
-            if loop_i.is_ccw {
-                // This is an outer boundary
-                let mut region = SketchRegion {
-                    outer_loop: i,
-                    inner_loops: Vec::new(),
-                    area: loop_i.area,
-                    depth: 0,
-                };
-
-                // Find holes inside this boundary
-                for &j in &loop_indices {
-                    if i != j && !assigned[j] {
-                        let loop_j = &self.loops[j];
-
-                        if !loop_j.is_ccw && self.loop_contains_loop(i, j) {
-                            region.inner_loops.push(j);
-                            region.area -= loop_j.area;
-                            assigned[j] = true;
-                        }
-                    }
+        // Containment-depth hierarchy. Winding (`is_ccw`) is NOT a
+        // valid outer-vs-hole signal here: walk direction depends on
+        // which edge seeded the walk, and a circle's single edge is
+        // always parameterised CCW — so the previous winding-gated
+        // builder silently dropped circle holes (and any outer loop a
+        // walk happened to traverse clockwise). Mainstream-CAD model
+        // instead: a loop contained by an EVEN number of other loops
+        // is an outer boundary; its holes are the loops directly
+        // inside it (depth exactly one greater). Mirrors the
+        // api-server click-draft `detect_regions`, which is the
+        // production-proven implementation of the same rule.
+        let n = self.loops.len();
+        let mut depth = vec![0usize; n];
+        for i in 0..n {
+            for j in 0..n {
+                if i != j && self.loop_contains_loop(j, i) {
+                    depth[i] += 1;
                 }
-
-                assigned[i] = true;
-                regions.push(region);
             }
+        }
+
+        let mut regions = Vec::new();
+        for &i in &loop_indices {
+            if depth[i] % 2 != 0 {
+                continue; // odd depth = hole; attached to its parent below
+            }
+            let mut region = SketchRegion {
+                outer_loop: i,
+                inner_loops: Vec::new(),
+                area: self.loops[i].area,
+                depth: depth[i],
+            };
+            for &j in &loop_indices {
+                if i != j && depth[j] == depth[i] + 1 && self.loop_contains_loop(i, j) {
+                    region.inner_loops.push(j);
+                    region.area -= self.loops[j].area;
+                }
+            }
+            regions.push(region);
         }
 
         self.regions = regions;
@@ -584,6 +628,21 @@ impl SketchTopology {
             return false;
         };
         let test = first_edge.start;
+
+        // A single-edge closed loop (full circle) has a degenerate
+        // chord polyline — the even-odd ray cast below would see zero
+        // crossings and report "contains nothing". Decide analytically
+        // from its bounds instead (centre + radius are exact for a
+        // circle's axis-aligned box).
+        if loop_i.edges.len() == 1 {
+            let (min_i, max_i) = loop_i.bounds;
+            let cx = (min_i.x + max_i.x) / 2.0;
+            let cy = (min_i.y + max_i.y) / 2.0;
+            let r = (max_i.x - min_i.x) / 2.0;
+            let dx = test.x - cx;
+            let dy = test.y - cy;
+            return dx * dx + dy * dy < r * r;
+        }
 
         // Even-odd ray cast in +X against loop_i's edge polyline.
         let mut crossings = 0usize;
@@ -675,6 +734,15 @@ impl SketchTopology {
     /// Get all loops
     pub fn loops(&self) -> &[SketchLoop] {
         &self.loops
+    }
+
+    /// All directed edges in the topology graph. `SketchLoop::edges`
+    /// holds indices into this slice; consumers that materialise loop
+    /// geometry (e.g. the api-server's csketch→solid bridge) walk the
+    /// loop and resolve each index here to reach the entity reference,
+    /// orientation, and parameter range.
+    pub fn edges(&self) -> &[TopologyEdge] {
+        &self.edges
     }
 
     /// Get all regions
@@ -836,4 +904,179 @@ pub struct RevolutionProfile {
     pub axis_origin: Point2d,
     /// Revolution axis direction
     pub axis_direction: Vector2d,
+}
+
+#[cfg(test)]
+mod tests {
+    //! First-ever tests for the topology walker. The module shipped
+    //! untested and its loop walk was broken on every normal profile
+    //! (parity-based cursor flipping — see `find_loops` docs); these
+    //! pin the rewritten oriented walk + containment-depth regions.
+    use super::*;
+    use crate::sketch2d::{Sketch, SketchAnchor, Tolerance2d};
+
+    fn analyze(sketch: &Sketch) -> SketchTopology {
+        SketchTopology::analyze(sketch, &Tolerance2d::default())
+            .expect("topology analysis must succeed on valid sketches")
+    }
+
+    fn sketch() -> Sketch {
+        Sketch::new("t".to_string(), SketchAnchor::xy())
+    }
+
+    #[test]
+    fn closed_polyline_forms_one_loop_and_region() {
+        let s = sketch();
+        s.add_polyline(
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(80.0, 0.0),
+                Point2d::new(80.0, 50.0),
+                Point2d::new(0.0, 50.0),
+            ],
+            true,
+        )
+        .expect("closed polyline must construct");
+        let topo = analyze(&s);
+        assert_eq!(topo.loops().len(), 1, "one closed loop expected");
+        assert_eq!(topo.regions().len(), 1, "one region expected");
+        assert!(
+            (topo.loops()[0].area - 4000.0).abs() < 1e-9,
+            "80x50 loop area, got {}",
+            topo.loops()[0].area
+        );
+        assert_eq!(topo.profile_type(), ProfileType::Simple);
+        assert!(topo.is_valid_for_extrusion());
+    }
+
+    #[test]
+    fn polyline_with_circle_hole_is_one_region_one_hole() {
+        let s = sketch();
+        s.add_polyline(
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(80.0, 0.0),
+                Point2d::new(80.0, 50.0),
+                Point2d::new(0.0, 50.0),
+            ],
+            true,
+        )
+        .expect("closed polyline must construct");
+        s.add_circle(Point2d::new(25.0, 25.0), 6.0)
+            .expect("circle must construct");
+        let topo = analyze(&s);
+        assert_eq!(topo.loops().len(), 2, "outer + circle loops");
+        assert_eq!(topo.regions().len(), 1, "circle nests as a hole");
+        assert_eq!(topo.regions()[0].inner_loops.len(), 1);
+        assert!(topo.is_valid_for_extrusion());
+    }
+
+    #[test]
+    fn four_head_to_tail_lines_form_a_loop() {
+        let s = sketch();
+        let p = [
+            Point2d::new(0.0, 0.0),
+            Point2d::new(10.0, 0.0),
+            Point2d::new(10.0, 10.0),
+            Point2d::new(0.0, 10.0),
+        ];
+        let ids: Vec<_> = p.iter().map(|q| s.add_point(*q)).collect();
+        for i in 0..4 {
+            s.add_line(ids[i], ids[(i + 1) % 4])
+                .expect("line between distinct points must construct");
+        }
+        let topo = analyze(&s);
+        assert_eq!(topo.loops().len(), 1);
+        assert!(topo.is_valid_for_extrusion());
+    }
+
+    #[test]
+    fn lone_circle_is_a_closed_simple_profile() {
+        let s = sketch();
+        s.add_circle(Point2d::new(0.0, 0.0), 5.0)
+            .expect("circle must construct");
+        let topo = analyze(&s);
+        assert_eq!(topo.loops().len(), 1, "circle is a single-edge loop");
+        assert_eq!(topo.regions().len(), 1);
+        assert!(topo.is_valid_for_extrusion());
+        let area = topo.loops()[0].area;
+        assert!(
+            (area - std::f64::consts::PI * 25.0).abs() < 1e-6,
+            "pi r^2 from bounds fallback, got {area}"
+        );
+    }
+
+    #[test]
+    fn open_chain_is_not_extrudable_and_names_its_endpoints() {
+        let s = sketch();
+        let a = s.add_point(Point2d::new(0.0, 0.0));
+        let b = s.add_point(Point2d::new(10.0, 0.0));
+        let c = s.add_point(Point2d::new(10.0, 10.0));
+        s.add_line(a, b).expect("line ab");
+        s.add_line(b, c).expect("line bc");
+        let topo = analyze(&s);
+        assert_eq!(topo.loops().len(), 0);
+        assert_eq!(topo.profile_type(), ProfileType::Open);
+        assert!(!topo.is_valid_for_extrusion());
+        assert_eq!(topo.open_endpoints().len(), 2, "two dangling endpoints");
+    }
+
+    #[test]
+    fn reversed_edge_direction_still_walks_the_loop() {
+        // Two of the four lines are added "backwards" (end->start
+        // relative to the walk) — the oriented walker must consume
+        // them with orientation=false rather than dead-ending, and the
+        // orientations vector must say so.
+        let s = sketch();
+        let p = [
+            Point2d::new(0.0, 0.0),
+            Point2d::new(10.0, 0.0),
+            Point2d::new(10.0, 10.0),
+            Point2d::new(0.0, 10.0),
+        ];
+        let ids: Vec<_> = p.iter().map(|q| s.add_point(*q)).collect();
+        s.add_line(ids[0], ids[1]).expect("ab");
+        s.add_line(ids[2], ids[1]).expect("cb reversed");
+        s.add_line(ids[2], ids[3]).expect("cd");
+        s.add_line(ids[0], ids[3]).expect("ad reversed");
+        let topo = analyze(&s);
+        assert_eq!(topo.loops().len(), 1);
+        let lp = &topo.loops()[0];
+        assert_eq!(lp.edges.len(), 4);
+        assert!(
+            lp.orientations.iter().any(|o| !o),
+            "at least one edge must be traversed reversed"
+        );
+        assert!(topo.is_valid_for_extrusion());
+    }
+
+    #[test]
+    fn disjoint_rectangles_are_two_regions() {
+        let s = sketch();
+        s.add_polyline(
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(10.0, 0.0),
+                Point2d::new(10.0, 10.0),
+                Point2d::new(0.0, 10.0),
+            ],
+            true,
+        )
+        .expect("rect 1");
+        s.add_polyline(
+            vec![
+                Point2d::new(100.0, 0.0),
+                Point2d::new(110.0, 0.0),
+                Point2d::new(110.0, 10.0),
+                Point2d::new(100.0, 10.0),
+            ],
+            true,
+        )
+        .expect("rect 2");
+        let topo = analyze(&s);
+        assert_eq!(topo.loops().len(), 2);
+        assert_eq!(topo.regions().len(), 2);
+        assert_eq!(topo.profile_type(), ProfileType::Disjoint);
+        assert!(topo.is_valid_for_extrusion());
+    }
 }
