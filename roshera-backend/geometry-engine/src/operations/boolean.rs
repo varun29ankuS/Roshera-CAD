@@ -5474,6 +5474,100 @@ fn split_face_by_curves(
         })
         .collect();
 
+    // Void-cut filter (#27 chained-union): a face carrying PRE-EXISTING
+    // inner loops (holes from a prior boolean) can receive a coplanar
+    // imprint from the other operand that lands ENTIRELY INSIDE one of
+    // those holes — e.g. chaining coaxial unions, the incoming solid's
+    // section circle projects onto a composite cap's hole region. Such a
+    // cut bounds empty space (a hole is not material), yet the DCEL still
+    // walks it into a phantom fragment that classifies Outside and is kept
+    // → extra faces, a non-manifold solid, and over-reported volume.
+    // Dropping the phantom AFTER region extraction orphans its shared rim
+    // edges (open seams), so the correct layer is to never add the void
+    // cut at all.
+    //
+    // Restricted to PLANAR faces: the hole polygon projects exactly there,
+    // and the annular caps that trigger the bug are planar. Curved faces
+    // route through the sphere/cone/cylinder/torus splitters below, which
+    // must see every cut.
+    let preexisting_hole_filter: Option<(Point3, Vector3, Vector3, Vec<Vec<(f64, f64)>>)> = {
+        let is_planar = model
+            .surfaces
+            .get(surface_id)
+            .map(|s| {
+                matches!(
+                    s.surface_type(),
+                    crate::primitives::surface::SurfaceType::Plane
+                )
+            })
+            .unwrap_or(false);
+        let inner_edge_lists: Vec<Vec<EdgeId>> = match model.faces.get(face_id) {
+            Some(face) if is_planar => face
+                .inner_loops
+                .iter()
+                .filter_map(|&lid| model.loops.get(lid).map(|l| l.edges.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if inner_edge_lists.is_empty() {
+            None
+        } else {
+            let inner_verts_3d: Vec<Vec<Point3>> = inner_edge_lists
+                .iter()
+                .map(|edges| extract_cycle_vertices_3d(edges, model))
+                .collect();
+            // Tangent frame at the hole-vertex centroid (planar → the frame
+            // is constant over the face, so the anchor is immaterial). Same
+            // construction as partition_outer_and_pre_existing_hole_cycles.
+            let mut sx = 0.0f64;
+            let mut sy = 0.0f64;
+            let mut sz = 0.0f64;
+            let mut cnt = 0usize;
+            for v in inner_verts_3d.iter().flatten() {
+                sx += v.x;
+                sy += v.y;
+                sz += v.z;
+                cnt += 1;
+            }
+            let frame = if cnt == 0 {
+                None
+            } else {
+                let anchor = Point3::new(sx / cnt as f64, sy / cnt as f64, sz / cnt as f64);
+                model.surfaces.get(surface_id).and_then(|surface| {
+                    let tol = Tolerance::default();
+                    let (u0, v0) = surface.closest_point(&anchor, tol).ok()?;
+                    let sp = surface.evaluate_full(u0, v0).ok()?;
+                    let e1 = sp.du.normalize().ok()?;
+                    let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
+                    let e2 = dv_perp.normalize().ok()?;
+                    Some((sp.position, e1, e2))
+                })
+            };
+            frame
+                .map(|(origin, e1, e2)| {
+                    let polys: Vec<Vec<(f64, f64)>> = inner_verts_3d
+                        .iter()
+                        .map(|verts| {
+                            verts
+                                .iter()
+                                .map(|p| {
+                                    let d = Vector3::new(
+                                        p.x - origin.x,
+                                        p.y - origin.y,
+                                        p.z - origin.z,
+                                    );
+                                    (d.dot(&e1), d.dot(&e2))
+                                })
+                                .collect::<Vec<(f64, f64)>>()
+                        })
+                        .filter(|poly| poly.len() >= 3)
+                        .collect();
+                    (origin, e1, e2, polys)
+                })
+                .filter(|(_, _, _, polys)| !polys.is_empty())
+        }
+    };
+
     // Add splitting curves to graph
     let mut active_cut_count = 0usize;
     for &curve_id in curves {
@@ -5542,15 +5636,49 @@ fn split_face_by_curves(
                 .map(|p| boundary_pairs.contains(p))
                 .unwrap_or(false);
 
+        // Void-cut detection (#27): if every interior sample of this cut
+        // projects strictly inside one pre-existing hole polygon, the cut
+        // bounds void rather than material — skip it (see the filter set up
+        // before the loop). A cut that crosses the hole boundary has samples
+        // outside the hole and is retained; a cut retracing the hole
+        // boundary is already caught by the boundary-coincidence guard.
+        let lies_in_preexisting_hole = match (&preexisting_hole_filter, model.curves.get(curve_id))
+        {
+            (Some((h_origin, h_e1, h_e2, hole_polys)), Some(curve)) => {
+                const SAMPLES: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
+                hole_polys.iter().any(|poly| {
+                    SAMPLES.iter().all(|&t| match curve.evaluate(t) {
+                        Ok(cp) => {
+                            let p = cp.position;
+                            let d =
+                                Vector3::new(p.x - h_origin.x, p.y - h_origin.y, p.z - h_origin.z);
+                            point_in_polygon_2d(d.dot(h_e1), d.dot(h_e2), poly)
+                        }
+                        Err(_) => false,
+                    })
+                })
+            }
+            _ => false,
+        };
+
         if pipeline_trace_enabled() {
             if let Some(e) = model.edges.get(edge_id) {
                 eprintln!(
-                    "[bool]     cut edge={:?} sv={:?} ev={:?} (orig sv={:?} ev={:?}) coincides_with_boundary={}",
-                    edge_id, e.start_vertex, e.end_vertex, orig_sv, orig_ev, coincides_with_boundary
+                    "[bool]     cut edge={:?} sv={:?} ev={:?} (orig sv={:?} ev={:?}) coincides_with_boundary={} in_hole={}",
+                    edge_id, e.start_vertex, e.end_vertex, orig_sv, orig_ev, coincides_with_boundary, lies_in_preexisting_hole
                 );
             }
         }
         if coincides_with_boundary {
+            continue;
+        }
+        if lies_in_preexisting_hole {
+            if pipeline_trace_enabled() {
+                eprintln!(
+                    "[bool]     cut edge={:?} curve={:?} lies entirely inside a pre-existing hole — skipping void-cut (#27)",
+                    edge_id, curve_id
+                );
+            }
             continue;
         }
         graph.add_edge(edge_id, EdgeType::Splitting);
