@@ -162,6 +162,23 @@ was rewritten to the neighbour bound. 682 operations tests green.
 
 ---
 
+## Queries / bounding box / mass
+
+### #42 🔴 bbox/OBB/centroid of analytic curved solids ignore surface extent
+Found live (ladder step 7). An analytic cylinder at center (0,0,0) r10 h40
+reports `world_bbox min=(10,0,0) max=(10,0,40)` — ZERO extent in X/Y,
+collapsed to the seam line at (r,0). The cylinder is V2/E3/F3 (2 seam
+vertices); bbox/OBB/centroid iterate VERTICES only and never bound the
+curved face's radial extent. Knock-on: OBB center (10,0,20) not (0,0,20);
+assembly placement read every cylinder +r off in X. Geometry is correct
+(transform moves the real solid; renders watertight) — only the QUERY lies.
+Affects OBB, world_bbox, camera auto-frame, mass-properties centroid/inertia,
+part_distance — for ALL curved primitives (cylinder/sphere/cone/torus).
+Fix: bound the solid from FACE extent (tessellated-mesh bbox, or per-analytic-
+surface bbox), thread into OBB + mass-props. Contained query-layer fix, NOT
+the boolean core. Regression: cylinder r10 h40 at origin → AABB x[-10,10]
+y[-10,10] z[0,40], center (0,0,20).
+
 ## Validation / model lifecycle
 
 ### #29 🟢 Op post-validation runs over the WHOLE model
