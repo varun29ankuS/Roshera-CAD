@@ -16817,4 +16817,79 @@ mod tests {
             "stepped hub volume {v:.0} vs expected {expected:.0} (rel {rel:.3})"
         );
     }
+
+    /// #34 REGRESSION: a blind flat-bottom counterbore cut into a BORED boss
+    /// must stay watertight. The cutter's bottom cap becomes the pocket FLOOR
+    /// — an annulus, clipped by the through-bore — and must not be dropped.
+    /// Was: 64 open edges (floor missing) because the cap's centroid lands in
+    /// the bore void and misclassifies Outside (the difference-side analogue
+    /// of #27). `cargo test -p geometry-engine diff_blind_counterbore -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "tracks #34: counterbore floor inner-rim T-junction weld — un-ignore when fixed"]
+    fn diff_blind_counterbore_floor_34() {
+        use crate::harness::watertight::manifold_report;
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+        let ngon = |r: f64, n: usize| -> Vec<[f64; 2]> {
+            (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * (i as f64) / (n as f64);
+                    [r * a.cos(), r * a.sin()]
+                })
+                .collect()
+        };
+        let tol = Tolerance::default();
+        let mut m = BRepModel::new();
+        // Bored boss: r50 outer, r20 through-bore, h65 — annular in one extrude.
+        let boss = extrude_polygon_regions(
+            &mut m,
+            Point3::ORIGIN,
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer: ngon(50.0, 32),
+                holes: vec![ngon(20.0, 32)],
+            }],
+            65.0,
+            None,
+            tol,
+        )
+        .expect("boss extrude");
+        // Counterbore cutter: r27 disk on the z=55 plane, extruded up to z=65.
+        let cutter = extrude_polygon_regions(
+            &mut m,
+            Point3::new(0.0, 0.0, 55.0),
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer: ngon(27.0, 32),
+                holes: vec![],
+            }],
+            10.0,
+            None,
+            tol,
+        )
+        .expect("cutter extrude");
+        let res = boolean_operation(
+            &mut m,
+            boss,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("counterbore difference");
+        let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("manifold report");
+        eprintln!(
+            "[#34] open_edges={} nonmanifold={} euler={} valid={}",
+            r.boundary_edges,
+            r.nonmanifold_edges,
+            r.euler_characteristic,
+            r.manifold && r.closed && r.oriented
+        );
+        assert!(
+            r.boundary_edges == 0 && r.nonmanifold_edges == 0,
+            "#34: blind counterbore difference must be watertight (open={}, nm={})",
+            r.boundary_edges,
+            r.nonmanifold_edges
+        );
+    }
 }
