@@ -3,6 +3,7 @@ import { TopBar } from '@/components/layout/TopBar'
 import { ToolBar } from '@/components/layout/ToolBar'
 import { StatusBar } from '@/components/layout/StatusBar'
 import { CADViewport } from '@/components/viewport/CADViewport'
+import { AgentEyePanel } from '@/components/viewport/AgentEyePanel'
 import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { AIChatPanel } from '@/components/panels/AIChatPanel'
 import { ModelTree } from '@/components/panels/ModelTree'
@@ -87,6 +88,7 @@ export function App() {
             <div className="relative flex-1 overflow-hidden">
               <CADViewport />
               <AIChatPanel />
+              <AgentEyePanel />
 
               {/* Browser — single consolidated panel. The header chip is
                   always visible and acts as the collapse toggle; an
