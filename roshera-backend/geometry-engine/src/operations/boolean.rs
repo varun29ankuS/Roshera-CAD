@@ -16117,4 +16117,138 @@ mod tests {
             "no original inner loops, no fabricated holes",
         );
     }
+
+    /// REGRESSION SPEC for #27 (chained-union B-Rep bug, 2026-06-13).
+    /// PRISM chained union faithful to the live csketch repro
+    /// (polygon→extrude prisms, all planar). A union whose operand is
+    /// itself a PRIOR boolean result leaves the composite's buried
+    /// interior faces: the 3-tier coaxial hub comes out with 135 B-Rep
+    /// faces / 61 non-manifold mesh edges / euler 34 / +7.6% volume
+    /// instead of a clean genus-0 solid. The identical FRESH pairwise
+    /// union (step1) is clean (68 faces, euler 2, valid) — so the
+    /// defect is the SECOND union's handling of the composite operand,
+    /// localized to the coplanar-imprint + classify path
+    /// (compute_face_intersections reports coplanar_curves_a=64,
+    /// coplanar_curves_b=0 — ZERO transverse curves — and the buried
+    /// regions classify Outside instead of Inside, so they are kept).
+    ///
+    /// `#[ignore]`d so it does not red the floor while the fix is
+    /// pending; it is the executable spec — un-ignore when #27 lands.
+    /// Diagnostic run: `cargo test -p geometry-engine prism_chain_diag
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "tracks #27 chained-union B-Rep bug — un-ignore when fixed"]
+    fn prism_chain_diag_27() {
+        use crate::harness::watertight::{manifold_report, mesh_volume};
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+
+        let ngon = |r: f64, n: usize| -> Vec<[f64; 2]> {
+            (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * (i as f64) / (n as f64);
+                    [r * a.cos(), r * a.sin()]
+                })
+                .collect()
+        };
+        let tol = Tolerance::default();
+        let extrude_disc = |model: &mut BRepModel, r: f64, h: f64| -> SolidId {
+            extrude_polygon_regions(
+                model,
+                Point3::ORIGIN,
+                Vector3::X,
+                Vector3::Y,
+                &[PolygonRegion {
+                    outer: ngon(r, 32),
+                    holes: vec![],
+                }],
+                h,
+                None,
+                tol,
+            )
+            .expect("prism extrude ok")
+        };
+        let face_count = |model: &BRepModel, sid: SolidId| -> usize {
+            let mut n = 0;
+            if let Some(solid) = model.solids.get(sid) {
+                if let Some(shell) = model.shells.get(solid.outer_shell) {
+                    n += shell.face_count();
+                }
+                for &is in solid.inner_shells.iter() {
+                    if let Some(sh) = model.shells.get(is) {
+                        n += sh.face_count();
+                    }
+                }
+            }
+            n
+        };
+        let closed_form_vol = |model: &mut BRepModel, sid: SolidId| -> f64 {
+            let Some(mut solid) = model.solids.get(sid).cloned() else {
+                return f64::NAN;
+            };
+            solid
+                .volume(
+                    &mut model.shells,
+                    &mut model.faces,
+                    &mut model.loops,
+                    &model.vertices,
+                    &model.edges,
+                    &model.surfaces,
+                    tol,
+                )
+                .unwrap_or(f64::NAN)
+        };
+        let chord = 0.5;
+        let report = |model: &mut BRepModel, sid: SolidId, label: &str| {
+            let cf = closed_form_vol(model, sid);
+            let mv = mesh_volume(model, sid, chord).unwrap_or(f64::NAN);
+            let fc = face_count(model, sid);
+            let (nm, oe, eu, man) = manifold_report(model, sid, chord, 1e-6)
+                .map(|r| {
+                    (
+                        r.nonmanifold_edges,
+                        r.boundary_edges,
+                        r.euler_characteristic,
+                        r.manifold && r.closed && r.oriented,
+                    )
+                })
+                .unwrap_or((9999, 9999, -999, false));
+            eprintln!(
+                "[#27] {label}: closed_form_vol={cf:.0} mesh_vol={mv:.0} brep_faces={fc} nonmanifold_edges={nm} open_edges={oe} euler={eu} valid_solid={man}"
+            );
+        };
+
+        let mut m = BRepModel::new();
+        let disc = extrude_disc(&mut m, 80.0, 12.0);
+        let boss = extrude_disc(&mut m, 60.0, 36.0);
+        let tower = extrude_disc(&mut m, 35.0, 60.0);
+        let u1 = boolean_operation(
+            &mut m,
+            disc,
+            boss,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("u1 ok");
+        report(&mut m, u1, "step1 disc∪boss (target ~509k)");
+        let u2 = boolean_operation(
+            &mut m,
+            u1,
+            tower,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("u2 ok");
+        report(&mut m, u2, "step2 ∪tower    (target ~601k)");
+
+        // The spec: the chained union must be a valid closed manifold
+        // solid. Fails today (the bug); the fix makes this pass and the
+        // test is un-ignored.
+        let valid = manifold_report(&mut m, u2, chord, 1e-6)
+            .map(|r| r.manifold && r.closed && r.oriented)
+            .unwrap_or(false);
+        assert!(
+            valid,
+            "#27: chained prism union must be a valid manifold solid",
+        );
+    }
 }
