@@ -20,10 +20,36 @@ are the saddle intersection curve where the horizontal tunnel wall meets
 the vertical bore void — the hbore wall facets that pass through the
 already-empty vbore region are not trimmed/welded against the vbore wall
 facets, leaving the saddle loop open. Both bores are 24-gon prisms, so
-this is faceted plane∩plane at the saddle, not analytic SSI. Fix lives in
-the difference pipeline's handling of a cutter face that crosses a
-pre-existing void boundary (the second operand's wall must be clipped to
-material and welded to the first void's wall along the shared saddle).
+this is faceted plane∩plane at the saddle, not analytic SSI.
+
+**Root cause refined (2026-06-13, deeper trace + experiment):** NOT a
+weld-tolerance problem. Both walls ARE split at the saddle (2nd diff:
+51 kept solid-A frags + 48 kept solid-B frags), but each operand imprints
+the saddle intersection INDEPENDENTLY, producing vertices that are not
+coincident — `canonicalise_face_edges_by_position` reports
+`canonical_collapses=0` even at a 1e-3 probe tolerance (1000× the model
+1e-6). So the kept A-wall fragments and B-wall fragments meet along two
+slightly different polylines → genuine gap → 15 open edges. Position-weld
+can't fix it because the points genuinely differ.
+
+**Fix direction — COREFINEMENT (cutting-edge consensus):** compute each
+face-pair intersection ONCE and insert the SAME shared vertices/edge into
+BOTH faces' splits, rather than letting each operand re-imprint. Two
+robustness substrates from current literature:
+- **Indirect predicates** (Cherchi/Livesu/Attene, "Interactive and Robust
+  Mesh Booleans" SIGGRAPH 2022; "Fast and Robust Mesh Arrangements" SIGGRAPH
+  Asia 2020, header-only OSS): represent an intersection vertex IMPLICITLY by
+  its defining construction (the 3 planes that meet there), so both faces
+  reference the identical point by construction — coincidence is exact, not
+  tolerance-based. Ties to #30 (exact predicates).
+- **CGAL-style corefinement**: exact constructions under the hood, both
+  surfaces refined along one shared polyline.
+Roshera is a B-Rep (not a triangle soup), so the targeted version: in
+`compute_face_intersections` / the split, intern the intersection curve's
+vertices in a shared table keyed by the implicit construction and reuse the
+same VertexId/EdgeId when imprinting both operands' faces. Ties to #6
+(persist boolean pcurves) and #30. Refs: arXiv:2205.14151, arXiv:2405.12949,
+ACM TOG EMBER (10.1145/3528223.3530181).
 
 ### #36 🟢 Boolean leaves invalid operand husks in the solid store
 After a boolean the consumed operands lingered in `SolidStore` as
