@@ -496,6 +496,25 @@ pub fn boolean_operation(
                 .with_output_solids([result_solid as u64]),
         );
 
+        // Retire the consumed operands. `reconstruct_topology` builds the
+        // result as a brand-new `Solid` (`model.solids.add`) whose faces
+        // re-reference the operands' surfaces/edges/vertices; the operand
+        // `Solid` records themselves are now degenerate shells that no
+        // longer describe a closed body. Left in the store they surface as
+        // phantom parts and — because op post-validation walks every solid
+        // — fail a later operation's whole-model validation with an
+        // unrelated Euler-characteristic error (the "husk" defect). Drop
+        // the records here, inside the rollback closure, so a failure
+        // before this point restores them via the snapshot and a success
+        // commits their removal. `result_solid` is always a fresh id
+        // distinct from both operands, so this never removes the result.
+        if solid_a != result_solid {
+            model.solids.remove(solid_a);
+        }
+        if solid_b != result_solid {
+            model.solids.remove(solid_b);
+        }
+
         Ok(result_solid)
     })
 }
@@ -15049,9 +15068,11 @@ mod tests {
 
         /// `A ∪ B` and `B ∪ A` must have the same success/failure parity.
         /// Different outcomes indicate asymmetric classification — a real
-        /// regression even at the current robustness ceiling. Both
-        /// orderings run against the same model so the solid IDs remain
-        /// addressable after each boolean creates a new output solid.
+        /// regression even at the current robustness ceiling. A boolean
+        /// CONSUMES its operands (they are removed from the store on
+        /// success — see #36), so the second ordering runs against
+        /// deep-cloned copies of the same geometry rather than the
+        /// now-retired originals.
         #[test]
         fn prop_tier2_union_commutativity_parity(
             a_dims in arb_box_dims(),
@@ -15060,11 +15081,15 @@ mod tests {
             let mut model = BRepModel::new();
             let a = make_box(&mut model, a_dims);
             let b = make_box(&mut model, b_dims);
+            let a2 = deep_clone_solid(&mut model, a, None)
+                .expect("deep_clone_solid must succeed for a valid box");
+            let b2 = deep_clone_solid(&mut model, b, None)
+                .expect("deep_clone_solid must succeed for a valid box");
             let r_ab = boolean_operation(
                 &mut model, a, b, BooleanOp::Union, BooleanOptions::default(),
             );
             let r_ba = boolean_operation(
-                &mut model, b, a, BooleanOp::Union, BooleanOptions::default(),
+                &mut model, b2, a2, BooleanOp::Union, BooleanOptions::default(),
             );
             check_tier1(&r_ab, &model, BooleanOp::Union)?;
             check_tier1(&r_ba, &model, BooleanOp::Union)?;
@@ -15085,11 +15110,16 @@ mod tests {
             let mut model = BRepModel::new();
             let a = make_box(&mut model, a_dims);
             let b = make_box(&mut model, b_dims);
+            // Boolean consumes its operands (#36); clone for ordering two.
+            let a2 = deep_clone_solid(&mut model, a, None)
+                .expect("deep_clone_solid must succeed for a valid box");
+            let b2 = deep_clone_solid(&mut model, b, None)
+                .expect("deep_clone_solid must succeed for a valid box");
             let r_ab = boolean_operation(
                 &mut model, a, b, BooleanOp::Intersection, BooleanOptions::default(),
             );
             let r_ba = boolean_operation(
-                &mut model, b, a, BooleanOp::Intersection, BooleanOptions::default(),
+                &mut model, b2, a2, BooleanOp::Intersection, BooleanOptions::default(),
             );
             check_tier1(&r_ab, &model, BooleanOp::Intersection)?;
             check_tier1(&r_ba, &model, BooleanOp::Intersection)?;

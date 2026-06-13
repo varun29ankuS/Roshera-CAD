@@ -1752,8 +1752,10 @@ fn validate_drafted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResu
             solid_id
         )));
     }
-    let result = crate::primitives::validation::validate_model_enhanced(
+    // #29 — scope verdict to the drafted solid (see validate_solid_scoped).
+    let result = crate::primitives::validation::validate_solid_scoped(
         model,
+        solid_id,
         crate::math::Tolerance::default(),
         crate::primitives::validation::ValidationLevel::Standard,
     );

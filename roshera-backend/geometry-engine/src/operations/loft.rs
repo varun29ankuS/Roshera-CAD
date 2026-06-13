@@ -1652,8 +1652,10 @@ fn validate_lofted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResul
     if model.solids.get(solid_id).is_none() {
         return Err(OperationError::InvalidBRep("Solid not found".to_string()));
     }
-    let result = crate::primitives::validation::validate_model_enhanced(
+    // #29 — scope verdict to the lofted solid (see validate_solid_scoped).
+    let result = crate::primitives::validation::validate_solid_scoped(
         model,
+        solid_id,
         crate::math::Tolerance::default(),
         crate::primitives::validation::ValidationLevel::Standard,
     );

@@ -133,6 +133,29 @@ pub enum ValidationError {
     },
 }
 
+impl ValidationError {
+    /// The solid this error is attributed to, when the variant carries an
+    /// [`EntityLocation`]. Returns `None` for model-global or
+    /// unattributed variants (`MissingEntity`, `ManufacturingError`,
+    /// `ToleranceError`, `FeatureError`, `AssemblyError`).
+    ///
+    /// Used by operation post-validation to scope a verdict to the solid
+    /// the op actually touched (see [`validate_solid_scoped`]).
+    pub fn solid_id(&self) -> Option<SolidId> {
+        match self {
+            ValidationError::TopologyError { location, .. }
+            | ValidationError::GeometryError { location, .. }
+            | ValidationError::OrientationError { location, .. }
+            | ValidationError::ConnectivityError { location, .. } => location.solid_id,
+            ValidationError::MissingEntity { .. }
+            | ValidationError::ManufacturingError { .. }
+            | ValidationError::ToleranceError { .. }
+            | ValidationError::FeatureError { .. }
+            | ValidationError::AssemblyError { .. } => None,
+        }
+    }
+}
+
 /// Entity location for precise error reporting
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntityLocation {
@@ -789,6 +812,33 @@ pub fn validate_model_enhanced(
 ) -> ValidationResult {
     let validator = ParallelValidator::new();
     validator.validate_model(model, tolerance, level)
+}
+
+/// Run [`validate_model_enhanced`] but scope the verdict to a single solid.
+///
+/// The enhanced sweep necessarily walks the whole model — cross-solid
+/// checks need the full picture — but an *operation's* post-validation
+/// must judge only the solid it just modified. A pre-existing defect on
+/// an unrelated solid (a boolean operand husk, another already-open part)
+/// is not this op's fault and must not fail it. This keeps errors
+/// attributed to `solid_id`, keeps model-global errors that carry no
+/// solid attribution, and drops errors pinned to a *different* solid.
+///
+/// See `KNOWN_BUGS.md` #29 (whole-model validation scope) for the defect
+/// this closes.
+pub fn validate_solid_scoped(
+    model: &BRepModel,
+    solid_id: SolidId,
+    tolerance: Tolerance,
+    level: ValidationLevel,
+) -> ValidationResult {
+    let mut result = validate_model_enhanced(model, tolerance, level);
+    result.errors.retain(|e| match e.solid_id() {
+        Some(sid) => sid == solid_id,
+        None => true,
+    });
+    result.is_valid = result.errors.is_empty();
+    result
 }
 
 /// Validate that a single shell is closed: every edge contained in any

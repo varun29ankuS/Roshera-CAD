@@ -17,14 +17,15 @@ saddle leaves ~15 open + 3 non-manifold edges. Repro:
 `boolean::tests::diff_intersecting_bores_35` (ignored). Localized to the
 saddle between the two bore cutters' facets.
 
-### #36 🔴 Boolean leaves invalid operand husks in the solid store
-After a boolean, the consumed operands remain in `SolidStore` as
-degenerate/invalid solids (Euler χ ≠ 2). The API drops the
-UUID→solid_id mapping but the kernel `Solid` persists. Live repro:
-extrude two boxes, union → result, but `GET /api/agent/parts` still
-lists both operands; each is invalid. **Amplifies #29.** Fix:
-`boolean_operation` must remove consumed operands from `SolidStore` on
-success. Workaround: `DELETE /api/agent/parts/{id}` the husks.
+### #36 🟢 Boolean leaves invalid operand husks in the solid store
+After a boolean the consumed operands lingered in `SolidStore` as
+degenerate solids (Euler χ ≠ 2) — phantom parts that amplified #29.
+Fixed: `boolean_operation` now removes both operands from `SolidStore`
+on success (inside the rollback closure, so a failure restores them).
+This aligns the kernel with the API, which already unregisters the
+operand UUIDs and broadcasts `object_deleted`. Verified live: a union's
+`GET /api/agent/parts` now lists only the result. Commutativity parity
+tests updated to `deep_clone` operands for the second ordering.
 
 ### #32 🔴 Coincident-face union produces invalid B-Rep (Same-Domain)
 Unioning a solid whose face sits *exactly coincident* on another's face
@@ -71,11 +72,15 @@ radius-feasibility gate. Low severity.
 
 ## Validation / model lifecycle
 
-### #29 🔴 Op post-validation runs over the WHOLE model
-A new operation's validation validates *every* solid, so any unrelated
-invalid solid (e.g. a #36 husk) blocks an otherwise-valid op. Confirmed
-live: chamfer rejected because of leftover union husks. Validation
-should scope to the solid(s) the op touched.
+### #29 🟡 Op post-validation runs over the WHOLE model
+A new operation's validation validated *every* solid, so any unrelated
+invalid solid (e.g. a #36 husk) blocked an otherwise-valid op.
+Added `validation::validate_solid_scoped(model, solid_id, …)` (keeps
+errors on the touched solid + model-global, drops other solids') and
+wired it into the 7 single-solid ops: chamfer, fillet, revolve,
+transform, draft, loft, shell. **Remaining (#39):** `blend` and
+`pattern` validate by face-sets (pattern spans multiple new solids) and
+need a face-set-scoped variant.
 
 ### #24 🔴 Sketch-extrude of a circle → 64 planar faces, not one cylinder
 A circular profile extrudes to a 64-sided faceted prism instead of an
