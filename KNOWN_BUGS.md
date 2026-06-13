@@ -11,6 +11,21 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ## Boolean
 
+### #41 🔴 Coaxial bore through a cylindrical boss drops the outer wall
+Found live (ladder step 6, bearing housing). `plate ∪ analytic-cylinder boss`
+(r30, interpenetrating) is CLEAN (open=0). Differencing a COAXIAL analytic
+cylinder bore (r15, same axis, through) → 600 open: the boss's OUTER wall
+(r30) is dropped entirely (diagnostic: boss top rim + base seam open, you see
+through where the r30 wall was; the r15 bore wall is intact). The r30 wall is
+wholly OUTSIDE the r15 bore → must be KEPT. A plain box−cylinder bore is
+clean, so the trigger is the bore being coaxial/concentric with a pre-existing
+analytic CYLINDER wall in the target. Likely root: difference face-
+classification / point-in-cutter membership mishandles a coaxial cylinder
+wall vs a cylinder cutter (concentric cylinders produce no SSI curve, and the
+boss wall face is then dropped rather than kept). Adjacent to #7/#35 but a
+distinct symptom. DEEP (classify core) — fresh context. Gate: housing
+watertight; kernel regression + widen brep_validation_oracle.
+
 ### #35 🟡 Difference cut intersecting another bore leaves open faces
 Box − vertical bore − crossing horizontal bore: the second cut's wall
 fragments where it breaks into the FIRST bore's void.
