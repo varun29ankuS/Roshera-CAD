@@ -1562,7 +1562,8 @@ pub async fn extrude_sketch(
         ));
     }
 
-    let result_solid_id = {
+    let suppress = crate::csketch::RecorderSuppressGuard::new(&state.timeline_recorder);
+    let build_result = {
         let mut model = model_handle.write().await;
 
         // Per-region multi-loop face construction: build one Face per
@@ -1652,8 +1653,47 @@ pub async fn extrude_sketch(
             )
             .map_err(ApiError::kernel_error)?;
         }
-        accumulator
+        Ok::<u32, ApiError>(accumulator)
     };
+    drop(suppress);
+    let result_solid_id = build_result?;
+
+    // Replayable consolidated event — see extrude_csketch for the
+    // rationale; the click-draft path records the identical payload
+    // shape so both sketch systems replay through one arm.
+    {
+        use geometry_engine::operations::recorder::OperationRecorder as _;
+        let frame_origin = session.plane.lift(0.0, 0.0);
+        let u_pt = session.plane.lift(1.0, 0.0);
+        let v_pt = session.plane.lift(0.0, 1.0);
+        let regions_json: Vec<serde_json::Value> = regions
+            .iter()
+            .map(|r| {
+                let outer = &shape_polygons[r.outer_shape_idx].2;
+                let holes: Vec<&Vec<[f64; 2]>> = r
+                    .hole_shape_idxs
+                    .iter()
+                    .map(|&i| &shape_polygons[i].2)
+                    .collect();
+                serde_json::json!({ "outer": outer, "holes": holes })
+            })
+            .collect();
+        let record = geometry_engine::operations::recorder::RecordedOperation::new(
+            "sketch_extrude",
+        )
+        .with_parameters(serde_json::json!({
+            "origin": [frame_origin.x, frame_origin.y, frame_origin.z],
+            "u_axis": [u_pt.x - frame_origin.x, u_pt.y - frame_origin.y, u_pt.z - frame_origin.z],
+            "v_axis": [v_pt.x - frame_origin.x, v_pt.y - frame_origin.y, v_pt.z - frame_origin.z],
+            "regions": regions_json,
+            "distance": body.distance,
+            "direction": [direction.x, direction.y, direction.z],
+        }))
+        .with_output_solids([result_solid_id as u64]);
+        if let Err(e) = state.timeline_recorder.record(record) {
+            tracing::warn!("sketch_extrude event not recorded: {e}");
+        }
+    }
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;

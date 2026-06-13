@@ -1332,7 +1332,15 @@ pub async fn extrude_csketch(
         regions_2d.push((outer, holes));
     }
 
-    let result_solid_id = {
+    // Suppress the kernel's inner events (extrude_face + region
+    // Unions) for the duration of the build: they are not replayable
+    // in isolation (their input faces/solids don't exist in a fresh
+    // model), and the timeline gets ONE self-contained
+    // `sketch_extrude` event below instead. `begin_pending` /
+    // `abort_pending` share staging state across recorder clones, so
+    // the model-attached recorder participates.
+    let suppress = RecorderSuppressGuard::new(&state.timeline_recorder);
+    let build_result = {
         let mut model = model_handle.write().await;
         let tolerance = Tolerance::default();
         let plane_origin = plane.lift(0.0, 0.0);
@@ -1402,8 +1410,40 @@ pub async fn extrude_csketch(
             )
             .map_err(ApiError::kernel_error)?;
         }
-        accumulator
+        Ok::<u32, ApiError>(accumulator)
     };
+    // Close the suppression window (drop = abort_pending) before the
+    // consolidated event below is recorded for real.
+    drop(suppress);
+    let result_solid_id = build_result?;
+
+    // The replayable record: everything needed to rebuild this solid
+    // from an empty model (frame + materialised region polygons),
+    // applied by `replay::dispatch_generic("sketch_extrude")` through
+    // the same kernel path. This is what makes time-scrub, undo
+    // reconciliation, and branch exploration work for sketch-built
+    // parts.
+    use geometry_engine::operations::recorder::OperationRecorder as _;
+    let frame_origin = plane.lift(0.0, 0.0);
+    let u_pt = plane.lift(1.0, 0.0);
+    let v_pt = plane.lift(0.0, 1.0);
+    let regions_json: Vec<serde_json::Value> = regions_2d
+        .iter()
+        .map(|(outer, holes)| serde_json::json!({ "outer": outer, "holes": holes }))
+        .collect();
+    let record = geometry_engine::operations::recorder::RecordedOperation::new("sketch_extrude")
+        .with_parameters(serde_json::json!({
+            "origin": [frame_origin.x, frame_origin.y, frame_origin.z],
+            "u_axis": [u_pt.x - frame_origin.x, u_pt.y - frame_origin.y, u_pt.z - frame_origin.z],
+            "v_axis": [v_pt.x - frame_origin.x, v_pt.y - frame_origin.y, v_pt.z - frame_origin.z],
+            "regions": regions_json,
+            "distance": req.distance,
+            "direction": [direction.x, direction.y, direction.z],
+        }))
+        .with_output_solids([result_solid_id as u64]);
+    if let Err(e) = state.timeline_recorder.record(record) {
+        tracing::warn!("sketch_extrude event not recorded: {e}");
+    }
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;
@@ -1598,6 +1638,31 @@ fn sample_topology_loop(
         ));
     }
     Ok(polygon)
+}
+
+/// Suppress kernel-recorded events for a scope. `begin_pending` on
+/// construction, `abort_pending` on drop — the suppression window
+/// closes on EVERY exit path, including `?` early returns. A leaked
+/// `begin_pending` would leave the process-wide recorder buffering
+/// every future event into its staging vec forever (silent timeline
+/// loss), which is why this is drop-based rather than a manual pair.
+pub(crate) struct RecorderSuppressGuard<'a> {
+    recorder: &'a timeline_engine::TimelineRecorder,
+}
+
+impl<'a> RecorderSuppressGuard<'a> {
+    pub(crate) fn new(recorder: &'a timeline_engine::TimelineRecorder) -> Self {
+        use geometry_engine::operations::recorder::OperationRecorder;
+        recorder.begin_pending();
+        Self { recorder }
+    }
+}
+
+impl Drop for RecorderSuppressGuard<'_> {
+    fn drop(&mut self) {
+        use geometry_engine::operations::recorder::OperationRecorder;
+        self.recorder.abort_pending();
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

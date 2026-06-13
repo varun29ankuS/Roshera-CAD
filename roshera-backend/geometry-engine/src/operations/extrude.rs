@@ -1370,6 +1370,156 @@ pub fn create_face_from_profile(
 /// stamped at `FaceOrientation::Forward` against the resulting plane.
 /// Inner loops are added separately by the caller via
 /// `Face::add_inner_loop` if needed.
+
+/// One extrusion region in plane-local coordinates: an outer boundary
+/// polygon plus zero or more hole polygons. The polygons are already
+/// materialised (arcs/circles chord-sampled); every vertex is (u, v)
+/// in the frame supplied to [`extrude_polygon_regions`].
+#[derive(Debug, Clone)]
+pub struct PolygonRegion {
+    pub outer: Vec<[f64; 2]>,
+    pub holes: Vec<Vec<[f64; 2]>>,
+}
+
+/// Build and extrude a set of polygon regions on an arbitrary plane
+/// frame, Union-folding multi-region results into one solid.
+///
+/// This is the SINGLE implementation behind both the api-server's
+/// sketch→solid bridges and the timeline's `sketch_extrude` replay arm
+/// (2026-06-13): sketch extrudes were unreplayable because the only
+/// recorded event was the kernel's `extrude_face`, whose input face
+/// does not exist in a fresh replay model. Handlers now record a
+/// self-contained `sketch_extrude` event (frame + materialised region
+/// polygons + distance) and replay rebuilds it here — one code path,
+/// no drift between live behaviour and replay.
+///
+/// Frame: `lift(p) = origin + u_axis·p[0] + v_axis·p[1]`; the default
+/// extrude direction is `u_axis × v_axis`.
+pub fn extrude_polygon_regions(
+    model: &mut BRepModel,
+    origin: Point3,
+    u_axis: Vector3,
+    v_axis: Vector3,
+    regions: &[PolygonRegion],
+    distance: f64,
+    direction: Option<Vector3>,
+    tolerance: crate::math::Tolerance,
+) -> OperationResult<u32> {
+    use crate::primitives::curve::{ParameterRange, Polyline};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+
+    if regions.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "extrude_polygon_regions: no regions supplied".to_string(),
+        ));
+    }
+    let normal = u_axis.cross(&v_axis);
+    let direction = direction.unwrap_or(normal);
+    let lift = |p: &[f64; 2]| -> Point3 {
+        Point3::new(
+            origin.x + u_axis.x * p[0] + v_axis.x * p[1],
+            origin.y + u_axis.y * p[0] + v_axis.y * p[1],
+            origin.z + u_axis.z * p[0] + v_axis.z * p[1],
+        )
+    };
+
+    // Closed-loop edge builder, mirroring the api-server's
+    // shared-Polyline-curve construction: one closed Polyline curve
+    // per loop, per-segment edges parameterised onto it, vertices
+    // de-duplicated through add_or_find so adjacent loops weld.
+    fn build_loop(
+        model: &mut BRepModel,
+        lifted: &[Point3],
+        tolerance: f64,
+    ) -> OperationResult<Vec<crate::primitives::edge::EdgeId>> {
+        use crate::primitives::curve::{ParameterRange, Polyline};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        let n = lifted.len();
+        if n < 3 {
+            return Err(OperationError::InvalidGeometry(format!(
+                "polygon loop has {n} vertices (need >= 3)"
+            )));
+        }
+        let mut verts = Vec::with_capacity(n + 1);
+        verts.extend_from_slice(lifted);
+        verts.push(lifted[0]);
+        let polyline = Polyline::new(verts)
+            .map_err(|e| OperationError::InvalidGeometry(format!("polyline curve: {e:?}")))?;
+        let curve_id = model.curves.add(Box::new(polyline));
+        let n_f = n as f64;
+        let mut edges = Vec::with_capacity(n);
+        for i in 0..n {
+            let p_start = lifted[i];
+            let p_end = lifted[(i + 1) % n];
+            let v_start = model
+                .vertices
+                .add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
+            let v_end = model
+                .vertices
+                .add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
+            if v_start == v_end {
+                return Err(OperationError::InvalidGeometry(format!(
+                    "polygon vertices {i} and {} collapse under tolerance {tolerance}",
+                    (i + 1) % n
+                )));
+            }
+            let edge = Edge::new(
+                0,
+                v_start,
+                v_end,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(i as f64 / n_f, (i as f64 + 1.0) / n_f),
+            );
+            edges.push(model.edges.add(edge));
+        }
+        Ok(edges)
+    }
+
+    let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
+    for region in regions {
+        let outer_lifted: Vec<Point3> = region.outer.iter().map(&lift).collect();
+        let outer_edges = build_loop(model, &outer_lifted, tolerance.distance())?;
+        let face_id = create_face_from_profile_with_plane(model, outer_edges, origin, normal)?;
+
+        for hole in &region.holes {
+            let hole_lifted: Vec<Point3> = hole.iter().map(&lift).collect();
+            let hole_edges = build_loop(model, &hole_lifted, tolerance.distance())?;
+            let mut inner_loop = Loop::new(0, LoopType::Inner);
+            for edge_id in &hole_edges {
+                inner_loop.add_edge(*edge_id, true);
+            }
+            let inner_loop_id = model.loops.add(inner_loop);
+            let face = model.faces.get_mut(face_id).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
+                    "face {face_id} disappeared before add_inner_loop"
+                ))
+            })?;
+            face.add_inner_loop(inner_loop_id);
+        }
+
+        let options = ExtrudeOptions {
+            direction,
+            distance,
+            ..ExtrudeOptions::default()
+        };
+        region_solids.push(extrude_face(model, face_id, options)?);
+    }
+
+    let mut accumulator = region_solids[0];
+    for &sid in &region_solids[1..] {
+        accumulator = crate::operations::boolean::boolean_operation(
+            model,
+            accumulator,
+            sid,
+            crate::operations::boolean::BooleanOp::Union,
+            crate::operations::boolean::BooleanOptions::default(),
+        )?;
+    }
+    Ok(accumulator)
+}
+
 pub fn create_face_from_profile_with_plane(
     model: &mut BRepModel,
     profile_edges: Vec<EdgeId>,

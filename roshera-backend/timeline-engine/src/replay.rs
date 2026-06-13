@@ -395,6 +395,81 @@ fn dispatch_generic(
             Ok(())
         }
 
+        "sketch_extrude" => {
+            // Self-contained sketch extrusion: frame + materialised
+            // region polygons. Replays through the SAME kernel helper
+            // the live api-server bridges use (extrude_polygon_regions),
+            // so replay cannot drift from live behaviour.
+            let vec3 = |key: &str| -> Option<geometry_engine::math::Vector3> {
+                let a = inner.get(key)?.as_array()?;
+                Some(geometry_engine::math::Vector3::new(
+                    a.first()?.as_f64()?,
+                    a.get(1)?.as_f64()?,
+                    a.get(2)?.as_f64()?,
+                ))
+            };
+            let point3 = |key: &str| -> Option<geometry_engine::math::Point3> {
+                let a = inner.get(key)?.as_array()?;
+                Some(geometry_engine::math::Point3::new(
+                    a.first()?.as_f64()?,
+                    a.get(1)?.as_f64()?,
+                    a.get(2)?.as_f64()?,
+                ))
+            };
+            let polygon = |v: &serde_json::Value| -> Option<Vec<[f64; 2]>> {
+                v.as_array()?
+                    .iter()
+                    .map(|p| {
+                        let pa = p.as_array()?;
+                        Some([pa.first()?.as_f64()?, pa.get(1)?.as_f64()?])
+                    })
+                    .collect()
+            };
+            let parsed = (|| -> Option<_> {
+                let origin = point3("origin")?;
+                let u_axis = vec3("u_axis")?;
+                let v_axis = vec3("v_axis")?;
+                let distance = inner.get("distance")?.as_f64()?;
+                let direction = vec3("direction");
+                let regions: Option<Vec<geometry_engine::operations::extrude::PolygonRegion>> =
+                    inner
+                        .get("regions")?
+                        .as_array()?
+                        .iter()
+                        .map(|r| {
+                            let outer = polygon(r.get("outer")?)?;
+                            let holes: Option<Vec<_>> =
+                                r.get("holes")?.as_array()?.iter().map(polygon).collect();
+                            Some(geometry_engine::operations::extrude::PolygonRegion {
+                                outer,
+                                holes: holes?,
+                            })
+                        })
+                        .collect();
+                Some((origin, u_axis, v_axis, regions?, distance, direction))
+            })();
+            match parsed {
+                Some((origin, u_axis, v_axis, regions, distance, direction)) => {
+                    geometry_engine::operations::extrude::extrude_polygon_regions(
+                        model,
+                        origin,
+                        u_axis,
+                        v_axis,
+                        &regions,
+                        distance,
+                        direction,
+                        geometry_engine::math::Tolerance::default(),
+                    )
+                    .map(|_| ())
+                    .map_err(|e| kernel_err(kind, &e))
+                }
+                None => Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing/malformed sketch_extrude payload".to_string(),
+                }),
+            }
+        }
+
         "boolean_union" | "boolean_intersection" | "boolean_difference" => {
             let op = match kind {
                 "boolean_union" => BooleanOp::Union,

@@ -415,6 +415,16 @@ impl Timeline {
     }
 
     /// Get events for a branch
+
+    /// Every checkpoint on the timeline, newest first. Read-only
+    /// accessor for the api-server's named-design-states surface; the
+    /// store itself stays crate-private.
+    pub fn list_checkpoints(&self) -> Vec<Checkpoint> {
+        let mut all: Vec<Checkpoint> = self.checkpoints.iter().map(|e| e.value().clone()).collect();
+        all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        all
+    }
+
     pub fn get_branch_events(
         &self,
         branch_id: &BranchId,
