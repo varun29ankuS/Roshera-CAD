@@ -2812,6 +2812,154 @@ async fn create_extrude(
     })))
 }
 
+/// POST /api/geometry/cylinder — create an ANALYTIC cylinder primitive: one
+/// smooth periodic lateral face, NOT a faceted N-gon prism. This is the
+/// round-bore / round-boss primitive. Because the wall is a true cylinder
+/// surface, it renders smooth (no axial facet seams — KNOWN_BUGS #24) and a
+/// boolean against a prismatic block uses the analytic plane∩cylinder path.
+///
+/// Request: `{ "center":[x,y,z], "axis":[x,y,z], "radius":r, "height":h, "name"?:s }`
+/// (center defaults to origin, axis to +Z).
+async fn create_cylinder_primitive(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::primitives::topology_builder::{GeometryId, TopologyBuilder};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let arr3 = |key: &str, default: Option<[f64; 3]>| -> Result<[f64; 3], ApiError> {
+        match payload.get(key) {
+            Some(v) => {
+                let a = v.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'{key}' must be an array of 3 numbers"),
+                    )
+                })?;
+                Ok([
+                    a[0].as_f64().unwrap_or(0.0),
+                    a[1].as_f64().unwrap_or(0.0),
+                    a[2].as_f64().unwrap_or(0.0),
+                ])
+            }
+            None => default.ok_or_else(|| ApiError::missing_field(key)),
+        }
+    };
+    let c = arr3("center", Some([0.0, 0.0, 0.0]))?;
+    let ax = arr3("axis", Some([0.0, 0.0, 1.0]))?;
+    let radius = payload
+        .get("radius")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("radius"))?;
+    let height = payload
+        .get("height")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("height"))?;
+    if !(radius.is_finite() && radius > 0.0) || !(height.is_finite() && height > 0.0) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "radius and height must be positive and finite".to_string(),
+        ));
+    }
+    let display_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let result_solid_id = {
+        let mut model = model_handle.write().await;
+        let gid = TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(c[0], c[1], c[2]),
+                Vector3::new(ax[0], ax[1], ax[2]),
+                radius,
+                height,
+            )
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("create_cylinder_3d failed: {e:?}"),
+                )
+            })?;
+        match gid {
+            GeometryId::Solid(id) => id,
+            other => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("create_cylinder_3d returned {other:?}, expected a solid"),
+                ))
+            }
+        }
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let t = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        (mesh, t.elapsed().as_millis() as u64)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = display_name.unwrap_or_else(|| format!("Cylinder {result_solid_id}"));
+    let parameters = serde_json::json!({
+        "center": c, "axis": ax, "radius": radius, "height": height,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "cylinder",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "cylinder",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 /// POST /api/geometry/face/extrude — direct-modeling face-pull. Pick a face
 /// of an existing solid + a distance + (optional) direction; the kernel
 /// extrudes that face into the parent solid.
@@ -5792,6 +5940,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/geometry/extrude",
             post(create_extrude).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/cylinder",
+            post(create_cylinder_primitive).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_create_geometry,
             )),
         )

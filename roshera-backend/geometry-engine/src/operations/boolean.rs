@@ -17296,4 +17296,52 @@ mod tests {
             );
         }
     }
+
+    /// #24 REGRESSION: a round bore made by differencing an ANALYTIC cylinder
+    /// from a block must be watertight AND stay smooth — one analytic cylinder
+    /// wall face, not N planar facets (the axial-seam-lines symptom). A faceted
+    /// N-gon bore would add N side faces; an analytic bore keeps the count
+    /// small. Exposed live via POST /api/geometry/cylinder.
+    #[test]
+    fn analytic_cylinder_bore_is_smooth_and_watertight_24() {
+        use crate::harness::watertight::manifold_report;
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let mut m = BRepModel::new();
+        let blk = make_box(&mut m, (80.0, 80.0, 40.0)); // z ∈ [-20, 20]
+        let cyl = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -25.0), Vector3::Z, 15.0, 50.0)
+            .expect("analytic cylinder")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {other:?}"),
+        };
+        let res = boolean_operation(
+            &mut m,
+            blk,
+            cyl,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("analytic-cylinder bore difference must succeed");
+        let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("manifold report");
+        assert!(
+            r.manifold && r.closed && r.oriented,
+            "#24: analytic bore must be watertight (open={}, nm={})",
+            r.boundary_edges,
+            r.nonmanifold_edges
+        );
+        // Smooth, not faceted: a round through-hole adds ONE analytic cylinder
+        // wall face. A 24-gon bore would push the face count past 24.
+        let fcount = m
+            .solids
+            .get(res)
+            .and_then(|s| m.shells.get(s.outer_shell))
+            .map(|sh| sh.faces.len())
+            .unwrap_or(0);
+        assert!(
+            fcount <= 10,
+            "#24: analytic bore must stay smooth (≤10 faces, one cylinder wall); \
+             got {fcount} — faceted?"
+        );
+    }
 }
