@@ -420,7 +420,7 @@ pub fn boolean_operation(
         // preserving for cases where no nesting fires; Slice 3 wires
         // selection + topology reconstruction to consume the new
         // structure.
-        let merged_faces = merge_same_origin_fragments(
+        let mut merged_faces = merge_same_origin_fragments(
             model,
             classified_faces,
             operation,
@@ -428,6 +428,15 @@ pub fn boolean_operation(
             solid_b,
             &options.common.tolerance,
         );
+        // #34: a difference cut concentric-and-larger than a pre-existing hole
+        // (e.g. a Ø54 counterbore over a Ø40 bore) leaves the smaller hole
+        // nested inside the cut hole on the same cap face — never-valid B-Rep
+        // whose dangling loop tessellates as open edges. Drop any inner loop
+        // contained within another inner loop of the same face, keeping the
+        // outer-most (correct) hole boundary.
+        for f in merged_faces.iter_mut() {
+            drop_nested_inner_loops(model, f);
+        }
         pipeline_trace(format_args!(
             "stage=merge_same_origin_fragments fragments={} with_inner_loops={} inner_loop_total={}",
             merged_faces.len(),
@@ -6080,10 +6089,104 @@ fn split_face_by_curves(
         if let Some(holes) = attached_holes.get(idx) {
             split_face.inner_loops.extend(holes.iter().cloned());
         }
+        drop_nested_inner_loops(model, &mut split_face);
         split_faces.push(split_face);
     }
 
     Ok(split_faces)
+}
+
+/// Remove any inner loop (hole) strictly contained within ANOTHER inner
+/// loop of the same face. A face's holes must be pairwise disjoint — a hole
+/// nested inside another hole is never valid B-Rep. This arises in a
+/// DIFFERENCE when the cut is concentric-and-larger than a pre-existing
+/// hole (e.g. a Ø54 counterbore over a Ø40 bore): the cut becomes the
+/// face's inner boundary, the pre-existing smaller hole now lies inside the
+/// removed material, and its loop is left dangling — open edges on the cap
+/// (#34). Dropping the contained loop keeps only the outer-most hole, which
+/// is the correct boundary. Same invariant as #27 part-1's nest-guard,
+/// applied to a single face's finalized inner loops.
+fn drop_nested_inner_loops(model: &BRepModel, face: &mut SplitFace) {
+    if face.inner_loops.len() < 2 {
+        return;
+    }
+    let Some(surface) = model.surfaces.get(face.surface) else {
+        return;
+    };
+    let loops_3d: Vec<Vec<Point3>> = face
+        .inner_loops
+        .iter()
+        .map(|lp| extract_cycle_vertices_3d(&lp.iter().map(|&(e, _)| e).collect::<Vec<_>>(), model))
+        .collect();
+    // Tangent frame at the centroid of all inner-loop vertices (planar →
+    // constant over the face; same construction as the other hole helpers).
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    let mut sz = 0.0;
+    let mut cnt = 0usize;
+    for v in loops_3d.iter().flatten() {
+        sx += v.x;
+        sy += v.y;
+        sz += v.z;
+        cnt += 1;
+    }
+    if cnt == 0 {
+        return;
+    }
+    let anchor = Point3::new(sx / cnt as f64, sy / cnt as f64, sz / cnt as f64);
+    let tol = Tolerance::default();
+    let Ok((u0, v0)) = surface.closest_point(&anchor, tol) else {
+        return;
+    };
+    let Ok(sp) = surface.evaluate_full(u0, v0) else {
+        return;
+    };
+    let Ok(e1) = sp.du.normalize() else {
+        return;
+    };
+    let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
+    let Ok(e2) = dv_perp.normalize() else {
+        return;
+    };
+    let origin = sp.position;
+    let polys: Vec<Vec<(f64, f64)>> = loops_3d
+        .iter()
+        .map(|verts| {
+            verts
+                .iter()
+                .map(|p| {
+                    let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                    (d.dot(&e1), d.dot(&e2))
+                })
+                .collect()
+        })
+        .collect();
+    let n = polys.len();
+    let mut drop = vec![false; n];
+    for i in 0..n {
+        if polys[i].len() < 3 {
+            continue;
+        }
+        for j in 0..n {
+            if i == j || drop[j] || polys[j].len() < 3 {
+                continue;
+            }
+            // inner loop i lies strictly inside inner loop j → i is nested → drop it.
+            if uv_polygon_strictly_contains(&polys[j], &polys[i]) {
+                drop[i] = true;
+                break;
+            }
+        }
+    }
+    if drop.iter().any(|&d| d) {
+        let kept: Vec<_> = face
+            .inner_loops
+            .drain(..)
+            .enumerate()
+            .filter_map(|(i, lp)| if drop[i] { None } else { Some(lp) })
+            .collect();
+        face.inner_loops = kept;
+    }
 }
 
 /// Partition cycles emitted by `extract_regions` into "outer fragment"
@@ -16824,8 +16927,10 @@ mod tests {
     /// Was: 64 open edges (floor missing) because the cap's centroid lands in
     /// the bore void and misclassifies Outside (the difference-side analogue
     /// of #27). `cargo test -p geometry-engine diff_blind_counterbore -- --ignored --nocapture`.
+    /// FIXED (drop_nested_inner_loops after merge): the counterbore (r27)
+    /// subsumes the bore (r20) at the top cap; the stale r20 inner loop is
+    /// now dropped so the cap keeps a single r27 hole.
     #[test]
-    #[ignore = "tracks #34: counterbore floor inner-rim T-junction weld — un-ignore when fixed"]
     fn diff_blind_counterbore_floor_34() {
         use crate::harness::watertight::manifold_report;
         use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
