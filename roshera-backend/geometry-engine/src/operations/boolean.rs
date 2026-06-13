@@ -16997,4 +16997,102 @@ mod tests {
             r.nonmanifold_edges
         );
     }
+
+    /// #35 REGRESSION: a difference cut passing through a region already
+    /// hollowed by a prior bore (two intersecting cylindrical voids) must stay
+    /// watertight. A horizontal bore crossing a vertical bore (the engine
+    /// crank-tunnel ∩ cylinder-bore case) currently fragments the second cut's
+    /// wall at the saddle intersection → open edges. `#[ignore]` until fixed.
+    #[test]
+    #[ignore = "tracks #35: difference cut intersecting another bore leaves open faces"]
+    fn diff_intersecting_bores_35() {
+        use crate::harness::watertight::manifold_report;
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+        let ngon = |cx: f64, cy: f64, r: f64, n: usize| -> Vec<[f64; 2]> {
+            (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * (i as f64) / (n as f64);
+                    [cx + r * a.cos(), cy + r * a.sin()]
+                })
+                .collect()
+        };
+        let tol = Tolerance::default();
+        let mut m = BRepModel::new();
+        // Block 80 × 40 × 40.
+        let block = extrude_polygon_regions(
+            &mut m,
+            Point3::ORIGIN,
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer: vec![[0.0, 0.0], [80.0, 0.0], [80.0, 40.0], [0.0, 40.0]],
+                holes: vec![],
+            }],
+            40.0,
+            None,
+            tol,
+        )
+        .expect("block");
+        // Vertical bore r10 at (40,20), through Z.
+        let vbore = extrude_polygon_regions(
+            &mut m,
+            Point3::new(0.0, 0.0, -5.0),
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer: ngon(40.0, 20.0, 10.0, 24),
+                holes: vec![],
+            }],
+            50.0,
+            None,
+            tol,
+        )
+        .expect("vbore");
+        let b1 = boolean_operation(
+            &mut m,
+            block,
+            vbore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("vbore diff");
+        // Horizontal bore r10 along X at (y20,z20), through — INTERSECTS the
+        // vertical bore void at ~(40,20,20).
+        let hbore = extrude_polygon_regions(
+            &mut m,
+            Point3::new(-5.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            &[PolygonRegion {
+                outer: ngon(20.0, 20.0, 10.0, 24),
+                holes: vec![],
+            }],
+            90.0,
+            None,
+            tol,
+        )
+        .expect("hbore");
+        let res = boolean_operation(
+            &mut m,
+            b1,
+            hbore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("hbore diff");
+        let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("report");
+        eprintln!(
+            "[#35] open_edges={} nonmanifold={} euler={} valid={}",
+            r.boundary_edges,
+            r.nonmanifold_edges,
+            r.euler_characteristic,
+            r.manifold && r.closed && r.oriented
+        );
+        assert!(
+            r.boundary_edges == 0 && r.nonmanifold_edges == 0,
+            "#35: intersecting bores must be watertight (open={}, nm={})",
+            r.boundary_edges,
+            r.nonmanifold_edges
+        );
+    }
 }
