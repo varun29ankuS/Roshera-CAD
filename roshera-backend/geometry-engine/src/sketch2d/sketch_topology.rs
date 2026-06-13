@@ -30,6 +30,7 @@ pub enum EdgeType {
     Arc,
     Circle,
     Spline,
+    Ellipse,
     PolylineSegment(usize), // Index of segment in polyline
 }
 
@@ -300,11 +301,49 @@ impl SketchTopology {
             }
         }
 
-        // Ellipses and splines are deliberately not added to the topology
-        // edge graph: they can introduce non-circular curvature that the
-        // current loop-extraction passes (line/arc/polyline only) cannot
-        // walk without sampling. Sketches containing them produce open
-        // profiles and surface as such in validation.
+        // Add spline edges. The oriented loop walker chains edges by
+        // endpoint coincidence, and the profile materialiser samples
+        // `Spline2d::evaluate` over the recorded param range — so
+        // splines participate in closed profiles like any other curve.
+        // A closed spline (start ≈ end) forms a single-edge loop
+        // exactly like a circle. The bounds hint covers the
+        // control-polygon box (the curve lies inside its control
+        // hull), keeping loop bounds and containment honest for curves
+        // that bulge past their chord.
+        for entry in sketch.splines().iter() {
+            let spline = entry.value();
+            let (start, end) = match (spline.spline.evaluate(0.0), spline.spline.evaluate(1.0)) {
+                (Ok(s), Ok(e)) => (s, e),
+                _ => continue, // unevaluable spline cannot bound a profile
+            };
+            self.edges.push(TopologyEdge {
+                entity: EntityRef::Spline(spline.id),
+                edge_type: EdgeType::Spline,
+                start,
+                end,
+                forward: true,
+                param_range: Some((0.0, 1.0)),
+                bounds_hint: Some(spline.bounding_box()),
+            });
+        }
+
+        // Add ellipse edges (closed single-edge loops, like circles).
+        // Param range is the angle convention of `Ellipse2d::evaluate`
+        // (0..2pi); the bounds hint carries the rotated extents.
+        for entry in sketch.ellipses().iter() {
+            let ellipse = entry.value();
+            let start = ellipse.ellipse.evaluate(0.0);
+            self.edges.push(TopologyEdge {
+                entity: EntityRef::Ellipse(ellipse.id),
+                edge_type: EdgeType::Ellipse,
+                start,
+                end: start, // closed
+                forward: true,
+                param_range: Some((0.0, 2.0 * std::f64::consts::PI)),
+                bounds_hint: Some(ellipse.bounding_box()),
+            });
+        }
+
         Ok(())
     }
 
@@ -629,19 +668,28 @@ impl SketchTopology {
         };
         let test = first_edge.start;
 
-        // A single-edge closed loop (full circle) has a degenerate
-        // chord polyline — the even-odd ray cast below would see zero
-        // crossings and report "contains nothing". Decide analytically
-        // from its bounds instead (centre + radius are exact for a
-        // circle's axis-aligned box).
+        // A single-edge closed loop (full circle / ellipse) has a
+        // degenerate chord polyline — the even-odd ray cast below
+        // would see zero crossings and report "contains nothing".
+        // Decide analytically from its bounds instead: an ellipse
+        // inscribed in the box, (dx/rx)^2 + (dy/ry)^2 < 1. Exact for
+        // circles and axis-aligned ellipses; for ROTATED ellipses the
+        // AABB-inscribed ellipse over-approximates the true curve, so
+        // containment of points near the rotated corners can
+        // misclassify — acceptable until topology edges carry sampled
+        // boundary polylines.
         if loop_i.edges.len() == 1 {
             let (min_i, max_i) = loop_i.bounds;
             let cx = (min_i.x + max_i.x) / 2.0;
             let cy = (min_i.y + max_i.y) / 2.0;
-            let r = (max_i.x - min_i.x) / 2.0;
-            let dx = test.x - cx;
-            let dy = test.y - cy;
-            return dx * dx + dy * dy < r * r;
+            let rx = (max_i.x - min_i.x) / 2.0;
+            let ry = (max_i.y - min_i.y) / 2.0;
+            if rx <= 0.0 || ry <= 0.0 {
+                return false;
+            }
+            let dx = (test.x - cx) / rx;
+            let dy = (test.y - cy) / ry;
+            return dx * dx + dy * dy < 1.0;
         }
 
         // Even-odd ray cast in +X against loop_i's edge polyline.
@@ -1078,5 +1126,93 @@ mod tests {
         assert_eq!(topo.regions().len(), 2);
         assert_eq!(topo.profile_type(), ProfileType::Disjoint);
         assert!(topo.is_valid_for_extrusion());
+    }
+}
+
+#[cfg(test)]
+mod spline_profile_tests {
+    //! Splines as profile boundaries (SKETCH-DCM showpiece slice,
+    //! 2026-06-13): a line+spline closed chain and a closed spline
+    //! must both form extrudable regions.
+    use super::*;
+    use crate::sketch2d::{Sketch, SketchAnchor, Spline2d, Tolerance2d};
+
+    #[test]
+    fn line_plus_spline_chain_forms_a_region() {
+        let s = Sketch::new("t".to_string(), SketchAnchor::xy());
+        // Open cubic B-Spline from (0,0) to (40,0) bulging upward;
+        // clamped knot vector so evaluate(0)/evaluate(1) hit the
+        // endpoint control points exactly.
+        s.add_bspline(
+            3,
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(10.0, 25.0),
+                Point2d::new(30.0, 25.0),
+                Point2d::new(40.0, 0.0),
+            ],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        )
+        .expect("bspline must construct");
+        // Straight return edge closing the chain.
+        let a = s.add_point(Point2d::new(40.0, 0.0));
+        let b = s.add_point(Point2d::new(0.0, 0.0));
+        s.add_line(a, b).expect("closing line");
+
+        let topo = SketchTopology::analyze(&s, &Tolerance2d::default()).expect("analysis succeeds");
+        assert_eq!(topo.loops().len(), 1, "spline+line loop expected");
+        assert_eq!(topo.regions().len(), 1);
+        assert!(topo.is_valid_for_extrusion());
+        // Bounds must include the spline's bulge (control hull up to
+        // y=25), not just the chord at y=0.
+        let (_min, max) = topo.loops()[0].bounds;
+        assert!(
+            max.y > 10.0,
+            "loop bounds must cover the spline bulge, got max.y={}",
+            max.y
+        );
+    }
+}
+
+#[cfg(test)]
+mod ellipse_profile_tests {
+    use super::*;
+    use crate::sketch2d::{Sketch, SketchAnchor, Tolerance2d};
+
+    #[test]
+    fn lone_ellipse_is_a_closed_simple_profile() {
+        let s = Sketch::new("t".to_string(), SketchAnchor::xy());
+        s.add_ellipse(Point2d::new(0.0, 0.0), 20.0, 10.0, 0.0)
+            .expect("ellipse must construct");
+        let topo = SketchTopology::analyze(&s, &Tolerance2d::default()).expect("analysis succeeds");
+        assert_eq!(topo.loops().len(), 1, "single-edge ellipse loop");
+        assert_eq!(topo.regions().len(), 1);
+        assert!(topo.is_valid_for_extrusion());
+        let area = topo.loops()[0].area;
+        let expected = std::f64::consts::PI * 20.0 * 10.0;
+        assert!(
+            (area - expected).abs() < 1e-6,
+            "pi*a*b from bounds fallback, got {area} want {expected}"
+        );
+    }
+
+    #[test]
+    fn ellipse_inside_rectangle_is_a_hole() {
+        let s = Sketch::new("t".to_string(), SketchAnchor::xy());
+        s.add_polyline(
+            vec![
+                Point2d::new(-50.0, -30.0),
+                Point2d::new(50.0, -30.0),
+                Point2d::new(50.0, 30.0),
+                Point2d::new(-50.0, 30.0),
+            ],
+            true,
+        )
+        .expect("rect");
+        s.add_ellipse(Point2d::new(0.0, 0.0), 20.0, 10.0, 0.0)
+            .expect("ellipse");
+        let topo = SketchTopology::analyze(&s, &Tolerance2d::default()).expect("analysis succeeds");
+        assert_eq!(topo.regions().len(), 1, "ellipse nests as hole");
+        assert_eq!(topo.regions()[0].inner_loops.len(), 1);
     }
 }

@@ -1599,6 +1599,21 @@ fn sample_topology_loop(
                     polygon.push([p.x, p.y]);
                 }
             }
+            (EdgeType::Ellipse, EntityRef::Ellipse(ellipse_id)) => {
+                let entry = sketch.ellipses().get(ellipse_id).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("loop references missing ellipse {ellipse_id}"),
+                    )
+                })?;
+                let n = SEGMENTS_PER_TURN as usize;
+                for j in 0..n {
+                    let angle = (j as f64 / n as f64) * std::f64::consts::TAU;
+                    let angle = if walk_forward { angle } else { -angle };
+                    let p = entry.value().ellipse.evaluate(angle);
+                    polygon.push([p.x, p.y]);
+                }
+            }
             (EdgeType::Spline, EntityRef::Spline(spline_id)) => {
                 let spline_entry = sketch.splines().get(spline_id).ok_or_else(|| {
                     ApiError::new(
