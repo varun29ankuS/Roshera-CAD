@@ -75,6 +75,14 @@ pub enum RenderMode {
     /// Per-triangle world-space normal encoded as RGB ((n+1)/2 · 255).
     /// Surface-orientation channel of the G-buffer.
     Normals,
+    /// Defect-finder for boolean/tessellation errors. Renders shaded with
+    /// FRONT-FACE CULLING (so a missing or inward-flipped face shows as a
+    /// see-through hole, exactly as a front-side viewer sees it), then
+    /// overlays the mesh's broken edges: OPEN/boundary edges (bordered by
+    /// one triangle — a hole rim) in bright RED, NON-MANIFOLD edges
+    /// (bordered by 3+ triangles — overlapping/duplicate faces) in MAGENTA.
+    /// `RenderFrame::{open_edges, nonmanifold_edges}` carry the counts.
+    Diagnostic,
 }
 
 /// Render request.
@@ -110,6 +118,12 @@ pub struct RenderFrame {
     /// color (whether or not it survived the depth test). Empty in
     /// `Shaded` mode.
     pub face_legend: Vec<(u32, [u8; 3])>,
+    /// `Diagnostic` mode: count of OPEN (boundary) undirected mesh edges —
+    /// a hole rim where a face is missing. 0 elsewhere.
+    pub open_edges: usize,
+    /// `Diagnostic` mode: count of NON-MANIFOLD undirected mesh edges
+    /// (bordered by 3+ triangles — overlapping/duplicate faces). 0 elsewhere.
+    pub nonmanifold_edges: usize,
 }
 
 impl RenderFrame {
@@ -190,6 +204,58 @@ pub fn render_solid(
         return None;
     }
 
+    // Defect analysis (Diagnostic mode): weld per-face vertices by position,
+    // then count how many triangles border each undirected edge. A closed
+    // manifold borders every edge with exactly 2; 1 = OPEN (hole rim, a
+    // missing face), 3+ = NON-MANIFOLD (overlapping/duplicate faces). The
+    // representative welded vertex is an original index so endpoints project
+    // through the same `px` table the triangles use.
+    let mut defect_open: Vec<(usize, usize)> = Vec::new();
+    let mut defect_nonmanifold: Vec<(usize, usize)> = Vec::new();
+    if opts.mode == RenderMode::Diagnostic {
+        use std::collections::HashMap;
+        const Q: f64 = 1.0e5; // 1e-5 length weld
+        let key = |p: &Point3| -> (i64, i64, i64) {
+            (
+                (p.x * Q).round() as i64,
+                (p.y * Q).round() as i64,
+                (p.z * Q).round() as i64,
+            )
+        };
+        let mut canon: HashMap<(i64, i64, i64), usize> = HashMap::new();
+        let vert_canon: Vec<usize> = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(i, v)| *canon.entry(key(&v.position)).or_insert(i))
+            .collect();
+        let mut edge_count: HashMap<(usize, usize), u32> = HashMap::new();
+        for tri in &mesh.triangles {
+            let cs = [
+                vert_canon[tri[0] as usize],
+                vert_canon[tri[1] as usize],
+                vert_canon[tri[2] as usize],
+            ];
+            for k in 0..3 {
+                let (a, b) = (cs[k], cs[(k + 1) % 3]);
+                if a == b {
+                    continue;
+                }
+                let e = if a < b { (a, b) } else { (b, a) };
+                *edge_count.entry(e).or_insert(0) += 1;
+            }
+        }
+        for (&e, &c) in &edge_count {
+            if c == 1 {
+                defect_open.push(e);
+            } else if c >= 3 {
+                defect_nonmanifold.push(e);
+            }
+        }
+    }
+    let open_edges = defect_open.len();
+    let nonmanifold_edges = defect_nonmanifold.len();
+
     // Camera basis: right/up orthonormal to the view direction.
     let dir = opts.view.direction();
     let up_hint = opts.view.up_hint();
@@ -247,7 +313,9 @@ pub fn render_solid(
             .enumerate()
             .map(|(n, &fid)| (fid, face_color(n)))
             .collect(),
-        RenderMode::Shaded | RenderMode::Depth | RenderMode::Normals => Vec::new(),
+        RenderMode::Shaded | RenderMode::Depth | RenderMode::Normals | RenderMode::Diagnostic => {
+            Vec::new()
+        }
     };
     let color_of_face = |fid: u32| -> [u8; 3] {
         match face_legend.binary_search_by_key(&fid, |&(f, _)| f) {
@@ -287,9 +355,21 @@ pub fn render_solid(
                 Vector3::new(0.0, 0.0, 0.0)
             }
         };
+        // Diagnostic mode: front-face cull. A back-facing triangle is the
+        // far wall (correctly hidden) OR an inward-flipped face; culling it
+        // makes a missing/flipped face read as a see-through hole, matching
+        // a front-side viewer (which is why such defects hide from the
+        // double-sided Shaded render but show in the browser).
+        if opts.mode == RenderMode::Diagnostic && tri_normal.dot(&dir) > 1.0e-9 {
+            continue;
+        }
         let shade_color = match opts.mode {
             RenderMode::FaceIds => {
                 color_of_face(mesh.face_map.get(ti).copied().unwrap_or(u32::MAX))
+            }
+            RenderMode::Diagnostic => {
+                let g = (60.0 + 175.0 * tri_normal.dot(&dir).abs()) as u8;
+                [g, g, g]
             }
             RenderMode::Shaded => {
                 // Headlight lambert, orientation-independent via abs().
@@ -362,10 +442,45 @@ pub fn render_solid(
         }
     }
 
+    // Diagnostic overlay: stroke broken edges on top of the culled render.
+    // Non-manifold first (magenta), open edges last (red) so hole rims —
+    // the "missing surface" signal — are the most prominent.
+    if opts.mode == RenderMode::Diagnostic {
+        let (w, h) = (opts.width, opts.height);
+        let mut stroke = |e: &(usize, usize), col: [u8; 3]| {
+            let (a, b) = (px[e.0], px[e.1]);
+            let steps = (a.0 - b.0).abs().max((a.1 - b.1).abs()).ceil().max(1.0) as i32;
+            for s in 0..=steps {
+                let t = s as f64 / steps as f64;
+                let cx = (a.0 + (b.0 - a.0) * t).round() as i32;
+                let cy = (a.1 + (b.1 - a.1) * t).round() as i32;
+                for dy in -1..=1i32 {
+                    for dx in -1..=1i32 {
+                        let (xx, yy) = (cx + dx, cy + dy);
+                        if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                            let p = ((yy as usize) * w + xx as usize) * 3;
+                            pixels[p] = col[0];
+                            pixels[p + 1] = col[1];
+                            pixels[p + 2] = col[2];
+                        }
+                    }
+                }
+            }
+        };
+        for e in &defect_nonmanifold {
+            stroke(e, [255, 0, 255]);
+        }
+        for e in &defect_open {
+            stroke(e, [255, 0, 0]);
+        }
+    }
+
     Some(RenderFrame {
         width: opts.width,
         height: opts.height,
         pixels,
         face_legend,
+        open_edges,
+        nonmanifold_edges,
     })
 }

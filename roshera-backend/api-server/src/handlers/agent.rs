@@ -341,6 +341,12 @@ pub struct RenderResponse {
     /// Populated in `ids` mode: exact color → face mapping (flat colors,
     /// so the mapping survives image resampling).
     pub face_legend: Vec<FaceLegendEntry>,
+    /// `diagnostic` mode: count of OPEN (boundary) mesh edges — missing-face
+    /// hole rims, drawn red in the image. 0 in other modes.
+    pub open_edges: usize,
+    /// `diagnostic` mode: count of NON-MANIFOLD mesh edges (3+ triangles —
+    /// overlapping/duplicate faces), drawn magenta. 0 in other modes.
+    pub nonmanifold_edges: usize,
 }
 
 /// `GET /api/agent/parts/{id}/render` — the agent's eye.
@@ -378,6 +384,7 @@ pub async fn render_part(
         "ids" => RenderMode::FaceIds,
         "depth" => RenderMode::Depth,
         "normals" => RenderMode::Normals,
+        "diagnostic" => RenderMode::Diagnostic,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     let size = q.size.unwrap_or(512).clamp(64, 2048);
@@ -410,6 +417,8 @@ pub async fn render_part(
             .iter()
             .map(|&(face_id, rgb)| FaceLegendEntry { face_id, rgb })
             .collect(),
+        open_edges: frame.open_edges,
+        nonmanifold_edges: frame.nonmanifold_edges,
     }))
 }
 
