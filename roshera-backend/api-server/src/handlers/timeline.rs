@@ -1490,6 +1490,104 @@ pub async fn truncate_history(
     })))
 }
 
+/// Request to clear a branch's history outright.
+///
+/// Unlike [`TruncateHistoryRequest`] this carries no `event_id` — it
+/// drops *every* event on the branch (cut at index 0) and rebuilds the
+/// live model against the now-empty prefix, leaving a clean slate.
+/// `branch_id` defaults to `main`.
+#[derive(Serialize, Deserialize)]
+pub struct ClearHistoryRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub branch_id: Option<String>,
+}
+
+/// Clear an entire branch's timeline back to zero events and wipe the
+/// live model to match.
+///
+/// This is the "start over" / "reset timeline" action the UI needs when
+/// a session has accumulated stale events that per-event truncation
+/// can't reach (the user has no specific event to cut from, they just
+/// want an empty ledger). Because `main` is a protected branch, the
+/// HTTP truncate path refuses it; this endpoint force-truncates from
+/// index 0 so the trunk itself can be reset. It is destructive and
+/// irreversible — the frontend must confirm before issuing it.
+pub async fn clear_history(
+    State(state): State<AppState>,
+    Json(request): Json<ClearHistoryRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let branch_id = match request.branch_id.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+
+    // Seed a session position before we mutate, so the post-clear replay
+    // step doesn't 404 with `SessionNotFound`.
+    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
+        tracing::error!(
+            target: "timeline.clear",
+            session = %session_uuid,
+            error = %err,
+            "failed to seed session position; clear aborted"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Drop every event on the branch. `force = true` — this endpoint is
+    // the deliberate admin/reset path that is allowed to rewrite the
+    // protected `main` trunk, unlike the per-event truncate handler.
+    let removed = {
+        let timeline = state.timeline.read().await;
+        timeline.truncate_branch(branch_id, 0, true).map_err(|e| {
+            tracing::error!(
+                target: "timeline.clear",
+                branch = %branch_id,
+                error = %e,
+                "branch clear failed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
+
+    // Rebuild the live model from the now-empty prefix and push
+    // ObjectDeleted frames so every connected client refreshes to empty.
+    let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
+        Ok(outcome) => Some(outcome),
+        Err(err) => {
+            tracing::error!(
+                target: "timeline.clear",
+                session = %session_uuid,
+                error = %err,
+                "model replay after clear failed; clients may see stale geometry"
+            );
+            None
+        }
+    };
+
+    let _ = state
+        .session_manager
+        .broadcast_manager()
+        .broadcast_to_session(
+            &request.session_id,
+            BroadcastMessage::TimelineUpdate {
+                session_id: session_uuid,
+                event_id: String::new(),
+                operation: "clear".to_string(),
+                user_id: "system".to_string(),
+            },
+        )
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "events_removed": removed,
+        "model_reconciled": replay_outcome.is_some(),
+        "branch_id": branch_id.to_string(),
+    })))
+}
+
 /// Redo the last undone operation
 pub async fn redo_operation(
     State(state): State<AppState>,
