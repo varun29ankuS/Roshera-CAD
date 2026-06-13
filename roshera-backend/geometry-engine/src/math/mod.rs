@@ -22,11 +22,13 @@ pub mod bbox;
 pub mod constants;
 pub mod exact_predicates;
 pub mod matrix3;
+// Generalized winding number: robust global point-in-solid classification
 pub mod plane_math;
 pub mod quaternion;
 pub mod ray;
 pub mod test_math;
 pub mod vector2;
+pub mod winding_number;
 
 // Advanced curve/surface mathematics
 pub mod bspline;
