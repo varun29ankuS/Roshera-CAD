@@ -2106,6 +2106,151 @@ async fn chamfer_edges_endpoint(
 ///   "count":     3                   // total instances incl. original (≥ 2)
 /// }
 /// ```
+/// POST /api/geometry/transform — move a solid IN PLACE by a translation
+/// and/or a rotation, then rebroadcast its mesh under the SAME uuid so the
+/// viewport updates the existing object (identity preserved; the kernel
+/// transform mutates the solid). Rotation is applied first (about `center`,
+/// default origin), then translation.
+///
+/// Request:
+/// ```json
+/// { "object": "<uuid>",
+///   "translation": [dx, dy, dz],                              // optional
+///   "rotation": { "axis": [x,y,z], "angle": <radians>,
+///                 "center": [cx,cy,cz] } }                     // optional
+/// ```
+async fn transform_geometry_endpoint(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::math::{Matrix4, Point3, Vector3};
+    use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let object_uuid_str = payload
+        .get("object")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("object"))?;
+    let object_uuid = Uuid::parse_str(object_uuid_str).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("'object' is not a valid UUID: {object_uuid_str}"),
+        )
+    })?;
+    let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for object={object_uuid}"),
+        )
+    })?;
+
+    // Build the matrices to apply, in order: rotation (about center) then
+    // translation. Each is applied as its own transform_solid call.
+    let mut mats: Vec<Matrix4> = Vec::new();
+    if let Some(rot) = payload.get("rotation").filter(|v| v.is_object()) {
+        let axis = rot
+            .get("axis")
+            .and_then(|v| v.as_array())
+            .filter(|a| a.len() == 3)
+            .ok_or_else(|| ApiError::missing_field("rotation.axis (3 numbers)"))?;
+        let av = Vector3::new(
+            axis[0].as_f64().unwrap_or(0.0),
+            axis[1].as_f64().unwrap_or(0.0),
+            axis[2].as_f64().unwrap_or(0.0),
+        );
+        let len = av.magnitude();
+        if !len.is_finite() || len < 1e-9 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "rotation.axis must be a non-zero finite vector".to_string(),
+            ));
+        }
+        let axis_norm = Vector3::new(av.x / len, av.y / len, av.z / len);
+        let angle = rot
+            .get("angle")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| ApiError::missing_field("rotation.angle (radians)"))?;
+        let c = rot.get("center").and_then(|v| v.as_array());
+        let center = match c {
+            Some(a) if a.len() == 3 => Point3::new(
+                a[0].as_f64().unwrap_or(0.0),
+                a[1].as_f64().unwrap_or(0.0),
+                a[2].as_f64().unwrap_or(0.0),
+            ),
+            _ => Point3::ORIGIN,
+        };
+        let rmat = Matrix4::rotation_axis(center, axis_norm, angle).map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("rotation_axis failed: {e:?}"),
+            )
+        })?;
+        mats.push(rmat);
+    }
+    if let Some(t) = payload.get("translation").and_then(|v| v.as_array()) {
+        if t.len() != 3 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "'translation' must be a 3-element array".to_string(),
+            ));
+        }
+        mats.push(Matrix4::from_translation(&Vector3::new(
+            t[0].as_f64().unwrap_or(0.0),
+            t[1].as_f64().unwrap_or(0.0),
+            t[2].as_f64().unwrap_or(0.0),
+        )));
+    }
+    if mats.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "provide 'translation' and/or 'rotation'".to_string(),
+        ));
+    }
+
+    {
+        let mut model = model_handle.write().await;
+        for m in &mats {
+            transform_solid(&mut model, solid_id, *m, TransformOptions::default())
+                .map_err(ApiError::kernel_error)?;
+        }
+    }
+    let tri_mesh = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(solid_id))?;
+        tessellate_solid(solid, &model, &TessellationParams::default())
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals_buf, face_ids) = flatten_tri_mesh(&tri_mesh);
+    // Rebroadcast under the SAME uuid → the viewport replaces the object's
+    // mesh rather than creating a duplicate.
+    let params = serde_json::json!({ "object": object_uuid.to_string(), "transform": payload });
+    broadcast_object_created(
+        object_uuid_str,
+        "Transformed",
+        solid_id,
+        "transform",
+        &params,
+        &vertices,
+        &indices,
+        &normals_buf,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+    Ok(Json(
+        serde_json::json!({ "success": true, "object": object_uuid.to_string() }),
+    ))
+}
+
 async fn pattern_linear_endpoint(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -5685,6 +5830,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/geometry/transform",
+            post(transform_geometry_endpoint).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
+        )
+        .route(
             "/api/geometry/pattern/linear",
             post(pattern_linear_endpoint).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_modify_geometry,
@@ -6092,6 +6243,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/timeline/truncate",
             post(crate::handlers::timeline::truncate_history),
+        )
+        .route(
+            "/api/timeline/clear",
+            post(crate::handlers::timeline::clear_history),
         )
         .route("/api/timeline/checkpoint", post(create_checkpoint))
         .route(
