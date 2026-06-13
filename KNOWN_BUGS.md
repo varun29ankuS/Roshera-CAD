@@ -164,7 +164,7 @@ was rewritten to the neighbour bound. 682 operations tests green.
 
 ## Queries / bounding box / mass
 
-### #42 🔴 bbox/OBB/centroid of analytic curved solids ignore surface extent
+### #42 🟢 bbox/OBB/centroid of analytic curved solids ignored surface extent
 Found live (ladder step 7). An analytic cylinder at center (0,0,0) r10 h40
 reports `world_bbox min=(10,0,0) max=(10,0,40)` — ZERO extent in X/Y,
 collapsed to the seam line at (r,0). The cylinder is V2/E3/F3 (2 seam
@@ -174,10 +174,13 @@ assembly placement read every cylinder +r off in X. Geometry is correct
 (transform moves the real solid; renders watertight) — only the QUERY lies.
 Affects OBB, world_bbox, camera auto-frame, mass-properties centroid/inertia,
 part_distance — for ALL curved primitives (cylinder/sphere/cone/torus).
-Fix: bound the solid from FACE extent (tessellated-mesh bbox, or per-analytic-
-surface bbox), thread into OBB + mass-props. Contained query-layer fix, NOT
-the boolean core. Regression: cylinder r10 h40 at origin → AABB x[-10,10]
-y[-10,10] z[0,40], center (0,0,20).
+Fixed: `solid_world_bbox` and `oriented_bbox_for` now bound the TESSELLATED
+mesh (which samples every curved face's full extent), with the B-Rep
+vertex hull as fallback for degenerate/empty tessellation. The OBB centre
+now sits on the true COM instead of the seam. Regression:
+`topology_builder::…::solid_world_bbox_captures_cylinder_radial_extent_42`
+(cylinder r10 h40 → AABB x[-10,10] y[-10,10] z[0,40], centre (0,0,20)).
+Suites green: readable 60, topology_builder 67, mass-inertia harnesses.
 
 ## Validation / model lifecycle
 

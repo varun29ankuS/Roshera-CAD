@@ -473,45 +473,70 @@ impl BRepModel {
             ),
         ];
 
-        // Walk every vertex referenced by the outer shell and project
-        // onto each principal axis.
+        // Project the TESSELLATED surface onto each principal axis — not
+        // just the B-Rep vertices. A curved solid (cylinder/sphere/cone)
+        // carries only a couple of seam vertices, so a vertex-only
+        // projection collapses the extent to the seam and shifts the box
+        // centre off the true COM (KNOWN_BUGS #42). The tessellation samples
+        // the full curved extent of every face.
         let solid = self.solids.get(solid_id)?;
-        let outer_shell = self.shells.get(solid.outer_shell)?;
         let mut min_proj = [f64::INFINITY; 3];
         let mut max_proj = [f64::NEG_INFINITY; 3];
 
-        let mut visited_vertices = std::collections::HashSet::new();
-        for &face_id in &outer_shell.faces {
-            let face = match self.faces.get(face_id) {
-                Some(f) => f,
-                None => continue,
-            };
-            let outer_loop = match self.loops.get(face.outer_loop) {
-                Some(l) => l,
-                None => continue,
-            };
-            for &edge_id in &outer_loop.edges {
-                let edge = match self.edges.get(edge_id) {
-                    Some(e) => e,
+        let mesh = crate::tessellation::tessellate_solid(
+            solid,
+            self,
+            &crate::tessellation::TessellationParams::default(),
+        );
+        if !mesh.vertices.is_empty() {
+            for mv in &mesh.vertices {
+                let rel = mv.position - com;
+                for (i, axis) in axes_world.iter().enumerate() {
+                    let proj = rel.dot(axis);
+                    if proj < min_proj[i] {
+                        min_proj[i] = proj;
+                    }
+                    if proj > max_proj[i] {
+                        max_proj[i] = proj;
+                    }
+                }
+            }
+        } else {
+            // Fallback (degenerate / empty tessellation): B-Rep vertex hull.
+            let outer_shell = self.shells.get(solid.outer_shell)?;
+            let mut visited_vertices = std::collections::HashSet::new();
+            for &face_id in &outer_shell.faces {
+                let face = match self.faces.get(face_id) {
+                    Some(f) => f,
                     None => continue,
                 };
-                for vid in [edge.start_vertex, edge.end_vertex] {
-                    if !visited_vertices.insert(vid) {
-                        continue;
-                    }
-                    let vertex = match self.vertices.get(vid) {
-                        Some(v) => v,
+                let outer_loop = match self.loops.get(face.outer_loop) {
+                    Some(l) => l,
+                    None => continue,
+                };
+                for &edge_id in &outer_loop.edges {
+                    let edge = match self.edges.get(edge_id) {
+                        Some(e) => e,
                         None => continue,
                     };
-                    let p = vertex.point();
-                    let rel = p - com;
-                    for (i, axis) in axes_world.iter().enumerate() {
-                        let proj = rel.dot(axis);
-                        if proj < min_proj[i] {
-                            min_proj[i] = proj;
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if !visited_vertices.insert(vid) {
+                            continue;
                         }
-                        if proj > max_proj[i] {
-                            max_proj[i] = proj;
+                        let vertex = match self.vertices.get(vid) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let p = vertex.point();
+                        let rel = p - com;
+                        for (i, axis) in axes_world.iter().enumerate() {
+                            let proj = rel.dot(axis);
+                            if proj < min_proj[i] {
+                                min_proj[i] = proj;
+                            }
+                            if proj > max_proj[i] {
+                                max_proj[i] = proj;
+                            }
                         }
                     }
                 }

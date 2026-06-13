@@ -1167,6 +1167,30 @@ impl BRepModel {
     pub fn solid_world_bbox(&self, id: SolidId) -> Option<crate::math::BBox> {
         use std::collections::HashSet;
         let solid = self.solids.get(id)?;
+
+        // Bound the TESSELLATED surface, not just the B-Rep vertices. An
+        // analytic curved solid (cylinder / sphere / cone) carries only a
+        // couple of seam vertices, so a vertex-only AABB collapses to the
+        // seam line — e.g. a cylinder r10 h40 at the origin would report a
+        // zero-width box at the seam (r,0) instead of x[-10,10]/y[-10,10].
+        // That wrong bbox then poisons the OBB centre, camera auto-framing,
+        // mass-property centroid and distance queries (KNOWN_BUGS #42). The
+        // tessellation samples the full curved extent of every face.
+        let mesh = crate::tessellation::tessellate_solid(
+            solid,
+            self,
+            &crate::tessellation::TessellationParams::default(),
+        );
+        if !mesh.vertices.is_empty() {
+            let pts: Vec<Point3> = mesh.vertices.iter().map(|v| v.position).collect();
+            if let Some(bb) = crate::math::BBox::from_points(&pts) {
+                return Some(bb);
+            }
+        }
+
+        // Fallback (degenerate / empty tessellation): the B-Rep vertex hull.
+        // Correct for polyhedral solids, where the vertices already bound
+        // every planar face.
         let shell = self.shells.get(solid.outer_shell)?;
         let mut seen: HashSet<VertexId> = HashSet::new();
         let mut points: Vec<Point3> = Vec::with_capacity(shell.faces.len() * 4);
@@ -4674,6 +4698,45 @@ mod anchor_tests {
     fn solid_world_bbox_returns_none_for_unknown_id() {
         let model = BRepModel::new();
         assert!(model.solid_world_bbox(9999).is_none());
+    }
+
+    /// #42 REGRESSION: the bbox must come from the curved-face extent, not
+    /// the two seam vertices. A cylinder r10 h40 at the origin (z 0..40)
+    /// must report an AABB ≈ x[-10,10] y[-10,10] z[0,40] centred (0,0,20),
+    /// NOT a zero-width box collapsed to the seam at (10,0).
+    #[test]
+    fn solid_world_bbox_captures_cylinder_radial_extent_42() {
+        let mut model = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 10.0, 40.0)
+            .expect("cylinder creation succeeds");
+        let sid = match gid {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let bb = model.solid_world_bbox(sid).expect("cylinder world bbox");
+        let size = bb.size();
+        let c = bb.center();
+        // Radial extent ≈ 2r (samples lie on the circle of radius 10, so the
+        // span is ≤ 20 and clearly not the collapsed ~0 of the old bug).
+        assert!(
+            size.x > 18.0 && size.x < 20.5,
+            "x extent ≈ 20, got {}",
+            size.x
+        );
+        assert!(
+            size.y > 18.0 && size.y < 20.5,
+            "y extent ≈ 20, got {}",
+            size.y
+        );
+        assert!((size.z - 40.0).abs() < 1e-6, "z extent 40, got {}", size.z);
+        assert!(
+            c.x.abs() < 0.5,
+            "center x ≈ 0 (not the seam at r), got {}",
+            c.x
+        );
+        assert!(c.y.abs() < 0.5, "center y ≈ 0, got {}", c.y);
+        assert!((c.z - 20.0).abs() < 0.5, "center z ≈ 20, got {}", c.z);
     }
 
     #[test]
