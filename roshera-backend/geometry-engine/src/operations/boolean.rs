@@ -10636,9 +10636,6 @@ fn point_inside_cylinder_solid(
     )
 }
 
-/// Classify a single point relative to a solid (Inside / Outside / OnBoundary).
-/// The face-level [`classify_face_relative_to_solid`] wraps this with multi-point
-/// sampling to tell a true coincident-area contact from a measure-zero tangency.
 thread_local! {
     /// Per-operand GWN triangle cache, keyed by SolidId. Classification
     /// calls `classify_point_gwn` many times against the SAME two operand
@@ -10715,6 +10712,9 @@ fn classify_point_gwn(
     }
 }
 
+/// Classify a single point relative to a solid (Inside / Outside / OnBoundary).
+/// The face-level [`classify_face_relative_to_solid`] wraps this with multi-point
+/// sampling to tell a true coincident-area contact from a measure-zero tangency.
 fn classify_point_relative_to_solid(
     model: &BRepModel,
     test_point: Point3,
