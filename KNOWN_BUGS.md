@@ -79,6 +79,25 @@ Fixed via `drop_nested_inner_loops` after merge.
 
 ---
 
+### #40 🟢 Faceted-cutter difference against a curved fillet face hard-failed
+Found live by build-and-look: a filleted block minus a faceted bore that
+overlaps a fillet → `"Invalid surface types for plane-cylinder intersection"`.
+Two-layer cause: (1) the SSI dispatch classifies a flat RuledSurface cutter
+wall as Planar, but `plane_cylinder_intersection`'s inner guard demanded
+strict `surface_type()==Plane` and rejected it; (2) the fillet face is
+cylinder-SHAPED but not the concrete analytic `Cylinder` (it's a NURBS/blend
+surface), so even a corrected guard can't extract axis/radius. Fixed: the
+plane∩{cylinder,sphere,cone} routines now identify the analytic operand by
+DOWNCAST (so any planar surface is accepted as the plane) and, when the
+curved operand isn't the concrete analytic type, FALL BACK to the marching
+solver instead of erroring. The boolean no longer hard-fails on
+cutter-meets-curved-face. Regression:
+`boolean::tests::diff_faceted_cutter_against_fillet_cylinder_40`.
+NOTE: this removes the hard error; full analytic correctness for
+cylinder-shaped-NURBS faces (vs marching) remains part of the analytic-SSI
+lane (#7) — and #24 (make extrudes/fillets emit concrete analytic surfaces)
+would let the fast analytic path apply.
+
 ## Blends (fillet / chamfer)
 
 ### #82 🔴 Multi-edge ring chamfer — corner-patch not implemented

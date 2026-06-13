@@ -1162,8 +1162,6 @@ fn surface_surface_intersection(
     surface_b: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    use crate::primitives::surface::SurfaceType;
-
     // Dispatch by analytical role, NOT surface_type alone. A RuledSurface
     // built for an extrusion side wall reports surface_type=RuledSurface
     // but is geometrically planar — and a Plane-vs-planar-RuledSurface
@@ -1530,15 +1528,32 @@ fn plane_cylinder_intersection(
     surface_b: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    // Determine which is plane and which is cylinder
-    let (plane, cylinder) = match (surface_a.surface_type(), surface_b.surface_type()) {
-        (SurfaceType::Plane, SurfaceType::Cylinder) => (surface_a, surface_b),
-        (SurfaceType::Cylinder, SurfaceType::Plane) => (surface_b, surface_a),
-        _ => {
-            return Err(OperationError::InternalError(
-                "Invalid surface types for plane-cylinder intersection".to_string(),
-            ))
-        }
+    // Identify the cylinder by DOWNCAST, not by surface_type(): the plane
+    // side may be any geometrically-planar surface — in particular a flat
+    // RuledSurface extrusion wall (a faceted cutter facet), which the
+    // dispatcher's `analytical_surface_kind` correctly classifies as Planar
+    // but whose surface_type() is RuledSurface, not Plane. The strict
+    // surface_type()==Plane guard used to reject those with a spurious
+    // "Invalid surface types" error (KNOWN_BUGS #40). The plane is consumed
+    // only via `evaluate_full` (point + normal), which is valid for any flat
+    // surface; only the cylinder needs its concrete type (axis/radius).
+    let (plane, cylinder) = if surface_b
+        .as_any()
+        .is::<crate::primitives::surface::Cylinder>()
+    {
+        (surface_a, surface_b)
+    } else if surface_a
+        .as_any()
+        .is::<crate::primitives::surface::Cylinder>()
+    {
+        (surface_b, surface_a)
+    } else {
+        // The dispatcher classified one surface as cylinder-KIND geometrically
+        // (e.g. a cylinder-shaped NURBS / blend fillet face) but it is not the
+        // concrete analytic `Cylinder`, so we can't extract axis/radius. Fall
+        // back to the general marching solver — which works on any surface
+        // pair — rather than failing the whole boolean (KNOWN_BUGS #40).
+        return march_surface_intersection(surface_a, surface_b, tolerance);
     };
 
     // Get plane properties
@@ -2468,17 +2483,20 @@ fn plane_sphere_intersection(
     surface_b: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    use crate::primitives::surface::{Sphere, SurfaceType};
+    use crate::primitives::surface::Sphere;
 
-    // Determine which is plane and which is sphere
-    let (plane, sphere) = match (surface_a.surface_type(), surface_b.surface_type()) {
-        (SurfaceType::Plane, SurfaceType::Sphere) => (surface_a, surface_b),
-        (SurfaceType::Sphere, SurfaceType::Plane) => (surface_b, surface_a),
-        _ => {
-            return Err(OperationError::InternalError(
-                "Invalid surface types for plane-sphere intersection".to_string(),
-            ))
-        }
+    // Identify the sphere by DOWNCAST, not surface_type(): the plane side may
+    // be any geometrically-planar surface (e.g. a flat RuledSurface extrusion
+    // wall classified Planar by the dispatcher). See the #40 note in
+    // `plane_cylinder_intersection`.
+    let (plane, sphere) = if surface_b.as_any().is::<Sphere>() {
+        (surface_a, surface_b)
+    } else if surface_a.as_any().is::<Sphere>() {
+        (surface_b, surface_a)
+    } else {
+        // Sphere-KIND but not the concrete analytic Sphere — marching
+        // fallback (KNOWN_BUGS #40 pattern).
+        return march_surface_intersection(surface_a, surface_b, tolerance);
     };
 
     // Get plane properties
@@ -2631,17 +2649,20 @@ fn plane_cone_intersection(
     surface_b: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    use crate::primitives::surface::{Cone, SurfaceType};
+    use crate::primitives::surface::Cone;
 
-    let (plane, cone_surf, plane_is_a) = match (surface_a.surface_type(), surface_b.surface_type())
-    {
-        (SurfaceType::Plane, SurfaceType::Cone) => (surface_a, surface_b, true),
-        (SurfaceType::Cone, SurfaceType::Plane) => (surface_b, surface_a, false),
-        _ => {
-            return Err(OperationError::InternalError(
-                "Invalid surface types for plane-cone intersection".to_string(),
-            ))
-        }
+    // Identify the cone by DOWNCAST, not surface_type(): the plane side may be
+    // any geometrically-planar surface (e.g. a flat RuledSurface extrusion
+    // wall classified Planar by the dispatcher). See the #40 note in
+    // `plane_cylinder_intersection`.
+    let (plane, cone_surf, plane_is_a) = if surface_b.as_any().is::<Cone>() {
+        (surface_a, surface_b, true)
+    } else if surface_a.as_any().is::<Cone>() {
+        (surface_b, surface_a, false)
+    } else {
+        // Cone-KIND but not the concrete analytic Cone — marching fallback
+        // (KNOWN_BUGS #40 pattern).
+        return march_surface_intersection(surface_a, surface_b, tolerance);
     };
 
     let cone = cone_surf
@@ -17180,5 +17201,99 @@ mod tests {
             r.boundary_edges,
             r.nonmanifold_edges
         );
+    }
+
+    /// #40 REGRESSION: differencing a faceted (RuledSurface-walled) cutter
+    /// from a solid that carries an ANALYTIC cylinder fillet face must NOT
+    /// fail with the spurious "Invalid surface types for plane-cylinder
+    /// intersection". The SSI dispatch classifies a flat RuledSurface as
+    /// Planar; `plane_cylinder_intersection` now identifies the cylinder by
+    /// downcast and accepts any planar surface as the plane.
+    #[test]
+    fn diff_faceted_cutter_against_fillet_cylinder_40() {
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+        use crate::operations::fillet::{fillet_edges, FilletOptions, FilletType, PropagationMode};
+        let tol = Tolerance::default();
+        let mut m = BRepModel::new();
+        let blk = make_box(&mut m, (80.0, 80.0, 40.0)); // centered: corners (±40,±40), z∈[-20,20]
+
+        // Find a vertical edge (constant x,y; z spans) and fillet it → the
+        // fillet emits an analytic Cylinder face at that corner.
+        let edge_snapshot: Vec<(EdgeId, VertexId, VertexId)> = m
+            .edges
+            .iter()
+            .map(|(id, e)| (id, e.start_vertex, e.end_vertex))
+            .collect();
+        let (vedge, cx, cy) = edge_snapshot
+            .iter()
+            .find_map(|&(id, sv, ev)| {
+                let a = m.vertices.get_position(sv)?;
+                let b = m.vertices.get_position(ev)?;
+                if (a[2] - b[2]).abs() > 1.0
+                    && (a[0] - b[0]).abs() < 1e-6
+                    && (a[1] - b[1]).abs() < 1e-6
+                {
+                    Some((id, a[0], a[1]))
+                } else {
+                    None
+                }
+            })
+            .expect("box must have a vertical edge");
+        fillet_edges(
+            &mut m,
+            blk,
+            vec![vedge],
+            FilletOptions {
+                radius: 10.0,
+                fillet_type: FilletType::Constant(10.0),
+                propagation: PropagationMode::None,
+                ..Default::default()
+            },
+        )
+        .expect("fillet a vertical edge → analytic cylinder fillet face");
+
+        // Faceted 16-gon cutter, inset toward the body so it overlaps the
+        // fillet's cylinder face, spanning the full Z extent of the block.
+        let ncx = cx * 0.8;
+        let ncy = cy * 0.8;
+        let outer: Vec<[f64; 2]> = (0..16)
+            .map(|i| {
+                let a = std::f64::consts::TAU * (i as f64) / 16.0;
+                [ncx + 8.0 * a.cos(), ncy + 8.0 * a.sin()]
+            })
+            .collect();
+        let cutter = extrude_polygon_regions(
+            &mut m,
+            Point3::new(0.0, 0.0, -25.0),
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer,
+                holes: vec![],
+            }],
+            50.0,
+            None,
+            tol,
+        )
+        .expect("faceted cutter prism");
+
+        // The cut must not hit the #40 SSI dispatch error. (Downstream
+        // watertightness of a cutter-meets-fillet diff is its own concern;
+        // this gate pins specifically that the plane∩cylinder routine
+        // accepts a planar RuledSurface cutter facet.)
+        if let Err(e) = boolean_operation(
+            &mut m,
+            blk,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        ) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("Invalid surface types")
+                    && !msg.contains("neither surface downcasts"),
+                "#40: plane∩cylinder SSI must accept a planar RuledSurface cutter facet; got: {msg}"
+            );
+        }
     }
 }
