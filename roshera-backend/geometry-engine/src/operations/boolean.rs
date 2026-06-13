@@ -363,10 +363,20 @@ pub fn boolean_operation(
         ));
         if pipeline_trace_enabled() {
             for f in &classified_faces {
+                let ip = get_face_interior_point(model, f)
+                    .map(|p| format!("({:.1},{:.1},{:.1})", p.x, p.y, p.z))
+                    .unwrap_or_else(|_| "?".to_string());
+                let sty = model
+                    .surfaces
+                    .get(f.surface)
+                    .map(|s| format!("{:?}", s.surface_type()))
+                    .unwrap_or_else(|| "?".into());
                 eprintln!(
-                    "  fragment origin={} solid={} edges={} class={:?} inner_loops={}",
+                    "  fragment origin={} solid={} surf={} ip={} edges={} class={:?} inner_loops={}",
                     f.original_face,
                     f.from_solid,
+                    sty,
+                    ip,
                     f.boundary_edges.len(),
                     f.classification,
                     f.inner_loops.len(),
