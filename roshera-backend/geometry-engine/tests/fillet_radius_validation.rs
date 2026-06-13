@@ -1,20 +1,21 @@
 //! Radius-precondition regression tests for `fillet_edges` (Task #86 /
 //! Task #89 slice D).
 //!
-//! `validate_fillet_parameters` rejects any radius that exceeds half
-//! the edge's arc length — otherwise the rolling-ball cap arcs cannot
-//! sit on the edge without overlapping each other. Slice D extends
-//! that validation in the public `fillet_edges` entry point so that
-//! variable-radius fillets must satisfy the bound at **both**
-//! endpoint radii (`r1` and `r2`), not just `r1`. Earlier revisions
-//! only checked `r1`, allowing a pathological `r2` to slip through
-//! validation and surface a less-actionable error deep inside the
-//! surgery loop.
+//! `validate_fillet_parameters` rejects any radius that exceeds the
+//! shortest NEIGHBOURING edge (the perpendicular-face room the rolling
+//! ball needs), NOT the filleted edge's own length — a short edge
+//! between large faces accepts a large radius (KNOWN_BUGS #38). On a
+//! 4×4×4 cube every neighbour is 4.0, so the bound is 4.0. Slice D
+//! extends that validation in the public `fillet_edges` entry point so
+//! variable-radius fillets must satisfy the bound at **both** endpoint
+//! radii (`r1` and `r2`), not just `r1`. Earlier revisions only checked
+//! `r1`, allowing a pathological `r2` to slip through and surface a
+//! less-actionable error deep inside the surgery loop.
 //!
 //! These tests pin:
 //!
 //!   * Variable-radius `(r1, r2)` is rejected when **only `r2`**
-//!     exceeds the half-edge bound — the bug fixed by slice D.
+//!     exceeds the neighbour bound — the bug fixed by slice D.
 //!   * Variable-radius `(r1, r2)` is rejected when **only `r1`**
 //!     exceeds the bound — pre-existing behaviour, kept here so the
 //!     two cases live side-by-side.
@@ -97,16 +98,16 @@ fn variable_fillet_rejects_when_r2_exceeds_half_edge_length() {
     // validation because the inputs loop only checked r1. Now both
     // endpoints are validated.
     //
-    // Box edge length = 4.0 (the side dimension). half = 2.0.
-    // r1 = 0.5 is valid; r2 = 3.0 exceeds the bound.
+    // Box edge length = 4.0; every neighbour edge is 4.0, so the bound
+    // is 4.0. r1 = 0.5 is valid; r2 = 5.0 exceeds the neighbour bound.
     let mut model = BRepModel::new();
     let solid = make_box(&mut model, 4.0, 4.0, 4.0);
     let edge = first_open_edge(&model);
 
-    let result = fillet_edges(&mut model, solid, vec![edge], variable_opts(0.5, 3.0));
+    let result = fillet_edges(&mut model, solid, vec![edge], variable_opts(0.5, 5.0));
     let err = result.expect_err(
-        "variable fillet (0.5, 3.0) on edge of length 4.0 must fail — r2 = 3.0 \
-         exceeds edge_length/2 = 2.0",
+        "variable fillet (0.5, 5.0) on a 4.0 cube must fail — r2 = 5.0 \
+         exceeds neighbour bound = 4.0",
     );
     assert!(
         matches!(err, OperationError::InvalidRadius(_)),
@@ -124,10 +125,10 @@ fn variable_fillet_rejects_when_r1_exceeds_half_edge_length() {
     let solid = make_box(&mut model, 4.0, 4.0, 4.0);
     let edge = first_open_edge(&model);
 
-    let result = fillet_edges(&mut model, solid, vec![edge], variable_opts(3.0, 0.5));
+    let result = fillet_edges(&mut model, solid, vec![edge], variable_opts(5.0, 0.5));
     let err = result.expect_err(
-        "variable fillet (3.0, 0.5) on edge of length 4.0 must fail — r1 = 3.0 \
-         exceeds edge_length/2 = 2.0",
+        "variable fillet (5.0, 0.5) on a 4.0 cube must fail — r1 = 5.0 \
+         exceeds neighbour bound = 4.0",
     );
     assert!(
         matches!(err, OperationError::InvalidRadius(_)),
@@ -189,13 +190,13 @@ fn multi_edge_call_rejected_if_any_edge_violates_bound() {
     fillet_edges(&mut sanity_model, sanity_solid, vec![s1, s2], opts)
         .expect("two vertex-disjoint valid edges with r=0.5 must succeed");
 
-    // Now the rejection case: a radius that exceeds the half-edge
-    // bound for both edges. The validate loop iterates over `edges`
-    // and the first violation aborts — neither edge is mutated.
+    // Now the rejection case: a radius that exceeds the neighbour
+    // bound (4.0) for both edges. The validate loop iterates over
+    // `edges` and the first violation aborts — neither edge is mutated.
     let face_count_before = model.faces.len();
     let bad_opts = FilletOptions {
-        fillet_type: FilletType::Constant(3.0),
-        radius: 3.0,
+        fillet_type: FilletType::Constant(5.0),
+        radius: 5.0,
         propagation: PropagationMode::None,
         ..Default::default()
     };

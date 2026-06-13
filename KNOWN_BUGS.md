@@ -105,10 +105,19 @@ Euler"` prefix to keep matching the reworded message.
 Chamfering over a previously filleted region produces a
 topologically-clean but geometrically self-overlapping solid. Pinned.
 
-### #38 🔴 Fillet rejects a geometrically valid radius
-R20 on a 30mm-tall corner between 140/220mm faces rejected
-"Invalid radius: 20"; R12 ok. Looks like an over-conservative
-radius-feasibility gate. Low severity.
+### #38 🟢 Fillet rejected a geometrically valid radius
+`validate_fillet_parameters` bounded the radius by `edge_length * 0.5` —
+the WRONG dimension. A fillet's rolling ball runs *along* the edge; its
+radius is limited by the *perpendicular room on the adjacent faces*, not
+the filleted edge's own length. So R20 on a 30mm edge between 200/120mm
+faces was falsely rejected. Fixed: bound by the shortest NEIGHBOURING
+edge (the edges meeting this one at its endpoints — the perpendicular-room
+proxy the tangent line runs along); isolated edges (no neighbours) defer to
+downstream construction. Verified empirically: the construction was never
+the limit — R20 on a 30mm slab edge constructs a watertight solid.
+Regression: `fillet::tests::fillet_large_radius_on_short_edge_between_large_faces_38`;
+the deliberate half-edge contract in `tests/fillet_radius_validation.rs`
+was rewritten to the neighbour bound. 682 operations tests green.
 
 ---
 
