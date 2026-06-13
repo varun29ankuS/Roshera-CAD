@@ -39,15 +39,23 @@ export function SceneLighting() {
         intensity={1.0}
         color={palette.keyLight}
         castShadow
-        shadow-mapSize-width={2048}
-        shadow-mapSize-height={2048}
-        shadow-camera-near={0.5}
-        shadow-camera-far={100}
-        shadow-camera-left={-30}
-        shadow-camera-right={30}
-        shadow-camera-top={30}
-        shadow-camera-bottom={-30}
-        shadow-bias={-0.0005}
+        shadow-mapSize-width={4096}
+        shadow-mapSize-height={4096}
+        shadow-camera-near={1}
+        shadow-camera-far={400}
+        // Frustum sized to cover typical parts (was ±30 — clipped anything
+        // larger than 60mm, e.g. a 120mm bracket, producing hard "square"
+        // shadow artifacts where the part fell outside the shadow map).
+        shadow-camera-left={-150}
+        shadow-camera-right={150}
+        shadow-camera-top={150}
+        shadow-camera-bottom={-150}
+        // `normalBias` offsets the shadow lookup along the surface normal —
+        // the modern cure for shadow ACNE (the random square/moiré self-
+        // shadowing on lit faces). `bias` alone (the old -0.0005) can't fix
+        // acne across a large frustum without causing peter-panning.
+        shadow-bias={-0.0006}
+        shadow-normalBias={0.04}
       />
       <directionalLight
         position={[-10, 10, -15]}
