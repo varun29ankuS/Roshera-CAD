@@ -748,8 +748,11 @@ fn validate_blend_result(model: &BRepModel, blend_faces: &[FaceId]) -> Operation
         }
     }
 
-    let result = crate::primitives::validation::validate_model_enhanced(
+    // #29/#39 — scope the verdict to the solid(s) owning the blend faces,
+    // so an unrelated pre-existing defect can't fail this blend.
+    let result = crate::primitives::validation::validate_faces_scoped(
         model,
+        blend_faces,
         crate::math::Tolerance::default(),
         crate::primitives::validation::ValidationLevel::Standard,
     );

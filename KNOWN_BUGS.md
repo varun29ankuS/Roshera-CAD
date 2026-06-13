@@ -123,15 +123,15 @@ was rewritten to the neighbour bound. 682 operations tests green.
 
 ## Validation / model lifecycle
 
-### #29 🟡 Op post-validation runs over the WHOLE model
+### #29 🟢 Op post-validation runs over the WHOLE model
 A new operation's validation validated *every* solid, so any unrelated
 invalid solid (e.g. a #36 husk) blocked an otherwise-valid op.
 Added `validation::validate_solid_scoped(model, solid_id, …)` (keeps
-errors on the touched solid + model-global, drops other solids') and
-wired it into the 7 single-solid ops: chamfer, fillet, revolve,
-transform, draft, loft, shell. **Remaining (#39):** `blend` and
-`pattern` validate by face-sets (pattern spans multiple new solids) and
-need a face-set-scoped variant.
+errors on the touched solid + model-global, drops other solids') wired
+into the 7 single-solid ops (chamfer, fillet, revolve, transform, draft,
+loft, shell), and `validate_faces_scoped(model, &faces, …)` for the
+face-set ops `blend` + `pattern` (derives owning solids from the faces;
+#39). Guarded by `brep_validation_oracle::scoped_validation_ignores_unrelated_invalid_solid`.
 
 ### #24 🔴 Sketch-extrude of a circle → 64 planar faces, not one cylinder
 A circular profile extrudes to a 64-sided faceted prism instead of an
