@@ -13,7 +13,14 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ### #35 🟡 Difference cut intersecting another bore leaves open faces
 Box − vertical bore − crossing horizontal bore: the second cut's wall
-fragments where it breaks into the FIRST bore's void. Repro:
+fragments where it breaks into the FIRST bore's void.
+**CONFIRMED for ANALYTIC cylinders too (2026-06-13, ladder step 5):** block
+− analytic vbore (clean, open=0) − crossing analytic hbore → 600 open edges;
+the vertical bore is visibly shattered open at the saddle (diagnostic
+render). So this is NOT a faceting artifact — the cylinder∩cylinder saddle
+weld fails the same way, which means the COREFINEMENT fix (shared
+intersection vertices) is the right cure for both facet and analytic paths.
+Repro:
 `boolean::tests::diff_intersecting_bores_35` (ignored) → 15 open + 3 nm,
 euler −10. **Localized (diagnostic render, 2026-06-13):** the open edges
 are the saddle intersection curve where the horizontal tunnel wall meets
