@@ -9,28 +9,37 @@ resume.
 
 ## ▶ ACTIVE WORK — START HERE
 
-**Boolean #27 chained-union B-Rep bug — PART 1 SHIPPED, PART 2 = one
-upstream filter.** Read `boolean-coaxial-cap-bug.md` "FIX PROGRESS"
-section first.
+**Boolean #27 chained-union B-Rep bug — PARTS 1 & 2 SHIPPED & GREEN;
+PART 3 (final) localized.** It's a 3-defect campaign, not the "2/2" the
+earlier note predicted. Read `boolean-coaxial-cap-bug.md` "PART 2
+SHIPPED" + "PART 3 PRECISELY LOCALIZED" sections first.
 
-- **PART 1 DONE & GREEN (commit f35b74e, pushed):** merge nest-guard in
-  `merge_same_origin_fragments` — never nest a fragment into an existing
-  hole. Boolean floor 106/0.
-- **PART 2 (the finish line, ~30 lines):** in `split_face_by_curves`
-  cut-add loop (~5479 `for &curve_id in curves`), BEFORE adding a cut
-  edge, SKIP it if the cut lies entirely inside a pre-existing hole of
-  the face (sample cut → project to face plane → all samples strictly
-  inside an inner-loop polygon → skip). This prevents the phantom
-  fragment at the source. The post-extract DROP variant was WRONG-LAYER
-  (orphaned rims → 96 open edges) and is reverted — do NOT redo it.
-  Near-miss data proving the approach: removing the phantoms already
-  gets euler→2 and vol→601k; the upstream filter additionally keeps
-  edges matched. Verify `prism_chain_diag_27` (un-ignore it) →
-  valid_solid, ~601k, 0 open, 0 nonmanifold; then full floor (expect
-  107/0) + poke matrix (any move = info per Varun, not a veto) → commit
-  "BOOL #27 FIXED (2/2)" → live REST re-verify → task #27 done.
-- Reusable bits: `is_point_in_face` planar branch (~11392) for the
-  plane projection; `point_in_polygon_2d` (~7503); `extract_cycle_vertices_3d`.
+- **PART 1 GREEN (f35b74e):** merge nest-guard — never nest a fragment
+  into an existing hole.
+- **PART 2 GREEN (c7ba18a, this session):** upstream void-cut filter in
+  `split_face_by_curves` (~5477, before the cut-add loop) — for planar
+  faces with pre-existing holes, skip any cut whose samples all project
+  strictly inside a hole polygon. Effect on prism_chain_diag_27: euler
+  32→**2**, nonmanifold 61→**32**, vol +7.6%→~exact. Floor GREEN: boolean
+  lib 89/0, curved poke 4/0, cargo check clean. NOT yet a valid solid.
+- **PART 3 (the actual finish line) — LOCALIZED, NOT a quick patch.**
+  Residual: 96 open + 64 triple-used B-Rep edges (two rings: r35 192-223,
+  r60 288-319). Root: the merge/partition layer NESTS AN ADJACENT COPLANAR
+  SIBLING AS A HOLE on the composite z=0 base. `face_idx=64 orig=102`
+  (r60..80 annulus) carries the r60 ring in BOTH outer boundary AND
+  inner_loops (malformed); `orig=103` is double-kept as annulus r35..60
+  AND flat r35 disk. Fix: (a) never attach a cycle as an inner loop when
+  it's also part of the face's outer boundary (shared ring = adjacency,
+  not containment); (b) dedupe the orig=103 double-keep. FIRST trace the
+  attach site (merge_same_origin_fragments ~9991 vs
+  partition_outer_and_pre_existing_hole_cycles ~5872) before editing —
+  this is shared code the poke matrix depends on, so floor-gate it. Then
+  un-ignore prism_chain_diag_27 + "BOOL #27 FIXED (3/3)".
+- Reusable bits: `is_point_in_face` planar branch (~11392);
+  `point_in_polygon_2d` (~7503); `extract_cycle_vertices_3d`. Edge-usage
+  tally trick (no instrumentation): parse the `face_idx=...edges=[...]`
+  reconstruct dump under ROSHERA_BOOL_TRACE, count edge-ID occurrences;
+  1×=open, 3×=nonmanifold.
 
 Below: original diagnosis detail (still valid).
 
