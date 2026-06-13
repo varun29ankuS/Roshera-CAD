@@ -108,7 +108,9 @@ server.tool(
     "G-buffer channels.",
   {
     part_id: z.number().int().describe("kernel part id from list_parts"),
-    mode: z.enum(["shaded", "ids", "depth", "normals"]).default("shaded"),
+    mode: z
+      .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
+      .default("shaded"),
     view: z.enum(["iso", "front", "top", "right"]).default("iso"),
     size: z.number().int().min(64).max(2048).default(512),
   },
@@ -127,7 +129,62 @@ server.tool(
           text: `face legend (rgb → face_id): ${JSON.stringify(r.face_legend)}`,
         });
       }
+      if (mode === "diagnostic") {
+        content.push({
+          type: "text",
+          text:
+            `defects — open_edges (red hole rims, missing faces): ${r.open_edges}; ` +
+            `nonmanifold_edges (magenta, overlapping faces): ${r.nonmanifold_edges}. ` +
+            `Both 0 = watertight. Front-face culled, so missing/flipped faces read as see-through holes.`,
+        });
+      }
       return { content };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "verify_part",
+  "SELF-CHECK a part's geometry: runs the diagnostic render and reports " +
+    "watertightness — open_edges (missing-face hole rims), nonmanifold_edges " +
+    "(overlapping faces), and a watertight verdict. ALWAYS call this after a " +
+    "boolean (union/difference) or a multi-feature build: booleans can drop " +
+    "or flip faces, and a part can LOOK solid in a shaded render while being " +
+    "broken. Returns the iso diagnostic image too so you can see WHERE.",
+  {
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    view: z.enum(["iso", "front", "top", "right"]).default("iso"),
+  },
+  async ({ part_id, view }) => {
+    try {
+      const r = await api(
+        "GET",
+        `/api/agent/parts/${part_id}/render?mode=diagnostic&view=${view}&size=720`,
+      );
+      const watertight = r.open_edges === 0 && r.nonmanifold_edges === 0;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                part_id,
+                watertight,
+                open_edges: r.open_edges,
+                nonmanifold_edges: r.nonmanifold_edges,
+                verdict: watertight
+                  ? "OK — closed manifold solid"
+                  : "BROKEN — see red (open) / magenta (non-manifold) edges in the image",
+              },
+              null,
+              2,
+            ),
+          },
+          { type: "image", data: r.png_base64, mimeType: "image/png" },
+        ],
+      };
     } catch (e) {
       return fail(e);
     }
@@ -231,9 +288,8 @@ server.tool(
 
 server.tool(
   "clear_parts",
-  "Delete EVERY part (each deletion timeline-recorded). KNOWN BUG #26: " +
-    "after clear, new extrudes may fail until the server restarts — " +
-    "prefer delete_part loops until fixed.",
+  "Delete EVERY part (each deletion timeline-recorded, undo-safe). Safe to " +
+    "build immediately after (the post-clear extrude wedge, bug #26, is fixed).",
   {},
   async () => {
     try {
@@ -481,6 +537,45 @@ server.tool(
 );
 
 
+// ---- mutation: boolean (feature stacking) -----------------------------
+
+server.tool(
+  "boolean",
+  "Combine two solids: union (weld together), difference (cut object_b out " +
+    "of object_a), or intersection (keep only the overlap). Operands are " +
+    "OBJECT UUIDs (the object_uuid returned by the create/extrude tools), " +
+    "NOT kernel part ids. Both operands are consumed; a new solid is born. " +
+    "This is feature-stacking — chained unions and bores. ALWAYS verify_part " +
+    "the result: differences (bores/slots/counterbores) can leave open faces.",
+  {
+    op: z.enum(["union", "difference", "intersection"]),
+    object_a: z.string().uuid().describe("object_uuid of the base solid"),
+    object_b: z
+      .string()
+      .uuid()
+      .describe("object_uuid of the tool solid (subtracted in difference)"),
+  },
+  async ({ op, object_a, object_b }) => {
+    try {
+      const r = await api("POST", "/api/geometry/boolean", {
+        operation: op,
+        object_a,
+        object_b,
+      });
+      const part_id = await newestPartId();
+      return ok({
+        object_uuid: r.object?.id ?? null,
+        part_id,
+        consumed: r.consumed ?? [object_a, object_b],
+        placement: part_id !== null ? await placement(part_id) : null,
+        note: "verify_part this result — differences can drop faces",
+      });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
 // ─── Parametric sketching (csketch — constraint-solver backed) ────────
 
 server.tool(
@@ -583,8 +678,10 @@ server.tool(
         distance,
         name: name ?? null,
       });
+      const part_id = await newestPartId();
       return ok({
-        part_id: r.object?.id,
+        object_uuid: r.object?.id ?? null, // pass to `boolean` as an operand
+        part_id, // kernel id for render/verify/inspect tools
         solid_id: r.solid_id,
         triangles: r.stats?.triangle_count,
         regions: r.stats?.regions,
