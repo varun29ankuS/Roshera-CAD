@@ -87,7 +87,15 @@ fn pipeline_trace(args: std::fmt::Arguments<'_>) {
 /// becomes the default.
 fn gwn_classification_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("ROSHERA_BOOL_GWN").is_ok())
+    // Default ON: GWN is the robust classifier (parity-proven on the
+    // boolean floor + curved poke matrix, and it closes the #27
+    // chained-union family). Set ROSHERA_BOOL_GWN=0 to fall back to the
+    // legacy 3-ray vote for debugging/comparison.
+    *ENABLED.get_or_init(|| {
+        std::env::var("ROSHERA_BOOL_GWN")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// Type of Boolean operation
@@ -293,6 +301,10 @@ pub fn boolean_operation(
         "boolean_operation: ENTRY op={:?} solid_a={} solid_b={}",
         operation, solid_a, solid_b,
     );
+
+    // Drop any GWN operand triangles cached by a previous op (SolidIds may
+    // be reused after the model mutates).
+    clear_gwn_triangle_cache();
 
     // F2-δ pre-flight.
     if options.common.validate_before {
@@ -10627,6 +10639,36 @@ fn point_inside_cylinder_solid(
 /// Classify a single point relative to a solid (Inside / Outside / OnBoundary).
 /// The face-level [`classify_face_relative_to_solid`] wraps this with multi-point
 /// sampling to tell a true coincident-area contact from a measure-zero tangency.
+thread_local! {
+    /// Per-operand GWN triangle cache, keyed by SolidId. Classification
+    /// calls `classify_point_gwn` many times against the SAME two operand
+    /// solids within one boolean op; without this each call re-tessellates
+    /// the operand (O(faces) per point), which makes boolean-heavy suites
+    /// minutes slow. The operands are read-only for the op's duration, so
+    /// caching their triangles is safe. Cleared at every `boolean_operation`
+    /// entry to avoid staleness from SolidId reuse after the model mutates.
+    static GWN_TRI_CACHE: std::cell::RefCell<
+        std::collections::HashMap<SolidId, std::rc::Rc<Vec<[Point3; 3]>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Drop all cached operand triangles. Called at each `boolean_operation`
+/// entry so a later op never reads triangles for a since-mutated solid.
+fn clear_gwn_triangle_cache() {
+    GWN_TRI_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// Cached accessor for [`solid_gwn_triangles`]. The fill closure does not
+/// touch the cache, so there is no nested borrow.
+fn solid_gwn_triangles_cached(model: &BRepModel, solid: SolidId) -> std::rc::Rc<Vec<[Point3; 3]>> {
+    GWN_TRI_CACHE.with(|c| {
+        c.borrow_mut()
+            .entry(solid)
+            .or_insert_with(|| std::rc::Rc::new(solid_gwn_triangles(model, solid)))
+            .clone()
+    })
+}
+
 /// Outward-oriented boundary triangles of `solid`, for generalized
 /// winding number classification. Tessellates the solid's faces; returns
 /// empty when the solid is missing or tessellates to nothing (caller
@@ -10662,7 +10704,7 @@ fn classify_point_gwn(
     solid: SolidId,
     test_point: &Point3,
 ) -> Option<FaceClassification> {
-    let tris = solid_gwn_triangles(model, solid);
+    let tris = solid_gwn_triangles_cached(model, solid);
     if tris.is_empty() {
         return None;
     }
@@ -16502,12 +16544,10 @@ mod tests {
     /// coplanar_curves_b=0 — ZERO transverse curves — and the buried
     /// regions classify Outside instead of Inside, so they are kept).
     ///
-    /// `#[ignore]`d so it does not red the floor while the fix is
-    /// pending; it is the executable spec — un-ignore when #27 lands.
-    /// Diagnostic run: `cargo test -p geometry-engine prism_chain_diag
-    /// -- --ignored --nocapture`.
+    /// #27 REGRESSION TEST (fixed): chaining coaxial prism unions must
+    /// produce a valid closed manifold solid. Closed by the GWN classifier
+    /// (default-on) + the material interior-point fix for annular faces.
     #[test]
-    #[ignore = "tracks #27 chained-union B-Rep bug — un-ignore when fixed"]
     fn prism_chain_diag_27() {
         use crate::harness::watertight::{manifold_report, mesh_volume};
         use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
@@ -16619,6 +16659,120 @@ mod tests {
         assert!(
             valid,
             "#27: chained prism union must be a valid manifold solid",
+        );
+    }
+
+    // ---- Chained-union regression suite (#27 fix lock-in) --------------
+    //
+    // A single diagnostic case is not enough coverage for the fundamental
+    // fix (annular material interior-point + GWN classification). These
+    // assert the chained-union INVARIANT across configurations: a union
+    // whose operand is itself a prior boolean result must stay a valid
+    // closed manifold solid at EVERY step, since that composite carries
+    // annular faces that broke classification before the fix.
+
+    /// Coaxial regular-n-gon prism on z=0, centred at (cx, cy).
+    fn ngon_prism(model: &mut BRepModel, cx: f64, cy: f64, r: f64, h: f64, n: usize) -> SolidId {
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+        let outer: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * (i as f64) / (n as f64);
+                [cx + r * a.cos(), cy + r * a.sin()]
+            })
+            .collect();
+        extrude_polygon_regions(
+            model,
+            Point3::ORIGIN,
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer,
+                holes: vec![],
+            }],
+            h,
+            None,
+            Tolerance::default(),
+        )
+        .expect("prism extrude ok")
+    }
+
+    /// Chain-union `solids` left to right, asserting EVERY intermediate
+    /// result is a valid closed manifold solid. Returns the final solid.
+    fn assert_chained_union_valid(
+        model: &mut BRepModel,
+        solids: &[SolidId],
+        label: &str,
+    ) -> SolidId {
+        use crate::harness::watertight::manifold_report;
+        let chord = 0.5;
+        let mut acc = solids[0];
+        for (i, &next) in solids.iter().enumerate().skip(1) {
+            acc = boolean_operation(
+                model,
+                acc,
+                next,
+                BooleanOp::Union,
+                BooleanOptions::default(),
+            )
+            .expect("chained union step must succeed");
+            let valid = manifold_report(model, acc, chord, 1e-6)
+                .map(|r| r.manifold && r.closed && r.oriented)
+                .unwrap_or(false);
+            assert!(valid, "{label}: union step {i} produced an invalid solid");
+        }
+        acc
+    }
+
+    #[test]
+    fn chained_union_four_level_coaxial_stack() {
+        use crate::harness::watertight::mesh_volume;
+        let mut m = BRepModel::new();
+        let s: Vec<SolidId> = [(90.0, 10.0), (70.0, 30.0), (50.0, 55.0), (30.0, 85.0)]
+            .iter()
+            .map(|&(r, h)| ngon_prism(&mut m, 0.0, 0.0, r, h, 32))
+            .collect();
+        let result = assert_chained_union_valid(&mut m, &s, "four-level coaxial stack");
+        assert!(
+            mesh_volume(&m, result, 0.5).unwrap_or(0.0) > 0.0,
+            "four-level stack must enclose positive volume"
+        );
+    }
+
+    #[test]
+    #[ignore = "tracks #33: offset/partial-overlap chained union still \
+                produces an invalid solid — distinct from the coaxial #27 \
+                fix (annular caps); the composite operand's clipped (non-\
+                annular) overlap faces are the new failure. Un-ignore when fixed."]
+    fn chained_union_offset_overlapping_prisms() {
+        // Non-coaxial: partial overlaps rather than nesting, so the
+        // composite operand's annular/clipped faces differ from the
+        // coaxial case.
+        let mut m = BRepModel::new();
+        let a = ngon_prism(&mut m, 0.0, 0.0, 40.0, 20.0, 24);
+        let b = ngon_prism(&mut m, 30.0, 0.0, 40.0, 30.0, 24);
+        let c = ngon_prism(&mut m, 15.0, 25.0, 40.0, 25.0, 24);
+        assert_chained_union_valid(&mut m, &[a, b, c], "offset overlapping prisms");
+    }
+
+    #[test]
+    fn chained_union_stepped_hub_volume_is_accurate() {
+        use crate::harness::watertight::mesh_volume;
+        // The original #27 hub: assert not just validity but that the mesh
+        // volume matches the analytic 32-gon stack within faceting tolerance.
+        let mut m = BRepModel::new();
+        let disc = ngon_prism(&mut m, 0.0, 0.0, 80.0, 12.0, 32);
+        let boss = ngon_prism(&mut m, 0.0, 0.0, 60.0, 36.0, 32);
+        let tower = ngon_prism(&mut m, 0.0, 0.0, 35.0, 60.0, 32);
+        let result = assert_chained_union_valid(&mut m, &[disc, boss, tower], "stepped hub");
+        // 32-gon area = (n/2)·r²·sin(2π/n) = 16·r²·sin(11.25°). The union
+        // stacks: r80 over z0..12, r60 over z12..36, r35 over z36..60.
+        let area = |r: f64| 16.0 * r * r * (std::f64::consts::TAU / 32.0).sin();
+        let expected = area(80.0) * 12.0 + area(60.0) * 24.0 + area(35.0) * 24.0;
+        let v = mesh_volume(&m, result, 0.5).unwrap_or(0.0);
+        let rel = (v - expected).abs() / expected;
+        assert!(
+            rel < 0.02,
+            "stepped hub volume {v:.0} vs expected {expected:.0} (rel {rel:.3})"
         );
     }
 }
