@@ -1400,14 +1400,47 @@ fn create_line_intersection_curve(
     // `intersect_faces`; this cap is the fallback for non-planar faces or
     // non-Line cutting curves that that clipper does not yet handle.
     const MAX_LINE_EXTENT: f64 = 1.0e6;
+    // Span the cutting line over each surface's WORLD-SPACE extent, not its
+    // parameter-range delta. A planar extrusion wall is a RuledSurface whose
+    // parameter_bounds are NORMALISED (0,1)×(0,1) — delta 1, floored to 10 —
+    // even though the wall is tens of units tall in world space. Using that
+    // tiny delta drew the plane-plane line far too short, so a wall∩wall
+    // transverse crossing's true exit fell beyond the line's [0,1] domain and
+    // the face clip CLAMPED it, truncating the intersection to part-height →
+    // an open seam (the offset-prism chained-union bug #33). Evaluating the
+    // (clamped) domain corners recovers the true 3D size; infinite planes
+    // clamp to MAX_LINE_EXTENT exactly as before.
+    let world_extent = |s: &dyn Surface| -> f64 {
+        let ((u0, u1), (v0, v1)) = s.parameter_bounds();
+        let c = MAX_LINE_EXTENT;
+        let (u0, u1) = (u0.clamp(-c, c), u1.clamp(-c, c));
+        let (v0, v1) = (v0.clamp(-c, c), v1.clamp(-c, c));
+        let pts: Vec<Point3> = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+            .iter()
+            .filter_map(|&(u, v)| s.evaluate_full(u, v).ok().map(|e| e.position))
+            .collect();
+        let mut max_d = 0.0_f64;
+        for i in 0..pts.len() {
+            for j in (i + 1)..pts.len() {
+                max_d = max_d.max((pts[i] - pts[j]).magnitude());
+            }
+        }
+        max_d
+    };
     let bounds_a = surface_a.parameter_bounds();
     let bounds_b = surface_b.parameter_bounds();
-    let extent_a =
-        ((bounds_a.0 .1 - bounds_a.0 .0).abs()).max((bounds_a.1 .1 - bounds_a.1 .0).abs());
-    let extent_b =
-        ((bounds_b.0 .1 - bounds_b.0 .0).abs()).max((bounds_b.1 .1 - bounds_b.1 .0).abs());
+    let extent_a = world_extent(surface_a);
+    let extent_b = world_extent(surface_b);
     // Floor at 10.0 for degenerate bounds; cap unbounded (infinite plane) surfaces.
     let line_extent = extent_a.max(extent_b).clamp(10.0, MAX_LINE_EXTENT);
+
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]     create_line_intersection_curve: bounds_a={bounds_a:?} bounds_b={bounds_b:?} extent_a={extent_a:.3} extent_b={extent_b:.3} line_extent={line_extent:.3} type_a={} type_b={}",
+            surface_a.type_name(),
+            surface_b.type_name()
+        );
+    }
 
     let start_point = line_point - line_direction * line_extent;
     let end_point = line_point + line_direction * line_extent;
@@ -6933,6 +6966,15 @@ fn clip_line_to_planar_face(
     } else {
         None
     };
+
+    if pipeline_trace_enabled() {
+        let d = line.end - line.start;
+        let plo = line.start + d * clamped_lo;
+        let phi = line.start + d * clamped_hi;
+        eprintln!(
+            "[bool]     clip_line_to_planar_face: face={face_id:?} crossings={crossings:?} s=[{clamped_lo:.4},{clamped_hi:.4}] seg3d=[{plo:?} -> {phi:?}]"
+        );
+    }
 
     let outcome = match best {
         Some((t_min, t_max)) => ClipOutcome::Trimmed(t_min, t_max),
@@ -16738,11 +16780,11 @@ mod tests {
         );
     }
 
+    /// #33 REGRESSION (fixed): offset/partial-overlap chained union. Closed
+    /// by the world-space line-extent fix in create_line_intersection_curve —
+    /// wall∩wall (RuledSurface∩RuledSurface) transverse crossings no longer
+    /// truncate, so the overlap seam welds shut.
     #[test]
-    #[ignore = "tracks #33: offset/partial-overlap chained union still \
-                produces an invalid solid — distinct from the coaxial #27 \
-                fix (annular caps); the composite operand's clipped (non-\
-                annular) overlap faces are the new failure. Un-ignore when fixed."]
     fn chained_union_offset_overlapping_prisms() {
         // Non-coaxial: partial overlaps rather than nesting, so the
         // composite operand's annular/clipped faces differ from the
