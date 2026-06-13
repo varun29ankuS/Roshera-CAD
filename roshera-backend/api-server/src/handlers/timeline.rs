@@ -1610,3 +1610,116 @@ pub async fn redo_operation(
         }
     }
 }
+
+// ── Named design states + non-destructive time scrub ───────────────
+//
+// "Better-than-git" exploration slice 1 (2026-06-13). git can show you
+// an old state only by checking it out; these two endpoints make the
+// design history browsable IN PLACE:
+//
+//   GET /api/timeline/checkpoints           — named design states
+//   GET /api/timeline/scrub/{branch}/{seq}  — the full scene AS OF
+//                                             event `seq`, rebuilt in a
+//                                             scratch model. READ-ONLY:
+//                                             the live model, the
+//                                             recorder, and the
+//                                             viewport are untouched.
+//
+// The scrub payload is shaped like /api/scene/snapshot so any client
+// that can render a snapshot can render a historical state — including
+// an agent diffing two moments of the design without disturbing the
+// user's scene.
+
+/// Wire form of a [`timeline_engine::Checkpoint`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CheckpointSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// `[first, last]` event indices captured by the checkpoint.
+    pub event_range: [u64; 2],
+    pub author: String,
+    pub timestamp: String,
+    pub tags: Vec<String>,
+}
+
+/// `GET /api/timeline/checkpoints` — list named design states.
+pub async fn list_checkpoints(State(state): State<AppState>) -> Json<Vec<CheckpointSummary>> {
+    let timeline = state.timeline.read().await;
+    let out = timeline
+        .list_checkpoints()
+        .into_iter()
+        .map(|c| CheckpointSummary {
+            id: c.id.to_string(),
+            name: c.name,
+            description: c.description,
+            event_range: [c.event_range.0, c.event_range.1],
+            author: author_label(&c.author),
+            timestamp: c.timestamp.to_rfc3339(),
+            tags: c.tags,
+        })
+        .collect();
+    Json(out)
+}
+
+/// `GET /api/timeline/scrub/{branch_id}/{sequence}` — rebuild the
+/// scene as of event `sequence` (inclusive) on `branch_id`, in a
+/// scratch model, and return it snapshot-shaped. Mutates nothing.
+pub async fn scrub_timeline(
+    State(state): State<AppState>,
+    Path((branch_ref, sequence)): Path<(String, u64)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Drain in-flight recorder ops so "as of event N" is exact even
+    // for events recorded microseconds ago.
+    let _ = state.timeline_recorder.flush().await;
+
+    let (total, events) = {
+        let timeline = state.timeline.read().await;
+        let branch_id = resolve_branch_ref(&branch_ref)?;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        let total = all.len();
+        all.retain(|e| e.sequence_number <= sequence);
+        (total, all)
+    };
+
+    // Rebuild into a SCRATCH model — the live model handle is never
+    // touched, which is the whole point of a scrub.
+    let mut scratch = geometry_engine::primitives::topology_builder::BRepModel::new();
+    let outcome = timeline_engine::replay::rebuild_model_from_events(&mut scratch, &events);
+
+    let tess_params = geometry_engine::tessellation::TessellationParams::default();
+    let mut objects = Vec::new();
+    for (solid_id, solid) in scratch.solids.iter() {
+        let mesh = geometry_engine::tessellation::tessellate_solid(solid, &scratch, &tess_params);
+        if mesh.triangles.is_empty() {
+            continue;
+        }
+        let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&mesh);
+        objects.push(serde_json::json!({
+            // Synthetic id: scrub views are ephemeral and own no UUID
+            // mappings in the live registry.
+            "id": format!("scrub:{}", solid_id),
+            "name": format!("solid {} @ event {}", solid_id, sequence),
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analytical_geometry": serde_json::Value::Null,
+            "transform": serde_json::Value::Null,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "branch": branch_ref,
+        "at_sequence": sequence,
+        "events_total": total,
+        "events_applied": outcome.events_applied,
+        "events_skipped": outcome.events_skipped,
+        "objects": objects,
+    })))
+}

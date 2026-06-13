@@ -6094,6 +6094,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(crate::handlers::timeline::truncate_history),
         )
         .route("/api/timeline/checkpoint", post(create_checkpoint))
+        .route(
+            "/api/timeline/checkpoints",
+            get(handlers::timeline::list_checkpoints),
+        )
+        .route(
+            "/api/timeline/scrub/{branch_id}/{sequence}",
+            get(handlers::timeline::scrub_timeline),
+        )
         .route("/api/timeline/branch/create", post(create_branch))
         .route(
             "/api/timeline/branch/switch/{branch_id}",
