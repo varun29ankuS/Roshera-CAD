@@ -6544,13 +6544,46 @@ fn validate_fillet_parameters(
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
 
-    // Check that radius is not too large for the edge length. Use the
-    // caller-supplied tolerance so arc-length integration matches the
-    // precision the fillet operation will run at downstream — running
-    // it at a different (default) tolerance can let a borderline-too-
-    // large radius slip past validation.
-    let edge_length = edge.compute_arc_length(&model.curves, *tolerance)?;
-    if radius > edge_length * 0.5 {
+    // A fillet radius is bounded by the PERPENDICULAR room on the two
+    // adjacent faces, NOT by the filleted edge's own length. The rolling
+    // ball runs ALONG the edge; what limits its radius is how far each
+    // adjacent face extends AWAY from the edge. A 30 mm-tall box edge
+    // between 200 mm faces takes a 20 mm fillet fine — the old
+    // `radius > edge_length * 0.5` test measured the wrong dimension and
+    // falsely rejected such valid fillets (KNOWN_BUGS #38).
+    //
+    // The standard proxy for that perpendicular room is the length of the
+    // neighbouring edges that meet this edge at its two endpoints: the
+    // fillet's tangent line runs along each of them, so the radius must not
+    // overrun the shortest neighbour. (For a cube every neighbour equals the
+    // edge length, recovering a sensible bound; for a slab the long
+    // neighbours correctly permit a radius far exceeding the short edge.)
+    let start_v = edge.start_vertex;
+    let end_v = edge.end_vertex;
+    let mut min_neighbor = f64::INFINITY;
+    for (other_id, other) in model.edges.iter() {
+        if other_id == edge_id {
+            continue;
+        }
+        let shares_endpoint = other.start_vertex == start_v
+            || other.start_vertex == end_v
+            || other.end_vertex == start_v
+            || other.end_vertex == end_v;
+        if !shares_endpoint {
+            continue;
+        }
+        if let Ok(len) = other.compute_arc_length(&model.curves, *tolerance) {
+            if len < min_neighbor {
+                min_neighbor = len;
+            }
+        }
+    }
+
+    // `min_neighbor` is INFINITY only for an isolated edge with no
+    // neighbours — a degenerate fixture, not a real solid feature; such an
+    // edge has no adjacent-face room to reason about, so the upper bound is
+    // left to the downstream blend construction + validation.
+    if min_neighbor.is_finite() && radius > min_neighbor {
         return Err(OperationError::InvalidRadius(radius));
     }
 
@@ -6980,13 +7013,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_fillet_parameters_rejects_radius_above_half_edge_length() {
+    fn validate_fillet_parameters_rejects_radius_above_neighbor_bound() {
+        // #38: the radius bound is the shortest NEIGHBOURING edge
+        // (perpendicular-face room), not the filleted edge's own length.
+        // On a 4 mm cube every neighbour is 4 mm, so R5 (> 4) is rejected.
         let mut model = BRepModel::new();
-        let (edge_id, _, _) =
-            add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(2.0, 0.0, 0.0));
+        let _ = TopologyBuilder::new(&mut model)
+            .create_box_3d(4.0, 4.0, 4.0)
+            .expect("box creation succeeds");
+        let edge_id = model
+            .edges
+            .iter()
+            .find(|(_, e)| !e.is_loop())
+            .map(|(id, _)| id)
+            .expect("box has open edges");
         let tol = Tolerance::default();
-        // edge length = 2, half = 1. radius = 1.5 > 1 must fail.
-        let result = validate_fillet_parameters(&model, edge_id, 1.5, &tol);
+        let result = validate_fillet_parameters(&model, edge_id, 5.0, &tol);
         assert!(matches!(result, Err(OperationError::InvalidRadius(_))));
     }
 
@@ -6997,6 +7039,67 @@ mod tests {
             add_simple_edge(&mut model, Point3::ORIGIN, Point3::new(10.0, 0.0, 0.0));
         let tol = Tolerance::default();
         assert!(validate_fillet_parameters(&model, edge_id, 1.0, &tol).is_ok());
+    }
+
+    /// #38 REGRESSION: a fillet radius is bounded by adjacent-face room,
+    /// not the filleted edge's own length. A 30 mm-deep slab (200×120×30)
+    /// has short 30 mm edges between large faces; an R20 fillet fits with
+    /// ample margin and must both pass validation AND construct a
+    /// watertight solid. The old `edge_length * 0.5` gate rejected it
+    /// ("Invalid radius: 20") though it is geometrically valid.
+    #[test]
+    fn fillet_large_radius_on_short_edge_between_large_faces_38() {
+        use crate::harness::watertight::manifold_report;
+        let mut model = BRepModel::new();
+        let solid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(200.0, 120.0, 30.0)
+            .expect("box creation succeeds")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {other:?}"),
+        };
+        let tol = Tolerance::default();
+        // A 30 mm edge (along the depth axis) between two large faces.
+        let short_edge = model
+            .edges
+            .iter()
+            .find(|(_, e)| {
+                !e.is_loop()
+                    && e.compute_arc_length(&model.curves, tol)
+                        .map(|l| (l - 30.0).abs() < 1e-6)
+                        .unwrap_or(false)
+            })
+            .map(|(id, _)| id)
+            .expect("box must have a 30 mm edge");
+
+        // The bound must accept R20 (neighbour faces are 200/120 mm).
+        validate_fillet_parameters(&model, short_edge, 20.0, &tol)
+            .expect("#38: R20 on a 30mm edge between 200×120 faces must pass the radius gate");
+
+        let faces_before = model.faces.len();
+        fillet_edges(
+            &mut model,
+            solid,
+            vec![short_edge],
+            FilletOptions {
+                radius: 20.0,
+                fillet_type: FilletType::Constant(20.0),
+                propagation: PropagationMode::None,
+                ..Default::default()
+            },
+        )
+        .expect("#38: R20 fillet on a 30mm edge between large faces must construct");
+        assert!(
+            model.faces.len() > faces_before,
+            "fillet must add a blend face"
+        );
+        let r = manifold_report(&mut model, solid, 0.5, 1e-6).expect("manifold report");
+        assert!(
+            r.manifold && r.closed && r.oriented,
+            "#38: R20 fillet result must be watertight (open={}, nm={})",
+            r.boundary_edges,
+            r.nonmanifold_edges
+        );
     }
 
     // -------------------------------------------------------------------
