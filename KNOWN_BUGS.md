@@ -11,7 +11,7 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ## Boolean
 
-### #41 🔴 Coaxial bore through a cylindrical boss drops the outer wall
+### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall
 Found live (ladder step 6, bearing housing). `plate ∪ analytic-cylinder boss`
 (r30, interpenetrating) is CLEAN (open=0). Differencing a COAXIAL analytic
 cylinder bore (r15, same axis, through) → 600 open: the boss's OUTER wall
@@ -21,10 +21,17 @@ wholly OUTSIDE the r15 bore → must be KEPT. A plain box−cylinder bore is
 clean, so the trigger is the bore being coaxial/concentric with a pre-existing
 analytic CYLINDER wall in the target. Likely root: difference face-
 classification / point-in-cutter membership mishandles a coaxial cylinder
-wall vs a cylinder cutter (concentric cylinders produce no SSI curve, and the
-boss wall face is then dropped rather than kept). Adjacent to #7/#35 but a
-distinct symptom. DEEP (classify core) — fresh context. Gate: housing
-watertight; kernel regression + widen brep_validation_oracle.
+wall vs a cylinder cutter.
+**ROOT CAUSE + FIX (trace-confirmed):** NOT an SSI bug — it was the interior
+point. `get_face_interior_point` averages boundary-edge midpoints; for a
+cylinder WALL the boundary (top+bottom circles + seam) averages toward the
+AXIS, so the outer r30 wall's interior point came out at (7.5,0,20) — inside
+the r15 bore — and the wall classified `Inside` and was dropped. Fixed by
+projecting the centroid back ONTO the analytic surface for
+Cylinder/Sphere/Cone faces (closest_point → point_at): the interior point is
+now (30,0,20) → `Outside` → wall kept. Minimal repro
+`boolean::tests::diff_coaxial_cylinder_tube_41` now open=0/nm=0. Suites green:
+boolean 98, curved_boolean_poke_envelope 4, determinism 3, operations 685.
 
 ### #35 🟡 Difference cut intersecting another bore leaves open faces
 Box − vertical bore − crossing horizontal bore: the second cut's wall

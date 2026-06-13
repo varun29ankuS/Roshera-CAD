@@ -11285,11 +11285,34 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
     }
 
     if count > 0 {
-        Ok(Point3::new(
+        let centroid = Point3::new(
             sum.x / count as f64,
             sum.y / count as f64,
             sum.z / count as f64,
-        ))
+        );
+        // For a CURVED analytic face the boundary-edge centroid lies OFF the
+        // surface: a cylinder wall's boundary (top + bottom circles + seam)
+        // averages toward the AXIS, so the centroid sits well inside the
+        // solid rather than on the wall. Classifying that off-surface point
+        // mis-attributes the face — in a coaxial tube (outer r30 − inner r15)
+        // the outer wall's centroid lands at ~r/4 (inside the bore) and the
+        // wall is wrongly dropped (KNOWN_BUGS #41). Project the centroid back
+        // ONTO the analytic surface so the interior point really lies on the
+        // face. (Planar faces already have an on-surface centroid; skip them.)
+        if let Some(surface) = model.surfaces.get(face.surface) {
+            use crate::primitives::surface::SurfaceType;
+            if matches!(
+                surface.surface_type(),
+                SurfaceType::Cylinder | SurfaceType::Sphere | SurfaceType::Cone
+            ) {
+                if let Ok((u, v)) = surface.closest_point(&centroid, Tolerance::default()) {
+                    if let Ok(p) = surface.point_at(u, v) {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+        Ok(centroid)
     } else {
         // Fallback to surface parameter center if no edges available
         let surface =
@@ -17342,6 +17365,47 @@ mod tests {
             fcount <= 10,
             "#24: analytic bore must stay smooth (≤10 faces, one cylinder wall); \
              got {fcount} — faceted?"
+        );
+    }
+
+    /// #41 REGRESSION: a coaxial cylinder tube — outer cylinder r30 minus a
+    /// concentric inner cylinder r15 — must be watertight. The outer wall
+    /// (r30) is entirely OUTSIDE the r15 cutter and must be kept; the bug
+    /// drops it (600 open). Minimal isolation of the boss+coaxial-bore case.
+    #[test]
+    fn diff_coaxial_cylinder_tube_41() {
+        use crate::harness::watertight::manifold_report;
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let mut m = BRepModel::new();
+        let outer = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 30.0, 40.0)
+            .expect("outer cylinder")
+        {
+            GeometryId::Solid(id) => id,
+            o => panic!("{o:?}"),
+        };
+        let inner = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -5.0), Vector3::Z, 15.0, 50.0)
+            .expect("inner cylinder")
+        {
+            GeometryId::Solid(id) => id,
+            o => panic!("{o:?}"),
+        };
+        let res = boolean_operation(
+            &mut m,
+            outer,
+            inner,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("coaxial tube difference");
+        let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("manifold report");
+        eprintln!("[#41] open={} nm={}", r.boundary_edges, r.nonmanifold_edges);
+        assert!(
+            r.boundary_edges == 0 && r.nonmanifold_edges == 0,
+            "#41: coaxial tube must be watertight (open={}, nm={})",
+            r.boundary_edges,
+            r.nonmanifold_edges
         );
     }
 }
