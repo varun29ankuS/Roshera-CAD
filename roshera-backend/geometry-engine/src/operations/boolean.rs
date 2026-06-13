@@ -5689,38 +5689,43 @@ fn split_face_by_curves(
     // The face has no interior splits — return it as-is with the
     // unsplit boundary loop.
     if active_cut_count == 0 {
-        let face = model
-            .faces
-            .get(face_id)
-            .ok_or_else(|| OperationError::InvalidInput {
-                parameter: "face_id".to_string(),
-                expected: "valid face ID".to_string(),
-                received: format!("{:?}", face_id),
-            })?;
         let original_face = face_id;
-        let surface = face.surface_id;
-        let inner_loops_original: Vec<Vec<(EdgeId, bool)>> = face
-            .inner_loops
-            .iter()
-            .filter_map(|lid| model.loops.get(*lid))
-            .map(|lp| {
-                lp.edges
-                    .iter()
-                    .zip(lp.orientations.iter())
-                    .map(|(eid, &forward)| (*eid, forward))
-                    .collect()
-            })
-            .collect();
+        let surface = {
+            let face = model
+                .faces
+                .get(face_id)
+                .ok_or_else(|| OperationError::InvalidInput {
+                    parameter: "face_id".to_string(),
+                    expected: "valid face ID".to_string(),
+                    received: format!("{:?}", face_id),
+                })?;
+            face.surface_id
+        };
+        // Return the face unsplit, but keep OUTER and INNER loops SEPARATE.
+        // `boundary_edges` (from get_face_boundary_edges above) flattens
+        // outer + inner into a single bag; reusing it here would place a
+        // face-with-hole's inner-loop edges into BOTH `boundary_edges` and
+        // `inner_loops`, yielding a self-contradictory face — the hole ring
+        // counted as outer boundary AND as a hole, which reconstructs to a
+        // non-manifold solid (the hole ring is shared by 3 faces). This
+        // path fires for a composite operand's annular cap that receives
+        // only void-cuts (every cut skipped → active_cut_count == 0; see
+        // the void-cut filter and the boundary-coincidence guard above).
+        // Identical flatten bug to the one already fixed in
+        // `add_non_intersecting_faces`.
+        let (outer_only, inner_loops_original) = get_face_outer_and_inner_loops(model, face_id)?;
         if pipeline_trace_enabled() {
             eprintln!(
-                "[bool]     split_face_by_curves: face={:?} all cuts coincident with boundary — returning unsplit face",
-                face_id
+                "[bool]     split_face_by_curves: face={:?} all cuts coincident-or-void — returning unsplit face (outer={} edges, holes={})",
+                face_id,
+                outer_only.len(),
+                inner_loops_original.len()
             );
         }
         return Ok(vec![SplitFace {
             original_face,
             surface,
-            boundary_edges: boundary_edges.clone(),
+            boundary_edges: outer_only,
             classification: FaceClassification::Outside,
             from_solid: origin_solid,
             inner_loops: inner_loops_original,
