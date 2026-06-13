@@ -22,6 +22,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 
 const BASE = process.env.ROSHERA_URL ?? "http://localhost:8081";
 
@@ -576,6 +577,59 @@ server.tool(
   },
 );
 
+server.tool(
+  "transform",
+  "Move and/or rotate a solid IN PLACE by its object_uuid. Identity is " +
+    "preserved — same uuid, the viewport updates the existing object " +
+    "rather than spawning a new one. Rotation (about an optional center, " +
+    "default origin) applies first, then translation. Supply translation " +
+    "and/or rotation (at least one). Angle is in DEGREES. After moving, " +
+    "render_part to confirm the new position.",
+  {
+    object: z.string().uuid().describe("object_uuid of the solid to move"),
+    translation: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("[dx, dy, dz] world-space offset"),
+    rotation: z
+      .object({
+        axis: z
+          .tuple([z.number(), z.number(), z.number()])
+          .describe("rotation axis (need not be unit length)"),
+        angle_deg: z.number().describe("rotation angle in DEGREES"),
+        center: z
+          .tuple([z.number(), z.number(), z.number()])
+          .optional()
+          .describe("pivot point, default origin [0,0,0]"),
+      })
+      .optional(),
+  },
+  async ({ object, translation, rotation }) => {
+    try {
+      if (!translation && !rotation) {
+        return fail(new Error("provide translation and/or rotation"));
+      }
+      const body: any = { object };
+      if (translation) body.translation = translation;
+      if (rotation) {
+        body.rotation = {
+          axis: rotation.axis,
+          angle: (rotation.angle_deg * Math.PI) / 180,
+          ...(rotation.center ? { center: rotation.center } : {}),
+        };
+      }
+      const r = await api("POST", "/api/geometry/transform", body);
+      return ok({
+        object_uuid: r.object ?? object,
+        moved: true,
+        note: "render_part to confirm the new position",
+      });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
 // ─── Parametric sketching (csketch — constraint-solver backed) ────────
 
 server.tool(
@@ -710,6 +764,40 @@ server.tool(
           name: o.name,
           triangles: (o.mesh?.indices?.length ?? 0) / 3,
         })),
+      });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "clear_timeline",
+  "Reset a timeline branch to ZERO events and wipe the live model to " +
+    "match — the one-shot 'start over'. Default branch 'main'. DESTRUCTIVE " +
+    "and irreversible: the event ledger is rewritten, not undoable. Unlike " +
+    "undo/truncate (which refuse the protected main trunk and need a " +
+    "specific event), this clears the whole branch. Use clear_parts instead " +
+    "if you only want an empty scene but a preserved history.",
+  {
+    branch_id: z
+      .string()
+      .default("main")
+      .describe("branch to clear; 'main' is the trunk"),
+  },
+  async ({ branch_id }) => {
+    try {
+      // The endpoint seeds its own replay position, so a fresh per-call
+      // session id is sufficient; the truncate is branch-scoped, not
+      // session-scoped.
+      const r = await api("POST", "/api/timeline/clear", {
+        session_id: randomUUID(),
+        branch_id,
+      });
+      return ok({
+        events_removed: r.events_removed,
+        model_reconciled: r.model_reconciled,
+        branch_id: r.branch_id ?? branch_id,
       });
     } catch (e) {
       return fail(e);
