@@ -12,10 +12,18 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 ## Boolean
 
 ### #35 🟡 Difference cut intersecting another bore leaves open faces
-Box − vertical bore − crossing horizontal bore: the cylinder∩cylinder
-saddle leaves ~15 open + 3 non-manifold edges. Repro:
-`boolean::tests::diff_intersecting_bores_35` (ignored). Localized to the
-saddle between the two bore cutters' facets.
+Box − vertical bore − crossing horizontal bore: the second cut's wall
+fragments where it breaks into the FIRST bore's void. Repro:
+`boolean::tests::diff_intersecting_bores_35` (ignored) → 15 open + 3 nm,
+euler −10. **Localized (diagnostic render, 2026-06-13):** the open edges
+are the saddle intersection curve where the horizontal tunnel wall meets
+the vertical bore void — the hbore wall facets that pass through the
+already-empty vbore region are not trimmed/welded against the vbore wall
+facets, leaving the saddle loop open. Both bores are 24-gon prisms, so
+this is faceted plane∩plane at the saddle, not analytic SSI. Fix lives in
+the difference pipeline's handling of a cutter face that crosses a
+pre-existing void boundary (the second operand's wall must be clipped to
+material and welded to the first void's wall along the shared saddle).
 
 ### #36 🟢 Boolean leaves invalid operand husks in the solid store
 After a boolean the consumed operands lingered in `SolidStore` as
