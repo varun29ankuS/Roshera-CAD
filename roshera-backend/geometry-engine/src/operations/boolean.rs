@@ -10918,6 +10918,110 @@ fn face_boundary_samples(model: &BRepModel, face: &SplitFace) -> Vec<Point3> {
 /// Uses the centroid of boundary edge midpoints rather than the surface
 /// parameter center, which can lie outside the actual face boundary for
 /// trimmed or partial faces (e.g., a small sector of a cylinder).
+/// Find a point in the MATERIAL of a face-with-hole: inside the outer
+/// loop and outside every inner loop (hole). Returns `None` when the
+/// surface frame can't be built or no material candidate is found, so the
+/// caller falls back to the boundary centroid.
+///
+/// Why this exists: the outer-boundary centroid of an annular face lands
+/// in the HOLE (an annulus's centroid is its centre, which is void). The
+/// boolean classifier then tests a point that is not on the face's
+/// material and drops the face — the root of the chained-union bug #27,
+/// where a composite operand's annular cap (e.g. the disc-top ring carried
+/// in unsplit) classified Inside via its hole-centre and vanished, leaving
+/// open seams where its rims met the walls.
+///
+/// Method: build a tangent frame at the outer centroid, project the outer
+/// loop and every hole to 2D, then test candidate points — the outer
+/// centroid first, then each outer-edge midpoint nudged inward toward the
+/// centroid — returning the first that is inside the outer polygon and
+/// outside all holes. Mirrors `compute_split_face_interior_points`.
+fn face_with_hole_interior_point(model: &BRepModel, face: &SplitFace) -> Option<Point3> {
+    let outer_eids: Vec<EdgeId> = face.boundary_edges.iter().map(|&(e, _)| e).collect();
+    let outer_3d = extract_cycle_vertices_3d(&outer_eids, model);
+    if outer_3d.len() < 3 {
+        return None;
+    }
+    let hole_3d: Vec<Vec<Point3>> = face
+        .inner_loops
+        .iter()
+        .map(|lp| extract_cycle_vertices_3d(&lp.iter().map(|&(e, _)| e).collect::<Vec<_>>(), model))
+        .filter(|v| v.len() >= 3)
+        .collect();
+    if hole_3d.is_empty() {
+        return None;
+    }
+
+    // Tangent frame at the outer-vertex centroid (same construction as
+    // partition_outer_and_pre_existing_hole_cycles).
+    let n = outer_3d.len() as f64;
+    let anchor = {
+        let s = outer_3d.iter().fold(Vector3::new(0.0, 0.0, 0.0), |a, p| {
+            a + Vector3::new(p.x, p.y, p.z)
+        });
+        Point3::new(s.x / n, s.y / n, s.z / n)
+    };
+    let surface = model.surfaces.get(face.surface)?;
+    let tol = Tolerance::default();
+    let (u0, v0) = surface.closest_point(&anchor, tol).ok()?;
+    let sp = surface.evaluate_full(u0, v0).ok()?;
+    let origin = sp.position;
+    let e1 = sp.du.normalize().ok()?;
+    let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
+    let e2 = dv_perp.normalize().ok()?;
+    let project = |p: &Point3| -> (f64, f64) {
+        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        (d.dot(&e1), d.dot(&e2))
+    };
+    let unproject = |u: f64, v: f64| -> Point3 {
+        Point3::new(
+            origin.x + e1.x * u + e2.x * v,
+            origin.y + e1.y * u + e2.y * v,
+            origin.z + e1.z * u + e2.z * v,
+        )
+    };
+
+    let outer_2d: Vec<(f64, f64)> = outer_3d.iter().map(&project).collect();
+    let holes_2d: Vec<Vec<(f64, f64)>> = hole_3d
+        .iter()
+        .map(|h| h.iter().map(&project).collect())
+        .collect();
+
+    let is_material = |u: f64, v: f64| -> bool {
+        point_in_polygon_2d(u, v, &outer_2d)
+            && holes_2d.iter().all(|h| !point_in_polygon_2d(u, v, h))
+    };
+
+    // Candidate 1: the outer centroid (correct for any face whose hole
+    // does not contain the centroid).
+    let (cx, cy) = outer_2d
+        .iter()
+        .fold((0.0, 0.0), |(ax, ay), &(x, y)| (ax + x, ay + y));
+    let centroid_2d = (cx / outer_2d.len() as f64, cy / outer_2d.len() as f64);
+    if is_material(centroid_2d.0, centroid_2d.1) {
+        return Some(unproject(centroid_2d.0, centroid_2d.1));
+    }
+
+    // Candidate 2: each outer-edge midpoint nudged inward toward the
+    // centroid by an increasing fraction. The first small nudge lands in
+    // the material band of an annulus.
+    const FRACTIONS: [f64; 6] = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5];
+    for i in 0..outer_2d.len() {
+        let (ax, ay) = outer_2d[i];
+        let (bx, by) = outer_2d[(i + 1) % outer_2d.len()];
+        let mx = 0.5 * (ax + bx);
+        let my = 0.5 * (ay + by);
+        for f in FRACTIONS {
+            let u = mx + f * (centroid_2d.0 - mx);
+            let v = my + f * (centroid_2d.1 - my);
+            if is_material(u, v) {
+                return Some(unproject(u, v));
+            }
+        }
+    }
+    None
+}
+
 fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResult<Point3> {
     // Prefer the pre-computed interior point when available. It is set by
     // `split_face_by_curves` in situations where naive boundary-centroid
@@ -10925,6 +11029,15 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
     // causing ray-cast classification to misattribute Inside/Outside.
     if let Some(p) = face.interior_point {
         return Ok(p);
+    }
+
+    // Face-with-hole: the outer-boundary centroid lands in the hole (an
+    // annulus's centre is void), so classification would test a non-material
+    // point and drop the face. Find a point in the actual material instead.
+    if !face.inner_loops.is_empty() {
+        if let Some(p) = face_with_hole_interior_point(model, face) {
+            return Ok(p);
+        }
     }
 
     // Collect midpoints of boundary edges (orientation does not affect
