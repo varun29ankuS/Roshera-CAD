@@ -34,6 +34,12 @@ now (30,0,20) → `Outside` → wall kept. Minimal repro
 boolean 98, curved_boolean_poke_envelope 4, determinism 3, operations 685.
 
 ### #35 🟡 Difference cut intersecting another bore leaves open faces
+NOTE (2026-06-13): the #41 interior-point fix did NOT help #35 — re-checked
+faceted (15 open / 3 nm) and analytic (600 open) both still broken. Confirms
+#35 is the saddle IMPRINT/WELD where the two cutters' walls cross (a
+corefinement problem), NOT the curved-face interior-point classification that
+#41 fixed. Stays the deep corefinement lane (#30/#6).
+
 Box − vertical bore − crossing horizontal bore: the second cut's wall
 fragments where it breaks into the FIRST bore's void.
 **CONFIRMED for ANALYTIC cylinders too (2026-06-13, ladder step 5):** block
