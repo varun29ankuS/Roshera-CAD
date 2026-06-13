@@ -75,6 +75,21 @@ fn pipeline_trace(args: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Whether point-in-solid classification uses the generalized winding
+/// number (BOOL-ARCH-2) instead of the legacy 3-ray even-odd vote.
+///
+/// Gated behind `ROSHERA_BOOL_GWN` while the GWN path is validated for
+/// parity against the full boolean floor + curved poke matrix. The GWN
+/// test is global (sums each oriented boundary triangle's solid angle at
+/// the query point), so it does not flip at the coincident/coplanar/near-
+/// hole configurations that make ray-casting fragile — the root of the
+/// chained-union misclassification family. Once parity is proven this
+/// becomes the default.
+fn gwn_classification_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ROSHERA_BOOL_GWN").is_ok())
+}
+
 /// Type of Boolean operation
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BooleanOp {
@@ -10612,6 +10627,52 @@ fn point_inside_cylinder_solid(
 /// Classify a single point relative to a solid (Inside / Outside / OnBoundary).
 /// The face-level [`classify_face_relative_to_solid`] wraps this with multi-point
 /// sampling to tell a true coincident-area contact from a measure-zero tangency.
+/// Outward-oriented boundary triangles of `solid`, for generalized
+/// winding number classification. Tessellates the solid's faces; returns
+/// empty when the solid is missing or tessellates to nothing (caller
+/// falls back to the ray-cast). The GWN inside-test (`|w| > 0.5`) is
+/// sign-agnostic, so the tessellator's global orientation convention does
+/// not matter — only that the surface is closed (no gaps), which a valid
+/// operand satisfies.
+fn solid_gwn_triangles(model: &BRepModel, solid: SolidId) -> Vec<[Point3; 3]> {
+    let Some(solid_ref) = model.solids.get(solid) else {
+        return Vec::new();
+    };
+    let params = crate::tessellation::TessellationParams::default();
+    let mesh = crate::tessellation::tessellate_solid(solid_ref, model, &params);
+    let mut tris = Vec::with_capacity(mesh.triangles.len());
+    for t in &mesh.triangles {
+        if let (Some(v0), Some(v1), Some(v2)) = (
+            mesh.vertices.get(t[0] as usize),
+            mesh.vertices.get(t[1] as usize),
+            mesh.vertices.get(t[2] as usize),
+        ) {
+            tris.push([v0.position, v1.position, v2.position]);
+        }
+    }
+    tris
+}
+
+/// Classify `test_point` as Inside/Outside `solid` via the generalized
+/// winding number. Returns `None` when the solid yields no triangles, so
+/// the caller can fall back to the ray-cast. Never returns `OnBoundary` —
+/// boundary coincidence is detected upstream by the per-face test.
+fn classify_point_gwn(
+    model: &BRepModel,
+    solid: SolidId,
+    test_point: &Point3,
+) -> Option<FaceClassification> {
+    let tris = solid_gwn_triangles(model, solid);
+    if tris.is_empty() {
+        return None;
+    }
+    if crate::math::winding_number::point_is_inside(test_point, &tris) {
+        Some(FaceClassification::Inside)
+    } else {
+        Some(FaceClassification::Outside)
+    }
+}
+
 fn classify_point_relative_to_solid(
     model: &BRepModel,
     test_point: Point3,
@@ -10647,6 +10708,19 @@ fn classify_point_relative_to_solid(
     for face_id in get_solid_faces(model, solid)? {
         if is_point_in_face(model, face_id, &test_point, tolerance)? {
             return Ok(FaceClassification::OnBoundary);
+        }
+    }
+
+    // Generalized winding number classification (BOOL-ARCH-2): a global,
+    // robust replacement for the 3-ray even-odd vote below. The point is
+    // not on the boundary (handled above), so GWN gives a definitive
+    // Inside/Outside without the ray-cast's sensitivity to grazing hits,
+    // coincident faces, or small surface gaps. Gated behind ROSHERA_BOOL_GWN
+    // until parity with the ray-cast is proven on the full floor; falls
+    // back to the ray-cast when the operand yields no triangles.
+    if gwn_classification_enabled() {
+        if let Some(cls) = classify_point_gwn(model, solid, &test_point) {
+            return Ok(cls);
         }
     }
 
