@@ -934,14 +934,16 @@ async fn boolean_operation(
         state.tombstone_consumed_uuids(event_id, [(solid_a, uuid_a), (solid_b, uuid_b)]);
     }
 
-    // Drop the consumed operands from the id-mapping table. The kernel
-    // boolean has already merged or removed those solids; leaving stale
-    // UUID→solid_id rows around would let a subsequent request resolve
-    // a UUID to a non-existent solid.
-    state.unregister_id_mapping(&uuid_a);
+    // Operand B (the tool) is consumed and gone. Operand A (the base) PERSISTS
+    // as the result: keep its UUID so the part retains its identity, name,
+    // selection and outliner place across the feature — a cut/boss/blend is a
+    // feature ON the part, not a brand-new part. The frontend preserves the
+    // user-visible name on a same-UUID upsert, so the part stops being renamed
+    // "Difference N"/"Union N" on every boolean. Only B's mapping is dropped;
+    // A's UUID is remapped to the new result solid.
     state.unregister_id_mapping(&uuid_b);
 
-    let result_uuid = Uuid::new_v4();
+    let result_uuid = uuid_a;
     let result_id_str = result_uuid.to_string();
     state.register_id_mapping(result_uuid, result_solid_id);
 
@@ -953,10 +955,8 @@ async fn boolean_operation(
     let display_name = format!("{} {}", capitalize(op_label), result_solid_id);
     let parameters = serde_json::json!({ "operation": op_label });
 
-    // Order matters: tell viewers the operands are gone before adding
-    // the new solid, so the new solid never momentarily appears
-    // alongside the originals.
-    broadcast_object_deleted(&uuid_a.to_string());
+    // Operand B is removed; operand A is upserted in place (same UUID) so the
+    // base part keeps its identity and name across the feature.
     broadcast_object_deleted(&uuid_b.to_string());
     broadcast_object_created(
         &result_id_str,
@@ -974,7 +974,7 @@ async fn boolean_operation(
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
-        "consumed": [uuid_a.to_string(), uuid_b.to_string()],
+        "consumed": [uuid_b.to_string()],
         "object": {
             "id":         result_id_str,
             "name":       display_name,
