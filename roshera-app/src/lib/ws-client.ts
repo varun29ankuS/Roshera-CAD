@@ -62,15 +62,16 @@ class WSClient {
 
     ws.onopen = () => {
       const s = useWSStore.getState()
-      const wasReconnect = s.reconnectAttempt > 0
       s.setStatus('connected')
       s.resetReconnect()
       this.startHeartbeat()
-      // After a reconnect the server may be a NEW process: resync the
-      // whole scene rather than trusting anything broadcast-accumulated.
-      if (wasReconnect) {
-        resyncHook?.()
-      }
+      // Resync the whole scene from the server snapshot on EVERY connect.
+      // The FIRST connect needs it too: a fresh page load (or refresh) must
+      // hydrate existing geometry from /api/scene/snapshot — otherwise the
+      // scene stays empty until some live broadcast happens to arrive, which
+      // is why a refresh showed nothing. A reconnect additionally needs it
+      // because the server may be a new process.
+      resyncHook?.()
     }
 
     ws.onmessage = (event) => {
