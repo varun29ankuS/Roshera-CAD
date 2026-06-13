@@ -954,8 +954,13 @@ fn validate_pattern_result(model: &BRepModel, instances: &[Vec<FaceId>]) -> Oper
             }
         }
     }
-    let result = crate::primitives::validation::validate_model_enhanced(
+    // #29/#39 — scope the verdict to the solids owning the pattern's
+    // instance faces (a pattern spawns several new instance solids), so an
+    // unrelated pre-existing defect elsewhere can't fail the pattern.
+    let instance_faces: Vec<FaceId> = instances.iter().flatten().copied().collect();
+    let result = crate::primitives::validation::validate_faces_scoped(
         model,
+        &instance_faces,
         crate::math::Tolerance::default(),
         crate::primitives::validation::ValidationLevel::Standard,
     );

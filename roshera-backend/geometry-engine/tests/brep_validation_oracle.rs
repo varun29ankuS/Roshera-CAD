@@ -18,9 +18,12 @@
 use geometry_engine::math::{Matrix4, Tolerance, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
-use geometry_engine::primitives::validation::{validate_model_enhanced, ValidationLevel};
+use geometry_engine::primitives::validation::{
+    validate_faces_scoped, validate_model_enhanced, ValidationLevel,
+};
 
 fn box_solid(model: &mut BRepModel, w: f64, h: f64, d: f64) -> SolidId {
     match TopologyBuilder::new(model)
@@ -106,5 +109,53 @@ fn open_box_is_rejected() {
         !is_valid(&model),
         "a box with a face removed is an open shell and must FAIL validation \
          — the oracle must not accept genuine defects"
+    );
+}
+
+/// #29/#39 GUARD: scoped validation must IGNORE defects on solids the op
+/// did not touch. A valid box A and an open (invalid) box B coexist;
+/// validating scoped to A's faces passes even though whole-model
+/// validation fails on B. This is exactly what lets a blend / pattern /
+/// op on A succeed despite an unrelated broken solid elsewhere in the
+/// model (without it, every op fails as soon as any solid is malformed).
+#[test]
+fn scoped_validation_ignores_unrelated_invalid_solid() {
+    let mut model = BRepModel::new();
+    let a = box_solid(&mut model, 10.0, 10.0, 10.0);
+    let b = box_solid(&mut model, 4.0, 4.0, 4.0);
+
+    // Break B: remove one face → open shell, invalid.
+    let b_shell = model.solids.get(b).expect("b in store").outer_shell;
+    let bad_face = *model
+        .shells
+        .get(b_shell)
+        .expect("b shell")
+        .faces
+        .first()
+        .expect("b has faces");
+    model
+        .shells
+        .get_mut(b_shell)
+        .expect("b shell")
+        .remove_face(bad_face);
+    assert!(
+        !is_valid(&model),
+        "precondition: whole-model validation must see B's defect"
+    );
+
+    // Scoped to A's faces, B's defect must be invisible.
+    let a_shell = model.solids.get(a).expect("a in store").outer_shell;
+    let a_faces: Vec<FaceId> = model.shells.get(a_shell).expect("a shell").faces.clone();
+    let scoped = validate_faces_scoped(
+        &model,
+        &a_faces,
+        Tolerance::default(),
+        ValidationLevel::Standard,
+    );
+    assert!(
+        scoped.is_valid,
+        "validation scoped to A's faces must ignore the unrelated defect on B; \
+         errors: {:?}",
+        scoped.errors
     );
 }

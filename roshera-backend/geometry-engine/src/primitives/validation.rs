@@ -880,6 +880,42 @@ pub fn validate_solid_scoped(
     result
 }
 
+/// Like [`validate_solid_scoped`] but scoped to whichever solids OWN the
+/// given faces — the form an op that works by face-sets needs (blend emits
+/// blend faces on one result solid; a pattern emits faces across several
+/// newly-created instance solids). Derives the owning-solid set from the
+/// faces, then keeps only errors attributed to those solids (plus
+/// model-global, unattributed errors). See KNOWN_BUGS.md #29/#39.
+pub fn validate_faces_scoped(
+    model: &BRepModel,
+    faces: &[FaceId],
+    tolerance: Tolerance,
+    level: ValidationLevel,
+) -> ValidationResult {
+    let face_set: std::collections::HashSet<FaceId> = faces.iter().copied().collect();
+    let mut touched_solids: std::collections::HashSet<SolidId> = std::collections::HashSet::new();
+    for (sid, solid) in model.solids.iter() {
+        let shells = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        for shid in shells {
+            let Some(shell) = model.shells.get(shid) else {
+                continue;
+            };
+            if shell.faces.iter().any(|f| face_set.contains(f)) {
+                touched_solids.insert(sid);
+                break;
+            }
+        }
+    }
+
+    let mut result = validate_model_enhanced(model, tolerance, level);
+    result.errors.retain(|e| match e.solid_id() {
+        Some(sid) => touched_solids.contains(&sid),
+        None => true,
+    });
+    result.is_valid = result.errors.is_empty();
+    result
+}
+
 /// Validate that a single shell is closed: every edge contained in any
 /// loop of any face in the shell must be used by exactly two faces of
 /// the shell.
