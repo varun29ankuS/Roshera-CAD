@@ -6481,8 +6481,12 @@ fn validate_filleted_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
             solid_id
         )));
     }
-    let mut result = crate::primitives::validation::validate_model_enhanced(
+    // #29 — scope the verdict to the filleted solid (see chamfer's
+    // mirror of this and `validate_solid_scoped`). An unrelated solid's
+    // pre-existing defect must not fail this fillet.
+    let mut result = crate::primitives::validation::validate_solid_scoped(
         model,
+        solid_id,
         Tolerance::default(),
         crate::primitives::validation::ValidationLevel::Standard,
     );

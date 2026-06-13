@@ -3251,8 +3251,14 @@ fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationRe
             solid_id
         )));
     }
-    let mut result = crate::primitives::validation::validate_model_enhanced(
+    // #29 — scope the verdict to the chamfered solid. The enhanced sweep
+    // walks every solid, but a pre-existing defect on an UNRELATED solid
+    // (a boolean operand husk, another open part) is not this chamfer's
+    // fault and must not fail it. `validate_solid_scoped` keeps errors on
+    // `solid_id` plus model-global errors and drops other solids'.
+    let mut result = crate::primitives::validation::validate_solid_scoped(
         model,
+        solid_id,
         Tolerance::default(),
         crate::primitives::validation::ValidationLevel::Standard,
     );
