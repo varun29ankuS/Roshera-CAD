@@ -9,8 +9,34 @@ resume.
 
 ## ▶ ACTIVE WORK — START HERE
 
-**Boolean #27 chained-union B-Rep bug — DIAGNOSIS COMPLETE, FIX PENDING.**
-This is the one live task. Everything needed to implement is banked.
+**Boolean #27 chained-union B-Rep bug — PART 1 SHIPPED, PART 2 = one
+upstream filter.** Read `boolean-coaxial-cap-bug.md` "FIX PROGRESS"
+section first.
+
+- **PART 1 DONE & GREEN (commit f35b74e, pushed):** merge nest-guard in
+  `merge_same_origin_fragments` — never nest a fragment into an existing
+  hole. Boolean floor 106/0.
+- **PART 2 (the finish line, ~30 lines):** in `split_face_by_curves`
+  cut-add loop (~5479 `for &curve_id in curves`), BEFORE adding a cut
+  edge, SKIP it if the cut lies entirely inside a pre-existing hole of
+  the face (sample cut → project to face plane → all samples strictly
+  inside an inner-loop polygon → skip). This prevents the phantom
+  fragment at the source. The post-extract DROP variant was WRONG-LAYER
+  (orphaned rims → 96 open edges) and is reverted — do NOT redo it.
+  Near-miss data proving the approach: removing the phantoms already
+  gets euler→2 and vol→601k; the upstream filter additionally keeps
+  edges matched. Verify `prism_chain_diag_27` (un-ignore it) →
+  valid_solid, ~601k, 0 open, 0 nonmanifold; then full floor (expect
+  107/0) + poke matrix (any move = info per Varun, not a veto) → commit
+  "BOOL #27 FIXED (2/2)" → live REST re-verify → task #27 done.
+- Reusable bits: `is_point_in_face` planar branch (~11392) for the
+  plane projection; `point_in_polygon_2d` (~7503); `extract_cycle_vertices_3d`.
+
+Below: original diagnosis detail (still valid).
+
+---
+
+**Boolean #27 — diagnosis (complete).**
 
 - **Read first:** `boolean-coaxial-cap-bug.md` (full diagnosis + fix
   lane) and `fix-fundamentals-first.md` (Varun's strategy steer).
