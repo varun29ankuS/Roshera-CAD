@@ -53,11 +53,19 @@ Chamfering a closed ring of edges errors at the shared corner vertices
 not yet implemented." Workaround: apply each edge in a separate call
 (single-edge chamfer works on clean geometry).
 
-### #37 🔴 Chamfer on a boolean-reshaped face → invalid B-Rep
-Single-edge chamfer of an edge adjacent to a face that a prior boolean
-reshaped fails post-validation (χ=3). The same single-edge chamfer
-succeeds on a fresh box. Workaround: chamfer BEFORE the boolean on clean
-geometry, then interpenetrate-union.
+### #37 🟢 Chamfer on a boolean-reshaped face → invalid B-Rep
+NOT a chamfer bug — the *validator* was wrong. Any solid with a face that
+has a hole (a through-bore, counterbore, or a box pierced by another box)
+has `V−E+F ≠ 2`, because the naive Euler formula only holds when every
+face is a disk. The validator used `V−E+F = 2`, so it rejected every
+boolean result with a face-hole, which then blocked chamfer/fillet on it.
+Fixed: `validate_euler_characteristic_for_solid` now uses the generalized
+**Euler–Poincaré** identity `V − E + F − R = 2(S − G)` (R = inner loops,
+S = shells, G = genus), counting R/S across all shells. Pierced/bored
+solids validate; chamfer on a union result succeeds. Regression:
+`boolean::tests::pierced_face_union_passes_euler_poincare_validation_37`.
+The mixed-kind-corner cap's error filter was broadened to the `"Invalid
+Euler"` prefix to keep matching the reworded message.
 
 ### #70 🔴 Chamfer crossing a fillet → self-overlapping solid
 Chamfering over a previously filleted region produces a

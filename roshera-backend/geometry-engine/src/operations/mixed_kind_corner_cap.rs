@@ -828,7 +828,12 @@ pub(crate) fn filter_pending_corner_errors(
                 && location.edge_id.is_none()
                 && location.face_id.is_none()
                 && location.loop_id.is_none();
-            if is_shell_scoped && message.starts_with("Invalid Euler characteristic") {
+            // Anchor on "Invalid Euler" so this matches both the legacy
+            // "Invalid Euler characteristic" wording and the generalized
+            // "Invalid Euler–Poincaré characteristic" (odd / negative-genus)
+            // messages — a partially-blended corner leaves one loop open,
+            // which shows up as exactly this shell-scoped deficit.
+            if is_shell_scoped && message.starts_with("Invalid Euler") {
                 return false;
             }
             // CF-β.5.2-A — boundary-edge connectivity errors on

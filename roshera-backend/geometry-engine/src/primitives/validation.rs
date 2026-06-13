@@ -574,9 +574,21 @@ impl ParallelValidator {
         }
     }
 
-    /// Validate Euler characteristic for a solid
-    /// V - E + F = 2 for a simple closed solid (genus 0)
-    /// V - E + F = 2(1 - g) for genus g
+    /// Validate the generalized Euler–Poincaré characteristic of a solid:
+    ///
+    /// ```text
+    ///     V - E + F - R = 2 (S - G)
+    /// ```
+    ///
+    /// where R = total inner loops (face holes / rings), S = number of
+    /// shells (1 outer + N voids), G = genus (handles). The naive
+    /// `V - E + F = 2` only holds when every face is a topological disk and
+    /// the body is a single closed shell; it FALSELY rejects every
+    /// legitimate solid that has a face with a hole — a through-bore, a
+    /// counterbore floor, a box pierced by another box — i.e. the everyday
+    /// output of boolean operations. Counting R (and S) and using the full
+    /// formula is what makes a pierced/bored solid validate (and what lets a
+    /// downstream chamfer/fillet succeed on it). See KNOWN_BUGS.md #37.
     fn validate_euler_characteristic_for_solid(
         &self,
         model: &BRepModel,
@@ -585,17 +597,27 @@ impl ParallelValidator {
         errors: &mut Vec<ValidationError>,
         warnings: &mut Vec<ValidationWarning>,
     ) {
-        // Count vertices, edges, and faces for this solid
-        let shell_id = solid.outer_shell;
-        if let Some(shell) = model.shells.get(shell_id) {
-            let mut vertex_set = std::collections::HashSet::new();
-            let mut edge_set = std::collections::HashSet::new();
-            let mut face_count = 0;
+        // Count V, E, F, R across EVERY shell (outer + any voids), so a
+        // hollow solid with inner shells is handled by the same formula.
+        let shells = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .collect::<Vec<_>>();
+        let shell_count = shells.len() as i32;
+        let shell_id = solid.outer_shell; // diagnostic location anchor
 
-            // Count entities in the shell
+        let mut vertex_set = std::collections::HashSet::new();
+        let mut edge_set = std::collections::HashSet::new();
+        let mut face_count = 0i32;
+        let mut ring_count = 0i32; // R: inner loops summed over all faces
+
+        for sid in &shells {
+            let Some(shell) = model.shells.get(*sid) else {
+                continue;
+            };
             for &face_id in &shell.faces {
                 face_count += 1;
                 if let Some(face) = model.faces.get(face_id) {
+                    ring_count += face.inner_loops.len() as i32;
                     let mut all_loops = vec![face.outer_loop];
                     all_loops.extend(&face.inner_loops);
                     for &loop_id in &all_loops {
@@ -611,61 +633,78 @@ impl ParallelValidator {
                     }
                 }
             }
+        }
 
-            let v = vertex_set.len() as i32;
-            let e = edge_set.len() as i32;
-            let f = face_count;
-            let euler = v - e + f;
+        let v = vertex_set.len() as i32;
+        let e = edge_set.len() as i32;
+        let f = face_count;
+        let r = ring_count;
 
-            // A closed analytic surface can be modelled as one (or more) fully
-            // periodic faces carrying no bounding B-Rep edges — e.g. a sphere
-            // as a single seamless face (V=0, E=0, F=1). That is a valid solid
-            // but NOT a polyhedral 2-cell complex, so the combinatorial Euler
-            // formula V-E+F=2 does not apply (the lone sphere yields 1, which
-            // this check would otherwise reject — and which broke
-            // transform_solid on spheres). Polyhedral solids (box) and seamed
-            // analytic ones (cylinder V2/E3/F3, torus) all have edges and are
-            // validated normally below.
-            if e == 0 {
-                return;
-            }
+        // A closed analytic surface modelled as one fully periodic face with
+        // no bounding B-Rep edges — e.g. a sphere as a single seamless face
+        // (V=0, E=0, F=1) — is a valid solid but not a polyhedral 2-cell
+        // complex, so the combinatorial formula does not apply (it would
+        // reject the lone sphere, which once broke transform_solid on
+        // spheres). Seamed analytic solids (cylinder, torus) carry edges and
+        // validate normally below.
+        if e == 0 {
+            return;
+        }
 
-            // For a simple closed solid, Euler characteristic should be 2
-            // Allow for some tolerance due to genus (holes)
-            if euler != 2 {
-                // Check if it's a valid genus
-                let genus = (2 - euler) / 2;
-                if euler == 2 - 2 * genus && genus >= 0 {
-                    // Valid genus, just add a warning
-                    warnings.push(ValidationWarning::ToleranceRisk {
-                        location: EntityLocation {
-                            solid_id: Some(solid_id),
-                            shell_id: Some(shell_id),
-                            face_id: None,
-                            loop_id: None,
-                            edge_id: None,
-                            vertex_id: None,
-                        },
-                        accumulated: genus as f64,
-                    });
-                } else {
-                    // Invalid Euler characteristic
-                    errors.push(ValidationError::TopologyError {
-                        message: format!(
-                            "Invalid Euler characteristic: V({}) - E({}) + F({}) = {} (expected 2 for genus 0)",
-                            v, e, f, euler
-                        ),
-                        location: EntityLocation {
-                            solid_id: Some(solid_id),
-                            shell_id: Some(shell_id),
-                            face_id: None,
-                            loop_id: None,
-                            edge_id: None,
-                            vertex_id: None,
-                        },
-                    });
-                }
-            }
+        // V - E + F - R = 2(S - G)  ⇒  G = S - (V - E + F - R) / 2.
+        // The left side must be even (it equals 2·something); an odd value
+        // is a genuine topology defect. A non-negative genus is valid (a
+        // torus is G=1); a negative genus is impossible and flags a defect.
+        let poincare = v - e + f - r;
+        if poincare % 2 != 0 {
+            errors.push(ValidationError::TopologyError {
+                message: format!(
+                    "Invalid Euler–Poincaré characteristic: V({})-E({})+F({})-R({}) = {} is odd \
+                     (must be even = 2(S-G); S={})",
+                    v, e, f, r, poincare, shell_count
+                ),
+                location: EntityLocation {
+                    solid_id: Some(solid_id),
+                    shell_id: Some(shell_id),
+                    face_id: None,
+                    loop_id: None,
+                    edge_id: None,
+                    vertex_id: None,
+                },
+            });
+            return;
+        }
+
+        let genus = shell_count - poincare / 2;
+        if genus < 0 {
+            errors.push(ValidationError::TopologyError {
+                message: format!(
+                    "Invalid Euler–Poincaré characteristic: V({})-E({})+F({})-R({}) = {} with \
+                     S={} implies negative genus {} (impossible for a closed orientable solid)",
+                    v, e, f, r, poincare, shell_count, genus
+                ),
+                location: EntityLocation {
+                    solid_id: Some(solid_id),
+                    shell_id: Some(shell_id),
+                    face_id: None,
+                    loop_id: None,
+                    edge_id: None,
+                    vertex_id: None,
+                },
+            });
+        } else if genus > 0 {
+            // Valid but non-zero genus (handles) — informational only.
+            warnings.push(ValidationWarning::ToleranceRisk {
+                location: EntityLocation {
+                    solid_id: Some(solid_id),
+                    shell_id: Some(shell_id),
+                    face_id: None,
+                    loop_id: None,
+                    edge_id: None,
+                    vertex_id: None,
+                },
+                accumulated: genus as f64,
+            });
         }
     }
 

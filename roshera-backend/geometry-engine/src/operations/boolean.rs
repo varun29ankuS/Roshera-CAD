@@ -16913,6 +16913,62 @@ mod tests {
         );
     }
 
+    /// #37 REGRESSION: a solid with a face that has a HOLE must validate.
+    /// Box B pierces box A's top face (interpenetration, not coincident
+    /// faces), so the union's top becomes an annulus — one inner loop
+    /// (R=1). The generalized Euler–Poincaré identity holds: V-E+F-R = 2.
+    /// The old naive check (V-E+F = 2) saw the raw count as 3 and FALSELY
+    /// rejected the solid, which in turn blocked any downstream
+    /// chamfer/fillet (their post-validation ran the same check). Closed by
+    /// the R-aware check in `validate_euler_characteristic_for_solid`.
+    #[test]
+    fn pierced_face_union_passes_euler_poincare_validation_37() {
+        use crate::math::Matrix4;
+        use crate::operations::transform::{transform_solid, TransformOptions};
+        use crate::primitives::validation::{validate_model_enhanced, ValidationLevel};
+
+        let mut m = BRepModel::new();
+        let a = make_box(&mut m, (80.0, 80.0, 40.0)); // z ∈ [-20, 20]
+        let b = make_box(&mut m, (30.0, 30.0, 60.0)); // z ∈ [-30, 30]
+                                                      // Lift B so its bottom (-5) stays inside A but its top (55) pierces
+                                                      // out through A's top face (20): interpenetration, one face-hole.
+        transform_solid(
+            &mut m,
+            b,
+            Matrix4::from_translation(&Vector3::new(0.0, 0.0, 25.0)),
+            TransformOptions::default(),
+        )
+        .expect("translate B");
+        let result = boolean_operation(&mut m, a, b, BooleanOp::Union, BooleanOptions::default())
+            .expect("pierce union must succeed");
+
+        let report = validate_model_enhanced(&m, Tolerance::default(), ValidationLevel::Standard);
+        assert!(
+            report.is_valid,
+            "pierced-face union must validate under Euler–Poincaré (a face with a hole is \
+             legal); errors: {:?}",
+            report.errors
+        );
+        // Sanity: the result really does carry a face with an inner loop.
+        let has_hole = m
+            .solids
+            .get(result)
+            .and_then(|s| m.shells.get(s.outer_shell))
+            .map(|sh| {
+                sh.faces.iter().any(|&fid| {
+                    m.faces
+                        .get(fid)
+                        .map(|f| !f.inner_loops.is_empty())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            has_hole,
+            "expected an annular (face-with-hole) top after the pierce"
+        );
+    }
+
     /// #33 REGRESSION (fixed): offset/partial-overlap chained union. Closed
     /// by the world-space line-extent fix in create_line_intersection_curve —
     /// wall∩wall (RuledSurface∩RuledSurface) transverse crossings no longer
