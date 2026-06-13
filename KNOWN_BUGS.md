@@ -152,10 +152,21 @@ loft, shell), and `validate_faces_scoped(model, &faces, …)` for the
 face-set ops `blend` + `pattern` (derives owning solids from the faces;
 #39). Guarded by `brep_validation_oracle::scoped_validation_ignores_unrelated_invalid_solid`.
 
-### #24 🔴 Sketch-extrude of a circle → 64 planar faces, not one cylinder
-A circular profile extrudes to a 64-sided faceted prism instead of an
-analytic cylinder. Makes round bores faceted and inflates downstream
-boolean facet counts.
+### #24 🟢 Round features were faceted prisms (axial seam lines), not cylinders
+A circular profile extruded to an N-gon prism → N planar wall faces with
+visible axial seam lines, and inflated boolean facet counts. Resolved by
+exposing the kernel's ANALYTIC cylinder as a build primitive:
+`POST /api/geometry/cylinder {center,axis,radius,height}` →
+`create_cylinder_3d` → one smooth periodic lateral face (V2/E3/F3, ~1 seam,
+not 24 edges). Verified live: the cylinder primitive renders smooth (no
+axial lines), and a block − analytic-cylinder bore is watertight (open=0/
+nm=0) and smooth — the difference uses the analytic plane∩cylinder SSI path
+(unblocked by #40). Regression:
+`boolean::tests::analytic_cylinder_bore_is_smooth_and_watertight_24`.
+NOTE: polygon-profile extrudes are still (correctly) faceted — a polygon IS
+faceted; round features should use the cylinder primitive. A circle-edge
+profile path through `extrude_profile` (which already emits a Cylinder from
+a Circle edge) is a possible future convenience but not required.
 
 ### #28 🔴 Full 2π revolve of an offset rectangle → tessellation_empty
 
