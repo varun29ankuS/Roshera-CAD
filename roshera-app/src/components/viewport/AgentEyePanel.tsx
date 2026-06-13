@@ -47,7 +47,7 @@ export function AgentEyePanel() {
       }
       const id = parts.reduce((m, p) => Math.max(m, p.id), 0)
       const r = await fetch(
-        `${API_HOST}/api/agent/parts/${id}/render?mode=${mode}&view=${view}&size=360`,
+        `${API_HOST}/api/agent/parts/${id}/render?mode=${mode}&view=${view}&size=256`,
       )
       if (!r.ok) throw new Error(`render ${r.status}`)
       const data = (await r.json()) as RenderResponse
@@ -82,7 +82,7 @@ export function AgentEyePanel() {
   }
 
   return (
-    <div className="absolute bottom-2 right-2 z-20 w-[360px] overflow-hidden rounded-md border border-border bg-background/95 shadow-lg backdrop-blur">
+    <div className="absolute bottom-2 right-2 z-20 w-[208px] overflow-hidden rounded-md border border-border bg-background/95 shadow-lg backdrop-blur">
       <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
         <div className="flex items-center gap-1.5 text-xs font-semibold">
           <span>👁 Agent Eye</span>
