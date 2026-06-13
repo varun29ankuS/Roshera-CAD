@@ -10084,6 +10084,42 @@ fn merge_same_origin_fragments(
             polygons.insert(idx, poly);
         }
 
+        // A candidate `inner` may only be nested into `outer` if it lies
+        // in `outer`'s MATERIAL — inside its boundary AND outside every
+        // EXISTING hole it already carries (inner_loops). Without this,
+        // a fragment lying in `outer`'s pre-existing hole (the void)
+        // passes the boundary-only containment test and gets attached as
+        // a hole-within-a-hole → inner_loops=2 → invalid face-with-hole
+        // → non-manifold solid. This only bites when `outer` already has
+        // holes, i.e. when the operand is a COMPOSITE (prior boolean
+        // result whose faces are annular); fresh primitive operands have
+        // hole-free faces so the guard never changes their behaviour.
+        // This is the #27 chained-union root cause.
+        let inner_in_outer_hole = |outer_idx: usize, inner_poly: &[(f64, f64)]| -> bool {
+            for hole in &faces[outer_idx].inner_loops {
+                let edge_ids: Vec<EdgeId> = hole.iter().map(|(e, _)| *e).collect();
+                let cyc = extract_cycle_vertices_3d(&edge_ids, model);
+                if cyc.len() < 3 {
+                    continue;
+                }
+                let mut hpoly = Vec::with_capacity(cyc.len());
+                let mut ok = true;
+                for pt in &cyc {
+                    match surface.closest_point(pt, *tolerance) {
+                        Ok((u, v)) => hpoly.push((u, v)),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && hpoly.len() >= 3 && uv_polygon_strictly_contains(&hpoly, inner_poly) {
+                    return true;
+                }
+            }
+            false
+        };
+
         // 3. For every ordered pair (outer, inner) in this group, test
         // containment + the operation's keep/drop rule. The first
         // outer that contains an inner wins; subsequent containment
@@ -10128,7 +10164,9 @@ fn merge_same_origin_fragments(
                     // (outer's hole + island's boundary) = manifold.
                     if !attached_kept.contains(&inner_idx) {
                         if let Some(inner_poly) = polygons.get(&inner_idx) {
-                            if uv_polygon_strictly_contains(outer_poly, inner_poly) {
+                            if uv_polygon_strictly_contains(outer_poly, inner_poly)
+                                && !inner_in_outer_hole(outer_idx, inner_poly)
+                            {
                                 let reversed: Vec<(EdgeId, bool)> = faces[inner_idx]
                                     .boundary_edges
                                     .iter()
@@ -10146,7 +10184,9 @@ fn merge_same_origin_fragments(
                     Some(p) => p,
                     None => continue,
                 };
-                if !uv_polygon_strictly_contains(outer_poly, inner_poly) {
+                if !uv_polygon_strictly_contains(outer_poly, inner_poly)
+                    || inner_in_outer_hole(outer_idx, inner_poly)
+                {
                     continue;
                 }
 
