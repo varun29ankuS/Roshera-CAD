@@ -179,6 +179,10 @@ pub struct ComponentSummary {
     pub parent: Option<Uuid>,
     pub degrees_of_freedom: u8,
     pub mate_references: Vec<MateReferenceSummary>,
+    /// Part UUID this component instantiates, when bound via
+    /// `AddComponentRequest::part_id`. `None` for primitive-seeded
+    /// components.
+    pub source_part: Option<Uuid>,
 }
 
 /// Wire form of a named `MateReference` entry on a component. The
@@ -234,6 +238,7 @@ pub fn snapshot(assembly: &Assembly) -> AssemblySummary {
     let components: Vec<ComponentSummary> = assembly
         .components()
         .map(|c| ComponentSummary {
+            source_part: c.source_part,
             id: c.id.0,
             name: c.name.clone(),
             transform: matrix_to_array(c.transform),
@@ -320,11 +325,19 @@ pub struct AddComponentRequest {
     /// Optional 4×4 row-major transform. Defaults to identity.
     pub transform: Option<[[f64; 4]; 4]>,
     /// Optional primitive geometry to seed the component's BRepModel.
-    /// When omitted the component is created with an empty model
-    /// (caller is expected to bind a part later via a future
-    /// part-registry slice). The primitive is built in the
-    /// component's *local* frame; the world pose is the `transform`.
+    /// The primitive is built in the component's *local* frame; the
+    /// world pose is the `transform`. Mutually exclusive with
+    /// `part_id`.
     pub primitive: Option<ComponentPrimitive>,
+    /// Bind an EXISTING part (by its viewport/part UUID) as this
+    /// component's geometry — the "part-registry slice" that was
+    /// promised in a comment here and never written. The part's solid
+    /// is extracted from the active model into the component's own
+    /// BRepModel (a geometric copy today; shared-definition instancing
+    /// is the follow-up), and the component records `source_part` so
+    /// summaries can name which part it instantiates. Mutually
+    /// exclusive with `primitive`.
+    pub part_id: Option<Uuid>,
 }
 
 /// Primitive geometry kinds accepted by `add_component`. Externally
@@ -470,6 +483,7 @@ pub async fn delete_assembly(
 
 pub async fn add_component(
     State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
     Path(id): Path<Uuid>,
     Json(req): Json<AddComponentRequest>,
 ) -> Result<Json<AddComponentResponse>, ApiError> {
@@ -477,6 +491,12 @@ pub async fn add_component(
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
             "component name must not be empty",
+        ));
+    }
+    if req.primitive.is_some() && req.part_id.is_some() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "primitive and part_id are mutually exclusive — a component is              seeded with fresh primitive geometry OR bound to an existing part",
         ));
     }
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
@@ -493,7 +513,48 @@ pub async fn add_component(
     // later). The primitive is built in the component's local frame
     // at the origin; the world pose lives in `transform`.
     let mut model = BRepModel::new();
-    if let Some(primitive) = req.primitive.clone() {
+    if let Some(part_uuid) = req.part_id {
+        // Bind an existing part: extract its solid from the ACTIVE
+        // part model into this component's own BRepModel. v1 strategy
+        // deliberately composes two battle-tested pieces instead of a
+        // new subgraph walker: snapshot-copy the whole model, then
+        // lifecycle-delete every solid that is not the bound one
+        // (delete_solid cascades the orphaned topology). A shared-
+        // definition instance store (no geometric copy) is the
+        // follow-up once the document model lands.
+        let solid_id = state.get_local_id(&part_uuid).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("part {part_uuid} not found in the active model"),
+            )
+        })?;
+        {
+            let src = model_handle.read().await;
+            if src.solids.get(solid_id).is_none() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("part {part_uuid} maps to solid {solid_id}, which no longer exists"),
+                ));
+            }
+            geometry_engine::primitives::snapshot::ModelSnapshot::take(&src).restore(&mut model);
+        }
+        let others: Vec<u32> = model
+            .solids
+            .iter()
+            .map(|(sid, _)| sid)
+            .filter(|sid| *sid != solid_id)
+            .collect();
+        for sid in others {
+            geometry_engine::operations::delete::delete_solid(&mut model, sid, true).map_err(
+                |e| {
+                    ApiError::new(
+                        ErrorCode::KernelError,
+                        format!("failed to isolate part solid {solid_id}: {e}"),
+                    )
+                },
+            )?;
+        }
+    } else if let Some(primitive) = req.primitive.clone() {
         let mut builder = TopologyBuilder::new(&mut model);
         match primitive {
             ComponentPrimitive::Box { dx, dy, dz } => {
@@ -515,7 +576,7 @@ pub async fn add_component(
     }
     let part = Arc::new(model);
     let name = req.name.clone();
-    let cid = guard.add_part(part, req.name);
+    let cid = guard.add_part_from_source(part, req.name, req.part_id);
     // Caller-supplied transform wins. Otherwise, if this assembly
     // already had components, lay the new one down at +X = N * 30mm
     // so its geometry doesn't fully overlap an existing component.

@@ -117,6 +117,14 @@ pub struct Component {
     pub mate_references: HashMap<String, MateReference>,
     /// Degrees of freedom (0-6)
     pub degrees_of_freedom: u8,
+    /// The part document this component is an INSTANCE of (the
+    /// api-server's part UUID), when the component was bound from an
+    /// existing part rather than seeded with a primitive. `None` for
+    /// primitive-seeded and legacy components. This is the assembly →
+    /// part reference that makes "build parts, then assemble
+    /// instances of them" possible (SKETCH-DCM era audit: components
+    /// previously had no way to name their source part at all).
+    pub source_part: Option<uuid::Uuid>,
 }
 
 /// Component properties
@@ -275,11 +283,25 @@ impl Assembly {
 
     /// Add a part to the assembly
     pub fn add_part(&mut self, part: Arc<BRepModel>, name: impl Into<String>) -> ComponentId {
+        self.add_part_from_source(part, name, None)
+    }
+
+    /// Add a component that is an instance of a known part document.
+    /// `source_part` is the api-server part UUID this component's
+    /// geometry was bound from; it travels on the component so wire
+    /// summaries (and eventually BOMs) can say "3 instances of Part X".
+    pub fn add_part_from_source(
+        &mut self,
+        part: Arc<BRepModel>,
+        name: impl Into<String>,
+        source_part: Option<uuid::Uuid>,
+    ) -> ComponentId {
         let id = ComponentId::new();
         let component = Component {
             id,
             name: name.into(),
             part,
+            source_part,
             transform: Matrix4::IDENTITY,
             is_fixed: self.root_component.is_none(), // First part is fixed by default
             parent: None,
@@ -308,6 +330,7 @@ impl Assembly {
         // Create a parent component for the sub-assembly
         let parent_id = ComponentId::new();
         let parent_component = Component {
+            source_part: None,
             id: parent_id,
             name: name.into(),
             part: Arc::new(BRepModel::new()), // Empty container for sub-assembly
