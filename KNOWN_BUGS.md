@@ -376,7 +376,13 @@ faceted; round features should use the cylinder primitive. A circle-edge
 profile path through `extrude_profile` (which already emits a Cylinder from
 a Circle edge) is a possible future convenience but not required.
 
-### #28 🔴 Full 2π revolve of an offset rectangle → tessellation_empty
+### #28 🟢 FIXED — full 2π revolve of an offset rectangle (was tessellation_empty)
+Resolved by REVOLVE-ROBUSTNESS #47 (per-segment wall wedges tessellated as
+structured grids) + the tessellation fixes; verified by re-audit 2026-06-14.
+`revolve_volume_invariants` (14 cases, partial + full 2π) all tessellate
+non-empty with correct Pappus volume, and the harness now also asserts every
+revolve is a valid B-Rep (`validate_solid_scoped`) + watertight
+(`manifold_report`). Commit f3d0006.
 
 ---
 
