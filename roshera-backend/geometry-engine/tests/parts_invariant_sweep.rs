@@ -1105,15 +1105,14 @@ fn flanged_body_verify_dimension() {
     assert!((f.dims.2 - 65.0).abs() < 0.6, "H={} expected 65", f.dims.2);
 }
 
-/// PIN (new this fire): sectioning the now-valid 4-bolt-hole flange cap through
-/// mid-flange yields the wrong area — the `cdt` crate panics (caught → empty
-/// faces) triangulating the many-contour section profile (annulus + 4 holes).
-/// The SOLID is sound (flanged_body_verify_dimension passes); this is a
-/// section/triangulation-robustness issue on a multi-hole planar profile, NOT a
-/// boolean defect. #[ignore] until the section CDT handles many contours.
+/// #85b FIXED: sectioning the 4-bolt-hole flange cap mid-flange returns the
+/// correct cross-section area. The bug was NOT cdt — it was `point_in_polygon`
+/// (section loop-nesting) missing an `.abs()` on the edge dy, which broke
+/// containment for any polygon with downward edges (every circle), so the cap's
+/// bolt/centre holes were mis-classified as separate solid discs (+20% area).
+/// Now the r40 outer correctly owns all 5 inner circles as holes.
 #[test]
-#[ignore = "section CDT panics on the 4-hole flange profile (solid is valid)"]
-fn flanged_body_section_multihole_cdt_85b() {
+fn flanged_body_section_multihole_85b() {
     use geometry_engine::render::dimensioned::render_section;
 
     let mut model = BRepModel::new();

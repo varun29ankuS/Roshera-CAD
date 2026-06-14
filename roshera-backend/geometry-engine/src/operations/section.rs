@@ -1142,8 +1142,15 @@ fn point_in_polygon(p: (f64, f64), poly: &[(f64, f64)]) -> bool {
     for i in 0..n {
         let (xi, yi) = poly[i];
         let (xj, yj) = poly[j];
-        let intersects = ((yi > y) != (yj > y))
-            && (x < (xj - xi) * (y - yi) / (yj - yi).max(1e-18).copysign(yj - yi) + xi);
+        // Denominator must be `yj - yi` guarded against zero — keep its MAGNITUDE
+        // (floored at 1e-18) AND its sign. The earlier `(yj-yi).max(1e-18)` (no
+        // `.abs()`) clobbered any NEGATIVE dy to 1e-18, so every downward edge got
+        // a ±1e-18 denominator → the x-intersection blew up to ±huge → spurious /
+        // missed crossings. PIP was thus wrong for any polygon with downward edges
+        // (every circle), which mis-classified section loop nesting (#85b: a flange
+        // cap's bolt/centre holes were read as separate solid discs → 20% over-area).
+        let dy = (yj - yi).abs().max(1e-18).copysign(yj - yi);
+        let intersects = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / dy + xi);
         if intersects {
             inside = !inside;
         }
