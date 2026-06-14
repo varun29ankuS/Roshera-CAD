@@ -23,6 +23,7 @@ use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::{tessellate_solid, TessellationParams};
+use serde::Serialize;
 
 const BG: [u8; 3] = [250, 250, 250];
 const CELL: usize = 512;
@@ -207,6 +208,136 @@ pub fn render_dimensioned_multiview(
         volume,
         surface_area,
         centroid,
+    })
+}
+
+// ── EYE-5: ambiguity / coverage protocol ────────────────────────────────────
+
+/// What the 4 standard EYE-1 views actually let an agent SEE — so it never
+/// silently assumes it saw the whole part. `unseen_faces` are faces with zero
+/// visible pixels in iso/front/top/right (back faces, deep pockets, internal
+/// voids); their existence is the signal to request another angle rather than
+/// reason about geometry that was never shown.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoverageReport {
+    pub total_faces: usize,
+    /// Face ids visible in ≥1 of the 4 standard views.
+    pub seen_faces: Vec<u32>,
+    /// Face ids visible in NONE of the 4 standard views.
+    pub unseen_faces: Vec<u32>,
+    /// Faces seen in exactly one view — low-confidence (a single grazing angle).
+    pub single_view_faces: Vec<u32>,
+    /// seen / total.
+    pub coverage_fraction: f64,
+    /// Human-facing ambiguity flags ("N faces unseen — request another angle").
+    pub notes: Vec<String>,
+}
+
+/// Build the coverage report by rendering FaceIds across the 4 standard views
+/// and recording which face colors actually reach the framebuffer. Honest: a
+/// face counts as "seen" only if it painted ≥1 pixel from some standard view.
+pub fn coverage_report(
+    model: &BRepModel,
+    solid_id: SolidId,
+    tessellation: &TessellationParams,
+) -> Option<CoverageReport> {
+    use super::{render_solid, RenderMode, RenderOptions};
+    use std::collections::{BTreeSet, HashMap};
+
+    let views = [
+        CanonicalView::Isometric,
+        CanonicalView::Front,
+        CanonicalView::Top,
+        CanonicalView::Right,
+    ];
+
+    let mut all_faces: BTreeSet<u32> = BTreeSet::new();
+    let mut view_count: HashMap<u32, usize> = HashMap::new();
+
+    for view in views {
+        let frame = render_solid(
+            model,
+            solid_id,
+            &RenderOptions {
+                width: 512,
+                height: 512,
+                view,
+                mode: RenderMode::FaceIds,
+                tessellation: tessellation.clone(),
+            },
+        )?;
+        // The legend covers EVERY face (visible or not) → the full face set.
+        let by_color: HashMap<[u8; 3], u32> =
+            frame.face_legend.iter().map(|&(f, c)| (c, f)).collect();
+        for &(fid, _) in &frame.face_legend {
+            all_faces.insert(fid);
+        }
+        // Faces that actually painted a pixel this view (flat colors, no AA →
+        // exact color↔face mapping).
+        let mut seen_here: BTreeSet<u32> = BTreeSet::new();
+        for px in frame.pixels.chunks_exact(3) {
+            if px == [255, 255, 255] {
+                continue; // background
+            }
+            if let Some(&fid) = by_color.get(&[px[0], px[1], px[2]]) {
+                seen_here.insert(fid);
+            }
+        }
+        for fid in seen_here {
+            *view_count.entry(fid).or_insert(0) += 1;
+        }
+    }
+
+    let total = all_faces.len();
+    if total == 0 {
+        return None;
+    }
+    let seen_faces: Vec<u32> = view_count.keys().copied().collect();
+    let mut seen_sorted = seen_faces.clone();
+    seen_sorted.sort_unstable();
+    let unseen_faces: Vec<u32> = all_faces
+        .iter()
+        .copied()
+        .filter(|f| !view_count.contains_key(f))
+        .collect();
+    let single_view_faces: Vec<u32> = {
+        let mut v: Vec<u32> = view_count
+            .iter()
+            .filter(|(_, &c)| c == 1)
+            .map(|(&f, _)| f)
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let coverage_fraction = seen_sorted.len() as f64 / total as f64;
+
+    let mut notes = Vec::new();
+    if !unseen_faces.is_empty() {
+        notes.push(format!(
+            "{} of {} faces are not visible in any of the 4 standard views \
+             (iso/front/top/right) — request another camera angle before \
+             reasoning about them",
+            unseen_faces.len(),
+            total
+        ));
+    }
+    if !single_view_faces.is_empty() {
+        notes.push(format!(
+            "{} face(s) seen from only one view (low confidence)",
+            single_view_faces.len()
+        ));
+    }
+    if unseen_faces.is_empty() {
+        notes.push("all faces visible across the 4 standard views".to_string());
+    }
+
+    Some(CoverageReport {
+        total_faces: total,
+        seen_faces: seen_sorted,
+        unseen_faces,
+        single_view_faces,
+        coverage_fraction,
+        notes,
     })
 }
 
@@ -1187,6 +1318,42 @@ mod tests {
             "overlay centroid {:?} vs kernel {:?} (dist {dc})",
             frame.centroid,
             com
+        );
+    }
+
+    /// EYE-5: the coverage report must HONESTLY partition faces into seen /
+    /// unseen across the 4 standard views. A box has 6 faces; iso/front/top/
+    /// right only cover one hemisphere, so the 3 back faces (−X/−Y/−Z) must be
+    /// reported unseen — the agent must learn it has NOT seen them, not assume
+    /// full coverage.
+    #[test]
+    fn coverage_report_flags_unseen_back_faces() {
+        let mut model = BRepModel::new();
+        let bx = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(40.0, 40.0, 40.0)
+            .expect("box"));
+        let r = coverage_report(&model, bx, &TessellationParams::default()).expect("coverage");
+
+        assert_eq!(r.total_faces, 6, "a box has 6 faces");
+        // Partition is exact and disjoint.
+        assert_eq!(
+            r.seen_faces.len() + r.unseen_faces.len(),
+            r.total_faces,
+            "seen+unseen must equal total"
+        );
+        for f in &r.seen_faces {
+            assert!(!r.unseen_faces.contains(f), "face {f} both seen and unseen");
+        }
+        // The 4 standard views cover one hemisphere → some faces seen, some not.
+        assert!(r.seen_faces.len() >= 3, "should see ≥3 front faces");
+        assert!(
+            !r.unseen_faces.is_empty(),
+            "the box's back faces must be flagged unseen (not silently assumed)"
+        );
+        assert!(r.coverage_fraction < 1.0, "coverage must not claim 100%");
+        assert!(
+            r.notes.iter().any(|n| n.contains("request another")),
+            "an unseen-faces note must tell the agent to request another angle"
         );
     }
 
