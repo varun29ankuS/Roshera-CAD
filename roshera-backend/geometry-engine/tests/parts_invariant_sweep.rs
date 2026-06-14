@@ -1539,3 +1539,83 @@ fn emit_l_bracket_png() {
         f.dims.0, f.dims.1, f.dims.2, sec.section_area
     );
 }
+
+// ── BOOL #86 hang isolation (bounded — never hangs the runner) ────────────────
+
+/// BOOL #86: the 6-boss mounting-plate sequence wedged the kernel live. Isolate
+/// WHICH op hangs without hanging the test runner: run the build on a worker
+/// thread that bumps a shared stage counter after each op; the main thread waits
+/// with a timeout and, on timeout, reports the last completed stage so the
+/// hanging op is `stage+1`. (Subprocess-isolation philosophy, thread+atomic+
+/// timeout variant; the leaked worker dies at process exit.) #[ignore]: may run
+/// the full timeout and spin a core meanwhile.
+#[test]
+#[ignore = "BOOL #86 hang isolation — bounded ~120s, leaks the worker on a true hang"]
+fn bool86_hang_isolation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let stage = Arc::new(AtomicUsize::new(0));
+    let stage_t = stage.clone();
+    let (tx, rx) = mpsc::channel::<u32>();
+
+    std::thread::spawn(move || {
+        let mut m = BRepModel::new();
+        let cyl = |m: &mut BRepModel, x: f64, y: f64, z: f64, r: f64, h: f64| -> SolidId {
+            sid_of(
+                TopologyBuilder::new(m)
+                    .create_cylinder_3d(Point3::new(x, y, z), Vector3::new(0.0, 0.0, 1.0), r, h)
+                    .expect("cyl"),
+            )
+        };
+        // Stage 1: plate (matches the live mount-plate that hung).
+        let mut acc = make_box(&mut m, 140.0, 100.0, 16.0);
+        stage_t.store(1, Ordering::SeqCst);
+        let grid = [
+            (-40.0, -25.0),
+            (0.0, -25.0),
+            (40.0, -25.0),
+            (-40.0, 25.0),
+            (0.0, 25.0),
+            (40.0, 25.0),
+        ];
+        // Stages 2-7: boss unions (r9, base z5, h20).
+        for (i, (bx, by)) in grid.iter().enumerate() {
+            let b = cyl(&mut m, *bx, *by, 5.0, 9.0, 20.0);
+            acc = boolean_operation(&mut m, acc, b, BooleanOp::Union, BooleanOptions::default())
+                .expect("boss union");
+            stage_t.store(2 + i, Ordering::SeqCst);
+        }
+        // Stages 8-13: boss bores (r4 through).
+        for (i, (bx, by)) in grid.iter().enumerate() {
+            let b = cyl(&mut m, *bx, *by, -20.0, 4.0, 60.0);
+            acc = boolean_operation(
+                &mut m,
+                acc,
+                b,
+                BooleanOp::Difference,
+                BooleanOptions::default(),
+            )
+            .expect("boss bore");
+            stage_t.store(8 + i, Ordering::SeqCst);
+        }
+        let _ = tx.send(acc);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(_) => {
+            // Completed within budget — the hang did not reproduce here (config-
+            // specific, or already addressed). Record that explicitly.
+            eprintln!("BOOL #86: 6-boss mount-plate completed all 13 stages in <120s — no hang reproduced in-kernel");
+        }
+        Err(_) => {
+            let reached = stage.load(Ordering::SeqCst);
+            let map = "stages: 1=plate, 2-7=boss unions, 8-13=boss bores";
+            panic!(
+                "BOOL #86 HANG ISOLATED: completed {reached} stages, then hung on stage {} ({map})",
+                reached + 1
+            );
+        }
+    }
+}

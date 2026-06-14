@@ -109,9 +109,12 @@ the kernel into a RUNAWAY LOOP: ~1971 CPU-seconds on one core, then wedged
 documented "f64::MAX → i32 grid saturation" hang (bounded RAM, ~10¹⁹ iterations).
 The 4-boss bolt-circle manifold (r5 bores / r10 bosses / 100×100) built CLEAN
 moments before, so the trigger is the specific 6-boss/r9/r4/140×100 cell, not the
-pattern. BOOL-91 HANG class. FIX: reproduce OFFLINE subprocess-isolated / per-op
-wall-clock timeout (so the test runner can't hang), bisect to the exact op
-(suspect: a boss-bore difference on the 6-boss union), then bound the
+pattern. **ISOLATED (bool86_hang_isolation, #[ignore], thread+atomic+timeout):**
+completes 8 stages — plate + 6 boss unions + the FIRST boss-bore — then HANGS on
+stage 9, the SECOND chained boss-bore difference (a difference into an already-
+bored 6-boss solid). So the union is fine; the runaway is a chained DIFFERENCE on
+the many-faced result (a classification/marching loop that never terminates).
+BOOL-91 HANG class. FIX: bisect within the stage-9 difference pipeline, then bound the
 non-terminating loop in the boolean core (DEEP, fresh-context). Live impact:
 wedged the demo server; required kill+restart. Recipe: PowerShell build
 `borin107a` in this session.
