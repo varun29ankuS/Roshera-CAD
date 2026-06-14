@@ -6342,10 +6342,42 @@ fn partition_outer_and_pre_existing_hole_cycles(
         (d.dot(&e1), d.dot(&e2))
     };
 
-    let cycle_polys_2d: Vec<Vec<(f64, f64)>> = cycle_verts_3d
-        .iter()
-        .map(|verts| verts.iter().map(project).collect())
-        .collect();
+    // Densified (arc-following) 2D polygons. CRITICAL for #35: the
+    // hole-to-outer ATTACHMENT below tests each hole's centroid against the
+    // outer polygon. Built from cycle ENDPOINTS only, a curved outer rim (an
+    // r40 cap split into ~3 arcs) becomes an inscribed chord triangle whose
+    // incircle is ~r/2, so a pre-existing hole near the rim (a bolt hole at
+    // radius 30) tests OUTSIDE the outer and is NOT attached — the hole is
+    // dropped and its wall strands as its own shell (#35 chained-difference
+    // residual: 3rd+ hole into a multi-hole cap). Sample each boundary edge's
+    // curve so the polygon follows the arc (mirrors the merge-stage fix and
+    // `is_point_in_face`).
+    let densify_2d = |cycle: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
+        const SAMPLES: usize = 8;
+        let mut poly: Vec<(f64, f64)> = Vec::with_capacity(cycle.len() * SAMPLES);
+        for &(eid, fwd) in cycle {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                if let Ok(p) = curve.point_at(t) {
+                    poly.push(project(&p));
+                }
+            }
+        }
+        poly
+    };
+    let cycle_polys_2d: Vec<Vec<(f64, f64)>> = loops.iter().map(|c| densify_2d(c)).collect();
 
     let centroid_2d = |poly: &[(f64, f64)]| -> Option<(f64, f64)> {
         if poly.len() < 3 {
