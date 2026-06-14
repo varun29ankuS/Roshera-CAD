@@ -152,13 +152,17 @@ HARNESS-1000). NOT a vertex-tolerance issue (near-miss probe: zero pairs in
 1e-6..0.5). Pinned tests now PASS; `diag_flanged_stages` (#[ignore], slow) keeps
 the per-stage characterization.
 
-### #85b 🟡 Section of a multi-hole planar profile → cdt panic (wrong area)
-Surfaced when #35 made the 4-bolt flange valid: `render_section` mid-flange
-yields the wrong cross-section area because the `cdt` crate panics (caught →
-empty faces) triangulating the many-contour section profile (annulus + 4 holes).
-The SOLID is sound (`flanged_body_verify_dimension` passes). Section/triangulation
-robustness on a multi-hole planar profile, NOT a boolean defect. Pinned
-`flanged_body_section_multihole_cdt_85b` (#[ignore]).
+### #85b 🟢 FIXED — section of a multi-hole planar profile gave wrong area
+Surfaced when #35 made the 4-bolt flange valid. Root cause was NOT cdt (red
+herring): `section::point_in_polygon` mis-classified loop nesting. Its even-odd
+ray-cast denominator `(yj-yi).max(1e-18).copysign(yj-yi)` clobbered any NEGATIVE
+dy to ±1e-18 (missing `.abs()`), so the x-intersection blew up on every DOWNWARD
+edge → PIP wrong for any polygon with downward edges (every circle) →
+classify_loop_nesting read the cap's 4 bolt holes + centre bore as separate solid
+discs (area 5441 vs analytic 4511, +20%). FIX (bfbdf4d): keep magnitude AND sign,
+`(yj-yi).abs().max(1e-18).copysign(yj-yi)`. Now the r40 outer owns all 5 inner
+circles as holes. `flanged_body_section_multihole_85b` un-#[ignore]'d (running
+guard); section_area_sweep + 82 section lib tests green.
 
 ### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall
 Found live (ladder step 6, bearing housing). `plate ∪ analytic-cylinder boss`
