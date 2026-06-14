@@ -1158,10 +1158,25 @@ fn diag_flanged_stages() {
     };
     let report = |m: &BRepModel, s: SolidId, label: &str| {
         let r = manifold_report(m, s, CHORD, WELD);
+        let v = validate_solid_scoped(m, s, Tolerance::default(), ValidationLevel::Standard);
+        let nf = m
+            .solids
+            .get(s)
+            .and_then(|sol| m.shells.get(sol.outer_shell))
+            .map(|sh| sh.faces.len())
+            .unwrap_or(0);
         match r {
             Some(r) => eprintln!(
-                "  {label}: open={} nm={}",
-                r.boundary_edges, r.nonmanifold_edges
+                "  {label}: open={} nm={} | brep_valid={} faces={} ({})",
+                r.boundary_edges,
+                r.nonmanifold_edges,
+                v.is_valid,
+                nf,
+                if v.errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("{:?}", v.errors)
+                }
             ),
             None => eprintln!("  {label}: no mesh"),
         }
