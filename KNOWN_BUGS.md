@@ -127,18 +127,28 @@ collapse + skinny-refinement gated on geometric fidelity. Boss cylinder
 20202 tris/4.5s → 2872/58ms; HARNESS-1000 ~975s → 56s; all tessellation +
 boolean suites green. See memory `bool86-gwn-tessellation-hang.md`.
 
-### #84 🟡 Coaxial through-pierce union (shaft through disc) → non-manifold
-Found by the S3 flanged-body build. Union of two COAXIAL cylinders of different
-radii where the slim body (r20) passes fully THROUGH a wider flange disc (r40),
-interpenetrating (NOT coincident → not #32), is watertight but NON-MANIFOLD:
-`diag_flanged_stages` shows the bare body+flange union at `open=0 nm=72`. The
-body pierces BOTH planar flange faces (top + bottom annuli) while coaxial; nm
-edges appear at the pierce rims. (Distinct from the housing/box-boss case where
-a cylinder pierces ONE planar face — that's clean.) Downstream: chained
-bolt-circle differences on the already-nm solid then add open edges (bolt1=504,
-bolt2=1008, bolt3=1512). ROOT = the coaxial through-pierce union; fix it and the
-downstream likely clears. Boolean split/merge/classify core (#32/#35/#27
-family) — DEEP, fresh-context only. Research lane: robust corefinement /
+### #84 🟢 (union) + 🟡 (residual re-pinned to #35) — coaxial through-pierce
+**The headline bug — coaxial through-pierce UNION → non-manifold — is RESOLVED**
+(2026-06-14). It was a TESSELLATION ARTIFACT, not a B-Rep defect: the old
+over-refined cylinder lateral didn't align with the flange-cap annulus sampling,
+so the *mesh* had T-junctions (nm=72) at the pierce rim. The TESS-PERF #58 fix
+(developable Steiner collapse + fidelity-gated skinny refinement) made the seams
+align. `diag_flanged_stages` now shows `A:body+flange union: open=0 nm=0
+brep_valid=true faces=7`, central bore and 1st bolt likewise clean — verified at
+the B-Rep level (`validate_solid_scoped`, mesh-independent), not just the mesh.
+
+**Residual (separate bug, re-pinned to #35):** the 2nd-and-later bolt-hole
+DIFFERENCE into a flange cap that ALREADY has holes leaves the new hole's rim
+dangling. `diag_flanged_stages`: bolt0 clean (`brep_valid=true`), bolt1/2/3
+`brep_valid=false`, each leaving exactly 6 boundary edges on ONE cap-face loop,
+and `faces` stuck at 11 (the bolt wall face is never created). Trace localises it
+precisely: bolt0 `canonicalise_face_edges_by_position edge_remaps=6/86 →
+build_shells components=1`; bolt1 `edge_remaps=0/94 → components=2`. The cutter
+wall rim and the cap hole rim are split at NON-coincident vertices on a multi-
+hole cap, so canonicalise merges nothing, the wall becomes its own shell
+component, and reconstruct orphans it → dangling cap loop. ROOT = corefinement
+shared-vertex imprinting on a multi-inner-loop face (#35/#32/#27 family) — DEEP,
+fresh-context only. Research lane: robust corefinement /
 shared-edge imprint at the pierce rim (Cherchi–Attene; CGAL corefinement).
 Pinned: `parts_invariant_sweep.rs::flanged_body_verify_dimension_section` +
 `diag_flanged_stages` (#[ignore]).
