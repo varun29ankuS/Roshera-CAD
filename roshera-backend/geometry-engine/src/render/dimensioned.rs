@@ -1490,14 +1490,12 @@ mod tests {
         assert!(px >= 0.0 && px < f.width as f64 && py >= 0.0 && py < f.height as f64);
     }
 
-    /// PIN #83: sectioning a solid with PLANAR faces misses them — a plain
-    /// 60×60×20 box at z=0 should yield a 3600 mm² square section, but the
-    /// kernel returns no caps (render_section → None). The bored plate likewise
-    /// returns only the bore disk. Flip on when #83 (Plane-face SSI / UV-bounds)
-    /// lands.
+    /// #83 GUARD (fixed): sectioning a solid with PLANAR faces must capture
+    /// them. Mid-plane section of the bored plate is the 60×60 square MINUS the
+    /// Ø20 bore disk = 3600 − 100π ≈ 3285.8 mm² (planar sides via the exact
+    /// Plane×Plane clip + the bore circle via the curved-face marching path).
     #[test]
-    #[ignore = "#83: section_solid_by_plane ignores planar faces"]
-    fn section_planar_faces_missing_83() {
+    fn section_planar_faces_covered_83() {
         let mut model = BRepModel::new();
         let s = bored_plate(&mut model);
         let f = render_section(
@@ -1507,7 +1505,7 @@ mod tests {
             Vector3::new(0.0, 0.0, 1.0),
             Tolerance::default(),
         )
-        .expect("section should produce caps once #83 lands");
+        .expect("planar section must produce caps");
         let expected = 60.0 * 60.0 - std::f64::consts::PI * 100.0;
         let rel = (f.section_area - expected).abs() / expected;
         assert!(

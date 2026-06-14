@@ -34,7 +34,18 @@ tessellates_nonmanifold_51` (#[ignore]). When fixed, flip it on and restore
 
 ## Section / clip
 
-### #83 🟡 `section_solid_by_plane` ignores PLANAR faces (plain box → 0 caps)
+### #83 🟢 `section_solid_by_plane` ignores PLANAR faces (plain box → 0 caps)
+**FIXED** (research-grade, EYE-2 lane): the marching-square SSI fragmented a
+single straight cut line into 2 disjoint pieces on WIDE/SHORT planar faces (box
+sides where the in-plane span ≫ the cut-direction span), so the 8 pieces never
+chained into a cap — cubes (equal extents → 1 clean piece/face) accidentally
+worked, masking it. Fix: in `collect_face_fragments`, branch `Plane` faces to an
+EXACT Plane×Plane clip — the two planes meet in a line `p₀ + t·(n_cut×n_face)`
+(closed-form `p₀`), clipped to the face by even-odd crossings against every loop
+edge (outer + holes); curved faces keep marching. Guards: `section_planar_box_dims_match_analytic`
+(every aspect ratio → area=w·h), `render::dimensioned::section_planar_faces_covered_83`
+(bored plate → 3600−100π), existing cube/oblique/cylinder tests still green.
+Original report:
 Found by EYE-2 (the section render, dogfooding `render_section`). Sectioning a
 plain box returns ZERO caps; a bored plate returns only the bore disk
 (area 314.15 = πr², missing the 60×60 outer square). Diagnosis
