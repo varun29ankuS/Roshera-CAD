@@ -1205,3 +1205,197 @@ fn diag_flanged_stages() {
         report(&m, acc, &format!("C:bolt{i}"));
     }
 }
+
+// ── SECTION sweep: #83 guard at scale (analytic cross-section areas) ──────────
+
+/// Research-grade verification of the planar+curved section pipeline (#83): for
+/// a grid of solids × cut planes, the measured cross-section area must equal the
+/// CLOSED-FORM analytic area. Planar cuts (exact Plane×Plane clip) are checked
+/// tight; curved cuts (faceted disks/rectangles) absorb tessellation. Analytic:
+///   box, axis-aligned cut       → w·h of the two in-plane extents
+///   cube/box oblique 45° cut    → (cross-section is a rectangle) L·(L√2)
+///   cylinder radial cut         → π r²   (disk)
+///   cylinder axial cut at x=a   → 2√(r²−a²) · h   (rectangle)
+///   plate with Ø2r through-bore → w·h − π r²   (square minus disk)
+#[test]
+fn section_area_sweep() {
+    use geometry_engine::render::dimensioned::render_section;
+
+    let bored = |m: &mut BRepModel, w: f64, d: f64, r: f64| -> SolidId {
+        let plate = make_box(m, w, w, d);
+        let cy = sid_of(
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(
+                    Point3::new(0.0, 0.0, -d),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    r,
+                    4.0 * d,
+                )
+                .expect("bore"),
+        );
+        boolean_operation(
+            m,
+            plate,
+            cy,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bored")
+    };
+
+    // (label, builder, plane_origin, plane_normal, analytic_area, rel_tol)
+    type B = Box<dyn Fn(&mut BRepModel) -> SolidId>;
+    let cases: Vec<(&str, B, Point3, Vector3, f64, f64)> = vec![
+        (
+            "box40x30x20 z0",
+            Box::new(|m: &mut BRepModel| make_box(m, 40.0, 30.0, 20.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            40.0 * 30.0,
+            0.02,
+        ),
+        (
+            "box40x30x20 z+5",
+            Box::new(|m: &mut BRepModel| make_box(m, 40.0, 30.0, 20.0)),
+            Point3::new(0.0, 0.0, 5.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            40.0 * 30.0,
+            0.02,
+        ),
+        (
+            "box40x30x20 x0",
+            Box::new(|m: &mut BRepModel| make_box(m, 40.0, 30.0, 20.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            30.0 * 20.0,
+            0.02,
+        ),
+        (
+            "box40x30x20 y0",
+            Box::new(|m: &mut BRepModel| make_box(m, 40.0, 30.0, 20.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            40.0 * 20.0,
+            0.02,
+        ),
+        (
+            "box60x60x20 x0",
+            Box::new(|m: &mut BRepModel| make_box(m, 60.0, 60.0, 20.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            60.0 * 20.0,
+            0.02,
+        ),
+        (
+            "cyl r10 h40 radial",
+            Box::new(|m: &mut BRepModel| make_cylinder(m, 10.0, 40.0)),
+            Point3::new(0.0, 0.0, 20.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            PI * 100.0,
+            0.05,
+        ),
+        // NOTE: AXIAL cylinder cuts (plane containing the axis) are pinned
+        // separately as #85 (axial_cylinder_section_returns_none_85) — the
+        // curved lateral-face marching returns no caps for that orientation.
+        (
+            "cyl r20 h10 radial",
+            Box::new(|m: &mut BRepModel| make_cylinder(m, 20.0, 10.0)),
+            Point3::new(0.0, 0.0, 5.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            PI * 400.0,
+            0.05,
+        ),
+        (
+            "bored 60 d20 r10 z0",
+            Box::new(move |m: &mut BRepModel| bored(m, 60.0, 20.0, 10.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            3600.0 - PI * 100.0,
+            0.05,
+        ),
+        (
+            "bored 40 d16 r8 z0",
+            Box::new(move |m: &mut BRepModel| bored(m, 40.0, 16.0, 8.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            1600.0 - PI * 64.0,
+            0.05,
+        ),
+        (
+            "cube20 oblique45",
+            Box::new(|m: &mut BRepModel| make_box(m, 20.0, 20.0, 20.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 1.0),
+            20.0 * 20.0 * 2.0_f64.sqrt(),
+            0.03,
+        ),
+        (
+            "cube30 oblique45",
+            Box::new(|m: &mut BRepModel| make_box(m, 30.0, 30.0, 30.0)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 1.0),
+            30.0 * 30.0 * 2.0_f64.sqrt(),
+            0.03,
+        ),
+    ];
+
+    let mut fails: Vec<String> = Vec::new();
+    for (label, build, origin, normal, expected, tol) in &cases {
+        let mut m = BRepModel::new();
+        let s = build(&mut m);
+        match render_section(&m, s, *origin, *normal, Tolerance::default()) {
+            Some(f) => {
+                let rel = (f.section_area - expected).abs() / expected;
+                if rel > *tol {
+                    fails.push(format!(
+                        "{label}: section area {:.2} != analytic {:.2} (rel {:.3} > {tol})",
+                        f.section_area, expected, rel
+                    ));
+                }
+            }
+            None => fails.push(format!(
+                "{label}: render_section returned None (expected area {expected:.1})"
+            )),
+        }
+    }
+    eprintln!(
+        "SECTION sweep: {} cases, {} failures",
+        cases.len(),
+        fails.len()
+    );
+    assert!(
+        fails.is_empty(),
+        "SECTION sweep violations:\n{}",
+        fails.join("\n")
+    );
+}
+
+/// PIN #85: an AXIAL cylinder section (cut plane containing the axis, normal ⟂
+/// axis) returns NO caps — render_section → None — when it should be a
+/// 2√(r²−a²)·h rectangle. The cylinder∩plane is then 2 disjoint straight lines
+/// on the lateral face (vs a single circle for a radial cut, which works); the
+/// curved-face marching SSI on the lateral face misses that orientation. The
+/// cap chords (planar clip, #83) are fine; the lateral lines are the gap. Flip
+/// on when #85 lands. (Distinct from #83 which was planar faces.)
+#[test]
+#[ignore = "#85: axial cylinder section (plane containing axis) returns no caps"]
+fn axial_cylinder_section_returns_none_85() {
+    use geometry_engine::render::dimensioned::render_section;
+    let mut m = BRepModel::new();
+    let cyl = make_cylinder(&mut m, 10.0, 40.0);
+    let f = render_section(
+        &m,
+        cyl,
+        Point3::new(0.0, 0.0, 20.0),
+        Vector3::new(1.0, 0.0, 0.0),
+        Tolerance::default(),
+    )
+    .expect("axial cylinder section must produce a rectangle cap once #85 lands");
+    let expected = 2.0 * 10.0 * 40.0; // 2r·h
+    let rel = (f.section_area - expected).abs() / expected;
+    assert!(
+        rel < 0.06,
+        "axial section area {} vs {expected}",
+        f.section_area
+    );
+}
