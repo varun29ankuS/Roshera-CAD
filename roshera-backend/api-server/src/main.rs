@@ -858,6 +858,36 @@ fn mesh_open_nonmanifold(mesh: &geometry_engine::tessellation::TriangleMesh) -> 
     (open, nm)
 }
 
+/// FEEDBACK-AS-DEFAULT: the perception block every mutating endpoint embeds in
+/// its response so the caller learns the result's soundness from the operation
+/// itself — watertight (open/nonmanifold off the mesh in hand), valid B-Rep
+/// (`validate_solid_scoped`), and world dims (`solid_world_bbox`). No 2nd query.
+fn perception_json(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    mesh: &geometry_engine::tessellation::TriangleMesh,
+) -> serde_json::Value {
+    let (open, nm) = mesh_open_nonmanifold(mesh);
+    let valid = geometry_engine::primitives::validation::validate_solid_scoped(
+        model,
+        solid_id,
+        geometry_engine::math::Tolerance::default(),
+        geometry_engine::primitives::validation::ValidationLevel::Standard,
+    )
+    .is_valid;
+    let dims = model.solid_world_bbox(solid_id).map(|b| {
+        let s = b.size();
+        vec![s.x, s.y, s.z]
+    });
+    serde_json::json!({
+        "watertight":        open == 0 && nm == 0,
+        "open_edges":        open,
+        "nonmanifold_edges": nm,
+        "valid":             valid,
+        "dims":              dims,
+    })
+}
+
 async fn boolean_operation(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -1021,33 +1051,15 @@ async fn boolean_operation(
     // valid + dims — so a caller learns whether the result is sound from the
     // operation itself, no second query. open/nonmanifold are read off the mesh
     // we already tessellated (no extra work); valid + dims from the kernel.
-    let (open_edges, nonmanifold_edges) = mesh_open_nonmanifold(&tri_mesh);
-    let (result_valid, result_dims) = {
+    let perception = {
         let model = model_handle.read().await;
-        let valid = geometry_engine::primitives::validation::validate_solid_scoped(
-            &model,
-            result_solid_id,
-            geometry_engine::math::Tolerance::default(),
-            geometry_engine::primitives::validation::ValidationLevel::Standard,
-        )
-        .is_valid;
-        let dims = model.solid_world_bbox(result_solid_id).map(|b| {
-            let s = b.size();
-            vec![s.x, s.y, s.z]
-        });
-        (valid, dims)
+        perception_json(&model, result_solid_id, &tri_mesh)
     };
 
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
-        "perception": {
-            "watertight":        open_edges == 0 && nonmanifold_edges == 0,
-            "open_edges":        open_edges,
-            "nonmanifold_edges": nonmanifold_edges,
-            "valid":             result_valid,
-            "dims":              result_dims,
-        },
+        "perception": perception,
         "consumed": [uuid_b.to_string()],
         "object": {
             "id":         result_id_str,
@@ -1922,9 +1934,15 @@ async fn fillet_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, solid_id, &tri_mesh)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
+        "perception": perception,
         "consumed": [],
         "object": {
             "id":         result_id_str,
@@ -2138,9 +2156,15 @@ async fn chamfer_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, solid_id, &tri_mesh)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
+        "perception": perception,
         "consumed": [],
         "object": {
             "id":         result_id_str,
@@ -2860,9 +2884,15 @@ async fn create_extrude(
         [0.0, 0.0, 0.0],
     );
 
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "object": {
             "id":         result_id_str,
             "name":       name,
