@@ -32,6 +32,28 @@ tessellates_nonmanifold_51` (#[ignore]). When fixed, flip it on and restore
 
 ---
 
+## Section / clip
+
+### #83 🟡 `section_solid_by_plane` ignores PLANAR faces (plain box → 0 caps)
+Found by EYE-2 (the section render, dogfooding `render_section`). Sectioning a
+plain box returns ZERO caps; a bored plate returns only the bore disk
+(area 314.15 = πr², missing the 60×60 outer square). Diagnosis
+(`diag_section_caps`): plain-box=0, plain-cyl=1 (correct disk), bored-plate=1
+(only the cylinder loop). Root: `collect_face_fragments` →
+`intersect_surface_plane` (generic marching-square SSI) produces no zero-crossing
+fragments for **Plane** faces — likely the face UV-bounds
+(`get_face_parameter_bounds` returns the [0,1] placeholder for analytic faces)
+or the Plane parameterization leaves the signed-distance grid without a sign
+change. Curved faces (cylinder/sphere/cone) section correctly. Impact: section /
+clip is unusable on any part with planar faces (≈ all mechanical parts) — only
+curved cross-sections work. The EYE-2 RENDER layer (`render_section` +
+`SectionFrame`) is correct and ready; it lights up once this is fixed. Repro:
+`render::dimensioned::tests::section_planar_faces_missing_83` (#[ignore]). Fix is
+in the kernel SSI / Plane face-UV-bounds — fresh-context (section.rs is 1227
+LOC).
+
+---
+
 ## Blend (fillet / chamfer)
 
 ### #82 🟡 Multi-edge blend on adjacent (corner-sharing) edges not implemented
