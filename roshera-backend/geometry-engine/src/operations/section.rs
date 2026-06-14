@@ -61,10 +61,11 @@ use crate::math::surface_plane_intersection::{
 };
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::operations::{OperationError, OperationResult};
-use crate::primitives::face::FaceId;
+use crate::primitives::face::{Face, FaceId};
+use crate::primitives::r#loop::LoopId;
 use crate::primitives::shell::ShellId;
 use crate::primitives::solid::SolidId;
-use crate::primitives::surface::SurfaceType;
+use crate::primitives::surface::{Plane, SurfaceType};
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::adaptive::compute_plane_axes;
 use crate::tessellation::surface::{
@@ -231,6 +232,150 @@ struct Polyline3D {
     points: Vec<Point3>,
 }
 
+/// Ordered 3D boundary points of a loop (one vertex per directed edge).
+fn loop_points(model: &BRepModel, loop_id: LoopId) -> Vec<Point3> {
+    let mut pts = Vec::new();
+    let lp = match model.loops.get(loop_id) {
+        Some(l) => l,
+        None => return pts,
+    };
+    for (i, &eid) in lp.edges.iter().enumerate() {
+        let e = match model.edges.get(eid) {
+            Some(e) => e,
+            None => continue,
+        };
+        let fwd = lp.orientations.get(i).copied().unwrap_or(true);
+        let vid = if fwd { e.start_vertex } else { e.end_vertex };
+        if let Some(v) = model.vertices.get(vid) {
+            pts.push(Point3::new(v.position[0], v.position[1], v.position[2]));
+        }
+    }
+    pts
+}
+
+/// Intersect the infinite 2D line `o + t·d` with segment `a→b`; return the line
+/// parameter `t` at the crossing if it lies within the segment.
+fn line_seg_intersect_2d(
+    o: (f64, f64),
+    d: (f64, f64),
+    a: (f64, f64),
+    b: (f64, f64),
+) -> Option<f64> {
+    let ex = b.0 - a.0;
+    let ey = b.1 - a.1;
+    // Solve o + t·d = a + s·e for t,s.  det of [d, -e].
+    let det = ex * d.1 - ey * d.0;
+    if det.abs() < 1e-12 {
+        return None; // line ∥ edge
+    }
+    let rx = a.0 - o.0;
+    let ry = a.1 - o.1;
+    let t = (ex * ry - ey * rx) / det;
+    let s = (d.0 * ry - d.1 * rx) / det;
+    if s >= -1e-9 && s <= 1.0 + 1e-9 {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// EYE-2 / SECTION #83: EXACT planar-face cross-section. Two planes meet in a
+/// line `p₀ + t·u` with `u = n_cut × n_face` and `p₀` the closed-form solution
+/// of the two-plane system; clip that line to the face by collecting even-odd
+/// crossings against every loop edge (outer boundary + holes), then emit the
+/// inside intervals as fragments. This replaces the marching-square grid on
+/// flat faces — which fragmented a single straight cut line into disjoint
+/// pieces on wide/short faces (box sides), so the fragments never chained into
+/// a cap. Reference: Liang–Barsky / Cyrus–Beck line clipping + even-odd
+/// point-in-polygon (Foley & van Dam). Curved faces keep the marching path.
+fn plane_face_fragments(
+    model: &BRepModel,
+    face: &Face,
+    plane: &Plane,
+    cut_origin: Point3,
+    cut_normal: Vector3,
+    out: &mut Vec<Polyline3D>,
+) {
+    let n_c = cut_normal;
+    let n_f = plane.normal;
+    let u = n_c.cross(&n_f);
+    let uu = u.dot(&u);
+    if uu < 1e-18 {
+        return; // planes parallel (or coincident) → no proper section line
+    }
+    let inv_len = 1.0 / uu.sqrt();
+    let line_dir = u * inv_len;
+    // Closed-form point on both planes: p₀ = (d_c (n_f×u) + d_f (u×n_c)) / (u·u).
+    let d_c = n_c.dot(&cut_origin);
+    let d_f = n_f.dot(&plane.origin);
+    let p0v = (n_f.cross(&u) * d_c + u.cross(&n_c) * d_f) * (1.0 / uu);
+    let p0 = Point3::new(p0v.x, p0v.y, p0v.z);
+
+    // Project to the face plane's orthonormal (u_dir, v_dir) basis.
+    let to2 = |p: &Point3| -> (f64, f64) {
+        let w = Vector3::new(
+            p.x - plane.origin.x,
+            p.y - plane.origin.y,
+            p.z - plane.origin.z,
+        );
+        (w.dot(&plane.u_dir), w.dot(&plane.v_dir))
+    };
+    let o2 = to2(&p0);
+    let d2 = (line_dir.dot(&plane.u_dir), line_dir.dot(&plane.v_dir));
+
+    // Crossings of the line with every loop edge (outer + holes).
+    let mut loops = vec![face.outer_loop];
+    loops.extend_from_slice(&face.inner_loops);
+    let mut ts: Vec<f64> = Vec::new();
+    for lid in loops {
+        let pts = loop_points(model, lid);
+        let n = pts.len();
+        if n < 2 {
+            continue;
+        }
+        for i in 0..n {
+            let a = to2(&pts[i]);
+            let b = to2(&pts[(i + 1) % n]);
+            if let Some(t) = line_seg_intersect_2d(o2, d2, a, b) {
+                ts.push(t);
+            }
+        }
+    }
+    if ts.len() < 2 {
+        return;
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Dedup near-coincident crossings (a crossing through a shared vertex is
+    // reported by both incident edges).
+    let mut xs: Vec<f64> = Vec::new();
+    for t in ts {
+        if xs.last().map_or(true, |&l| (t - l).abs() > 1e-6) {
+            xs.push(t);
+        }
+    }
+    // Even-odd: material lies between crossing pairs [x0,x1], [x2,x3], …
+    let mut i = 0;
+    while i + 1 < xs.len() {
+        let (t0, t1) = (xs[i], xs[i + 1]);
+        if t1 - t0 > 1e-6 {
+            let pa = Point3::new(
+                p0.x + line_dir.x * t0,
+                p0.y + line_dir.y * t0,
+                p0.z + line_dir.z * t0,
+            );
+            let pb = Point3::new(
+                p0.x + line_dir.x * t1,
+                p0.y + line_dir.y * t1,
+                p0.z + line_dir.z * t1,
+            );
+            out.push(Polyline3D {
+                points: vec![pa, pb],
+            });
+        }
+        i += 2;
+    }
+}
+
 fn collect_face_fragments(
     model: &BRepModel,
     face_id: FaceId,
@@ -246,6 +391,14 @@ fn collect_face_fragments(
         Some(s) => s,
         None => return,
     };
+
+    // SECTION #83: planar faces use the exact Plane×Plane line-clip (robust
+    // where the marching grid fragments a straight cut line). Curved faces fall
+    // through to the marching-square path below.
+    if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
+        plane_face_fragments(model, face, plane, plane_origin, plane_normal, out);
+        return;
+    }
 
     // Real face UV extent comes from lifting the loop's 3D edges back
     // into (u, v) via `surface.closest_point`. `face.uv_bounds` is a
@@ -1116,6 +1269,100 @@ mod tests {
             other => panic!("expected Solid, got {:?}", other),
         };
         (model, solid_id)
+    }
+
+    #[test]
+    fn diag_section_box_perface() {
+        // Per-face breakdown for the failing 60×60×20 box, cut z=0 normal +Z.
+        let mut model = BRepModel::new();
+        let gid = {
+            let mut b = TopologyBuilder::new(&mut model);
+            b.create_box_3d(60.0, 60.0, 20.0).expect("box")
+        };
+        let sid = match gid {
+            GeometryId::Solid(id) => id,
+            o => panic!("{o:?}"),
+        };
+        let origin = Vector3::ZERO;
+        let normal = Vector3::new(0.0, 0.0, 1.0);
+        let solid = model.get_solid(sid).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        for &fid in &shell.faces {
+            let face = model.faces.get(fid).expect("face");
+            let surf = model.surfaces.get(face.surface_id).expect("surf");
+            let (u0, u1, v0, v1) = get_face_parameter_bounds(face, &model);
+            let cfg = SurfacePlaneIntersectionConfig {
+                param_bounds_override: Some(((u0, u1), (v0, v1))),
+                ..Default::default()
+            };
+            let curves = intersect_surface_plane(surf, origin, normal, &cfg)
+                .map(|c| c.len())
+                .unwrap_or(usize::MAX);
+            let mut frags = Vec::new();
+            collect_face_fragments(&model, fid, origin, normal, &mut frags);
+            eprintln!(
+                "face {fid} {:?} uv=[{u0:.1},{u1:.1}]x[{v0:.1},{v1:.1}] curves={curves} frags={}",
+                surf.surface_type(),
+                frags.len()
+            );
+        }
+    }
+
+    /// #83 GUARD: a z=0 section through boxes of any aspect ratio must yield
+    /// exactly one cap of area w·h. Wide/short boxes (60×60×20, 60×40×20) used
+    /// to give 0 caps because the marching SSI fragmented the straight cut line
+    /// on the side faces; the exact Plane×Plane clip fixes every aspect ratio.
+    #[test]
+    fn section_planar_box_dims_match_analytic() {
+        // Section a z=0 plane (normal +Z) through boxes of varying dims.
+        for (w, h, d) in [
+            (10.0, 10.0, 10.0),
+            (40.0, 40.0, 40.0),
+            (60.0, 60.0, 20.0),
+            (60.0, 40.0, 20.0),
+            (20.0, 20.0, 60.0),
+        ] {
+            let mut model = BRepModel::new();
+            let gid = {
+                let mut b = TopologyBuilder::new(&mut model);
+                b.create_box_3d(w, h, d).expect("box")
+            };
+            let sid = match gid {
+                GeometryId::Solid(id) => id,
+                o => panic!("{o:?}"),
+            };
+            let caps = section_solid_by_plane(
+                &model,
+                sid,
+                Vector3::ZERO,
+                Vector3::new(0.0, 0.0, 1.0),
+                Tolerance::default(),
+            )
+            .expect("section");
+            let area: f64 = caps
+                .iter()
+                .flat_map(|c| c.indices.iter().map(move |t| (c, t)))
+                .map(|(c, t)| {
+                    let a = c.vertices[t[0] as usize];
+                    let b = c.vertices[t[1] as usize];
+                    let e = c.vertices[t[2] as usize];
+                    let e1 = Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+                    let e2 = Vector3::new(e.x - a.x, e.y - a.y, e.z - a.z);
+                    e1.cross(&e2).magnitude() * 0.5
+                })
+                .sum();
+            assert_eq!(
+                caps.len(),
+                1,
+                "box {w}x{h}x{d}: expected 1 cap, got {}",
+                caps.len()
+            );
+            assert!(
+                (area - w * h).abs() < 0.5,
+                "box {w}x{h}x{d}: section area {area:.2} != {:.2}",
+                w * h
+            );
+        }
     }
 
     #[test]
