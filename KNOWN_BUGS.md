@@ -134,18 +134,23 @@ align. `diag_flanged_stages` now shows `A:body+flange union: open=0 nm=0
 brep_valid=true faces=7`, central bore and 1st bolt likewise clean — verified at
 the B-Rep level (`validate_solid_scoped`, mesh-independent), not just the mesh.
 
-**Residual (separate bug, re-pinned to #35):** the 2nd-and-later bolt-hole
-DIFFERENCE into a flange cap that ALREADY has holes leaves the new hole's rim
-dangling. `diag_flanged_stages`: bolt0 clean (`brep_valid=true`), bolt1/2/3
-`brep_valid=false`, each leaving exactly 6 boundary edges on ONE cap-face loop,
-and `faces` stuck at 11 (the bolt wall face is never created). Trace localises it
-precisely: bolt0 `canonicalise_face_edges_by_position edge_remaps=6/86 →
-build_shells components=1`; bolt1 `edge_remaps=0/94 → components=2`. The cutter
-wall rim and the cap hole rim are split at NON-coincident vertices on a multi-
-hole cap, so canonicalise merges nothing, the wall becomes its own shell
-component, and reconstruct orphans it → dangling cap loop. ROOT = corefinement
-shared-vertex imprinting on a multi-inner-loop face (#35/#32/#27 family) — DEEP,
-fresh-context only. Research lane: robust corefinement /
+**Residual (separate bug, re-pinned to #35) — ROOT CAUSE CONFIRMED 2026-06-14:**
+the 2nd-and-later bolt-hole DIFFERENCE into a flange cap that ALREADY has ≥2
+holes **never imprints the new hole onto the cap face**. Face-membership dump at
+canonicalise (bolt1, 3rd Difference): the top/bottom cap faces (`from=6`) keep
+`inner_loops=2` (the pre-existing central + bolt0 holes) — the bolt1 rim is
+ABSENT from them; the bolt1 rim (canon vertices 50–55) lives ONLY on the cutter
+WALL face (`from=7`, Cylinder). So the rim edges are used by one face → boundary
+→ `build_shells components=2` → reconstruct orphans the wall → dangling cap loop
+(`brep_valid=false`, 6 edges/hole). It is NOT a vertex-tolerance issue (the #35
+near-miss probe found zero pairs in 1e-6..0.5; min nonzero gap 5.0). The earlier
+"non-coincident split vertices" guess is SUPERSEDED. Threshold is the inner-loop
+count: cap 0→1 (central) and 1→2 (bolt0) imprint fine; 2→3 (bolt1) drops the new
+hole. ROOT = `split_face_by_curves` pre-existing-hole absorption + new-hole
+emission (and/or `merge_same_origin_fragments`) fails to add the current cut's
+hole as an inner loop when the target face already carries ≥2 inner loops
+(#27/#32/#86-merge family). DEEP, fresh-context. Research lane: robust
+corefinement /
 shared-edge imprint at the pierce rim (Cherchi–Attene; CGAL corefinement).
 Pinned: `parts_invariant_sweep.rs::flanged_body_verify_dimension_section` +
 `diag_flanged_stages` (#[ignore]).
