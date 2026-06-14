@@ -658,3 +658,129 @@ fn eye1_perception_invariants() {
         }
     }
 }
+
+// ── S3: climbing-complexity parts (build → VERIFY → DIMENSION) ───────────────
+
+/// A bolt-circle multi-boss manifold — one step up from the single-boss
+/// housing. Base plate (100×100×20) + 4 interpenetrating bosses on a Ø70 bolt
+/// circle (r10, exposed wall 22mm — clear of TESS #51), each with a Ø10
+/// through-bore, plus a Ø30 central through-bore. Exercises CHAINED booleans
+/// (4 unions then 5 differences) on a single growing solid — the regime where
+/// chained-union defects (#33) historically appeared.
+fn multi_boss_manifold(model: &mut BRepModel) -> SolidId {
+    let cyl_at = |model: &mut BRepModel, cx: f64, cy: f64, cz: f64, r: f64, h: f64| -> SolidId {
+        sid_of(
+            TopologyBuilder::new(model)
+                .create_cylinder_3d(Point3::new(cx, cy, cz), Vector3::new(0.0, 0.0, 1.0), r, h)
+                .expect("cylinder"),
+        )
+    };
+
+    // Plate centred at origin: top face z = +10, bottom z = -10.
+    let mut acc = make_box(model, 100.0, 100.0, 20.0);
+
+    // 4 bosses on a Ø70 bolt circle, base sunk 3mm below the top face.
+    let bolt_r = 35.0;
+    let bosses = [(bolt_r, 0.0), (0.0, bolt_r), (-bolt_r, 0.0), (0.0, -bolt_r)];
+    for (bx, by) in bosses {
+        let boss = cyl_at(model, bx, by, 7.0, 10.0, 25.0); // top z=32, exposed 22mm
+        acc = boolean_operation(
+            model,
+            acc,
+            boss,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("boss union");
+    }
+    // Through-bore in each boss (Ø10), spanning the whole stack.
+    for (bx, by) in bosses {
+        let bore = cyl_at(model, bx, by, -20.0, 5.0, 80.0);
+        acc = boolean_operation(
+            model,
+            acc,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("boss bore");
+    }
+    // Central Ø30 through-bore in the plate.
+    let center_bore = cyl_at(model, 0.0, 0.0, -20.0, 15.0, 80.0);
+    boolean_operation(
+        model,
+        acc,
+        center_bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("central bore")
+}
+
+/// S3 VERIFY + DIMENSION on the multi-boss manifold: it must be watertight,
+/// valid, and the EYE-1 render must report the intended L×W×H. If chained
+/// booleans break on this part, this is where it surfaces.
+#[test]
+fn multi_boss_manifold_verify_and_dimension() {
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let mut model = BRepModel::new();
+    let s = multi_boss_manifold(&mut model);
+
+    // VERIFY: watertight + valid.
+    let r = manifold_report(&model, s, CHORD, WELD).expect("mesh");
+    assert_eq!(
+        (r.boundary_edges, r.nonmanifold_edges),
+        (0, 0),
+        "multi-boss manifold not watertight: open={} nm={}",
+        r.boundary_edges,
+        r.nonmanifold_edges
+    );
+    let v = validate_solid_scoped(&model, s, Tolerance::default(), ValidationLevel::Standard);
+    assert!(
+        v.is_valid,
+        "multi-boss manifold invalid B-Rep: {:?}",
+        v.errors
+    );
+
+    // DIMENSION: bbox L=100, W=100, H from plate bottom z=-10 to boss top z=32 = 42.
+    let f =
+        render_dimensioned_multiview(&model, s, &TessellationParams::default()).expect("render");
+    assert!(
+        (f.dims.0 - 100.0).abs() < 0.5,
+        "L={} expected 100",
+        f.dims.0
+    );
+    assert!(
+        (f.dims.1 - 100.0).abs() < 0.5,
+        "W={} expected 100",
+        f.dims.1
+    );
+    assert!((f.dims.2 - 42.0).abs() < 0.5, "H={} expected 42", f.dims.2);
+}
+
+/// Emit the multi-boss manifold render for eyeballing (verify-by-looking).
+#[test]
+#[ignore = "writes a PNG for manual inspection"]
+fn emit_multi_boss_png() {
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let mut model = BRepModel::new();
+    let s = multi_boss_manifold(&mut model);
+    let f =
+        render_dimensioned_multiview(&model, s, &TessellationParams::default()).expect("render");
+    let png = f.to_png().expect("png");
+    std::fs::write("../_multi_boss.png", &png).expect("write png");
+    let r = manifold_report(&model, s, CHORD, WELD).expect("mesh");
+    eprintln!(
+        "wrote ../_multi_boss.png ({} bytes) dims L{:.0} W{:.0} H{:.0}, open={} nm={}",
+        png.len(),
+        f.dims.0,
+        f.dims.1,
+        f.dims.2,
+        r.boundary_edges,
+        r.nonmanifold_edges
+    );
+}
