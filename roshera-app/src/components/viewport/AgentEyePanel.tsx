@@ -27,6 +27,13 @@ export function AgentEyePanel() {
   const [view, setView] = useState<ViewName>('iso')
   const [png, setPng] = useState<string | null>(null)
   const [diag, setDiag] = useState<{ open: number; nm: number } | null>(null)
+  const [perc, setPerc] = useState<{
+    watertight: boolean
+    open_edges: number
+    nonmanifold_edges: number
+    valid: boolean
+    dims: number[] | null
+  } | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const inFlight = useRef(false)
 
@@ -44,6 +51,13 @@ export function AgentEyePanel() {
         return
       }
       const id = parts.reduce((m, p) => Math.max(m, p.id), 0)
+      // Feedback-as-default: the part's soundness, always shown, every poll.
+      try {
+        const pr = await fetch(`${API_HOST}/api/agent/parts/${id}/perception`)
+        if (pr.ok) setPerc(await pr.json())
+      } catch {
+        /* perception is best-effort; never block the render */
+      }
       if (mode === 'dim') {
         // EYE-1: 2×2 dimensioned multiview (triad, scale bar, L×W×H, centroid).
         const r = await fetch(`${API_HOST}/api/agent/parts/${id}/dimensioned`)
@@ -162,6 +176,28 @@ export function AgentEyePanel() {
           </div>
         )}
       </div>
+
+      {perc && (
+        <div className="flex items-center justify-between gap-2 border-t border-border px-2 py-1 font-mono text-[10px]">
+          <span className={perc.watertight && perc.valid ? 'text-green-600' : 'text-red-500'}>
+            {perc.watertight && perc.valid ? '✓ sound' : '✗ defect'}
+          </span>
+          <span className={perc.open_edges ? 'text-red-500' : 'text-muted-foreground'}>
+            open {perc.open_edges}
+          </span>
+          <span className={perc.nonmanifold_edges ? 'text-fuchsia-500' : 'text-muted-foreground'}>
+            nm {perc.nonmanifold_edges}
+          </span>
+          <span className={perc.valid ? 'text-muted-foreground' : 'text-red-500'}>
+            {perc.valid ? 'valid' : 'invalid'}
+          </span>
+          {perc.dims && (
+            <span className="text-muted-foreground">
+              {perc.dims.map((d) => Math.round(d)).join('×')}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-1">
         <div className="flex gap-0.5">
