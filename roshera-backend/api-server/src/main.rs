@@ -812,6 +812,52 @@ async fn tx_rollback(
 ///
 /// Response on success matches `create_geometry`, plus a `consumed`
 /// list of the operand UUIDs the frontend should drop from its scene.
+/// FEEDBACK-AS-DEFAULT (memory feedback-is-default): count OPEN (boundary) and
+/// NON-MANIFOLD (3+ triangle) undirected edges directly off an already-built
+/// mesh — so a mutating endpoint can report its result's watertightness without
+/// re-tessellating or forcing the caller into a second query. Mirrors the
+/// kernel's `manifold_report` weld+edge-count, applied to the mesh in hand.
+fn mesh_open_nonmanifold(mesh: &geometry_engine::tessellation::TriangleMesh) -> (usize, usize) {
+    use std::collections::HashMap;
+    const Q: f64 = 1.0e5; // 1e-5 length weld
+    let key = |p: &geometry_engine::math::Point3| -> (i64, i64, i64) {
+        (
+            (p.x * Q).round() as i64,
+            (p.y * Q).round() as i64,
+            (p.z * Q).round() as i64,
+        )
+    };
+    let mut canon: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let vc: Vec<usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(i, v)| *canon.entry(key(&v.position)).or_insert(i))
+        .collect();
+    let mut edge_count: HashMap<(usize, usize), u32> = HashMap::new();
+    for t in &mesh.triangles {
+        let cs = [vc[t[0] as usize], vc[t[1] as usize], vc[t[2] as usize]];
+        for k in 0..3 {
+            let (a, b) = (cs[k], cs[(k + 1) % 3]);
+            if a == b {
+                continue;
+            }
+            let e = if a < b { (a, b) } else { (b, a) };
+            *edge_count.entry(e).or_insert(0) += 1;
+        }
+    }
+    let mut open = 0usize;
+    let mut nm = 0usize;
+    for &c in edge_count.values() {
+        if c == 1 {
+            open += 1;
+        } else if c >= 3 {
+            nm += 1;
+        }
+    }
+    (open, nm)
+}
+
 async fn boolean_operation(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -971,9 +1017,37 @@ async fn boolean_operation(
         [0.0, 0.0, 0.0],
     );
 
+    // Feedback-as-default: the boolean reports its OWN validity — watertight +
+    // valid + dims — so a caller learns whether the result is sound from the
+    // operation itself, no second query. open/nonmanifold are read off the mesh
+    // we already tessellated (no extra work); valid + dims from the kernel.
+    let (open_edges, nonmanifold_edges) = mesh_open_nonmanifold(&tri_mesh);
+    let (result_valid, result_dims) = {
+        let model = model_handle.read().await;
+        let valid = geometry_engine::primitives::validation::validate_solid_scoped(
+            &model,
+            result_solid_id,
+            geometry_engine::math::Tolerance::default(),
+            geometry_engine::primitives::validation::ValidationLevel::Standard,
+        )
+        .is_valid;
+        let dims = model.solid_world_bbox(result_solid_id).map(|b| {
+            let s = b.size();
+            vec![s.x, s.y, s.z]
+        });
+        (valid, dims)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": {
+            "watertight":        open_edges == 0 && nonmanifold_edges == 0,
+            "open_edges":        open_edges,
+            "nonmanifold_edges": nonmanifold_edges,
+            "valid":             result_valid,
+            "dims":              result_dims,
+        },
         "consumed": [uuid_b.to_string()],
         "object": {
             "id":         result_id_str,
@@ -5471,6 +5545,32 @@ fn calculate_confidence_from_command(command: &str) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feedback-as-default: the perception helper a mutating endpoint uses to
+    /// self-report watertightness must read a watertight box as (0 open, 0 nm).
+    #[test]
+    fn boolean_perception_reads_watertight_box() {
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+        use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+        let mut m = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut m)
+            .create_box_3d(20.0, 20.0, 20.0)
+            .expect("box");
+        let sid = match gid {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        let solid = m.solids.get(sid).expect("solid in store");
+        let mesh = tessellate_solid(solid, &m, &TessellationParams::default());
+        let (open, nm) = mesh_open_nonmanifold(&mesh);
+        assert_eq!(
+            (open, nm),
+            (0, 0),
+            "a watertight box must self-report (0 open, 0 nm); got ({open}, {nm})"
+        );
+    }
 
     #[tokio::test]
     async fn test_enhanced_server() {
