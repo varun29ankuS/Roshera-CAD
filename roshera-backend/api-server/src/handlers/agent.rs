@@ -481,6 +481,12 @@ pub struct DimensionedResponse {
     pub dims: DimsWire,
     pub scale_bar_world: f64,
     pub views: Vec<ViewProjectionWire>,
+    /// EYE-3 analytics, measured off the same mesh the views are drawn from:
+    /// volume, surface area, and the volume centroid. Match the kernel's
+    /// mass-properties query within faceting tolerance (visual⇄numeric check).
+    pub volume: f64,
+    pub surface_area: f64,
+    pub centroid: Vec3Wire,
 }
 
 /// `GET /api/agent/parts/{id}/dimensioned` — EYE-1, the measuring eye.
@@ -544,6 +550,9 @@ pub async fn render_dimensioned(
                 cell: [vp.cell.0, vp.cell.1, vp.cell.2, vp.cell.3],
             })
             .collect(),
+        volume: frame.volume,
+        surface_area: frame.surface_area,
+        centroid: frame.centroid.into(),
     }))
 }
 
