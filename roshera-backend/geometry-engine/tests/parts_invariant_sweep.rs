@@ -1258,6 +1258,7 @@ fn diag_cylinder_tess_timing() {
     for (label, params) in [
         ("default", TessellationParams::default()),
         ("coarse", TessellationParams::coarse()),
+        ("fine", TessellationParams::fine()),
     ] {
         let solid = m.solids.get(cyl).expect("solid");
         // Warm + timed (3 runs, report min to dodge first-call noise).
