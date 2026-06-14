@@ -100,6 +100,22 @@ lands.
 
 ## Boolean
 
+### #86 🔴 6-boss mount-plate chained booleans HANG the kernel (runaway loop)
+Building a 6-boss mounting plate live (box 140×100×16 + 6 bosses r9 unioned →
+OK, then boss-bore r4 differences at the 3×2 grid x{−40,0,40} y{−25,25}) sent
+the kernel into a RUNAWAY LOOP: ~1971 CPU-seconds on one core, then wedged
+(0% CPU, unresponsive, blocked on the model lock). Memory stayed LOW (84 MB WS /
+179 MB private) — so it's compute/iteration, not memory; same shape as the
+documented "f64::MAX → i32 grid saturation" hang (bounded RAM, ~10¹⁹ iterations).
+The 4-boss bolt-circle manifold (r5 bores / r10 bosses / 100×100) built CLEAN
+moments before, so the trigger is the specific 6-boss/r9/r4/140×100 cell, not the
+pattern. BOOL-91 HANG class. FIX: reproduce OFFLINE subprocess-isolated / per-op
+wall-clock timeout (so the test runner can't hang), bisect to the exact op
+(suspect: a boss-bore difference on the 6-boss union), then bound the
+non-terminating loop in the boolean core (DEEP, fresh-context). Live impact:
+wedged the demo server; required kill+restart. Recipe: PowerShell build
+`borin107a` in this session.
+
 ### #84 🟡 Coaxial through-pierce union (shaft through disc) → non-manifold
 Found by the S3 flanged-body build. Union of two COAXIAL cylinders of different
 radii where the slim body (r20) passes fully THROUGH a wider flange disc (r40),
