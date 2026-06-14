@@ -6189,18 +6189,43 @@ fn drop_nested_inner_loops(model: &BRepModel, face: &mut SplitFace) {
         return;
     };
     let origin = sp.position;
-    let polys: Vec<Vec<(f64, f64)>> = loops_3d
-        .iter()
-        .map(|verts| {
-            verts
-                .iter()
-                .map(|p| {
-                    let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
-                    (d.dot(&e1), d.dot(&e2))
-                })
-                .collect()
-        })
-        .collect();
+    let project = |p: &Point3| -> (f64, f64) {
+        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        (d.dot(&e1), d.dot(&e2))
+    };
+    // Densified (arc-following) polygons. A few-arc circular hole (the B-Rep
+    // stores bolt/bore rims as ~3 arcs) projected by its ENDPOINTS is an
+    // inscribed chord triangle whose incircle is ~r/2 — so the nesting
+    // containment below can mis-decide for CONCENTRIC curved holes (a Ø54
+    // counterbore over a Ø40 bore), wrongly keeping or dropping a loop. Sample
+    // each edge's curve so the projected polygon follows the arc (same fix as
+    // the merge/partition containment, #85b / #35 lineage).
+    let densify = |lp: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
+        const SAMPLES: usize = 8;
+        let mut poly: Vec<(f64, f64)> = Vec::with_capacity(lp.len() * SAMPLES);
+        for &(eid, fwd) in lp {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                if let Ok(p) = curve.point_at(t) {
+                    poly.push(project(&p));
+                }
+            }
+        }
+        poly
+    };
+    let polys: Vec<Vec<(f64, f64)>> = face.inner_loops.iter().map(|lp| densify(lp)).collect();
     let n = polys.len();
     let mut drop = vec![false; n];
     for i in 0..n {
