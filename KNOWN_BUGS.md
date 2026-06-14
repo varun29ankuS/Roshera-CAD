@@ -11,24 +11,21 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ## Tessellation
 
-### #51 🟡 Short-protrusion boss tessellates non-manifold (valid B-Rep)
-Found by HARNESS-1000 (#49, `geometry-engine/tests/parts_invariant_sweep.rs`).
-A box + interpenetrating cylinder boss union whose EXPOSED protruding wall is
-short (≤ ~8mm) yields a VALID 8-face B-Rep (`validate_solid_scoped` passes,
-Euler–Poincaré OK) that tessellates NON-MANIFOLD (`open=0`, `nm = 2×angular-
-segments`, e.g. 28 for r6 / 32 for r12). With the boss base sunk OVERLAP=3mm
-below the box top, `bh ≤ 11` fails and `bh ≥ 12` passes → the trigger is the
-exposed wall height (`bh − OVERLAP`), not radius or position. **Chord-
-independent**: nm is constant 28 across chord 0.1→2.0, so it is NOT a ring-
-density / weld-tolerance issue — it is structural to the tessellation of the
-short trimmed cylinder wall and/or its top cap. The pierced top-face annulus
-is identical for every bh (fails only when the boss is short), so the defect
-is the short exposed wall/cap, not the annulus. Impact: breaks agent-eyes
-render + STL export for short bosses (a common feature). Fix lives in the
-tessellation-weld lineage (cf #45 sphere weld, #69 normal-aware weld) —
-fresh-context. Pinned: `parts_invariant_sweep.rs::box_boss_short_protrusion_
-tessellates_nonmanifold_51` (#[ignore]). When fixed, flip it on and restore
-`boss_h=[10,25]` in the sweep's box-boss grid.
+### #51 🟢 FIXED — short-protrusion boss tessellated non-manifold (valid B-Rep)
+**RESOLVED by TESS-PERF #58 (2026-06-14).** A box + interpenetrating cylinder
+boss union whose EXPOSED protruding wall was short (≤ ~8mm) yielded a VALID
+B-Rep that tessellated NON-MANIFOLD (`open=0`, `nm = 2×angular-segments`). The
+report called it "chord-independent / structural / not a weld-tolerance issue" —
+correct that it wasn't density, but it WAS a tessellation-TOPOLOGY artifact: the
+curved-CDT Ruppert skinny pass over-refined the short developable wall and its
+rim didn't weld. #58 (developable Steiner collapse + fidelity-gated skinny
+refinement) cleared it. Verified across the whole formerly-failing range
+(exposed wall 1–8mm × r6/r12): `box_boss_short_protrusion_tessellates_manifold_51`
+now passes (un-#[ignore]'d, upgraded to a sweep guard), and the HARNESS-1000
+box-boss grid restored to `boss_h=[10,25]` (short bosses re-covered) stays green.
+LESSON: a "valid B-Rep but non-manifold mesh" pin is by definition a tessellation
+artifact — several were #58 collateral (cf #84). See memory
+`flanged-84-35-corefinement.md`.
 
 ---
 
