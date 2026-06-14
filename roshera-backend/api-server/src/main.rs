@@ -6321,6 +6321,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::part_coverage),
         )
         .route(
+            "/api/agent/parts/{id}/best-view",
+            get(handlers::agent::part_best_view),
+        )
+        .route(
+            "/api/agent/parts/{id}/orbit",
+            get(handlers::agent::part_orbit),
+        )
+        .route(
             "/api/agent/pointer",
             get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),
         )

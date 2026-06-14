@@ -26,6 +26,9 @@ use crate::tessellation::{tessellate_solid, TessellationParams};
 /// EYE-1: coordinate-anchored dimensioned multi-view render.
 pub mod dimensioned;
 
+/// EYE-6: active-perception viewpoint selection (next-best-view).
+pub mod viewpoint;
+
 /// Canonical orthographic camera directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalView {
@@ -201,6 +204,22 @@ pub fn render_solid(
     solid_id: SolidId,
     opts: &RenderOptions,
 ) -> Option<RenderFrame> {
+    let dir = opts.view.direction();
+    let up_hint = opts.view.up_hint();
+    render_solid_dir(model, solid_id, dir, up_hint, opts)
+}
+
+/// Render from an ARBITRARY view direction — the engine behind both the
+/// canonical views and EYE-6 orbit / next-best-view. `dir` points camera→scene;
+/// `up_hint` must not be parallel to it (the caller resolves pole degeneracy,
+/// e.g. switch to world-Y when `|dir·Z|` ≈ 1). `opts.view` is ignored here.
+pub fn render_solid_dir(
+    model: &BRepModel,
+    solid_id: SolidId,
+    dir: Vector3,
+    up_hint: Vector3,
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
     let solid = model.solids.get(solid_id)?;
     let mesh = tessellate_solid(solid, model, &opts.tessellation);
     if mesh.triangles.is_empty() {
@@ -260,8 +279,6 @@ pub fn render_solid(
     let nonmanifold_edges = defect_nonmanifold.len();
 
     // Camera basis: right/up orthonormal to the view direction.
-    let dir = opts.view.direction();
-    let up_hint = opts.view.up_hint();
     let right = match up_hint.cross(&dir).normalize() {
         Ok(v) => v,
         Err(_) => return None,

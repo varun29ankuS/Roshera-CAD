@@ -422,6 +422,124 @@ pub async fn render_part(
     }))
 }
 
+// ───────────────────── viewpoint selection (EYE-6) ──────────────────
+
+/// `GET /api/agent/parts/{id}/best-view` — EYE-6 active perception.
+///
+/// Returns the most-informative single view (max viewpoint entropy) plus a
+/// greedy next-best-view sequence that covers every face — the answer to
+/// EYE-5's "request another angle". `?candidates=N` (default 64) sets the
+/// Fibonacci view-sphere density. Read lock only; `404` on unknown id.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BestViewQuery {
+    pub candidates: Option<usize>,
+}
+
+pub async fn part_best_view(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<BestViewQuery>,
+) -> Result<Json<geometry_engine::render::viewpoint::ViewpointReport>, StatusCode> {
+    use geometry_engine::render::viewpoint::analyze_viewpoints;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let n = q.candidates.unwrap_or(64).clamp(8, 256);
+    let model = model_handle.read().await;
+    analyze_viewpoints(&model, id as SolidId, n, &TessellationParams::default())
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Query for `GET /api/agent/parts/{id}/orbit` — render from an arbitrary
+/// azimuth/elevation (world Z up). The companion to best-view: once the agent
+/// knows where to look, this shows it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OrbitQuery {
+    pub az: Option<f64>,
+    pub el: Option<f64>,
+    pub mode: Option<String>,
+    pub size: Option<usize>,
+}
+
+/// One arbitrary-direction render + its camera basis (so coordinates stay
+/// recoverable from frame + query).
+#[derive(Debug, Clone, Serialize)]
+pub struct OrbitResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub az_deg: f64,
+    pub el_deg: f64,
+    pub dir: [f64; 3],
+    pub mode: String,
+    pub open_edges: usize,
+    pub nonmanifold_edges: usize,
+}
+
+pub async fn part_orbit(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<OrbitQuery>,
+) -> Result<Json<OrbitResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::math::Vector3;
+    use geometry_engine::render::{render_solid_dir, CanonicalView, RenderMode, RenderOptions};
+
+    let az = q.az.unwrap_or(45.0).to_radians();
+    let el = q.el.unwrap_or(30.0).to_radians();
+    // Camera position on the unit sphere (world Z up) → view dir = −position.
+    let pos = [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()];
+    let dir = Vector3::new(-pos[0], -pos[1], -pos[2]);
+    let up_hint = if pos[2].abs() > 0.999 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let mode_name = q.mode.as_deref().unwrap_or("shaded");
+    let mode = match mode_name {
+        "shaded" => RenderMode::Shaded,
+        "ids" => RenderMode::FaceIds,
+        "depth" => RenderMode::Depth,
+        "normals" => RenderMode::Normals,
+        "diagnostic" => RenderMode::Diagnostic,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let size = q.size.unwrap_or(512).clamp(64, 2048);
+
+    let model = model_handle.read().await;
+    let frame = render_solid_dir(
+        &model,
+        id as SolidId,
+        dir,
+        up_hint,
+        &RenderOptions {
+            width: size,
+            height: size,
+            view: CanonicalView::Isometric, // ignored by render_solid_dir
+            mode,
+            ..Default::default()
+        },
+    )
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(OrbitResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        az_deg: q.az.unwrap_or(45.0),
+        el_deg: q.el.unwrap_or(30.0),
+        dir: [dir.x, dir.y, dir.z],
+        mode: mode_name.to_string(),
+        open_edges: frame.open_edges,
+        nonmanifold_edges: frame.nonmanifold_edges,
+    }))
+}
+
 // ───────────────────── coverage / ambiguity (EYE-5) ─────────────────
 
 /// `GET /api/agent/parts/{id}/coverage` — EYE-5 honesty protocol.
