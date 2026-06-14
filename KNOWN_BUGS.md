@@ -249,12 +249,20 @@ operand UUIDs and broadcasts `object_deleted`. Verified live: a union's
 `GET /api/agent/parts` now lists only the result. Commutativity parity
 tests updated to `deep_clone` operands for the second ordering.
 
-### #32 🔴 Coincident-face union produces invalid B-Rep (Same-Domain)
-Unioning a solid whose face sits *exactly coincident* on another's face
-(e.g. a riser resting on a plinth top) yields χ=4 + non-manifold rim
-edges. Interpenetrating the solids 10mm makes the identical union clean
-(χ=2, open=0 nm=0). Needs Same-Domain face unification. Workaround:
-always interpenetrate, never touch face-to-face.
+### #32 🟢 FIXED — coincident-face union (Same-Domain) (commit 450fb77)
+Unioning a solid whose face sits exactly coincident on another's (a riser on a
+plinth top; a boss flush on a box) yielded χ=odd + non-manifold rim (3 faces per
+edge). ROOT: the pipeline imprinted+split+classified the coincident face
+(OnBoundary) correctly, but selection's `OnBoundary → from_a` kept the buried
+disc — which is sandwiched between the two operands' interiors (anti-coincident
+= INTERNAL). FIX: a Same-Domain cull (`cull_internal_coincident_faces`, between
+merge and select): probe one side of each OnBoundary face and classify vs BOTH
+operands; `inside(A) XOR inside(B)` ⇒ opposite sides ⇒ internal ⇒ drop;
+same-domain kept (selection dedups). Orientation-independent. Coincident
+face-to-face union now works (no more interpenetrate-only workaround). Running
+guard: `box_boss_coincident_base_union_valid_32`. Verified no regression across
+118 boolean lib + poke + volume + adversarial + determinism + oracle +
+HARNESS-1000.
 
 ### #27 🟢 Coaxial stacked-step union left buried cap
 Fixed via annular face-with-hole interior-point. See boolean campaign.
