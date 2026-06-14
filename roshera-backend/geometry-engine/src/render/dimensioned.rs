@@ -94,6 +94,13 @@ pub struct MultiViewFrame {
     pub views: Vec<ViewProjection>,
     /// World length represented by the scale-bar ruler in each quadrant.
     pub scale_bar_world: f64,
+    /// EYE-3 analytics, MEASURED off the same tessellated mesh (so the overlay
+    /// and the numbers can never disagree): solid volume, surface area, and the
+    /// volume centroid. These match the kernel's mass-properties query within
+    /// faceting tolerance — that agreement is the visual⇄numeric self-check.
+    pub volume: f64,
+    pub surface_area: f64,
+    pub centroid: Point3,
 }
 
 impl MultiViewFrame {
@@ -139,6 +146,11 @@ pub fn render_dimensioned_multiview(
     let dims = (hi.x - lo.x, hi.y - lo.y, hi.z - lo.z);
     let corners = bbox_corners(&lo, &hi);
 
+    // EYE-3 analytics from the mesh (divergence-theorem volume/centroid + summed
+    // triangle area). Same mesh the views are drawn from → overlay and numbers
+    // are inherently consistent.
+    let (volume, surface_area, centroid) = mesh_analytics(&mesh);
+
     // A scale-bar length that is a "nice" round fraction of the largest extent.
     let max_extent = dims.0.max(dims.1).max(dims.2).max(1e-9);
     let scale_bar_world = nice_number(max_extent / 4.0);
@@ -173,11 +185,11 @@ pub fn render_dimensioned_multiview(
             &hi,
             scale_bar_world,
             dims,
+            (volume, surface_area, centroid),
             &mut pixels,
             width,
             height,
         );
-        // Cell separators.
         views.push(proj);
     }
     draw_grid_separators(&mut pixels, width, height);
@@ -192,7 +204,54 @@ pub fn render_dimensioned_multiview(
         dims,
         views,
         scale_bar_world,
+        volume,
+        surface_area,
+        centroid,
     })
+}
+
+/// Volume (divergence theorem over the welded mesh), surface area (summed
+/// triangle areas), and the volume centroid — all from the tessellated mesh.
+/// For a watertight, consistently-wound mesh these equal the polyhedron's exact
+/// values, and track the kernel's analytic mass properties within faceting.
+fn mesh_analytics(mesh: &crate::tessellation::TriangleMesh) -> (f64, f64, Point3) {
+    let mut vol6 = 0.0; // 6×volume
+    let mut area2 = 0.0; // 2×area
+    let mut cx = 0.0;
+    let mut cy = 0.0;
+    let mut cz = 0.0;
+    for tri in &mesh.triangles {
+        let a = &mesh.vertices[tri[0] as usize].position;
+        let b = &mesh.vertices[tri[1] as usize].position;
+        let c = &mesh.vertices[tri[2] as usize].position;
+        // Signed volume of tet (origin, a, b, c) = a · (b × c).
+        let cross = Vector3::new(
+            b.y * c.z - b.z * c.y,
+            b.z * c.x - b.x * c.z,
+            b.x * c.y - b.y * c.x,
+        );
+        let sv = a.x * cross.x + a.y * cross.y + a.z * cross.z; // 6× tet volume
+        vol6 += sv;
+        // Volume centroid: Σ (tet_centroid · 6·tetVol); tet_centroid = (a+b+c)/4
+        // (origin contributes 0). Divide by 4 and by total at the end.
+        cx += sv * (a.x + b.x + c.x);
+        cy += sv * (a.y + b.y + c.y);
+        cz += sv * (a.z + b.z + c.z);
+        // Triangle area = ½|(b−a)×(c−a)|.
+        let e1 = Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+        let e2 = Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z);
+        let n = e1.cross(&e2);
+        area2 += n.magnitude();
+    }
+    let volume = (vol6 / 6.0).abs();
+    let surface_area = area2 * 0.5;
+    let centroid = if vol6.abs() > 1e-12 {
+        // cx accumulated sv·Σpos; centroid = (Σ sv·(a+b+c)) / (4 · Σsv).
+        Point3::new(cx / (4.0 * vol6), cy / (4.0 * vol6), cz / (4.0 * vol6))
+    } else {
+        Point3::new(0.0, 0.0, 0.0)
+    };
+    (volume, surface_area, centroid)
 }
 
 fn bbox_corners(lo: &Point3, hi: &Point3) -> [Point3; 8] {
@@ -357,10 +416,12 @@ fn draw_overlays(
     hi: &Point3,
     scale_bar_world: f64,
     dims: (f64, f64, f64),
+    analytics: (f64, f64, Point3),
     pixels: &mut [u8],
     width: usize,
     height: usize,
 ) {
+    let (volume, surface_area, centroid) = analytics;
     // View label, top-left of the cell.
     let (cx0, cy0, _cw, _ch) = proj.cell;
     draw_text(
@@ -452,6 +513,39 @@ fn draw_overlays(
         by - 8.0,
         &dim_label,
         [20, 20, 20],
+        1,
+    );
+
+    // EYE-3: centroid marker (magenta crosshair + 'C') projected into this view.
+    let cm = [200, 0, 200];
+    let (cpx, cpy, _) = proj.project(&centroid);
+    draw_line(pixels, width, height, cpx - 7.0, cpy, cpx + 7.0, cpy, cm);
+    draw_line(pixels, width, height, cpx, cpy - 7.0, cpx, cpy + 7.0, cm);
+    draw_text(pixels, width, height, cpx + 4.0, cpy + 4.0, "C", cm, 1);
+
+    // EYE-3: measured volume + surface-area readout, top-right of the cell.
+    let v_label = format!("V {}", fmt_num(volume));
+    let a_label = format!("A {}", fmt_num(surface_area));
+    let vw = text_width(&v_label, 1);
+    let aw = text_width(&a_label, 1);
+    draw_text(
+        pixels,
+        width,
+        height,
+        (cx0 + CELL) as f64 - MARGIN - vw,
+        cy0 as f64 + 8.0,
+        &v_label,
+        [90, 30, 110],
+        1,
+    );
+    draw_text(
+        pixels,
+        width,
+        height,
+        (cx0 + CELL) as f64 - MARGIN - aw,
+        cy0 as f64 + 20.0,
+        &a_label,
+        [90, 30, 110],
         1,
     );
 }
@@ -586,6 +680,15 @@ fn glyph(c: char) -> Option<[u8; 7]> {
         ],
         'W' => [
             0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'C' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
         ],
         ' ' => [0; 7],
         _ => return None,
@@ -783,6 +886,46 @@ mod tests {
             fmt_num(frame.dims.1),
             fmt_num(frame.dims.2),
             frame.units
+        );
+    }
+
+    /// EYE-3 self-check: the analytics OVERLAID on the render (volume, surface
+    /// area, centroid — measured off the mesh) must agree with the kernel's
+    /// authoritative mass-properties query within faceting tolerance. If they
+    /// ever diverge, the eye is lying and this fails. This is the visual⇄numeric
+    /// contract that makes the overlay trustworthy.
+    #[test]
+    fn eye3_analytics_match_kernel_mass_properties() {
+        let mut model = BRepModel::new();
+        let s = housing(&mut model);
+        let frame = render_dimensioned_multiview(&model, s, &TessellationParams::default())
+            .expect("render");
+        let mp = model.mass_properties_for(s).expect("mass properties");
+
+        let vrel = (frame.volume - mp.volume).abs() / mp.volume;
+        assert!(
+            vrel < 0.02,
+            "overlay volume {} vs kernel {} (rel {vrel})",
+            frame.volume,
+            mp.volume
+        );
+        let arel = (frame.surface_area - mp.surface_area).abs() / mp.surface_area;
+        assert!(
+            arel < 0.05,
+            "overlay area {} vs kernel {} (rel {arel})",
+            frame.surface_area,
+            mp.surface_area
+        );
+        let com = mp.center_of_mass;
+        let dc = ((frame.centroid.x - com[0]).powi(2)
+            + (frame.centroid.y - com[1]).powi(2)
+            + (frame.centroid.z - com[2]).powi(2))
+        .sqrt();
+        assert!(
+            dc < 1.0,
+            "overlay centroid {:?} vs kernel {:?} (dist {dc})",
+            frame.centroid,
+            com
         );
     }
 
