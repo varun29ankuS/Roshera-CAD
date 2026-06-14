@@ -32,6 +32,26 @@ tessellates_nonmanifold_51` (#[ignore]). When fixed, flip it on and restore
 
 ---
 
+## Blend (fillet / chamfer)
+
+### #82 🟡 Multi-edge blend on adjacent (corner-sharing) edges not implemented
+Found by the ribbed-bracket S3 build. `fillet_edges` / `chamfer_edges` over
+edges that share a corner vertex where the *selected* edges meet at a degree-2
+`ConvexCorner` (e.g. the 4 top-perimeter edges of a box, meeting pairwise at the
+4 top corners) returns `NotImplemented`: "corner-patch synthesis for this vertex
+kind is not yet implemented (Task #82 / F5-γ / F5-δ). Apply each edge in a
+separate call." This is the kernel's own internal **#82 / F5-γ/δ** corner-patch
+work — a known unimplemented feature, NOT a regression. The earlier multi-edge
+corner fixes (#51/#62/#63) covered all-fillet 3-edge box-VERTEX corners and
+multi-edge chamfer; this degree-2 face-perimeter `ConvexCorner` is the remaining
+gap. **Supported path:** blend only vertex-disjoint edge sets — e.g. the 4
+vertical edges of a box are pairwise disjoint, so `ribbed_bracket`
+(parts_invariant_sweep.rs) fillets 2 + chamfers 2 of them cleanly. Repro:
+`multi_edge_adjacent_fillet_unsupported_82` (#[ignore]); flip on when F5-γ/δ
+lands.
+
+---
+
 ## Boolean
 
 ### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall

@@ -717,6 +717,247 @@ fn multi_boss_manifold(model: &mut BRepModel) -> SolidId {
     .expect("central bore")
 }
 
+/// Select the EdgeIds of `model` whose BOTH endpoints lie at z ≈ `z` — i.e. the
+/// 4 perimeter edges of a box's top (or bottom) face. Used to address blend
+/// edges geometrically (the kernel has no "top edges" query yet).
+fn edges_at_z(
+    model: &BRepModel,
+    z: f64,
+    tol: f64,
+) -> Vec<geometry_engine::primitives::edge::EdgeId> {
+    model
+        .edges
+        .iter()
+        .filter_map(|(eid, e)| {
+            let a = model.vertices.get(e.start_vertex)?.position;
+            let b = model.vertices.get(e.end_vertex)?.position;
+            if (a[2] - z).abs() < tol && (b[2] - z).abs() < tol {
+                Some(eid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn assert_clean(model: &BRepModel, s: SolidId, stage: &str) {
+    let r = manifold_report(model, s, CHORD, WELD).unwrap_or_else(|| panic!("{stage}: no mesh"));
+    assert_eq!(
+        (r.boundary_edges, r.nonmanifold_edges),
+        (0, 0),
+        "{stage}: not watertight (open={} nm={})",
+        r.boundary_edges,
+        r.nonmanifold_edges
+    );
+    let v = validate_solid_scoped(model, s, Tolerance::default(), ValidationLevel::Standard);
+    assert!(v.is_valid, "{stage}: invalid B-Rep: {:?}", v.errors);
+}
+
+/// The 4 vertical edges of a centred box: (eid, x) where the edge spans z and
+/// its endpoints share (x, y). These are pairwise VERTEX-DISJOINT, so blending
+/// any subset needs no corner-patch synthesis (the #82 limitation).
+fn vertical_edges(model: &BRepModel) -> Vec<(geometry_engine::primitives::edge::EdgeId, f64)> {
+    model
+        .edges
+        .iter()
+        .filter_map(|(eid, e)| {
+            let a = model.vertices.get(e.start_vertex)?.position;
+            let b = model.vertices.get(e.end_vertex)?.position;
+            let spans_z = (a[2] - b[2]).abs() > 5.0;
+            let same_xy = (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+            if spans_z && same_xy {
+                Some((eid, a[0]))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// S3 RIBBED BRACKET — the blend-ops rung. Built in stages, each VERIFIED, so a
+/// failure pinpoints the exact operation. Blends go on CLEAN geometry BEFORE
+/// booleans (live-build recipe). The 4 vertical edges are vertex-disjoint, so
+/// (A) fillet the 2 on the +X side and (B) chamfer the 2 on the −X side — both
+/// blend ops, no shared corners, no #82 corner-patch dependency. Then (C) union
+/// 2 interpenetrating bosses and (D) through-bore each.
+fn ribbed_bracket(model: &mut BRepModel) -> SolidId {
+    use geometry_engine::operations::chamfer::{chamfer_edges, ChamferOptions, ChamferType};
+    use geometry_engine::operations::fillet::{fillet_edges, FilletOptions, FilletType};
+
+    // Clean plate: 80×60×16, centred → top z=+8, bottom z=-8.
+    let plate = make_box(model, 80.0, 60.0, 16.0);
+
+    let verts = vertical_edges(model);
+    assert_eq!(
+        verts.len(),
+        4,
+        "expected 4 vertical edges, got {}",
+        verts.len()
+    );
+
+    // (A) Fillet the 2 vertical edges on the +X side (r4).
+    let fillet_e: Vec<_> = verts
+        .iter()
+        .filter(|(_, x)| *x > 0.0)
+        .map(|(e, _)| *e)
+        .collect();
+    assert_eq!(fillet_e.len(), 2, "expected 2 +X vertical edges");
+    fillet_edges(
+        model,
+        plate,
+        fillet_e,
+        FilletOptions {
+            fillet_type: FilletType::Constant(4.0),
+            radius: 4.0,
+            ..Default::default()
+        },
+    )
+    .expect("stage A: fillet +X vertical edges");
+    assert_clean(model, plate, "A:fillet-verticals");
+
+    // (B) Chamfer the 2 vertical edges on the −X side (3mm).
+    let chamfer_e: Vec<_> = verts
+        .iter()
+        .filter(|(_, x)| *x < 0.0)
+        .map(|(e, _)| *e)
+        .collect();
+    assert_eq!(chamfer_e.len(), 2, "expected 2 -X vertical edges");
+    chamfer_edges(
+        model,
+        plate,
+        chamfer_e,
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(3.0),
+            distance1: 3.0,
+            distance2: 3.0,
+            ..Default::default()
+        },
+    )
+    .expect("stage B: chamfer -X vertical edges");
+    assert_clean(model, plate, "B:chamfer-verticals");
+
+    // (C) Union 2 interpenetrating bosses on the top face (exposed wall 15mm).
+    let mut acc = plate;
+    for bx in [-25.0, 25.0] {
+        let boss = sid_of(
+            TopologyBuilder::new(model)
+                .create_cylinder_3d(
+                    Point3::new(bx, 0.0, 5.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    10.0,
+                    18.0,
+                )
+                .expect("boss"),
+        );
+        acc = boolean_operation(
+            model,
+            acc,
+            boss,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("stage C: boss union");
+    }
+    assert_clean(model, acc, "C:bosses");
+
+    // (D) Through-bore each boss (r5).
+    for bx in [-25.0, 25.0] {
+        let bore = sid_of(
+            TopologyBuilder::new(model)
+                .create_cylinder_3d(
+                    Point3::new(bx, 0.0, -20.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    5.0,
+                    80.0,
+                )
+                .expect("bore"),
+        );
+        acc = boolean_operation(
+            model,
+            acc,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("stage D: boss bore");
+    }
+    assert_clean(model, acc, "D:bores");
+
+    acc
+}
+
+/// PIN #82: multi-edge fillet on ADJACENT (corner-sharing) box edges is not yet
+/// implemented — the kernel rejects with NotImplemented (ConvexCorner degree-2
+/// corner-patch synthesis, F5-γ / F5-δ). Filleting the 4 top-perimeter edges
+/// (they meet pairwise at the 4 top corners) is the minimal repro. The
+/// supported path is vertex-disjoint edges (see `ribbed_bracket`). Flip this on
+/// when #82 lands.
+#[test]
+#[ignore = "#82: corner-patch synthesis for adjacent multi-edge blends not implemented (F5-γ/δ)"]
+fn multi_edge_adjacent_fillet_unsupported_82() {
+    use geometry_engine::operations::fillet::{fillet_edges, FilletOptions, FilletType};
+    let mut model = BRepModel::new();
+    let plate = make_box(&mut model, 80.0, 60.0, 16.0);
+    let top_edges = edges_at_z(&model, 8.0, 1e-6);
+    assert_eq!(top_edges.len(), 4);
+    fillet_edges(
+        &mut model,
+        plate,
+        top_edges,
+        FilletOptions {
+            fillet_type: FilletType::Constant(4.0),
+            radius: 4.0,
+            ..Default::default()
+        },
+    )
+    .expect("adjacent multi-edge fillet should succeed once #82 lands");
+    assert_clean(&model, plate, "82:adjacent-fillet");
+}
+
+/// S3 VERIFY + DIMENSION on the ribbed bracket. Stages self-verify inside the
+/// builder; here we confirm the final solid and its EYE-1 dims.
+#[test]
+fn ribbed_bracket_verify_and_dimension() {
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let mut model = BRepModel::new();
+    let s = ribbed_bracket(&mut model);
+    assert_clean(&model, s, "final");
+
+    // Bbox: L=80, W=60, H from plate bottom z=-8 to boss top z=23 = 31.
+    let f =
+        render_dimensioned_multiview(&model, s, &TessellationParams::default()).expect("render");
+    assert!((f.dims.0 - 80.0).abs() < 0.5, "L={} expected 80", f.dims.0);
+    assert!((f.dims.1 - 60.0).abs() < 0.5, "W={} expected 60", f.dims.1);
+    assert!((f.dims.2 - 31.0).abs() < 0.6, "H={} expected 31", f.dims.2);
+}
+
+/// Emit the ribbed bracket render for eyeballing.
+#[test]
+#[ignore = "writes a PNG for manual inspection"]
+fn emit_ribbed_bracket_png() {
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let mut model = BRepModel::new();
+    let s = ribbed_bracket(&mut model);
+    let f =
+        render_dimensioned_multiview(&model, s, &TessellationParams::default()).expect("render");
+    let png = f.to_png().expect("png");
+    std::fs::write("../_ribbed_bracket.png", &png).expect("write png");
+    let r = manifold_report(&model, s, CHORD, WELD).expect("mesh");
+    eprintln!(
+        "wrote ../_ribbed_bracket.png ({} bytes) dims L{:.0} W{:.0} H{:.0}, open={} nm={}",
+        png.len(),
+        f.dims.0,
+        f.dims.1,
+        f.dims.2,
+        r.boundary_edges,
+        r.nonmanifold_edges
+    );
+}
+
 /// S3 VERIFY + DIMENSION on the multi-boss manifold: it must be watertight,
 /// valid, and the EYE-1 render must report the intended L×W×H. If chained
 /// booleans break on this part, this is where it surfaces.
