@@ -120,10 +120,12 @@ GWN runs). The 6-boss build: >120 s hang → **10.87 s, all 13 stages**.
 `bool86_hang_isolation` (#[ignore]) now PASSES (asserts termination). Verified no
 classification regression: poke-envelope (exact), determinism, brep-oracle,
 adversarial-intersection, volume-proptest, analytic-watertight, curved-CDT — all
-green. **Still-open downstream:** cylinder DISPLAY tessellation is over-dense/slow
-(the Ruppert pass over-refines the developable lateral) — affects render/export/
-perception; tracked as a TESS-PERF task (deep, deferred). See memory
-`bool86-gwn-tessellation-hang.md`.
+green. **Downstream TESS-PERF also FIXED (same session):** the cylinder/cone
+DISPLAY over-tessellation that this exposed (curved-CDT over-refining the
+developable lateral) is fixed in `curved_cdt.rs` — developable-direction Steiner
+collapse + skinny-refinement gated on geometric fidelity. Boss cylinder
+20202 tris/4.5s → 2872/58ms; HARNESS-1000 ~975s → 56s; all tessellation +
+boolean suites green. See memory `bool86-gwn-tessellation-hang.md`.
 
 ### #84 🟡 Coaxial through-pierce union (shaft through disc) → non-manifold
 Found by the S3 flanged-body build. Union of two COAXIAL cylinders of different
