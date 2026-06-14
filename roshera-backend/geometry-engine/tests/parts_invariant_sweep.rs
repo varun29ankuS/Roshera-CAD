@@ -1025,3 +1025,183 @@ fn emit_multi_boss_png() {
         r.nonmanifold_edges
     );
 }
+
+// ── S3 rung 4: flanged body (cylindrical body + bolt-circle flange) ──────────
+
+/// A flanged body — one rung past the ribbed bracket. Cylindrical body (r20,
+/// h60) + a wider flange ring (r40, h12) at the base + a Ø20 central through-
+/// bore + a Ø8 bolt-circle of 4 through-holes in the flange (radius 30, clear
+/// of the body). All interpenetrating with exposed walls >8mm (clear of TESS
+/// #51). Exercises chained union+difference on curved primitives and is the
+/// first part inspected three ways (verify + dimension + SECTION, now that #83
+/// is fixed).
+fn flanged_body(model: &mut BRepModel) -> SolidId {
+    let cyl = |m: &mut BRepModel, cx: f64, cy: f64, cz: f64, r: f64, h: f64| -> SolidId {
+        sid_of(
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Point3::new(cx, cy, cz), Vector3::new(0.0, 0.0, 1.0), r, h)
+                .expect("cyl"),
+        )
+    };
+    // Body base sunk 5mm BELOW the flange base so the two coaxial cylinders do
+    // NOT share the z=0 plane — coincident coaxial base faces are the deep #32
+    // (Same-Domain) union defect; they must interpenetrate (live-build recipe).
+    let body = cyl(model, 0.0, 0.0, -5.0, 20.0, 65.0); // z [-5,60]
+    let flange = cyl(model, 0.0, 0.0, 0.0, 40.0, 12.0); // z [0,12]
+    let mut acc = boolean_operation(
+        model,
+        body,
+        flange,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("flange union");
+    let bore = cyl(model, 0.0, 0.0, -10.0, 10.0, 80.0); // Ø20 central, through
+    acc = boolean_operation(
+        model,
+        acc,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("central bore");
+    for (bx, by) in [(30.0, 0.0), (0.0, 30.0), (-30.0, 0.0), (0.0, -30.0)] {
+        let hole = cyl(model, bx, by, -2.0, 4.0, 16.0); // Ø8 bolt hole through flange
+        acc = boolean_operation(
+            model,
+            acc,
+            hole,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bolt hole");
+    }
+    acc
+}
+
+/// S3 three-way inspection (VERIFY + DIMENSION + SECTION). PINNED by BOOL #84:
+/// the coaxial through-pierce union (body shaft through the flange disc) is
+/// watertight-but-non-manifold (nm=72 at the union; see diag_flanged_stages),
+/// and chained bolt-bores then add open edges. Deep boolean-core (corefinement
+/// at the pierce rim) — fresh-context. Flip on when #84 lands.
+#[test]
+#[ignore = "BOOL #84: coaxial through-pierce union is non-manifold"]
+fn flanged_body_verify_dimension_section() {
+    use geometry_engine::render::dimensioned::{render_dimensioned_multiview, render_section};
+    use geometry_engine::tessellation::TessellationParams;
+
+    let mut model = BRepModel::new();
+    let s = flanged_body(&mut model);
+    assert_clean(&model, s, "flanged-body");
+
+    let f =
+        render_dimensioned_multiview(&model, s, &TessellationParams::default()).expect("render");
+    assert!((f.dims.0 - 80.0).abs() < 0.6, "L={} expected 80", f.dims.0);
+    assert!((f.dims.1 - 80.0).abs() < 0.6, "W={} expected 80", f.dims.1);
+    assert!((f.dims.2 - 65.0).abs() < 0.6, "H={} expected 65", f.dims.2);
+
+    let sec = render_section(
+        &model,
+        s,
+        Point3::new(0.0, 0.0, 6.0),
+        Vector3::new(0.0, 0.0, 1.0),
+        Tolerance::default(),
+    )
+    .expect("mid-flange section");
+    let expected = PI * (1600.0 - 100.0) - 4.0 * PI * 16.0;
+    let rel = (sec.section_area - expected).abs() / expected;
+    assert!(
+        rel < 0.04,
+        "flange section area {} vs analytic {expected} (rel {rel})",
+        sec.section_area
+    );
+}
+
+#[test]
+#[ignore = "writes PNGs for manual inspection"]
+fn emit_flanged_body_png() {
+    use geometry_engine::render::dimensioned::{render_dimensioned_multiview, render_section};
+    use geometry_engine::tessellation::TessellationParams;
+
+    let mut model = BRepModel::new();
+    let s = flanged_body(&mut model);
+    let f =
+        render_dimensioned_multiview(&model, s, &TessellationParams::default()).expect("render");
+    std::fs::write("../_flanged.png", f.to_png().expect("png")).expect("write");
+    let sec = render_section(
+        &model,
+        s,
+        Point3::new(0.0, 0.0, 6.0),
+        Vector3::new(0.0, 0.0, 1.0),
+        Tolerance::default(),
+    )
+    .expect("section");
+    std::fs::write("../_flanged_section.png", sec.to_png().expect("png")).expect("write");
+    eprintln!(
+        "flanged: dims L{:.0} W{:.0} H{:.0}; section area={:.1} ({}x{:.0})",
+        f.dims.0, f.dims.1, f.dims.2, sec.section_area, sec.extent_u, sec.extent_v
+    );
+}
+
+/// BOOL #84 stage breakdown (kept as the characterization repro): shows the
+/// coaxial union is already nm=72 before any bore, and chained bolt-bores add
+/// open edges from the 2nd hole on. #[ignore] (diagnostic + slow).
+#[test]
+#[ignore = "BOOL #84 characterization diagnostic (slow)"]
+fn diag_flanged_stages() {
+    let cyl = |m: &mut BRepModel, cx: f64, cy: f64, cz: f64, r: f64, h: f64| -> SolidId {
+        sid_of(
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Point3::new(cx, cy, cz), Vector3::new(0.0, 0.0, 1.0), r, h)
+                .expect("cyl"),
+        )
+    };
+    let report = |m: &BRepModel, s: SolidId, label: &str| {
+        let r = manifold_report(m, s, CHORD, WELD);
+        match r {
+            Some(r) => eprintln!(
+                "  {label}: open={} nm={}",
+                r.boundary_edges, r.nonmanifold_edges
+            ),
+            None => eprintln!("  {label}: no mesh"),
+        }
+    };
+    let mut m = BRepModel::new();
+    let body = cyl(&mut m, 0.0, 0.0, -5.0, 20.0, 65.0);
+    let flange = cyl(&mut m, 0.0, 0.0, 0.0, 40.0, 12.0);
+    let u = boolean_operation(
+        &mut m,
+        body,
+        flange,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("union");
+    report(&m, u, "A:body+flange union");
+    let bore = cyl(&mut m, 0.0, 0.0, -10.0, 10.0, 80.0);
+    let b = boolean_operation(
+        &mut m,
+        u,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("bore");
+    report(&m, b, "B:central bore");
+    let mut acc = b;
+    for (i, (bx, by)) in [(30.0, 0.0), (0.0, 30.0), (-30.0, 0.0), (0.0, -30.0)]
+        .iter()
+        .enumerate()
+    {
+        let hole = cyl(&mut m, *bx, *by, -2.0, 4.0, 16.0);
+        acc = boolean_operation(
+            &mut m,
+            acc,
+            hole,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("hole");
+        report(&m, acc, &format!("C:bolt{i}"));
+    }
+}
