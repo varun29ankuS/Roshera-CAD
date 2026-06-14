@@ -23,6 +23,9 @@ use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::{tessellate_solid, TessellationParams};
 
+/// EYE-1: coordinate-anchored dimensioned multi-view render.
+pub mod dimensioned;
+
 /// Canonical orthographic camera directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalView {
@@ -38,7 +41,7 @@ pub enum CanonicalView {
 
 impl CanonicalView {
     /// Unit view direction (from camera toward the scene).
-    fn direction(self) -> Vector3 {
+    pub(crate) fn direction(self) -> Vector3 {
         match self {
             CanonicalView::Isometric => {
                 let inv = 1.0 / 3.0_f64.sqrt();
@@ -51,7 +54,7 @@ impl CanonicalView {
     }
 
     /// A world "up" hint that is never parallel to the view direction.
-    fn up_hint(self) -> Vector3 {
+    pub(crate) fn up_hint(self) -> Vector3 {
         match self {
             CanonicalView::Top => Vector3::new(0.0, 1.0, 0.0),
             _ => Vector3::new(0.0, 0.0, 1.0),
