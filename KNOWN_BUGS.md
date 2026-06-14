@@ -9,6 +9,29 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ---
 
+## Tessellation
+
+### #51 🟡 Short-protrusion boss tessellates non-manifold (valid B-Rep)
+Found by HARNESS-1000 (#49, `geometry-engine/tests/parts_invariant_sweep.rs`).
+A box + interpenetrating cylinder boss union whose EXPOSED protruding wall is
+short (≤ ~8mm) yields a VALID 8-face B-Rep (`validate_solid_scoped` passes,
+Euler–Poincaré OK) that tessellates NON-MANIFOLD (`open=0`, `nm = 2×angular-
+segments`, e.g. 28 for r6 / 32 for r12). With the boss base sunk OVERLAP=3mm
+below the box top, `bh ≤ 11` fails and `bh ≥ 12` passes → the trigger is the
+exposed wall height (`bh − OVERLAP`), not radius or position. **Chord-
+independent**: nm is constant 28 across chord 0.1→2.0, so it is NOT a ring-
+density / weld-tolerance issue — it is structural to the tessellation of the
+short trimmed cylinder wall and/or its top cap. The pierced top-face annulus
+is identical for every bh (fails only when the boss is short), so the defect
+is the short exposed wall/cap, not the annulus. Impact: breaks agent-eyes
+render + STL export for short bosses (a common feature). Fix lives in the
+tessellation-weld lineage (cf #45 sphere weld, #69 normal-aware weld) —
+fresh-context. Pinned: `parts_invariant_sweep.rs::box_boss_short_protrusion_
+tessellates_nonmanifold_51` (#[ignore]). When fixed, flip it on and restore
+`boss_h=[10,25]` in the sweep's box-boss grid.
+
+---
+
 ## Boolean
 
 ### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall
