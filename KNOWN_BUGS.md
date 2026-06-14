@@ -124,7 +124,7 @@ collapse + skinny-refinement gated on geometric fidelity. Boss cylinder
 20202 tris/4.5s → 2872/58ms; HARNESS-1000 ~975s → 56s; all tessellation +
 boolean suites green. See memory `bool86-gwn-tessellation-hang.md`.
 
-### #84 🟢 (union) + 🟡 (residual re-pinned to #35) — coaxial through-pierce
+### #84 🟢 FIXED + #35 🟢 FIXED — coaxial through-pierce flanged body, fully clean
 **The headline bug — coaxial through-pierce UNION → non-manifold — is RESOLVED**
 (2026-06-14). It was a TESSELLATION ARTIFACT, not a B-Rep defect: the old
 over-refined cylinder lateral didn't align with the flange-cap annulus sampling,
@@ -134,26 +134,31 @@ align. `diag_flanged_stages` now shows `A:body+flange union: open=0 nm=0
 brep_valid=true faces=7`, central bore and 1st bolt likewise clean — verified at
 the B-Rep level (`validate_solid_scoped`, mesh-independent), not just the mesh.
 
-**Residual (separate bug, re-pinned to #35) — ROOT CAUSE CONFIRMED 2026-06-14:**
-the 2nd-and-later bolt-hole DIFFERENCE into a flange cap that ALREADY has ≥2
-holes **never imprints the new hole onto the cap face**. Face-membership dump at
-canonicalise (bolt1, 3rd Difference): the top/bottom cap faces (`from=6`) keep
-`inner_loops=2` (the pre-existing central + bolt0 holes) — the bolt1 rim is
-ABSENT from them; the bolt1 rim (canon vertices 50–55) lives ONLY on the cutter
-WALL face (`from=7`, Cylinder). So the rim edges are used by one face → boundary
-→ `build_shells components=2` → reconstruct orphans the wall → dangling cap loop
-(`brep_valid=false`, 6 edges/hole). It is NOT a vertex-tolerance issue (the #35
-near-miss probe found zero pairs in 1e-6..0.5; min nonzero gap 5.0). The earlier
-"non-coincident split vertices" guess is SUPERSEDED. Threshold is the inner-loop
-count: cap 0→1 (central) and 1→2 (bolt0) imprint fine; 2→3 (bolt1) drops the new
-hole. ROOT = `split_face_by_curves` pre-existing-hole absorption + new-hole
-emission (and/or `merge_same_origin_fragments`) fails to add the current cut's
-hole as an inner loop when the target face already carries ≥2 inner loops
-(#27/#32/#86-merge family). DEEP, fresh-context. Research lane: robust
-corefinement /
-shared-edge imprint at the pierce rim (Cherchi–Attene; CGAL corefinement).
-Pinned: `parts_invariant_sweep.rs::flanged_body_verify_dimension_section` +
-`diag_flanged_stages` (#[ignore]).
+**Residual #35 — FIXED 2026-06-14 (commits 98c20c5 + d4b5113).** A chained
+DIFFERENCE into a cap that already has holes dropped the new (and, for 3+ holes,
+a pre-existing) hole, orphaning its wall as a separate shell. ROOT was the SAME
+chord-polygon flaw in two stages, both using boundary-edge ENDPOINTS for a
+strict point-in-polygon containment test: (1) `merge_same_origin_fragments`
+(absorbing the new cut's disc as an inner loop) and (2)
+`partition_outer_and_pre_existing_hole_cycles` (re-attaching pre-existing holes
+to their outer). For a curved cap rim split into ~3 arcs the inscribed chord
+triangle's incircle is ~r/2, so a hole at radius 30 in an r40 cap tested OUTSIDE
+the outer and was dropped. FIX: build both containment polygons by SAMPLING each
+boundary edge's curve (8/edge, follow arcs) — mirrors `is_point_in_face`. Now
+diag_flanged_stages: union/bore/bolt0..bolt3 ALL `open=0 nm=0 brep_valid=true`
+(bolt3 faces=14). `flanged_body_verify_dimension` un-#[ignore]'d as a running
+guard; verified no regression (118 boolean lib + poke + volume + tess +
+HARNESS-1000). NOT a vertex-tolerance issue (near-miss probe: zero pairs in
+1e-6..0.5). Pinned tests now PASS; `diag_flanged_stages` (#[ignore], slow) keeps
+the per-stage characterization.
+
+### #85b 🟡 Section of a multi-hole planar profile → cdt panic (wrong area)
+Surfaced when #35 made the 4-bolt flange valid: `render_section` mid-flange
+yields the wrong cross-section area because the `cdt` crate panics (caught →
+empty faces) triangulating the many-contour section profile (annulus + 4 holes).
+The SOLID is sound (`flanged_body_verify_dimension` passes). Section/triangulation
+robustness on a multi-hole planar profile, NOT a boolean defect. Pinned
+`flanged_body_section_multihole_cdt_85b` (#[ignore]).
 
 ### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall
 Found live (ladder step 6, bearing housing). `plate ∪ analytic-cylinder boss`
