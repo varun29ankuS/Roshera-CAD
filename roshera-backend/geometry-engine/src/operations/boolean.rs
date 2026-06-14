@@ -10399,34 +10399,51 @@ fn merge_same_origin_fragments(
             continue;
         }
 
-        // 2. Project each fragment's boundary cycle to UV. The merge
-        // test below is polygon-in-polygon (every inner vertex inside
-        // outer), so the projected polygon is the only artifact we
-        // need per fragment.
-        let mut polygons: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
-
-        for &idx in indices {
-            let edge_ids: Vec<EdgeId> = faces[idx].boundary_edges.iter().map(|(e, _)| *e).collect();
-            let cycle3d = extract_cycle_vertices_3d(&edge_ids, model);
-            if cycle3d.len() < 3 {
-                continue;
-            }
-
-            let mut poly = Vec::with_capacity(cycle3d.len());
-            let mut all_projected = true;
-            for pt in &cycle3d {
-                match surface.closest_point(pt, *tolerance) {
-                    Ok((u, v)) => poly.push((u, v)),
-                    Err(_) => {
-                        all_projected = false;
-                        break;
-                    }
+        // Densified UV polygon of a boundary cycle. CRITICAL for #35: sample
+        // each boundary EDGE's curve (not just its endpoints) so the polygon
+        // FOLLOWS arcs. Using only cycle vertices builds the inscribed CHORD
+        // polygon — for a curved cap boundary split into a few arcs (e.g. an
+        // r40 cap rim as 3 arcs), that polygon's incircle is ~r/2, so a hole
+        // near the rim (a bolt hole at radius 30 inside an r40 cap) tests
+        // OUTSIDE the chord triangle and the containment check below wrongly
+        // rejects it — the new hole is never absorbed into the cap, its rim is
+        // left only on the cutter wall, and the wall strands as its own shell
+        // (#35: 2nd+ hole into a multi-inner-loop cap). Sampling each arc at
+        // SAMPLES points (mirrors `is_point_in_face`) makes containment exact.
+        let densify_uv = |edges: &[(EdgeId, bool)]| -> Option<Vec<(f64, f64)>> {
+            const SAMPLES: usize = 8;
+            let mut poly: Vec<(f64, f64)> = Vec::with_capacity(edges.len() * SAMPLES);
+            for &(eid, fwd) in edges {
+                let edge = model.edges.get(eid)?;
+                let curve = model.curves.get(edge.curve_id)?;
+                let (a, b) = (edge.param_range.start, edge.param_range.end);
+                // Emit SAMPLES points in loop-traversal order, excluding the end
+                // endpoint (supplied by the next edge's start) to avoid dupes.
+                for k in 0..SAMPLES {
+                    let f = k as f64 / SAMPLES as f64;
+                    let t = if fwd {
+                        a + (b - a) * f
+                    } else {
+                        b - (b - a) * f
+                    };
+                    let p = curve.point_at(t).ok()?;
+                    let (u, v) = surface.closest_point(&p, *tolerance).ok()?;
+                    poly.push((u, v));
                 }
             }
-            if !all_projected || poly.len() < 3 {
-                continue;
+            if poly.len() < 3 {
+                None
+            } else {
+                Some(poly)
             }
-            polygons.insert(idx, poly);
+        };
+
+        // 2. Project each fragment's boundary cycle to a densified UV polygon.
+        let mut polygons: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
+        for &idx in indices {
+            if let Some(poly) = densify_uv(&faces[idx].boundary_edges) {
+                polygons.insert(idx, poly);
+            }
         }
 
         // A candidate `inner` may only be nested into `outer` if it lies
@@ -10442,24 +10459,13 @@ fn merge_same_origin_fragments(
         // This is the #27 chained-union root cause.
         let inner_in_outer_hole = |outer_idx: usize, inner_poly: &[(f64, f64)]| -> bool {
             for hole in &faces[outer_idx].inner_loops {
-                let edge_ids: Vec<EdgeId> = hole.iter().map(|(e, _)| *e).collect();
-                let cyc = extract_cycle_vertices_3d(&edge_ids, model);
-                if cyc.len() < 3 {
-                    continue;
-                }
-                let mut hpoly = Vec::with_capacity(cyc.len());
-                let mut ok = true;
-                for pt in &cyc {
-                    match surface.closest_point(pt, *tolerance) {
-                        Ok((u, v)) => hpoly.push((u, v)),
-                        Err(_) => {
-                            ok = false;
-                            break;
-                        }
+                // Densified (arc-following) hole polygon — same reason as the
+                // fragment polygons above: a chord polygon of a curved hole rim
+                // is too small and would miss that `inner` lies in the hole.
+                if let Some(hpoly) = densify_uv(hole) {
+                    if uv_polygon_strictly_contains(&hpoly, inner_poly) {
+                        return true;
                     }
-                }
-                if ok && hpoly.len() >= 3 && uv_polygon_strictly_contains(&hpoly, inner_poly) {
-                    return true;
                 }
             }
             false
