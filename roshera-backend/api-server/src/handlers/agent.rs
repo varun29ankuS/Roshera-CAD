@@ -422,6 +422,131 @@ pub async fn render_part(
     }))
 }
 
+// ───────────────────── dimensioned multi-view (EYE-1) ───────────────
+
+/// A world-space 3-vector on the wire.
+#[derive(Debug, Clone, Serialize)]
+pub struct Vec3Wire {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+// Point3 is a type alias for Vector3 in the kernel, so one impl covers both.
+impl From<geometry_engine::math::Vector3> for Vec3Wire {
+    fn from(v: geometry_engine::math::Vector3) -> Self {
+        Self {
+            x: v.x,
+            y: v.y,
+            z: v.z,
+        }
+    }
+}
+
+/// One quadrant's orthographic camera matrix — the structured payload that
+/// makes coordinates RECOVERABLE: world `p` → pixel
+/// `(ox + (p·right)·scale, oy − (p·up)·scale)` within `cell`. The agent reads
+/// geometry from this transform + the frame, never by guessing from pixels.
+#[derive(Debug, Clone, Serialize)]
+pub struct ViewProjectionWire {
+    pub view: String,
+    pub label: String,
+    pub right: Vec3Wire,
+    pub up: Vec3Wire,
+    pub dir: Vec3Wire,
+    pub scale: f64,
+    pub ox: f64,
+    pub oy: f64,
+    /// (x, y, w, h) of this view's cell within the composite image.
+    pub cell: [usize; 4],
+}
+
+/// L×W×H extents (mm), X/Y/Z.
+#[derive(Debug, Clone, Serialize)]
+pub struct DimsWire {
+    pub l: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Wire shape for the dimensioned multi-view render.
+#[derive(Debug, Clone, Serialize)]
+pub struct DimensionedResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub units: String,
+    pub bbox_min: Vec3Wire,
+    pub bbox_max: Vec3Wire,
+    pub dims: DimsWire,
+    pub scale_bar_world: f64,
+    pub views: Vec<ViewProjectionWire>,
+}
+
+/// `GET /api/agent/parts/{id}/dimensioned` — EYE-1, the measuring eye.
+///
+/// A 2×2 (Front/Right/Top/Iso) dimensioned composite plus the per-view camera
+/// matrices, bbox, and L×W×H — measured off the tessellated mesh, never
+/// assumed. The image is the aligned aid; the JSON is authoritative. Read lock
+/// only (pure query). `404` unknown id / empty tessellation.
+pub async fn render_dimensioned(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<DimensionedResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
+    use geometry_engine::render::CanonicalView;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let model = model_handle.read().await;
+    let frame = render_dimensioned_multiview(&model, id as SolidId, &TessellationParams::default())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let view_name = |v: CanonicalView| -> String {
+        match v {
+            CanonicalView::Isometric => "iso",
+            CanonicalView::Front => "front",
+            CanonicalView::Top => "top",
+            CanonicalView::Right => "right",
+        }
+        .to_string()
+    };
+
+    Ok(Json(DimensionedResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        units: frame.units.to_string(),
+        bbox_min: frame.bbox_min.into(),
+        bbox_max: frame.bbox_max.into(),
+        dims: DimsWire {
+            l: frame.dims.0,
+            w: frame.dims.1,
+            h: frame.dims.2,
+        },
+        scale_bar_world: frame.scale_bar_world,
+        views: frame
+            .views
+            .iter()
+            .map(|vp| ViewProjectionWire {
+                view: view_name(vp.view),
+                label: vp.label.to_string(),
+                right: vp.right.into(),
+                up: vp.up.into(),
+                dir: vp.dir.into(),
+                scale: vp.scale,
+                ox: vp.ox,
+                oy: vp.oy,
+                cell: [vp.cell.0, vp.cell.1, vp.cell.2, vp.cell.3],
+            })
+            .collect(),
+    }))
+}
+
 // ───────────────────── pointer (the user's attention) ───────────────
 
 /// Wire shape for `GET /api/agent/pointer`: the user's latest viewport

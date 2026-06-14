@@ -571,3 +571,90 @@ fn parts_invariant_sweep() {
         fails.join("\n")
     );
 }
+
+/// EYE-1 perception invariants (#43): the dimensioned multi-view render must
+/// report dimensions that MATCH analytic intent, and every view's camera
+/// matrix must round-trip — project a known world point into its own cell and
+/// recover its in-plane coordinates by the inverse. This pins the "agent reads
+/// geometry from frame + camera matrix, never guessed from pixels" contract to
+/// the harness. A curated subset (not all 1114) keeps the render cost bounded.
+#[test]
+fn eye1_perception_invariants() {
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
+    use geometry_engine::tessellation::TessellationParams;
+
+    // (label, builder, analytic (L,W,H) AABB extents)
+    type Builder = Box<dyn Fn(&mut BRepModel) -> SolidId>;
+    let cases: Vec<(&str, Builder, (f64, f64, f64))> = vec![
+        (
+            "box",
+            Box::new(|m: &mut BRepModel| make_box(m, 40.0, 24.0, 16.0)),
+            (40.0, 24.0, 16.0),
+        ),
+        (
+            "cyl",
+            Box::new(|m: &mut BRepModel| make_cylinder(m, 12.0, 30.0)),
+            (24.0, 24.0, 30.0),
+        ),
+        (
+            "sphere",
+            Box::new(|m: &mut BRepModel| make_sphere(m, 18.0)),
+            (36.0, 36.0, 36.0),
+        ),
+    ];
+
+    for (name, build, (el, ew, eh)) in &cases {
+        let mut m = BRepModel::new();
+        let s = build(&mut m);
+        let f = render_dimensioned_multiview(&m, s, &TessellationParams::default())
+            .unwrap_or_else(|| panic!("{name}: render produced no frame"));
+
+        assert_eq!(f.views.len(), 4, "{name}: must produce all four views");
+
+        // (1) Rendered dims == analytic ± faceting tol.
+        assert!(
+            (f.dims.0 - el).abs() <= 0.03 * el + 1e-6,
+            "{name}: rendered L {} != analytic {el}",
+            f.dims.0
+        );
+        assert!(
+            (f.dims.1 - ew).abs() <= 0.03 * ew + 1e-6,
+            "{name}: rendered W {} != analytic {ew}",
+            f.dims.1
+        );
+        assert!(
+            (f.dims.2 - eh).abs() <= 0.03 * eh + 1e-6,
+            "{name}: rendered H {} != analytic {eh}",
+            f.dims.2
+        );
+
+        // (2) Camera round-trip on the bbox centre.
+        let center = Point3::new(
+            (f.bbox_min.x + f.bbox_max.x) * 0.5,
+            (f.bbox_min.y + f.bbox_max.y) * 0.5,
+            (f.bbox_min.z + f.bbox_max.z) * 0.5,
+        );
+        let q = Vector3::new(center.x, center.y, center.z);
+        for v in &f.views {
+            let (px, py, _d) = v.project(&center);
+            let (cx0, cy0, cw, ch) = v.cell;
+            assert!(
+                px >= cx0 as f64
+                    && px < (cx0 + cw) as f64
+                    && py >= cy0 as f64
+                    && py < (cy0 + ch) as f64,
+                "{name}/{}: centre projected ({px:.1},{py:.1}) outside cell {:?}",
+                v.label,
+                v.cell
+            );
+            let back = v.unproject_plane(px, py);
+            let qb = Vector3::new(back.x, back.y, back.z);
+            assert!(
+                (qb.dot(&v.right) - q.dot(&v.right)).abs() < 1e-6
+                    && (qb.dot(&v.up) - q.dot(&v.up)).abs() < 1e-6,
+                "{name}/{}: unproject did not recover in-plane coords",
+                v.label
+            );
+        }
+    }
+}
