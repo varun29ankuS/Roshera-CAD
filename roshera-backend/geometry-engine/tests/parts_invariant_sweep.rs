@@ -1081,15 +1081,17 @@ fn flanged_body(model: &mut BRepModel) -> SolidId {
     acc
 }
 
-/// S3 three-way inspection (VERIFY + DIMENSION + SECTION). PINNED by BOOL #84:
-/// the coaxial through-pierce union (body shaft through the flange disc) is
-/// watertight-but-non-manifold (nm=72 at the union; see diag_flanged_stages),
-/// and chained bolt-bores then add open edges. Deep boolean-core (corefinement
-/// at the pierce rim) — fresh-context. Flip on when #84 lands.
+/// S3 VERIFY + DIMENSION. Was pinned by #84 (union non-manifold — a tess
+/// artifact cleared by #58) and #35 (chained bolt-bores into a multi-hole cap
+/// dropped holes — fixed by densifying the merge + partition containment
+/// polygons to follow arcs). Now CLEAN: every boolean stage is watertight +
+/// valid B-Rep, and the fine multi-view render reproduces the 80×80×65 bbox.
+/// (The mid-flange SECTION of this 4-hole cap is pinned separately —
+/// `flanged_body_section_multihole_cdt_85b` — by a cdt-robustness issue on the
+/// many-contour section profile; the solid itself is sound.)
 #[test]
-#[ignore = "BOOL #84: coaxial through-pierce union is non-manifold"]
-fn flanged_body_verify_dimension_section() {
-    use geometry_engine::render::dimensioned::{render_dimensioned_multiview, render_section};
+fn flanged_body_verify_dimension() {
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
     use geometry_engine::tessellation::TessellationParams;
 
     let mut model = BRepModel::new();
@@ -1101,7 +1103,21 @@ fn flanged_body_verify_dimension_section() {
     assert!((f.dims.0 - 80.0).abs() < 0.6, "L={} expected 80", f.dims.0);
     assert!((f.dims.1 - 80.0).abs() < 0.6, "W={} expected 80", f.dims.1);
     assert!((f.dims.2 - 65.0).abs() < 0.6, "H={} expected 65", f.dims.2);
+}
 
+/// PIN (new this fire): sectioning the now-valid 4-bolt-hole flange cap through
+/// mid-flange yields the wrong area — the `cdt` crate panics (caught → empty
+/// faces) triangulating the many-contour section profile (annulus + 4 holes).
+/// The SOLID is sound (flanged_body_verify_dimension passes); this is a
+/// section/triangulation-robustness issue on a multi-hole planar profile, NOT a
+/// boolean defect. #[ignore] until the section CDT handles many contours.
+#[test]
+#[ignore = "section CDT panics on the 4-hole flange profile (solid is valid)"]
+fn flanged_body_section_multihole_cdt_85b() {
+    use geometry_engine::render::dimensioned::render_section;
+
+    let mut model = BRepModel::new();
+    let s = flanged_body(&mut model);
     let sec = render_section(
         &model,
         s,
