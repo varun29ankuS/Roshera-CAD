@@ -34,6 +34,19 @@ tessellates_nonmanifold_51` (#[ignore]). When fixed, flip it on and restore
 
 ## Section / clip
 
+### #85 🟡 Axial cylinder section (plane containing the axis) returns no caps
+Found by `section_area_sweep` (the #83-hardening grid). An AXIAL cut of a
+cylinder (plane contains the axis; normal ⟂ axis) returns NO caps
+(`render_section` → None) when it should be a `2√(r²−a²)·h` rectangle. The
+RADIAL cut (normal ∥ axis → disk) works, so it's orientation-specific: the
+cylinder∩axial-plane is 2 disjoint straight lines on the lateral face (vs a
+single circle radially), and the curved-face marching SSI misses that case — so
+only the planar cap chords (#83 path) survive and 2 parallel segments can't
+chain. Fix lane: analytic cylinder×plane SSI (circle / 1–2 lines / ellipse by
+orientation), tying to the analytic-SSI-arms work. Pinned:
+`parts_invariant_sweep.rs::axial_cylinder_section_returns_none_85` (#[ignore]).
+The sweep guards the 11 working cases (planar/radial/oblique/bored).
+
 ### #83 🟢 `section_solid_by_plane` ignores PLANAR faces (plain box → 0 caps)
 **FIXED** (research-grade, EYE-2 lane): the marching-square SSI fragmented a
 single straight cut line into 2 disjoint pieces on WIDE/SHORT planar faces (box
