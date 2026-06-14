@@ -181,51 +181,54 @@ fn check(
     }
 }
 
-/// TESS #51 (found by this sweep): a box + interpenetrating cylinder boss
-/// whose EXPOSED protruding wall is short (≤ ~8mm) yields a VALID 8-face
-/// B-Rep that tessellates NON-MANIFOLD (open=0, nm = 2×angular-segments).
-/// Deterministic; CHORD-INDEPENDENT (nm constant across chord 0.1→2.0, so not
-/// a ring-density/weld-tolerance issue); height-dependent (with base sunk 3mm,
-/// bh≤11 fails / bh≥12 passes → exposed wall = bh−overlap). The pierced top
-/// annulus is identical for all bh, so the defect is the short trimmed wall /
-/// its cap, not the annulus. Fix lives in the tessellation-weld lineage
-/// (cf #45/#69 normal-aware weld) — fresh-context. #[ignore] until #51 lands;
-/// flip on + restore boss_h=[10,25] in the sweep grid when fixed.
+/// TESS #51 — RESOLVED by TESS-PERF #58 (2026-06-14). A box + interpenetrating
+/// cylinder boss whose EXPOSED protruding wall was short (≤ ~8mm) yielded a VALID
+/// B-Rep that tessellated NON-MANIFOLD (open=0, nm = 2×angular-segments). It was
+/// a tessellation-TOPOLOGY artifact of the short trimmed wall, not a B-Rep
+/// defect: the curved-CDT Ruppert skinny pass over-refined the short developable
+/// wall and its rim didn't weld cleanly. #58 (developable Steiner collapse +
+/// fidelity-gated skinny refinement) cleared it. This is now a REGRESSION GUARD
+/// sweeping the entire formerly-failing range (exposed wall 1–8mm, two radii):
+/// every short boss must tessellate watertight AND manifold.
 #[test]
-#[ignore = "TESS #51: short-protrusion boss tessellates non-manifold (valid B-Rep)"]
-fn box_boss_short_protrusion_tessellates_nonmanifold_51() {
-    let mut m = BRepModel::new();
-    let bx = make_box(&mut m, 40.0, 40.0, 20.0); // top face at z = +10
-    let boss = sid_of(
-        TopologyBuilder::new(&mut m)
-            .create_cylinder_3d(
-                Point3::new(0.0, 0.0, 7.0),
-                Vector3::new(0.0, 0.0, 1.0),
-                6.0,
-                10.0,
+fn box_boss_short_protrusion_tessellates_manifold_51() {
+    const OVERLAP: f64 = 3.0;
+    // bh−OVERLAP = exposed wall ∈ {1,2,3,5,7,8} — all formerly nm; plus a tall
+    // control (bh=15 ⇒ 12mm) that always passed. Two radii (the report's r6/r12).
+    for &r in &[6.0_f64, 12.0] {
+        for &bh in &[4.0_f64, 5.0, 6.0, 8.0, 10.0, 11.0, 15.0] {
+            let mut m = BRepModel::new();
+            let bx = make_box(&mut m, 40.0, 40.0, 20.0); // top face at z = +10
+            let boss = sid_of(
+                TopologyBuilder::new(&mut m)
+                    .create_cylinder_3d(
+                        Point3::new(0.0, 0.0, 10.0 - OVERLAP), // base sunk OVERLAP below top
+                        Vector3::new(0.0, 0.0, 1.0),
+                        r,
+                        bh,
+                    )
+                    .expect("boss"),
+            );
+            let res = boolean_operation(
+                &mut m,
+                bx,
+                boss,
+                BooleanOp::Union,
+                BooleanOptions::default(),
             )
-            .expect("boss"), // exposed wall = 10 - 3 = 7mm → currently non-manifold
-    );
-    let res = boolean_operation(
-        &mut m,
-        bx,
-        boss,
-        BooleanOp::Union,
-        BooleanOptions::default(),
-    )
-    .expect("union runs");
-    let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
-    assert!(
-        v.is_valid,
-        "B-Rep is valid (the defect is mesh-only): {:?}",
-        v.errors
-    );
-    let r = manifold_report(&m, res, CHORD, WELD).expect("mesh");
-    assert_eq!(
-        (r.boundary_edges, r.nonmanifold_edges),
-        (0, 0),
-        "short-boss union must tessellate watertight+manifold once #51 lands"
-    );
+            .expect("union runs");
+            let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
+            assert!(v.is_valid, "r{r} bh{bh}: B-Rep invalid: {:?}", v.errors);
+            let rep = manifold_report(&m, res, CHORD, WELD).expect("mesh");
+            assert_eq!(
+                (rep.boundary_edges, rep.nonmanifold_edges),
+                (0, 0),
+                "r{r} bh{bh} (exposed {:.0}mm): short-boss union must tessellate \
+                 watertight+manifold (TESS #51 regression)",
+                bh - OVERLAP
+            );
+        }
+    }
 }
 
 /// DIAGNOSIS for the box-boss failure the sweep found: a cylinder boss whose
@@ -468,12 +471,11 @@ fn parts_invariant_sweep() {
     let boss_w = [40.0, 60.0];
     let boss_hb = [20.0, 30.0];
     let boss_r = [6.0, 12.0];
-    // boss heights chosen so the EXPOSED protruding wall (bh − OVERLAP) clears
-    // the ~8mm short-protrusion threshold of TESS #51 (a valid solid that
-    // tessellates non-manifold when the boss barely protrudes; pinned by
-    // box_boss_short_protrusion_tessellates_nonmanifold_51). Restore a short
-    // height (e.g. 10.0) here when #51 lands.
-    let boss_h = [15.0, 25.0];
+    // boss heights include a SHORT protrusion (bh=10 ⇒ exposed wall 7mm), which
+    // tessellated non-manifold (TESS #51) until TESS-PERF #58 cleared it; the
+    // short case is now re-covered here and guarded by
+    // box_boss_short_protrusion_tessellates_manifold_51.
+    let boss_h = [10.0, 25.0];
     for &w in &boss_w {
         for &hb in &boss_hb {
             for &r in &boss_r {
