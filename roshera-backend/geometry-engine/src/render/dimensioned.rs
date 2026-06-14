@@ -210,6 +210,263 @@ pub fn render_dimensioned_multiview(
     })
 }
 
+// ── EYE-2: section / clip-plane render ──────────────────────────────────────
+
+/// A dimensioned cross-section render: the solid cut by a plane, the cut face
+/// drawn TRUE-SHAPE (face-on, looking along the plane normal), with the section
+/// area + in-plane extents measured off the cap geometry. Like EYE-1 it carries
+/// its world→pixel transform (`right`/`up`/`scale`/`ox`/`oy`) so a point on the
+/// section is recoverable from frame + query, not guessed.
+#[derive(Debug, Clone)]
+pub struct SectionFrame {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u8>,
+    pub units: &'static str,
+    pub plane_origin: Point3,
+    pub plane_normal: Vector3,
+    /// Total cross-section area (sum of cap triangle areas), MEASURED.
+    pub section_area: f64,
+    /// In-plane extents of the section (along `right`, along `up`).
+    pub extent_u: f64,
+    pub extent_v: f64,
+    // World→pixel transform for the face-on view (camera matrix).
+    pub right: Vector3,
+    pub up: Vector3,
+    pub scale: f64,
+    pub ox: f64,
+    pub oy: f64,
+}
+
+impl SectionFrame {
+    pub fn to_png(&self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, self.width as u32, self.height as u32);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().map_err(|e| format!("png header: {e}"))?;
+            w.write_image_data(&self.pixels)
+                .map_err(|e| format!("png data: {e}"))?;
+        }
+        Ok(out)
+    }
+
+    /// World point → section-image pixel (the section's camera matrix).
+    pub fn project(&self, p: &Point3) -> (f64, f64) {
+        let q = Vector3::new(p.x, p.y, p.z);
+        (
+            self.ox + q.dot(&self.right) * self.scale,
+            self.oy - q.dot(&self.up) * self.scale,
+        )
+    }
+}
+
+/// Render the cross-section of `solid` cut by the plane (origin, normal).
+/// Reuses the kernel's `section_solid_by_plane` (the cap triangulation is the
+/// source of truth) and draws it true-shape. Returns `None` if the plane
+/// misses the solid or the basis is degenerate.
+pub fn render_section(
+    model: &BRepModel,
+    solid_id: SolidId,
+    plane_origin: Point3,
+    plane_normal: Vector3,
+    tolerance: crate::math::Tolerance,
+) -> Option<SectionFrame> {
+    use crate::operations::section::section_solid_by_plane;
+
+    let caps =
+        section_solid_by_plane(model, solid_id, plane_origin, plane_normal, tolerance).ok()?;
+    if caps.is_empty() {
+        return None;
+    }
+
+    let dir = plane_normal.normalize().ok()?;
+    let up_hint = if dir.z.abs() > 0.9 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let right = up_hint.cross(&dir).normalize().ok()?;
+    let up = dir.cross(&right).normalize().ok()?;
+
+    // Project all cap vertices to (u, v); accumulate area in 3D.
+    let mut u_min = f64::INFINITY;
+    let mut u_max = f64::NEG_INFINITY;
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    let mut section_area = 0.0;
+    for cap in &caps {
+        for v in &cap.vertices {
+            let q = Vector3::new(v.x, v.y, v.z);
+            let (cu, cv) = (q.dot(&right), q.dot(&up));
+            u_min = u_min.min(cu);
+            u_max = u_max.max(cu);
+            v_min = v_min.min(cv);
+            v_max = v_max.max(cv);
+        }
+        for tri in &cap.indices {
+            let a = &cap.vertices[tri[0] as usize];
+            let b = &cap.vertices[tri[1] as usize];
+            let c = &cap.vertices[tri[2] as usize];
+            let e1 = Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+            let e2 = Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z);
+            section_area += e1.cross(&e2).magnitude() * 0.5;
+        }
+    }
+    let span_u = (u_max - u_min).max(1e-9);
+    let span_v = (v_max - v_min).max(1e-9);
+
+    let w = CELL;
+    let h = CELL;
+    let inner_w = w as f64 - 2.0 * MARGIN;
+    let inner_h = h as f64 - 2.0 * MARGIN - LABEL_H;
+    let scale = (inner_w / span_u).min(inner_h / span_v);
+    let draw_x0 = MARGIN;
+    let draw_y0 = MARGIN + LABEL_H;
+    let ox = draw_x0 + (inner_w - span_u * scale) * 0.5 - u_min * scale;
+    let oy = draw_y0 + (inner_h - span_v * scale) * 0.5 + v_max * scale;
+
+    let mut pixels = vec![0u8; w * h * 3];
+    for px in pixels.chunks_exact_mut(3) {
+        px.copy_from_slice(&BG);
+    }
+
+    let project = |p: &Point3| -> (f64, f64) {
+        let q = Vector3::new(p.x, p.y, p.z);
+        (ox + q.dot(&right) * scale, oy - q.dot(&up) * scale)
+    };
+
+    // Fill cap triangles (steel) then stroke their boundary edges (darker).
+    let fill = [70, 110, 170];
+    let stroke = [30, 50, 90];
+    for cap in &caps {
+        for tri in &cap.indices {
+            let a = project(&cap.vertices[tri[0] as usize]);
+            let b = project(&cap.vertices[tri[1] as usize]);
+            let c = project(&cap.vertices[tri[2] as usize]);
+            fill_tri(&mut pixels, w, h, a, b, c, fill);
+        }
+        // Outline: stroke every edge that belongs to exactly one triangle
+        // (the section boundary, incl. inner holes).
+        use std::collections::HashMap;
+        let mut edge_count: HashMap<(u32, u32), u32> = HashMap::new();
+        for tri in &cap.indices {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                let e = if a < b { (a, b) } else { (b, a) };
+                *edge_count.entry(e).or_insert(0) += 1;
+            }
+        }
+        for (&(i, j), &cnt) in &edge_count {
+            if cnt == 1 {
+                let a = project(&cap.vertices[i as usize]);
+                let b = project(&cap.vertices[j as usize]);
+                draw_line(&mut pixels, w, h, a.0, a.1, b.0, b.1, stroke);
+            }
+        }
+    }
+
+    // Label + dimensions + area + scale bar.
+    draw_text(&mut pixels, w, h, MARGIN, 6.0, "SECTION", [20, 20, 20], 2);
+    let dim_label = format!("{} x {} mm", fmt_num(span_u), fmt_num(span_v));
+    draw_text(
+        &mut pixels,
+        w,
+        h,
+        MARGIN,
+        h as f64 - MARGIN + 4.0,
+        &dim_label,
+        [20, 20, 20],
+        1,
+    );
+    let area_label = format!("A {} mm2", fmt_num(section_area));
+    let aw = text_width(&area_label, 1);
+    draw_text(
+        &mut pixels,
+        w,
+        h,
+        w as f64 - MARGIN - aw,
+        h as f64 - MARGIN + 4.0,
+        &area_label,
+        [90, 30, 110],
+        1,
+    );
+    let bar_world = nice_number(span_u.max(span_v) / 4.0);
+    let bar_px = bar_world * scale;
+    let bx = MARGIN;
+    let by = h as f64 - MARGIN - 14.0;
+    draw_line(&mut pixels, w, h, bx, by, bx + bar_px, by, [20, 20, 20]);
+    for t in [0.0, 0.5, 1.0] {
+        let tx = bx + bar_px * t;
+        draw_line(&mut pixels, w, h, tx, by - 4.0, tx, by + 4.0, [20, 20, 20]);
+    }
+    draw_text(
+        &mut pixels,
+        w,
+        h,
+        bx,
+        by - 16.0,
+        &format!("{} mm", fmt_num(bar_world)),
+        [20, 20, 20],
+        1,
+    );
+
+    Some(SectionFrame {
+        width: w,
+        height: h,
+        pixels,
+        units: "mm",
+        plane_origin,
+        plane_normal: dir,
+        section_area,
+        extent_u: span_u,
+        extent_v: span_v,
+        right,
+        up,
+        scale,
+        ox,
+        oy,
+    })
+}
+
+/// Flat single-color triangle fill (no depth; section caps are coplanar).
+fn fill_tri(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    a: (f64, f64),
+    b: (f64, f64),
+    c: (f64, f64),
+    color: [u8; 3],
+) {
+    let area2 = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+    if area2.abs() < 1e-12 {
+        return;
+    }
+    let inv = 1.0 / area2;
+    let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as usize;
+    let max_x = (a.0.max(b.0).max(c.0).ceil() as usize).min(width.saturating_sub(1));
+    let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as usize;
+    let max_y = (a.1.max(b.1).max(c.1).ceil() as usize).min(height.saturating_sub(1));
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let fx = x as f64 + 0.5;
+            let fy = y as f64 + 0.5;
+            let w0 = ((b.0 - fx) * (c.1 - fy) - (b.1 - fy) * (c.0 - fx)) * inv;
+            let w1 = ((c.0 - fx) * (a.1 - fy) - (c.1 - fy) * (a.0 - fx)) * inv;
+            let w2 = 1.0 - w0 - w1;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                continue;
+            }
+            let p = (y * width + x) * 3;
+            pixels[p] = color[0];
+            pixels[p + 1] = color[1];
+            pixels[p + 2] = color[2];
+        }
+    }
+}
+
 /// Volume (divergence theorem over the welded mesh), surface area (summed
 /// triangle areas), and the volume centroid — all from the tessellated mesh.
 /// For a watertight, consistently-wound mesh these equal the polyhedron's exact
@@ -690,6 +947,9 @@ fn glyph(c: char) -> Option<[u8; 7]> {
         'C' => [
             0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
         ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
         ' ' => [0; 7],
         _ => return None,
     };
@@ -794,6 +1054,7 @@ fn draw_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::Tolerance;
     use crate::math::Vector3 as V3;
     use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
@@ -926,6 +1187,193 @@ mod tests {
             "overlay centroid {:?} vs kernel {:?} (dist {dc})",
             frame.centroid,
             com
+        );
+    }
+
+    /// A 60×60×20 plate with a central Ø20 through-bore — a clean solid whose
+    /// mid-plane section has a known analytic area.
+    fn bored_plate(model: &mut BRepModel) -> SolidId {
+        let plate = sid(TopologyBuilder::new(model)
+            .create_box_3d(60.0, 60.0, 20.0)
+            .expect("plate"));
+        let bore = sid(TopologyBuilder::new(model)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -20.0),
+                V3::new(0.0, 0.0, 1.0),
+                10.0,
+                80.0,
+            )
+            .expect("bore"));
+        boolean_operation(
+            model,
+            plate,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("through bore")
+    }
+
+    /// DIAG for the EYE-2 section finding: dump cap count + per-cap area for a
+    /// plain box, a plain cylinder, and the bored plate, to localize whether the
+    /// section op mishandles the outer boundary, holes, or both.
+    #[test]
+    fn diag_section_caps() {
+        use crate::operations::section::section_solid_by_plane;
+        let tri_area = |c: &crate::operations::section::SectionCap| -> f64 {
+            c.indices
+                .iter()
+                .map(|t| {
+                    let a = &c.vertices[t[0] as usize];
+                    let b = &c.vertices[t[1] as usize];
+                    let d = &c.vertices[t[2] as usize];
+                    let e1 = V3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+                    let e2 = V3::new(d.x - a.x, d.y - a.y, d.z - a.z);
+                    e1.cross(&e2).magnitude() * 0.5
+                })
+                .sum()
+        };
+        let cases: Vec<(&str, Box<dyn Fn(&mut BRepModel) -> SolidId>)> = vec![
+            (
+                "plain-box",
+                Box::new(|m: &mut BRepModel| {
+                    sid(TopologyBuilder::new(m)
+                        .create_box_3d(60.0, 60.0, 20.0)
+                        .expect("box"))
+                }),
+            ),
+            (
+                "plain-cyl",
+                Box::new(|m: &mut BRepModel| {
+                    sid(TopologyBuilder::new(m)
+                        .create_cylinder_3d(
+                            Point3::new(0.0, 0.0, -10.0),
+                            V3::new(0.0, 0.0, 1.0),
+                            10.0,
+                            20.0,
+                        )
+                        .expect("cyl"))
+                }),
+            ),
+            ("bored-plate", Box::new(|m: &mut BRepModel| bored_plate(m))),
+        ];
+        for (name, build) in &cases {
+            let mut m = BRepModel::new();
+            let s = build(&mut m);
+            let caps = section_solid_by_plane(
+                &m,
+                s,
+                Point3::new(0.0, 0.0, 0.0),
+                V3::new(0.0, 0.0, 1.0),
+                Tolerance::default(),
+            )
+            .expect("section");
+            eprintln!("{name}: {} caps", caps.len());
+            for (i, c) in caps.iter().enumerate() {
+                eprintln!(
+                    "  cap{i}: verts={} tris={} area={:.2}",
+                    c.vertices.len(),
+                    c.indices.len(),
+                    tri_area(c)
+                );
+            }
+        }
+    }
+
+    /// EYE-2 GREEN GUARD: the cross-section area measured off the kernel's cap
+    /// triangulation must match analytic. Mid-plane (z=0, +Z) section of a
+    /// cylinder (r10, z∈[−10,10]) is a Ø20 disk = 100π ≈ 314.16 mm². (Planar
+    /// faces are broken — see #83 — so the guard uses a curved section, which
+    /// works correctly.)
+    #[test]
+    fn eye2_section_area_matches_analytic() {
+        let mut model = BRepModel::new();
+        let cyl = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -10.0),
+                V3::new(0.0, 0.0, 1.0),
+                10.0,
+                20.0,
+            )
+            .expect("cyl"));
+        let f = render_section(
+            &model,
+            cyl,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Tolerance::default(),
+        )
+        .expect("section");
+
+        let expected = std::f64::consts::PI * 100.0;
+        let rel = (f.section_area - expected).abs() / expected;
+        assert!(
+            rel < 0.03,
+            "section area {} vs analytic {expected} (rel {rel})",
+            f.section_area
+        );
+        assert!(
+            (f.extent_u - 20.0).abs() < 0.5 && (f.extent_v - 20.0).abs() < 0.5,
+            "section extents {}×{} expected 20×20",
+            f.extent_u,
+            f.extent_v
+        );
+        // Recoverability: the section plane origin projects inside the image.
+        let (px, py) = f.project(&f.plane_origin);
+        assert!(px >= 0.0 && px < f.width as f64 && py >= 0.0 && py < f.height as f64);
+    }
+
+    /// PIN #83: sectioning a solid with PLANAR faces misses them — a plain
+    /// 60×60×20 box at z=0 should yield a 3600 mm² square section, but the
+    /// kernel returns no caps (render_section → None). The bored plate likewise
+    /// returns only the bore disk. Flip on when #83 (Plane-face SSI / UV-bounds)
+    /// lands.
+    #[test]
+    #[ignore = "#83: section_solid_by_plane ignores planar faces"]
+    fn section_planar_faces_missing_83() {
+        let mut model = BRepModel::new();
+        let s = bored_plate(&mut model);
+        let f = render_section(
+            &model,
+            s,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Tolerance::default(),
+        )
+        .expect("section should produce caps once #83 lands");
+        let expected = 60.0 * 60.0 - std::f64::consts::PI * 100.0;
+        let rel = (f.section_area - expected).abs() / expected;
+        assert!(
+            rel < 0.03,
+            "section area {} vs analytic {expected}",
+            f.section_area
+        );
+    }
+
+    #[test]
+    #[ignore = "writes a PNG for manual inspection"]
+    fn emit_section_png() {
+        let mut model = BRepModel::new();
+        let cyl = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -10.0),
+                V3::new(0.0, 0.0, 1.0),
+                10.0,
+                20.0,
+            )
+            .expect("cyl"));
+        let f = render_section(
+            &model,
+            cyl,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Tolerance::default(),
+        )
+        .expect("section");
+        std::fs::write("../_section.png", f.to_png().expect("png")).expect("write");
+        eprintln!(
+            "wrote ../_section.png area={:.1} extent {:.0}x{:.0}",
+            f.section_area, f.extent_u, f.extent_v
         );
     }
 
