@@ -100,24 +100,30 @@ lands.
 
 ## Boolean
 
-### #86 🔴 6-boss mount-plate chained booleans HANG the kernel (runaway loop)
-Building a 6-boss mounting plate live (box 140×100×16 + 6 bosses r9 unioned →
-OK, then boss-bore r4 differences at the 3×2 grid x{−40,0,40} y{−25,25}) sent
-the kernel into a RUNAWAY LOOP: ~1971 CPU-seconds on one core, then wedged
-(0% CPU, unresponsive, blocked on the model lock). Memory stayed LOW (84 MB WS /
-179 MB private) — so it's compute/iteration, not memory; same shape as the
-documented "f64::MAX → i32 grid saturation" hang (bounded RAM, ~10¹⁹ iterations).
-The 4-boss bolt-circle manifold (r5 bores / r10 bosses / 100×100) built CLEAN
-moments before, so the trigger is the specific 6-boss/r9/r4/140×100 cell, not the
-pattern. **ISOLATED (bool86_hang_isolation, #[ignore], thread+atomic+timeout):**
-completes 8 stages — plate + 6 boss unions + the FIRST boss-bore — then HANGS on
-stage 9, the SECOND chained boss-bore difference (a difference into an already-
-bored 6-boss solid). So the union is fine; the runaway is a chained DIFFERENCE on
-the many-faced result (a classification/marching loop that never terminates).
-BOOL-91 HANG class. FIX: bisect within the stage-9 difference pipeline, then bound the
-non-terminating loop in the boolean core (DEEP, fresh-context). Live impact:
-wedged the demo server; required kill+restart. Recipe: PowerShell build
-`borin107a` in this session.
+### #86 🟢 FIXED — 6-boss mount-plate chained booleans appeared to HANG the kernel
+**Root cause (2026-06-14): NOT a boolean bug and NOT an infinite loop — it was
+catastrophically-slow but finite OPERAND TESSELLATION, surfaced through the
+boolean classifier.** BOOL-ARCH-2's generalized-winding-number classification is
+default-ON; `classify_point_relative_to_solid` → `classify_point_gwn` →
+`solid_gwn_triangles` tessellated each operand with `TessellationParams::default()`
+(display-FINE). A single boss cylinder lateral (r9 h20) tessellates to ~20 000
+triangles in ~4 s via the curved-CDT Ruppert refinement; a 6-boss husk has ~12
+cylinder faces, so one operand tessellation ≈ 30–40 s and the chained build ran
+for minutes → "wedged" (the ~1971 CPU-s observed live). Earlier handoffs
+mis-pinned this to `extract_regions` degenerate loops / `classify_split_faces`;
+instrumented `ROSHERA_BOOL_TRACE` + `ROSHERA_TESS_TRACE` traces proved it is
+`tessellate_solid` on the operand.
+**FIX:** `solid_gwn_triangles` now uses `TessellationParams::coarse()` (the mesh
+feeds only the winding SIGN, never display/export; near-boundary points are
+resolved upstream analytically by the `is_point_in_face` coincident-loop before
+GWN runs). The 6-boss build: >120 s hang → **10.87 s, all 13 stages**.
+`bool86_hang_isolation` (#[ignore]) now PASSES (asserts termination). Verified no
+classification regression: poke-envelope (exact), determinism, brep-oracle,
+adversarial-intersection, volume-proptest, analytic-watertight, curved-CDT — all
+green. **Still-open downstream:** cylinder DISPLAY tessellation is over-dense/slow
+(the Ruppert pass over-refines the developable lateral) — affects render/export/
+perception; tracked as a TESS-PERF task (deep, deferred). See memory
+`bool86-gwn-tessellation-hang.md`.
 
 ### #84 🟡 Coaxial through-pierce union (shaft through disc) → non-manifold
 Found by the S3 flanged-body build. Union of two COAXIAL cylinders of different

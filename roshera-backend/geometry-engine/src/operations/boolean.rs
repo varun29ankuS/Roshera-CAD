@@ -10858,12 +10858,35 @@ fn solid_gwn_triangles_cached(model: &BRepModel, solid: SolidId) -> std::rc::Rc<
 /// sign-agnostic, so the tessellator's global orientation convention does
 /// not matter — only that the surface is closed (no gaps), which a valid
 /// operand satisfies.
+///
+/// COARSE tessellation, deliberately (BOOL #86). This mesh is consumed only
+/// by the winding-number sign — never displayed or exported — and the sign is
+/// robust to facet density for any point not within the faceting error of the
+/// surface. Points that ARE that close (coincident / near-tangent boundary
+/// contacts — the cases that actually need fidelity) are resolved upstream by
+/// the analytic `is_point_in_face` coincident-loop BEFORE GWN runs, so GWN only
+/// ever classifies points comfortably inside or outside. Using the production-
+/// FINE params here was the real BOOL #86 defect: every boolean operand was
+/// re-tessellated at display quality (a single boss cylinder → ~20k triangles
+/// over ~4 s via the curved-CDT refinement), so a chained multi-boss build's
+/// per-classification operand tessellation ran for minutes and the kernel
+/// appeared to hang. `coarse()` caps `max_segments`, which also bounds the
+/// Ruppert refinement budget, making operand tessellation cheap and bounded.
 fn solid_gwn_triangles(model: &BRepModel, solid: SolidId) -> Vec<[Point3; 3]> {
     let Some(solid_ref) = model.solids.get(solid) else {
         return Vec::new();
     };
-    let params = crate::tessellation::TessellationParams::default();
+    let params = crate::tessellation::TessellationParams::coarse();
+    if pipeline_trace_enabled() {
+        eprintln!("[bool]       gwn: tessellate_solid START solid={solid:?}");
+    }
     let mesh = crate::tessellation::tessellate_solid(solid_ref, model, &params);
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]       gwn: tessellate_solid DONE solid={solid:?} tris={}",
+            mesh.triangles.len()
+        );
+    }
     let mut tris = Vec::with_capacity(mesh.triangles.len());
     for t in &mesh.triangles {
         if let (Some(v0), Some(v1), Some(v2)) = (
