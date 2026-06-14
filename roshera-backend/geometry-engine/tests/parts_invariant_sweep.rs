@@ -1134,6 +1134,147 @@ fn flanged_body_section_multihole_85b() {
     );
 }
 
+/// TESS-PERF VERIFICATION HARNESS (agent-eye invariant). A DEVELOPABLE primitive
+/// — cylinder or cone, zero Gaussian curvature — must tessellate to O(angular)
+/// triangles, never O(angular²), and stay watertight + valid at every quality.
+/// This guards the regression where curved-CDT Ruppert refinement over-tessellated
+/// the developable lateral (a r9×h20 cylinder hit ~20k tris / ~341 ms; the
+/// quadratic blow-up); the budget + sub-quadratic-scaling assertions below would
+/// catch any recurrence. Watertight + valid are the correctness floor; the
+/// triangle budget is the perf floor.
+#[test]
+fn tessellation_developable_is_linear_watertight_valid() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    // (label, builder) for the two developable primitives.
+    let builders: Vec<(&str, Box<dyn Fn(&mut BRepModel) -> SolidId>)> = vec![
+        (
+            "cylinder",
+            Box::new(|m: &mut BRepModel| {
+                sid_of(
+                    TopologyBuilder::new(m)
+                        .create_cylinder_3d(
+                            Point3::new(0.0, 0.0, 0.0),
+                            Vector3::new(0.0, 0.0, 1.0),
+                            9.0,
+                            20.0,
+                        )
+                        .expect("cyl"),
+                )
+            }),
+        ),
+        (
+            "cone-frustum",
+            Box::new(|m: &mut BRepModel| {
+                sid_of(
+                    TopologyBuilder::new(m)
+                        .create_cone_3d(
+                            Point3::new(0.0, 0.0, 0.0),
+                            Vector3::new(0.0, 0.0, 1.0),
+                            9.0,
+                            4.0,
+                            20.0,
+                        )
+                        .expect("cone"),
+                )
+            }),
+        ),
+    ];
+
+    for (label, build) in &builders {
+        let mut m = BRepModel::new();
+        let s = build(&mut m);
+
+        // Correctness floor: watertight mesh + valid B-Rep.
+        let rep = manifold_report(&m, s, CHORD, WELD).unwrap_or_else(|| panic!("{label}: no mesh"));
+        assert_eq!(
+            (rep.boundary_edges, rep.nonmanifold_edges),
+            (0, 0),
+            "{label}: not watertight (open={} nm={})",
+            rep.boundary_edges,
+            rep.nonmanifold_edges
+        );
+        let v = validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard);
+        assert!(v.is_valid, "{label}: invalid B-Rep: {:?}", v.errors);
+
+        // Perf floor: O(angular) triangle budgets. A developable lateral is
+        // angular_segments × O(1) axial rows; the caps add ~angular each. The
+        // bug made it angular², i.e. ~20k at default — these budgets are a few×
+        // the healthy count and far below any quadratic blow-up.
+        let n_default = tessellate_solid(
+            m.solids.get(s).expect("solid"),
+            &m,
+            &TessellationParams::default(),
+        )
+        .triangles
+        .len();
+        let n_fine = tessellate_solid(
+            m.solids.get(s).expect("solid"),
+            &m,
+            &TessellationParams::fine(),
+        )
+        .triangles
+        .len();
+        assert!(
+            n_default <= 3_000,
+            "{label}: default tessellation {n_default} tris exceeds O(angular) budget 3000 \
+             (quadratic-refinement regression?)"
+        );
+        assert!(
+            n_fine <= 12_000,
+            "{label}: fine tessellation {n_fine} tris exceeds O(angular) budget 12000 \
+             (quadratic-refinement regression?)"
+        );
+        // Sub-quadratic scaling: fine has ~2× the angular resolution of default,
+        // so a LINEAR developable grows ~2–4×; a QUADRATIC one would grow ~4–16×.
+        // Guard well below the quadratic regime.
+        assert!(
+            n_fine <= n_default.saturating_mul(8),
+            "{label}: fine/default tri ratio {n_fine}/{n_default} is super-linear \
+             (developable must scale ~linearly with angular resolution)"
+        );
+    }
+}
+
+/// TESS-PERF diagnostic: time tessellating a LONE cylinder (r9 h20) at each
+/// quality. A cylinder is the simplest curved primitive; hundreds of ms / k-tris
+/// is wrong. Run with ROSHERA_TESS_TRACE=1 for the per-face + weld breakdown.
+#[test]
+#[ignore = "TESS-PERF cylinder timing diagnostic"]
+fn diag_cylinder_tess_timing() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+    let mut m = BRepModel::new();
+    let cyl = sid_of(
+        TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                9.0,
+                20.0,
+            )
+            .expect("cyl"),
+    );
+    for (label, params) in [
+        ("default", TessellationParams::default()),
+        ("coarse", TessellationParams::coarse()),
+    ] {
+        let solid = m.solids.get(cyl).expect("solid");
+        // Warm + timed (3 runs, report min to dodge first-call noise).
+        let mut best = std::time::Duration::MAX;
+        let mut tris = 0;
+        let mut verts = 0;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let mesh = tessellate_solid(solid, &m, &params);
+            best = best.min(t.elapsed());
+            tris = mesh.triangles.len();
+            verts = mesh.vertices.len();
+        }
+        eprintln!("[cyltime] {label}: {tris} tris {verts} verts, min {best:?}");
+    }
+}
+
 #[test]
 #[ignore = "writes PNGs for manual inspection"]
 fn emit_flanged_body_png() {
