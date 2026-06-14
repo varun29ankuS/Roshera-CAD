@@ -422,6 +422,27 @@ pub async fn render_part(
     }))
 }
 
+// ───────────────────── coverage / ambiguity (EYE-5) ─────────────────
+
+/// `GET /api/agent/parts/{id}/coverage` — EYE-5 honesty protocol.
+///
+/// Reports which faces the 4 standard views actually show vs leave unseen, so
+/// an agent knows when it must request another angle instead of assuming full
+/// coverage. Read lock only; `404` on unknown id / empty tessellation.
+pub async fn part_coverage(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<geometry_engine::render::dimensioned::CoverageReport>, StatusCode> {
+    use geometry_engine::render::dimensioned::coverage_report;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let model = model_handle.read().await;
+    coverage_report(&model, id as SolidId, &TessellationParams::default())
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 // ───────────────────── features + measure (EYE-4) ───────────────────
 
 /// Wire shape for `GET /api/agent/parts/{id}/features`: every face's analytic
