@@ -32,9 +32,13 @@
 //! - The AI tool routing layer lives in `ai-integration::tool_dispatch`
 //!   and `ai-integration::executor`; this module is provider-agnostic.
 
+pub mod features;
 pub mod part;
 pub mod query;
 
+pub use features::{
+    cylindrical_diameters, distance, extract_features, point_to_plane_signed, FeatureDim,
+};
 pub use part::{
     format_datum_kind, format_datum_subkind, format_location_oneliner, DatumSummary,
     DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter, MassPropertiesReport,

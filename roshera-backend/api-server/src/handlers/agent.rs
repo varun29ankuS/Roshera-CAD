@@ -422,6 +422,50 @@ pub async fn render_part(
     }))
 }
 
+// ───────────────────── features + measure (EYE-4) ───────────────────
+
+/// Wire shape for `GET /api/agent/parts/{id}/features`: every face's analytic
+/// feature dimensions plus a distinct-diameter summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeaturesResponse {
+    pub features: Vec<geometry_engine::readable::FeatureDim>,
+    /// Distinct cylindrical (bore/boss) diameters present, each with a count.
+    pub diameters: Vec<DiameterCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiameterCount {
+    pub diameter: f64,
+    pub count: usize,
+}
+
+/// `GET /api/agent/parts/{id}/features` — EYE-4 feature extraction.
+///
+/// Reads analytic feature sizes straight off each face (cylinder diameters +
+/// axes, plane normals) so an agent can ask "what holes/bosses and how big"
+/// without measuring pixels. Read lock only; `404` on unknown id.
+pub async fn part_features(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<FeaturesResponse>, StatusCode> {
+    use geometry_engine::readable::{cylindrical_diameters, extract_features};
+
+    let model = model_handle.read().await;
+    if model.solids.get(id as SolidId).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let features = extract_features(&model, id as SolidId);
+    let diameters = cylindrical_diameters(&model, id as SolidId)
+        .into_iter()
+        .map(|(diameter, count)| DiameterCount { diameter, count })
+        .collect();
+    Ok(Json(FeaturesResponse {
+        features,
+        diameters,
+    }))
+}
+
 // ───────────────────── dimensioned multi-view (EYE-1) ───────────────
 
 /// A world-space 3-vector on the wire.

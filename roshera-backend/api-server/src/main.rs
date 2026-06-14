@@ -6313,6 +6313,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::render_dimensioned),
         )
         .route(
+            "/api/agent/parts/{id}/features",
+            get(handlers::agent::part_features),
+        )
+        .route(
             "/api/agent/pointer",
             get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),
         )
