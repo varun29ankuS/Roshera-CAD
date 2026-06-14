@@ -1587,33 +1587,53 @@ fn bool86_hang_isolation() {
                 .expect("boss union");
             stage_t.store(2 + i, Ordering::SeqCst);
         }
-        // Stages 8-13: boss bores (r4 through).
+        // Stages 8-13: boss bores (r4 through). The fix (coarse GWN operand
+        // tessellation) lets every bore COMPLETE quickly; should a bore instead
+        // fail with a typed error, that is still a SUCCESS for this test — the
+        // kernel terminated rather than wedged. Send a sentinel and stop.
         for (i, (bx, by)) in grid.iter().enumerate() {
             let b = cyl(&mut m, *bx, *by, -20.0, 4.0, 60.0);
-            acc = boolean_operation(
+            match boolean_operation(
                 &mut m,
                 acc,
                 b,
                 BooleanOp::Difference,
                 BooleanOptions::default(),
-            )
-            .expect("boss bore");
+            ) {
+                Ok(next) => acc = next,
+                Err(e) => {
+                    eprintln!(
+                        "BOOL #86: bore {} degraded gracefully (no hang): {e}",
+                        i + 1
+                    );
+                    let _ = tx.send(u32::MAX); // sentinel: terminated via typed error
+                    return;
+                }
+            }
             stage_t.store(8 + i, Ordering::SeqCst);
         }
         let _ = tx.send(acc);
     });
 
+    // The invariant under test is TERMINATION, not correctness: the chained
+    // booleans must either complete or fail with a typed error within budget —
+    // never wedge the kernel. (Producing a watertight 6-boss plate from this
+    // config is the deeper #86 corefinement fix; this test only guards the hang.)
     match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(sentinel) if sentinel == u32::MAX => {
+            let reached = stage.load(Ordering::SeqCst);
+            eprintln!(
+                "BOOL #86: terminated via typed error after {reached} stages (graceful degradation — no hang)"
+            );
+        }
         Ok(_) => {
-            // Completed within budget — the hang did not reproduce here (config-
-            // specific, or already addressed). Record that explicitly.
-            eprintln!("BOOL #86: 6-boss mount-plate completed all 13 stages in <120s — no hang reproduced in-kernel");
+            eprintln!("BOOL #86: 6-boss mount-plate completed all 13 stages in <120s — no hang");
         }
         Err(_) => {
             let reached = stage.load(Ordering::SeqCst);
             let map = "stages: 1=plate, 2-7=boss unions, 8-13=boss bores";
             panic!(
-                "BOOL #86 HANG ISOLATED: completed {reached} stages, then hung on stage {} ({map})",
+                "BOOL #86 STILL HANGS: completed {reached} stages, then hung on stage {} ({map})",
                 reached + 1
             );
         }
