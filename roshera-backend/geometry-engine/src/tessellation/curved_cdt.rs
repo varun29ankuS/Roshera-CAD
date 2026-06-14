@@ -1238,18 +1238,40 @@ pub(crate) fn tessellate_curved_cdt(
     // Steiners that encroach on boundary segments (option (c): never
     // mutate the boundary, per the EdgeSampleCache contract). Loops
     // until convergence (empty augmentation set) or RUPPERT_MAX_PASSES.
-    let (final_pts2d, final_triangles) = refine_to_convergence(
-        &outer,
-        &inners,
-        &inner_polygons,
-        steiner,
-        pts2d,
-        triangles,
-        surface,
-        face,
-        model,
-        params,
+    //
+    // DEVELOPABLE FAST-PATH (TESS-PERF cylinder/cone). A ruled, zero-Gaussian-
+    // curvature lateral (cylinder, cone) is already chord-accurate after the
+    // initial CDT: the cap/trim rims are sampled to `chord_tolerance` by the
+    // EdgeSampleCache, and the ruled direction is exactly planar, so no flat
+    // facet between boundary samples can exceed tolerance. Refinement therefore
+    // finds NO real violation — but its per-triangle fidelity scan
+    // (`closest_point` + 4× `normal_at` per triangle, every pass) dominated the
+    // cost: a lone r9×h20 cylinder lateral was 596 tris in ~28 ms (~47 µs/tri),
+    // and a display-quality one ~20 k tris / ~340 ms. Skip refinement for these
+    // surfaces; the curved poke matrix + analytic-watertight + HARNESS-1000
+    // guard correctness. Doubly-curved surfaces (sphere/torus/NURBS) still
+    // refine.
+    use crate::primitives::surface::SurfaceType;
+    let developable = matches!(
+        surface.surface_type(),
+        SurfaceType::Cylinder | SurfaceType::Cone
     );
+    let (final_pts2d, final_triangles) = if developable {
+        (pts2d, triangles)
+    } else {
+        refine_to_convergence(
+            &outer,
+            &inners,
+            &inner_polygons,
+            steiner,
+            pts2d,
+            triangles,
+            surface,
+            face,
+            model,
+            params,
+        )
+    };
 
     // Step 5 — mesh emission. Vertex base offset must be recorded so
     // triangle indices are rebased into `mesh.vertices` numbering.
