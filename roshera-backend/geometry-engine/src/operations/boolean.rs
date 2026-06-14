@@ -444,6 +444,22 @@ pub fn boolean_operation(
             merged_faces.iter().map(|f| f.inner_loops.len()).sum::<usize>(),
         ));
 
+        // Same-Domain cull (#32): drop anti-coincident internal faces before
+        // selection, so a coincident face buried between the two operands'
+        // interiors (e.g. the box-top disc under a flush-based boss) doesn't
+        // survive and create a 3-faces-per-edge non-manifold rim.
+        let merged_faces = cull_internal_coincident_faces(
+            model,
+            merged_faces,
+            solid_a,
+            solid_b,
+            &options.common.tolerance,
+        );
+        pipeline_trace(format_args!(
+            "stage=cull_internal_coincident fragments={}",
+            merged_faces.len()
+        ));
+
         // Step 4: Select faces based on boolean operation
         let selected_faces = select_faces_for_operation(&merged_faces, operation, solid_a, solid_b);
         pipeline_trace(format_args!(
@@ -12310,6 +12326,69 @@ fn is_point_in_face(
     }
 
     Ok(crossings % 2 == 1)
+}
+
+/// Same-Domain cull (#32 / #27 family): drop ANTI-coincident internal faces.
+///
+/// When a face is coincident (`OnBoundary`) with a face of the other solid, the
+/// two operands either share material on the SAME side of the plane (same-
+/// domain — a real boundary of the result; `select_faces_for_operation`'s
+/// `OnBoundary → from_a` rule keeps one copy and dedups the other) OR they sit on
+/// OPPOSITE sides (anti-domain — the face is sandwiched between A's interior and
+/// B's interior, i.e. INTERNAL to the union, and must be removed). The selection
+/// rule alone keeps the `from_a` copy unconditionally, so an anti-coincident
+/// internal face survives and its rim ends up shared by THREE faces → odd Euler /
+/// non-manifold. The canonical case: a cylinder boss whose base plane is
+/// coincident with the box top it sits on (#32) — the box-top disc under the boss
+/// is internal but was kept.
+///
+/// Discriminator (orientation-independent): probe one side of the face,
+/// `p + ε·n`, and classify it against BOTH solids. If `inside(A) XOR inside(B)`
+/// the solids are on opposite sides → internal → drop. If they agree, the side
+/// is either shared material or shared void → same-domain boundary → keep.
+/// Only `OnBoundary` faces are examined; Inside/Outside faces pass through.
+fn cull_internal_coincident_faces(
+    model: &BRepModel,
+    faces: Vec<SplitFace>,
+    solid_a: SolidId,
+    solid_b: SolidId,
+    tolerance: &Tolerance,
+) -> Vec<SplitFace> {
+    const EPS: f64 = 1.0e-3;
+    faces
+        .into_iter()
+        .filter(|face| {
+            if !matches!(face.classification, FaceClassification::OnBoundary) {
+                return true;
+            }
+            let Ok(p) = get_face_interior_point(model, face) else {
+                return true;
+            };
+            let Some(surface) = model.surfaces.get(face.surface) else {
+                return true;
+            };
+            let Ok((u, v)) = surface.closest_point(&p, *tolerance) else {
+                return true;
+            };
+            let Ok(sp) = surface.evaluate_full(u, v) else {
+                return true;
+            };
+            let Ok(n) = sp.normal.normalize() else {
+                return true;
+            };
+            let probe = Point3::new(p.x + n.x * EPS, p.y + n.y * EPS, p.z + n.z * EPS);
+            let in_a = matches!(
+                classify_point_relative_to_solid(model, probe, solid_a, tolerance),
+                Ok(FaceClassification::Inside)
+            );
+            let in_b = matches!(
+                classify_point_relative_to_solid(model, probe, solid_b, tolerance),
+                Ok(FaceClassification::Inside)
+            );
+            // Anti-domain (opposite sides) ⇒ internal ⇒ drop. Same-domain ⇒ keep.
+            in_a == in_b
+        })
+        .collect()
 }
 
 /// Select faces based on boolean operation type

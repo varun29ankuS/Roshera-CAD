@@ -273,13 +273,13 @@ fn box_boss_interpenetrating_unions_cleanly() {
     );
 }
 
-/// The coincident-face counterpart: boss base coplanar with the box top face.
-/// This is the deep #32 Same-Domain unification defect — it leaves 3 faces
-/// sharing the rim edge (odd Euler). #[ignore]'d until #32 lands; flip it on
-/// when the Same-Domain stage exists.
+/// #32 FIXED (Same-Domain coincident-face union): boss base coplanar with the
+/// box top. Before the Same-Domain cull the box-top disc under the boss was an
+/// anti-coincident INTERNAL face kept by selection → the rim was shared by 3
+/// faces (odd Euler / non-manifold). Now the cull drops it; the result is valid
+/// + watertight. Running guard (validity is mesh-independent; manifold the mesh).
 #[test]
-#[ignore = "KNOWN_BUGS #32: coincident-face union (Same-Domain unification) not yet implemented"]
-fn box_boss_coincident_base_is_known_nonmanifold_32() {
+fn box_boss_coincident_base_union_valid_32() {
     let mut m = BRepModel::new();
     let bx = make_box(&mut m, 60.0, 60.0, 30.0); // top face at z = +15
     let boss = sid_of(
@@ -301,10 +301,14 @@ fn box_boss_coincident_base_is_known_nonmanifold_32() {
     )
     .expect("union runs");
     let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
-    assert!(
-        v.is_valid,
-        "coincident-face union should be valid once #32 lands: {:?}",
-        v.errors
+    assert!(v.is_valid, "coincident-face union invalid: {:?}", v.errors);
+    let rep = manifold_report(&m, res, CHORD, WELD).expect("mesh");
+    assert_eq!(
+        (rep.boundary_edges, rep.nonmanifold_edges),
+        (0, 0),
+        "coincident-face union not watertight (open={} nm={})",
+        rep.boundary_edges,
+        rep.nonmanifold_edges
     );
 }
 
