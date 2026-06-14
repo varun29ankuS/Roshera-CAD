@@ -652,6 +652,56 @@ pub async fn part_coverage(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+// ───────────────────── perception (feedback-as-default) ─────────────
+
+/// A part's self-reported soundness — watertight + valid + dims — queryable for
+/// ANY existing solid, not just at mutation time. Feedback-as-default: the agent
+/// (and the panel) can read current truth on demand without re-running the op.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartPerception {
+    pub solid_id: u32,
+    pub watertight: bool,
+    pub open_edges: usize,
+    pub nonmanifold_edges: usize,
+    pub valid: bool,
+    /// [L, W, H] world extents, or null if degenerate.
+    pub dims: Option<[f64; 3]>,
+}
+
+/// `GET /api/agent/parts/{id}/perception` — the part's validity in one cheap
+/// query: watertight (open=0 ∧ nonmanifold=0), valid B-Rep, and L×W×H. Read
+/// lock only; `404` on unknown id / empty tessellation.
+pub async fn part_perception(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<PartPerception>, StatusCode> {
+    use geometry_engine::harness::watertight::manifold_report;
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+
+    let model = model_handle.read().await;
+    let sid = id as SolidId;
+    if model.solids.get(sid).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
+    let valid =
+        validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard).is_valid;
+    let dims = model.solid_world_bbox(sid).map(|b| {
+        let s = b.size();
+        [s.x, s.y, s.z]
+    });
+    Ok(Json(PartPerception {
+        solid_id: id,
+        watertight: report.boundary_edges == 0 && report.nonmanifold_edges == 0,
+        open_edges: report.boundary_edges,
+        nonmanifold_edges: report.nonmanifold_edges,
+        valid,
+        dims,
+    }))
+}
+
 // ───────────────────── features + measure (EYE-4) ───────────────────
 
 /// Wire shape for `GET /api/agent/parts/{id}/features`: every face's analytic

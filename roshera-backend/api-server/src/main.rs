@@ -6447,6 +6447,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::part_features),
         )
         .route(
+            "/api/agent/parts/{id}/perception",
+            get(handlers::agent::part_perception),
+        )
+        .route(
             "/api/agent/parts/{id}/coverage",
             get(handlers::agent::part_coverage),
         )
