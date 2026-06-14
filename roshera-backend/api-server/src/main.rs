@@ -6321,6 +6321,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::part_coverage),
         )
         .route(
+            "/api/agent/parts/{id}/section",
+            get(handlers::agent::part_section),
+        )
+        .route(
             "/api/agent/parts/{id}/best-view",
             get(handlers::agent::part_best_view),
         )

@@ -1518,18 +1518,13 @@ mod tests {
     #[test]
     #[ignore = "writes a PNG for manual inspection"]
     fn emit_section_png() {
+        // Bored plate mid-section: a 60×60 square with a Ø20 round hole — the
+        // visual proof of the #83 planar-face section fix.
         let mut model = BRepModel::new();
-        let cyl = sid(TopologyBuilder::new(&mut model)
-            .create_cylinder_3d(
-                Point3::new(0.0, 0.0, -10.0),
-                V3::new(0.0, 0.0, 1.0),
-                10.0,
-                20.0,
-            )
-            .expect("cyl"));
+        let part = bored_plate(&mut model);
         let f = render_section(
             &model,
-            cyl,
+            part,
             Point3::new(0.0, 0.0, 0.0),
             Vector3::new(0.0, 0.0, 1.0),
             Tolerance::default(),

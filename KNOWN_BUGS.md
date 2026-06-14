@@ -87,6 +87,22 @@ lands.
 
 ## Boolean
 
+### #84 🟡 Coaxial through-pierce union (shaft through disc) → non-manifold
+Found by the S3 flanged-body build. Union of two COAXIAL cylinders of different
+radii where the slim body (r20) passes fully THROUGH a wider flange disc (r40),
+interpenetrating (NOT coincident → not #32), is watertight but NON-MANIFOLD:
+`diag_flanged_stages` shows the bare body+flange union at `open=0 nm=72`. The
+body pierces BOTH planar flange faces (top + bottom annuli) while coaxial; nm
+edges appear at the pierce rims. (Distinct from the housing/box-boss case where
+a cylinder pierces ONE planar face — that's clean.) Downstream: chained
+bolt-circle differences on the already-nm solid then add open edges (bolt1=504,
+bolt2=1008, bolt3=1512). ROOT = the coaxial through-pierce union; fix it and the
+downstream likely clears. Boolean split/merge/classify core (#32/#35/#27
+family) — DEEP, fresh-context only. Research lane: robust corefinement /
+shared-edge imprint at the pierce rim (Cherchi–Attene; CGAL corefinement).
+Pinned: `parts_invariant_sweep.rs::flanged_body_verify_dimension_section` +
+`diag_flanged_stages` (#[ignore]).
+
 ### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall
 Found live (ladder step 6, bearing housing). `plate ∪ analytic-cylinder boss`
 (r30, interpenetrating) is CLEAN (open=0). Differencing a COAXIAL analytic

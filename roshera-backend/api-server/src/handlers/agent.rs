@@ -422,6 +422,97 @@ pub async fn render_part(
     }))
 }
 
+// ───────────────────── section / clip (EYE-2) ───────────────────────
+
+/// Query for `GET /api/agent/parts/{id}/section` — a cutting plane (point +
+/// normal). Defaults to the world XY plane through the origin.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SectionQuery {
+    pub px: Option<f64>,
+    pub py: Option<f64>,
+    pub pz: Option<f64>,
+    pub nx: Option<f64>,
+    pub ny: Option<f64>,
+    pub nz: Option<f64>,
+}
+
+/// The section's in-plane camera transform (true-shape, looking along normal).
+#[derive(Debug, Clone, Serialize)]
+pub struct SectionCameraWire {
+    pub right: Vec3Wire,
+    pub up: Vec3Wire,
+    pub scale: f64,
+    pub ox: f64,
+    pub oy: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SectionResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub units: String,
+    pub plane_origin: Vec3Wire,
+    pub plane_normal: Vec3Wire,
+    /// Measured cross-section area (mm²).
+    pub section_area: f64,
+    pub extent_u: f64,
+    pub extent_v: f64,
+    pub camera: SectionCameraWire,
+}
+
+/// `GET /api/agent/parts/{id}/section?px&py&pz&nx&ny&nz` — EYE-2.
+///
+/// Cuts the solid by the plane and returns a true-shape, dimensioned
+/// cross-section render plus the measured area/extents and the in-plane camera
+/// (so section points are recoverable from frame + query). Read lock only;
+/// `404` if the plane misses the solid or the id is unknown.
+pub async fn part_section(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<SectionQuery>,
+) -> Result<Json<SectionResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::math::{Point3, Tolerance, Vector3};
+    use geometry_engine::render::dimensioned::render_section;
+
+    let origin = Point3::new(
+        q.px.unwrap_or(0.0),
+        q.py.unwrap_or(0.0),
+        q.pz.unwrap_or(0.0),
+    );
+    let normal = Vector3::new(
+        q.nx.unwrap_or(0.0),
+        q.ny.unwrap_or(0.0),
+        q.nz.unwrap_or(1.0),
+    );
+
+    let model = model_handle.read().await;
+    let f = render_section(&model, id as SolidId, origin, normal, Tolerance::default())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let png = f.to_png().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(SectionResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: f.width,
+        height: f.height,
+        units: f.units.to_string(),
+        plane_origin: f.plane_origin.into(),
+        plane_normal: f.plane_normal.into(),
+        section_area: f.section_area,
+        extent_u: f.extent_u,
+        extent_v: f.extent_v,
+        camera: SectionCameraWire {
+            right: f.right.into(),
+            up: f.up.into(),
+            scale: f.scale,
+            ox: f.ox,
+            oy: f.oy,
+        },
+    }))
+}
+
 // ───────────────────── viewpoint selection (EYE-6) ──────────────────
 
 /// `GET /api/agent/parts/{id}/best-view` — EYE-6 active perception.
