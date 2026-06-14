@@ -1399,3 +1399,143 @@ fn axial_cylinder_section_returns_none_85() {
         f.section_area
     );
 }
+
+// ── S3 rung 5: L-bracket + FULL 7-endpoint eye dogfood ───────────────────────
+
+/// An L-bracket: a horizontal plate (80×50×12) + a vertical plate (80×12×50)
+/// standing on its back edge (interpenetrating union, partial overlap — NOT a
+/// coaxial pierce / coincident face), with two Ø8 through-holes in the
+/// horizontal plate. New topology vs the ribbed bracket; avoids every pinned
+/// defect (#84/#32/#51/#82/#85).
+fn l_bracket(model: &mut BRepModel) -> SolidId {
+    use geometry_engine::math::Matrix4;
+    use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+
+    let horiz = make_box(model, 80.0, 50.0, 12.0); // x[-40,40] y[-25,25] z[-6,6]
+    let vert = make_box(model, 80.0, 12.0, 50.0); // centred; translate to the back, standing up
+    transform_solid(
+        model,
+        vert,
+        Matrix4::from_translation(&Vector3::new(0.0, -19.0, 19.0)),
+        TransformOptions::default(),
+    )
+    .expect("position vertical plate"); // → y[-25,-13] z[-6,44]
+    let mut acc = boolean_operation(
+        model,
+        horiz,
+        vert,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("L union");
+    for bx in [-25.0, 25.0] {
+        let bore = sid_of(
+            TopologyBuilder::new(model)
+                .create_cylinder_3d(
+                    Point3::new(bx, 10.0, -10.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    4.0,
+                    32.0,
+                )
+                .expect("bore"),
+        );
+        acc = boolean_operation(
+            model,
+            acc,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("mounting bore");
+    }
+    acc
+}
+
+/// FULL EYE DOGFOOD on the L-bracket — the product end-to-end. Every one of the
+/// six perception queries asserted against analytic ground truth.
+#[test]
+fn l_bracket_full_eye_dogfood() {
+    use geometry_engine::readable::extract_features;
+    use geometry_engine::render::dimensioned::{
+        coverage_report, render_dimensioned_multiview, render_section,
+    };
+    use geometry_engine::render::viewpoint::analyze_viewpoints;
+    use geometry_engine::tessellation::TessellationParams;
+    let tess = TessellationParams::default();
+
+    let mut m = BRepModel::new();
+    let s = l_bracket(&mut m);
+
+    // 1. VERIFY watertight + valid.
+    assert_clean(&m, s, "l-bracket");
+
+    // 2. DIMENSION: bbox 80 × 50 × 50 (x[-40,40], y[-25,25], z[-6,44]).
+    let f = render_dimensioned_multiview(&m, s, &tess).expect("dimensioned");
+    assert!((f.dims.0 - 80.0).abs() < 0.6, "L={}", f.dims.0);
+    assert!((f.dims.1 - 50.0).abs() < 0.6, "W={}", f.dims.1);
+    assert!((f.dims.2 - 50.0).abs() < 0.6, "H={}", f.dims.2);
+
+    // 3. FEATURES: the two mounting bores are Ø8 cylinders.
+    let feats = extract_features(&m, s);
+    let eights = feats
+        .iter()
+        .filter(|fd| fd.diameter.map(|d| (d - 8.0).abs() < 1e-6).unwrap_or(false))
+        .count();
+    assert!(eights >= 2, "expected ≥2 Ø8 bores, got {eights}");
+
+    // 4. COVERAGE: exact disjoint partition; some faces unseen (honest).
+    let cov = coverage_report(&m, s, &tess).expect("coverage");
+    assert_eq!(
+        cov.seen_faces.len() + cov.unseen_faces.len(),
+        cov.total_faces
+    );
+
+    // 5. BEST-VIEW / NBV: the greedy cover reaches every face.
+    let vp = analyze_viewpoints(&m, s, 48, &tess).expect("viewpoints");
+    assert!(
+        vp.nbv_covers_all,
+        "NBV failed to cover all faces of the L-bracket"
+    );
+
+    // 6. SECTION at z=0 (through the horizontal plate): 80×50 rect minus the two
+    //    Ø8 bores = 4000 − 2π·16 ≈ 3899.5 mm².
+    let sec = render_section(
+        &m,
+        s,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+        Tolerance::default(),
+    )
+    .expect("section");
+    let expected = 80.0 * 50.0 - 2.0 * PI * 16.0;
+    let rel = (sec.section_area - expected).abs() / expected;
+    assert!(
+        rel < 0.03,
+        "section area {} vs analytic {expected} (rel {rel})",
+        sec.section_area
+    );
+}
+
+#[test]
+#[ignore = "writes PNGs for manual inspection"]
+fn emit_l_bracket_png() {
+    use geometry_engine::render::dimensioned::{render_dimensioned_multiview, render_section};
+    use geometry_engine::tessellation::TessellationParams;
+    let mut m = BRepModel::new();
+    let s = l_bracket(&mut m);
+    let f = render_dimensioned_multiview(&m, s, &TessellationParams::default()).expect("render");
+    std::fs::write("../_lbracket.png", f.to_png().expect("png")).expect("write");
+    let sec = render_section(
+        &m,
+        s,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+        Tolerance::default(),
+    )
+    .expect("section");
+    std::fs::write("../_lbracket_section.png", sec.to_png().expect("png")).expect("write");
+    eprintln!(
+        "l-bracket dims L{:.0} W{:.0} H{:.0}; section {:.1}",
+        f.dims.0, f.dims.1, f.dims.2, sec.section_area
+    );
+}
