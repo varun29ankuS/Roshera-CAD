@@ -13240,11 +13240,37 @@ fn heal_t_junctions_across_faces(
             if d.x * d.x + d.y * d.y + d.z * d.z > tol_sq {
                 continue;
             }
-            let local_t = (t_curve - original.param_range.start) / range_len;
+            // PERIODIC WRAP: `closest_point` returns a param in the curve's base
+            // domain (e.g. [0, 2π) for a circle), which can fall OUTSIDE this
+            // edge's `param_range` even when the foreign vertex genuinely lies on
+            // the edge interior. The canonical case is a full-circle rim edge
+            // (start_vertex == end_vertex) whose seam sits at a non-zero angle:
+            // its `param_range` is [θ_seam, θ_seam + period], so a foreign vertex
+            // at a SMALLER angle reports a param below `range.start` → negative
+            // local_t → the split was silently dropped, leaving a coincident rim
+            // welded on only one operand (the "rocket" cone-base-on-cylinder-cap
+            // bug: cyl top split into arcs, cone base left a closed circle → 279
+            // open edges). For a periodic curve, shift the param by whole periods
+            // into the edge's range before the endpoint test.
+            let mut t_use = t_curve;
+            let mut local_t = (t_use - original.param_range.start) / range_len;
+            if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&local_t) {
+                if let Some(period) = curve.period() {
+                    if period > 1e-12 {
+                        let k = ((original.param_range.start - t_use) / period).ceil();
+                        let cand = t_use + k * period;
+                        let lt = (cand - original.param_range.start) / range_len;
+                        if (ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&lt) {
+                            t_use = cand;
+                            local_t = lt;
+                        }
+                    }
+                }
+            }
             if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&local_t) {
                 continue;
             }
-            splits.push((t_curve, vid));
+            splits.push((t_use, vid));
         }
         if splits.is_empty() {
             continue;

@@ -94,20 +94,17 @@ fn cyl_minus_cone_enclosed_void_7() {
     assert_eq!(inner, 1, "enclosed cone must form exactly one void shell");
 }
 
-/// PIN (BOOL #7 / #32 family): a cone whose BASE is COINCIDENT/coplanar with the
-/// cylinder's base cap (both at z=0) — cyl∖cone should be a conical pit opening
-/// at the base (vol 785.40 − 94.25 = 691.2). PROGRESS (49f8703-follow-up,
-/// get_face_interior_point fix): the cone lateral now classifies Inside (its
-/// interior probe is nudged off the coincident base plane) so the cone IS
-/// subtracted — VOLUME is now correct (691.0). REMAINING (still invalid): the
-/// conical wall isn't WELDED to the base annulus at the coincident rim →
-/// boundary-edge gaps (open B-Rep), and tessellation cdt-panics on the unwelded
-/// result. So this asserts B-Rep validity (mesh-INDEPENDENT — avoids the
-/// tessellation panic) + correct volume; the validity still FAILS (rim weld is
-/// the next layer). #32 Same-Domain coincident-face for a cone base. Flip on when
-/// the rim weld lands.
+/// GATE (BOOL #7 / #32 family): a cone whose BASE is COINCIDENT/coplanar with the
+/// cylinder's base cap (both at z=0) — cyl∖cone is a conical pit opening at the
+/// base (vol 785.40 − 94.25 = 691.2). HISTORY: the cone lateral first failed to
+/// be subtracted, then (get_face_interior_point fix) volume became correct but
+/// the conical wall stayed UNWELDED at the coincident rim (open B-Rep). FIXED
+/// 2026-06-15 by the cone rim-seam alignment fix (see cyl_union_cone_stacked_
+/// rocket_27): the rim's seam vertex now matches its curve `t = 0`, so the
+/// T-junction healer can split + weld the coincident base rim. Asserts B-Rep
+/// validity (mesh-INDEPENDENT — the fine tessellation of the conical pit can still
+/// cdt-stress, but the B-Rep is sound) + correct volume.
 #[test]
-#[ignore = "#7/#32: cone base coincident with cyl cap — vol now correct, rim weld remains — flip when fixed"]
 fn cyl_minus_cone_coincident_base_7() {
     let mut m = BRepModel::new();
     let cyl = sid(TopologyBuilder::new(&mut m)
@@ -186,4 +183,58 @@ fn diag_cone_cyl_current_state() {
             Err(e) => eprintln!("[conecyl] {label}: ERROR {e:?}"),
         }
     }
+}
+
+/// GATE (BOOL #27/#32 cone family — the "rocket"): a cone stacked coaxially on
+/// the cylinder's top cap (cone base circle r5 @ z=10 coincident with the cyl top
+/// rim) ∪ → a rocket (cylinder body + cone nose). Volume was always correct
+/// (cyl 785.40 + cone 130.90 = 916.30), so it RENDERED right, but the result was
+/// a hollow husk: 279 open edges, invalid.
+///
+/// ROOT CAUSE (fixed 2026-06-15): the cone primitive placed its rim seam VERTEX
+/// at `center + axis.perpendicular()·r` (e.g. +Y for a −Z internal axis) while
+/// the rim `Circle` curve's `t = 0` sits at the canonical +X. The full-cone rim
+/// edge's `param_range` of [0,1] therefore did NOT start at its `start_vertex`,
+/// so `heal_t_junctions_across_faces` saw the coincident foreign vertex land on
+/// the param boundary (t = 0) and could not split the closed circle — the rim
+/// stayed welded on the cylinder side only. Fix: derive the cone `ref_dir` from
+/// `Circle::x_axis()` so surface seam, rim curve `t = 0`, seam vertex, and edge
+/// `param_range` all coincide (cone_primitive.rs). A periodic-wrap guard was also
+/// added to the T-junction healer (boolean.rs) as defence in depth.
+#[test]
+fn cyl_union_cone_stacked_rocket_27() {
+    let mut m = BRepModel::new();
+    let cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 5.0, 10.0)
+        .expect("cyl"));
+    // Cone base (r5) sits exactly on the cylinder top cap (z=10); nose at z=15.
+    let cone = sid(TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::new(0.0, 0.0, 10.0), Vector3::Z, 5.0, 0.0, 5.0)
+        .expect("cone"));
+    let res = boolean_operation(
+        &mut m,
+        cyl,
+        cone,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("stacked rocket union must succeed");
+    let rep = manifold_report(&m, res, 0.5, 1e-6).expect("mesh");
+    let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
+    let vol = m.calculate_solid_volume(res).unwrap_or(f64::NAN);
+    eprintln!(
+        "[rocket] open={} nm={} valid={} vol={vol:.2} (truth 916.30)",
+        rep.boundary_edges, rep.nonmanifold_edges, v.is_valid
+    );
+    assert_eq!(
+        (rep.boundary_edges, rep.nonmanifold_edges),
+        (0, 0),
+        "stacked rocket not watertight"
+    );
+    assert!(v.is_valid, "stacked rocket invalid: {:?}", v.errors);
+    let truth = std::f64::consts::PI * 25.0 * 10.0 + std::f64::consts::PI * 25.0 * 5.0 / 3.0;
+    assert!(
+        (vol - truth).abs() / truth < 0.02,
+        "rocket vol {vol:.2} vs truth {truth:.2}"
+    );
 }
