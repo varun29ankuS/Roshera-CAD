@@ -57,6 +57,17 @@ fn cone_sphere_correct_cases_7() {
         19.50,
     );
     check("cone∪sphere-tip", 8.0, 3.0, BooleanOp::Union, 350.11);
+    // Enclosed sphere fully inside the cone → conical void: cone 261.80 −
+    // sphere(r1.5) 14.14 = 247.66. Completes cone∘sphere as 4/4 valid.
+    check(
+        "cone∖sphere-enclosed",
+        2.5,
+        1.5,
+        BooleanOp::Difference,
+        247.66,
+    );
+    // cone∪sphere-transverse (sphere engulfs the lower cone) — fixed by disc-clip.
+    check("cone∪sphere-transverse", 0.0, 6.0, BooleanOp::Union, 924.11);
 }
 
 /// PIN (BOOL #7): cone∪sphere where the sphere transversally engulfs the lower
