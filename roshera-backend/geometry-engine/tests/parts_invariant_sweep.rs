@@ -1582,14 +1582,14 @@ fn section_area_sweep() {
 }
 
 /// PIN #85: an AXIAL cylinder section (cut plane containing the axis, normal ⟂
-/// axis) returns NO caps — render_section → None — when it should be a
-/// 2√(r²−a²)·h rectangle. The cylinder∩plane is then 2 disjoint straight lines
-/// on the lateral face (vs a single circle for a radial cut, which works); the
-/// curved-face marching SSI on the lateral face misses that orientation. The
-/// cap chords (planar clip, #83) are fine; the lateral lines are the gap. Flip
-/// on when #85 lands. (Distinct from #83 which was planar faces.)
+/// axis) must return a 2r·h rectangle cap. The lateral cylinder∩plane is two
+/// disjoint straight generator lines (the marching SSI finds these fine); the
+/// gap was the END-CAP fragments — a disc cap is bounded by a single closed
+/// circular edge (start==end seam vertex), so the vertex-only `loop_points`
+/// walk yielded ONE point and the planar cut-line clip saw `n < 2` and emitted
+/// nothing, so the rectangle never closed. FIXED by sampling curved boundary
+/// edges in `loop_points` (#85). (Distinct from #83 which was planar faces.)
 #[test]
-#[ignore = "#85: axial cylinder section (plane containing axis) returns no caps"]
 fn axial_cylinder_section_returns_none_85() {
     use geometry_engine::render::dimensioned::render_section;
     let mut m = BRepModel::new();
