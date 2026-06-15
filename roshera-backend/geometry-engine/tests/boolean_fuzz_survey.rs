@@ -906,10 +906,20 @@ fn boolean_box_cone_fuzz_survey() {
 /// LOCALIZED (2026-06-15): the analytic cone×plane SSI arm is CORRECT — the
 /// lib test `boolean::tests::cone_plane_ssi_points_lie_on_both_surfaces_1`
 /// confirms every intersection-curve point lies on BOTH surfaces for the
-/// circle / two-line / hyperbola orientations. So the defect is DOWNSTREAM of
-/// the SSI: the cone-LATERAL patch (bounded by the two generators + the rim
-/// arcs) is dropped/mis-stitched in split_faces / classify — the intersection
-/// curve itself is not the problem.
+/// circle / two-line / hyperbola orientations AND that the axial cut straddles
+/// the cone (a complete two-sided partition). So the defect is DOWNSTREAM.
+///
+/// STAGE-PRECISE (2026-06-15, ROSHERA_BOOL_TRACE on box∩cone): the cone lateral
+/// `face=8` is split by the 2 generator lines into 3 fragments — but ALL three
+/// classify Outside, with interior points (1.3,−0.3,0.0), (1.5,0,−0.3),
+/// (1.3,−0.3,0.6) — every one in the OUTSIDE angular half (x≥1.3). The INSIDE
+/// angular strip (x<1, cone angles ≈90°–270°) is NEVER produced as a fragment:
+/// `split_face_by_curves`' UV arrangement on the curved cone face fails to
+/// extract it (loops_extracted=3, all on the outside half). So no Inside cone
+/// fragment reaches selection → ∩ keeps only the 3 planar faces. Implicates #6
+/// (dropped boolean pcurves): the cut-line (u,v) images are dropped and
+/// re-projected, and on the cone the re-projected generators don't close the
+/// inside strip. Fix = curved-face arrangement / persist pcurves.
 ///
 /// Characterized failure signature (2026-06-15, ROSHERA_BOOL_TRACE):
 ///   ∩ → InvalidBRep "component 0 has only 3 planar faces" (the cone-lateral

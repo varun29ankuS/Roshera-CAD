@@ -17625,10 +17625,27 @@ mod tests {
                 "{label}: expected ≥{min_curves} curve(s), got {}",
                 curves.len()
             );
+            // In-plane direction ⊥ axis: the two generator lines of the axial
+            // cut must straddle it (one on each side), i.e. the cut PARTITIONS
+            // the cone's full angular range. If the SSI handed split_faces only
+            // a one-sided cut, the missing inside strip would be the SSI's
+            // fault; this proves it is NOT — the partition is complete, so the
+            // dropped inside cone-lateral patch (#1) is purely downstream in
+            // split_face_by_curves' UV arrangement.
+            let m_hat = cone.axis.cross(&p_n);
+            let mut side_min = f64::INFINITY;
+            let mut side_max = f64::NEG_INFINITY;
             let mut n_pts = 0usize;
             for sic in &curves {
                 let range = sic.curve.parameter_range();
                 const N: usize = 24;
+                let mid = sic
+                    .curve
+                    .point_at(0.5 * (range.start + range.end))
+                    .expect("curve mid");
+                let side = (mid - cone.apex).dot(&m_hat);
+                side_min = side_min.min(side);
+                side_max = side_max.max(side);
                 for i in 0..=N {
                     let t = range.start + (range.end - range.start) * (i as f64 / N as f64);
                     let p = sic.curve.point_at(t).expect("curve point");
@@ -17650,6 +17667,13 @@ mod tests {
                     );
                     n_pts += 1;
                 }
+            }
+            if label == "axial→two-lines" {
+                assert!(
+                    side_min < -1e-6 && side_max > 1e-6,
+                    "axial cut must straddle the in-plane ⊥-axis direction \
+                     (complete two-sided partition): side range [{side_min:.3},{side_max:.3}]"
+                );
             }
             eprintln!(
                 "[cone-plane SSI #1] {label}: {} curve(s), {n_pts} points all on both surfaces",

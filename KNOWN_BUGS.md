@@ -116,12 +116,17 @@ signature (`radial-face+x`: bc=[1,0,-0.5] rb=0.5 rt=0.3 h=1):
 new lib test `boolean::tests::cone_plane_ssi_points_lie_on_both_surfaces_1`
 confirms every intersection-curve point lies on BOTH surfaces for the circle /
 two-generator-line / hyperbola orientations. So the defect is DOWNSTREAM of the
-SSI: the cone-LATERAL patch is dropped/mis-stitched in split_faces / classify
-(∩ keeps only the 3 planar faces — base disc + top disc + +X wall). Note the
-`radial-face+x` cell is the TWO-GENERATOR-LINE case (the +X wall plane contains
-the cone axis), not a hyperbola — `plane_cone_parallel_intersection` already
-emits those two lines correctly. Fix lane: make split/classify KEEP the cone
-conic patch — DEEP, multi-fire, ties task #7. Pinned: `boolean_fuzz_survey.rs::
+SSI: the cone-LATERAL patch is dropped in split_faces (∩ keeps only the 3
+planar faces — base disc + top disc + +X wall). Note the `radial-face+x` cell
+is the TWO-GENERATOR-LINE case (the +X wall plane contains the cone axis), not a
+hyperbola — `plane_cone_parallel_intersection` already emits those two lines
+correctly. **Stage-precise (trace):** the cone lateral splits into 3 fragments
+but ALL classify Outside (interior pts x≥1.3); the INSIDE angular strip
+(x<1, cone angles ≈90°–270°) is never produced — `split_face_by_curves`' UV
+arrangement on the curved cone face fails to extract it. Implicates #6 (dropped
+pcurves: cut-line (u,v) images re-projected on the cone don't close the inside
+strip). Fix lane: curved-face arrangement / persist pcurves — DEEP, multi-fire,
+ties #6/#7. Pinned: `boolean_fuzz_survey.rs::
 cone_radial_conic_cut_pin_1` (#[ignore], asserts watertight+valid+vol — flip on
 when #1 lands). The 33-cell curved poke matrix (`harness::poke_matrix`) stays
 fully green; this off-axis conic class is the remaining frontier.
