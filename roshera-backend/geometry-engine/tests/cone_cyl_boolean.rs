@@ -96,12 +96,18 @@ fn cyl_minus_cone_enclosed_void_7() {
 
 /// PIN (BOOL #7 / #32 family): a cone whose BASE is COINCIDENT/coplanar with the
 /// cylinder's base cap (both at z=0) — cyl∖cone should be a conical pit opening
-/// at the base (vol 785.40 − 94.25 = 691.2), but the coincident base discs
-/// confuse classification (`inside=0`, cone lateral not selected) → 192 open
-/// edges, cone not subtracted. This is the Same-Domain coincident-face class
-/// (#32) applied to a cone base, NOT an enclosed-void bug. Flip on when fixed.
+/// at the base (vol 785.40 − 94.25 = 691.2). PROGRESS (49f8703-follow-up,
+/// get_face_interior_point fix): the cone lateral now classifies Inside (its
+/// interior probe is nudged off the coincident base plane) so the cone IS
+/// subtracted — VOLUME is now correct (691.0). REMAINING (still invalid): the
+/// conical wall isn't WELDED to the base annulus at the coincident rim →
+/// boundary-edge gaps (open B-Rep), and tessellation cdt-panics on the unwelded
+/// result. So this asserts B-Rep validity (mesh-INDEPENDENT — avoids the
+/// tessellation panic) + correct volume; the validity still FAILS (rim weld is
+/// the next layer). #32 Same-Domain coincident-face for a cone base. Flip on when
+/// the rim weld lands.
 #[test]
-#[ignore = "#7/#32: cone base coincident with cylinder base cap → 192 open — flip when fixed"]
+#[ignore = "#7/#32: cone base coincident with cyl cap — vol now correct, rim weld remains — flip when fixed"]
 fn cyl_minus_cone_coincident_base_7() {
     let mut m = BRepModel::new();
     let cyl = sid(TopologyBuilder::new(&mut m)
@@ -118,20 +124,16 @@ fn cyl_minus_cone_coincident_base_7() {
         BooleanOptions::default(),
     )
     .expect("coincident-base cyl∖cone must return");
-    let rep = manifold_report(&m, res, 0.5, 1e-6).expect("mesh");
+    // Mesh-INDEPENDENT validity (manifold_report tessellates → cdt-panics on the
+    // unwelded result; validate_solid_scoped reports the boundary-edge gaps).
     let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
     let vol = m.calculate_solid_volume(res).unwrap_or(f64::NAN);
-    assert_eq!(
-        (rep.boundary_edges, rep.nonmanifold_edges),
-        (0, 0),
-        "not watertight"
-    );
-    assert!(v.is_valid, "invalid: {:?}", v.errors);
     let truth = std::f64::consts::PI * 25.0 * 10.0 - std::f64::consts::PI * 9.0 * 10.0 / 3.0;
     assert!(
         (vol - truth).abs() / truth < 0.03,
         "vol {vol:.2} vs truth {truth:.2}"
     );
+    assert!(v.is_valid, "invalid (rim weld remains): {:?}", v.errors);
 }
 
 #[test]

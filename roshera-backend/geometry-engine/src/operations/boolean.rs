@@ -12021,7 +12021,26 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
                 SurfaceType::Cylinder | SurfaceType::Sphere | SurfaceType::Cone
             ) {
                 if let Ok((u, v)) = surface.closest_point(&centroid, Tolerance::default()) {
-                    if let Ok(p) = surface.point_at(u, v) {
+                    // A face whose ONLY boundary is a single closed loop (e.g. a
+                    // cone lateral whose sole boundary edge is its base rim
+                    // circle) has its centroid = that one edge's midpoint, which
+                    // lies ON the boundary. Projected to the surface it stays on
+                    // the rim — and when that rim is coincident with the other
+                    // operand's cutting plane it classifies OnBoundary, dropping
+                    // a face that is really Inside (the conical wall of cyl∖cone
+                    // with a coincident base, #32). Nudge toward the surface's
+                    // interior in v so it is a GENUINE interior point. (Fragments
+                    // produced by a dedicated curved splitter carry an explicit
+                    // interior_point and return early above, so this only affects
+                    // single-closed-loop full-surface fragments.)
+                    let v_used = if count == 1 {
+                        let ((_, _), (v_min, v_max)) = surface.parameter_bounds();
+                        let v_mid = 0.5 * (v_min + v_max);
+                        v + (v_mid - v) * 0.25
+                    } else {
+                        v
+                    };
+                    if let Ok(p) = surface.point_at(u, v_used) {
                         return Ok(p);
                     }
                 }
