@@ -1206,6 +1206,9 @@ fn surface_surface_intersection(
         (Cone, Cylinder) | (Cylinder, Cone) => {
             cone_cylinder_intersection(surface_a, surface_b, tolerance)
         }
+        (Cone, Sphere) | (Sphere, Cone) => {
+            cone_sphere_intersection(surface_a, surface_b, tolerance)
+        }
         _ => {
             use crate::primitives::surface::SurfaceType;
             if matches!(
@@ -2846,6 +2849,104 @@ fn cone_cylinder_intersection(
         on_surface_a,
         on_surface_b,
     }])
+}
+
+/// Closed-form cone(lateral)–sphere intersection for a COAXIAL sphere (centre on
+/// the cone axis) — BOOL #7. With the sphere centre at axial distance `s` from
+/// the apex, a cone-lateral point at axial `v` (radius `v·tanα`) lies on the
+/// sphere when `(v−s)² + (v·tanα)² = rs²`, i.e.
+///   `v = s·cos²α ± cosα·√(rs² − s²·sin²α)`.
+/// The discriminant `D = rs² − s²·sin²α` gives 0 / 1(tangent) / 2 crossing
+/// circles. Each valid root that is STRICTLY interior to the cone's extent (and
+/// v>0) emits a circle of radius `v·tanα`; a root at a rim, a tangency
+/// (D≤0), or a root outside the extent → no curve (shared boundary / no cut).
+/// Off-axis spheres → general quartic → step-capped marcher.
+fn cone_sphere_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::{Cone, Sphere};
+
+    let (cone, sphere, cone_is_a) = if let (Some(c), Some(s)) = (
+        surface_a.as_any().downcast_ref::<Cone>(),
+        surface_b.as_any().downcast_ref::<Sphere>(),
+    ) {
+        (c, s, true)
+    } else if let (Some(s), Some(c)) = (
+        surface_a.as_any().downcast_ref::<Sphere>(),
+        surface_b.as_any().downcast_ref::<Cone>(),
+    ) {
+        (c, s, false)
+    } else {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    };
+
+    let tol = tolerance.distance();
+    let k = cone.half_angle.tan();
+    let sin_a = cone.half_angle.sin();
+    let cos_a = cone.half_angle.cos();
+    if !k.is_finite() || k <= tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+    let axis = cone.axis;
+    let rs = sphere.radius;
+
+    // Sphere centre in the cone's axial/radial frame (from the apex).
+    let rel = sphere.center - cone.apex;
+    let s = rel.dot(&axis);
+    let d = (rel - axis * s).magnitude();
+    if d > tol {
+        // Off-axis: general quartic, no closed form here.
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+
+    let disc = rs * rs - s * s * sin_a * sin_a;
+    if disc <= tol * tol {
+        return Ok(vec![]); // no real crossing, or a tangency (non-separating)
+    }
+    let sqrt_d = disc.sqrt();
+    let base = s * cos_a * cos_a;
+    let off = cos_a * sqrt_d;
+
+    let (cv_lo, cv_hi) = match cone.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (0.0, f64::INFINITY),
+    };
+
+    let mut curves = Vec::new();
+    for v in [base - off, base + off] {
+        // STRICTLY interior to the cone extent and a non-degenerate radius; a
+        // rim-coincident root is a shared boundary, not a transverse cut.
+        if v <= cv_lo + tol || v >= cv_hi - tol {
+            continue;
+        }
+        let radius = v * k;
+        if radius <= tol {
+            continue;
+        }
+        let circle = Circle::new(cone.apex + axis * v, axis, radius)?;
+        let params_cone = compute_circle_cone_parameters(&circle, cone)?;
+        let params_sph = compute_circle_sphere_parameters(&circle, sphere)?;
+        let (on_surface_a, on_surface_b) = if cone_is_a {
+            (
+                create_parametric_curve(&params_cone),
+                create_parametric_curve(&params_sph),
+            )
+        } else {
+            (
+                create_parametric_curve(&params_sph),
+                create_parametric_curve(&params_cone),
+            )
+        };
+        curves.push(SurfaceIntersectionCurve {
+            curve: Box::new(circle),
+            on_surface_a,
+            on_surface_b,
+        });
+    }
+    Ok(curves)
 }
 
 /// Closed-form plane–cone intersection.
@@ -18220,6 +18321,57 @@ mod tests {
                         (cone_radial - v * k).abs() < 1e-6,
                         "{label}: point {p:?} off cone (radial {cone_radial} vs {})",
                         v * k
+                    );
+                }
+            }
+        }
+    }
+
+    /// ISOLATED SSI test (BOOL #7): the analytic cone×sphere arm. A coaxial
+    /// sphere meets the cone lateral where (v−s)²+(v·tanα)²=rs² → up to two
+    /// circles; each emitted only when strictly interior to the cone extent.
+    /// Cone: apex (0,0,10), axis −Z, base r5 at z=0 (half-angle atan(0.5)).
+    #[test]
+    fn cone_sphere_ssi_arm_7() {
+        use crate::primitives::surface::{Cone, Sphere};
+        let tol = Tolerance::default();
+        let ha = 0.5_f64.atan();
+        let k = ha.tan();
+        let apex = Point3::new(0.0, 0.0, 10.0);
+        let axis_down = Vector3::new(0.0, 0.0, -1.0);
+        let cone = Cone::truncated(apex, axis_down, ha, 0.0, 10.0).expect("cone");
+        // (label, sphere centre z, radius, expected count)
+        let cases: [(&str, f64, f64, usize); 3] = [
+            ("transverse", 0.0, 6.0, 1), // s=10: one root interior, other beyond base
+            ("tip", 8.0, 3.0, 1),        // s=2: one positive interior root
+            ("enclosed", 2.5, 1.5, 0),   // sphere inside the cone → no lateral crossing
+        ];
+        for (label, sz, sr, want) in cases {
+            let sphere = Sphere::new(Point3::new(0.0, 0.0, sz), sr).expect("sphere");
+            let curves = surface_surface_intersection(&cone, &sphere, &tol)
+                .unwrap_or_else(|e| panic!("{label}: SSI errored {e:?}"));
+            assert_eq!(
+                curves.len(),
+                want,
+                "{label}: expected {want} circle(s), got {}",
+                curves.len()
+            );
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                for i in 0..=24 {
+                    let t = range.start + (range.end - range.start) * (i as f64 / 24.0);
+                    let p = sic.curve.point_at(t).expect("pt");
+                    let rel = p - apex;
+                    let v = rel.dot(&axis_down);
+                    let cone_radial = (rel - axis_down * v).magnitude();
+                    assert!(
+                        (cone_radial - v * k).abs() < 1e-6,
+                        "{label}: point {p:?} off cone"
+                    );
+                    let dr = (p - Point3::new(0.0, 0.0, sz)).magnitude();
+                    assert!(
+                        (dr - sr).abs() < 1e-6,
+                        "{label}: point {p:?} off sphere (dist {dr})"
                     );
                 }
             }
