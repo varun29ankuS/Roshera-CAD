@@ -3696,23 +3696,97 @@ fn tessellate_revolution_wedge(
         chains.push(c);
     }
     let (a, b, c, d) = (&chains[0], &chains[1], &chains[2], &chains[3]);
-    // Opposite chains must tile a rectangular grid.
-    if a.len() != c.len() || b.len() != d.len() {
+    // Corner continuity (chains belong to one loop, so these hold exactly for a
+    // clean quad; a mismatch means the loop is not a 4-corner patch). Walk
+    // c0→c1 (a) → c1→c2 (b) → c2→c3 (c) → c3→c0 (d).
+    let close = |p: Point3, q: Point3| (p - q).magnitude() < 1e-6;
+    if !close(a[a.len() - 1], b[0])
+        || !close(b[b.len() - 1], c[0])
+        || !close(c[c.len() - 1], d[0])
+        || !close(d[d.len() - 1], a[0])
+    {
         return false;
     }
+
+    // GENERAL CASE — unequal opposite boundary counts. A revolve band's two
+    // meridian arcs sit at DIFFERENT radii, so the chord-driven edge cache
+    // samples them with different counts (`b.len() != d.len()`); congruent
+    // profile-arc copies at adjacent stations can differ too (`a.len() !=
+    // c.len()`). The Coons grid below needs equal opposite counts, so a CONE
+    // band always fails it — and the curved-CDT fallback chokes on the thin 3D
+    // sliver, leaving the band UNMESHED (holes → a revolved nozzle renders as
+    // nothing). Fix it FUNDAMENTALLY for every profile shape: triangulate in
+    // the wedge's (u,v) PARAMETER square, where the patch is well-conditioned
+    // regardless of radii (no sliver aspect ratio), using the EXACT boundary
+    // cache samples. Each boundary point keeps its real 3D position (so every
+    // shared edge matches its neighbour's samples bit-for-bit → watertight);
+    // only the 2D triangulation connectivity is computed in (u,v). Boundary-
+    // only (no interior Steiner) — exact for the developable band.
+    if a.len() != c.len() || b.len() != d.len() {
+        let mut p3: Vec<Point3> = Vec::new();
+        let mut puv: Vec<Point3> = Vec::new();
+        // a: v=0, u 0→1 ; b: u=1, v 0→1 ; c: v=1, u 1→0 ; d: u=0, v 1→0.
+        // Drop each chain's last point: it is the shared corner that opens the
+        // next chain (corner continuity verified above).
+        let na = a.len();
+        for i in 0..na - 1 {
+            p3.push(a[i]);
+            puv.push(Point3::new(i as f64 / (na - 1) as f64, 0.0, 0.0));
+        }
+        let nb = b.len();
+        for j in 0..nb - 1 {
+            p3.push(b[j]);
+            puv.push(Point3::new(1.0, j as f64 / (nb - 1) as f64, 0.0));
+        }
+        let nc = c.len();
+        for k in 0..nc - 1 {
+            p3.push(c[k]);
+            puv.push(Point3::new(1.0 - k as f64 / (nc - 1) as f64, 1.0, 0.0));
+        }
+        let nd = d.len();
+        for l in 0..nd - 1 {
+            p3.push(d[l]);
+            puv.push(Point3::new(0.0, 1.0 - l as f64 / (nd - 1) as f64, 0.0));
+        }
+        if p3.len() < 3 {
+            return false;
+        }
+        let boundaries = [(0usize, puv.len(), true)];
+        let tris = triangulate_planar_polygon(&puv, &boundaries, &Vector3::Z);
+        if tris.is_empty() {
+            return false;
+        }
+        // Outward normal: Newell of the real 3D ring (CCW about the surface's
+        // natural normal, since the loop is CCW) times the face orientation sign
+        // — identical convention to `tessellate_planar_face`.
+        let outward = newell_normal(&p3)
+            .map(|nv| nv * face.orientation.sign())
+            .unwrap_or(Vector3::Z);
+        let idx: Vec<u32> = p3
+            .iter()
+            .map(|p| {
+                mesh.add_vertex(MeshVertex {
+                    position: *p,
+                    normal: outward,
+                    uv: None,
+                })
+            })
+            .collect();
+        for t in &tris {
+            let (i0, i1, i2) = (t[0], t[1], t[2]);
+            let gn = (p3[i1] - p3[i0]).cross(&(p3[i2] - p3[i0]));
+            if gn.dot(&outward) >= 0.0 {
+                mesh.add_triangle(idx[i0], idx[i1], idx[i2]);
+            } else {
+                mesh.add_triangle(idx[i0], idx[i2], idx[i1]);
+            }
+        }
+        return true;
+    }
+
     let n = a.len(); // i index: 0..n along A (c0→c1) and C (c2→c3)
     let m = b.len(); // j index: 0..m along B (c1→c2) and D (c3→c0)
     if n < 2 || m < 2 {
-        return false;
-    }
-    // Corner continuity (chains belong to one loop, so these hold exactly for a
-    // clean quad; a mismatch means the loop is not a 4-corner patch).
-    let close = |p: Point3, q: Point3| (p - q).magnitude() < 1e-6;
-    if !close(a[n - 1], b[0])
-        || !close(b[m - 1], c[0])
-        || !close(c[n - 1], d[0])
-        || !close(d[m - 1], a[0])
-    {
         return false;
     }
 
