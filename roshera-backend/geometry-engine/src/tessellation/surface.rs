@@ -3762,12 +3762,31 @@ fn tessellate_revolution_wedge(
         let outward = newell_normal(&p3)
             .map(|nv| nv * face.orientation.sign())
             .unwrap_or(Vector3::Z);
-        let idx: Vec<u32> = p3
-            .iter()
-            .map(|p| {
+        // SMOOTH SHADING: take each vertex's normal from the surface itself
+        // (evaluate_full at the vertex's (u,v)), not a single flat per-band
+        // normal — otherwise each sloped band renders as a faceted rectangle
+        // ("rectangular spots" on a revolved cone). The wedge's (u,v) square
+        // maps to the SurfaceOfRevolution params as u=profile∈[0,1],
+        // v=angle∈[0,angle]; puv carries (u, v_frac, 0). Orient each to the
+        // outward side so shading is consistent; fall back to the flat outward
+        // normal if the surface evaluation fails.
+        let surf = model.surfaces.get(face.surface_id);
+        let ang = surf.map(|s| s.parameter_bounds().1 .1).unwrap_or(0.0);
+        let idx: Vec<u32> = (0..p3.len())
+            .map(|k| {
+                let normal = surf
+                    .and_then(|s| s.evaluate_full(puv[k].x, puv[k].y * ang).ok())
+                    .map(|sp| {
+                        if sp.normal.dot(&outward) < 0.0 {
+                            -sp.normal
+                        } else {
+                            sp.normal
+                        }
+                    })
+                    .unwrap_or(outward);
                 mesh.add_vertex(MeshVertex {
-                    position: *p,
-                    normal: outward,
+                    position: p3[k],
+                    normal,
                     uv: None,
                 })
             })
