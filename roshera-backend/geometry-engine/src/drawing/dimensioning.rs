@@ -139,6 +139,7 @@ pub fn standard_drawing(
     for (proj, name, pos) in layout {
         let mut view = project_solid_view(model, source.clone(), proj, name, pos, scale)?;
         view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+        view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
         drawing.add_view(view);
     }
     Ok(drawing)

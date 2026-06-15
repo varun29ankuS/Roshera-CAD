@@ -235,6 +235,10 @@ pub struct ProjectedView {
     /// keeps older serialized drawings (no dimensions) parsing.
     #[serde(default)]
     pub dimensions: Vec<super::dimensioning::Dimension2d>,
+    /// Auto-derived chain-line centerlines for circular features (view-space
+    /// mm). Empty unless populated by `dimensioning::standard_drawing`.
+    #[serde(default)]
+    pub centerlines: Vec<super::centerlines::Centerline>,
 }
 
 /// Paper sizes, ISO 216 series. Dimensions in millimetres, landscape
