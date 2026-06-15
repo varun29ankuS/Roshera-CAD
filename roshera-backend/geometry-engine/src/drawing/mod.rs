@@ -23,12 +23,14 @@
 //! SVG rendering lives in [`svg`]; REST and frontend integration lives
 //! in `api-server` and `roshera-app` respectively.
 
+pub mod dimensioning;
 pub mod dxf;
 pub mod pdf;
 pub mod projection;
 pub mod svg;
 pub mod types;
 
+pub use dimensioning::{auto_dimensions, visible_dimensions, Dimension2d};
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{
