@@ -49,6 +49,91 @@ fn cyl_minus_cone_transverse_7() {
     assert!(v.is_valid, "transverse cyl∖cone invalid: {:?}", v.errors);
 }
 
+/// GATE (BOOL #7): a cone fully INSIDE the cylinder (no coincident faces) →
+/// cyl∖cone is a clean conical VOID (valid 2-shell solid). cyl(r5,z[0,10]) ∖
+/// cone(base r3 @ z=2, apex z=8) → vol = 785.40 − 56.55 = 728.9. This confirms
+/// the enclosed-void path works for cones (an earlier "enclosed" pin actually had
+/// the cone base COINCIDENT with the cylinder base — a coplanar coincidence,
+/// pinned separately below, not an enclosed-void bug).
+#[test]
+fn cyl_minus_cone_enclosed_void_7() {
+    let mut m = BRepModel::new();
+    let cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 5.0, 10.0)
+        .expect("cyl"));
+    let cone = sid(TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::new(0.0, 0.0, 2.0), Vector3::Z, 3.0, 0.0, 6.0)
+        .expect("cone"));
+    let res = boolean_operation(
+        &mut m,
+        cyl,
+        cone,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("enclosed cyl∖cone must succeed");
+    let rep = manifold_report(&m, res, 0.5, 1e-6).expect("mesh");
+    let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
+    let vol = m.calculate_solid_volume(res).unwrap_or(f64::NAN);
+    let inner = m.solids.get(res).map(|s| s.inner_shells.len()).unwrap_or(0);
+    eprintln!(
+        "[cyl∖cone-enclosed] open={} nm={} valid={} vol={vol:.2} inner_shells={inner}",
+        rep.boundary_edges, rep.nonmanifold_edges, v.is_valid
+    );
+    assert_eq!(
+        (rep.boundary_edges, rep.nonmanifold_edges),
+        (0, 0),
+        "not watertight"
+    );
+    assert!(v.is_valid, "invalid: {:?}", v.errors);
+    let truth = std::f64::consts::PI * 25.0 * 10.0 - std::f64::consts::PI * 9.0 * 6.0 / 3.0;
+    assert!(
+        (vol - truth).abs() / truth < 0.03,
+        "vol {vol:.2} vs truth {truth:.2}"
+    );
+    assert_eq!(inner, 1, "enclosed cone must form exactly one void shell");
+}
+
+/// PIN (BOOL #7 / #32 family): a cone whose BASE is COINCIDENT/coplanar with the
+/// cylinder's base cap (both at z=0) — cyl∖cone should be a conical pit opening
+/// at the base (vol 785.40 − 94.25 = 691.2), but the coincident base discs
+/// confuse classification (`inside=0`, cone lateral not selected) → 192 open
+/// edges, cone not subtracted. This is the Same-Domain coincident-face class
+/// (#32) applied to a cone base, NOT an enclosed-void bug. Flip on when fixed.
+#[test]
+#[ignore = "#7/#32: cone base coincident with cylinder base cap → 192 open — flip when fixed"]
+fn cyl_minus_cone_coincident_base_7() {
+    let mut m = BRepModel::new();
+    let cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 5.0, 10.0)
+        .expect("cyl"));
+    let cone = sid(TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 3.0, 0.0, 10.0)
+        .expect("cone"));
+    let res = boolean_operation(
+        &mut m,
+        cyl,
+        cone,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("coincident-base cyl∖cone must return");
+    let rep = manifold_report(&m, res, 0.5, 1e-6).expect("mesh");
+    let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
+    let vol = m.calculate_solid_volume(res).unwrap_or(f64::NAN);
+    assert_eq!(
+        (rep.boundary_edges, rep.nonmanifold_edges),
+        (0, 0),
+        "not watertight"
+    );
+    assert!(v.is_valid, "invalid: {:?}", v.errors);
+    let truth = std::f64::consts::PI * 25.0 * 10.0 - std::f64::consts::PI * 9.0 * 10.0 / 3.0;
+    assert!(
+        (vol - truth).abs() / truth < 0.03,
+        "vol {vol:.2} vs truth {truth:.2}"
+    );
+}
+
 #[test]
 #[ignore = "task #7 characterization — run with --ignored --nocapture"]
 fn diag_cone_cyl_current_state() {
