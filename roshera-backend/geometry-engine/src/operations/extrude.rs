@@ -693,6 +693,77 @@ fn create_fresh_extrusion(
 /// material. The target is passed to `create_side_face_shared` which
 /// hands it to `orient_face_for_outward` to pick the correct
 /// `FaceOrientation` for the ruled surface.
+/// Sample a point on an edge's underlying curve at fraction `f` of its
+/// parameter sub-range. Unlike reading the edge's endpoint vertices, this
+/// is correct for a closed curved edge (e.g. a full-circle loop, whose
+/// single start==end seam vertex would otherwise collapse the geometry to
+/// one point). For a straight `Line` edge it reduces to linear interpolation.
+fn sample_edge_point(model: &BRepModel, edge_id: EdgeId, f: f64) -> OperationResult<Point3> {
+    let edge = model
+        .edges
+        .get(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+    let curve = model
+        .curves
+        .get(edge.curve_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+    let r = edge.param_range;
+    let t = r.start + f * (r.end - r.start);
+    curve
+        .point_at(t)
+        .map_err(|e| OperationError::NumericalError(format!("edge point_at failed: {:?}", e)))
+}
+
+/// Sample a loop's edge CURVES into a dense world-space polygon. A closed
+/// curved boundary (e.g. a one-edge `Circle` loop, whose start==end seam is
+/// its only vertex) is thereby represented by many points instead of a single
+/// vertex — which is what a vertex-only winding-number test degrades to (it
+/// returns 0 for any loop with < 3 vertices). `per_edge` samples are taken at
+/// `f ∈ [0, 1)` per edge so shared endpoints aren't duplicated.
+fn sample_loop_polygon(
+    model: &BRepModel,
+    lp: &Loop,
+    per_edge: usize,
+) -> OperationResult<Vec<Point3>> {
+    let mut pts = Vec::with_capacity(lp.edges.len() * per_edge.max(1));
+    for &edge_id in &lp.edges {
+        for k in 0..per_edge.max(1) {
+            let f = k as f64 / per_edge.max(1) as f64;
+            pts.push(sample_edge_point(model, edge_id, f)?);
+        }
+    }
+    Ok(pts)
+}
+
+/// Winding-number point-in-polygon on a pre-sampled world-space polygon,
+/// projected to the coordinate plane whose dominant axis is `normal`. Mirrors
+/// `Loop::winding_number` but operates on sampled points so curved loops test
+/// correctly.
+fn point_in_sampled_polygon(point: &Point3, polygon: &[Point3], normal: &Vector3) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+    let an = normal.abs();
+    let (u, v) = if an.x > an.y && an.x > an.z {
+        (1usize, 2usize)
+    } else if an.y > an.z {
+        (0usize, 2usize)
+    } else {
+        (0usize, 1usize)
+    };
+    let comp = |p: &Point3, i: usize| [p.x, p.y, p.z][i];
+    let (pu, pv) = (comp(point, u), comp(point, v));
+    let mut winding = 0.0;
+    for i in 0..polygon.len() {
+        let a = &polygon[i];
+        let b = &polygon[(i + 1) % polygon.len()];
+        let (au, av) = (comp(a, u) - pu, comp(a, v) - pv);
+        let (bu, bv) = (comp(b, u) - pu, comp(b, v) - pv);
+        winding += (au * bv - bu * av).atan2(au * bu + av * bv);
+    }
+    (winding / (2.0 * std::f64::consts::PI)).abs() > 0.5
+}
+
 fn build_loop_side_faces(
     model: &mut BRepModel,
     base_loop: &Loop,
@@ -722,39 +793,40 @@ fn build_loop_side_faces(
         ));
     }
 
-    // Compute the loop centroid (vertex-centroid in 3D) — the reference
-    // point for outward-target direction at every wall along this loop.
-    // For an outer loop the centroid lies inside the solid material so
-    // (edge_mid - centroid) points outward. For an inner (hole) loop the
-    // centroid lies inside the void so (edge_mid - centroid) points INTO
-    // the surrounding material and must be flipped.
-    let mut unique_vertices: Vec<VertexId> = Vec::with_capacity(bottom_endpoints.len());
-    for &(s, e) in &bottom_endpoints {
-        if !unique_vertices.contains(&s) {
-            unique_vertices.push(s);
-        }
-        if !unique_vertices.contains(&e) {
-            unique_vertices.push(e);
-        }
-    }
+    // Compute the loop centroid — the reference point for outward-target
+    // direction at every wall along this loop. For an outer loop the centroid
+    // lies inside the solid material so (edge_mid - centroid) points outward.
+    // For an inner (hole) loop the centroid lies inside the void so
+    // (edge_mid - centroid) points INTO the surrounding material and must be
+    // flipped.
+    //
+    // The samples come from the edge CURVES (several interior parameters each),
+    // not the loop vertices. A vertex-centroid collapses for a closed curved
+    // edge — a single full-circle loop has one start==end seam vertex, so its
+    // vertex-centroid would sit ON the seam and (edge_mid - centroid) would be
+    // zero, degrading the wall orientation to an arbitrary fallback. Curve
+    // sampling yields the true interior centroid (the circle centre for a
+    // circle) and the correct radial outward direction. For straight-edge
+    // polygons the samples lie along the edges and reproduce an interior
+    // centroid, so the orientation sign is unchanged.
     let (mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0);
-    for &vid in &unique_vertices {
-        let v = model.vertices.get(vid).ok_or_else(|| {
-            OperationError::InvalidGeometry(
-                "Loop vertex not found while computing centroid".to_string(),
-            )
-        })?;
-        cx += v.position[0];
-        cy += v.position[1];
-        cz += v.position[2];
+    let mut sample_count = 0.0_f64;
+    for &edge_id in &base_loop.edges {
+        for &f in &[0.25_f64, 0.5, 0.75] {
+            let p = sample_edge_point(model, edge_id, f)?;
+            cx += p.x;
+            cy += p.y;
+            cz += p.z;
+            sample_count += 1.0;
+        }
     }
-    let n = unique_vertices.len() as f64;
-    if n == 0.0 {
+    if sample_count == 0.0 {
         return Err(OperationError::InvalidGeometry(
-            "Loop has no vertices".to_string(),
+            "Loop has no edges".to_string(),
         ));
     }
-    let centroid = crate::math::Point3::new(cx / n, cy / n, cz / n);
+    let centroid =
+        crate::math::Point3::new(cx / sample_count, cy / sample_count, cz / sample_count);
     let inner_sign = match base_loop.loop_type {
         crate::primitives::r#loop::LoopType::Inner => -1.0,
         _ => 1.0,
@@ -769,22 +841,13 @@ fn build_loop_side_faces(
             (raw_end, raw_start)
         };
 
-        // Bottom-edge midpoint in 3D as the per-wall sample point.
-        let start_pos = model
-            .vertices
-            .get(loop_start)
-            .ok_or_else(|| OperationError::InvalidGeometry("Start vertex not found".to_string()))?
-            .position;
-        let end_pos = model
-            .vertices
-            .get(loop_end)
-            .ok_or_else(|| OperationError::InvalidGeometry("End vertex not found".to_string()))?
-            .position;
-        let edge_mid = crate::math::Point3::new(
-            0.5 * (start_pos[0] + end_pos[0]),
-            0.5 * (start_pos[1] + end_pos[1]),
-            0.5 * (start_pos[2] + end_pos[2]),
-        );
+        // Per-wall sample point: the bottom edge's CURVE midpoint. Sampling
+        // the curve (not the endpoint-vertex midpoint) keeps this correct for
+        // a closed circular edge, whose two endpoints coincide at the seam —
+        // their midpoint would be the seam itself, not the wall's geometric
+        // centre. `loop_start` / `loop_end` are still used below to address
+        // the shared vertical edges.
+        let edge_mid = sample_edge_point(model, bottom_edge_id, 0.5)?;
         let radial = (edge_mid - centroid) * inner_sign;
         // If the bottom edge happens to pass through the centroid the
         // radial direction degenerates to zero; fall back to any
@@ -851,44 +914,38 @@ fn validate_inner_loops_inside_outer(model: &BRepModel, base_face: &Face) -> Ope
         .normal_at(u_mid, v_mid)
         .map_err(|e| OperationError::NumericalError(format!("Surface normal failed: {:?}", e)))?;
 
+    // Sample the outer boundary from its edge curves so a circular outer loop
+    // (one `Circle` edge, single seam vertex) is a real polygon for the
+    // winding-number test rather than a degenerate point. #24: extruded
+    // circles are now single analytic edges, so the old vertex-only
+    // `Loop::contains_point` returned 0 winding (< 3 vertices) and rejected
+    // every hole inside a round boss/flange.
+    let outer_polygon = sample_loop_polygon(model, outer_loop, 24)?;
+
     for &inner_loop_id in &base_face.inner_loops {
         let inner_loop = model
             .loops
             .get(inner_loop_id)
             .ok_or_else(|| OperationError::InvalidGeometry("Inner loop not found".to_string()))?;
 
-        let inner_vertex_ids = inner_loop.vertices_cached(&model.edges).map_err(|e| {
-            OperationError::NumericalError(format!("Inner loop vertex query failed: {:?}", e))
-        })?;
-        if inner_vertex_ids.is_empty() {
+        // Inner-loop centroid from curve samples, not vertices: a circular
+        // hole's lone seam vertex sits ON the rim, not at the centre.
+        let inner_samples = sample_loop_polygon(model, inner_loop, 12)?;
+        if inner_samples.is_empty() {
             return Err(OperationError::InvalidGeometry(
-                "Inner loop has no vertices".to_string(),
+                "Inner loop has no edges".to_string(),
             ));
         }
-
-        let mut cx = 0.0;
-        let mut cy = 0.0;
-        let mut cz = 0.0;
-        for vid in &inner_vertex_ids {
-            let v = model.vertices.get(*vid).ok_or_else(|| {
-                OperationError::InvalidGeometry("Inner-loop vertex not found".to_string())
-            })?;
-            cx += v.position[0];
-            cy += v.position[1];
-            cz += v.position[2];
+        let n = inner_samples.len() as f64;
+        let (mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0);
+        for p in &inner_samples {
+            cx += p.x;
+            cy += p.y;
+            cz += p.z;
         }
-        let n = inner_vertex_ids.len() as f64;
         let centroid = Point3::new(cx / n, cy / n, cz / n);
 
-        let inside = outer_loop
-            .contains_point(&centroid, &surface_normal, &model.vertices, &model.edges)
-            .map_err(|e| {
-                OperationError::NumericalError(format!(
-                    "Inner-loop containment test failed: {:?}",
-                    e
-                ))
-            })?;
-        if !inside {
+        if !point_in_sampled_polygon(&centroid, &outer_polygon, &surface_normal) {
             return Err(OperationError::InvalidGeometry(format!(
                 "Inner loop {} centroid is not inside the outer loop",
                 inner_loop_id

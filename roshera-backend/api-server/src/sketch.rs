@@ -721,7 +721,7 @@ pub(crate) fn build_loop_edges(
     lifted: &[Point3],
     tolerance: geometry_engine::math::Tolerance,
 ) -> Result<Vec<geometry_engine::primitives::edge::EdgeId>, ApiError> {
-    use geometry_engine::primitives::curve::{Line, ParameterRange, Polyline};
+    use geometry_engine::primitives::curve::{Circle, Line, ParameterRange, Polyline};
     use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 
     let n = lifted.len();
@@ -730,6 +730,68 @@ pub(crate) fn build_loop_edges(
             ErrorCode::InvalidParameter,
             format!("shape[{shape_idx}] lifted polygon has {n} vertices (need ≥2)"),
         ));
+    }
+
+    // Circle → ONE analytic `Circle` edge, not a chord-sampled N-gon (#24).
+    // The kernel's extrude path (`create_ruled_surface` →
+    // `try_build_cylinder_from_circles`) collapses a full-circle profile edge
+    // into a single `Cylinder` lateral face, so the bore/boss/peg gets a real
+    // 3-face cylinder B-Rep instead of ~64 planar strips — which is what makes
+    // it tessellate watertight AND boolean cleanly. The materialised polygon is
+    // still used upstream for region (outer/hole) classification; here we only
+    // build the actual edge.
+    //
+    // `materialise_circle` emits N evenly-spaced points (no duplicate closing
+    // vertex), so the centroid is the exact centre and |p0 − centre| the exact
+    // radius. The plane normal comes from the sample winding (CCW in the sketch
+    // plane ⇒ +normal), matching the polygon path's orientation.
+    if tool == SketchTool::Circle && n >= 3 {
+        let n_f = n as f64;
+        let (mut cx, mut cy, mut cz) = (0.0, 0.0, 0.0);
+        for p in lifted {
+            cx += p.x;
+            cy += p.y;
+            cz += p.z;
+        }
+        let center = Point3::new(cx / n_f, cy / n_f, cz / n_f);
+        let radius = (lifted[0] - center).magnitude();
+        let axis = (lifted[1] - lifted[0])
+            .cross(&(lifted[2] - lifted[1]))
+            .normalize()
+            .map_err(|_| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("shape[{shape_idx}] circle: degenerate normal from samples"),
+                )
+            })?;
+        let circle = Circle::new(center, axis, radius).map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("shape[{shape_idx}] circle curve: {e:?}"),
+            )
+        })?;
+        // Closed-curve seam invariant: the start==end vertex MUST sit at the
+        // curve's parametric origin (t=0 ≡ `x_axis()`), or the lateral face's
+        // u-sweep straddles the seam and the curved-CDT path fails.
+        let ref_dir = circle.x_axis();
+        let seam = Point3::new(
+            center.x + ref_dir.x * radius,
+            center.y + ref_dir.y * radius,
+            center.z + ref_dir.z * radius,
+        );
+        let v = model
+            .vertices
+            .add_or_find(seam.x, seam.y, seam.z, tolerance.distance());
+        let curve_id = model.curves.add(Box::new(circle));
+        let edge = Edge::new(
+            0,
+            v,
+            v,
+            curve_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        );
+        return Ok(vec![model.edges.add(edge)]);
     }
 
     // Closed-loop polyline curve: include the wrap-around vertex
