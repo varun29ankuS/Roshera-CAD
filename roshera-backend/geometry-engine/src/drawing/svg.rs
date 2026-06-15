@@ -233,6 +233,31 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
         out.push_str("\" />\n");
     }
 
+    // Auto-placed dimension callouts (view-space, same frame as polylines).
+    // The line draws in the flipped group; the label re-flips (scale(1 -1)) so
+    // text reads upright — hence the negated y. SVG text is Unicode, so Ø/∠
+    // render directly (no ASCII fallback). Drawn in dimension red.
+    for d in &view.dimensions {
+        if d.kind != "angle" {
+            let _ = write!(
+                out,
+                "    <line x1=\"{:.4}\" y1=\"{:.4}\" x2=\"{:.4}\" y2=\"{:.4}\" \
+                 stroke=\"#cc3300\" stroke-width=\"0.35\" />\n",
+                d.a[0], d.a[1], d.b[0], d.b[1]
+            );
+        }
+        let mx = 0.5 * (d.a[0] + d.b[0]);
+        let my = 0.5 * (d.a[1] + d.b[1]);
+        let _ = write!(
+            out,
+            "    <text class=\"label\" x=\"{:.4}\" y=\"{:.4}\" \
+             transform=\"scale(1 -1)\" fill=\"#cc3300\">{}</text>\n",
+            mx,
+            -my,
+            escape_xml(&d.label)
+        );
+    }
+
     out.push_str("  </g>\n");
 }
 

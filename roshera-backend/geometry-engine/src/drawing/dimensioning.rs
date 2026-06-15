@@ -107,6 +107,43 @@ pub fn visible_dimensions(
         .collect()
 }
 
+/// Assemble a standard third-angle engineering drawing — Front, Top, Right —
+/// of a solid, with the analytic dimensions auto-placed on each view (each view
+/// carries only the callouts that READ in it; edge-on ones are dropped). The
+/// result renders directly via `render_drawing_svg` / `render_drawing_dxf`.
+/// This is the "automatic drawing" verb: solid in, dimensioned drawing out, no
+/// human placement.
+pub fn standard_drawing(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    sheet: super::types::SheetSize,
+    scale: f64,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    use super::projection::project_solid_view;
+    use super::types::{Drawing, ViewSource};
+
+    let mut drawing = Drawing::new("Auto Drawing", sheet);
+    let source = ViewSource::Part {
+        part_id: part_uuid,
+        solid_id,
+    };
+    // Third-angle layout: Top ABOVE Front, Right to the RIGHT of Front.
+    let layout = [
+        (ProjectionType::Front, "FRONT", [80.0, 110.0]),
+        (ProjectionType::Top, "TOP", [80.0, 210.0]),
+        (ProjectionType::Right, "RIGHT", [210.0, 110.0]),
+    ];
+    // A span shorter than ~0.5 model-units in a view is edge-on → drop it.
+    let min_span = 0.5_f64;
+    for (proj, name, pos) in layout {
+        let mut view = project_solid_view(model, source.clone(), proj, name, pos, scale)?;
+        view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+        drawing.add_view(view);
+    }
+    Ok(drawing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +203,34 @@ mod tests {
             !has(&vis, "extent", 30.0),
             "edge-on Y extent dropped from Front"
         );
+    }
+
+    #[test]
+    fn standard_drawing_renders_a_dimensioned_svg() {
+        let mut m = BRepModel::new();
+        let b = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box"));
+        let dwg = standard_drawing(
+            &m,
+            b,
+            uuid::Uuid::nil(),
+            super::super::types::SheetSize::A3,
+            1.0,
+        )
+        .expect("standard drawing");
+        assert_eq!(dwg.views.len(), 3, "front/top/right");
+        assert!(
+            dwg.views.iter().all(|v| !v.dimensions.is_empty()),
+            "every view auto-dimensioned"
+        );
+        let svg = crate::drawing::render_drawing_svg(&dwg);
+        // The drawing carries the dimension lines (red) and the EXACT values —
+        // 40 / 30 / 20 each read in the view that reveals them.
+        assert!(svg.contains("#cc3300"), "dimension lines rendered");
+        assert!(svg.contains("40.00"), "40mm extent value drawn");
+        assert!(svg.contains("30.00"), "30mm extent value drawn");
+        assert!(svg.contains("20.00"), "20mm extent value drawn");
     }
 
     #[test]

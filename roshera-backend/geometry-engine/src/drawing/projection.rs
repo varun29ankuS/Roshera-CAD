@@ -268,6 +268,7 @@ pub fn project_solid_view(
         scale,
         polylines,
         extent,
+        dimensions: Vec::new(),
     })
 }
 
