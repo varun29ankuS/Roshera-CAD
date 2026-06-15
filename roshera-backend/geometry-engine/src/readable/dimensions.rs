@@ -123,6 +123,35 @@ fn world_aabb(model: &BRepModel, solid_id: SolidId) -> Option<Aabb> {
             }
         }
     }
+
+    // Edgeless closed analytic surfaces (a full sphere has NO seam edge, so the
+    // edge loop above contributes nothing) — add their exact ±radius envelope
+    // so extents stay sound. Cylinders/cones are bounded by cap/base edges and
+    // are already covered.
+    if let Some(solid) = model.solids.get(solid_id) {
+        let mut shells = vec![solid.outer_shell];
+        shells.extend_from_slice(&solid.inner_shells);
+        for sh in shells {
+            let shell = match model.shells.get(sh) {
+                Some(s) => s,
+                None => continue,
+            };
+            for &fid in &shell.faces {
+                let face = match model.faces.get(fid) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                if let Some(surf) = model.surfaces.get(face.surface_id) {
+                    if let Some(sph) = surf.as_any().downcast_ref::<Sphere>() {
+                        let (c, r) = (sph.center, sph.radius);
+                        aabb.add([c.x - r, c.y - r, c.z - r]);
+                        aabb.add([c.x + r, c.y + r, c.z + r]);
+                    }
+                }
+            }
+        }
+    }
+
     if aabb.any {
         Some(aabb)
     } else {
