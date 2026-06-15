@@ -448,12 +448,16 @@ server.tool(
       await api("POST", `/api/sketch/${s.id}/point`, {
         point: [cx + width / 2, cy + depth / 2],
       });
-      await api("POST", `/api/sketch/${s.id}/extrude`, {
+      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
         distance: height,
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return ok({
+        object_uuid: r.object?.id ?? null, // operand for boolean / transform
+        part_id: id,
+        placement: id !== null ? await placement(id) : null,
+      });
     } catch (e) {
       return fail(e);
     }
@@ -478,12 +482,16 @@ server.tool(
       const s = await api("POST", "/api/sketch", { plane, tool: "circle" });
       await api("POST", `/api/sketch/${s.id}/point`, { point: [cx, cy] });
       await api("POST", `/api/sketch/${s.id}/point`, { point: [cx + radius, cy] });
-      await api("POST", `/api/sketch/${s.id}/extrude`, {
+      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
         distance: height,
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return ok({
+        object_uuid: r.object?.id ?? null, // operand for boolean / transform
+        part_id: id,
+        placement: id !== null ? await placement(id) : null,
+      });
     } catch (e) {
       return fail(e);
     }
@@ -514,7 +522,11 @@ server.tool(
         name: name ?? null,
       });
       const id = r.solid_id ?? (await newestPartId());
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return ok({
+        object_uuid: r.object?.id ?? null, // operand for boolean / transform
+        part_id: id,
+        placement: id !== null ? await placement(id) : null,
+      });
     } catch (e) {
       return fail(e);
     }
@@ -527,12 +539,16 @@ server.tool(
   { radius: z.number().positive(), name: z.string().optional() },
   async ({ radius }) => {
     try {
-      await api("POST", "/api/geometry", {
+      const r = await api("POST", "/api/geometry", {
         shape_type: "sphere",
         parameters: { radius },
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return ok({
+        object_uuid: r.object?.id ?? null, // operand for boolean / transform
+        part_id: id,
+        placement: id !== null ? await placement(id) : null,
+      });
     } catch (e) {
       return fail(e);
     }
@@ -571,6 +587,7 @@ server.tool(
       });
       const id = r.solid_id ?? (await newestPartId());
       return ok({
+        object_uuid: r.object?.id ?? null, // operand for boolean / transform
         part_id: id,
         triangles: r?.stats?.triangle_count ?? null,
         placement: id !== null ? await placement(id) : null,
@@ -646,12 +663,16 @@ server.tool(
           point: [hx + r, hy],
         });
       }
-      await api("POST", `/api/sketch/${s.id}/extrude`, {
+      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
         distance: height,
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return ok({
+        object_uuid: r.object?.id ?? null, // operand for boolean / transform
+        part_id: id,
+        placement: id !== null ? await placement(id) : null,
+      });
     } catch (e) {
       return fail(e);
     }
