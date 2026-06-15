@@ -21,7 +21,7 @@ use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::queries::raycast_solid;
 
-use super::projection::{view_matrix_for_projection, ProjectionError, DEFAULT_CURVE_SAMPLES};
+use super::projection::{view_matrix_for_projection, ProjectionError};
 use super::types::{Polyline2d, ProjectionType};
 
 /// The edges of a view split by visibility. `visible` draws solid; `hidden`
@@ -268,6 +268,7 @@ pub fn project_solid_edges_visibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drawing::projection::DEFAULT_CURVE_SAMPLES;
     use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
 
