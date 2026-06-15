@@ -90,6 +90,105 @@ fn assert_clean_void(rc: f64, rs: f64) {
     );
 }
 
+/// DIAGNOSTIC (task #7): localize the enclosed-void invalidity. Validate a LONE
+/// sphere, a LONE cylinder, and the cyl∖sphere result; print per-solid shell
+/// count + the Euler residual message. Tells us whether the sphere PRIMITIVE's
+/// B-Rep is the odd-Euler source or whether the difference's void-shell drops
+/// the sphere seam/poles.
+#[test]
+#[ignore = "diagnostic — run with --ignored --nocapture"]
+fn diag_cyl_sphere_validity_structure_7() {
+    let report = |label: &str, m: &BRepModel, s: geometry_engine::primitives::solid::SolidId| {
+        let v = validate_solid_scoped(m, s, Tolerance::default(), ValidationLevel::Standard);
+        let solid = m.solids.get(s);
+        let n_shells = solid.map(|sd| 1 + sd.inner_shells.len()).unwrap_or(0);
+        eprintln!("[{label}] valid={} shells={n_shells}", v.is_valid);
+        for e in v.errors.iter().take(4) {
+            eprintln!("    {e:?}");
+        }
+    };
+    // Lone sphere.
+    let mut ms = BRepModel::new();
+    let sp = sid(TopologyBuilder::new(&mut ms)
+        .create_sphere_3d(Point3::ORIGIN, 4.0)
+        .expect("sphere"));
+    report("lone-sphere-r4", &ms, sp);
+    // Lone cylinder.
+    let mut mc = BRepModel::new();
+    let cy = sid(TopologyBuilder::new(&mut mc)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -5.0), Vector3::Z, 5.0, 10.0)
+        .expect("cyl"));
+    report("lone-cyl-r5", &mc, cy);
+    // The difference.
+    let mut m = BRepModel::new();
+    let cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -5.0), Vector3::Z, 5.0, 10.0)
+        .expect("cylinder"));
+    let sph = sid(TopologyBuilder::new(&mut m)
+        .create_sphere_3d(Point3::ORIGIN, 4.0)
+        .expect("sphere"));
+    let res = boolean_operation(
+        &mut m,
+        cyl,
+        sph,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("difference");
+    report("cyl-minus-sphere", &m, res);
+
+    // Per-shell unique edge/vertex/loop counts (the Euler decomposition).
+    let dump_shell = |label: &str,
+                      mm: &BRepModel,
+                      sh_id: geometry_engine::primitives::shell::ShellId| {
+        use std::collections::HashSet;
+        let mut edges = HashSet::new();
+        let mut verts = HashSet::new();
+        let mut n_loops = 0usize;
+        let mut n_faces = 0usize;
+        if let Some(sh) = mm.shells.get(sh_id) {
+            n_faces = sh.faces.len();
+            for &fid in &sh.faces {
+                if let Some(f) = mm.faces.get(fid) {
+                    for lid in std::iter::once(f.outer_loop).chain(f.inner_loops.iter().copied()) {
+                        if let Some(lp) = mm.loops.get(lid) {
+                            n_loops += 1;
+                            for &eid in &lp.edges {
+                                edges.insert(eid);
+                                if let Some(e) = mm.edges.get(eid) {
+                                    verts.insert(e.start_vertex);
+                                    verts.insert(e.end_vertex);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (vn, en, fnn) = (verts.len() as i64, edges.len() as i64, n_faces as i64);
+        eprintln!(
+            "    [{label}] shell {sh_id:?}: F={n_faces} loops={n_loops} E={} V={} chi={}",
+            edges.len(),
+            verts.len(),
+            vn - en + fnn
+        );
+    };
+    // Lone sphere structure for comparison.
+    if let Some(solid) = ms.solids.get(sp) {
+        dump_shell("lone-sphere", &ms, solid.outer_shell);
+    }
+    if let Some(solid) = m.solids.get(res) {
+        eprintln!(
+            "    outer_shell={:?} inner_shells={:?}",
+            solid.outer_shell, solid.inner_shells
+        );
+        dump_shell("result-outer", &m, solid.outer_shell);
+        for &is in &solid.inner_shells {
+            dump_shell("result-void", &m, is);
+        }
+    }
+}
+
 /// SAME radius — sphere tangent to the cylinder wall along the whole equator.
 /// The degenerate tangency case the marching cyl∘sphere SSI cannot trace.
 #[test]
@@ -99,9 +198,11 @@ fn cyl_minus_sphere_same_radius_7() {
 }
 
 /// SMALLER enclosed sphere — a clean interior spherical void; no wall tangency.
-/// The mesh closes but the void-shell B-Rep validates invalid today.
+/// FIXED (validator): the spherical void shell is a seamless closed face (χ=2),
+/// which the Euler–Poincaré check now accounts for in a mixed (seamed outer +
+/// seamless void) solid. Geometry was always correct (watertight, exact volume);
+/// only the validity check was wrong. This is now a passing GATE.
 #[test]
-#[ignore = "task #7: cyl∘sphere enclosed-void B-Rep invalid — flip on when it lands"]
 fn cyl_minus_sphere_enclosed_void_7() {
     assert_clean_void(5.0, 4.0);
 }
