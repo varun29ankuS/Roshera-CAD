@@ -1237,6 +1237,39 @@ fn tessellation_developable_is_linear_watertight_valid() {
             "{label}: fine/default tri ratio {n_fine}/{n_default} is super-linear \
              (developable must scale ~linearly with angular resolution)"
         );
+
+        // ACCURACY floor (the invariant a tri-budget + watertight check MISSED:
+        // an under-tessellated developable can be watertight, valid, AND within
+        // budget yet 43% wrong in volume — the c9715d3 skip-refinement bug the
+        // oracle caught). Tessellate at a moderate chord and require the
+        // divergence-theorem volume to match analytic. Watertight ≠ accurate.
+        let analytic_vol = match *label {
+            "cylinder" => std::f64::consts::PI * 9.0 * 9.0 * 20.0,
+            "cone-frustum" => {
+                std::f64::consts::PI * 20.0 / 3.0 * (9.0 * 9.0 + 9.0 * 4.0 + 4.0 * 4.0)
+            }
+            _ => continue,
+        };
+        let mut acc = TessellationParams::default();
+        acc.chord_tolerance = 0.01;
+        let vmesh = tessellate_solid(m.solids.get(s).expect("solid"), &m, &acc);
+        // Divergence-theorem volume of the closed mesh.
+        let mut vol = 0.0;
+        for t in &vmesh.triangles {
+            let a = vmesh.vertices[t[0] as usize].position;
+            let b = vmesh.vertices[t[1] as usize].position;
+            let c = vmesh.vertices[t[2] as usize].position;
+            vol += (a.x * (b.y * c.z - b.z * c.y) - a.y * (b.x * c.z - b.z * c.x)
+                + a.z * (b.x * c.y - b.y * c.x))
+                / 6.0;
+        }
+        let vol = vol.abs();
+        let rel = (vol - analytic_vol).abs() / analytic_vol;
+        assert!(
+            rel < 0.05,
+            "{label}: mesh volume {vol:.1} vs analytic {analytic_vol:.1} (rel {rel:.3}) — \
+             under-tessellated (developable lateral too coarse)?"
+        );
     }
 }
 
