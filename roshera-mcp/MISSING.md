@@ -65,3 +65,21 @@ bore+counterbore), no booleans → 0/0, closed manifold. Bolt holes remain the g
 missing primitive is a robust union of that extruded flange with the revolved
 tube (the tube revolve itself needs finding #3's clean-state to validate).
 
+
+## N. Cylinder surface closest_point blind spots (found by #15 spatial-query harness) [OPEN, kernel]
+The spatial-query core (`queries::nearest_on_solid` / `signed_distance`) is exact
+against analytic SDFs for box/sphere/cylinder-wall, EXCEPT two `Cylinder`
+`closest_point` degeneracies surfaced by the #15 harness:
+- **Axis point (ρ=0):** a point exactly on the cylinder axis has no defined
+  radial projection (any angle), so nearest falls back to a cap instead of the
+  (nearer) wall. e.g. point on axis at mid-height of an r=10 cyl reports distance
+  to cap, not 10 to the wall.
+- **Seam (u=0, +X) projection:** a radial probe whose nearest wall point sits on
+  the u=0 seam is rejected by `point_inside_face_uv` (the seam is excluded from
+  the trim), so nearest again falls to a cap. Off-seam probes (+Y etc.) are exact.
+Both are the SAME root family as the raycast seam caveat (#12/#13). A real fix =
+treat the u=0 seam as in-trim for closest-point/containment (periodic wrap), and
+special-case the axis-point as "nearest = wall at distance r". Deferred: low-impact
+(measure-zero probe locations), and the seam fix touches the shared trim predicate
+used everywhere, so it needs a careful pass. The #15 harness pins both by probing
+off-seam/off-axis and documenting the exclusion.
