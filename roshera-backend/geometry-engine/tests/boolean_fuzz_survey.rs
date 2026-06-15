@@ -896,6 +896,89 @@ fn boolean_box_cone_fuzz_survey() {
     );
 }
 
+/// PIN (task #1): the cone-radial conic-cut worst class — the deepest open
+/// boolean-core defect. A z-axis cone whose base is shifted to x=1.0 so its
+/// slanted LATERAL surface pierces the box's +X wall (plane x=1). A cone
+/// lateral × plane intersection is a CONIC — here a HYPERBOLA (cutting plane
+/// parallel to the cone axis) — not a circle or a line. The split/classify/
+/// stitch pipeline cannot form that hyperbolic boundary curve, so the conic
+/// patch is dropped or mis-stitched.
+///
+/// Characterized failure signature (2026-06-15, ROSHERA_BOOL_TRACE):
+///   ∩ → InvalidBRep "component 0 has only 3 planar faces" (the hyperbolic
+///       conic patch is dropped entirely → can't close a manifold).
+///   ∪ → vol −1.2%, open=6, nonmanifold=2, odd Euler (3 faces share the conic
+///       boundary edge + boundary gaps).
+///   ∖ → vol −1.3%, open=8, odd Euler (gaps along the conic cut).
+///
+/// This asserts the CORRECT outcome (watertight + valid + volume within tol);
+/// it FAILS today, so it is #[ignore]'d. Flip on when #1 (analytic cone×plane
+/// conic SSI + conic-patch stitching, ties #7) lands. Run the live signature:
+///   `cargo test -p geometry-engine --test boolean_fuzz_survey \
+///        cone_radial_conic_cut_pin_1 -- --ignored --nocapture`
+#[test]
+#[ignore = "task #1: cone-radial conic-cut (hyperbola) not yet stitched — flip on when #1 lands"]
+fn cone_radial_conic_cut_pin_1() {
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+
+    let (bc, rb, rt, h) = ([1.0, 0.0, -0.5], 0.5, 0.3, 1.0); // "radial-face+x"
+    let truth = cone_grid_truth(bc, rb, rt, h);
+    let ops: [(BooleanOp, &str, f64); 3] = [
+        (BooleanOp::Intersection, "∩", truth.intersection),
+        (BooleanOp::Union, "∪", truth.union),
+        (BooleanOp::Difference, "∖", truth.difference),
+    ];
+    eprintln!(
+        "[cone-radial #1] cone base={bc:?} rb={rb} rt={rt} h={h} (lateral pierces plane x=1 → hyperbola)"
+    );
+    let mut failures = Vec::new();
+    for (op, sym, t) in ops {
+        let mut model = BRepModel::new();
+        let bx = the_box(&mut model);
+        let cn = cone(&mut model, bc, rb, rt, h);
+        match boolean_operation(&mut model, bx, cn, op, BooleanOptions::default()) {
+            Ok(res) => {
+                let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+                let rep = brep_integrity(&model, res, 1e-6);
+                let v = validate_solid_scoped(
+                    &model,
+                    res,
+                    Tolerance::default(),
+                    ValidationLevel::Standard,
+                );
+                let (open, nm) = (rep.edges_used_once.len(), rep.edges_used_3plus.len());
+                let rel = (vol - t).abs() / t.max(1e-9);
+                eprintln!(
+                    "  {sym}: vol={vol:.4} truth={t:.4} ({:+.1}%)  open={open} nonmanifold={nm}  valid={}",
+                    100.0 * (vol - t) / t.max(1e-9),
+                    v.is_valid,
+                );
+                if !v.is_valid {
+                    eprintln!("      B-Rep errors: {:?}", v.errors);
+                }
+                if open != 0 || nm != 0 {
+                    failures.push(format!("{sym}: open={open} nonmanifold={nm}"));
+                }
+                if !v.is_valid {
+                    failures.push(format!("{sym}: invalid B-Rep"));
+                }
+                if rel > 0.03 {
+                    failures.push(format!("{sym}: vol {vol:.4} vs truth {t:.4}"));
+                }
+            }
+            Err(e) => {
+                eprintln!("  {sym}: ERROR {e:?} (truth {t:.4})");
+                failures.push(format!("{sym}: ERROR {e:?}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "cone-radial conic-cut (#1) still broken: {failures:?}"
+    );
+}
+
 // ===========================================================================
 // box ∘ ROTATED-BOX survey — second solid is a unit-ish box rotated by an
 // arbitrary axis/angle. All-planar, but the rotated faces cut the axis-aligned

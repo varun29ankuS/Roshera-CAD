@@ -100,6 +100,25 @@ lands.
 
 ## Boolean
 
+### #1 🔴 Cone-radial conic-cut blindness (worst class, task #1, 21 HARD cells)
+A z-axis cone shifted off-axis (base at x=1.0) so its slanted LATERAL surface
+pierces a box side wall (plane x=1). The cone-lateral × plane intersection is a
+CONIC — a HYPERBOLA when the cutting plane is parallel to the cone axis — not a
+circle or a line. The split/classify/stitch pipeline cannot form that hyperbolic
+boundary curve, so the conic patch is dropped or mis-stitched. Characterized
+signature (`radial-face+x`: bc=[1,0,-0.5] rb=0.5 rt=0.3 h=1):
+- **∩** → `InvalidBRep` "component 0 has only 3 planar faces" — the hyperbolic
+  conic patch is dropped entirely, so no closed manifold can form.
+- **∪** → vol −1.2%, open=6, nonmanifold=2, odd Euler (3 faces share the conic
+  boundary edge + boundary gaps).
+- **∖** → vol −1.3%, open=8, odd Euler (gaps along the conic cut).
+Fix lane: analytic cone×plane conic SSI (recognize circle / ellipse / parabola /
+hyperbola / 1–2 lines by orientation) + conic-patch stitching — DEEP, multi-fire,
+ties task #7 (analytic SSI arms). Pinned: `boolean_fuzz_survey.rs::
+cone_radial_conic_cut_pin_1` (#[ignore], asserts watertight+valid+vol — flip on
+when #1 lands). The 33-cell curved poke matrix (`harness::poke_matrix`) stays
+fully green; this off-axis conic class is the remaining frontier.
+
 ### #86 🟢 FIXED — 6-boss mount-plate chained booleans appeared to HANG the kernel
 **Root cause (2026-06-14): NOT a boolean bug and NOT an infinite loop — it was
 catastrophically-slow but finite OPERAND TESSELLATION, surfaced through the
