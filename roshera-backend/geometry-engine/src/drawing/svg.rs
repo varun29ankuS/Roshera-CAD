@@ -108,6 +108,11 @@ fn write_stylesheet(out: &mut String) {
         "    .view polyline { fill: none; stroke: #111; stroke-width: 0.2; \
          stroke-linejoin: round; stroke-linecap: round; }\n",
     );
+    // Centerline: thin chain (dash-dot) line, ISO 128 convention.
+    out.push_str(
+        "    .centerline { stroke: #111; stroke-width: 0.18; fill: none; \
+         stroke-dasharray: 4 1 1 1; stroke-linecap: round; }\n",
+    );
     out.push_str("    .label { font: 3.6px sans-serif; fill: #444; }\n");
     out.push_str(
         "    .zone { font: 700 3px sans-serif; fill: #111; text-anchor: middle; \
@@ -231,6 +236,19 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
             let _ = write!(out, "{:.4},{:.4}", p[0], p[1]);
         }
         out.push_str("\" />\n");
+    }
+
+    // Chain-line centerlines for circular features (view-space, same frame as
+    // the polylines). Drawn before dimensions so callouts sit on top.
+    for cl in &view.centerlines {
+        for s in &cl.segments {
+            let _ = write!(
+                out,
+                "    <line class=\"centerline\" x1=\"{:.4}\" y1=\"{:.4}\" \
+                 x2=\"{:.4}\" y2=\"{:.4}\" />\n",
+                s[0], s[1], s[2], s[3]
+            );
+        }
     }
 
     // Auto-placed dimension callouts (view-space, same frame as polylines).

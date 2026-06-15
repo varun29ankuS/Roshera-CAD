@@ -269,6 +269,7 @@ pub fn project_solid_view(
         polylines,
         extent,
         dimensions: Vec::new(),
+        centerlines: Vec::new(),
     })
 }
 
