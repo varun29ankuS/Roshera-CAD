@@ -1199,6 +1199,9 @@ fn surface_surface_intersection(
             plane_sphere_intersection(surface_a, surface_b, tolerance)
         }
         (Sphere, Sphere) => sphere_sphere_intersection(surface_a, surface_b, tolerance),
+        (Cylinder, Sphere) | (Sphere, Cylinder) => {
+            cylinder_sphere_intersection(surface_a, surface_b, tolerance)
+        }
         (Planar, Cone) | (Cone, Planar) => plane_cone_intersection(surface_a, surface_b, tolerance),
         _ => {
             use crate::primitives::surface::SurfaceType;
@@ -2645,6 +2648,103 @@ fn sphere_sphere_intersection(
     };
 
     Ok(vec![curve])
+}
+
+/// Closed-form cylinder(lateral)–sphere intersection for a COAXIAL sphere
+/// (centre on the cylinder axis) — BOOL #7. A cylinder lateral `radial = rc`
+/// meets a sphere of radius `rs` centred at axial position `s` on the axis where
+/// `rc² + (t − s)² = rs²` (t = axial coord), i.e. two circles at
+/// `t = s ± √(rs² − rc²)` of radius `rc`. Cases:
+///   * rs > rc (sphere pokes THROUGH the wall): two transverse circles (clipped
+///     to the cylinder's finite axial extent).
+///   * rs ≤ rc (sphere tangent to, or inside, the wall): NO transverse section —
+///     return empty. The sphere does not separate the lateral, so the difference
+///     takes the enclosed-void path. (The marching solver wrongly traced the
+///     tangent equator circle for rs=rc → ~200 open edges; this is the fix.)
+/// An OFF-axis sphere cuts the cylinder in a general quartic with no closed form
+/// here — fall back to the (now step-capped) marching solver. Cap faces are
+/// PLANAR and dispatch to `plane_sphere_intersection` separately.
+fn cylinder_sphere_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::{Cylinder, Sphere};
+
+    // Identify which operand is the cylinder; keep (a, b) ordering for the
+    // parametric images.
+    let (cyl, sphere, cyl_is_a) = if let (Some(c), Some(s)) = (
+        surface_a.as_any().downcast_ref::<Cylinder>(),
+        surface_b.as_any().downcast_ref::<Sphere>(),
+    ) {
+        (c, s, true)
+    } else if let (Some(s), Some(c)) = (
+        surface_a.as_any().downcast_ref::<Sphere>(),
+        surface_b.as_any().downcast_ref::<Cylinder>(),
+    ) {
+        (c, s, false)
+    } else {
+        // Cylinder/Sphere KIND but not the concrete analytic types — marching
+        // fallback (KNOWN_BUGS #40 pattern).
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    };
+
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let rc = cyl.radius;
+    let rs = sphere.radius;
+    let tol = tolerance.distance();
+
+    // Sphere centre in the cylinder's axial/radial frame.
+    let rel = sphere.center - origin;
+    let s_axial = rel.dot(&axis);
+    let d = (rel - axis * s_axial).magnitude(); // radial offset from the axis
+
+    // Off-axis → general quartic; no closed form. Marching (step-capped) handles
+    // it without hanging.
+    if d > tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+
+    let disc = rs * rs - rc * rc;
+    if disc <= tol * tol {
+        // rs ≤ rc: tangent to or inside the wall — no separating section.
+        return Ok(vec![]);
+    }
+    let off = disc.sqrt();
+
+    let (h_lo, h_hi) = match cyl.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+
+    let mut curves = Vec::new();
+    for t in [s_axial - off, s_axial + off] {
+        if t < h_lo - tol || t > h_hi + tol {
+            continue; // circle lies beyond the cylinder's finite extent
+        }
+        let circle = Circle::new(origin + axis * t, axis, rc)?;
+        let params_cyl = compute_circle_cylinder_parameters(&circle, cyl)?;
+        let params_sph = compute_circle_sphere_parameters(&circle, sphere)?;
+        let (on_surface_a, on_surface_b) = if cyl_is_a {
+            (
+                create_parametric_curve(&params_cyl),
+                create_parametric_curve(&params_sph),
+            )
+        } else {
+            (
+                create_parametric_curve(&params_sph),
+                create_parametric_curve(&params_cyl),
+            )
+        };
+        curves.push(SurfaceIntersectionCurve {
+            curve: Box::new(circle),
+            on_surface_a,
+            on_surface_b,
+        });
+    }
+    Ok(curves)
 }
 
 /// Closed-form plane–cone intersection.
@@ -17916,6 +18016,57 @@ mod tests {
                 "[cone-plane SSI #1] {label}: {} curve(s), {n_pts} points all on both surfaces",
                 curves.len()
             );
+        }
+    }
+
+    /// ISOLATED SSI test (BOOL #7): the analytic cylinder×sphere arm. A coaxial
+    /// sphere (centre on the cylinder axis) cuts the lateral in circles ONLY
+    /// when rs > rc; rs ≤ rc is tangent/inside → no separating section. Verifies
+    /// every returned curve point lies on BOTH surfaces (distance oracle) and
+    /// the count is right per case. Cylinder: origin (0,0,-5), axis +Z, rc=5,
+    /// height [0,10] (z∈[-5,5]); sphere at origin.
+    #[test]
+    fn cylinder_sphere_ssi_arm_7() {
+        use crate::primitives::surface::{Cylinder, Sphere};
+        let tol = Tolerance::default();
+        let cyl =
+            Cylinder::new_finite(Point3::new(0.0, 0.0, -5.0), Vector3::Z, 5.0, 10.0).expect("cyl");
+        // (rs, expected curve count)
+        let cases: [(f64, usize); 3] = [
+            (6.0, 2), // pokes through the wall → two transverse circles
+            (5.0, 0), // tangent to the wall → no separating section
+            (4.0, 0), // fully inside the wall → none
+        ];
+        for (rs, want) in cases {
+            let sphere = Sphere::new(Point3::ORIGIN, rs).expect("sphere");
+            let curves = surface_surface_intersection(&cyl, &sphere, &tol)
+                .unwrap_or_else(|e| panic!("rs={rs}: SSI errored {e:?}"));
+            assert_eq!(
+                curves.len(),
+                want,
+                "rs={rs}: expected {want} circle(s), got {}",
+                curves.len()
+            );
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                for i in 0..=24 {
+                    let t = range.start + (range.end - range.start) * (i as f64 / 24.0);
+                    let p = sic.curve.point_at(t).expect("curve point");
+                    // On the cylinder lateral: radial distance from axis == rc.
+                    let rel = p - Point3::new(0.0, 0.0, -5.0);
+                    let radial = (rel - Vector3::Z * rel.dot(&Vector3::Z)).magnitude();
+                    assert!(
+                        (radial - 5.0).abs() < 1e-6,
+                        "rs={rs}: point {p:?} off cylinder (radial {radial})"
+                    );
+                    // On the sphere: distance from centre == rs.
+                    let dr = (p - Point3::ORIGIN).magnitude();
+                    assert!(
+                        (dr - rs).abs() < 1e-6,
+                        "rs={rs}: point {p:?} off sphere (dist {dr})"
+                    );
+                }
+            }
         }
     }
 }
