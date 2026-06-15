@@ -896,103 +896,90 @@ fn boolean_box_cone_fuzz_survey() {
     );
 }
 
-/// PIN (task #1): the cone-radial conic-cut worst class — the deepest open
-/// boolean-core defect. A z-axis cone whose base is shifted to x=1.0 so its
-/// slanted LATERAL surface pierces the box's +X wall (plane x=1). The box +X
-/// wall here CONTAINS the cone axis (x=1, y=0, z varying), so the cone × plane
-/// section is TWO GENERATOR LINES (the dd≈0 branch of
-/// `plane_cone_parallel_intersection`); off-axis radial cells are a hyperbola.
+/// GATE (task #1): the cone-radial conic-cut class — long the deepest open
+/// boolean-core defect, now FIXED (2026-06-15). A z-axis cone shifted off-axis
+/// so its slanted LATERAL surface pierces a box side wall; the cone × plane
+/// section is two generator lines (wall ∋ axis) or a hyperbola (offset). The
+/// cone lateral, split by the generators, must keep its INSIDE angular strip.
 ///
-/// LOCALIZED (2026-06-15): the analytic cone×plane SSI arm is CORRECT — the
-/// lib test `boolean::tests::cone_plane_ssi_points_lie_on_both_surfaces_1`
-/// confirms every intersection-curve point lies on BOTH surfaces for the
-/// circle / two-line / hyperbola orientations AND that the axial cut straddles
-/// the cone (a complete two-sided partition). So the defect is DOWNSTREAM.
+/// ROOT CAUSE + FIX: `split_face_by_curves` had a sector splitter for the
+/// CYLINDER lateral (`split_cylinder_lateral_by_sectors`) but none for the
+/// CONE — so cone generator cuts fell through to the generic DCEL, which can't
+/// partition the periodic cone u-domain and dropped the inside angular strip
+/// (x<1, cone angles ≈90°–270°). ∩ then kept only the 3 planar faces. Added
+/// `split_cone_face_by_sectors` (the cone analogue: axial = distance-from-apex,
+/// rim radius = v·tan(half_angle)); the inside strip is now a proper fragment.
+/// Cleared 18 of the 21 cone HARD fuzz cells. SSI was already correct (the
+/// `cone_plane_ssi_points_lie_on_both_surfaces_1` harness); the defect was
+/// purely the curved-face arrangement.
 ///
-/// STAGE-PRECISE (2026-06-15, ROSHERA_BOOL_TRACE on box∩cone): the cone lateral
-/// `face=8` is split by the 2 generator lines into 3 fragments — but ALL three
-/// classify Outside, with interior points (1.3,−0.3,0.0), (1.5,0,−0.3),
-/// (1.3,−0.3,0.6) — every one in the OUTSIDE angular half (x≥1.3). The INSIDE
-/// angular strip (x<1, cone angles ≈90°–270°) is NEVER produced as a fragment:
-/// `split_face_by_curves`' UV arrangement on the curved cone face fails to
-/// extract it (loops_extracted=3, all on the outside half). So no Inside cone
-/// fragment reaches selection → ∩ keeps only the 3 planar faces. Implicates #6
-/// (dropped boolean pcurves): the cut-line (u,v) images are dropped and
-/// re-projected, and on the cone the re-projected generators don't close the
-/// inside strip. Fix = curved-face arrangement / persist pcurves.
+/// REMAINING (still a frontier, not gated here): `radial-poke-past`
+/// (bc=[1.4,…], cone base ENTIRELY outside the box) — a distinct sub-case
+/// (∩ vol +199%, open=2; ∖ nonmanifold=2). Tracked under #1.
 ///
-/// Characterized failure signature (2026-06-15, ROSHERA_BOOL_TRACE):
-///   ∩ → InvalidBRep "component 0 has only 3 planar faces" (the cone-lateral
-///       patch is dropped entirely; only base disc + top disc + +X wall remain).
-///   ∪ → vol −1.2%, open=6, nonmanifold=2, odd Euler (3 faces share the cut
-///       edge + boundary gaps).
-///   ∖ → vol −1.3%, open=8, odd Euler (gaps along the cut).
-///
-/// This asserts the CORRECT outcome (watertight + valid + volume within tol);
-/// it FAILS today, so it is #[ignore]'d. Flip on when #1 (split/classify keeps
-/// the cone-lateral conic patch; ties #7) lands. Run the live signature:
+/// This GATE asserts the correct outcome (watertight + valid + volume within
+/// 3%) for the now-fixed cells; it PASSES. Live signature:
 ///   `cargo test -p geometry-engine --test boolean_fuzz_survey \
-///        cone_radial_conic_cut_pin_1 -- --ignored --nocapture`
+///        cone_radial_conic_cut_gate_1 -- --nocapture`
 #[test]
-#[ignore = "task #1: cone-radial conic-cut (hyperbola) not yet stitched — flip on when #1 lands"]
-fn cone_radial_conic_cut_pin_1() {
+fn cone_radial_conic_cut_gate_1() {
     use geometry_engine::math::Tolerance;
     use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 
-    let (bc, rb, rt, h) = ([1.0, 0.0, -0.5], 0.5, 0.3, 1.0); // "radial-face+x"
-    let truth = cone_grid_truth(bc, rb, rt, h);
-    let ops: [(BooleanOp, &str, f64); 3] = [
-        (BooleanOp::Intersection, "∩", truth.intersection),
-        (BooleanOp::Union, "∪", truth.union),
-        (BooleanOp::Difference, "∖", truth.difference),
+    // (base_center, base_r, top_r, height, label) — the two fixed radial cells.
+    let cells: [([f64; 3], f64, f64, f64, &str); 2] = [
+        ([1.0, 0.0, -0.5], 0.5, 0.3, 1.0, "radial-face+x"),
+        ([1.0, 1.0, -0.5], 0.5, 0.3, 1.0, "radial-edge"),
     ];
-    eprintln!(
-        "[cone-radial #1] cone base={bc:?} rb={rb} rt={rt} h={h} (lateral pierces plane x=1 → hyperbola)"
-    );
     let mut failures = Vec::new();
-    for (op, sym, t) in ops {
-        let mut model = BRepModel::new();
-        let bx = the_box(&mut model);
-        let cn = cone(&mut model, bc, rb, rt, h);
-        match boolean_operation(&mut model, bx, cn, op, BooleanOptions::default()) {
-            Ok(res) => {
-                let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
-                let rep = brep_integrity(&model, res, 1e-6);
-                let v = validate_solid_scoped(
-                    &model,
-                    res,
-                    Tolerance::default(),
-                    ValidationLevel::Standard,
-                );
-                let (open, nm) = (rep.edges_used_once.len(), rep.edges_used_3plus.len());
-                let rel = (vol - t).abs() / t.max(1e-9);
-                eprintln!(
-                    "  {sym}: vol={vol:.4} truth={t:.4} ({:+.1}%)  open={open} nonmanifold={nm}  valid={}",
-                    100.0 * (vol - t) / t.max(1e-9),
-                    v.is_valid,
-                );
-                if !v.is_valid {
-                    eprintln!("      B-Rep errors: {:?}", v.errors);
-                }
-                if open != 0 || nm != 0 {
-                    failures.push(format!("{sym}: open={open} nonmanifold={nm}"));
-                }
-                if !v.is_valid {
-                    failures.push(format!("{sym}: invalid B-Rep"));
-                }
-                if rel > 0.03 {
-                    failures.push(format!("{sym}: vol {vol:.4} vs truth {t:.4}"));
-                }
+    for (bc, rb, rt, h, label) in cells {
+        let truth = cone_grid_truth(bc, rb, rt, h);
+        let ops: [(BooleanOp, &str, f64); 3] = [
+            (BooleanOp::Intersection, "∩", truth.intersection),
+            (BooleanOp::Union, "∪", truth.union),
+            (BooleanOp::Difference, "∖", truth.difference),
+        ];
+        for (op, sym, t) in ops {
+            if t < 1e-3 {
+                continue;
             }
-            Err(e) => {
-                eprintln!("  {sym}: ERROR {e:?} (truth {t:.4})");
-                failures.push(format!("{sym}: ERROR {e:?}"));
+            let mut model = BRepModel::new();
+            let bx = the_box(&mut model);
+            let cn = cone(&mut model, bc, rb, rt, h);
+            match boolean_operation(&mut model, bx, cn, op, BooleanOptions::default()) {
+                Ok(res) => {
+                    let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+                    let rep = brep_integrity(&model, res, 1e-6);
+                    let v = validate_solid_scoped(
+                        &model,
+                        res,
+                        Tolerance::default(),
+                        ValidationLevel::Standard,
+                    );
+                    let (open, nm) = (rep.edges_used_once.len(), rep.edges_used_3plus.len());
+                    let rel = (vol - t).abs() / t.max(1e-9);
+                    eprintln!(
+                        "  {label} {sym}: vol={vol:.4} truth={t:.4} ({:+.1}%)  open={open} nm={nm}  valid={}",
+                        100.0 * (vol - t) / t.max(1e-9),
+                        v.is_valid,
+                    );
+                    if open != 0 || nm != 0 {
+                        failures.push(format!("{label} {sym}: open={open} nm={nm}"));
+                    }
+                    if !v.is_valid {
+                        failures.push(format!("{label} {sym}: invalid B-Rep {:?}", v.errors));
+                    }
+                    if rel > 0.03 {
+                        failures.push(format!("{label} {sym}: vol {vol:.4} vs truth {t:.4}"));
+                    }
+                }
+                Err(e) => failures.push(format!("{label} {sym}: ERROR {e:?}")),
             }
         }
     }
     assert!(
         failures.is_empty(),
-        "cone-radial conic-cut (#1) still broken: {failures:?}"
+        "cone-radial conic-cut (#1) regressed: {failures:?}"
     );
 }
 

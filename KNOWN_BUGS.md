@@ -100,36 +100,26 @@ lands.
 
 ## Boolean
 
-### #1 🔴 Cone-radial conic-cut blindness (worst class, task #1, 21 HARD cells)
-A z-axis cone shifted off-axis (base at x=1.0) so its slanted LATERAL surface
-pierces a box side wall (plane x=1). The cone-lateral × plane intersection is a
-CONIC — a HYPERBOLA when the cutting plane is parallel to the cone axis — not a
-circle or a line. The split/classify/stitch pipeline cannot form that hyperbolic
-boundary curve, so the conic patch is dropped or mis-stitched. Characterized
-signature (`radial-face+x`: bc=[1,0,-0.5] rb=0.5 rt=0.3 h=1):
-- **∩** → `InvalidBRep` "component 0 has only 3 planar faces" — the hyperbolic
-  conic patch is dropped entirely, so no closed manifold can form.
-- **∪** → vol −1.2%, open=6, nonmanifold=2, odd Euler (3 faces share the conic
-  boundary edge + boundary gaps).
-- **∖** → vol −1.3%, open=8, odd Euler (gaps along the conic cut).
-**LOCALIZED (2026-06-15):** the analytic cone×plane SSI arm is CORRECT — the
-new lib test `boolean::tests::cone_plane_ssi_points_lie_on_both_surfaces_1`
-confirms every intersection-curve point lies on BOTH surfaces for the circle /
-two-generator-line / hyperbola orientations. So the defect is DOWNSTREAM of the
-SSI: the cone-LATERAL patch is dropped in split_faces (∩ keeps only the 3
-planar faces — base disc + top disc + +X wall). Note the `radial-face+x` cell
-is the TWO-GENERATOR-LINE case (the +X wall plane contains the cone axis), not a
-hyperbola — `plane_cone_parallel_intersection` already emits those two lines
-correctly. **Stage-precise (trace):** the cone lateral splits into 3 fragments
-but ALL classify Outside (interior pts x≥1.3); the INSIDE angular strip
-(x<1, cone angles ≈90°–270°) is never produced — `split_face_by_curves`' UV
-arrangement on the curved cone face fails to extract it. Implicates #6 (dropped
-pcurves: cut-line (u,v) images re-projected on the cone don't close the inside
-strip). Fix lane: curved-face arrangement / persist pcurves — DEEP, multi-fire,
-ties #6/#7. Pinned: `boolean_fuzz_survey.rs::
-cone_radial_conic_cut_pin_1` (#[ignore], asserts watertight+valid+vol — flip on
-when #1 lands). The 33-cell curved poke matrix (`harness::poke_matrix`) stays
-fully green; this off-axis conic class is the remaining frontier.
+### #1 🟢 Cone-radial conic-cut — FIXED (18/21 cells; 1 sub-case remains)
+A z-axis cone shifted off-axis so its slanted LATERAL surface pierces a box side
+wall; the cone × plane section is two generator lines (wall ∋ axis) or a
+hyperbola (offset). **ROOT CAUSE:** `split_face_by_curves` had a sector splitter
+for the CYLINDER lateral (`split_cylinder_lateral_by_sectors`) but NONE for the
+CONE — so cone generator cuts fell through to the generic DCEL, which can't
+partition the periodic cone u-domain and dropped the inside angular strip (x<1,
+cone angles ≈90°–270°); ∩ then kept only the 3 planar faces. The SSI was already
+correct (`cone_plane_ssi_points_lie_on_both_surfaces_1`) — purely the curved-face
+arrangement. **FIX:** added `split_cone_face_by_sectors` (cone analogue: axial =
+distance-from-apex, rim radius = v·tan(half_angle)). Cone HARD fuzz cells
+21 → 3; `radial-face+x` and `radial-edge` now exact (∩/∪/∖ watertight + valid +
+volume within 0.0%). Verified no regression: lib 3721/0, poke_matrix 33/33,
+determinism/adversarial/volume-proptest, HARNESS-1000 13/0. GATE:
+`boolean_fuzz_survey.rs::cone_radial_conic_cut_gate_1` (now passing, both cells).
+**REMAINING (still 🔴, tracked under #1):** `radial-poke-past` (bc=[1.4,…], cone
+base ENTIRELY outside the box) — ∩ vol +199%, open=2; ∖ nonmanifold=2; a distinct
+sub-case (the base rim, not just the lateral, exits the wall). Fix lane: extend
+the sector handling for the base-outside topology — DEEP, follow-up. The 33-cell
+curved poke matrix (`harness::poke_matrix`) stays fully green throughout.
 
 ### #86 🟢 FIXED — 6-boss mount-plate chained booleans appeared to HANG the kernel
 **Root cause (2026-06-14): NOT a boolean bug and NOT an infinite loop — it was
