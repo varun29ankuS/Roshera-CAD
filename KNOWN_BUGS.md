@@ -31,18 +31,21 @@ artifact — several were #58 collateral (cf #84). See memory
 
 ## Section / clip
 
-### #85 🟡 Axial cylinder section (plane containing the axis) returns no caps
-Found by `section_area_sweep` (the #83-hardening grid). An AXIAL cut of a
-cylinder (plane contains the axis; normal ⟂ axis) returns NO caps
-(`render_section` → None) when it should be a `2√(r²−a²)·h` rectangle. The
-RADIAL cut (normal ∥ axis → disk) works, so it's orientation-specific: the
-cylinder∩axial-plane is 2 disjoint straight lines on the lateral face (vs a
-single circle radially), and the curved-face marching SSI misses that case — so
-only the planar cap chords (#83 path) survive and 2 parallel segments can't
-chain. Fix lane: analytic cylinder×plane SSI (circle / 1–2 lines / ellipse by
-orientation), tying to the analytic-SSI-arms work. Pinned:
-`parts_invariant_sweep.rs::axial_cylinder_section_returns_none_85` (#[ignore]).
-The sweep guards the 11 working cases (planar/radial/oblique/bored).
+### #85 🟢 Axial cylinder section (plane containing the axis) returns no caps
+FIXED (f9df69a). An AXIAL cut of a cylinder (plane contains the axis) must give
+a `2r·h` rectangle but returned NO caps. The lateral cylinder∩plane = two
+straight generator lines (the marching SSI finds these fine); the actual gap was
+the END CAPS. A disc cap is bounded by a SINGLE closed circular edge whose
+start_vertex == end_vertex (seam), so `loop_points` (one vertex per directed
+edge) yielded ONE point; `plane_face_fragments` saw `n < 2` crossings and
+emitted nothing, so the two cap diameter segments were lost and the rectangle
+never closed. (Never exercised before: a radial cut produces the circle on the
+lateral face and never touches the caps.) Fix: `loop_points` samples curved
+boundary edges (`Edge::evaluate`, 64 interior pts when `!curve.is_linear`) so
+the planar clip sees the real circular polygon; straight edges unchanged (line =
+its start vertex, preserving #83's exact box clip). Guards:
+`section_cylinder_axial_plane_produces_rectangle_85` (lib) +
+un-ignored `axial_cylinder_section_returns_none_85` (integration, render_section).
 
 ### #83 🟢 `section_solid_by_plane` ignores PLANAR faces (plain box → 0 caps)
 **FIXED** (research-grade, EYE-2 lane): the marching-square SSI fragmented a
