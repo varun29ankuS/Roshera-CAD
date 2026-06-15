@@ -491,6 +491,127 @@ server.tool(
 );
 
 server.tool(
+  "create_cone",
+  "ONE-CALL analytic cone or frustum. base_radius is the radius at `center`; " +
+    "top_radius (default 0 = sharp apex) is the radius at center+axis*height. " +
+    "A true smooth cone surface (not faceted). Returns part id + placement.",
+  {
+    center: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+    axis: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
+    base_radius: z.number().nonnegative(),
+    top_radius: z.number().nonnegative().default(0),
+    height: z.number().positive(),
+    name: z.string().optional(),
+  },
+  async ({ center, axis, base_radius, top_radius, height, name }) => {
+    try {
+      const r = await api("POST", "/api/geometry/cone", {
+        center,
+        axis,
+        base_radius,
+        top_radius,
+        height,
+        name: name ?? null,
+      });
+      const id = r.solid_id ?? (await newestPartId());
+      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "create_sphere",
+  "ONE-CALL analytic sphere of `radius` at the origin. Returns part id + placement.",
+  { radius: z.number().positive(), name: z.string().optional() },
+  async ({ radius }) => {
+    try {
+      await api("POST", "/api/geometry", {
+        shape_type: "sphere",
+        parameters: { radius },
+      });
+      const id = await newestPartId();
+      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "revolve",
+  "Build a SOLID OF REVOLUTION from a closed meridian profile — the correct " +
+    "primitive for any axisymmetric part (nozzles, pulleys, bottles, pressure " +
+    "vessels, a whole rocket engine in one op). `profile` is a closed polygon of " +
+    "[r, z] points (radius-from-axis, height-along-axis), revolved about the axis " +
+    "(default +Z through origin, full 360°). One op, no booleans, watertight, " +
+    "structured smooth mesh. Profile must be a simple loop with all r ≥ 0 and not " +
+    "cross the axis (no r=0 pole). Hollow part = trace the wall cross-section.",
+  {
+    profile: z
+      .array(z.tuple([z.number(), z.number()]))
+      .min(3)
+      .describe("closed [r,z] meridian profile (auto-closes last→first)"),
+    axis_origin: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+    axis_direction: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
+    angle_deg: z.number().default(360),
+    segments: z.number().int().min(3).max(512).default(96),
+    name: z.string().optional(),
+  },
+  async ({ profile, axis_origin, axis_direction, angle_deg, segments, name }) => {
+    try {
+      const r = await api("POST", "/api/geometry/revolve", {
+        profile,
+        axis_origin,
+        axis_direction,
+        angle_deg,
+        segments,
+        name: name ?? null,
+      });
+      const id = r.solid_id ?? (await newestPartId());
+      return ok({
+        part_id: id,
+        triangles: r?.stats?.triangle_count ?? null,
+        placement: id !== null ? await placement(id) : null,
+      });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "section_view",
+  "CUTAWAY: slice a part with a plane and return the cross-section as an image " +
+    "(steel-filled profile + section area). The way to SEE a hollow interior. " +
+    "Plane = point `p` + `normal`; an axial cut (normal ⟂ the part's axis through " +
+    "its center) reveals wall thickness, bores and internal cavities.",
+  {
+    part_id: z.number().int(),
+    p: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+    normal: z.tuple([z.number(), z.number(), z.number()]).default([1, 0, 0]),
+  },
+  async ({ part_id, p, normal }) => {
+    try {
+      const q = `nx=${normal[0]}&ny=${normal[1]}&nz=${normal[2]}&px=${p[0]}&py=${p[1]}&pz=${p[2]}`;
+      const r = await api("GET", `/api/agent/parts/${part_id}/section?${q}`);
+      return {
+        content: [
+          { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+          {
+            type: "text" as const,
+            text: `section area=${r.section_area?.toFixed?.(2)} extent_u=${r.extent_u?.toFixed?.(2)} extent_v=${r.extent_v?.toFixed?.(2)} units=${r.units}`,
+          },
+        ],
+      };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "create_plate_with_holes",
   "ONE-CALL plate: rectangle (width × depth at cx,cy) with circular holes, " +
     "extruded. Holes are [hx, hy, radius] triples in plane coordinates.",
