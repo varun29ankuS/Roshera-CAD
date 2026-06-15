@@ -1251,27 +1251,18 @@ pub(crate) fn tessellate_curved_cdt(
     // surfaces; the curved poke matrix + analytic-watertight + HARNESS-1000
     // guard correctness. Doubly-curved surfaces (sphere/torus/NURBS) still
     // refine.
-    use crate::primitives::surface::SurfaceType;
-    let developable = matches!(
-        surface.surface_type(),
-        SurfaceType::Cylinder | SurfaceType::Cone
+    let (final_pts2d, final_triangles) = refine_to_convergence(
+        &outer,
+        &inners,
+        &inner_polygons,
+        steiner,
+        pts2d,
+        triangles,
+        surface,
+        face,
+        model,
+        params,
     );
-    let (final_pts2d, final_triangles) = if developable {
-        (pts2d, triangles)
-    } else {
-        refine_to_convergence(
-            &outer,
-            &inners,
-            &inner_polygons,
-            steiner,
-            pts2d,
-            triangles,
-            surface,
-            face,
-            model,
-            params,
-        )
-    };
 
     // Step 5 — mesh emission. Vertex base offset must be recorded so
     // triangle indices are rebased into `mesh.vertices` numbering.
