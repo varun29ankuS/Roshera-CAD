@@ -1182,6 +1182,92 @@ fn draw_line(
     }
 }
 
+// ── Dimension callouts ──────────────────────────────────────────────────────
+
+/// One callout to draw: a world anchor point and a (already ASCII-safe) label.
+/// Built from the analytic dimension table by the caller — kept as a plain
+/// tuple so this render module stays decoupled from `readable::dimensions`.
+pub type Callout = ([f64; 3], String);
+
+/// Overlay analytic dimension callouts onto an already-rendered multi-view
+/// frame. For each quadrant, every callout whose world anchor projects into
+/// that cell is drawn as a tick at the anchor, a leader line, and the label —
+/// with greedy vertical de-overlap so labels don't stack on top of each other.
+///
+/// The anchor is projected through the SAME `ViewProjection` the frame carries,
+/// so the drawn callout and the structured dimension value can never disagree
+/// (the picture is the table, placed). Labels must be ASCII (the 5×7 font has
+/// no Ø/° glyphs); unknown glyphs are silently skipped.
+pub fn draw_dimension_callouts(frame: &mut MultiViewFrame, callouts: &[Callout]) {
+    const DIM_COLOR: [u8; 3] = [210, 105, 0]; // orange — distinct from triad/bbox
+    const SCALE: usize = 2;
+    let w = frame.width;
+    let h = frame.height;
+    let th = (GLYPH_H * SCALE) as f64;
+    // Clone the (cheap) camera list so we can mutate `frame.pixels` in the loop.
+    let views = frame.views.clone();
+    for proj in &views {
+        let (cx0, cy0, cw, ch) = proj.cell;
+        let (x_lo, y_lo) = (cx0 as f64, cy0 as f64);
+        let (x_hi, y_hi) = ((cx0 + cw) as f64, (cy0 + ch) as f64);
+        let mut placed: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for (anchor, label) in callouts {
+            let p = Point3::new(anchor[0], anchor[1], anchor[2]);
+            let (px, py, _depth) = proj.project(&p);
+            if px < x_lo || px >= x_hi || py < y_lo || py >= y_hi {
+                continue; // anchor not visible in this quadrant
+            }
+            let tw = text_width(label, SCALE);
+            // Default label box up-right of the anchor; flip in-bounds.
+            let mut lx = px + 6.0;
+            let mut ly = py - 6.0 - th;
+            if lx + tw > x_hi - 2.0 {
+                lx = (px - 6.0 - tw).max(x_lo + 2.0);
+            }
+            if ly < y_lo + 2.0 {
+                ly = py + 6.0;
+            }
+            // Greedy vertical de-overlap against already-placed labels.
+            let mut guard = 0;
+            loop {
+                let b = (lx, ly, lx + tw, ly + th);
+                let hit = placed
+                    .iter()
+                    .any(|q| !(b.2 < q.0 || b.0 > q.2 || b.3 < q.1 || b.1 > q.3));
+                if !hit || guard > 40 || ly + 2.0 * th > y_hi - 2.0 {
+                    break;
+                }
+                ly += th + 2.0;
+                guard += 1;
+            }
+            placed.push((lx, ly, lx + tw, ly + th));
+            // Anchor tick (+), leader to the label, then the label.
+            draw_line(
+                &mut frame.pixels,
+                w,
+                h,
+                px - 3.0,
+                py,
+                px + 3.0,
+                py,
+                DIM_COLOR,
+            );
+            draw_line(
+                &mut frame.pixels,
+                w,
+                h,
+                px,
+                py - 3.0,
+                px,
+                py + 3.0,
+                DIM_COLOR,
+            );
+            draw_line(&mut frame.pixels, w, h, px, py, lx, ly + th, DIM_COLOR);
+            draw_text(&mut frame.pixels, w, h, lx, ly, label, DIM_COLOR, SCALE);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,6 +1317,97 @@ mod tests {
             BooleanOptions::default(),
         )
         .expect("through bore")
+    }
+
+    #[test]
+    #[ignore = "writes a PNG for manual inspection"]
+    fn emit_dimensioned_callouts_png() {
+        let mut m = BRepModel::new();
+        let part = housing(&mut m);
+        let mut frame =
+            render_dimensioned_multiview(&m, part, &TessellationParams::default()).expect("frame");
+        let dims = crate::readable::extract_dimensions(&m, part);
+        let callouts: Vec<Callout> = dims
+            .iter()
+            .map(|d| {
+                let ascii: String = d
+                    .label
+                    .chars()
+                    .map(|c| match c {
+                        'Ø' => 'D',
+                        '∠' => 'A',
+                        '°' => ' ',
+                        o => o,
+                    })
+                    .collect();
+                (d.anchor, ascii)
+            })
+            .collect();
+        draw_dimension_callouts(&mut frame, &callouts);
+        let png = frame.to_png().expect("png");
+        std::fs::write("_dimensioned_callouts.png", png).expect("write");
+    }
+
+    fn count_dim_pixels(frame: &MultiViewFrame) -> usize {
+        frame
+            .pixels
+            .chunks_exact(3)
+            .filter(|px| px[0] == 210 && px[1] == 105 && px[2] == 0)
+            .count()
+    }
+
+    #[test]
+    fn dimension_callouts_draw_and_project_into_views() {
+        let mut m = BRepModel::new();
+        let part = housing(&mut m);
+        let mut frame =
+            render_dimensioned_multiview(&m, part, &TessellationParams::default()).expect("frame");
+        let before = count_dim_pixels(&frame);
+        assert_eq!(before, 0, "no dim-colored pixels before drawing");
+
+        // Anchors on the part: boss top, a bbox extent, the bore axis.
+        let callouts = vec![
+            ([0.0_f64, 0.0, 32.0], "D24.00".to_string()),
+            ([30.0, 0.0, 0.0], "X 60.00".to_string()),
+            ([8.0, 0.0, 0.0], "D16.00".to_string()),
+        ];
+        draw_dimension_callouts(&mut frame, &callouts);
+        let after = count_dim_pixels(&frame);
+        assert!(after > before, "callouts drew no pixels (after {after})");
+    }
+
+    #[test]
+    fn callout_label_position_recovers_anchor_via_camera() {
+        // Recoverability: the pixel a callout is anchored at must unproject
+        // (through the SAME ViewProjection) back onto the anchor's view-plane
+        // coordinates — the drawn mark and the structured value agree by
+        // construction, never read off pixels.
+        let mut m = BRepModel::new();
+        let part = housing(&mut m);
+        let frame =
+            render_dimensioned_multiview(&m, part, &TessellationParams::default()).expect("frame");
+        let anchor = Point3::new(0.0, 0.0, 32.0);
+        for proj in &frame.views {
+            let (px, py, _) = proj.project(&anchor);
+            let back = proj.unproject_plane(px, py);
+            // unproject lands on the view plane: its right/up components must
+            // match the anchor's.
+            let want_u =
+                anchor.x * proj.right.x + anchor.y * proj.right.y + anchor.z * proj.right.z;
+            let want_v = anchor.x * proj.up.x + anchor.y * proj.up.y + anchor.z * proj.up.z;
+            let got_u = back.x * proj.right.x + back.y * proj.right.y + back.z * proj.right.z;
+            let got_v = back.x * proj.up.x + back.y * proj.up.y + back.z * proj.up.z;
+            assert!(
+                (want_u - got_u).abs() < 1e-6,
+                "{}: u not recovered",
+                proj.label
+            );
+            assert!(
+                (want_v - got_v).abs() < 1e-6,
+                "{}: v not recovered",
+                proj.label
+            );
+        }
     }
 
     #[test]
