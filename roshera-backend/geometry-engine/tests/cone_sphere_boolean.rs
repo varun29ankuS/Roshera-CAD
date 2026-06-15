@@ -60,10 +60,22 @@ fn cone_sphere_correct_cases_7() {
 }
 
 /// PIN (BOOL #7): cone∪sphere where the sphere transversally engulfs the lower
-/// cone — the analytic SSI circle is correct (the matching DIFFERENCE is exact,
-/// see the gate above) but the UNION region-selection over-reports (~2×): MC
-/// truth 924.11, kernel ~1602, invalid. A downstream union classify/select bug,
-/// not the SSI. Flip on when fixed.
+/// cone — the cone-lateral×sphere SSI circle is correct (the matching DIFFERENCE
+/// is exact, gate above), but the UNION is invalid + over-reports: MC truth
+/// 924.11, kernel ~1602. ROOT CAUSE (traced 2026-06-15): two compounding
+/// downstream bugs, NOT the curved SSI —
+///   1. the cone BASE plane (z=0, disc r5) × sphere (r6) emits the sphere
+///      EQUATOR circle (r6) via plane_sphere, but the base disc (r5) is fully
+///      inside the sphere so that circle lies OUTSIDE the disc and should be
+///      clipped to the bounded face → it isn't, so it SPURIOUSLY over-splits
+///      the sphere (3 fragments not 2) → wrong union regions. (Clip-to-face for
+///      plane×sphere when the face is smaller than the section.)
+///   2. the seamless sphere-body fragment (outer loop 0 edges) WITH holes trips
+///      the Euler validator: χ = V(6)−E(6)+F(3)−R(2) = 1 odd. The seamless-face
+///      correction (462e4ca) only counts faces with ZERO edges across ALL loops;
+///      a seamless OUTER loop + inner holes needs the same +1 (check the OUTER
+///      loop's edge count, not all loops).
+/// Flip on when both land. (#7 downstream; ties #34/#80 clip-to-face + validator.)
 #[test]
 #[ignore = "#7: cone∪sphere transverse union over-inclusion (downstream classify) — flip when fixed"]
 fn cone_union_sphere_transverse_overinclusion_7() {
