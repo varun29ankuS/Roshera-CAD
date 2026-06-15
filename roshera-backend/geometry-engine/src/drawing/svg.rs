@@ -108,6 +108,11 @@ fn write_stylesheet(out: &mut String) {
         "    .view polyline { fill: none; stroke: #111; stroke-width: 0.2; \
          stroke-linejoin: round; stroke-linecap: round; }\n",
     );
+    // Hidden line: thin dashed line, ISO 128 type-04 (occluded edges).
+    out.push_str(
+        "    .view polyline.hidden { fill: none; stroke: #111; stroke-width: 0.18; \
+         stroke-dasharray: 2 1.2; stroke-linejoin: round; stroke-linecap: butt; }\n",
+    );
     // Centerline: thin chain (dash-dot) line, ISO 128 convention.
     out.push_str(
         "    .centerline { stroke: #111; stroke-width: 0.18; fill: none; \
@@ -229,6 +234,22 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
             continue;
         }
         out.push_str("    <polyline points=\"");
+        for (i, p) in pl.points.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let _ = write!(out, "{:.4},{:.4}", p[0], p[1]);
+        }
+        out.push_str("\" />\n");
+    }
+
+    // Occluded edges, dashed (hidden-line removal). Drawn after the visible
+    // edges so the solid outline reads on top where they coincide.
+    for pl in &view.hidden_polylines {
+        if pl.points.len() < 2 {
+            continue;
+        }
+        out.push_str("    <polyline class=\"hidden\" points=\"");
         for (i, p) in pl.points.iter().enumerate() {
             if i > 0 {
                 out.push(' ');

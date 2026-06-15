@@ -569,6 +569,7 @@ mod tests {
                 extent: ViewExtent::empty(),
                 dimensions: Vec::new(),
                 centerlines: Vec::new(),
+                hidden_polylines: Vec::new(),
             });
         }
         let layers = assign_view_layers(&drawing.views);

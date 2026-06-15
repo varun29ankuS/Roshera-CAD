@@ -239,6 +239,11 @@ pub struct ProjectedView {
     /// mm). Empty unless populated by `dimensioning::standard_drawing`.
     #[serde(default)]
     pub centerlines: Vec<super::centerlines::Centerline>,
+    /// Occluded edges drawn dashed (view-space mm). Empty unless populated by
+    /// `dimensioning::standard_drawing_hlr`; when set, `polylines` holds only
+    /// the visible edges. `#[serde(default)]` keeps older drawings parsing.
+    #[serde(default)]
+    pub hidden_polylines: Vec<Polyline2d>,
 }
 
 /// Paper sizes, ISO 216 series. Dimensions in millimetres, landscape

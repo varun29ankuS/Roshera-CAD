@@ -145,6 +145,48 @@ pub fn standard_drawing(
     Ok(drawing)
 }
 
+/// As [`standard_drawing`], but with HIDDEN-LINE REMOVAL: each view's edges are
+/// split by the analytic raytrace eye into visible (solid `polylines`) and
+/// occluded (dashed `hidden_polylines`). This is the mechanically-correct
+/// drawing — an opaque part, not a see-through wireframe. The extent is kept
+/// from the full wireframe so layout is unchanged. Sound: every visible/hidden
+/// verdict is an exact ray↔surface test, never a rasterised z-buffer.
+pub fn standard_drawing_hlr(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+    sheet: super::types::SheetSize,
+    scale: f64,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    use super::projection::{project_solid_view, DEFAULT_CURVE_SAMPLES};
+    use super::types::{Drawing, ViewSource};
+    use super::visibility::project_solid_edges_visibility;
+
+    let mut drawing = Drawing::new("Auto Drawing (HLR)", sheet);
+    let source = ViewSource::Part {
+        part_id: part_uuid,
+        solid_id,
+    };
+    let layout = [
+        (ProjectionType::Front, "FRONT", [80.0, 110.0]),
+        (ProjectionType::Top, "TOP", [80.0, 210.0]),
+        (ProjectionType::Right, "RIGHT", [210.0, 110.0]),
+    ];
+    let min_span = 0.5_f64;
+    for (proj, name, pos) in layout {
+        // Start from the wireframe view (gives extent + placement), then replace
+        // its edges with the visibility split.
+        let mut view = project_solid_view(model, source.clone(), proj, name, pos, scale)?;
+        let edges = project_solid_edges_visibility(model, solid_id, proj, DEFAULT_CURVE_SAMPLES)?;
+        view.polylines = edges.visible;
+        view.hidden_polylines = edges.hidden;
+        view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+        view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
+        drawing.add_view(view);
+    }
+    Ok(drawing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
