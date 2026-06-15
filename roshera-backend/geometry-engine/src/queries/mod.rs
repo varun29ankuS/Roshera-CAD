@@ -11,9 +11,11 @@ pub mod features;
 pub mod kinematics;
 pub mod lmd;
 pub mod newton;
+pub mod point;
 pub mod raycast;
 pub mod raytrace;
 pub mod trim;
 
-pub use raycast::{raycast_solid, RayHit};
+pub use point::{classify_point, nearest_on_solid, PointClass};
+pub use raycast::{raycast_all, raycast_solid, RayHit};
 pub use raytrace::{raytrace_ortho, RaytraceFrame};
