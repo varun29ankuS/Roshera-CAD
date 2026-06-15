@@ -629,6 +629,43 @@ server.tool(
 );
 
 server.tool(
+  "dimension_part",
+  "DIMENSION a part in ONE call. Returns a 2×2 multi-view image with every " +
+    "analytic dimension drawn as a leader+label callout, AND the structured " +
+    "table: each row has an id (the handle a future mould edits), kind " +
+    "(extent / diameter / length / angle), value, the face ids it spans, and a " +
+    "3D anchor. Values are read off analytic surfaces / exact curves, NEVER " +
+    "measured from pixels — the id you SEE is the id you edit.",
+  { part_id: z.number().int().describe("kernel part id from list_parts") },
+  async ({ part_id }) => {
+    try {
+      const r = await api("GET", `/api/agent/parts/${part_id}/dimensions`);
+      const rows = (r.dimensions ?? [])
+        .map(
+          (d: any) =>
+            `${d.id}  ${d.label}  (${d.kind} ${d.value.toFixed(2)}${
+              d.unit === "deg" ? "°" : ""
+            })  faces=[${d.entities.join(",")}]  @[${d.anchor
+              .map((c: number) => c.toFixed(1))
+              .join(", ")}]`,
+        )
+        .join("\n");
+      const overall = `overall L×W×H = ${r.dims.l.toFixed(2)} × ${r.dims.w.toFixed(
+        2,
+      )} × ${r.dims.h.toFixed(2)} ${r.units}`;
+      return {
+        content: [
+          { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+          { type: "text" as const, text: `${overall}\n${rows}` },
+        ],
+      };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "create_plate_with_holes",
   "ONE-CALL plate: rectangle (width × depth at cx,cy) with circular holes, " +
     "extruded. Holes are [hx, hy, radius] triples in plane coordinates.",

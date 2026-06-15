@@ -880,6 +880,135 @@ pub async fn render_dimensioned(
     }))
 }
 
+/// One row of the analytic dimension table — recoverable (3D anchor + the face
+/// ids it spans), read off analytic surfaces / exact curves, never the mesh.
+#[derive(Debug, Clone, Serialize)]
+pub struct DimensionWire {
+    pub id: String,
+    pub kind: String,
+    pub value: f64,
+    pub unit: String,
+    pub label: String,
+    pub entities: Vec<u32>,
+    pub anchor: [f64; 3],
+    pub direction: [f64; 3],
+}
+
+/// Wire shape for the single-call dimensioning answer: the callout-annotated
+/// multi-view image AND the complete structured dimension table + cameras.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartDimensionsResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub units: String,
+    pub dims: DimsWire,
+    pub dimensions: Vec<DimensionWire>,
+    pub views: Vec<ViewProjectionWire>,
+}
+
+/// `GET /api/agent/parts/{id}/dimensions` — the dimensioning eye in one call.
+///
+/// Returns the EYE-1 multi-view with every analytic dimension drawn as a
+/// leader+label callout, AND the complete structured table: each dimension's
+/// id (the handle a future mould edits), kind, value, the face entities it
+/// spans, and a 3D anchor. The image is the placed table; the JSON is
+/// authoritative. Values are read off analytic surfaces / exact curves, never
+/// the tessellation. Read lock only. `404` unknown id / empty tessellation.
+pub async fn part_dimensions(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<PartDimensionsResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::readable::extract_dimensions;
+    use geometry_engine::render::dimensioned::{
+        draw_dimension_callouts, render_dimensioned_multiview, Callout,
+    };
+    use geometry_engine::render::CanonicalView;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let model = model_handle.read().await;
+    let mut frame =
+        render_dimensioned_multiview(&model, id as SolidId, &TessellationParams::default())
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+    let dims = extract_dimensions(&model, id as SolidId);
+    // The 5×7 overlay font has no Ø/∠/° glyphs — render ASCII, keep the pretty
+    // label in the structured table.
+    let callouts: Vec<Callout> = dims
+        .iter()
+        .map(|d| {
+            let ascii: String = d
+                .label
+                .chars()
+                .map(|c| match c {
+                    'Ø' => 'D',
+                    '∠' => 'A',
+                    '°' => ' ',
+                    o => o,
+                })
+                .collect();
+            (d.anchor, ascii)
+        })
+        .collect();
+    draw_dimension_callouts(&mut frame, &callouts);
+
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let view_name = |v: CanonicalView| -> String {
+        match v {
+            CanonicalView::Isometric => "iso",
+            CanonicalView::Front => "front",
+            CanonicalView::Top => "top",
+            CanonicalView::Right => "right",
+        }
+        .to_string()
+    };
+
+    Ok(Json(PartDimensionsResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        units: frame.units.to_string(),
+        dims: DimsWire {
+            l: frame.dims.0,
+            w: frame.dims.1,
+            h: frame.dims.2,
+        },
+        dimensions: dims
+            .into_iter()
+            .map(|d| DimensionWire {
+                id: d.id,
+                kind: d.kind,
+                value: d.value,
+                unit: d.unit,
+                label: d.label,
+                entities: d.entities,
+                anchor: d.anchor,
+                direction: d.direction,
+            })
+            .collect(),
+        views: frame
+            .views
+            .iter()
+            .map(|vp| ViewProjectionWire {
+                view: view_name(vp.view),
+                label: vp.label.to_string(),
+                right: vp.right.into(),
+                up: vp.up.into(),
+                dir: vp.dir.into(),
+                scale: vp.scale,
+                ox: vp.ox,
+                oy: vp.oy,
+                cell: [vp.cell.0, vp.cell.1, vp.cell.2, vp.cell.3],
+            })
+            .collect(),
+    }))
+}
+
 // ───────────────────── pointer (the user's attention) ───────────────
 
 /// Wire shape for `GET /api/agent/pointer`: the user's latest viewport

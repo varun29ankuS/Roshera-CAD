@@ -6818,6 +6818,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::render_dimensioned),
         )
         .route(
+            "/api/agent/parts/{id}/dimensions",
+            get(handlers::agent::part_dimensions),
+        )
+        .route(
             "/api/agent/parts/{id}/features",
             get(handlers::agent::part_features),
         )
