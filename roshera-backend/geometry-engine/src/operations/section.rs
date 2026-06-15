@@ -232,8 +232,23 @@ struct Polyline3D {
     points: Vec<Point3>,
 }
 
-/// Ordered 3D boundary points of a loop (one vertex per directed edge).
+/// Ordered 3D boundary points of a loop, traversed in loop order. STRAIGHT
+/// edges contribute their start vertex only (a polygon corner); CURVED edges
+/// (arcs/circles/NURBS) are additionally sampled at interior points so the
+/// boundary used for line-clipping is the real curve and not a single vertex.
+///
+/// SECTION #85: a cylinder/disc cap is bounded by a single closed circular
+/// edge whose start_vertex == end_vertex (the seam), so the vertex-only walk
+/// yielded ONE point and the planar cut-line clip in `plane_face_fragments`
+/// saw `n < 2` and produced no fragments — an axial cut through a cylinder lost
+/// both end-cap diameter segments and never closed the rectangle. Sampling the
+/// curve restores the polygon. Straight-edge faces (boxes) are unchanged: a
+/// line contributes exactly its start vertex, preserving the exact #83 clip.
 fn loop_points(model: &BRepModel, loop_id: LoopId) -> Vec<Point3> {
+    // Interior samples per closed/curved edge — dense enough that a diameter
+    // crossing lands within chord tolerance of the true rim for tier-1 radii.
+    const CURVE_SAMPLES: usize = 64;
+    let tol = Tolerance::default();
     let mut pts = Vec::new();
     let lp = match model.loops.get(loop_id) {
         Some(l) => l,
@@ -248,6 +263,23 @@ fn loop_points(model: &BRepModel, loop_id: LoopId) -> Vec<Point3> {
         let vid = if fwd { e.start_vertex } else { e.end_vertex };
         if let Some(v) = model.vertices.get(vid) {
             pts.push(Point3::new(v.position[0], v.position[1], v.position[2]));
+        }
+        // Add interior curve samples for non-linear edges. `Edge::evaluate`
+        // takes a normalized t∈[0,1] that already honours the edge's own
+        // orientation; the loop traversal direction is applied on top of it.
+        let curved = model
+            .curves
+            .get(e.curve_id)
+            .map(|c| !c.is_linear(tol))
+            .unwrap_or(false);
+        if curved {
+            for k in 1..CURVE_SAMPLES {
+                let t = k as f64 / CURVE_SAMPLES as f64;
+                let te = if fwd { t } else { 1.0 - t };
+                if let Ok(p) = e.evaluate(te, &model.curves) {
+                    pts.push(p);
+                }
+            }
         }
     }
     pts
@@ -1438,6 +1470,42 @@ mod tests {
             "expected InvalidInput on plane_normal, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn section_cylinder_axial_plane_produces_rectangle_85() {
+        // SECTION #85: a plane CONTAINING the cylinder axis (here x = 0, normal
+        // +X, through the z-axis) cuts the solid in a rectangle 2r × h, NOT a
+        // circle. Cylinder r2 h10, z ∈ [0,10] ⇒ rectangle 4 × 10, area 40.
+        let (model, solid_id) = build_cylinder_model(2.0, 10.0);
+        let caps = section_solid_by_plane(
+            &model,
+            solid_id,
+            Point3::new(0.0, 0.0, 5.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("section call");
+        assert_eq!(caps.len(), 1, "axial cylinder section: expected one cap");
+        let area: f64 = caps
+            .iter()
+            .flat_map(|c| c.indices.iter().map(move |t| (c, t)))
+            .map(|(c, t)| {
+                let a = c.vertices[t[0] as usize];
+                let b = c.vertices[t[1] as usize];
+                let e = c.vertices[t[2] as usize];
+                let e1 = Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+                let e2 = Vector3::new(e.x - a.x, e.y - a.y, e.z - a.z);
+                e1.cross(&e2).magnitude() * 0.5
+            })
+            .sum();
+        assert!(
+            (area - 40.0).abs() < 0.5,
+            "axial cylinder section area {area:.2} != 40.0 (2r×h rectangle)"
+        );
+        for v in &caps[0].vertices {
+            assert!(v.x.abs() < 1e-4, "cap vertex off plane: x = {}", v.x);
+        }
     }
 
     #[test]
