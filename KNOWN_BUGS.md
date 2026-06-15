@@ -392,6 +392,53 @@ the rotated-box marching-intersection path. NOT `#[ignore]`'d (reds the poke run
 honestly). Task #61. Fix = deterministic iteration/accumulation, or pin honestly
 if a true marching limitation.
 
+### REVOLVE-TESS #63 🟢 FIXED — cone/sloped revolve bands non-watertight (commit 27d053c + fa26c18)
+`revolve_profile` made a valid B-Rep but a NON-watertight MESH for any profile
+with SLOPED (cone) bands: a band's two meridian arcs sit at different radii, so
+the chord-driven edge cache sampled them with UNEQUAL counts, the structured
+Coons-grid wedge declined (needs equal opposite counts), and the curved-CDT
+fallback choked on the thin 3D sliver → the band emitted no triangles → holes
+scaling with tessellation density (a revolved nozzle rendered as nothing). FIX
+(tessellate_revolution_wedge): when opposite counts are unequal, triangulate the
+wedge in its (u,v) PARAMETER square — well-conditioned regardless of radii — from
+the EXACT boundary cache samples (watertight by construction). fa26c18: smooth
+per-vertex surface normals on those wedges (flat per-band normal made sloped
+bands render as faceted "rectangles"). Gate `tests/revolve_watertight.rs` (7
+cases: tube/cone/frustum/stepped/engine/coarse+fine/partial-angle). Full lib
+3724/0. Unblocked `POST /api/geometry/revolve`. LESSON: validate_solid_scoped
+(B-Rep valid) ≠ watertight MESH — check manifold_report too. See memory
+`revolve-tessellation-cone-bands.md`.
+
+### SECTION #85c 🟢 FIXED — cutaway through a periodic seam dropped a generator (commit 398606d)
+A section/cutaway was direction-dependent: a plane normal to +X gave the right
+rectangle but a plane normal to +Y (which CONTAINS the cylinder's +X seam) gave
+ZERO caps — the seam generator was reported at u≈−9e-13 (a hair below u_min=0) and
+the UV-bbox trim's strict `>= u_min` dropped it. Fix: pad the trim's inside-test
+to match the already-padded intersection search. Section now rotation-invariant
+for axial planes. Gate `axial_cylinder_section_through_seam_85c`. KNOWN remaining:
+oblique vertical planes (nz=0, off-seam) still 0 caps — separate pre-existing
+marching-grid limitation.
+
+### REVOLVE axis-touch 🔴 profiles with a pole (r=0) reject or go non-watertight
+A revolve profile that TOUCHES the axis (a hemispherical dome apex, a solid cone
+tip, a sphere's poles) is either rejected (`SelfIntersection`) or tessellates
+non-watertight (sphere-via-revolve = 64 open at the poles). Blocks a whole class
+of common solids of revolution with a pole (spheres, domes, ogives, solid cones).
+Workaround: a small pole bore (vent) avoids the axis and is watertight. Found
+2026-06-15 building a domed pressure vessel. Fix = handle the single-apex pole
+case in revolve (apex vertex already has code; the self-intersection guard +
+pole-fan tessellation need to admit it).
+
+### #65 🔴 box∪cylinder boss + chained planar bores → non-watertight (bracket build)
+Building an engine mount bracket: base plate (box) ∪ raised cylindrical boss came
+back watertight=False open=12 (B-Rep valid), and chained difference of bolt-circle
+/center-bore cylinders cascaded to open=1012→3932. The SAME bracket built clean
+via the sketch-region path (rectangle + 13 holes in ONE extrude, no booleans).
+So: the box∪cylinder coincident-face boss union leaves ~12 open (a #32/#84-family
+residual on this config) and chained bores on an already-open solid compound it.
+Task #65. LESSON for the agent/MCP: prefer sketch-region extrude for plates-with-
+holes over boolean subtraction.
+
 ### #33 🟢 Offset/partial-overlap chained union invalid
 Fixed (line-extent classification).
 
