@@ -514,8 +514,21 @@ fn trim_curve_to_uv_bbox(
     v_max: f64,
     out: &mut Vec<Polyline3D>,
 ) {
+    // Boundary tolerance. When the cutting plane passes through a periodic
+    // surface's SEAM (e.g. a cylinder whose u=0 generator lies in the plane),
+    // `intersect_surface_plane` reports that generator at u ≈ 0 — but rounding
+    // can place it a hair BELOW u_min (observed −9e-13), so a strict `>= u_min`
+    // silently drops the seam generator. That left an axial cylinder section a
+    // generator short → the cross-section rectangle never closed → zero caps,
+    // but ONLY for cut planes containing the seam (e.g. +Y for an +X-seam
+    // cylinder), making section direction-dependent. The intersection search
+    // rectangle is already padded (`pad_u`/`pad_v`); pad the trim test to match
+    // so a boundary-coincident (seam) generator is kept. A relative+absolute
+    // epsilon keeps genuinely-outside samples out.
+    let eps_u = ((u_max - u_min).abs() * 1e-6).max(1e-9);
+    let eps_v = ((v_max - v_min).abs() * 1e-6).max(1e-9);
     let inside = |p: &ParametricIntersectionPoint| -> bool {
-        p.u >= u_min && p.u <= u_max && p.v >= v_min && p.v <= v_max
+        p.u >= u_min - eps_u && p.u <= u_max + eps_u && p.v >= v_min - eps_v && p.v <= v_max + eps_v
     };
 
     let mut current: Vec<Point3> = Vec::new();

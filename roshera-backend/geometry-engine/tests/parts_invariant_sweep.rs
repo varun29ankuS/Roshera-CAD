@@ -1611,6 +1611,35 @@ fn axial_cylinder_section_returns_none_85() {
     );
 }
 
+/// SECTION #85c: an axial section whose cut plane CONTAINS the cylinder's seam
+/// must return the same 2r·h rectangle as any other axial plane — section must
+/// be rotation-invariant. The cylinder's seam generator sits at u=0; a plane
+/// through it (+Y normal for an +X-seam cylinder) had the seam generator
+/// reported at u ≈ −9e-13, a hair below u_min, so the strict UV-bbox trim
+/// dropped it → only one lateral generator survived → the rectangle never
+/// closed → ZERO caps, but ONLY for seam-containing planes (+X worked, +Y did
+/// not). FIXED by padding the trim's inside-test to match the already-padded
+/// intersection search rectangle. Checks the previously-broken directions.
+#[test]
+fn axial_cylinder_section_through_seam_85c() {
+    use geometry_engine::render::dimensioned::render_section;
+    let mut m = BRepModel::new();
+    let cyl = make_cylinder(&mut m, 10.0, 40.0);
+    let expected = 2.0 * 10.0 * 40.0; // 2r·h
+    for (nx, ny, lbl) in [(0.0, 1.0, "+Y through seam"), (1.0, 1.0, "+XY diagonal")] {
+        let f = render_section(
+            &m,
+            cyl,
+            Point3::new(0.0, 0.0, 20.0),
+            Vector3::new(nx, ny, 0.0),
+            Tolerance::default(),
+        )
+        .unwrap_or_else(|| panic!("{lbl}: axial section must produce a rectangle cap"));
+        let rel = (f.section_area - expected).abs() / expected;
+        assert!(rel < 0.06, "{lbl}: area {} vs {expected}", f.section_area);
+    }
+}
+
 // ── S3 rung 5: L-bracket + FULL 7-endpoint eye dogfood ───────────────────────
 
 /// An L-bracket: a horizontal plate (80×50×12) + a vertical plate (80×12×50)
