@@ -367,6 +367,21 @@ cone/cyl/sphere suites + poke 14/15. LESSON: a closed-curve (seam) edge's
 `param_range.start` MUST sit at its `start_vertex` (= `curve.evaluate(0)`).
 See memory `cone-rim-seam-alignment.md`.
 
+### #27/#32 frustum throat 🟢 FIXED — coincident closed-circle rims not welded (commit 7af8e4e)
+Sibling of the cone "rocket": surfaced building a de Laval rocket nozzle via the
+API (`convergent r6→r20 ∪ divergent r18→r6` sharing the r6 throat circle). The
+union was watertight (open=0) with EXACT volume (15808) but B-Rep INVALID — odd
+Euler V(3)−E(6)+F(4)−R(0)=1 because the throat was TWO unmerged closed-circle
+edges. Unlike the rocket (closed-circle vs arcs, healed by a T-junction split),
+here BOTH rims are full closed circles sharing the SAME seam vertex → no foreign
+vertex to split, and `canonicalise_face_edges_by_position` SKIPPED all
+closed-circle edges (`cs == ce`). FIX: canonicalise now welds genuine coincident
+closed-circle edges (skip narrowed to degenerate edges via `start_vertex !=
+end_vertex`; (X,X) bucket key discriminated by the circle's antipode midpoint).
+Gate `frustum_union_frustum_throat_27`. Full lib 3724/0. Also added
+`POST /api/geometry/cone` (commit ca7a684) — frustum + placement, which the
+generic endpoint lacked — to build the nozzle. See `cone-rim-seam-alignment.md`.
+
 ### BOOL determinism 🔴 rbox-diag45 Intersection non-deterministic (10th digit)
 `boolean_pipeline_determinism_gate` (boolean_fuzz_survey.rs) fails: a 45°-rotated
 box Intersection yields bit-different volumes across two identical runs (~1e-10,
