@@ -5323,6 +5323,198 @@ fn split_cylinder_lateral_by_sectors(
     Some(faces)
 }
 
+/// CONE analogue of `split_cylinder_lateral_by_sectors` (BOOL #1 cone-radial
+/// conic-cut). A cone lateral cut by ≥3 full-height GENERATOR lines (the two
+/// x=plane generators of a radial cut + the cone's own u-seam) splits into
+/// angular θ-sectors. The generic DCEL can't partition the periodic cone
+/// u-domain, so it dropped the inside angular strip entirely — `∩` then kept
+/// only the 3 planar faces. This walks the (already complete) arrangement into
+/// sectors exactly like the cylinder, with two cone-specific changes: the axial
+/// coordinate is distance-from-apex `v = (p−apex)·axis`, and the rim radius is
+/// `v·tan(half_angle)` (not constant). Returns None unless there are ≥3
+/// full-height generators, so circle-cut cones (axial poke) still route through
+/// `split_cone_face_by_circles`.
+fn split_cone_face_by_sectors(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::surface::Cone;
+    let surface = model.surfaces.get(surface_id)?;
+    let cone = surface.as_any().downcast_ref::<Cone>()?;
+    let axis = cone.axis;
+    let apex = cone.apex;
+    let k = cone.half_angle.tan();
+    let [v_lo, v_hi] = cone.height_limits?;
+    let span = (v_hi - v_lo).abs();
+    if span <= 0.0 {
+        return None;
+    }
+    let span_tol = (span * 1.0e-3).max(1.0e-6);
+
+    // Orthonormal frame perpendicular to the axis for angular ordering.
+    let seed = if axis.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u1 = axis.cross(&seed).normalize().ok()?;
+    let u2 = axis.cross(&u1);
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let theta_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        let d = Point3::new(p[0], p[1], p[2]) - apex;
+        Some(d.dot(&u2).atan2(d.dot(&u1)).rem_euclid(two_pi))
+    };
+    // Axial coordinate = distance from APEX along the axis.
+    let axial_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        Some((Point3::new(p[0], p[1], p[2]) - apex).dot(&axis))
+    };
+
+    // Full-height generators (cut generators + seam): (theta@v_lo, lo_vid, hi_vid, edge_id).
+    let mut verticals: Vec<(f64, VertexId, VertexId, EdgeId)> = Vec::new();
+    for (&eid, _) in graph.edges.iter() {
+        let e = model.edges.get(eid)?;
+        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+        if (sa - ea).abs() < span - span_tol {
+            continue; // rim arc or partial — not a full-height generator
+        }
+        let (lov, hiv) = if sa <= ea {
+            (e.start_vertex, e.end_vertex)
+        } else {
+            (e.end_vertex, e.start_vertex)
+        };
+        verticals.push((theta_of(lov)?, lov, hiv, eid));
+    }
+    if verticals.len() < 3 {
+        return None;
+    }
+    verticals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Rim arcs = non-generator, non-degenerate edges whose endpoints share an
+    // axial height (≈ v_lo or ≈ v_hi). The rim may be subdivided into a CHAIN of
+    // arcs (cap-circle self-coincidence densification), so build per-rim
+    // adjacency and walk it.
+    let mut lo_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    let mut hi_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    let mut seen_arc: HashSet<EdgeId> = HashSet::new();
+    for (&eid, _) in graph.edges.iter() {
+        let e = model.edges.get(eid)?;
+        if e.start_vertex == e.end_vertex {
+            continue;
+        }
+        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+        if (sa - ea).abs() > span_tol {
+            continue; // a generator or slanted edge — not a flat rim arc
+        }
+        if !seen_arc.insert(eid) {
+            continue;
+        }
+        let mid = 0.5 * (sa + ea);
+        let adj = if (mid - v_lo).abs() <= (mid - v_hi).abs() {
+            &mut lo_adj
+        } else {
+            &mut hi_adj
+        };
+        adj.entry(e.start_vertex)
+            .or_default()
+            .push((e.end_vertex, eid));
+        adj.entry(e.end_vertex)
+            .or_default()
+            .push((e.start_vertex, eid));
+    }
+
+    let oriented = |eid: EdgeId, from: VertexId| -> Option<(EdgeId, bool)> {
+        let e = model.edges.get(eid)?;
+        if e.start_vertex == from {
+            Some((eid, true))
+        } else if e.end_vertex == from {
+            Some((eid, false))
+        } else {
+            None
+        }
+    };
+
+    // Walk a rim CCW (increasing θ) from `start` to `end`.
+    let walk_ccw = |start: VertexId,
+                    end: VertexId,
+                    adj: &HashMap<VertexId, Vec<(VertexId, EdgeId)>>|
+     -> Option<Vec<(EdgeId, bool)>> {
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        let mut cur = start;
+        let mut prev: Option<VertexId> = None;
+        let mut guard = 0usize;
+        let limit = adj.len() + 4;
+        while cur != end {
+            guard += 1;
+            if guard > limit {
+                return None;
+            }
+            let cur_th = theta_of(cur)?;
+            let neighbours = adj.get(&cur)?;
+            let mut best: Option<(f64, VertexId, EdgeId)> = None;
+            for &(nb, eid) in neighbours.iter() {
+                if Some(nb) == prev {
+                    continue;
+                }
+                let gap = (theta_of(nb)? - cur_th).rem_euclid(two_pi);
+                if gap <= 1.0e-9 {
+                    continue;
+                }
+                if best.map_or(true, |(g, _, _)| gap < g) {
+                    best = Some((gap, nb, eid));
+                }
+            }
+            let (_, nb, eid) = best?;
+            out.push(oriented(eid, cur)?);
+            prev = Some(cur);
+            cur = nb;
+        }
+        Some(out)
+    };
+
+    let n = verticals.len();
+    let mut faces = Vec::with_capacity(n);
+    for i in 0..n {
+        let (th_i, loi, hii, ei) = verticals[i];
+        let (th_j, loj, hij, ej) = verticals[(i + 1) % n];
+        // hi rim: hii → hij CCW. lo rim: loi → loj CCW, then reversed.
+        let hi_chain = walk_ccw(hii, hij, &hi_adj)?;
+        let lo_chain = walk_ccw(loi, loj, &lo_adj)?;
+        let mut loop_edges: Vec<(EdgeId, bool)> =
+            Vec::with_capacity(hi_chain.len() + lo_chain.len() + 2);
+        loop_edges.push(oriented(ei, loi)?); // left generator loi → hii
+        loop_edges.extend(hi_chain); // hi rim chain hii → hij
+        loop_edges.push(oriented(ej, hij)?); // right generator hij → loj
+        for &(eid, fwd) in lo_chain.iter().rev() {
+            loop_edges.push((eid, !fwd)); // lo rim chain loj → loi
+        }
+        // Interior point at the sector mid-angle (handle wrap) and mid-v; the
+        // cone radius at v_mid is v_mid·tan(half_angle).
+        let th_mid = if th_j >= th_i {
+            0.5 * (th_i + th_j)
+        } else {
+            (0.5 * (th_i + th_j + two_pi)).rem_euclid(two_pi)
+        };
+        let v_mid = 0.5 * (v_lo + v_hi);
+        let radial = u1 * th_mid.cos() + u2 * th_mid.sin();
+        let interior = apex + axis * v_mid + radial * (v_mid * k);
+        faces.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: loop_edges,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(interior),
+            inner_loops: Vec::new(),
+        });
+    }
+    Some(faces)
+}
+
 /// Torus analogue of the sphere/cone/cylinder curved-Boolean fast paths, for a
 /// RIM-POKE: the tube pokes box side-walls, each wall imprinting a closed quartic
 /// oval on the torus near the outer equator (v≈0). The DCEL arrangement on the
@@ -5954,6 +6146,23 @@ fn split_face_by_curves(
         if pipeline_trace_enabled() {
             eprintln!(
                 "[bool]   cone band split: face={face_id:?} → {} fragments",
+                cone_faces.len()
+            );
+        }
+        return Ok(cone_faces);
+    }
+
+    // Cone lateral RADIAL cut: ≥3 full-height generators (the two plane
+    // generators of a radial cut + the cone's u-seam) split the lateral into
+    // angular θ-sectors. The generic DCEL can't partition the periodic cone
+    // u-domain → it dropped the inside angular strip (BOOL #1). Same handling
+    // as the cylinder sector split; returns None for circle-cut cones.
+    if let Some(cone_faces) =
+        split_cone_face_by_sectors(model, surface_id, face_id, origin_solid, &graph)
+    {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   cone sector split: face={face_id:?} → {} fragments",
                 cone_faces.len()
             );
         }
