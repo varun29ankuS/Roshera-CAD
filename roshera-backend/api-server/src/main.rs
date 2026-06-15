@@ -4557,6 +4557,14 @@ async fn clear_all_geometry(
         deleted += 1;
     }
 
+    // Sweep orphaned geometry (vertices/edges/curves/surfaces left by an
+    // upstream op that materialised entities then failed — e.g. a sketch
+    // lifted into edges followed by a revolve that failed validation). Deleting
+    // solids does not remove these, and they poison later op validation with
+    // phantom connectivity errors. clear_geometry makes "clear" a true reset,
+    // matching clear_timeline, without needing a full timeline rewind.
+    model_handle.write().await.clear_geometry();
+
     Ok(Json(serde_json::json!({
         "success": true,
         "deleted": deleted,

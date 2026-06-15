@@ -385,6 +385,35 @@ impl BRepModel {
         self.tolerance = tolerance;
     }
 
+    /// Reset every GEOMETRY store to empty, preserving the seeded datums
+    /// (canonical seven), the attached recorder, and the tolerance.
+    ///
+    /// This is the kernel half of a TRUE "clear the scene". Deleting solids
+    /// one-by-one leaves ORPHANED vertices/edges/curves/surfaces behind when an
+    /// upstream op added entities that were never folded into a solid — the
+    /// classic case is a sketch materialised into edges/curves followed by a
+    /// kernel op that fails: the kernel op's own `with_rollback` undoes its
+    /// additions, but the pre-materialised sketch entities (added *before* the
+    /// rolled-back op) linger. Those orphans then surface as phantom
+    /// connectivity errors in later validation. `clear_geometry` sweeps them so
+    /// "clear" leaves a genuinely empty model, not invisible residue.
+    pub fn clear_geometry(&mut self) {
+        let tol = self.tolerance;
+        self.vertices = VertexStore::with_capacity_and_tolerance(64, tol.distance());
+        self.curves = CurveStore::new();
+        self.pcurves = crate::primitives::p_curve::PCurveStore::default();
+        self.edges = EdgeStore::default();
+        self.loops = LoopStore::default();
+        self.surfaces = SurfaceStore::default();
+        self.faces = FaceStore::default();
+        self.shells = ShellStore::default();
+        self.solids = SolidStore::default();
+        self.sketch_planes.clear();
+        self.cap_apex_hint.clear();
+        self.location_cache = crate::primitives::datum::LocationDescriptorCache::new();
+        // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance.
+    }
+
     /// Attach a recorder that will receive one event per successful
     /// operation on this model. Returns the previous recorder, if any.
     ///
