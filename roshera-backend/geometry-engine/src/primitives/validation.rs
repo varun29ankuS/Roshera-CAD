@@ -609,6 +609,11 @@ impl ParallelValidator {
         let mut edge_set = std::collections::HashSet::new();
         let mut face_count = 0i32;
         let mut ring_count = 0i32; // R: inner loops summed over all faces
+                                   // Faces modelled as a single fully-periodic CLOSED surface with no
+                                   // bounding B-Rep edges (a sphere/torus as one seamless face). Such a
+                                   // face is itself a closed surface (χ=2), not a polyhedral 2-cell/disk
+                                   // (χ=1), so the plain V−E+F count under-reports it by 1 per face.
+        let mut seamless_closed_faces = 0i32;
 
         for sid in &shells {
             let Some(shell) = model.shells.get(*sid) else {
@@ -620,9 +625,11 @@ impl ParallelValidator {
                     ring_count += face.inner_loops.len() as i32;
                     let mut all_loops = vec![face.outer_loop];
                     all_loops.extend(&face.inner_loops);
+                    let mut face_edge_count = 0usize;
                     for &loop_id in &all_loops {
                         if let Some(loop_data) = model.loops.get(loop_id) {
                             for &edge_id in &loop_data.edges {
+                                face_edge_count += 1;
                                 edge_set.insert(edge_id);
                                 if let Some(edge) = model.edges.get(edge_id) {
                                     vertex_set.insert(edge.start_vertex);
@@ -630,6 +637,9 @@ impl ParallelValidator {
                                 }
                             }
                         }
+                    }
+                    if face_edge_count == 0 {
+                        seamless_closed_faces += 1;
                     }
                 }
             }
@@ -640,22 +650,25 @@ impl ParallelValidator {
         let f = face_count;
         let r = ring_count;
 
-        // A closed analytic surface modelled as one fully periodic face with
-        // no bounding B-Rep edges — e.g. a sphere as a single seamless face
-        // (V=0, E=0, F=1) — is a valid solid but not a polyhedral 2-cell
-        // complex, so the combinatorial formula does not apply (it would
-        // reject the lone sphere, which once broke transform_solid on
-        // spheres). Seamed analytic solids (cylinder, torus) carry edges and
-        // validate normally below.
+        // A solid built ENTIRELY from seamless closed faces (e.g. a lone
+        // sphere: V=0, E=0, F=1) is a valid closed surface but not a
+        // polyhedral 2-cell complex, so the plain combinatorial form does not
+        // apply (it once rejected the lone sphere and broke transform_solid).
+        // The seamless correction below restores the right χ, but keep this
+        // fast exit for the all-seamless case.
         if e == 0 {
             return;
         }
 
         // V - E + F - R = 2(S - G)  ⇒  G = S - (V - E + F - R) / 2.
-        // The left side must be even (it equals 2·something); an odd value
-        // is a genuine topology defect. A non-negative genus is valid (a
-        // torus is G=1); a negative genus is impossible and flags a defect.
-        let poincare = v - e + f - r;
+        // Each seamless closed face contributes χ=2 (a closed surface), but the
+        // raw V−E+F counts it as a single 2-cell (χ=1); add +1 per such face so
+        // a MIXED solid — a seamed outer shell plus a seamless void shell (the
+        // sphere cavity of cyl∖sphere, BOOL #7) — sums to the right parity
+        // instead of falsely reading odd. The left side must be even (= 2·k);
+        // an odd value is a genuine topology defect. Non-negative genus is
+        // valid (a torus is G=1); a negative genus is impossible.
+        let poincare = v - e + f - r + seamless_closed_faces;
         if poincare % 2 != 0 {
             errors.push(ValidationError::TopologyError {
                 message: format!(
