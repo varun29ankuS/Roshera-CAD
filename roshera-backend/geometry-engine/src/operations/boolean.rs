@@ -17573,4 +17573,88 @@ mod tests {
             r.nonmanifold_edges
         );
     }
+
+    /// SSI-LEVEL harness for the cone×plane intersection (task #1 sub-step).
+    /// Independent of the full boolean stitch: it asserts that every point of
+    /// every curve `surface_surface_intersection` returns for a cone cut by a
+    /// plane lies on BOTH the plane AND the cone (a distance-to-true-surface
+    /// oracle), across the conic orientations:
+    ///   * perpendicular (normal ∥ axis)  → circle,
+    ///   * axial (plane contains the axis) → two generator lines  ← the #1
+    ///     "radial-face+x" family,
+    ///   * offset-parallel (normal ⊥ axis, offset) → hyperbola arc.
+    /// This LOCALIZES #1: the SSI arm is correct (this passes), so the
+    /// cone-radial conic-cut defect (`cone_radial_conic_cut_pin_1`) lives
+    /// DOWNSTREAM of the SSI — the cone lateral patch is dropped/mis-stitched
+    /// in split/classify, NOT because the intersection curve is missing or
+    /// wrong. Cone: apex origin, axis +Z, half-angle atan(0.5), frustum band
+    /// v∈[1,3] (base radius 0.5→1.5).
+    #[test]
+    fn cone_plane_ssi_points_lie_on_both_surfaces_1() {
+        use crate::primitives::surface::Cone;
+
+        let half_angle = 0.5_f64.atan();
+        let k = half_angle.tan(); // 0.5
+        let cone = Cone::truncated(Point3::ORIGIN, Vector3::Z, half_angle, 1.0, 3.0)
+            .expect("frustum cone");
+        let tol = Tolerance::default();
+
+        // (label, plane_point, plane_normal, min curves expected)
+        let cases: [(&str, Point3, Vector3, usize); 3] = [
+            (
+                "perpendicular→circle",
+                Point3::new(0.0, 0.0, 2.0),
+                Vector3::Z,
+                1,
+            ),
+            ("axial→two-lines", Point3::ORIGIN, Vector3::X, 2),
+            (
+                "offset-parallel→hyperbola",
+                Point3::new(0.4, 0.0, 0.0),
+                Vector3::X,
+                1,
+            ),
+        ];
+
+        for (label, p_pt, p_n, min_curves) in cases {
+            let plane = Plane::new(p_pt, p_n, p_n.perpendicular()).expect("plane");
+            let curves = surface_surface_intersection(&plane, &cone, &tol)
+                .unwrap_or_else(|e| panic!("{label}: SSI errored: {e:?}"));
+            assert!(
+                curves.len() >= min_curves,
+                "{label}: expected ≥{min_curves} curve(s), got {}",
+                curves.len()
+            );
+            let mut n_pts = 0usize;
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                const N: usize = 24;
+                for i in 0..=N {
+                    let t = range.start + (range.end - range.start) * (i as f64 / N as f64);
+                    let p = sic.curve.point_at(t).expect("curve point");
+                    // On the plane: signed distance along the normal.
+                    let d_plane = (p - p_pt).dot(&p_n).abs();
+                    assert!(
+                        d_plane < 1e-4,
+                        "{label}: point {p:?} off plane by {d_plane:.2e}"
+                    );
+                    // On the cone: implicit residual (r − v·k)·cos(half_angle)
+                    // ≈ perpendicular distance to the cone surface.
+                    let w = p - cone.apex;
+                    let v = w.dot(&cone.axis);
+                    let radial = (w - cone.axis * v).magnitude();
+                    let d_cone = ((radial - v * k) * half_angle.cos()).abs();
+                    assert!(
+                        d_cone < 1e-3,
+                        "{label}: point {p:?} off cone by {d_cone:.2e} (v={v:.3} r={radial:.3})"
+                    );
+                    n_pts += 1;
+                }
+            }
+            eprintln!(
+                "[cone-plane SSI #1] {label}: {} curve(s), {n_pts} points all on both surfaces",
+                curves.len()
+            );
+        }
+    }
 }
