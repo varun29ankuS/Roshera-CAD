@@ -3098,16 +3098,42 @@ fn march_from_point(
     start: IntersectionPoint,
     tolerance: &Tolerance,
 ) -> OperationResult<Option<SurfaceIntersectionCurve>> {
-    let mut points = vec![start.clone()];
-    let mut params_a = vec![start.params_a];
-    let mut params_b = vec![start.params_b];
+    // HARD STEP CAP per direction. The marching step is tied to the distance
+    // tolerance (≈1e-5), so a curve on unit-scale primitives needs ~10^6 steps;
+    // for a pair with NO analytic SSI arm (cone×cylinder, cone×sphere, …) the
+    // march can also fail to ever close → a true HANG that freezes the kernel
+    // (the worst failure class). Bound it: a real intersection curve on bounded
+    // analytic primitives needs far fewer points; exceeding the cap means the
+    // march is non-terminating/unreliable, so discard this curve (Ok(None))
+    // rather than hang or feed a truncated garbage curve downstream. The proper
+    // fix for those pairs is an analytic SSI arm (task #7) / a geometry-scaled
+    // step — tracked separately; this is the safety guard.
+    const MAX_MARCH_STEPS: usize = 200_000;
 
-    // March in both directions
+    // Collect each direction into its own Vec (forward + backward) and splice at
+    // the end, so the backward branch is O(n) instead of the old insert(0, …)
+    // which made a long march quadratic.
+    let mut fwd: Vec<IntersectionPoint> = Vec::new();
+    let mut bwd: Vec<IntersectionPoint> = Vec::new();
+
     for direction in &[1.0, -1.0] {
         let mut current = start.clone();
         let mut step_size = tolerance.distance() * 10.0;
+        let mut steps = 0usize;
 
         loop {
+            steps += 1;
+            if steps > MAX_MARCH_STEPS {
+                // Non-terminating march — bail the whole curve as unreliable.
+                if pipeline_trace_enabled() {
+                    eprintln!(
+                        "[bool]   march_from_point: step cap {MAX_MARCH_STEPS} hit \
+                         (non-terminating SSI — discarding curve; needs analytic arm)"
+                    );
+                }
+                return Ok(None);
+            }
+
             // Compute tangent direction
             let tangent = compute_intersection_tangent(surface_a, surface_b, &current)?;
             if tangent.magnitude() < tolerance.distance() {
@@ -3146,25 +3172,19 @@ fn march_from_point(
                 params_b: (u_b, v_b),
             };
 
-            // Check for loop closure
-            if points.len() > 3 {
-                let dist_to_start = (next.position - points[0].position).magnitude();
+            // Check for loop closure against the seed point.
+            if fwd.len() + bwd.len() > 3 {
+                let dist_to_start = (next.position - start.position).magnitude();
                 if dist_to_start < tolerance.distance() * 2.0 {
-                    // Closed loop found
-                    break;
+                    break; // Closed loop found
                 }
             }
 
             if *direction > 0.0 {
-                points.push(next.clone());
-                params_a.push((u_a, v_a));
-                params_b.push((u_b, v_b));
+                fwd.push(next.clone());
             } else {
-                points.insert(0, next.clone());
-                params_a.insert(0, (u_a, v_a));
-                params_b.insert(0, (u_b, v_b));
+                bwd.push(next.clone());
             }
-
             current = next;
 
             // Adaptive step size
@@ -3173,6 +3193,14 @@ fn march_from_point(
             }
         }
     }
+
+    // Splice: backward branch (reversed) + seed + forward branch.
+    let mut points = Vec::with_capacity(bwd.len() + 1 + fwd.len());
+    points.extend(bwd.iter().rev().cloned());
+    points.push(start.clone());
+    points.extend(fwd.iter().cloned());
+    let params_a: Vec<(f64, f64)> = points.iter().map(|p| p.params_a).collect();
+    let params_b: Vec<(f64, f64)> = points.iter().map(|p| p.params_b).collect();
 
     if points.len() < 2 {
         return Ok(None);
