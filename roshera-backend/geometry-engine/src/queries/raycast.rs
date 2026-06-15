@@ -94,6 +94,74 @@ pub fn raycast_solid(
     best
 }
 
+/// ALL ray–solid hits along the ray (every face crossing), sorted near→far.
+/// Used for point-in-solid parity and multi-hit field queries.
+pub fn raycast_all(
+    model: &BRepModel,
+    solid_id: SolidId,
+    origin: Point3,
+    direction: Vector3,
+) -> Vec<RayHit> {
+    let dir = match direction.normalize() {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
+    let solid = match model.solids.get(solid_id) {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+
+    let mut hits = Vec::new();
+    for shell_id in shells {
+        let shell = match model.shells.get(shell_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        for &face_id in &shell.faces {
+            let face = match model.faces.get(face_id) {
+                Some(f) => f,
+                None => continue,
+            };
+            let surface = match model.surfaces.get(face.surface_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            for t in surface_ray_ts(surface, origin, dir) {
+                if t <= EPS {
+                    continue;
+                }
+                let p = Point3::new(
+                    origin.x + dir.x * t,
+                    origin.y + dir.y * t,
+                    origin.z + dir.z * t,
+                );
+                let (u, v) = match surface.closest_point(&p, model.tolerance()) {
+                    Ok(uv) => uv,
+                    Err(_) => continue,
+                };
+                if !crate::tessellation::surface::point_inside_face_uv(u, v, face, model) {
+                    continue;
+                }
+                let n = oriented_normal(surface, face, u, v);
+                hits.push(RayHit {
+                    face_id,
+                    point: p,
+                    normal: n,
+                    distance: t,
+                });
+            }
+        }
+    }
+    hits.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits
+}
+
 fn oriented_normal(surface: &dyn Surface, face: &Face, u: f64, v: f64) -> Vector3 {
     let n = surface.normal_at(u, v).unwrap_or(Vector3::Z);
     let s = match face.orientation {
