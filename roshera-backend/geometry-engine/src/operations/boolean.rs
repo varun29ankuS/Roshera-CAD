@@ -7855,6 +7855,80 @@ fn clip_circle_to_planar_face(
     let x_axis_3d = (p_at_zero - center3) * inv_r;
     let y_axis_3d = (p_at_quarter - center3) * inv_r;
 
+    // DISC fast-path (BOOL #7): a planar face bounded by a SINGLE closed circular
+    // edge (a cone/cylinder cap disc) has no straight-line edges, so the polygon
+    // clipper below bails (NotApplicable on the first non-Line edge) and a
+    // coplanar cutting circle is never trimmed to the disc. A cutting circle
+    // LARGER than the disc (the sphere equator r6 vs a cone base disc r5) is then
+    // never dropped → it spuriously over-splits the other operand (cone∪sphere
+    // over-inclusion). Clip the cutting circle against the disc circle-vs-circle.
+    {
+        use crate::primitives::curve::Circle as CircleCurve;
+        let disc = (boundary_edges.len() == 1)
+            .then(|| boundary_edges[0].0)
+            .and_then(|eid| model.edges.get(eid))
+            .and_then(|e| model.curves.get(e.curve_id))
+            .and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<CircleCurve>()
+                    .map(|circ| (circ.center(), circ.radius()))
+            });
+        if let Some((dc, dr)) = disc {
+            let tol = tolerance.distance();
+            let delta = dc - center3;
+            let d = (delta - plane.normal * delta.dot(&plane.normal)).magnitude();
+            if d <= tol {
+                // Concentric: classify by radius.
+                if radius < dr - tol {
+                    return Ok(CircleClipOutcome::Full);
+                } else if radius > dr + tol {
+                    return Ok(CircleClipOutcome::Misses);
+                }
+                return Ok(CircleClipOutcome::NotApplicable); // coincident boundary
+            }
+            if d + radius <= dr + tol {
+                return Ok(CircleClipOutcome::Full); // cutting circle inside the disc
+            }
+            if d >= dr + radius - tol || radius >= d + dr - tol {
+                return Ok(CircleClipOutcome::Misses); // separate, or encircles the disc
+            }
+            // Two coplanar circles intersect → keep the arc inside the disc.
+            let e_hat = (delta - plane.normal * delta.dot(&plane.normal)) * (1.0 / d);
+            let a = (d * d + radius * radius - dr * dr) / (2.0 * d);
+            let h = (radius * radius - a * a).max(0.0).sqrt();
+            let perp = plane.normal.cross(&e_hat);
+            let ang = |p: Point3| -> f64 {
+                let local = p - center3;
+                let mut t = local.dot(&y_axis_3d).atan2(local.dot(&x_axis_3d));
+                if t < 0.0 {
+                    t += std::f64::consts::TAU;
+                }
+                t
+            };
+            let (mut t1, mut t2) = (
+                ang(center3 + e_hat * a + perp * h),
+                ang(center3 + e_hat * a - perp * h),
+            );
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            let mid = 0.5 * (t1 + t2);
+            let mid_pt =
+                center3 + x_axis_3d * (radius * mid.cos()) + y_axis_3d * (radius * mid.sin());
+            let md = mid_pt - dc;
+            let mid_inside = (md - plane.normal * md.dot(&plane.normal)).magnitude() < dr;
+            let (start, sweep) = if mid_inside {
+                (t1, t2 - t1)
+            } else {
+                (t2, std::f64::consts::TAU - (t2 - t1))
+            };
+            return Ok(CircleClipOutcome::Arc {
+                start_angle: start,
+                sweep_angle: sweep,
+            });
+        }
+    }
+
     let origin = plane.origin;
     let u_dir = plane.u_dir;
     let v_dir = plane.v_dir;

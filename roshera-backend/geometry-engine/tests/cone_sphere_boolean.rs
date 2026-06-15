@@ -75,9 +75,12 @@ fn cone_sphere_correct_cases_7() {
 ///      correction (462e4ca) only counts faces with ZERO edges across ALL loops;
 ///      a seamless OUTER loop + inner holes needs the same +1 (check the OUTER
 ///      loop's edge count, not all loops).
-/// Flip on when both land. (#7 downstream; ties #34/#80 clip-to-face + validator.)
+/// FIXED (disc-clip): clip_circle_to_planar_face now handles a disc-bounded
+/// planar face (single circular edge) via circle-vs-circle, so the spurious
+/// equator cut is dropped → correct union (watertight, valid, vol≈924). The
+/// validator seamless-OUTER half wasn't needed: the correct split yields a
+/// normally-seamed sphere body. This is now a passing GATE.
 #[test]
-#[ignore = "#7: cone∪sphere transverse union over-inclusion (downstream classify) — flip when fixed"]
 fn cone_union_sphere_transverse_overinclusion_7() {
     let mut m = BRepModel::new();
     let cone = sid(TopologyBuilder::new(&mut m)
