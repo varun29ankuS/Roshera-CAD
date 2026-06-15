@@ -189,6 +189,54 @@ fn diag_cyl_sphere_validity_structure_7() {
     }
 }
 
+/// TRANSVERSE gate (BOOL #7): a sphere that pokes THROUGH the cylinder wall
+/// (rs > rc), fully within the cylinder's height so it cuts ONLY the lateral
+/// (two circles at z = ±√(rs²−rc²)). This is the case the analytic cyl×sphere
+/// SSI arm handles (exact circles, vs the old marching hang/garbage). The
+/// end-to-end difference must be watertight + valid. cyl(r5, z∈[-10,10]) ∖
+/// sphere(r6 @ origin) → a cylinder with a spherical side-scoop open at the wall.
+#[test]
+fn cyl_minus_sphere_transverse_wall_7() {
+    let mut m = BRepModel::new();
+    let cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -10.0), Vector3::Z, 5.0, 20.0)
+        .expect("cyl"));
+    let sph = sid(TopologyBuilder::new(&mut m)
+        .create_sphere_3d(Point3::ORIGIN, 6.0)
+        .expect("sphere"));
+    let res = boolean_operation(
+        &mut m,
+        cyl,
+        sph,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("transverse cyl∖sphere must succeed");
+    let rep = manifold_report(&m, res, 0.5, 1e-6).expect("mesh");
+    let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
+    let vol = m.calculate_solid_volume(res).unwrap_or(f64::NAN);
+    eprintln!(
+        "[transverse] open={} nm={} valid={} vol={vol:.2}",
+        rep.boundary_edges, rep.nonmanifold_edges, v.is_valid
+    );
+    assert_eq!(
+        (rep.boundary_edges, rep.nonmanifold_edges),
+        (0, 0),
+        "transverse cyl∖sphere not watertight"
+    );
+    assert!(
+        v.is_valid,
+        "transverse cyl∖sphere invalid B-Rep: {:?}",
+        v.errors
+    );
+    // Sanity bounds: removed volume is positive and less than the cylinder.
+    let cyl_vol = std::f64::consts::PI * 25.0 * 20.0;
+    assert!(
+        vol > 0.0 && vol < cyl_vol,
+        "transverse cyl∖sphere volume {vol:.2} out of (0, {cyl_vol:.2})"
+    );
+}
+
 /// SAME radius — sphere tangent to the cylinder wall along the whole equator.
 /// The degenerate tangency case the marching cyl∘sphere SSI cannot trace.
 #[test]
