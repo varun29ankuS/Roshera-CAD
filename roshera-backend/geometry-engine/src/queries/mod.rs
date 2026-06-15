@@ -11,4 +11,7 @@ pub mod features;
 pub mod kinematics;
 pub mod lmd;
 pub mod newton;
+pub mod raycast;
 pub mod trim;
+
+pub use raycast::{raycast_solid, RayHit};
