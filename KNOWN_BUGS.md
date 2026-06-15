@@ -346,6 +346,37 @@ HARNESS-1000.
 ### #27 🟢 Coaxial stacked-step union left buried cap
 Fixed via annular face-with-hole interior-point. See boolean campaign.
 
+### #27/#32 cone family 🟢 FIXED — coincident cone rim left unwelded ("rocket") (commit ae1c8ad)
+A cone stacked/offset on a cylinder so the cone base circle is COINCIDENT with a
+cylinder rim (Varun's live "rocket with nozzle at the bottom") unioned to a
+watertight-LOOKING solid with EXACT volume (916.30) but a hollow B-Rep: 279 open
+edges, invalid. The correct volume + clean render hid it. ROOT: the cone
+primitive placed its rim seam VERTEX at `center + axis.perpendicular()*r` (+Y for
+a −Z internal axis) while the rim Circle/Arc parametrizes t=0 at the canonical +X
+(±Z→+X, ±X→+Y, ±Y→+Z; see `Arc::new`). The full-cone rim edge's `param_range
+[0,1]` therefore did NOT start at its `start_vertex`, so
+`heal_t_junctions_across_faces` saw the coincident foreign vertex land on the
+param boundary (t=0) and could not split the closed circle → rim welded on the
+cylinder side only. (The cylinder is immune — it already uses `Circle::x_axis()`.)
+FIX: derive cone `ref_dir` from `Circle::x_axis()` so surface seam, rim curve
+t=0, seam vertex, and edge param_range all coincide; plus a periodic-wrap guard
+in the T-junction healer. Same fix ALSO closed the coincident cone-base
+difference. Result open=0/valid=true. Gates: `cyl_union_cone_stacked_rocket_27`,
+`cyl_minus_cone_coincident_base_7` (flipped ignore→live). Verified lib 3724/0 +
+cone/cyl/sphere suites + poke 14/15. LESSON: a closed-curve (seam) edge's
+`param_range.start` MUST sit at its `start_vertex` (= `curve.evaluate(0)`).
+See memory `cone-rim-seam-alignment.md`.
+
+### BOOL determinism 🔴 rbox-diag45 Intersection non-deterministic (10th digit)
+`boolean_pipeline_determinism_gate` (boolean_fuzz_survey.rs) fails: a 45°-rotated
+box Intersection yields bit-different volumes across two identical runs (~1e-10,
+e.g. 2.7246017656 vs ...657). PRE-EXISTING (confirmed via `git stash` on the
+clean tree 2026-06-15 — not the cone rim-seam fix). Same family as #34/#80
+rotated/degenerate box over-inclusion. Likely HashMap/float-accumulation order in
+the rotated-box marching-intersection path. NOT `#[ignore]`'d (reds the poke run
+honestly). Task #61. Fix = deterministic iteration/accumulation, or pin honestly
+if a true marching limitation.
+
 ### #33 🟢 Offset/partial-overlap chained union invalid
 Fixed (line-extent classification).
 
