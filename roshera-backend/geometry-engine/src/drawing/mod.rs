@@ -30,7 +30,7 @@ pub mod projection;
 pub mod svg;
 pub mod types;
 
-pub use dimensioning::{auto_dimensions, visible_dimensions, Dimension2d};
+pub use dimensioning::{auto_dimensions, standard_drawing, visible_dimensions, Dimension2d};
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{

@@ -230,6 +230,11 @@ pub struct ProjectedView {
     pub polylines: Vec<Polyline2d>,
     /// View-space extent of the geometry.
     pub extent: ViewExtent,
+    /// Auto-derived analytic dimension callouts on this view (view-space mm).
+    /// Empty unless populated by `dimensioning::standard_drawing`. `#[serde(default)]`
+    /// keeps older serialized drawings (no dimensions) parsing.
+    #[serde(default)]
+    pub dimensions: Vec<super::dimensioning::Dimension2d>,
 }
 
 /// Paper sizes, ISO 216 series. Dimensions in millimetres, landscape
