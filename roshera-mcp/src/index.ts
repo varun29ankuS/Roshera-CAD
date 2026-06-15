@@ -94,6 +94,53 @@ async function newestPartId(): Promise<number | null> {
   return parts.reduce((m: number, p: any) => Math.max(m, p.id), 0);
 }
 
+/**
+ * Automatic perception — the ambient default. After any mutating op, fetch the
+ * result part's validity verdict + structural facts so the agent never operates
+ * blind. Watertightness comes from the diagnostic render (open / non-manifold
+ * edge counts, the same source `verify_part` uses); face-count / volume / bbox
+ * from the part query. Default-ON; disable per process with
+ * `ROSHERA_MCP_AUTOVERIFY=0`. Best-effort: returns `undefined` (no perception
+ * block, never an error) if anything fails, so it can't break a real result.
+ */
+async function perceive(partId: number | null): Promise<any> {
+  if (partId === null || process.env.ROSHERA_MCP_AUTOVERIFY === "0") {
+    return undefined;
+  }
+  try {
+    const diag = await api(
+      "GET",
+      `/api/agent/parts/${partId}/render?mode=diagnostic&view=iso&size=128`,
+    );
+    const part = await api("GET", `/api/agent/parts/${partId}`).catch(() => null);
+    const open = diag?.open_edges ?? 0;
+    const nm = diag?.nonmanifold_edges ?? 0;
+    const watertight = open === 0 && nm === 0;
+    return {
+      watertight,
+      open_edges: open,
+      nonmanifold_edges: nm,
+      face_count: part?.topology?.face_count ?? null,
+      volume: part?.volume ?? null,
+      bbox:
+        part?.world_bbox_min && part?.world_bbox_max
+          ? { min: part.world_bbox_min, max: part.world_bbox_max }
+          : null,
+      verdict: watertight
+        ? "OK — closed manifold solid"
+        : `BROKEN — ${open} open edge(s), ${nm} non-manifold edge(s); render mode:diagnostic to see where`,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** `ok()` plus an automatic perception verdict for the resulting part. */
+async function okp(data: Record<string, unknown>, partId: number | null) {
+  const perception = await perceive(partId);
+  return ok(perception === undefined ? data : { ...data, perception });
+}
+
 // ─── Server + tools ────────────────────────────────────────────────────
 
 const server = new McpServer({ name: "roshera", version: "0.1.0" });
@@ -399,7 +446,7 @@ server.tool(
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return await okp({ part_id: id, placement: id !== null ? await placement(id) : null }, id);
     } catch (e) {
       return fail(e);
     }
@@ -453,11 +500,14 @@ server.tool(
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null, // operand for boolean / transform
-        part_id: id,
-        placement: id !== null ? await placement(id) : null,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -487,11 +537,14 @@ server.tool(
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null, // operand for boolean / transform
-        part_id: id,
-        placement: id !== null ? await placement(id) : null,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -522,11 +575,14 @@ server.tool(
         name: name ?? null,
       });
       const id = r.solid_id ?? (await newestPartId());
-      return ok({
-        object_uuid: r.object?.id ?? null, // operand for boolean / transform
-        part_id: id,
-        placement: id !== null ? await placement(id) : null,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -544,11 +600,14 @@ server.tool(
         parameters: { radius },
       });
       const id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null, // operand for boolean / transform
-        part_id: id,
-        placement: id !== null ? await placement(id) : null,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -586,12 +645,15 @@ server.tool(
         name: name ?? null,
       });
       const id = r.solid_id ?? (await newestPartId());
-      return ok({
-        object_uuid: r.object?.id ?? null, // operand for boolean / transform
-        part_id: id,
-        triangles: r?.stats?.triangle_count ?? null,
-        placement: id !== null ? await placement(id) : null,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          triangles: r?.stats?.triangle_count ?? null,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -705,11 +767,14 @@ server.tool(
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null, // operand for boolean / transform
-        part_id: id,
-        placement: id !== null ? await placement(id) : null,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -743,13 +808,15 @@ server.tool(
         object_b,
       });
       const part_id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null,
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null,
+          part_id,
+          consumed: r.consumed ?? [object_a, object_b],
+          placement: part_id !== null ? await placement(part_id) : null,
+        },
         part_id,
-        consumed: r.consumed ?? [object_a, object_b],
-        placement: part_id !== null ? await placement(part_id) : null,
-        note: "verify_part this result — differences can drop faces",
-      });
+      );
     } catch (e) {
       return fail(e);
     }
@@ -912,13 +979,16 @@ server.tool(
         name: name ?? null,
       });
       const part_id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null, // pass to `boolean` as an operand
-        part_id, // kernel id for render/verify/inspect tools
-        solid_id: r.solid_id,
-        triangles: r.stats?.triangle_count,
-        regions: r.stats?.regions,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // pass to `boolean` as an operand
+          part_id, // kernel id for render/verify/inspect tools
+          solid_id: r.solid_id,
+          triangles: r.stats?.triangle_count,
+          regions: r.stats?.regions,
+        },
+        part_id,
+      );
     } catch (e) {
       return fail(e);
     }
