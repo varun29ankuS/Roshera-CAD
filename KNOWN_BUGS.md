@@ -100,6 +100,22 @@ lands.
 
 ## Boolean
 
+### #34/#80 🔴 box∘box difference bbox over-inclusion (robustness ceiling)
+Discovered by the tier-3 bbox-containment proptest
+(`prop_tier3_difference_bbox_within_minuend`) during the BOOL #7 cyl×sphere fire;
+proven PRE-EXISTING (reproduces with that fire's changes stashed). `A ∖ B` must
+satisfy `bbox(A∖B) ⊆ bbox(A)` (subtracting can't grow the minuend), but for a
+near-degenerate config where B slightly exceeds A in some axes, the result bbox
+escapes A — the difference keeps B's larger extent instead of clipping to A
+(classic over-inclusion). Shrunk case (boxes centred at origin):
+A = 19.828×19.814×8.401 ∖ B = 2.000×19.852×8.402 → result max.y 9.926 > A's
+9.907. Explicit pin: `box_box_bbox_overinclusion.rs::
+box_box_difference_bbox_within_minuend_3480` (#[ignore]). The randomized tier-3
+proptest remains the live discovery gate (usually green; occasionally re-finds a
+case). Fix lane = the #34/#80 over-inclusion class (classification keeps
+material outside the minuend); DEEP, ties exact predicates (#30). NOTE: NOT
+caused by the cyl×sphere arm (7666c2e) — that was verified independent.
+
 ### MARCH-HANG 🟢 FIXED — curved×curved booleans with no analytic SSI arm froze the kernel
 Live dogfood ("union of cone and cylinder takes a loooot of time") = a TRUE HANG
 (>25s, no return) on every cone∪cylinder config, even a trivial coaxial one. A
