@@ -112,9 +112,16 @@ signature (`radial-face+x`: bc=[1,0,-0.5] rb=0.5 rt=0.3 h=1):
 - **∪** → vol −1.2%, open=6, nonmanifold=2, odd Euler (3 faces share the conic
   boundary edge + boundary gaps).
 - **∖** → vol −1.3%, open=8, odd Euler (gaps along the conic cut).
-Fix lane: analytic cone×plane conic SSI (recognize circle / ellipse / parabola /
-hyperbola / 1–2 lines by orientation) + conic-patch stitching — DEEP, multi-fire,
-ties task #7 (analytic SSI arms). Pinned: `boolean_fuzz_survey.rs::
+**LOCALIZED (2026-06-15):** the analytic cone×plane SSI arm is CORRECT — the
+new lib test `boolean::tests::cone_plane_ssi_points_lie_on_both_surfaces_1`
+confirms every intersection-curve point lies on BOTH surfaces for the circle /
+two-generator-line / hyperbola orientations. So the defect is DOWNSTREAM of the
+SSI: the cone-LATERAL patch is dropped/mis-stitched in split_faces / classify
+(∩ keeps only the 3 planar faces — base disc + top disc + +X wall). Note the
+`radial-face+x` cell is the TWO-GENERATOR-LINE case (the +X wall plane contains
+the cone axis), not a hyperbola — `plane_cone_parallel_intersection` already
+emits those two lines correctly. Fix lane: make split/classify KEEP the cone
+conic patch — DEEP, multi-fire, ties task #7. Pinned: `boolean_fuzz_survey.rs::
 cone_radial_conic_cut_pin_1` (#[ignore], asserts watertight+valid+vol — flip on
 when #1 lands). The 33-cell curved poke matrix (`harness::poke_matrix`) stays
 fully green; this off-axis conic class is the remaining frontier.

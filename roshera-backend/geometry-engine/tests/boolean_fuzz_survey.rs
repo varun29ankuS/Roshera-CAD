@@ -898,22 +898,29 @@ fn boolean_box_cone_fuzz_survey() {
 
 /// PIN (task #1): the cone-radial conic-cut worst class — the deepest open
 /// boolean-core defect. A z-axis cone whose base is shifted to x=1.0 so its
-/// slanted LATERAL surface pierces the box's +X wall (plane x=1). A cone
-/// lateral × plane intersection is a CONIC — here a HYPERBOLA (cutting plane
-/// parallel to the cone axis) — not a circle or a line. The split/classify/
-/// stitch pipeline cannot form that hyperbolic boundary curve, so the conic
-/// patch is dropped or mis-stitched.
+/// slanted LATERAL surface pierces the box's +X wall (plane x=1). The box +X
+/// wall here CONTAINS the cone axis (x=1, y=0, z varying), so the cone × plane
+/// section is TWO GENERATOR LINES (the dd≈0 branch of
+/// `plane_cone_parallel_intersection`); off-axis radial cells are a hyperbola.
+///
+/// LOCALIZED (2026-06-15): the analytic cone×plane SSI arm is CORRECT — the
+/// lib test `boolean::tests::cone_plane_ssi_points_lie_on_both_surfaces_1`
+/// confirms every intersection-curve point lies on BOTH surfaces for the
+/// circle / two-line / hyperbola orientations. So the defect is DOWNSTREAM of
+/// the SSI: the cone-LATERAL patch (bounded by the two generators + the rim
+/// arcs) is dropped/mis-stitched in split_faces / classify — the intersection
+/// curve itself is not the problem.
 ///
 /// Characterized failure signature (2026-06-15, ROSHERA_BOOL_TRACE):
-///   ∩ → InvalidBRep "component 0 has only 3 planar faces" (the hyperbolic
-///       conic patch is dropped entirely → can't close a manifold).
-///   ∪ → vol −1.2%, open=6, nonmanifold=2, odd Euler (3 faces share the conic
-///       boundary edge + boundary gaps).
-///   ∖ → vol −1.3%, open=8, odd Euler (gaps along the conic cut).
+///   ∩ → InvalidBRep "component 0 has only 3 planar faces" (the cone-lateral
+///       patch is dropped entirely; only base disc + top disc + +X wall remain).
+///   ∪ → vol −1.2%, open=6, nonmanifold=2, odd Euler (3 faces share the cut
+///       edge + boundary gaps).
+///   ∖ → vol −1.3%, open=8, odd Euler (gaps along the cut).
 ///
 /// This asserts the CORRECT outcome (watertight + valid + volume within tol);
-/// it FAILS today, so it is #[ignore]'d. Flip on when #1 (analytic cone×plane
-/// conic SSI + conic-patch stitching, ties #7) lands. Run the live signature:
+/// it FAILS today, so it is #[ignore]'d. Flip on when #1 (split/classify keeps
+/// the cone-lateral conic patch; ties #7) lands. Run the live signature:
 ///   `cargo test -p geometry-engine --test boolean_fuzz_survey \
 ///        cone_radial_conic_cut_pin_1 -- --ignored --nocapture`
 #[test]
