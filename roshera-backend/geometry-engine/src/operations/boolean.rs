@@ -1203,6 +1203,9 @@ fn surface_surface_intersection(
             cylinder_sphere_intersection(surface_a, surface_b, tolerance)
         }
         (Planar, Cone) | (Cone, Planar) => plane_cone_intersection(surface_a, surface_b, tolerance),
+        (Cone, Cylinder) | (Cylinder, Cone) => {
+            cone_cylinder_intersection(surface_a, surface_b, tolerance)
+        }
         _ => {
             use crate::primitives::surface::SurfaceType;
             if matches!(
@@ -2745,6 +2748,104 @@ fn cylinder_sphere_intersection(
         });
     }
     Ok(curves)
+}
+
+/// Closed-form cone(lateral)–cylinder(lateral) intersection for a COAXIAL pair
+/// (cone apex on the cylinder axis, axes parallel) — BOOL #7. A cone's radius is
+/// monotonic along its axis (`r(v) = v·tan(α)`, v = axial distance from apex), so
+/// it equals the cylinder radius `rc` at exactly ONE axial position
+/// `v* = rc / tan(α)` → a single circle of radius `rc`. Emit it when v* lies in
+/// the cone's extent AND the circle's axial position lies in the cylinder's
+/// extent; otherwise the cone never reaches the wall there → empty (so an
+/// enclosed cone routes to the void path, like cyl∖sphere). Non-coaxial cones
+/// cut the cylinder in a general quartic with no closed form here → step-capped
+/// marcher. Cone/cylinder CAPS are planar and dispatch to plane_* separately.
+fn cone_cylinder_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::{Cone, Cylinder};
+
+    let (cone, cyl, cone_is_a) = if let (Some(c), Some(y)) = (
+        surface_a.as_any().downcast_ref::<Cone>(),
+        surface_b.as_any().downcast_ref::<Cylinder>(),
+    ) {
+        (c, y, true)
+    } else if let (Some(y), Some(c)) = (
+        surface_a.as_any().downcast_ref::<Cylinder>(),
+        surface_b.as_any().downcast_ref::<Cone>(),
+    ) {
+        (c, y, false)
+    } else {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    };
+
+    let k = cone.half_angle.tan();
+    let tol = tolerance.distance();
+    if !k.is_finite() || k <= tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+    let cone_axis = cone.axis;
+    let cyl_axis = cyl.axis;
+    let rc = cyl.radius;
+
+    // Coaxial test: axes parallel AND the cone apex lies on the cylinder axis.
+    let parallel = cone_axis.cross(&cyl_axis).magnitude() <= tolerance.parallel_threshold();
+    let rel_apex = cone.apex - cyl.origin;
+    let apex_radial = (rel_apex - cyl_axis * rel_apex.dot(&cyl_axis)).magnitude();
+    if !parallel || apex_radial > tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+
+    // Axial distance from the apex (along the cone axis) where the cone radius
+    // equals the cylinder radius.
+    let v_star = rc / k;
+    let (cv_lo, cv_hi) = match cone.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (0.0, f64::INFINITY),
+    };
+    // STRICTLY interior: a circle at the cone's own rim (v* ≈ cv_lo/cv_hi) is a
+    // shared boundary (e.g. a cone stacked on a cylinder, base rim == top rim),
+    // NOT a transverse cut — emitting it corrupts the split. Such rim
+    // coincidence is handled by the coplanar-imprint / shared-edge path, so
+    // return empty here.
+    if v_star <= cv_lo + tol || v_star >= cv_hi - tol {
+        return Ok(vec![]);
+    }
+    let center = cone.apex + cone_axis * v_star;
+
+    // Circle must fall STRICTLY within the cylinder's finite axial extent for
+    // the same reason (a circle at a cap rim is a shared boundary, not a cut).
+    let (yh_lo, yh_hi) = match cyl.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+    let cyl_axial = (center - cyl.origin).dot(&cyl_axis);
+    if cyl_axial <= yh_lo + tol || cyl_axial >= yh_hi - tol {
+        return Ok(vec![]);
+    }
+
+    let circle = Circle::new(center, cone_axis, rc)?;
+    let params_cone = compute_circle_cone_parameters(&circle, cone)?;
+    let params_cyl = compute_circle_cylinder_parameters(&circle, cyl)?;
+    let (on_surface_a, on_surface_b) = if cone_is_a {
+        (
+            create_parametric_curve(&params_cone),
+            create_parametric_curve(&params_cyl),
+        )
+    } else {
+        (
+            create_parametric_curve(&params_cyl),
+            create_parametric_curve(&params_cone),
+        )
+    };
+    Ok(vec![SurfaceIntersectionCurve {
+        curve: Box::new(circle),
+        on_surface_a,
+        on_surface_b,
+    }])
 }
 
 /// Closed-form plane–cone intersection.
@@ -18064,6 +18165,61 @@ mod tests {
                     assert!(
                         (dr - rs).abs() < 1e-6,
                         "rs={rs}: point {p:?} off sphere (dist {dr})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ISOLATED SSI test (BOOL #7): the analytic cone×cylinder arm. A coaxial
+    /// cone meets the cylinder lateral in ONE circle where the cone radius equals
+    /// rc — but only when that circle is STRICTLY interior to both surfaces; a
+    /// rim-coincident circle (cone enclosed, or base rim == cap) → empty.
+    /// Cylinder: origin (0,0,0), axis +Z, rc=5, height 10 (z∈[0,10]).
+    #[test]
+    fn cone_cylinder_ssi_arm_7() {
+        use crate::primitives::surface::{Cone, Cylinder};
+        let tol = Tolerance::default();
+        let cyl = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, 5.0, 10.0).expect("cyl");
+        let axis_down = Vector3::new(0.0, 0.0, -1.0);
+        // (label, half_angle, [bottom,top] from apex at (0,0,10), expected count)
+        let cases: [(&str, f64, f64, f64, usize); 3] = [
+            ("transverse", 0.8_f64.atan(), 0.0, 10.0, 1), // base r8 → v*=6.25 interior
+            ("enclosed", 0.3_f64.atan(), 0.0, 10.0, 0),   // base r3 → v*=16.7 beyond
+            ("rim-coincident", 1.0_f64.atan(), 0.0, 5.0, 0), // base r5 → v*=5=cv_hi
+        ];
+        for (label, ha, bot, top, want) in cases {
+            let cone = Cone::truncated(Point3::new(0.0, 0.0, 10.0), axis_down, ha, bot, top)
+                .expect("cone");
+            let curves = surface_surface_intersection(&cone, &cyl, &tol)
+                .unwrap_or_else(|e| panic!("{label}: SSI errored {e:?}"));
+            assert_eq!(
+                curves.len(),
+                want,
+                "{label}: expected {want} circle(s), got {}",
+                curves.len()
+            );
+            let k = ha.tan();
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                for i in 0..=24 {
+                    let t = range.start + (range.end - range.start) * (i as f64 / 24.0);
+                    let p = sic.curve.point_at(t).expect("pt");
+                    // On the cylinder: radial distance from the axis == rc.
+                    let rel_c = p - Point3::ORIGIN;
+                    let cyl_radial = (rel_c - Vector3::Z * rel_c.dot(&Vector3::Z)).magnitude();
+                    assert!(
+                        (cyl_radial - 5.0).abs() < 1e-6,
+                        "{label}: point {p:?} off cylinder (radial {cyl_radial})"
+                    );
+                    // On the cone: radial == v·tan(half_angle), v from apex.
+                    let rel = p - Point3::new(0.0, 0.0, 10.0);
+                    let v = rel.dot(&axis_down);
+                    let cone_radial = (rel - axis_down * v).magnitude();
+                    assert!(
+                        (cone_radial - v * k).abs() < 1e-6,
+                        "{label}: point {p:?} off cone (radial {cone_radial} vs {})",
+                        v * k
                     );
                 }
             }
