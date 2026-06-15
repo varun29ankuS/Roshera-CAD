@@ -3229,6 +3229,204 @@ async fn create_cone_primitive(
     })))
 }
 
+/// POST /api/geometry/revolve — build a SOLID OF REVOLUTION from a closed
+/// meridian profile. This is the correct primitive for any axisymmetric part
+/// (nozzles, pulleys, bottles, rocket engines): one profile revolved 360°
+/// yields the whole body — including hollows — as a single clean surface of
+/// revolution, with NO booleans (so no coincident-rim weld cost) and a
+/// structured ring×station mesh (no chaotic CDT on the inner walls).
+///
+/// Request: `{ "profile": [[r,z], …], "axis_origin"?:[x,y,z],
+///             "axis_direction"?:[x,y,z], "angle_deg"?:f64, "segments"?:u32,
+///             "name"?:s }`
+/// The profile is a closed polygon in the meridian half-plane: each `[r,z]` is
+/// (radius-from-axis, height-along-axis). Points are placed at `(r,0,z)` and
+/// revolved about the axis (default +Z through the origin, full 360°). The loop
+/// auto-closes (last→first); give ≥3 points, all with r ≥ 0, non-self-
+/// intersecting. A hollow part is one profile whose outline traces the wall
+/// cross-section (outer contour out, inner contour back).
+async fn create_revolve_primitive(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
+    use geometry_engine::primitives::curve::{Line, ParameterRange};
+    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let arr3 = |key: &str, default: [f64; 3]| -> Result<[f64; 3], ApiError> {
+        match payload.get(key) {
+            Some(v) => {
+                let a = v.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'{key}' must be an array of 3 numbers"),
+                    )
+                })?;
+                Ok([
+                    a[0].as_f64().unwrap_or(0.0),
+                    a[1].as_f64().unwrap_or(0.0),
+                    a[2].as_f64().unwrap_or(0.0),
+                ])
+            }
+            None => Ok(default),
+        }
+    };
+
+    let profile_raw = payload
+        .get("profile")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::missing_field("profile"))?;
+    if profile_raw.len() < 3 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "profile needs at least 3 [r,z] points".to_string(),
+        ));
+    }
+    let mut profile: Vec<(f64, f64)> = Vec::with_capacity(profile_raw.len());
+    for p in profile_raw {
+        let pair = p.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                "each profile point must be [r, z]".to_string(),
+            )
+        })?;
+        let r = pair[0].as_f64().unwrap_or(f64::NAN);
+        let z = pair[1].as_f64().unwrap_or(f64::NAN);
+        if !r.is_finite() || !z.is_finite() || r < -1e-9 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("profile point [{r}, {z}] invalid (r must be finite and >= 0)"),
+            ));
+        }
+        profile.push((r, z));
+    }
+
+    let axis_origin = arr3("axis_origin", [0.0, 0.0, 0.0])?;
+    let axis_dir = arr3("axis_direction", [0.0, 0.0, 1.0])?;
+    let angle_deg = payload
+        .get("angle_deg")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(360.0);
+    let segments = payload
+        .get("segments")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(48)
+        .clamp(3, 512) as u32;
+    let display_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let result_solid_id = {
+        let mut model = model_handle.write().await;
+        // Build the profile loop: a vertex per point in the (r, 0, z) meridian
+        // half-plane, joined by line edges, auto-closed last->first.
+        let n = profile.len();
+        let verts: Vec<_> = profile
+            .iter()
+            .map(|(r, z)| model.vertices.add(*r, 0.0, *z))
+            .collect();
+        let mut edges = Vec::with_capacity(n);
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (ri, zi) = profile[i];
+            let (rj, zj) = profile[j];
+            let line = Line::new(Point3::new(ri, 0.0, zi), Point3::new(rj, 0.0, zj));
+            let cid = model.curves.add(Box::new(line));
+            edges.push(model.edges.add(Edge::new(
+                0,
+                verts[i],
+                verts[j],
+                cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            )));
+        }
+        let opts = RevolveOptions {
+            axis_origin: Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
+            axis_direction: Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]),
+            angle: angle_deg.to_radians(),
+            segments,
+            ..Default::default()
+        };
+        revolve_profile(&mut model, edges, opts).map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("revolve_profile failed: {e:?}"),
+            )
+        })?
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let t = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        (mesh, t.elapsed().as_millis() as u64)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = display_name.unwrap_or_else(|| format!("Revolve {result_solid_id}"));
+    let parameters = serde_json::json!({
+        "profile": profile, "axis_origin": axis_origin, "axis_direction": axis_dir,
+        "angle_deg": angle_deg, "segments": segments,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "revolve",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "revolve",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 /// POST /api/geometry/face/extrude — direct-modeling face-pull. Pick a face
 /// of an existing solid + a distance + (optional) direction; the kernel
 /// extrudes that face into the parent solid.
@@ -6247,6 +6445,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/geometry/cone",
             post(create_cone_primitive).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/revolve",
+            post(create_revolve_primitive).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_create_geometry,
             )),
         )

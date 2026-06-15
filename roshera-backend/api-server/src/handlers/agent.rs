@@ -686,8 +686,8 @@ pub async fn part_perception(
         return Err(StatusCode::NOT_FOUND);
     }
     let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
-    let valid =
-        validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard).is_valid;
+    let valid = validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard)
+        .is_valid;
     let dims = model.solid_world_bbox(sid).map(|b| {
         let s = b.size();
         [s.x, s.y, s.z]
