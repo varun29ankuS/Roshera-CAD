@@ -13440,10 +13440,21 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
                         .get(&edge.start_vertex)
                         .unwrap_or(&edge.start_vertex);
                     let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
-                    if cs == ce {
+                    // cs == ce happens two ways: a GENUINE closed-curve edge
+                    // (a full-circle rim, start_vertex == end_vertex by
+                    // construction) or a DEGENERATE edge whose distinct
+                    // endpoints collapsed onto one canonical vertex. Weld the
+                    // former — two coincident rim circles sharing a seam vertex
+                    // (a frustum∪frustum throat, a cone-on-cylinder cap) are
+                    // otherwise left as TWO unmerged closed edges → odd Euler
+                    // characteristic / non-manifold rim. Skip the latter (a
+                    // zero-extent edge must not absorb anything). The midpoint
+                    // (the circle's antipode) discriminates distinct circles
+                    // that happen to share a seam vertex.
+                    if cs == ce && edge.start_vertex != edge.end_vertex {
                         continue;
                     }
-                    let key = if cs < ce { (cs, ce) } else { (ce, cs) };
+                    let key = if cs <= ce { (cs, ce) } else { (ce, cs) };
                     let Some(mid) = edge_mid(eid) else {
                         continue;
                     };
@@ -13474,10 +13485,12 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
             .get(&edge.start_vertex)
             .unwrap_or(&edge.start_vertex);
         let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
-        if cs == ce {
+        // Mirror the bucket-build guard: genuine closed-curve edges (full
+        // circles) participate; degenerate collapsed edges do not.
+        if cs == ce && edge.start_vertex != edge.end_vertex {
             return entry;
         }
-        let key = if cs < ce { (cs, ce) } else { (ce, cs) };
+        let key = if cs <= ce { (cs, ce) } else { (ce, cs) };
         let (Some(bucket), Some(mid)) = (canon_e.get(&key), edge_mid(eid)) else {
             return entry;
         };

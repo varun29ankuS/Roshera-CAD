@@ -49,6 +49,58 @@ fn cyl_minus_cone_transverse_7() {
     assert!(v.is_valid, "transverse cyl∖cone invalid: {:?}", v.errors);
 }
 
+/// GATE (BOOL #27/#32 cone family): two FRUSTUMS meeting at a coincident throat
+/// rim — a de Laval nozzle (convergent r6→r20 ∪ divergent r18→r6, sharing the
+/// r6 throat circle at z=-12). Surfaced building a rocket engine via the API:
+/// the union was watertight (open=0) with EXACT volume (15808) but B-Rep INVALID
+/// — odd Euler V−E+F−R because the throat was TWO unmerged closed-circle edges.
+/// Unlike the cone-on-cylinder "rocket" (closed-circle vs arcs, healed by a
+/// T-junction split), here BOTH rims are FULL closed circles sharing the same
+/// seam vertex, so there is no foreign vertex to split — and
+/// `canonicalise_face_edges_by_position` USED to skip every closed-circle edge
+/// (`cs == ce`). FIXED 2026-06-15: canonicalise now welds genuine coincident
+/// closed-circle edges (discriminated by the circle's antipode midpoint).
+#[test]
+fn frustum_union_frustum_throat_27() {
+    let mut m = BRepModel::new();
+    // convergent: r6 @ z=-12 (throat) → r20 @ z=0
+    let conv = sid(TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::new(0.0, 0.0, -12.0), Vector3::Z, 6.0, 20.0, 12.0)
+        .expect("convergent frustum"));
+    // divergent: r18 @ z=-30 (exit) → r6 @ z=-12 (throat, coincident with conv)
+    let div = sid(TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::new(0.0, 0.0, -30.0), Vector3::Z, 18.0, 6.0, 18.0)
+        .expect("divergent frustum"));
+    let res = boolean_operation(
+        &mut m,
+        conv,
+        div,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("nozzle union must succeed");
+    let rep = manifold_report(&m, res, 0.5, 1e-6).expect("mesh");
+    let v = validate_solid_scoped(&m, res, Tolerance::default(), ValidationLevel::Standard);
+    let vol = m.calculate_solid_volume(res).unwrap_or(f64::NAN);
+    eprintln!(
+        "[nozzle] open={} nm={} valid={} vol={vol:.1} (truth ~15808)",
+        rep.boundary_edges, rep.nonmanifold_edges, v.is_valid
+    );
+    assert_eq!(
+        (rep.boundary_edges, rep.nonmanifold_edges),
+        (0, 0),
+        "nozzle not watertight"
+    );
+    assert!(v.is_valid, "nozzle invalid: {:?}", v.errors);
+    // π·h/3·(R²+Rr+r²): conv (r6→r20,h12)=6987.9 + div (r6→r18,h18)=8821.1
+    let truth = std::f64::consts::PI * 12.0 / 3.0 * (400.0 + 120.0 + 36.0)
+        + std::f64::consts::PI * 18.0 / 3.0 * (324.0 + 108.0 + 36.0);
+    assert!(
+        (vol - truth).abs() / truth < 0.02,
+        "nozzle vol {vol:.1} vs truth {truth:.1}"
+    );
+}
+
 /// GATE (BOOL #7): a cone fully INSIDE the cylinder (no coincident faces) →
 /// cyl∖cone is a clean conical VOID (valid 2-shell solid). cyl(r5,z[0,10]) ∖
 /// cone(base r3 @ z=2, apex z=8) → vol = 785.40 − 56.55 = 728.9. This confirms
