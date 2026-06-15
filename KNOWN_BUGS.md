@@ -100,6 +100,30 @@ lands.
 
 ## Boolean
 
+### #7 🔴 cylinder ∖ sphere — no analytic cyl×sphere SSI (campaign, live-surfaced)
+Surfaced by a live dogfood ("subtract a sphere from a cylinder of the same
+radius"). `surface_surface_intersection` has no Cylinder–Sphere arm → routes to
+the generic MARCHING fallback. A z-cylinder centred at origin (r_c, h=10) minus a
+sphere at origin (r_s); for r_s ≤ r_c, r_s ≤ 5 the sphere is fully enclosed, so
+the result should be the cylinder with a spherical cavity (vol = π·r_c²·10 −
+(4/3)π·r_s³, watertight, valid 2-shell solid). Two distinct failures (reproduced
+offline AND via the live api-server, identical numbers):
+- **Same radius (r_c=r_s=5):** the sphere is TANGENT to the cylinder wall along
+  the whole equator; the intersection degenerates to a tangent circle the marcher
+  can't trace → **200 open edges**, not watertight, invalid. The deep case (needs
+  the analytic SSI + tangency handling).
+- **Enclosed void (r_c=5, r_s=4):** geometry is CORRECT — watertight mesh,
+  volume 517.25 vs 517.32 (−0.0%) — but B-Rep validates INVALID:
+  `Euler χ = V(2)−E(3)+F(4) = 3 is odd (must be even = 2(S−G); S=2)`. The
+  spherical void becomes an inner shell but the combined Euler comes out odd — a
+  void-shell representation/validation issue, MORE BOUNDED than the SSI.
+Pins (offline gate): `cyl_sphere_boolean.rs::cyl_minus_sphere_same_radius_7` +
+`cyl_minus_sphere_enclosed_void_7` (#[ignore], assert watertight+valid+vol — flip
+on when the cyl∘sphere arm lands). Notably the api-server perception block
+self-reported `valid:false/watertight:false` (feedback-as-default working). Fix
+lane: analytic cylinder×sphere SSI (circle/two-circle/tangent-point cases) +
+void-shell B-Rep — DEEP, multi-fire, ties task #7.
+
 ### #1 🟢 Cone-radial conic-cut — FIXED (18/21 cells; 1 sub-case remains)
 A z-axis cone shifted off-axis so its slanted LATERAL surface pierces a box side
 wall; the cone × plane section is two generator lines (wall ∋ axis) or a
