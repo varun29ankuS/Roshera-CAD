@@ -1,0 +1,143 @@
+//! Section-on-revolve ACCEPTANCE gate (campaign task #9) — currently
+//! `#[ignore]`'d, PINNED on the root fix.
+//!
+//! DIAGNOSIS: a revolve emits MANY narrow `SurfaceOfRevolution` patches (one
+//! per angular segment — a 48-segment tube = 192 faces). `section_solid_by_plane`
+//! intersects each patch with the cut plane and chains the fragments into loops.
+//! Per patch the marching-square section line is sampled too coarsely to emit
+//! the patch's COMPLETE fragment, so the pieces have real (not float-noise)
+//! gaps; the chainer correctly refuses to fabricate geometry across them and
+//! closes no loops → `render_section` returns `None` (the 404 an agent hit
+//! trying to SEE a revolved part's hollow interior).
+//!
+//! NOT fixable soundly section-side: raising the grid density to 120² made it
+//! 200× slower AND crashed the CDT triangulator on the denser fragments. The
+//! gaps are a symptom of the faceting — the SOUND fix is making revolve emit
+//! ANALYTIC bands (Cylinder/Cone/Plane), the same faceting class #24 fixed for
+//! extrude. Once revolve produces analytic faces, each band sections to a clean
+//! line (exactly like a box's planar faces do today) and these gates pass.
+//!
+//! These tests are the acceptance criteria for that work — un-ignore them when
+//! the revolve-analytic-bands task lands. They assert a non-empty cross-section
+//! of the correct area on revolved tubes/solids.
+use geometry_engine::math::{Point3, Tolerance, Vector3};
+use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
+use geometry_engine::operations::section::section_solid_by_plane;
+use geometry_engine::primitives::curve::{Line, ParameterRange};
+use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+use geometry_engine::primitives::solid::SolidId;
+use geometry_engine::primitives::topology_builder::BRepModel;
+
+/// Revolve a closed (r, z) meridian profile 360° about +Z.
+fn revolve(m: &mut BRepModel, pts: &[(f64, f64)], segments: u32) -> SolidId {
+    let verts: Vec<_> = pts
+        .iter()
+        .map(|(r, z)| m.vertices.add(*r, 0.0, *z))
+        .collect();
+    let mut edges = Vec::new();
+    for i in 0..pts.len() {
+        let j = (i + 1) % pts.len();
+        let line = Line::new(
+            Point3::new(pts[i].0, 0.0, pts[i].1),
+            Point3::new(pts[j].0, 0.0, pts[j].1),
+        );
+        let cid = m.curves.add(Box::new(line));
+        edges.push(m.edges.add(Edge::new(
+            0,
+            verts[i],
+            verts[j],
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+    }
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments,
+        ..Default::default()
+    };
+    revolve_profile(m, edges, opts).unwrap_or_else(|e| panic!("revolve: {e:?}"))
+}
+
+/// Total area of all section caps (sum of triangle areas).
+fn cap_area(caps: &[geometry_engine::operations::section::SectionCap]) -> f64 {
+    let mut area = 0.0;
+    for cap in caps {
+        for tri in &cap.indices {
+            let a = cap.vertices[tri[0] as usize];
+            let b = cap.vertices[tri[1] as usize];
+            let c = cap.vertices[tri[2] as usize];
+            let e1 = b - a;
+            let e2 = c - a;
+            area += e1.cross(&e2).magnitude() * 0.5;
+        }
+    }
+    area
+}
+
+fn assert_section(pts: &[(f64, f64)], segments: u32, normal: Vector3, want_area: f64, label: &str) {
+    let mut m = BRepModel::new();
+    let s = revolve(&mut m, pts, segments);
+    let caps = section_solid_by_plane(
+        &m,
+        s,
+        Point3::new(0.0, 0.0, 10.0),
+        normal,
+        Tolerance::default(),
+    )
+    .unwrap_or_else(|e| panic!("{label}: section errored: {e:?}"));
+    assert!(
+        !caps.is_empty(),
+        "{label}: section produced NO caps (the 404 bug)"
+    );
+    let area = cap_area(&caps);
+    assert!(
+        (area - want_area).abs() < want_area * 0.05,
+        "{label}: section area {area:.2} != expected ~{want_area:.2}"
+    );
+}
+
+#[test]
+#[ignore = "PINNED on revolve-analytic-bands: revolve emits 192 SurfaceOfRevolution patches; per-patch section fragments are gappy and cannot soundly chain. Un-ignore when revolve emits analytic Cylinder/Cone/Plane bands."]
+fn section_revolved_tube_x_plane() {
+    // Tube r5..10, z0..20. The x=0 plane (normal +X) contains the axis →
+    // two wall rectangles 5 wide × 20 tall = 2 × 100 = 200 mm².
+    assert_section(
+        &[(5.0, 0.0), (10.0, 0.0), (10.0, 20.0), (5.0, 20.0)],
+        48,
+        Vector3::X,
+        200.0,
+        "tube +X",
+    );
+}
+
+#[test]
+#[ignore = "PINNED on revolve-analytic-bands: revolve emits 192 SurfaceOfRevolution patches; per-patch section fragments are gappy and cannot soundly chain. Un-ignore when revolve emits analytic Cylinder/Cone/Plane bands."]
+fn section_revolved_tube_y_plane() {
+    // Same tube, orthogonal axial cut (the SEAM-containing direction that was
+    // the SECTION #85c failure mode) — must also give 200 mm².
+    assert_section(
+        &[(5.0, 0.0), (10.0, 0.0), (10.0, 20.0), (5.0, 20.0)],
+        48,
+        Vector3::Y,
+        200.0,
+        "tube +Y",
+    );
+}
+
+#[test]
+#[ignore = "PINNED on revolve-analytic-bands: revolve emits 192 SurfaceOfRevolution patches; per-patch section fragments are gappy and cannot soundly chain. Un-ignore when revolve emits analytic Cylinder/Cone/Plane bands."]
+fn section_revolved_solid_cylinder() {
+    // A solid disc revolve (r0..12, but profile kept off the axis at r=0.001
+    // to satisfy the no-pole rule), z0..16. Axial cut → a 24×16 rectangle
+    // (two 12×16 halves) = 384 mm².
+    assert_section(
+        &[(0.001, 0.0), (12.0, 0.0), (12.0, 16.0), (0.001, 16.0)],
+        64,
+        Vector3::X,
+        384.0,
+        "solid cyl +X",
+    );
+}
