@@ -13677,6 +13677,11 @@ fn build_shells_from_faces(
     }
 
     let mut shell_ids = Vec::new();
+    // Persistent-id lineage (#11 slice 40-D): collect, per minted result face,
+    // the TRUE parent input face (`SplitFace.original_face`) + which operand it
+    // came from, so each result face's PID derives from its real source. Filled
+    // at the face-creation seam below; consumed by `assign_boolean_face_pids`.
+    let mut face_lineage: Vec<(FaceId, FaceId, SolidId)> = Vec::new();
 
     for component in components {
         // Pick shell type per options: when non-manifold is permitted, we may
@@ -13800,6 +13805,7 @@ fn build_shells_from_faces(
                 }
             }
 
+            face_lineage.push((face_id, split_face.original_face, split_face.from_solid));
             shell.add_face(face_id);
         }
 
@@ -13807,7 +13813,114 @@ fn build_shells_from_faces(
         shell_ids.push(shell_id);
     }
 
+    assign_boolean_face_pids(model, &face_lineage, operation, solid_b);
+
     Ok(shell_ids)
+}
+
+/// Centroid of a face's outer-loop vertices (a stable-ordering anchor).
+fn boolean_face_centroid(model: &BRepModel, face_id: FaceId) -> [f64; 3] {
+    let mut sum = [0.0_f64; 3];
+    let mut n = 0.0_f64;
+    if let Some(face) = model.faces.get(face_id) {
+        if let Some(lp) = model.loops.get(face.outer_loop) {
+            for &eid in &lp.edges {
+                if let Some(e) = model.edges.get(eid) {
+                    for vid in [e.start_vertex, e.end_vertex] {
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            sum[0] += p[0];
+                            sum[1] += p[1];
+                            sum[2] += p[2];
+                            n += 1.0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if n > 0.0 {
+        [sum[0] / n, sum[1] / n, sum[2] / n]
+    } else {
+        sum
+    }
+}
+
+/// Assign persistent-id lineage to a boolean's result faces (#11 slice 40-D).
+///
+/// Every result face derives from its TRUE parent input face (`original_face`,
+/// tracked soundly through split/merge/select) via [`Role::BooleanFromA`] /
+/// [`Role::BooleanFromB`], plus the operand solid PIDs as derivation parents —
+/// so a face that survives the boolean (and a later mould of an operand) keeps a
+/// stable PID traceable to where it came from. When one input face SPLITS into
+/// several result fragments (sharing one `original_face`), the fragments are
+/// ordered by centroid and the ordinal is folded into the op tag so each gets a
+/// distinct PID. The ordering is geometric — stable under a structure-preserving
+/// mould, best-effort under a split-reordering edit (a fully topological
+/// fragment key — bounding cut-face set — is the documented deepening, needing
+/// per-result-edge source-face lineage).
+fn assign_boolean_face_pids(
+    model: &mut BRepModel,
+    lineage: &[(FaceId, FaceId, SolidId)],
+    operation: BooleanOp,
+    solid_b: SolidId,
+) {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+    use std::collections::HashMap;
+
+    let op_tag = format!("boolean_{operation:?}");
+
+    // Group result faces by their (parent input face, operand).
+    let mut groups: HashMap<(FaceId, SolidId), Vec<FaceId>> = HashMap::new();
+    for &(result, parent, from) in lineage {
+        groups.entry((parent, from)).or_default().push(result);
+    }
+
+    for ((parent, from), mut result_faces) in groups {
+        // Parent face PID — the real source identity. Fall back to a mint keyed
+        // on the operand PID when the input carried no lineage (e.g. a solid
+        // built without an event key); still traceable, just not mould-stable.
+        let parent_pid = model.face_pid(parent).unwrap_or_else(|| {
+            let seed = match model.solid_pid(from) {
+                Some(sp) => format!("{}|origface|{}", sp.as_u128(), parent),
+                None => format!("origface|{}|{}", from, parent),
+            };
+            PersistentId::root(seed.as_bytes())
+        });
+        let role = if from == solid_b {
+            Role::BooleanFromB {
+                source_face_pid: parent_pid,
+            }
+        } else {
+            Role::BooleanFromA {
+                source_face_pid: parent_pid,
+            }
+        };
+        // Derivation parents: the operand solid PID (binds the face to THIS
+        // boolean of THIS operand) + the parent face PID.
+        let mut parents: Vec<PersistentId> = Vec::with_capacity(2);
+        if let Some(sp) = model.solid_pid(from) {
+            parents.push(sp);
+        }
+        parents.push(parent_pid);
+
+        if result_faces.len() == 1 {
+            let pid = PersistentId::derive(&parents, &op_tag, &role);
+            model.set_face_pid(result_faces[0], pid);
+        } else {
+            // Several fragments of one parent: order by centroid for a stable
+            // discriminator, fold the ordinal into the op tag.
+            result_faces.sort_by(|&a, &b| {
+                let ca = boolean_face_centroid(model, a);
+                let cb = boolean_face_centroid(model, b);
+                ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (i, &face) in result_faces.iter().enumerate() {
+                let tag = format!("{op_tag}#{i}");
+                let pid = PersistentId::derive(&parents, &tag, &role);
+                model.set_face_pid(face, pid);
+            }
+        }
+    }
 }
 
 /// Group faces into connected components based on shared boundary edges.
