@@ -108,27 +108,28 @@ async function perceive(partId: number | null): Promise<any> {
     return undefined;
   }
   try {
-    const diag = await api(
-      "GET",
-      `/api/agent/parts/${partId}/render?mode=diagnostic&view=iso&size=128`,
-    );
+    // SOUND channel: /perception reports the B-Rep validity verdict
+    // (validate_solid_scoped, mesh-independent) plus a manifold check.
+    // The B-Rep verdict is authoritative — a valid solid whose DISPLAY
+    // tessellation has T-junctions is NOT broken (see KNOWN_BUGS #65 /
+    // EYE-SOUND). We never judge soundness off the display render.
+    const p = await api("GET", `/api/agent/parts/${partId}/perception`);
     const part = await api("GET", `/api/agent/parts/${partId}`).catch(() => null);
-    const open = diag?.open_edges ?? 0;
-    const nm = diag?.nonmanifold_edges ?? 0;
-    const watertight = open === 0 && nm === 0;
+    const valid = p?.valid === true;
+    const meshClean = p?.watertight === true;
     return {
-      watertight,
-      open_edges: open,
-      nonmanifold_edges: nm,
+      brep_valid: valid,
+      watertight: meshClean,
+      open_edges: p?.open_edges ?? null,
+      nonmanifold_edges: p?.nonmanifold_edges ?? null,
+      dims: p?.dims ?? null,
       face_count: part?.topology?.face_count ?? null,
       volume: part?.volume ?? null,
-      bbox:
-        part?.world_bbox_min && part?.world_bbox_max
-          ? { min: part.world_bbox_min, max: part.world_bbox_max }
-          : null,
-      verdict: watertight
-        ? "OK — closed manifold solid"
-        : `BROKEN — ${open} open edge(s), ${nm} non-manifold edge(s); render mode:diagnostic to see where`,
+      verdict: !valid
+        ? "BROKEN — B-Rep invalid (real topological defect)"
+        : meshClean
+          ? "OK — valid closed solid"
+          : "OK — valid B-Rep; display mesh has tessellation T-junctions only (not a defect)",
     };
   } catch {
     return undefined;
@@ -195,23 +196,28 @@ server.tool(
 
 server.tool(
   "verify_part",
-  "SELF-CHECK a part's geometry: runs the diagnostic render and reports " +
-    "watertightness — open_edges (missing-face hole rims), nonmanifold_edges " +
-    "(overlapping faces), and a watertight verdict. ALWAYS call this after a " +
-    "boolean (union/difference) or a multi-feature build: booleans can drop " +
-    "or flip faces, and a part can LOOK solid in a shaded render while being " +
-    "broken. Returns the iso diagnostic image too so you can see WHERE.",
+  "SELF-CHECK a part's geometry. The verdict is the SOUND, mesh-independent " +
+    "B-Rep check (validate_solid_scoped via /perception): brep_valid is the " +
+    "authoritative 'is this a real closed solid' answer. The display mesh's " +
+    "open/non-manifold edge counts are reported separately as DISPLAY quality " +
+    "— a valid B-Rep can still tessellate with T-junctions (KNOWN_BUGS #65), " +
+    "which is a rendering artifact, NOT a broken solid. ALWAYS call this after " +
+    "a boolean or multi-feature build. Returns the iso diagnostic image so you " +
+    "can SEE where any real (red=open / magenta=non-manifold) defect is.",
   {
     part_id: z.number().int().describe("kernel part id from list_parts"),
     view: z.enum(["iso", "front", "top", "right"]).default("iso"),
   },
   async ({ part_id, view }) => {
     try {
+      // Sound verdict from the B-Rep; image + display-mesh counts from the render.
+      const p = await api("GET", `/api/agent/parts/${part_id}/perception`);
       const r = await api(
         "GET",
         `/api/agent/parts/${part_id}/render?mode=diagnostic&view=${view}&size=720`,
       );
-      const watertight = r.open_edges === 0 && r.nonmanifold_edges === 0;
+      const valid = p.valid === true;
+      const meshClean = r.open_edges === 0 && r.nonmanifold_edges === 0;
       return {
         content: [
           {
@@ -219,12 +225,19 @@ server.tool(
             text: JSON.stringify(
               {
                 part_id,
-                watertight,
-                open_edges: r.open_edges,
-                nonmanifold_edges: r.nonmanifold_edges,
-                verdict: watertight
-                  ? "OK — closed manifold solid"
-                  : "BROKEN — see red (open) / magenta (non-manifold) edges in the image",
+                brep_valid: valid,
+                brep_watertight: p.watertight === true,
+                verdict: !valid
+                  ? "BROKEN — B-Rep invalid (a real topological defect; see the image)"
+                  : meshClean
+                    ? "OK — valid closed solid"
+                    : "OK — valid solid; display mesh has tessellation T-junctions only (not a defect)",
+                display_mesh: {
+                  open_edges: r.open_edges,
+                  nonmanifold_edges: r.nonmanifold_edges,
+                  note: "display tessellation quality only — does NOT determine validity",
+                },
+                dims: p.dims ?? null,
               },
               null,
               2,
