@@ -2436,11 +2436,13 @@ impl<'a> TopologyBuilder<'a> {
         &mut self,
         solid_id: SolidId,
         kind: crate::primitives::persistent_id::PrimitiveKind,
-        params: &str,
     ) {
         use crate::primitives::persistent_id::{PersistentId, Role};
-        let kind_params = format!("{kind:?}|{params}");
-        let seed = self.model.next_root_seed(&kind_params);
+        // Seed from (event, kind) ONLY — never the dimensions. The event key (or
+        // the counter fallback) already disambiguates distinct creations, and
+        // excluding the parameters is what makes the root PID survive a MOULD
+        // (edit a dimension → same identity, new geometry). #11/#16.
+        let seed = self.model.next_root_seed(&format!("{kind:?}"));
         let solid_pid = PersistentId::root(&seed);
         self.model.set_solid_pid(solid_id, solid_pid);
 
@@ -2811,7 +2813,6 @@ impl<'a> TopologyBuilder<'a> {
         self.assign_primitive_pids(
             solid_id,
             crate::primitives::persistent_id::PrimitiveKind::Box,
-            &format!("{width}x{height}x{depth}"),
         );
 
         // Record in timeline + forward to attached recorder.
@@ -2882,7 +2883,6 @@ impl<'a> TopologyBuilder<'a> {
         self.assign_primitive_pids(
             solid_id,
             crate::primitives::persistent_id::PrimitiveKind::Sphere,
-            &format!("c{},{},{}|r{}", center.x, center.y, center.z, radius),
         );
 
         // Record in timeline + forward to attached recorder.
@@ -2934,10 +2934,6 @@ impl<'a> TopologyBuilder<'a> {
         self.assign_primitive_pids(
             solid_id,
             crate::primitives::persistent_id::PrimitiveKind::Cylinder,
-            &format!(
-                "b{},{},{}|a{},{},{}|r{}|h{}",
-                base_center.x, base_center.y, base_center.z, axis.x, axis.y, axis.z, radius, height
-            ),
         );
 
         // Record in timeline + forward to attached recorder.
@@ -3003,18 +2999,6 @@ impl<'a> TopologyBuilder<'a> {
         self.assign_primitive_pids(
             solid_id,
             crate::primitives::persistent_id::PrimitiveKind::Cone,
-            &format!(
-                "b{},{},{}|a{},{},{}|br{}|tr{}|h{}",
-                base_center.x,
-                base_center.y,
-                base_center.z,
-                axis.x,
-                axis.y,
-                axis.z,
-                base_radius,
-                top_radius,
-                height
-            ),
         );
 
         // Record in timeline + forward to attached recorder.
@@ -3068,17 +3052,6 @@ impl<'a> TopologyBuilder<'a> {
         self.assign_primitive_pids(
             solid_id,
             crate::primitives::persistent_id::PrimitiveKind::Torus,
-            &format!(
-                "c{},{},{}|a{},{},{}|R{}|r{}",
-                center.x,
-                center.y,
-                center.z,
-                params.axis.x,
-                params.axis.y,
-                params.axis.z,
-                major_radius,
-                minor_radius
-            ),
         );
 
         // Record in timeline + forward to attached recorder.
