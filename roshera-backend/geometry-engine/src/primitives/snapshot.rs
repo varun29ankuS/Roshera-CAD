@@ -95,6 +95,7 @@ pub struct ModelSnapshot {
     pid_to_edge: HashMap<PersistentId, EdgeId>,
     pid_to_face: HashMap<PersistentId, FaceId>,
     pid_to_solid: HashMap<PersistentId, SolidId>,
+    root_counter: u64,
 }
 
 impl ModelSnapshot {
@@ -131,6 +132,7 @@ impl ModelSnapshot {
             pid_to_edge: model.pid_to_edge.clone(),
             pid_to_face: model.pid_to_face.clone(),
             pid_to_solid: model.pid_to_solid.clone(),
+            root_counter: model.root_counter,
         }
     }
 
@@ -161,6 +163,7 @@ impl ModelSnapshot {
         model.pid_to_edge = self.pid_to_edge;
         model.pid_to_face = self.pid_to_face;
         model.pid_to_solid = self.pid_to_solid;
+        model.root_counter = self.root_counter;
     }
 }
 

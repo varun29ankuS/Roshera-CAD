@@ -327,6 +327,15 @@ pub struct BRepModel {
         std::collections::HashMap<crate::primitives::persistent_id::PersistentId, FaceId>,
     pub pid_to_solid:
         std::collections::HashMap<crate::primitives::persistent_id::PersistentId, SolidId>,
+    /// Stable key of the operation currently being applied — set by the
+    /// orchestration / replay layer before each op so root persistent-ids derive
+    /// from the TIMELINE EVENT ID (identical across replays, robust to event
+    /// reordering). `None` for standalone/test creation, where root pids fall
+    /// back to `root_counter`. Operation context — like `recorder`, NOT snapshotted.
+    pub current_event_key: Option<String>,
+    /// Monotonic fallback for root-pid seeds when `current_event_key` is unset.
+    /// Snapshotted so a rolled-back primitive creation re-mints the same seed.
+    pub root_counter: u64,
 }
 
 impl BRepModel {
@@ -394,6 +403,8 @@ impl BRepModel {
             pid_to_edge: std::collections::HashMap::new(),
             pid_to_face: std::collections::HashMap::new(),
             pid_to_solid: std::collections::HashMap::new(),
+            current_event_key: None,
+            root_counter: 0,
         }
     }
 
@@ -450,7 +461,9 @@ impl BRepModel {
         self.pid_to_edge.clear();
         self.pid_to_face.clear();
         self.pid_to_solid.clear();
-        // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance.
+        self.root_counter = 0;
+        // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance,
+        // current_event_key (caller op-context, set per-op).
     }
 
     // --- Persistent-id accessors (#11, slice 40-A) ---
@@ -535,6 +548,28 @@ impl BRepModel {
         pid: crate::primitives::persistent_id::PersistentId,
     ) -> Option<SolidId> {
         self.pid_to_solid.get(&pid).copied()
+    }
+
+    /// Set the stable key of the operation currently being applied (the timeline
+    /// event id), so root persistent-ids derive deterministically across replays.
+    /// The orchestration / replay layer sets this before each op and clears it
+    /// (`None`) after. No-op for standalone/test creation.
+    pub fn set_event_key(&mut self, key: Option<String>) {
+        self.current_event_key = key;
+    }
+
+    /// Seed bytes for a root persistent-id of a primitive described by
+    /// `kind_params`. Uses `current_event_key` when set (timeline-stable across
+    /// replays), else a monotonic fallback (distinct within this model). `&mut`
+    /// because the fallback path advances `root_counter`.
+    pub fn next_root_seed(&mut self, kind_params: &str) -> Vec<u8> {
+        if let Some(k) = self.current_event_key.clone() {
+            format!("{k}|{kind_params}").into_bytes()
+        } else {
+            let n = self.root_counter;
+            self.root_counter += 1;
+            format!("__local:{n}|{kind_params}").into_bytes()
+        }
     }
 
     /// Attach a recorder that will receive one event per successful
@@ -2391,6 +2426,47 @@ impl<'a> TopologyBuilder<'a> {
         ts
     }
 
+    /// Assign root persistent-ids to a freshly-built primitive solid and its
+    /// faces (#11, slice 40-B). The solid gets a root PID seeded from the current
+    /// event key (timeline-stable) or the monotonic fallback; each face gets a
+    /// PID derived from the solid PID + its creation-order index — a stable
+    /// per-face role, since each constructor builds faces in a fixed order. Edge
+    /// / vertex PIDs are wired in later op slices.
+    fn assign_primitive_pids(
+        &mut self,
+        solid_id: SolidId,
+        kind: crate::primitives::persistent_id::PrimitiveKind,
+        params: &str,
+    ) {
+        use crate::primitives::persistent_id::{PersistentId, Role};
+        let kind_params = format!("{kind:?}|{params}");
+        let seed = self.model.next_root_seed(&kind_params);
+        let solid_pid = PersistentId::root(&seed);
+        self.model.set_solid_pid(solid_id, solid_pid);
+
+        let face_ids: Vec<FaceId> = {
+            let mut fs = Vec::new();
+            if let Some(solid) = self.model.solids.get(solid_id) {
+                let mut shells = vec![solid.outer_shell];
+                shells.extend_from_slice(&solid.inner_shells);
+                for sh in shells {
+                    if let Some(shell) = self.model.shells.get(sh) {
+                        fs.extend_from_slice(&shell.faces);
+                    }
+                }
+            }
+            fs
+        };
+        for (i, fid) in face_ids.iter().enumerate() {
+            let role = Role::Generic {
+                source_pid: solid_pid,
+                label: format!("face{i}"),
+            };
+            let fpid = PersistentId::derive(&[solid_pid], "primitive_face", &role);
+            self.model.set_face_pid(*fid, fpid);
+        }
+    }
+
     /// Push a `TimelineOperation` to the builder's internal timeline **and**
     /// forward a canonical `RecordedOperation` to the model's attached
     /// recorder (if any).
@@ -2731,6 +2807,13 @@ impl<'a> TopologyBuilder<'a> {
         // Create solid
         let solid_id = self.create_box_solid(shell)?;
 
+        // Persistent-id roots (#11).
+        self.assign_primitive_pids(
+            solid_id,
+            crate::primitives::persistent_id::PrimitiveKind::Box,
+            &format!("{width}x{height}x{depth}"),
+        );
+
         // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "box".to_string(),
@@ -2795,6 +2878,13 @@ impl<'a> TopologyBuilder<'a> {
         let solid = Solid::new(0, shell_id);
         let solid_id = self.model.solids.add(solid);
 
+        // Persistent-id roots (#11).
+        self.assign_primitive_pids(
+            solid_id,
+            crate::primitives::persistent_id::PrimitiveKind::Sphere,
+            &format!("c{},{},{}|r{}", center.x, center.y, center.z, radius),
+        );
+
         // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "sphere".to_string(),
@@ -2839,6 +2929,16 @@ impl<'a> TopologyBuilder<'a> {
 
         // Create cylinder topology
         let solid_id = self.create_cylinder_topology(base_center, axis, radius, height)?;
+
+        // Persistent-id roots (#11).
+        self.assign_primitive_pids(
+            solid_id,
+            crate::primitives::persistent_id::PrimitiveKind::Cylinder,
+            &format!(
+                "b{},{},{}|a{},{},{}|r{}|h{}",
+                base_center.x, base_center.y, base_center.z, axis.x, axis.y, axis.z, radius, height
+            ),
+        );
 
         // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
@@ -2899,6 +2999,24 @@ impl<'a> TopologyBuilder<'a> {
         let solid_id =
             self.create_cone_topology(base_center, axis, base_radius, top_radius, height)?;
 
+        // Persistent-id roots (#11).
+        self.assign_primitive_pids(
+            solid_id,
+            crate::primitives::persistent_id::PrimitiveKind::Cone,
+            &format!(
+                "b{},{},{}|a{},{},{}|br{}|tr{}|h{}",
+                base_center.x,
+                base_center.y,
+                base_center.z,
+                axis.x,
+                axis.y,
+                axis.z,
+                base_radius,
+                top_radius,
+                height
+            ),
+        );
+
         // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
             primitive_type: "cone".to_string(),
@@ -2945,6 +3063,23 @@ impl<'a> TopologyBuilder<'a> {
 
         let solid_id =
             crate::primitives::torus_primitive::TorusPrimitive::create(&params, self.model)?;
+
+        // Persistent-id roots (#11).
+        self.assign_primitive_pids(
+            solid_id,
+            crate::primitives::persistent_id::PrimitiveKind::Torus,
+            &format!(
+                "c{},{},{}|a{},{},{}|R{}|r{}",
+                center.x,
+                center.y,
+                center.z,
+                params.axis.x,
+                params.axis.y,
+                params.axis.z,
+                major_radius,
+                minor_radius
+            ),
+        );
 
         // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create3D {
