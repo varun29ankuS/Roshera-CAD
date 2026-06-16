@@ -654,7 +654,22 @@ over-dimensioning / label-collision density so the oracle drives it (the user's
 "better verification layer to improve"). The simple box / single-bore parts draw
 clean (commit 7e59347); the gap is COMPLEX parts.
 
-### REVOLVE-TESS-SEAM 🔴 revolve band boundaries non-manifold at very fine chord
+### REVOLVE-TESS-SEAM 🟡 MITIGATED — revolve band boundaries non-manifold at very fine chord
+**MITIGATED 2026-06-16 by a size-relative chord floor in `tessellate_solid`.** An
+absolute chord (the 0.001 mm default) is size-blind — 178000:1 on a 178 mm part —
+which is what pushed adjacent bands into the non-conforming regime AND caused the
+build jitter. `tessellate_solid` now floors the chord at `5e-4 · bbox-diagonal`
+(chord can only get COARSER, never finer; coarse explicit chords like
+manifold_report's 0.5 are untouched). The bell nozzle now tessellates MANIFOLD at
+the default/export density (was nm=2 + a seam sliver). No regression:
+revolve_watertight 7, primitive_tess_watertight, tess_seam_tjunction_65 2,
+revolve_analytic_faces 4, closed_edge_bore_rim 5, fillet_closed_edge 5. NOTE this
+SIDESTEPS the regime rather than fixing the underlying band-boundary shared-edge
+sampling — a part forced to an absolute chord finer than the floor could still
+hit it; the true fix (revolve bands share boundary samples at any density) stays
+open under this heading. Original report below.
+
+### (orig) revolve band boundaries non-manifold at very fine chord
 Same nozzle: at the DISPLAY default chord (0.001 ABSOLUTE — 178000:1 on a 178 mm
 part) the mesh has 2 non-manifold edges (x4 fans) at band boundaries (bell z≈164,
 chamber z≈48) + a thin seam sliver (the visible "extrusion" in the shaded render).
