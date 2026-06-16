@@ -637,7 +637,20 @@ revolve is a valid B-Rep (`validate_solid_scoped`) + watertight
 
 ## Drawing / dimensioning
 
-### DRW-DIM-EXPLOSION 🔴 auto-dimensioning + circle projection don't scale to complex revolves
+### DRW-DIM-EXPLOSION 🟢 FIXED — dimension selection + circle de-clutter
+**FIXED 2026-06-16.** `visible_dimensions` now runs `select_dimensions`: drop
+per-band cone half-angles when there are several, collapse near-equal (kind,
+value) callouts, cap diameters to the largest-3 + smallest-2 (envelope + throat),
+and a hard per-view cap of 8 prioritising extents > diameters. `build_hlr_view`
+runs `select_circles`: dedupe coincident circles and cap CONCENTRIC rings (same
+centre) to largest-3 + smallest-2 while keeping scattered same-radius circles (a
+bolt pattern). Bell-nozzle drawing went from dozens of overlapping ∠/Ø callouts +
+~12 concentric circles to ≤8 dims/view + ~7 circles — readable. Drawing tests 36,
+oracle 6, drawing_mgr 54 green. REMAINING (separate, not the explosion): tangent-
+edge suppression (smooth band boundaries still draw as faint lines; the silhouette
+isn't a B-Rep edge so it needs real silhouette handling) — original report below.
+
+### (orig) auto-dimensioning + circle projection don't scale to complex revolves
 Surfaced live building a rocket-engine bell nozzle (revolve, ~19-segment hollow
 profile). The solid is SOUND (B-Rep valid, watertight). But its auto drawing is
 UNUSABLE: `visible_dimensions` emits a callout for EVERY analytic band — a nozzle
