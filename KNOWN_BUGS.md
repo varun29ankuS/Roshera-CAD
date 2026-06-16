@@ -429,7 +429,7 @@ Workaround: a small pole bore (vent) avoids the axis and is watertight. Found
 case in revolve (apex vertex already has code; the self-intersection guard +
 pole-fan tessellation need to admit it).
 
-### #65 🔴 box∪cylinder boss + chained planar bores → non-watertight (bracket build)
+### #65 🟢 FIXED — box∪cylinder boss mesh non-manifold at fine density (doubled facet)
 Building an engine mount bracket: base plate (box) ∪ raised cylindrical boss came
 back watertight=False open=12 (B-Rep valid), and chained difference of bolt-circle
 /center-bore cylinders cascaded to open=1012→3932. The SAME bracket built clean
@@ -482,8 +482,20 @@ assembled solid mesh (safe, post-hoc), or (ii) an adaptive default chord (0.001
 ABSOLUTE over-tessellates a 120 mm part ~120000:1 — also the source of the
 build-time "jitter/hang"; a size-relative chord keeps normal parts out of this
 regime AND speeds tessellation), or (iii) fix the curved-CDT degeneracy directly.
-Pinned: `tests/tess_seam_tjunction_65.rs` (B-Rep-sound gate live; fine-mesh gate
-`#[ignore]`).
+**FIXED 2026-06-16 — doubled-facet removal.** The exact triangles: `tri7055
+[3925,3967,3944]` and `tri7056 [3967,3925,3944]` — the SAME three welded vertices
+with OPPOSITE winding (a degenerate "fin", area ~0.002), so every fin edge
+bordered 4 triangles → non-manifold. The curved-CDT emitted the sliver twice at
+high density. The bare curved-CDT is fine (plain cylinder manifold at all chords)
+and the shared seam-edge sampling is correct — it was purely a duplicate-facet
+artifact. FIX: `weld_mesh_watertight_range` (the per-shell weld already in the
+tessellate path) now, after the degenerate-collapse pass, CANCELS opposite-winding
+facet pairs (drops both — the real tiling still covers the patch) and dedups
+same-winding duplicates to one. No-op on a clean mesh (every facet's vertex-triple
+is unique), so watertight primitives are bit-unchanged. Gate
+`tests/tess_seam_tjunction_65.rs` both tests LIVE (B-Rep sound + fine-mesh
+watertight at chord 0.001). No regression: revolve_watertight 7, primitive_tess_
+watertight, revolve_analytic_faces 4, closed_edge_bore_rim_blends 5.
 
 ### EYE-SOUND 🟡 the agent-eye verdict judged the DISPLAY MESH, not the B-Rep
 The MCP `verify_part` + auto-`perceive()` computed `watertight = (open==0 ∧ nm==0)`

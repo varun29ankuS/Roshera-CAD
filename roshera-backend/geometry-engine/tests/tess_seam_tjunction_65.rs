@@ -1,18 +1,16 @@
-//! KNOWN_BUGS #65 / #21 — boolean curved↔planar SEAM T-junctions at fine
-//! tessellation density.
+//! KNOWN_BUGS #65 — boolean-result curved face doubled-facet → non-manifold
+//! mesh at fine density. FIXED 2026-06-16 (doubled-facet removal in
+//! `weld_mesh_watertight_range`).
 //!
-//! Diagnosis (2026-06-16): plate ∪ coaxial cylinder boss is B-Rep VALID and
-//! its mesh is watertight at coarse density, but at the DISPLAY/EXPORT chord
-//! (TessellationParams::default = 0.001) the seam tessellates NON-MANIFOLD:
-//!   chord 0.01 → nm=0 · 0.005 → nm=5 · 0.001 → nm=2.
-//! The weld is NOT the cause — manifold_report and the render's 1e-5 grid weld
-//! agree exactly at every chord. Root: the cylinder lateral (curved) and the
-//! adjacent planar face (plate top, circular hole) sample the SHARED seam
-//! circle at DIFFERENT parameter points, so the meshes don't share seam
-//! vertices → T-junctions. Fix lane = consistent shared boundary-edge sampling
-//! across adjacent curved+planar faces at a boolean seam (#21/#24). #[ignore]'d
-//! until that lands; the SOUND verdict is the B-Rep (valid), which is asserted
-//! un-ignored below so the gate still proves the part itself is not broken.
+//! plate ∪ coaxial cylinder boss is B-Rep VALID, but at the DISPLAY/EXPORT
+//! chord (TessellationParams::default = 0.001) the mesh was NON-MANIFOLD
+//! (chord 0.01→nm=0 · 0.005→nm=5 · 0.001→nm=2). Localized: NOT the boolean
+//! seam and NOT the bare curved-CDT (a plain cylinder is manifold at every
+//! chord) — the curved-CDT of the BOOLEAN-RESULT lateral emitted a degenerate
+//! sliver TWICE with opposite winding (a "doubled facet"/fin: same 3 welded
+//! vertices, area ~0.002), so every fin edge bordered 4 triangles. Fix: the
+//! weld pass now cancels opposite-winding facet pairs + dedups same-winding
+//! duplicates (no-op on clean meshes). Both gates below are live.
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
@@ -49,7 +47,6 @@ fn box_union_cylinder_brep_is_sound_65() {
 }
 
 #[test]
-#[ignore = "KNOWN_BUGS #65/#21 — boolean curved↔planar seam T-junctions at fine chord"]
 fn box_union_cylinder_fine_mesh_watertight_65() {
     let mut m = BRepModel::new();
     let sid = build(&mut m);
