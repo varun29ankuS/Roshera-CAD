@@ -118,6 +118,63 @@ pub fn visible_dimensions(
             }
         }
     }
+    select_dimensions(dims)
+}
+
+/// Keep a COMPLEX part's drawing readable. A revolved bell nozzle has ~9 cone
+/// bands, so the raw auto-dimensions stack dozens of overlapping ∠/Ø callouts
+/// (KNOWN_BUGS DRW-DIM-EXPLOSION). Select the few that DEFINE the part:
+///   1. drop per-band cone half-angles when there are several (clutter, not
+///      something a drawing dimensions per band);
+///   2. collapse near-equal values (a stack of Ø72.0/Ø72.0/… → one);
+///   3. cap diameters to the most significant — the largest (envelope) plus
+///      the smallest (throat/bore) — dropping the intermediate contour rings;
+///   4. cap the per-view total so callouts never overlap.
+fn select_dimensions(mut dims: Vec<Dimension2d>) -> Vec<Dimension2d> {
+    use std::collections::HashSet;
+
+    // 1. Per-band angle clutter.
+    let angle_count = dims.iter().filter(|d| d.kind == "angle").count();
+    if angle_count > 2 {
+        dims.retain(|d| d.kind != "angle");
+    }
+
+    // 2. Collapse near-equal (kind, value) to a single representative (0.5 mm).
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
+    dims.retain(|d| seen.insert((d.kind.clone(), (d.value * 2.0).round() as i64)));
+
+    // 3. Cap diameters/radii: keep the largest 3 + smallest 2 distinct (envelope
+    //    + throat), drop the rest of a contour's rings.
+    const MAX_DIA: usize = 5;
+    let mut dia: Vec<Dimension2d> = dims
+        .iter()
+        .filter(|d| d.kind == "diameter" || d.kind == "radius")
+        .cloned()
+        .collect();
+    if dia.len() > MAX_DIA {
+        dia.sort_by(|a, b| {
+            b.value
+                .partial_cmp(&a.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut keep: Vec<Dimension2d> = dia.iter().take(3).cloned().collect();
+        keep.extend(dia.iter().rev().take(2).cloned());
+        let kept: HashSet<String> = keep.iter().map(|d| d.id.clone()).collect();
+        dims.retain(|d| (d.kind != "diameter" && d.kind != "radius") || kept.contains(&d.id));
+    }
+
+    // 4. Hard per-view cap, prioritising extents (overall envelope) > diameters
+    //    > the rest, so the most informative callouts survive.
+    const MAX_PER_VIEW: usize = 8;
+    if dims.len() > MAX_PER_VIEW {
+        let rank = |k: &str| match k {
+            "extent" | "length" => 0,
+            "diameter" | "radius" => 1,
+            _ => 2,
+        };
+        dims.sort_by_key(|d| rank(&d.kind));
+        dims.truncate(MAX_PER_VIEW);
+    }
     dims
 }
 
@@ -193,6 +250,36 @@ pub fn standard_drawing_hlr(
     Ok(drawing)
 }
 
+/// De-clutter projected circles: a revolved part draws a ring per band, so the
+/// TOP view stacks dozens of concentric circles. Dedupe exact coincidents, then
+/// for each CONCENTRIC group (same centre) cap the rings to the largest 3 +
+/// smallest 2 (envelope + throat/bore). Circles at DIFFERENT centres (a bolt
+/// pattern — same radius, scattered) are all kept.
+fn select_circles(
+    circles: Vec<super::types::ProjectedCircle>,
+) -> Vec<super::types::ProjectedCircle> {
+    use std::collections::{HashMap, HashSet};
+    let q = |v: f64| (v * 10.0).round() as i64;
+    let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
+    let mut groups: HashMap<(i64, i64), Vec<super::types::ProjectedCircle>> = HashMap::new();
+    for c in circles {
+        if seen.insert((q(c.cx), q(c.cy), q(c.r))) {
+            groups.entry((q(c.cx), q(c.cy))).or_default().push(c);
+        }
+    }
+    let mut out = Vec::new();
+    for (_, mut g) in groups {
+        if g.len() > 5 {
+            g.sort_by(|a, b| b.r.partial_cmp(&a.r).unwrap_or(std::cmp::Ordering::Equal));
+            out.extend(g.iter().take(3).cloned());
+            out.extend(g.iter().rev().take(2).cloned());
+        } else {
+            out.extend(g);
+        }
+    }
+    out
+}
+
 /// Build one HLR view: wireframe (for extent + placement), edges split
 /// into visible / hidden by the raytrace eye, plus auto dimensions and
 /// centerlines. Shared by [`standard_drawing_hlr`] and
@@ -214,8 +301,8 @@ fn build_hlr_view(
     let edges = project_solid_edges_visibility(model, solid_id, proj, DEFAULT_CURVE_SAMPLES)?;
     view.polylines = edges.visible;
     view.hidden_polylines = edges.hidden;
-    view.circles = edges.circles;
-    view.hidden_circles = edges.hidden_circles;
+    view.circles = select_circles(edges.circles);
+    view.hidden_circles = select_circles(edges.hidden_circles);
     view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
     view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
     Ok(view)
