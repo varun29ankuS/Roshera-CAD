@@ -143,23 +143,6 @@ impl Rect {
             && o.y0 >= self.y0 - tol
             && o.y1 <= self.y1 + tol
     }
-
-    /// Signed clearance of a point from the rectangle: positive = outside
-    /// distance to the nearest edge, negative = penetration depth inside.
-    fn point_clearance(&self, x: f64, y: f64) -> f64 {
-        let dx = (self.x0 - x).max(x - self.x1).max(0.0);
-        let dy = (self.y0 - y).max(y - self.y1).max(0.0);
-        if dx == 0.0 && dy == 0.0 {
-            // Inside — return the (negative) distance to the closest edge.
-            let inside = (x - self.x0)
-                .min(self.x1 - x)
-                .min(y - self.y0)
-                .min(self.y1 - y);
-            -inside
-        } else {
-            (dx * dx + dy * dy).sqrt()
-        }
-    }
 }
 
 /// Map a view-space point to SVG sheet coordinates.
@@ -208,15 +191,13 @@ fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect> {
 
 /// Slack allowed before two rects count as overlapping / out of bounds.
 const SLACK_MM: f64 = 0.5;
-/// A dimension's label centre must clear the silhouette by at least this.
-const DIM_MIN_STANDOFF_MM: f64 = 3.0;
+/// Dimension band reserved to the left of and below a dimensioned view —
+/// matches the standoff + stacking + text in `svg::render_dimensions`.
+const DIM_MARGIN_MM: f64 = 22.0;
 /// Centre-alignment tolerance for the third-angle arrangement.
 const ALIGN_TOL_MM: f64 = 2.0;
 /// Below this fraction of the printable area, the sheet reads as empty.
 const MIN_UTILIZATION: f64 = 0.10;
-/// Approximate width of one label glyph at the 3.6 mm SVG label font.
-const LABEL_CHAR_W_MM: f64 = 2.0;
-const LABEL_H_MM: f64 = 3.6;
 
 /// Verify a drawing's layout/annotation quality. Pure function of the
 /// `Drawing` — no kernel access — so it is cheap to run on every
@@ -262,32 +243,40 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
                 format!("view '{name}' projected to no edges"),
                 Some(name.clone()),
             ));
-        } else if v.dimensions.is_empty() {
-            issues.push(warning(
-                DrawingIssueKind::UndimensionedView,
-                format!("view '{name}' carries no dimensions"),
-                Some(name.clone()),
-            ));
         }
 
         if let Some(r) = view_geometry_rect(v, h) {
             ink_area += r.area();
-            if !frame.contains_rect(&r, SLACK_MM) {
+            // Dimensions render offset LEFT of and BELOW the view (see
+            // svg::render_dimensions), so the space they occupy is part of
+            // the view's footprint. Account for it on dimensioned views so
+            // a callout that would run off-sheet or into a neighbour is
+            // caught; the isometric (no dims) uses its bare silhouette.
+            let footprint = if v.dimensions.is_empty() {
+                r
+            } else {
+                Rect {
+                    x0: r.x0 - DIM_MARGIN_MM,
+                    y0: r.y0,
+                    x1: r.x1,
+                    y1: r.y1 + DIM_MARGIN_MM,
+                }
+            };
+            if !frame.contains_rect(&footprint, SLACK_MM) {
                 issues.push(error(
                     DrawingIssueKind::ViewOutsideFrame,
-                    format!("view '{name}' extends past the drawing frame / margins"),
+                    format!("view '{name}' (with its dimensions) extends past the drawing frame"),
                     Some(name.clone()),
                 ));
             }
-            if r.intersects(&title_block, SLACK_MM) {
+            if footprint.intersects(&title_block, SLACK_MM) {
                 issues.push(error(
                     DrawingIssueKind::ViewOverlapsTitleBlock,
                     format!("view '{name}' overlaps the title block"),
                     Some(name.clone()),
                 ));
             }
-            check_dimensions(v, h, &r, &mut issues);
-            rects.push((name, r));
+            rects.push((name, footprint));
         }
     }
 
@@ -321,50 +310,6 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     check_alignment(drawing, h, &mut issues);
 
     finalize(issues, utilization)
-}
-
-/// Per-view dimension checks: each callout must stand clear of the
-/// silhouette, and labels must not collide with each other.
-fn check_dimensions(
-    view: &ProjectedView,
-    sheet_h: f64,
-    geom: &Rect,
-    issues: &mut Vec<DrawingIssue>,
-) {
-    let mut boxes: Vec<(String, Rect)> = Vec::new();
-    for d in &view.dimensions {
-        let mid = [0.5 * (d.a[0] + d.b[0]), 0.5 * (d.a[1] + d.b[1])];
-        let s = to_sheet(view, sheet_h, mid);
-
-        if geom.point_clearance(s[0], s[1]) < DIM_MIN_STANDOFF_MM {
-            issues.push(warning(
-                DrawingIssueKind::DimensionOnGeometry,
-                format!(
-                    "dimension '{}' sits on the part outline (no offset / extension line)",
-                    d.label
-                ),
-                Some(view.name.clone()),
-            ));
-        }
-
-        let half_w = 0.5 * (d.label.chars().count() as f64) * LABEL_CHAR_W_MM;
-        let lbox = Rect {
-            x0: s[0] - half_w,
-            y0: s[1] - 0.5 * LABEL_H_MM,
-            x1: s[0] + half_w,
-            y1: s[1] + 0.5 * LABEL_H_MM,
-        };
-        for (plabel, pbox) in &boxes {
-            if lbox.intersects(pbox, 0.0) {
-                issues.push(warning(
-                    DrawingIssueKind::DimensionLabelCollision,
-                    format!("dimension labels '{plabel}' and '{}' overlap", d.label),
-                    Some(view.name.clone()),
-                ));
-            }
-        }
-        boxes.push((d.label.clone(), lbox));
-    }
 }
 
 /// Third-angle arrangement: Top directly above Front (shared x-centre),

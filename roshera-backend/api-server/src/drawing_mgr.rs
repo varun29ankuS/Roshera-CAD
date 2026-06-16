@@ -34,8 +34,8 @@ use axum::{
 use dashmap::DashMap;
 use geometry_engine::drawing::{
     project_solid_view, render_drawing_dxf, render_drawing_pdf, render_drawing_svg,
-    standard_drawing_hlr, verify_drawing, Drawing, DrawingId, DrawingQualityReport,
-    ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
+    standard_drawing_auto, standard_drawing_hlr, verify_drawing, Drawing, DrawingId,
+    DrawingQualityReport, ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use geometry_engine::primitives::solid::SolidId;
@@ -536,60 +536,6 @@ pub struct PartDrawingQuery {
     pub name: Option<String>,
 }
 
-/// Largest world-space extent of a solid, from its face-loop vertices.
-fn solid_max_extent(model: &BRepModel, solid_id: SolidId) -> f64 {
-    let mut min = [f64::INFINITY; 3];
-    let mut max = [f64::NEG_INFINITY; 3];
-    let mut any = false;
-    if let Some(solid) = model.solids.get(solid_id) {
-        let mut shells = vec![solid.outer_shell];
-        shells.extend_from_slice(&solid.inner_shells);
-        for sh in shells {
-            if let Some(shell) = model.shells.get(sh) {
-                for &fid in &shell.faces {
-                    let Some(face) = model.faces.get(fid) else {
-                        continue;
-                    };
-                    let mut loops = vec![face.outer_loop];
-                    loops.extend_from_slice(&face.inner_loops);
-                    for lid in loops {
-                        let Some(lp) = model.loops.get(lid) else {
-                            continue;
-                        };
-                        for &eid in &lp.edges {
-                            let Some(e) = model.edges.get(eid) else {
-                                continue;
-                            };
-                            for vid in [e.start_vertex, e.end_vertex] {
-                                if let Some(p) = model.vertices.get_position(vid) {
-                                    for i in 0..3 {
-                                        min[i] = min[i].min(p[i]);
-                                        max[i] = max[i].max(p[i]);
-                                    }
-                                    any = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if !any {
-        return 1.0;
-    }
-    (0..3)
-        .map(|i| max[i] - min[i])
-        .fold(0.0_f64, f64::max)
-        .max(1.0)
-}
-
-/// Scale that fits the part's largest extent to ~90 mm of view space (so the
-/// three views sit comfortably on an A3 sheet without overlapping or clipping).
-fn auto_fit_scale(model: &BRepModel, solid_id: SolidId) -> f64 {
-    (90.0 / solid_max_extent(model, solid_id)).clamp(0.02, 50.0)
-}
-
 /// `GET /api/parts/{id}/drawing.svg` — ONE-CALL engineering drawing of a part by
 /// kernel solid id: third-angle Front / Top / Right with hidden-line removal,
 /// centerlines, and auto dimensions, returned as SVG. The scale auto-fits the
@@ -625,9 +571,12 @@ async fn drawing_svg_for_solid(
     if model.solids.get(solid_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let scale = q.scale.unwrap_or_else(|| auto_fit_scale(&model, solid_id));
-    let drawing = standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
-        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let drawing = match q.scale {
+        Some(scale) => standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
+            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+        None => standard_drawing_auto(&model, solid_id, part_uuid)
+            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+    };
     let svg = render_drawing_svg(&drawing);
     let content_type = if q.plain {
         "text/plain; charset=utf-8"
@@ -678,9 +627,16 @@ async fn create_part_drawing_inner(
         if model.solids.get(solid_id).is_none() {
             return Err(StatusCode::NOT_FOUND);
         }
-        let scale = q.scale.unwrap_or_else(|| auto_fit_scale(&model, solid_id));
-        standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
-            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?
+        // Fully automatic: picks the sheet size + fill scale, centers the
+        // four-view layout (Front/Top/Right + isometric), and draws proper
+        // offset dimensions. A manual `?scale=` override falls back to the
+        // fixed-A3 path for callers that want an exact ratio.
+        match q.scale {
+            Some(scale) => standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+            None => standard_drawing_auto(&model, solid_id, part_uuid)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+        }
     };
 
     // Name the sheet after the originating part when the caller didn't

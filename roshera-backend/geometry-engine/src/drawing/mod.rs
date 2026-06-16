@@ -35,7 +35,8 @@ pub mod visibility;
 
 pub use centerlines::{centerlines, Centerline};
 pub use dimensioning::{
-    auto_dimensions, standard_drawing, standard_drawing_hlr, visible_dimensions, Dimension2d,
+    auto_dimensions, standard_drawing, standard_drawing_auto, standard_drawing_hlr,
+    visible_dimensions, Dimension2d,
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use pdf::{render_drawing_pdf, PdfRenderError};

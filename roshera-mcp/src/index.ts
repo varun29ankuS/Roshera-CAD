@@ -240,6 +240,45 @@ server.tool(
 );
 
 server.tool(
+  "make_drawing",
+  "Generate a 2D engineering DRAWING from a part: the standard four-view " +
+    "sheet — Front / Top / Right plus an isometric pictorial — with " +
+    "hidden-line removal, centerlines, and automatic dimensions. The sheet " +
+    "size and scale are chosen to fit the part (small parts on A4, growing " +
+    "to A0), and the views are centered with proper offset dimension lines. " +
+    "Returns the new drawing id (open it in the Drawing workspace, or fetch " +
+    "GET /api/drawings/<id>/svg|pdf|dxf) AND a QUALITY report — the 2D " +
+    "perception layer: whether the layout passed, sheet utilization, and any " +
+    "issues (views overlapping, off-sheet, dimensions on the outline). Treat " +
+    "the quality report the way you treat watertightness for 3D geometry.",
+  {
+    part_id: z.number().int().describe("kernel part/solid id from list_parts"),
+    name: z.string().optional().describe("title-block name for the sheet"),
+  },
+  async ({ part_id, name }) => {
+    try {
+      const qs = name ? `?name=${encodeURIComponent(name)}` : "";
+      const r = await api("POST", `/api/parts/${part_id}/drawing${qs}`);
+      const q = r?.quality ?? null;
+      return ok({
+        drawing_id: r?.id ?? null,
+        quality: q,
+        verdict: q
+          ? q.passed
+            ? `OK — clean sheet (${Math.round((q.sheet_utilization ?? 0) * 100)}% utilization, ${
+                q.issues?.length ?? 0
+              } advisory issue(s))`
+            : `LAYOUT ISSUES — ${q.issues?.length ?? 0} finding(s); see quality.issues`
+          : "drawing created (no quality report)",
+        note: "Open in the Drawing workspace, or GET /api/drawings/<id>/svg|pdf|dxf.",
+      });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "get_pointer",
   "What is the HUMAN pointing at in the viewport right now? Returns their " +
     "latest click (object, face_id, world position) joined with the " +
