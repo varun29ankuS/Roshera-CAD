@@ -465,6 +465,26 @@ COINCIDENT-face boss (#32 family); the interpenetrating boss is open=0/valid.
 LESSON: the diagnostic-render mesh is not a sound VALIDITY oracle (use B-Rep), AND
 "watertight at chord 0.5" does not imply watertight at export density — sweep chords.
 
+**LOCALIZED 2026-06-16 (the defect is NOT the boolean seam, and NOT plain
+curved-CDT):** at chord 0.001 the non-manifold edges sit at **r=26.000, z≈34.583,
+θ≈155°** — UP ON THE CYLINDER LATERAL, far above the plate seam (z=16), as `x4`
+(four triangles on one welded edge = coincident edge pairs, not a classic
+1+2 T-junction). Two further isolations: (a) a PLAIN cylinder (r26 h45 and r10
+h20) is manifold at every chord 0.01→0.001, so the bare curved-CDT is fine; (b)
+the defect only appears on the BOOLEAN-RESULT lateral (the piece above the plate,
+whose boundary loop = the seam circle at z=16 + the top rim at z=41 + the vertical
+seam, with cache-sampled boundaries). So the root is the curved-CDT triangulating
+a BOOLEAN-MODIFIED cylinder lateral at high sample density — a degenerate/duplicate
+near one interior spot — NOT the shared seam-edge sampling (that part is correct).
+Deep #24-cluster (curved-CDT robustness on boolean-result faces). Candidate fixes
+for the loop: (i) a final T-junction/duplicate-triangle removal pass over the
+assembled solid mesh (safe, post-hoc), or (ii) an adaptive default chord (0.001
+ABSOLUTE over-tessellates a 120 mm part ~120000:1 — also the source of the
+build-time "jitter/hang"; a size-relative chord keeps normal parts out of this
+regime AND speeds tessellation), or (iii) fix the curved-CDT degeneracy directly.
+Pinned: `tests/tess_seam_tjunction_65.rs` (B-Rep-sound gate live; fine-mesh gate
+`#[ignore]`).
+
 ### EYE-SOUND 🟡 the agent-eye verdict judged the DISPLAY MESH, not the B-Rep
 The MCP `verify_part` + auto-`perceive()` computed `watertight = (open==0 ∧ nm==0)`
 from `GET /render?mode=diagnostic` — the DISPLAY tessellation. As #65 (re-char.)
