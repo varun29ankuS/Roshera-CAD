@@ -305,6 +305,28 @@ pub struct BRepModel {
     /// always honoured via the `max(stored, caller)` rule — this is the
     /// caller tolerance when no explicit op tolerance is supplied.
     pub tolerance: Tolerance,
+    /// Persistent-id sidecar maps (#11, slice 40-A). Transient store ids →
+    /// durable [`PersistentId`]s that survive regeneration + parameter edits,
+    /// plus their inverses for PID-anchored lookup. Sidecar (not embedded in the
+    /// SoA stores) to preserve the columnar cache layout — a PID probe is an O(1)
+    /// hashmap lookup, off the math hot path. Empty until operations are wired to
+    /// assign PIDs (slices 40-B onward); an empty map is a supported state.
+    pub vertex_pids:
+        std::collections::HashMap<VertexId, crate::primitives::persistent_id::PersistentId>,
+    pub edge_pids:
+        std::collections::HashMap<EdgeId, crate::primitives::persistent_id::PersistentId>,
+    pub face_pids:
+        std::collections::HashMap<FaceId, crate::primitives::persistent_id::PersistentId>,
+    pub solid_pids:
+        std::collections::HashMap<SolidId, crate::primitives::persistent_id::PersistentId>,
+    pub pid_to_vertex:
+        std::collections::HashMap<crate::primitives::persistent_id::PersistentId, VertexId>,
+    pub pid_to_edge:
+        std::collections::HashMap<crate::primitives::persistent_id::PersistentId, EdgeId>,
+    pub pid_to_face:
+        std::collections::HashMap<crate::primitives::persistent_id::PersistentId, FaceId>,
+    pub pid_to_solid:
+        std::collections::HashMap<crate::primitives::persistent_id::PersistentId, SolidId>,
 }
 
 impl BRepModel {
@@ -364,6 +386,14 @@ impl BRepModel {
             cap_apex_hint: DashMap::new(),
             recorder: None,
             tolerance,
+            vertex_pids: std::collections::HashMap::new(),
+            edge_pids: std::collections::HashMap::new(),
+            face_pids: std::collections::HashMap::new(),
+            solid_pids: std::collections::HashMap::new(),
+            pid_to_vertex: std::collections::HashMap::new(),
+            pid_to_edge: std::collections::HashMap::new(),
+            pid_to_face: std::collections::HashMap::new(),
+            pid_to_solid: std::collections::HashMap::new(),
         }
     }
 
@@ -411,7 +441,100 @@ impl BRepModel {
         self.sketch_planes.clear();
         self.cap_apex_hint.clear();
         self.location_cache = crate::primitives::datum::LocationDescriptorCache::new();
+        // Persistent-id sidecars are part of the geometry — clear with it.
+        self.vertex_pids.clear();
+        self.edge_pids.clear();
+        self.face_pids.clear();
+        self.solid_pids.clear();
+        self.pid_to_vertex.clear();
+        self.pid_to_edge.clear();
+        self.pid_to_face.clear();
+        self.pid_to_solid.clear();
         // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance.
+    }
+
+    // --- Persistent-id accessors (#11, slice 40-A) ---
+
+    /// Assign a [`PersistentId`] to a face, maintaining the inverse map.
+    pub fn set_face_pid(
+        &mut self,
+        face: FaceId,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) {
+        self.face_pids.insert(face, pid);
+        self.pid_to_face.insert(pid, face);
+    }
+
+    /// Assign a [`PersistentId`] to an edge, maintaining the inverse map.
+    pub fn set_edge_pid(
+        &mut self,
+        edge: EdgeId,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) {
+        self.edge_pids.insert(edge, pid);
+        self.pid_to_edge.insert(pid, edge);
+    }
+
+    /// Assign a [`PersistentId`] to a vertex, maintaining the inverse map.
+    pub fn set_vertex_pid(
+        &mut self,
+        vertex: VertexId,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) {
+        self.vertex_pids.insert(vertex, pid);
+        self.pid_to_vertex.insert(pid, vertex);
+    }
+
+    /// Assign a [`PersistentId`] to a solid, maintaining the inverse map.
+    pub fn set_solid_pid(
+        &mut self,
+        solid: SolidId,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) {
+        self.solid_pids.insert(solid, pid);
+        self.pid_to_solid.insert(pid, solid);
+    }
+
+    /// The persistent id of a face, if assigned.
+    pub fn face_pid(&self, face: FaceId) -> Option<crate::primitives::persistent_id::PersistentId> {
+        self.face_pids.get(&face).copied()
+    }
+
+    /// The live face id for a persistent id, if it still resolves.
+    pub fn face_by_pid(
+        &self,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) -> Option<FaceId> {
+        self.pid_to_face.get(&pid).copied()
+    }
+
+    /// The persistent id of an edge, if assigned.
+    pub fn edge_pid(&self, edge: EdgeId) -> Option<crate::primitives::persistent_id::PersistentId> {
+        self.edge_pids.get(&edge).copied()
+    }
+
+    /// The live edge id for a persistent id, if it still resolves.
+    pub fn edge_by_pid(
+        &self,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) -> Option<EdgeId> {
+        self.pid_to_edge.get(&pid).copied()
+    }
+
+    /// The persistent id of a solid, if assigned.
+    pub fn solid_pid(
+        &self,
+        solid: SolidId,
+    ) -> Option<crate::primitives::persistent_id::PersistentId> {
+        self.solid_pids.get(&solid).copied()
+    }
+
+    /// The live solid id for a persistent id, if it still resolves.
+    pub fn solid_by_pid(
+        &self,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) -> Option<SolidId> {
+        self.pid_to_solid.get(&pid).copied()
     }
 
     /// Attach a recorder that will receive one event per successful

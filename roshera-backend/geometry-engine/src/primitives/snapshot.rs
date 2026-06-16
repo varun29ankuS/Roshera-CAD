@@ -52,14 +52,18 @@ use dashmap::DashMap;
 
 use crate::primitives::curve::CurveStore;
 use crate::primitives::datum::{DatumGraph, DatumStore, LocationDescriptorCache};
-use crate::primitives::edge::EdgeStore;
-use crate::primitives::face::FaceStore;
+use crate::primitives::edge::{EdgeId, EdgeStore};
+use crate::primitives::face::{FaceId, FaceStore};
 use crate::primitives::p_curve::PCurveStore;
+use crate::primitives::persistent_id::PersistentId;
 use crate::primitives::r#loop::LoopStore;
 use crate::primitives::shell::ShellStore;
+use crate::primitives::solid::SolidId;
 use crate::primitives::solid::SolidStore;
 use crate::primitives::surface::SurfaceStore;
+use crate::primitives::vertex::VertexId;
 use crate::primitives::vertex::VertexStore;
+use std::collections::HashMap;
 
 /// Owned deep copy of a [`BRepModel`].
 ///
@@ -83,6 +87,14 @@ pub struct ModelSnapshot {
     datum_graph: DatumGraph,
     location_cache: LocationDescriptorCache,
     tolerance: Tolerance,
+    vertex_pids: HashMap<VertexId, PersistentId>,
+    edge_pids: HashMap<EdgeId, PersistentId>,
+    face_pids: HashMap<FaceId, PersistentId>,
+    solid_pids: HashMap<SolidId, PersistentId>,
+    pid_to_vertex: HashMap<PersistentId, VertexId>,
+    pid_to_edge: HashMap<PersistentId, EdgeId>,
+    pid_to_face: HashMap<PersistentId, FaceId>,
+    pid_to_solid: HashMap<PersistentId, SolidId>,
 }
 
 impl ModelSnapshot {
@@ -111,6 +123,14 @@ impl ModelSnapshot {
             datum_graph: model.datum_graph.deep_copy(),
             location_cache: model.location_cache.deep_copy(),
             tolerance: model.tolerance,
+            vertex_pids: model.vertex_pids.clone(),
+            edge_pids: model.edge_pids.clone(),
+            face_pids: model.face_pids.clone(),
+            solid_pids: model.solid_pids.clone(),
+            pid_to_vertex: model.pid_to_vertex.clone(),
+            pid_to_edge: model.pid_to_edge.clone(),
+            pid_to_face: model.pid_to_face.clone(),
+            pid_to_solid: model.pid_to_solid.clone(),
         }
     }
 
@@ -133,6 +153,14 @@ impl ModelSnapshot {
         model.datum_graph = self.datum_graph;
         model.location_cache = self.location_cache;
         model.tolerance = self.tolerance;
+        model.vertex_pids = self.vertex_pids;
+        model.edge_pids = self.edge_pids;
+        model.face_pids = self.face_pids;
+        model.solid_pids = self.solid_pids;
+        model.pid_to_vertex = self.pid_to_vertex;
+        model.pid_to_edge = self.pid_to_edge;
+        model.pid_to_face = self.pid_to_face;
+        model.pid_to_solid = self.pid_to_solid;
     }
 }
 
