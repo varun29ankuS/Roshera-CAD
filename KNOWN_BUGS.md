@@ -439,22 +439,31 @@ residual on this config) and chained bores on an already-open solid compound it.
 Task #65. LESSON for the agent/MCP: prefer sketch-region extrude for plates-with-
 holes over boolean subtraction.
 
-**RE-CHARACTERISED 2026-06-16 (interpenetrating boss, NOT coincident): it is a
-DISPLAY-tessellation artifact, the part is SOUND.** Repro: plate 120×80×16 ∪
-coaxial analytic cylinder boss (r26 h45, INTERPENETRATING — bottom buried inside
-the plate, no coincident face). Three independent reads on the SAME solid:
-- `validate_solid_scoped` (B-Rep) → **valid=true** (mesh-independent).
-- `manifold_report(chord 0.5)` / `GET /perception` → **watertight=true, open=0,
-  nm=0**.
-- `GET /render?mode=diagnostic` (display tessellation, finer) → **nm=4**.
-So the union is correct; the 4 nm edges are T-junctions where the cylinder's
-developable-lateral display tessellation meets the plate's planar mesh at the
-pierce rim — the SAME class #84/#51 fixed (#58) for the flange, with a residual on
-this coaxial-boss config. The deep fix is shared-edge sampling at the seam (the
-#21/#24 lane). NOTE the original "open=12" reading was the COINCIDENT-face boss
-(#32/#65 family); the interpenetrating boss is open=0 / valid. LESSON RE-CONFIRMED:
-the diagnostic-render (display mesh) is NOT a sound validity oracle — it over-reports
-on tessellation T-junctions. Use `validate_solid_scoped` (B-Rep) + `/perception`.
+**RE-CHARACTERISED 2026-06-16 (interpenetrating boss, NOT coincident): the B-Rep
+is SOUND, but the FINE mesh has REAL, density-dependent seam T-junctions.** Repro:
+plate 120×80×16 ∪ coaxial analytic cylinder boss (r26 h45, INTERPENETRATING —
+bottom buried inside the plate, no coincident face). Gate
+`tests/tess_seam_tjunction_65.rs`.
+- `validate_solid_scoped` (B-Rep) → **valid=true** (mesh-independent, SOUND). The
+  part is NOT broken; the eye must judge on this (see EYE-SOUND, fixed bd426cd).
+- `manifold_report` swept by chord on the SAME solid:
+  `0.01 → nm=0 · 0.005 → nm=5 · 0.001 → nm=2`. The display/export default chord
+  (`TessellationParams::default` = **0.001**) lands in the broken regime.
+- **The weld is NOT the cause** — `manifold_report` (weld 1e-6) and the render's
+  `1e-5` grid weld give IDENTICAL counts at every chord. Earlier "display-only
+  artifact" framing was wrong: it is a real density-dependent mesh defect that
+  also affects STL export.
+ROOT: at the boolean pierce seam the cylinder LATERAL (curved) and the adjacent
+plate-top PLANAR face (annulus with the circular hole) sample the SHARED seam
+circle at DIFFERENT parameter points, so the two face meshes don't share seam
+vertices → T-junctions. #58 fixed the developable-lateral over-refinement (the
+flange case #84/#51) but NOT this curved↔planar shared-edge sampling at fine
+density. FIX LANE = consistent shared boundary-edge sampling across adjacent
+faces of different kinds at a boolean seam (#21 — which was closed for the cases
+it covered but NOT this one — and #24). NOTE the original "open=12" reading was the
+COINCIDENT-face boss (#32 family); the interpenetrating boss is open=0/valid.
+LESSON: the diagnostic-render mesh is not a sound VALIDITY oracle (use B-Rep), AND
+"watertight at chord 0.5" does not imply watertight at export density — sweep chords.
 
 ### EYE-SOUND 🟡 the agent-eye verdict judged the DISPLAY MESH, not the B-Rep
 The MCP `verify_part` + auto-`perceive()` computed `watertight = (open==0 ∧ nm==0)`
