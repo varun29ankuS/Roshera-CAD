@@ -92,9 +92,8 @@ fn cyl_radii(m: &BRepModel, sid: SolidId) -> Vec<f64> {
 }
 
 #[test]
-#[ignore = "PINNED on tessellator #21: the analytic-band revolve B-Rep is correct, but annular Plane caps and Cylinder walls sharing a circle edge tessellate at mismatched densities → mesh gaps, so the watertight self-check rolls every revolve back to the per-segment path. Un-ignore when planar/curved shared-edge sampling is consistent."]
 fn tube_is_four_analytic_faces_19() {
-    // Tube r5..10, z0..20: outer cyl r10 + inner cyl r5 + 2 annular plane caps.
+    // Tube r6..10, z0..20: outer cyl r10 + inner cyl r6 + 2 annular plane caps.
     let mut m = BRepModel::new();
     let s = revolve(
         &mut m,
@@ -112,15 +111,14 @@ fn tube_is_four_analytic_faces_19() {
     );
     let radii = cyl_radii(&m, s);
     assert!(
-        radii.len() == 2 && (radii[0] - 5.0).abs() < 1e-6 && (radii[1] - 10.0).abs() < 1e-6,
-        "cylinder radii recoverable as 5 and 10: {radii:?}"
+        radii.len() == 2 && (radii[0] - 6.0).abs() < 1e-6 && (radii[1] - 10.0).abs() < 1e-6,
+        "cylinder radii recoverable as 6 and 10: {radii:?}"
     );
     let v = validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard);
     assert!(v.is_valid, "tube B-Rep invalid: {:?}", v.errors);
 }
 
 #[test]
-#[ignore = "PINNED on tessellator #21: the analytic-band revolve B-Rep is correct, but annular Plane caps and Cylinder walls sharing a circle edge tessellate at mismatched densities → mesh gaps, so the watertight self-check rolls every revolve back to the per-segment path. Un-ignore when planar/curved shared-edge sampling is consistent."]
 fn open_washer_is_four_analytic_faces_19() {
     // A flat washer (short tube): outer r20, inner r8, thin (z0..2). Still 4.
     let mut m = BRepModel::new();

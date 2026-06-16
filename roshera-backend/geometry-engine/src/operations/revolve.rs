@@ -186,6 +186,19 @@ fn create_revolution(
     let axis = options.axis_direction.normalize()?;
     let seg_angle = options.angle / segments as f64;
 
+    // #19: analytic-band fast path. A full revolution of a straight-line
+    // (rectilinear v1) meridian profile is a stack of coaxial analytic bands —
+    // Cylinder walls + annular Plane caps sharing ring-circle edges — exactly the
+    // watertight structure `create_cylinder_topology` uses. Self-verifying: it
+    // builds the minimal analytic faces, checks the result is a valid watertight
+    // solid, and on ANY failure rolls back so the proven per-segment grid path
+    // below runs on a clean model (zero regression by construction).
+    if is_full {
+        if let Some(sid) = try_analytic_band_revolution(model, base_face, base_face_id, options)? {
+            return Ok(sid);
+        }
+    }
+
     let base_loop = model
         .loops
         .get(base_face.outer_loop)
@@ -456,6 +469,322 @@ fn create_revolution(
     let shell_id = model.shells.add(shell);
     let solid = Solid::new(0, shell_id);
     Ok(model.solids.add(solid))
+}
+
+/// Ring geometry of a profile vertex: `(center_on_axis, radius, axial_param)`.
+fn ring_geometry(
+    model: &BRepModel,
+    vid: VertexId,
+    axis_origin: Point3,
+    axis: Vector3,
+) -> OperationResult<(Point3, f64, f64)> {
+    let pos = model.vertices.get_position(vid).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!("revolve: vertex {vid} not found"))
+    })?;
+    let p = Vector3::new(pos[0], pos[1], pos[2]);
+    let rel = p - axis_origin;
+    let axial = rel.dot(&axis);
+    let radius = (rel - axis * axial).magnitude();
+    let center = axis_origin + axis * axial;
+    Ok((Point3::new(center.x, center.y, center.z), radius, axial))
+}
+
+/// #19 analytic-band revolve (v1: Cylinder walls + annular Plane caps).
+///
+/// Returns `Some(solid)` when the profile is a full-revolution rectilinear
+/// (axis-aligned) closed meridian with every radius `> 1e-4` — emitting ONE
+/// analytic face per band instead of `segments` `SurfaceOfRevolution` patches —
+/// and `None` (model unchanged) for any other profile, so the caller falls back
+/// to the proven per-segment grid path. The build runs inside a nested
+/// `with_rollback` whose closure returns `Err` if the result is not a valid
+/// watertight solid, so a failed analytic attempt leaves a clean model.
+fn try_analytic_band_revolution(
+    model: &mut BRepModel,
+    base_face: &Face,
+    base_face_id: FaceId,
+    options: &RevolveOptions,
+) -> OperationResult<Option<SolidId>> {
+    let axis = options.axis_direction.normalize()?;
+    let axis_origin = options.axis_origin;
+    let eps = 1e-7;
+
+    if !base_face.inner_loops.is_empty() {
+        return Ok(None);
+    }
+    let base_loop = model
+        .loops
+        .get(base_face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("revolve: base loop not found".into()))?
+        .clone();
+
+    // Oriented profile vertex pairs; require every edge linear.
+    let mut prof: Vec<(VertexId, VertexId)> = Vec::new();
+    for (idx, &eid) in base_loop.edges.iter().enumerate() {
+        let e = model
+            .edges
+            .get(eid)
+            .ok_or_else(|| OperationError::InvalidGeometry("revolve: profile edge".into()))?;
+        let curve = model
+            .curves
+            .get(e.curve_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("revolve: profile curve".into()))?;
+        if !curve.is_linear(crate::math::Tolerance::default()) {
+            return Ok(None); // curved profile → grid fallback
+        }
+        let fwd = base_loop.orientations.get(idx).copied().unwrap_or(true);
+        let (s, en) = if fwd {
+            (e.start_vertex, e.end_vertex)
+        } else {
+            (e.end_vertex, e.start_vertex)
+        };
+        prof.push((s, en));
+    }
+
+    // Eligibility: every edge vertical (cylinder) or horizontal (plane); every
+    // radius > 1e-4 (annular caps, no apex/disc — those are v2).
+    for &(s, en) in &prof {
+        let (_, r0, t0) = ring_geometry(model, s, axis_origin, axis)?;
+        let (_, r1, t1) = ring_geometry(model, en, axis_origin, axis)?;
+        if r0 < 1e-4 || r1 < 1e-4 {
+            return Ok(None);
+        }
+        let vertical = (r0 - r1).abs() < eps;
+        let horizontal = (t0 - t1).abs() < eps;
+        if !vertical && !horizontal {
+            return Ok(None); // sloped (cone) band → v2 fallback
+        }
+    }
+
+    // Build + self-check inside a rollback: Err restores the model so the grid
+    // path runs clean.
+    let attempt = lifecycle::with_rollback(model, move |model| {
+        build_analytic_bands(
+            model,
+            base_face,
+            base_face_id,
+            &base_loop,
+            &prof,
+            axis_origin,
+            axis,
+        )
+    });
+    Ok(attempt.ok())
+}
+
+/// Emit the analytic band faces (shared ring-circle edges), clean up the scratch
+/// profile face, assemble the solid, and self-verify. Returns `Err` (→ rollback)
+/// if the result is not a valid watertight solid.
+#[allow(clippy::too_many_arguments)]
+fn build_analytic_bands(
+    model: &mut BRepModel,
+    base_face: &Face,
+    base_face_id: FaceId,
+    base_loop: &Loop,
+    prof: &[(VertexId, VertexId)],
+    axis_origin: Point3,
+    axis: Vector3,
+) -> OperationResult<SolidId> {
+    use super::orientation::orient_face_for_outward;
+    use crate::primitives::curve::{Circle, Line};
+    use crate::primitives::r#loop::LoopType;
+    use crate::primitives::surface::{Cylinder, Plane};
+    use std::collections::HashMap;
+    use std::f64::consts::PI;
+
+    let eps = 1e-7;
+    let tol = model.tolerance();
+
+    // Canonical seam direction, shared by every ring (a full revolution is
+    // rotationally symmetric, so anchoring all seams to the canonical x-axis
+    // lines the seam meridians up → watertight).
+    let unit_circle = Circle::new(axis_origin, axis, 1.0)
+        .map_err(|e| OperationError::NumericalError(format!("revolve seam circle: {e}")))?;
+    let ref_dir = unit_circle.x_axis();
+
+    // One SHARED closed circle edge per unique profile vertex.
+    let mut uniq: Vec<VertexId> = Vec::new();
+    for &(s, en) in prof {
+        for v in [s, en] {
+            if !uniq.contains(&v) {
+                uniq.push(v);
+            }
+        }
+    }
+    let mut ring_edge: HashMap<VertexId, EdgeId> = HashMap::new();
+    let mut ring_seamv: HashMap<VertexId, VertexId> = HashMap::new();
+    let mut ring_geo: HashMap<VertexId, (Point3, f64, f64)> = HashMap::new();
+    for &v in &uniq {
+        let (center, radius, axial) = ring_geometry(model, v, axis_origin, axis)?;
+        ring_geo.insert(v, (center, radius, axial));
+        let seam_pos = Point3::new(
+            center.x + ref_dir.x * radius,
+            center.y + ref_dir.y * radius,
+            center.z + ref_dir.z * radius,
+        );
+        let seam_v = model
+            .vertices
+            .add_or_find(seam_pos.x, seam_pos.y, seam_pos.z, tol.distance());
+        let circle = Circle::new(center, axis, radius)
+            .map_err(|e| OperationError::NumericalError(format!("revolve ring circle: {e}")))?;
+        let cid = model.curves.add(Box::new(circle));
+        let edge = model.edges.add(Edge::new(
+            0,
+            seam_v,
+            seam_v,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        ring_edge.insert(v, edge);
+        ring_seamv.insert(v, seam_v);
+    }
+
+    // One analytic face per band.
+    let mut faces: Vec<FaceId> = Vec::new();
+    for &(s, en) in prof {
+        let (c0, r0, t0) = ring_geo[&s];
+        let (c1, r1, _t1) = ring_geo[&en];
+        let sp0 = model
+            .vertices
+            .get_position(s)
+            .ok_or_else(|| OperationError::InvalidGeometry("revolve: band start vertex".into()))?;
+        let ep0 = model
+            .vertices
+            .get_position(en)
+            .ok_or_else(|| OperationError::InvalidGeometry("revolve: band end vertex".into()))?;
+        let sp0 = Vector3::new(sp0[0], sp0[1], sp0[2]);
+        let ep0 = Vector3::new(ep0[0], ep0[1], ep0[2]);
+        // Proven outward rule (matches the grid path, fixed the ⅓-volume bug).
+        let d = ep0 - sp0;
+        let mid = (sp0 + ep0) * 0.5;
+        let mrel = mid - axis_origin;
+        let rhat = mrel - axis * mrel.dot(&axis);
+        let outward0 = if rhat.magnitude_squared() > 1e-20 {
+            let n_p = axis.cross(&rhat.normalize()?);
+            n_p.cross(&d).normalize().unwrap_or(rhat)
+        } else {
+            axis
+        };
+
+        let vertical = (r0 - r1).abs() < eps;
+        if vertical {
+            // Cylinder wall: base at lower axial, height = |Δaxial|.
+            let (base_center, height) = if t0 <= ring_geo[&en].2 {
+                (c0, ring_geo[&en].2 - t0)
+            } else {
+                (c1, t0 - ring_geo[&en].2)
+            };
+            let mut cyl = Cylinder::new_finite(base_center, axis, r0, height)
+                .map_err(|e| OperationError::NumericalError(format!("revolve cylinder: {e}")))?;
+            cyl.ref_dir = ref_dir;
+            let surf_id = model.surfaces.add(Box::new(cyl));
+
+            // Seam meridian between the two ring seam vertices.
+            let svs = model
+                .vertices
+                .get_position(ring_seamv[&s])
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: seam vtx s".into()))?;
+            let sve = model
+                .vertices
+                .get_position(ring_seamv[&en])
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: seam vtx e".into()))?;
+            let seam_line = Line::new(
+                Point3::new(svs[0], svs[1], svs[2]),
+                Point3::new(sve[0], sve[1], sve[2]),
+            );
+            let seam_cid = model.curves.add(Box::new(seam_line));
+            let seam_eid = model.edges.add(Edge::new(
+                0,
+                ring_seamv[&s],
+                ring_seamv[&en],
+                seam_cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            ));
+
+            // Lateral loop: bottom_circle(fwd) seam(fwd) top_circle(bwd) seam(bwd).
+            let mut lp = Loop::new(0, LoopType::Outer);
+            lp.add_edge(ring_edge[&s], true);
+            lp.add_edge(seam_eid, true);
+            lp.add_edge(ring_edge[&en], false);
+            lp.add_edge(seam_eid, false);
+            let lp_id = model.loops.add(lp);
+
+            // orient_face_for_outward samples u=π; rotate outward0 (at angle 0) there.
+            let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
+            let surf = model.surfaces.get(surf_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: cylinder surface".into())
+            })?;
+            let orient = orient_face_for_outward(surf, target)?;
+            let mut f = Face::new(0, surf_id, lp_id, orient);
+            f.outer_loop = lp_id;
+            faces.push(model.faces.add(f));
+        } else {
+            // Annular plane cap at constant axial. Outer = larger-radius circle.
+            let (outer_v, inner_v) = if r0 >= r1 { (s, en) } else { (en, s) };
+            let plane = Plane::from_point_normal(c0, axis)
+                .map_err(|e| OperationError::NumericalError(format!("revolve plane: {e}")))?;
+            let surf_id = model.surfaces.add(Box::new(plane));
+
+            let mut lp = Loop::new(0, LoopType::Outer);
+            lp.add_edge(ring_edge[&outer_v], true);
+            let lp_id = model.loops.add(lp);
+            let mut inner = Loop::new(0, LoopType::Inner);
+            inner.add_edge(ring_edge[&inner_v], true);
+            let inner_id = model.loops.add(inner);
+
+            // Plane outward0 is constant ±axis over the whole face → sample midpoint.
+            let surf = model
+                .surfaces
+                .get(surf_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: plane surface".into()))?;
+            let orient = orient_face_for_outward(surf, outward0)?;
+            let mut f = Face::new(0, surf_id, lp_id, orient);
+            f.outer_loop = lp_id;
+            f.add_inner_loop(inner_id);
+            faces.push(model.faces.add(f));
+        }
+    }
+
+    // Remove the scratch profile face + its edges/loop (mirrors create_revolution).
+    for &eid in &base_loop.edges {
+        model.edges.remove(eid);
+    }
+    model.loops.remove(base_face.outer_loop);
+    model.faces.remove(base_face_id);
+
+    // Shell + solid.
+    let mut shell = Shell::new(0, ShellType::Closed);
+    for &fid in &faces {
+        shell.add_face(fid);
+    }
+    let shell_id = model.shells.add(shell);
+    let solid = Solid::new(0, shell_id);
+    let sid = model.solids.add(solid);
+
+    // Self-check: a valid, closed, manifold, watertight solid — else Err → rollback.
+    let v = crate::primitives::validation::validate_solid_scoped(
+        model,
+        sid,
+        tol,
+        crate::primitives::validation::ValidationLevel::Standard,
+    );
+    if !v.is_valid {
+        return Err(OperationError::InvalidGeometry(format!(
+            "analytic revolve invalid: {:?}",
+            v.errors
+        )));
+    }
+    match crate::harness::watertight::manifold_report(model, sid, 0.1, 1e-6) {
+        Some(rep) if rep.boundary_edges == 0 && rep.closed && rep.manifold => Ok(sid),
+        Some(rep) => Err(OperationError::InvalidGeometry(format!(
+            "analytic revolve not watertight: boundary={} closed={} manifold={}",
+            rep.boundary_edges, rep.closed, rep.manifold
+        ))),
+        None => Err(OperationError::InvalidGeometry(
+            "analytic revolve tessellation empty".into(),
+        )),
+    }
 }
 
 /// Build a revolution end-cap face at a given angular `station`, reusing the
