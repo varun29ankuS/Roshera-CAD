@@ -635,6 +635,37 @@ revolve is a valid B-Rep (`validate_solid_scoped`) + watertight
 
 ---
 
+## Drawing / dimensioning
+
+### DRW-DIM-EXPLOSION 🔴 auto-dimensioning + circle projection don't scale to complex revolves
+Surfaced live building a rocket-engine bell nozzle (revolve, ~19-segment hollow
+profile). The solid is SOUND (B-Rep valid, watertight). But its auto drawing is
+UNUSABLE: `visible_dimensions` emits a callout for EVERY analytic band — a nozzle
+has ~9 cone bands, so the FRONT view stacks ∠36.9°/∠30.3°/∠24.8°/… AND the bottom
+floods with Ø150/Ø136/Ø112/Ø84/Ø72/Ø60/Ø44… extension lines, all overlapping.
+The TOP view draws a concentric circle for EVERY band ring (a dozen dashed
+circles) — the analytic-circle feature (true circles, good) amplifies the clutter.
+ROOT: the dimensioning has no SELECTION — it annotates every feature instead of
+the few that define the part (overall L + OD, throat Ø, exit Ø, chamber Ø). FIX
+LANE: (1) a dimension-selection pass (dedupe near-equal values, keep extents +
+distinct key diameters, cap per view); (2) circle de-clutter (only distinct-radius
+rings, drop interior duplicates); (3) extend `drawing::verify` to FLAG
+over-dimensioning / label-collision density so the oracle drives it (the user's
+"better verification layer to improve"). The simple box / single-bore parts draw
+clean (commit 7e59347); the gap is COMPLEX parts.
+
+### REVOLVE-TESS-SEAM 🔴 revolve band boundaries non-manifold at very fine chord
+Same nozzle: at the DISPLAY default chord (0.001 ABSOLUTE — 178000:1 on a 178 mm
+part) the mesh has 2 non-manifold edges (x4 fans) at band boundaries (bell z≈164,
+chamber z≈48) + a thin seam sliver (the visible "extrusion" in the shaded render).
+Manifold at chord 0.05; the B-Rep is valid + watertight (sound eye correct). The
+adjacent revolve bands don't share boundary samples at extreme density — the
+#21/#24 shared-edge-sampling lane, on the REVOLVE seam (the boolean-seam sibling
+#65 was fixed via doubled-facet removal, but these are x4 fans, not doubled
+facets). Compounded by the absolute-0.001 default chord over-tessellating (also
+the build-time jitter source) — a SIZE-RELATIVE default chord would sidestep this
+regime AND speed display. Pin lane: revolve band-boundary shared sampling.
+
 ## Other notes (not bugs, but gotchas)
 
 - **Edge IDs are global and accumulate across solids.** A "fresh box" is
