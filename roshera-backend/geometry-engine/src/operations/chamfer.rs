@@ -845,6 +845,34 @@ fn chamfer_distances_for_closed_edge(
 /// Returns `(blend_face_id, None)`. The `None` tells
 /// [`update_adjacent_faces_for_chamfer`] to skip the open-edge splice.
 #[allow(clippy::too_many_lines)] // mirrors cylinder_rim_fillet's structure for maintainability
+/// Largest radial distance of any vertex on a face's OUTER loop, used to
+/// gate a bore-rim chamfer so the growing hole can't reach the cap edge.
+fn chamfer_face_outer_loop_max_radius(
+    model: &BRepModel,
+    face_id: FaceId,
+    origin: Point3,
+    axis: Vector3,
+) -> f64 {
+    let mut max_r = 0.0_f64;
+    let Some(face) = model.faces.get(face_id) else {
+        return max_r;
+    };
+    if let Some(l) = model.loops.get(face.outer_loop) {
+        for &e in &l.edges {
+            if let Some(ed) = model.edges.get(e) {
+                for v in [ed.start_vertex, ed.end_vertex] {
+                    if let Some(p) = model.vertices.get_position(v) {
+                        let d = Point3::new(p[0], p[1], p[2]) - origin;
+                        let radial = d - axis * d.dot(&axis);
+                        max_r = max_r.max(radial.magnitude());
+                    }
+                }
+            }
+        }
+    }
+    max_r
+}
+
 fn create_closed_edge_chamfer(
     model: &mut BRepModel,
     rim_edge_id: EdgeId,
@@ -906,30 +934,7 @@ fn create_closed_edge_chamfer(
     let h_high = height_limits[1];
     let height = h_high - h_low;
 
-    // ---------- step 0b: geometric preconditions. ----------
-    // d_cap < big_r keeps the inner cap circle non-degenerate.
-    // d_lat < height keeps the lateral surface non-degenerate after
-    // it's shortened on the rim side.
-    //
-    // AUDIT-H1: numerical safety margins use the caller-supplied
-    // distance tolerance instead of a hardcoded `1e-9`.
-    let margin = tol.distance();
-    if d_cap >= big_r - margin {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Chamfer cap distance {d_cap} is too large for cylinder rim: must \
-             be strictly less than the cylinder radius ({big_r}); the inner \
-             cap circle would collapse to (or invert through) the axis."
-        )));
-    }
-    if d_lat >= height - margin {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Chamfer lateral distance {d_lat} is too large for cylinder rim: \
-             exceeds available cylinder height ({height}); the lateral \
-             surface would collapse."
-        )));
-    }
-
-    // ---------- step 0c: rim sign + new seam positions. ----------
+    // ---------- step 0b: rim sign. ----------
     // sign = +1 for top rim (cap normal aligned with cylinder axis),
     //      = -1 for bottom rim (cap normal opposite the cylinder axis).
     let sign: f64 = if plane.normal.dot(&axis) > 0.0 {
@@ -937,6 +942,67 @@ fn create_closed_edge_chamfer(
     } else {
         -1.0
     };
+
+    // ---------- step 0c: outer vs bore rim. ----------
+    // An annular cap (tube/washer/flange) carries the bore rim in one of
+    // its inner loops. The two cases mirror radially: an outer rim pulls
+    // the cap edge in to R−d_cap; a bore rim pushes the hole out to
+    // R+d_cap, and the chamfer cone opens the other way (apex on the far
+    // side of the cap).
+    let (cap_loop_id, radial_out) = {
+        let cap_face = model
+            .faces
+            .get(cap_face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap face missing".to_string()))?;
+        let has_rim = |lid| -> bool {
+            model
+                .loops
+                .get(lid)
+                .is_some_and(|l| l.edges.contains(&rim_edge_id))
+        };
+        if has_rim(cap_face.outer_loop) {
+            (cap_face.outer_loop, 1.0_f64)
+        } else if let Some(&inner) = cap_face.inner_loops.iter().find(|&&lid| has_rim(lid)) {
+            (inner, -1.0_f64)
+        } else {
+            return Err(OperationError::InvalidGeometry(
+                "Rim edge not found in cap loop".to_string(),
+            ));
+        }
+    };
+    let inner = radial_out < 0.0;
+    // Cap circle radius after the chamfer: R−d_cap (outer) or R+d_cap (bore).
+    let cap_r = big_r - radial_out * d_cap;
+
+    // ---------- step 0d: geometric preconditions. ----------
+    // d_lat < height keeps the shortened lateral cylinder non-degenerate
+    // (both kinds). The radial gate differs: an outer rim's cap circle
+    // must stay off the axis (d_cap < R); a bore rim's growing hole must
+    // not reach the cap's outer edge.
+    // AUDIT-H1: safety margins use the caller-supplied tolerance.
+    let margin = tol.distance();
+    if d_lat >= height - margin {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Chamfer lateral distance {d_lat} is too large for cylinder rim: \
+             exceeds available cylinder height ({height}); the lateral \
+             surface would collapse."
+        )));
+    }
+    if inner {
+        let cap_outer_r = chamfer_face_outer_loop_max_radius(model, cap_face_id, origin, axis);
+        if cap_r >= cap_outer_r - margin {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Chamfer cap distance {d_cap} too large for bore rim: the chamfered \
+                 bore (R+d_cap = {cap_r}) would reach the cap's outer edge ({cap_outer_r})."
+            )));
+        }
+    } else if d_cap >= big_r - margin {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Chamfer cap distance {d_cap} is too large for cylinder rim: must \
+             be strictly less than the cylinder radius ({big_r}); the inner \
+             cap circle would collapse to (or invert through) the axis."
+        )));
+    }
 
     let cap_h = if sign > 0.0 { h_high } else { h_low };
     let lat_seam_h = cap_h - sign * d_lat;
@@ -952,7 +1018,7 @@ fn create_closed_edge_chamfer(
     //   cylinder at the new shorter height.
     //   v_cap (= newly created) lives on the cap at the reduced radius.
     let lat_seam_pos = origin + axis * lat_seam_h + ref_dir * big_r;
-    let cap_seam_pos = origin + axis * cap_h + ref_dir * (big_r - d_cap);
+    let cap_seam_pos = origin + axis * cap_h + ref_dir * cap_r;
 
     // ---------- step 0d: cone geometry. ----------
     // Walking the chamfer line in (radial, axial) coordinates from
@@ -965,12 +1031,18 @@ fn create_closed_edge_chamfer(
     // cylinder; v = h_a coincides with the cap seam circle (smaller
     // radius), v = h_a + d_lat with the lateral seam circle (radius
     // = big_r).
-    let h_a = d_lat * (big_r - d_cap) / d_cap;
+    // `h_a` is the signed axial offset of the apex from the cap plane.
+    // For an outer rim it is positive (apex beyond the cap, cone narrows
+    // toward the axis); for a bore rim it is negative (apex on the far
+    // side, cone widens away from the axis). `cone_v_*` are the unsigned
+    // distances from the apex to each circle; for a bore rim the cap is
+    // FARTHER than the lateral, so the v-ordering flips.
+    let h_a = d_lat * cap_r / (radial_out * d_cap);
     let cone_apex = origin + axis * (cap_h + sign * h_a);
-    let cone_axis = axis * (-sign);
+    let cone_axis = axis * (-sign) * radial_out;
     let cone_half_angle = (d_cap / d_lat).atan();
-    let cone_v_cap = h_a;
-    let cone_v_lat = h_a + d_lat;
+    let cone_v_cap = cap_r * d_lat / d_cap;
+    let cone_v_lat = big_r * d_lat / d_cap;
 
     // ---------- step 1: snapshot the rim edge. ----------
     let rim_edge = model
@@ -991,11 +1063,8 @@ fn create_closed_edge_chamfer(
         .get(lat_face_id)
         .map(|f| f.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Lateral face missing".to_string()))?;
-    let cap_loop_id = model
-        .faces
-        .get(cap_face_id)
-        .map(|f| f.outer_loop)
-        .ok_or_else(|| OperationError::InvalidGeometry("Cap face missing".to_string()))?;
+    // (cap_loop_id was resolved in step 0c — outer loop for an outer rim,
+    // the matching inner loop for a bore rim.)
 
     // The lateral seam edge appears twice in the lateral loop (once
     // forward, once backward) — same "seamed face" pattern the fillet
@@ -1074,7 +1143,7 @@ fn create_closed_edge_chamfer(
     // Cap and lateral trim circles share the cylinder's parametric
     // direction so loop orientation flags carry the same convention as
     // the fillet implementation (see step 7).
-    let cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, big_r - d_cap)
+    let cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, cap_r)
         .map_err(|e| OperationError::NumericalError(format!("cap trim circle: {e}")))?;
     let lat_trim_circle = Arc::circle(origin + axis * lat_seam_h, axis, big_r)
         .map_err(|e| OperationError::NumericalError(format!("lat trim circle: {e}")))?;
@@ -1223,14 +1292,15 @@ fn create_closed_edge_chamfer(
     }
 
     // ---------- step 10: build the cone surface + blend face. ----------
-    let mut cone = Cone::truncated(
-        cone_apex,
-        cone_axis,
-        cone_half_angle,
-        cone_v_cap,
-        cone_v_lat,
-    )
-    .map_err(|e| OperationError::NumericalError(format!("Cone blend: {e}")))?;
+    // height_limits expects ascending [bottom, top]; for a bore rim the
+    // cap distance exceeds the lateral distance, so order them.
+    let (v_lo, v_hi) = if cone_v_cap <= cone_v_lat {
+        (cone_v_cap, cone_v_lat)
+    } else {
+        (cone_v_lat, cone_v_cap)
+    };
+    let mut cone = Cone::truncated(cone_apex, cone_axis, cone_half_angle, v_lo, v_hi)
+        .map_err(|e| OperationError::NumericalError(format!("Cone blend: {e}")))?;
     // Cone's intrinsic normal at its parametric midpoint (u=π,
     // v=midpoint) points in the direction (cos π · ref_dir + sin π ·
     // ortho)·cos(half_angle) + cone_axis·sin(half_angle), which is
@@ -1240,7 +1310,7 @@ fn create_closed_edge_chamfer(
     // circle, the geometric outward direction at the blend midpoint
     // is `axis·sign − ref_dir` — the same diagonal that the fillet
     // torus uses (away from the cylinder material at u=π).
-    let chamfer_outward_target = axis * sign - ref_dir;
+    let chamfer_outward_target = axis * sign - ref_dir * radial_out;
     let blend_orientation = orient_face_for_outward(&cone, chamfer_outward_target)?;
     // Anchor u=0 to the cylinder's ref_dir so the cone's seam aligns
     // with the new lateral seam edge.
@@ -1257,11 +1327,20 @@ fn create_closed_edge_chamfer(
     // tolerates because `FaceOrientation::Forward` plus the loop's
     // closed cycle uniquely determines the boundary regardless of the
     // surface's natural normal direction.
+    // Bore rim flips the lateral/cap slots (same as the fillet's inner
+    // branch) because the lateral circle is now the FARTHER v boundary.
     let mut blend_loop = Loop::new(0, LoopType::Outer);
-    blend_loop.add_edge(lat_trim_edge_id, true);
-    blend_loop.add_edge(cone_seam_edge_id, true);
-    blend_loop.add_edge(cap_trim_edge_id, false);
-    blend_loop.add_edge(cone_seam_edge_id, false);
+    if inner {
+        blend_loop.add_edge(cap_trim_edge_id, true);
+        blend_loop.add_edge(cone_seam_edge_id, true);
+        blend_loop.add_edge(lat_trim_edge_id, false);
+        blend_loop.add_edge(cone_seam_edge_id, false);
+    } else {
+        blend_loop.add_edge(lat_trim_edge_id, true);
+        blend_loop.add_edge(cone_seam_edge_id, true);
+        blend_loop.add_edge(cap_trim_edge_id, false);
+        blend_loop.add_edge(cone_seam_edge_id, false);
+    }
     let blend_loop_id = model.loops.add(blend_loop);
 
     let mut blend_face = Face::new(0, cone_surface_id, blend_loop_id, blend_orientation);
