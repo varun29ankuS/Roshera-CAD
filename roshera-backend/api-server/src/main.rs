@@ -6723,6 +6723,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/parts/uuid/{uuid}/drawing",
             post(drawing_mgr::create_part_drawing_by_uuid),
         )
+        // Drawing quality oracle (2D perception layer): re-check any
+        // registered drawing's layout/annotation quality.
+        .route(
+            "/api/drawings/{id}/quality",
+            get(drawing_mgr::drawing_quality),
+        )
         // Part documents — one per frontend tab. CRUD on the registry;
         // geometry/sketch endpoints continue to route through the
         // legacy `state.model` until P.2 wires per-part extraction.

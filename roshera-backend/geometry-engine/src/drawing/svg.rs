@@ -166,7 +166,7 @@ fn write_stylesheet(out: &mut String) {
 // ---------------------------------------------------------------------
 
 /// Frame margins (left, right, top, bottom) in mm.
-fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
+pub(crate) fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
     match sheet {
         SheetSize::A4 => (15.0, 10.0, 10.0, 10.0),
         _ => (20.0, 10.0, 10.0, 10.0),
@@ -177,7 +177,7 @@ fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
 /// so it stays legible without dominating the drawing area. Heights are
 /// generous (`row_h >= 12 mm` for the TITLE band) so labels and values
 /// never crowd each other.
-fn title_block_size(sheet: &SheetSize) -> (f64, f64) {
+pub(crate) fn title_block_size(sheet: &SheetSize) -> (f64, f64) {
     match sheet {
         SheetSize::A4 => (170.0, 42.0),
         SheetSize::A3 => (185.0, 48.0),

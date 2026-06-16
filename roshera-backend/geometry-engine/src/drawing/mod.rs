@@ -30,6 +30,7 @@ pub mod pdf;
 pub mod projection;
 pub mod svg;
 pub mod types;
+pub mod verify;
 pub mod visibility;
 
 pub use centerlines::{centerlines, Centerline};
@@ -46,6 +47,7 @@ pub use types::{
     Drawing, DrawingId, Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize,
     TitleBlock, ViewExtent, ViewSource,
 };
+pub use verify::{verify_drawing, DrawingIssue, DrawingIssueKind, DrawingQualityReport, Severity};
 pub use visibility::{is_point_hidden, project_solid_edges_visibility, ViewEdges};
 
 #[cfg(test)]

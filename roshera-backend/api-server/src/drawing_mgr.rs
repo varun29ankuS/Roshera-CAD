@@ -34,8 +34,8 @@ use axum::{
 use dashmap::DashMap;
 use geometry_engine::drawing::{
     project_solid_view, render_drawing_dxf, render_drawing_pdf, render_drawing_svg,
-    standard_drawing_hlr, Drawing, DrawingId, ProjectedViewId, ProjectionType, SheetSize,
-    TitleBlock, ViewSource,
+    standard_drawing_hlr, verify_drawing, Drawing, DrawingId, DrawingQualityReport,
+    ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use geometry_engine::primitives::solid::SolidId;
@@ -140,6 +140,16 @@ fn default_sheet_size() -> SheetSize {
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateDrawingResponse {
     pub id: Uuid,
+}
+
+/// Response for the one-call part drawing: the new drawing id plus its
+/// quality report, so the caller gets the perception/feedback verdict
+/// (overlaps, off-sheet views, dimensions on the outline, sheet
+/// utilization) in the same round-trip it created the sheet.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartDrawingResponse {
+    pub id: Uuid,
+    pub quality: DrawingQualityReport,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -637,7 +647,7 @@ pub async fn create_part_drawing(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
     Query(q): Query<PartDrawingQuery>,
-) -> Result<Json<CreateDrawingResponse>, StatusCode> {
+) -> Result<Json<PartDrawingResponse>, StatusCode> {
     create_part_drawing_inner(state, model_handle, id, Uuid::nil(), q).await
 }
 
@@ -651,7 +661,7 @@ pub async fn create_part_drawing_by_uuid(
     ActiveModel(model_handle): ActiveModel,
     Path(uuid): Path<Uuid>,
     Query(q): Query<PartDrawingQuery>,
-) -> Result<Json<CreateDrawingResponse>, StatusCode> {
+) -> Result<Json<PartDrawingResponse>, StatusCode> {
     let solid_id = state.get_local_id(&uuid).ok_or(StatusCode::NOT_FOUND)?;
     create_part_drawing_inner(state, model_handle, solid_id, uuid, q).await
 }
@@ -662,7 +672,7 @@ async fn create_part_drawing_inner(
     solid_id: SolidId,
     part_uuid: Uuid,
     q: PartDrawingQuery,
-) -> Result<Json<CreateDrawingResponse>, StatusCode> {
+) -> Result<Json<PartDrawingResponse>, StatusCode> {
     let mut drawing = {
         let model = model_handle.read().await;
         if model.solids.get(solid_id).is_none() {
@@ -685,6 +695,12 @@ async fn create_part_drawing_inner(
             .unwrap_or_else(|| format!("Solid {solid_id} — Drawing"))
     });
 
+    // Perception/feedback: verify layout + annotation quality before we
+    // hand the drawing back, so the response carries the same verdict the
+    // harness oracle uses (overlaps, off-sheet views, dimensions on the
+    // outline, sheet utilization).
+    let quality = verify_drawing(&drawing);
+
     let drawing_id = state.drawings.insert(drawing);
     state.drawings.record_event(
         RecordedOperation::new("drawing.create_from_part")
@@ -692,11 +708,28 @@ async fn create_part_drawing_inner(
                 "solid_id": solid_id,
                 "part_uuid": part_uuid,
                 "sheet_size": SheetSize::A3,
+                "quality_passed": quality.passed,
+                "quality_issues": quality.issues.len(),
             }))
             .with_output_drawing(drawing_id),
     );
 
-    Ok(Json(CreateDrawingResponse { id: drawing_id }))
+    Ok(Json(PartDrawingResponse {
+        id: drawing_id,
+        quality,
+    }))
+}
+
+/// `GET /api/drawings/{id}/quality` — re-run the drawing quality oracle
+/// over a stored drawing and return its report. The perception layer for
+/// 2D output, mirroring the geometry watertight/validity oracles.
+pub async fn drawing_quality(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<DrawingQualityReport>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let guard = handle.read().await;
+    Ok(Json(verify_drawing(&guard)))
 }
 
 /// Build a content-disposition value with a sanitised filename based on
