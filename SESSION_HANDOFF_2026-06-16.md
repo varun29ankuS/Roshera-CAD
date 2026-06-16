@@ -31,8 +31,30 @@ TaskList, self-paced `/loop`, commit green / defer-with-diagnosis.
 (Earlier in the same continuous session, before this file's window: #12 raytrace eye,
  #13 raytrace soundness harness, #1–8/#10/#11/#20 — see prior handoffs + git log.)
 
+## ★ Follow-on (same day, interactive): #21 re-diagnosed → #19 + #9 SHIPPED
+Varun: "tackle #21 tessellator." Investigated and **disproved the #21 hypothesis**:
+- `5651141` test(#21): primitive shared-edge watertightness battery
+  (`tests/primitive_tess_watertight.rs`) — standalone AND boolean-trimmed
+  sphere/cone/torus (incl. a planar face sharing a circle edge with a curved
+  face) are watertight at all chord tolerances. The tessellator was innocent;
+  the cache + planar + curved-CDT paths already sample shared edges bit-exactly.
+- The REAL blocker was revolve's reverted analytic path giving each band its OWN
+  circle copy (different EdgeIds → cache samples independently → gaps),
+  misattributed to the tessellator.
+- `5ce82b0` feat(#19/#9): analytic Cylinder + annular-Plane bands (shared ring-
+  circle EdgeIds, mirrors create_cylinder_topology; self-check + grid fallback =
+  zero regression). 48-seg tube = 4 faces not 192. **Unblocked #9** — section
+  tube x/y now pass (the "404 bug").
+- `e1db4fe` feat(#19 v2): analytic Cone bands for sloped edges (frustum tube =
+  2 Cone + 2 Plane). Revolve now emits the full Cylinder/Cone/Plane band set.
+- `8bb38c9` docs: corrected the REVOLVE_ANALYTIC_BANDS_PLAN.
+Gates all green: revolve_analytic_faces 3/3, section_revolve tube 2/2,
+revolve_watertight 7/7, revolve_volume 14/14, lib revolve 32/32. Only a profile
+vertex ON the axis (r→0 disc/apex) still uses the watertight grid fallback (v3).
+**#9, #19, #21 all COMPLETE.**
+
 ## Campaign state
-DONE: #1–8, #10–15, #20, #22.
+DONE: #1–15, #19, #20, #21, #22. (#16, #17 remain — see below.)
 The **spatial-query core** (`geometry-engine/src/queries/`) now has all five composable
 primitives — ray (`raycast`/`raytrace`), point, field, region, relational — each
 analytic-sound and recoverable. This is the inhabitable substrate: the agent can ask
@@ -40,18 +62,14 @@ point/field/region/relational questions of the space, all verified against close
 truth. The **drawing module** is now mechanical-grade: auto-dimensions (#20) + centerlines
 + hidden-line removal, all rendered through the SVG pipeline.
 
-## Remaining = the DEFERRED DEEP CLUSTER (needs Varun's steer — do NOT force)
-- **#21 tessellator** — primitive tessellators ignore `EdgeSampleCache` for boundary
-  edges; planar caps + curved walls sample inconsistently. The shared root of #9 and #19.
-  Deep; risks regressing watertight primitives. Needs a careful fresh-context pass.
-- **#9 section_view on revolved solids** — blocked on #21 (revolve faceting).
-- **#19 revolve emits analytic bands** — blocked on #21 (was attempted + reverted; the
-  analytic bands fall back to non-watertight at coarse deflection until #21 is fixed).
+## Remaining (only two — both genuinely need Varun's steer)
 - **#16 set_dimension / mould verb** — the composable form needs persistent IDs (#11,
   the parametric-timeline-hybrid prereq) so re-evaluation can remap face/edge refs.
 - **#17 live Three.js viewport eye** — frontend/transport plumbing (shared camera pose →
   backend raytrace). Backend half is DONE (`raytrace_ortho` takes any camera basis);
   Varun flagged the live-camera wiring as a later/explore item.
+
+(#9, #19, #21 — formerly this cluster — are now DONE; see the follow-on section above.)
 
 ## Open follow-ups (small, user-gated)
 - #22 per-dimension **tolerances**: needs user spec (not autonomously derivable; the
