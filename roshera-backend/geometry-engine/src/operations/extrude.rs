@@ -680,7 +680,143 @@ fn create_fresh_extrusion(
         "Created fresh extruded solid"
     );
 
+    // Persistent-id lineage (#11, slice 40-C): the bottom cap keeps the base
+    // face's PID; the top cap + each side face derive from it, so an agent's
+    // "top cap of extrude X" / "side over edge e" survive a distance edit.
+    assign_fresh_extrude_pids(
+        model,
+        base_face_id,
+        &outer_base_loop,
+        &inner_specs,
+        &unified_faces,
+        solid_id,
+        cap_ends,
+    );
+
     Ok(solid_id)
+}
+
+/// Resolve (or mint) the persistent-id of a base-loop edge, deriving from the
+/// base face PID + a stable per-edge label when the edge has no upstream PID.
+fn extrude_edge_pid(
+    model: &mut BRepModel,
+    edge_id: crate::primitives::edge::EdgeId,
+    base_face_pid: crate::primitives::persistent_id::PersistentId,
+    label: &str,
+) -> crate::primitives::persistent_id::PersistentId {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+    if let Some(p) = model.edge_pid(edge_id) {
+        return p;
+    }
+    let p = PersistentId::derive(
+        &[base_face_pid],
+        "face_edge",
+        &Role::Generic {
+            source_pid: base_face_pid,
+            label: label.to_string(),
+        },
+    );
+    model.set_edge_pid(edge_id, p);
+    p
+}
+
+/// Assign persistent-id lineage to a fresh extrusion's output (#11, slice 40-C).
+///
+/// `unified_faces` is built in a fixed order — `[bottom cap]`, outer side faces
+/// (one per outer-loop edge, in order), inner side faces (per inner loop), then
+/// `[top cap]` — so each output face's role + parent are recoverable by position.
+/// The bottom cap IS the base face (same id) and keeps its PID; the top cap and
+/// sides derive from the base face PID via their [`Role`].
+fn assign_fresh_extrude_pids(
+    model: &mut BRepModel,
+    base_face_id: FaceId,
+    outer_loop: &crate::primitives::r#loop::Loop,
+    inner_specs: &[(crate::primitives::r#loop::Loop, ExtrusionLoopTopology)],
+    unified_faces: &[FaceId],
+    solid_id: SolidId,
+    cap_ends: bool,
+) {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+
+    // Parent = the base face PID; mint a root if the base face had none.
+    let fp = match model.face_pid(base_face_id) {
+        Some(p) => p,
+        None => {
+            let seed = model.next_root_seed("extrude_base_face");
+            PersistentId::root(&seed)
+        }
+    };
+    model.set_face_pid(base_face_id, fp);
+
+    // Solid PID derives from the base face PID.
+    let solid_pid = PersistentId::derive(
+        &[fp],
+        "extrude_face",
+        &Role::Generic {
+            source_pid: fp,
+            label: "solid".to_string(),
+        },
+    );
+    model.set_solid_pid(solid_id, solid_pid);
+
+    // Guard: only walk the side correspondence when the face set matches the
+    // expected structure (so an unexpected build never mislabels). Caps + solid
+    // are assigned regardless.
+    let n_caps = if cap_ends { 2 } else { 0 };
+    let n_sides: usize = outer_loop.edges.len()
+        + inner_specs
+            .iter()
+            .map(|(l, _)| l.edges.len())
+            .sum::<usize>();
+
+    let mut cursor = 0usize;
+    if cap_ends {
+        // unified_faces[0] is the base face (bottom cap) — keeps `fp`.
+        cursor += 1;
+    }
+
+    if unified_faces.len() == n_sides + n_caps {
+        for (i, &edge_id) in outer_loop.edges.iter().enumerate() {
+            if let Some(&face) = unified_faces.get(cursor) {
+                let epid = extrude_edge_pid(model, edge_id, fp, &format!("o{i}"));
+                let fpid = PersistentId::derive(
+                    &[fp],
+                    "extrude_face",
+                    &Role::ExtrudeSide {
+                        base_edge_pid: epid,
+                    },
+                );
+                model.set_face_pid(face, fpid);
+            }
+            cursor += 1;
+        }
+        for (li, (inner_loop, _)) in inner_specs.iter().enumerate() {
+            for (i, &edge_id) in inner_loop.edges.iter().enumerate() {
+                if let Some(&face) = unified_faces.get(cursor) {
+                    let epid = extrude_edge_pid(model, edge_id, fp, &format!("i{li}_{i}"));
+                    let fpid = PersistentId::derive(
+                        &[fp],
+                        "extrude_face",
+                        &Role::ExtrudeSide {
+                            base_edge_pid: epid,
+                        },
+                    );
+                    model.set_face_pid(face, fpid);
+                }
+                cursor += 1;
+            }
+        }
+    }
+
+    // Top cap is the last face.
+    if cap_ends {
+        if let Some(&top) = unified_faces.last() {
+            if top != base_face_id {
+                let fpid = PersistentId::derive(&[fp], "extrude_face", &Role::ExtrudeCapEnd);
+                model.set_face_pid(top, fpid);
+            }
+        }
+    }
 }
 
 /// Build one side face per edge of `base_loop`, pushing each new `FaceId`
