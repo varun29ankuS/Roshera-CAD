@@ -6703,6 +6703,26 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/drawings/{id}/svg", get(drawing_mgr::export_svg))
         .route("/api/drawings/{id}/pdf", get(drawing_mgr::export_pdf))
         .route("/api/drawings/{id}/dxf", get(drawing_mgr::export_dxf))
+        // One-call "right-click → drawing": third-angle Front/Top/Right with
+        // hidden-line removal + centerlines + auto dimensions, as SVG.
+        .route(
+            "/api/parts/{id}/drawing.svg",
+            get(drawing_mgr::part_drawing_svg),
+        )
+        .route(
+            "/api/parts/uuid/{uuid}/drawing.svg",
+            get(drawing_mgr::part_drawing_svg_by_uuid),
+        )
+        // …and the registry variant: build the same standard sheet but
+        // register it so the Drawing workspace can open / edit / export it.
+        .route(
+            "/api/parts/{id}/drawing",
+            post(drawing_mgr::create_part_drawing),
+        )
+        .route(
+            "/api/parts/uuid/{uuid}/drawing",
+            post(drawing_mgr::create_part_drawing_by_uuid),
+        )
         // Part documents — one per frontend tab. CRUD on the registry;
         // geometry/sketch endpoints continue to route through the
         // legacy `state.model` until P.2 wires per-part extraction.

@@ -163,6 +163,29 @@ export async function createDrawing(name: string, sheet_size: SheetSize = 'A3'):
   return id
 }
 
+/**
+ * One-call "right-click → drawing": build the standard third-angle sheet
+ * (Front / Top / Right with hidden-line removal, centerlines, and auto
+ * dimensions) for a viewport object and register it in the drawing
+ * registry. The scale auto-fits the part to the A3 sheet. Returns the
+ * new drawing's UUID, ready to open in the Drawing workspace.
+ *
+ * `objectUuid` is the viewport object id (scene-store key); the server
+ * resolves it to the kernel solid id.
+ */
+export async function createPartDrawing(
+  objectUuid: string,
+  name?: string,
+): Promise<string> {
+  const qs = name && name.trim() ? `?name=${encodeURIComponent(name.trim())}` : ''
+  const r = await fetch(
+    `${API_HOST}/api/parts/uuid/${objectUuid}/drawing${qs}`,
+    { method: 'POST' },
+  )
+  const { id } = await jsonOrThrow<{ id: string }>(r, 'createPartDrawing')
+  return id
+}
+
 /** Delete a drawing. The server returns 404 on unknown ids. */
 export async function deleteDrawing(id: string): Promise<void> {
   const r = await fetch(`${API_HOST}/api/drawings/${id}`, { method: 'DELETE' })
