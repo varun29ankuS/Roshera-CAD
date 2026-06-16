@@ -44,6 +44,8 @@ fn rect_view(
         dimensions: dims,
         centerlines: Vec::new(),
         hidden_polylines: Vec::new(),
+        circles: Vec::new(),
+        hidden_circles: Vec::new(),
     }
 }
 

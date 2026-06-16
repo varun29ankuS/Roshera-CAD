@@ -570,6 +570,8 @@ mod tests {
                 dimensions: Vec::new(),
                 centerlines: Vec::new(),
                 hidden_polylines: Vec::new(),
+                circles: Vec::new(),
+                hidden_circles: Vec::new(),
             });
         }
         let layers = assign_view_layers(&drawing.views);
