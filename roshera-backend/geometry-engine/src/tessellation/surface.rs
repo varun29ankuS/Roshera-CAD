@@ -5194,16 +5194,95 @@ pub(crate) fn weld_mesh_watertight_range(
             new_face_map.push(mesh.face_map[idx]);
         }
     }
+    // Remove DOUBLED FACETS in the welded range: two triangles sharing the
+    // same three (welded) vertices. An opposite-winding pair is a degenerate
+    // "fin" that contributes zero surface yet makes every one of its edges
+    // border 4 triangles → non-manifold; this is how a curved-CDT sliver
+    // emitted TWICE at high density leaves an otherwise-sound solid's mesh
+    // non-manifold (KNOWN_BUGS #65). Cancel opposite-winding pairs (drop
+    // BOTH — a fin sits on top of the real tiling, which still covers the
+    // patch), and collapse same-winding exact duplicates to one
+    // representative. This is a no-op on a clean mesh — every facet's
+    // vertex-triple is unique — so watertight primitives stay bit-for-bit
+    // identical.
+    let mut doubled_removed = 0usize;
+    {
+        let parity = |t: &[u32; 3]| -> bool {
+            // true = even permutation of the sorted triple (one winding),
+            // false = the opposite. Degenerate triangles (two equal indices)
+            // were already dropped above.
+            let inv = (t[0] > t[1]) as u8 + (t[0] > t[2]) as u8 + (t[1] > t[2]) as u8;
+            inv % 2 == 0
+        };
+        let mut groups: HashMap<[u32; 3], Vec<usize>> = HashMap::new();
+        for i in t_start..new_triangles.len() {
+            let mut k = new_triangles[i];
+            k.sort_unstable();
+            groups.entry(k).or_default().push(i);
+        }
+        let mut remove = vec![false; new_triangles.len()];
+        for idxs in groups.values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            // Greedily pair opposite-winding indices (cancel both); keep one
+            // representative of any same-winding surplus so the patch stays
+            // covered.
+            let mut even: Vec<usize> = Vec::new();
+            let mut odd: Vec<usize> = Vec::new();
+            for &i in idxs {
+                if parity(&new_triangles[i]) {
+                    if let Some(j) = odd.pop() {
+                        remove[i] = true;
+                        remove[j] = true;
+                    } else {
+                        even.push(i);
+                    }
+                } else if let Some(j) = even.pop() {
+                    remove[i] = true;
+                    remove[j] = true;
+                } else {
+                    odd.push(i);
+                }
+            }
+            for &extra in even.iter().chain(odd.iter()).skip(1) {
+                remove[extra] = true;
+            }
+        }
+        doubled_removed = remove.iter().filter(|&&r| r).count();
+        if doubled_removed > 0 {
+            let mut tris: Vec<[u32; 3]> = Vec::with_capacity(new_triangles.len());
+            let mut fmap: Vec<u32> = if has_face_map {
+                Vec::with_capacity(new_face_map.len())
+            } else {
+                Vec::new()
+            };
+            for i in 0..new_triangles.len() {
+                if remove[i] {
+                    continue;
+                }
+                tris.push(new_triangles[i]);
+                if has_face_map {
+                    fmap.push(new_face_map[i]);
+                }
+            }
+            new_triangles = tris;
+            if has_face_map {
+                new_face_map = fmap;
+            }
+        }
+    }
+
     mesh.triangles = new_triangles;
     if has_face_map {
         mesh.face_map = new_face_map;
     }
 
-    if welded > 0 || g1_smoothed > 0 {
+    if welded > 0 || g1_smoothed > 0 || doubled_removed > 0 {
         tracing::debug!(
             "weld_mesh_watertight_range: collapsed {welded} duplicate vertices, \
-             G1-smoothed {g1_smoothed} canonical normals \
-             (tol={weld_tolerance:e}, v_start={v_start})"
+             G1-smoothed {g1_smoothed} canonical normals, removed {doubled_removed} \
+             doubled-facet triangles (tol={weld_tolerance:e}, v_start={v_start})"
         );
     }
 }
