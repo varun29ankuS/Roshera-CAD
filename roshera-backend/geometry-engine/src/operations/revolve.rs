@@ -787,6 +787,37 @@ fn build_analytic_bands(
     let solid = Solid::new(0, shell_id);
     let sid = model.solids.add(solid);
 
+    // Persistent-id lineage (#11 slice 40-E): the result solid roots on the
+    // revolve event; each analytic band face (1:1 with the profile edges, in
+    // order) derives from the profile edge it was revolved from. So "the band
+    // over profile edge i" keeps its PID across a dimension mould — even if the
+    // edit morphs that band cylinder↔cone↔annulus. If the self-check below fails
+    // and rolls back, these PIDs roll back with it (snapshot-captured).
+    {
+        use crate::primitives::persistent_id::{PersistentId, Role};
+        let solid_pid = PersistentId::root(&model.next_root_seed("revolve"));
+        model.set_solid_pid(sid, solid_pid);
+        for (i, &face_id) in faces.iter().enumerate() {
+            let base_edge_pid = match base_loop.edges.get(i).and_then(|&e| model.edge_pid(e)) {
+                Some(p) => p,
+                None => PersistentId::derive(
+                    &[solid_pid],
+                    "revolve_profile_edge",
+                    &Role::Generic {
+                        source_pid: solid_pid,
+                        label: format!("e{i}"),
+                    },
+                ),
+            };
+            let fpid = PersistentId::derive(
+                &[solid_pid, base_edge_pid],
+                "revolve",
+                &Role::RevolveBand { base_edge_pid },
+            );
+            model.set_face_pid(face_id, fpid);
+        }
+    }
+
     // Self-check: a valid, closed, manifold, watertight solid — else Err → rollback.
     let v = crate::primitives::validation::validate_solid_scoped(
         model,
