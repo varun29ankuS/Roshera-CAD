@@ -101,10 +101,24 @@ pub fn visible_dimensions(
     projection: ProjectionType,
     min_span: f64,
 ) -> Vec<Dimension2d> {
-    auto_dimensions(model, solid_id, projection)
+    let mut dims: Vec<Dimension2d> = auto_dimensions(model, solid_id, projection)
         .into_iter()
         .filter(|d| d.kind == "angle" || d.projected_span() >= min_span)
-        .collect()
+        .collect();
+    // Drawing convention: a linear dimension shows just its value — strip the
+    // analytic axis tag ("X 80.00" → "80.00"). Ø (diameter), R (radius) and
+    // ∠ (angle) prefixes are kept; they are not axis tags.
+    for d in &mut dims {
+        let first = d.label.chars().next();
+        if matches!(first, Some(c) if c.is_ascii_uppercase() && c != 'R') {
+            if let Some(rest) = d.label.strip_prefix(|c: char| c.is_ascii_uppercase()) {
+                if let Some(num) = rest.strip_prefix(' ') {
+                    d.label = num.to_string();
+                }
+            }
+        }
+    }
+    dims
 }
 
 /// Assemble a standard third-angle engineering drawing — Front, Top, Right —
@@ -200,6 +214,8 @@ fn build_hlr_view(
     let edges = project_solid_edges_visibility(model, solid_id, proj, DEFAULT_CURVE_SAMPLES)?;
     view.polylines = edges.visible;
     view.hidden_polylines = edges.hidden;
+    view.circles = edges.circles;
+    view.hidden_circles = edges.hidden_circles;
     view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
     view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
     Ok(view)
@@ -269,8 +285,10 @@ fn layout_four_view(
     // the title-block band along the bottom, then center the group.
     const PAD_LEFT: f64 = 22.0;
     const PAD_BOTTOM: f64 = 18.0;
-    const VGAP: f64 = 16.0;
-    const HGAP: f64 = 26.0;
+    // VGAP must clear the upper view's BELOW dimension band (~22 mm) plus the
+    // lower view's title (~6 mm); HGAP clears the right column's LEFT dims.
+    const VGAP: f64 = 32.0;
+    const HGAP: f64 = 30.0;
 
     let avail_x0 = ml + PAD_LEFT;
     let avail_x1 = w - mr;

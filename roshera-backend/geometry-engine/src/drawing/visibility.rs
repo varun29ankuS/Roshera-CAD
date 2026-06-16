@@ -25,11 +25,46 @@ use super::projection::{view_matrix_for_projection, ProjectionError};
 use super::types::{Polyline2d, ProjectionType};
 
 /// The edges of a view split by visibility. `visible` draws solid; `hidden`
-/// draws dashed.
+/// draws dashed. Closed circular edges that project to a TRUE circle are split
+/// out as analytic `circles` / `hidden_circles` (rendered as exact SVG
+/// circles, not faceted polylines).
 #[derive(Debug, Clone)]
 pub struct ViewEdges {
     pub visible: Vec<Polyline2d>,
     pub hidden: Vec<Polyline2d>,
+    pub circles: Vec<super::types::ProjectedCircle>,
+    pub hidden_circles: Vec<super::types::ProjectedCircle>,
+}
+
+/// `(center3d, unit normal, radius)` if `curve` lies on a circle (a full
+/// Circle or an Arc — a boolean often fragments a rim into several co-circular
+/// arc-edges, which we regroup downstream into one drawn circle).
+fn circular_geom(curve: &dyn crate::primitives::curve::Curve) -> Option<(Point3, Vector3, f64)> {
+    if let Some(c) = curve
+        .as_any()
+        .downcast_ref::<crate::primitives::curve::Circle>()
+    {
+        return Some((c.center(), c.normal(), c.radius()));
+    }
+    if let Some(a) = curve
+        .as_any()
+        .downcast_ref::<crate::primitives::curve::Arc>()
+    {
+        return Some((a.center, a.normal, a.radius));
+    }
+    None
+}
+
+/// Accumulates co-circular arc-edges of one rim so the whole circle is drawn
+/// once. `all_visible`/`all_hidden` stay true only while every arc is uniformly
+/// that; a genuinely mixed rim falls back to its per-arc `fallback` polylines.
+struct CircleGroup {
+    cx: f64,
+    cy: f64,
+    r: f64,
+    all_visible: bool,
+    all_hidden: bool,
+    fallback: Vec<(bool, Polyline2d)>,
 }
 
 /// Into-scene view direction (unit) for a projection: the third row of the
@@ -163,7 +198,13 @@ pub fn project_solid_edges_visibility(
     let mut out = ViewEdges {
         visible: Vec::new(),
         hidden: Vec::new(),
+        circles: Vec::new(),
+        hidden_circles: Vec::new(),
     };
+    // Co-circular arc-edges of each camera-facing rim, keyed by quantised
+    // (centre, radius), regrouped after the edge walk into one drawn circle.
+    let mut circle_groups: std::collections::HashMap<(i64, i64, i64, i64), CircleGroup> =
+        std::collections::HashMap::new();
 
     // All shells (outer + inner), so a bore's own walls are classified too.
     let mut shell_ids = vec![solid.outer_shell];
@@ -246,6 +287,51 @@ pub fn project_solid_edges_visibility(
                         }
                     }
 
+                    // Analytic circle: a circular arc-edge whose circle plane
+                    // faces the camera (normal ∥ view dir) projects, under the
+                    // orthonormal view matrix, to a TRUE circle of the same
+                    // radius at the projected centre. A boolean fragments a rim
+                    // into several co-circular arcs, so accumulate them by
+                    // (centre, radius) and draw ONE circle once the rim is whole
+                    // and uniformly visible/hidden. The per-arc polylines are
+                    // kept as the fallback for a genuinely mixed rim.
+                    if let Some((c3, nrm, r)) = circular_geom(curve) {
+                        let faces_camera =
+                            nrm.normalize().map(|u| u.dot(&w).abs()).unwrap_or(0.0) > 0.99;
+                        if faces_camera && !runs.is_empty() {
+                            let c2 = vm.transform_point(&c3);
+                            // Key on the 3D centre so the two coincident rims of
+                            // a through-hole (same projected circle, different
+                            // depth + visibility) stay SEPARATE groups — the
+                            // near rim draws solid, the far rim dashed.
+                            let key = (
+                                (c3.x * 1e3).round() as i64,
+                                (c3.y * 1e3).round() as i64,
+                                (c3.z * 1e3).round() as i64,
+                                (r * 1e3).round() as i64,
+                            );
+                            let g = circle_groups.entry(key).or_insert(CircleGroup {
+                                cx: c2.x,
+                                cy: c2.y,
+                                r,
+                                all_visible: true,
+                                all_hidden: true,
+                                fallback: Vec::new(),
+                            });
+                            let arc_vis = runs.iter().all(|(v, _)| *v);
+                            let arc_hid = runs.iter().all(|(v, _)| !*v);
+                            g.all_visible &= arc_vis;
+                            g.all_hidden &= arc_hid;
+                            for (vis, pts) in &runs {
+                                let pl = Polyline2d::from_points(pts.clone());
+                                if pl.points.len() >= 2 {
+                                    g.fallback.push((*vis, pl));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     for (visible, pts) in runs {
                         let pl = Polyline2d::from_points(pts);
                         if pl.points.len() < 2 {
@@ -257,6 +343,29 @@ pub fn project_solid_edges_visibility(
                             out.hidden.push(pl);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Flush the accumulated rims: a whole, uniformly-visible (or -hidden) rim
+    // draws as ONE true circle; a genuinely mixed rim falls back to its arcs.
+    for g in circle_groups.into_values() {
+        let circ = super::types::ProjectedCircle {
+            cx: g.cx,
+            cy: g.cy,
+            r: g.r,
+        };
+        if g.all_visible {
+            out.circles.push(circ);
+        } else if g.all_hidden {
+            out.hidden_circles.push(circ);
+        } else {
+            for (vis, pl) in g.fallback {
+                if vis {
+                    out.visible.push(pl);
+                } else {
+                    out.hidden.push(pl);
                 }
             }
         }

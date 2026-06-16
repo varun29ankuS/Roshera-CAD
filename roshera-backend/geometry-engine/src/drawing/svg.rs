@@ -119,6 +119,12 @@ fn write_stylesheet(out: &mut String) {
         "    .view polyline.hidden { fill: none; stroke: #111; stroke-width: 0.18; \
          stroke-dasharray: 2 1.2; stroke-linejoin: round; stroke-linecap: butt; }\n",
     );
+    // Analytic circles — same visible/hidden styling as the edge polylines.
+    out.push_str("    .view circle { fill: none; stroke: #111; stroke-width: 0.2; }\n");
+    out.push_str(
+        "    .view circle.hidden { fill: none; stroke: #111; stroke-width: 0.18; \
+         stroke-dasharray: 2 1.2; }\n",
+    );
     // Centerline: thin chain (dash-dot) line, ISO 128 convention.
     out.push_str(
         "    .centerline { stroke: #111; stroke-width: 0.18; fill: none; \
@@ -253,6 +259,24 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
             let _ = write!(out, "{:.4},{:.4}", p[0], p[1]);
         }
         out.push_str("\" />\n");
+    }
+
+    // Analytic circles — true SVG circles (a circular edge facing the camera),
+    // not faceted polylines. Drawn in the same scaled/flipped view group as the
+    // polylines so the radius and centre scale identically.
+    for c in &view.circles {
+        let _ = write!(
+            out,
+            "    <circle cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\" />\n",
+            c.cx, c.cy, c.r
+        );
+    }
+    for c in &view.hidden_circles {
+        let _ = write!(
+            out,
+            "    <circle class=\"hidden\" cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\" />\n",
+            c.cx, c.cy, c.r
+        );
     }
 
     // Occluded edges, dashed (hidden-line removal). Drawn after the visible
