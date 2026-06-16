@@ -561,6 +561,27 @@ fn tessellate_planar_face(
             .unwrap_or(Vector3::Z)
     };
 
+    // ANNULUS FAST PATH. A planar face bounded by an outer circle and a single
+    // CONCENTRIC inner circle (the washer caps an analytic revolve emits) is a
+    // degenerate case for the general hole-CDT: it produces a chevron/herringbone
+    // mesh and — because the `cdt` crate classifies holes by nesting and the two
+    // circles confuse it — fills part of the bore with spanning triangles. Detect
+    // it and triangulate directly as a clean radial strip between the two rings.
+    if let Some(tris) = annulus_radial_strip(&all_vertices, &loop_boundaries, &normal) {
+        let mut vertex_map = Vec::with_capacity(all_vertices.len());
+        for vertex in &all_vertices {
+            vertex_map.push(mesh.add_vertex(MeshVertex {
+                position: *vertex,
+                normal,
+                uv: None,
+            }));
+        }
+        for t in tris {
+            mesh.add_triangle(vertex_map[t[0]], vertex_map[t[1]], vertex_map[t[2]]);
+        }
+        return;
+    }
+
     // Triangulate. We unify the hole-free and holed cases on a single
     // bridged-ear-clipping algorithm:
     //
@@ -887,6 +908,101 @@ pub(crate) fn triangulate_planar_polygon(
             Vec::new()
         }
     }
+}
+
+/// Triangulate a CONCENTRIC-CIRCLE ANNULUS (one outer ring + one inner ring) as a
+/// clean radial strip between the two rings — well-conditioned triangles, no
+/// chevron seam, the bore left correctly empty. Returns `None` unless the face is
+/// exactly such an annulus (the caller then falls back to the general CDT). The
+/// rings are sampled CCW from a common seam, so they are stitched by fractional
+/// position around the circle (handling unequal sample counts) into `n + m`
+/// triangles, each oriented to the face `normal`. Indices are into `vertices`.
+fn annulus_radial_strip(
+    vertices: &[Point3],
+    loop_boundaries: &[(usize, usize, bool)],
+    normal: &Vector3,
+) -> Option<Vec<[usize; 3]>> {
+    // Exactly one outer ring + one inner ring, each with ≥3 samples.
+    let mut outer: Option<(usize, usize)> = None;
+    let mut inner: Option<(usize, usize)> = None;
+    for &(s, e, is_outer) in loop_boundaries {
+        if e - s < 3 {
+            return None;
+        }
+        if is_outer {
+            if outer.replace((s, e)).is_some() {
+                return None;
+            }
+        } else if inner.replace((s, e)).is_some() {
+            return None;
+        }
+    }
+    let (os, oe) = outer?;
+    let (is_, ie) = inner?;
+
+    let centroid = |s: usize, e: usize| -> Point3 {
+        let mut c = Vector3::ZERO;
+        for p in &vertices[s..e] {
+            c = c + Vector3::new(p.x, p.y, p.z);
+        }
+        let c = c * (1.0 / (e - s) as f64);
+        Point3::new(c.x, c.y, c.z)
+    };
+    // Mean radius if the ring is circular (max deviation < 2% of mean), else None.
+    let circular = |s: usize, e: usize, c: Point3| -> Option<f64> {
+        let rs: Vec<f64> = vertices[s..e]
+            .iter()
+            .map(|p| (*p - c).magnitude())
+            .collect();
+        let mean = rs.iter().sum::<f64>() / rs.len() as f64;
+        if mean < 1e-9 {
+            return None;
+        }
+        let maxdev = rs.iter().map(|r| (r - mean).abs()).fold(0.0_f64, f64::max);
+        if maxdev > mean * 0.02 {
+            return None;
+        }
+        Some(mean)
+    };
+    let oc = centroid(os, oe);
+    let ic = centroid(is_, ie);
+    let or = circular(os, oe, oc)?;
+    let ir = circular(is_, ie, ic)?;
+    if (oc - ic).magnitude() > or.min(ir) * 0.02 || ir >= or {
+        return None; // not concentric, or inner is not the smaller ring
+    }
+
+    let n = oe - os;
+    let m = ie - is_;
+    let oidx = |k: usize| os + (k % n);
+    let iidx = |k: usize| is_ + (k % m);
+    let mut tris: Vec<[usize; 3]> = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0usize, 0usize);
+    for _ in 0..(n + m) {
+        let advance_outer = if i == n {
+            false
+        } else if j == m {
+            true
+        } else {
+            (i as f64 / n as f64) <= (j as f64 / m as f64)
+        };
+        let (a, b, c) = if advance_outer {
+            let t = (oidx(i), oidx(i + 1), iidx(j));
+            i += 1;
+            t
+        } else {
+            let t = (oidx(i), iidx(j + 1), iidx(j));
+            j += 1;
+            t
+        };
+        let gn = (vertices[b] - vertices[a]).cross(&(vertices[c] - vertices[a]));
+        if gn.dot(normal) >= 0.0 {
+            tris.push([a, b, c]);
+        } else {
+            tris.push([a, c, b]);
+        }
+    }
+    Some(tris)
 }
 
 /// Signed area of a polygon described by indices into `vertices_2d`.
