@@ -1,15 +1,24 @@
 # #19 — Revolve emits analytic bands (implementation plan)
 
-Diagnosed + designed 2026-06-15. **IMPLEMENTED + verified sound, then reverted —
-BLOCKED ON tessellator #21.** The analytic-band construction below was built and
-proven zero-regression (a watertight self-check + `with_rollback` falls back to
-the per-segment path on any failure; revolve_watertight stayed 7/7). But the
-analytic faces NEVER ship: a tube's annular Plane caps and Cylinder walls share
-ring circle edges that tessellate at mismatched densities (planar path vs
-curved-CDT) → mesh gaps at coarse deflection → the self-check rolls every revolve
-back. That mesh mismatch is tessellator task #21. Re-apply this design verbatim
-once #21 lands (it's known-correct; cylinder + annular-plane bands worked, cones
-are a v2 with the cone_axis=-axis u-direction caveat).
+**v1 SHIPPED 2026-06-16 (commit 5ce82b0).** Cylinder walls + annular Plane caps,
+one analytic face per band; 48-seg tube = 4 faces not 192. `try_analytic_band_
+revolution` + `build_analytic_bands` in revolve.rs, wired at the top of
+`create_revolution`. Self-verifying (validate_solid_scoped + manifold_report
+inside a nested `with_rollback`) → grid fallback on any failure (zero regression).
+Gates green: revolve_analytic_faces 2/2, section_revolve tube x/y 2/2 (unblocked
+#9), revolve_watertight 7/7, revolve_volume 14/14.
+
+**The "#21 tessellator block" was a MISDIAGNOSIS.** The prior attempt was reverted
+believing annular-Plane + Cylinder shared circle edges tessellate at mismatched
+densities. The primitive watertightness battery (tests/primitive_tess_watertight.rs)
+DISPROVED that — a planar face sharing a circle edge with a curved face is
+watertight. The real prior bug was almost certainly each band getting its OWN
+circle copy (different EdgeIds → the cache samples them independently → gaps). v1
+fixes it by sharing ONE circle EdgeId per ring (mirrors create_cylinder_topology).
+
+**v2 REMAINING:** cone bands (sloped edges → `create_frustum_topology`-style
+Cone band) + disc/apex bands (a profile vertex ON the axis → a real disc cap, not
+the v1 sliver-cylinder). Both currently fall back to the watertight grid path.
 
 ## Problem
 `create_revolution` (revolve.rs:174) builds one face per **(profile-edge ×
