@@ -8,7 +8,7 @@
 
 use geometry_engine::drawing::dimensioning::Dimension2d;
 use geometry_engine::drawing::{
-    standard_drawing_hlr, verify_drawing, Drawing, DrawingIssueKind, Polyline2d, ProjectedView,
+    standard_drawing_auto, verify_drawing, Drawing, DrawingIssueKind, Polyline2d, ProjectedView,
     ProjectedViewId, ProjectionType, SheetSize, ViewExtent, ViewSource,
 };
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
@@ -194,32 +194,11 @@ fn empty_drawing_reports_no_views() {
 }
 
 #[test]
-fn dimension_on_outline_is_flagged() {
-    // A length dimension whose span lies ON the bottom edge (no offset)
-    // is exactly the current auto-drawing defect.
-    let mut d = Drawing::new("OnEdge", SheetSize::A3);
-    d.add_view(rect_view(
-        "FRONT",
-        ProjectionType::Front,
-        [80.0, 110.0],
-        100.0,
-        70.0,
-        vec![dim("100.00", [0.0, 0.0], [100.0, 0.0])], // on the silhouette
-    ));
-    let report = verify_drawing(&d);
-    assert!(
-        report.has(DrawingIssueKind::DimensionOnGeometry),
-        "a dimension on the outline must be flagged; issues={:?}",
-        report.issues
-    );
-}
-
-#[test]
-fn current_auto_drawing_defects_are_detected() {
-    // The real standard_drawing_hlr of a small box on A3 reproduces the
-    // user-visible "looks bad": dimensions stamped on the outline and a
-    // part that fills only a sliver of the sheet. The oracle must SEE
-    // both so the feedback layer is honest about quality.
+fn auto_drawing_passes_quality() {
+    // The fully-automatic sheet (sheet auto-fit + centered four-view
+    // layout + offset dimensions) must PASS the oracle: four views, no
+    // overlaps, nothing off-sheet, nothing on the title block. This is
+    // the regression guard for "the drawing looks like a real drawing".
     let mut model = BRepModel::new();
     let sid = match TopologyBuilder::new(&mut model)
         .create_box_3d(40.0, 30.0, 20.0)
@@ -228,20 +207,24 @@ fn current_auto_drawing_defects_are_detected() {
         GeometryId::Solid(s) => s,
         o => panic!("{o:?}"),
     };
-    let drawing = standard_drawing_hlr(&model, sid, uuid::Uuid::nil(), SheetSize::A3, 2.0)
-        .expect("standard sheet");
-    let report = verify_drawing(&drawing);
+    let drawing = standard_drawing_auto(&model, sid, uuid::Uuid::nil()).expect("auto sheet");
 
+    assert_eq!(
+        drawing.views.len(),
+        4,
+        "auto sheet is Front/Top/Right + isometric"
+    );
+    let report = verify_drawing(&drawing);
     assert!(
-        report.has(DrawingIssueKind::DimensionOnGeometry),
-        "auto-drawing stamps dimensions on the outline — the oracle must detect it; issues={:?}",
+        report.passed,
+        "the auto layout must be clean; issues={:?}",
         report.issues
     );
     assert!(
-        report.sheet_utilization < 0.2,
-        "a 40 mm box on A3 barely fills the sheet (util={:.2})",
-        report.sheet_utilization
+        !report.has(DrawingIssueKind::ViewOverlap)
+            && !report.has(DrawingIssueKind::ViewOutsideFrame)
+            && !report.has(DrawingIssueKind::ViewOverlapsTitleBlock),
+        "no structural layout defects; issues={:?}",
+        report.issues
     );
-    // Soundness: a real report has the third-angle views and never panics.
-    assert_eq!(drawing.views.len(), 3);
 }

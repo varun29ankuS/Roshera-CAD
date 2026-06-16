@@ -158,9 +158,7 @@ pub fn standard_drawing_hlr(
     sheet: super::types::SheetSize,
     scale: f64,
 ) -> Result<super::types::Drawing, super::projection::ProjectionError> {
-    use super::projection::{project_solid_view, DEFAULT_CURVE_SAMPLES};
     use super::types::{Drawing, ViewSource};
-    use super::visibility::project_solid_edges_visibility;
 
     let mut drawing = Drawing::new("Auto Drawing (HLR)", sheet);
     let source = ViewSource::Part {
@@ -174,14 +172,241 @@ pub fn standard_drawing_hlr(
     ];
     let min_span = 0.5_f64;
     for (proj, name, pos) in layout {
-        // Start from the wireframe view (gives extent + placement), then replace
-        // its edges with the visibility split.
-        let mut view = project_solid_view(model, source.clone(), proj, name, pos, scale)?;
-        let edges = project_solid_edges_visibility(model, solid_id, proj, DEFAULT_CURVE_SAMPLES)?;
-        view.polylines = edges.visible;
-        view.hidden_polylines = edges.hidden;
-        view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
-        view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
+        drawing.add_view(build_hlr_view(
+            model, solid_id, source, proj, name, pos, scale, min_span,
+        )?);
+    }
+    Ok(drawing)
+}
+
+/// Build one HLR view: wireframe (for extent + placement), edges split
+/// into visible / hidden by the raytrace eye, plus auto dimensions and
+/// centerlines. Shared by [`standard_drawing_hlr`] and
+/// [`standard_drawing_auto`].
+fn build_hlr_view(
+    model: &BRepModel,
+    solid_id: SolidId,
+    source: super::types::ViewSource,
+    proj: ProjectionType,
+    name: &str,
+    pos: [f64; 2],
+    scale: f64,
+    min_span: f64,
+) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
+    use super::projection::{project_solid_view, DEFAULT_CURVE_SAMPLES};
+    use super::visibility::project_solid_edges_visibility;
+
+    let mut view = project_solid_view(model, source, proj, name, pos, scale)?;
+    let edges = project_solid_edges_visibility(model, solid_id, proj, DEFAULT_CURVE_SAMPLES)?;
+    view.polylines = edges.visible;
+    view.hidden_polylines = edges.hidden;
+    view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
+    view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
+    Ok(view)
+}
+
+/// Snap a fill scale down to the nearest preferred drafting ratio so the
+/// title block reads a clean "2:1" / "1:2" rather than "2.37:1".
+fn snap_scale(s: f64) -> f64 {
+    const LADDER: [f64; 21] = [
+        100.0, 50.0, 20.0, 10.0, 5.0, 4.0, 2.5, 2.0, 1.5, 1.0, 0.75, 0.5, 0.4, 0.25, 0.2, 0.1,
+        0.08, 0.05, 0.04, 0.02, 0.01,
+    ];
+    for &v in LADDER.iter() {
+        if s >= v - 1e-9 {
+            return v;
+        }
+    }
+    s.max(0.005)
+}
+
+/// Pick the smallest ISO sheet whose drawing area comfortably suits a
+/// part of the given largest dimension (mm), matching common drafting
+/// practice (small parts on A4, growing to A0). The fill scale then sizes
+/// the part within the chosen sheet.
+fn pick_sheet(max_dim: f64) -> super::types::SheetSize {
+    use super::types::SheetSize::*;
+    if max_dim <= 90.0 {
+        A4
+    } else if max_dim <= 180.0 {
+        A3
+    } else if max_dim <= 360.0 {
+        A2
+    } else if max_dim <= 700.0 {
+        A1
+    } else {
+        A0
+    }
+}
+
+/// Compute the fill scale and a CENTERED 2×2 placement for the standard
+/// four-view sheet:
+///
+/// ```text
+///   TOP    ISO
+///   FRONT  RIGHT
+/// ```
+///
+/// Top is directly above Front (shared centre-x), Right is level with
+/// Front (shared centre-y) — proper third angle — and the isometric
+/// pictorial fills the otherwise-empty top-right quadrant. Each view is
+/// centred in its grid cell; the group is centred in the drawing area
+/// with room reserved for dimensions. Returns `(scale, [front, top,
+/// right, iso] position_mm)`.
+fn layout_four_view(
+    sheet: &super::types::SheetSize,
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+) -> (f64, [[f64; 2]; 4]) {
+    let w = sheet.width();
+    let h = sheet.height();
+    let (ml, mr, mt, mb) = super::svg::frame_margins(sheet);
+    let (_tb_w, tb_h) = super::svg::title_block_size(sheet);
+
+    // Reserve dimension room on the left + bottom + between columns, and
+    // the title-block band along the bottom, then center the group.
+    const PAD_LEFT: f64 = 22.0;
+    const PAD_BOTTOM: f64 = 18.0;
+    const VGAP: f64 = 16.0;
+    const HGAP: f64 = 26.0;
+
+    let avail_x0 = ml + PAD_LEFT;
+    let avail_x1 = w - mr;
+    let avail_y0 = mt;
+    let avail_y1 = h - mb - tb_h - PAD_BOTTOM;
+    let avail_w = (avail_x1 - avail_x0).max(10.0);
+    let avail_h = (avail_y1 - avail_y0).max(10.0);
+
+    let (fw, fh) = (fe.width(), fe.height());
+    let (tw, th) = (te.width(), te.height());
+    let (rw, rh) = (re.width(), re.height());
+    let (iw, ih) = (ie.width(), ie.height());
+
+    // Left column = max(Front, Top) width; right column = max(Right, Iso).
+    // Top row height = max(Top, Iso); bottom row = max(Front, Right).
+    let left_w = fw.max(tw);
+    let right_w = rw.max(iw);
+    let top_h = th.max(ih);
+    let bot_h = fh.max(rh);
+
+    let unit_w = (left_w + right_w).max(1e-6);
+    let unit_h = (top_h + bot_h).max(1e-6);
+    let s_w = (avail_w - HGAP) / unit_w;
+    let s_h = (avail_h - VGAP) / unit_h;
+    let mut scale = 0.9 * s_w.min(s_h);
+    if !scale.is_finite() || scale <= 0.0 {
+        scale = 1.0;
+    }
+    scale = snap_scale(scale);
+
+    let lw = left_w * scale;
+    let rwc = right_w * scale;
+    let trh = top_h * scale;
+    let brh = bot_h * scale;
+    let g_w = lw + HGAP + rwc;
+    let g_h = trh + VGAP + brh;
+    let gx = avail_x0 + 0.5 * (avail_w - g_w);
+    let gy = avail_y0 + 0.5 * (avail_h - g_h);
+
+    // Cell origins (top-left, sheet coords y down).
+    let left_cx = gx + 0.5 * lw;
+    let right_cx = gx + lw + HGAP + 0.5 * rwc;
+    let top_cy = gy + 0.5 * trh;
+    let bot_cy = gy + trh + VGAP + 0.5 * brh;
+
+    // A view of extent `e` centred on (cx, cy): top-left at
+    // (cx − e.w·s/2, cy − e.h·s/2).
+    let place = |cx: f64, cy: f64, e: super::types::ViewExtent| -> [f64; 2] {
+        let xtl = cx - 0.5 * e.width() * scale;
+        let ytl = cy - 0.5 * e.height() * scale;
+        // Invert the render transform: sheet_x = pos.x + min_x·s,
+        // sheet_y_top = (h − pos.y) − max_y·s.
+        [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
+    };
+    (
+        scale,
+        [
+            place(left_cx, bot_cy, fe),  // FRONT  (bottom-left)
+            place(left_cx, top_cy, te),  // TOP    (top-left)
+            place(right_cx, bot_cy, re), // RIGHT  (bottom-right)
+            place(right_cx, top_cy, ie), // ISO    (top-right)
+        ],
+    )
+}
+
+/// Fully automatic standard drawing: picks the sheet size and fill scale
+/// from the part's size, lays the three third-angle views out CENTERED in
+/// the drawing area with room for dimensions, and renders them with HLR +
+/// auto dimensions + centerlines. This is what "right-click → drawing"
+/// uses so a small part fills a small sheet instead of floating in a
+/// corner of an oversized one.
+pub fn standard_drawing_auto(
+    model: &BRepModel,
+    solid_id: SolidId,
+    part_uuid: uuid::Uuid,
+) -> Result<super::types::Drawing, super::projection::ProjectionError> {
+    use super::types::{Drawing, ViewSource};
+
+    let source = ViewSource::Part {
+        part_id: part_uuid,
+        solid_id,
+    };
+    let min_span = 0.5_f64;
+    // Order matches `layout_four_view`'s returned positions:
+    // [Front, Top, Right, Iso]. Only the orthographic views are
+    // dimensioned; the isometric is a clean pictorial reference.
+    let specs = [
+        (ProjectionType::Front, "FRONT", true),
+        (ProjectionType::Top, "TOP", true),
+        (ProjectionType::Right, "RIGHT", true),
+        (ProjectionType::Isometric, "ISOMETRIC", false),
+    ];
+
+    // Pass 1 — unit-scale extents to drive sheet + scale + placement. The
+    // sheet size keys off the ORTHOGRAPHIC max dimension (true part size),
+    // not the larger isometric silhouette.
+    let mut extents = Vec::with_capacity(4);
+    for (proj, name, _) in specs {
+        let v = build_hlr_view(
+            model,
+            solid_id,
+            source,
+            proj,
+            name,
+            [0.0, 0.0],
+            1.0,
+            min_span,
+        )?;
+        extents.push(v.extent);
+    }
+    let max_dim = extents
+        .iter()
+        .take(3)
+        .map(|e| e.width().max(e.height()))
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let sheet = pick_sheet(max_dim);
+    let (scale, positions) =
+        layout_four_view(&sheet, extents[0], extents[1], extents[2], extents[3]);
+
+    // Pass 2 — build the placed, scaled views.
+    let mut drawing = Drawing::new("Auto Drawing", sheet);
+    for (i, (proj, name, dimensioned)) in specs.iter().enumerate() {
+        let mut view = build_hlr_view(
+            model,
+            solid_id,
+            source,
+            *proj,
+            name,
+            positions[i],
+            scale,
+            min_span,
+        )?;
+        if !dimensioned {
+            view.dimensions.clear();
+        }
         drawing.add_view(view);
     }
     Ok(drawing)
@@ -268,9 +493,11 @@ mod tests {
             "every view auto-dimensioned"
         );
         let svg = crate::drawing::render_drawing_svg(&dwg);
-        // The drawing carries the dimension lines (red) and the EXACT values —
-        // 40 / 30 / 20 each read in the view that reveals them.
-        assert!(svg.contains("#cc3300"), "dimension lines rendered");
+        // The drawing carries ISO dimension lines (offset, with arrowheads)
+        // and the EXACT values — 40 / 30 / 20 each read in the view that
+        // reveals them.
+        assert!(svg.contains("dim-line"), "dimension lines rendered");
+        assert!(svg.contains("dim-arrow"), "dimension arrowheads rendered");
         assert!(svg.contains("40.00"), "40mm extent value drawn");
         assert!(svg.contains("30.00"), "30mm extent value drawn");
         assert!(svg.contains("20.00"), "20mm extent value drawn");
