@@ -674,8 +674,13 @@ fn build_analytic_bands(
             let mut lp = Loop::new(0, LoopType::Outer);
             lp.add_edge(ring_edge[&outer_v], true);
             let lp_id = model.loops.add(lp);
+            // The hole loop must wind OPPOSITE the outer boundary, or the planar
+            // CDT does not subtract it and fills part of the bore with a spanning
+            // triangle (a visible scar on revolved washers). Both ring circles
+            // are parameterised the same way (CCW from +axis), so traverse the
+            // inner one BACKWARD to make it CW relative to the outer.
             let mut inner = Loop::new(0, LoopType::Inner);
-            inner.add_edge(ring_edge[&inner_v], true);
+            inner.add_edge(ring_edge[&inner_v], false);
             let inner_id = model.loops.add(inner);
 
             // Plane outward0 is constant ±axis over the whole face → sample midpoint.

@@ -156,3 +156,55 @@ fn open_washer_is_four_analytic_faces_19() {
     assert_eq!(count(&k, SurfaceType::Cylinder), 2);
     assert_eq!(count(&k, SurfaceType::Plane), 2);
 }
+
+/// The annular-cap hole must be SUBTRACTED, not filled. A hole loop wound the
+/// same way as its outer boundary makes the planar CDT fill part of the bore
+/// with a spanning triangle — a visible scar on a revolved washer. The bore of a
+/// hollow revolve is empty, so NO tessellation triangle may cover the axis; a
+/// hole-spanning triangle is exactly one whose xy-projection contains the origin.
+#[test]
+fn revolved_bushing_bore_is_not_filled() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let mut m = BRepModel::new();
+    // Hollow flanged stepped bushing, bore radius 12 about +Z.
+    let s = revolve(
+        &mut m,
+        &[
+            (12.0, 0.0),
+            (40.0, 0.0),
+            (40.0, 8.0),
+            (22.0, 8.0),
+            (22.0, 30.0),
+            (16.0, 50.0),
+            (12.0, 50.0),
+        ],
+        64,
+    );
+    let solid = m.solids.get(s).expect("solid");
+    let mesh = tessellate_solid(solid, &m, &TessellationParams::default());
+
+    // 2D (xy) point-in-triangle for the origin: origin is inside iff the three
+    // edge cross-products share a sign. Slivers of the bore wall project to thin
+    // triangles near radius 12 (far from the axis) and never contain the origin.
+    let edge_sign = |p: Point3, q: Point3| (q.x - p.x) * (-p.y) - (q.y - p.y) * (-p.x);
+    let mut covering = 0usize;
+    for tri in &mesh.triangles {
+        let a = mesh.vertices[tri[0] as usize].position;
+        let b = mesh.vertices[tri[1] as usize].position;
+        let c = mesh.vertices[tri[2] as usize].position;
+        let (d1, d2, d3) = (edge_sign(a, b), edge_sign(b, c), edge_sign(c, a));
+        if d1.abs() < 1e-9 && d2.abs() < 1e-9 && d3.abs() < 1e-9 {
+            continue; // degenerate projection
+        }
+        let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+        let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+        if !(has_neg && has_pos) {
+            covering += 1;
+        }
+    }
+    assert_eq!(
+        covering, 0,
+        "{covering} tessellation triangle(s) cover the axis — the bore is filled"
+    );
+}
