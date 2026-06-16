@@ -439,6 +439,34 @@ residual on this config) and chained bores on an already-open solid compound it.
 Task #65. LESSON for the agent/MCP: prefer sketch-region extrude for plates-with-
 holes over boolean subtraction.
 
+**RE-CHARACTERISED 2026-06-16 (interpenetrating boss, NOT coincident): it is a
+DISPLAY-tessellation artifact, the part is SOUND.** Repro: plate 120×80×16 ∪
+coaxial analytic cylinder boss (r26 h45, INTERPENETRATING — bottom buried inside
+the plate, no coincident face). Three independent reads on the SAME solid:
+- `validate_solid_scoped` (B-Rep) → **valid=true** (mesh-independent).
+- `manifold_report(chord 0.5)` / `GET /perception` → **watertight=true, open=0,
+  nm=0**.
+- `GET /render?mode=diagnostic` (display tessellation, finer) → **nm=4**.
+So the union is correct; the 4 nm edges are T-junctions where the cylinder's
+developable-lateral display tessellation meets the plate's planar mesh at the
+pierce rim — the SAME class #84/#51 fixed (#58) for the flange, with a residual on
+this coaxial-boss config. The deep fix is shared-edge sampling at the seam (the
+#21/#24 lane). NOTE the original "open=12" reading was the COINCIDENT-face boss
+(#32/#65 family); the interpenetrating boss is open=0 / valid. LESSON RE-CONFIRMED:
+the diagnostic-render (display mesh) is NOT a sound validity oracle — it over-reports
+on tessellation T-junctions. Use `validate_solid_scoped` (B-Rep) + `/perception`.
+
+### EYE-SOUND 🟡 the agent-eye verdict judged the DISPLAY MESH, not the B-Rep
+The MCP `verify_part` + auto-`perceive()` computed `watertight = (open==0 ∧ nm==0)`
+from `GET /render?mode=diagnostic` — the DISPLAY tessellation. As #65 (re-char.)
+shows, that mesh over-reports tessellation T-junctions, so the eye reported BROKEN
+on geometry the B-Rep validator + `/perception` both call SOUND. A verifier that
+false-alarms is worse than none — it made the agent build blind past a clean step.
+FIX LANE: the eye's verdict must come from the SOUND channel
+(`GET /api/agent/parts/{id}/perception`: `valid` B-Rep + manifold_report), with the
+display open/nm demoted to a "mesh/display-quality" note. Backend `/perception`
+already exists and reports correctly; the fix is to route the MCP eye through it.
+
 ### #33 🟢 Offset/partial-overlap chained union invalid
 Fixed (line-extent classification).
 
