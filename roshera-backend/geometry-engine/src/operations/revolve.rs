@@ -506,7 +506,6 @@ fn try_analytic_band_revolution(
 ) -> OperationResult<Option<SolidId>> {
     let axis = options.axis_direction.normalize()?;
     let axis_origin = options.axis_origin;
-    let eps = 1e-7;
 
     if !base_face.inner_loops.is_empty() {
         return Ok(None);
@@ -540,18 +539,14 @@ fn try_analytic_band_revolution(
         prof.push((s, en));
     }
 
-    // Eligibility: every edge vertical (cylinder) or horizontal (plane); every
-    // radius > 1e-4 (annular caps, no apex/disc — those are v2).
+    // Eligibility: every profile vertex radius > 1e-4 (annular caps + finite
+    // cone/cylinder walls, no apex/disc — those remain grid fallback). Vertical
+    // edges → Cylinder, horizontal → annular Plane, sloped → Cone frustum.
     for &(s, en) in &prof {
-        let (_, r0, t0) = ring_geometry(model, s, axis_origin, axis)?;
-        let (_, r1, t1) = ring_geometry(model, en, axis_origin, axis)?;
+        let (_, r0, _) = ring_geometry(model, s, axis_origin, axis)?;
+        let (_, r1, _) = ring_geometry(model, en, axis_origin, axis)?;
         if r0 < 1e-4 || r1 < 1e-4 {
             return Ok(None);
-        }
-        let vertical = (r0 - r1).abs() < eps;
-        let horizontal = (t0 - t1).abs() < eps;
-        if !vertical && !horizontal {
-            return Ok(None); // sloped (cone) band → v2 fallback
         }
     }
 
@@ -643,7 +638,7 @@ fn build_analytic_bands(
     let mut faces: Vec<FaceId> = Vec::new();
     for &(s, en) in prof {
         let (c0, r0, t0) = ring_geo[&s];
-        let (c1, r1, _t1) = ring_geo[&en];
+        let (c1, r1, t1) = ring_geo[&en];
         let sp0 = model
             .vertices
             .get_position(s)
@@ -667,19 +662,72 @@ fn build_analytic_bands(
         };
 
         let vertical = (r0 - r1).abs() < eps;
-        if vertical {
-            // Cylinder wall: base at lower axial, height = |Δaxial|.
-            let (base_center, height) = if t0 <= ring_geo[&en].2 {
-                (c0, ring_geo[&en].2 - t0)
-            } else {
-                (c1, t0 - ring_geo[&en].2)
-            };
-            let mut cyl = Cylinder::new_finite(base_center, axis, r0, height)
-                .map_err(|e| OperationError::NumericalError(format!("revolve cylinder: {e}")))?;
-            cyl.ref_dir = ref_dir;
-            let surf_id = model.surfaces.add(Box::new(cyl));
+        let horizontal = (t0 - t1).abs() < eps;
 
-            // Seam meridian between the two ring seam vertices.
+        if horizontal {
+            // Annular plane cap at constant axial. Outer = larger-radius circle.
+            let (outer_v, inner_v) = if r0 >= r1 { (s, en) } else { (en, s) };
+            let plane = Plane::from_point_normal(c0, axis)
+                .map_err(|e| OperationError::NumericalError(format!("revolve plane: {e}")))?;
+            let surf_id = model.surfaces.add(Box::new(plane));
+
+            let mut lp = Loop::new(0, LoopType::Outer);
+            lp.add_edge(ring_edge[&outer_v], true);
+            let lp_id = model.loops.add(lp);
+            let mut inner = Loop::new(0, LoopType::Inner);
+            inner.add_edge(ring_edge[&inner_v], true);
+            let inner_id = model.loops.add(inner);
+
+            // Plane outward0 is constant ±axis over the whole face → sample midpoint.
+            let surf = model
+                .surfaces
+                .get(surf_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: plane surface".into()))?;
+            let orient = orient_face_for_outward(surf, outward0)?;
+            let mut f = Face::new(0, surf_id, lp_id, orient);
+            f.outer_loop = lp_id;
+            f.add_inner_loop(inner_id);
+            faces.push(model.faces.add(f));
+        } else {
+            // Periodic seam band: Cylinder (vertical edge) or Cone frustum
+            // (sloped edge). Both share the seam meridian + rectangular loop.
+            // Geometry uses the axial-ordered base ring; the loop/orientation use
+            // profile order (decoupled, same as the grid path).
+            let (base_c, base_r, top_c, top_r, height) = if t0 <= t1 {
+                (c0, r0, c1, r1, t1 - t0)
+            } else {
+                (c1, r1, c0, r0, t0 - t1)
+            };
+            let surf_id = if vertical {
+                let mut cyl = Cylinder::new_finite(base_c, axis, base_r, height).map_err(|e| {
+                    OperationError::NumericalError(format!("revolve cylinder: {e}"))
+                })?;
+                cyl.ref_dir = ref_dir;
+                model.surfaces.add(Box::new(cyl))
+            } else {
+                // Cone frustum band (mirrors create_frustum_topology) with the
+                // seam anchored to the shared ring ref_dir (cone-rim-seam-alignment).
+                let tan_half = (base_r - top_r).abs() / height;
+                let half_angle = tan_half.atan();
+                let (apex, cone_axis) = if base_r > top_r {
+                    (base_c + axis * (base_r / tan_half), -axis)
+                } else {
+                    (base_c - axis * (base_r / tan_half), axis)
+                };
+                let v_base_d = (base_c - apex).dot(&cone_axis);
+                let v_top_d = (top_c - apex).dot(&cone_axis);
+                let cone = crate::primitives::surface::Cone {
+                    apex,
+                    axis: cone_axis,
+                    half_angle,
+                    ref_dir,
+                    height_limits: Some([v_base_d.min(v_top_d), v_base_d.max(v_top_d)]),
+                    angle_limits: None,
+                };
+                model.surfaces.add(Box::new(cone))
+            };
+
+            // Seam meridian between the two ring seam vertices (profile order).
             let svs = model
                 .vertices
                 .get_position(ring_seamv[&s])
@@ -712,36 +760,13 @@ fn build_analytic_bands(
 
             // orient_face_for_outward samples u=π; rotate outward0 (at angle 0) there.
             let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
-            let surf = model.surfaces.get(surf_id).ok_or_else(|| {
-                OperationError::InvalidGeometry("revolve: cylinder surface".into())
-            })?;
-            let orient = orient_face_for_outward(surf, target)?;
-            let mut f = Face::new(0, surf_id, lp_id, orient);
-            f.outer_loop = lp_id;
-            faces.push(model.faces.add(f));
-        } else {
-            // Annular plane cap at constant axial. Outer = larger-radius circle.
-            let (outer_v, inner_v) = if r0 >= r1 { (s, en) } else { (en, s) };
-            let plane = Plane::from_point_normal(c0, axis)
-                .map_err(|e| OperationError::NumericalError(format!("revolve plane: {e}")))?;
-            let surf_id = model.surfaces.add(Box::new(plane));
-
-            let mut lp = Loop::new(0, LoopType::Outer);
-            lp.add_edge(ring_edge[&outer_v], true);
-            let lp_id = model.loops.add(lp);
-            let mut inner = Loop::new(0, LoopType::Inner);
-            inner.add_edge(ring_edge[&inner_v], true);
-            let inner_id = model.loops.add(inner);
-
-            // Plane outward0 is constant ±axis over the whole face → sample midpoint.
             let surf = model
                 .surfaces
                 .get(surf_id)
-                .ok_or_else(|| OperationError::InvalidGeometry("revolve: plane surface".into()))?;
-            let orient = orient_face_for_outward(surf, outward0)?;
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: band surface".into()))?;
+            let orient = orient_face_for_outward(surf, target)?;
             let mut f = Face::new(0, surf_id, lp_id, orient);
             f.outer_loop = lp_id;
-            f.add_inner_loop(inner_id);
             faces.push(model.faces.add(f));
         }
     }

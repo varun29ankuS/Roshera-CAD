@@ -119,6 +119,30 @@ fn tube_is_four_analytic_faces_19() {
 }
 
 #[test]
+fn frustum_tube_is_four_analytic_faces_19() {
+    // A hollow conical frustum (sloped outer + inner walls): outer cone
+    // (10,0)→(6,20), top annulus, inner cone (4,20)→(8,0), bottom annulus.
+    // Must be 2 Cone + 2 Plane analytic faces, not segments × SurfaceOfRevolution.
+    let mut m = BRepModel::new();
+    let s = revolve(
+        &mut m,
+        &[(10.0, 0.0), (6.0, 20.0), (4.0, 20.0), (8.0, 0.0)],
+        48,
+    );
+    let k = face_kinds(&m, s);
+    assert_eq!(k.len(), 4, "frustum tube must be 4 faces (kinds={k:?})");
+    assert_eq!(count(&k, SurfaceType::Cone), 2, "2 cone walls");
+    assert_eq!(count(&k, SurfaceType::Plane), 2, "2 annular plane caps");
+    assert_eq!(
+        count(&k, SurfaceType::SurfaceOfRevolution),
+        0,
+        "no faceted SurfaceOfRevolution patches"
+    );
+    let v = validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard);
+    assert!(v.is_valid, "frustum tube B-Rep invalid: {:?}", v.errors);
+}
+
+#[test]
 fn open_washer_is_four_analytic_faces_19() {
     // A flat washer (short tube): outer r20, inner r8, thin (z0..2). Still 4.
     let mut m = BRepModel::new();
