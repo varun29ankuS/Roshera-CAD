@@ -266,6 +266,27 @@ face's actual surface, or use GWN classification for the wall face), tying to th
 #41/#35 coaxial-bore family. Workaround to keep building: bore BEFORE the union,
 or keep features non-coaxial.
 
+**BOTH BUILD PATHS FAIL THIS CONFIG (2026-06-17, live + kernel), differently —
+so the root is the BOOLEAN coaxial-bore-through-a-tall-boss, not the primitive:**
+- EXTRUDE-path boss (MCP create_cylinder = sketch+extrude): boss OUTER wall
+  dropped → 300 open, B-Rep invalid, bbox z overshoots to the cutter top.
+- ANALYTIC boss (POST /api/geometry/cylinder = create_cylinder_3d): much closer —
+  mesh WATERTIGHT (open=0 nm=0) with CORRECT dims (120×120×50), boss wall PRESENT
+  — but the boss TOP cap is left a SOLID disc (the coaxial bore never opens it;
+  `ids` top = full Ø70 green disc, no Ø40 hole) ⇒ B-Rep `valid=false`. The bore
+  opened the base but not the boss top: the boss-top annular cap / the wall↔cap
+  imprint at the bore exit is missing. Same #35 corefinement signature (the two
+  coaxial walls' intersection not imprinted into both faces).
+- ALSO: tessellating the analytic version at FINE density panics the `cdt` crate
+  (triangulate.rs:1015) — the known #24 curved-CDT spanning-triangle panic.
+Kernel repro: `agent_build_eval::diag_bearing_housing_boss_wall` (#[ignore]) —
+base ∪ boss − coaxial bore; analytic gives valid? + watertight but the panic
+fires at fine tess. Fix lane = the #35/#41 coaxial corefinement (imprint the
+shared bore↔boss-wall intersection into BOTH faces; persist the boss-top annular
+hole), DEEP — same lane as the #27 chained-union work. NET for the agent: prefer
+the ANALYTIC cylinder primitive (watertight, wall kept) over extrude, and avoid
+bores that exit through a boss top until corefinement lands.
+
 ### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall
 Found live (ladder step 6, bearing housing). `plate ∪ analytic-cylinder boss`
 (r30, interpenetrating) is CLEAN (open=0). Differencing a COAXIAL analytic
