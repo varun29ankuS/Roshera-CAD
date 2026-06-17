@@ -329,9 +329,23 @@ function handleServerMessage(msg: ServerMessage) {
     }
     case 'SketchExtruded': {
       // The actual mesh arrives via `ObjectCreated` (broadcast just
-      // before this frame). Nothing to wire into the scene store yet —
-      // future timeline / chat hooks can attribute the new solid back
-      // to its sketch via `payload.sketch_id`.
+      // before this frame). Future timeline / chat hooks can attribute
+      // the new solid back to its sketch via `payload.sketch_id`.
+      //
+      // If the *local* user's active sketch is the one that just
+      // extruded, tear the overlay down: the profile has become a solid,
+      // so leaving the 2D loop on screen (and capturing pointer events
+      // behind the new body) is exactly the "sketch lingers after the
+      // 3D is consumed" confusion. The backend already owns the session
+      // lifecycle here, so don't re-delete it (`deleteBackend: false`).
+      // This frame precedes `SketchDeleted` in the broadcast order, so
+      // `serverId` still matches at this point.
+      if (
+        scene.sketch.active &&
+        scene.sketch.serverId === msg.payload.sketch_id
+      ) {
+        scene.exitSketch({ deleteBackend: false })
+      }
       break
     }
   }

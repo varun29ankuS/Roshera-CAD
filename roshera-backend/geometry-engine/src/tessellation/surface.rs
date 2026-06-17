@@ -561,6 +561,27 @@ fn tessellate_planar_face(
             .unwrap_or(Vector3::Z)
     };
 
+    // ANNULUS FAST PATH. A planar face bounded by an outer circle and a single
+    // CONCENTRIC inner circle (the washer caps an analytic revolve emits) is a
+    // degenerate case for the general hole-CDT: it produces a chevron/herringbone
+    // mesh and — because the `cdt` crate classifies holes by nesting and the two
+    // circles confuse it — fills part of the bore with spanning triangles. Detect
+    // it and triangulate directly as a clean radial strip between the two rings.
+    if let Some(tris) = annulus_radial_strip(&all_vertices, &loop_boundaries, &normal) {
+        let mut vertex_map = Vec::with_capacity(all_vertices.len());
+        for vertex in &all_vertices {
+            vertex_map.push(mesh.add_vertex(MeshVertex {
+                position: *vertex,
+                normal,
+                uv: None,
+            }));
+        }
+        for t in tris {
+            mesh.add_triangle(vertex_map[t[0]], vertex_map[t[1]], vertex_map[t[2]]);
+        }
+        return;
+    }
+
     // Triangulate. We unify the hole-free and holed cases on a single
     // bridged-ear-clipping algorithm:
     //
@@ -887,6 +908,151 @@ pub(crate) fn triangulate_planar_polygon(
             Vec::new()
         }
     }
+}
+
+/// Triangulate a CONCENTRIC-CIRCLE ANNULUS (one outer ring + one inner ring) as a
+/// clean radial strip between the two rings — well-conditioned triangles, no
+/// chevron seam, the bore left correctly empty. Returns `None` unless the face is
+/// exactly such an annulus (the caller then falls back to the general CDT). The
+/// rings are sampled CCW from a common seam, so they are stitched by fractional
+/// position around the circle (handling unequal sample counts) into `n + m`
+/// triangles, each oriented to the face `normal`. Indices are into `vertices`.
+fn annulus_radial_strip(
+    vertices: &[Point3],
+    loop_boundaries: &[(usize, usize, bool)],
+    normal: &Vector3,
+) -> Option<Vec<[usize; 3]>> {
+    // Exactly one outer ring + one inner ring, each with ≥3 samples.
+    let mut outer: Option<(usize, usize)> = None;
+    let mut inner: Option<(usize, usize)> = None;
+    for &(s, e, is_outer) in loop_boundaries {
+        if e - s < 3 {
+            return None;
+        }
+        if is_outer {
+            if outer.replace((s, e)).is_some() {
+                return None;
+            }
+        } else if inner.replace((s, e)).is_some() {
+            return None;
+        }
+    }
+    let (os, oe) = outer?;
+    let (is_, ie) = inner?;
+
+    let centroid = |s: usize, e: usize| -> Point3 {
+        let mut c = Vector3::ZERO;
+        for p in &vertices[s..e] {
+            c = c + Vector3::new(p.x, p.y, p.z);
+        }
+        let c = c * (1.0 / (e - s) as f64);
+        Point3::new(c.x, c.y, c.z)
+    };
+    // Mean radius if the ring is circular (max deviation < 2% of mean), else None.
+    let circular = |s: usize, e: usize, c: Point3| -> Option<f64> {
+        let pts = &vertices[s..e];
+        let rs: Vec<f64> = pts.iter().map(|p| (*p - c).magnitude()).collect();
+        let mean = rs.iter().sum::<f64>() / rs.len() as f64;
+        if mean < 1e-9 {
+            return None;
+        }
+        let maxdev = rs.iter().map(|r| (r - mean).abs()).fold(0.0_f64, f64::max);
+        if maxdev > mean * 0.02 {
+            return None;
+        }
+        // Reject SPARSE polygons whose corners merely happen to be equidistant
+        // from the centroid — the classic trap is a rectangle/square cap, whose
+        // 4 corners pass the all-equidistant test above yet are NOT a circle.
+        // A genuinely circular tessellated ring has every consecutive chord well
+        // below its radius (chord = 2·r·sin(π/n) < r for n ≥ 7); a 4-corner
+        // square's side (its chord) EXCEEDS its corner-radius (80 > 56.57), so it
+        // fails here and falls through to the general CDT — which triangulates a
+        // square-outer + circular-hole annulus correctly. Without this guard the
+        // radial-strip mis-stitched the 4 square corners to the bore ring and
+        // over-covered the cap (area 8320 vs 5948 — the bored-plate-volume bug).
+        let n = pts.len();
+        let max_chord = (0..n)
+            .map(|i| (pts[(i + 1) % n] - pts[i]).magnitude())
+            .fold(0.0_f64, f64::max);
+        if max_chord > mean {
+            return None;
+        }
+        Some(mean)
+    };
+    let oc = centroid(os, oe);
+    let ic = centroid(is_, ie);
+    let or = circular(os, oe, oc)?;
+    let ir = circular(is_, ie, ic)?;
+    if (oc - ic).magnitude() > or.min(ir) * 0.02 || ir >= or {
+        return None; // not concentric, or inner is not the smaller ring
+    }
+
+    // Stitch the two rings by ANGLE, not by raw loop index. The previous
+    // index-walk assumed both rings were sampled CCW from a COMMON seam — true
+    // for a revolve washer (both circles built together) but NOT for a
+    // boolean-result annular cap (e.g. a bored boss top), whose outer rim and
+    // inner bore have independent seams and can wind oppositely. That mismatch
+    // twisted the strip into overlapping spanning triangles (the bore filled →
+    // a coaxial bore through a boss rendered solid; mesh area 5484 vs the true
+    // annulus 2591). FIX: reorder each ring into canonical CCW-by-angle order
+    // about its own centre (kills the winding/seam dependence), then rotate the
+    // inner ring so its first point is angularly aligned with the outer's first
+    // point. The fractional-advance walk below is then correct for both.
+    let (u_axis, v_axis) = compute_plane_axes(normal);
+    let angle_of = |vi: usize, c: Point3| -> f64 {
+        let d = vertices[vi] - c;
+        d.dot(&v_axis).atan2(d.dot(&u_axis))
+    };
+    let mut o_order: Vec<usize> = (os..oe).collect();
+    o_order.sort_by(|&x, &y| angle_of(x, oc).total_cmp(&angle_of(y, oc)));
+    let mut i_order: Vec<usize> = (is_..ie).collect();
+    i_order.sort_by(|&x, &y| angle_of(x, ic).total_cmp(&angle_of(y, ic)));
+    let o0 = angle_of(o_order[0], oc);
+    let ang_dist = |a: f64, b: f64| -> f64 {
+        let mut d = (a - b).abs();
+        if d > std::f64::consts::PI {
+            d = std::f64::consts::TAU - d;
+        }
+        d
+    };
+    let start_j = (0..i_order.len())
+        .min_by(|&x, &y| {
+            ang_dist(angle_of(i_order[x], ic), o0)
+                .total_cmp(&ang_dist(angle_of(i_order[y], ic), o0))
+        })
+        .unwrap_or(0);
+    i_order.rotate_left(start_j);
+    let n = o_order.len();
+    let m = i_order.len();
+    let oidx = |k: usize| o_order[k % n];
+    let iidx = |k: usize| i_order[k % m];
+    let mut tris: Vec<[usize; 3]> = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0usize, 0usize);
+    for _ in 0..(n + m) {
+        let advance_outer = if i == n {
+            false
+        } else if j == m {
+            true
+        } else {
+            (i as f64 / n as f64) <= (j as f64 / m as f64)
+        };
+        let (a, b, c) = if advance_outer {
+            let t = (oidx(i), oidx(i + 1), iidx(j));
+            i += 1;
+            t
+        } else {
+            let t = (oidx(i), iidx(j + 1), iidx(j));
+            j += 1;
+            t
+        };
+        let gn = (vertices[b] - vertices[a]).cross(&(vertices[c] - vertices[a]));
+        if gn.dot(normal) >= 0.0 {
+            tris.push([a, b, c]);
+        } else {
+            tris.push([a, c, b]);
+        }
+    }
+    Some(tris)
 }
 
 /// Signed area of a polygon described by indices into `vertices_2d`.
@@ -3696,23 +3862,116 @@ fn tessellate_revolution_wedge(
         chains.push(c);
     }
     let (a, b, c, d) = (&chains[0], &chains[1], &chains[2], &chains[3]);
-    // Opposite chains must tile a rectangular grid.
-    if a.len() != c.len() || b.len() != d.len() {
+    // Corner continuity (chains belong to one loop, so these hold exactly for a
+    // clean quad; a mismatch means the loop is not a 4-corner patch). Walk
+    // c0→c1 (a) → c1→c2 (b) → c2→c3 (c) → c3→c0 (d).
+    let close = |p: Point3, q: Point3| (p - q).magnitude() < 1e-6;
+    if !close(a[a.len() - 1], b[0])
+        || !close(b[b.len() - 1], c[0])
+        || !close(c[c.len() - 1], d[0])
+        || !close(d[d.len() - 1], a[0])
+    {
         return false;
     }
+
+    // GENERAL CASE — unequal opposite boundary counts. A revolve band's two
+    // meridian arcs sit at DIFFERENT radii, so the chord-driven edge cache
+    // samples them with different counts (`b.len() != d.len()`); congruent
+    // profile-arc copies at adjacent stations can differ too (`a.len() !=
+    // c.len()`). The Coons grid below needs equal opposite counts, so a CONE
+    // band always fails it — and the curved-CDT fallback chokes on the thin 3D
+    // sliver, leaving the band UNMESHED (holes → a revolved nozzle renders as
+    // nothing). Fix it FUNDAMENTALLY for every profile shape: triangulate in
+    // the wedge's (u,v) PARAMETER square, where the patch is well-conditioned
+    // regardless of radii (no sliver aspect ratio), using the EXACT boundary
+    // cache samples. Each boundary point keeps its real 3D position (so every
+    // shared edge matches its neighbour's samples bit-for-bit → watertight);
+    // only the 2D triangulation connectivity is computed in (u,v). Boundary-
+    // only (no interior Steiner) — exact for the developable band.
+    if a.len() != c.len() || b.len() != d.len() {
+        let mut p3: Vec<Point3> = Vec::new();
+        let mut puv: Vec<Point3> = Vec::new();
+        // a: v=0, u 0→1 ; b: u=1, v 0→1 ; c: v=1, u 1→0 ; d: u=0, v 1→0.
+        // Drop each chain's last point: it is the shared corner that opens the
+        // next chain (corner continuity verified above).
+        let na = a.len();
+        for i in 0..na - 1 {
+            p3.push(a[i]);
+            puv.push(Point3::new(i as f64 / (na - 1) as f64, 0.0, 0.0));
+        }
+        let nb = b.len();
+        for j in 0..nb - 1 {
+            p3.push(b[j]);
+            puv.push(Point3::new(1.0, j as f64 / (nb - 1) as f64, 0.0));
+        }
+        let nc = c.len();
+        for k in 0..nc - 1 {
+            p3.push(c[k]);
+            puv.push(Point3::new(1.0 - k as f64 / (nc - 1) as f64, 1.0, 0.0));
+        }
+        let nd = d.len();
+        for l in 0..nd - 1 {
+            p3.push(d[l]);
+            puv.push(Point3::new(0.0, 1.0 - l as f64 / (nd - 1) as f64, 0.0));
+        }
+        if p3.len() < 3 {
+            return false;
+        }
+        let boundaries = [(0usize, puv.len(), true)];
+        let tris = triangulate_planar_polygon(&puv, &boundaries, &Vector3::Z);
+        if tris.is_empty() {
+            return false;
+        }
+        // Outward normal: Newell of the real 3D ring (CCW about the surface's
+        // natural normal, since the loop is CCW) times the face orientation sign
+        // — identical convention to `tessellate_planar_face`.
+        let outward = newell_normal(&p3)
+            .map(|nv| nv * face.orientation.sign())
+            .unwrap_or(Vector3::Z);
+        // SMOOTH SHADING: take each vertex's normal from the surface itself
+        // (evaluate_full at the vertex's (u,v)), not a single flat per-band
+        // normal — otherwise each sloped band renders as a faceted rectangle
+        // ("rectangular spots" on a revolved cone). The wedge's (u,v) square
+        // maps to the SurfaceOfRevolution params as u=profile∈[0,1],
+        // v=angle∈[0,angle]; puv carries (u, v_frac, 0). Orient each to the
+        // outward side so shading is consistent; fall back to the flat outward
+        // normal if the surface evaluation fails.
+        let surf = model.surfaces.get(face.surface_id);
+        let ang = surf.map(|s| s.parameter_bounds().1 .1).unwrap_or(0.0);
+        let idx: Vec<u32> = (0..p3.len())
+            .map(|k| {
+                let normal = surf
+                    .and_then(|s| s.evaluate_full(puv[k].x, puv[k].y * ang).ok())
+                    .map(|sp| {
+                        if sp.normal.dot(&outward) < 0.0 {
+                            -sp.normal
+                        } else {
+                            sp.normal
+                        }
+                    })
+                    .unwrap_or(outward);
+                mesh.add_vertex(MeshVertex {
+                    position: p3[k],
+                    normal,
+                    uv: None,
+                })
+            })
+            .collect();
+        for t in &tris {
+            let (i0, i1, i2) = (t[0], t[1], t[2]);
+            let gn = (p3[i1] - p3[i0]).cross(&(p3[i2] - p3[i0]));
+            if gn.dot(&outward) >= 0.0 {
+                mesh.add_triangle(idx[i0], idx[i1], idx[i2]);
+            } else {
+                mesh.add_triangle(idx[i0], idx[i2], idx[i1]);
+            }
+        }
+        return true;
+    }
+
     let n = a.len(); // i index: 0..n along A (c0→c1) and C (c2→c3)
     let m = b.len(); // j index: 0..m along B (c1→c2) and D (c3→c0)
     if n < 2 || m < 2 {
-        return false;
-    }
-    // Corner continuity (chains belong to one loop, so these hold exactly for a
-    // clean quad; a mismatch means the loop is not a 4-corner patch).
-    let close = |p: Point3, q: Point3| (p - q).magnitude() < 1e-6;
-    if !close(a[n - 1], b[0])
-        || !close(b[m - 1], c[0])
-        || !close(c[n - 1], d[0])
-        || !close(d[m - 1], a[0])
-    {
         return false;
     }
 
@@ -4985,16 +5244,95 @@ pub(crate) fn weld_mesh_watertight_range(
             new_face_map.push(mesh.face_map[idx]);
         }
     }
+    // Remove DOUBLED FACETS in the welded range: two triangles sharing the
+    // same three (welded) vertices. An opposite-winding pair is a degenerate
+    // "fin" that contributes zero surface yet makes every one of its edges
+    // border 4 triangles → non-manifold; this is how a curved-CDT sliver
+    // emitted TWICE at high density leaves an otherwise-sound solid's mesh
+    // non-manifold (KNOWN_BUGS #65). Cancel opposite-winding pairs (drop
+    // BOTH — a fin sits on top of the real tiling, which still covers the
+    // patch), and collapse same-winding exact duplicates to one
+    // representative. This is a no-op on a clean mesh — every facet's
+    // vertex-triple is unique — so watertight primitives stay bit-for-bit
+    // identical.
+    let mut doubled_removed = 0usize;
+    {
+        let parity = |t: &[u32; 3]| -> bool {
+            // true = even permutation of the sorted triple (one winding),
+            // false = the opposite. Degenerate triangles (two equal indices)
+            // were already dropped above.
+            let inv = (t[0] > t[1]) as u8 + (t[0] > t[2]) as u8 + (t[1] > t[2]) as u8;
+            inv % 2 == 0
+        };
+        let mut groups: HashMap<[u32; 3], Vec<usize>> = HashMap::new();
+        for i in t_start..new_triangles.len() {
+            let mut k = new_triangles[i];
+            k.sort_unstable();
+            groups.entry(k).or_default().push(i);
+        }
+        let mut remove = vec![false; new_triangles.len()];
+        for idxs in groups.values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            // Greedily pair opposite-winding indices (cancel both); keep one
+            // representative of any same-winding surplus so the patch stays
+            // covered.
+            let mut even: Vec<usize> = Vec::new();
+            let mut odd: Vec<usize> = Vec::new();
+            for &i in idxs {
+                if parity(&new_triangles[i]) {
+                    if let Some(j) = odd.pop() {
+                        remove[i] = true;
+                        remove[j] = true;
+                    } else {
+                        even.push(i);
+                    }
+                } else if let Some(j) = even.pop() {
+                    remove[i] = true;
+                    remove[j] = true;
+                } else {
+                    odd.push(i);
+                }
+            }
+            for &extra in even.iter().chain(odd.iter()).skip(1) {
+                remove[extra] = true;
+            }
+        }
+        doubled_removed = remove.iter().filter(|&&r| r).count();
+        if doubled_removed > 0 {
+            let mut tris: Vec<[u32; 3]> = Vec::with_capacity(new_triangles.len());
+            let mut fmap: Vec<u32> = if has_face_map {
+                Vec::with_capacity(new_face_map.len())
+            } else {
+                Vec::new()
+            };
+            for i in 0..new_triangles.len() {
+                if remove[i] {
+                    continue;
+                }
+                tris.push(new_triangles[i]);
+                if has_face_map {
+                    fmap.push(new_face_map[i]);
+                }
+            }
+            new_triangles = tris;
+            if has_face_map {
+                new_face_map = fmap;
+            }
+        }
+    }
+
     mesh.triangles = new_triangles;
     if has_face_map {
         mesh.face_map = new_face_map;
     }
 
-    if welded > 0 || g1_smoothed > 0 {
+    if welded > 0 || g1_smoothed > 0 || doubled_removed > 0 {
         tracing::debug!(
             "weld_mesh_watertight_range: collapsed {welded} duplicate vertices, \
-             G1-smoothed {g1_smoothed} canonical normals \
-             (tol={weld_tolerance:e}, v_start={v_start})"
+             G1-smoothed {g1_smoothed} canonical normals, removed {doubled_removed} \
+             doubled-facet triangles (tol={weld_tolerance:e}, v_start={v_start})"
         );
     }
 }
@@ -5127,6 +5465,130 @@ mod tests {
                 "triangle centroid ({cx}, {cy}) lies inside hole — bridging failed"
             );
         }
+    }
+
+    #[test]
+    fn planar_face_square_with_circular_hole() {
+        // TESS-ANNULAR-CAP repro: 80×80 outer square (CCW) with a centred Ø24
+        // circular hole (32-gon, CW). This is the bored-plate cap. Expected face
+        // area = 6400 − π·12² ≈ 5947.6. The live bug over-covers to ~8320 (> the
+        // outer square 6400) — overlapping triangles fill the bore.
+        let r = 12.0_f64;
+        let n = 32usize;
+        let hole: Vec<(f64, f64)> = (0..n)
+            .map(|k| {
+                // CW (negative angle) so the hole winds opposite the CCW outer.
+                let a = -(k as f64) / (n as f64) * std::f64::consts::TAU;
+                (40.0 + r * a.cos(), 40.0 + r * a.sin())
+            })
+            .collect();
+        let (verts, loops) = build_planar_loops(
+            &[(0.0, 0.0), (80.0, 0.0), (80.0, 80.0), (0.0, 80.0)],
+            &[&hole],
+        );
+        let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
+        let area = total_tri_area_xy(&verts, &tris);
+        let expected = 80.0 * 80.0 - std::f64::consts::PI * r * r;
+        // The hole is a 32-gon, so the true polygonal area is slightly under πr².
+        let poly_hole = 0.5 * (n as f64) * r * r * (std::f64::consts::TAU / n as f64).sin();
+        let expected_poly = 80.0 * 80.0 - poly_hole;
+        assert!(
+            (area - expected_poly).abs() < 1.0,
+            "square+circular-hole tri area {area} ≠ expected {expected_poly:.1} \
+             (analytic annulus {expected:.1}); >outer-square 6400 ⇒ overlap"
+        );
+        for &t in &tris {
+            let (cx, cy) = tri_centroid_xy(&verts, t);
+            let inside_hole = ((cx - 40.0).powi(2) + (cy - 40.0).powi(2)).sqrt() < r * 0.9;
+            assert!(
+                !inside_hole,
+                "triangle centroid ({cx:.1},{cy:.1}) lies inside the bore — hole not erased"
+            );
+        }
+    }
+
+    /// TESS-ANNULAR-CAP regression: the real bored-plate cap (a SQUARE outer +
+    /// circular bore hole) must tessellate to the correct annulus area. The bug:
+    /// `annulus_radial_strip` mis-classified the 4-corner square as a circular
+    /// ring (its corners are equidistant from the centroid) and radial-stripped
+    /// it to the bore, over-covering the cap to area 8320 (vs 5948) and inflating
+    /// the bored solid's volume to 107817 (vs 95162). Fixed by the chord<radius
+    /// guard in `circular`. Gate on cap AREA (no test checked it before — which is
+    /// why a watertight-but-wrong mesh hid).
+    #[test]
+    fn bored_plate_caps_tessellate_to_annulus() {
+        use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+        let mut m = BRepModel::new();
+        let plate = match TopologyBuilder::new(&mut m)
+            .create_box_3d(80.0, 80.0, 16.0)
+            .unwrap()
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let bore = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -10.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                12.0,
+                36.0,
+            )
+            .unwrap()
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let holed = boolean_operation(
+            &mut m,
+            plate,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .unwrap();
+        let params = TessellationParams::default();
+        let cache = EdgeSampleCache::new(&params);
+        let solid = m.solids.get(holed).unwrap();
+        let mut shells = vec![solid.outer_shell];
+        shells.extend_from_slice(&solid.inner_shells);
+        let mut caps = 0;
+        for sh in shells {
+            let shell = m.shells.get(sh).unwrap();
+            for &fid in &shell.faces {
+                let face = m.faces.get(fid).unwrap();
+                let surf = m.surfaces.get(face.surface_id).unwrap();
+                if surf.type_name() != "Plane" {
+                    continue;
+                }
+                let n = face.normal_at(0.5, 0.5, &m.surfaces).unwrap_or(Vector3::Z);
+                if n.z.abs() < 0.9 || face.inner_loops.is_empty() {
+                    continue; // only the horizontal caps that carry the bore
+                }
+                let mut mesh = TriangleMesh::new();
+                tessellate_planar_face(face, &m, &params, &cache, &mut mesh);
+                let area: f64 = mesh
+                    .triangles
+                    .iter()
+                    .map(|t| {
+                        let a = mesh.vertices[t[0] as usize].position;
+                        let b = mesh.vertices[t[1] as usize].position;
+                        let c = mesh.vertices[t[2] as usize].position;
+                        (b.to_vec() - a.to_vec())
+                            .cross(&(c.to_vec() - a.to_vec()))
+                            .magnitude()
+                            * 0.5
+                    })
+                    .sum();
+                let expected = 80.0 * 80.0 - std::f64::consts::PI * 12.0 * 12.0;
+                assert!(
+                    (area - expected).abs() < 5.0,
+                    "bored cap {fid} area {area:.1} ≠ annulus {expected:.1} (over-cover bug)"
+                );
+                caps += 1;
+            }
+        }
+        assert_eq!(caps, 2, "expected 2 bored caps, found {caps}");
     }
 
     #[test]

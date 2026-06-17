@@ -163,8 +163,24 @@ impl ConePrimitive {
         let bottom_radius = params.bottom_radius.unwrap_or(0.0);
         let has_apex = bottom_radius == 0.0;
 
-        // Create reference direction perpendicular to axis
-        let ref_dir = params.axis.perpendicular();
+        // Reference direction perpendicular to the axis.
+        //
+        // This MUST match the canonical parametric reference that `Arc`/`Circle`
+        // use for their `t = 0` seam (the cardinal mapping ±Z→+X, ±X→+Y, ±Y→+Z;
+        // see `Arc::new`). The generic `axis.perpendicular()` returns a different
+        // perpendicular (e.g. +Y for a −Z axis) — so the rim seam VERTEX, placed
+        // at `center + ref_dir·r`, landed at the surface seam while the rim
+        // `Circle` curve's `t = 0` sat at +X. The full-cone rim edge then carried
+        // a `param_range` of [0,1] whose start did NOT correspond to its
+        // `start_vertex`, so a foreign vertex coincident with the curve's true
+        // `t = 0` fell on the param boundary and could not be split. That silently
+        // defeated T-junction healing in Booleans: a coincident rim (cone base on
+        // a cylinder cap — the "rocket" union) was left welded on only one
+        // operand → 279 open edges, invalid solid, despite correct volume.
+        // Deriving `ref_dir` from the circle's own `x_axis` keeps the surface
+        // seam, the rim curve's `t = 0`, the seam vertex, and the edge
+        // `param_range` mutually consistent.
+        let ref_dir = Circle::new(params.apex, params.axis, 1.0)?.x_axis();
         let y_dir = params.axis.cross(&ref_dir);
 
         // Angle range

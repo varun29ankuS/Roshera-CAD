@@ -444,6 +444,22 @@ pub fn boolean_operation(
             merged_faces.iter().map(|f| f.inner_loops.len()).sum::<usize>(),
         ));
 
+        // Same-Domain cull (#32): drop anti-coincident internal faces before
+        // selection, so a coincident face buried between the two operands'
+        // interiors (e.g. the box-top disc under a flush-based boss) doesn't
+        // survive and create a 3-faces-per-edge non-manifold rim.
+        let merged_faces = cull_internal_coincident_faces(
+            model,
+            merged_faces,
+            solid_a,
+            solid_b,
+            &options.common.tolerance,
+        );
+        pipeline_trace(format_args!(
+            "stage=cull_internal_coincident fragments={}",
+            merged_faces.len()
+        ));
+
         // Step 4: Select faces based on boolean operation
         let selected_faces = select_faces_for_operation(&merged_faces, operation, solid_a, solid_b);
         pipeline_trace(format_args!(
@@ -1183,7 +1199,16 @@ fn surface_surface_intersection(
             plane_sphere_intersection(surface_a, surface_b, tolerance)
         }
         (Sphere, Sphere) => sphere_sphere_intersection(surface_a, surface_b, tolerance),
+        (Cylinder, Sphere) | (Sphere, Cylinder) => {
+            cylinder_sphere_intersection(surface_a, surface_b, tolerance)
+        }
         (Planar, Cone) | (Cone, Planar) => plane_cone_intersection(surface_a, surface_b, tolerance),
+        (Cone, Cylinder) | (Cylinder, Cone) => {
+            cone_cylinder_intersection(surface_a, surface_b, tolerance)
+        }
+        (Cone, Sphere) | (Sphere, Cone) => {
+            cone_sphere_intersection(surface_a, surface_b, tolerance)
+        }
         _ => {
             use crate::primitives::surface::SurfaceType;
             if matches!(
@@ -2631,6 +2656,299 @@ fn sphere_sphere_intersection(
     Ok(vec![curve])
 }
 
+/// Closed-form cylinder(lateral)–sphere intersection for a COAXIAL sphere
+/// (centre on the cylinder axis) — BOOL #7. A cylinder lateral `radial = rc`
+/// meets a sphere of radius `rs` centred at axial position `s` on the axis where
+/// `rc² + (t − s)² = rs²` (t = axial coord), i.e. two circles at
+/// `t = s ± √(rs² − rc²)` of radius `rc`. Cases:
+///   * rs > rc (sphere pokes THROUGH the wall): two transverse circles (clipped
+///     to the cylinder's finite axial extent).
+///   * rs ≤ rc (sphere tangent to, or inside, the wall): NO transverse section —
+///     return empty. The sphere does not separate the lateral, so the difference
+///     takes the enclosed-void path. (The marching solver wrongly traced the
+///     tangent equator circle for rs=rc → ~200 open edges; this is the fix.)
+/// An OFF-axis sphere cuts the cylinder in a general quartic with no closed form
+/// here — fall back to the (now step-capped) marching solver. Cap faces are
+/// PLANAR and dispatch to `plane_sphere_intersection` separately.
+fn cylinder_sphere_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::{Cylinder, Sphere};
+
+    // Identify which operand is the cylinder; keep (a, b) ordering for the
+    // parametric images.
+    let (cyl, sphere, cyl_is_a) = if let (Some(c), Some(s)) = (
+        surface_a.as_any().downcast_ref::<Cylinder>(),
+        surface_b.as_any().downcast_ref::<Sphere>(),
+    ) {
+        (c, s, true)
+    } else if let (Some(s), Some(c)) = (
+        surface_a.as_any().downcast_ref::<Sphere>(),
+        surface_b.as_any().downcast_ref::<Cylinder>(),
+    ) {
+        (c, s, false)
+    } else {
+        // Cylinder/Sphere KIND but not the concrete analytic types — marching
+        // fallback (KNOWN_BUGS #40 pattern).
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    };
+
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let rc = cyl.radius;
+    let rs = sphere.radius;
+    let tol = tolerance.distance();
+
+    // Sphere centre in the cylinder's axial/radial frame.
+    let rel = sphere.center - origin;
+    let s_axial = rel.dot(&axis);
+    let d = (rel - axis * s_axial).magnitude(); // radial offset from the axis
+
+    // Off-axis → general quartic; no closed form. Marching (step-capped) handles
+    // it without hanging.
+    if d > tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+
+    let disc = rs * rs - rc * rc;
+    if disc <= tol * tol {
+        // rs ≤ rc: tangent to or inside the wall — no separating section.
+        return Ok(vec![]);
+    }
+    let off = disc.sqrt();
+
+    let (h_lo, h_hi) = match cyl.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+
+    let mut curves = Vec::new();
+    for t in [s_axial - off, s_axial + off] {
+        if t < h_lo - tol || t > h_hi + tol {
+            continue; // circle lies beyond the cylinder's finite extent
+        }
+        let circle = Circle::new(origin + axis * t, axis, rc)?;
+        let params_cyl = compute_circle_cylinder_parameters(&circle, cyl)?;
+        let params_sph = compute_circle_sphere_parameters(&circle, sphere)?;
+        let (on_surface_a, on_surface_b) = if cyl_is_a {
+            (
+                create_parametric_curve(&params_cyl),
+                create_parametric_curve(&params_sph),
+            )
+        } else {
+            (
+                create_parametric_curve(&params_sph),
+                create_parametric_curve(&params_cyl),
+            )
+        };
+        curves.push(SurfaceIntersectionCurve {
+            curve: Box::new(circle),
+            on_surface_a,
+            on_surface_b,
+        });
+    }
+    Ok(curves)
+}
+
+/// Closed-form cone(lateral)–cylinder(lateral) intersection for a COAXIAL pair
+/// (cone apex on the cylinder axis, axes parallel) — BOOL #7. A cone's radius is
+/// monotonic along its axis (`r(v) = v·tan(α)`, v = axial distance from apex), so
+/// it equals the cylinder radius `rc` at exactly ONE axial position
+/// `v* = rc / tan(α)` → a single circle of radius `rc`. Emit it when v* lies in
+/// the cone's extent AND the circle's axial position lies in the cylinder's
+/// extent; otherwise the cone never reaches the wall there → empty (so an
+/// enclosed cone routes to the void path, like cyl∖sphere). Non-coaxial cones
+/// cut the cylinder in a general quartic with no closed form here → step-capped
+/// marcher. Cone/cylinder CAPS are planar and dispatch to plane_* separately.
+fn cone_cylinder_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::{Cone, Cylinder};
+
+    let (cone, cyl, cone_is_a) = if let (Some(c), Some(y)) = (
+        surface_a.as_any().downcast_ref::<Cone>(),
+        surface_b.as_any().downcast_ref::<Cylinder>(),
+    ) {
+        (c, y, true)
+    } else if let (Some(y), Some(c)) = (
+        surface_a.as_any().downcast_ref::<Cylinder>(),
+        surface_b.as_any().downcast_ref::<Cone>(),
+    ) {
+        (c, y, false)
+    } else {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    };
+
+    let k = cone.half_angle.tan();
+    let tol = tolerance.distance();
+    if !k.is_finite() || k <= tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+    let cone_axis = cone.axis;
+    let cyl_axis = cyl.axis;
+    let rc = cyl.radius;
+
+    // Coaxial test: axes parallel AND the cone apex lies on the cylinder axis.
+    let parallel = cone_axis.cross(&cyl_axis).magnitude() <= tolerance.parallel_threshold();
+    let rel_apex = cone.apex - cyl.origin;
+    let apex_radial = (rel_apex - cyl_axis * rel_apex.dot(&cyl_axis)).magnitude();
+    if !parallel || apex_radial > tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+
+    // Axial distance from the apex (along the cone axis) where the cone radius
+    // equals the cylinder radius.
+    let v_star = rc / k;
+    let (cv_lo, cv_hi) = match cone.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (0.0, f64::INFINITY),
+    };
+    // STRICTLY interior: a circle at the cone's own rim (v* ≈ cv_lo/cv_hi) is a
+    // shared boundary (e.g. a cone stacked on a cylinder, base rim == top rim),
+    // NOT a transverse cut — emitting it corrupts the split. Such rim
+    // coincidence is handled by the coplanar-imprint / shared-edge path, so
+    // return empty here.
+    if v_star <= cv_lo + tol || v_star >= cv_hi - tol {
+        return Ok(vec![]);
+    }
+    let center = cone.apex + cone_axis * v_star;
+
+    // Circle must fall STRICTLY within the cylinder's finite axial extent for
+    // the same reason (a circle at a cap rim is a shared boundary, not a cut).
+    let (yh_lo, yh_hi) = match cyl.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+    let cyl_axial = (center - cyl.origin).dot(&cyl_axis);
+    if cyl_axial <= yh_lo + tol || cyl_axial >= yh_hi - tol {
+        return Ok(vec![]);
+    }
+
+    let circle = Circle::new(center, cone_axis, rc)?;
+    let params_cone = compute_circle_cone_parameters(&circle, cone)?;
+    let params_cyl = compute_circle_cylinder_parameters(&circle, cyl)?;
+    let (on_surface_a, on_surface_b) = if cone_is_a {
+        (
+            create_parametric_curve(&params_cone),
+            create_parametric_curve(&params_cyl),
+        )
+    } else {
+        (
+            create_parametric_curve(&params_cyl),
+            create_parametric_curve(&params_cone),
+        )
+    };
+    Ok(vec![SurfaceIntersectionCurve {
+        curve: Box::new(circle),
+        on_surface_a,
+        on_surface_b,
+    }])
+}
+
+/// Closed-form cone(lateral)–sphere intersection for a COAXIAL sphere (centre on
+/// the cone axis) — BOOL #7. With the sphere centre at axial distance `s` from
+/// the apex, a cone-lateral point at axial `v` (radius `v·tanα`) lies on the
+/// sphere when `(v−s)² + (v·tanα)² = rs²`, i.e.
+///   `v = s·cos²α ± cosα·√(rs² − s²·sin²α)`.
+/// The discriminant `D = rs² − s²·sin²α` gives 0 / 1(tangent) / 2 crossing
+/// circles. Each valid root that is STRICTLY interior to the cone's extent (and
+/// v>0) emits a circle of radius `v·tanα`; a root at a rim, a tangency
+/// (D≤0), or a root outside the extent → no curve (shared boundary / no cut).
+/// Off-axis spheres → general quartic → step-capped marcher.
+fn cone_sphere_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::{Cone, Sphere};
+
+    let (cone, sphere, cone_is_a) = if let (Some(c), Some(s)) = (
+        surface_a.as_any().downcast_ref::<Cone>(),
+        surface_b.as_any().downcast_ref::<Sphere>(),
+    ) {
+        (c, s, true)
+    } else if let (Some(s), Some(c)) = (
+        surface_a.as_any().downcast_ref::<Sphere>(),
+        surface_b.as_any().downcast_ref::<Cone>(),
+    ) {
+        (c, s, false)
+    } else {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    };
+
+    let tol = tolerance.distance();
+    let k = cone.half_angle.tan();
+    let sin_a = cone.half_angle.sin();
+    let cos_a = cone.half_angle.cos();
+    if !k.is_finite() || k <= tol {
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+    let axis = cone.axis;
+    let rs = sphere.radius;
+
+    // Sphere centre in the cone's axial/radial frame (from the apex).
+    let rel = sphere.center - cone.apex;
+    let s = rel.dot(&axis);
+    let d = (rel - axis * s).magnitude();
+    if d > tol {
+        // Off-axis: general quartic, no closed form here.
+        return march_surface_intersection(surface_a, surface_b, tolerance);
+    }
+
+    let disc = rs * rs - s * s * sin_a * sin_a;
+    if disc <= tol * tol {
+        return Ok(vec![]); // no real crossing, or a tangency (non-separating)
+    }
+    let sqrt_d = disc.sqrt();
+    let base = s * cos_a * cos_a;
+    let off = cos_a * sqrt_d;
+
+    let (cv_lo, cv_hi) = match cone.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (0.0, f64::INFINITY),
+    };
+
+    let mut curves = Vec::new();
+    for v in [base - off, base + off] {
+        // STRICTLY interior to the cone extent and a non-degenerate radius; a
+        // rim-coincident root is a shared boundary, not a transverse cut.
+        if v <= cv_lo + tol || v >= cv_hi - tol {
+            continue;
+        }
+        let radius = v * k;
+        if radius <= tol {
+            continue;
+        }
+        let circle = Circle::new(cone.apex + axis * v, axis, radius)?;
+        let params_cone = compute_circle_cone_parameters(&circle, cone)?;
+        let params_sph = compute_circle_sphere_parameters(&circle, sphere)?;
+        let (on_surface_a, on_surface_b) = if cone_is_a {
+            (
+                create_parametric_curve(&params_cone),
+                create_parametric_curve(&params_sph),
+            )
+        } else {
+            (
+                create_parametric_curve(&params_sph),
+                create_parametric_curve(&params_cone),
+            )
+        };
+        curves.push(SurfaceIntersectionCurve {
+            curve: Box::new(circle),
+            on_surface_a,
+            on_surface_b,
+        });
+    }
+    Ok(curves)
+}
+
 /// Closed-form plane–cone intersection.
 ///
 /// For a plane PERPENDICULAR to the cone axis the section is a circle of radius
@@ -3082,16 +3400,42 @@ fn march_from_point(
     start: IntersectionPoint,
     tolerance: &Tolerance,
 ) -> OperationResult<Option<SurfaceIntersectionCurve>> {
-    let mut points = vec![start.clone()];
-    let mut params_a = vec![start.params_a];
-    let mut params_b = vec![start.params_b];
+    // HARD STEP CAP per direction. The marching step is tied to the distance
+    // tolerance (≈1e-5), so a curve on unit-scale primitives needs ~10^6 steps;
+    // for a pair with NO analytic SSI arm (cone×cylinder, cone×sphere, …) the
+    // march can also fail to ever close → a true HANG that freezes the kernel
+    // (the worst failure class). Bound it: a real intersection curve on bounded
+    // analytic primitives needs far fewer points; exceeding the cap means the
+    // march is non-terminating/unreliable, so discard this curve (Ok(None))
+    // rather than hang or feed a truncated garbage curve downstream. The proper
+    // fix for those pairs is an analytic SSI arm (task #7) / a geometry-scaled
+    // step — tracked separately; this is the safety guard.
+    const MAX_MARCH_STEPS: usize = 200_000;
 
-    // March in both directions
+    // Collect each direction into its own Vec (forward + backward) and splice at
+    // the end, so the backward branch is O(n) instead of the old insert(0, …)
+    // which made a long march quadratic.
+    let mut fwd: Vec<IntersectionPoint> = Vec::new();
+    let mut bwd: Vec<IntersectionPoint> = Vec::new();
+
     for direction in &[1.0, -1.0] {
         let mut current = start.clone();
         let mut step_size = tolerance.distance() * 10.0;
+        let mut steps = 0usize;
 
         loop {
+            steps += 1;
+            if steps > MAX_MARCH_STEPS {
+                // Non-terminating march — bail the whole curve as unreliable.
+                if pipeline_trace_enabled() {
+                    eprintln!(
+                        "[bool]   march_from_point: step cap {MAX_MARCH_STEPS} hit \
+                         (non-terminating SSI — discarding curve; needs analytic arm)"
+                    );
+                }
+                return Ok(None);
+            }
+
             // Compute tangent direction
             let tangent = compute_intersection_tangent(surface_a, surface_b, &current)?;
             if tangent.magnitude() < tolerance.distance() {
@@ -3130,25 +3474,19 @@ fn march_from_point(
                 params_b: (u_b, v_b),
             };
 
-            // Check for loop closure
-            if points.len() > 3 {
-                let dist_to_start = (next.position - points[0].position).magnitude();
+            // Check for loop closure against the seed point.
+            if fwd.len() + bwd.len() > 3 {
+                let dist_to_start = (next.position - start.position).magnitude();
                 if dist_to_start < tolerance.distance() * 2.0 {
-                    // Closed loop found
-                    break;
+                    break; // Closed loop found
                 }
             }
 
             if *direction > 0.0 {
-                points.push(next.clone());
-                params_a.push((u_a, v_a));
-                params_b.push((u_b, v_b));
+                fwd.push(next.clone());
             } else {
-                points.insert(0, next.clone());
-                params_a.insert(0, (u_a, v_a));
-                params_b.insert(0, (u_b, v_b));
+                bwd.push(next.clone());
             }
-
             current = next;
 
             // Adaptive step size
@@ -3157,6 +3495,14 @@ fn march_from_point(
             }
         }
     }
+
+    // Splice: backward branch (reversed) + seed + forward branch.
+    let mut points = Vec::with_capacity(bwd.len() + 1 + fwd.len());
+    points.extend(bwd.iter().rev().cloned());
+    points.push(start.clone());
+    points.extend(fwd.iter().cloned());
+    let params_a: Vec<(f64, f64)> = points.iter().map(|p| p.params_a).collect();
+    let params_b: Vec<(f64, f64)> = points.iter().map(|p| p.params_b).collect();
 
     if points.len() < 2 {
         return Ok(None);
@@ -5307,6 +5653,198 @@ fn split_cylinder_lateral_by_sectors(
     Some(faces)
 }
 
+/// CONE analogue of `split_cylinder_lateral_by_sectors` (BOOL #1 cone-radial
+/// conic-cut). A cone lateral cut by ≥3 full-height GENERATOR lines (the two
+/// x=plane generators of a radial cut + the cone's own u-seam) splits into
+/// angular θ-sectors. The generic DCEL can't partition the periodic cone
+/// u-domain, so it dropped the inside angular strip entirely — `∩` then kept
+/// only the 3 planar faces. This walks the (already complete) arrangement into
+/// sectors exactly like the cylinder, with two cone-specific changes: the axial
+/// coordinate is distance-from-apex `v = (p−apex)·axis`, and the rim radius is
+/// `v·tan(half_angle)` (not constant). Returns None unless there are ≥3
+/// full-height generators, so circle-cut cones (axial poke) still route through
+/// `split_cone_face_by_circles`.
+fn split_cone_face_by_sectors(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::surface::Cone;
+    let surface = model.surfaces.get(surface_id)?;
+    let cone = surface.as_any().downcast_ref::<Cone>()?;
+    let axis = cone.axis;
+    let apex = cone.apex;
+    let k = cone.half_angle.tan();
+    let [v_lo, v_hi] = cone.height_limits?;
+    let span = (v_hi - v_lo).abs();
+    if span <= 0.0 {
+        return None;
+    }
+    let span_tol = (span * 1.0e-3).max(1.0e-6);
+
+    // Orthonormal frame perpendicular to the axis for angular ordering.
+    let seed = if axis.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u1 = axis.cross(&seed).normalize().ok()?;
+    let u2 = axis.cross(&u1);
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let theta_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        let d = Point3::new(p[0], p[1], p[2]) - apex;
+        Some(d.dot(&u2).atan2(d.dot(&u1)).rem_euclid(two_pi))
+    };
+    // Axial coordinate = distance from APEX along the axis.
+    let axial_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        Some((Point3::new(p[0], p[1], p[2]) - apex).dot(&axis))
+    };
+
+    // Full-height generators (cut generators + seam): (theta@v_lo, lo_vid, hi_vid, edge_id).
+    let mut verticals: Vec<(f64, VertexId, VertexId, EdgeId)> = Vec::new();
+    for (&eid, _) in graph.edges.iter() {
+        let e = model.edges.get(eid)?;
+        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+        if (sa - ea).abs() < span - span_tol {
+            continue; // rim arc or partial — not a full-height generator
+        }
+        let (lov, hiv) = if sa <= ea {
+            (e.start_vertex, e.end_vertex)
+        } else {
+            (e.end_vertex, e.start_vertex)
+        };
+        verticals.push((theta_of(lov)?, lov, hiv, eid));
+    }
+    if verticals.len() < 3 {
+        return None;
+    }
+    verticals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Rim arcs = non-generator, non-degenerate edges whose endpoints share an
+    // axial height (≈ v_lo or ≈ v_hi). The rim may be subdivided into a CHAIN of
+    // arcs (cap-circle self-coincidence densification), so build per-rim
+    // adjacency and walk it.
+    let mut lo_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    let mut hi_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    let mut seen_arc: HashSet<EdgeId> = HashSet::new();
+    for (&eid, _) in graph.edges.iter() {
+        let e = model.edges.get(eid)?;
+        if e.start_vertex == e.end_vertex {
+            continue;
+        }
+        let (sa, ea) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+        if (sa - ea).abs() > span_tol {
+            continue; // a generator or slanted edge — not a flat rim arc
+        }
+        if !seen_arc.insert(eid) {
+            continue;
+        }
+        let mid = 0.5 * (sa + ea);
+        let adj = if (mid - v_lo).abs() <= (mid - v_hi).abs() {
+            &mut lo_adj
+        } else {
+            &mut hi_adj
+        };
+        adj.entry(e.start_vertex)
+            .or_default()
+            .push((e.end_vertex, eid));
+        adj.entry(e.end_vertex)
+            .or_default()
+            .push((e.start_vertex, eid));
+    }
+
+    let oriented = |eid: EdgeId, from: VertexId| -> Option<(EdgeId, bool)> {
+        let e = model.edges.get(eid)?;
+        if e.start_vertex == from {
+            Some((eid, true))
+        } else if e.end_vertex == from {
+            Some((eid, false))
+        } else {
+            None
+        }
+    };
+
+    // Walk a rim CCW (increasing θ) from `start` to `end`.
+    let walk_ccw = |start: VertexId,
+                    end: VertexId,
+                    adj: &HashMap<VertexId, Vec<(VertexId, EdgeId)>>|
+     -> Option<Vec<(EdgeId, bool)>> {
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        let mut cur = start;
+        let mut prev: Option<VertexId> = None;
+        let mut guard = 0usize;
+        let limit = adj.len() + 4;
+        while cur != end {
+            guard += 1;
+            if guard > limit {
+                return None;
+            }
+            let cur_th = theta_of(cur)?;
+            let neighbours = adj.get(&cur)?;
+            let mut best: Option<(f64, VertexId, EdgeId)> = None;
+            for &(nb, eid) in neighbours.iter() {
+                if Some(nb) == prev {
+                    continue;
+                }
+                let gap = (theta_of(nb)? - cur_th).rem_euclid(two_pi);
+                if gap <= 1.0e-9 {
+                    continue;
+                }
+                if best.map_or(true, |(g, _, _)| gap < g) {
+                    best = Some((gap, nb, eid));
+                }
+            }
+            let (_, nb, eid) = best?;
+            out.push(oriented(eid, cur)?);
+            prev = Some(cur);
+            cur = nb;
+        }
+        Some(out)
+    };
+
+    let n = verticals.len();
+    let mut faces = Vec::with_capacity(n);
+    for i in 0..n {
+        let (th_i, loi, hii, ei) = verticals[i];
+        let (th_j, loj, hij, ej) = verticals[(i + 1) % n];
+        // hi rim: hii → hij CCW. lo rim: loi → loj CCW, then reversed.
+        let hi_chain = walk_ccw(hii, hij, &hi_adj)?;
+        let lo_chain = walk_ccw(loi, loj, &lo_adj)?;
+        let mut loop_edges: Vec<(EdgeId, bool)> =
+            Vec::with_capacity(hi_chain.len() + lo_chain.len() + 2);
+        loop_edges.push(oriented(ei, loi)?); // left generator loi → hii
+        loop_edges.extend(hi_chain); // hi rim chain hii → hij
+        loop_edges.push(oriented(ej, hij)?); // right generator hij → loj
+        for &(eid, fwd) in lo_chain.iter().rev() {
+            loop_edges.push((eid, !fwd)); // lo rim chain loj → loi
+        }
+        // Interior point at the sector mid-angle (handle wrap) and mid-v; the
+        // cone radius at v_mid is v_mid·tan(half_angle).
+        let th_mid = if th_j >= th_i {
+            0.5 * (th_i + th_j)
+        } else {
+            (0.5 * (th_i + th_j + two_pi)).rem_euclid(two_pi)
+        };
+        let v_mid = 0.5 * (v_lo + v_hi);
+        let radial = u1 * th_mid.cos() + u2 * th_mid.sin();
+        let interior = apex + axis * v_mid + radial * (v_mid * k);
+        faces.push(SplitFace {
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: loop_edges,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(interior),
+            inner_loops: Vec::new(),
+        });
+    }
+    Some(faces)
+}
+
 /// Torus analogue of the sphere/cone/cylinder curved-Boolean fast paths, for a
 /// RIM-POKE: the tube pokes box side-walls, each wall imprinting a closed quartic
 /// oval on the torus near the outer equator (v≈0). The DCEL arrangement on the
@@ -5944,6 +6482,23 @@ fn split_face_by_curves(
         return Ok(cone_faces);
     }
 
+    // Cone lateral RADIAL cut: ≥3 full-height generators (the two plane
+    // generators of a radial cut + the cone's u-seam) split the lateral into
+    // angular θ-sectors. The generic DCEL can't partition the periodic cone
+    // u-domain → it dropped the inside angular strip (BOOL #1). Same handling
+    // as the cylinder sector split; returns None for circle-cut cones.
+    if let Some(cone_faces) =
+        split_cone_face_by_sectors(model, surface_id, face_id, origin_solid, &graph)
+    {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   cone sector split: face={face_id:?} → {} fragments",
+                cone_faces.len()
+            );
+        }
+        return Ok(cone_faces);
+    }
+
     // Cylinder lateral cut by an off-axis "window" loop (cap arcs + vertical
     // wall lines that don't span the full sweep) → explicit window + complement
     // fragments. The DCEL drops the seam-wrapping complement, orphaning the
@@ -6189,18 +6744,43 @@ fn drop_nested_inner_loops(model: &BRepModel, face: &mut SplitFace) {
         return;
     };
     let origin = sp.position;
-    let polys: Vec<Vec<(f64, f64)>> = loops_3d
-        .iter()
-        .map(|verts| {
-            verts
-                .iter()
-                .map(|p| {
-                    let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
-                    (d.dot(&e1), d.dot(&e2))
-                })
-                .collect()
-        })
-        .collect();
+    let project = |p: &Point3| -> (f64, f64) {
+        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        (d.dot(&e1), d.dot(&e2))
+    };
+    // Densified (arc-following) polygons. A few-arc circular hole (the B-Rep
+    // stores bolt/bore rims as ~3 arcs) projected by its ENDPOINTS is an
+    // inscribed chord triangle whose incircle is ~r/2 — so the nesting
+    // containment below can mis-decide for CONCENTRIC curved holes (a Ø54
+    // counterbore over a Ø40 bore), wrongly keeping or dropping a loop. Sample
+    // each edge's curve so the projected polygon follows the arc (same fix as
+    // the merge/partition containment, #85b / #35 lineage).
+    let densify = |lp: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
+        const SAMPLES: usize = 8;
+        let mut poly: Vec<(f64, f64)> = Vec::with_capacity(lp.len() * SAMPLES);
+        for &(eid, fwd) in lp {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                if let Ok(p) = curve.point_at(t) {
+                    poly.push(project(&p));
+                }
+            }
+        }
+        poly
+    };
+    let polys: Vec<Vec<(f64, f64)>> = face.inner_loops.iter().map(|lp| densify(lp)).collect();
     let n = polys.len();
     let mut drop = vec![false; n];
     for i in 0..n {
@@ -6342,10 +6922,42 @@ fn partition_outer_and_pre_existing_hole_cycles(
         (d.dot(&e1), d.dot(&e2))
     };
 
-    let cycle_polys_2d: Vec<Vec<(f64, f64)>> = cycle_verts_3d
-        .iter()
-        .map(|verts| verts.iter().map(project).collect())
-        .collect();
+    // Densified (arc-following) 2D polygons. CRITICAL for #35: the
+    // hole-to-outer ATTACHMENT below tests each hole's centroid against the
+    // outer polygon. Built from cycle ENDPOINTS only, a curved outer rim (an
+    // r40 cap split into ~3 arcs) becomes an inscribed chord triangle whose
+    // incircle is ~r/2, so a pre-existing hole near the rim (a bolt hole at
+    // radius 30) tests OUTSIDE the outer and is NOT attached — the hole is
+    // dropped and its wall strands as its own shell (#35 chained-difference
+    // residual: 3rd+ hole into a multi-hole cap). Sample each boundary edge's
+    // curve so the polygon follows the arc (mirrors the merge-stage fix and
+    // `is_point_in_face`).
+    let densify_2d = |cycle: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
+        const SAMPLES: usize = 8;
+        let mut poly: Vec<(f64, f64)> = Vec::with_capacity(cycle.len() * SAMPLES);
+        for &(eid, fwd) in cycle {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                if let Ok(p) = curve.point_at(t) {
+                    poly.push(project(&p));
+                }
+            }
+        }
+        poly
+    };
+    let cycle_polys_2d: Vec<Vec<(f64, f64)>> = loops.iter().map(|c| densify_2d(c)).collect();
 
     let centroid_2d = |poly: &[(f64, f64)]| -> Option<(f64, f64)> {
         if poly.len() < 3 {
@@ -7242,6 +7854,80 @@ fn clip_circle_to_planar_face(
     let inv_r = 1.0 / radius;
     let x_axis_3d = (p_at_zero - center3) * inv_r;
     let y_axis_3d = (p_at_quarter - center3) * inv_r;
+
+    // DISC fast-path (BOOL #7): a planar face bounded by a SINGLE closed circular
+    // edge (a cone/cylinder cap disc) has no straight-line edges, so the polygon
+    // clipper below bails (NotApplicable on the first non-Line edge) and a
+    // coplanar cutting circle is never trimmed to the disc. A cutting circle
+    // LARGER than the disc (the sphere equator r6 vs a cone base disc r5) is then
+    // never dropped → it spuriously over-splits the other operand (cone∪sphere
+    // over-inclusion). Clip the cutting circle against the disc circle-vs-circle.
+    {
+        use crate::primitives::curve::Circle as CircleCurve;
+        let disc = (boundary_edges.len() == 1)
+            .then(|| boundary_edges[0].0)
+            .and_then(|eid| model.edges.get(eid))
+            .and_then(|e| model.curves.get(e.curve_id))
+            .and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<CircleCurve>()
+                    .map(|circ| (circ.center(), circ.radius()))
+            });
+        if let Some((dc, dr)) = disc {
+            let tol = tolerance.distance();
+            let delta = dc - center3;
+            let d = (delta - plane.normal * delta.dot(&plane.normal)).magnitude();
+            if d <= tol {
+                // Concentric: classify by radius.
+                if radius < dr - tol {
+                    return Ok(CircleClipOutcome::Full);
+                } else if radius > dr + tol {
+                    return Ok(CircleClipOutcome::Misses);
+                }
+                return Ok(CircleClipOutcome::NotApplicable); // coincident boundary
+            }
+            if d + radius <= dr + tol {
+                return Ok(CircleClipOutcome::Full); // cutting circle inside the disc
+            }
+            if d >= dr + radius - tol || radius >= d + dr - tol {
+                return Ok(CircleClipOutcome::Misses); // separate, or encircles the disc
+            }
+            // Two coplanar circles intersect → keep the arc inside the disc.
+            let e_hat = (delta - plane.normal * delta.dot(&plane.normal)) * (1.0 / d);
+            let a = (d * d + radius * radius - dr * dr) / (2.0 * d);
+            let h = (radius * radius - a * a).max(0.0).sqrt();
+            let perp = plane.normal.cross(&e_hat);
+            let ang = |p: Point3| -> f64 {
+                let local = p - center3;
+                let mut t = local.dot(&y_axis_3d).atan2(local.dot(&x_axis_3d));
+                if t < 0.0 {
+                    t += std::f64::consts::TAU;
+                }
+                t
+            };
+            let (mut t1, mut t2) = (
+                ang(center3 + e_hat * a + perp * h),
+                ang(center3 + e_hat * a - perp * h),
+            );
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            let mid = 0.5 * (t1 + t2);
+            let mid_pt =
+                center3 + x_axis_3d * (radius * mid.cos()) + y_axis_3d * (radius * mid.sin());
+            let md = mid_pt - dc;
+            let mid_inside = (md - plane.normal * md.dot(&plane.normal)).magnitude() < dr;
+            let (start, sweep) = if mid_inside {
+                (t1, t2 - t1)
+            } else {
+                (t2, std::f64::consts::TAU - (t2 - t1))
+            };
+            return Ok(CircleClipOutcome::Arc {
+                start_angle: start,
+                sweep_angle: sweep,
+            });
+        }
+    }
 
     let origin = plane.origin;
     let u_dir = plane.u_dir;
@@ -10399,34 +11085,51 @@ fn merge_same_origin_fragments(
             continue;
         }
 
-        // 2. Project each fragment's boundary cycle to UV. The merge
-        // test below is polygon-in-polygon (every inner vertex inside
-        // outer), so the projected polygon is the only artifact we
-        // need per fragment.
-        let mut polygons: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
-
-        for &idx in indices {
-            let edge_ids: Vec<EdgeId> = faces[idx].boundary_edges.iter().map(|(e, _)| *e).collect();
-            let cycle3d = extract_cycle_vertices_3d(&edge_ids, model);
-            if cycle3d.len() < 3 {
-                continue;
-            }
-
-            let mut poly = Vec::with_capacity(cycle3d.len());
-            let mut all_projected = true;
-            for pt in &cycle3d {
-                match surface.closest_point(pt, *tolerance) {
-                    Ok((u, v)) => poly.push((u, v)),
-                    Err(_) => {
-                        all_projected = false;
-                        break;
-                    }
+        // Densified UV polygon of a boundary cycle. CRITICAL for #35: sample
+        // each boundary EDGE's curve (not just its endpoints) so the polygon
+        // FOLLOWS arcs. Using only cycle vertices builds the inscribed CHORD
+        // polygon — for a curved cap boundary split into a few arcs (e.g. an
+        // r40 cap rim as 3 arcs), that polygon's incircle is ~r/2, so a hole
+        // near the rim (a bolt hole at radius 30 inside an r40 cap) tests
+        // OUTSIDE the chord triangle and the containment check below wrongly
+        // rejects it — the new hole is never absorbed into the cap, its rim is
+        // left only on the cutter wall, and the wall strands as its own shell
+        // (#35: 2nd+ hole into a multi-inner-loop cap). Sampling each arc at
+        // SAMPLES points (mirrors `is_point_in_face`) makes containment exact.
+        let densify_uv = |edges: &[(EdgeId, bool)]| -> Option<Vec<(f64, f64)>> {
+            const SAMPLES: usize = 8;
+            let mut poly: Vec<(f64, f64)> = Vec::with_capacity(edges.len() * SAMPLES);
+            for &(eid, fwd) in edges {
+                let edge = model.edges.get(eid)?;
+                let curve = model.curves.get(edge.curve_id)?;
+                let (a, b) = (edge.param_range.start, edge.param_range.end);
+                // Emit SAMPLES points in loop-traversal order, excluding the end
+                // endpoint (supplied by the next edge's start) to avoid dupes.
+                for k in 0..SAMPLES {
+                    let f = k as f64 / SAMPLES as f64;
+                    let t = if fwd {
+                        a + (b - a) * f
+                    } else {
+                        b - (b - a) * f
+                    };
+                    let p = curve.point_at(t).ok()?;
+                    let (u, v) = surface.closest_point(&p, *tolerance).ok()?;
+                    poly.push((u, v));
                 }
             }
-            if !all_projected || poly.len() < 3 {
-                continue;
+            if poly.len() < 3 {
+                None
+            } else {
+                Some(poly)
             }
-            polygons.insert(idx, poly);
+        };
+
+        // 2. Project each fragment's boundary cycle to a densified UV polygon.
+        let mut polygons: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
+        for &idx in indices {
+            if let Some(poly) = densify_uv(&faces[idx].boundary_edges) {
+                polygons.insert(idx, poly);
+            }
         }
 
         // A candidate `inner` may only be nested into `outer` if it lies
@@ -10442,24 +11145,13 @@ fn merge_same_origin_fragments(
         // This is the #27 chained-union root cause.
         let inner_in_outer_hole = |outer_idx: usize, inner_poly: &[(f64, f64)]| -> bool {
             for hole in &faces[outer_idx].inner_loops {
-                let edge_ids: Vec<EdgeId> = hole.iter().map(|(e, _)| *e).collect();
-                let cyc = extract_cycle_vertices_3d(&edge_ids, model);
-                if cyc.len() < 3 {
-                    continue;
-                }
-                let mut hpoly = Vec::with_capacity(cyc.len());
-                let mut ok = true;
-                for pt in &cyc {
-                    match surface.closest_point(pt, *tolerance) {
-                        Ok((u, v)) => hpoly.push((u, v)),
-                        Err(_) => {
-                            ok = false;
-                            break;
-                        }
+                // Densified (arc-following) hole polygon — same reason as the
+                // fragment polygons above: a chord polygon of a curved hole rim
+                // is too small and would miss that `inner` lies in the hole.
+                if let Some(hpoly) = densify_uv(hole) {
+                    if uv_polygon_strictly_contains(&hpoly, inner_poly) {
+                        return true;
                     }
-                }
-                if ok && hpoly.len() >= 3 && uv_polygon_strictly_contains(&hpoly, inner_poly) {
-                    return true;
                 }
             }
             false
@@ -10858,12 +11550,35 @@ fn solid_gwn_triangles_cached(model: &BRepModel, solid: SolidId) -> std::rc::Rc<
 /// sign-agnostic, so the tessellator's global orientation convention does
 /// not matter — only that the surface is closed (no gaps), which a valid
 /// operand satisfies.
+///
+/// COARSE tessellation, deliberately (BOOL #86). This mesh is consumed only
+/// by the winding-number sign — never displayed or exported — and the sign is
+/// robust to facet density for any point not within the faceting error of the
+/// surface. Points that ARE that close (coincident / near-tangent boundary
+/// contacts — the cases that actually need fidelity) are resolved upstream by
+/// the analytic `is_point_in_face` coincident-loop BEFORE GWN runs, so GWN only
+/// ever classifies points comfortably inside or outside. Using the production-
+/// FINE params here was the real BOOL #86 defect: every boolean operand was
+/// re-tessellated at display quality (a single boss cylinder → ~20k triangles
+/// over ~4 s via the curved-CDT refinement), so a chained multi-boss build's
+/// per-classification operand tessellation ran for minutes and the kernel
+/// appeared to hang. `coarse()` caps `max_segments`, which also bounds the
+/// Ruppert refinement budget, making operand tessellation cheap and bounded.
 fn solid_gwn_triangles(model: &BRepModel, solid: SolidId) -> Vec<[Point3; 3]> {
     let Some(solid_ref) = model.solids.get(solid) else {
         return Vec::new();
     };
-    let params = crate::tessellation::TessellationParams::default();
+    let params = crate::tessellation::TessellationParams::coarse();
+    if pipeline_trace_enabled() {
+        eprintln!("[bool]       gwn: tessellate_solid START solid={solid:?}");
+    }
     let mesh = crate::tessellation::tessellate_solid(solid_ref, model, &params);
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]       gwn: tessellate_solid DONE solid={solid:?} tris={}",
+            mesh.triangles.len()
+        );
+    }
     let mut tris = Vec::with_capacity(mesh.triangles.len());
     for t in &mesh.triangles {
         if let (Some(v0), Some(v1), Some(v2)) = (
@@ -11306,7 +12021,26 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
                 SurfaceType::Cylinder | SurfaceType::Sphere | SurfaceType::Cone
             ) {
                 if let Ok((u, v)) = surface.closest_point(&centroid, Tolerance::default()) {
-                    if let Ok(p) = surface.point_at(u, v) {
+                    // A face whose ONLY boundary is a single closed loop (e.g. a
+                    // cone lateral whose sole boundary edge is its base rim
+                    // circle) has its centroid = that one edge's midpoint, which
+                    // lies ON the boundary. Projected to the surface it stays on
+                    // the rim — and when that rim is coincident with the other
+                    // operand's cutting plane it classifies OnBoundary, dropping
+                    // a face that is really Inside (the conical wall of cyl∖cone
+                    // with a coincident base, #32). Nudge toward the surface's
+                    // interior in v so it is a GENUINE interior point. (Fragments
+                    // produced by a dedicated curved splitter carry an explicit
+                    // interior_point and return early above, so this only affects
+                    // single-closed-loop full-surface fragments.)
+                    let v_used = if count == 1 {
+                        let ((_, _), (v_min, v_max)) = surface.parameter_bounds();
+                        let v_mid = 0.5 * (v_min + v_max);
+                        v + (v_mid - v) * 0.25
+                    } else {
+                        v
+                    };
+                    if let Ok(p) = surface.point_at(u, v_used) {
                         return Ok(p);
                     }
                 }
@@ -12226,6 +12960,69 @@ fn is_point_in_face(
     Ok(crossings % 2 == 1)
 }
 
+/// Same-Domain cull (#32 / #27 family): drop ANTI-coincident internal faces.
+///
+/// When a face is coincident (`OnBoundary`) with a face of the other solid, the
+/// two operands either share material on the SAME side of the plane (same-
+/// domain — a real boundary of the result; `select_faces_for_operation`'s
+/// `OnBoundary → from_a` rule keeps one copy and dedups the other) OR they sit on
+/// OPPOSITE sides (anti-domain — the face is sandwiched between A's interior and
+/// B's interior, i.e. INTERNAL to the union, and must be removed). The selection
+/// rule alone keeps the `from_a` copy unconditionally, so an anti-coincident
+/// internal face survives and its rim ends up shared by THREE faces → odd Euler /
+/// non-manifold. The canonical case: a cylinder boss whose base plane is
+/// coincident with the box top it sits on (#32) — the box-top disc under the boss
+/// is internal but was kept.
+///
+/// Discriminator (orientation-independent): probe one side of the face,
+/// `p + ε·n`, and classify it against BOTH solids. If `inside(A) XOR inside(B)`
+/// the solids are on opposite sides → internal → drop. If they agree, the side
+/// is either shared material or shared void → same-domain boundary → keep.
+/// Only `OnBoundary` faces are examined; Inside/Outside faces pass through.
+fn cull_internal_coincident_faces(
+    model: &BRepModel,
+    faces: Vec<SplitFace>,
+    solid_a: SolidId,
+    solid_b: SolidId,
+    tolerance: &Tolerance,
+) -> Vec<SplitFace> {
+    const EPS: f64 = 1.0e-3;
+    faces
+        .into_iter()
+        .filter(|face| {
+            if !matches!(face.classification, FaceClassification::OnBoundary) {
+                return true;
+            }
+            let Ok(p) = get_face_interior_point(model, face) else {
+                return true;
+            };
+            let Some(surface) = model.surfaces.get(face.surface) else {
+                return true;
+            };
+            let Ok((u, v)) = surface.closest_point(&p, *tolerance) else {
+                return true;
+            };
+            let Ok(sp) = surface.evaluate_full(u, v) else {
+                return true;
+            };
+            let Ok(n) = sp.normal.normalize() else {
+                return true;
+            };
+            let probe = Point3::new(p.x + n.x * EPS, p.y + n.y * EPS, p.z + n.z * EPS);
+            let in_a = matches!(
+                classify_point_relative_to_solid(model, probe, solid_a, tolerance),
+                Ok(FaceClassification::Inside)
+            );
+            let in_b = matches!(
+                classify_point_relative_to_solid(model, probe, solid_b, tolerance),
+                Ok(FaceClassification::Inside)
+            );
+            // Anti-domain (opposite sides) ⇒ internal ⇒ drop. Same-domain ⇒ keep.
+            in_a == in_b
+        })
+        .collect()
+}
+
 /// Select faces based on boolean operation type
 fn select_faces_for_operation(
     classified_faces: &[SplitFace],
@@ -12443,11 +13240,37 @@ fn heal_t_junctions_across_faces(
             if d.x * d.x + d.y * d.y + d.z * d.z > tol_sq {
                 continue;
             }
-            let local_t = (t_curve - original.param_range.start) / range_len;
+            // PERIODIC WRAP: `closest_point` returns a param in the curve's base
+            // domain (e.g. [0, 2π) for a circle), which can fall OUTSIDE this
+            // edge's `param_range` even when the foreign vertex genuinely lies on
+            // the edge interior. The canonical case is a full-circle rim edge
+            // (start_vertex == end_vertex) whose seam sits at a non-zero angle:
+            // its `param_range` is [θ_seam, θ_seam + period], so a foreign vertex
+            // at a SMALLER angle reports a param below `range.start` → negative
+            // local_t → the split was silently dropped, leaving a coincident rim
+            // welded on only one operand (the "rocket" cone-base-on-cylinder-cap
+            // bug: cyl top split into arcs, cone base left a closed circle → 279
+            // open edges). For a periodic curve, shift the param by whole periods
+            // into the edge's range before the endpoint test.
+            let mut t_use = t_curve;
+            let mut local_t = (t_use - original.param_range.start) / range_len;
+            if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&local_t) {
+                if let Some(period) = curve.period() {
+                    if period > 1e-12 {
+                        let k = ((original.param_range.start - t_use) / period).ceil();
+                        let cand = t_use + k * period;
+                        let lt = (cand - original.param_range.start) / range_len;
+                        if (ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&lt) {
+                            t_use = cand;
+                            local_t = lt;
+                        }
+                    }
+                }
+            }
             if !(ENDPOINT_EPS..(1.0 - ENDPOINT_EPS)).contains(&local_t) {
                 continue;
             }
-            splits.push((t_curve, vid));
+            splits.push((t_use, vid));
         }
         if splits.is_empty() {
             continue;
@@ -12617,10 +13440,21 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
                         .get(&edge.start_vertex)
                         .unwrap_or(&edge.start_vertex);
                     let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
-                    if cs == ce {
+                    // cs == ce happens two ways: a GENUINE closed-curve edge
+                    // (a full-circle rim, start_vertex == end_vertex by
+                    // construction) or a DEGENERATE edge whose distinct
+                    // endpoints collapsed onto one canonical vertex. Weld the
+                    // former — two coincident rim circles sharing a seam vertex
+                    // (a frustum∪frustum throat, a cone-on-cylinder cap) are
+                    // otherwise left as TWO unmerged closed edges → odd Euler
+                    // characteristic / non-manifold rim. Skip the latter (a
+                    // zero-extent edge must not absorb anything). The midpoint
+                    // (the circle's antipode) discriminates distinct circles
+                    // that happen to share a seam vertex.
+                    if cs == ce && edge.start_vertex != edge.end_vertex {
                         continue;
                     }
-                    let key = if cs < ce { (cs, ce) } else { (ce, cs) };
+                    let key = if cs <= ce { (cs, ce) } else { (ce, cs) };
                     let Some(mid) = edge_mid(eid) else {
                         continue;
                     };
@@ -12651,10 +13485,12 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
             .get(&edge.start_vertex)
             .unwrap_or(&edge.start_vertex);
         let ce = *canon_v.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
-        if cs == ce {
+        // Mirror the bucket-build guard: genuine closed-curve edges (full
+        // circles) participate; degenerate collapsed edges do not.
+        if cs == ce && edge.start_vertex != edge.end_vertex {
             return entry;
         }
-        let key = if cs < ce { (cs, ce) } else { (ce, cs) };
+        let key = if cs <= ce { (cs, ce) } else { (ce, cs) };
         let (Some(bucket), Some(mid)) = (canon_e.get(&key), edge_mid(eid)) else {
             return entry;
         };
@@ -12841,6 +13677,11 @@ fn build_shells_from_faces(
     }
 
     let mut shell_ids = Vec::new();
+    // Persistent-id lineage (#11 slice 40-D): collect, per minted result face,
+    // the TRUE parent input face (`SplitFace.original_face`) + which operand it
+    // came from, so each result face's PID derives from its real source. Filled
+    // at the face-creation seam below; consumed by `assign_boolean_face_pids`.
+    let mut face_lineage: Vec<(FaceId, FaceId, SolidId)> = Vec::new();
 
     for component in components {
         // Pick shell type per options: when non-manifold is permitted, we may
@@ -12964,6 +13805,7 @@ fn build_shells_from_faces(
                 }
             }
 
+            face_lineage.push((face_id, split_face.original_face, split_face.from_solid));
             shell.add_face(face_id);
         }
 
@@ -12971,7 +13813,114 @@ fn build_shells_from_faces(
         shell_ids.push(shell_id);
     }
 
+    assign_boolean_face_pids(model, &face_lineage, operation, solid_b);
+
     Ok(shell_ids)
+}
+
+/// Centroid of a face's outer-loop vertices (a stable-ordering anchor).
+fn boolean_face_centroid(model: &BRepModel, face_id: FaceId) -> [f64; 3] {
+    let mut sum = [0.0_f64; 3];
+    let mut n = 0.0_f64;
+    if let Some(face) = model.faces.get(face_id) {
+        if let Some(lp) = model.loops.get(face.outer_loop) {
+            for &eid in &lp.edges {
+                if let Some(e) = model.edges.get(eid) {
+                    for vid in [e.start_vertex, e.end_vertex] {
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            sum[0] += p[0];
+                            sum[1] += p[1];
+                            sum[2] += p[2];
+                            n += 1.0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if n > 0.0 {
+        [sum[0] / n, sum[1] / n, sum[2] / n]
+    } else {
+        sum
+    }
+}
+
+/// Assign persistent-id lineage to a boolean's result faces (#11 slice 40-D).
+///
+/// Every result face derives from its TRUE parent input face (`original_face`,
+/// tracked soundly through split/merge/select) via [`Role::BooleanFromA`] /
+/// [`Role::BooleanFromB`], plus the operand solid PIDs as derivation parents —
+/// so a face that survives the boolean (and a later mould of an operand) keeps a
+/// stable PID traceable to where it came from. When one input face SPLITS into
+/// several result fragments (sharing one `original_face`), the fragments are
+/// ordered by centroid and the ordinal is folded into the op tag so each gets a
+/// distinct PID. The ordering is geometric — stable under a structure-preserving
+/// mould, best-effort under a split-reordering edit (a fully topological
+/// fragment key — bounding cut-face set — is the documented deepening, needing
+/// per-result-edge source-face lineage).
+fn assign_boolean_face_pids(
+    model: &mut BRepModel,
+    lineage: &[(FaceId, FaceId, SolidId)],
+    operation: BooleanOp,
+    solid_b: SolidId,
+) {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+    use std::collections::HashMap;
+
+    let op_tag = format!("boolean_{operation:?}");
+
+    // Group result faces by their (parent input face, operand).
+    let mut groups: HashMap<(FaceId, SolidId), Vec<FaceId>> = HashMap::new();
+    for &(result, parent, from) in lineage {
+        groups.entry((parent, from)).or_default().push(result);
+    }
+
+    for ((parent, from), mut result_faces) in groups {
+        // Parent face PID — the real source identity. Fall back to a mint keyed
+        // on the operand PID when the input carried no lineage (e.g. a solid
+        // built without an event key); still traceable, just not mould-stable.
+        let parent_pid = model.face_pid(parent).unwrap_or_else(|| {
+            let seed = match model.solid_pid(from) {
+                Some(sp) => format!("{}|origface|{}", sp.as_u128(), parent),
+                None => format!("origface|{}|{}", from, parent),
+            };
+            PersistentId::root(seed.as_bytes())
+        });
+        let role = if from == solid_b {
+            Role::BooleanFromB {
+                source_face_pid: parent_pid,
+            }
+        } else {
+            Role::BooleanFromA {
+                source_face_pid: parent_pid,
+            }
+        };
+        // Derivation parents: the operand solid PID (binds the face to THIS
+        // boolean of THIS operand) + the parent face PID.
+        let mut parents: Vec<PersistentId> = Vec::with_capacity(2);
+        if let Some(sp) = model.solid_pid(from) {
+            parents.push(sp);
+        }
+        parents.push(parent_pid);
+
+        if result_faces.len() == 1 {
+            let pid = PersistentId::derive(&parents, &op_tag, &role);
+            model.set_face_pid(result_faces[0], pid);
+        } else {
+            // Several fragments of one parent: order by centroid for a stable
+            // discriminator, fold the ordinal into the op tag.
+            result_faces.sort_by(|&a, &b| {
+                let ca = boolean_face_centroid(model, a);
+                let cb = boolean_face_centroid(model, b);
+                ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for (i, &face) in result_faces.iter().enumerate() {
+                let tag = format!("{op_tag}#{i}");
+                let pid = PersistentId::derive(&parents, &tag, &role);
+                model.set_face_pid(face, pid);
+            }
+        }
+    }
 }
 
 /// Group faces into connected components based on shared boundary edges.
@@ -17407,5 +18356,270 @@ mod tests {
             r.boundary_edges,
             r.nonmanifold_edges
         );
+    }
+
+    /// SSI-LEVEL harness for the cone×plane intersection (task #1 sub-step).
+    /// Independent of the full boolean stitch: it asserts that every point of
+    /// every curve `surface_surface_intersection` returns for a cone cut by a
+    /// plane lies on BOTH the plane AND the cone (a distance-to-true-surface
+    /// oracle), across the conic orientations:
+    ///   * perpendicular (normal ∥ axis)  → circle,
+    ///   * axial (plane contains the axis) → two generator lines  ← the #1
+    ///     "radial-face+x" family,
+    ///   * offset-parallel (normal ⊥ axis, offset) → hyperbola arc.
+    /// This LOCALIZES #1: the SSI arm is correct (this passes), so the
+    /// cone-radial conic-cut defect (`cone_radial_conic_cut_pin_1`) lives
+    /// DOWNSTREAM of the SSI — the cone lateral patch is dropped/mis-stitched
+    /// in split/classify, NOT because the intersection curve is missing or
+    /// wrong. Cone: apex origin, axis +Z, half-angle atan(0.5), frustum band
+    /// v∈[1,3] (base radius 0.5→1.5).
+    #[test]
+    fn cone_plane_ssi_points_lie_on_both_surfaces_1() {
+        use crate::primitives::surface::Cone;
+
+        let half_angle = 0.5_f64.atan();
+        let k = half_angle.tan(); // 0.5
+        let cone = Cone::truncated(Point3::ORIGIN, Vector3::Z, half_angle, 1.0, 3.0)
+            .expect("frustum cone");
+        let tol = Tolerance::default();
+
+        // (label, plane_point, plane_normal, min curves expected)
+        let cases: [(&str, Point3, Vector3, usize); 3] = [
+            (
+                "perpendicular→circle",
+                Point3::new(0.0, 0.0, 2.0),
+                Vector3::Z,
+                1,
+            ),
+            ("axial→two-lines", Point3::ORIGIN, Vector3::X, 2),
+            (
+                "offset-parallel→hyperbola",
+                Point3::new(0.4, 0.0, 0.0),
+                Vector3::X,
+                1,
+            ),
+        ];
+
+        for (label, p_pt, p_n, min_curves) in cases {
+            let plane = Plane::new(p_pt, p_n, p_n.perpendicular()).expect("plane");
+            let curves = surface_surface_intersection(&plane, &cone, &tol)
+                .unwrap_or_else(|e| panic!("{label}: SSI errored: {e:?}"));
+            assert!(
+                curves.len() >= min_curves,
+                "{label}: expected ≥{min_curves} curve(s), got {}",
+                curves.len()
+            );
+            // In-plane direction ⊥ axis: the two generator lines of the axial
+            // cut must straddle it (one on each side), i.e. the cut PARTITIONS
+            // the cone's full angular range. If the SSI handed split_faces only
+            // a one-sided cut, the missing inside strip would be the SSI's
+            // fault; this proves it is NOT — the partition is complete, so the
+            // dropped inside cone-lateral patch (#1) is purely downstream in
+            // split_face_by_curves' UV arrangement.
+            let m_hat = cone.axis.cross(&p_n);
+            let mut side_min = f64::INFINITY;
+            let mut side_max = f64::NEG_INFINITY;
+            let mut n_pts = 0usize;
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                const N: usize = 24;
+                let mid = sic
+                    .curve
+                    .point_at(0.5 * (range.start + range.end))
+                    .expect("curve mid");
+                let side = (mid - cone.apex).dot(&m_hat);
+                side_min = side_min.min(side);
+                side_max = side_max.max(side);
+                for i in 0..=N {
+                    let t = range.start + (range.end - range.start) * (i as f64 / N as f64);
+                    let p = sic.curve.point_at(t).expect("curve point");
+                    // On the plane: signed distance along the normal.
+                    let d_plane = (p - p_pt).dot(&p_n).abs();
+                    assert!(
+                        d_plane < 1e-4,
+                        "{label}: point {p:?} off plane by {d_plane:.2e}"
+                    );
+                    // On the cone: implicit residual (r − v·k)·cos(half_angle)
+                    // ≈ perpendicular distance to the cone surface.
+                    let w = p - cone.apex;
+                    let v = w.dot(&cone.axis);
+                    let radial = (w - cone.axis * v).magnitude();
+                    let d_cone = ((radial - v * k) * half_angle.cos()).abs();
+                    assert!(
+                        d_cone < 1e-3,
+                        "{label}: point {p:?} off cone by {d_cone:.2e} (v={v:.3} r={radial:.3})"
+                    );
+                    n_pts += 1;
+                }
+            }
+            if label == "axial→two-lines" {
+                assert!(
+                    side_min < -1e-6 && side_max > 1e-6,
+                    "axial cut must straddle the in-plane ⊥-axis direction \
+                     (complete two-sided partition): side range [{side_min:.3},{side_max:.3}]"
+                );
+            }
+            eprintln!(
+                "[cone-plane SSI #1] {label}: {} curve(s), {n_pts} points all on both surfaces",
+                curves.len()
+            );
+        }
+    }
+
+    /// ISOLATED SSI test (BOOL #7): the analytic cylinder×sphere arm. A coaxial
+    /// sphere (centre on the cylinder axis) cuts the lateral in circles ONLY
+    /// when rs > rc; rs ≤ rc is tangent/inside → no separating section. Verifies
+    /// every returned curve point lies on BOTH surfaces (distance oracle) and
+    /// the count is right per case. Cylinder: origin (0,0,-5), axis +Z, rc=5,
+    /// height [0,10] (z∈[-5,5]); sphere at origin.
+    #[test]
+    fn cylinder_sphere_ssi_arm_7() {
+        use crate::primitives::surface::{Cylinder, Sphere};
+        let tol = Tolerance::default();
+        let cyl =
+            Cylinder::new_finite(Point3::new(0.0, 0.0, -5.0), Vector3::Z, 5.0, 10.0).expect("cyl");
+        // (rs, expected curve count)
+        let cases: [(f64, usize); 3] = [
+            (6.0, 2), // pokes through the wall → two transverse circles
+            (5.0, 0), // tangent to the wall → no separating section
+            (4.0, 0), // fully inside the wall → none
+        ];
+        for (rs, want) in cases {
+            let sphere = Sphere::new(Point3::ORIGIN, rs).expect("sphere");
+            let curves = surface_surface_intersection(&cyl, &sphere, &tol)
+                .unwrap_or_else(|e| panic!("rs={rs}: SSI errored {e:?}"));
+            assert_eq!(
+                curves.len(),
+                want,
+                "rs={rs}: expected {want} circle(s), got {}",
+                curves.len()
+            );
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                for i in 0..=24 {
+                    let t = range.start + (range.end - range.start) * (i as f64 / 24.0);
+                    let p = sic.curve.point_at(t).expect("curve point");
+                    // On the cylinder lateral: radial distance from axis == rc.
+                    let rel = p - Point3::new(0.0, 0.0, -5.0);
+                    let radial = (rel - Vector3::Z * rel.dot(&Vector3::Z)).magnitude();
+                    assert!(
+                        (radial - 5.0).abs() < 1e-6,
+                        "rs={rs}: point {p:?} off cylinder (radial {radial})"
+                    );
+                    // On the sphere: distance from centre == rs.
+                    let dr = (p - Point3::ORIGIN).magnitude();
+                    assert!(
+                        (dr - rs).abs() < 1e-6,
+                        "rs={rs}: point {p:?} off sphere (dist {dr})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ISOLATED SSI test (BOOL #7): the analytic cone×cylinder arm. A coaxial
+    /// cone meets the cylinder lateral in ONE circle where the cone radius equals
+    /// rc — but only when that circle is STRICTLY interior to both surfaces; a
+    /// rim-coincident circle (cone enclosed, or base rim == cap) → empty.
+    /// Cylinder: origin (0,0,0), axis +Z, rc=5, height 10 (z∈[0,10]).
+    #[test]
+    fn cone_cylinder_ssi_arm_7() {
+        use crate::primitives::surface::{Cone, Cylinder};
+        let tol = Tolerance::default();
+        let cyl = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, 5.0, 10.0).expect("cyl");
+        let axis_down = Vector3::new(0.0, 0.0, -1.0);
+        // (label, half_angle, [bottom,top] from apex at (0,0,10), expected count)
+        let cases: [(&str, f64, f64, f64, usize); 3] = [
+            ("transverse", 0.8_f64.atan(), 0.0, 10.0, 1), // base r8 → v*=6.25 interior
+            ("enclosed", 0.3_f64.atan(), 0.0, 10.0, 0),   // base r3 → v*=16.7 beyond
+            ("rim-coincident", 1.0_f64.atan(), 0.0, 5.0, 0), // base r5 → v*=5=cv_hi
+        ];
+        for (label, ha, bot, top, want) in cases {
+            let cone = Cone::truncated(Point3::new(0.0, 0.0, 10.0), axis_down, ha, bot, top)
+                .expect("cone");
+            let curves = surface_surface_intersection(&cone, &cyl, &tol)
+                .unwrap_or_else(|e| panic!("{label}: SSI errored {e:?}"));
+            assert_eq!(
+                curves.len(),
+                want,
+                "{label}: expected {want} circle(s), got {}",
+                curves.len()
+            );
+            let k = ha.tan();
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                for i in 0..=24 {
+                    let t = range.start + (range.end - range.start) * (i as f64 / 24.0);
+                    let p = sic.curve.point_at(t).expect("pt");
+                    // On the cylinder: radial distance from the axis == rc.
+                    let rel_c = p - Point3::ORIGIN;
+                    let cyl_radial = (rel_c - Vector3::Z * rel_c.dot(&Vector3::Z)).magnitude();
+                    assert!(
+                        (cyl_radial - 5.0).abs() < 1e-6,
+                        "{label}: point {p:?} off cylinder (radial {cyl_radial})"
+                    );
+                    // On the cone: radial == v·tan(half_angle), v from apex.
+                    let rel = p - Point3::new(0.0, 0.0, 10.0);
+                    let v = rel.dot(&axis_down);
+                    let cone_radial = (rel - axis_down * v).magnitude();
+                    assert!(
+                        (cone_radial - v * k).abs() < 1e-6,
+                        "{label}: point {p:?} off cone (radial {cone_radial} vs {})",
+                        v * k
+                    );
+                }
+            }
+        }
+    }
+
+    /// ISOLATED SSI test (BOOL #7): the analytic cone×sphere arm. A coaxial
+    /// sphere meets the cone lateral where (v−s)²+(v·tanα)²=rs² → up to two
+    /// circles; each emitted only when strictly interior to the cone extent.
+    /// Cone: apex (0,0,10), axis −Z, base r5 at z=0 (half-angle atan(0.5)).
+    #[test]
+    fn cone_sphere_ssi_arm_7() {
+        use crate::primitives::surface::{Cone, Sphere};
+        let tol = Tolerance::default();
+        let ha = 0.5_f64.atan();
+        let k = ha.tan();
+        let apex = Point3::new(0.0, 0.0, 10.0);
+        let axis_down = Vector3::new(0.0, 0.0, -1.0);
+        let cone = Cone::truncated(apex, axis_down, ha, 0.0, 10.0).expect("cone");
+        // (label, sphere centre z, radius, expected count)
+        let cases: [(&str, f64, f64, usize); 3] = [
+            ("transverse", 0.0, 6.0, 1), // s=10: one root interior, other beyond base
+            ("tip", 8.0, 3.0, 1),        // s=2: one positive interior root
+            ("enclosed", 2.5, 1.5, 0),   // sphere inside the cone → no lateral crossing
+        ];
+        for (label, sz, sr, want) in cases {
+            let sphere = Sphere::new(Point3::new(0.0, 0.0, sz), sr).expect("sphere");
+            let curves = surface_surface_intersection(&cone, &sphere, &tol)
+                .unwrap_or_else(|e| panic!("{label}: SSI errored {e:?}"));
+            assert_eq!(
+                curves.len(),
+                want,
+                "{label}: expected {want} circle(s), got {}",
+                curves.len()
+            );
+            for sic in &curves {
+                let range = sic.curve.parameter_range();
+                for i in 0..=24 {
+                    let t = range.start + (range.end - range.start) * (i as f64 / 24.0);
+                    let p = sic.curve.point_at(t).expect("pt");
+                    let rel = p - apex;
+                    let v = rel.dot(&axis_down);
+                    let cone_radial = (rel - axis_down * v).magnitude();
+                    assert!(
+                        (cone_radial - v * k).abs() < 1e-6,
+                        "{label}: point {p:?} off cone"
+                    );
+                    let dr = (p - Point3::new(0.0, 0.0, sz)).magnitude();
+                    assert!(
+                        (dr - sr).abs() < 1e-6,
+                        "{label}: point {p:?} off sphere (dist {dr})"
+                    );
+                }
+            }
+        }
     }
 }

@@ -13,11 +13,13 @@
 
 use std::f64::consts::PI;
 
-use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::harness::watertight::manifold_report;
+use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::{revolve_profile, RevolveOptions};
 use geometry_engine::primitives::curve::Line;
 use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
 use geometry_engine::primitives::topology_builder::BRepModel;
+use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams, TriangleMesh};
 
 // Divergence-theorem volume of the WATERTIGHT tessellated solid. NOTE: this is
@@ -80,6 +82,28 @@ fn revolve_volume(x0: f64, x1: f64, z0: f64, z1: f64, angle: f64) -> Option<f64>
         ..RevolveOptions::default()
     };
     let solid_id = revolve_profile(&mut model, edges, opts).ok()?;
+    // HARNESS-AS-DEFAULT: a successful revolve must be a VALID, WATERTIGHT B-Rep,
+    // not merely volume-correct. (Mesh-independent validity + mesh manifoldness.)
+    let v = validate_solid_scoped(
+        &model,
+        solid_id,
+        Tolerance::default(),
+        ValidationLevel::Standard,
+    );
+    assert!(
+        v.is_valid,
+        "revolve [{x0},{x1}]x[{z0},{z1}] @ {angle:.4}: invalid B-Rep: {:?}",
+        v.errors
+    );
+    if let Some(rep) = manifold_report(&model, solid_id, 0.5, 1e-6) {
+        assert_eq!(
+            (rep.boundary_edges, rep.nonmanifold_edges),
+            (0, 0),
+            "revolve [{x0},{x1}]x[{z0},{z1}] @ {angle:.4}: not watertight (open={} nm={})",
+            rep.boundary_edges,
+            rep.nonmanifold_edges
+        );
+    }
     let solid = model.solids.get(solid_id)?;
     let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
     Some(mesh_volume(&mesh))

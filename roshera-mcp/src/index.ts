@@ -94,6 +94,54 @@ async function newestPartId(): Promise<number | null> {
   return parts.reduce((m: number, p: any) => Math.max(m, p.id), 0);
 }
 
+/**
+ * Automatic perception — the ambient default. After any mutating op, fetch the
+ * result part's validity verdict + structural facts so the agent never operates
+ * blind. Watertightness comes from the diagnostic render (open / non-manifold
+ * edge counts, the same source `verify_part` uses); face-count / volume / bbox
+ * from the part query. Default-ON; disable per process with
+ * `ROSHERA_MCP_AUTOVERIFY=0`. Best-effort: returns `undefined` (no perception
+ * block, never an error) if anything fails, so it can't break a real result.
+ */
+async function perceive(partId: number | null): Promise<any> {
+  if (partId === null || process.env.ROSHERA_MCP_AUTOVERIFY === "0") {
+    return undefined;
+  }
+  try {
+    // SOUND channel: /perception reports the B-Rep validity verdict
+    // (validate_solid_scoped, mesh-independent) plus a manifold check.
+    // The B-Rep verdict is authoritative — a valid solid whose DISPLAY
+    // tessellation has T-junctions is NOT broken (see KNOWN_BUGS #65 /
+    // EYE-SOUND). We never judge soundness off the display render.
+    const p = await api("GET", `/api/agent/parts/${partId}/perception`);
+    const part = await api("GET", `/api/agent/parts/${partId}`).catch(() => null);
+    const valid = p?.valid === true;
+    const meshClean = p?.watertight === true;
+    return {
+      brep_valid: valid,
+      watertight: meshClean,
+      open_edges: p?.open_edges ?? null,
+      nonmanifold_edges: p?.nonmanifold_edges ?? null,
+      dims: p?.dims ?? null,
+      face_count: part?.topology?.face_count ?? null,
+      volume: part?.volume ?? null,
+      verdict: !valid
+        ? "BROKEN — B-Rep invalid (real topological defect)"
+        : meshClean
+          ? "OK — valid closed solid"
+          : "OK — valid B-Rep; display mesh has tessellation T-junctions only (not a defect)",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** `ok()` plus an automatic perception verdict for the resulting part. */
+async function okp(data: Record<string, unknown>, partId: number | null) {
+  const perception = await perceive(partId);
+  return ok(perception === undefined ? data : { ...data, perception });
+}
+
 // ─── Server + tools ────────────────────────────────────────────────────
 
 const server = new McpServer({ name: "roshera", version: "0.1.0" });
@@ -148,23 +196,28 @@ server.tool(
 
 server.tool(
   "verify_part",
-  "SELF-CHECK a part's geometry: runs the diagnostic render and reports " +
-    "watertightness — open_edges (missing-face hole rims), nonmanifold_edges " +
-    "(overlapping faces), and a watertight verdict. ALWAYS call this after a " +
-    "boolean (union/difference) or a multi-feature build: booleans can drop " +
-    "or flip faces, and a part can LOOK solid in a shaded render while being " +
-    "broken. Returns the iso diagnostic image too so you can see WHERE.",
+  "SELF-CHECK a part's geometry. The verdict is the SOUND, mesh-independent " +
+    "B-Rep check (validate_solid_scoped via /perception): brep_valid is the " +
+    "authoritative 'is this a real closed solid' answer. The display mesh's " +
+    "open/non-manifold edge counts are reported separately as DISPLAY quality " +
+    "— a valid B-Rep can still tessellate with T-junctions (KNOWN_BUGS #65), " +
+    "which is a rendering artifact, NOT a broken solid. ALWAYS call this after " +
+    "a boolean or multi-feature build. Returns the iso diagnostic image so you " +
+    "can SEE where any real (red=open / magenta=non-manifold) defect is.",
   {
     part_id: z.number().int().describe("kernel part id from list_parts"),
     view: z.enum(["iso", "front", "top", "right"]).default("iso"),
   },
   async ({ part_id, view }) => {
     try {
+      // Sound verdict from the B-Rep; image + display-mesh counts from the render.
+      const p = await api("GET", `/api/agent/parts/${part_id}/perception`);
       const r = await api(
         "GET",
         `/api/agent/parts/${part_id}/render?mode=diagnostic&view=${view}&size=720`,
       );
-      const watertight = r.open_edges === 0 && r.nonmanifold_edges === 0;
+      const valid = p.valid === true;
+      const meshClean = r.open_edges === 0 && r.nonmanifold_edges === 0;
       return {
         content: [
           {
@@ -172,12 +225,19 @@ server.tool(
             text: JSON.stringify(
               {
                 part_id,
-                watertight,
-                open_edges: r.open_edges,
-                nonmanifold_edges: r.nonmanifold_edges,
-                verdict: watertight
-                  ? "OK — closed manifold solid"
-                  : "BROKEN — see red (open) / magenta (non-manifold) edges in the image",
+                brep_valid: valid,
+                brep_watertight: p.watertight === true,
+                verdict: !valid
+                  ? "BROKEN — B-Rep invalid (a real topological defect; see the image)"
+                  : meshClean
+                    ? "OK — valid closed solid"
+                    : "OK — valid solid; display mesh has tessellation T-junctions only (not a defect)",
+                display_mesh: {
+                  open_edges: r.open_edges,
+                  nonmanifold_edges: r.nonmanifold_edges,
+                  note: "display tessellation quality only — does NOT determine validity",
+                },
+                dims: p.dims ?? null,
               },
               null,
               2,
@@ -186,6 +246,45 @@ server.tool(
           { type: "image", data: r.png_base64, mimeType: "image/png" },
         ],
       };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "make_drawing",
+  "Generate a 2D engineering DRAWING from a part: the standard four-view " +
+    "sheet — Front / Top / Right plus an isometric pictorial — with " +
+    "hidden-line removal, centerlines, and automatic dimensions. The sheet " +
+    "size and scale are chosen to fit the part (small parts on A4, growing " +
+    "to A0), and the views are centered with proper offset dimension lines. " +
+    "Returns the new drawing id (open it in the Drawing workspace, or fetch " +
+    "GET /api/drawings/<id>/svg|pdf|dxf) AND a QUALITY report — the 2D " +
+    "perception layer: whether the layout passed, sheet utilization, and any " +
+    "issues (views overlapping, off-sheet, dimensions on the outline). Treat " +
+    "the quality report the way you treat watertightness for 3D geometry.",
+  {
+    part_id: z.number().int().describe("kernel part/solid id from list_parts"),
+    name: z.string().optional().describe("title-block name for the sheet"),
+  },
+  async ({ part_id, name }) => {
+    try {
+      const qs = name ? `?name=${encodeURIComponent(name)}` : "";
+      const r = await api("POST", `/api/parts/${part_id}/drawing${qs}`);
+      const q = r?.quality ?? null;
+      return ok({
+        drawing_id: r?.id ?? null,
+        quality: q,
+        verdict: q
+          ? q.passed
+            ? `OK — clean sheet (${Math.round((q.sheet_utilization ?? 0) * 100)}% utilization, ${
+                q.issues?.length ?? 0
+              } advisory issue(s))`
+            : `LAYOUT ISSUES — ${q.issues?.length ?? 0} finding(s); see quality.issues`
+          : "drawing created (no quality report)",
+        note: "Open in the Drawing workspace, or GET /api/drawings/<id>/svg|pdf|dxf.",
+      });
     } catch (e) {
       return fail(e);
     }
@@ -399,7 +498,7 @@ server.tool(
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return await okp({ part_id: id, placement: id !== null ? await placement(id) : null }, id);
     } catch (e) {
       return fail(e);
     }
@@ -448,12 +547,19 @@ server.tool(
       await api("POST", `/api/sketch/${s.id}/point`, {
         point: [cx + width / 2, cy + depth / 2],
       });
-      await api("POST", `/api/sketch/${s.id}/extrude`, {
+      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
         distance: height,
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -462,9 +568,11 @@ server.tool(
 
 server.tool(
   "create_cylinder",
-  "ONE-CALL cylinder: radius at (cx, cy) on the chosen plane, extruded by " +
-    "height. KNOWN BUG #24: the bore/lateral currently tessellates as ~64 " +
-    "planar strips, not one analytic cylinder face.",
+  "ONE-CALL analytic cylinder: radius at (cx, cy) on the chosen plane, extruded " +
+    "by height along the plane normal. Uses the analytic cylinder primitive " +
+    "(one smooth lateral face) — NOT sketch+extrude, which produced an " +
+    "inside-out lateral mesh (⅓ volume, negative inertia, dropped boss walls in " +
+    "coaxial bores).",
   {
     plane: PlaneSchema.default("xy"),
     cx: z.number().default(0),
@@ -475,15 +583,219 @@ server.tool(
   },
   async ({ plane, cx, cy, radius, height, name }) => {
     try {
-      const s = await api("POST", "/api/sketch", { plane, tool: "circle" });
-      await api("POST", `/api/sketch/${s.id}/point`, { point: [cx, cy] });
-      await api("POST", `/api/sketch/${s.id}/point`, { point: [cx + radius, cy] });
-      await api("POST", `/api/sketch/${s.id}/extrude`, {
-        distance: height,
+      // Resolve the plane to a world origin + in-plane (u, v) basis.
+      const std: Record<string, { o: number[]; u: number[]; v: number[] }> = {
+        xy: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 1, 0] },
+        xz: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 0, 1] },
+        yz: { o: [0, 0, 0], u: [0, 1, 0], v: [0, 0, 1] },
+      };
+      const p =
+        typeof plane === "string"
+          ? std[plane]
+          : { o: plane.origin, u: plane.u_axis, v: plane.v_axis };
+      const cross = (a: number[], b: number[]) => [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+      ];
+      // Cylinder base centre = plane origin + cx·u + cy·v; axis = u × v (the
+      // plane normal), matching the old sketch-extrude placement.
+      const center = [0, 1, 2].map(
+        (i) => p.o[i] + cx * p.u[i] + cy * p.v[i],
+      );
+      const axis = cross(p.u, p.v);
+      const r = await api("POST", "/api/geometry/cylinder", {
+        center,
+        axis,
+        radius,
+        height,
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "create_cone",
+  "ONE-CALL analytic cone or frustum. base_radius is the radius at `center`; " +
+    "top_radius (default 0 = sharp apex) is the radius at center+axis*height. " +
+    "A true smooth cone surface (not faceted). Returns part id + placement.",
+  {
+    center: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+    axis: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
+    base_radius: z.number().nonnegative(),
+    top_radius: z.number().nonnegative().default(0),
+    height: z.number().positive(),
+    name: z.string().optional(),
+  },
+  async ({ center, axis, base_radius, top_radius, height, name }) => {
+    try {
+      const r = await api("POST", "/api/geometry/cone", {
+        center,
+        axis,
+        base_radius,
+        top_radius,
+        height,
+        name: name ?? null,
+      });
+      const id = r.solid_id ?? (await newestPartId());
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "create_sphere",
+  "ONE-CALL analytic sphere of `radius` at the origin. Returns part id + placement.",
+  { radius: z.number().positive(), name: z.string().optional() },
+  async ({ radius }) => {
+    try {
+      const r = await api("POST", "/api/geometry", {
+        shape_type: "sphere",
+        parameters: { radius },
+      });
+      const id = await newestPartId();
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "revolve",
+  "Build a SOLID OF REVOLUTION from a closed meridian profile — the correct " +
+    "primitive for any axisymmetric part (nozzles, pulleys, bottles, pressure " +
+    "vessels, a whole rocket engine in one op). `profile` is a closed polygon of " +
+    "[r, z] points (radius-from-axis, height-along-axis), revolved about the axis " +
+    "(default +Z through origin, full 360°). One op, no booleans, watertight, " +
+    "structured smooth mesh. Profile must be a simple loop with all r ≥ 0 and not " +
+    "cross the axis (no r=0 pole). Hollow part = trace the wall cross-section.",
+  {
+    profile: z
+      .array(z.tuple([z.number(), z.number()]))
+      .min(3)
+      .describe("closed [r,z] meridian profile (auto-closes last→first)"),
+    axis_origin: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+    axis_direction: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
+    angle_deg: z.number().default(360),
+    segments: z.number().int().min(3).max(512).default(96),
+    name: z.string().optional(),
+  },
+  async ({ profile, axis_origin, axis_direction, angle_deg, segments, name }) => {
+    try {
+      const r = await api("POST", "/api/geometry/revolve", {
+        profile,
+        axis_origin,
+        axis_direction,
+        angle_deg,
+        segments,
+        name: name ?? null,
+      });
+      const id = r.solid_id ?? (await newestPartId());
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          triangles: r?.stats?.triangle_count ?? null,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "section_view",
+  "CUTAWAY: slice a part with a plane and return the cross-section as an image " +
+    "(steel-filled profile + section area). The way to SEE a hollow interior. " +
+    "Plane = point `p` + `normal`; an axial cut (normal ⟂ the part's axis through " +
+    "its center) reveals wall thickness, bores and internal cavities.",
+  {
+    part_id: z.number().int(),
+    p: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+    normal: z.tuple([z.number(), z.number(), z.number()]).default([1, 0, 0]),
+  },
+  async ({ part_id, p, normal }) => {
+    try {
+      const q = `nx=${normal[0]}&ny=${normal[1]}&nz=${normal[2]}&px=${p[0]}&py=${p[1]}&pz=${p[2]}`;
+      const r = await api("GET", `/api/agent/parts/${part_id}/section?${q}`);
+      return {
+        content: [
+          { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+          {
+            type: "text" as const,
+            text: `section area=${r.section_area?.toFixed?.(2)} extent_u=${r.extent_u?.toFixed?.(2)} extent_v=${r.extent_v?.toFixed?.(2)} units=${r.units}`,
+          },
+        ],
+      };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "dimension_part",
+  "DIMENSION a part in ONE call. Returns a 2×2 multi-view image with every " +
+    "analytic dimension drawn as a leader+label callout, AND the structured " +
+    "table: each row has an id (the handle a future mould edits), kind " +
+    "(extent / diameter / length / angle), value, the face ids it spans, and a " +
+    "3D anchor. Values are read off analytic surfaces / exact curves, NEVER " +
+    "measured from pixels — the id you SEE is the id you edit.",
+  { part_id: z.number().int().describe("kernel part id from list_parts") },
+  async ({ part_id }) => {
+    try {
+      const r = await api("GET", `/api/agent/parts/${part_id}/dimensions`);
+      const rows = (r.dimensions ?? [])
+        .map(
+          (d: any) =>
+            `${d.id}  ${d.label}  (${d.kind} ${d.value.toFixed(2)}${
+              d.unit === "deg" ? "°" : ""
+            })  faces=[${d.entities.join(",")}]  @[${d.anchor
+              .map((c: number) => c.toFixed(1))
+              .join(", ")}]`,
+        )
+        .join("\n");
+      const overall = `overall L×W×H = ${r.dims.l.toFixed(2)} × ${r.dims.w.toFixed(
+        2,
+      )} × ${r.dims.h.toFixed(2)} ${r.units}`;
+      return {
+        content: [
+          { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+          { type: "text" as const, text: `${overall}\n${rows}` },
+        ],
+      };
     } catch (e) {
       return fail(e);
     }
@@ -525,12 +837,19 @@ server.tool(
           point: [hx + r, hy],
         });
       }
-      await api("POST", `/api/sketch/${s.id}/extrude`, {
+      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
         distance: height,
         name: name ?? null,
       });
       const id = await newestPartId();
-      return ok({ part_id: id, placement: id !== null ? await placement(id) : null });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
     } catch (e) {
       return fail(e);
     }
@@ -564,13 +883,15 @@ server.tool(
         object_b,
       });
       const part_id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null,
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null,
+          part_id,
+          consumed: r.consumed ?? [object_a, object_b],
+          placement: part_id !== null ? await placement(part_id) : null,
+        },
         part_id,
-        consumed: r.consumed ?? [object_a, object_b],
-        placement: part_id !== null ? await placement(part_id) : null,
-        note: "verify_part this result — differences can drop faces",
-      });
+      );
     } catch (e) {
       return fail(e);
     }
@@ -733,13 +1054,16 @@ server.tool(
         name: name ?? null,
       });
       const part_id = await newestPartId();
-      return ok({
-        object_uuid: r.object?.id ?? null, // pass to `boolean` as an operand
-        part_id, // kernel id for render/verify/inspect tools
-        solid_id: r.solid_id,
-        triangles: r.stats?.triangle_count,
-        regions: r.stats?.regions,
-      });
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // pass to `boolean` as an operand
+          part_id, // kernel id for render/verify/inspect tools
+          solid_id: r.solid_id,
+          triangles: r.stats?.triangle_count,
+          regions: r.stats?.regions,
+        },
+        part_id,
+      );
     } catch (e) {
       return fail(e);
     }

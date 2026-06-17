@@ -81,6 +81,29 @@ impl TessellationParams {
             max_segments: 8, // Very low for speed
         }
     }
+
+    /// Parameters for the LIVE viewport broadcast — the mesh the server
+    /// tessellates after every interactive geometry op and pushes to the
+    /// frontend. `default()`'s 1-micron chord (and up to 100 segments per
+    /// curve) is export-grade overkill for a screen-space preview and is
+    /// the dominant per-op latency. This preset is ~10× lighter on the
+    /// chord guard while keeping curves visibly smooth (up to 64 segments,
+    /// ≈0.15 rad facets) so a part still reads cleanly on camera.
+    ///
+    /// Safe to coarsen because the live perception verdict (`watertight`,
+    /// `sound`) is computed from the EXACT B-Rep (`validate_solid_scoped`),
+    /// not from this display mesh — coarsening the preview can never flip
+    /// the soundness signal. The fine/`default()` mesh is still used for
+    /// export and the analytic agent-eye render.
+    pub fn display() -> Self {
+        Self {
+            max_edge_length: 0.5,
+            max_angle_deviation: 0.15,
+            chord_tolerance: 0.01,
+            min_segments: 8,
+            max_segments: 64,
+        }
+    }
 }
 
 /// Bridge from the wire-level `shared_types::DisplayQuality` enum
@@ -142,11 +165,81 @@ impl From<&shared_types::DisplayQuality> for TessellationParams {
 }
 
 /// Tessellate a solid into a triangle mesh
+/// Largest distance between any two boundary vertices of a solid (a cheap
+/// over-estimate of the bbox diagonal) — used to floor the chord tolerance
+/// relative to part size.
+fn solid_extent(solid: &Solid, model: &BRepModel) -> f64 {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    let mut any = false;
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+    for sh in shells {
+        let Some(shell) = model.shells.get(sh) else {
+            continue;
+        };
+        for &fid in &shell.faces {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            let mut loops = vec![face.outer_loop];
+            loops.extend_from_slice(&face.inner_loops);
+            for lid in loops {
+                let Some(lp) = model.loops.get(lid) else {
+                    continue;
+                };
+                for &eid in &lp.edges {
+                    let Some(e) = model.edges.get(eid) else {
+                        continue;
+                    };
+                    for vid in [e.start_vertex, e.end_vertex] {
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            for i in 0..3 {
+                                min[i] = min[i].min(p[i]);
+                                max[i] = max[i].max(p[i]);
+                            }
+                            any = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !any {
+        return 1.0;
+    }
+    let d = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6)
+}
+
 pub fn tessellate_solid(
     solid: &Solid,
     model: &BRepModel,
     params: &TessellationParams,
 ) -> TriangleMesh {
+    // Size-relative chord FLOOR. An absolute chord (the 0.001 mm default) is a
+    // size-blind deviation: on a 178 mm part it is 178000:1, which both wastes
+    // wall-clock (build jitter) and pushes adjacent analytic bands into a
+    // non-conforming fine-density regime (KNOWN_BUGS REVOLVE-TESS-SEAM). Floor
+    // the chord at a small fraction of the part's size so it can only get
+    // COARSER, never finer — coarse explicit chords (manifold_report's 0.5,
+    // preview's 0.01) are above the floor and untouched; only pathological
+    // over-tessellation is clamped. ~5e-4·diagonal ≈ a 6° facet on the part's
+    // gross radius — smooth for display AND watertight for export.
+    let floored;
+    let params = {
+        const REL_FLOOR: f64 = 5.0e-4;
+        let floor = solid_extent(solid, model) * REL_FLOOR;
+        if params.chord_tolerance > 0.0 && params.chord_tolerance < floor {
+            floored = TessellationParams {
+                chord_tolerance: floor,
+                ..params.clone()
+            };
+            &floored
+        } else {
+            params
+        }
+    };
     let mut mesh = TriangleMesh::new();
 
     // A single canonical edge-sample cache is shared by every face of

@@ -64,15 +64,27 @@ function persist(mode: DocumentMode | null) {
 interface DocModeState {
   /** Active workspace; `null` = show the chooser overlay. */
   mode: DocumentMode | null
+  /**
+   * Drawing the Drawing workspace should focus on its next mount, set by
+   * the viewport "Create Drawing" flow. The workspace consumes and
+   * clears this so it only steers the initial selection, not every
+   * subsequent visit. `null` = no pending navigation.
+   */
+  pendingDrawingId: string | null
   /** Pick a mode (also dismisses the chooser). */
   setMode: (mode: DocumentMode) => void
   /** Drop back to the chooser without changing the kernel state. */
   clearMode: () => void
+  /** Switch to the Drawing workspace and focus `id` once it mounts. */
+  openDrawing: (id: string) => void
+  /** Read-and-clear the pending drawing id (workspace mount handshake). */
+  consumePendingDrawing: () => string | null
 }
 
-export const useDocModeStore = create<DocModeState>((set) => ({
+export const useDocModeStore = create<DocModeState>((set, get) => ({
   // Hash wins over storage so deep links work even after a saved mode.
   mode: modeFromHash() ?? modeFromStorage(),
+  pendingDrawingId: null,
   setMode: (mode) => {
     persist(mode)
     set({ mode })
@@ -80,5 +92,14 @@ export const useDocModeStore = create<DocModeState>((set) => ({
   clearMode: () => {
     persist(null)
     set({ mode: null })
+  },
+  openDrawing: (id) => {
+    persist('drawing')
+    set({ mode: 'drawing', pendingDrawingId: id })
+  },
+  consumePendingDrawing: () => {
+    const id = get().pendingDrawingId
+    if (id !== null) set({ pendingDrawingId: null })
+    return id
   },
 }))

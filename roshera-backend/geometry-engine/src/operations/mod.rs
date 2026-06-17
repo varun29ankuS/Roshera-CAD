@@ -24,6 +24,7 @@ pub mod g2_blending;
 pub mod geometry_validity;
 pub mod loft;
 pub mod modify;
+pub mod mould;
 pub mod offset;
 pub mod pattern;
 pub mod revolve;

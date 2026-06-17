@@ -75,6 +75,12 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
         render_view(&mut out, view, h);
     }
 
+    // Dimensions in a second pass (sheet space) so they sit on top of all
+    // geometry and stay a constant size regardless of view scale.
+    for view in &drawing.views {
+        render_dimensions(&mut out, view, h);
+    }
+
     // Notes strip in the bottom-left corner of the frame.
     render_notes_strip(&mut out, frame_x, frame_y + frame_h);
 
@@ -108,7 +114,29 @@ fn write_stylesheet(out: &mut String) {
         "    .view polyline { fill: none; stroke: #111; stroke-width: 0.2; \
          stroke-linejoin: round; stroke-linecap: round; }\n",
     );
+    // Hidden line: thin dashed line, ISO 128 type-04 (occluded edges).
+    out.push_str(
+        "    .view polyline.hidden { fill: none; stroke: #111; stroke-width: 0.18; \
+         stroke-dasharray: 2 1.2; stroke-linejoin: round; stroke-linecap: butt; }\n",
+    );
+    // Analytic circles — same visible/hidden styling as the edge polylines.
+    out.push_str("    .view circle { fill: none; stroke: #111; stroke-width: 0.2; }\n");
+    out.push_str(
+        "    .view circle.hidden { fill: none; stroke: #111; stroke-width: 0.18; \
+         stroke-dasharray: 2 1.2; }\n",
+    );
+    // Centerline: thin chain (dash-dot) line, ISO 128 convention.
+    out.push_str(
+        "    .centerline { stroke: #111; stroke-width: 0.18; fill: none; \
+         stroke-dasharray: 4 1 1 1; stroke-linecap: round; }\n",
+    );
     out.push_str("    .label { font: 3.6px sans-serif; fill: #444; }\n");
+    // ISO 129 dimensions: thin black lines + filled arrowheads + a
+    // constant-size value label (centred via .dim-text-c).
+    out.push_str("    .dim-line { stroke: #111; stroke-width: 0.18; fill: none; }\n");
+    out.push_str("    .dim-arrow { fill: #111; stroke: none; }\n");
+    out.push_str("    .dim-text { font: 3.1px sans-serif; fill: #111; }\n");
+    out.push_str("    .dim-text-c { text-anchor: middle; dominant-baseline: alphabetic; }\n");
     out.push_str(
         "    .zone { font: 700 3px sans-serif; fill: #111; text-anchor: middle; \
          dominant-baseline: middle; }\n",
@@ -156,7 +184,7 @@ fn write_stylesheet(out: &mut String) {
 // ---------------------------------------------------------------------
 
 /// Frame margins (left, right, top, bottom) in mm.
-fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
+pub(crate) fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
     match sheet {
         SheetSize::A4 => (15.0, 10.0, 10.0, 10.0),
         _ => (20.0, 10.0, 10.0, 10.0),
@@ -167,7 +195,7 @@ fn frame_margins(sheet: &SheetSize) -> (f64, f64, f64, f64) {
 /// so it stays legible without dominating the drawing area. Heights are
 /// generous (`row_h >= 12 mm` for the TITLE band) so labels and values
 /// never crowd each other.
-fn title_block_size(sheet: &SheetSize) -> (f64, f64) {
+pub(crate) fn title_block_size(sheet: &SheetSize) -> (f64, f64) {
     match sheet {
         SheetSize::A4 => (170.0, 42.0),
         SheetSize::A3 => (185.0, 48.0),
@@ -233,7 +261,215 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
         out.push_str("\" />\n");
     }
 
+    // Analytic circles — true SVG circles (a circular edge facing the camera),
+    // not faceted polylines. Drawn in the same scaled/flipped view group as the
+    // polylines so the radius and centre scale identically.
+    for c in &view.circles {
+        let _ = write!(
+            out,
+            "    <circle cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\" />\n",
+            c.cx, c.cy, c.r
+        );
+    }
+    for c in &view.hidden_circles {
+        let _ = write!(
+            out,
+            "    <circle class=\"hidden\" cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\" />\n",
+            c.cx, c.cy, c.r
+        );
+    }
+
+    // Occluded edges, dashed (hidden-line removal). Drawn after the visible
+    // edges so the solid outline reads on top where they coincide.
+    for pl in &view.hidden_polylines {
+        if pl.points.len() < 2 {
+            continue;
+        }
+        out.push_str("    <polyline class=\"hidden\" points=\"");
+        for (i, p) in pl.points.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let _ = write!(out, "{:.4},{:.4}", p[0], p[1]);
+        }
+        out.push_str("\" />\n");
+    }
+
+    // Chain-line centerlines for circular features (view-space, same frame as
+    // the polylines). Drawn before dimensions so callouts sit on top.
+    for cl in &view.centerlines {
+        for s in &cl.segments {
+            let _ = write!(
+                out,
+                "    <line class=\"centerline\" x1=\"{:.4}\" y1=\"{:.4}\" \
+                 x2=\"{:.4}\" y2=\"{:.4}\" />\n",
+                s[0], s[1], s[2], s[3]
+            );
+        }
+    }
+
+    // NB: dimensions are NOT drawn here. They are rendered in a separate
+    // sheet-space pass (`render_dimensions`) so the dimension line, its
+    // extension lines, arrowheads, and text are offset CLEAR of the
+    // silhouette and stay a constant physical size regardless of the
+    // view's scale — proper ISO 129 dimensioning, not a label stamped on
+    // the geometry.
+
     out.push_str("  </g>\n");
+}
+
+// ---------------------------------------------------------------------
+// Dimensions (sheet-space — constant size, offset clear of the part)
+// ---------------------------------------------------------------------
+
+/// Map a view-space point to SVG sheet coordinates (origin top-left, y
+/// DOWN), matching the transform baked into the view's `<g>` group.
+fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
+    [
+        view.position_mm[0] + p[0] * view.scale,
+        (sheet_h - view.position_mm[1]) - p[1] * view.scale,
+    ]
+}
+
+/// Sheet-space bounding box `[x0, y0, x1, y1]` of a view's drawn edges.
+fn view_sheet_bbox(view: &ProjectedView, sheet_h: f64) -> Option<[f64; 4]> {
+    let mut x0 = f64::INFINITY;
+    let mut y0 = f64::INFINITY;
+    let mut x1 = f64::NEG_INFINITY;
+    let mut y1 = f64::NEG_INFINITY;
+    let mut any = false;
+    for pl in view.polylines.iter().chain(view.hidden_polylines.iter()) {
+        for &p in &pl.points {
+            let s = dim_to_sheet(view, sheet_h, p);
+            x0 = x0.min(s[0]);
+            x1 = x1.max(s[0]);
+            y0 = y0.min(s[1]);
+            y1 = y1.max(s[1]);
+            any = true;
+        }
+    }
+    if any && x1 > x0 && y1 > y0 {
+        Some([x0, y0, x1, y1])
+    } else {
+        None
+    }
+}
+
+/// Draw all of a view's dimension callouts in sheet space: horizontal
+/// extents below the part, vertical extents to its left, each with
+/// extension lines, inward arrowheads, and the value in a constant-size
+/// label. Stacks parallel callouts so they never overlap.
+fn render_dimensions(out: &mut String, view: &ProjectedView, sheet_h: f64) {
+    let Some(bbox) = view_sheet_bbox(view, sheet_h) else {
+        return;
+    };
+    // All constants are sheet millimetres (the SVG user unit).
+    const STANDOFF: f64 = 11.0;
+    const STACK: f64 = 8.0;
+    const GAP: f64 = 1.5;
+    const EXT: f64 = 1.5;
+    const AR_L: f64 = 2.6;
+    const AR_W: f64 = 0.85;
+    const TGAP: f64 = 1.4;
+
+    let mut below = 0.0_f64;
+    let mut left = 0.0_f64;
+
+    for d in &view.dimensions {
+        let a = dim_to_sheet(view, sheet_h, d.a);
+        let b = dim_to_sheet(view, sheet_h, d.b);
+        let dx = (a[0] - b[0]).abs();
+        let dy = (a[1] - b[1]).abs();
+
+        // Angle / point callouts have no linear span — leader-free label
+        // just outside the nearest corner.
+        if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
+            let _ = write!(
+                out,
+                "  <text class=\"dim-text\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
+                a[0] + 2.0,
+                a[1] - 2.0,
+                escape_xml(&d.label)
+            );
+            continue;
+        }
+
+        if dx >= dy {
+            // Horizontal extent → dimension line below the part.
+            let xa = a[0].min(b[0]);
+            let xb = a[0].max(b[0]);
+            let level = bbox[3] + STANDOFF + below;
+            below += STACK;
+            dim_line(out, xa, bbox[3] + GAP, xa, level + EXT);
+            dim_line(out, xb, bbox[3] + GAP, xb, level + EXT);
+            dim_line(out, xa, level, xb, level);
+            arrow_h(out, xa, level, 1.0, AR_L, AR_W);
+            arrow_h(out, xb, level, -1.0, AR_L, AR_W);
+            dim_text(out, 0.5 * (xa + xb), level - TGAP, &d.label, 0.0);
+        } else {
+            // Vertical extent → dimension line to the left of the part.
+            let ya = a[1].min(b[1]);
+            let yb = a[1].max(b[1]);
+            let level = bbox[0] - STANDOFF - left;
+            left += STACK;
+            dim_line(out, bbox[0] - GAP, ya, level - EXT, ya);
+            dim_line(out, bbox[0] - GAP, yb, level - EXT, yb);
+            dim_line(out, level, ya, level, yb);
+            arrow_v(out, level, ya, 1.0, AR_L, AR_W);
+            arrow_v(out, level, yb, -1.0, AR_L, AR_W);
+            dim_text(out, level - TGAP, 0.5 * (ya + yb), &d.label, -90.0);
+        }
+    }
+}
+
+fn dim_line(out: &mut String, x1: f64, y1: f64, x2: f64, y2: f64) {
+    let _ = write!(
+        out,
+        "  <line class=\"dim-line\" x1=\"{x1:.3}\" y1=\"{y1:.3}\" x2=\"{x2:.3}\" y2=\"{y2:.3}\" />\n"
+    );
+}
+
+/// Filled horizontal arrowhead: tip at `(x, y)`, opening toward `dir`
+/// (+1 = points right, −1 = points left).
+fn arrow_h(out: &mut String, x: f64, y: f64, dir: f64, len: f64, half_w: f64) {
+    let bx = x + dir * len;
+    let _ = write!(
+        out,
+        "  <polygon class=\"dim-arrow\" points=\"{x:.3},{y:.3} {bx:.3},{:.3} {bx:.3},{:.3}\" />\n",
+        y - half_w,
+        y + half_w
+    );
+}
+
+/// Filled vertical arrowhead: tip at `(x, y)`, opening toward `dir`
+/// (+1 = points down, −1 = points up).
+fn arrow_v(out: &mut String, x: f64, y: f64, dir: f64, len: f64, half_w: f64) {
+    let by = y + dir * len;
+    let _ = write!(
+        out,
+        "  <polygon class=\"dim-arrow\" points=\"{x:.3},{y:.3} {:.3},{by:.3} {:.3},{by:.3}\" />\n",
+        x - half_w,
+        x + half_w
+    );
+}
+
+/// Centered dimension label. `rot` (degrees) rotates it about its anchor
+/// — −90 for the vertical callouts so the text reads bottom-to-top.
+fn dim_text(out: &mut String, x: f64, y: f64, label: &str, rot: f64) {
+    if rot.abs() < 1e-6 {
+        let _ = write!(
+            out,
+            "  <text class=\"dim-text dim-text-c\" x=\"{x:.3}\" y=\"{y:.3}\">{}</text>\n",
+            escape_xml(label)
+        );
+    } else {
+        let _ = write!(
+            out,
+            "  <text class=\"dim-text dim-text-c\" x=\"{x:.3}\" y=\"{y:.3}\" \
+             transform=\"rotate({rot:.1} {x:.3} {y:.3})\">{}</text>\n",
+            escape_xml(label)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

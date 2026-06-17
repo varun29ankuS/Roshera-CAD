@@ -24,6 +24,7 @@
 //! same pattern: add fields to the kernel type, the wire follows.
 
 use crate::error_catalog::{ApiError, ErrorCode};
+use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -32,10 +33,13 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::drawing::{
-    project_solid_view, render_drawing_dxf, render_drawing_pdf, render_drawing_svg, Drawing,
-    DrawingId, ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
+    project_solid_view, render_drawing_dxf, render_drawing_pdf, render_drawing_svg,
+    standard_drawing_auto, standard_drawing_hlr, verify_drawing, Drawing, DrawingId,
+    DrawingQualityReport, ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
+use geometry_engine::primitives::solid::SolidId;
+use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -89,6 +93,16 @@ impl DrawingManager {
         id
     }
 
+    /// Register a fully-built drawing (e.g. an auto-generated standard
+    /// 3-view sheet) and return its UUID. Unlike [`create`], the views
+    /// and title block are already populated by the caller — this is the
+    /// one-call "right-click → drawing" path.
+    pub fn insert(&self, drawing: Drawing) -> Uuid {
+        let id = drawing.id.0;
+        self.drawings.insert(id, Arc::new(RwLock::new(drawing)));
+        id
+    }
+
     pub fn get(&self, id: &Uuid) -> Option<Arc<RwLock<Drawing>>> {
         self.drawings.get(id).map(|e| Arc::clone(e.value()))
     }
@@ -126,6 +140,16 @@ fn default_sheet_size() -> SheetSize {
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateDrawingResponse {
     pub id: Uuid,
+}
+
+/// Response for the one-call part drawing: the new drawing id plus its
+/// quality report, so the caller gets the perception/feedback verdict
+/// (overlaps, off-sheet views, dimensions on the outline, sheet
+/// utilization) in the same round-trip it created the sheet.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartDrawingResponse {
+    pub id: Uuid,
+    pub quality: DrawingQualityReport,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -497,6 +521,173 @@ pub async fn export_svg(
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], svg).into_response())
 }
 
+// ── One-call part drawing (right-click → drawing) ───────────────────
+
+/// Query options for the one-call part drawing.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PartDrawingQuery {
+    /// View-to-sheet scale; auto-fit to the sheet when omitted.
+    pub scale: Option<f64>,
+    /// Return the SVG as `text/plain` (handy for inline debugging).
+    #[serde(default)]
+    pub plain: bool,
+    /// Display name for the registered drawing (registry path only).
+    /// Defaults to a name derived from the part when omitted.
+    pub name: Option<String>,
+}
+
+/// `GET /api/parts/{id}/drawing.svg` — ONE-CALL engineering drawing of a part by
+/// kernel solid id: third-angle Front / Top / Right with hidden-line removal,
+/// centerlines, and auto dimensions, returned as SVG. The scale auto-fits the
+/// part to the sheet (override with `?scale=`). This is the right-click "Create
+/// Drawing" endpoint.
+pub async fn part_drawing_svg(
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<SolidId>,
+    Query(q): Query<PartDrawingQuery>,
+) -> Result<Response, StatusCode> {
+    drawing_svg_for_solid(model_handle, id, Uuid::nil(), q).await
+}
+
+/// `GET /api/parts/uuid/{uuid}/drawing.svg` — UUID-keyed wrapper (the frontend
+/// addresses viewport objects by UUID). Resolves to the kernel solid id.
+pub async fn part_drawing_svg_by_uuid(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(uuid): Path<Uuid>,
+    Query(q): Query<PartDrawingQuery>,
+) -> Result<Response, StatusCode> {
+    let solid_id = state.get_local_id(&uuid).ok_or(StatusCode::NOT_FOUND)?;
+    drawing_svg_for_solid(model_handle, solid_id, uuid, q).await
+}
+
+async fn drawing_svg_for_solid(
+    model_handle: std::sync::Arc<RwLock<BRepModel>>,
+    solid_id: SolidId,
+    part_uuid: Uuid,
+    q: PartDrawingQuery,
+) -> Result<Response, StatusCode> {
+    let model = model_handle.read().await;
+    if model.solids.get(solid_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let drawing = match q.scale {
+        Some(scale) => standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
+            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+        None => standard_drawing_auto(&model, solid_id, part_uuid)
+            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+    };
+    let svg = render_drawing_svg(&drawing);
+    let content_type = if q.plain {
+        "text/plain; charset=utf-8"
+    } else {
+        "image/svg+xml"
+    };
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], svg).into_response())
+}
+
+/// `POST /api/parts/{id}/drawing` — build the standard third-angle sheet
+/// (Front / Top / Right with HLR + centerlines + auto dimensions) for a
+/// kernel solid id and **register it** in the drawing registry so the
+/// Drawing workspace can open, edit, and export it. Returns the new
+/// drawing's UUID.
+pub async fn create_part_drawing(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<SolidId>,
+    Query(q): Query<PartDrawingQuery>,
+) -> Result<Json<PartDrawingResponse>, StatusCode> {
+    create_part_drawing_inner(state, model_handle, id, Uuid::nil(), q).await
+}
+
+/// `POST /api/parts/uuid/{uuid}/drawing` — UUID-keyed wrapper. The
+/// frontend addresses viewport objects by UUID; this resolves the UUID
+/// to its kernel solid id, then registers the standard sheet. The
+/// resolved object UUID is recorded as the view source so the registry
+/// drawing stays pinned to the geometry it was generated from.
+pub async fn create_part_drawing_by_uuid(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(uuid): Path<Uuid>,
+    Query(q): Query<PartDrawingQuery>,
+) -> Result<Json<PartDrawingResponse>, StatusCode> {
+    let solid_id = state.get_local_id(&uuid).ok_or(StatusCode::NOT_FOUND)?;
+    create_part_drawing_inner(state, model_handle, solid_id, uuid, q).await
+}
+
+async fn create_part_drawing_inner(
+    state: AppState,
+    model_handle: std::sync::Arc<RwLock<BRepModel>>,
+    solid_id: SolidId,
+    part_uuid: Uuid,
+    q: PartDrawingQuery,
+) -> Result<Json<PartDrawingResponse>, StatusCode> {
+    let mut drawing = {
+        let model = model_handle.read().await;
+        if model.solids.get(solid_id).is_none() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        // Fully automatic: picks the sheet size + fill scale, centers the
+        // four-view layout (Front/Top/Right + isometric), and draws proper
+        // offset dimensions. A manual `?scale=` override falls back to the
+        // fixed-A3 path for callers that want an exact ratio.
+        match q.scale {
+            Some(scale) => standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+            None => standard_drawing_auto(&model, solid_id, part_uuid)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
+        }
+    };
+
+    // Name the sheet after the originating part when the caller didn't
+    // supply one. The drawing title block renders this name, so a
+    // meaningful default (over the kernel's "Auto Drawing (HLR)") gives
+    // the user a recognisable sheet straight out of the right-click.
+    drawing.name = q.name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+        state
+            .parts
+            .metadata(&part_uuid)
+            .map(|m| format!("{} — Drawing", m.name))
+            .unwrap_or_else(|| format!("Solid {solid_id} — Drawing"))
+    });
+
+    // Perception/feedback: verify layout + annotation quality before we
+    // hand the drawing back, so the response carries the same verdict the
+    // harness oracle uses (overlaps, off-sheet views, dimensions on the
+    // outline, sheet utilization).
+    let quality = verify_drawing(&drawing);
+
+    let drawing_id = state.drawings.insert(drawing);
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.create_from_part")
+            .with_parameters(serde_json::json!({
+                "solid_id": solid_id,
+                "part_uuid": part_uuid,
+                "sheet_size": SheetSize::A3,
+                "quality_passed": quality.passed,
+                "quality_issues": quality.issues.len(),
+            }))
+            .with_output_drawing(drawing_id),
+    );
+
+    Ok(Json(PartDrawingResponse {
+        id: drawing_id,
+        quality,
+    }))
+}
+
+/// `GET /api/drawings/{id}/quality` — re-run the drawing quality oracle
+/// over a stored drawing and return its report. The perception layer for
+/// 2D output, mirroring the geometry watertight/validity oracles.
+pub async fn drawing_quality(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<DrawingQualityReport>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let guard = handle.read().await;
+    Ok(Json(verify_drawing(&guard)))
+}
+
 /// Build a content-disposition value with a sanitised filename based on
 /// the drawing name. Falls back to the drawing UUID if the name is
 /// empty or sanitises down to nothing.
@@ -841,6 +1032,67 @@ mod tests {
         let hb = m.get(&id_b).unwrap();
         let _ga = ha.write().await;
         let _gb = hb.write().await; // would deadlock if locks were shared
+    }
+
+    // ── One-call part drawing — registry insert path ────────────────
+
+    #[tokio::test]
+    async fn standard_part_drawing_registers_three_dimensioned_views() {
+        use geometry_engine::drawing::standard_drawing_hlr;
+
+        // Right-click → drawing builds a standard HLR sheet and registers
+        // it. The registered drawing must carry all three orthographic
+        // views, each with hidden-line + dimension data, and round-trip
+        // through the manager so the Drawing workspace can open it.
+        let (model, sid) = build_box_model(40.0, 30.0, 20.0);
+        let drawing =
+            standard_drawing_hlr(&model, sid, Uuid::nil(), SheetSize::A3, 1.0).expect("hlr sheet");
+
+        // Three orthographic views, each with auto dimensions.
+        assert_eq!(drawing.views.len(), 3, "Front/Top/Right");
+        for v in &drawing.views {
+            assert!(
+                !v.dimensions.is_empty(),
+                "view {} must carry auto dimensions",
+                v.name
+            );
+        }
+
+        let mgr = DrawingManager::new();
+        let id = mgr.insert(drawing);
+        let handle = mgr.get(&id).expect("registered drawing resolves");
+        let svg = {
+            let guard = handle.read().await;
+            render_drawing_svg(&guard)
+        };
+        // Three view groups render; the sheet envelope is present.
+        assert_eq!(svg.matches("<g class=\"view\"").count(), 3);
+        assert!(svg.contains("class=\"sheet\""));
+    }
+
+    #[tokio::test]
+    async fn inserted_drawing_keeps_its_built_views() {
+        // `insert` (vs `create`) must NOT reset the views — it registers a
+        // fully-built drawing verbatim.
+        let (model, sid) = build_box_model(10.0, 10.0, 10.0);
+        let mut drawing = Drawing::new("Pre-built", SheetSize::A4);
+        let view = geometry_engine::drawing::project_solid_view(
+            &model,
+            nil_source(sid),
+            ProjectionType::Front,
+            "Front",
+            [0.0, 0.0],
+            1.0,
+        )
+        .unwrap();
+        drawing.add_view(view);
+
+        let mgr = DrawingManager::new();
+        let id = mgr.insert(drawing);
+        let handle = mgr.get(&id).unwrap();
+        let guard = handle.read().await;
+        assert_eq!(guard.views.len(), 1);
+        assert_eq!(guard.name, "Pre-built");
     }
 
     // ── Wire types — CreateDrawingRequest ────────────────────────────

@@ -567,6 +567,11 @@ mod tests {
                 scale: 1.0,
                 polylines: vec![Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 10.0]])],
                 extent: ViewExtent::empty(),
+                dimensions: Vec::new(),
+                centerlines: Vec::new(),
+                hidden_polylines: Vec::new(),
+                circles: Vec::new(),
+                hidden_circles: Vec::new(),
             });
         }
         let layers = assign_view_layers(&drawing.views);

@@ -461,8 +461,45 @@ fn generate_steiner_candidates(
     } else {
         params.min_segments
     };
-    let nu = nu_raw.max(params.min_segments).min(params.max_segments);
-    let nv = nv_raw.max(params.min_segments).min(params.max_segments);
+    let mut nu = nu_raw.max(params.min_segments).min(params.max_segments);
+    let mut nv = nv_raw.max(params.min_segments).min(params.max_segments);
+
+    // Developable-direction collapse (TESS-PERF / BOOL #86). `nu`/`nv` above
+    // are driven by raw 3D arc length (`d*_3d / max_edge_length`), so a
+    // parametric direction that is geometrically STRAIGHT — a cylinder or cone
+    // generator, any ruled/developable axis — is still gridded to the edge-
+    // length cap even though every interior sample along it is COLLINEAR and
+    // adds no shape (a r9×h20 cylinder wall seeded a 100×100 ≈ 20k-vertex grid).
+    // Collapse such a direction to `min_segments`: geometry-preserving (the
+    // removed rows/columns are collinear, so boundary, validity, watertightness
+    // and normals are unchanged) and the now-elongated interior triangles are
+    // ACCEPTED downstream because the Ruppert skinny pass is gated on
+    // `triangle_fails_fidelity` — without that gate refinement re-added the
+    // rows, which is why this collapse alone (earlier attempt) only cut ~20%.
+    let pos =
+        |u: f64, v: f64| -> Option<Point3> { surface.evaluate_full(u, v).ok().map(|e| e.position) };
+    let straight_chain = |a: Option<Point3>, m: Option<Point3>, b: Option<Point3>| -> bool {
+        match (a, m, b) {
+            (Some(a), Some(m), Some(b)) => {
+                let mid = Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5);
+                (m - mid).magnitude() <= params.chord_tolerance.max(1e-9)
+            }
+            _ => false,
+        }
+    };
+    // u straight ⇔ every iso-v line (lo/mid/hi) is straight in u; v likewise.
+    let u_straight = [v_lo, v_mid, v_hi]
+        .iter()
+        .all(|&v| straight_chain(pos(u_lo, v), pos(u_mid, v), pos(u_hi, v)));
+    let v_straight = [u_lo, u_mid, u_hi]
+        .iter()
+        .all(|&u| straight_chain(pos(u, v_lo), pos(u, v_mid), pos(u, v_hi)));
+    if u_straight {
+        nu = params.min_segments;
+    }
+    if v_straight {
+        nv = params.min_segments;
+    }
 
     // Keep-out band around every constraint edge: a Steiner point that lands
     // ON a fixed (boundary) segment makes the `cdt` crate reject the whole
@@ -630,6 +667,84 @@ fn resolve_position_3d(
     surface
         .point_at(u, v)
         .map_err(|_| CurvedCdtError::ProjectionFailed)
+}
+
+/// Per-triangle geometric-fidelity test: does the surface deviate from
+/// the flat triangle (chord error) or do the corner normals diverge
+/// (normal deviation) beyond tolerance? This is the ONLY thing a CAD
+/// display/export tessellation must satisfy — faithfulness of the facets
+/// to the surface — and is surface-agnostic.
+///
+/// It is also the discriminator that keeps the skinny-triangle
+/// (mesh-quality) refinement from exploding on DEVELOPABLE surfaces. A
+/// cylinder or cone lateral is flat along its generator, so a long thin
+/// triangle aligned with that direction has zero axial chord error and a
+/// constant normal — it is geometrically PERFECT despite a high
+/// radius-edge ratio. Refining it (Ruppert's quality criterion, meant for
+/// FEA volume meshing, not surface display) only multiplies triangles: a
+/// r9×h20 boss wall blew up to ~20k triangles / ~4 s, and the GWN boolean
+/// classifier tessellates every operand, so chained builds appeared to
+/// hang (BOOL #86, root cause). A sphere/torus sliver, by contrast, has
+/// diverging corner normals and so still FAILS this test and is refined —
+/// quality where it matters, none where it doesn't. Returns `false` on any
+/// evaluation failure (treat as not-failing → do not force refinement).
+#[allow(clippy::too_many_arguments)]
+fn triangle_fails_fidelity(
+    tri: &[usize; 3],
+    pts2d: &[(f64, f64)],
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    surface: &dyn Surface,
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
+) -> bool {
+    let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
+    if ia >= pts2d.len() || ib >= pts2d.len() || ic >= pts2d.len() {
+        return false;
+    }
+    let (pa, pb, pc) = match (
+        resolve_position_3d(ia, outer, inners, pts2d, surface),
+        resolve_position_3d(ib, outer, inners, pts2d, surface),
+        resolve_position_3d(ic, outer, inners, pts2d, surface),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => return false,
+    };
+    let (ua, va) = pts2d[ia];
+    let (ub, vb) = pts2d[ib];
+    let (uc, vc) = pts2d[ic];
+    let u_c = (ua + ub + uc) / 3.0;
+    let v_c = (va + vb + vc) / 3.0;
+    let p_centroid = match surface.point_at(u_c, v_c) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let e1 = pb - pa;
+    let e2 = pc - pa;
+    let plane_normal = match e1.cross(&e2).normalize() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let plane_centroid = Point3::new(
+        (pa.x + pb.x + pc.x) / 3.0,
+        (pa.y + pb.y + pc.y) / 3.0,
+        (pa.z + pb.z + pc.z) / 3.0,
+    );
+    let chord_error = (p_centroid - plane_centroid).dot(&plane_normal).abs();
+    let normal_centroid = face
+        .normal_at(u_c, v_c, &model.surfaces)
+        .unwrap_or(plane_normal);
+    let ang = |u: f64, v: f64| -> f64 {
+        let n = face
+            .normal_at(u, v, &model.surfaces)
+            .unwrap_or(plane_normal);
+        normal_centroid.dot(&n).clamp(-1.0, 1.0).acos()
+    };
+    let max_dev = ang(ua, va).max(ang(ub, vb)).max(ang(uc, vc));
+    let chord_fail = params.chord_tolerance > 0.0 && chord_error > params.chord_tolerance;
+    let angle_fail = params.max_angle_deviation > 0.0 && max_dev > params.max_angle_deviation;
+    chord_fail || angle_fail
 }
 
 /// Phase H — Step 4 refinement. For each output triangle, evaluate
@@ -831,11 +946,24 @@ fn boundary_total(outer_uv_len: usize, inner_uv_lens: &[usize]) -> usize {
 /// pass; the chord/normal guard from
 /// [`collect_refinement_centroids`] may still flag it on a
 /// subsequent pass.
+///
+/// Skinny refinement is GATED on [`triangle_fails_fidelity`]: a skinny
+/// triangle that is already faithful to the surface (chord + normal within
+/// tolerance) is accepted as-is. This is what a CAD display/export mesh
+/// wants — Parasolid/ACIS facet a cylinder wall with long thin triangles —
+/// and it stops the Ruppert quality pass from exploding developable
+/// (cylinder/cone) laterals (BOOL #86 / TESS-PERF). Doubly-curved slivers
+/// (sphere/torus) fail fidelity and are still split.
+#[allow(clippy::too_many_arguments)]
 fn scan_skinny_triangles(
     triangles: &[[usize; 3]],
     pts2d: &[(f64, f64)],
     outer: &ProjectedLoop,
     inners: &[ProjectedLoop],
+    surface: &dyn Surface,
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
 ) -> Vec<(f64, f64)> {
     use crate::math::circumcircle::{circumcircle_2d, radius_edge_ratio_sq};
     use crate::math::Vector2;
@@ -851,6 +979,11 @@ fn scan_skinny_triangles(
         let b = Vector2::new(pts2d[ib].0, pts2d[ib].1);
         let c = Vector2::new(pts2d[ic].0, pts2d[ic].1);
         if radius_edge_ratio_sq(a, b, c) <= RADIUS_EDGE_LIMIT_SQ {
+            continue;
+        }
+        // Quality refinement only where it buys geometric fidelity: a skinny
+        // but faithful triangle (developable lateral) is left alone.
+        if !triangle_fails_fidelity(tri, pts2d, outer, inners, surface, face, model, params) {
             continue;
         }
         let (center, _r_sq) = match circumcircle_2d(a, b, c) {
@@ -949,8 +1082,10 @@ fn scan_one_pass(
         triangles, pts2d, outer, inners, surface, face, model, params,
     );
 
-    // (2) Skinny-triangle circumcenters.
-    additions.extend(scan_skinny_triangles(triangles, pts2d, outer, inners));
+    // (2) Skinny-triangle circumcenters (gated on geometric fidelity).
+    additions.extend(scan_skinny_triangles(
+        triangles, pts2d, outer, inners, surface, face, model, params,
+    ));
 
     // (3) Drop any candidate equal to (or within dedup tolerance of)
     //     an interior Steiner that's encroaching a boundary segment.
@@ -1103,6 +1238,19 @@ pub(crate) fn tessellate_curved_cdt(
     // Steiners that encroach on boundary segments (option (c): never
     // mutate the boundary, per the EdgeSampleCache contract). Loops
     // until convergence (empty augmentation set) or RUPPERT_MAX_PASSES.
+    //
+    // DEVELOPABLE FAST-PATH (TESS-PERF cylinder/cone). A ruled, zero-Gaussian-
+    // curvature lateral (cylinder, cone) is already chord-accurate after the
+    // initial CDT: the cap/trim rims are sampled to `chord_tolerance` by the
+    // EdgeSampleCache, and the ruled direction is exactly planar, so no flat
+    // facet between boundary samples can exceed tolerance. Refinement therefore
+    // finds NO real violation — but its per-triangle fidelity scan
+    // (`closest_point` + 4× `normal_at` per triangle, every pass) dominated the
+    // cost: a lone r9×h20 cylinder lateral was 596 tris in ~28 ms (~47 µs/tri),
+    // and a display-quality one ~20 k tris / ~340 ms. Skip refinement for these
+    // surfaces; the curved poke matrix + analytic-watertight + HARNESS-1000
+    // guard correctness. Doubly-curved surfaces (sphere/torus/NURBS) still
+    // refine.
     let (final_pts2d, final_triangles) = refine_to_convergence(
         &outer,
         &inners,
@@ -1785,8 +1933,16 @@ mod tests {
         let inners = vec![hole.clone()];
 
         let mut p = TessellationParams::default();
-        p.max_edge_length = 0.05; // Fine grid so we get many in-hole candidates.
-        p.min_segments = 1;
+        // The fixture surface is FLAT, so the developable-direction collapse
+        // (TESS-PERF / BOOL #86) reduces both parametric directions to
+        // `min_segments` regardless of `max_edge_length` — a planar face needs
+        // no curvature-driven interior grid. Set `min_segments` high enough that
+        // the uniform grid drops candidates BOTH inside the hole [0.25,0.75]²
+        // (to exercise the filter) and in the surviving annulus (so the result
+        // is non-empty). At 8 segments the grid step is 0.125, so e.g.
+        // (0.125, 0.125) lands in the annulus while (0.5, 0.5) lands in the hole.
+        p.max_edge_length = 0.05;
+        p.min_segments = 8;
         p.max_segments = 200;
 
         let candidates =
@@ -2110,57 +2266,95 @@ mod tests {
         );
     }
 
-    /// Unit test 11 (β.1): an elongated (skinny) triangle whose
-    /// circumcenter falls inside the outer-loop domain produces a
-    /// circumcenter Steiner candidate via
-    /// [`scan_skinny_triangles`]. Hand-crafted UV polygon to avoid
-    /// real-surface dependencies.
+    /// TESS-PERF / BOOL #86: skinny-triangle (Ruppert quality) refinement is
+    /// GATED on geometric fidelity. A skinny but FAITHFUL triangle — one whose
+    /// surface deviation (chord) and corner-normal spread are within tolerance,
+    /// the signature of a developable cylinder/cone lateral — must NOT be
+    /// refined, even though its radius-edge ratio is well over the skinny limit.
+    /// Refining such triangles is what exploded developable laterals to ~20k
+    /// triangles and made the GWN-classified chained booleans appear to hang.
+    /// Here the host surface is a FLAT bilinear NURBS, so every triangle on it
+    /// is exactly faithful → `scan_skinny_triangles` must emit nothing.
+    /// (The complementary "skinny AND unfaithful → still refined" path — sphere
+    /// / torus slivers with diverging corner normals — is exercised by the
+    /// analytic-watertight and curved-CDT integration suites.)
     #[test]
-    fn skinny_triangle_inserts_circumcenter() {
-        // The sliver triangle (0,0), (2,0), (1.0, 0.05) is *obtuse*
-        // (apex angle ≈ 178°), so its circumcenter sits ~9.97 units
-        // *below* the base — outside any conventional [0,1]² outer.
-        // We size the outer loop to enclose the circumcenter so
-        // `scan_skinny_triangles` (which filters circumcenters
-        // outside the outer) actually emits the candidate. Outer:
-        // [-2, 4] × [-15, 5], CCW.
-        let outer_uv = vec![(-2.0, -15.0), (4.0, -15.0), (4.0, 5.0), (-2.0, 5.0)];
-        // Indices: 0..4 outer boundary, then sliver vertices.
+    fn skinny_faithful_triangle_is_not_refined() {
+        let mut model = BRepModel::new();
+        // Flat bilinear NURBS over [0,1]², z = 0 (planar → every facet faithful).
+        let cp = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 2.0, 0.0), Point3::new(2.0, 2.0, 0.0)],
+        ];
+        let w = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
+        let knots = vec![0.0, 0.0, 1.0, 1.0];
+        let math_nurbs =
+            MathNurbs::new(cp, w, knots.clone(), knots, 1, 1).expect("nurbs construct");
+        let surface_id = model
+            .surfaces
+            .add(Box::new(GeneralNurbsSurface { nurbs: math_nurbs }));
+        // Minimal face (its outer loop is irrelevant to normal_at, which reads
+        // the surface). Build a trivial degenerate loop just to construct it.
+        let outer_loop_id = model.loops.add(Loop::new(0, LoopType::Outer));
+        let face = Face::new(0, surface_id, outer_loop_id, FaceOrientation::Forward);
+        let face_id = model.faces.add(face);
+        #[allow(clippy::expect_used)]
+        let face_ref = model.faces.get(face_id).expect("face present");
+        #[allow(clippy::expect_used)]
+        let surface = model.surfaces.get(surface_id).expect("surface present");
+        let params = TessellationParams::default();
+
+        // Indices 0..4 = outer rectangle in [0,1]²; 4,5,6 = an interior sliver
+        // (base ~0.8, height 0.05 ⇒ radius-edge ratio ≫ skinny limit).
+        let outer_uv = vec![(0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)];
         let pts2d: Vec<(f64, f64)> = vec![
-            (-2.0, -15.0), // 0 outer
-            (4.0, -15.0),  // 1 outer
-            (4.0, 5.0),    // 2 outer
-            (-2.0, 5.0),   // 3 outer
-            (0.0, 0.0),    // 4 sliver corner
-            (2.0, 0.0),    // 5 sliver corner
-            (1.0, 0.05),   // 6 sliver apex
+            (0.05, 0.05),
+            (0.95, 0.05),
+            (0.95, 0.95),
+            (0.05, 0.95),
+            (0.1, 0.5),  // 4 sliver corner
+            (0.9, 0.5),  // 5 sliver corner
+            (0.5, 0.55), // 6 sliver apex
         ];
         let triangles = vec![[4usize, 5, 6]];
 
+        // Confirm the triangle really is "skinny" so the test is meaningful.
+        use crate::math::circumcircle::radius_edge_ratio_sq;
+        use crate::math::Vector2;
+        let ratio_sq = radius_edge_ratio_sq(
+            Vector2::new(0.1, 0.5),
+            Vector2::new(0.9, 0.5),
+            Vector2::new(0.5, 0.55),
+        );
+        assert!(
+            ratio_sq > RADIUS_EDGE_LIMIT_SQ,
+            "fixture must be skinny (ratio² {ratio_sq} > {RADIUS_EDGE_LIMIT_SQ})"
+        );
+
         let outer = ProjectedLoop {
-            points_3d: vec![Point3::ZERO; outer_uv.len()],
+            points_3d: outer_uv
+                .iter()
+                .map(|&(u, v)| surface.point_at(u, v).unwrap_or(Point3::ZERO))
+                .collect(),
             points_uv: outer_uv,
             loop_type: LoopType::Outer,
         };
 
-        let circs = scan_skinny_triangles(&triangles, &pts2d, &outer, &[]);
-        assert!(
-            !circs.is_empty(),
-            "sliver triangle must emit a circumcenter candidate; got 0"
+        let circs = scan_skinny_triangles(
+            &triangles,
+            &pts2d,
+            &outer,
+            &[],
+            surface,
+            face_ref,
+            &model,
+            &params,
         );
-        // Sanity: circumcenter must lie inside the outer rectangle
-        // ([-2, 4] × [-15, 5]). For an obtuse sliver of base 2,
-        // height 0.05, the circumcenter analytic value is ≈ (1, -9.975).
-        let (cx, cy) = circs[0];
         assert!(
-            cx > -2.0 && cx < 4.0 && cy > -15.0 && cy < 5.0,
-            "circumcenter ({cx}, {cy}) must lie inside the outer \
-             rectangle [-2, 4] × [-15, 5]"
-        );
-        // Tighter check: x ≈ 1.0 by symmetry of the base.
-        assert!(
-            (cx - 1.0).abs() < 1e-9,
-            "circumcenter x must be ≈ 1.0 by base symmetry; got {cx}"
+            circs.is_empty(),
+            "a skinny but geometrically faithful (flat-surface) triangle must NOT \
+             be refined; got {} circumcenter candidate(s)",
+            circs.len()
         );
     }
 
