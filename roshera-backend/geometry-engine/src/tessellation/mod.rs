@@ -81,6 +81,29 @@ impl TessellationParams {
             max_segments: 8, // Very low for speed
         }
     }
+
+    /// Parameters for the LIVE viewport broadcast — the mesh the server
+    /// tessellates after every interactive geometry op and pushes to the
+    /// frontend. `default()`'s 1-micron chord (and up to 100 segments per
+    /// curve) is export-grade overkill for a screen-space preview and is
+    /// the dominant per-op latency. This preset is ~10× lighter on the
+    /// chord guard while keeping curves visibly smooth (up to 64 segments,
+    /// ≈0.15 rad facets) so a part still reads cleanly on camera.
+    ///
+    /// Safe to coarsen because the live perception verdict (`watertight`,
+    /// `sound`) is computed from the EXACT B-Rep (`validate_solid_scoped`),
+    /// not from this display mesh — coarsening the preview can never flip
+    /// the soundness signal. The fine/`default()` mesh is still used for
+    /// export and the analytic agent-eye render.
+    pub fn display() -> Self {
+        Self {
+            max_edge_length: 0.5,
+            max_angle_deviation: 0.15,
+            chord_tolerance: 0.01,
+            min_segments: 8,
+            max_segments: 64,
+        }
+    }
 }
 
 /// Bridge from the wire-level `shared_types::DisplayQuality` enum

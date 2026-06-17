@@ -9,6 +9,40 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ---
 
+## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
+Differencing a small axial cylinder (bolt hole) out of a REVOLVED solid's
+annular flange PANICS the kernel and — because the release profile is
+`panic="abort"` — takes the whole api-server process down:
+```
+thread 'tokio-runtime-worker' panicked at cdt-0.1.0/src/triangulate.rs:965:
+Failed to create fixed edge
+```
+Repro: revolve the thrust-chamber profile
+`[[70,0],[50,30],[30,60],[15,90],[25,105],[35,120],[35,200],[58,200],[58,178],[43,178],[43,120],[33,105],[23,90],[38,60],[58,30],[78,0]]`
+(integral flange → annular planar top z=200 r35-58 + bottom z=178 r43-58), then
+`difference` a Ø8 cylinder at radius 50. Reproduced BOTH with a tall cylinder
+(z0-210, also pierces the nozzle cone) AND a short flange-only cylinder
+(z170-205, custom plane origin) AND at full `default()` tessellation — so it is
+NOT the cone and NOT tessellation coarseness. Root: the boolean RESULT's planar
+flange face becomes an annulus carrying a SECOND, non-concentric hole (the bolt),
+and `cdt` fails to insert a constrained (fixed) hole-boundary edge → panic. Same
+#24 curved/planar-CDT-with-holes family. Simple booleans (box ∖ cylinder = bored
+plate) still work; it is specifically the bore into a revolved annular flange.
+TWO fixes needed: (1) harden the planar-CDT path for an annular face with an
+offset hole (the actual bug); (2) panic-ISOLATE the broadcast/perception
+tessellation so a kernel panic can't kill the server — but release is
+`panic="abort"`, so `catch_unwind` is a no-op; either build api-server with
+`panic="unwind"` or tessellate in a process/worker that can't abort the server.
+Until fixed: do NOT bore bolt circles into a revolved flange on the live server.
+NOTE: the coarse `display()` preset added 2026-06-17 AMPLIFIED a related curved
+case; it was REVERTED (all three api-server `tessellate_solid` broadcast sites
+back to `default()`); the `display()` preset definition remains (unused) in
+`tessellation/mod.rs`, blocked on this fix + panic-isolation. The
+`perception_json` watertight-from-B-Rep decouple (api-server/src/main.rs) was
+KEPT — it is mesh-independent and correct.
+
+---
+
 ## Tessellation
 
 ### #51 🟢 FIXED — short-protrusion boss tessellated non-manifold (valid B-Rep)
@@ -740,6 +774,33 @@ now sits on the true COM instead of the seam. Regression:
 `topology_builder::…::solid_world_bbox_captures_cylinder_radial_extent_42`
 (cylinder r10 h40 → AABB x[-10,10] y[-10,10] z[0,40], centre (0,0,20)).
 Suites green: readable 60, topology_builder 67, mass-inertia harnesses.
+
+## Rocket-engine live build (2026-06-17) — two limits surfaced
+
+### UNION-INTO-HOLLOW-REVOLVE 🔴 union of a solid into a hollow revolved body → non-manifold
+Building the thrust chamber: unioning a solid cylinder (injector flange) into the
+hollow revolved chamber failed — coincident-face base → 100 open; interpenetrating
+→ 300 non-manifold + volume LOSS. The union of a solid that spans the chamber's
+CAVITY + curved hollow wall (14-face revolved body: inner wall + outer wall +
+bands + caps) overwhelms the boolean. WORKAROUND THAT WORKS: build the flange INTO
+the revolve meridian profile (a wider rim band) — one watertight revolve, no
+union — then bore the bolt circle (6× Ø8 chained differences ALL clean,
+watertight, sound). So axisymmetric features → put them in the profile; bores →
+fine; but discrete ribs / side mounting lugs (non-axisymmetric unions onto the
+hollow body) hit this limit. Fix lane = boolean robustness for union vs a
+multi-face hollow revolved operand (#32/#84 corefinement family). Repro: revolve
+a hollow nozzle profile, create_cylinder flange, union → 300 nm.
+
+### SECTION-DROPS-REVOLVE-BANDS 🔴 section_view of a revolved hollow part captures only planar/cylindrical faces
+An axial section (plane ∋ axis) of the hollow thrust chamber returned only the
+FLANGE cross-section (extent_v=22mm of a 200mm part, area 176) — the curved
+SurfaceOfRevolution bands (bell, throat, chamber taper) were dropped, so the
+de Laval meridian never shows. The engine itself is sound (watertight, valid,
+render correct); this is a section/SSI gap on SurfaceOfRevolution faces (the
+section marcher handles Plane/Cylinder but not the revolution bands). Ties to the
+section lane (#85/#9). Fix lane = SSI arm for SurfaceOfRevolution in the section
+clip. Repro: revolve a hollow profile, section_view normal [0,1,0] → only the
+flange band appears.
 
 ## Mass properties / volume / verification honesty (2026-06-17 live dogfood)
 

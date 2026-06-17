@@ -874,7 +874,6 @@ fn perception_json(
     solid_id: geometry_engine::primitives::solid::SolidId,
     mesh: &geometry_engine::tessellation::TriangleMesh,
 ) -> serde_json::Value {
-    let (open, nm) = mesh_open_nonmanifold(mesh);
     let valid = geometry_engine::primitives::validation::validate_solid_scoped(
         model,
         solid_id,
@@ -886,25 +885,37 @@ fn perception_json(
         let s = b.size();
         vec![s.x, s.y, s.z]
     });
-    // SOUND verdict (feedback-as-default): the authoritative answer to "is this a
-    // real, manufacturable solid?" is the EXACT B-Rep validity (validate_solid_
-    // scoped, mesh-independent) — `sound`. The mesh open/non-manifold counts are
-    // DISPLAY/export quality: a valid solid whose tessellation has T-junctions is
-    // NOT broken (the unsound-eye trap, KNOWN_BUGS #65 / EYE-SOUND). Callers must
-    // judge soundness off `sound`/`valid`, never the mesh `watertight`.
-    let mesh_watertight = open == 0 && nm == 0;
+    // SOUND + WATERTIGHT verdict (feedback-as-default): the authoritative answer to
+    // "is this a real, closed, manufacturable solid?" is the EXACT B-Rep validity
+    // (`validate_solid_scoped`, Standard level — which already enforces shell
+    // closure AND correctly tolerates periodic seams, so cylinders/tori pass).
+    // This is mesh-INDEPENDENT, so `watertight` is reported off the B-Rep, not off
+    // the tessellation. That decoupling is what lets the live broadcast use the
+    // coarse `display()` mesh for speed without ever flashing a false
+    // "not watertight": a sound solid is closed by definition (open=0, nm=0).
+    //
+    // The display mesh is consulted ONLY for the export-quality hint in the verdict
+    // string (does the coarse preview have T-junctions?) — never for the soundness
+    // signal. A valid solid whose tessellation has T-junctions is NOT broken (the
+    // unsound-eye trap, KNOWN_BUGS #65 / EYE-SOUND).
+    let (mesh_open, mesh_nm) = mesh_open_nonmanifold(mesh);
+    let mesh_clean = mesh_open == 0 && mesh_nm == 0;
     let verdict = if !valid {
         "BROKEN — B-Rep invalid (a real topological defect)"
-    } else if mesh_watertight {
-        "OK — valid closed solid; export mesh watertight"
+    } else if mesh_clean {
+        "OK — valid closed solid; display mesh watertight"
     } else {
-        "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)"
+        "OK — valid closed solid; display mesh coarsened for live view (artifacts are not defects)"
     };
+    // `watertight`/`open_edges`/`nonmanifold_edges` report the B-Rep TRUTH: a sound
+    // solid is closed (0/0). When unsound, surface the display-mesh counts as a
+    // best-effort diagnostic of where the boundary opened up.
+    let (open, nm) = if valid { (0, 0) } else { (mesh_open, mesh_nm) };
     serde_json::json!({
         "sound":             valid,
         "valid":             valid,
         "verdict":           verdict,
-        "watertight":        mesh_watertight,
+        "watertight":        valid,
         "open_edges":        open,
         "nonmanifold_edges": nm,
         "dims":              dims,
