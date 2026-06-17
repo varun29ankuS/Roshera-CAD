@@ -664,6 +664,37 @@ Suites green: readable 60, topology_builder 67, mass-inertia harnesses.
 
 ## Mass properties / volume / verification honesty (2026-06-17 live dogfood)
 
+### MASS-PROPS-⅓ 🟢 FIXED (integrator/endpoint) — /properties routed to mesh-based Tonon
+The `/api/geometry/{id}/properties` endpoint (kernel_state.rs) used
+`Solid::compute_mass_properties`, whose per-face divergence
+`centroid·normal·area/3` drops the curved lateral flux (the lateral's surface
+centroid sits on the axis, ⟂ its radial normal) → a cylinder came back at ⅓·πr²h
+with a box-approximated/NEGATIVE inertia and area-weighted COM. FIX (commit on
+this branch): route the endpoint to `BRepModel::mass_properties_for` →
+`compute_solid_mass_properties` → `mesh_based_mass_properties` (Tonon
+signed-tetrahedron, EXACT for curved faces). VERIFIED LIVE: an ANALYTIC cylinder
+(`POST /api/geometry/cylinder`, r12 h26) now reports volume 11760 (≈πr²h),
+COM [0,0,13], POSITIVE inertia. Gate `agent_build_eval::cylinder_mass_properties_are_correct`.
+
+### EXTRUDE-CYL-MESH-INVERTED 🔴 the sketch-extruded circle cylinder has an inverted mesh
+SEPARATE, deeper bug surfaced by the fix above. Through the SAME (now-correct)
+`/properties` endpoint: an analytic cylinder → 11760 (right), but an EXTRUDE-path
+cylinder (MCP `create_cylinder` = `/api/sketch` circle + `/api/sketch/{id}/extrude`,
+which `extrude_profile` turns into an analytic `Cylinder` via
+`try_build_cylinder_from_circles`) → **3920 (⅓) with NEGATIVE inertia diagonal**.
+Negative inertia is impossible for a consistently-outward mesh, so the
+extrude-built Cylinder's LATERAL face is wound/oriented INWARD — its tessellated
+mesh is inside-out on the lateral. This silently corrupts volume/mass for EVERY
+MCP-created cylinder (the user creates cylinders this way), and likely feeds the
+#41b extrude-path boss-wall drop. The create-response `perception.volume` (assembled
+in the MCP) shows the same 3920. FIX LANE: orient the lateral face outward in
+`extrude.rs::try_build_cylinder_from_circles` (match `create_cylinder_3d`'s
+convention) — OR, pragmatic interim, switch MCP `create_cylinder` to the analytic
+`POST /api/geometry/cylinder` (correct in every way: mass, mesh, booleans #41b).
+Repro: build a cylinder both ways, compare `mass_properties_for` (analytic=πr²h+,
+extrude=⅓+negative).
+
+
 Surfaced rebuilding + driving a bored plate through the LIVE api-server (the
 verification-layer dogfood Varun asked for). THREE intertwined findings; the
 B-Rep boolean itself is INNOCENT.
