@@ -609,11 +609,27 @@ Surfaced rebuilding + driving a bored plate through the LIVE api-server (the
 verification-layer dogfood Varun asked for). THREE intertwined findings; the
 B-Rep boolean itself is INNOCENT.
 
-### TESS-ORIENT 🔴 inward-wound triangles on boolean-result + extrude-path meshes (ONE root cause)
-**This is the real root of BOTH the "⅓ cylinder volume" and the "bored plate has
-no hole" — and the mass-properties integrators are INNOCENT.** Decisive evidence
-(`agent_build_eval.rs::diag_cylinder_mesh_orientation`, signed-tetrahedron volume
-= the exact mesh-enclosed volume):
+### TESS-ANNULAR-CAP 🔴 planar face-with-hole triangulation OVER-COVERS (the real root)
+**PINPOINTED 2026-06-17.** The bored plate's wrong volume + filled-looking hole is
+NOT triangle inversion and NOT the boolean — it is the ANNULAR PLANAR CAP
+triangulating with OVERLAPPING triangles. Per-face measurement
+(`diag_bored_plate_face_winding`): the top/bottom caps (a Plane face whose inner
+loop is the Ø24 bore) tessellate to **area 8320 each — larger than the cap's own
+80×80 outer square (6400)**, which is only possible if triangles overlap; the
+correct annulus is 80²−π·12² = 5948. That excess area maps EXACTLY to the volume
+error: each cap contributes ⅓·8·8320 = 22187 instead of ⅓·8·5948 = 15861, and the
++6326 × 2 caps = +12652 ⇒ 95162 + 12652 = 107814 ≈ the observed 107817. The bore
+WALL is correctly oriented (points toward axis, z∈[−8,8]); the integrators are
+fine. So the fix is in `tessellation/surface.rs::triangulate_planar_polygon` (the
+`cdt::triangulate_contours` hole path) / the cap contour construction for
+boolean-result faces — the hole is not being erased, so the cap is covered twice.
+This is LOAD-BEARING (every plate-with-hole uses it) — fix carefully, gate on cap
+AREA == analytic (no current test checks face area, which is why it hid).
+Pins: `diag_bored_plate_face_winding` (#[ignore], localises per-face area),
+`bored_plate_mesh_volume_wrong` (#[ignore], FAILS on the volume).
+
+PRIOR (superseded) framing — kept for the signed-tet evidence that exonerates the
+integrators and boolean:
 - a `create_cylinder_3d` cylinder integrates CORRECTLY at both default and fine
   tess (11754 / 11760 ≈ 11762, watertight). So the Tonon signed-tet integrator
   (`mesh_based_mass_properties`) AND `mesh_analytics` (the eye) are both correct,
