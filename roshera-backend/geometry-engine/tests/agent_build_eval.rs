@@ -49,6 +49,15 @@ fn world_dims(m: &BRepModel, sid: SolidId) -> [f64; 3] {
     [s.x, s.y, s.z]
 }
 
+/// Mesh-integrated volume via the trustworthy `mesh_analytics` integrator (the
+/// eye's `frame.volume` — NOT `compute_mass_properties`, which still has the
+/// MASS-PROPS-⅓ curved-face-flux bug). Used by the VERIFY-EFFECT gates.
+fn mesh_volume(m: &BRepModel, sid: SolidId) -> f64 {
+    render_dimensioned_multiview(m, sid, &TessellationParams::default())
+        .map(|f| f.volume)
+        .unwrap_or(0.0)
+}
+
 /// Verify the part through the AGENT EYE — the visual perception channel — and
 /// assert the eye AGREES with the sound B-Rep verdict. A part is only truly
 /// verified when both channels concur (cf. EYE-SOUND #27: a verifier that judges
@@ -80,6 +89,16 @@ fn assert_eye_agrees(m: &BRepModel, sid: SolidId, part: &str) {
         frame.volume > 0.0 && frame.volume.is_finite(),
         "[{part}] eye volume not positive-finite: {}",
         frame.volume
+    );
+    // VERIFY-EFFECT physical-sanity: a solid cannot enclose more than its own
+    // bounding box. This is the guard that would have caught TESS-ANNULAR-CAP
+    // (bored plate mesh volume 107817 > bbox 102400) — "watertight" never did.
+    let bbox_vol = brep[0] * brep[1] * brep[2];
+    assert!(
+        frame.volume <= bbox_vol * 1.01 + 1.0,
+        "[{part}] eye volume {:.1} EXCEEDS bbox volume {:.1} — overlapping/inflated mesh",
+        frame.volume,
+        bbox_vol
     );
     assert!(
         frame.centroid.x.is_finite()
@@ -451,9 +470,18 @@ fn eval_bored_plate() {
     let mut m = BRepModel::new();
     let plate = box_solid(&mut m, 80.0, 80.0, 16.0);
     assert_sound(&m, plate, "plate");
+    let vol_before = mesh_volume(&m, plate);
     let bore = cyl(&mut m, Point3::new(0.0, 0.0, -5.0), 12.0, 26.0);
     let holed = diff(&mut m, plate, bore);
     assert_sound(&m, holed, "plate − bore");
+    // VERIFY-EFFECT: a Difference must REMOVE material. This (with the bbox bound
+    // in assert_eye_agrees) is the gate that turns a no-effect/inflated bore from
+    // a false-green into a hard red.
+    let vol_after = mesh_volume(&m, holed);
+    assert!(
+        vol_after < vol_before - 1.0,
+        "bored plate: difference did not remove material ({vol_before:.0} → {vol_after:.0})"
+    );
     let d = world_dims(&m, holed);
     assert!(
         (d[0] - 80.0).abs() < 0.5 && (d[1] - 80.0).abs() < 0.5 && (d[2] - 16.0).abs() < 0.5,
@@ -471,12 +499,24 @@ fn eval_bossed_plate_with_coaxial_bore() {
     let mut m = BRepModel::new();
     let plate = box_solid(&mut m, 120.0, 80.0, 16.0); // centred z −8..8
     assert_sound(&m, plate, "plate");
+    let plate_vol = mesh_volume(&m, plate);
     let boss = cyl(&mut m, Point3::new(0.0, 0.0, 4.0), 26.0, 45.0); // base buried in plate
     let body = union(&mut m, plate, boss);
     assert_sound(&m, body, "plate ∪ boss");
+    // VERIFY-EFFECT: a Union must not LOSE material (boss adds volume above plate).
+    let union_vol = mesh_volume(&m, body);
+    assert!(
+        union_vol > plate_vol - 1.0,
+        "bossed plate: union lost material ({plate_vol:.0} → {union_vol:.0})"
+    );
     let bore = cyl(&mut m, Point3::new(0.0, 0.0, -10.0), 15.0, 70.0); // through everything
     let holed = diff(&mut m, body, bore);
     assert_sound(&m, holed, "boss − coaxial bore");
+    let bored_vol = mesh_volume(&m, holed);
+    assert!(
+        bored_vol < union_vol - 1.0,
+        "bossed plate: coaxial bore did not remove material ({union_vol:.0} → {bored_vol:.0})"
+    );
     // Envelope: outer plate 120×80, boss rises to z=49 → height 49−(−8)=57.
     let d = world_dims(&m, holed);
     assert!(
