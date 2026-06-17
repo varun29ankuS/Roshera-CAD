@@ -23,6 +23,8 @@ use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+use geometry_engine::render::dimensioned::{coverage_report, render_dimensioned_multiview};
+use geometry_engine::tessellation::TessellationParams;
 
 /// Assert a build STEP produced a sound, export-watertight solid.
 fn assert_sound(m: &BRepModel, sid: SolidId, step: &str) {
@@ -44,6 +46,62 @@ fn world_dims(m: &BRepModel, sid: SolidId) -> [f64; 3] {
     let b = m.solid_world_bbox(sid).expect("bbox");
     let s = b.size();
     [s.x, s.y, s.z]
+}
+
+/// Verify the part through the AGENT EYE — the visual perception channel — and
+/// assert the eye AGREES with the sound B-Rep verdict. A part is only truly
+/// verified when both channels concur (cf. EYE-SOUND #27: a verifier that judges
+/// one channel and contradicts the other is worse than none). Two checks:
+///   1. the eye MEASURES the part (dims/volume/centroid from the rendered mesh)
+///      and its dims must match the sound B-Rep envelope — the agent sees the
+///      same size the kernel reports;
+///   2. the eye's face accounting (coverage across the 4 standard views) is an
+///      EXACT partition — seen ∪ unseen = total, every fraction in [0,1] — so the
+///      eye never silently double-counts or invents a face.
+fn assert_eye_agrees(m: &BRepModel, sid: SolidId, part: &str) {
+    let tess = TessellationParams::default();
+
+    let frame = render_dimensioned_multiview(m, sid, &tess)
+        .unwrap_or_else(|| panic!("[{part}] eye produced no frame"));
+    let brep = world_dims(m, sid);
+    let eye = [frame.dims.0, frame.dims.1, frame.dims.2];
+    for k in 0..3 {
+        let tol = 0.5 + 0.01 * brep[k];
+        assert!(
+            (eye[k] - brep[k]).abs() <= tol,
+            "[{part}] eye dim[{k}]={:.3} disagrees with B-Rep {:.3} (tol {:.3})",
+            eye[k],
+            brep[k],
+            tol
+        );
+    }
+    assert!(
+        frame.volume > 0.0 && frame.volume.is_finite(),
+        "[{part}] eye volume not positive-finite: {}",
+        frame.volume
+    );
+    assert!(
+        frame.centroid.x.is_finite()
+            && frame.centroid.y.is_finite()
+            && frame.centroid.z.is_finite(),
+        "[{part}] eye centroid not finite"
+    );
+
+    let cov =
+        coverage_report(m, sid, &tess).unwrap_or_else(|| panic!("[{part}] eye coverage empty"));
+    assert_eq!(
+        cov.seen_faces.len() + cov.unseen_faces.len(),
+        cov.total_faces,
+        "[{part}] eye coverage is not an exact partition (seen {} + unseen {} != total {})",
+        cov.seen_faces.len(),
+        cov.unseen_faces.len(),
+        cov.total_faces
+    );
+    assert!(
+        (0.0..=1.0).contains(&cov.coverage_fraction),
+        "[{part}] eye coverage_fraction out of range: {}",
+        cov.coverage_fraction
+    );
 }
 
 fn box_solid(m: &mut BRepModel, w: f64, h: f64, d: f64) -> SolidId {
@@ -130,6 +188,7 @@ fn eval_bored_plate() {
         (d[0] - 80.0).abs() < 0.5 && (d[1] - 80.0).abs() < 0.5 && (d[2] - 16.0).abs() < 0.5,
         "bored-plate envelope wrong: {d:?}"
     );
+    assert_eye_agrees(&m, holed, "bored plate");
 }
 
 #[test]
@@ -152,6 +211,7 @@ fn eval_bossed_plate_with_coaxial_bore() {
         (d[0] - 120.0).abs() < 0.5 && (d[1] - 80.0).abs() < 0.5,
         "bossed-plate envelope wrong: {d:?}"
     );
+    assert_eye_agrees(&m, holed, "bossed plate + coaxial bore");
 }
 
 #[test]
@@ -220,6 +280,7 @@ fn eval_bell_nozzle() {
         (d[2] - 178.0).abs() < 0.5 && (d[0] - 150.0).abs() < 1.0,
         "nozzle envelope wrong: {d:?}"
     );
+    assert_eye_agrees(&m, sid, "bell nozzle");
 }
 
 #[test]
@@ -261,6 +322,7 @@ fn eval_gusseted_l_bracket() {
         (d[0] - 80.0).abs() < 0.6 && (d[1] - 50.0).abs() < 0.6 && (d[2] - 50.0).abs() < 0.6,
         "gusseted-bracket envelope wrong: {d:?}"
     );
+    assert_eye_agrees(&m, acc, "gusseted L-bracket");
 }
 
 #[test]
@@ -304,6 +366,7 @@ fn eval_flanged_tube() {
         (d[0] - 80.0).abs() < 1.0 && (d[1] - 80.0).abs() < 1.0 && (d[2] - 60.0).abs() < 0.5,
         "flanged-tube envelope wrong: {d:?}"
     );
+    assert_eye_agrees(&m, acc, "flanged tube + bolt circle");
 }
 
 /// Build a solid hemispherical dome (radius R) by revolving a quarter-circle
@@ -373,4 +436,5 @@ fn eval_revolved_dome() {
         (d[0] - 80.0).abs() < 1.0 && (d[2] - 40.0).abs() < 0.5,
         "dome envelope wrong: {d:?}"
     );
+    assert_eye_agrees(&m, dome, "hemispherical dome");
 }
