@@ -266,6 +266,70 @@ fn kernel_bored_plate_mesh_has_bore() {
 }
 
 #[test]
+#[ignore = "diagnostic: per-face triangle-winding vs analytic outward normal on the bored plate"]
+fn diag_bored_plate_face_winding() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let mut m = BRepModel::new();
+    let plate = box_solid(&mut m, 80.0, 80.0, 16.0);
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -10.0), 12.0, 36.0);
+    let holed = diff(&mut m, plate, bore);
+    let mesh = tessellate_solid(
+        m.solids.get(holed).unwrap(),
+        &m,
+        &TessellationParams::default(),
+    );
+    // Per face: average dot(geometric triangle normal, analytic outward normal).
+    // A negative average ⇒ that face's triangles are wound INWARD.
+    // For the bore-wall cylinder, the CORRECT outward normal (it bounds a VOID,
+    // material is outside r) points TOWARD the axis = −radial. So per triangle,
+    // n_geo · radial_at_centroid should be ≈ −1 if correct, ≈ +1 if inverted.
+    use std::collections::BTreeMap;
+    let mut agree: BTreeMap<u32, (f64, usize, String)> = BTreeMap::new();
+    for (ti, tri) in mesh.triangles.iter().enumerate() {
+        let fid = mesh.face_map[ti];
+        let v0 = mesh.vertices[tri[0] as usize].position.to_vec();
+        let v1 = mesh.vertices[tri[1] as usize].position.to_vec();
+        let v2 = mesh.vertices[tri[2] as usize].position.to_vec();
+        let n_geo = (v1 - v0)
+            .cross(&(v2 - v0))
+            .normalize()
+            .unwrap_or(Vector3::Z);
+        let c = (v0 + v1 + v2) / 3.0;
+        let radial = Vector3::new(c.x, c.y, 0.0)
+            .normalize()
+            .unwrap_or(Vector3::X);
+        let kind = m
+            .surfaces
+            .get(m.faces.get(fid).unwrap().surface_id)
+            .map(|s| s.type_name().to_string())
+            .unwrap_or_default();
+        let e = agree.entry(fid).or_insert((0.0, 0, kind));
+        e.0 += n_geo.dot(&radial); // +1 = points away from axis (into material)
+        e.1 += 1;
+    }
+    // Per-face signed-tet CONTRIBUTION to the mesh volume (Σ v0·(v1×v2)/6) and
+    // surface area — the face whose mesh contribution deviates from analytic is
+    // the culprit. (Total = 107817 vs correct 95162.)
+    let mut contrib: BTreeMap<u32, (f64, f64)> = BTreeMap::new();
+    for (ti, tri) in mesh.triangles.iter().enumerate() {
+        let fid = mesh.face_map[ti];
+        let v0 = mesh.vertices[tri[0] as usize].position.to_vec();
+        let v1 = mesh.vertices[tri[1] as usize].position.to_vec();
+        let v2 = mesh.vertices[tri[2] as usize].position.to_vec();
+        let e = contrib.entry(fid).or_insert((0.0, 0.0));
+        e.0 += v0.dot(&v1.cross(&v2)) / 6.0;
+        e.1 += (v1 - v0).cross(&(v2 - v0)).magnitude() * 0.5;
+    }
+    for (fid, (sum, n, kind)) in &agree {
+        let (vol, area) = contrib[fid];
+        eprintln!(
+            "face {fid} [{kind}]: tris={n} radial={:.2} signed_vol_contrib={vol:.1} area={area:.1}",
+            sum / (*n as f64),
+        );
+    }
+}
+
+#[test]
 #[ignore = "diagnostic: mesh signed-tet volume + orientation at default vs fine tess"]
 fn diag_cylinder_mesh_orientation() {
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
