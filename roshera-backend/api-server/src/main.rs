@@ -659,9 +659,16 @@ async fn create_geometry(
     );
 
     let shape_type_copy = shape_type.clone();
+    // Feedback-as-default: a primitive is sound by construction, but report the
+    // SOUND (B-Rep) verdict anyway so EVERY mutating op has a uniform contract.
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, solid_id, &tri_mesh)
+    };
     Ok(Json(serde_json::json!({
         "success": true,
         "solid_id": solid_id,
+        "perception": perception,
         "object": {
             "id":         object_id,
             "name":       display_name,
@@ -3226,9 +3233,14 @@ async fn create_cone_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "object": {
             "id":         result_id_str,
             "name":       name,
