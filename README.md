@@ -16,18 +16,18 @@
 ---
 
 <p align="center">
-  <img src="assets/kernel-demo.gif" alt="Roshera kernel demo — datum system, B-Rep topology, viewport navigation" width="100%" />
+  <img src="assets/Roshera_demo.gif" alt="Roshera demo — an agent builds a rocket thrust chamber and a keyed gear pair, each verified watertight and sound" width="100%" />
 </p>
 
 <p align="center">
-  <em>Native B-Rep kernel: datum system, topology, tessellated viewport — running through the same REST/WebSocket bridge an external agent would use.</em>
+  <em>An agent drives the kernel over the bridge to build real mechanical parts — a revolved rocket thrust chamber and a pair of keyed involute gears — and the kernel certifies each one as a closed, watertight, physically-sound solid.</em>
 </p>
 
 ---
 
 Roshera is an **agent runtime for geometry**. The product is the kernel and the bridge it exposes: a native Rust B-Rep engine whose primitives, topology, and operations carry enough semantic structure for an LLM to query, reason about, and drive directly. Humans orchestrate; agents execute. The React/Three.js frontend that ships in this repo is one client of that runtime — it talks to the kernel over REST + WebSocket the same way an external agent would.
 
-The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. Many things work, many things don't — see [Status](#status) for what's actually usable today.
+The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. And every operation an agent runs reports its own verdict — whether the result is a *sound*, *watertight* B-Rep — so the geometry carries its own proof of correctness instead of a render that merely looks right. Many things work, many things don't — see [Status](#status) for what's actually usable today.
 
 | Dark Mode | Light Mode |
 |-----------|------------|
@@ -59,7 +59,9 @@ Where this is going: agents that pick faces, fillet edges, run sections,
 and walk a part the way a designer would — by reasoning over the
 readable surface (named features, persistent IDs, the timeline of
 events that produced the current state), not by parsing triangle soup.
-A CLI client and an MCP server are next on the list, then embeddings
+An MCP server already exposes the kernel to agents directly — the demo
+above was built through it, one tool call per feature, with each result
+verified sound and watertight before the next step. Next are embeddings
 and retrieval over the timeline so an agent can answer questions like
 "how did this corner get to be 4mm" without re-deriving the model from
 scratch.
