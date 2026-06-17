@@ -190,6 +190,81 @@ fn revolve_ring(m: &mut BRepModel, pts: &[(f64, f64)], segments: u32) -> SolidId
     .expect("revolve_ring")
 }
 
+/// PIN — BORE-TESS-VOLUME (🔴 2026-06-17): a bored plate's tessellated MESH has
+/// the WRONG volume. The B-Rep difference is correct (the void is real — see
+/// `kernel_bored_plate_mesh_has_bore`) and the integrator is fine for a clean
+/// cylinder (≈πr²h), yet the bored-plate mesh integrates to ~107817 instead of
+/// 95162 — INFLATED above even the solid plate (102400). So the bore wall is
+/// meshed but mis-oriented (inward normals) and/or the cap is filled, which is
+/// exactly why the live viewport shows NO hole. This is the user-visible
+/// "subtraction didn't work". Un-ignore when the bored mesh integrates correctly.
+#[test]
+#[ignore = "BORE-TESS-VOLUME 🔴: bored-plate mesh volume inflated (bore wall mis-oriented / cap filled)"]
+fn bored_plate_mesh_volume_wrong() {
+    let mut m = BRepModel::new();
+    let plate = box_solid(&mut m, 80.0, 80.0, 16.0); // centred z[-8,8], 102400
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -10.0), 12.0, 36.0); // through
+    let holed = diff(&mut m, plate, bore);
+    let frame =
+        render_dimensioned_multiview(&m, holed, &TessellationParams::default()).expect("frame");
+    let expected = 80.0 * 80.0 * 16.0 - std::f64::consts::PI * 144.0 * 16.0; // 95161.8
+    let r = manifold_report(&m, holed, 0.001, 1e-6).expect("mesh");
+    eprintln!(
+        "bored plate: mesh_vol={:.1} expected~{:.1} (solid plate=102400) | watertight open={} nm={}",
+        frame.volume, expected, r.boundary_edges, r.nonmanifold_edges
+    );
+    assert!(
+        (frame.volume - expected).abs() < 0.02 * expected,
+        "bored-plate mesh volume {:.1} != expected {:.1} (a SUBTRACTION must remove material; \
+         inflated => bore wall mis-oriented / cap filled)",
+        frame.volume,
+        expected
+    );
+}
+
+/// COUNTER-EVIDENCE: the KERNEL boolean difference is GEOMETRICALLY CORRECT — the
+/// bore is a genuine B-Rep void (exact ray-parity) AND the tessellated mesh
+/// contains the full bore wall. So the bored-plate trouble is NOT the kernel
+/// boolean; it is (a) the volume integration above and (b) the extrude-path /
+/// live tessellation that fills the cap (BORE-TESS-FILL in KNOWN_BUGS). This
+/// test PASSES — it pins what is actually sound so future triage doesn't chase
+/// the wrong layer.
+#[test]
+fn kernel_bored_plate_mesh_has_bore() {
+    use geometry_engine::queries::point::{classify_point, PointClass};
+    use geometry_engine::tessellation::tessellate_solid;
+    let mut m = BRepModel::new();
+    let plate = box_solid(&mut m, 80.0, 80.0, 16.0); // centred z[-8,8]
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -10.0), 12.0, 36.0); // z[-10,26] THROUGH
+    let holed = diff(&mut m, plate, bore);
+    // 1. B-Rep: bore centre is a void, plate body is solid.
+    assert_eq!(
+        classify_point(&m, holed, Point3::new(0.0, 0.0, 0.0), 1e-6),
+        PointClass::Outside,
+        "bore centre must be a B-Rep void"
+    );
+    assert_eq!(
+        classify_point(&m, holed, Point3::new(30.0, 0.0, 0.0), 1e-6),
+        PointClass::Inside,
+        "plate body must be solid"
+    );
+    // 2. Mesh: the bore wall (r≈12) is actually tessellated, not filled.
+    let solid = m.solids.get(holed).expect("s");
+    let mesh = tessellate_solid(solid, &m, &TessellationParams::default());
+    let on_bore = mesh
+        .vertices
+        .iter()
+        .filter(|v| {
+            let r = (v.position.x * v.position.x + v.position.y * v.position.y).sqrt();
+            (r - 12.0).abs() < 0.5
+        })
+        .count();
+    assert!(
+        on_bore > 50,
+        "kernel bored-plate mesh must contain the bore wall (verts at r≈12), got {on_bore}"
+    );
+}
+
 fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
     transform_solid(
         m,
