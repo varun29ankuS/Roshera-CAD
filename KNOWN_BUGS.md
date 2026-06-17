@@ -266,8 +266,23 @@ face's actual surface, or use GWN classification for the wall face), tying to th
 #41/#35 coaxial-bore family. Workaround to keep building: bore BEFORE the union,
 or keep features non-coaxial.
 
-**BOTH BUILD PATHS FAIL THIS CONFIG (2026-06-17, live + kernel), differently —
-so the root is the BOOLEAN coaxial-bore-through-a-tall-boss, not the primitive:**
+**UPDATE 2026-06-17 — the KERNEL corefinement is SOUND; the live failure is a
+PIPELINE artifact, not a geometry bug.** Reproduced the EXACT live analytic config
+in-kernel (base z[-10,10] ∪ boss z[0,40] − coaxial bore z[-15,45]):
+`validate_solid_scoped` = VALID, `manifold_report` watertight (open=0 nm=0), and
+the boss-TOP cap (Plane n.z=+1 at z=40) carries an inner loop = the bore hole is
+OPEN. New passing gate `agent_build_eval::bearing_housing_coaxial_bore_is_sound`.
+So the boolean DOES correctly bore the boss top + keep the wall. The live
+`valid=false`/solid-boss-top could NOT be reproduced offline → it is a live-path
+artifact (likely the slow GWN-classification tessellation of the boss at display
+density — BOOL #86 territory — and/or stale SolidStore state), NOT corefinement.
+The #24 curved-CDT panic fires during tessellation but is CAUGHT and cylinder
+walls fall back to a grid, so the kernel mesh stays watertight. NEXT: trace the
+LIVE difference (ROSHERA_BOOL_TRACE / TESS_TRACE) on a clean rebuild to find why
+the live result diverges from the (correct) kernel result. The EXTRUDE-path boss
+(below) is still a genuine bug.
+
+**ORIGINAL (extrude-path) FAILURE — still a real bug:**
 - EXTRUDE-path boss (MCP create_cylinder = sketch+extrude): boss OUTER wall
   dropped → 300 open, B-Rep invalid, bbox z overshoots to the cutter top.
 - ANALYTIC boss (POST /api/geometry/cylinder = create_cylinder_3d): much closer —
