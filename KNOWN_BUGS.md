@@ -243,6 +243,29 @@ discs (area 5441 vs analytic 4511, +20%). FIX (bfbdf4d): keep magnitude AND sign
 circles as holes. `flanged_body_section_multihole_85b` un-#[ignore]'d (running
 guard); section_area_sweep + 82 section lib tests green.
 
+### #41b 🔴 RE-SURFACED 2026-06-17 — coaxial bore through a boss STILL drops the outer wall (live)
+Live dogfood after the TESS-ANNULAR-CAP fix: built a bearing housing —
+base 120×120×20 ∪ boss (MCP create_cylinder r35, z10→50, interpenetrating),
+then − coaxial bore (r20, through). Result: `sound:false / valid:false / 300
+open / "B-Rep invalid (a real topological defect)"`, bbox z=55 (the cutter top,
+above the boss z=50 — a dangling bore wall) and the boss OUTER wall (r35) is
+DROPPED (diagnostic render: see straight through the boss, open rim at its base).
+This is the SAME signature as #41 (below, marked fixed for analytic
+create_cylinder_3d via interior-point-projection): the boss wall's interior point
+averages toward the axis → classified Inside the r20 bore → wall dropped. The fix
+evidently does NOT cover this config — likely because the MCP/extrude-path boss
+(or the boss after a UNION onto the base) is not the concrete analytic `Cylinder`
+the projection special-cases, OR because the union changed the wall face's loop so
+the centroid-projection no longer lands on it. NOTE: the SOUND verdict CORRECTLY
+flagged this BROKEN (the EYE-SOUND channel works — contrast the bored-plate
+false-green which had no volume gate). Repro: REST `POST /api/geometry` box +
+`POST /api/geometry/cylinder` boss + `/api/geometry/boolean` union + bore; or pin
+a kernel test mirroring it. Fix lane: extend the #41 interior-point projection to
+cover boss walls that are not the concrete analytic Cylinder (project onto the
+face's actual surface, or use GWN classification for the wall face), tying to the
+#41/#35 coaxial-bore family. Workaround to keep building: bore BEFORE the union,
+or keep features non-coaxial.
+
 ### #41 🟢 Coaxial bore through a cylindrical boss dropped the outer wall
 Found live (ladder step 6, bearing housing). `plate ∪ analytic-cylinder boss`
 (r30, interpenetrating) is CLEAN (open=0). Differencing a COAXIAL analytic
