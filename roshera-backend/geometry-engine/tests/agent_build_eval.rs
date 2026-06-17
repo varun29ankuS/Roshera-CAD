@@ -352,19 +352,25 @@ fn kernel_bored_plate_mesh_has_bore() {
 
 /// #41b — the KERNEL coaxial-bore-through-a-boss is SOUND (the corefinement is
 /// NOT the bug). Base ∪ boss − a coaxial bore that EXITS the boss top: the result
-/// must be a valid, watertight B-Rep whose boss-top cap (a Plane at z≈40, normal
-/// +z) is OPENED by the bore (carries an inner loop). The live API once produced
-/// `valid=false` here, but it could NOT be reproduced in-kernel — so that is a
-/// live-pipeline artifact (store state / the slow GWN-tessellation path), not a
-/// corefinement defect. (A curved-CDT panic, #24, fires during tessellation but is
-/// caught and the cylinder walls fall back to a grid, so the mesh stays
-/// watertight.)
+/// PIN — COAXIAL-BORE-THROUGH-BOSS (🔴): a coaxial bore through a box base ∪ boss
+/// only bores the BASE — the boss is left solid (just a thin annular top cap
+/// forms). Volume removed ≈ 24244 (the base column z[-10,10]) vs the full
+/// ≈62832 (z[-10,40]). The bore-cut does not propagate across the base∪boss
+/// union seam — the #35/#41 corefinement family. CORRECTS a prior false pass:
+/// the earlier assertion only checked "boss-top has an inner loop" (true — the
+/// annular cap forms) + watertight + B-Rep-valid, NONE of which detect that the
+/// boss INTERIOR column was never removed. Only the VERIFY-EFFECT volume check
+/// catches it. This is the user's live "the difference isn't working". Pinned
+/// asserting the correct full-bore volume; un-ignore when the cut propagates
+/// through the union seam. (#24 cdt panic also fires at the boss/bore tessellation.)
 #[test]
+#[ignore = "COAXIAL-BORE-THROUGH-BOSS 🔴: bore through base∪boss only bores the base (#35/#41 corefinement)"]
 fn bearing_housing_coaxial_bore_is_sound() {
     let mut m = BRepModel::new();
     let base = box_solid(&mut m, 120.0, 120.0, 20.0); // centred z[-10,10]
     let boss = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 35.0, 40.0); // z[0,40]
     let body = union(&mut m, base, boss);
+    let union_vol = mesh_volume(&m, body);
     let bore = cyl(&mut m, Point3::new(0.0, 0.0, -15.0), 20.0, 60.0); // coaxial z[-15,45]
     let holed = diff(&mut m, body, bore);
     let v = validate_solid_scoped(&m, holed, Tolerance::default(), ValidationLevel::Standard);
@@ -376,6 +382,21 @@ fn bearing_housing_coaxial_bore_is_sound() {
         "bearing housing not watertight: open={} nm={}",
         r.boundary_edges,
         r.nonmanifold_edges
+    );
+    // VERIFY-EFFECT: the coaxial bore must go ALL THE WAY THROUGH base AND boss —
+    // removing a r20 column over z[-10,40] (50 tall, ≈62832). A base-only bore
+    // (the live failure — boss stays solid) removes only ≈25133. This is the
+    // check the weak "boss-top has an inner loop" assertion below missed.
+    let bored_vol = mesh_volume(&m, holed);
+    let removed = union_vol - bored_vol;
+    let full_bore = std::f64::consts::PI * 20.0 * 20.0 * 50.0;
+    eprintln!(
+        "bearing housing: union_vol={union_vol:.0} bored_vol={bored_vol:.0} removed={removed:.0} (full bore≈{full_bore:.0})"
+    );
+    assert!(
+        (removed - full_bore).abs() < 0.05 * full_bore,
+        "coaxial bore did not pass through the boss: removed {removed:.0}, expected ≈{full_bore:.0} \
+         (base-only bore ≈25133 ⇒ boss left solid)"
     );
     // The boss-top cap (Plane, normal +z, near z=40) must be OPENED by the bore.
     let solid = m.solids.get(holed).unwrap();

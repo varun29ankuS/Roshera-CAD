@@ -277,18 +277,34 @@ face's actual surface, or use GWN classification for the wall face), tying to th
 #41/#35 coaxial-bore family. Workaround to keep building: bore BEFORE the union,
 or keep features non-coaxial.
 
-**UPDATE 2026-06-17 — the KERNEL corefinement is SOUND; the live failure is a
-PIPELINE artifact, not a geometry bug.** Reproduced the EXACT live analytic config
-in-kernel (base z[-10,10] ∪ boss z[0,40] − coaxial bore z[-15,45]):
-`validate_solid_scoped` = VALID, `manifold_report` watertight (open=0 nm=0), and
-the boss-TOP cap (Plane n.z=+1 at z=40) carries an inner loop = the bore hole is
-OPEN. New passing gate `agent_build_eval::bearing_housing_coaxial_bore_is_sound`.
-So the boolean DOES correctly bore the boss top + keep the wall. The live
-`valid=false`/solid-boss-top could NOT be reproduced offline → it is a live-path
-artifact (likely the slow GWN-classification tessellation of the boss at display
-density — BOOL #86 territory — and/or stale SolidStore state), NOT corefinement.
-The #24 curved-CDT panic fires during tessellation but is CAUGHT and cylinder
-walls fall back to a grid, so the kernel mesh stays watertight. NEXT: trace the
+### COAXIAL-BORE-THROUGH-BOSS 🔴 the bore only bores the BASE; the boss stays solid (2026-06-17, live + kernel)
+**RETRACTION of the 2026-06-17 "corefinement is SOUND" claim — that was a FALSE
+PASS.** Live + kernel: box base ∪ cylinder boss − coaxial bore through both →
+the bore removes ONLY the base column (z[-10,10], ≈24244 by mesh volume) and
+LEAVES THE BOSS SOLID (z[10,40] interior never removed); a thin annular top cap
+forms on the boss so the part is B-Rep-valid + watertight + the boss-top "has an
+inner loop", but the cylindrical bore column through the boss height is gone.
+Full bore would remove ≈62832 (z[-10,40]). The cut does NOT propagate across the
+base∪boss UNION SEAM — the #35/#41 corefinement family. The earlier gate
+`bearing_housing_coaxial_bore_is_sound` only asserted valid + watertight +
+boss-top-inner-loop — NONE of which detect the unremoved boss interior; it is now
+#[ignore]'d with a VERIFY-EFFECT volume assertion (`removed ≈ full_bore`) that
+correctly FAILS. This is the user's live "the difference isn't working / no hole
+through the boss". Render confirms a solid boss; `mass_properties` volume 378014
+≈ unbored-union(403404) − base-only-column(25133). FIX LANE: propagate the
+difference cut through the union seam (the boss lateral + the bore must
+co-refine so the bore column is removed across the whole base+boss height) —
+DEEP #35/#41 corefinement, same lane as #27 chained-union. The LESSON (again):
+"valid + watertight + a feature face exists" ≠ "the op had its intended effect";
+only volume/effect catches a no-effect cut. NOTE the #41b wall-drop IS genuinely
+fixed (the boss outer wall survives — `extrude_boss_coaxial_bore_keeps_wall`);
+that is a DIFFERENT defect from this bore-doesn't-propagate one.
+
+(superseded) UPDATE 2026-06-17 — claimed the KERNEL corefinement is SOUND; the
+live failure a PIPELINE artifact. Reproduced the analytic config in-kernel:
+validate_solid_scoped VALID, watertight, boss-top inner loop present —
+but this MISSED that the boss interior column is never bored (volume check added
+later proves removed≈24244 ≠ full 62832). NEXT: trace the
 LIVE difference (ROSHERA_BOOL_TRACE / TESS_TRACE) on a clean rebuild to find why
 the live result diverges from the (correct) kernel result. The EXTRUDE-path boss
 (below) is still a genuine bug.
