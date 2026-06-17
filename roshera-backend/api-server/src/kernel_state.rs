@@ -366,26 +366,22 @@ pub async fn solid_properties(
     // which kernel state they were measured against. Previously this
     // ran a separate `surface_area` call before `compute_mass_properties`,
     // which traversed the topology twice and could (in principle) drift.
-    let solid = model
-        .solids
-        .get_mut(solid_id)
-        .expect("solid existed two lines up; nothing has dropped it");
-    let props = match solid.compute_mass_properties(
-        &mut model.shells,
-        &mut model.faces,
-        &mut model.loops,
-        &model.vertices,
-        &model.edges,
-        &model.curves,
-        &model.surfaces,
-    ) {
-        Ok(p) => p.clone(),
-        Err(e) => {
+    // Mass properties via the mesh-based (Tonon signed-tetrahedron) integrator.
+    // `mass_properties_for` tessellates the solid and integrates over the mesh,
+    // which is EXACT for curved faces (cylinders/spheres/cones). The previous
+    // `Solid::compute_mass_properties` used a per-face `centroid · normal · area
+    // / 3` divergence approximation that DROPS the curved-lateral flux (the
+    // lateral's surface centroid sits on the axis, ⟂ its radial normal, so its
+    // contribution is ~0) — a cylinder came back at ⅓·πr²h with a box-
+    // approximated (and for some inputs NEGATIVE) inertia tensor. See
+    // MASS-PROPS-⅓ in KNOWN_BUGS.
+    let props = match model.mass_properties_for(solid_id) {
+        Some(p) => p,
+        None => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
                     "error": "failed to compute mass properties",
-                    "details": e.to_string(),
                     "solid_id": solid_id,
                 })),
             ));
@@ -398,39 +394,11 @@ pub async fn solid_properties(
         volume: props.volume,
         surface_area: props.surface_area,
         mass: props.mass,
-        center_of_mass: [
-            props.center_of_mass.x,
-            props.center_of_mass.y,
-            props.center_of_mass.z,
-        ],
+        center_of_mass: props.center_of_mass,
         inertia_tensor: props.inertia_tensor,
-        principal_moments: [
-            props.principal_moments.x,
-            props.principal_moments.y,
-            props.principal_moments.z,
-        ],
-        principal_axes: [
-            [
-                props.principal_axes[0].x,
-                props.principal_axes[0].y,
-                props.principal_axes[0].z,
-            ],
-            [
-                props.principal_axes[1].x,
-                props.principal_axes[1].y,
-                props.principal_axes[1].z,
-            ],
-            [
-                props.principal_axes[2].x,
-                props.principal_axes[2].y,
-                props.principal_axes[2].z,
-            ],
-        ],
-        radius_of_gyration: [
-            props.radius_of_gyration.x,
-            props.radius_of_gyration.y,
-            props.radius_of_gyration.z,
-        ],
+        principal_moments: props.principal_moments,
+        principal_axes: props.principal_axes,
+        radius_of_gyration: props.radius_of_gyration,
         bounding_box: bbox,
     }))
 }
