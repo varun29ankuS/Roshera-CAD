@@ -173,6 +173,73 @@ fn union(m: &mut BRepModel, a: SolidId, b: SolidId) -> SolidId {
     boolean_operation(m, a, b, BooleanOp::Union, BooleanOptions::default()).expect("union")
 }
 
+/// Build a cylinder by EXTRUDING a full-circle profile (the sketch→extrude path
+/// the MCP uses), base centre at `base`, along +Z by `height`. This exercises
+/// the extrude side-face orientation fixed in EXTRUDE-CYL-MESH-INVERTED — vs
+/// `cyl()` which uses the analytic primitive.
+fn extruded_cyl(m: &mut BRepModel, base: Point3, r: f64, height: f64) -> SolidId {
+    use geometry_engine::operations::extrude::{
+        create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
+    };
+    use geometry_engine::primitives::curve::Circle;
+    let circle = Circle::new(base, Vector3::Z, r).expect("circle");
+    let cid = m.curves.add(Box::new(circle));
+    let seam = m.vertices.add(base.x + r, base.y, base.z); // Circle t=0 = +X·r
+    let edge = m.edges.add(Edge::new(
+        0,
+        seam,
+        seam,
+        cid,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let face = create_face_from_profile_with_plane(m, vec![edge], base, Vector3::Z).expect("face");
+    extrude_face(
+        m,
+        face,
+        ExtrudeOptions {
+            distance: height,
+            ..Default::default()
+        },
+    )
+    .expect("extrude boss")
+}
+
+/// #41b — does the EXTRUDE-CYL fix also resolve the extrude-path boss-wall drop?
+/// Box base ∪ EXTRUDE-circle boss − coaxial bore exiting the boss top. Before the
+/// fix the extrude boss lateral wound inward and the coaxial bore dropped the boss
+/// wall (300 open, invalid, dims overshoot). Now it must be valid + watertight
+/// with the Ø boss wall present.
+#[test]
+fn extrude_boss_coaxial_bore_keeps_wall() {
+    let mut m = BRepModel::new();
+    let base = box_solid(&mut m, 120.0, 120.0, 20.0); // centred z[-10,10]
+    let boss = extruded_cyl(&mut m, Point3::new(0.0, 0.0, 5.0), 35.0, 35.0); // z[5,40]
+    let body = union(&mut m, base, boss);
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -15.0), 20.0, 60.0); // coaxial through
+    let holed = diff(&mut m, body, bore);
+    let v = validate_solid_scoped(&m, holed, Tolerance::default(), ValidationLevel::Standard);
+    assert!(
+        v.is_valid,
+        "extrude-boss bearing housing INVALID: {:?}",
+        v.errors
+    );
+    let r = manifold_report(&m, holed, 0.5, 1e-6).expect("mr");
+    assert_eq!(
+        (r.boundary_edges, r.nonmanifold_edges),
+        (0, 0),
+        "extrude-boss bearing housing not watertight: open={} nm={}",
+        r.boundary_edges,
+        r.nonmanifold_edges
+    );
+    // The Ø70 boss wall must survive the coaxial bore (not be dropped).
+    let dias = cylindrical_diameters(&m, holed);
+    assert!(
+        dias.iter().any(|(d, _)| (d - 70.0).abs() < 1.0),
+        "boss outer wall (Ø70) dropped by the coaxial bore; saw {dias:?}"
+    );
+}
+
 /// Revolve a closed (r, z) profile a full turn about +Z → a solid of revolution.
 fn revolve_ring(m: &mut BRepModel, pts: &[(f64, f64)], segments: u32) -> SolidId {
     let verts: Vec<_> = pts
