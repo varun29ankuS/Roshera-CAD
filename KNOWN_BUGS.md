@@ -542,6 +542,18 @@ fix is TWO parts that MUST land together:
    samples (the analogue of the sphere-pole fan that already works for the sphere
    primitive) — never feed the degenerate apex contour to cdt. Then the guard
    relaxation (part 1) + this make eval_revolved_dome watertight together.
+   **STRUCTURE PINNED 2026-06-17** (reproduced w/ guard relaxed, dumped the dome
+   faces): every apex face is a **3-EDGE** SurfaceOfRevolution wedge —
+   [r0..40][r40..40][r0..40] = two meridians (apex r≈0 → rim r40) + one rim arc
+   (r40). But tessellate_revolution_wedge hard-returns false unless the loop has
+   exactly 4 edges (surface.rs ~3845), so every apex wedge is rejected → curved-
+   CDT → degenerate apex → 147 open. EXACT FIX: add a 3-edge branch to
+   tessellate_revolution_wedge — find the apex corner (shared vertex of the two
+   meridian chains, r≈0) and fan-triangulate the ring from it to the rim-arc
+   samples (boundary-only, reusing cache samples → watertight); the 4-edge Coons
+   path is untouched. CAVEAT: validate the repro profile yields a correct dome
+   (the pie-slice try_dome decomposes into apex fans — confirm hemisphere not cone
+   before un-ignoring the gate).
 Repro `agent_build_eval::eval_revolved_dome` (#[ignore], asserts the desired
 sound+watertight end state). (Original report below.)
 
