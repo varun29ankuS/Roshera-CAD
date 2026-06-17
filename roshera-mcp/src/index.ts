@@ -568,9 +568,11 @@ server.tool(
 
 server.tool(
   "create_cylinder",
-  "ONE-CALL cylinder: radius at (cx, cy) on the chosen plane, extruded by " +
-    "height. KNOWN BUG #24: the bore/lateral currently tessellates as ~64 " +
-    "planar strips, not one analytic cylinder face.",
+  "ONE-CALL analytic cylinder: radius at (cx, cy) on the chosen plane, extruded " +
+    "by height along the plane normal. Uses the analytic cylinder primitive " +
+    "(one smooth lateral face) — NOT sketch+extrude, which produced an " +
+    "inside-out lateral mesh (⅓ volume, negative inertia, dropped boss walls in " +
+    "coaxial bores).",
   {
     plane: PlaneSchema.default("xy"),
     cx: z.number().default(0),
@@ -581,11 +583,32 @@ server.tool(
   },
   async ({ plane, cx, cy, radius, height, name }) => {
     try {
-      const s = await api("POST", "/api/sketch", { plane, tool: "circle" });
-      await api("POST", `/api/sketch/${s.id}/point`, { point: [cx, cy] });
-      await api("POST", `/api/sketch/${s.id}/point`, { point: [cx + radius, cy] });
-      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
-        distance: height,
+      // Resolve the plane to a world origin + in-plane (u, v) basis.
+      const std: Record<string, { o: number[]; u: number[]; v: number[] }> = {
+        xy: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 1, 0] },
+        xz: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 0, 1] },
+        yz: { o: [0, 0, 0], u: [0, 1, 0], v: [0, 0, 1] },
+      };
+      const p =
+        typeof plane === "string"
+          ? std[plane]
+          : { o: plane.origin, u: plane.u_axis, v: plane.v_axis };
+      const cross = (a: number[], b: number[]) => [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+      ];
+      // Cylinder base centre = plane origin + cx·u + cy·v; axis = u × v (the
+      // plane normal), matching the old sketch-extrude placement.
+      const center = [0, 1, 2].map(
+        (i) => p.o[i] + cx * p.u[i] + cy * p.v[i],
+      );
+      const axis = cross(p.u, p.v);
+      const r = await api("POST", "/api/geometry/cylinder", {
+        center,
+        axis,
+        radius,
+        height,
         name: name ?? null,
       });
       const id = await newestPartId();
