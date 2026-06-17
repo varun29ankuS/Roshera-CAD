@@ -305,3 +305,72 @@ fn eval_flanged_tube() {
         "flanged-tube envelope wrong: {d:?}"
     );
 }
+
+/// Build a solid hemispherical dome (radius R) by revolving a quarter-circle
+/// profile whose APEX sits on the axis (r = 0). Returns the revolve Result so a
+/// probe can observe rejection vs non-watertight tessellation.
+fn try_dome(
+    m: &mut BRepModel,
+    r: f64,
+    arc_segs: usize,
+) -> geometry_engine::operations::OperationResult<SolidId> {
+    // (0,0) base centre → (R,0) base edge → quarter arc up to the apex (0,R).
+    // The implicit closing edge (0,R)→(0,0) runs ALONG the axis — the pole case.
+    let mut pts = vec![(0.0_f64, 0.0_f64)];
+    for k in 0..=arc_segs {
+        let theta = (k as f64) / (arc_segs as f64) * std::f64::consts::FRAC_PI_2;
+        pts.push((r * theta.cos(), r * theta.sin()));
+    }
+    let verts: Vec<_> = pts
+        .iter()
+        .map(|(rr, z)| m.vertices.add(*rr, 0.0, *z))
+        .collect();
+    let mut edges = Vec::new();
+    for i in 0..pts.len() {
+        let j = (i + 1) % pts.len();
+        let cid = m.curves.add(Box::new(Line::new(
+            Point3::new(pts[i].0, 0.0, pts[i].1),
+            Point3::new(pts[j].0, 0.0, pts[j].1),
+        )));
+        edges.push(m.edges.add(Edge::new(
+            0,
+            verts[i],
+            verts[j],
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+    }
+    revolve_profile(
+        m,
+        edges,
+        RevolveOptions {
+            axis_origin: Point3::ZERO,
+            axis_direction: Vector3::Z,
+            angle: std::f64::consts::TAU,
+            segments: 64,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+#[ignore = "REVOLVE axis-touch (🔴): apex-on-axis revolve rejected SelfIntersection; un-ignore when the pole case lands"]
+fn eval_revolved_dome() {
+    // A hemispherical pressure-vessel dome — apex on the axis (r=0). DESIRED end
+    // state: a sound, export-watertight solid of revolution. OBSERVED 2026-06-17:
+    // `revolve_profile` REJECTS the profile with `SelfIntersection` (the implicit
+    // closing edge runs along the axis), so the dome can't be built at all — the
+    // REVOLVE axis-touch pole bug (KNOWN_BUGS → "REVOLVE axis-touch"). Pinned as a
+    // forward-looking eval — un-ignore when the pole case is handled (admit the
+    // single axis segment + single-apex fan tessellation). Workaround today: a
+    // small pole vent bore keeps r_min > 0 (see eval_flanged_tube's annulus).
+    let mut m = BRepModel::new();
+    let dome = try_dome(&mut m, 40.0, 16).expect("dome revolve (apex on axis)");
+    assert_sound(&m, dome, "hemispherical dome (pole)");
+    let d = world_dims(&m, dome);
+    assert!(
+        (d[0] - 80.0).abs() < 1.0 && (d[2] - 40.0).abs() < 0.5,
+        "dome envelope wrong: {d:?}"
+    );
+}

@@ -428,6 +428,12 @@ Workaround: a small pole bore (vent) avoids the axis and is watertight. Found
 2026-06-15 building a domed pressure vessel. Fix = handle the single-apex pole
 case in revolve (apex vertex already has code; the self-intersection guard +
 pole-fan tessellation need to admit it).
+**PINNED 2026-06-17:** `agent_build_eval.rs::eval_revolved_dome` (#[ignore]'d) is
+a forward-looking repro — a hemispherical dome (apex on axis). OBSERVED: the
+revolve REJECTS with `SelfIntersection` (it never reaches tessellation), because
+the profile's implicit closing edge runs ALONG the axis (both endpoints r=0). So
+the dominant failure today is REJECTION, not the non-watertight-poles variant.
+Un-ignore when the pole case lands.
 
 ### #65 🟢 FIXED — box∪cylinder boss mesh non-manifold at fine density (doubled facet)
 Building an engine mount bracket: base plate (box) ∪ raised cylindrical boss came
