@@ -190,17 +190,16 @@ fn revolve_ring(m: &mut BRepModel, pts: &[(f64, f64)], segments: u32) -> SolidId
     .expect("revolve_ring")
 }
 
-/// PIN — BORE-TESS-VOLUME (🔴 2026-06-17): a bored plate's tessellated MESH has
-/// the WRONG volume. The B-Rep difference is correct (the void is real — see
-/// `kernel_bored_plate_mesh_has_bore`) and the integrator is fine for a clean
-/// cylinder (≈πr²h), yet the bored-plate mesh integrates to ~107817 instead of
-/// 95162 — INFLATED above even the solid plate (102400). So the bore wall is
-/// meshed but mis-oriented (inward normals) and/or the cap is filled, which is
-/// exactly why the live viewport shows NO hole. This is the user-visible
-/// "subtraction didn't work". Un-ignore when the bored mesh integrates correctly.
+/// GATE — BORE-TESS-VOLUME (FIXED 2026-06-17): a bored plate's tessellated MESH
+/// must integrate to the correct volume. The bug was `annulus_radial_strip`
+/// mis-classifying the square cap as a circular ring and radial-stripping it to
+/// the bore, over-covering the annular cap (area 8320 vs 5948) and inflating the
+/// mesh volume to 107817 vs 95162 — which is why the live viewport showed NO
+/// hole. Fixed by the chord<radius guard in `circular` (surface.rs). This was a
+/// FALSE GREEN: watertight + dims + bore-face-exists all passed; only volume
+/// caught it. Now a running gate.
 #[test]
-#[ignore = "BORE-TESS-VOLUME 🔴: bored-plate mesh volume inflated (bore wall mis-oriented / cap filled)"]
-fn bored_plate_mesh_volume_wrong() {
+fn bored_plate_mesh_volume_correct() {
     let mut m = BRepModel::new();
     let plate = box_solid(&mut m, 80.0, 80.0, 16.0); // centred z[-8,8], 102400
     let bore = cyl(&mut m, Point3::new(0.0, 0.0, -10.0), 12.0, 36.0); // through

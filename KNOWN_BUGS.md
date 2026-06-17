@@ -609,8 +609,31 @@ Surfaced rebuilding + driving a bored plate through the LIVE api-server (the
 verification-layer dogfood Varun asked for). THREE intertwined findings; the
 B-Rep boolean itself is INNOCENT.
 
-### TESS-ANNULAR-CAP 🔴 planar face-with-hole triangulation OVER-COVERS (the real root)
-**PINPOINTED 2026-06-17.** The bored plate's wrong volume + filled-looking hole is
+### TESS-ANNULAR-CAP 🟢 FIXED 2026-06-17 — annulus_radial_strip mis-classified a square cap as a ring
+**ROOT + FIX.** `annulus_radial_strip`'s `circular()` ring-detector accepted the
+bored-plate cap's OUTER loop (a square sampled at its 4 corners) as a circle —
+because the 4 corners are equidistant from the centroid (40√2) — then radial-
+stripped the "ring" to the bore (n+m = 4+300 = 304 triangles), over-covering the
+annular cap to area 8320 (vs 5948) and inflating the bored solid's mesh volume to
+107817 (vs 95162). The B-Rep, the boolean, the mass-props integrators, and
+`triangulate_planar_polygon` were ALL innocent (a synthetic square+circle through
+the general CDT was always correct). FIX: a chord<radius guard in `circular` —
+a genuinely circular tessellated ring has every consecutive chord below its
+radius (2r·sin(π/n) < r for n ≥ 7), but a 4-corner square's side (80) exceeds its
+corner-radius (56.57), so the square now falls through to the general CDT (which
+triangulates square-outer + circular-hole correctly). RESULTS: bored cap area
+8320 → 5947.6; bored-plate mesh volume 107817 → 95165; the bored cylinder
+`analytic_cylinder_bore_is_smooth_and_watertight_24` flipped RED → GREEN as
+collateral. Gates: `tessellation::surface::tests::bored_plate_caps_tessellate_to_annulus`
++ `planar_face_square_with_circular_hole` (lib) + `agent_build_eval::
+bored_plate_mesh_volume_correct` (un-ignored). NO regression: revolve_watertight
+7/7 (washer annuli use dense circular rings, still radial-stripped),
+primitive_tess_watertight, tess_seam_tjunction_65, closed_edge_bore_rim_blends,
+drawing 36, boolean 99/3 (the 3 are pre-existing #27 chained-union, unrelated).
+LESSON: no test checked face AREA / solid VOLUME, so a watertight-but-wrong mesh
+hid for a long time — VERIFY-EFFECT (volume/area gates) is the durable guard.
+
+(historical) PINPOINTED 2026-06-17. The bored plate's wrong volume + filled-looking hole is
 NOT triangle inversion and NOT the boolean — it is the ANNULAR PLANAR CAP
 triangulating with OVERLAPPING triangles. Per-face measurement
 (`diag_bored_plate_face_winding`): the top/bottom caps (a Plane face whose inner

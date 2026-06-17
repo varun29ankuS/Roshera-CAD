@@ -950,16 +950,31 @@ fn annulus_radial_strip(
     };
     // Mean radius if the ring is circular (max deviation < 2% of mean), else None.
     let circular = |s: usize, e: usize, c: Point3| -> Option<f64> {
-        let rs: Vec<f64> = vertices[s..e]
-            .iter()
-            .map(|p| (*p - c).magnitude())
-            .collect();
+        let pts = &vertices[s..e];
+        let rs: Vec<f64> = pts.iter().map(|p| (*p - c).magnitude()).collect();
         let mean = rs.iter().sum::<f64>() / rs.len() as f64;
         if mean < 1e-9 {
             return None;
         }
         let maxdev = rs.iter().map(|r| (r - mean).abs()).fold(0.0_f64, f64::max);
         if maxdev > mean * 0.02 {
+            return None;
+        }
+        // Reject SPARSE polygons whose corners merely happen to be equidistant
+        // from the centroid — the classic trap is a rectangle/square cap, whose
+        // 4 corners pass the all-equidistant test above yet are NOT a circle.
+        // A genuinely circular tessellated ring has every consecutive chord well
+        // below its radius (chord = 2·r·sin(π/n) < r for n ≥ 7); a 4-corner
+        // square's side (its chord) EXCEEDS its corner-radius (80 > 56.57), so it
+        // fails here and falls through to the general CDT — which triangulates a
+        // square-outer + circular-hole annulus correctly. Without this guard the
+        // radial-strip mis-stitched the 4 square corners to the bore ring and
+        // over-covered the cap (area 8320 vs 5948 — the bored-plate-volume bug).
+        let n = pts.len();
+        let max_chord = (0..n)
+            .map(|i| (pts[(i + 1) % n] - pts[i]).magnitude())
+            .fold(0.0_f64, f64::max);
+        if max_chord > mean {
             return None;
         }
         Some(mean)
@@ -5415,6 +5430,130 @@ mod tests {
                 "triangle centroid ({cx}, {cy}) lies inside hole — bridging failed"
             );
         }
+    }
+
+    #[test]
+    fn planar_face_square_with_circular_hole() {
+        // TESS-ANNULAR-CAP repro: 80×80 outer square (CCW) with a centred Ø24
+        // circular hole (32-gon, CW). This is the bored-plate cap. Expected face
+        // area = 6400 − π·12² ≈ 5947.6. The live bug over-covers to ~8320 (> the
+        // outer square 6400) — overlapping triangles fill the bore.
+        let r = 12.0_f64;
+        let n = 32usize;
+        let hole: Vec<(f64, f64)> = (0..n)
+            .map(|k| {
+                // CW (negative angle) so the hole winds opposite the CCW outer.
+                let a = -(k as f64) / (n as f64) * std::f64::consts::TAU;
+                (40.0 + r * a.cos(), 40.0 + r * a.sin())
+            })
+            .collect();
+        let (verts, loops) = build_planar_loops(
+            &[(0.0, 0.0), (80.0, 0.0), (80.0, 80.0), (0.0, 80.0)],
+            &[&hole],
+        );
+        let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
+        let area = total_tri_area_xy(&verts, &tris);
+        let expected = 80.0 * 80.0 - std::f64::consts::PI * r * r;
+        // The hole is a 32-gon, so the true polygonal area is slightly under πr².
+        let poly_hole = 0.5 * (n as f64) * r * r * (std::f64::consts::TAU / n as f64).sin();
+        let expected_poly = 80.0 * 80.0 - poly_hole;
+        assert!(
+            (area - expected_poly).abs() < 1.0,
+            "square+circular-hole tri area {area} ≠ expected {expected_poly:.1} \
+             (analytic annulus {expected:.1}); >outer-square 6400 ⇒ overlap"
+        );
+        for &t in &tris {
+            let (cx, cy) = tri_centroid_xy(&verts, t);
+            let inside_hole = ((cx - 40.0).powi(2) + (cy - 40.0).powi(2)).sqrt() < r * 0.9;
+            assert!(
+                !inside_hole,
+                "triangle centroid ({cx:.1},{cy:.1}) lies inside the bore — hole not erased"
+            );
+        }
+    }
+
+    /// TESS-ANNULAR-CAP regression: the real bored-plate cap (a SQUARE outer +
+    /// circular bore hole) must tessellate to the correct annulus area. The bug:
+    /// `annulus_radial_strip` mis-classified the 4-corner square as a circular
+    /// ring (its corners are equidistant from the centroid) and radial-stripped
+    /// it to the bore, over-covering the cap to area 8320 (vs 5948) and inflating
+    /// the bored solid's volume to 107817 (vs 95162). Fixed by the chord<radius
+    /// guard in `circular`. Gate on cap AREA (no test checked it before — which is
+    /// why a watertight-but-wrong mesh hid).
+    #[test]
+    fn bored_plate_caps_tessellate_to_annulus() {
+        use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+        let mut m = BRepModel::new();
+        let plate = match TopologyBuilder::new(&mut m)
+            .create_box_3d(80.0, 80.0, 16.0)
+            .unwrap()
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let bore = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -10.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                12.0,
+                36.0,
+            )
+            .unwrap()
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let holed = boolean_operation(
+            &mut m,
+            plate,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .unwrap();
+        let params = TessellationParams::default();
+        let cache = EdgeSampleCache::new(&params);
+        let solid = m.solids.get(holed).unwrap();
+        let mut shells = vec![solid.outer_shell];
+        shells.extend_from_slice(&solid.inner_shells);
+        let mut caps = 0;
+        for sh in shells {
+            let shell = m.shells.get(sh).unwrap();
+            for &fid in &shell.faces {
+                let face = m.faces.get(fid).unwrap();
+                let surf = m.surfaces.get(face.surface_id).unwrap();
+                if surf.type_name() != "Plane" {
+                    continue;
+                }
+                let n = face.normal_at(0.5, 0.5, &m.surfaces).unwrap_or(Vector3::Z);
+                if n.z.abs() < 0.9 || face.inner_loops.is_empty() {
+                    continue; // only the horizontal caps that carry the bore
+                }
+                let mut mesh = TriangleMesh::new();
+                tessellate_planar_face(face, &m, &params, &cache, &mut mesh);
+                let area: f64 = mesh
+                    .triangles
+                    .iter()
+                    .map(|t| {
+                        let a = mesh.vertices[t[0] as usize].position;
+                        let b = mesh.vertices[t[1] as usize].position;
+                        let c = mesh.vertices[t[2] as usize].position;
+                        (b.to_vec() - a.to_vec())
+                            .cross(&(c.to_vec() - a.to_vec()))
+                            .magnitude()
+                            * 0.5
+                    })
+                    .sum();
+                let expected = 80.0 * 80.0 - std::f64::consts::PI * 12.0 * 12.0;
+                assert!(
+                    (area - expected).abs() < 5.0,
+                    "bored cap {fid} area {area:.1} ≠ annulus {expected:.1} (over-cover bug)"
+                );
+                caps += 1;
+            }
+        }
+        assert_eq!(caps, 2, "expected 2 bored caps, found {caps}");
     }
 
     #[test]
