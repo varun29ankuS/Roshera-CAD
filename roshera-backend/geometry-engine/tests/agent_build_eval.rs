@@ -71,6 +71,42 @@ fn union(m: &mut BRepModel, a: SolidId, b: SolidId) -> SolidId {
     boolean_operation(m, a, b, BooleanOp::Union, BooleanOptions::default()).expect("union")
 }
 
+/// Revolve a closed (r, z) profile a full turn about +Z → a solid of revolution.
+fn revolve_ring(m: &mut BRepModel, pts: &[(f64, f64)], segments: u32) -> SolidId {
+    let verts: Vec<_> = pts
+        .iter()
+        .map(|(r, z)| m.vertices.add(*r, 0.0, *z))
+        .collect();
+    let mut edges = Vec::new();
+    for i in 0..pts.len() {
+        let j = (i + 1) % pts.len();
+        let cid = m.curves.add(Box::new(Line::new(
+            Point3::new(pts[i].0, 0.0, pts[i].1),
+            Point3::new(pts[j].0, 0.0, pts[j].1),
+        )));
+        edges.push(m.edges.add(Edge::new(
+            0,
+            verts[i],
+            verts[j],
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+    }
+    revolve_profile(
+        m,
+        edges,
+        RevolveOptions {
+            axis_origin: Point3::ZERO,
+            axis_direction: Vector3::Z,
+            angle: std::f64::consts::TAU,
+            segments,
+            ..Default::default()
+        },
+    )
+    .expect("revolve_ring")
+}
+
 fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
     transform_solid(
         m,
@@ -224,5 +260,48 @@ fn eval_gusseted_l_bracket() {
     assert!(
         (d[0] - 80.0).abs() < 0.6 && (d[1] - 50.0).abs() < 0.6 && (d[2] - 50.0).abs() < 0.6,
         "gusseted-bracket envelope wrong: {d:?}"
+    );
+}
+
+#[test]
+fn eval_flanged_tube() {
+    // Probes the #35-family path at EXPORT density: a hollow flanged tube
+    // (revolved annular profile) with a bolt-circle of bores chained-differenced
+    // into the FLANGE — i.e. several holes through one annular cap, the exact
+    // topology that #35/#84 corefinement fixed (commits 98c20c5 + d4b5113). Here
+    // we assert it stays sound + watertight at the floored default (STL/FEA)
+    // chord after EACH bolt, not just the coarse density the flanged_body test
+    // checks. A revolved annulus (r_min = 15 > 0) never touches the axis, so the
+    // REVOLVE axis-touch pole bug is deliberately avoided.
+    let mut m = BRepModel::new();
+    // Hollow flanged tube, cross-section (r, z): inner bore r15 the full height,
+    // a foot flange r20→40 at z0–10, tube wall r15–20 up to z60.
+    let body = revolve_ring(
+        &mut m,
+        &[
+            (15.0, 0.0),
+            (40.0, 0.0),
+            (40.0, 10.0),
+            (20.0, 10.0),
+            (20.0, 60.0),
+            (15.0, 60.0),
+        ],
+        96,
+    );
+    assert_sound(&m, body, "flanged tube (revolve)");
+
+    // Bolt circle: four Ø6 holes at radius 30, through the 10 mm flange foot.
+    let mut acc = body;
+    for (bx, by) in [(30.0, 0.0), (0.0, 30.0), (-30.0, 0.0), (0.0, -30.0)] {
+        let bore = cyl(&mut m, Point3::new(bx, by, -5.0), 3.0, 20.0);
+        acc = diff(&mut m, acc, bore);
+        assert_sound(&m, acc, "flange bolt bore");
+    }
+
+    // Envelope: OD 80 (flange r40), height 60.
+    let d = world_dims(&m, acc);
+    assert!(
+        (d[0] - 80.0).abs() < 1.0 && (d[1] - 80.0).abs() < 1.0 && (d[2] - 60.0).abs() < 0.5,
+        "flanged-tube envelope wrong: {d:?}"
     );
 }
