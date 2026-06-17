@@ -23,6 +23,7 @@ use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+use geometry_engine::readable::cylindrical_diameters;
 use geometry_engine::render::dimensioned::{coverage_report, render_dimensioned_multiview};
 use geometry_engine::tessellation::TessellationParams;
 
@@ -101,6 +102,30 @@ fn assert_eye_agrees(m: &BRepModel, sid: SolidId, part: &str) {
         (0.0..=1.0).contains(&cov.coverage_fraction),
         "[{part}] eye coverage_fraction out of range: {}",
         cov.coverage_fraction
+    );
+}
+
+/// SEMANTIC eye check (the moat — perception depth ladder rung 3): the eye must
+/// RECOGNIZE the holes the build actually drilled, not just see the silhouette.
+/// `cylindrical_diameters` is the agent's "what bore sizes does this part have"
+/// answer; assert it reports at least `min_count` cylindrical faces at the
+/// expected Ø. This verifies built-feature == recognized-feature.
+fn assert_recognizes_bore(
+    m: &BRepModel,
+    sid: SolidId,
+    diameter: f64,
+    min_count: usize,
+    part: &str,
+) {
+    let dias = cylindrical_diameters(m, sid);
+    let found: usize = dias
+        .iter()
+        .filter(|(d, _)| (d - diameter).abs() < 1e-3)
+        .map(|(_, c)| *c)
+        .sum();
+    assert!(
+        found >= min_count,
+        "[{part}] eye recognized {found} Ø{diameter:.1} bore(s), expected ≥{min_count}; saw {dias:?}"
     );
 }
 
@@ -189,6 +214,7 @@ fn eval_bored_plate() {
         "bored-plate envelope wrong: {d:?}"
     );
     assert_eye_agrees(&m, holed, "bored plate");
+    assert_recognizes_bore(&m, holed, 24.0, 1, "bored plate"); // Ø24 = r12 bore
 }
 
 #[test]
@@ -212,6 +238,8 @@ fn eval_bossed_plate_with_coaxial_bore() {
         "bossed-plate envelope wrong: {d:?}"
     );
     assert_eye_agrees(&m, holed, "bossed plate + coaxial bore");
+    assert_recognizes_bore(&m, holed, 30.0, 1, "bossed plate"); // Ø30 = r15 coaxial bore
+    assert_recognizes_bore(&m, holed, 52.0, 1, "bossed plate"); // Ø52 = r26 boss wall
 }
 
 #[test]
@@ -323,6 +351,7 @@ fn eval_gusseted_l_bracket() {
         "gusseted-bracket envelope wrong: {d:?}"
     );
     assert_eye_agrees(&m, acc, "gusseted L-bracket");
+    assert_recognizes_bore(&m, acc, 8.0, 2, "gusseted L-bracket"); // two Ø8 = r4 mounting bores
 }
 
 #[test]
@@ -367,6 +396,8 @@ fn eval_flanged_tube() {
         "flanged-tube envelope wrong: {d:?}"
     );
     assert_eye_agrees(&m, acc, "flanged tube + bolt circle");
+    assert_recognizes_bore(&m, acc, 6.0, 4, "flanged tube"); // four Ø6 = r3 bolt holes
+    assert_recognizes_bore(&m, acc, 30.0, 1, "flanged tube"); // Ø30 = r15 inner bore
 }
 
 /// Build a solid hemispherical dome (radius R) by revolving a quarter-circle
