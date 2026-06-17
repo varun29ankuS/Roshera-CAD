@@ -265,6 +265,56 @@ fn kernel_bored_plate_mesh_has_bore() {
     );
 }
 
+#[test]
+#[ignore = "diagnostic: mesh signed-tet volume + orientation at default vs fine tess"]
+fn diag_cylinder_mesh_orientation() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let signed_vol = |mesh: &geometry_engine::tessellation::TriangleMesh| -> f64 {
+        let mut six = 0.0;
+        for t in &mesh.triangles {
+            let v0 = mesh.vertices[t[0] as usize].position.to_vec();
+            let v1 = mesh.vertices[t[1] as usize].position.to_vec();
+            let v2 = mesh.vertices[t[2] as usize].position.to_vec();
+            six += v0.dot(&v1.cross(&v2));
+        }
+        six / 6.0
+    };
+    for (label, params) in [
+        ("default", TessellationParams::default()),
+        ("fine", TessellationParams::fine()),
+    ] {
+        let mut m = BRepModel::new();
+        let c = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 12.0, 26.0);
+        let mesh = tessellate_solid(m.solids.get(c).unwrap(), &m, &params);
+        let r = manifold_report(&m, c, 0.05, 1e-6).expect("mr");
+        eprintln!(
+            "CYL {label}: signed_tet_vol={:.1} (truth=11762.1) tris={} open={} nm={}",
+            signed_vol(&mesh),
+            mesh.triangles.len(),
+            r.boundary_edges,
+            r.nonmanifold_edges
+        );
+    }
+    // Kernel bored plate: signed-tet (the CORRECT integrator) vs the render's
+    // mesh_analytics frame.volume — which one is wrong?
+    let mut m = BRepModel::new();
+    let plate = box_solid(&mut m, 80.0, 80.0, 16.0);
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -10.0), 12.0, 36.0);
+    let holed = diff(&mut m, plate, bore);
+    let mesh = tessellate_solid(
+        m.solids.get(holed).unwrap(),
+        &m,
+        &TessellationParams::default(),
+    );
+    let frame =
+        render_dimensioned_multiview(&m, holed, &TessellationParams::default()).expect("frame");
+    eprintln!(
+        "BORED PLATE: signed_tet_vol={:.1}  mesh_analytics(frame)={:.1}  (truth=95161.8, solid=102400)",
+        signed_vol(&mesh),
+        frame.volume
+    );
+}
+
 fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
     transform_solid(
         m,
