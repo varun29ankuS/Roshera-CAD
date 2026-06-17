@@ -503,9 +503,10 @@ fn cylinder_mass_properties_are_correct() {
 /// is the face-orientation / loop-winding interaction with the curved-CDT on the
 /// closed-circle lateral (create_side_face_shared / orient_face_for_outward). Pin
 /// asserts the CORRECT result — un-ignore when the lateral is oriented outward.
-/// Workaround in place: MCP create_cylinder now uses the analytic primitive.
+/// FIXED 2026-06-17: create_side_face_shared now derives the outward target from
+/// the SURFACE sample point (co-located with the orientation normal) instead of
+/// the loop edge-midpoint, so the closed-circle lateral orients outward.
 #[test]
-#[ignore = "EXTRUDE-CYL-MESH-INVERTED 🔴: sketch-extruded cylinder lateral winds inward (⅓ vol, neg inertia)"]
 fn extrude_circle_cylinder_mass_props_correct() {
     use geometry_engine::operations::extrude::{
         create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
@@ -555,6 +556,70 @@ fn extrude_circle_cylinder_mass_props_correct() {
         "extrude-circle cylinder inertia must be positive, got {}",
         mp.inertia_tensor[0][0]
     );
+}
+
+#[test]
+#[ignore = "diagnostic: compare lateral face orientation/normal — extrude vs create_cylinder_3d"]
+fn diag_compare_cylinder_laterals() {
+    use geometry_engine::operations::extrude::{
+        create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
+    };
+    use geometry_engine::primitives::curve::Circle;
+    let inspect = |m: &BRepModel, sid: SolidId, label: &str| {
+        let solid = m.solids.get(sid).unwrap();
+        let mut shells = vec![solid.outer_shell];
+        shells.extend_from_slice(&solid.inner_shells);
+        for sh in shells {
+            for &fid in &m.shells.get(sh).unwrap().faces {
+                let f = m.faces.get(fid).unwrap();
+                let surf = m.surfaces.get(f.surface_id).unwrap();
+                if surf.type_name() != "Cylinder" {
+                    continue;
+                }
+                let (ur, vr) = surf.parameter_bounds();
+                let um = (ur.0 + ur.1) * 0.5;
+                let vm = (vr.0 + vr.1) * 0.5;
+                let n = f.normal_at(um, vm, &m.surfaces).unwrap_or(Vector3::Z);
+                let p = surf.point_at(um, vm).unwrap_or(Point3::ZERO);
+                let radial = Vector3::new(p.x, p.y, 0.0)
+                    .normalize()
+                    .unwrap_or(Vector3::X);
+                eprintln!(
+                    "{label} lateral face {fid}: orient={:?} uvbounds=u[{:.2},{:.2}]v[{:.2},{:.2}] mid=({um:.2},{vm:.2}) pt=({:.1},{:.1},{:.1}) n=({:.2},{:.2},{:.2}) n·radial_out={:.2}",
+                    f.orientation, ur.0, ur.1, vr.0, vr.1, p.x, p.y, p.z, n.x, n.y, n.z, n.dot(&radial)
+                );
+            }
+        }
+    };
+    // create_cylinder_3d
+    let mut m1 = BRepModel::new();
+    let c1 = cyl(&mut m1, Point3::ZERO, 12.0, 26.0);
+    inspect(&m1, c1, "PRIMITIVE");
+    // extrude-circle
+    let mut m2 = BRepModel::new();
+    let circle = Circle::new(Point3::ZERO, Vector3::Z, 12.0).expect("circle");
+    let cid = m2.curves.add(Box::new(circle));
+    let seam = m2.vertices.add(12.0, 0.0, 0.0);
+    let edge = m2.edges.add(Edge::new(
+        0,
+        seam,
+        seam,
+        cid,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let face = create_face_from_profile_with_plane(&mut m2, vec![edge], Point3::ZERO, Vector3::Z)
+        .expect("face");
+    let c2 = extrude_face(
+        &mut m2,
+        face,
+        ExtrudeOptions {
+            distance: 26.0,
+            ..Default::default()
+        },
+    )
+    .expect("extrude");
+    inspect(&m2, c2, "EXTRUDE");
 }
 
 fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
