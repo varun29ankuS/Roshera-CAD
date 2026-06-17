@@ -493,6 +493,70 @@ fn cylinder_mass_properties_are_correct() {
     }
 }
 
+/// PIN — EXTRUDE-CYL-MESH-INVERTED (🔴): extruding a full CIRCLE profile builds an
+/// analytic Cylinder whose surface is IDENTICAL to `create_cylinder_3d`, yet its
+/// tessellated LATERAL winds INWARD → mass-integration gives ⅓·πr²h (top-cap flux
+/// 3920 − lateral flux 7840 = −3920 → |·| = ⅓), COM at the origin, and a NEGATIVE
+/// inertia diagonal. The CAPS are correct; only the closed-circle lateral inverts.
+/// This corrupts volume/mass for every sketch-extruded cylinder and feeds the
+/// #41b extrude-path boss-wall drop. Surface == create_cylinder_3d's, so the fault
+/// is the face-orientation / loop-winding interaction with the curved-CDT on the
+/// closed-circle lateral (create_side_face_shared / orient_face_for_outward). Pin
+/// asserts the CORRECT result — un-ignore when the lateral is oriented outward.
+/// Workaround in place: MCP create_cylinder now uses the analytic primitive.
+#[test]
+#[ignore = "EXTRUDE-CYL-MESH-INVERTED 🔴: sketch-extruded cylinder lateral winds inward (⅓ vol, neg inertia)"]
+fn extrude_circle_cylinder_mass_props_correct() {
+    use geometry_engine::operations::extrude::{
+        create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
+    };
+    use geometry_engine::primitives::curve::Circle;
+    let mut m = BRepModel::new();
+    let circle = Circle::new(Point3::ZERO, Vector3::Z, 12.0).expect("circle");
+    let cid = m.curves.add(Box::new(circle));
+    let seam = m.vertices.add(12.0, 0.0, 0.0); // Circle t=0 = +X·r
+    let edge = m.edges.add(Edge::new(
+        0,
+        seam,
+        seam,
+        cid,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let face = create_face_from_profile_with_plane(&mut m, vec![edge], Point3::ZERO, Vector3::Z)
+        .expect("face");
+    let sid = extrude_face(
+        &mut m,
+        face,
+        ExtrudeOptions {
+            distance: 26.0,
+            ..Default::default()
+        },
+    )
+    .expect("extrude circle");
+    let mp = m.mass_properties_for(sid).expect("mp");
+    let truth = std::f64::consts::PI * 144.0 * 26.0;
+    eprintln!(
+        "extrude-circle cylinder: vol={:.1} truth={:.1} ratio={:.3} com={:?} inertia_xx={:.0}",
+        mp.volume,
+        truth,
+        mp.volume / truth,
+        mp.center_of_mass,
+        mp.inertia_tensor[0][0]
+    );
+    assert!(
+        (mp.volume - truth).abs() < 0.02 * truth,
+        "extrude-circle cylinder volume {:.1} != πr²h {:.1} (lateral wound inward)",
+        mp.volume,
+        truth
+    );
+    assert!(
+        mp.inertia_tensor[0][0] > 0.0,
+        "extrude-circle cylinder inertia must be positive, got {}",
+        mp.inertia_tensor[0][0]
+    );
+}
+
 fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
     transform_solid(
         m,
