@@ -489,7 +489,32 @@ for axial planes. Gate `axial_cylinder_section_through_seam_85c`. KNOWN remainin
 oblique vertical planes (nz=0, off-seam) still 0 caps — separate pre-existing
 marching-grid limitation.
 
-### REVOLVE axis-touch 🔴 profiles with a pole (r=0) reject or go non-watertight
+### REVOLVE axis-touch 🔴 profiles with a pole (r=0) reject — TWO-PART FIX SPEC (2026-06-17)
+**Investigated + scoped (experiment reverted to avoid shipping leaky domes):** the
+fix is TWO parts that MUST land together:
+1. **GUARD (face_intersects_axis, revolve.rs ~1547):** conditions (1) "vertex on
+   axis" and (2) "edge sample r<tol" reject ANY touch of the axis. But a boundary
+   vertex on the axis is a POLE and an edge lying ALONG the axis is the
+   solid-of-revolution's axis segment — neither is a self-intersection. Only an
+   edge CROSSING the axis (radial-offset sign-flip with both samples off-axis) or
+   the axis piercing the face INTERIOR (condition 3, already skipped when the
+   profile plane contains the axis) is real. RELAXING (1)+(2) to drop the
+   touch-rejects while keeping the guarded sign-flip ADMITS the dome (verified:
+   revolve no longer returns SelfIntersection). NOTE `make_on_axis_rectangle` +
+   `face_intersects_axis_on_axis_rectangle_does_intersect` encode the BUGGY
+   behavior — that rectangle (one edge on Z) revolves to a VALID cylinder, so that
+   test must be updated when the guard is fixed.
+2. **POLE TESSELLATION (the deep half):** with the guard relaxed, the dome builds
+   a B-Rep-VALID solid but its mesh is NON-watertight — `open=147 nm=20` at the
+   apex + a `cdt` panic (triangulate.rs, the #24 curved-CDT panic). The apex fan
+   isn't closed watertight. This ties to #24 (curved-CDT spanning-triangle panic)
+   and the pole-fan tessellation. UNTIL this lands, relaxing the guard alone makes
+   domes build as silently-leaky solids (B-Rep valid, mesh open) — WORSE than the
+   honest reject, so the guard relaxation was reverted. Ship both together.
+Repro `agent_build_eval::eval_revolved_dome` (#[ignore], asserts the desired
+sound+watertight end state). (Original report below.)
+
+### (orig) REVOLVE axis-touch — profiles with a pole (r=0) reject or go non-watertight
 A revolve profile that TOUCHES the axis (a hemispherical dome apex, a solid cone
 tip, a sphere's poles) is either rejected (`SelfIntersection`) or tessellates
 non-watertight (sphere-via-revolve = 64 open at the poles). Blocks a whole class
