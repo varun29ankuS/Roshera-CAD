@@ -530,6 +530,18 @@ fix is TWO parts that MUST land together:
    and the pole-fan tessellation. UNTIL this lands, relaxing the guard alone makes
    domes build as silently-leaky solids (B-Rep valid, mesh open) — WORSE than the
    honest reject, so the guard relaxation was reverted. Ship both together.
+   **LOCALIZED 2026-06-17:** the apex band is a `SurfaceOfRevolution` face that
+   routes through `tessellation/surface.rs::tessellate_revolution_wedge` (the
+   `"SurfaceOfRevolution"` arm, surface.rs ~207) — the structured-grid wedge
+   declines for the degenerate apex band (one meridian collapses to the pole,
+   r=0, so opposite boundaries have unequal sample counts), and the curved-CDT
+   fallback chokes on the apex (all boundary points converge → degenerate contour
+   → cdt panic → caught → empty → the 147 open). FIX LANE: in
+   `tessellate_revolution_wedge`, detect the apex band (one boundary radius ≈ 0)
+   and triangulate it as a FAN from the single apex vertex to the opposite rim
+   samples (the analogue of the sphere-pole fan that already works for the sphere
+   primitive) — never feed the degenerate apex contour to cdt. Then the guard
+   relaxation (part 1) + this make eval_revolved_dome watertight together.
 Repro `agent_build_eval::eval_revolved_dome` (#[ignore], asserts the desired
 sound+watertight end state). (Original report below.)
 
