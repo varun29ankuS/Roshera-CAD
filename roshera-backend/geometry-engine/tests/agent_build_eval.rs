@@ -14,9 +14,10 @@
 //! this session (bored plate, box∪boss + coaxial bore, bell nozzle).
 
 use geometry_engine::harness::watertight::manifold_report;
-use geometry_engine::math::{Point3, Tolerance, Vector3};
+use geometry_engine::math::{Matrix4, Point3, Tolerance, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
+use geometry_engine::operations::transform::{transform_solid, TransformOptions};
 use geometry_engine::primitives::curve::{Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
@@ -68,6 +69,16 @@ fn diff(m: &mut BRepModel, a: SolidId, b: SolidId) -> SolidId {
 }
 fn union(m: &mut BRepModel, a: SolidId, b: SolidId) -> SolidId {
     boolean_operation(m, a, b, BooleanOp::Union, BooleanOptions::default()).expect("union")
+}
+
+fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
+    transform_solid(
+        m,
+        sid,
+        Matrix4::from_translation(&Vector3::new(dx, dy, dz)),
+        TransformOptions::default(),
+    )
+    .expect("translate");
 }
 
 #[test]
@@ -172,5 +183,46 @@ fn eval_bell_nozzle() {
     assert!(
         (d[2] - 178.0).abs() < 0.5 && (d[0] - 150.0).abs() < 1.0,
         "nozzle envelope wrong: {d:?}"
+    );
+}
+
+#[test]
+fn eval_gusseted_l_bracket() {
+    // The hardest agent-build probe in the eval: THREE chained box unions —
+    // horizontal plate ∪ vertical plate ∪ an interpenetrating gusset web —
+    // then two mounting bores, asserting sound + watertight at EXPORT density
+    // after EVERY step. The parts_invariant_sweep L-bracket only checks at the
+    // coarse chord 0.5; this verifies the same family of seams at the real
+    // STL/FEA density (the floored default chord), where box∪box seams are most
+    // likely to leak.
+    let mut m = BRepModel::new();
+
+    let horiz = box_solid(&mut m, 80.0, 50.0, 12.0); // x[-40,40] y[-25,25] z[-6,6]
+    assert_sound(&m, horiz, "horiz plate");
+
+    let vert = box_solid(&mut m, 80.0, 12.0, 50.0); // centred → stand it up at the back
+    translate(&mut m, vert, 0.0, -19.0, 19.0); // y[-25,-13] z[-6,44]
+    let l = union(&mut m, horiz, vert);
+    assert_sound(&m, l, "horiz ∪ vert");
+
+    // Gusset web bridging the inside corner — interpenetrates BOTH plates.
+    let rib = box_solid(&mut m, 10.0, 24.0, 24.0); // x[-5,5] y[-12,12] z[-12,12]
+    translate(&mut m, rib, 0.0, -7.0, 11.0); // y[-19,5] z[-1,23] — buried in both
+    let gusseted = union(&mut m, l, rib);
+    assert_sound(&m, gusseted, "L ∪ gusset web");
+
+    // Two mounting bores through the horizontal plate.
+    let mut acc = gusseted;
+    for bx in [-25.0, 25.0] {
+        let bore = cyl(&mut m, Point3::new(bx, 10.0, -10.0), 4.0, 32.0);
+        acc = diff(&mut m, acc, bore);
+        assert_sound(&m, acc, "mounting bore");
+    }
+
+    // Envelope: x 80, y 50 (−25..25), z 50 (−6..44).
+    let d = world_dims(&m, acc);
+    assert!(
+        (d[0] - 80.0).abs() < 0.6 && (d[1] - 50.0).abs() < 0.6 && (d[2] - 50.0).abs() < 0.6,
+        "gusseted-bracket envelope wrong: {d:?}"
     );
 }
