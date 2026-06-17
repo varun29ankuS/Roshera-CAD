@@ -243,7 +243,18 @@ discs (area 5441 vs analytic 4511, +20%). FIX (bfbdf4d): keep magnitude AND sign
 circles as holes. `flanged_body_section_multihole_85b` un-#[ignore]'d (running
 guard); section_area_sweep + 82 section lib tests green.
 
-### #41b 🔴 RE-SURFACED 2026-06-17 — coaxial bore through a boss STILL drops the outer wall (live)
+### #41b 🟢 FIXED 2026-06-17 — resolved by the EXTRUDE-CYL-MESH-INVERTED orientation fix
+The extrude-path boss-wall drop was a downstream symptom of the inverted extrude
+cylinder lateral (EXTRUDE-CYL-MESH-INVERTED, below): the boss wall's inward
+orientation made the coaxial difference mis-handle/drop it. With
+`create_side_face_shared` now orienting side faces from the surface sample point
+(commit 3fc8fdb), the extrude boss lateral winds outward and the bore keeps it.
+GATE `agent_build_eval::extrude_boss_coaxial_bore_keeps_wall` (PASSES): box base
+∪ EXTRUDE-circle boss − coaxial through-bore → valid + watertight + Ø70 boss wall
+present (was 300 open / invalid / wall dropped). The analytic-boss path was
+already sound (`bearing_housing_coaxial_bore_is_sound`). Original report below.
+
+### (orig) #41b — coaxial bore through a boss STILL drops the outer wall (live)
 Live dogfood after the TESS-ANNULAR-CAP fix: built a bearing housing —
 base 120×120×20 ∪ boss (MCP create_cylinder r35, z10→50, interpenetrating),
 then − coaxial bore (r20, through). Result: `sound:false / valid:false / 300
