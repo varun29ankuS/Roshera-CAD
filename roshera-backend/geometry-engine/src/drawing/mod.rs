@@ -23,12 +23,21 @@
 //! SVG rendering lives in [`svg`]; REST and frontend integration lives
 //! in `api-server` and `roshera-app` respectively.
 
+pub mod centerlines;
+pub mod dimensioning;
 pub mod dxf;
 pub mod pdf;
 pub mod projection;
 pub mod svg;
 pub mod types;
+pub mod verify;
+pub mod visibility;
 
+pub use centerlines::{centerlines, Centerline};
+pub use dimensioning::{
+    auto_dimensions, standard_drawing, standard_drawing_auto, standard_drawing_hlr,
+    visible_dimensions, Dimension2d,
+};
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{
@@ -39,6 +48,8 @@ pub use types::{
     Drawing, DrawingId, Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize,
     TitleBlock, ViewExtent, ViewSource,
 };
+pub use verify::{verify_drawing, DrawingIssue, DrawingIssueKind, DrawingQualityReport, Severity};
+pub use visibility::{is_point_hidden, project_solid_edges_visibility, ViewEdges};
 
 #[cfg(test)]
 mod tests;

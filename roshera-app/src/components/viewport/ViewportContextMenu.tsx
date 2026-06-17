@@ -1,7 +1,9 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { Eye, EyeOff, PenTool, Trash2 } from 'lucide-react'
+import { Eye, EyeOff, FileText, PenTool, Trash2 } from 'lucide-react'
 import { useSceneStore } from '@/stores/scene-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 import { sketchApi } from '@/lib/sketch-api'
+import { createPartDrawing } from '@/lib/drawings-api'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -69,6 +71,23 @@ export function ViewportContextMenu() {
     close()
   }, [menu, updateObject, close])
 
+  const handleCreateDrawing = useCallback(async () => {
+    if (!menu) return
+    const objectId = menu.objectId
+    const obj = useSceneStore.getState().objects.get(objectId)
+    close()
+    try {
+      // Server builds the standard third-angle sheet (Front/Top/Right +
+      // HLR + centerlines + auto dimensions), registers it, and returns
+      // its id. We then switch to the Drawing workspace focused on it —
+      // the kernel is the single source of truth for the geometry.
+      const drawingId = await createPartDrawing(objectId, obj?.name)
+      useDocModeStore.getState().openDrawing(drawingId)
+    } catch (err) {
+      console.error('[viewport] create-drawing failed:', err)
+    }
+  }, [menu, close])
+
   const handleSketchOnFace = useCallback(async () => {
     if (!menu || menu.faceId === undefined) return
     close()
@@ -104,6 +123,11 @@ export function ViewportContextMenu() {
       <MenuItem onClick={handleToggleVisibility}>
         {isVisible ? <EyeOff size={13} /> : <Eye size={13} />}
         {isVisible ? 'Hide' : 'Show'}
+      </MenuItem>
+      <div className="my-1 border-t border-border/50" />
+      <MenuItem onClick={handleCreateDrawing}>
+        <FileText size={13} />
+        Create Drawing
       </MenuItem>
       {menu.faceId !== undefined && (
         <>

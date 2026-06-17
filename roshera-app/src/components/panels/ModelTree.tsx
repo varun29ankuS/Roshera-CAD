@@ -1,9 +1,11 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
-import { Eye, EyeOff, Trash2, Pencil, Plus } from 'lucide-react'
+import { Eye, EyeOff, Trash2, Pencil, Plus, FileText } from 'lucide-react'
 import { useSceneStore, isStandardPlane, type CADObject, type SketchPlane } from '@/stores/scene-store'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useWSStore } from '@/stores/ws-store'
 import { sketchApi, type ServerSketchSession } from '@/lib/sketch-api'
+import { createPartDrawing } from '@/lib/drawings-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 import { CreateDatumDialog } from '@/components/panels/CreateDatumDialog'
@@ -1025,6 +1027,20 @@ function TreeContextMenu({
     updateObject(localObj.id, { visible: !localObj.visible })
   }, [localObj, updateObject, onClose])
 
+  const handleCreateDrawing = useCallback(async () => {
+    onClose()
+    if (!localObj) return
+    try {
+      // Server builds the standard third-angle sheet (Front/Top/Right +
+      // HLR + centerlines + auto dimensions), registers it, and returns
+      // its id; we then open the Drawing workspace focused on it.
+      const drawingId = await createPartDrawing(localObj.id, localObj.name)
+      useDocModeStore.getState().openDrawing(drawingId)
+    } catch (err) {
+      console.error('[browser] create-drawing failed:', err)
+    }
+  }, [localObj, onClose])
+
   const handleDeleteSketch = useCallback(async () => {
     onClose()
     try {
@@ -1185,6 +1201,12 @@ function TreeContextMenu({
         {isVisible ? <EyeOff size={13} /> : <Eye size={13} />}
         {isVisible ? 'Hide' : 'Show'}
       </TreeMenuItem>
+      {visibilityEnabled && (
+        <TreeMenuItem onClick={handleCreateDrawing}>
+          <FileText size={13} />
+          Create Drawing
+        </TreeMenuItem>
+      )}
       <div className="my-1 border-t border-border/50" />
       <TreeMenuItem onClick={handleDelete} danger disabled={!deleteEnabled}>
         <Trash2 size={13} />

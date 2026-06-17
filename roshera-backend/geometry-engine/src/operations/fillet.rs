@@ -1550,6 +1550,35 @@ fn create_closed_edge_fillet(
     )
 }
 
+/// Largest radial distance (perpendicular to `axis`) of any vertex on a
+/// face's OUTER loop. Used to gate a bore-rim fillet so the growing hole
+/// (R → R+r) can't reach the cap's outer edge.
+fn face_outer_loop_max_radius(
+    model: &BRepModel,
+    face_id: FaceId,
+    origin: Point3,
+    axis: Vector3,
+) -> f64 {
+    let mut max_r = 0.0_f64;
+    let Some(face) = model.faces.get(face_id) else {
+        return max_r;
+    };
+    if let Some(l) = model.loops.get(face.outer_loop) {
+        for &e in &l.edges {
+            if let Some(ed) = model.edges.get(e) {
+                for v in [ed.start_vertex, ed.end_vertex] {
+                    if let Some(p) = model.vertices.get_position(v) {
+                        let d = Point3::new(p[0], p[1], p[2]) - origin;
+                        let radial = d - axis * d.dot(&axis);
+                        max_r = max_r.max(radial.magnitude());
+                    }
+                }
+            }
+        }
+    }
+    max_r
+}
+
 /// Build the quarter-torus blend that replaces a cylinder/cap rim.
 ///
 /// See [`create_closed_edge_fillet`] for the high-level recipe. This
@@ -1557,6 +1586,12 @@ fn create_closed_edge_fillet(
 /// loop pattern is the same "seamed" rectangle a cylinder lateral uses,
 /// which `splice_blend_edge` (designed for the open V0–V1 case) cannot
 /// produce.
+///
+/// Handles both the OUTER rim of a (solid or annular) cap and the INNER
+/// bore rim of an annular cap (tube/washer/flange). The two are radial
+/// mirrors: the outer rim's cap circle shrinks to R−r and the blend sits
+/// on the torus outer equator (v ∈ [0, π/2]); the bore rim's hole grows
+/// to R+r and the blend sits on the inner equator (v ∈ [π/2, π]).
 fn cylinder_rim_fillet(
     model: &mut BRepModel,
     rim_edge_id: EdgeId,
@@ -1588,31 +1623,6 @@ fn cylinder_rim_fillet(
     let h_high = height_limits[1];
     let height = h_high - h_low;
 
-    // Geometric preconditions:
-    //   - r < R/2 keeps the resulting torus's minor radius strictly
-    //     below its major radius, so the surface doesn't self-pinch
-    //     (Torus::new rejects minor >= major outright).
-    //   - r < height keeps the lateral cylinder non-degenerate after
-    //     it's shortened on the rim side.
-    // AUDIT-H1: numerical safety margins use the caller-supplied
-    // distance tolerance instead of a hardcoded `1e-9`. This lets the
-    // user widen the gate (loose tolerance ⇒ reject borderline radii
-    // earlier) or tighten it (strict ⇒ accept tighter blends).
-    let margin = tol.distance();
-    if radius >= big_r * 0.5 - margin {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Fillet radius {radius} too large for cylinder rim: must be strictly \
-             less than half the cylinder radius ({big_r}); the resulting torus \
-             would self-pinch (minor >= major)."
-        )));
-    }
-    if radius >= height - margin {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Fillet radius {radius} too large for cylinder rim: exceeds available \
-             cylinder height ({height}); the lateral surface would collapse."
-        )));
-    }
-
     // sign = +1 for top rim (cap normal aligned with cylinder axis),
     //      = -1 for bottom rim (cap normal opposite the cylinder axis).
     let sign: f64 = if plane.normal.dot(&axis) > 0.0 {
@@ -1620,6 +1630,68 @@ fn cylinder_rim_fillet(
     } else {
         -1.0
     };
+
+    // Does the rim sit on the cap's OUTER boundary, or on an INNER
+    // (bore/hole) boundary? An annular cap — every tube, washer, or
+    // flange — carries its bore rim in one of the cap face's inner loops.
+    //   * outer rim (radial_out = +1): the cap edge shrinks toward the
+    //     axis to R−r.
+    //   * bore  rim (radial_out = −1): the hole grows away from the axis
+    //     to R+r.
+    let (cap_loop_id, radial_out) = {
+        let cap_face = model
+            .faces
+            .get(cap_face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap face missing".to_string()))?;
+        let has_rim = |lid| -> bool {
+            model
+                .loops
+                .get(lid)
+                .is_some_and(|l| l.edges.contains(&rim_edge_id))
+        };
+        if has_rim(cap_face.outer_loop) {
+            (cap_face.outer_loop, 1.0_f64)
+        } else if let Some(&inner) = cap_face.inner_loops.iter().find(|&&lid| has_rim(lid)) {
+            (inner, -1.0_f64)
+        } else {
+            return Err(OperationError::InvalidGeometry(
+                "Rim edge not found in cap loop".to_string(),
+            ));
+        }
+    };
+    let inner = radial_out < 0.0;
+    // Cap circle radius after the blend: R−r for an outer rim, R+r for a
+    // bore rim.
+    let cap_r = big_r - radial_out * radius;
+
+    // Geometric preconditions. `r < height` keeps the shortened lateral
+    // cylinder non-degenerate (both rim kinds). The radial gate differs:
+    // an outer rim must keep r < R/2 so the torus doesn't self-pinch
+    // (minor >= major); a bore rim's growing hole must not reach the
+    // cap's outer edge.
+    // AUDIT-H1: numerical safety margins use the caller-supplied tolerance.
+    let margin = tol.distance();
+    if radius >= height - margin {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Fillet radius {radius} too large for cylinder rim: exceeds available \
+             cylinder height ({height}); the lateral surface would collapse."
+        )));
+    }
+    if inner {
+        let cap_outer_r = face_outer_loop_max_radius(model, cap_face_id, origin, axis);
+        if cap_r >= cap_outer_r - margin {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Fillet radius {radius} too large for bore rim: the rounded bore \
+                 (R+r = {cap_r}) would reach the cap's outer edge ({cap_outer_r})."
+            )));
+        }
+    } else if radius >= big_r * 0.5 - margin {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Fillet radius {radius} too large for cylinder rim: must be strictly \
+             less than half the cylinder radius ({big_r}); the resulting torus \
+             would self-pinch (minor >= major)."
+        )));
+    }
 
     // After the fillet:
     //   - cap stays at its original height (cap_h) but its outer
@@ -1640,7 +1712,7 @@ fn cylinder_rim_fillet(
     //   cylinder at the new shorter height.
     //   v_cap (= newly created) lives on the cap at the reduced radius.
     let lat_seam_pos = origin + axis * lat_seam_h + ref_dir * big_r;
-    let cap_seam_pos = origin + axis * cap_h + ref_dir * (big_r - radius);
+    let cap_seam_pos = origin + axis * cap_h + ref_dir * cap_r;
 
     // Torus blend center on the cylinder axis at the lateral shrink
     // height; its axis is the cylinder axis flipped for the rim's
@@ -1649,7 +1721,7 @@ fn cylinder_rim_fillet(
     let torus_center = origin + axis * lat_seam_h;
     let torus_axis = axis * sign;
     // Center of the meridional quarter-arc (in the seam plane).
-    let torus_arc_center = torus_center + ref_dir * (big_r - radius);
+    let torus_arc_center = torus_center + ref_dir * cap_r;
 
     // Snapshot the rim edge before mutating anything else.
     let rim_edge = model
@@ -1670,11 +1742,8 @@ fn cylinder_rim_fillet(
         .get(lat_face_id)
         .map(|f| f.outer_loop)
         .ok_or_else(|| OperationError::InvalidGeometry("Lateral face missing".to_string()))?;
-    let cap_loop_id = model
-        .faces
-        .get(cap_face_id)
-        .map(|f| f.outer_loop)
-        .ok_or_else(|| OperationError::InvalidGeometry("Cap face missing".to_string()))?;
+    // (cap_loop_id was resolved above — outer loop for an outer rim, the
+    // matching inner loop for a bore rim.)
 
     // The lateral seam edge appears twice in the lateral loop (once
     // forward, once backward) — that's the canonical "seamed face"
@@ -1756,7 +1825,7 @@ fn cylinder_rim_fillet(
     // Cap and lateral trim circles share the cylinder's parametric
     // direction so loop orientation flags carry over from the original
     // top/bottom edges unchanged (see step 5).
-    let cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, big_r - radius)
+    let cap_trim_circle = Arc::circle(origin + axis * cap_h, axis, cap_r)
         .map_err(|e| OperationError::NumericalError(format!("cap trim circle: {e}")))?;
     let lat_trim_circle = Arc::circle(torus_center, axis, big_r)
         .map_err(|e| OperationError::NumericalError(format!("lat trim circle: {e}")))?;
@@ -1774,7 +1843,11 @@ fn cylinder_rim_fillet(
         let x_axis = probe.x_axis;
         // probe.normal is the normalised version of normal_arc.
         let y_axis = probe.normal.cross(&x_axis);
-        let start_a = ref_dir.dot(&y_axis).atan2(ref_dir.dot(&x_axis));
+        // The arc starts at v_lat, whose radial offset from the arc
+        // centre is +ref_dir for an outer rim and −ref_dir for a bore
+        // rim (the arc centre sits outside the wall in the bore case).
+        let start_dir = ref_dir * radial_out;
+        let start_a = start_dir.dot(&y_axis).atan2(start_dir.dot(&x_axis));
         let end_dir = axis * sign;
         let end_a = end_dir.dot(&y_axis).atan2(end_dir.dot(&x_axis));
         let mut sweep = end_a - start_a;
@@ -1930,34 +2003,44 @@ fn cylinder_rim_fillet(
     }
 
     // ---- step 8: build the torus surface + blend face. ----
-    let mut torus = Torus::new(torus_center, torus_axis, big_r - radius, radius)
+    let mut torus = Torus::new(torus_center, torus_axis, cap_r, radius)
         .map_err(|e| OperationError::NumericalError(format!("Torus blend: {e}")))?;
-    // Restrict to the quarter-toroidal sector u ∈ [0, 2π], v ∈ [0, π/2]
-    // so the surface domain matches the loop the four edges define.
-    torus.param_limits = Some([0.0, TAU, 0.0, FRAC_PI_2]);
+    // Restrict to the quarter-toroidal sector. The lateral contact is at
+    // radius `big_r`; for an outer rim that is the torus OUTER equator
+    // (v=0, major+minor) so the sector is v ∈ [0, π/2]; for a bore rim it
+    // is the INNER equator (v=π, major−minor) so the sector is
+    // v ∈ [π/2, π]. The cap contact is at v = π/2 in both cases.
+    let v_range = if inner {
+        [FRAC_PI_2, PI]
+    } else {
+        [0.0, FRAC_PI_2]
+    };
+    torus.param_limits = Some([0.0, TAU, v_range[0], v_range[1]]);
     // Anchor u=0 to the same ref_dir as the cylinder so the torus seam
     // aligns with the new lateral seam edge.
     torus.ref_dir = ref_dir;
-    // Outward target at the torus's parametric midpoint (u=π, v=π/4):
-    // the surface normal there is in the direction
-    // -ref_dir·cos(π/4) + (axis·sign)·sin(π/4) ≡ (axis·sign − ref_dir)/√2.
-    // This is the geometric "diagonal" between the lateral-outward and
-    // cap-outward directions at the corner — the fillet blend face must
-    // have its oriented outward normal align with this diagonal.
-    let blend_outward_target = torus_axis - ref_dir;
+    // Outward target at the corner diagonal: the average of the lateral-
+    // outward (+ref_dir·radial_out) and cap-outward (axis·sign) normals.
+    let blend_outward_target = torus_axis - ref_dir * radial_out;
     let blend_orientation = orient_face_for_outward(&torus, blend_outward_target)?;
     let torus_surface_id = model.surfaces.add(Box::new(torus));
 
-    // Loop sequence (parameter-space CCW for outward-pointing torus):
-    //   (u=0, v=0)    → (u=2π, v=0)   : lat_trim_edge   forward
-    //   (u=2π, v=0)   → (u=2π, v=π/2) : torus_seam_edge forward
-    //   (u=2π, v=π/2) → (u=0,  v=π/2) : cap_trim_edge   backward
-    //   (u=0,  v=π/2) → (u=0,  v=0)   : torus_seam_edge backward
+    // Loop sequence (parameter-space CCW for the outward-pointing torus).
+    // Outer rim, v ∈ [0, π/2]:  lat(v=0) fwd, seam fwd, cap(v=π/2) back, seam back.
+    // Bore rim,  v ∈ [π/2, π]:  cap(v=π/2) fwd, seam fwd, lat(v=π) back, seam back
+    //   — the lateral edge is now at the higher v, so its slot flips.
     let mut blend_loop = Loop::new(0, LoopType::Outer);
-    blend_loop.add_edge(lat_trim_edge_id, true);
-    blend_loop.add_edge(torus_seam_edge_id, true);
-    blend_loop.add_edge(cap_trim_edge_id, false);
-    blend_loop.add_edge(torus_seam_edge_id, false);
+    if inner {
+        blend_loop.add_edge(cap_trim_edge_id, true);
+        blend_loop.add_edge(torus_seam_edge_id, true);
+        blend_loop.add_edge(lat_trim_edge_id, false);
+        blend_loop.add_edge(torus_seam_edge_id, false);
+    } else {
+        blend_loop.add_edge(lat_trim_edge_id, true);
+        blend_loop.add_edge(torus_seam_edge_id, true);
+        blend_loop.add_edge(cap_trim_edge_id, false);
+        blend_loop.add_edge(torus_seam_edge_id, false);
+    }
     let blend_loop_id = model.loops.add(blend_loop);
 
     let mut blend_face = Face::new(0, torus_surface_id, blend_loop_id, blend_orientation);

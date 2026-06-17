@@ -230,6 +230,36 @@ pub struct ProjectedView {
     pub polylines: Vec<Polyline2d>,
     /// View-space extent of the geometry.
     pub extent: ViewExtent,
+    /// Auto-derived analytic dimension callouts on this view (view-space mm).
+    /// Empty unless populated by `dimensioning::standard_drawing`. `#[serde(default)]`
+    /// keeps older serialized drawings (no dimensions) parsing.
+    #[serde(default)]
+    pub dimensions: Vec<super::dimensioning::Dimension2d>,
+    /// Auto-derived chain-line centerlines for circular features (view-space
+    /// mm). Empty unless populated by `dimensioning::standard_drawing`.
+    #[serde(default)]
+    pub centerlines: Vec<super::centerlines::Centerline>,
+    /// Occluded edges drawn dashed (view-space mm). Empty unless populated by
+    /// `dimensioning::standard_drawing_hlr`; when set, `polylines` holds only
+    /// the visible edges. `#[serde(default)]` keeps older drawings parsing.
+    #[serde(default)]
+    pub hidden_polylines: Vec<Polyline2d>,
+    /// Circular edges that project to a TRUE circle (a closed circular edge
+    /// whose plane faces the camera) — rendered as an exact SVG circle, not a
+    /// faceted polyline. View-space (pre-scale).
+    #[serde(default)]
+    pub circles: Vec<ProjectedCircle>,
+    /// Occluded analytic circles, drawn dashed.
+    #[serde(default)]
+    pub hidden_circles: Vec<ProjectedCircle>,
+}
+
+/// A circular edge projected to a true circle in view-space (mm, pre-scale).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ProjectedCircle {
+    pub cx: f64,
+    pub cy: f64,
+    pub r: f64,
 }
 
 /// Paper sizes, ISO 216 series. Dimensions in millimetres, landscape

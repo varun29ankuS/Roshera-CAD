@@ -41,6 +41,7 @@ import {
   type TitleBlockPatch,
 } from '@/lib/drawings-api'
 import { type PartSummary, listParts } from '@/lib/parts-api'
+import { useDocModeStore } from '@/stores/doc-mode-store'
 
 // Default solid id used when a part is freshly selected. Solid ids in
 // the kernel are u32 sequence numbers starting at 1 — the first solid
@@ -217,7 +218,7 @@ export function DrawingsWorkspace() {
   }, [])
 
   // ── Data fetchers ────────────────────────────────────────────────
-  const refreshList = useCallback(async () => {
+  const refreshList = useCallback(async (preferId?: string) => {
     setError(null)
     try {
       const ids = await listDrawings()
@@ -233,15 +234,22 @@ export function DrawingsWorkspace() {
         ),
       )
       setDrawings(summaries)
-      // If the previously active drawing was deleted, clear selection.
-      if (activeId && !ids.includes(activeId)) {
-        setActiveId(null)
-        setActiveDrawing(null)
-        setSvg('')
-      }
-      // If nothing is selected yet, pick the first.
-      if (!activeId && ids.length > 0) {
-        setActiveId(ids[0])
+      // A caller-preferred drawing (e.g. the viewport "Create Drawing"
+      // flow) wins over every other selection rule when it actually
+      // exists on the server.
+      if (preferId && ids.includes(preferId)) {
+        setActiveId(preferId)
+      } else {
+        // If the previously active drawing was deleted, clear selection.
+        if (activeId && !ids.includes(activeId)) {
+          setActiveId(null)
+          setActiveDrawing(null)
+          setSvg('')
+        }
+        // If nothing is selected yet, pick the first.
+        if (!activeId && ids.length > 0) {
+          setActiveId(ids[0])
+        }
       }
       // Keep the "New Drawing" name input one ahead of the existing
       // Roshera-N counter so the user can spam "+ New" without
@@ -284,7 +292,11 @@ export function DrawingsWorkspace() {
   }, [])
 
   useEffect(() => {
-    void refreshList()
+    // The viewport "Create Drawing" flow stashes the new drawing id and
+    // flips the workspace mode; consume it here so this mount lands on
+    // that sheet instead of the first in the list.
+    const pending = useDocModeStore.getState().consumePendingDrawing()
+    void refreshList(pending ?? undefined)
     void refreshParts()
     // refreshList captures activeId for the deleted-id check; we only
     // want this on mount.

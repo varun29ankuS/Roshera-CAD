@@ -659,9 +659,16 @@ async fn create_geometry(
     );
 
     let shape_type_copy = shape_type.clone();
+    // Feedback-as-default: a primitive is sound by construction, but report the
+    // SOUND (B-Rep) verdict anyway so EVERY mutating op has a uniform contract.
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, solid_id, &tri_mesh)
+    };
     Ok(Json(serde_json::json!({
         "success": true,
         "solid_id": solid_id,
+        "perception": perception,
         "object": {
             "id":         object_id,
             "name":       display_name,
@@ -812,6 +819,109 @@ async fn tx_rollback(
 ///
 /// Response on success matches `create_geometry`, plus a `consumed`
 /// list of the operand UUIDs the frontend should drop from its scene.
+/// FEEDBACK-AS-DEFAULT (memory feedback-is-default): count OPEN (boundary) and
+/// NON-MANIFOLD (3+ triangle) undirected edges directly off an already-built
+/// mesh — so a mutating endpoint can report its result's watertightness without
+/// re-tessellating or forcing the caller into a second query. Mirrors the
+/// kernel's `manifold_report` weld+edge-count, applied to the mesh in hand.
+fn mesh_open_nonmanifold(mesh: &geometry_engine::tessellation::TriangleMesh) -> (usize, usize) {
+    use std::collections::HashMap;
+    const Q: f64 = 1.0e5; // 1e-5 length weld
+    let key = |p: &geometry_engine::math::Point3| -> (i64, i64, i64) {
+        (
+            (p.x * Q).round() as i64,
+            (p.y * Q).round() as i64,
+            (p.z * Q).round() as i64,
+        )
+    };
+    let mut canon: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let vc: Vec<usize> = mesh
+        .vertices
+        .iter()
+        .enumerate()
+        .map(|(i, v)| *canon.entry(key(&v.position)).or_insert(i))
+        .collect();
+    let mut edge_count: HashMap<(usize, usize), u32> = HashMap::new();
+    for t in &mesh.triangles {
+        let cs = [vc[t[0] as usize], vc[t[1] as usize], vc[t[2] as usize]];
+        for k in 0..3 {
+            let (a, b) = (cs[k], cs[(k + 1) % 3]);
+            if a == b {
+                continue;
+            }
+            let e = if a < b { (a, b) } else { (b, a) };
+            *edge_count.entry(e).or_insert(0) += 1;
+        }
+    }
+    let mut open = 0usize;
+    let mut nm = 0usize;
+    for &c in edge_count.values() {
+        if c == 1 {
+            open += 1;
+        } else if c >= 3 {
+            nm += 1;
+        }
+    }
+    (open, nm)
+}
+
+/// FEEDBACK-AS-DEFAULT: the perception block every mutating endpoint embeds in
+/// its response so the caller learns the result's soundness from the operation
+/// itself — watertight (open/nonmanifold off the mesh in hand), valid B-Rep
+/// (`validate_solid_scoped`), and world dims (`solid_world_bbox`). No 2nd query.
+fn perception_json(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    mesh: &geometry_engine::tessellation::TriangleMesh,
+) -> serde_json::Value {
+    let valid = geometry_engine::primitives::validation::validate_solid_scoped(
+        model,
+        solid_id,
+        geometry_engine::math::Tolerance::default(),
+        geometry_engine::primitives::validation::ValidationLevel::Standard,
+    )
+    .is_valid;
+    let dims = model.solid_world_bbox(solid_id).map(|b| {
+        let s = b.size();
+        vec![s.x, s.y, s.z]
+    });
+    // SOUND + WATERTIGHT verdict (feedback-as-default): the authoritative answer to
+    // "is this a real, closed, manufacturable solid?" is the EXACT B-Rep validity
+    // (`validate_solid_scoped`, Standard level — which already enforces shell
+    // closure AND correctly tolerates periodic seams, so cylinders/tori pass).
+    // This is mesh-INDEPENDENT, so `watertight` is reported off the B-Rep, not off
+    // the tessellation. That decoupling is what lets the live broadcast use the
+    // coarse `display()` mesh for speed without ever flashing a false
+    // "not watertight": a sound solid is closed by definition (open=0, nm=0).
+    //
+    // The display mesh is consulted ONLY for the export-quality hint in the verdict
+    // string (does the coarse preview have T-junctions?) — never for the soundness
+    // signal. A valid solid whose tessellation has T-junctions is NOT broken (the
+    // unsound-eye trap, KNOWN_BUGS #65 / EYE-SOUND).
+    let (mesh_open, mesh_nm) = mesh_open_nonmanifold(mesh);
+    let mesh_clean = mesh_open == 0 && mesh_nm == 0;
+    let verdict = if !valid {
+        "BROKEN — B-Rep invalid (a real topological defect)"
+    } else if mesh_clean {
+        "OK — valid closed solid; display mesh watertight"
+    } else {
+        "OK — valid closed solid; display mesh coarsened for live view (artifacts are not defects)"
+    };
+    // `watertight`/`open_edges`/`nonmanifold_edges` report the B-Rep TRUTH: a sound
+    // solid is closed (0/0). When unsound, surface the display-mesh counts as a
+    // best-effort diagnostic of where the boundary opened up.
+    let (open, nm) = if valid { (0, 0) } else { (mesh_open, mesh_nm) };
+    serde_json::json!({
+        "sound":             valid,
+        "valid":             valid,
+        "verdict":           verdict,
+        "watertight":        valid,
+        "open_edges":        open,
+        "nonmanifold_edges": nm,
+        "dims":              dims,
+    })
+}
+
 async fn boolean_operation(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -971,9 +1081,19 @@ async fn boolean_operation(
         [0.0, 0.0, 0.0],
     );
 
+    // Feedback-as-default: the boolean reports its OWN validity — watertight +
+    // valid + dims — so a caller learns whether the result is sound from the
+    // operation itself, no second query. open/nonmanifold are read off the mesh
+    // we already tessellated (no extra work); valid + dims from the kernel.
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "consumed": [uuid_b.to_string()],
         "object": {
             "id":         result_id_str,
@@ -1160,9 +1280,16 @@ async fn shell_solid(
         [0.0, 0.0, 0.0],
     );
 
+    // Feedback-as-default: shell can leave a self-intersecting or open wall, so
+    // it reports its own SOUND (B-Rep) verdict like the boolean.
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "consumed": [],
         "object": {
             "id":         result_id_str,
@@ -1848,9 +1975,15 @@ async fn fillet_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, solid_id, &tri_mesh)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
+        "perception": perception,
         "consumed": [],
         "object": {
             "id":         result_id_str,
@@ -2064,9 +2197,15 @@ async fn chamfer_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, solid_id, &tri_mesh)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
+        "perception": perception,
         "consumed": [],
         "object": {
             "id":         result_id_str,
@@ -2786,9 +2925,15 @@ async fn create_extrude(
         [0.0, 0.0, 0.0],
     );
 
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "object": {
             "id":         result_id_str,
             "name":       name,
@@ -2941,6 +3086,381 @@ async fn create_cylinder_primitive(
             "id":         result_id_str,
             "name":       name,
             "objectType": "cylinder",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
+/// POST /api/geometry/cone — create an ANALYTIC cone OR frustum primitive with
+/// full control over placement and both radii. This is the round nozzle /
+/// taper / countersink primitive. Unlike the generic `/api/geometry` "cone"
+/// (true apex cone at the origin on +Z), this exposes the kernel's full
+/// `create_cone_3d`: arbitrary `center`/`axis`, a non-zero `top_radius` for a
+/// truncated cone (frustum), so a de Laval nozzle's convergent/divergent
+/// sections can be built directly.
+///
+/// Request: `{ "center":[x,y,z], "axis":[x,y,z], "base_radius":rb,
+///             "top_radius":rt, "height":h, "name"?:s }`
+/// (center defaults to origin, axis to +Z; `top_radius` defaults to 0 = apex
+/// cone). `base_radius` is the radius at `center`; `top_radius` is the radius at
+/// `center + axis*height`.
+async fn create_cone_primitive(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::primitives::topology_builder::{GeometryId, TopologyBuilder};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let arr3 = |key: &str, default: Option<[f64; 3]>| -> Result<[f64; 3], ApiError> {
+        match payload.get(key) {
+            Some(v) => {
+                let a = v.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'{key}' must be an array of 3 numbers"),
+                    )
+                })?;
+                Ok([
+                    a[0].as_f64().unwrap_or(0.0),
+                    a[1].as_f64().unwrap_or(0.0),
+                    a[2].as_f64().unwrap_or(0.0),
+                ])
+            }
+            None => default.ok_or_else(|| ApiError::missing_field(key)),
+        }
+    };
+    let c = arr3("center", Some([0.0, 0.0, 0.0]))?;
+    let ax = arr3("axis", Some([0.0, 0.0, 1.0]))?;
+    let base_radius = payload
+        .get("base_radius")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("base_radius"))?;
+    let top_radius = payload
+        .get("top_radius")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let height = payload
+        .get("height")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| ApiError::missing_field("height"))?;
+    if !(base_radius.is_finite() && base_radius >= 0.0)
+        || !(top_radius.is_finite() && top_radius >= 0.0)
+        || (base_radius == 0.0 && top_radius == 0.0)
+        || !(height.is_finite() && height > 0.0)
+    {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "radii must be finite and non-negative (not both zero); height must be positive"
+                .to_string(),
+        ));
+    }
+
+    let display_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let result_solid_id = {
+        let mut model = model_handle.write().await;
+        let gid = TopologyBuilder::new(&mut model)
+            .create_cone_3d(
+                Point3::new(c[0], c[1], c[2]),
+                Vector3::new(ax[0], ax[1], ax[2]),
+                base_radius,
+                top_radius,
+                height,
+            )
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("create_cone_3d failed: {e:?}"),
+                )
+            })?;
+        match gid {
+            GeometryId::Solid(id) => id,
+            other => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("create_cone_3d returned {other:?}, expected a solid"),
+                ))
+            }
+        }
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let t = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        (mesh, t.elapsed().as_millis() as u64)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = display_name.unwrap_or_else(|| format!("Cone {result_solid_id}"));
+    let parameters = serde_json::json!({
+        "center": c, "axis": ax,
+        "base_radius": base_radius, "top_radius": top_radius, "height": height,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "cone",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "perception": perception,
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "cone",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
+/// POST /api/geometry/revolve — build a SOLID OF REVOLUTION from a closed
+/// meridian profile. This is the correct primitive for any axisymmetric part
+/// (nozzles, pulleys, bottles, rocket engines): one profile revolved 360°
+/// yields the whole body — including hollows — as a single clean surface of
+/// revolution, with NO booleans (so no coincident-rim weld cost) and a
+/// structured ring×station mesh (no chaotic CDT on the inner walls).
+///
+/// Request: `{ "profile": [[r,z], …], "axis_origin"?:[x,y,z],
+///             "axis_direction"?:[x,y,z], "angle_deg"?:f64, "segments"?:u32,
+///             "name"?:s }`
+/// The profile is a closed polygon in the meridian half-plane: each `[r,z]` is
+/// (radius-from-axis, height-along-axis). Points are placed at `(r,0,z)` and
+/// revolved about the axis (default +Z through the origin, full 360°). The loop
+/// auto-closes (last→first); give ≥3 points, all with r ≥ 0, non-self-
+/// intersecting. A hollow part is one profile whose outline traces the wall
+/// cross-section (outer contour out, inner contour back).
+async fn create_revolve_primitive(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
+    use geometry_engine::primitives::curve::{Line, ParameterRange};
+    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let arr3 = |key: &str, default: [f64; 3]| -> Result<[f64; 3], ApiError> {
+        match payload.get(key) {
+            Some(v) => {
+                let a = v.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'{key}' must be an array of 3 numbers"),
+                    )
+                })?;
+                Ok([
+                    a[0].as_f64().unwrap_or(0.0),
+                    a[1].as_f64().unwrap_or(0.0),
+                    a[2].as_f64().unwrap_or(0.0),
+                ])
+            }
+            None => Ok(default),
+        }
+    };
+
+    let profile_raw = payload
+        .get("profile")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::missing_field("profile"))?;
+    if profile_raw.len() < 3 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "profile needs at least 3 [r,z] points".to_string(),
+        ));
+    }
+    let mut profile: Vec<(f64, f64)> = Vec::with_capacity(profile_raw.len());
+    for p in profile_raw {
+        let pair = p.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                "each profile point must be [r, z]".to_string(),
+            )
+        })?;
+        let r = pair[0].as_f64().unwrap_or(f64::NAN);
+        let z = pair[1].as_f64().unwrap_or(f64::NAN);
+        if !r.is_finite() || !z.is_finite() || r < -1e-9 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("profile point [{r}, {z}] invalid (r must be finite and >= 0)"),
+            ));
+        }
+        profile.push((r, z));
+    }
+
+    let axis_origin = arr3("axis_origin", [0.0, 0.0, 0.0])?;
+    let axis_dir = arr3("axis_direction", [0.0, 0.0, 1.0])?;
+    let angle_deg = payload
+        .get("angle_deg")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(360.0);
+    let segments = payload
+        .get("segments")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(48)
+        .clamp(3, 512) as u32;
+    let display_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let result_solid_id = {
+        let mut model = model_handle.write().await;
+        // Build the profile loop: a vertex per point in the (r, 0, z) meridian
+        // half-plane, joined by line edges, auto-closed last->first.
+        let n = profile.len();
+        let verts: Vec<_> = profile
+            .iter()
+            .map(|(r, z)| model.vertices.add(*r, 0.0, *z))
+            .collect();
+        let mut edges = Vec::with_capacity(n);
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (ri, zi) = profile[i];
+            let (rj, zj) = profile[j];
+            let line = Line::new(Point3::new(ri, 0.0, zi), Point3::new(rj, 0.0, zj));
+            let cid = model.curves.add(Box::new(line));
+            edges.push(model.edges.add(Edge::new(
+                0,
+                verts[i],
+                verts[j],
+                cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            )));
+        }
+        let opts = RevolveOptions {
+            axis_origin: Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
+            axis_direction: Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]),
+            angle: angle_deg.to_radians(),
+            segments,
+            ..Default::default()
+        };
+        revolve_profile(&mut model, edges, opts).map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("revolve_profile failed: {e:?}"),
+            )
+        })?
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let t = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        (mesh, t.elapsed().as_millis() as u64)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = display_name.unwrap_or_else(|| format!("Revolve {result_solid_id}"));
+    let parameters = serde_json::json!({
+        "profile": profile, "axis_origin": axis_origin, "axis_direction": axis_dir,
+        "angle_deg": angle_deg, "segments": segments,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "revolve",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    // Feedback-as-default: a self-intersecting / axis-touching profile can yield
+    // an unsound solid, so revolve reports its own SOUND (B-Rep) verdict.
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "perception": perception,
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "revolve",
             "mesh": {
                 "vertices": vertices,
                 "indices":  indices,
@@ -4089,6 +4609,14 @@ async fn clear_all_geometry(
         delete_solid_core(&state, &model_handle, uuid, solid_id).await;
         deleted += 1;
     }
+
+    // Sweep orphaned geometry (vertices/edges/curves/surfaces left by an
+    // upstream op that materialised entities then failed — e.g. a sketch
+    // lifted into edges followed by a revolve that failed validation). Deleting
+    // solids does not remove these, and they poison later op validation with
+    // phantom connectivity errors. clear_geometry makes "clear" a true reset,
+    // matching clear_timeline, without needing a full timeline rewind.
+    model_handle.write().await.clear_geometry();
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -5472,6 +6000,32 @@ fn calculate_confidence_from_command(command: &str) -> f32 {
 mod tests {
     use super::*;
 
+    /// Feedback-as-default: the perception helper a mutating endpoint uses to
+    /// self-report watertightness must read a watertight box as (0 open, 0 nm).
+    #[test]
+    fn boolean_perception_reads_watertight_box() {
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+        use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+        let mut m = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut m)
+            .create_box_3d(20.0, 20.0, 20.0)
+            .expect("box");
+        let sid = match gid {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        let solid = m.solids.get(sid).expect("solid in store");
+        let mesh = tessellate_solid(solid, &m, &TessellationParams::default());
+        let (open, nm) = mesh_open_nonmanifold(&mesh);
+        assert_eq!(
+            (open, nm),
+            (0, 0),
+            "a watertight box must self-report (0 open, 0 nm); got ({open}, {nm})"
+        );
+    }
+
     #[tokio::test]
     async fn test_enhanced_server() {
         // Test implementation
@@ -5950,6 +6504,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/geometry/cone",
+            post(create_cone_primitive).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/revolve",
+            post(create_revolve_primitive).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
             "/api/geometry/face/extrude",
             post(extrude_face_endpoint).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_modify_geometry,
@@ -6190,6 +6756,32 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/drawings/{id}/svg", get(drawing_mgr::export_svg))
         .route("/api/drawings/{id}/pdf", get(drawing_mgr::export_pdf))
         .route("/api/drawings/{id}/dxf", get(drawing_mgr::export_dxf))
+        // One-call "right-click → drawing": third-angle Front/Top/Right with
+        // hidden-line removal + centerlines + auto dimensions, as SVG.
+        .route(
+            "/api/parts/{id}/drawing.svg",
+            get(drawing_mgr::part_drawing_svg),
+        )
+        .route(
+            "/api/parts/uuid/{uuid}/drawing.svg",
+            get(drawing_mgr::part_drawing_svg_by_uuid),
+        )
+        // …and the registry variant: build the same standard sheet but
+        // register it so the Drawing workspace can open / edit / export it.
+        .route(
+            "/api/parts/{id}/drawing",
+            post(drawing_mgr::create_part_drawing),
+        )
+        .route(
+            "/api/parts/uuid/{uuid}/drawing",
+            post(drawing_mgr::create_part_drawing_by_uuid),
+        )
+        // Drawing quality oracle (2D perception layer): re-check any
+        // registered drawing's layout/annotation quality.
+        .route(
+            "/api/drawings/{id}/quality",
+            get(drawing_mgr::drawing_quality),
+        )
         // Part documents — one per frontend tab. CRUD on the registry;
         // geometry/sketch endpoints continue to route through the
         // legacy `state.model` until P.2 wires per-part extraction.
@@ -6307,6 +6899,38 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/{id}/render",
             get(handlers::agent::render_part),
+        )
+        .route(
+            "/api/agent/parts/{id}/dimensioned",
+            get(handlers::agent::render_dimensioned),
+        )
+        .route(
+            "/api/agent/parts/{id}/dimensions",
+            get(handlers::agent::part_dimensions),
+        )
+        .route(
+            "/api/agent/parts/{id}/features",
+            get(handlers::agent::part_features),
+        )
+        .route(
+            "/api/agent/parts/{id}/perception",
+            get(handlers::agent::part_perception),
+        )
+        .route(
+            "/api/agent/parts/{id}/coverage",
+            get(handlers::agent::part_coverage),
+        )
+        .route(
+            "/api/agent/parts/{id}/section",
+            get(handlers::agent::part_section),
+        )
+        .route(
+            "/api/agent/parts/{id}/best-view",
+            get(handlers::agent::part_best_view),
+        )
+        .route(
+            "/api/agent/parts/{id}/orbit",
+            get(handlers::agent::part_orbit),
         )
         .route(
             "/api/agent/pointer",

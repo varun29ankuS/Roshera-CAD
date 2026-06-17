@@ -44,7 +44,7 @@ pub enum ProjectionError {
 /// constant is conservative: drawing fidelity is bounded by SVG path
 /// resolution, not by the kernel. 24 samples is enough to make a
 /// 100mm circle look round on an A3 sheet without flooding the output.
-pub const DEFAULT_CURVE_SAMPLES: usize = 24;
+pub const DEFAULT_CURVE_SAMPLES: usize = 96;
 
 /// Construct the world→view rotation matrix for a given projection.
 ///
@@ -268,6 +268,11 @@ pub fn project_solid_view(
         scale,
         polylines,
         extent,
+        dimensions: Vec::new(),
+        centerlines: Vec::new(),
+        hidden_polylines: Vec::new(),
+        circles: Vec::new(),
+        hidden_circles: Vec::new(),
     })
 }
 

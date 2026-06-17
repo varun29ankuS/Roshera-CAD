@@ -422,6 +422,610 @@ pub async fn render_part(
     }))
 }
 
+// ───────────────────── section / clip (EYE-2) ───────────────────────
+
+/// Query for `GET /api/agent/parts/{id}/section` — a cutting plane (point +
+/// normal). Defaults to the world XY plane through the origin.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SectionQuery {
+    pub px: Option<f64>,
+    pub py: Option<f64>,
+    pub pz: Option<f64>,
+    pub nx: Option<f64>,
+    pub ny: Option<f64>,
+    pub nz: Option<f64>,
+}
+
+/// The section's in-plane camera transform (true-shape, looking along normal).
+#[derive(Debug, Clone, Serialize)]
+pub struct SectionCameraWire {
+    pub right: Vec3Wire,
+    pub up: Vec3Wire,
+    pub scale: f64,
+    pub ox: f64,
+    pub oy: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SectionResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub units: String,
+    pub plane_origin: Vec3Wire,
+    pub plane_normal: Vec3Wire,
+    /// Measured cross-section area (mm²).
+    pub section_area: f64,
+    pub extent_u: f64,
+    pub extent_v: f64,
+    pub camera: SectionCameraWire,
+}
+
+/// `GET /api/agent/parts/{id}/section?px&py&pz&nx&ny&nz` — EYE-2.
+///
+/// Cuts the solid by the plane and returns a true-shape, dimensioned
+/// cross-section render plus the measured area/extents and the in-plane camera
+/// (so section points are recoverable from frame + query). Read lock only;
+/// `404` if the plane misses the solid or the id is unknown.
+pub async fn part_section(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<SectionQuery>,
+) -> Result<Json<SectionResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::math::{Point3, Tolerance, Vector3};
+    use geometry_engine::render::dimensioned::render_section;
+
+    let origin = Point3::new(
+        q.px.unwrap_or(0.0),
+        q.py.unwrap_or(0.0),
+        q.pz.unwrap_or(0.0),
+    );
+    let normal = Vector3::new(
+        q.nx.unwrap_or(0.0),
+        q.ny.unwrap_or(0.0),
+        q.nz.unwrap_or(1.0),
+    );
+
+    let model = model_handle.read().await;
+    let f = render_section(&model, id as SolidId, origin, normal, Tolerance::default())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let png = f.to_png().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(SectionResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: f.width,
+        height: f.height,
+        units: f.units.to_string(),
+        plane_origin: f.plane_origin.into(),
+        plane_normal: f.plane_normal.into(),
+        section_area: f.section_area,
+        extent_u: f.extent_u,
+        extent_v: f.extent_v,
+        camera: SectionCameraWire {
+            right: f.right.into(),
+            up: f.up.into(),
+            scale: f.scale,
+            ox: f.ox,
+            oy: f.oy,
+        },
+    }))
+}
+
+// ───────────────────── viewpoint selection (EYE-6) ──────────────────
+
+/// `GET /api/agent/parts/{id}/best-view` — EYE-6 active perception.
+///
+/// Returns the most-informative single view (max viewpoint entropy) plus a
+/// greedy next-best-view sequence that covers every face — the answer to
+/// EYE-5's "request another angle". `?candidates=N` (default 64) sets the
+/// Fibonacci view-sphere density. Read lock only; `404` on unknown id.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BestViewQuery {
+    pub candidates: Option<usize>,
+}
+
+pub async fn part_best_view(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<BestViewQuery>,
+) -> Result<Json<geometry_engine::render::viewpoint::ViewpointReport>, StatusCode> {
+    use geometry_engine::render::viewpoint::analyze_viewpoints;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let n = q.candidates.unwrap_or(64).clamp(8, 256);
+    let model = model_handle.read().await;
+    analyze_viewpoints(&model, id as SolidId, n, &TessellationParams::default())
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Query for `GET /api/agent/parts/{id}/orbit` — render from an arbitrary
+/// azimuth/elevation (world Z up). The companion to best-view: once the agent
+/// knows where to look, this shows it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OrbitQuery {
+    pub az: Option<f64>,
+    pub el: Option<f64>,
+    pub mode: Option<String>,
+    pub size: Option<usize>,
+}
+
+/// One arbitrary-direction render + its camera basis (so coordinates stay
+/// recoverable from frame + query).
+#[derive(Debug, Clone, Serialize)]
+pub struct OrbitResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub az_deg: f64,
+    pub el_deg: f64,
+    pub dir: [f64; 3],
+    pub mode: String,
+    pub open_edges: usize,
+    pub nonmanifold_edges: usize,
+}
+
+pub async fn part_orbit(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<OrbitQuery>,
+) -> Result<Json<OrbitResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::math::Vector3;
+    use geometry_engine::render::{render_solid_dir, CanonicalView, RenderMode, RenderOptions};
+
+    let az = q.az.unwrap_or(45.0).to_radians();
+    let el = q.el.unwrap_or(30.0).to_radians();
+    // Camera position on the unit sphere (world Z up) → view dir = −position.
+    let pos = [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()];
+    let dir = Vector3::new(-pos[0], -pos[1], -pos[2]);
+    let up_hint = if pos[2].abs() > 0.999 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let mode_name = q.mode.as_deref().unwrap_or("shaded");
+    let mode = match mode_name {
+        "shaded" => RenderMode::Shaded,
+        "ids" => RenderMode::FaceIds,
+        "depth" => RenderMode::Depth,
+        "normals" => RenderMode::Normals,
+        "diagnostic" => RenderMode::Diagnostic,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let size = q.size.unwrap_or(512).clamp(64, 2048);
+
+    let model = model_handle.read().await;
+    let frame = render_solid_dir(
+        &model,
+        id as SolidId,
+        dir,
+        up_hint,
+        &RenderOptions {
+            width: size,
+            height: size,
+            view: CanonicalView::Isometric, // ignored by render_solid_dir
+            mode,
+            ..Default::default()
+        },
+    )
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(OrbitResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        az_deg: q.az.unwrap_or(45.0),
+        el_deg: q.el.unwrap_or(30.0),
+        dir: [dir.x, dir.y, dir.z],
+        mode: mode_name.to_string(),
+        open_edges: frame.open_edges,
+        nonmanifold_edges: frame.nonmanifold_edges,
+    }))
+}
+
+// ───────────────────── coverage / ambiguity (EYE-5) ─────────────────
+
+/// `GET /api/agent/parts/{id}/coverage` — EYE-5 honesty protocol.
+///
+/// Reports which faces the 4 standard views actually show vs leave unseen, so
+/// an agent knows when it must request another angle instead of assuming full
+/// coverage. Read lock only; `404` on unknown id / empty tessellation.
+pub async fn part_coverage(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<geometry_engine::render::dimensioned::CoverageReport>, StatusCode> {
+    use geometry_engine::render::dimensioned::coverage_report;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let model = model_handle.read().await;
+    coverage_report(&model, id as SolidId, &TessellationParams::default())
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// ───────────────────── perception (feedback-as-default) ─────────────
+
+/// A part's self-reported soundness — watertight + valid + dims — queryable for
+/// ANY existing solid, not just at mutation time. Feedback-as-default: the agent
+/// (and the panel) can read current truth on demand without re-running the op.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartPerception {
+    pub solid_id: u32,
+    /// AUTHORITATIVE verdict: the exact B-Rep validity (mesh-independent). This —
+    /// not `watertight` — is the sound answer to "is this a real solid?".
+    pub sound: bool,
+    /// Human/agent-readable one-liner derived from `sound` + the mesh check.
+    pub verdict: String,
+    /// Export-mesh watertightness (display/STL quality) — a valid solid can show
+    /// `false` here from tessellation T-junctions without being broken.
+    pub watertight: bool,
+    pub open_edges: usize,
+    pub nonmanifold_edges: usize,
+    pub valid: bool,
+    /// [L, W, H] world extents, or null if degenerate.
+    pub dims: Option<[f64; 3]>,
+}
+
+/// `GET /api/agent/parts/{id}/perception` — the part's validity in one cheap
+/// query: watertight (open=0 ∧ nonmanifold=0), valid B-Rep, and L×W×H. Read
+/// lock only; `404` on unknown id / empty tessellation.
+pub async fn part_perception(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<PartPerception>, StatusCode> {
+    use geometry_engine::harness::watertight::manifold_report;
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+
+    let model = model_handle.read().await;
+    let sid = id as SolidId;
+    if model.solids.get(sid).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
+    let valid = validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard)
+        .is_valid;
+    let dims = model.solid_world_bbox(sid).map(|b| {
+        let s = b.size();
+        [s.x, s.y, s.z]
+    });
+    let watertight = report.boundary_edges == 0 && report.nonmanifold_edges == 0;
+    let verdict = if !valid {
+        "BROKEN — B-Rep invalid (a real topological defect)".to_string()
+    } else if watertight {
+        "OK — valid closed solid; export mesh watertight".to_string()
+    } else {
+        "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)".to_string()
+    };
+    Ok(Json(PartPerception {
+        solid_id: id,
+        sound: valid,
+        verdict,
+        watertight,
+        open_edges: report.boundary_edges,
+        nonmanifold_edges: report.nonmanifold_edges,
+        valid,
+        dims,
+    }))
+}
+
+// ───────────────────── features + measure (EYE-4) ───────────────────
+
+/// Wire shape for `GET /api/agent/parts/{id}/features`: every face's analytic
+/// feature dimensions plus a distinct-diameter summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeaturesResponse {
+    pub features: Vec<geometry_engine::readable::FeatureDim>,
+    /// Distinct cylindrical (bore/boss) diameters present, each with a count.
+    pub diameters: Vec<DiameterCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiameterCount {
+    pub diameter: f64,
+    pub count: usize,
+}
+
+/// `GET /api/agent/parts/{id}/features` — EYE-4 feature extraction.
+///
+/// Reads analytic feature sizes straight off each face (cylinder diameters +
+/// axes, plane normals) so an agent can ask "what holes/bosses and how big"
+/// without measuring pixels. Read lock only; `404` on unknown id.
+pub async fn part_features(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<FeaturesResponse>, StatusCode> {
+    use geometry_engine::readable::{cylindrical_diameters, extract_features};
+
+    let model = model_handle.read().await;
+    if model.solids.get(id as SolidId).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let features = extract_features(&model, id as SolidId);
+    let diameters = cylindrical_diameters(&model, id as SolidId)
+        .into_iter()
+        .map(|(diameter, count)| DiameterCount { diameter, count })
+        .collect();
+    Ok(Json(FeaturesResponse {
+        features,
+        diameters,
+    }))
+}
+
+// ───────────────────── dimensioned multi-view (EYE-1) ───────────────
+
+/// A world-space 3-vector on the wire.
+#[derive(Debug, Clone, Serialize)]
+pub struct Vec3Wire {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+// Point3 is a type alias for Vector3 in the kernel, so one impl covers both.
+impl From<geometry_engine::math::Vector3> for Vec3Wire {
+    fn from(v: geometry_engine::math::Vector3) -> Self {
+        Self {
+            x: v.x,
+            y: v.y,
+            z: v.z,
+        }
+    }
+}
+
+/// One quadrant's orthographic camera matrix — the structured payload that
+/// makes coordinates RECOVERABLE: world `p` → pixel
+/// `(ox + (p·right)·scale, oy − (p·up)·scale)` within `cell`. The agent reads
+/// geometry from this transform + the frame, never by guessing from pixels.
+#[derive(Debug, Clone, Serialize)]
+pub struct ViewProjectionWire {
+    pub view: String,
+    pub label: String,
+    pub right: Vec3Wire,
+    pub up: Vec3Wire,
+    pub dir: Vec3Wire,
+    pub scale: f64,
+    pub ox: f64,
+    pub oy: f64,
+    /// (x, y, w, h) of this view's cell within the composite image.
+    pub cell: [usize; 4],
+}
+
+/// L×W×H extents (mm), X/Y/Z.
+#[derive(Debug, Clone, Serialize)]
+pub struct DimsWire {
+    pub l: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Wire shape for the dimensioned multi-view render.
+#[derive(Debug, Clone, Serialize)]
+pub struct DimensionedResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub units: String,
+    pub bbox_min: Vec3Wire,
+    pub bbox_max: Vec3Wire,
+    pub dims: DimsWire,
+    pub scale_bar_world: f64,
+    pub views: Vec<ViewProjectionWire>,
+    /// EYE-3 analytics, measured off the same mesh the views are drawn from:
+    /// volume, surface area, and the volume centroid. Match the kernel's
+    /// mass-properties query within faceting tolerance (visual⇄numeric check).
+    pub volume: f64,
+    pub surface_area: f64,
+    pub centroid: Vec3Wire,
+}
+
+/// `GET /api/agent/parts/{id}/dimensioned` — EYE-1, the measuring eye.
+///
+/// A 2×2 (Front/Right/Top/Iso) dimensioned composite plus the per-view camera
+/// matrices, bbox, and L×W×H — measured off the tessellated mesh, never
+/// assumed. The image is the aligned aid; the JSON is authoritative. Read lock
+/// only (pure query). `404` unknown id / empty tessellation.
+pub async fn render_dimensioned(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<DimensionedResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::render::dimensioned::render_dimensioned_multiview;
+    use geometry_engine::render::CanonicalView;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let model = model_handle.read().await;
+    let frame = render_dimensioned_multiview(&model, id as SolidId, &TessellationParams::default())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let view_name = |v: CanonicalView| -> String {
+        match v {
+            CanonicalView::Isometric => "iso",
+            CanonicalView::Front => "front",
+            CanonicalView::Top => "top",
+            CanonicalView::Right => "right",
+        }
+        .to_string()
+    };
+
+    Ok(Json(DimensionedResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        units: frame.units.to_string(),
+        bbox_min: frame.bbox_min.into(),
+        bbox_max: frame.bbox_max.into(),
+        dims: DimsWire {
+            l: frame.dims.0,
+            w: frame.dims.1,
+            h: frame.dims.2,
+        },
+        scale_bar_world: frame.scale_bar_world,
+        views: frame
+            .views
+            .iter()
+            .map(|vp| ViewProjectionWire {
+                view: view_name(vp.view),
+                label: vp.label.to_string(),
+                right: vp.right.into(),
+                up: vp.up.into(),
+                dir: vp.dir.into(),
+                scale: vp.scale,
+                ox: vp.ox,
+                oy: vp.oy,
+                cell: [vp.cell.0, vp.cell.1, vp.cell.2, vp.cell.3],
+            })
+            .collect(),
+        volume: frame.volume,
+        surface_area: frame.surface_area,
+        centroid: frame.centroid.into(),
+    }))
+}
+
+/// One row of the analytic dimension table — recoverable (3D anchor + the face
+/// ids it spans), read off analytic surfaces / exact curves, never the mesh.
+#[derive(Debug, Clone, Serialize)]
+pub struct DimensionWire {
+    pub id: String,
+    pub kind: String,
+    pub value: f64,
+    pub unit: String,
+    pub label: String,
+    pub entities: Vec<u32>,
+    pub anchor: [f64; 3],
+    pub direction: [f64; 3],
+}
+
+/// Wire shape for the single-call dimensioning answer: the callout-annotated
+/// multi-view image AND the complete structured dimension table + cameras.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartDimensionsResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub units: String,
+    pub dims: DimsWire,
+    pub dimensions: Vec<DimensionWire>,
+    pub views: Vec<ViewProjectionWire>,
+}
+
+/// `GET /api/agent/parts/{id}/dimensions` — the dimensioning eye in one call.
+///
+/// Returns the EYE-1 multi-view with every analytic dimension drawn as a
+/// leader+label callout, AND the complete structured table: each dimension's
+/// id (the handle a future mould edits), kind, value, the face entities it
+/// spans, and a 3D anchor. The image is the placed table; the JSON is
+/// authoritative. Values are read off analytic surfaces / exact curves, never
+/// the tessellation. Read lock only. `404` unknown id / empty tessellation.
+pub async fn part_dimensions(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<PartDimensionsResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::readable::extract_dimensions;
+    use geometry_engine::render::dimensioned::{
+        draw_dimension_callouts, render_dimensioned_multiview, Callout,
+    };
+    use geometry_engine::render::CanonicalView;
+    use geometry_engine::tessellation::TessellationParams;
+
+    let model = model_handle.read().await;
+    let mut frame =
+        render_dimensioned_multiview(&model, id as SolidId, &TessellationParams::default())
+            .ok_or(StatusCode::NOT_FOUND)?;
+
+    let dims = extract_dimensions(&model, id as SolidId);
+    // The 5×7 overlay font has no Ø/∠/° glyphs — render ASCII, keep the pretty
+    // label in the structured table.
+    let callouts: Vec<Callout> = dims
+        .iter()
+        .map(|d| {
+            let ascii: String = d
+                .label
+                .chars()
+                .map(|c| match c {
+                    'Ø' => 'D',
+                    '∠' => 'A',
+                    '°' => ' ',
+                    o => o,
+                })
+                .collect();
+            (d.anchor, ascii)
+        })
+        .collect();
+    draw_dimension_callouts(&mut frame, &callouts);
+
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let view_name = |v: CanonicalView| -> String {
+        match v {
+            CanonicalView::Isometric => "iso",
+            CanonicalView::Front => "front",
+            CanonicalView::Top => "top",
+            CanonicalView::Right => "right",
+        }
+        .to_string()
+    };
+
+    Ok(Json(PartDimensionsResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        units: frame.units.to_string(),
+        dims: DimsWire {
+            l: frame.dims.0,
+            w: frame.dims.1,
+            h: frame.dims.2,
+        },
+        dimensions: dims
+            .into_iter()
+            .map(|d| DimensionWire {
+                id: d.id,
+                kind: d.kind,
+                value: d.value,
+                unit: d.unit,
+                label: d.label,
+                entities: d.entities,
+                anchor: d.anchor,
+                direction: d.direction,
+            })
+            .collect(),
+        views: frame
+            .views
+            .iter()
+            .map(|vp| ViewProjectionWire {
+                view: view_name(vp.view),
+                label: vp.label.to_string(),
+                right: vp.right.into(),
+                up: vp.up.into(),
+                dir: vp.dir.into(),
+                scale: vp.scale,
+                ox: vp.ox,
+                oy: vp.oy,
+                cell: [vp.cell.0, vp.cell.1, vp.cell.2, vp.cell.3],
+            })
+            .collect(),
+    }))
+}
+
 // ───────────────────── pointer (the user's attention) ───────────────
 
 /// Wire shape for `GET /api/agent/pointer`: the user's latest viewport

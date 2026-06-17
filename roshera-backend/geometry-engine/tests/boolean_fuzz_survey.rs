@@ -896,6 +896,93 @@ fn boolean_box_cone_fuzz_survey() {
     );
 }
 
+/// GATE (task #1): the cone-radial conic-cut class — long the deepest open
+/// boolean-core defect, now FIXED (2026-06-15). A z-axis cone shifted off-axis
+/// so its slanted LATERAL surface pierces a box side wall; the cone × plane
+/// section is two generator lines (wall ∋ axis) or a hyperbola (offset). The
+/// cone lateral, split by the generators, must keep its INSIDE angular strip.
+///
+/// ROOT CAUSE + FIX: `split_face_by_curves` had a sector splitter for the
+/// CYLINDER lateral (`split_cylinder_lateral_by_sectors`) but none for the
+/// CONE — so cone generator cuts fell through to the generic DCEL, which can't
+/// partition the periodic cone u-domain and dropped the inside angular strip
+/// (x<1, cone angles ≈90°–270°). ∩ then kept only the 3 planar faces. Added
+/// `split_cone_face_by_sectors` (the cone analogue: axial = distance-from-apex,
+/// rim radius = v·tan(half_angle)); the inside strip is now a proper fragment.
+/// Cleared 18 of the 21 cone HARD fuzz cells. SSI was already correct (the
+/// `cone_plane_ssi_points_lie_on_both_surfaces_1` harness); the defect was
+/// purely the curved-face arrangement.
+///
+/// REMAINING (still a frontier, not gated here): `radial-poke-past`
+/// (bc=[1.4,…], cone base ENTIRELY outside the box) — a distinct sub-case
+/// (∩ vol +199%, open=2; ∖ nonmanifold=2). Tracked under #1.
+///
+/// This GATE asserts the correct outcome (watertight + valid + volume within
+/// 3%) for the now-fixed cells; it PASSES. Live signature:
+///   `cargo test -p geometry-engine --test boolean_fuzz_survey \
+///        cone_radial_conic_cut_gate_1 -- --nocapture`
+#[test]
+fn cone_radial_conic_cut_gate_1() {
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+
+    // (base_center, base_r, top_r, height, label) — the two fixed radial cells.
+    let cells: [([f64; 3], f64, f64, f64, &str); 2] = [
+        ([1.0, 0.0, -0.5], 0.5, 0.3, 1.0, "radial-face+x"),
+        ([1.0, 1.0, -0.5], 0.5, 0.3, 1.0, "radial-edge"),
+    ];
+    let mut failures = Vec::new();
+    for (bc, rb, rt, h, label) in cells {
+        let truth = cone_grid_truth(bc, rb, rt, h);
+        let ops: [(BooleanOp, &str, f64); 3] = [
+            (BooleanOp::Intersection, "∩", truth.intersection),
+            (BooleanOp::Union, "∪", truth.union),
+            (BooleanOp::Difference, "∖", truth.difference),
+        ];
+        for (op, sym, t) in ops {
+            if t < 1e-3 {
+                continue;
+            }
+            let mut model = BRepModel::new();
+            let bx = the_box(&mut model);
+            let cn = cone(&mut model, bc, rb, rt, h);
+            match boolean_operation(&mut model, bx, cn, op, BooleanOptions::default()) {
+                Ok(res) => {
+                    let vol = model.calculate_solid_volume(res).unwrap_or(f64::NAN);
+                    let rep = brep_integrity(&model, res, 1e-6);
+                    let v = validate_solid_scoped(
+                        &model,
+                        res,
+                        Tolerance::default(),
+                        ValidationLevel::Standard,
+                    );
+                    let (open, nm) = (rep.edges_used_once.len(), rep.edges_used_3plus.len());
+                    let rel = (vol - t).abs() / t.max(1e-9);
+                    eprintln!(
+                        "  {label} {sym}: vol={vol:.4} truth={t:.4} ({:+.1}%)  open={open} nm={nm}  valid={}",
+                        100.0 * (vol - t) / t.max(1e-9),
+                        v.is_valid,
+                    );
+                    if open != 0 || nm != 0 {
+                        failures.push(format!("{label} {sym}: open={open} nm={nm}"));
+                    }
+                    if !v.is_valid {
+                        failures.push(format!("{label} {sym}: invalid B-Rep {:?}", v.errors));
+                    }
+                    if rel > 0.03 {
+                        failures.push(format!("{label} {sym}: vol {vol:.4} vs truth {t:.4}"));
+                    }
+                }
+                Err(e) => failures.push(format!("{label} {sym}: ERROR {e:?}")),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "cone-radial conic-cut (#1) regressed: {failures:?}"
+    );
+}
+
 // ===========================================================================
 // box ∘ ROTATED-BOX survey — second solid is a unit-ish box rotated by an
 // arbitrary axis/angle. All-planar, but the rotated faces cut the axis-aligned

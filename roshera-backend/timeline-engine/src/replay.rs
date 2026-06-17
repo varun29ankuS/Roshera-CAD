@@ -173,7 +173,14 @@ pub fn apply_event(
     event: &TimelineEvent,
     id_remap: &mut HashMap<u64, u64>,
 ) -> Result<(), ReplayError> {
-    match &event.operation {
+    // Persistent-id lineage (#11 slice 40-G): drive the kernel's root-pid seed
+    // from this event's STABLE sequence number, so a replay re-derives identical
+    // persistent-ids for the same timeline — even after a parameter edit (mould).
+    // The sequence number is stable across replays (events replay in order), so
+    // two replays of the same timeline assign the same PIDs, and a moulded event
+    // keeps its key (only its parameters change) → references survive.
+    model.set_event_key(Some(format!("evt:{}", event.sequence_number)));
+    let result = match &event.operation {
         Operation::Generic {
             command_type,
             parameters,
@@ -182,7 +189,9 @@ pub fn apply_event(
             "non-Generic operation variant: {:?}",
             std::mem::discriminant(other)
         ))),
-    }
+    };
+    model.set_event_key(None);
+    result
 }
 
 /// Dispatch on the kernel-side `kind` string emitted by the recorder
@@ -1080,5 +1089,86 @@ mod tests {
         assert_eq!(parse_fillet_constant_radius(&p), Some(2.5));
         let p2 = serde_json::json!({"fillet_type": "Variable(1.0, 2.0)"});
         assert_eq!(parse_fillet_constant_radius(&p2), None);
+    }
+
+    // ---- #11 slice 40-G: replay-driven persistent-id lineage ----
+
+    fn box_event(width: f64, seq: u64) -> TimelineEvent {
+        let mut e = mk_event(
+            "create_box_3d",
+            serde_json::json!({
+                "params": { "Create3D": {
+                    "primitive_type": "box",
+                    "parameters": { "width": width, "height": 10.0, "depth": 10.0 },
+                    "timestamp": 0
+                }},
+                "inputs": [],
+                "outputs": [0]
+            }),
+        );
+        e.sequence_number = seq;
+        e
+    }
+
+    fn only_solid(m: &BRepModel) -> SolidId {
+        m.solids.iter().next().map(|(id, _)| id).expect("one solid")
+    }
+
+    fn max_abs_x(m: &BRepModel) -> f64 {
+        let mut mx = 0.0_f64;
+        for vid in 0..m.vertices.len() as u32 {
+            if let Some(p) = m.vertices.get_position(vid) {
+                mx = mx.max(p[0].abs());
+            }
+        }
+        mx
+    }
+
+    #[test]
+    fn replay_assigns_stable_pids_and_mould_preserves_them() {
+        // Replay is PID-deterministic: the SAME timeline → the SAME persistent
+        // ids, because the kernel seeds root PIDs from each event's stable
+        // sequence number (set by apply_event).
+        let mut m1 = BRepModel::new();
+        rebuild_model_from_events(&mut m1, &[box_event(10.0, 5)]);
+        let s1 = only_solid(&m1);
+        let solid_pid = m1.solid_pid(s1).expect("solid has a persistent id");
+        let face0 = {
+            let solid = m1.solids.get(s1).unwrap();
+            m1.shells.get(solid.outer_shell).unwrap().faces[0]
+        };
+        let face_pid = m1.face_pid(face0).expect("face has a persistent id");
+
+        let mut m2 = BRepModel::new();
+        rebuild_model_from_events(&mut m2, &[box_event(10.0, 5)]);
+        let s2 = only_solid(&m2);
+        assert_eq!(
+            m2.solid_pid(s2),
+            Some(solid_pid),
+            "replaying the same timeline re-derives the same solid PID"
+        );
+
+        // MOULD: same event (sequence 5), width 10 -> 25. Re-evaluate.
+        let mut m3 = BRepModel::new();
+        rebuild_model_from_events(&mut m3, &[box_event(25.0, 5)]);
+        let s3 = only_solid(&m3);
+
+        // The agent's durable references SURVIVE the dimension edit.
+        assert_eq!(
+            m3.solid_pid(s3),
+            Some(solid_pid),
+            "solid PID survives the mould (depends on the event, not the dimension)"
+        );
+        assert!(
+            m3.face_by_pid(face_pid).is_some(),
+            "the face PID still resolves after the mould"
+        );
+
+        // And the edit actually took effect: the box really is wider.
+        assert!((max_abs_x(&m1) - 5.0).abs() < 1e-6, "original half-width 5");
+        assert!(
+            (max_abs_x(&m3) - 12.5).abs() < 1e-6,
+            "moulded half-width 12.5"
+        );
     }
 }

@@ -17,6 +17,7 @@ import { ModifyPreview } from './ModifyPreview'
 import { ViewportContextMenu } from './ViewportContextMenu'
 import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
 import { SketchOverlay } from './SketchOverlay'
+import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
 import { MateSuggestionPopover } from '@/components/panels/MateSuggestionPopover'
 import { isStandardPlane, useSceneStore, type SketchPlane } from '@/stores/scene-store'
@@ -184,6 +185,7 @@ export function CADViewport() {
         <ExtrudeGizmo />
         <SelectionOutline />
         <SketchOverlay />
+        <ServerSketches />
       </Canvas>
 
       <ViewportFrame />
