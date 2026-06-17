@@ -676,7 +676,28 @@ signed-tetrahedron, EXACT for curved faces). VERIFIED LIVE: an ANALYTIC cylinder
 (`POST /api/geometry/cylinder`, r12 h26) now reports volume 11760 (≈πr²h),
 COM [0,0,13], POSITIVE inertia. Gate `agent_build_eval::cylinder_mass_properties_are_correct`.
 
-### EXTRUDE-CYL-MESH-INVERTED 🔴 the sketch-extruded circle cylinder has an inverted mesh
+### EXTRUDE-CYL-MESH-INVERTED 🟢 FIXED 2026-06-17 — outward target was at the loop sample, not the surface sample
+ROOT: `create_side_face_shared` (extrude.rs) passed `orient_face_for_outward` an
+`outward_target` computed at the LOOP edge-midpoint, while
+`orient_face_for_outward` reads the surface normal at the SURFACE parametric
+midpoint. For a closed-circle lateral the extruded Cylinder's seam (ref_dir) sits
+~90° from the loop's circle parameterisation, so the normal (at surface u=π →
+angle π/2) and the target (at loop angle π) came out PERPENDICULAR → the dot was
+~0 and the orientation fell to the wrong side → lateral wound INWARD → ⅓ volume,
+COM at origin, NEGATIVE inertia (caps were fine). FIX: derive the outward target
+from the SURFACE's own sample point — `create_side_face_shared` now takes the loop
+centroid + inner_sign and computes `target = (surface_midpoint − centroid)·
+inner_sign`, co-located with the orientation normal (the axial component is ⟂ the
+radial lateral normal, so it doesn't bias the sign). RESULT: extrude-circle
+cylinder → vol 11760, COM [0,0,13], POSITIVE inertia; lateral orient=Forward,
+n·radial_out=+1. Gate `extrude_circle_cylinder_mass_props_correct` (un-ignored,
+PASSES). NO regression: extrude lib 35, agent_build_eval 10, revolve_watertight 7,
+primitive_tess_watertight, tess_seam_65 2, closed_edge_bore_rim 5, drawing 36,
+bored_plate_caps. LIKELY also fixes the #41b extrude-path boss-wall drop (the
+extrude boss lateral was inverted) — re-verify live after MCP rebuild. (Original
+report below.)
+
+### (orig) EXTRUDE-CYL-MESH-INVERTED — the sketch-extruded circle cylinder has an inverted mesh
 SEPARATE, deeper bug surfaced by the fix above. Through the SAME (now-correct)
 `/properties` endpoint: an analytic cylinder → 11760 (right), but an EXTRUDE-path
 cylinder (MCP `create_cylinder` = `/api/sketch` circle + `/api/sketch/{id}/extrude`,

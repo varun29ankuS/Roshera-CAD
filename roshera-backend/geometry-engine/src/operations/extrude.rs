@@ -164,7 +164,8 @@ fn create_side_face_shared(
     bottom_end_v: VertexId,
     top_edge_id: EdgeId,
     topology: &ExtrusionLoopTopology,
-    outward_target: Vector3,
+    loop_centroid: Point3,
+    inner_sign: f64,
 ) -> OperationResult<FaceId> {
     let left_vertical = *topology.vertical_edge.get(&bottom_start_v).ok_or_else(|| {
         OperationError::InvalidGeometry("Vertical edge map miss (left)".to_string())
@@ -184,7 +185,32 @@ fn create_side_face_shared(
     let loop_id = model.loops.add(face_loop);
 
     let surface = create_ruled_surface(model, bottom_edge_id, top_edge_id)?;
-    let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
+    // Compute the outward target AT THE SURFACE'S OWN sample point, co-located
+    // with the normal that `orient_face_for_outward` reads at the parametric
+    // midpoint. The previous caller-supplied target was evaluated at the LOOP
+    // edge-midpoint, which for a closed-circle lateral (the extruded-circle
+    // cylinder) sits at a DIFFERENT angle than the surface seam — the normal and
+    // target then come out ~perpendicular and the orientation defaults to the
+    // wrong side (EXTRUDE-CYL-MESH-INVERTED: ⅓ volume, inward lateral). Sampling
+    // the surface midpoint makes the radial-out direction and the normal share a
+    // location, so the dot product is decisive. The axial component of
+    // `sample - centroid` is orthogonal to the (radial) lateral normal, so it
+    // does not bias the sign. `inner_sign` flips it for hole loops.
+    let target = {
+        let ((umn, umx), (vmn, vmx)) = surface.parameter_bounds();
+        match surface.point_at(0.5 * (umn + umx), 0.5 * (vmn + vmx)) {
+            Ok(sp) => {
+                let radial = (sp - loop_centroid) * inner_sign;
+                if radial.magnitude_squared() > 1e-20 {
+                    radial
+                } else {
+                    Vector3::Z
+                }
+            }
+            Err(_) => Vector3::Z,
+        }
+    };
+    let orientation = orient_face_for_outward(surface.as_ref(), target)?;
     let surface_id = model.surfaces.add(surface);
 
     let face = Face::new(0, surface_id, loop_id, orientation);
@@ -977,29 +1003,12 @@ fn build_loop_side_faces(
             (raw_end, raw_start)
         };
 
-        // Per-wall sample point: the bottom edge's CURVE midpoint. Sampling
-        // the curve (not the endpoint-vertex midpoint) keeps this correct for
-        // a closed circular edge, whose two endpoints coincide at the seam —
-        // their midpoint would be the seam itself, not the wall's geometric
-        // centre. `loop_start` / `loop_end` are still used below to address
-        // the shared vertical edges.
-        let edge_mid = sample_edge_point(model, bottom_edge_id, 0.5)?;
-        let radial = (edge_mid - centroid) * inner_sign;
-        // If the bottom edge happens to pass through the centroid the
-        // radial direction degenerates to zero; fall back to any
-        // direction perpendicular to the edge that is non-zero. In
-        // practice this only happens for pathological degenerate loops
-        // and the downstream `orient_face_for_outward` will still
-        // produce a determinate (if arbitrary) answer.
-        let outward_target = if radial.magnitude_squared() > 1e-20 {
-            radial
-        } else {
-            // Use any non-zero fallback so the dot product is well-
-            // defined; the resulting orientation is arbitrary but
-            // deterministic.
-            crate::math::Vector3::Z
-        };
-
+        // The wall's outward direction is derived inside `create_side_face_shared`
+        // from the SURFACE's own sample point (co-located with the orientation
+        // normal) using `loop_centroid` + `inner_sign` — passing the loop
+        // edge-midpoint here was the EXTRUDE-CYL-MESH-INVERTED bug (the
+        // closed-circle lateral's seam sits at a different angle than the loop
+        // sample, so normal and target came out perpendicular).
         let side_face = create_side_face_shared(
             model,
             bottom_edge_id,
@@ -1008,7 +1017,8 @@ fn build_loop_side_faces(
             loop_end,
             topology.top_edges[i],
             topology,
-            outward_target,
+            centroid,
+            inner_sign,
         )?;
         out_faces.push(side_face);
     }
