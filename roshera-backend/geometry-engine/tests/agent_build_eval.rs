@@ -455,6 +455,44 @@ fn bearing_housing_coaxial_bore_is_sound() {
     );
 }
 
+/// GATE — MASS-PROPS-⅓: the mesh-based (Tonon signed-tet) integrator behind
+/// `BRepModel::mass_properties_for` must report a cylinder's volume, COM and
+/// inertia CORRECTLY. The OLD per-face divergence formula in
+/// `Solid::compute_mass_properties` (`centroid·normal·area/3`) dropped the curved
+/// lateral flux → ⅓·πr²h, a box-approximated/negative inertia, and an
+/// area-weighted COM. The live `/properties` endpoint was routed off that buggy
+/// path onto this one (kernel_state.rs). This pins the correct integrator.
+#[test]
+fn cylinder_mass_properties_are_correct() {
+    let truth = std::f64::consts::PI * 144.0 * 26.0; // r12 h26
+    let mut m = BRepModel::new();
+    let c = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 12.0, 26.0); // z[0,26], COM z=13
+    let mp = m.mass_properties_for(c).expect("mp");
+    assert!(
+        (mp.volume - truth).abs() < 0.02 * truth,
+        "cylinder volume {:.1} != πr²h {:.1} (ratio {:.3} — dropped lateral flux?)",
+        mp.volume,
+        truth,
+        mp.volume / truth
+    );
+    // COM on the axis at mid-height (z=13), not the origin.
+    assert!(
+        mp.center_of_mass[0].abs() < 0.1
+            && mp.center_of_mass[1].abs() < 0.1
+            && (mp.center_of_mass[2] - 13.0).abs() < 0.2,
+        "cylinder COM {:?} should be ~[0,0,13]",
+        mp.center_of_mass
+    );
+    // Inertia diagonal must be POSITIVE (a real mass distribution).
+    for i in 0..3 {
+        assert!(
+            mp.inertia_tensor[i][i] > 0.0,
+            "cylinder inertia diagonal [{i}] = {} is not positive",
+            mp.inertia_tensor[i][i]
+        );
+    }
+}
+
 fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
     transform_solid(
         m,
