@@ -277,28 +277,31 @@ face's actual surface, or use GWN classification for the wall face), tying to th
 #41/#35 coaxial-bore family. Workaround to keep building: bore BEFORE the union,
 or keep features non-coaxial.
 
-### COAXIAL-BORE-THROUGH-BOSS 🔴 the bore only bores the BASE; the boss stays solid (2026-06-17, live + kernel)
-**RETRACTION of the 2026-06-17 "corefinement is SOUND" claim — that was a FALSE
-PASS.** Live + kernel: box base ∪ cylinder boss − coaxial bore through both →
-the bore removes ONLY the base column (z[-10,10], ≈24244 by mesh volume) and
-LEAVES THE BOSS SOLID (z[10,40] interior never removed); a thin annular top cap
-forms on the boss so the part is B-Rep-valid + watertight + the boss-top "has an
-inner loop", but the cylindrical bore column through the boss height is gone.
-Full bore would remove ≈62832 (z[-10,40]). The cut does NOT propagate across the
-base∪boss UNION SEAM — the #35/#41 corefinement family. The earlier gate
-`bearing_housing_coaxial_bore_is_sound` only asserted valid + watertight +
-boss-top-inner-loop — NONE of which detect the unremoved boss interior; it is now
-#[ignore]'d with a VERIFY-EFFECT volume assertion (`removed ≈ full_bore`) that
-correctly FAILS. This is the user's live "the difference isn't working / no hole
-through the boss". Render confirms a solid boss; `mass_properties` volume 378014
-≈ unbored-union(403404) − base-only-column(25133). FIX LANE: propagate the
-difference cut through the union seam (the boss lateral + the bore must
-co-refine so the bore column is removed across the whole base+boss height) —
-DEEP #35/#41 corefinement, same lane as #27 chained-union. The LESSON (again):
-"valid + watertight + a feature face exists" ≠ "the op had its intended effect";
-only volume/effect catches a no-effect cut. NOTE the #41b wall-drop IS genuinely
-fixed (the boss outer wall survives — `extrude_boss_coaxial_bore_keeps_wall`);
-that is a DIFFERENT defect from this bore-doesn't-propagate one.
+### COAXIAL-BORE-THROUGH-BOSS 🟢 FIXED 2026-06-17 — it was the annular-cap stitch, NOT corefinement
+**The boolean was always CORRECT** — NOT a #35/#41 corefinement defect (an
+earlier "corefinement" framing was wrong, itself a retraction of a still-earlier
+false "sound" pass). Per-face inspection of base ∪ boss − coaxial bore proved the
+B-Rep is fully bored: bore wall through the base (z[-10,10]) AND the boss
+(z[10,40], both oriented toward the axis), and the boss-top cap is annular
+(inner loop = the bore). The failure was purely TESSELLATION: the concentric
+boss-top annulus (outer rim + inner bore — independent seams, opposite winding)
+went through `annulus_radial_strip`, which stitched the two rings by fractional
+INDEX assuming a common seam + same winding (true for revolve washers, false
+here) → the strip twisted into overlapping spanning triangles that FILLED the
+bore (mesh area 5484 vs the true annulus 2591). So the boss rendered SOLID and
+the mesh volume reflected only the base bore (removed ≈24244 vs the full ≈62832).
+FIX: angle-ordered stitching in `annulus_radial_strip` — reorder each ring into
+canonical CCW-by-angle order about its own centre (kills the winding/seam
+dependence) and rotate the inner ring to align its first point with the outer's.
+RESULT: boss-top area 5484→2592, removed 62805 ≈ full bore, bore now goes through
+the boss (render shows the hole). Gate `bearing_housing_coaxial_bore_is_sound`
+(un-ignored, VERIFY-EFFECT volume assertion PASSES). NO regression:
+revolve_watertight 7/7 (washers — the other annulus_radial_strip client —
+unaffected, since angle-order is a no-op for their aligned rings),
+primitive_tess, tess_seam_65, bore_rim 5, drawing 36, surface lib 18, eval 11.
+THE LESSON (yet again): only the VERIFY-EFFECT volume check caught this; "valid +
+watertight + a feature face exists" passed on a filled bore. The #41b wall-drop
+was a separate, also-fixed defect.
 
 (superseded) UPDATE 2026-06-17 — claimed the KERNEL corefinement is SOUND; the
 live failure a PIPELINE artifact. Reproduced the analytic config in-kernel:

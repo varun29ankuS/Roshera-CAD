@@ -987,10 +987,45 @@ fn annulus_radial_strip(
         return None; // not concentric, or inner is not the smaller ring
     }
 
-    let n = oe - os;
-    let m = ie - is_;
-    let oidx = |k: usize| os + (k % n);
-    let iidx = |k: usize| is_ + (k % m);
+    // Stitch the two rings by ANGLE, not by raw loop index. The previous
+    // index-walk assumed both rings were sampled CCW from a COMMON seam — true
+    // for a revolve washer (both circles built together) but NOT for a
+    // boolean-result annular cap (e.g. a bored boss top), whose outer rim and
+    // inner bore have independent seams and can wind oppositely. That mismatch
+    // twisted the strip into overlapping spanning triangles (the bore filled →
+    // a coaxial bore through a boss rendered solid; mesh area 5484 vs the true
+    // annulus 2591). FIX: reorder each ring into canonical CCW-by-angle order
+    // about its own centre (kills the winding/seam dependence), then rotate the
+    // inner ring so its first point is angularly aligned with the outer's first
+    // point. The fractional-advance walk below is then correct for both.
+    let (u_axis, v_axis) = compute_plane_axes(normal);
+    let angle_of = |vi: usize, c: Point3| -> f64 {
+        let d = vertices[vi] - c;
+        d.dot(&v_axis).atan2(d.dot(&u_axis))
+    };
+    let mut o_order: Vec<usize> = (os..oe).collect();
+    o_order.sort_by(|&x, &y| angle_of(x, oc).total_cmp(&angle_of(y, oc)));
+    let mut i_order: Vec<usize> = (is_..ie).collect();
+    i_order.sort_by(|&x, &y| angle_of(x, ic).total_cmp(&angle_of(y, ic)));
+    let o0 = angle_of(o_order[0], oc);
+    let ang_dist = |a: f64, b: f64| -> f64 {
+        let mut d = (a - b).abs();
+        if d > std::f64::consts::PI {
+            d = std::f64::consts::TAU - d;
+        }
+        d
+    };
+    let start_j = (0..i_order.len())
+        .min_by(|&x, &y| {
+            ang_dist(angle_of(i_order[x], ic), o0)
+                .total_cmp(&ang_dist(angle_of(i_order[y], ic), o0))
+        })
+        .unwrap_or(0);
+    i_order.rotate_left(start_j);
+    let n = o_order.len();
+    let m = i_order.len();
+    let oidx = |k: usize| o_order[k % n];
+    let iidx = |k: usize| i_order[k % m];
     let mut tris: Vec<[usize; 3]> = Vec::with_capacity(n + m);
     let (mut i, mut j) = (0usize, 0usize);
     for _ in 0..(n + m) {
