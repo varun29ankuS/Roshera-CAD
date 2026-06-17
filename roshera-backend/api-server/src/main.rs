@@ -879,11 +879,27 @@ fn perception_json(
         let s = b.size();
         vec![s.x, s.y, s.z]
     });
+    // SOUND verdict (feedback-as-default): the authoritative answer to "is this a
+    // real, manufacturable solid?" is the EXACT B-Rep validity (validate_solid_
+    // scoped, mesh-independent) — `sound`. The mesh open/non-manifold counts are
+    // DISPLAY/export quality: a valid solid whose tessellation has T-junctions is
+    // NOT broken (the unsound-eye trap, KNOWN_BUGS #65 / EYE-SOUND). Callers must
+    // judge soundness off `sound`/`valid`, never the mesh `watertight`.
+    let mesh_watertight = open == 0 && nm == 0;
+    let verdict = if !valid {
+        "BROKEN — B-Rep invalid (a real topological defect)"
+    } else if mesh_watertight {
+        "OK — valid closed solid; export mesh watertight"
+    } else {
+        "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)"
+    };
     serde_json::json!({
-        "watertight":        open == 0 && nm == 0,
+        "sound":             valid,
+        "valid":             valid,
+        "verdict":           verdict,
+        "watertight":        mesh_watertight,
         "open_edges":        open,
         "nonmanifold_edges": nm,
-        "valid":             valid,
         "dims":              dims,
     })
 }

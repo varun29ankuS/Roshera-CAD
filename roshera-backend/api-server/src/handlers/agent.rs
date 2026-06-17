@@ -660,6 +660,13 @@ pub async fn part_coverage(
 #[derive(Debug, Clone, Serialize)]
 pub struct PartPerception {
     pub solid_id: u32,
+    /// AUTHORITATIVE verdict: the exact B-Rep validity (mesh-independent). This —
+    /// not `watertight` — is the sound answer to "is this a real solid?".
+    pub sound: bool,
+    /// Human/agent-readable one-liner derived from `sound` + the mesh check.
+    pub verdict: String,
+    /// Export-mesh watertightness (display/STL quality) — a valid solid can show
+    /// `false` here from tessellation T-junctions without being broken.
     pub watertight: bool,
     pub open_edges: usize,
     pub nonmanifold_edges: usize,
@@ -692,9 +699,19 @@ pub async fn part_perception(
         let s = b.size();
         [s.x, s.y, s.z]
     });
+    let watertight = report.boundary_edges == 0 && report.nonmanifold_edges == 0;
+    let verdict = if !valid {
+        "BROKEN — B-Rep invalid (a real topological defect)".to_string()
+    } else if watertight {
+        "OK — valid closed solid; export mesh watertight".to_string()
+    } else {
+        "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)".to_string()
+    };
     Ok(Json(PartPerception {
         solid_id: id,
-        watertight: report.boundary_edges == 0 && report.nonmanifold_edges == 0,
+        sound: valid,
+        verdict,
+        watertight,
         open_edges: report.boundary_edges,
         nonmanifold_edges: report.nonmanifold_edges,
         valid,
