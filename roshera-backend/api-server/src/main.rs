@@ -1262,9 +1262,16 @@ async fn shell_solid(
         [0.0, 0.0, 0.0],
     );
 
+    // Feedback-as-default: shell can leave a self-intersecting or open wall, so
+    // it reports its own SOUND (B-Rep) verdict like the boolean.
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "consumed": [],
         "object": {
             "id":         result_id_str,
@@ -3417,9 +3424,16 @@ async fn create_revolve_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    // Feedback-as-default: a self-intersecting / axis-touching profile can yield
+    // an unsound solid, so revolve reports its own SOUND (B-Rep) verdict.
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "object": {
             "id":         result_id_str,
             "name":       name,
