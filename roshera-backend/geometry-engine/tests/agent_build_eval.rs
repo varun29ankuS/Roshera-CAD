@@ -378,6 +378,34 @@ fn diag_cylinder_mesh_orientation() {
     );
 }
 
+#[test]
+#[ignore = "diagnostic: bearing housing — does the coaxial bore drop the boss wall? (#41b)"]
+fn diag_bearing_housing_boss_wall() {
+    let mut m = BRepModel::new();
+    let base = box_solid(&mut m, 120.0, 120.0, 20.0); // centred z[-10,10]
+    let boss = cyl(&mut m, Point3::new(0.0, 0.0, 5.0), 35.0, 35.0); // z[5,40], interpenetrates
+    let body = union(&mut m, base, boss);
+    let v = validate_solid_scoped(&m, body, Tolerance::default(), ValidationLevel::Standard);
+    let r = manifold_report(&m, body, 0.5, 1e-6).expect("mr");
+    eprintln!(
+        "after UNION: valid={} watertight(open={},nm={})",
+        v.is_valid, r.boundary_edges, r.nonmanifold_edges
+    );
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -15.0), 20.0, 60.0); // coaxial through
+    let holed = diff(&mut m, body, bore);
+    let v2 = validate_solid_scoped(&m, holed, Tolerance::default(), ValidationLevel::Standard);
+    let r2 = manifold_report(&m, holed, 0.5, 1e-6).expect("mr2");
+    // Is the r35 boss wall still present? Look for a Cylinder face with radius ~35.
+    let dias = cylindrical_diameters(&m, holed);
+    eprintln!(
+        "after coaxial BORE: valid={} watertight(open={},nm={}) | cyl diameters={:?} (expect Ø70 boss wall + Ø40 bore)",
+        v2.is_valid, r2.boundary_edges, r2.nonmanifold_edges, dias
+    );
+    if !v2.is_valid {
+        eprintln!("  errors: {:?}", v2.errors);
+    }
+}
+
 fn translate(m: &mut BRepModel, sid: SolidId, dx: f64, dy: f64, dz: f64) {
     transform_solid(
         m,
