@@ -609,34 +609,37 @@ Surfaced rebuilding + driving a bored plate through the LIVE api-server (the
 verification-layer dogfood Varun asked for). THREE intertwined findings; the
 B-Rep boolean itself is INNOCENT.
 
-### MASS-PROPS-⅓ 🔴 cylinder volume = ⅓·true; COM wrong; inertia NEGATIVE
-`compute_mass_properties` (solid.rs/shell.rs — the path behind `GET /perception`'s
-`volume` field AND `mass_properties`) reports a plain analytic cylinder's volume
-as EXACTLY ⅓ of πr²h (e.g. r12 h26 → 3920 vs 11762), puts the COM at the origin
-(should be the axial midpoint), and yields NEGATIVE inertia-tensor diagonals
-(physically impossible). Arithmetic points at the divergence sum dropping the
-CURVED (lateral) face contribution: ⅓·(top-cap z-flux) = ⅓πr²h matches the
-observed number. NOTE the OTHER integrator — `render::dimensioned`'s
-`mesh_analytics` (the EYE/`frame.volume`) — is CORRECT for a clean cylinder
-(11754 ≈ truth), so this is specific to `compute_mass_properties`, not all volume
-code. Repro (live): create_cylinder → perception.volume=3920; mass_properties →
-negative principal moments. Fix lane: include curved-face flux (or integrate the
-tessellated mesh consistently) in compute_mass_properties.
-
-### BORE-TESS-VOLUME 🔴 bored-plate MESH volume inflated (bore wall mis-oriented / cap filled)
-A box − through-cylinder difference is a CORRECT B-Rep (the bore centre classifies
-Outside by exact ray-parity; the bore wall IS tessellated, ~1400 verts at r≈12)
-and is watertight (open=0 nm=0) — yet its tessellated mesh integrates to ~107817,
-INFLATED above even the solid plate (102400), vs the correct 95162. A watertight
-mesh with volume > the un-bored solid ⇒ the bore-wall triangles are wound
-inside-out and/or the annular cap is triangulated FILLED. This is the
-user-visible "the subtraction didn't work" — the live viewport + `render_part`
-(ids top = solid cap, no annulus; depth uniform) show NO hole even though the
-B-Rep has it. Pins: `agent_build_eval.rs::bored_plate_mesh_volume_wrong`
-(#[ignore], FAILS) + `kernel_bored_plate_mesh_has_bore` (PASSES — proves the
-B-Rep + bore-wall verts are sound, so triage targets TESSELLATION, not boolean).
-NOTE may be related to the #65/#21 curved↔planar seam-sampling lane. Fix lane:
-orient the bore-wall + annular-cap triangulation outward on boolean-result faces.
+### TESS-ORIENT 🔴 inward-wound triangles on boolean-result + extrude-path meshes (ONE root cause)
+**This is the real root of BOTH the "⅓ cylinder volume" and the "bored plate has
+no hole" — and the mass-properties integrators are INNOCENT.** Decisive evidence
+(`agent_build_eval.rs::diag_cylinder_mesh_orientation`, signed-tetrahedron volume
+= the exact mesh-enclosed volume):
+- a `create_cylinder_3d` cylinder integrates CORRECTLY at both default and fine
+  tess (11754 / 11760 ≈ 11762, watertight). So the Tonon signed-tet integrator
+  (`mesh_based_mass_properties`) AND `mesh_analytics` (the eye) are both correct,
+  and the kernel-primitive cylinder mesh is well-oriented.
+- the kernel bored plate (`create_box_3d − create_cylinder_3d`) integrates to
+  107817 by BOTH integrators identically (signed-tet == mesh_analytics), while
+  watertight (open=0 nm=0). A watertight mesh enclosing MORE than the un-bored
+  solid block (102400) is only possible if some triangles are wound INWARD — here
+  the bore wall (the bore is a real B-Rep void, ray-parity confirms; the wall IS
+  meshed, ~1400 verts at r≈12 — `kernel_bored_plate_mesh_has_bore` PASSES). So the
+  bore-wall (and/or annular-cap) triangles are emitted with reversed winding.
+- the LIVE/MCP (extrude-path) cylinder shows the SAME disease from the other end:
+  `mass_properties` returns volume ⅓ (3920) AND NEGATIVE inertia diagonals — a
+  consistently-outward mesh can NEVER yield negative inertia, so its mesh also has
+  inverted triangles.
+USER-VISIBLE EFFECT: the inward bore wall renders as a filled cap (ids-top = solid
+face, no annulus; depth uniform) → "the subtraction didn't work" in the viewport,
+and STL export would be wrong. Pins: `bored_plate_mesh_volume_wrong` (#[ignore],
+FAILS — kernel repro), `diag_cylinder_mesh_orientation` (#[ignore], characterises
+both), `kernel_bored_plate_mesh_has_bore` (PASSES — B-Rep + wall present, so the
+fix is in TESSELLATION winding, NOT the boolean and NOT the integrators). FIX
+LANE: orient triangulated triangles outward per face on boolean-result + extrude
+solids — the per-face winding should follow the analytic outward normal (the bore
+wall's outward points toward the axis = into the void; cap inner-loop winding must
+oppose the outer loop). Likely the same place that sets face/triangle winding from
+`FaceOrientation` for split/new faces. Possibly related to #65/#21.
 
 ### VERIFY-EFFECT 🔴 the verification layer false-greens "no-effect" / wrong-volume ops
 Both bugs above sailed through EVERY check: `perception` reported
@@ -649,9 +652,10 @@ shared the blind spot — it asserted watertight + dims (unchanged by a bore) +
 bore-face-exists (the wall face exists even when mis-meshed), never volume. FIX
 LANE (the real "verify the verification layer"): add EFFECT + physical-sanity
 gates — a Difference must DECREASE volume; a Union must not decrease it; volume ≤
-bbox-volume·(1+ε); volume > 0; COM ∈ bbox; inertia positive-definite. BLOCKED on
-MASS-PROPS-⅓ + BORE-TESS-VOLUME first (the volume signal must be trustworthy
-before it can gate). LESSON: "sound/watertight" was necessary but never
+bbox-volume·(1+ε); volume > 0; COM ∈ bbox; inertia positive-definite. The
+integrators are trustworthy TODAY (signed-tet is exact on a well-oriented mesh),
+so this gate would have CAUGHT TESS-ORIENT immediately — it is the right next
+guard once the mesh winding is fixed (TESS-ORIENT). LESSON: "sound/watertight" was necessary but never
 sufficient; the eye-agreement + bore-recognition added this session also pass on
 this part (dims + a cylinder face both survive), so they too need a volume/effect
 arm.
