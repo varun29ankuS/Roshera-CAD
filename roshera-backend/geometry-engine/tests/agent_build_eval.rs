@@ -352,19 +352,18 @@ fn kernel_bored_plate_mesh_has_bore() {
 
 /// #41b — the KERNEL coaxial-bore-through-a-boss is SOUND (the corefinement is
 /// NOT the bug). Base ∪ boss − a coaxial bore that EXITS the boss top: the result
-/// PIN — COAXIAL-BORE-THROUGH-BOSS (🔴): a coaxial bore through a box base ∪ boss
-/// only bores the BASE — the boss is left solid (just a thin annular top cap
-/// forms). Volume removed ≈ 24244 (the base column z[-10,10]) vs the full
-/// ≈62832 (z[-10,40]). The bore-cut does not propagate across the base∪boss
-/// union seam — the #35/#41 corefinement family. CORRECTS a prior false pass:
-/// the earlier assertion only checked "boss-top has an inner loop" (true — the
-/// annular cap forms) + watertight + B-Rep-valid, NONE of which detect that the
-/// boss INTERIOR column was never removed. Only the VERIFY-EFFECT volume check
-/// catches it. This is the user's live "the difference isn't working". Pinned
-/// asserting the correct full-bore volume; un-ignore when the cut propagates
-/// through the union seam. (#24 cdt panic also fires at the boss/bore tessellation.)
+/// GATE — COAXIAL-BORE-THROUGH-BOSS (FIXED 2026-06-17): a coaxial bore through a
+/// box base ∪ cylinder boss must remove the FULL r20 column over z[-10,40]
+/// (≈62832), not just the base portion. The boolean B-Rep was always correct
+/// (bore wall through base AND boss, boss-top annular) — the failure was purely
+/// tessellation: the concentric boss-top annulus (outer rim + inner bore, with
+/// independent seams / opposite winding) stitched into overlapping triangles
+/// that FILLED the bore (mesh area 5484 vs the true 2591), so the boss rendered
+/// solid and the mesh volume reflected only the base bore. Fixed by angle-ordered
+/// stitching in `annulus_radial_strip` (surface.rs). The VERIFY-EFFECT volume
+/// check (removed ≈ full bore) is what caught it — "valid + watertight +
+/// boss-top-has-inner-loop" did not.
 #[test]
-#[ignore = "COAXIAL-BORE-THROUGH-BOSS 🔴: bore through base∪boss only bores the base (#35/#41 corefinement)"]
 fn bearing_housing_coaxial_bore_is_sound() {
     let mut m = BRepModel::new();
     let base = box_solid(&mut m, 120.0, 120.0, 20.0); // centred z[-10,10]
