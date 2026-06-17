@@ -693,6 +693,21 @@ convention) — OR, pragmatic interim, switch MCP `create_cylinder` to the analy
 `POST /api/geometry/cylinder` (correct in every way: mass, mesh, booleans #41b).
 Repro: build a cylinder both ways, compare `mass_properties_for` (analytic=πr²h+,
 extrude=⅓+negative).
+**NARROWED 2026-06-17 + KERNEL REPRO PINNED** (`agent_build_eval::
+extrude_circle_cylinder_mass_props_correct`, #[ignore], FAILS): extruding a full
+Circle profile (`create_face_from_profile_with_plane` + `extrude_face`) gives a
+Cylinder whose SURFACE is byte-identical to `create_cylinder_3d`'s, and the CAPS
+tessellate correctly, but the closed-circle LATERAL winds INWARD: mass-integration
+= top-cap flux (3920) − lateral flux (7840) = −3920 → |·| = ⅓·πr²h, COM at origin,
+inertia ⟂-diagonal NEGATIVE. So the surface/axis and `orient_face_for_outward`'s
+chosen FaceOrientation are NOT the culprit (the B-Rep face is outward) — the fault
+is the curved-CDT tessellation winding of the extrude's QUAD side-loop
+(`create_side_face_shared`: bottom-circle-fwd → vertical → top-circle-rev →
+vertical) vs `create_cylinder_3d`'s native lateral loop, with the same surface +
+outward orientation producing opposite triangle winding on the closed-circle
+seam. FIX LANE: make the curved-CDT honor the face's outward orientation
+independent of the side-loop's 2D winding (or align the extrude side-loop winding
+with the primitive's). DEEP — extrude path is load-bearing; fix with fresh focus.
 
 
 Surfaced rebuilding + driving a bored plate through the LIVE api-server (the
