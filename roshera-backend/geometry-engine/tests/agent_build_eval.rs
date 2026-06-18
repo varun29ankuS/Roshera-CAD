@@ -1459,3 +1459,51 @@ fn gen_chamfered_block() {
     );
     assert_recognizes_bore(&m, holed, 20.0, 1, "chamfered block");
 }
+
+/// ROSTER part: a rounded cylinder — a Ø60 × 50 cylinder with its TOP RIM rounded
+/// over (r6 constant fillet → a ToroidalFillet carrier). Exercises a blend on a
+/// CURVED (closed circular) edge and the TOROIDAL-fillet-face TESSELLATION through
+/// the full 6-channel verifier (watertight + volume + no-dropped-faces + eye) —
+/// the B-rep-level closed-edge tests don't check the mesh. (#26/#89 frontier.)
+#[test]
+fn gen_rounded_cylinder() {
+    let mut m = BRepModel::new();
+    let cylinder = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 30.0, 50.0); // z[0,50]
+                                                                        // The top rim = the closed (seam) edge whose seam vertex sits at z≈50.
+    let top_rim: Vec<EdgeId> = m
+        .edges
+        .iter()
+        .filter(|(_, e)| e.is_loop())
+        .filter(|(_, e)| {
+            m.vertices
+                .get_position(e.start_vertex)
+                .map(|p| (p[2] - 50.0).abs() < 1e-6)
+                .unwrap_or(false)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        top_rim.len(),
+        1,
+        "expected exactly 1 top-rim closed edge, got {top_rim:?}"
+    );
+    fillet_edges(
+        &mut m,
+        cylinder,
+        top_rim,
+        FilletOptions {
+            fillet_type: FilletType::Constant(6.0),
+            radius: 6.0,
+            ..Default::default()
+        },
+    )
+    .expect("round over the cylinder top rim (r6 torus blend)");
+    // Cylinder V = π·30²·50 = 141372; the r6 round-over shaves a small toroidal
+    // corner ring off the top — generous range, mesh facets undershoot.
+    verify_comprehensive(&m, cylinder, "rounded cylinder", 136_000.0, 142_000.0);
+    let d = world_dims(&m, cylinder);
+    assert!(
+        (d[0] - 60.0).abs() < 1.0 && (d[1] - 60.0).abs() < 1.0 && (d[2] - 50.0).abs() < 0.5,
+        "rounded-cylinder envelope wrong: {d:?}"
+    );
+}
