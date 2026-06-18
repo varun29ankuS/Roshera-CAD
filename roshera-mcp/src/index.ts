@@ -252,6 +252,51 @@ server.tool(
 );
 
 server.tool(
+  "select_face",
+  "Address a face by DESCRIPTION instead of guessing its id — the kernel " +
+    "resolves it or REFUSES. Give a surface `kind` (planar/cylindrical/…), an " +
+    "optional `normal_dir` the face must point along (e.g. [0,0,1] for the top), " +
+    "and an optional `extremal` tie-breaker (largest_area/smallest_area/" +
+    "most_along). Returns the concrete face_id + its persistent_id (stable across " +
+    "edits) on success; on `ambiguous` it returns the candidate face_ids (refine " +
+    "the description) and on `not_found` nothing matched. The kernel NEVER picks " +
+    "one of several equal matches for you — that's the point.",
+  {
+    part_id: z.number().int(),
+    kind: z
+      .enum(["any", "planar", "cylindrical", "spherical", "conical", "toroidal", "nurbs"])
+      .default("any"),
+    normal_dir: z.tuple([z.number(), z.number(), z.number()]).optional(),
+    extremal: z
+      .enum(["none", "largest_area", "smallest_area", "most_along"])
+      .default("none"),
+    along: z.tuple([z.number(), z.number(), z.number()]).optional(),
+    angle_tol_deg: z.number().default(12),
+  },
+  async ({ part_id, kind, normal_dir, extremal, along, angle_tol_deg }) => {
+    try {
+      // Read the body regardless of status: 404 (not_found) / 409 (ambiguous)
+      // are the kernel's meaningful REFUSALS, not transport errors.
+      const res = await fetch(`${BASE}/api/agent/parts/${part_id}/select-face`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind,
+          normal_dir: normal_dir ?? null,
+          extremal,
+          along: along ?? null,
+          angle_tol_deg,
+        }),
+      });
+      const j = await res.json();
+      return ok(j);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "verify_part",
   "SELF-CHECK a part's geometry. The verdict is the SOUND, mesh-independent " +
     "B-Rep check (validate_solid_scoped via /perception): brep_valid is the " +

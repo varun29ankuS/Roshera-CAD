@@ -7132,6 +7132,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(handlers::agent::set_part_color),
         )
         .route(
+            "/api/agent/parts/{id}/select-face",
+            post(handlers::agent::select_face),
+        )
+        .route(
             "/api/agent/pointer",
             get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),
         )
