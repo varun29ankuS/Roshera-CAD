@@ -1222,3 +1222,51 @@ fn gen_l_bracket_with_bores() {
         "L-bracket envelope wrong: {d:?}"
     );
 }
+
+/// ROSTER part: a hollow pipe tee — a main RUN cylinder (X-axis) UNIONED with a
+/// perpendicular BRANCH cylinder (Z-axis), then bored coaxially through each to
+/// hollow it. The outer union is a CURVED∩CURVED (Steinmetz saddle) intersection
+/// and the two bores intersect the same way — the hardest case in the roster
+/// (bool7 cyl∩cyl family). The branch ROOTS INSIDE the run (base z=−10, well
+/// within the run's z[−20,20]) so they interpenetrate, never tangent/coincident.
+///
+/// SURFACED BUG 2026-06-18 (kept #[ignore]'d): the curved cyl∩cyl UNION builds,
+/// but the next step — boring it with a Difference — FAILS (`diff` returns Err,
+/// the `.expect("difference")` panics). The boolean's GWN classification
+/// tessellates the saddle-faced tee operand and hits a cdt panic at
+/// triangulate.rs:1015 (a THIRD distinct cdt assert, after :965 and :927) twice,
+/// and the whole op took 362s (GWN over-tessellation, bool86 family). DEEP
+/// curved-union+bore robustness — pinned, see KNOWN_BUGS (PIPE-TEE).
+#[test]
+#[ignore = "PIPE-TEE surfaced bug: curved cyl∩cyl union builds but boring it (Difference) fails — cdt:1015 panic in GWN classification tessellation of the saddle-faced tee; 362s. See KNOWN_BUGS."]
+fn gen_pipe_tee() {
+    let mut m = BRepModel::new();
+    // Run: Ø40 along X, x[−60,60], centred on origin.
+    let run = cyl_axis(
+        &mut m,
+        Point3::new(-60.0, 0.0, 0.0),
+        Vector3::X,
+        20.0,
+        120.0,
+    );
+    // Branch: Ø40 along Z, base inside the run -> z[−10,60].
+    let branch = cyl(&mut m, Point3::new(0.0, 0.0, -10.0), 20.0, 70.0);
+    let tee = union(&mut m, run, branch);
+    // Bore the run (Ø28 through X) and the branch (Ø28 through Z) to hollow it.
+    let run_bore = cyl_axis(
+        &mut m,
+        Point3::new(-65.0, 0.0, 0.0),
+        Vector3::X,
+        14.0,
+        130.0,
+    );
+    let tee = diff(&mut m, tee, run_bore);
+    let branch_bore = cyl(&mut m, Point3::new(0.0, 0.0, -25.0), 14.0, 90.0);
+    let tee = diff(&mut m, tee, branch_bore);
+    verify_comprehensive(&m, tee, "hollow pipe tee", 80_000.0, 200_000.0);
+    let d = world_dims(&m, tee);
+    assert!(
+        (d[0] - 120.0).abs() < 1.5 && (d[1] - 40.0).abs() < 1.0 && (d[2] - 80.0).abs() < 1.5,
+        "pipe-tee envelope wrong: {d:?}"
+    );
+}

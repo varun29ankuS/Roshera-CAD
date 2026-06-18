@@ -597,6 +597,27 @@ RECOVERED via the planar fallback (watertight + no-dropped-faces both pass) — 
 the cone case where recovery fails. The latent annular-cap cdt:965 fragility is the
 through-line of both.
 
+### ROSTER (gen_pipe_tee) 🔴 boring a curved cyl∩cyl union FAILS (Difference Err + cdt:1015) (2026-06-18)
+Surfaced by the generative harness; pinned #[ignore]'d (gen_pipe_tee). A hollow
+pipe tee = a run cylinder (Ø40, X-axis) UNIONED with a perpendicular branch
+cylinder (Ø40, Z-axis), then bored Ø28 through each. The curved∩curved UNION
+(Steinmetz saddle) BUILDS fine, but the very next step — boring the tee with a
+Difference — FAILS: `boolean_operation(.., Difference)` returns Err (the test's
+`.expect("difference")` panics). During that boolean, GWN classification
+tessellates the saddle-faced tee operand and hits a cdt panic at
+triangulate.rs:1015 TWICE — a THIRD distinct cdt assert beyond the annular-cap
+:965 and the dome :927 — and the whole op runs 362s (GWN over-tessellation of the
+curved operand, the bool86 family). So the bug has two coupled faces: (a)
+correctness — Difference on a saddle-union solid errors out; (b) the saddle/scar
+faces don't tessellate (cdt:1015) which is likely what makes the boolean's GWN
+step fail. DEEP curved-union+bore robustness (bool7 cyl∩cyl + bool86 GWN-tess +
+the cdt-panic family converging). NEXT when picked up: capture the exact
+OperationError variant from the Difference; determine whether GWN classification
+is the failure path (try BooleanOptions with GWN off as a probe) vs the SSI arms;
+and find which saddle face hits cdt:1015 (face_map attribution + curved-CDT entry
+trace). The simpler cyl∩cyl cases (bool7) are the prerequisite. Repro:
+`gen_pipe_tee` (un-ignore to run; ~6 min).
+
 ### #27 🟢 Coaxial stacked-step union left buried cap
 Fixed via annular face-with-hole interior-point. See boolean campaign.
 
