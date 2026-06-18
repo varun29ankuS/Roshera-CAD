@@ -997,16 +997,17 @@ fn try_dome(
 }
 
 #[test]
-#[ignore = "REVOLVE axis-touch (🔴): apex-on-axis revolve rejected SelfIntersection; un-ignore when the pole case lands"]
+#[ignore = "REVOLVE-POLE: guard FIXED (revolve now builds the dome as a SOUND solid); the apex BAND mesh still leaves ~147 open edges — needs the 3-edge apex-fan in tessellate_revolution_wedge. Un-ignore when the apex meshes watertight."]
 fn eval_revolved_dome() {
     // A hemispherical pressure-vessel dome — apex on the axis (r=0). DESIRED end
-    // state: a sound, export-watertight solid of revolution. OBSERVED 2026-06-17:
-    // `revolve_profile` REJECTS the profile with `SelfIntersection` (the implicit
-    // closing edge runs along the axis), so the dome can't be built at all — the
-    // REVOLVE axis-touch pole bug (KNOWN_BUGS → "REVOLVE axis-touch"). Pinned as a
-    // forward-looking eval — un-ignore when the pole case is handled (admit the
-    // single axis segment + single-apex fan tessellation). Workaround today: a
-    // small pole vent bore keeps r_min > 0 (see eval_flanged_tube's annulus).
+    // state: a sound, export-watertight solid of revolution. PROGRESS 2026-06-18:
+    // the REVOLVE-POLE guard relaxation (face_intersects_axis no longer rejects an
+    // axis TOUCH) means `revolve_profile` now ACCEPTS the pole profile and builds
+    // a SOUND solid. REMAINING: the apex BAND is a 3-edge wedge (two meridians
+    // meeting at the pole + one rim arc); `tessellate_revolution_wedge` only
+    // handles the 4-edge quad wedge, so the apex tessellation leaves ~147 open
+    // edges (non-watertight MESH; the B-Rep is sound). Un-ignore when the 3-edge
+    // apex-fan lands.
     let mut m = BRepModel::new();
     let dome = try_dome(&mut m, 40.0, 16).expect("dome revolve (apex on axis)");
     assert_sound(&m, dome, "hemispherical dome (pole)");

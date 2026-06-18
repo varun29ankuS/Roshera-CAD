@@ -1583,9 +1583,11 @@ fn face_intersects_axis(
                 .ok_or_else(|| OperationError::InvalidGeometry("Vertex not found".to_string()))?;
             let point = Point3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
             let r = radial_offset(point);
-            if r.magnitude() < tolerance {
-                return Ok(true);
-            }
+            // A boundary vertex ON the axis (r≈0) is a valid POLE / axis touch —
+            // a quarter-disk's apex, or a rectangle edge on the axis that
+            // revolves to a solid cylinder — NOT a self-intersection. Only an
+            // interior CROSSING of the axis is rejected (the sign-flip test in
+            // the edge loop + the planar pierce test below). REVOLVE-POLE.
             radial_samples.push(r);
         }
 
@@ -1601,13 +1603,17 @@ fn face_intersects_axis(
                     let t = pr.start + span * (i as f64 / N as f64);
                     if let Ok(p) = curve.point_at(t) {
                         let r = radial_offset(p);
-                        if r.magnitude() < tolerance {
-                            return Ok(true);
-                        }
+                        // Drop the touch-reject: an edge sample at r≈0 is a valid
+                        // axis-coincident edge (the pole's closing edge, or a
+                        // cylinder's axis edge), not a crossing. Only flag a
+                        // genuine CROSSING — both samples strictly OFF-axis AND
+                        // pointing into opposite radial half-spaces (the profile
+                        // passes through the axis interior). REVOLVE-POLE.
                         if let Some(prev_r) = prev {
-                            // If the offset vectors point in opposite
-                            // half-spaces, the edge crossed the axis line.
-                            if prev_r.dot(&r) < 0.0 {
+                            if prev_r.magnitude() > tolerance
+                                && r.magnitude() > tolerance
+                                && prev_r.dot(&r) < 0.0
+                            {
                                 return Ok(true);
                             }
                         }
@@ -1945,14 +1951,21 @@ mod tests {
     }
 
     #[test]
-    fn face_intersects_axis_on_axis_rectangle_does_intersect() {
+    fn face_intersects_axis_on_axis_rectangle_does_not_intersect() {
+        // A rectangle with one edge ON the Z axis (r=0..2, z=0..1) revolves to a
+        // VALID solid cylinder — the axis edge sweeps to the cylinder centerline.
+        // After the REVOLVE-POLE relaxation this is an axis TOUCH, not a
+        // self-intersection, so it must NOT register.
         let mut model = BRepModel::new();
         let edges = make_on_axis_rectangle(&mut model);
         let face_id = create_face_from_profile(&mut model, edges).expect("face");
         let face = model.faces.get(face_id).expect("face").clone();
         let result =
             face_intersects_axis(&model, &face, Point3::ZERO, Vector3::Z).expect("intersect query");
-        assert!(result, "rectangle with vertices on Z axis must register");
+        assert!(
+            !result,
+            "on-axis rectangle revolves to a valid cylinder — axis touch, not a crossing"
+        );
     }
 
     #[test]
@@ -2049,7 +2062,13 @@ mod tests {
     }
 
     #[test]
-    fn revolve_face_rejects_face_intersecting_axis() {
+    fn revolve_face_accepts_on_axis_cylinder_profile() {
+        // An on-axis rectangle (r=0..2, z=0..1) revolves to a VALID solid
+        // cylinder — the axis edge is a pole/centerline touch, not a
+        // self-intersection. After the REVOLVE-POLE relaxation revolve_face must
+        // ACCEPT it (previously wrongly rejected as SelfIntersection). A genuine
+        // axis CROSSING is still rejected — see
+        // face_intersects_axis_pierce_through_interior_detects.
         let mut model = BRepModel::new();
         let edges = make_on_axis_rectangle(&mut model);
         let face_id = create_face_from_profile(&mut model, edges).expect("face");
@@ -2061,7 +2080,10 @@ mod tests {
             ..Default::default()
         };
         let result = revolve_face(&mut model, face_id, opts);
-        assert!(matches!(result, Err(OperationError::SelfIntersection)));
+        assert!(
+            result.is_ok(),
+            "on-axis rectangle must revolve to a valid cylinder, got {result:?}"
+        );
     }
 
     #[test]
