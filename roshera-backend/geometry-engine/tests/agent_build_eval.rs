@@ -997,26 +997,22 @@ fn try_dome(
 }
 
 #[test]
-#[ignore = "REVOLVE-POLE: guard FIXED (revolve now builds the dome as a SOUND solid); the apex BAND mesh still leaves ~147 open edges — needs the 3-edge apex-fan in tessellate_revolution_wedge. Un-ignore when the apex meshes watertight."]
 fn eval_revolved_dome() {
-    // A hemispherical pressure-vessel dome — apex on the axis (r=0). DESIRED end
-    // state: a sound, export-watertight solid of revolution. PROGRESS 2026-06-18:
-    // the REVOLVE-POLE guard relaxation (face_intersects_axis no longer rejects an
-    // axis TOUCH) means `revolve_profile` now ACCEPTS the pole profile and builds
-    // a SOUND solid. REMAINING: the apex BAND is a 3-edge wedge (two meridians
-    // meeting at the pole + one rim arc); `tessellate_revolution_wedge` only
-    // handles the 4-edge quad wedge, so the apex tessellation leaves ~147 open
-    // edges (non-watertight MESH; the B-Rep is sound). Un-ignore when the 3-edge
-    // apex-fan lands.
+    // A hemispherical pressure-vessel dome — apex on the axis (r=0). FIXED
+    // 2026-06-18 (REVOLVE-POLE 2b): the profile's closing edge (0,R)->(0,0) runs
+    // ALONG the axis; revolve used to sweep it into 64 zero-area "fin" faces
+    // (2-edge bigons) the tessellator could not mesh, leaving 147 open edges. The
+    // revolve op now skips wall faces for a both-pole profile edge (it bounds no
+    // surface), so the dome bands + base disc seal on their own — SOUND and mesh-
+    // WATERTIGHT. Solid hemisphere R=40: V = (2/3)*pi*R^3 ~ 134041 (faceted under).
     let mut m = BRepModel::new();
     let dome = try_dome(&mut m, 40.0, 16).expect("dome revolve (apex on axis)");
-    assert_sound(&m, dome, "hemispherical dome (pole)");
+    verify_comprehensive(&m, dome, "hemispherical dome (pole)", 120_000.0, 135_000.0);
     let d = world_dims(&m, dome);
     assert!(
         (d[0] - 80.0).abs() < 1.0 && (d[2] - 40.0).abs() < 0.5,
         "dome envelope wrong: {d:?}"
     );
-    assert_eye_agrees(&m, dome, "hemispherical dome");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

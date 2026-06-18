@@ -223,6 +223,24 @@ pub fn tessellate_face(
             // triangle, a slanted unequal-radius wedge) falls back to the
             // generic planar-or-curved-CDT routing the `_` arm uses.
             if !tessellate_revolution_wedge(face, model, cache, mesh) {
+                if std::env::var("ROSHERA_WEDGE_TRACE").is_ok() {
+                    let ne = model
+                        .loops
+                        .get(face.outer_loop)
+                        .map(|l| l.edges.len())
+                        .unwrap_or(0);
+                    let pl = surface.is_planar(Tolerance::new(
+                        params.chord_tolerance,
+                        params.max_angle_deviation,
+                    ));
+                    eprintln!(
+                        "[revfall] face {} edges={} planar={} inner={}",
+                        face.id,
+                        ne,
+                        pl,
+                        face.inner_loops.len()
+                    );
+                }
                 let planar_tol = Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
                 if surface.is_planar(planar_tol)
                     || is_face_loop_planar_in_3d(face, model, cache, planar_tol)

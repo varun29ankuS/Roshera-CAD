@@ -672,14 +672,36 @@ now has a 3-EDGE branch — the dome has 128 three-edge wedges (64 apex ["2","41
 param triangulation (verified 64×40 + 64×4 tris, reusing exact cache samples ->
 seam-watertight). NO REGRESSION: revolve_watertight 7/7, primitive_tess (sphere
 poles) 1/1, agent_build_eval 15/2.
-REMAINING (🔴 PART 2b — CORRECTS slice-8's assumption): the dome is STILL 147 open
-+ 20 nm with a caught cdt panic (triangulate.rs:927 'edge_ba.buddy'), and the
-apex-fan changed that count by ZERO — so the 147 open are NOT the apex (the 3-edge
-wedges mesh fine). The real source is elsewhere: the 4-EDGE body bands or the
-angular seams, and a cdt panic on some non-apex face. eval_revolved_dome stays
-#[ignore]'d. NEXT slice = DIAGNOSE which faces/edges are open (per-face open-edge
-attribution + which face hits the cdt panic at :927), then fix THAT. The SOLID is
-sound; only the mesh is non-watertight.
+PART 2b — ✅ FIXED 2026-06-18 (commit pending): the dome is now SOUND + mesh-
+WATERTIGHT (manifold 0/0) and passes the full 6-channel verify_comprehensive +
+envelope; eval_revolved_dome UN-IGNORED and is a permanent roster gate. NO
+REGRESSION: revolve_watertight 7/7, revolve_validity 4/4, revolve_volume 14/14,
+primitive_tess_watertight 1/1, agent_build_eval 16/0 (+1 ignored = cone-mesh),
+lib revolve 32/0. THE FIX (upstream in the revolve OP, revolve.rs ~337): skip wall
+faces for a profile edge whose BOTH endpoints are poles (`if apex[&sp] &&
+apex[&ep] { continue; }`) — such an edge runs along the axis and bounds no surface;
+the dome bands + base disc converge to the shared pole vertices and seal without it.
+DIAGNOSIS that led here (env trace `ROSHERA_WEDGE_TRACE=1`, [revfall] in surface.rs):
+the 147 open + 20 nm + 1 cdt panic came from **64 TWO-EDGE SurfaceOfRevolution faces** (NOT the apex
+3-edge wedges — those mesh fine; NOT the 4-edge bands). Env-gated trace
+(`ROSHERA_WEDGE_TRACE=1`, [revfall] in surface.rs SurfaceOfRevolution arm) shows
+exactly 64 faces fall through tessellate_revolution_wedge with `edges=2
+planar=false inner=0`; 54 of them then hit curved_cdt Err (FALLBACK revolution ->
+emits NOTHING) and 1 hits the cdt panic at triangulate.rs:927 'edge_ba.buddy'.
+A 2-edge loop is a degenerate BIGON: these are the dome profile's CLOSING AXIS EDGE
+`(0,R)->(0,0)` (lies ON the revolve axis, r=0) swept by each of the 64 angular
+segments into a ZERO-AREA "fin" on the axis. curved-CDT can't triangulate a
+zero-area face -> emits nothing -> the fins' axis edges are covered by 0 triangles
+-> 147 open. The SOLID is sound (B-rep valid); only the mesh leaks at the axis.
+ROOT CAUSE IS UPSTREAM IN THE REVOLVE OP, NOT TESSELLATION: revolve should NOT
+generate faces (nor the spurious axis edges) for a profile edge that lies along the
+axis — it sweeps nothing. NEXT slice = fix the REVOLVE OPERATION to detect an
+axis-coincident profile edge and skip face/edge generation for it (the closing axis
+segment of a pole profile), then the dome surface + base disc seal on their own.
+eval_revolved_dome stays #[ignore]'d until then. (Tessellation band-aid — a 2-edge
+"emit nothing + return true" branch — would silence the panic but NOT close the 147
+open, since the open edges ARE the fins' axis edges that need 2 covering tris each
+and a zero-area fin can never provide them; the fins must not exist.)
 
 (orig two-part spec below.)
 
