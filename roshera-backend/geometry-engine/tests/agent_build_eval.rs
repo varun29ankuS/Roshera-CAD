@@ -1018,3 +1018,77 @@ fn eval_revolved_dome() {
     );
     assert_eye_agrees(&m, dome, "hemispherical dome");
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// GENERATIVE BUILD-AND-VERIFY (2026-06-18, Varun's steer): build complicated
+// parts and run each through ONE comprehensive, automatic verification bundle.
+// A part that passes is a permanent gate; a part that fails pinpoints the broken
+// channel and is pinned #[ignore]'d as a surfaced bug. This IS the
+// automatic + comprehensive verification layer.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The comprehensive verifier. Every built solid must pass ALL channels; the
+/// panic names the channel so a failure says exactly what broke.
+fn verify_comprehensive(m: &BRepModel, sid: SolidId, label: &str, vol_lo: f64, vol_hi: f64) {
+    // (1) B-REP SOUND — the authoritative closed-manifold verdict.
+    let v = validate_solid_scoped(m, sid, Tolerance::default(), ValidationLevel::Standard);
+    assert!(
+        v.is_valid,
+        "[{label}] CHANNEL=sound: B-Rep INVALID: {:?}",
+        v.errors
+    );
+
+    // (2) MESH WATERTIGHT — export/display mesh has no boundary or non-manifold
+    // edges (catches dropped faces, seam T-junctions, apex holes).
+    let mr = manifold_report(m, sid, 0.5, 1e-6)
+        .unwrap_or_else(|| panic!("[{label}] CHANNEL=watertight: no manifold report"));
+    assert_eq!(
+        (mr.boundary_edges, mr.nonmanifold_edges),
+        (0, 0),
+        "[{label}] CHANNEL=watertight: open={} nonmanifold={}",
+        mr.boundary_edges,
+        mr.nonmanifold_edges
+    );
+
+    // (3) VOLUME / EFFECT — the mesh integrates to the expected volume range.
+    // This is the channel that caught "the bore removed zero material".
+    let vol = mesh_volume(m, sid);
+    assert!(
+        (vol_lo..=vol_hi).contains(&vol),
+        "[{label}] CHANNEL=volume: mesh volume {vol:.1} outside [{vol_lo:.1}, {vol_hi:.1}]"
+    );
+
+    // (4) AGENT-EYE AGREES — perceived dims match the B-Rep envelope and the
+    // face accounting is an exact partition.
+    assert_eye_agrees(m, sid, label);
+}
+
+/// ROSTER part: a 3-step coaxial shaft (stacked cylinders, decreasing radius,
+/// unioned) — a stock turned-shaft shape. Exercises chained coaxial unions and
+/// the annular shoulder faces they create.
+#[test]
+fn gen_stepped_shaft() {
+    let mut m = BRepModel::new();
+    let s1 = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 20.0, 30.0);
+    let s2 = cyl(&mut m, Point3::new(0.0, 0.0, 30.0), 14.0, 30.0);
+    let s3 = cyl(&mut m, Point3::new(0.0, 0.0, 60.0), 8.0, 30.0);
+    let shaft = union(&mut m, s1, s2);
+    let shaft = union(&mut m, shaft, s3);
+    // V = π·30·(20² + 14² + 8²) = π·30·660 ≈ 62204; mesh facets undershoot a bit.
+    verify_comprehensive(&m, shaft, "stepped shaft", 59_000.0, 63_000.0);
+}
+
+/// ROSTER part: an 80×80×20 plate with a counterbored bolt hole (Ø12 through +
+/// Ø24 counterbore 10 deep) — a standard machined cap feature. Exercises chained
+/// coaxial DIFFERENCES making a stepped cylindrical bore + an annular shoulder.
+#[test]
+fn gen_counterbored_plate() {
+    let mut m = BRepModel::new();
+    let plate = box_solid(&mut m, 80.0, 80.0, 20.0); // centred z[-10,10]
+    let through = cyl(&mut m, Point3::new(0.0, 0.0, -15.0), 6.0, 30.0); // Ø12 through
+    let cbore = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 12.0, 15.0); // Ø24 c'bore (top half)
+    let p = diff(&mut m, plate, through);
+    let p = diff(&mut m, p, cbore);
+    // V = 80·80·20 − π·6²·20 − π·(12²−6²)·10 ≈ 122_345; bore facets undershoot.
+    verify_comprehensive(&m, p, "counterbored plate", 120_000.0, 124_000.0);
+}
