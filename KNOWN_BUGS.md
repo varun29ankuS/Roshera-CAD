@@ -578,6 +578,25 @@ guard: `box_boss_coincident_base_union_valid_32`. Verified no regression across
 118 boolean lib + poke + volume + adversarial + determinism + oracle +
 HARNESS-1000.
 
+### ROSTER (gen_flanged_housing) 🟡 coincident-union result is SOUND but its MESH leaks (2026-06-18)
+Surfaced by the generative harness. A flanged housing built as flange (Ø100×15,
+z[0,15]) + body (Ø50, base EXACTLY z=15 on the flange top) — i.e. a coincident
+mating face — unions to a SOUND B-Rep (#32's Same-Domain cull holds: CHANNEL=sound
+PASSES) but the TESSELLATION leaks badly: CHANNEL=watertight open=1884 nm=0 + a
+cdt panic at triangulate.rs:965 ('failed to create fixed edge'). So #32 fixed the
+coincident-union B-REP validity but the resulting scar/annular faces still don't
+MESH watertight — a tessellation gap #32's verification (B-rep/volume only, never
+mesh) never measured. Same cdt:965 annular-cap family as the bored-flange cone-mesh
+bug. WORKAROUND (and the correct model): INTERPENETRATE — body base z=5 INSIDE the
+flange (z[5,15] overlap doesn't double-count, so volume is identical) → open=0, all
+6 channels green. gen_flanged_housing is a permanent gate built this way. The
+coincident-MESH leak stays open (deep tessellation family; the interpenetrating
+build is how a real casting is modeled anyway). NOTE: the interpenetrating build
+ALSO trips a cdt:965 panic on one annular cap, but it is CAUGHT and the cap
+RECOVERED via the planar fallback (watertight + no-dropped-faces both pass) — unlike
+the cone case where recovery fails. The latent annular-cap cdt:965 fragility is the
+through-line of both.
+
 ### #27 🟢 Coaxial stacked-step union left buried cap
 Fixed via annular face-with-hole interior-point. See boolean campaign.
 
