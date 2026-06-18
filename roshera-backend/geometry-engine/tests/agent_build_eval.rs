@@ -16,6 +16,7 @@
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Matrix4, Point3, Tolerance, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+use geometry_engine::operations::chamfer::{chamfer_edges, ChamferOptions, ChamferType};
 use geometry_engine::operations::fillet::{fillet_edges, FilletOptions, FilletType};
 use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
 use geometry_engine::operations::transform::{transform_solid, TransformOptions};
@@ -1417,4 +1418,44 @@ fn gen_filleted_block() {
         "filleted-block envelope wrong: {d:?}"
     );
     assert_recognizes_bore(&m, holed, 20.0, 1, "filleted block");
+}
+
+/// ROSTER part: a chamfered block — a 60×60×40 box with its FOUR vertical edges
+/// beveled (5 mm equal-distance chamfer) then a Ø20 through-bore. Exercises the
+/// CHAMFER op (sibling of fillet; flat-bevel faces, a distinct splice/tessellation
+/// path) — blend-on-clean-geometry recipe: chamfer first, then bore.
+#[test]
+fn gen_chamfered_block() {
+    let mut m = BRepModel::new();
+    let block = box_solid(&mut m, 60.0, 60.0, 40.0);
+    let edges = vertical_edges(&m, block);
+    assert_eq!(
+        edges.len(),
+        4,
+        "expected 4 vertical box edges, got {edges:?}"
+    );
+    chamfer_edges(
+        &mut m,
+        block,
+        edges,
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(5.0),
+            distance1: 5.0,
+            distance2: 5.0,
+            symmetric: true,
+            ..Default::default()
+        },
+    )
+    .expect("chamfer 4 vertical edges (5mm)");
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -25.0), 10.0, 50.0); // Ø20 through
+    let holed = diff(&mut m, block, bore);
+    // V = 60·60·40 − 4·(½·5²·40) − π·10²·40 = 144000 − 2000 − 12566 = 129434;
+    // chamfer bevels are planar (exact), the bore facets undershoot slightly.
+    verify_comprehensive(&m, holed, "chamfered block", 128_000.0, 131_000.0);
+    let d = world_dims(&m, holed);
+    assert!(
+        (d[0] - 60.0).abs() < 0.5 && (d[1] - 60.0).abs() < 0.5 && (d[2] - 40.0).abs() < 0.5,
+        "chamfered-block envelope wrong: {d:?}"
+    );
+    assert_recognizes_bore(&m, holed, 20.0, 1, "chamfered block");
 }
