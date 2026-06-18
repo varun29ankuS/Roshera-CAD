@@ -1216,6 +1216,18 @@ fn surface_surface_intersection(
         (Cone, Sphere) | (Sphere, Cone) => {
             cone_sphere_intersection(surface_a, surface_b, tolerance)
         }
+        // A PLANE cutting a general (NURBS / freeform) surface — the F1
+        // cockpit-cut case. The intersection is the zero-set of the scalar
+        // field d(u,v) = (S(u,v) - p0)·n over the general surface's parameter
+        // domain, which `intersect_surface_plane` traces robustly
+        // (marching-squares seeds + predictor-corrector). This is far more
+        // reliable than the generic surface×surface marcher, which grid-samples
+        // BOTH surfaces and routinely misses thin plane∩freeform curves —
+        // leaving the freeform face un-split and the boolean rejecting the
+        // result. Routing the plane case here is the fix for #17.
+        (Planar, Other) | (Other, Planar) => {
+            plane_general_intersection(surface_a, surface_b, tolerance)
+        }
         _ => {
             use crate::primitives::surface::SurfaceType;
             if matches!(
@@ -1224,9 +1236,8 @@ fn surface_surface_intersection(
             ) {
                 return plane_torus_intersection(surface_a, surface_b, tolerance);
             }
-            // No closed-form handler covers this pair (e.g. NURBS,
-            // RuledSurface that isn't planar). Marching solver is the
-            // last resort.
+            // No closed-form handler covers this pair (e.g. NURBS×NURBS,
+            // NURBS×Cylinder). Marching solver is the last resort.
             march_surface_intersection(surface_a, surface_b, tolerance)
         }
     }
@@ -1263,6 +1274,94 @@ fn analytical_surface_kind(surface: &dyn Surface, tolerance: &Tolerance) -> Anal
             }
         }
     }
+}
+
+/// Intersect a PLANE with a general (NURBS/freeform) surface by tracing the
+/// zero-set of the signed plane-distance field over the general surface's
+/// parameter domain. Uses `math::surface_plane_intersection` (marching-squares
+/// seeds + predictor-corrector), which is robust where the generic dual-surface
+/// marcher is not. Returns one [`SurfaceIntersectionCurve`] per traced branch.
+fn plane_general_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    use crate::math::surface_plane_intersection::{
+        intersect_surface_plane, SurfacePlaneIntersectionConfig,
+    };
+
+    // Identify the planar side. Exactly one of the pair is planar here (the
+    // (Planar, Planar) case is handled by plane_plane_intersection upstream).
+    let a_is_plane = surface_a.is_planar(*tolerance);
+    let b_is_plane = surface_b.is_planar(*tolerance);
+    let (plane, general, general_is_a) = match (a_is_plane, b_is_plane) {
+        (true, false) => (surface_a, surface_b, false),
+        (false, true) => (surface_b, surface_a, true),
+        // Neither (or both) planar — not our case; fall back to marching.
+        _ => return march_surface_intersection(surface_a, surface_b, tolerance),
+    };
+
+    // Plane through `evaluate_full(0,0)` (position + normal are constant on a
+    // plane regardless of the (u,v) chosen).
+    let pe = plane.evaluate_full(0.0, 0.0)?;
+    let plane_origin = pe.position;
+    let plane_normal = pe.normal;
+
+    // Search the general surface's real parameter domain; scale the grid +
+    // marching step to it. A denser grid than the generic marcher's default
+    // (48² vs 20²) makes thin/curved intersections reliable without being
+    // expensive (one scalar eval per node).
+    let ((u0, u1), (v0, v1)) = general.parameter_bounds();
+    let span_u = (u1 - u0).abs().clamp(1e-6, 1e6);
+    let span_v = (v1 - v0).abs().clamp(1e-6, 1e6);
+    let config = SurfacePlaneIntersectionConfig {
+        tolerance: *tolerance,
+        grid_resolution: 48,
+        marching_step: span_u.min(span_v) / 200.0,
+        max_curves: 64,
+        param_bounds_override: Some(((u0, u1), (v0, v1))),
+    };
+
+    let branches = intersect_surface_plane(general, plane_origin, plane_normal, &config)?;
+
+    let mut out = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if branch.points.len() < 2 {
+            continue;
+        }
+        let mut pts = Vec::with_capacity(branch.points.len());
+        let mut general_params = Vec::with_capacity(branch.points.len());
+        let mut plane_params = Vec::with_capacity(branch.points.len());
+        for p in &branch.points {
+            let gp = (p.u, p.v);
+            // Plane params are dropped downstream (classification reads only the
+            // 3D curve); compute a best-effort (u,v) so the parametric curve is
+            // well-formed.
+            let pp = plane
+                .closest_point(&p.position, *tolerance)
+                .unwrap_or((0.0, 0.0));
+            let (pa, pb) = if general_is_a { (gp, pp) } else { (pp, gp) };
+            pts.push(IntersectionPoint {
+                position: p.position,
+                params_a: pa,
+                params_b: pb,
+            });
+            general_params.push(gp);
+            plane_params.push(pp);
+        }
+        let curve = fit_curve_to_points(&pts, tolerance)?;
+        let (params_a, params_b) = if general_is_a {
+            (general_params, plane_params)
+        } else {
+            (plane_params, general_params)
+        };
+        out.push(SurfaceIntersectionCurve {
+            curve,
+            on_surface_a: create_parametric_curve(&params_a),
+            on_surface_b: create_parametric_curve(&params_b),
+        });
+    }
+    Ok(out)
 }
 
 /// Marching algorithm for surface intersection
