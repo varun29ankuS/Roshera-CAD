@@ -654,6 +654,26 @@ for axial planes. Gate `axial_cylinder_section_through_seam_85c`. KNOWN remainin
 oblique vertical planes (nz=0, off-seam) still 0 caps — separate pre-existing
 marching-grid limitation.
 
+### REVOLVE axis-touch 🟡 PART 1 (guard) FIXED 2026-06-18; PART 2 (apex mesh) open
+**SLICE-8 (2026-06-18): GUARD relaxation SHIPPED.** `face_intersects_axis`
+(revolve.rs ~1547) no longer rejects an axis TOUCH: dropped the vertex-on-axis
+(~1586) and edge-sample-r<tol (~1604) touch-rejects, and guarded the sign-flip
+CROSSING test on BOTH samples strictly off-axis (prev_r.mag>tol && r.mag>tol &&
+dot<0). The planar interior-pierce test is unchanged. So a pole profile (quarter-
+disk dome, hemisphere) or an on-axis rectangle (-> solid cylinder) is now
+ACCEPTED and builds a SOUND solid; a genuine axis crossing is still rejected.
+Updated 2 unit tests (on_axis_rectangle now does_NOT_intersect; revolve_face
+ACCEPTS the on-axis cylinder profile). NO REGRESSION: revolve_watertight 7/7,
+revolve_validity_invariants 4/4, revolve_volume_invariants 14/14,
+primitive_tess_watertight 1/1 (sphere poles fine), lib revolve 26/0,
+agent_build_eval 12/2. REMAINING (🔴 PART 2): the apex BAND mesh leaves ~147 open
++ 20 nm edges (eval_revolved_dome still #[ignore]'d) — the apex is a 3-edge wedge
+(2 meridians meeting at the pole + 1 rim arc) and tessellate_revolution_wedge
+only handles the 4-edge quad; needs the 3-edge apex-fan. The SOLID is sound; only
+the apex MESH is open. NEXT slice = the apex-fan.
+
+(orig two-part spec below.)
+
 ### REVOLVE axis-touch 🔴 profiles with a pole (r=0) reject — TWO-PART FIX SPEC (2026-06-17)
 **Investigated + scoped (experiment reverted to avoid shipping leaky domes):** the
 fix is TWO parts that MUST land together:
