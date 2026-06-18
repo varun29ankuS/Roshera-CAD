@@ -6,7 +6,8 @@
 use geometry_engine::math::Vector3;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::queries::select::{
-    resolve_face, Extremal, FaceQuery, SelectError, SurfaceKind,
+    resolve_edge, resolve_face, CurveKind, EdgeExtremal, EdgeQuery, Extremal, FaceQuery,
+    SelectError, SurfaceKind,
 };
 
 fn box_solid(m: &mut BRepModel, w: f64, h: f64, d: f64) -> u32 {
@@ -89,4 +90,30 @@ fn extremal_breaks_ties_but_still_refuses_a_true_tie() {
         ),
         "a cube's faces all tie → refuse"
     );
+}
+
+#[test]
+fn edge_selection_resolves_or_refuses() {
+    let mut m = BRepModel::new();
+    let s = box_solid(&mut m, 40.0, 30.0, 20.0);
+
+    // The 4 vertical (parallel-to-Z) edges → ambiguous without a tie-break.
+    let vertical = EdgeQuery::new(CurveKind::Line).along(Vector3::Z);
+    match resolve_edge(&mut m, s, &vertical) {
+        Err(SelectError::Ambiguous(c)) => assert_eq!(c.len(), 4, "a box has 4 vertical edges"),
+        other => panic!("expected Ambiguous(4), got {other:?}"),
+    }
+
+    // The vertical edge nearest the +X+Y corner → unique.
+    let corner = EdgeQuery::new(CurveKind::Line)
+        .along(Vector3::Z)
+        .extremal(EdgeExtremal::MostAlong(Vector3::new(1.0, 1.0, 0.0)));
+    assert!(
+        resolve_edge(&mut m, s, &corner).is_ok(),
+        "the +X+Y vertical edge is unique"
+    );
+
+    // No arc edges on a box → NotFound.
+    let arc = EdgeQuery::new(CurveKind::Arc);
+    assert_eq!(resolve_edge(&mut m, s, &arc), Err(SelectError::NotFound));
 }
