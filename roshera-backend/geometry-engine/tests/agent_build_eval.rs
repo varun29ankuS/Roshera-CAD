@@ -1301,3 +1301,33 @@ fn gen_pipe_tee() {
         "pipe-tee envelope wrong: {d:?}"
     );
 }
+
+/// ROSTER part: a bolt-circle flange — a Ø160 disc with a Ø40 centre bore and a
+/// ring of SIX Ø12 bolt holes on a Ø120 PCD. All-planar caps but the top/bottom
+/// faces become a 7-hole annulus (centre + 6 on the circle) — exercises chained
+/// coaxial + off-axis Differences and multi-hole planar-cap tessellation AT SCALE
+/// (slice-5 proved one offset hole on an annulus meshes; this checks six at once).
+#[test]
+fn gen_bolt_circle_flange() {
+    let mut m = BRepModel::new();
+    let mut flange = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 80.0, 20.0); // Ø160 × 20
+    let center = cyl(&mut m, Point3::new(0.0, 0.0, -5.0), 20.0, 30.0); // Ø40 through
+    flange = diff(&mut m, flange, center);
+    for i in 0..6 {
+        let a = i as f64 * std::f64::consts::FRAC_PI_3; // 60° spacing
+        let (bx, by) = (60.0 * a.cos(), 60.0 * a.sin()); // Ø120 PCD = r60
+        let hole = cyl(&mut m, Point3::new(bx, by, -5.0), 6.0, 30.0); // Ø12 through
+        flange = diff(&mut m, flange, hole);
+    }
+    // V = π·80²·20 − π·20²·20 − 6·π·6²·20 = 402124 − 25133 − 13572 = 363419;
+    // cylinder facets undershoot the disc rim (less) and the bores (less removed).
+    verify_comprehensive(&m, flange, "bolt-circle flange", 350_000.0, 366_000.0);
+    let d = world_dims(&m, flange);
+    assert!(
+        (d[0] - 160.0).abs() < 2.0 && (d[1] - 160.0).abs() < 2.0 && (d[2] - 20.0).abs() < 0.5,
+        "bolt-circle flange envelope wrong: {d:?}"
+    );
+    // SEMANTIC: the eye must recognize all six Ø12 bolt holes + the Ø40 centre bore.
+    assert_recognizes_bore(&m, flange, 12.0, 6, "bolt-circle flange");
+    assert_recognizes_bore(&m, flange, 40.0, 1, "bolt-circle flange");
+}
