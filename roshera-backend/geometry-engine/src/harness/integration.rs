@@ -79,8 +79,13 @@ impl FullContract {
         if !self.mesh_manifold {
             f.push("manifold_report: mesh not closed/oriented/manifold");
         }
-        if self.euler_characteristic != 2 {
-            f.push("manifold_report: euler characteristic ≠ 2 (genus-0 expected)");
+        // Euler-Poincaré for a closed orientable 2-manifold: χ = 2 − 2g, so a
+        // VALID solid has χ even and ≤ 2 (genus g ≥ 0). A bored plate / torus is
+        // genuinely genus-1 (χ = 0) and must NOT be flagged broken — only an ODD
+        // χ or χ > 2 is topologically impossible for a closed manifold (the real
+        // defect signal; a missing/duplicated face or open boundary).
+        if self.euler_characteristic % 2 != 0 || self.euler_characteristic > 2 {
+            f.push("manifold_report: euler characteristic not a valid closed-manifold value (odd or > 2)");
         }
         if !self.volume_watertight {
             f.push("is_watertight: mesh volume ≠ analytic volume (leak/flip)");
