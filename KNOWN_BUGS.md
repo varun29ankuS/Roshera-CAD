@@ -68,6 +68,23 @@ degeneracy is its own curved-CDT robustness bug (dedup the contour / pick a
 non-degenerate projection / skip true slivers). Diagnostic kept (env-gated
 ROSHERA_TESS_TRACE). Repro unchanged.
 
+SLICE-5 (2026-06-18): CORRECTS slice-4's "separate" guess — the two issues are
+CONNECTED. B-Rep face dump (FLANGE-DIAG, env-gated in agent_build_eval) PROVES
+the bolt hole IS correctly imprinted: flange-top Plane face (z=200) has inner
+loops r=35 (central) + **r=4 @ (50,0) = bolt**; flange-bottom Plane (z=178) has
+r=43 + **r=4 @ (50,0)**. Both planar faces mesh WITHOUT panic, so the hole is
+present in the mesh. Therefore the volume error is NOT a missing hole — it is the
+4 CONE-band panics' fallback adding spurious volume that MASKS the correct bore:
+chamber 507_755 − 1_105 (bore) + ~1_529 (cone-panic over-cover) = 508_179 (the
+observed bored mesh vol). So fixing `bore_into_revolved_flange_mesh_reflects_hole`
+REQUIRES fixing the cone-band degenerate-UV-projection panic (slice-4 root
+cause) — it is the real blocker, not a side issue. NEXT: fix the cone-band UV
+degeneracy so those faces mesh correctly (no fallback over-cover); then the bore
+volume will drop ~1.1k and the repro passes. Approaches: detect the collapsed-UV
+contour in curved_cdt and (a) dedup+rebuild the contour, (b) re-project on a
+better axis (face normal-aligned basis), or (c) if it is a true zero-area sliver,
+emit nothing rather than an untrimmed over-cover.
+
 (Original report below — the abort/crash mechanism, now fixed.)
 
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
