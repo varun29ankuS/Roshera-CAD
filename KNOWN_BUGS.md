@@ -42,6 +42,18 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   exact modes that become defective manufactured parts). Golden-file regression
   so a fix never silently breaks a working case. Extend HARNESS-1000 + the
   existing oracles, don't restart.
+  **PROGRESS (2026-06-18):** (1) `tests/golden_contracts.rs` golden regression on
+  canonical parts (green) — it CAUGHT + fixed an over-strict invariant
+  (`full_contract` Euler check assumed genus-0; a bored plate is genus-1/χ=0 →
+  now genus-aware). (2) `tests/op_sequence_fuzz.rs` randomized op-SEQUENCE fuzz
+  cross-checking PILLAR 1: every result of a random single-boolean composition
+  must carry provenance + certify sound + pass the structural bundle (green, 24
+  cases, ~190s). It REDISCOVERED a real bug: CHAINED unions (a union onto a
+  boolean RESULT) go unsound — `box ∪ cyl` is sound, `box ∪ cyl ∪ cyl` is not =
+  the deep #27 chained-union family; pinned `#[ignore]`'d as
+  `chained_unions_should_stay_sound`. REMAINING: self-intersection invariant
+  (no kernel-wide check exists — also the certificate's one gap; needs a
+  triangle-triangle test), true golden-FILE snapshots, deeper fuzz once #27 lands.
 - **PILLAR 3 — Persistent semantic naming = the moat (🔴, #15).** Stable
   topological IDs surviving upstream edits + reference-by-description ("largest
   +Z planar face", "fillet on the top-rear edge") + a kernel that REFUSES an
