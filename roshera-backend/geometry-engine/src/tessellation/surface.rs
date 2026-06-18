@@ -144,6 +144,13 @@ pub fn tessellate_face(
                 // mass properties stay correct (at the cost of possible seam
                 // T-junctions on export, far less harmful than a 3× volume
                 // error).
+                if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                    eprintln!(
+                        "[tess] FALLBACK cylinder face {:?}: curved_cdt {:?} -> UNTRIMMED grid \
+                         (ignores boolean trim/holes; covers the bore — #24)",
+                        face.id, e
+                    );
+                }
                 tracing::warn!(
                     "curved_cdt failed for cylinder face {:?}: {:?}; falling back to grid",
                     face.id,
@@ -224,6 +231,13 @@ pub fn tessellate_face(
                 } else if let Err(e) = super::curved_cdt::tessellate_curved_cdt(
                     surface, face, model, params, cache, mesh,
                 ) {
+                    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                        eprintln!(
+                            "[tess] FALLBACK revolution face {:?}: grid declined + curved_cdt {:?} \
+                             -> emitted NOTHING (#24)",
+                            face.id, e
+                        );
+                    }
                     tracing::warn!(
                         "revolution wedge: grid declined and curved_cdt failed for face {:?}: {:?}",
                         face.id,
@@ -3020,6 +3034,13 @@ fn tessellate_conical_face(
         if let Err(e) =
             super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
         {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[tess] FALLBACK cone face {:?}: curved_cdt {:?} -> UNTRIMMED grid \
+                     (ignores boolean trim/holes; covers the bore — #24)",
+                    face.id, e
+                );
+            }
             tracing::warn!(
                 "curved_cdt failed for cone frustum face {:?}: {:?}; falling back to grid",
                 face.id,

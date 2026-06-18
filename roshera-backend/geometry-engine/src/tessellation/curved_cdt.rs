@@ -627,7 +627,18 @@ fn run_cdt(
             Ok((pts2d, triangles))
         }
         Ok(Err(e)) => Err(CurvedCdtError::CdtFailed(e)),
-        Err(_) => Err(CurvedCdtError::CdtPanicked),
+        Err(_) => {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[tess] run_cdt PANICKED: pts={} contours={} (outer + {} inner) steiner={} (#24)",
+                    pts2d.len(),
+                    contours.len(),
+                    inner_uvs.len(),
+                    steiner.len()
+                );
+            }
+            Err(CurvedCdtError::CdtPanicked)
+        }
     }
 }
 

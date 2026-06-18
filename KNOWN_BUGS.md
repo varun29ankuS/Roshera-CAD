@@ -28,6 +28,25 @@ dig is WHICH face drops the hole and why the fallback plugs it. Pinned repro
 bored mesh vol must drop ~1.1k vs the chamber. LESSON (again): watertight ≠
 correct — only the VOLUME/effect check caught the dropped hole.
 
+SLICE-3 LOCALIZATION (2026-06-18, ROSHERA_TESS_TRACE instrumentation added to
+`curved_cdt::run_cdt` + the cylinder/cone/revolution fallbacks): the 4 panics
+are caught in `curved_cdt::run_cdt` with `pts≈295 contours=1 (outer + 0 INNER)
+steiner≈253` — i.e. on a curved face with a SINGLE outer boundary and NO holes,
+heavily refined (~253 Steiner points). "Failed to create fixed edge" = a STEINER
+point lands on the OUTER boundary fixed edge. The Steiner candidate filter
+(curved_cdt.rs ~543-575) rejects points near INNER edges (`near_inner_edge`) but
+NOT near the OUTER boundary — so a near-outer Steiner triggers the cdt panic.
+These are the bore-modified CONE nozzle-band faces (NOT the bolt faces; the bolt
+hole is on PLANAR flange faces which meshed without panic). BORE-INDUCED: a clean
+revolve / bell nozzle has 0 such panics. Numbers: chamber MESH vol 507_755,
+bored MESH vol 508_179 (the bore ADDED +424 instead of removing ~1.1k → off by
+~+1.5k). NOTE: the cylinder/cone/SoR UNTRIMMED-grid fallbacks did NOT fire for
+these — so `tessellate_curved_cdt` swallows `CdtPanicked` internally (retry/
+partial) and emits the wrong-covering tris; tracing THAT is the next dig. FIX
+candidates: (1) add a `near_outer_edge` Steiner reject symmetric to
+`near_inner_edge` so cdt never gets a boundary-coincident Steiner; (2) make the
+post-panic path trim-aware instead of over-covering. Repro unchanged.
+
 (Original report below — the abort/crash mechanism, now fixed.)
 
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
