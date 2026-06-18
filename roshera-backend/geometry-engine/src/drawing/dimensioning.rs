@@ -299,10 +299,29 @@ fn build_hlr_view(
 
     let mut view = project_solid_view(model, source, proj, name, pos, scale)?;
     let edges = project_solid_edges_visibility(model, solid_id, proj, DEFAULT_CURVE_SAMPLES)?;
-    view.polylines = edges.visible;
-    view.hidden_polylines = edges.hidden;
-    view.circles = select_circles(edges.circles);
-    view.hidden_circles = select_circles(edges.hidden_circles);
+    if matches!(proj, ProjectionType::Isometric) {
+        // The isometric is a PICTORIAL reference, drawn as a clean solid
+        // wireframe. Per-segment occlusion mis-classifies a curved rim in the
+        // oblique iso view: the rim is mostly near-silhouette (its tangent is
+        // ~perpendicular to the view), where the occlusion raycast grazes the
+        // surface and reports "hidden", so the whole rim renders dashed — an
+        // all-dashed "ghost". Showing every edge solid (the standard isometric
+        // convention, which omits hidden lines) removes the ghost without
+        // relying on the fragile oblique-view occlusion test.
+        let mut all = edges.visible;
+        all.extend(edges.hidden);
+        view.polylines = all;
+        view.hidden_polylines = Vec::new();
+        let mut all_circles = edges.circles;
+        all_circles.extend(edges.hidden_circles);
+        view.circles = select_circles(all_circles);
+        view.hidden_circles = Vec::new();
+    } else {
+        view.polylines = edges.visible;
+        view.hidden_polylines = edges.hidden;
+        view.circles = select_circles(edges.circles);
+        view.hidden_circles = select_circles(edges.hidden_circles);
+    }
     view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
     view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
     Ok(view)
