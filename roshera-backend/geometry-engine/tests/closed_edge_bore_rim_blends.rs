@@ -14,9 +14,9 @@
 //! right kind (Torus / Cone), and leaves the solid B-Rep-valid AND mesh-
 //! watertight. Outer-rim coverage stays in `fillet_closed_edge.rs`.
 //!
-//! Cone-walled rims (Cone±Plane) remain `NotImplemented` (task #89); the
-//! `cone_*` tests below pin that they fail cleanly rather than silently
-//! producing garbage.
+//! Cone-walled rims (Plane–Cone) are now supported too (task #89,
+//! `cone_rim_fillet`): `cone_walled_rim_fillet_succeeds` pins that filleting a
+//! frustum-tube's outer-top rim yields a sound, watertight torus blend.
 
 use std::f64::consts::TAU;
 
