@@ -327,6 +327,81 @@ fn bore_into_revolved_flange_isolates_cdt_panic() {
         "tessellation of the bored revolved flange produced no triangles — \
          the cdt panic was not isolated (or the whole pass was lost)"
     );
+
+    // FLANGE-DIAG (slice-5): does the boolean imprint the bolt hole onto the
+    // PLANAR flange faces? List every Plane face's z, inner-loop count, and each
+    // inner loop's (centre, mean radius). The bolt hole = an inner loop centred
+    // ~(50,0) with r≈4. Env-gated so the gate stays quiet.
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+        let shell_ids: Vec<_> = {
+            let solid = m.solids.get(holed).expect("holed");
+            std::iter::once(solid.outer_shell)
+                .chain(solid.inner_shells.iter().copied())
+                .collect::<Vec<_>>()
+        };
+        let mut face_ids: Vec<_> = Vec::new();
+        for shid in shell_ids {
+            if let Some(sh) = m.shells.get(shid) {
+                face_ids.extend(sh.faces.iter().copied());
+            }
+        }
+        let loop_geom = |lid| -> (Point3, f64, usize) {
+            let lp = match m.loops.get(lid) {
+                Some(l) => l,
+                None => return (Point3::ZERO, 0.0, 0),
+            };
+            let pts: Vec<Point3> = lp
+                .edges
+                .iter()
+                .filter_map(|&eid| m.edges.get(eid))
+                .filter_map(|e| m.vertices.get(e.start_vertex))
+                .map(|v| v.point())
+                .collect();
+            if pts.is_empty() {
+                return (Point3::ZERO, 0.0, 0);
+            }
+            let n = pts.len() as f64;
+            let cx = pts.iter().map(|p| p.x).sum::<f64>() / n;
+            let cy = pts.iter().map(|p| p.y).sum::<f64>() / n;
+            let cz = pts.iter().map(|p| p.z).sum::<f64>() / n;
+            let r = pts
+                .iter()
+                .map(|p| ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt())
+                .sum::<f64>()
+                / n;
+            (Point3::new(cx, cy, cz), r, pts.len())
+        };
+        eprintln!("FLANGE-DIAG: {} faces on bored solid", face_ids.len());
+        for fid in face_ids {
+            let f = match m.faces.get(fid) {
+                Some(f) => f,
+                None => continue,
+            };
+            let kind = m
+                .surfaces
+                .get(f.surface_id)
+                .map(|s| s.type_name())
+                .unwrap_or("?");
+            if kind != "Plane" {
+                continue;
+            }
+            let (oc, _or, on) = loop_geom(f.outer_loop);
+            let inners: Vec<String> = f
+                .inner_loops
+                .iter()
+                .map(|&il| {
+                    let (ic, ir, inn) = loop_geom(il);
+                    format!("inner(c=({:.1},{:.1}) r={:.2} n={})", ic.x, ic.y, ir, inn)
+                })
+                .collect();
+            eprintln!(
+                "FLANGE-DIAG face {fid} Plane z={:.1} outer(n={on}) inner_loops={} {}",
+                oc.z,
+                f.inner_loops.len(),
+                inners.join(" ")
+            );
+        }
+    }
 }
 
 /// #24 SHARPENED (slice-2 finding): slice #1 (`panic=unwind`) makes the bored
