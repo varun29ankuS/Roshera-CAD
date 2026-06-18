@@ -33,8 +33,9 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   `tests/ground_truth.rs` green — a Box now reports `Primitive`/not-designed and a
   NURBS loft reports designed: they are DISTINGUISHABLE (root defect closed for
   these op classes). REMAINING: wire extrude/loft/sweep/fillet/chamfer/shell/
-  transform; self-intersection check; `GET /api/agent/parts/{id}/truth` + fold
-  into `perception_json`; certificate memoisation; carry through deep_clone/snapshot.
+  transform (ALL DONE); self-intersection check (DONE — see Pillar 2);
+  `GET /api/agent/parts/{id}/truth` + `perception_json` provenance (DONE).
+  REMAINING: certificate memoisation; carry provenance through deep_clone/snapshot.
 - **PILLAR 2 — Property/fuzz invariants + golden files (🔴, #14).** Close the
   "renders fine" ≠ "is valid" gap NOW. Randomized op-sequence fuzzing asserting
   manifold / Euler-Poincaré / no self-intersection / no zero-area / tessellation
@@ -51,9 +52,13 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   cases, ~190s). It REDISCOVERED a real bug: CHAINED unions (a union onto a
   boolean RESULT) go unsound — `box ∪ cyl` is sound, `box ∪ cyl ∪ cyl` is not =
   the deep #27 chained-union family; pinned `#[ignore]`'d as
-  `chained_unions_should_stay_sound`. REMAINING: self-intersection invariant
-  (no kernel-wide check exists — also the certificate's one gap; needs a
-  triangle-triangle test), true golden-FILE snapshots, deeper fuzz once #27 lands.
+  `chained_unions_should_stay_sound`. (3) SELF-INTERSECTION invariant DONE:
+  `harness::self_intersection` (segment-triangle Möller–Trumbore + welded-pair-
+  skip + AABB prune) → `ValidityCertificate.self_intersection_free` (in
+  `certify_solid` + `is_sound()`) + `/truth` — closes the certificate's last gap
+  (a valid+watertight solid that geometrically self-overlaps, #70-class, is now
+  caught). REMAINING: true golden-FILE snapshots; add a coarse self-intersection
+  pass to `full_contract`; deeper fuzz once #27 lands.
 - **PILLAR 3 — Persistent semantic naming = the moat (🔴, #15).** Stable
   topological IDs surviving upstream edits + reference-by-description ("largest
   +Z planar face", "fillet on the top-rear edge") + a kernel that REFUSES an
