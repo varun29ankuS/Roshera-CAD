@@ -1150,3 +1150,31 @@ fn gen_pipe_reducer() {
     // wall = outer frustum − inner frustum ≈ 51_836; cone facets undershoot.
     verify_comprehensive(&m, reducer, "pipe reducer", 48_000.0, 53_000.0);
 }
+
+/// ROSTER part: a flanged housing — a Ø50 cylindrical body sitting on a wider
+/// Ø100 base flange (coaxial union), bored through coaxially (Ø30). A bearing-
+/// carrier / pump-housing shape. Exercises a coaxial cylinder union (creating the
+/// flange-to-body annular shoulder) followed by a through-bore that must keep both
+/// the body wall and the flange shoulder.
+#[test]
+fn gen_flanged_housing() {
+    let mut m = BRepModel::new();
+    let flange = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 50.0, 15.0); // Ø100 × 15, z[0,15]
+                                                                      // Body roots INSIDE the flange (base z=5, not z=15) so the two solids
+                                                                      // INTERPENETRATE rather than meet on a coincident face — the live-build recipe
+                                                                      // (coincident mating faces trip the #32 coaxial-union family: a z=15-coincident
+                                                                      // build yields open=1884 + a cdt panic). The z[5,15] overlap doesn't double-
+                                                                      // count, so the union volume is identical to a flush stack.
+    let body = cyl(&mut m, Point3::new(0.0, 0.0, 5.0), 25.0, 60.0); // Ø50 × 60, z[5,65]
+    let housing = union(&mut m, flange, body);
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -5.0), 15.0, 75.0); // Ø30 coaxial through
+    let housing = diff(&mut m, housing, bore);
+    // V = π·50²·15 + π·25²·50 − π·15²·65 ≈ 117810 + 98175 − 45945 = 170040;
+    // cylinder facets undershoot the outer walls AND the bore, net ~within 5%.
+    verify_comprehensive(&m, housing, "flanged housing", 160_000.0, 172_000.0);
+    let d = world_dims(&m, housing);
+    assert!(
+        (d[0] - 100.0).abs() < 1.5 && (d[2] - 65.0).abs() < 1.0,
+        "flanged-housing envelope wrong: {d:?}"
+    );
+}
