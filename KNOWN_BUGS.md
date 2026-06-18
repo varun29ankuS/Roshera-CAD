@@ -106,6 +106,11 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   details in memory `nurbs-corefinement-17`. Touches the core weld path shared by
   ALL booleans → must be done in isolation with tests/poke_matrix green after; not
   a rushed change. Kernel stays HONEST meanwhile (certificate reports unsound).
+  ATTEMPT 1 (2026-06-19, isolated worktree, NOT merged): shared cut-edge ENDPOINT
+  vertices between operands — NO effect (tests still euler=0). ⇒ endpoints aren't
+  the (whole) issue; deeper = open-arc loop closure / full shared-edge imprint.
+  Details + next-trace plan in memory `nurbs-corefinement-17`. Needs a focused
+  human-guided session, not an autonomous pass.
 - 🔴 **Loft surfacing control** (#18) — `skin_surface` bulges at section
   transitions (F1 cockpit/sidepod lumpiness); needs tangency / guide-rail control.
 - 🔴 **Assembly grouping** (#19) — 38 independent solids; wire the assembly module
