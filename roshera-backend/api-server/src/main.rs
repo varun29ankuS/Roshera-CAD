@@ -7136,6 +7136,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(handlers::agent::select_face),
         )
         .route(
+            "/api/agent/parts/{id}/select-edge",
+            post(handlers::agent::select_edge),
+        )
+        .route(
             "/api/agent/pointer",
             get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),
         )
