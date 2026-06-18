@@ -891,6 +891,98 @@ pub async fn select_face(
     }
 }
 
+/// `POST /api/agent/parts/{id}/select-edge` — resolve an edge by DESCRIPTION, or
+/// REFUSE. Body: `{ "curve_kind": "line|arc|circle|nurbs|any", "blend":
+/// "any|filleted|chamfered|unblended", "direction": [x,y,z]?, "angle_tol_deg":
+/// 12?, "extremal": "none|longest|shortest|most_along", "along": [x,y,z]? }`.
+/// 200 → `{edge_id, persistent_id}`; 404 → not found; 409 → ambiguous (candidate
+/// edge ids). Mirrors `select_face`; the kernel never guesses.
+pub async fn select_edge(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::math::Vector3;
+    use geometry_engine::queries::select::{
+        resolve_edge, BlendFilter, CurveKind, EdgeExtremal, EdgeQuery, SelectError,
+    };
+
+    let curve_kind = match body
+        .get("curve_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("any")
+    {
+        "line" => CurveKind::Line,
+        "arc" => CurveKind::Arc,
+        "circle" => CurveKind::Circle,
+        "nurbs" => CurveKind::Nurbs,
+        _ => CurveKind::Any,
+    };
+    let blend = match body.get("blend").and_then(|v| v.as_str()).unwrap_or("any") {
+        "filleted" | "fillet" => BlendFilter::Filleted,
+        "chamfered" | "chamfer" => BlendFilter::Chamfered,
+        "unblended" | "none" => BlendFilter::Unblended,
+        _ => BlendFilter::Any,
+    };
+    let vec3 = |key: &str| -> Option<Vector3> {
+        body.get(key).and_then(|v| v.as_array()).and_then(|a| {
+            if a.len() == 3 {
+                Some(Vector3::new(a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?))
+            } else {
+                None
+            }
+        })
+    };
+    let direction = vec3("direction");
+    let along = vec3("along").or(direction);
+    let extremal = match body
+        .get("extremal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+    {
+        "longest" => EdgeExtremal::Longest,
+        "shortest" => EdgeExtremal::Shortest,
+        "most_along" | "furthest" => EdgeExtremal::MostAlong(along.unwrap_or(Vector3::Z)),
+        _ => EdgeExtremal::None,
+    };
+    let mut q = EdgeQuery::new(curve_kind);
+    q.blend = blend;
+    q.direction = direction;
+    q.extremal = extremal;
+    if let Some(t) = body.get("angle_tol_deg").and_then(|v| v.as_f64()) {
+        q.angle_tol_deg = t;
+    }
+
+    let mut model = model_handle.write().await;
+    match resolve_edge(&mut model, id as SolidId, &q) {
+        Ok(eid) => {
+            let pid = model.edge_pid(eid).map(|p| p.0.to_string());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "resolved": true, "part_id": id, "edge_id": eid, "persistent_id": pid,
+                })),
+            )
+        }
+        Err(SelectError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "resolved": false, "error": "not_found",
+                "message": "no edge matches that description",
+            })),
+        ),
+        Err(SelectError::Ambiguous(candidates)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "resolved": false, "error": "ambiguous",
+                "message": "several edges match equally well — refine the description",
+                "candidates": candidates,
+            })),
+        ),
+    }
+}
+
 // ───────────────────── coverage / ambiguity (EYE-5) ─────────────────
 
 /// `GET /api/agent/parts/{id}/coverage` — EYE-5 honesty protocol.

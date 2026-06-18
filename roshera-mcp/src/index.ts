@@ -297,6 +297,44 @@ server.tool(
 );
 
 server.tool(
+  "select_edge",
+  "Address an EDGE by description — the kernel resolves it or REFUSES. Give a " +
+    "`curve_kind` (line/arc/circle/nurbs), a `blend` filter (filleted/chamfered/" +
+    "unblended — so 'the fillet edge' resolves), an optional `direction` the edge " +
+    "must run along, and an optional `extremal` (longest/shortest/most_along). " +
+    "Returns edge_id + persistent_id, or `ambiguous` (candidate edge_ids) / " +
+    "`not_found`. The kernel never picks among equal matches for you.",
+  {
+    part_id: z.number().int(),
+    curve_kind: z.enum(["any", "line", "arc", "circle", "nurbs"]).default("any"),
+    blend: z.enum(["any", "filleted", "chamfered", "unblended"]).default("any"),
+    direction: z.tuple([z.number(), z.number(), z.number()]).optional(),
+    extremal: z.enum(["none", "longest", "shortest", "most_along"]).default("none"),
+    along: z.tuple([z.number(), z.number(), z.number()]).optional(),
+    angle_tol_deg: z.number().default(12),
+  },
+  async ({ part_id, curve_kind, blend, direction, extremal, along, angle_tol_deg }) => {
+    try {
+      const res = await fetch(`${BASE}/api/agent/parts/${part_id}/select-edge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          curve_kind,
+          blend,
+          direction: direction ?? null,
+          extremal,
+          along: along ?? null,
+          angle_tol_deg,
+        }),
+      });
+      return ok(await res.json());
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "verify_part",
   "SELF-CHECK a part's geometry. The verdict is the SOUND, mesh-independent " +
     "B-Rep check (validate_solid_scoped via /perception): brep_valid is the " +
