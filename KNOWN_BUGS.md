@@ -119,6 +119,21 @@ lower priority than shipped correctness. PIVOTING the loop to the revolve pole
 apex-fan (eval_revolved_dome, #[ignore]'d) — a more self-contained curved item.
 The 6 #24 commits (server-killer fix + full diagnosis) stay on main.
 
+SLICE-8 (2026-06-18): re-audited; re-confirmed slice-6/7 (the scar CONE bands'
+degenerate-UV is the root; `tessellate_conical_face`'s OWN run_cdt path is where
+the fix must go, NOT the generic curved_cdt guards — verified again: a face-level
+trace I added at curved_cdt.rs:1294 NEVER fires for these panics, so they bypass
+the generic Step-0). NEW, SHIPPED: PROVED the bored flange mesh is WATERTIGHT
+(manifold 0/0) at chord 0.5, 0.1 AND 0.02 — the panic-freeze degrades to a
+coarse-but-CLOSED 2-manifold, never a leak. Locked that as a strengthened
+assertion on the (passing) `bore_into_revolved_flange_isolates_cdt_panic` gate.
+So the ONLY remaining defect is the scar bands' AREA/volume (mis-areaed, density-
+dependent), not topology. The volume fix stays a DEDICATED effort on
+`tessellate_conical_face`'s projection (dedup collapsed contour / re-project on a
+face-normal basis / emit-nothing for a true sliver) + full curved-suite
+regression — out of scope for a self-paced slice. `*_mesh_reflects_hole` stays
+#[ignore]'d. Env-gated [curved-cdt] trace kept (useful for generic-path failures).
+
 (Original report below — the abort/crash mechanism, now fixed.)
 
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
