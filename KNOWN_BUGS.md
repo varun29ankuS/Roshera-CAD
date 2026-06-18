@@ -47,6 +47,27 @@ candidates: (1) add a `near_outer_edge` Steiner reject symmetric to
 `near_inner_edge` so cdt never gets a boundary-coincident Steiner; (2) make the
 post-panic path trim-aware instead of over-covering. Repro unchanged.
 
+SLICE-4 (2026-06-18): fix-candidate (1) FAILED — a `near_outer_edge` Steiner
+reject changed NOTHING (panic count 4 → 4, steiner 253 → 253: it rejected ZERO
+candidates), so the panic is NOT a near-boundary Steiner. REVERTED it. Extended
+the run_cdt panic trace with two probes: `on_outer_edge=0` (no point lies ON an
+outer segment → not collinearity) and **`dup_pairs=41 min_pair_dist=4.4e-16`
+with outer=42**. So ~41 of the 42 OUTER contour points are FLOATING-POINT-EXACT
+COINCIDENT in UV: the face's UV projection COLLAPSES nearly the whole outer
+boundary to one location. cdt dedups the coincident points, the outer contour's
+fixed edges collapse to degenerate edges, and it `assert!`s "failed to create
+fixed edge". ROOT CAUSE = a DEGENERATE UV PROJECTION on these boolean-scar cone
+bands (near-zero-area slivers, or a bad projection axis), NOT Steiner placement
+and NOT a holed face (0 inner). IMPORTANT PIVOT: these 4 panicking faces are
+CONE nozzle bands, NOT the bolt faces — the bolt hole lives on PLANAR flange
+faces that meshed without panic. So the cone panic is likely SEPARATE from the
+hole-missing. NEXT: (a) trace the bolt PLANAR flange faces — do they carry the
+bolt inner loop after the boolean, and does triangulate_planar_polygon mesh the
+hole? That is the real volume bug; (b) separately, the cone-band UV-projection
+degeneracy is its own curved-CDT robustness bug (dedup the contour / pick a
+non-degenerate projection / skip true slivers). Diagnostic kept (env-gated
+ROSHERA_TESS_TRACE). Repro unchanged.
+
 (Original report below — the abort/crash mechanism, now fixed.)
 
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
