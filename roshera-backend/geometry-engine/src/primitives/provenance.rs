@@ -107,13 +107,17 @@ pub struct ValidityCertificate {
     pub euler_characteristic: i64,
     pub boundary_edges: usize,
     pub nonmanifold_edges: usize,
+    /// No two non-adjacent faces cross (geometrically non-self-overlapping). A
+    /// solid can be valid + watertight yet self-intersect (#70-class); this is
+    /// the only check that catches it.
+    pub self_intersection_free: bool,
     /// B-Rep validation errors (stringified), empty when `brep_valid`.
     pub errors: Vec<String>,
 }
 
 impl ValidityCertificate {
     pub fn is_sound(&self) -> bool {
-        self.brep_valid && self.watertight && self.manifold
+        self.brep_valid && self.watertight && self.manifold && self.self_intersection_free
     }
 }
 

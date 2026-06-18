@@ -27,6 +27,7 @@ pub mod math_oracle;
 pub mod nurbs_loft;
 pub mod poke_matrix;
 pub mod revolve;
+pub mod self_intersection;
 pub mod shell;
 pub mod sweep;
 pub mod tessellation;
