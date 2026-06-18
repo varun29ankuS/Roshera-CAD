@@ -276,6 +276,59 @@ fn revolve_ring(m: &mut BRepModel, pts: &[(f64, f64)], segments: u32) -> SolidId
     .expect("revolve_ring")
 }
 
+/// PANIC-ISOLATION (#24): boring an off-axis hole into a REVOLVED annular
+/// flange drives `cdt::triangulate_contours` to `assert!`-panic ("failed to
+/// create fixed edge") while tessellating the boolean-scar flange face (an
+/// annular planar face that now carries a second, non-concentric hole). The
+/// tessellation path wraps cdt in `catch_unwind`, so the panic MUST degrade to
+/// a dropped face — never unwind past the guard. In release the same guard only
+/// works because `profile.release` is `panic = "unwind"` (not `abort`, which
+/// silently aborts the whole api-server on the first bad face).
+///
+/// This pins the live-demo repro and guards the isolation: the bore must
+/// boolean to a sound B-Rep and tessellate to a non-empty mesh with the panic
+/// contained. The deeper CDT root cause (annular face + offset hole producing
+/// an unmeshable contour set) stays OPEN — isolation prevents the crash, it
+/// does not yet make the bored flange watertight.
+#[test]
+fn bore_into_revolved_flange_isolates_cdt_panic() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let mut m = BRepModel::new();
+    // Hollow thrust-chamber meridian with an integral annular flange
+    // (top z=200 r35..58, bottom z=178 r43..58) — the live-demo geometry.
+    let profile = [
+        (70.0, 0.0),
+        (50.0, 30.0),
+        (30.0, 60.0),
+        (15.0, 90.0),
+        (25.0, 105.0),
+        (35.0, 120.0),
+        (35.0, 200.0),
+        (58.0, 200.0),
+        (58.0, 178.0),
+        (43.0, 178.0),
+        (43.0, 120.0),
+        (33.0, 105.0),
+        (23.0, 90.0),
+        (38.0, 60.0),
+        (58.0, 30.0),
+        (78.0, 0.0),
+    ];
+    let chamber = revolve_ring(&mut m, &profile, 128);
+    // Bolt hole confined to the flange band (z170..205) at radius 50.
+    let bore = cyl(&mut m, Point3::new(50.0, 0.0, 170.0), 4.0, 35.0);
+    let holed = diff(&mut m, chamber, bore);
+    // Tessellation must COMPLETE (catch_unwind isolates the cdt panic) and
+    // return a non-empty mesh rather than unwinding past the guard / aborting.
+    let solid = m.solids.get(holed).expect("holed solid");
+    let mesh = tessellate_solid(solid, &m, &TessellationParams::default());
+    assert!(
+        !mesh.triangles.is_empty(),
+        "tessellation of the bored revolved flange produced no triangles — \
+         the cdt panic was not isolated (or the whole pass was lost)"
+    );
+}
+
 /// GATE — BORE-TESS-VOLUME (FIXED 2026-06-17): a bored plate's tessellated MESH
 /// must integrate to the correct volume. The bug was `annulus_radial_strip`
 /// mis-classifying the square cap as a circular ring and radial-stripping it to

@@ -34,7 +34,15 @@ lru = "0.16.0"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# `unwind`, NOT `abort`: the tessellation path deliberately wraps the
+# third-party `cdt::triangulate_contours` calls in `catch_unwind` so a
+# degenerate face (e.g. an annular boolean-scar face whose contours make
+# `cdt` `assert!` "failed to create fixed edge") degrades to a recoverable
+# per-face error instead of taking down the whole process. `panic = "abort"`
+# silently defeats that isolation in release builds — a single bad face
+# would abort the api-server. Keep this `unwind` so the catch_unwind guards
+# actually work and one bad geometry can never crash the server.
+panic = "unwind"
 strip = true
 opt-level = 3
 
