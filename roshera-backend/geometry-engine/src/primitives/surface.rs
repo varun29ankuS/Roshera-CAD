@@ -3850,9 +3850,23 @@ impl Surface for Torus {
             0.0
         };
 
-        // Normalize angles
+        // Normalize angles. u is always normalized to [0, 2π). v is normally
+        // normalized to [0, 2π) too — but a TRIMMED patch whose v-domain dips
+        // below 0 (a blend that straddles the outer-equator seam v=0, e.g. a
+        // cone-rim fillet whose lateral contact sits just below the equator)
+        // must keep the raw signed v ∈ (−π, π]; clamping it to 2π−|v| would put
+        // the point on the far side of the periodic seam, off the patch, and the
+        // boundary projection would weld it at the wrong meridian. All untrimmed
+        // tori and positive-domain patches are unchanged.
         let u = if u < 0.0 { u + consts::TWO_PI } else { u };
-        let v = if v < 0.0 { v + consts::TWO_PI } else { v };
+        let v_straddles_seam = self.param_limits.map(|l| l[2] < 0.0).unwrap_or(false);
+        let v = if v_straddles_seam {
+            v
+        } else if v < 0.0 {
+            v + consts::TWO_PI
+        } else {
+            v
+        };
 
         Ok((u, v))
     }
