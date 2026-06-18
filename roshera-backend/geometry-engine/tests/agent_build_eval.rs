@@ -1061,6 +1061,54 @@ fn verify_comprehensive(m: &BRepModel, sid: SolidId, label: &str, vol_lo: f64, v
     // (4) AGENT-EYE AGREES — perceived dims match the B-Rep envelope and the
     // face accounting is an exact partition.
     assert_eye_agrees(m, sid, label);
+
+    // (5) CENTROID SANE — the perceived centre of mass is finite and inside the
+    // world bbox (a NaN or wildly-offset mesh fails here).
+    let frame = render_dimensioned_multiview(m, sid, &TessellationParams::default())
+        .unwrap_or_else(|| panic!("[{label}] CHANNEL=centroid: no render frame"));
+    let c = frame.centroid;
+    assert!(
+        c.x.is_finite() && c.y.is_finite() && c.z.is_finite(),
+        "[{label}] CHANNEL=centroid: non-finite CoM {c:?}"
+    );
+    let bb = m
+        .solid_world_bbox(sid)
+        .unwrap_or_else(|| panic!("[{label}] CHANNEL=centroid: no bbox"));
+    assert!(
+        bb.contains_point_tolerance(&c, Tolerance::from_distance(1.0)),
+        "[{label}] CHANNEL=centroid: CoM {c:?} outside bbox [{:?}, {:?}]",
+        bb.min,
+        bb.max
+    );
+
+    // (6) NO DROPPED FACES — tessellate the whole solid; EVERY B-Rep face must
+    // emit at least one triangle (appear in the mesh face_map). A face absent
+    // from face_map was silently dropped — the channel that directly catches the
+    // boolean-scar cone over-cover/drop and the revolve apex-fan hole.
+    let all_faces: Vec<u32> = {
+        let solid = m.solids.get(sid).expect("solid");
+        let shells: Vec<_> = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .collect();
+        let mut fs = Vec::new();
+        for shid in shells {
+            if let Some(sh) = m.shells.get(shid) {
+                fs.extend(sh.faces.iter().copied());
+            }
+        }
+        fs
+    };
+    let mesh = {
+        let solid = m.solids.get(sid).expect("solid");
+        geometry_engine::tessellation::tessellate_solid(solid, m, &TessellationParams::default())
+    };
+    let covered: std::collections::HashSet<u32> = mesh.face_map.iter().copied().collect();
+    for fid in all_faces {
+        assert!(
+            covered.contains(&fid),
+            "[{label}] CHANNEL=no_dropped_faces: face {fid} emitted 0 triangles (dropped)"
+        );
+    }
 }
 
 /// ROSTER part: a 3-step coaxial shaft (stacked cylinders, decreasing radius,
@@ -1091,4 +1139,18 @@ fn gen_counterbored_plate() {
     let p = diff(&mut m, p, cbore);
     // V = 80·80·20 − π·6²·20 − π·(12²−6²)·10 ≈ 122_345; bore facets undershoot.
     verify_comprehensive(&m, p, "counterbored plate", 120_000.0, 124_000.0);
+}
+
+/// ROSTER part: a hollow conical pipe reducer — revolve a frustum-wall profile
+/// (OD 80→40, ID 70→30 over h=60). A pure solid-of-revolution with cone bands +
+/// annular caps, NO boolean (the chamber-style case that meshes cleanly).
+#[test]
+fn gen_pipe_reducer() {
+    let mut m = BRepModel::new();
+    // (r,z): bottom-outer -> top-outer (outer cone) -> top-inner -> bottom-inner
+    // (inner cone) -> implicit close (bottom annulus).
+    let profile = [(40.0, 0.0), (20.0, 60.0), (15.0, 60.0), (35.0, 0.0)];
+    let reducer = revolve_ring(&mut m, &profile, 64);
+    // wall = outer frustum − inner frustum ≈ 51_836; cone facets undershoot.
+    verify_comprehensive(&m, reducer, "pipe reducer", 48_000.0, 53_000.0);
 }
