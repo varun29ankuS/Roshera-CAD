@@ -59,7 +59,7 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   (a valid+watertight solid that geometrically self-overlaps, #70-class, is now
   caught). REMAINING: true golden-FILE snapshots; add a coarse self-intersection
   pass to `full_contract`; deeper fuzz once #27 lands.
-- **PILLAR 3 — Persistent semantic naming = the moat (🔴, #15).** Stable
+- **PILLAR 3 — Persistent semantic naming = the moat (🟢 core done, #15).** Stable
   topological IDs surviving upstream edits + reference-by-description ("largest
   +Z planar face", "fillet on the top-rear edge") + a kernel that REFUSES an
   ambiguous reference instead of guessing. The 40-yr naming problem; what a
@@ -80,9 +80,23 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   only; can't show livery / black tyres / metallic rims. Kernel render per-solid
   colour DONE (`render_solids_dir`); server colour registry + endpoint + frontend
   material pending. Biggest realism lever.
-- 🔴 **Robust NURBS boolean** (#17) — differencing a cutter from a NURBS-lateral
-  solid fails (`build_shells_from_faces` invalid); blocks real cockpit/inlet/duct
-  cuts (forced the loft-notch workaround). Ties to the boolean-robustness lane + #24.
+- 🟡 **Robust NURBS boolean** (#17, IN PROGRESS) — root cause found + SSI fixed.
+  The NURBS×plane pair fell to the generic dual-surface marcher, which was
+  NON-TERMINATING (hit the 200k step cap, ROSHERA_BOOL_TRACE) and DISCARDED the
+  curve → the freeform wall never split → `build_shells_from_faces` rejected the
+  result. FIX (done): rewrote `math::surface_plane_intersection::intersect_surface_plane`
+  as a bounded marching-squares contour extractor (was a stall-prone predictor-
+  corrector tracer), and added a `(Planar, Other)` arm in `surface_surface_intersection`
+  → `plane_general_intersection` that routes plane↔freeform there. Now the cut
+  COMPLETES + imprints, bounded (gate: tests/nurbs_boolean_17.rs::
+  nurbs_minus_box_completes_and_imprints; section 85/85 + draft 6/6 = no caller
+  regression). REMAINING (the watertight bar, ignored test nurbs_minus_box_should_be_watertight):
+  the result still has boundary edges (gaps) + odd Euler — the cut edges are NOT
+  shared between the NURBS-wall fragments and the box-face fragments
+  (corefinement / shared-vertex imprint, the #35 family). Also: the boolean
+  currently returns Ok with this non-watertight solid (the certificate flags it)
+  — reaching watertight is the fix; gating to Err is the fallback. Ties to #35 +
+  the boolean-robustness lane + #24.
 - 🔴 **Loft surfacing control** (#18) — `skin_surface` bulges at section
   transitions (F1 cockpit/sidepod lumpiness); needs tangency / guide-rail control.
 - 🔴 **Assembly grouping** (#19) — 38 independent solids; wire the assembly module

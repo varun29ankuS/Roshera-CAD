@@ -1,76 +1,66 @@
 //! Surface-Plane Intersection Algorithm
 //!
-//! Computes intersection curves between arbitrary parametric surfaces and planes
-//! using a marching-squares seed finder with predictor-corrector curve tracing.
+//! Computes intersection curves between an arbitrary parametric surface and a
+//! plane by extracting the zero-set of the signed plane-distance field
+//! `d(u,v) = (S(u,v) - origin) · normal` over the surface parameter domain.
 //!
 //! # Algorithm Overview
 //!
-//! 1. **Grid sampling** -- evaluate signed distance `d(u,v) = (S(u,v) - origin) . normal`
-//!    on a uniform grid covering the surface parameter domain.
-//! 2. **Zero-crossing detection** -- identify grid edges where `d` changes sign
-//!    (marching squares on the scalar field).
-//! 3. **Seed computation** -- linear interpolation along each zero-crossing edge
-//!    yields initial intersection points.
-//! 4. **Curve tracing** -- from each unused seed, march in both directions:
-//!    - *Predictor*: step along `tangent = plane_normal x surface_normal` projected
-//!      into parameter space via surface partial derivatives.
-//!    - *Corrector*: Newton-Raphson iteration to snap back to `d = 0`.
-//!    - Terminate when hitting the parameter domain boundary, closing back on the
-//!      start point, or exceeding the step budget.
-//! 5. **Curve assembly** -- link traced segments, detect closed loops, remove
-//!    duplicates.
+//! 1. **Grid sampling** — evaluate `d(u,v)` on a uniform `(n+1)×(n+1)` grid.
+//! 2. **Marching squares** — for every grid cell, the corner signs of `d`
+//!    determine which of the four cell edges the contour crosses; the crossing
+//!    on each edge is found by linear interpolation and snapped onto `d = 0`
+//!    with one Newton step. Edge crossings are stored ONCE per grid edge so the
+//!    two cells sharing an edge reference the same point — this is what makes
+//!    the linking exact.
+//! 3. **Linking** — within each cell the crossings are paired into segments
+//!    (the 16 marching-squares cases; saddles disambiguated by the cell-centre
+//!    sign). Segments are then walked end-to-end into polylines: chains that
+//!    start at a domain-boundary crossing are OPEN curves; the rest are CLOSED
+//!    loops.
 //!
-//! # Performance
-//!
-//! - Grid evaluation: O(grid_resolution^2)
-//! - Curve tracing: O(curve_length / marching_step)
-//! - Newton corrector: typically 3-5 iterations per step
+//! Unlike predictor-corrector curve tracing, this is **bounded** — O(cells)
+//! work, no marching step that can stall or oscillate on a closed/periodic
+//! surface (the failure mode that hung the boolean on a lofted barrel). It also
+//! recovers multiple disjoint branches and interior loops for free.
 //!
 //! # References
 //!
 //! - Patrikalakis, N.M. & Maekawa, T. (2002). *Shape Interrogation for Computer
-//!   Aided Design and Manufacturing*. Springer.
-//! - Barnhill, R.E. et al. (1987). "Surface/surface intersection". *CAGD* 4(1-2).
+//!   Aided Design and Manufacturing*. Springer. (§ surface intersection)
+//! - Lorensen & Cline (1987), "Marching cubes" — the 2-D specialisation here.
 //!
-//! Indexed access into the (Nu × Nv) signed-distance grid is the canonical
+//! Indexed access into the `(Nu × Nv)` signed-distance grid is the canonical
 //! idiom — all `grid[i][j]` sites use indices bounded by the sampling grid
-//! dimensions established at solver entry. Matches the numerical-kernel
-//! pattern used in nurbs.rs.
+//! dimensions established at solver entry.
 #![allow(clippy::indexing_slicing)]
 
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::surface::Surface;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 /// Configuration for surface-plane intersection computation.
-///
-/// # Fields
-///
-/// * `tolerance` -- geometric distance tolerance for convergence checks.
-/// * `grid_resolution` -- number of subdivisions along each parameter axis for
-///   the initial signed-distance grid.  Higher values find more seed points
-///   but cost O(n^2) evaluations.
-/// * `marching_step` -- step size in parameter space for the predictor phase
-///   of curve tracing.
-/// * `max_curves` -- hard cap on the number of intersection curves returned,
-///   guarding against degenerate configurations.
 #[derive(Debug, Clone)]
 pub struct SurfacePlaneIntersectionConfig {
+    /// Geometric distance tolerance for convergence checks.
     pub tolerance: Tolerance,
+    /// Subdivisions along each parameter axis for the signed-distance grid.
+    /// Higher resolves finer features at O(n²) evaluations. The contour is
+    /// exact at grid resolution; features thinner than one cell can be missed,
+    /// so callers with a tight known feature size should raise this.
     pub grid_resolution: usize,
+    /// Retained for API compatibility; the marching-squares core does not march
+    /// in fixed steps, so this is unused by the contour extractor.
     pub marching_step: f64,
+    /// Hard cap on the number of intersection curves returned.
     pub max_curves: usize,
-    /// Optional override for the (u, v) parameter rectangle searched for
-    /// zero-crossings, as `((u_min, u_max), (v_min, v_max))`. When `None`
-    /// the search uses `surface.parameter_bounds()` clamped to
-    /// `±1e6`. Callers with a tighter known domain (e.g. a section
-    /// preview that already knows the face's lifted UV extent) should
-    /// supply it here — the default 30×30 grid is hopelessly coarse on
-    /// an unbounded plane and misses any feature smaller than a few
-    /// percent of the clamp range.
+    /// Optional override for the `(u, v)` rectangle searched, as
+    /// `((u_min, u_max), (v_min, v_max))`. When `None`, uses
+    /// `surface.parameter_bounds()` clamped to `±1e6`.
     pub param_bounds_override: Option<((f64, f64), (f64, f64))>,
 }
 
@@ -78,31 +68,26 @@ impl Default for SurfacePlaneIntersectionConfig {
     fn default() -> Self {
         Self {
             tolerance: Tolerance::default(),
-            grid_resolution: 30,
+            grid_resolution: 48,
             marching_step: 0.01,
-            max_curves: 50,
+            max_curves: 64,
             param_bounds_override: None,
         }
     }
 }
 
-/// A single point on the intersection curve, carrying both 3-D position and
-/// the surface parameter coordinates where the intersection was found.
+/// A single point on the intersection curve, carrying 3-D position and the
+/// surface parameter coordinates where the intersection was found.
 #[derive(Debug, Clone, Copy)]
 pub struct ParametricIntersectionPoint {
-    /// World-space position on the intersection.
     pub position: Point3,
-    /// Parameter coordinate in the u-direction on the surface.
     pub u: f64,
-    /// Parameter coordinate in the v-direction on the surface.
     pub v: f64,
 }
 
-/// An ordered, possibly closed, intersection curve expressed as a sequence of
-/// [`ParametricIntersectionPoint`]s.
+/// An ordered, possibly closed, intersection curve.
 #[derive(Debug, Clone)]
 pub struct ParametricIntersectionCurve {
-    /// Ordered sample points along the curve.
     pub points: Vec<ParametricIntersectionPoint>,
     /// `true` when the last point connects back to the first within tolerance.
     pub is_closed: bool,
@@ -115,33 +100,17 @@ pub struct ParametricIntersectionCurve {
 /// Compute intersection curves between an arbitrary parametric surface and a
 /// plane defined by `(plane_origin, plane_normal)`.
 ///
-/// # Arguments
-///
-/// * `surface` -- any type implementing the `Surface` trait.
-/// * `plane_origin` -- a point on the cutting plane.
-/// * `plane_normal` -- outward normal of the cutting plane (will be normalised
-///   internally).
-/// * `config` -- algorithm tuning parameters.
-///
-/// # Returns
-///
-/// A vector of [`ParametricIntersectionCurve`]s, each containing an ordered
-/// sequence of intersection points with parameter-space coordinates.
-/// Returns an empty vector when the surface does not intersect the plane.
+/// Returns one [`ParametricIntersectionCurve`] per connected branch of the
+/// intersection; an empty vector when the surface does not meet the plane.
 ///
 /// # Errors
-///
-/// * `MathError::InvalidParameter` -- if `plane_normal` is zero-length.
-/// * `MathError::ConvergenceFailure` -- if Newton iteration diverges on every
-///   seed (extremely unlikely with reasonable inputs).
-#[allow(clippy::expect_used)] // pts.len() >= 2: continue-guard above; curve was pushed in this loop
+/// * `MathError::InvalidParameter` — `plane_normal` is zero-length.
 pub fn intersect_surface_plane(
     surface: &dyn Surface,
     plane_origin: Point3,
     plane_normal: Vector3,
     config: &SurfacePlaneIntersectionConfig,
 ) -> MathResult<Vec<ParametricIntersectionCurve>> {
-    // Normalise the plane normal.
     let normal = plane_normal
         .normalize()
         .map_err(|_| MathError::InvalidParameter("plane_normal must be non-zero".into()))?;
@@ -150,7 +119,6 @@ pub fn intersect_surface_plane(
         .param_bounds_override
         .unwrap_or_else(|| surface.parameter_bounds());
 
-    // Clamp infinite parameter domains to a practical working range.
     let clamp_bound = 1e6;
     let u_min = raw_u_min.max(-clamp_bound);
     let u_max = raw_u_max.min(clamp_bound);
@@ -165,7 +133,7 @@ pub fn intersect_surface_plane(
     let du = (u_max - u_min) / n as f64;
     let dv = (v_max - v_min) / n as f64;
 
-    // Step 1 -- evaluate signed distance on a uniform grid.
+    // Step 1 — signed-distance grid.
     let mut grid = vec![vec![0.0_f64; n + 1]; n + 1];
     for i in 0..=n {
         let u = u_min + i as f64 * du;
@@ -176,234 +144,275 @@ pub fn intersect_surface_plane(
         }
     }
 
-    // Step 2+3 -- detect zero-crossings and compute seed points.
-    let mut seeds: Vec<ParametricIntersectionPoint> = Vec::new();
+    // Steps 2+3 — marching-squares contour extraction.
+    let mut curves = contour_zero_set(
+        surface,
+        &normal,
+        plane_origin,
+        &grid,
+        u_min,
+        du,
+        v_min,
+        dv,
+        n,
+        config,
+    );
+    if curves.len() > config.max_curves {
+        curves.truncate(config.max_curves);
+    }
+    Ok(curves)
+}
 
+// ---------------------------------------------------------------------------
+// Marching-squares contour extraction
+// ---------------------------------------------------------------------------
+
+/// Orientation tag for a grid edge: `H` is the horizontal edge from `(i,j)` to
+/// `(i+1,j)`, `V` the vertical edge from `(i,j)` to `(i,j+1)`.
+type EdgeKey = (u8, usize, usize);
+const H: u8 = 0;
+const V: u8 = 1;
+
+#[allow(clippy::too_many_arguments)]
+fn contour_zero_set(
+    surface: &dyn Surface,
+    normal: &Vector3,
+    plane_origin: Point3,
+    grid: &[Vec<f64>],
+    u_min: f64,
+    du: f64,
+    v_min: f64,
+    dv: f64,
+    n: usize,
+    config: &SurfacePlaneIntersectionConfig,
+) -> Vec<ParametricIntersectionCurve> {
+    // --- Pass 1: one crossing point per grid edge that changes sign. ---
+    let mut nodes: Vec<ParametricIntersectionPoint> = Vec::new();
+    let mut node_of_edge: HashMap<EdgeKey, usize> = HashMap::new();
+
+    let uv = |i: usize, j: usize| (u_min + i as f64 * du, v_min + j as f64 * dv);
+
+    // Horizontal edges: (i,j)->(i+1,j).
     for i in 0..n {
+        for j in 0..=n {
+            let da = grid[i][j];
+            let db = grid[i + 1][j];
+            if !crosses(da, db) {
+                continue;
+            }
+            let (ua, va) = uv(i, j);
+            let (ub, _vb) = uv(i + 1, j);
+            let t = lerp_t(da, db);
+            let (us, vs) = (ua + t * (ub - ua), va);
+            if let Some(node) = make_node(surface, normal, plane_origin, us, vs, config) {
+                let id = nodes.len();
+                nodes.push(node);
+                node_of_edge.insert((H, i, j), id);
+            }
+        }
+    }
+    // Vertical edges: (i,j)->(i,j+1).
+    for i in 0..=n {
         for j in 0..n {
-            let d00 = grid[i][j];
-            let d10 = grid[i + 1][j];
-            let d01 = grid[i][j + 1];
-            let d11 = grid[i + 1][j + 1];
-
-            let u0 = u_min + i as f64 * du;
-            let u1 = u0 + du;
-            let v0 = v_min + j as f64 * dv;
-            let v1 = v0 + dv;
-
-            // Check each of the four edges of this grid cell.
-            maybe_add_seed(
-                surface,
-                &normal,
-                plane_origin,
-                d00,
-                d10,
-                u0,
-                v0,
-                u1,
-                v0,
-                &mut seeds,
-                config,
-            );
-            maybe_add_seed(
-                surface,
-                &normal,
-                plane_origin,
-                d10,
-                d11,
-                u1,
-                v0,
-                u1,
-                v1,
-                &mut seeds,
-                config,
-            );
-            maybe_add_seed(
-                surface,
-                &normal,
-                plane_origin,
-                d00,
-                d01,
-                u0,
-                v0,
-                u0,
-                v1,
-                &mut seeds,
-                config,
-            );
-            maybe_add_seed(
-                surface,
-                &normal,
-                plane_origin,
-                d01,
-                d11,
-                u0,
-                v1,
-                u1,
-                v1,
-                &mut seeds,
-                config,
-            );
+            let da = grid[i][j];
+            let db = grid[i][j + 1];
+            if !crosses(da, db) {
+                continue;
+            }
+            let (ua, va) = uv(i, j);
+            let (_ub, vb) = uv(i, j + 1);
+            let t = lerp_t(da, db);
+            let (us, vs) = (ua, va + t * (vb - va));
+            if let Some(node) = make_node(surface, normal, plane_origin, us, vs, config) {
+                let id = nodes.len();
+                nodes.push(node);
+                node_of_edge.insert((V, i, j), id);
+            }
         }
     }
 
-    // Deduplicate seeds that fall within tolerance of each other.
-    dedup_seeds(&mut seeds, config.tolerance);
+    if nodes.is_empty() {
+        return Vec::new();
+    }
 
-    // Step 4 -- trace curves from unused seeds.
-    let mut used = vec![false; seeds.len()];
-    let mut curves: Vec<ParametricIntersectionCurve> = Vec::new();
-
-    for idx in 0..seeds.len() {
-        if used[idx] {
-            continue;
+    // --- Pass 2: pair crossings within each cell into adjacency. ---
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    let mut connect = |a: usize, b: usize, adj: &mut Vec<Vec<usize>>| {
+        if a != b {
+            adj[a].push(b);
+            adj[b].push(a);
         }
-        if curves.len() >= config.max_curves {
-            break;
-        }
+    };
+    for i in 0..n {
+        for j in 0..n {
+            // Cell edges.
+            let b = node_of_edge.get(&(H, i, j)).copied();
+            let t = node_of_edge.get(&(H, i, j + 1)).copied();
+            let l = node_of_edge.get(&(V, i, j)).copied();
+            let r = node_of_edge.get(&(V, i + 1, j)).copied();
 
-        let seed = seeds[idx];
-        used[idx] = true;
-
-        // Trace in both directions.
-        let forward = trace_direction(
-            surface,
-            &normal,
-            plane_origin,
-            seed,
-            true,
-            config,
-            u_min,
-            u_max,
-            v_min,
-            v_max,
-        );
-        let backward = trace_direction(
-            surface,
-            &normal,
-            plane_origin,
-            seed,
-            false,
-            config,
-            u_min,
-            u_max,
-            v_min,
-            v_max,
-        );
-
-        // Assemble curve: reversed-backward + seed + forward.
-        let mut pts: Vec<ParametricIntersectionPoint> = Vec::new();
-        let mut bw = backward;
-        bw.reverse();
-        pts.extend(bw);
-        pts.push(seed);
-        pts.extend(forward);
-
-        if pts.len() < 2 {
-            continue;
-        }
-
-        // Check closure.
-        // Guarded by the `pts.len() < 2` continue above — `pts` is guaranteed
-        // to have at least two elements here.
-        let first = pts
-            .first()
-            .expect("pts.len() >= 2 verified by guard above")
-            .position;
-        let last = pts
-            .last()
-            .expect("pts.len() >= 2 verified by guard above")
-            .position;
-        let is_closed = (last - first).magnitude() < config.tolerance.distance() * 10.0;
-
-        curves.push(ParametricIntersectionCurve {
-            points: pts,
-            is_closed,
-        });
-
-        // Mark consumed seeds.
-        for (k, s) in seeds.iter().enumerate() {
-            if used[k] {
-                continue;
-            }
-            // `curves.last()` is the curve we just pushed above.
-            for cp in &curves.last().expect("curve just pushed above").points {
-                if (cp.position - s.position).magnitude() < config.tolerance.distance() * 5.0 {
-                    used[k] = true;
-                    break;
+            let present: Vec<usize> = [b, r, t, l].into_iter().flatten().collect();
+            match present.len() {
+                0 => {}
+                2 => connect(present[0], present[1], &mut adj),
+                4 => {
+                    // Saddle — disambiguate by the cell-centre sign.
+                    let centre =
+                        0.25 * (grid[i][j] + grid[i + 1][j] + grid[i][j + 1] + grid[i + 1][j + 1]);
+                    // Unwraps guarded: all four are Some here.
+                    let (bb, rr, tt, ll) = (
+                        b.unwrap_or(present[0]),
+                        r.unwrap_or(present[0]),
+                        t.unwrap_or(present[0]),
+                        l.unwrap_or(present[0]),
+                    );
+                    if centre < 0.0 {
+                        connect(bb, ll, &mut adj);
+                        connect(tt, rr, &mut adj);
+                    } else {
+                        connect(bb, rr, &mut adj);
+                        connect(tt, ll, &mut adj);
+                    }
+                }
+                // 1 or 3 crossings: a corner sits exactly on the plane (d == 0)
+                // so an edge pair is degenerate. Connect the available pair if
+                // two exist; a lone crossing is a dangling node (left as a
+                // degree-≤1 endpoint, harmless to the walk).
+                _ => {
+                    if present.len() >= 2 {
+                        connect(present[0], present[1], &mut adj);
+                    }
                 }
             }
         }
     }
 
-    Ok(curves)
+    // --- Pass 3: walk adjacency into polylines (open chains first). ---
+    let mut curves: Vec<ParametricIntersectionCurve> = Vec::new();
+
+    // Open chains start at a node that currently has a single connection
+    // (a contour terminating on the domain boundary).
+    loop {
+        let start = (0..adj.len()).find(|&k| adj[k].len() == 1);
+        let start = match start {
+            Some(s) => s,
+            None => break,
+        };
+        let chain = walk_chain(start, &mut adj);
+        push_curve(&mut curves, &nodes, &chain, config.tolerance);
+    }
+    // Remaining connected nodes form closed loops.
+    loop {
+        let start = (0..adj.len()).find(|&k| !adj[k].is_empty());
+        let start = match start {
+            Some(s) => s,
+            None => break,
+        };
+        let chain = walk_chain(start, &mut adj);
+        push_curve(&mut curves, &nodes, &chain, config.tolerance);
+    }
+
+    curves
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+/// A sign change (or a touch where exactly one endpoint is on the plane).
+fn crosses(da: f64, db: f64) -> bool {
+    (da < 0.0) != (db < 0.0)
+}
 
-/// If the signed distances `d_a` and `d_b` at the two endpoints of a grid edge
-/// have opposite sign, linearly interpolate the zero-crossing, refine it with
-/// a Newton step, and push the result onto `seeds`.
-fn maybe_add_seed(
+/// Interpolation parameter of the zero-crossing along an edge `[da, db]`.
+fn lerp_t(da: f64, db: f64) -> f64 {
+    let denom = da - db;
+    if denom.abs() < 1e-30 {
+        0.5
+    } else {
+        (da / denom).clamp(0.0, 1.0)
+    }
+}
+
+/// Build a contour node at `(u, v)`, snapping onto `d = 0` with Newton when
+/// possible and falling back to the raw surface point otherwise.
+fn make_node(
     surface: &dyn Surface,
     normal: &Vector3,
     plane_origin: Point3,
-    d_a: f64,
-    d_b: f64,
-    u_a: f64,
-    v_a: f64,
-    u_b: f64,
-    v_b: f64,
-    seeds: &mut Vec<ParametricIntersectionPoint>,
+    u: f64,
+    v: f64,
     config: &SurfacePlaneIntersectionConfig,
-) {
-    if d_a * d_b > 0.0 {
-        return; // Strictly same sign: no crossing.
+) -> Option<ParametricIntersectionPoint> {
+    if let Some(refined) = newton_correct(surface, normal, plane_origin, u, v, config) {
+        return Some(refined);
     }
-    // Degenerate edge: both endpoints lie on the plane. Seed at midpoint so
-    // grid-aligned intersections (where d = 0 at grid nodes) are not lost.
-    let sum_abs = d_a.abs() + d_b.abs();
-    if sum_abs < 1e-30 {
-        let u_seed = 0.5 * (u_a + u_b);
-        let v_seed = 0.5 * (v_a + v_b);
-        if let Some(refined) = newton_correct(surface, normal, plane_origin, u_seed, v_seed, config)
-        {
-            seeds.push(refined);
-        } else if let Ok(pos) = surface.point_at(u_seed, v_seed) {
-            seeds.push(ParametricIntersectionPoint {
-                position: pos,
-                u: u_seed,
-                v: v_seed,
-            });
-        }
-        return;
-    }
-    // Linear interpolation parameter. Safe now because sum_abs > 0.
-    let t = d_a.abs() / sum_abs;
-    let u_seed = u_a + t * (u_b - u_a);
-    let v_seed = v_a + t * (v_b - v_a);
+    surface
+        .point_at(u, v)
+        .ok()
+        .map(|position| ParametricIntersectionPoint { position, u, v })
+}
 
-    // Refine with one Newton step.
-    if let Some(refined) = newton_correct(surface, normal, plane_origin, u_seed, v_seed, config) {
-        seeds.push(refined);
-    } else {
-        // Fallback: accept the linear interpolation.
-        if let Ok(pos) = surface.point_at(u_seed, v_seed) {
-            seeds.push(ParametricIntersectionPoint {
-                position: pos,
-                u: u_seed,
-                v: v_seed,
-            });
+/// Walk a chain from `start`, consuming connections, until a dead end or a
+/// return to `start` (closed loop). Returns the ordered node ids.
+fn walk_chain(start: usize, adj: &mut [Vec<usize>]) -> Vec<usize> {
+    let mut chain = vec![start];
+    let mut cur = start;
+    loop {
+        let next = match adj[cur].first().copied() {
+            Some(nx) => nx,
+            None => break,
+        };
+        remove_first(&mut adj[cur], next);
+        remove_first(&mut adj[next], cur);
+        chain.push(next);
+        cur = next;
+        if cur == start {
+            break; // closed loop
         }
+    }
+    chain
+}
+
+fn remove_first(v: &mut Vec<usize>, x: usize) {
+    if let Some(p) = v.iter().position(|&y| y == x) {
+        v.swap_remove(p);
     }
 }
 
-/// Newton-Raphson corrector: given an approximate `(u, v)` near the
-/// intersection, iterate until `d(u,v) = 0` within tolerance.
-///
-/// Returns `None` only if derivatives are degenerate everywhere.
+/// Append a curve built from a node-id chain (if it has ≥2 distinct points).
+fn push_curve(
+    curves: &mut Vec<ParametricIntersectionCurve>,
+    nodes: &[ParametricIntersectionPoint],
+    chain: &[usize],
+    tolerance: Tolerance,
+) {
+    if chain.len() < 2 {
+        return;
+    }
+    let closed = chain.len() >= 4 && chain.first() == chain.last();
+    let slice = if closed {
+        &chain[..chain.len() - 1]
+    } else {
+        chain
+    };
+    if slice.len() < 2 {
+        return;
+    }
+    let pts: Vec<ParametricIntersectionPoint> = slice.iter().map(|&id| nodes[id]).collect();
+    // Reject a hair-thin degenerate chain (all points coincident).
+    let span = (pts[pts.len() - 1].position - pts[0].position).magnitude();
+    if !closed && span < tolerance.distance() {
+        return;
+    }
+    curves.push(ParametricIntersectionCurve {
+        points: pts,
+        is_closed: closed,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Newton corrector
+// ---------------------------------------------------------------------------
+
+/// Newton-Raphson corrector: from an approximate `(u, v)`, iterate until
+/// `d(u,v) = 0` within tolerance. Returns `None` if derivatives are degenerate.
 fn newton_correct(
     surface: &dyn Surface,
     normal: &Vector3,
@@ -413,7 +422,7 @@ fn newton_correct(
     config: &SurfacePlaneIntersectionConfig,
 ) -> Option<ParametricIntersectionPoint> {
     let tol = config.tolerance.distance();
-    let max_iter = 20;
+    let max_iter = 16;
     let ((raw_u_min, raw_u_max), (raw_v_min, raw_v_max)) = config
         .param_bounds_override
         .unwrap_or_else(|| surface.parameter_bounds());
@@ -433,27 +442,17 @@ fn newton_correct(
                 v,
             });
         }
-
-        // Gradient of d in parameter space:  grad_d = (dS/du . n, dS/dv . n)
         let grad_u = eval.du.dot(normal);
         let grad_v = eval.dv.dot(normal);
         let grad_mag_sq = grad_u * grad_u + grad_v * grad_v;
         if grad_mag_sq < 1e-30 {
-            // Surface tangent plane is parallel to cutting plane -- degenerate.
-            return None;
+            return None; // tangent plane parallel to cutting plane
         }
-
-        // Newton step:  delta = -d / |grad|^2 * grad
         let scale = -d / grad_mag_sq;
-        u += scale * grad_u;
-        v += scale * grad_v;
-
-        // Clamp to domain.
-        u = u.clamp(u_min, u_max);
-        v = v.clamp(v_min, v_max);
+        u = (u + scale * grad_u).clamp(u_min, u_max);
+        v = (v + scale * grad_v).clamp(v_min, v_max);
     }
 
-    // Accept best-effort position.
     let pos = surface.point_at(u, v).ok()?;
     let d = (pos - plane_origin).dot(normal);
     if d.abs() < tol * 100.0 {
@@ -464,131 +463,6 @@ fn newton_correct(
         })
     } else {
         None
-    }
-}
-
-/// Trace the intersection curve in one direction from `seed`.
-///
-/// Returns an ordered list of intersection points (excluding the seed itself).
-fn trace_direction(
-    surface: &dyn Surface,
-    normal: &Vector3,
-    plane_origin: Point3,
-    seed: ParametricIntersectionPoint,
-    forward: bool,
-    config: &SurfacePlaneIntersectionConfig,
-    u_min: f64,
-    u_max: f64,
-    v_min: f64,
-    v_max: f64,
-) -> Vec<ParametricIntersectionPoint> {
-    let max_steps = 5000;
-    let sign = if forward { 1.0 } else { -1.0 };
-    let tol = config.tolerance.distance();
-    let step = config.marching_step;
-
-    let mut pts: Vec<ParametricIntersectionPoint> = Vec::new();
-    let mut cur = seed;
-
-    for _ in 0..max_steps {
-        // Evaluate surface at current (u, v).
-        let eval = match surface.evaluate_full(cur.u, cur.v) {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-
-        // Tangent to the intersection curve in 3-D:  t = n_plane x n_surface.
-        let tangent_3d = normal.cross(&eval.normal) * sign;
-        let t_mag = tangent_3d.magnitude();
-        if t_mag < 1e-14 {
-            break; // Surface tangent plane parallel to cutting plane.
-        }
-
-        // Project tangent into parameter space via the pseudo-inverse of the
-        // Jacobian  [dS/du | dS/dv].
-        //   delta_u = (t . dS/du) / |dS/du|^2   (approximate, ignoring coupling)
-        //   delta_v = (t . dS/dv) / |dS/dv|^2
-        // For better accuracy we solve the 2x2 system:
-        //   [du.du  du.dv] [delta_u]   [t . du]
-        //   [du.dv  dv.dv] [delta_v] = [t . dv]
-        let a11 = eval.du.magnitude_squared();
-        let a12 = eval.du.dot(&eval.dv);
-        let a22 = eval.dv.magnitude_squared();
-        let b1 = tangent_3d.dot(&eval.du);
-        let b2 = tangent_3d.dot(&eval.dv);
-        let det = a11 * a22 - a12 * a12;
-        if det.abs() < 1e-30 {
-            break;
-        }
-        let raw_du = (a22 * b1 - a12 * b2) / det;
-        let raw_dv = (a11 * b2 - a12 * b1) / det;
-
-        // Normalise so that the parameter-space step has magnitude `step`.
-        let param_mag = (raw_du * raw_du + raw_dv * raw_dv).sqrt();
-        if param_mag < 1e-30 {
-            break;
-        }
-        let scale = step / param_mag;
-        let du = raw_du * scale;
-        let dv = raw_dv * scale;
-
-        let next_u = cur.u + du;
-        let next_v = cur.v + dv;
-
-        // Check domain boundary.
-        if next_u < u_min || next_u > u_max || next_v < v_min || next_v > v_max {
-            // Clip to boundary and add the boundary point.
-            let clamped_u = next_u.clamp(u_min, u_max);
-            let clamped_v = next_v.clamp(v_min, v_max);
-            if let Some(corrected) =
-                newton_correct(surface, normal, plane_origin, clamped_u, clamped_v, config)
-            {
-                pts.push(corrected);
-            }
-            break;
-        }
-
-        // Corrector: snap back to d = 0.
-        if let Some(corrected) =
-            newton_correct(surface, normal, plane_origin, next_u, next_v, config)
-        {
-            // Check we actually advanced.
-            let dist = (corrected.position - cur.position).magnitude();
-            if dist < tol * 0.01 {
-                break; // Stalled.
-            }
-            // Check for closure (returning to the seed).
-            if pts.len() > 4 {
-                let back_to_seed = (corrected.position - seed.position).magnitude();
-                if back_to_seed < tol * 5.0 {
-                    pts.push(corrected);
-                    break; // Closed loop detected.
-                }
-            }
-            cur = corrected;
-            pts.push(corrected);
-        } else {
-            break; // Corrector failed -- end of reachable curve.
-        }
-    }
-
-    pts
-}
-
-/// Remove duplicate seed points within tolerance.
-fn dedup_seeds(seeds: &mut Vec<ParametricIntersectionPoint>, tolerance: Tolerance) {
-    let tol = tolerance.distance() * 3.0;
-    let mut i = 0;
-    while i < seeds.len() {
-        let mut j = i + 1;
-        while j < seeds.len() {
-            if (seeds[i].position - seeds[j].position).magnitude() < tol {
-                seeds.swap_remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
     }
 }
 
@@ -603,22 +477,18 @@ mod tests {
     use crate::primitives::surface::Plane as SurfacePlane;
 
     /// Intersect a tilted plane surface with a horizontal cutting plane.
-    /// The intersection is a single straight line.
     #[test]
     fn test_plane_plane_intersection() {
-        // Surface: plane through origin with normal tilted 45 deg.
-        // Plane::new(origin, normal, u_dir) returns MathResult.
         let s2 = std::f64::consts::FRAC_1_SQRT_2;
         let surface = SurfacePlane::new_bounded(
             Point3::ZERO,
-            Vector3::new(s2, 0.0, s2),  // tilted normal
-            Vector3::new(s2, 0.0, -s2), // u direction in the plane
+            Vector3::new(s2, 0.0, s2),
+            Vector3::new(s2, 0.0, -s2),
             (-5.0, 5.0),
             (-5.0, 5.0),
         )
         .expect("plane construction should succeed");
 
-        // Cutting plane: z = 0 (XY plane).
         let config = SurfacePlaneIntersectionConfig {
             tolerance: Tolerance::from_distance(1e-8),
             grid_resolution: 20,
@@ -630,13 +500,10 @@ mod tests {
         let curves = intersect_surface_plane(&surface, Point3::ZERO, Vector3::Z, &config)
             .expect("intersection should succeed");
 
-        // The two planes intersect, so we expect at least one curve.
         assert!(
             !curves.is_empty(),
             "expected at least one intersection curve"
         );
-
-        // All intersection points must lie on z = 0 within tolerance.
         for curve in &curves {
             for pt in &curve.points {
                 assert!(
@@ -648,10 +515,9 @@ mod tests {
         }
     }
 
-    /// A surface entirely above the cutting plane should yield no intersection.
+    /// A surface entirely above the cutting plane yields no intersection.
     #[test]
     fn test_no_intersection() {
-        // Bounded XY plane at z = 10 -- entirely above cutting plane z = 0.
         let surface = SurfacePlane::new_bounded(
             Point3::new(0.0, 0.0, 10.0),
             Vector3::Z,
@@ -664,7 +530,6 @@ mod tests {
         let config = SurfacePlaneIntersectionConfig::default();
         let curves = intersect_surface_plane(&surface, Point3::ZERO, Vector3::Z, &config)
             .expect("should succeed with empty result");
-
         assert!(curves.is_empty(), "no intersection expected");
     }
 
@@ -680,8 +545,40 @@ mod tests {
         )
         .expect("plane construction should succeed");
         let config = SurfacePlaneIntersectionConfig::default();
-
         let result = intersect_surface_plane(&surface, Point3::ZERO, Vector3::ZERO, &config);
         assert!(result.is_err(), "zero normal should produce an error");
+    }
+
+    /// Boundedness guard: a tilted plane fully crossing the cutting plane must
+    /// return quickly with a bounded number of points — the regression test for
+    /// the predictor-corrector stall that hung the boolean. Marching-squares is
+    /// O(cells), so the point count cannot exceed a few per cell.
+    #[test]
+    fn test_contour_is_bounded() {
+        let s2 = std::f64::consts::FRAC_1_SQRT_2;
+        let surface = SurfacePlane::new_bounded(
+            Point3::ZERO,
+            Vector3::new(s2, 0.0, s2),
+            Vector3::new(s2, 0.0, -s2),
+            (-5.0, 5.0),
+            (-5.0, 5.0),
+        )
+        .expect("plane");
+        let config = SurfacePlaneIntersectionConfig {
+            tolerance: Tolerance::from_distance(1e-7),
+            grid_resolution: 32,
+            marching_step: 0.01,
+            max_curves: 16,
+            param_bounds_override: None,
+        };
+        let curves = intersect_surface_plane(&surface, Point3::ZERO, Vector3::Z, &config)
+            .expect("section should succeed");
+        assert!(!curves.is_empty(), "expected an intersection");
+        let total: usize = curves.iter().map(|c| c.points.len()).sum();
+        // Far below any unbounded-marching blowup: O(grid_resolution) per branch.
+        assert!(
+            total < 16 * 64,
+            "contour must be bounded, got {total} points"
+        );
     }
 }
