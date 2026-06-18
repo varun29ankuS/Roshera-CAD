@@ -9,7 +9,100 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ---
 
-## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
+## ROADMAP — AGENT-HONESTY KERNEL CAMPAIGN + F1-EXERCISE BACKLOG (2026-06-18)
+Varun's directive after the F1 build-and-see exercise: **the kernel's job is to
+make the agent unable to lie — including to itself.** Today a finished `fw_main`
+(a real NURBS-lofted surface) and a `Box` dropped in as a placeholder are
+IDENTICAL objects inside the kernel — nothing records what is designed vs a punt,
+or whether it is actually valid. Ground truth must be STRUCTURAL B-Rep data, not
+a label the LLM writes. Three pillars (see tasks #13/#14/#15):
+
+- **PILLAR 1 — Ground truth per entity (🟡 in progress, #13).** Every solid/face
+  carries (a) PROVENANCE — creating op + inputs + classification
+  (designed-loft/revolve/extrude vs bare-primitive-standin vs boolean-result),
+  and (b) a kernel-computed VALIDITY CERTIFICATE — watertight, b-rep-valid,
+  manifold, Euler balances, self-intersection-free, no zero-area. A
+  "ground-truth" report (extend `perception_json` / new endpoint) answers "what
+  did you make and which parts are real" WITHOUT the LLM. Build on
+  `OperationRecorder` + `validate_solid_scoped` + the persistent-id sidecars.
+  **SLICE 1 LANDED (2026-06-18):** `primitives/provenance.rs` (OperationKind /
+  SolidProvenance / ValidityCertificate / GroundTruth) + `BRepModel` sidecar
+  `solid_provenance` + `certify_solid` (kernel-COMPUTED via validate_solid_scoped
+  + manifold_report) + `ground_truth(id)`; provenance wired for ALL primitives
+  (`assign_primitive_pids`) + nurbs_loft + revolve + boolean; gate
+  `tests/ground_truth.rs` green — a Box now reports `Primitive`/not-designed and a
+  NURBS loft reports designed: they are DISTINGUISHABLE (root defect closed for
+  these op classes). REMAINING: wire extrude/loft/sweep/fillet/chamfer/shell/
+  transform; self-intersection check; `GET /api/agent/parts/{id}/truth` + fold
+  into `perception_json`; certificate memoisation; carry through deep_clone/snapshot.
+- **PILLAR 2 — Property/fuzz invariants + golden files (🔴, #14).** Close the
+  "renders fine" ≠ "is valid" gap NOW. Randomized op-sequence fuzzing asserting
+  manifold / Euler-Poincaré / no self-intersection / no zero-area / tessellation
+  closes — thousands of cases on garbage inputs to surface silent failures (the
+  exact modes that become defective manufactured parts). Golden-file regression
+  so a fix never silently breaks a working case. Extend HARNESS-1000 + the
+  existing oracles, don't restart.
+- **PILLAR 3 — Persistent semantic naming = the moat (🔴, #15).** Stable
+  topological IDs surviving upstream edits + reference-by-description ("largest
+  +Z planar face", "fillet on the top-rear edge") + a kernel that REFUSES an
+  ambiguous reference instead of guessing. The 40-yr naming problem; what a
+  wrapped OCC can't replicate. Build on persistent-ids #11 (PersistentId u128 +
+  Role + sidecars). Parametric families (nozzle/aerofoil) ride on top.
+
+**F1-exercise backlog (limits hit while building a detailed F1 via the API):**
+- 🔴 **Colour/materials in the render** (#10–12, paused) — render is grey lambert
+  only; can't show livery / black tyres / metallic rims. Kernel render per-solid
+  colour DONE (`render_solids_dir`); server colour registry + endpoint + frontend
+  material pending. Biggest realism lever.
+- 🔴 **Robust NURBS boolean** (#17) — differencing a cutter from a NURBS-lateral
+  solid fails (`build_shells_from_faces` invalid); blocks real cockpit/inlet/duct
+  cuts (forced the loft-notch workaround). Ties to the boolean-robustness lane + #24.
+- 🔴 **Loft surfacing control** (#18) — `skin_surface` bulges at section
+  transitions (F1 cockpit/sidepod lumpiness); needs tangency / guide-rail control.
+- 🔴 **Assembly grouping** (#19) — 38 independent solids; wire the assembly module
+  so parts group + transform as a unit and the scene-eye renders a named assembly.
+- 🔴 **Render quality** (#20) — flat lambert (no shadow/AO/ground) reads as clay;
+  add contact shadow + AO + a tessellation-quality param (tyre silhouette facets).
+- 🔴 **Live frontend camera control** (#21) — let the agent drive the 3js camera
+  so agent-render and human-view share one camera (the "live video" idea).
+- 🟢 **Scene-eye** (DONE) — `GET /api/agent/scene/orbit?az&el` composites all
+  solids into one auto-framed image (`render_solids_dir`); the agent sees the
+  whole assembly and iterates build→render→fix instead of guessing.
+- 🟢 **Scene-adaptive viewport camera** (DONE) — dolly range + near/far derived
+  from live scene bounds (was hardcoded 500/2000); 1 mm features and 10 m+
+  assemblies both frame correctly.
+- ⚠️ **Foundation uncommitted** (#16) — the NURBS stack, scene-eye, camera, render
+  colour, and the panic=unwind fix are all working-tree only; commit before the
+  honesty campaign churns more code.
+
+---
+
+## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🟢 FIXED 2026-06-18 — release now `panic="unwind"`
+**The server-killer is resolved.** The panic itself is a third-party `cdt`
+limitation we cannot fully prevent, but it can no longer abort the process. Both
+cdt call sites (`tessellation::surface::triangulate_planar_polygon` and
+`tessellation::curved_cdt::run_cdt`) ALREADY wrap the call in `catch_unwind` and
+degrade a panicked face to a recoverable per-face error — that recovery was a
+DEAD no-op only because the release profile set `panic="abort"` (an abort fires
+before any unwind can be caught). FIX: `roshera-backend/Cargo.toml` release
+profile `panic="abort"` → `panic="unwind"` (the live `demo` profile already
+inherited dev's unwind, which is why the server only died under `--release`).
+REFINED DIAGNOSIS (repro `agent_build_eval::revolved_flange_offset_bore_tessellates_43`,
+run with `ROSHERA_TESS_TRACE=1`): the panic fires on the curved-CDT path (Cone
+faces) during the boolean's GWN operand-CLASSIFICATION tessellation, not only the
+planar annular cap the original report assumed — and the FINAL result mesh
+tessellates clean and watertight regardless (the recovery is lossless here, the
+GWN sign is still computed from the partial triangulation). So under unwind the
+server survives AND the part is correct. REMAINING (quality, NOT a server-killer,
+tracked separately): (a) reduce how often cdt panics at the source (curved-CDT
+Steiner placement / planar annular-cap-with-offset-hole degeneracy — the original
+"harden the planar-CDT path" item), and (b) a robust per-face fallback so a
+panicked face that ISN'T covered by neighbours doesn't leave an export hole
+(today it emits no triangles). The caught panic still prints the default hook
+message to stderr per face — cosmetic log noise, optionally suppressible via a
+scoped panic hook. Original report below.
+
+### (orig) BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
 Differencing a small axial cylinder (bolt hole) out of a REVOLVED solid's
 annular flange PANICS the kernel and — because the release profile is
 `panic="abort"` — takes the whole api-server process down:

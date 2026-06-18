@@ -736,6 +736,50 @@ server.tool(
 );
 
 server.tool(
+  "nurbs_loft",
+  "Build a watertight FREEFORM SOLID by skinning a single NURBS surface through " +
+    "a stack of cross-section rings — the primitive for organic / sculpted shapes " +
+    "that revolve and extrude can't make (bulged barrels, ogives, twisted/lobed " +
+    "transitions, blended ducts). `sections` is an ordered list of cross-sections, " +
+    "each an OPEN ring of [x,y,z] points of the SAME count (the op closes each " +
+    "ring); sections are stacked along the loft. The lateral wall is one genuine " +
+    "NURBS surface interpolated through the rings; at the default degree_v=3 it is " +
+    "G2 (curvature-continuous) along the loft. The first and last sections must be " +
+    "planar (they become the end caps). One op, no booleans, watertight.",
+  {
+    sections: z
+      .array(z.array(z.tuple([z.number(), z.number(), z.number()])).min(3))
+      .min(2)
+      .describe("stack of cross-section rings (each an open ring, equal point count)"),
+    degree_u: z.number().int().min(1).max(7).default(3).describe("degree around the section"),
+    degree_v: z.number().int().min(1).max(7).default(3).describe("degree along the loft (3 = G2)"),
+    name: z.string().optional(),
+  },
+  async ({ sections, degree_u, degree_v, name }) => {
+    try {
+      const r = await api("POST", "/api/geometry/nurbs_loft", {
+        sections,
+        degree_u,
+        degree_v,
+        name: name ?? null,
+      });
+      const id = r.solid_id ?? (await newestPartId());
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? null, // operand for boolean / transform
+          part_id: id,
+          triangles: r?.stats?.triangle_count ?? null,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "section_view",
   "CUTAWAY: slice a part with a plane and return the cross-section as an image " +
     "(steel-filled profile + section area). The way to SEE a hollow interior. " +

@@ -225,6 +225,11 @@ fn sweep_profile_body(
 
     // Record for attached recorders. Include the sweep type discriminant
     // by Debug-formatting since SweepOptions is not Serialize.
+    model.set_solid_provenance(
+        solid_id,
+        crate::primitives::provenance::OperationKind::Sweep,
+        Vec::new(),
+    );
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("sweep_profile")
             .with_parameters(serde_json::json!({

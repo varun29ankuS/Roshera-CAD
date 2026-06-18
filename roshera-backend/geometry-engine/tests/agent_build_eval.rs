@@ -831,3 +831,61 @@ fn eval_revolved_dome() {
     );
     assert_eye_agrees(&m, dome, "hemispherical dome");
 }
+
+/// GATE — BORE-INTO-REVOLVED-FLANGE CDT PANIC (🟢 FIXED 2026-06-18): differencing
+/// an offset Ø8 bolt hole out of a revolved thrust-chamber makes the tessellator
+/// feed `cdt` a config it can't insert a fixed edge for, panicking at
+/// `cdt-0.1.0/src/triangulate.rs:965`. Both cdt call sites wrap the call in
+/// `catch_unwind` and recover the panicked face per-face — but the release profile
+/// set `panic="abort"`, which fires BEFORE any unwind can be caught, so the panic
+/// took the whole api-server process down (the server-killer). FIX: release profile
+/// `panic="abort"` → `panic="unwind"` (Cargo.toml), so the existing recovery runs in
+/// production exactly as it does in dev/test. This test exercises the recovery: the
+/// boolean B-Rep is SOUND (the bore is a real void) and, with the panic caught, the
+/// result mesh is watertight at export density. Run with `ROSHERA_TESS_TRACE=1` to
+/// see the caught cdt panics on the operand-classification cone faces. REMAINING
+/// (quality, not server-killer): reduce the source degeneracy + a robust per-face
+/// fallback so an uncovered panicked face never leaves an export hole.
+#[test]
+fn revolved_flange_offset_bore_tessellates_43() {
+    let mut m = BRepModel::new();
+    // Thrust-chamber meridian: nozzle cone up to an integral annular flange
+    // (top z=200 r35-58, bottom z=178 r43-58).
+    let profile = [
+        (70.0, 0.0),
+        (50.0, 30.0),
+        (30.0, 60.0),
+        (15.0, 90.0),
+        (25.0, 105.0),
+        (35.0, 120.0),
+        (35.0, 200.0),
+        (58.0, 200.0),
+        (58.0, 178.0),
+        (43.0, 178.0),
+        (43.0, 120.0),
+        (33.0, 105.0),
+        (23.0, 90.0),
+        (38.0, 60.0),
+        (58.0, 30.0),
+        (78.0, 0.0),
+    ];
+    let chamber = revolve_ring(&mut m, &profile, 48);
+    // Ø8 bolt hole, offset to radius 50, through the flange only (z170-205).
+    let bolt = cyl(&mut m, Point3::new(50.0, 0.0, 170.0), 4.0, 35.0);
+    let holed = diff(&mut m, chamber, bolt);
+    // The boolean B-Rep is sound — the bore is a genuine void.
+    let v = validate_solid_scoped(&m, holed, Tolerance::default(), ValidationLevel::Standard);
+    assert!(v.is_valid, "flange-bore B-Rep invalid: {:?}", v.errors);
+    // The defect: tessellating the annular flange cap (now carrying the offset
+    // bolt hole) panics cdt → the mesh has open edges (the panicked face emits
+    // nothing). After the fix it must be watertight at export density.
+    let r = manifold_report(&m, holed, 0.001, 1e-6).expect("flange-bore tess");
+    assert_eq!(
+        (r.boundary_edges, r.nonmanifold_edges),
+        (0, 0),
+        "flange-bore not watertight (cdt panicked on the annular cap with an offset hole?): \
+         open={} nm={}",
+        r.boundary_edges,
+        r.nonmanifold_edges
+    );
+}

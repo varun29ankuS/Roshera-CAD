@@ -760,6 +760,11 @@ pub fn fillet_edges(
             v.sort_unstable();
             v
         };
+        model.set_solid_provenance(
+            solid_id,
+            crate::primitives::provenance::OperationKind::Fillet,
+            Vec::new(),
+        );
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("fillet_edges")
                 .with_parameters(serde_json::json!({

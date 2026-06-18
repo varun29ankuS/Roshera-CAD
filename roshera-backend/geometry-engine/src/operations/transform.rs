@@ -113,6 +113,11 @@ fn transform_solid_body(
     }
 
     // Record the operation for timeline / event-sourcing consumers.
+    model.set_solid_provenance(
+        solid,
+        crate::primitives::provenance::OperationKind::Transform,
+        vec![solid_id],
+    );
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("transform_solid")
             .with_parameters(serde_json::json!({

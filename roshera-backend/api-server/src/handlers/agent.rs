@@ -631,6 +631,139 @@ pub async fn part_orbit(
     }))
 }
 
+/// `GET /api/agent/scene/orbit?az&el&mode&size` — the agent's eye on the WHOLE
+/// SCENE. Composites every solid in the model into one frame from an arbitrary
+/// azimuth/elevation (world Z up), auto-framed to the combined bounds. This is
+/// what lets the agent drive the camera and SEE the full assembly (a car, a
+/// mechanism) rather than one part at a time. Read lock only; `404` if the scene
+/// is empty / tessellates to nothing, `400` on an unknown mode.
+pub async fn scene_orbit(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Query(q): Query<OrbitQuery>,
+) -> Result<Json<OrbitResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::math::Vector3;
+    use geometry_engine::render::{render_solids_dir, CanonicalView, RenderMode, RenderOptions};
+
+    let az = q.az.unwrap_or(45.0).to_radians();
+    let el = q.el.unwrap_or(30.0).to_radians();
+    let pos = [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()];
+    let dir = Vector3::new(-pos[0], -pos[1], -pos[2]);
+    let up_hint = if pos[2].abs() > 0.999 {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let mode_name = q.mode.as_deref().unwrap_or("shaded");
+    let mode = match mode_name {
+        "shaded" => RenderMode::Shaded,
+        "ids" => RenderMode::FaceIds,
+        "depth" => RenderMode::Depth,
+        "normals" => RenderMode::Normals,
+        "diagnostic" => RenderMode::Diagnostic,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let size = q.size.unwrap_or(640).clamp(64, 2048);
+
+    let model = model_handle.read().await;
+    let ids: Vec<SolidId> = model.solids.iter().map(|(id, _)| id).collect();
+    if ids.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let frame = render_solids_dir(
+        &model,
+        &ids,
+        &[], // per-solid colours (none yet → grey); colour campaign #10
+        dir,
+        up_hint,
+        &RenderOptions {
+            width: size,
+            height: size,
+            view: CanonicalView::Isometric, // ignored by the direction render
+            mode,
+            ..Default::default()
+        },
+    )
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(OrbitResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        az_deg: q.az.unwrap_or(45.0),
+        el_deg: q.el.unwrap_or(30.0),
+        dir: [dir.x, dir.y, dir.z],
+        mode: mode_name.to_string(),
+        open_edges: frame.open_edges,
+        nonmanifold_edges: frame.nonmanifold_edges,
+    }))
+}
+
+// ───────────────────── ground truth (PILLAR 1) ──────────────────────
+
+/// The kernel's self-reported ground truth for a solid: provenance (what op made
+/// it, designed vs bare primitive) + a COMPUTED validity certificate.
+#[derive(Debug, Clone, Serialize)]
+pub struct TruthResponse {
+    pub solid_id: u32,
+    /// Operation that created it, e.g. "nurbs_loft", "primitive:Box", "boolean".
+    pub origin: String,
+    /// A genuine designed feature (not a bare primitive stand-in / unrecorded).
+    pub designed: bool,
+    pub primitive: bool,
+    pub inputs: Vec<u32>,
+    pub brep_valid: bool,
+    pub watertight: bool,
+    pub manifold: bool,
+    pub euler_characteristic: i64,
+    /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold).
+    pub sound: bool,
+    pub errors: Vec<String>,
+    pub summary: String,
+}
+
+/// `GET /api/agent/parts/{id}/truth` — "what did you actually make, and is it
+/// real?" answered by the KERNEL (provenance + computed certificate), never by
+/// the agent. Read lock only; `404` on unknown id.
+pub async fn part_truth(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Result<Json<TruthResponse>, StatusCode> {
+    let model = model_handle.read().await;
+    let gt = model
+        .ground_truth(id as SolidId)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let (origin, designed, primitive, inputs) = match &gt.provenance {
+        Some(p) => (
+            p.created_by.label(),
+            p.created_by.is_designed(),
+            p.created_by.is_primitive(),
+            p.inputs.clone(),
+        ),
+        None => ("unrecorded".to_string(), false, false, Vec::new()),
+    };
+    let c = &gt.certificate;
+    Ok(Json(TruthResponse {
+        solid_id: id,
+        origin,
+        designed,
+        primitive,
+        inputs,
+        brep_valid: c.brep_valid,
+        watertight: c.watertight,
+        manifold: c.manifold,
+        euler_characteristic: c.euler_characteristic,
+        sound: c.is_sound(),
+        errors: c.errors.clone(),
+        summary: gt.summary(),
+    }))
+}
+
 // ───────────────────── coverage / ambiguity (EYE-5) ─────────────────
 
 /// `GET /api/agent/parts/{id}/coverage` — EYE-5 honesty protocol.

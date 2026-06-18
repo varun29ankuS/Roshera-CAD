@@ -336,6 +336,13 @@ pub struct BRepModel {
     /// Monotonic fallback for root-pid seeds when `current_event_key` is unset.
     /// Snapshotted so a rolled-back primitive creation re-mints the same seed.
     pub root_counter: u64,
+    /// Ground-truth provenance per solid (PILLAR 1): the kernel's own faithful
+    /// record of which operation created each solid, classified primitive vs
+    /// designed. Sidecar (like the PID maps) to keep the SoA stores lean. Set by
+    /// `assign_primitive_pids` (primitives) and by designed operations on
+    /// success; absence is reported honestly as "unrecorded", never assumed.
+    pub solid_provenance:
+        std::collections::HashMap<SolidId, crate::primitives::provenance::SolidProvenance>,
 }
 
 impl BRepModel {
@@ -405,6 +412,7 @@ impl BRepModel {
             pid_to_solid: std::collections::HashMap::new(),
             current_event_key: None,
             root_counter: 0,
+            solid_provenance: std::collections::HashMap::new(),
         }
     }
 
@@ -600,6 +608,78 @@ impl BRepModel {
                 tracing::warn!("operation recorder returned error: {}", e);
             }
         }
+    }
+
+    // ───────────────────── PILLAR 1: ground truth ─────────────────────
+
+    /// Record how a solid was created (primitive vs designed + input solids).
+    /// Called by `assign_primitive_pids` for primitives and by designed
+    /// operations on success.
+    pub fn set_solid_provenance(
+        &mut self,
+        solid_id: SolidId,
+        created_by: crate::primitives::provenance::OperationKind,
+        inputs: Vec<SolidId>,
+    ) {
+        self.solid_provenance.insert(
+            solid_id,
+            crate::primitives::provenance::SolidProvenance::new(created_by, inputs),
+        );
+    }
+
+    /// The kernel's recorded provenance for a solid, if any.
+    pub fn solid_provenance(
+        &self,
+        solid_id: SolidId,
+    ) -> Option<&crate::primitives::provenance::SolidProvenance> {
+        self.solid_provenance.get(&solid_id)
+    }
+
+    /// COMPUTE (never accept) a solid's validity certificate: B-Rep validity
+    /// (`validate_solid_scoped`) + watertight/manifold/Euler from the tessellated
+    /// mesh (`manifold_report`). This is the kernel's own verdict — the agent
+    /// cannot fake it.
+    pub fn certify_solid(
+        &self,
+        solid_id: SolidId,
+    ) -> crate::primitives::provenance::ValidityCertificate {
+        use crate::primitives::provenance::ValidityCertificate;
+        use crate::primitives::validation::{validate_solid_scoped, ValidationLevel};
+        let v = validate_solid_scoped(self, solid_id, self.tolerance, ValidationLevel::Standard);
+        let (watertight, manifold, euler, be, nm) =
+            match crate::harness::watertight::manifold_report(self, solid_id, 0.1, 1e-6) {
+                Some(r) => (
+                    r.boundary_edges == 0,
+                    r.nonmanifold_edges == 0,
+                    r.euler_characteristic,
+                    r.boundary_edges,
+                    r.nonmanifold_edges,
+                ),
+                None => (false, false, 0, 0, 0),
+            };
+        ValidityCertificate {
+            brep_valid: v.is_valid,
+            watertight,
+            manifold,
+            euler_characteristic: euler,
+            boundary_edges: be,
+            nonmanifold_edges: nm,
+            errors: v.errors.iter().map(|e| format!("{e:?}")).collect(),
+        }
+    }
+
+    /// The kernel's ground-truth answer for a solid: provenance + computed
+    /// certificate. `None` if the solid does not exist. PILLAR 1.
+    pub fn ground_truth(
+        &self,
+        solid_id: SolidId,
+    ) -> Option<crate::primitives::provenance::GroundTruth> {
+        self.solids.get(solid_id)?;
+        Some(crate::primitives::provenance::GroundTruth {
+            solid_id,
+            provenance: self.solid_provenance.get(&solid_id).cloned(),
+            certificate: self.certify_solid(solid_id),
+        })
     }
 
     /// Open a transactional recording scope on the attached recorder, if
@@ -2445,6 +2525,14 @@ impl<'a> TopologyBuilder<'a> {
         let seed = self.model.next_root_seed(&format!("{kind:?}"));
         let solid_pid = PersistentId::root(&seed);
         self.model.set_solid_pid(solid_id, solid_pid);
+
+        // PILLAR 1: a primitive is honestly tagged as a bare stand-in, never a
+        // designed surface. Single chokepoint for box/sphere/cylinder/cone/torus.
+        self.model.set_solid_provenance(
+            solid_id,
+            crate::primitives::provenance::OperationKind::Primitive(kind),
+            Vec::new(),
+        );
 
         let face_ids: Vec<FaceId> = {
             let mut fs = Vec::new();

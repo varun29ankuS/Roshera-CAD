@@ -911,6 +911,18 @@ fn perception_json(
     // solid is closed (0/0). When unsound, surface the display-mesh counts as a
     // best-effort diagnostic of where the boundary opened up.
     let (open, nm) = if valid { (0, 0) } else { (mesh_open, mesh_nm) };
+    // PILLAR 1 — ground-truth provenance on every build response: WHAT operation
+    // made this solid and whether it is a designed surface vs a bare primitive
+    // stand-in. Cheap O(1) sidecar lookup (no extra tessellation). The full
+    // computed certificate is on GET /api/agent/parts/{id}/truth.
+    let provenance = model.solid_provenance(solid_id).map(|p| {
+        serde_json::json!({
+            "created_by": p.created_by.label(),
+            "designed":   p.created_by.is_designed(),
+            "primitive":  p.created_by.is_primitive(),
+            "inputs":     p.inputs,
+        })
+    });
     serde_json::json!({
         "sound":             valid,
         "valid":             valid,
@@ -919,6 +931,7 @@ fn perception_json(
         "open_edges":        open,
         "nonmanifold_edges": nm,
         "dims":              dims,
+        "provenance":        provenance,
     })
 }
 
@@ -3461,6 +3474,171 @@ async fn create_revolve_primitive(
             "id":         result_id_str,
             "name":       name,
             "objectType": "revolve",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
+/// POST /api/geometry/nurbs_loft — skin a watertight NURBS solid through a stack
+/// of cross-section rings. The lateral wall is a single freeform NURBS surface
+/// (`GeneralNurbsSurface`) interpolated through the sections; at the default
+/// `degree_v = 3` it is G2 (curvature-continuous) along the loft. Request:
+/// `{ "sections": [[[x,y,z],...], ...], "degree_u": 3, "degree_v": 3, "name": ? }`
+/// — each section an OPEN ring of equal point count (the op closes the ring); the
+/// first and last sections must be planar (they become the end caps).
+async fn create_nurbs_loft_primitive(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::operations::nurbs_loft::{nurbs_loft, NurbsLoftOptions};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let sections_raw = payload
+        .get("sections")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::missing_field("sections"))?;
+    if sections_raw.len() < 2 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "nurbs_loft needs at least 2 sections".to_string(),
+        ));
+    }
+    let mut sections: Vec<Vec<Point3>> = Vec::with_capacity(sections_raw.len());
+    for (si, sec) in sections_raw.iter().enumerate() {
+        let pts = sec.as_array().filter(|a| a.len() >= 3).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("section {si} must be an array of at least 3 [x,y,z] points"),
+            )
+        })?;
+        let mut ring = Vec::with_capacity(pts.len());
+        for p in pts {
+            let a = p.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("each point in section {si} must be [x, y, z]"),
+                )
+            })?;
+            let (x, y, z) = (
+                a[0].as_f64().unwrap_or(f64::NAN),
+                a[1].as_f64().unwrap_or(f64::NAN),
+                a[2].as_f64().unwrap_or(f64::NAN),
+            );
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("section {si} has a non-finite point"),
+                ));
+            }
+            ring.push(Point3::new(x, y, z));
+        }
+        sections.push(ring);
+    }
+    let degree_u = payload
+        .get("degree_u")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3)
+        .clamp(1, 7) as usize;
+    let degree_v = payload
+        .get("degree_v")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3)
+        .clamp(1, 7) as usize;
+    let display_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let n_sections = sections.len();
+    let ring_points = sections[0].len();
+
+    let result_solid_id = {
+        let mut model = model_handle.write().await;
+        nurbs_loft(
+            &mut model,
+            sections,
+            NurbsLoftOptions {
+                degree_u,
+                degree_v,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("nurbs_loft failed: {e:?}"),
+            )
+        })?
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let t = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        (mesh, t.elapsed().as_millis() as u64)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = display_name.unwrap_or_else(|| format!("NURBS Loft {result_solid_id}"));
+    let parameters = serde_json::json!({
+        "sections": n_sections, "ring_points": ring_points,
+        "degree_u": degree_u, "degree_v": degree_v,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "nurbs_loft",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    let perception = {
+        let model = model_handle.read().await;
+        perception_json(&model, result_solid_id, &tri_mesh)
+    };
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "perception": perception,
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "nurbs_loft",
             "mesh": {
                 "vertices": vertices,
                 "indices":  indices,
@@ -6516,6 +6694,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             )),
         )
         .route(
+            "/api/geometry/nurbs_loft",
+            post(create_nurbs_loft_primitive).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
             "/api/geometry/face/extrude",
             post(extrude_face_endpoint).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_modify_geometry,
@@ -6931,6 +7115,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/{id}/orbit",
             get(handlers::agent::part_orbit),
+        )
+        .route("/api/agent/scene/orbit", get(handlers::agent::scene_orbit))
+        .route(
+            "/api/agent/parts/{id}/truth",
+            get(handlers::agent::part_truth),
         )
         .route(
             "/api/agent/pointer",
