@@ -229,12 +229,16 @@ server.tool(
       .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
       .default("shaded"),
     size: z.number().int().min(64).max(2048).default(720),
+    quality: z
+      .enum(["coarse", "medium", "fine"])
+      .default("medium")
+      .describe("mesh tessellation quality: coarse=fast, fine=resolve curved silhouettes"),
   },
-  async ({ az, el, mode, size }) => {
+  async ({ az, el, mode, size, quality }) => {
     try {
       const r = await api(
         "GET",
-        `/api/agent/scene/orbit?az=${az}&el=${el}&mode=${mode}&size=${size}`,
+        `/api/agent/scene/orbit?az=${az}&el=${el}&mode=${mode}&size=${size}&quality=${quality}`,
       );
       return {
         content: [
