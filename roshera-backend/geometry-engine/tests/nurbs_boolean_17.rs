@@ -101,3 +101,53 @@ fn nurbs_minus_box_should_be_watertight() {
         gt.summary()
     );
 }
+
+/// EXPLORATION (#[ignore]): is a CLEAN single-wall blind pocket watertight? The
+/// `should_be_watertight` cutter is a nasty partial overlap (pokes through both
+/// walls + sits below the base cap). This isolates whether corefinement already
+/// works for a WELL-POSED cut — a small box driven into the +X wall at mid-height
+/// (away from the caps and the far wall). Run with `--ignored --nocapture` to see
+/// the certificate summary; the result tells us if #17 is "works for clean cuts,
+/// degenerate cases pending" vs "fundamentally unshared".
+#[test]
+#[ignore = "#17 exploration: clean single-wall blind pocket watertightness"]
+fn nurbs_clean_blind_pocket() {
+    use geometry_engine::math::Vector3;
+    use geometry_engine::operations::transform::{translate, TransformOptions};
+
+    let mut m = BRepModel::new();
+    let b = barrel(&mut m);
+    let cutter = boxs(&mut m, 2.0, 2.0, 2.0); // centred at origin: [-1,1]^3
+                                              // Drive into the +X wall (barrel radius ~4 at mid-height) at z = 3.
+    translate(
+        &mut m,
+        vec![cutter],
+        Vector3::X,
+        4.0,
+        TransformOptions::default(),
+    )
+    .expect("tx");
+    translate(
+        &mut m,
+        vec![cutter],
+        Vector3::Z,
+        3.0,
+        TransformOptions::default(),
+    )
+    .expect("tz");
+    let result = boolean_operation(
+        &mut m,
+        b,
+        cutter,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("clean pocket should complete");
+    let gt = m.ground_truth(result).expect("gt");
+    eprintln!("CLEAN POCKET: {}", gt.summary());
+    assert!(
+        gt.certificate.is_sound(),
+        "clean blind pocket should be watertight: {}",
+        gt.summary()
+    );
+}

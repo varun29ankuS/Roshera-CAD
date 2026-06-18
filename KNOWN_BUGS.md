@@ -97,6 +97,15 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   currently returns Ok with this non-watertight solid (the certificate flags it)
   — reaching watertight is the fix; gating to Err is the fallback. Ties to #35 +
   the boolean-robustness lane + #24.
+  UPDATE 2026-06-19: traced — result is ONE connected shell (components=1) with
+  4 unshared boundary edges; weld collapses=0 (the NURBS-rim cut endpoint has no
+  coincident box vertex). A CLEAN single-wall blind pocket ALSO fails
+  (tests/nurbs_boolean_17.rs::nurbs_clean_blind_pocket, ignored) → GENERAL
+  corefinement gap, not degenerate geometry. Primary fix = shared-imprint (create
+  the cut edge ONCE with shared vertices, referenced by both operand faces),
+  details in memory `nurbs-corefinement-17`. Touches the core weld path shared by
+  ALL booleans → must be done in isolation with tests/poke_matrix green after; not
+  a rushed change. Kernel stays HONEST meanwhile (certificate reports unsound).
 - 🔴 **Loft surfacing control** (#18) — `skin_surface` bulges at section
   transitions (F1 cockpit/sidepod lumpiness); needs tangency / guide-rail control.
 - 🔴 **Assembly grouping** (#19) — 38 independent solids; wire the assembly module
