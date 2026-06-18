@@ -28,6 +28,7 @@ pub mod dimensioning;
 pub mod dxf;
 pub mod pdf;
 pub mod projection;
+pub mod section_view;
 pub mod svg;
 pub mod types;
 pub mod verify;
@@ -43,6 +44,7 @@ pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{
     project_solid_edges, project_solid_view, view_matrix_for_projection, ProjectionError,
 };
+pub use section_view::section_view;
 pub use svg::render_drawing_svg;
 pub use types::{
     Drawing, DrawingId, Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize,

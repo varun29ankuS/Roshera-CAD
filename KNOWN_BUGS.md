@@ -34,6 +34,22 @@ visible side). Lower priority — the wireframe pictorial is clean and conventio
 
 ---
 
+## DRAWING: SECTION view 🟡 works on planar solids; curved/boolean solids cut empty (2026-06-18)
+NEW: `drawing::section_view` (drawing/section_view.rs) generates a real SECTION
+view — cut the solid on a plane via `section_solid_by_plane`, project the cap
+triangles into the plane frame, trace the boundary outline + scan-fill 45° ISO-128
+HATCHING (triangle-clipped so bores/voids stay un-hatched), returns a
+`ProjectedView`. Verified: a box section renders a clean hatched "SECTION A-A"
+profile (render_drawing_demo → _drawing_section.pdf). GAP: the underlying
+`section_solid_by_plane` returns ZERO caps for a curved/boolean solid (a bored
+flanged housing cut through its axis → caps=0) while a box → caps=1. So sections
+only work on planar solids today. NEXT: (a) fix `section_solid_by_plane` to handle
+cylinder/cone laterals + boolean solids (the cut should produce the stepped
+profile + the bore slot); (b) integrate the section as an auto view in
+standard_drawing (cut-plane indicator + "SECTION A-A" label on the parent view);
+(c) expose plane + section in the make_drawing MCP tool / REST. The section_view +
+hatch code is sound — the blocker is the section OP on curved solids.
+
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🟡 SERVER-KILLER FIXED; mesh still drops the hole (2026-06-18)
 UPDATE (slice #1, commit 66a3588): the SERVER-KILLER half is FIXED. The
 tessellation already wrapped `cdt::triangulate_contours` in `catch_unwind`, but
