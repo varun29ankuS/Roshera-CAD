@@ -195,6 +195,63 @@ server.tool(
 );
 
 server.tool(
+  "ground_truth",
+  "ASK THE KERNEL what a part actually is and whether it's real — the kernel's " +
+    "OWN account, not a guess. Returns PROVENANCE (which operation made it: a " +
+    "designed surface — nurbs_loft / revolve / extrude / loft / sweep / boolean / " +
+    "fillet / chamfer — vs a bare PRIMITIVE stand-in like a box/cylinder) and the " +
+    "kernel-COMPUTED validity certificate (brep_valid, watertight, manifold, " +
+    "euler, sound + a one-line summary). The kernel cannot misrepresent this, so " +
+    "use it to confirm a build is a genuine closed DESIGNED solid before trusting " +
+    "or reporting it — `designed:false`/`sound:false` means stop and fix, not ship.",
+  { part_id: z.number().int().describe("kernel part id from list_parts") },
+  async ({ part_id }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/${part_id}/truth`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "scene_view",
+  "SEE THE WHOLE SCENE: composite EVERY part into one image from an arbitrary " +
+    "camera (azimuth/elevation, world-Z up), auto-framed to the combined bounds. " +
+    "The way to look at a multi-part ASSEMBLY (a car, a mechanism) as a whole " +
+    "instead of one part at a time — change az/el to orbit and inspect from any " +
+    "angle. `mode:'diagnostic'` highlights open (red) / non-manifold (magenta) " +
+    "edges across the assembly.",
+  {
+    az: z.number().default(35).describe("azimuth degrees around world Z"),
+    el: z.number().default(20).describe("elevation degrees above the horizon"),
+    mode: z
+      .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
+      .default("shaded"),
+    size: z.number().int().min(64).max(2048).default(720),
+  },
+  async ({ az, el, mode, size }) => {
+    try {
+      const r = await api(
+        "GET",
+        `/api/agent/scene/orbit?az=${az}&el=${el}&mode=${mode}&size=${size}`,
+      );
+      return {
+        content: [
+          { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+          {
+            type: "text" as const,
+            text: `scene az=${az}° el=${el}° dir=${JSON.stringify(r.dir)} open=${r.open_edges} nm=${r.nonmanifold_edges}`,
+          },
+        ],
+      };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "verify_part",
   "SELF-CHECK a part's geometry. The verdict is the SOUND, mesh-independent " +
     "B-Rep check (validate_solid_scoped via /perception): brep_valid is the " +
