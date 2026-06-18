@@ -657,6 +657,33 @@ cone/cyl/sphere suites + poke 14/15. LESSON: a closed-curve (seam) edge's
 `param_range.start` MUST sit at its `start_vertex` (= `curve.evaluate(0)`).
 See memory `cone-rim-seam-alignment.md`.
 
+### #89 🟢 FIXED — fillet a CONE-WALLED rim (Plane–Cone closed edge) (2026-06-18)
+Closed-edge fillet previously returned `NotImplemented` for a Plane–Cone rim (a
+frustum / cone cap rim) — only Plane–Cylinder rims were supported. Now
+`cone_rim_fillet` (fillet.rs) handles it: the rolling-ball blend on a plane/cone
+rim is still a Torus by rotational symmetry, so it solves the ball centre + the two
+surface contacts at ONE rim point (analytic, from the outward face normals) and
+revolves them — Torus carrier (major = ball-centre radius, minor = r), two trim
+circles, a meridian seam arc (sweep 90°±half-angle) — then the same seamed-loop
+surgery `cylinder_rim_fillet` uses, re-trimming the Cone (clone + new
+`height_limits`). Produces a SOUND, mesh-WATERTIGHT solid (verified on a solid
+frustum AND a hollow cone-tube). THREE sub-bugs had to fall: (1) the cone normal
+must be taken ANALYTICALLY in the rim meridian — `get_face_oriented_normal`
+projects to find (u,v) and `create_cone_3d`'s `ref_dir` is offset from the rim
+seam, so the projected normal tilts off-meridian and throws the ball centre
+off-axis; (2) the lateral trim circle is swept −u so the cone's curved-CDT outer
+loop unwraps to a clean rectangle (a +u circle doubles the UV contour →
+CrossingFixedEdge → non-welding grid fallback); (3) FUNDAMENTAL — `Torus::
+closest_point` blindly clamped v to [0,2π), which is wrong for a trimmed torus
+patch that straddles the outer-equator seam v=0 (every cone-rim blend does, by the
+half-angle): it now keeps the raw signed v when `param_limits` v-min < 0, so the
+torus↔cone weld lands on the right meridian. Gates: `gen_filleted_cone_rim`
+(agent_build_eval), `cone_walled_rim_fillet_succeeds` (closed_edge_bore_rim_blends).
+NO REGRESSION across fillet/chamfer/closed-edge/dihedral/revolve suites. LESSON:
+a periodic surface's `closest_point` must respect the patch's param domain, not a
+blind [0,2π) normalize. CONE/TORUS/general-revolve closed-edge fillets beyond the
+plane-cone rim remain the open part of #89.
+
 ### #27/#32 frustum throat 🟢 FIXED — coincident closed-circle rims not welded (commit 7af8e4e)
 Sibling of the cone "rocket": surfaced building a de Laval rocket nozzle via the
 API (`convergent r6→r20 ∪ divergent r18→r6` sharing the r6 throat circle). The

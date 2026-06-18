@@ -1509,14 +1509,19 @@ fn gen_rounded_cylinder() {
     );
 }
 
-/// ROSTER probe of the #89 FRONTIER: a blend on a CONE-WALLED rim. Closed-edge
-/// fillet currently supports only Plane–Cylinder rims; a Plane–Cone rim (a
-/// frustum's cap rim, whose lateral is a Cone) returns NotImplemented
-/// (fillet.rs ~1534, task #89). This is a CHARACTERIZATION test: it pins that
-/// boundary — when #89 lands cone-rim blends, this assertion fails, flagging that
-/// the test should become a real verify_comprehensive gate.
+/// ROSTER gate — #89 FIXED: closed-edge fillet now supports Plane–Cone rims (a
+/// frustum's cap rim, whose lateral is a Cone) via `cone_rim_fillet` — an
+/// analytic torus carrier derived from a single rolling-ball solve. Filleting the
+/// base rim of a frustum SUCCEEDS, adds exactly one torus blend face, and leaves
+/// a SOUND, mesh-WATERTIGHT solid. Three fixes made it watertight: (1) the cone
+/// outward normal is taken analytically in the rim meridian (the projection-based
+/// normal tilts off-meridian because `create_cone_3d`'s `ref_dir` is offset from
+/// the rim seam); (2) the lateral trim circle is swept −u so the cone's curved-
+/// CDT boundary unwraps to a clean rectangle; (3) `Torus::closest_point` honours a
+/// seam-straddling param domain (the blend rides the outer equator v=0) so the
+/// torus↔cone weld lands on the right meridian.
 #[test]
-fn cone_walled_rim_fillet_is_89_notimplemented() {
+fn gen_filleted_cone_rim() {
     let mut m = BRepModel::new();
     let cone = match TopologyBuilder::new(&mut m)
         .create_cone_3d(Point3::ZERO, Vector3::Z, 40.0, 20.0, 60.0)
@@ -1544,7 +1549,7 @@ fn cone_walled_rim_fillet_is_89_notimplemented() {
         1,
         "expected exactly 1 base-rim closed edge, got {rim:?}"
     );
-    let result = fillet_edges(
+    let blend = fillet_edges(
         &mut m,
         cone,
         rim,
@@ -1553,11 +1558,73 @@ fn cone_walled_rim_fillet_is_89_notimplemented() {
             radius: 5.0,
             ..Default::default()
         },
+    )
+    .expect("cone-rim fillet must now succeed (#89)");
+    assert_eq!(
+        blend.len(),
+        1,
+        "cone-rim fillet must add exactly one torus blend face, added {}",
+        blend.len()
     );
-    assert!(
-        matches!(result, Err(OperationError::NotImplemented(_))),
-        "#89 boundary moved: a cone-walled (Plane–Cone) rim fillet returned {result:?}, \
-         not NotImplemented — if cone-rim blends now work, promote this to a \
-         verify_comprehensive gate"
+    let v = validate_solid_scoped(&m, cone, Tolerance::default(), ValidationLevel::Standard);
+    assert!(v.is_valid, "filleted frustum B-Rep INVALID: {:?}", v.errors);
+    let r = manifold_report(&m, cone, 0.5, 1e-6).expect("mesh");
+    assert_eq!(
+        (r.boundary_edges, r.nonmanifold_edges),
+        (0, 0),
+        "filleted frustum not watertight: open={} nm={}",
+        r.boundary_edges,
+        r.nonmanifold_edges
     );
+}
+
+/// Visual demo of the #89 cone-rim fillet — writes a shaded isometric PNG of a
+/// frustum with an r8 rounded base rim. `cargo test render_cone_fillet_demo --
+/// --ignored`.
+#[test]
+#[ignore = "render demo — writes _cone_fillet.png"]
+fn render_cone_fillet_demo() {
+    use geometry_engine::render::{render_solid, CanonicalView, RenderMode, RenderOptions};
+    let mut m = BRepModel::new();
+    let cone = match TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::ZERO, Vector3::Z, 40.0, 22.0, 60.0)
+        .expect("frustum")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("{o:?}"),
+    };
+    let rim: Vec<EdgeId> = m
+        .edges
+        .iter()
+        .filter(|(_, e)| e.is_loop())
+        .filter(|(_, e)| {
+            m.vertices
+                .get_position(e.start_vertex)
+                .map(|p| p[2].abs() < 1e-6)
+                .unwrap_or(false)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    fillet_edges(
+        &mut m,
+        cone,
+        rim,
+        FilletOptions {
+            fillet_type: FilletType::Constant(8.0),
+            radius: 8.0,
+            ..Default::default()
+        },
+    )
+    .expect("round the base rim r8");
+    let opts = RenderOptions {
+        width: 720,
+        height: 720,
+        view: CanonicalView::Isometric,
+        mode: RenderMode::Shaded,
+        ..Default::default()
+    };
+    let frame = render_solid(&m, cone, &opts).expect("render frame");
+    let png = frame.to_png().expect("encode png");
+    std::fs::write("C:/Users/Varun Sharma/Roshera-merge/_cone_fillet.png", &png)
+        .expect("write png");
 }
