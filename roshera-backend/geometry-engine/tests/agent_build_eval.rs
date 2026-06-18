@@ -16,10 +16,11 @@
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Matrix4, Point3, Tolerance, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+use geometry_engine::operations::fillet::{fillet_edges, FilletOptions, FilletType};
 use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
 use geometry_engine::operations::transform::{transform_solid, TransformOptions};
 use geometry_engine::primitives::curve::{Line, ParameterRange};
-use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
@@ -146,6 +147,52 @@ fn assert_recognizes_bore(
         found >= min_count,
         "[{part}] eye recognized {found} Ø{diameter:.1} bore(s), expected ≥{min_count}; saw {dias:?}"
     );
+}
+
+/// Collect a solid's VERTICAL edges (parallel to Z: endpoints differ only in z).
+/// Used to fillet a box's four corner edges.
+fn vertical_edges(m: &BRepModel, sid: SolidId) -> Vec<EdgeId> {
+    let solid = m.solids.get(sid).expect("solid");
+    let shells: Vec<_> = std::iter::once(solid.outer_shell)
+        .chain(solid.inner_shells.iter().copied())
+        .collect();
+    let mut eids: std::collections::HashSet<EdgeId> = std::collections::HashSet::new();
+    for shid in shells {
+        if let Some(sh) = m.shells.get(shid) {
+            for &fid in &sh.faces {
+                if let Some(f) = m.faces.get(fid) {
+                    for &lid in std::iter::once(&f.outer_loop).chain(f.inner_loops.iter()) {
+                        if let Some(lp) = m.loops.get(lid) {
+                            for &eid in &lp.edges {
+                                eids.insert(eid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<EdgeId> = eids
+        .into_iter()
+        .filter(|&eid| {
+            if let Some(e) = m.edges.get(eid) {
+                if let (Some(a), Some(b)) = (
+                    m.vertices.get_position(e.start_vertex),
+                    m.vertices.get_position(e.end_vertex),
+                ) {
+                    let (dx, dy, dz) = (
+                        (a[0] - b[0]).abs(),
+                        (a[1] - b[1]).abs(),
+                        (a[2] - b[2]).abs(),
+                    );
+                    return dz > 1.0 && dx < 1e-6 && dy < 1e-6;
+                }
+            }
+            false
+        })
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 fn box_solid(m: &mut BRepModel, w: f64, h: f64, d: f64) -> SolidId {
@@ -1330,4 +1377,44 @@ fn gen_bolt_circle_flange() {
     // SEMANTIC: the eye must recognize all six Ø12 bolt holes + the Ø40 centre bore.
     assert_recognizes_bore(&m, flange, 12.0, 6, "bolt-circle flange");
     assert_recognizes_bore(&m, flange, 40.0, 1, "bolt-circle flange");
+}
+
+/// ROSTER part: a filleted block — a 60×60×40 box with its FOUR vertical edges
+/// rounded (r5 constant fillet) then a Ø20 through-bore. Exercises the FILLET/
+/// BLEND op + fillet-face tessellation (a path no other roster gate touches), and
+/// follows the live-build recipe: BLEND ON CLEAN GEOMETRY before the boolean
+/// (fillet first, then bore — chamfer/fillet-after-boolean is the #37 trap).
+#[test]
+fn gen_filleted_block() {
+    let mut m = BRepModel::new();
+    let block = box_solid(&mut m, 60.0, 60.0, 40.0); // x,y[-30,30] z[-20,20]
+    let edges = vertical_edges(&m, block);
+    assert_eq!(
+        edges.len(),
+        4,
+        "expected 4 vertical box edges, got {edges:?}"
+    );
+    fillet_edges(
+        &mut m,
+        block,
+        edges,
+        FilletOptions {
+            fillet_type: FilletType::Constant(5.0),
+            radius: 5.0,
+            ..Default::default()
+        },
+    )
+    .expect("fillet 4 vertical edges (r5)");
+    // Bore AFTER the blend (clean-geometry-first).
+    let bore = cyl(&mut m, Point3::new(0.0, 0.0, -25.0), 10.0, 50.0); // Ø20 through
+    let holed = diff(&mut m, block, bore);
+    // V = 60·60·40 − 4·(1−π/4)·5²·40 − π·10²·40 = 144000 − 858 − 12566 = 130576;
+    // fillet + bore facets undershoot slightly.
+    verify_comprehensive(&m, holed, "filleted block", 127_000.0, 132_000.0);
+    let d = world_dims(&m, holed);
+    assert!(
+        (d[0] - 60.0).abs() < 0.5 && (d[1] - 60.0).abs() < 0.5 && (d[2] - 40.0).abs() < 0.5,
+        "filleted-block envelope wrong: {d:?}"
+    );
+    assert_recognizes_bore(&m, holed, 20.0, 1, "filleted block");
 }
