@@ -195,6 +195,237 @@ pub fn resolve_face(
     }
 }
 
+// ───────────────────── edge selection ──────────────────────────────
+
+/// Curve-kind filter (matches `Curve::type_name()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurveKind {
+    Any,
+    Line,
+    Arc,
+    Circle,
+    Nurbs,
+}
+
+impl CurveKind {
+    fn matches(self, type_name: &str) -> bool {
+        match self {
+            CurveKind::Any => true,
+            CurveKind::Line => type_name == "Line",
+            CurveKind::Arc => type_name == "Arc",
+            CurveKind::Circle => type_name == "Circle",
+            CurveKind::Nurbs => type_name.starts_with("Nurbs"),
+        }
+    }
+}
+
+/// Blend-state filter — addresses "the fillet edge" / "the unblended edges".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendFilter {
+    Any,
+    Filleted,
+    Chamfered,
+    Unblended,
+}
+
+impl BlendFilter {
+    fn matches(self, k: Option<crate::primitives::solid::BlendKind>) -> bool {
+        use crate::primitives::solid::BlendKind;
+        match self {
+            BlendFilter::Any => true,
+            BlendFilter::Filleted => matches!(k, Some(BlendKind::Fillet)),
+            BlendFilter::Chamfered => matches!(k, Some(BlendKind::Chamfer)),
+            BlendFilter::Unblended => k.is_none(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EdgeExtremal {
+    None,
+    Longest,
+    Shortest,
+    /// The edge whose midpoint is farthest along `dir`.
+    MostAlong(Vector3),
+}
+
+/// A descriptive edge reference.
+#[derive(Debug, Clone)]
+pub struct EdgeQuery {
+    pub kind: CurveKind,
+    pub blend: BlendFilter,
+    /// Require the edge's chord direction to align with this (sign-insensitive).
+    pub direction: Option<Vector3>,
+    pub angle_tol_deg: f64,
+    pub extremal: EdgeExtremal,
+}
+
+impl EdgeQuery {
+    pub fn new(kind: CurveKind) -> Self {
+        Self {
+            kind,
+            blend: BlendFilter::Any,
+            direction: None,
+            angle_tol_deg: 12.0,
+            extremal: EdgeExtremal::None,
+        }
+    }
+    pub fn blend(mut self, b: BlendFilter) -> Self {
+        self.blend = b;
+        self
+    }
+    pub fn along(mut self, dir: Vector3) -> Self {
+        self.direction = Some(dir);
+        self
+    }
+    pub fn extremal(mut self, e: EdgeExtremal) -> Self {
+        self.extremal = e;
+        self
+    }
+}
+
+fn solid_edge_ids(model: &BRepModel, solid: SolidId) -> Vec<crate::primitives::edge::EdgeId> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if let Some(s) = model.solids.get(solid) {
+        for sh in s.shell_ids() {
+            if let Some(shell) = model.shells.get(sh) {
+                for &fid in &shell.faces {
+                    if let Some(face) = model.faces.get(fid) {
+                        let mut lids = vec![face.outer_loop];
+                        lids.extend_from_slice(&face.inner_loops);
+                        for lid in lids {
+                            if let Some(lp) = model.loops.get(lid) {
+                                for &e in &lp.edges {
+                                    if seen.insert(e) {
+                                        out.push(e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Length (cached) or midpoint·dir for the extremal pick — split field borrows.
+fn edge_metric(
+    model: &mut BRepModel,
+    eid: crate::primitives::edge::EdgeId,
+    e: EdgeExtremal,
+) -> Option<f64> {
+    match e {
+        EdgeExtremal::Longest | EdgeExtremal::Shortest => {
+            let BRepModel { edges, curves, .. } = model;
+            let edge = edges.get_mut(eid)?;
+            edge.length(curves, crate::math::Tolerance::default()).ok()
+        }
+        EdgeExtremal::MostAlong(d) => {
+            let edge = model.edges.get(eid)?;
+            let a = model.vertices.get(edge.start_vertex)?.point();
+            let b = model.vertices.get(edge.end_vertex)?.point();
+            Some(0.5 * ((a.x + b.x) * d.x + (a.y + b.y) * d.y + (a.z + b.z) * d.z))
+        }
+        EdgeExtremal::None => None,
+    }
+}
+
+/// Resolve a descriptive edge reference to a single `EdgeId`, or refuse.
+pub fn resolve_edge(
+    model: &mut BRepModel,
+    solid: SolidId,
+    q: &EdgeQuery,
+) -> Result<crate::primitives::edge::EdgeId, SelectError> {
+    let cos_tol = q.angle_tol_deg.to_radians().cos();
+    let want_dir = q.direction.and_then(|d| d.normalize().ok());
+
+    let mut matches: Vec<crate::primitives::edge::EdgeId> = Vec::new();
+    for eid in solid_edge_ids(model, solid) {
+        let edge = match model.edges.get(eid) {
+            Some(e) => e,
+            None => continue,
+        };
+        let cn = model
+            .curves
+            .get(edge.curve_id)
+            .map(|c| c.type_name())
+            .unwrap_or("");
+        if !q.kind.matches(cn) {
+            continue;
+        }
+        let blend = model
+            .solids
+            .get(solid)
+            .and_then(|s| s.blend_kind_at_edge(eid));
+        if !q.blend.matches(blend) {
+            continue;
+        }
+        if let Some(d) = want_dir {
+            let a = model.vertices.get(edge.start_vertex).map(|v| v.point());
+            let b = model.vertices.get(edge.end_vertex).map(|v| v.point());
+            match (a, b) {
+                (Some(a), Some(b)) => match (b - a).normalize() {
+                    Ok(span) if span.dot(&d).abs() >= cos_tol => {}
+                    _ => continue,
+                },
+                _ => continue,
+            }
+        }
+        matches.push(eid);
+    }
+
+    if matches.is_empty() {
+        return Err(SelectError::NotFound);
+    }
+    match q.extremal {
+        EdgeExtremal::None => {
+            if matches.len() == 1 {
+                Ok(matches[0])
+            } else {
+                Err(SelectError::Ambiguous(matches))
+            }
+        }
+        e => {
+            let mut scored: Vec<(crate::primitives::edge::EdgeId, f64)> = Vec::new();
+            for &eid in &matches {
+                if let Some(s) = edge_metric(model, eid, e) {
+                    scored.push((eid, s));
+                }
+            }
+            if scored.is_empty() {
+                return Err(SelectError::NotFound);
+            }
+            let want_max = !matches!(e, EdgeExtremal::Shortest);
+            let best = scored
+                .iter()
+                .cloned()
+                .reduce(|a, b| {
+                    if (want_max && b.1 > a.1) || (!want_max && b.1 < a.1) {
+                        b
+                    } else {
+                        a
+                    }
+                })
+                .map(|(_, s)| s)
+                .unwrap_or(0.0);
+            let band = best.abs().max(1.0) * 0.01;
+            let near: Vec<crate::primitives::edge::EdgeId> = scored
+                .iter()
+                .filter(|(_, s)| (s - best).abs() <= band)
+                .map(|(x, _)| *x)
+                .collect();
+            if near.len() == 1 {
+                Ok(near[0])
+            } else {
+                Err(SelectError::Ambiguous(near))
+            }
+        }
+    }
+}
+
 /// Score one face for the extremal pick, with the split field borrows
 /// `compute_stats` needs. Returns area or centroid·dir.
 fn face_score(model: &mut BRepModel, fid: FaceId, e: Extremal) -> Option<f64> {

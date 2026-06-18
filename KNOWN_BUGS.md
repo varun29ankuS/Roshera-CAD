@@ -63,8 +63,17 @@ a label the LLM writes. Three pillars (see tasks #13/#14/#15):
   topological IDs surviving upstream edits + reference-by-description ("largest
   +Z planar face", "fillet on the top-rear edge") + a kernel that REFUSES an
   ambiguous reference instead of guessing. The 40-yr naming problem; what a
-  wrapped OCC can't replicate. Build on persistent-ids #11 (PersistentId u128 +
-  Role + sidecars). Parametric families (nozzle/aerofoil) ride on top.
+  wrapped OCC can't replicate. **PROGRESS (2026-06-18):** infra map confirmed
+  persistent-IDs are ALREADY wired through primitives + extrude + boolean +
+  revolve (stable-IDs-through-edits foundation exists). Built the agent-facing
+  selection layer: `queries::select::resolve_face` (kind + normal-dir + extremal,
+  returns FaceId or `SelectError::{NotFound, Ambiguous(candidates)}` — REFUSES a
+  true tie; commit cc7bab0, gate tests/semantic_select.rs) + `POST /api/agent/
+  parts/{id}/select-face` (200/404/409, returns the resolved face's persistent_id
+  so the ref survives edits) + MCP `select_face` (commit 3c2ed2b). REMAINING: edge
+  selector (mirror for edges + blend-edge filter via Solid::blend_kind_at_edge);
+  wire PID assignment through the few remaining ops; parametric families
+  (nozzle/aerofoil) ride on top.
 
 **F1-exercise backlog (limits hit while building a detailed F1 via the API):**
 - 🔴 **Colour/materials in the render** (#10–12, paused) — render is grey lambert
