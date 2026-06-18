@@ -666,11 +666,20 @@ Updated 2 unit tests (on_axis_rectangle now does_NOT_intersect; revolve_face
 ACCEPTS the on-axis cylinder profile). NO REGRESSION: revolve_watertight 7/7,
 revolve_validity_invariants 4/4, revolve_volume_invariants 14/14,
 primitive_tess_watertight 1/1 (sphere poles fine), lib revolve 26/0,
-agent_build_eval 12/2. REMAINING (🔴 PART 2): the apex BAND mesh leaves ~147 open
-+ 20 nm edges (eval_revolved_dome still #[ignore]'d) — the apex is a 3-edge wedge
-(2 meridians meeting at the pole + 1 rim arc) and tessellate_revolution_wedge
-only handles the 4-edge quad; needs the 3-edge apex-fan. The SOLID is sound; only
-the apex MESH is open. NEXT slice = the apex-fan.
+agent_build_eval 12/2. PART 2 apex-fan LANDED (2026-06-18): tessellate_revolution_wedge
+now has a 3-EDGE branch — the dome has 128 three-edge wedges (64 apex ["2","41","2"]
++ 64 base ["2","2","5"]) and the branch meshes them all via the analytic (u,v)
+param triangulation (verified 64×40 + 64×4 tris, reusing exact cache samples ->
+seam-watertight). NO REGRESSION: revolve_watertight 7/7, primitive_tess (sphere
+poles) 1/1, agent_build_eval 15/2.
+REMAINING (🔴 PART 2b — CORRECTS slice-8's assumption): the dome is STILL 147 open
++ 20 nm with a caught cdt panic (triangulate.rs:927 'edge_ba.buddy'), and the
+apex-fan changed that count by ZERO — so the 147 open are NOT the apex (the 3-edge
+wedges mesh fine). The real source is elsewhere: the 4-EDGE body bands or the
+angular seams, and a cdt panic on some non-apex face. eval_revolved_dome stays
+#[ignore]'d. NEXT slice = DIAGNOSE which faces/edges are open (per-face open-edge
+attribution + which face hits the cdt panic at :927), then fix THAT. The SOLID is
+sound; only the mesh is non-watertight.
 
 (orig two-part spec below.)
 
