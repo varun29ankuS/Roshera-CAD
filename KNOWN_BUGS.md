@@ -681,8 +681,11 @@ torus↔cone weld lands on the right meridian. Gates: `gen_filleted_cone_rim`
 (agent_build_eval), `cone_walled_rim_fillet_succeeds` (closed_edge_bore_rim_blends).
 NO REGRESSION across fillet/chamfer/closed-edge/dihedral/revolve suites. LESSON:
 a periodic surface's `closest_point` must respect the patch's param domain, not a
-blind [0,2π) normalize. CONE/TORUS/general-revolve closed-edge fillets beyond the
-plane-cone rim remain the open part of #89.
+blind [0,2π) normalize. STILL OPEN under #89: the closed-edge CHAMFER on a
+Plane–Cone rim (`create_closed_edge_chamfer`, chamfer.rs ~913, still
+Plane–Cylinder only → `NotImplemented`; pinned by
+`chamfer_cone_rim_is_89_notimplemented` — mirror `cone_rim_fillet` with a cone
+bevel to close it), plus CONE/TORUS/general-revolve fillet rims beyond plane-cone.
 
 ### #27/#32 frustum throat 🟢 FIXED — coincident closed-circle rims not welded (commit 7af8e4e)
 Sibling of the cone "rocket": surfaced building a de Laval rocket nozzle via the
