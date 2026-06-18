@@ -117,6 +117,11 @@ pub struct AppState {
     /// have no pre-replay mapping. See `handlers/timeline.rs`.
     pub consumed_uuids: Arc<DashMap<uuid::Uuid, HashMap<u32, uuid::Uuid>>>,
 
+    /// Per-solid display colour (RGB), set via POST /api/agent/parts/{id}/color
+    /// and consumed by the scene-eye (`/api/agent/scene/orbit`) so the agent sees
+    /// a coloured assembly (black tyres, livery body, …) instead of grey clay.
+    pub solid_colors: Arc<DashMap<u32, [u8; 3]>>,
+
     // Enhanced AI integration
     ai_processor: Arc<Mutex<AIProcessor>>,
     session_aware_ai: Arc<SessionAwareAIProcessor>,
@@ -6508,6 +6513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         uuid_to_local: Arc::new(DashMap::new()),
         local_to_uuid: Arc::new(DashMap::new()),
         consumed_uuids: Arc::new(DashMap::new()),
+        solid_colors: Arc::new(DashMap::new()),
         ai_processor,
         session_aware_ai,
         full_integration_executor,
@@ -7120,6 +7126,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/{id}/truth",
             get(handlers::agent::part_truth),
+        )
+        .route(
+            "/api/agent/parts/{id}/color",
+            post(handlers::agent::set_part_color),
         )
         .route(
             "/api/agent/pointer",

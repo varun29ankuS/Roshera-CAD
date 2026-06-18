@@ -638,7 +638,7 @@ pub async fn part_orbit(
 /// mechanism) rather than one part at a time. Read lock only; `404` if the scene
 /// is empty / tessellates to nothing, `400` on an unknown mode.
 pub async fn scene_orbit(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Query(q): Query<OrbitQuery>,
 ) -> Result<Json<OrbitResponse>, StatusCode> {
@@ -671,10 +671,21 @@ pub async fn scene_orbit(
     if ids.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
+    // Per-solid colours from the registry (set via .../color); default light grey.
+    let colors: Vec<[u8; 3]> = ids
+        .iter()
+        .map(|id| {
+            state
+                .solid_colors
+                .get(id)
+                .map(|c| *c)
+                .unwrap_or([200, 200, 200])
+        })
+        .collect();
     let frame = render_solids_dir(
         &model,
         &ids,
-        &[], // per-solid colours (none yet → grey); colour campaign #10
+        &colors,
         dir,
         up_hint,
         &RenderOptions {
@@ -763,6 +774,30 @@ pub async fn part_truth(
         sound: c.is_sound(),
         errors: c.errors.clone(),
         summary: gt.summary(),
+    }))
+}
+
+/// Body for `POST /api/agent/parts/{id}/color` — RGB 0..255.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColorBody {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/// `POST /api/agent/parts/{id}/color` — set a part's display colour, consumed by
+/// the scene-eye (`/api/agent/scene/orbit`) so the agent sees a coloured
+/// assembly. Registry-only (no geometry mutation); returns the stored colour.
+pub async fn set_part_color(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+    Json(c): Json<ColorBody>,
+) -> Json<serde_json::Value> {
+    state.solid_colors.insert(id, [c.r, c.g, c.b]);
+    Json(serde_json::json!({
+        "success": true,
+        "part_id": id,
+        "color": [c.r, c.g, c.b],
     }))
 }
 
