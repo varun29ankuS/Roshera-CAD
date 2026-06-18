@@ -9,6 +9,27 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ---
 
+## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🟡 SERVER-KILLER FIXED; mesh still drops the hole (2026-06-18)
+UPDATE (slice #1, commit 66a3588): the SERVER-KILLER half is FIXED. The
+tessellation already wrapped `cdt::triangulate_contours` in `catch_unwind`, but
+`profile.release` was `panic = "abort"`, which silently defeated it — so the
+first unmeshable face aborted the whole api-server. Set `panic = "unwind"`; now
+the cdt panic is caught and the grid fallback runs, so the bored flange is
+NON-CRASHING **and** watertight/sound. Gate
+`bore_into_revolved_flange_isolates_cdt_panic` (agent_build_eval) green.
+REMAINING (🔴 slice-2 finding): the bore is "watertight but WRONG" — the bolt
+hole is NOT reflected in the MESH. Bored mesh volume ≈ 508_179 == the un-bored
+chamber's mesh volume, i.e. the Ø8 through-hole removed ZERO material. The
+boolean-scar CURVED faces around the bore cdt-panic (caught), then the grid
+fallback over-covers the region as if solid → the hole is filled, not cut. The
+4 panics are on CURVED faces (no planar `[tess] cdt` trace fired), so the next
+dig is WHICH face drops the hole and why the fallback plugs it. Pinned repro
+(FAILS today, #[ignore]'d): `bore_into_revolved_flange_mesh_reflects_hole` —
+bored mesh vol must drop ~1.1k vs the chamber. LESSON (again): watertight ≠
+correct — only the VOLUME/effect check caught the dropped hole.
+
+(Original report below — the abort/crash mechanism, now fixed.)
+
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
 Differencing a small axial cylinder (bolt hole) out of a REVOLVED solid's
 annular flange PANICS the kernel and — because the release profile is

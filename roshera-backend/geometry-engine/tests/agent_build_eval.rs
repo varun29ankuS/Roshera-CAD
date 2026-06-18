@@ -329,6 +329,60 @@ fn bore_into_revolved_flange_isolates_cdt_panic() {
     );
 }
 
+/// #24 SHARPENED (slice-2 finding): slice #1 (`panic=unwind`) makes the bored
+/// revolved flange non-crashing AND watertight/sound — BUT the bolt hole is NOT
+/// reflected in the mesh. The bored mesh integrates to ~508_179 (the un-bored
+/// chamber's mesh volume), i.e. the Ø8 through-hole removed *no* material: the
+/// hole is dropped/filled, not cut. The curved boolean-scar faces around the
+/// bore `cdt`-panic (caught, then the grid fallback over-covers the region as
+/// if solid), so the result is "watertight but wrong" — the classic trap.
+/// This pins the precise repro: the bored mesh volume MUST drop by ~the bolt
+/// volume (r4 through the 22 mm flange ≈ 1.1k). FAILS today; un-ignore when the
+/// bore is faithfully tessellated.
+#[ignore = "#24: bored revolved-flange mesh does not reflect the bolt hole (volume unchanged)"]
+#[test]
+fn bore_into_revolved_flange_mesh_reflects_hole() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let profile = [
+        (70.0, 0.0),
+        (50.0, 30.0),
+        (30.0, 60.0),
+        (15.0, 90.0),
+        (25.0, 105.0),
+        (35.0, 120.0),
+        (35.0, 200.0),
+        (58.0, 200.0),
+        (58.0, 178.0),
+        (43.0, 178.0),
+        (43.0, 120.0),
+        (33.0, 105.0),
+        (23.0, 90.0),
+        (38.0, 60.0),
+        (58.0, 30.0),
+        (78.0, 0.0),
+    ];
+    // Reference: the un-bored chamber's MESH volume (same tessellation params).
+    let mut mref = BRepModel::new();
+    let chamber_ref = revolve_ring(&mut mref, &profile, 128);
+    let chamber_vol = mesh_volume(&mref, chamber_ref);
+
+    // Bored: same chamber minus the Ø8 flange bolt hole.
+    let mut m = BRepModel::new();
+    let chamber = revolve_ring(&mut m, &profile, 128);
+    let bore = cyl(&mut m, Point3::new(50.0, 0.0, 170.0), 4.0, 35.0);
+    let holed = diff(&mut m, chamber, bore);
+    let solid = m.solids.get(holed).expect("holed solid");
+    let _ = tessellate_solid(solid, &m, &TessellationParams::default());
+    let holed_vol = mesh_volume(&m, holed);
+
+    // The bolt (r4 through the 22 mm flange band) must remove ~1.1k of material.
+    assert!(
+        holed_vol < chamber_vol - 800.0,
+        "bore not reflected in mesh: chamber_mesh_vol={chamber_vol:.1} \
+         bored_mesh_vol={holed_vol:.1} (expected a ~1.1k drop)"
+    );
+}
+
 /// GATE — BORE-TESS-VOLUME (FIXED 2026-06-17): a bored plate's tessellated MESH
 /// must integrate to the correct volume. The bug was `annulus_radial_strip`
 /// mis-classifying the square cap as a circular ring and radial-stripping it to
