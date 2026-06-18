@@ -1291,7 +1291,23 @@ pub(crate) fn tessellate_curved_cdt(
     );
 
     // Step 3 — first CDT run.
-    let (pts2d, triangles) = run_cdt(&outer.points_uv, &inner_polygons, &steiner)?;
+    let (pts2d, triangles) = match run_cdt(&outer.points_uv, &inner_polygons, &steiner) {
+        Ok(v) => v,
+        Err(e) => {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[curved-cdt] face {} kind={} FAILED {:?}: outer={}pts holes={} steiner={}",
+                    face.id,
+                    surface.type_name(),
+                    e,
+                    outer.points_uv.len(),
+                    inner_polygons.len(),
+                    steiner.len()
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // Step 4 — Ruppert-style iterative refinement. Each pass collects
     // chord/normal violations (α's criterion), skinny-triangle

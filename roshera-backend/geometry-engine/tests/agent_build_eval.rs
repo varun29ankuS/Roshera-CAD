@@ -340,6 +340,24 @@ fn bore_into_revolved_flange_isolates_cdt_panic() {
          the cdt panic was not isolated (or the whole pass was lost)"
     );
 
+    // GATE (slice-7 2026-06-18): the bored flange mesh is WATERTIGHT at every
+    // density. The cdt:965 panic on the boolean-scar cone bands degrades to a
+    // coarse-but-CLOSED triangulation (refinement freezes on the prior good mesh),
+    // never a leak — so isolation gives a 2-manifold mesh, not just a non-empty
+    // one. (The bolt-hole VOLUME is still mis-areaed by those scar bands — that's
+    // the separate #[ignore]'d cone-band bug `*_mesh_reflects_hole`.)
+    for chord in [0.5_f64, 0.1, 0.02] {
+        let mr = manifold_report(&m, holed, chord, 1e-6)
+            .unwrap_or_else(|| panic!("empty tess at chord {chord}"));
+        assert_eq!(
+            (mr.boundary_edges, mr.nonmanifold_edges),
+            (0, 0),
+            "bored revolved flange NOT watertight at chord {chord}: open={} nm={}",
+            mr.boundary_edges,
+            mr.nonmanifold_edges
+        );
+    }
+
     // FLANGE-DIAG (slice-5): does the boolean imprint the bolt hole onto the
     // PLANAR flange faces? List every Plane face's z, inner-loop count, and each
     // inner loop's (centre, mean radius). The bolt hole = an inner loop centred
@@ -462,11 +480,24 @@ fn bore_into_revolved_flange_mesh_reflects_hole() {
     let _ = tessellate_solid(solid, &m, &TessellationParams::default());
     let holed_vol = mesh_volume(&m, holed);
 
-    // The bolt (r4 through the 22 mm flange band) must remove ~1.1k of material.
-    // NOTE the boolean-scar cone faces mis-tessellate at EVERY density (slice-6):
-    // default over-covers (+424), fine DROPS faces (-10629) — so this mesh-volume
-    // metric is unstable until the curved-CDT cone-projection bug is fixed. The
-    // B-Rep itself is sound and the hole is imprinted (see slice-5 FLANGE-DIAG).
+    // ROOT (slice-6, re-confirmed slice-7 2026-06-18): the SOLID is correct (sound
+    // B-Rep, bolt hole imprinted on the planar caps — FLANGE-DIAG faces 20/21 carry
+    // an inner loop c≈(50,0) r≈4). The defect is purely the DISPLAY MESH of the
+    // BOOLEAN-SCAR CONE bands: corefinement adds boundary vertices that collapse
+    // those bands' UV projection, so curved-CDT's refinement re-run panics
+    // (cdt:965, curved_cdt.rs:1238) and FREEZES on the coarse initial mesh at
+    // default density (net OVER-cover +~1.5k → bored 508179 vs chamber 507755,
+    // hiding the −1.1k bore) while FINE params push the initial CDT itself to fail
+    // → whole bands DROPPED (−10629). The chamber's OWN cone bands mesh perfectly
+    // (fine 508006 == analytic), so only the bore-MODIFIED bands break. NEW (slice
+    // -7): the bored mesh is nonetheless watertight (manifold 0/0) at chord 0.5,
+    // 0.1 AND 0.02 — the freeze/over-cover stays 2-manifold, it just mis-areas.
+    // FIX TARGET = the cone-band degenerate-UV projection in curved_cdt (dedup the
+    // collapsed contour / re-project on a face-normal basis / emit nothing for a
+    // true sliver) — a focused, regression-sensitive change (must not disturb the
+    // clean-cone path). The cross-tessellation volume-delta metric here is too
+    // coarse (0.2%-of-total feature) and should become a direct scar-band area or
+    // analytic-volume check once the UV fix lands.
     assert!(
         holed_vol < chamber_vol - 800.0,
         "bore not reflected in mesh: chamber_mesh_vol={chamber_vol:.1} \
