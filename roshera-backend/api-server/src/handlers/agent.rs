@@ -551,6 +551,10 @@ pub struct OrbitQuery {
     pub el: Option<f64>,
     pub mode: Option<String>,
     pub size: Option<usize>,
+    /// Tessellation quality of the rendered mesh: `coarse` | `medium` (default)
+    /// | `fine`. Coarse is fast for quick orbits; fine resolves curved-surface
+    /// silhouettes for inspection.
+    pub quality: Option<String>,
 }
 
 /// One arbitrary-direction render + its camera basis (so coordinates stay
@@ -645,6 +649,7 @@ pub async fn scene_orbit(
     use base64::Engine as _;
     use geometry_engine::math::Vector3;
     use geometry_engine::render::{render_solids_dir, CanonicalView, RenderMode, RenderOptions};
+    use geometry_engine::tessellation::TessellationParams;
 
     let az = q.az.unwrap_or(45.0).to_radians();
     let el = q.el.unwrap_or(30.0).to_radians();
@@ -693,6 +698,11 @@ pub async fn scene_orbit(
             height: size,
             view: CanonicalView::Isometric, // ignored by the direction render
             mode,
+            tessellation: match q.quality.as_deref() {
+                Some("coarse") => TessellationParams::coarse(),
+                Some("fine") => TessellationParams::fine(),
+                _ => TessellationParams::default(),
+            },
             ..Default::default()
         },
     )
