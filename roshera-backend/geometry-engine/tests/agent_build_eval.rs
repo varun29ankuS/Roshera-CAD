@@ -1687,7 +1687,9 @@ fn render_cone_fillet_demo() {
 #[test]
 #[ignore = "drawing demo — writes _drawing_*.pdf"]
 fn render_drawing_demo() {
-    use geometry_engine::drawing::{render_drawing_pdf, standard_drawing_auto};
+    use geometry_engine::drawing::{render_drawing_pdf, render_drawing_svg, standard_drawing_auto};
+    // Also drop browser-openable SVGs in the repo root so they can be viewed
+    // without a PDF viewer.
 
     // (1) Stepped shaft — 3 coaxial cylinders (turned part).
     let mut m = BRepModel::new();
@@ -1699,6 +1701,11 @@ fn render_drawing_demo() {
     let dwg = standard_drawing_auto(&m, shaft, uuid::Uuid::nil()).expect("shaft drawing");
     let pdf = render_drawing_pdf(&dwg).expect("shaft pdf");
     std::fs::write(std::env::temp_dir().join("_drawing_shaft.pdf"), &pdf).expect("write");
+    std::fs::write(
+        std::env::temp_dir().join("_drawing_shaft.svg"),
+        render_drawing_svg(&dwg),
+    )
+    .ok();
 
     // (2) Bolt-circle flange — Ø160 disc, Ø40 centre bore, six Ø12 holes on a
     // Ø120 PCD (stresses dimension density + circular features).
@@ -1719,4 +1726,56 @@ fn render_drawing_demo() {
     let dwg2 = standard_drawing_auto(&m2, flange, uuid::Uuid::nil()).expect("flange drawing");
     let pdf2 = render_drawing_pdf(&dwg2).expect("flange pdf");
     std::fs::write(std::env::temp_dir().join("_drawing_flange.pdf"), &pdf2).expect("write");
+    std::fs::write(
+        std::env::temp_dir().join("_drawing_flange.svg"),
+        render_drawing_svg(&dwg2),
+    )
+    .ok();
+
+    // (3) Flanged housing — Ø50 body on a Ø100 base flange (coaxial), bored Ø30
+    // through. A curved + stepped + bored part (bearing carrier).
+    let mut m3 = BRepModel::new();
+    let fl = cyl(&mut m3, Point3::new(0.0, 0.0, 0.0), 50.0, 15.0);
+    let body = cyl(&mut m3, Point3::new(0.0, 0.0, 5.0), 25.0, 60.0);
+    let housing = union(&mut m3, fl, body);
+    let bore = cyl(&mut m3, Point3::new(0.0, 0.0, -5.0), 15.0, 75.0);
+    let housing = diff(&mut m3, housing, bore);
+    let dwg3 = standard_drawing_auto(&m3, housing, uuid::Uuid::nil()).expect("housing drawing");
+    let pdf3 = render_drawing_pdf(&dwg3).expect("housing pdf");
+    std::fs::write(std::env::temp_dir().join("_drawing_housing.pdf"), &pdf3).expect("write");
+    std::fs::write(
+        std::env::temp_dir().join("_drawing_housing.svg"),
+        render_drawing_svg(&dwg3),
+    )
+    .ok();
+
+    // (4) SECTION view of the housing — cut on a vertical plane through the axis
+    // (normal +X) so the bore is revealed as an un-hatched hole in the hatched
+    // solid wall.
+    // (4) SECTION view (cut + hatched profile). Section op is exact on planar
+    // solids; curved/boolean solids return empty caps today (section-op gap),
+    // so the demo sections a box.
+    use geometry_engine::drawing::{section_view, Drawing, SheetSize};
+    let mut mb = BRepModel::new();
+    let bx = box_solid(&mut mb, 80.0, 80.0, 40.0);
+    let sv = section_view(
+        &mb,
+        bx,
+        uuid::Uuid::nil(),
+        Point3::ZERO,
+        Vector3::new(1.0, 0.0, 0.0),
+        "SECTION A-A",
+        [148.0, 110.0],
+        1.0,
+    )
+    .expect("section view of box");
+    let mut sdwg = Drawing::new("Section Demo", SheetSize::A4);
+    sdwg.add_view(sv);
+    let spdf = render_drawing_pdf(&sdwg).expect("section pdf");
+    std::fs::write(std::env::temp_dir().join("_drawing_section.pdf"), &spdf).expect("write");
+    std::fs::write(
+        std::env::temp_dir().join("_drawing_section.svg"),
+        render_drawing_svg(&sdwg),
+    )
+    .ok();
 }
