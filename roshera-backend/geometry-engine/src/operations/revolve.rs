@@ -335,6 +335,19 @@ fn create_revolution(
     // bottom-arc(fwd) · right-meridian(fwd) · top-arc(bwd) · left-meridian(bwd).
     let mut shell_faces: Vec<FaceId> = Vec::new();
     for (e_idx, &(curve_id, sp, ep)) in prof.iter().enumerate() {
+        // A profile edge whose BOTH endpoints lie on the axis (both poles) runs
+        // ALONG the axis: rotating it gives the same axis line, so every angular
+        // copy is a zero-area "fin". Such a face has no meridian sides (both are
+        // skipped just below), collapsing its loop to a 2-edge bigon the
+        // tessellator cannot mesh — it falls to curved-CDT, emits nothing, and
+        // leaves the fin's axis edges uncovered (REVOLVE-POLE 2b: 147 open on the
+        // pole dome). The axis segment bounds no surface, so skip its wall faces
+        // entirely; the real walls (dome bands + base disc) already converge to
+        // the shared pole vertices and seal without it. The arc copies built above
+        // remain available for a partial revolution's start/end caps.
+        if apex[&sp] && apex[&ep] {
+            continue;
+        }
         // Outward normal of this profile edge at angle 0 = the right-hand
         // normal of the (CCW) profile loop, which points OUT of the solid.
         // edge dir d, profile-plane normal n_p = axis × r̂ (the angular tangent
