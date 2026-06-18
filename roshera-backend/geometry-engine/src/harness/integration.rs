@@ -44,6 +44,9 @@ pub struct FullContract {
     pub tess_valid: bool,
     /// Tessellation is bit-identical across repeated runs.
     pub deterministic: bool,
+    /// No two non-adjacent faces geometrically cross (not self-overlapping).
+    /// Computed at a coarse chord; a #70-class self-intersection fails it.
+    pub self_intersection_free: bool,
 }
 
 impl FullContract {
@@ -53,6 +56,7 @@ impl FullContract {
             && self.volume_watertight
             && self.tess_valid
             && self.deterministic
+            && self.self_intersection_free
     }
 
     /// The subset of the contract that holds for *every* solid the kernel
@@ -96,6 +100,9 @@ impl FullContract {
         if !self.deterministic {
             f.push("tess: non-deterministic across runs");
         }
+        if !self.self_intersection_free {
+            f.push("self_intersection: non-adjacent faces cross (geometrically self-overlapping)");
+        }
         f
     }
 }
@@ -129,6 +136,12 @@ pub fn full_contract(
 
     let deterministic = is_deterministic(model, solid, chord, 3).unwrap_or(false);
 
+    // Self-intersection at a FIXED coarse chord (independent of the bundle chord):
+    // a gross self-overlap shows at low density, and a coarse mesh keeps the
+    // O(n²) pair scan cheap even when the caller passes a fine display chord.
+    let self_intersection_free =
+        !crate::harness::self_intersection::mesh_self_intersects(model, solid, 0.5);
+
     FullContract {
         brep_clean,
         mesh_manifold,
@@ -136,6 +149,7 @@ pub fn full_contract(
         volume_watertight,
         tess_valid,
         deterministic,
+        self_intersection_free,
     }
 }
 
