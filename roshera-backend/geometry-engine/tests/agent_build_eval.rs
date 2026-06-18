@@ -451,6 +451,10 @@ fn bore_into_revolved_flange_mesh_reflects_hole() {
     let holed_vol = mesh_volume(&m, holed);
 
     // The bolt (r4 through the 22 mm flange band) must remove ~1.1k of material.
+    // NOTE the boolean-scar cone faces mis-tessellate at EVERY density (slice-6):
+    // default over-covers (+424), fine DROPS faces (-10629) — so this mesh-volume
+    // metric is unstable until the curved-CDT cone-projection bug is fixed. The
+    // B-Rep itself is sound and the hole is imprinted (see slice-5 FLANGE-DIAG).
     assert!(
         holed_vol < chamber_vol - 800.0,
         "bore not reflected in mesh: chamber_mesh_vol={chamber_vol:.1} \

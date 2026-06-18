@@ -85,6 +85,26 @@ contour in curved_cdt and (a) dedup+rebuild the contour, (b) re-project on a
 better axis (face normal-aligned basis), or (c) if it is a true zero-area sliver,
 emit nothing rather than an untrimmed over-cover.
 
+SLICE-6 (2026-06-18): measured the volume error at BOTH densities (VOL-DIAG, now
+reverted): default chamber=507_755 bored=508_179 (delta +424); FINE chamber=
+508_006 (== analytic, so the CHAMBER meshes perfectly) bored=497_376 (delta
+**-10_629**, want -1_105). So the boolean-scar CONE faces mis-tessellate at
+EVERY density — default OVER-COVERS (+~1.5k net) and fine DROPS whole faces
+(-~9.5k). The mechanism (refine_to_convergence ~curved_cdt.rs:1238): the initial
+run_cdt yields a COARSE triangulation, a refinement re-run then panics on the
+degenerate-UV contour and FREEZES on that coarse mesh (default), while fine
+params push the initial call itself to fail -> face dropped. The CHAMBER's cone
+bands mesh fine (508_006 exact) — only the BORE-MODIFIED bands break, so the
+boolean is MODIFYING the cone faces' boundary loops (corefinement adds vertices)
+in a way that makes their UV projection collapse. REFRAME: the SOLID is correct
+(sound B-Rep, hole imprinted, validate_solid_scoped passes) — only the DISPLAY
+MESH of boolean-scar cone bands is broken, so EXPORT/mass-props off the B-Rep are
+fine; the live-viewport/STL mesh is wrong. This is a DEEP curved-CDT robustness
+bug needing a dedicated fix (not a one-loop-slice patch) + a full curved-suite
+regression. The mesh-volume repro is UNSTABLE as written (density-dependent);
+the real fix target is the curved-CDT projection/refinement for boolean-modified
+cone bands. Server-killer (slice#1) remains the shipped win.
+
 (Original report below — the abort/crash mechanism, now fixed.)
 
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
