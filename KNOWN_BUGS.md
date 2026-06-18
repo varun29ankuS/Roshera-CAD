@@ -105,6 +105,20 @@ regression. The mesh-volume repro is UNSTABLE as written (density-dependent);
 the real fix target is the curved-CDT projection/refinement for boolean-modified
 cone bands. Server-killer (slice#1) remains the shipped win.
 
+SLICE-7 (2026-06-18): attempted the bounded fix — a collapsed-projection guard
+in `curved_cdt::validate_loop` (reject a loop whose projected points are >50%
+coincident -> DegenerateLoop -> analytic-grid fallback). It was a NO-OP: panics
+stayed 4->4, volume unchanged. So the panicking CONE faces DO NOT go through
+`run_boundary_projection`/`validate_loop` at all — `tessellate_conical_face`
+(surface.rs ~2967) has its OWN projection + run_cdt path that bypasses the
+generic curved_cdt Step-0 validation. REVERTED the guard. CONCLUSION: the
+boolean-scar-cone mesh fix is a DEDICATED effort (trace + fix the cone-specific
+tessellation dispatch, then add the collapse guard at THAT path's projection),
+not a self-paced loop slice. It is a DISPLAY-mesh bug (solid is sound), so it is
+lower priority than shipped correctness. PIVOTING the loop to the revolve pole
+apex-fan (eval_revolved_dome, #[ignore]'d) — a more self-contained curved item.
+The 6 #24 commits (server-killer fix + full diagnosis) stay on main.
+
 (Original report below — the abort/crash mechanism, now fixed.)
 
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
