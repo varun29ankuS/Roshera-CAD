@@ -20,6 +20,7 @@ use geometry_engine::operations::chamfer::{chamfer_edges, ChamferOptions, Chamfe
 use geometry_engine::operations::fillet::{fillet_edges, FilletOptions, FilletType};
 use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
 use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+use geometry_engine::operations::OperationError;
 use geometry_engine::primitives::curve::{Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
@@ -1505,5 +1506,58 @@ fn gen_rounded_cylinder() {
     assert!(
         (d[0] - 60.0).abs() < 1.0 && (d[1] - 60.0).abs() < 1.0 && (d[2] - 50.0).abs() < 0.5,
         "rounded-cylinder envelope wrong: {d:?}"
+    );
+}
+
+/// ROSTER probe of the #89 FRONTIER: a blend on a CONE-WALLED rim. Closed-edge
+/// fillet currently supports only Plane–Cylinder rims; a Plane–Cone rim (a
+/// frustum's cap rim, whose lateral is a Cone) returns NotImplemented
+/// (fillet.rs ~1534, task #89). This is a CHARACTERIZATION test: it pins that
+/// boundary — when #89 lands cone-rim blends, this assertion fails, flagging that
+/// the test should become a real verify_comprehensive gate.
+#[test]
+fn cone_walled_rim_fillet_is_89_notimplemented() {
+    let mut m = BRepModel::new();
+    let cone = match TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::ZERO, Vector3::Z, 40.0, 20.0, 60.0)
+        .expect("frustum (base r40, top r20, h60)")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected a solid frustum, got {o:?}"),
+    };
+    // Base rim at z≈0: a closed (seam) edge between the bottom Plane cap and the
+    // Cone lateral — the #89 Plane–Cone case.
+    let rim: Vec<EdgeId> = m
+        .edges
+        .iter()
+        .filter(|(_, e)| e.is_loop())
+        .filter(|(_, e)| {
+            m.vertices
+                .get_position(e.start_vertex)
+                .map(|p| p[2].abs() < 1e-6)
+                .unwrap_or(false)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        rim.len(),
+        1,
+        "expected exactly 1 base-rim closed edge, got {rim:?}"
+    );
+    let result = fillet_edges(
+        &mut m,
+        cone,
+        rim,
+        FilletOptions {
+            fillet_type: FilletType::Constant(5.0),
+            radius: 5.0,
+            ..Default::default()
+        },
+    );
+    assert!(
+        matches!(result, Err(OperationError::NotImplemented(_))),
+        "#89 boundary moved: a cone-walled (Plane–Cone) rim fillet returned {result:?}, \
+         not NotImplemented — if cone-rim blends now work, promote this to a \
+         verify_comprehensive gate"
     );
 }
