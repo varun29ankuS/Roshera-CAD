@@ -801,6 +801,96 @@ pub async fn set_part_color(
     }))
 }
 
+// ───────────────────── descriptive selection (PILLAR 3) ─────────────
+
+/// `POST /api/agent/parts/{id}/select-face` — resolve a face by DESCRIPTION, or
+/// REFUSE. Body: `{ "kind": "planar|cylindrical|spherical|conical|toroidal|nurbs|any",
+/// "normal_dir": [x,y,z]?, "angle_tol_deg": 12?, "extremal":
+/// "none|largest_area|smallest_area|most_along", "along": [x,y,z]? }`.
+/// 200 → `{face_id, persistent_id}`; 404 → not found; 409 → ambiguous (with the
+/// candidate face ids). The kernel never guesses — see queries::select.
+pub async fn select_face(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::math::Vector3;
+    use geometry_engine::queries::select::{
+        resolve_face, Extremal, FaceQuery, SelectError, SurfaceKind,
+    };
+
+    let kind = match body.get("kind").and_then(|v| v.as_str()).unwrap_or("any") {
+        "planar" | "plane" => SurfaceKind::Planar,
+        "cylindrical" | "cylinder" => SurfaceKind::Cylindrical,
+        "spherical" | "sphere" => SurfaceKind::Spherical,
+        "conical" | "cone" => SurfaceKind::Conical,
+        "toroidal" | "torus" => SurfaceKind::Toroidal,
+        "nurbs" | "nurbssurface" => SurfaceKind::Nurbs,
+        _ => SurfaceKind::Any,
+    };
+    let vec3 = |key: &str| -> Option<Vector3> {
+        body.get(key).and_then(|v| v.as_array()).and_then(|a| {
+            if a.len() == 3 {
+                Some(Vector3::new(a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?))
+            } else {
+                None
+            }
+        })
+    };
+    let normal_dir = vec3("normal_dir");
+    let along = vec3("along").or(normal_dir);
+    let extremal = match body
+        .get("extremal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+    {
+        "largest_area" | "largest" => Extremal::LargestArea,
+        "smallest_area" | "smallest" => Extremal::SmallestArea,
+        "most_along" | "topmost" | "furthest" => Extremal::MostAlong(along.unwrap_or(Vector3::Z)),
+        _ => Extremal::None,
+    };
+    let mut q = FaceQuery::new(kind);
+    q.normal_dir = normal_dir;
+    q.extremal = extremal;
+    if let Some(t) = body.get("angle_tol_deg").and_then(|v| v.as_f64()) {
+        q.angle_tol_deg = t;
+    }
+
+    let mut model = model_handle.write().await;
+    match resolve_face(&mut model, id as SolidId, &q) {
+        Ok(fid) => {
+            let pid = model.face_pid(fid).map(|p| p.0.to_string());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "resolved": true,
+                    "part_id": id,
+                    "face_id": fid,
+                    // Stable id that survives edits (if assigned), so the agent
+                    // can re-reference this face after a parametric change.
+                    "persistent_id": pid,
+                })),
+            )
+        }
+        Err(SelectError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "resolved": false, "error": "not_found",
+                "message": "no face matches that description",
+            })),
+        ),
+        Err(SelectError::Ambiguous(candidates)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "resolved": false, "error": "ambiguous",
+                "message": "several faces match equally well — refine the description",
+                "candidates": candidates,
+            })),
+        ),
+    }
+}
+
 // ───────────────────── coverage / ambiguity (EYE-5) ─────────────────
 
 /// `GET /api/agent/parts/{id}/coverage` — EYE-5 honesty protocol.
