@@ -1578,6 +1578,60 @@ fn gen_filleted_cone_rim() {
     );
 }
 
+/// CAPABILITY-EDGE probe — the CHAMFER side of #89. The closed-edge FILLET now
+/// supports Plane–Cone rims (`cone_rim_fillet`), but the closed-edge CHAMFER path
+/// (`create_closed_edge_chamfer`, chamfer.rs ~913) still handles only
+/// Plane–Cylinder rims. Chamfering a frustum's base rim must therefore fail with
+/// a clean NotImplemented — never a corrupt solid. Characterization test that
+/// pins the boundary; promote it to a verify_comprehensive gate when the chamfer
+/// side lands (mirror `cone_rim_fillet` with a cone bevel).
+#[test]
+fn chamfer_cone_rim_is_89_notimplemented() {
+    let mut m = BRepModel::new();
+    let cone = match TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::ZERO, Vector3::Z, 40.0, 20.0, 60.0)
+        .expect("frustum")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected a solid frustum, got {o:?}"),
+    };
+    let rim: Vec<EdgeId> = m
+        .edges
+        .iter()
+        .filter(|(_, e)| e.is_loop())
+        .filter(|(_, e)| {
+            m.vertices
+                .get_position(e.start_vertex)
+                .map(|p| p[2].abs() < 1e-6)
+                .unwrap_or(false)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        rim.len(),
+        1,
+        "expected exactly 1 base-rim closed edge, got {rim:?}"
+    );
+    let result = chamfer_edges(
+        &mut m,
+        cone,
+        rim,
+        ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(5.0),
+            distance1: 5.0,
+            distance2: 5.0,
+            symmetric: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        matches!(result, Err(OperationError::NotImplemented(_))),
+        "#89 chamfer side moved: a Plane–Cone rim chamfer returned {result:?}, not \
+         NotImplemented — if cone-rim chamfers now work, promote this to a \
+         verify_comprehensive gate"
+    );
+}
+
 /// Visual demo of the #89 cone-rim fillet — writes a shaded isometric PNG of a
 /// frustum with an r8 rounded base rim. `cargo test render_cone_fillet_demo --
 /// --ignored`.
@@ -1625,6 +1679,44 @@ fn render_cone_fillet_demo() {
     };
     let frame = render_solid(&m, cone, &opts).expect("render frame");
     let png = frame.to_png().expect("encode png");
-    std::fs::write("C:/Users/Varun Sharma/Roshera-merge/_cone_fillet.png", &png)
-        .expect("write png");
+    std::fs::write(std::env::temp_dir().join("_cone_fillet.png"), &png).expect("write png");
+}
+
+/// Render the CURRENT engineering-drawing output for representative parts to
+/// assess quality. `cargo test render_drawing_demo -- --ignored`.
+#[test]
+#[ignore = "drawing demo — writes _drawing_*.pdf"]
+fn render_drawing_demo() {
+    use geometry_engine::drawing::{render_drawing_pdf, standard_drawing_auto};
+
+    // (1) Stepped shaft — 3 coaxial cylinders (turned part).
+    let mut m = BRepModel::new();
+    let s1 = cyl(&mut m, Point3::new(0.0, 0.0, 0.0), 20.0, 30.0);
+    let s2 = cyl(&mut m, Point3::new(0.0, 0.0, 30.0), 14.0, 30.0);
+    let s3 = cyl(&mut m, Point3::new(0.0, 0.0, 60.0), 8.0, 30.0);
+    let shaft = union(&mut m, s1, s2);
+    let shaft = union(&mut m, shaft, s3);
+    let dwg = standard_drawing_auto(&m, shaft, uuid::Uuid::nil()).expect("shaft drawing");
+    let pdf = render_drawing_pdf(&dwg).expect("shaft pdf");
+    std::fs::write(std::env::temp_dir().join("_drawing_shaft.pdf"), &pdf).expect("write");
+
+    // (2) Bolt-circle flange — Ø160 disc, Ø40 centre bore, six Ø12 holes on a
+    // Ø120 PCD (stresses dimension density + circular features).
+    let mut m2 = BRepModel::new();
+    let mut flange = cyl(&mut m2, Point3::new(0.0, 0.0, 0.0), 80.0, 20.0);
+    let center = cyl(&mut m2, Point3::new(0.0, 0.0, -5.0), 20.0, 30.0);
+    flange = diff(&mut m2, flange, center);
+    for i in 0..6 {
+        let a = i as f64 * std::f64::consts::FRAC_PI_3;
+        let hole = cyl(
+            &mut m2,
+            Point3::new(60.0 * a.cos(), 60.0 * a.sin(), -5.0),
+            6.0,
+            30.0,
+        );
+        flange = diff(&mut m2, flange, hole);
+    }
+    let dwg2 = standard_drawing_auto(&m2, flange, uuid::Uuid::nil()).expect("flange drawing");
+    let pdf2 = render_drawing_pdf(&dwg2).expect("flange pdf");
+    std::fs::write(std::env::temp_dir().join("_drawing_flange.pdf"), &pdf2).expect("write");
 }
