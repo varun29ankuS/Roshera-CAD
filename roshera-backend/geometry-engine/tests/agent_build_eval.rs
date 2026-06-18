@@ -165,6 +165,18 @@ fn cyl(m: &mut BRepModel, base: Point3, r: f64, h: f64) -> SolidId {
     }
 }
 
+/// A cylinder about an arbitrary axis (e.g. a horizontal bore through a wall),
+/// `base` = centre of the starting end-circle, swept `h` along `axis`.
+fn cyl_axis(m: &mut BRepModel, base: Point3, axis: Vector3, r: f64, h: f64) -> SolidId {
+    match TopologyBuilder::new(m)
+        .create_cylinder_3d(base, axis, r, h)
+        .unwrap()
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("{o:?}"),
+    }
+}
+
 fn diff(m: &mut BRepModel, a: SolidId, b: SolidId) -> SolidId {
     boolean_operation(m, a, b, BooleanOp::Difference, BooleanOptions::default())
         .expect("difference")
@@ -1176,5 +1188,37 @@ fn gen_flanged_housing() {
     assert!(
         (d[0] - 100.0).abs() < 1.5 && (d[2] - 65.0).abs() < 1.0,
         "flanged-housing envelope wrong: {d:?}"
+    );
+}
+
+/// ROSTER part: an L-bracket — a horizontal foot + a vertical leg meeting at a
+/// corner, with a mounting bore through each arm. The leg ROOTS INSIDE the foot
+/// (base z=5, not flush at z=0) so the two arms INTERPENETRATE rather than share a
+/// coincident bottom face (the #32 mesh-leak trap). The leg bore runs HORIZONTALLY
+/// (X-axis) through the 20-thick leg — exercising a non-Z-axis through-hole.
+#[test]
+fn gen_l_bracket_with_bores() {
+    let mut m = BRepModel::new();
+    // Foot: 100×60×20, corner at origin -> x[0,100] y[-30,30] z[0,20].
+    let foot = box_solid(&mut m, 100.0, 60.0, 20.0);
+    translate(&mut m, foot, 50.0, 0.0, 10.0);
+    // Leg: 20×60×95, rooted inside the foot -> x[0,20] y[-30,30] z[5,100].
+    let leg = box_solid(&mut m, 20.0, 60.0, 95.0);
+    translate(&mut m, leg, 10.0, 0.0, 52.5);
+    let bracket = union(&mut m, foot, leg);
+    // Vertical Ø16 mounting bore through the foot at (75,0) — clear of the leg.
+    let foot_bore = cyl(&mut m, Point3::new(75.0, 0.0, -5.0), 8.0, 30.0);
+    let bracket = diff(&mut m, bracket, foot_bore);
+    // Horizontal Ø12 bore through the leg thickness (X-axis) at z=70.
+    let leg_bore = cyl_axis(&mut m, Point3::new(-5.0, 0.0, 70.0), Vector3::X, 6.0, 30.0);
+    let bracket = diff(&mut m, bracket, leg_bore);
+    // V = 100·60·20 + 20·60·95 − overlap(20·60·15) − π·8²·20 − π·6²·20
+    //   = 120000 + 114000 − 18000 − 4021 − 2262 = 209717; bore facets undershoot
+    //   (remove slightly less) so the mesh reads a touch higher.
+    verify_comprehensive(&m, bracket, "L-bracket with bores", 208_000.0, 213_000.0);
+    let d = world_dims(&m, bracket);
+    assert!(
+        (d[0] - 100.0).abs() < 1.0 && (d[1] - 60.0).abs() < 1.0 && (d[2] - 100.0).abs() < 1.0,
+        "L-bracket envelope wrong: {d:?}"
     );
 }
