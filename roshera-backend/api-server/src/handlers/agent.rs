@@ -811,6 +811,18 @@ pub async fn set_part_color(
     }))
 }
 
+/// `GET /api/agent/parts/{id}/color` — read a part's display colour. The read
+/// half of the colour registry: `color` is `[r,g,b]` if one was set, else `null`
+/// (the viewport/scene-eye then uses its default grey). Lets the frontend (#12)
+/// apply per-object colour without re-deriving it.
+pub async fn get_part_color(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> Json<serde_json::Value> {
+    let color = state.solid_colors.get(&id).map(|c| *c);
+    Json(serde_json::json!({ "part_id": id, "color": color }))
+}
+
 // ───────────────────── descriptive selection (PILLAR 3) ─────────────
 
 /// `POST /api/agent/parts/{id}/select-face` — resolve a face by DESCRIPTION, or
