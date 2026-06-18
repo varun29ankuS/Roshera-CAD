@@ -21,6 +21,7 @@
 use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
+use crate::tessellation::mesh::TriangleMesh;
 use crate::tessellation::{tessellate_solid, TessellationParams};
 
 /// EYE-1: coordinate-anchored dimensioned multi-view render.
@@ -222,6 +223,61 @@ pub fn render_solid_dir(
 ) -> Option<RenderFrame> {
     let solid = model.solids.get(solid_id)?;
     let mesh = tessellate_solid(solid, model, &opts.tessellation);
+    render_mesh_dir(&mesh, dir, up_hint, opts, None)
+}
+
+/// Scene render — composite EVERY solid in `solid_ids` into one frame from an
+/// arbitrary view direction (auto-framed to the combined bounds). This is the
+/// agent's eye on a whole ASSEMBLY (not just one part): the per-solid meshes are
+/// tessellated and merged into a single mesh, then rasterized through the same
+/// path as `render_solid_dir`. `dir` points camera→scene; `up_hint` must not be
+/// parallel to it.
+/// `colors`, when non-empty, gives a per-solid base RGB parallel to `solid_ids`
+/// (missing/short entries fall back to light grey) — the Shaded pass tints each
+/// solid by it, so the agent's eye sees a coloured assembly (black tyres, livery
+/// body, …) instead of monochrome clay.
+pub fn render_solids_dir(
+    model: &BRepModel,
+    solid_ids: &[SolidId],
+    colors: &[[u8; 3]],
+    dir: Vector3,
+    up_hint: Vector3,
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
+    const DEFAULT: [u8; 3] = [200, 200, 200];
+    let mut merged = TriangleMesh::new();
+    let mut tri_colors: Vec<[u8; 3]> = Vec::new();
+    for (si, &id) in solid_ids.iter().enumerate() {
+        let solid = match model.solids.get(id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let col = colors.get(si).copied().unwrap_or(DEFAULT);
+        let m = tessellate_solid(solid, model, &opts.tessellation);
+        let base = merged.vertices.len() as u32;
+        merged.vertices.extend_from_slice(&m.vertices);
+        for (ti, t) in m.triangles.iter().enumerate() {
+            merged
+                .triangles
+                .push([t[0] + base, t[1] + base, t[2] + base]);
+            merged
+                .face_map
+                .push(m.face_map.get(ti).copied().unwrap_or(u32::MAX));
+            tri_colors.push(col);
+        }
+    }
+    render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors))
+}
+
+/// Rasterize an already-tessellated mesh from a view direction (auto-framed).
+/// Shared by `render_solid_dir` (one solid) and `render_solids_dir` (assembly).
+fn render_mesh_dir(
+    mesh: &TriangleMesh,
+    dir: Vector3,
+    up_hint: Vector3,
+    opts: &RenderOptions,
+    tri_colors: Option<&[[u8; 3]]>,
+) -> Option<RenderFrame> {
     if mesh.triangles.is_empty() {
         return None;
     }
@@ -392,9 +448,18 @@ pub fn render_solid_dir(
                 [g, g, g]
             }
             RenderMode::Shaded => {
-                // Headlight lambert, orientation-independent via abs().
-                let g = (60.0 + 175.0 * tri_normal.dot(&dir).abs()) as u8;
-                [g, g, g]
+                // Headlight lambert, orientation-independent via abs(), TINTING
+                // a per-triangle base colour (grey when none supplied).
+                let ndl = tri_normal.dot(&dir).abs();
+                let f = 0.26 + 0.74 * ndl; // ambient + diffuse
+                let base = tri_colors
+                    .and_then(|c| c.get(ti).copied())
+                    .unwrap_or([200, 200, 200]);
+                [
+                    (base[0] as f64 * f) as u8,
+                    (base[1] as f64 * f) as u8,
+                    (base[2] as f64 * f) as u8,
+                ]
             }
             RenderMode::Normals => [
                 ((tri_normal.x + 1.0) * 127.5) as u8,

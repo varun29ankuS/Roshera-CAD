@@ -101,6 +101,13 @@ pub fn revolve_face(
             create_helical_sweep(model, &face, face_id, &options)?
         };
 
+        // PILLAR 1: a revolution is a designed surface.
+        model.set_solid_provenance(
+            solid_id,
+            crate::primitives::provenance::OperationKind::Revolve,
+            Vec::new(),
+        );
+
         // Validate result if requested
         if options.common.validate_result {
             validate_revolved_solid(model, solid_id)?;

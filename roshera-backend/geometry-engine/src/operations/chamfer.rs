@@ -403,6 +403,11 @@ pub fn chamfer_edges(
             v.sort_unstable();
             v
         };
+        model.set_solid_provenance(
+            solid_id,
+            crate::primitives::provenance::OperationKind::Chamfer,
+            Vec::new(),
+        );
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("chamfer_edges")
                 .with_parameters(serde_json::json!({

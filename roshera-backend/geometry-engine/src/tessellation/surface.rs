@@ -197,7 +197,18 @@ pub fn tessellate_face(
                 tessellate_toroidal_face(face, model, params, cache, mesh);
             }
         }
-        "NURBS" => tessellate_nurbs_face(face, model, params, cache, mesh),
+        // A `GeneralNurbsSurface` reports `type_name() == "NurbsSurface"`. A
+        // CLOSED-in-U skin lateral (the `nurbs_loft` wall: a seamed ring surface)
+        // routes to the structured cache-driven grid — curved-CDT's NURBS
+        // `closest_point` boundary inversion is unreliable at the seam and emits
+        // an empty mesh. Open NURBS patches keep the curved-CDT path.
+        "NurbsSurface" => {
+            if !(surface.is_closed_u()
+                && tessellate_nurbs_skin_lateral(surface, face, model, params, cache, mesh))
+            {
+                tessellate_nurbs_face(face, model, params, cache, mesh);
+            }
+        }
         // Revolve emits each curved wall as thin per-segment SurfaceOfRevolution
         // wedge faces; the generic curved-CDT path fails on these high-aspect
         // slivers at fine chord (REVOLVE-ROBUSTNESS #47). A wedge is a tensor-
@@ -4061,6 +4072,208 @@ fn tessellate_revolution_wedge(
         }
     }
     true
+}
+
+/// Tessellate a CLOSED-in-U NURBS skin lateral (the `nurbs_loft` wall): one
+/// `GeneralNurbsSurface` face whose loop is the cylinder-style 4-edge ring
+/// (bottom closed ring at v=0, seam at u=0≡u=1 used twice, top closed ring at
+/// v=1). curved-CDT cannot tessellate it — its boundary→(u,v) inversion uses the
+/// NURBS surface's grid-search `closest_point`, which is ambiguous/divergent at
+/// the seam and emits zero triangles (the lateral vanishes, leaving the caps'
+/// rings open). The revolution-wedge Coons path is no good either: a single tall
+/// patch carries its v-curvature INTERNALLY, which a boundary-only blend of the
+/// two end rings would flatten (a barrel would tessellate as a cone).
+///
+/// This samples a STRUCTURED grid directly in the surface's (u, v) domain — no
+/// `closest_point`. The v=0 / v=1 rows are taken VERBATIM from the
+/// `EdgeSampleCache` for the two ring edges, so they are bit-identical to what
+/// the adjacent planar caps sample for the same edges (watertight weld).
+/// Interior rows are real `surface.point_at(u, v)` samples (the wall follows the
+/// NURBS curvature). Consecutive rows — whose point counts may differ (the end
+/// rings come from a chord-driven cache, interior rows from a fixed u-grid) — are
+/// stitched by parametric fraction. Returns `false` (caller falls back to
+/// curved-CDT) if the face is not this closed-lateral form.
+fn tessellate_nurbs_skin_lateral(
+    surface: &dyn Surface,
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let loop_data = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return false,
+    };
+    // Cylinder-style loop: two distinct CLOSED ring edges + one seam edge used
+    // twice (4 loop entries).
+    if loop_data.edges.len() != 4 {
+        return false;
+    }
+    let mut ring_edges: Vec<crate::primitives::edge::EdgeId> = Vec::new();
+    for &eid in &loop_data.edges {
+        if let Some(e) = model.edges.get(eid) {
+            if e.start_vertex == e.end_vertex && !ring_edges.contains(&eid) {
+                ring_edges.push(eid);
+            }
+        }
+    }
+    if ring_edges.len() != 2 {
+        return false;
+    }
+
+    // Ring boundary samples (cache emits forward param direction, u: 0→1).
+    let s_a = cache.get_or_compute(ring_edges[0], model);
+    let s_b = cache.get_or_compute(ring_edges[1], model);
+    if s_a.len() < 4 || s_b.len() < 4 {
+        return false;
+    }
+    // Classify v=0 vs v=1 by proximity of each ring's seam point to S(0,0)/S(0,1).
+    let p00 = match surface.point_at(0.0, 0.0) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let p01 = match surface.point_at(0.0, 1.0) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let a_is_bottom = (s_a[0] - p00).magnitude() <= (s_a[0] - p01).magnitude();
+    let (bottom_s, top_s): (&[Point3], &[Point3]) = if a_is_bottom {
+        (&s_a, &s_b)
+    } else {
+        (&s_b, &s_a)
+    };
+    // Distinct ring points (drop the duplicated closing sample).
+    let bottom_ring = &bottom_s[..bottom_s.len() - 1];
+    let top_ring = &top_s[..top_s.len() - 1];
+
+    // v-resolution: chord-driven along the (curved) seam at u=0.
+    let m_bands = {
+        let probe = 32;
+        let mut prev = p00;
+        let mut length = 0.0;
+        for k in 1..=probe {
+            let v = k as f64 / probe as f64;
+            if let Ok(p) = surface.point_at(0.0, v) {
+                length += (p - prev).magnitude();
+                prev = p;
+            }
+        }
+        linear_steps_for_quality(length, params).max(2)
+    };
+    let n_u = bottom_ring.len().max(top_ring.len()).max(8);
+    let orient_sign = face.orientation.sign();
+
+    // Build the rows of mesh-vertex indices.
+    let push_ring = |mesh: &mut TriangleMesh, pts: &[Point3], v: f64| -> Vec<u32> {
+        let count = pts.len();
+        pts.iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let u = k as f64 / count as f64;
+                let normal = surface
+                    .normal_at(u, v)
+                    .map(|nn| nn * orient_sign)
+                    .unwrap_or(Vector3::Z);
+                mesh.add_vertex(MeshVertex {
+                    position: *p,
+                    normal,
+                    uv: None,
+                })
+            })
+            .collect()
+    };
+
+    let mut rows: Vec<Vec<u32>> = Vec::with_capacity(m_bands + 1);
+    rows.push(push_ring(mesh, bottom_ring, 0.0));
+    for j in 1..m_bands {
+        let v = j as f64 / m_bands as f64;
+        let mut row = Vec::with_capacity(n_u);
+        for i in 0..n_u {
+            let u = i as f64 / n_u as f64;
+            let p = match surface.point_at(u, v) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let normal = surface
+                .normal_at(u, v)
+                .map(|nn| nn * orient_sign)
+                .unwrap_or(Vector3::Z);
+            row.push(mesh.add_vertex(MeshVertex {
+                position: p,
+                normal,
+                uv: None,
+            }));
+        }
+        rows.push(row);
+    }
+    rows.push(push_ring(mesh, top_ring, 1.0));
+
+    for band in 0..rows.len() - 1 {
+        stitch_closed_rings(&rows[band].clone(), &rows[band + 1].clone(), mesh);
+    }
+    true
+}
+
+/// Triangulate the strip between two CLOSED rings of mesh-vertex indices that are
+/// phase-aligned (both start at the seam u=0 and wind the same way around u). The
+/// rings may have different point counts; advance whichever ring's next vertex
+/// has the smaller parametric fraction, emitting one triangle per step, until
+/// both rings are fully consumed (wrapping closed). Each triangle is wound so its
+/// geometric normal agrees with the rings' (already outward-oriented) vertex
+/// normals.
+fn stitch_closed_rings(lo: &[u32], hi: &[u32], mesh: &mut TriangleMesh) {
+    let p = lo.len();
+    let q = hi.len();
+    if p < 2 || q < 2 {
+        return;
+    }
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < p || j < q {
+        let fi = i as f64 / p as f64;
+        let fj = j as f64 / q as f64;
+        let advance_lo = if i >= p {
+            false
+        } else if j >= q {
+            true
+        } else {
+            fi <= fj
+        };
+        let (a, b, c) = if advance_lo {
+            // Triangle lo[i] → lo[i+1] → hi[j].
+            (lo[i % p], lo[(i + 1) % p], hi[j % q])
+        } else {
+            // Triangle lo[i] → hi[j+1] → hi[j].
+            (lo[i % p], hi[(j + 1) % q], hi[j % q])
+        };
+        emit_outward_triangle(mesh, a, b, c);
+        if advance_lo {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+}
+
+/// Emit a triangle wound so its geometric normal agrees with the average of its
+/// vertices' (outward-oriented) stored normals.
+fn emit_outward_triangle(mesh: &mut TriangleMesh, a: u32, b: u32, c: u32) {
+    let pa = mesh.vertices[a as usize].position;
+    let pb = mesh.vertices[b as usize].position;
+    let pc = mesh.vertices[c as usize].position;
+    let navg = mesh.vertices[a as usize].normal
+        + mesh.vertices[b as usize].normal
+        + mesh.vertices[c as usize].normal;
+    let gn = (pb - pa).cross(&(pc - pa));
+    if gn.dot(&navg) >= 0.0 {
+        mesh.add_triangle(a, b, c);
+    } else {
+        mesh.add_triangle(a, c, b);
+    }
 }
 
 /// Grid-tessellate a full surface patch over `[u_min,u_max]×[v_min,v_max]`

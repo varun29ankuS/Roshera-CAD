@@ -2970,6 +2970,106 @@ pub enum ParameterizationType {
     Centripetal,
 }
 
+/// Skin (loft) a NURBS surface that INTERPOLATES a stack of cross-section
+/// point rows — Piegl & Tiller, *The NURBS Book* (2nd ed.), §10.3 "Skinned
+/// Surfaces".
+///
+/// `sections[v]` is the `v`-th cross-section, a row of `nu` points along the
+/// U direction; the sections are ordered along V (the loft direction). All
+/// sections must carry the SAME number of points so the control nets line up.
+/// The returned surface passes through every input point and is `degree_u`×
+/// `degree_v`. A `degree_v >= 3` skin is therefore **G2-continuous along the
+/// loft direction** by construction (a degree-p B-spline is C^{p-1} internally),
+/// which is the cheapest sound way to build a curvature-continuous freeform
+/// part — no inter-patch constraint solving required.
+///
+/// Method (the two-stage curve-interpolation form of skinning): interpolate one
+/// degree-`degree_u` curve through each section, then interpolate degree-
+/// `degree_v` curves down each resulting column of control points. Both stages
+/// use UNIFORM parameterization deliberately: the uniform knot vector depends
+/// only on the point COUNT and degree, never the coordinates, so every section
+/// curve shares one identical `knots_u` and every column curve shares one
+/// identical `knots_v` — the rectangular-grid precondition skinning requires,
+/// met without a separate knot-merging pass. The result is non-rational
+/// (unit weights).
+pub fn skin_surface(
+    sections: &[Vec<Point3>],
+    degree_u: usize,
+    degree_v: usize,
+) -> Result<NurbsSurface, &'static str> {
+    let n_v = sections.len();
+    if n_v < degree_v + 1 {
+        return Err("skin_surface: need at least degree_v + 1 sections");
+    }
+    if degree_u == 0 || degree_v == 0 {
+        return Err("skin_surface: degrees must be at least 1");
+    }
+    let n_u = sections[0].len();
+    if n_u < degree_u + 1 {
+        return Err("skin_surface: need at least degree_u + 1 points per section");
+    }
+    if sections.iter().any(|s| s.len() != n_u) {
+        return Err("skin_surface: every section must have the same point count");
+    }
+
+    // Stage 1 — interpolate a degree_u curve through each section. Uniform
+    // parameterization makes `knots_u` identical across sections.
+    let mut knots_u: Option<Vec<f64>> = None;
+    // row_ctrl[v][k] = k-th U control point of section v's interpolating curve.
+    let mut row_ctrl: Vec<Vec<Point3>> = Vec::with_capacity(n_v);
+    for section in sections {
+        let curve = interpolate_nurbs_curve(section, degree_u, ParameterizationType::Uniform)?;
+        if curve.control_points.len() != n_u {
+            return Err("skin_surface: U interpolation changed control-point count");
+        }
+        match &knots_u {
+            None => knots_u = Some(curve.knots.to_vec()),
+            Some(ku) => {
+                if curve.knots.to_vec() != *ku {
+                    // Uniform knots are coordinate-independent, so this cannot
+                    // happen for equal-length sections; guard it regardless.
+                    return Err("skin_surface: section U knot vectors disagree");
+                }
+            }
+        }
+        row_ctrl.push(curve.control_points);
+    }
+    let knots_u = knots_u.ok_or("skin_surface: no sections")?;
+
+    // Stage 2 — for each U control index, interpolate a degree_v curve down the
+    // column of stage-1 control points. Uniform again ⇒ one shared `knots_v`.
+    let mut knots_v: Option<Vec<f64>> = None;
+    // control_points[u][v] — the NurbsSurface convention (outer = U, inner = V).
+    let mut control_points: Vec<Vec<Point3>> = Vec::with_capacity(n_u);
+    for k in 0..n_u {
+        let column: Vec<Point3> = (0..n_v).map(|v| row_ctrl[v][k]).collect();
+        let curve = interpolate_nurbs_curve(&column, degree_v, ParameterizationType::Uniform)?;
+        if curve.control_points.len() != n_v {
+            return Err("skin_surface: V interpolation changed control-point count");
+        }
+        match &knots_v {
+            None => knots_v = Some(curve.knots.to_vec()),
+            Some(kv) => {
+                if curve.knots.to_vec() != *kv {
+                    return Err("skin_surface: column V knot vectors disagree");
+                }
+            }
+        }
+        control_points.push(curve.control_points);
+    }
+    let knots_v = knots_v.ok_or("skin_surface: empty section")?;
+
+    let weights = vec![vec![1.0; n_v]; n_u];
+    NurbsSurface::new(
+        control_points,
+        weights,
+        knots_u,
+        knots_v,
+        degree_u,
+        degree_v,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3021,6 +3121,59 @@ mod tests {
             );
             assert!(d.duv.unwrap().magnitude() < 1e-9, "Suv at ({u},{v})");
         }
+    }
+
+    /// `skin_surface` must INTERPOLATE every section point (the defining
+    /// property of a skinned surface) and, at degree 3 in V, be C2 across its
+    /// interior V-knot — i.e. curvature-continuous (G2) along the loft, the
+    /// claim that makes a degree-3 NURBS skin a sound G2 part.
+    #[test]
+    fn skin_surface_interpolates_sections_and_is_g2_in_v() {
+        use std::f64::consts::FRAC_PI_2;
+        // 5 sections (V) stacked in z, each a 5-point quarter-arc (U) whose
+        // radius grows with the section → a genuinely skinned (non-extruded)
+        // surface.
+        let nu = 5usize;
+        let nv = 5usize;
+        let sections: Vec<Vec<Point3>> = (0..nv)
+            .map(|v| {
+                let r = 2.0 + 0.3 * v as f64;
+                let z = v as f64;
+                (0..nu)
+                    .map(|u| {
+                        let a = u as f64 * FRAC_PI_2 / (nu - 1) as f64;
+                        Point3::new(r * a.cos(), r * a.sin(), z)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let surf = skin_surface(&sections, 3, 3).expect("skin");
+        assert_eq!(surf.degree_v, 3, "loft direction must be degree 3 for G2");
+
+        // Interpolation: S(i/(nu-1), j/(nv-1)) == sections[j][i].
+        for j in 0..nv {
+            for i in 0..nu {
+                let p = surf
+                    .evaluate(i as f64 / (nu - 1) as f64, j as f64 / (nv - 1) as f64)
+                    .point;
+                assert!(
+                    (p - sections[j][i]).magnitude() < 1e-6,
+                    "skin must pass through section[{j}][{i}]: got {p:?} want {:?}",
+                    sections[j][i]
+                );
+            }
+        }
+
+        // C2 across the interior V-knot (uniform knots for nv=5,deg=3 put it at
+        // v=0.5): the second V-derivative is continuous ⇒ G2 along the loft.
+        let u = 0.5;
+        let below = surf.evaluate_derivatives(u, 0.5 - 1e-5, 0, 2).dvv.unwrap();
+        let above = surf.evaluate_derivatives(u, 0.5 + 1e-5, 0, 2).dvv.unwrap();
+        assert!(
+            (below - above).magnitude() < 1e-3,
+            "Svv jumps across the interior V-knot ({below:?} vs {above:?}) — not G2 in V"
+        );
     }
 
     /// On a *rational* patch the analytic second derivatives must track a

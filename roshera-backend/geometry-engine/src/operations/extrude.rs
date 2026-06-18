@@ -435,6 +435,11 @@ pub fn extrude_face(
         // Record for attached recorders. `direction` above was moved into
         // `create_*_unified_extrusion`, so re-read from `options` (the option
         // struct is still borrowed and un-normalized — sufficient for a record).
+        model.set_solid_provenance(
+            unified_solid_id,
+            crate::primitives::provenance::OperationKind::Extrude,
+            Vec::new(),
+        );
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("extrude_face")
                 .with_parameters(serde_json::json!({

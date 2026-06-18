@@ -34,7 +34,19 @@ lru = "0.16.0"
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# UNWIND, not abort. The tessellator calls the third-party `cdt` crate, which
+# `assert!`s (panics) rather than returning `Err` on some legitimately-hard
+# degenerate inputs (e.g. a constrained-edge insertion it can't satisfy on an
+# annular cap carrying an offset hole, or a near-cocircular curved-CDT contour —
+# `triangulate.rs:965` "Failed to create fixed edge"). Both cdt call sites
+# (`tessellation::surface::triangulate_planar_polygon` and
+# `tessellation::curved_cdt::run_cdt`) wrap that call in `catch_unwind` and
+# degrade a panicked face to a recoverable per-face error — but `panic="abort"`
+# turns that catch into a no-op and takes the whole api-server process down
+# (BORE-INTO-REVOLVED-FLANGE CDT PANIC, KNOWN_BUGS). `unwind` lets the existing
+# recovery run, so one bad face can never abort the server. The live `demo`
+# profile already inherits dev's unwind; this makes `release` match.
+panic = "unwind"
 strip = true
 opt-level = 3
 

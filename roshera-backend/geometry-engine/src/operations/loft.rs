@@ -154,6 +154,11 @@ fn loft_profiles_body(
     }
 
     // Record for attached recorders.
+    model.set_solid_provenance(
+        solid_id,
+        crate::primitives::provenance::OperationKind::Loft,
+        Vec::new(),
+    );
     model.record_operation(
         crate::operations::recorder::RecordedOperation::new("loft_profiles")
             .with_parameters(serde_json::json!({

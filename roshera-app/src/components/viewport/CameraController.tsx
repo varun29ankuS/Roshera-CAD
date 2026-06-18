@@ -1,11 +1,11 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useThree, useFrame } from '@react-three/fiber'
 import {
   OrbitControls,
   OrthographicCamera,
   PerspectiveCamera,
 } from '@react-three/drei'
-import { useSceneStore } from '@/stores/scene-store'
+import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import * as THREE from 'three'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -30,15 +30,54 @@ const INITIAL_TARGET: [number, number, number] = [0, 0, 0]
 const PERSPECTIVE_FOV = 50
 const PERSPECTIVE_NEAR = 0.1
 const PERSPECTIVE_FAR = 2000
-// Orthographic frustum extends well into both half-spaces so geometry
-// behind the look-at point is never clipped. Width/height are derived
-// from `zoom`; near/far are world-space distances along the view axis.
-const ORTHO_NEAR = -2000
-const ORTHO_FAR = 2000
+// Orthographic frustum extends well into both half-spaces so geometry behind
+// the look-at point is never clipped. Width/height are derived from `zoom`;
+// near/far are world-space distances along the view axis, sized per-frame from
+// the scene extent (see `farProp` / the useFrame clip-plane refinement).
 // Initial ortho zoom chosen so the default isometric camera frames a
 // roughly 60-unit world span on a 1080p viewport. Scroll-wheel
 // (OrbitControls) and the viewport's auto-frame logic adjust it.
 const INITIAL_ORTHO_ZOOM = 30
+
+// Scene-adaptive camera limits. The viewport must frame anything from a 1 mm
+// feature to a 10 m+ assembly, so the dolly range and clip planes are DERIVED
+// from the scene's world extent rather than hardcoded. These floors keep the
+// behaviour for small/empty scenes identical to before.
+const MIN_SCENE_RADIUS = 30 // empty/tiny scene → behaves like the old defaults
+const MAX_DOLLY_FLOOR = 500 // never tighter than the previous maxDistance
+
+/** World-space bounding sphere (center + radius) of every object's mesh,
+ *  transformed by its placement — the basis for all scene-adaptive framing. */
+function computeSceneBounds(
+  objects: Map<string, CADObject>,
+): { center: THREE.Vector3; radius: number } {
+  const min = new THREE.Vector3(Infinity, Infinity, Infinity)
+  const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity)
+  const v = new THREE.Vector3()
+  const m = new THREE.Matrix4()
+  let any = false
+  for (const obj of objects.values()) {
+    const verts = obj.mesh?.vertices
+    if (!verts || verts.length === 0) continue
+    m.compose(
+      new THREE.Vector3(obj.position[0], obj.position[1], obj.position[2]),
+      new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(obj.rotation[0], obj.rotation[1], obj.rotation[2], 'XYZ'),
+      ),
+      new THREE.Vector3(obj.scale[0], obj.scale[1], obj.scale[2]),
+    )
+    for (let i = 0; i < verts.length; i += 3) {
+      v.set(verts[i], verts[i + 1], verts[i + 2]).applyMatrix4(m)
+      min.min(v)
+      max.max(v)
+      any = true
+    }
+  }
+  if (!any) return { center: new THREE.Vector3(0, 0, 0), radius: MIN_SCENE_RADIUS }
+  const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5)
+  const radius = Math.max(new THREE.Vector3().subVectors(max, min).length() * 0.5, 1e-3)
+  return { center, radius }
+}
 
 export function CameraController() {
   const controlsRef = useRef<OrbitControlsRef>(null)
@@ -58,6 +97,19 @@ export function CameraController() {
   // level so R3F's `e.stopPropagation()` doesn't reach it; gating
   // `enableRotate` here is the only reliable suppression.
   const gizmoDragging = useSceneStore((s) => s.gizmoDragging)
+
+  // Scene-adaptive framing: recompute the world bounding sphere whenever the
+  // object set changes, and derive the dolly range from it. The clip planes are
+  // adapted per-frame (below) from the live camera distance so precision holds
+  // from millimetre features to 10 m+ assemblies.
+  const objects = useSceneStore((s) => s.objects)
+  const sceneBounds = useMemo(() => computeSceneBounds(objects), [objects])
+  const maxDistance = Math.max(sceneBounds.radius * 8, MAX_DOLLY_FLOOR)
+  const minDistance = Math.max(sceneBounds.radius * 1e-4, 0.02)
+  // Clip-plane PROPS sized to the scene so a re-render never clips the model
+  // before the per-frame refinement (above) tightens `near` for precision.
+  const farProp = Math.max(maxDistance * 4, PERSPECTIVE_FAR)
+  const nearProp = Math.max(farProp * 1e-5, PERSPECTIVE_NEAR)
 
   // When the projection toggles, copy the outgoing camera's transform
   // onto the incoming one so the swap is visually seamless. Runs once
@@ -226,6 +278,29 @@ export function CameraController() {
   }, [pendingFrameObjectId, camera, setPendingFrameObject])
 
   useFrame((_, delta) => {
+    // Scene-adaptive clip planes, every frame. far must reach past the whole
+    // scene from wherever the camera sits; near is pulled as close as depth
+    // precision allows for the current distance, so a 1 mm detail and a 10 m
+    // assembly are both crisp without z-fighting. Runs regardless of animation.
+    const controls = controlsRef.current
+    if (controls) {
+      const d = camera.position.distanceTo(controls.target as THREE.Vector3)
+      const far = Math.max((d + sceneBounds.radius) * 4, PERSPECTIVE_FAR)
+      const near = Math.max(far * 1e-4, d * 1e-3, 0.02)
+      const persp = perspRef.current
+      if (persp && (persp.near !== near || persp.far !== far)) {
+        persp.near = near
+        persp.far = far
+        persp.updateProjectionMatrix()
+      }
+      const ortho = orthoRef.current
+      if (ortho && (ortho.near !== -far || ortho.far !== far)) {
+        ortho.near = -far
+        ortho.far = far
+        ortho.updateProjectionMatrix()
+      }
+    }
+
     const anim = animRef.current
     if (!anim || !controlsRef.current) return
 
@@ -260,15 +335,15 @@ export function CameraController() {
         ref={perspRef}
         makeDefault={projection === 'perspective'}
         fov={PERSPECTIVE_FOV}
-        near={PERSPECTIVE_NEAR}
-        far={PERSPECTIVE_FAR}
+        near={nearProp}
+        far={farProp}
         position={INITIAL_POSITION}
       />
       <OrthographicCamera
         ref={orthoRef}
         makeDefault={projection === 'orthographic'}
-        near={ORTHO_NEAR}
-        far={ORTHO_FAR}
+        near={-farProp}
+        far={farProp}
         zoom={INITIAL_ORTHO_ZOOM}
         position={INITIAL_POSITION}
       />
@@ -281,8 +356,8 @@ export function CameraController() {
         rotateSpeed={0.8}
         panSpeed={0.8}
         zoomSpeed={1.2}
-        minDistance={1}
-        maxDistance={500}
+        minDistance={minDistance}
+        maxDistance={maxDistance}
         // Sketch mode shares the left button with OrbitControls:
         // click-without-drag places a sketch point (SketchOverlay
         // implements a movement threshold on pointerup), drag-beyond-

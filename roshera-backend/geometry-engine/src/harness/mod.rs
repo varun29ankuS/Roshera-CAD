@@ -24,6 +24,7 @@ pub mod fillet;
 pub mod integration;
 pub mod loft;
 pub mod math_oracle;
+pub mod nurbs_loft;
 pub mod poke_matrix;
 pub mod revolve;
 pub mod shell;

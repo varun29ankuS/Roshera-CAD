@@ -25,6 +25,7 @@ pub mod geometry_validity;
 pub mod loft;
 pub mod modify;
 pub mod mould;
+pub mod nurbs_loft;
 pub mod offset;
 pub mod pattern;
 pub mod revolve;

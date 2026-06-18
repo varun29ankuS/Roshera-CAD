@@ -495,6 +495,13 @@ pub fn boolean_operation(
             result_solid,
         ));
 
+        // PILLAR 1: a boolean result is designed, derived from both operands.
+        model.set_solid_provenance(
+            result_solid,
+            crate::primitives::provenance::OperationKind::Boolean,
+            vec![solid_a, solid_b],
+        );
+
         // Record the successful operation for attached recorders.
         let op_kind = match operation {
             BooleanOp::Union => "boolean_union",
