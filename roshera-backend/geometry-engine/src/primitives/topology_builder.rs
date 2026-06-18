@@ -657,6 +657,10 @@ impl BRepModel {
                 ),
                 None => (false, false, 0, 0, 0),
             };
+        // Self-intersection at a COARSE chord (gross self-overlap is visible at
+        // low density; keeps the O(n²) pair scan cheap for this on-demand check).
+        let self_intersection_free =
+            !crate::harness::self_intersection::mesh_self_intersects(self, solid_id, 0.5);
         ValidityCertificate {
             brep_valid: v.is_valid,
             watertight,
@@ -664,6 +668,7 @@ impl BRepModel {
             euler_characteristic: euler,
             boundary_edges: be,
             nonmanifold_edges: nm,
+            self_intersection_free,
             errors: v.errors.iter().map(|e| format!("{e:?}")).collect(),
         }
     }

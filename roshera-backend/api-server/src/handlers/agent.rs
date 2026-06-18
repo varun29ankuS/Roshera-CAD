@@ -719,6 +719,7 @@ pub struct TruthResponse {
     pub brep_valid: bool,
     pub watertight: bool,
     pub manifold: bool,
+    pub self_intersection_free: bool,
     pub euler_characteristic: i64,
     /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold).
     pub sound: bool,
@@ -757,6 +758,7 @@ pub async fn part_truth(
         brep_valid: c.brep_valid,
         watertight: c.watertight,
         manifold: c.manifold,
+        self_intersection_free: c.self_intersection_free,
         euler_characteristic: c.euler_characteristic,
         sound: c.is_sound(),
         errors: c.errors.clone(),
