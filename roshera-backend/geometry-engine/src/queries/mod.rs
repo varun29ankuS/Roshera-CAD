@@ -17,6 +17,7 @@ pub mod raycast;
 pub mod raytrace;
 pub mod region;
 pub mod relational;
+pub mod select;
 pub mod trim;
 
 pub use field::{sample_field, signed_distance, ScalarField};
