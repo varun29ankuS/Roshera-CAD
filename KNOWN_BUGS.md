@@ -9,6 +9,31 @@ Status key: 🔴 open · 🟡 in progress · 🟢 fixed
 
 ---
 
+## DRAWING: ISOMETRIC pictorial was an all-dashed "ghost" on curved parts 🟡 MITIGATED (2026-06-18)
+The ISOMETRIC view (a non-dimensioned pictorial) rendered every edge DASHED on
+cylinder/curved parts — a faint "ghost". ROOT (drawing/visibility.rs
+`project_solid_edges_visibility`): a circular rim draws as a clean analytic circle
+only when `faces_camera` = |rim_normal · view_dir| > 0.99 (line ~300). An ORTHO
+view aligned with the axis satisfies this (Top: Z·w(0,0,-1)=1); the OBLIQUE iso
+(w=(1,1,-1)/√3) gives a Z-rim |normal·w|=1/√3≈0.58 < 0.99 → NOT faces_camera → the
+rim falls to per-SEGMENT `occluded()`. A cylinder rim in iso is mostly
+near-SILHOUETTE (tangent to view), where the occlusion raycast grazes the surface
+and reports "hidden" → the whole rim went dashed. (The occlusion logic itself is
+sound: `back=2·diag+10` origin is well outside, w sign correct.)
+FIX SHIPPED (dimensioning.rs `build_hlr_view`): for `ProjectionType::Isometric`,
+draw the pictorial as a clean SOLID WIREFRAME — merge visible+hidden into
+`polylines`/`circles`, leave hidden empty. (Note: "omit hidden, keep visible"
+would have left an EMPTY iso, since the broken classification marks ~everything
+hidden — all-solid is the correct simple fix and matches the convention that an
+isometric reference omits hidden lines.) Verified on the shaft/flange/housing
+demo: iso now reads as a clean 3D pictorial, no dashed cloud.
+REMAINING (true HLR): a proper iso would show only camera-facing edges solid +
+hidden removed; that needs silhouette-robust occlusion for oblique views (skip the
+occluded() test for near-silhouette segments, or offset the sample toward the
+visible side). Lower priority — the wireframe pictorial is clean and conventional.
+
+---
+
 ## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🟡 SERVER-KILLER FIXED; mesh still drops the hole (2026-06-18)
 UPDATE (slice #1, commit 66a3588): the SERVER-KILLER half is FIXED. The
 tessellation already wrapped `cdt::triangulate_contours` in `catch_unwind`, but
