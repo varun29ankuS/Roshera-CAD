@@ -3880,6 +3880,189 @@ fn merge_connected_curves(
     Ok(merged)
 }
 
+/// Build the shared-corner registry for task #17 watertight corefinement.
+///
+/// Each shareable cut curve (a plane × non-analytic meet arc) contributes its
+/// two endpoints. Endpoints that lie at the SAME pocket corner — but disagree
+/// by the marching-SSI fit residual because they came from two independent
+/// curve fits — are clustered and replaced by a SINGLE shared corner
+/// `VertexId` (placed at the cluster centroid). The returned map gives, per
+/// shareable `CurveId`, the `(start, end)` corner vertices both operands must
+/// use, so the arcs close into a loop on the freeform face and every cut edge
+/// is shared by exactly two faces.
+///
+/// The clustering radius is derived from the natural GAP in the sorted
+/// endpoint-pair distance spectrum: intra-corner pairs (fit residual, ~1e-2)
+/// are separated from inter-corner pairs (feature spacing, ~1e0) by a wide
+/// gap, so a cut placed in that gap merges only true corner-mates. This is
+/// fully independent of the global weld tolerance used downstream by
+/// `canonicalise_face_edges_by_position` (which stays tight for #35).
+fn build_shared_corner_endpoints(
+    model: &mut BRepModel,
+    shareable_curves: &HashSet<CurveId>,
+    tolerance: &Tolerance,
+) -> HashMap<CurveId, (VertexId, VertexId)> {
+    let mut result: HashMap<CurveId, (VertexId, VertexId)> = HashMap::new();
+    if shareable_curves.len() < 2 {
+        return result;
+    }
+
+    // (curve_id, end_index 0|1, position) for every shareable-curve endpoint.
+    let mut endpoints: Vec<(CurveId, usize, Point3)> = Vec::new();
+    let mut ordered_curves: Vec<CurveId> = shareable_curves.iter().copied().collect();
+    ordered_curves.sort_unstable();
+    for cid in &ordered_curves {
+        let Some(curve) = model.curves.get(*cid) else {
+            continue;
+        };
+        let (Ok(sp), Ok(ep)) = (curve.evaluate(0.0), curve.evaluate(1.0)) else {
+            continue;
+        };
+        endpoints.push((*cid, 0, sp.position));
+        endpoints.push((*cid, 1, ep.position));
+    }
+    let n = endpoints.len();
+    if n < 2 {
+        return result;
+    }
+
+    // All cross-curve endpoint-pair distances, ascending. Intra-corner pairs
+    // (two arcs that meet at one pocket corner, separated only by the SSI fit
+    // residual) form a tight low band; everything else (distinct corners, the
+    // far side of the feature) sits in a high band. The two bands are
+    // separated by a wide multiplicative gap because a fit residual (~1e-2) is
+    // orders below any real feature dimension. The corner-cluster radius is
+    // placed in that gap.
+    let global_tol = tolerance.distance();
+    let mut pair_dists: Vec<f64> = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if endpoints[i].0 == endpoints[j].0 {
+                continue;
+            }
+            let dx = endpoints[i].2.x - endpoints[j].2.x;
+            let dy = endpoints[i].2.y - endpoints[j].2.y;
+            let dz = endpoints[i].2.z - endpoints[j].2.z;
+            pair_dists.push((dx * dx + dy * dy + dz * dz).sqrt());
+        }
+    }
+    pair_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // The smallest pair must be a genuine near-coincidence (above the weld
+    // tolerance — otherwise the existing weld already unifies it — but still a
+    // small residual, not a feature). Locate the widest multiplicative jump
+    // and place the radius there; require a ≥4× jump so two distinct corners
+    // can never be merged (feature/residual ratios are far larger in
+    // practice). The radius is capped below the high band so it can only ever
+    // link true corner-mates.
+    let radius = {
+        let mut radius = global_tol;
+        let mut best_ratio = 4.0;
+        for w in pair_dists.windows(2) {
+            let (lo, hi) = (w[0], w[1]);
+            if lo <= global_tol {
+                continue;
+            }
+            let ratio = hi / lo;
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                radius = 0.5 * (lo + hi);
+            }
+        }
+        radius
+    };
+    // No corner band above the weld tolerance → nothing to merge here.
+    if radius <= global_tol {
+        return result;
+    }
+    let radius_sq = radius * radius;
+
+    // Single-linkage union-find over endpoints within `radius`. Endpoints of
+    // the SAME curve are never linked (an arc never collapses to a point).
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if endpoints[i].0 == endpoints[j].0 {
+                continue;
+            }
+            let dx = endpoints[i].2.x - endpoints[j].2.x;
+            let dy = endpoints[i].2.y - endpoints[j].2.y;
+            let dz = endpoints[i].2.z - endpoints[j].2.z;
+            if dx * dx + dy * dy + dz * dz <= radius_sq {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+
+    // Cluster → centroid → single minted corner vertex. A singleton cluster
+    // (an arc endpoint with no corner mate) keeps its own minted vertex; this
+    // is the verbatim position the per-face split would have produced, so it
+    // never regresses a curve that already welded cleanly.
+    let mut clusters: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        clusters.entry(r).or_default().push(i);
+    }
+    let mut corner_vertex: HashMap<usize, VertexId> = HashMap::new();
+    for (root, members) in &clusters {
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        let mut cz = 0.0;
+        for &m in members {
+            cx += endpoints[m].2.x;
+            cy += endpoints[m].2.y;
+            cz += endpoints[m].2.z;
+        }
+        let k = members.len() as f64;
+        let (cx, cy, cz) = (cx / k, cy / k, cz / k);
+        // Mint a fresh vertex AT the centroid. `add_or_find` would coincide
+        // with an existing model vertex only if one already sits within the
+        // tight global tolerance — exactly the welded case, where reusing it
+        // is correct. Then pin the position to the centroid so both members
+        // resolve to an identical point.
+        let vid = model.vertices.add_or_find(cx, cy, cz, global_tol);
+        model.vertices.set_position(vid, cx, cy, cz);
+        corner_vertex.insert(*root, vid);
+    }
+
+    for (idx, &(cid, end_idx, _)) in endpoints.iter().enumerate() {
+        let root = find(&mut parent, idx);
+        let Some(&vid) = corner_vertex.get(&root) else {
+            continue;
+        };
+        let entry = result.entry(cid).or_insert((
+            crate::primitives::vertex::INVALID_VERTEX_ID,
+            crate::primitives::vertex::INVALID_VERTEX_ID,
+        ));
+        if end_idx == 0 {
+            entry.0 = vid;
+        } else {
+            entry.1 = vid;
+        }
+    }
+
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool] stage=build_shared_corner_endpoints curves={} endpoints={} clusters={} radius={:.4}",
+            shareable_curves.len(),
+            n,
+            clusters.len(),
+            radius,
+        );
+    }
+
+    result
+}
+
 /// Split faces along intersection curves.
 ///
 /// Each entry in the intersection list contributes curves to exactly one face
@@ -3977,6 +4160,30 @@ fn split_faces_along_curves(
     // reused by the opposite operand's face split.
     let mut shared_edges: HashMap<CurveId, EdgeId> = HashMap::new();
 
+    // GLOBAL SHARED-CORNER pre-pass (task #17 watertight). The plane × non-
+    // analytic cut arcs that bound a pocket opening on the freeform face are
+    // each an INDEPENDENT marching-squares fit, trimmed to its own bounding
+    // planar wall (`clip_general_curve_by_face_membership`). Two adjacent arcs
+    // that geometrically meet at a pocket CORNER (the box vertical edge ∩ the
+    // freeform surface) therefore terminate at points that disagree on the
+    // freeform-radial coordinate by the fit residual (~1e-2) — far above the
+    // weld tolerance. On the freeform face the four arcs then fail to close
+    // into a loop (the DCEL drops the open chain) so the pocket is never
+    // imprinted, and the result splits into two shells (the unsplit freeform
+    // body + the detached cutter walls).
+    //
+    // Fix: cluster the endpoints of all shareable cut curves into shared
+    // CORNER vertices and force every arc that meets at a corner to terminate
+    // at the SAME vertex on BOTH operands. The four arcs then close on the
+    // freeform face, and every cut edge is shared by exactly two faces (one
+    // per operand) → one watertight shell. The clustering tolerance is derived
+    // from the natural gap in the endpoint-pair distance spectrum (intra-corner
+    // fit-residual vs. inter-corner feature spacing), so it never merges
+    // distinct corners and is independent of the (load-bearing, untouched)
+    // global weld tolerance in `canonicalise_face_edges_by_position`.
+    let shared_corner_endpoints =
+        build_shared_corner_endpoints(model, &shareable_curves, &options.common.tolerance);
+
     let mut ordered_face_curves: Vec<(FaceId, (SolidId, Vec<CurveId>))> =
         face_curves.into_iter().collect();
     ordered_face_curves.sort_by_key(|(fid, _)| *fid);
@@ -3990,6 +4197,7 @@ fn split_faces_along_curves(
             options,
             &shareable_curves,
             &mut shared_edges,
+            &shared_corner_endpoints,
         )?;
         let produced = faces.len();
         // Per-face diagnostic: input face's surface type → number of split
@@ -6181,6 +6389,7 @@ fn face_surface_is_analytic(model: &BRepModel, face_id: FaceId) -> bool {
 /// corefinement (task #17): for a curve_id in `shareable_curves`, the cut
 /// edge is minted ONCE (registered in `shared_edges`) and reused verbatim by
 /// the opposite operand's face split, so both faces reference one `EdgeId`.
+#[allow(clippy::too_many_arguments)]
 fn split_face_by_curves(
     model: &mut BRepModel,
     face_id: FaceId,
@@ -6189,6 +6398,7 @@ fn split_face_by_curves(
     options: &BooleanOptions,
     shareable_curves: &HashSet<CurveId>,
     shared_edges: &mut HashMap<CurveId, EdgeId>,
+    shared_corner_endpoints: &HashMap<CurveId, (VertexId, VertexId)>,
 ) -> OperationResult<Vec<SplitFace>> {
     // Extract surface_id from face before we start mutating
     let surface_id = {
@@ -6449,6 +6659,22 @@ fn split_face_by_curves(
                 existing
             } else {
                 let fresh = create_edge_from_curve(model, curve_id)?;
+                // GLOBAL SHARED-CORNER (task #17): retarget this shared edge's
+                // endpoints to the clustered corner vertices so the cut arcs
+                // meet at IDENTICAL pocket corners on both operands and close
+                // into a loop on the freeform face. Only overrides an endpoint
+                // that was assigned a corner cluster; singleton endpoints keep
+                // the verbatim curve endpoint the prior path produced.
+                if let Some(&(corner_sv, corner_ev)) = shared_corner_endpoints.get(&curve_id) {
+                    if let Some(e) = model.edges.get_mut(fresh) {
+                        if corner_sv != crate::primitives::vertex::INVALID_VERTEX_ID {
+                            e.start_vertex = corner_sv;
+                        }
+                        if corner_ev != crate::primitives::vertex::INVALID_VERTEX_ID {
+                            e.end_vertex = corner_ev;
+                        }
+                    }
+                }
                 shared_edges.insert(curve_id, fresh);
                 fresh
             }
@@ -6909,8 +7135,30 @@ fn split_face_by_curves(
     // mirroring the runtime hole-attachment that
     // `merge_same_origin_fragments` already does for newly-created
     // Inside fragments under Difference.
-    let (loops, attached_holes) =
+    let (loops, mut attached_holes) =
         partition_outer_and_pre_existing_hole_cycles(loops, model, surface_id, face_id);
+
+    // NEW-island-loop attachment (task #17 blind pocket). A closed cut loop
+    // imprinted ENTIRELY in the interior of a freeform face — a blind pocket
+    // whose opening does not reach the face's outer boundary — splits the face
+    // into an outer cycle (the body, walked WITHOUT the island because nothing
+    // bridges them) and the island patch cycle. The body fragment must carry
+    // the island as an INNER loop (a hole); otherwise the body returns
+    // simply-connected and the pocket walls detach into their own shell (the
+    // w01 two-component failure). Unlike the pre-existing-hole pass above, the
+    // island also stays in `loops` as its own fragment: classification keeps
+    // it for Intersection / drops it for Difference, and because it is dropped
+    // its rim edges end up shared by exactly the body's inner loop and the
+    // cutter wall (manifold). Gated to non-analytic faces so the analytic
+    // splitters (cylinder/sphere/cone window+sector paths) are untouched.
+    attach_interior_island_loops(
+        &loops,
+        &mut attached_holes,
+        model,
+        surface_id,
+        face_id,
+        &graph,
+    );
 
     // Detect cycle nesting and compute corrected interior points for any
     // "annular" faces whose naive centroid would land inside an enclosed
@@ -7278,6 +7526,173 @@ fn partition_outer_and_pre_existing_hole_cycles(
     let outer_loops: Vec<Vec<(EdgeId, bool)>> =
         outer_indices.iter().map(|&i| loops[i].clone()).collect();
     (outer_loops, attachments)
+}
+
+/// Attach NEW interior island cut-loops to their containing fragment as inner
+/// loops (task #17 blind pocket on a freeform face).
+///
+/// An "island" is a cycle whose every edge is a `Splitting` (cut) edge — i.e.
+/// a closed pocket-opening loop imprinted wholly inside a freeform face, not
+/// touching the face's outer boundary. `extract_regions` emits it as a
+/// separate CCW cycle, disconnected from the body cycle. For the body to be a
+/// valid face-with-hole (so the pocket walls stay welded to it as one shell),
+/// the island must be added to the body fragment's `inner_loops`, wound
+/// opposite the body (LoopType::Inner convention). The island also remains as
+/// its own fragment in `loops`; classification keeps/drops it independently.
+///
+/// Gated to non-analytic host faces — analytic curved laterals route through
+/// their dedicated window/sector splitters and never reach this generic path,
+/// and planar analytic faces never produce a wholly-interior cut island that
+/// the existing pre-existing-hole pass doesn't already cover.
+fn attach_interior_island_loops(
+    loops: &[Vec<(EdgeId, bool)>],
+    attached_holes: &mut [Vec<Vec<(EdgeId, bool)>>],
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    graph: &IntersectionGraph,
+) {
+    let n = loops.len();
+    if n < 2 {
+        return;
+    }
+    // Gate: only freeform host faces. Analytic faces are handled by their
+    // dedicated splitters / the pre-existing-hole pass.
+    if !face_is_nonanalytic(model, face_id) {
+        return;
+    }
+    let Some(surface) = model.surfaces.get(surface_id) else {
+        return;
+    };
+
+    // An island loop's every edge is a cut (Splitting) edge in the graph. A
+    // body loop carries at least one original boundary edge (seam / cap rim).
+    let is_island: Vec<bool> = loops
+        .iter()
+        .map(|cycle| {
+            !cycle.is_empty()
+                && cycle.iter().all(|&(eid, _)| {
+                    graph
+                        .edges
+                        .get(&eid)
+                        .map(|ge| ge.edge_type == EdgeType::Splitting)
+                        .unwrap_or(false)
+                })
+        })
+        .collect();
+    if !is_island.iter().any(|&b| b) {
+        return;
+    }
+
+    // Project each loop into the surface's PARAMETRIC (u, v) space rather than
+    // a flat tangent plane. A freeform body loop is the whole lateral minus the
+    // pocket: its tangent-plane projection at the centroid is degenerate (the
+    // far side of the barrel folds back over the near side), but in (u, v) it
+    // is a simple domain rectangle that cleanly contains the small pocket
+    // island. `closest_point` maps each sampled boundary point back to (u, v).
+    let tol = Tolerance::default();
+    let densify_2d = |cycle: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
+        const SAMPLES: usize = 8;
+        let mut poly: Vec<(f64, f64)> = Vec::with_capacity(cycle.len() * SAMPLES);
+        for &(eid, fwd) in cycle {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                if let Ok(p) = curve.point_at(t) {
+                    if let Ok((u, v)) = surface.closest_point(&p, tol) {
+                        poly.push((u, v));
+                    }
+                }
+            }
+        }
+        poly
+    };
+    let polys: Vec<Vec<(f64, f64)>> = loops.iter().map(|c| densify_2d(c)).collect();
+    let centroid_2d = |poly: &[(f64, f64)]| -> Option<(f64, f64)> {
+        if poly.len() < 3 {
+            return None;
+        }
+        let (cx, cy) = poly
+            .iter()
+            .fold((0.0f64, 0.0f64), |(ax, ay), &(x, y)| (ax + x, ay + y));
+        let m = poly.len() as f64;
+        Some((cx / m, cy / m))
+    };
+
+    for h in 0..n {
+        if !is_island[h] {
+            continue;
+        }
+        let Some(hc) = centroid_2d(&polys[h]) else {
+            continue;
+        };
+        // Smallest-area containing NON-island loop wins (the immediate parent).
+        let mut chosen: Option<usize> = None;
+        let mut chosen_area = f64::INFINITY;
+        for o in 0..n {
+            if o == h || is_island[o] || polys[o].len() < 3 {
+                continue;
+            }
+            if !point_in_polygon_2d(hc.0, hc.1, &polys[o]) {
+                continue;
+            }
+            let mut area2 = 0.0;
+            for i in 0..polys[o].len() {
+                let (ax, ay) = polys[o][i];
+                let (bx, by) = polys[o][(i + 1) % polys[o].len()];
+                area2 += ax * by - bx * ay;
+            }
+            let area = area2.abs();
+            if area < chosen_area {
+                chosen_area = area;
+                chosen = Some(o);
+            }
+        }
+        // Fallback: a wholly-interior cut island must belong to SOME body. When
+        // the (u, v) containment is ambiguous (a periodic freeform body loop
+        // traces the seam twice, so its parametric polygon is not a clean
+        // simple rectangle), but there is exactly one non-island loop, that
+        // loop is unambiguously the container. This is sound because an island
+        // is by construction interior to the face and cannot belong elsewhere.
+        if chosen.is_none() {
+            let non_island: Vec<usize> = (0..n).filter(|&o| o != h && !is_island[o]).collect();
+            if non_island.len() == 1 {
+                chosen = Some(non_island[0]);
+            }
+        }
+        if let Some(o) = chosen {
+            // Reverse winding for the inner-loop convention. Skip if the same
+            // edge set is already attached (idempotent / no double-attach).
+            let reversed: Vec<(EdgeId, bool)> =
+                loops[h].iter().rev().map(|(e, fwd)| (*e, !*fwd)).collect();
+            let already: HashSet<EdgeId> = reversed.iter().map(|&(e, _)| e).collect();
+            let dup = attached_holes
+                .get(o)
+                .map(|hs| {
+                    hs.iter().any(|existing| {
+                        existing.len() == reversed.len()
+                            && existing.iter().all(|&(e, _)| already.contains(&e))
+                    })
+                })
+                .unwrap_or(false);
+            if !dup {
+                if let Some(slot) = attached_holes.get_mut(o) {
+                    slot.push(reversed);
+                }
+            }
+        }
+    }
 }
 
 /// Compute a corrected interior point for each extracted DCEL cycle in the

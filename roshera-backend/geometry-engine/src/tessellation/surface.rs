@@ -4101,8 +4101,12 @@ fn tessellate_nurbs_skin_lateral(
     cache: &EdgeSampleCache,
     mesh: &mut TriangleMesh,
 ) -> bool {
+    // A closed-u skin lateral carrying a blind-pocket hole (task #17) routes
+    // through the hole-aware structured CDT below — the generic curved-CDT
+    // path cracks at the periodic seam for this surface class. Faces with no
+    // hole keep the original phase-aligned ring stitch.
     if !face.inner_loops.is_empty() {
-        return false;
+        return tessellate_nurbs_skin_lateral_with_holes(surface, face, model, params, cache, mesh);
     }
     let loop_data = match model.loops.get(face.outer_loop) {
         Some(l) => l,
@@ -4214,6 +4218,396 @@ fn tessellate_nurbs_skin_lateral(
 
     for band in 0..rows.len() - 1 {
         stitch_closed_rings(&rows[band].clone(), &rows[band + 1].clone(), mesh);
+    }
+    true
+}
+
+/// Ray-cast point-in-polygon in 2D (even-odd rule). Local to the skin-lateral
+/// hole mesher; a Steiner grid point landing inside a pocket rim must be
+/// skipped so the CDT hole stays empty.
+fn uv_point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > py) != (yj > py) {
+            let x_int = (xj - xi) * (py - yi) / (yj - yi) + xi;
+            if px < x_int {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Tessellate a CLOSED-in-u NURBS skin lateral that carries one or more blind-
+/// pocket holes (task #17). The generic curved-CDT path cracks at the periodic
+/// seam of this surface class (its `closest_point` boundary inversion is
+/// ambiguous at u=0/u=2π), so a holed barrel came out non-watertight. This
+/// builds a constrained Delaunay triangulation in the surface's UNROLLED (u, v)
+/// parameter rectangle — non-periodic, so the seam is an ordinary left/right
+/// edge — with each pocket rim as a hole contour, then maps every UV vertex
+/// back to 3D. Boundary vertices (the two ring caps, the seam, and every hole
+/// rim) take their 3D positions VERBATIM from the shared `EdgeSampleCache`, so
+/// they coincide bit-exactly with the adjacent cap and pocket-wall faces;
+/// interior Steiner points use `surface.point_at`. The left (u=0) and right
+/// (u=1) seam columns resolve to the same cached seam samples, so the periodic
+/// seam welds shut.
+///
+/// Returns `false` (caller falls back to curved-CDT) on any structural surprise
+/// — wrong loop arity, missing seam edge, CDT failure — so this never silently
+/// drops the wall.
+fn tessellate_nurbs_skin_lateral_with_holes(
+    surface: &dyn Surface,
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::edge::EdgeId;
+    let tol = Tolerance::default();
+
+    let loop_data = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return false,
+    };
+    let (Ok(p00), Ok(p01)) = (surface.point_at(0.0, 0.0), surface.point_at(0.0, 1.0)) else {
+        return false;
+    };
+
+    // Classify each outer-loop edge by the surface-v of its midpoint: v≈0 →
+    // bottom ring, v≈1 → top ring, otherwise the seam (a v-spanning edge). The
+    // post-boolean barrel's cap circles are split into several arcs and the
+    // seam appears twice, so a fixed 4-edge arity no longer holds — classify
+    // by geometry instead. Bottom/top arcs are concatenated (in loop order,
+    // honoring orientation) into the two rings; the seam edge supplies the
+    // interior v-column.
+    let mut bottom_pts: Vec<Point3> = Vec::new();
+    let mut top_pts: Vec<Point3> = Vec::new();
+    let mut seam_edge: Option<EdgeId> = None;
+    for (i, &eid) in loop_data.edges.iter().enumerate() {
+        let Some(edge) = model.edges.get(eid) else {
+            return false;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            return false;
+        };
+        let t_mid = 0.5 * (edge.param_range.start + edge.param_range.end);
+        let Ok(mid) = curve.point_at(t_mid) else {
+            return false;
+        };
+        let Ok((_, v_mid)) = surface.closest_point(&mid, tol) else {
+            return false;
+        };
+        let samples = cache.get_or_compute(eid, model);
+        if samples.len() < 2 {
+            return false;
+        }
+        let fwd = loop_data.orientations.get(i).copied().unwrap_or(true);
+        let ordered: Vec<Point3> = if fwd {
+            samples.to_vec()
+        } else {
+            samples.iter().rev().copied().collect()
+        };
+        if v_mid < 0.25 {
+            // bottom ring arc — append (drop last, shared with next arc).
+            bottom_pts.extend_from_slice(&ordered[..ordered.len() - 1]);
+        } else if v_mid > 0.75 {
+            top_pts.extend_from_slice(&ordered[..ordered.len() - 1]);
+        } else if seam_edge.is_none() {
+            seam_edge = Some(eid);
+        }
+    }
+    if bottom_pts.len() < 3 || top_pts.len() < 3 {
+        return false;
+    }
+    let Some(seam_edge) = seam_edge else {
+        return false;
+    };
+
+    // Bottom ring must wind so u increases; the loop walk already produced one
+    // consistent direction. Make both rings start near u=0 (the seam) for the
+    // u = k/count mapping below. We accept whatever phase the loop gave; the
+    // outer contour is consistent regardless of where u=0 sits because the CDT
+    // operates on the actual (u, v) coordinates we assign next.
+    let bottom_ring: &[Point3] = &bottom_pts;
+    let top_ring: &[Point3] = &top_pts;
+
+    // Seam samples (cache forward direction); order bottom→top.
+    let seam_s = cache.get_or_compute(seam_edge, model);
+    if seam_s.len() < 2 {
+        return false;
+    }
+    let seam_forward_is_up = (seam_s[0] - p00).magnitude() <= (seam_s[0] - p01).magnitude();
+    let seam_up: Vec<Point3> = if seam_forward_is_up {
+        seam_s.to_vec()
+    } else {
+        seam_s.iter().rev().copied().collect()
+    };
+
+    // UV-builder: a list of (u, v) points and a parallel list of their 3D
+    // positions. Boundary points carry their cache 3D; interior points are
+    // None (filled by point_at). The CDT runs on the UV coordinates.
+    let mut uv: Vec<(f64, f64)> = Vec::new();
+    let mut pos3d: Vec<Option<Point3>> = Vec::new();
+    let mut push = |u: f64,
+                    v: f64,
+                    p: Option<Point3>,
+                    uv: &mut Vec<(f64, f64)>,
+                    pos3d: &mut Vec<Option<Point3>>|
+     -> usize {
+        let idx = uv.len();
+        uv.push((u, v));
+        pos3d.push(p);
+        idx
+    };
+
+    // ---- Outer contour (CCW in UV): bottom ring (u: 0→1 at v=0), right seam
+    //      (v: 0→1 at u=1), top ring (u: 1→0 at v=1), left seam (v: 1→0 at
+    //      u=0). Ring point u comes from `closest_point` (the post-boolean ring
+    //      is a set of arcs that need not start at the seam), then the ring is
+    //      sorted by u and pinned to span exactly [0, 1] with the seam point
+    //      duplicated at both ends. Seam columns at u=0 and u=1 carry the SAME
+    //      cached seam 3D so the periodic seam welds shut. ----
+    // Each ring point gets its true u (from `closest_point`); the ring is
+    // sorted by u and the seam point (the cache sample coincident with the seam
+    // edge's endpoint) is identified so it can anchor u=0 and be duplicated at
+    // u=1. The cap face samples the SAME ring edges via the same cache, so the
+    // 3D points are identical on both sides — the only thing this function
+    // controls is the (u, v) layout for the CDT.
+    let seam_bottom = seam_up[0];
+    let seam_top = seam_up[seam_up.len() - 1];
+    // Assign u to each ring point by CUMULATIVE CHORD FRACTION in the ring's
+    // (already angular, CCW) loop order — NOT `closest_point`, whose u is
+    // ambiguous at the periodic seam and silently collides near-seam points on
+    // opposite sides (they then dedup away, leaving the CDT to chord across the
+    // gap → leaks). The ring is rotated so the seam point is index 0 (u=0); the
+    // sequence is strictly increasing in u and spans [0, 1).
+    let ring_uv = |ring: &[Point3], seam_pt: Point3| -> Vec<(f64, Point3)> {
+        if ring.len() < 3 {
+            return Vec::new();
+        }
+        // Rotate so the seam point is first.
+        let seam_idx = ring
+            .iter()
+            .position(|p| (*p - seam_pt).magnitude() < 1e-9)
+            .unwrap_or(0);
+        let rotated: Vec<Point3> = ring[seam_idx..]
+            .iter()
+            .chain(ring[..seam_idx].iter())
+            .copied()
+            .collect();
+        // Cumulative chord length, closing back to the seam.
+        let mut cum: Vec<f64> = Vec::with_capacity(rotated.len());
+        let mut acc = 0.0;
+        cum.push(0.0);
+        for k in 1..rotated.len() {
+            acc += (rotated[k] - rotated[k - 1]).magnitude();
+            cum.push(acc);
+        }
+        let closing = acc + (rotated[0] - rotated[rotated.len() - 1]).magnitude();
+        if closing <= 1e-12 {
+            return Vec::new();
+        }
+        rotated
+            .iter()
+            .zip(cum.iter())
+            .map(|(p, c)| (c / closing, *p))
+            .collect()
+    };
+    let bottom_uv = ring_uv(bottom_ring, seam_bottom);
+    let top_uv = ring_uv(top_ring, seam_top);
+    if bottom_uv.len() < 3 || top_uv.len() < 3 {
+        return false;
+    }
+    // The seam point must be the first entry (u=0) of each ring.
+    if bottom_uv[0].0 > 1e-9 || top_uv[0].0 > 1e-9 {
+        return false;
+    }
+    let seam_interior: Vec<Point3> = seam_up[1..seam_up.len() - 1].to_vec();
+    let ns = seam_interior.len();
+
+    let mut outer: Vec<usize> = Vec::new();
+    // Bottom ring, ascending u from 0 (seam) through (0,1).
+    for &(u, p) in &bottom_uv {
+        outer.push(push(u, 0.0, Some(p), &mut uv, &mut pos3d));
+    }
+    // Bottom-right corner (u=1, v=0) = seam bottom (duplicated 3D → welds).
+    outer.push(push(1.0, 0.0, Some(seam_bottom), &mut uv, &mut pos3d));
+    // Right seam column, ascending v.
+    for (k, p) in seam_interior.iter().enumerate() {
+        let v = (k + 1) as f64 / (ns + 1) as f64;
+        outer.push(push(1.0, v, Some(*p), &mut uv, &mut pos3d));
+    }
+    // Top-right corner (u=1, v=1) = seam top.
+    outer.push(push(1.0, 1.0, Some(seam_top), &mut uv, &mut pos3d));
+    // Top ring, descending u from (0,1) toward u=0 (seam). Skip the u=0 seam
+    // entry here — the left column closes back to it.
+    for &(u, p) in top_uv.iter().rev() {
+        if u <= 1e-9 {
+            continue;
+        }
+        outer.push(push(u, 1.0, Some(p), &mut uv, &mut pos3d));
+    }
+    // Top-left corner (u=0, v=1) = seam top.
+    outer.push(push(0.0, 1.0, Some(seam_top), &mut uv, &mut pos3d));
+    // Left seam column, descending v (back down to the bottom seam at u=0).
+    for k in 0..ns {
+        let kk = ns - 1 - k;
+        let v = (kk + 1) as f64 / (ns + 1) as f64;
+        outer.push(push(0.0, v, Some(seam_interior[kk]), &mut uv, &mut pos3d));
+    }
+
+    // ---- Hole contours: project each inner-loop rim's cache 3D to UV. ----
+    let mut hole_contours: Vec<Vec<usize>> = Vec::new();
+    let mut hole_uv_polys: Vec<Vec<(f64, f64)>> = Vec::new();
+    for &inner_id in &face.inner_loops {
+        let Some(inner) = model.loops.get(inner_id) else {
+            return false;
+        };
+        let mut contour: Vec<usize> = Vec::new();
+        let mut poly: Vec<(f64, f64)> = Vec::new();
+        let mut last_u: Option<f64> = None;
+        for (i, &eid) in inner.edges.iter().enumerate() {
+            let fwd = inner.orientations.get(i).copied().unwrap_or(true);
+            let samples = cache.get_or_compute(eid, model);
+            let n = samples.len();
+            if n < 2 {
+                continue;
+            }
+            let emit: Vec<usize> = if fwd {
+                (0..n - 1).collect()
+            } else {
+                (1..n).rev().collect()
+            };
+            for si in emit {
+                let p = samples[si];
+                let Ok((mut u, v)) = surface.closest_point(&p, tol) else {
+                    return false;
+                };
+                // Unwrap u against the previous rim sample so the rim doesn't
+                // straddle the seam ambiguously.
+                if let Some(pu) = last_u {
+                    while u - pu > 0.5 {
+                        u -= 1.0;
+                    }
+                    while u - pu < -0.5 {
+                        u += 1.0;
+                    }
+                }
+                last_u = Some(u);
+                contour.push(push(u, v, Some(p), &mut uv, &mut pos3d));
+                poly.push((u, v));
+            }
+        }
+        if contour.len() < 3 {
+            return false;
+        }
+        hole_contours.push(contour);
+        hole_uv_polys.push(poly);
+    }
+
+    // ---- Interior Steiner grid (skip points inside any hole or on the
+    //      seam columns, which the outer contour already supplies). ----
+    let m_bands = {
+        let probe = 32;
+        let mut prev = p00;
+        let mut length = 0.0;
+        for k in 1..=probe {
+            let v = k as f64 / probe as f64;
+            if let Ok(p) = surface.point_at(0.0, v) {
+                length += (p - prev).magnitude();
+                prev = p;
+            }
+        }
+        linear_steps_for_quality(length, params).max(2)
+    };
+    let n_u = bottom_uv.len().max(top_uv.len()).max(8);
+    for j in 1..m_bands {
+        let v = j as f64 / m_bands as f64;
+        for i in 1..n_u {
+            let u = i as f64 / n_u as f64;
+            let inside_hole = hole_uv_polys
+                .iter()
+                .any(|poly| uv_point_in_polygon(u, v, poly));
+            if inside_hole {
+                continue;
+            }
+            push(u, v, None, &mut uv, &mut pos3d);
+        }
+    }
+
+    // ---- CDT in UV with the hole contours. ----
+    let mut contours: Vec<Vec<usize>> = Vec::with_capacity(1 + hole_contours.len());
+    let outer_closed: Vec<usize> = outer
+        .iter()
+        .copied()
+        .chain(std::iter::once(outer[0]))
+        .collect();
+    contours.push(outer_closed);
+    for hc in &hole_contours {
+        let closed: Vec<usize> = hc.iter().copied().chain(std::iter::once(hc[0])).collect();
+        contours.push(closed);
+    }
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cdt::triangulate_contours(&uv, &contours)
+    }));
+    let tris = match outcome {
+        Ok(Ok(tris)) => tris,
+        _ => return false,
+    };
+    if tris.is_empty() {
+        return false;
+    }
+
+    // ---- Map each UV vertex to 3D (cached boundary / point_at interior) and
+    //      emit. ----
+    let orient_sign = face.orientation.sign();
+    let mut vidx: Vec<Option<u32>> = vec![None; uv.len()];
+    let mut resolve = |k: usize,
+                       uv: &[(f64, f64)],
+                       pos3d: &[Option<Point3>],
+                       mesh: &mut TriangleMesh,
+                       vidx: &mut Vec<Option<u32>>|
+     -> Option<u32> {
+        if let Some(v) = vidx[k] {
+            return Some(v);
+        }
+        let (u, vv) = uv[k];
+        let p = match pos3d[k] {
+            Some(p) => p,
+            None => surface.point_at(u.rem_euclid(1.0), vv).ok()?,
+        };
+        let normal = surface
+            .normal_at(u.rem_euclid(1.0), vv)
+            .map(|nn| nn * orient_sign)
+            .unwrap_or(Vector3::Z);
+        let id = mesh.add_vertex(MeshVertex {
+            position: p,
+            normal,
+            uv: None,
+        });
+        vidx[k] = Some(id);
+        Some(id)
+    };
+
+    for (a, b, c) in tris {
+        let (Some(ia), Some(ib), Some(ic)) = (
+            resolve(a, &uv, &pos3d, mesh, &mut vidx),
+            resolve(b, &uv, &pos3d, mesh, &mut vidx),
+            resolve(c, &uv, &pos3d, mesh, &mut vidx),
+        ) else {
+            return false;
+        };
+        emit_outward_triangle(mesh, ia, ib, ic);
     }
     true
 }
