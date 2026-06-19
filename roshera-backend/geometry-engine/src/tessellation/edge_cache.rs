@@ -269,6 +269,28 @@ impl EdgeSampleCache {
                 return out;
             }
         }
+
+        // B-Rep-authoritative endpoints: snap the first/last sample to the
+        // edge's TOPOLOGICAL vertex positions. For an analytic edge the curve
+        // endpoint already equals its vertex, so this is a no-op. For a boolean
+        // cut edge whose endpoints were retargeted to a SHARED corner vertex
+        // (task #17 — two independent marching-SSI arcs that meet at a pocket
+        // corner, reconciled to one vertex), the underlying fit-curve still
+        // evaluates to its own slightly-divergent endpoint; without this snap
+        // each arc's cache would terminate at its private endpoint (~1e-2 apart)
+        // and the shared rim would not weld. Anchoring the cache to the shared
+        // vertex makes every face bounding the edge emit the identical corner
+        // point, so the rim is watertight by construction. The closed-edge case
+        // (start == end vertex) is left untouched (the seam sample is correct).
+        if !is_closed_edge && out.len() >= 2 {
+            if let Some(sp) = model.vertices.get_position(edge.start_vertex) {
+                let last = out.len() - 1;
+                out[0] = Point3::new(sp[0], sp[1], sp[2]);
+                if let Some(ep) = model.vertices.get_position(edge.end_vertex) {
+                    out[last] = Point3::new(ep[0], ep[1], ep[2]);
+                }
+            }
+        }
         out
     }
 }
