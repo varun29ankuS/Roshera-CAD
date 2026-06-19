@@ -135,12 +135,45 @@ pub fn intersect_surface_plane(
 
     // Step 1 — signed-distance grid.
     let mut grid = vec![vec![0.0_f64; n + 1]; n + 1];
+    let mut max_abs = 0.0_f64;
     for i in 0..=n {
         let u = u_min + i as f64 * du;
         for j in 0..=n {
             let v = v_min + j as f64 * dv;
             let pos = surface.point_at(u, v)?;
-            grid[i][j] = (pos - plane_origin).dot(&normal);
+            let d = (pos - plane_origin).dot(&normal);
+            grid[i][j] = d;
+            max_abs = max_abs.max(d.abs());
+        }
+    }
+
+    // Symbolic perturbation of on-contour grid nodes (Edelsbrunner & Mücke,
+    // *Simulation of Simplicity*, ACM TOG 1990). The marching-squares
+    // `crosses` predicate uses a strict `< 0` sign test, so a node whose
+    // signed distance is exactly (or numerically) zero is classified as
+    // non-negative and contributes NO sign change to either incident grid
+    // edge. When the zero-set runs ALONG a grid line — the canonical case is
+    // an axis-perpendicular cutting plane that coincides with a lofted
+    // surface's iso-parameter section (a horizontal z=const plane slicing a
+    // barrel lofted along z, where the section rings sit on grid rows) — an
+    // entire row/column of nodes is ≈0, every incident edge reports "no
+    // crossing", and the contour is silently dropped (0 branches → the
+    // boolean never imprints the cut → the cap face is left unsplit → a
+    // non-watertight result). Pushing every ≈0 node to a single, consistent
+    // infinitesimal POSITIVE value breaks the tie the same way for all of
+    // them: the contour then crosses cleanly onto the grid edges between the
+    // perturbed row and its strictly-negative neighbour. The shift is far
+    // below the geometric tolerance, so the Newton corrector in `make_node`
+    // re-snaps each node back onto d=0 exactly — the perturbation only
+    // affects the discrete sign topology, never the returned geometry.
+    if max_abs > 0.0 {
+        let zero_eps = max_abs * 1e-9;
+        for row in grid.iter_mut() {
+            for d in row.iter_mut() {
+                if d.abs() <= zero_eps {
+                    *d = zero_eps;
+                }
+            }
         }
     }
 
@@ -386,7 +419,7 @@ fn push_curve(
     if chain.len() < 2 {
         return;
     }
-    let closed = chain.len() >= 4 && chain.first() == chain.last();
+    let mut closed = chain.len() >= 4 && chain.first() == chain.last();
     let slice = if closed {
         &chain[..chain.len() - 1]
     } else {
@@ -396,8 +429,24 @@ fn push_curve(
         return;
     }
     let pts: Vec<ParametricIntersectionPoint> = slice.iter().map(|&id| nodes[id]).collect();
-    // Reject a hair-thin degenerate chain (all points coincident).
+    // Endpoint separation in 3D.
     let span = (pts[pts.len() - 1].position - pts[0].position).magnitude();
+    // Periodic-seam closure: a contour that wraps a surface's periodic
+    // direction (e.g. a horizontal z=const plane cutting a barrel lofted along
+    // z produces a FULL section circle in the u-parameter) is walked as an OPEN
+    // chain in the non-periodic (u_min..u_max) grid — its two ends land on the
+    // seam, the SAME 3D point but DISTINCT grid nodes (so `first()==last()` is
+    // false). Such a chain is geometrically CLOSED. Detect it by 3D-coincident
+    // endpoints with enough points to bound real area, and tag it closed so the
+    // downstream face-split treats it as a closed imprint loop. Without this,
+    // the `span < tolerance` guard below — meant to drop hair-thin degenerate
+    // chains — silently discards the entire section circle, the cutter cap face
+    // is never split, and the boolean is not watertight (#17).
+    if !closed && slice.len() >= 3 && span < tolerance.distance() {
+        closed = true;
+    }
+    // Reject a hair-thin degenerate OPEN chain (all points coincident, too few
+    // to be a real loop).
     if !closed && span < tolerance.distance() {
         return;
     }
