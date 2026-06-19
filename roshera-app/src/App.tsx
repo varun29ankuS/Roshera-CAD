@@ -16,6 +16,7 @@ import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
+import { installBackendBlackboard } from '@/lib/blackboard-api'
 import { ViewportBridge } from '@/lib/viewport-bridge'
 
 const DEMOS_HASH = '#/demos'
@@ -40,6 +41,16 @@ export function App() {
     const onHashChange = () => setRoute(isDemosRoute() ? 'demos' : 'workspace')
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
+
+  // Install the backend-backed Blackboard adapter once at bootstrap: the
+  // notebook now reads + writes the server (lines an agent adds over MCP
+  // appear live here via a short poll), with a localStorage fallback when
+  // the backend is unreachable. Swaps only the persistence adapter — the
+  // store's reducers are untouched. See `lib/blackboard-api.ts`.
+  useEffect(() => {
+    const stop = installBackendBlackboard()
+    return stop
   }, [])
 
   // Only the workspace owns the live websocket. The gallery is purely
