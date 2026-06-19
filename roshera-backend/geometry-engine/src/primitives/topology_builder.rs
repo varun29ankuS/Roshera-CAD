@@ -26,6 +26,98 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+/// Verify a computed mass-properties result against the PHYSICAL contract of a
+/// real rigid body, returning `Err(reason)` with a machine-readable cause when
+/// any check fails so the caller can REFUSE (rather than emit a lie).
+///
+/// A genuine solid's mass-properties satisfy:
+///  1. volume and surface area are positive and finite;
+///  2. the inertia tensor is symmetric (`I[i][j] == I[j][i]`);
+///  3. its principal moments (eigenvalues of the symmetric tensor) are all
+///     finite and NON-NEGATIVE — the tensor is positive-semidefinite; and
+///  4. the rigid-body triangle inequality holds on the principal moments
+///     (`Ii + Ij ≥ Ik` for every pairing) — a real mass distribution cannot
+///     violate it even when the tensor is symmetric.
+///
+/// Tolerances are scaled to the tensor magnitude (so a large part is not held to
+/// an absolute epsilon) and take their *relative* band from the kernel's default
+/// [`Tolerance`] distance term rather than a hardcoded literal at the call site.
+/// A symmetric, near-degenerate eigenproblem
+/// can leave a tiny negative epsilon on one eigenvalue or a hair of asymmetry;
+/// those are tolerated. A gross violation (a large negative moment, an
+/// asymmetric tensor, a broken triangle inequality) is the husk signature and is
+/// rejected.
+fn check_mass_properties_physical(
+    volume: f64,
+    surface_area: f64,
+    inertia_tensor: &[[f64; 3]; 3],
+    principal_moments: Vector3,
+) -> Result<(), String> {
+    // Relative band: derive a dimensionless ratio from the kernel's default
+    // distance tolerance rather than hardcoding `1e-6`. NORMAL_TOLERANCE's
+    // distance is ~1e-6 model units; we use it directly as the relative band on
+    // tensor-scaled quantities (the tensor is already a magnitude, so the band
+    // is a fraction of it).
+    let rel_band = Tolerance::default().distance().max(f64::EPSILON);
+
+    if !(volume.is_finite() && volume > 0.0) {
+        return Err(format!("volume not positive-finite: {volume}"));
+    }
+    if !(surface_area.is_finite() && surface_area > 0.0) {
+        return Err(format!("surface area not positive-finite: {surface_area}"));
+    }
+
+    // Tensor magnitude scale (≥ 1 so a near-zero tensor isn't held to an
+    // absolute epsilon either).
+    let scale = inertia_tensor
+        .iter()
+        .flat_map(|row| row.iter())
+        .fold(0.0f64, |m, &x| m.max(x.abs()))
+        .max(1.0);
+
+    // Symmetry: the integration writes the tensor symmetrically, but a NaN/Inf
+    // accumulator from a degenerate triangle would surface as asymmetry here.
+    for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        let asym = (inertia_tensor[a][b] - inertia_tensor[b][a]).abs();
+        if !asym.is_finite() || asym > rel_band * scale {
+            return Err(format!(
+                "inertia tensor not symmetric: I[{a}][{b}]={} vs I[{b}][{a}]={} (asym {asym:.3e})",
+                inertia_tensor[a][b], inertia_tensor[b][a]
+            ));
+        }
+    }
+
+    // Positive-semidefiniteness: every principal moment finite and ≥ 0 (within a
+    // scaled epsilon for a near-degenerate Jacobi solve).
+    let pm = [
+        principal_moments.x,
+        principal_moments.y,
+        principal_moments.z,
+    ];
+    let neg_tol = -rel_band * scale;
+    for (k, &m) in pm.iter().enumerate() {
+        if !m.is_finite() || m < neg_tol {
+            return Err(format!(
+                "principal moment {k} non-physical (negative/NaN): {m}"
+            ));
+        }
+    }
+
+    // Rigid-body triangle inequality: Ii + Ij ≥ Ik for every pairing.
+    let tri_tol = rel_band * scale;
+    for (a, b, c) in [(0, 1, 2), (0, 2, 1), (1, 2, 0)] {
+        if pm[a] + pm[b] + tri_tol < pm[c] {
+            return Err(format!(
+                "principal-moment triangle inequality violated: I{a}+I{b}={} < I{c}={}",
+                pm[a] + pm[b],
+                pm[c]
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Flatten a `Matrix4` to a 4×4 row-major nested array for JSON
 /// recording. Used by the slice 4a datum mediators so timeline replay
 /// and the API layer share the same wire shape.
@@ -2411,6 +2503,37 @@ impl BRepModel {
             (principal_moments.y / mass).sqrt(),
             (principal_moments.z / mass).sqrt(),
         );
+
+        // PHYSICAL-VALIDITY GATE — the kernel must not LIE with mass-properties.
+        //
+        // The integration above is the divergence theorem summed per tetrahedron
+        // (Tonon 2004). It is only correct over a CLOSED, consistently-wound
+        // surface. A malformed / non-watertight solid (e.g. a curved-boolean
+        // husk with leaked or oppositely-wound triangles) makes the per-triangle
+        // tetrahedra cancel inconsistently and yields a tensor that is symmetric
+        // but INDEFINITE — a NEGATIVE principal moment, which a real rigid body
+        // cannot have (the inertia tensor is positive-semidefinite). Returning
+        // such numbers is a form of lying.
+        //
+        // So we VERIFY the result against the physical contract and REFUSE
+        // (return `None`, logging the reason) if it is non-physical, rather than
+        // hand a caller bogus numbers. We do NOT clamp a negative moment to zero
+        // — that would be a different lie; we refuse. The public surface
+        // (`compute_solid_mass_properties` → `mass_properties_for`) already
+        // returns `Option`, so a refusal is a `None` that callers already handle
+        // (the agent-facing report surfaces it as "indeterminate", not a fake
+        // tensor). Clean solids are unaffected — they pass every check.
+        if let Err(reason) =
+            check_mass_properties_physical(volume, surface_area, &inertia_tensor, principal_moments)
+        {
+            tracing::warn!(
+                "mass-properties REFUSED for solid {solid_id}: non-physical result \
+                 ({reason}) — the source solid is malformed (non-watertight / \
+                 inconsistently-wound mesh); returning None rather than emitting \
+                 a physically impossible tensor"
+            );
+            return None;
+        }
 
         Some(crate::primitives::solid::SolidMassProperties {
             volume,
