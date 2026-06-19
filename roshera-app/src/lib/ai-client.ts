@@ -1,4 +1,5 @@
 import { useChatStore } from '@/stores/chat-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useWSStore } from '@/stores/ws-store'
 
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
@@ -176,5 +177,62 @@ export async function processUserMessage(text: string, sessionId?: string) {
     }
   } finally {
     store.setProcessing(false)
+  }
+}
+
+/**
+ * Blackboard variant of `processUserMessage`. Same agent plumbing
+ * (`sendAICommandStreaming` → `sendAICommand` fallback), but the user prompt
+ * and the agent reply are appended to the Blackboard as *editable lines*
+ * rather than chat bubbles.
+ *
+ * Streaming chunks update the agent line in place via `setLineText` (no event
+ * spam); once the reply settles we commit a single `edit` event through
+ * `editLine` so the append-only log records exactly one meaningful entry for
+ * the final agent text. The initial `addLine` already logged the line's
+ * creation, so reload + history-scrub both see a coherent sequence.
+ */
+export async function processBlackboardMessage(text: string, sessionId?: string) {
+  const board = useBlackboardStore.getState()
+  const wsSession = useWSStore.getState().sessionId
+  const sid = sessionId || wsSession || undefined
+
+  board.addLine(text, 'user')
+  board.setProcessing(true)
+
+  // Placeholder agent line for progressive streaming. Created empty so the
+  // `add` event is logged immediately; final text is committed via `editLine`.
+  const lineId = board.addLine('', 'agent')
+  let accumulated = ''
+
+  const commit = (content: string) => {
+    useBlackboardStore.getState().editLine(lineId, content)
+  }
+
+  try {
+    await sendAICommandStreaming(text, sid, (chunk) => {
+      accumulated += chunk
+      useBlackboardStore.getState().setLineText(lineId, accumulated)
+    })
+    commit(accumulated || 'Command processed.')
+  } catch {
+    try {
+      const resp = await sendAICommand(text, sid)
+      if (resp.success && resp.result?.result) {
+        commit(resp.result.result.message || 'Command executed.')
+      } else if (resp.error) {
+        commit(resp.error)
+      } else {
+        commit('Command processed.')
+      }
+      if (resp.session_id) {
+        useWSStore.getState().setSessionId(resp.session_id)
+      }
+    } catch (fallbackErr) {
+      const message = fallbackErr instanceof Error ? fallbackErr.message : 'Unknown error'
+      commit(`Failed to reach backend: ${message}`)
+    }
+  } finally {
+    useBlackboardStore.getState().setProcessing(false)
   }
 }
