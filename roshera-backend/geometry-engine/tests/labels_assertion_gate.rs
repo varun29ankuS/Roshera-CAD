@@ -107,6 +107,8 @@ fn selector_label_resolves_then_goes_stale_when_assertion_breaks() {
         angle_tol_deg: 12.0,
         extremal: "smallest_area".into(),
         along: None,
+        axis_origin: None,
+        axis_dir: None,
     });
     m.label_face_with_assertion(
         throat_fid,
@@ -216,17 +218,26 @@ fn propose_labels_recognizes_throat_and_exit_with_assertions() {
     assert!(throat_prop.confidence > 0.0 && throat_prop.confidence <= 1.0);
     let expected_throat = resolve_face(&mut m, solid, &throat_selector()).expect("throat");
 
-    // The proposal's assertion is a selector (the kernel owns the claim).
+    // The proposal's assertion is a selector (the kernel owns the claim). On a
+    // surface-of-revolution part the throat recognizer is the geometry-aware
+    // min-radius station (axis-relative), which on this tube nozzle picks the
+    // same inner wall the smallest-area-cylinder selector does — but is now
+    // robust to a necked-down revolved band, not just an analytic cylinder.
     match &throat_prop.assertion {
         LabelAssertion::Selector(SelectorSpec::Face(s)) => {
-            assert_eq!(s.extremal, "smallest_area");
-            assert_eq!(s.surface, "cylindrical");
+            assert_eq!(s.extremal, "min_radius_station");
+            assert!(
+                s.axis_origin.is_some() && s.axis_dir.is_some(),
+                "min-radius-station throat carries the symmetry axis in its selector"
+            );
         }
         other => panic!("throat proposal should carry a face selector assertion: {other:?}"),
     }
 
     // Confirm = attach with the proposal's assertion. Then it resolves to the
-    // recognized feature and the assertion holds.
+    // recognized feature and the assertion holds. (The min-radius station on this
+    // tube nozzle is the inner cylindrical wall — the same face `throat_selector`
+    // finds, which `expected_throat` captured above.)
     m.label_face_with_assertion(
         expected_throat,
         &throat_prop.suggested_name,
@@ -241,6 +252,9 @@ fn propose_labels_recognizes_throat_and_exit_with_assertions() {
     assert_eq!(status, AssertionStatus::Holds);
 
     // The exit proposal too carries an assertion that resolves to a planar cap.
+    // On a surface-of-revolution part the exit recognizer is the axis-EXTREMAL
+    // planar cap (axis-relative, so a bell-down nozzle works), carrying the
+    // symmetry axis in its selector rather than a hardcoded +Z normal.
     let exit_prop = proposals
         .iter()
         .find(|p| p.suggested_name == "exit")
@@ -248,7 +262,11 @@ fn propose_labels_recognizes_throat_and_exit_with_assertions() {
     match &exit_prop.assertion {
         LabelAssertion::Selector(SelectorSpec::Face(s)) => {
             assert_eq!(s.surface, "planar");
-            assert_eq!(s.normal_dir, Some([0.0, 0.0, 1.0]));
+            assert_eq!(s.extremal, "axial_extremal_cap");
+            assert!(
+                s.axis_origin.is_some() && s.axis_dir.is_some(),
+                "axial-extremal-cap exit carries the symmetry axis"
+            );
         }
         other => panic!("exit proposal should carry a planar-cap selector: {other:?}"),
     }
@@ -349,17 +367,28 @@ fn render_proposed_and_confirmed_labels_overlay() {
                 // Resolve the proposal's own assertion to the entity it names,
                 // then pin the suggested name with that exact assertion.
                 if let LabelAssertion::Selector(SelectorSpec::Face(s)) = &p.assertion {
+                    use geometry_engine::math::Vector3;
+                    use geometry_engine::queries::select::Axis;
+                    let axis = match (s.axis_origin, s.axis_dir) {
+                        (Some(o), Some(d)) => Some(Axis {
+                            origin: Vector3::new(o[0], o[1], o[2]),
+                            direction: Vector3::new(d[0], d[1], d[2]),
+                        }),
+                        _ => None,
+                    };
                     let q = match s.extremal.as_str() {
                         "smallest_area" => FaceQuery::new(SurfaceKind::Cylindrical)
                             .extremal(Extremal::SmallestArea),
                         "largest_area" => {
                             FaceQuery::new(SurfaceKind::Cylindrical).extremal(Extremal::LargestArea)
                         }
+                        "min_radius_station" => FaceQuery::new(SurfaceKind::Any)
+                            .extremal(Extremal::MinRadiusStation(axis.expect("axis"))),
+                        "axial_extremal_cap" => FaceQuery::new(SurfaceKind::Planar)
+                            .extremal(Extremal::AxialExtremalCap(axis.expect("axis"))),
                         _ => FaceQuery::new(SurfaceKind::Planar)
-                            .facing(geometry_engine::math::Vector3::new(0.0, 0.0, 1.0))
-                            .extremal(Extremal::MostAlong(geometry_engine::math::Vector3::new(
-                                0.0, 0.0, 1.0,
-                            ))),
+                            .facing(Vector3::new(0.0, 0.0, 1.0))
+                            .extremal(Extremal::MostAlong(Vector3::new(0.0, 0.0, 1.0))),
                     };
                     if let Ok(fid) = resolve_face(&mut m, solid, &q) {
                         m.label_face_with_assertion(

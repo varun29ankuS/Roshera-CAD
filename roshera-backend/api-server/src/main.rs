@@ -37,7 +37,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::{IntoResponse, Sse},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use dashmap::DashMap;
@@ -7316,6 +7316,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/{id}/labels/{name}/resolve",
             get(handlers::agent::resolve_label),
+        )
+        .route(
+            "/api/agent/parts/{id}/labels/{name}",
+            delete(handlers::agent::delete_label).patch(handlers::agent::rename_label),
         )
         .route(
             "/api/agent/parts/{id}/propose-labels",

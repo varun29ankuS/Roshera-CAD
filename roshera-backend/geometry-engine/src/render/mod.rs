@@ -236,6 +236,67 @@ pub fn render_solid_dir(
 /// label VERIFIABLE on the picture (you SEE "throat" on the throat face).
 pub type LabelCallout = (Point3, String);
 
+/// A COLOR-CODED label mark for the set-of-marks overlay: a world `anchor`, the
+/// callout `text` (drawn verbatim — `"name — Ø2.00 mm"`), the label's display
+/// `color`, and the optional `target_face` to TINT that same colour so the human
+/// / agent can see which mark belongs to which feature. The richer companion to
+/// [`LabelCallout`]; [`render_solid_with_label_marks`] draws each callout in its
+/// own colour and tints the target face.
+#[derive(Debug, Clone)]
+pub struct LabelMark {
+    pub anchor: Point3,
+    pub text: String,
+    pub color: [u8; 3],
+    pub target_face: Option<crate::primitives::face::FaceId>,
+}
+
+/// Render one solid, TINTING each labelled target face in its label colour, then
+/// overlay each callout in that same colour with its measurement text. This is
+/// the COLOR-CODED set-of-marks eye (named, dimensioned, color-coded callouts):
+/// the picture itself shows which mark maps to which feature. Empty `marks` is
+/// identical to [`render_solid`].
+pub fn render_solid_with_label_marks(
+    model: &BRepModel,
+    solid_id: SolidId,
+    marks: &[LabelMark],
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
+    let solid = model.solids.get(solid_id)?;
+    let mesh = tessellate_solid(solid, model, &opts.tessellation);
+    // Per-triangle base colour: a face tinted by the label whose target it is,
+    // else the default clay. A face claimed by two labels takes the first (marks
+    // are name-ordered, so this is deterministic).
+    const DEFAULT: [u8; 3] = [200, 200, 200];
+    let mut tri_colors: Vec<[u8; 3]> = Vec::with_capacity(mesh.triangles.len());
+    for ti in 0..mesh.triangles.len() {
+        let fid = mesh.face_map.get(ti).copied();
+        let col = fid
+            .and_then(|f| {
+                marks
+                    .iter()
+                    .find(|m| m.target_face == Some(f))
+                    .map(|m| m.color)
+            })
+            .unwrap_or(DEFAULT);
+        tri_colors.push(col);
+    }
+    let callouts: Vec<ColoredCallout> = marks
+        .iter()
+        .map(|m| (m.anchor, m.text.clone(), m.color))
+        .collect();
+    render_mesh_dir_marks(
+        &mesh,
+        opts.view.direction(),
+        opts.view.up_hint(),
+        opts,
+        Some(&tri_colors),
+        &callouts,
+    )
+}
+
+/// A coloured callout for the set-of-marks overlay: anchor, text, RGB.
+type ColoredCallout = (Point3, String, [u8; 3]);
+
 /// Render one solid through the canonical view of `opts`, then overlay the
 /// given label callouts (leader line from the projected anchor to a text tag).
 /// The LABELLER's eye: the agent and the user see the named features marked on
@@ -341,6 +402,9 @@ pub fn render_solids_with_labels(
 
 /// Rasterize an already-tessellated mesh from a view direction (auto-framed).
 /// Shared by `render_solid_dir` (one solid) and `render_solids_dir` (assembly).
+/// Thin wrapper: rasterize with MONO-coloured callouts (the default labeller
+/// blue). Keeps the original `render_mesh_dir` contract for callers that do not
+/// carry per-label colour.
 #[allow(clippy::too_many_arguments)]
 fn render_mesh_dir(
     mesh: &TriangleMesh,
@@ -349,6 +413,26 @@ fn render_mesh_dir(
     opts: &RenderOptions,
     tri_colors: Option<&[[u8; 3]]>,
     label_callouts: &[LabelCallout],
+) -> Option<RenderFrame> {
+    const LABEL_COLOR: [u8; 3] = [0, 90, 200]; // blue — distinct from dim-orange
+    let colored: Vec<ColoredCallout> = label_callouts
+        .iter()
+        .map(|(p, s)| (*p, s.clone(), LABEL_COLOR))
+        .collect();
+    render_mesh_dir_marks(mesh, dir, up_hint, opts, tri_colors, &colored)
+}
+
+/// Rasterize an already-tessellated mesh, then overlay COLOUR-CODED callouts —
+/// each callout drawn in its own colour (the set-of-marks eye). Shared core of
+/// every label-overlay render path.
+#[allow(clippy::too_many_arguments)]
+fn render_mesh_dir_marks(
+    mesh: &TriangleMesh,
+    dir: Vector3,
+    up_hint: Vector3,
+    opts: &RenderOptions,
+    tri_colors: Option<&[[u8; 3]]>,
+    label_callouts: &[ColoredCallout],
 ) -> Option<RenderFrame> {
     if mesh.triangles.is_empty() {
         return None;
@@ -640,7 +724,6 @@ fn render_mesh_dir(
     // font + Bresenham line shared from `dimensioned`, so the labeller overlay
     // and the dimension overlay are visually identical and share one font.
     if !label_callouts.is_empty() {
-        const LABEL_COLOR: [u8; 3] = [0, 90, 200]; // blue — distinct from dim-orange / diag-red
         const SCALE: usize = 2;
         let (w, h) = (opts.width, opts.height);
         let th = crate::render::dimensioned::glyph_height_px(SCALE);
@@ -655,7 +738,8 @@ fn render_mesh_dir(
             )
         };
         let mut placed: Vec<(f64, f64, f64, f64)> = Vec::new();
-        for (anchor, name) in label_callouts {
+        for (anchor, name, label_color) in label_callouts {
+            let label_color = *label_color;
             let (ax, ay, _depth) = project(anchor);
             // Skip anchors that fall outside the framebuffer.
             if ax < 0.0 || ay < 0.0 || ax >= w as f64 || ay >= h as f64 {
@@ -694,7 +778,7 @@ fn render_mesh_dir(
                 ay,
                 ax + 4.0,
                 ay,
-                LABEL_COLOR,
+                label_color,
             );
             crate::render::dimensioned::draw_line_overlay(
                 &mut pixels,
@@ -704,7 +788,7 @@ fn render_mesh_dir(
                 ay - 4.0,
                 ax,
                 ay + 4.0,
-                LABEL_COLOR,
+                label_color,
             );
             crate::render::dimensioned::draw_line_overlay(
                 &mut pixels,
@@ -714,7 +798,7 @@ fn render_mesh_dir(
                 ay,
                 lx,
                 ly + th,
-                LABEL_COLOR,
+                label_color,
             );
             crate::render::dimensioned::draw_text_overlay(
                 &mut pixels,
@@ -723,7 +807,7 @@ fn render_mesh_dir(
                 lx,
                 ly,
                 name,
-                LABEL_COLOR,
+                label_color,
                 SCALE,
             );
         }
