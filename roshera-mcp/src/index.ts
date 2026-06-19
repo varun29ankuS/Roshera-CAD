@@ -36,7 +36,7 @@ class ApiError extends Error {
 }
 
 async function api(
-  method: "GET" | "POST" | "DELETE",
+  method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   body?: unknown,
 ): Promise<any> {
@@ -946,6 +946,51 @@ server.tool(
 );
 
 server.tool(
+  "shell",
+  "HOLLOW a solid to a constant wall thickness, opening the listed cap faces so " +
+    "the interior cavity is exposed (a closed body becomes an open shell — a box " +
+    "into a tray, a revolved/lofted body into a thin-walled vessel or nozzle). " +
+    "`object` is the OBJECT UUID (the object_uuid returned by the create/loft/" +
+    "revolve/boolean tools), NOT a kernel part id. `thickness` is the wall " +
+    "thickness (the wall grows inward). `faces_to_remove` are the face ids to open " +
+    "up — an empty list yields a fully closed hollow solid (a void), which is " +
+    "rarely the intent. Get those face ids from `select_face` (e.g. " +
+    "`{kind:'planar'}` returns the planar cap faces as candidates) or from a " +
+    "render_part `mode:'ids'` legend. Identity-preserving: the body keeps its " +
+    "UUID. Shelling can leave a self-intersecting or open wall, so ALWAYS " +
+    "verify_part the result.",
+  {
+    object: z.string().uuid().describe("object_uuid of the solid to hollow"),
+    thickness: z.number().describe("wall thickness (wall grows inward); must be non-zero"),
+    faces_to_remove: z
+      .array(z.number().int().nonnegative())
+      .default([])
+      .describe("face ids of the caps to open (from select_face / render_part ids); [] = closed void"),
+  },
+  async ({ object, thickness, faces_to_remove }) => {
+    try {
+      const r = await api("POST", "/api/geometry/shell", {
+        object,
+        thickness,
+        faces_to_remove,
+      });
+      const part_id = r.solid_id ?? (await newestPartId());
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? object, // identity-preserving: same uuid
+          part_id,
+          triangles: r?.stats?.triangle_count ?? null,
+          placement: part_id !== null ? await placement(part_id) : null,
+        },
+        part_id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "import_step",
   "IMPORT a STEP file (ISO 10303-21 / AP203 / AP214 / AP242) into the live " +
     "scene as one or more real B-Rep solids. Give either a `path` to a .step/.stp " +
@@ -1401,6 +1446,109 @@ server.tool(
         model_reconciled: r.model_reconciled,
         branch_id: r.branch_id ?? branch_id,
       });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// BLACKBOARD — agent/human shared notebook of editable, event-logged lines.
+// Backend-persisted (GET/POST/PATCH/DELETE /api/blackboard*); a line added
+// here shows up live in the frontend Blackboard panel. Kept as a delimited
+// block at the end so concurrent edits to the tool list above don't conflict.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Wire shape of one Blackboard line (mirrors the frontend store). */
+interface BlackboardLine {
+  id: string;
+  text: string;
+  author: "user" | "agent";
+  createdAt: number;
+  updatedAt: number;
+}
+
+server.tool(
+  "blackboard_add_entry",
+  "WRITE a line to the shared Blackboard — the agent/human notebook that the " +
+    "human SEES live in the app. Use it to record findings, reasoning, a plan, " +
+    "or a result as an editable, markdown+math line (e.g. '$E = mc^2$'). The " +
+    "line is appended to the backend document and broadcast to every open " +
+    "client. `author` defaults to 'agent'. Returns the created line's id.",
+  {
+    text: z.string().describe("markdown + $math$ source for the line"),
+    author: z
+      .enum(["agent", "user"])
+      .default("agent")
+      .describe("line origin; defaults to 'agent'"),
+  },
+  async ({ text, author }) => {
+    try {
+      const line = (await api("POST", "/api/blackboard/entries", {
+        text,
+        author,
+      })) as BlackboardLine;
+      return ok({ id: line.id, author: line.author, text: line.text });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "blackboard_edit_entry",
+  "EDIT an existing Blackboard line in place by its id (from blackboard_list). " +
+    "Replaces the line's text and logs an edit event; the change appears live " +
+    "in the app. Returns the updated line.",
+  {
+    id: z.string().describe("line id from blackboard_list"),
+    text: z.string().describe("new markdown + $math$ source for the line"),
+  },
+  async ({ id, text }) => {
+    try {
+      const line = (await api(
+        "PATCH",
+        `/api/blackboard/entries/${encodeURIComponent(id)}`,
+        { text },
+      )) as BlackboardLine;
+      return ok({ id: line.id, author: line.author, text: line.text });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "blackboard_list",
+  "READ the shared Blackboard: returns every current line (id, author, text) " +
+    "in document order. Use it to see what the human has written, or to fetch " +
+    "the id of a line before editing it.",
+  {},
+  async () => {
+    try {
+      const snap = (await api("GET", "/api/blackboard")) as {
+        lines?: BlackboardLine[];
+      };
+      const lines = (snap.lines ?? []).map((l) => ({
+        id: l.id,
+        author: l.author,
+        text: l.text,
+      }));
+      return ok({ count: lines.length, lines });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "blackboard_clear",
+  "CLEAR the shared Blackboard — remove every line and reset the event log. " +
+    "Destructive 'start over' for the notebook; does not touch geometry.",
+  {},
+  async () => {
+    try {
+      return ok(await api("POST", "/api/blackboard/clear", {}));
     } catch (e) {
       return fail(e);
     }

@@ -216,6 +216,7 @@ async fn make_test_state() -> AppState {
             timeline_recorder.clone()
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
+        blackboard: Arc::new(crate::blackboard::BlackboardManager::new()),
     }
 }
 
@@ -1403,5 +1404,209 @@ async fn fillet_g1_mixed_corner_returns_200_with_three_subpatch_cap() {
     assert_eq!(
         body["success"], true,
         "γ.6.2 G1 mixed-corner fillet response must report success; body = {body}"
+    );
+}
+
+// =====================================================================
+// Tests — Blackboard notebook REST surface through the router
+// =====================================================================
+
+/// Full Blackboard round-trip through the live router: an empty GET, an
+/// agent-authored POST, the line appearing in a subsequent GET with the
+/// matching `add` event, a PATCH edit (with its `edit` event), a DELETE,
+/// and finally clear. Pins the agent-writable contract end to end past URL
+/// routing, the auth middleware (soft mode = permissive), the `Json`
+/// extractor, and the event-log wire shape the frontend hydrates from.
+#[tokio::test]
+async fn blackboard_full_round_trip_through_router() {
+    let state = make_test_state().await;
+
+    // Start clean (the default notebook is created lazily on first access).
+    let (status, _) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/clear")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "clear must route to 200");
+
+    // GET — empty document.
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["lines"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["events"].as_array().map(Vec::len), Some(0));
+
+    // POST — append an agent line (author defaults to agent when omitted).
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/entries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "text": "agent finding $x^2$" }).to_string(),
+            ))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "add must route to 200; body = {body}"
+    );
+    assert_eq!(body["author"], "agent", "omitted author defaults to agent");
+    let line_id = body["id"]
+        .as_str()
+        .expect("add must return a line id")
+        .to_string();
+
+    // GET — line + add event present, with frontend-shaped field names.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(body["lines"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["lines"][0]["id"], line_id);
+    assert_eq!(body["lines"][0]["text"], "agent finding $x^2$");
+    assert!(
+        body["lines"][0]["createdAt"].is_number(),
+        "camelCase createdAt"
+    );
+    assert_eq!(body["events"][0]["kind"], "add");
+    assert_eq!(body["events"][0]["lineId"], line_id);
+
+    // PATCH — edit the line.
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/api/blackboard/entries/{line_id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "text": "edited" }).to_string()))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "edit must route to 200; body = {body}"
+    );
+    assert_eq!(body["text"], "edited");
+
+    // PATCH unknown id → 400 (InvalidParameter), not a silent success.
+    let (status, _body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::PATCH)
+            .uri("/api/blackboard/entries/does-not-exist")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "text": "x" }).to_string()))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown id must reject");
+
+    // DELETE — remove the line.
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/api/blackboard/entries/{line_id}"))
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "delete must route to 200; body = {body}"
+    );
+    assert_eq!(body["success"], true);
+
+    // GET — line gone; the log retains add + edit + delete.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(body["lines"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        body["events"].as_array().map(Vec::len),
+        Some(3),
+        "event log keeps add + edit + delete; body = {body}"
+    );
+}
+
+/// A client-supplied line id is honoured verbatim on add — the contract the
+/// frontend adapter relies on so a locally-inserted line is addressable by
+/// the SAME id for later PATCH / DELETE, and a duplicate re-POST (poll race)
+/// is idempotent rather than creating a second row.
+#[tokio::test]
+async fn blackboard_honours_client_supplied_id_and_dedupes() {
+    let state = make_test_state().await;
+    let _ = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/clear")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .expect("static request must build"),
+    )
+    .await;
+
+    let body_json = json!({ "id": "bb-client-1", "text": "from frontend", "author": "user" });
+    let post = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/entries")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .expect("static request must build")
+    };
+
+    let (status, body) = dispatch(&state, post()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], "bb-client-1", "client id must be kept verbatim");
+    assert_eq!(body["author"], "user");
+
+    // Re-POST the same id → idempotent (no duplicate row).
+    let (status, _body) = dispatch(&state, post()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        body["lines"].as_array().map(Vec::len),
+        Some(1),
+        "duplicate id must not create a second line; body = {body}"
     );
 }
