@@ -147,6 +147,13 @@ pub struct ResolutionCaches {
     pub shells: HashMap<u64, ShellId>,
     /// Source `#N` → kernel solid id.
     pub solids: HashMap<u64, SolidId>,
+    /// Source `#N` of a `MAPPED_ITEM` (assembly instance) → the kernel
+    /// solid ids it placed. A `MAPPED_ITEM` can instance a whole
+    /// sub-representation (multiple solids), so this is a list, unlike
+    /// [`Self::solids`]. Populated by the tier-3 assembly handler;
+    /// consumed by the root handler when walking a representation's
+    /// items list.
+    pub mapped_solids: HashMap<u64, Vec<SolidId>>,
     /// Source `#N` of a root representation (`SHAPE_REPRESENTATION` /
     /// `ADVANCED_BREP_SHAPE_REPRESENTATION`) → the kernel solid ids
     /// produced by its items list. Populated by the root handlers in

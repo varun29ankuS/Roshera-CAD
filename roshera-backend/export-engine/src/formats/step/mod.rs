@@ -37,9 +37,12 @@ pub mod context;
 pub mod diagnostics;
 pub mod dispatch;
 pub mod handlers;
+pub mod merge;
 pub mod parser;
 pub mod registry;
 pub mod writer;
+
+pub use merge::merge_solids_into;
 
 // Re-export the writer's full public surface so existing callers
 // (`crate::engine::ExportEngine`, `roshera-backend/api-server`)
@@ -48,7 +51,9 @@ pub use writer::*;
 
 pub use diagnostics::ImportReport;
 
+use geometry_engine::math::Tolerance;
 use geometry_engine::primitives::topology_builder::BRepModel;
+use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 use std::path::Path;
 
 use crate::ExportError;
@@ -97,8 +102,20 @@ pub async fn import_step_to_brep_with_report(
         ),
     })?;
 
+    import_step_text_with_report(&text, &path_str)
+}
+
+/// Import STEP from an in-memory exchange-structure string (no file I/O).
+///
+/// The agent/REST path receives STEP content inline; this is the shared
+/// core that [`import_step_to_brep_with_report`] delegates to after
+/// reading the file. `source_hint` is used only in diagnostics.
+pub fn import_step_text_with_report(
+    text: &str,
+    source_hint: &str,
+) -> Result<(BRepModel, ImportReport), ExportError> {
     // Parse → index → dispatch.
-    let exchange = parser::parse_step(&text, &path_str)?;
+    let exchange = parser::parse_step(text, source_hint)?;
     let registry = EntityRegistry::build(&exchange);
     let mut model = BRepModel::new();
     let mut report = ImportReport::new();
@@ -118,7 +135,54 @@ pub async fn import_step_to_brep_with_report(
     };
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
-    report.ok = resolved > 0 && !model.solids.is_empty();
+
+    // Validation gate (IMP5). A solid that materialises topologically is
+    // not yet trustworthy — STEP files in the wild deliver self-
+    // intersecting faces, non-manifold seams, and open boundaries. Run
+    // the kernel's `validate_solid_scoped` on every imported solid and
+    // fold the verdict into `ImportReport::ok`: a manifold-but-invalid
+    // reconstruction is now reported `ok = false` rather than passing
+    // silently. The per-solid verdicts are surfaced on
+    // `report.validation` so the caller can see exactly which solid(s)
+    // failed and why.
+    // Modelling tolerance for the gate. The importer defaults to 1e-6 mm
+    // (the kernel canonical default) when the file omits an
+    // `UNCERTAINTY_MEASURE_WITH_UNIT`; the same value scopes validation.
+    let report_tolerance = 1e-6_f64;
+    let solid_ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
+    let mut all_solids_valid = true;
+    for solid_id in solid_ids {
+        let verdict = validate_solid_scoped(
+            &model,
+            solid_id,
+            Tolerance::from_distance(report_tolerance),
+            ValidationLevel::Standard,
+        );
+        if !verdict.is_valid {
+            all_solids_valid = false;
+        }
+        // Cap the captured messages so a pathological shell can't bloat
+        // the report; the count is always exact.
+        let errors: Vec<String> = verdict
+            .errors
+            .iter()
+            .take(8)
+            .map(|e| e.to_string())
+            .collect();
+        report.validation.push(diagnostics::SolidValidation {
+            solid_id,
+            valid: verdict.is_valid,
+            error_count: verdict.errors.len(),
+            errors,
+        });
+    }
+
+    // `ok` now requires: at least one entity resolved, at least one
+    // kernel solid materialised, AND every materialised solid passed
+    // kernel validation. Honest partial: a file that yields a valid
+    // solid plus an invalid husk reports `ok = false` with the husk
+    // flagged in `report.validation`.
+    report.ok = resolved > 0 && !model.solids.is_empty() && all_solids_valid;
     Ok((model, report))
 }
 

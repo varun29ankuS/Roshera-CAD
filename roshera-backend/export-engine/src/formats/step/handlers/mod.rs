@@ -9,8 +9,12 @@
 //!   (CARTESIAN_POINT through CYLINDRICAL_SURFACE), topology
 //!   handlers (EDGE_CURVE through MANIFOLD_SOLID_BREP), and root
 //!   handlers (SHAPE_REPRESENTATION, ADVANCED_BREP_SHAPE_REPRESENTATION).
-//! - **`tier2`** (IMP3, pending): NURBS curves and surfaces.
-//! - **`tier3`** (IMP4, pending): voids, open shells, assemblies.
+//! - **`tier2`** (IMP3): NURBS curves and surfaces (simple + rational
+//!   complex-entity forms) plus the analytic spherical / toroidal /
+//!   conical family and the swept surfaces (revolution, linear
+//!   extrusion).
+//! - **`tier3`** (IMP4): `OPEN_SHELL`, `BREP_WITH_VOIDS` (solids with
+//!   internal cavities), and `MAPPED_ITEM` assembly instancing.
 //!
 //! See `plans/step-import-universal.md` for the coverage roadmap.
 
@@ -18,6 +22,7 @@ use crate::formats::step::dispatch::EntityDispatch;
 
 pub mod tier1;
 pub mod tier2;
+pub mod tier3;
 
 /// Register every available entity handler into `dispatch`.
 ///
@@ -27,5 +32,5 @@ pub mod tier2;
 pub fn register_all(dispatch: &mut EntityDispatch) {
     tier1::register(dispatch);
     tier2::register(dispatch);
-    // IMP4: tier3::register(dispatch);
+    tier3::register(dispatch);
 }

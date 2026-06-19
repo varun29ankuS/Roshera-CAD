@@ -124,6 +124,34 @@ pub fn ensure_resolved(
         }
     };
 
+    // Complex (sub-super) instance: the rational / bounded B-spline
+    // curve and surface families arrive this way and carry no single
+    // dispatch name. Attempt the complex geometry builder before the
+    // name check (which would otherwise reject the arbitrary
+    // first-constituent name against the caller's `expected` list). On
+    // success the kernel curve/surface is now in `ctx.caches`, which is
+    // exactly what the caller re-reads after we return.
+    if let EntityKind::Complex(records) = &entity.kind {
+        let records = records.clone();
+        ctx.resolution_stack.push(instance);
+        ctx.mark_resolved(instance);
+        let built = crate::formats::step::handlers::tier2::complex::try_build_complex(
+            instance, &records, registry, dispatch, ctx,
+        );
+        let popped = ctx.resolution_stack.pop();
+        debug_assert_eq!(
+            popped,
+            Some(instance),
+            "resolution stack imbalance (complex)"
+        );
+        if built {
+            return ResolveOutcome::Dispatched;
+        }
+        // Not a recognised complex geometry entity — fall through to the
+        // legacy first-constituent dispatch path (un-mark so it can run).
+        ctx.resolved.remove(&instance);
+    }
+
     // Name check.
     let name = entity.kind.primary_name().to_string();
     if !expected.is_empty() && !expected.iter().any(|e| e.eq_ignore_ascii_case(&name)) {

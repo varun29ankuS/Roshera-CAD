@@ -253,6 +253,30 @@ pub struct ImportReport {
     /// AP242 files where every solid belongs to exactly one root.
     #[serde(default)]
     pub solids_in_roots: usize,
+    /// Kernel-validation verdict per imported solid, folded into
+    /// [`Self::ok`]. A solid that materialises topologically but fails
+    /// `validate_solid_scoped` (self-intersection, non-manifold edges,
+    /// open boundary) is recorded here as `valid = false`; the import is
+    /// then `ok = false` even though the BRep is non-empty. This closes
+    /// the "manifold-but-invalid import still reports ok" gap.
+    #[serde(default)]
+    pub validation: Vec<SolidValidation>,
+}
+
+/// Per-solid kernel-validation verdict, surfaced on
+/// [`ImportReport::validation`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolidValidation {
+    /// Kernel solid id (local `u32`).
+    pub solid_id: u32,
+    /// `true` when `validate_solid_scoped` returned `is_valid`.
+    pub valid: bool,
+    /// Count of validation errors attributed to this solid.
+    pub error_count: usize,
+    /// First few human-readable error messages (capped to keep the
+    /// report compact — the kernel can emit hundreds for a badly
+    /// malformed shell).
+    pub errors: Vec<String>,
 }
 
 impl ImportReport {

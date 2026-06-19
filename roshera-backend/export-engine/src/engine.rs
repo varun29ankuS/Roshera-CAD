@@ -3,7 +3,9 @@
 use crate::formats::ros::{
     export_brep_to_ros, import_ros_to_brep, RosExportOptions, RosExportPayload,
 };
-use crate::formats::step::{export_brep_to_step, import_step_to_brep};
+use crate::formats::step::{
+    export_brep_to_step, import_step_text_with_report, import_step_to_brep, ImportReport,
+};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use shared_types::*;
 use std::path::PathBuf;
@@ -156,6 +158,22 @@ impl ExportEngine {
 
         // Import from STEP format
         import_step_to_brep(&filepath).await
+    }
+
+    /// Import a STEP exchange structure supplied inline (no file I/O),
+    /// returning the reconstructed [`BRepModel`] and the structured
+    /// [`ImportReport`] (validity verdict, per-entity coverage counts,
+    /// warnings). This is the entry point the agent/REST import path
+    /// uses: the client posts STEP content, the engine reconstructs the
+    /// B-Rep, and the caller splices the resulting solids into the live
+    /// session model via
+    /// [`crate::formats::step::merge_solids_into`].
+    pub fn import_step_content(
+        &self,
+        content: &str,
+        source_hint: &str,
+    ) -> Result<(BRepModel, ImportReport), ExportError> {
+        import_step_text_with_report(content, source_hint)
     }
 }
 
