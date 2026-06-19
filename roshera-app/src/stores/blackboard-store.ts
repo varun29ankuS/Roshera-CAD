@@ -91,13 +91,16 @@ export function setBlackboardAdapter(next: BlackboardPersistenceAdapter): void {
   adapter = next
 }
 
-const WELCOME_LINE: BlackboardLine = {
-  id: 'welcome',
-  text: 'Welcome to the **Blackboard**. Every line is editable — click to edit, Enter to commit. Ask the agent below and its replies land here as editable lines. Math renders inline, e.g. $E = mc^2$.',
-  author: 'agent',
-  createdAt: 0,
-  updatedAt: 0,
-}
+const WELCOME_LINES: BlackboardLine[] = [
+  { id: 'rao-0', text: '# Rao Bell Nozzle — Notebook\nParabolic-approximation (80% bell), built and verified **watertight** in the kernel. Every line is editable — click to edit, Enter to commit.', author: 'agent', createdAt: 0, updatedAt: 0 },
+  { id: 'rao-1', text: '**Given:** $p_c = 7\\,\\text{MPa}$, $T_c = 3500\\,\\text{K}$, $\\gamma = 1.22$, $R = 320\\,\\text{J·kg}^{-1}\\text{K}^{-1}$, $p_a = 101\\,\\text{kPa}$, throat radius $R_t = 50\\,\\text{mm}$.', author: 'agent', createdAt: 0, updatedAt: 0 },
+  { id: 'rao-2', text: '**Expansion ratio** — areas measured on the as-built solid:\n$$\\varepsilon = \\frac{A_e}{A_t} = \\frac{\\pi R_e^2}{\\pi R_t^2} = \\frac{0.1963}{0.00785} = 25.0$$', author: 'agent', createdAt: 0, updatedAt: 0 },
+  { id: 'rao-3', text: '**Rao contour (80% bell):** initial angle $\\theta_n = 33^\\circ$, exit angle $\\theta_e = 9^\\circ$, divergent length\n$$L_n = 0.8\\,\\frac{R_t(\\sqrt{\\varepsilon}-1)}{\\tan 15^\\circ} = 11.94\\,R_t$$\nabout 20% shorter than a $15^\\circ$ cone of the same $\\varepsilon$.', author: 'agent', createdAt: 0, updatedAt: 0 },
+  { id: 'rao-4', text: '**Exit Mach** — supersonic root of the area–Mach relation:\n$$\\frac{A_e}{A_t} = \\frac{1}{M_e}\\left[\\frac{2}{\\gamma+1}\\Big(1+\\tfrac{\\gamma-1}{2}M_e^2\\Big)\\right]^{\\frac{\\gamma+1}{2(\\gamma-1)}} = 25 \\;\\Rightarrow\\; M_e = 4.01$$', author: 'agent', createdAt: 0, updatedAt: 0 },
+  { id: 'rao-5', text: '**Exit pressure ratio** (isentropic): $\\dfrac{p_e}{p_c} = \\left(1+\\tfrac{\\gamma-1}{2}M_e^2\\right)^{-\\frac{\\gamma}{\\gamma-1}} = 3.5\\times10^{-3}$.', author: 'agent', createdAt: 0, updatedAt: 0 },
+  { id: 'rao-6', text: '**Thrust coefficient:**\n$$C_F = \\sqrt{\\frac{2\\gamma^2}{\\gamma-1}\\Big(\\frac{2}{\\gamma+1}\\Big)^{\\frac{\\gamma+1}{\\gamma-1}}\\!\\Big[1-\\big(\\tfrac{p_e}{p_c}\\big)^{\\frac{\\gamma-1}{\\gamma}}\\Big]} + \\Big(\\frac{p_e-p_a}{p_c}\\Big)\\varepsilon = 1.46$$', author: 'agent', createdAt: 0, updatedAt: 0 },
+  { id: 'rao-7', text: '**Performance:** $c^{*} = 1622\\,\\text{m/s}$, thrust $F = C_F\\,p_c\\,A_t = 80.4\\,\\text{kN}$, specific impulse $I_{sp} = \\dfrac{C_F\\,c^{*}}{g_0} = 242\\,\\text{s}$ (sea level, this propellant).', author: 'agent', createdAt: 0, updatedAt: 0 },
+]
 
 interface BlackboardState {
   lines: BlackboardLine[]
@@ -133,7 +136,7 @@ function persist(state: Pick<BlackboardState, 'lines' | 'events'>): void {
 const initial = adapter.load()
 
 export const useBlackboardStore = create<BlackboardState>((set, get) => ({
-  lines: initial?.lines ?? [WELCOME_LINE],
+  lines: initial?.lines ?? WELCOME_LINES,
   events: initial?.events ?? [],
   isProcessing: false,
   isPanelOpen: true,

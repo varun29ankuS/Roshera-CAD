@@ -49,7 +49,10 @@ export const analyticalGeometrySchema = z.object({
   // Locking values to numbers caused every non-primitive ObjectCreated frame
   // to fail validation and be silently dropped — Timeline showed the op,
   // but Browser and the viewport stayed empty. Accept any JSON value.
-  parameters: z.record(z.string(), z.unknown()),
+  // NURBS / mesh parts (nurbs_loft, shell, imported solids) have NO analytic
+  // parameters and ship `parameters: null` — must be nullable or the whole
+  // freeform-geometry frame is dropped and the viewport stays empty.
+  parameters: z.record(z.string(), z.unknown()).nullable(),
   properties: z.object({
     volume: z.number(),
     surface_area: z.number(),
