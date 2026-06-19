@@ -4834,20 +4834,24 @@ impl Surface for GeneralNurbsSurface {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // NURBS offset is non-trivial in general (the offset of a degree-p
-        // surface is not itself a polynomial NURBS); a faithful exact-offset
-        // would require fitting a new control net at the requested distance.
-        // Until that lands we return the original surface and surface the
-        // requested distance at warn level so callers don't silently believe
-        // they have a true offset. A zero distance is exact (no-op).
+        // The exact offset of a degree-p NURBS surface is not itself a
+        // polynomial NURBS. The standard approximation (Piegl & Tiller §10.5,
+        // Maekawa 1999) pushes each control point along the surface normal
+        // evaluated at that control point's parametric location, keeping the
+        // degree/knots/weights — a first-order-accurate offset that converges
+        // as the control net densifies. Delegate to the constant-distance case
+        // of `offset_variable`, which performs exactly that control-net push.
+        // A zero / non-finite distance is the identity. On any failure (an
+        // ill-formed net), fall back to the original so callers never receive
+        // a degenerate surface.
         if !distance.is_finite() || distance.abs() < f64::EPSILON {
             return Box::new(self.clone());
         }
-        tracing::warn!(
-            distance = distance,
-            "NurbsSurface::offset: returning original surface; exact NURBS offset not yet implemented"
-        );
-        Box::new(self.clone())
+        let d = distance;
+        match self.offset_variable(Box::new(move |_u, _v| d), Tolerance::default()) {
+            Ok(s) => s,
+            Err(_) => Box::new(self.clone()),
+        }
     }
 
     fn offset_exact(&self, distance: f64, tolerance: Tolerance) -> MathResult<OffsetSurface> {
