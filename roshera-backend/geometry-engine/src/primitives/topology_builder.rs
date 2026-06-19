@@ -351,6 +351,14 @@ pub struct BRepModel {
     /// document/scene-level setting, not a per-entity property; the clean seam
     /// for true unit conversion lives on [`crate::units::LengthUnit`].
     pub document_unit: crate::units::LengthUnit,
+    /// GD&T annotations (PILLAR-aligned): dimensional tolerances and feature
+    /// control frames bound to features by [`crate::primitives::persistent_id::PersistentId`].
+    /// Sidecar (like the PID maps + provenance) so the SoA stores stay lean and a
+    /// tolerance probe is an O(1) lookup off the math hot path. Keyed by
+    /// persistent id (which IS snapshotted), so it is carried through
+    /// snapshot/restore and emptied by `clear_geometry`. Empty by default — a
+    /// supported state for any model with no tolerances authored.
+    pub gdt: crate::gdt::sidecar::GdtSidecar,
 }
 
 impl BRepModel {
@@ -422,6 +430,7 @@ impl BRepModel {
             root_counter: 0,
             solid_provenance: std::collections::HashMap::new(),
             document_unit: crate::units::LengthUnit::default(),
+            gdt: crate::gdt::sidecar::GdtSidecar::new(),
         }
     }
 
@@ -493,6 +502,8 @@ impl BRepModel {
         self.pid_to_face.clear();
         self.pid_to_solid.clear();
         self.root_counter = 0;
+        // GD&T annotations are bound to the topology being discarded.
+        self.gdt.clear();
         // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance,
         // current_event_key (caller op-context, set per-op).
     }
@@ -579,6 +590,108 @@ impl BRepModel {
         pid: crate::primitives::persistent_id::PersistentId,
     ) -> Option<SolidId> {
         self.pid_to_solid.get(&pid).copied()
+    }
+
+    // --- GD&T annotation + verification (kernel-verified conformance) ---
+
+    /// Resolve a face's durable annotation key, assigning a [`PersistentId`] if
+    /// the face does not yet have one. GD&T annotations key off persistent ids
+    /// (which survive regeneration); a face created by an op not yet wired for
+    /// PIDs has none, so we mint a deterministic one derived from the face's
+    /// transient id + the current op-context seed and register it. Idempotent for
+    /// an already-PID'd face.
+    pub fn ensure_face_annotation_key(
+        &mut self,
+        face: FaceId,
+    ) -> crate::primitives::persistent_id::PersistentId {
+        if let Some(p) = self.face_pid(face) {
+            return p;
+        }
+        let seed = self.next_root_seed(&format!("gdt_face:{face}"));
+        let pid = crate::primitives::persistent_id::PersistentId::root(&seed);
+        self.set_face_pid(face, pid);
+        pid
+    }
+
+    /// Resolve an edge's durable annotation key, assigning a [`PersistentId`] if
+    /// absent (see [`Self::ensure_face_annotation_key`]).
+    pub fn ensure_edge_annotation_key(
+        &mut self,
+        edge: EdgeId,
+    ) -> crate::primitives::persistent_id::PersistentId {
+        if let Some(p) = self.edge_pid(edge) {
+            return p;
+        }
+        let seed = self.next_root_seed(&format!("gdt_edge:{edge}"));
+        let pid = crate::primitives::persistent_id::PersistentId::root(&seed);
+        self.set_edge_pid(edge, pid);
+        pid
+    }
+
+    /// Attach a GD&T annotation to a FACE by its (resolved) persistent id.
+    /// Returns the persistent key so the caller can re-query the feature later.
+    pub fn attach_face_annotation(
+        &mut self,
+        face: FaceId,
+        annotation: crate::gdt::model::Annotation,
+    ) -> crate::primitives::persistent_id::PersistentId {
+        let key = self.ensure_face_annotation_key(face);
+        self.gdt.attach(key, annotation);
+        key
+    }
+
+    /// Attach a GD&T annotation to an EDGE by its (resolved) persistent id.
+    pub fn attach_edge_annotation(
+        &mut self,
+        edge: EdgeId,
+        annotation: crate::gdt::model::Annotation,
+    ) -> crate::primitives::persistent_id::PersistentId {
+        let key = self.ensure_edge_annotation_key(edge);
+        self.gdt.attach(key, annotation);
+        key
+    }
+
+    /// Verify EVERY annotation attached to a face, measuring the actual geometry.
+    /// Returns one [`crate::gdt::verify::ConformanceResult`] per annotation in
+    /// attachment order. Empty when the face has no annotations or no key.
+    pub fn verify_face_conformance(
+        &self,
+        face: FaceId,
+    ) -> Vec<crate::gdt::verify::ConformanceResult> {
+        let Some(key) = self.face_pid(face) else {
+            return Vec::new();
+        };
+        let tol = self.tolerance;
+        self.gdt
+            .annotations(key)
+            .iter()
+            .map(|ann| crate::gdt::verify::verify_face_annotation(self, face, ann, tol))
+            .collect()
+    }
+
+    /// Verify EVERY annotation attached to an edge (circularity / straightness).
+    /// `samples` controls the edge sampling density.
+    pub fn verify_edge_conformance(
+        &self,
+        edge: EdgeId,
+        samples: usize,
+    ) -> Vec<crate::gdt::verify::ConformanceResult> {
+        let Some(key) = self.edge_pid(edge) else {
+            return Vec::new();
+        };
+        let tol = self.tolerance;
+        self.gdt
+            .annotations(key)
+            .iter()
+            .filter_map(|ann| match ann {
+                crate::gdt::model::Annotation::Geometric(fcf) => Some(
+                    crate::gdt::verify::verify_form_on_edge(self, edge, fcf, tol, samples),
+                ),
+                // A dimensional annotation on an edge is not an edge-form check;
+                // skip it here (it belongs on a face).
+                crate::gdt::model::Annotation::Dimensional(_) => None,
+            })
+            .collect()
     }
 
     /// Set the stable key of the operation currently being applied (the timeline
