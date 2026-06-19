@@ -26,8 +26,10 @@ export interface AnalyticalGeometry {
   primitive_type: string
   // Heterogeneous: primitives ship numeric dimensions, but booleans/
   // extrudes ship strings, arrays, and nested values. Mirrors the
-  // backend `serde_json::json!` payload exactly.
-  parameters: Record<string, unknown>
+  // backend `serde_json::json!` payload exactly. NURBS / mesh / imported
+  // parts have no analytic parameters and ship `null` — must be nullable
+  // (matches ws-schemas) or freeform-geometry frames fail to type-check.
+  parameters: Record<string, unknown> | null
   properties: {
     volume: number
     surface_area: number
