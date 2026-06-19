@@ -7310,6 +7310,22 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(handlers::agent::select_edge),
         )
         .route(
+            "/api/agent/parts/{id}/faces/{face_id}/tolerance",
+            post(handlers::agent::attach_face_tolerance),
+        )
+        .route(
+            "/api/agent/parts/{id}/faces/{face_id}/verify",
+            get(handlers::agent::verify_face_tolerances),
+        )
+        .route(
+            "/api/agent/parts/{id}/edges/{edge_id}/tolerance",
+            post(handlers::agent::attach_edge_tolerance),
+        )
+        .route(
+            "/api/agent/parts/{id}/edges/{edge_id}/verify",
+            get(handlers::agent::verify_edge_tolerances),
+        )
+        .route(
             "/api/agent/pointer",
             get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),
         )
