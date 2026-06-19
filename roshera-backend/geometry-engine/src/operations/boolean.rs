@@ -321,6 +321,23 @@ pub fn boolean_operation(
             operation, solid_a, solid_b,
         ));
 
+        // Snapshot each operand's GWN classification triangles NOW, before any
+        // face-splitting mutates the operands' edges/loops. Inside/outside
+        // classification (`classify_point_relative_to_solid` → GWN) must test
+        // against the ORIGINAL operand geometry; the per-face split pipeline
+        // adds cut edges and snaps boundary vertices on the original faces, so
+        // a lazily-built mesh taken at classification time can be corrupted
+        // (e.g. a lofted barrel that tessellates cleanly to ~600 watertight
+        // triangles up front collapsed to ~74 leaky triangles after splitting,
+        // so a point genuinely inside it scored GWN≈0 and every cut fragment
+        // mis-classified Outside — the W01 pocket lost all its walls). Priming
+        // the per-SolidId cache here pins the clean, watertight snapshot. The
+        // cache is sign-agnostic and read-only for the op's duration. This is
+        // correct for every boolean (analytic operands tessellate identically
+        // before and after, so no behavioural change there).
+        let _ = solid_gwn_triangles_cached(model, solid_a);
+        let _ = solid_gwn_triangles_cached(model, solid_b);
+
         // Step 1: Compute face-face intersections
         let intersections = compute_face_intersections(model, solid_a, solid_b, &options)?;
         pipeline_trace(format_args!(
@@ -3922,12 +3939,58 @@ fn split_faces_along_curves(
     // the whole Boolean reproducible.
     let intersected_faces: HashSet<FaceId> = face_curves.keys().copied().collect();
     let intersected_count = intersected_faces.len();
+
+    // SHARED-IMPRINT corefinement (task #17): the set of intersection curves
+    // that must produce a SINGLE shared cut edge across both operand faces,
+    // rather than an independent per-face edge that later fails to weld.
+    //
+    // This is gated to intersections where at least one operand face is a
+    // NON-ANALYTIC surface (NURBS / B-spline / ruled / revolution / offset).
+    // For two analytic surfaces the existing position-weld
+    // (`canonicalise_face_edges_by_position`) succeeds — both sides evaluate
+    // the same closed-form curve to within 1e-12 — so the analytic boolean
+    // core (poke matrix, box/cyl/sphere) is left completely untouched. For a
+    // plane × NURBS cut the two operands produce GEOMETRICALLY DIVERGENT cut
+    // arcs (a marching-squares fit on the freeform side vs. the planar edge on
+    // the box side land ~1e-2 apart), so position-weld can never unify them.
+    // Sharing the edge at creation makes them the SAME `EdgeId`, which both
+    // makes the B-Rep manifold (each cut edge used by exactly 2 faces) AND
+    // drives the tessellator's per-`EdgeId` `EdgeSampleCache` to emit
+    // bit-identical boundary samples on both faces → watertight mesh.
+    let shareable_curves: HashSet<CurveId> = {
+        let mut set: HashSet<CurveId> = HashSet::new();
+        for intersection in intersections {
+            let a_analytic = face_surface_is_analytic(model, intersection.face_a_id);
+            let b_analytic = face_surface_is_analytic(model, intersection.face_b_id);
+            if a_analytic && b_analytic {
+                continue;
+            }
+            // Only the proper-crossing meet curves are genuinely shared by
+            // both faces; the coplanar per-face cuts apply to one side only.
+            for c in &intersection.curves {
+                set.insert(c.curve_id);
+            }
+        }
+        set
+    };
+    // Registry: the canonical cut edge minted once per shareable curve_id and
+    // reused by the opposite operand's face split.
+    let mut shared_edges: HashMap<CurveId, EdgeId> = HashMap::new();
+
     let mut ordered_face_curves: Vec<(FaceId, (SolidId, Vec<CurveId>))> =
         face_curves.into_iter().collect();
     ordered_face_curves.sort_by_key(|(fid, _)| *fid);
     for (face_id, (origin_solid, curves)) in ordered_face_curves {
         let before = split_faces.len();
-        let faces = split_face_by_curves(model, face_id, origin_solid, &curves, options)?;
+        let faces = split_face_by_curves(
+            model,
+            face_id,
+            origin_solid,
+            &curves,
+            options,
+            &shareable_curves,
+            &mut shared_edges,
+        )?;
         let produced = faces.len();
         // Per-face diagnostic: input face's surface type → number of split
         // regions emitted. A `Sphere → 0` line is the smoking gun for
@@ -6084,16 +6147,48 @@ fn split_torus_face_by_ovals(
     Some(faces)
 }
 
+/// Whether a face's surface is an ANALYTIC primitive (plane / cylinder /
+/// sphere / cone / torus). Non-analytic surfaces (NURBS, B-spline, ruled,
+/// surface-of-revolution, offset) intersect via approximate marching, so two
+/// operand faces produce divergent cut geometry that position-weld cannot
+/// unify — those intersections route through the shared-imprint path. Missing
+/// surfaces conservatively report `true` (treat as analytic) so an unexpected
+/// store miss never silently widens the gated path.
+fn face_surface_is_analytic(model: &BRepModel, face_id: FaceId) -> bool {
+    model
+        .faces
+        .get(face_id)
+        .and_then(|f| model.surfaces.get(f.surface_id))
+        .map(|s| {
+            matches!(
+                s.surface_type(),
+                SurfaceType::Plane
+                    | SurfaceType::Cylinder
+                    | SurfaceType::Sphere
+                    | SurfaceType::Cone
+                    | SurfaceType::Torus
+            )
+        })
+        .unwrap_or(true)
+}
+
 /// Split a single face by multiple curves.
 ///
 /// `origin_solid` identifies which of the two boolean operands this face
 /// belongs to; it is propagated verbatim into every produced `SplitFace`.
+///
+/// `shareable_curves` / `shared_edges` implement the shared-imprint
+/// corefinement (task #17): for a curve_id in `shareable_curves`, the cut
+/// edge is minted ONCE (registered in `shared_edges`) and reused verbatim by
+/// the opposite operand's face split, so both faces reference one `EdgeId`.
 fn split_face_by_curves(
     model: &mut BRepModel,
     face_id: FaceId,
     origin_solid: SolidId,
     curves: &[CurveId],
     options: &BooleanOptions,
+    shareable_curves: &HashSet<CurveId>,
+    shared_edges: &mut HashMap<CurveId, EdgeId>,
 ) -> OperationResult<Vec<SplitFace>> {
     // Extract surface_id from face before we start mutating
     let surface_id = {
@@ -6324,10 +6419,46 @@ fn split_face_by_curves(
     // Add splitting curves to graph
     let mut active_cut_count = 0usize;
     for &curve_id in curves {
-        // Create edges from curves
-        let edge_id = create_edge_from_curve(model, curve_id)?;
+        // SHARED-IMPRINT (task #17): a curve shared by a non-analytic
+        // intersection is imprinted as ONE edge across both operand faces.
+        // The first face to reach it mints the canonical edge and registers
+        // it; the opposite face REUSES the same `EdgeId` (and its vertices)
+        // verbatim. Both operands evaluate the identical 3D intersection
+        // curve, so the canonical edge's endpoints are correct for both —
+        // and a single shared `EdgeId` is manifold by construction and feeds
+        // the tessellator's per-edge sample cache identically on both faces.
+        //
+        // Shared cut edges deliberately SKIP the per-face boundary snap: that
+        // snap pulls each operand's copy onto its OWN boundary vertices,
+        // which is exactly the divergence (the box-wall rim vs. the freeform
+        // rim are distinct points). Leaving the raw curve endpoints keeps
+        // both faces' copies geometrically identical; the global
+        // `heal_t_junctions_across_faces` + `canonicalise_face_edges_by_position`
+        // passes then reconcile the cut endpoints against the boundary once,
+        // symmetrically, across both faces.
+        let is_shared = shareable_curves.contains(&curve_id);
+        // `reusing` is true on the SECOND operand face to touch a shared
+        // curve: the edge already carries the first face's snapped endpoints,
+        // so it must NOT be re-snapped (re-snapping to the second face's own
+        // boundary would diverge it right back). The global heal pass splits
+        // the second face's boundary at the shared endpoint instead.
+        let mut reusing = false;
+        let edge_id = if is_shared {
+            if let Some(&existing) = shared_edges.get(&curve_id) {
+                reusing = true;
+                existing
+            } else {
+                let fresh = create_edge_from_curve(model, curve_id)?;
+                shared_edges.insert(curve_id, fresh);
+                fresh
+            }
+        } else {
+            create_edge_from_curve(model, curve_id)?
+        };
 
         // Snap cut-edge endpoints to face boundary vertices when coincident.
+        // Skipped for shared edges (see above): the snap is the source of the
+        // per-operand divergence the shared-imprint path is built to avoid.
         let (orig_sv, orig_ev) = {
             let e = model
                 .edges
@@ -6339,14 +6470,20 @@ fn split_face_by_curves(
                 })?;
             (e.start_vertex, e.end_vertex)
         };
-        let snapped_sv = snap_vertex_to_boundary(orig_sv, model);
-        let snapped_ev = snap_vertex_to_boundary(orig_ev, model);
-        if snapped_sv != orig_sv || snapped_ev != orig_ev {
-            if let Some(e) = model.edges.get_mut(edge_id) {
-                e.start_vertex = snapped_sv;
-                e.end_vertex = snapped_ev;
+        let (snapped_sv, snapped_ev) = if reusing {
+            // Reused shared edge: keep the first face's snapped endpoints.
+            (orig_sv, orig_ev)
+        } else {
+            let sv = snap_vertex_to_boundary(orig_sv, model);
+            let ev = snap_vertex_to_boundary(orig_ev, model);
+            if sv != orig_sv || ev != orig_ev {
+                if let Some(e) = model.edges.get_mut(edge_id) {
+                    e.start_vertex = sv;
+                    e.end_vertex = ev;
+                }
             }
-        }
+            (sv, ev)
+        };
 
         // Skip cuts coincident with an existing boundary edge.
         //
@@ -9025,7 +9162,25 @@ fn clip_surface_intersection_curve_to_faces(
     // them via the existing arrangement code.
     let line = match curve.curve.as_any().downcast_ref::<Line>() {
         Some(l) => l.clone(),
-        None => return Ok(Some(curve)),
+        None => {
+            // GENERAL-CURVE membership clip (task #17): a marching-squares
+            // intersection curve between a BOUNDED planar face (e.g. a box
+            // side wall) and a NON-ANALYTIC surface (a NURBS lateral) is
+            // computed from the planar face's UNBOUNDED carrier plane, so the
+            // raw curve runs the full extent of the freeform surface — far
+            // beyond the small finite box face. The Line/Circle arms clip
+            // analytically; the general arm previously passed the whole curve
+            // through, which imprinted a cut spanning the entire barrel
+            // (the W01 cut ran z=0..6 instead of the pocket's z=2..4) and
+            // shredded the freeform face into self-touching fragments.
+            //
+            // Trim the general curve to the maximal contiguous parameter
+            // sub-interval whose 3D points lie inside BOTH faces. Gated to a
+            // (planar × non-analytic) pair so analytic booleans — whose cut
+            // curves are exact Lines/Circles handled above — never reach
+            // this path.
+            return clip_general_curve_by_face_membership(curve, face_a, face_b, model, tolerance);
+        }
     };
 
     let clip_a = clip_line_to_planar_face(&line, face_a, model, tolerance)?;
@@ -9099,6 +9254,214 @@ fn clip_surface_intersection_curve_to_faces(
         on_surface_a,
         on_surface_b,
     }))
+}
+
+/// Trim a GENERAL (non-Line, non-Circle) surface-surface intersection curve to
+/// the maximal contiguous parameter sub-interval whose 3D points lie inside
+/// BOTH operand faces.
+///
+/// The marching-squares SSI used for plane × NURBS computes the intersection
+/// against the planar face's UNBOUNDED carrier plane, so the raw curve extends
+/// across the whole freeform surface rather than the small finite planar face.
+/// Without this trim the cut imprints far beyond the actual feature and shreds
+/// the freeform face into self-touching fragments that the tessellator rejects
+/// (task #17: the W01 +Y pocket's side cuts ran the full barrel height).
+///
+/// Gated to a (planar × non-analytic) pair: for two analytic surfaces the cut
+/// is an exact Line/Circle handled by the analytic clip arms above, and for
+/// two non-analytic surfaces neither face gives a reliable planar membership
+/// test — both cases pass through unchanged, leaving the analytic boolean core
+/// untouched. Returns `Ok(None)` when no sub-interval lies inside both faces
+/// (the curve misses the bounded feature entirely).
+fn clip_general_curve_by_face_membership(
+    curve: SurfaceIntersectionCurve,
+    face_a: FaceId,
+    face_b: FaceId,
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+    // Gate: exactly the planar × non-analytic configuration. The PLANAR face
+    // is the bounded one we trim to; the freeform face is the (large)
+    // unbounded surface whose carrier produced the over-long curve.
+    let a_planar = face_is_planar(model, face_a);
+    let b_planar = face_is_planar(model, face_b);
+    let a_freeform = face_is_nonanalytic(model, face_a);
+    let b_freeform = face_is_nonanalytic(model, face_b);
+    let bounded_face = if a_planar && b_freeform {
+        face_a
+    } else if b_planar && a_freeform {
+        face_b
+    } else {
+        return Ok(Some(curve));
+    };
+
+    // Sample the curve over t ∈ [0, 1] and test membership against the BOUNDED
+    // planar face only. The curve already lies on BOTH surfaces by
+    // construction (it is their intersection), so the only finite trimming
+    // constraint is the planar face's loop — the freeform face's own UV
+    // membership test (`closest_point` on a NURBS) is too unreliable to gate
+    // on and is the surface we are trimming the curve TO the planar feature
+    // ACROSS. 96 samples resolve the feature comfortably; the cost is
+    // negligible against the marching SSI that produced the curve.
+    const SAMPLES: usize = 96;
+    let mut inside: Vec<bool> = Vec::with_capacity(SAMPLES + 1);
+    let mut ts: Vec<f64> = Vec::with_capacity(SAMPLES + 1);
+    for i in 0..=SAMPLES {
+        let t = i as f64 / SAMPLES as f64;
+        ts.push(t);
+        let p = match curve.curve.evaluate(t) {
+            Ok(cp) => cp.position,
+            Err(_) => {
+                inside.push(false);
+                continue;
+            }
+        };
+        inside.push(is_point_in_face(model, bounded_face, &p, tolerance).unwrap_or(false));
+    }
+
+    // Find the longest contiguous run of `inside == true`.
+    let mut best_lo = 0usize;
+    let mut best_hi = 0usize;
+    let mut best_len = 0usize;
+    let mut run_lo = 0usize;
+    let mut in_run = false;
+    for i in 0..inside.len() {
+        if inside[i] {
+            if !in_run {
+                in_run = true;
+                run_lo = i;
+            }
+            let len = i - run_lo + 1;
+            if len > best_len {
+                best_len = len;
+                best_lo = run_lo;
+                best_hi = i;
+            }
+        } else {
+            in_run = false;
+        }
+    }
+
+    // No interior samples → the curve misses the bounded feature.
+    if best_len == 0 {
+        return Ok(None);
+    }
+    // Entire curve already inside both faces → keep it verbatim.
+    if best_lo == 0 && best_hi == inside.len() - 1 {
+        return Ok(Some(curve));
+    }
+
+    // Refine each trimmed endpoint by bisecting between the last strictly-
+    // interior sample and the adjacent strictly-exterior sample, so the
+    // trimmed curve TERMINATES exactly on the planar face's boundary edge
+    // (within tolerance). A crude half-sample extension would leave the arc
+    // endpoint short of (or past) the box edge — and an open arc that does
+    // not reach the bounded face's boundary cannot split that face into an
+    // inside/outside pair (the region-extraction walks past it), which is
+    // precisely what drops a pocket's side/cap walls. The bisected endpoint
+    // lands on the boundary, so the cut closes the region.
+    let step = 1.0 / SAMPLES as f64;
+    // Bisection on the membership predicate of the bounded face.
+    let bisect = |t_inside: f64, t_outside: f64| -> f64 {
+        let mut lo = t_inside; // inside
+        let mut hi = t_outside; // outside
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            let on = match curve.curve.evaluate(mid) {
+                Ok(cp) => {
+                    is_point_in_face(model, bounded_face, &cp.position, tolerance).unwrap_or(false)
+                }
+                Err(_) => false,
+            };
+            if on {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        // The boundary lies between lo (inside) and hi (outside); take the
+        // midpoint, which is on the face boundary within ~2^-40 of the span.
+        0.5 * (lo + hi)
+    };
+    let t_lo = if best_lo == 0 {
+        0.0
+    } else {
+        bisect(ts[best_lo], ts[best_lo - 1]).clamp(0.0, 1.0)
+    };
+    let t_hi = if best_hi == inside.len() - 1 {
+        1.0
+    } else {
+        bisect(ts[best_hi], ts[best_hi + 1]).clamp(0.0, 1.0)
+    };
+    if t_hi - t_lo <= step * 0.5 {
+        // Degenerate sliver — treat as a miss rather than imprint a near-zero
+        // cut that the arrangement would walk into a phantom fragment.
+        return Ok(None);
+    }
+
+    let trimmed = match curve.curve.subcurve(t_lo, t_hi) {
+        Ok(c) => c,
+        // If the curve cannot be sub-divided, the safe choice is to keep the
+        // original (no worse than the pre-clip behaviour).
+        Err(_) => return Ok(Some(curve)),
+    };
+
+    // Re-anchor the dropped parametric maps at the trimmed endpoints. Only the
+    // 3D curve is consumed downstream (see `intersect_faces`), so two-sample
+    // linear maps are sufficient and faithful for the trimmed span.
+    let (ua0, va0) = (
+        (curve.on_surface_a.u_of_t)(t_lo),
+        (curve.on_surface_a.v_of_t)(t_lo),
+    );
+    let (ua1, va1) = (
+        (curve.on_surface_a.u_of_t)(t_hi),
+        (curve.on_surface_a.v_of_t)(t_hi),
+    );
+    let (ub0, vb0) = (
+        (curve.on_surface_b.u_of_t)(t_lo),
+        (curve.on_surface_b.v_of_t)(t_lo),
+    );
+    let (ub1, vb1) = (
+        (curve.on_surface_b.u_of_t)(t_hi),
+        (curve.on_surface_b.v_of_t)(t_hi),
+    );
+
+    Ok(Some(SurfaceIntersectionCurve {
+        curve: trimmed,
+        on_surface_a: create_parametric_curve(&[(ua0, va0), (ua1, va1)]),
+        on_surface_b: create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]),
+    }))
+}
+
+/// True when the face's surface is a NON-ANALYTIC primitive (NURBS / B-spline /
+/// ruled / surface-of-revolution / offset) — the freeform side of a general
+/// intersection.
+fn face_is_nonanalytic(model: &BRepModel, face_id: FaceId) -> bool {
+    model
+        .faces
+        .get(face_id)
+        .and_then(|f| model.surfaces.get(f.surface_id))
+        .map(|s| {
+            matches!(
+                s.surface_type(),
+                SurfaceType::NURBS
+                    | SurfaceType::BSpline
+                    | SurfaceType::Ruled
+                    | SurfaceType::SurfaceOfRevolution
+                    | SurfaceType::Offset
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// True when the face's surface reports `SurfaceType::Plane`.
+fn face_is_planar(model: &BRepModel, face_id: FaceId) -> bool {
+    model
+        .faces
+        .get(face_id)
+        .and_then(|f| model.surfaces.get(f.surface_id))
+        .map(|s| matches!(s.surface_type(), SurfaceType::Plane))
+        .unwrap_or(false)
 }
 
 /// Combine clip outcomes from both faces and rebuild a trimmed
