@@ -6,6 +6,7 @@ pub mod assembly;
 pub mod drawing;
 pub mod gdt;
 pub mod harness;
+pub mod labels;
 pub mod math;
 pub mod operations;
 pub mod performance;

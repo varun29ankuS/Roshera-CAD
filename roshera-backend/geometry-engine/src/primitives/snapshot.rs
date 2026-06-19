@@ -99,6 +99,10 @@ pub struct ModelSnapshot {
     /// GD&T annotation sidecar. Keyed by persistent id (also snapshotted), so a
     /// rolled-back op that authored a tolerance is undone with the geometry.
     gdt: crate::gdt::sidecar::GdtSidecar,
+    /// Label sidecar (names → entities/sections). Keyed by persistent id (also
+    /// snapshotted), so a rolled-back op that named a feature is undone with the
+    /// geometry — same contract as the GD&T sidecar.
+    labels: crate::labels::LabelSidecar,
 }
 
 impl ModelSnapshot {
@@ -137,6 +141,7 @@ impl ModelSnapshot {
             pid_to_solid: model.pid_to_solid.clone(),
             root_counter: model.root_counter,
             gdt: model.gdt.clone(),
+            labels: model.labels.clone(),
         }
     }
 
@@ -169,6 +174,7 @@ impl ModelSnapshot {
         model.pid_to_solid = self.pid_to_solid;
         model.root_counter = self.root_counter;
         model.gdt = self.gdt;
+        model.labels = self.labels;
     }
 }
 

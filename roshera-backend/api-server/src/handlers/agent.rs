@@ -321,6 +321,10 @@ pub struct RenderQuery {
     pub mode: Option<String>,
     /// Square output size in pixels, clamped to 64..=2048. Default 512.
     pub size: Option<usize>,
+    /// When `true`, overlay this part's labels as named callouts (the LABELLER
+    /// eye) — a leader from each labelled entity's projected anchor to its name.
+    /// Default `false`. Honoured in the `shaded` mode (the readable backdrop).
+    pub labels: Option<bool>,
 }
 
 /// One legend row: which RGB in an `ids`-mode image is which face.
@@ -368,7 +372,9 @@ pub async fn render_part(
     Query(q): Query<RenderQuery>,
 ) -> Result<Json<RenderResponse>, StatusCode> {
     use base64::Engine as _;
-    use geometry_engine::render::{render_solid, CanonicalView, RenderMode, RenderOptions};
+    use geometry_engine::render::{
+        render_solid, render_solid_with_labels, CanonicalView, RenderMode, RenderOptions,
+    };
 
     let view_name = q.view.as_deref().unwrap_or("iso");
     let view = match view_name {
@@ -388,20 +394,30 @@ pub async fn render_part(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     let size = q.size.unwrap_or(512).clamp(64, 2048);
+    let opts = RenderOptions {
+        width: size,
+        height: size,
+        view,
+        mode,
+        ..Default::default()
+    };
 
-    let model = model_handle.read().await;
-    let frame = render_solid(
-        &model,
-        id as SolidId,
-        &RenderOptions {
-            width: size,
-            height: size,
-            view,
-            mode,
-            ..Default::default()
-        },
-    )
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let frame = if q.labels.unwrap_or(false) {
+        // Overlay path: needs a write lock (centroid anchors warm a cache) and
+        // the label-aware renderer. Build a callout per label that has a world
+        // anchor (name uppercased so the engineering 5×7 font renders it).
+        let mut model = model_handle.write().await;
+        let callouts: Vec<(geometry_engine::math::Point3, String)> = model
+            .list_labels()
+            .into_iter()
+            .filter_map(|(name, _kind, anchor, _desc)| anchor.map(|p| (p, name.to_uppercase())))
+            .collect();
+        render_solid_with_labels(&model, id as SolidId, &callouts, &opts)
+            .ok_or(StatusCode::NOT_FOUND)?
+    } else {
+        let model = model_handle.read().await;
+        render_solid(&model, id as SolidId, &opts).ok_or(StatusCode::NOT_FOUND)?
+    };
     let png = frame
         .to_png()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1103,6 +1119,368 @@ pub async fn select_edge(
                 "candidates": candidates,
             })),
         ),
+    }
+}
+
+// ───────────────────── labels (the LABELLER) ────────────────────────
+
+/// Map a kernel [`geometry_engine::labels::LabelError`] onto an HTTP verdict +
+/// machine-readable body. `NotFound`/`Dangling` → 404, `EmptyName` → 400. The
+/// kernel never guesses; the wire surface mirrors that refusal.
+fn label_error_response(
+    e: geometry_engine::labels::LabelError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::labels::LabelError;
+    match e {
+        LabelError::EmptyName => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "resolved": false, "error": "empty_name",
+                "message": "a label name must be non-empty",
+            })),
+        ),
+        LabelError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "resolved": false, "error": "not_found",
+                "message": "no label of that kind with that name on this part",
+            })),
+        ),
+        LabelError::Dangling => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "resolved": false, "error": "dangling",
+                "message": "the entity this label named no longer exists",
+            })),
+        ),
+    }
+}
+
+/// `POST /api/agent/parts/{id}/labels` — pin a human-readable NAME to a
+/// topological entity or a cross-section. The shared vocabulary between agent
+/// and user. Body (JSON):
+/// * `{ "name": "throat", "kind": "vertex|edge|face", "entity_id": 12,
+///     "description"?: "..." }` — attach BY ID, or
+/// * `{ "name": "throat", "kind": "face", "selector": { ...select-face body... },
+///     "description"?: "..." }` — attach BY DESCRIPTION (Pillar 3): the kernel
+///     resolves the selector (or REFUSES on ambiguity/not-found) and labels the
+///     result, or
+/// * `{ "name": "midspan", "kind": "section", "origin": [x,y,z],
+///     "normal": [x,y,z], "description"?: "..." }` — name a cutting plane.
+///
+/// 200 → `{ created|replaced, name, kind, entity_id?|plane? }`; 400 invalid
+/// name/kind/body; 404 selector not-found; 409 selector ambiguous.
+pub async fn create_label(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::labels::{AttachOutcome, LabelKind};
+    use geometry_engine::math::Vector3;
+
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing_name"})),
+            )
+        }
+    };
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let kind_str = body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let vec3 = |key: &str| -> Option<Vector3> {
+        body.get(key).and_then(|v| v.as_array()).and_then(|a| {
+            if a.len() == 3 {
+                Some(Vector3::new(a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?))
+            } else {
+                None
+            }
+        })
+    };
+
+    let mut model = model_handle.write().await;
+
+    // Section label: a named plane (not a topological entity).
+    if kind_str.eq_ignore_ascii_case("section") {
+        let (origin, normal) = match (vec3("origin"), vec3("normal")) {
+            (Some(o), Some(n)) => (o, n),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "section_requires_origin_and_normal",
+                    })),
+                )
+            }
+        };
+        let origin_pt = geometry_engine::math::Point3::new(origin.x, origin.y, origin.z);
+        return match model.label_section(&name, origin_pt, normal, description) {
+            Ok(outcome) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "created": outcome == AttachOutcome::Created,
+                    "replaced": outcome == AttachOutcome::Replaced,
+                    "part_id": id, "name": name, "kind": "section",
+                    "plane": { "origin": [origin.x, origin.y, origin.z],
+                               "normal": [normal.x, normal.y, normal.z] },
+                })),
+            ),
+            Err(e) => label_error_response(e),
+        };
+    }
+
+    // Entity label: vertex / edge / face, by id or by selector.
+    let kind = match LabelKind::from_tag(kind_str) {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "unknown_kind",
+                    "message": "kind must be vertex|edge|face|section",
+                })),
+            )
+        }
+    };
+
+    // Resolve the target entity id: explicit `entity_id`, or by `selector`.
+    let entity_id: u32 = if let Some(eid) = body.get("entity_id").and_then(|v| v.as_u64()) {
+        eid as u32
+    } else if let Some(sel) = body.get("selector") {
+        match resolve_selector(&mut model, id as SolidId, kind, sel) {
+            Ok(eid) => eid,
+            Err(resp) => return resp,
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_target",
+                "message": "provide entity_id or selector",
+            })),
+        );
+    };
+
+    let attach = match kind {
+        LabelKind::Face => model.label_face(entity_id, &name, description),
+        LabelKind::Edge => model.label_edge(entity_id, &name, description),
+        LabelKind::Vertex => model.label_vertex(entity_id, &name, description),
+    };
+    match attach {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "created": outcome == AttachOutcome::Created,
+                "replaced": outcome == AttachOutcome::Replaced,
+                "part_id": id, "name": name, "kind": kind.tag(),
+                "entity_id": entity_id,
+            })),
+        ),
+        Err(e) => label_error_response(e),
+    }
+}
+
+/// Resolve a `selector` JSON body (the same shape as `select-face` /
+/// `select-edge`) to a single entity id of the requested `kind`, or return the
+/// refusal response. Only `face`/`edge` selectors are supported (a vertex has
+/// no descriptive selector yet); a `vertex` kind with a selector is rejected.
+fn resolve_selector(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    solid: SolidId,
+    kind: geometry_engine::labels::LabelKind,
+    sel: &serde_json::Value,
+) -> Result<u32, (StatusCode, Json<serde_json::Value>)> {
+    use geometry_engine::labels::LabelKind;
+    use geometry_engine::math::Vector3;
+    use geometry_engine::queries::select::{
+        resolve_edge, resolve_face, BlendFilter, CurveKind, EdgeExtremal, EdgeQuery, Extremal,
+        FaceQuery, SelectError, SurfaceKind,
+    };
+
+    let vec3 = |key: &str| -> Option<Vector3> {
+        sel.get(key).and_then(|v| v.as_array()).and_then(|a| {
+            if a.len() == 3 {
+                Some(Vector3::new(a[0].as_f64()?, a[1].as_f64()?, a[2].as_f64()?))
+            } else {
+                None
+            }
+        })
+    };
+    let refuse = |e: SelectError| -> (StatusCode, Json<serde_json::Value>) {
+        match e {
+            SelectError::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "resolved": false, "error": "selector_not_found",
+                    "message": "no entity matches that description",
+                })),
+            ),
+            SelectError::Ambiguous(c) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "resolved": false, "error": "selector_ambiguous",
+                    "message": "several entities match — refine the description",
+                    "candidates": c,
+                })),
+            ),
+        }
+    };
+
+    match kind {
+        LabelKind::Face => {
+            let surf = match sel.get("kind").and_then(|v| v.as_str()).unwrap_or("any") {
+                "planar" | "plane" => SurfaceKind::Planar,
+                "cylindrical" | "cylinder" => SurfaceKind::Cylindrical,
+                "spherical" | "sphere" => SurfaceKind::Spherical,
+                "conical" | "cone" => SurfaceKind::Conical,
+                "toroidal" | "torus" => SurfaceKind::Toroidal,
+                "nurbs" | "nurbssurface" => SurfaceKind::Nurbs,
+                _ => SurfaceKind::Any,
+            };
+            let normal_dir = vec3("normal_dir");
+            let along = vec3("along").or(normal_dir);
+            let extremal = match sel
+                .get("extremal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+            {
+                "largest_area" | "largest" => Extremal::LargestArea,
+                "smallest_area" | "smallest" => Extremal::SmallestArea,
+                "most_along" | "topmost" | "furthest" => {
+                    Extremal::MostAlong(along.unwrap_or(Vector3::Z))
+                }
+                _ => Extremal::None,
+            };
+            let mut q = FaceQuery::new(surf);
+            q.normal_dir = normal_dir;
+            q.extremal = extremal;
+            if let Some(t) = sel.get("angle_tol_deg").and_then(|v| v.as_f64()) {
+                q.angle_tol_deg = t;
+            }
+            resolve_face(model, solid, &q).map_err(refuse)
+        }
+        LabelKind::Edge => {
+            let curve_kind = match sel
+                .get("curve_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("any")
+            {
+                "line" => CurveKind::Line,
+                "arc" => CurveKind::Arc,
+                "circle" => CurveKind::Circle,
+                "nurbs" => CurveKind::Nurbs,
+                _ => CurveKind::Any,
+            };
+            let blend = match sel.get("blend").and_then(|v| v.as_str()).unwrap_or("any") {
+                "filleted" | "fillet" => BlendFilter::Filleted,
+                "chamfered" | "chamfer" => BlendFilter::Chamfered,
+                "unblended" | "none" => BlendFilter::Unblended,
+                _ => BlendFilter::Any,
+            };
+            let direction = vec3("direction");
+            let along = vec3("along").or(direction);
+            let extremal = match sel
+                .get("extremal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+            {
+                "longest" => EdgeExtremal::Longest,
+                "shortest" => EdgeExtremal::Shortest,
+                "most_along" | "furthest" => EdgeExtremal::MostAlong(along.unwrap_or(Vector3::Z)),
+                _ => EdgeExtremal::None,
+            };
+            let mut q = EdgeQuery::new(curve_kind);
+            q.blend = blend;
+            q.direction = direction;
+            q.extremal = extremal;
+            if let Some(t) = sel.get("angle_tol_deg").and_then(|v| v.as_f64()) {
+                q.angle_tol_deg = t;
+            }
+            resolve_edge(model, solid, &q).map_err(refuse)
+        }
+        LabelKind::Vertex => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "no_vertex_selector",
+                "message": "a vertex label must be attached by entity_id (no descriptive selector)",
+            })),
+        )),
+    }
+}
+
+/// `GET /api/agent/parts/{id}/labels` — list every label on this part: its
+/// name, kind, optional world anchor (the callout point), and description. In
+/// name order. Read path warms the centroid cache, so it takes a write lock.
+pub async fn list_labels(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> Json<serde_json::Value> {
+    let mut model = model_handle.write().await;
+    let labels: Vec<serde_json::Value> = model
+        .list_labels()
+        .into_iter()
+        .map(|(name, kind, anchor, description)| {
+            serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "anchor": anchor.map(|p| [p.x, p.y, p.z]),
+                "description": description,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "part_id": id, "labels": labels }))
+}
+
+/// `GET /api/agent/parts/{id}/labels/{name}/resolve` — resolve a NAME back to
+/// the live entity (or section plane) it pins. 200 → the resolved target; 404
+/// → not-found / dangling; the kernel never guesses.
+pub async fn resolve_label(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, name)): Path<(u32, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::labels::{LabelError, LabelKind, LabelTarget};
+    let model = model_handle.read().await;
+    let label = match model.label(&name) {
+        Some(l) => l,
+        None => return label_error_response(LabelError::NotFound),
+    };
+    match &label.target {
+        LabelTarget::Section(p) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "resolved": true, "part_id": id, "name": name, "kind": "section",
+                "plane": { "origin": [p.origin.x, p.origin.y, p.origin.z],
+                           "normal": [p.normal.x, p.normal.y, p.normal.z] },
+                "description": label.description,
+            })),
+        ),
+        LabelTarget::Entity { kind, .. } => {
+            let resolved = match kind {
+                LabelKind::Face => model.resolve_label_face(&name).map(|fid| ("face", fid)),
+                LabelKind::Edge => model.resolve_label_edge(&name).map(|eid| ("edge", eid)),
+                LabelKind::Vertex => model.resolve_label_vertex(&name).map(|vid| ("vertex", vid)),
+            };
+            match resolved {
+                Ok((tag, eid)) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "resolved": true, "part_id": id, "name": name,
+                        "kind": tag, "entity_id": eid,
+                        "description": label.description,
+                    })),
+                ),
+                Err(e) => label_error_response(e),
+            }
+        }
     }
 }
 
