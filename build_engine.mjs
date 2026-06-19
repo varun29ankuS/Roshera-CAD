@@ -27,6 +27,10 @@ const I = O.map((p, i) => {
   return { r: p.r - t * nr, z: p.z - t * nz };
 });
 const round = (x) => Math.round(x * 1000) / 1000;
-const profile = [...O.map((p) => [round(p.r), round(p.z)]), ...I.slice().reverse().map((p) => [round(p.r), round(p.z)])];
+// Negate z so the nozzle exit points -Z and the chamber head sits at +Z (the
+// conventional engine orientation: injector on top, exhaust down). Built this way
+// from the start — no post-build transform/flip, so the construction sketch never
+// orphans (the divergence that the consistency invariant exists to catch).
+const profile = [...O.map((p) => [round(p.r), -round(p.z)]), ...I.slice().reverse().map((p) => [round(p.r), -round(p.z)])];
 console.log(JSON.stringify(profile));
 console.error(`chamber+nozzle wall profile: ${profile.length} pts, t=${t}, barrel=${Lchamber}, throat z=0..exit z=${round(zE)}`);
