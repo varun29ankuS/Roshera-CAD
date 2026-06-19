@@ -28,6 +28,9 @@
 //! - `sketch_planes`, `datums`, `datum_graph`, `location_cache`,
 //!   `tolerance` — every field of the model that contributes to
 //!   geometric identity.
+//! - `solid_construction` — per-solid source-sketch geometry, so a
+//!   rolled-back transform undoes the sketch move in lock-step with
+//!   the solid (FIX 1 / FIX 2).
 //!
 //! ## What the snapshot deliberately does NOT capture
 //!
@@ -99,6 +102,11 @@ pub struct ModelSnapshot {
     /// GD&T annotation sidecar. Keyed by persistent id (also snapshotted), so a
     /// rolled-back op that authored a tolerance is undone with the geometry.
     gdt: crate::gdt::sidecar::GdtSidecar,
+    /// Construction-geometry sidecar (FIX 1). Snapshotted so a rolled-back
+    /// transform that moved a solid's source sketch is undone in lock-step
+    /// with the geometry — otherwise the sketch would stay moved while the
+    /// solid rolled back, exactly the divergence FIX 2 exists to catch.
+    solid_construction: HashMap<SolidId, crate::primitives::provenance::ConstructionGeometry>,
 }
 
 impl ModelSnapshot {
@@ -137,6 +145,7 @@ impl ModelSnapshot {
             pid_to_solid: model.pid_to_solid.clone(),
             root_counter: model.root_counter,
             gdt: model.gdt.clone(),
+            solid_construction: model.solid_construction.clone(),
         }
     }
 
@@ -169,6 +178,7 @@ impl ModelSnapshot {
         model.pid_to_solid = self.pid_to_solid;
         model.root_counter = self.root_counter;
         model.gdt = self.gdt;
+        model.solid_construction = self.solid_construction;
     }
 }
 
