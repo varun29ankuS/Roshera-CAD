@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { Tag, AlertTriangle } from 'lucide-react'
+import { Tag, AlertTriangle, Check, X } from 'lucide-react'
 import { useSceneStore } from '@/stores/scene-store'
 import { usePartLabels } from './use-part-labels'
-import type { Label, LabelKind } from '@/lib/labels-api'
+import { labelText, type Label, type LabelKind } from '@/lib/labels-api'
 
 /**
  * Hover tooltip that surfaces the part's named features so the user can
@@ -94,22 +94,44 @@ export function LabelHoverTooltip() {
 
 function LabelRow({ label }: { label: Label }) {
   const Icon = label.stale ? AlertTriangle : Tag
+  // Live labels with a kernel colour render the glyph + name in it so the
+  // tooltip row matches the in-scene chip + face tint. Stale rows keep
+  // the amber semantic; older backends (no colour) keep the neutral tone.
+  const colored = !label.stale && label.color !== null
+  const iconClass = label.stale
+    ? 'text-amber-400'
+    : colored
+      ? ''
+      : 'text-muted-foreground'
+  const nameClass = label.stale
+    ? 'text-amber-300 line-through decoration-amber-400/70'
+    : colored
+      ? ''
+      : 'text-foreground'
+  const colorStyle = colored ? { color: label.color as string } : undefined
+  // name — measurement.display (verbatim, units-bearing) when present.
+  const text = labelText(label)
+
   return (
     <li className="flex items-center gap-1.5 normal-case tracking-normal text-[11px]">
       <Icon
-        className={`w-3 h-3 shrink-0 ${label.stale ? 'text-amber-400' : 'text-muted-foreground'}`}
+        className={`w-3 h-3 shrink-0 ${iconClass}`}
+        style={colorStyle}
         aria-hidden
       />
       <span
-        className={
-          label.stale
-            ? 'text-amber-300 line-through decoration-amber-400/70'
-            : 'text-foreground'
-        }
+        className={nameClass}
+        style={colorStyle}
         title={label.stale ? 'stale: this name no longer points at a live entity' : undefined}
       >
-        {label.name}
+        {text}
       </span>
+      {label.conformance === 'in_spec' && (
+        <Check className="w-3 h-3 shrink-0 text-emerald-400" aria-label="in spec" />
+      )}
+      {label.conformance === 'out_of_spec' && (
+        <X className="w-3 h-3 shrink-0 text-red-400" aria-label="out of spec" />
+      )}
       {label.description && (
         <span className="text-muted-foreground/70 truncate">
           {label.description}
