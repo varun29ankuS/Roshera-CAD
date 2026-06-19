@@ -36,7 +36,21 @@ function rgbaToHex(rgba: [number, number, number, number]): string {
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`
 }
 
-function convertMaterial(mat: MaterialProperties): CADMaterial {
+// Default neutral material for objects that ship without one — the
+// agent/MCP build path (revolve, create_*) and the /api/scene/snapshot
+// serialization don't always attach a material, and a missing one must
+// NOT crash the whole scene convert (it used to throw on `mat.diffuse_color`
+// and, paired with a clear-then-build resync, blanked the viewport — the
+// "appears then disappears on reconnect" bug). Mirrors the scene-eye's grey.
+const DEFAULT_MATERIAL: CADMaterial = {
+  color: '#9a9a9a',
+  metalness: 0.1,
+  roughness: 0.6,
+  opacity: 1,
+}
+
+function convertMaterial(mat: MaterialProperties | null | undefined): CADMaterial {
+  if (!mat || !mat.diffuse_color) return { ...DEFAULT_MATERIAL }
   return {
     color: rgbaToHex(mat.diffuse_color),
     metalness: mat.metallic,
@@ -393,18 +407,21 @@ async function resyncSceneFromServer(): Promise<void> {
     const res = await fetch(`${API_BASE}/scene/snapshot`)
     if (!res.ok) return
     const snap = (await res.json()) as { objects?: ProtocolCADObject[] }
+    // Convert FIRST, then clear+swap. If a malformed object throws mid-convert,
+    // it throws BEFORE we touch the live scene — so a bad snapshot can never
+    // blank the viewport. (The old clear-then-build order, paired with an
+    // object missing its material, was the "appears then disappears" bug.)
+    const converted = (snap.objects ?? []).map(convertCADObject)
     const scene = useSceneStore.getState()
     scene.clearScene()
-    for (const proto of snap.objects ?? []) {
-      scene.addObject(convertCADObject(proto))
-    }
+    for (const obj of converted) scene.addObject(obj)
     sketchesHydrated = false
     hydrateSketchesOnce()
     console.info(
-      `[ws-bridge] scene resynced after reconnect: ${snap.objects?.length ?? 0} object(s)`,
+      `[ws-bridge] scene resynced after reconnect: ${converted.length} object(s)`,
     )
   } catch (err) {
-    console.warn('[ws-bridge] scene resync failed:', err)
+    console.warn('[ws-bridge] scene resync failed (scene preserved):', err)
   }
 }
 
