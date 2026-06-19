@@ -10,6 +10,7 @@
 //! kernel can answer "what did you actually make, and which parts are real?"
 //! without consulting the LLM.
 
+use crate::math::{Matrix4, Point3};
 use crate::primitives::persistent_id::PrimitiveKind;
 use crate::primitives::solid::SolidId;
 
@@ -92,6 +93,102 @@ impl SolidProvenance {
     }
 }
 
+/// The construction geometry a solid was built FROM — the source sketch's
+/// plane frame plus the world-space points that bound the drawn profile.
+///
+/// This is the kernel-side anchor of the solid↔sketch link. A
+/// sketch-derived solid (extrude / revolve-from-sketch) records the plane
+/// origin and the lifted profile points here so the kernel can (a) carry
+/// the construction geometry through a [`crate::operations::transform`]
+/// in lock-step with the solid (FIX 1 — sketch and solid never diverge),
+/// and (b) certify that the two are still co-located (FIX 2 — a stale /
+/// orphaned sketch is flagged honestly).
+///
+/// Solids with no source sketch (bare primitives, revolve / loft with no
+/// recorded profile, NURBS skins) simply have no entry, and the
+/// consistency check reports [`ConstructionConsistency::NotApplicable`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstructionGeometry {
+    /// World-space origin of the source sketch plane (the lift of plane
+    /// (0, 0)).
+    pub plane_origin: Point3,
+    /// World-space points of the drawn profile (the lifted sketch loop
+    /// vertices). Used to derive the construction bbox for the
+    /// co-location check; never empty for a recorded sketch.
+    pub profile_points: Vec<Point3>,
+}
+
+impl ConstructionGeometry {
+    pub fn new(plane_origin: Point3, profile_points: Vec<Point3>) -> Self {
+        Self {
+            plane_origin,
+            profile_points,
+        }
+    }
+
+    /// Apply an affine transform to every stored point (FIX 1). Keeps the
+    /// construction geometry rigidly attached to the solid it built so a
+    /// `transform_solid` can never leave the sketch behind.
+    pub fn transformed(&self, m: &Matrix4) -> Self {
+        Self {
+            plane_origin: m.transform_point(&self.plane_origin),
+            profile_points: self
+                .profile_points
+                .iter()
+                .map(|p| m.transform_point(p))
+                .collect(),
+        }
+    }
+
+    /// Axis-aligned world bbox of the construction geometry (plane origin
+    /// + every profile point). `None` only if there are no points at all.
+    pub fn world_bbox(&self) -> Option<crate::math::BBox> {
+        let mut pts = Vec::with_capacity(self.profile_points.len() + 1);
+        pts.push(self.plane_origin);
+        pts.extend_from_slice(&self.profile_points);
+        crate::math::BBox::from_points(&pts)
+    }
+}
+
+/// Tri-state verdict on whether a solid's linked construction geometry is
+/// consistent with the solid itself (FIX 2). Tri-state so the certificate
+/// is HONEST: it distinguishes "checked and good" from "checked and bad"
+/// from "nothing to check".
+///
+/// * `Consistent` — the construction geometry exists and is co-located
+///   with the solid (sketch bbox lies within the solid's bbox, expanded
+///   by a tolerance band).
+/// * `Inconsistent` — the construction geometry exists but has drifted
+///   away from the solid (an orphaned sketch left behind by a transform).
+///   Folds into `is_sound() == false`.
+/// * `NotApplicable` — no construction geometry is linked (bare
+///   primitive, revolve / loft / NURBS with no recorded profile). MUST
+///   NOT affect soundness — a primitive solid stays sound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructionConsistency {
+    Consistent,
+    Inconsistent,
+    NotApplicable,
+}
+
+impl ConstructionConsistency {
+    /// Short agent-facing label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ConstructionConsistency::Consistent => "consistent",
+            ConstructionConsistency::Inconsistent => "inconsistent",
+            ConstructionConsistency::NotApplicable => "not_applicable",
+        }
+    }
+
+    /// True when this verdict does NOT block soundness — i.e. anything but
+    /// `Inconsistent`. `NotApplicable` is sound by construction so
+    /// sketch-less solids never regress.
+    pub fn is_sound(&self) -> bool {
+        !matches!(self, ConstructionConsistency::Inconsistent)
+    }
+}
+
 /// The kernel's COMPUTED verdict on a solid — never written by the caller.
 /// `is_sound()` is the honest "this is a real, closed, manufacturable solid"
 /// gate: a valid B-Rep that is watertight and manifold.
@@ -111,13 +208,22 @@ pub struct ValidityCertificate {
     /// solid can be valid + watertight yet self-intersect (#70-class); this is
     /// the only check that catches it.
     pub self_intersection_free: bool,
+    /// Cross-entity consistency (FIX 2): is the solid's linked construction
+    /// geometry (source sketch plane + profile) co-located with the solid?
+    /// Tri-state — `NotApplicable` when no sketch is linked, and it does NOT
+    /// affect soundness in that case (a bare primitive stays sound).
+    pub construction_consistent: ConstructionConsistency,
     /// B-Rep validation errors (stringified), empty when `brep_valid`.
     pub errors: Vec<String>,
 }
 
 impl ValidityCertificate {
     pub fn is_sound(&self) -> bool {
-        self.brep_valid && self.watertight && self.manifold && self.self_intersection_free
+        self.brep_valid
+            && self.watertight
+            && self.manifold
+            && self.self_intersection_free
+            && self.construction_consistent.is_sound()
     }
 }
 
@@ -139,7 +245,7 @@ impl GroundTruth {
             .map(|p| p.created_by.label())
             .unwrap_or_else(|| "unrecorded".into());
         format!(
-            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} euler={})",
+            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} euler={} construction={})",
             self.solid_id,
             origin,
             self.provenance
@@ -151,6 +257,7 @@ impl GroundTruth {
             self.certificate.watertight,
             self.certificate.manifold,
             self.certificate.euler_characteristic,
+            self.certificate.construction_consistent.label(),
         )
     }
 }

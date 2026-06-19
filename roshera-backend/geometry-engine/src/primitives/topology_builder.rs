@@ -343,6 +343,16 @@ pub struct BRepModel {
     /// success; absence is reported honestly as "unrecorded", never assumed.
     pub solid_provenance:
         std::collections::HashMap<SolidId, crate::primitives::provenance::SolidProvenance>,
+    /// Per-solid construction geometry (FIX 1 / FIX 2): the source sketch
+    /// plane + profile a sketch-derived solid was built from. Sidecar (like
+    /// `solid_provenance` and the PID maps) so the SoA stores stay lean.
+    /// Absent for bare primitives and any op with no recorded source sketch;
+    /// absence is reported honestly as `ConstructionConsistency::NotApplicable`
+    /// and does NOT affect soundness. Set by the sketch-extrude path via
+    /// `set_solid_construction`; transformed in lock-step with the solid by
+    /// `operations::transform`; read by `certify_solid`.
+    pub solid_construction:
+        std::collections::HashMap<SolidId, crate::primitives::provenance::ConstructionGeometry>,
     /// Document length unit (GD&T Phase 1): the unit lengths/diameters are
     /// *labelled and formatted* in on drawings and agent-facing readouts. The
     /// kernel's native modelling unit is the millimetre (1 kernel unit = 1 mm)
@@ -429,6 +439,7 @@ impl BRepModel {
             current_event_key: None,
             root_counter: 0,
             solid_provenance: std::collections::HashMap::new(),
+            solid_construction: std::collections::HashMap::new(),
             document_unit: crate::units::LengthUnit::default(),
             gdt: crate::gdt::sidecar::GdtSidecar::new(),
         }
@@ -504,6 +515,10 @@ impl BRepModel {
         self.root_counter = 0;
         // GD&T annotations are bound to the topology being discarded.
         self.gdt.clear();
+        // Construction geometry is bound to the solids being discarded —
+        // clear it so a recycled solid id can't inherit a stale orphan
+        // sketch and certify falsely Inconsistent.
+        self.solid_construction.clear();
         // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance,
         // current_event_key (caller op-context, set per-op).
     }
@@ -771,6 +786,83 @@ impl BRepModel {
         self.solid_provenance.get(&solid_id)
     }
 
+    /// Record the construction geometry a solid was built FROM — the source
+    /// sketch's plane origin + lifted profile points (FIX 1 / FIX 2). Called
+    /// by the sketch-extrude orchestration after a sketch-derived solid is
+    /// built so the kernel owns the solid↔sketch link and can carry it
+    /// through transforms + certify co-location. Overwrites any prior entry.
+    pub fn set_solid_construction(
+        &mut self,
+        solid_id: SolidId,
+        construction: crate::primitives::provenance::ConstructionGeometry,
+    ) {
+        self.solid_construction.insert(solid_id, construction);
+    }
+
+    /// The construction geometry linked to a solid, if any.
+    pub fn solid_construction(
+        &self,
+        solid_id: SolidId,
+    ) -> Option<&crate::primitives::provenance::ConstructionGeometry> {
+        self.solid_construction.get(&solid_id)
+    }
+
+    /// Compute the cross-entity consistency verdict for a solid (FIX 2):
+    /// is its linked construction geometry co-located with the solid?
+    ///
+    /// Tri-state and honest:
+    /// * `NotApplicable` — no construction geometry linked (bare primitive,
+    ///   revolve / loft / NURBS with no recorded profile). Does NOT block
+    ///   soundness.
+    /// * `Consistent` — every construction point lies within the solid's
+    ///   world bbox expanded by `tolerance_band`. The band absorbs the fact
+    ///   that a sketch profile sits ON a face of the solid (so a point can
+    ///   be flush with a bbox boundary) and accommodates the extrude
+    ///   direction adding depth the sketch plane does not span.
+    /// * `Inconsistent` — at least one construction point has drifted
+    ///   outside the band (an orphaned sketch left behind by a transform).
+    ///
+    /// `tolerance_band` is a fraction of the solid's bbox diagonal, floored
+    /// at the model tolerance, so the check scales with part size rather
+    /// than using a hardcoded absolute distance.
+    pub fn construction_consistency(
+        &self,
+        solid_id: SolidId,
+    ) -> crate::primitives::provenance::ConstructionConsistency {
+        use crate::primitives::provenance::ConstructionConsistency;
+        let Some(construction) = self.solid_construction.get(&solid_id) else {
+            return ConstructionConsistency::NotApplicable;
+        };
+        // A linked-but-empty construction record carries no spatial claim to
+        // verify; treat it as nothing to check rather than a false failure.
+        let Some(construction_bbox) = construction.world_bbox() else {
+            return ConstructionConsistency::NotApplicable;
+        };
+        let Some(solid_bbox) = self.solid_world_bbox(solid_id) else {
+            // The solid has no reachable geometry but a sketch IS linked —
+            // they cannot be co-located. Honest failure, not a silent pass.
+            return ConstructionConsistency::Inconsistent;
+        };
+
+        // Tolerance band: 1% of the solid diagonal, floored at the model
+        // tolerance. Large enough to absorb on-face flushness + numeric
+        // noise, far smaller than the ~17u orphan the gate must catch.
+        let band = (solid_bbox.diagonal_length() * 0.01).max(self.tolerance.distance());
+        let expanded = solid_bbox.expand(band);
+
+        let all_inside = construction
+            .profile_points
+            .iter()
+            .chain(std::iter::once(&construction.plane_origin))
+            .all(|p| expanded.contains_point(p));
+
+        if all_inside {
+            ConstructionConsistency::Consistent
+        } else {
+            ConstructionConsistency::Inconsistent
+        }
+    }
+
     /// COMPUTE (never accept) a solid's validity certificate: B-Rep validity
     /// (`validate_solid_scoped`) + watertight/manifold/Euler from the tessellated
     /// mesh (`manifold_report`). This is the kernel's own verdict — the agent
@@ -797,6 +889,10 @@ impl BRepModel {
         // low density; keeps the O(n²) pair scan cheap for this on-demand check).
         let self_intersection_free =
             !crate::harness::self_intersection::mesh_self_intersects(self, solid_id, 0.5);
+        // FIX 2 — cross-entity consistency: is the solid's linked construction
+        // geometry (source sketch) still co-located with the solid? Tri-state,
+        // and NotApplicable when no sketch is linked (does not block soundness).
+        let construction_consistent = self.construction_consistency(solid_id);
         ValidityCertificate {
             brep_valid: v.is_valid,
             watertight,
@@ -805,6 +901,7 @@ impl BRepModel {
             boundary_edges: be,
             nonmanifold_edges: nm,
             self_intersection_free,
+            construction_consistent,
             errors: v.errors.iter().map(|e| format!("{e:?}")).collect(),
         }
     }

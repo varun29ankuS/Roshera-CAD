@@ -843,7 +843,11 @@ pub struct TruthResponse {
     pub manifold: bool,
     pub self_intersection_free: bool,
     pub euler_characteristic: i64,
-    /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold).
+    /// Cross-entity consistency verdict for the solid's linked construction
+    /// geometry: "consistent" / "inconsistent" / "not_applicable".
+    pub construction_consistent: String,
+    /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold
+    /// ∧ self-intersection-free ∧ construction-consistent).
     pub sound: bool,
     pub errors: Vec<String>,
     pub summary: String,
@@ -882,6 +886,7 @@ pub async fn part_truth(
         manifold: c.manifold,
         self_intersection_free: c.self_intersection_free,
         euler_characteristic: c.euler_characteristic,
+        construction_consistent: c.construction_consistent.label().to_string(),
         sound: c.is_sound(),
         errors: c.errors.clone(),
         summary: gt.summary(),
