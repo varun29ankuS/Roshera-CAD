@@ -862,6 +862,10 @@ pub struct TruthResponse {
     /// Cross-entity consistency verdict for the solid's linked construction
     /// geometry: "consistent" / "inconsistent" / "not_applicable".
     pub construction_consistent: String,
+    /// D4 labels-consistency verdict: are all the part's labels still backed by
+    /// a holding assertion? "consistent" / "inconsistent" / "not_applicable".
+    /// An annotation flag — does NOT affect `sound`.
+    pub labels_consistent: String,
     /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold
     /// ∧ self-intersection-free ∧ construction-consistent).
     pub sound: bool,
@@ -877,7 +881,9 @@ pub async fn part_truth(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
 ) -> Result<Json<TruthResponse>, StatusCode> {
-    let model = model_handle.read().await;
+    // Write lock: `ground_truth` re-runs Pillar-3 selectors for the D4 labels
+    // flag, which warm a per-face centroid cache (no geometry is mutated).
+    let mut model = model_handle.write().await;
     let gt = model
         .ground_truth(id as SolidId)
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -903,6 +909,7 @@ pub async fn part_truth(
         self_intersection_free: c.self_intersection_free,
         euler_characteristic: c.euler_characteristic,
         construction_consistent: c.construction_consistent.label().to_string(),
+        labels_consistent: c.labels_consistent.label().to_string(),
         sound: c.is_sound(),
         errors: c.errors.clone(),
         summary: gt.summary(),
@@ -1158,6 +1165,13 @@ fn label_error_response(
                 "message": "the entity this label named no longer exists",
             })),
         ),
+        LabelError::MissingAssertion => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "resolved": false, "error": "missing_assertion",
+                "message": "an entity label must carry an assertion (a selector or fingerprint) — no bare labels",
+            })),
+        ),
     }
 }
 
@@ -1255,11 +1269,18 @@ pub async fn create_label(
     };
 
     // Resolve the target entity id: explicit `entity_id`, or by `selector`.
+    // D4: when attached BY SELECTOR, the selector IS the assertion (re-run on
+    // every resolve); BY ID, the kernel captures the entity's fingerprint.
+    let selector_spec: Option<geometry_engine::labels::SelectorSpec>;
     let entity_id: u32 = if let Some(eid) = body.get("entity_id").and_then(|v| v.as_u64()) {
+        selector_spec = None;
         eid as u32
-    } else if let Some(sel) = body.get("selector") {
+    } else if let Some(sel) = body.get("selector").filter(|v| !v.is_null()) {
         match resolve_selector(&mut model, id as SolidId, kind, sel) {
-            Ok(eid) => eid,
+            Ok((eid, spec)) => {
+                selector_spec = Some(spec);
+                eid
+            }
             Err(resp) => return resp,
         }
     } else {
@@ -1272,10 +1293,22 @@ pub async fn create_label(
         );
     };
 
-    let attach = match kind {
-        LabelKind::Face => model.label_face(entity_id, &name, description),
-        LabelKind::Edge => model.label_edge(entity_id, &name, description),
-        LabelKind::Vertex => model.label_vertex(entity_id, &name, description),
+    let attach = match (kind, selector_spec) {
+        (LabelKind::Face, Some(spec)) => model.label_face_with_assertion(
+            entity_id,
+            &name,
+            geometry_engine::labels::LabelAssertion::Selector(spec),
+            description,
+        ),
+        (LabelKind::Edge, Some(spec)) => model.label_edge_with_assertion(
+            entity_id,
+            &name,
+            geometry_engine::labels::LabelAssertion::Selector(spec),
+            description,
+        ),
+        (LabelKind::Face, None) => model.label_face(entity_id, &name, description),
+        (LabelKind::Edge, None) => model.label_edge(entity_id, &name, description),
+        (LabelKind::Vertex, _) => model.label_vertex(entity_id, &name, description),
     };
     match attach {
         Ok(outcome) => (
@@ -1301,8 +1334,8 @@ fn resolve_selector(
     solid: SolidId,
     kind: geometry_engine::labels::LabelKind,
     sel: &serde_json::Value,
-) -> Result<u32, (StatusCode, Json<serde_json::Value>)> {
-    use geometry_engine::labels::LabelKind;
+) -> Result<(u32, geometry_engine::labels::SelectorSpec), (StatusCode, Json<serde_json::Value>)> {
+    use geometry_engine::labels::{EdgeSelectorSpec, FaceSelectorSpec, LabelKind, SelectorSpec};
     use geometry_engine::math::Vector3;
     use geometry_engine::queries::select::{
         resolve_edge, resolve_face, BlendFilter, CurveKind, EdgeExtremal, EdgeQuery, Extremal,
@@ -1338,9 +1371,16 @@ fn resolve_selector(
         }
     };
 
+    let v3arr = |v: Option<Vector3>| v.map(|d| [d.x, d.y, d.z]);
+
     match kind {
         LabelKind::Face => {
-            let surf = match sel.get("kind").and_then(|v| v.as_str()).unwrap_or("any") {
+            let surf_tag = sel
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("any")
+                .to_string();
+            let surf = match surf_tag.as_str() {
                 "planar" | "plane" => SurfaceKind::Planar,
                 "cylindrical" | "cylinder" => SurfaceKind::Cylindrical,
                 "spherical" | "sphere" => SurfaceKind::Spherical,
@@ -1351,11 +1391,12 @@ fn resolve_selector(
             };
             let normal_dir = vec3("normal_dir");
             let along = vec3("along").or(normal_dir);
-            let extremal = match sel
+            let extremal_tag = sel
                 .get("extremal")
                 .and_then(|v| v.as_str())
                 .unwrap_or("none")
-            {
+                .to_string();
+            let extremal = match extremal_tag.as_str() {
                 "largest_area" | "largest" => Extremal::LargestArea,
                 "smallest_area" | "smallest" => Extremal::SmallestArea,
                 "most_along" | "topmost" | "furthest" => {
@@ -1369,21 +1410,36 @@ fn resolve_selector(
             if let Some(t) = sel.get("angle_tol_deg").and_then(|v| v.as_f64()) {
                 q.angle_tol_deg = t;
             }
-            resolve_face(model, solid, &q).map_err(refuse)
+            let spec = SelectorSpec::Face(FaceSelectorSpec {
+                surface: surf_tag,
+                normal_dir: v3arr(normal_dir),
+                angle_tol_deg: q.angle_tol_deg,
+                extremal: extremal_tag,
+                along: v3arr(along),
+            });
+            resolve_face(model, solid, &q)
+                .map(|fid| (fid, spec))
+                .map_err(refuse)
         }
         LabelKind::Edge => {
-            let curve_kind = match sel
+            let curve_tag = sel
                 .get("curve_kind")
                 .and_then(|v| v.as_str())
                 .unwrap_or("any")
-            {
+                .to_string();
+            let curve_kind = match curve_tag.as_str() {
                 "line" => CurveKind::Line,
                 "arc" => CurveKind::Arc,
                 "circle" => CurveKind::Circle,
                 "nurbs" => CurveKind::Nurbs,
                 _ => CurveKind::Any,
             };
-            let blend = match sel.get("blend").and_then(|v| v.as_str()).unwrap_or("any") {
+            let blend_tag = sel
+                .get("blend")
+                .and_then(|v| v.as_str())
+                .unwrap_or("any")
+                .to_string();
+            let blend = match blend_tag.as_str() {
                 "filleted" | "fillet" => BlendFilter::Filleted,
                 "chamfered" | "chamfer" => BlendFilter::Chamfered,
                 "unblended" | "none" => BlendFilter::Unblended,
@@ -1391,11 +1447,12 @@ fn resolve_selector(
             };
             let direction = vec3("direction");
             let along = vec3("along").or(direction);
-            let extremal = match sel
+            let extremal_tag = sel
                 .get("extremal")
                 .and_then(|v| v.as_str())
                 .unwrap_or("none")
-            {
+                .to_string();
+            let extremal = match extremal_tag.as_str() {
                 "longest" => EdgeExtremal::Longest,
                 "shortest" => EdgeExtremal::Shortest,
                 "most_along" | "furthest" => EdgeExtremal::MostAlong(along.unwrap_or(Vector3::Z)),
@@ -1408,7 +1465,17 @@ fn resolve_selector(
             if let Some(t) = sel.get("angle_tol_deg").and_then(|v| v.as_f64()) {
                 q.angle_tol_deg = t;
             }
-            resolve_edge(model, solid, &q).map_err(refuse)
+            let spec = SelectorSpec::Edge(EdgeSelectorSpec {
+                curve: curve_tag,
+                blend: blend_tag,
+                direction: v3arr(direction),
+                angle_tol_deg: q.angle_tol_deg,
+                extremal: extremal_tag,
+                along: v3arr(along),
+            });
+            resolve_edge(model, solid, &q)
+                .map(|eid| (eid, spec))
+                .map_err(refuse)
         }
         LabelKind::Vertex => Err((
             StatusCode::BAD_REQUEST,
@@ -1452,41 +1519,134 @@ pub async fn resolve_label(
     ActiveModel(model_handle): ActiveModel,
     Path((id, name)): Path<(u32, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    use geometry_engine::labels::{LabelError, LabelKind, LabelTarget};
-    let model = model_handle.read().await;
-    let label = match model.label(&name) {
-        Some(l) => l,
+    use geometry_engine::labels::{AssertionStatus, LabelError, LabelKind, LabelTarget};
+    // Write lock: the `_checked` resolve RE-RUNS the label's assertion (D4),
+    // which warms the selector centroid cache. No geometry is mutated.
+    let mut model = model_handle.write().await;
+    let (target, description) = match model.label(&name) {
+        Some(l) => (l.target.clone(), l.description.clone()),
         None => return label_error_response(LabelError::NotFound),
     };
-    match &label.target {
+    match target {
         LabelTarget::Section(p) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "resolved": true, "part_id": id, "name": name, "kind": "section",
                 "plane": { "origin": [p.origin.x, p.origin.y, p.origin.z],
                            "normal": [p.normal.x, p.normal.y, p.normal.z] },
-                "description": label.description,
+                "stale": false,
+                "description": description,
             })),
         ),
         LabelTarget::Entity { kind, .. } => {
+            // Resolve to a live id AND re-verify the assertion. A `Stale` verdict
+            // is surfaced HONESTLY (`stale:true`) — the id is the named entity's
+            // last-known live id, but the claim that justified the name no longer
+            // holds, so the caller must not blindly trust it.
             let resolved = match kind {
-                LabelKind::Face => model.resolve_label_face(&name).map(|fid| ("face", fid)),
-                LabelKind::Edge => model.resolve_label_edge(&name).map(|eid| ("edge", eid)),
-                LabelKind::Vertex => model.resolve_label_vertex(&name).map(|vid| ("vertex", vid)),
+                LabelKind::Face => model
+                    .resolve_label_face_checked(&name)
+                    .map(|(fid, st)| ("face", fid, st)),
+                LabelKind::Edge => model
+                    .resolve_label_edge_checked(&name)
+                    .map(|(eid, st)| ("edge", eid, st)),
+                LabelKind::Vertex => model
+                    .resolve_label_vertex(&name)
+                    .map(|vid| ("vertex", vid, model.verify_label_assertion(&name))),
             };
             match resolved {
-                Ok((tag, eid)) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "resolved": true, "part_id": id, "name": name,
-                        "kind": tag, "entity_id": eid,
-                        "description": label.description,
-                    })),
-                ),
+                Ok((tag, eid, status)) => {
+                    let stale = status == AssertionStatus::Stale;
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "resolved": true, "part_id": id, "name": name,
+                            "kind": tag, "entity_id": eid,
+                            "stale": stale,
+                            "description": description,
+                        })),
+                    )
+                }
                 Err(e) => label_error_response(e),
             }
         }
     }
+}
+
+/// `GET /api/agent/parts/{id}/propose-labels` — D3 AUTO-PROPOSE. The kernel
+/// recognizes features (throat / exit / chamber / fillet …) and SUGGESTS a name
+/// plus the ASSERTION that pins it — it does NOT apply them. Confirming a
+/// proposal = `POST .../labels` with `name` + a `selector` equal to the
+/// proposal's assertion (the user owns the name, the kernel owns the claim).
+/// Write lock (the recognizers run Pillar-3 selectors that warm the centroid
+/// cache); `404` on unknown id.
+pub async fn propose_labels(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::labels::{LabelAssertion, SelectorSpec};
+    let mut model = model_handle.write().await;
+    if model.solids.get(id as SolidId).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown_part", "part_id": id })),
+        );
+    }
+    let proposals = model.propose_labels(id as SolidId);
+    // Render each proposal's assertion as the exact `selector` body the agent
+    // would POST to confirm it — so confirming is a copy-paste, not a re-derive.
+    let selector_json = |spec: &SelectorSpec| -> serde_json::Value {
+        match spec {
+            SelectorSpec::Face(s) => {
+                let mut o = serde_json::Map::new();
+                o.insert("kind".into(), serde_json::json!(s.surface));
+                if let Some(n) = s.normal_dir {
+                    o.insert("normal_dir".into(), serde_json::json!(n));
+                }
+                o.insert("extremal".into(), serde_json::json!(s.extremal));
+                if let Some(a) = s.along {
+                    o.insert("along".into(), serde_json::json!(a));
+                }
+                o.insert("angle_tol_deg".into(), serde_json::json!(s.angle_tol_deg));
+                serde_json::Value::Object(o)
+            }
+            SelectorSpec::Edge(s) => {
+                let mut o = serde_json::Map::new();
+                o.insert("curve_kind".into(), serde_json::json!(s.curve));
+                o.insert("blend".into(), serde_json::json!(s.blend));
+                if let Some(d) = s.direction {
+                    o.insert("direction".into(), serde_json::json!(d));
+                }
+                o.insert("extremal".into(), serde_json::json!(s.extremal));
+                if let Some(a) = s.along {
+                    o.insert("along".into(), serde_json::json!(a));
+                }
+                o.insert("angle_tol_deg".into(), serde_json::json!(s.angle_tol_deg));
+                serde_json::Value::Object(o)
+            }
+        }
+    };
+    let body: Vec<serde_json::Value> = proposals
+        .into_iter()
+        .map(|p| {
+            let selector = match &p.assertion {
+                LabelAssertion::Selector(spec) => Some(selector_json(spec)),
+                LabelAssertion::Fingerprint(_) => None,
+            };
+            serde_json::json!({
+                "suggested_name": p.suggested_name,
+                "kind": p.kind,
+                "confidence": p.confidence,
+                "rationale": p.rationale,
+                "selector": selector,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "part_id": id, "proposals": body })),
+    )
 }
 
 // ───────────────────── coverage / ambiguity (EYE-5) ─────────────────

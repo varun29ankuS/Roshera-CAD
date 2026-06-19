@@ -329,6 +329,80 @@ impl SketchPlane {
     }
 }
 
+/// Perpendicular distance from a point to an (origin, unit-direction) axis line
+/// — the revolution radius at that point for a surface of revolution. Used to
+/// derive a representative radius for cone/torus faces in a label fingerprint.
+fn point_to_axis_distance(p: Point3, axis_origin: Point3, axis_dir: Vector3) -> f64 {
+    let d = match axis_dir.normalize() {
+        Ok(d) => d,
+        Err(_) => return 0.0,
+    };
+    let w = p - axis_origin;
+    let along = w.dot(&d);
+    let proj = Point3::new(
+        axis_origin.x + d.x * along,
+        axis_origin.y + d.y * along,
+        axis_origin.z + d.z * along,
+    );
+    p.distance(&proj)
+}
+
+/// Does a live fingerprint still satisfy the claim recorded at attach time? The
+/// position must coincide within a size-scaled band; any recorded radius/normal
+/// must agree within a relative / angular band. Fields the recorded fingerprint
+/// left `None` are not part of the claim and are not checked.
+fn fingerprint_matches(
+    claim: &crate::labels::Fingerprint,
+    now: &crate::labels::Fingerprint,
+    tol: f64,
+) -> bool {
+    if claim.kind != now.kind {
+        return false;
+    }
+    // Position band: scale with the claimed feature size so a large feature is
+    // not held to an absolute micron, floored at the model tolerance.
+    let scale = claim
+        .radius
+        .map(|r| r.abs())
+        .or_else(|| claim.size.map(|s| s.abs()))
+        .unwrap_or(0.0);
+    let pos_band = (scale * 0.02).max(tol).max(1e-6);
+    let dp = [
+        now.position[0] - claim.position[0],
+        now.position[1] - claim.position[1],
+        now.position[2] - claim.position[2],
+    ];
+    let pos_dist = (dp[0] * dp[0] + dp[1] * dp[1] + dp[2] * dp[2]).sqrt();
+    if pos_dist > pos_band {
+        return false;
+    }
+    // Radius: relative 2% band (floored), only when the claim carries one.
+    if let Some(rc) = claim.radius {
+        match now.radius {
+            Some(rn) => {
+                let band = (rc.abs() * 0.02).max(1e-6);
+                if (rn - rc).abs() > band {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    // Normal: aligned within ~6° (cos 0.994), only when the claim carries one.
+    if let Some(nc) = claim.normal {
+        match now.normal {
+            Some(nn) => {
+                let dot = nc[0] * nn[0] + nc[1] * nn[1] + nc[2] * nn[2];
+                if dot < 0.994 {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
 /// B-Rep model container with all topology stores
 #[derive(Debug)]
 pub struct BRepModel {
@@ -834,10 +908,32 @@ impl BRepModel {
     /// Pin a NAME to a FACE (by its resolved persistent id). The name is the
     /// shared vocabulary; the durable PID is what survives regeneration. Returns
     /// whether the name was created or replaced, or refuses an empty name.
+    ///
+    /// D4 (NO BARE LABELS): attaching BY ID captures the face's geometric
+    /// [`Fingerprint`] as the label's assertion, so the name is justified by a
+    /// claim the kernel can keep proving. To attach BY DESCRIPTION (the selector
+    /// IS the assertion) use [`Self::label_face_with_assertion`].
     pub fn label_face(
         &mut self,
         face: FaceId,
         name: &str,
+        description: Option<String>,
+    ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
+        let assertion = crate::labels::LabelAssertion::Fingerprint(
+            self.face_fingerprint(face)
+                .ok_or(crate::labels::LabelError::Dangling)?,
+        );
+        self.label_face_with_assertion(face, name, assertion, description)
+    }
+
+    /// Pin a NAME to a FACE with an explicit assertion (the selector that found
+    /// it, or a fingerprint). The selector-based form is the Pillar-3 path:
+    /// the selector IS the assertion, re-run on every resolve.
+    pub fn label_face_with_assertion(
+        &mut self,
+        face: FaceId,
+        name: &str,
+        assertion: crate::labels::LabelAssertion,
         description: Option<String>,
     ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
         let pid = self.ensure_face_annotation_key(face);
@@ -848,16 +944,33 @@ impl BRepModel {
                     kind: crate::labels::LabelKind::Face,
                     pid,
                 },
+                assertion: Some(assertion),
                 description,
             },
         )
     }
 
-    /// Pin a NAME to an EDGE (by its resolved persistent id).
+    /// Pin a NAME to an EDGE (by its resolved persistent id). Captures the
+    /// edge's fingerprint as the assertion (see [`Self::label_face`]).
     pub fn label_edge(
         &mut self,
         edge: EdgeId,
         name: &str,
+        description: Option<String>,
+    ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
+        let assertion = crate::labels::LabelAssertion::Fingerprint(
+            self.edge_fingerprint(edge)
+                .ok_or(crate::labels::LabelError::Dangling)?,
+        );
+        self.label_edge_with_assertion(edge, name, assertion, description)
+    }
+
+    /// Pin a NAME to an EDGE with an explicit assertion (selector or fingerprint).
+    pub fn label_edge_with_assertion(
+        &mut self,
+        edge: EdgeId,
+        name: &str,
+        assertion: crate::labels::LabelAssertion,
         description: Option<String>,
     ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
         let pid = self.ensure_edge_annotation_key(edge);
@@ -868,18 +981,24 @@ impl BRepModel {
                     kind: crate::labels::LabelKind::Edge,
                     pid,
                 },
+                assertion: Some(assertion),
                 description,
             },
         )
     }
 
-    /// Pin a NAME to a VERTEX (by its resolved persistent id).
+    /// Pin a NAME to a VERTEX (by its resolved persistent id). Captures the
+    /// vertex's fingerprint (its position) as the assertion.
     pub fn label_vertex(
         &mut self,
         vertex: VertexId,
         name: &str,
         description: Option<String>,
     ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
+        let assertion = crate::labels::LabelAssertion::Fingerprint(
+            self.vertex_fingerprint(vertex)
+                .ok_or(crate::labels::LabelError::Dangling)?,
+        );
         let pid = self.ensure_vertex_label_key(vertex);
         self.labels.attach(
             name,
@@ -888,6 +1007,7 @@ impl BRepModel {
                     kind: crate::labels::LabelKind::Vertex,
                     pid,
                 },
+                assertion: Some(assertion),
                 description,
             },
         )
@@ -909,6 +1029,7 @@ impl BRepModel {
                     origin,
                     normal,
                 }),
+                assertion: None,
                 description,
             },
         )
@@ -1109,6 +1230,546 @@ impl BRepModel {
             .collect()
     }
 
+    // --- LABELLER: assertions, resolve-with-re-verification, proposals ---
+    //
+    // D4 (NO BARE LABELS): every entity label carries an ASSERTION the kernel
+    // can keep PROVING — either the Pillar-3 selector that found it, or the
+    // entity's geometric fingerprint. `resolve_label_*_checked` RE-RUNS the
+    // assertion and reports `Stale` when it no longer holds, instead of silently
+    // re-pointing at a wrong entity.
+
+    /// The representative radius of a face: the cylinder/sphere radius directly,
+    /// or for any other curved surface the perpendicular distance from the
+    /// face's representative point to the surface's axis (revolution radius).
+    /// `None` for a planar face (no radius is part of its identity).
+    fn face_radius(&self, fid: FaceId, position: Point3) -> Option<f64> {
+        use crate::primitives::surface::{Cone, Cylinder, Sphere, Torus};
+        let face = self.faces.get(fid)?;
+        let surf = self.surfaces.get(face.surface_id)?;
+        let any = surf.as_any();
+        if let Some(c) = any.downcast_ref::<Cylinder>() {
+            return Some(c.radius);
+        }
+        if let Some(s) = any.downcast_ref::<Sphere>() {
+            return Some(s.radius);
+        }
+        if let Some(c) = any.downcast_ref::<Cone>() {
+            // Radius at the representative point = distance from it to the axis.
+            return Some(point_to_axis_distance(position, c.apex, c.axis));
+        }
+        if let Some(t) = any.downcast_ref::<Torus>() {
+            return Some(point_to_axis_distance(position, t.center, t.axis));
+        }
+        None
+    }
+
+    /// The geometric IDENTITY of a face: kind, representative point (centroid,
+    /// falling back to boundary mean), outward normal, radius (curved), area.
+    /// Read-only — usable from the `&self` certificate path. `None` if the face
+    /// has no resolvable boundary.
+    pub fn face_fingerprint(&self, fid: FaceId) -> Option<crate::labels::Fingerprint> {
+        let position = self.face_boundary_mean(fid)?;
+        let face = self.faces.get(fid)?;
+        let b = face.uv_bounds;
+        let (u, v) = (0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]));
+        let normal = face
+            .normal_at(u, v, &self.surfaces)
+            .ok()
+            .and_then(|n| n.normalize().ok())
+            .map(|n| [n.x, n.y, n.z]);
+        let radius = self.face_radius(fid, position);
+        Some(crate::labels::Fingerprint {
+            kind: crate::labels::LabelKind::Face,
+            position: [position.x, position.y, position.z],
+            normal,
+            radius,
+            size: None,
+        })
+    }
+
+    /// The geometric IDENTITY of an edge: kind, midpoint, circular radius (if a
+    /// `Circle`/`Arc`), straight-line size (chord length). Read-only.
+    pub fn edge_fingerprint(&self, eid: EdgeId) -> Option<crate::labels::Fingerprint> {
+        use crate::primitives::curve::{Arc, Circle};
+        let edge = self.edges.get(eid)?;
+        let a = self.vertices.get(edge.start_vertex)?.point();
+        let b = self.vertices.get(edge.end_vertex)?.point();
+        let position = [0.5 * (a.x + b.x), 0.5 * (a.y + b.y), 0.5 * (a.z + b.z)];
+        let radius = self.curves.get(edge.curve_id).and_then(|c| {
+            let any = c.as_any();
+            if let Some(circle) = any.downcast_ref::<Circle>() {
+                Some(circle.radius())
+            } else {
+                any.downcast_ref::<Arc>().map(|arc| arc.radius)
+            }
+        });
+        Some(crate::labels::Fingerprint {
+            kind: crate::labels::LabelKind::Edge,
+            position,
+            normal: None,
+            radius,
+            size: Some(a.distance(&b)),
+        })
+    }
+
+    /// The geometric IDENTITY of a vertex: its position. Read-only.
+    pub fn vertex_fingerprint(&self, vid: VertexId) -> Option<crate::labels::Fingerprint> {
+        let p = self.vertices.get(vid)?.point();
+        Some(crate::labels::Fingerprint {
+            kind: crate::labels::LabelKind::Vertex,
+            position: [p.x, p.y, p.z],
+            normal: None,
+            radius: None,
+            size: None,
+        })
+    }
+
+    /// Build a live `FaceQuery` from the serializable selector spec.
+    fn face_query_from_spec(
+        spec: &crate::labels::FaceSelectorSpec,
+    ) -> crate::queries::select::FaceQuery {
+        use crate::queries::select::{Extremal, FaceQuery, SurfaceKind};
+        let surf = match spec.surface.as_str() {
+            "planar" | "plane" => SurfaceKind::Planar,
+            "cylindrical" | "cylinder" => SurfaceKind::Cylindrical,
+            "spherical" | "sphere" => SurfaceKind::Spherical,
+            "conical" | "cone" => SurfaceKind::Conical,
+            "toroidal" | "torus" => SurfaceKind::Toroidal,
+            "nurbs" | "nurbssurface" => SurfaceKind::Nurbs,
+            _ => SurfaceKind::Any,
+        };
+        let along = spec
+            .along
+            .map(|a| Vector3::new(a[0], a[1], a[2]))
+            .unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+        let extremal = match spec.extremal.as_str() {
+            "largest_area" | "largest" => Extremal::LargestArea,
+            "smallest_area" | "smallest" => Extremal::SmallestArea,
+            "most_along" | "topmost" | "furthest" => Extremal::MostAlong(along),
+            _ => Extremal::None,
+        };
+        let mut q = FaceQuery::new(surf);
+        q.normal_dir = spec.normal_dir.map(|n| Vector3::new(n[0], n[1], n[2]));
+        q.angle_tol_deg = spec.angle_tol_deg;
+        q.extremal = extremal;
+        q
+    }
+
+    /// Build a live `EdgeQuery` from the serializable selector spec.
+    fn edge_query_from_spec(
+        spec: &crate::labels::EdgeSelectorSpec,
+    ) -> crate::queries::select::EdgeQuery {
+        use crate::queries::select::{BlendFilter, CurveKind, EdgeExtremal, EdgeQuery};
+        let curve = match spec.curve.as_str() {
+            "line" => CurveKind::Line,
+            "arc" => CurveKind::Arc,
+            "circle" => CurveKind::Circle,
+            "nurbs" => CurveKind::Nurbs,
+            _ => CurveKind::Any,
+        };
+        let blend = match spec.blend.as_str() {
+            "filleted" | "fillet" => BlendFilter::Filleted,
+            "chamfered" | "chamfer" => BlendFilter::Chamfered,
+            "unblended" | "none" => BlendFilter::Unblended,
+            _ => BlendFilter::Any,
+        };
+        let along = spec
+            .along
+            .map(|a| Vector3::new(a[0], a[1], a[2]))
+            .unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+        let extremal = match spec.extremal.as_str() {
+            "longest" => EdgeExtremal::Longest,
+            "shortest" => EdgeExtremal::Shortest,
+            "most_along" | "furthest" => EdgeExtremal::MostAlong(along),
+            _ => EdgeExtremal::None,
+        };
+        let mut q = EdgeQuery::new(curve);
+        q.blend = blend;
+        q.direction = spec.direction.map(|d| Vector3::new(d[0], d[1], d[2]));
+        q.angle_tol_deg = spec.angle_tol_deg;
+        q.extremal = extremal;
+        q
+    }
+
+    /// Does a live face still match a stored fingerprint within tolerance? The
+    /// identity claim: same position (within a size-scaled band), same radius
+    /// (relative band), same normal direction (angular band). Missing fields in
+    /// the fingerprint are not part of the claim.
+    fn face_matches_fingerprint(&self, fid: FaceId, fp: &crate::labels::Fingerprint) -> bool {
+        let Some(now) = self.face_fingerprint(fid) else {
+            return false;
+        };
+        fingerprint_matches(fp, &now, self.tolerance.distance())
+    }
+
+    fn edge_matches_fingerprint(&self, eid: EdgeId, fp: &crate::labels::Fingerprint) -> bool {
+        let Some(now) = self.edge_fingerprint(eid) else {
+            return false;
+        };
+        fingerprint_matches(fp, &now, self.tolerance.distance())
+    }
+
+    fn vertex_matches_fingerprint(&self, vid: VertexId, fp: &crate::labels::Fingerprint) -> bool {
+        let Some(now) = self.vertex_fingerprint(vid) else {
+            return false;
+        };
+        fingerprint_matches(fp, &now, self.tolerance.distance())
+    }
+
+    /// RE-VERIFY a label's assertion against the live geometry (D4). Returns
+    /// `Holds` if the named entity still satisfies the assertion, `Stale`
+    /// otherwise. Read-only (it re-runs the selector / re-matches the
+    /// fingerprint without mutating the model). A section label always `Holds`
+    /// (the plane is its own claim). An unknown name / wrong kind is treated as
+    /// `Stale` — the assertion cannot be confirmed.
+    pub fn verify_label_assertion(&self, name: &str) -> crate::labels::AssertionStatus {
+        use crate::labels::{AssertionStatus, LabelAssertion, LabelKind, LabelTarget};
+        let Some(label) = self.labels.get(name) else {
+            return AssertionStatus::Stale;
+        };
+        let (kind, pid) = match &label.target {
+            LabelTarget::Section(_) => return AssertionStatus::Holds,
+            LabelTarget::Entity { kind, pid } => (*kind, *pid),
+        };
+        let assertion = match &label.assertion {
+            Some(a) => a,
+            // An entity label with no assertion cannot be proven — honest Stale.
+            None => return AssertionStatus::Stale,
+        };
+
+        // The solid this label lives on (needed to re-run a selector). All of a
+        // part's labels reference one solid; pick the one owning the named pid.
+        match assertion {
+            LabelAssertion::Fingerprint(fp) => {
+                let ok = match kind {
+                    LabelKind::Face => self
+                        .pid_to_face
+                        .get(&pid)
+                        .copied()
+                        .is_some_and(|fid| self.face_matches_fingerprint(fid, fp)),
+                    LabelKind::Edge => self
+                        .pid_to_edge
+                        .get(&pid)
+                        .copied()
+                        .is_some_and(|eid| self.edge_matches_fingerprint(eid, fp)),
+                    LabelKind::Vertex => self
+                        .pid_to_vertex
+                        .get(&pid)
+                        .copied()
+                        .is_some_and(|vid| self.vertex_matches_fingerprint(vid, fp)),
+                };
+                if ok {
+                    AssertionStatus::Holds
+                } else {
+                    AssertionStatus::Stale
+                }
+            }
+            LabelAssertion::Selector(_) => {
+                // Re-RUNNING a selector needs `&mut` (the resolver warms a
+                // centroid cache), so the FULL "still resolves to the SAME
+                // entity" check lives in `verify_label_assertion_mut` — that is
+                // the verdict the certificate and `resolve_*_checked` use. On
+                // this read-only path we confirm the NECESSARY condition that
+                // the named entity still exists at all; a deleted entity is
+                // unambiguously `Stale`.
+                let exists = match kind {
+                    LabelKind::Face => self.pid_to_face.contains_key(&pid),
+                    LabelKind::Edge => self.pid_to_edge.contains_key(&pid),
+                    LabelKind::Vertex => false, // no vertex selector
+                };
+                if exists {
+                    AssertionStatus::Holds
+                } else {
+                    AssertionStatus::Stale
+                }
+            }
+        }
+    }
+
+    /// RE-VERIFY a label's assertion with FULL selector re-execution (`&mut` for
+    /// the resolver's centroid cache). For a `Selector` assertion this re-runs
+    /// the exact `queries::select` resolve and confirms it lands on the SAME
+    /// live entity the label names — the strongest form of "the kernel can keep
+    /// proving the name". For a `Fingerprint` assertion it matches as in
+    /// [`Self::verify_label_assertion`]. This is the resolve-time check D4 calls
+    /// for.
+    pub fn verify_label_assertion_mut(&mut self, name: &str) -> crate::labels::AssertionStatus {
+        use crate::labels::{
+            AssertionStatus, LabelAssertion, LabelKind, LabelTarget, SelectorSpec,
+        };
+        let label = match self.labels.get(name) {
+            Some(l) => l.clone(),
+            None => return AssertionStatus::Stale,
+        };
+        let (kind, pid) = match &label.target {
+            LabelTarget::Section(_) => return AssertionStatus::Holds,
+            LabelTarget::Entity { kind, pid } => (*kind, *pid),
+        };
+        let assertion = match &label.assertion {
+            Some(a) => a,
+            None => return AssertionStatus::Stale,
+        };
+        match assertion {
+            LabelAssertion::Fingerprint(_) => self.verify_label_assertion(name),
+            LabelAssertion::Selector(spec) => {
+                let Some(solid) = self.solid_owning_entity(kind, pid) else {
+                    return AssertionStatus::Stale;
+                };
+                match (kind, spec) {
+                    (LabelKind::Face, SelectorSpec::Face(s)) => {
+                        let live = match self.pid_to_face.get(&pid).copied() {
+                            Some(f) => f,
+                            None => return AssertionStatus::Stale,
+                        };
+                        let q = Self::face_query_from_spec(s);
+                        match crate::queries::select::resolve_face(self, solid, &q) {
+                            Ok(found) if found == live => AssertionStatus::Holds,
+                            _ => AssertionStatus::Stale,
+                        }
+                    }
+                    (LabelKind::Edge, SelectorSpec::Edge(s)) => {
+                        let live = match self.pid_to_edge.get(&pid).copied() {
+                            Some(e) => e,
+                            None => return AssertionStatus::Stale,
+                        };
+                        let q = Self::edge_query_from_spec(s);
+                        match crate::queries::select::resolve_edge(self, solid, &q) {
+                            Ok(found) if found == live => AssertionStatus::Holds,
+                            _ => AssertionStatus::Stale,
+                        }
+                    }
+                    _ => AssertionStatus::Stale,
+                }
+            }
+        }
+    }
+
+    /// Resolve a FACE label to a live id AND re-verify its assertion (D4). On
+    /// success the assertion still holds; `Err(Stale)` (mapped to the
+    /// label-error `Dangling`-adjacent `Stale` via the returned status) means
+    /// the name's claim broke. Returns `(FaceId, AssertionStatus)` so the caller
+    /// can act on a `Stale` honestly rather than trusting a drifted id.
+    pub fn resolve_label_face_checked(
+        &mut self,
+        name: &str,
+    ) -> Result<(FaceId, crate::labels::AssertionStatus), crate::labels::LabelError> {
+        let fid = self.resolve_label_face(name)?;
+        let status = self.verify_label_assertion_mut(name);
+        Ok((fid, status))
+    }
+
+    /// Resolve an EDGE label to a live id AND re-verify its assertion (D4).
+    pub fn resolve_label_edge_checked(
+        &mut self,
+        name: &str,
+    ) -> Result<(EdgeId, crate::labels::AssertionStatus), crate::labels::LabelError> {
+        let eid = self.resolve_label_edge(name)?;
+        let status = self.verify_label_assertion_mut(name);
+        Ok((eid, status))
+    }
+
+    /// Which solid owns the entity with this persistent id (the solid one of
+    /// whose shells contains the live entity). `None` if the pid no longer
+    /// resolves or no owning solid is found.
+    fn solid_owning_entity(
+        &self,
+        kind: crate::labels::LabelKind,
+        pid: crate::primitives::persistent_id::PersistentId,
+    ) -> Option<SolidId> {
+        use crate::labels::LabelKind;
+        let target_face = match kind {
+            LabelKind::Face => self.pid_to_face.get(&pid).copied(),
+            _ => None,
+        };
+        let target_edge = match kind {
+            LabelKind::Edge => self.pid_to_edge.get(&pid).copied(),
+            _ => None,
+        };
+        let sids: Vec<SolidId> = self.solids.iter().map(|(sid, _)| sid).collect();
+        for sid in sids {
+            let solid = match self.solids.get(sid) {
+                Some(s) => s,
+                None => continue,
+            };
+            for sh in solid.shell_ids() {
+                let shell = match self.shells.get(sh) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                for &fid in &shell.faces {
+                    if Some(fid) == target_face {
+                        return Some(sid);
+                    }
+                    if let Some(te) = target_edge {
+                        if let Some(face) = self.faces.get(fid) {
+                            let mut lids = vec![face.outer_loop];
+                            lids.extend_from_slice(&face.inner_loops);
+                            for lid in lids {
+                                if let Some(lp) = self.loops.get(lid) {
+                                    if lp.edges.contains(&te) {
+                                        return Some(sid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// D4 — the labels-consistency verdict for the whole part: re-verify EVERY
+    /// label's assertion. `Consistent` when all hold, `Inconsistent` when any is
+    /// stale, `NotApplicable` when there are no labels. A label is an annotation,
+    /// NOT a geometric defect, so `Inconsistent` does NOT force `is_sound` false
+    /// — it is its own honest flag on the certificate (the frontend renders a
+    /// stale label amber). `&mut` for the selector re-run's centroid cache.
+    pub fn labels_consistency(&mut self) -> crate::primitives::provenance::LabelsConsistency {
+        use crate::labels::AssertionStatus;
+        use crate::primitives::provenance::LabelsConsistency;
+        if self.labels.is_empty() {
+            return LabelsConsistency::NotApplicable;
+        }
+        let names: Vec<String> = self.labels.iter().map(|(n, _)| n.to_string()).collect();
+        let mut any = false;
+        for name in names {
+            any = true;
+            if self.verify_label_assertion_mut(&name) == AssertionStatus::Stale {
+                return LabelsConsistency::Inconsistent;
+            }
+        }
+        if any {
+            LabelsConsistency::Consistent
+        } else {
+            LabelsConsistency::NotApplicable
+        }
+    }
+
+    /// D3 — AUTO-PROPOSE labels: recognize features on a solid and SUGGEST a
+    /// name + the ASSERTION that pins it, WITHOUT applying. The user owns the
+    /// name; confirming = `label_*_with_assertion` with this exact assertion, so
+    /// the kernel owns the claim. Proposals are deterministic (name-stable) and
+    /// only emitted when the recognizer actually resolves a single entity.
+    ///
+    /// Recognizers:
+    /// * `throat`   — the smallest-area cylindrical wall (min-radius bore).
+    /// * `exit`     — the planar cap whose outward normal points most +Z (the
+    ///                downstream / max-axial cap).
+    /// * `chamber`  — the largest-area cylindrical barrel (max-radius wall).
+    /// * `hole_*`   — each cylindrical INNER face (a bore in a cap).
+    /// * `fillet_*` — each constant-radius filleted edge.
+    pub fn propose_labels(&mut self, solid: SolidId) -> Vec<crate::labels::LabelProposal> {
+        use crate::labels::{
+            EdgeSelectorSpec, FaceSelectorSpec, LabelAssertion, LabelProposal, SelectorSpec,
+        };
+        use crate::queries::select::{
+            resolve_edge, resolve_face, BlendFilter, CurveKind, EdgeQuery, Extremal, FaceQuery,
+            SurfaceKind,
+        };
+        let mut out: Vec<LabelProposal> = Vec::new();
+
+        let face_spec =
+            |surface: &str, extremal: &str, normal_dir: Option<[f64; 3]>| FaceSelectorSpec {
+                surface: surface.to_string(),
+                normal_dir,
+                angle_tol_deg: 12.0,
+                extremal: extremal.to_string(),
+                along: None,
+            };
+
+        // throat = smallest-area cylindrical wall (the min-radius bore).
+        let throat_q = FaceQuery::new(SurfaceKind::Cylindrical).extremal(Extremal::SmallestArea);
+        if resolve_face(self, solid, &throat_q).is_ok() {
+            out.push(LabelProposal {
+                suggested_name: "throat".to_string(),
+                kind: "face",
+                assertion: LabelAssertion::Selector(SelectorSpec::Face(face_spec(
+                    "cylindrical",
+                    "smallest_area",
+                    None,
+                ))),
+                confidence: 0.8,
+                rationale: "smallest-area cylindrical wall (minimum-radius bore)".to_string(),
+            });
+        }
+
+        // chamber = largest-area cylindrical barrel.
+        let chamber_q = FaceQuery::new(SurfaceKind::Cylindrical).extremal(Extremal::LargestArea);
+        if let Ok(chamber_fid) = resolve_face(self, solid, &chamber_q) {
+            // Only distinct from throat when there is more than one cylinder.
+            let throat_fid = resolve_face(self, solid, &throat_q).ok();
+            if throat_fid != Some(chamber_fid) {
+                out.push(LabelProposal {
+                    suggested_name: "chamber".to_string(),
+                    kind: "face",
+                    assertion: LabelAssertion::Selector(SelectorSpec::Face(face_spec(
+                        "cylindrical",
+                        "largest_area",
+                        None,
+                    ))),
+                    confidence: 0.7,
+                    rationale: "largest-area cylindrical barrel (maximum-radius wall)".to_string(),
+                });
+            }
+        }
+
+        // exit = the planar cap whose outward normal points downstream (+Z) —
+        // the max-axial cap. Matched by the +Z-facing filter (the same selector
+        // the labeller gate uses); when two caps face +Z, break the tie by the
+        // one farthest along +Z.
+        let exit_q = FaceQuery::new(SurfaceKind::Planar).facing(Vector3::new(0.0, 0.0, 1.0));
+        let exit_q_tiebreak = FaceQuery::new(SurfaceKind::Planar)
+            .facing(Vector3::new(0.0, 0.0, 1.0))
+            .extremal(Extremal::MostAlong(Vector3::new(0.0, 0.0, 1.0)));
+        if resolve_face(self, solid, &exit_q).is_ok()
+            || resolve_face(self, solid, &exit_q_tiebreak).is_ok()
+        {
+            // Prefer the bare +Z-facing assertion when it is unambiguous, else
+            // carry the tie-broken one so confirming always re-resolves single.
+            let unambiguous = resolve_face(self, solid, &exit_q).is_ok();
+            let (extremal, along) = if unambiguous {
+                ("none".to_string(), None)
+            } else {
+                ("most_along".to_string(), Some([0.0, 0.0, 1.0]))
+            };
+            out.push(LabelProposal {
+                suggested_name: "exit".to_string(),
+                kind: "face",
+                assertion: LabelAssertion::Selector(SelectorSpec::Face(FaceSelectorSpec {
+                    surface: "planar".to_string(),
+                    normal_dir: Some([0.0, 0.0, 1.0]),
+                    angle_tol_deg: 12.0,
+                    extremal,
+                    along,
+                })),
+                confidence: 0.65,
+                rationale: "downstream planar cap (outward normal points +Z)".to_string(),
+            });
+        }
+
+        // fillet = a single constant-radius filleted edge, if exactly one.
+        let fillet_q = EdgeQuery::new(CurveKind::Any).blend(BlendFilter::Filleted);
+        if resolve_edge(self, solid, &fillet_q).is_ok() {
+            out.push(LabelProposal {
+                suggested_name: "fillet".to_string(),
+                kind: "edge",
+                assertion: LabelAssertion::Selector(SelectorSpec::Edge(EdgeSelectorSpec {
+                    curve: "any".to_string(),
+                    blend: "filleted".to_string(),
+                    direction: None,
+                    angle_tol_deg: 12.0,
+                    extremal: "none".to_string(),
+                    along: None,
+                })),
+                confidence: 0.6,
+                rationale: "constant-radius filleted edge".to_string(),
+            });
+        }
+
+        out
+    }
+
     /// Set the stable key of the operation currently being applied (the timeline
     /// event id), so root persistent-ids derive deterministically across replays.
     /// The orchestration / replay layer sets this before each op and clears it
@@ -1267,8 +1928,13 @@ impl BRepModel {
     /// (`validate_solid_scoped`) + watertight/manifold/Euler from the tessellated
     /// mesh (`manifold_report`). This is the kernel's own verdict — the agent
     /// cannot fake it.
+    ///
+    /// `&mut self` because computing the D4 `labels_consistent` flag re-runs
+    /// each label's Pillar-3 selector, and `queries::select::resolve_*` warms a
+    /// per-face centroid cache (the same `&mut` contract the readable query path
+    /// uses). The geometry itself is never mutated.
     pub fn certify_solid(
-        &self,
+        &mut self,
         solid_id: SolidId,
     ) -> crate::primitives::provenance::ValidityCertificate {
         use crate::primitives::provenance::ValidityCertificate;
@@ -1293,6 +1959,10 @@ impl BRepModel {
         // geometry (source sketch) still co-located with the solid? Tri-state,
         // and NotApplicable when no sketch is linked (does not block soundness).
         let construction_consistent = self.construction_consistency(solid_id);
+        // D4 — labels consistency: re-verify every label's assertion. An
+        // annotation defect, not a geometric one — does NOT touch `is_sound`.
+        let labels_consistent = self.labels_consistency();
+        let errors = v.errors.iter().map(|e| format!("{e:?}")).collect();
         ValidityCertificate {
             brep_valid: v.is_valid,
             watertight,
@@ -1302,21 +1972,27 @@ impl BRepModel {
             nonmanifold_edges: nm,
             self_intersection_free,
             construction_consistent,
-            errors: v.errors.iter().map(|e| format!("{e:?}")).collect(),
+            labels_consistent,
+            errors,
         }
     }
 
     /// The kernel's ground-truth answer for a solid: provenance + computed
     /// certificate. `None` if the solid does not exist. PILLAR 1.
+    ///
+    /// `&mut self` for the same reason as [`Self::certify_solid`] (the D4 labels
+    /// flag re-runs Pillar-3 selectors, which warm the centroid cache).
     pub fn ground_truth(
-        &self,
+        &mut self,
         solid_id: SolidId,
     ) -> Option<crate::primitives::provenance::GroundTruth> {
         self.solids.get(solid_id)?;
+        let provenance = self.solid_provenance.get(&solid_id).cloned();
+        let certificate = self.certify_solid(solid_id);
         Some(crate::primitives::provenance::GroundTruth {
             solid_id,
-            provenance: self.solid_provenance.get(&solid_id).cloned(),
-            certificate: self.certify_solid(solid_id),
+            provenance,
+            certificate,
         })
     }
 

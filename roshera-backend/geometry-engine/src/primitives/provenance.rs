@@ -189,6 +189,35 @@ impl ConstructionConsistency {
     }
 }
 
+/// Tri-state verdict on whether a part's LABELS are all still consistent with
+/// the geometry (D4). Computed by re-verifying every label's assertion (the
+/// selector still resolves to the SAME entity, or the entity still matches the
+/// captured fingerprint).
+///
+/// * `Consistent` — every label's assertion still holds.
+/// * `Inconsistent` — at least one label is STALE (its selector now finds
+///   nothing / a different entity, or no live entity matches its fingerprint).
+///   Per D4 this is an ANNOTATION defect, NOT a geometric one: it does NOT
+///   force `is_sound() == false` — it is its own honest flag.
+/// * `NotApplicable` — the part has no labels (nothing to check).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelsConsistency {
+    Consistent,
+    Inconsistent,
+    NotApplicable,
+}
+
+impl LabelsConsistency {
+    /// Short agent-facing label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            LabelsConsistency::Consistent => "consistent",
+            LabelsConsistency::Inconsistent => "inconsistent",
+            LabelsConsistency::NotApplicable => "not_applicable",
+        }
+    }
+}
+
 /// The kernel's COMPUTED verdict on a solid — never written by the caller.
 /// `is_sound()` is the honest "this is a real, closed, manufacturable solid"
 /// gate: a valid B-Rep that is watertight and manifold.
@@ -213,6 +242,12 @@ pub struct ValidityCertificate {
     /// Tri-state — `NotApplicable` when no sketch is linked, and it does NOT
     /// affect soundness in that case (a bare primitive stays sound).
     pub construction_consistent: ConstructionConsistency,
+    /// D4 — labels consistency: are all the part's labels still backed by a
+    /// holding assertion? Tri-state, `NotApplicable` when the part has no
+    /// labels. A label is an ANNOTATION, not a geometric feature, so an
+    /// `Inconsistent` verdict does NOT affect `is_sound()` — it is its own
+    /// honest flag the agent/frontend can surface (stale labels rendered amber).
+    pub labels_consistent: LabelsConsistency,
     /// B-Rep validation errors (stringified), empty when `brep_valid`.
     pub errors: Vec<String>,
 }
@@ -245,7 +280,7 @@ impl GroundTruth {
             .map(|p| p.created_by.label())
             .unwrap_or_else(|| "unrecorded".into());
         format!(
-            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} euler={} construction={})",
+            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} euler={} construction={} labels={})",
             self.solid_id,
             origin,
             self.provenance
@@ -258,6 +293,7 @@ impl GroundTruth {
             self.certificate.manifold,
             self.certificate.euler_characteristic,
             self.certificate.construction_consistent.label(),
+            self.certificate.labels_consistent.label(),
         )
     }
 }

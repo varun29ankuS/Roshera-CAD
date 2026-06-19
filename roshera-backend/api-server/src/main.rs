@@ -7318,6 +7318,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::resolve_label),
         )
         .route(
+            "/api/agent/parts/{id}/propose-labels",
+            get(handlers::agent::propose_labels),
+        )
+        .route(
             "/api/agent/parts/{id}/faces/{face_id}/tolerance",
             post(handlers::agent::attach_face_tolerance),
         )

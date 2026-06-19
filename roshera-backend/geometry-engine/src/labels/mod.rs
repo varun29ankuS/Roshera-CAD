@@ -102,12 +102,120 @@ impl LabelTarget {
     }
 }
 
-/// One label: its target plus an optional human description (free text the
-/// agent/user attached, e.g. "minimum-area throat of the nozzle").
+/// A serializable mirror of a `queries::select::FaceQuery` — the descriptive
+/// claim "the face that means X" (e.g. the smallest-area cylindrical wall is the
+/// throat). Stored on a label as its ASSERTION so `resolve()` can RE-RUN the
+/// selector and confirm the same face still satisfies it (or report `Stale`).
+///
+/// Decoupled from `queries::select` (which is not serde) by mirroring its fields
+/// as primitives; `topology_builder` rebuilds the live `FaceQuery` from this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaceSelectorSpec {
+    /// Surface-kind tag: `any|planar|cylindrical|spherical|conical|toroidal|nurbs`.
+    pub surface: String,
+    /// Optional required outward-normal direction.
+    pub normal_dir: Option<[f64; 3]>,
+    pub angle_tol_deg: f64,
+    /// Extremal tag: `none|largest_area|smallest_area|most_along`.
+    pub extremal: String,
+    /// Direction for the `most_along` extremal.
+    pub along: Option<[f64; 3]>,
+}
+
+/// A serializable mirror of a `queries::select::EdgeQuery`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeSelectorSpec {
+    /// Curve-kind tag: `any|line|arc|circle|nurbs`.
+    pub curve: String,
+    /// Blend-state tag: `any|filleted|chamfered|unblended`.
+    pub blend: String,
+    pub direction: Option<[f64; 3]>,
+    pub angle_tol_deg: f64,
+    /// Extremal tag: `none|longest|shortest|most_along`.
+    pub extremal: String,
+    pub along: Option<[f64; 3]>,
+}
+
+/// A descriptive selector assertion — the Pillar-3 claim that picks the entity
+/// out by MEANING. Carried verbatim so `resolve()` re-runs the exact selector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SelectorSpec {
+    Face(FaceSelectorSpec),
+    Edge(EdgeSelectorSpec),
+}
+
+/// The GEOMETRIC IDENTITY of the entity a label was pinned to, captured at
+/// attach time. `resolve()` re-derives the named entity's geometry and confirms
+/// it still matches this fingerprint within tolerance, else reports `Stale`.
+///
+/// Every field beyond `kind`/`position` is optional because not every entity
+/// kind has it (a planar face has no radius; a straight edge has no radius);
+/// `None` means "not part of the identity claim".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Fingerprint {
+    pub kind: LabelKind,
+    /// World-space representative point (face centroid / edge midpoint / vertex
+    /// position).
+    pub position: [f64; 3],
+    /// Representative outward normal (faces only).
+    pub normal: Option<[f64; 3]>,
+    /// Representative radius (curved faces / circular edges).
+    pub radius: Option<f64>,
+    /// Representative size (face area / edge length) — a coarse identity signal.
+    pub size: Option<f64>,
+}
+
+/// The ASSERTION every label MUST carry (D4: no bare labels). It is the claim
+/// the kernel can keep PROVING: either the descriptive `Selector` that picked
+/// the entity out, or the `Fingerprint` geometric identity captured at attach.
+///
+/// A label is a NAME bound to an assertion the kernel re-verifies on resolve —
+/// not a silent pointer that can drift onto the wrong entity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LabelAssertion {
+    /// "the entity that satisfies this description" — re-run the selector.
+    Selector(SelectorSpec),
+    /// "the entity with this geometric identity" — re-match the fingerprint.
+    Fingerprint(Fingerprint),
+}
+
+/// One label: its target, the ASSERTION that justifies the name (D4 — required;
+/// the kernel re-verifies it on resolve), plus an optional human description.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Label {
     pub target: LabelTarget,
+    /// The identity claim. `None` ONLY for a `Section` label (a named plane is
+    /// its own claim — the plane IS the assertion); an `Entity` label MUST have
+    /// `Some` assertion (enforced by [`LabelSidecar::attach`]).
+    pub assertion: Option<LabelAssertion>,
     pub description: Option<String>,
+}
+
+/// The verdict of re-verifying a label's assertion at resolve time. Distinct
+/// from [`LabelError`] (which is about whether the NAME / kind is even valid):
+/// `Stale` means the name and kind are fine but the assertion no longer holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssertionStatus {
+    /// The assertion still holds — the entity it picks out is unchanged.
+    Holds,
+    /// The assertion no longer holds: the selector now finds nothing / a
+    /// different entity, or no live entity matches the fingerprint within tol.
+    /// The kernel reports this honestly rather than silently re-pointing.
+    Stale,
+}
+
+/// One auto-recognized feature SUGGESTION (D3). The kernel recognizes a feature
+/// and proposes a NAME + the ASSERTION that pins it — but does NOT apply it. The
+/// user owns the name; confirming = `label_create` with this exact assertion, so
+/// the kernel owns the claim. `confidence` is a 0..1 heuristic strength.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelProposal {
+    pub suggested_name: String,
+    pub kind: &'static str,
+    pub assertion: LabelAssertion,
+    pub confidence: f64,
+    /// One-line human rationale ("smallest-radius cylindrical wall").
+    pub rationale: String,
 }
 
 /// Why a label operation refused. The kernel never guesses — an unknown name,
@@ -123,6 +231,10 @@ pub enum LabelError {
     /// topology it named was deleted/regenerated away). Honest "I had it, it's
     /// gone" rather than a silent wrong answer.
     Dangling,
+    /// D4 — NO BARE LABELS: an `Entity` label was offered with no assertion.
+    /// A name must carry the claim that justifies it (selector or fingerprint),
+    /// so the kernel can keep proving it. Refused, never stored bare.
+    MissingAssertion,
 }
 
 /// Outcome of [`LabelSidecar::attach`]: whether the name was newly created or
@@ -167,8 +279,15 @@ impl LabelSidecar {
     /// Attach (or replace) a label. The name must be non-empty (validated);
     /// re-using a name REPLACES the existing label and reports
     /// [`AttachOutcome::Replaced`] so the caller never silently shadows a name.
+    ///
+    /// D4 (NO BARE LABELS): an `Entity` label MUST carry an assertion — a name
+    /// with none is refused with [`LabelError::MissingAssertion`]. A `Section`
+    /// label needs none (the plane is its own claim).
     pub fn attach(&mut self, name: &str, label: Label) -> Result<AttachOutcome, LabelError> {
         let key = Self::validate_name(name)?.to_string();
+        if matches!(label.target, LabelTarget::Entity { .. }) && label.assertion.is_none() {
+            return Err(LabelError::MissingAssertion);
+        }
         let outcome = if self.labels.contains_key(&key) {
             AttachOutcome::Replaced
         } else {
@@ -219,12 +338,23 @@ impl LabelSidecar {
 mod tests {
     use super::*;
 
+    fn fp(kind: LabelKind) -> LabelAssertion {
+        LabelAssertion::Fingerprint(Fingerprint {
+            kind,
+            position: [0.0, 0.0, 0.0],
+            normal: None,
+            radius: None,
+            size: None,
+        })
+    }
+
     fn face_label(pid: PersistentId) -> Label {
         Label {
             target: LabelTarget::Entity {
                 kind: LabelKind::Face,
                 pid,
             },
+            assertion: Some(fp(LabelKind::Face)),
             description: None,
         }
     }
@@ -275,6 +405,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_entity_label_refused() {
+        // D4: an Entity label with no assertion is refused, never stored bare.
+        let mut s = LabelSidecar::new();
+        let bare = Label {
+            target: LabelTarget::Entity {
+                kind: LabelKind::Face,
+                pid: PersistentId::root(b"x"),
+            },
+            assertion: None,
+            description: None,
+        };
+        assert_eq!(s.attach("throat", bare), Err(LabelError::MissingAssertion));
+        assert!(s.is_empty(), "bare label was not stored");
+    }
+
+    #[test]
     fn section_label_stores_plane() {
         let mut s = LabelSidecar::new();
         let plane = SectionPlane {
@@ -285,6 +431,7 @@ mod tests {
             "midspan",
             Label {
                 target: LabelTarget::Section(plane),
+                assertion: None,
                 description: Some("cut at z=5".into()),
             },
         )
@@ -328,6 +475,7 @@ mod tests {
                     kind: LabelKind::Face,
                     pid: PersistentId::root(b"throat"),
                 },
+                assertion: Some(fp(LabelKind::Face)),
                 description: Some("min area".into()),
             },
         )
@@ -339,6 +487,7 @@ mod tests {
                     origin: Point3::ORIGIN,
                     normal: Vector3::new(1.0, 0.0, 0.0),
                 }),
+                assertion: None,
                 description: None,
             },
         )
