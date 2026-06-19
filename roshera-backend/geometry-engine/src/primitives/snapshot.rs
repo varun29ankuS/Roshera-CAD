@@ -96,6 +96,9 @@ pub struct ModelSnapshot {
     pid_to_face: HashMap<PersistentId, FaceId>,
     pid_to_solid: HashMap<PersistentId, SolidId>,
     root_counter: u64,
+    /// GD&T annotation sidecar. Keyed by persistent id (also snapshotted), so a
+    /// rolled-back op that authored a tolerance is undone with the geometry.
+    gdt: crate::gdt::sidecar::GdtSidecar,
 }
 
 impl ModelSnapshot {
@@ -133,6 +136,7 @@ impl ModelSnapshot {
             pid_to_face: model.pid_to_face.clone(),
             pid_to_solid: model.pid_to_solid.clone(),
             root_counter: model.root_counter,
+            gdt: model.gdt.clone(),
         }
     }
 
@@ -164,6 +168,7 @@ impl ModelSnapshot {
         model.pid_to_face = self.pid_to_face;
         model.pid_to_solid = self.pid_to_solid;
         model.root_counter = self.root_counter;
+        model.gdt = self.gdt;
     }
 }
 
