@@ -3498,6 +3498,132 @@ async fn create_revolve_primitive(
     })))
 }
 
+/// POST /api/geometry/import_step — reconstruct B-Rep solids from a STEP
+/// (ISO 10303-21) exchange structure supplied inline and splice them
+/// into the live session model.
+///
+/// Request: `{ "content": "ISO-10303-21;…", "name"?: "label" }`.
+/// `content` is the full text of a STEP file (AP203 / AP214 / AP242).
+///
+/// Mirrors the export endpoint's shape: the geometry kernel
+/// reconstructs a genuine shared B-Rep via the phased import handlers
+/// (`export_engine::formats::step`), every materialised solid is
+/// validated (`validate_solid_scoped`, folded into `report.ok`), then
+/// each solid is merged into the live `BRepModel`, registered with a
+/// fresh object UUID, tessellated, and broadcast to viewport clients —
+/// exactly as `create_*` primitives are. The structured
+/// [`export_engine::ImportReport`] is returned verbatim so the agent
+/// sees the reconstruct-coverage matrix and any unsupported entities.
+async fn import_step_geometry(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let content = payload
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::missing_field("content (STEP file text)"))?;
+    let base_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Reconstruct into a fresh model + honest report. This is a pure CPU
+    // pass (parse → dispatch → validate); no file I/O.
+    let (imported, report) = state
+        .export_engine
+        .import_step_content(content, "api:/api/geometry/import_step")
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("STEP import failed: {e:?}"),
+            )
+        })?;
+
+    if imported.solids.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "STEP file produced no solids (roots_resolved={}, unsupported entities: {:?})",
+                report.roots_resolved, report.counts.unsupported
+            ),
+        ));
+    }
+
+    // Splice the reconstructed solids into the live session model,
+    // remapping ids so they don't collide with existing parts.
+    let new_solid_ids: Vec<u32> = {
+        let mut model = model_handle.write().await;
+        export_engine::formats::step::merge_solids_into(&mut model, &imported)
+    };
+
+    // Register + broadcast each new solid exactly like a primitive create.
+    let mut objects = Vec::with_capacity(new_solid_ids.len());
+    for (i, &solid_id) in new_solid_ids.iter().enumerate() {
+        let tri_mesh = {
+            let model = model_handle.read().await;
+            match model.solids.get(solid_id) {
+                Some(solid) => tessellate_solid(solid, &model, &TessellationParams::default()),
+                None => continue,
+            }
+        };
+        let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+        let object_uuid = Uuid::new_v4();
+        let id_str = object_uuid.to_string();
+        state.register_id_mapping(object_uuid, solid_id);
+
+        let name = match &base_name {
+            Some(b) if new_solid_ids.len() == 1 => b.clone(),
+            Some(b) => format!("{b} {}", i + 1),
+            None => format!("Imported {solid_id}"),
+        };
+        let parameters = serde_json::json!({ "source": "step_import", "index": i });
+        broadcast_object_created(
+            &id_str,
+            &name,
+            solid_id,
+            "import_step",
+            &parameters,
+            &vertices,
+            &indices,
+            &normals,
+            &face_ids,
+            [0.0, 0.0, 0.0],
+        );
+
+        let perception = {
+            let model = model_handle.read().await;
+            perception_json(&model, solid_id, &tri_mesh)
+        };
+        objects.push(serde_json::json!({
+            "id":         id_str,
+            "name":       name,
+            "solid_id":   solid_id,
+            "objectType": "import_step",
+            "perception": perception,
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": report.ok,
+        "objects": objects,
+        "report": report,
+    })))
+}
+
 /// POST /api/geometry/nurbs_loft — skin a watertight NURBS solid through a stack
 /// of cross-section rings. The lateral wall is a single freeform NURBS surface
 /// (`GeneralNurbsSurface`) interpolated through the sections; at the default
@@ -6702,6 +6828,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/geometry/nurbs_loft",
             post(create_nurbs_loft_primitive).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/import_step",
+            post(import_step_geometry).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_create_geometry,
             )),
         )

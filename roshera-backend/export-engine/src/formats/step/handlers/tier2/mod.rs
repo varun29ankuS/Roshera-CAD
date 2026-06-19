@@ -45,9 +45,15 @@ use crate::formats::step::dispatch::EntityDispatch;
 
 pub mod analytic;
 pub mod bspline;
+pub mod complex;
+pub mod swept;
 
 /// Register every tier-2 entity handler into `dispatch`.
 pub fn register(dispatch: &mut EntityDispatch) {
     bspline::register(dispatch);
     analytic::register(dispatch);
+    swept::register(dispatch);
+    // `complex` has no name-keyed handler: complex (sub-super) instances
+    // are routed directly by the dispatcher / lazy resolver via
+    // `complex::try_build_complex`, not through the name table.
 }

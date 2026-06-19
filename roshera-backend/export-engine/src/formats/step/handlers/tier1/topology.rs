@@ -216,8 +216,29 @@ impl EntityHandler for EdgeCurveHandler {
         };
 
         // Force the underlying geometry record to be dispatched so the
-        // template is in step_lines / step_circles.
-        let _ = ensure_resolved(geom_ref, &["LINE", "CIRCLE"], registry, dispatch, ctx);
+        // template is in step_lines / step_circles, or — for free-form
+        // edges — the kernel curve is in `caches.curves`. The edge
+        // geometry may be a LINE, CIRCLE, ELLIPSE, a (simple or rational)
+        // B-spline curve, or a trimmed/composite curve. We pass the full
+        // accepted set; the resolver only dispatches the one whose name
+        // matches, and complex (rational) B-splines dispatch through the
+        // dispatcher's `Complex` arm.
+        let _ = ensure_resolved(
+            geom_ref,
+            &[
+                "LINE",
+                "CIRCLE",
+                "ELLIPSE",
+                "B_SPLINE_CURVE_WITH_KNOTS",
+                "BOUNDED_CURVE",
+                "B_SPLINE_CURVE",
+                "RATIONAL_B_SPLINE_CURVE",
+                "CURVE",
+            ],
+            registry,
+            dispatch,
+            ctx,
+        );
 
         // Vertex positions for curve construction + snap-check.
         let start_pos = match ctx.model.vertices.get_position(start_vid) {
@@ -237,38 +258,73 @@ impl EntityHandler for EdgeCurveHandler {
             }
         };
 
-        // Dispatch on the underlying geometry template.
-        let curve_box: Box<dyn Curve> = if let Some(line_geom) =
-            ctx.caches.step_lines.get(&geom_ref).copied()
-        {
-            build_line_curve(line_geom, start_pos, end_pos)
-        } else if let Some(circle_geom) = ctx.caches.step_circles.get(&geom_ref).copied() {
-            match build_circle_curve(circle_geom, start_pos, end_pos, instance, ctx) {
-                Some(c) => c,
-                None => {
-                    return HandlerOutcome::Failed {
-                        message: "kernel rejected circle/arc".into(),
+        // Dispatch on the underlying geometry template. LINE and CIRCLE
+        // are per-edge instantiated (one STEP template shared by many
+        // edges → a fresh kernel curve sized to this edge's vertices).
+        // A free-form edge instead references a fully-realised kernel
+        // curve already in `caches.curves` (a B-spline/NURBS curve, simple
+        // or rational, materialised by the tier-2 B-spline handler or the
+        // complex-entity dispatch path). For those we clone the kernel
+        // curve and adopt its native parameter range. `edge_param_range`
+        // carries the per-curve domain so the `Edge` is parameterised
+        // consistently with its backing curve.
+        let mut edge_param_range = ParameterRange::unit();
+        let curve_box: Box<dyn Curve> =
+            if let Some(line_geom) = ctx.caches.step_lines.get(&geom_ref).copied() {
+                build_line_curve(line_geom, start_pos, end_pos)
+            } else if let Some(circle_geom) = ctx.caches.step_circles.get(&geom_ref).copied() {
+                match build_circle_curve(circle_geom, start_pos, end_pos, instance, ctx) {
+                    Some(c) => c,
+                    None => {
+                        return HandlerOutcome::Failed {
+                            message: "kernel rejected circle/arc".into(),
+                        }
                     }
                 }
-            }
-        } else {
-            ctx.report.push_warning(Warning {
-                severity: Severity::Warn,
-                entity: names::EDGE_CURVE.into(),
-                instance: Some(instance),
-                message: format!(
-                    "edge_geometry #{geom_ref} did not resolve to a tier-1 LINE or CIRCLE; tier-2 (NURBS) is not yet supported"
-                ),
-            });
-            return HandlerOutcome::Failed {
-                message: "unsupported edge_geometry".into(),
+            } else if let Some(curve_id) = ctx.caches.curves.get(&geom_ref).copied() {
+                // Free-form edge backed by an already-materialised kernel
+                // curve (B-spline / NURBS). Clone it so this edge owns an
+                // independent curve instance and preserve its native domain.
+                match ctx.model.curves.get(curve_id) {
+                    Some(c) => {
+                        edge_param_range = c.parameter_range();
+                        c.clone_box()
+                    }
+                    None => {
+                        ctx.report.push_warning(Warning {
+                            severity: Severity::Warn,
+                            entity: names::EDGE_CURVE.into(),
+                            instance: Some(instance),
+                            message: format!(
+                                "edge_geometry #{geom_ref} cached a curve id absent from the model"
+                            ),
+                        });
+                        return HandlerOutcome::Failed {
+                            message: "edge curve id dangling".into(),
+                        };
+                    }
+                }
+            } else {
+                ctx.report.push_warning(Warning {
+                    severity: Severity::Warn,
+                    entity: names::EDGE_CURVE.into(),
+                    instance: Some(instance),
+                    message: format!(
+                        "edge_geometry #{geom_ref} did not resolve to a supported curve \
+                     (LINE / CIRCLE / B_SPLINE_CURVE_WITH_KNOTS / rational B-spline)"
+                    ),
+                });
+                return HandlerOutcome::Failed {
+                    message: "unsupported edge_geometry".into(),
+                };
             };
-        };
 
         // Per-edge snap check between the curve's endpoint evaluation
         // and the recorded vertex position. STEP doesn't always emit
-        // perfectly coincident points; we record any deviation.
-        if let Ok(cp) = curve_box.evaluate(0.0) {
+        // perfectly coincident points; we record any deviation. Evaluate
+        // at the curve's actual domain endpoints (unit range for the
+        // per-edge Line/Arc, native range for a cloned NURBS curve).
+        if let Ok(cp) = curve_box.evaluate(edge_param_range.start) {
             check_edge_vertex_snap(
                 [cp.position.x, cp.position.y, cp.position.z],
                 start_pos,
@@ -278,7 +334,7 @@ impl EntityHandler for EdgeCurveHandler {
                 ctx,
             );
         }
-        if let Ok(cp) = curve_box.evaluate(1.0) {
+        if let Ok(cp) = curve_box.evaluate(edge_param_range.end) {
             check_edge_vertex_snap(
                 [cp.position.x, cp.position.y, cp.position.z],
                 end_pos,
@@ -302,7 +358,7 @@ impl EntityHandler for EdgeCurveHandler {
             end_vid,
             curve_id,
             orientation,
-            ParameterRange::unit(),
+            edge_param_range,
         );
         let mut edge = edge;
         edge.set_tolerance(tol);
@@ -848,10 +904,27 @@ impl EntityHandler for AdvancedFaceHandler {
                 }
             };
 
-        // Resolve the surface (Plane / Cylinder cached by IMP2.3).
+        // Resolve the face surface. Tier-1 covers PLANE / CYLINDRICAL;
+        // tier-2 adds the spherical / toroidal / conical analytic family,
+        // (rational) NURBS surfaces, and the swept surfaces (revolution /
+        // linear extrusion). Complex (rational) B-spline surfaces resolve
+        // through the dispatcher's complex path inside `ensure_resolved`.
         let _ = ensure_resolved(
             surf_ref,
-            &["PLANE", "CYLINDRICAL_SURFACE"],
+            &[
+                "PLANE",
+                "CYLINDRICAL_SURFACE",
+                "SPHERICAL_SURFACE",
+                "TOROIDAL_SURFACE",
+                "CONICAL_SURFACE",
+                "B_SPLINE_SURFACE_WITH_KNOTS",
+                "BOUNDED_SURFACE",
+                "B_SPLINE_SURFACE",
+                "RATIONAL_B_SPLINE_SURFACE",
+                "SURFACE",
+                "SURFACE_OF_REVOLUTION",
+                "SURFACE_OF_LINEAR_EXTRUSION",
+            ],
             registry,
             dispatch,
             ctx,
@@ -864,7 +937,7 @@ impl EntityHandler for AdvancedFaceHandler {
                     entity: names::ADVANCED_FACE.into(),
                     instance: Some(instance),
                     message: format!(
-                        "face_geometry #{surf_ref} did not resolve to a tier-1 surface"
+                        "face_geometry #{surf_ref} did not resolve to a supported surface"
                     ),
                 });
                 return HandlerOutcome::Failed {
@@ -1239,7 +1312,7 @@ fn resolve_face_bound(
 }
 
 /// Force `instance` to resolve as an ADVANCED_FACE.
-fn resolve_face(
+pub(crate) fn resolve_face(
     instance: u64,
     registry: &EntityRegistry,
     dispatch: &EntityDispatch,
@@ -1252,8 +1325,8 @@ fn resolve_face(
     ctx.caches.faces.get(&instance).copied()
 }
 
-/// Force `instance` to resolve as a CLOSED_SHELL.
-fn resolve_shell(
+/// Force `instance` to resolve as a CLOSED_SHELL or OPEN_SHELL.
+pub(crate) fn resolve_shell(
     instance: u64,
     registry: &EntityRegistry,
     dispatch: &EntityDispatch,
@@ -1262,7 +1335,13 @@ fn resolve_shell(
     if let Some(s) = ctx.caches.shells.get(&instance) {
         return Some(*s);
     }
-    let _ = ensure_resolved(instance, &[names::CLOSED_SHELL], registry, dispatch, ctx);
+    let _ = ensure_resolved(
+        instance,
+        &[names::CLOSED_SHELL, "OPEN_SHELL"],
+        registry,
+        dispatch,
+        ctx,
+    );
     ctx.caches.shells.get(&instance).copied()
 }
 

@@ -534,7 +534,7 @@ impl EntityHandler for BSplineSurfaceHandler {
 /// cached length-scaled position on success. Mirrors the helper
 /// inside `tier1::geometry` so tier-2 handlers don't need to expose
 /// it pub-crate.
-fn resolve_point(
+pub(super) fn resolve_point(
     instance: u64,
     registry: &EntityRegistry,
     dispatch: &EntityDispatch,
@@ -547,7 +547,7 @@ fn resolve_point(
     ctx.caches.points.get(&instance).copied()
 }
 
-fn parse_integer_list(
+pub(super) fn parse_integer_list(
     param: &ruststep::ast::Parameter,
     entity: &str,
     instance: u64,
@@ -585,7 +585,7 @@ fn parse_integer_list(
     Some(out)
 }
 
-fn parse_real_list(
+pub(super) fn parse_real_list(
     param: &ruststep::ast::Parameter,
     entity: &str,
     instance: u64,
@@ -616,7 +616,7 @@ fn parse_real_list(
 /// Expand the STEP `(knots, multiplicities)` pair into the flat
 /// vector the kernel expects. Rejects mismatched lengths, zero
 /// multiplicities, and non-monotone `knots`.
-fn expand_knot_vector(knots: &[f64], mults: &[usize]) -> Result<Vec<f64>, String> {
+pub(super) fn expand_knot_vector(knots: &[f64], mults: &[usize]) -> Result<Vec<f64>, String> {
     if knots.len() != mults.len() {
         return Err(format!(
             "knots/multiplicities length mismatch ({} vs {})",

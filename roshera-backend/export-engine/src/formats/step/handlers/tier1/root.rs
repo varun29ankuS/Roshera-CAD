@@ -50,6 +50,8 @@ mod names {
     pub const SHAPE_REPRESENTATION: &str = "SHAPE_REPRESENTATION";
     pub const ADVANCED_BREP_SHAPE_REPRESENTATION: &str = "ADVANCED_BREP_SHAPE_REPRESENTATION";
     pub const MANIFOLD_SOLID_BREP: &str = "MANIFOLD_SOLID_BREP";
+    pub const BREP_WITH_VOIDS: &str = "BREP_WITH_VOIDS";
+    pub const MAPPED_ITEM: &str = "MAPPED_ITEM";
     pub const AXIS2_PLACEMENT_3D: &str = "AXIS2_PLACEMENT_3D";
 }
 
@@ -182,25 +184,38 @@ fn collect_root_item(
         root_solids.push(solid_id);
         return;
     }
+    if let Some(mapped) = ctx.caches.mapped_solids.get(&item_ref) {
+        root_solids.extend(mapped.iter().copied());
+        return;
+    }
     if ctx.caches.placements.contains_key(&item_ref) {
         return; // origin placement — no kernel side-effect
     }
 
-    // Slow path: force resolution.
+    // Slow path: force resolution. A representation item may be a plain
+    // `MANIFOLD_SOLID_BREP`, a `BREP_WITH_VOIDS` (both populate
+    // `caches.solids`), a `MAPPED_ITEM` assembly instance (populates
+    // `caches.mapped_solids`), or the world-origin `AXIS2_PLACEMENT_3D`.
     let _ = ensure_resolved(
         item_ref,
-        &[names::MANIFOLD_SOLID_BREP, names::AXIS2_PLACEMENT_3D],
+        &[
+            names::MANIFOLD_SOLID_BREP,
+            names::BREP_WITH_VOIDS,
+            names::MAPPED_ITEM,
+            names::AXIS2_PLACEMENT_3D,
+        ],
         registry,
         dispatch,
         ctx,
     );
 
-    // Re-check: a successful MANIFOLD_SOLID_BREP resolve populates
-    // caches.solids; a successful AXIS2_PLACEMENT_3D resolve
-    // populates caches.placements. Anything else stayed off the
-    // expected list and triggered a wrong-kind warning already.
+    // Re-check the caches the various handlers populate.
     if let Some(solid_id) = ctx.caches.solids.get(&item_ref).copied() {
         root_solids.push(solid_id);
+        return;
+    }
+    if let Some(mapped) = ctx.caches.mapped_solids.get(&item_ref) {
+        root_solids.extend(mapped.iter().copied());
         return;
     }
     if ctx.caches.placements.contains_key(&item_ref) {

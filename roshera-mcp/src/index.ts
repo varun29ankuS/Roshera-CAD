@@ -23,6 +23,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 
 const BASE = process.env.ROSHERA_URL ?? "http://localhost:8081";
 
@@ -935,6 +936,74 @@ server.tool(
           part_id: id,
           triangles: r?.stats?.triangle_count ?? null,
           placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "import_step",
+  "IMPORT a STEP file (ISO 10303-21 / AP203 / AP214 / AP242) into the live " +
+    "scene as one or more real B-Rep solids. Give either a `path` to a .step/.stp " +
+    "file on disk OR inline `content` (the file text). The kernel reconstructs a " +
+    "genuine shared B-Rep — planar/cylindrical/spherical/toroidal/conical faces, " +
+    "rational & non-rational NURBS curves and surfaces, surfaces of revolution / " +
+    "linear extrusion, solids with internal voids, and assembly (MAPPED_ITEM) " +
+    "instances — then VALIDATES every solid (validate_solid_scoped) and folds the " +
+    "verdict into ok. Returns the new part ids/uuids, the per-solid validity, and " +
+    "the reconstruct-coverage report (resolved vs unsupported entity counts). " +
+    "ok:false means a solid materialised but failed kernel validation — inspect " +
+    "report.validation. Unsupported entities are listed honestly, never faked.",
+  {
+    path: z
+      .string()
+      .optional()
+      .describe("filesystem path to a .step/.stp file (read locally by the MCP server)"),
+    content: z
+      .string()
+      .optional()
+      .describe("inline STEP file text (use instead of path)"),
+    name: z.string().optional().describe("display-name prefix for imported parts"),
+  },
+  async ({ path, content, name }) => {
+    try {
+      let text = content;
+      if (!text && path) {
+        text = await readFile(path, "utf8");
+      }
+      if (!text) {
+        return fail(new Error("provide either `path` or `content`"));
+      }
+      const r = await api("POST", "/api/geometry/import_step", {
+        content: text,
+        name: name ?? null,
+      });
+      const objects = Array.isArray(r.objects) ? r.objects : [];
+      const id = await newestPartId();
+      return await okp(
+        {
+          ok: r.success,
+          imported: objects.map((o: any) => ({
+            object_uuid: o.id,
+            part_id: o.solid_id,
+            name: o.name,
+            brep_valid: o.perception?.brep_valid ?? null,
+          })),
+          coverage: {
+            schema: r.report?.schema ?? null,
+            roots_resolved: r.report?.roots_resolved ?? null,
+            resolved: r.report?.counts?.resolved ?? null,
+            unsupported: r.report?.counts?.unsupported ?? null,
+            validation: r.report?.validation ?? null,
+          },
+          note:
+            r.success === false
+              ? "ok:false — a solid imported but failed kernel validation; see coverage.validation"
+              : "imported; render_part / scene_view to SEE the result",
         },
         id,
       );

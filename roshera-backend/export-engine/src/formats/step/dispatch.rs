@@ -164,6 +164,35 @@ impl EntityDispatch {
         registry: &EntityRegistry,
         ctx: &mut ImportContext<'_>,
     ) -> bool {
+        // Complex (`(NAME1(...) NAME2(...) …)`) instances carry no single
+        // dispatch name — the partial types are combined by AND. The
+        // rational / bounded B-spline curve and surface families arrive
+        // this way. We attempt to materialise them in the Geometry phase
+        // (they are pure geometry, referenced by topology exactly like a
+        // simple `B_SPLINE_CURVE_WITH_KNOTS`). Recognised ones resolve;
+        // unrecognised complex instances fall through to the existing
+        // first-constituent dispatch / Unsupported logging below.
+        if let EntityKind::Complex(records) = &entity.kind {
+            if matches!(phase, Phase::Geometry) && !ctx.is_resolved(entity.instance) {
+                ctx.mark_resolved(entity.instance);
+                if super::handlers::tier2::complex::try_build_complex(
+                    entity.instance,
+                    records,
+                    registry,
+                    self,
+                    ctx,
+                ) {
+                    ctx.report.counts.add_resolved(entity.kind.primary_name());
+                    return true;
+                }
+                // Not a recognised complex geometry entity. Un-mark so the
+                // first-constituent dispatch path below still gets a
+                // chance on this or a later phase (it re-checks
+                // `is_resolved`).
+                ctx.resolved.remove(&entity.instance);
+            }
+        }
+
         let name = entity.kind.primary_name();
         let handler = match self.lookup(name) {
             Some(h) => h,
