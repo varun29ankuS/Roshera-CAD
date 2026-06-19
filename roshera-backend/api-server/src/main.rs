@@ -7310,6 +7310,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(handlers::agent::select_edge),
         )
         .route(
+            "/api/agent/parts/{id}/labels",
+            post(handlers::agent::create_label).get(handlers::agent::list_labels),
+        )
+        .route(
+            "/api/agent/parts/{id}/labels/{name}/resolve",
+            get(handlers::agent::resolve_label),
+        )
+        .route(
             "/api/agent/parts/{id}/faces/{face_id}/tolerance",
             post(handlers::agent::attach_face_tolerance),
         )

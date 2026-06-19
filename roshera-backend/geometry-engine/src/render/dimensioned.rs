@@ -1118,6 +1118,24 @@ fn glyph(c: char) -> Option<[u8; 7]> {
         'E' => [
             0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
         ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        '_' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111,
+        ],
         ' ' => [0; 7],
         _ => return None,
     };
@@ -1216,6 +1234,52 @@ pub(crate) fn fmt_num_pub(x: f64) -> String {
 /// Whether the 5×7 font has a glyph for `c` (so callers can pre-filter labels).
 pub(crate) fn glyph_supported(c: char) -> bool {
     glyph(c).is_some()
+}
+
+// ── Label-overlay shims (the LABELLER eye in `super`) ───────────────────────
+// The single-solid / scene render in `render::mod` overlays label callouts on
+// its own framebuffer using the SAME font + line primitives, so a name drawn on
+// a part is visually identical to a dimension callout and there is one font to
+// maintain. Thin `pub(crate)` shims; implementations stay private here.
+
+/// Bresenham line into the render framebuffer (see [`draw_line`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_line_overlay(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    color: [u8; 3],
+) {
+    draw_line(pixels, width, height, x0, y0, x1, y1, color);
+}
+
+/// 5×7 bitmap text into the render framebuffer (see [`draw_text`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_text_overlay(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    x: f64,
+    y: f64,
+    text: &str,
+    color: [u8; 3],
+    scale: usize,
+) {
+    draw_text(pixels, width, height, x, y, text, color, scale);
+}
+
+/// Rendered pixel width of `text` at `scale` (see [`text_width`]).
+pub(crate) fn text_width_px(s: &str, scale: usize) -> f64 {
+    text_width(s, scale)
+}
+
+/// Rendered pixel height of one glyph row at `scale`.
+pub(crate) fn glyph_height_px(scale: usize) -> f64 {
+    (GLYPH_H * scale) as f64
 }
 
 // ── Pixel primitives ────────────────────────────────────────────────────────

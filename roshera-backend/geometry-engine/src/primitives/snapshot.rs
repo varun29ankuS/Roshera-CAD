@@ -107,6 +107,10 @@ pub struct ModelSnapshot {
     /// with the geometry — otherwise the sketch would stay moved while the
     /// solid rolled back, exactly the divergence FIX 2 exists to catch.
     solid_construction: HashMap<SolidId, crate::primitives::provenance::ConstructionGeometry>,
+    /// Label sidecar (names → entities/sections). Keyed by persistent id (also
+    /// snapshotted), so a rolled-back op that named a feature is undone with the
+    /// geometry — same contract as the GD&T sidecar.
+    labels: crate::labels::LabelSidecar,
 }
 
 impl ModelSnapshot {
@@ -146,6 +150,7 @@ impl ModelSnapshot {
             root_counter: model.root_counter,
             gdt: model.gdt.clone(),
             solid_construction: model.solid_construction.clone(),
+            labels: model.labels.clone(),
         }
     }
 
@@ -179,6 +184,7 @@ impl ModelSnapshot {
         model.root_counter = self.root_counter;
         model.gdt = self.gdt;
         model.solid_construction = self.solid_construction;
+        model.labels = self.labels;
     }
 }
 
