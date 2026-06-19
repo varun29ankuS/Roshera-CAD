@@ -1720,6 +1720,27 @@ pub async fn extrude_sketch(
     drop(suppress);
     let result_solid_id = build_result?;
 
+    // Link the source sketch to the resulting solid in the kernel
+    // (FIX 1 / FIX 2). Record the sketch plane origin + every lifted
+    // profile point as the solid's construction geometry. From here the
+    // kernel owns the solid↔sketch link: a later `transform_solid` carries
+    // the sketch with the solid, and the validity certificate certifies
+    // the two stay co-located. The lifted profile points (`.3`) are the
+    // world-space sketch loop vertices for every shape in the session.
+    {
+        let frame_origin = session.plane.lift(0.0, 0.0);
+        let mut profile_points: Vec<geometry_engine::math::Point3> = Vec::new();
+        for (_id, _tool, _polygon_2d, lifted) in &shape_polygons {
+            profile_points.extend_from_slice(lifted);
+        }
+        let construction = geometry_engine::primitives::provenance::ConstructionGeometry::new(
+            frame_origin,
+            profile_points,
+        );
+        let mut model = model_handle.write().await;
+        model.set_solid_construction(result_solid_id, construction);
+    }
+
     // Replayable consolidated event — see extrude_csketch for the
     // rationale; the click-draft path records the identical payload
     // shape so both sketch systems replay through one arm.

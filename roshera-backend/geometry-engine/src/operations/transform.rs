@@ -97,6 +97,21 @@ fn transform_solid_body(
         transform_surfaces(model, &entities.faces, &transform)?;
     }
 
+    // FIX 1 — carry construction geometry with the solid. A sketch-derived
+    // solid records its source sketch plane + profile in the
+    // `solid_construction` sidecar; without this the solid's vertices move
+    // while the construction sketch stays behind, so the certificate's
+    // cross-entity consistency check (FIX 2) would then — correctly — flag
+    // the pair as Inconsistent. Applying the SAME matrix keeps the sketch
+    // rigidly attached. No-op when the solid has no linked construction
+    // geometry (analytic primitives, revolve, nurbs_loft), so those solids
+    // are untouched. Identity / persistent ids are unaffected — this only
+    // moves stored world points, it does not re-key the sidecar.
+    if let Some(existing) = model.solid_construction.get(&solid) {
+        let moved = existing.transformed(&transform);
+        model.solid_construction.insert(solid, moved);
+    }
+
     // Validate result
     if options.common.validate_result {
         validate_transformed_solid(model, solid)?;
