@@ -357,9 +357,16 @@ impl BRepModel {
     /// per-entity caches on the solid, shell, face, and loop stores
     /// on first call. Subsequent calls hit the cache.
     ///
-    /// Returns `None` only when the solid id is unknown or the
-    /// tessellation pass produces zero triangles (an irrecoverably
-    /// degenerate solid). Mass = `volume × material.density` —
+    /// Returns `None` when the solid id is unknown, the tessellation
+    /// pass produces zero triangles (an irrecoverably degenerate
+    /// solid), OR the computed result fails the physical-validity
+    /// contract — a malformed / non-watertight solid can make the
+    /// divergence-theorem integration emit a symmetric-but-indefinite
+    /// inertia tensor (a NEGATIVE principal moment, physically
+    /// impossible). The pipeline REFUSES such a result (logging the
+    /// reason) rather than handing the caller a non-physical tensor, so
+    /// a `None` here means "indeterminate on a malformed solid", never a
+    /// fabricated number. Mass = `volume × material.density` —
     /// `Material` defaults to Steel (7850 kg/m³) for solids without
     /// an explicit assignment, so `mass` is always a real number on
     /// the returned report.
