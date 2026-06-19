@@ -144,6 +144,13 @@ pub fn tessellate_face(
                 // mass properties stay correct (at the cost of possible seam
                 // T-junctions on export, far less harmful than a 3× volume
                 // error).
+                if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                    eprintln!(
+                        "[tess] FALLBACK cylinder face {:?}: curved_cdt {:?} -> UNTRIMMED grid \
+                         (ignores boolean trim/holes; covers the bore — #24)",
+                        face.id, e
+                    );
+                }
                 tracing::warn!(
                     "curved_cdt failed for cylinder face {:?}: {:?}; falling back to grid",
                     face.id,
@@ -227,6 +234,24 @@ pub fn tessellate_face(
             // triangle, a slanted unequal-radius wedge) falls back to the
             // generic planar-or-curved-CDT routing the `_` arm uses.
             if !tessellate_revolution_wedge(face, model, cache, mesh) {
+                if std::env::var("ROSHERA_WEDGE_TRACE").is_ok() {
+                    let ne = model
+                        .loops
+                        .get(face.outer_loop)
+                        .map(|l| l.edges.len())
+                        .unwrap_or(0);
+                    let pl = surface.is_planar(Tolerance::new(
+                        params.chord_tolerance,
+                        params.max_angle_deviation,
+                    ));
+                    eprintln!(
+                        "[revfall] face {} edges={} planar={} inner={}",
+                        face.id,
+                        ne,
+                        pl,
+                        face.inner_loops.len()
+                    );
+                }
                 let planar_tol = Tolerance::new(params.chord_tolerance, params.max_angle_deviation);
                 if surface.is_planar(planar_tol)
                     || is_face_loop_planar_in_3d(face, model, cache, planar_tol)
@@ -235,6 +260,13 @@ pub fn tessellate_face(
                 } else if let Err(e) = super::curved_cdt::tessellate_curved_cdt(
                     surface, face, model, params, cache, mesh,
                 ) {
+                    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                        eprintln!(
+                            "[tess] FALLBACK revolution face {:?}: grid declined + curved_cdt {:?} \
+                             -> emitted NOTHING (#24)",
+                            face.id, e
+                        );
+                    }
                     tracing::warn!(
                         "revolution wedge: grid declined and curved_cdt failed for face {:?}: {:?}",
                         face.id,
@@ -3031,6 +3063,13 @@ fn tessellate_conical_face(
         if let Err(e) =
             super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
         {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[tess] FALLBACK cone face {:?}: curved_cdt {:?} -> UNTRIMMED grid \
+                     (ignores boolean trim/holes; covers the bore — #24)",
+                    face.id, e
+                );
+            }
             tracing::warn!(
                 "curved_cdt failed for cone frustum face {:?}: {:?}; falling back to grid",
                 face.id,
@@ -3853,6 +3892,90 @@ fn tessellate_revolution_wedge(
         Some(l) => l,
         None => return false,
     };
+
+    // 3-EDGE APEX WEDGE (REVOLVE-POLE part 2): the band touching the pole is a
+    // TRIANGLE — two meridian arcs meeting at the single pole vertex (r≈0 on the
+    // axis) plus one rim arc. The 4-edge Coons / (u,v)-param paths below need a
+    // quad, so the apex band used to fall through to curved-CDT, which left it
+    // UNMESHED (~147 open edges at the pole — a leaky dome). Mesh it directly:
+    // collect the 3 edge cache-sample chains, lay them out as a non-degenerate
+    // triangle in (u,v) — positions stay the EXACT 3D cache samples so the
+    // meridian/rim seams match the neighbouring wedges bit-for-bit (watertight);
+    // only the 2D connectivity is computed in param space — and triangulate.
+    if loop_data.edges.len() == 3 {
+        let mut chains: Vec<Vec<Point3>> = Vec::with_capacity(3);
+        for (k, &eid) in loop_data.edges.iter().enumerate() {
+            let samples = cache.get_or_compute(eid, model);
+            if samples.len() < 2 {
+                return false;
+            }
+            let mut ch: Vec<Point3> = samples.iter().copied().collect();
+            if !loop_data.orientations.get(k).copied().unwrap_or(true) {
+                ch.reverse();
+            }
+            chains.push(ch);
+        }
+        let close = |p: Point3, q: Point3| (p - q).magnitude() < 1e-6;
+        if !close(chains[0][chains[0].len() - 1], chains[1][0])
+            || !close(chains[1][chains[1].len() - 1], chains[2][0])
+            || !close(chains[2][chains[2].len() - 1], chains[0][0])
+        {
+            return false;
+        }
+        // Map the 3 chains onto a CCW triangle in (u,v): corner0=(0,0),
+        // corner1=(1,0), corner2=(0.5,1). Drop each chain's shared last corner.
+        let corners = [
+            (Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)),
+            (Point3::new(1.0, 0.0, 0.0), Point3::new(0.5, 1.0, 0.0)),
+            (Point3::new(0.5, 1.0, 0.0), Point3::new(0.0, 0.0, 0.0)),
+        ];
+        let mut p3: Vec<Point3> = Vec::new();
+        let mut puv: Vec<Point3> = Vec::new();
+        for (ch, (c0, c1)) in chains.iter().zip(corners.iter()) {
+            let nn = ch.len();
+            for i in 0..nn - 1 {
+                let t = i as f64 / (nn - 1) as f64;
+                p3.push(ch[i]);
+                puv.push(Point3::new(
+                    c0.x + (c1.x - c0.x) * t,
+                    c0.y + (c1.y - c0.y) * t,
+                    0.0,
+                ));
+            }
+        }
+        if p3.len() < 3 {
+            return false;
+        }
+        let boundaries = [(0usize, puv.len(), true)];
+        let tris = triangulate_planar_polygon(&puv, &boundaries, &Vector3::Z);
+        if tris.is_empty() {
+            return false;
+        }
+        let outward = newell_normal(&p3)
+            .map(|nv| nv * face.orientation.sign())
+            .unwrap_or(Vector3::Z);
+        let idx: Vec<u32> = p3
+            .iter()
+            .map(|&position| {
+                mesh.add_vertex(MeshVertex {
+                    position,
+                    normal: outward,
+                    uv: None,
+                })
+            })
+            .collect();
+        for t in &tris {
+            let (i0, i1, i2) = (t[0], t[1], t[2]);
+            let gn = (p3[i1] - p3[i0]).cross(&(p3[i2] - p3[i0]));
+            if gn.dot(&outward) >= 0.0 {
+                mesh.add_triangle(idx[i0], idx[i1], idx[i2]);
+            } else {
+                mesh.add_triangle(idx[i0], idx[i2], idx[i1]);
+            }
+        }
+        return true;
+    }
+
     if loop_data.edges.len() != 4 {
         return false;
     }

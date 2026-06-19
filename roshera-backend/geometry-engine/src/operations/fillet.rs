@@ -1483,7 +1483,7 @@ fn create_closed_edge_fillet(
     end_radius: f64,
     tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
-    use crate::primitives::surface::{Cylinder, Plane};
+    use crate::primitives::surface::{Cone, Cylinder, Plane};
 
     // Variable radius on a closed edge requires a *periodic* radius
     // profile (same value at u=0 and u=2π) to avoid a discontinuity at
@@ -1528,31 +1528,38 @@ fn create_closed_edge_fillet(
 
     let plane1 = surf1.as_any().downcast_ref::<Plane>();
     let cyl1 = surf1.as_any().downcast_ref::<Cylinder>();
+    let cone1 = surf1.as_any().downcast_ref::<Cone>();
     let plane2 = surf2.as_any().downcast_ref::<Plane>();
     let cyl2 = surf2.as_any().downcast_ref::<Cylinder>();
+    let cone2 = surf2.as_any().downcast_ref::<Cone>();
 
-    let (cap_face_id, lat_face_id, plane, cylinder) = if let (Some(p), Some(c)) = (plane1, cyl2) {
-        (face1_id, face2_id, *p, *c)
-    } else if let (Some(c), Some(p)) = (cyl1, plane2) {
-        (face2_id, face1_id, *p, *c)
-    } else {
-        return Err(OperationError::NotImplemented(format!(
-            "Closed-edge fillet (edge {edge_id}) currently supports only \
-             Plane–Cylinder rims (cylinder caps). Cone, torus, and revolve \
-             seams are tracked as follow-up slices under task #89."
-        )));
-    };
-
-    cylinder_rim_fillet(
-        model,
-        edge_id,
-        cap_face_id,
-        lat_face_id,
-        &plane,
-        &cylinder,
-        radius,
-        tol,
-    )
+    // Copy the matched surfaces OUT of the model so the immutable surface
+    // borrow ends before the surgery takes `&mut model`.
+    // Plane–Cylinder rim (cylinder cap) — the original A2 fast path.
+    if let (Some(p), Some(c)) = (plane1, cyl2) {
+        let (p, c) = (*p, *c);
+        return cylinder_rim_fillet(model, edge_id, face1_id, face2_id, &p, &c, radius, tol);
+    }
+    if let (Some(c), Some(p)) = (cyl1, plane2) {
+        let (p, c) = (*p, *c);
+        return cylinder_rim_fillet(model, edge_id, face2_id, face1_id, &p, &c, radius, tol);
+    }
+    // Plane–Cone rim (frustum / cone cap) — task #89. The blend is still a
+    // torus (the rolling ball traces a circle about the cone axis); only the
+    // geometry is derived from the cone's slant.
+    if let (Some(p), Some(c)) = (plane1, cone2) {
+        let (p, c) = (*p, c.clone());
+        return cone_rim_fillet(model, edge_id, face1_id, face2_id, &p, &c, radius, tol);
+    }
+    if let (Some(c), Some(p)) = (cone1, plane2) {
+        let (p, c) = (*p, c.clone());
+        return cone_rim_fillet(model, edge_id, face2_id, face1_id, &p, &c, radius, tol);
+    }
+    Err(OperationError::NotImplemented(format!(
+        "Closed-edge fillet (edge {edge_id}) currently supports Plane–Cylinder \
+         and Plane–Cone rims. Torus and general revolve seams are tracked as \
+         follow-up slices under task #89."
+    )))
 }
 
 /// Largest radial distance (perpendicular to `axis`) of any vertex on a
@@ -2057,6 +2064,466 @@ fn cylinder_rim_fillet(
     // any loop. Curves are append-only in the kernel, so the old
     // circle/line curves become orphaned but cannot be safely removed
     // here without a curve-store reference count (out of scope).
+    model.edges.remove(rim_edge_id);
+    model.edges.remove(seam_edge_id);
+
+    Ok((blend_face_id, None))
+}
+
+/// Build the torus blend that replaces a plane–cone rim (task #89).
+///
+/// A rolling ball of radius `r` seated in the plane/cone corner traces a
+/// circle about the cone axis, so the blend surface is a `Torus` — exactly as
+/// for the cylinder rim — but the geometry is derived from the cone's slant
+/// rather than a constant radius. We solve the rolling ball at ONE rim point
+/// (its centre + the two surface contacts, from the outward face normals),
+/// then rotational symmetry gives the torus (major = ball-centre radius, minor
+/// = r), the two trim circles, and the meridian seam arc (sweep 90°±half-angle).
+/// The topology surgery is the same seamed-rectangle rewrite
+/// `cylinder_rim_fillet` performs; only the lateral surface shortened in step 7
+/// is a re-trimmed `Cone` (clone + new `height_limits`) instead of a cylinder.
+#[allow(clippy::too_many_lines)]
+fn cone_rim_fillet(
+    model: &mut BRepModel,
+    rim_edge_id: EdgeId,
+    cap_face_id: FaceId,
+    lat_face_id: FaceId,
+    plane: &crate::primitives::surface::Plane,
+    cone: &crate::primitives::surface::Cone,
+    radius: f64,
+    tol: Tolerance,
+) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
+    use crate::primitives::curve::Arc;
+    use crate::primitives::edge::EdgeOrientation;
+    use crate::primitives::face::Face;
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::surface::Torus;
+    use std::f64::consts::{PI, TAU};
+
+    let _ = plane; // outward orientation is taken from the face normal, not the raw plane.
+
+    if !radius.is_finite() || radius <= 0.0 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Closed-edge cone fillet (edge {rim_edge_id}) radius must be a positive \
+             finite number; got {radius}"
+        )));
+    }
+
+    let axis = cone.axis;
+    let apex = cone.apex;
+
+    // ---- rolling-ball solve at the rim seam point. ----
+    let rim_edge = model
+        .edges
+        .get(rim_edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Rim edge not found".to_string()))?
+        .clone();
+    if rim_edge.start_vertex != rim_edge.end_vertex {
+        return Err(OperationError::InvalidGeometry(
+            "Closed-edge fillet invariant violated: rim edge is not a loop".to_string(),
+        ));
+    }
+    let v_lat = rim_edge.start_vertex;
+    let q = {
+        let p = model.vertices.get_position(v_lat).ok_or_else(|| {
+            OperationError::InvalidGeometry("Rim seam vertex missing".to_string())
+        })?;
+        Point3::new(p[0], p[1], p[2])
+    };
+
+    // Axis decomposition about the cone apex.
+    let axial_of = |p: Point3| -> f64 { (p - apex).dot(&axis) };
+    let radial_vec = |p: Point3| -> Vector3 {
+        let d = p - apex;
+        d - axis * d.dot(&axis)
+    };
+    let u_rad = radial_vec(q)
+        .normalize()
+        .map_err(|e| OperationError::NumericalError(format!("cone rim radial dir: {e}")))?;
+
+    // Cap normal is reliable from the planar cap. The cone normal is computed
+    // ANALYTICALLY in the rim meridian: `get_face_oriented_normal` projects the
+    // point to find (u, v), but `create_cone_3d` leaves `cone.ref_dir` offset
+    // from the rim seam (cone-rim-seam-alignment), so the projection lands at a
+    // wrong u and tilts the normal OFF the meridian — which throws the ball
+    // centre off-axis and breaks the rotational symmetry the torus blend needs.
+    // The exact cone outward normal at radius dir `u_rad` is
+    // `cos α·u_rad − sin α·axis` (axis = apex→base); orient it by the probe sign.
+    let n_cap = get_face_oriented_normal(model, cap_face_id, &q)?;
+    let alpha = cone.half_angle;
+    let s = axial_of(q).signum();
+    let mut n_cone = (u_rad * alpha.cos() - axis * (alpha.sin() * s))
+        .normalize()
+        .map_err(|e| OperationError::NumericalError(format!("cone analytic normal: {e}")))?;
+    let n_probe = get_face_oriented_normal(model, lat_face_id, &q)?;
+    if n_cone.dot(&n_probe) < 0.0 {
+        n_cone = n_cone * -1.0;
+    }
+
+    // Convex rim: the ball sits INSIDE the solid along the inward bisector;
+    // each contact is one radius back along the corresponding outward normal
+    // (matches `compute_variable_rolling_ball_positions`' convex branch).
+    let bis = (n_cap + n_cone)
+        .normalize()
+        .map_err(|e| OperationError::NumericalError(format!("cone rim bisector: {e}")))?;
+    let bd = bis.dot(&n_cap);
+    if bd.abs() < tol.parallel_threshold() {
+        return Err(OperationError::NumericalError(
+            "Degenerate plane/cone dihedral at rim (anti-parallel normals)".to_string(),
+        ));
+    }
+    let center = q - bis * (radius / bd);
+    let contact_cap = center + n_cap * radius;
+    let contact_cone = center + n_cone * radius;
+
+    let rho = radial_vec(center).magnitude();
+    if rho <= radius + tol.distance() {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Fillet radius {radius} too large for cone rim: the ball-centre radius \
+             ({rho:.4}) is not greater than the radius; the torus would self-pinch."
+        )));
+    }
+
+    // Torus carrier centred on the axis at the ball-centre height.
+    let torus_center = apex + axis * axial_of(center);
+
+    // Meridian-frame angle of a point about the ball centre (u=0 plane,
+    // ref_dir = u_rad): matches `Torus::evaluate` so the seam arc and the
+    // torus patch boundary coincide.
+    let v_param = |p: Point3| -> f64 {
+        let d = p - center;
+        d.dot(&axis).atan2(d.dot(&u_rad))
+    };
+    let v_cone = v_param(contact_cone);
+    let v_cap = v_param(contact_cap);
+    let mut sweep_v = v_cap - v_cone;
+    if sweep_v > PI {
+        sweep_v -= TAU;
+    } else if sweep_v < -PI {
+        sweep_v += TAU;
+    }
+    let v_end = v_cone + sweep_v;
+    // Keep the natural meridian range (it may straddle the outer equator v=0 by
+    // the cone half-angle); do NOT shift it across the 0/2π seam.
+    let (v0, v1) = (v_cone.min(v_end), v_cone.max(v_end));
+
+    // ---- resolve the cap loop carrying the rim (outer vs bore). ----
+    let (cap_loop_id, radial_out) = {
+        let cap_face = model
+            .faces
+            .get(cap_face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap face missing".to_string()))?;
+        let has_rim = |lid| -> bool {
+            model
+                .loops
+                .get(lid)
+                .is_some_and(|l| l.edges.contains(&rim_edge_id))
+        };
+        if has_rim(cap_face.outer_loop) {
+            (cap_face.outer_loop, 1.0_f64)
+        } else if let Some(&inner) = cap_face.inner_loops.iter().find(|&&lid| has_rim(lid)) {
+            (inner, -1.0_f64)
+        } else {
+            return Err(OperationError::InvalidGeometry(
+                "Rim edge not found in cap loop".to_string(),
+            ));
+        }
+    };
+
+    // New seam vertex positions.
+    let lat_seam_pos = contact_cone; // v_lat moves onto the cone contact circle
+    let cap_seam_pos = contact_cap; // v_cap created on the cap contact circle
+
+    // ---- locate the lateral seam edge (the meridian line, twice in loop). ----
+    let lat_loop_id = model
+        .faces
+        .get(lat_face_id)
+        .map(|f| f.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Lateral face missing".to_string()))?;
+    let (rim_idx_in_lat, seam_edge_id, seam_idx_first, seam_idx_second) = {
+        let lat_loop = model
+            .loops
+            .get(lat_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Lateral loop missing".to_string()))?;
+        let mut counts: HashMap<EdgeId, Vec<usize>> = HashMap::new();
+        for (i, &e) in lat_loop.edges.iter().enumerate() {
+            counts.entry(e).or_default().push(i);
+        }
+        let mut rim_idx: Option<usize> = None;
+        for (i, &e) in lat_loop.edges.iter().enumerate() {
+            if e == rim_edge_id {
+                rim_idx = Some(i);
+                break;
+            }
+        }
+        let mut seam_id = None;
+        let mut seam_first = None;
+        let mut seam_second = None;
+        for (e, idxs) in &counts {
+            if idxs.len() == 2 {
+                seam_id = Some(*e);
+                seam_first = Some(idxs[0]);
+                seam_second = Some(idxs[1]);
+                break;
+            }
+        }
+        (
+            rim_idx.ok_or_else(|| {
+                OperationError::InvalidGeometry("Rim edge not found in lateral loop".to_string())
+            })?,
+            seam_id.ok_or_else(|| {
+                OperationError::InvalidGeometry(
+                    "Lateral seam edge not found (no duplicate edge in loop)".to_string(),
+                )
+            })?,
+            seam_first.ok_or_else(|| {
+                OperationError::InvalidGeometry("Seam first occurrence missing".to_string())
+            })?,
+            seam_second.ok_or_else(|| {
+                OperationError::InvalidGeometry("Seam second occurrence missing".to_string())
+            })?,
+        )
+    };
+    let seam_edge = model
+        .edges
+        .get(seam_edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Seam edge not found".to_string()))?
+        .clone();
+
+    // ---- step 1: move v_lat onto the cone contact circle. ----
+    if !model
+        .vertices
+        .set_position(v_lat, lat_seam_pos.x, lat_seam_pos.y, lat_seam_pos.z)
+    {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Failed to move cone-rim seam vertex {v_lat}"
+        )));
+    }
+    // ---- step 2: create v_cap on the cap contact circle. ----
+    let vtol = Tolerance::default().distance();
+    let v_cap_vertex =
+        model
+            .vertices
+            .add_or_find(cap_seam_pos.x, cap_seam_pos.y, cap_seam_pos.z, vtol);
+
+    // ---- step 3: build the new curves. ----
+    // Anchor each trim circle's t=0 to the seam direction `u_rad` (= the cone's
+    // ref_dir and the torus's ref_dir), so the rim edge's param starts at its
+    // seam vertex. `Arc::circle` would otherwise force a canonical +X t=0 that
+    // misaligns with the cone seam (cone-rim-seam-alignment), making the cone's
+    // curved-CDT contour cross itself (CrossingFixedEdge).
+    let mut cap_trim_circle = Arc::circle(
+        apex + axis * axial_of(contact_cap),
+        axis,
+        radial_vec(contact_cap).magnitude(),
+    )
+    .map_err(|e| OperationError::NumericalError(format!("cap trim circle: {e}")))?;
+    cap_trim_circle.x_axis = u_rad;
+    // The lateral trim circle is swept in the −u direction (sweep = −TAU) so the
+    // cone's outer loop traverses its bottom rim OPPOSITE its top rim — the clean
+    // rectangle the cone's curved-CDT unwrap needs. A +TAU circle makes both rims
+    // run the same way, doubling the UV contour over itself (CrossingFixedEdge).
+    // The torus reads this edge through the shared sample cache, so the direction
+    // does not affect the blend weld.
+    let mut lat_trim_circle = Arc::new(
+        apex + axis * axial_of(contact_cone),
+        axis,
+        radial_vec(contact_cone).magnitude(),
+        0.0,
+        -std::f64::consts::TAU,
+    )
+    .map_err(|e| OperationError::NumericalError(format!("lat trim circle: {e}")))?;
+    lat_trim_circle.x_axis = u_rad;
+    // Meridian seam arc from v_lat (cone contact) to v_cap (cap contact),
+    // centred on the ball centre, in the (u_rad, axis) plane.
+    let normal_arc = u_rad.cross(&axis);
+    let seam_arc = {
+        let probe = Arc::new(center, normal_arc, radius, 0.0, 0.0)
+            .map_err(|e| OperationError::NumericalError(format!("seam arc probe: {e}")))?;
+        let x_axis = probe.x_axis;
+        let y_axis = probe.normal.cross(&x_axis);
+        let start_dir = (contact_cone - center)
+            .normalize()
+            .map_err(|e| OperationError::NumericalError(format!("seam start dir: {e}")))?;
+        let end_dir = (contact_cap - center)
+            .normalize()
+            .map_err(|e| OperationError::NumericalError(format!("seam end dir: {e}")))?;
+        let start_a = start_dir.dot(&y_axis).atan2(start_dir.dot(&x_axis));
+        let end_a = end_dir.dot(&y_axis).atan2(end_dir.dot(&x_axis));
+        let mut sweep = end_a - start_a;
+        if sweep > PI {
+            sweep -= TAU;
+        } else if sweep < -PI {
+            sweep += TAU;
+        }
+        Arc::new(center, normal_arc, radius, start_a, sweep)
+            .map_err(|e| OperationError::NumericalError(format!("seam arc: {e}")))?
+    };
+    // Recompute the lateral seam line from the (moved) endpoints.
+    let start_pos = {
+        let v = model.vertices.get(seam_edge.start_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Seam start vertex missing".to_string())
+        })?;
+        Point3::new(v.position[0], v.position[1], v.position[2])
+    };
+    let end_pos = {
+        let v = model.vertices.get(seam_edge.end_vertex).ok_or_else(|| {
+            OperationError::InvalidGeometry("Seam end vertex missing".to_string())
+        })?;
+        Point3::new(v.position[0], v.position[1], v.position[2])
+    };
+    let new_seam_line = Line::new(start_pos, end_pos);
+
+    let cap_trim_curve_id = model.curves.add(Box::new(cap_trim_circle));
+    let lat_trim_curve_id = model.curves.add(Box::new(lat_trim_circle));
+    let seam_arc_curve_id = model.curves.add(Box::new(seam_arc));
+    let new_seam_line_id = model.curves.add(Box::new(new_seam_line));
+
+    // ---- step 4: build the new edges. ----
+    let rail_tol = crate::math::Tolerance::default().distance();
+    let cap_trim_edge_id = model.edges.add(Edge::new_with_tolerance(
+        0,
+        v_cap_vertex,
+        v_cap_vertex,
+        cap_trim_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+        rail_tol,
+    ));
+    let lat_trim_edge_id = model.edges.add(Edge::new_with_tolerance(
+        0,
+        v_lat,
+        v_lat,
+        lat_trim_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+        rail_tol,
+    ));
+    let torus_seam_edge_id = model.edges.add(Edge::new_with_tolerance(
+        0,
+        v_lat,
+        v_cap_vertex,
+        seam_arc_curve_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+        rail_tol,
+    ));
+    let new_seam_edge_id = model.edges.add(Edge::new_with_tolerance(
+        0,
+        seam_edge.start_vertex,
+        seam_edge.end_vertex,
+        new_seam_line_id,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+        rail_tol,
+    ));
+
+    // ---- step 5: replace the rim slot in the cap loop. ----
+    let cap_orientation = {
+        let cap_loop = model
+            .loops
+            .get(cap_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap loop missing".to_string()))?;
+        let mut orient = None;
+        for (i, &e) in cap_loop.edges.iter().enumerate() {
+            if e == rim_edge_id {
+                orient = Some(cap_loop.orientations[i]);
+                break;
+            }
+        }
+        orient.ok_or_else(|| {
+            OperationError::InvalidGeometry("Rim edge not found in cap loop".to_string())
+        })?
+    };
+    {
+        let cap_loop = model
+            .loops
+            .get_mut(cap_loop_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Cap loop missing (mut)".to_string()))?;
+        for (i, edge) in cap_loop.edges.iter_mut().enumerate() {
+            if *edge == rim_edge_id {
+                *edge = cap_trim_edge_id;
+                cap_loop.orientations[i] = cap_orientation;
+                break;
+            }
+        }
+    }
+
+    // ---- step 6: replace rim + both seam slots in the lateral loop. ----
+    {
+        let lat_loop = model.loops.get_mut(lat_loop_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("Lateral loop missing (mut)".to_string())
+        })?;
+        let rim_orient = lat_loop.orientations[rim_idx_in_lat];
+        let s1 = lat_loop.orientations[seam_idx_first];
+        let s2 = lat_loop.orientations[seam_idx_second];
+        lat_loop.edges[rim_idx_in_lat] = lat_trim_edge_id;
+        lat_loop.orientations[rim_idx_in_lat] = rim_orient;
+        lat_loop.edges[seam_idx_first] = new_seam_edge_id;
+        lat_loop.orientations[seam_idx_first] = s1;
+        lat_loop.edges[seam_idx_second] = new_seam_edge_id;
+        lat_loop.orientations[seam_idx_second] = s2;
+    }
+
+    // ---- step 7: re-trim the cone surface in-place (shorten on the rim side). ----
+    let lat_surface_id = model
+        .faces
+        .get(lat_face_id)
+        .map(|f| f.surface_id)
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry("Lateral face missing for surface swap".to_string())
+        })?;
+    {
+        let [v_bot, v_top] = cone.height_limits.ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "Closed-edge cone fillet requires a finite cone (height_limits set)".to_string(),
+            )
+        })?;
+        let v_rim = axial_of(q);
+        let v_seam = axial_of(contact_cone);
+        // Replace whichever limit the rim sat on with the shortened seam height.
+        let new_limits = if (v_rim - v_top).abs() <= (v_rim - v_bot).abs() {
+            [v_bot, v_seam]
+        } else {
+            [v_seam, v_top]
+        };
+        let mut new_cone = cone.clone();
+        new_cone.height_limits = Some(new_limits);
+        if model
+            .surfaces
+            .replace(lat_surface_id, Box::new(new_cone))
+            .is_none()
+        {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Failed to replace lateral cone surface {lat_surface_id}"
+            )));
+        }
+    }
+
+    // ---- step 8: build the torus surface + blend face. ----
+    let mut torus = Torus::new(torus_center, axis, rho, radius)
+        .map_err(|e| OperationError::NumericalError(format!("Torus blend: {e}")))?;
+    torus.ref_dir = u_rad;
+    torus.param_limits = Some([0.0, TAU, v0, v1]);
+    // Outward at the corner diagonal: from the ball centre toward the original
+    // sharp rim point.
+    let blend_outward_target = q - center;
+    let blend_orientation = orient_face_for_outward(&torus, blend_outward_target)?;
+    let torus_surface_id = model.surfaces.add(Box::new(torus));
+
+    let mut blend_loop = Loop::new(0, LoopType::Outer);
+    blend_loop.add_edge(lat_trim_edge_id, true);
+    blend_loop.add_edge(torus_seam_edge_id, true);
+    blend_loop.add_edge(cap_trim_edge_id, false);
+    blend_loop.add_edge(torus_seam_edge_id, false);
+    let blend_loop_id = model.loops.add(blend_loop);
+    let _ = radial_out;
+
+    let mut blend_face = Face::new(0, torus_surface_id, blend_loop_id, blend_orientation);
+    blend_face.outer_loop = blend_loop_id;
+    let blend_face_id = model.faces.add(blend_face);
+
+    // ---- step 9: cleanup. ----
     model.edges.remove(rim_edge_id);
     model.edges.remove(seam_edge_id);
 
