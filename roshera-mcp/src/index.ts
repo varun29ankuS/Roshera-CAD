@@ -1670,6 +1670,25 @@ server.tool(
   },
 );
 
+server.tool(
+  "propose_labels",
+  "AUTO-PROPOSE labels (D3): the kernel recognizes features on a part (throat = " +
+    "min-radius cylindrical wall, exit = downstream planar cap, chamber = " +
+    "max-radius barrel, fillet = constant-radius blend) and SUGGESTS a name plus " +
+    "the ASSERTION that pins it — it does NOT apply them. You confirm one by " +
+    "calling label_create with the suggested name and the returned `selector` as " +
+    "the selector arg (you own the name, the kernel owns the claim). Returns " +
+    "{ proposals: [{ suggested_name, kind, confidence, rationale, selector }] }.",
+  { part_id: z.number().int() },
+  async ({ part_id }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/${part_id}/propose-labels`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
 // ════════════════════════ END LABELLER TOOLS ════════════════════════════
 
 // ─── main ──────────────────────────────────────────────────────────────
