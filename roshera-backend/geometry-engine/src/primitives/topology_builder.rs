@@ -343,6 +343,14 @@ pub struct BRepModel {
     /// success; absence is reported honestly as "unrecorded", never assumed.
     pub solid_provenance:
         std::collections::HashMap<SolidId, crate::primitives::provenance::SolidProvenance>,
+    /// Document length unit (GD&T Phase 1): the unit lengths/diameters are
+    /// *labelled and formatted* in on drawings and agent-facing readouts. The
+    /// kernel's native modelling unit is the millimetre (1 kernel unit = 1 mm)
+    /// and that does not change with this setting — only the displayed unit
+    /// string and number formatting do. Defaults to millimetres. A
+    /// document/scene-level setting, not a per-entity property; the clean seam
+    /// for true unit conversion lives on [`crate::units::LengthUnit`].
+    pub document_unit: crate::units::LengthUnit,
 }
 
 impl BRepModel {
@@ -413,6 +421,7 @@ impl BRepModel {
             current_event_key: None,
             root_counter: 0,
             solid_provenance: std::collections::HashMap::new(),
+            document_unit: crate::units::LengthUnit::default(),
         }
     }
 
@@ -432,6 +441,20 @@ impl BRepModel {
     #[inline]
     pub fn set_tolerance(&mut self, tolerance: Tolerance) {
         self.tolerance = tolerance;
+    }
+
+    /// The document length unit lengths/diameters are labelled in on drawings
+    /// and agent readouts (GD&T Phase 1). Defaults to millimetres.
+    #[inline]
+    pub fn document_unit(&self) -> crate::units::LengthUnit {
+        self.document_unit
+    }
+
+    /// Set the document length unit. This changes only display/labelling — the
+    /// kernel geometry stays in its native millimetre modelling unit.
+    #[inline]
+    pub fn set_document_unit(&mut self, unit: crate::units::LengthUnit) {
+        self.document_unit = unit;
     }
 
     /// Reset every GEOMETRY store to empty, preserving the seeded datums
