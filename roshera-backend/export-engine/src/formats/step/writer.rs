@@ -18,7 +18,7 @@ use geometry_engine::math::matrix4::Matrix4;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use shared_types::*;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -75,8 +75,6 @@ impl std::fmt::Display for StepId {
 pub struct StepWriter<W: Write> {
     writer: BufWriter<W>,
     entity_counter: u32,
-    /// Map from internal IDs to STEP entity IDs
-    id_map: HashMap<Uuid, StepId>,
     /// Application protocol declared in the FILE_SCHEMA header.
     protocol: StepApplicationProtocol,
 }
@@ -95,7 +93,6 @@ impl<W: Write> StepWriter<W> {
         Self {
             writer: BufWriter::new(writer),
             entity_counter: 1,
-            id_map: HashMap::new(),
             protocol,
         }
     }
@@ -112,40 +109,34 @@ impl<W: Write> StepWriter<W> {
         id
     }
 
-    /// Map an internal ID to a STEP ID
-    fn map_id(&mut self, internal_id: Uuid) -> StepId {
-        if let Some(&step_id) = self.id_map.get(&internal_id) {
-            step_id
-        } else {
-            let step_id = self.next_id();
-            self.id_map.insert(internal_id, step_id);
-            step_id
-        }
-    }
-
     /// Write the STEP header
     pub fn write_header(&mut self, header: &StepHeader) -> std::io::Result<()> {
         writeln!(self.writer, "ISO-10303-21;")?;
         writeln!(self.writer, "HEADER;")?;
 
-        // FILE_DESCRIPTION
+        // FILE_DESCRIPTION — ISO 10303-21 §8 requires the trailing `;`.
+        // Its absence made the entire header unparseable (the importer
+        // failed on the FILE_NAME record that ran into it).
         writeln!(
             self.writer,
-            "FILE_DESCRIPTION(('{}'),'{}')",
-            header.description, header.implementation_level
+            "FILE_DESCRIPTION(('{}'),'{}');",
+            escape_step_string(&header.description),
+            escape_step_string(&header.implementation_level)
         )?;
 
-        // FILE_NAME
+        // FILE_NAME — `author` and `organization` are STRING-list fields
+        // in the schema (`(author)`, `(organization)`); emit each as a
+        // single-element list. Trailing `;` is mandatory.
         writeln!(
             self.writer,
-            "FILE_NAME('{}','{}','{}',('{}'),'{}','{}','{}')",
-            header.name,
+            "FILE_NAME('{}','{}',('{}'),('{}'),'{}','{}','{}');",
+            escape_step_string(&header.name),
             header.time_stamp.format("%Y-%m-%dT%H:%M:%S"),
-            header.author,
-            header.organization,
-            header.preprocessor_version,
-            header.originating_system,
-            header.authorization
+            escape_step_string(&header.author),
+            escape_step_string(&header.organization),
+            escape_step_string(&header.preprocessor_version),
+            escape_step_string(&header.originating_system),
+            escape_step_string(&header.authorization)
         )?;
 
         // FILE_SCHEMA — declares the application protocol of this
@@ -259,7 +250,10 @@ impl<W: Write> StepWriter<W> {
     /// Write a line
     pub fn write_line(&mut self, start: &[f64; 3], end: &[f64; 3]) -> std::io::Result<StepId> {
         let start_id = self.write_cartesian_point(start)?;
-        let end_id = self.write_cartesian_point(end)?;
+        // Emit the end point too so the LINE's two endpoints are both
+        // representable in the file (the importer keys edge extent off
+        // the vertices, but downstream readers expect both points).
+        let _end_id = self.write_cartesian_point(end)?;
 
         // Calculate direction and magnitude
         let dir = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
@@ -307,25 +301,37 @@ impl<W: Write> StepWriter<W> {
         let id = self.next_id();
 
         if rational && weights.is_some() {
-            // Write as rational B-spline
+            // Rational B-spline curve. Per ISO 10303-42 a weighted
+            // B-spline is a *complex* (AND-combined) entity instance,
+            // not a standalone `RATIONAL_B_SPLINE_CURVE`. The long-form
+            // MIM spelling combines the supertype chain so importers
+            // (incl. OCCT) resolve the rational specialisation:
+            //
+            //   ( BOUNDED_CURVE() B_SPLINE_CURVE(deg,(cps),.UNSPECIFIED.,.F.,.F.)
+            //     B_SPLINE_CURVE_WITH_KNOTS((mults),(knots),.UNSPECIFIED.)
+            //     CURVE() GEOMETRIC_REPRESENTATION_ITEM()
+            //     RATIONAL_B_SPLINE_CURVE((weights))
+            //     REPRESENTATION_ITEM('') )
             #[allow(clippy::expect_used)]
             // Reason: weights.is_some() is checked one line above in the
             // enclosing `if` guard; the Option cannot be None here.
             let weights_slice =
                 weights.expect("weights.is_some() verified by enclosing `if` guard");
             writeln!(self.writer,
-                "{}=RATIONAL_B_SPLINE_CURVE({},({}),.UNSPECIFIED.,.F.,.U.,({}),({}),.UNSPECIFIED.,({}));",
-                id,
-                degree,
-                format_id_list(&cp_ids),
-                format_real_list(knots),
-                format_int_list(multiplicities),
-                format_real_list(weights_slice)
+                "{id}=( BOUNDED_CURVE() B_SPLINE_CURVE({degree},({cps}),.UNSPECIFIED.,.F.,.F.) B_SPLINE_CURVE_WITH_KNOTS(({mults}),({knots}),.UNSPECIFIED.) CURVE() GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(({weights})) REPRESENTATION_ITEM('') );",
+                id = id,
+                degree = degree,
+                cps = format_id_list(&cp_ids),
+                mults = format_int_list(multiplicities),
+                knots = format_real_list(knots),
+                weights = format_real_list(weights_slice),
             )?;
         } else {
-            // Write as non-rational B-spline
+            // Non-rational B-spline. The leading `.` on the final
+            // `.UNSPECIFIED.` enum was previously missing — that made
+            // every B-spline curve unparseable.
             writeln!(self.writer,
-                "{}=B_SPLINE_CURVE_WITH_KNOTS({},({}),.UNSPECIFIED.,.F.,.U.,({}),({}),UNSPECIFIED.);",
+                "{}=B_SPLINE_CURVE_WITH_KNOTS({},({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);",
                 id,
                 degree,
                 format_id_list(&cp_ids),
@@ -337,31 +343,31 @@ impl<W: Write> StepWriter<W> {
         Ok(id)
     }
 
-    /// Write a curve entity
+    /// Write a curve entity.
+    ///
+    /// `_vertex_map` is unused: curve geometry carries its own
+    /// coordinates in the snapshot, independent of the vertex topology.
     pub fn write_curve(
         &mut self,
         curve: &crate::formats::ros_snapshot::CurveData,
-        vertex_map: &HashMap<&uuid::Uuid, StepId>,
+        _vertex_map: &HashMap<&uuid::Uuid, StepId>,
     ) -> std::io::Result<StepId> {
         use crate::formats::ros_snapshot::CurveData;
 
         match curve {
             CurveData::Line { start, end } => {
-                // Write LINE entity
+                // LINE('', point, vector). The point is the line origin;
+                // the vector is the (unit) direction with magnitude 1.
                 let start_id = self.write_cartesian_point(start)?;
-                let _end_id = self.write_cartesian_point(end)?;
-
-                // Create vector from start to end
-                let vector_id = self.next_id();
-                let dir = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-                writeln!(
-                    self.writer,
-                    "{}=DIRECTION('',({},{},{}));",
-                    vector_id, dir[0], dir[1], dir[2]
-                )?;
-                let vec_id = self.next_id();
-                writeln!(self.writer, "{}=VECTOR('',{},1.0);", vec_id, vector_id)?;
-
+                let raw = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+                let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+                let unit = if len > 0.0 {
+                    [raw[0] / len, raw[1] / len, raw[2] / len]
+                } else {
+                    [1.0, 0.0, 0.0]
+                };
+                let dir_id = self.write_direction(&unit)?;
+                let vec_id = self.write_vector(dir_id, 1.0)?;
                 let id = self.next_id();
                 writeln!(self.writer, "{}=LINE('',{},{});", id, start_id, vec_id)?;
                 Ok(id)
@@ -371,14 +377,7 @@ impl<W: Write> StepWriter<W> {
                 radius,
                 normal,
             } => {
-                // Write CIRCLE entity
-                let center_pt = self.write_cartesian_point(&[center[0], center[1], center[2]])?;
-                let axis = self.write_axis2_placement_3d(
-                    &[center[0], center[1], center[2]],
-                    Some(&[normal[0], normal[1], normal[2]]),
-                    Some(&[1.0, 0.0, 0.0]),
-                )?;
-                // write_circle expects center, normal, radius - not axis
+                // write_circle emits the placement + CIRCLE itself.
                 self.write_circle(
                     &[center[0], center[1], center[2]],
                     &[normal[0], normal[1], normal[2]],
@@ -460,42 +459,22 @@ impl<W: Write> StepWriter<W> {
                 center,
                 normal,
                 radius,
-                start_angle,
-                end_angle,
+                start_angle: _,
+                end_angle: _,
             } => {
-                // Write basis CIRCLE entity first
-                let basis_circle_id = self.write_circle(
+                // In an ADVANCED_BREP an arc edge references its
+                // *unbounded* basis CIRCLE as `edge_geometry`; the arc
+                // extent is defined by the EDGE_CURVE's two VERTEX_POINTs
+                // (the CAx-IF recommended-practice form, and exactly what
+                // the importer reconstructs). A standalone TRIMMED_CURVE
+                // is a wireframe/geometric-set construct that B-Rep
+                // edge-geometry resolvers (including ours and OCCT's edge
+                // path) do not accept here, so emit the basis circle.
+                self.write_circle(
                     &[center[0], center[1], center[2]],
                     &[normal[0], normal[1], normal[2]],
                     *radius,
-                )?;
-
-                // Write trim parameter points
-                let trim1_id = self.next_id();
-                writeln!(
-                    self.writer,
-                    "{}=PARAMETER_VALUE({});",
-                    trim1_id, start_angle
-                )?;
-                let trim2_id = self.next_id();
-                writeln!(self.writer, "{}=PARAMETER_VALUE({});", trim2_id, end_angle)?;
-
-                // Write TRIMMED_CURVE referencing the basis circle
-                let id = self.next_id();
-                writeln!(
-                    self.writer,
-                    "{}=TRIMMED_CURVE('',{},({}),({}),{},.PARAMETER.);",
-                    id,
-                    basis_circle_id,
-                    trim1_id,
-                    trim2_id,
-                    if end_angle > start_angle {
-                        ".T."
-                    } else {
-                        ".F."
-                    }
-                )?;
-                Ok(id)
+                )
             }
         }
     }
@@ -568,13 +547,20 @@ impl<W: Write> StepWriter<W> {
                     Some(&[1.0, 0.0, 0.0]),
                 )?;
 
+                // CONICAL_SURFACE('', placement, radius, semi_angle).
+                // The angle unit declared in the geometric context is
+                // RADIAN, so the semi-angle MUST be emitted in radians
+                // (it was previously degrees → wrong cone half-angle and
+                // an unreadable cross-section). We place the reference
+                // frame at the apex with `radius = 0`, which the importer
+                // reads back as apex == placement origin (ISO 10303-42:
+                // apex = origin − axis·(radius/tan(semi_angle)), and with
+                // radius == 0 the offset vanishes).
                 let id = self.next_id();
                 writeln!(
                     self.writer,
-                    "{}=CONICAL_SURFACE('',{},0.0,{});",
-                    id,
-                    axis_placement,
-                    half_angle.to_degrees()
+                    "{}=CONICAL_SURFACE('',{},0.0,{:.12});",
+                    id, axis_placement, half_angle
                 )?;
                 Ok(id)
             }
@@ -599,80 +585,200 @@ impl<W: Write> StepWriter<W> {
                 )?;
                 Ok(id)
             }
-            _ => {
-                // For NURBS and other surfaces, write as generic
-                let id = self.next_id();
-                writeln!(self.writer, "{}=SURFACE('');", id)?;
-                Ok(id)
-            }
+            SurfaceData::BSpline {
+                control_points,
+                knots_u,
+                knots_v,
+                degree_u,
+                degree_v,
+            } => self.write_b_spline_surface(
+                *degree_u,
+                *degree_v,
+                control_points,
+                knots_u,
+                knots_v,
+                None,
+            ),
+            SurfaceData::Nurbs {
+                control_points,
+                weights,
+                knots_u,
+                knots_v,
+                degree_u,
+                degree_v,
+            } => self.write_b_spline_surface(
+                *degree_u,
+                *degree_v,
+                control_points,
+                knots_u,
+                knots_v,
+                Some(weights),
+            ),
         }
     }
 
-    /// Write a LINE entity using already-written vertex STEP IDs as endpoints
+    /// Write a B-spline (or rational/NURBS) surface as
+    /// `B_SPLINE_SURFACE_WITH_KNOTS`. When `weights` is supplied and any
+    /// weight differs from 1, the rational complex-entity form is
+    /// emitted per ISO 10303-42. Control points arrive in row-major
+    /// `[u][v]` order; the knot vectors are full (clamped) vectors which
+    /// we collapse into the `(distinct_knots, multiplicities)` pairs the
+    /// schema (and the importer) expect.
+    fn write_b_spline_surface(
+        &mut self,
+        degree_u: u32,
+        degree_v: u32,
+        control_points: &[Vec<[f64; 3]>],
+        knots_u: &[f64],
+        knots_v: &[f64],
+        weights: Option<&[Vec<f64>]>,
+    ) -> std::io::Result<StepId> {
+        // Emit the control-point grid as CARTESIAN_POINTs and collect a
+        // list-of-lists of their ids in [u][v] order.
+        let mut row_id_lists: Vec<String> = Vec::with_capacity(control_points.len());
+        for row in control_points {
+            let mut ids = Vec::with_capacity(row.len());
+            for cp in row {
+                ids.push(self.write_cartesian_point(cp)?);
+            }
+            row_id_lists.push(format!("({})", format_id_list(&ids)));
+        }
+        let cp_grid = row_id_lists.join(",");
+
+        let (u_knots, u_mults) = collapse_knots(knots_u);
+        let (v_knots, v_mults) = collapse_knots(knots_v);
+
+        let rational = weights
+            .map(|w| {
+                w.iter()
+                    .any(|row| row.iter().any(|&x| (x - 1.0).abs() > 1e-12))
+            })
+            .unwrap_or(false);
+
+        let id = self.next_id();
+        if rational {
+            #[allow(clippy::expect_used)]
+            // Reason: `rational` is only true when weights.is_some().
+            let w = weights.expect("rational implies weights present");
+            let weight_grid = w
+                .iter()
+                .map(|row| format!("({})", format_real_list(row)))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(self.writer,
+                "{id}=( BOUNDED_SURFACE() B_SPLINE_SURFACE({du},{dv},({cps}),.UNSPECIFIED.,.F.,.F.,.F.) B_SPLINE_SURFACE_WITH_KNOTS(({um}),({vm}),({uk}),({vk}),.UNSPECIFIED.) GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_SURFACE(({weights})) REPRESENTATION_ITEM('') SURFACE() );",
+                id = id,
+                du = degree_u,
+                dv = degree_v,
+                cps = cp_grid,
+                um = format_int_list(&u_mults),
+                vm = format_int_list(&v_mults),
+                uk = format_real_list(&u_knots),
+                vk = format_real_list(&v_knots),
+                weights = weight_grid,
+            )?;
+        } else {
+            writeln!(self.writer,
+                "{id}=B_SPLINE_SURFACE_WITH_KNOTS('',{du},{dv},({cps}),.UNSPECIFIED.,.F.,.F.,.F.,({um}),({vm}),({uk}),({vk}),.UNSPECIFIED.);",
+                id = id,
+                du = degree_u,
+                dv = degree_v,
+                cps = cp_grid,
+                um = format_int_list(&u_mults),
+                vm = format_int_list(&v_mults),
+                uk = format_real_list(&u_knots),
+                vk = format_real_list(&v_knots),
+            )?;
+        }
+        Ok(id)
+    }
+
+    /// Write a fallback LINE from an already-emitted `CARTESIAN_POINT`
+    /// origin. Used only when an edge has no backing curve in the
+    /// snapshot; the importer re-derives the line's extent from the two
+    /// vertex positions, so the unit-X direction placeholder is inert.
+    /// `_end_point_id` is accepted for call-site symmetry.
     fn write_line_from_vertices(
         &mut self,
-        start_vertex_id: StepId,
-        end_vertex_id: StepId,
+        start_point_id: StepId,
+        _end_point_id: StepId,
     ) -> std::io::Result<StepId> {
-        // Create a direction placeholder (unit X — the actual geometry is defined by vertices)
         let dir_id = self.write_direction(&[1.0, 0.0, 0.0])?;
-        let vec_id = self.next_id();
-        writeln!(self.writer, "{}=VECTOR('',{},1.0);", vec_id, dir_id)?;
-
+        let vec_id = self.write_vector(dir_id, 1.0)?;
         let id = self.next_id();
         writeln!(
             self.writer,
             "{}=LINE('',{},{});",
-            id, start_vertex_id, vec_id
+            id, start_point_id, vec_id
         )?;
         Ok(id)
     }
 
-    /// Write an edge entity
-    pub fn write_edge(
+    /// Write an `EDGE_CURVE` entity.
+    ///
+    /// `vertex_point_map` maps each vertex UUID to an already-emitted
+    /// `VERTEX_POINT` id (so vertices are shared, not duplicated per
+    /// edge). `vertex_geom_map` maps the same UUID to its underlying
+    /// `CARTESIAN_POINT` (used to synthesise a `LINE` when the curve
+    /// lookup misses). The edge references its actual backing curve
+    /// (line / circle / b-spline) when present.
+    fn write_edge_curve(
         &mut self,
         edge: &crate::formats::ros_snapshot::EdgeData,
-        vertex_map: &HashMap<&uuid::Uuid, StepId>,
+        vertex_point_map: &HashMap<&uuid::Uuid, StepId>,
+        vertex_geom_map: &HashMap<&uuid::Uuid, StepId>,
         curve_map: &HashMap<&uuid::Uuid, StepId>,
     ) -> std::io::Result<StepId> {
-        let start_vertex = vertex_map.get(&edge.start_vertex).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing start vertex")
-        })?;
-        let end_vertex = vertex_map.get(&edge.end_vertex).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing end vertex")
-        })?;
+        let v1_id = vertex_point_map
+            .get(&edge.start_vertex)
+            .copied()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing start vertex")
+            })?;
+        let v2_id = vertex_point_map
+            .get(&edge.end_vertex)
+            .copied()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing end vertex")
+            })?;
 
-        // Write VERTEX entities
-        let v1_id = self.next_id();
-        writeln!(self.writer, "{}=VERTEX('',{});", v1_id, start_vertex)?;
-
-        let v2_id = self.next_id();
-        writeln!(self.writer, "{}=VERTEX('',{});", v2_id, end_vertex)?;
-
-        // Write EDGE_CURVE — if no curve exists, synthesize a straight line
-        let curve_id = if let Some(curve_uuid) = &edge.curve {
-            if let Some(&id) = curve_map.get(curve_uuid) {
-                id
-            } else {
-                // Curve UUID exists but wasn't written — create a line from start to end vertex
-                self.write_line_from_vertices(*start_vertex, *end_vertex)?
+        // Reference the edge's actual backing curve. Only fall back to a
+        // straight LINE when there genuinely is no curve to reference
+        // (a degenerate snapshot) — never silently when a curved edge's
+        // curve simply wasn't emitted.
+        let curve_id = match edge.curve.as_ref().and_then(|c| curve_map.get(c).copied()) {
+            Some(id) => id,
+            None => {
+                let s = vertex_geom_map.get(&edge.start_vertex).copied();
+                let e = vertex_geom_map.get(&edge.end_vertex).copied();
+                match (s, e) {
+                    (Some(s_pt), Some(e_pt)) => self.write_line_from_vertices(s_pt, e_pt)?,
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "edge has neither a curve nor resolvable endpoint geometry",
+                        ))
+                    }
+                }
             }
-        } else {
-            // No curve defined — create a straight line from start to end vertex
-            self.write_line_from_vertices(*start_vertex, *end_vertex)?
         };
 
+        let same_sense = if edge.orientation { ".T." } else { ".F." };
         let id = self.next_id();
         writeln!(
             self.writer,
-            "{}=EDGE_CURVE('',{},{},{},.T.);",
-            id, v1_id, v2_id, curve_id
+            "{}=EDGE_CURVE('',{},{},{},{});",
+            id, v1_id, v2_id, curve_id, same_sense
         )?;
         Ok(id)
     }
 
-    /// Write a face entity
-    pub fn write_face(
+    /// Write an `ADVANCED_FACE` and the topology it owns.
+    ///
+    /// Each loop is materialised as an `EDGE_LOOP` of `ORIENTED_EDGE`s
+    /// (with per-edge orientation taken from the loop's `orientations`),
+    /// wrapped in a `FACE_OUTER_BOUND` (outer) or `FACE_BOUND` (inner).
+    fn write_advanced_face(
         &mut self,
         face: &crate::formats::ros_snapshot::FaceData,
         surface_map: &HashMap<&uuid::Uuid, StepId>,
@@ -690,65 +796,83 @@ impl<W: Write> StepWriter<W> {
             ));
         };
 
-        // Write face bounds (loops)
         let mut bound_ids = Vec::new();
 
-        // Outer loop — look up edges from loop data
         if let Some(outer_loop_uuid) = &face.outer_loop {
             if let Some(loop_data) = loop_map.get(outer_loop_uuid) {
-                let outer_edges: Vec<StepId> = loop_data
-                    .edges
-                    .iter()
-                    .filter_map(|edge_uuid| edge_map.get(edge_uuid).copied())
-                    .collect();
-
-                if !outer_edges.is_empty() {
-                    let loop_id = self.write_face_loop(&outer_edges, true)?;
-                    bound_ids.push(loop_id);
+                if let Some(bound_id) = self.write_face_bound(loop_data, edge_map, true)? {
+                    bound_ids.push(bound_id);
                 }
             }
         }
 
-        // Inner loops (holes) — look up edges from loop data
         for inner_loop_uuid in &face.inner_loops {
             if let Some(loop_data) = loop_map.get(inner_loop_uuid) {
-                let inner_edges: Vec<StepId> = loop_data
-                    .edges
-                    .iter()
-                    .filter_map(|edge_uuid| edge_map.get(edge_uuid).copied())
-                    .collect();
-
-                if !inner_edges.is_empty() {
-                    let loop_id = self.write_face_loop(&inner_edges, false)?;
-                    bound_ids.push(loop_id);
+                if let Some(bound_id) = self.write_face_bound(loop_data, edge_map, false)? {
+                    bound_ids.push(bound_id);
                 }
             }
         }
 
-        // Write ADVANCED_FACE
+        if bound_ids.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "face has no resolvable bounds",
+            ));
+        }
+
+        // ADVANCED_FACE same_sense follows the face's stored orientation.
+        let same_sense = if face.orientation { ".T." } else { ".F." };
         let id = self.next_id();
         writeln!(
             self.writer,
-            "{}=ADVANCED_FACE('',({}),{},.T.);",
+            "{}=ADVANCED_FACE('',({}),{},{});",
             id,
             format_id_list(&bound_ids),
-            surface_id
+            surface_id,
+            same_sense
         )?;
         Ok(id)
     }
 
-    /// Write a face loop
-    fn write_face_loop(&mut self, edges: &[StepId], is_outer: bool) -> std::io::Result<StepId> {
-        // Write EDGE_LOOP
+    /// Materialise one loop as `ORIENTED_EDGE`s → `EDGE_LOOP` →
+    /// `FACE_OUTER_BOUND`/`FACE_BOUND`. Returns `None` when no edge in
+    /// the loop resolves (a degenerate loop is dropped rather than
+    /// emitting an empty `EDGE_LOOP`, which the schema forbids).
+    fn write_face_bound(
+        &mut self,
+        loop_data: &crate::formats::ros_snapshot::LoopData,
+        edge_map: &HashMap<&uuid::Uuid, StepId>,
+        is_outer: bool,
+    ) -> std::io::Result<Option<StepId>> {
+        let mut oriented_ids = Vec::with_capacity(loop_data.edges.len());
+        for (i, edge_uuid) in loop_data.edges.iter().enumerate() {
+            let Some(edge_id) = edge_map.get(edge_uuid).copied() else {
+                continue;
+            };
+            let forward = loop_data.orientations.get(i).copied().unwrap_or(true);
+            let oriented_id = self.next_id();
+            writeln!(
+                self.writer,
+                "{}=ORIENTED_EDGE('',*,*,{},{});",
+                oriented_id,
+                edge_id,
+                if forward { ".T." } else { ".F." }
+            )?;
+            oriented_ids.push(oriented_id);
+        }
+        if oriented_ids.is_empty() {
+            return Ok(None);
+        }
+
         let loop_id = self.next_id();
         writeln!(
             self.writer,
             "{}=EDGE_LOOP('',({}));",
             loop_id,
-            format_id_list(edges)
+            format_id_list(&oriented_ids)
         )?;
 
-        // Write FACE_BOUND or FACE_OUTER_BOUND
         let bound_id = self.next_id();
         if is_outer {
             writeln!(
@@ -757,10 +881,9 @@ impl<W: Write> StepWriter<W> {
                 bound_id, loop_id
             )?;
         } else {
-            writeln!(self.writer, "{}=FACE_BOUND('',{},.F.);", bound_id, loop_id)?;
+            writeln!(self.writer, "{}=FACE_BOUND('',{},.T.);", bound_id, loop_id)?;
         }
-
-        Ok(bound_id)
+        Ok(Some(bound_id))
     }
 
     /// Write a shell entity
@@ -794,41 +917,127 @@ impl<W: Write> StepWriter<W> {
         Ok(id)
     }
 
-    /// Write a solid entity
-    pub fn write_solid(
+    /// Write the solid B-Rep entity for `solid`, returning its id.
+    ///
+    /// The first shell is the outer boundary. If the solid carries
+    /// additional (inner) shells they are voids: a `BREP_WITH_VOIDS`
+    /// (with `ORIENTED_CLOSED_SHELL` wrappers) is emitted instead of a
+    /// plain `MANIFOLD_SOLID_BREP`. The solid `name` is carried into the
+    /// entity label.
+    fn write_solid_brep(
         &mut self,
         solid: &crate::formats::ros_snapshot::SolidData,
-        _solid_id: &uuid::Uuid,
         shell_map: &HashMap<&uuid::Uuid, StepId>,
     ) -> std::io::Result<StepId> {
-        // Get the first shell (typically the outer shell)
-        let shell_id = if let Some(first_shell) = solid.shells.first() {
-            shell_map.get(first_shell).copied().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing shell")
-            })?
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Solid has no shells",
-            ));
-        };
+        let mut shell_ids = solid
+            .shells
+            .iter()
+            .filter_map(|s| shell_map.get(s).copied());
+        let outer = shell_ids.next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Solid has no shells")
+        })?;
+        let voids: Vec<StepId> = shell_ids.collect();
 
-        // Write MANIFOLD_SOLID_BREP
+        let label = solid
+            .feature_type
+            .as_deref()
+            .map(escape_step_string)
+            .unwrap_or_default();
+
         let id = self.next_id();
-        writeln!(self.writer, "{}=MANIFOLD_SOLID_BREP('',{});", id, shell_id)?;
+        if voids.is_empty() {
+            writeln!(
+                self.writer,
+                "{}=MANIFOLD_SOLID_BREP('{}',{});",
+                id, label, outer
+            )?;
+        } else {
+            // Each void shell is wrapped in an ORIENTED_CLOSED_SHELL
+            // oriented inward (.F.) per ISO 10303-42 BREP_WITH_VOIDS.
+            let mut oriented_voids = Vec::with_capacity(voids.len());
+            for v in voids {
+                let ov = self.next_id();
+                writeln!(self.writer, "{}=ORIENTED_CLOSED_SHELL('',{},.F.);", ov, v)?;
+                oriented_voids.push(ov);
+            }
+            writeln!(
+                self.writer,
+                "{}=BREP_WITH_VOIDS('{}',{},({}));",
+                id,
+                label,
+                outer,
+                format_id_list(&oriented_voids)
+            )?;
+        }
+        Ok(id)
+    }
 
-        // Write geometric context for the shape representation
-        let context_id = self.write_geometric_context()?;
+    /// Emit the PRODUCT structure chain that lets a STEP importer locate
+    /// the shape: `PRODUCT` → `PRODUCT_DEFINITION_FORMATION` →
+    /// `PRODUCT_DEFINITION` → `PRODUCT_DEFINITION_SHAPE` →
+    /// `SHAPE_DEFINITION_REPRESENTATION` bound to `shape_rep_id`. A
+    /// minimal `APPLICATION_CONTEXT` / `PRODUCT_DEFINITION_CONTEXT`
+    /// scaffold is shared per call. Without this chain mainstream CAD
+    /// imports the file as empty.
+    fn write_product_structure(&mut self, name: &str, shape_rep_id: StepId) -> std::io::Result<()> {
+        let label = escape_step_string(name);
 
-        // Write ADVANCED_BREP_SHAPE_REPRESENTATION
-        let shape_id = self.next_id();
+        let app_ctx = self.next_id();
         writeln!(
             self.writer,
-            "{}=ADVANCED_BREP_SHAPE_REPRESENTATION('',({},{}),{});",
-            shape_id, id, context_id, context_id
+            "{}=APPLICATION_CONTEXT('managed model based 3d engineering');",
+            app_ctx
+        )?;
+        let app_proto = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=APPLICATION_PROTOCOL_DEFINITION('international standard','ap242_managed_model_based_3d_engineering',2020,{});",
+            app_proto, app_ctx
+        )?;
+        let prod_ctx = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=PRODUCT_CONTEXT('',{},'mechanical');",
+            prod_ctx, app_ctx
+        )?;
+        let prod_def_ctx = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=PRODUCT_DEFINITION_CONTEXT('part definition',{},'design');",
+            prod_def_ctx, app_ctx
         )?;
 
-        Ok(shape_id)
+        let product = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=PRODUCT('{}','{}','',({}));",
+            product, label, label, prod_ctx
+        )?;
+        let formation = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=PRODUCT_DEFINITION_FORMATION('','',{});",
+            formation, product
+        )?;
+        let prod_def = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=PRODUCT_DEFINITION('design','',{},{});",
+            prod_def, formation, prod_def_ctx
+        )?;
+        let pds = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=PRODUCT_DEFINITION_SHAPE('','',{});",
+            pds, prod_def
+        )?;
+        let sdr = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=SHAPE_DEFINITION_REPRESENTATION({},{});",
+            sdr, pds, shape_rep_id
+        )?;
+        Ok(())
     }
 
     /// Write a geometric representation context (required by ADVANCED_BREP_SHAPE_REPRESENTATION)
@@ -878,6 +1087,107 @@ impl<W: Write> StepWriter<W> {
         )?;
 
         Ok(ctx_id)
+    }
+
+    /// Emit a complete B-Rep model into the DATA section: geometry,
+    /// topology, solids, an `ADVANCED_BREP_SHAPE_REPRESENTATION`
+    /// (sharing `context_id`), and the PRODUCT structure that anchors
+    /// the shape. Returns the number of solids written.
+    ///
+    /// `context_id` is allocated once by the caller (via
+    /// [`Self::write_geometric_context`]) and shared across every solid
+    /// in the file, as the audit requires.
+    fn write_brep_model(
+        &mut self,
+        snapshot: &BRepSnapshot,
+        context_id: StepId,
+        model_name: &str,
+    ) -> std::io::Result<usize> {
+        // Vertices: one CARTESIAN_POINT + one VERTEX_POINT each, shared
+        // by every edge that references the vertex.
+        let mut vertex_geom_map: HashMap<&Uuid, StepId> = HashMap::new();
+        let mut vertex_point_map: HashMap<&Uuid, StepId> = HashMap::new();
+        for (vid, vertex) in &snapshot.vertices {
+            let pt = self.write_cartesian_point(&vertex.position)?;
+            vertex_geom_map.insert(vid, pt);
+            let vp = self.next_id();
+            writeln!(self.writer, "{}=VERTEX_POINT('',{});", vp, pt)?;
+            vertex_point_map.insert(vid, vp);
+        }
+
+        // Curves.
+        let mut curve_map: HashMap<&Uuid, StepId> = HashMap::new();
+        for (cid, curve) in &snapshot.curves {
+            let step_id = self.write_curve(curve, &vertex_geom_map)?;
+            curve_map.insert(cid, step_id);
+        }
+
+        // Surfaces.
+        let mut surface_map: HashMap<&Uuid, StepId> = HashMap::new();
+        for (sid, surface) in &snapshot.surfaces {
+            let step_id = self.write_surface(surface)?;
+            surface_map.insert(sid, step_id);
+        }
+
+        // Edges (EDGE_CURVE).
+        let mut edge_map: HashMap<&Uuid, StepId> = HashMap::new();
+        for (eid, edge) in &snapshot.edges {
+            let step_id =
+                self.write_edge_curve(edge, &vertex_point_map, &vertex_geom_map, &curve_map)?;
+            edge_map.insert(eid, step_id);
+        }
+
+        let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> =
+            snapshot.loops.iter().map(|(id, data)| (id, data)).collect();
+
+        // Faces (ADVANCED_FACE + bounds/loops/oriented-edges).
+        let mut face_map: HashMap<&Uuid, StepId> = HashMap::new();
+        for (fid, face) in &snapshot.faces {
+            let step_id = self.write_advanced_face(face, &surface_map, &edge_map, &loop_map)?;
+            face_map.insert(fid, step_id);
+        }
+
+        // Shells.
+        let mut shell_map: HashMap<&Uuid, StepId> = HashMap::new();
+        for (sid, shell) in &snapshot.shells {
+            let step_id = self.write_shell(shell, &face_map)?;
+            shell_map.insert(sid, step_id);
+        }
+
+        // Solids → ADVANCED_BREP_SHAPE_REPRESENTATION items + product
+        // structure. Every solid in the file shares one context.
+        let mut solid_ids = Vec::with_capacity(snapshot.solids.len());
+        for (_solid_id, solid) in &snapshot.solids {
+            let brep_id = self.write_solid_brep(solid, &shell_map)?;
+            solid_ids.push(brep_id);
+        }
+        let solid_count = solid_ids.len();
+
+        if !solid_ids.is_empty() {
+            // World-origin placement, listed alongside the solids as a
+            // representation item (the importer treats it as the origin).
+            let origin = self.write_axis2_placement_3d(
+                &[0.0, 0.0, 0.0],
+                Some(&[0.0, 0.0, 1.0]),
+                Some(&[1.0, 0.0, 0.0]),
+            )?;
+            let mut items = solid_ids.clone();
+            items.push(origin);
+
+            let shape_id = self.next_id();
+            writeln!(
+                self.writer,
+                "{}=ADVANCED_BREP_SHAPE_REPRESENTATION('{}',({}),{});",
+                shape_id,
+                escape_step_string(model_name),
+                format_id_list(&items),
+                context_id
+            )?;
+
+            self.write_product_structure(model_name, shape_id)?;
+        }
+
+        Ok(solid_count)
     }
 
     /// Flush the writer
@@ -978,6 +1288,39 @@ fn format_id_list(ids: &[StepId]) -> String {
         .join(",")
 }
 
+/// Escape a Rust string for inclusion inside a STEP single-quoted
+/// string literal. ISO 10303-21 §6.3.2 escapes an embedded apostrophe
+/// by doubling it (`''`). Backslashes are control-directive
+/// introducers in P21; we double them defensively so a stray `\` in a
+/// model name can't open a malformed `\X\`-style directive.
+fn escape_step_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
+}
+
+/// Collapse a full (clamped) knot vector into the
+/// `(distinct_knots, multiplicities)` pair that
+/// `B_SPLINE_CURVE_WITH_KNOTS` / `B_SPLINE_SURFACE_WITH_KNOTS` carry.
+/// The kernel and the importer both store knots in expanded form; the
+/// STEP schema stores the distinct values with their multiplicities.
+fn collapse_knots(knots: &[f64]) -> (Vec<f64>, Vec<u32>) {
+    let mut distinct: Vec<f64> = Vec::new();
+    let mut mults: Vec<u32> = Vec::new();
+    for &k in knots {
+        match distinct.last() {
+            Some(&last) if (k - last).abs() < 1e-10 => {
+                if let Some(m) = mults.last_mut() {
+                    *m += 1;
+                }
+            }
+            _ => {
+                distinct.push(k);
+                mults.push(1u32);
+            }
+        }
+    }
+    (distinct, mults)
+}
+
 /// Export B-Rep model to STEP format
 pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), ExportError> {
     // Create file
@@ -1000,93 +1343,27 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
         reason: format!("Failed to begin STEP data section: {}", e),
     })?;
 
-    // Convert to snapshot for easier iteration
+    // Convert to snapshot for easier iteration.
     let snapshot = BRepSnapshot::from_model(model);
 
-    // Write geometry entities - COMPREHENSIVE IMPLEMENTATION
+    // One geometric_representation_context shared across every solid.
+    let context_id = writer
+        .write_geometric_context()
+        .map_err(|e| ExportError::ExportFailed {
+            reason: format!("Failed to write geometric context: {}", e),
+        })?;
 
-    // Step 1: Write all vertices as CARTESIAN_POINT
-    let mut vertex_map = HashMap::new();
-    for (vid, vertex) in &snapshot.vertices {
-        let point = vertex.position;
-        let step_id =
-            writer
-                .write_cartesian_point(&point)
-                .map_err(|e| ExportError::ExportFailed {
-                    reason: format!("Failed to write vertex: {}", e),
-                })?;
-        vertex_map.insert(vid, step_id);
-    }
+    let model_name = snapshot
+        .solids
+        .iter()
+        .find_map(|(_, s)| s.feature_type.clone())
+        .unwrap_or_else(|| "Roshera Model".to_string());
 
-    // Step 2: Write all curves
-    let mut curve_map = HashMap::new();
-    for (cid, curve) in &snapshot.curves {
-        let step_id =
-            writer
-                .write_curve(curve, &vertex_map)
-                .map_err(|e| ExportError::ExportFailed {
-                    reason: format!("Failed to write curve: {}", e),
-                })?;
-        curve_map.insert(cid, step_id);
-    }
-
-    // Step 3: Write all surfaces
-    let mut surface_map = HashMap::new();
-    for (sid, surface) in &snapshot.surfaces {
-        let step_id = writer
-            .write_surface(surface)
-            .map_err(|e| ExportError::ExportFailed {
-                reason: format!("Failed to write surface: {}", e),
-            })?;
-        surface_map.insert(sid, step_id);
-    }
-
-    // Step 4: Write all edges as EDGE_CURVE
-    let mut edge_map = HashMap::new();
-    for (eid, edge) in &snapshot.edges {
-        let step_id = writer
-            .write_edge(edge, &vertex_map, &curve_map)
-            .map_err(|e| ExportError::ExportFailed {
-                reason: format!("Failed to write edge: {}", e),
-            })?;
-        edge_map.insert(eid, step_id);
-    }
-
-    // Build loop lookup map: Uuid -> &LoopData
-    let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> =
-        snapshot.loops.iter().map(|(id, data)| (id, data)).collect();
-
-    // Step 5: Write all faces as ADVANCED_FACE
-    let mut face_map = HashMap::new();
-    for (fid, face) in &snapshot.faces {
-        let step_id = writer
-            .write_face(face, &surface_map, &edge_map, &loop_map)
-            .map_err(|e| ExportError::ExportFailed {
-                reason: format!("Failed to write face: {}", e),
-            })?;
-        face_map.insert(fid, step_id);
-    }
-
-    // Step 6: Write shells
-    let mut shell_map = HashMap::new();
-    for (sid, shell) in &snapshot.shells {
-        let step_id =
-            writer
-                .write_shell(shell, &face_map)
-                .map_err(|e| ExportError::ExportFailed {
-                    reason: format!("Failed to write shell: {}", e),
-                })?;
-        shell_map.insert(sid, step_id);
-    }
-
-    // Step 7: Write solids as MANIFOLD_SOLID_BREP
-    for (solid_id, solid) in &snapshot.solids {
-        writer
-            .write_solid(solid, solid_id, &shell_map)
-            .map_err(|e| ExportError::ExportFailed {
-                reason: format!("Failed to write solid: {}", e),
-            })?;
-    }
+    writer
+        .write_brep_model(&snapshot, context_id, &model_name)
+        .map_err(|e| ExportError::ExportFailed {
+            reason: format!("Failed to write B-Rep model: {}", e),
+        })?;
 
     // End data section
     writer.end_data().map_err(|e| ExportError::ExportFailed {
@@ -1110,8 +1387,6 @@ pub async fn export_assembly_to_step(
     assembly: &geometry_engine::assembly::Assembly,
     path: &Path,
 ) -> Result<(), ExportError> {
-    use geometry_engine::assembly::*;
-
     // Create file
     let file = std::fs::File::create(path).map_err(|_| ExportError::FileWriteError {
         path: path.to_string_lossy().to_string(),
@@ -1134,98 +1409,30 @@ pub async fn export_assembly_to_step(
         reason: format!("Failed to begin STEP data section: {}", e),
     })?;
 
-    // Export each component's geometry
-    let mut component_step_ids = Vec::new();
-    for component in assembly.components() {
+    // One shared geometric_representation_context for the whole file.
+    let context_id = writer
+        .write_geometric_context()
+        .map_err(|e| ExportError::ExportFailed {
+            reason: format!("Failed to write geometric context: {}", e),
+        })?;
+
+    // Export each component's geometry as a complete, anchored B-Rep
+    // model (geometry + topology + solids + product structure).
+    for (idx, component) in assembly.components().enumerate() {
         if !component.properties.suppressed {
-            // Convert component's B-Rep model to STEP entities
             let snapshot = BRepSnapshot::from_model(&component.part);
-
-            // Write all geometry entities for this component
-            let mut vertex_map = HashMap::new();
-            for (vid, vertex) in &snapshot.vertices {
-                let step_id = writer
-                    .write_cartesian_point(&vertex.position)
-                    .map_err(|e| ExportError::ExportFailed {
-                        reason: format!("Failed to write vertex: {}", e),
-                    })?;
-                vertex_map.insert(vid, step_id);
-            }
-
-            let mut curve_map = HashMap::new();
-            for (cid, curve) in &snapshot.curves {
-                let step_id = writer.write_curve(curve, &vertex_map).map_err(|e| {
-                    ExportError::ExportFailed {
-                        reason: format!("Failed to write curve: {}", e),
-                    }
+            let comp_name = snapshot
+                .solids
+                .iter()
+                .find_map(|(_, s)| s.feature_type.clone())
+                .unwrap_or_else(|| format!("{}_component_{}", assembly.name, idx));
+            writer
+                .write_brep_model(&snapshot, context_id, &comp_name)
+                .map_err(|e| ExportError::ExportFailed {
+                    reason: format!("Failed to write assembly component: {}", e),
                 })?;
-                curve_map.insert(cid, step_id);
-            }
-
-            let mut surface_map = HashMap::new();
-            for (sid, surface) in &snapshot.surfaces {
-                let step_id =
-                    writer
-                        .write_surface(surface)
-                        .map_err(|e| ExportError::ExportFailed {
-                            reason: format!("Failed to write surface: {}", e),
-                        })?;
-                surface_map.insert(sid, step_id);
-            }
-
-            let mut edge_map = HashMap::new();
-            for (eid, edge) in &snapshot.edges {
-                let step_id = writer
-                    .write_edge(edge, &vertex_map, &curve_map)
-                    .map_err(|e| ExportError::ExportFailed {
-                        reason: format!("Failed to write edge: {}", e),
-                    })?;
-                edge_map.insert(eid, step_id);
-            }
-
-            let loop_map: HashMap<&Uuid, &crate::formats::ros_snapshot::LoopData> =
-                snapshot.loops.iter().map(|(id, data)| (id, data)).collect();
-
-            let mut face_map = HashMap::new();
-            for (fid, face) in &snapshot.faces {
-                let step_id = writer
-                    .write_face(face, &surface_map, &edge_map, &loop_map)
-                    .map_err(|e| ExportError::ExportFailed {
-                        reason: format!("Failed to write face: {}", e),
-                    })?;
-                face_map.insert(fid, step_id);
-            }
-
-            let mut shell_map = HashMap::new();
-            for (sid, shell) in &snapshot.shells {
-                let step_id = writer.write_shell(shell, &face_map).map_err(|e| {
-                    ExportError::ExportFailed {
-                        reason: format!("Failed to write shell: {}", e),
-                    }
-                })?;
-                shell_map.insert(sid, step_id);
-            }
-
-            // Write solids and capture the last shape ID for this component
-            let mut last_shape_id = writer.next_id(); // fallback
-            for (solid_id, solid) in &snapshot.solids {
-                last_shape_id = writer
-                    .write_solid(solid, solid_id, &shell_map)
-                    .map_err(|e| ExportError::ExportFailed {
-                        reason: format!("Failed to write solid: {}", e),
-                    })?;
-            }
-
-            component_step_ids.push((last_shape_id, component.transform.clone()));
         }
     }
-
-    // Write assembly structure
-    writer
-        .write_assembly_structure(&assembly.name, &component_step_ids)
-        .map_err(|e| ExportError::ExportFailed {
-            reason: format!("Failed to write assembly structure: {}", e),
-        })?;
 
     // Write mate constraints as AP203 relationships
     for mate in assembly.mates() {
@@ -1665,7 +1872,9 @@ mod tests {
     }
 
     #[test]
-    fn write_curve_arc_emits_trimmed_curve() {
+    fn write_curve_arc_emits_basis_circle() {
+        // An arc edge references its unbounded basis CIRCLE; the extent
+        // is carried by the EDGE_CURVE vertices, not a TRIMMED_CURVE.
         let out = write_into(|w| {
             let curve = CurveData::Arc {
                 center: [0.0, 0.0, 0.0],
@@ -1679,10 +1888,11 @@ mod tests {
             Ok(())
         });
         assert!(out.contains("CIRCLE"));
-        assert!(out.contains("PARAMETER_VALUE"));
-        assert!(out.contains("TRIMMED_CURVE"));
-        // end_angle > start_angle → .T.
-        assert!(out.contains(".T."));
+        assert!(
+            !out.contains("TRIMMED_CURVE"),
+            "B-Rep arc edge uses basis circle: {out}"
+        );
+        assert!(!out.contains("PARAMETER_VALUE"));
     }
 
     #[test]
@@ -1762,22 +1972,9 @@ mod tests {
         assert!(out.contains(",2.5)"));
     }
 
-    #[test]
-    fn write_surface_cone_converts_radians_to_degrees() {
-        // half-angle of π/4 rad → 45 degrees in output
-        let out = write_into(|w| {
-            let s = SurfaceData::Cone {
-                apex: [0.0, 0.0, 0.0],
-                axis: [0.0, 0.0, 1.0],
-                half_angle: std::f64::consts::FRAC_PI_4,
-            };
-            w.write_surface(&s)?;
-            Ok(())
-        });
-        assert!(out.contains("CONICAL_SURFACE"));
-        // 45.0 degrees (or close, due to f64 print of FRAC_PI_4.to_degrees())
-        assert!(out.contains(",45"));
-    }
+    // (cone semi-angle is now asserted in radians — see
+    // `cone_semi_angle_emitted_in_radians` below. The earlier
+    // degrees-based assertion was the bug.)
 
     #[test]
     fn write_surface_torus() {
@@ -1941,5 +2138,148 @@ mod tests {
             Ok(())
         });
         assert!(out_p.contains("PARALLEL_CONSTRAINT"));
+    }
+
+    // ─── L. Header & structural fixes ──────────────────────────────
+
+    #[test]
+    fn header_records_are_semicolon_terminated() {
+        let out = write_into(|w| w.write_header(&StepHeader::default()));
+        for key in ["FILE_DESCRIPTION", "FILE_NAME", "FILE_SCHEMA"] {
+            let line = out
+                .lines()
+                .find(|l| l.starts_with(key))
+                .unwrap_or_else(|| panic!("{key} present"));
+            assert!(
+                line.trim_end().ends_with(';'),
+                "{key} must end in ;: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn b_spline_curve_non_rational_enum_has_leading_dot() {
+        let cps = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        let knots = vec![0.0, 0.0, 1.0, 1.0];
+        let mults = vec![2, 2];
+        let out = write_into(|w| {
+            w.write_b_spline_curve(1, &cps, &knots, &mults, false, None)?;
+            Ok(())
+        });
+        // The bug was a missing leading `.` on the trailing UNSPECIFIED
+        // enum (`UNSPECIFIED.`), which made the record unparseable.
+        assert!(out.contains(".UNSPECIFIED.);"), "got: {out}");
+        assert!(
+            !out.contains(",UNSPECIFIED."),
+            "stray bare UNSPECIFIED: {out}"
+        );
+    }
+
+    #[test]
+    fn cone_semi_angle_emitted_in_radians() {
+        let out = write_into(|w| {
+            let s = SurfaceData::Cone {
+                apex: [0.0, 0.0, 0.0],
+                axis: [0.0, 0.0, 1.0],
+                half_angle: std::f64::consts::FRAC_PI_4,
+            };
+            w.write_surface(&s)?;
+            Ok(())
+        });
+        assert!(out.contains("CONICAL_SURFACE"));
+        // π/4 rad ≈ 0.785398, NOT 45 (degrees).
+        assert!(
+            out.contains("0.785398"),
+            "semi-angle must be radians: {out}"
+        );
+        assert!(
+            !out.contains(",45.0") && !out.contains(",45)"),
+            "no degrees: {out}"
+        );
+    }
+
+    #[test]
+    fn nurbs_surface_emits_control_net_not_abstract_surface() {
+        let out = write_into(|w| {
+            let s = SurfaceData::Nurbs {
+                control_points: vec![
+                    vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                    vec![[0.0, 1.0, 0.0], [1.0, 1.0, 1.0]],
+                ],
+                weights: vec![vec![1.0, 0.5], vec![1.0, 1.0]],
+                knots_u: vec![0.0, 0.0, 1.0, 1.0],
+                knots_v: vec![0.0, 0.0, 1.0, 1.0],
+                degree_u: 1,
+                degree_v: 1,
+            };
+            w.write_surface(&s)?;
+            Ok(())
+        });
+        assert!(out.contains("B_SPLINE_SURFACE_WITH_KNOTS"), "got: {out}");
+        assert!(
+            out.contains("RATIONAL_B_SPLINE_SURFACE"),
+            "weighted → rational: {out}"
+        );
+        assert!(
+            !out.contains("=SURFACE('')"),
+            "no abstract SURFACE drop: {out}"
+        );
+    }
+
+    #[test]
+    fn multi_shell_solid_emits_brep_with_voids_and_name() {
+        use crate::formats::ros_snapshot::{BRepSnapshot, ShellData, ShellType, SolidData};
+
+        // Two empty closed shells in one solid is enough to exercise the
+        // outer-vs-void routing in `write_solid_brep`; no faces are
+        // needed (and an empty face list keeps the topology emitters,
+        // which would reject an edgeless loop, out of the way).
+        let mut snap = BRepSnapshot::new();
+        let mk_shell = |snap: &mut BRepSnapshot| -> Uuid {
+            let sh = Uuid::new_v4();
+            snap.shells.push((
+                sh,
+                ShellData {
+                    faces: vec![],
+                    is_closed: true,
+                    shell_type: ShellType::Closed,
+                },
+            ));
+            sh
+        };
+        let outer = mk_shell(&mut snap);
+        let inner = mk_shell(&mut snap);
+        snap.solids.push((
+            Uuid::new_v4(),
+            SolidData {
+                shells: vec![outer, inner],
+                feature_type: Some("hollow_block".to_string()),
+            },
+        ));
+
+        let out = write_into(|w| {
+            let ctx = w.write_geometric_context()?;
+            w.write_brep_model(&snap, ctx, "hollow_block")?;
+            Ok(())
+        });
+        assert!(
+            out.contains("BREP_WITH_VOIDS"),
+            "two-shell solid → voids: {out}"
+        );
+        assert!(out.contains("ORIENTED_CLOSED_SHELL"), "void wrapper: {out}");
+        assert!(out.contains("'hollow_block'"), "solid name carried: {out}");
+    }
+
+    #[test]
+    fn collapse_knots_groups_multiplicities() {
+        let (distinct, mults) = collapse_knots(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        assert_eq!(distinct, vec![0.0, 1.0]);
+        assert_eq!(mults, vec![3, 3]);
+    }
+
+    #[test]
+    fn escape_step_string_doubles_apostrophe() {
+        assert_eq!(escape_step_string("O'Brien"), "O''Brien");
+        assert_eq!(escape_step_string("a\\b"), "a\\\\b");
     }
 }
