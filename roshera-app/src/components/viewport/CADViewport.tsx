@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { Canvas } from '@react-three/fiber'
-import { Box, Grid3x3, SquareDashed } from 'lucide-react'
+import { Box, Grid3x3, SquareDashed, Tags } from 'lucide-react'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
 import { SceneLighting } from './SceneLighting'
@@ -16,6 +16,8 @@ import { SubElementHighlight } from './SubElementHighlight'
 import { ModifyPreview } from './ModifyPreview'
 import { ViewportContextMenu } from './ViewportContextMenu'
 import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
+import { LabelHoverTooltip } from './LabelHoverTooltip'
+import { PartLabels } from './PartLabels'
 import { SketchOverlay } from './SketchOverlay'
 import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
@@ -186,6 +188,7 @@ export function CADViewport() {
         <SelectionOutline />
         <SketchOverlay />
         <ServerSketches />
+        <PartLabels />
       </Canvas>
 
       <ViewportFrame />
@@ -198,6 +201,7 @@ export function CADViewport() {
       <SectionViewPanel />
       <ViewportContextMenu />
       <ExtrudeHoverTooltip />
+      <LabelHoverTooltip />
       <CSketchDofHud />
       <SketchPanel />
       <MateSuggestionPopover />
@@ -513,6 +517,8 @@ function ViewportControls() {
   const setGridSettings = useSceneStore((s) => s.setGridSettings)
   const projection = useSceneStore((s) => s.cameraProjection)
   const toggleProjection = useSceneStore((s) => s.toggleCameraProjection)
+  const labelsVisible = useSceneStore((s) => s.labelsVisible)
+  const toggleLabelsVisible = useSceneStore((s) => s.toggleLabelsVisible)
 
   const toggleGrid = useCallback(() => {
     setGridSettings({ visible: !gridVisible })
@@ -554,6 +560,20 @@ function ViewportControls() {
         ].join(' ')}
       >
         <Grid3x3 className="w-3.5 h-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={toggleLabelsVisible}
+        title={labelsVisible ? 'Hide labels' : 'Show labels'}
+        aria-pressed={labelsVisible}
+        className={[
+          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
+          labelsVisible
+            ? 'text-foreground border-border'
+            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
+        ].join(' ')}
+      >
+        <Tags className="w-3.5 h-3.5" />
       </button>
     </div>
   )
