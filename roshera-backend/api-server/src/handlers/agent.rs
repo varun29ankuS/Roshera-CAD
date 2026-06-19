@@ -373,7 +373,8 @@ pub async fn render_part(
 ) -> Result<Json<RenderResponse>, StatusCode> {
     use base64::Engine as _;
     use geometry_engine::render::{
-        render_solid, render_solid_with_labels, CanonicalView, RenderMode, RenderOptions,
+        render_solid, render_solid_with_label_marks, CanonicalView, LabelMark, RenderMode,
+        RenderOptions,
     };
 
     let view_name = q.view.as_deref().unwrap_or("iso");
@@ -407,12 +408,32 @@ pub async fn render_part(
         // the label-aware renderer. Build a callout per label that has a world
         // anchor (name uppercased so the engineering 5×7 font renders it).
         let mut model = model_handle.write().await;
-        let callouts: Vec<(geometry_engine::math::Point3, String)> = model
-            .list_labels()
-            .into_iter()
-            .filter_map(|(name, _kind, anchor, _desc)| anchor.map(|p| (p, name.to_uppercase())))
-            .collect();
-        render_solid_with_labels(&model, id as SolidId, &callouts, &opts)
+        // COLOR-CODED set-of-marks: each callout = "name — measurement.display",
+        // drawn in the label's deterministic colour, with the target face tinted
+        // the same colour so the picture itself maps mark → feature.
+        let names: Vec<String> = model.list_labels().into_iter().map(|(n, ..)| n).collect();
+        let mut marks: Vec<LabelMark> = Vec::new();
+        for name in names {
+            let Some(anchor) = model.label_anchor(&name) else {
+                continue;
+            };
+            let color = geometry_engine::labels::label_color(&name);
+            let measurement = model.label_measurement(&name);
+            // The labelled face id (if it is a face label) so the render can tint
+            // it; non-face labels still get a coloured callout.
+            let target_face = model.resolve_label_face(&name).ok();
+            let text = match &measurement {
+                Some(m) => format!("{} - {}", name.to_uppercase(), m.display),
+                None => name.to_uppercase(),
+            };
+            marks.push(LabelMark {
+                anchor,
+                text,
+                color,
+                target_face,
+            });
+        }
+        render_solid_with_label_marks(&model, id as SolidId, &marks, &opts)
             .ok_or(StatusCode::NOT_FOUND)?
     } else {
         let model = model_handle.read().await;
@@ -1172,6 +1193,13 @@ fn label_error_response(
                 "message": "an entity label must carry an assertion (a selector or fingerprint) — no bare labels",
             })),
         ),
+        LabelError::NameInUse => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "resolved": false, "error": "name_in_use",
+                "message": "another label already has that name",
+            })),
+        ),
     }
 }
 
@@ -1396,12 +1424,31 @@ fn resolve_selector(
                 .and_then(|v| v.as_str())
                 .unwrap_or("none")
                 .to_string();
+            // Geometry-aware extremals (the throat / exit recognizers) carry the
+            // symmetry axis in the selector body so a proposal confirms verbatim.
+            let axis_origin = vec3("axis_origin");
+            let axis_dir = vec3("axis_dir");
+            let spec_axis = match (axis_origin, axis_dir) {
+                (Some(o), Some(d)) => Some(geometry_engine::queries::select::Axis {
+                    origin: o,
+                    direction: d,
+                }),
+                _ => None,
+            };
             let extremal = match extremal_tag.as_str() {
                 "largest_area" | "largest" => Extremal::LargestArea,
                 "smallest_area" | "smallest" => Extremal::SmallestArea,
                 "most_along" | "topmost" | "furthest" => {
                     Extremal::MostAlong(along.unwrap_or(Vector3::Z))
                 }
+                "min_radius_station" | "min_radius" => match spec_axis {
+                    Some(a) => Extremal::MinRadiusStation(a),
+                    None => Extremal::None,
+                },
+                "axial_extremal_cap" | "axial_cap" => match spec_axis {
+                    Some(a) => Extremal::AxialExtremalCap(a),
+                    None => Extremal::None,
+                },
                 _ => Extremal::None,
             };
             let mut q = FaceQuery::new(surf);
@@ -1416,6 +1463,8 @@ fn resolve_selector(
                 angle_tol_deg: q.angle_tol_deg,
                 extremal: extremal_tag,
                 along: v3arr(along),
+                axis_origin: v3arr(axis_origin),
+                axis_dir: v3arr(axis_dir),
             });
             resolve_face(model, solid, &q)
                 .map(|fid| (fid, spec))
@@ -1495,15 +1544,42 @@ pub async fn list_labels(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
 ) -> Json<serde_json::Value> {
+    use geometry_engine::labels::AssertionStatus;
     let mut model = model_handle.write().await;
-    let labels: Vec<serde_json::Value> = model
-        .list_labels()
+    // Snapshot (name, kind, anchor, description) first — list_labels warms the
+    // centroid cache — then enrich each with measurement / colour / conformance /
+    // stale. The per-label fields are ADDITIVE: existing consumers that read only
+    // name / kind / anchor / description keep working unchanged.
+    let base: Vec<(
+        String,
+        &'static str,
+        Option<geometry_engine::math::Point3>,
+        Option<String>,
+    )> = model.list_labels();
+    let labels: Vec<serde_json::Value> = base
         .into_iter()
         .map(|(name, kind, anchor, description)| {
+            let color = geometry_engine::labels::label_color_hex(&name);
+            let measurement = model.label_measurement(&name).map(|m| {
+                serde_json::json!({
+                    "value": m.value,
+                    "unit": m.unit,
+                    "kind": m.kind.tag(),
+                    "display": m.display,
+                })
+            });
+            let conformance = model.label_conformance(&name);
+            // A section label is its own claim and always holds; an entity label
+            // is stale when its assertion no longer re-verifies.
+            let stale = model.verify_label_assertion_mut(&name) == AssertionStatus::Stale;
             serde_json::json!({
                 "name": name,
                 "kind": kind,
                 "anchor": anchor.map(|p| [p.x, p.y, p.z]),
+                "color": color,
+                "measurement": measurement,
+                "conformance": conformance,
+                "stale": stale,
                 "description": description,
             })
         })
@@ -1573,6 +1649,83 @@ pub async fn resolve_label(
     }
 }
 
+/// `DELETE /api/agent/parts/{id}/labels/{name}` — REMOVE a label by name. 200
+/// when it existed and was removed; 404 when there was no such name (the kernel
+/// reports honestly rather than pretending). Fixes the "a mislabel can't be
+/// removed" gap.
+pub async fn delete_label(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, name)): Path<(u32, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut model = model_handle.write().await;
+    if model.delete_label(&name) {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": true, "part_id": id, "name": name })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "deleted": false, "part_id": id, "name": name,
+                "error": "not_found", "message": "no label of that name on this part",
+            })),
+        )
+    }
+}
+
+/// Body for `PATCH /api/agent/parts/{id}/labels/{name}` — the new name.
+#[derive(serde::Deserialize)]
+pub struct RenameLabelRequest {
+    pub new_name: String,
+}
+
+/// `PATCH /api/agent/parts/{id}/labels/{name}` — RENAME a label, preserving its
+/// binding (target + assertion + description). 200 on success; 404 when `name`
+/// is unknown; 409 when `new_name` is already taken by a different label (refuse,
+/// never clobber); 400 when `new_name` is empty.
+pub async fn rename_label(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, name)): Path<(u32, String)>,
+    Json(body): Json<RenameLabelRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::labels::LabelError;
+    let mut model = model_handle.write().await;
+    match model.rename_label(&name, &body.new_name) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "renamed": true, "part_id": id,
+                "old_name": name, "new_name": body.new_name.trim(),
+            })),
+        ),
+        Err(LabelError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "renamed": false, "part_id": id, "old_name": name,
+                "error": "not_found", "message": "no label of that name on this part",
+            })),
+        ),
+        Err(LabelError::NameInUse) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "renamed": false, "part_id": id, "old_name": name, "new_name": body.new_name,
+                "error": "name_in_use", "message": "another label already has that name; remove it first",
+            })),
+        ),
+        Err(LabelError::EmptyName) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "renamed": false, "part_id": id, "old_name": name,
+                "error": "empty_name", "message": "the new label name must be non-empty",
+            })),
+        ),
+        Err(e) => label_error_response(e),
+    }
+}
+
 /// `GET /api/agent/parts/{id}/propose-labels` — D3 AUTO-PROPOSE. The kernel
 /// recognizes features (throat / exit / chamber / fillet …) and SUGGESTS a name
 /// plus the ASSERTION that pins it — it does NOT apply them. Confirming a
@@ -1607,6 +1760,12 @@ pub async fn propose_labels(
                 o.insert("extremal".into(), serde_json::json!(s.extremal));
                 if let Some(a) = s.along {
                     o.insert("along".into(), serde_json::json!(a));
+                }
+                if let Some(ao) = s.axis_origin {
+                    o.insert("axis_origin".into(), serde_json::json!(ao));
+                }
+                if let Some(ad) = s.axis_dir {
+                    o.insert("axis_dir".into(), serde_json::json!(ad));
                 }
                 o.insert("angle_tol_deg".into(), serde_json::json!(s.angle_tol_deg));
                 serde_json::Value::Object(o)
