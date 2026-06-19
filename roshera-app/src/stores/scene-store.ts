@@ -559,6 +559,15 @@ interface SceneState {
   // Grid
   gridSettings: GridSettings
 
+  /**
+   * Whether the LABELLER overlay is shown in the viewport — named
+   * billboard callouts anchored at each label's world point (see
+   * `PartLabels`). Off by default so the viewport stays clean; the user
+   * toggles it from the viewport controls when they want to read (or
+   * frame a question around) the part's named features.
+   */
+  labelsVisible: boolean
+
   /** Cutting-plane state for Section View. See {@link SectionViewState}. */
   sectionView: SectionViewState
 
@@ -641,6 +650,8 @@ interface SceneState {
 
   setEdgeSettings: (settings: Partial<EdgeSettings>) => void
   setGridSettings: (settings: Partial<GridSettings>) => void
+  /** Toggle the LABELLER viewport overlay on/off. */
+  toggleLabelsVisible: () => void
   setSectionView: (settings: Partial<SectionViewState>) => void
   toggleSectionView: () => void
   /** Replace the live cap set with the result of the most recent
@@ -911,6 +922,7 @@ const sceneCreator: StateCreator<
       fadeDistance: 80,
       infiniteGrid: true,
     },
+    labelsVisible: false,
     sectionView: {
       enabled: false,
       axis: 'x',
@@ -1141,6 +1153,9 @@ const sceneCreator: StateCreator<
       set((state) => ({
         gridSettings: { ...state.gridSettings, ...settings },
       })),
+
+    toggleLabelsVisible: () =>
+      set((state) => ({ labelsVisible: !state.labelsVisible })),
 
     setSectionView: (settings) =>
       set((state) => ({
