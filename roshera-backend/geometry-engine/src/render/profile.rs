@@ -34,6 +34,7 @@ use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::{tessellate_solid, TessellationParams};
+use crate::units::LengthUnit;
 use serde::Serialize;
 
 const BG: [u8; 3] = [250, 250, 250];
@@ -72,6 +73,8 @@ pub struct ProfileFrame {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u8>,
+    /// Document length-unit label for every reported length (e.g. `"mm"`).
+    /// Mirrors the model's [`crate::units::LengthUnit`]; angles are degrees.
     pub units: &'static str,
     /// Detected (or supplied) axis of symmetry: a point on the axis + a unit
     /// direction.
@@ -120,6 +123,11 @@ pub fn render_axial_profile(
     tolerance: Tolerance,
 ) -> Option<ProfileFrame> {
     model.solids.get(solid_id)?;
+
+    // Document length unit governs the unit string + formatting on the drawing
+    // (the kernel geometry stays in its native millimetre modelling unit).
+    let unit = model.document_unit();
+    let ulabel = unit.label();
 
     let (axis_origin, axis_dir) = match axis_override {
         Some((o, d)) => (o, d.normalize().ok()?),
@@ -254,8 +262,8 @@ pub fn render_axial_profile(
     dims.push(ProfileDimension {
         kind: "overall_length".into(),
         value: length,
-        unit: "mm".into(),
-        label: format!("L {}", fmt_num_pub(length)),
+        unit: ulabel.into(),
+        label: format!("L {} {}", fmt_num_pub(length), ulabel),
         station: None,
     });
 
@@ -284,8 +292,8 @@ pub fn render_axial_profile(
     dims.push(ProfileDimension {
         kind: "max_diameter".into(),
         value: 2.0 * max_r,
-        unit: "mm".into(),
-        label: format!("Ø{}", fmt_num_pub(2.0 * max_r)),
+        unit: ulabel.into(),
+        label: format!("Ø{} {}", fmt_num_pub(2.0 * max_r), ulabel),
         station: Some(max_st),
     });
 
@@ -310,8 +318,8 @@ pub fn render_axial_profile(
             dims.push(ProfileDimension {
                 kind: "min_diameter".into(),
                 value: 2.0 * thr_r,
-                unit: "mm".into(),
-                label: format!("Ø{}", fmt_num_pub(2.0 * thr_r)),
+                unit: ulabel.into(),
+                label: format!("Ø{} {}", fmt_num_pub(2.0 * thr_r), ulabel),
                 station: Some(thr_st),
             });
         }
@@ -341,8 +349,8 @@ pub fn render_axial_profile(
         dims.push(ProfileDimension {
             kind: "base_diameter".into(),
             value: 2.0 * r,
-            unit: "mm".into(),
-            label: format!("Ø{}", fmt_num_pub(2.0 * r)),
+            unit: ulabel.into(),
+            label: format!("Ø{} {}", fmt_num_pub(2.0 * r), ulabel),
             station: Some(0.0),
         });
     }
@@ -350,8 +358,8 @@ pub fn render_axial_profile(
         dims.push(ProfileDimension {
             kind: "exit_diameter".into(),
             value: 2.0 * r,
-            unit: "mm".into(),
-            label: format!("Ø{}", fmt_num_pub(2.0 * r)),
+            unit: ulabel.into(),
+            label: format!("Ø{} {}", fmt_num_pub(2.0 * r), ulabel),
             station: Some(length),
         });
     }
@@ -374,8 +382,8 @@ pub fn render_axial_profile(
             dims.push(ProfileDimension {
                 kind: "wall_thickness".into(),
                 value: t,
-                unit: "mm".into(),
-                label: format!("t {}", fmt_num_pub(t)),
+                unit: ulabel.into(),
+                label: format!("t {} {}", fmt_num_pub(t), ulabel),
                 station: None,
             });
         }
@@ -400,7 +408,7 @@ pub fn render_axial_profile(
         width: WIDTH,
         height: HEIGHT,
         pixels,
-        units: "mm",
+        units: ulabel,
         axis_origin,
         axis_dir,
         hollow,
@@ -751,7 +759,7 @@ fn draw_profile(
     draw_line_pub(&mut px, WIDTH, HEIGHT, lx1, cy_axis, lx1, dim_y + 8.0, DIM);
     draw_dim_line(&mut px, lx0, dim_y, lx1, dim_y, DIM);
     if let Some(d) = dims.iter().find(|d| d.kind == "overall_length") {
-        let lbl = ascii_label(&d.label);
+        let lbl = render_label(&d.label);
         let tw = text_width_pub(&lbl, 2);
         draw_text_pub(
             &mut px,
@@ -797,7 +805,7 @@ fn draw_profile(
         let yb = cy_axis + r_at * scale;
         // Full-diameter witness across the section at the station.
         draw_dim_line_v(&mut px, x, yt, x, yb, DIA);
-        let lbl = ascii_label(&d.label);
+        let lbl = render_label(&d.label);
         let tw = text_width_pub(&lbl, 2);
         // Park the label above the part; nudge into 3 stacked rows to avoid
         // collisions, then leader from the outer wall up to it.
@@ -829,7 +837,7 @@ fn draw_profile(
     let mut info_y = HEIGHT as f64 - 40.0;
     for d in dims {
         if d.kind == "wall_thickness" || d.kind == "half_angle" {
-            let lbl = ascii_label(&d.label);
+            let lbl = render_label(&d.label);
             draw_text_pub(&mut px, WIDTH, HEIGHT, margin_l, info_y, &lbl, DIM, 2);
             info_y += 22.0;
         }
@@ -879,19 +887,13 @@ fn draw_chain_dash(px: &mut [u8], x0: f64, y: f64, x1: f64, _y1: f64, color: [u8
     }
 }
 
-/// Replace glyphs the 5×7 overlay font can't draw (Ø, ∠, °) with ASCII so the
-/// label is always renderable; the pretty label is kept in the structured
-/// table. Any other unsupported glyph is dropped.
-fn ascii_label(s: &str) -> String {
-    s.chars()
-        .filter_map(|c| match c {
-            'Ø' => Some('D'),
-            '∠' => Some('A'),
-            '°' => None,
-            o if glyph_supported(o) => Some(o),
-            _ => None,
-        })
-        .collect()
+/// Keep only glyphs the 5×7 overlay font can actually draw. The font now
+/// carries the true engineering symbols (Ø diameter, ∠ angle, ° degree) plus
+/// the unit letters, so the pretty label renders verbatim; any glyph still
+/// outside the font is dropped rather than substituted (the structured table
+/// keeps the authoritative label regardless).
+fn render_label(s: &str) -> String {
+    s.chars().filter(|&c| glyph_supported(c)).collect()
 }
 
 #[cfg(test)]

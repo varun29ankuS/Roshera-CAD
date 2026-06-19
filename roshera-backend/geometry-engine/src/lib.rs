@@ -15,6 +15,7 @@ pub mod render;
 pub mod sketch2d;
 pub mod spatial;
 pub mod tessellation;
+pub mod units;
 
 #[cfg(feature = "export")]
 pub mod export;
@@ -22,6 +23,7 @@ pub mod export;
 // Re-export commonly used types
 pub use math::{Matrix4, Point3, Tolerance, Vector3};
 pub use primitives::topology_builder::BRepModel;
+pub use units::LengthUnit;
 
 /// Prelude module for convenient imports
 pub mod prelude {

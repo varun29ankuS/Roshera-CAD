@@ -23,6 +23,7 @@ use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::{tessellate_solid, TessellationParams};
+use crate::units::LengthUnit;
 use serde::Serialize;
 
 const BG: [u8; 3] = [250, 250, 250];
@@ -134,6 +135,10 @@ pub fn render_dimensioned_multiview(
         return None;
     }
 
+    // Document length unit: governs the unit string shown on the overlay (the
+    // kernel geometry stays in its native millimetre modelling unit).
+    let unit = model.document_unit();
+
     // Mesh AABB — the measured (not assumed) extent.
     let (mut lo, mut hi) = (
         Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
@@ -187,6 +192,7 @@ pub fn render_dimensioned_multiview(
             scale_bar_world,
             dims,
             (volume, surface_area, centroid),
+            unit,
             &mut pixels,
             width,
             height,
@@ -199,7 +205,7 @@ pub fn render_dimensioned_multiview(
         width,
         height,
         pixels,
-        units: "mm",
+        units: unit.label(),
         bbox_min: lo,
         bbox_max: hi,
         dims,
@@ -411,6 +417,8 @@ pub fn render_section(
     if caps.is_empty() {
         return None;
     }
+    let unit = model.document_unit();
+    let ulabel = unit.label();
 
     let dir = plane_normal.normalize().ok()?;
     let up_hint = if dir.z.abs() > 0.9 {
@@ -500,7 +508,7 @@ pub fn render_section(
 
     // Label + dimensions + area + scale bar.
     draw_text(&mut pixels, w, h, MARGIN, 6.0, "SECTION", [20, 20, 20], 2);
-    let dim_label = format!("{} x {} mm", fmt_num(span_u), fmt_num(span_v));
+    let dim_label = format!("{} x {} {}", fmt_num(span_u), fmt_num(span_v), ulabel);
     draw_text(
         &mut pixels,
         w,
@@ -511,7 +519,7 @@ pub fn render_section(
         [20, 20, 20],
         1,
     );
-    let area_label = format!("A {} mm2", fmt_num(section_area));
+    let area_label = format!("A {} {}2", fmt_num(section_area), ulabel);
     let aw = text_width(&area_label, 1);
     draw_text(
         &mut pixels,
@@ -538,7 +546,7 @@ pub fn render_section(
         h,
         bx,
         by - 16.0,
-        &format!("{} mm", fmt_num(bar_world)),
+        &format!("{} {}", fmt_num(bar_world), ulabel),
         [20, 20, 20],
         1,
     );
@@ -547,7 +555,7 @@ pub fn render_section(
         width: w,
         height: h,
         pixels,
-        units: "mm",
+        units: unit.label(),
         plane_origin,
         plane_normal: dir,
         section_area,
@@ -805,11 +813,13 @@ fn draw_overlays(
     scale_bar_world: f64,
     dims: (f64, f64, f64),
     analytics: (f64, f64, Point3),
+    unit: LengthUnit,
     pixels: &mut [u8],
     width: usize,
     height: usize,
 ) {
     let (volume, surface_area, centroid) = analytics;
+    let ulabel = unit.label();
     // View label, top-left of the cell.
     let (cx0, cy0, _cw, _ch) = proj.cell;
     draw_text(
@@ -873,7 +883,7 @@ fn draw_overlays(
             [20, 20, 20],
         );
     }
-    let bar_label = format!("{} mm", fmt_num(scale_bar_world));
+    let bar_label = format!("{} {}", fmt_num(scale_bar_world), ulabel);
     draw_text(
         pixels,
         width,
@@ -887,10 +897,11 @@ fn draw_overlays(
 
     // Dimension readout (L×W×H), bottom-right of the cell.
     let dim_label = format!(
-        "L{} W{} H{}",
+        "L{} W{} H{} {}",
         fmt_num(dims.0),
         fmt_num(dims.1),
-        fmt_num(dims.2)
+        fmt_num(dims.2),
+        ulabel
     );
     let tw = text_width(&dim_label, 1);
     draw_text(
@@ -984,6 +995,29 @@ const GLYPH_W: usize = 5;
 const GLYPH_H: usize = 7;
 
 fn glyph(c: char) -> Option<[u8; 7]> {
+    // Non-ASCII engineering symbols handled first (the ASCII uppercase fold
+    // below would mangle them). Ø = diameter, ∠ = angle, ° = degree.
+    match c {
+        // Ø — capital O with a corner-to-corner slash through it.
+        'Ø' => {
+            return Some([
+                0b01110, 0b10011, 0b10101, 0b10101, 0b10101, 0b11001, 0b01110,
+            ])
+        }
+        // ∠ — angle: a rising hypotenuse meeting a horizontal base.
+        '∠' => {
+            return Some([
+                0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000, 0b11111,
+            ])
+        }
+        // ° — degree: a small ring in the upper rows, blank below.
+        '°' => {
+            return Some([
+                0b01100, 0b10010, 0b10010, 0b01100, 0b00000, 0b00000, 0b00000,
+            ])
+        }
+        _ => {}
+    }
     let g: [u8; 7] = match c.to_ascii_uppercase() {
         '0' => [
             0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
@@ -1249,8 +1283,9 @@ pub type Callout = ([f64; 3], String);
 ///
 /// The anchor is projected through the SAME `ViewProjection` the frame carries,
 /// so the drawn callout and the structured dimension value can never disagree
-/// (the picture is the table, placed). Labels must be ASCII (the 5×7 font has
-/// no Ø/° glyphs); unknown glyphs are silently skipped.
+/// (the picture is the table, placed). The 5×7 font carries the engineering
+/// symbols (Ø diameter, ∠ angle, ° degree) and the unit letters, so labels may
+/// use them verbatim; any glyph still outside the font is silently skipped.
 pub fn draw_dimension_callouts(frame: &mut MultiViewFrame, callouts: &[Callout]) {
     const DIM_COLOR: [u8; 3] = [210, 105, 0]; // orange — distinct from triad/bbox
     const SCALE: usize = 2;
@@ -1380,20 +1415,13 @@ mod tests {
         let mut frame =
             render_dimensioned_multiview(&m, part, &TessellationParams::default()).expect("frame");
         let dims = crate::readable::extract_dimensions(&m, part);
+        // The 5×7 font now carries Ø/∠/° so the analytic labels render verbatim;
+        // drop only any glyph still outside the font.
         let callouts: Vec<Callout> = dims
             .iter()
             .map(|d| {
-                let ascii: String = d
-                    .label
-                    .chars()
-                    .map(|c| match c {
-                        'Ø' => 'D',
-                        '∠' => 'A',
-                        '°' => ' ',
-                        o => o,
-                    })
-                    .collect();
-                (d.anchor, ascii)
+                let label: String = d.label.chars().filter(|&c| glyph(c).is_some()).collect();
+                (d.anchor, label)
             })
             .collect();
         draw_dimension_callouts(&mut frame, &callouts);
