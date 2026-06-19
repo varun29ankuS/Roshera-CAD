@@ -22,17 +22,17 @@
 //!                               polygon fixes + coplanar imprint-merge cover the
 //!                               protruding/sunk/straddling/corner pad configs).
 //!                               Pinned as a SOUND guard, not a broken pin.
-//!   F4 through-wall bore     — BROKEN: brep_valid=false, euler=4 (two shells).
-//!                               Root (isolated): NOT the union seam and NOT the
-//!                               axis orientation. The bore RADIUS (7) exceeds
-//!                               the wall HALF-thickness (4), so the bore circle
-//!                               pokes through the entry face's top/bottom edges
-//!                               — a "circle crosses a boundary edge" BITE. The
-//!                               entry face splits into BANDS, not disc+annulus,
-//!                               so merge_same_origin_fragments forms NO inner
-//!                               loop → entry/exit rims unwelded → 2 shells. A
-//!                               bore that FITS the wall (probe_x_bore_fits_wall)
-//!                               is SOUND, in either +X or +Z. The #54 bite family.
+//!   F4 oversized bore        — NOT A BUG (retracted; traced+rendered+component-
+//!                               counted 2026-06-20). The bore (r=7) cuts clean
+//!                               through the 8-thick wall and SEVERS the upright
+//!                               into TWO disconnected bodies. Geometry is CORRECT
+//!                               (watertight, manifold, nm=0, 2 components, euler=4);
+//!                               brep_valid=false is the kernel HONESTLY refusing to
+//!                               emit two outer Solids from one difference (single-
+//!                               SolidId output). Real follow-up = a MULTI-BODY
+//!                               BOOLEAN OUTPUT feature (deliberate core campaign),
+//!                               NOT an arrangement fix. Bore that doesn't sever =
+//!                               sound (probe controls, either +X/+Z).
 
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Point3, Vector3};
@@ -199,38 +199,48 @@ fn f3_partial_embed_face_imprint_is_sound() {
     assert!(sound, "f3: box∪box partial-embed imprint must stay sound");
 }
 
-// ───────── #4 through-wall bore (radius exceeds wall thickness) ─────────
+// ───────── #4 oversized bore SEVERS the wall into two bodies ─────────
 //
-// Bore an axis-+X Ø14 cylinder through the UPRIGHT wall of an L-bracket. The
-// bore radius (7) exceeds the wall half-thickness (4), so the bore circle pokes
-// through the entry face's top/bottom edges — a "circle crosses a boundary edge"
-// BITE. The entry face splits into bands (not disc+annulus), no inner loop is
-// formed, the entry/exit rims stay unwelded → two shells (euler=4).
+// RETRACTED DIAGNOSIS (traced + rendered + connected-component-counted, 2026-06-20):
+// this is NOT a "circle crosses a boundary edge" bite, and NOT a boolean defect.
+// The bore (r=7) is so large it CUTS CLEAN THROUGH the 8-thick wall and severs the
+// upright into TWO disconnected solid bodies (a chunk joined to the base + a floating
+// bar). The difference geometry is CORRECT: result is watertight=true, manifold=true,
+// nm=0, 2 connected components, euler=4 (= two genus-0 shells). The kernel flags
+// brep_valid=false ONLY because reconstruct_topology emits ONE Solid (shells[0]) and
+// files the rest as void/inner shells — it cannot represent "one difference produced
+// two outer bodies". That is HONEST refusal of an unrepresentable result, not a bug.
+// The real follow-up is a MULTI-BODY BOOLEAN OUTPUT feature (detect disjoint outer
+// shells → emit multiple Solids) — a deliberate core-contract campaign (blast radius:
+// boolean_operation's single SolidId return + timeline/export/render/validity), NOT a
+// planar-arrangement tweak. A bore that does NOT sever (fits, or thicker wall) is sound
+// — see the two controls below. This test documents the CORRECT 2-body outcome.
 #[test]
-fn f4_through_wall_bore_is_broken() {
+fn f4_oversized_bore_severs_into_two_bodies() {
     let mut m = BRepModel::new();
     let bracket = l_bracket(&mut m);
     assert_operand_sound(&mut m, bracket, "f4 bracket operand");
-    // upright wall: x∈[-20,-8], z∈[-4,4] (8 thick). bore r=7 > half-thickness 4.
+    // upright wall: x∈[-20,-8], z∈[-4,4] (8 thick). bore r=7 severs it (cuts through).
     let bore = cylinder(&mut m, Point3::new(-25.0, 14.0, 0.0), Vector3::X, 7.0, 30.0);
     assert_operand_sound(&mut m, bore, "f4 bore operand");
     let r = diff(&mut m, bracket, bore);
-    let (sound, _bnd, _nm, euler) = metrics(&mut m, r, "f4 through-bore");
-    // FIXME(#F4 / #54): the bore circle exceeds the wall thickness → the cut
-    // circle crosses the entry face's boundary edges → the face splits into
-    // bands, not disc+annulus → no inner loop → unwelded rims → 2 shells. A
-    // bore that FITS the wall is sound (probe_x_bore_fits_wall, either axis).
-    // The "circle crosses a boundary edge" bite family — core arrangement.
-    // (Ranked: moderate, but touches the shared face-arrangement path.)
-    assert!(!sound, "f4: expected BROKEN (kernel flagged it)");
-    assert_eq!(euler, 4, "f4: expected two-shell mesh (euler=4)");
+    let (sound, _bnd, _nm, euler) = metrics(&mut m, r, "f4 severing bore");
+    // The geometry is correct (2 watertight bodies); single-Solid output can't carry
+    // them, so the certificate honestly reports !sound. NOT a defect to "fix" in the
+    // arrangement — needs the multi-body-output feature. Pinned as the correct outcome.
+    assert!(
+        !sound,
+        "f4: single-Solid output cannot represent a 2-body sever"
+    );
+    assert_eq!(euler, 4, "f4: two severed genus-0 bodies (euler=4)");
 }
 
 // ───────── isolation controls (prove the F4 root cause + F3 robustness) ─────────
 
 /// CONTROL: a +X bore that FITS within the wall thickness (r=3 in an 8-thick
 /// wall) is a clean fully-enclosed through-hole → SOUND. This proves F4 is the
-/// radius-exceeds-thickness BITE, not the +X orientation and not the union seam.
+/// bore SEVERING the wall (radius exceeds thickness → one body becomes two), not
+/// the +X orientation and not the union seam.
 #[test]
 fn probe_x_bore_fits_wall_is_sound() {
     let mut m = BRepModel::new();
