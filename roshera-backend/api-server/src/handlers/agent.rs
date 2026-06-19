@@ -513,6 +513,107 @@ pub async fn part_section(
     }))
 }
 
+// ───────────────────── axial profile (EYE-PROFILE) ──────────────────
+
+/// Query for `GET /api/agent/parts/{id}/profile`. With no parameters the axis
+/// of symmetry is auto-detected from the geometry. To override it, supply an
+/// axis point (`ox,oy,oz`) AND direction (`ax,ay,az`); a partial override falls
+/// back to auto-detection.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProfileQuery {
+    pub ox: Option<f64>,
+    pub oy: Option<f64>,
+    pub oz: Option<f64>,
+    pub ax: Option<f64>,
+    pub ay: Option<f64>,
+    pub az: Option<f64>,
+}
+
+/// One measured feature dimension on the meridian.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileDimensionWire {
+    pub kind: String,
+    pub value: f64,
+    pub unit: String,
+    pub label: String,
+    /// Axial station the dimension is taken at (diameters); `null` for spans.
+    pub station: Option<f64>,
+}
+
+/// Wire shape for the dimensioned axial-profile drawing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileResponse {
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+    pub units: String,
+    /// Detected (or supplied) axis of symmetry.
+    pub axis_origin: Vec3Wire,
+    pub axis_dir: Vec3Wire,
+    /// `true` when the section showed an inner wall (a hollow part).
+    pub hollow: bool,
+    /// Measured feature dimensions (overall length, Ø max/min/exit/base, wall
+    /// thickness if hollow, dominant half-angle). The image is the placed
+    /// table; this is authoritative.
+    pub dimensions: Vec<ProfileDimensionWire>,
+}
+
+/// `GET /api/agent/parts/{id}/profile` — EYE-PROFILE, the engineering meridian.
+///
+/// Sections the solid by a plane CONTAINING its axis of symmetry and returns a
+/// dimensioned axial-profile drawing: the meridian outline + chain-dash
+/// centerline + feature dimensions (diameters, station heights, wall thickness,
+/// half-angle), all MEASURED off the cut — never assumed. The axis is
+/// auto-detected (Z fall-back) or supplied via query. Read lock only; `404` on
+/// unknown id or when the part has no usable axial section.
+pub async fn part_profile(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<ProfileQuery>,
+) -> Result<Json<ProfileResponse>, StatusCode> {
+    use base64::Engine as _;
+    use geometry_engine::math::{Point3, Tolerance, Vector3};
+    use geometry_engine::render::profile::render_axial_profile;
+
+    // A full axis override requires both an origin AND a direction; anything
+    // less defers to auto-detection.
+    let axis_override = match (q.ox, q.oy, q.oz, q.ax, q.ay, q.az) {
+        (Some(ox), Some(oy), Some(oz), Some(ax), Some(ay), Some(az)) => {
+            Some((Point3::new(ox, oy, oz), Vector3::new(ax, ay, az)))
+        }
+        _ => None,
+    };
+
+    let model = model_handle.read().await;
+    let frame = render_axial_profile(&model, id as SolidId, axis_override, Tolerance::default())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let png = frame
+        .to_png()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ProfileResponse {
+        png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
+        width: frame.width,
+        height: frame.height,
+        units: frame.units.to_string(),
+        axis_origin: frame.axis_origin.into(),
+        axis_dir: frame.axis_dir.into(),
+        hollow: frame.hollow,
+        dimensions: frame
+            .dimensions
+            .into_iter()
+            .map(|d| ProfileDimensionWire {
+                kind: d.kind,
+                value: d.value,
+                unit: d.unit,
+                label: d.label,
+                station: d.station,
+            })
+            .collect(),
+    }))
+}
+
 // ───────────────────── viewpoint selection (EYE-6) ──────────────────
 
 /// `GET /api/agent/parts/{id}/best-view` — EYE-6 active perception.
