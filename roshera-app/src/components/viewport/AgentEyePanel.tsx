@@ -7,24 +7,44 @@ const API_HOST = import.meta.env.VITE_API_URL || ''
 type RenderMode = 'shaded' | 'diagnostic' | 'ids' | 'dim' | 'section'
 type ViewName = 'iso' | 'front' | 'top' | 'right'
 
+// What the eye is looking at: a single part (newest/selected) or the whole
+// assembly (every solid composited via the scene-eye).
+type Scope = 'part' | 'assembly'
+
 const SINGLE_VIEW: RenderMode[] = ['shaded', 'diagnostic', 'ids']
+
+// The scene-eye (`/api/agent/scene/orbit`) accepts the same render mode names
+// but has no per-part `dim`/`section` notion. These are the modes shared by
+// both endpoints, so the mode selector stays meaningful when toggling scope.
+const SCENE_MODES: RenderMode[] = ['shaded', 'diagnostic', 'ids']
+
+const DEFAULT_AZ = 35
+const DEFAULT_EL = 20
 
 /**
  * Agent-Eye panel — a small, minimizable, LIVE window showing exactly what
- * the agent/kernel "sees": the server-side deterministic render of the
- * newest part (`GET /api/agent/parts/{id}/render`). This is the human-facing
- * mirror of the agent's perception loop. `diagnostic` mode overlays open
- * (red) / non-manifold (magenta) edges so watertightness is visible at a
- * glance; `ids` paints each B-Rep face a distinct flat colour.
+ * the agent/kernel "sees". Two scopes:
  *
- * It polls the same endpoint the agent reads, so what you watch here is the
- * exact frame the agent grabs when it inspects geometry.
+ *  - **Part** (`GET /api/agent/parts/{id}/render` + the EYE-1/EYE-2
+ *    `/dimensioned` and `/section` endpoints): the newest part on its own,
+ *    with dimensioned multiview and cross-section.
+ *  - **Assembly** (`GET /api/agent/scene/orbit?az&el&mode&size&quality`): every
+ *    solid composited into one auto-framed frame, orbitable by az/el. This is
+ *    the same composite the MCP `scene_view` tool reads — so the human sees the
+ *    full assembly the agent drives, not just one part.
+ *
+ * `diagnostic` mode overlays open (red) / non-manifold (magenta) edges so
+ * watertightness is visible at a glance; `ids` paints each B-Rep face a
+ * distinct flat colour. The panel polls the same endpoints the agent reads.
  */
 export function AgentEyePanel() {
   const [minimized, setMinimized] = useState(false)
   const [live, setLive] = useState(true)
+  const [scope, setScope] = useState<Scope>('part')
   const [mode, setMode] = useState<RenderMode>('shaded')
   const [view, setView] = useState<ViewName>('iso')
+  const [az, setAz] = useState(DEFAULT_AZ)
+  const [el, setEl] = useState(DEFAULT_EL)
   const [png, setPng] = useState<string | null>(null)
   const [diag, setDiag] = useState<{ open: number; nm: number } | null>(null)
   const [perc, setPerc] = useState<{
@@ -37,16 +57,46 @@ export function AgentEyePanel() {
   const [err, setErr] = useState<string | null>(null)
   const inFlight = useRef(false)
 
+  // In Assembly mode only the scene-shared modes are valid; fall back cleanly
+  // if the user was on `dim`/`section` when they switched scope.
+  const sceneMode: RenderMode = SCENE_MODES.includes(mode) ? mode : 'shaded'
+
   const grab = useCallback(async () => {
     if (inFlight.current) return
     inFlight.current = true
     try {
+      if (scope === 'assembly') {
+        // SCENE-EYE: composite every solid, auto-framed, orbitable by az/el.
+        // Per-part perception (`perc`) is not meaningful for a whole scene.
+        setPerc(null)
+        const r = await fetch(
+          `${API_HOST}/api/agent/scene/orbit?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`,
+        )
+        if (r.status === 404) {
+          setPng(null)
+          setDiag(null)
+          setErr('no geometry yet')
+          return
+        }
+        if (!r.ok) throw new Error(`scene ${r.status}`)
+        const data = (await r.json()) as {
+          png_base64: string
+          open_edges: number
+          nonmanifold_edges: number
+        }
+        setPng(data.png_base64)
+        setDiag({ open: data.open_edges, nm: data.nonmanifold_edges })
+        setErr(null)
+        return
+      }
+
       const partsR = await fetch(`${API_HOST}/api/agent/parts`)
       if (!partsR.ok) throw new Error(`parts ${partsR.status}`)
       const parts = (await partsR.json()) as Array<{ id: number }>
       if (!Array.isArray(parts) || parts.length === 0) {
         setPng(null)
         setDiag(null)
+        setPerc(null)
         setErr('no geometry yet')
         return
       }
@@ -97,7 +147,7 @@ export function AgentEyePanel() {
     } finally {
       inFlight.current = false
     }
-  }, [mode, view])
+  }, [scope, mode, view, az, el, sceneMode])
 
   useEffect(() => {
     if (minimized) return
@@ -118,6 +168,10 @@ export function AgentEyePanel() {
       </button>
     )
   }
+
+  const activeMode: RenderMode = scope === 'assembly' ? sceneMode : mode
+  const modeOptions: RenderMode[] =
+    scope === 'assembly' ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[])
 
   return (
     <div className="absolute bottom-2 right-2 z-20 w-[208px] overflow-hidden rounded-md border border-border bg-background/95 shadow-lg backdrop-blur">
@@ -156,11 +210,33 @@ export function AgentEyePanel() {
         </div>
       </div>
 
+      {/* Scope: a single part vs the whole assembly (scene-eye composite). */}
+      <div className="flex border-b border-border">
+        {(['part', 'assembly'] as Scope[]).map((s) => (
+          <button
+            key={s}
+            onClick={() => setScope(s)}
+            className={`flex-1 px-2 py-1 text-[10px] font-medium capitalize ${
+              scope === s
+                ? 'bg-primary text-primary-foreground'
+                : 'text-muted-foreground hover:bg-accent'
+            }`}
+            title={
+              s === 'part'
+                ? 'Show the newest part on its own'
+                : 'Show the whole assembly (every solid composited)'
+            }
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+
       <div className="relative aspect-square w-full bg-muted">
         {png ? (
           <img
             src={`data:image/png;base64,${png}`}
-            alt="agent view"
+            alt={scope === 'assembly' ? 'agent scene view' : 'agent part view'}
             className="h-full w-full object-contain"
           />
         ) : (
@@ -168,7 +244,7 @@ export function AgentEyePanel() {
             {err ?? 'loading…'}
           </div>
         )}
-        {mode === 'diagnostic' && diag && (
+        {activeMode === 'diagnostic' && diag && (
           <div className="absolute left-1 top-1 rounded bg-background/80 px-1.5 py-0.5 font-mono text-[10px]">
             <span className={diag.open ? 'text-red-500' : 'text-green-500'}>open {diag.open}</span>
             {' · '}
@@ -177,7 +253,7 @@ export function AgentEyePanel() {
         )}
       </div>
 
-      {perc && (
+      {scope === 'part' && perc && (
         <div className="flex items-center justify-between gap-2 border-t border-border px-2 py-1 font-mono text-[10px]">
           <span className={perc.watertight && perc.valid ? 'text-green-600' : 'text-red-500'}>
             {perc.watertight && perc.valid ? '✓ sound' : '✗ defect'}
@@ -201,19 +277,19 @@ export function AgentEyePanel() {
 
       <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-1">
         <div className="flex gap-0.5">
-          {(['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[]).map((m) => (
+          {modeOptions.map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
               className={`rounded px-1 py-0.5 text-[10px] ${
-                mode === m ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'
+                activeMode === m ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'
               }`}
             >
               {m === 'diagnostic' ? 'diag' : m === 'section' ? 'sec' : m}
             </button>
           ))}
         </div>
-        {SINGLE_VIEW.includes(mode) && (
+        {scope === 'part' && SINGLE_VIEW.includes(mode) && (
           <div className="flex gap-0.5">
             {(['iso', 'front', 'top', 'right'] as ViewName[]).map((v) => (
               <button
@@ -229,6 +305,58 @@ export function AgentEyePanel() {
           </div>
         )}
       </div>
+
+      {/* Assembly orbit controls: az/el step the scene-eye camera. */}
+      {scope === 'assembly' && (
+        <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-1 font-mono text-[10px]">
+          <div className="flex items-center gap-0.5">
+            <span className="text-muted-foreground">az</span>
+            <button
+              onClick={() => setAz((a) => a - 15)}
+              className="rounded px-1 py-0.5 hover:bg-accent"
+              title="Orbit left"
+            >
+              −
+            </button>
+            <span className="w-7 text-center tabular-nums">{Math.round(az)}°</span>
+            <button
+              onClick={() => setAz((a) => a + 15)}
+              className="rounded px-1 py-0.5 hover:bg-accent"
+              title="Orbit right"
+            >
+              +
+            </button>
+          </div>
+          <div className="flex items-center gap-0.5">
+            <span className="text-muted-foreground">el</span>
+            <button
+              onClick={() => setEl((e) => Math.max(-89, e - 15))}
+              className="rounded px-1 py-0.5 hover:bg-accent"
+              title="Tilt down"
+            >
+              −
+            </button>
+            <span className="w-7 text-center tabular-nums">{Math.round(el)}°</span>
+            <button
+              onClick={() => setEl((e) => Math.min(89, e + 15))}
+              className="rounded px-1 py-0.5 hover:bg-accent"
+              title="Tilt up"
+            >
+              +
+            </button>
+          </div>
+          <button
+            onClick={() => {
+              setAz(DEFAULT_AZ)
+              setEl(DEFAULT_EL)
+            }}
+            className="rounded px-1.5 py-0.5 hover:bg-accent"
+            title="Reset orbit"
+          >
+            ⌂
+          </button>
+        </div>
+      )}
     </div>
   )
 }

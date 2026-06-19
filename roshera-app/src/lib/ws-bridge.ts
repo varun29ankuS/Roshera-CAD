@@ -69,7 +69,9 @@ function convertAnalyticalGeometry(
   if (!ag) return undefined
   return {
     type: ag.primitive_type,
-    params: ag.parameters,
+    // NURBS / mesh / imported parts carry no analytic parameters (null);
+    // the scene store's params is a plain map, so default to empty.
+    params: ag.parameters ?? {},
   }
 }
 

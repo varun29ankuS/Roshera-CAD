@@ -209,7 +209,7 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   clearBoard: () => {
     void get
     set(() => {
-      const lines = [WELCOME_LINE]
+      const lines = [...WELCOME_LINES]
       const events: BlackboardEvent[] = []
       persist({ lines, events })
       return { lines, events }
