@@ -1078,6 +1078,9 @@ fn glyph(c: char) -> Option<[u8; 7]> {
         'C' => [
             0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
         ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
         'E' => [
             0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
         ],
@@ -1129,6 +1132,56 @@ fn draw_text(
         cx += adv;
     }
     let _ = (GLYPH_H, cy);
+}
+
+// ── Shared primitives for sibling render modules ────────────────────────────
+// EYE-PROFILE (`super::profile`) reuses the same 5×7 font + Bresenham line +
+// nice-number formatting so the profile drawing and the multi-view overlay are
+// visually identical and there is one font to maintain. These are thin
+// `pub(crate)` shims; the implementations stay private to this module.
+
+/// Bresenham line into a sibling module's framebuffer (see [`draw_line`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_line_pub(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    color: [u8; 3],
+) {
+    draw_line(pixels, width, height, x0, y0, x1, y1, color);
+}
+
+/// 5×7 bitmap text into a sibling module's framebuffer (see [`draw_text`]).
+pub(crate) fn draw_text_pub(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    x: f64,
+    y: f64,
+    text: &str,
+    color: [u8; 3],
+    scale: usize,
+) {
+    draw_text(pixels, width, height, x, y, text, color, scale);
+}
+
+/// Rendered pixel width of `text` at `scale` (see [`text_width`]).
+pub(crate) fn text_width_pub(s: &str, scale: usize) -> f64 {
+    text_width(s, scale)
+}
+
+/// `1/2/5 × 10ⁿ` integer-or-one-decimal formatting (see [`fmt_num`]).
+pub(crate) fn fmt_num_pub(x: f64) -> String {
+    fmt_num(x)
+}
+
+/// Whether the 5×7 font has a glyph for `c` (so callers can pre-filter labels).
+pub(crate) fn glyph_supported(c: char) -> bool {
+    glyph(c).is_some()
 }
 
 // ── Pixel primitives ────────────────────────────────────────────────────────

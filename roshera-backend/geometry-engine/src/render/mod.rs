@@ -27,6 +27,10 @@ use crate::tessellation::{tessellate_solid, TessellationParams};
 /// EYE-1: coordinate-anchored dimensioned multi-view render.
 pub mod dimensioned;
 
+/// EYE-PROFILE: dimensioned axial-profile (meridian) drawing for axisymmetric
+/// solids (nozzles / revolved / lofted bodies).
+pub mod profile;
+
 /// EYE-6: active-perception viewpoint selection (next-best-view).
 pub mod viewpoint;
 
