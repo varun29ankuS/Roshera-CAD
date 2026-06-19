@@ -227,7 +227,35 @@ pub fn render_solid_dir(
 ) -> Option<RenderFrame> {
     let solid = model.solids.get(solid_id)?;
     let mesh = tessellate_solid(solid, model, &opts.tessellation);
-    render_mesh_dir(&mesh, dir, up_hint, opts, None)
+    render_mesh_dir(&mesh, dir, up_hint, opts, None, &[])
+}
+
+/// One overlaid label callout: a WORLD anchor point and an (ASCII-safe) name.
+/// The anchor is projected through the SAME camera the render uses, so the
+/// drawn callout always lands on the feature it names — that is what makes the
+/// label VERIFIABLE on the picture (you SEE "throat" on the throat face).
+pub type LabelCallout = (Point3, String);
+
+/// Render one solid through the canonical view of `opts`, then overlay the
+/// given label callouts (leader line from the projected anchor to a text tag).
+/// The LABELLER's eye: the agent and the user see the named features marked on
+/// the part. Empty `callouts` is identical to [`render_solid`].
+pub fn render_solid_with_labels(
+    model: &BRepModel,
+    solid_id: SolidId,
+    callouts: &[LabelCallout],
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
+    let solid = model.solids.get(solid_id)?;
+    let mesh = tessellate_solid(solid, model, &opts.tessellation);
+    render_mesh_dir(
+        &mesh,
+        opts.view.direction(),
+        opts.view.up_hint(),
+        opts,
+        None,
+        callouts,
+    )
 }
 
 /// Scene render — composite EVERY solid in `solid_ids` into one frame from an
@@ -270,17 +298,57 @@ pub fn render_solids_dir(
             tri_colors.push(col);
         }
     }
-    render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors))
+    render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors), &[])
+}
+
+/// Scene render with label callouts overlaid — the assembly variant of
+/// [`render_solid_with_labels`]. Composites every solid (tinted by `colors`),
+/// then draws the named-feature callouts through the shared camera.
+#[allow(clippy::too_many_arguments)]
+pub fn render_solids_with_labels(
+    model: &BRepModel,
+    solid_ids: &[SolidId],
+    colors: &[[u8; 3]],
+    callouts: &[LabelCallout],
+    dir: Vector3,
+    up_hint: Vector3,
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
+    const DEFAULT: [u8; 3] = [200, 200, 200];
+    let mut merged = TriangleMesh::new();
+    let mut tri_colors: Vec<[u8; 3]> = Vec::new();
+    for (si, &id) in solid_ids.iter().enumerate() {
+        let solid = match model.solids.get(id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let col = colors.get(si).copied().unwrap_or(DEFAULT);
+        let m = tessellate_solid(solid, model, &opts.tessellation);
+        let base = merged.vertices.len() as u32;
+        merged.vertices.extend_from_slice(&m.vertices);
+        for (ti, t) in m.triangles.iter().enumerate() {
+            merged
+                .triangles
+                .push([t[0] + base, t[1] + base, t[2] + base]);
+            merged
+                .face_map
+                .push(m.face_map.get(ti).copied().unwrap_or(u32::MAX));
+            tri_colors.push(col);
+        }
+    }
+    render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors), callouts)
 }
 
 /// Rasterize an already-tessellated mesh from a view direction (auto-framed).
 /// Shared by `render_solid_dir` (one solid) and `render_solids_dir` (assembly).
+#[allow(clippy::too_many_arguments)]
 fn render_mesh_dir(
     mesh: &TriangleMesh,
     dir: Vector3,
     up_hint: Vector3,
     opts: &RenderOptions,
     tri_colors: Option<&[[u8; 3]]>,
+    label_callouts: &[LabelCallout],
 ) -> Option<RenderFrame> {
     if mesh.triangles.is_empty() {
         return None;
@@ -561,6 +629,103 @@ fn render_mesh_dir(
         }
         for e in &defect_open {
             stroke(e, [255, 0, 0]);
+        }
+    }
+
+    // ── Label callout overlay (the LABELLER's eye) ───────────────────────────
+    // Project each world anchor through the SAME orthographic camera the mesh
+    // used (so the callout always lands on the feature it names), then draw a
+    // crosshair tick at the anchor, a leader line to a text tag, and the name.
+    // Greedy vertical de-overlap keeps stacked names legible. Reuses the 5×7
+    // font + Bresenham line shared from `dimensioned`, so the labeller overlay
+    // and the dimension overlay are visually identical and share one font.
+    if !label_callouts.is_empty() {
+        const LABEL_COLOR: [u8; 3] = [0, 90, 200]; // blue — distinct from dim-orange / diag-red
+        const SCALE: usize = 2;
+        let (w, h) = (opts.width, opts.height);
+        let th = crate::render::dimensioned::glyph_height_px(SCALE);
+        // Project an arbitrary world point through the active camera + window.
+        let project = |p: &Point3| -> (f64, f64, f64) {
+            let q = Vector3::new(p.x, p.y, p.z);
+            let (u, v, ww) = (q.dot(&right), q.dot(&up), q.dot(&dir));
+            (
+                u * scale + off_u,
+                opts.height as f64 - (v * scale + off_v),
+                ww,
+            )
+        };
+        let mut placed: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for (anchor, name) in label_callouts {
+            let (ax, ay, _depth) = project(anchor);
+            // Skip anchors that fall outside the framebuffer.
+            if ax < 0.0 || ay < 0.0 || ax >= w as f64 || ay >= h as f64 {
+                continue;
+            }
+            let tw = crate::render::dimensioned::text_width_px(name, SCALE);
+            // Default label box up-right of the anchor; flip to stay in-bounds.
+            let mut lx = ax + 8.0;
+            let mut ly = ay - 8.0 - th;
+            if lx + tw > w as f64 - 2.0 {
+                lx = (ax - 8.0 - tw).max(2.0);
+            }
+            if ly < 2.0 {
+                ly = ay + 8.0;
+            }
+            // Greedy vertical de-overlap against already-placed labels.
+            let mut guard = 0;
+            loop {
+                let b = (lx, ly, lx + tw, ly + th);
+                let hit = placed
+                    .iter()
+                    .any(|q| !(b.2 < q.0 || b.0 > q.2 || b.3 < q.1 || b.1 > q.3));
+                if !hit || guard > 40 || ly + 2.0 * th > h as f64 - 2.0 {
+                    break;
+                }
+                ly += th + 2.0;
+                guard += 1;
+            }
+            placed.push((lx, ly, lx + tw, ly + th));
+            // Anchor crosshair, leader to the label box, then the name.
+            crate::render::dimensioned::draw_line_overlay(
+                &mut pixels,
+                w,
+                h,
+                ax - 4.0,
+                ay,
+                ax + 4.0,
+                ay,
+                LABEL_COLOR,
+            );
+            crate::render::dimensioned::draw_line_overlay(
+                &mut pixels,
+                w,
+                h,
+                ax,
+                ay - 4.0,
+                ax,
+                ay + 4.0,
+                LABEL_COLOR,
+            );
+            crate::render::dimensioned::draw_line_overlay(
+                &mut pixels,
+                w,
+                h,
+                ax,
+                ay,
+                lx,
+                ly + th,
+                LABEL_COLOR,
+            );
+            crate::render::dimensioned::draw_text_overlay(
+                &mut pixels,
+                w,
+                h,
+                lx,
+                ly,
+                name,
+                LABEL_COLOR,
+                SCALE,
+            );
         }
     }
 

@@ -1555,6 +1555,123 @@ server.tool(
   },
 );
 
+// ════════════════════════════════════════════════════════════════════════
+// LABELLER TOOLS (added block — do not interleave with other edits)
+// Human-readable NAMEs pinned to a topological entity (vertex/edge/face) or a
+// cross-section plane, so the agent and the user share one vocabulary for the
+// geometry. Backed by POST/GET /api/agent/parts/{id}/labels and the
+// .../labels/{name}/resolve endpoint. Resolution REFUSES on unknown/ambiguous
+// rather than guessing — the Pillar-3 discipline.
+// ════════════════════════════════════════════════════════════════════════
+
+server.tool(
+  "label_create",
+  "PIN a human-readable name to a feature so you and the user share one word " +
+    "for it (e.g. call the min-radius face 'throat'). Target it three ways: by " +
+    "id (`entity_id` + `kind` vertex/edge/face); by DESCRIPTION (`kind` " +
+    "face|edge + a `selector` shaped exactly like select_face/select_edge — the " +
+    "kernel resolves it or REFUSES, never guesses); or as a named cross-section " +
+    "(`kind`:'section' + `origin` + `normal`). Re-using a name REPLACES it (you " +
+    "are told `replaced:true`). Returns the resolved entity_id / plane. See it " +
+    "on the part with render_part(labels:true).",
+  {
+    part_id: z.number().int(),
+    name: z.string().min(1).describe("the label, e.g. 'throat' (unique per part)"),
+    kind: z.enum(["vertex", "edge", "face", "section"]),
+    entity_id: z
+      .number()
+      .int()
+      .optional()
+      .describe("attach by id (omit when using selector or section)"),
+    selector: z
+      .string()
+      .optional()
+      .describe(
+        "attach by description: a JSON object string shaped like the select_face " +
+          "/select_edge body, e.g. '{\"kind\":\"cylindrical\",\"extremal\":\"smallest_area\"}'",
+      ),
+    origin: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("section only: a point on the cutting plane"),
+    normal: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("section only: the plane normal"),
+    description: z.string().optional(),
+  },
+  async ({ part_id, name, kind, entity_id, selector, origin, normal, description }) => {
+    try {
+      let selectorObj: unknown = null;
+      if (selector !== undefined && selector.trim().length > 0) {
+        try {
+          selectorObj = JSON.parse(selector);
+        } catch {
+          return fail(`selector is not valid JSON: ${selector}`);
+        }
+      }
+      // Raw fetch: 400/404/409 are meaningful REFUSALS (empty name / not-found
+      // / ambiguous selector), surfaced as structured JSON, not transport errors.
+      const res = await fetch(`${BASE}/api/agent/parts/${part_id}/labels`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Roshera-Agent": "Claude" },
+        body: JSON.stringify({
+          name,
+          kind,
+          entity_id: entity_id ?? null,
+          selector: selectorObj,
+          origin: origin ?? null,
+          normal: normal ?? null,
+          description: description ?? null,
+        }),
+      });
+      return ok(await res.json());
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "label_list",
+  "LIST every label on a part: name, kind (vertex/edge/face/section), the world " +
+    "anchor point of its callout, and any description — in name order. Your map " +
+    "of the shared vocabulary for this part.",
+  { part_id: z.number().int() },
+  async ({ part_id }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/${part_id}/labels`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "label_resolve",
+  "RESOLVE a label name back to the live entity (face/edge/vertex id) or section " +
+    "plane it pins. REFUSES with not_found (unknown name) or dangling (the entity " +
+    "was deleted) — it never returns a wrong entity. Use it to turn a name the " +
+    "user said ('fillet the throat edge') into the concrete id an op needs.",
+  {
+    part_id: z.number().int(),
+    name: z.string().min(1),
+  },
+  async ({ part_id, name }) => {
+    try {
+      const res = await fetch(
+        `${BASE}/api/agent/parts/${part_id}/labels/${encodeURIComponent(name)}/resolve`,
+        { headers: { "X-Roshera-Agent": "Claude" } },
+      );
+      return ok(await res.json());
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ════════════════════════ END LABELLER TOOLS ════════════════════════════
+
 // ─── main ──────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();

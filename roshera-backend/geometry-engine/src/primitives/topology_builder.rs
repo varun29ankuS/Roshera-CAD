@@ -359,6 +359,14 @@ pub struct BRepModel {
     /// snapshot/restore and emptied by `clear_geometry`. Empty by default — a
     /// supported state for any model with no tolerances authored.
     pub gdt: crate::gdt::sidecar::GdtSidecar,
+    /// Human-readable labels (the LABELLER): a NAME pinned to a topological
+    /// entity (by [`crate::primitives::persistent_id::PersistentId`]) or a named
+    /// cross-section plane, so the agent and the user share one vocabulary for
+    /// the geometry. Sidecar (like the PID maps + provenance + GD&T) so the SoA
+    /// stores stay lean; keyed durably so a name survives regeneration. Carried
+    /// through snapshot/restore and emptied by `clear_geometry`. Empty by
+    /// default — a supported state for any unlabelled model.
+    pub labels: crate::labels::LabelSidecar,
 }
 
 impl BRepModel {
@@ -431,6 +439,7 @@ impl BRepModel {
             solid_provenance: std::collections::HashMap::new(),
             document_unit: crate::units::LengthUnit::default(),
             gdt: crate::gdt::sidecar::GdtSidecar::new(),
+            labels: crate::labels::LabelSidecar::new(),
         }
     }
 
@@ -504,6 +513,9 @@ impl BRepModel {
         self.root_counter = 0;
         // GD&T annotations are bound to the topology being discarded.
         self.gdt.clear();
+        // Labels are bound to the topology (entity labels) / the part (section
+        // labels) being discarded.
+        self.labels.clear();
         // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance,
         // current_event_key (caller op-context, set per-op).
     }
@@ -690,6 +702,302 @@ impl BRepModel {
                 // A dimensional annotation on an edge is not an edge-form check;
                 // skip it here (it belongs on a face).
                 crate::gdt::model::Annotation::Dimensional(_) => None,
+            })
+            .collect()
+    }
+
+    // --- Labels (the LABELLER): names pinned to entities / sections ----------
+
+    /// Ensure a VERTEX has a durable persistent id, minting one if absent —
+    /// mirror of [`Self::ensure_face_annotation_key`] for the vertex case, used
+    /// when a label is pinned to a vertex created by an op not yet PID-wired.
+    pub fn ensure_vertex_label_key(
+        &mut self,
+        vertex: VertexId,
+    ) -> crate::primitives::persistent_id::PersistentId {
+        if let Some(p) = self.vertex_pids.get(&vertex).copied() {
+            return p;
+        }
+        let seed = self.next_root_seed(&format!("label_vertex:{vertex}"));
+        let pid = crate::primitives::persistent_id::PersistentId::root(&seed);
+        self.set_vertex_pid(vertex, pid);
+        pid
+    }
+
+    /// Pin a NAME to a FACE (by its resolved persistent id). The name is the
+    /// shared vocabulary; the durable PID is what survives regeneration. Returns
+    /// whether the name was created or replaced, or refuses an empty name.
+    pub fn label_face(
+        &mut self,
+        face: FaceId,
+        name: &str,
+        description: Option<String>,
+    ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
+        let pid = self.ensure_face_annotation_key(face);
+        self.labels.attach(
+            name,
+            crate::labels::Label {
+                target: crate::labels::LabelTarget::Entity {
+                    kind: crate::labels::LabelKind::Face,
+                    pid,
+                },
+                description,
+            },
+        )
+    }
+
+    /// Pin a NAME to an EDGE (by its resolved persistent id).
+    pub fn label_edge(
+        &mut self,
+        edge: EdgeId,
+        name: &str,
+        description: Option<String>,
+    ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
+        let pid = self.ensure_edge_annotation_key(edge);
+        self.labels.attach(
+            name,
+            crate::labels::Label {
+                target: crate::labels::LabelTarget::Entity {
+                    kind: crate::labels::LabelKind::Edge,
+                    pid,
+                },
+                description,
+            },
+        )
+    }
+
+    /// Pin a NAME to a VERTEX (by its resolved persistent id).
+    pub fn label_vertex(
+        &mut self,
+        vertex: VertexId,
+        name: &str,
+        description: Option<String>,
+    ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
+        let pid = self.ensure_vertex_label_key(vertex);
+        self.labels.attach(
+            name,
+            crate::labels::Label {
+                target: crate::labels::LabelTarget::Entity {
+                    kind: crate::labels::LabelKind::Vertex,
+                    pid,
+                },
+                description,
+            },
+        )
+    }
+
+    /// Pin a NAME to a cross-section PLANE (`origin` + `normal`). A named section
+    /// is not a topological entity — the plane itself is the target.
+    pub fn label_section(
+        &mut self,
+        name: &str,
+        origin: Point3,
+        normal: Vector3,
+        description: Option<String>,
+    ) -> Result<crate::labels::AttachOutcome, crate::labels::LabelError> {
+        self.labels.attach(
+            name,
+            crate::labels::Label {
+                target: crate::labels::LabelTarget::Section(crate::labels::SectionPlane {
+                    origin,
+                    normal,
+                }),
+                description,
+            },
+        )
+    }
+
+    /// The label with this name, if present (the stored target, not yet resolved
+    /// to a live id).
+    pub fn label(&self, name: &str) -> Option<&crate::labels::Label> {
+        self.labels.get(name)
+    }
+
+    /// Resolve a label NAME to a live `FaceId`, or refuse. `NotFound` if the name
+    /// is unknown or names a non-face target; `Dangling` if the face it named has
+    /// been deleted. The kernel never guesses.
+    pub fn resolve_label_face(&self, name: &str) -> Result<FaceId, crate::labels::LabelError> {
+        use crate::labels::{LabelError, LabelKind, LabelTarget};
+        match self.labels.get(name) {
+            None => Err(LabelError::NotFound),
+            Some(l) => match &l.target {
+                LabelTarget::Entity {
+                    kind: LabelKind::Face,
+                    pid,
+                } => self.face_by_pid(*pid).ok_or(LabelError::Dangling),
+                _ => Err(LabelError::NotFound),
+            },
+        }
+    }
+
+    /// Resolve a label NAME to a live `EdgeId`, or refuse (see
+    /// [`Self::resolve_label_face`]).
+    pub fn resolve_label_edge(&self, name: &str) -> Result<EdgeId, crate::labels::LabelError> {
+        use crate::labels::{LabelError, LabelKind, LabelTarget};
+        match self.labels.get(name) {
+            None => Err(LabelError::NotFound),
+            Some(l) => match &l.target {
+                LabelTarget::Entity {
+                    kind: LabelKind::Edge,
+                    pid,
+                } => self.edge_by_pid(*pid).ok_or(LabelError::Dangling),
+                _ => Err(LabelError::NotFound),
+            },
+        }
+    }
+
+    /// Resolve a label NAME to a live `VertexId`, or refuse.
+    pub fn resolve_label_vertex(&self, name: &str) -> Result<VertexId, crate::labels::LabelError> {
+        use crate::labels::{LabelError, LabelKind, LabelTarget};
+        match self.labels.get(name) {
+            None => Err(LabelError::NotFound),
+            Some(l) => match &l.target {
+                LabelTarget::Entity {
+                    kind: LabelKind::Vertex,
+                    pid,
+                } => self
+                    .pid_to_vertex
+                    .get(pid)
+                    .copied()
+                    .ok_or(LabelError::Dangling),
+                _ => Err(LabelError::NotFound),
+            },
+        }
+    }
+
+    /// Resolve a label NAME to a section PLANE, or refuse.
+    pub fn resolve_label_section(
+        &self,
+        name: &str,
+    ) -> Result<crate::labels::SectionPlane, crate::labels::LabelError> {
+        use crate::labels::{LabelError, LabelTarget};
+        match self.labels.get(name) {
+            None => Err(LabelError::NotFound),
+            Some(l) => match &l.target {
+                LabelTarget::Section(p) => Ok(*p),
+                _ => Err(LabelError::NotFound),
+            },
+        }
+    }
+
+    /// The WORLD anchor point for a label's eye-overlay callout: a face's
+    /// centroid, an edge's midpoint, a vertex's position, or a section plane's
+    /// origin. `None` when the named entity no longer resolves (dangling) or the
+    /// stats cannot be computed. `&mut` because face-centroid computation warms a
+    /// per-entity cache (same contract as the readable/select query path).
+    pub fn label_anchor(&mut self, name: &str) -> Option<Point3> {
+        use crate::labels::{LabelKind, LabelTarget};
+        let target = self.labels.get(name)?.target.clone();
+        match target {
+            LabelTarget::Section(p) => Some(p.origin),
+            LabelTarget::Entity {
+                kind: LabelKind::Vertex,
+                pid,
+            } => {
+                let vid = self.pid_to_vertex.get(&pid).copied()?;
+                self.vertices.get(vid).map(|v| v.point())
+            }
+            LabelTarget::Entity {
+                kind: LabelKind::Edge,
+                pid,
+            } => {
+                let eid = self.edge_by_pid(pid)?;
+                let edge = self.edges.get(eid)?;
+                let a = self.vertices.get(edge.start_vertex)?.point();
+                let b = self.vertices.get(edge.end_vertex)?.point();
+                Some(Point3::new(
+                    0.5 * (a.x + b.x),
+                    0.5 * (a.y + b.y),
+                    0.5 * (a.z + b.z),
+                ))
+            }
+            LabelTarget::Entity {
+                kind: LabelKind::Face,
+                pid,
+            } => {
+                let fid = self.face_by_pid(pid)?;
+                // Prefer the exact analytic centroid; fall back to the mean of
+                // the face's boundary vertices when the centroid integral
+                // declines (e.g. an annular cap with inner + outer loops) — the
+                // callout still lands ON the face, which is all the overlay needs.
+                {
+                    let Self {
+                        faces,
+                        loops,
+                        vertices,
+                        edges,
+                        curves,
+                        surfaces,
+                        ..
+                    } = self;
+                    if let Some(face) = faces.get_mut(fid) {
+                        if let Ok(stats) =
+                            face.compute_stats(loops, vertices, edges, curves, surfaces)
+                        {
+                            return Some(stats.centroid);
+                        }
+                    }
+                }
+                self.face_boundary_mean(fid)
+            }
+        }
+    }
+
+    /// Mean of a face's boundary vertices (outer + inner loops) — a robust
+    /// representative point on the face when the analytic centroid is
+    /// unavailable. `None` if the face has no resolvable boundary vertices.
+    fn face_boundary_mean(&self, fid: FaceId) -> Option<Point3> {
+        let face = self.faces.get(fid)?;
+        let mut lids = vec![face.outer_loop];
+        lids.extend_from_slice(&face.inner_loops);
+        let (mut sx, mut sy, mut sz, mut n) = (0.0_f64, 0.0_f64, 0.0_f64, 0_u64);
+        for lid in lids {
+            if let Some(lp) = self.loops.get(lid) {
+                for &eid in &lp.edges {
+                    if let Some(edge) = self.edges.get(eid) {
+                        for vid in [edge.start_vertex, edge.end_vertex] {
+                            if let Some(v) = self.vertices.get(vid) {
+                                let p = v.point();
+                                sx += p.x;
+                                sy += p.y;
+                                sz += p.z;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if n == 0 {
+            None
+        } else {
+            let inv = 1.0 / n as f64;
+            Some(Point3::new(sx * inv, sy * inv, sz * inv))
+        }
+    }
+
+    /// All labels as `(name, target-kind-tag, optional-world-anchor,
+    /// description)`, in name order — the agent-facing listing. The anchor is the
+    /// callout point (centroid/midpoint/position/section-origin); `None` for a
+    /// dangling entity label. `&mut` for the centroid cache, as in
+    /// [`Self::label_anchor`].
+    pub fn list_labels(&mut self) -> Vec<(String, &'static str, Option<Point3>, Option<String>)> {
+        let entries: Vec<(String, &'static str, Option<String>)> = self
+            .labels
+            .iter()
+            .map(|(name, label)| {
+                (
+                    name.to_string(),
+                    label.target.kind_tag(),
+                    label.description.clone(),
+                )
+            })
+            .collect();
+        entries
+            .into_iter()
+            .map(|(name, kind, desc)| {
+                let anchor = self.label_anchor(&name);
+                (name, kind, anchor, desc)
             })
             .collect()
     }
