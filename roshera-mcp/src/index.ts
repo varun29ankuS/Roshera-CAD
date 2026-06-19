@@ -256,6 +256,27 @@ server.tool(
 );
 
 server.tool(
+  "set_part_color",
+  "Colour a part for the scene-eye: set its display RGB so `scene_view` renders " +
+    "it in that colour (black tyres, livery body, …). Registry-only — does NOT " +
+    "modify geometry. After colouring parts, call `scene_view` to see the result.",
+  {
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    r: z.number().int().min(0).max(255),
+    g: z.number().int().min(0).max(255),
+    b: z.number().int().min(0).max(255),
+  },
+  async ({ part_id, r, g, b }) => {
+    try {
+      const res = await api("POST", `/api/agent/parts/${part_id}/color`, { r, g, b });
+      return ok(res);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "select_face",
   "Address a face by DESCRIPTION instead of guessing its id — the kernel " +
     "resolves it or REFUSES. Give a surface `kind` (planar/cylindrical/…), an " +
