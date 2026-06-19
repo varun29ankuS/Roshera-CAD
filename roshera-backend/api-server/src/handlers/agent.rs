@@ -1550,3 +1550,116 @@ pub async fn get_pointer(
     };
     Ok(Json(PointerReport { event, hover }))
 }
+
+// ───────────────────── GD&T (kernel-verified conformance) ───────────
+
+/// Body for attaching a GD&T tolerance to a feature: the kernel's own
+/// [`geometry_engine::gdt::model::Annotation`] (a dimensional tolerance or a
+/// feature control frame). Wire shape IS the kernel type — no DTO drift, exactly
+/// like the rest of this handler module.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachToleranceBody {
+    pub annotation: geometry_engine::gdt::model::Annotation,
+}
+
+/// Response from attaching a tolerance: the durable persistent-id key the
+/// annotation was filed under (hex), so the caller can re-reference the feature.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachToleranceResponse {
+    pub success: bool,
+    pub part_id: u32,
+    pub feature_id: u32,
+    /// The persistent-id key (as a 128-bit hex string) the annotation is bound to.
+    pub annotation_key: String,
+    pub kind: String,
+}
+
+/// `POST /api/agent/parts/{id}/faces/{face_id}/tolerance` — attach a dimensional
+/// tolerance or feature control frame to a FACE. The annotation is bound to the
+/// face's persistent id (minted if absent) so it survives regeneration. Write
+/// lock (sidecar mutation). `404` on unknown face.
+pub async fn attach_face_tolerance(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, face_id)): Path<(u32, u32)>,
+    Json(body): Json<AttachToleranceBody>,
+) -> Result<Json<AttachToleranceResponse>, StatusCode> {
+    let mut model = model_handle.write().await;
+    if model.faces.get(face_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let kind = body.annotation.kind_label().to_string();
+    let key = model.attach_face_annotation(face_id, body.annotation);
+    Ok(Json(AttachToleranceResponse {
+        success: true,
+        part_id: id,
+        feature_id: face_id,
+        annotation_key: format!("{:032x}", key.as_u128()),
+        kind,
+    }))
+}
+
+/// `POST /api/agent/parts/{id}/edges/{edge_id}/tolerance` — attach a tolerance to
+/// an EDGE (for circularity / straightness form callouts). Write lock.
+pub async fn attach_edge_tolerance(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((id, edge_id)): Path<(u32, u32)>,
+    Json(body): Json<AttachToleranceBody>,
+) -> Result<Json<AttachToleranceResponse>, StatusCode> {
+    let mut model = model_handle.write().await;
+    if model.edges.get(edge_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let kind = body.annotation.kind_label().to_string();
+    let key = model.attach_edge_annotation(edge_id, body.annotation);
+    Ok(Json(AttachToleranceResponse {
+        success: true,
+        part_id: id,
+        feature_id: edge_id,
+        annotation_key: format!("{:032x}", key.as_u128()),
+        kind,
+    }))
+}
+
+/// `GET /api/agent/parts/{id}/faces/{face_id}/verify` — the differentiator:
+/// the KERNEL measures the actual geometry against every tolerance attached to
+/// the face and returns one conformance result each. The verdict is computed
+/// from the B-Rep, never asserted; an unimplemented characteristic reports
+/// `not_yet_verified`, never a false pass. Read lock. Empty list when the face
+/// carries no annotations.
+pub async fn verify_face_tolerances(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((_id, face_id)): Path<(u32, u32)>,
+) -> Result<Json<Vec<geometry_engine::gdt::verify::ConformanceResult>>, StatusCode> {
+    let model = model_handle.read().await;
+    if model.faces.get(face_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(model.verify_face_conformance(face_id)))
+}
+
+/// Query for edge verification: `?samples=N` controls the edge sampling density
+/// (default 64, the resolution at which form deviation is measured along the
+/// curve).
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyEdgeQuery {
+    pub samples: Option<usize>,
+}
+
+/// `GET /api/agent/parts/{id}/edges/{edge_id}/verify` — measure every edge form
+/// tolerance (circularity / straightness) against the actual curve. Read lock.
+pub async fn verify_edge_tolerances(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path((_id, edge_id)): Path<(u32, u32)>,
+    Query(q): Query<VerifyEdgeQuery>,
+) -> Result<Json<Vec<geometry_engine::gdt::verify::ConformanceResult>>, StatusCode> {
+    let model = model_handle.read().await;
+    if model.edges.get(edge_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let samples = q.samples.unwrap_or(64).clamp(2, 4096);
+    Ok(Json(model.verify_edge_conformance(edge_id, samples)))
+}
