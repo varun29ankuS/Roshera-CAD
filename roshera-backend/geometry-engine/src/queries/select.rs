@@ -38,6 +38,17 @@ impl SurfaceKind {
     }
 }
 
+/// A revolution / symmetry axis: a point on the axis and its unit direction.
+/// Carried by the geometry-aware extremals (`MinRadiusStation`,
+/// `AxialExtremalCap`) so the score is measured RELATIVE to the part's own axis
+/// rather than a hardcoded world direction. Built by the recognizer that detects
+/// the part's symmetry axis (see `BRepModel::symmetry_axis`).
+#[derive(Debug, Clone, Copy)]
+pub struct Axis {
+    pub origin: Vector3,
+    pub direction: Vector3,
+}
+
 /// How to pick among multiple matches. `None` means "there must be exactly one"
 /// (else `Ambiguous`); the extremal variants rank the matches and pick the top —
 /// but a near-tie at the top is itself `Ambiguous` (the kernel won't guess).
@@ -48,6 +59,17 @@ pub enum Extremal {
     SmallestArea,
     /// The face whose centroid is farthest along `dir` (e.g. +Z = "topmost").
     MostAlong(Vector3),
+    /// THROAT recognizer (geometry-aware): the face whose globally-MINIMUM
+    /// radial distance to the symmetry `Axis` is smallest. Works on any
+    /// surface-of-revolution band — the necked-down station of a bell nozzle —
+    /// not just an analytic cylinder, because the score samples the face surface
+    /// for its closest approach to the axis. Smaller is "more throat".
+    MinRadiusStation(Axis),
+    /// EXIT recognizer (geometry-aware): the face whose centroid is most EXTREME
+    /// along the symmetry `Axis` — the cap at EITHER end (max |signed distance|
+    /// from the axis origin), axis-relative rather than hardcoded +Z. Larger
+    /// |projection| is "more of an end cap".
+    AxialExtremalCap(Axis),
 }
 
 /// A descriptive face reference.
@@ -166,7 +188,7 @@ pub fn resolve_face(
             if scored.is_empty() {
                 return Err(SelectError::NotFound);
             }
-            let want_max = !matches!(e, Extremal::SmallestArea);
+            let want_max = !matches!(e, Extremal::SmallestArea | Extremal::MinRadiusStation(_));
             let best = scored
                 .iter()
                 .cloned()
@@ -427,8 +449,17 @@ pub fn resolve_edge(
 }
 
 /// Score one face for the extremal pick, with the split field borrows
-/// `compute_stats` needs. Returns area or centroid·dir.
+/// `compute_stats` needs. Returns area, centroid·dir, the face's minimum radial
+/// distance to an axis, or the magnitude of its centroid's axial projection.
 fn face_score(model: &mut BRepModel, fid: FaceId, e: Extremal) -> Option<f64> {
+    // The two geometry-aware extremals SAMPLE the face surface, which needs an
+    // immutable borrow of the model alongside the surface store — keep them off
+    // the `compute_stats` split-borrow path.
+    match e {
+        Extremal::MinRadiusStation(axis) => return face_min_radius_to_axis(model, fid, axis),
+        Extremal::AxialExtremalCap(axis) => return face_axial_extent_magnitude(model, fid, axis),
+        _ => {}
+    }
     // Distinct BRepModel fields → simultaneous &mut faces + &mut loops + & others
     // is sound (the readable query path relies on the same field-disjoint borrow).
     let BRepModel {
@@ -450,6 +481,100 @@ fn face_score(model: &mut BRepModel, fid: FaceId, e: Extremal) -> Option<f64> {
             let c = stats.centroid;
             Some(c.x * d.x + c.y * d.y + c.z * d.z)
         }
-        Extremal::None => None,
+        Extremal::None | Extremal::MinRadiusStation(_) | Extremal::AxialExtremalCap(_) => None,
     }
+}
+
+/// Perpendicular distance from a point to the axis `(origin, dir)`. `dir` need
+/// not be unit; it is normalized here (a zero axis yields 0).
+fn point_to_axis_distance(p: crate::math::Point3, axis: Axis) -> f64 {
+    let d = match axis.direction.normalize() {
+        Ok(d) => d,
+        Err(_) => return 0.0,
+    };
+    let o = crate::math::Point3::new(axis.origin.x, axis.origin.y, axis.origin.z);
+    let w = p - o;
+    let along = w.dot(&d);
+    let proj = crate::math::Point3::new(o.x + d.x * along, o.y + d.y * along, o.z + d.z * along);
+    p.distance(&proj)
+}
+
+/// The REPRESENTATIVE radial distance of a face to `axis` — the MEAN radius of
+/// the face's boundary samples (loop vertices + edge midpoints). This is the
+/// throat score: the face whose body SITS closest to the axis. A min-radius
+/// cylinder/band scores its own radius; an adjacent contraction cone, which
+/// meets the throat at one rim but flares to a wide rim at the other, scores its
+/// rim-mean — well above the throat. Using the body MEAN rather than the
+/// touching minimum avoids a degenerate tie at the shared throat rim, where a
+/// cone and the throat band meet at the same radius but only the band STATIONS
+/// there.
+///
+/// Boundary samples are used (not a `uv_bounds` parametric grid) because an
+/// analytic face's `uv_bounds` is the normalized `[0,1]²` placeholder, not the
+/// trimmed extent — its loop edges carry the real geometry. `None` if the face
+/// has no resolvable boundary point.
+fn face_min_radius_to_axis(model: &BRepModel, fid: FaceId, axis: Axis) -> Option<f64> {
+    let face = model.faces.get(fid)?;
+    let mut sum = 0.0_f64;
+    let mut count = 0u32;
+    let mut add = |p: crate::math::Point3| {
+        sum += point_to_axis_distance(p, axis);
+        count += 1;
+    };
+    let mut lids = vec![face.outer_loop];
+    lids.extend_from_slice(&face.inner_loops);
+    for lid in lids {
+        if let Some(lp) = model.loops.get(lid) {
+            for &eid in &lp.edges {
+                if let Some(edge) = model.edges.get(eid) {
+                    let a = model.vertices.get(edge.start_vertex).map(|v| v.point());
+                    let b = model.vertices.get(edge.end_vertex).map(|v| v.point());
+                    if let Some(a) = a {
+                        add(a);
+                    }
+                    // Edge midpoint — densifies a curved-band boundary so the
+                    // mean tracks the band, not just its corner vertices.
+                    if let (Some(a), Some(b)) = (a, b) {
+                        add(crate::math::Point3::new(
+                            0.5 * (a.x + b.x),
+                            0.5 * (a.y + b.y),
+                            0.5 * (a.z + b.z),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(sum / count as f64)
+}
+
+/// The magnitude of a face's centroid projection onto `axis` (signed distance
+/// from the axis origin, absolute) — how far toward EITHER end of the part the
+/// face sits. The end caps maximize this. `None` if the centroid is unavailable.
+fn face_axial_extent_magnitude(model: &mut BRepModel, fid: FaceId, axis: Axis) -> Option<f64> {
+    let d = axis.direction.normalize().ok()?;
+    let centroid = {
+        let BRepModel {
+            faces,
+            loops,
+            vertices,
+            edges,
+            curves,
+            surfaces,
+            ..
+        } = model;
+        let face = faces.get_mut(fid)?;
+        match face.compute_stats(loops, vertices, edges, curves, surfaces) {
+            Ok(stats) => stats.centroid,
+            // Fall back to the boundary mean for a face whose centroid integral
+            // declines (annular caps) — the axial position is still well-defined.
+            Err(_) => model.face_boundary_mean(fid)?,
+        }
+    };
+    let o = crate::math::Point3::new(axis.origin.x, axis.origin.y, axis.origin.z);
+    let along = (centroid - o).dot(&d);
+    Some(along.abs())
 }
