@@ -7,16 +7,23 @@
 //! single CLOSED curve, so the quad path aborted with a curve mid-point drift
 //! ≈ the diameter.
 //!
-//! The fix builds an ANNULAR (ruled) wall for a closed/curved rim: outer loop =
-//! the rim curve, inner loop = the offset rim curve (shared with the adjacent
-//! interior offset face so the seam is 2-manifold).
+//! The fix builds a wall for a closed/curved rim, choosing by whether the
+//! offset rim lies in the cap plane:
+//!   * COPLANAR (cylinder / revolved cap — radial offset, no axial component):
+//!     a flat ANNULUS on the cap's own surface (outer loop = rim, inner loop =
+//!     in-plane offset rim).
+//!   * OFF-PLANE (NURBS lateral — the control-net normal-push has an axial
+//!     component at a barrel end, so the offset rim is a small slanted collar
+//!     and the offset surface never reaches the cap plane): a RULED BAND collar
+//!     between the original rim and the offset rim. The offset rim is rebuilt
+//!     as the offset surface's exact iso-curve (a clean concentric ring, NOT
+//!     the single-direction `Curve::offset` translate, which oscillates the
+//!     radius and self-overlaps), and the offset NURBS lateral's u-closure is
+//!     preserved so it tessellates through the watertight skin-lateral stitch.
 //!
-//! Analytic cases (cylinder, revolved bands) — whose surface offset is exact —
-//! are gated as fully mesh-watertight closed 2-manifolds (`manifold_report`:
-//! boundary_edges == 0, nonmanifold_edges == 0). The NURBS-lateral case is
-//! gated as a structurally SOUND B-Rep (`validate_solid_scoped`, every edge
-//! used by exactly two faces); its mesh still has a documented sliver leak
-//! along the offset NURBS rim (see `barrel` doc-comment).
+//! ALL three cases — cylinder, revolved bands, and the NURBS barrel — are now
+//! gated as fully mesh-watertight closed 2-manifolds (`manifold_report`:
+//! boundary_edges == 0, nonmanifold_edges == 0) AND sound certificates.
 
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Point3, Tolerance, Vector3};
@@ -233,5 +240,17 @@ fn shell_nurbs_barrel_both_caps_removed() {
     assert_eq!(caps.len(), 2, "barrel must have 2 planar end caps");
     let hollow =
         offset_solid(&mut model, solid, 0.3, caps, shell_options()).expect("shell nurbs barrel");
+
+    // FULL watertight gate: sound B-Rep AND closed 2-manifold mesh (no leak).
+    // The shell op trims the curved-cap collar as a ruled band between the
+    // shared rim edges (and preserves the offset lateral's u-closure), so the
+    // offset NURBS rim no longer leaves ~200 sliver boundary edges.
+    assert_shell_watertight(&mut model, hollow, 6.0, "nurbs-barrel-tube");
     assert_brep_sound(&model, hollow, "nurbs-barrel-tube");
+
+    let cert = model.certify_solid(hollow);
+    assert!(
+        cert.is_sound(),
+        "nurbs-barrel-tube: certificate not sound: {cert:?}"
+    );
 }

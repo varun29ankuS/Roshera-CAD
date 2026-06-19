@@ -278,6 +278,15 @@ pub fn tessellate_face(
         "CylindricalFillet" | "ToroidalFillet" | "SphericalFillet" | "VariableRadiusFillet" => {
             tessellate_fillet_face(face, model, params, cache, mesh)
         }
+        // A shell's collar wall (`offset_solid` on a NURBS / curved lateral)
+        // is a RuledSurface between two CLOSED concentric rims that do not lie
+        // in a common cap plane — a slanted annular band. Stitch the two cached
+        // rim rings directly (the same closed-ring stitch the cylinder/NURBS
+        // laterals use), so the collar coincides bit-for-bit with the adjacent
+        // exterior / interior laterals at every rim sample. Any other
+        // RuledSurface (planar extrude wall, non-annular band) falls through to
+        // the generic planar-or-curved routing below.
+        "RuledSurface" if tessellate_ruled_annular_band(face, model, cache, mesh) => {}
         _ => {
             // RuledSurface (extruded straight-line side faces, prismatic
             // sweeps, etc.) is geometrically planar whenever its two
@@ -4742,6 +4751,113 @@ fn tessellate_nurbs_skin_lateral_with_holes(
 /// both rings are fully consumed (wrapping closed). Each triangle is wound so its
 /// geometric normal agrees with the rings' (already outward-oriented) vertex
 /// normals.
+/// Tessellate a shell collar wall: a `RuledSurface` whose outer loop and single
+/// inner loop are each ONE closed rim edge (an `offset_solid` curved-cap wall).
+/// Stitches the two cached rim rings into a watertight band. Returns `false`
+/// WITHOUT touching `mesh` when the face is not this exact structure (so the
+/// caller falls through to the generic routing); on success, emits the band and
+/// returns `true`.
+fn tessellate_ruled_annular_band(
+    face: &Face,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    // Exactly one inner loop, and both loops a single closed edge.
+    if face.inner_loops.len() != 1 {
+        return false;
+    }
+    let outer = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return false,
+    };
+    let inner = match model.loops.get(face.inner_loops[0]) {
+        Some(l) => l,
+        None => return false,
+    };
+    if outer.edges.len() != 1 || inner.edges.len() != 1 {
+        return false;
+    }
+    let outer_edge_id = outer.edges[0];
+    let inner_edge_id = inner.edges[0];
+    let closed = |eid| {
+        model
+            .edges
+            .get(eid)
+            .map(|e| e.start_vertex == e.end_vertex)
+            .unwrap_or(false)
+    };
+    if !closed(outer_edge_id) || !closed(inner_edge_id) {
+        return false;
+    }
+
+    // Cached rim rings (forward param direction; last sample duplicates the
+    // seam, drop it so the stitch wraps cleanly).
+    let outer_s = cache.get_or_compute(outer_edge_id, model);
+    let inner_s = cache.get_or_compute(inner_edge_id, model);
+    if outer_s.len() < 4 || inner_s.len() < 4 {
+        return false;
+    }
+    let outer_ring = &outer_s[..outer_s.len() - 1];
+    let inner_ring = &inner_s[..inner_s.len() - 1];
+
+    // Per-vertex outward normal: the ruled-band surface normal, oriented by the
+    // face. A degenerate sample (e.g. on a sliver collar) falls back to the
+    // ring-plane normal estimated from the two ring centroids.
+    let surface = match model.surfaces.get(face.surface_id) {
+        Some(s) => s,
+        None => return false,
+    };
+    let orient_sign = face.orientation.sign();
+    let centroid = |ring: &[Point3]| {
+        let mut c = Point3::ZERO;
+        for p in ring {
+            c = c + *p;
+        }
+        c * (1.0 / ring.len() as f64)
+    };
+    let oc = centroid(outer_ring);
+    let ic = centroid(inner_ring);
+    let band_axis = (ic - oc).normalize().unwrap_or(Vector3::Z);
+
+    let ring_row = |mesh: &mut TriangleMesh, ring: &[Point3]| -> Vec<u32> {
+        ring.iter()
+            .map(|p| {
+                let normal = surface
+                    .closest_point(p, Tolerance::default())
+                    .and_then(|(u, v)| surface.normal_at(u, v))
+                    .ok()
+                    .and_then(|n| n.normalize().ok())
+                    .map(|n| n * orient_sign)
+                    .unwrap_or_else(|| {
+                        // Radial-from-axis fallback through the band centroid.
+                        let mid = Point3::new(
+                            0.5 * (oc.x + ic.x),
+                            0.5 * (oc.y + ic.y),
+                            0.5 * (oc.z + ic.z),
+                        );
+                        let radial = *p - mid;
+                        let along = radial.dot(&band_axis);
+                        (radial - band_axis * along)
+                            .normalize()
+                            .map(|r| r * orient_sign)
+                            .unwrap_or(Vector3::Z)
+                    });
+                mesh.add_vertex(MeshVertex {
+                    position: *p,
+                    normal,
+                    uv: None,
+                })
+            })
+            .collect()
+    };
+
+    let outer_idx = ring_row(mesh, outer_ring);
+    let inner_idx = ring_row(mesh, inner_ring);
+    stitch_closed_rings(&outer_idx, &inner_idx, mesh);
+    true
+}
+
 fn stitch_closed_rings(lo: &[u32], hi: &[u32], mesh: &mut TriangleMesh) {
     let p = lo.len();
     let q = hi.len();

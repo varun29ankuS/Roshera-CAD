@@ -188,15 +188,19 @@ fn offset_solid_body(
     // these interior faces just created — that's what gives the
     // resulting shell shared topology (manifold) instead of a stack of
     // disjoint surfaces that just happen to dedup at their corner
-    // vertices.
-    let (interior_faces, original_to_offset_edge) = create_interior_offset_faces(
-        model,
-        &solid,
-        -thickness.abs(),
-        &faces_to_remove,
-        &vertex_insets,
-        &options,
-    )?;
+    // vertices. `source_to_offset_surface` records, per source edge, the
+    // OFFSET SURFACE its adjacent interior face was built on, so a curved cap
+    // wall can rebuild the offset rim as that surface's exact iso-curve (see
+    // `create_curved_rim_wall`).
+    let (interior_faces, original_to_offset_edge, source_to_offset_surface) =
+        create_interior_offset_faces(
+            model,
+            &solid,
+            -thickness.abs(),
+            &faces_to_remove,
+            &vertex_insets,
+            &options,
+        )?;
 
     // Create side walls for removed faces
     let wall_faces = create_shell_walls(
@@ -205,6 +209,7 @@ fn offset_solid_body(
         thickness,
         &faces_to_remove,
         &original_to_offset_edge,
+        &source_to_offset_surface,
         &vertex_insets,
         &options,
     )?;
@@ -863,7 +868,11 @@ fn create_interior_offset_faces(
     faces_to_remove: &[FaceId],
     vertex_insets: &HashMap<VertexId, Point3>,
     options: &OffsetOptions,
-) -> OperationResult<(Vec<FaceId>, std::collections::HashMap<EdgeId, EdgeId>)> {
+) -> OperationResult<(
+    Vec<FaceId>,
+    std::collections::HashMap<EdgeId, EdgeId>,
+    std::collections::HashMap<EdgeId, u32>,
+)> {
     let shell = model
         .shells
         .get(solid.outer_shell)
@@ -872,6 +881,8 @@ fn create_interior_offset_faces(
 
     let mut interior_faces = Vec::new();
     let mut original_to_offset = std::collections::HashMap::new();
+    let mut source_to_offset_surface: std::collections::HashMap<EdgeId, u32> =
+        std::collections::HashMap::new();
 
     let offset_options = OffsetOptions {
         common: options.common.clone(),
@@ -934,12 +945,17 @@ fn create_interior_offset_faces(
         interior_faces.push(offset_face_id);
 
         // `create_offset_loop` already recorded every newly created offset
-        // edge in `original_to_offset` (the shared dedup map). `edge_map`
-        // mirrors those just-created entries; nothing further to merge.
-        let _ = edge_map;
+        // edge in `original_to_offset` (the shared dedup map). Record this
+        // face's offset SURFACE against each source edge it offset, so a
+        // curved cap wall can rebuild the offset rim as that surface's exact
+        // iso-curve (the cap rim is offset exactly once — by its adjacent kept
+        // lateral — so the mapping is unambiguous for the rim).
+        for (source_edge, _offset_edge) in &edge_map {
+            source_to_offset_surface.insert(*source_edge, surface_id);
+        }
     }
 
-    Ok((interior_faces, original_to_offset))
+    Ok((interior_faces, original_to_offset, source_to_offset_surface))
 }
 
 /// Create wall faces for shell openings.
@@ -955,6 +971,7 @@ fn create_shell_walls(
     thickness: f64,
     faces_to_remove: &[FaceId],
     original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
+    source_to_offset_surface: &std::collections::HashMap<EdgeId, u32>,
     vertex_insets: &HashMap<VertexId, Point3>,
     options: &OffsetOptions,
 ) -> OperationResult<Vec<FaceId>> {
@@ -1056,6 +1073,7 @@ fn create_shell_walls(
                         face.surface_id,
                         removed_normal,
                         original_to_offset_edge,
+                        source_to_offset_surface,
                     )?;
                     wall_faces.push(wall_face);
                 } else {
@@ -1161,6 +1179,7 @@ fn create_curved_rim_wall(
     cap_surface_id: u32,
     removed_face_outward_normal: Vector3,
     original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
+    source_to_offset_surface: &std::collections::HashMap<EdgeId, u32>,
 ) -> OperationResult<FaceId> {
     use crate::primitives::face::FaceOrientation;
     use crate::primitives::r#loop::LoopType;
@@ -1179,62 +1198,330 @@ fn create_curved_rim_wall(
         ))
     })?;
 
-    // Rebuild the offset rim's curve as a true in-plane inset of the cap rim,
-    // matching the already-inset offset vertex. The cap plane's normal is the
-    // removed face's outward normal; the inset direction is in-plane, toward
-    // the rim's interior (the cap centroid). `Curve::offset(d, in_plane_dir)`
-    // shrinks a closed analytic rim (circle / arc) by `d` and is the exact
-    // in-plane offset for the planar-cap case.
-    rebuild_offset_rim_curve(
+    // Decide the wall topology by whether the offset rim lies in the cap plane.
+    //
+    // For an ANALYTIC offset surface (cylinder / revolved cap) the rim is offset
+    // radially with no axial component, so the offset rim stays in the cap plane
+    // and the wall is a flat annulus on the cap's own surface. For a NURBS
+    // lateral the offset is a control-net normal-push: at a barrel end the
+    // inward push has an axial component, so the offset rim sits OFF the cap
+    // plane (a small slanted collar) and the offset surface never reaches the
+    // cap plane at all. Forcing such a rim onto the planar cap surface makes the
+    // wall's planar tessellation degenerate and leaks the rim (~200 slivers).
+    //
+    // Test the AS-CREATED offset rim (the surface-normal offset, before any
+    // reshape): its planarity relative to the cap plane is the discriminator.
+    let normal = removed_face_outward_normal
+        .normalize()
+        .unwrap_or(removed_face_outward_normal);
+    let cap_point = {
+        let rim_edge = model.edges.get(rim_edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_curved_rim_wall: rim edge {rim_edge_id} not found"
+            ))
+        })?;
+        let rim_curve = model.curves.get(rim_edge.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("create_curved_rim_wall: rim curve not found".into())
+        })?;
+        rim_curve.point_at(0.0).map_err(|e| {
+            OperationError::InvalidGeometry(format!("create_curved_rim_wall: rim eval: {e}"))
+        })?
+    };
+    let offset_in_cap_plane =
+        offset_rim_lies_in_plane(model, offset_rim_edge_id, cap_point, normal)?;
+
+    if offset_in_cap_plane {
+        // ---- Flat annular wall on the cap plane (analytic-offset case). ----
+        //
+        // The offset rim is already in the cap plane; reshape it to the exact
+        // analytic in-plane inset of the cap rim (a no-op when the curve cannot
+        // be analytically offset) so the flat annulus is geometrically clean.
+        rebuild_offset_rim_curve(
+            model,
+            rim_edge_id,
+            offset_rim_edge_id,
+            removed_face_outward_normal,
+        )?;
+        //
+        // Decide which rim bounds the annulus from outside. Inset of a convex
+        // cap's OUTER rim shrinks it (rim is outer, offset is the hole); but on
+        // the INNER rim of an annular cap (washer / tube end) the material lies
+        // OUTSIDE the original rim — the offset rim is larger and must be the
+        // outer loop. Compare the two closed curves' characteristic radius
+        // about their shared centroid and put the larger one on the outer loop.
+        let rim_radius = closed_edge_mean_radius(model, rim_edge_id)?;
+        let offset_radius = closed_edge_mean_radius(model, offset_rim_edge_id)?;
+        let (outer_edge, inner_edge) = if offset_radius > rim_radius {
+            (offset_rim_edge_id, rim_edge_id)
+        } else {
+            (rim_edge_id, offset_rim_edge_id)
+        };
+
+        let mut outer_loop = Loop::new(0, LoopType::Outer);
+        outer_loop.add_edge(outer_edge, true);
+        let outer_loop_id = model.loops.add(outer_loop);
+
+        let mut inner_loop = Loop::new(0, LoopType::Inner);
+        inner_loop.add_edge(inner_edge, false);
+        let inner_loop_id = model.loops.add(inner_loop);
+
+        let cap_surface = model.surfaces.get(cap_surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_curved_rim_wall: cap surface {cap_surface_id} not found"
+            ))
+        })?;
+        let orientation = orient_face_for_outward(cap_surface, removed_face_outward_normal)
+            .unwrap_or(FaceOrientation::Forward);
+
+        let mut wall_face = Face::new(0, cap_surface_id, outer_loop_id, orientation);
+        wall_face.add_inner_loop(inner_loop_id);
+        return Ok(model.faces.add(wall_face));
+    }
+
+    // ---- Ruled-band collar wall (off-plane offset rim, e.g. NURBS barrel). ----
+    //
+    // Rebuild the offset rim as the offset SURFACE's exact iso-curve at this cap
+    // end. The as-created offset rim is a single-direction translate of the cap
+    // rim (`Curve::offset(d, fixed_dir)`), which on a closed ring is a sideways
+    // SHIFT (radius oscillates ±d) rather than a clean concentric ring — the
+    // resulting collar self-overlaps and disagrees with the interior offset
+    // face's own surface boundary. The offset surface's iso-curve is the true,
+    // clean ring AND is exactly what the interior face tessellates to at its
+    // rim, so installing it makes the collar non-self-intersecting and the seam
+    // bit-coincident with the interior lateral. (Best-effort: if the iso-curve
+    // is unavailable the as-created rim is kept.)
+    if let Some(&offset_surface_id) = source_to_offset_surface.get(&rim_edge_id) {
+        rebuild_offset_rim_from_iso_curve(
+            model,
+            rim_edge_id,
+            offset_rim_edge_id,
+            offset_surface_id,
+            normal,
+        )?;
+    }
+
+    // The wall surface is the ruled surface between the two closed rims; the
+    // dedicated annular-band tessellator stitches the original-rim ring to the
+    // offset-rim ring (both drawn from the shared edge cache). Outer loop = the
+    // original cap rim, inner loop = the offset rim — the same two-loop
+    // structure the flat wall uses, so the ruled-band tessellator and the
+    // shell-validator both see one closed edge per loop.
+    create_ruled_band_wall(
         model,
         rim_edge_id,
         offset_rim_edge_id,
         removed_face_outward_normal,
-    )?;
+    )
+}
 
-    // Decide which rim bounds the annulus from outside. Inset of a convex
-    // cap's OUTER rim shrinks it (rim is outer, offset is the hole); but on
-    // the INNER rim of an annular cap (washer / tube end) the material lies
-    // OUTSIDE the original rim — the offset rim is larger and must be the
-    // outer loop. Compare the two closed curves' characteristic radius about
-    // their shared centroid and put the larger one on the outer loop.
-    let rim_radius = closed_edge_mean_radius(model, rim_edge_id)?;
-    let offset_radius = closed_edge_mean_radius(model, offset_rim_edge_id)?;
-    let (outer_edge, inner_edge) = if offset_radius > rim_radius {
-        (offset_rim_edge_id, rim_edge_id)
-    } else {
-        (rim_edge_id, offset_rim_edge_id)
+/// Replace the offset rim edge's curve with the offset SURFACE's iso-curve at
+/// the cap end this rim belongs to (the v-end of the offset NURBS lateral whose
+/// 3D position is nearest the cap plane through `cap_normal`·rim). This is the
+/// true ring the interior offset face tessellates to at its boundary, so the
+/// collar's inner rim and the interior face's rim become bit-coincident, and
+/// the ring is clean (no single-direction-translate radius oscillation).
+fn rebuild_offset_rim_from_iso_curve(
+    model: &mut BRepModel,
+    rim_edge_id: EdgeId,
+    offset_rim_edge_id: EdgeId,
+    offset_surface_id: u32,
+    cap_normal: Vector3,
+) -> OperationResult<()> {
+    use crate::primitives::curve::{Curve, NurbsCurve};
+    use crate::primitives::surface::GeneralNurbsSurface;
+
+    // Cap-plane reference point (a point on the original rim).
+    let cap_point = {
+        let rim_edge = model.edges.get(rim_edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "rebuild_offset_rim_from_iso_curve: rim edge {rim_edge_id} not found"
+            ))
+        })?;
+        let rim_curve = model.curves.get(rim_edge.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "rebuild_offset_rim_from_iso_curve: rim curve not found".into(),
+            )
+        })?;
+        match rim_curve.point_at(0.0) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        }
     };
 
-    // Outer loop = the larger closed rim edge, traversed FORWARD. Its single
-    // seam vertex closes the loop.
-    let mut outer_loop = Loop::new(0, LoopType::Outer);
-    outer_loop.add_edge(outer_edge, true);
-    let outer_loop_id = model.loops.add(outer_loop);
-
-    // Inner loop (hole) = the smaller closed rim edge. Traversed BACKWARD so
-    // its winding opposes the outer loop — the standard inner-loop convention
-    // for a face with a hole, leaving the annular material between the rims.
-    let mut inner_loop = Loop::new(0, LoopType::Inner);
-    inner_loop.add_edge(inner_edge, false);
-    let inner_loop_id = model.loops.add(inner_loop);
-
-    // The wall lives in the removed cap's plane, so reuse that surface and
-    // orient the face so its outward direction matches the cap's outward
-    // normal (the wall faces out of the resulting hollow solid).
-    let cap_surface = model.surfaces.get(cap_surface_id).ok_or_else(|| {
+    // Extract the NURBS iso-curve at whichever v-end (0 or 1) of the offset
+    // surface sits on this cap's side.
+    let surface = model.surfaces.get(offset_surface_id).ok_or_else(|| {
         OperationError::InvalidGeometry(format!(
-            "create_curved_rim_wall: cap surface {cap_surface_id} not found"
+            "rebuild_offset_rim_from_iso_curve: offset surface {offset_surface_id} not found"
         ))
     })?;
-    let orientation = orient_face_for_outward(cap_surface, removed_face_outward_normal)
+    let nurbs = match surface.as_any().downcast_ref::<GeneralNurbsSurface>() {
+        Some(g) => &g.nurbs,
+        // Non-NURBS offset surface (e.g. analytic) — keep the as-created rim.
+        None => return Ok(()),
+    };
+    // Signed distance of each v-end's seam point to the cap plane; the smaller
+    // |distance| identifies this cap's end.
+    let end_for = |v: f64| -> Option<f64> {
+        surface
+            .point_at(0.0, v)
+            .ok()
+            .map(|p| ((p - cap_point).dot(&cap_normal)).abs())
+    };
+    let v_end = match (end_for(0.0), end_for(1.0)) {
+        (Some(d0), Some(d1)) => {
+            if d0 <= d1 {
+                0.0
+            } else {
+                1.0
+            }
+        }
+        _ => return Ok(()),
+    };
+
+    let iso = match nurbs.iso_curve_v(v_end) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    let iso_prim = match NurbsCurve::new(
+        iso.degree,
+        iso.control_points,
+        iso.weights,
+        iso.knots.to_vec(),
+    ) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    // Seam point of the iso-curve → snap the closed offset rim edge's vertex.
+    let seam = match iso_prim.point_at(0.0) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    let new_curve_id = model.curves.add(Box::new(iso_prim));
+    let (sv, ev) = {
+        let e = model.edges.get(offset_rim_edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "rebuild_offset_rim_from_iso_curve: offset edge {offset_rim_edge_id} not found"
+            ))
+        })?;
+        (e.start_vertex, e.end_vertex)
+    };
+    model.vertices.set_position(sv, seam.x, seam.y, seam.z);
+    if ev != sv {
+        model.vertices.set_position(ev, seam.x, seam.y, seam.z);
+    }
+    if let Some(e) = model.edges.get_mut(offset_rim_edge_id) {
+        e.curve_id = new_curve_id;
+    }
+    Ok(())
+}
+
+/// True when the closed offset-rim edge lies entirely within the plane through
+/// `plane_point` with unit `plane_normal` (every sample's signed distance is
+/// below a relative tolerance). Used to choose between the flat annular wall
+/// (rim in the cap plane) and the ruled-band collar (rim off the plane).
+fn offset_rim_lies_in_plane(
+    model: &BRepModel,
+    offset_rim_edge_id: EdgeId,
+    plane_point: Point3,
+    plane_normal: Vector3,
+) -> OperationResult<bool> {
+    const SAMPLES: usize = 24;
+    let edge = model.edges.get(offset_rim_edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "offset_rim_lies_in_plane: edge {offset_rim_edge_id} not found"
+        ))
+    })?;
+    let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
+        OperationError::InvalidGeometry("offset_rim_lies_in_plane: curve not found".into())
+    })?;
+    let mut max_d = 0.0_f64;
+    let mut mean_r = 0.0_f64;
+    let mut count = 0usize;
+    for i in 0..SAMPLES {
+        let t = i as f64 / SAMPLES as f64;
+        if let Ok(p) = curve.point_at(t) {
+            let d = (p - plane_point).dot(&plane_normal).abs();
+            max_d = max_d.max(d);
+            mean_r += (p - plane_point).magnitude();
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return Ok(false);
+    }
+    mean_r /= count as f64;
+    // Relative tolerance: the rim is "in plane" only if its out-of-plane drift
+    // is a negligible fraction of its own extent. 1e-6 keeps the analytic
+    // cylinder / revolved caps (drift ~0) on the flat path while routing the
+    // NURBS barrel collar (drift ≫ that) to the ruled band.
+    Ok(max_d <= mean_r.max(1.0) * 1e-6)
+}
+
+/// Build a ruled-band collar wall between a closed cap rim and its (off-plane)
+/// offset rim. The wall surface is `RuledSurface(rim_curve, offset_rim_curve)`;
+/// outer loop = the original rim, inner loop = the offset rim. The dedicated
+/// `tessellate_ruled_annular_band` path stitches the two cached rings into a
+/// watertight collar. Both rims are shared edges, so the collar coincides with
+/// the adjacent exterior / interior laterals at every rim sample.
+fn create_ruled_band_wall(
+    model: &mut BRepModel,
+    rim_edge_id: EdgeId,
+    offset_rim_edge_id: EdgeId,
+    removed_face_outward_normal: Vector3,
+) -> OperationResult<FaceId> {
+    use crate::primitives::face::FaceOrientation;
+    use crate::primitives::r#loop::LoopType;
+    use crate::primitives::surface::RuledSurface;
+
+    use super::orientation::orient_face_for_outward;
+
+    let rim_curve = {
+        let e = model.edges.get(rim_edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_ruled_band_wall: rim edge {rim_edge_id} not found"
+            ))
+        })?;
+        let c = model.curves.get(e.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("create_ruled_band_wall: rim curve not found".into())
+        })?;
+        c.clone_box()
+    };
+    let offset_curve = {
+        let e = model.edges.get(offset_rim_edge_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_ruled_band_wall: offset edge {offset_rim_edge_id} not found"
+            ))
+        })?;
+        let c = model.curves.get(e.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("create_ruled_band_wall: offset curve not found".into())
+        })?;
+        c.clone_box()
+    };
+
+    let ruled = RuledSurface::new(rim_curve, offset_curve);
+    let surface_id = model.surfaces.add(Box::new(ruled));
+
+    // Outer loop = original rim (forward); inner loop = offset rim (backward),
+    // the standard hole winding. The tessellator reads the two closed loop
+    // edges directly, so winding only needs to satisfy the B-Rep validator.
+    let mut outer_loop = Loop::new(0, LoopType::Outer);
+    outer_loop.add_edge(rim_edge_id, true);
+    let outer_loop_id = model.loops.add(outer_loop);
+
+    let mut inner_loop = Loop::new(0, LoopType::Inner);
+    inner_loop.add_edge(offset_rim_edge_id, false);
+    let inner_loop_id = model.loops.add(inner_loop);
+
+    let surface_ref = model.surfaces.get(surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry("create_ruled_band_wall: surface vanished".into())
+    })?;
+    let orientation = orient_face_for_outward(surface_ref, removed_face_outward_normal)
         .unwrap_or(FaceOrientation::Forward);
 
-    let mut wall_face = Face::new(0, cap_surface_id, outer_loop_id, orientation);
+    let mut wall_face = Face::new(0, surface_id, outer_loop_id, orientation);
     wall_face.add_inner_loop(inner_loop_id);
-    let face_id = model.faces.add(wall_face);
-
-    Ok(face_id)
+    Ok(model.faces.add(wall_face))
 }
 
 /// Replace the curve on `offset_rim_edge_id` with a geometrically exact

@@ -4929,6 +4929,23 @@ impl Surface for GeneralNurbsSurface {
             offset_weights.push(row_weights);
         }
 
+        // Preserve u-periodicity: a surface closed in u (`S(u_min,v) ==
+        // S(u_max,v)`, e.g. a lofted barrel lateral) has its first and last
+        // control-point columns identical. The per-control-point normal push
+        // can break that exact equality — the seam normal evaluated from u_min
+        // and from u_max differs slightly when the clamped knot vector is not
+        // periodic — leaving `is_closed_u()` false. A consumer that special-
+        // cases closed-u surfaces (the watertight skin-lateral tessellator)
+        // then falls off its path and the seam leaks. Force the last column to
+        // equal the first so closure is preserved exactly; the two columns
+        // were coincident on the input, so this only removes numerical drift.
+        if self.is_closed_u() && n_u >= 2 {
+            let first = offset_control_points[0].clone();
+            let first_w = offset_weights[0].clone();
+            offset_control_points[n_u - 1] = first;
+            offset_weights[n_u - 1] = first_w;
+        }
+
         // Create new NURBS surface with offset control points
         let offset_nurbs = NurbsSurface::new(
             offset_control_points,
