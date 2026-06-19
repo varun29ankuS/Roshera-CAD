@@ -627,7 +627,68 @@ fn run_cdt(
             Ok((pts2d, triangles))
         }
         Ok(Err(e)) => Err(CurvedCdtError::CdtFailed(e)),
-        Err(_) => Err(CurvedCdtError::CdtPanicked),
+        Err(_) => {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                // Which points lie ON an outer fixed edge (the cdt "failed to
+                // create fixed edge" trigger)? Check every assembled point
+                // against every outer segment, excluding that segment's own
+                // endpoints.
+                let no = outer_uv.len();
+                let mut on_edge = 0usize;
+                let mut example = String::new();
+                for k in 0..no {
+                    let a = outer_uv[k];
+                    let b = outer_uv[(k + 1) % no];
+                    for (pi, &p) in pts2d.iter().enumerate() {
+                        let is_a = (p.0 - a.0).abs() < 1e-12 && (p.1 - a.1).abs() < 1e-12;
+                        let is_b = (p.0 - b.0).abs() < 1e-12 && (p.1 - b.1).abs() < 1e-12;
+                        if is_a || is_b {
+                            continue;
+                        }
+                        let d = point_segment_distance_uv(p, a, b);
+                        if d < 1e-7 {
+                            on_edge += 1;
+                            if example.is_empty() {
+                                let src = if pi < no { "outer" } else { "steiner/inner" };
+                                example = format!(
+                                    "{src} pt[{pi}]=({:.4},{:.4}) ON outer seg[{k}] d={d:.2e}",
+                                    p.0, p.1
+                                );
+                            }
+                        }
+                    }
+                }
+                // Coincident points: cdt dedups them, which can collapse a
+                // contour edge to a degenerate "fixed edge" -> the panic.
+                let mut dup_pairs = 0usize;
+                let mut min_d = f64::INFINITY;
+                for i in 0..pts2d.len() {
+                    for j in (i + 1)..pts2d.len() {
+                        let dx = pts2d[i].0 - pts2d[j].0;
+                        let dy = pts2d[i].1 - pts2d[j].1;
+                        let d = (dx * dx + dy * dy).sqrt();
+                        if d < min_d {
+                            min_d = d;
+                        }
+                        if d < 1e-9 {
+                            dup_pairs += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "[tess] run_cdt PANICKED: pts={} outer={} steiner={} | on_outer_edge={} \
+                     dup_pairs={} min_pair_dist={:.3e} {}",
+                    pts2d.len(),
+                    no,
+                    steiner.len(),
+                    on_edge,
+                    dup_pairs,
+                    min_d,
+                    example
+                );
+            }
+            Err(CurvedCdtError::CdtPanicked)
+        }
     }
 }
 
@@ -1230,7 +1291,23 @@ pub(crate) fn tessellate_curved_cdt(
     );
 
     // Step 3 — first CDT run.
-    let (pts2d, triangles) = run_cdt(&outer.points_uv, &inner_polygons, &steiner)?;
+    let (pts2d, triangles) = match run_cdt(&outer.points_uv, &inner_polygons, &steiner) {
+        Ok(v) => v,
+        Err(e) => {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[curved-cdt] face {} kind={} FAILED {:?}: outer={}pts holes={} steiner={}",
+                    face.id,
+                    surface.type_name(),
+                    e,
+                    outer.points_uv.len(),
+                    inner_polygons.len(),
+                    steiner.len()
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // Step 4 — Ruppert-style iterative refinement. Each pass collects
     // chord/normal violations (α's criterion), skinny-triangle

@@ -157,6 +157,175 @@ message to stderr per face — cosmetic log noise, optionally suppressible via a
 scoped panic hook. Original report below.
 
 ### (orig) BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
+## DRAWING: ISOMETRIC pictorial was an all-dashed "ghost" on curved parts 🟡 MITIGATED (2026-06-18)
+The ISOMETRIC view (a non-dimensioned pictorial) rendered every edge DASHED on
+cylinder/curved parts — a faint "ghost". ROOT (drawing/visibility.rs
+`project_solid_edges_visibility`): a circular rim draws as a clean analytic circle
+only when `faces_camera` = |rim_normal · view_dir| > 0.99 (line ~300). An ORTHO
+view aligned with the axis satisfies this (Top: Z·w(0,0,-1)=1); the OBLIQUE iso
+(w=(1,1,-1)/√3) gives a Z-rim |normal·w|=1/√3≈0.58 < 0.99 → NOT faces_camera → the
+rim falls to per-SEGMENT `occluded()`. A cylinder rim in iso is mostly
+near-SILHOUETTE (tangent to view), where the occlusion raycast grazes the surface
+and reports "hidden" → the whole rim went dashed. (The occlusion logic itself is
+sound: `back=2·diag+10` origin is well outside, w sign correct.)
+FIX SHIPPED (dimensioning.rs `build_hlr_view`): for `ProjectionType::Isometric`,
+draw the pictorial as a clean SOLID WIREFRAME — merge visible+hidden into
+`polylines`/`circles`, leave hidden empty. (Note: "omit hidden, keep visible"
+would have left an EMPTY iso, since the broken classification marks ~everything
+hidden — all-solid is the correct simple fix and matches the convention that an
+isometric reference omits hidden lines.) Verified on the shaft/flange/housing
+demo: iso now reads as a clean 3D pictorial, no dashed cloud.
+REMAINING (true HLR): a proper iso would show only camera-facing edges solid +
+hidden removed; that needs silhouette-robust occlusion for oblique views (skip the
+occluded() test for near-silhouette segments, or offset the sample toward the
+visible side). Lower priority — the wireframe pictorial is clean and conventional.
+
+---
+
+## DRAWING: SECTION view 🟡 works on planar solids; curved/boolean solids cut empty (2026-06-18)
+NEW: `drawing::section_view` (drawing/section_view.rs) generates a real SECTION
+view — cut the solid on a plane via `section_solid_by_plane`, project the cap
+triangles into the plane frame, trace the boundary outline + scan-fill 45° ISO-128
+HATCHING (triangle-clipped so bores/voids stay un-hatched), returns a
+`ProjectedView`. Verified: a box section renders a clean hatched "SECTION A-A"
+profile (render_drawing_demo → _drawing_section.pdf). GAP: the underlying
+`section_solid_by_plane` returns ZERO caps for a curved/boolean solid (a bored
+flanged housing cut through its axis → caps=0) while a box → caps=1. So sections
+only work on planar solids today. NEXT: (a) fix `section_solid_by_plane` to handle
+cylinder/cone laterals + boolean solids (the cut should produce the stepped
+profile + the bore slot); (b) integrate the section as an auto view in
+standard_drawing (cut-plane indicator + "SECTION A-A" label on the parent view);
+(c) expose plane + section in the make_drawing MCP tool / REST. The section_view +
+hatch code is sound — the blocker is the section OP on curved solids.
+
+## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🟡 SERVER-KILLER FIXED; mesh still drops the hole (2026-06-18)
+UPDATE (slice #1, commit 66a3588): the SERVER-KILLER half is FIXED. The
+tessellation already wrapped `cdt::triangulate_contours` in `catch_unwind`, but
+`profile.release` was `panic = "abort"`, which silently defeated it — so the
+first unmeshable face aborted the whole api-server. Set `panic = "unwind"`; now
+the cdt panic is caught and the grid fallback runs, so the bored flange is
+NON-CRASHING **and** watertight/sound. Gate
+`bore_into_revolved_flange_isolates_cdt_panic` (agent_build_eval) green.
+REMAINING (🔴 slice-2 finding): the bore is "watertight but WRONG" — the bolt
+hole is NOT reflected in the MESH. Bored mesh volume ≈ 508_179 == the un-bored
+chamber's mesh volume, i.e. the Ø8 through-hole removed ZERO material. The
+boolean-scar CURVED faces around the bore cdt-panic (caught), then the grid
+fallback over-covers the region as if solid → the hole is filled, not cut. The
+4 panics are on CURVED faces (no planar `[tess] cdt` trace fired), so the next
+dig is WHICH face drops the hole and why the fallback plugs it. Pinned repro
+(FAILS today, #[ignore]'d): `bore_into_revolved_flange_mesh_reflects_hole` —
+bored mesh vol must drop ~1.1k vs the chamber. LESSON (again): watertight ≠
+correct — only the VOLUME/effect check caught the dropped hole.
+
+SLICE-3 LOCALIZATION (2026-06-18, ROSHERA_TESS_TRACE instrumentation added to
+`curved_cdt::run_cdt` + the cylinder/cone/revolution fallbacks): the 4 panics
+are caught in `curved_cdt::run_cdt` with `pts≈295 contours=1 (outer + 0 INNER)
+steiner≈253` — i.e. on a curved face with a SINGLE outer boundary and NO holes,
+heavily refined (~253 Steiner points). "Failed to create fixed edge" = a STEINER
+point lands on the OUTER boundary fixed edge. The Steiner candidate filter
+(curved_cdt.rs ~543-575) rejects points near INNER edges (`near_inner_edge`) but
+NOT near the OUTER boundary — so a near-outer Steiner triggers the cdt panic.
+These are the bore-modified CONE nozzle-band faces (NOT the bolt faces; the bolt
+hole is on PLANAR flange faces which meshed without panic). BORE-INDUCED: a clean
+revolve / bell nozzle has 0 such panics. Numbers: chamber MESH vol 507_755,
+bored MESH vol 508_179 (the bore ADDED +424 instead of removing ~1.1k → off by
+~+1.5k). NOTE: the cylinder/cone/SoR UNTRIMMED-grid fallbacks did NOT fire for
+these — so `tessellate_curved_cdt` swallows `CdtPanicked` internally (retry/
+partial) and emits the wrong-covering tris; tracing THAT is the next dig. FIX
+candidates: (1) add a `near_outer_edge` Steiner reject symmetric to
+`near_inner_edge` so cdt never gets a boundary-coincident Steiner; (2) make the
+post-panic path trim-aware instead of over-covering. Repro unchanged.
+
+SLICE-4 (2026-06-18): fix-candidate (1) FAILED — a `near_outer_edge` Steiner
+reject changed NOTHING (panic count 4 → 4, steiner 253 → 253: it rejected ZERO
+candidates), so the panic is NOT a near-boundary Steiner. REVERTED it. Extended
+the run_cdt panic trace with two probes: `on_outer_edge=0` (no point lies ON an
+outer segment → not collinearity) and **`dup_pairs=41 min_pair_dist=4.4e-16`
+with outer=42**. So ~41 of the 42 OUTER contour points are FLOATING-POINT-EXACT
+COINCIDENT in UV: the face's UV projection COLLAPSES nearly the whole outer
+boundary to one location. cdt dedups the coincident points, the outer contour's
+fixed edges collapse to degenerate edges, and it `assert!`s "failed to create
+fixed edge". ROOT CAUSE = a DEGENERATE UV PROJECTION on these boolean-scar cone
+bands (near-zero-area slivers, or a bad projection axis), NOT Steiner placement
+and NOT a holed face (0 inner). IMPORTANT PIVOT: these 4 panicking faces are
+CONE nozzle bands, NOT the bolt faces — the bolt hole lives on PLANAR flange
+faces that meshed without panic. So the cone panic is likely SEPARATE from the
+hole-missing. NEXT: (a) trace the bolt PLANAR flange faces — do they carry the
+bolt inner loop after the boolean, and does triangulate_planar_polygon mesh the
+hole? That is the real volume bug; (b) separately, the cone-band UV-projection
+degeneracy is its own curved-CDT robustness bug (dedup the contour / pick a
+non-degenerate projection / skip true slivers). Diagnostic kept (env-gated
+ROSHERA_TESS_TRACE). Repro unchanged.
+
+SLICE-5 (2026-06-18): CORRECTS slice-4's "separate" guess — the two issues are
+CONNECTED. B-Rep face dump (FLANGE-DIAG, env-gated in agent_build_eval) PROVES
+the bolt hole IS correctly imprinted: flange-top Plane face (z=200) has inner
+loops r=35 (central) + **r=4 @ (50,0) = bolt**; flange-bottom Plane (z=178) has
+r=43 + **r=4 @ (50,0)**. Both planar faces mesh WITHOUT panic, so the hole is
+present in the mesh. Therefore the volume error is NOT a missing hole — it is the
+4 CONE-band panics' fallback adding spurious volume that MASKS the correct bore:
+chamber 507_755 − 1_105 (bore) + ~1_529 (cone-panic over-cover) = 508_179 (the
+observed bored mesh vol). So fixing `bore_into_revolved_flange_mesh_reflects_hole`
+REQUIRES fixing the cone-band degenerate-UV-projection panic (slice-4 root
+cause) — it is the real blocker, not a side issue. NEXT: fix the cone-band UV
+degeneracy so those faces mesh correctly (no fallback over-cover); then the bore
+volume will drop ~1.1k and the repro passes. Approaches: detect the collapsed-UV
+contour in curved_cdt and (a) dedup+rebuild the contour, (b) re-project on a
+better axis (face normal-aligned basis), or (c) if it is a true zero-area sliver,
+emit nothing rather than an untrimmed over-cover.
+
+SLICE-6 (2026-06-18): measured the volume error at BOTH densities (VOL-DIAG, now
+reverted): default chamber=507_755 bored=508_179 (delta +424); FINE chamber=
+508_006 (== analytic, so the CHAMBER meshes perfectly) bored=497_376 (delta
+**-10_629**, want -1_105). So the boolean-scar CONE faces mis-tessellate at
+EVERY density — default OVER-COVERS (+~1.5k net) and fine DROPS whole faces
+(-~9.5k). The mechanism (refine_to_convergence ~curved_cdt.rs:1238): the initial
+run_cdt yields a COARSE triangulation, a refinement re-run then panics on the
+degenerate-UV contour and FREEZES on that coarse mesh (default), while fine
+params push the initial call itself to fail -> face dropped. The CHAMBER's cone
+bands mesh fine (508_006 exact) — only the BORE-MODIFIED bands break, so the
+boolean is MODIFYING the cone faces' boundary loops (corefinement adds vertices)
+in a way that makes their UV projection collapse. REFRAME: the SOLID is correct
+(sound B-Rep, hole imprinted, validate_solid_scoped passes) — only the DISPLAY
+MESH of boolean-scar cone bands is broken, so EXPORT/mass-props off the B-Rep are
+fine; the live-viewport/STL mesh is wrong. This is a DEEP curved-CDT robustness
+bug needing a dedicated fix (not a one-loop-slice patch) + a full curved-suite
+regression. The mesh-volume repro is UNSTABLE as written (density-dependent);
+the real fix target is the curved-CDT projection/refinement for boolean-modified
+cone bands. Server-killer (slice#1) remains the shipped win.
+
+SLICE-7 (2026-06-18): attempted the bounded fix — a collapsed-projection guard
+in `curved_cdt::validate_loop` (reject a loop whose projected points are >50%
+coincident -> DegenerateLoop -> analytic-grid fallback). It was a NO-OP: panics
+stayed 4->4, volume unchanged. So the panicking CONE faces DO NOT go through
+`run_boundary_projection`/`validate_loop` at all — `tessellate_conical_face`
+(surface.rs ~2967) has its OWN projection + run_cdt path that bypasses the
+generic curved_cdt Step-0 validation. REVERTED the guard. CONCLUSION: the
+boolean-scar-cone mesh fix is a DEDICATED effort (trace + fix the cone-specific
+tessellation dispatch, then add the collapse guard at THAT path's projection),
+not a self-paced loop slice. It is a DISPLAY-mesh bug (solid is sound), so it is
+lower priority than shipped correctness. PIVOTING the loop to the revolve pole
+apex-fan (eval_revolved_dome, #[ignore]'d) — a more self-contained curved item.
+The 6 #24 commits (server-killer fix + full diagnosis) stay on main.
+
+SLICE-8 (2026-06-18): re-audited; re-confirmed slice-6/7 (the scar CONE bands'
+degenerate-UV is the root; `tessellate_conical_face`'s OWN run_cdt path is where
+the fix must go, NOT the generic curved_cdt guards — verified again: a face-level
+trace I added at curved_cdt.rs:1294 NEVER fires for these panics, so they bypass
+the generic Step-0). NEW, SHIPPED: PROVED the bored flange mesh is WATERTIGHT
+(manifold 0/0) at chord 0.5, 0.1 AND 0.02 — the panic-freeze degrades to a
+coarse-but-CLOSED 2-manifold, never a leak. Locked that as a strengthened
+assertion on the (passing) `bore_into_revolved_flange_isolates_cdt_panic` gate.
+So the ONLY remaining defect is the scar bands' AREA/volume (mis-areaed, density-
+dependent), not topology. The volume fix stays a DEDICATED effort on
+`tessellate_conical_face`'s projection (dedup collapsed contour / re-project on a
+face-normal basis / emit-nothing for a true sliver) + full curved-suite
+regression — out of scope for a self-paced slice. `*_mesh_reflects_hole` stays
+#[ignore]'d. Env-gated [curved-cdt] trace kept (useful for generic-path failures).
+
+(Original report below — the abort/crash mechanism, now fixed.)
+
+## BORE-INTO-REVOLVED-FLANGE CDT PANIC 🔴🔴 SERVER-KILLER (2026-06-17)
 Differencing a small axial cylinder (bolt hole) out of a REVOLVED solid's
 annular flange PANICS the kernel and — because the release profile is
 `panic="abort"` — takes the whole api-server process down:
@@ -613,6 +782,46 @@ guard: `box_boss_coincident_base_union_valid_32`. Verified no regression across
 118 boolean lib + poke + volume + adversarial + determinism + oracle +
 HARNESS-1000.
 
+### ROSTER (gen_flanged_housing) 🟡 coincident-union result is SOUND but its MESH leaks (2026-06-18)
+Surfaced by the generative harness. A flanged housing built as flange (Ø100×15,
+z[0,15]) + body (Ø50, base EXACTLY z=15 on the flange top) — i.e. a coincident
+mating face — unions to a SOUND B-Rep (#32's Same-Domain cull holds: CHANNEL=sound
+PASSES) but the TESSELLATION leaks badly: CHANNEL=watertight open=1884 nm=0 + a
+cdt panic at triangulate.rs:965 ('failed to create fixed edge'). So #32 fixed the
+coincident-union B-REP validity but the resulting scar/annular faces still don't
+MESH watertight — a tessellation gap #32's verification (B-rep/volume only, never
+mesh) never measured. Same cdt:965 annular-cap family as the bored-flange cone-mesh
+bug. WORKAROUND (and the correct model): INTERPENETRATE — body base z=5 INSIDE the
+flange (z[5,15] overlap doesn't double-count, so volume is identical) → open=0, all
+6 channels green. gen_flanged_housing is a permanent gate built this way. The
+coincident-MESH leak stays open (deep tessellation family; the interpenetrating
+build is how a real casting is modeled anyway). NOTE: the interpenetrating build
+ALSO trips a cdt:965 panic on one annular cap, but it is CAUGHT and the cap
+RECOVERED via the planar fallback (watertight + no-dropped-faces both pass) — unlike
+the cone case where recovery fails. The latent annular-cap cdt:965 fragility is the
+through-line of both.
+
+### ROSTER (gen_pipe_tee) 🔴 boring a curved cyl∩cyl union FAILS (Difference Err + cdt:1015) (2026-06-18)
+Surfaced by the generative harness; pinned #[ignore]'d (gen_pipe_tee). A hollow
+pipe tee = a run cylinder (Ø40, X-axis) UNIONED with a perpendicular branch
+cylinder (Ø40, Z-axis), then bored Ø28 through each. The curved∩curved UNION
+(Steinmetz saddle) BUILDS fine, but the very next step — boring the tee with a
+Difference — FAILS: `boolean_operation(.., Difference)` returns Err (the test's
+`.expect("difference")` panics). During that boolean, GWN classification
+tessellates the saddle-faced tee operand and hits a cdt panic at
+triangulate.rs:1015 TWICE — a THIRD distinct cdt assert beyond the annular-cap
+:965 and the dome :927 — and the whole op runs 362s (GWN over-tessellation of the
+curved operand, the bool86 family). So the bug has two coupled faces: (a)
+correctness — Difference on a saddle-union solid errors out; (b) the saddle/scar
+faces don't tessellate (cdt:1015) which is likely what makes the boolean's GWN
+step fail. DEEP curved-union+bore robustness (bool7 cyl∩cyl + bool86 GWN-tess +
+the cdt-panic family converging). NEXT when picked up: capture the exact
+OperationError variant from the Difference; determine whether GWN classification
+is the failure path (try BooleanOptions with GWN off as a probe) vs the SSI arms;
+and find which saddle face hits cdt:1015 (face_map attribution + curved-CDT entry
+trace). The simpler cyl∩cyl cases (bool7) are the prerequisite. Repro:
+`gen_pipe_tee` (un-ignore to run; ~6 min).
+
 ### #27 🟢 Coaxial stacked-step union left buried cap
 Fixed via annular face-with-hole interior-point. See boolean campaign.
 
@@ -636,6 +845,36 @@ difference. Result open=0/valid=true. Gates: `cyl_union_cone_stacked_rocket_27`,
 cone/cyl/sphere suites + poke 14/15. LESSON: a closed-curve (seam) edge's
 `param_range.start` MUST sit at its `start_vertex` (= `curve.evaluate(0)`).
 See memory `cone-rim-seam-alignment.md`.
+
+### #89 🟢 FIXED — fillet a CONE-WALLED rim (Plane–Cone closed edge) (2026-06-18)
+Closed-edge fillet previously returned `NotImplemented` for a Plane–Cone rim (a
+frustum / cone cap rim) — only Plane–Cylinder rims were supported. Now
+`cone_rim_fillet` (fillet.rs) handles it: the rolling-ball blend on a plane/cone
+rim is still a Torus by rotational symmetry, so it solves the ball centre + the two
+surface contacts at ONE rim point (analytic, from the outward face normals) and
+revolves them — Torus carrier (major = ball-centre radius, minor = r), two trim
+circles, a meridian seam arc (sweep 90°±half-angle) — then the same seamed-loop
+surgery `cylinder_rim_fillet` uses, re-trimming the Cone (clone + new
+`height_limits`). Produces a SOUND, mesh-WATERTIGHT solid (verified on a solid
+frustum AND a hollow cone-tube). THREE sub-bugs had to fall: (1) the cone normal
+must be taken ANALYTICALLY in the rim meridian — `get_face_oriented_normal`
+projects to find (u,v) and `create_cone_3d`'s `ref_dir` is offset from the rim
+seam, so the projected normal tilts off-meridian and throws the ball centre
+off-axis; (2) the lateral trim circle is swept −u so the cone's curved-CDT outer
+loop unwraps to a clean rectangle (a +u circle doubles the UV contour →
+CrossingFixedEdge → non-welding grid fallback); (3) FUNDAMENTAL — `Torus::
+closest_point` blindly clamped v to [0,2π), which is wrong for a trimmed torus
+patch that straddles the outer-equator seam v=0 (every cone-rim blend does, by the
+half-angle): it now keeps the raw signed v when `param_limits` v-min < 0, so the
+torus↔cone weld lands on the right meridian. Gates: `gen_filleted_cone_rim`
+(agent_build_eval), `cone_walled_rim_fillet_succeeds` (closed_edge_bore_rim_blends).
+NO REGRESSION across fillet/chamfer/closed-edge/dihedral/revolve suites. LESSON:
+a periodic surface's `closest_point` must respect the patch's param domain, not a
+blind [0,2π) normalize. STILL OPEN under #89: the closed-edge CHAMFER on a
+Plane–Cone rim (`create_closed_edge_chamfer`, chamfer.rs ~913, still
+Plane–Cylinder only → `NotImplemented`; pinned by
+`chamfer_cone_rim_is_89_notimplemented` — mirror `cone_rim_fillet` with a cone
+bevel to close it), plus CONE/TORUS/general-revolve fillet rims beyond plane-cone.
 
 ### #27/#32 frustum throat 🟢 FIXED — coincident closed-circle rims not welded (commit 7af8e4e)
 Sibling of the cone "rocket": surfaced building a de Laval rocket nozzle via the
@@ -688,6 +927,57 @@ to match the already-padded intersection search. Section now rotation-invariant
 for axial planes. Gate `axial_cylinder_section_through_seam_85c`. KNOWN remaining:
 oblique vertical planes (nz=0, off-seam) still 0 caps — separate pre-existing
 marching-grid limitation.
+
+### REVOLVE axis-touch 🟡 PART 1 (guard) FIXED 2026-06-18; PART 2 (apex mesh) open
+**SLICE-8 (2026-06-18): GUARD relaxation SHIPPED.** `face_intersects_axis`
+(revolve.rs ~1547) no longer rejects an axis TOUCH: dropped the vertex-on-axis
+(~1586) and edge-sample-r<tol (~1604) touch-rejects, and guarded the sign-flip
+CROSSING test on BOTH samples strictly off-axis (prev_r.mag>tol && r.mag>tol &&
+dot<0). The planar interior-pierce test is unchanged. So a pole profile (quarter-
+disk dome, hemisphere) or an on-axis rectangle (-> solid cylinder) is now
+ACCEPTED and builds a SOUND solid; a genuine axis crossing is still rejected.
+Updated 2 unit tests (on_axis_rectangle now does_NOT_intersect; revolve_face
+ACCEPTS the on-axis cylinder profile). NO REGRESSION: revolve_watertight 7/7,
+revolve_validity_invariants 4/4, revolve_volume_invariants 14/14,
+primitive_tess_watertight 1/1 (sphere poles fine), lib revolve 26/0,
+agent_build_eval 12/2. PART 2 apex-fan LANDED (2026-06-18): tessellate_revolution_wedge
+now has a 3-EDGE branch — the dome has 128 three-edge wedges (64 apex ["2","41","2"]
++ 64 base ["2","2","5"]) and the branch meshes them all via the analytic (u,v)
+param triangulation (verified 64×40 + 64×4 tris, reusing exact cache samples ->
+seam-watertight). NO REGRESSION: revolve_watertight 7/7, primitive_tess (sphere
+poles) 1/1, agent_build_eval 15/2.
+PART 2b — ✅ FIXED 2026-06-18 (commit pending): the dome is now SOUND + mesh-
+WATERTIGHT (manifold 0/0) and passes the full 6-channel verify_comprehensive +
+envelope; eval_revolved_dome UN-IGNORED and is a permanent roster gate. NO
+REGRESSION: revolve_watertight 7/7, revolve_validity 4/4, revolve_volume 14/14,
+primitive_tess_watertight 1/1, agent_build_eval 16/0 (+1 ignored = cone-mesh),
+lib revolve 32/0. THE FIX (upstream in the revolve OP, revolve.rs ~337): skip wall
+faces for a profile edge whose BOTH endpoints are poles (`if apex[&sp] &&
+apex[&ep] { continue; }`) — such an edge runs along the axis and bounds no surface;
+the dome bands + base disc converge to the shared pole vertices and seal without it.
+DIAGNOSIS that led here (env trace `ROSHERA_WEDGE_TRACE=1`, [revfall] in surface.rs):
+the 147 open + 20 nm + 1 cdt panic came from **64 TWO-EDGE SurfaceOfRevolution faces** (NOT the apex
+3-edge wedges — those mesh fine; NOT the 4-edge bands). Env-gated trace
+(`ROSHERA_WEDGE_TRACE=1`, [revfall] in surface.rs SurfaceOfRevolution arm) shows
+exactly 64 faces fall through tessellate_revolution_wedge with `edges=2
+planar=false inner=0`; 54 of them then hit curved_cdt Err (FALLBACK revolution ->
+emits NOTHING) and 1 hits the cdt panic at triangulate.rs:927 'edge_ba.buddy'.
+A 2-edge loop is a degenerate BIGON: these are the dome profile's CLOSING AXIS EDGE
+`(0,R)->(0,0)` (lies ON the revolve axis, r=0) swept by each of the 64 angular
+segments into a ZERO-AREA "fin" on the axis. curved-CDT can't triangulate a
+zero-area face -> emits nothing -> the fins' axis edges are covered by 0 triangles
+-> 147 open. The SOLID is sound (B-rep valid); only the mesh leaks at the axis.
+ROOT CAUSE IS UPSTREAM IN THE REVOLVE OP, NOT TESSELLATION: revolve should NOT
+generate faces (nor the spurious axis edges) for a profile edge that lies along the
+axis — it sweeps nothing. NEXT slice = fix the REVOLVE OPERATION to detect an
+axis-coincident profile edge and skip face/edge generation for it (the closing axis
+segment of a pole profile), then the dome surface + base disc seal on their own.
+eval_revolved_dome stays #[ignore]'d until then. (Tessellation band-aid — a 2-edge
+"emit nothing + return true" branch — would silence the panic but NOT close the 147
+open, since the open edges ARE the fins' axis edges that need 2 covering tris each
+and a zero-area fin can never provide them; the fins must not exist.)
+
+(orig two-part spec below.)
 
 ### REVOLVE axis-touch 🔴 profiles with a pole (r=0) reject — TWO-PART FIX SPEC (2026-06-17)
 **Investigated + scoped (experiment reverted to avoid shipping leaky domes):** the

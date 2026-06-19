@@ -14,9 +14,9 @@
 //! right kind (Torus / Cone), and leaves the solid B-Rep-valid AND mesh-
 //! watertight. Outer-rim coverage stays in `fillet_closed_edge.rs`.
 //!
-//! Cone-walled rims (Cone±Plane) remain `NotImplemented` (task #89); the
-//! `cone_*` tests below pin that they fail cleanly rather than silently
-//! producing garbage.
+//! Cone-walled rims (Plane–Cone) are now supported too (task #89,
+//! `cone_rim_fillet`): `cone_walled_rim_fillet_succeeds` pins that filleting a
+//! frustum-tube's outer-top rim yields a sound, watertight torus blend.
 
 use std::f64::consts::TAU;
 
@@ -202,10 +202,11 @@ fn bore_rim_fillet_radius_too_large_rejected_cleanly() {
 }
 
 #[test]
-fn cone_walled_rim_fillet_is_not_implemented_cleanly() {
-    // A cone-frustum tube: the outer-top rim is Cone+Plane, which the
-    // closed-edge fillet does not yet support. It must fail with a clear
-    // NotImplemented (task #89), never a corrupt solid.
+fn cone_walled_rim_fillet_succeeds() {
+    // A cone-frustum tube: the outer-top rim is Plane+Cone. Closed-edge fillet
+    // now supports this (#89 — `cone_rim_fillet`, an analytic torus carrier), so
+    // it must produce a SOUND, watertight solid with the torus blend — never a
+    // corrupt solid and never NotImplemented.
     let cone: &[(f64, f64)] = &[(10.0, 0.0), (6.0, 20.0), (4.0, 20.0), (8.0, 0.0)];
     let mut m = BRepModel::new();
     let s = revolve_tube(&mut m, cone);
@@ -216,8 +217,12 @@ fn cone_walled_rim_fillet_is_not_implemented_cleanly() {
         propagation: PropagationMode::None,
         ..Default::default()
     };
-    match fillet_edges(&mut m, s, vec![rim], opts) {
-        Err(OperationError::NotImplemented(_)) => {}
-        other => panic!("cone-walled rim fillet should be NotImplemented, got {other:?}"),
-    }
+    let blend = fillet_edges(&mut m, s, vec![rim], opts).expect("cone-walled rim fillet (#89)");
+    assert_eq!(
+        blend.len(),
+        1,
+        "expected one torus blend face, got {}",
+        blend.len()
+    );
+    assert_valid_watertight(&mut m, s, "cone-walled outer-top rim fillet");
 }

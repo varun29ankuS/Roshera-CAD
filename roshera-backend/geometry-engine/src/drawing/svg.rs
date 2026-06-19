@@ -356,24 +356,40 @@ fn view_sheet_bbox(view: &ProjectedView, sheet_h: f64) -> Option<[f64; 4]> {
 }
 
 /// Draw all of a view's dimension callouts in sheet space: horizontal
-/// extents below the part, vertical extents to its left, each with
-/// extension lines, inward arrowheads, and the value in a constant-size
-/// label. Stacks parallel callouts so they never overlap.
+/// extents stacked below the part, vertical extents stacked to its left,
+/// each with extension lines, inward arrowheads, and a constant-size value
+/// label.
+///
+/// Placement follows ISO 129 drafting practice: parallel callouts are
+/// ordered by SPAN with the SMALLEST nearest the part and the largest
+/// outermost, so the extension lines never cross and the widest dimension
+/// line never runs back across the geometry it brackets. The previous code
+/// placed callouts in arbitrary `view.dimensions` order, so on a real part
+/// the overall (widest) dimension often landed closest to the part — its
+/// line cutting through the view while narrower callouts stacked outside it.
 fn render_dimensions(out: &mut String, view: &ProjectedView, sheet_h: f64) {
     let Some(bbox) = view_sheet_bbox(view, sheet_h) else {
         return;
     };
     // All constants are sheet millimetres (the SVG user unit).
-    const STANDOFF: f64 = 11.0;
-    const STACK: f64 = 8.0;
-    const GAP: f64 = 1.5;
-    const EXT: f64 = 1.5;
+    const STANDOFF: f64 = 11.0; // first dimension line, clear of the silhouette
+    const STACK: f64 = 8.0; // gap between successive parallel dimension lines
+    const GAP: f64 = 1.5; // extension-line gap from the part
+    const EXT: f64 = 1.5; // extension-line overshoot past the dimension line
     const AR_L: f64 = 2.6;
     const AR_W: f64 = 0.85;
     const TGAP: f64 = 1.4;
 
-    let mut below = 0.0_f64;
-    let mut left = 0.0_f64;
+    // A linear callout reduced to its on-sheet bracket: [lo, hi] along the
+    // measured axis + the span used to order the stack.
+    struct Lin {
+        lo: f64,
+        hi: f64,
+        span: f64,
+        label: String,
+    }
+    let mut horiz: Vec<Lin> = Vec::new();
+    let mut vert: Vec<Lin> = Vec::new();
 
     for d in &view.dimensions {
         let a = dim_to_sheet(view, sheet_h, d.a);
@@ -381,8 +397,8 @@ fn render_dimensions(out: &mut String, view: &ProjectedView, sheet_h: f64) {
         let dx = (a[0] - b[0]).abs();
         let dy = (a[1] - b[1]).abs();
 
-        // Angle / point callouts have no linear span — leader-free label
-        // just outside the nearest corner.
+        // Angle / point callouts have no linear span — leader-free label just
+        // outside the nearest corner.
         if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
             let _ = write!(
                 out,
@@ -395,30 +411,54 @@ fn render_dimensions(out: &mut String, view: &ProjectedView, sheet_h: f64) {
         }
 
         if dx >= dy {
-            // Horizontal extent → dimension line below the part.
-            let xa = a[0].min(b[0]);
-            let xb = a[0].max(b[0]);
-            let level = bbox[3] + STANDOFF + below;
-            below += STACK;
-            dim_line(out, xa, bbox[3] + GAP, xa, level + EXT);
-            dim_line(out, xb, bbox[3] + GAP, xb, level + EXT);
-            dim_line(out, xa, level, xb, level);
-            arrow_h(out, xa, level, 1.0, AR_L, AR_W);
-            arrow_h(out, xb, level, -1.0, AR_L, AR_W);
-            dim_text(out, 0.5 * (xa + xb), level - TGAP, &d.label, 0.0);
+            horiz.push(Lin {
+                lo: a[0].min(b[0]),
+                hi: a[0].max(b[0]),
+                span: dx,
+                label: d.label.clone(),
+            });
         } else {
-            // Vertical extent → dimension line to the left of the part.
-            let ya = a[1].min(b[1]);
-            let yb = a[1].max(b[1]);
-            let level = bbox[0] - STANDOFF - left;
-            left += STACK;
-            dim_line(out, bbox[0] - GAP, ya, level - EXT, ya);
-            dim_line(out, bbox[0] - GAP, yb, level - EXT, yb);
-            dim_line(out, level, ya, level, yb);
-            arrow_v(out, level, ya, 1.0, AR_L, AR_W);
-            arrow_v(out, level, yb, -1.0, AR_L, AR_W);
-            dim_text(out, level - TGAP, 0.5 * (ya + yb), &d.label, -90.0);
+            vert.push(Lin {
+                lo: a[1].min(b[1]),
+                hi: a[1].max(b[1]),
+                span: dy,
+                label: d.label.clone(),
+            });
         }
+    }
+
+    // Smallest span nearest the part (ascending), so extension lines never
+    // cross and the overall dimension sits outermost.
+    let by_span = |x: &Lin, y: &Lin| {
+        x.span
+            .partial_cmp(&y.span)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    horiz.sort_by(by_span);
+    vert.sort_by(by_span);
+
+    // Horizontal extents → stacked below the part.
+    let mut level = bbox[3] + STANDOFF;
+    for d in &horiz {
+        dim_line(out, d.lo, bbox[3] + GAP, d.lo, level + EXT);
+        dim_line(out, d.hi, bbox[3] + GAP, d.hi, level + EXT);
+        dim_line(out, d.lo, level, d.hi, level);
+        arrow_h(out, d.lo, level, 1.0, AR_L, AR_W);
+        arrow_h(out, d.hi, level, -1.0, AR_L, AR_W);
+        dim_text(out, 0.5 * (d.lo + d.hi), level - TGAP, &d.label, 0.0);
+        level += STACK;
+    }
+
+    // Vertical extents → stacked to the left of the part.
+    let mut level = bbox[0] - STANDOFF;
+    for d in &vert {
+        dim_line(out, bbox[0] - GAP, d.lo, level - EXT, d.lo);
+        dim_line(out, bbox[0] - GAP, d.hi, level - EXT, d.hi);
+        dim_line(out, level, d.lo, level, d.hi);
+        arrow_v(out, level, d.lo, 1.0, AR_L, AR_W);
+        arrow_v(out, level, d.hi, -1.0, AR_L, AR_W);
+        dim_text(out, level - TGAP, 0.5 * (d.lo + d.hi), &d.label, -90.0);
+        level -= STACK;
     }
 }
 
