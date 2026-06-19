@@ -347,6 +347,95 @@ fn point_to_axis_distance(p: Point3, axis_origin: Point3, axis_dir: Vector3) -> 
     p.distance(&proj)
 }
 
+/// Format a kernel-native (mm) magnitude to a fixed 2-decimal display number —
+/// the engineering-drawing convention the labeller readouts use.
+fn fmt_measure(value: f64) -> String {
+    format!("{value:.2}")
+}
+
+/// Build a DIAMETER measurement: the Ø glyph + the value (no space) + the unit.
+fn measurement_diameter(value: f64, unit: crate::units::LengthUnit) -> crate::labels::Measurement {
+    crate::labels::Measurement {
+        value,
+        unit: unit.label().to_string(),
+        kind: crate::labels::MeasurementKind::Diameter,
+        display: format!("\u{00d8}{} {}", fmt_measure(value), unit.label()),
+    }
+}
+
+/// Build a RADIUS measurement: an `R` prefix + the value + the unit.
+fn measurement_radius(value: f64, unit: crate::units::LengthUnit) -> crate::labels::Measurement {
+    crate::labels::Measurement {
+        value,
+        unit: unit.label().to_string(),
+        kind: crate::labels::MeasurementKind::Radius,
+        display: format!("R{} {}", fmt_measure(value), unit.label()),
+    }
+}
+
+/// Build a LENGTH measurement: the value + the unit (no prefix glyph).
+fn measurement_length(value: f64, unit: crate::units::LengthUnit) -> crate::labels::Measurement {
+    crate::labels::Measurement {
+        value,
+        unit: unit.label().to_string(),
+        kind: crate::labels::MeasurementKind::Length,
+        display: format!("{} {}", fmt_measure(value), unit.label()),
+    }
+}
+
+/// Build an AREA measurement: the value + the unit² (squared).
+fn measurement_area(value: f64, unit: crate::units::LengthUnit) -> crate::labels::Measurement {
+    crate::labels::Measurement {
+        value,
+        unit: unit.label().to_string(),
+        kind: crate::labels::MeasurementKind::Area,
+        display: format!("{} {}\u{00b2}", fmt_measure(value), unit.label()),
+    }
+}
+
+/// Build a POSITION measurement: the value carries the magnitude of the position
+/// vector from the origin (a single scalar for the `value` field), with the full
+/// `(x, y, z)` in `display`.
+fn measurement_position(p: Point3, unit: crate::units::LengthUnit) -> crate::labels::Measurement {
+    let mag = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
+    crate::labels::Measurement {
+        value: mag,
+        unit: unit.label().to_string(),
+        kind: crate::labels::MeasurementKind::Position,
+        display: format!(
+            "({}, {}, {}) {}",
+            fmt_measure(p.x),
+            fmt_measure(p.y),
+            fmt_measure(p.z),
+            unit.label()
+        ),
+    }
+}
+
+/// Canonicalize an axis direction to a stable SIGN: a revolve axis is a line, so
+/// `d` and `-d` describe the same axis. Flip so the first component whose
+/// magnitude clears a small epsilon is positive — deterministic across runs and
+/// independent of how the primitive happened to orient its axis.
+fn canonical_axis_dir(d: Vector3) -> Vector3 {
+    const EPS: f64 = 1e-9;
+    let sign = if d.x.abs() > EPS {
+        d.x.signum()
+    } else if d.y.abs() > EPS {
+        d.y.signum()
+    } else if d.z.abs() > EPS {
+        d.z.signum()
+    } else {
+        1.0
+    };
+    Vector3::new(d.x * sign, d.y * sign, d.z * sign)
+}
+
+/// Lexicographic ordering on a canonicalized axis direction — a deterministic
+/// tiebreak when two candidate axes are shared by the same number of faces.
+fn axis_dir_less(a: Vector3, b: Vector3) -> bool {
+    (a.x, a.y, a.z) < (b.x, b.y, b.z)
+}
+
 /// Does a live fingerprint still satisfy the claim recorded at attach time? The
 /// position must coincide within a size-scaled band; any recorded radius/normal
 /// must agree within a relative / angular band. Fields the recorded fingerprint
@@ -1174,7 +1263,7 @@ impl BRepModel {
     /// Mean of a face's boundary vertices (outer + inner loops) — a robust
     /// representative point on the face when the analytic centroid is
     /// unavailable. `None` if the face has no resolvable boundary vertices.
-    fn face_boundary_mean(&self, fid: FaceId) -> Option<Point3> {
+    pub(crate) fn face_boundary_mean(&self, fid: FaceId) -> Option<Point3> {
         let face = self.faces.get(fid)?;
         let mut lids = vec![face.outer_loop];
         lids.extend_from_slice(&face.inner_loops);
@@ -1204,6 +1293,49 @@ impl BRepModel {
         }
     }
 
+    /// The measured AREA of a single face, summed over its triangles in the
+    /// owning solid's tessellation. The robust fallback when the analytic area
+    /// integral declines (annular caps). `None` if the face is not owned by any
+    /// solid or contributes no triangles.
+    fn face_meshed_area(&self, fid: FaceId) -> Option<f64> {
+        // Find the solid owning this face.
+        let owner = self.solids.iter().find_map(|(sid, solid)| {
+            for sh in solid.shell_ids() {
+                if let Some(shell) = self.shells.get(sh) {
+                    if shell.faces.contains(&fid) {
+                        return Some(sid);
+                    }
+                }
+            }
+            None
+        })?;
+        let solid = self.solids.get(owner)?;
+        let mesh = crate::tessellation::tessellate_solid(
+            solid,
+            self,
+            &crate::tessellation::TessellationParams::default(),
+        );
+        let mut area = 0.0_f64;
+        for (ti, tri) in mesh.triangles.iter().enumerate() {
+            if mesh.face_map.get(ti).copied() != Some(fid) {
+                continue;
+            }
+            let a = mesh.vertices.get(tri[0] as usize).map(|v| v.position);
+            let b = mesh.vertices.get(tri[1] as usize).map(|v| v.position);
+            let c = mesh.vertices.get(tri[2] as usize).map(|v| v.position);
+            if let (Some(a), Some(b), Some(c)) = (a, b, c) {
+                let e1 = b - a;
+                let e2 = c - a;
+                area += 0.5 * e1.cross(&e2).magnitude();
+            }
+        }
+        if area > 0.0 {
+            Some(area)
+        } else {
+            None
+        }
+    }
+
     /// All labels as `(name, target-kind-tag, optional-world-anchor,
     /// description)`, in name order — the agent-facing listing. The anchor is the
     /// callout point (centroid/midpoint/position/section-origin); `None` for a
@@ -1228,6 +1360,159 @@ impl BRepModel {
                 (name, kind, anchor, desc)
             })
             .collect()
+    }
+
+    /// Remove a label by name. Returns `true` if it existed (and was removed),
+    /// `false` if there was no such name — the caller surfaces a 404 honestly
+    /// rather than pretending it deleted something.
+    pub fn delete_label(&mut self, name: &str) -> bool {
+        self.labels.remove(name).is_some()
+    }
+
+    /// Rename a label, preserving its binding (target + assertion + description).
+    /// See [`crate::labels::LabelSidecar::rename`] for the refusal contract.
+    pub fn rename_label(&mut self, old: &str, new: &str) -> Result<(), crate::labels::LabelError> {
+        self.labels.rename(old, new)
+    }
+
+    /// The deterministic display COLOUR for a label, by NAME (stable across runs,
+    /// distinct per name). `None` only when the name is unknown — so a colour is
+    /// reported exactly for the labels that exist.
+    pub fn label_color(&self, name: &str) -> Option<[u8; 3]> {
+        self.labels
+            .get(name)
+            .map(|_| crate::labels::label_color(name))
+    }
+
+    /// MEASURE a label's key dimension from the LIVE geometry (truth, never
+    /// asserted), formatted in the document unit:
+    /// * face — diameter (2×radius) if cylindrical/spherical, the revolution
+    ///   diameter for cone/torus, else the planar/curved AREA;
+    /// * edge — radius if circular/arc, else chord LENGTH;
+    /// * vertex — its POSITION.
+    ///
+    /// `None` when the name is unknown, the entity is dangling, or no dimension
+    /// can be measured (the kernel reports nothing rather than a guess). `&mut`
+    /// because face area/centroid computation warms the same per-face stats cache
+    /// the resolver uses.
+    pub fn label_measurement(&mut self, name: &str) -> Option<crate::labels::Measurement> {
+        use crate::labels::{LabelKind, LabelTarget, Measurement, MeasurementKind};
+        let target = self.labels.get(name)?.target.clone();
+        let unit = self.document_unit;
+        // A section label is a plane, not a measurable feature dimension.
+        let (kind, _pid) = match target {
+            LabelTarget::Section(_) => return None,
+            LabelTarget::Entity { kind, pid } => (kind, pid),
+        };
+        match kind {
+            LabelKind::Face => {
+                let fid = self.resolve_label_face(name).ok()?;
+                // A representative point on the face (for the cone/torus radius).
+                let position = self.label_anchor(name)?;
+                if let Some(r) = self.face_radius(fid, position) {
+                    let dia = 2.0 * r;
+                    return Some(measurement_diameter(dia, unit));
+                }
+                // Planar (or otherwise radius-less) face → its measured AREA.
+                // Prefer the exact analytic area; fall back to the tessellated
+                // per-face triangle area when the integral declines (annular caps
+                // with inner + outer loops, where `compute_stats` returns Err) so
+                // a bored cap still reports its real area, not nothing.
+                let analytic = {
+                    let Self {
+                        faces,
+                        loops,
+                        vertices,
+                        edges,
+                        curves,
+                        surfaces,
+                        ..
+                    } = self;
+                    faces.get_mut(fid).and_then(|face| {
+                        face.compute_stats(loops, vertices, edges, curves, surfaces)
+                            .ok()
+                            .map(|s| s.area)
+                    })
+                };
+                let area = match analytic {
+                    Some(a) if a.is_finite() && a > 0.0 => a,
+                    _ => self.face_meshed_area(fid)?,
+                };
+                Some(measurement_area(area, unit))
+            }
+            LabelKind::Edge => {
+                let eid = self.resolve_label_edge(name).ok()?;
+                // Prefer a circular radius; else the chord length.
+                if let Some(fp) = self.edge_fingerprint(eid) {
+                    if let Some(r) = fp.radius {
+                        return Some(measurement_radius(r, unit));
+                    }
+                    if let Some(len) = fp.size {
+                        return Some(measurement_length(len, unit));
+                    }
+                }
+                None
+            }
+            LabelKind::Vertex => {
+                let vid = self.resolve_label_vertex(name).ok()?;
+                let p = self.vertices.get(vid)?.point();
+                Some(measurement_position(p, unit))
+            }
+        }
+    }
+
+    /// The GD&T CONFORMANCE verdict for a label's entity, rolled up across every
+    /// frame attached to it:
+    /// * `Some("in_spec")`     — at least one frame measured, all measured ones pass;
+    /// * `Some("out_of_spec")` — at least one measured frame fails;
+    /// * `Some("not_verified")`— frames exist but none could be measured;
+    /// * `None`                — no GD&T frame on the entity (or it is a section).
+    ///
+    /// A single out-of-spec frame dominates (a feature with any failing tolerance
+    /// is out of spec). This is the honest tri-state from [`crate::gdt::verify`],
+    /// never a bare bool.
+    pub fn label_conformance(&self, name: &str) -> Option<&'static str> {
+        use crate::labels::{LabelKind, LabelTarget};
+        let target = &self.labels.get(name)?.target;
+        let results = match target {
+            LabelTarget::Section(_) => return None,
+            LabelTarget::Entity {
+                kind: LabelKind::Face,
+                ..
+            } => {
+                let fid = self.resolve_label_face(name).ok()?;
+                self.verify_face_conformance(fid)
+            }
+            LabelTarget::Entity {
+                kind: LabelKind::Edge,
+                ..
+            } => {
+                let eid = self.resolve_label_edge(name).ok()?;
+                // 64 samples: enough for a stable circularity/straightness read.
+                self.verify_edge_conformance(eid, 64)
+            }
+            // A vertex carries no GD&T form/size frame.
+            LabelTarget::Entity {
+                kind: LabelKind::Vertex,
+                ..
+            } => return None,
+        };
+        if results.is_empty() {
+            return None;
+        }
+        let mut any_measured = false;
+        for r in &results {
+            match r.in_spec() {
+                Some(false) => return Some("out_of_spec"),
+                Some(true) => any_measured = true,
+                None => {}
+            }
+        }
+        Some(if any_measured {
+            "in_spec"
+        } else {
+            "not_verified"
+        })
     }
 
     // --- LABELLER: assertions, resolve-with-re-verification, proposals ---
@@ -1328,7 +1613,7 @@ impl BRepModel {
     fn face_query_from_spec(
         spec: &crate::labels::FaceSelectorSpec,
     ) -> crate::queries::select::FaceQuery {
-        use crate::queries::select::{Extremal, FaceQuery, SurfaceKind};
+        use crate::queries::select::{Axis, Extremal, FaceQuery, SurfaceKind};
         let surf = match spec.surface.as_str() {
             "planar" | "plane" => SurfaceKind::Planar,
             "cylindrical" | "cylinder" => SurfaceKind::Cylindrical,
@@ -1342,10 +1627,28 @@ impl BRepModel {
             .along
             .map(|a| Vector3::new(a[0], a[1], a[2]))
             .unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+        // The geometry-aware extremals carry the symmetry axis in the spec; a
+        // missing axis degrades them to `None` (an honest no-match) rather than
+        // guessing a world axis.
+        let spec_axis = match (spec.axis_origin, spec.axis_dir) {
+            (Some(o), Some(d)) => Some(Axis {
+                origin: Vector3::new(o[0], o[1], o[2]),
+                direction: Vector3::new(d[0], d[1], d[2]),
+            }),
+            _ => None,
+        };
         let extremal = match spec.extremal.as_str() {
             "largest_area" | "largest" => Extremal::LargestArea,
             "smallest_area" | "smallest" => Extremal::SmallestArea,
             "most_along" | "topmost" | "furthest" => Extremal::MostAlong(along),
+            "min_radius_station" | "min_radius" => match spec_axis {
+                Some(a) => Extremal::MinRadiusStation(a),
+                None => Extremal::None,
+            },
+            "axial_extremal_cap" | "axial_cap" => match spec_axis {
+                Some(a) => Extremal::AxialExtremalCap(a),
+                None => Extremal::None,
+            },
             _ => Extremal::None,
         };
         let mut q = FaceQuery::new(surf);
@@ -1646,19 +1949,115 @@ impl BRepModel {
         }
     }
 
+    /// Detect a solid's SYMMETRY / REVOLVE axis from its curved faces. Every
+    /// surface of revolution (cylinder / cone / torus / sphere via its pole axis /
+    /// `SurfaceOfRevolution`) carries an axis direction; a true surface-of-
+    /// revolution part has them all collinear. Returns `(origin, unit_dir)` of the
+    /// axis shared by the most curved faces, or `None` when the part has no
+    /// curved face to define one (a pure polyhedron has no revolve axis).
+    ///
+    /// The direction is canonicalized to a stable sign (first non-near-zero
+    /// component positive) so the recognizer's selector is deterministic across
+    /// runs. The origin is the centroid of the contributing axes' origins
+    /// projected to the consensus line — any point on the axis is equivalent for
+    /// the radial / axial scores that consume it.
+    pub fn symmetry_axis(&self, solid: SolidId) -> Option<(Point3, Vector3)> {
+        use crate::primitives::surface::{Cone, Cylinder, SurfaceOfRevolution, Torus};
+        let tol = self.tolerance.distance();
+        // Collect (axis_origin, unit_dir) for every curved face that has one.
+        let mut axes: Vec<(Point3, Vector3)> = Vec::new();
+        if let Some(s) = self.solids.get(solid) {
+            for sh in s.shell_ids() {
+                let Some(shell) = self.shells.get(sh) else {
+                    continue;
+                };
+                for &fid in &shell.faces {
+                    let Some(face) = self.faces.get(fid) else {
+                        continue;
+                    };
+                    let Some(surf) = self.surfaces.get(face.surface_id) else {
+                        continue;
+                    };
+                    let any = surf.as_any();
+                    let entry = if let Some(c) = any.downcast_ref::<Cylinder>() {
+                        Some((c.origin, c.axis))
+                    } else if let Some(c) = any.downcast_ref::<Cone>() {
+                        Some((c.apex, c.axis))
+                    } else if let Some(t) = any.downcast_ref::<Torus>() {
+                        Some((t.center, t.axis))
+                    } else {
+                        any.downcast_ref::<SurfaceOfRevolution>()
+                            .map(|r| (r.axis_origin, r.axis_direction))
+                    };
+                    if let Some((o, d)) = entry {
+                        if let Ok(d) = d.normalize() {
+                            axes.push((o, canonical_axis_dir(d)));
+                        }
+                    }
+                }
+            }
+        }
+        if axes.is_empty() {
+            return None;
+        }
+        // Consensus direction: the canonical dir shared (within `tol` angle) by
+        // the most faces. Ties broken by lexicographic order for determinism.
+        let mut best_dir: Option<Vector3> = None;
+        let mut best_count = 0usize;
+        for &(_, d) in &axes {
+            let count = axes
+                .iter()
+                .filter(|(_, e)| {
+                    1.0 - d.dot(e).abs() < (1.0_f64).to_radians().sin().max(tol)
+                        || d.dot(e).abs() > 0.999_5
+                })
+                .count();
+            let better = count > best_count
+                || (count == best_count && best_dir.is_some_and(|b| axis_dir_less(d, b)));
+            if better {
+                best_count = count;
+                best_dir = Some(d);
+            }
+        }
+        let dir = best_dir?;
+        // Origin: mean of the contributing axes' origins (all lie on/near the
+        // consensus line for a true revolution part).
+        let contributing: Vec<Point3> = axes
+            .iter()
+            .filter(|(_, e)| e.dot(&dir).abs() > 0.999_5)
+            .map(|(o, _)| *o)
+            .collect();
+        let n = contributing.len().max(1) as f64;
+        let mut sum = Point3::ORIGIN;
+        for p in &contributing {
+            sum = Point3::new(sum.x + p.x, sum.y + p.y, sum.z + p.z);
+        }
+        let origin = Point3::new(sum.x / n, sum.y / n, sum.z / n);
+        Some((origin, dir))
+    }
+
     /// D3 — AUTO-PROPOSE labels: recognize features on a solid and SUGGEST a
     /// name + the ASSERTION that pins it, WITHOUT applying. The user owns the
     /// name; confirming = `label_*_with_assertion` with this exact assertion, so
     /// the kernel owns the claim. Proposals are deterministic (name-stable) and
     /// only emitted when the recognizer actually resolves a single entity.
     ///
-    /// Recognizers:
-    /// * `throat`   — the smallest-area cylindrical wall (min-radius bore).
-    /// * `exit`     — the planar cap whose outward normal points most +Z (the
-    ///                downstream / max-axial cap).
+    /// Recognizers (geometry-aware — they work on a REVOLVED bell nozzle, not
+    /// just analytic-primitive parts):
+    /// * `throat`   — the MINIMUM-RADIUS station along the symmetry axis: the
+    ///                face whose closest approach to the revolve axis is globally
+    ///                smallest. On a bell nozzle this is the necked-down throat
+    ///                band, not the wide chamber barrel — and it is GUARANTEED a
+    ///                different face than `chamber`.
+    /// * `exit`     — the axis-EXTREMAL planar cap: the planar face whose centroid
+    ///                is most extreme along the symmetry axis (EITHER end), so a
+    ///                bell-down nozzle is handled, not just +Z-up.
     /// * `chamber`  — the largest-area cylindrical barrel (max-radius wall).
-    /// * `hole_*`   — each cylindrical INNER face (a bore in a cap).
     /// * `fillet_*` — each constant-radius filleted edge.
+    ///
+    /// When no symmetry axis is detectable (a non-revolution part) the throat /
+    /// exit recognizers fall back to the analytic-primitive selectors so a plain
+    /// bored block still gets a `throat` / `exit` proposal.
     pub fn propose_labels(&mut self, solid: SolidId) -> Vec<crate::labels::LabelProposal> {
         use crate::labels::{
             EdgeSelectorSpec, FaceSelectorSpec, LabelAssertion, LabelProposal, SelectorSpec,
@@ -1676,29 +2075,63 @@ impl BRepModel {
                 angle_tol_deg: 12.0,
                 extremal: extremal.to_string(),
                 along: None,
+                axis_origin: None,
+                axis_dir: None,
             };
 
-        // throat = smallest-area cylindrical wall (the min-radius bore).
-        let throat_q = FaceQuery::new(SurfaceKind::Cylindrical).extremal(Extremal::SmallestArea);
-        if resolve_face(self, solid, &throat_q).is_ok() {
+        // The part's symmetry / revolve axis (if it has one): the basis of the
+        // geometry-aware throat / exit recognizers.
+        let axis = self.symmetry_axis(solid);
+        let axis_sel = axis.map(|(o, d)| crate::queries::select::Axis {
+            origin: Vector3::new(o.x, o.y, o.z),
+            direction: d,
+        });
+        let axis_arrays = axis.map(|(o, d)| ([o.x, o.y, o.z], [d.x, d.y, d.z]));
+
+        // ── throat = the MINIMUM-RADIUS station along the axis ──────────────────
+        // Axis-aware: the face (ANY surface kind — a revolved band, not just an
+        // analytic cylinder) whose closest approach to the axis is globally
+        // smallest. No axis → fall back to the smallest-area cylinder selector so
+        // a plain bored block still proposes a throat. We keep the resolved
+        // throat fid so chamber can guarantee distinctness.
+        let (throat_q, throat_spec, throat_rationale) = match axis_sel {
+            Some(a) => (
+                FaceQuery::new(SurfaceKind::Any).extremal(Extremal::MinRadiusStation(a)),
+                FaceSelectorSpec {
+                    surface: "any".to_string(),
+                    normal_dir: None,
+                    angle_tol_deg: 12.0,
+                    extremal: "min_radius_station".to_string(),
+                    along: None,
+                    axis_origin: axis_arrays.map(|(o, _)| o),
+                    axis_dir: axis_arrays.map(|(_, d)| d),
+                },
+                "minimum-radius station along the symmetry axis".to_string(),
+            ),
+            None => (
+                FaceQuery::new(SurfaceKind::Cylindrical).extremal(Extremal::SmallestArea),
+                face_spec("cylindrical", "smallest_area", None),
+                "smallest-area cylindrical wall (minimum-radius bore)".to_string(),
+            ),
+        };
+        let throat_fid = resolve_face(self, solid, &throat_q).ok();
+        if throat_fid.is_some() {
             out.push(LabelProposal {
                 suggested_name: "throat".to_string(),
                 kind: "face",
-                assertion: LabelAssertion::Selector(SelectorSpec::Face(face_spec(
-                    "cylindrical",
-                    "smallest_area",
-                    None,
-                ))),
-                confidence: 0.8,
-                rationale: "smallest-area cylindrical wall (minimum-radius bore)".to_string(),
+                assertion: LabelAssertion::Selector(SelectorSpec::Face(throat_spec)),
+                confidence: if axis_sel.is_some() { 0.85 } else { 0.8 },
+                rationale: throat_rationale,
             });
         }
 
-        // chamber = largest-area cylindrical barrel.
+        // ── chamber = the largest-area cylindrical barrel ───────────────────────
+        // Emitted only when it is a DIFFERENT face than the throat (the bug this
+        // fix targets: on a revolved nozzle the old smallest-area-cylinder throat
+        // collapsed onto the chamber barrel — now throat is the min-radius station
+        // and chamber is the widest barrel, guaranteed distinct).
         let chamber_q = FaceQuery::new(SurfaceKind::Cylindrical).extremal(Extremal::LargestArea);
         if let Ok(chamber_fid) = resolve_face(self, solid, &chamber_q) {
-            // Only distinct from throat when there is more than one cylinder.
-            let throat_fid = resolve_face(self, solid, &throat_q).ok();
             if throat_fid != Some(chamber_fid) {
                 out.push(LabelProposal {
                     suggested_name: "chamber".to_string(),
@@ -1714,38 +2147,65 @@ impl BRepModel {
             }
         }
 
-        // exit = the planar cap whose outward normal points downstream (+Z) —
-        // the max-axial cap. Matched by the +Z-facing filter (the same selector
-        // the labeller gate uses); when two caps face +Z, break the tie by the
-        // one farthest along +Z.
-        let exit_q = FaceQuery::new(SurfaceKind::Planar).facing(Vector3::new(0.0, 0.0, 1.0));
-        let exit_q_tiebreak = FaceQuery::new(SurfaceKind::Planar)
-            .facing(Vector3::new(0.0, 0.0, 1.0))
-            .extremal(Extremal::MostAlong(Vector3::new(0.0, 0.0, 1.0)));
-        if resolve_face(self, solid, &exit_q).is_ok()
-            || resolve_face(self, solid, &exit_q_tiebreak).is_ok()
-        {
-            // Prefer the bare +Z-facing assertion when it is unambiguous, else
-            // carry the tie-broken one so confirming always re-resolves single.
-            let unambiguous = resolve_face(self, solid, &exit_q).is_ok();
-            let (extremal, along) = if unambiguous {
-                ("none".to_string(), None)
-            } else {
-                ("most_along".to_string(), Some([0.0, 0.0, 1.0]))
-            };
-            out.push(LabelProposal {
-                suggested_name: "exit".to_string(),
-                kind: "face",
-                assertion: LabelAssertion::Selector(SelectorSpec::Face(FaceSelectorSpec {
-                    surface: "planar".to_string(),
-                    normal_dir: Some([0.0, 0.0, 1.0]),
-                    angle_tol_deg: 12.0,
-                    extremal,
-                    along,
-                })),
-                confidence: 0.65,
-                rationale: "downstream planar cap (outward normal points +Z)".to_string(),
-            });
+        // ── exit = the axis-EXTREMAL planar cap (EITHER end) ────────────────────
+        // Axis-aware: the planar face whose centroid is most extreme along the
+        // symmetry axis, so a bell-DOWN nozzle's exit is found just as a +Z-up
+        // one's is. No axis → fall back to the +Z-facing planar cap (with a
+        // most-along tiebreak) so a bored block still proposes an exit.
+        match axis_sel {
+            Some(a) => {
+                let exit_q =
+                    FaceQuery::new(SurfaceKind::Planar).extremal(Extremal::AxialExtremalCap(a));
+                if resolve_face(self, solid, &exit_q).is_ok() {
+                    out.push(LabelProposal {
+                        suggested_name: "exit".to_string(),
+                        kind: "face",
+                        assertion: LabelAssertion::Selector(SelectorSpec::Face(FaceSelectorSpec {
+                            surface: "planar".to_string(),
+                            normal_dir: None,
+                            angle_tol_deg: 12.0,
+                            extremal: "axial_extremal_cap".to_string(),
+                            along: None,
+                            axis_origin: axis_arrays.map(|(o, _)| o),
+                            axis_dir: axis_arrays.map(|(_, d)| d),
+                        })),
+                        confidence: 0.7,
+                        rationale: "axis-extremal planar cap (the end of the part)".to_string(),
+                    });
+                }
+            }
+            None => {
+                let exit_q =
+                    FaceQuery::new(SurfaceKind::Planar).facing(Vector3::new(0.0, 0.0, 1.0));
+                let exit_q_tiebreak = FaceQuery::new(SurfaceKind::Planar)
+                    .facing(Vector3::new(0.0, 0.0, 1.0))
+                    .extremal(Extremal::MostAlong(Vector3::new(0.0, 0.0, 1.0)));
+                if resolve_face(self, solid, &exit_q).is_ok()
+                    || resolve_face(self, solid, &exit_q_tiebreak).is_ok()
+                {
+                    let unambiguous = resolve_face(self, solid, &exit_q).is_ok();
+                    let (extremal, along) = if unambiguous {
+                        ("none".to_string(), None)
+                    } else {
+                        ("most_along".to_string(), Some([0.0, 0.0, 1.0]))
+                    };
+                    out.push(LabelProposal {
+                        suggested_name: "exit".to_string(),
+                        kind: "face",
+                        assertion: LabelAssertion::Selector(SelectorSpec::Face(FaceSelectorSpec {
+                            surface: "planar".to_string(),
+                            normal_dir: Some([0.0, 0.0, 1.0]),
+                            angle_tol_deg: 12.0,
+                            extremal,
+                            along,
+                            axis_origin: None,
+                            axis_dir: None,
+                        })),
+                        confidence: 0.65,
+                        rationale: "downstream planar cap (outward normal points +Z)".to_string(),
+                    });
+                }
+            }
         }
 
         // fillet = a single constant-radius filleted edge, if exactly one.

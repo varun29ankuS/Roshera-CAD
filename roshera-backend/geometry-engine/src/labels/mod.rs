@@ -116,10 +116,18 @@ pub struct FaceSelectorSpec {
     /// Optional required outward-normal direction.
     pub normal_dir: Option<[f64; 3]>,
     pub angle_tol_deg: f64,
-    /// Extremal tag: `none|largest_area|smallest_area|most_along`.
+    /// Extremal tag: `none|largest_area|smallest_area|most_along|min_radius_station|axial_extremal_cap`.
     pub extremal: String,
     /// Direction for the `most_along` extremal.
     pub along: Option<[f64; 3]>,
+    /// Symmetry/revolve axis origin for the geometry-aware extremals
+    /// (`min_radius_station`, `axial_extremal_cap`). `None` for the others. A
+    /// missing field deserializes to `None`, so older specs round-trip.
+    #[serde(default)]
+    pub axis_origin: Option<[f64; 3]>,
+    /// Symmetry/revolve axis direction for the geometry-aware extremals.
+    #[serde(default)]
+    pub axis_dir: Option<[f64; 3]>,
 }
 
 /// A serializable mirror of a `queries::select::EdgeQuery`.
@@ -235,6 +243,9 @@ pub enum LabelError {
     /// A name must carry the claim that justifies it (selector or fingerprint),
     /// so the kernel can keep proving it. Refused, never stored bare.
     MissingAssertion,
+    /// A rename target name is already owned by a DIFFERENT label. Refused rather
+    /// than silently clobbering the existing binding.
+    NameInUse,
 }
 
 /// Outcome of [`LabelSidecar::attach`]: whether the name was newly created or
@@ -243,6 +254,93 @@ pub enum LabelError {
 pub enum AttachOutcome {
     Created,
     Replaced,
+}
+
+/// What KIND of dimension a label's measurement reports — picks the glyph the
+/// `display` string is formatted with (Ø for a diameter, ∠ for an angle, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeasurementKind {
+    Diameter,
+    Radius,
+    Length,
+    Area,
+    Angle,
+    Position,
+}
+
+impl MeasurementKind {
+    /// The wire/agent-facing tag.
+    pub fn tag(self) -> &'static str {
+        match self {
+            MeasurementKind::Diameter => "diameter",
+            MeasurementKind::Radius => "radius",
+            MeasurementKind::Length => "length",
+            MeasurementKind::Area => "area",
+            MeasurementKind::Angle => "angle",
+            MeasurementKind::Position => "position",
+        }
+    }
+}
+
+/// A MEASURED key dimension of a labelled feature, in the document unit. The
+/// value is read from the live geometry (truth), never asserted: a cylindrical
+/// face yields its `Diameter`, a circular edge its `Radius`, a straight edge its
+/// `Length`, a planar face its `Area`, a vertex its `Position`. `display` is the
+/// formatted, glyph-decorated string (e.g. `"Ø2.00 mm"`, `"4.50 mm"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Measurement {
+    pub value: f64,
+    pub unit: String,
+    pub kind: MeasurementKind,
+    pub display: String,
+}
+
+/// A deterministic, well-separated display COLOR for a label NAME: stable across
+/// runs (same name → same colour) and visibly distinct between names (e.g.
+/// throat / chamber / exit). Returns `[r, g, b]`.
+///
+/// The hue is the FNV-1a hash of the name mapped onto the colour wheel, then
+/// converted from a fixed-saturation/value HSV so every colour is vivid and no
+/// two hashed hues collapse to the same grey. Saturation/value are high and
+/// fixed so the palette stays legible on the shaded render and as a swatch.
+pub fn label_color(name: &str) -> [u8; 3] {
+    // FNV-1a over the trimmed name — small, fast, well-distributed.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.trim().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Hue from the full hash range; fixed S, V for a vivid, separable palette.
+    let hue = (h % 360) as f64;
+    hsv_to_rgb(hue, 0.72, 0.92)
+}
+
+/// Hex `"#rrggbb"` form of [`label_color`] — the wire/agent-facing colour.
+pub fn label_color_hex(name: &str) -> String {
+    let [r, g, b] = label_color(name);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// HSV→RGB with `h` in degrees `[0,360)`, `s`/`v` in `[0,1]`. Standard sextant
+/// conversion; used to spread label hues evenly around the wheel.
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> [u8; 3] {
+    let c = v * s;
+    let hp = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [
+        (((r1 + m) * 255.0).round()).clamp(0.0, 255.0) as u8,
+        (((g1 + m) * 255.0).round()).clamp(0.0, 255.0) as u8,
+        (((b1 + m) * 255.0).round()).clamp(0.0, 255.0) as u8,
+    ]
 }
 
 /// The per-model label store. Names are unique (a `HashMap` keyed by name);
@@ -305,6 +403,29 @@ impl LabelSidecar {
     /// Remove a label by name, returning it if it existed.
     pub fn remove(&mut self, name: &str) -> Option<Label> {
         self.labels.remove(Self::normalize(name))
+    }
+
+    /// Rename a label, preserving its target + assertion + description. The new
+    /// name must be non-empty (validated). Refuses [`LabelError::NotFound`] when
+    /// `old` is unknown, and (to never silently clobber) refuses
+    /// [`LabelError::EmptyName`] reused here for a `new` name already taken by a
+    /// DIFFERENT label — the caller must `remove` the collision first. A no-op
+    /// rename to the same canonical name succeeds.
+    pub fn rename(&mut self, old: &str, new: &str) -> Result<(), LabelError> {
+        let old_key = Self::normalize(old).to_string();
+        let new_key = Self::validate_name(new)?.to_string();
+        if !self.labels.contains_key(&old_key) {
+            return Err(LabelError::NotFound);
+        }
+        if new_key != old_key && self.labels.contains_key(&new_key) {
+            // A distinct label already owns the target name — refuse rather than
+            // overwrite it (the kernel never silently drops a binding).
+            return Err(LabelError::NameInUse);
+        }
+        if let Some(label) = self.labels.remove(&old_key) {
+            self.labels.insert(new_key, label);
+        }
+        Ok(())
     }
 
     /// Iterate `(name, &label)` over every label, in name order (deterministic
@@ -454,6 +575,48 @@ mod tests {
         }
         let names: Vec<&str> = s.iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn label_color_is_deterministic_and_distinct() {
+        // Same name → same colour, every time (stable hash, not run-dependent).
+        assert_eq!(label_color("throat"), label_color("throat"));
+        assert_eq!(label_color_hex("chamber"), label_color_hex("chamber"));
+        // Distinct names → distinct colours (the throat / chamber / exit triad
+        // must be visibly different).
+        let t = label_color("throat");
+        let c = label_color("chamber");
+        let e = label_color("exit");
+        assert_ne!(t, c);
+        assert_ne!(t, e);
+        assert_ne!(c, e);
+        // The hex form is well-formed `#rrggbb`.
+        let hex = label_color_hex("throat");
+        assert_eq!(hex.len(), 7);
+        assert!(hex.starts_with('#'));
+        assert!(hex[1..].chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn rename_preserves_binding_and_refuses_collision() {
+        let mut s = LabelSidecar::new();
+        let a = PersistentId::root(b"a");
+        let b = PersistentId::root(b"b");
+        s.attach("throat", face_label(a)).expect("attach throat");
+        s.attach("chamber", face_label(b)).expect("attach chamber");
+        // Rename throat → bore: the binding moves with the name.
+        s.rename("throat", "bore").expect("rename");
+        assert!(s.get("throat").is_none());
+        match &s.get("bore").expect("renamed present").target {
+            LabelTarget::Entity { pid, .. } => assert_eq!(*pid, a),
+            _ => panic!(),
+        }
+        // Renaming onto an in-use DIFFERENT name refuses (never clobbers chamber).
+        assert_eq!(s.rename("bore", "chamber"), Err(LabelError::NameInUse));
+        assert_eq!(s.len(), 2, "no binding lost");
+        // Unknown old name → NotFound; empty new name → EmptyName.
+        assert_eq!(s.rename("missing", "x"), Err(LabelError::NotFound));
+        assert_eq!(s.rename("bore", "  "), Err(LabelError::EmptyName));
     }
 
     #[test]

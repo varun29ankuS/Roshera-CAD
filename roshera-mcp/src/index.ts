@@ -1634,9 +1634,12 @@ server.tool(
 
 server.tool(
   "label_list",
-  "LIST every label on a part: name, kind (vertex/edge/face/section), the world " +
-    "anchor point of its callout, and any description — in name order. Your map " +
-    "of the shared vocabulary for this part.",
+  "LIST every label on a part: name, kind (vertex/edge/face/section), world " +
+    "anchor, deterministic display color (#rrggbb), the kernel-MEASURED key " +
+    "dimension { value, unit, kind, display } (e.g. Ø2.00 mm — null when none), " +
+    "the GD&T conformance verdict (in_spec/out_of_spec/not_verified — null when no " +
+    "frame), whether the label is stale, and any description — in name order. " +
+    "Your map of the shared vocabulary for this part.",
   { part_id: z.number().int() },
   async ({ part_id }) => {
     try {
@@ -1673,16 +1676,68 @@ server.tool(
 server.tool(
   "propose_labels",
   "AUTO-PROPOSE labels (D3): the kernel recognizes features on a part (throat = " +
-    "min-radius cylindrical wall, exit = downstream planar cap, chamber = " +
-    "max-radius barrel, fillet = constant-radius blend) and SUGGESTS a name plus " +
-    "the ASSERTION that pins it — it does NOT apply them. You confirm one by " +
-    "calling label_create with the suggested name and the returned `selector` as " +
-    "the selector arg (you own the name, the kernel owns the claim). Returns " +
-    "{ proposals: [{ suggested_name, kind, confidence, rationale, selector }] }.",
+    "the minimum-radius station along the symmetry axis — works on a revolved " +
+    "bell nozzle, not just analytic cylinders, exit = the axis-extremal planar " +
+    "cap at either end, chamber = max-radius barrel, fillet = constant-radius " +
+    "blend) and SUGGESTS a name plus the ASSERTION that pins it — it does NOT " +
+    "apply them. You confirm one by calling label_create with the suggested name " +
+    "and the returned `selector` as the selector arg (you own the name, the " +
+    "kernel owns the claim). Returns { proposals: [{ suggested_name, kind, " +
+    "confidence, rationale, selector }] }.",
   { part_id: z.number().int() },
   async ({ part_id }) => {
     try {
       return ok(await api("GET", `/api/agent/parts/${part_id}/propose-labels`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "label_delete",
+  "REMOVE a label from a part by name (fixes a mislabel that can't otherwise be " +
+    "undone). 200 with deleted:true when it existed; 404 when there was no such " +
+    "name — the kernel reports honestly rather than pretending it deleted " +
+    "something.",
+  {
+    part_id: z.number().int(),
+    name: z.string().min(1).describe("the label to remove"),
+  },
+  async ({ part_id, name }) => {
+    try {
+      return ok(
+        await api(
+          "DELETE",
+          `/api/agent/parts/${part_id}/labels/${encodeURIComponent(name)}`,
+        ),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "label_rename",
+  "RENAME a label, preserving its binding (the entity/selector it pins and its " +
+    "description). 404 when the old name is unknown; 409 when the new name is " +
+    "already taken by a DIFFERENT label (delete that one first — the kernel never " +
+    "silently clobbers a binding).",
+  {
+    part_id: z.number().int(),
+    name: z.string().min(1).describe("the existing label name"),
+    new_name: z.string().min(1).describe("the new name (unique per part)"),
+  },
+  async ({ part_id, name, new_name }) => {
+    try {
+      return ok(
+        await api(
+          "PATCH",
+          `/api/agent/parts/${part_id}/labels/${encodeURIComponent(name)}`,
+          { new_name },
+        ),
+      );
     } catch (e) {
       return fail(e);
     }
