@@ -5,7 +5,7 @@ import { StatusBar } from '@/components/layout/StatusBar'
 import { CADViewport } from '@/components/viewport/CADViewport'
 import { AgentEyePanel } from '@/components/viewport/AgentEyePanel'
 import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
-import { AIChatPanel } from '@/components/panels/AIChatPanel'
+import { Blackboard } from '@/components/panels/Blackboard'
 import { ModelTree } from '@/components/panels/ModelTree'
 import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
@@ -87,7 +87,7 @@ export function App() {
             {/* Viewport + floating overlays in the standard CAD layout */}
             <div className="relative flex-1 overflow-hidden">
               <CADViewport />
-              <AIChatPanel />
+              <Blackboard />
               <AgentEyePanel />
 
               {/* Browser — single consolidated panel. The header chip is
