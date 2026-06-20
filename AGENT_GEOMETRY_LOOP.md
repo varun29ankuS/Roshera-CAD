@@ -81,6 +81,17 @@ against recognition.)
 4. Track 3 analytic recognition (one detector at a time, each harness-gated).
 5. Track 4 labeller wiring; Track 6 blackboard verify.
 
+## ★ MCP exposure is non-optional (Varun, 2026-06-20: "build MCP along the way")
+Every agent-facing capability MUST ship its **MCP tool** so the agent can call it
+live — a kernel function nobody can invoke is half-built. Pattern: kernel fn
+(geometry-engine) → api-server handler (+ session→`Sketch` adapter where the input
+is a live sketch) → MCP tool schema (`tool_schema_generator`) + dispatch
+(`ai-integration/tool_dispatch.rs` / `handlers/agent.rs`). Pending MCP tools the
+loop owes: `render_sketch(sketch_id) -> PNG`, `recognize_sketch(sketch_id) ->
+ShapeClass`, `certify_sketch(sketch_id) -> SketchValidityCertificate`. Build the
+kernel fn and its MCP tool in the SAME or the immediately-following slice — never
+leave a capability un-callable.
+
 Discipline (all tracks): production-grade only (no stubs/todos), compile-safe
 slices, verify each compiles+passes before the next, commit each increment with a
 clear message (no AI-authorship trailers), `cargo fmt` clean, never run
