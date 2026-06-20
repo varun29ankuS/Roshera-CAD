@@ -4,6 +4,7 @@ import { ToolBar } from '@/components/layout/ToolBar'
 import { StatusBar } from '@/components/layout/StatusBar'
 import { CADViewport } from '@/components/viewport/CADViewport'
 import { AgentEyePanel } from '@/components/viewport/AgentEyePanel'
+import { StepImportDropzone } from '@/components/viewport/StepImportDropzone'
 import { PropertiesPanel } from '@/components/panels/PropertiesPanel'
 import { Blackboard } from '@/components/panels/Blackboard'
 import { ModelTree } from '@/components/panels/ModelTree'
@@ -100,6 +101,7 @@ export function App() {
               <CADViewport />
               <Blackboard />
               <AgentEyePanel />
+              <StepImportDropzone />
 
               {/* Browser — single consolidated panel. The header chip is
                   always visible and acts as the collapse toggle; an

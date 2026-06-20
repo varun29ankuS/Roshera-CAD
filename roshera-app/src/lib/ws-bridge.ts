@@ -402,6 +402,18 @@ function hydrateSketchesOnce() {
 /// so `convertCADObject` is reused verbatim). Sketch hydration is also
 /// reset so the model tree refills against the new server.
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
+
+/// Force a full scene refetch from the server.
+///
+/// Identical to the reconnect resync, exposed for mutations whose result the
+/// client must reflect immediately without waiting on (or in case of a missed)
+/// an `ObjectCreated` WS frame — e.g. a drag-and-drop STEP import that splices
+/// several solids into the live model server-side. Cheap (one
+/// `GET /api/scene/snapshot`) and idempotent (clear + rebuild).
+export async function refreshSceneFromServer(): Promise<void> {
+  return resyncSceneFromServer()
+}
+
 async function resyncSceneFromServer(): Promise<void> {
   try {
     const res = await fetch(`${API_BASE}/scene/snapshot`)
