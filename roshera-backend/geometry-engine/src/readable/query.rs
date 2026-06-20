@@ -371,6 +371,43 @@ impl BRepModel {
     /// an explicit assignment, so `mass` is always a real number on
     /// the returned report.
     pub fn mass_properties_for(&mut self, solid_id: SolidId) -> Option<MassPropertiesReport> {
+        let props = self.compute_solid_mass_properties(solid_id)?;
+        self.build_mass_report(solid_id, props)
+    }
+
+    /// AUDIT-quality mass-properties — the SAME physical report as
+    /// [`Self::mass_properties_for`] but computed from a cheaper `default()`
+    /// (chord 1e-3, ≤100 segments) tessellation instead of the export-grade
+    /// `fine()` (chord 1e-4, ≤200 segments), and WITHOUT caching, for the internal
+    /// verification path (the gap-finder / harness mass-properties physical-sanity
+    /// contract).
+    ///
+    /// The sanity contract checks physics — positive volume/area, a symmetric
+    /// positive-semidefinite inertia tensor, the principal-moment triangle
+    /// inequality — none of which needs `fine()`'s 1e-4 chord: that chord
+    /// over-samples a curved-Boolean rim into an enormous mesh, which was a chunk
+    /// of the per-op audit cost. `default()` quality converges comfortably inside
+    /// those bands while keeping the inertia integration robust (so we do NOT drop
+    /// to the 24-segment `audit()` preset, whose principal moments can drift on a
+    /// high-genus fragment). The agent-facing `mass_properties_for` keeps `fine()`;
+    /// this never installs the cache, so a later agent query still gets the precise
+    /// numbers. It DOES reuse a fine cache if one is already warm (more precise,
+    /// free).
+    pub fn audit_mass_properties_for(&mut self, solid_id: SolidId) -> Option<MassPropertiesReport> {
+        let props = self.audit_mass_properties(solid_id)?;
+        self.build_mass_report(solid_id, props)
+    }
+
+    /// Assemble the agent-facing [`MassPropertiesReport`] from an already-computed
+    /// [`crate::primitives::solid::SolidMassProperties`] — shared by the fine
+    /// ([`Self::mass_properties_for`]) and audit ([`Self::audit_mass_properties_for`])
+    /// entry points so the two differ ONLY in tessellation quality, never in the
+    /// report shape.
+    fn build_mass_report(
+        &self,
+        solid_id: SolidId,
+        props: crate::primitives::solid::SolidMassProperties,
+    ) -> Option<MassPropertiesReport> {
         // Capture the material before borrowing the solid mutably so
         // we don't tangle borrows on the inertia computation.
         let (material_name, material_density) = {
@@ -380,8 +417,6 @@ impl BRepModel {
                 solid.attributes.material.density,
             )
         };
-
-        let props = self.compute_solid_mass_properties(solid_id)?;
 
         // Surface area now lives on `SolidMassProperties` itself — read
         // from the same struct as volume / COM / inertia so the

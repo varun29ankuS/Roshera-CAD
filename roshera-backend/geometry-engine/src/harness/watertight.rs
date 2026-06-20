@@ -20,8 +20,16 @@ use std::collections::HashMap;
 
 /// The analytic (mass-properties) volume of a solid, or `None` if it can't be
 /// computed.
+///
+/// Uses the AUDIT-quality, non-caching volume — the coarse divergence-theorem
+/// integration the verification path needs (a few-percent band), NOT the
+/// export-grade `fine()` mass-properties the agent-facing `mass_properties_for`
+/// returns. This is the change that makes the audit fast: the `fine()` volume on
+/// a curved-Boolean fragment is the audit's dominant cost. It does not poison the
+/// `fine()` mass-props cache (a later agent query still gets precise numbers),
+/// and reuses that cache when a prior agent query already warmed it.
 pub fn analytic_volume(model: &mut BRepModel, solid: SolidId) -> Option<f64> {
-    model.calculate_solid_volume(solid)
+    model.audit_volume(solid)
 }
 
 /// The volume enclosed by the solid's tessellated mesh at chord tolerance
@@ -29,6 +37,13 @@ pub fn analytic_volume(model: &mut BRepModel, solid: SolidId) -> Option<f64> {
 /// solid is missing or tessellates to nothing.
 pub fn mesh_volume(model: &BRepModel, solid: SolidId, chord: f64) -> Option<f64> {
     let solid_ref = model.solids.get(solid)?;
+    // The caller's `chord` is the deliberate quality knob here (fillet/chamfer
+    // harnesses compare this against an EXTERNAL analytic truth at a tight chord,
+    // so the segment ceiling stays at `default()`'s 100 — coarsening it would
+    // shift a curved fillet's meshed volume relative to its closed-form truth).
+    // The fan-budget non-termination guard scales with `max_segments`, so this
+    // path is still bounded; the audit's heavy cost was the `fine()` ANALYTIC
+    // volume, addressed by `analytic_volume`/`audit_volume`, not this mesh side.
     let params = TessellationParams {
         chord_tolerance: chord,
         ..TessellationParams::default()
@@ -52,7 +67,11 @@ pub fn mesh_volume(model: &BRepModel, solid: SolidId, chord: f64) -> Option<f64>
 /// leak or flip produces a far larger discrepancy). `false` if either volume is
 /// uncomputable (which is itself a failure).
 pub fn is_watertight(model: &mut BRepModel, solid: SolidId, chord: f64, rel_tol: f64) -> bool {
-    let Some(analytic) = model.calculate_solid_volume(solid) else {
+    // AUDIT-quality analytic volume (coarse, non-caching) — both sides of the
+    // comparison are now coarse, so they agree on the SHAPE'S volume and only a
+    // real leak/flip (a topological defect coarse tessellation still exposes)
+    // produces a discrepancy beyond `rel_tol`. See `analytic_volume`.
+    let Some(analytic) = model.audit_volume(solid) else {
         return false;
     };
     let Some(mesh) = mesh_volume(model, solid, chord) else {
@@ -138,6 +157,10 @@ pub fn manifold_report(
     weld_eps: f64,
 ) -> Option<ManifoldReport> {
     let solid_ref = model.solids.get(solid)?;
+    // Caller-driven `chord` with `default()`'s segment ceiling (see `mesh_volume`
+    // for why this side is not coarsened to `audit()`). Connectivity is a
+    // topological verdict the `max_segments`-scaled fan-budget guard keeps
+    // bounded; the audit's cost was the `fine()` analytic volume, not this.
     let params = TessellationParams {
         chord_tolerance: chord,
         ..TessellationParams::default()
@@ -477,6 +500,106 @@ mod tests {
         let r = manifold_report(&model, result, 0.05, 1e-6).expect("union mesh");
         assert!(r.is_valid_solid(), "box union not a valid manifold: {r:?}");
         assert_eq!(r.euler_characteristic, 2, "union euler: {r:?}");
+    }
+
+    /// NON-VACUOUS AFTER THE AUDIT-PERF CHANGE: coarsening the audit's ANALYTIC
+    /// volume to `audit_volume` (and scaling the spherical-fan budget with
+    /// `max_segments`) must NOT make the leak detector blind. A box with one face
+    /// removed is a genuine open shell — a hole the size of a whole face — and the
+    /// connectivity oracle (`manifold_report`, the audit's topological leak check)
+    /// must still flag it: `boundary_edges > 0`, not a valid solid. This is the
+    /// regression gate proving the faster audit still SEES leaks.
+    ///
+    /// (Note: `is_watertight` — the volume-AGREEMENT check — is by construction
+    /// blind to a removed face, as its own docstring states: both the analytic and
+    /// mesh sides integrate the SAME open mesh, so they agree. That is exactly why
+    /// `manifold_report` exists and why the audit runs BOTH. This test pins the
+    /// detector that actually catches a torn-face leak.)
+    #[test]
+    fn open_box_leak_is_still_detected_after_audit_coarsening() {
+        let mut model = BRepModel::new();
+        TopologyBuilder::new(&mut model)
+            .create_box_3d(10.0, 8.0, 6.0)
+            .expect("box");
+        let solid = last_solid(&model);
+
+        // Precondition: the intact box is watertight AND a valid manifold.
+        assert!(
+            is_watertight(&mut model, solid, 0.3, 0.06),
+            "precondition: intact box must be watertight"
+        );
+        let intact = manifold_report(&model, solid, 0.3, 1e-6).expect("intact mesh");
+        assert!(
+            intact.is_valid_solid() && intact.boundary_edges == 0,
+            "precondition: intact box must be a closed valid manifold: {intact:?}"
+        );
+
+        // Tear a face out → an open boundary the size of a whole face.
+        let shell_id = model.solids.get(solid).expect("solid").outer_shell;
+        let face_to_remove = *model
+            .shells
+            .get(shell_id)
+            .expect("shell")
+            .faces
+            .first()
+            .expect("box has faces");
+        let removed = model
+            .shells
+            .get_mut(shell_id)
+            .expect("shell")
+            .remove_face(face_to_remove);
+        assert!(removed, "face removal must succeed");
+
+        // The connectivity oracle MUST still catch it after the perf change.
+        let leaky = manifold_report(&model, solid, 0.3, 1e-6).expect("leaky mesh");
+        assert!(
+            leaky.boundary_edges > 0,
+            "manifold_report must report boundary (open) edges for the torn box: {leaky:?}"
+        );
+        assert!(
+            !leaky.is_valid_solid(),
+            "manifold_report must reject the open box: {leaky:?}"
+        );
+    }
+
+    /// `audit_volume` (the new coarse, non-caching analytic volume the audit uses)
+    /// must agree with the exact analytic volume on the primitives — coarse is
+    /// fine for a sanity band, but it must not be WRONG. A 2×3×4 box is exactly 24
+    /// at any density; a sphere/cylinder must land within the coarse faceting
+    /// band. This proves the audit's volume source is sound, not merely cheap.
+    #[test]
+    fn audit_volume_is_accurate_on_primitives() {
+        let mut mb = BRepModel::new();
+        TopologyBuilder::new(&mut mb)
+            .create_box_3d(2.0, 3.0, 4.0)
+            .expect("box");
+        let b = last_solid(&mb);
+        let vb = mb.audit_volume(b).expect("box audit volume");
+        assert!((vb - 24.0).abs() < 1e-6, "box audit volume {vb} ≠ 24");
+
+        let mut ms = BRepModel::new();
+        TopologyBuilder::new(&mut ms)
+            .create_sphere_3d(Vector3::ZERO, 3.0)
+            .expect("sphere");
+        let s = last_solid(&ms);
+        let vs = ms.audit_volume(s).expect("sphere audit volume");
+        let true_sphere = 4.0 / 3.0 * std::f64::consts::PI * 27.0;
+        assert!(
+            (vs - true_sphere).abs() / true_sphere < 0.05,
+            "sphere audit volume {vs} vs {true_sphere} (>5% off — coarse audit too inaccurate)"
+        );
+
+        let mut mc = BRepModel::new();
+        TopologyBuilder::new(&mut mc)
+            .create_cylinder_3d(Vector3::ZERO, Vector3::Z, 2.0, 5.0)
+            .expect("cyl");
+        let c = last_solid(&mc);
+        let vc = mc.audit_volume(c).expect("cyl audit volume");
+        let true_cyl = std::f64::consts::PI * 4.0 * 5.0;
+        assert!(
+            (vc - true_cyl).abs() / true_cyl < 0.05,
+            "cylinder audit volume {vc} vs {true_cyl} (>5% off)"
+        );
     }
 
     /// The oracle is strict enough to FAIL on a known-broken result: the
