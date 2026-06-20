@@ -6973,6 +6973,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/sketch/{id}/recognize",
             get(sketch::recognize_sketch_handler),
         )
+        .route(
+            "/api/sketch/{id}/certify",
+            get(sketch::certify_sketch_handler),
+        )
         .route("/api/sketch/regions/preview", post(sketch::preview_regions))
         // Multi-shape control — a sketch session may carry multiple
         // shapes; outer/hole classification is decided geometrically

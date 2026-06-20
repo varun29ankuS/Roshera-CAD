@@ -1504,6 +1504,24 @@ pub async fn recognize_sketch_handler(
     Ok(Json(geometry_engine::sketch2d::recognize_sketch(&sketch)))
 }
 
+/// `GET /api/sketch/{id}/certify` — the SKETCH validity certificate for a live
+/// sketch: the "can't lie" moat over the wire. Bridges the session to a kernel
+/// `Sketch` and returns the certificate (constrainedness, constraint-consistency,
+/// closed-profile, self-intersection-free, entity-validity, `is_sound`). The
+/// agent-facing `certify_sketch` MCP tool wraps this.
+pub async fn certify_sketch_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<geometry_engine::sketch2d::SketchValidityCertificate>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+    let sketch = session.to_kernel_sketch();
+    Ok(Json(sketch.certify()))
+}
+
 /// `GET /api/sketch/{id}/regions` — read-only region classification
 /// for an in-progress sketch session. Returns the same data the
 /// extrude pipeline will see at finalise time, so a hover preview
