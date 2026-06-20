@@ -803,3 +803,43 @@ fn adversarial_transitive_coincidence_vs_distance_conflict() {
         "transitive coincidence vs distance is unsound"
     );
 }
+
+/// Transitive coincidence vs a COORDINATE constraint: a≡b≡c, yet XCoordinate(a)=0
+/// and XCoordinate(c)=5. The coincident group is forced to one x, contradicting
+/// two different fixed x values — extends the transitive case beyond Distance.
+#[test]
+fn adversarial_transitive_coincidence_vs_xcoordinate_conflict() {
+    let sketch = Sketch::new("transitive-x".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(20.0, 0.0));
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Coincident,
+        vec![EntityRef::Point(a), EntityRef::Point(b)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Coincident,
+        vec![EntityRef::Point(b), EntityRef::Point(c)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::XCoordinate(0.0),
+        vec![EntityRef::Point(a)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::XCoordinate(5.0),
+        vec![EntityRef::Point(c)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "a≡b≡c forces one x, contradicting x(a)=0 and x(c)=5: {cert:?}"
+    );
+    assert!(
+        !cert.is_sound(),
+        "transitive coincidence vs coordinate is unsound"
+    );
+}
