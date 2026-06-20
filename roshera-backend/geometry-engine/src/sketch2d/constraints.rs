@@ -722,6 +722,11 @@ impl ConstraintStore {
             // Parallel and perpendicular are contradictory
             (Parallel, Perpendicular) | (Perpendicular, Parallel) => true,
 
+            // Collinear lines lie on the same infinite line, hence are parallel;
+            // a perpendicular requirement contradicts that. (Collinear+Parallel,
+            // by contrast, AGREE and must not be flagged.)
+            (Collinear, Perpendicular) | (Perpendicular, Collinear) => true,
+
             // Horizontal and vertical are contradictory (for same line)
             (Horizontal, Vertical) | (Vertical, Horizontal) => true,
 
