@@ -1468,25 +1468,62 @@ interface BlackboardLine {
   updatedAt: number;
 }
 
+/**
+ * Build the `?scope=…` / `?part_id=…` query suffix for the scoped Blackboard
+ * routes. A `part_id` (a part UUID from list_parts, or its integer kernel id)
+ * targets THAT part's own notebook; `scope` lets the agent address an
+ * assembly (`assembly:<uuid>`) or the document (`document`). Omitting both
+ * targets the document-wide notebook.
+ */
+function blackboardScopeQuery(part_id?: string, scope?: string): string {
+  const p = new URLSearchParams();
+  if (scope) p.set("scope", scope);
+  else if (part_id) p.set("part_id", part_id);
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
+const SCOPE_ARGS = {
+  part_id: z
+    .string()
+    .optional()
+    .describe(
+      "target THIS part's own notebook — a part UUID (object_uuid) or its " +
+        "integer kernel part_id from list_parts. Omit for the document-wide " +
+        "notebook.",
+    ),
+  scope: z
+    .string()
+    .optional()
+    .describe(
+      "explicit scope token: 'document', 'part:<uuid>', or " +
+        "'assembly:<uuid>' (cross-part calcs). Wins over part_id.",
+    ),
+};
+
 server.tool(
   "blackboard_add_entry",
-  "WRITE a line to the shared Blackboard — the agent/human notebook that the " +
-    "human SEES live in the app. Use it to record findings, reasoning, a plan, " +
-    "or a result as an editable, markdown+math line (e.g. '$E = mc^2$'). The " +
-    "line is appended to the backend document and broadcast to every open " +
-    "client. `author` defaults to 'agent'. Returns the created line's id.",
+  "WRITE a line to a part's Blackboard — the per-part agent/human notebook " +
+    "that the human SEES live in the app. Each part has its OWN notebook, so " +
+    "pass `part_id` to record a finding, derivation, or result on THAT part " +
+    "(markdown+math, e.g. '$E = mc^2$'). Omit part_id for the document-wide " +
+    "notebook; use `scope` for assembly-level (cross-part) calcs. `author` " +
+    "defaults to 'agent'. Returns the created line's id.",
   {
     text: z.string().describe("markdown + $math$ source for the line"),
     author: z
       .enum(["agent", "user"])
       .default("agent")
       .describe("line origin; defaults to 'agent'"),
+    ...SCOPE_ARGS,
   },
-  async ({ text, author }) => {
+  async ({ text, author, part_id, scope }) => {
     try {
       const line = (await api("POST", "/api/blackboard/entries", {
         text,
         author,
+        ...(part_id ? { part_id } : {}),
+        ...(scope ? { scope } : {}),
       })) as BlackboardLine;
       return ok({ id: line.id, author: line.author, text: line.text });
     } catch (e) {
@@ -1499,16 +1536,18 @@ server.tool(
   "blackboard_edit_entry",
   "EDIT an existing Blackboard line in place by its id (from blackboard_list). " +
     "Replaces the line's text and logs an edit event; the change appears live " +
-    "in the app. Returns the updated line.",
+    "in the app. Pass the same `part_id`/`scope` you listed it under (omit to " +
+    "find the line by id across notebooks). Returns the updated line.",
   {
     id: z.string().describe("line id from blackboard_list"),
     text: z.string().describe("new markdown + $math$ source for the line"),
+    ...SCOPE_ARGS,
   },
-  async ({ id, text }) => {
+  async ({ id, text, part_id, scope }) => {
     try {
       const line = (await api(
         "PATCH",
-        `/api/blackboard/entries/${encodeURIComponent(id)}`,
+        `/api/blackboard/entries/${encodeURIComponent(id)}${blackboardScopeQuery(part_id, scope)}`,
         { text },
       )) as BlackboardLine;
       return ok({ id: line.id, author: line.author, text: line.text });
@@ -1520,13 +1559,18 @@ server.tool(
 
 server.tool(
   "blackboard_list",
-  "READ the shared Blackboard: returns every current line (id, author, text) " +
-    "in document order. Use it to see what the human has written, or to fetch " +
-    "the id of a line before editing it.",
-  {},
-  async () => {
+  "READ a part's Blackboard: returns that notebook's current lines (id, " +
+    "author, text) in document order. Pass `part_id` to read THAT part's " +
+    "notebook (each part has its own); omit for the document-wide notebook, " +
+    "or use `scope` for an assembly. Use it to see what the human wrote or to " +
+    "fetch a line id before editing.",
+  { ...SCOPE_ARGS },
+  async ({ part_id, scope }) => {
     try {
-      const snap = (await api("GET", "/api/blackboard")) as {
+      const snap = (await api(
+        "GET",
+        `/api/blackboard${blackboardScopeQuery(part_id, scope)}`,
+      )) as {
         lines?: BlackboardLine[];
       };
       const lines = (snap.lines ?? []).map((l) => ({
@@ -1543,12 +1587,20 @@ server.tool(
 
 server.tool(
   "blackboard_clear",
-  "CLEAR the shared Blackboard — remove every line and reset the event log. " +
-    "Destructive 'start over' for the notebook; does not touch geometry.",
-  {},
-  async () => {
+  "CLEAR one Blackboard notebook — remove every line and reset its event log. " +
+    "Scoped: `part_id` clears THAT part's notebook only (others untouched); " +
+    "omit for the document-wide notebook, `scope` for an assembly. Destructive " +
+    "'start over'; does not touch geometry.",
+  { ...SCOPE_ARGS },
+  async ({ part_id, scope }) => {
     try {
-      return ok(await api("POST", "/api/blackboard/clear", {}));
+      return ok(
+        await api(
+          "POST",
+          `/api/blackboard/clear${blackboardScopeQuery(part_id, scope)}`,
+          {},
+        ),
+      );
     } catch (e) {
       return fail(e);
     }
