@@ -2424,7 +2424,37 @@ fn tessellate_spherical_polygon(
             .unwrap_or(cdir)
     };
 
-    let n_rings = arc_steps_for_quality(max_ang, r, params).max(2);
+    let mut n_rings = arc_steps_for_quality(max_ang, r, params).max(2);
+
+    // NON-TERMINATION GUARD (NO-HANGS pillar). This fan emits ~`2·n_rings·m`
+    // triangles. `n_rings` is chord-bounded (≤ `params.max_segments`), but `m`
+    // (the rim sample count) comes from `loop_rim_samples` over the face's
+    // boundary arcs and is NOT bounded here: a Boolean cut-circle arrangement
+    // cell on a sphere can present a rim of THOUSANDS of samples (e.g. a sphere
+    // fragment from a chained curved boolean sampled at `fine()` produced
+    // m≈3450), which multiplied by `n_rings=200` rings is ~1.4M triangles for a
+    // SINGLE face — the divergence-theorem mass-properties / watertight check
+    // (which tessellates at `fine()`) then takes minutes, presenting to the
+    // caller as a HANG. Cap the fan's total triangle yield: when `2·n_rings·m`
+    // would exceed the budget, thin only the INTERIOR radial rings (`n_rings`),
+    // never the rim (`ring0` is emitted verbatim from the edge cache, so the
+    // weld to the adjoining faces stays bit-exact and the boundary is never
+    // truncated). The interior of a star-shaped spherical cell is smooth, so
+    // fewer radial rings only coarsens interior facets — geometry-preserving for
+    // the rim/boundary that matters. The budget is an order of magnitude above
+    // any legitimate single-face tessellation, so it fires only on the
+    // pathological over-sampled-rim case, never on a real fine mesh — and the
+    // poke_matrix gate (chord 0.08, `max_segments` 100) is far below it.
+    //
+    // Budget = 150k: a FULL `fine()` sphere is ~80k triangles and a single
+    // arrangement-cell fragment is a fraction of one sphere, so 150k is ~2× the
+    // most any single legitimate sphere face can need — it cannot truncate a
+    // real fine mesh, yet hard-bounds the pathological m·n_rings product.
+    const FAN_TRI_BUDGET: usize = 150_000;
+    if m >= 2 && 2 * n_rings * m > FAN_TRI_BUDGET {
+        let capped = (FAN_TRI_BUDGET / (2 * m)).max(2);
+        n_rings = n_rings.min(capped);
+    }
     let mk = |dir: Vector3, mesh: &mut TriangleMesh| -> u32 {
         let p = o + dir * r;
         mesh.add_vertex(MeshVertex {
