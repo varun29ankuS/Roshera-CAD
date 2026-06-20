@@ -208,6 +208,15 @@ export function StepImportDropzone() {
     }
   }, [dragging, runImport])
 
+  // The toolbar's Export flyout (Import ▸ STEP) dispatches this event to open the
+  // native file picker — the import affordance lives under Export now, not as a
+  // floating overlay button. Drag-and-drop onto the viewport still works.
+  useEffect(() => {
+    const open = () => fileInput.current?.click()
+    window.addEventListener('roshera:open-step-import', open)
+    return () => window.removeEventListener('roshera:open-step-import', open)
+  }, [])
+
   const onPick = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0]
@@ -238,14 +247,10 @@ export function StepImportDropzone() {
 
       {/* Toolbar affordance + hidden file input. Sits top-right, clear of the
           ModelTree (top-left) and the AgentEyePanel (bottom-right). */}
+      {/* The import trigger now lives in the toolbar's Export flyout (Import ▸
+          STEP); this overlay keeps only the hidden file input + the transient
+          result card, so nothing floats over the viewport at rest. */}
       <div className="absolute right-2 top-2 z-30 flex flex-col items-end gap-2">
-        <button
-          onClick={() => fileInput.current?.click()}
-          className="rounded-md border border-border bg-background/90 px-3 py-1.5 text-xs font-medium shadow-md backdrop-blur hover:bg-accent"
-          title="Import a STEP (.step/.stp) file — or drag one onto the viewport"
-        >
-          ⤓ Import STEP
-        </button>
         <input
           ref={fileInput}
           type="file"
