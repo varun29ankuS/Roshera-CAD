@@ -6969,6 +6969,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // receive `SketchRegionsUpdated` frames on every mutation,
         // so polling these endpoints is not required.
         .route("/api/sketch/{id}/regions", get(sketch::get_sketch_regions))
+        .route(
+            "/api/sketch/{id}/recognize",
+            get(sketch::recognize_sketch_handler),
+        )
         .route("/api/sketch/regions/preview", post(sketch::preview_regions))
         // Multi-shape control — a sketch session may carry multiple
         // shapes; outer/hole classification is decided geometrically
