@@ -35,14 +35,17 @@ async fn produce_fixed_sample() {
         BooleanOptions::default(),
     )
     .unwrap();
-    let v =
-        validate_solid_scoped(&model, result, Tolerance::default(), ValidationLevel::Standard);
+    let v = validate_solid_scoped(
+        &model,
+        result,
+        Tolerance::default(),
+        ValidationLevel::Standard,
+    );
     assert!(v.is_valid, "source must be valid: {:?}", v.errors);
 
     let out_dir = Path::new("C:/Users/Varun Sharma/Downloads");
-    let engine = export_engine::ExportEngine::with_output_directory(
-        out_dir.to_string_lossy().to_string(),
-    );
+    let engine =
+        export_engine::ExportEngine::with_output_directory(out_dir.to_string_lossy().to_string());
     let filename = engine
         .export_step(&model, "ROSHERA_FIXED_export")
         .await
@@ -51,13 +54,16 @@ async fn produce_fixed_sample() {
     eprintln!("WROTE {}", path.display());
 
     // Prove the fixed file re-imports VALID (the oracle, no FreeCAD needed).
-    let (imported, report) =
-        export_engine::formats::step::import_step_to_brep_with_report(&path)
-            .await
-            .expect("import");
+    let (imported, report) = export_engine::formats::step::import_step_to_brep_with_report(&path)
+        .await
+        .expect("import");
     let sid = imported.solids.iter().next().map(|(id, _)| id).unwrap();
-    let rv =
-        validate_solid_scoped(&imported, sid, Tolerance::default(), ValidationLevel::Standard);
+    let rv = validate_solid_scoped(
+        &imported,
+        sid,
+        Tolerance::default(),
+        ValidationLevel::Standard,
+    );
     eprintln!(
         "RE-IMPORT ok={} valid={} errors={}",
         report.ok,
