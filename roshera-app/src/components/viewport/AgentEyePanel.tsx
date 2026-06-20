@@ -7,9 +7,11 @@ const API_HOST = import.meta.env.VITE_API_URL || ''
 type RenderMode = 'shaded' | 'diagnostic' | 'ids' | 'dim' | 'section'
 type ViewName = 'iso' | 'front' | 'top' | 'right'
 
-// What the eye is looking at: a single part (newest/selected) or the whole
-// assembly (every solid composited via the scene-eye).
-type Scope = 'part' | 'assembly'
+// What the eye is looking at: a single part (newest/selected), the whole
+// scene (every solid composited via the scene-eye), or one NAMED instanced
+// assembly (#19 — every instance composited at its transform via
+// `/api/assembly/{id}/view`).
+type Scope = 'part' | 'assembly' | 'named'
 
 const SINGLE_VIEW: RenderMode[] = ['shaded', 'diagnostic', 'ids']
 
@@ -41,6 +43,9 @@ export function AgentEyePanel() {
   const [minimized, setMinimized] = useState(false)
   const [live, setLive] = useState(true)
   const [scope, setScope] = useState<Scope>('part')
+  // The instanced-assembly id the 'named' scope renders (#19). Empty = the
+  // user hasn't picked one yet; the panel prompts for it.
+  const [assemblyId, setAssemblyId] = useState('')
   const [mode, setMode] = useState<RenderMode>('shaded')
   const [view, setView] = useState<ViewName>('iso')
   const [az, setAz] = useState(DEFAULT_AZ)
@@ -57,14 +62,48 @@ export function AgentEyePanel() {
   const [err, setErr] = useState<string | null>(null)
   const inFlight = useRef(false)
 
-  // In Assembly mode only the scene-shared modes are valid; fall back cleanly
-  // if the user was on `dim`/`section` when they switched scope.
+  // In Assembly / named-assembly mode only the scene-shared modes are valid;
+  // fall back cleanly if the user was on `dim`/`section` when they switched.
   const sceneMode: RenderMode = SCENE_MODES.includes(mode) ? mode : 'shaded'
+  // Scopes that render a composited scene (orbit camera + scene modes).
+  const isSceneScope = scope === 'assembly' || scope === 'named'
 
   const grab = useCallback(async () => {
     if (inFlight.current) return
     inFlight.current = true
     try {
+      if (scope === 'named') {
+        // NAMED-ASSEMBLY EYE (#19): composite every instance of one assembly
+        // at its transform. Per-part perception is not meaningful here; the
+        // assembly's own perception comes from GET /api/assembly/{id}.
+        setPerc(null)
+        if (!assemblyId.trim()) {
+          setPng(null)
+          setDiag(null)
+          setErr('enter an assembly id')
+          return
+        }
+        const r = await fetch(
+          `${API_HOST}/api/assembly/${assemblyId.trim()}/view?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`,
+        )
+        if (r.status === 404) {
+          setPng(null)
+          setDiag(null)
+          setErr('no such assembly / no instances')
+          return
+        }
+        if (!r.ok) throw new Error(`assembly ${r.status}`)
+        const data = (await r.json()) as {
+          png_base64: string
+          open_edges: number
+          nonmanifold_edges: number
+        }
+        setPng(data.png_base64)
+        setDiag({ open: data.open_edges, nm: data.nonmanifold_edges })
+        setErr(null)
+        return
+      }
+
       if (scope === 'assembly') {
         // SCENE-EYE: composite every solid, auto-framed, orbitable by az/el.
         // Per-part perception (`perc`) is not meaningful for a whole scene.
@@ -147,7 +186,7 @@ export function AgentEyePanel() {
     } finally {
       inFlight.current = false
     }
-  }, [scope, mode, view, az, el, sceneMode])
+  }, [scope, mode, view, az, el, sceneMode, assemblyId])
 
   useEffect(() => {
     if (minimized) return
@@ -169,9 +208,9 @@ export function AgentEyePanel() {
     )
   }
 
-  const activeMode: RenderMode = scope === 'assembly' ? sceneMode : mode
+  const activeMode: RenderMode = isSceneScope ? sceneMode : mode
   const modeOptions: RenderMode[] =
-    scope === 'assembly' ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[])
+    isSceneScope ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[])
 
   return (
     <div className="absolute bottom-2 right-2 z-20 w-[208px] overflow-hidden rounded-md border border-border bg-background/95 shadow-lg backdrop-blur">
@@ -212,7 +251,7 @@ export function AgentEyePanel() {
 
       {/* Scope: a single part vs the whole assembly (scene-eye composite). */}
       <div className="flex border-b border-border">
-        {(['part', 'assembly'] as Scope[]).map((s) => (
+        {(['part', 'assembly', 'named'] as Scope[]).map((s) => (
           <button
             key={s}
             onClick={() => setScope(s)}
@@ -224,19 +263,34 @@ export function AgentEyePanel() {
             title={
               s === 'part'
                 ? 'Show the newest part on its own'
-                : 'Show the whole assembly (every solid composited)'
+                : s === 'assembly'
+                  ? 'Show the whole scene (every solid composited)'
+                  : 'Show one named instanced assembly (every instance at its transform)'
             }
           >
-            {s}
+            {s === 'named' ? 'asm' : s}
           </button>
         ))}
       </div>
+
+      {/* Named-assembly id input (#19): which instanced assembly to render. */}
+      {scope === 'named' && (
+        <div className="border-b border-border px-2 py-1">
+          <input
+            type="text"
+            value={assemblyId}
+            onChange={(e) => setAssemblyId(e.target.value)}
+            placeholder="assembly id (uuid)"
+            className="w-full rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px]"
+          />
+        </div>
+      )}
 
       <div className="relative aspect-square w-full bg-muted">
         {png ? (
           <img
             src={`data:image/png;base64,${png}`}
-            alt={scope === 'assembly' ? 'agent scene view' : 'agent part view'}
+            alt={isSceneScope ? 'agent scene view' : 'agent part view'}
             className="h-full w-full object-contain"
           />
         ) : (
@@ -306,8 +360,8 @@ export function AgentEyePanel() {
         )}
       </div>
 
-      {/* Assembly orbit controls: az/el step the scene-eye camera. */}
-      {scope === 'assembly' && (
+      {/* Scene orbit controls: az/el step the scene-eye camera. */}
+      {isSceneScope && (
         <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-1 font-mono text-[10px]">
           <div className="flex items-center gap-0.5">
             <span className="text-muted-foreground">az</span>

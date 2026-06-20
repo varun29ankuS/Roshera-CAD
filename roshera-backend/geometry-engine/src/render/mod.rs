@@ -18,7 +18,7 @@
 //! (same solid → identical bytes) so renders can be snapshot-tested and
 //! diffed across kernel changes the same way volumes are.
 
-use crate::math::{Point3, Vector3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::mesh::TriangleMesh;
@@ -357,6 +357,63 @@ pub fn render_solids_dir(
                 .face_map
                 .push(m.face_map.get(ti).copied().unwrap_or(u32::MAX));
             tri_colors.push(col);
+        }
+    }
+    render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors), &[])
+}
+
+/// INSTANCED scene render — the true-assembly eye. Each instance is a
+/// `(solid_id, world_transform, rgb)` triple: the SAME solid id may appear
+/// in many instances at different transforms (geometry is referenced, never
+/// copied). For each instance the solid's mesh is tessellated ONCE per
+/// distinct solid would be ideal, but tessellation is cheap relative to the
+/// rest of the pipeline and the per-instance transform must be baked into
+/// world space anyway, so we tessellate-then-transform per instance. The
+/// instance transform is applied to vertex positions (full affine) and to
+/// normals (rotation/linear part only — translation does not move a
+/// direction). `dir` points camera→scene; `up_hint` must not be parallel.
+///
+/// This is what makes a 100-part assembly tractable: the kernel stores N
+/// instances referencing M ≤ N parts, and only the render walks the
+/// instance list. Returns `None` if every instance resolves to a missing or
+/// empty solid.
+pub fn render_instances_dir(
+    model: &BRepModel,
+    instances: &[(SolidId, Matrix4, [u8; 3])],
+    dir: Vector3,
+    up_hint: Vector3,
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
+    let mut merged = TriangleMesh::new();
+    let mut tri_colors: Vec<[u8; 3]> = Vec::new();
+    for (solid_id, transform, color) in instances {
+        let solid = match model.solids.get(*solid_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let m = tessellate_solid(solid, model, &opts.tessellation);
+        let base = merged.vertices.len() as u32;
+        for v in &m.vertices {
+            let position = transform.transform_point(&v.position);
+            // Normal: linear part only. Re-normalise in case the transform
+            // carries a uniform scale; a non-uniform scale would skew the
+            // normal but instancing transforms are rigid in Phase 1.
+            let n = transform.transform_vector(&v.normal);
+            let normal = n.normalize().unwrap_or(v.normal);
+            merged.vertices.push(crate::tessellation::mesh::MeshVertex {
+                position,
+                normal,
+                uv: v.uv,
+            });
+        }
+        for (ti, t) in m.triangles.iter().enumerate() {
+            merged
+                .triangles
+                .push([t[0] + base, t[1] + base, t[2] + base]);
+            merged
+                .face_map
+                .push(m.face_map.get(ti).copied().unwrap_or(u32::MAX));
+            tri_colors.push(*color);
         }
     }
     render_mesh_dir(&merged, dir, up_hint, opts, Some(&tri_colors), &[])

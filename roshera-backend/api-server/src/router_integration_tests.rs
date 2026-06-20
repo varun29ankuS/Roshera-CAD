@@ -23,8 +23,8 @@
 #![cfg(test)]
 
 use crate::{
-    assembly_mgr, build_router, csketch, drawing_mgr, metrics, part_mgr, sketch, transactions,
-    viewport_bridge, AppState,
+    assembly_instances, assembly_mgr, build_router, csketch, drawing_mgr, metrics, part_mgr,
+    sketch, transactions, viewport_bridge, AppState,
 };
 
 use ai_integration::{
@@ -208,6 +208,7 @@ async fn make_test_state() -> AppState {
             timeline_recorder.clone()
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
+        instanced_assemblies: Arc::new(assembly_instances::InstancedAssemblyManager::new()),
         drawings: Arc::new(drawing_mgr::DrawingManager::with_recorder(
             timeline_recorder.clone()
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
