@@ -668,3 +668,66 @@ fn adversarial_parallel_and_angle_zero_is_consistent() {
         "parallel AND angle=0 agree — must NOT be flagged: {cert:?}"
     );
 }
+
+// ── Iteration 3: collinear/perpendicular geometric conflict ────────────────
+
+/// GEOMETRIC conflict: two lines forced Collinear AND Perpendicular. Collinear
+/// lines are parallel (angle 0), so a 90° requirement contradicts — must be
+/// caught (the geometric conflict table covered only Parallel/Perp + H/V).
+#[test]
+fn adversarial_collinear_and_perpendicular_conflict() {
+    let sketch = Sketch::new("coll-perp".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(0.0, 5.0));
+    let d = sketch.add_point(Point2d::new(10.0, 5.0));
+    let l1 = sketch.add_line(a, b).expect("l1");
+    let l2 = sketch.add_line(c, d).expect("l2");
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Collinear,
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Perpendicular,
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "collinear lines are parallel, so perpendicular contradicts: {cert:?}"
+    );
+    assert!(
+        !cert.is_sound(),
+        "a collinear+perpendicular pair is unsound"
+    );
+}
+
+/// CALIBRATION: Collinear AND Parallel AGREE (collinear is a stronger parallel).
+/// Must NOT be flagged as a conflict.
+#[test]
+fn adversarial_collinear_and_parallel_is_consistent() {
+    let sketch = Sketch::new("coll-para".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(0.0, 5.0));
+    let d = sketch.add_point(Point2d::new(10.0, 5.0));
+    let l1 = sketch.add_line(a, b).expect("l1");
+    let l2 = sketch.add_line(c, d).expect("l2");
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Collinear,
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Parallel,
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        cert.constraint_consistent,
+        "collinear implies parallel — they agree, not conflict: {cert:?}"
+    );
+}
