@@ -40,24 +40,38 @@
 import {
   type BlackboardSnapshot,
   type BlackboardEvent,
+  type BlackboardScope,
   type BlackboardPersistenceAdapter,
   type BlackboardLine,
+  DOCUMENT_SCOPE,
   setBlackboardAdapter,
   useBlackboardStore,
 } from '@/stores/blackboard-store'
 
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
-const STORAGE_KEY = 'roshera.blackboard.v1'
+const STORAGE_PREFIX = 'roshera.blackboard.v1'
 
 /** Default poll interval (ms) for picking up agent-written lines. */
 const POLL_INTERVAL_MS = 2500
 
+/** Per-scope localStorage key — mirrors the store's own keying so the offline
+ *  cache for one part never overwrites another's. */
+function storageKey(scope: BlackboardScope): string {
+  return `${STORAGE_PREFIX}.${scope}`
+}
+
+/** The `?scope=` query suffix that routes a request to a scope's notebook. The
+ *  document scope is the backend default, so it needs no query. */
+function scopeQuery(scope: BlackboardScope): string {
+  return scope === DOCUMENT_SCOPE ? '' : `?scope=${encodeURIComponent(scope)}`
+}
+
 // ─── localStorage fallback (same key/shape as the store's own) ──────
 
-function loadLocal(): BlackboardSnapshot | null {
+function loadLocal(scope: BlackboardScope): BlackboardSnapshot | null {
   if (typeof window === 'undefined') return null
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
+    const raw = window.localStorage.getItem(storageKey(scope))
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<BlackboardSnapshot>
     if (!Array.isArray(parsed.lines) || !Array.isArray(parsed.events)) return null
@@ -67,10 +81,10 @@ function loadLocal(): BlackboardSnapshot | null {
   }
 }
 
-function saveLocal(snapshot: BlackboardSnapshot): void {
+function saveLocal(scope: BlackboardScope, snapshot: BlackboardSnapshot): void {
   if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot))
+    window.localStorage.setItem(storageKey(scope), JSON.stringify(snapshot))
   } catch {
     /* quota / private-mode — non-fatal */
   }
@@ -78,9 +92,9 @@ function saveLocal(snapshot: BlackboardSnapshot): void {
 
 // ─── REST helpers ────────────────────────────────────────────────────
 
-async function fetchSnapshot(): Promise<BlackboardSnapshot | null> {
+async function fetchSnapshot(scope: BlackboardScope): Promise<BlackboardSnapshot | null> {
   try {
-    const res = await fetch(`${API_BASE}/blackboard`)
+    const res = await fetch(`${API_BASE}/blackboard${scopeQuery(scope)}`)
     if (!res.ok) return null
     const snap = (await res.json()) as Partial<BlackboardSnapshot>
     if (!Array.isArray(snap.lines) || !Array.isArray(snap.events)) return null
@@ -90,42 +104,58 @@ async function fetchSnapshot(): Promise<BlackboardSnapshot | null> {
   }
 }
 
-async function postEntry(line: BlackboardLine): Promise<void> {
+async function postEntry(scope: BlackboardScope, line: BlackboardLine): Promise<void> {
   // The frontend owns line ids; the backend keeps `id` verbatim so edit /
-  // delete address the same row. We send id alongside text/author.
+  // delete address the same row. We send id + scope alongside text/author so
+  // the line lands in the active part's notebook.
   await fetch(`${API_BASE}/blackboard/entries`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: line.id, text: line.text, author: line.author }),
+    body: JSON.stringify({
+      id: line.id,
+      text: line.text,
+      author: line.author,
+      ...(scope === DOCUMENT_SCOPE ? {} : { scope }),
+    }),
   })
 }
 
-async function patchEntry(id: string, text: string): Promise<void> {
-  await fetch(`${API_BASE}/blackboard/entries/${encodeURIComponent(id)}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
-  })
+async function patchEntry(scope: BlackboardScope, id: string, text: string): Promise<void> {
+  await fetch(
+    `${API_BASE}/blackboard/entries/${encodeURIComponent(id)}${scopeQuery(scope)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    },
+  )
 }
 
-async function deleteEntry(id: string): Promise<void> {
-  await fetch(`${API_BASE}/blackboard/entries/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-  })
+async function deleteEntry(scope: BlackboardScope, id: string): Promise<void> {
+  await fetch(
+    `${API_BASE}/blackboard/entries/${encodeURIComponent(id)}${scopeQuery(scope)}`,
+    { method: 'DELETE' },
+  )
 }
 
-async function clearBackend(): Promise<void> {
-  await fetch(`${API_BASE}/blackboard/clear`, { method: 'POST' })
+async function clearBackend(scope: BlackboardScope): Promise<void> {
+  await fetch(`${API_BASE}/blackboard/clear${scopeQuery(scope)}`, { method: 'POST' })
 }
 
 // ─── Delta detection ─────────────────────────────────────────────────
 
 /**
- * Last snapshot we either fetched from or wrote to the backend. `save`
- * diffs against it; polling replaces it. Module-scoped so the adapter is a
- * stable singleton across reducer calls.
+ * Last snapshot we either fetched from or wrote to the backend, PER SCOPE.
+ * `save` diffs the active scope against its entry; polling replaces it. A part
+ * and the document each track their own baseline so a delta is never computed
+ * against the wrong notebook. Module-scoped so the adapter is a stable
+ * singleton across reducer calls.
  */
-let lastApplied: BlackboardSnapshot = { lines: [], events: [] }
+const lastApplied = new Map<BlackboardScope, BlackboardSnapshot>()
+const EMPTY: BlackboardSnapshot = { lines: [], events: [] }
+function baseline(scope: BlackboardScope): BlackboardSnapshot {
+  return lastApplied.get(scope) ?? EMPTY
+}
 
 /** Suppress re-persisting a backend-sourced state we just pushed into the store. */
 let applyingRemote = false
@@ -135,18 +165,19 @@ function findLine(snapshot: BlackboardSnapshot, id: string): BlackboardLine | un
 }
 
 /**
- * Translate the single delta between `lastApplied` and `next` into one REST
- * call. Best-effort: any failure falls back to a full-snapshot localStorage
- * save so the session is never lost.
+ * Translate the single delta between `scope`'s baseline and `next` into one
+ * REST call against that scope's notebook. Best-effort: any failure falls back
+ * to a full-snapshot localStorage save so the session is never lost.
  */
-async function persistDelta(next: BlackboardSnapshot): Promise<void> {
+async function persistDelta(scope: BlackboardScope, next: BlackboardSnapshot): Promise<void> {
+  const prev = baseline(scope)
   // clearBoard resets events to empty (and lines to just the welcome line).
-  if (next.events.length === 0 && lastApplied.events.length > 0) {
+  if (next.events.length === 0 && prev.events.length > 0) {
     try {
-      await clearBackend()
+      await clearBackend(scope)
       return
     } catch {
-      saveLocal(next)
+      saveLocal(scope, next)
       return
     }
   }
@@ -154,11 +185,11 @@ async function persistDelta(next: BlackboardSnapshot): Promise<void> {
   // Append-only log: any new event sits at the tail. We only ever apply one
   // reducer between saves, so a single new event is the common case; if the
   // log advanced by more than one (e.g. a streamed sequence), replay the tail.
-  const newEvents: BlackboardEvent[] = next.events.slice(lastApplied.events.length)
+  const newEvents: BlackboardEvent[] = next.events.slice(prev.events.length)
   if (newEvents.length === 0) {
     // No log change (e.g. `setLineText` streaming chunk, which does not log) —
     // mirror to localStorage but don't spam the backend.
-    saveLocal(next)
+    saveLocal(scope, next)
     return
   }
 
@@ -167,14 +198,14 @@ async function persistDelta(next: BlackboardSnapshot): Promise<void> {
       switch (ev.kind) {
         case 'add': {
           const line = findLine(next, ev.lineId)
-          if (line) await postEntry(line)
+          if (line) await postEntry(scope, line)
           break
         }
         case 'edit':
-          await patchEntry(ev.lineId, ev.after)
+          await patchEntry(scope, ev.lineId, ev.after)
           break
         case 'delete':
-          await deleteEntry(ev.lineId)
+          await deleteEntry(scope, ev.lineId)
           break
       }
     }
@@ -182,35 +213,34 @@ async function persistDelta(next: BlackboardSnapshot): Promise<void> {
     // Backend unreachable mid-sequence — fall back to a local snapshot so the
     // user's edits survive the session. The next successful poll/hydrate
     // reconciles state.
-    saveLocal(next)
+    saveLocal(scope, next)
   }
 }
 
 // ─── The adapter ─────────────────────────────────────────────────────
 
 /**
- * Backend-backed persistence adapter. `load` is synchronous (the store calls
- * it once at module init), so it returns the localStorage cache for an instant
- * first paint; the authoritative backend snapshot arrives via async hydration
- * in `installBackendBlackboard`.
+ * Backend-backed persistence adapter. `load(scope)` is synchronous (the store
+ * calls it on init and on every scope switch), so it returns the localStorage
+ * cache for that scope for an instant first paint; the authoritative backend
+ * snapshot arrives via async hydration in `installBackendBlackboard`.
  */
 export const backendBlackboardAdapter: BlackboardPersistenceAdapter = {
-  load() {
-    return loadLocal()
+  load(scope) {
+    return loadLocal(scope)
   },
-  save(snapshot) {
+  save(scope, snapshot) {
     // Always keep the localStorage mirror fresh (offline fallback) ...
-    saveLocal(snapshot)
+    saveLocal(scope, snapshot)
     // ... and skip the backend round-trip when WE are the ones writing the
     // store from a backend snapshot (hydrate / poll), which would echo every
     // line straight back to the server.
     if (applyingRemote) {
-      lastApplied = snapshot
+      lastApplied.set(scope, snapshot)
       return
     }
-    const next = snapshot
-    void persistDelta(next).finally(() => {
-      lastApplied = next
+    void persistDelta(scope, snapshot).finally(() => {
+      lastApplied.set(scope, snapshot)
     })
   },
 }
@@ -218,29 +248,32 @@ export const backendBlackboardAdapter: BlackboardPersistenceAdapter = {
 // ─── Store hydration from a backend snapshot ────────────────────────
 
 /**
- * Replace the store's document with a backend snapshot WITHOUT going through
- * the mutating reducers (which would re-POST every line). We set `lines` /
- * `events` directly via the store's own `setState` — state shape only, no
- * reducer logic touched — guarded by `applyingRemote` so the resulting `save`
- * is treated as a no-op against the backend.
+ * Replace the ACTIVE scope's document with a backend snapshot WITHOUT going
+ * through the mutating reducers (which would re-POST every line). Guarded by
+ * `applyingRemote` so the resulting `save` is treated as a no-op against the
+ * backend. `scope` is the notebook the snapshot belongs to; if the user has
+ * since switched parts, the snapshot is cached but not painted (it would clash
+ * with the now-active notebook).
  */
-function applyRemoteSnapshot(snapshot: BlackboardSnapshot): void {
-  // Skip if nothing changed since we last applied — avoids needless renders
-  // on every poll tick.
+function applyRemoteSnapshot(scope: BlackboardScope, snapshot: BlackboardSnapshot): void {
+  const prev = baseline(scope)
   const same =
-    snapshot.events.length === lastApplied.events.length &&
-    snapshot.lines.length === lastApplied.lines.length &&
+    snapshot.events.length === prev.events.length &&
+    snapshot.lines.length === prev.lines.length &&
     snapshot.lines.every((l, i) => {
-      const prev = lastApplied.lines[i]
-      return prev && prev.id === l.id && prev.text === l.text
+      const p = prev.lines[i]
+      return p && p.id === l.id && p.text === l.text
     })
   if (same) return
 
   applyingRemote = true
   try {
-    useBlackboardStore.setState({ lines: snapshot.lines, events: snapshot.events })
-    lastApplied = snapshot
-    saveLocal(snapshot)
+    lastApplied.set(scope, snapshot)
+    saveLocal(scope, snapshot)
+    // Only repaint the panel if this snapshot is for the notebook on screen.
+    if (useBlackboardStore.getState().activeScope === scope) {
+      useBlackboardStore.setState({ lines: snapshot.lines, events: snapshot.events })
+    }
   } finally {
     applyingRemote = false
   }
@@ -249,39 +282,57 @@ function applyRemoteSnapshot(snapshot: BlackboardSnapshot): void {
 // ─── Install + lifecycle ─────────────────────────────────────────────
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
+let unsubScope: (() => void) | null = null
+
+/** Fetch + reconcile the currently-active scope's notebook. */
+function syncActiveScope(): void {
+  const scope = useBlackboardStore.getState().activeScope
+  void fetchSnapshot(scope).then((snap) => {
+    if (snap) applyRemoteSnapshot(scope, snap)
+  })
+}
 
 /**
  * Install the backend adapter and start syncing. Idempotent. Returns a
- * teardown that restores nothing destructive — it only stops the poll (the
- * adapter stays installed, which is the desired steady state for the app).
+ * teardown that stops the poll and the scope subscription (the adapter stays
+ * installed, the desired steady state for the app).
  *
- * Call once at app bootstrap. On the first successful GET it hydrates the
- * store from the server; thereafter a short poll picks up lines other clients
- * (or an agent over MCP) wrote. If the backend is unreachable the store keeps
- * its localStorage-seeded state and the poll keeps retrying.
+ * Call once at app bootstrap. It hydrates the active scope's notebook from the
+ * server, re-hydrates whenever the user selects a different part (the store's
+ * `activeScope` changes), and polls so lines other clients / an agent over MCP
+ * wrote appear live. If the backend is unreachable the store keeps its
+ * localStorage-seeded state and the poll keeps retrying.
  */
 export function installBackendBlackboard(intervalMs: number = POLL_INTERVAL_MS): () => void {
   setBlackboardAdapter(backendBlackboardAdapter)
 
-  // Initial hydration — authoritative document from the server.
-  void fetchSnapshot().then((snap) => {
-    if (snap) applyRemoteSnapshot(snap)
-  })
+  // Initial hydration — authoritative document for whatever scope is active
+  // at boot (the Document notebook).
+  syncActiveScope()
 
-  // Live updates: re-fetch and reconcile. A failed poll is a no-op (offline);
-  // the next tick retries.
+  // Re-hydrate immediately when the active scope changes (the user selected a
+  // different part). The store has already painted that scope's local cache;
+  // this fetches the authoritative backend document for it.
+  if (unsubScope === null) {
+    unsubScope = useBlackboardStore.subscribe((state, prev) => {
+      if (state.activeScope !== prev.activeScope) syncActiveScope()
+    })
+  }
+
+  // Live updates: re-fetch and reconcile the active scope. A failed poll is a
+  // no-op (offline); the next tick retries.
   if (pollTimer === null && typeof window !== 'undefined') {
-    pollTimer = setInterval(() => {
-      void fetchSnapshot().then((snap) => {
-        if (snap) applyRemoteSnapshot(snap)
-      })
-    }, intervalMs)
+    pollTimer = setInterval(syncActiveScope, intervalMs)
   }
 
   return () => {
     if (pollTimer !== null) {
       clearInterval(pollTimer)
       pollTimer = null
+    }
+    if (unsubScope !== null) {
+      unsubScope()
+      unsubScope = null
     }
   }
 }

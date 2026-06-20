@@ -1,5 +1,10 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
-import { useBlackboardStore } from '@/stores/blackboard-store'
+import {
+  useBlackboardStore,
+  DOCUMENT_SCOPE,
+  partScope,
+} from '@/stores/blackboard-store'
+import { useSceneStore } from '@/stores/scene-store'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { BlackboardLine } from './BlackboardLine'
 import { Button } from '@/components/ui/button'
@@ -35,6 +40,34 @@ export function Blackboard() {
   const editLine = useBlackboardStore((s) => s.editLine)
   const deleteLine = useBlackboardStore((s) => s.deleteLine)
   const addLine = useBlackboardStore((s) => s.addLine)
+  const activeScope = useBlackboardStore((s) => s.activeScope)
+  const setActiveScope = useBlackboardStore((s) => s.setActiveScope)
+
+  // Drive the notebook scope from the viewport selection: the active part's
+  // notebook is shown, so each part has its OWN blackboard. The primary
+  // selected scene object IS a part (its id is the kernel part UUID); when
+  // nothing (or a non-part) is selected, fall back to the document notebook.
+  const selectedIds = useSceneStore((s) => s.selectedIds)
+  const objects = useSceneStore((s) => s.objects)
+  const selectedPart = useSceneStore((s) => {
+    for (const id of s.selectedIds) {
+      const obj = s.objects.get(id)
+      if (obj) return obj
+    }
+    return null
+  })
+  useEffect(() => {
+    setActiveScope(selectedPart ? partScope(selectedPart.id) : DOCUMENT_SCOPE)
+    // `selectedIds`/`objects` are dependencies via `selectedPart`; listing the
+    // raw stores keeps the effect honest if selection changes within the set.
+  }, [selectedPart, selectedIds, objects, setActiveScope])
+
+  const scopeLabel =
+    activeScope === DOCUMENT_SCOPE
+      ? 'Document'
+      : selectedPart
+        ? selectedPart.name
+        : 'Part'
 
   const [input, setInput] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -94,9 +127,16 @@ export function Blackboard() {
     <div className="absolute bottom-8 left-3 z-20 w-[50rem] max-w-[calc(100vw-1.5rem)] max-h-[60vh] flex flex-col rounded-xl overflow-hidden bg-background/35 backdrop-blur-md border border-border/60">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
-        <div className="flex items-center gap-2">
-          <NotebookPen size={14} className="text-primary" />
-          <span className="text-xs font-medium">Blackboard</span>
+        <div className="flex items-center gap-2 min-w-0">
+          <NotebookPen size={14} className="text-primary shrink-0" />
+          <span className="text-xs font-medium shrink-0">Blackboard</span>
+          {/* Which part's notebook is on screen — the per-part scope. */}
+          <span
+            className="text-[11px] text-muted-foreground truncate"
+            title={`Notebook scope: ${scopeLabel}`}
+          >
+            · {scopeLabel}
+          </span>
         </div>
         <div className="flex items-center gap-0.5">
           <button

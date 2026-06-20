@@ -1611,3 +1611,107 @@ async fn blackboard_honours_client_supplied_id_and_dedupes() {
         "duplicate id must not create a second line; body = {body}"
     );
 }
+
+/// THE per-part isolation proof through the live router: a calc posted to
+/// part A's notebook and a different calc to part B's notebook never
+/// cross-contaminate. A GET scoped to A returns ONLY A's line; B's returns
+/// ONLY B's; the un-scoped (document) notebook is empty. This is the whole
+/// point of scoping the blackboard per part.
+#[tokio::test]
+async fn blackboard_part_scopes_are_isolated_through_router() {
+    let state = make_test_state().await;
+    let part_a = "11111111-1111-1111-1111-111111111111";
+    let part_b = "22222222-2222-2222-2222-222222222222";
+
+    // Post a calc to A's notebook.
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/entries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "text": "stress in A: $\\sigma=F/A$", "part_id": part_a }).to_string(),
+            ))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "post to A must route 200; {body}");
+
+    // Post a different calc to B's notebook.
+    let (status, _body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/entries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "text": "torque in B: $T=Fr$", "part_id": part_b }).to_string(),
+            ))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GET A → only A's calc.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/blackboard?part_id={part_a}"))
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        body["lines"].as_array().map(Vec::len),
+        Some(1),
+        "A: one line"
+    );
+    assert!(
+        body["lines"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("sigma"),
+        "A sees ONLY A's calc; body = {body}"
+    );
+
+    // GET B → only B's calc.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/blackboard?scope=part:{part_b}"))
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        body["lines"].as_array().map(Vec::len),
+        Some(1),
+        "B: one line"
+    );
+    assert!(
+        body["lines"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("T=Fr"),
+        "B sees ONLY B's calc; body = {body}"
+    );
+
+    // GET document (un-scoped) → empty: part writes never leak into it.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        body["lines"].as_array().map(Vec::len),
+        Some(0),
+        "document notebook stays empty; body = {body}"
+    );
+}
