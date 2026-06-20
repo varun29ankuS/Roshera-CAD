@@ -707,7 +707,13 @@ fn extract_curve_data(curve: &dyn Curve) -> CurveData {
         };
     }
 
-    // Fallback: sample the curve as a polyline and store as BSpline degree 1
+    // Fallback: sample the curve as a polyline and store as a degree-1
+    // B-spline. The knot vector MUST be a valid clamped vector sized to
+    // the control-point count (`n + degree + 1`), NOT empty — an empty
+    // knot vector serializes to `B_SPLINE_CURVE_WITH_KNOTS(…,(),())`,
+    // which every conforming reader (Roshera's importer, OCCT/FreeCAD)
+    // rejects, dropping the edge and tearing a topology gap. A degree-1
+    // clamped uniform vector reproduces the sampled polyline exactly.
     let n_samples = 20;
     let mut cps = Vec::with_capacity(n_samples + 1);
     for i in 0..=n_samples {
@@ -716,11 +722,47 @@ fn extract_curve_data(curve: &dyn Curve) -> CurveData {
             cps.push([pt.x, pt.y, pt.z]);
         }
     }
+    let degree = 1;
+    let knots = clamped_uniform_knots(cps.len(), degree);
     CurveData::BSpline {
         control_points: cps,
-        knots: Vec::new(), // Empty knots = sampled polyline
-        degree: 1,
+        knots,
+        degree: degree as u32,
     }
+}
+
+/// Build a clamped, uniformly-spaced knot vector for a B-spline with
+/// `n` control points and the given `degree`.
+///
+/// The returned vector has the schema-mandated length `n + degree + 1`:
+/// the first and last knots each carry multiplicity `degree + 1`
+/// (clamping the curve/surface to its end control points), and the
+/// interior knots step uniformly `1, 2, …, n - degree - 1`. The
+/// parameter domain is therefore `[0, n - degree]`, which is
+/// non-degenerate whenever `n > degree` (the caller guarantees this by
+/// sampling more points than the degree).
+///
+/// This is the inverse of the importer's `expand_knot_vector`: the
+/// writer collapses this expanded vector back into `(distinct, mult)`
+/// pairs, the importer re-expands it, and the two agree exactly.
+fn clamped_uniform_knots(n: usize, degree: usize) -> Vec<f64> {
+    // Guard: a valid clamped vector needs n > degree. If the sampler
+    // produced too few points, fall back to the minimum legal grid by
+    // clamping the interior span count to zero (Bézier-like), which
+    // still yields a non-degenerate domain of length 1.
+    let interior = n.saturating_sub(degree + 1);
+    let span_max = (interior + 1) as f64; // domain end = n - degree
+    let mut knots = Vec::with_capacity(n + degree + 1);
+    for _ in 0..=degree {
+        knots.push(0.0);
+    }
+    for i in 1..=interior {
+        knots.push(i as f64);
+    }
+    for _ in 0..=degree {
+        knots.push(span_max);
+    }
+    knots
 }
 
 /// Extract surface parameters into serializable SurfaceData
@@ -797,7 +839,16 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
         };
     }
 
-    // Fallback: sample the surface and store as BSpline approximation
+    // Fallback: sample the surface on a grid and store as a degree-1
+    // B-spline. As with the curve fallback, the knot vectors MUST be
+    // valid clamped vectors sized to the control-point grid
+    // (`n + degree + 1` per direction), NOT empty — an empty knot
+    // vector serializes to `B_SPLINE_SURFACE_WITH_KNOTS(…,(),(),(),())`,
+    // which the importer rejects ("knot vector is empty"), dropping the
+    // face and tearing topology gaps in every adjacent edge. This was
+    // the root cause of Roshera-exported solids failing to re-import as
+    // watertight: boolean-split faces whose surface type the analytic
+    // downcasts above didn't recognise fell here and lost their knots.
     let n = 10;
     let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
     let mut cps: Vec<Vec<[f64; 3]>> = Vec::with_capacity(n + 1);
@@ -814,11 +865,55 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
         }
         cps.push(row);
     }
+    let (degree_u, degree_v) = (1usize, 1usize);
+    let knots_u = clamped_uniform_knots(cps.len(), degree_u);
+    let knots_v = clamped_uniform_knots(cps.first().map(|r| r.len()).unwrap_or(0), degree_v);
     SurfaceData::BSpline {
         control_points: cps,
-        knots_u: Vec::new(),
-        knots_v: Vec::new(),
-        degree_u: 1,
-        degree_v: 1,
+        knots_u,
+        knots_v,
+        degree_u: degree_u as u32,
+        degree_v: degree_v as u32,
+    }
+}
+
+#[cfg(test)]
+mod knot_tests {
+    use super::clamped_uniform_knots;
+
+    /// The clamped vector has the schema-mandated length `n + degree + 1`,
+    /// clamps both ends to multiplicity `degree + 1`, and spans a
+    /// non-degenerate, strictly-increasing interior — so the kernel's
+    /// `KnotVector::validate(degree, n)` accepts it (the inverse of the
+    /// "knot vector is empty" import failure this fixes).
+    #[test]
+    fn clamped_uniform_knots_are_valid_for_degree_one() {
+        use geometry_engine::math::bspline::KnotVector;
+        for n in 2..=20usize {
+            let degree = 1usize;
+            let k = clamped_uniform_knots(n, degree);
+            assert_eq!(k.len(), n + degree + 1, "knot count n={n}");
+            // Clamped ends.
+            assert_eq!(k[0], k[degree], "start clamp n={n}");
+            let last = k.len() - 1;
+            assert_eq!(k[last], k[last - degree], "end clamp n={n}");
+            // Non-decreasing.
+            assert!(k.windows(2).all(|w| w[1] >= w[0]), "monotone n={n}");
+            // Non-degenerate domain.
+            assert!(k[last] > k[0], "domain non-degenerate n={n}");
+            // The kernel accepts it.
+            let kv = KnotVector::new(k).expect("knot vector constructs");
+            kv.validate(degree, n)
+                .unwrap_or_else(|e| panic!("kernel rejected clamped knots n={n}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn clamped_uniform_knots_never_empty() {
+        // Even a degenerate-small grid must not produce an empty vector
+        // (that was the exact serialization that broke re-import).
+        for n in 2..=4usize {
+            assert!(!clamped_uniform_knots(n, 1).is_empty());
+        }
     }
 }
