@@ -34,6 +34,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Positioned-instance assemblies (#19, Phase 1) — reference-only part
+/// instancing, distinct from the mate-centric [`Assembly`] in this module.
+/// See [`instancing::InstancedAssembly`].
+pub mod instancing;
+pub use instancing::{Instance, InstanceId, InstancedAssembly};
+
 /// Unique identifier for assembly components
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComponentId(pub Uuid);

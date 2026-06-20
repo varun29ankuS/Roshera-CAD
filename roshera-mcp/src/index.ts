@@ -1746,6 +1746,240 @@ server.tool(
 
 // ════════════════════════ END LABELLER TOOLS ════════════════════════════
 
+// ════════════════════════ ASSEMBLY (#19) TOOLS ══════════════════════════
+//
+// TRUE assemblies: an assembly is a set of positioned part INSTANCES, NOT a
+// boolean of everything into one solid. An instance is a reference to a part
+// (by id) plus a world transform — the SAME part id can be instanced many
+// times at different poses, reusing the geometry instead of copying it. This
+// is the scaling primitive for big assemblies (a 100-part scene = 100
+// instances over far fewer distinct parts). Phase 1 is positioned instances;
+// mates are Phase 2.
+
+/** Build a row-major 4×4 transform from a translation (+ optional axis-angle
+ *  rotation in degrees about a unit axis). Both optional → identity. */
+function buildTransform(
+  position?: [number, number, number],
+  rotation_deg?: number,
+  rotation_axis?: [number, number, number],
+): number[][] {
+  const I = [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+  ];
+  let m = I.map((r) => r.slice());
+  if (rotation_deg && rotation_axis) {
+    const [ax, ay, az] = rotation_axis;
+    const len = Math.hypot(ax, ay, az) || 1;
+    const [x, y, z] = [ax / len, ay / len, az / len];
+    const a = (rotation_deg * Math.PI) / 180;
+    const c = Math.cos(a);
+    const s = Math.sin(a);
+    const t = 1 - c;
+    // Rodrigues rotation matrix.
+    m = [
+      [t * x * x + c, t * x * y - s * z, t * x * z + s * y, 0],
+      [t * x * y + s * z, t * y * y + c, t * y * z - s * x, 0],
+      [t * x * z - s * y, t * y * z + s * x, t * z * z + c, 0],
+      [0, 0, 0, 1],
+    ];
+  }
+  if (position) {
+    m[0][3] = position[0];
+    m[1][3] = position[1];
+    m[2][3] = position[2];
+  }
+  return m;
+}
+
+server.tool(
+  "assembly_create",
+  "Create a TRUE assembly: a named scene of positioned part INSTANCES (not a " +
+    "boolean merge). Returns the assembly id. Add instances with " +
+    "`assembly_add_instance`, then SEE the whole thing with `assembly_view`. " +
+    "Instances REFERENCE parts by id and reuse their geometry — the same part " +
+    "can be placed many times.",
+  { name: z.string().min(1).describe("display name, e.g. 'gearbox'") },
+  async ({ name }) => {
+    try {
+      const r = await api("POST", "/api/assembly", { name });
+      return ok({ assembly_id: r.id, name });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "assembly_add_instance",
+  "Place an INSTANCE of an existing part into an assembly at a world pose. The " +
+    "part is REFERENCED by id (and reused) — call this twice with the same " +
+    "part_id at different positions to instance one part many times, no copy. " +
+    "Pose: give `position` [x,y,z] (mm) and optionally `rotation_deg` about " +
+    "`rotation_axis`, OR a raw row-major `transform` 4×4. Returns the new " +
+    "instance id plus the assembly's perception (instance_count, " +
+    "unique_part_count = distinct parts, per-instance soundness, combined bbox).",
+  {
+    assembly_id: z.string().describe("assembly id from assembly_create"),
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    position: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("world translation [x,y,z] mm"),
+    rotation_deg: z.number().optional().describe("rotation angle in degrees"),
+    rotation_axis: z
+      .array(z.number())
+      .length(3)
+      .optional()
+      .describe("unit axis for rotation_deg, e.g. [0,0,1]"),
+    transform: z
+      .array(z.array(z.number()).length(4))
+      .length(4)
+      .optional()
+      .describe("raw row-major 4×4 (overrides position/rotation)"),
+    name: z.string().optional().describe("placement name, e.g. 'wheel-FL'"),
+    color: z
+      .array(z.number().int().min(0).max(255))
+      .length(3)
+      .optional()
+      .describe("per-instance RGB"),
+  },
+  async ({
+    assembly_id,
+    part_id,
+    position,
+    rotation_deg,
+    rotation_axis,
+    transform,
+    name,
+    color,
+  }) => {
+    try {
+      const t =
+        transform ??
+        buildTransform(
+          position as [number, number, number] | undefined,
+          rotation_deg,
+          rotation_axis as [number, number, number] | undefined,
+        );
+      const r = await api(
+        "POST",
+        `/api/assembly/${assembly_id}/instance`,
+        { part_id, transform: t, name, color },
+      );
+      return ok(r);
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "assembly_list_instances",
+  "List an assembly's instances with full PERCEPTION: instance_count, " +
+    "unique_part_count (distinct parts — the gap from instance_count is the " +
+    "reuse), each instance's part_id / transform / resolved solid / soundness " +
+    "(from the part's validity certificate), the combined world bbox, and " +
+    "all_sound. This is how you confirm instancing is real (one part, many " +
+    "instances) and that every placed part is a sound solid.",
+  { assembly_id: z.string() },
+  async ({ assembly_id }) => {
+    try {
+      return ok(await api("GET", `/api/assembly/${assembly_id}`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "assembly_transform_instance",
+  "Re-pose ONE instance in an assembly without touching the others or the " +
+    "referenced part. Give `position`/`rotation_deg`/`rotation_axis` or a raw " +
+    "`transform`. Returns the updated assembly perception.",
+  {
+    assembly_id: z.string(),
+    instance_id: z.string().describe("instance id from assembly_list_instances"),
+    position: z.array(z.number()).length(3).optional(),
+    rotation_deg: z.number().optional(),
+    rotation_axis: z.array(z.number()).length(3).optional(),
+    transform: z.array(z.array(z.number()).length(4)).length(4).optional(),
+  },
+  async ({
+    assembly_id,
+    instance_id,
+    position,
+    rotation_deg,
+    rotation_axis,
+    transform,
+  }) => {
+    try {
+      const t =
+        transform ??
+        buildTransform(
+          position as [number, number, number] | undefined,
+          rotation_deg,
+          rotation_axis as [number, number, number] | undefined,
+        );
+      return ok(
+        await api(
+          "PATCH",
+          `/api/assembly/${assembly_id}/instance/${instance_id}`,
+          { transform: t },
+        ),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "assembly_view",
+  "SEE A WHOLE ASSEMBLY: composite EVERY instance into one image, each part " +
+    "rendered at its instance transform (reused geometry, not copied), from an " +
+    "orbit camera (azimuth/elevation, world-Z up). This is the scene-eye for a " +
+    "named assembly — the way to look at a positioned multi-part scene as a " +
+    "whole. Change az/el to orbit. `mode:'diagnostic'` highlights open (red) / " +
+    "non-manifold (magenta) edges.",
+  {
+    assembly_id: z.string(),
+    az: z.number().default(35).describe("azimuth degrees around world Z"),
+    el: z.number().default(20).describe("elevation degrees above horizon"),
+    mode: z
+      .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
+      .default("shaded"),
+    size: z.number().int().min(64).max(2048).default(720),
+    quality: z.enum(["coarse", "medium", "fine"]).default("medium"),
+  },
+  async ({ assembly_id, az, el, mode, size, quality }) => {
+    try {
+      const r = await api(
+        "GET",
+        `/api/assembly/${assembly_id}/view?az=${az}&el=${el}&mode=${mode}&size=${size}&quality=${quality}`,
+      );
+      return {
+        content: [
+          { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+          {
+            type: "text" as const,
+            text:
+              `assembly az=${az}° el=${el}° instances=${r.instance_count} ` +
+              `distinct_parts=${r.unique_part_count} open=${r.open_edges} nm=${r.nonmanifold_edges}`,
+          },
+        ],
+      };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ════════════════════════ END ASSEMBLY TOOLS ════════════════════════════
+
 // ─── main ──────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();

@@ -7,6 +7,7 @@
 //! - Delta updates for real-time sync
 //! - Full AI integration with session awareness
 
+mod assembly_instances;
 mod assembly_mgr;
 mod auth_middleware;
 mod blackboard;
@@ -201,6 +202,13 @@ pub struct AppState {
     /// which owns the simpler project-tree DTOs from `shared-types`.
     /// See `assembly_mgr.rs`.
     pub assemblies: Arc<assembly_mgr::AssemblyManager>,
+
+    /// Positioned-INSTANCE assemblies (#19): reference-only part instances
+    /// (`part_id` + transform), the scaling pillar for 100-part scenes.
+    /// Distinct from `assemblies` above (mate-centric, copies geometry):
+    /// here geometry is referenced and composited at render time, never
+    /// copied. See `assembly_instances.rs`.
+    pub instanced_assemblies: Arc<assembly_instances::InstancedAssemblyManager>,
     /// Drawing registry — 2D views projected from kernel solids,
     /// SVG-renderable. Distinct lifecycle from assemblies; views
     /// resolve solid ids against the active model at projection time.
@@ -6680,6 +6688,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeline_recorder.clone()
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
+        // Positioned-instance assemblies (#19). Reference-only, no
+        // geometry copy, no recorder bridge needed — the instance list
+        // is pure scene data composited against the active model at
+        // render time. See assembly_instances.rs.
+        instanced_assemblies: Arc::new(assembly_instances::InstancedAssemblyManager::new()),
         // Drawings share the same timeline recorder so view-add /
         // view-remove events land on the active branch alongside
         // every other kernel mutation. See drawing_mgr.rs.
@@ -7015,6 +7028,32 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/csketch/{id}/infer-constraints",
             post(csketch::infer_constraints_handler),
+        )
+        // Positioned-INSTANCE assemblies (#19) — reference-only part
+        // instances composited at render time (no geometry copy). The
+        // scaling pillar for 100-part scenes. Singular `/api/assembly`
+        // namespace, distinct from the mate-centric plural
+        // `/api/assemblies` below. See `assembly_instances.rs`.
+        .route(
+            "/api/assembly",
+            post(assembly_instances::create_assembly).get(assembly_instances::list_assemblies),
+        )
+        .route(
+            "/api/assembly/{id}",
+            get(assembly_instances::get_assembly).delete(assembly_instances::delete_assembly),
+        )
+        .route(
+            "/api/assembly/{id}/instance",
+            post(assembly_instances::add_instance),
+        )
+        .route(
+            "/api/assembly/{id}/instance/{iid}",
+            axum::routing::patch(assembly_instances::transform_instance)
+                .delete(assembly_instances::remove_instance),
+        )
+        .route(
+            "/api/assembly/{id}/view",
+            get(assembly_instances::view_assembly),
         )
         // Kernel assemblies — multi-part scenes, mates, solver,
         // exploded views, interference reports. Distinct from the
