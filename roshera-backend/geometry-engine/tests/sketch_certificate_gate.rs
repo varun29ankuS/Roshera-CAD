@@ -494,3 +494,117 @@ fn adversarial_empty_sketch_certifies_without_panic() {
     assert!(cert.constraint_consistent, "no constraints, no conflict");
     assert!(cert.entities_valid, "no entities, none invalid");
 }
+
+// ── Iteration 1: conflict-type coverage + scale ────────────────────────────
+
+/// GEOMETRIC H/V conflict: a line forced both Horizontal AND Vertical. There is
+/// no direction satisfying both — must be caught (exercises the Horizontal/
+/// Vertical arm of the geometric conflict table).
+#[test]
+fn adversarial_horizontal_and_vertical_conflict() {
+    let sketch = Sketch::new("h-v".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let line = sketch.add_line(a, b).expect("edge");
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Horizontal,
+        vec![EntityRef::Line(line)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Vertical,
+        vec![EntityRef::Line(line)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "horizontal AND vertical is unsatisfiable: {cert:?}"
+    );
+    assert!(!cert.is_sound(), "an H+V line is unsound");
+}
+
+/// DIMENSIONAL conflict on a circle: two Radius constraints demanding different
+/// values. Must be caught (radius analogue of the distance=10 ∧ distance=20 case).
+#[test]
+fn adversarial_two_radii_conflict() {
+    let sketch = Sketch::new("two-radii".to_string(), SketchAnchor::xy());
+    let circle = sketch
+        .add_circle(Point2d::new(0.0, 0.0), 5.0)
+        .expect("circle");
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Radius(5.0),
+        vec![EntityRef::Circle(circle)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Radius(8.0),
+        vec![EntityRef::Circle(circle)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "radius=5 AND radius=8 cannot both hold: {cert:?}"
+    );
+    assert!(!cert.is_sound(), "a doubly-radius'd circle is unsound");
+}
+
+/// CROSS-TYPE dimensional conflict: Radius(3) and Diameter(10) on the same circle
+/// imply radius 3 vs radius 5 — contradictory. This stresses whether the conflict
+/// detector relates radius and diameter (not just same-variant duplicates).
+#[test]
+fn adversarial_radius_diameter_conflict() {
+    let sketch = Sketch::new("r-d".to_string(), SketchAnchor::xy());
+    let circle = sketch
+        .add_circle(Point2d::new(0.0, 0.0), 4.0)
+        .expect("circle");
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Radius(3.0),
+        vec![EntityRef::Circle(circle)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Diameter(10.0),
+        vec![EntityRef::Circle(circle)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "radius=3 implies diameter=6, contradicting diameter=10: {cert:?}"
+    );
+    assert!(!cert.is_sound(), "a radius/diameter mismatch is unsound");
+}
+
+/// SCALE + DETERMINISM: a dense (40-vertex) non-self-crossing open polyline must
+/// certify without panic, stay sound, and yield an identical verdict twice — the
+/// all-pairs self-intersection scan and the analysis must hold up under size.
+#[test]
+fn adversarial_dense_polyline_is_sound_and_deterministic() {
+    let sketch = Sketch::new("dense".to_string(), SketchAnchor::xy());
+    // A monotone staircase: strictly increasing x guarantees no self-crossing.
+    let mut verts = Vec::new();
+    for i in 0..40u32 {
+        let x = i as f64;
+        let y = if i % 2 == 0 { 0.0 } else { 1.0 };
+        verts.push(Point2d::new(x, y));
+    }
+    sketch.add_polyline(verts, false).expect("dense polyline");
+
+    let c1 = certify_sketch(&sketch);
+    let c2 = certify_sketch(&sketch);
+    assert!(
+        c1.self_intersection_free,
+        "a monotone staircase does not self-cross: {c1:?}"
+    );
+    assert!(c1.is_sound(), "a clean dense polyline is sound");
+    assert_eq!(
+        c1.constrainedness, c2.constrainedness,
+        "dense-sketch verdict must be deterministic"
+    );
+    assert_eq!(
+        c1.self_intersection_free, c2.self_intersection_free,
+        "dense self-intersection scan must be deterministic"
+    );
+}
