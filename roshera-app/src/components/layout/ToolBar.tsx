@@ -28,6 +28,7 @@ import {
   Pipette,
   Eye,
   FileDown,
+  FileUp,
   CircleDot,
   Torus,
   Component,
@@ -1507,6 +1508,19 @@ export function ToolBar() {
             { icon: FileDown, label: 'STEP', action: () => sendDirectExport('STEP') },
             { icon: FileDown, label: 'STL', action: () => sendDirectExport('STL') },
             { icon: FileDown, label: 'OBJ', action: () => sendDirectExport('OBJ') },
+          ],
+        },
+        {
+          label: 'Import',
+          items: [
+            // Opens the StepImportDropzone's native file picker (which also
+            // accepts drag-and-drop onto the viewport). Lives here under Export
+            // rather than as a floating overlay button.
+            {
+              icon: FileUp,
+              label: 'STEP',
+              action: () => window.dispatchEvent(new CustomEvent('roshera:open-step-import')),
+            },
           ],
         },
       ],
