@@ -29,6 +29,7 @@ pub mod poke_matrix;
 pub mod revolve;
 pub mod self_intersection;
 pub mod shell;
+pub mod sketch_validity;
 pub mod sweep;
 pub mod tessellation;
 pub mod tessellation_oracle;
