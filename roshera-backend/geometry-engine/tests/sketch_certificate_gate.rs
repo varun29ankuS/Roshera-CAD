@@ -731,3 +731,75 @@ fn adversarial_collinear_and_parallel_is_consistent() {
         "collinear implies parallel — they agree, not conflict: {cert:?}"
     );
 }
+
+// ── Iteration 4: transitive / global inconsistency (DCM-grade tier) ─────────
+
+/// Equal(c1,c2) ties the two radii; Radius(c1)=5 and Radius(c2)=8 then demand
+/// 5 == 8. The Equal row is linearly dependent on the two Radius rows, so the
+/// rank-based diagnosis SHOULD catch it post-solve. Probe to confirm.
+#[test]
+fn adversarial_equal_circles_with_different_radii_conflict() {
+    let sketch = Sketch::new("equal-radii".to_string(), SketchAnchor::xy());
+    let c1 = sketch.add_circle(Point2d::new(0.0, 0.0), 5.0).expect("c1");
+    let c2 = sketch.add_circle(Point2d::new(30.0, 0.0), 8.0).expect("c2");
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Equal,
+        vec![EntityRef::Circle(c1), EntityRef::Circle(c2)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Radius(5.0),
+        vec![EntityRef::Circle(c1)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Radius(8.0),
+        vec![EntityRef::Circle(c2)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "equal radii forced to 5 and 8 is contradictory: {cert:?}"
+    );
+    assert!(
+        !cert.is_sound(),
+        "equal-circles with r=5 and r=8 is unsound"
+    );
+}
+
+/// TRANSITIVE coincidence vs distance: a≡b and b≡c (so a≡c transitively), yet
+/// Distance(a,c)=10. No pairwise check sees Coincident(a,c), and the distance
+/// gradient at coincident points is degenerate — the genuinely hard case that
+/// needs transitive-closure reasoning over Coincident.
+#[test]
+fn adversarial_transitive_coincidence_vs_distance_conflict() {
+    let sketch = Sketch::new("transitive".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(20.0, 0.0));
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Coincident,
+        vec![EntityRef::Point(a), EntityRef::Point(b)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Coincident,
+        vec![EntityRef::Point(b), EntityRef::Point(c)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Distance(10.0),
+        vec![EntityRef::Point(a), EntityRef::Point(c)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "a≡b≡c forces a≡c, contradicting distance(a,c)=10: {cert:?}"
+    );
+    assert!(
+        !cert.is_sound(),
+        "transitive coincidence vs distance is unsound"
+    );
+}
