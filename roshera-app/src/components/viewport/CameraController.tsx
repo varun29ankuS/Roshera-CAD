@@ -97,6 +97,11 @@ export function CameraController() {
   // level so R3F's `e.stopPropagation()` doesn't reach it; gating
   // `enableRotate` here is the only reliable suppression.
   const gizmoDragging = useSceneStore((s) => s.gizmoDragging)
+  // Sketch mode: on ENTRY, snap the camera normal-to the sketch plane so the
+  // 2D profile reads face-on instead of as a foreshortened diagonal.
+  const sketchActive = useSceneStore((s) => s.sketch.active)
+  const sketchPlane = useSceneStore((s) => s.sketch.plane)
+  const wasSketchingRef = useRef(false)
 
   // Scene-adaptive framing: recompute the world bounding sphere whenever the
   // object set changes, and derive the dolly range from it. The clip planes are
@@ -182,6 +187,56 @@ export function CameraController() {
 
     clearPending()
   }, [pendingPreset, camera, clearPending])
+
+  // Sketch-plane look-at. Every CAD sketcher orients the view normal-to the
+  // active sketch plane on entry so the 2D profile is face-on and EDITABLE —
+  // without it an XZ/YZ sketch on an iso camera reads as an unreadable
+  // foreshortened diagonal. Fires only on the false→true transition (the
+  // `wasSketchingRef` guard) so adding geometry mid-sketch doesn't re-snap.
+  useEffect(() => {
+    const entering = sketchActive && !wasSketchingRef.current
+    wasSketchingRef.current = sketchActive
+    if (!entering || !controlsRef.current) return
+
+    // View offset (camera sits along this from the target) + screen-up, per
+    // plane, matching CAD convention (Top / Front / Right).
+    let offset: THREE.Vector3
+    let up: THREE.Vector3
+    if (sketchPlane === 'xy') {
+      offset = new THREE.Vector3(0, 0, 1)
+      up = new THREE.Vector3(0, 1, 0)
+    } else if (sketchPlane === 'xz') {
+      offset = new THREE.Vector3(0, -1, 0)
+      up = new THREE.Vector3(0, 0, 1)
+    } else if (sketchPlane === 'yz') {
+      offset = new THREE.Vector3(1, 0, 0)
+      up = new THREE.Vector3(0, 0, 1)
+    } else {
+      // Custom plane: face its normal (u × v), keep its v-axis upright.
+      const u = new THREE.Vector3(...sketchPlane.u_axis)
+      const v = new THREE.Vector3(...sketchPlane.v_axis)
+      offset = new THREE.Vector3().crossVectors(u, v).normalize()
+      up = v.clone().normalize()
+      if (offset.lengthSq() < 1e-9) offset = new THREE.Vector3(0, 0, 1)
+    }
+
+    const center = sceneBounds.center.clone()
+    let distance = sceneBounds.radius * 2.5
+    const persp = perspRef.current
+    if (persp && (camera as THREE.PerspectiveCamera).isPerspectiveCamera) {
+      const fov = (persp.fov * Math.PI) / 180
+      distance = (sceneBounds.radius / Math.tan(fov / 2)) * 1.4
+    }
+
+    animRef.current = {
+      startPosition: camera.position.clone(),
+      startTarget: controlsRef.current.target.clone(),
+      endPosition: center.clone().addScaledVector(offset, distance),
+      endTarget: center,
+      endUp: up,
+      progress: 0,
+    }
+  }, [sketchActive, sketchPlane, sceneBounds, camera])
 
   // Auto-frame newly-created objects. ws-bridge sets this whenever a
   // brand-new object id appears in the scene (ObjectCreated, or a

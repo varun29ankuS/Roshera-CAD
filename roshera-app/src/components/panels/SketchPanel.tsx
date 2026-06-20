@@ -967,8 +967,14 @@ function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps)
   }
   return (
     <div className="flex items-start gap-3 pt-1 border-t border-border/30">
-      <span className="text-muted-foreground text-[10px] mt-1">Segments</span>
-      <div className="flex flex-wrap items-center gap-2 flex-1">
+      <span className="text-muted-foreground text-[10px] mt-1 whitespace-nowrap">
+        Segments <span className="opacity-50">({segments.length})</span>
+      </span>
+      {/* Cap the editable-segment list to a small scrollable box. A dense or
+          agent-built profile can have dozens of segments; dumping every length
+          field across the canvas (the old behaviour) buried half the viewport
+          and made the sketch impossible to read/audit. */}
+      <div className="flex flex-wrap items-center gap-2 flex-1 max-h-[4.5rem] overflow-y-auto pr-1">
         {segments.map((s) => (
           <NumberField
             key={s.i}
