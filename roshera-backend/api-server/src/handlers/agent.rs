@@ -865,6 +865,41 @@ pub async fn scene_orbit(
 // ───────────────────── ground truth (PILLAR 1) ──────────────────────
 
 /// The kernel's self-reported ground truth for a solid: provenance (what op made
+/// Per-face display-tessellation defect — the agent's pointer to exactly which
+/// face renders wrong, without rendering a pixel.
+#[derive(Debug, Clone, Serialize)]
+pub struct TessFaceDefectResponse {
+    pub face_id: u64,
+    pub triangles: usize,
+    pub degenerate_triangles: usize,
+    pub normal_agreement: f64,
+    /// Winding-vs-TRUE-surface-normal agreement for this face — the decisive
+    /// scribble signal (a bore whose stored normals are wrong-but-consistent
+    /// drops here while `normal_agreement` stays high).
+    pub analytic_normal_agreement: f64,
+}
+
+/// Display-tessellation quality — the render-mesh analogue of B-Rep soundness.
+/// A watertight + manifold solid can still tessellate to a degenerate /
+/// inverted-normal mesh (the inner-bore scribble); `clean == false` is that
+/// defect, surfaced so the agent can SEE it without a render round-trip.
+#[derive(Debug, Clone, Serialize)]
+pub struct TessQualityResponse {
+    pub clean: bool,
+    pub triangles: usize,
+    pub degenerate_triangles: usize,
+    /// Fraction of facets whose winding normal agrees with their stored
+    /// (analytic-intent) vertex normals. `1.0` = every facet shaded correctly.
+    pub normal_agreement: f64,
+    /// Fraction of facets whose winding normal agrees with the TRUE surface
+    /// normal at the facet centroid — the ground-truth scribble check.
+    pub analytic_normal_agreement: f64,
+    pub inconsistent_facets: usize,
+    /// Facets pointing into the wrong hemisphere of the true surface normal.
+    pub off_surface_facets: usize,
+    pub worst_face: Option<TessFaceDefectResponse>,
+}
+
 /// it, designed vs bare primitive) + a COMPUTED validity certificate.
 #[derive(Debug, Clone, Serialize)]
 pub struct TruthResponse {
@@ -887,8 +922,14 @@ pub struct TruthResponse {
     /// a holding assertion? "consistent" / "inconsistent" / "not_applicable".
     /// An annotation flag — does NOT affect `sound`.
     pub labels_consistent: String,
+    /// Display-tessellation quality: `false` ⇒ the render mesh is degenerate or
+    /// has inverted normals (the inner-bore scribble) even if the B-Rep is sound.
+    /// Factored into `sound`.
+    pub tessellation_clean: bool,
+    /// Full tessellation-quality breakdown incl. the worst defective face.
+    pub tessellation: TessQualityResponse,
     /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold
-    /// ∧ self-intersection-free ∧ construction-consistent).
+    /// ∧ self-intersection-free ∧ construction-consistent ∧ tessellation-clean).
     pub sound: bool,
     pub errors: Vec<String>,
     pub summary: String,
@@ -931,6 +972,27 @@ pub async fn part_truth(
         euler_characteristic: c.euler_characteristic,
         construction_consistent: c.construction_consistent.label().to_string(),
         labels_consistent: c.labels_consistent.label().to_string(),
+        tessellation_clean: c.tessellation.clean,
+        tessellation: TessQualityResponse {
+            clean: c.tessellation.clean,
+            triangles: c.tessellation.triangles,
+            degenerate_triangles: c.tessellation.degenerate_triangles,
+            normal_agreement: c.tessellation.normal_agreement,
+            analytic_normal_agreement: c.tessellation.analytic_normal_agreement,
+            inconsistent_facets: c.tessellation.inconsistent_facets,
+            off_surface_facets: c.tessellation.off_surface_facets,
+            worst_face: c
+                .tessellation
+                .worst_face
+                .as_ref()
+                .map(|w| TessFaceDefectResponse {
+                    face_id: w.face_id,
+                    triangles: w.triangles,
+                    degenerate_triangles: w.degenerate_triangles,
+                    normal_agreement: w.normal_agreement,
+                    analytic_normal_agreement: w.analytic_normal_agreement,
+                }),
+        },
         sound: c.is_sound(),
         errors: c.errors.clone(),
         summary: gt.summary(),

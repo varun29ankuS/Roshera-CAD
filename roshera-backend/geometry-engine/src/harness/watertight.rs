@@ -274,6 +274,273 @@ pub fn manifold_report(
     })
 }
 
+/// Display-tessellation quality verdict for `solid` — the render-mesh analogue of
+/// [`manifold_report`]'s topological check, measured at the **display density**
+/// the viewport/exporter actually ships (`TessellationParams::default()`), not a
+/// coarse audit chord, because a scribble can be density-dependent.
+///
+/// Per face (via the mesh `face_map`) it computes three things:
+/// 1. **degenerate** zero-area facets;
+/// 2. **stored-normal agreement** — winding `(p1−p0)×(p2−p0)` vs the stored vertex
+///    normals (catches a facet shaded against its own geometry);
+/// 3. **analytic-normal agreement** — winding vs the TRUE surface normal at the
+///    facet centroid (`surface.closest_point` → `normal_at`, oriented by face
+///    sense). This is the ground-truth check: an inner-bore scribble whose stored
+///    normals are wrong-but-self-consistent passes (2) but fails (3), because the
+///    off-radial facets disagree with the actual analytic surface.
+///
+/// Returns the aggregate plus the single **worst face** — a deterministic pointer
+/// (lowest analytic agreement, then stored, then most-degenerate, then lowest id)
+/// the agent can act on without rendering. `None` if the solid is missing or
+/// tessellates to nothing.
+pub fn tessellation_quality(
+    model: &BRepModel,
+    solid: SolidId,
+) -> Option<crate::primitives::provenance::TessellationQuality> {
+    use crate::primitives::provenance::{TessFaceDefect, TessellationQuality};
+    use std::cmp::Ordering::Equal;
+    let solid_ref = model.solids.get(solid)?;
+    let params = TessellationParams::default();
+    let mesh = tessellate_solid(solid_ref, model, &params);
+    if mesh.triangles.is_empty() {
+        return None;
+    }
+    let has_faces = mesh.face_map.len() == mesh.triangles.len();
+    let tol = model.tolerance;
+
+    // Per-face: (triangles, degenerate, stored_agree, analytic_agree, comparable).
+    let mut per_face: HashMap<u32, (usize, usize, usize, usize, usize)> = HashMap::new();
+    let mut degenerate_triangles = 0usize;
+    let mut stored_agree = 0usize;
+    let mut analytic_agree = 0usize;
+    let mut comparable = 0usize;
+
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        let v0 = mesh.vertices[tri[0] as usize];
+        let v1 = mesh.vertices[tri[1] as usize];
+        let v2 = mesh.vertices[tri[2] as usize];
+        let geo = (v1.position - v0.position).cross(&(v2.position - v0.position));
+        let fid = if has_faces { mesh.face_map[i] } else { 0 };
+        let entry = per_face.entry(fid).or_insert((0, 0, 0, 0, 0));
+        entry.0 += 1;
+        if geo.magnitude() <= 1e-12 {
+            degenerate_triangles += 1;
+            entry.1 += 1;
+            continue;
+        }
+        comparable += 1;
+        entry.4 += 1;
+        // (1) stored-normal agreement.
+        let stored = v0.normal + v1.normal + v2.normal;
+        if stored.dot(&geo) > 0.0 {
+            stored_agree += 1;
+            entry.2 += 1;
+        }
+        // (2) analytic-normal agreement (ground truth). Unresolvable normal ⇒
+        // treat as agreeing rather than manufacture a false defect.
+        if analytic_facet_agrees(
+            model,
+            fid,
+            &v0.position,
+            &v1.position,
+            &v2.position,
+            &geo,
+            tol,
+        )
+        .unwrap_or(true)
+        {
+            analytic_agree += 1;
+            entry.3 += 1;
+        }
+    }
+
+    let normal_agreement = if comparable == 0 {
+        1.0
+    } else {
+        stored_agree as f64 / comparable as f64
+    };
+    let analytic_normal_agreement = if comparable == 0 {
+        1.0
+    } else {
+        analytic_agree as f64 / comparable as f64
+    };
+    let inconsistent_facets = comparable.saturating_sub(stored_agree);
+    let off_surface_facets = comparable.saturating_sub(analytic_agree);
+
+    // Worst defective face, chosen deterministically.
+    let mut defects: Vec<TessFaceDefect> = per_face
+        .into_iter()
+        .filter_map(|(fid, (tris, degen, st_a, an_a, cmp))| {
+            let na = if cmp == 0 {
+                1.0
+            } else {
+                st_a as f64 / cmp as f64
+            };
+            let aa = if cmp == 0 {
+                1.0
+            } else {
+                an_a as f64 / cmp as f64
+            };
+            let clean_face = degen == 0
+                && na >= TessellationQuality::MIN_NORMAL_AGREEMENT
+                && aa >= TessellationQuality::MIN_ANALYTIC_AGREEMENT;
+            if clean_face {
+                return None;
+            }
+            Some(TessFaceDefect {
+                face_id: fid as u64,
+                triangles: tris,
+                degenerate_triangles: degen,
+                normal_agreement: na,
+                analytic_normal_agreement: aa,
+            })
+        })
+        .collect();
+    defects.sort_by(|a, b| {
+        a.analytic_normal_agreement
+            .partial_cmp(&b.analytic_normal_agreement)
+            .unwrap_or(Equal)
+            .then(
+                a.normal_agreement
+                    .partial_cmp(&b.normal_agreement)
+                    .unwrap_or(Equal),
+            )
+            .then(b.degenerate_triangles.cmp(&a.degenerate_triangles))
+            .then(a.face_id.cmp(&b.face_id))
+    });
+    let worst_face = defects.into_iter().next();
+
+    Some(TessellationQuality::evaluate(
+        mesh.triangles.len(),
+        degenerate_triangles,
+        normal_agreement,
+        analytic_normal_agreement,
+        inconsistent_facets,
+        off_surface_facets,
+        worst_face,
+    ))
+}
+
+/// `Some(true)` if the facet's winding normal `geo` sits in the same hemisphere as
+/// the TRUE surface normal at the facet centroid (oriented by the owning face's
+/// sense); `Some(false)` if it points the wrong way (off-surface / scribbled).
+/// `None` when the face / surface / normal can't be resolved (caller treats as
+/// agreeing).
+fn analytic_facet_agrees(
+    model: &BRepModel,
+    face_id: u32,
+    p0: &crate::math::Point3,
+    p1: &crate::math::Point3,
+    p2: &crate::math::Point3,
+    geo: &crate::math::Vector3,
+    tol: crate::math::Tolerance,
+) -> Option<bool> {
+    let face = model.faces.get(face_id)?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    let centroid = crate::math::Point3::new(
+        (p0.x + p1.x + p2.x) / 3.0,
+        (p0.y + p1.y + p2.y) / 3.0,
+        (p0.z + p1.z + p2.z) / 3.0,
+    );
+    let (u, v) = surface.closest_point(&centroid, tol).ok()?;
+    let n = surface.normal_at(u, v).ok()?;
+    let oriented = n * face.orientation.sign();
+    Some(oriented.dot(geo) > 0.0)
+}
+
+/// Pure per-mesh tessellation-quality scoring — the heart of
+/// [`tessellation_quality`], split out so it can be unit-tested against
+/// hand-built meshes (a deliberately inverted-normal facet, a zero-area sliver)
+/// without driving a tessellator. Reads the mesh `face_map` for per-face
+/// localisation; falls back to a single face id `0` when the map is absent.
+pub fn score_mesh_tessellation(
+    mesh: &crate::tessellation::mesh::TriangleMesh,
+) -> crate::primitives::provenance::TessellationQuality {
+    use crate::primitives::provenance::{TessFaceDefect, TessellationQuality};
+    let has_faces = mesh.face_map.len() == mesh.triangles.len();
+
+    // Per-face accumulators: (triangles, degenerate, agree, comparable).
+    let mut per_face: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
+    let mut degenerate_triangles = 0usize;
+    let mut agree = 0usize;
+    let mut comparable = 0usize;
+
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        let v0 = mesh.vertices[tri[0] as usize];
+        let v1 = mesh.vertices[tri[1] as usize];
+        let v2 = mesh.vertices[tri[2] as usize];
+        let geo = (v1.position - v0.position).cross(&(v2.position - v0.position));
+        let fid = if has_faces { mesh.face_map[i] } else { 0 };
+        let entry = per_face.entry(fid).or_insert((0, 0, 0, 0));
+        entry.0 += 1;
+        if geo.magnitude() <= 1e-12 {
+            degenerate_triangles += 1;
+            entry.1 += 1;
+            continue;
+        }
+        comparable += 1;
+        entry.3 += 1;
+        // Stored vertex normals = the analytic intent; winding = the geometry.
+        let stored = v0.normal + v1.normal + v2.normal;
+        if stored.dot(&geo) > 0.0 {
+            agree += 1;
+            entry.2 += 1;
+        }
+    }
+
+    let normal_agreement = if comparable == 0 {
+        1.0
+    } else {
+        agree as f64 / comparable as f64
+    };
+    let inconsistent_facets = comparable.saturating_sub(agree);
+
+    // Worst defective face, chosen deterministically (HashMap order is arbitrary):
+    // lowest per-face agreement, then most degenerate, then lowest face id.
+    let mut defects: Vec<TessFaceDefect> = per_face
+        .into_iter()
+        .filter_map(|(fid, (tris, degen, fa_agree, fa_cmp))| {
+            let fa = if fa_cmp == 0 {
+                1.0
+            } else {
+                fa_agree as f64 / fa_cmp as f64
+            };
+            if degen == 0 && fa >= TessellationQuality::MIN_NORMAL_AGREEMENT {
+                return None; // this face is clean
+            }
+            Some(TessFaceDefect {
+                face_id: fid as u64,
+                triangles: tris,
+                degenerate_triangles: degen,
+                normal_agreement: fa,
+                // Mesh-only scorer has no surface access; analytic agreement is
+                // the full `tessellation_quality` path's job.
+                analytic_normal_agreement: 1.0,
+            })
+        })
+        .collect();
+    defects.sort_by(|a, b| {
+        a.normal_agreement
+            .partial_cmp(&b.normal_agreement)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.degenerate_triangles.cmp(&a.degenerate_triangles))
+            .then(a.face_id.cmp(&b.face_id))
+    });
+    let worst_face = defects.into_iter().next();
+
+    // Mesh-only verdict: analytic agreement defaults to perfect (no surface
+    // access here); off-surface facets = 0.
+    TessellationQuality::evaluate(
+        mesh.triangles.len(),
+        degenerate_triangles,
+        normal_agreement,
+        1.0,
+        inconsistent_facets,
+        0,
+        worst_face,
+    )
+}
+
 /// Convenience: is `solid` a valid closed, oriented 2-manifold at the given
 /// chord tolerance? Uses a `1e-6` weld epsilon.
 pub fn is_manifold(model: &BRepModel, solid: SolidId, chord: f64) -> bool {

@@ -215,9 +215,14 @@ server.tool(
     "designed surface — nurbs_loft / revolve / extrude / loft / sweep / boolean / " +
     "fillet / chamfer — vs a bare PRIMITIVE stand-in like a box/cylinder) and the " +
     "kernel-COMPUTED validity certificate (brep_valid, watertight, manifold, " +
-    "euler, sound + a one-line summary). The kernel cannot misrepresent this, so " +
-    "use it to confirm a build is a genuine closed DESIGNED solid before trusting " +
-    "or reporting it — `designed:false`/`sound:false` means stop and fix, not ship.",
+    "euler, sound + a one-line summary). ALSO returns `tessellation` — the DISPLAY-" +
+    "MESH verdict: `tessellation_clean:false` means the render mesh is degenerate " +
+    "or has inverted normals (e.g. a bored cylinder's inner wall tessellating to a " +
+    "scribble) even when the B-Rep is watertight; `tessellation.worst_face` names " +
+    "the exact face so you can SEE the defect without rendering. The kernel cannot " +
+    "misrepresent this, so use it to confirm a build is a genuine closed DESIGNED " +
+    "solid that also RENDERS correctly before trusting or reporting it — " +
+    "`designed:false`/`sound:false` (now incl. a bad display mesh) means stop and fix, not ship.",
   { part_id: z.number().int().describe("kernel part id from list_parts") },
   async ({ part_id }) => {
     try {

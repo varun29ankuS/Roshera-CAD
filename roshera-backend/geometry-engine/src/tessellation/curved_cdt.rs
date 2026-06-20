@@ -614,16 +614,81 @@ fn run_cdt(
     // CDT treats them as floating constraint anchors.
     pts2d.extend_from_slice(steiner);
 
+    // ── Constraint sanitiser (curved-CDT robustness) ───────────────────────
+    // The `cdt` crate `assert!`s "failed to create fixed edge" whenever two of
+    // the points it is given are coincident — it dedups them, and if either was
+    // a fixed-edge (contour) endpoint the edge collapses to a point. This is the
+    // dominant curved-CDT failure on a TRIMMED cylinder — a bore interrupted by
+    // a pocket — where shared boundary vertices (and steiner anchors landing on
+    // them) project to identical UV (panic trace: `on_outer_edge=0`,
+    // `dup_pairs≫0`, `min_pair_dist≈1e-16`). Unsanitised it panicked → the
+    // catch_unwind fallback produced the skewed "scribble" at the junction.
+    //
+    // Fix: build a COMPACT, duplicate-free point set for `cdt` by welding
+    // coincident points to their FIRST occurrence — which (because `pts2d` is
+    // laid out outer | inner | steiner) is a *boundary* sample whenever one
+    // coincides, so the watertight cached-sample contract is preserved. Remap
+    // the contours onto the compact set, run `cdt` on it, then map the output
+    // triangle indices BACK to the original `pts2d` layout so the downstream
+    // boundary/steiner index→3D resolution is unchanged.
+    const WELD_UV: f64 = 1e-9;
+    let mut canon: std::collections::HashMap<(i64, i64), usize> =
+        std::collections::HashMap::with_capacity(pts2d.len());
+    let mut orig_to_compact: Vec<usize> = Vec::with_capacity(pts2d.len());
+    let mut compact_to_orig: Vec<usize> = Vec::new();
+    let mut compact_pts: Vec<(f64, f64)> = Vec::new();
+    for (i, &p) in pts2d.iter().enumerate() {
+        let k = (
+            (p.0 / WELD_UV).round() as i64,
+            (p.1 / WELD_UV).round() as i64,
+        );
+        let c = *canon.entry(k).or_insert_with(|| {
+            compact_to_orig.push(i);
+            compact_pts.push(p);
+            compact_pts.len() - 1
+        });
+        orig_to_compact.push(c);
+    }
+    let mut compact_contours: Vec<Vec<usize>> = Vec::with_capacity(contours.len());
+    for (ci, c) in contours.iter().enumerate() {
+        // Remap and drop consecutive duplicates (contours are stored closed,
+        // i.e. last == first).
+        let mut rc: Vec<usize> = Vec::with_capacity(c.len());
+        for &vi in c {
+            let r = orig_to_compact[vi];
+            if rc.last() != Some(&r) {
+                rc.push(r);
+            }
+        }
+        if rc.len() >= 2 && rc.first() == rc.last() {
+            rc.pop();
+        }
+        if rc.len() < 3 {
+            if ci == 0 {
+                return Err(CurvedCdtError::DegenerateLoop);
+            }
+            continue; // inner loop collapsed by welding — drop it
+        }
+        let first = rc[0];
+        rc.push(first); // re-close
+        compact_contours.push(rc);
+    }
+
     // The `cdt` crate `assert!`s on some degenerate inputs (a contour
     // vertex lying on another fixed edge) rather than returning `Err`.
     // Catch the unwind so a third-party panic degrades to a recoverable
     // per-face error instead of aborting the entire tessellation pass.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cdt::triangulate_contours(&pts2d, &contours)
+        cdt::triangulate_contours(&compact_pts, &compact_contours)
     }));
     match outcome {
         Ok(Ok(tris)) => {
-            let triangles: Vec<[usize; 3]> = tris.into_iter().map(|(a, b, c)| [a, b, c]).collect();
+            // Map compact indices back to the original `pts2d` layout so the
+            // caller's boundary/steiner resolution still applies.
+            let triangles: Vec<[usize; 3]> = tris
+                .into_iter()
+                .map(|(a, b, c)| [compact_to_orig[a], compact_to_orig[b], compact_to_orig[c]])
+                .collect();
             Ok((pts2d, triangles))
         }
         Ok(Err(e)) => Err(CurvedCdtError::CdtFailed(e)),
