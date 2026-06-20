@@ -608,3 +608,63 @@ fn adversarial_dense_polyline_is_sound_and_deterministic() {
         "dense self-intersection scan must be deterministic"
     );
 }
+
+// ── Iteration 2: mixed geometric/dimensional angle conflicts ───────────────
+
+/// MIXED conflict: two lines forced Parallel (angle 0) AND Angle(90°). No angle
+/// satisfies both. This stresses the geometric-vs-dimensional angle relationship
+/// — a path the Coincident+Distance fill does not cover.
+#[test]
+fn adversarial_parallel_and_angle_ninety_conflict() {
+    let sketch = Sketch::new("para-angle".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(0.0, 5.0));
+    let d = sketch.add_point(Point2d::new(10.0, 5.0));
+    let l1 = sketch.add_line(a, b).expect("l1");
+    let l2 = sketch.add_line(c, d).expect("l2");
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Parallel,
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Angle(std::f64::consts::FRAC_PI_2),
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        !cert.constraint_consistent,
+        "parallel (angle 0) AND angle=90 is unsatisfiable: {cert:?}"
+    );
+    assert!(!cert.is_sound(), "a parallel+angle(90) pair is unsound");
+}
+
+/// CALIBRATION for the above: Parallel AND Angle(0) are CONSISTENT (both say the
+/// lines are aligned). Must NOT be flagged — guards against an over-eager fill.
+#[test]
+fn adversarial_parallel_and_angle_zero_is_consistent() {
+    let sketch = Sketch::new("para-angle0".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(0.0, 5.0));
+    let d = sketch.add_point(Point2d::new(10.0, 5.0));
+    let l1 = sketch.add_line(a, b).expect("l1");
+    let l2 = sketch.add_line(c, d).expect("l2");
+    sketch.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Parallel,
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Angle(0.0),
+        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        ConstraintPriority::Required,
+    ));
+    let cert = certify_sketch(&sketch);
+    assert!(
+        cert.constraint_consistent,
+        "parallel AND angle=0 agree — must NOT be flagged: {cert:?}"
+    );
+}
