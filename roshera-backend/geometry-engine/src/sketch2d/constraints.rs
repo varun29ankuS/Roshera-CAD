@@ -760,11 +760,27 @@ impl ConstraintStore {
         // reliably: at coincident points the distance gradient is 0/0, so the
         // solver may report a spurious degenerate "solution". Configuration-
         // independent static detection closes that hole.
+        // Angle between two lines is defined modulo π (a line has no head/tail),
+        // so compare the requested angle on [0, π) against the orientation the
+        // geometric constraint pins.
+        use std::f64::consts::{FRAC_PI_2, PI};
+        const ANGLE_TOL: f64 = 1e-9;
         match (g, d) {
             (GeometricConstraint::Coincident, DimensionalConstraint::Distance(v)) => v.abs() > 1e-9,
-            // Room to grow: Parallel + Angle(≠0,π), Perpendicular + Angle(≠π/2),
-            // Horizontal/Vertical + a contradictory Angle, etc. Each needs a
-            // value-aware check, added as the adversarial harness demands them.
+            // Parallel pins the inter-line angle to 0 (mod π). Any Angle that is
+            // not aligned contradicts it.
+            (GeometricConstraint::Parallel, DimensionalConstraint::Angle(theta)) => {
+                let a = theta.rem_euclid(PI);
+                a.min(PI - a) > ANGLE_TOL
+            }
+            // Perpendicular pins the inter-line angle to π/2. Any Angle that is
+            // not a right angle contradicts it.
+            (GeometricConstraint::Perpendicular, DimensionalConstraint::Angle(theta)) => {
+                let a = theta.rem_euclid(PI);
+                (a - FRAC_PI_2).abs() > ANGLE_TOL
+            }
+            // Room to grow: Concentric + a positive centre Distance, Equal + two
+            // fixed-but-different dimensions, etc. — added as the harness demands.
             _ => false,
         }
     }
