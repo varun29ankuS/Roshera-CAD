@@ -608,6 +608,25 @@ pub trait Surface: fmt::Debug + Send + Sync + Any {
         }
     }
 
+    /// Whether the surface is **developable** — zero Gaussian curvature
+    /// everywhere, i.e. ruled with the ruling exactly straight in 3D so it can be
+    /// unrolled onto a plane without distortion (cylinder, cone).
+    ///
+    /// Curved-surface tessellation uses this to take the developable fast-path:
+    /// a developable lateral is chord-faithful after the initial CDT (its
+    /// accuracy is fixed by the boundary-rim sampling in the curved direction and
+    /// the exactly planar ruled direction), so interior Ruppert refinement cannot
+    /// improve it and merely cascades — a full-2π trimmed bore wall otherwise ran
+    /// away to ~9.6k triangles/slivers, doubling every pass. Doubly-curved
+    /// surfaces (sphere, torus, general NURBS) genuinely benefit from interior
+    /// refinement and MUST return `false`.
+    ///
+    /// Default `false` (conservative: an unclassified surface keeps full
+    /// refinement). Only the analytic zero-Gaussian-curvature surfaces override.
+    fn is_developable(&self) -> bool {
+        false
+    }
+
     /// Transform surface by matrix
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface>;
 
@@ -1757,6 +1776,12 @@ impl Surface for Cylinder {
 
     fn is_closed_v(&self) -> bool {
         false
+    }
+
+    /// A cylinder is developable: zero Gaussian curvature (the axial ruling is
+    /// exactly straight), so it unrolls to a rectangle. See the trait default.
+    fn is_developable(&self) -> bool {
+        true
     }
 
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
@@ -3030,6 +3055,12 @@ impl Surface for Cone {
 
     fn is_closed_v(&self) -> bool {
         false
+    }
+
+    /// A cone is developable: zero Gaussian curvature (the generator ruling is
+    /// exactly straight), so it unrolls to a planar sector. See the trait default.
+    fn is_developable(&self) -> bool {
+        true
     }
 
     fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
