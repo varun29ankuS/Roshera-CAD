@@ -11007,8 +11007,7 @@ fn presplit_boundary_t_junctions(
     // order and make the boolean non-deterministic (same root cause as
     // `compute_edge_intersections`, #37). Sort so EdgeId assignment is a pure
     // function of topology.
-    let mut ordered_splits: Vec<(EdgeId, Vec<(f64, VertexId)>)> =
-        edge_splits.into_iter().collect();
+    let mut ordered_splits: Vec<(EdgeId, Vec<(f64, VertexId)>)> = edge_splits.into_iter().collect();
     ordered_splits.sort_by_key(|(eid, _)| *eid);
     for (edge_id, mut splits) in ordered_splits {
         splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -11391,8 +11390,7 @@ pub(super) fn compute_edge_intersections(
     // the same input produced a different region partition each run (the
     // torus/rim-poke cell returned three different volumes). Sorting the split
     // application makes EdgeId assignment a pure function of topology. (#37)
-    let mut ordered_splits: Vec<(EdgeId, Vec<(f64, VertexId)>)> =
-        edge_splits.into_iter().collect();
+    let mut ordered_splits: Vec<(EdgeId, Vec<(f64, VertexId)>)> = edge_splits.into_iter().collect();
     ordered_splits.sort_by_key(|(eid, _)| *eid);
     for (edge_id, mut splits) in ordered_splits {
         // Sort by parameter so we split from start to end
