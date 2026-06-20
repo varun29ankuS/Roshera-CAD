@@ -218,6 +218,127 @@ impl LabelsConsistency {
     }
 }
 
+/// Per-face display-tessellation defect — lets an agent point at exactly which
+/// face renders wrong, without rendering a pixel. Returned as the single worst
+/// face inside [`TessellationQuality`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TessFaceDefect {
+    /// The offending face id (matches the kernel `FaceId` / the per-triangle
+    /// `face_map` the frontend uses for picking).
+    pub face_id: u64,
+    /// Triangles tessellated for this face.
+    pub triangles: usize,
+    /// Zero-area facets on this face.
+    pub degenerate_triangles: usize,
+    /// Fraction of this face's facets whose winding normal agrees with the
+    /// stored (analytic-intent) vertex normals. `1.0` = clean; an inner-bore
+    /// scribble drops well below.
+    pub normal_agreement: f64,
+    /// Fraction of this face's facets whose winding normal sits in the same
+    /// hemisphere as the TRUE surface normal at the facet centroid. This is the
+    /// ground-truth check: a scribble whose stored normals are wrong-but-self-
+    /// consistent scores `1.0` on `normal_agreement` yet drops here.
+    pub analytic_normal_agreement: f64,
+}
+
+/// Display-tessellation quality — the render-mesh analogue of B-Rep soundness.
+///
+/// A solid can be a valid, watertight, manifold B-Rep yet tessellate to a
+/// degenerate / inverted-normal mesh (the inner-bore "scribble" class): the mesh
+/// still closes and every edge borders two faces, so the *topological* checks
+/// ([`ValidityCertificate::watertight`] / [`manifold`](ValidityCertificate::manifold))
+/// all pass — but the facets are zero-area slivers or face the wrong way and the
+/// part renders as garbage. This dimension is the missing invariant: the kernel
+/// must not certify a solid "sound" while its display mesh is broken.
+///
+/// The verdict compares each facet's winding normal to its stored vertex normals
+/// (the analytic normal the tessellator *intended*), so a mis-oriented face is
+/// caught against ground truth, not merely against its neighbours.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TessellationQuality {
+    /// Total triangles in the certification mesh.
+    pub triangles: usize,
+    /// Zero-area facets (coincident or collinear vertices).
+    pub degenerate_triangles: usize,
+    /// Fraction of non-degenerate facets whose winding normal agrees with their
+    /// stored vertex normals. `1.0` = every facet shaded the way its geometry
+    /// faces.
+    pub normal_agreement: f64,
+    /// Fraction of non-degenerate facets whose winding normal sits in the same
+    /// hemisphere as the TRUE surface normal at the facet centroid. THIS is the
+    /// ground-truth check: a scribble whose stored normals are wrong-but-self-
+    /// consistent scores `1.0` on `normal_agreement` yet drops here, because the
+    /// off-radial facets disagree with the actual analytic surface normal.
+    pub analytic_normal_agreement: f64,
+    /// Facets whose winding disagrees with their stored normals (inverted/skewed).
+    pub inconsistent_facets: usize,
+    /// Facets pointing into the wrong hemisphere of the TRUE surface normal — the
+    /// off-radial scribble count. The decisive signal for an inner-bore defect.
+    pub off_surface_facets: usize,
+    /// The single worst face by normal disagreement — the agent's pointer to the
+    /// defect. `None` when the mesh is clean.
+    pub worst_face: Option<TessFaceDefect>,
+    /// `true` when there are no degenerate facets, normal agreement clears
+    /// [`Self::MIN_NORMAL_AGREEMENT`], and there are zero off-surface facets.
+    /// Conservative (gross-defect only) so a clean part at a coarse chord never
+    /// false-positives.
+    pub clean: bool,
+}
+
+impl TessellationQuality {
+    /// Soundness threshold for stored-normal agreement. Set well below `1.0` so
+    /// coarse-chord numerical noise never trips it, yet far above the ~0.5–0.7 a
+    /// scribbled bore scores.
+    pub const MIN_NORMAL_AGREEMENT: f64 = 0.98;
+
+    /// Soundness threshold for analytic-normal agreement. A correct (even coarse)
+    /// facet always lies in the surface-normal hemisphere, so any shortfall is a
+    /// genuinely off-surface (scribbled / inverted) facet.
+    pub const MIN_ANALYTIC_AGREEMENT: f64 = 0.999;
+
+    /// Build a verdict from the measured counts, deriving `clean`.
+    pub fn evaluate(
+        triangles: usize,
+        degenerate_triangles: usize,
+        normal_agreement: f64,
+        analytic_normal_agreement: f64,
+        inconsistent_facets: usize,
+        off_surface_facets: usize,
+        worst_face: Option<TessFaceDefect>,
+    ) -> Self {
+        let clean = degenerate_triangles == 0
+            && normal_agreement >= Self::MIN_NORMAL_AGREEMENT
+            && off_surface_facets == 0
+            && analytic_normal_agreement >= Self::MIN_ANALYTIC_AGREEMENT;
+        Self {
+            triangles,
+            degenerate_triangles,
+            normal_agreement,
+            analytic_normal_agreement,
+            inconsistent_facets,
+            off_surface_facets,
+            worst_face,
+            clean,
+        }
+    }
+
+    /// The verdict for a solid that tessellates to nothing. Such a solid is
+    /// already flagged unsound by `brep_valid`/`watertight`, so an empty mesh is
+    /// reported `clean` (quality is not-applicable) rather than double-penalised.
+    pub fn empty() -> Self {
+        Self {
+            triangles: 0,
+            degenerate_triangles: 0,
+            normal_agreement: 1.0,
+            analytic_normal_agreement: 1.0,
+            inconsistent_facets: 0,
+            off_surface_facets: 0,
+            worst_face: None,
+            clean: true,
+        }
+    }
+}
+
 /// The kernel's COMPUTED verdict on a solid — never written by the caller.
 /// `is_sound()` is the honest "this is a real, closed, manufacturable solid"
 /// gate: a valid B-Rep that is watertight and manifold.
@@ -248,6 +369,11 @@ pub struct ValidityCertificate {
     /// `Inconsistent` verdict does NOT affect `is_sound()` — it is its own
     /// honest flag the agent/frontend can surface (stale labels rendered amber).
     pub labels_consistent: LabelsConsistency,
+    /// Display-tessellation quality — the render-mesh analogue of the topological
+    /// checks above. A degenerate / inverted-normal mesh (the inner-bore scribble)
+    /// is a real defect the closure/manifold checks cannot see; `clean == false`
+    /// blocks `is_sound()` so the kernel cannot certify a solid that renders wrong.
+    pub tessellation: TessellationQuality,
     /// B-Rep validation errors (stringified), empty when `brep_valid`.
     pub errors: Vec<String>,
 }
@@ -259,6 +385,7 @@ impl ValidityCertificate {
             && self.manifold
             && self.self_intersection_free
             && self.construction_consistent.is_sound()
+            && self.tessellation.clean
     }
 }
 
@@ -280,7 +407,7 @@ impl GroundTruth {
             .map(|p| p.created_by.label())
             .unwrap_or_else(|| "unrecorded".into());
         format!(
-            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} euler={} construction={} labels={})",
+            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} euler={} construction={} labels={} tess_clean={} normal_agreement={:.3} degenerate={})",
             self.solid_id,
             origin,
             self.provenance
@@ -294,6 +421,13 @@ impl GroundTruth {
             self.certificate.euler_characteristic,
             self.certificate.construction_consistent.label(),
             self.certificate.labels_consistent.label(),
+            self.certificate.tessellation.clean,
+            self.certificate.tessellation.normal_agreement,
+            self.certificate.tessellation.degenerate_triangles,
+        ) + &format!(
+            " analytic_agreement={:.3} off_surface={}",
+            self.certificate.tessellation.analytic_normal_agreement,
+            self.certificate.tessellation.off_surface_facets,
         )
     }
 }
