@@ -7,11 +7,12 @@ const API_HOST = import.meta.env.VITE_API_URL || ''
 type RenderMode = 'shaded' | 'diagnostic' | 'ids' | 'dim' | 'section'
 type ViewName = 'iso' | 'front' | 'top' | 'right'
 
-// What the eye is looking at: a single part (newest/selected), the whole
-// scene (every solid composited via the scene-eye), or one NAMED instanced
-// assembly (#19 — every instance composited at its transform via
-// `/api/assembly/{id}/view`).
-type Scope = 'part' | 'assembly' | 'named'
+// What the eye is looking at: a single part (newest/selected), or an
+// ASSEMBLY. The assembly scope renders a named instanced assembly (#19) by id
+// via `/api/assembly/{id}/view`, and falls back to the whole-scene composite
+// (`/api/agent/scene/orbit`) when no id is given — i.e. the whole scene is the
+// implicit "everything" assembly. Two scopes only: part + assembly.
+type Scope = 'part' | 'assembly'
 
 const SINGLE_VIEW: RenderMode[] = ['shaded', 'diagnostic', 'ids']
 
@@ -43,8 +44,8 @@ export function AgentEyePanel() {
   const [minimized, setMinimized] = useState(false)
   const [live, setLive] = useState(true)
   const [scope, setScope] = useState<Scope>('part')
-  // The instanced-assembly id the 'named' scope renders (#19). Empty = the
-  // user hasn't picked one yet; the panel prompts for it.
+  // The instanced-assembly id the 'assembly' scope renders (#19). Empty = render
+  // the whole-scene composite instead (the implicit "everything" assembly).
   const [assemblyId, setAssemblyId] = useState('')
   const [mode, setMode] = useState<RenderMode>('shaded')
   const [view, setView] = useState<ViewName>('iso')
@@ -62,62 +63,35 @@ export function AgentEyePanel() {
   const [err, setErr] = useState<string | null>(null)
   const inFlight = useRef(false)
 
-  // In Assembly / named-assembly mode only the scene-shared modes are valid;
-  // fall back cleanly if the user was on `dim`/`section` when they switched.
+  // In Assembly mode only the scene-shared modes are valid; fall back cleanly
+  // if the user was on `dim`/`section` when they switched.
   const sceneMode: RenderMode = SCENE_MODES.includes(mode) ? mode : 'shaded'
-  // Scopes that render a composited scene (orbit camera + scene modes).
-  const isSceneScope = scope === 'assembly' || scope === 'named'
+  // The assembly scope renders a composited scene (orbit camera + scene modes).
+  const isSceneScope = scope === 'assembly'
 
   const grab = useCallback(async () => {
     if (inFlight.current) return
     inFlight.current = true
     try {
-      if (scope === 'named') {
-        // NAMED-ASSEMBLY EYE (#19): composite every instance of one assembly
-        // at its transform. Per-part perception is not meaningful here; the
-        // assembly's own perception comes from GET /api/assembly/{id}.
-        setPerc(null)
-        if (!assemblyId.trim()) {
-          setPng(null)
-          setDiag(null)
-          setErr('enter an assembly id')
-          return
-        }
-        const r = await fetch(
-          `${API_HOST}/api/assembly/${assemblyId.trim()}/view?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`,
-        )
-        if (r.status === 404) {
-          setPng(null)
-          setDiag(null)
-          setErr('no such assembly / no instances')
-          return
-        }
-        if (!r.ok) throw new Error(`assembly ${r.status}`)
-        const data = (await r.json()) as {
-          png_base64: string
-          open_edges: number
-          nonmanifold_edges: number
-        }
-        setPng(data.png_base64)
-        setDiag({ open: data.open_edges, nm: data.nonmanifold_edges })
-        setErr(null)
-        return
-      }
-
       if (scope === 'assembly') {
-        // SCENE-EYE: composite every solid, auto-framed, orbitable by az/el.
-        // Per-part perception (`perc`) is not meaningful for a whole scene.
+        // ASSEMBLY EYE: a named instanced assembly (#19) when an id is given —
+        // every instance composited at its transform via /api/assembly/{id}/view;
+        // otherwise the whole-scene composite (/api/agent/scene/orbit), i.e. the
+        // implicit "everything" assembly. Per-part perception isn't meaningful for
+        // a composite (a named assembly's own perception is GET /api/assembly/{id}).
         setPerc(null)
-        const r = await fetch(
-          `${API_HOST}/api/agent/scene/orbit?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`,
-        )
+        const named = assemblyId.trim()
+        const url = named
+          ? `${API_HOST}/api/assembly/${named}/view?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`
+          : `${API_HOST}/api/agent/scene/orbit?az=${az}&el=${el}&mode=${sceneMode}&size=256&quality=medium`
+        const r = await fetch(url)
         if (r.status === 404) {
           setPng(null)
           setDiag(null)
-          setErr('no geometry yet')
+          setErr(named ? 'no such assembly / no instances' : 'no geometry yet')
           return
         }
-        if (!r.ok) throw new Error(`scene ${r.status}`)
+        if (!r.ok) throw new Error(`${named ? 'assembly' : 'scene'} ${r.status}`)
         const data = (await r.json()) as {
           png_base64: string
           open_edges: number
@@ -249,9 +223,10 @@ export function AgentEyePanel() {
         </div>
       </div>
 
-      {/* Scope: a single part vs the whole assembly (scene-eye composite). */}
+      {/* Scope: a single part vs an assembly (a named instanced assembly by id,
+          or the whole-scene composite when no id is given). */}
       <div className="flex border-b border-border">
-        {(['part', 'assembly', 'named'] as Scope[]).map((s) => (
+        {(['part', 'assembly'] as Scope[]).map((s) => (
           <button
             key={s}
             onClick={() => setScope(s)}
@@ -263,24 +238,23 @@ export function AgentEyePanel() {
             title={
               s === 'part'
                 ? 'Show the newest part on its own'
-                : s === 'assembly'
-                  ? 'Show the whole scene (every solid composited)'
-                  : 'Show one named instanced assembly (every instance at its transform)'
+                : 'Show an assembly — enter an id for a named instanced assembly, or leave blank for the whole scene'
             }
           >
-            {s === 'named' ? 'asm' : s}
+            {s}
           </button>
         ))}
       </div>
 
-      {/* Named-assembly id input (#19): which instanced assembly to render. */}
-      {scope === 'named' && (
+      {/* Assembly id input (#19): a named instanced assembly to render; blank
+          renders the whole-scene composite (the implicit "everything" assembly). */}
+      {scope === 'assembly' && (
         <div className="border-b border-border px-2 py-1">
           <input
             type="text"
             value={assemblyId}
             onChange={(e) => setAssemblyId(e.target.value)}
-            placeholder="assembly id (uuid)"
+            placeholder="assembly id (uuid) — blank = whole scene"
             className="w-full rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px]"
           />
         </div>
