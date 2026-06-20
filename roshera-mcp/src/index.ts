@@ -153,7 +153,9 @@ const ROSHERA_ICON =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0OCIgaGVpZ2h0PSI0OCIgdmlld0JveD0iMCAwIDQ4IDQ4Ij4NCiAgPGNpcmNsZSBjeD0iMjQiIGN5PSIyNCIgcj0iMjMiIGZpbGw9IiNGNURGQTAiIHN0cm9rZT0iI0Q0NjQ1QyIgc3Ryb2tlLXdpZHRoPSIyLjUiLz4NCiAgPHBhdGggZD0iTTE2IDM2VjEyaDhjNC40MTggMCA4IDMuMTM0IDggN3MtMy41ODIgNy04IDdoLTgiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI0M0NTI0QSIgc3Ryb2tlLXdpZHRoPSIwIi8+DQogIDxwYXRoIGQ9Ik0xNiAxMiBMMjggMTIgUTMyIDEyIDMyIDE5IFEzMiAyNiAyOCAyNiBMMTYgMzYgWiIgZmlsbD0iI0M0NTI0QSIvPg0KICA8cGF0aCBkPSJNMjggMTIgUTMyIDEyIDMyIDE5IFEzMiAyNiAyOCAyNiBaIiBmaWxsPSIjRDQ2NDVDIi8+DQo8L3N2Zz4NCg==";
 
 const server = new McpServer({
-  name: "roshera",
+  // Display name Claude Code shows in "Calling …". The 🅡 glyph (negative
+  // circled R) renders the Roshera mark inline in the CLI status line.
+  name: "🅡 ROSHERA",
   version: "0.1.0",
   icons: [{ src: ROSHERA_ICON, mimeType: "image/svg+xml", sizes: ["48x48"] }],
 });
