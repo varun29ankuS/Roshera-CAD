@@ -1113,6 +1113,90 @@ fn diag_trace_seed() {
     eprintln!("seed {seed}: chain complete");
 }
 
+/// NO-HANGS REGRESSION GATE (always-on). A curved boolean on a ROTATED curved
+/// primitive must NEVER hang — it must complete (or terminate cleanly), and the
+/// FULL invariant set must then be checkable in bounded time. This pins the
+/// specific defect this gate was added for: seed 4's chain (sphere → translate →
+/// rotate → curved boolean) produced a sphere fragment whose arc-bounded
+/// `tessellate_spherical_polygon` rim sampled to ~3450 points, which the
+/// `fine()` concentric-ring fan multiplied by 200 radial rings into ~1.4M
+/// triangles for a single face — the divergence-theorem mass-properties /
+/// watertight check (the `audit_seed` invariant set, which tessellates at
+/// `fine()`) then ran for minutes, presenting as a HANG. With the fan's
+/// triangle budget bounded it terminates in a few seconds.
+///
+/// The assertion is TERMINATION, not correctness: the seed's geometry may be
+/// unsound (the kernel honestly flags it via the certificate — that is the
+/// separate curved-boolean correctness work), but its audit MUST FINISH. We run
+/// the previously-hanging seeds on a worker thread with a generous wall-clock
+/// budget and fail loudly if any blows it. Release-fast; the budget has wide
+/// headroom over the observed ~10–20s/seed so a slow debug run still passes.
+#[test]
+fn curved_boolean_on_rotated_primitive_terminates() {
+    // The seeds the gap-finder reported as hangs (curved booleans on rotated
+    // sphere/cone bases) — all must now finish their full invariant audit.
+    let seeds: [u64; 9] = [2, 3, 4, 5, 6, 8, 12, 13, 14];
+    let budget = std::time::Duration::from_secs(
+        std::env::var("HANG_GATE_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(90),
+    );
+    for seed in seeds {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // audit_seed runs the FULL invariant set after every op (the path
+            // whose `fine()` tessellation hung); finishing it proves termination.
+            let _ = tx.send(audit_seed(seed));
+        });
+        match rx.recv_timeout(budget) {
+            Ok(_findings) => { /* terminated — findings (un)soundness is out of scope here */ }
+            Err(_) => panic!(
+                "curved boolean on a rotated primitive did NOT terminate: seed {seed} \
+                 exceeded {budget:?} (NO-HANGS regression)"
+            ),
+        }
+    }
+}
+
+/// SPHERE poke-matrix non-regression gate for the fan-budget guard. The
+/// non-termination guard added to `tessellate_spherical_polygon` (the spherical-
+/// polygon arrangement-cell fan) could in principle truncate a VALID fine
+/// tessellation — these are the cells whose path it touches, so they must stay
+/// green: `sphere/corner-poke` is exactly the arrangement-cell case the guard's
+/// `tessellate_spherical_polygon` handles, and `sphere/contained` /
+/// `sphere/face-poke` cover the other sphere paths. (The full
+/// `poke_matrix_green_cells_hold` gate also exercises torus/cylinder/cone cells,
+/// which the guard cannot affect — it is gated on a `Sphere` downcast.) Verified
+/// green AFTER the guard: all 9 sphere cells pass BOTH the MC-volume and the
+/// topological-manifold oracles, so the budget never truncates a real fine mesh.
+#[test]
+#[ignore = "poke-matrix sphere cells (slow ~540s; run explicitly to verify the fan guard)"]
+fn sphere_poke_cells_hold() {
+    use geometry_engine::harness::poke_matrix::{catalog, run_case};
+    let sphere_cases = ["sphere/contained", "sphere/face-poke", "sphere/corner-poke"];
+    for case in catalog() {
+        if !sphere_cases.contains(&case.name) {
+            continue;
+        }
+        let verdicts = run_case(&case, 0.05, 0.08, 60);
+        for (op_idx, v) in verdicts.iter().enumerate() {
+            assert!(
+                v.ok(),
+                "sphere poke cell regressed: {} op#{op_idx} vol_ok={} topo_ok={} \
+                 kernel_vol={:?} truth={:.3} report={:?}",
+                case.name,
+                v.volume_ok,
+                v.topology_ok,
+                v.kernel_volume,
+                v.truth_volume,
+                v.manifold,
+            );
+        }
+        eprintln!("[sphere-poke] {} → all 3 ops green", case.name);
+    }
+}
+
 /// The generator is itself deterministic: the same seed yields the same chain
 /// length and PRNG stream (a non-deterministic generator would make the report
 /// irreproducible).
