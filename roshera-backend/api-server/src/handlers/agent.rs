@@ -900,6 +900,30 @@ pub struct TessQualityResponse {
     pub worst_face: Option<TessFaceDefectResponse>,
 }
 
+/// Per-face mesh-shape defect (the CAD mesh-quality rules).
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshFaceQualityResponse {
+    pub face_id: u64,
+    pub worst_aspect_ratio: f64,
+    pub min_angle_deg: f64,
+    pub max_normal_deviation_deg: f64,
+    pub boundary_crossing_facets: usize,
+}
+
+/// Mesh-quality verdict — the render mesh against the CAD tessellation rules
+/// (boundary conformance, normal deviation, aspect ratio, min angle). Catches a
+/// sliver "wing" / bridging facet that is watertight + correctly oriented.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshQualityResponse {
+    pub clean: bool,
+    pub triangles: usize,
+    pub worst_aspect_ratio: f64,
+    pub min_angle_deg: f64,
+    pub max_normal_deviation_deg: f64,
+    pub boundary_crossing_facets: usize,
+    pub worst_face: Option<MeshFaceQualityResponse>,
+}
+
 /// it, designed vs bare primitive) + a COMPUTED validity certificate.
 #[derive(Debug, Clone, Serialize)]
 pub struct TruthResponse {
@@ -928,8 +952,15 @@ pub struct TruthResponse {
     pub tessellation_clean: bool,
     /// Full tessellation-quality breakdown incl. the worst defective face.
     pub tessellation: TessQualityResponse,
+    /// Mesh-quality (CAD tessellation-rule) verdict: `false` ⇒ a facet violates a
+    /// shape rule (a sliver "wing", a boundary-crossing/bridging facet, a far-off-
+    /// surface normal) even if the mesh is watertight. Factored into `sound`.
+    pub mesh_quality_clean: bool,
+    /// Full mesh-quality breakdown incl. the worst face + which rule it fails.
+    pub mesh_quality: MeshQualityResponse,
     /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold
-    /// ∧ self-intersection-free ∧ construction-consistent ∧ tessellation-clean).
+    /// ∧ self-intersection-free ∧ construction-consistent ∧ tessellation-clean
+    /// ∧ mesh-quality-clean).
     pub sound: bool,
     pub errors: Vec<String>,
     pub summary: String,
@@ -991,6 +1022,26 @@ pub async fn part_truth(
                     degenerate_triangles: w.degenerate_triangles,
                     normal_agreement: w.normal_agreement,
                     analytic_normal_agreement: w.analytic_normal_agreement,
+                }),
+        },
+        mesh_quality_clean: c.mesh_quality.clean,
+        mesh_quality: MeshQualityResponse {
+            clean: c.mesh_quality.clean,
+            triangles: c.mesh_quality.triangles,
+            worst_aspect_ratio: c.mesh_quality.worst_aspect_ratio,
+            min_angle_deg: c.mesh_quality.min_angle_deg,
+            max_normal_deviation_deg: c.mesh_quality.max_normal_deviation_deg,
+            boundary_crossing_facets: c.mesh_quality.boundary_crossing_facets,
+            worst_face: c
+                .mesh_quality
+                .worst_face
+                .as_ref()
+                .map(|w| MeshFaceQualityResponse {
+                    face_id: w.face_id,
+                    worst_aspect_ratio: w.worst_aspect_ratio,
+                    min_angle_deg: w.min_angle_deg,
+                    max_normal_deviation_deg: w.max_normal_deviation_deg,
+                    boundary_crossing_facets: w.boundary_crossing_facets,
                 }),
         },
         sound: c.is_sound(),

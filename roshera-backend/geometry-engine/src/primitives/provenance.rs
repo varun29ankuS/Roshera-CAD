@@ -339,6 +339,118 @@ impl TessellationQuality {
     }
 }
 
+/// Per-face mesh-shape defect — the agent's pointer to which face violates a
+/// CAD mesh-quality rule and on which metric.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshFaceQualityDefect {
+    pub face_id: u64,
+    /// Largest facet aspect ratio on this face (longest edge / shortest edge).
+    pub worst_aspect_ratio: f64,
+    /// Smallest interior facet angle on this face, degrees.
+    pub min_angle_deg: f64,
+    /// Largest angle between a facet's winding normal and the true surface normal
+    /// at its centroid, degrees.
+    pub max_normal_deviation_deg: f64,
+    /// Facets on this face that cross an analytical boundary (a periodic lateral
+    /// facet spanning > half a period bridges the interior — the bore "wing").
+    pub boundary_crossing_facets: usize,
+}
+
+/// **Mesh-quality** verdict — the render mesh measured against the established
+/// CAD/FEA tessellation rules, not just "is it closed / correctly-oriented"
+/// ([`TessellationQuality`]). A facet can be watertight, non-degenerate, and
+/// correctly oriented yet still violate a *shape* rule — a sliver-angle triangle,
+/// a triangle that bridges across a bore (the "wing"), a facet whose normal
+/// strays far from the surface, or a triangle that crosses a face boundary. This
+/// dimension encodes those rules so the kernel can REFUSE a badly-shaped mesh the
+/// way it refuses a non-manifold one — and name the offending face + metric.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshQuality {
+    pub triangles: usize,
+    /// Worst (largest) facet aspect ratio over the whole mesh. REPORTED, not
+    /// gated: a faithful developable lateral is legitimately *tall* (~20), so a
+    /// high aspect alone is not a defect — it's a readout for the agent.
+    pub worst_aspect_ratio: f64,
+    /// Smallest interior facet angle over the whole mesh, degrees. REPORTED.
+    pub min_angle_deg: f64,
+    /// Largest angle between a facet's winding normal and the TRUE surface normal
+    /// at its centroid, degrees. **GATED** — a bridging wing points tens of
+    /// degrees off-surface while a faithful (even tall) facet stays within a few.
+    pub max_normal_deviation_deg: f64,
+    /// Facets crossing an analytical boundary — on a periodic/closed lateral, a
+    /// facet whose UV spans more than half the period bridges across the interior
+    /// (the bore "wing"). **GATED** — boundary conformance is a hard rule.
+    pub boundary_crossing_facets: usize,
+    /// The single worst face, the agent's pointer to the defect. `None` if clean.
+    pub worst_face: Option<MeshFaceQualityDefect>,
+    /// `true` when no facet crosses a boundary and the worst normal deviation is
+    /// within [`Self::MAX_NORMAL_DEVIATION_DEG`].
+    pub clean: bool,
+}
+
+impl MeshQuality {
+    /// A facet whose winding normal strays beyond this from the true surface
+    /// normal is off-surface (a bridge / fold). Well above a faithful developable
+    /// facet (a few degrees) and below a folded one (tens of degrees).
+    pub const MAX_NORMAL_DEVIATION_DEG: f64 = 40.0;
+
+    /// Conservative aspect-ratio ceiling — a faithful developable lateral is
+    /// legitimately tall (~20) and a planar fan can reach ~30, so this is set
+    /// well above both to catch only a GROSS sliver "wing" (measured ~290 on the
+    /// imported bore), not the merely-tall.
+    pub const MAX_ASPECT_RATIO: f64 = 100.0;
+
+    /// Conservative minimum-angle floor, degrees — a faithful developable facet's
+    /// apex angle is ~2.8° and a fan's is ~1-2°, while a sliver "wing" collapses
+    /// toward 0°. Set below the faithful floor so only a degenerate-shape facet
+    /// trips it.
+    pub const MIN_ANGLE_DEG: f64 = 0.5;
+
+    pub fn evaluate(
+        triangles: usize,
+        worst_aspect_ratio: f64,
+        min_angle_deg: f64,
+        max_normal_deviation_deg: f64,
+        boundary_crossing_facets: usize,
+        worst_face: Option<MeshFaceQualityDefect>,
+    ) -> Self {
+        // `clean` (which gates `is_sound`) keys ONLY on the true mesh-TOPOLOGY
+        // defects — a facet that bridges across a periodic lateral
+        // (`boundary_crossing`) or folds far off the surface (`normal_deviation`).
+        // Both are 0 on a clean part. Aspect ratio and min-angle are SHAPE-quality
+        // readouts (reported via `worst_aspect_ratio`/`min_angle_deg` + the worst
+        // face), NOT gates: a faithful tessellation routinely carries aspect ~150-
+        // 290 slivers (planar fans near curved boundaries, the developable
+        // collapse), so gating on them would flag every real part. They are the
+        // OPTIMISATION ORACLE — the number to drive down — not a soundness bar.
+        let clean = boundary_crossing_facets == 0
+            && max_normal_deviation_deg <= Self::MAX_NORMAL_DEVIATION_DEG;
+        Self {
+            triangles,
+            worst_aspect_ratio,
+            min_angle_deg,
+            max_normal_deviation_deg,
+            boundary_crossing_facets,
+            worst_face,
+            clean,
+        }
+    }
+
+    /// Verdict for a solid that tessellates to nothing — already flagged unsound
+    /// by `watertight`, so reported clean (quality not-applicable).
+    pub fn empty() -> Self {
+        Self {
+            triangles: 0,
+            worst_aspect_ratio: 1.0,
+            min_angle_deg: 60.0,
+            max_normal_deviation_deg: 0.0,
+            boundary_crossing_facets: 0,
+            worst_face: None,
+            clean: true,
+        }
+    }
+}
+
 /// The kernel's COMPUTED verdict on a solid — never written by the caller.
 /// `is_sound()` is the honest "this is a real, closed, manufacturable solid"
 /// gate: a valid B-Rep that is watertight and manifold.
@@ -374,6 +486,12 @@ pub struct ValidityCertificate {
     /// is a real defect the closure/manifold checks cannot see; `clean == false`
     /// blocks `is_sound()` so the kernel cannot certify a solid that renders wrong.
     pub tessellation: TessellationQuality,
+    /// Mesh-quality verdict — the render mesh against the CAD tessellation rules
+    /// (boundary conformance, normal deviation, aspect/min-angle). A facet that
+    /// bridges across a bore (the "wing") or crosses a face boundary is caught
+    /// here even though it is watertight + correctly oriented; `clean == false`
+    /// blocks `is_sound()`.
+    pub mesh_quality: MeshQuality,
     /// B-Rep validation errors (stringified), empty when `brep_valid`.
     pub errors: Vec<String>,
 }
@@ -386,6 +504,7 @@ impl ValidityCertificate {
             && self.self_intersection_free
             && self.construction_consistent.is_sound()
             && self.tessellation.clean
+            && self.mesh_quality.clean
     }
 }
 
@@ -425,9 +544,14 @@ impl GroundTruth {
             self.certificate.tessellation.normal_agreement,
             self.certificate.tessellation.degenerate_triangles,
         ) + &format!(
-            " analytic_agreement={:.3} off_surface={}",
+            " analytic_agreement={:.3} off_surface={} | mesh_clean={} worst_aspect={:.1} min_angle={:.1} max_normal_dev={:.1} boundary_crossing={}",
             self.certificate.tessellation.analytic_normal_agreement,
             self.certificate.tessellation.off_surface_facets,
+            self.certificate.mesh_quality.clean,
+            self.certificate.mesh_quality.worst_aspect_ratio,
+            self.certificate.mesh_quality.min_angle_deg,
+            self.certificate.mesh_quality.max_normal_deviation_deg,
+            self.certificate.mesh_quality.boundary_crossing_facets,
         )
     }
 }

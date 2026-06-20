@@ -448,6 +448,182 @@ fn analytic_facet_agrees(
     Some(oriented.dot(geo) > 0.0)
 }
 
+/// Angle (degrees) between a facet's winding normal `geo` and the TRUE surface
+/// normal at its centroid (oriented by face sense). `None` if unresolvable.
+fn analytic_facet_deviation_deg(
+    model: &BRepModel,
+    face_id: u32,
+    p0: &crate::math::Point3,
+    p1: &crate::math::Point3,
+    p2: &crate::math::Point3,
+    geo: &crate::math::Vector3,
+    tol: crate::math::Tolerance,
+) -> Option<f64> {
+    let face = model.faces.get(face_id)?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    let centroid = crate::math::Point3::new(
+        (p0.x + p1.x + p2.x) / 3.0,
+        (p0.y + p1.y + p2.y) / 3.0,
+        (p0.z + p1.z + p2.z) / 3.0,
+    );
+    let (u, v) = surface.closest_point(&centroid, tol).ok()?;
+    let n = (surface.normal_at(u, v).ok()? * face.orientation.sign())
+        .normalize()
+        .ok()?;
+    let g = geo.normalize().ok()?;
+    let dot = g.dot(&n).clamp(-1.0, 1.0);
+    Some(dot.acos().to_degrees())
+}
+
+/// Angular extent a triangle covers on a periodic direction of period `p` — the
+/// circle minus the largest gap between its three (wrapped) parameter values. A
+/// thin seam triangle covers ~0; a facet bridging across the interior (the bore
+/// "wing") covers ~p/2 or more.
+pub fn periodic_coverage(u0: f64, u1: f64, u2: f64, p: f64) -> f64 {
+    if p <= 0.0 {
+        return 0.0;
+    }
+    let mut us = [u0.rem_euclid(p), u1.rem_euclid(p), u2.rem_euclid(p)];
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let g0 = us[1] - us[0];
+    let g1 = us[2] - us[1];
+    let g2 = p - us[2] + us[0]; // wrap gap
+    let max_gap = g0.max(g1).max(g2);
+    p - max_gap
+}
+
+/// **Mesh-quality** verdict — the render mesh against the CAD tessellation rules:
+/// boundary conformance (no facet bridges across a periodic/closed lateral),
+/// normal deviation from the true surface (smoothness / off-surface bridges), and
+/// the agent-facing aspect-ratio / min-angle readout. A facet can be watertight,
+/// non-degenerate and correctly oriented yet still bridge the bore (the "wing") —
+/// this catches that. `None` if the solid is missing or tessellates to nothing.
+pub fn mesh_quality(
+    model: &BRepModel,
+    solid: SolidId,
+) -> Option<crate::primitives::provenance::MeshQuality> {
+    use crate::primitives::provenance::{MeshFaceQualityDefect, MeshQuality};
+    use std::cmp::Ordering::Equal;
+    let solid_ref = model.solids.get(solid)?;
+    let params = TessellationParams::default();
+    let mesh = tessellate_solid(solid_ref, model, &params);
+    if mesh.triangles.is_empty() {
+        return None;
+    }
+    let has_faces = mesh.face_map.len() == mesh.triangles.len();
+    let tol = model.tolerance;
+
+    // Per face: (worst_aspect, min_angle_deg, max_normal_dev_deg, boundary_cross).
+    let mut per_face: HashMap<u32, (f64, f64, f64, usize)> = HashMap::new();
+    let mut worst_aspect = 1.0_f64;
+    let mut min_angle = 180.0_f64;
+    let mut max_dev = 0.0_f64;
+    let mut boundary_crossing = 0usize;
+
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        let v0 = mesh.vertices[tri[0] as usize];
+        let v1 = mesh.vertices[tri[1] as usize];
+        let v2 = mesh.vertices[tri[2] as usize];
+        let (p0, p1, p2) = (v0.position, v1.position, v2.position);
+        let geo = (p1 - p0).cross(&(p2 - p0));
+        if geo.magnitude() <= 1e-12 {
+            continue; // zero-area handled by TessellationQuality
+        }
+        let fid = if has_faces { mesh.face_map[i] } else { 0 };
+        let entry = per_face.entry(fid).or_insert((1.0, 180.0, 0.0, 0));
+
+        // Aspect ratio = longest edge / shortest edge.
+        let e0 = (p1 - p0).magnitude();
+        let e1 = (p2 - p1).magnitude();
+        let e2 = (p0 - p2).magnitude();
+        let lo = e0.min(e1).min(e2).max(1e-12);
+        let hi = e0.max(e1).max(e2);
+        let aspect = hi / lo;
+        worst_aspect = worst_aspect.max(aspect);
+        entry.0 = entry.0.max(aspect);
+
+        // Smallest interior angle (law of cosines).
+        let ang = |a: f64, b: f64, c: f64| -> f64 {
+            (((a * a + b * b - c * c) / (2.0 * a * b)).clamp(-1.0, 1.0))
+                .acos()
+                .to_degrees()
+        };
+        let tmin = ang(e0, e2, e1).min(ang(e0, e1, e2)).min(ang(e1, e2, e0));
+        min_angle = min_angle.min(tmin);
+        entry.1 = entry.1.min(tmin);
+
+        // Normal deviation from the true surface.
+        if let Some(dev) = analytic_facet_deviation_deg(model, fid, &p0, &p1, &p2, &geo, tol) {
+            max_dev = max_dev.max(dev);
+            entry.2 = entry.2.max(dev);
+        }
+
+        // Boundary conformance: a facet bridging across a periodic/closed lateral.
+        if let (Some(face), Some(uv0), Some(uv1), Some(uv2)) =
+            (model.faces.get(fid), v0.uv, v1.uv, v2.uv)
+        {
+            if let Some(surface) = model.surfaces.get(face.surface_id) {
+                if let Some(p) = surface.period_u() {
+                    if periodic_coverage(uv0.0, uv1.0, uv2.0, p) > p * 0.5 {
+                        boundary_crossing += 1;
+                        entry.3 += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut defects: Vec<MeshFaceQualityDefect> = per_face
+        .into_iter()
+        .filter_map(|(fid, (asp, ang, dev, bx))| {
+            let clean = bx == 0
+                && dev <= MeshQuality::MAX_NORMAL_DEVIATION_DEG
+                && asp <= MeshQuality::MAX_ASPECT_RATIO
+                && ang >= MeshQuality::MIN_ANGLE_DEG;
+            if clean {
+                return None;
+            }
+            Some(MeshFaceQualityDefect {
+                face_id: fid as u64,
+                worst_aspect_ratio: asp,
+                min_angle_deg: ang,
+                max_normal_deviation_deg: dev,
+                boundary_crossing_facets: bx,
+            })
+        })
+        .collect();
+    defects.sort_by(|a, b| {
+        b.boundary_crossing_facets
+            .cmp(&a.boundary_crossing_facets)
+            .then(
+                a.min_angle_deg
+                    .partial_cmp(&b.min_angle_deg)
+                    .unwrap_or(Equal),
+            )
+            .then(
+                b.worst_aspect_ratio
+                    .partial_cmp(&a.worst_aspect_ratio)
+                    .unwrap_or(Equal),
+            )
+            .then(
+                b.max_normal_deviation_deg
+                    .partial_cmp(&a.max_normal_deviation_deg)
+                    .unwrap_or(Equal),
+            )
+            .then(a.face_id.cmp(&b.face_id))
+    });
+    let worst_face = defects.into_iter().next();
+
+    Some(MeshQuality::evaluate(
+        mesh.triangles.len(),
+        worst_aspect,
+        min_angle,
+        max_dev,
+        boundary_crossing,
+        worst_face,
+    ))
+}
+
 /// Pure per-mesh tessellation-quality scoring — the heart of
 /// [`tessellation_quality`], split out so it can be unit-tested against
 /// hand-built meshes (a deliberately inverted-normal facet, a zero-area sliver)
