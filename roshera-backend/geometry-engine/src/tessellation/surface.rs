@@ -2446,13 +2446,28 @@ fn tessellate_spherical_polygon(
     // pathological over-sampled-rim case, never on a real fine mesh — and the
     // poke_matrix gate (chord 0.08, `max_segments` 100) is far below it.
     //
-    // Budget = 150k: a FULL `fine()` sphere is ~80k triangles and a single
-    // arrangement-cell fragment is a fraction of one sphere, so 150k is ~2× the
-    // most any single legitimate sphere face can need — it cannot truncate a
-    // real fine mesh, yet hard-bounds the pathological m·n_rings product.
-    const FAN_TRI_BUDGET: usize = 150_000;
-    if m >= 2 && 2 * n_rings * m > FAN_TRI_BUDGET {
-        let capped = (FAN_TRI_BUDGET / (2 * m)).max(2);
+    // Budget = 150k for DISPLAY/EXPORT quality (`default()`/`fine()`, segments
+    // ≥100): a FULL `fine()` sphere is ~80k triangles and a single arrangement-
+    // cell fragment is a fraction of one sphere, so 150k is ~2× the most any
+    // single legitimate sphere face can need — it cannot truncate a real fine
+    // mesh, yet hard-bounds the pathological m·n_rings product. This constant is
+    // PRESERVED exactly for the production tessellation paths (no regression).
+    //
+    // For the internal coarse AUDIT path (`TessellationParams::audit()`, max
+    // segments 24 — used by `mesh_self_intersects` to bound its O(n²) pair scan)
+    // the budget tightens proportionally (~18k): the audit rim already samples
+    // far fewer points, so the smaller cap cannot truncate a legitimate audit
+    // mesh, only the pathological over-sampled-rim fragment that makes the
+    // quadratic self-intersection scan explode. Gating on `max_segments >= 100`
+    // keeps `default()`/`fine()` at the original 150k and only the deliberately-
+    // coarse presets get the tighter cap.
+    let fan_tri_budget: usize = if params.max_segments >= 100 {
+        150_000
+    } else {
+        (750 * params.max_segments).max(12_000)
+    };
+    if m >= 2 && 2 * n_rings * m > fan_tri_budget {
+        let capped = (fan_tri_budget / (2 * m)).max(2);
         n_rings = n_rings.min(capped);
     }
     let mk = |dir: Vector3, mesh: &mut TriangleMesh| -> u32 {

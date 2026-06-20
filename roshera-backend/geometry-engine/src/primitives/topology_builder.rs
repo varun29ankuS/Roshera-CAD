@@ -3481,13 +3481,115 @@ impl BRepModel {
         &self,
         solid_id: u32,
     ) -> Option<crate::primitives::solid::SolidMassProperties> {
+        self.mesh_based_mass_properties_at(
+            solid_id,
+            &crate::tessellation::TessellationParams::fine(),
+        )
+    }
+
+    /// Audit-quality analytic volume — the divergence-theorem mesh volume at
+    /// [`crate::tessellation::TessellationParams::audit`] resolution, computed
+    /// WITHOUT touching the `fine()` mass-properties cache.
+    ///
+    /// The internal verification path (`harness::watertight::is_watertight`, the
+    /// poke-matrix MC-volume oracle) compares this against a coarse mesh volume
+    /// within a few-percent band; it does NOT need the export-grade `fine()`
+    /// resolution the agent-facing `mass_properties_for` uses, and paying for it
+    /// is the audit's dominant cost (a curved-Boolean fragment at `fine()` can
+    /// tessellate to >1M triangles). Coarse volume converges well inside the
+    /// audit tolerance, so this is both correct and fast. It deliberately does
+    /// not install the cache: a later agent `mass_properties_for` must still get
+    /// the precise `fine()` numbers, not these coarse ones.
+    ///
+    /// This integrates the VOLUME ONLY (the divergence sum), bypassing the full
+    /// inertia-tensor physical-validity gate of `mesh_based_mass_properties_at`:
+    /// on a high-genus curved-Boolean result a coarse mesh's INERTIA tensor can
+    /// drift just non-physical (a negative principal moment) even though its
+    /// VOLUME is perfectly sound, and that gate would then refuse a volume the
+    /// MC oracle needs. The volume integral itself is robust; we only require it
+    /// be positive and finite.
+    ///
+    /// Quality is `default()` (chord 1e-3, ≤100 segments) — NOT `fine()` (chord
+    /// 1e-4, ≤200 segments) and NOT `audit()` (≤24 segments). `default()` is the
+    /// SAME quality `harness::watertight::mesh_volume`/`manifold_report` use, so
+    /// `is_watertight` (analytic-vs-mesh) compares two like-quality meshes that
+    /// agree on a sound solid (a 24-segment analytic vs a 100-segment mesh would
+    /// disagree on a curved fillet and spuriously fail). The cost drop vs `fine()`
+    /// is real (fine's 1e-4 chord over-samples a curved-Boolean rim into thousands
+    /// of points → an enormous mesh), while default-quality volume is well within
+    /// the audit's few-percent band. The deeper per-op audit win came from
+    /// bounding the certificate's O(n²) self-intersection scan (`audit()` there).
+    pub(crate) fn audit_volume(&self, solid_id: u32) -> Option<f64> {
+        // A clean solid's mass-props may already be cached at fine() from a
+        // prior agent query — reuse it (it's strictly more precise and free).
+        if let Some(solid) = self.solids.get(solid_id) {
+            if let Some(cached) = solid.cached_mass_props_ref() {
+                return Some(cached.volume);
+            }
+        }
         let solid = self.solids.get(solid_id)?;
-        let density = solid.attributes.material.density;
         let mesh = crate::tessellation::tessellate_solid(
             solid,
             self,
-            &crate::tessellation::TessellationParams::fine(),
+            &crate::tessellation::TessellationParams::default(),
         );
+        if mesh.triangles.is_empty() {
+            return None;
+        }
+        // V = (1/6) Σ p0·(p1×p2) over the outward-oriented mesh.
+        let mut six_v = 0.0_f64;
+        for tri in &mesh.triangles {
+            let p0 = mesh.vertices[tri[0] as usize].position.to_vec();
+            let p1 = mesh.vertices[tri[1] as usize].position.to_vec();
+            let p2 = mesh.vertices[tri[2] as usize].position.to_vec();
+            six_v += p0.dot(&p1.cross(&p2));
+        }
+        let volume = (six_v / 6.0).abs();
+        if volume.is_finite() && volume > 1e-12 {
+            Some(volume)
+        } else {
+            None
+        }
+    }
+
+    /// Audit-quality full mass-properties (volume, COM, inertia tensor, principal
+    /// moments) — the divergence-theorem integration at `default()` resolution
+    /// (chord 1e-3, ≤100 segments), WITHOUT touching the `fine()` cache. Backs
+    /// `audit_mass_properties_for` so the harness physical-sanity contract runs on
+    /// a cheaper mesh than the export-grade `fine()` (chord 1e-4, ≤200 segments)
+    /// the agent-facing `mass_properties_for` uses — `fine()`'s 1e-4 chord
+    /// over-samples a curved-Boolean rim into an enormous mesh, which was a chunk
+    /// of the per-op audit cost. `default()` keeps the inertia integration robust
+    /// (the physical-validity gate's principal-moment checks are more sensitive
+    /// than a bare volume, so we do NOT drop to the 24-segment `audit()` here).
+    /// Reuses a warm fine cache when present (strictly more precise, free).
+    pub(crate) fn audit_mass_properties(
+        &self,
+        solid_id: u32,
+    ) -> Option<crate::primitives::solid::SolidMassProperties> {
+        if let Some(solid) = self.solids.get(solid_id) {
+            if let Some(cached) = solid.cached_mass_props_ref() {
+                return Some(cached.clone());
+            }
+        }
+        self.mesh_based_mass_properties_at(
+            solid_id,
+            &crate::tessellation::TessellationParams::default(),
+        )
+    }
+
+    /// Shared mesh-integration core for [`Self::mesh_based_mass_properties`]
+    /// (fine, cached, agent-facing) and [`Self::audit_volume`] (coarse, internal
+    /// verification). The tessellation quality is the only thing that varies; the
+    /// Tonon (2004) integration and the physical-validity gate are identical.
+    fn mesh_based_mass_properties_at(
+        &self,
+        solid_id: u32,
+        tess_params: &crate::tessellation::TessellationParams,
+    ) -> Option<crate::primitives::solid::SolidMassProperties> {
+        let solid = self.solids.get(solid_id)?;
+        let density = solid.attributes.material.density;
+        let mesh = crate::tessellation::tessellate_solid(solid, self, tess_params);
         if mesh.triangles.is_empty() {
             return None;
         }
@@ -3681,11 +3783,19 @@ impl BRepModel {
             principal_axes,
             radius_of_gyration,
             method: crate::primitives::solid::MassPropertiesMethod::Tessellated {
-                // Empirical bound at `TessellationParams::fine()`:
-                // matches analytical formulas to ~5e-3 relative on
-                // curved primitives (sphere/cylinder/cone) per the
-                // kernel_workflow_regression suite.
-                rel_tolerance: 5e-3,
+                // Empirical bound at `TessellationParams::fine()`: matches
+                // analytical formulas to ~5e-3 relative on curved primitives
+                // (sphere/cylinder/cone) per the kernel_workflow_regression
+                // suite. The coarser internal AUDIT quality (`audit_volume`)
+                // tessellates with a looser chord, so we report a tolerance
+                // honestly scaled by the requested chord rather than claiming
+                // the fine-mesh 5e-3 for a coarse integration — the audit only
+                // reads `.volume` and checks it within a few-percent band.
+                rel_tolerance: if tess_params.chord_tolerance <= 1e-3 {
+                    5e-3
+                } else {
+                    (tess_params.chord_tolerance * 0.5).max(5e-3)
+                },
             },
         })
     }

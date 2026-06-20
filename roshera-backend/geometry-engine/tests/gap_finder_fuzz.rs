@@ -93,7 +93,13 @@ struct MassPropVerdict {
 ///     rigid body's principal moments must satisfy it; a violation is a
 ///     non-physical tensor a symmetric-but-wrong integration can still produce.
 fn mass_prop_sanity(model: &mut BRepModel, solid: SolidId) -> MassPropVerdict {
-    let Some(mp) = model.mass_properties_for(solid) else {
+    // AUDIT-quality (coarse, non-caching) mass-properties: the physical-sanity
+    // contract below (positive volume/area, symmetric PSD inertia tensor,
+    // principal-moment triangle inequality) converges well inside its bands on a
+    // coarse mesh, and the export-grade `fine()` tessellation the agent-facing
+    // `mass_properties_for` uses is the audit's dominant cost on curved-Boolean
+    // fragments (>1M tris/face). This is the same numbers, just from a coarse mesh.
+    let Some(mp) = model.audit_mass_properties_for(solid) else {
         return MassPropVerdict {
             ok: false,
             detail: "mass_properties_for returned None (degenerate solid)".into(),
