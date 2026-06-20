@@ -97,8 +97,19 @@ pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bo
         Some(s) => s,
         None => return false,
     };
-    let mut params = TessellationParams::default();
-    params.chord_tolerance = chord;
+    // AUDIT-bounded tessellation: this is a coarse self-overlap certificate, and
+    // the pair scan below is O(n²) in the triangle count. `default()`'s 100-
+    // segment ceiling lets a curved-Boolean arrangement-cell fragment (whose rim
+    // can sample thousands of points) explode the triangle count, making the
+    // quadratic scan run for tens of seconds — it was the dominant cost of the
+    // per-op certificate audit. `audit()` caps segments at 24 (and the spherical-
+    // fan budget scales with it), bounding `n` so the scan is fast. Gross self-
+    // overlap is visible at this density (the check's stated contract), so the
+    // coarser mesh does not blind it. The caller's `chord` stays the quality knob.
+    let params = TessellationParams {
+        chord_tolerance: chord,
+        ..TessellationParams::audit()
+    };
     let mesh = tessellate_solid(solid_ref, model, &params);
     if mesh.triangles.len() < 2 {
         return false;
@@ -214,6 +225,39 @@ mod tests {
         assert!(
             !triangles_intersect(a, d),
             "edge-sharing triangles do not self-intersect"
+        );
+    }
+
+    /// NON-BLINDNESS AT AUDIT QUALITY: the segment ceiling was lowered to
+    /// `TessellationParams::audit()` (24 segments) to bound this oracle's O(n²)
+    /// pair scan. A clean curved solid must STILL report `false` (no false
+    /// positive from the coarser mesh — adjacent faceting edges only touch, they
+    /// don't cross), AND a sphere/cylinder tessellate to enough triangles that
+    /// the scan is genuinely exercised. This proves the coarsening did not make
+    /// the certificate's self-overlap check vacuous.
+    #[test]
+    fn clean_curved_solids_report_no_self_intersection_at_audit_quality() {
+        use crate::math::vector3::Vector3;
+        use crate::primitives::topology_builder::TopologyBuilder;
+
+        let mut ms = BRepModel::new();
+        TopologyBuilder::new(&mut ms)
+            .create_sphere_3d(Vector3::ZERO, 5.0)
+            .expect("sphere");
+        let s = ms.solids.iter().last().map(|(id, _)| id).expect("sphere");
+        assert!(
+            !mesh_self_intersects(&ms, s, 0.5),
+            "a clean sphere must not self-intersect at the audit chord"
+        );
+
+        let mut mc = BRepModel::new();
+        TopologyBuilder::new(&mut mc)
+            .create_cylinder_3d(Vector3::ZERO, Vector3::Z, 3.0, 8.0)
+            .expect("cyl");
+        let c = mc.solids.iter().last().map(|(id, _)| id).expect("cyl");
+        assert!(
+            !mesh_self_intersects(&mc, c, 0.5),
+            "a clean cylinder must not self-intersect at the audit chord"
         );
     }
 }

@@ -115,7 +115,17 @@ pub fn run_cell(
     let (a, b) = (case.build)(&mut m);
     match boolean_operation(&mut m, a, b, op, BooleanOptions::default()) {
         Ok(result) => {
-            let kernel_volume = m.calculate_solid_volume(result);
+            // AUDIT-quality volume (`default()` resolution via `audit_volume`,
+            // non-caching): the MC oracle compares against a Monte-Carlo truth
+            // within a few-percent band (`vol_tol`), so the export-grade `fine()`
+            // mass-properties volume is unnecessary precision here and was the
+            // matrix's dominant cost on the curved-Boolean fragments it exercises.
+            // `audit_volume` integrates the divergence volume at `default()`
+            // (100-segment) quality — well inside `vol_tol` for the SOUND cells.
+            // (A genuinely-broken cell such as `torus/rim-poke`, whose Boolean
+            // result is an open husk, is wrong at `fine()` too — coarsening does
+            // not mask it; it stays correctly flagged.)
+            let kernel_volume = m.audit_volume(result);
             let scale = truth.abs().max(kernel_volume.unwrap_or(0.0).abs()).max(1.0);
             let volume_ok = kernel_volume.is_some_and(|v| (v - truth).abs() / scale <= vol_tol);
             let manifold = manifold_report(&m, result, chord, 1e-6);

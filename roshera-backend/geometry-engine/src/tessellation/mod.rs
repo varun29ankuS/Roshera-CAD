@@ -71,6 +71,35 @@ impl TessellationParams {
         }
     }
 
+    /// Parameters for the COARSE internal self-intersection certificate — a hard
+    /// segment ceiling (`max_segments 24`) bounding the triangle count that the
+    /// O(n²) mesh self-intersection pair scan
+    /// ([`crate::harness::self_intersection::mesh_self_intersects`]) runs over.
+    ///
+    /// The certificate's self-overlap check was the dominant cost of the per-op
+    /// verification audit: a curved-Boolean arrangement-cell fragment sampled at
+    /// `default()`/`fine()` density produces thousands of rim triangles, and the
+    /// quadratic pair scan over them ran for tens of seconds per op. Gross self-
+    /// overlap is a coarse geometric fault, visible at low density (the check's
+    /// own stated contract), so a 24-segment mesh detects it just as reliably
+    /// while keeping `n²` small. The spherical-fan triangle budget also tightens
+    /// for sub-100-segment presets (see `surface.rs`), reinforcing the bound.
+    ///
+    /// Coarse-grade — between `coarse()` and `realtime()`. DISPLAY/EXPORT
+    /// tessellation, the agent-facing `mass_properties_for`, and the watertight /
+    /// audit mass-properties oracles all stay at `fine()`/`default()` — only the
+    /// self-intersection scan uses this. Precedent: `solid_gwn_triangles` already
+    /// uses `coarse()` for GWN classification.
+    pub fn audit() -> Self {
+        Self {
+            max_edge_length: 0.5,
+            max_angle_deviation: 0.3,
+            chord_tolerance: 0.05,
+            min_segments: 6,
+            max_segments: 24,
+        }
+    }
+
     /// Create parameters for ultra-fast real-time preview
     pub fn realtime() -> Self {
         Self {
@@ -733,15 +762,18 @@ mod watertight_tests {
         assert_eq!(mesh.triangles[0], [p0, p1, p2]);
         assert_eq!(mesh.face_map[0], 0);
 
-        // Second-shell triangles must have q3 collapsed to q0 — but
-        // since q3 ↔ q0 collapse makes both triangles share the same
-        // 3-vertex set, the second triangle becomes (q0, q1, q2) which
-        // is a duplicate of the first; both must survive (welding does
-        // not deduplicate identical triangles, only collapses indices).
-        assert_eq!(mesh.triangles.len(), 3);
-        assert_eq!(mesh.triangles[1], [q0, q1, q2]);
-        assert_eq!(mesh.triangles[2], [q0, q1, q2]); // q3 → q0
-        assert_eq!(mesh.face_map, vec![0, 1, 2]);
+        // Second-shell triangles have q3 collapsed to q0, so the second
+        // shell triangle (q3, q1, q2) becomes (q0, q1, q2) — an exact,
+        // same-winding duplicate of the first shell triangle. The weld
+        // pass's doubled-facet removal (#65) collapses same-winding exact
+        // duplicates to a single representative (an emitted-twice facet is
+        // a non-manifold fin over an already-covered patch), so exactly ONE
+        // of the two survives. The head triangle, being outside the weld
+        // range, is untouched. `face_map` shrinks in lock-step with the
+        // surviving triangles.
+        assert_eq!(mesh.triangles.len(), 2);
+        assert_eq!(mesh.triangles[1], [q0, q1, q2]); // q3 → q0; duplicate dropped
+        assert_eq!(mesh.face_map, vec![0, 1]);
     }
 
     /// K13 — winding consistency. For a closed convex solid centred at
