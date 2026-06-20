@@ -3554,8 +3554,19 @@ fn tessellate_toroidal_trimmed(
     }
 
     // Open boundary: directed edges with no reverse twin → next-vertex chain.
+    // Iterate `dir_edges` in SORTED key order: it is a HashMap, and when a
+    // boundary vertex has more than one outgoing edge (a degenerate pinch in
+    // the membership grid) the last `next.insert` wins, so a per-process hash
+    // order would pick a different successor — and the entire stitch-band
+    // triangle EMISSION ORDER below derives from this chain. Identical triangles
+    // summed in a different order gave the toroidal volume a ~1e-3 run-to-run
+    // jitter even once the topology was fixed (#37). Sorting makes the chain a
+    // pure function of the grid.
+    let mut dir_keys: Vec<(u32, u32)> = dir_edges.keys().copied().collect();
+    dir_keys.sort_unstable();
     let mut next: HashMap<u32, u32> = HashMap::new();
-    for (&(a, b), &cnt) in &dir_edges {
+    for &(a, b) in &dir_keys {
+        let cnt = dir_edges.get(&(a, b)).copied().unwrap_or(0);
         if cnt > 0 && !dir_edges.contains_key(&(b, a)) {
             next.insert(a, b);
         }
@@ -3565,9 +3576,15 @@ fn tessellate_toroidal_trimmed(
         let j = (k as usize) % n_v;
         (gpos[i][j], gid[i][j].unwrap_or(0))
     };
+    // Walk the boundary loops from SORTED start vertices. `visited` is shared
+    // across starts, so the discovery order decides which chain claims a vertex
+    // a degenerate junction shares — a HashMap key order would partition the
+    // loops differently each run. Sorted starts make the loop set deterministic.
+    let mut next_starts: Vec<u32> = next.keys().copied().collect();
+    next_starts.sort_unstable();
     let mut visited: HashSet<u32> = HashSet::new();
     let mut loops: Vec<Vec<u32>> = Vec::new();
-    for &start in next.keys() {
+    for &start in &next_starts {
         if visited.contains(&start) {
             continue;
         }
