@@ -291,6 +291,101 @@ async fn roundtrip_multi_solid() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Multi-face curved solid with a hole — the user's real case class.
+//
+// A box with a clean cylindrical through-bore (boolean difference) is a
+// 19-ish-face solid whose curved/split faces, when the analytic surface
+// downcasts miss them, fall to the writer's *sampled* B-spline fallback.
+// Before the fix that fallback emitted EMPTY knot vectors
+// (`B_SPLINE_SURFACE_WITH_KNOTS(…,(),(),(),())`), which every conformant
+// reader (Roshera's own importer, OCCT/FreeCAD, Parasolid, ACIS) rejects
+// — dropping the face and tearing topology gaps in every adjacent edge.
+// This is exactly the "7 boundary-edge gaps → invalid, non-watertight"
+// failure the user hit. The fix emits a valid clamped knot vector, so
+// the bored box now round-trips VALID. This gate pins it.
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn roundtrip_bored_box_with_hole() {
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use geometry_engine::operations::transform::{translate, TransformOptions};
+
+    let mut model = BRepModel::new();
+    let box_id = BoxPrimitive::create(BoxParameters::new(40.0, 40.0, 20.0).unwrap(), &mut model)
+        .expect("box");
+    // Cylinder longer than the box, centered, axis Z — a clean through-bore.
+    let cyl_id = CylinderPrimitive::create(CylinderParameters::new(6.0, 60.0).unwrap(), &mut model)
+        .expect("cyl");
+    translate(
+        &mut model,
+        vec![cyl_id],
+        Vector3::new(0.0, 0.0, 1.0),
+        -30.0,
+        TransformOptions::default(),
+    )
+    .expect("translate cylinder through the box");
+    let result = boolean_operation(
+        &mut model,
+        box_id,
+        cyl_id,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("box - cylinder difference");
+
+    // Source must be a clean solid (we are testing the round-trip, not
+    // the boolean kernel).
+    let orig = validate_solid_scoped(
+        &model,
+        result,
+        Tolerance::default(),
+        ValidationLevel::Standard,
+    );
+    assert!(
+        orig.is_valid,
+        "source bored box must be valid before we test its round-trip: {:?}",
+        orig.errors
+    );
+
+    let (text, imported, _report) = export_then_import(&model, "rt_bored_box").await;
+
+    // The fix's signature: the writer must NOT emit an empty knot list.
+    assert!(
+        !text.contains("(),(),(),()") && !text.contains("(),()"),
+        "no B-spline may serialize with empty knot vectors"
+    );
+    assert!(check_references_resolve(&text), "all #N refs must resolve");
+
+    assert_eq!(
+        imported.solids.len(),
+        1,
+        "bored box must re-import as exactly one solid"
+    );
+    let sid = imported
+        .solids
+        .iter()
+        .next()
+        .map(|(id, _)| id)
+        .expect("imported solid id");
+    let v = validate_solid_scoped(
+        &imported,
+        sid,
+        Tolerance::default(),
+        ValidationLevel::Standard,
+    );
+    assert!(
+        v.is_valid,
+        "re-imported bored box must be VALID (0 connectivity gaps), got {} errors: {:?}",
+        v.errors.len(),
+        v.errors
+            .iter()
+            .take(5)
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // NURBS barrel — export well-formedness + precise import status.
 // ─────────────────────────────────────────────────────────────────────
 

@@ -982,17 +982,21 @@ impl<W: Write> StepWriter<W> {
     fn write_product_structure(&mut self, name: &str, shape_rep_id: StepId) -> std::io::Result<()> {
         let label = escape_step_string(name);
 
+        // Application context / protocol strings are driven by the
+        // declared protocol so they agree with the FILE_SCHEMA identifier.
         let app_ctx = self.next_id();
         writeln!(
             self.writer,
-            "{}=APPLICATION_CONTEXT('managed model based 3d engineering');",
-            app_ctx
+            "{}=APPLICATION_CONTEXT('{}');",
+            app_ctx,
+            self.protocol.application_context()
         )?;
+        let (proto_schema, proto_year) = self.protocol.protocol_definition();
         let app_proto = self.next_id();
         writeln!(
             self.writer,
-            "{}=APPLICATION_PROTOCOL_DEFINITION('international standard','ap242_managed_model_based_3d_engineering',2020,{});",
-            app_proto, app_ctx
+            "{}=APPLICATION_PROTOCOL_DEFINITION('international standard','{}',{},{});",
+            app_proto, proto_schema, proto_year, app_ctx
         )?;
         let prod_ctx = self.next_id();
         writeln!(
@@ -1496,20 +1500,66 @@ pub enum StepApplicationProtocol {
 
 impl StepApplicationProtocol {
     /// Schema name written into the STEP `FILE_SCHEMA` header for
-    /// this protocol. Matches the canonical short-form schema
-    /// identifier emitted by mainstream CAD systems.
+    /// this protocol.
+    ///
+    /// ISO 10303-21 §8 models `FILE_SCHEMA` as a list of *schema
+    /// identifier* strings. For the configuration-controlled families
+    /// (AP203 / AP214) the conformant identifier carries the schema
+    /// **object identifier** in braces — e.g.
+    /// `AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }`. Emitting the
+    /// bare schema name without that object identifier is what some
+    /// readers (notably OCCT / FreeCAD's STEP reader, when the file
+    /// also has fragile topology) refused to open. We now emit the
+    /// fully-qualified identifier for every protocol so the header is
+    /// unambiguous.
     pub fn schema_name(self) -> &'static str {
         match self {
-            Self::AP203 => "CONFIG_CONTROL_DESIGN",
-            Self::AP214 => "AUTOMOTIVE_DESIGN",
-            Self::AP242 => "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF",
+            Self::AP203 => "CONFIG_CONTROL_DESIGN { 1 0 10303 203 1 1 1 1 }",
+            Self::AP214 => "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }",
+            // AP242 ed.2 MIM long-form — the canonical fully-qualified id.
+            Self::AP242 => {
+                "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }"
+            }
+        }
+    }
+
+    /// `APPLICATION_CONTEXT` description string for this protocol — the
+    /// human-readable application domain the file targets. Must agree
+    /// with the [`Self::schema_name`] family so the product-structure
+    /// chain is internally consistent (a file that declares
+    /// `AUTOMOTIVE_DESIGN` in `FILE_SCHEMA` but carries an
+    /// `ap242_…` `APPLICATION_CONTEXT` mixes protocols and trips
+    /// stricter readers).
+    pub fn application_context(self) -> &'static str {
+        match self {
+            Self::AP203 => "configuration controlled 3d designs of mechanical parts and assemblies",
+            Self::AP214 => "automotive design",
+            Self::AP242 => "managed model based 3d engineering",
+        }
+    }
+
+    /// `(schema_id, year)` for the `APPLICATION_PROTOCOL_DEFINITION`
+    /// entity. The schema id is the lowercase long-form name (no
+    /// object identifier — that's the `FILE_SCHEMA`'s job) and the
+    /// year is the protocol's published edition.
+    pub fn protocol_definition(self) -> (&'static str, u32) {
+        match self {
+            Self::AP203 => ("config_control_design", 1994),
+            Self::AP214 => ("automotive_design", 2010),
+            Self::AP242 => ("ap242_managed_model_based_3d_engineering", 2020),
         }
     }
 }
 
 impl Default for StepApplicationProtocol {
     fn default() -> Self {
-        // AP242 is Roshera's canonical export protocol.
+        // AP242 is the modern superset of AP203/AP214 (it subsumes both
+        // their MIMs) and is fully supported by every mainstream reader
+        // and kernel translator (OCCT/FreeCAD, Parasolid, ACIS). It is
+        // Roshera's canonical export target. The header now emits the
+        // fully-qualified schema identifier (with object identifier),
+        // which is what conformant readers require — the previous bare
+        // name was the latent header defect.
         Self::AP242
     }
 }
@@ -1606,18 +1656,22 @@ mod tests {
         assert!(out.contains("FILE_DESCRIPTION"));
         assert!(out.contains("Roshera CAD Model"));
         assert!(out.contains("FILE_NAME"));
-        // Default protocol is AP242 — see StepApplicationProtocol::default.
+        // Default protocol is AP242 — the modern superset, fully read by
+        // OCCT/FreeCAD, Parasolid, and ACIS. The schema id MUST carry
+        // its object identifier in braces (the previous bare-name form
+        // was the latent header defect).
         assert!(
-            out.contains("FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF'))"),
-            "default writer must declare AP242, got: {out}"
+            out.contains(
+                "FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }'))"
+            ),
+            "default writer must declare fully-qualified AP242 schema, got: {out}"
         );
         assert!(out.contains("ENDSEC;"));
     }
 
     #[test]
     fn write_header_honours_legacy_ap214_protocol() {
-        // `with_protocol` overrides the AP242 default. Used when
-        // round-tripping with vendors that have not migrated yet.
+        // `with_protocol` overrides the AP242 default for legacy vendors.
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut w = StepWriter::with_protocol(&mut buf, StepApplicationProtocol::AP214);
@@ -1626,8 +1680,8 @@ mod tests {
         }
         let out = String::from_utf8(buf).expect("STEP output must be UTF-8");
         assert!(
-            out.contains("FILE_SCHEMA(('AUTOMOTIVE_DESIGN'))"),
-            "AP214 writer must declare AUTOMOTIVE_DESIGN, got: {out}"
+            out.contains("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'))"),
+            "AP214 writer must declare fully-qualified AUTOMOTIVE_DESIGN, got: {out}"
         );
     }
 
@@ -1641,8 +1695,8 @@ mod tests {
         }
         let out = String::from_utf8(buf).expect("STEP output must be UTF-8");
         assert!(
-            out.contains("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'))"),
-            "AP203 writer must declare CONFIG_CONTROL_DESIGN, got: {out}"
+            out.contains("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN { 1 0 10303 203 1 1 1 1 }'))"),
+            "AP203 writer must declare fully-qualified CONFIG_CONTROL_DESIGN, got: {out}"
         );
     }
 
@@ -2070,15 +2124,15 @@ mod tests {
     fn step_application_protocol_schema_names() {
         assert_eq!(
             StepApplicationProtocol::AP203.schema_name(),
-            "CONFIG_CONTROL_DESIGN"
+            "CONFIG_CONTROL_DESIGN { 1 0 10303 203 1 1 1 1 }"
         );
         assert_eq!(
             StepApplicationProtocol::AP214.schema_name(),
-            "AUTOMOTIVE_DESIGN"
+            "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }"
         );
         assert_eq!(
             StepApplicationProtocol::AP242.schema_name(),
-            "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF"
+            "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }"
         );
     }
 
