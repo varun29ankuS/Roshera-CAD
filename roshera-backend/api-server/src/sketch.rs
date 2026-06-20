@@ -1486,6 +1486,24 @@ pub async fn get_sketch(
     Ok(Json(session))
 }
 
+/// `GET /api/sketch/{id}/recognize` — analytic IDENTITY of a live sketch
+/// ("is a gear a gear?"). Bridges the session to a kernel `Sketch` and runs the
+/// analytic recognizer, returning the measured shape class (circle / triangle /
+/// rectangle / square / regular-polygon / polygon / compound) — not a VLM guess.
+/// Read-only; the agent-facing `recognize_sketch` MCP tool wraps this.
+pub async fn recognize_sketch_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<geometry_engine::sketch2d::Recognition>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+    let sketch = session.to_kernel_sketch();
+    Ok(Json(geometry_engine::sketch2d::recognize_sketch(&sketch)))
+}
+
 /// `GET /api/sketch/{id}/regions` — read-only region classification
 /// for an in-progress sketch session. Returns the same data the
 /// extrude pipeline will see at finalise time, so a hover preview
