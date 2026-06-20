@@ -568,7 +568,74 @@ impl ConstraintStore {
             }
         }
 
+        // Transitive coincidence vs separation (the DCM-grade tier): points
+        // joined by a CHAIN of Coincident constraints share one location, so any
+        // Distance > 0 between two of them is contradictory even though no single
+        // Coincident names that pair (e.g. a≡b, b≡c, distance(a,c)=10). Pairwise
+        // comparison cannot see it; a union-find over the Coincident graph does.
+        let mut parent: std::collections::HashMap<Point2dId, Point2dId> =
+            std::collections::HashMap::new();
+        let mut witness: std::collections::HashMap<Point2dId, ConstraintId> =
+            std::collections::HashMap::new();
+        for entry in self.constraints.iter() {
+            let con = entry.value();
+            if let ConstraintType::Geometric(GeometricConstraint::Coincident) = &con.constraint_type
+            {
+                if let [EntityRef::Point(a), EntityRef::Point(b)] = con.entities.as_slice() {
+                    let (a, b) = (*a, *b);
+                    let ra = Self::uf_find(&mut parent, a);
+                    let rb = Self::uf_find(&mut parent, b);
+                    if ra != rb {
+                        parent.insert(ra, rb);
+                    }
+                    witness.entry(a).or_insert(con.id);
+                    witness.entry(b).or_insert(con.id);
+                }
+            }
+        }
+        if !parent.is_empty() {
+            for entry in self.constraints.iter() {
+                let con = entry.value();
+                if let ConstraintType::Dimensional(DimensionalConstraint::Distance(v)) =
+                    &con.constraint_type
+                {
+                    if v.abs() > 1e-9 {
+                        if let [EntityRef::Point(p), EntityRef::Point(q)] = con.entities.as_slice()
+                        {
+                            let (p, q) = (*p, *q);
+                            if Self::uf_find(&mut parent, p) == Self::uf_find(&mut parent, q) {
+                                if let Some(w) =
+                                    witness.get(&p).or_else(|| witness.get(&q)).copied()
+                                {
+                                    conflicts.push((con.id, w));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         conflicts
+    }
+
+    /// Union-find root with path compression over point ids. Used by
+    /// `find_conflicts` to take the transitive closure of Coincident
+    /// constraints so a chained coincidence is treated as one location.
+    fn uf_find(
+        parent: &mut std::collections::HashMap<Point2dId, Point2dId>,
+        x: Point2dId,
+    ) -> Point2dId {
+        let p = match parent.get(&x) {
+            Some(&p) => p,
+            None => return x,
+        };
+        if p == x {
+            return x;
+        }
+        let root = Self::uf_find(parent, p);
+        parent.insert(x, root);
+        root
     }
 
     /// Check if two constraints conflict with each other
