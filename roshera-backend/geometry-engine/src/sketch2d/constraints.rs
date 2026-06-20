@@ -614,6 +614,52 @@ impl ConstraintStore {
                     }
                 }
             }
+
+            // Coordinate coherence within a coincident group: points forced
+            // coincident cannot carry different fixed X (or Y) coordinates, even
+            // when the two coordinate constraints name DIFFERENT points in the
+            // same chain (x(a)=0, x(c)=5 with a≡b≡c). The same-point case is
+            // already caught pairwise; here we only consider coincidence-touched
+            // points so we don't double-report it.
+            let mut x_by_root: std::collections::HashMap<Point2dId, (f64, ConstraintId)> =
+                std::collections::HashMap::new();
+            let mut y_by_root: std::collections::HashMap<Point2dId, (f64, ConstraintId)> =
+                std::collections::HashMap::new();
+            for entry in self.constraints.iter() {
+                let con = entry.value();
+                let coord = match &con.constraint_type {
+                    ConstraintType::Dimensional(DimensionalConstraint::XCoordinate(v)) => {
+                        Some((true, *v))
+                    }
+                    ConstraintType::Dimensional(DimensionalConstraint::YCoordinate(v)) => {
+                        Some((false, *v))
+                    }
+                    _ => None,
+                };
+                if let Some((is_x, v)) = coord {
+                    if let [EntityRef::Point(p)] = con.entities.as_slice() {
+                        let p = *p;
+                        // `witness` holds every coincidence-touched point;
+                        // `parent` does not (a group's final root is only ever a
+                        // value, never a key), so gate on `witness`.
+                        if !witness.contains_key(&p) {
+                            continue; // not in any coincident group
+                        }
+                        let root = Self::uf_find(&mut parent, p);
+                        let map = if is_x { &mut x_by_root } else { &mut y_by_root };
+                        match map.get(&root) {
+                            Some(&(prev_v, prev_id)) => {
+                                if (prev_v - v).abs() > 1e-9 {
+                                    conflicts.push((con.id, prev_id));
+                                }
+                            }
+                            None => {
+                                map.insert(root, (v, con.id));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         conflicts
