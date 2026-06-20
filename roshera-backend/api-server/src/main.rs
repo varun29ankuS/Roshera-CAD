@@ -6760,6 +6760,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Roshera CAD API server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // Roshera startup banner — the orange 🅡 mark (filled-circle R) printed once
+    // the server is actually listening. ANSI truecolor orange (#FF8C00).
+    println!(
+        "\n  \x1b[1;38;2;255;140;0m🅡  ROSHERA\x1b[0m   \x1b[38;5;245magent-native geometry kernel\x1b[0m\n     \x1b[38;5;245mlistening on\x1b[0m http://localhost:8081\n"
+    );
+
     axum::serve(listener, app).await?;
 
     Ok(())
