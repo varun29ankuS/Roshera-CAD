@@ -11002,7 +11002,15 @@ fn presplit_boundary_t_junctions(
         return Ok(());
     }
 
-    for (edge_id, mut splits) in edge_splits {
+    // SORTED edge-id order: the body mints sub-edges via `model.edges.add`, so
+    // a HashMap iteration would assign fresh EdgeIds in a per-process-seeded
+    // order and make the boolean non-deterministic (same root cause as
+    // `compute_edge_intersections`, #37). Sort so EdgeId assignment is a pure
+    // function of topology.
+    let mut ordered_splits: Vec<(EdgeId, Vec<(f64, VertexId)>)> =
+        edge_splits.into_iter().collect();
+    ordered_splits.sort_by_key(|(eid, _)| *eid);
+    for (edge_id, mut splits) in ordered_splits {
         splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         // Dedup adjacent entries with the same vertex id (two cuts
         // ending at one T-junction on the same boundary edge).
@@ -11374,7 +11382,19 @@ pub(super) fn compute_edge_intersections(
             .push((op.parameter, op.vertex_id));
     }
 
-    for (edge_id, mut splits) in edge_splits {
+    // Apply the edge splits in SORTED edge-id order. The loop body mints new
+    // sub-edges via `model.edges.add`, so the iteration order is the order in
+    // which fresh EdgeIds are assigned in the global store. A HashMap iteration
+    // (seeded per process) therefore stamped the cut sub-edges with different
+    // EdgeIds run-to-run; those ids are the BTreeMap keys the DCEL arrangement
+    // walk and every downstream weld/canonicalise pass iterate in id order, so
+    // the same input produced a different region partition each run (the
+    // torus/rim-poke cell returned three different volumes). Sorting the split
+    // application makes EdgeId assignment a pure function of topology. (#37)
+    let mut ordered_splits: Vec<(EdgeId, Vec<(f64, VertexId)>)> =
+        edge_splits.into_iter().collect();
+    ordered_splits.sort_by_key(|(eid, _)| *eid);
+    for (edge_id, mut splits) in ordered_splits {
         // Sort by parameter so we split from start to end
         splits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 

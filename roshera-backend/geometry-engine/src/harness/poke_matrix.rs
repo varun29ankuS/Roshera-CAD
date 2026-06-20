@@ -415,6 +415,96 @@ mod tests {
         );
     }
 
+    /// Build one case under one op 5× IN ONE PROCESS and collect the
+    /// (volume, faces, edges, vertices, tess-triangle-count) fingerprint of
+    /// each run. A correct, reproducible kernel returns the SAME fingerprint
+    /// every time; a HashMap/HashSet-iteration-order-dependent weld returns
+    /// different volumes/counts run-to-run (the torus/rim-poke cell yielded
+    /// 74.79 / 59.42 / 64.81 before the determinism sweep).
+    fn determinism_fingerprints(
+        case_name: &str,
+        op: BooleanOp,
+        runs: usize,
+    ) -> Vec<(u64, usize, usize, usize, usize)> {
+        let case = catalog()
+            .into_iter()
+            .find(|c| c.name == case_name)
+            .expect("case present in catalog");
+        let mut out = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let mut m = BRepModel::new();
+            let (a, b) = (case.build)(&mut m);
+            let result = boolean_operation(&mut m, a, b, op, BooleanOptions::default())
+                .expect("boolean must not error");
+            let vol = m.calculate_solid_volume(result).unwrap_or(f64::NAN);
+            // Quantise the volume so legitimate last-ULP float noise from a
+            // *fixed* computation order does not masquerade as nondeterminism,
+            // while the 10–15-unit swings of an order-dependent weld still show.
+            let vq = (vol * 1e6).round() as u64;
+            let faces = m
+                .solids
+                .get(result)
+                .map(|s| {
+                    std::iter::once(s.outer_shell)
+                        .chain(s.inner_shells.iter().copied())
+                        .filter_map(|sh| m.shells.get(sh))
+                        .map(|sh| sh.faces.len())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+            let report = manifold_report(&m, result, 0.08, 1e-6);
+            let tris = report.as_ref().map(|r| r.triangles).unwrap_or(0);
+            let edges = report.as_ref().map(|r| r.undirected_edges).unwrap_or(0);
+            let verts = report.as_ref().map(|r| r.welded_vertices).unwrap_or(0);
+            out.push((vq, faces, tris, edges, verts));
+        }
+        out
+    }
+
+    /// THE determinism gate (#37): the torus/rim-poke weld must be reproducible.
+    /// Builds the union 5× in one process; every run's
+    /// (volume, faces, tris, edges, verts) fingerprint must be identical, and
+    /// none may panic. This is the cell that returned three different volumes
+    /// (74.79 / 59.42 / 64.81 vs truth 68.55) because the curved weld picked a
+    /// different merge order each run.
+    #[test]
+    fn torus_boolean_is_deterministic() {
+        for op in [
+            BooleanOp::Union,
+            BooleanOp::Intersection,
+            BooleanOp::Difference,
+        ] {
+            let fps = determinism_fingerprints("torus/rim-poke", op, 5);
+            let first = fps[0];
+            for (i, fp) in fps.iter().enumerate() {
+                assert_eq!(
+                    *fp, first,
+                    "torus/rim-poke {op:?} NONDETERMINISTIC: run {i} fingerprint \
+                     (vol*1e6, faces, tris, edges, verts) = {fp:?} != run0 {first:?}; \
+                     full set = {fps:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diag — ROSHERA_BOOL_TRACE=1 to localize the diverging stage"]
+    fn diag_torus_determinism_trace() {
+        let case = catalog()
+            .into_iter()
+            .find(|c| c.name == "torus/rim-poke")
+            .unwrap();
+        for run in 0..4 {
+            eprintln!("[bool] ===RUN {run}===");
+            let mut m = BRepModel::new();
+            let (a, b) = (case.build)(&mut m);
+            let r = boolean_operation(&mut m, a, b, BooleanOp::Union, BooleanOptions::default())
+                .expect("ok");
+            let vol = m.calculate_solid_volume(r).unwrap_or(f64::NAN);
+            eprintln!("[bool] ===RUN {run} VOL={vol}===");
+        }
+    }
+
     /// Full-matrix diagnostic. Run with
     /// `cargo test -p geometry-engine --lib diag_poke_matrix -- --ignored --nocapture`
     /// to print every cell's volume + topology verdict. This is the live frontier
