@@ -71,6 +71,35 @@ impl TessellationParams {
         }
     }
 
+    /// Parameters for the COARSE internal self-intersection certificate — a hard
+    /// segment ceiling (`max_segments 24`) bounding the triangle count that the
+    /// O(n²) mesh self-intersection pair scan
+    /// ([`crate::harness::self_intersection::mesh_self_intersects`]) runs over.
+    ///
+    /// The certificate's self-overlap check was the dominant cost of the per-op
+    /// verification audit: a curved-Boolean arrangement-cell fragment sampled at
+    /// `default()`/`fine()` density produces thousands of rim triangles, and the
+    /// quadratic pair scan over them ran for tens of seconds per op. Gross self-
+    /// overlap is a coarse geometric fault, visible at low density (the check's
+    /// own stated contract), so a 24-segment mesh detects it just as reliably
+    /// while keeping `n²` small. The spherical-fan triangle budget also tightens
+    /// for sub-100-segment presets (see `surface.rs`), reinforcing the bound.
+    ///
+    /// Coarse-grade — between `coarse()` and `realtime()`. DISPLAY/EXPORT
+    /// tessellation, the agent-facing `mass_properties_for`, and the watertight /
+    /// audit mass-properties oracles all stay at `fine()`/`default()` — only the
+    /// self-intersection scan uses this. Precedent: `solid_gwn_triangles` already
+    /// uses `coarse()` for GWN classification.
+    pub fn audit() -> Self {
+        Self {
+            max_edge_length: 0.5,
+            max_angle_deviation: 0.3,
+            chord_tolerance: 0.05,
+            min_segments: 6,
+            max_segments: 24,
+        }
+    }
+
     /// Create parameters for ultra-fast real-time preview
     pub fn realtime() -> Self {
         Self {
