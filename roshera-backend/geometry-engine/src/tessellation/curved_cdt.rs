@@ -564,6 +564,57 @@ fn generate_steiner_candidates(
         }
     }
 
+    // TRIM-ALIGNED rows. The developable v-collapse (nv → min_segments) leaves the
+    // interior grid too sparse in v to follow a TRIMMED boundary: where the outer
+    // (or an inner) loop has vertices at intermediate heights — a bore interrupted
+    // by a pocket/slot — the CDT has no interior point to connect those heights to
+    // and bridges the gap with a single diameter-spanning triangle (the bore
+    // "wing": aspect ~98 vs the developable norm ~20). Seed an interior row of
+    // u-samples at each DISTINCT intermediate boundary height so the grid follows
+    // the trim and the CDT produces well-shaped local triangles instead of a
+    // bridge. Bounded — only the heights the boundary actually introduces, deduped
+    // — and strictly interior (keepout from every boundary edge) so no Steiner
+    // lands on a fixed edge. A no-op on a clean rectangular wall (no intermediate
+    // heights), so the lean clean-cylinder mesh is unchanged.
+    let near_outer_edge = |u: f64, v: f64| -> bool {
+        let m = outer_polygon.len();
+        (0..m).any(|k| {
+            let (ax, ay) = outer_polygon[k];
+            let (bx, by) = outer_polygon[(k + 1) % m];
+            point_segment_distance_uv((u, v), (ax, ay), (bx, by)) < keepout
+        })
+    };
+    let v_eps = v_span * 1e-3;
+    let mut trim_vs: Vec<f64> = Vec::new();
+    for poly in std::iter::once(outer_polygon).chain(inner_polygons.iter().map(|p| p.as_slice())) {
+        for &(_, v) in poly {
+            if v > v_lo + v_eps
+                && v < v_hi - v_eps
+                && !trim_vs.iter().any(|&t| (t - v).abs() < v_eps)
+            {
+                trim_vs.push(v);
+            }
+        }
+    }
+    for &v in &trim_vs {
+        for i in 1..nu {
+            let u = u_lo + (i as f64) * u_span / (nu as f64);
+            if !is_inside_uv_polygon((u, v), outer_polygon) {
+                continue;
+            }
+            if inner_polygons
+                .iter()
+                .any(|p| is_inside_uv_polygon((u, v), p))
+            {
+                continue;
+            }
+            if near_outer_edge(u, v) || near_inner_edge(u, v) {
+                continue;
+            }
+            candidates.push((u, v));
+        }
+    }
+
     candidates
 }
 
@@ -1256,6 +1307,23 @@ fn refine_to_convergence(
     model: &BRepModel,
     params: &TessellationParams,
 ) -> (Vec<(f64, f64)>, Vec<[usize; 3]>) {
+    // Developable fast-path (cylinder / cone). A zero-Gaussian-curvature lateral
+    // is already chord-faithful after the initial CDT: the developable-direction
+    // collapse plus the curvature-driven `EdgeSampleCache` rim give the optimal
+    // mesh, and interior Ruppert refinement cannot improve it — it only cascades.
+    // On a full-2π TRIMMED bore wall the per-pass chord + skinny scans both fire
+    // on the coarse-rim skinny triangles and DOUBLE the triangle count every pass
+    // (instrumented: 798 → 1834 → 4048 → 9618, with ~15k boundary-encroachment
+    // drops), producing the sliver "wings" the user reported on the inner bore.
+    // A partial (un-seamed) wall happens to stay under tolerance and converges
+    // with zero additions, which is why only the full-2π trimmed wall exploded;
+    // gating on the surface (not the symptom) covers both. Emit the initial
+    // triangulation directly. Doubly-curved surfaces (sphere/torus/NURBS) fall
+    // through and refine; correctness on these laterals is held by the curved
+    // poke matrix + analytic-watertight + HARNESS-1000 gates.
+    if surface.is_developable() {
+        return (initial_pts2d, initial_triangles);
+    }
     let outer_uv_len = outer.points_uv.len();
     let inner_uv_lens: Vec<usize> = inners.iter().map(|p| p.points_uv.len()).collect();
     let boundary_points = outer_uv_len + inner_uv_lens.iter().sum::<usize>();
