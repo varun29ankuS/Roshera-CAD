@@ -762,15 +762,18 @@ mod watertight_tests {
         assert_eq!(mesh.triangles[0], [p0, p1, p2]);
         assert_eq!(mesh.face_map[0], 0);
 
-        // Second-shell triangles must have q3 collapsed to q0 — but
-        // since q3 ↔ q0 collapse makes both triangles share the same
-        // 3-vertex set, the second triangle becomes (q0, q1, q2) which
-        // is a duplicate of the first; both must survive (welding does
-        // not deduplicate identical triangles, only collapses indices).
-        assert_eq!(mesh.triangles.len(), 3);
-        assert_eq!(mesh.triangles[1], [q0, q1, q2]);
-        assert_eq!(mesh.triangles[2], [q0, q1, q2]); // q3 → q0
-        assert_eq!(mesh.face_map, vec![0, 1, 2]);
+        // Second-shell triangles have q3 collapsed to q0, so the second
+        // shell triangle (q3, q1, q2) becomes (q0, q1, q2) — an exact,
+        // same-winding duplicate of the first shell triangle. The weld
+        // pass's doubled-facet removal (#65) collapses same-winding exact
+        // duplicates to a single representative (an emitted-twice facet is
+        // a non-manifold fin over an already-covered patch), so exactly ONE
+        // of the two survives. The head triangle, being outside the weld
+        // range, is untouched. `face_map` shrinks in lock-step with the
+        // surviving triangles.
+        assert_eq!(mesh.triangles.len(), 2);
+        assert_eq!(mesh.triangles[1], [q0, q1, q2]); // q3 → q0; duplicate dropped
+        assert_eq!(mesh.face_map, vec![0, 1]);
     }
 
     /// K13 — winding consistency. For a closed convex solid centred at
