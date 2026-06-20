@@ -745,12 +745,28 @@ impl ConstraintStore {
     /// incompatibility as an unsatisfied residual.
     fn mixed_constraints_conflict(
         &self,
-        _c1: &Constraint,
-        _c2: &Constraint,
-        _d: &DimensionalConstraint,
-        _g: &GeometricConstraint,
+        c1: &Constraint,
+        c2: &Constraint,
+        d: &DimensionalConstraint,
+        g: &GeometricConstraint,
     ) -> bool {
-        false
+        // Only constraints on the same ordered entity tuple can contradict.
+        if !self.same_entity_pairs(c1, c2) {
+            return false;
+        }
+        // Coincident forces ZERO separation between the two points; any non-zero
+        // Distance demands a POSITIVE separation — a direct contradiction. This
+        // is precisely the case the numerical (Jacobian) diagnosis cannot see
+        // reliably: at coincident points the distance gradient is 0/0, so the
+        // solver may report a spurious degenerate "solution". Configuration-
+        // independent static detection closes that hole.
+        match (g, d) {
+            (GeometricConstraint::Coincident, DimensionalConstraint::Distance(v)) => v.abs() > 1e-9,
+            // Room to grow: Parallel + Angle(≠0,π), Perpendicular + Angle(≠π/2),
+            // Horizontal/Vertical + a contradictory Angle, etc. Each needs a
+            // value-aware check, added as the adversarial harness demands them.
+            _ => false,
+        }
     }
 
     /// Check if two constraints apply to the same entity tuple. Compares the

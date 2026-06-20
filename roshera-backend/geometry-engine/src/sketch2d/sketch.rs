@@ -839,6 +839,14 @@ impl Sketch {
         super::sketch_solver::analyze_dofs(self)
     }
 
+    /// Certify this sketch: the kernel's self-certified, can't-lie verdict —
+    /// DOF/constrainedness, constraint-consistency, closed-profile,
+    /// self-intersection-free, entity-validity. The 2D analogue of the solid
+    /// `ValidityCertificate`. See [`super::sketch_certificate`].
+    pub fn certify(&self) -> super::sketch_certificate::SketchValidityCertificate {
+        super::sketch_certificate::certify_sketch(self)
+    }
+
     // Delete operations
 
     /// Delete a point from the sketch

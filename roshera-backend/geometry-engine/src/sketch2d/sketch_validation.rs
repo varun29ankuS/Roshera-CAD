@@ -440,24 +440,37 @@ impl SketchValidator {
         issues: &mut Vec<ValidationIssue>,
         _stats: &mut ValidationStats,
     ) {
-        // Check polylines for self-intersection
+        // Check polylines for self-intersection.
+        //
+        // Segment k spans (v_k, v_{(k+1) mod n}). An OPEN polyline has n-1
+        // segments; a CLOSED one has n — the extra being the closing edge
+        // (v_{n-1}, v_0). A naive `0..len-1` loop silently drops that closing
+        // edge AND mis-skips the (seg0, seg_{n-2}) pair as "adjacent" when those
+        // two segments share no vertex — which is exactly the pair that crosses
+        // in a 4-vertex bow-tie. The correct adjacency to skip is segments that
+        // share an endpoint: consecutive segments, plus (first, last) when closed.
         for entry in sketch.polylines().iter() {
             let polyline = entry.value();
             let vertices = &polyline.polyline.vertices;
+            let n = vertices.len();
+            if n < 3 {
+                continue; // fewer than 3 vertices cannot self-cross
+            }
+            let is_closed = polyline.polyline.is_closed;
+            let seg_count = if is_closed { n } else { n - 1 };
 
-            // Check each segment against all non-adjacent segments
-            for i in 0..vertices.len() - 1 {
-                for j in i + 2..vertices.len() - 1 {
-                    if i == 0 && j == vertices.len() - 2 && polyline.polyline.is_closed {
-                        continue; // Skip adjacent segments in closed polyline
+            for a in 0..seg_count {
+                for b in (a + 1)..seg_count {
+                    // Adjacent segments legitimately share a vertex — skip them.
+                    let adjacent = b == a + 1 || (is_closed && a == 0 && b == seg_count - 1);
+                    if adjacent {
+                        continue;
                     }
-
-                    if let Some(intersection) = self.segment_intersection(
-                        &vertices[i],
-                        &vertices[i + 1],
-                        &vertices[j],
-                        &vertices[j + 1],
-                    ) {
+                    let a0 = &vertices[a];
+                    let a1 = &vertices[(a + 1) % n];
+                    let b0 = &vertices[b];
+                    let b1 = &vertices[(b + 1) % n];
+                    if let Some(intersection) = self.segment_intersection(a0, a1, b0, b1) {
                         issues.push(ValidationIssue::SelfIntersection {
                             entity: EntityRef::Polyline(polyline.id),
                             points: vec![intersection],
