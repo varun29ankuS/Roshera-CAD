@@ -61,6 +61,9 @@ pub mod inference;
 pub mod sketch_topology;
 pub mod sketch_validation;
 
+// Sketch-validity certificate — the "can't lie" moat extended to 2D sketches.
+pub mod sketch_certificate;
+
 // Re-export commonly used types
 pub use arc2d::{Arc2d, Arc2dId};
 pub use circle2d::{Circle2d, Circle2dId};
@@ -86,6 +89,7 @@ pub use inference::{
     infer_constraints, DraftEntity, DraftSlot, InferenceTolerance, ProposedConstraint,
 };
 pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
+pub use sketch_certificate::{certify_sketch, SketchConstrainedness, SketchValidityCertificate};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 pub use snap::{SnapCandidate, SnapKind};
 
