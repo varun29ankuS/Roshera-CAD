@@ -285,6 +285,59 @@ impl SketchSession {
             .last_mut()
             .ok_or(SketchError::NoShapes(session_id))
     }
+
+    /// Build a kernel [`geometry_engine::sketch2d::Sketch`] from this
+    /// click-to-place session so the kernel's analytic capabilities — shape
+    /// recognition, the agent-eye rasterizer, the validity certificate — can run
+    /// on a LIVE sketch. Polylines and rectangles become closed polylines;
+    /// circles become circle entities (centre + a point on the radius).
+    ///
+    /// Anchored at XY: the in-plane (u, v) coordinates are what every 2D analysis
+    /// reads, so the plane choice is immaterial here. This read-only bridge is
+    /// what the `render_sketch` / `recognize_sketch` / `certify_sketch` MCP tools
+    /// call; B1 widens it into the full unify-onto-the-constrained-Sketch path.
+    pub fn to_kernel_sketch(&self) -> geometry_engine::sketch2d::Sketch {
+        use geometry_engine::sketch2d::{Point2d, Sketch, SketchAnchor};
+        let sketch = Sketch::new(format!("session-{}", self.id), SketchAnchor::xy());
+        for shape in &self.shapes {
+            match shape.tool {
+                SketchTool::Polyline => {
+                    let verts: Vec<Point2d> = shape
+                        .points
+                        .iter()
+                        .map(|&[x, y]| Point2d::new(x, y))
+                        .collect();
+                    if verts.len() >= 2 {
+                        let _ = sketch.add_polyline(verts, true);
+                    }
+                }
+                SketchTool::Rectangle => {
+                    if let [a, b] = shape.points.as_slice() {
+                        let [ax, ay] = *a;
+                        let [bx, by] = *b;
+                        let verts = vec![
+                            Point2d::new(ax, ay),
+                            Point2d::new(bx, ay),
+                            Point2d::new(bx, by),
+                            Point2d::new(ax, by),
+                        ];
+                        let _ = sketch.add_polyline(verts, true);
+                    }
+                }
+                SketchTool::Circle => {
+                    if let [center, edge] = shape.points.as_slice() {
+                        let [cx, cy] = *center;
+                        let [ex, ey] = *edge;
+                        let r = ((ex - cx).powi(2) + (ey - cy).powi(2)).sqrt();
+                        if r > 1e-9 {
+                            let _ = sketch.add_circle(Point2d::new(cx, cy), r);
+                        }
+                    }
+                }
+            }
+        }
+        sketch
+    }
 }
 
 fn unix_now() -> u64 {
@@ -292,6 +345,54 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use geometry_engine::sketch2d::{recognize_sketch, ShapeClass};
+
+    fn session(tool: SketchTool, points: Vec<[f64; 2]>) -> SketchSession {
+        SketchSession {
+            id: Uuid::new_v4(),
+            plane: SketchPlane::XY,
+            shapes: vec![SketchShape {
+                id: Uuid::new_v4(),
+                tool,
+                points,
+            }],
+            circle_segments: 64,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn circle_session_recognises_as_circle() {
+        let s = session(SketchTool::Circle, vec![[0.0, 0.0], [5.0, 0.0]]);
+        assert_eq!(
+            recognize_sketch(&s.to_kernel_sketch()).class,
+            ShapeClass::Circle
+        );
+    }
+
+    #[test]
+    fn rectangle_session_recognises_as_rectangle() {
+        let s = session(SketchTool::Rectangle, vec![[0.0, 0.0], [20.0, 10.0]]);
+        assert_eq!(
+            recognize_sketch(&s.to_kernel_sketch()).class,
+            ShapeClass::Rectangle
+        );
+    }
+
+    #[test]
+    fn square_session_recognises_as_square() {
+        let s = session(SketchTool::Rectangle, vec![[0.0, 0.0], [10.0, 10.0]]);
+        assert_eq!(
+            recognize_sketch(&s.to_kernel_sketch()).class,
+            ShapeClass::Square
+        );
+    }
 }
 
 /// Errors that can come out of the manager. Carry the Uuid where
