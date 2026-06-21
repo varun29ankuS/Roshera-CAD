@@ -12,7 +12,9 @@
 //! FAIL on a non-exact predicate — that is the gap, to be filled (never pinned).
 
 use geometry_engine::math::vector2::Vector2;
-use geometry_engine::math::{incircle, orient2d, orient3d, CircleLocation, Orientation, Point3};
+use geometry_engine::math::{
+    incircle, insphere, orient2d, orient3d, CircleLocation, Orientation, Point3,
+};
 use num_rational::BigRational;
 use num_traits::Signed;
 use rand::rngs::StdRng;
@@ -320,6 +322,169 @@ fn incircle_matches_exact_rational_oracle_on_adversarial_inputs() {
     assert_eq!(
         mismatches, 0,
         "incircle disagreed with the EXACT rational oracle on {mismatches}/{n} cases \
+         (hard cases where naive f64 was wrong: {hard}); first failure: {first_fail:?} \
+         — the predicate is NOT exact"
+    );
+}
+
+// ── insphere (cospherical) ─────────────────────────────────────────────────
+
+/// Exact in-sphere sign via rationals. Mirrors insphere_fast's determinant
+/// `dlift·abc - clift·dab + blift·cda - alift·bcd` (>0 ⇒ Inside).
+#[allow(clippy::too_many_arguments)]
+fn exact_insphere_sign(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3], e: [f64; 3]) -> i32 {
+    let aex = rat(a[0]) - rat(e[0]);
+    let aey = rat(a[1]) - rat(e[1]);
+    let aez = rat(a[2]) - rat(e[2]);
+    let bex = rat(b[0]) - rat(e[0]);
+    let bey = rat(b[1]) - rat(e[1]);
+    let bez = rat(b[2]) - rat(e[2]);
+    let cex = rat(c[0]) - rat(e[0]);
+    let cey = rat(c[1]) - rat(e[1]);
+    let cez = rat(c[2]) - rat(e[2]);
+    let dex = rat(d[0]) - rat(e[0]);
+    let dey = rat(d[1]) - rat(e[1]);
+    let dez = rat(d[2]) - rat(e[2]);
+    let ab = &aex * &bey - &bex * &aey;
+    let bc = &bex * &cey - &cex * &bey;
+    let cd = &cex * &dey - &dex * &cey;
+    let da = &dex * &aey - &aex * &dey;
+    let ac = &aex * &cey - &cex * &aey;
+    let bd = &bex * &dey - &dex * &bey;
+    let abc = &aez * &bc - &bez * &ac + &cez * &ab;
+    let bcd = &bez * &cd - &cez * &bd + &dez * &bc;
+    let cda = &cez * &da + &dez * &ac + &aez * &cd;
+    let dab = &dez * &ab + &aez * &bd + &bez * &da;
+    let alift = &aex * &aex + &aey * &aey + &aez * &aez;
+    let blift = &bex * &bex + &bey * &bey + &bez * &bez;
+    let clift = &cex * &cex + &cey * &cey + &cez * &cez;
+    let dlift = &dex * &dex + &dey * &dey + &dez * &dez;
+    let det = &dlift * &abc - &clift * &dab + &blift * &cda - &alift * &bcd;
+    if det.is_positive() {
+        1
+    } else if det.is_negative() {
+        -1
+    } else {
+        0
+    }
+}
+
+fn pred_insphere_sign(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3], e: [f64; 3]) -> i32 {
+    match insphere(
+        &Point3::new(a[0], a[1], a[2]),
+        &Point3::new(b[0], b[1], b[2]),
+        &Point3::new(c[0], c[1], c[2]),
+        &Point3::new(d[0], d[1], d[2]),
+        &Point3::new(e[0], e[1], e[2]),
+    ) {
+        CircleLocation::Inside => 1,
+        CircleLocation::Outside => -1,
+        CircleLocation::OnBoundary => 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn naive_insphere_sign(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3], e: [f64; 3]) -> i32 {
+    let (aex, aey, aez) = (a[0] - e[0], a[1] - e[1], a[2] - e[2]);
+    let (bex, bey, bez) = (b[0] - e[0], b[1] - e[1], b[2] - e[2]);
+    let (cex, cey, cez) = (c[0] - e[0], c[1] - e[1], c[2] - e[2]);
+    let (dex, dey, dez) = (d[0] - e[0], d[1] - e[1], d[2] - e[2]);
+    let ab = aex * bey - bex * aey;
+    let bc = bex * cey - cex * bey;
+    let cd = cex * dey - dex * cey;
+    let da = dex * aey - aex * dey;
+    let ac = aex * cey - cex * aey;
+    let bd = bex * dey - dex * bey;
+    let abc = aez * bc - bez * ac + cez * ab;
+    let bcd = bez * cd - cez * bd + dez * bc;
+    let cda = cez * da + dez * ac + aez * cd;
+    let dab = dez * ab + aez * bd + bez * da;
+    let alift = aex * aex + aey * aey + aez * aez;
+    let blift = bex * bex + bey * bey + bez * bez;
+    let clift = cex * cex + cey * cey + cez * cez;
+    let dlift = dex * dex + dey * dey + dez * dez;
+    let det = dlift * abc - clift * dab + blift * cda - alift * bcd;
+    if det > 0.0 {
+        1
+    } else if det < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+#[test]
+fn insphere_matches_exact_rational_oracle_on_adversarial_inputs() {
+    let mut rng = StdRng::seed_from_u64(0xFEED_FACE_2468_ACE0);
+    let mut mismatches = 0u64;
+    let mut hard = 0u64;
+    let mut first_fail = None;
+    // Fewer cases than the 2D sweeps: the exact path runs heap expansion
+    // arithmetic on thousands of components, and the oracle is a 4×4 rational
+    // determinant — both costly. 30k still hits the hard regime densely.
+    let n = 30_000u64;
+
+    let mut unit = |rng: &mut StdRng| -> [f64; 3] {
+        loop {
+            let v = [
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+            ];
+            let len2: f64 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+            if len2 > 0.05 {
+                let len = len2.sqrt();
+                return [v[0] / len, v[1] / len, v[2] / len];
+            }
+        }
+    };
+
+    for _ in 0..n {
+        let center = [
+            rng.gen_range(-1.0..1.0),
+            rng.gen_range(-1.0..1.0),
+            rng.gen_range(-1.0..1.0),
+        ];
+        let r = rng.gen_range(0.5..2.0);
+        let on = |dir: [f64; 3], dr: f64| {
+            [
+                center[0] + (r + dr) * dir[0],
+                center[1] + (r + dr) * dir[1],
+                center[2] + (r + dr) * dir[2],
+            ]
+        };
+        let da = unit(&mut rng);
+        let db = unit(&mut rng);
+        let dc = unit(&mut rng);
+        let dd = unit(&mut rng);
+        let de = unit(&mut rng);
+        let a = on(da, 0.0);
+        let b = on(db, 0.0);
+        let c = on(dc, 0.0);
+        let d = on(dd, 0.0);
+        // e nudged radially off the sphere — small enough to be sign-delicate.
+        let e = on(de, rng.gen_range(-1.0..1.0) * 1e-13);
+
+        let exact = exact_insphere_sign(a, b, c, d, e);
+        let got = pred_insphere_sign(a, b, c, d, e);
+        if got != exact {
+            mismatches += 1;
+            if first_fail.is_none() {
+                first_fail = Some((a, b, c, d, e, got, exact));
+            }
+        }
+        if naive_insphere_sign(a, b, c, d, e) != exact {
+            hard += 1;
+        }
+    }
+
+    assert!(
+        hard > 0,
+        "the sweep never reached the hard regime (naive f64 always matched exact) — make e closer to the sphere"
+    );
+    assert_eq!(
+        mismatches, 0,
+        "insphere disagreed with the EXACT rational oracle on {mismatches}/{n} cases \
          (hard cases where naive f64 was wrong: {hard}); first failure: {first_fail:?} \
          — the predicate is NOT exact"
     );
