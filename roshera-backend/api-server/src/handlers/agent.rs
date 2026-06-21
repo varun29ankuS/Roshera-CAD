@@ -245,10 +245,15 @@ pub async fn verify_claim_handler(
 /// #25 edit→regenerate loop). 404 when the part carries no retained profile (it
 /// was not built by a parametric revolve).
 pub async fn part_revolve_profile(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
 ) -> Result<Json<Vec<[f64; 2]>>, StatusCode> {
+    // The persistent profile store is replay-proof; prefer it, then fall back to
+    // the kernel construction geometry.
+    if let Some(p) = state.solid_profiles.get(&id) {
+        return Ok(Json(p.clone()));
+    }
     let model = model_handle.read().await;
     geometry_engine::operations::revolve::get_revolve_meridian(&model, id)
         .map(|rz| Json(rz.into_iter().map(|(r, z)| [r, z]).collect()))

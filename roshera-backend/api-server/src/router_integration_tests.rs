@@ -181,6 +181,7 @@ async fn make_test_state() -> AppState {
         local_to_uuid: Arc::new(DashMap::new()),
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
+        solid_profiles: Arc::new(DashMap::new()),
         ai_processor,
         session_aware_ai,
         full_integration_executor,

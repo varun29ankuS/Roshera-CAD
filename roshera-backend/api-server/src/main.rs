@@ -124,6 +124,12 @@ pub struct AppState {
     /// a coloured assembly (black tyres, livery body, …) instead of grey clay.
     pub solid_colors: Arc<DashMap<u32, [u8; 3]>>,
 
+    /// Per-solid generating revolve profile (the editable `[r,z]` meridian).
+    /// Stored here — not only in kernel construction geometry — so it survives a
+    /// timeline replay (the construction sidecar is set outside the recorded op,
+    /// so a replay drops it) and `GET /parts/{id}/profile` can always recover it.
+    pub solid_profiles: Arc<DashMap<u32, Vec<[f64; 2]>>>,
+
     // Enhanced AI integration
     ai_processor: Arc<Mutex<AIProcessor>>,
     session_aware_ai: Arc<SessionAwareAIProcessor>,
@@ -3332,7 +3338,7 @@ async fn create_revolve_primitive(
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
     use geometry_engine::operations::revolve::{
-        revolve_meridian, revolve_spline_meridian, RevolveOptions,
+        revolve_meridian, revolve_smooth_nozzle, revolve_spline_meridian, RevolveOptions,
     };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
@@ -3411,6 +3417,14 @@ async fn create_revolve_primitive(
         .get("bore_radius")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
+    // Smooth CONTOURED shell (Rao nozzle / vessel): `profile` is the INNER flow
+    // contour; the outer wall is offset radially by `wall_thickness`. BOTH walls
+    // are fit as NURBS and revolved → one smooth SurfaceOfRevolution each (exact
+    // circles, smooth contour, no band rings, no loft seam).
+    let wall_thickness = payload
+        .get("wall_thickness")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
     let result_solid_id = {
         let mut model = model_handle.write().await;
@@ -3424,7 +3438,14 @@ async fn create_revolve_primitive(
             segments,
             ..Default::default()
         };
-        if smooth {
+        if wall_thickness > 0.0 {
+            revolve_smooth_nozzle(&mut model, &profile, wall_thickness, opts).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("smooth nozzle revolve failed: {e:?}"),
+                )
+            })?
+        } else if smooth {
             revolve_spline_meridian(&mut model, &profile, bore_radius, opts).map_err(|e| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
@@ -3440,6 +3461,13 @@ async fn create_revolve_primitive(
             })?
         }
     };
+
+    // Persist the generating profile (replay-proof) so it is always recoverable
+    // via GET /api/agent/parts/{id}/profile for the edit→regenerate loop.
+    state.solid_profiles.insert(
+        result_solid_id,
+        profile.iter().map(|&(r, z)| [r, z]).collect(),
+    );
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;
@@ -6656,6 +6684,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_to_uuid: Arc::new(DashMap::new()),
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
+        solid_profiles: Arc::new(DashMap::new()),
         ai_processor,
         session_aware_ai,
         full_integration_executor,
