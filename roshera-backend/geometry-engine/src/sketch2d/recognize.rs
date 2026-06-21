@@ -32,6 +32,10 @@ pub enum ShapeClass {
     Square,
     /// All edges equal AND all interior angles equal (≥5 sides).
     RegularPolygon { sides: usize },
+    /// An N-tooth gear/cog: `2·teeth` vertices whose radii about the centroid
+    /// alternate between two distinct tight clusters (tooth tips and valleys)
+    /// at regular angular spacing.
+    Gear { teeth: usize },
     /// A generic closed polygon.
     Polygon { sides: usize },
     /// Multiple loops / mixed entities — no single boundary to classify.
@@ -67,11 +71,75 @@ fn max_rel_spread(vals: &[f64]) -> f64 {
     (hi - lo) / hi
 }
 
+/// Max relative spread allowed within a gear's tip cluster (and valley cluster).
+const GEAR_CLUSTER_TOL: f64 = 0.05;
+/// Minimum relative tip-to-valley depth `(R_tip − R_valley)/R_tip` — below this
+/// the two clusters are indistinct and the shape is a regular polygon, not a gear.
+const GEAR_TOOTH_DEPTH_MIN: f64 = 0.08;
+/// Allowed deviation of each angular gap from the regular `TAU/n` spacing.
+const GEAR_ANGLE_REL_TOL: f64 = 0.15;
+
+/// Detect an N-tooth gear/cog. Returns the tooth count `N` when `verts` is an
+/// even number (≥ 6) of vertices whose radii about the centroid alternate
+/// between two DISTINCT, tight clusters (tips and valleys) at regular angular
+/// spacing. A regular polygon (one radius cluster) is rejected by the
+/// tip-depth gate, so this is safe to test before the polygon classification.
+fn detect_gear(verts: &[Point2d]) -> Option<usize> {
+    use std::f64::consts::{PI, TAU};
+    let n = verts.len();
+    if n < 6 || n % 2 != 0 {
+        return None;
+    }
+    let cx = verts.iter().map(|p| p.x).sum::<f64>() / n as f64;
+    let cy = verts.iter().map(|p| p.y).sum::<f64>() / n as f64;
+
+    let mut radii = Vec::with_capacity(n);
+    let mut angles = Vec::with_capacity(n);
+    for p in verts {
+        let dx = p.x - cx;
+        let dy = p.y - cy;
+        radii.push((dx * dx + dy * dy).sqrt());
+        angles.push(dy.atan2(dx));
+    }
+
+    // Even- and odd-indexed vertices form the two candidate clusters.
+    let evens: Vec<f64> = (0..n).step_by(2).map(|i| radii[i]).collect();
+    let odds: Vec<f64> = (1..n).step_by(2).map(|i| radii[i]).collect();
+    if max_rel_spread(&evens) > GEAR_CLUSTER_TOL || max_rel_spread(&odds) > GEAR_CLUSTER_TOL {
+        return None;
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let (me, mo) = (mean(&evens), mean(&odds));
+    let (r_big, r_small) = if me >= mo { (me, mo) } else { (mo, me) };
+    if r_small <= 1e-9 || (r_big - r_small) / r_big < GEAR_TOOTH_DEPTH_MIN {
+        return None; // indistinct clusters → regular polygon, not a gear
+    }
+
+    // Vertices must be regularly spaced around the centroid (CW or CCW): the
+    // minimal angular gap between consecutive vertices ≈ TAU/n.
+    let expected = TAU / n as f64;
+    for i in 0..n {
+        let mut d = (angles[(i + 1) % n] - angles[i]).rem_euclid(TAU);
+        if d > PI {
+            d = TAU - d;
+        }
+        if (d - expected).abs() > expected * GEAR_ANGLE_REL_TOL {
+            return None;
+        }
+    }
+    Some(n / 2)
+}
+
 /// Classify a closed polygon from its ordered (non-repeating) corner vertices.
 fn classify_polygon(verts: &[Point2d]) -> ShapeClass {
     let n = verts.len();
     if n < 3 {
         return ShapeClass::Polygon { sides: n };
+    }
+    // A gear's alternating-radius pattern is checked first; a regular polygon
+    // fails the tip-depth gate, so this never steals a RegularPolygon verdict.
+    if let Some(teeth) = detect_gear(verts) {
+        return ShapeClass::Gear { teeth };
     }
     let mut edges = Vec::with_capacity(n);
     let mut angles = Vec::with_capacity(n);
@@ -239,6 +307,63 @@ mod tests {
             verts.push(Point2d::new(10.0 * t.cos(), 10.0 * t.sin()));
         }
         assert_eq!(poly(verts).class, ShapeClass::RegularPolygon { sides: 6 });
+    }
+
+    #[test]
+    fn recognises_a_six_tooth_gear() {
+        // 12 vertices: tooth tips (r=10) and valleys (r=7) alternating, evenly
+        // spaced — the canonical build-it-then-recognise gear harness.
+        let n = 12;
+        let verts: Vec<Point2d> = (0..n)
+            .map(|i| {
+                let t = (i as f64) / (n as f64) * TAU;
+                let r = if i % 2 == 0 { 10.0 } else { 7.0 };
+                Point2d::new(r * t.cos(), r * t.sin())
+            })
+            .collect();
+        assert_eq!(poly(verts).class, ShapeClass::Gear { teeth: 6 });
+    }
+
+    #[test]
+    fn recognises_a_twenty_tooth_gear() {
+        let teeth = 20;
+        let n = 2 * teeth;
+        let verts: Vec<Point2d> = (0..n)
+            .map(|i| {
+                let t = (i as f64) / (n as f64) * TAU;
+                let r = if i % 2 == 0 { 5.0 } else { 4.2 };
+                Point2d::new(r * t.cos(), r * t.sin())
+            })
+            .collect();
+        assert_eq!(poly(verts).class, ShapeClass::Gear { teeth: 20 });
+    }
+
+    #[test]
+    fn an_even_regular_polygon_is_not_mistaken_for_a_gear() {
+        // A regular octagon: 8 vertices ALL at the same radius. The tip-depth
+        // gate must reject it (no distinct tip/valley clusters) → RegularPolygon.
+        let n = 8;
+        let verts: Vec<Point2d> = (0..n)
+            .map(|i| {
+                let t = (i as f64) / (n as f64) * TAU;
+                Point2d::new(10.0 * t.cos(), 10.0 * t.sin())
+            })
+            .collect();
+        assert_eq!(poly(verts).class, ShapeClass::RegularPolygon { sides: 8 });
+    }
+
+    #[test]
+    fn a_shallow_tooth_profile_is_not_a_gear() {
+        // tips/valleys differ by ~2% (< GEAR_TOOTH_DEPTH_MIN) — not a gear.
+        let n = 12;
+        let verts: Vec<Point2d> = (0..n)
+            .map(|i| {
+                let t = (i as f64) / (n as f64) * TAU;
+                let r = if i % 2 == 0 { 10.0 } else { 9.8 };
+                Point2d::new(r * t.cos(), r * t.sin())
+            })
+            .collect();
+        assert!(!matches!(poly(verts).class, ShapeClass::Gear { .. }));
     }
 
     #[test]
