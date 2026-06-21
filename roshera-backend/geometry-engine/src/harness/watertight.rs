@@ -274,6 +274,63 @@ pub fn manifold_report(
     })
 }
 
+/// Diagnostic: the 3D segments of every BOUNDARY edge (an undirected mesh edge
+/// incident to exactly one live triangle) in `solid`'s tessellation. Localizes
+/// WHERE a non-watertight result leaks — clustered segments reveal a specific
+/// seam (e.g. a cyl-cyl saddle ellipse), spread-out segments a classification
+/// failure. Diagnostic-only; mirrors `manifold_report`'s welding.
+pub fn boundary_edge_positions(
+    model: &BRepModel,
+    solid: SolidId,
+    chord: f64,
+    weld_eps: f64,
+) -> Vec<[crate::math::vector3::Point3; 2]> {
+    let Some(solid_ref) = model.solids.get(solid) else {
+        return Vec::new();
+    };
+    let params = TessellationParams {
+        chord_tolerance: chord,
+        ..TessellationParams::default()
+    };
+    let mesh = tessellate_solid(solid_ref, model, &params);
+    let mut weld_map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut welded_index: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+    let mut pos_of: Vec<crate::math::vector3::Point3> = Vec::new();
+    for v in &mesh.vertices {
+        let key = weld_key(&v.position, weld_eps);
+        let next = weld_map.len() as u32;
+        let id = *weld_map.entry(key).or_insert(next);
+        if id as usize == pos_of.len() {
+            pos_of.push(v.position);
+        }
+        welded_index.push(id);
+    }
+    let mut directed: HashMap<(u32, u32), u32> = HashMap::new();
+    for tri in &mesh.triangles {
+        let a = welded_index[tri[0] as usize];
+        let b = welded_index[tri[1] as usize];
+        let c = welded_index[tri[2] as usize];
+        if a == b || b == c || c == a {
+            continue;
+        }
+        for &(u, v) in &[(a, b), (b, c), (c, a)] {
+            *directed.entry((u, v)).or_insert(0) += 1;
+        }
+    }
+    let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+    for (&(u, v), &count) in &directed {
+        let key = if u < v { (u, v) } else { (v, u) };
+        *undirected.entry(key).or_insert(0) += count;
+    }
+    let mut segs = Vec::new();
+    for (&(u, v), &incident) in &undirected {
+        if incident == 1 {
+            segs.push([pos_of[u as usize], pos_of[v as usize]]);
+        }
+    }
+    segs
+}
+
 /// Display-tessellation quality verdict for `solid` — the render-mesh analogue of
 /// [`manifold_report`]'s topological check, measured at the **display density**
 /// the viewport/exporter actually ships (`TessellationParams::default()`), not a
