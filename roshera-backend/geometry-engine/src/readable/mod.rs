@@ -32,6 +32,7 @@
 //! - The AI tool routing layer lives in `ai-integration::tool_dispatch`
 //!   and `ai-integration::executor`; this module is provider-agnostic.
 
+pub mod claim;
 pub mod dimensions;
 pub mod features;
 pub mod part;
