@@ -4024,7 +4024,10 @@ impl Curve for Ellipse {
             // Check tangent continuity
             match (self_point.tangent(), other_point.tangent()) {
                 (Ok(t1), Ok(t2)) => {
-                    let tangent_angle = t1.dot(&t2).acos();
+                    // Clamp before acos: for near-identical unit tangents the dot
+                    // rounds to 1+ε, and acos(>1)=NaN would misclassify the common
+                    // G1 case as G0.
+                    let tangent_angle = t1.dot(&t2).clamp(-1.0, 1.0).acos();
                     if tangent_angle < tolerance.angle() {
                         Continuity::G1
                     } else {
