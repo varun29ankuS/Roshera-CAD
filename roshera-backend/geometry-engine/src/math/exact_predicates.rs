@@ -407,50 +407,146 @@ fn orient3d_fast(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3) -> f64 {
 }
 
 /// Adaptive precision 3D orientation test
+/// Buffer ceiling for the generic exact-expansion orient3d fallback. The largest
+/// expansion built is a cofactor `coord_diff (≤2) × minor (≤16) ≤ 64` summed
+/// three times (≤192); 256 leaves headroom.
+const EXP_MAX: usize = 256;
+
+/// A coordinate difference `a - b` as a zero-free expansion (low→high) in `buf`.
+/// Returns the component count (0 when `a == b` exactly).
+#[inline]
+fn diff_exp(a: f64, b: f64, buf: &mut [f64; 2]) -> usize {
+    let (x, y) = two_diff(a, b);
+    let mut n = 0;
+    if y != 0.0 {
+        buf[n] = y;
+        n += 1;
+    }
+    if x != 0.0 {
+        buf[n] = x;
+        n += 1;
+    }
+    n
+}
+
+/// Exact product `out = a · b` of two zero-free expansions, via `Σ scale(a, b[i])`.
+/// Returns the component count; empty input ⇒ exact 0.
+fn expansion_product(a: &[f64], b: &[f64], out: &mut [f64]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut acc = [0.0f64; EXP_MAX];
+    let mut acc_len = 0usize;
+    let mut scaled = [0.0f64; EXP_MAX];
+    let mut next = [0.0f64; EXP_MAX];
+    for &bi in b {
+        let slen = scale_expansion_zeroelim(a, bi, &mut scaled);
+        if acc_len == 0 {
+            acc[..slen].copy_from_slice(&scaled[..slen]);
+            acc_len = slen;
+        } else {
+            let nlen = fast_expansion_sum_zeroelim(&acc[..acc_len], &scaled[..slen], &mut next);
+            acc[..nlen].copy_from_slice(&next[..nlen]);
+            acc_len = nlen;
+        }
+    }
+    out[..acc_len].copy_from_slice(&acc[..acc_len]);
+    acc_len
+}
+
+/// Exact difference `out = e - f` of two zero-free expansions; empty ⇒ 0.
+fn expansion_diff(e: &[f64], f: &[f64], out: &mut [f64]) -> usize {
+    if f.is_empty() {
+        out[..e.len()].copy_from_slice(e);
+        return e.len();
+    }
+    let mut negf = [0.0f64; EXP_MAX];
+    for (i, &c) in f.iter().enumerate() {
+        negf[i] = -c;
+    }
+    if e.is_empty() {
+        out[..f.len()].copy_from_slice(&negf[..f.len()]);
+        return f.len();
+    }
+    fast_expansion_sum_zeroelim(e, &negf[..f.len()], out)
+}
+
+/// Exact 3D orientation determinant value — its SIGN is correct for all finite
+/// inputs. Builds the full expansion of
+/// `-(adx·(bdy·cdz - bdz·cdy) + ady·(bdz·cdx - bdx·cdz) + adz·(bdx·cdy - bdy·cdx))`
+/// with the coordinate-difference tails carried (the bits the old implementation
+/// dropped). Generic exact fallback — only runs when the A-filter is inconclusive.
 fn orient3d_adapt(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3) -> f64 {
-    let adx = pa.x - pd.x;
-    let ady = pa.y - pd.y;
-    let adz = pa.z - pd.z;
-    let bdx = pb.x - pd.x;
-    let bdy = pb.y - pd.y;
-    let bdz = pb.z - pd.z;
-    let cdx = pc.x - pd.x;
-    let cdy = pc.y - pd.y;
-    let cdz = pc.z - pd.z;
+    let (mut adx, mut ady, mut adz) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+    let (mut bdx, mut bdy, mut bdz) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+    let (mut cdx, mut cdy, mut cdz) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+    let adxn = diff_exp(pa.x, pd.x, &mut adx);
+    let adyn = diff_exp(pa.y, pd.y, &mut ady);
+    let adzn = diff_exp(pa.z, pd.z, &mut adz);
+    let bdxn = diff_exp(pb.x, pd.x, &mut bdx);
+    let bdyn = diff_exp(pb.y, pd.y, &mut bdy);
+    let bdzn = diff_exp(pb.z, pd.z, &mut bdz);
+    let cdxn = diff_exp(pc.x, pd.x, &mut cdx);
+    let cdyn = diff_exp(pc.y, pd.y, &mut cdy);
+    let cdzn = diff_exp(pc.z, pd.z, &mut cdz);
 
-    // Compute the 2x2 minors using exact arithmetic
-    // bc = bdy * cdz - bdz * cdy
-    let (bc_hi, bc_lo) = two_product(bdy, cdz);
-    let (temp_hi, temp_lo) = two_product(bdz, cdy);
-    let (bc_1, bc_2) = two_sum(bc_hi, -temp_hi);
-    let bc_3 = bc_lo - temp_lo;
-    let bc = bc_1 + (bc_2 + bc_3);
+    let mut p1 = [0.0f64; EXP_MAX];
+    let mut p2 = [0.0f64; EXP_MAX];
+    let mut minor = [0.0f64; EXP_MAX];
+    let mut term = [0.0f64; EXP_MAX];
+    let mut s = [0.0f64; EXP_MAX];
+    let mut s2 = [0.0f64; EXP_MAX];
+    let mut s_len;
 
-    // ca = bdz * cdx - bdx * cdz
-    let (ca_hi, ca_lo) = two_product(bdz, cdx);
-    let (temp_hi, temp_lo) = two_product(bdx, cdz);
-    let (ca_1, ca_2) = two_sum(ca_hi, -temp_hi);
-    let ca_3 = ca_lo - temp_lo;
-    let ca = ca_1 + (ca_2 + ca_3);
+    // Cofactor 1: adx · (bdy·cdz - bdz·cdy)
+    let p1n = expansion_product(&bdy[..bdyn], &cdz[..cdzn], &mut p1);
+    let p2n = expansion_product(&bdz[..bdzn], &cdy[..cdyn], &mut p2);
+    let mn = expansion_diff(&p1[..p1n], &p2[..p2n], &mut minor);
+    let tn = expansion_product(&adx[..adxn], &minor[..mn], &mut term);
+    s[..tn].copy_from_slice(&term[..tn]);
+    s_len = tn;
 
-    // ab = bdx * cdy - bdy * cdx
-    let (ab_hi, ab_lo) = two_product(bdx, cdy);
-    let (temp_hi, temp_lo) = two_product(bdy, cdx);
-    let (ab_1, ab_2) = two_sum(ab_hi, -temp_hi);
-    let ab_3 = ab_lo - temp_lo;
-    let ab = ab_1 + (ab_2 + ab_3);
+    // Cofactor 2: ady · (bdz·cdx - bdx·cdz)
+    let p1n = expansion_product(&bdz[..bdzn], &cdx[..cdxn], &mut p1);
+    let p2n = expansion_product(&bdx[..bdxn], &cdz[..cdzn], &mut p2);
+    let mn = expansion_diff(&p1[..p1n], &p2[..p2n], &mut minor);
+    let tn = expansion_product(&ady[..adyn], &minor[..mn], &mut term);
+    s_len = accumulate(&mut s, s_len, &term[..tn], &mut s2);
 
-    // Final determinant: -(adx * bc + ady * ca + adz * ab)
-    let (term1_hi, term1_lo) = two_product(adx, bc);
-    let (term2_hi, term2_lo) = two_product(ady, ca);
-    let (term3_hi, term3_lo) = two_product(adz, ab);
+    // Cofactor 3: adz · (bdx·cdy - bdy·cdx)
+    let p1n = expansion_product(&bdx[..bdxn], &cdy[..cdyn], &mut p1);
+    let p2n = expansion_product(&bdy[..bdyn], &cdx[..cdxn], &mut p2);
+    let mn = expansion_diff(&p1[..p1n], &p2[..p2n], &mut minor);
+    let tn = expansion_product(&adz[..adzn], &minor[..mn], &mut term);
+    s_len = accumulate(&mut s, s_len, &term[..tn], &mut s2);
 
-    let (sum1_hi, sum1_lo) = two_sum(term1_hi, term2_hi);
-    let (sum2_hi, sum2_lo) = two_sum(sum1_hi, term3_hi);
+    // S = adx·M1 + ady·M2 + adz·M3; orient3d's value is -S (existing sign
+    // convention). The top component carries the exact sign.
+    if s_len == 0 {
+        0.0
+    } else {
+        -s[s_len - 1]
+    }
+}
 
-    let result = sum2_hi + (sum2_lo + sum1_lo + term1_lo + term2_lo + term3_lo);
-
-    -result // Note the sign change
+/// Accumulate `s += addend` (zero-free expansions), using `scratch`. Returns the
+/// new length of `s`.
+fn accumulate(s: &mut [f64], s_len: usize, addend: &[f64], scratch: &mut [f64]) -> usize {
+    if addend.is_empty() {
+        return s_len;
+    }
+    if s_len == 0 {
+        s[..addend.len()].copy_from_slice(addend);
+        return addend.len();
+    }
+    let n = {
+        // Copy `s`'s live prefix out so we can borrow it immutably while writing
+        // `scratch`, then copy back.
+        let cur: &[f64] = &s[..s_len];
+        fast_expansion_sum_zeroelim(cur, addend, scratch)
+    };
+    s[..n].copy_from_slice(&scratch[..n]);
+    n
 }
 
 /// Test orientation of four points in 3D
