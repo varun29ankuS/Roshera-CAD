@@ -26,7 +26,7 @@
 
 use super::orientation::orient_face_for_outward;
 use super::{lifecycle, CommonOptions, OperationError, OperationResult};
-use crate::math::nurbs::{skin_surface, NurbsSurface};
+use crate::math::nurbs::{skin_surface_periodic_u, NurbsSurface};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{NurbsCurve, ParameterRange},
@@ -91,25 +91,17 @@ pub fn nurbs_loft(
         return Err(OperationError::IncompatibleProfiles);
     }
 
-    // Close each ring (repeat the first point) so the skinned U-curve is
-    // geometrically closed (S(0,v) == S(1,v)) → a watertight seam.
-    let closed_sections: Vec<Vec<Point3>> = sections
-        .iter()
-        .map(|s| {
-            let mut c = s.clone();
-            c.push(s[0]);
-            c
-        })
-        .collect();
-    let nu = ring_len + 1; // points per closed section
     let nv = n_sections;
-
-    // Degrees, clamped so the interpolation system is well-posed.
-    let degree_u = options.degree_u.clamp(1, nu - 1);
+    // The around-the-section (U) direction is a PERIODIC cubic NURBS — a
+    // genuinely smooth-closed seam (C2), the Parasolid/OCCT-parity representation
+    // for a closed profile — instead of clamping a repeated first point (only C0
+    // at the seam → a visible notch). U degree is fixed at 3 by the periodic-cubic
+    // primitive; V keeps the requested degree. The sections are the OPEN rings
+    // (the periodic interpolation closes them smoothly).
     let degree_v = options.degree_v.clamp(1, nv - 1);
 
-    // ---- the skinned lateral surface. ----
-    let surf: NurbsSurface = skin_surface(&closed_sections, degree_u, degree_v)
+    // ---- the skinned lateral surface (periodic in U, clamped in V). ----
+    let surf: NurbsSurface = skin_surface_periodic_u(&sections, degree_v)
         .map_err(|e| OperationError::NumericalError(format!("nurbs_loft skin: {e}")))?;
 
     lifecycle::with_rollback(model, move |model| {
@@ -278,7 +270,7 @@ pub fn nurbs_loft(
                 .with_parameters(serde_json::json!({
                     "sections": n_sections,
                     "ring_points": ring_len,
-                    "degree_u": degree_u,
+                    "degree_u": 3, // periodic-cubic U
                     "degree_v": degree_v,
                 }))
                 .with_output_solids([solid_id as u64]),
