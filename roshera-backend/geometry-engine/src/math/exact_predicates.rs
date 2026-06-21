@@ -407,10 +407,11 @@ fn orient3d_fast(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3) -> f64 {
 }
 
 /// Adaptive precision 3D orientation test
-/// Buffer ceiling for the generic exact-expansion orient3d fallback. The largest
-/// expansion built is a cofactor `coord_diff (≤2) × minor (≤16) ≤ 64` summed
-/// three times (≤192); 256 leaves headroom.
-const EXP_MAX: usize = 256;
+/// Buffer ceiling for the generic exact-expansion fallbacks. Sized for the
+/// largest determinant built this way — the degree-4 in-circle (lifted)
+/// expansion reaches ~1536 components; 2048 leaves headroom. (orient3d uses far
+/// less.) These live on the stack only on the rare exact path.
+const EXP_MAX: usize = 2048;
 
 /// A coordinate difference `a - b` as a zero-free expansion (low→high) in `buf`.
 /// Returns the component count (0 when `a == b` exactly).
@@ -615,37 +616,79 @@ fn incircle_fast(pa: &Vector2, pb: &Vector2, pc: &Vector2, pd: &Vector2) -> f64 
     alift * bcdet + blift * cadet + clift * abdet
 }
 
-/// Adaptive precision in-circle test
+/// Exact addition `out = e + f` of two zero-free expansions; empty operand ⇒ copy.
+fn sum_exp(e: &[f64], f: &[f64], out: &mut [f64]) -> usize {
+    if e.is_empty() {
+        out[..f.len()].copy_from_slice(f);
+        return f.len();
+    }
+    if f.is_empty() {
+        out[..e.len()].copy_from_slice(e);
+        return e.len();
+    }
+    fast_expansion_sum_zeroelim(e, f, out)
+}
+
+/// Exact in-circle determinant value — its SIGN is correct for all finite inputs.
+/// Builds the full expansion of `alift·bcdet + blift·cadet + clift·abdet`, where
+/// each `*lift = *dx² + *dy²` and each sub-determinant carries the coordinate
+/// roundoff tails (the bits the old adapt dropped). Generic exact fallback; runs
+/// only when the A-filter is inconclusive.
 fn incircle_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2, pd: &Vector2) -> f64 {
-    let adx = pa.x - pd.x;
-    let ady = pa.y - pd.y;
-    let bdx = pb.x - pd.x;
-    let bdy = pb.y - pd.y;
-    let cdx = pc.x - pd.x;
-    let cdy = pc.y - pd.y;
+    let (mut adx, mut ady) = ([0.0; 2], [0.0; 2]);
+    let (mut bdx, mut bdy) = ([0.0; 2], [0.0; 2]);
+    let (mut cdx, mut cdy) = ([0.0; 2], [0.0; 2]);
+    let adxn = diff_exp(pa.x, pd.x, &mut adx);
+    let adyn = diff_exp(pa.y, pd.y, &mut ady);
+    let bdxn = diff_exp(pb.x, pd.x, &mut bdx);
+    let bdyn = diff_exp(pb.y, pd.y, &mut bdy);
+    let cdxn = diff_exp(pc.x, pd.x, &mut cdx);
+    let cdyn = diff_exp(pc.y, pd.y, &mut cdy);
 
-    // Use exact arithmetic for the lifts
-    let (adx2_hi, adx2_lo) = two_product(adx, adx);
-    let (ady2_hi, ady2_lo) = two_product(ady, ady);
-    let (alift_hi, alift_lo) = two_sum(adx2_hi, ady2_hi);
-    let alift = alift_hi + (alift_lo + adx2_lo + ady2_lo);
+    let mut u = [0.0f64; EXP_MAX];
+    let mut v = [0.0f64; EXP_MAX];
+    let mut lift = [0.0f64; EXP_MAX];
+    let mut sub = [0.0f64; EXP_MAX];
+    let mut term = [0.0f64; EXP_MAX];
+    let mut sc = [0.0f64; EXP_MAX];
+    let mut det = [0.0f64; EXP_MAX];
+    let mut det_len = 0usize;
 
-    let (bdx2_hi, bdx2_lo) = two_product(bdx, bdx);
-    let (bdy2_hi, bdy2_lo) = two_product(bdy, bdy);
-    let (blift_hi, blift_lo) = two_sum(bdx2_hi, bdy2_hi);
-    let blift = blift_hi + (blift_lo + bdx2_lo + bdy2_lo);
+    // term 1: (adx² + ady²) · (bdx·cdy - cdx·bdy)
+    let un = expansion_product(&adx[..adxn], &adx[..adxn], &mut u);
+    let vn = expansion_product(&ady[..adyn], &ady[..adyn], &mut v);
+    let lift_n = sum_exp(&u[..un], &v[..vn], &mut lift);
+    let un = expansion_product(&bdx[..bdxn], &cdy[..cdyn], &mut u);
+    let vn = expansion_product(&cdx[..cdxn], &bdy[..bdyn], &mut v);
+    let sub_n = expansion_diff(&u[..un], &v[..vn], &mut sub);
+    let term_n = expansion_product(&lift[..lift_n], &sub[..sub_n], &mut term);
+    det_len = accumulate(&mut det, det_len, &term[..term_n], &mut sc);
 
-    let (cdx2_hi, cdx2_lo) = two_product(cdx, cdx);
-    let (cdy2_hi, cdy2_lo) = two_product(cdy, cdy);
-    let (clift_hi, clift_lo) = two_sum(cdx2_hi, cdy2_hi);
-    let clift = clift_hi + (clift_lo + cdx2_lo + cdy2_lo);
+    // term 2: (bdx² + bdy²) · (cdx·ady - adx·cdy)
+    let un = expansion_product(&bdx[..bdxn], &bdx[..bdxn], &mut u);
+    let vn = expansion_product(&bdy[..bdyn], &bdy[..bdyn], &mut v);
+    let lift_n = sum_exp(&u[..un], &v[..vn], &mut lift);
+    let un = expansion_product(&cdx[..cdxn], &ady[..adyn], &mut u);
+    let vn = expansion_product(&adx[..adxn], &cdy[..cdyn], &mut v);
+    let sub_n = expansion_diff(&u[..un], &v[..vn], &mut sub);
+    let term_n = expansion_product(&lift[..lift_n], &sub[..sub_n], &mut term);
+    det_len = accumulate(&mut det, det_len, &term[..term_n], &mut sc);
 
-    // Compute sub-determinants
-    let abdet = adx * bdy - bdx * ady;
-    let bcdet = bdx * cdy - cdx * bdy;
-    let cadet = cdx * ady - adx * cdy;
+    // term 3: (cdx² + cdy²) · (adx·bdy - bdx·ady)
+    let un = expansion_product(&cdx[..cdxn], &cdx[..cdxn], &mut u);
+    let vn = expansion_product(&cdy[..cdyn], &cdy[..cdyn], &mut v);
+    let lift_n = sum_exp(&u[..un], &v[..vn], &mut lift);
+    let un = expansion_product(&adx[..adxn], &bdy[..bdyn], &mut u);
+    let vn = expansion_product(&bdx[..bdxn], &ady[..adyn], &mut v);
+    let sub_n = expansion_diff(&u[..un], &v[..vn], &mut sub);
+    let term_n = expansion_product(&lift[..lift_n], &sub[..sub_n], &mut term);
+    det_len = accumulate(&mut det, det_len, &term[..term_n], &mut sc);
 
-    alift * bcdet + blift * cadet + clift * abdet
+    if det_len == 0 {
+        0.0
+    } else {
+        det[det_len - 1]
+    }
 }
 
 /// Test whether a point is inside the circle passing through three other points
