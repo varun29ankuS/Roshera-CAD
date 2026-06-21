@@ -36,6 +36,9 @@ pub enum ShapeClass {
     /// alternate between two distinct tight clusters (tooth tips and valleys)
     /// at regular angular spacing.
     Gear { teeth: usize },
+    /// A mounting bracket / plate: a rectangular boundary with `holes` interior
+    /// circular holes (all fully inside the plate).
+    Bracket { holes: usize },
     /// A generic closed polygon.
     Polygon { sides: usize },
     /// Multiple loops / mixed entities — no single boundary to classify.
@@ -240,6 +243,49 @@ pub fn recognize_sketch(sketch: &Sketch) -> Recognition {
         }
     }
 
+    // A mounting bracket / plate: one rectangular closed boundary plus N
+    // interior circular holes, each fully inside the plate. (AABB containment —
+    // exact for an axis-aligned plate, the common case.)
+    if n_lines == 0 && n_circles >= 1 && polys.len() == 1 {
+        if let Some((verts, true)) = polys.first().map(|(v, c)| (v, *c)) {
+            if matches!(
+                classify_polygon(verts),
+                ShapeClass::Rectangle | ShapeClass::Square
+            ) {
+                let (mut minx, mut miny, mut maxx, mut maxy) = (
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                );
+                for v in verts {
+                    minx = minx.min(v.x);
+                    miny = miny.min(v.y);
+                    maxx = maxx.max(v.x);
+                    maxy = maxy.max(v.y);
+                }
+                let all_inside = sketch.circles().iter().all(|e| {
+                    let c = &e.value().circle;
+                    c.center.x - c.radius >= minx
+                        && c.center.x + c.radius <= maxx
+                        && c.center.y - c.radius >= miny
+                        && c.center.y + c.radius <= maxy
+                });
+                if all_inside {
+                    return Recognition {
+                        class: ShapeClass::Bracket { holes: n_circles },
+                        vertices: verts.len(),
+                        closed: true,
+                        evidence: format!(
+                            "{}-gon plate with {n_circles} interior hole(s)",
+                            verts.len()
+                        ),
+                    };
+                }
+            }
+        }
+    }
+
     Recognition {
         class: ShapeClass::Compound,
         vertices: 0,
@@ -364,6 +410,46 @@ mod tests {
             })
             .collect();
         assert!(!matches!(poly(verts).class, ShapeClass::Gear { .. }));
+    }
+
+    #[test]
+    fn recognises_a_bracket_plate_with_four_holes() {
+        let s = Sketch::new("br".to_string(), SketchAnchor::xy());
+        s.add_polyline(
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(40.0, 0.0),
+                Point2d::new(40.0, 20.0),
+                Point2d::new(0.0, 20.0),
+            ],
+            true,
+        )
+        .expect("plate");
+        for (cx, cy) in [(5.0, 5.0), (35.0, 5.0), (35.0, 15.0), (5.0, 15.0)] {
+            s.add_circle(Point2d::new(cx, cy), 2.0).expect("hole");
+        }
+        assert_eq!(recognize_sketch(&s).class, ShapeClass::Bracket { holes: 4 });
+    }
+
+    #[test]
+    fn a_plate_with_a_hole_escaping_the_boundary_is_not_a_bracket() {
+        let s = Sketch::new("br".to_string(), SketchAnchor::xy());
+        s.add_polyline(
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(40.0, 0.0),
+                Point2d::new(40.0, 20.0),
+                Point2d::new(0.0, 20.0),
+            ],
+            true,
+        )
+        .expect("plate");
+        // A circle straddling the right edge — not fully contained.
+        s.add_circle(Point2d::new(39.0, 10.0), 3.0).expect("hole");
+        assert!(!matches!(
+            recognize_sketch(&s).class,
+            ShapeClass::Bracket { .. }
+        ));
     }
 
     #[test]
