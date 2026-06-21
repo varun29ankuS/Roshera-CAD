@@ -1712,7 +1712,7 @@ function CSketchPoints({ plane }: { plane: SketchPlane }) {
           entity: pointRef(pointId),
           target: { kind: 'point', params: { x: target[0], y: target[1] } },
         }).catch((err) => {
-          // eslint-disable-next-line no-console
+           
           console.error('[CSketchPoints] drag failed:', err)
         })
       }
@@ -1784,7 +1784,7 @@ function CSketchPoints({ plane }: { plane: SketchPlane }) {
             entity: pointRef(drag.pointId),
             target: { kind: 'point', params: { x: final[0], y: final[1] } },
           }).catch((err) => {
-            // eslint-disable-next-line no-console
+             
             console.error('[CSketchPoints] final drag failed:', err)
           })
         }

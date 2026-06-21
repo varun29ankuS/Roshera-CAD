@@ -109,13 +109,13 @@ export function ViewportBridge() {
 
     const connect = () => {
       if (closingRef.current) return
-      // eslint-disable-next-line no-console
+       
       console.info('[viewport-bridge] connecting to', url)
       const ws = new WebSocket(url)
       wsRef.current = ws
 
       ws.onopen = () => {
-        // eslint-disable-next-line no-console
+         
         console.info('[viewport-bridge] connected')
         // Push an immediate snapshot so `latest.png` is fresh on connect.
         scheduleAutoSnapshot(wsRef, autoSnapTimerRef, 100)
@@ -126,14 +126,14 @@ export function ViewportBridge() {
         try {
           cmd = JSON.parse(event.data) as BridgeCommand
         } catch (err) {
-          // eslint-disable-next-line no-console
+           
           console.warn('[viewport-bridge] bad json', err, event.data)
           return
         }
         handleCommand(ws, cmd).catch((err: unknown) => {
           const message =
             err instanceof Error ? err.message : String(err)
-          // eslint-disable-next-line no-console
+           
           console.error('[viewport-bridge] handler failed', err)
           sendError(ws, cmd.request_id, message)
         })
@@ -147,7 +147,7 @@ export function ViewportBridge() {
       }
 
       ws.onerror = (event) => {
-        // eslint-disable-next-line no-console
+         
         console.warn('[viewport-bridge] ws error', event)
         // onclose will follow.
       }
@@ -217,7 +217,7 @@ function scheduleAutoSnapshot(
         height: canvas.height,
       })
     } catch (err) {
-      // eslint-disable-next-line no-console
+       
       console.warn('[viewport-bridge] auto-snapshot failed', err)
     }
   }, delayMs)
