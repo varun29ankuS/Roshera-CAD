@@ -1,0 +1,183 @@
+# ☀️ MORNING SUMMARY (read this first) — 2026-06-21 overnight
+
+**Branch `fix/bore-tess-verification`, all gated + pushed. Tree is green (compiles; pre-commit passed each commit).**
+
+## ✅ FIXED + PUSHED (9 audit-found bugs, 3 commits)
+- **fc7c185** — 4 reachable correctness bugs: `bisect_root` returned a NaN-poisoned root to NURBS point-inversion (→None); `Cone::offset` recomputed half-angle wrongly (→apex-shift, mirrors offset_exact); `insert_knot` multiplicity guard ignored `times` (→`mult+times`); `Ellipse::check_continuity` acos un-clamped (→NaN G1 misclassified as G0).
+- **a5c5021** — panic guards + doc: empty `sections` in `create_frame_driven_sweep` (panic+underflow); empty `entity_ids[0]` in transform translate/rotate/scale/mirror (4 panics); degenerate `create_offset_cone` sin~0 (apex at ∞); corrected the stale CLAUDE.md `timeline_handlers` note.
+- **b45280e** — STEP export: `AXIS2_PLACEMENT` ref_direction was hardcoded `[1,0,0]`, degenerate for X-aligned cylinders/cones/planes (OCCT/FreeCAD rejected) → now Gram-Schmidt-orthogonalized vs the axis. **(One of the two STEP-export bugs behind your FreeCAD issue.)**
+
+## 🛑 NEEDS-VARUN (real, but too big/risky/design for unsupervised overnight — see B-list + A12 below for details/fix-paths)
+- **B1 ★ geometric validation is a STUB** (`primitives/validation.rs:474`): Standard/Deep validation stamps `geometry_valid:true` WITHOUT checking — the kernel can certify invalid geometry. Plus a torn shell (boundary edge) is a warning not an error. THE verification moat.
+- **A12 ★ STEP export still facets SurfaceOfRevolution** (your nozzle screenshot): `extract_surface_data` has no arm → degree-1 grid. Complete fix-path documented below; deferred because it's high-visibility + multi-piece (a subtle error ships a STEP that *looks* fixed). B3 above fixed the *other* STEP bug.
+- **B2-sketch** sketch→3D bridge facets every curve (`csketch.rs:1534`); **B9** boolean single-curve branch emits a dummy Line (`boolean.rs:3881`); **B4** SSI corrector branch-hops (the #35 cyl-cyl saddle); **B3-sketch** dimensional constraints (Diameter/Length) silently no-op yet count as DOF; **B5** RBAC dead/bypassed; **B7** spatial queries (point/field/region) orphaned from API/MCP (the "inhabitable substrate" moat unreachable); **B8** EdgeStore::add skips indexes (find_edge_between empty for all primitive edges); **B12** transform skips surfaces when update_parameterization=false; sweep `validate_swept_solid` stub.
+
+## ⚠️ PRE-EXISTING TEST FAILURES (NOT mine — fail at HEAD) + a GATE GAP
+- P1 `nozzle_profile_measured_dims_match` (throat not detected), P2 `tessellation refining_tolerance`, P3 `ros loft_watertight_after_roundtrip`.
+- ★ **The pre-commit gate only COMPILES (`cargo check --all-targets`), it never RUNS lib/integration tests** — so these rotted unnoticed. Recommend adding a `cargo test`/`nextest` gate to CI/pre-commit.
+
+## 🧹 DEAD CODE (remove with your permission — rule 5) & MISSING
+- `tessellate_surface` (placeholder+buggy), `render_solids_with_labels`, `drawing/section_view.rs` pipeline, `ai-integration/providers/universal_endpoint.rs` (608-line dup), api-server `full_integration_executor` field + `send_collaborators_update`, math SIMD suite + `trimmed_nurbs.rs`, `timeline_impl.rs merge_branches_alt`/`replay_from` (dangerous if called).
+- **rag-engine DOES NOT EXIST** — only aspirational CLAUDE.md + a Dockerfile stub that would fail a clean build.
+- `/api/metrics` command/perf trackers never written (always 0) + hardcoded DB metrics.
+
+## 🔌 WIRING (your main question) — mostly GOOD
+- **Frontend↔backend + MCP↔backend: fully consistent — zero broken endpoints, zero param mismatches** (~60 MCP tools + all ~22 frontend clients verified against the route table). One frontend bug: **`CADMesh.tsx` leaks Three.js geometry/material (no dispose)** under edit churn — ready-to-apply fix: `useEffect(() => () => { geometry.dispose(); material.dispose(); }, [geometry, material])`. (Left for you — I can't build/verify the frontend per your rules.)
+- Backend endpoints with no UI: assembly explode/interferences/simulate; dead export MIME entries glTF/FBX/IGES (501).
+- api-server routes 100% wired to real handlers; the CLAUDE.md "~30 orphaned WS handlers" note was stale (fixed in a5c5021).
+
+## Audit coverage: 10/10 modules (math, primitives, operations, tessellation, sketch/queries, api-server, ai/rag, timeline/session, export, frontend/mcp). Full per-module findings + the A/B/C worklist are below.
+
+---
+
+# Overnight Autonomous Fix Campaign — started 2026-06-21 night
+
+Varun: "create loops to start fixing the codebase ... and wiring each and
+everything ... i am done for the day .. headed to sleep." → autonomous overnight
+work: AUDIT the whole architecture, FIX bugs, WIRE everything, gated + committed.
+
+## Working agreement (autonomous, no oversight)
+- Branch `fix/bore-tess-verification`. Production-grade only. cargo fmt, NO AI trailers.
+- Every fix is a GATED slice: implement → `cargo test`/`cargo check` green → commit → push.
+- Pre-commit runs `--all-targets`; keep every `AppState{}` constructor + test target complete.
+- REVERT on any gate break. NO force-push. NO merge to `main` (ask Varun). NO destructive ops.
+- One concern per commit, clear message. Append every action to the PROGRESS LOG below.
+- If something needs Varun's judgment (design call, risky refactor), note it under NEEDS-VARUN and move on.
+
+## Process (the loop)
+1. Collect the 10 audit-agent reports as they complete (TaskOutput / SendMessage per agent id).
+2. Synthesize into a prioritized worklist below (critical → high → medium). Dedup.
+3. Fix top item: implement, verify (test/check), commit, push, log. Repeat.
+4. Prefer correctness + wiring (dead/half-wired features → wire or document). Small, safe slices.
+5. Morning: write a SUMMARY (fixed / open / needs-Varun) at the top for Varun.
+
+## Audit agents (in flight)
+- math — `a991c0ce7253adaba`
+- primitives — `a7f41ce7407fb1795`
+- operations — `adae14d44eed90600`
+- tessellation+render+drawing — `a6ea025bd17636918`
+- sketch2d+queries+readable+datum — `a49c293476ab56629`
+- api-server (route↔handler wiring) — `a5916267ff41863dd`
+- ai-integration+rag — `a14a358526c3d7513`
+- timeline+session+shared-types — `a1d3ef8e8e61250ab`
+- export-engine — `ad57afde7ca19d92e`
+- frontend+mcp (contract wiring) — `a8f4a644f563a2bb6`
+
+## Known item (diagnosed, pre-audit) — FIX FIRST
+**STEP export facets SurfaceOfRevolution.** `export-engine/src/formats/ros_snapshot.rs:769`
+`extract_surface_data` has NO `SurfaceOfRevolution` arm → falls to the degree-1 grid
+fallback (line ~852, n=10) → a faceted ~10-gon in FreeCAD (Varun's screenshot). The
+analytic surface is correct; only the export facets it. FIX: add a `SurfaceOfRevolution`
+arm that emits an EXACT smooth representation — either (a) a proper STEP
+`SURFACE_OF_REVOLUTION` entity (the importer already handles it, `formats/step/handlers/tier2/swept.rs`)
+by writing the profile curve (`write_b_spline_curve`) + `AXIS1_PLACEMENT`, or (b) a rational
+NURBS surface of revolution (Piegl–Tiller A8.1) emitted as `SurfaceData::Nurbs`. Prefer (a)
+(no rational-circle math, FreeCAD-native, round-trips with the existing import). Gate: export
+the smooth nozzle, confirm the STEP carries an analytic surface (not the degree-1 grid), and
+ideally re-import → watertight. Same class likely affects Ruled/Offset — check during the fix.
+
+## AUDIT FINDINGS (per module, as agents report)
+### tessellation+render+drawing (a6ea025...) — DONE
+Production tessellation dispatch is CORRECT — every surface type routes to a proper path
+(incl. the just-fixed SurfaceOfRevolution wedge); NO faceting/wrong-path traps on live surfaces.
+Bugs (all medium-or-lower, none on hot path):
+- [MED] `tessellation/surface.rs:5930` `tessellate_surface` — DEAD placeholder ("uniform for now"),
+  ignores params + index-skip desync bug when evaluate_full errs. Orphaned (0 callers) but `pub`. → remove-with-permission (NEEDS-VARUN) or `#[doc(hidden)]`/private.
+- [MED] `render/viewpoint.rs:81-99` EYE-6 az/el axis mismatch: fibonacci lattice is Y-up but `az_el` reads elevation from Z-up index → returned az/el don't match `dir`. `dir` itself correct. FIXABLE (safe).
+- [MED] `drawing/section_view.rs:117` reachable `.unwrap()` w/o `#[allow]+Reason` (lint policy). Dead path. FIXABLE (pattern-bind).
+- [LOW] `surface.rs:5230` fillet boundary-resample can desync shared-edge samples → rare seam crack.
+- [LOW] `drawing/projection.rs:13` no silhouette/tangent edges → curved parts lack outline (design gap).
+- [LOW] `drawing/visibility.rs:283` ortho curved-edge occlusion grazing (only Iso mitigated).
+- [LOW] `render/profile.rs:443,487` half-angle flat-start + symmetry-axis only-world-axes edge cases.
+WIRING: tessellation fully wired. DEAD: `tessellate_surface`, `render::render_solids_with_labels`
+(mod.rs:430), entire `drawing/section_view.rs` pipeline (only a test calls it; REST/MCP `section_view`
+is the render-based `operations::section`). → dead-code list for NEEDS-VARUN (rule 5: no delete w/o permission).
+
+## SYNTHESIZED WORKLIST (from audits — 2026-06-21 night)
+
+### A. SAFE FIXES — do autonomously, each gated (test→commit→push). Each mirrors a known-correct sibling or is a clear guard.
+- [ ] A1 `math/bisection.rs:59-61` `bisect_root` returns NaN midpoint as success → return None on non-finite f(mid). PRODUCTION-reachable (NURBS inversion nurbs.rs:1732/1780). TEST: bracket with NaN mid → None.
+- [ ] A2 `primitives/surface.rs:3200-3208` `Cone::offset` recomputes half_angle (wrong, NaN-prone) → mirror `offset_exact` (3210): keep half_angle, shift apex along axis. TEST: offset cone half_angle unchanged, apex moved.
+- [ ] A3 `primitives/curve.rs:3824,3845` `Ellipse::evaluate_derivatives` never pushes result[0]=position (order 0 → empty vec, all orders shifted) → push position first like every other curve. Also fix order≥3 axis trig (alternate cos/sin). TEST: evaluate_derivatives(t,0)[0]==evaluate position.
+- [ ] A4 `math/nurbs.rs:1084-1100` `insert_knot` checks `mult>=p` but inserts `times` → check `mult+times>degree` like `insert_knot_u` (2516). TEST: insert beyond degree rejected.
+- [ ] A5 `primitives/curve.rs:4027` `Ellipse::check_continuity` `acos(dot)` unclamped → NaN at dot≈1 → clamp(-1,1). (math/continuity_analysis.rs:316 also: `(1-dot).acos()` should be `dot.clamp().acos()` — orphaned but fix.)
+- [ ] A6 `math/nurbs.rs:585-589` `evaluate_derivatives_simd` 2nd-deriv ÷W² should be ÷W (scalar twin :312 correct). Orphaned (bench only) but wrong. TEST vs scalar on rational curve.
+- [ ] A7 `math/vector3.rs:553-558` `signed_angle` antiparallel → signum(0)=0 → returns 0 not ±π; clamp + handle. Orphaned, low pri.
+- [ ] A8 `primitives/curve.rs:1089` `Arc::evaluate_derivatives` order≥4 odd: y-sign wrong. Low pri.
+- [ ] A9 `primitives/vertex.rs:631` `VertexStore::remove` decrements total_created on already-DELETED → u64 underflow. Guard.
+- [ ] A10 `shared-types/src/traits.rs:278` `From<String> for GeometryId` fabricates UUIDv5 from garbage → should error (mirror `from_string` :267). And M3 dup `ExportFormat` (commands.rs:145 vs geometry_commands.rs:852 — FBX drift).
+- [ ] A11 Update `roshera-backend/CLAUDE.md` "Module reality check": the `protocol/timeline_handlers.rs`/`geometry_handlers.rs` "~30 orphaned handlers" note is STALE (files deleted; all WS inlined in message_handlers.rs). Doc-only.
+- [ ] A12 STEP export facets SurfaceOfRevolution (ros_snapshot.rs:769 — see Known item). Medium; do carefully w/ round-trip test.
+
+### B. NEEDS-VARUN — too big / risky / a design call for unsupervised overnight. Do NOT guess.
+- B1 ★ `primitives/validation.rs:474-567` geometric validation (Standard/Deep) is a STUB that stamps `geometry_valid:true` without checking — the central "kernel can certify invalid geometry" defect. Also: torn shell (boundary edge) downgraded to warning not error (725-785); `analyze_edge_usage` uses `0..len()` on holey ids (498); orphaned `check_face_orientations`/`validate_pcurve_references`/certificate (1229-1362, the "SHA256" is SipHash+SystemTime, doc false). HUGE — the verification moat. Design + scope with Varun.
+- B2 ★ `api-server/src/csketch.rs:1534-1647` sketch→3D bridge facets EVERY curve (arc/circle/ellipse/spline → 64-gon polylines) before B-Rep — STEP/booleans see prisms. Kernel CAN build NURBS edges (spline2d.rs correct). The headline product defect (task #9). Big bridge rewrite.
+- B3 `constraint_solver.rs:669,740` dimensional constraints (Diameter/Length/Area/...) silently return 0 residual yet count as DOF-removed → solver lies about constrainedness. Implement real residuals (math + care).
+- B4 `math/surface_intersection.rs:667-735` SSI corrector ignores predicted advance + reseeds from domain midpoint → branch-hops on cylinders (the #35 cyl-cyl saddle root). Deep, known (boolean-cyl-cyl-saddle-35).
+- B5 RBAC dead/bypassed: `session-manager/permissions.rs` `check_permission`/`can_access_object` zero prod callers; api-server auth off by default. Security posture = design call.
+- B6 Two sketch systems parallel (live click-to-place has NO solver; csketch/MCP has it) — unify? (tasks #8/#14). Design.
+- B7 Spatial queries (point/field/region/relational in `queries/`) implemented + sound but ORPHANED from API/MCP — the "inhabitable substrate" moat is unreachable by agents. Wire to MCP/REST (medium-big).
+- B8 `EdgeStore::add` (edge.rs:855) fast path skips indexes → `find_edge_between`/`edges_on_curve` empty for ALL primitive edges. Pervasive; fixing = perf/correctness tradeoff (index every add?). Scope w/ Varun.
+
+### C. ORPHANED / DEAD (mostly remove-with-permission — rule 5; note, don't delete autonomously)
+- `tessellation/surface.rs:5930` `tessellate_surface` (buggy placeholder), `render/mod.rs:430` `render_solids_with_labels`, `drawing/section_view.rs` pipeline, `ai-integration/src/providers/universal_endpoint.rs` (608-line dead dup), `api-server` `full_integration_executor` field + `send_collaborators_update`, math SIMD suite + `trimmed_nurbs.rs` + several exact_predicates, `timeline_impl.rs` `merge_branches_alt`/`replay_from` (dangerous if called), WS `BranchManager` path (H3 split-brain).
+- rag-engine: DOES NOT EXIST (only CLAUDE.md aspirational + a Dockerfile stub that would fail a clean build). Note for Varun.
+- api-server `/api/metrics`: command/perf trackers never written (record_* uncalled) + hardcoded DB metrics → wire record_* or remove.
+
+## MORE AUDIT FINDINGS (operations, math, primitives, sketch, timeline, ai, api — in)
+### operations (adae...) — critical fallback defects
+- B9 CRIT `operations/boolean.rs:3881-3929` `merge_connected_curves` SINGLE-curve branch DISCARDS the marched intersection geometry and emits a dummy `Line(ORIGIN→+X)` (multi-curve branch just below is correct). Hit by every non-analytic boolean fallback (NURBS×*, off-axis cyl-sphere, general cyl-cyl). Boolean imprints garbage/drops the cut. → NEEDS-VARUN (deep, the boolean core).
+- B10 CRIT `operations/sweep.rs:1230` `validate_swept_solid` is an Ok-but-does-nothing stub (others run validate_solid_scoped) → bad sweeps certify clean. SAFE-ish fix: call validate_solid_scoped like extrude/revolve. (sweep also has the rail/twist degradations below.)
+- A13 `operations/sweep.rs:374-377` `sections.len()-1` usize underflow panic on empty frames → guard. SAFE.
+- A14 `operations/transform.rs:283/299/321/343` `entity_ids[0]` no-bounds panic on empty Vec → guard. SAFE.
+- A15 `operations/revolve.rs:2150` accepts angle up to 4π → self-intersecting solid; clamp/reject >2π. SAFE.
+- A16 `operations/offset.rs:357` `create_offset_cone` divides by sin(half_angle) no guard → apex at ∞. SAFE guard.
+- B11 HIGH `operations/revolve.rs:1352` `create_helical_sweep` (pitch≠0) non-manifold + falsely Closed (no caps). NEEDS care.
+- B12 HIGH `operations/transform.rs:96` surfaces NOT transformed when update_parameterization=false → stale analytic faces. NEEDS care (why is the flag there?).
+- B13 `operations/sweep.rs:345/632` Rail/BiRail/MultiGuide ignore guides (plain sweep); twist about world-Z not path tangent. + blend.rs:375 G2/G3 silently → degree-1 ruled. "Silently-degraded features" → NEEDS-VARUN (should error or implement).
+- WIRING: `sweep_profile` has NO REST/MCP endpoint (only timeline replay). section/pattern thin recording.
+### others (summarized; details in B-list above): primitives validation STUB (B1), sketch facet bridge (B2), dim-constraints no-op (B3), SSI corrector (B4), RBAC dead (B5), queries orphaned (B7), edge-index skip (B8). math: bisect_root/Cone/insert_knot/ellipse = SAFE (fixing now). api-server: solid, /metrics dead trackers, CLAUDE.md stale (A11). timeline: core sound; merge_branches_alt/replay_from orphaned-dangerous, session leak (H4), RBAC dead. ai: LLM fine, rag-engine DOESN'T EXIST, NL Boolean/Transform half-wired.
+
+## A12 (STEP SurfaceOfRevolution export) — DEFERRED to a focused session (NOT attempted overnight)
+Why deferred: highest-visibility fix (Varun's FreeCAD screenshot) where a subtle error ships a
+STEP that LOOKS fixed but isn't; the clean path has real surface area (new SurfaceData variant +
+extract arm + to_model arm + extracting an inline curve-builder to a reusable helper + a new
+writer arm + an AXIS1_PLACEMENT emitter + a round-trip test) — not safe to land context-saturated
+overnight without Varun able to verify the round-trip. B3 (ref_direction) — the OTHER STEP export
+bug — IS fixed + pushed, so X-axis analytic surfaces now export correctly.
+COMPLETE FIX PATH (for the focused session):
+  Approach A (exact, recommended): emit STEP SURFACE_OF_REVOLUTION (importer ready, swept.rs:84/180).
+   1. ros_snapshot.rs:124 add `SurfaceData::SurfaceOfRevolution{axis_origin:[f64;3],axis_direction:[f64;3],profile:CurveData,angle:f64}`.
+   2. EXTRACT the inline CurveData→Box<dyn Curve> match (ros_snapshot.rs ~388-437, the to_model Curves loop) into `fn build_curve_from_data(&CurveData)->Option<Box<dyn Curve>>`; reuse it in the loop AND the new surface arm.
+   3. extract_surface_data arm (before fallback :842): downcast SurfaceOfRevolution (fields axis_origin/axis_direction/profile_curve/angle, surface.rs:5036), profile via extract_curve_data(&*sor.profile_curve).
+   4. to_model surface arm (:447 match): build_curve_from_data(profile) + SurfaceOfRevolution::new(pt(axis_origin),vec(axis_direction),profile_curve,angle).
+   5. writer.rs write_surface arm (:507): id_curve=self.write_curve(profile)?; id_axis1=self.write_axis1_placement(origin,axis)?; writeln SURFACE_OF_REVOLUTION('',{id_curve},{id_axis1}); + add write_axis1_placement (AXIS1_PLACEMENT = a CARTESIAN_POINT loc + a DIRECTION axis; analogue of write_axis2_placement_3d:211 minus ref_dir).
+   6. ALSO route an Arc profile through to_nurbs() (B4) so a partial-revolve arc isn't emitted as a full CIRCLE.
+   7. TEST: build a revolved solid (revolve_profile, curved meridian → SurfaceOfRevolution face), export_step, assert output contains "SURFACE_OF_REVOLUTION"; re-import via import_step_content → watertight.
+  Approach B (alt): A8.1 rational NURBS surface of revolution → SurfaceData::Nurbs (fewer plumbing pieces, but silent-math risk — needs an evaluate-vs-SurfaceOfRevolution test).
+ALSO (same fallback trap, do alongside): B2 RuledSurface + OffsetSurface faceted; Ellipse CURVE has no extract_curve_data arm (→ to_nurbs).
+
+### frontend+mcp (re-audit ac3e99...) — DONE, wiring is STRONG
+- Frontend↔backend + MCP↔backend contracts fully consistent: NO broken endpoints, NO param mismatches (~22 frontend clients + ~60 MCP tools checked against the route table). api-server routes 100% wired to real handlers.
+- ONLY real bug: [MED] CADMesh.tsx:87-154 Three.js geometry+material built in useMemo, never disposed → VRAM leak under edit churn. Fix: useEffect(()=>()=>{geometry.dispose();material.dispose();},[geometry,material]). (Frontend — left for Varun to build-verify per the no-npm-build rule.)
+- Minor: dead export MIME glTF/FBX/IGES (export-api.ts:23, 501 if used); backend assembly explode/interferences/simulate endpoints have no UI caller.
+
+## PROGRESS LOG (append-only)
+- 2026-06-21 night: launched 10 audit agents; created this campaign; STEP-export faceting diagnosed.
+- All 10 audits in. 9 safe fixes committed+pushed (fc7c185, a5c5021, b45280e). A12 deferred (fix-path documented). Morning summary written at top. WINDING DOWN: safe-fix campaign complete; remaining work is NEEDS-VARUN (don't do autonomously). Tree green + pushed.
+- tessellation audit: no hot-path bugs; safe fixes queued; dead-code → NEEDS-VARUN.
+- 8/10 audits in (export+frontend rate-limited, re-run pending). Synthesized worklist above.
+- ✅ BATCH 1 COMMITTED+PUSHED (fc7c185): A1 bisect_root NaN→None, A2 Cone::offset apex-shift, A4 insert_knot mult+times, A5 ellipse continuity acos clamp. geometry-engine lib 3847 pass.
+- ⚠ PRE-EXISTING failures found (fail at HEAD with batch stashed — NOT mine, NEEDS-VARUN):
+  P1 `render::profile::nozzle_profile_measured_dims_match` (profile.rs:968 throat NOT detected — the render/profile dominant-half-angle/symmetry-axis bugs the tess audit flagged).
+  P2 `harness::tessellation_oracle::refining_tolerance_converges_volume_and_adds_triangles`.
+  (pre-commit only compiles, never ran these → they rotted unnoticed. The CI/test gate doesn't run lib tests.)
+- ✅ BATCH 2 COMMITTED+PUSHED (a5c5021): A13 sweep empty-sections guard, A14 transform 4× empty-entity_ids guards, A16 offset_cone sin~0 guard, A11 CLAUDE.md stale-doc fix. lib 3847 pass (same 2 pre-existing). Deferred A15 (helical >2π nuance).
+- Remaining A-list mostly deferred (uncertain/low): A3 ellipse derivs (deriv-vector convention), A7/A8 (orphaned low-pri), A9 (VertexFlags API), A10 (From<String> trait can't error — semantics → NEEDS-VARUN), A12 STEP export (medium, do carefully). B12 confirmed: transform.rs:96 surfaces only moved if update_parameterization (intentional flag? → NEEDS-VARUN).
+- Re-running the 2 rate-limited audits ONE AT A TIME to finish wiring coverage (Varun: "figure out if everything is wired"): export ✅, then frontend+mcp (still pending).
+### export-engine (re-audit a2fc7c...) — DONE
+- ★ A12 FIX-PATH (clean, low-risk): SurfaceOfRevolution STEP export → emit a real STEP SURFACE_OF_REVOLUTION entity (importer already handles it: step/handlers/tier2/swept.rs:84/180). Steps: (1) add `SurfaceData::SurfaceOfRevolution{axis_origin,axis_direction,profile:CurveData,angle}` to ros_snapshot.rs:124; (2) extract_surface_data arm (before fallback ~842): downcast SurfaceOfRevolution, serialize profile via the EXISTING extract_curve_data(&*sor.profile_curve); (3) writer.rs write_surface arm: self.write_curve(profile) + new write_axis1_placement(origin,axis) (3-line analogue of write_axis2_placement_3d:211, emits AXIS1_PLACEMENT) + emit `#id=SURFACE_OF_REVOLUTION('',#curve,#axis1);`; (4) add the to_model reverse arm (ros_snapshot.rs:447, SurfaceOfRevolution::new) so the enum match stays exhaustive + ROS round-trips. NO rational-circle math, reuses curve plumbing. GATE: export a revolved solid, assert STEP contains "SURFACE_OF_REVOLUTION" (not degree-1 B_SPLINE); ideally re-import→watertight. NOTE: a partial-revolve ARC profile would be emitted as a full basis CIRCLE (B4) — route Arc profiles through to_nurbs() (exact rational, curve.rs:3677) when serializing the profile.
+- B2 (same fallback trap): RuledSurface + OffsetSurface also faceted to degree-1 grid (extract_surface_data downcasts only Plane/Cyl/Sphere/Cone/Torus/GeneralNurbs). + Ellipse CURVE: extract_curve_data (ros_snapshot.rs:655) has no Ellipse arm → 20-pt polyline (Ellipse has exact to_nurbs curve.rs:3994). → add arms (use to_nurbs) — medium.
+- ✅ B3 FIXED (this batch): writer.rs:211 write_axis2_placement_3d hardcoded ref_direction [1,0,0] → degenerate STEP for X-axis Plane/Cyl/Cone/Torus (OCCT/FreeCAD reject). Now Gram-Schmidt orthogonalizes the ref_dir vs the axis + fallback. Affects ALL analytic surface exports.
+- B5 coord precision {:.6} below declared 1e-7 uncertainty + truncates knots/weights (→ {:.9}); B6 ROS edge ParameterRange always reset to unit() (range never serialized); B7 binary STL normal not normalized. LOW.
+- WIRING: STL/OBJ/ROS/STEP-export all wired via POST /api/export; STEP-import via /api/geometry/import_step + MCP import_step. No MCP export tool (exports REST-only).
