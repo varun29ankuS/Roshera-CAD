@@ -3125,9 +3125,143 @@ pub fn skin_surface(
     )
 }
 
+/// Skin a surface that is PERIODIC (smooth-closed) in U and clamped in V — the
+/// parity-grade loft of CLOSED cross-sections (a bottle, a duct, a nozzle bell).
+/// `sections[v]` is an OPEN ring (the closing point is NOT repeated); each is
+/// periodic-cubic interpolated in U (so the around-the-section direction is C2
+/// across the seam — no kink, unlike the clamped repeat-first-point skin), then
+/// the U control columns are clamped degree-`degree_v` interpolated down V.
+///
+/// U degree is fixed at 3 (the periodic-cubic primitive). The U control net has
+/// `n_u + 3` points (the periodic wrap); U evaluates on the domain `[3, n_u+3]`,
+/// V on `[0, 1]`.
+pub fn skin_surface_periodic_u(
+    sections: &[Vec<Point3>],
+    degree_v: usize,
+) -> Result<NurbsSurface, &'static str> {
+    const DEG_U: usize = 3;
+    let n_v = sections.len();
+    if n_v < degree_v + 1 {
+        return Err("skin_surface_periodic_u: need at least degree_v + 1 sections");
+    }
+    if degree_v == 0 {
+        return Err("skin_surface_periodic_u: degree_v must be at least 1");
+    }
+    let n_u = sections[0].len();
+    if n_u < DEG_U {
+        return Err("skin_surface_periodic_u: need at least 3 points per section");
+    }
+    if sections.iter().any(|s| s.len() != n_u) {
+        return Err("skin_surface_periodic_u: every section must have the same point count");
+    }
+
+    // Stage 1 — periodic-cubic interpolate each section (U is closed + smooth).
+    // The uniform periodic knots depend only on n_u + DEG_U, so they agree across
+    // sections (the rectangular-grid precondition).
+    let mut knots_u: Option<Vec<f64>> = None;
+    let mut row_ctrl: Vec<Vec<Point3>> = Vec::with_capacity(n_v);
+    for section in sections {
+        let curve = interpolate_periodic_cubic_nurbs(section)?;
+        match &knots_u {
+            None => knots_u = Some(curve.knots.to_vec()),
+            Some(ku) => {
+                if curve.knots.to_vec() != *ku {
+                    return Err("skin_surface_periodic_u: section U knot vectors disagree");
+                }
+            }
+        }
+        row_ctrl.push(curve.control_points);
+    }
+    let knots_u = knots_u.ok_or("skin_surface_periodic_u: no sections")?;
+    let m_u = row_ctrl[0].len(); // n_u + DEG_U
+
+    // Stage 2 — clamped degree_v interpolate down each U control column.
+    let mut knots_v: Option<Vec<f64>> = None;
+    let mut control_points: Vec<Vec<Point3>> = Vec::with_capacity(m_u);
+    for k in 0..m_u {
+        let column: Vec<Point3> = (0..n_v).map(|v| row_ctrl[v][k]).collect();
+        let curve = interpolate_nurbs_curve(&column, degree_v, ParameterizationType::Uniform)?;
+        if curve.control_points.len() != n_v {
+            return Err("skin_surface_periodic_u: V interpolation changed control-point count");
+        }
+        match &knots_v {
+            None => knots_v = Some(curve.knots.to_vec()),
+            Some(kv) => {
+                if curve.knots.to_vec() != *kv {
+                    return Err("skin_surface_periodic_u: column V knot vectors disagree");
+                }
+            }
+        }
+        control_points.push(curve.control_points);
+    }
+    let knots_v = knots_v.ok_or("skin_surface_periodic_u: empty section")?;
+
+    let weights = vec![vec![1.0; n_v]; m_u];
+    NurbsSurface::new(control_points, weights, knots_u, knots_v, DEG_U, degree_v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parity: a periodic-U skin of CLOSED circular sections is smooth-closed
+    /// around U (no seam kink) and interpolates each section. Stack of growing
+    /// circles → a smooth tapered tube.
+    #[test]
+    fn periodic_skin_is_smooth_closed_in_u() {
+        let n_u = 12usize;
+        let n_v = 4usize;
+        let sections: Vec<Vec<Point3>> = (0..n_v)
+            .map(|v| {
+                let r = 2.0 + 0.5 * v as f64;
+                let z = v as f64;
+                (0..n_u)
+                    .map(|u| {
+                        let a = std::f64::consts::TAU * u as f64 / n_u as f64;
+                        Point3::new(r * a.cos(), r * a.sin(), z)
+                    })
+                    .collect()
+            })
+            .collect();
+        let surf = skin_surface_periodic_u(&sections, 3).expect("periodic skin");
+
+        let u0 = 3.0;
+        let u1 = (n_u + 3) as f64; // U domain [DEG_U, n_u+DEG_U]
+        let samples = 240;
+
+        // Bottom section (v=0): the U-loop closes and stays on the r=2 circle (a
+        // C0 seam kink would bulge off it).
+        let ps = surf.evaluate(u0, 0.0).point;
+        let pe = surf.evaluate(u1, 0.0).point;
+        assert!(
+            (ps - pe).magnitude() < 1e-6,
+            "periodic-U surface must close at the seam"
+        );
+        for k in 0..=samples {
+            let u = u0 + (u1 - u0) * k as f64 / samples as f64;
+            let p = surf.evaluate(u, 0.0).point;
+            let rad = (p.x * p.x + p.y * p.y).sqrt();
+            assert!(
+                (rad - 2.0).abs() < 0.03,
+                "bottom U-loop must stay on the r=2 circle (no seam kink): r={rad}"
+            );
+            assert!(
+                p.z.abs() < 1e-6,
+                "bottom section must stay at z=0: z={}",
+                p.z
+            );
+        }
+        // Top section (v=1): r = 2 + 0.5*3 = 3.5, z = 3.
+        for k in 0..=samples {
+            let u = u0 + (u1 - u0) * k as f64 / samples as f64;
+            let p = surf.evaluate(u, 1.0).point;
+            let rad = (p.x * p.x + p.y * p.y).sqrt();
+            assert!(
+                (rad - 3.5).abs() < 0.05,
+                "top U-loop must stay on the r=3.5 circle: r={rad}"
+            );
+        }
+    }
 
     /// Parity primitive: a CLOSED (periodic) cubic interpolation must produce a
     /// smooth closed loop — C2 across the seam, no kink. Interpolate 12 points on
