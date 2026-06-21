@@ -462,17 +462,13 @@ fn smooth_nozzle_is_two_revolution_walls_not_faceted() {
 /// 114≠104). This invariant catches that class. Uses a Rao-like contour with a
 /// throat + a sharp chamber corner (the case that warped live).
 ///
-/// KNOWN-BROKEN (documented, do not delete — it is the regression marker): the
-/// invariant correctly FAILS here because `revolve_smooth_nozzle` exposes a
-/// `SurfaceOfRevolution`-of-NURBS SEAM TESSELLATION bug — the curved-CDT mesher
-/// places spurious vertices at r≈60 at the seam (octant_max_r=[60,52,…,52,60])
-/// even though the NURBS meridian is provably ≤52 (control-point radii clamped to
-/// the contour range AND the curve evaluate clamps its parameter). It is NOT the
-/// fit (chord-length/centripetal/clamped all leave the ~60 seam spike). The fix
-/// is in the analytic surface-of-revolution seam tessellation, a focused deep
-/// task. Un-ignore once that lands.
-#[ignore = "known-broken: SurfaceOfRevolution-of-NURBS seam tessellation spikes the \
-            seam to r≈60 (curved-CDT seam bug); the invariant correctly flags it"]
+/// This gate guards the SurfaceOfRevolution seam-tessellation fix: the wedge
+/// path (`tessellate_revolution_wedge`) used to Coons-blend interior nodes, which
+/// overshoots OFF a curved meridian and spiked the seam to r≈60 on a wall of true
+/// radius ≤52 (octant_max_r=[60,52,…,52,60], x=112≠y=104). The fix rotates the
+/// cached seam about the surface's true axis instead — exact, so the mesh is a
+/// flat 52 in every octant and x==y. Regression marker: if the Coons path (or any
+/// non-surface interior) returns, this fails first.
 #[test]
 fn smooth_nozzle_revolve_is_rotationally_symmetric() {
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
@@ -520,23 +516,6 @@ fn smooth_nozzle_revolve_is_rotationally_symmetric() {
         ymax = ymax.max(p.y);
     }
     let (xext, yext) = (xmax - xmin, ymax - ymin);
-
-    // DIAGNOSTIC: analytic (few SurfaceOfRevolution) vs grid fallback (many), and
-    // per-octant max radius — a seam bulge shows as one octant >> the rest.
-    let k = face_kinds(&m, sid);
-    let mut octant_max = [0.0f64; 8];
-    for v in &mesh.vertices {
-        let p = v.position;
-        let r = (p.x * p.x + p.y * p.y).sqrt();
-        let a = p.y.atan2(p.x) + std::f64::consts::PI; // 0..2π
-        let oct = ((a / (std::f64::consts::TAU / 8.0)) as usize).min(7);
-        octant_max[oct] = octant_max[oct].max(r);
-    }
-    eprintln!(
-        "DIAG faces={} SoR={} x={xext:.3} y={yext:.3} octant_max_r={octant_max:?}",
-        k.len(),
-        count(&k, SurfaceType::SurfaceOfRevolution)
-    );
 
     assert!(
         (xext - yext).abs() < 0.01 * xext.max(yext),
