@@ -971,6 +971,44 @@ pub fn insphere(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3)
     }
 }
 
+/// Exact orientation of a closed polygon from the SIGN of its shoelace signed
+/// area `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)`, computed in exact expansion
+/// arithmetic. `CounterClockwise` = positive area, `Clockwise` = negative,
+/// `Collinear` = exactly zero (degenerate / self-cancelling). Correct for all
+/// finite inputs — the tolerance-free basis for winding/orientation tests that
+/// today compare an f64 signed area against `0.0`.
+pub fn signed_area_2d(points: &[Vector2]) -> Orientation {
+    let n = points.len();
+    if n < 3 {
+        return Orientation::Collinear;
+    }
+    let mut acc: Vec<f64> = Vec::new();
+    for i in 0..n {
+        let p = &points[i];
+        let q = &points[(i + 1) % n];
+        // term = x_i·y_{i+1} − x_{i+1}·y_i, exactly (a 4-component expansion).
+        let (h1, l1) = two_product(p.x, q.y);
+        let (h2, l2) = two_product(q.x, p.y);
+        let term: Vec<f64> = two_two_diff(h1, l1, h2, l2)
+            .into_iter()
+            .filter(|&c| c != 0.0)
+            .collect();
+        if term.is_empty() {
+            continue;
+        }
+        acc = if acc.is_empty() {
+            term
+        } else {
+            sum_v(&acc, &term)
+        };
+    }
+    if acc.is_empty() {
+        Orientation::Collinear
+    } else {
+        orientation_of(acc[acc.len() - 1])
+    }
+}
+
 /// Robust version of orient2d that handles special cases
 ///
 /// This version includes additional checks for numerical stability

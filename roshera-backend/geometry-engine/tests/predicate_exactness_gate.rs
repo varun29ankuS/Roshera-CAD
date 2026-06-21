@@ -13,10 +13,10 @@
 
 use geometry_engine::math::vector2::Vector2;
 use geometry_engine::math::{
-    incircle, insphere, orient2d, orient3d, CircleLocation, Orientation, Point3,
+    incircle, insphere, orient2d, orient3d, signed_area_2d, CircleLocation, Orientation, Point3,
 };
 use num_rational::BigRational;
-use num_traits::Signed;
+use num_traits::{Signed, Zero};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -485,6 +485,99 @@ fn insphere_matches_exact_rational_oracle_on_adversarial_inputs() {
     assert_eq!(
         mismatches, 0,
         "insphere disagreed with the EXACT rational oracle on {mismatches}/{n} cases \
+         (hard cases where naive f64 was wrong: {hard}); first failure: {first_fail:?} \
+         — the predicate is NOT exact"
+    );
+}
+
+// ── signed_area_2d (polygon winding) ───────────────────────────────────────
+
+/// Exact polygon shoelace sign via rationals: Σ (x_i·y_{i+1} − x_{i+1}·y_i).
+fn exact_signed_area_sign(poly: &[[f64; 2]]) -> i32 {
+    let n = poly.len();
+    let mut sum = BigRational::zero();
+    for i in 0..n {
+        let p = &poly[i];
+        let q = &poly[(i + 1) % n];
+        sum += rat(p[0]) * rat(q[1]) - rat(q[0]) * rat(p[1]);
+    }
+    if sum.is_positive() {
+        1
+    } else if sum.is_negative() {
+        -1
+    } else {
+        0
+    }
+}
+
+fn pred_signed_area_sign(poly: &[[f64; 2]]) -> i32 {
+    let pts: Vec<Vector2> = poly.iter().map(|p| Vector2::new(p[0], p[1])).collect();
+    match signed_area_2d(&pts) {
+        Orientation::CounterClockwise => 1,
+        Orientation::Clockwise => -1,
+        Orientation::Collinear => 0,
+    }
+}
+
+fn naive_signed_area_sign(poly: &[[f64; 2]]) -> i32 {
+    let n = poly.len();
+    let mut sum = 0.0f64;
+    for i in 0..n {
+        let p = &poly[i];
+        let q = &poly[(i + 1) % n];
+        sum += p[0] * q[1] - q[0] * p[1];
+    }
+    if sum > 0.0 {
+        1
+    } else if sum < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+#[test]
+fn signed_area_2d_matches_exact_rational_oracle_on_adversarial_inputs() {
+    let mut rng = StdRng::seed_from_u64(0x5161_5249_4E47_2218);
+    let mut mismatches = 0u64;
+    let mut hard = 0u64;
+    let mut first_fail = None;
+    let n = 200_000u64;
+
+    for _ in 0..n {
+        // Near-degenerate slivers: vertices hug the line y = x (O(1) coords, so
+        // the shoelace PRODUCTS are ~1) with a ~1e-15 perpendicular nudge, so the
+        // net area sits near the f64 rounding floor and the products cancel
+        // catastrophically — the regime where naive f64 flips sign. Vertex 3..7.
+        let vcount = 3 + (rng.gen_range(0u32..4) as usize);
+        let poly: Vec<[f64; 2]> = (0..vcount)
+            .map(|_| {
+                let x = rng.gen_range(-1.0..1.0);
+                let y = x + rng.gen_range(-1.0..1.0) * 1e-15;
+                [x, y]
+            })
+            .collect();
+
+        let exact = exact_signed_area_sign(&poly);
+        let got = pred_signed_area_sign(&poly);
+        if got != exact {
+            mismatches += 1;
+            if first_fail.is_none() {
+                first_fail = Some((poly.clone(), got, exact));
+            }
+        }
+        if naive_signed_area_sign(&poly) != exact {
+            hard += 1;
+        }
+    }
+
+    assert!(
+        hard > 0,
+        "the sweep never reached the hard regime (naive f64 always matched exact) — squeeze the polygons thinner"
+    );
+    assert_eq!(
+        mismatches, 0,
+        "signed_area_2d disagreed with the EXACT rational oracle on {mismatches}/{n} cases \
          (hard cases where naive f64 was wrong: {hard}); first failure: {first_fail:?} \
          — the predicate is NOT exact"
     );

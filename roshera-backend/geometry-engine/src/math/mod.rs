@@ -86,7 +86,9 @@ pub use utils::{
 };
 
 // Re-export exact predicates
-pub use exact_predicates::{incircle, insphere, orient2d, orient3d, CircleLocation, Orientation};
+pub use exact_predicates::{
+    incircle, insphere, orient2d, orient3d, signed_area_2d, CircleLocation, Orientation,
+};
 
 // Use constants module
 pub use constants::consts;
