@@ -416,10 +416,11 @@ impl SketchTopology {
                 let orientations = vec![true];
                 let area = self.calculate_loop_area(&edges, &orientations);
                 let bounds = self.calculate_loop_bounds(&edges);
+                let is_ccw = self.loop_is_ccw(&edges, &orientations, area);
                 loops.push(SketchLoop {
                     edges,
                     orientations,
-                    is_ccw: area > 0.0,
+                    is_ccw,
                     area: area.abs(),
                     bounds,
                 });
@@ -431,7 +432,7 @@ impl SketchTopology {
             {
                 let area = self.calculate_loop_area(&loop_edges, &orientations);
                 let bounds = self.calculate_loop_bounds(&loop_edges);
-                let is_ccw = area > 0.0;
+                let is_ccw = self.loop_is_ccw(&loop_edges, &orientations, area);
                 loops.push(SketchLoop {
                     edges: loop_edges,
                     orientations,
@@ -546,6 +547,32 @@ impl SketchTopology {
             return std::f64::consts::PI * rx * ry;
         }
         area
+    }
+
+    /// Exact loop winding (`is_ccw`), tolerance-free. `calculate_loop_area` uses
+    /// the trapezoidal form `Σ(b.x−a.x)(b.y+a.y) = −2·shoelace`, so its POSITIVE
+    /// sign corresponds to CLOCKWISE standard winding — this preserves the exact
+    /// same `area > 0.0` decision, only making the SIGN exact (robust for thin
+    /// near-degenerate loops). Degenerate loops (e.g. a single full-circle edge,
+    /// whose endpoint polygon collapses to < 3 points) fall back to the f64 area.
+    fn loop_is_ccw(&self, loop_edges: &[usize], orientations: &[bool], area: f64) -> bool {
+        use crate::math::vector2::Vector2;
+        use crate::math::{signed_area_2d, Orientation};
+        let poly: Vec<Vector2> = loop_edges
+            .iter()
+            .enumerate()
+            .map(|(k, &edge_idx)| {
+                let edge = &self.edges[edge_idx];
+                let forward = orientations.get(k).copied().unwrap_or(true);
+                let p = if forward { edge.start } else { edge.end };
+                Vector2::new(p.x, p.y)
+            })
+            .collect();
+        match signed_area_2d(&poly) {
+            Orientation::Clockwise => true,
+            Orientation::CounterClockwise => false,
+            Orientation::Collinear => area > 0.0,
+        }
     }
 
     /// Calculate bounding box of a loop
