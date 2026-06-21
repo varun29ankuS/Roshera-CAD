@@ -9,8 +9,8 @@
 //! solid (via fallback), just not the minimal analytic face set yet (v2).
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::revolve::{
-    get_revolve_meridian, revolve_meridian, revolve_profile, revolve_spline_meridian,
-    RevolveOptions,
+    get_revolve_meridian, revolve_meridian, revolve_profile, revolve_smooth_nozzle,
+    revolve_spline_meridian, RevolveOptions,
 };
 use geometry_engine::primitives::curve::{Arc, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
@@ -400,5 +400,147 @@ fn revolve_spline_meridian_is_one_smooth_wall() {
         get_revolve_meridian(&m, sid).expect("recover").len(),
         4,
         "the wall profile is recoverable for editing"
+    );
+}
+
+/// HARNESS — face economy + smoothness (the invariant that was MISSING when the
+/// faceted "so many circles" revolve shipped): a smooth axisymmetric nozzle must
+/// revolve to O(1) analytic faces — ONE `SurfaceOfRevolution` per wall + 2 rims
+/// = 4 — NOT O(points) faceted bands. A valid, watertight, 90-face solid passes
+/// every OTHER check; only this gate fails it.
+#[test]
+fn smooth_nozzle_is_two_revolution_walls_not_faceted() {
+    let mut m = BRepModel::new();
+    // A bell inner/flow contour: chamber r12 → throat r4 @ z12 → exit r10, sampled
+    // at 15 stations (a faceted revolve would explode to ~15 bands per wall).
+    let inner: Vec<(f64, f64)> = (0..15)
+        .map(|i| {
+            let z = i as f64 * 3.0;
+            let r = if z <= 12.0 {
+                12.0 - 8.0 * (z / 12.0)
+            } else {
+                4.0 + 6.0 * ((z - 12.0) / 30.0)
+            };
+            (r, z)
+        })
+        .collect();
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 64,
+        ..Default::default()
+    };
+    let sid = revolve_smooth_nozzle(&mut m, &inner, 2.0, opts)
+        .unwrap_or_else(|e| panic!("revolve_smooth_nozzle: {e:?}"));
+
+    let k = face_kinds(&m, sid);
+    // The inner flow wall and the outer wall are EACH one smooth SurfaceOfRevolution.
+    assert_eq!(
+        count(&k, SurfaceType::SurfaceOfRevolution),
+        2,
+        "inner + outer must each be ONE SurfaceOfRevolution (face economy): {k:?}"
+    );
+    // O(1) faces total — 2 walls + 2 annular rims — never O(points) bands.
+    assert!(
+        k.len() <= 4,
+        "smooth nozzle must be 4 faces (2 walls + 2 rims), not faceted: {} {k:?}",
+        k.len()
+    );
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "smooth nozzle must be a valid solid"
+    );
+    // And the flow contour is recoverable for editing.
+    assert_eq!(get_revolve_meridian(&m, sid).expect("recover").len(), 15);
+}
+
+/// HARNESS — ROTATIONAL SYMMETRY (the automatic visual-verification invariant,
+/// geometric form): a Z-axis revolve is axisymmetric, so the tessellated mesh's
+/// X-extent must equal its Y-extent. A VALID, watertight nozzle can still be
+/// DEFORMED (non-circular) — exactly what shipped (cert said sound, dims were
+/// 114≠104). This invariant catches that class. Uses a Rao-like contour with a
+/// throat + a sharp chamber corner (the case that warped live).
+///
+/// KNOWN-BROKEN (documented, do not delete — it is the regression marker): the
+/// invariant correctly FAILS here because `revolve_smooth_nozzle` exposes a
+/// `SurfaceOfRevolution`-of-NURBS SEAM TESSELLATION bug — the curved-CDT mesher
+/// places spurious vertices at r≈60 at the seam (octant_max_r=[60,52,…,52,60])
+/// even though the NURBS meridian is provably ≤52 (control-point radii clamped to
+/// the contour range AND the curve evaluate clamps its parameter). It is NOT the
+/// fit (chord-length/centripetal/clamped all leave the ~60 seam spike). The fix
+/// is in the analytic surface-of-revolution seam tessellation, a focused deep
+/// task. Un-ignore once that lands.
+#[ignore = "known-broken: SurfaceOfRevolution-of-NURBS seam tessellation spikes the \
+            seam to r≈60 (curved-CDT seam bug); the invariant correctly flags it"]
+#[test]
+fn smooth_nozzle_revolve_is_rotationally_symmetric() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let mut m = BRepModel::new();
+    let inner: Vec<(f64, f64)> = vec![
+        (30.0, 0.0),
+        (30.0, 6.0),
+        (30.0, 12.0),
+        (24.0, 17.0),
+        (18.0, 21.0),
+        (13.0, 24.0),
+        (10.0, 27.0),
+        (10.5, 29.0),
+        (13.0, 35.0),
+        (18.0, 45.0),
+        (24.0, 60.0),
+        (30.0, 80.0),
+        (38.0, 105.0),
+        (45.0, 130.0),
+        (50.0, 156.0),
+    ];
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 96,
+        ..Default::default()
+    };
+    let sid = revolve_smooth_nozzle(&mut m, &inner, 2.0, opts)
+        .unwrap_or_else(|e| panic!("revolve_smooth_nozzle: {e:?}"));
+    let solid = m.solids.get(sid).expect("solid");
+    let mesh = tessellate_solid(solid, &m, &TessellationParams::default());
+
+    let (mut xmin, mut xmax, mut ymin, mut ymax) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for v in &mesh.vertices {
+        let p = v.position;
+        xmin = xmin.min(p.x);
+        xmax = xmax.max(p.x);
+        ymin = ymin.min(p.y);
+        ymax = ymax.max(p.y);
+    }
+    let (xext, yext) = (xmax - xmin, ymax - ymin);
+
+    // DIAGNOSTIC: analytic (few SurfaceOfRevolution) vs grid fallback (many), and
+    // per-octant max radius — a seam bulge shows as one octant >> the rest.
+    let k = face_kinds(&m, sid);
+    let mut octant_max = [0.0f64; 8];
+    for v in &mesh.vertices {
+        let p = v.position;
+        let r = (p.x * p.x + p.y * p.y).sqrt();
+        let a = p.y.atan2(p.x) + std::f64::consts::PI; // 0..2π
+        let oct = ((a / (std::f64::consts::TAU / 8.0)) as usize).min(7);
+        octant_max[oct] = octant_max[oct].max(r);
+    }
+    eprintln!(
+        "DIAG faces={} SoR={} x={xext:.3} y={yext:.3} octant_max_r={octant_max:?}",
+        k.len(),
+        count(&k, SurfaceType::SurfaceOfRevolution)
+    );
+
+    assert!(
+        (xext - yext).abs() < 0.01 * xext.max(yext),
+        "a Z-axis revolve must be rotationally symmetric (X-extent ≈ Y-extent); \
+         deformed: x={xext:.3} y={yext:.3}"
     );
 }

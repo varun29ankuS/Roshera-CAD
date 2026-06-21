@@ -358,6 +358,147 @@ pub fn revolve_spline_meridian(
     Ok(solid)
 }
 
+/// Parametric revolve of a SMOOTH constant-thickness AXISYMMETRIC SHELL — the
+/// correct primitive for a Rao bell nozzle (or any contoured vessel). `inner_rz`
+/// is the FLOW/inner meridian (the `(r, z)` contour, inlet→exit, every `r > 0`);
+/// the outer wall is `inner` offset radially by `wall_thickness`. BOTH contours
+/// are interpolated by degree-3 NURBS and revolved, so the inner AND outer walls
+/// are each ONE smooth `SurfaceOfRevolution` — EXACT circular cross-sections AND
+/// a smooth contour, with NO band rings (the faceted-revolve artifact) and NO
+/// loft seam (the nurbs_loft notch). Two planar annular rims close it into a
+/// watertight wall. The inner contour is retained as construction geometry for
+/// the edit→regenerate loop.
+pub fn revolve_smooth_nozzle(
+    model: &mut BRepModel,
+    inner_rz: &[(f64, f64)],
+    wall_thickness: f64,
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+    use crate::primitives::curve::{Line, NurbsCurve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+
+    if inner_rz.len() < 4 {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_nozzle: need at least 4 inner contour points".to_string(),
+        ));
+    }
+    if !(wall_thickness > 0.0) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_nozzle: wall_thickness must be > 0".to_string(),
+        ));
+    }
+    if inner_rz.iter().any(|&(r, _)| r <= 0.0) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_nozzle: every inner radius must be > 0".to_string(),
+        ));
+    }
+
+    let axis_origin = options.axis_origin;
+    let (ir0, z0) = inner_rz[0]; // inner inlet
+    let (ir1, z1) = inner_rz[inner_rz.len() - 1]; // inner exit
+    let (or0, or1) = (ir0 + wall_thickness, ir1 + wall_thickness);
+
+    let fit = |pts: Vec<(f64, f64)>| -> OperationResult<NurbsCurve> {
+        let rmin = pts.iter().map(|&(r, _)| r).fold(f64::INFINITY, f64::min);
+        let rmax = pts
+            .iter()
+            .map(|&(r, _)| r)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let p: Vec<Point3> = pts.iter().map(|&(r, z)| Point3::new(r, 0.0, z)).collect();
+        let m = interpolate_nurbs_curve(&p, 3, ParameterizationType::ChordLength)
+            .map_err(|e| OperationError::NumericalError(format!("nozzle spline fit: {e}")))?;
+        // Clamp the control-point RADII to the contour's [rmin, rmax]. A B-spline
+        // lies inside its control hull, so a control point whose radius exceeds the
+        // data range bulges the curve past the contour — cubic interpolation
+        // overshoot at the sharp chamber/throat corners (chord-length overshot to
+        // r≈60, centripetal to r≈66, from a max contour radius of 52), and the
+        // revolved seam captured the spike → a non-rotationally-symmetric wall.
+        // Clamping the radius guarantees no overshoot; the throat (rmin) and exit
+        // (rmax) sit at the bounds so they are preserved.
+        let cps: Vec<Point3> = m
+            .control_points
+            .iter()
+            .map(|&cp| Point3::new(cp.x.clamp(rmin, rmax), cp.y, cp.z))
+            .collect();
+        NurbsCurve::new(m.degree, cps, m.weights, m.knots.to_vec())
+            .map_err(|e| OperationError::NumericalError(format!("nozzle curve: {e:?}")))
+    };
+
+    // Outer wall = inner offset radially by wall_thickness (so the inlet/exit rims
+    // stay planar annuli). Inner is reversed (exit→inlet) so its forward edge runs
+    // the inner-exit→inner-inlet leg of the tube loop.
+    let outer_curve = fit(inner_rz
+        .iter()
+        .map(|&(r, z)| (r + wall_thickness, z))
+        .collect())?;
+    let inner_curve = fit(inner_rz.iter().rev().cloned().collect())?;
+
+    // Tube winding: outer-inlet → outer-exit → inner-exit → inner-inlet.
+    let v_out_bot = model.vertices.add(or0, 0.0, z0);
+    let v_out_top = model.vertices.add(or1, 0.0, z1);
+    let v_in_top = model.vertices.add(ir1, 0.0, z1);
+    let v_in_bot = model.vertices.add(ir0, 0.0, z0);
+
+    let c_outer = model.curves.add(Box::new(outer_curve));
+    let c_exit = model.curves.add(Box::new(Line::new(
+        Point3::new(or1, 0.0, z1),
+        Point3::new(ir1, 0.0, z1),
+    )));
+    let c_inner = model.curves.add(Box::new(inner_curve));
+    let c_inlet = model.curves.add(Box::new(Line::new(
+        Point3::new(ir0, 0.0, z0),
+        Point3::new(or0, 0.0, z0),
+    )));
+
+    let edges = vec![
+        model.edges.add(Edge::new(
+            0,
+            v_out_bot,
+            v_out_top,
+            c_outer,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_out_top,
+            v_in_top,
+            c_exit,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_top,
+            v_in_bot,
+            c_inner,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_bot,
+            v_out_bot,
+            c_inlet,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+    ];
+
+    let solid = revolve_profile(model, edges, options)?;
+
+    let meridian_pts: Vec<Point3> = inner_rz
+        .iter()
+        .map(|&(r, z)| Point3::new(r, 0.0, z))
+        .collect();
+    model.set_solid_construction(
+        solid,
+        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+    );
+    Ok(solid)
+}
+
 /// Create a pure revolution (no helical component) as a watertight B-Rep.
 ///
 /// Builds a SHARED vertex/edge grid rather than independent per-quad islands:

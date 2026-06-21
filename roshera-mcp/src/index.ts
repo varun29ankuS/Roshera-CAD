@@ -979,6 +979,14 @@ server.tool(
       .number()
       .optional()
       .describe("hollow bore radius for a smooth-walled tube (use with smooth=true)"),
+    wall_thickness: z
+      .number()
+      .optional()
+      .describe(
+        "CONTOURED nozzle/vessel (e.g. a Rao bell): treat `profile` as the INNER " +
+          "flow contour and offset the outer wall by this thickness — both walls become " +
+          "ONE smooth SurfaceOfRevolution (exact circles, smooth contour, no rings/seam).",
+      ),
     name: z.string().optional(),
   },
   async ({
@@ -989,6 +997,7 @@ server.tool(
     segments,
     smooth,
     bore_radius,
+    wall_thickness,
     name,
   }) => {
     try {
@@ -1000,6 +1009,7 @@ server.tool(
         segments,
         smooth: smooth ?? false,
         bore_radius: bore_radius ?? 0,
+        wall_thickness: wall_thickness ?? 0,
         name: name ?? null,
       });
       const id = r.solid_id ?? (await newestPartId());
