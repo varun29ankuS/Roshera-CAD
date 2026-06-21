@@ -8,7 +8,9 @@
 //! zero-regression contract: cone/stepped profiles still produce a watertight
 //! solid (via fallback), just not the minimal analytic face set yet (v2).
 use geometry_engine::math::{Point3, Tolerance, Vector3};
-use geometry_engine::operations::revolve::{revolve_meridian, revolve_profile, RevolveOptions};
+use geometry_engine::operations::revolve::{
+    get_revolve_meridian, revolve_meridian, revolve_profile, RevolveOptions,
+};
 use geometry_engine::primitives::curve::{Arc, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
@@ -303,5 +305,54 @@ fn revolve_meridian_retains_its_generating_profile() {
     assert!(
         validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
         "revolve_meridian must build a valid solid"
+    );
+}
+
+/// #25.2 — the kernel edit→regenerate loop: RECOVER a part's meridian, EDIT it,
+/// and re-revolve to a new part. Widening the profile must yield a larger solid,
+/// and the regenerated part must retain the edited meridian.
+#[test]
+fn revolve_meridian_edit_regenerate_loop() {
+    let opts = || RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let mut m = BRepModel::new();
+    let profile = [(0.0, 0.0), (5.0, 0.0), (5.0, 10.0), (0.0, 10.0)];
+    let sid = revolve_meridian(&mut m, &profile, opts()).expect("revolve");
+
+    // RECOVER the editable meridian (matches the original).
+    let recovered = get_revolve_meridian(&m, sid).expect("recover meridian");
+    assert_eq!(recovered.len(), 4);
+    for (got, want) in recovered.iter().zip(profile.iter()) {
+        assert!(
+            (got.0 - want.0).abs() < 1e-9 && (got.1 - want.1).abs() < 1e-9,
+            "recovered {got:?} != original {want:?}"
+        );
+    }
+    let v_orig = m.mass_properties_for(sid).expect("mp").volume;
+
+    // EDIT: widen the outer radius 5 → 8, then REGENERATE.
+    let edited: Vec<(f64, f64)> = recovered
+        .iter()
+        .map(|&(r, z)| (if r > 0.0 { 8.0 } else { r }, z))
+        .collect();
+    let mut m2 = BRepModel::new();
+    let sid2 = revolve_meridian(&mut m2, &edited, opts()).expect("regenerate");
+    let v_new = m2.mass_properties_for(sid2).expect("mp2").volume;
+
+    // π·8²·10 ≈ 2.56× π·5²·10 — the edit regenerated a substantially larger part.
+    assert!(
+        v_new > v_orig * 1.5,
+        "widened profile must regenerate a larger part: {v_new} vs {v_orig}"
+    );
+    // The regenerated part retains the EDITED meridian (r = 8).
+    let re2 = get_revolve_meridian(&m2, sid2).expect("recover2");
+    assert!(
+        (re2[1].0 - 8.0).abs() < 1e-9,
+        "regenerated part must retain the edit: {re2:?}"
     );
 }
