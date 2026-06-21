@@ -124,6 +124,32 @@ predicates.c (cs.cmu.edu/~quake/robust.html); OCCT Boolean docs; Attene arXiv
 2105.09772 + Cherchi mesh-arrangements/booleans papers; crates `robust` /
 `geometry-predicates`. Full report in the research agent transcript.
 
+## Phase 2 progress + findings (2026-06-21)
+WIRED + verified (each gate green): **2.1** sketch self-intersection →
+exact `orient2d` (robust straddle test; 27-case sketch gate). **2.2** added
+exact `signed_area_2d` (shoelace winding), bignum-proven 0/200k. **2.3**
+`sketch_topology` `is_ccw` → exact `signed_area_2d` (inverted trapezoidal
+convention matched; topology+gate+extrude green).
+
+FINDINGS (which consumers are NOT clean swaps — for the next focused session):
+- `tessellation/surface.rs` winding: `polygon_signed_area_2d` is `#[cfg(test)]`
+  only; `polygon_signed_area_uv` is used via `.abs() < DEGENERATE_AREA_TOL` — a
+  MAGNITUDE threshold, not a sign decision (exact sign doesn't help).
+- `face_arrangement.rs` `signed_area_of_cycle`: decision is `signed > tol*tol`
+  (sign + magnitude threshold mixed) — not a clean sign swap; boolean-critical.
+- `polygon_clip.rs` `point_in_polygon`: I wired it to exact `orient2d` (robust
+  ray-crossing) — polygon_clip's own 13 tests + 102 boolean lib tests passed, but
+  the **poke_matrix gate FAILED** (it changed a coplanar-boolean classification).
+  REVERTED per discipline. LESSON: boolean-path inside/winding decisions depend on
+  the existing f64 semantics at the boundary; swapping for the exact predicate
+  needs per-cell poke_matrix analysis, NOT a blind swap. The poke_matrix (33/33)
+  is the gate that catches this. NEXT: a focused session — diff which poke cell
+  flips, understand the boundary dependency, then wire+fix together.
+
+The clean winding/orientation wirings (sketch) are done; the remaining ones are
+boolean-critical and need focused, poke_matrix-verified work (+ Phase 3 indirect
+predicates is the structural #17/#35 cure regardless).
+
 ## Discipline
 Production-grade, compile-safe slices, each predicate harness-gated (the harness
 is the proof of exactness), `cargo fmt` clean, commit each verified increment.
