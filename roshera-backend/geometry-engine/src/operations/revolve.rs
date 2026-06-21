@@ -161,6 +161,64 @@ pub fn revolve_profile(
     })
 }
 
+/// Parametric revolve from a MERIDIAN profile — the scientist-facing form of a
+/// solid of revolution. `profile_rz` is the `(r, z)` half-plane meridian (r =
+/// radius from the axis, z = height along it); it is lifted to the `(r, 0, z)`
+/// plane, joined by line edges (auto-closed last→first) and revolved. The
+/// generating meridian is RETAINED as the solid's construction geometry, so the
+/// part remembers how it was made — the foundation of the edit→regenerate
+/// workflow (#25): an edit recovers this profile, changes it, and re-revolves.
+pub fn revolve_meridian(
+    model: &mut BRepModel,
+    profile_rz: &[(f64, f64)],
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    use crate::primitives::curve::{Line, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+
+    if profile_rz.len() < 3 {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_meridian: need at least 3 meridian points".to_string(),
+        ));
+    }
+
+    let axis_origin = options.axis_origin;
+    let n = profile_rz.len();
+    let verts: Vec<_> = profile_rz
+        .iter()
+        .map(|&(r, z)| model.vertices.add(r, 0.0, z))
+        .collect();
+    let mut edges = Vec::with_capacity(n);
+    let mut meridian_pts = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (ri, zi) = profile_rz[i];
+        let (rj, zj) = profile_rz[j];
+        meridian_pts.push(Point3::new(ri, 0.0, zi));
+        let line = Line::new(Point3::new(ri, 0.0, zi), Point3::new(rj, 0.0, zj));
+        let cid = model.curves.add(Box::new(line));
+        edges.push(model.edges.add(Edge::new(
+            0,
+            verts[i],
+            verts[j],
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+    }
+
+    let solid = revolve_profile(model, edges, options)?;
+
+    // Retain the generating meridian as construction geometry (the source-profile
+    // link, consistency-checked + carried through transforms) so the part
+    // remembers its profile for the edit→regenerate workflow.
+    model.set_solid_construction(
+        solid,
+        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+    );
+    Ok(solid)
+}
+
 /// Create a pure revolution (no helical component) as a watertight B-Rep.
 ///
 /// Builds a SHARED vertex/edge grid rather than independent per-quad islands:

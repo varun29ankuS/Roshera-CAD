@@ -8,7 +8,7 @@
 //! zero-regression contract: cone/stepped profiles still produce a watertight
 //! solid (via fallback), just not the minimal analytic face set yet (v2).
 use geometry_engine::math::{Point3, Tolerance, Vector3};
-use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
+use geometry_engine::operations::revolve::{revolve_meridian, revolve_profile, RevolveOptions};
 use geometry_engine::primitives::curve::{Arc, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
@@ -266,5 +266,42 @@ fn curved_meridian_revolves_to_one_surface_of_revolution() {
     assert!(
         validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
         "curved revolve must be a valid solid"
+    );
+}
+
+/// #25.1 — a PARAMETRIC revolve (`revolve_meridian`) builds a valid solid AND
+/// RETAINS its generating meridian as construction geometry, so the part
+/// remembers how it was made (the foundation of the edit→regenerate workflow:
+/// the profile is recoverable for editing).
+#[test]
+fn revolve_meridian_retains_its_generating_profile() {
+    let mut m = BRepModel::new();
+    // Solid cylinder meridian (CCW in r-z): axis-bottom → outer-bottom →
+    // outer-top → axis-top.
+    let profile = [(0.0, 0.0), (5.0, 0.0), (5.0, 10.0), (0.0, 10.0)];
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let sid = revolve_meridian(&mut m, &profile, opts)
+        .unwrap_or_else(|e| panic!("revolve_meridian: {e:?}"));
+
+    // The part REMEMBERS its meridian (all 4 points, recoverable for editing).
+    let cg = m
+        .solid_construction(sid)
+        .expect("revolve_meridian must retain the generating meridian");
+    assert_eq!(
+        cg.profile_points.len(),
+        4,
+        "all 4 meridian points retained as construction geometry"
+    );
+
+    // And it is a valid solid of revolution.
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "revolve_meridian must build a valid solid"
     );
 }
