@@ -7311,6 +7311,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::part_mass_properties_by_uuid),
         )
         .route(
+            "/api/agent/verify-claim",
+            post(handlers::agent::verify_claim_handler),
+        )
+        .route(
             "/api/agent/parts/{id}/obb",
             get(handlers::agent::part_oriented_bbox),
         )

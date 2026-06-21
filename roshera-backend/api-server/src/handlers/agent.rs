@@ -41,6 +41,9 @@ use axum::{
 use geometry_engine::math::Matrix4;
 use geometry_engine::primitives::datum::DatumId;
 use geometry_engine::primitives::solid::SolidId;
+use geometry_engine::readable::claim::{
+    verify_claim, CheckableClaim, ClaimBinding, ClaimVerdict, Measurement,
+};
 use geometry_engine::readable::{
     DatumSummary, DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter,
     MassPropertiesReport, OrientedBBox, PartProximity, PartReport, PartSummary,
@@ -127,6 +130,95 @@ pub async fn part_mass_properties_by_uuid(
         .mass_properties_for(solid_id)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// One variable→measurement binding in a verify-claim request. Parts are
+/// addressed by public UUID (the wire id); resolved to a kernel `SolidId`
+/// before measuring. A `constant` carries a supplied non-geometric value.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerifyMeasure {
+    Volume { part: uuid::Uuid },
+    SurfaceArea { part: uuid::Uuid },
+    Constant { value: f64 },
+}
+
+/// A `(var, measure)` pair: binds a variable name in the claim expression to a
+/// measurement.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyBinding {
+    pub var: String,
+    pub measure: VerifyMeasure,
+}
+
+/// Request body for `POST /api/agent/verify-claim`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyClaimRequest {
+    /// Math expression over the binding variable names, e.g. `"a / v"`.
+    pub expr: String,
+    pub bindings: Vec<VerifyBinding>,
+    pub expected: f64,
+    #[serde(default)]
+    pub tolerance: Option<f64>,
+}
+
+/// `POST /api/agent/verify-claim` — "the notebook that can't lie". Checks an
+/// equation/numeric claim against the kernel's GROUND-TRUTH geometry: resolves
+/// each part UUID to its `SolidId`, then runs the kernel verifier, returning the
+/// three-state verdict (verified / false / refused). A part UUID that doesn't
+/// resolve yields `refused` (a structured "couldn't measure that"), not a 404 —
+/// the verifier never silently passes.
+pub async fn verify_claim_handler(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(req): Json<VerifyClaimRequest>,
+) -> Json<ClaimVerdict> {
+    let mut bindings = Vec::with_capacity(req.bindings.len());
+    let mut unresolved: Vec<String> = Vec::new();
+    for b in req.bindings {
+        let measure = match b.measure {
+            VerifyMeasure::Constant { value } => Some(Measurement::Constant { value }),
+            VerifyMeasure::Volume { part } => state
+                .get_local_id(&part)
+                .map(|solid| Measurement::Volume { solid }),
+            VerifyMeasure::SurfaceArea { part } => state
+                .get_local_id(&part)
+                .map(|solid| Measurement::SurfaceArea { solid }),
+        };
+        match measure {
+            Some(m) => bindings.push(ClaimBinding {
+                var: b.var,
+                measure: m,
+            }),
+            None => unresolved.push(b.var),
+        }
+    }
+
+    // A binding whose part UUID didn't resolve cannot be measured — refuse
+    // honestly rather than dropping it and evaluating an incomplete expression.
+    if !unresolved.is_empty() {
+        return Json(ClaimVerdict {
+            verified: false,
+            refused: true,
+            computed: None,
+            expected: req.expected,
+            abs_error: None,
+            tolerance_used: req
+                .tolerance
+                .unwrap_or_else(|| req.expected.abs().max(1.0) * 1e-6),
+            resolved: Vec::new(),
+            unresolved,
+        });
+    }
+
+    let claim = CheckableClaim {
+        expr: req.expr,
+        bindings,
+        expected: req.expected,
+        tolerance: req.tolerance,
+    };
+    let mut model = model_handle.write().await;
+    Json(verify_claim(&claim, &mut model))
 }
 
 /// `GET /api/agent/parts/{id}/obb` — oriented bounding box (axes
