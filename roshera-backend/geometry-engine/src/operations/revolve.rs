@@ -536,8 +536,13 @@ fn try_analytic_band_revolution(
         .ok_or_else(|| OperationError::InvalidGeometry("revolve: base loop not found".into()))?
         .clone();
 
-    // Oriented profile vertex pairs; require every edge linear.
-    let mut prof: Vec<(VertexId, VertexId)> = Vec::new();
+    // Oriented profile vertex pairs, each carrying its curve id + whether it is
+    // linear. Linear edges → Cylinder / Cone / annular-Plane bands; a CURVED edge
+    // → ONE `SurfaceOfRevolution` band for the whole 360° (the #21 fix: a smooth
+    // revolved wall is ONE analytic face, not `segments` angular patches). A bad
+    // curved-band attempt fails the self-check below and rolls back to the proven
+    // grid path, so this never regresses a working revolve.
+    let mut prof: Vec<(VertexId, VertexId, u32, bool)> = Vec::new();
     for (idx, &eid) in base_loop.edges.iter().enumerate() {
         let e = model
             .edges
@@ -547,22 +552,21 @@ fn try_analytic_band_revolution(
             .curves
             .get(e.curve_id)
             .ok_or_else(|| OperationError::InvalidGeometry("revolve: profile curve".into()))?;
-        if !curve.is_linear(crate::math::Tolerance::default()) {
-            return Ok(None); // curved profile → grid fallback
-        }
+        let is_linear = curve.is_linear(crate::math::Tolerance::default());
+        let curve_id = e.curve_id;
         let fwd = base_loop.orientations.get(idx).copied().unwrap_or(true);
         let (s, en) = if fwd {
             (e.start_vertex, e.end_vertex)
         } else {
             (e.end_vertex, e.start_vertex)
         };
-        prof.push((s, en));
+        prof.push((s, en, curve_id, is_linear));
     }
 
     // Eligibility: every profile vertex radius > 1e-4 (annular caps + finite
     // cone/cylinder walls, no apex/disc — those remain grid fallback). Vertical
     // edges → Cylinder, horizontal → annular Plane, sloped → Cone frustum.
-    for &(s, en) in &prof {
+    for &(s, en, _, _) in &prof {
         let (_, r0, _) = ring_geometry(model, s, axis_origin, axis)?;
         let (_, r1, _) = ring_geometry(model, en, axis_origin, axis)?;
         if r0 < 1e-4 || r1 < 1e-4 {
@@ -595,7 +599,7 @@ fn build_analytic_bands(
     base_face: &Face,
     base_face_id: FaceId,
     base_loop: &Loop,
-    prof: &[(VertexId, VertexId)],
+    prof: &[(VertexId, VertexId, u32, bool)],
     axis_origin: Point3,
     axis: Vector3,
 ) -> OperationResult<SolidId> {
@@ -618,7 +622,7 @@ fn build_analytic_bands(
 
     // One SHARED closed circle edge per unique profile vertex.
     let mut uniq: Vec<VertexId> = Vec::new();
-    for &(s, en) in prof {
+    for &(s, en, _, _) in prof {
         for v in [s, en] {
             if !uniq.contains(&v) {
                 uniq.push(v);
@@ -656,7 +660,7 @@ fn build_analytic_bands(
 
     // One analytic face per band.
     let mut faces: Vec<FaceId> = Vec::new();
-    for &(s, en) in prof {
+    for &(s, en, curve_id, is_linear) in prof {
         let (c0, r0, t0) = ring_geo[&s];
         let (c1, r1, t1) = ring_geo[&en];
         let sp0 = model
@@ -684,7 +688,81 @@ fn build_analytic_bands(
         let vertical = (r0 - r1).abs() < eps;
         let horizontal = (t0 - t1).abs() < eps;
 
-        if horizontal {
+        if !is_linear {
+            // CURVED profile edge → ONE SurfaceOfRevolution face for the full
+            // 360° band (#21: a smooth revolved wall is one analytic face, not
+            // `segments` patches). The seam meridian is the profile curve rotated
+            // onto the canonical ref_dir so its endpoints meet the shared ring
+            // seam vertices; the surface revolves that same curve through 2π. A
+            // misaligned seam fails the watertight self-check → rollback to grid.
+            let pv = model
+                .vertices
+                .get_position(if r0 > 1e-4 { s } else { en })
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry("revolve: curved band angle vertex".into())
+                })?;
+            let pv = Vector3::new(pv[0], pv[1], pv[2]);
+            let rel = pv - axis_origin;
+            let radial = rel - axis * rel.dot(&axis);
+            let rhat = radial.normalize()?;
+            let cos_t = ref_dir.dot(&rhat).clamp(-1.0, 1.0);
+            let sin_t = axis.dot(&ref_dir.cross(&rhat));
+            let theta = sin_t.atan2(cos_t);
+            let rot = Matrix4::from_axis_angle(&axis, -theta)?;
+
+            let base_curve = model.curves.get(curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: curved profile curve".into())
+            })?;
+            let mut seam_curve = base_curve.clone_box().transform(&rot);
+            // Orient the seam from ring_seamv[s] → ring_seamv[en].
+            let c0p = seam_curve
+                .evaluate(0.0)
+                .map_err(|e| OperationError::NumericalError(format!("revolve curved seam: {e}")))?
+                .position;
+            let want = model.vertices.get_position(ring_seamv[&s]).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: curved seam start".into())
+            })?;
+            let want = Point3::new(want[0], want[1], want[2]);
+            if (c0p - want).magnitude() > tol.distance() {
+                seam_curve = seam_curve.reversed();
+            }
+
+            let sor = crate::primitives::surface::SurfaceOfRevolution::new(
+                axis_origin,
+                axis,
+                seam_curve.clone_box(),
+                std::f64::consts::TAU,
+            )
+            .map_err(|e| OperationError::NumericalError(format!("revolve sor: {e}")))?;
+            let surf_id = model.surfaces.add(Box::new(sor));
+            let seam_cid = model.curves.add(seam_curve);
+            let seam_eid = model.edges.add(Edge::new(
+                0,
+                ring_seamv[&s],
+                ring_seamv[&en],
+                seam_cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            ));
+
+            // Lateral loop: bottom_circle(fwd) seam(fwd) top_circle(bwd) seam(bwd).
+            let mut lp = Loop::new(0, LoopType::Outer);
+            lp.add_edge(ring_edge[&s], true);
+            lp.add_edge(seam_eid, true);
+            lp.add_edge(ring_edge[&en], false);
+            lp.add_edge(seam_eid, false);
+            let lp_id = model.loops.add(lp);
+
+            let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
+            let surf = model
+                .surfaces
+                .get(surf_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: sor surface".into()))?;
+            let orient = orient_face_for_outward(surf, target)?;
+            let mut f = Face::new(0, surf_id, lp_id, orient);
+            f.outer_loop = lp_id;
+            faces.push(model.faces.add(f));
+        } else if horizontal {
             // Annular plane cap at constant axial. Outer = larger-radius circle.
             let (outer_v, inner_v) = if r0 >= r1 { (s, en) } else { (en, s) };
             let plane = Plane::from_point_normal(c0, axis)

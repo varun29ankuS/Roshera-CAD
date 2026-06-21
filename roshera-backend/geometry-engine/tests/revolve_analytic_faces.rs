@@ -9,7 +9,7 @@
 //! solid (via fallback), just not the minimal analytic face set yet (v2).
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
-use geometry_engine::primitives::curve::{Line, ParameterRange};
+use geometry_engine::primitives::curve::{Arc, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::surface::{Cylinder, SurfaceType};
@@ -190,5 +190,81 @@ fn revolved_washer_bore_is_not_filled() {
     assert_eq!(
         filling, 0,
         "{filling} tessellation triangle(s) fill the bore (centroid inside the Ø16 bore)"
+    );
+}
+
+/// #21 — a CURVED meridian edge revolves to ONE `SurfaceOfRevolution` face for
+/// the whole 360°, not `segments` patches. An annular barrel: the outer wall is
+/// an ARC (r bulges 8→13→8 over z 0→10), inner wall straight (r=5), annular caps
+/// — all radii > 0 so the analytic-band path is eligible. Proves the curved arm
+/// engaged: a grid fallback would emit 48 SurfaceOfRevolution patches just for
+/// the outer wall.
+#[test]
+fn curved_meridian_revolves_to_one_surface_of_revolution() {
+    let mut m = BRepModel::new();
+    let v_bo = m.vertices.add(8.0, 0.0, 0.0); // bottom outer
+    let v_to = m.vertices.add(8.0, 0.0, 10.0); // top outer
+    let v_ti = m.vertices.add(5.0, 0.0, 10.0); // top inner
+    let v_bi = m.vertices.add(5.0, 0.0, 0.0); // bottom inner
+
+    // Outer wall arc: center (8,0,5), r=5, normal +Y; start π = (8,0,0),
+    // sweep -π ends at (8,0,10) bulging through (13,0,5).
+    let arc = Arc::new(
+        Point3::new(8.0, 0.0, 5.0),
+        Vector3::Y,
+        5.0,
+        std::f64::consts::PI,
+        -std::f64::consts::PI,
+    )
+    .expect("arc");
+    let arc_cid = m.curves.add(Box::new(arc));
+    let e_outer = m.edges.add(Edge::new(
+        0,
+        v_bo,
+        v_to,
+        arc_cid,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let mut line = |m: &mut BRepModel, a: (f64, f64), b: (f64, f64), s, e| {
+        let l = Line::new(Point3::new(a.0, 0.0, a.1), Point3::new(b.0, 0.0, b.1));
+        let cid = m.curves.add(Box::new(l));
+        m.edges.add(Edge::new(
+            0,
+            s,
+            e,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ))
+    };
+    let e_top = line(&mut m, (8.0, 10.0), (5.0, 10.0), v_to, v_ti);
+    let e_inner = line(&mut m, (5.0, 10.0), (5.0, 0.0), v_ti, v_bi);
+    let e_bot = line(&mut m, (5.0, 0.0), (8.0, 0.0), v_bi, v_bo);
+
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let sid = revolve_profile(&mut m, vec![e_outer, e_top, e_inner, e_bot], opts)
+        .unwrap_or_else(|e| panic!("revolve: {e:?}"));
+
+    let kinds = face_kinds(&m, sid);
+    assert_eq!(
+        count(&kinds, SurfaceType::SurfaceOfRevolution),
+        1,
+        "curved outer wall must be ONE SurfaceOfRevolution face (analytic path), got {kinds:?}"
+    );
+    assert!(
+        kinds.len() <= 6,
+        "barrel must be a handful of analytic faces, not 48× patches: {} faces {kinds:?}",
+        kinds.len()
+    );
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "curved revolve must be a valid solid"
     );
 }
