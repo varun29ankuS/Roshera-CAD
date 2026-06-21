@@ -278,9 +278,12 @@ pub fn translate(
 ) -> OperationResult<TransformResult> {
     let transform = Matrix4::from_translation(&(direction * distance));
 
-    // Dispatch based on entity type
-    // For simplicity, assuming solids
-    transform_solid(model, entity_ids[0], transform, options)
+    // Dispatch based on entity type (the caller may pass an empty list —
+    // indexing [0] would panic).
+    let &first = entity_ids.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("translate requires an entity id".to_string())
+    })?;
+    transform_solid(model, first, transform, options)
 }
 
 /// Rotate entities
@@ -295,8 +298,11 @@ pub fn rotate(
     // Build rotation matrix
     let transform = Matrix4::rotation_axis(axis_origin, axis_direction, angle)?;
 
-    // Dispatch based on entity type
-    transform_solid(model, entity_ids[0], transform, options)
+    // Dispatch based on entity type (guard empty list — [0] would panic).
+    let &first = entity_ids.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("rotate requires an entity id".to_string())
+    })?;
+    transform_solid(model, first, transform, options)
 }
 
 /// Scale entities
@@ -317,8 +323,11 @@ pub fn scale(
     // Build scale matrix
     let transform = Matrix4::scale_about_point(scale_origin, scale_factors);
 
-    // Dispatch based on entity type
-    transform_solid(model, entity_ids[0], transform, options)
+    // Dispatch based on entity type (guard empty list — [0] would panic).
+    let &first = entity_ids.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("scale requires an entity id".to_string())
+    })?;
+    transform_solid(model, first, transform, options)
 }
 
 /// Mirror entities
@@ -332,6 +341,10 @@ pub fn mirror(
     if options.common.validate_before {
         lifecycle::validate_can_apply(model, OpSpec::Generic)?;
     }
+    // Guard the empty list before entering the rollback scope ([0] would panic).
+    let first = *entity_ids.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("mirror requires an entity id".to_string())
+    })?;
     lifecycle::with_rollback(model, move |model| {
         // Build mirror matrix
         let transform = Matrix4::mirror(plane_origin, plane_normal)?;
@@ -340,7 +353,7 @@ pub fn mirror(
         // takes its own snapshot; we accept the nested-snapshot cost
         // for transactional correctness across the combined
         // mirror+orient-fix path.
-        let result = transform_solid(model, entity_ids[0], transform, options)?;
+        let result = transform_solid(model, first, transform, options)?;
 
         // Mirroring reverses orientation, need to fix
         fix_mirrored_orientations(model, result.transformed_ids[0])?;

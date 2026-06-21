@@ -370,6 +370,14 @@ fn create_frame_driven_sweep(
     // Assemble solid from sections (same logic as create_path_sweep)
     let mut shell_faces = Vec::new();
 
+    // Guard: an empty `sections` would make `sections[0]` panic and
+    // `0..sections.len() - 1` underflow to a near-infinite loop.
+    if sections.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "frame-driven sweep produced no sections".to_string(),
+        ));
+    }
+
     if options.create_solid {
         shell_faces.push(sections[0].face_id);
     }
