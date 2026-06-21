@@ -968,9 +968,29 @@ server.tool(
     axis_direction: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
     angle_deg: z.number().default(360),
     segments: z.number().int().min(3).max(512).default(96),
+    smooth: z
+      .boolean()
+      .optional()
+      .describe(
+        "fit a SMOOTH NURBS curve through `profile` (treated as the outer wall) so " +
+          "the revolved wall is ONE surface, not a faceted polyline — needs bore_radius",
+      ),
+    bore_radius: z
+      .number()
+      .optional()
+      .describe("hollow bore radius for a smooth-walled tube (use with smooth=true)"),
     name: z.string().optional(),
   },
-  async ({ profile, axis_origin, axis_direction, angle_deg, segments, name }) => {
+  async ({
+    profile,
+    axis_origin,
+    axis_direction,
+    angle_deg,
+    segments,
+    smooth,
+    bore_radius,
+    name,
+  }) => {
     try {
       const r = await api("POST", "/api/geometry/revolve", {
         profile,
@@ -978,6 +998,8 @@ server.tool(
         axis_direction,
         angle_deg,
         segments,
+        smooth: smooth ?? false,
+        bore_radius: bore_radius ?? 0,
         name: name ?? null,
       });
       const id = r.solid_id ?? (await newestPartId());

@@ -3331,7 +3331,9 @@ async fn create_revolve_primitive(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
-    use geometry_engine::operations::revolve::{revolve_meridian, RevolveOptions};
+    use geometry_engine::operations::revolve::{
+        revolve_meridian, revolve_spline_meridian, RevolveOptions,
+    };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -3398,6 +3400,17 @@ async fn create_revolve_primitive(
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Smooth (NURBS-spline) wall: treat `profile` as the OUTER wall, fit a smooth
+    // curve through it, and hollow it with `bore_radius` so the revolved wall is
+    // ONE smooth surface instead of a faceted polyline (#9 — the nozzle wall).
+    let smooth = payload
+        .get("smooth")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let bore_radius = payload
+        .get("bore_radius")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
     let result_solid_id = {
         let mut model = model_handle.write().await;
@@ -3411,12 +3424,21 @@ async fn create_revolve_primitive(
             segments,
             ..Default::default()
         };
-        revolve_meridian(&mut model, &profile, opts).map_err(|e| {
-            ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("revolve failed: {e:?}"),
-            )
-        })?
+        if smooth {
+            revolve_spline_meridian(&mut model, &profile, bore_radius, opts).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("smooth revolve failed: {e:?}"),
+                )
+            })?
+        } else {
+            revolve_meridian(&mut model, &profile, opts).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("revolve failed: {e:?}"),
+                )
+            })?
+        }
     };
 
     let (tri_mesh, tessellation_ms) = {
