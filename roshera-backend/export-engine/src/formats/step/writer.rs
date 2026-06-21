@@ -300,6 +300,24 @@ impl<W: Write> StepWriter<W> {
 
         let id = self.next_id();
 
+        // ISO 10303-42: a B_SPLINE_CURVE_WITH_KNOTS `knots` list holds the
+        // DISTINCT knot values, paired 1:1 with `multiplicities`. Callers pass
+        // the FULL (expanded) knot vector, so collapse it here — emitting the
+        // raw vector leaves len(knots) != len(mults) ("knots/multiplicities
+        // length mismatch") and the curve (and its edge, face bound, shell and
+        // solid) fail to resolve in strict readers (our importer AND OCCT).
+        let knot_values = collapse_knots(knots).0;
+        if knot_values.len() != multiplicities.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "B-spline curve knot/multiplicity mismatch: {} distinct knots vs {} multiplicities",
+                    knot_values.len(),
+                    multiplicities.len()
+                ),
+            ));
+        }
+
         if rational && weights.is_some() {
             // Rational B-spline curve. Per ISO 10303-42 a weighted
             // B-spline is a *complex* (AND-combined) entity instance,
@@ -323,20 +341,26 @@ impl<W: Write> StepWriter<W> {
                 degree = degree,
                 cps = format_id_list(&cp_ids),
                 mults = format_int_list(multiplicities),
-                knots = format_real_list(knots),
+                knots = format_real_list(&knot_values),
                 weights = format_real_list(weights_slice),
             )?;
         } else {
-            // Non-rational B-spline. The leading `.` on the final
-            // `.UNSPECIFIED.` enum was previously missing — that made
-            // every B-spline curve unparseable.
+            // Non-rational B-spline. ISO 10303-42: the entity's FIRST field
+            // is the REPRESENTATION_ITEM `name` (the `''` label) — it was
+            // omitted, leaving 8 fields where the schema requires 9
+            // (name, degree, control_points, curve_form, closed,
+            // self_intersect, knot_mults, knots, knot_spec). Strict readers
+            // (our importer AND OCCT/FreeCAD) then reject the curve → the
+            // edge, face bound, shell and solid all fail to resolve → a
+            // lofted/freeform part exports unopenable. The surface writer
+            // already carries its `''`; this brings the curve into line.
             writeln!(self.writer,
-                "{}=B_SPLINE_CURVE_WITH_KNOTS({},({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);",
+                "{}=B_SPLINE_CURVE_WITH_KNOTS('',{},({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);",
                 id,
                 degree,
                 format_id_list(&cp_ids),
                 format_int_list(multiplicities),
-                format_real_list(knots)
+                format_real_list(&knot_values)
             )?;
         }
 
@@ -647,6 +671,28 @@ impl<W: Write> StepWriter<W> {
 
         let (u_knots, u_mults) = collapse_knots(knots_u);
         let (v_knots, v_mults) = collapse_knots(knots_v);
+
+        // Verification (ISO 10303-42 §4.4.3): a B_SPLINE_SURFACE_WITH_KNOTS is
+        // well-formed only if its knot multiplicities sum to n+degree+1 in each
+        // direction (n = control-point count). A violation is silently accepted
+        // by lenient readers but REJECTED by strict ones (OCCT/FreeCAD). Refuse
+        // to emit a malformed surface rather than write an unopenable file.
+        let nu = control_points.len();
+        let nv = control_points.first().map(|r| r.len()).unwrap_or(0);
+        let u_sum: u32 = u_mults.iter().sum();
+        let v_sum: u32 = v_mults.iter().sum();
+        let u_need = nu + degree_u as usize + 1;
+        let v_need = nv + degree_v as usize + 1;
+        if u_sum as usize != u_need || v_sum as usize != v_need {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "B-spline surface not ISO-10303-42 conformant: \
+                     u Σmult={u_sum} but n+deg+1={u_need} (nu={nu},deg_u={degree_u}); \
+                     v Σmult={v_sum} but n+deg+1={v_need} (nv={nv},deg_v={degree_v})"
+                ),
+            ));
+        }
 
         let rational = weights
             .map(|w| {
@@ -1857,8 +1903,13 @@ mod tests {
         assert!(out.contains("#2=CARTESIAN_POINT"));
         assert!(out.contains("#3=CARTESIAN_POINT"));
         assert!(out.contains("#4=B_SPLINE_CURVE_WITH_KNOTS"));
-        // Degree 2 appears as first arg
-        assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS(2,"));
+        // ISO 10303-42: the FIRST field is the REPRESENTATION_ITEM `''` name,
+        // then degree 2 — the curve must carry all 9 fields or strict readers
+        // (and OCCT/FreeCAD) reject it.
+        assert!(
+            out.contains("B_SPLINE_CURVE_WITH_KNOTS('',2,"),
+            "got: {out}"
+        );
     }
 
     #[test]
