@@ -751,6 +751,11 @@ impl SketchValidator {
         !(max1.x < min2.x || min1.x > max2.x || max1.y < min2.y || min1.y > max2.y)
     }
 
+    /// Robust segment-segment crossing test. The crossing DECISION uses the
+    /// exact `orient2d` predicate (no `1e-10` tolerance — near-degenerate
+    /// crossings and grazing touches are classified by the correct sign, not a
+    /// magnitude guess). The returned point is the f64 parametric location, used
+    /// only for reporting where the crossing is.
     fn segment_intersection(
         &self,
         p1: &Point2d,
@@ -758,23 +763,54 @@ impl SketchValidator {
         p3: &Point2d,
         p4: &Point2d,
     ) -> Option<Point2d> {
+        use crate::math::vector2::Vector2;
+        use crate::math::{orient2d, Orientation};
+
+        let a = Vector2::new(p1.x, p1.y);
+        let b = Vector2::new(p2.x, p2.y);
+        let c = Vector2::new(p3.x, p3.y);
+        let d = Vector2::new(p4.x, p4.y);
+
+        let o1 = orient2d(&a, &b, &c);
+        let o2 = orient2d(&a, &b, &d);
+        let o3 = orient2d(&c, &d, &a);
+        let o4 = orient2d(&c, &d, &b);
+
+        let opposite = |x: Orientation, y: Orientation| {
+            matches!(
+                (x, y),
+                (Orientation::CounterClockwise, Orientation::Clockwise)
+                    | (Orientation::Clockwise, Orientation::CounterClockwise)
+            )
+        };
+        // `c` lies on segment ab given it is already collinear with a, b.
+        let on_seg = |a: &Vector2, b: &Vector2, c: &Vector2| -> bool {
+            c.x >= a.x.min(b.x) && c.x <= a.x.max(b.x) && c.y >= a.y.min(b.y) && c.y <= a.y.max(b.y)
+        };
+
+        // Proper crossing: each segment strictly straddles the other's line.
+        let proper = opposite(o1, o2) && opposite(o3, o4);
+        // Collinear/touching: an endpoint lies on the other segment.
+        let touching = (o1 == Orientation::Collinear && on_seg(&a, &b, &c))
+            || (o2 == Orientation::Collinear && on_seg(&a, &b, &d))
+            || (o3 == Orientation::Collinear && on_seg(&c, &d, &a))
+            || (o4 == Orientation::Collinear && on_seg(&c, &d, &b));
+
+        if !(proper || touching) {
+            return None;
+        }
+
+        // Report the crossing location (f64 parametric; reporting only).
         let d1 = Vector2d::new(p2.x - p1.x, p2.y - p1.y);
         let d2 = Vector2d::new(p4.x - p3.x, p4.y - p3.y);
         let d3 = Vector2d::new(p3.x - p1.x, p3.y - p1.y);
-
         let cross = d1.cross(&d2);
-
-        if cross.abs() < 1e-10 {
-            return None; // Parallel
-        }
-
-        let t1 = d3.cross(&d2) / cross;
-        let t2 = d3.cross(&d1) / cross;
-
-        if (0.0..=1.0).contains(&t1) && (0.0..=1.0).contains(&t2) {
+        if cross != 0.0 {
+            let t1 = d3.cross(&d2) / cross;
             Some(Point2d::new(p1.x + t1 * d1.x, p1.y + t1 * d1.y))
         } else {
-            None
+            // Collinear overlap — report a representative point on the overlap.
+            Some(Point2d::new(p3.x, p3.y))
         }
     }
 
