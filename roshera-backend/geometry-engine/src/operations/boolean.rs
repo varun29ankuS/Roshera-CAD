@@ -2221,9 +2221,99 @@ fn cylinder_cylinder_intersection(
         return handle_parallel_cylinders(cyl_a, cyl_b, tolerance);
     }
 
-    // General case: intersecting cylinders with different axes
-    // This results in a quartic curve that can be solved analytically
+    // Perpendicular + equal-radius + intersecting axes — the Steinmetz/bicylinder
+    // case (engine-block bore ∩ crank tunnel). Exact closed-form TWO-ellipse
+    // intersection; replaces the seed-marcher, which fails on the tangent
+    // crossings of equal-radius cylinders (#35: intersecting analytic bores).
+    if let Some(curves) = cylinder_cylinder_perpendicular_equal_radius(cyl_a, cyl_b, tolerance)? {
+        return Ok(curves);
+    }
+
+    // General case: intersecting cylinders with different axes — a quartic.
+    // (Marching fallback; the equal-radius perpendicular special case above is
+    // handled analytically.)
     solve_general_cylinder_intersection(cyl_a, cyl_b, tolerance)
+}
+
+/// Analytic intersection of two PERPENDICULAR, EQUAL-radius cylinders whose axes
+/// intersect — the Steinmetz/bicylinder configuration. Subtracting the two
+/// cylinder equations gives the two diagonal bisector planes, each cutting an
+/// exact ellipse: center = the axis-intersection point `I`, minor axis along the
+/// common perpendicular `n̂ = â × b̂` (length `r`), major axis along `(â ± b̂)`
+/// (length `r√2`). Returns `None` (→ marching fallback) when the pair is not this
+/// special case (non-perpendicular, unequal radius, or skew axes).
+fn cylinder_cylinder_perpendicular_equal_radius(
+    cyl_a: &crate::primitives::surface::Cylinder,
+    cyl_b: &crate::primitives::surface::Cylinder,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<Vec<SurfaceIntersectionCurve>>> {
+    use crate::primitives::curve::Ellipse;
+
+    let a_axis = cyl_a.axis;
+    let b_axis = cyl_b.axis;
+    let trace = std::env::var("ROSHERA_BOOL_TRACE").is_ok();
+    if trace {
+        eprintln!(
+            "[bool]     cyl_cyl_perp_eq: a_axis={a_axis:?} b_axis={b_axis:?} dot={:.4} ra={} rb={}",
+            a_axis.dot(&b_axis),
+            cyl_a.radius,
+            cyl_b.radius
+        );
+    }
+    // Perpendicular axes? (|cos θ| ≈ 0)
+    if a_axis.dot(&b_axis).abs() > tolerance.parallel_threshold() {
+        if trace {
+            eprintln!("[bool]     cyl_cyl_perp_eq: NOT perpendicular → None");
+        }
+        return Ok(None);
+    }
+    // Equal radius?
+    let r = cyl_a.radius;
+    if (cyl_a.radius - cyl_b.radius).abs() > tolerance.distance() {
+        if trace {
+            eprintln!("[bool]     cyl_cyl_perp_eq: radii differ → None");
+        }
+        return Ok(None);
+    }
+    // Do the axes intersect? Closest approach of the two axis lines (â ⊥ b̂ makes
+    // the normal equations decouple): s = d·â, t = −d·b̂, d = origin_b − origin_a.
+    let d = cyl_b.origin - cyl_a.origin;
+    let p_a = cyl_a.origin + a_axis * d.dot(&a_axis);
+    let p_b = cyl_b.origin + b_axis * (-d.dot(&b_axis));
+    if (p_a - p_b).magnitude() > tolerance.distance() {
+        if trace {
+            eprintln!(
+                "[bool]     cyl_cyl_perp_eq: axes skew (dist={:.4}) → None",
+                (p_a - p_b).magnitude()
+            );
+        }
+        return Ok(None); // skew axes — not the bicylinder case
+    }
+    if trace {
+        eprintln!("[bool]     cyl_cyl_perp_eq: MATCH → emitting 2 ellipses");
+    }
+    let center = (p_a + p_b) * 0.5;
+
+    let n = a_axis.cross(&b_axis).normalize()?; // common perpendicular = minor dir
+    let major_len = r * std::f64::consts::SQRT_2;
+    let minor_len = r;
+
+    let mut curves = Vec::with_capacity(2);
+    for sign in [1.0f64, -1.0f64] {
+        let major_dir = (a_axis + b_axis * sign).normalize()?;
+        let ellipse = Ellipse::new(center, major_dir, n, major_len, minor_len)?;
+        // The ellipse lies on BOTH cylinders (it is their intersection), so the
+        // existing ellipse→cylinder UV mapping yields each operand's parametric
+        // curve directly.
+        let params_a = compute_ellipse_cylinder_parameters(&ellipse, cyl_a)?;
+        let params_b = compute_ellipse_cylinder_parameters(&ellipse, cyl_b)?;
+        curves.push(SurfaceIntersectionCurve {
+            curve: Box::new(ellipse),
+            on_surface_a: create_parametric_curve(&params_a),
+            on_surface_b: create_parametric_curve(&params_b),
+        });
+    }
+    Ok(Some(curves))
 }
 
 /// Check if two cylinders are coaxial (same axis)
