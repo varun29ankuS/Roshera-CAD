@@ -230,6 +230,134 @@ pub fn get_revolve_meridian(model: &BRepModel, solid: SolidId) -> Option<Vec<(f6
     Some(cg.profile_points.iter().map(|p| (p.x, p.z)).collect())
 }
 
+/// Parametric revolve of a SMOOTH (NURBS-spline) walled TUBE — the smooth-meridian
+/// form for nozzles, vases and bell profiles (#9 + #25). `wall_rz` is the OUTER
+/// wall meridian (the `(r, z)` points, bottom→top, every `r > bore_radius`); it
+/// is interpolated by a degree-3 NURBS so the revolved outer wall is ONE smooth
+/// `SurfaceOfRevolution` (not a faceted polyline of `P × segments` tiny faces —
+/// the original nozzle complaint). The meridian closes through a cylindrical
+/// `bore_radius` bore and two annular caps, so it never touches the axis (which
+/// would force the per-segment grid fallback) — the hollow form a real nozzle
+/// takes. The wall points are retained as construction geometry for the
+/// edit→regenerate loop.
+pub fn revolve_spline_meridian(
+    model: &mut BRepModel,
+    wall_rz: &[(f64, f64)],
+    bore_radius: f64,
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+    use crate::primitives::curve::{Line, NurbsCurve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+
+    if wall_rz.len() < 4 {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_spline_meridian: need at least 4 wall points for a cubic spline".to_string(),
+        ));
+    }
+    if !(bore_radius > 0.0) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_spline_meridian: bore_radius must be > 0".to_string(),
+        ));
+    }
+    if wall_rz.iter().any(|&(r, _)| r <= bore_radius) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_spline_meridian: every wall radius must exceed bore_radius".to_string(),
+        ));
+    }
+
+    let axis_origin = options.axis_origin;
+    let (r0, z0) = wall_rz[0];
+    let (r1, z1) = wall_rz[wall_rz.len() - 1];
+
+    // Fit a degree-3 NURBS through the outer wall meridian (in the (r,0,z)
+    // half-plane) — the single smooth wall curve.
+    let wall_pts: Vec<Point3> = wall_rz
+        .iter()
+        .map(|&(r, z)| Point3::new(r, 0.0, z))
+        .collect();
+    let wall_math = interpolate_nurbs_curve(&wall_pts, 3, ParameterizationType::ChordLength)
+        .map_err(|e| OperationError::NumericalError(format!("wall spline fit: {e}")))?;
+    let wall_curve = NurbsCurve::new(
+        wall_math.degree,
+        wall_math.control_points,
+        wall_math.weights,
+        wall_math.knots.to_vec(),
+    )
+    .map_err(|e| OperationError::NumericalError(format!("wall curve: {e:?}")))?;
+
+    // Tube meridian (same winding as the analytic-band tube: outer-bottom →
+    // outer-top → inner-top → inner-bottom). The outer wall is the smooth NURBS;
+    // the bore is a straight cylinder; the caps are annular planes. No vertex sits
+    // on the axis, so the analytic one-surface band path applies to the wall.
+    let v_out_bot = model.vertices.add(r0, 0.0, z0);
+    let v_out_top = model.vertices.add(r1, 0.0, z1);
+    let v_in_top = model.vertices.add(bore_radius, 0.0, z1);
+    let v_in_bot = model.vertices.add(bore_radius, 0.0, z0);
+
+    let c_wall = model.curves.add(Box::new(wall_curve));
+    let c_top = model.curves.add(Box::new(Line::new(
+        Point3::new(r1, 0.0, z1),
+        Point3::new(bore_radius, 0.0, z1),
+    )));
+    let c_bore = model.curves.add(Box::new(Line::new(
+        Point3::new(bore_radius, 0.0, z1),
+        Point3::new(bore_radius, 0.0, z0),
+    )));
+    let c_bottom = model.curves.add(Box::new(Line::new(
+        Point3::new(bore_radius, 0.0, z0),
+        Point3::new(r0, 0.0, z0),
+    )));
+
+    let edges = vec![
+        model.edges.add(Edge::new(
+            0,
+            v_out_bot,
+            v_out_top,
+            c_wall,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_out_top,
+            v_in_top,
+            c_top,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_top,
+            v_in_bot,
+            c_bore,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_bot,
+            v_out_bot,
+            c_bottom,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+    ];
+
+    let solid = revolve_profile(model, edges, options)?;
+
+    // Retain the outer wall meridian (construction geometry) for edit→regenerate.
+    let meridian_pts: Vec<Point3> = wall_rz
+        .iter()
+        .map(|&(r, z)| Point3::new(r, 0.0, z))
+        .collect();
+    model.set_solid_construction(
+        solid,
+        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+    );
+    Ok(solid)
+}
+
 /// Create a pure revolution (no helical component) as a watertight B-Rep.
 ///
 /// Builds a SHARED vertex/edge grid rather than independent per-quad islands:

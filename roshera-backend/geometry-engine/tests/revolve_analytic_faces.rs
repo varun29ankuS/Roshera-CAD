@@ -9,7 +9,8 @@
 //! solid (via fallback), just not the minimal analytic face set yet (v2).
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::revolve::{
-    get_revolve_meridian, revolve_meridian, revolve_profile, RevolveOptions,
+    get_revolve_meridian, revolve_meridian, revolve_profile, revolve_spline_meridian,
+    RevolveOptions,
 };
 use geometry_engine::primitives::curve::{Arc, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
@@ -354,5 +355,50 @@ fn revolve_meridian_edit_regenerate_loop() {
     assert!(
         (re2[1].0 - 8.0).abs() < 1e-9,
         "regenerated part must retain the edit: {re2:?}"
+    );
+}
+
+/// #9 — a SMOOTH (NURBS-spline) wall revolves to ONE `SurfaceOfRevolution`, not a
+/// faceted polyline of `P × segments` tiny faces (the original nozzle complaint).
+/// A curved bell wall → one revolution surface + plane caps, valid, and the wall
+/// profile stays recoverable for editing.
+#[test]
+fn revolve_spline_meridian_is_one_smooth_wall() {
+    let mut m = BRepModel::new();
+    // A bell/vase outer wall: a smooth curve through r = 5→3→4→7 over z = 0→12,
+    // hollowed by a Ø4 bore (radius 2) so it is a tube (no axis-touching).
+    let wall = [(5.0, 0.0), (3.0, 4.0), (4.0, 8.0), (7.0, 12.0)];
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let sid = revolve_spline_meridian(&mut m, &wall, 2.0, opts)
+        .unwrap_or_else(|e| panic!("revolve_spline_meridian: {e:?}"));
+
+    let k = face_kinds(&m, sid);
+    // The smooth outer wall is ONE revolution surface (NOT planar facets) …
+    assert!(
+        count(&k, SurfaceType::SurfaceOfRevolution) >= 1,
+        "the smooth wall must be a SurfaceOfRevolution: {k:?}"
+    );
+    // … and there is NO per-segment explosion: a faceted/grid wall would be ~48+
+    // faces; the analytic collapse gives wall + bore + 2 caps.
+    assert!(
+        k.len() <= 5,
+        "smooth wall must not explode into per-segment faces: {} faces {k:?}",
+        k.len()
+    );
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "spline revolve must be a valid solid"
+    );
+    // The editable wall profile is retained.
+    assert_eq!(
+        get_revolve_meridian(&m, sid).expect("recover").len(),
+        4,
+        "the wall profile is recoverable for editing"
     );
 }
