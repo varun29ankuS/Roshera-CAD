@@ -19077,6 +19077,85 @@ mod tests {
         );
     }
 
+    /// #35 (ANALYTIC variant): the same intersecting-bores case but with REAL
+    /// analytic-cylinder bores (not 24-gon prisms), so the saddle goes through
+    /// the `cylinder_cylinder_intersection` SSI path rather than facet-vs-facet
+    /// plane-plane lines. Diagnostic: does production-style analytic geometry hit
+    /// the same weld failure, a different one, or pass? `#[ignore]` (diagnostic).
+    #[test]
+    #[ignore = "#35 diagnostic: analytic-cylinder intersecting bores"]
+    fn diff_intersecting_analytic_bores_35() {
+        use crate::harness::watertight::manifold_report;
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let sid = |g: GeometryId| match g {
+            GeometryId::Solid(id) => id,
+            o => panic!("expected Solid, got {o:?}"),
+        };
+        let tol = Tolerance::default();
+        let mut m = BRepModel::new();
+        let block = extrude_polygon_regions(
+            &mut m,
+            Point3::ORIGIN,
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer: vec![[0.0, 0.0], [80.0, 0.0], [80.0, 40.0], [0.0, 40.0]],
+                holes: vec![],
+            }],
+            40.0,
+            None,
+            tol,
+        )
+        .expect("block");
+        // Analytic vertical bore: axis Z at (40,20), r10, z∈[-5,45].
+        let vbore = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(40.0, 20.0, -5.0), Vector3::Z, 10.0, 50.0)
+            .expect("vbore"));
+        let b1 = boolean_operation(
+            &mut m,
+            block,
+            vbore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("vbore diff");
+        // Isolate: is the SINGLE analytic bore already non-watertight (curved-CDT
+        // seam, task #2) or is the failure introduced only by the saddle?
+        let r1 = manifold_report(&mut m, b1, 0.5, 1e-6).expect("report b1");
+        eprintln!(
+            "[#35-analytic] after 1st bore only: open={} nm={}",
+            r1.boundary_edges, r1.nonmanifold_edges
+        );
+        // Analytic horizontal bore: axis X at (y20,z20), r10, x∈[-5,85] — its
+        // wall intersects the vertical bore wall at the saddle.
+        let hbore = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(-5.0, 20.0, 20.0), Vector3::X, 10.0, 90.0)
+            .expect("hbore"));
+        let res = boolean_operation(
+            &mut m,
+            b1,
+            hbore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("hbore diff");
+        let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("report");
+        eprintln!(
+            "[#35-analytic] open_edges={} nonmanifold={} euler={} valid={}",
+            r.boundary_edges,
+            r.nonmanifold_edges,
+            r.euler_characteristic,
+            r.manifold && r.closed && r.oriented
+        );
+        assert!(
+            r.boundary_edges == 0 && r.nonmanifold_edges == 0,
+            "#35-analytic: intersecting analytic bores must be watertight (open={}, nm={})",
+            r.boundary_edges,
+            r.nonmanifold_edges
+        );
+    }
+
     /// #40 REGRESSION: differencing a faceted (RuledSurface-walled) cutter
     /// from a solid that carries an ANALYTIC cylinder fillet face must NOT
     /// fail with the spurious "Invalid surface types for plane-cylinder
