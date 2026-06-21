@@ -7286,6 +7286,24 @@ fn drop_nested_inner_loops(model: &BRepModel, face: &mut SplitFace) {
     if face.inner_loops.len() < 2 {
         return;
     }
+    // Drop EXACT-DUPLICATE inner loops first. The corefinement can emit the SAME
+    // hole twice when two same-origin fragments (each carrying the hole) merge —
+    // e.g. a through-bore's rim circle on a block end face after a 2nd Boolean —
+    // leaving two identical inner loops. Every hole edge is then referenced twice
+    // by this one face → a non-manifold rim (3 faces share the edge) → invalid
+    // B-Rep → open mesh (#35). Dedup by the loop's edge-id set (orientation- and
+    // order-independent); a valid face never lists the same hole twice.
+    {
+        let mut seen: HashSet<Vec<EdgeId>> = HashSet::new();
+        face.inner_loops.retain(|lp| {
+            let mut ids: Vec<EdgeId> = lp.iter().map(|&(e, _)| e).collect();
+            ids.sort_unstable();
+            seen.insert(ids)
+        });
+        if face.inner_loops.len() < 2 {
+            return;
+        }
+    }
     let Some(surface) = model.surfaces.get(face.surface) else {
         return;
     };
@@ -19252,8 +19270,62 @@ mod tests {
             brep.is_valid,
             brep.errors.len()
         );
-        for e in brep.errors.iter().take(4) {
-            eprintln!("    {e:?}");
+        // Pinpoint the over-welded (>2-face) edges: position + the faces sharing
+        // them. Position reveals cap (z=0/40) vs saddle; faces reveal what merged.
+        if let Some(solid_ref) = m.solids.get(res) {
+            let shell_id = solid_ref.outer_shell;
+            if let Some(shell) = m.shells.get(shell_id) {
+                let mut edge_faces: std::collections::HashMap<EdgeId, Vec<FaceId>> =
+                    std::collections::HashMap::new();
+                for &fid in &shell.faces {
+                    if let Some(face) = m.faces.get(fid) {
+                        let mut loops = vec![face.outer_loop];
+                        loops.extend(&face.inner_loops);
+                        for &lid in &loops {
+                            if let Some(lp) = m.loops.get(lid) {
+                                for &eid in &lp.edges {
+                                    edge_faces.entry(eid).or_default().push(fid);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut dumped: std::collections::HashSet<FaceId> =
+                    std::collections::HashSet::new();
+                for (eid, fids) in edge_faces.iter() {
+                    if fids.len() > 2 {
+                        let p = m
+                            .edges
+                            .get(*eid)
+                            .and_then(|e| m.vertices.get_position(e.start_vertex));
+                        eprintln!(
+                            "  NONMANIFOLD edge={eid:?} nfaces={} faces={fids:?} start={p:?}",
+                            fids.len()
+                        );
+                        // Dump the loop structure of the doubly-listed face.
+                        let mut seen: std::collections::HashSet<FaceId> =
+                            std::collections::HashSet::new();
+                        for &fid in fids.iter() {
+                            if seen.insert(fid) {
+                                continue;
+                            }
+                            if !dumped.insert(fid) {
+                                continue;
+                            }
+                            if let Some(face) = m.faces.get(fid) {
+                                if let Some(ol) = m.loops.get(face.outer_loop) {
+                                    eprintln!("    face {fid:?} OUTER edges={:?}", ol.edges);
+                                }
+                                for &il in &face.inner_loops {
+                                    if let Some(l) = m.loops.get(il) {
+                                        eprintln!("    face {fid:?} INNER edges={:?}", l.edges);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         // Localize the leaks: how many open edges sit near the saddle (the bore
         // intersection ~(40,20,20)) vs the rest of the model? Distinguishes a
