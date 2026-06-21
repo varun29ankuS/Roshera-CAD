@@ -3331,9 +3331,7 @@ async fn create_revolve_primitive(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
-    use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
-    use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::operations::revolve::{revolve_meridian, RevolveOptions};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -3403,29 +3401,9 @@ async fn create_revolve_primitive(
 
     let result_solid_id = {
         let mut model = model_handle.write().await;
-        // Build the profile loop: a vertex per point in the (r, 0, z) meridian
-        // half-plane, joined by line edges, auto-closed last->first.
-        let n = profile.len();
-        let verts: Vec<_> = profile
-            .iter()
-            .map(|(r, z)| model.vertices.add(*r, 0.0, *z))
-            .collect();
-        let mut edges = Vec::with_capacity(n);
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let (ri, zi) = profile[i];
-            let (rj, zj) = profile[j];
-            let line = Line::new(Point3::new(ri, 0.0, zi), Point3::new(rj, 0.0, zj));
-            let cid = model.curves.add(Box::new(line));
-            edges.push(model.edges.add(Edge::new(
-                0,
-                verts[i],
-                verts[j],
-                cid,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            )));
-        }
+        // Parametric revolve: revolve the (r, z) meridian AND retain it as the
+        // part's construction geometry, so the part remembers how it was made and
+        // its profile is recoverable + editable (the #25 edit→regenerate loop).
         let opts = RevolveOptions {
             axis_origin: Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
             axis_direction: Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]),
@@ -3433,10 +3411,10 @@ async fn create_revolve_primitive(
             segments,
             ..Default::default()
         };
-        revolve_profile(&mut model, edges, opts).map_err(|e| {
+        revolve_meridian(&mut model, &profile, opts).map_err(|e| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
-                format!("revolve_profile failed: {e:?}"),
+                format!("revolve failed: {e:?}"),
             )
         })?
     };
@@ -7313,6 +7291,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/verify-claim",
             post(handlers::agent::verify_claim_handler),
+        )
+        .route(
+            "/api/agent/parts/{id}/profile",
+            get(handlers::agent::part_revolve_profile),
         )
         .route(
             "/api/agent/parts/{id}/obb",

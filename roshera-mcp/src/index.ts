@@ -597,6 +597,24 @@ server.tool(
 );
 
 server.tool(
+  "get_revolve_profile",
+  "RECOVER the editable meridian a revolved part was built from — the (r, z) " +
+    "half-plane profile (radius-from-axis, height-along-axis). This is the " +
+    "scientist's editable source: read it, change a radius (e.g. widen the throat), " +
+    "and call revolve again with the edited profile to REGENERATE the part (the " +
+    "edit→regenerate loop). Returns [[r,z],...]; 404 if the part was not built by a " +
+    "parametric revolve.",
+  { part_id: z.number().int() },
+  async ({ part_id }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/${part_id}/profile`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "get_face",
   "Per-face report: surface type, area, principal curvatures " +
     "([0,0]=flat, [±1/r,0]=cylindrical, [±1/r,±1/r]=spherical), boundary " +
