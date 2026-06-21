@@ -1522,6 +1522,47 @@ pub async fn certify_sketch_handler(
     Ok(Json(sketch.certify()))
 }
 
+/// Base64-PNG agent-eye render of a live sketch (mirrors `render_part`'s shape).
+#[derive(Debug, serde::Serialize)]
+pub struct SketchRenderResponse {
+    /// Base64-encoded PNG a vision-capable agent can decode and SEE.
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// `GET /api/sketch/{id}/render` — the AGENT EYE for a live sketch: a base64-PNG
+/// rasterization a vision-capable agent can SEE. Bridges the session to a kernel
+/// `Sketch` and runs the deterministic 2D rasterizer. The `render_sketch` MCP
+/// tool wraps this.
+pub async fn render_sketch_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SketchRenderResponse>, ApiError> {
+    use base64::Engine as _;
+    let id = parse_uuid(&id)?;
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+    let sketch = session.to_kernel_sketch();
+    let frame = geometry_engine::render::sketch::render_sketch(&sketch).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch has no drawable geometry to render",
+        )
+    })?;
+    let png = frame
+        .to_png()
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("png encode: {e}")))?;
+    let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    Ok(Json(SketchRenderResponse {
+        png_base64,
+        width: frame.width,
+        height: frame.height,
+    }))
+}
+
 /// `GET /api/sketch/{id}/regions` — read-only region classification
 /// for an in-progress sketch session. Returns the same data the
 /// extrude pipeline will see at finalise time, so a hover preview
