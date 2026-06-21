@@ -48,14 +48,17 @@ pub enum CircleLocation {
 
 // Error bounds for adaptive precision filters (Shewchuk 1997, "Adaptive
 // Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates",
-// Discrete & Computational Geometry 18:305–363). Only the first-stage
-// A-bound is needed by the single-pass filters below; multi-stage refinement
-// (B and C bounds) is not implemented in this kernel.
-const RESULTERRBOUND: f64 = 3.0e-15;
+// Discrete & Computational Geometry 18:305–363). The A-bound is the first-stage
+// filter; when |det| falls within it the predicate falls through to EXACT
+// expansion arithmetic (the `*_adapt` functions), so the returned sign is
+// correct for all finite inputs — proven against an arbitrary-precision oracle
+// in tests/predicate_exactness_gate.rs. All four A-bounds are ε-derived
+// (ε = 2^-53; see EPS below): ccwA=(3+16ε)ε, o3dA=(7+56ε)ε, iccA=(10+96ε)ε,
+// ispA=(16+224ε)ε.
 const CCWERRBOUNDSA: f64 = 3.3306690738754716e-16;
 const O3DERRBOUNDSA: f64 = 7.771_561_172_376_096e-16;
-const ICCERRBOUNDSA: f64 = 1.0e-15;
-const ISPERRBOUNDSA: f64 = 1.6e-15;
+const ICCERRBOUNDSA: f64 = (10.0 + 96.0 * EPS) * EPS;
+const ISPERRBOUNDSA: f64 = (16.0 + 224.0 * EPS) * EPS;
 
 // Multi-stage orient2d bounds, derived from ε = 2^-53 (Shewchuk exactinit).
 // The A bound equals CCWERRBOUNDSA above; B/C drive the exact-fallback cascade.
@@ -733,6 +736,143 @@ pub fn incircle(pa: &Vector2, pb: &Vector2, pc: &Vector2, pd: &Vector2) -> Circl
     }
 }
 
+// ── Heap (Vec) expansion arithmetic ─────────────────────────────────────────
+// The in-sphere determinant's exact expansion reaches several thousand
+// components — too large for the fixed `EXP_MAX` stack arrays — so insphere's
+// exact fallback uses these `Vec`-returning helpers. Allocation cost is
+// irrelevant: this path runs only when the A-filter is inconclusive (rare).
+
+/// Scale a zero-free expansion `e` by `b`, exactly; empty ⇒ 0.
+fn scale_v(e: &[f64], b: f64) -> Vec<f64> {
+    if e.is_empty() {
+        return Vec::new();
+    }
+    let mut h = vec![0.0f64; 2 * e.len() + 8];
+    let n = scale_expansion_zeroelim(e, b, &mut h);
+    h.truncate(n);
+    h
+}
+
+/// Exact sum `e + f` of zero-free expansions.
+fn sum_v(e: &[f64], f: &[f64]) -> Vec<f64> {
+    if e.is_empty() {
+        return f.to_vec();
+    }
+    if f.is_empty() {
+        return e.to_vec();
+    }
+    let mut h = vec![0.0f64; e.len() + f.len() + 8];
+    let n = fast_expansion_sum_zeroelim(e, f, &mut h);
+    h.truncate(n);
+    h
+}
+
+/// Exact difference `e - f` of zero-free expansions.
+fn diff_v(e: &[f64], f: &[f64]) -> Vec<f64> {
+    if f.is_empty() {
+        return e.to_vec();
+    }
+    let negf: Vec<f64> = f.iter().map(|&c| -c).collect();
+    sum_v(e, &negf)
+}
+
+/// Exact product `a · b` of zero-free expansions (`Σ scale(a, b[i])`).
+fn product_v(a: &[f64], b: &[f64]) -> Vec<f64> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let mut acc: Vec<f64> = Vec::new();
+    for &bi in b {
+        let scaled = scale_v(a, bi);
+        acc = if acc.is_empty() {
+            scaled
+        } else {
+            sum_v(&acc, &scaled)
+        };
+    }
+    acc
+}
+
+/// A coordinate difference `a - b` as a zero-free heap expansion.
+fn diff_exp_v(a: f64, b: f64) -> Vec<f64> {
+    let (x, y) = two_diff(a, b);
+    let mut v = Vec::with_capacity(2);
+    if y != 0.0 {
+        v.push(y);
+    }
+    if x != 0.0 {
+        v.push(x);
+    }
+    v
+}
+
+/// Exact in-sphere determinant value — its SIGN is correct for all finite inputs.
+/// Mirrors `insphere_fast`'s formula
+/// `dlift·abc - clift·dab + blift·cda - alift·bcd` exactly, carrying every
+/// coordinate-difference and lift roundoff tail. Generic exact fallback; runs
+/// only when the A-filter is inconclusive. (Replaces the former hardcoded
+/// `RESULTERRBOUND` tolerance — the last and worst non-exact path.)
+fn insphere_adapt(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3) -> f64 {
+    let aex = diff_exp_v(pa.x, pe.x);
+    let aey = diff_exp_v(pa.y, pe.y);
+    let aez = diff_exp_v(pa.z, pe.z);
+    let bex = diff_exp_v(pb.x, pe.x);
+    let bey = diff_exp_v(pb.y, pe.y);
+    let bez = diff_exp_v(pb.z, pe.z);
+    let cex = diff_exp_v(pc.x, pe.x);
+    let cey = diff_exp_v(pc.y, pe.y);
+    let cez = diff_exp_v(pc.z, pe.z);
+    let dex = diff_exp_v(pd.x, pe.x);
+    let dey = diff_exp_v(pd.y, pe.y);
+    let dez = diff_exp_v(pd.z, pe.z);
+
+    // 2x2 minors (xy)
+    let ab = diff_v(&product_v(&aex, &bey), &product_v(&bex, &aey));
+    let bc = diff_v(&product_v(&bex, &cey), &product_v(&cex, &bey));
+    let cd = diff_v(&product_v(&cex, &dey), &product_v(&dex, &cey));
+    let da = diff_v(&product_v(&dex, &aey), &product_v(&aex, &dey));
+    let ac = diff_v(&product_v(&aex, &cey), &product_v(&cex, &aey));
+    let bd = diff_v(&product_v(&bex, &dey), &product_v(&dex, &bey));
+
+    // 3x3 cofactors (with z)
+    let abc = sum_v(
+        &diff_v(&product_v(&aez, &bc), &product_v(&bez, &ac)),
+        &product_v(&cez, &ab),
+    );
+    let bcd = sum_v(
+        &diff_v(&product_v(&bez, &cd), &product_v(&cez, &bd)),
+        &product_v(&dez, &bc),
+    );
+    let cda = sum_v(
+        &sum_v(&product_v(&cez, &da), &product_v(&dez, &ac)),
+        &product_v(&aez, &cd),
+    );
+    let dab = sum_v(
+        &sum_v(&product_v(&dez, &ab), &product_v(&aez, &bd)),
+        &product_v(&bez, &da),
+    );
+
+    // lifts = x² + y² + z²
+    let lift = |x: &[f64], y: &[f64], z: &[f64]| -> Vec<f64> {
+        sum_v(&sum_v(&product_v(x, x), &product_v(y, y)), &product_v(z, z))
+    };
+    let alift = lift(&aex, &aey, &aez);
+    let blift = lift(&bex, &bey, &bez);
+    let clift = lift(&cex, &cey, &cez);
+    let dlift = lift(&dex, &dey, &dez);
+
+    // det = dlift·abc - clift·dab + blift·cda - alift·bcd
+    let pos = sum_v(&product_v(&dlift, &abc), &product_v(&blift, &cda));
+    let neg = sum_v(&product_v(&clift, &dab), &product_v(&alift, &bcd));
+    let det = diff_v(&pos, &neg);
+
+    if det.is_empty() {
+        0.0
+    } else {
+        det[det.len() - 1]
+    }
+}
+
 /// Fast approximate in-sphere test
 #[inline(always)]
 fn insphere_fast(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3) -> f64 {
@@ -818,15 +958,12 @@ pub fn insphere(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3)
     } else if det < -errbound {
         CircleLocation::Outside
     } else {
-        // Tighter f64 fallback when |det| sits below the adaptive error
-        // bound. A full Shewchuk-style expansion-arithmetic refinement
-        // would resolve points that are exactly cocircular up to the last
-        // bit; here we treat anything within RESULTERRBOUND of zero as
-        // OnBoundary, which is conservative and consistent with the
-        // tolerance contract used elsewhere in the kernel.
-        if det > RESULTERRBOUND {
+        // Exact expansion-arithmetic refinement — resolves points cocircular
+        // up to the last bit (replaces the former RESULTERRBOUND tolerance).
+        let det_exact = insphere_adapt(pa, pb, pc, pd, pe);
+        if det_exact > 0.0 {
             CircleLocation::Inside
-        } else if det < -RESULTERRBOUND {
+        } else if det_exact < 0.0 {
             CircleLocation::Outside
         } else {
             CircleLocation::OnBoundary
