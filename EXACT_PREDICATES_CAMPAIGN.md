@@ -5,9 +5,22 @@
 > substrate — one of the three agreed strategic moves ([[zoo-kcl-and-3-strategic-moves]]),
 > and the "fix the physics first" foundation under the boolean weld (#35/#17).
 
-## The honest current state (assessed 2026-06-21)
-`geometry-engine/src/math/exact_predicates.rs` is **semi-robust, NOT exact**,
-despite a doc line claiming *"exact for all inputs"* (an overclaim to fix):
+## ✅ PHASE 1 COMPLETE (2026-06-21) — all four predicates proven exact
+`orient2d`, `orient3d`, `incircle`, `insphere` are now **truly exact** (full
+adaptive cascade: A-filter → exact expansion arithmetic via `two_diff` +
+`expansion_product`/`expansion_diff`/`sum_exp` (stack) and `*_v` Vec helpers for
+insphere). Each is proven against an arbitrary-precision `BigRational` oracle on
+100k+ adversarial degenerate inputs in `tests/predicate_exactness_gate.rs`:
+orient2d 0/300k (near-collinear), orient3d 0/150k (near-coplanar), incircle
+0/150k (near-cocircular), insphere 0/30k (near-cospherical). The harness FOUND
+the gap first (orient2d was wrong on 35/300k) — the proof-of-exactness the code
+never had. A-bounds corrected to ε-derived; dead `RESULTERRBOUND` removed.
+**Remaining: Phase 2 (wire into boolean/CDT/NURBS/sketch/primitive sign
+decisions — boolean.rs calls none today) + Phase 3 (indirect predicates).**
+
+## (historical) The state before Phase 1 (assessed 2026-06-21)
+`geometry-engine/src/math/exact_predicates.rs` was **semi-robust, NOT exact**,
+despite a doc line claiming *"exact for all inputs"* (an overclaim, now true):
 - It has the **first-stage A-filter** only (`CCWERRBOUNDSA`, `O3DERRBOUNDSA`, …)
   — the file's own comment admits "multi-stage refinement (B and C bounds) is not
   implemented."
