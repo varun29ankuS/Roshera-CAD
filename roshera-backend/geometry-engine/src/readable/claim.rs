@@ -30,6 +30,10 @@ pub enum Measurement {
     Volume { solid: SolidId },
     /// Solid surface area.
     SurfaceArea { solid: SolidId },
+    /// Area of a single face (from its exact analytic surface).
+    FaceArea { face: u32 },
+    /// Length of a single edge (from its exact curve).
+    EdgeLength { edge: u32 },
     /// A non-geometric supplied constant (recorded, taken as given — the honest
     /// way external/physics inputs enter a check).
     Constant { value: f64 },
@@ -79,6 +83,8 @@ fn resolve(model: &mut BRepModel, measure: &Measurement) -> Option<f64> {
         Measurement::SurfaceArea { solid } => {
             model.mass_properties_for(*solid).map(|mp| mp.surface_area)
         }
+        Measurement::FaceArea { face } => model.query_face(*face).and_then(|f| f.area),
+        Measurement::EdgeLength { edge } => model.query_edge(*edge).and_then(|e| e.length),
         Measurement::Constant { value } => Some(*value),
     }
 }
@@ -259,5 +265,67 @@ mod tests {
         let verdict = verify_claim(&claim, &mut m_b);
         assert!(verdict.refused && !verdict.verified, "{verdict:?}");
         assert!(!verdict.unresolved.is_empty());
+    }
+
+    #[test]
+    fn face_area_and_edge_length_formula_verifies() {
+        // A 10-cube: every face is 10×10=100, every edge is length 10. The claim
+        // "fa / (el*el) == 1" exercises both new measurements in one formula.
+        let mut m = BRepModel::new();
+        let _s = box_solid(&mut m, 10.0, 10.0, 10.0);
+        let face = m.faces.iter().next().expect("a face").0;
+        let edge = m.edges.iter().next().expect("an edge").0;
+        let claim = CheckableClaim {
+            expr: "fa / (el * el)".to_string(),
+            bindings: vec![
+                ClaimBinding {
+                    var: "fa".to_string(),
+                    measure: Measurement::FaceArea { face },
+                },
+                ClaimBinding {
+                    var: "el".to_string(),
+                    measure: Measurement::EdgeLength { edge },
+                },
+            ],
+            expected: 1.0,
+            tolerance: Some(1e-6),
+        };
+        let verdict = verify_claim(&claim, &mut m);
+        assert!(verdict.verified && !verdict.refused, "{verdict:?}");
+    }
+
+    #[test]
+    fn wrong_face_area_is_flagged() {
+        let mut m = BRepModel::new();
+        let _s = box_solid(&mut m, 10.0, 10.0, 10.0); // face area is 100
+        let face = m.faces.iter().next().expect("a face").0;
+        let claim = CheckableClaim {
+            expr: "fa".to_string(),
+            bindings: vec![ClaimBinding {
+                var: "fa".to_string(),
+                measure: Measurement::FaceArea { face },
+            }],
+            expected: 50.0, // wrong
+            tolerance: None,
+        };
+        let verdict = verify_claim(&claim, &mut m);
+        assert!(!verdict.verified && !verdict.refused, "{verdict:?}");
+    }
+
+    #[test]
+    fn unknown_face_id_is_refused() {
+        let mut m = BRepModel::new();
+        let _s = box_solid(&mut m, 10.0, 10.0, 10.0);
+        let claim = CheckableClaim {
+            expr: "fa".to_string(),
+            bindings: vec![ClaimBinding {
+                var: "fa".to_string(),
+                measure: Measurement::FaceArea { face: 99_999 },
+            }],
+            expected: 100.0,
+            tolerance: None,
+        };
+        let verdict = verify_claim(&claim, &mut m);
+        assert!(verdict.refused && !verdict.verified, "{verdict:?}");
     }
 }
