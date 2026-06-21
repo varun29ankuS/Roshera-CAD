@@ -2962,6 +2962,61 @@ pub fn interpolate_nurbs_curve(
     NurbsCurve::new(control_points, weights, knots, degree)
 }
 
+/// Interpolate a CLOSED (periodic) uniform CUBIC NURBS curve through `points` —
+/// an OPEN ring (the closing point is NOT repeated). The result is C2 across the
+/// seam (no kink): the parity-grade representation for a smooth closed profile
+/// (a bottle, a duct, a lofted cross-section), which a clamped interpolation
+/// (repeat-the-first-point) fundamentally cannot express — it is C0 at the seam.
+/// Production kernels (Parasolid/ACIS/OCCT) and STEP (`closed_curve`) all carry
+/// this primitive.
+///
+/// Method: the classic uniform-cubic interpolation collocation at the knots is
+/// `(P_{i-1} + 4·P_i + P_{i+1}) / 6 = D_i`; for a CLOSED curve the indices wrap
+/// (mod n), giving a cyclic system solved for `n` control points. The curve is
+/// the degree-3 uniform B-spline over that net with `degree` control points
+/// wrapped, so the existing basis evaluation traverses the closed loop on the
+/// domain `[degree, n + degree]`.
+///
+/// Degree is fixed at 3 (the uniform-cubic 1-4-1 system); higher degrees need
+/// the general periodic basis (a later slice).
+pub fn interpolate_periodic_cubic_nurbs(points: &[Point3]) -> Result<NurbsCurve, &'static str> {
+    const DEG: usize = 3;
+    let n = points.len();
+    if n < DEG {
+        return Err("periodic cubic interpolation needs at least 3 points");
+    }
+
+    // Cyclic collocation: (P_{i-1} + 4 P_i + P_{i+1}) / 6 = D_i, indices mod n.
+    let mut a = vec![vec![0.0_f64; n]; n];
+    for i in 0..n {
+        a[i][(i + n - 1) % n] += 1.0 / 6.0;
+        a[i][i] += 4.0 / 6.0;
+        a[i][(i + 1) % n] += 1.0 / 6.0;
+    }
+    let solve_axis = |coord: &dyn Fn(&Point3) -> f64| -> Result<Vec<f64>, &'static str> {
+        let rhs: Vec<f64> = points.iter().map(coord).collect();
+        crate::math::linear_solver::solve(a.clone(), rhs)
+            .map_err(|_| "periodic interpolation linear system is singular")
+    };
+    let xs = solve_axis(&|p| p.x)?;
+    let ys = solve_axis(&|p| p.y)?;
+    let zs = solve_axis(&|p| p.z)?;
+    let ctrl: Vec<Point3> = (0..n).map(|i| Point3::new(xs[i], ys[i], zs[i])).collect();
+
+    // Periodic control net: wrap DEG control points so the uniform B-spline
+    // closes smoothly (C2). `m = n + DEG` control points; uniform integer knots
+    // of length `m + DEG + 1`; the evaluable domain is [knots[DEG], knots[m]] =
+    // [DEG, n + DEG], over which the curve traverses the closed loop.
+    let mut wctrl = ctrl.clone();
+    for i in 0..DEG {
+        wctrl.push(ctrl[i]);
+    }
+    let m = n + DEG;
+    let knots: Vec<f64> = (0..=(m + DEG)).map(|i| i as f64).collect();
+    let weights = vec![1.0; m];
+    NurbsCurve::new(wctrl, weights, knots, DEG)
+}
+
 /// Parameterization types for interpolation
 #[derive(Debug, Clone, Copy)]
 pub enum ParameterizationType {
@@ -3073,6 +3128,61 @@ pub fn skin_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parity primitive: a CLOSED (periodic) cubic interpolation must produce a
+    /// smooth closed loop — C2 across the seam, no kink. Interpolate 12 points on
+    /// a radius-2 circle and assert the curve (1) closes at the seam, (2) stays on
+    /// the circle everywhere (a seam kink would bulge off it), and (3) passes
+    /// through every data point.
+    #[test]
+    fn periodic_cubic_interpolates_a_smooth_closed_circle() {
+        let n = 12usize;
+        let r = 2.0;
+        let pts: Vec<Point3> = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                Point3::new(r * a.cos(), r * a.sin(), 0.0)
+            })
+            .collect();
+        let c = interpolate_periodic_cubic_nurbs(&pts).expect("periodic interpolation");
+
+        let u0 = 3.0;
+        let u1 = (n + 3) as f64; // domain [DEG, n+DEG]
+
+        // (1) CLOSED: the seam endpoints coincide.
+        let p0 = c.evaluate(u0).point;
+        let p1 = c.evaluate(u1).point;
+        assert!(
+            (p0 - p1).magnitude() < 1e-6,
+            "periodic curve must close at the seam: {p0:?} vs {p1:?}"
+        );
+
+        // (2) ON-CIRCLE everywhere — a C0 seam kink would bulge off the circle.
+        let samples = 360;
+        let mut max_err = 0.0_f64;
+        for k in 0..=samples {
+            let u = u0 + (u1 - u0) * k as f64 / samples as f64;
+            let p = c.evaluate(u).point;
+            max_err = max_err.max(((p.x * p.x + p.y * p.y).sqrt() - r).abs());
+        }
+        assert!(
+            max_err < 0.02,
+            "smooth closed cubic must stay on the circle (a seam kink bulges): max radius error {max_err}"
+        );
+
+        // (3) INTERPOLATES every data point.
+        for d in &pts {
+            let mut best = f64::MAX;
+            for k in 0..=samples {
+                let u = u0 + (u1 - u0) * k as f64 / samples as f64;
+                best = best.min((c.evaluate(u).point - *d).magnitude());
+            }
+            assert!(
+                best < 1e-3,
+                "data point {d:?} not interpolated (min dist {best})"
+            );
+        }
+    }
 
     /// Analytic NURBS surface second derivatives must be *exact* on a
     /// polynomial patch (no finite-difference truncation). Build the
