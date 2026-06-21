@@ -238,6 +238,23 @@ pub async fn verify_claim_handler(
     Json(verify_claim(&claim, &mut model))
 }
 
+/// `GET /api/agent/parts/{id}/profile` — the editable MERIDIAN a revolved part
+/// was built from: the `(r, z)` half-plane points (returned as `[[r,z],...]`),
+/// recovered from the part's retained construction geometry. This is the
+/// scientist's editable profile — open it, change a radius, and re-revolve (the
+/// #25 edit→regenerate loop). 404 when the part carries no retained profile (it
+/// was not built by a parametric revolve).
+pub async fn part_revolve_profile(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<SolidId>,
+) -> Result<Json<Vec<[f64; 2]>>, StatusCode> {
+    let model = model_handle.read().await;
+    geometry_engine::operations::revolve::get_revolve_meridian(&model, id)
+        .map(|rz| Json(rz.into_iter().map(|(r, z)| [r, z]).collect()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// `GET /api/agent/parts/{id}/obb` — oriented bounding box (axes
 /// aligned to the part's principal moments of inertia).
 pub async fn part_oriented_bbox(
