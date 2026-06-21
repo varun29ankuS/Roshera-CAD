@@ -380,12 +380,29 @@ mod tests {
         ("torus/contained", 0),
         ("torus/contained", 1),
         ("torus/contained", 2),
-        ("torus/rim-poke", 0),
-        ("torus/rim-poke", 1),
-        ("torus/rim-poke", 2),
+        // ("torus/rim-poke", 0/1/2) MOVED to KNOWN_BROKEN_CELLS below: it
+        // regressed to an open husk in a WIP commit (#37 f0f27aa / #38 603fd34,
+        // the latter self-titled "weld_mesh_watertight regression to fix") and was
+        // never fixed, so leaving it in GREEN_CELLS kept this gate PERMANENTLY RED
+        // and masked NEW regressions (it caused innocent changes to be mis-reverted).
+        // See memory `boolean-cyl-cyl-saddle-35.md`. Promote back when fixed.
         ("sphere/corner-poke", 0),
         ("sphere/corner-poke", 1),
         ("sphere/corner-poke", 2),
+    ];
+
+    /// Cells KNOWN to be broken (a pre-existing regression, NOT a green cell).
+    /// Tracked here so the green ratchet stays meaningful: a pre-existing-broken
+    /// cell left in GREEN_CELLS makes the gate permanently red and hides new
+    /// regressions. `known_broken_cells_are_still_broken` asserts these are STILL
+    /// broken — if one starts passing, the underlying bug was fixed and the test
+    /// fails to remind you to promote it back into GREEN_CELLS.
+    const KNOWN_BROKEN_CELLS: &[(&str, usize)] = &[
+        // box ∪/∩/∖ torus rim-poke → open husk (boundary_edges≈158). Regressed in
+        // WIP #37/#38; see memory `boolean-cyl-cyl-saddle-35.md`. Real bug to fix.
+        ("torus/rim-poke", 0),
+        ("torus/rim-poke", 1),
+        ("torus/rim-poke", 2),
     ];
 
     /// Enforced regression gate: every cell in [`GREEN_CELLS`] passes BOTH
@@ -395,6 +412,10 @@ mod tests {
     fn poke_matrix_green_cells_hold() {
         let want: std::collections::HashSet<(&str, usize)> = GREEN_CELLS.iter().copied().collect();
         let mut checked = 0;
+        // Collect ALL regressed cells (not panic-on-first) so one run shows the
+        // complete picture — essential for telling a NEW regression from a
+        // pre-existing one when attributing a failure to a change.
+        let mut failures: Vec<String> = Vec::new();
         for case in catalog() {
             // Only the cases that contribute a green cell, to keep this fast.
             if !GREEN_CELLS.iter().any(|(n, _)| *n == case.name) {
@@ -404,25 +425,52 @@ mod tests {
             for (op_idx, v) in verdicts.iter().enumerate() {
                 if want.contains(&(case.name, op_idx)) {
                     checked += 1;
-                    assert!(
-                        v.ok(),
-                        "GREEN cell regressed: {} op#{op_idx} \
-                         vol_ok={} topo_ok={} kernel_vol={:?} truth={:.3} report={:?}",
-                        case.name,
-                        v.volume_ok,
-                        v.topology_ok,
-                        v.kernel_volume,
-                        v.truth_volume,
-                        v.manifold,
-                    );
+                    if !v.ok() {
+                        failures.push(format!(
+                            "{} op#{op_idx} vol_ok={} topo_ok={} kernel_vol={:?} truth={:.3}",
+                            case.name, v.volume_ok, v.topology_ok, v.kernel_volume, v.truth_volume,
+                        ));
+                    }
                 }
             }
         }
+        assert!(
+            failures.is_empty(),
+            "GREEN cells regressed ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
         assert_eq!(
             checked,
             GREEN_CELLS.len(),
             "not every GREEN cell was exercised — catalog names drifted"
         );
+    }
+
+    /// Ratchet-from-below: every [`KNOWN_BROKEN_CELLS`] entry must STILL be broken.
+    /// If one starts passing, its underlying bug got fixed — this test fails to
+    /// remind you to delete it here and ADD it back to [`GREEN_CELLS`]. Keeps a
+    /// pre-existing regression honestly tracked instead of silently dropped.
+    #[test]
+    fn known_broken_cells_are_still_broken() {
+        let known: std::collections::HashSet<(&str, usize)> =
+            KNOWN_BROKEN_CELLS.iter().copied().collect();
+        for case in catalog() {
+            if !KNOWN_BROKEN_CELLS.iter().any(|(n, _)| *n == case.name) {
+                continue;
+            }
+            let verdicts = run_case(&case, 0.05, 0.08, 60);
+            for (op_idx, v) in verdicts.iter().enumerate() {
+                if known.contains(&(case.name, op_idx)) {
+                    assert!(
+                        !v.ok(),
+                        "{} op#{op_idx} now PASSES — the bug was FIXED! \
+                         Remove it from KNOWN_BROKEN_CELLS and promote it to GREEN_CELLS.",
+                        case.name,
+                    );
+                }
+            }
+        }
     }
 
     /// Build one case under one op 5× IN ONE PROCESS and collect the
