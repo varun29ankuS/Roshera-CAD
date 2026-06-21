@@ -223,7 +223,39 @@ impl<W: Write> StepWriter<W> {
         };
 
         let ref_dir_id = if let Some(ref_dir) = ref_direction {
-            Some(self.write_direction(ref_dir)?)
+            // ISO 10303-42 requires the ref_direction to be NON-parallel to the
+            // axis (it is projected to form the placement's X). Callers pass a
+            // literal [1,0,0], which is degenerate when the axis is parallel to
+            // ±X (a very common X-aligned cylinder/cone/plane) — strict readers
+            // (OCCT/FreeCAD) then reject the placement or pick a garbage frame.
+            // Orthogonalize the seed against the axis (Gram-Schmidt), falling
+            // back to the world basis vector least aligned with the axis.
+            let rd = if let Some(axis) = axis {
+                let norm = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let al = norm(axis).max(1e-12);
+                let a = [axis[0] / al, axis[1] / al, axis[2] / al];
+                let proj = |v: &[f64; 3]| {
+                    let d = v[0] * a[0] + v[1] * a[1] + v[2] * a[2];
+                    [v[0] - a[0] * d, v[1] - a[1] * d, v[2] - a[2] * d]
+                };
+                let mut r = proj(ref_dir);
+                if norm(&r) < 1e-9 {
+                    let ab = [a[0].abs(), a[1].abs(), a[2].abs()];
+                    let e = if ab[0] <= ab[1] && ab[0] <= ab[2] {
+                        [1.0, 0.0, 0.0]
+                    } else if ab[1] <= ab[2] {
+                        [0.0, 1.0, 0.0]
+                    } else {
+                        [0.0, 0.0, 1.0]
+                    };
+                    r = proj(&e);
+                }
+                let rl = norm(&r).max(1e-12);
+                [r[0] / rl, r[1] / rl, r[2] / rl]
+            } else {
+                *ref_dir
+            };
+            Some(self.write_direction(&rd)?)
         } else {
             None
         };
