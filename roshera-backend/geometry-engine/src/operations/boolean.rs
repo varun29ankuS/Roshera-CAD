@@ -19292,6 +19292,20 @@ mod tests {
                 }
                 let mut dumped: std::collections::HashSet<FaceId> =
                     std::collections::HashSet::new();
+                let mut brep_boundary = 0usize;
+                for (eid, fids) in edge_faces.iter() {
+                    if fids.len() == 1 {
+                        brep_boundary += 1;
+                        if brep_boundary <= 6 {
+                            let p = m
+                                .edges
+                                .get(*eid)
+                                .and_then(|e| m.vertices.get_position(e.start_vertex));
+                            eprintln!("  BREP-BOUNDARY edge={eid:?} face={fids:?} start={p:?}");
+                        }
+                    }
+                }
+                eprintln!("[#35-analytic] brep_boundary_edges={brep_boundary}");
                 for (eid, fids) in edge_faces.iter() {
                     if fids.len() > 2 {
                         let p = m
