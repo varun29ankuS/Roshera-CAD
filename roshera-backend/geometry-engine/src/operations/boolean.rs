@@ -19238,6 +19238,23 @@ mod tests {
             r.euler_characteristic,
             r.manifold && r.closed && r.oriented
         );
+        // Discriminate: is the B-Rep itself valid (→ the leak is a tessellation
+        // sampling mismatch on a SHARED rim edge) or invalid (→ the rim edge got
+        // un-welded by the 2nd op)?
+        let brep = crate::primitives::validation::validate_solid_scoped(
+            &mut m,
+            res,
+            tol,
+            crate::primitives::validation::ValidationLevel::Standard,
+        );
+        eprintln!(
+            "[#35-analytic] brep_valid={} brep_errs={}",
+            brep.is_valid,
+            brep.errors.len()
+        );
+        for e in brep.errors.iter().take(4) {
+            eprintln!("    {e:?}");
+        }
         // Localize the leaks: how many open edges sit near the saddle (the bore
         // intersection ~(40,20,20)) vs the rest of the model? Distinguishes a
         // saddle-seam weld bug (layer 2) from a classification failure.
