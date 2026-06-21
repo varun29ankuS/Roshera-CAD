@@ -1088,7 +1088,12 @@ impl NurbsCurve {
             }
         }
 
-        if mult >= p {
+        // Inserting `times` copies must not push the multiplicity past the
+        // degree (mult == p is the max for an interior knot of a connected
+        // curve). The old guard only checked the PRE-insertion `mult >= p`, so
+        // `mult + times > p` silently produced an invalid knot vector. Mirror
+        // the surface path `insert_knot_u`, which checks `mult + times`.
+        if mult + times > p {
             return Err("Knot multiplicity would exceed degree");
         }
 

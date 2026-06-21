@@ -3198,12 +3198,17 @@ impl Surface for Cone {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // Offset cone changes the angle
-        let offset_angle =
-            ((self.half_angle.sin() + distance / self.half_angle.cos()).asin()).abs();
-
+        // A parallel offset of a cone is the SAME-half-angle cone with the apex
+        // shifted along the axis (and the height limits shifted with it) — this
+        // is what `offset_exact` below does. Recomputing `half_angle` via
+        // `asin(sin a + d/cos a)` is geometrically wrong and NaN-prone (asin of
+        // an argument > 1 for ordinary offsets). Mirror the apex shift.
+        let apex_offset = distance / self.half_angle.sin();
         let mut offset_cone = *self;
-        offset_cone.half_angle = offset_angle;
+        offset_cone.apex = self.apex - self.axis * apex_offset;
+        offset_cone.height_limits = self
+            .height_limits
+            .map(|[bottom, top]| [bottom + apex_offset, top + apex_offset]);
         Box::new(offset_cone)
     }
 
