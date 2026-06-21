@@ -538,6 +538,65 @@ server.tool(
 );
 
 server.tool(
+  "verify_claim",
+  "VERIFY a math claim against the kernel's GROUND TRUTH — 'the notebook that can't " +
+    "lie'. Bind each variable in `expr` to an EXACT kernel measurement (a part's " +
+    "volume / surface_area, a face's area, an edge's length, or a supplied constant), " +
+    "assert `expected`, and the kernel evaluates it deterministically (NOT an LLM). " +
+    "Returns a THREE-STATE verdict: verified | false (a real mismatch, with abs_error) " +
+    "| refused (a binding could not resolve — never a silent pass). Use it to check an " +
+    "engineering relation against measured geometry, e.g. nozzle expansion ratio " +
+    "A_exit/A_throat, or mass = volume * density.",
+  {
+    expr: z
+      .string()
+      .describe("math expression over the binding variable names, e.g. 'a_exit / a_throat'"),
+    bindings: z
+      .array(
+        z.object({
+          var: z.string().describe("variable name used in expr"),
+          measure: z.object({
+            kind: z.enum([
+              "volume",
+              "surface_area",
+              "face_area",
+              "edge_length",
+              "constant",
+            ]),
+            part: z
+              .string()
+              .optional()
+              .describe("part object UUID — for volume / surface_area"),
+            face: z.number().int().optional().describe("face id — for face_area"),
+            edge: z.number().int().optional().describe("edge id — for edge_length"),
+            value: z.number().optional().describe("the value — for constant"),
+          }),
+        }),
+      )
+      .describe("variable→measurement bindings"),
+    expected: z.number().describe("the value the expression should equal"),
+    tolerance: z
+      .number()
+      .optional()
+      .describe("absolute tolerance; omit for auto (1e-6 relative)"),
+  },
+  async ({ expr, bindings, expected, tolerance }) => {
+    try {
+      return ok(
+        await api("POST", "/api/agent/verify-claim", {
+          expr,
+          bindings,
+          expected,
+          ...(tolerance !== undefined ? { tolerance } : {}),
+        }),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "get_face",
   "Per-face report: surface type, area, principal curvatures " +
     "([0,0]=flat, [±1/r,0]=cylindrical, [±1/r,±1/r]=spherical), boundary " +

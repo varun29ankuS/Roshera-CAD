@@ -138,9 +138,24 @@ pub async fn part_mass_properties_by_uuid(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerifyMeasure {
-    Volume { part: uuid::Uuid },
-    SurfaceArea { part: uuid::Uuid },
-    Constant { value: f64 },
+    Volume {
+        part: uuid::Uuid,
+    },
+    SurfaceArea {
+        part: uuid::Uuid,
+    },
+    /// A single face's area (faces are addressed by kernel face id, not UUID —
+    /// the agent gets them from render_part `ids` / get_face / select_face).
+    FaceArea {
+        face: u32,
+    },
+    /// A single edge's length (kernel edge id).
+    EdgeLength {
+        edge: u32,
+    },
+    Constant {
+        value: f64,
+    },
 }
 
 /// A `(var, measure)` pair: binds a variable name in the claim expression to a
@@ -184,6 +199,8 @@ pub async fn verify_claim_handler(
             VerifyMeasure::SurfaceArea { part } => state
                 .get_local_id(&part)
                 .map(|solid| Measurement::SurfaceArea { solid }),
+            VerifyMeasure::FaceArea { face } => Some(Measurement::FaceArea { face }),
+            VerifyMeasure::EdgeLength { edge } => Some(Measurement::EdgeLength { edge }),
         };
         match measure {
             Some(m) => bindings.push(ClaimBinding {
