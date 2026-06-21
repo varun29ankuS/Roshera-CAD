@@ -19238,6 +19238,31 @@ mod tests {
             r.euler_characteristic,
             r.manifold && r.closed && r.oriented
         );
+        // Localize the leaks: how many open edges sit near the saddle (the bore
+        // intersection ~(40,20,20)) vs the rest of the model? Distinguishes a
+        // saddle-seam weld bug (layer 2) from a classification failure.
+        let segs = crate::harness::watertight::boundary_edge_positions(&m, res, 0.5, 1e-6);
+        let (sx, sy, sz) = (40.0_f64, 20.0_f64, 20.0_f64); // saddle / bore intersection
+        let near_saddle = segs
+            .iter()
+            .filter(|s| {
+                let mx = (s[0].x + s[1].x) * 0.5;
+                let my = (s[0].y + s[1].y) * 0.5;
+                let mz = (s[0].z + s[1].z) * 0.5;
+                (mx - sx).powi(2) + (my - sy).powi(2) + (mz - sz).powi(2) < 15.0 * 15.0
+            })
+            .count();
+        eprintln!(
+            "[#35-analytic] boundary_segs={} near_saddle(<15mm)={}",
+            segs.len(),
+            near_saddle
+        );
+        for s in segs.iter().take(6) {
+            eprintln!(
+                "  seg [{:.1},{:.1},{:.1}]->[{:.1},{:.1},{:.1}]",
+                s[0].x, s[0].y, s[0].z, s[1].x, s[1].y, s[1].z
+            );
+        }
         assert!(
             r.boundary_edges == 0 && r.nonmanifold_edges == 0,
             "#35-analytic: intersecting analytic bores must be watertight (open={}, nm={})",
