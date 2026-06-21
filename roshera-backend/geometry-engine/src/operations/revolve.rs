@@ -219,6 +219,17 @@ pub fn revolve_meridian(
     Ok(solid)
 }
 
+/// Recover the `(r, z)` meridian a revolved part was built from, read back from
+/// its retained construction geometry — the editable profile a scientist opens,
+/// changes, and re-revolves with [`revolve_meridian`]. The stored points live in
+/// the `(r, 0, z)` half-plane, so `r = x`, `z = z`. Returns `None` when the solid
+/// carries no retained meridian (it was not built by `revolve_meridian`),
+/// completing the edit→regenerate loop's recover step (#25).
+pub fn get_revolve_meridian(model: &BRepModel, solid: SolidId) -> Option<Vec<(f64, f64)>> {
+    let cg = model.solid_construction(solid)?;
+    Some(cg.profile_points.iter().map(|p| (p.x, p.z)).collect())
+}
+
 /// Create a pure revolution (no helical component) as a watertight B-Rep.
 ///
 /// Builds a SHARED vertex/edge grid rather than independent per-quad islands:
