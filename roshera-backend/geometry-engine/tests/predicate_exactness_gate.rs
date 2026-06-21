@@ -12,7 +12,7 @@
 //! FAIL on a non-exact predicate — that is the gap, to be filled (never pinned).
 
 use geometry_engine::math::vector2::Vector2;
-use geometry_engine::math::{orient2d, orient3d, Orientation, Point3};
+use geometry_engine::math::{incircle, orient2d, orient3d, CircleLocation, Orientation, Point3};
 use num_rational::BigRational;
 use num_traits::Signed;
 use rand::rngs::StdRng;
@@ -215,6 +215,111 @@ fn orient3d_matches_exact_rational_oracle_on_adversarial_inputs() {
     assert_eq!(
         mismatches, 0,
         "orient3d disagreed with the EXACT rational oracle on {mismatches}/{n} cases \
+         (hard cases where naive f64 was wrong: {hard}); first failure: {first_fail:?} \
+         — the predicate is NOT exact"
+    );
+}
+
+// ── incircle (cocircular) ──────────────────────────────────────────────────
+
+/// Exact in-circle sign via rationals. Matches incircle's determinant:
+/// `alift·bcdet + blift·cadet + clift·abdet` (>0 ⇒ Inside).
+fn exact_incircle_sign(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> i32 {
+    let adx = rat(a[0]) - rat(d[0]);
+    let ady = rat(a[1]) - rat(d[1]);
+    let bdx = rat(b[0]) - rat(d[0]);
+    let bdy = rat(b[1]) - rat(d[1]);
+    let cdx = rat(c[0]) - rat(d[0]);
+    let cdy = rat(c[1]) - rat(d[1]);
+    let alift = &adx * &adx + &ady * &ady;
+    let blift = &bdx * &bdx + &bdy * &bdy;
+    let clift = &cdx * &cdx + &cdy * &cdy;
+    let bcdet = &bdx * &cdy - &cdx * &bdy;
+    let cadet = &cdx * &ady - &adx * &cdy;
+    let abdet = &adx * &bdy - &bdx * &ady;
+    let det = &alift * &bcdet + &blift * &cadet + &clift * &abdet;
+    if det.is_positive() {
+        1
+    } else if det.is_negative() {
+        -1
+    } else {
+        0
+    }
+}
+
+fn pred_incircle_sign(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> i32 {
+    match incircle(
+        &Vector2::new(a[0], a[1]),
+        &Vector2::new(b[0], b[1]),
+        &Vector2::new(c[0], c[1]),
+        &Vector2::new(d[0], d[1]),
+    ) {
+        CircleLocation::Inside => 1,
+        CircleLocation::Outside => -1,
+        CircleLocation::OnBoundary => 0,
+    }
+}
+
+fn naive_incircle_sign(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> i32 {
+    let (adx, ady) = (a[0] - d[0], a[1] - d[1]);
+    let (bdx, bdy) = (b[0] - d[0], b[1] - d[1]);
+    let (cdx, cdy) = (c[0] - d[0], c[1] - d[1]);
+    let alift = adx * adx + ady * ady;
+    let blift = bdx * bdx + bdy * bdy;
+    let clift = cdx * cdx + cdy * cdy;
+    let det = alift * (bdx * cdy - cdx * bdy)
+        + blift * (cdx * ady - adx * cdy)
+        + clift * (adx * bdy - bdx * ady);
+    if det > 0.0 {
+        1
+    } else if det < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+#[test]
+fn incircle_matches_exact_rational_oracle_on_adversarial_inputs() {
+    let mut rng = StdRng::seed_from_u64(0xCAFE_BABE_1357_9BDF);
+    let mut mismatches = 0u64;
+    let mut hard = 0u64;
+    let mut first_fail = None;
+    let n = 150_000u64;
+    use std::f64::consts::TAU;
+
+    for _ in 0..n {
+        // a, b, c, d on (nearly) a common circle: the in-circle determinant is
+        // then small and sign-delicate. d is nudged radially off the circle.
+        let cx = rng.gen_range(-1.0..1.0);
+        let cy = rng.gen_range(-1.0..1.0);
+        let r = rng.gen_range(0.5..2.0);
+        let on = |ang: f64, dr: f64| [cx + (r + dr) * ang.cos(), cy + (r + dr) * ang.sin()];
+        let a = on(rng.gen_range(0.0..TAU), 0.0);
+        let b = on(rng.gen_range(0.0..TAU), 0.0);
+        let c = on(rng.gen_range(0.0..TAU), 0.0);
+        let d = on(rng.gen_range(0.0..TAU), rng.gen_range(-1.0..1.0) * 1e-13);
+
+        let exact = exact_incircle_sign(a, b, c, d);
+        let got = pred_incircle_sign(a, b, c, d);
+        if got != exact {
+            mismatches += 1;
+            if first_fail.is_none() {
+                first_fail = Some((a, b, c, d, got, exact));
+            }
+        }
+        if naive_incircle_sign(a, b, c, d) != exact {
+            hard += 1;
+        }
+    }
+
+    assert!(
+        hard > 0,
+        "the sweep never reached the hard regime (naive f64 always matched exact) — make d closer to the circle"
+    );
+    assert_eq!(
+        mismatches, 0,
+        "incircle disagreed with the EXACT rational oracle on {mismatches}/{n} cases \
          (hard cases where naive f64 was wrong: {hard}); first failure: {first_fail:?} \
          — the predicate is NOT exact"
     );
