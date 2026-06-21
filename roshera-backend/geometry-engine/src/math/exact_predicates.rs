@@ -97,6 +97,162 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
     (x, y)
 }
 
+/// Fast exact sum, valid ONLY when `|a| >= |b|`. 3 flops vs `two_sum`'s 6.
+/// Returns `(x, y)` with `x + y == a + b` exactly. (Shewchuk `Fast_Two_Sum`.)
+#[inline(always)]
+#[allow(dead_code)] // wired into the exact predicates in the following slice
+fn fast_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let x = a + b;
+    let bvirt = x - a;
+    let y = b - bvirt;
+    (x, y)
+}
+
+/// Exact subtraction: `(x, y)` with `x + y == a - b` exactly. (Shewchuk `Two_Diff`.)
+#[inline(always)]
+#[allow(dead_code)]
+fn two_diff(a: f64, b: f64) -> (f64, f64) {
+    let x = a - b;
+    let bvirt = a - x;
+    let avirt = x + bvirt;
+    let bround = bvirt - b;
+    let around = a - avirt;
+    let y = around + bround;
+    (x, y)
+}
+
+/// Sum of an expansion's components — the cheap approximation of its value
+/// (Shewchuk `estimate`). Components are summed low→high.
+#[inline]
+#[allow(dead_code)]
+fn estimate(e: &[f64]) -> f64 {
+    let mut q = 0.0;
+    for &c in e {
+        q += c;
+    }
+    q
+}
+
+/// Merge two nonoverlapping, sorted (low→high magnitude) expansions `e` and `f`
+/// into `h = e + f`, exactly, eliminating zero components. `h` must have
+/// capacity `e.len() + f.len()`. Returns the component count. (Shewchuk
+/// `fast_expansion_sum_zeroelim`.) Reads are bounds-guarded (the C original
+/// reads one-past-end into a value it never uses; Rust must not).
+#[allow(dead_code)]
+fn fast_expansion_sum_zeroelim(e: &[f64], f: &[f64], h: &mut [f64]) -> usize {
+    let (elen, flen) = (e.len(), f.len());
+    let mut enow = e[0];
+    let mut fnow = f[0];
+    let mut eindex = 0usize;
+    let mut findex = 0usize;
+    let mut q: f64;
+    if (fnow > enow) == (fnow > -enow) {
+        q = enow;
+        eindex += 1;
+        if eindex < elen {
+            enow = e[eindex];
+        }
+    } else {
+        q = fnow;
+        findex += 1;
+        if findex < flen {
+            fnow = f[findex];
+        }
+    }
+    let mut hindex = 0usize;
+    while eindex < elen && findex < flen {
+        let (qnew, hh) = if (fnow > enow) == (fnow > -enow) {
+            let r = if hindex == 0 {
+                fast_two_sum(enow, q)
+            } else {
+                two_sum(q, enow)
+            };
+            eindex += 1;
+            if eindex < elen {
+                enow = e[eindex];
+            }
+            r
+        } else {
+            let r = if hindex == 0 {
+                fast_two_sum(fnow, q)
+            } else {
+                two_sum(q, fnow)
+            };
+            findex += 1;
+            if findex < flen {
+                fnow = f[findex];
+            }
+            r
+        };
+        q = qnew;
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+    }
+    while eindex < elen {
+        let (qnew, hh) = two_sum(q, enow);
+        eindex += 1;
+        if eindex < elen {
+            enow = e[eindex];
+        }
+        q = qnew;
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+    }
+    while findex < flen {
+        let (qnew, hh) = two_sum(q, fnow);
+        findex += 1;
+        if findex < flen {
+            fnow = f[findex];
+        }
+        q = qnew;
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+    }
+    if q != 0.0 || hindex == 0 {
+        h[hindex] = q;
+        hindex += 1;
+    }
+    hindex
+}
+
+/// Scale an expansion `e` by a single double `b`, exactly, zero-eliminated.
+/// `h` must have capacity `2 * e.len()`. Returns the component count.
+/// (Shewchuk `scale_expansion_zeroelim`.)
+#[allow(dead_code)]
+fn scale_expansion_zeroelim(e: &[f64], b: f64, h: &mut [f64]) -> usize {
+    let (mut q, hh0) = two_product(e[0], b);
+    let mut hindex = 0usize;
+    if hh0 != 0.0 {
+        h[hindex] = hh0;
+        hindex += 1;
+    }
+    for &enow in &e[1..] {
+        let (product1, product0) = two_product(enow, b);
+        let (sum, hh) = two_sum(q, product0);
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+        let (qn, hh2) = fast_two_sum(product1, sum);
+        q = qn;
+        if hh2 != 0.0 {
+            h[hindex] = hh2;
+            hindex += 1;
+        }
+    }
+    if q != 0.0 || hindex == 0 {
+        h[hindex] = q;
+        hindex += 1;
+    }
+    hindex
+}
+
 /// Fast approximate 2D orientation test
 #[inline(always)]
 fn orient2d_fast(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
@@ -735,5 +891,80 @@ mod tests {
         let result = orient2d(&Vector2::ZERO, &Vector2::X, &tiny);
         // Should detect the slight CCW orientation
         assert_eq!(result, Orientation::CounterClockwise);
+    }
+}
+
+#[cfg(test)]
+mod expansion_primitive_tests {
+    //! Exactness gates for the Shewchuk expansion toolkit — the foundation the
+    //! true exact predicates are built from. `two_product`'s tail is checked
+    //! against the hardware-exact FMA residual; the expansion routines are
+    //! checked on cases with a hand-known exact sum.
+    use super::*;
+
+    #[test]
+    fn two_product_tail_is_the_exact_fma_residual() {
+        for &(a, b) in &[
+            (1.0 + 2.0_f64.powi(-30), 1.0 - 2.0_f64.powi(-30)),
+            (1.3, 7.9),
+            (123456.789, 0.000123),
+            (2.0_f64.powi(40) + 1.0, 3.0),
+            (-5.5, 11.25),
+        ] {
+            let (x, y) = two_product(a, b);
+            assert_eq!(x, a * b, "high part is the rounded product");
+            // FMA computes a*b - x with no intermediate rounding → ground truth.
+            assert_eq!(y, a.mul_add(b, -x), "tail must equal the exact residual");
+        }
+    }
+
+    #[test]
+    fn two_diff_recovers_dropped_low_bits() {
+        let a = 1.0;
+        let b = 2.0_f64.powi(-60); // below ulp(1.0) = 2^-52, so a-b rounds to 1.0
+        let (x, y) = two_diff(a, b);
+        assert_eq!(x, 1.0, "rounded difference");
+        assert_eq!(y, -b, "the lost low bits live in the tail; x + y == a - b");
+    }
+
+    #[test]
+    fn fast_two_sum_matches_two_sum_when_ordered() {
+        let (a, b) = (1.0e16, 3.0); // |a| >= |b|
+        assert_eq!(fast_two_sum(a, b), two_sum(a, b));
+    }
+
+    #[test]
+    fn fast_expansion_sum_clean_integers() {
+        let mut h = [0.0f64; 4];
+        let n = fast_expansion_sum_zeroelim(&[3.0], &[5.0], &mut h);
+        assert_eq!(&h[..n], &[8.0], "3 + 5 = 8, zero tail eliminated");
+
+        let n = fast_expansion_sum_zeroelim(&[1.0, 16.0], &[2.0], &mut h);
+        assert_eq!(estimate(&h[..n]), 19.0, "(1+16) + 2 = 19");
+    }
+
+    #[test]
+    fn fast_expansion_sum_preserves_a_tiny_tail() {
+        let mut h = [0.0f64; 4];
+        let tiny = 2.0_f64.powi(-60);
+        let n = fast_expansion_sum_zeroelim(&[tiny], &[1.0], &mut h);
+        assert!(
+            h[..n].iter().any(|&c| c == tiny),
+            "1 + 2^-60 rounds to 1.0 but the 2^-60 component must survive: {:?}",
+            &h[..n]
+        );
+    }
+
+    #[test]
+    fn scale_expansion_clean() {
+        let mut h = [0.0f64; 4];
+        let n = scale_expansion_zeroelim(&[2.0, 16.0], 3.0, &mut h);
+        assert_eq!(estimate(&h[..n]), 54.0, "(2+16) * 3 = 54");
+    }
+
+    #[test]
+    fn estimate_sums_components() {
+        assert_eq!(estimate(&[1.0, 2.0, 4.0]), 7.0);
+        assert_eq!(estimate(&[]), 0.0);
     }
 }
