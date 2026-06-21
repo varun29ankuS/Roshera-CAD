@@ -57,6 +57,13 @@ const O3DERRBOUNDSA: f64 = 7.771_561_172_376_096e-16;
 const ICCERRBOUNDSA: f64 = 1.0e-15;
 const ISPERRBOUNDSA: f64 = 1.6e-15;
 
+// Multi-stage orient2d bounds, derived from ε = 2^-53 (Shewchuk exactinit).
+// The A bound equals CCWERRBOUNDSA above; B/C drive the exact-fallback cascade.
+const EPS: f64 = 1.110_223_024_625_156_5e-16; // 2^-53
+const CCWERRBOUNDB: f64 = (2.0 + 12.0 * EPS) * EPS;
+const CCWERRBOUNDC: f64 = (9.0 + 64.0 * EPS) * EPS * EPS;
+const O2D_RESULTERRBOUND: f64 = (3.0 + 8.0 * EPS) * EPS;
+
 // Splitter for exact arithmetic (2^27 + 1 for IEEE 754 double)
 const SPLITTER: f64 = 134217729.0;
 
@@ -110,7 +117,6 @@ fn fast_two_sum(a: f64, b: f64) -> (f64, f64) {
 
 /// Exact subtraction: `(x, y)` with `x + y == a - b` exactly. (Shewchuk `Two_Diff`.)
 #[inline(always)]
-#[allow(dead_code)]
 fn two_diff(a: f64, b: f64) -> (f64, f64) {
     let x = a - b;
     let bvirt = a - x;
@@ -119,6 +125,24 @@ fn two_diff(a: f64, b: f64) -> (f64, f64) {
     let around = a - avirt;
     let y = around + bround;
     (x, y)
+}
+
+/// `(a1 + a0) - b` as a 3-component expansion `(x2, x1, x0)` (high→low).
+/// (Shewchuk `Two_One_Diff`.)
+#[inline(always)]
+fn two_one_diff(a1: f64, a0: f64, b: f64) -> (f64, f64, f64) {
+    let (i, x0) = two_diff(a0, b);
+    let (x2, x1) = two_sum(a1, i);
+    (x2, x1, x0)
+}
+
+/// `(a1 + a0) - (b1 + b0)` as a 4-component expansion `[x0, x1, x2, x3]`
+/// (low→high). (Shewchuk `Two_Two_Diff`.)
+#[inline(always)]
+fn two_two_diff(a1: f64, a0: f64, b1: f64, b0: f64) -> [f64; 4] {
+    let (j, j0, x0) = two_one_diff(a1, a0, b0);
+    let (x3, x2, x1) = two_one_diff(j, j0, b1);
+    [x0, x1, x2, x3]
 }
 
 /// Sum of an expansion's components — the cheap approximation of its value
@@ -260,57 +284,109 @@ fn orient2d_fast(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
 }
 
 /// Adaptive precision 2D orientation test
-fn orient2d_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
-    let acx = pa.x - pc.x;
-    let acy = pa.y - pc.y;
-    let bcx = pb.x - pc.x;
-    let bcy = pb.y - pc.y;
-
-    // Compute exact expansion using two-product
-    let (detleft, detleft_tail) = two_product(acx, bcy);
-    let (detright, detright_tail) = two_product(acy, bcx);
-
-    // Compute determinant with exact arithmetic
-    let (det, det_tail) = two_sum(detleft, -detright);
-
-    det + (detleft_tail - detright_tail + det_tail)
-}
-
-/// Test whether three points are in counter-clockwise order
-///
-/// Returns the orientation of the triangle (pa, pb, pc):
-/// - `CounterClockwise` if the points are in counter-clockwise order
-/// - `Clockwise` if the points are in clockwise order  
-/// - `Collinear` if the points are collinear
-///
-/// This predicate is exact for all inputs.
-pub fn orient2d(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> Orientation {
-    let det = orient2d_fast(pa, pb, pc);
-
-    // Compute error bound
-    let acx = (pa.x - pc.x).abs();
-    let acy = (pa.y - pc.y).abs();
-    let bcx = (pb.x - pc.x).abs();
-    let bcy = (pb.y - pc.y).abs();
-
-    let permanent = acx * bcy + acy * bcx;
-    let errbound = CCWERRBOUNDSA * permanent;
-
-    if det > errbound {
+/// Map a determinant value to an [`Orientation`].
+#[inline]
+fn orientation_of(det: f64) -> Orientation {
+    if det > 0.0 {
         Orientation::CounterClockwise
-    } else if det < -errbound {
+    } else if det < 0.0 {
         Orientation::Clockwise
     } else {
-        // Need exact test
-        let det_exact = orient2d_adapt(pa, pb, pc);
-        if det_exact > 0.0 {
-            Orientation::CounterClockwise
-        } else if det_exact < 0.0 {
-            Orientation::Clockwise
-        } else {
-            Orientation::Collinear
-        }
+        Orientation::Collinear
     }
+}
+
+/// Full Shewchuk adaptive orient2d. Returns a value whose SIGN is the exact sign
+/// of the determinant. Stage B refines with the product roundoffs; Stage C adds
+/// the coordinate-difference-tail corrections; Stage D builds the complete
+/// expansion (the provably-exact pass). `detsum` is the `|det|` magnitude
+/// estimate from the caller's A-filter.
+fn orient2d_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2, detsum: f64) -> f64 {
+    // Coordinate differences WITH their roundoff tails (the bits the old
+    // implementation dropped — the source of the sign errors the harness found).
+    let (acx, acxtail) = two_diff(pa.x, pc.x);
+    let (bcx, bcxtail) = two_diff(pb.x, pc.x);
+    let (acy, acytail) = two_diff(pa.y, pc.y);
+    let (bcy, bcytail) = two_diff(pb.y, pc.y);
+
+    let (detleft, detlefttail) = two_product(acx, bcy);
+    let (detright, detrighttail) = two_product(acy, bcx);
+
+    // Stage B: B = (detleft+detlefttail) - (detright+detrighttail), exact 4-comp.
+    let b = two_two_diff(detleft, detlefttail, detright, detrighttail);
+    let mut det = estimate(&b);
+    let errbound = CCWERRBOUNDB * detsum;
+    if det >= errbound || -det >= errbound {
+        return det;
+    }
+
+    // If every coordinate difference was exact, B is already the exact answer.
+    if acxtail == 0.0 && acytail == 0.0 && bcxtail == 0.0 && bcytail == 0.0 {
+        return det;
+    }
+
+    // Stage C: add the first-order coordinate-tail correction.
+    let errbound = CCWERRBOUNDC * detsum + O2D_RESULTERRBOUND * det.abs();
+    det += (acx * bcytail + bcy * acxtail) - (acy * bcxtail + bcx * acytail);
+    if det >= errbound || -det >= errbound {
+        return det;
+    }
+
+    // Stage D: the exact expansion. C1 = B + (acxtail·bcy - acytail·bcx).
+    let (s1, s0) = two_product(acxtail, bcy);
+    let (t1, t0) = two_product(acytail, bcx);
+    let u = two_two_diff(s1, s0, t1, t0);
+    let mut c1 = [0.0f64; 8];
+    let c1len = fast_expansion_sum_zeroelim(&b, &u, &mut c1);
+
+    // C2 = C1 + (acx·bcytail - acy·bcxtail).
+    let (s1, s0) = two_product(acx, bcytail);
+    let (t1, t0) = two_product(acy, bcxtail);
+    let u = two_two_diff(s1, s0, t1, t0);
+    let mut c2 = [0.0f64; 12];
+    let c2len = fast_expansion_sum_zeroelim(&c1[..c1len], &u, &mut c2);
+
+    // D = C2 + (acxtail·bcytail - acytail·bcxtail).
+    let (s1, s0) = two_product(acxtail, bcytail);
+    let (t1, t0) = two_product(acytail, bcxtail);
+    let u = two_two_diff(s1, s0, t1, t0);
+    let mut d = [0.0f64; 16];
+    let dlen = fast_expansion_sum_zeroelim(&c2[..c2len], &u, &mut d);
+
+    // The most significant component carries the exact sign.
+    d[dlen - 1]
+}
+
+/// Test whether three points are in counter-clockwise order — the EXACT sign of
+/// the orientation determinant of (pa, pb, pc), correct for all finite inputs
+/// (full Shewchuk adaptive cascade). `Collinear` iff the determinant is exactly
+/// zero.
+pub fn orient2d(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> Orientation {
+    let detleft = (pa.x - pc.x) * (pb.y - pc.y);
+    let detright = (pa.y - pc.y) * (pb.x - pc.x);
+    let det = detleft - detright;
+
+    // A-filter permanent: when the two products have strict opposite signs the
+    // subtraction is reliable; otherwise bound by their magnitude sum.
+    let detsum = if detleft > 0.0 {
+        if detright <= 0.0 {
+            return orientation_of(det);
+        }
+        detleft + detright
+    } else if detleft < 0.0 {
+        if detright >= 0.0 {
+            return orientation_of(det);
+        }
+        -detleft - detright
+    } else {
+        return orientation_of(det);
+    };
+
+    let errbound = CCWERRBOUNDSA * detsum;
+    if det >= errbound || -det >= errbound {
+        return orientation_of(det);
+    }
+    orientation_of(orient2d_adapt(pa, pb, pc, detsum))
 }
 
 /// Fast approximate 3D orientation test  
