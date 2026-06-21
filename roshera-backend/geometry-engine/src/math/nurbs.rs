@@ -2986,12 +2986,17 @@ pub fn interpolate_periodic_cubic_nurbs(points: &[Point3]) -> Result<NurbsCurve,
         return Err("periodic cubic interpolation needs at least 3 points");
     }
 
-    // Cyclic collocation: (P_{i-1} + 4 P_i + P_{i+1}) / 6 = D_i, indices mod n.
+    // Cyclic collocation. The uniform-cubic curve at integer knot u = DEG + i is
+    // (P_i + 4 P_{i+1} + P_{i+2}) / 6, so to land data point D_i at the NATURAL
+    // closed-loop parameter (normalized i/n) we collocate (P_i + 4 P_{i+1} +
+    // P_{i+2}) / 6 = D_i (indices mod n). That alignment makes the skinned
+    // surface interpolate section point i at u = i/n — matching the loft's
+    // interpolation convention without a param shift.
     let mut a = vec![vec![0.0_f64; n]; n];
     for i in 0..n {
-        a[i][(i + n - 1) % n] += 1.0 / 6.0;
-        a[i][i] += 4.0 / 6.0;
-        a[i][(i + 1) % n] += 1.0 / 6.0;
+        a[i][i] += 1.0 / 6.0;
+        a[i][(i + 1) % n] += 4.0 / 6.0;
+        a[i][(i + 2) % n] += 1.0 / 6.0;
     }
     let solve_axis = |coord: &dyn Fn(&Point3) -> f64| -> Result<Vec<f64>, &'static str> {
         let rhs: Vec<f64> = points.iter().map(coord).collect();
@@ -3174,6 +3179,14 @@ pub fn skin_surface_periodic_u(
     }
     let knots_u = knots_u.ok_or("skin_surface_periodic_u: no sections")?;
     let m_u = row_ctrl[0].len(); // n_u + DEG_U
+                                 // Normalize the periodic U-knots so the closed-loop domain maps to [0,1]
+                                 // (affine, geometry-preserving) — the param convention the loft seam/edge
+                                 // code and the rest of the kernel expect.
+    let knots_u: Vec<f64> = {
+        let lo = knots_u[DEG_U];
+        let hi = knots_u[knots_u.len() - DEG_U - 1];
+        knots_u.iter().map(|k| (k - lo) / (hi - lo)).collect()
+    };
 
     // Stage 2 — clamped degree_v interpolate down each U control column.
     let mut knots_v: Option<Vec<f64>> = None;
@@ -3225,8 +3238,8 @@ mod tests {
             .collect();
         let surf = skin_surface_periodic_u(&sections, 3).expect("periodic skin");
 
-        let u0 = 3.0;
-        let u1 = (n_u + 3) as f64; // U domain [DEG_U, n_u+DEG_U]
+        let u0 = 0.0;
+        let u1 = 1.0; // U domain normalized to [0, 1]
         let samples = 240;
 
         // Bottom section (v=0): the U-loop closes and stays on the r=2 circle (a
