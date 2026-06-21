@@ -353,7 +353,6 @@ export function SketchPanel() {
     sketch.circleSegments,
     sketch.editingSourceObjectId,
     sketch.plane,
-    sketch.points,
     sketch.shapes,
     sketch.thickness,
     sketch.tool,

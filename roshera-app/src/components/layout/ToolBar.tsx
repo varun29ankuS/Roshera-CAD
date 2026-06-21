@@ -99,7 +99,7 @@ async function sendDirectGeometry(
 ) {
   const { addMessage, setProcessing } = useChatStore.getState()
   const label = `${shapeType} (${Object.entries(parameters).map(([k, v]) => `${k}=${v}`).join(', ')})`
-  // eslint-disable-next-line no-console
+   
   console.log('[toolbar] sendDirectGeometry click', { shapeType, parameters, url: `${API_BASE}/geometry` })
   addMessage({ role: 'user', content: `Create ${label}` })
   setProcessing(true)
@@ -115,17 +115,17 @@ async function sendDirectGeometry(
       }),
     })
 
-    // eslint-disable-next-line no-console
+     
     console.log('[toolbar] /api/geometry response', { ok: resp.ok, status: resp.status, statusText: resp.statusText })
     if (!resp.ok) {
       const errBody = await resp.text().catch(() => '')
-      // eslint-disable-next-line no-console
+       
       console.error('[toolbar] /api/geometry error body:', errBody)
       throw new Error(`${resp.status} ${errBody}`)
     }
 
     const data = await resp.json()
-    // eslint-disable-next-line no-console
+     
     console.log('[toolbar] /api/geometry data', {
       success: data?.success,
       objectId: data?.object?.id,
@@ -148,7 +148,7 @@ async function sendDirectGeometry(
     })
   } catch (err) {
     // Direct API unavailable — fall back to NLP pipeline
-    // eslint-disable-next-line no-console
+     
     console.warn('[toolbar] direct geometry failed, falling back to NLP', err)
     await processUserMessage(`create a ${shapeType} ${Object.entries(parameters).map(([k, v]) => `${k} ${v}`).join(' ')}`)
   } finally {

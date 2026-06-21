@@ -84,7 +84,7 @@ export function CADViewport() {
     planeNormal[axisIndex] = sign
     let cancelled = false
     const t = window.setTimeout(() => {
-      // eslint-disable-next-line no-console
+       
       console.log(
         '[section] requesting preview',
         'origin=',
@@ -94,7 +94,7 @@ export function CADViewport() {
       )
       fetchSectionPreview(planeOrigin, planeNormal)
         .then((caps) => {
-          // eslint-disable-next-line no-console
+           
           console.log(
             '[section] got',
             caps.length,
@@ -108,7 +108,7 @@ export function CADViewport() {
           if (!cancelled) setSectionCaps(caps)
         })
         .catch((err) => {
-          // eslint-disable-next-line no-console
+           
           console.warn('[section] preview fetch failed:', err)
         })
     }, 50)

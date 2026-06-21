@@ -134,7 +134,7 @@ export async function exportSceneAs(format: string): Promise<ExportResult> {
         if (err instanceof DOMException && err.name === 'AbortError') {
           return { ok: true, filename: meta.filename }
         }
-        // eslint-disable-next-line no-console
+         
         console.warn('showSaveFilePicker failed, falling back:', err)
       }
     }
