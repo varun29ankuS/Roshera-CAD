@@ -4181,38 +4181,91 @@ fn tessellate_revolution_wedge(
     }
 
     // Position at grid node (i, j): boundary nodes come verbatim from the cache
-    // chains (so shared seams are bit-exact); interior nodes are a bilinear
-    // Coons blend of the four boundaries — purely boundary-driven, no surface
-    // re-evaluation, and exact for the developable wedge.
-    let c0 = a[0];
-    let c1 = a[n - 1];
-    let c2 = b[m - 1];
-    let c3 = c[n - 1];
+    // chains (so shared seams are bit-exact). INTERIOR nodes are the seam meridian
+    // ROTATED about the axis — the exact surface-of-revolution point — NOT a Coons
+    // blend. A Coons blend is exact only for a DEVELOPABLE wedge (a cone/cylinder
+    // band); for a meridian with internal curvature (a throated nozzle, a barrel)
+    // it overshoots, pushing interior vertices OFF the surface and spiking the seam
+    // (the deformed-nozzle bug — a Ø104 wall reaching r≈60 at the seam, not even
+    // rotationally symmetric). Rotating a cached boundary about the surface's TRUE
+    // axis keeps interior vertices exactly on the surface; boundaries stay verbatim
+    // (watertight weld preserved).
+    let (ox, oy, oz, dx, dy, dz) = model
+        .surfaces
+        .get(face.surface_id)
+        .and_then(|s| {
+            s.as_any()
+                .downcast_ref::<crate::primitives::surface::SurfaceOfRevolution>()
+        })
+        .map(|sr| {
+            let (o, d) = (sr.axis_origin, sr.axis_direction);
+            let dl = (d.x * d.x + d.y * d.y + d.z * d.z).sqrt().max(1e-12);
+            (o.x, o.y, o.z, d.x / dl, d.y / dl, d.z / dl)
+        })
+        .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0, 1.0));
+    let radial = |p: Point3| -> (f64, f64, f64) {
+        let (vx, vy, vz) = (p.x - ox, p.y - oy, p.z - oz);
+        let dot = vx * dx + vy * dy + vz * dz;
+        (vx - dx * dot, vy - dy * dot, vz - dz * dot)
+    };
+    let signed_angle = |r0: (f64, f64, f64), p: Point3| -> f64 {
+        let (rx, ry, rz) = radial(p);
+        let (cx, cy, cz) = (
+            r0.1 * rz - r0.2 * ry,
+            r0.2 * rx - r0.0 * rz,
+            r0.0 * ry - r0.1 * rx,
+        );
+        (cx * dx + cy * dy + cz * dz).atan2(r0.0 * rx + r0.1 * ry + r0.2 * rz)
+    };
+    let rotate = |p: Point3, ang: f64| -> Point3 {
+        let (vx, vy, vz) = (p.x - ox, p.y - oy, p.z - oz);
+        let dot = vx * dx + vy * dy + vz * dz;
+        let (ax, ay, az) = (dx * dot, dy * dot, dz * dot);
+        let (rx, ry, rz) = (vx - ax, vy - ay, vz - az);
+        let (tx, ty, tz) = (dy * rz - dz * ry, dz * rx - dx * rz, dx * ry - dy * rx);
+        let (cs, sn) = (ang.cos(), ang.sin());
+        Point3::new(
+            ox + ax + rx * cs + tx * sn,
+            oy + ay + ry * cs + ty * sn,
+            oz + az + rz * cs + tz * sn,
+        )
+    };
+    // Which boundary direction is the SEAM (constant angle) vs the RING (sweeps the
+    // wedge angle)? `a`/`c` are one opposite pair, `b`/`d` the other, so exactly one
+    // pair is the seams; the seam's angular span is ~0, the ring's is the wedge angle.
+    let ang_span = |ch: &[Point3]| -> f64 {
+        let r0 = radial(ch[0]);
+        let (mut lo, mut hi) = (0.0_f64, 0.0_f64);
+        for &p in ch {
+            let aa = signed_angle(r0, p);
+            lo = lo.min(aa);
+            hi = hi.max(aa);
+        }
+        hi - lo
+    };
+    let a_is_seam = ang_span(a) <= ang_span(d);
+    let (ra0, rb0) = (radial(a[0]), radial(b[0]));
     let node = |i: usize, j: usize| -> Point3 {
         if j == 0 {
-            return a[i]; // c0 → c1
+            return a[i];
         }
         if j == m - 1 {
-            return c[n - 1 - i]; // c3 → c2
+            return c[n - 1 - i];
         }
         if i == 0 {
-            return d[m - 1 - j]; // c0 → c3
+            return d[m - 1 - j];
         }
         if i == n - 1 {
-            return b[j]; // c1 → c2
+            return b[j];
         }
-        let s = i as f64 / (n - 1) as f64;
-        let t = j as f64 / (m - 1) as f64;
-        let bottom = a[i];
-        let top = c[n - 1 - i];
-        let left = d[m - 1 - j];
-        let right = b[j];
-        // Coons bilinear transfinite interpolation.
-        left * (1.0 - s) + right * s + bottom * (1.0 - t) + top * t
-            - (c0 * ((1.0 - s) * (1.0 - t))
-                + c1 * (s * (1.0 - t))
-                + c2 * (s * t)
-                + c3 * ((1.0 - s) * t))
+        // Interior = a cached boundary rotated to the node's angle (exact). If `a`
+        // is the seam, rotate a[i] by column j's angle (from ring b); otherwise `a`
+        // is the ring, so rotate the seam d[m-1-j] by row i's angle (from ring a).
+        if a_is_seam {
+            rotate(a[i], signed_angle(rb0, b[j]))
+        } else {
+            rotate(d[m - 1 - j], signed_angle(ra0, a[i]))
+        }
     };
 
     // Emit grid vertices. Shading normals are taken from local grid tangents
