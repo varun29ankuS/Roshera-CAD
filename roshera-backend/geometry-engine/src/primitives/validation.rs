@@ -236,12 +236,14 @@ pub enum ValidationWarning {
         location: EntityLocation,
         accumulated: f64,
     },
-    /// An edge/vertex does not lie on its face's surface within tolerance — a
-    /// geometric inconsistency (B1 consistency check). Emitted as a WARNING for
-    /// now: it surfaces genuine but pre-existing op defects (e.g. fillet/chamfer
-    /// trim edges that sit slightly off a planar face), and promoting it to a
-    /// blocking error would break those ops until the trim geometry is fixed.
-    /// `geometry_valid` is set false when any of these are present.
+    /// An edge of a CURVED face (NURBS / ruled / revolution / offset) lies off
+    /// its face's surface by more than a conservative (u,v)-grid upper bound
+    /// (B1 consistency check, slice 1b). This is an APPROXIMATION (the grid is
+    /// an upper bound on the true distance), so it is emitted as a NON-blocking
+    /// WARNING and must never hard-fail an op — it only sets `geometry_valid`
+    /// false. The EXACT checks (1a analytic edge-on-surface, 1c degenerate face,
+    /// #70 planar self-overlap, #24 shell self-intersection) are BLOCKING and
+    /// emit `ValidationError::GeometryError` instead.
     GeometryInconsistency {
         location: EntityLocation,
         distance: f64,
@@ -501,18 +503,27 @@ impl ParallelValidator {
         // revolution surfaces use an iterative `closest_point` that can
         // false-negative at seams, so checking them this way would WRONGLY fail
         // valid curved geometry — those get a direct (u,v)-sampling slice next.
+        //
+        // SCOPED PROMOTION (B1): the EXACT checks below — 1a (analytic
+        // edge-on-surface), 1c (degenerate face) and #70 (planar self-overlap)
+        // — are BLOCKING: they emit `ValidationError::GeometryError`, so a
+        // geometrically-inconsistent result FAILS validation (an op that
+        // validates its output returns `Err`). Only 1b (the conservative
+        // curved-surface (u,v)-grid upper bound, an APPROXIMATION) stays a
+        // non-blocking `ValidationWarning` — it must never hard-fail a valid op.
         let face_ids: Vec<FaceId> = (0..model.faces.len() as u32).collect();
-        let warnings: Vec<ValidationWarning> = face_ids
+        let face_findings: Vec<(Vec<ValidationError>, Vec<ValidationWarning>)> = face_ids
             .par_iter()
-            .flat_map(|&face_id| {
+            .map(|&face_id| {
+                let mut errs: Vec<ValidationError> = Vec::new();
                 let mut warns: Vec<ValidationWarning> = Vec::new();
                 let face = match model.faces.get(face_id) {
                     Some(f) => f,
-                    None => return warns,
+                    None => return (errs, warns),
                 };
                 let surface = match model.surfaces.get(face.surface_id) {
                     Some(s) => s,
-                    None => return warns,
+                    None => return (errs, warns),
                 };
 
                 // 1c — DEGENERATE FACE: an outer loop that collapses to ~a point
@@ -536,7 +547,8 @@ impl ParallelValidator {
                     }
                     let diag = mn.distance(&mx);
                     if diag < tolerance.distance() {
-                        warns.push(ValidationWarning::GeometryInconsistency {
+                        // 1c — BLOCKING (exact).
+                        errs.push(ValidationError::GeometryError {
                             location: EntityLocation {
                                 solid_id: None,
                                 shell_id: None,
@@ -545,7 +557,6 @@ impl ParallelValidator {
                                 edge_id: None,
                                 vertex_id: None,
                             },
-                            distance: diag,
                             message: format!(
                                 "face {face_id} is degenerate: outer loop spans only {diag:.3e}"
                             ),
@@ -636,7 +647,7 @@ impl ParallelValidator {
                             }
                         }
                     }
-                    return warns;
+                    return (errs, warns);
                 }
 
                 let mut loop_ids = vec![face.outer_loop];
@@ -680,7 +691,8 @@ impl ParallelValidator {
                             })
                             .fold(0.0_f64, f64::max);
                         if max_off > tolerance.distance() {
-                            warns.push(ValidationWarning::GeometryInconsistency {
+                            // 1a — BLOCKING (exact analytic closest_point).
+                            errs.push(ValidationError::GeometryError {
                                 location: EntityLocation {
                                     solid_id: None,
                                     shell_id: None,
@@ -689,7 +701,6 @@ impl ParallelValidator {
                                     edge_id: Some(edge_id),
                                     vertex_id: None,
                                 },
-                                distance: max_off,
                                 message: format!(
                                     "edge {edge_id} lies {max_off:.3e} off face {face_id}'s {} surface",
                                     surface.type_name()
@@ -698,22 +709,28 @@ impl ParallelValidator {
                         }
                     }
                 }
-                warns
+                (errs, warns)
             })
             .collect();
+
+        let mut errors: Vec<ValidationError> = Vec::new();
+        let mut warnings: Vec<ValidationWarning> = Vec::new();
+        for (errs, warns) in face_findings {
+            errors.extend(errs);
+            warnings.extend(warns);
+        }
 
         // Per-solid: planar-face boundary SELF-OVERLAP (#70 — the chamfer-crosses-
         // fillet class, where a topologically-clean planar face's boundary loop
         // geometrically crosses itself). Cheap + exact for planar faces (a
-        // projected-polygon crossing in the face's own plane).
-        let mut warnings = warnings;
+        // projected-polygon crossing in the face's own plane). BLOCKING (exact).
         let solid_ids: Vec<SolidId> = (0..model.solids.len() as u32).collect();
-        let overlaps: Vec<ValidationWarning> = solid_ids
+        let overlaps: Vec<ValidationError> = solid_ids
             .par_iter()
             .flat_map(|&sid| {
                 crate::operations::geometry_validity::self_overlapping_planar_faces(model, sid)
                     .into_iter()
-                    .map(move |fid| ValidationWarning::GeometryInconsistency {
+                    .map(move |fid| ValidationError::GeometryError {
                         location: EntityLocation {
                             solid_id: Some(sid),
                             shell_id: None,
@@ -722,7 +739,6 @@ impl ParallelValidator {
                             edge_id: None,
                             vertex_id: None,
                         },
-                        distance: 0.0,
                         message: format!(
                             "planar face {fid} of solid {sid} self-overlaps (boundary loop crosses itself)"
                         ),
@@ -730,9 +746,9 @@ impl ParallelValidator {
                     .collect::<Vec<_>>()
             })
             .collect();
-        warnings.extend(overlaps);
+        errors.extend(overlaps);
 
-        GeometryValidationResults { warnings }
+        GeometryValidationResults { errors, warnings }
     }
 
     fn validate_deep_parallel(
@@ -746,15 +762,14 @@ impl ParallelValidator {
         // non-adjacent faces cross is not a real solid — the verification gap this
         // closes. `mesh_self_intersects` tessellates the solid and runs an O(n²)
         // triangle-pair scan, so it is a DEEP-level check (not run at Standard).
-        // Surfaced as a warning (geometry_valid → false) rather than a hard error
-        // so it doesn't break ops mid-pipeline.
+        // BLOCKING (exact): a positive hit makes validation FAIL.
         let chord = tolerance.distance().max(1.0e-3);
         let solid_ids: Vec<SolidId> = (0..model.solids.len() as u32).collect();
-        let warnings: Vec<ValidationWarning> = solid_ids
+        let errors: Vec<ValidationError> = solid_ids
             .par_iter()
             .filter_map(|&sid| {
                 if crate::harness::self_intersection::mesh_self_intersects(model, sid, chord) {
-                    Some(ValidationWarning::GeometryInconsistency {
+                    Some(ValidationError::GeometryError {
                         location: EntityLocation {
                             solid_id: Some(sid),
                             shell_id: None,
@@ -763,7 +778,6 @@ impl ParallelValidator {
                             edge_id: None,
                             vertex_id: None,
                         },
-                        distance: 0.0,
                         message: format!(
                             "solid {sid} self-intersects (non-adjacent shell faces cross)"
                         ),
@@ -774,7 +788,7 @@ impl ParallelValidator {
             })
             .collect();
 
-        DeepValidationResults { warnings }
+        DeepValidationResults { errors }
     }
 
     fn analyze_edge_usage_parallel(&self, model: &BRepModel) -> DashMap<EdgeId, EdgeUsage> {
@@ -841,21 +855,24 @@ impl ParallelValidator {
         // Add gap errors
         all_errors.extend(topology.gap_errors);
 
-        // B1: geometric-consistency findings now genuinely set `geometry_valid`
-        // (it was hardcoded `true`, so a geometrically-broken-but-topologically-
-        // wellformed solid certified as sound — the central "kernel can lie" bug).
-        // They are surfaced as WARNINGS, not errors: they catch genuine but
-        // pre-existing op defects (e.g. fillet/chamfer trim edges sitting slightly
-        // off a planar face), and adding them to the error list would break ops
-        // that validate their own result. `is_valid` stays gated on hard errors so
-        // the pipeline isn't broken; promote to errors once the trim geometry is
-        // fixed (the underlying op bug becomes the next target).
-        // Deep-level self-intersection findings (#24) join the geometry findings:
-        // both set geometry_valid false and surface as warnings (Standard runs the
-        // cheap geometry checks; Deep adds the O(n²) mesh self-intersection scan).
-        let geometry_valid = geometry.warnings.is_empty() && deep.warnings.is_empty();
+        // B1 (SCOPED PROMOTION): geometric-consistency findings set
+        // `geometry_valid` (it was once hardcoded `true`, so a geometrically-
+        // broken-but-topologically-wellformed solid certified as sound — the
+        // central "kernel can lie" bug). The EXACT checks (1a analytic
+        // edge-on-surface, 1c degenerate face, #70 planar self-overlap, #24 shell
+        // self-intersection) are now BLOCKING: they enter `all_errors`, so a
+        // geometrically-inconsistent result FAILS validation (`is_valid = false`)
+        // and an op that validates its own output returns `Err` instead of a
+        // flagged-but-usable solid. The CONSERVATIVE check (1b — the curved-surface
+        // (u,v)-grid upper bound) stays a NON-blocking WARNING: it is an
+        // approximation and must never hard-fail a valid op.
+        // Standard level runs the cheap geometry checks; Deep adds the O(n²) mesh
+        // self-intersection scan (its findings are blocking too).
+        let geometry_valid =
+            geometry.errors.is_empty() && geometry.warnings.is_empty() && deep.errors.is_empty();
+        all_errors.extend(geometry.errors);
+        all_errors.extend(deep.errors);
         all_warnings.extend(geometry.warnings);
-        all_warnings.extend(deep.warnings);
 
         let is_valid = all_errors.is_empty();
         let topology_valid = all_errors
@@ -1156,12 +1173,19 @@ struct TopologyValidationResults {
 
 #[derive(Default)]
 struct GeometryValidationResults {
+    /// BLOCKING geometric-consistency findings (B1 slices 1a/1c/#70) — EXACT
+    /// checks that make validation FAIL (contribute to `is_valid = false`).
+    errors: Vec<ValidationError>,
+    /// NON-BLOCKING findings (B1 slice 1b — the conservative curved-surface
+    /// (u,v)-grid upper bound). Approximate, so it can only ever warn.
     warnings: Vec<ValidationWarning>,
 }
 
 #[derive(Default)]
 struct DeepValidationResults {
-    warnings: Vec<ValidationWarning>,
+    /// BLOCKING shell-self-intersection findings (#24) — an EXACT mesh-pair
+    /// scan, so a positive hit makes validation FAIL.
+    errors: Vec<ValidationError>,
 }
 
 /// Validate entire B-Rep model (enhanced entry point)
