@@ -209,13 +209,25 @@ pub fn tessellate_face(
         // routes to the structured cache-driven grid — curved-CDT's NURBS
         // `closest_point` boundary inversion is unreliable at the seam and emits
         // an empty mesh. Open NURBS patches keep the curved-CDT path.
+        //
+        // The seam test is `is_periodic_u`, NOT `is_closed_u`: a genuinely
+        // PERIODIC-U skin (the `skin_surface_periodic_u` wall — wrapped control
+        // net, smooth C2 seam) closes onto itself at u=0≡u=1 exactly like the
+        // clamped-repeated skin but its first/last control rows differ, so
+        // `is_closed_u` misses it. Routed to curved-CDT the periodic wall's
+        // boundary→(u,v) inversion zig-zags across the seam, the winding test
+        // then rejects EVERY interior Steiner point, and the wall tessellates as
+        // a single rim-to-rim band — a geometrically collapsed mesh (a tapered
+        // nozzle read as a straight tube). The structured skin-lateral grid
+        // samples (u,v) directly and is watertight by construction for both
+        // representations.
         "NurbsSurface" => {
             // CF-γ.7 corner-cap apex fan: a small degenerate-column
             // triangular cap (3-rim loop + apex hint) that curved-CDT's
             // UV inversion rejects. Welds via the cached rim; falls
             // through for every other NURBS face.
             if tessellate_corner_cap_apex_fan(face, model, surface, cache, mesh) {
-            } else if !(surface.is_closed_u()
+            } else if !(surface.is_periodic_u()
                 && tessellate_nurbs_skin_lateral(surface, face, model, params, cache, mesh))
             {
                 tessellate_nurbs_face(face, model, params, cache, mesh);
