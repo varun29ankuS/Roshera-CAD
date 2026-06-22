@@ -182,7 +182,12 @@ RISK: stricter validation will surface genuine defects (incl. some of the 27 red
 ## PROGRESS LOG (append-only)
 - 2026-06-22 (Varun awake): A12 STEP SURFACE_OF_REVOLUTION export (5090eaf, backend rebuilt+live on 8081 for FreeCAD verify); small-safe sweep A3/A9/CADMesh (7650d16, c961af5); CI investigated (red, 27 tests, mostly #17).
 - ★ B1 SLICE 1a DONE+PUSHED (a2afa7b): geometric-consistency validation — validate_geometry_parallel now checks every analytic face's edges lie on its surface (exact closest_point); geometry_valid is HONEST (no longer hardcoded true). FINDING: on its FIRST run it caught a genuine pre-existing defect — fillet_edges produces trim edges that sit measurably off the planar face they border. Landed as ValidationWarning::GeometryInconsistency (edge+distance) NOT errors, so geometry_valid is honest WITHOUT breaking ops that validate their result. lib 3847 pass (only the 2 pre-existing).
-- B1 REMAINING: (next target) FIX the fillet/chamfer trim-edge-off-plane defect B1 surfaced → then PROMOTE the consistency check from warning to blocking error. Then SLICE 1b curved-surface consistency (direct (u,v) sampling, not closest_point), 1c planar-flatness + degenerate faces, SLICE 2 self-intersection (#24, pairwise face-face SSI w/ BVH broadphase).
+- ★ B1 SUBSTANTIALLY COMPLETE (the verification moat now inspects GEOMETRY, not just topology):
+  - 1a analytic edge-on-surface consistency (a2afa7b) — caught a real fillet trim-edge defect on first run.
+  - 1b curved-surface consistency (conservative (u,v)-grid upper-bound) + 1c degenerate faces (e0e0560).
+  - Slice 2 (a5bf9ac): self_overlapping_planar_faces #70 (Standard) + mesh_self_intersects #24 (Deep) — closes the "shell self-intersection isn't in the cert" gap.
+  - All feed an HONEST geometry_valid; surfaced as ValidationWarning::GeometryInconsistency (located + distance) so the cert stops lying WITHOUT breaking ops.
+- B1 FOLLOW-UPS (open): (1) ★ FIX the fillet/chamfer trim-edge-off-plane defect B1 found → then PROMOTE the consistency findings from warnings to BLOCKING errors (catch→enforce). (2) finer pcurve-based curved-surface check (replace the coarse grid). (3) manufacturing_valid still hardcoded true (separate moat dimension). (4) consider running #24 self-intersection at Standard for ops that opt in.
 - 2026-06-21 night: launched 10 audit agents; created this campaign; STEP-export faceting diagnosed.
 - All 10 audits in. 9 safe fixes committed+pushed (fc7c185, a5c5021, b45280e). A12 deferred (fix-path documented). Morning summary written at top.
 - 2026-06-22 (Varun awake, "sweep the small safe ones"): A3 ellipse evaluate_derivatives + A9 vertex remove underflow (7650d16), CADMesh Three.js dispose leak (c961af5). 11 fixes total now pushed.
