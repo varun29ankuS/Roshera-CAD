@@ -4731,6 +4731,42 @@ impl Surface for GeneralNurbsSurface {
         }
     }
 
+    /// Whether the surface seams onto itself in U — i.e. `S(u_min, v)` and
+    /// `S(u_max, v)` are the same physical curve.
+    ///
+    /// `is_closed_u` only catches the CLAMPED-and-repeated representation
+    /// (first control-point row == last). A genuinely PERIODIC NURBS built by
+    /// `skin_surface_periodic_u` instead WRAPS the control net (`m_u = n_u +
+    /// degree_u` rows, the first `degree_u` rows duplicated at the end) so its
+    /// first and last control rows differ even though the surface still closes
+    /// smoothly at the seam. Detect closure GEOMETRICALLY by comparing
+    /// `S(u_min, v)` with `S(u_max, v)` over a short `v` sweep. Drives
+    /// `period_u`, which the tessellation boundary unwrap and the boolean
+    /// face-arrangement both need to treat the seam as wrapping.
+    fn is_periodic_u(&self) -> bool {
+        if self.is_closed_u() {
+            return true;
+        }
+        let ((u_min, u_max), (v_min, v_max)) = self.parameter_bounds();
+        if !(u_max > u_min) {
+            return false;
+        }
+        const SAMPLES: usize = 5;
+        const SEAM_TOL: f64 = 1e-7;
+        for k in 0..=SAMPLES {
+            let t = k as f64 / SAMPLES as f64;
+            let v = v_min + (v_max - v_min) * t;
+            let (a, b) = match (self.point_at(u_min, v), self.point_at(u_max, v)) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => return false,
+            };
+            if (a - b).magnitude() > SEAM_TOL {
+                return false;
+            }
+        }
+        true
+    }
+
     fn is_closed_v(&self) -> bool {
         // Check if first and last control point columns are the same
         if !self.nurbs.control_points.is_empty() && !self.nurbs.control_points[0].is_empty() {
