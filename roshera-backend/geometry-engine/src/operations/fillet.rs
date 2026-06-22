@@ -5900,17 +5900,42 @@ fn create_fillet_transitions(
             // synthesizer in `synthesize_mixed_kind_corner_cap_g1`;
             // CF-γ.6.3 lifts the seed CPs to the coupled solver.
             let cap_face_ids: Vec<FaceId> = match seam_continuity {
-                SeamContinuity::C0 => vec![
-                    super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                        model,
-                        solid_id,
-                        corner.id,
-                        &cap_edges_with_kind,
-                        vertex_outward,
-                        Tolerance::default().distance(),
-                        BlendKind::Fillet,
-                    )?,
-                ],
+                SeamContinuity::C0 => {
+                    // #70 fix: a flat planar cap cannot bound fillet (arc) rims.
+                    // A unit fillet's V-side cap arc bulges ~0.24 out of the plane
+                    // through the three corner endpoints, so the planar cap face's
+                    // own edges leave its surface AND the bulge self-overlaps the
+                    // adjacent planar faces (the chamfer-crosses-fillet class). When
+                    // ANY rim is an arc, build the curved cap, which interpolates
+                    // the arc rims exactly. An all-linear (pure-chamfer) corner
+                    // stays a correct flat planar cap.
+                    if cap_edges_with_kind
+                        .iter()
+                        .any(|(_, k)| matches!(k, super::mixed_kind_corner_cap::RimKind::ArcRim))
+                    {
+                        super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                            model,
+                            solid_id,
+                            corner.id,
+                            &cap_edges_with_kind,
+                            vertex_outward,
+                            Tolerance::default().distance(),
+                            BlendKind::Fillet,
+                        )?
+                    } else {
+                        vec![
+                            super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                                model,
+                                solid_id,
+                                corner.id,
+                                &cap_edges_with_kind,
+                                vertex_outward,
+                                Tolerance::default().distance(),
+                                BlendKind::Fillet,
+                            )?,
+                        ]
+                    }
+                }
                 SeamContinuity::G1 => {
                     super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
                         model,
