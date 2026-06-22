@@ -3827,32 +3827,29 @@ impl Curve for Ellipse {
         let cos_t = t.cos();
         let sin_t = t.sin();
 
-        if order >= 1 {
-            // First derivative (tangent)
-            let d1 = self.major_axis * (-self.major_length * sin_t)
-                + self.minor_axis * (self.minor_length * cos_t);
-            derivatives.push(d1);
-        }
+        // The 0th "derivative" is the position itself — every other curve impl
+        // (Arc, Line, NURBS) pushes it at index 0. Omitting it made
+        // evaluate_derivatives(t, 0) return an EMPTY Vec and shifted every higher
+        // derivative down by one index.
+        let local_pos = self.major_axis * (self.major_length * cos_t)
+            + self.minor_axis * (self.minor_length * sin_t);
+        derivatives.push(self.center + local_pos);
 
-        if order >= 2 {
-            // Second derivative
-            let d2 = self.major_axis * (-self.major_length * cos_t)
-                + self.minor_axis * (-self.minor_length * sin_t);
-            derivatives.push(d2);
-        }
-
-        // Higher order derivatives for ellipse follow pattern (3rd and beyond)
-        for i in 3..=order {
-            // Sign cycles {+, -, -, +} every 4 derivatives
-            let factor = match i % 4 {
-                0 | 3 => 1.0,
-                _ => -1.0,
+        // n-th derivative (n >= 1): the major (cos) term differentiates as
+        // cos(t + nπ/2), the minor (sin) term as sin(t + nπ/2). The two axes are
+        // 90° out of phase, so the old code's single shared trig factor was wrong
+        // from the 3rd derivative onward.
+        for n in 1..=order {
+            let (major_trig, minor_trig) = match n % 4 {
+                0 => (cos_t, sin_t),
+                1 => (-sin_t, cos_t),
+                2 => (-cos_t, -sin_t),
+                _ => (sin_t, -cos_t),
             };
-            let trig_factor = if i % 2 == 0 { cos_t } else { sin_t };
-
-            let d = self.major_axis * (factor * self.major_length * trig_factor)
-                + self.minor_axis * (factor * self.minor_length * trig_factor);
-            derivatives.push(d);
+            derivatives.push(
+                self.major_axis * (self.major_length * major_trig)
+                    + self.minor_axis * (self.minor_length * minor_trig),
+            );
         }
 
         Ok(derivatives)
