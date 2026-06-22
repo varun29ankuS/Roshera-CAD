@@ -741,8 +741,8 @@ fn unwrap_cycle_uv(
         mids.push(uv);
     }
 
-    let period_u = surface.period_u();
-    let period_v = surface.period_v();
+    let period_u = effective_period_u(surface);
+    let period_v = effective_period_v(surface);
 
     // Anchor first vertex — its raw (u, v) is taken as-is. To match
     // it against the first edge's midpoint we still allow the midpoint
@@ -768,6 +768,97 @@ fn unwrap_cycle_uv(
     }
 
     Some(uvs)
+}
+
+/// Period of the surface's U domain **as the boolean face arrangement needs
+/// it**: the U-span over which a cut cycle may wrap across the seam.
+///
+/// `surface.period_u()` reports a period only when the surface advertises
+/// itself as periodic/closed in U. That signal is correct for the analytic
+/// primitives and the CLAMPED-and-repeated NURBS skin (first control row ==
+/// last). It is **silent** for a genuinely PERIODIC NURBS built by
+/// `skin_surface_periodic_u`, whose control net is WRAPPED (`m_u = n_u +
+/// degree_u` rows, the first `degree_u` duplicated at the end) so the
+/// first/last control rows differ even though `S(u_min, v) == S(u_max, v)`
+/// for every `v` — a smooth closed seam. Without a period the cycle-area
+/// unwrap leaves a seam-crossing complement cycle wrapped, so its shoelace
+/// area comes out tiny-and-negative and `extract_regions` discards it as the
+/// outer face — the lofted-barrel boolean then drops the entire freeform wall
+/// (#23.3 regression).
+///
+/// This helper takes the advertised period when present, and otherwise probes
+/// the surface GEOMETRICALLY: if `S(u_min, v) == S(u_max, v)` at several `v`
+/// samples the domain is closed in U and the span is its period. The probe is
+/// confined to this module (the arrangement), so the surface's globally-
+/// reported periodicity — and therefore its tessellation routing — is
+/// unchanged.
+fn effective_period_u(surface: &dyn Surface) -> Option<f64> {
+    if let Some(p) = surface.period_u() {
+        return Some(p);
+    }
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    if seam_closes_in_u(surface, u_min, u_max, v_min, v_max) {
+        Some(u_max - u_min)
+    } else {
+        None
+    }
+}
+
+/// V-axis analogue of [`effective_period_u`].
+fn effective_period_v(surface: &dyn Surface) -> Option<f64> {
+    if let Some(p) = surface.period_v() {
+        return Some(p);
+    }
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    if seam_closes_in_v(surface, u_min, u_max, v_min, v_max) {
+        Some(v_max - v_min)
+    } else {
+        None
+    }
+}
+
+/// Geometric closure probe: `true` when `S(u_min, v) == S(u_max, v)` across a
+/// short `v` sweep, i.e. the surface seams onto itself in U. A non-degenerate
+/// U-span is required; any evaluation failure is treated as "not closed".
+fn seam_closes_in_u(surface: &dyn Surface, u_min: f64, u_max: f64, v_min: f64, v_max: f64) -> bool {
+    if !(u_max > u_min) {
+        return false;
+    }
+    const SAMPLES: usize = 5;
+    const SEAM_TOL: f64 = 1e-7;
+    for k in 0..=SAMPLES {
+        let t = k as f64 / SAMPLES as f64;
+        let v = v_min + (v_max - v_min) * t;
+        let (a, b) = match (surface.point_at(u_min, v), surface.point_at(u_max, v)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return false,
+        };
+        if (a - b).magnitude() > SEAM_TOL {
+            return false;
+        }
+    }
+    true
+}
+
+/// V-axis analogue of [`seam_closes_in_u`]: `S(u, v_min) == S(u, v_max)`.
+fn seam_closes_in_v(surface: &dyn Surface, u_min: f64, u_max: f64, v_min: f64, v_max: f64) -> bool {
+    if !(v_max > v_min) {
+        return false;
+    }
+    const SAMPLES: usize = 5;
+    const SEAM_TOL: f64 = 1e-7;
+    for k in 0..=SAMPLES {
+        let t = k as f64 / SAMPLES as f64;
+        let u = u_min + (u_max - u_min) * t;
+        let (a, b) = match (surface.point_at(u, v_min), surface.point_at(u, v_max)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return false,
+        };
+        if (a - b).magnitude() > SEAM_TOL {
+            return false;
+        }
+    }
+    true
 }
 
 /// Return `value + k · period` for the `k ∈ {-1, 0, 1}` that minimises
