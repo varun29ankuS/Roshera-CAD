@@ -236,6 +236,17 @@ pub enum ValidationWarning {
         location: EntityLocation,
         accumulated: f64,
     },
+    /// An edge/vertex does not lie on its face's surface within tolerance — a
+    /// geometric inconsistency (B1 consistency check). Emitted as a WARNING for
+    /// now: it surfaces genuine but pre-existing op defects (e.g. fillet/chamfer
+    /// trim edges that sit slightly off a planar face), and promoting it to a
+    /// blocking error would break those ops until the trim geometry is fixed.
+    /// `geometry_valid` is set false when any of these are present.
+    GeometryInconsistency {
+        location: EntityLocation,
+        distance: f64,
+        message: String,
+    },
 }
 
 /// Enhanced model statistics
@@ -358,7 +369,7 @@ impl ParallelValidator {
             context.record_phase("geometry", phase_start.elapsed());
             results
         } else {
-            GeometryValidationResults
+            GeometryValidationResults::default()
         };
 
         // Phase 3: Deep validation (if needed)
@@ -473,11 +484,110 @@ impl ParallelValidator {
 
     fn validate_geometry_parallel(
         &self,
-        _model: &BRepModel,
-        _tolerance: Tolerance,
+        model: &BRepModel,
+        tolerance: Tolerance,
     ) -> GeometryValidationResults {
-        // Parallel geometry validation
-        GeometryValidationResults
+        use crate::primitives::surface::{Cone, Cylinder, Plane, Sphere, Torus};
+        use rayon::prelude::*;
+
+        // GEOMETRIC CONSISTENCY (B1 moat, slice 1a): every edge of a face must
+        // actually lie ON that face's surface — endpoints and interior curve
+        // samples. This catches geometry that is topologically well-formed but
+        // geometrically broken (an edge floating off its face, an orphaned
+        // sketch), which the old stub waved through with `geometry_valid: true`.
+        //
+        // Gated to ANALYTIC surfaces only (Plane/Cylinder/Cone/Sphere/Torus),
+        // where `contains_point` uses an exact `closest_point`. NURBS / ruled /
+        // revolution surfaces use an iterative `closest_point` that can
+        // false-negative at seams, so checking them this way would WRONGLY fail
+        // valid curved geometry — those get a direct (u,v)-sampling slice next.
+        let face_ids: Vec<FaceId> = (0..model.faces.len() as u32).collect();
+        let warnings: Vec<ValidationWarning> = face_ids
+            .par_iter()
+            .flat_map(|&face_id| {
+                let mut warns: Vec<ValidationWarning> = Vec::new();
+                let face = match model.faces.get(face_id) {
+                    Some(f) => f,
+                    None => return warns,
+                };
+                let surface = match model.surfaces.get(face.surface_id) {
+                    Some(s) => s,
+                    None => return warns,
+                };
+                let any = surface.as_any();
+                let analytic = any.is::<Plane>()
+                    || any.is::<Cylinder>()
+                    || any.is::<Cone>()
+                    || any.is::<Sphere>()
+                    || any.is::<Torus>();
+                if !analytic {
+                    return warns;
+                }
+
+                let mut loop_ids = vec![face.outer_loop];
+                loop_ids.extend(&face.inner_loops);
+                for &loop_id in &loop_ids {
+                    let loop_data = match model.loops.get(loop_id) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    for &edge_id in &loop_data.edges {
+                        let edge = match model.edges.get(edge_id) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        // Endpoints + interior curve samples.
+                        let mut points: Vec<Point3> = Vec::new();
+                        if let Some(v) = model.vertices.get(edge.start_vertex) {
+                            points.push(v.point());
+                        }
+                        if let Some(v) = model.vertices.get(edge.end_vertex) {
+                            points.push(v.point());
+                        }
+                        if let Some(curve) = model.curves.get(edge.curve_id) {
+                            let r = edge.param_range;
+                            for f in [0.25_f64, 0.5, 0.75] {
+                                let t = r.start + (r.end - r.start) * f;
+                                if let Ok(cp) = curve.evaluate(t) {
+                                    points.push(cp.position);
+                                }
+                            }
+                        }
+                        // Max distance of any sample off the face's surface.
+                        let max_off = points
+                            .iter()
+                            .filter_map(|p| {
+                                surface
+                                    .closest_point(p, tolerance)
+                                    .ok()
+                                    .and_then(|(u, v)| surface.point_at(u, v).ok())
+                                    .map(|sp| p.distance(&sp))
+                            })
+                            .fold(0.0_f64, f64::max);
+                        if max_off > tolerance.distance() {
+                            warns.push(ValidationWarning::GeometryInconsistency {
+                                location: EntityLocation {
+                                    solid_id: None,
+                                    shell_id: None,
+                                    face_id: Some(face_id),
+                                    loop_id: Some(loop_id),
+                                    edge_id: Some(edge_id),
+                                    vertex_id: None,
+                                },
+                                distance: max_off,
+                                message: format!(
+                                    "edge {edge_id} lies {max_off:.3e} off face {face_id}'s {} surface",
+                                    surface.type_name()
+                                ),
+                            });
+                        }
+                    }
+                }
+                warns
+            })
+            .collect();
+
+        GeometryValidationResults { warnings }
     }
 
     fn validate_deep_parallel(
@@ -535,7 +645,7 @@ impl ParallelValidator {
     fn combine_results(
         &self,
         topology: TopologyValidationResults,
-        _geometry: GeometryValidationResults,
+        geometry: GeometryValidationResults,
         _deep: DeepValidationResults,
         context: ValidationContext,
         _level: ValidationLevel,
@@ -553,6 +663,18 @@ impl ParallelValidator {
         // Add gap errors
         all_errors.extend(topology.gap_errors);
 
+        // B1: geometric-consistency findings now genuinely set `geometry_valid`
+        // (it was hardcoded `true`, so a geometrically-broken-but-topologically-
+        // wellformed solid certified as sound — the central "kernel can lie" bug).
+        // They are surfaced as WARNINGS, not errors: they catch genuine but
+        // pre-existing op defects (e.g. fillet/chamfer trim edges sitting slightly
+        // off a planar face), and adding them to the error list would break ops
+        // that validate their own result. `is_valid` stays gated on hard errors so
+        // the pipeline isn't broken; promote to errors once the trim geometry is
+        // fixed (the underlying op bug becomes the next target).
+        let geometry_valid = geometry.warnings.is_empty();
+        all_warnings.extend(geometry.warnings);
+
         let is_valid = all_errors.is_empty();
         let topology_valid = all_errors
             .iter()
@@ -563,7 +685,7 @@ impl ParallelValidator {
         ValidationResult {
             is_valid,
             topology_valid,
-            geometry_valid: true,
+            geometry_valid,
             manufacturing_valid: true,
             errors: all_errors,
             warnings: all_warnings,
@@ -851,7 +973,9 @@ struct TopologyValidationResults {
 }
 
 #[derive(Default)]
-struct GeometryValidationResults;
+struct GeometryValidationResults {
+    warnings: Vec<ValidationWarning>,
+}
 
 #[derive(Default)]
 struct DeepValidationResults;
@@ -1468,6 +1592,9 @@ impl std::fmt::Display for ValidationWarning {
                     "Tolerance accumulation risk at {:?}: {:.6}",
                     location, accumulated
                 )
+            }
+            ValidationWarning::GeometryInconsistency { message, .. } => {
+                write!(f, "{}", message)
             }
         }
     }
