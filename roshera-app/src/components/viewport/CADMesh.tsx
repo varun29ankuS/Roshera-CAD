@@ -153,6 +153,14 @@ export function CADMesh({ object, isHovered }: CADMeshProps) {
     })
   }, [object.material, editingSketch, clippingPlanes])
 
+  // Dispose GPU resources when geometry/material are replaced (every mesh edit
+  // swaps object.mesh / object.material, recomputing the memos) or when this
+  // mesh unmounts. useMemo does NOT auto-dispose, so without these each edit
+  // orphans the previous BufferGeometry + Material on the GPU — VRAM leaks
+  // across an edit session.
+  useEffect(() => () => geometry.dispose(), [geometry])
+  useEffect(() => () => material.dispose(), [material])
+
   const toggleSubElementSelection = useSceneStore((s) => s.toggleSubElementSelection)
   const addPendingPick = useAssemblyStore((s) => s.addPendingPick)
 
