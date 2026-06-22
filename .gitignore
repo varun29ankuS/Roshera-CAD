@@ -140,3 +140,6 @@ CD_API_DESIGN_SKETCH.md
 roshera-backend/geometry-engine/render_out/
 # Survey/diagnostic run logs
 roshera-backend/*.log
+
+# Session handoff docs (session-local notes, not part of the codebase)
+SESSION_HANDOFF_*.md
