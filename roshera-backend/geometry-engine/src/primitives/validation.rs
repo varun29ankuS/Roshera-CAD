@@ -514,6 +514,45 @@ impl ParallelValidator {
                     Some(s) => s,
                     None => return warns,
                 };
+
+                // 1c — DEGENERATE FACE: an outer loop that collapses to ~a point
+                // (zero spatial extent) is a face with no area, a real defect.
+                let mut loop_pts: Vec<Point3> = Vec::new();
+                if let Some(lp) = model.loops.get(face.outer_loop) {
+                    for &eid in &lp.edges {
+                        if let Some(e) = model.edges.get(eid) {
+                            if let Some(v) = model.vertices.get(e.start_vertex) {
+                                loop_pts.push(v.point());
+                            }
+                        }
+                    }
+                }
+                if loop_pts.len() >= 3 {
+                    let mut mn = loop_pts[0];
+                    let mut mx = loop_pts[0];
+                    for p in &loop_pts {
+                        mn = Point3::new(mn.x.min(p.x), mn.y.min(p.y), mn.z.min(p.z));
+                        mx = Point3::new(mx.x.max(p.x), mx.y.max(p.y), mx.z.max(p.z));
+                    }
+                    let diag = mn.distance(&mx);
+                    if diag < tolerance.distance() {
+                        warns.push(ValidationWarning::GeometryInconsistency {
+                            location: EntityLocation {
+                                solid_id: None,
+                                shell_id: None,
+                                face_id: Some(face_id),
+                                loop_id: Some(face.outer_loop),
+                                edge_id: None,
+                                vertex_id: None,
+                            },
+                            distance: diag,
+                            message: format!(
+                                "face {face_id} is degenerate: outer loop spans only {diag:.3e}"
+                            ),
+                        });
+                    }
+                }
+
                 let any = surface.as_any();
                 let analytic = any.is::<Plane>()
                     || any.is::<Cylinder>()
@@ -521,6 +560,82 @@ impl ParallelValidator {
                     || any.is::<Sphere>()
                     || any.is::<Torus>();
                 if !analytic {
+                    // 1b — CURVED SURFACE (NURBS / ruled / revolution / offset).
+                    // closest_point is iterative and false-negatives at seams, so
+                    // we use a (u,v) GRID UPPER BOUND: the min distance from an
+                    // edge sample to any grid point is an upper bound on the true
+                    // distance, and we warn only when it exceeds a few grid cells.
+                    // Coarse (catches gross edge-off-surface errors only) but it
+                    // CANNOT false-positive on grid resolution. A finer pcurve-
+                    // based check is a follow-up.
+                    let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+                    if u0.is_finite()
+                        && u1.is_finite()
+                        && v0.is_finite()
+                        && v1.is_finite()
+                        && u1 > u0
+                        && v1 > v0
+                    {
+                        const N: usize = 12;
+                        let mut grid: Vec<Point3> = Vec::new();
+                        for i in 0..=N {
+                            let u = u0 + (u1 - u0) * i as f64 / N as f64;
+                            for j in 0..=N {
+                                let v = v0 + (v1 - v0) * j as f64 / N as f64;
+                                if let Ok(p) = surface.point_at(u, v) {
+                                    grid.push(p);
+                                }
+                            }
+                        }
+                        let mut cell = 0.0_f64;
+                        for w in grid.windows(2) {
+                            cell = cell.max(w[0].distance(&w[1]));
+                        }
+                        let threshold = cell * 2.5;
+                        if grid.len() > 9 && threshold > 0.0 {
+                            let mut loops2 = vec![face.outer_loop];
+                            loops2.extend(&face.inner_loops);
+                            for &loop_id in &loops2 {
+                                let ld = match model.loops.get(loop_id) {
+                                    Some(l) => l,
+                                    None => continue,
+                                };
+                                for &edge_id in &ld.edges {
+                                    let edge = match model.edges.get(edge_id) {
+                                        Some(e) => e,
+                                        None => continue,
+                                    };
+                                    if let Some(curve) = model.curves.get(edge.curve_id) {
+                                        let r = edge.param_range;
+                                        let t = 0.5 * (r.start + r.end);
+                                        if let Ok(cp) = curve.evaluate(t) {
+                                            let min_d = grid
+                                                .iter()
+                                                .map(|g| cp.position.distance(g))
+                                                .fold(f64::INFINITY, f64::min);
+                                            if min_d > threshold {
+                                                warns.push(ValidationWarning::GeometryInconsistency {
+                                                    location: EntityLocation {
+                                                        solid_id: None,
+                                                        shell_id: None,
+                                                        face_id: Some(face_id),
+                                                        loop_id: Some(loop_id),
+                                                        edge_id: Some(edge_id),
+                                                        vertex_id: None,
+                                                    },
+                                                    distance: min_d,
+                                                    message: format!(
+                                                        "edge {edge_id} lies ~{min_d:.3e} off face {face_id}'s {} surface",
+                                                        surface.type_name()
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return warns;
                 }
 
