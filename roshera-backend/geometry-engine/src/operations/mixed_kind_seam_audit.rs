@@ -693,6 +693,53 @@ mod tests {
         );
     }
 
+    /// #70 regression — defect (1), the corner cap. Before the fix the C0 cap was
+    /// a flat plane fit through the three corner endpoints while two of its rims
+    /// were fillet arcs bulging ~0.24 OUT of that plane, so the cap face's own
+    /// edges lay off its surface. Routing the arc-containing C0 cap to the curved
+    /// builder keeps the arc rims ON the cap surface. (Defect (2) of #70 — the two
+    /// full-span trim tracks on the adjacent cube faces crossing in a bowtie — is
+    /// the deeper #72 "junction reconstruction" and is NOT fixed here; those
+    /// self-overlap warnings are expected until #72 lands.)
+    #[test]
+    fn mixed_kind_1c2f_corner_cap_arc_rims_on_surface_70() {
+        use crate::primitives::validation::{
+            validate_model_enhanced, ValidationLevel, ValidationWarning,
+        };
+        let mut model = BRepModel::new();
+        let solid_id = make_cube(&mut model);
+        let corner = vertex_at(&model, HALF, HALF, HALF);
+        let edges = corner_edges_sorted(&model, corner);
+        chamfer_edges(
+            &mut model,
+            solid_id,
+            vec![edges[0]],
+            chamfer_opts(D, vec![corner], false),
+        )
+        .expect("chamfer");
+        fillet_edges(
+            &mut model,
+            solid_id,
+            vec![edges[1], edges[2]],
+            fillet_opts(D, vec![], false),
+        )
+        .expect("fillet");
+        let result =
+            validate_model_enhanced(&model, Tolerance::default(), ValidationLevel::Standard);
+        // Defect (1): no edge lies OFF its face's surface (the cap arc rims).
+        let off_surface: Vec<String> = result
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, ValidationWarning::GeometryInconsistency { .. }))
+            .map(|w| format!("{w}"))
+            .filter(|m| m.contains("off") && m.contains("surface"))
+            .collect();
+        assert!(
+            off_surface.is_empty(),
+            "1C2F corner cap must contain its arc rims (no off-surface edges); got: {off_surface:?}"
+        );
+    }
+
     #[test]
     fn assert_within_returns_typed_err_when_tolerance_exceeded() {
         // The CF-β planar cap path is C0 by construction across
