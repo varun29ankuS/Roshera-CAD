@@ -1035,6 +1035,681 @@ pub fn compute_apex_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> Opera
     Ok(())
 }
 
+/// Predicted offset spine of one blend incident to a corner: an axis
+/// line (origin `q` + unit direction `u`) plus the V-end bookkeeping
+/// the apex solve needs.
+///
+/// Both fillet and chamfer incident blends reduce to *the same* row
+/// form for the least-squares concurrent-axes solve — a line that the
+/// apex must lie on. They differ only in how the offset origin `q` is
+/// derived (see [`predict_corner_blend_axis`]).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Reason: Stage 1 wires these (mixed vertex-blend corner).
+struct CornerBlendAxis {
+    edge_id: EdgeId,
+    /// Offset spine origin (`q_i` in the projector-sum solve).
+    q: Point3,
+    /// Unit axis direction (`u_i`), oriented along the outgoing edge
+    /// tangent at the shared corner vertex.
+    axis_dir: Vector3,
+    /// `true` iff the shared corner vertex is this edge's `start_vertex`
+    /// (the V-end whose setback we write).
+    is_start: bool,
+    /// Outward unit normals of the two faces adjacent to the edge,
+    /// re-oriented to point away from the solid. Carried for the
+    /// junction solver (chamfer-bevel plane reconstruction).
+    face_normals: [Vector3; 2],
+}
+
+/// Reason a corner blend's offset spine could not be predicted.
+///
+/// Mirrors the silent-bail conditions of [`compute_apex_setbacks`],
+/// but surfaced as a typed value so the mixed-corner solver and the
+/// junction solver can distinguish "leave the corner alone" from a
+/// genuine model-integrity fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Reason: Stage 1 wires these (mixed vertex-blend corner).
+pub enum CornerBlendError {
+    /// An incident edge, an adjacent face, or its surface was missing
+    /// from the model.
+    MissingTopology,
+    /// An adjacent face is not planar — the rectilinear-corner
+    /// precondition fails.
+    NonPlanarFace,
+    /// The two adjacent face normals are (near-)anti-parallel, so the
+    /// `r/(1+c)` offset origin diverges.
+    AntiParallelFaces,
+    /// The shared vertex is not an endpoint of the incident edge.
+    VertexNotOnEdge,
+    /// The outgoing edge tangent could not be evaluated.
+    TangentUnavailable,
+    /// The supplied offset distance (radius or chamfer distance) was
+    /// non-positive or non-finite.
+    InvalidDistance,
+    /// `n_a × n_b` was numerically degenerate (faces parallel).
+    DegenerateAxis,
+}
+
+impl CornerBlendError {
+    fn into_op_error(self, edge_id: EdgeId) -> OperationError {
+        OperationError::InvalidGeometry(format!(
+            "corner blend axis prediction failed for edge {}: {:?}",
+            edge_id, self
+        ))
+    }
+}
+
+/// Predict the offset spine (axis line) of one blend edge incident to
+/// a rectilinear corner vertex `vertex_id` at position `v_pos`.
+///
+/// `offset_distance` is the blend's offset arm: the fillet radius `r`
+/// for a rolling-ball fillet, or the chamfer set-back distance `D` for
+/// a planar bevel. In both cases the offset origin is the **same**
+/// `r/(1+c)` inward-perpendicular point reused verbatim from
+/// [`compute_apex_setbacks`] (`blend_graph.rs:928`):
+///
+/// ```text
+///   q = V − (offset_distance / (1 + n_a·n_b)) · (n_a + n_b)
+///   u = normalize(n_a × n_b)  (oriented along the outgoing tangent)
+/// ```
+///
+/// **Fillet vs chamfer.** For a fillet, `q` is the cylinder axis
+/// origin — the centre of the rolling ball at the V-end, equidistant
+/// `r` from both faces. For a chamfer the analogous spine is the line
+/// parallel to the chamfer edge through the **planar bevel offset**
+/// point `V − (D/(1+c))·(n_a + n_b)`; the bevel face's plane is the
+/// planar offset of the corner, and this spine is its apex-side
+/// retraction. The two derivations land on the identical algebraic
+/// row — the chamfer contributes a *planar-offset* row, the fillet a
+/// *cylinder-axis* row — so the projector-sum apex solve is uniform
+/// across the mixed corner.
+#[allow(dead_code)] // Reason: Stage 1 wires these (mixed vertex-blend corner).
+fn predict_corner_blend_axis(
+    model: &BRepModel,
+    vertex_id: VertexId,
+    v_pos: Point3,
+    edge_id: EdgeId,
+    offset_distance: f64,
+) -> Result<CornerBlendAxis, CornerBlendError> {
+    const ANTI_PARALLEL_TOL: f64 = 1.0e-9;
+
+    if !(offset_distance > 0.0 && offset_distance.is_finite()) {
+        return Err(CornerBlendError::InvalidDistance);
+    }
+
+    let edge = model
+        .edges
+        .get(edge_id)
+        .ok_or(CornerBlendError::MissingTopology)?;
+
+    let faces = find_adjacent_faces(model, edge_id);
+    if faces.len() != 2 {
+        return Err(CornerBlendError::MissingTopology);
+    }
+    let mut normals: [Vector3; 2] = [Vector3::new(0.0, 0.0, 0.0); 2];
+    for i in 0..2 {
+        let face = model
+            .faces
+            .get(faces[i])
+            .ok_or(CornerBlendError::MissingTopology)?;
+        let surface = model
+            .surfaces
+            .get(face.surface_id)
+            .ok_or(CornerBlendError::MissingTopology)?;
+        let plane = surface
+            .as_any()
+            .downcast_ref::<Plane>()
+            .ok_or(CornerBlendError::NonPlanarFace)?;
+        let mut n = plane.normal;
+        if face.orientation == FaceOrientation::Backward {
+            n = Vector3::new(-n.x, -n.y, -n.z);
+        }
+        normals[i] = n;
+    }
+
+    let n_a = normals[0];
+    let n_b = normals[1];
+    let c = n_a.dot(&n_b);
+    if (1.0 + c).abs() < ANTI_PARALLEL_TOL {
+        return Err(CornerBlendError::AntiParallelFaces);
+    }
+
+    let is_start = edge.start_vertex == vertex_id;
+    let is_end = edge.end_vertex == vertex_id;
+    if !is_start && !is_end {
+        return Err(CornerBlendError::VertexNotOnEdge);
+    }
+    let outgoing = if is_start {
+        edge.tangent_at(0.0_f64, &model.curves)
+            .map_err(|_| CornerBlendError::TangentUnavailable)?
+    } else {
+        let t_end = edge
+            .tangent_at(1.0_f64, &model.curves)
+            .map_err(|_| CornerBlendError::TangentUnavailable)?;
+        Vector3::new(-t_end.x, -t_end.y, -t_end.z)
+    };
+
+    // Offset origin: V − (offset/(1+c))·(n_a + n_b). Reused verbatim
+    // from `compute_apex_setbacks` (blend_graph.rs:928); the only
+    // difference here is `offset_distance` may be a chamfer set-back
+    // rather than a fillet radius.
+    let scale = offset_distance / (1.0 + c);
+    let sum = n_a + n_b;
+    let q = Point3::new(
+        v_pos.x - scale * sum.x,
+        v_pos.y - scale * sum.y,
+        v_pos.z - scale * sum.z,
+    );
+
+    let cross = n_a.cross(&n_b);
+    let axis_unit = match cross.normalize() {
+        Ok(u) => {
+            if u.dot(&outgoing) >= 0.0 {
+                u
+            } else {
+                Vector3::new(-u.x, -u.y, -u.z)
+            }
+        }
+        Err(_) => return Err(CornerBlendError::DegenerateAxis),
+    };
+
+    Ok(CornerBlendAxis {
+        edge_id,
+        q,
+        axis_dir: axis_unit,
+        is_start,
+        face_normals: [n_a, n_b],
+    })
+}
+
+/// Least-squares concurrent point of a set of offset-spine axis lines.
+///
+/// Solves `A = (Σ Mᵢ)⁻¹ (Σ Mᵢ qᵢ)` with `Mᵢ = I − uᵢ uᵢᵀ` — the same
+/// projector-sum formulation [`compute_apex_setbacks`] inlines at
+/// `blend_graph.rs:973`. Returns `None` when the normal matrix is
+/// rank-deficient (`|det| < 1e-9`) or non-invertible.
+#[allow(dead_code)] // Reason: Stage 1 wires these (mixed vertex-blend corner).
+fn least_squares_concurrent_point(axes: &[CornerBlendAxis]) -> Option<Point3> {
+    let mut a = [0.0_f64; 9]; // column-major 3x3
+    let mut b = Vector3::new(0.0, 0.0, 0.0);
+    for axis in axes {
+        let u = axis.axis_dir;
+        let q = axis.q;
+        let m00 = 1.0 - u.x * u.x;
+        let m11 = 1.0 - u.y * u.y;
+        let m22 = 1.0 - u.z * u.z;
+        let m01 = -u.x * u.y;
+        let m02 = -u.x * u.z;
+        let m12 = -u.y * u.z;
+        a[0] += m00;
+        a[4] += m11;
+        a[8] += m22;
+        a[3] += m01;
+        a[1] += m01;
+        a[6] += m02;
+        a[2] += m02;
+        a[7] += m12;
+        a[5] += m12;
+
+        let dot = u.x * q.x + u.y * q.y + u.z * q.z;
+        b.x += q.x - dot * u.x;
+        b.y += q.y - dot * u.y;
+        b.z += q.z - dot * u.z;
+    }
+    let mat = Matrix3::from_cols(a);
+    if mat.determinant().abs() < 1.0e-9 {
+        return None;
+    }
+    let inv = mat.inverse().ok()?;
+    let c_vec = inv.transform_vector(&b);
+    Some(Point3::new(c_vec.x, c_vec.y, c_vec.z))
+}
+
+/// Mixed-corner apex setback solve (Stage 0 building block for the
+/// vertex-blend corner primitive).
+///
+/// Generalises [`compute_apex_setbacks`] to a degree-3 convex corner
+/// where exactly **one** incident blend (`chamfer_edge`) is a planar
+/// chamfer of set-back `chamfer_distance` and the other two are
+/// fillets carrying their own radius in `graph`. The apex anchor `A`
+/// is the least-squares concurrent point of the three offset spines:
+/// two cylinder-axis rows (fillets) and one planar-offset row
+/// (chamfer). Each fillet edge then receives the apex-aware setback
+/// `|(A − qᵢ)·uᵢ|`, retracting its V-end to the foot of `A` on its
+/// axis. The chamfer edge receives **no** setback — a planar bevel is
+/// closed by the corner patch's G1 cap, not by a fillet-style spine
+/// retraction.
+///
+/// Pure function: reads `model`, writes only `start_setback` /
+/// `end_setback` on the two fillet `BlendEdge`s in `graph`. Corners
+/// that do not match (chamfer edge absent; any spine prediction
+/// fails; rank-deficient axis system) are left untouched and the
+/// upstream Hoffmann baseline survives — only a genuine
+/// model-integrity fault (a tangent that cannot be evaluated on an
+/// edge that *is* present) is surfaced as an error.
+///
+/// For the unit-cube 1C2F corner (chamfer `D = 1`, fillet
+/// `r₁ = r₂ = 1`, corner at `V = (5,5,5)`), the three spines are the
+/// lines `{(t,4,4)}`, `{(4,t,4)}`, `{(4,4,t)}`, which concur at
+/// `A = (4,4,4)`, and each fillet setback evaluates to exactly `1.0`.
+#[allow(dead_code)] // Reason: Stage 1 wires these (mixed vertex-blend corner).
+pub fn compute_apex_setbacks_mixed(
+    model: &BRepModel,
+    graph: &mut BlendGraph,
+    chamfer_edge: EdgeId,
+    chamfer_distance: f64,
+) -> OperationResult<()> {
+    let work: Vec<(VertexId, Vec<EdgeId>)> = graph
+        .vertices
+        .iter()
+        .filter_map(|(vid, v)| match v.kind {
+            BlendVertexKind::ConvexCorner { degree: 3 } if v.incident_blend_edges.len() == 3 => {
+                Some((*vid, v.incident_blend_edges.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    for (vertex_id, blend_edges) in work {
+        // Only mixed corners that actually contain the chamfer edge.
+        if !blend_edges.contains(&chamfer_edge) {
+            continue;
+        }
+        let vertex = match model.vertices.get(vertex_id) {
+            Some(v) => v,
+            None => continue,
+        };
+        let v_pos = Point3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
+
+        let mut axes: Vec<CornerBlendAxis> = Vec::with_capacity(3);
+        let mut bail = false;
+        for &eid in &blend_edges {
+            let offset = if eid == chamfer_edge {
+                chamfer_distance
+            } else {
+                graph
+                    .edges
+                    .get(&eid)
+                    .map(|be| be.radius.min_value())
+                    .unwrap_or(0.0_f64)
+            };
+            match predict_corner_blend_axis(model, vertex_id, v_pos, eid, offset) {
+                Ok(axis) => axes.push(axis),
+                Err(CornerBlendError::TangentUnavailable) => {
+                    // Genuine integrity fault on a present edge.
+                    return Err(CornerBlendError::TangentUnavailable.into_op_error(eid));
+                }
+                Err(_) => {
+                    bail = true;
+                    break;
+                }
+            }
+        }
+        if bail || axes.len() != 3 {
+            continue;
+        }
+
+        let apex = match least_squares_concurrent_point(&axes) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Per-fillet-edge apex setback. The chamfer edge is skipped —
+        // its planar bevel is bridged by the corner cap, not retracted
+        // along a spine.
+        for axis in &axes {
+            if axis.edge_id == chamfer_edge {
+                continue;
+            }
+            let delta = Vector3::new(apex.x - axis.q.x, apex.y - axis.q.y, apex.z - axis.q.z);
+            let setback = delta.dot(&axis.axis_dir).abs();
+            if let Some(be) = graph.edges.get_mut(&axis.edge_id) {
+                if axis.is_start {
+                    be.start_setback = Some(setback);
+                } else {
+                    be.end_setback = Some(setback);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Result of the corner junction solver: the three junction points of
+/// a 1-chamfer / 2-fillet corner that the G1 cap bridges.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Reason: Stage 1 wires these (mixed vertex-blend corner).
+pub struct CornerJunctions {
+    /// `J_1` — chamfer-bevel-plane ∩ fillet-1-cylinder, apex side.
+    pub j1: Point3,
+    /// `J_2` — chamfer-bevel-plane ∩ fillet-2-cylinder, apex side.
+    pub j2: Point3,
+    /// `P_12` — fillet-1-cylinder ∩ fillet-2-cylinder, apex side.
+    pub p12: Point3,
+}
+
+/// Reason a corner junction point could not be solved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Reason: Stage 1 wires these (mixed vertex-blend corner).
+pub enum JunctionError {
+    /// A spine could not be predicted (propagated cause).
+    Spine(CornerBlendError),
+    /// The plane and the cylinder do not meet (no real root).
+    NoPlaneCylinderRoot,
+    /// The two cylinders do not meet (no real root).
+    NoCylinderCylinderRoot,
+    /// A required line/quadratic solve was numerically singular.
+    Singular,
+}
+
+/// Solve the three junction points of a 1-chamfer / 2-fillet corner.
+///
+/// * `J_i = chamfer-bevel-plane ∩ fillet-i-cylinder`. The chamfer
+///   bevel plane is reconstructed from the chamfer edge's two adjacent
+///   face normals and set-back distance; the fillet cylinder is the
+///   axis spine of fillet `i` at its radius. A plane∩cylinder
+///   intersection has up to two real roots; we pick the **apex side**
+///   by the same outward/midpoint score
+///   [`intersect_two_caps`](crate::operations::fillet) uses
+///   (`fillet.rs:~3779`) — the root maximising `(x − V)·outward`.
+/// * `P_12 = fillet-1-cylinder ∩ fillet-2-cylinder`, apex side. This
+///   reuses the same cap-circle intersection geometry as
+///   `intersect_two_caps`: the two cylinder axes give two transverse
+///   planes whose line of intersection is parameterised, then the
+///   quadratic against cylinder 1 is solved and the apex-side root
+///   chosen.
+///
+/// `chamfer_edge` is the single chamfer; the other two entries of
+/// `corner_edges` are the fillets (radii read from `graph`). All three
+/// must be incident to `vertex_id`. Pure function — reads `model` and
+/// `graph`, mutates nothing.
+#[allow(dead_code, clippy::too_many_arguments)] // Reason: Stage 1 wires these.
+pub fn solve_corner_junctions(
+    model: &BRepModel,
+    graph: &BlendGraph,
+    vertex_id: VertexId,
+    corner_edges: [EdgeId; 3],
+    chamfer_edge: EdgeId,
+    chamfer_distance: f64,
+) -> Result<CornerJunctions, JunctionError> {
+    let vertex = model
+        .vertices
+        .get(vertex_id)
+        .ok_or(JunctionError::Spine(CornerBlendError::MissingTopology))?;
+    let v_pos = Point3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
+
+    // Identify the chamfer + the two fillets.
+    let fillet_edges: Vec<EdgeId> = corner_edges
+        .iter()
+        .copied()
+        .filter(|&e| e != chamfer_edge)
+        .collect();
+    if fillet_edges.len() != 2 {
+        return Err(JunctionError::Spine(CornerBlendError::MissingTopology));
+    }
+
+    let chamfer_axis =
+        predict_corner_blend_axis(model, vertex_id, v_pos, chamfer_edge, chamfer_distance)
+            .map_err(JunctionError::Spine)?;
+
+    // The chamfer bevel plane passes through the offset rim points and
+    // its normal is the in-plane bisector of the two adjacent face
+    // normals: n_bevel = normalize(n_a + n_b). A point on the bevel
+    // plane is the simple face-offset point V − D·n_a (the chamfer rim
+    // start on the first adjacent face).
+    let n_a = chamfer_axis.face_normals[0];
+    let n_b = chamfer_axis.face_normals[1];
+    let bevel_normal = (n_a + n_b)
+        .normalize()
+        .map_err(|_| JunctionError::Spine(CornerBlendError::DegenerateAxis))?;
+    let bevel_point = Point3::new(
+        v_pos.x - chamfer_distance * n_a.x,
+        v_pos.y - chamfer_distance * n_a.y,
+        v_pos.z - chamfer_distance * n_a.z,
+    );
+
+    // Outward score reference: the corner's outward direction is the
+    // sum of the three face normals through V. We approximate it with
+    // the bevel normal plus the two fillet face-normal sums; using the
+    // chamfer's two faces and each fillet's faces. The apex sits
+    // *inboard* (negative outward score), so we pick the root with the
+    // larger (least-negative) score — exactly `intersect_two_caps`'
+    // disambiguation.
+    let mut outward = Vector3::new(0.0, 0.0, 0.0);
+    for &eid in &corner_edges {
+        if let Ok(axis) = predict_corner_blend_axis(model, vertex_id, v_pos, eid, 1.0) {
+            outward = outward + axis.face_normals[0] + axis.face_normals[1];
+        }
+    }
+    let outward = outward.normalize().unwrap_or(bevel_normal);
+
+    // --- J_i: chamfer bevel plane ∩ fillet-i cylinder (apex side) ---
+    let solve_plane_cylinder = |fillet: EdgeId| -> Result<Point3, JunctionError> {
+        let r = graph
+            .edges
+            .get(&fillet)
+            .map(|be| be.radius.min_value())
+            .unwrap_or(0.0_f64);
+        let axis = predict_corner_blend_axis(model, vertex_id, v_pos, fillet, r)
+            .map_err(JunctionError::Spine)?;
+        plane_cylinder_apex_intersection(
+            bevel_normal,
+            bevel_point,
+            axis.q,
+            axis.axis_dir,
+            r,
+            v_pos,
+            outward,
+        )
+    };
+    let j1 = solve_plane_cylinder(fillet_edges[0])?;
+    let j2 = solve_plane_cylinder(fillet_edges[1])?;
+
+    // --- P_12: fillet-1 cylinder ∩ fillet-2 cylinder (apex side) ---
+    let r1 = graph
+        .edges
+        .get(&fillet_edges[0])
+        .map(|be| be.radius.min_value())
+        .unwrap_or(0.0_f64);
+    let r2 = graph
+        .edges
+        .get(&fillet_edges[1])
+        .map(|be| be.radius.min_value())
+        .unwrap_or(0.0_f64);
+    let axis1 = predict_corner_blend_axis(model, vertex_id, v_pos, fillet_edges[0], r1)
+        .map_err(JunctionError::Spine)?;
+    let axis2 = predict_corner_blend_axis(model, vertex_id, v_pos, fillet_edges[1], r2)
+        .map_err(JunctionError::Spine)?;
+    let p12 = two_cylinder_apex_intersection(
+        axis1.q,
+        axis1.axis_dir,
+        r1,
+        axis2.q,
+        axis2.axis_dir,
+        r2,
+        v_pos,
+        outward,
+    )?;
+
+    Ok(CornerJunctions { j1, j2, p12 })
+}
+
+/// Junction `J_i` of the chamfer-bevel plane and one fillet at a
+/// 1C2F corner: the intersection of the **fillet's V-side cap circle**
+/// (radius `r`, centred at `axis_origin`, in the plane perpendicular
+/// to `axis_dir`) with the bevel plane (`plane_normal`,
+/// `plane_point`), choosing the apex-side root.
+///
+/// The fillet face's V-end terminates on this cap circle; the chamfer
+/// bevel face terminates on the bevel plane. Their shared corner-patch
+/// junction is therefore where the cap circle pierces the bevel plane.
+/// A circle meets a plane in at most two points; the apex-side one is
+/// selected by the same outward/midpoint score
+/// `intersect_two_caps` uses — the root with the larger
+/// `(x − V)·outward` (the apex sits inboard, so the least-negative
+/// score wins).
+///
+/// In the cap-circle frame `(e1, e2) ⊥ axis_dir`, a point is
+/// `x(φ) = axis_origin + r·(cosφ·e1 + sinφ·e2)`. The bevel-plane
+/// constraint `n·(x − plane_point) = 0` becomes the sinusoid
+/// `a·cosφ + b·sinφ + n·w = 0` with `a = r·(n·e1)`, `b = r·(n·e2)`,
+/// `w = axis_origin − plane_point`, whose two roots are
+/// `φ = atan2(b, a) ± acos(−n·w / √(a²+b²))`. The cap circle is
+/// transverse to the bevel plane at every rectilinear corner (the
+/// fillet axis is never parallel to the bevel normal), so the
+/// amplitude `√(a²+b²)` is non-zero whenever a real crossing exists.
+#[allow(dead_code, clippy::too_many_arguments)] // Reason: Stage 1 wires these.
+fn plane_cylinder_apex_intersection(
+    plane_normal: Vector3,
+    plane_point: Point3,
+    axis_origin: Point3,
+    axis_dir: Vector3,
+    r: f64,
+    vertex: Point3,
+    outward: Vector3,
+) -> Result<Point3, JunctionError> {
+    if !(r > 0.0 && r.is_finite()) {
+        return Err(JunctionError::Spine(CornerBlendError::InvalidDistance));
+    }
+    // Orthonormal frame of the cap circle (cross-section of the
+    // cylinder at the V-cap, t = 0 along the axis).
+    let e1 = axis_dir
+        .perpendicular()
+        .normalize()
+        .map_err(|_| JunctionError::Singular)?;
+    let e2 = axis_dir.cross(&e1);
+
+    let w = Vector3::new(
+        axis_origin.x - plane_point.x,
+        axis_origin.y - plane_point.y,
+        axis_origin.z - plane_point.z,
+    );
+    let n_dot_w = plane_normal.dot(&w);
+    let a_coef = r * plane_normal.dot(&e1);
+    let b_coef = r * plane_normal.dot(&e2);
+
+    // a·cosφ + b·sinφ = −n·w  ⇒  φ = atan2(b,a) ± acos(−n·w / amp).
+    let amp = (a_coef * a_coef + b_coef * b_coef).sqrt();
+    let ratio = -n_dot_w / amp;
+    if amp <= 1.0e-12 || ratio.abs() > 1.0 + 1.0e-9 {
+        return Err(JunctionError::NoPlaneCylinderRoot);
+    }
+    let base = b_coef.atan2(a_coef);
+    let rhs = ratio.clamp(-1.0, 1.0).acos();
+    let phi1 = base + rhs;
+    let phi2 = base - rhs;
+
+    let make_point = |phi: f64| -> Point3 {
+        let cx = phi.cos();
+        let sx = phi.sin();
+        Point3::new(
+            axis_origin.x + r * (cx * e1.x + sx * e2.x),
+            axis_origin.y + r * (cx * e1.y + sx * e2.y),
+            axis_origin.z + r * (cx * e1.z + sx * e2.z),
+        )
+    };
+    let v_score = |p: Point3| -> f64 {
+        (p.x - vertex.x) * outward.x + (p.y - vertex.y) * outward.y + (p.z - vertex.z) * outward.z
+    };
+
+    let p1 = make_point(phi1);
+    let p2 = make_point(phi2);
+    Ok(if v_score(p1) >= v_score(p2) { p1 } else { p2 })
+}
+
+/// Intersect two cylinders (axis `i`/`j`, radius `r_i`/`r_j`) and
+/// return the apex-side junction `P_12`, reusing the cap-circle
+/// geometry of [`intersect_two_caps`](crate::operations::fillet).
+///
+/// Each cylinder's V-side cap is the circle in the plane through its
+/// axis origin perpendicular to the axis. The two caps lie in
+/// transverse planes (axes non-parallel at a rectilinear corner); the
+/// junction is the apex-side crossing of the two cap circles, picked
+/// by the outward score.
+#[allow(dead_code, clippy::too_many_arguments)] // Reason: Stage 1 wires these.
+fn two_cylinder_apex_intersection(
+    c_i: Point3,
+    u_i: Vector3,
+    r_i: f64,
+    c_j: Point3,
+    u_j: Vector3,
+    r_j: f64,
+    vertex: Point3,
+    outward: Vector3,
+) -> Result<Point3, JunctionError> {
+    const AXES_PARALLEL_TOL_SQ: f64 = 1.0e-18;
+    const CIRCLE_SANITY_TOL: f64 = 1.0e-9;
+    if !(r_i > 0.0 && r_i.is_finite() && r_j > 0.0 && r_j.is_finite()) {
+        return Err(JunctionError::Spine(CornerBlendError::InvalidDistance));
+    }
+
+    // Direction of the plane-plane intersection line.
+    let d_raw = u_i.cross(&u_j);
+    let d_norm_sq = d_raw.x * d_raw.x + d_raw.y * d_raw.y + d_raw.z * d_raw.z;
+    if d_norm_sq <= AXES_PARALLEL_TOL_SQ {
+        return Err(JunctionError::NoCylinderCylinderRoot);
+    }
+    let d_norm = d_norm_sq.sqrt();
+    let d_ij = Vector3::new(d_raw.x / d_norm, d_raw.y / d_norm, d_raw.z / d_norm);
+
+    // Anchor P_0 on L_ij via the same 3×3 solve as intersect_two_caps.
+    let mat = Matrix3::from_rows(&u_i, &u_j, &d_ij);
+    let m = Vector3::new(
+        (c_i.x + c_j.x) * 0.5,
+        (c_i.y + c_j.y) * 0.5,
+        (c_i.z + c_j.z) * 0.5,
+    );
+    let rhs = Vector3::new(
+        u_i.x * c_i.x + u_i.y * c_i.y + u_i.z * c_i.z,
+        u_j.x * c_j.x + u_j.y * c_j.y + u_j.z * c_j.z,
+        d_ij.x * m.x + d_ij.y * m.y + d_ij.z * m.z,
+    );
+    let inv = mat.inverse().map_err(|_| JunctionError::Singular)?;
+    let p0_vec = inv.transform_vector(&rhs);
+    let p0 = Point3::new(p0_vec.x, p0_vec.y, p0_vec.z);
+
+    let w = p0 - c_i;
+    let b_half = w.x * d_ij.x + w.y * d_ij.y + w.z * d_ij.z;
+    let w_sq = w.x * w.x + w.y * w.y + w.z * w.z;
+    let c_coeff = w_sq - r_i * r_i;
+    let disc = b_half * b_half - c_coeff;
+    if disc < 0.0 {
+        return Err(JunctionError::NoCylinderCylinderRoot);
+    }
+    let sqrt_disc = disc.sqrt();
+    let s_plus = -b_half + sqrt_disc;
+    let s_minus = -b_half - sqrt_disc;
+
+    let make_candidate =
+        |s: f64| -> Point3 { Point3::new(p0.x + s * d_ij.x, p0.y + s * d_ij.y, p0.z + s * d_ij.z) };
+    let on_second_circle = |x: Point3| -> bool {
+        let dx = x.x - c_j.x;
+        let dy = x.y - c_j.y;
+        let dz = x.z - c_j.z;
+        ((dx * dx + dy * dy + dz * dz).sqrt() - r_j).abs() <= CIRCLE_SANITY_TOL
+    };
+    let v_side_score = |x: Point3| -> f64 {
+        (x.x - vertex.x) * outward.x + (x.y - vertex.y) * outward.y + (x.z - vertex.z) * outward.z
+    };
+
+    let cand_plus = make_candidate(s_plus);
+    let cand_minus = make_candidate(s_minus);
+    let plus_ok = on_second_circle(cand_plus);
+    let minus_ok = on_second_circle(cand_minus);
+    if !plus_ok && !minus_ok {
+        return Err(JunctionError::NoCylinderCylinderRoot);
+    }
+    let plus_score = v_side_score(cand_plus);
+    let minus_score = v_side_score(cand_minus);
+    let best = if plus_ok && (!minus_ok || plus_score >= minus_score) {
+        cand_plus
+    } else {
+        cand_minus
+    };
+    Ok(best)
+}
+
 /// Zero out the Hoffmann / apex setbacks at the listed vertices on
 /// every incident [`BlendEdge`] in `graph`. Used by the CF-β.5.2-B
 /// partial-mixed corner path: at a 3-edge corner where one incident
@@ -1536,5 +2211,522 @@ mod tests {
         let v = BlendRadius::Variable(vec![(0.0, 0.3), (0.5, 0.9), (1.0, 0.2)]);
         assert_eq!(v.min_value(), 0.2);
         assert_eq!(v.max_value(), 0.9);
+    }
+
+    // ================================================================
+    // Stage 0 — vertex-blend corner primitive de-risk + building
+    // blocks. The fixture is a 10³ box (corners at (±5,±5,±5)); the
+    // 1C2F corner under test is V = (5,5,5) with chamfer D = 1 and two
+    // fillets r = 1. Apex is the concurrent point of the three offset
+    // spines, which for this corner is (4,4,4).
+    // ================================================================
+
+    fn build_box_side_10() -> BRepModel {
+        let mut model = BRepModel::new();
+        {
+            let mut builder = TopologyBuilder::new(&mut model);
+            builder
+                .create_box_3d(10.0, 10.0, 10.0)
+                .expect("create_box_3d(10,10,10) should succeed");
+        }
+        classify_all_unclassified_edges(&mut model).expect("F2-α sweep");
+        model
+    }
+
+    /// Locate the box vertex nearest `target` and return it with its
+    /// (≤3) incident edges, sorted by id for determinism.
+    fn corner_at(model: &BRepModel, target: Point3) -> (VertexId, Vec<EdgeId>) {
+        let mut best: Option<(VertexId, f64)> = None;
+        for (vid, v) in model.vertices.iter() {
+            let p = v.position;
+            let d =
+                (p[0] - target.x).powi(2) + (p[1] - target.y).powi(2) + (p[2] - target.z).powi(2);
+            match best {
+                Some((_, bd)) if bd <= d => {}
+                _ => best = Some((vid, d)),
+            }
+        }
+        let (vid, _) = best.expect("box has vertices");
+        let mut edges: Vec<EdgeId> = model
+            .edges
+            .iter()
+            .filter(|(_, e)| e.start_vertex == vid || e.end_vertex == vid)
+            .map(|(id, _)| id)
+            .collect();
+        edges.sort();
+        (vid, edges)
+    }
+
+    /// Build a degree-3 BlendGraph at the (5,5,5) corner with all three
+    /// incident edges selected at radius 1.0. Returns the graph plus
+    /// the corner vertex id and its three edge ids.
+    fn corner_graph_1c2f(model: &mut BRepModel) -> (BlendGraph, VertexId, [EdgeId; 3]) {
+        let (vid, edges) = corner_at(model, Point3::new(5.0, 5.0, 5.0));
+        assert_eq!(edges.len(), 3, "corner (5,5,5) must be degree-3");
+        let selection: Vec<_> = edges
+            .iter()
+            .map(|&e| (e, BlendRadius::Constant(1.0)))
+            .collect();
+        let graph = build(model, &selection).expect("build 1C2F corner graph");
+        let arr = [edges[0], edges[1], edges[2]];
+        (graph, vid, arr)
+    }
+
+    #[test]
+    fn mixed_apex_unit_cube_corner_is_4_4_4_setback_1() {
+        let mut model = build_box_side_10();
+        let (mut graph, vid, edges) = corner_graph_1c2f(&mut model);
+
+        // Designate edges[0] the chamfer (D = 1); edges[1], edges[2]
+        // are the fillets (r = 1).
+        let chamfer = edges[0];
+        compute_apex_setbacks_mixed(&model, &mut graph, chamfer, 1.0)
+            .expect("mixed apex solve must succeed on a clean box corner");
+
+        // Reconstruct the apex directly from the three spines so we can
+        // assert (4,4,4) exactly.
+        let v = model.vertices.get(vid).expect("corner vertex");
+        let v_pos = Point3::new(v.position[0], v.position[1], v.position[2]);
+        let axes: Vec<CornerBlendAxis> = edges
+            .iter()
+            .map(|&e| {
+                predict_corner_blend_axis(&model, vid, v_pos, e, 1.0).expect("spine prediction")
+            })
+            .collect();
+        let apex = least_squares_concurrent_point(&axes).expect("apex solvable");
+        println!("MIXED APEX = ({}, {}, {})", apex.x, apex.y, apex.z);
+        assert!(
+            (apex.x - 4.0).abs() < 1e-9
+                && (apex.y - 4.0).abs() < 1e-9
+                && (apex.z - 4.0).abs() < 1e-9,
+            "mixed 1C2F apex must be (4,4,4); got ({:.12}, {:.12}, {:.12})",
+            apex.x,
+            apex.y,
+            apex.z
+        );
+
+        // Each FILLET edge's V-end setback must be exactly 1.0; the
+        // chamfer edge must be left without a setback at the corner.
+        for &eid in &edges {
+            let be = graph.edge(eid).expect("BlendEdge present");
+            let edge = model.edges.get(eid).expect("edge present");
+            let at_corner = if edge.start_vertex == vid {
+                be.start_setback
+            } else {
+                be.end_setback
+            };
+            if eid == chamfer {
+                assert!(
+                    at_corner.is_none(),
+                    "chamfer edge must receive no apex setback; got {:?}",
+                    at_corner
+                );
+            } else {
+                let s = at_corner.expect("fillet setback at corner must be populated");
+                assert!(
+                    (s - 1.0).abs() < 1e-9,
+                    "fillet setback at 1C2F corner: expected 1.0, got {}",
+                    s
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_apex_no_op_when_chamfer_edge_absent() {
+        // A chamfer edge id not present at the corner ⇒ the solve must
+        // leave every setback untouched (None).
+        let mut model = build_box_side_10();
+        let (mut graph, vid, edges) = corner_graph_1c2f(&mut model);
+        let bogus_chamfer: EdgeId = 9_999;
+        compute_apex_setbacks_mixed(&model, &mut graph, bogus_chamfer, 1.0)
+            .expect("no matching corner ⇒ no-op");
+        for &eid in &edges {
+            let be = graph.edge(eid).expect("BlendEdge present");
+            let _ = vid;
+            assert!(
+                be.start_setback.is_none() && be.end_setback.is_none(),
+                "no-op solve must not write any setback"
+            );
+        }
+    }
+
+    #[test]
+    fn junctions_unit_cube_corner_apex_side() {
+        let mut model = build_box_side_10();
+        let (graph, vid, edges) = corner_graph_1c2f(&mut model);
+        let chamfer = edges[0];
+        let fillets = [edges[1], edges[2]];
+
+        let j = solve_corner_junctions(&model, &graph, vid, edges, chamfer, 1.0)
+            .expect("junction solve on clean box corner");
+
+        // Geometry of the corner V=(5,5,5):
+        //   chamfer edge[0] adjacent faces give bevel plane; fillets
+        //   are cylinders of axis {(t,4,4)} etc. We assert each
+        //   junction is a finite apex-side point inboard of V.
+        let v = model.vertices.get(vid).expect("vertex");
+        let v_pos = Point3::new(v.position[0], v.position[1], v.position[2]);
+        for (name, p) in [("J1", j.j1), ("J2", j.j2), ("P12", j.p12)] {
+            assert!(
+                p.x.is_finite() && p.y.is_finite() && p.z.is_finite(),
+                "{} must be finite, got {:?}",
+                name,
+                p
+            );
+            // Apex side: strictly inboard of the corner on every axis
+            // (each coordinate < 5).
+            assert!(
+                p.x < v_pos.x + 1e-9 && p.y < v_pos.y + 1e-9 && p.z < v_pos.z + 1e-9,
+                "{} must lie inboard of V=(5,5,5); got {:?}",
+                name,
+                p
+            );
+        }
+
+        // P_12 is the apex-side crossing of the two fillet cap circles.
+        // For r1=r2=1 perpendicular fillets the crossing on the apex
+        // side is the apex sphere centre's projection — it must be
+        // equidistant (=1) from both cylinder axes.
+        let v_pos2 = v_pos;
+        let dist_to_axis = |p: Point3, q: Point3, u: Vector3| -> f64 {
+            let w = p - q;
+            let along = w.dot(&u);
+            let perp = Vector3::new(w.x - along * u.x, w.y - along * u.y, w.z - along * u.z);
+            perp.magnitude()
+        };
+        let a1 =
+            predict_corner_blend_axis(&model, vid, v_pos2, fillets[0], 1.0).expect("fillet1 spine");
+        let a2 =
+            predict_corner_blend_axis(&model, vid, v_pos2, fillets[1], 1.0).expect("fillet2 spine");
+        assert!(
+            (dist_to_axis(j.p12, a1.q, a1.axis_dir) - 1.0).abs() < 1e-6,
+            "P12 must be radius 1 from fillet-1 axis; got {}",
+            dist_to_axis(j.p12, a1.q, a1.axis_dir)
+        );
+        assert!(
+            (dist_to_axis(j.p12, a2.q, a2.axis_dir) - 1.0).abs() < 1e-6,
+            "P12 must be radius 1 from fillet-2 axis; got {}",
+            dist_to_axis(j.p12, a2.q, a2.axis_dir)
+        );
+
+        // J_i must lie on BOTH the chamfer bevel plane AND fillet-i's
+        // V-cap circle (radius 1 from fillet-i axis). Reconstruct the
+        // bevel plane the same way the solver does.
+        let ca =
+            predict_corner_blend_axis(&model, vid, v_pos2, chamfer, 1.0).expect("chamfer spine");
+        let bevel_normal = (ca.face_normals[0] + ca.face_normals[1])
+            .normalize()
+            .expect("bevel normal");
+        let bevel_point = Point3::new(
+            v_pos2.x - 1.0 * ca.face_normals[0].x,
+            v_pos2.y - 1.0 * ca.face_normals[0].y,
+            v_pos2.z - 1.0 * ca.face_normals[0].z,
+        );
+        let on_bevel = |p: Point3| -> f64 { bevel_normal.dot(&(p - bevel_point)).abs() };
+        assert!(
+            on_bevel(j.j1) < 1e-6 && on_bevel(j.j2) < 1e-6,
+            "J1/J2 must lie on the bevel plane; devs {} / {}",
+            on_bevel(j.j1),
+            on_bevel(j.j2)
+        );
+        assert!(
+            (dist_to_axis(j.j1, a1.q, a1.axis_dir) - 1.0).abs() < 1e-6,
+            "J1 must lie on fillet-1 cap circle (radius 1); got {}",
+            dist_to_axis(j.j1, a1.q, a1.axis_dir)
+        );
+        assert!(
+            (dist_to_axis(j.j2, a2.q, a2.axis_dir) - 1.0).abs() < 1e-6,
+            "J2 must lie on fillet-2 cap circle (radius 1); got {}",
+            dist_to_axis(j.j2, a2.q, a2.axis_dir)
+        );
+
+        // Emit the computed junctions for the Stage-0 report.
+        println!(
+            "JUNCTIONS J1={:?} J2={:?} P12={:?}",
+            (j.j1.x, j.j1.y, j.j1.z),
+            (j.j2.x, j.j2.y, j.j2.z),
+            (j.p12.x, j.p12.y, j.p12.z)
+        );
+    }
+
+    #[test]
+    fn junction_two_cylinder_no_root_is_typed_error() {
+        // Parallel axes ⇒ the cap planes are parallel ⇒ no transverse
+        // intersection ⇒ typed error, not a panic.
+        let c_i = Point3::new(0.0, 0.0, 0.0);
+        let c_j = Point3::new(0.0, 5.0, 0.0);
+        let u = Vector3::new(1.0, 0.0, 0.0);
+        let res = two_cylinder_apex_intersection(
+            c_i,
+            u,
+            1.0,
+            c_j,
+            u,
+            1.0,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        );
+        assert_eq!(res, Err(JunctionError::NoCylinderCylinderRoot));
+    }
+
+    // ----------------------------------------------------------------
+    // ★ R1 DE-RISK PROTOTYPE
+    //
+    // Claim under test (strategy "D2"): a PLANAR chamfer bevel face
+    // tolerates re-anchoring its two V-end (cap-chord) vertices to
+    // arbitrary inboard points along the rails AND replacing the
+    // cap-chord edge with a fresh Line, while remaining (a) a closed
+    // outer loop and (b) planar. This is the asymmetry that makes the
+    // chamfer-rim rebuild safe where a curved fillet-rail param-range
+    // retrim tore the face (Euler-invalid). If this fails, Stage 1's
+    // rim rebuild balloons into a full bevel re-synthesis.
+    // ----------------------------------------------------------------
+
+    /// Build a real single-edge chamfer bevel on a 10³ box and return
+    /// (model, bevel_face_id, bevel_plane).
+    fn build_box_with_bevel() -> (BRepModel, crate::primitives::face::FaceId, Plane) {
+        use crate::operations::chamfer::{chamfer_edges, ChamferOptions, ChamferType};
+        use crate::primitives::topology_builder::GeometryId;
+
+        let mut model = BRepModel::new();
+        let solid_id = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            match builder.create_box_3d(10.0, 10.0, 10.0) {
+                Ok(GeometryId::Solid(id)) => id,
+                _ => panic!("box creation failed"),
+            }
+        };
+        let edge0: EdgeId = {
+            let mut es: Vec<EdgeId> = model.edges.iter().map(|(id, _)| id).collect();
+            es.sort();
+            es[0]
+        };
+        let options = ChamferOptions {
+            chamfer_type: ChamferType::EqualDistance(1.0),
+            ..Default::default()
+        };
+        let faces = chamfer_edges(&mut model, solid_id, vec![edge0], options)
+            .expect("single-edge chamfer must succeed");
+        let bevel_face = faces[0];
+
+        // The chamfer bevel surface is a `RuledSurface` between two
+        // parallel straight rails — geometrically planar but not a
+        // `Plane` object. Derive the bevel plane analytically from
+        // three distinct loop vertices so the R1 coplanarity check is
+        // grounded in the face's own geometry.
+        let outer_loop = model.faces.get(bevel_face).expect("bevel face").outer_loop;
+        let loop_edges: Vec<EdgeId> = model.loops.get(outer_loop).expect("loop").edges.clone();
+        let mut pts: Vec<Point3> = Vec::new();
+        for &eid in &loop_edges {
+            let edge = model.edges.get(eid).expect("edge");
+            for v in [edge.start_vertex, edge.end_vertex] {
+                let p = model.vertices.get_position(v).expect("vtx pos");
+                let pt = Point3::new(p[0], p[1], p[2]);
+                if !pts.iter().any(|q: &Point3| (*q - pt).magnitude() < 1e-9) {
+                    pts.push(pt);
+                }
+            }
+        }
+        assert!(
+            pts.len() >= 3,
+            "bevel face must expose ≥3 distinct vertices to define a plane"
+        );
+        // Pick three non-collinear vertices.
+        let p0 = pts[0];
+        let p1 = pts[1];
+        let p2 = pts
+            .iter()
+            .copied()
+            .find(|&p| {
+                let a = p1 - p0;
+                let b = p - p0;
+                a.cross(&b).magnitude() > 1e-6
+            })
+            .expect("three non-collinear bevel vertices exist");
+        let plane = Plane::from_three_points(p0, p1, p2).expect("bevel plane from 3 points");
+        (model, bevel_face, plane)
+    }
+
+    #[test]
+    fn r1_planar_bevel_tolerates_reanchor_and_chord_replacement() {
+        use crate::operations::edge_blend_topology::loop_is_closed;
+        use crate::primitives::curve::Line;
+
+        let (mut model, bevel_face, plane) = build_box_with_bevel();
+
+        // Loop must start closed and planar.
+        let outer_loop = model.faces.get(bevel_face).expect("face").outer_loop;
+        assert!(
+            loop_is_closed(&model, outer_loop).expect("loop closure check"),
+            "precondition: fresh bevel loop is closed"
+        );
+
+        // Identify a cap-chord edge: a straight (Line) edge of the
+        // bevel loop whose BOTH endpoints sit at original box corners
+        // (the V-ends). The bevel rectangle has two such chords; pick
+        // the one at the lowest index for determinism.
+        let edge_ids: Vec<EdgeId> = {
+            let lp = model.loops.get(outer_loop).expect("loop");
+            lp.edges.clone()
+        };
+        // A chord's two endpoints are the chamfer V-end pair; a rail's
+        // endpoints are one V-end + the far rim. We classify chords as
+        // the loop edges whose direction is the cross-section chord —
+        // distinguished by being the SHORTER straight edges. Compute
+        // each straight edge's length and take the two shortest.
+        let mut straight: Vec<(EdgeId, f64)> = Vec::new();
+        for &eid in &edge_ids {
+            let edge = model.edges.get(eid).expect("edge");
+            if model
+                .curves
+                .get(edge.curve_id)
+                .and_then(|c| c.as_any().downcast_ref::<Line>().map(|_| ()))
+                .is_none()
+            {
+                continue;
+            }
+            let s = model
+                .vertices
+                .get_position(edge.start_vertex)
+                .expect("start pos");
+            let e = model
+                .vertices
+                .get_position(edge.end_vertex)
+                .expect("end pos");
+            let len =
+                ((s[0] - e[0]).powi(2) + (s[1] - e[1]).powi(2) + (s[2] - e[2]).powi(2)).sqrt();
+            straight.push((eid, len));
+        }
+        straight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        assert!(
+            straight.len() >= 2,
+            "bevel loop must have ≥2 straight edges (the two cap chords)"
+        );
+        let chord_edge = straight[0].0;
+
+        // Find the two rail edges adjacent to the chord in the loop —
+        // the chord's endpoints are shared with exactly those rails.
+        let chord = model.edges.get(chord_edge).expect("chord edge");
+        let v_a = chord.start_vertex;
+        let v_b = chord.end_vertex;
+
+        // For each chord endpoint, find the rail edge (the OTHER loop
+        // edge incident to it) and re-anchor the endpoint a small step
+        // inboard ALONG that rail toward its far end.
+        let reanchor = |model: &mut BRepModel, v: VertexId| -> VertexId {
+            // Find a loop edge != chord_edge incident to v.
+            let rail = edge_ids
+                .iter()
+                .copied()
+                .find(|&e| {
+                    if e == chord_edge {
+                        return false;
+                    }
+                    let ed = match model.edges.get(e) {
+                        Some(ed) => ed,
+                        None => return false,
+                    };
+                    ed.start_vertex == v || ed.end_vertex == v
+                })
+                .expect("chord endpoint must share a rail edge");
+            let ed = model.edges.get(rail).expect("rail");
+            let far = if ed.start_vertex == v {
+                ed.end_vertex
+            } else {
+                ed.start_vertex
+            };
+            let vp = model.vertices.get_position(v).expect("v pos");
+            let fp = model.vertices.get_position(far).expect("far pos");
+            // Move 30% of the way from v toward the rail's far end —
+            // an arbitrary inboard point ON the rail (so still on the
+            // bevel plane, since the rail lies in the bevel plane).
+            let nx = vp[0] + 0.3 * (fp[0] - vp[0]);
+            let ny = vp[1] + 0.3 * (fp[1] - vp[1]);
+            let nz = vp[2] + 0.3 * (fp[2] - vp[2]);
+            let new_v = model.vertices.add(nx, ny, nz);
+            // Reanchor the rail's endpoint to the new vertex + rebuild
+            // the rail line (mirror reanchor_seam_edges_at_cap_arc_*).
+            let far_pos = model.vertices.get_position(far).expect("far pos");
+            let far_pt = Point3::new(far_pos[0], far_pos[1], far_pos[2]);
+            let new_pt = Point3::new(nx, ny, nz);
+            let ed = model.edges.get(rail).expect("rail");
+            let replaces_start = ed.start_vertex == v;
+            let (ls, le) = if replaces_start {
+                (new_pt, far_pt)
+            } else {
+                (far_pt, new_pt)
+            };
+            let new_curve = model.curves.add(Box::new(Line::new(ls, le)));
+            let edm = model.edges.get_mut(rail).expect("rail mut");
+            edm.curve_id = new_curve;
+            if replaces_start {
+                edm.start_vertex = new_v;
+            } else {
+                edm.end_vertex = new_v;
+            }
+            new_v
+        };
+
+        let new_a = reanchor(&mut model, v_a);
+        let new_b = reanchor(&mut model, v_b);
+
+        // REPLACE the chord edge: a fresh Line between the two new
+        // inboard points, spliced in by loop-edge replacement
+        // (lp.edges[idx] = new_edge), NOT an in-place curve mutation.
+        let na_pos = model.vertices.get_position(new_a).expect("new_a pos");
+        let nb_pos = model.vertices.get_position(new_b).expect("new_b pos");
+        let new_chord_curve = model.curves.add(Box::new(Line::new(
+            Point3::new(na_pos[0], na_pos[1], na_pos[2]),
+            Point3::new(nb_pos[0], nb_pos[1], nb_pos[2]),
+        )));
+        let old_chord = model.edges.get(chord_edge).expect("chord");
+        let new_chord_edge = model
+            .edges
+            .add(crate::primitives::edge::Edge::new_auto_range(
+                0,
+                new_a,
+                new_b,
+                new_chord_curve,
+                old_chord.orientation,
+            ));
+        {
+            let lp = model.loops.get_mut(outer_loop).expect("loop mut");
+            let idx = lp
+                .edges
+                .iter()
+                .position(|&e| e == chord_edge)
+                .expect("chord in loop");
+            lp.edges[idx] = new_chord_edge; // loop-edge replacement
+        }
+
+        // ---- ASSERT (a): outer loop still closed. ----
+        let closed = loop_is_closed(&model, outer_loop).expect("loop closure check after rebuild");
+        assert!(
+            closed,
+            "R1 FAIL: bevel outer loop tore after reanchor + chord replacement"
+        );
+
+        // ---- ASSERT (b): face still planar (all loop vertices
+        //       coplanar with the original bevel plane). ----
+        let loop_edges: Vec<EdgeId> = model.loops.get(outer_loop).expect("loop").edges.clone();
+        let mut max_dev = 0.0_f64;
+        for &eid in &loop_edges {
+            let edge = model.edges.get(eid).expect("edge");
+            for vtx in [edge.start_vertex, edge.end_vertex] {
+                let p = model.vertices.get_position(vtx).expect("vtx pos");
+                let dev = plane
+                    .distance_to_point(&Point3::new(p[0], p[1], p[2]))
+                    .abs();
+                if dev > max_dev {
+                    max_dev = dev;
+                }
+            }
+        }
+        assert!(
+            max_dev < 1e-6,
+            "R1 FAIL: bevel went non-planar; max vertex deviation {} from bevel plane",
+            max_dev
+        );
     }
 }
