@@ -15,7 +15,8 @@ use geometry_engine::primitives::{
     solid::Solid,
     surface::{
         Cone as GeoCone, Cylinder as GeoCylinder, GeneralNurbsSurface, Plane as GeoPlane,
-        Sphere as GeoSphere, Surface, Torus as GeoTorus,
+        Sphere as GeoSphere, Surface, SurfaceOfRevolution as GeoSurfaceOfRevolution,
+        Torus as GeoTorus,
     },
     topology_builder::BRepModel,
 };
@@ -160,6 +161,15 @@ pub enum SurfaceData {
         knots_v: Vec<f64>,
         degree_u: u32,
         degree_v: u32,
+    },
+    /// A surface of revolution: a profile curve revolved about an axis. Exported
+    /// as a STEP `SURFACE_OF_REVOLUTION` (exact, smooth) rather than the degree-1
+    /// grid fallback that faceted revolved parts (the FreeCAD nozzle issue).
+    SurfaceOfRevolution {
+        axis_origin: [f64; 3],
+        axis_direction: [f64; 3],
+        profile: CurveData,
+        angle: f64,
     },
 }
 
@@ -386,56 +396,7 @@ impl BRepSnapshot {
         // ── Curves ──
         let mut cmap: HashMap<Uuid, u32> = HashMap::new();
         for (uuid, c) in &self.curves {
-            let curve: Option<Box<dyn Curve>> = match c {
-                CurveData::Line { start, end } => {
-                    Some(Box::new(GeoLine::new(pt(*start), pt(*end))))
-                }
-                CurveData::Circle {
-                    center,
-                    normal,
-                    radius,
-                } => GeoCircle::new(pt(*center), vec(*normal), *radius)
-                    .ok()
-                    .map(|c| Box::new(c) as Box<dyn Curve>),
-                CurveData::Arc {
-                    center,
-                    normal,
-                    radius,
-                    start_angle,
-                    end_angle,
-                } => GeoArc::new(
-                    pt(*center),
-                    vec(*normal),
-                    *radius,
-                    *start_angle,
-                    *end_angle - *start_angle,
-                )
-                .ok()
-                .map(|a| Box::new(a) as Box<dyn Curve>),
-                CurveData::BSpline {
-                    control_points,
-                    knots,
-                    degree,
-                } => {
-                    let cps: Vec<Point3> = control_points.iter().map(|p| pt(*p)).collect();
-                    let weights = vec![1.0; cps.len()];
-                    GeoNurbsCurve::new(*degree as usize, cps, weights, knots.clone())
-                        .ok()
-                        .map(|n| Box::new(n) as Box<dyn Curve>)
-                }
-                CurveData::Nurbs {
-                    control_points,
-                    weights,
-                    knots,
-                    degree,
-                } => {
-                    let cps: Vec<Point3> = control_points.iter().map(|p| pt(*p)).collect();
-                    GeoNurbsCurve::new(*degree as usize, cps, weights.clone(), knots.clone())
-                        .ok()
-                        .map(|n| Box::new(n) as Box<dyn Curve>)
-                }
-            };
-            if let Some(curve) = curve {
+            if let Some(curve) = build_curve_from_data(c) {
                 let id = model.curves.add(curve);
                 cmap.insert(*uuid, id);
             }
@@ -522,6 +483,16 @@ impl BRepSnapshot {
                     .ok()
                     .map(|nurbs| Box::new(GeneralNurbsSurface { nurbs }) as Box<dyn Surface>)
                 }
+                SurfaceData::SurfaceOfRevolution {
+                    axis_origin,
+                    axis_direction,
+                    profile,
+                    angle,
+                } => build_curve_from_data(profile).and_then(|pc| {
+                    GeoSurfaceOfRevolution::new(pt(*axis_origin), vec(*axis_direction), pc, *angle)
+                        .ok()
+                        .map(|s| Box::new(s) as Box<dyn Surface>)
+                }),
             };
             if let Some(surface) = surface {
                 let id = model.surfaces.add(surface);
@@ -652,6 +623,60 @@ fn id_to_uuid(id: u64) -> Uuid {
 }
 
 /// Extract curve parameters into serializable CurveData
+/// Reconstruct a kernel curve from its serialized `CurveData`. Shared by the
+/// curve-import loop and the surface-of-revolution profile reconstruction.
+fn build_curve_from_data(c: &CurveData) -> Option<Box<dyn Curve>> {
+    let pt = |a: [f64; 3]| Point3::new(a[0], a[1], a[2]);
+    let vc = |a: [f64; 3]| Vector3::new(a[0], a[1], a[2]);
+    match c {
+        CurveData::Line { start, end } => Some(Box::new(GeoLine::new(pt(*start), pt(*end)))),
+        CurveData::Circle {
+            center,
+            normal,
+            radius,
+        } => GeoCircle::new(pt(*center), vc(*normal), *radius)
+            .ok()
+            .map(|c| Box::new(c) as Box<dyn Curve>),
+        CurveData::Arc {
+            center,
+            normal,
+            radius,
+            start_angle,
+            end_angle,
+        } => GeoArc::new(
+            pt(*center),
+            vc(*normal),
+            *radius,
+            *start_angle,
+            *end_angle - *start_angle,
+        )
+        .ok()
+        .map(|a| Box::new(a) as Box<dyn Curve>),
+        CurveData::BSpline {
+            control_points,
+            knots,
+            degree,
+        } => {
+            let cps: Vec<Point3> = control_points.iter().map(|p| pt(*p)).collect();
+            let weights = vec![1.0; cps.len()];
+            GeoNurbsCurve::new(*degree as usize, cps, weights, knots.clone())
+                .ok()
+                .map(|n| Box::new(n) as Box<dyn Curve>)
+        }
+        CurveData::Nurbs {
+            control_points,
+            weights,
+            knots,
+            degree,
+        } => {
+            let cps: Vec<Point3> = control_points.iter().map(|p| pt(*p)).collect();
+            GeoNurbsCurve::new(*degree as usize, cps, weights.clone(), knots.clone())
+                .ok()
+                .map(|n| Box::new(n) as Box<dyn Curve>)
+        }
+    }
+}
+
 fn extract_curve_data(curve: &dyn Curve) -> CurveData {
     use geometry_engine::primitives::curve::{Arc, Circle, Line, NurbsCurve};
 
@@ -839,6 +864,23 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
         };
     }
 
+    if let Some(sor) = any.downcast_ref::<GeoSurfaceOfRevolution>() {
+        // Exact: a profile curve revolved about an axis → STEP SURFACE_OF_REVOLUTION.
+        // The profile reuses the analytic curve paths (Line/Circle/Arc/NURBS), so a
+        // revolved nozzle/vessel exports smooth instead of the degree-1 grid below
+        // (the FreeCAD faceted-nozzle bug).
+        return SurfaceData::SurfaceOfRevolution {
+            axis_origin: [sor.axis_origin.x, sor.axis_origin.y, sor.axis_origin.z],
+            axis_direction: [
+                sor.axis_direction.x,
+                sor.axis_direction.y,
+                sor.axis_direction.z,
+            ],
+            profile: extract_curve_data(&*sor.profile_curve),
+            angle: sor.angle,
+        };
+    }
+
     // Fallback: sample the surface on a grid and store as a degree-1
     // B-spline. As with the curve fallback, the knot vectors MUST be
     // valid clamped vectors sized to the control-point grid
@@ -914,6 +956,53 @@ mod knot_tests {
         // (that was the exact serialization that broke re-import).
         for n in 2..=4usize {
             assert!(!clamped_uniform_knots(n, 1).is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod surface_of_revolution_export_tests {
+    use super::{extract_surface_data, CurveData, SurfaceData};
+    use geometry_engine::math::{Point3, Vector3};
+    use geometry_engine::primitives::curve::Line as GeoLine;
+    use geometry_engine::primitives::surface::SurfaceOfRevolution as SoR;
+
+    /// A SurfaceOfRevolution must export as an EXACT analytic surface, not the
+    /// degree-1 grid fallback that faceted revolved parts in FreeCAD. The extract
+    /// path must keep it analytic and preserve the profile curve exactly.
+    #[test]
+    fn surface_of_revolution_extracts_analytic_not_faceted() {
+        // A vertical line at radius 5, revolved 2π about Z (a cylinder as a SoR).
+        let profile = Box::new(GeoLine::new(
+            Point3::new(5.0, 0.0, 0.0),
+            Point3::new(5.0, 0.0, 10.0),
+        ));
+        let sor = SoR::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            profile,
+            std::f64::consts::TAU,
+        )
+        .expect("surface of revolution constructs");
+
+        match extract_surface_data(&sor) {
+            SurfaceData::SurfaceOfRevolution {
+                angle,
+                profile,
+                axis_direction,
+                ..
+            } => {
+                assert!(
+                    (angle - std::f64::consts::TAU).abs() < 1e-9,
+                    "full-revolution angle preserved"
+                );
+                assert!(
+                    matches!(profile, CurveData::Line { .. }),
+                    "profile stays an exact Line, not a faceted polyline"
+                );
+                assert!((axis_direction[2] - 1.0).abs() < 1e-9, "axis is +Z");
+            }
+            other => panic!("SurfaceOfRevolution faceted to the fallback: {other:?}"),
         }
     }
 }

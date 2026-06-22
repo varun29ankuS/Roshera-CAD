@@ -279,6 +279,24 @@ impl<W: Write> StepWriter<W> {
         Ok(id)
     }
 
+    /// Write an AXIS1_PLACEMENT (a location point + an axis direction) — the
+    /// placement a `SURFACE_OF_REVOLUTION` revolves its profile about.
+    pub fn write_axis1_placement(
+        &mut self,
+        location: &[f64; 3],
+        axis: &[f64; 3],
+    ) -> std::io::Result<StepId> {
+        let location_id = self.write_cartesian_point(location)?;
+        let axis_id = self.write_direction(axis)?;
+        let id = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=AXIS1_PLACEMENT('',{},{});",
+            id, location_id, axis_id
+        )?;
+        Ok(id)
+    }
+
     /// Write a line
     pub fn write_line(&mut self, start: &[f64; 3], end: &[f64; 3]) -> std::io::Result<StepId> {
         let start_id = self.write_cartesian_point(start)?;
@@ -670,6 +688,29 @@ impl<W: Write> StepWriter<W> {
                 knots_v,
                 Some(weights),
             ),
+            SurfaceData::SurfaceOfRevolution {
+                axis_origin,
+                axis_direction,
+                profile,
+                ..
+            } => {
+                // Exact analytic surface: the profile curve (reusing write_curve's
+                // Line/Circle/B-spline/NURBS paths) revolved about an
+                // AXIS1_PLACEMENT. STEP's SURFACE_OF_REVOLUTION is always the full
+                // 360°; the angular extent of a partial revolve lives on the
+                // trimming face, not the surface entity, so `angle` is not emitted.
+                let empty_map: std::collections::HashMap<&uuid::Uuid, StepId> =
+                    std::collections::HashMap::new();
+                let curve_id = self.write_curve(profile, &empty_map)?;
+                let axis_id = self.write_axis1_placement(axis_origin, axis_direction)?;
+                let id = self.next_id();
+                writeln!(
+                    self.writer,
+                    "{}=SURFACE_OF_REVOLUTION('',{},{});",
+                    id, curve_id, axis_id
+                )?;
+                Ok(id)
+            }
         }
     }
 
