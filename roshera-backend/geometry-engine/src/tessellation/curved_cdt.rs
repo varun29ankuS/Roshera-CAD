@@ -417,6 +417,60 @@ fn point_segment_distance_uv(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
+/// Number of segments needed to span a parametric direction so that the chord
+/// between consecutive samples deviates from the true surface by no more than
+/// `chord_tolerance` (the sagitta criterion — the standard CAD curve-density
+/// control). The deviation is MEASURED, not derived from an analytic radius, so
+/// it is correct for any surface: starting at `min_segments`, the segment count
+/// is doubled while the worst sampled sagitta over the supplied cross-parameter
+/// levels exceeds the tolerance, capped at `max_segments`.
+///
+/// `along_u == true` sweeps the primary parameter over `[p_lo, p_hi]` at each
+/// fixed `cross` value (an iso-`v` line); `false` sweeps `v` at each fixed `u`.
+/// A straight direction has zero sagitta at every level, so it returns
+/// `min_segments` immediately — the developable economy is preserved.
+fn chord_segments(
+    surface: &dyn Surface,
+    params: &TessellationParams,
+    along_u: bool,
+    p_lo: f64,
+    p_hi: f64,
+    cross: &[f64],
+) -> usize {
+    let span = p_hi - p_lo;
+    if !(span > 0.0) || params.chord_tolerance <= 0.0 {
+        return params.min_segments;
+    }
+    let eval = |p: f64, c: f64| -> Option<Point3> {
+        let (u, v) = if along_u { (p, c) } else { (c, p) };
+        surface.evaluate_full(u, v).ok().map(|e| e.position)
+    };
+    // Worst sagitta over all cross levels for a given segment count: each
+    // segment's true midpoint vs the straight chord midpoint.
+    let worst_sagitta = |n: usize| -> f64 {
+        let mut worst = 0.0_f64;
+        for &c in cross {
+            for i in 0..n {
+                let a_p = p_lo + span * (i as f64) / (n as f64);
+                let b_p = p_lo + span * ((i + 1) as f64) / (n as f64);
+                let m_p = 0.5 * (a_p + b_p);
+                if let (Some(a), Some(m), Some(b)) = (eval(a_p, c), eval(m_p, c), eval(b_p, c)) {
+                    let chord_mid =
+                        Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5);
+                    worst = worst.max((m - chord_mid).magnitude());
+                }
+            }
+        }
+        worst
+    };
+    let mut n = params.min_segments.max(1);
+    let cap = params.max_segments.max(n);
+    while n < cap && worst_sagitta(n) > params.chord_tolerance {
+        n = (n * 2).min(cap);
+    }
+    n.clamp(params.min_segments, params.max_segments)
+}
+
 fn generate_steiner_candidates(
     surface: &dyn Surface,
     bbox: UvBBox,
@@ -464,6 +518,26 @@ fn generate_steiner_candidates(
     let mut nu = nu_raw.max(params.min_segments).min(params.max_segments);
     let mut nv = nv_raw.max(params.min_segments).min(params.max_segments);
 
+    // CHORD-HEIGHT (sagitta) criterion. The edge-length-driven `nu`/`nv` above
+    // collapse to `min_segments` whenever `max_edge_length` is unset or large
+    // (the chord-tolerance-only tessellation regime), because they divide a 3D
+    // arc length by `max_edge` alone and never consult `chord_tolerance`. A
+    // CURVED parametric direction then gets only `min_segments` segments — e.g.
+    // a full cylinder lateral collapsed to nu=3, so its interior Steiner rows
+    // chorded 120° of the circle each, folding the wall across its own interior
+    // and under-measuring the enclosed volume by ~40% (and starving a
+    // NURBS-loft wall's per-station rings). The standard CAD density control is
+    // the sagitta: refine a direction until the chord between consecutive
+    // samples deviates from the true surface by ≤ `chord_tolerance`. This is
+    // measured GEOMETRICALLY (no analytic radius needed, so it is exact for any
+    // NURBS / ruled / analytic surface) and folded in via `max`, so a genuinely
+    // STRAIGHT direction (zero sagitta — a cylinder/cone generator) still needs
+    // only `min_segments` and the developable economy is preserved.
+    let nu_chord = chord_segments(surface, params, true, u_lo, u_hi, &[v_lo, v_mid, v_hi]);
+    let nv_chord = chord_segments(surface, params, false, v_lo, v_hi, &[u_lo, u_mid, u_hi]);
+    nu = nu.max(nu_chord).min(params.max_segments);
+    nv = nv.max(nv_chord).min(params.max_segments);
+
     // Developable-direction collapse (TESS-PERF / BOOL #86). `nu`/`nv` above
     // are driven by raw 3D arc length (`d*_3d / max_edge_length`), so a
     // parametric direction that is geometrically STRAIGHT — a cylinder or cone
@@ -476,6 +550,9 @@ fn generate_steiner_candidates(
     // ACCEPTED downstream because the Ruppert skinny pass is gated on
     // `triangle_fails_fidelity` — without that gate refinement re-added the
     // rows, which is why this collapse alone (earlier attempt) only cut ~20%.
+    // The sagitta criterion above already returns `min_segments` for a straight
+    // direction, so this is a belt-and-braces clamp that also neutralises any
+    // sampling noise in the chord measure for an exactly-collinear chain.
     let pos =
         |u: f64, v: f64| -> Option<Point3> { surface.evaluate_full(u, v).ok().map(|e| e.position) };
     let straight_chain = |a: Option<Point3>, m: Option<Point3>, b: Option<Point3>| -> bool {
