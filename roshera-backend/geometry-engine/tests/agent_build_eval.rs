@@ -1756,19 +1756,19 @@ fn render_drawing_demo() {
     // solids; curved/boolean solids return empty caps today (section-op gap),
     // so the demo sections a box.
     use geometry_engine::drawing::{section_view, Drawing, SheetSize};
-    let mut mb = BRepModel::new();
-    let bx = box_solid(&mut mb, 80.0, 80.0, 40.0);
+    // Cut the flanged housing on a plane through its axis (normal +X): the
+    // through-bore splits the axial section into two hatched wall profiles.
     let sv = section_view(
-        &mb,
-        bx,
+        &m3,
+        housing,
         uuid::Uuid::nil(),
-        Point3::ZERO,
+        Point3::new(0.0, 0.0, 30.0),
         Vector3::new(1.0, 0.0, 0.0),
         "SECTION A-A",
-        [148.0, 110.0],
+        [148.0, 105.0],
         1.0,
     )
-    .expect("section view of box");
+    .expect("section view of housing");
     let mut sdwg = Drawing::new("Section Demo", SheetSize::A4);
     sdwg.add_view(sv);
     let spdf = render_drawing_pdf(&sdwg).expect("section pdf");

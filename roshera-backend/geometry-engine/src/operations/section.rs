@@ -152,7 +152,21 @@ pub fn section_solid_by_plane(
             None => continue,
         };
         for face_id in &shell.faces {
+            let before = fragments.len();
             collect_face_fragments(model, *face_id, plane_origin, normal, &mut fragments);
+            if std::env::var("ROSHERA_SEC_TRACE").is_ok() {
+                let kind = model
+                    .faces
+                    .get(*face_id)
+                    .and_then(|f| model.surfaces.get(f.surface_id))
+                    .map(|s| s.surface_type());
+                eprintln!(
+                    "[sec] face {} {:?}: +{} frags",
+                    face_id,
+                    kind,
+                    fragments.len() - before
+                );
+            }
         }
     }
 
@@ -162,6 +176,8 @@ pub fn section_solid_by_plane(
 
     // Chain fragments into closed 3D loops.
     let raw_loops = chain_fragments_into_loops(&fragments, &tolerance);
+    let sec_trace = std::env::var("ROSHERA_SEC_TRACE").is_ok();
+    let n_raw = raw_loops.len();
     // Dense marching-square output produces ~1000 collinear samples per
     // straight edge. CDT chokes on long collinear runs (no triangulation
     // is well-defined), so simplify each loop to its corners before
@@ -174,6 +190,14 @@ pub fn section_solid_by_plane(
         .map(|l| simplify_loop_rdp(&l, simplify_eps))
         .filter(|l| l.len() >= 3)
         .collect();
+    if sec_trace {
+        eprintln!(
+            "[sec] frags={} raw_loops={} simplified(>=3)={}",
+            fragments.len(),
+            n_raw,
+            loops.len()
+        );
+    }
     if loops.is_empty() {
         return Ok(Vec::new());
     }
@@ -216,6 +240,14 @@ pub fn section_solid_by_plane(
         }
     }
 
+    if sec_trace {
+        eprintln!(
+            "[sec] deduped_loops={} outers={} caps={}",
+            projected.len(),
+            nesting.outers.len(),
+            caps.len()
+        );
+    }
     Ok(caps)
 }
 
@@ -725,6 +757,119 @@ fn clip_segment_to_bbox(
 // Internal: fragment chaining
 // ---------------------------------------------------------------------------
 
+/// If `frag` is a straight segment (all points collinear within `eps`), return
+/// its canonical line `(foot, dir)`: `dir` is a unit vector with its dominant
+/// component positive, `foot` the line's closest point to the origin (as a
+/// vector from origin). A point P's parameter along the line is then `P · dir`.
+fn fragment_as_line(frag: &Polyline3D, eps: f64) -> Option<(Vector3, Vector3)> {
+    let pts = &frag.points;
+    if pts.len() < 2 {
+        return None;
+    }
+    let a = Vector3::new(pts[0].x, pts[0].y, pts[0].z);
+    // len >= 2 guaranteed above, so the last index is valid.
+    let last = &pts[pts.len() - 1];
+    let b = Vector3::new(last.x, last.y, last.z);
+    let mut dir = (b - a).normalize().ok()?;
+    let (ax, ay, az) = (dir.x.abs(), dir.y.abs(), dir.z.abs());
+    let dom = if ax >= ay && ax >= az {
+        dir.x
+    } else if ay >= az {
+        dir.y
+    } else {
+        dir.z
+    };
+    if dom < 0.0 {
+        dir = dir * -1.0;
+    }
+    for p in pts {
+        let pv = Vector3::new(p.x, p.y, p.z) - a;
+        let perp = pv - dir * pv.dot(&dir);
+        if perp.magnitude() > eps {
+            return None;
+        }
+    }
+    let foot = a - dir * a.dot(&dir);
+    Some((foot, dir))
+}
+
+/// Merge straight fragments lying on the SAME infinite line into the union of
+/// their parameter ranges, so the marching-square tracer's overlapping copies
+/// of a single generator collapse to one exact-ended segment. Non-straight
+/// fragments (curved arcs) pass through unchanged.
+fn merge_collinear_fragments(frags: Vec<Polyline3D>, eps: f64) -> Vec<Polyline3D> {
+    use std::collections::HashMap;
+    let q = |x: f64| (x / eps).round() as i64;
+    let mut groups: HashMap<(i64, i64, i64, i64, i64, i64), (Vector3, Vector3, Vec<(f64, f64)>)> =
+        HashMap::new();
+    let mut out: Vec<Polyline3D> = Vec::new();
+    for f in frags {
+        if let Some((foot, dir)) = fragment_as_line(&f, eps) {
+            // fragment_as_line returned Some, so points.len() >= 2 — indices valid.
+            let a = &f.points[0];
+            let b = &f.points[f.points.len() - 1];
+            let ta = a.x * dir.x + a.y * dir.y + a.z * dir.z;
+            let tb = b.x * dir.x + b.y * dir.y + b.z * dir.z;
+            let key = (
+                q(foot.x),
+                q(foot.y),
+                q(foot.z),
+                q(dir.x),
+                q(dir.y),
+                q(dir.z),
+            );
+            let e = groups.entry(key).or_insert_with(|| (foot, dir, Vec::new()));
+            e.2.push((ta.min(tb), ta.max(tb)));
+        } else {
+            out.push(f);
+        }
+    }
+    for (_, (foot, dir, mut spans)) in groups {
+        spans.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cur: Option<(f64, f64)> = None;
+        for (lo, hi) in spans {
+            match cur {
+                Some((c0, c1)) if lo <= c1 + eps => cur = Some((c0, c1.max(hi))),
+                Some((c0, c1)) => {
+                    out.push(Polyline3D {
+                        points: vec![
+                            Point3::new(
+                                foot.x + dir.x * c0,
+                                foot.y + dir.y * c0,
+                                foot.z + dir.z * c0,
+                            ),
+                            Point3::new(
+                                foot.x + dir.x * c1,
+                                foot.y + dir.y * c1,
+                                foot.z + dir.z * c1,
+                            ),
+                        ],
+                    });
+                    cur = Some((lo, hi));
+                }
+                None => cur = Some((lo, hi)),
+            }
+        }
+        if let Some((c0, c1)) = cur {
+            out.push(Polyline3D {
+                points: vec![
+                    Point3::new(
+                        foot.x + dir.x * c0,
+                        foot.y + dir.y * c0,
+                        foot.z + dir.z * c0,
+                    ),
+                    Point3::new(
+                        foot.x + dir.x * c1,
+                        foot.y + dir.y * c1,
+                        foot.z + dir.z * c1,
+                    ),
+                ],
+            });
+        }
+    }
+    out
+}
+
 fn chain_fragments_into_loops(fragments: &[Polyline3D], tolerance: &Tolerance) -> Vec<Vec<Point3>> {
     let weld_eps = tolerance.distance().max(1e-9);
     let mut frags: Vec<Polyline3D> = fragments
@@ -743,6 +888,13 @@ fn chain_fragments_into_loops(fragments: &[Polyline3D], tolerance: &Tolerance) -
     // degenerate "loops" instead of walking to the real next face.
     let dedup_eps = (tolerance.distance() * 100.0).max(1e-4);
     frags = dedup_fragments_by_endpoints(frags, dedup_eps);
+    // Collapse the marching-square tracer's redundant copies of each straight
+    // generator (cylinder/cone laterals cut by an axis-containing plane) into
+    // their union, so the curved fragments reach the EXACT planar-clip corners
+    // and the chain closes. (dedup_fragments_by_endpoints only removes exact
+    // endpoint-pair duplicates; the grid emits overlapping near-duplicates whose
+    // endpoints differ by the grid step.)
+    frags = merge_collinear_fragments(frags, (tolerance.distance() * 1e4).max(1e-2));
 
     let mut used = vec![false; frags.len()];
     let mut loops: Vec<Vec<Point3>> = Vec::new();
