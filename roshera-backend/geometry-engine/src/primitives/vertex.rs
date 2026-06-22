@@ -631,9 +631,14 @@ impl VertexStore {
     pub fn remove(&mut self, id: VertexId) -> bool {
         let idx = id as usize;
         if idx < self.flags.len() {
-            // Mark as deleted
-            self.flags[idx] |= VertexFlags::DELETED;
-            self.stats.total_created -= 1; // Decrement count
+            // Only decrement the live count on the FIRST removal. A second
+            // remove() of an already-DELETED slot would underflow
+            // `total_created` (u64) — panic in debug, wrap in release —
+            // permanently corrupting the stat.
+            if self.flags[idx] & VertexFlags::DELETED == 0 {
+                self.flags[idx] |= VertexFlags::DELETED;
+                self.stats.total_created -= 1;
+            }
             true
         } else {
             false

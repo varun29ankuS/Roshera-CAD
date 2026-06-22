@@ -32,6 +32,9 @@ import { uvToWorld } from './sketch-plane-uv'
 
 export function ServerSketches() {
   const serverSketches = useSceneStore((s) => s.serverSketches)
+  // Sketch ids the user has hidden in the model tree — skip them entirely,
+  // exactly as a hidden solid's mesh is not drawn.
+  const hiddenSketchIds = useSceneStore((s) => s.hiddenSketchIds)
   // The locally-edited session (if any) — drawn by SketchOverlay, so we
   // must not redraw it here. `null` when the user isn't sketching, in
   // which case every server sketch is fair game.
@@ -43,6 +46,7 @@ export function ServerSketches() {
     const out: Array<{ key: string; points: THREE.Vector3[] }> = []
     for (const session of serverSketches.values()) {
       if (session.id === activeLocalId) continue
+      if (hiddenSketchIds.has(session.id)) continue
       const shapes = Array.isArray(session.shapes) ? session.shapes : []
       shapes.forEach((shape, idx) => {
         const profile = buildProfile2D(
@@ -58,12 +62,12 @@ export function ServerSketches() {
       })
     }
     return out
-  }, [serverSketches, activeLocalId])
+  }, [serverSketches, activeLocalId, hiddenSketchIds])
 
   if (loops.length === 0) return null
 
   return (
-    <group name="server-sketches">
+    <group name="server-sketches" renderOrder={999}>
       {loops.map((l) => (
         <Line
           key={l.key}
@@ -74,6 +78,14 @@ export function ServerSketches() {
           lineWidth={2}
           opacity={0.95}
           transparent
+          // Draw the generating curve ON TOP of solids. A revolve/extrude
+          // profile is COINCIDENT with the solid's wall, so with the default
+          // depth test the opaque mesh hides it entirely ("I can't see the
+          // sketch"). depthTest:false + a high renderOrder keeps the curve
+          // visible through the part — the standard "ghost generating geometry"
+          // treatment in CAD sketchers.
+          depthTest={false}
+          renderOrder={999}
         />
       ))}
     </group>

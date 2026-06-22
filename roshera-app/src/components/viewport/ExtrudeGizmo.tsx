@@ -216,7 +216,7 @@ export function ExtrudeGizmo() {
     cancelPreview()
     // cancelPreview is stable across renders (refs only), and we
     // deliberately want this to run on every selection change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [sel?.objectId, sel?.index, setGizmoDragging])
 
   // Window-level pointer listeners while dragging. Three-fiber's event
@@ -454,7 +454,7 @@ export function ExtrudeGizmo() {
         })
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({}))
-          // eslint-disable-next-line no-console
+           
           console.error(
             '[ExtrudeGizmo] face/extrude failed:',
             resp.status,
@@ -466,7 +466,7 @@ export function ExtrudeGizmo() {
         // cleared because the host UUID is retired — and a fresh face
         // selection has to be made on the new solid.
       } catch (err) {
-        // eslint-disable-next-line no-console
+         
         console.error('[ExtrudeGizmo] face/extrude network error:', err)
       } finally {
         setSubmitting(false)
@@ -486,7 +486,7 @@ export function ExtrudeGizmo() {
     }
     // cancelPreview is stable (refs only). The other deps are the
     // values the inner closures actually read.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [active, camera, gl, setGizmoDragging])
 
   // Quaternion that aligns the cone/cylinder default +Y axis to the

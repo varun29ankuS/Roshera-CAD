@@ -285,6 +285,59 @@ impl SketchSession {
             .last_mut()
             .ok_or(SketchError::NoShapes(session_id))
     }
+
+    /// Build a kernel [`geometry_engine::sketch2d::Sketch`] from this
+    /// click-to-place session so the kernel's analytic capabilities — shape
+    /// recognition, the agent-eye rasterizer, the validity certificate — can run
+    /// on a LIVE sketch. Polylines and rectangles become closed polylines;
+    /// circles become circle entities (centre + a point on the radius).
+    ///
+    /// Anchored at XY: the in-plane (u, v) coordinates are what every 2D analysis
+    /// reads, so the plane choice is immaterial here. This read-only bridge is
+    /// what the `render_sketch` / `recognize_sketch` / `certify_sketch` MCP tools
+    /// call; B1 widens it into the full unify-onto-the-constrained-Sketch path.
+    pub fn to_kernel_sketch(&self) -> geometry_engine::sketch2d::Sketch {
+        use geometry_engine::sketch2d::{Point2d, Sketch, SketchAnchor};
+        let sketch = Sketch::new(format!("session-{}", self.id), SketchAnchor::xy());
+        for shape in &self.shapes {
+            match shape.tool {
+                SketchTool::Polyline => {
+                    let verts: Vec<Point2d> = shape
+                        .points
+                        .iter()
+                        .map(|&[x, y]| Point2d::new(x, y))
+                        .collect();
+                    if verts.len() >= 2 {
+                        let _ = sketch.add_polyline(verts, true);
+                    }
+                }
+                SketchTool::Rectangle => {
+                    if let [a, b] = shape.points.as_slice() {
+                        let [ax, ay] = *a;
+                        let [bx, by] = *b;
+                        let verts = vec![
+                            Point2d::new(ax, ay),
+                            Point2d::new(bx, ay),
+                            Point2d::new(bx, by),
+                            Point2d::new(ax, by),
+                        ];
+                        let _ = sketch.add_polyline(verts, true);
+                    }
+                }
+                SketchTool::Circle => {
+                    if let [center, edge] = shape.points.as_slice() {
+                        let [cx, cy] = *center;
+                        let [ex, ey] = *edge;
+                        let r = ((ex - cx).powi(2) + (ey - cy).powi(2)).sqrt();
+                        if r > 1e-9 {
+                            let _ = sketch.add_circle(Point2d::new(cx, cy), r);
+                        }
+                    }
+                }
+            }
+        }
+        sketch
+    }
 }
 
 fn unix_now() -> u64 {
@@ -292,6 +345,54 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use geometry_engine::sketch2d::{recognize_sketch, ShapeClass};
+
+    fn session(tool: SketchTool, points: Vec<[f64; 2]>) -> SketchSession {
+        SketchSession {
+            id: Uuid::new_v4(),
+            plane: SketchPlane::XY,
+            shapes: vec![SketchShape {
+                id: Uuid::new_v4(),
+                tool,
+                points,
+            }],
+            circle_segments: 64,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn circle_session_recognises_as_circle() {
+        let s = session(SketchTool::Circle, vec![[0.0, 0.0], [5.0, 0.0]]);
+        assert_eq!(
+            recognize_sketch(&s.to_kernel_sketch()).class,
+            ShapeClass::Circle
+        );
+    }
+
+    #[test]
+    fn rectangle_session_recognises_as_rectangle() {
+        let s = session(SketchTool::Rectangle, vec![[0.0, 0.0], [20.0, 10.0]]);
+        assert_eq!(
+            recognize_sketch(&s.to_kernel_sketch()).class,
+            ShapeClass::Rectangle
+        );
+    }
+
+    #[test]
+    fn square_session_recognises_as_square() {
+        let s = session(SketchTool::Rectangle, vec![[0.0, 0.0], [10.0, 10.0]]);
+        assert_eq!(
+            recognize_sketch(&s.to_kernel_sketch()).class,
+            ShapeClass::Square
+        );
+    }
 }
 
 /// Errors that can come out of the manager. Carry the Uuid where
@@ -1383,6 +1484,83 @@ pub async fn get_sketch(
         .get(&id)
         .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
     Ok(Json(session))
+}
+
+/// `GET /api/sketch/{id}/recognize` — analytic IDENTITY of a live sketch
+/// ("is a gear a gear?"). Bridges the session to a kernel `Sketch` and runs the
+/// analytic recognizer, returning the measured shape class (circle / triangle /
+/// rectangle / square / regular-polygon / polygon / compound) — not a VLM guess.
+/// Read-only; the agent-facing `recognize_sketch` MCP tool wraps this.
+pub async fn recognize_sketch_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<geometry_engine::sketch2d::Recognition>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+    let sketch = session.to_kernel_sketch();
+    Ok(Json(geometry_engine::sketch2d::recognize_sketch(&sketch)))
+}
+
+/// `GET /api/sketch/{id}/certify` — the SKETCH validity certificate for a live
+/// sketch: the "can't lie" moat over the wire. Bridges the session to a kernel
+/// `Sketch` and returns the certificate (constrainedness, constraint-consistency,
+/// closed-profile, self-intersection-free, entity-validity, `is_sound`). The
+/// agent-facing `certify_sketch` MCP tool wraps this.
+pub async fn certify_sketch_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<geometry_engine::sketch2d::SketchValidityCertificate>, ApiError> {
+    let id = parse_uuid(&id)?;
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+    let sketch = session.to_kernel_sketch();
+    Ok(Json(sketch.certify()))
+}
+
+/// Base64-PNG agent-eye render of a live sketch (mirrors `render_part`'s shape).
+#[derive(Debug, serde::Serialize)]
+pub struct SketchRenderResponse {
+    /// Base64-encoded PNG a vision-capable agent can decode and SEE.
+    pub png_base64: String,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// `GET /api/sketch/{id}/render` — the AGENT EYE for a live sketch: a base64-PNG
+/// rasterization a vision-capable agent can SEE. Bridges the session to a kernel
+/// `Sketch` and runs the deterministic 2D rasterizer. The `render_sketch` MCP
+/// tool wraps this.
+pub async fn render_sketch_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SketchRenderResponse>, ApiError> {
+    use base64::Engine as _;
+    let id = parse_uuid(&id)?;
+    let session = state
+        .sketches
+        .get(&id)
+        .ok_or_else(|| ApiError::from(SketchError::NotFound(id)))?;
+    let sketch = session.to_kernel_sketch();
+    let frame = geometry_engine::render::sketch::render_sketch(&sketch).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch has no drawable geometry to render",
+        )
+    })?;
+    let png = frame
+        .to_png()
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("png encode: {e}")))?;
+    let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    Ok(Json(SketchRenderResponse {
+        png_base64,
+        width: frame.width,
+        height: frame.height,
+    }))
 }
 
 /// `GET /api/sketch/{id}/regions` — read-only region classification

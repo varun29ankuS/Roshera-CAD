@@ -610,6 +610,11 @@ interface SceneState {
    * sync by `Sketch{Created,Updated,Deleted}` WS frames.
    */
   serverSketches: Map<string, ServerSketchSession>
+  /** Sketch ids the user has hidden from the model tree. Parallels
+   *  `CADObject.visible` — a committed sketch is a first-class, HIDEABLE
+   *  scene entity (not a transient session), so it gets the same show/hide
+   *  affordance a solid has. `ServerSketches` skips ids in this set. */
+  hiddenSketchIds: Set<string>
 
   // Three.js refs (set by canvas components)
   sceneRef: THREE.Scene | null
@@ -761,6 +766,8 @@ interface SceneState {
    * sketches are live on the backend).
    */
   setServerSketches: (sessions: ServerSketchSession[]) => void
+  /** Show/hide a committed sketch (model-tree visibility toggle). */
+  toggleSketchVisibility: (id: string) => void
   /**
    * Re-enter an existing server-side sketch as the active editing
    * session. Used by the model tree's "Edit sketch" context menu.
@@ -952,6 +959,7 @@ const sceneCreator: StateCreator<
       extrudeHover: { active: false },
     },
     serverSketches: new Map(),
+    hiddenSketchIds: new Set(),
     csketch: {
       summaries: new Map(),
       activeId: null,
@@ -1041,6 +1049,7 @@ const sceneCreator: StateCreator<
         hoveredId: null,
         subElementSelections: [],
         serverSketches: new Map(),
+        hiddenSketchIds: new Set(),
       }),
 
     selectObject: (id, additive) =>
@@ -1273,13 +1282,18 @@ const sceneCreator: StateCreator<
     exitSketch: (options) => {
       const cur = useSceneStore.getState().sketch
       const id = cur.serverId
-      // When the panel is closing on a sketch that was reopened from
-      // an existing feature ("Edit sketch" path), the backend session
-      // *is* that feature's profile — deleting it would orphan the
-      // visible solid. Default the implicit-delete to false in that
-      // case; a caller that genuinely wants to wipe the session can
-      // still pass `deleteBackend: true` explicitly.
-      const defaultDelete = cur.editingSourceObjectId === null
+      // Default delete only an EMPTY, standalone session. Two cases must
+      // survive an implicit exit:
+      //  - a sketch reopened from a feature ("Edit sketch") — the backend
+      //    session IS that feature's profile; deleting it orphans the solid.
+      //  - a standalone sketch that has DRAWN CONTENT — a finished/closed
+      //    sketch must persist as a visible curve (the generating profile),
+      //    not vanish the moment the panel closes. Previously any standalone
+      //    session was deleted on exit, so a drawn curve disappeared on finish.
+      // A caller that genuinely wants to wipe the session passes
+      // `deleteBackend: true` explicitly (the Cancel/discard path).
+      const hasContent = cur.shapes.some((s) => s.points.length > 0)
+      const defaultDelete = cur.editingSourceObjectId === null && !hasContent
       const deleteBackend = options?.deleteBackend ?? defaultDelete
       set((state) => ({
         sketch: {
@@ -1636,6 +1650,14 @@ const sceneCreator: StateCreator<
           serverSketches.set(s.id, s)
         }
         return { serverSketches }
+      }),
+
+    toggleSketchVisibility: (id) =>
+      set((state) => {
+        const hiddenSketchIds = new Set(state.hiddenSketchIds)
+        if (hiddenSketchIds.has(id)) hiddenSketchIds.delete(id)
+        else hiddenSketchIds.add(id)
+        return { hiddenSketchIds }
       }),
 
     editServerSketch: async (id) => {

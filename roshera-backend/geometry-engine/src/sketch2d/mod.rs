@@ -61,6 +61,12 @@ pub mod inference;
 pub mod sketch_topology;
 pub mod sketch_validation;
 
+// Sketch-validity certificate — the "can't lie" moat extended to 2D sketches.
+pub mod sketch_certificate;
+
+// Analytic shape recognition — the certifiable IDENTITY layer ("is a gear a gear?").
+pub mod recognize;
+
 // Re-export commonly used types
 pub use arc2d::{Arc2d, Arc2dId};
 pub use circle2d::{Circle2d, Circle2dId};
@@ -85,7 +91,9 @@ pub use sketch_solver::{
 pub use inference::{
     infer_constraints, DraftEntity, DraftSlot, InferenceTolerance, ProposedConstraint,
 };
+pub use recognize::{recognize_sketch, Recognition, ShapeClass};
 pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
+pub use sketch_certificate::{certify_sketch, SketchConstrainedness, SketchValidityCertificate};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 pub use snap::{SnapCandidate, SnapKind};
 

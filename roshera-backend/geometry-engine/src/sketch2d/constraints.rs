@@ -568,7 +568,120 @@ impl ConstraintStore {
             }
         }
 
+        // Transitive coincidence vs separation (the DCM-grade tier): points
+        // joined by a CHAIN of Coincident constraints share one location, so any
+        // Distance > 0 between two of them is contradictory even though no single
+        // Coincident names that pair (e.g. a≡b, b≡c, distance(a,c)=10). Pairwise
+        // comparison cannot see it; a union-find over the Coincident graph does.
+        let mut parent: std::collections::HashMap<Point2dId, Point2dId> =
+            std::collections::HashMap::new();
+        let mut witness: std::collections::HashMap<Point2dId, ConstraintId> =
+            std::collections::HashMap::new();
+        for entry in self.constraints.iter() {
+            let con = entry.value();
+            if let ConstraintType::Geometric(GeometricConstraint::Coincident) = &con.constraint_type
+            {
+                if let [EntityRef::Point(a), EntityRef::Point(b)] = con.entities.as_slice() {
+                    let (a, b) = (*a, *b);
+                    let ra = Self::uf_find(&mut parent, a);
+                    let rb = Self::uf_find(&mut parent, b);
+                    if ra != rb {
+                        parent.insert(ra, rb);
+                    }
+                    witness.entry(a).or_insert(con.id);
+                    witness.entry(b).or_insert(con.id);
+                }
+            }
+        }
+        if !parent.is_empty() {
+            for entry in self.constraints.iter() {
+                let con = entry.value();
+                if let ConstraintType::Dimensional(DimensionalConstraint::Distance(v)) =
+                    &con.constraint_type
+                {
+                    if v.abs() > 1e-9 {
+                        if let [EntityRef::Point(p), EntityRef::Point(q)] = con.entities.as_slice()
+                        {
+                            let (p, q) = (*p, *q);
+                            if Self::uf_find(&mut parent, p) == Self::uf_find(&mut parent, q) {
+                                if let Some(w) =
+                                    witness.get(&p).or_else(|| witness.get(&q)).copied()
+                                {
+                                    conflicts.push((con.id, w));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Coordinate coherence within a coincident group: points forced
+            // coincident cannot carry different fixed X (or Y) coordinates, even
+            // when the two coordinate constraints name DIFFERENT points in the
+            // same chain (x(a)=0, x(c)=5 with a≡b≡c). The same-point case is
+            // already caught pairwise; here we only consider coincidence-touched
+            // points so we don't double-report it.
+            let mut x_by_root: std::collections::HashMap<Point2dId, (f64, ConstraintId)> =
+                std::collections::HashMap::new();
+            let mut y_by_root: std::collections::HashMap<Point2dId, (f64, ConstraintId)> =
+                std::collections::HashMap::new();
+            for entry in self.constraints.iter() {
+                let con = entry.value();
+                let coord = match &con.constraint_type {
+                    ConstraintType::Dimensional(DimensionalConstraint::XCoordinate(v)) => {
+                        Some((true, *v))
+                    }
+                    ConstraintType::Dimensional(DimensionalConstraint::YCoordinate(v)) => {
+                        Some((false, *v))
+                    }
+                    _ => None,
+                };
+                if let Some((is_x, v)) = coord {
+                    if let [EntityRef::Point(p)] = con.entities.as_slice() {
+                        let p = *p;
+                        // `witness` holds every coincidence-touched point;
+                        // `parent` does not (a group's final root is only ever a
+                        // value, never a key), so gate on `witness`.
+                        if !witness.contains_key(&p) {
+                            continue; // not in any coincident group
+                        }
+                        let root = Self::uf_find(&mut parent, p);
+                        let map = if is_x { &mut x_by_root } else { &mut y_by_root };
+                        match map.get(&root) {
+                            Some(&(prev_v, prev_id)) => {
+                                if (prev_v - v).abs() > 1e-9 {
+                                    conflicts.push((con.id, prev_id));
+                                }
+                            }
+                            None => {
+                                map.insert(root, (v, con.id));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         conflicts
+    }
+
+    /// Union-find root with path compression over point ids. Used by
+    /// `find_conflicts` to take the transitive closure of Coincident
+    /// constraints so a chained coincidence is treated as one location.
+    fn uf_find(
+        parent: &mut std::collections::HashMap<Point2dId, Point2dId>,
+        x: Point2dId,
+    ) -> Point2dId {
+        let p = match parent.get(&x) {
+            Some(&p) => p,
+            None => return x,
+        };
+        if p == x {
+            return x;
+        }
+        let root = Self::uf_find(parent, p);
+        parent.insert(x, root);
+        root
     }
 
     /// Check if two constraints conflict with each other
@@ -722,6 +835,11 @@ impl ConstraintStore {
             // Parallel and perpendicular are contradictory
             (Parallel, Perpendicular) | (Perpendicular, Parallel) => true,
 
+            // Collinear lines lie on the same infinite line, hence are parallel;
+            // a perpendicular requirement contradicts that. (Collinear+Parallel,
+            // by contrast, AGREE and must not be flagged.)
+            (Collinear, Perpendicular) | (Perpendicular, Collinear) => true,
+
             // Horizontal and vertical are contradictory (for same line)
             (Horizontal, Vertical) | (Vertical, Horizontal) => true,
 
@@ -745,12 +863,44 @@ impl ConstraintStore {
     /// incompatibility as an unsatisfied residual.
     fn mixed_constraints_conflict(
         &self,
-        _c1: &Constraint,
-        _c2: &Constraint,
-        _d: &DimensionalConstraint,
-        _g: &GeometricConstraint,
+        c1: &Constraint,
+        c2: &Constraint,
+        d: &DimensionalConstraint,
+        g: &GeometricConstraint,
     ) -> bool {
-        false
+        // Only constraints on the same ordered entity tuple can contradict.
+        if !self.same_entity_pairs(c1, c2) {
+            return false;
+        }
+        // Coincident forces ZERO separation between the two points; any non-zero
+        // Distance demands a POSITIVE separation — a direct contradiction. This
+        // is precisely the case the numerical (Jacobian) diagnosis cannot see
+        // reliably: at coincident points the distance gradient is 0/0, so the
+        // solver may report a spurious degenerate "solution". Configuration-
+        // independent static detection closes that hole.
+        // Angle between two lines is defined modulo π (a line has no head/tail),
+        // so compare the requested angle on [0, π) against the orientation the
+        // geometric constraint pins.
+        use std::f64::consts::{FRAC_PI_2, PI};
+        const ANGLE_TOL: f64 = 1e-9;
+        match (g, d) {
+            (GeometricConstraint::Coincident, DimensionalConstraint::Distance(v)) => v.abs() > 1e-9,
+            // Parallel pins the inter-line angle to 0 (mod π). Any Angle that is
+            // not aligned contradicts it.
+            (GeometricConstraint::Parallel, DimensionalConstraint::Angle(theta)) => {
+                let a = theta.rem_euclid(PI);
+                a.min(PI - a) > ANGLE_TOL
+            }
+            // Perpendicular pins the inter-line angle to π/2. Any Angle that is
+            // not a right angle contradicts it.
+            (GeometricConstraint::Perpendicular, DimensionalConstraint::Angle(theta)) => {
+                let a = theta.rem_euclid(PI);
+                (a - FRAC_PI_2).abs() > ANGLE_TOL
+            }
+            // Room to grow: Concentric + a positive centre Distance, Equal + two
+            // fixed-but-different dimensions, etc. — added as the harness demands.
+            _ => false,
+        }
     }
 
     /// Check if two constraints apply to the same entity tuple. Compares the

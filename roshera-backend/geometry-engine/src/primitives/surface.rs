@@ -608,6 +608,25 @@ pub trait Surface: fmt::Debug + Send + Sync + Any {
         }
     }
 
+    /// Whether the surface is **developable** — zero Gaussian curvature
+    /// everywhere, i.e. ruled with the ruling exactly straight in 3D so it can be
+    /// unrolled onto a plane without distortion (cylinder, cone).
+    ///
+    /// Curved-surface tessellation uses this to take the developable fast-path:
+    /// a developable lateral is chord-faithful after the initial CDT (its
+    /// accuracy is fixed by the boundary-rim sampling in the curved direction and
+    /// the exactly planar ruled direction), so interior Ruppert refinement cannot
+    /// improve it and merely cascades — a full-2π trimmed bore wall otherwise ran
+    /// away to ~9.6k triangles/slivers, doubling every pass. Doubly-curved
+    /// surfaces (sphere, torus, general NURBS) genuinely benefit from interior
+    /// refinement and MUST return `false`.
+    ///
+    /// Default `false` (conservative: an unclassified surface keeps full
+    /// refinement). Only the analytic zero-Gaussian-curvature surfaces override.
+    fn is_developable(&self) -> bool {
+        false
+    }
+
     /// Transform surface by matrix
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface>;
 
@@ -1757,6 +1776,12 @@ impl Surface for Cylinder {
 
     fn is_closed_v(&self) -> bool {
         false
+    }
+
+    /// A cylinder is developable: zero Gaussian curvature (the axial ruling is
+    /// exactly straight), so it unrolls to a rectangle. See the trait default.
+    fn is_developable(&self) -> bool {
+        true
     }
 
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
@@ -3032,6 +3057,12 @@ impl Surface for Cone {
         false
     }
 
+    /// A cone is developable: zero Gaussian curvature (the generator ruling is
+    /// exactly straight), so it unrolls to a planar sector. See the trait default.
+    fn is_developable(&self) -> bool {
+        true
+    }
+
     fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
         let u_bounds = if let Some(limits) = self.angle_limits {
             (limits[0], limits[1])
@@ -3167,12 +3198,17 @@ impl Surface for Cone {
     }
 
     fn offset(&self, distance: f64) -> Box<dyn Surface> {
-        // Offset cone changes the angle
-        let offset_angle =
-            ((self.half_angle.sin() + distance / self.half_angle.cos()).asin()).abs();
-
+        // A parallel offset of a cone is the SAME-half-angle cone with the apex
+        // shifted along the axis (and the height limits shifted with it) — this
+        // is what `offset_exact` below does. Recomputing `half_angle` via
+        // `asin(sin a + d/cos a)` is geometrically wrong and NaN-prone (asin of
+        // an argument > 1 for ordinary offsets). Mirror the apex shift.
+        let apex_offset = distance / self.half_angle.sin();
         let mut offset_cone = *self;
-        offset_cone.half_angle = offset_angle;
+        offset_cone.apex = self.apex - self.axis * apex_offset;
+        offset_cone.height_limits = self
+            .height_limits
+            .map(|[bottom, top]| [bottom + apex_offset, top + apex_offset]);
         Box::new(offset_cone)
     }
 

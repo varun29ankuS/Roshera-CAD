@@ -2221,9 +2221,99 @@ fn cylinder_cylinder_intersection(
         return handle_parallel_cylinders(cyl_a, cyl_b, tolerance);
     }
 
-    // General case: intersecting cylinders with different axes
-    // This results in a quartic curve that can be solved analytically
+    // Perpendicular + equal-radius + intersecting axes — the Steinmetz/bicylinder
+    // case (engine-block bore ∩ crank tunnel). Exact closed-form TWO-ellipse
+    // intersection; replaces the seed-marcher, which fails on the tangent
+    // crossings of equal-radius cylinders (#35: intersecting analytic bores).
+    if let Some(curves) = cylinder_cylinder_perpendicular_equal_radius(cyl_a, cyl_b, tolerance)? {
+        return Ok(curves);
+    }
+
+    // General case: intersecting cylinders with different axes — a quartic.
+    // (Marching fallback; the equal-radius perpendicular special case above is
+    // handled analytically.)
     solve_general_cylinder_intersection(cyl_a, cyl_b, tolerance)
+}
+
+/// Analytic intersection of two PERPENDICULAR, EQUAL-radius cylinders whose axes
+/// intersect — the Steinmetz/bicylinder configuration. Subtracting the two
+/// cylinder equations gives the two diagonal bisector planes, each cutting an
+/// exact ellipse: center = the axis-intersection point `I`, minor axis along the
+/// common perpendicular `n̂ = â × b̂` (length `r`), major axis along `(â ± b̂)`
+/// (length `r√2`). Returns `None` (→ marching fallback) when the pair is not this
+/// special case (non-perpendicular, unequal radius, or skew axes).
+fn cylinder_cylinder_perpendicular_equal_radius(
+    cyl_a: &crate::primitives::surface::Cylinder,
+    cyl_b: &crate::primitives::surface::Cylinder,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<Vec<SurfaceIntersectionCurve>>> {
+    use crate::primitives::curve::Ellipse;
+
+    let a_axis = cyl_a.axis;
+    let b_axis = cyl_b.axis;
+    let trace = std::env::var("ROSHERA_BOOL_TRACE").is_ok();
+    if trace {
+        eprintln!(
+            "[bool]     cyl_cyl_perp_eq: a_axis={a_axis:?} b_axis={b_axis:?} dot={:.4} ra={} rb={}",
+            a_axis.dot(&b_axis),
+            cyl_a.radius,
+            cyl_b.radius
+        );
+    }
+    // Perpendicular axes? (|cos θ| ≈ 0)
+    if a_axis.dot(&b_axis).abs() > tolerance.parallel_threshold() {
+        if trace {
+            eprintln!("[bool]     cyl_cyl_perp_eq: NOT perpendicular → None");
+        }
+        return Ok(None);
+    }
+    // Equal radius?
+    let r = cyl_a.radius;
+    if (cyl_a.radius - cyl_b.radius).abs() > tolerance.distance() {
+        if trace {
+            eprintln!("[bool]     cyl_cyl_perp_eq: radii differ → None");
+        }
+        return Ok(None);
+    }
+    // Do the axes intersect? Closest approach of the two axis lines (â ⊥ b̂ makes
+    // the normal equations decouple): s = d·â, t = −d·b̂, d = origin_b − origin_a.
+    let d = cyl_b.origin - cyl_a.origin;
+    let p_a = cyl_a.origin + a_axis * d.dot(&a_axis);
+    let p_b = cyl_b.origin + b_axis * (-d.dot(&b_axis));
+    if (p_a - p_b).magnitude() > tolerance.distance() {
+        if trace {
+            eprintln!(
+                "[bool]     cyl_cyl_perp_eq: axes skew (dist={:.4}) → None",
+                (p_a - p_b).magnitude()
+            );
+        }
+        return Ok(None); // skew axes — not the bicylinder case
+    }
+    if trace {
+        eprintln!("[bool]     cyl_cyl_perp_eq: MATCH → emitting 2 ellipses");
+    }
+    let center = (p_a + p_b) * 0.5;
+
+    let n = a_axis.cross(&b_axis).normalize()?; // common perpendicular = minor dir
+    let major_len = r * std::f64::consts::SQRT_2;
+    let minor_len = r;
+
+    let mut curves = Vec::with_capacity(2);
+    for sign in [1.0f64, -1.0f64] {
+        let major_dir = (a_axis + b_axis * sign).normalize()?;
+        let ellipse = Ellipse::new(center, major_dir, n, major_len, minor_len)?;
+        // The ellipse lies on BOTH cylinders (it is their intersection), so the
+        // existing ellipse→cylinder UV mapping yields each operand's parametric
+        // curve directly.
+        let params_a = compute_ellipse_cylinder_parameters(&ellipse, cyl_a)?;
+        let params_b = compute_ellipse_cylinder_parameters(&ellipse, cyl_b)?;
+        curves.push(SurfaceIntersectionCurve {
+            curve: Box::new(ellipse),
+            on_surface_a: create_parametric_curve(&params_a),
+            on_surface_b: create_parametric_curve(&params_b),
+        });
+    }
+    Ok(Some(curves))
 }
 
 /// Check if two cylinders are coaxial (same axis)
@@ -7195,6 +7285,24 @@ fn split_face_by_curves(
 fn drop_nested_inner_loops(model: &BRepModel, face: &mut SplitFace) {
     if face.inner_loops.len() < 2 {
         return;
+    }
+    // Drop EXACT-DUPLICATE inner loops first. The corefinement can emit the SAME
+    // hole twice when two same-origin fragments (each carrying the hole) merge —
+    // e.g. a through-bore's rim circle on a block end face after a 2nd Boolean —
+    // leaving two identical inner loops. Every hole edge is then referenced twice
+    // by this one face → a non-manifold rim (3 faces share the edge) → invalid
+    // B-Rep → open mesh (#35). Dedup by the loop's edge-id set (orientation- and
+    // order-independent); a valid face never lists the same hole twice.
+    {
+        let mut seen: HashSet<Vec<EdgeId>> = HashSet::new();
+        face.inner_loops.retain(|lp| {
+            let mut ids: Vec<EdgeId> = lp.iter().map(|&(e, _)| e).collect();
+            ids.sort_unstable();
+            seen.insert(ids)
+        });
+        if face.inner_loops.len() < 2 {
+            return;
+        }
     }
     let Some(surface) = model.surfaces.get(face.surface) else {
         return;
@@ -19072,6 +19180,195 @@ mod tests {
         assert!(
             r.boundary_edges == 0 && r.nonmanifold_edges == 0,
             "#35: intersecting bores must be watertight (open={}, nm={})",
+            r.boundary_edges,
+            r.nonmanifold_edges
+        );
+    }
+
+    /// #35 (ANALYTIC variant): the same intersecting-bores case but with REAL
+    /// analytic-cylinder bores (not 24-gon prisms), so the saddle goes through
+    /// the `cylinder_cylinder_intersection` SSI path rather than facet-vs-facet
+    /// plane-plane lines. Diagnostic: does production-style analytic geometry hit
+    /// the same weld failure, a different one, or pass? `#[ignore]` (diagnostic).
+    #[test]
+    #[ignore = "#35 diagnostic: analytic-cylinder intersecting bores"]
+    fn diff_intersecting_analytic_bores_35() {
+        use crate::harness::watertight::manifold_report;
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let sid = |g: GeometryId| match g {
+            GeometryId::Solid(id) => id,
+            o => panic!("expected Solid, got {o:?}"),
+        };
+        let tol = Tolerance::default();
+        let mut m = BRepModel::new();
+        let block = extrude_polygon_regions(
+            &mut m,
+            Point3::ORIGIN,
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer: vec![[0.0, 0.0], [80.0, 0.0], [80.0, 40.0], [0.0, 40.0]],
+                holes: vec![],
+            }],
+            40.0,
+            None,
+            tol,
+        )
+        .expect("block");
+        // Analytic vertical bore: axis Z at (40,20), r10, z∈[-5,45].
+        let vbore = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(40.0, 20.0, -5.0), Vector3::Z, 10.0, 50.0)
+            .expect("vbore"));
+        let b1 = boolean_operation(
+            &mut m,
+            block,
+            vbore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("vbore diff");
+        // Isolate: is the SINGLE analytic bore already non-watertight (curved-CDT
+        // seam, task #2) or is the failure introduced only by the saddle?
+        let r1 = manifold_report(&mut m, b1, 0.5, 1e-6).expect("report b1");
+        eprintln!(
+            "[#35-analytic] after 1st bore only: open={} nm={}",
+            r1.boundary_edges, r1.nonmanifold_edges
+        );
+        // Analytic horizontal bore: axis X at (y20,z20), r10, x∈[-5,85] — its
+        // wall intersects the vertical bore wall at the saddle.
+        let hbore = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(-5.0, 20.0, 20.0), Vector3::X, 10.0, 90.0)
+            .expect("hbore"));
+        let res = boolean_operation(
+            &mut m,
+            b1,
+            hbore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("hbore diff");
+        let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("report");
+        eprintln!(
+            "[#35-analytic] open_edges={} nonmanifold={} euler={} valid={}",
+            r.boundary_edges,
+            r.nonmanifold_edges,
+            r.euler_characteristic,
+            r.manifold && r.closed && r.oriented
+        );
+        // Discriminate: is the B-Rep itself valid (→ the leak is a tessellation
+        // sampling mismatch on a SHARED rim edge) or invalid (→ the rim edge got
+        // un-welded by the 2nd op)?
+        let brep = crate::primitives::validation::validate_solid_scoped(
+            &mut m,
+            res,
+            tol,
+            crate::primitives::validation::ValidationLevel::Standard,
+        );
+        eprintln!(
+            "[#35-analytic] brep_valid={} brep_errs={}",
+            brep.is_valid,
+            brep.errors.len()
+        );
+        // Pinpoint the over-welded (>2-face) edges: position + the faces sharing
+        // them. Position reveals cap (z=0/40) vs saddle; faces reveal what merged.
+        if let Some(solid_ref) = m.solids.get(res) {
+            let shell_id = solid_ref.outer_shell;
+            if let Some(shell) = m.shells.get(shell_id) {
+                let mut edge_faces: std::collections::HashMap<EdgeId, Vec<FaceId>> =
+                    std::collections::HashMap::new();
+                for &fid in &shell.faces {
+                    if let Some(face) = m.faces.get(fid) {
+                        let mut loops = vec![face.outer_loop];
+                        loops.extend(&face.inner_loops);
+                        for &lid in &loops {
+                            if let Some(lp) = m.loops.get(lid) {
+                                for &eid in &lp.edges {
+                                    edge_faces.entry(eid).or_default().push(fid);
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut dumped: std::collections::HashSet<FaceId> =
+                    std::collections::HashSet::new();
+                let mut brep_boundary = 0usize;
+                for (eid, fids) in edge_faces.iter() {
+                    if fids.len() == 1 {
+                        brep_boundary += 1;
+                        if brep_boundary <= 6 {
+                            let p = m
+                                .edges
+                                .get(*eid)
+                                .and_then(|e| m.vertices.get_position(e.start_vertex));
+                            eprintln!("  BREP-BOUNDARY edge={eid:?} face={fids:?} start={p:?}");
+                        }
+                    }
+                }
+                eprintln!("[#35-analytic] brep_boundary_edges={brep_boundary}");
+                for (eid, fids) in edge_faces.iter() {
+                    if fids.len() > 2 {
+                        let p = m
+                            .edges
+                            .get(*eid)
+                            .and_then(|e| m.vertices.get_position(e.start_vertex));
+                        eprintln!(
+                            "  NONMANIFOLD edge={eid:?} nfaces={} faces={fids:?} start={p:?}",
+                            fids.len()
+                        );
+                        // Dump the loop structure of the doubly-listed face.
+                        let mut seen: std::collections::HashSet<FaceId> =
+                            std::collections::HashSet::new();
+                        for &fid in fids.iter() {
+                            if seen.insert(fid) {
+                                continue;
+                            }
+                            if !dumped.insert(fid) {
+                                continue;
+                            }
+                            if let Some(face) = m.faces.get(fid) {
+                                if let Some(ol) = m.loops.get(face.outer_loop) {
+                                    eprintln!("    face {fid:?} OUTER edges={:?}", ol.edges);
+                                }
+                                for &il in &face.inner_loops {
+                                    if let Some(l) = m.loops.get(il) {
+                                        eprintln!("    face {fid:?} INNER edges={:?}", l.edges);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Localize the leaks: how many open edges sit near the saddle (the bore
+        // intersection ~(40,20,20)) vs the rest of the model? Distinguishes a
+        // saddle-seam weld bug (layer 2) from a classification failure.
+        let segs = crate::harness::watertight::boundary_edge_positions(&m, res, 0.5, 1e-6);
+        let (sx, sy, sz) = (40.0_f64, 20.0_f64, 20.0_f64); // saddle / bore intersection
+        let near_saddle = segs
+            .iter()
+            .filter(|s| {
+                let mx = (s[0].x + s[1].x) * 0.5;
+                let my = (s[0].y + s[1].y) * 0.5;
+                let mz = (s[0].z + s[1].z) * 0.5;
+                (mx - sx).powi(2) + (my - sy).powi(2) + (mz - sz).powi(2) < 15.0 * 15.0
+            })
+            .count();
+        eprintln!(
+            "[#35-analytic] boundary_segs={} near_saddle(<15mm)={}",
+            segs.len(),
+            near_saddle
+        );
+        for s in segs.iter().take(6) {
+            eprintln!(
+                "  seg [{:.1},{:.1},{:.1}]->[{:.1},{:.1},{:.1}]",
+                s[0].x, s[0].y, s[0].z, s[1].x, s[1].y, s[1].z
+            );
+        }
+        assert!(
+            r.boundary_edges == 0 && r.nonmanifold_edges == 0,
+            "#35-analytic: intersecting analytic bores must be watertight (open={}, nm={})",
             r.boundary_edges,
             r.nonmanifold_edges
         );

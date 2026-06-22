@@ -543,63 +543,84 @@ mod tests {
         m.edges.iter().next().map(|(id, _)| id).expect("edge")
     }
 
-    /// PINNED FINDING — CHAMFER-CROSSES-FILLET self-overlap (#70). Chamfering an
-    /// edge that *crosses* an existing fillet (here `edge 1` of the filleted box)
-    /// makes the chamfer cut cross the fillet region. The result is topologically
-    /// clean (edges shared twice, loops close) but GEOMETRICALLY SELF-OVERLAPPING:
-    /// a planar end-face's boundary carries the fillet arc, which bulges past the
-    /// new chamfer edge so the face's loop self-intersects — surfacing as a leaky
-    /// tessellation (163 boundary edges, euler −6).
+    /// #70 CHAMFER-CROSSES-FILLET — now WATERTIGHT (was pinned self-overlap).
     ///
-    /// History: a hard guard once rejected this (#71) but it also rejected the
-    /// legitimate CF-β / CF-γ mixed-kind corner (fillet+chamfer at a shared corner
-    /// the kernel is *designed* to handle), so the reject was removed — the chamfer
-    /// now SUCCEEDS and emits the self-overlapping solid. The proper fix is the
-    /// junction reconstruction (#72): place the junction vertex on the
-    /// chamfer∩fillet intersection so the result is valid. Un-ignore + assert
-    /// `full_contract(...).passes()` once #72 lands. Until then this documents the
-    /// open case (`geometry_validity::self_overlapping_planar_faces` flags it).
+    /// The 1C2F mixed corner: chamfer one edge of a box corner, then fillet the
+    /// two edges sharing that corner. The result is topologically clean, and used
+    /// to be GEOMETRICALLY SELF-OVERLAPPING — two fillet cap arcs lay on the cube
+    /// faces and bulged past the chamfer cut, so two planar cube faces
+    /// self-intersected (`self_overlapping_planar_faces` reported a non-empty
+    /// set). #71 once hard-rejected this, but that also rejected the legitimate
+    /// CF-β/CF-γ mixed corner the kernel is designed to handle, so the reject was
+    /// removed and the operation emitted the self-overlapping solid.
+    ///
+    /// The CF-γ.7 fix (`fillet::retract_mixed_1c2f_corner`) axially retracts each
+    /// fillet cap arc off the cube planes onto the apex-retracted inner triangle —
+    /// the same mechanism the watertight all-fillet apex corner uses — so the cube
+    /// faces close with straight cut edges and the bowtie is gone. This test now
+    /// pins the full-stack watertight contract instead of the defect.
     #[test]
-    #[ignore = "#70 CHAMFER-CROSSES-FILLET: chamfer over a fillet emits a self-overlapping solid; fix is #72"]
     fn chamfer_crossing_fillet_self_overlap_pinned_70() {
         let mut m = BRepModel::new();
         TopologyBuilder::new(&mut m)
-            .create_box_3d(6.0, 6.0, 6.0)
+            .create_box_3d(10.0, 10.0, 10.0)
             .ok();
         let s = last(&m);
-        let e0 = m.edges.iter().next().map(|(id, _)| id).expect("edge");
-        fillet_edges(
-            &mut m,
-            s,
-            vec![e0],
-            FilletOptions {
-                fillet_type: FilletType::Constant(0.5),
-                radius: 0.5,
-                ..Default::default()
-            },
-        )
-        .expect("fillet");
-        // `edge 1` of the filleted solid abuts the fillet — the crossing case.
-        let e1 = m.edges.iter().next().map(|(id, _)| id).expect("edge2");
+
+        // The (5, 5, 5) box corner and its three incident edges.
+        let corner = m
+            .vertices
+            .iter()
+            .find(|(_, v)| {
+                let p = v.position;
+                (p[0] - 5.0).abs() < 1e-9 && (p[1] - 5.0).abs() < 1e-9 && (p[2] - 5.0).abs() < 1e-9
+            })
+            .map(|(id, _)| id)
+            .expect("corner vertex");
+        let mut edges: Vec<crate::primitives::edge::EdgeId> = m
+            .edges
+            .iter()
+            .filter(|(_, e)| e.start_vertex == corner || e.end_vertex == corner)
+            .map(|(id, _)| id)
+            .collect();
+        edges.sort_unstable();
+
+        // Chamfer first (consumes the corner edge), then fillet the two
+        // remaining edges sharing the corner — the canonical 1C2F mixed corner.
         chamfer_edges(
             &mut m,
             s,
-            vec![e1],
+            vec![edges[0]],
             ChamferOptions {
-                chamfer_type: ChamferType::EqualDistance(0.4),
-                distance1: 0.4,
-                distance2: 0.4,
+                chamfer_type: ChamferType::EqualDistance(1.0),
+                distance1: 1.0,
+                distance2: 1.0,
                 symmetric: true,
+                partial_corner_vertices: vec![corner],
                 ..Default::default()
             },
         )
         .expect("chamfer");
-        // Currently self-overlapping → the planar-face validity check flags it.
+        fillet_edges(
+            &mut m,
+            s,
+            vec![edges[1], edges[2]],
+            FilletOptions {
+                fillet_type: FilletType::Constant(1.0),
+                radius: 1.0,
+                ..Default::default()
+            },
+        )
+        .expect("fillet");
+
+        // Defect GONE: no planar face self-overlaps after the retraction.
         let bad = crate::operations::geometry_validity::self_overlapping_planar_faces(&m, s);
         assert!(
-            !bad.is_empty(),
-            "expected #70 to still self-overlap until #72 trims the junction"
+            bad.is_empty(),
+            "#70 1C2F corner must no longer self-overlap; got faces {bad:?}"
         );
+        // And the full-stack contract holds (watertight + Euler-valid + clean).
+        assert_contract(&mut m, s, "1C2F chamfer+2-fillet corner");
     }
 
     /// CHAIN: union two overlapping boxes → fillet an edge of the union. Booleans

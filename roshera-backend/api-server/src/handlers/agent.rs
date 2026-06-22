@@ -41,6 +41,9 @@ use axum::{
 use geometry_engine::math::Matrix4;
 use geometry_engine::primitives::datum::DatumId;
 use geometry_engine::primitives::solid::SolidId;
+use geometry_engine::readable::claim::{
+    verify_claim, CheckableClaim, ClaimBinding, ClaimVerdict, Measurement,
+};
 use geometry_engine::readable::{
     DatumSummary, DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter,
     MassPropertiesReport, OrientedBBox, PartProximity, PartReport, PartSummary,
@@ -126,6 +129,134 @@ pub async fn part_mass_properties_by_uuid(
     model
         .mass_properties_for(solid_id)
         .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// One variable→measurement binding in a verify-claim request. Parts are
+/// addressed by public UUID (the wire id); resolved to a kernel `SolidId`
+/// before measuring. A `constant` carries a supplied non-geometric value.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerifyMeasure {
+    Volume {
+        part: uuid::Uuid,
+    },
+    SurfaceArea {
+        part: uuid::Uuid,
+    },
+    /// A single face's area (faces are addressed by kernel face id, not UUID —
+    /// the agent gets them from render_part `ids` / get_face / select_face).
+    FaceArea {
+        face: u32,
+    },
+    /// A single edge's length (kernel edge id).
+    EdgeLength {
+        edge: u32,
+    },
+    Constant {
+        value: f64,
+    },
+}
+
+/// A `(var, measure)` pair: binds a variable name in the claim expression to a
+/// measurement.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyBinding {
+    pub var: String,
+    pub measure: VerifyMeasure,
+}
+
+/// Request body for `POST /api/agent/verify-claim`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyClaimRequest {
+    /// Math expression over the binding variable names, e.g. `"a / v"`.
+    pub expr: String,
+    pub bindings: Vec<VerifyBinding>,
+    pub expected: f64,
+    #[serde(default)]
+    pub tolerance: Option<f64>,
+}
+
+/// `POST /api/agent/verify-claim` — "the notebook that can't lie". Checks an
+/// equation/numeric claim against the kernel's GROUND-TRUTH geometry: resolves
+/// each part UUID to its `SolidId`, then runs the kernel verifier, returning the
+/// three-state verdict (verified / false / refused). A part UUID that doesn't
+/// resolve yields `refused` (a structured "couldn't measure that"), not a 404 —
+/// the verifier never silently passes.
+pub async fn verify_claim_handler(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(req): Json<VerifyClaimRequest>,
+) -> Json<ClaimVerdict> {
+    let mut bindings = Vec::with_capacity(req.bindings.len());
+    let mut unresolved: Vec<String> = Vec::new();
+    for b in req.bindings {
+        let measure = match b.measure {
+            VerifyMeasure::Constant { value } => Some(Measurement::Constant { value }),
+            VerifyMeasure::Volume { part } => state
+                .get_local_id(&part)
+                .map(|solid| Measurement::Volume { solid }),
+            VerifyMeasure::SurfaceArea { part } => state
+                .get_local_id(&part)
+                .map(|solid| Measurement::SurfaceArea { solid }),
+            VerifyMeasure::FaceArea { face } => Some(Measurement::FaceArea { face }),
+            VerifyMeasure::EdgeLength { edge } => Some(Measurement::EdgeLength { edge }),
+        };
+        match measure {
+            Some(m) => bindings.push(ClaimBinding {
+                var: b.var,
+                measure: m,
+            }),
+            None => unresolved.push(b.var),
+        }
+    }
+
+    // A binding whose part UUID didn't resolve cannot be measured — refuse
+    // honestly rather than dropping it and evaluating an incomplete expression.
+    if !unresolved.is_empty() {
+        return Json(ClaimVerdict {
+            verified: false,
+            refused: true,
+            computed: None,
+            expected: req.expected,
+            abs_error: None,
+            tolerance_used: req
+                .tolerance
+                .unwrap_or_else(|| req.expected.abs().max(1.0) * 1e-6),
+            resolved: Vec::new(),
+            unresolved,
+        });
+    }
+
+    let claim = CheckableClaim {
+        expr: req.expr,
+        bindings,
+        expected: req.expected,
+        tolerance: req.tolerance,
+    };
+    let mut model = model_handle.write().await;
+    Json(verify_claim(&claim, &mut model))
+}
+
+/// `GET /api/agent/parts/{id}/profile` — the editable MERIDIAN a revolved part
+/// was built from: the `(r, z)` half-plane points (returned as `[[r,z],...]`),
+/// recovered from the part's retained construction geometry. This is the
+/// scientist's editable profile — open it, change a radius, and re-revolve (the
+/// #25 edit→regenerate loop). 404 when the part carries no retained profile (it
+/// was not built by a parametric revolve).
+pub async fn part_revolve_profile(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<SolidId>,
+) -> Result<Json<Vec<[f64; 2]>>, StatusCode> {
+    // The persistent profile store is replay-proof; prefer it, then fall back to
+    // the kernel construction geometry.
+    if let Some(p) = state.solid_profiles.get(&id) {
+        return Ok(Json(p.clone()));
+    }
+    let model = model_handle.read().await;
+    geometry_engine::operations::revolve::get_revolve_meridian(&model, id)
+        .map(|rz| Json(rz.into_iter().map(|(r, z)| [r, z]).collect()))
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -865,6 +996,65 @@ pub async fn scene_orbit(
 // ───────────────────── ground truth (PILLAR 1) ──────────────────────
 
 /// The kernel's self-reported ground truth for a solid: provenance (what op made
+/// Per-face display-tessellation defect — the agent's pointer to exactly which
+/// face renders wrong, without rendering a pixel.
+#[derive(Debug, Clone, Serialize)]
+pub struct TessFaceDefectResponse {
+    pub face_id: u64,
+    pub triangles: usize,
+    pub degenerate_triangles: usize,
+    pub normal_agreement: f64,
+    /// Winding-vs-TRUE-surface-normal agreement for this face — the decisive
+    /// scribble signal (a bore whose stored normals are wrong-but-consistent
+    /// drops here while `normal_agreement` stays high).
+    pub analytic_normal_agreement: f64,
+}
+
+/// Display-tessellation quality — the render-mesh analogue of B-Rep soundness.
+/// A watertight + manifold solid can still tessellate to a degenerate /
+/// inverted-normal mesh (the inner-bore scribble); `clean == false` is that
+/// defect, surfaced so the agent can SEE it without a render round-trip.
+#[derive(Debug, Clone, Serialize)]
+pub struct TessQualityResponse {
+    pub clean: bool,
+    pub triangles: usize,
+    pub degenerate_triangles: usize,
+    /// Fraction of facets whose winding normal agrees with their stored
+    /// (analytic-intent) vertex normals. `1.0` = every facet shaded correctly.
+    pub normal_agreement: f64,
+    /// Fraction of facets whose winding normal agrees with the TRUE surface
+    /// normal at the facet centroid — the ground-truth scribble check.
+    pub analytic_normal_agreement: f64,
+    pub inconsistent_facets: usize,
+    /// Facets pointing into the wrong hemisphere of the true surface normal.
+    pub off_surface_facets: usize,
+    pub worst_face: Option<TessFaceDefectResponse>,
+}
+
+/// Per-face mesh-shape defect (the CAD mesh-quality rules).
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshFaceQualityResponse {
+    pub face_id: u64,
+    pub worst_aspect_ratio: f64,
+    pub min_angle_deg: f64,
+    pub max_normal_deviation_deg: f64,
+    pub boundary_crossing_facets: usize,
+}
+
+/// Mesh-quality verdict — the render mesh against the CAD tessellation rules
+/// (boundary conformance, normal deviation, aspect ratio, min angle). Catches a
+/// sliver "wing" / bridging facet that is watertight + correctly oriented.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshQualityResponse {
+    pub clean: bool,
+    pub triangles: usize,
+    pub worst_aspect_ratio: f64,
+    pub min_angle_deg: f64,
+    pub max_normal_deviation_deg: f64,
+    pub boundary_crossing_facets: usize,
+    pub worst_face: Option<MeshFaceQualityResponse>,
+}
+
 /// it, designed vs bare primitive) + a COMPUTED validity certificate.
 #[derive(Debug, Clone, Serialize)]
 pub struct TruthResponse {
@@ -887,8 +1077,21 @@ pub struct TruthResponse {
     /// a holding assertion? "consistent" / "inconsistent" / "not_applicable".
     /// An annotation flag — does NOT affect `sound`.
     pub labels_consistent: String,
+    /// Display-tessellation quality: `false` ⇒ the render mesh is degenerate or
+    /// has inverted normals (the inner-bore scribble) even if the B-Rep is sound.
+    /// Factored into `sound`.
+    pub tessellation_clean: bool,
+    /// Full tessellation-quality breakdown incl. the worst defective face.
+    pub tessellation: TessQualityResponse,
+    /// Mesh-quality (CAD tessellation-rule) verdict: `false` ⇒ a facet violates a
+    /// shape rule (a sliver "wing", a boundary-crossing/bridging facet, a far-off-
+    /// surface normal) even if the mesh is watertight. Factored into `sound`.
+    pub mesh_quality_clean: bool,
+    /// Full mesh-quality breakdown incl. the worst face + which rule it fails.
+    pub mesh_quality: MeshQualityResponse,
     /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold
-    /// ∧ self-intersection-free ∧ construction-consistent).
+    /// ∧ self-intersection-free ∧ construction-consistent ∧ tessellation-clean
+    /// ∧ mesh-quality-clean).
     pub sound: bool,
     pub errors: Vec<String>,
     pub summary: String,
@@ -931,6 +1134,47 @@ pub async fn part_truth(
         euler_characteristic: c.euler_characteristic,
         construction_consistent: c.construction_consistent.label().to_string(),
         labels_consistent: c.labels_consistent.label().to_string(),
+        tessellation_clean: c.tessellation.clean,
+        tessellation: TessQualityResponse {
+            clean: c.tessellation.clean,
+            triangles: c.tessellation.triangles,
+            degenerate_triangles: c.tessellation.degenerate_triangles,
+            normal_agreement: c.tessellation.normal_agreement,
+            analytic_normal_agreement: c.tessellation.analytic_normal_agreement,
+            inconsistent_facets: c.tessellation.inconsistent_facets,
+            off_surface_facets: c.tessellation.off_surface_facets,
+            worst_face: c
+                .tessellation
+                .worst_face
+                .as_ref()
+                .map(|w| TessFaceDefectResponse {
+                    face_id: w.face_id,
+                    triangles: w.triangles,
+                    degenerate_triangles: w.degenerate_triangles,
+                    normal_agreement: w.normal_agreement,
+                    analytic_normal_agreement: w.analytic_normal_agreement,
+                }),
+        },
+        mesh_quality_clean: c.mesh_quality.clean,
+        mesh_quality: MeshQualityResponse {
+            clean: c.mesh_quality.clean,
+            triangles: c.mesh_quality.triangles,
+            worst_aspect_ratio: c.mesh_quality.worst_aspect_ratio,
+            min_angle_deg: c.mesh_quality.min_angle_deg,
+            max_normal_deviation_deg: c.mesh_quality.max_normal_deviation_deg,
+            boundary_crossing_facets: c.mesh_quality.boundary_crossing_facets,
+            worst_face: c
+                .mesh_quality
+                .worst_face
+                .as_ref()
+                .map(|w| MeshFaceQualityResponse {
+                    face_id: w.face_id,
+                    worst_aspect_ratio: w.worst_aspect_ratio,
+                    min_angle_deg: w.min_angle_deg,
+                    max_normal_deviation_deg: w.max_normal_deviation_deg,
+                    boundary_crossing_facets: w.boundary_crossing_facets,
+                }),
+        },
         sound: c.is_sound(),
         errors: c.errors.clone(),
         summary: gt.summary(),

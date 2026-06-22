@@ -395,7 +395,10 @@ function sketchPlaneLabel(plane: SketchPlane): string {
   return isStandardPlane(plane) ? plane.toUpperCase() : 'FACE'
 }
 
-function sketchesToNodes(sketches: Map<string, ServerSketchSession>): TreeNode[] {
+function sketchesToNodes(
+  sketches: Map<string, ServerSketchSession>,
+  hiddenSketchIds: Set<string>,
+): TreeNode[] {
   return Array.from(sketches.values())
     .sort((a, b) => a.created_at - b.created_at)
     .map((s, idx) => {
@@ -420,7 +423,7 @@ function sketchesToNodes(sketches: Map<string, ServerSketchSession>): TreeNode[]
         name: `Sketch ${idx + 1} (${planeLabel} · ${totalPoints} ${ptSuffix}${shapeSuffix})`,
         type: 'sketch',
         symbol: symbolForType('sketch'),
-        visible: true,
+        visible: !hiddenSketchIds.has(s.id),
         locked: false,
       }
     })
@@ -563,6 +566,8 @@ export function ModelTree({
   const selectObject = useSceneStore((s) => s.selectObject)
   const updateObject = useSceneStore((s) => s.updateObject)
   const serverSketches = useSceneStore((s) => s.serverSketches)
+  const hiddenSketchIds = useSceneStore((s) => s.hiddenSketchIds)
+  const toggleSketchVisibility = useSceneStore((s) => s.toggleSketchVisibility)
   const wsStatus = useWSStore((s) => s.status)
   const sessionId = useWSStore((s) => s.sessionId)
 
@@ -685,7 +690,7 @@ export function ModelTree({
   //      yet. Once extrusion runs they migrate under the resulting
   //      body automatically on the next render.
   const localNodes = sceneToNodes(objects, objectOrder)
-  const allSketchNodes = sketchesToNodes(serverSketches)
+  const allSketchNodes = sketchesToNodes(serverSketches, hiddenSketchIds)
   const baseObjectNodes =
     backendNodes && backendNodes.length > 0 ? backendNodes : localNodes
   const datumNodes = datumsToNodes(datums)
@@ -754,9 +759,14 @@ export function ModelTree({
         return
       }
       const obj = objects.get(id)
-      if (obj) updateObject(id, { visible: !obj.visible })
+      if (obj) {
+        updateObject(id, { visible: !obj.visible })
+        return
+      }
+      // A committed sketch is a first-class, hideable entity too.
+      if (serverSketches.has(id)) toggleSketchVisibility(id)
     },
-    [datums, objects, updateObject],
+    [datums, objects, updateObject, serverSketches, toggleSketchVisibility],
   )
 
   const handleToggleLock = useCallback(

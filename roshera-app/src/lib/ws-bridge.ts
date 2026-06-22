@@ -219,7 +219,7 @@ function handleServerMessage(msg: ServerMessage) {
       // the per-triangle FaceId map reached the bridge. If `faceIds` is
       // 0 here, face-picking will silently fall back to raw triangle
       // indices and the kernel pick query will reject them.
-      // eslint-disable-next-line no-console
+       
       console.log(
         '[WS] ObjectCreated',
         obj.id.slice(0, 8),

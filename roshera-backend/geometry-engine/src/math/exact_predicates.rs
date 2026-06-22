@@ -48,14 +48,24 @@ pub enum CircleLocation {
 
 // Error bounds for adaptive precision filters (Shewchuk 1997, "Adaptive
 // Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates",
-// Discrete & Computational Geometry 18:305–363). Only the first-stage
-// A-bound is needed by the single-pass filters below; multi-stage refinement
-// (B and C bounds) is not implemented in this kernel.
-const RESULTERRBOUND: f64 = 3.0e-15;
+// Discrete & Computational Geometry 18:305–363). The A-bound is the first-stage
+// filter; when |det| falls within it the predicate falls through to EXACT
+// expansion arithmetic (the `*_adapt` functions), so the returned sign is
+// correct for all finite inputs — proven against an arbitrary-precision oracle
+// in tests/predicate_exactness_gate.rs. All four A-bounds are ε-derived
+// (ε = 2^-53; see EPS below): ccwA=(3+16ε)ε, o3dA=(7+56ε)ε, iccA=(10+96ε)ε,
+// ispA=(16+224ε)ε.
 const CCWERRBOUNDSA: f64 = 3.3306690738754716e-16;
 const O3DERRBOUNDSA: f64 = 7.771_561_172_376_096e-16;
-const ICCERRBOUNDSA: f64 = 1.0e-15;
-const ISPERRBOUNDSA: f64 = 1.6e-15;
+const ICCERRBOUNDSA: f64 = (10.0 + 96.0 * EPS) * EPS;
+const ISPERRBOUNDSA: f64 = (16.0 + 224.0 * EPS) * EPS;
+
+// Multi-stage orient2d bounds, derived from ε = 2^-53 (Shewchuk exactinit).
+// The A bound equals CCWERRBOUNDSA above; B/C drive the exact-fallback cascade.
+const EPS: f64 = 1.110_223_024_625_156_5e-16; // 2^-53
+const CCWERRBOUNDB: f64 = (2.0 + 12.0 * EPS) * EPS;
+const CCWERRBOUNDC: f64 = (9.0 + 64.0 * EPS) * EPS * EPS;
+const O2D_RESULTERRBOUND: f64 = (3.0 + 8.0 * EPS) * EPS;
 
 // Splitter for exact arithmetic (2^27 + 1 for IEEE 754 double)
 const SPLITTER: f64 = 134217729.0;
@@ -97,6 +107,179 @@ fn two_sum(a: f64, b: f64) -> (f64, f64) {
     (x, y)
 }
 
+/// Fast exact sum, valid ONLY when `|a| >= |b|`. 3 flops vs `two_sum`'s 6.
+/// Returns `(x, y)` with `x + y == a + b` exactly. (Shewchuk `Fast_Two_Sum`.)
+#[inline(always)]
+#[allow(dead_code)] // wired into the exact predicates in the following slice
+fn fast_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let x = a + b;
+    let bvirt = x - a;
+    let y = b - bvirt;
+    (x, y)
+}
+
+/// Exact subtraction: `(x, y)` with `x + y == a - b` exactly. (Shewchuk `Two_Diff`.)
+#[inline(always)]
+fn two_diff(a: f64, b: f64) -> (f64, f64) {
+    let x = a - b;
+    let bvirt = a - x;
+    let avirt = x + bvirt;
+    let bround = bvirt - b;
+    let around = a - avirt;
+    let y = around + bround;
+    (x, y)
+}
+
+/// `(a1 + a0) - b` as a 3-component expansion `(x2, x1, x0)` (high→low).
+/// (Shewchuk `Two_One_Diff`.)
+#[inline(always)]
+fn two_one_diff(a1: f64, a0: f64, b: f64) -> (f64, f64, f64) {
+    let (i, x0) = two_diff(a0, b);
+    let (x2, x1) = two_sum(a1, i);
+    (x2, x1, x0)
+}
+
+/// `(a1 + a0) - (b1 + b0)` as a 4-component expansion `[x0, x1, x2, x3]`
+/// (low→high). (Shewchuk `Two_Two_Diff`.)
+#[inline(always)]
+fn two_two_diff(a1: f64, a0: f64, b1: f64, b0: f64) -> [f64; 4] {
+    let (j, j0, x0) = two_one_diff(a1, a0, b0);
+    let (x3, x2, x1) = two_one_diff(j, j0, b1);
+    [x0, x1, x2, x3]
+}
+
+/// Sum of an expansion's components — the cheap approximation of its value
+/// (Shewchuk `estimate`). Components are summed low→high.
+#[inline]
+#[allow(dead_code)]
+fn estimate(e: &[f64]) -> f64 {
+    let mut q = 0.0;
+    for &c in e {
+        q += c;
+    }
+    q
+}
+
+/// Merge two nonoverlapping, sorted (low→high magnitude) expansions `e` and `f`
+/// into `h = e + f`, exactly, eliminating zero components. `h` must have
+/// capacity `e.len() + f.len()`. Returns the component count. (Shewchuk
+/// `fast_expansion_sum_zeroelim`.) Reads are bounds-guarded (the C original
+/// reads one-past-end into a value it never uses; Rust must not).
+#[allow(dead_code)]
+fn fast_expansion_sum_zeroelim(e: &[f64], f: &[f64], h: &mut [f64]) -> usize {
+    let (elen, flen) = (e.len(), f.len());
+    let mut enow = e[0];
+    let mut fnow = f[0];
+    let mut eindex = 0usize;
+    let mut findex = 0usize;
+    let mut q: f64;
+    if (fnow > enow) == (fnow > -enow) {
+        q = enow;
+        eindex += 1;
+        if eindex < elen {
+            enow = e[eindex];
+        }
+    } else {
+        q = fnow;
+        findex += 1;
+        if findex < flen {
+            fnow = f[findex];
+        }
+    }
+    let mut hindex = 0usize;
+    while eindex < elen && findex < flen {
+        let (qnew, hh) = if (fnow > enow) == (fnow > -enow) {
+            let r = if hindex == 0 {
+                fast_two_sum(enow, q)
+            } else {
+                two_sum(q, enow)
+            };
+            eindex += 1;
+            if eindex < elen {
+                enow = e[eindex];
+            }
+            r
+        } else {
+            let r = if hindex == 0 {
+                fast_two_sum(fnow, q)
+            } else {
+                two_sum(q, fnow)
+            };
+            findex += 1;
+            if findex < flen {
+                fnow = f[findex];
+            }
+            r
+        };
+        q = qnew;
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+    }
+    while eindex < elen {
+        let (qnew, hh) = two_sum(q, enow);
+        eindex += 1;
+        if eindex < elen {
+            enow = e[eindex];
+        }
+        q = qnew;
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+    }
+    while findex < flen {
+        let (qnew, hh) = two_sum(q, fnow);
+        findex += 1;
+        if findex < flen {
+            fnow = f[findex];
+        }
+        q = qnew;
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+    }
+    if q != 0.0 || hindex == 0 {
+        h[hindex] = q;
+        hindex += 1;
+    }
+    hindex
+}
+
+/// Scale an expansion `e` by a single double `b`, exactly, zero-eliminated.
+/// `h` must have capacity `2 * e.len()`. Returns the component count.
+/// (Shewchuk `scale_expansion_zeroelim`.)
+#[allow(dead_code)]
+fn scale_expansion_zeroelim(e: &[f64], b: f64, h: &mut [f64]) -> usize {
+    let (mut q, hh0) = two_product(e[0], b);
+    let mut hindex = 0usize;
+    if hh0 != 0.0 {
+        h[hindex] = hh0;
+        hindex += 1;
+    }
+    for &enow in &e[1..] {
+        let (product1, product0) = two_product(enow, b);
+        let (sum, hh) = two_sum(q, product0);
+        if hh != 0.0 {
+            h[hindex] = hh;
+            hindex += 1;
+        }
+        let (qn, hh2) = fast_two_sum(product1, sum);
+        q = qn;
+        if hh2 != 0.0 {
+            h[hindex] = hh2;
+            hindex += 1;
+        }
+    }
+    if q != 0.0 || hindex == 0 {
+        h[hindex] = q;
+        hindex += 1;
+    }
+    hindex
+}
+
 /// Fast approximate 2D orientation test
 #[inline(always)]
 fn orient2d_fast(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
@@ -104,57 +287,109 @@ fn orient2d_fast(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
 }
 
 /// Adaptive precision 2D orientation test
-fn orient2d_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> f64 {
-    let acx = pa.x - pc.x;
-    let acy = pa.y - pc.y;
-    let bcx = pb.x - pc.x;
-    let bcy = pb.y - pc.y;
-
-    // Compute exact expansion using two-product
-    let (detleft, detleft_tail) = two_product(acx, bcy);
-    let (detright, detright_tail) = two_product(acy, bcx);
-
-    // Compute determinant with exact arithmetic
-    let (det, det_tail) = two_sum(detleft, -detright);
-
-    det + (detleft_tail - detright_tail + det_tail)
-}
-
-/// Test whether three points are in counter-clockwise order
-///
-/// Returns the orientation of the triangle (pa, pb, pc):
-/// - `CounterClockwise` if the points are in counter-clockwise order
-/// - `Clockwise` if the points are in clockwise order  
-/// - `Collinear` if the points are collinear
-///
-/// This predicate is exact for all inputs.
-pub fn orient2d(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> Orientation {
-    let det = orient2d_fast(pa, pb, pc);
-
-    // Compute error bound
-    let acx = (pa.x - pc.x).abs();
-    let acy = (pa.y - pc.y).abs();
-    let bcx = (pb.x - pc.x).abs();
-    let bcy = (pb.y - pc.y).abs();
-
-    let permanent = acx * bcy + acy * bcx;
-    let errbound = CCWERRBOUNDSA * permanent;
-
-    if det > errbound {
+/// Map a determinant value to an [`Orientation`].
+#[inline]
+fn orientation_of(det: f64) -> Orientation {
+    if det > 0.0 {
         Orientation::CounterClockwise
-    } else if det < -errbound {
+    } else if det < 0.0 {
         Orientation::Clockwise
     } else {
-        // Need exact test
-        let det_exact = orient2d_adapt(pa, pb, pc);
-        if det_exact > 0.0 {
-            Orientation::CounterClockwise
-        } else if det_exact < 0.0 {
-            Orientation::Clockwise
-        } else {
-            Orientation::Collinear
-        }
+        Orientation::Collinear
     }
+}
+
+/// Full Shewchuk adaptive orient2d. Returns a value whose SIGN is the exact sign
+/// of the determinant. Stage B refines with the product roundoffs; Stage C adds
+/// the coordinate-difference-tail corrections; Stage D builds the complete
+/// expansion (the provably-exact pass). `detsum` is the `|det|` magnitude
+/// estimate from the caller's A-filter.
+fn orient2d_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2, detsum: f64) -> f64 {
+    // Coordinate differences WITH their roundoff tails (the bits the old
+    // implementation dropped — the source of the sign errors the harness found).
+    let (acx, acxtail) = two_diff(pa.x, pc.x);
+    let (bcx, bcxtail) = two_diff(pb.x, pc.x);
+    let (acy, acytail) = two_diff(pa.y, pc.y);
+    let (bcy, bcytail) = two_diff(pb.y, pc.y);
+
+    let (detleft, detlefttail) = two_product(acx, bcy);
+    let (detright, detrighttail) = two_product(acy, bcx);
+
+    // Stage B: B = (detleft+detlefttail) - (detright+detrighttail), exact 4-comp.
+    let b = two_two_diff(detleft, detlefttail, detright, detrighttail);
+    let mut det = estimate(&b);
+    let errbound = CCWERRBOUNDB * detsum;
+    if det >= errbound || -det >= errbound {
+        return det;
+    }
+
+    // If every coordinate difference was exact, B is already the exact answer.
+    if acxtail == 0.0 && acytail == 0.0 && bcxtail == 0.0 && bcytail == 0.0 {
+        return det;
+    }
+
+    // Stage C: add the first-order coordinate-tail correction.
+    let errbound = CCWERRBOUNDC * detsum + O2D_RESULTERRBOUND * det.abs();
+    det += (acx * bcytail + bcy * acxtail) - (acy * bcxtail + bcx * acytail);
+    if det >= errbound || -det >= errbound {
+        return det;
+    }
+
+    // Stage D: the exact expansion. C1 = B + (acxtail·bcy - acytail·bcx).
+    let (s1, s0) = two_product(acxtail, bcy);
+    let (t1, t0) = two_product(acytail, bcx);
+    let u = two_two_diff(s1, s0, t1, t0);
+    let mut c1 = [0.0f64; 8];
+    let c1len = fast_expansion_sum_zeroelim(&b, &u, &mut c1);
+
+    // C2 = C1 + (acx·bcytail - acy·bcxtail).
+    let (s1, s0) = two_product(acx, bcytail);
+    let (t1, t0) = two_product(acy, bcxtail);
+    let u = two_two_diff(s1, s0, t1, t0);
+    let mut c2 = [0.0f64; 12];
+    let c2len = fast_expansion_sum_zeroelim(&c1[..c1len], &u, &mut c2);
+
+    // D = C2 + (acxtail·bcytail - acytail·bcxtail).
+    let (s1, s0) = two_product(acxtail, bcytail);
+    let (t1, t0) = two_product(acytail, bcxtail);
+    let u = two_two_diff(s1, s0, t1, t0);
+    let mut d = [0.0f64; 16];
+    let dlen = fast_expansion_sum_zeroelim(&c2[..c2len], &u, &mut d);
+
+    // The most significant component carries the exact sign.
+    d[dlen - 1]
+}
+
+/// Test whether three points are in counter-clockwise order — the EXACT sign of
+/// the orientation determinant of (pa, pb, pc), correct for all finite inputs
+/// (full Shewchuk adaptive cascade). `Collinear` iff the determinant is exactly
+/// zero.
+pub fn orient2d(pa: &Vector2, pb: &Vector2, pc: &Vector2) -> Orientation {
+    let detleft = (pa.x - pc.x) * (pb.y - pc.y);
+    let detright = (pa.y - pc.y) * (pb.x - pc.x);
+    let det = detleft - detright;
+
+    // A-filter permanent: when the two products have strict opposite signs the
+    // subtraction is reliable; otherwise bound by their magnitude sum.
+    let detsum = if detleft > 0.0 {
+        if detright <= 0.0 {
+            return orientation_of(det);
+        }
+        detleft + detright
+    } else if detleft < 0.0 {
+        if detright >= 0.0 {
+            return orientation_of(det);
+        }
+        -detleft - detright
+    } else {
+        return orientation_of(det);
+    };
+
+    let errbound = CCWERRBOUNDSA * detsum;
+    if det >= errbound || -det >= errbound {
+        return orientation_of(det);
+    }
+    orientation_of(orient2d_adapt(pa, pb, pc, detsum))
 }
 
 /// Fast approximate 3D orientation test  
@@ -175,50 +410,147 @@ fn orient3d_fast(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3) -> f64 {
 }
 
 /// Adaptive precision 3D orientation test
+/// Buffer ceiling for the generic exact-expansion fallbacks. Sized for the
+/// largest determinant built this way — the degree-4 in-circle (lifted)
+/// expansion reaches ~1536 components; 2048 leaves headroom. (orient3d uses far
+/// less.) These live on the stack only on the rare exact path.
+const EXP_MAX: usize = 2048;
+
+/// A coordinate difference `a - b` as a zero-free expansion (low→high) in `buf`.
+/// Returns the component count (0 when `a == b` exactly).
+#[inline]
+fn diff_exp(a: f64, b: f64, buf: &mut [f64; 2]) -> usize {
+    let (x, y) = two_diff(a, b);
+    let mut n = 0;
+    if y != 0.0 {
+        buf[n] = y;
+        n += 1;
+    }
+    if x != 0.0 {
+        buf[n] = x;
+        n += 1;
+    }
+    n
+}
+
+/// Exact product `out = a · b` of two zero-free expansions, via `Σ scale(a, b[i])`.
+/// Returns the component count; empty input ⇒ exact 0.
+fn expansion_product(a: &[f64], b: &[f64], out: &mut [f64]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut acc = [0.0f64; EXP_MAX];
+    let mut acc_len = 0usize;
+    let mut scaled = [0.0f64; EXP_MAX];
+    let mut next = [0.0f64; EXP_MAX];
+    for &bi in b {
+        let slen = scale_expansion_zeroelim(a, bi, &mut scaled);
+        if acc_len == 0 {
+            acc[..slen].copy_from_slice(&scaled[..slen]);
+            acc_len = slen;
+        } else {
+            let nlen = fast_expansion_sum_zeroelim(&acc[..acc_len], &scaled[..slen], &mut next);
+            acc[..nlen].copy_from_slice(&next[..nlen]);
+            acc_len = nlen;
+        }
+    }
+    out[..acc_len].copy_from_slice(&acc[..acc_len]);
+    acc_len
+}
+
+/// Exact difference `out = e - f` of two zero-free expansions; empty ⇒ 0.
+fn expansion_diff(e: &[f64], f: &[f64], out: &mut [f64]) -> usize {
+    if f.is_empty() {
+        out[..e.len()].copy_from_slice(e);
+        return e.len();
+    }
+    let mut negf = [0.0f64; EXP_MAX];
+    for (i, &c) in f.iter().enumerate() {
+        negf[i] = -c;
+    }
+    if e.is_empty() {
+        out[..f.len()].copy_from_slice(&negf[..f.len()]);
+        return f.len();
+    }
+    fast_expansion_sum_zeroelim(e, &negf[..f.len()], out)
+}
+
+/// Exact 3D orientation determinant value — its SIGN is correct for all finite
+/// inputs. Builds the full expansion of
+/// `-(adx·(bdy·cdz - bdz·cdy) + ady·(bdz·cdx - bdx·cdz) + adz·(bdx·cdy - bdy·cdx))`
+/// with the coordinate-difference tails carried (the bits the old implementation
+/// dropped). Generic exact fallback — only runs when the A-filter is inconclusive.
 fn orient3d_adapt(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3) -> f64 {
-    let adx = pa.x - pd.x;
-    let ady = pa.y - pd.y;
-    let adz = pa.z - pd.z;
-    let bdx = pb.x - pd.x;
-    let bdy = pb.y - pd.y;
-    let bdz = pb.z - pd.z;
-    let cdx = pc.x - pd.x;
-    let cdy = pc.y - pd.y;
-    let cdz = pc.z - pd.z;
+    let (mut adx, mut ady, mut adz) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+    let (mut bdx, mut bdy, mut bdz) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+    let (mut cdx, mut cdy, mut cdz) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+    let adxn = diff_exp(pa.x, pd.x, &mut adx);
+    let adyn = diff_exp(pa.y, pd.y, &mut ady);
+    let adzn = diff_exp(pa.z, pd.z, &mut adz);
+    let bdxn = diff_exp(pb.x, pd.x, &mut bdx);
+    let bdyn = diff_exp(pb.y, pd.y, &mut bdy);
+    let bdzn = diff_exp(pb.z, pd.z, &mut bdz);
+    let cdxn = diff_exp(pc.x, pd.x, &mut cdx);
+    let cdyn = diff_exp(pc.y, pd.y, &mut cdy);
+    let cdzn = diff_exp(pc.z, pd.z, &mut cdz);
 
-    // Compute the 2x2 minors using exact arithmetic
-    // bc = bdy * cdz - bdz * cdy
-    let (bc_hi, bc_lo) = two_product(bdy, cdz);
-    let (temp_hi, temp_lo) = two_product(bdz, cdy);
-    let (bc_1, bc_2) = two_sum(bc_hi, -temp_hi);
-    let bc_3 = bc_lo - temp_lo;
-    let bc = bc_1 + (bc_2 + bc_3);
+    let mut p1 = [0.0f64; EXP_MAX];
+    let mut p2 = [0.0f64; EXP_MAX];
+    let mut minor = [0.0f64; EXP_MAX];
+    let mut term = [0.0f64; EXP_MAX];
+    let mut s = [0.0f64; EXP_MAX];
+    let mut s2 = [0.0f64; EXP_MAX];
+    let mut s_len;
 
-    // ca = bdz * cdx - bdx * cdz
-    let (ca_hi, ca_lo) = two_product(bdz, cdx);
-    let (temp_hi, temp_lo) = two_product(bdx, cdz);
-    let (ca_1, ca_2) = two_sum(ca_hi, -temp_hi);
-    let ca_3 = ca_lo - temp_lo;
-    let ca = ca_1 + (ca_2 + ca_3);
+    // Cofactor 1: adx · (bdy·cdz - bdz·cdy)
+    let p1n = expansion_product(&bdy[..bdyn], &cdz[..cdzn], &mut p1);
+    let p2n = expansion_product(&bdz[..bdzn], &cdy[..cdyn], &mut p2);
+    let mn = expansion_diff(&p1[..p1n], &p2[..p2n], &mut minor);
+    let tn = expansion_product(&adx[..adxn], &minor[..mn], &mut term);
+    s[..tn].copy_from_slice(&term[..tn]);
+    s_len = tn;
 
-    // ab = bdx * cdy - bdy * cdx
-    let (ab_hi, ab_lo) = two_product(bdx, cdy);
-    let (temp_hi, temp_lo) = two_product(bdy, cdx);
-    let (ab_1, ab_2) = two_sum(ab_hi, -temp_hi);
-    let ab_3 = ab_lo - temp_lo;
-    let ab = ab_1 + (ab_2 + ab_3);
+    // Cofactor 2: ady · (bdz·cdx - bdx·cdz)
+    let p1n = expansion_product(&bdz[..bdzn], &cdx[..cdxn], &mut p1);
+    let p2n = expansion_product(&bdx[..bdxn], &cdz[..cdzn], &mut p2);
+    let mn = expansion_diff(&p1[..p1n], &p2[..p2n], &mut minor);
+    let tn = expansion_product(&ady[..adyn], &minor[..mn], &mut term);
+    s_len = accumulate(&mut s, s_len, &term[..tn], &mut s2);
 
-    // Final determinant: -(adx * bc + ady * ca + adz * ab)
-    let (term1_hi, term1_lo) = two_product(adx, bc);
-    let (term2_hi, term2_lo) = two_product(ady, ca);
-    let (term3_hi, term3_lo) = two_product(adz, ab);
+    // Cofactor 3: adz · (bdx·cdy - bdy·cdx)
+    let p1n = expansion_product(&bdx[..bdxn], &cdy[..cdyn], &mut p1);
+    let p2n = expansion_product(&bdy[..bdyn], &cdx[..cdxn], &mut p2);
+    let mn = expansion_diff(&p1[..p1n], &p2[..p2n], &mut minor);
+    let tn = expansion_product(&adz[..adzn], &minor[..mn], &mut term);
+    s_len = accumulate(&mut s, s_len, &term[..tn], &mut s2);
 
-    let (sum1_hi, sum1_lo) = two_sum(term1_hi, term2_hi);
-    let (sum2_hi, sum2_lo) = two_sum(sum1_hi, term3_hi);
+    // S = adx·M1 + ady·M2 + adz·M3; orient3d's value is -S (existing sign
+    // convention). The top component carries the exact sign.
+    if s_len == 0 {
+        0.0
+    } else {
+        -s[s_len - 1]
+    }
+}
 
-    let result = sum2_hi + (sum2_lo + sum1_lo + term1_lo + term2_lo + term3_lo);
-
-    -result // Note the sign change
+/// Accumulate `s += addend` (zero-free expansions), using `scratch`. Returns the
+/// new length of `s`.
+fn accumulate(s: &mut [f64], s_len: usize, addend: &[f64], scratch: &mut [f64]) -> usize {
+    if addend.is_empty() {
+        return s_len;
+    }
+    if s_len == 0 {
+        s[..addend.len()].copy_from_slice(addend);
+        return addend.len();
+    }
+    let n = {
+        // Copy `s`'s live prefix out so we can borrow it immutably while writing
+        // `scratch`, then copy back.
+        let cur: &[f64] = &s[..s_len];
+        fast_expansion_sum_zeroelim(cur, addend, scratch)
+    };
+    s[..n].copy_from_slice(&scratch[..n]);
+    n
 }
 
 /// Test orientation of four points in 3D
@@ -287,37 +619,79 @@ fn incircle_fast(pa: &Vector2, pb: &Vector2, pc: &Vector2, pd: &Vector2) -> f64 
     alift * bcdet + blift * cadet + clift * abdet
 }
 
-/// Adaptive precision in-circle test
+/// Exact addition `out = e + f` of two zero-free expansions; empty operand ⇒ copy.
+fn sum_exp(e: &[f64], f: &[f64], out: &mut [f64]) -> usize {
+    if e.is_empty() {
+        out[..f.len()].copy_from_slice(f);
+        return f.len();
+    }
+    if f.is_empty() {
+        out[..e.len()].copy_from_slice(e);
+        return e.len();
+    }
+    fast_expansion_sum_zeroelim(e, f, out)
+}
+
+/// Exact in-circle determinant value — its SIGN is correct for all finite inputs.
+/// Builds the full expansion of `alift·bcdet + blift·cadet + clift·abdet`, where
+/// each `*lift = *dx² + *dy²` and each sub-determinant carries the coordinate
+/// roundoff tails (the bits the old adapt dropped). Generic exact fallback; runs
+/// only when the A-filter is inconclusive.
 fn incircle_adapt(pa: &Vector2, pb: &Vector2, pc: &Vector2, pd: &Vector2) -> f64 {
-    let adx = pa.x - pd.x;
-    let ady = pa.y - pd.y;
-    let bdx = pb.x - pd.x;
-    let bdy = pb.y - pd.y;
-    let cdx = pc.x - pd.x;
-    let cdy = pc.y - pd.y;
+    let (mut adx, mut ady) = ([0.0; 2], [0.0; 2]);
+    let (mut bdx, mut bdy) = ([0.0; 2], [0.0; 2]);
+    let (mut cdx, mut cdy) = ([0.0; 2], [0.0; 2]);
+    let adxn = diff_exp(pa.x, pd.x, &mut adx);
+    let adyn = diff_exp(pa.y, pd.y, &mut ady);
+    let bdxn = diff_exp(pb.x, pd.x, &mut bdx);
+    let bdyn = diff_exp(pb.y, pd.y, &mut bdy);
+    let cdxn = diff_exp(pc.x, pd.x, &mut cdx);
+    let cdyn = diff_exp(pc.y, pd.y, &mut cdy);
 
-    // Use exact arithmetic for the lifts
-    let (adx2_hi, adx2_lo) = two_product(adx, adx);
-    let (ady2_hi, ady2_lo) = two_product(ady, ady);
-    let (alift_hi, alift_lo) = two_sum(adx2_hi, ady2_hi);
-    let alift = alift_hi + (alift_lo + adx2_lo + ady2_lo);
+    let mut u = [0.0f64; EXP_MAX];
+    let mut v = [0.0f64; EXP_MAX];
+    let mut lift = [0.0f64; EXP_MAX];
+    let mut sub = [0.0f64; EXP_MAX];
+    let mut term = [0.0f64; EXP_MAX];
+    let mut sc = [0.0f64; EXP_MAX];
+    let mut det = [0.0f64; EXP_MAX];
+    let mut det_len = 0usize;
 
-    let (bdx2_hi, bdx2_lo) = two_product(bdx, bdx);
-    let (bdy2_hi, bdy2_lo) = two_product(bdy, bdy);
-    let (blift_hi, blift_lo) = two_sum(bdx2_hi, bdy2_hi);
-    let blift = blift_hi + (blift_lo + bdx2_lo + bdy2_lo);
+    // term 1: (adx² + ady²) · (bdx·cdy - cdx·bdy)
+    let un = expansion_product(&adx[..adxn], &adx[..adxn], &mut u);
+    let vn = expansion_product(&ady[..adyn], &ady[..adyn], &mut v);
+    let lift_n = sum_exp(&u[..un], &v[..vn], &mut lift);
+    let un = expansion_product(&bdx[..bdxn], &cdy[..cdyn], &mut u);
+    let vn = expansion_product(&cdx[..cdxn], &bdy[..bdyn], &mut v);
+    let sub_n = expansion_diff(&u[..un], &v[..vn], &mut sub);
+    let term_n = expansion_product(&lift[..lift_n], &sub[..sub_n], &mut term);
+    det_len = accumulate(&mut det, det_len, &term[..term_n], &mut sc);
 
-    let (cdx2_hi, cdx2_lo) = two_product(cdx, cdx);
-    let (cdy2_hi, cdy2_lo) = two_product(cdy, cdy);
-    let (clift_hi, clift_lo) = two_sum(cdx2_hi, cdy2_hi);
-    let clift = clift_hi + (clift_lo + cdx2_lo + cdy2_lo);
+    // term 2: (bdx² + bdy²) · (cdx·ady - adx·cdy)
+    let un = expansion_product(&bdx[..bdxn], &bdx[..bdxn], &mut u);
+    let vn = expansion_product(&bdy[..bdyn], &bdy[..bdyn], &mut v);
+    let lift_n = sum_exp(&u[..un], &v[..vn], &mut lift);
+    let un = expansion_product(&cdx[..cdxn], &ady[..adyn], &mut u);
+    let vn = expansion_product(&adx[..adxn], &cdy[..cdyn], &mut v);
+    let sub_n = expansion_diff(&u[..un], &v[..vn], &mut sub);
+    let term_n = expansion_product(&lift[..lift_n], &sub[..sub_n], &mut term);
+    det_len = accumulate(&mut det, det_len, &term[..term_n], &mut sc);
 
-    // Compute sub-determinants
-    let abdet = adx * bdy - bdx * ady;
-    let bcdet = bdx * cdy - cdx * bdy;
-    let cadet = cdx * ady - adx * cdy;
+    // term 3: (cdx² + cdy²) · (adx·bdy - bdx·ady)
+    let un = expansion_product(&cdx[..cdxn], &cdx[..cdxn], &mut u);
+    let vn = expansion_product(&cdy[..cdyn], &cdy[..cdyn], &mut v);
+    let lift_n = sum_exp(&u[..un], &v[..vn], &mut lift);
+    let un = expansion_product(&adx[..adxn], &bdy[..bdyn], &mut u);
+    let vn = expansion_product(&bdx[..bdxn], &ady[..adyn], &mut v);
+    let sub_n = expansion_diff(&u[..un], &v[..vn], &mut sub);
+    let term_n = expansion_product(&lift[..lift_n], &sub[..sub_n], &mut term);
+    det_len = accumulate(&mut det, det_len, &term[..term_n], &mut sc);
 
-    alift * bcdet + blift * cadet + clift * abdet
+    if det_len == 0 {
+        0.0
+    } else {
+        det[det_len - 1]
+    }
 }
 
 /// Test whether a point is inside the circle passing through three other points
@@ -359,6 +733,143 @@ pub fn incircle(pa: &Vector2, pb: &Vector2, pc: &Vector2, pd: &Vector2) -> Circl
         } else {
             CircleLocation::OnBoundary
         }
+    }
+}
+
+// ── Heap (Vec) expansion arithmetic ─────────────────────────────────────────
+// The in-sphere determinant's exact expansion reaches several thousand
+// components — too large for the fixed `EXP_MAX` stack arrays — so insphere's
+// exact fallback uses these `Vec`-returning helpers. Allocation cost is
+// irrelevant: this path runs only when the A-filter is inconclusive (rare).
+
+/// Scale a zero-free expansion `e` by `b`, exactly; empty ⇒ 0.
+fn scale_v(e: &[f64], b: f64) -> Vec<f64> {
+    if e.is_empty() {
+        return Vec::new();
+    }
+    let mut h = vec![0.0f64; 2 * e.len() + 8];
+    let n = scale_expansion_zeroelim(e, b, &mut h);
+    h.truncate(n);
+    h
+}
+
+/// Exact sum `e + f` of zero-free expansions.
+fn sum_v(e: &[f64], f: &[f64]) -> Vec<f64> {
+    if e.is_empty() {
+        return f.to_vec();
+    }
+    if f.is_empty() {
+        return e.to_vec();
+    }
+    let mut h = vec![0.0f64; e.len() + f.len() + 8];
+    let n = fast_expansion_sum_zeroelim(e, f, &mut h);
+    h.truncate(n);
+    h
+}
+
+/// Exact difference `e - f` of zero-free expansions.
+fn diff_v(e: &[f64], f: &[f64]) -> Vec<f64> {
+    if f.is_empty() {
+        return e.to_vec();
+    }
+    let negf: Vec<f64> = f.iter().map(|&c| -c).collect();
+    sum_v(e, &negf)
+}
+
+/// Exact product `a · b` of zero-free expansions (`Σ scale(a, b[i])`).
+fn product_v(a: &[f64], b: &[f64]) -> Vec<f64> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let mut acc: Vec<f64> = Vec::new();
+    for &bi in b {
+        let scaled = scale_v(a, bi);
+        acc = if acc.is_empty() {
+            scaled
+        } else {
+            sum_v(&acc, &scaled)
+        };
+    }
+    acc
+}
+
+/// A coordinate difference `a - b` as a zero-free heap expansion.
+fn diff_exp_v(a: f64, b: f64) -> Vec<f64> {
+    let (x, y) = two_diff(a, b);
+    let mut v = Vec::with_capacity(2);
+    if y != 0.0 {
+        v.push(y);
+    }
+    if x != 0.0 {
+        v.push(x);
+    }
+    v
+}
+
+/// Exact in-sphere determinant value — its SIGN is correct for all finite inputs.
+/// Mirrors `insphere_fast`'s formula
+/// `dlift·abc - clift·dab + blift·cda - alift·bcd` exactly, carrying every
+/// coordinate-difference and lift roundoff tail. Generic exact fallback; runs
+/// only when the A-filter is inconclusive. (Replaces the former hardcoded
+/// `RESULTERRBOUND` tolerance — the last and worst non-exact path.)
+fn insphere_adapt(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3) -> f64 {
+    let aex = diff_exp_v(pa.x, pe.x);
+    let aey = diff_exp_v(pa.y, pe.y);
+    let aez = diff_exp_v(pa.z, pe.z);
+    let bex = diff_exp_v(pb.x, pe.x);
+    let bey = diff_exp_v(pb.y, pe.y);
+    let bez = diff_exp_v(pb.z, pe.z);
+    let cex = diff_exp_v(pc.x, pe.x);
+    let cey = diff_exp_v(pc.y, pe.y);
+    let cez = diff_exp_v(pc.z, pe.z);
+    let dex = diff_exp_v(pd.x, pe.x);
+    let dey = diff_exp_v(pd.y, pe.y);
+    let dez = diff_exp_v(pd.z, pe.z);
+
+    // 2x2 minors (xy)
+    let ab = diff_v(&product_v(&aex, &bey), &product_v(&bex, &aey));
+    let bc = diff_v(&product_v(&bex, &cey), &product_v(&cex, &bey));
+    let cd = diff_v(&product_v(&cex, &dey), &product_v(&dex, &cey));
+    let da = diff_v(&product_v(&dex, &aey), &product_v(&aex, &dey));
+    let ac = diff_v(&product_v(&aex, &cey), &product_v(&cex, &aey));
+    let bd = diff_v(&product_v(&bex, &dey), &product_v(&dex, &bey));
+
+    // 3x3 cofactors (with z)
+    let abc = sum_v(
+        &diff_v(&product_v(&aez, &bc), &product_v(&bez, &ac)),
+        &product_v(&cez, &ab),
+    );
+    let bcd = sum_v(
+        &diff_v(&product_v(&bez, &cd), &product_v(&cez, &bd)),
+        &product_v(&dez, &bc),
+    );
+    let cda = sum_v(
+        &sum_v(&product_v(&cez, &da), &product_v(&dez, &ac)),
+        &product_v(&aez, &cd),
+    );
+    let dab = sum_v(
+        &sum_v(&product_v(&dez, &ab), &product_v(&aez, &bd)),
+        &product_v(&bez, &da),
+    );
+
+    // lifts = x² + y² + z²
+    let lift = |x: &[f64], y: &[f64], z: &[f64]| -> Vec<f64> {
+        sum_v(&sum_v(&product_v(x, x), &product_v(y, y)), &product_v(z, z))
+    };
+    let alift = lift(&aex, &aey, &aez);
+    let blift = lift(&bex, &bey, &bez);
+    let clift = lift(&cex, &cey, &cez);
+    let dlift = lift(&dex, &dey, &dez);
+
+    // det = dlift·abc - clift·dab + blift·cda - alift·bcd
+    let pos = sum_v(&product_v(&dlift, &abc), &product_v(&blift, &cda));
+    let neg = sum_v(&product_v(&clift, &dab), &product_v(&alift, &bcd));
+    let det = diff_v(&pos, &neg);
+
+    if det.is_empty() {
+        0.0
+    } else {
+        det[det.len() - 1]
     }
 }
 
@@ -447,19 +958,54 @@ pub fn insphere(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3)
     } else if det < -errbound {
         CircleLocation::Outside
     } else {
-        // Tighter f64 fallback when |det| sits below the adaptive error
-        // bound. A full Shewchuk-style expansion-arithmetic refinement
-        // would resolve points that are exactly cocircular up to the last
-        // bit; here we treat anything within RESULTERRBOUND of zero as
-        // OnBoundary, which is conservative and consistent with the
-        // tolerance contract used elsewhere in the kernel.
-        if det > RESULTERRBOUND {
+        // Exact expansion-arithmetic refinement — resolves points cocircular
+        // up to the last bit (replaces the former RESULTERRBOUND tolerance).
+        let det_exact = insphere_adapt(pa, pb, pc, pd, pe);
+        if det_exact > 0.0 {
             CircleLocation::Inside
-        } else if det < -RESULTERRBOUND {
+        } else if det_exact < 0.0 {
             CircleLocation::Outside
         } else {
             CircleLocation::OnBoundary
         }
+    }
+}
+
+/// Exact orientation of a closed polygon from the SIGN of its shoelace signed
+/// area `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)`, computed in exact expansion
+/// arithmetic. `CounterClockwise` = positive area, `Clockwise` = negative,
+/// `Collinear` = exactly zero (degenerate / self-cancelling). Correct for all
+/// finite inputs — the tolerance-free basis for winding/orientation tests that
+/// today compare an f64 signed area against `0.0`.
+pub fn signed_area_2d(points: &[Vector2]) -> Orientation {
+    let n = points.len();
+    if n < 3 {
+        return Orientation::Collinear;
+    }
+    let mut acc: Vec<f64> = Vec::new();
+    for i in 0..n {
+        let p = &points[i];
+        let q = &points[(i + 1) % n];
+        // term = x_i·y_{i+1} − x_{i+1}·y_i, exactly (a 4-component expansion).
+        let (h1, l1) = two_product(p.x, q.y);
+        let (h2, l2) = two_product(q.x, p.y);
+        let term: Vec<f64> = two_two_diff(h1, l1, h2, l2)
+            .into_iter()
+            .filter(|&c| c != 0.0)
+            .collect();
+        if term.is_empty() {
+            continue;
+        }
+        acc = if acc.is_empty() {
+            term
+        } else {
+            sum_v(&acc, &term)
+        };
+    }
+    if acc.is_empty() {
+        Orientation::Collinear
+    } else {
+        orientation_of(acc[acc.len() - 1])
     }
 }
 
@@ -735,5 +1281,80 @@ mod tests {
         let result = orient2d(&Vector2::ZERO, &Vector2::X, &tiny);
         // Should detect the slight CCW orientation
         assert_eq!(result, Orientation::CounterClockwise);
+    }
+}
+
+#[cfg(test)]
+mod expansion_primitive_tests {
+    //! Exactness gates for the Shewchuk expansion toolkit — the foundation the
+    //! true exact predicates are built from. `two_product`'s tail is checked
+    //! against the hardware-exact FMA residual; the expansion routines are
+    //! checked on cases with a hand-known exact sum.
+    use super::*;
+
+    #[test]
+    fn two_product_tail_is_the_exact_fma_residual() {
+        for &(a, b) in &[
+            (1.0 + 2.0_f64.powi(-30), 1.0 - 2.0_f64.powi(-30)),
+            (1.3, 7.9),
+            (123456.789, 0.000123),
+            (2.0_f64.powi(40) + 1.0, 3.0),
+            (-5.5, 11.25),
+        ] {
+            let (x, y) = two_product(a, b);
+            assert_eq!(x, a * b, "high part is the rounded product");
+            // FMA computes a*b - x with no intermediate rounding → ground truth.
+            assert_eq!(y, a.mul_add(b, -x), "tail must equal the exact residual");
+        }
+    }
+
+    #[test]
+    fn two_diff_recovers_dropped_low_bits() {
+        let a = 1.0;
+        let b = 2.0_f64.powi(-60); // below ulp(1.0) = 2^-52, so a-b rounds to 1.0
+        let (x, y) = two_diff(a, b);
+        assert_eq!(x, 1.0, "rounded difference");
+        assert_eq!(y, -b, "the lost low bits live in the tail; x + y == a - b");
+    }
+
+    #[test]
+    fn fast_two_sum_matches_two_sum_when_ordered() {
+        let (a, b) = (1.0e16, 3.0); // |a| >= |b|
+        assert_eq!(fast_two_sum(a, b), two_sum(a, b));
+    }
+
+    #[test]
+    fn fast_expansion_sum_clean_integers() {
+        let mut h = [0.0f64; 4];
+        let n = fast_expansion_sum_zeroelim(&[3.0], &[5.0], &mut h);
+        assert_eq!(&h[..n], &[8.0], "3 + 5 = 8, zero tail eliminated");
+
+        let n = fast_expansion_sum_zeroelim(&[1.0, 16.0], &[2.0], &mut h);
+        assert_eq!(estimate(&h[..n]), 19.0, "(1+16) + 2 = 19");
+    }
+
+    #[test]
+    fn fast_expansion_sum_preserves_a_tiny_tail() {
+        let mut h = [0.0f64; 4];
+        let tiny = 2.0_f64.powi(-60);
+        let n = fast_expansion_sum_zeroelim(&[tiny], &[1.0], &mut h);
+        assert!(
+            h[..n].iter().any(|&c| c == tiny),
+            "1 + 2^-60 rounds to 1.0 but the 2^-60 component must survive: {:?}",
+            &h[..n]
+        );
+    }
+
+    #[test]
+    fn scale_expansion_clean() {
+        let mut h = [0.0f64; 4];
+        let n = scale_expansion_zeroelim(&[2.0, 16.0], 3.0, &mut h);
+        assert_eq!(estimate(&h[..n]), 54.0, "(2+16) * 3 = 54");
+    }
+
+    #[test]
+    fn estimate_sums_components() {
+        assert_eq!(estimate(&[1.0, 2.0, 4.0]), 7.0);
+        assert_eq!(estimate(&[]), 0.0);
     }
 }

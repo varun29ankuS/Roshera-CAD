@@ -215,9 +215,14 @@ server.tool(
     "designed surface — nurbs_loft / revolve / extrude / loft / sweep / boolean / " +
     "fillet / chamfer — vs a bare PRIMITIVE stand-in like a box/cylinder) and the " +
     "kernel-COMPUTED validity certificate (brep_valid, watertight, manifold, " +
-    "euler, sound + a one-line summary). The kernel cannot misrepresent this, so " +
-    "use it to confirm a build is a genuine closed DESIGNED solid before trusting " +
-    "or reporting it — `designed:false`/`sound:false` means stop and fix, not ship.",
+    "euler, sound + a one-line summary). ALSO returns `tessellation` — the DISPLAY-" +
+    "MESH verdict: `tessellation_clean:false` means the render mesh is degenerate " +
+    "or has inverted normals (e.g. a bored cylinder's inner wall tessellating to a " +
+    "scribble) even when the B-Rep is watertight; `tessellation.worst_face` names " +
+    "the exact face so you can SEE the defect without rendering. The kernel cannot " +
+    "misrepresent this, so use it to confirm a build is a genuine closed DESIGNED " +
+    "solid that also RENDERS correctly before trusting or reporting it — " +
+    "`designed:false`/`sound:false` (now incl. a bad display mesh) means stop and fix, not ship.",
   { part_id: z.number().int().describe("kernel part id from list_parts") },
   async ({ part_id }) => {
     try {
@@ -526,6 +531,83 @@ server.tool(
   async ({ part_id }) => {
     try {
       return ok(await api("GET", `/api/agent/parts/${part_id}/mass`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "verify_claim",
+  "VERIFY a math claim against the kernel's GROUND TRUTH — 'the notebook that can't " +
+    "lie'. Bind each variable in `expr` to an EXACT kernel measurement (a part's " +
+    "volume / surface_area, a face's area, an edge's length, or a supplied constant), " +
+    "assert `expected`, and the kernel evaluates it deterministically (NOT an LLM). " +
+    "Returns a THREE-STATE verdict: verified | false (a real mismatch, with abs_error) " +
+    "| refused (a binding could not resolve — never a silent pass). Use it to check an " +
+    "engineering relation against measured geometry, e.g. nozzle expansion ratio " +
+    "A_exit/A_throat, or mass = volume * density.",
+  {
+    expr: z
+      .string()
+      .describe("math expression over the binding variable names, e.g. 'a_exit / a_throat'"),
+    bindings: z
+      .array(
+        z.object({
+          var: z.string().describe("variable name used in expr"),
+          measure: z.object({
+            kind: z.enum([
+              "volume",
+              "surface_area",
+              "face_area",
+              "edge_length",
+              "constant",
+            ]),
+            part: z
+              .string()
+              .optional()
+              .describe("part object UUID — for volume / surface_area"),
+            face: z.number().int().optional().describe("face id — for face_area"),
+            edge: z.number().int().optional().describe("edge id — for edge_length"),
+            value: z.number().optional().describe("the value — for constant"),
+          }),
+        }),
+      )
+      .describe("variable→measurement bindings"),
+    expected: z.number().describe("the value the expression should equal"),
+    tolerance: z
+      .number()
+      .optional()
+      .describe("absolute tolerance; omit for auto (1e-6 relative)"),
+  },
+  async ({ expr, bindings, expected, tolerance }) => {
+    try {
+      return ok(
+        await api("POST", "/api/agent/verify-claim", {
+          expr,
+          bindings,
+          expected,
+          ...(tolerance !== undefined ? { tolerance } : {}),
+        }),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "get_revolve_profile",
+  "RECOVER the editable meridian a revolved part was built from — the (r, z) " +
+    "half-plane profile (radius-from-axis, height-along-axis). This is the " +
+    "scientist's editable source: read it, change a radius (e.g. widen the throat), " +
+    "and call revolve again with the edited profile to REGENERATE the part (the " +
+    "edit→regenerate loop). Returns [[r,z],...]; 404 if the part was not built by a " +
+    "parametric revolve.",
+  { part_id: z.number().int() },
+  async ({ part_id }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/${part_id}/profile`));
     } catch (e) {
       return fail(e);
     }
@@ -886,9 +968,38 @@ server.tool(
     axis_direction: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
     angle_deg: z.number().default(360),
     segments: z.number().int().min(3).max(512).default(96),
+    smooth: z
+      .boolean()
+      .optional()
+      .describe(
+        "fit a SMOOTH NURBS curve through `profile` (treated as the outer wall) so " +
+          "the revolved wall is ONE surface, not a faceted polyline — needs bore_radius",
+      ),
+    bore_radius: z
+      .number()
+      .optional()
+      .describe("hollow bore radius for a smooth-walled tube (use with smooth=true)"),
+    wall_thickness: z
+      .number()
+      .optional()
+      .describe(
+        "CONTOURED nozzle/vessel (e.g. a Rao bell): treat `profile` as the INNER " +
+          "flow contour and offset the outer wall by this thickness — both walls become " +
+          "ONE smooth SurfaceOfRevolution (exact circles, smooth contour, no rings/seam).",
+      ),
     name: z.string().optional(),
   },
-  async ({ profile, axis_origin, axis_direction, angle_deg, segments, name }) => {
+  async ({
+    profile,
+    axis_origin,
+    axis_direction,
+    angle_deg,
+    segments,
+    smooth,
+    bore_radius,
+    wall_thickness,
+    name,
+  }) => {
     try {
       const r = await api("POST", "/api/geometry/revolve", {
         profile,
@@ -896,6 +1007,9 @@ server.tool(
         axis_direction,
         angle_deg,
         segments,
+        smooth: smooth ?? false,
+        bore_radius: bore_radius ?? 0,
+        wall_thickness: wall_thickness ?? 0,
         name: name ?? null,
       });
       const id = r.solid_id ?? (await newestPartId());

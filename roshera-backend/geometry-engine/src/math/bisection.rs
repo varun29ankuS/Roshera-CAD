@@ -57,7 +57,12 @@ where
         let m = 0.5 * (a + b);
         let fm = f(m);
         if fm.is_nan() {
-            return Some(m);
+            // f is undefined at the bracket midpoint — we cannot tell which
+            // sub-interval keeps the bracket, and the doc contract promises
+            // |f(root)| <= target_tol. Returning `Some(m)` would hand the caller
+            // a NaN-poisoned "root"; report no root instead so the caller's
+            // fallback runs.
+            return None;
         }
         if fm.abs() <= target_tol {
             return Some(m);

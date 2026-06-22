@@ -581,10 +581,19 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
             total_free_dofs += 2;
         }
     }
-    // Lines: 4 DOFs (px, py, dx, dy). No per-DOF fix flags today.
-    for _entry in sketch.lines().iter() {
+    // Lines: 4 DOFs (px, py, dx, dy) for an INDEPENDENT line. A segment
+    // derived from two endpoint points (the shared-variable model,
+    // `endpoints = Some(..)`) owns ZERO independent DOF — its geometry IS its
+    // endpoints, already counted above. Counting a derived segment as 4 phantom
+    // DOF left every sketch that contains a segment perpetually 4-DOF
+    // under-constrained, so `FullyConstrained` could never be reported. The
+    // solver's `populate_solver` already treats derived segments as parameter-
+    // free, so this aligns the DOF count with what Newton-Raphson iterates.
+    for entry in sketch.lines().iter() {
         entities_analysed += 1;
-        total_free_dofs += 4;
+        if entry.value().endpoints.is_none() {
+            total_free_dofs += 4;
+        }
     }
     // Circles: 3 DOFs (cx, cy, r). No per-DOF fix flags today.
     for _entry in sketch.circles().iter() {
