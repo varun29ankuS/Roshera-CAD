@@ -14,7 +14,13 @@
 
 ## ⚠️ PRE-EXISTING TEST FAILURES (NOT mine — fail at HEAD) + a GATE GAP
 - P1 `nozzle_profile_measured_dims_match` (throat not detected), P2 `tessellation refining_tolerance`, P3 `ros loft_watertight_after_roundtrip`.
-- ★ **The pre-commit gate only COMPILES (`cargo check --all-targets`), it never RUNS lib/integration tests** — so these rotted unnoticed. Recommend adding a `cargo test`/`nextest` gate to CI/pre-commit.
+- ★ **CORRECTION (2026-06-22):** the CI test gate ALREADY EXISTS + is enforced (`.github/workflows/ci.yml:117` `cargo nextest run --workspace`, no continue-on-error). NO new gate needed. BUT **CI has been RED for a long time and pushed-past** — the latest run (27913210589) Test Suite fails the nextest step with **27 failing tests** (Frontend Build + Security + fmt + clippy all PASS; only tests are red). They cluster on the KNOWN-DEEP B-list, not the small stuff:
+  - **NURBS boolean watertightness ~13** — `nurbs_boolean_watertight.rs` w01–w10, `nurbs_minus_box_completes_and_imprints`: the #17 corefinement gap (memory `nurbs-corefinement-17`).
+  - **NURBS loft watertightness ~5** — `nurbs_loft.rs`×3, `nurbs_car_body`, `golden_nurbs_loft_barrel`, `shell_nurbs_barrel`.
+  - **Boolean robustness ~4** — `intersection/union_commutativity_parity`, `union_commutative_polyline_hexagons`, `curved_boolean_on_rotated_primitive_terminates`, `polyline_cut_harness`.
+  - **Tessellation ~3** — `refining_tolerance_converges` (P2), `high_curvature_nurbs_no_skinny_triangles`, `chord_tolerance_actually_enforced`.
+  - validation `ground_truth.rs:67` (B1-adjacent), `nozzle_profile_measured_dims` (P1), `loft_watertight_after_roundtrip` (P3).
+  ACTION (NEEDS-VARUN): this is the real robustness backlog — #17 NURBS corefinement is the biggest cluster (~13 tests). Getting CI green = fixing the deep NURBS boolean/loft/tessellation work. The small-safe sweep does NOT touch these.
 
 ## 🧹 DEAD CODE (remove with your permission — rule 5) & MISSING
 - `tessellate_surface` (placeholder+buggy), `render_solids_with_labels`, `drawing/section_view.rs` pipeline, `ai-integration/providers/universal_endpoint.rs` (608-line dup), api-server `full_integration_executor` field + `send_collaborators_update`, math SIMD suite + `trimmed_nurbs.rs`, `timeline_impl.rs merge_branches_alt`/`replay_from` (dangerous if called).
@@ -164,7 +170,9 @@ ALSO (same fallback trap, do alongside): B2 RuledSurface + OffsetSurface faceted
 
 ## PROGRESS LOG (append-only)
 - 2026-06-21 night: launched 10 audit agents; created this campaign; STEP-export faceting diagnosed.
-- All 10 audits in. 9 safe fixes committed+pushed (fc7c185, a5c5021, b45280e). A12 deferred (fix-path documented). Morning summary written at top. WINDING DOWN: safe-fix campaign complete; remaining work is NEEDS-VARUN (don't do autonomously). Tree green + pushed.
+- All 10 audits in. 9 safe fixes committed+pushed (fc7c185, a5c5021, b45280e). A12 deferred (fix-path documented). Morning summary written at top.
+- 2026-06-22 (Varun awake, "sweep the small safe ones"): A3 ellipse evaluate_derivatives + A9 vertex remove underflow (7650d16), CADMesh Three.js dispose leak (c961af5). 11 fixes total now pushed.
+- CI INVESTIGATION (the "CI gate" item): gate already exists + ENFORCED, but CI is RED — 27 failing tests, dominated by #17 NURBS corefinement (~13). This IS the remaining real backlog (see the corrected note above). The small-safe sweep is now COMPLETE; everything left is the deep B-list / #17.
 - tessellation audit: no hot-path bugs; safe fixes queued; dead-code → NEEDS-VARUN.
 - 8/10 audits in (export+frontend rate-limited, re-run pending). Synthesized worklist above.
 - ✅ BATCH 1 COMMITTED+PUSHED (fc7c185): A1 bisect_root NaN→None, A2 Cone::offset apex-shift, A4 insert_knot mult+times, A5 ellipse continuity acos clamp. geometry-engine lib 3847 pass.
