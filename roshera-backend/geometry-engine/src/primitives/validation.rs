@@ -380,7 +380,7 @@ impl ParallelValidator {
             context.record_phase("deep", phase_start.elapsed());
             results
         } else {
-            DeepValidationResults
+            DeepValidationResults::default()
         };
 
         // Combine results
@@ -702,16 +702,79 @@ impl ParallelValidator {
             })
             .collect();
 
+        // Per-solid: planar-face boundary SELF-OVERLAP (#70 — the chamfer-crosses-
+        // fillet class, where a topologically-clean planar face's boundary loop
+        // geometrically crosses itself). Cheap + exact for planar faces (a
+        // projected-polygon crossing in the face's own plane).
+        let mut warnings = warnings;
+        let solid_ids: Vec<SolidId> = (0..model.solids.len() as u32).collect();
+        let overlaps: Vec<ValidationWarning> = solid_ids
+            .par_iter()
+            .flat_map(|&sid| {
+                crate::operations::geometry_validity::self_overlapping_planar_faces(model, sid)
+                    .into_iter()
+                    .map(move |fid| ValidationWarning::GeometryInconsistency {
+                        location: EntityLocation {
+                            solid_id: Some(sid),
+                            shell_id: None,
+                            face_id: Some(fid),
+                            loop_id: None,
+                            edge_id: None,
+                            vertex_id: None,
+                        },
+                        distance: 0.0,
+                        message: format!(
+                            "planar face {fid} of solid {sid} self-overlaps (boundary loop crosses itself)"
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        warnings.extend(overlaps);
+
         GeometryValidationResults { warnings }
     }
 
     fn validate_deep_parallel(
         &self,
-        _model: &BRepModel,
-        _tolerance: Tolerance,
+        model: &BRepModel,
+        tolerance: Tolerance,
     ) -> DeepValidationResults {
-        // Deep validation including numerical checks
-        DeepValidationResults
+        use rayon::prelude::*;
+
+        // SHELL SELF-INTERSECTION (#24): a topologically-clean solid whose
+        // non-adjacent faces cross is not a real solid — the verification gap this
+        // closes. `mesh_self_intersects` tessellates the solid and runs an O(n²)
+        // triangle-pair scan, so it is a DEEP-level check (not run at Standard).
+        // Surfaced as a warning (geometry_valid → false) rather than a hard error
+        // so it doesn't break ops mid-pipeline.
+        let chord = tolerance.distance().max(1.0e-3);
+        let solid_ids: Vec<SolidId> = (0..model.solids.len() as u32).collect();
+        let warnings: Vec<ValidationWarning> = solid_ids
+            .par_iter()
+            .filter_map(|&sid| {
+                if crate::harness::self_intersection::mesh_self_intersects(model, sid, chord) {
+                    Some(ValidationWarning::GeometryInconsistency {
+                        location: EntityLocation {
+                            solid_id: Some(sid),
+                            shell_id: None,
+                            face_id: None,
+                            loop_id: None,
+                            edge_id: None,
+                            vertex_id: None,
+                        },
+                        distance: 0.0,
+                        message: format!(
+                            "solid {sid} self-intersects (non-adjacent shell faces cross)"
+                        ),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        DeepValidationResults { warnings }
     }
 
     fn analyze_edge_usage_parallel(&self, model: &BRepModel) -> DashMap<EdgeId, EdgeUsage> {
@@ -761,7 +824,7 @@ impl ParallelValidator {
         &self,
         topology: TopologyValidationResults,
         geometry: GeometryValidationResults,
-        _deep: DeepValidationResults,
+        deep: DeepValidationResults,
         context: ValidationContext,
         _level: ValidationLevel,
     ) -> ValidationResult {
@@ -787,8 +850,12 @@ impl ParallelValidator {
         // that validate their own result. `is_valid` stays gated on hard errors so
         // the pipeline isn't broken; promote to errors once the trim geometry is
         // fixed (the underlying op bug becomes the next target).
-        let geometry_valid = geometry.warnings.is_empty();
+        // Deep-level self-intersection findings (#24) join the geometry findings:
+        // both set geometry_valid false and surface as warnings (Standard runs the
+        // cheap geometry checks; Deep adds the O(n²) mesh self-intersection scan).
+        let geometry_valid = geometry.warnings.is_empty() && deep.warnings.is_empty();
         all_warnings.extend(geometry.warnings);
+        all_warnings.extend(deep.warnings);
 
         let is_valid = all_errors.is_empty();
         let topology_valid = all_errors
@@ -1093,7 +1160,9 @@ struct GeometryValidationResults {
 }
 
 #[derive(Default)]
-struct DeepValidationResults;
+struct DeepValidationResults {
+    warnings: Vec<ValidationWarning>,
+}
 
 /// Validate entire B-Rep model (enhanced entry point)
 pub fn validate_model_enhanced(
