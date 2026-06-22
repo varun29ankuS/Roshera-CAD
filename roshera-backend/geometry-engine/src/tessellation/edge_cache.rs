@@ -243,6 +243,23 @@ impl EdgeSampleCache {
         for &face_id in adjacent {
             if let Some(face) = model.faces.get(face_id) {
                 if let Some(surface) = model.surfaces.get(face.surface_id) {
+                    // A degenerate-apex corner-cap face (CF-γ.7: a NURBS
+                    // patch carrying a `cap_apex_hint`) is tessellated by
+                    // the rim-fan path, NOT by its surface — so it follows
+                    // whatever sample count the rim already has and must
+                    // not drive densification. Its `closest_point` /
+                    // `normal_at` near the collapsed apex are also
+                    // unreliable and would spuriously inflate the count,
+                    // breaking the shared-edge weld with the cylindrical
+                    // fillet's far cap (which only the cylinder curvature
+                    // should govern). The boolean sphere-cap faces also
+                    // carry an apex hint but are `Sphere` surfaces and
+                    // tessellate from their surface, so gate on NURBS.
+                    if surface.type_name() == "NurbsSurface"
+                        && model.cap_apex_hint.contains_key(&face_id)
+                    {
+                        continue;
+                    }
                     n = n.max(compute_face_boundary_sample_count(
                         curve,
                         t_start,

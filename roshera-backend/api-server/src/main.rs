@@ -124,6 +124,12 @@ pub struct AppState {
     /// a coloured assembly (black tyres, livery body, …) instead of grey clay.
     pub solid_colors: Arc<DashMap<u32, [u8; 3]>>,
 
+    /// Per-solid generating revolve profile (the editable `[r,z]` meridian).
+    /// Stored here — not only in kernel construction geometry — so it survives a
+    /// timeline replay (the construction sidecar is set outside the recorded op,
+    /// so a replay drops it) and `GET /parts/{id}/profile` can always recover it.
+    pub solid_profiles: Arc<DashMap<u32, Vec<[f64; 2]>>>,
+
     // Enhanced AI integration
     ai_processor: Arc<Mutex<AIProcessor>>,
     session_aware_ai: Arc<SessionAwareAIProcessor>,
@@ -3331,9 +3337,9 @@ async fn create_revolve_primitive(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
-    use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
-    use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::operations::revolve::{
+        revolve_meridian, revolve_smooth_nozzle, revolve_spline_meridian, RevolveOptions,
+    };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -3400,32 +3406,31 @@ async fn create_revolve_primitive(
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Smooth (NURBS-spline) wall: treat `profile` as the OUTER wall, fit a smooth
+    // curve through it, and hollow it with `bore_radius` so the revolved wall is
+    // ONE smooth surface instead of a faceted polyline (#9 — the nozzle wall).
+    let smooth = payload
+        .get("smooth")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let bore_radius = payload
+        .get("bore_radius")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    // Smooth CONTOURED shell (Rao nozzle / vessel): `profile` is the INNER flow
+    // contour; the outer wall is offset radially by `wall_thickness`. BOTH walls
+    // are fit as NURBS and revolved → one smooth SurfaceOfRevolution each (exact
+    // circles, smooth contour, no band rings, no loft seam).
+    let wall_thickness = payload
+        .get("wall_thickness")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
     let result_solid_id = {
         let mut model = model_handle.write().await;
-        // Build the profile loop: a vertex per point in the (r, 0, z) meridian
-        // half-plane, joined by line edges, auto-closed last->first.
-        let n = profile.len();
-        let verts: Vec<_> = profile
-            .iter()
-            .map(|(r, z)| model.vertices.add(*r, 0.0, *z))
-            .collect();
-        let mut edges = Vec::with_capacity(n);
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let (ri, zi) = profile[i];
-            let (rj, zj) = profile[j];
-            let line = Line::new(Point3::new(ri, 0.0, zi), Point3::new(rj, 0.0, zj));
-            let cid = model.curves.add(Box::new(line));
-            edges.push(model.edges.add(Edge::new(
-                0,
-                verts[i],
-                verts[j],
-                cid,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            )));
-        }
+        // Parametric revolve: revolve the (r, z) meridian AND retain it as the
+        // part's construction geometry, so the part remembers how it was made and
+        // its profile is recoverable + editable (the #25 edit→regenerate loop).
         let opts = RevolveOptions {
             axis_origin: Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
             axis_direction: Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]),
@@ -3433,13 +3438,36 @@ async fn create_revolve_primitive(
             segments,
             ..Default::default()
         };
-        revolve_profile(&mut model, edges, opts).map_err(|e| {
-            ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("revolve_profile failed: {e:?}"),
-            )
-        })?
+        if wall_thickness > 0.0 {
+            revolve_smooth_nozzle(&mut model, &profile, wall_thickness, opts).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("smooth nozzle revolve failed: {e:?}"),
+                )
+            })?
+        } else if smooth {
+            revolve_spline_meridian(&mut model, &profile, bore_radius, opts).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("smooth revolve failed: {e:?}"),
+                )
+            })?
+        } else {
+            revolve_meridian(&mut model, &profile, opts).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("revolve failed: {e:?}"),
+                )
+            })?
+        }
     };
+
+    // Persist the generating profile (replay-proof) so it is always recoverable
+    // via GET /api/agent/parts/{id}/profile for the edit→regenerate loop.
+    state.solid_profiles.insert(
+        result_solid_id,
+        profile.iter().map(|&(r, z)| [r, z]).collect(),
+    );
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;
@@ -6656,6 +6684,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_to_uuid: Arc::new(DashMap::new()),
         consumed_uuids: Arc::new(DashMap::new()),
         solid_colors: Arc::new(DashMap::new()),
+        solid_profiles: Arc::new(DashMap::new()),
         ai_processor,
         session_aware_ai,
         full_integration_executor,
@@ -6969,6 +6998,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // receive `SketchRegionsUpdated` frames on every mutation,
         // so polling these endpoints is not required.
         .route("/api/sketch/{id}/regions", get(sketch::get_sketch_regions))
+        .route(
+            "/api/sketch/{id}/recognize",
+            get(sketch::recognize_sketch_handler),
+        )
+        .route(
+            "/api/sketch/{id}/certify",
+            get(sketch::certify_sketch_handler),
+        )
+        .route(
+            "/api/sketch/{id}/render",
+            get(sketch::render_sketch_handler),
+        )
         .route("/api/sketch/regions/preview", post(sketch::preview_regions))
         // Multi-shape control — a sketch session may carry multiple
         // shapes; outer/hole classification is decided geometrically
@@ -7297,6 +7338,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/uuid/{uuid}/mass",
             get(handlers::agent::part_mass_properties_by_uuid),
+        )
+        .route(
+            "/api/agent/verify-claim",
+            post(handlers::agent::verify_claim_handler),
+        )
+        .route(
+            "/api/agent/parts/{id}/profile",
+            get(handlers::agent::part_revolve_profile),
         )
         .route(
             "/api/agent/parts/{id}/obb",

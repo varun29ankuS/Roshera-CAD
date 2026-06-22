@@ -34,6 +34,10 @@ pub mod profile;
 /// EYE-6: active-perception viewpoint selection (next-best-view).
 pub mod viewpoint;
 
+/// EYE-SKETCH: the agent eye for 2D sketches — rasterize a sketch to a PNG so a
+/// vision-capable agent can SEE it (precondition for semantic recognition).
+pub mod sketch;
+
 /// Canonical orthographic camera directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalView {

@@ -693,6 +693,80 @@ mod tests {
         );
     }
 
+    /// #70 regression — the 1C2F mixed corner is now WATERTIGHT.
+    ///
+    /// History: defect (1) was the cap face's own arc rims lying off a flat
+    /// planar cap (fixed by routing arc rims to the curved cap builder).
+    /// Defect (2) — the deeper #72 — was the two fillet trim tracks crossing
+    /// in a bowtie on the adjacent cube faces (`self_overlapping_planar_faces`
+    /// reported `[3, 5]`), an irreducibly non-manifold state while the cap rims
+    /// sat ON the cube planes. The CF-γ.7 axial cap-rim retraction
+    /// (`retract_mixed_1c2f_corner`) pulls each fillet cap arc off the cube
+    /// planes to the apex-retracted inner triangle — mirroring the watertight
+    /// all-fillet apex corner — so the cube faces close with straight cut edges
+    /// and the bowtie is gone. This test now pins the full watertight result.
+    #[test]
+    fn mixed_kind_1c2f_corner_cap_arc_rims_on_surface_70() {
+        use crate::primitives::validation::{
+            validate_model_enhanced, ValidationLevel, ValidationWarning,
+        };
+        let mut model = BRepModel::new();
+        let solid_id = make_cube(&mut model);
+        let corner = vertex_at(&model, HALF, HALF, HALF);
+        let edges = corner_edges_sorted(&model, corner);
+        chamfer_edges(
+            &mut model,
+            solid_id,
+            vec![edges[0]],
+            chamfer_opts(D, vec![corner], false),
+        )
+        .expect("chamfer");
+        fillet_edges(
+            &mut model,
+            solid_id,
+            vec![edges[1], edges[2]],
+            fillet_opts(D, vec![], false),
+        )
+        .expect("fillet");
+
+        // Defect (2): the cube faces no longer self-overlap.
+        let bad =
+            crate::operations::geometry_validity::self_overlapping_planar_faces(&model, solid_id);
+        assert!(
+            bad.is_empty(),
+            "1C2F corner must have no self-overlapping planar faces after CF-γ.7 \
+             retraction; got faces {bad:?}"
+        );
+
+        let result =
+            validate_model_enhanced(&model, Tolerance::default(), ValidationLevel::Standard);
+        // Defect (1): no edge lies OFF its face's surface (the cap arc rims).
+        let off_surface: Vec<String> = result
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, ValidationWarning::GeometryInconsistency { .. }))
+            .map(|w| format!("{w}"))
+            .filter(|m| m.contains("off") && m.contains("surface"))
+            .collect();
+        assert!(
+            off_surface.is_empty(),
+            "1C2F corner cap must contain its arc rims (no off-surface edges); got: {off_surface:?}"
+        );
+
+        // Euler-valid + watertight: the full integration contract.
+        let contract = crate::harness::integration::full_contract(&mut model, solid_id, 0.25, 0.05);
+        assert!(
+            contract.passes(),
+            "1C2F corner must be watertight + Euler-valid after retraction; \
+             failures: {:?}",
+            contract.failures()
+        );
+        assert_eq!(
+            contract.euler_characteristic, 2,
+            "closed genus-0 solid must have Euler characteristic 2"
+        );
+    }
+
     #[test]
     fn assert_within_returns_typed_err_when_tolerance_exceeded() {
         // The CF-β planar cap path is C0 by construction across

@@ -158,11 +158,13 @@ memory entry "T-Splines Deleted (#20)".
 `chamfer.rs`, `transform.rs`, `recorder.rs`. Every entry point records
 to `OperationRecorder` on success.
 
-`api-server/src/protocol/`: REST, WebSocket, and SSE handlers. There is
-known dead code in `protocol/timeline_handlers.rs` and parts of
-`protocol/geometry_handlers.rs` — orphaned WS handlers from a previous
-protocol design (~30 functions / structs). Cleanup is queued; do not
-re-introduce calls into them.
+`api-server/src/protocol/`: REST, WebSocket, and SSE handlers. The old
+`protocol/timeline_handlers.rs` and `protocol/geometry_handlers.rs` files
+have been DELETED (verified 2026-06-21 architecture audit) — all WS
+timeline/geometry/AI/session/export handling is now inlined in one match
+inside `handle_websocket_connection` (`protocol/message_handlers.rs`).
+The earlier "~30 orphaned handlers" note is obsolete; the only true WS
+orphan today is `send_collaborators_update` (`message_handlers.rs`).
 
 `ai-integration/src/providers/`: `claude.rs`, `mock.rs`,
 `native_factory.rs`, `universal_endpoint.rs`. No `coqui_tts.rs`, no

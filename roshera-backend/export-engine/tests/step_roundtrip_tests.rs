@@ -86,6 +86,78 @@ fn build_torus() -> (BRepModel, SolidId) {
     (model, id)
 }
 
+/// A small NURBS-loft barrel: three circular sections (r5 → r7 → r5) skinned
+/// into one freeform surface. Reproduces the nozzle's lofted-NURBS topology in
+/// miniature so the STEP B-spline export can be gated.
+fn build_nurbs_loft() -> (BRepModel, SolidId) {
+    let mut model = BRepModel::new();
+    let ring = |r: f64, z: f64, n: usize| -> Vec<Point3> {
+        (0..n)
+            .map(|k| {
+                let a = std::f64::consts::TAU * (k as f64) / (n as f64);
+                Point3::new(r * a.cos(), r * a.sin(), z)
+            })
+            .collect()
+    };
+    let sections = vec![ring(5.0, 0.0, 8), ring(7.0, 5.0, 8), ring(5.0, 10.0, 8)];
+    let id = geometry_engine::operations::nurbs_loft::nurbs_loft(
+        &mut model,
+        sections,
+        geometry_engine::operations::nurbs_loft::NurbsLoftOptions::default(),
+    )
+    .expect("nurbs_loft");
+    (model, id)
+}
+
+/// Export `model` to STEP and return the raw text (no re-import) — for
+/// entity-level inspection/validation.
+async fn export_step_text(model: &BRepModel, name: &str) -> String {
+    let temp = TempDir::new().expect("tmp");
+    let engine = ExportEngine::with_output_directory(temp.path().to_string_lossy().to_string());
+    let filename = engine.export_step(model, name).await.expect("export");
+    let path = temp.path().join(&filename);
+    std::fs::read_to_string(&path).expect("read step")
+}
+
+/// STEP round-trip GATE for a lofted NURBS solid. Regression for the missing
+/// `''` REPRESENTATION_ITEM label on `B_SPLINE_CURVE_WITH_KNOTS`: it left the
+/// curve with 8 of the schema's 9 fields, so every lofted/freeform part exported
+/// with malformed seam/iso curves → the edge, face bound and outer shell all
+/// failed to resolve → 0 solids on re-import (and an unopenable file in
+/// OCCT/FreeCAD). The export must now round-trip to exactly one valid solid.
+#[tokio::test]
+async fn roundtrip_nurbs_loft() {
+    let (m, s) = build_nurbs_loft();
+    let _ = topology_counts(&m, s);
+    let text = export_step_text(&m, "rt_loft").await;
+    let temp = TempDir::new().expect("tmp");
+    let path = temp.path().join("rt_loft.step");
+    std::fs::write(&path, &text).expect("write step");
+    let (imported, report) = export_engine::formats::step::import_step_to_brep_with_report(&path)
+        .await
+        .expect("import");
+    assert_eq!(
+        imported.solids.len(),
+        1,
+        "lofted NURBS must re-import as exactly one solid (ok={}, roots_resolved={}) — \
+         a malformed B-spline curve drops the whole shell",
+        report.ok,
+        report.roots_resolved
+    );
+    let (id, _) = imported.solids.iter().next().expect("one solid present");
+    let valid = validate_solid_scoped(
+        &imported,
+        id,
+        Tolerance::default(),
+        ValidationLevel::Standard,
+    )
+    .is_valid;
+    assert!(
+        valid,
+        "re-imported NURBS loft must pass validate_solid_scoped"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Helpers.
 // ─────────────────────────────────────────────────────────────────────

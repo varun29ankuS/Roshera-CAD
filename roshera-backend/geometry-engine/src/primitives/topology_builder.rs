@@ -2422,6 +2422,18 @@ impl BRepModel {
         // D4 — labels consistency: re-verify every label's assertion. An
         // annotation defect, not a geometric one — does NOT touch `is_sound`.
         let labels_consistent = self.labels_consistency();
+        // Display-tessellation quality: catches a degenerate / inverted-normal
+        // render mesh (the inner-bore scribble) that is watertight + manifold yet
+        // renders wrong. Same chord as the manifold check above. A solid that
+        // tessellates to nothing is already unsound via `watertight`, so an empty
+        // mesh maps to the not-applicable `empty()` verdict.
+        let tessellation = crate::harness::watertight::tessellation_quality(self, solid_id)
+            .unwrap_or_else(crate::primitives::provenance::TessellationQuality::empty);
+        // Mesh-quality: catches a render mesh that is watertight + correctly
+        // oriented yet violates a CAD tessellation rule — a facet bridging across
+        // a bore (the "wing"), a far-off-surface normal, etc.
+        let mesh_quality = crate::harness::watertight::mesh_quality(self, solid_id)
+            .unwrap_or_else(crate::primitives::provenance::MeshQuality::empty);
         let errors = v.errors.iter().map(|e| format!("{e:?}")).collect();
         ValidityCertificate {
             brep_valid: v.is_valid,
@@ -2433,6 +2445,8 @@ impl BRepModel {
             self_intersection_free,
             construction_consistent,
             labels_consistent,
+            tessellation,
+            mesh_quality,
             errors,
         }
     }

@@ -223,7 +223,39 @@ impl<W: Write> StepWriter<W> {
         };
 
         let ref_dir_id = if let Some(ref_dir) = ref_direction {
-            Some(self.write_direction(ref_dir)?)
+            // ISO 10303-42 requires the ref_direction to be NON-parallel to the
+            // axis (it is projected to form the placement's X). Callers pass a
+            // literal [1,0,0], which is degenerate when the axis is parallel to
+            // ±X (a very common X-aligned cylinder/cone/plane) — strict readers
+            // (OCCT/FreeCAD) then reject the placement or pick a garbage frame.
+            // Orthogonalize the seed against the axis (Gram-Schmidt), falling
+            // back to the world basis vector least aligned with the axis.
+            let rd = if let Some(axis) = axis {
+                let norm = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let al = norm(axis).max(1e-12);
+                let a = [axis[0] / al, axis[1] / al, axis[2] / al];
+                let proj = |v: &[f64; 3]| {
+                    let d = v[0] * a[0] + v[1] * a[1] + v[2] * a[2];
+                    [v[0] - a[0] * d, v[1] - a[1] * d, v[2] - a[2] * d]
+                };
+                let mut r = proj(ref_dir);
+                if norm(&r) < 1e-9 {
+                    let ab = [a[0].abs(), a[1].abs(), a[2].abs()];
+                    let e = if ab[0] <= ab[1] && ab[0] <= ab[2] {
+                        [1.0, 0.0, 0.0]
+                    } else if ab[1] <= ab[2] {
+                        [0.0, 1.0, 0.0]
+                    } else {
+                        [0.0, 0.0, 1.0]
+                    };
+                    r = proj(&e);
+                }
+                let rl = norm(&r).max(1e-12);
+                [r[0] / rl, r[1] / rl, r[2] / rl]
+            } else {
+                *ref_dir
+            };
+            Some(self.write_direction(&rd)?)
         } else {
             None
         };
@@ -244,6 +276,24 @@ impl<W: Write> StepWriter<W> {
         }
 
         writeln!(self.writer, ");")?;
+        Ok(id)
+    }
+
+    /// Write an AXIS1_PLACEMENT (a location point + an axis direction) — the
+    /// placement a `SURFACE_OF_REVOLUTION` revolves its profile about.
+    pub fn write_axis1_placement(
+        &mut self,
+        location: &[f64; 3],
+        axis: &[f64; 3],
+    ) -> std::io::Result<StepId> {
+        let location_id = self.write_cartesian_point(location)?;
+        let axis_id = self.write_direction(axis)?;
+        let id = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=AXIS1_PLACEMENT('',{},{});",
+            id, location_id, axis_id
+        )?;
         Ok(id)
     }
 
@@ -300,6 +350,24 @@ impl<W: Write> StepWriter<W> {
 
         let id = self.next_id();
 
+        // ISO 10303-42: a B_SPLINE_CURVE_WITH_KNOTS `knots` list holds the
+        // DISTINCT knot values, paired 1:1 with `multiplicities`. Callers pass
+        // the FULL (expanded) knot vector, so collapse it here — emitting the
+        // raw vector leaves len(knots) != len(mults) ("knots/multiplicities
+        // length mismatch") and the curve (and its edge, face bound, shell and
+        // solid) fail to resolve in strict readers (our importer AND OCCT).
+        let knot_values = collapse_knots(knots).0;
+        if knot_values.len() != multiplicities.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "B-spline curve knot/multiplicity mismatch: {} distinct knots vs {} multiplicities",
+                    knot_values.len(),
+                    multiplicities.len()
+                ),
+            ));
+        }
+
         if rational && weights.is_some() {
             // Rational B-spline curve. Per ISO 10303-42 a weighted
             // B-spline is a *complex* (AND-combined) entity instance,
@@ -323,20 +391,26 @@ impl<W: Write> StepWriter<W> {
                 degree = degree,
                 cps = format_id_list(&cp_ids),
                 mults = format_int_list(multiplicities),
-                knots = format_real_list(knots),
+                knots = format_real_list(&knot_values),
                 weights = format_real_list(weights_slice),
             )?;
         } else {
-            // Non-rational B-spline. The leading `.` on the final
-            // `.UNSPECIFIED.` enum was previously missing — that made
-            // every B-spline curve unparseable.
+            // Non-rational B-spline. ISO 10303-42: the entity's FIRST field
+            // is the REPRESENTATION_ITEM `name` (the `''` label) — it was
+            // omitted, leaving 8 fields where the schema requires 9
+            // (name, degree, control_points, curve_form, closed,
+            // self_intersect, knot_mults, knots, knot_spec). Strict readers
+            // (our importer AND OCCT/FreeCAD) then reject the curve → the
+            // edge, face bound, shell and solid all fail to resolve → a
+            // lofted/freeform part exports unopenable. The surface writer
+            // already carries its `''`; this brings the curve into line.
             writeln!(self.writer,
-                "{}=B_SPLINE_CURVE_WITH_KNOTS({},({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);",
+                "{}=B_SPLINE_CURVE_WITH_KNOTS('',{},({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);",
                 id,
                 degree,
                 format_id_list(&cp_ids),
                 format_int_list(multiplicities),
-                format_real_list(knots)
+                format_real_list(&knot_values)
             )?;
         }
 
@@ -614,6 +688,29 @@ impl<W: Write> StepWriter<W> {
                 knots_v,
                 Some(weights),
             ),
+            SurfaceData::SurfaceOfRevolution {
+                axis_origin,
+                axis_direction,
+                profile,
+                ..
+            } => {
+                // Exact analytic surface: the profile curve (reusing write_curve's
+                // Line/Circle/B-spline/NURBS paths) revolved about an
+                // AXIS1_PLACEMENT. STEP's SURFACE_OF_REVOLUTION is always the full
+                // 360°; the angular extent of a partial revolve lives on the
+                // trimming face, not the surface entity, so `angle` is not emitted.
+                let empty_map: std::collections::HashMap<&uuid::Uuid, StepId> =
+                    std::collections::HashMap::new();
+                let curve_id = self.write_curve(profile, &empty_map)?;
+                let axis_id = self.write_axis1_placement(axis_origin, axis_direction)?;
+                let id = self.next_id();
+                writeln!(
+                    self.writer,
+                    "{}=SURFACE_OF_REVOLUTION('',{},{});",
+                    id, curve_id, axis_id
+                )?;
+                Ok(id)
+            }
         }
     }
 
@@ -647,6 +744,28 @@ impl<W: Write> StepWriter<W> {
 
         let (u_knots, u_mults) = collapse_knots(knots_u);
         let (v_knots, v_mults) = collapse_knots(knots_v);
+
+        // Verification (ISO 10303-42 §4.4.3): a B_SPLINE_SURFACE_WITH_KNOTS is
+        // well-formed only if its knot multiplicities sum to n+degree+1 in each
+        // direction (n = control-point count). A violation is silently accepted
+        // by lenient readers but REJECTED by strict ones (OCCT/FreeCAD). Refuse
+        // to emit a malformed surface rather than write an unopenable file.
+        let nu = control_points.len();
+        let nv = control_points.first().map(|r| r.len()).unwrap_or(0);
+        let u_sum: u32 = u_mults.iter().sum();
+        let v_sum: u32 = v_mults.iter().sum();
+        let u_need = nu + degree_u as usize + 1;
+        let v_need = nv + degree_v as usize + 1;
+        if u_sum as usize != u_need || v_sum as usize != v_need {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "B-spline surface not ISO-10303-42 conformant: \
+                     u Σmult={u_sum} but n+deg+1={u_need} (nu={nu},deg_u={degree_u}); \
+                     v Σmult={v_sum} but n+deg+1={v_need} (nv={nv},deg_v={degree_v})"
+                ),
+            ));
+        }
 
         let rational = weights
             .map(|w| {
@@ -1857,8 +1976,13 @@ mod tests {
         assert!(out.contains("#2=CARTESIAN_POINT"));
         assert!(out.contains("#3=CARTESIAN_POINT"));
         assert!(out.contains("#4=B_SPLINE_CURVE_WITH_KNOTS"));
-        // Degree 2 appears as first arg
-        assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS(2,"));
+        // ISO 10303-42: the FIRST field is the REPRESENTATION_ITEM `''` name,
+        // then degree 2 — the curve must carry all 9 fields or strict readers
+        // (and OCCT/FreeCAD) reject it.
+        assert!(
+            out.contains("B_SPLINE_CURVE_WITH_KNOTS('',2,"),
+            "got: {out}"
+        );
     }
 
     #[test]

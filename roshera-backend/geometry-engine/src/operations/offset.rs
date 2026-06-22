@@ -354,7 +354,15 @@ fn create_offset_cone(surface: &dyn Surface, distance: f64) -> OperationResult<B
 
     // Offsetting a cone along its normal shifts the apex along the axis
     // by distance / sin(half_angle), keeping the half angle constant.
-    let shift = distance / cone.half_angle.sin();
+    let sin_ha = cone.half_angle.sin();
+    if sin_ha.abs() < 1e-9 {
+        // A near-zero half-angle is a degenerate (near-cylindrical) cone; the
+        // apex shift diverges to infinity. Refuse rather than emit an apex at ∞.
+        return Err(OperationError::InvalidGeometry(
+            "cannot offset a degenerate near-cylindrical cone (half-angle ~ 0)".into(),
+        ));
+    }
+    let shift = distance / sin_ha;
     let new_apex = cone.apex + cone.axis * shift;
 
     let mut offset = Cone::new(new_apex, cone.axis, cone.half_angle)?;

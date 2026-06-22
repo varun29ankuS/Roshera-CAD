@@ -161,6 +161,344 @@ pub fn revolve_profile(
     })
 }
 
+/// Parametric revolve from a MERIDIAN profile — the scientist-facing form of a
+/// solid of revolution. `profile_rz` is the `(r, z)` half-plane meridian (r =
+/// radius from the axis, z = height along it); it is lifted to the `(r, 0, z)`
+/// plane, joined by line edges (auto-closed last→first) and revolved. The
+/// generating meridian is RETAINED as the solid's construction geometry, so the
+/// part remembers how it was made — the foundation of the edit→regenerate
+/// workflow (#25): an edit recovers this profile, changes it, and re-revolves.
+pub fn revolve_meridian(
+    model: &mut BRepModel,
+    profile_rz: &[(f64, f64)],
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    use crate::primitives::curve::{Line, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+
+    if profile_rz.len() < 3 {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_meridian: need at least 3 meridian points".to_string(),
+        ));
+    }
+
+    let axis_origin = options.axis_origin;
+    let n = profile_rz.len();
+    let verts: Vec<_> = profile_rz
+        .iter()
+        .map(|&(r, z)| model.vertices.add(r, 0.0, z))
+        .collect();
+    let mut edges = Vec::with_capacity(n);
+    let mut meridian_pts = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (ri, zi) = profile_rz[i];
+        let (rj, zj) = profile_rz[j];
+        meridian_pts.push(Point3::new(ri, 0.0, zi));
+        let line = Line::new(Point3::new(ri, 0.0, zi), Point3::new(rj, 0.0, zj));
+        let cid = model.curves.add(Box::new(line));
+        edges.push(model.edges.add(Edge::new(
+            0,
+            verts[i],
+            verts[j],
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+    }
+
+    let solid = revolve_profile(model, edges, options)?;
+
+    // Retain the generating meridian as construction geometry (the source-profile
+    // link, consistency-checked + carried through transforms) so the part
+    // remembers its profile for the edit→regenerate workflow.
+    model.set_solid_construction(
+        solid,
+        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+    );
+    Ok(solid)
+}
+
+/// Recover the `(r, z)` meridian a revolved part was built from, read back from
+/// its retained construction geometry — the editable profile a scientist opens,
+/// changes, and re-revolves with [`revolve_meridian`]. The stored points live in
+/// the `(r, 0, z)` half-plane, so `r = x`, `z = z`. Returns `None` when the solid
+/// carries no retained meridian (it was not built by `revolve_meridian`),
+/// completing the edit→regenerate loop's recover step (#25).
+pub fn get_revolve_meridian(model: &BRepModel, solid: SolidId) -> Option<Vec<(f64, f64)>> {
+    let cg = model.solid_construction(solid)?;
+    Some(cg.profile_points.iter().map(|p| (p.x, p.z)).collect())
+}
+
+/// Parametric revolve of a SMOOTH (NURBS-spline) walled TUBE — the smooth-meridian
+/// form for nozzles, vases and bell profiles (#9 + #25). `wall_rz` is the OUTER
+/// wall meridian (the `(r, z)` points, bottom→top, every `r > bore_radius`); it
+/// is interpolated by a degree-3 NURBS so the revolved outer wall is ONE smooth
+/// `SurfaceOfRevolution` (not a faceted polyline of `P × segments` tiny faces —
+/// the original nozzle complaint). The meridian closes through a cylindrical
+/// `bore_radius` bore and two annular caps, so it never touches the axis (which
+/// would force the per-segment grid fallback) — the hollow form a real nozzle
+/// takes. The wall points are retained as construction geometry for the
+/// edit→regenerate loop.
+pub fn revolve_spline_meridian(
+    model: &mut BRepModel,
+    wall_rz: &[(f64, f64)],
+    bore_radius: f64,
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+    use crate::primitives::curve::{Line, NurbsCurve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+
+    if wall_rz.len() < 4 {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_spline_meridian: need at least 4 wall points for a cubic spline".to_string(),
+        ));
+    }
+    if !(bore_radius > 0.0) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_spline_meridian: bore_radius must be > 0".to_string(),
+        ));
+    }
+    if wall_rz.iter().any(|&(r, _)| r <= bore_radius) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_spline_meridian: every wall radius must exceed bore_radius".to_string(),
+        ));
+    }
+
+    let axis_origin = options.axis_origin;
+    let (r0, z0) = wall_rz[0];
+    let (r1, z1) = wall_rz[wall_rz.len() - 1];
+
+    // Fit a degree-3 NURBS through the outer wall meridian (in the (r,0,z)
+    // half-plane) — the single smooth wall curve.
+    let wall_pts: Vec<Point3> = wall_rz
+        .iter()
+        .map(|&(r, z)| Point3::new(r, 0.0, z))
+        .collect();
+    let wall_math = interpolate_nurbs_curve(&wall_pts, 3, ParameterizationType::ChordLength)
+        .map_err(|e| OperationError::NumericalError(format!("wall spline fit: {e}")))?;
+    let wall_curve = NurbsCurve::new(
+        wall_math.degree,
+        wall_math.control_points,
+        wall_math.weights,
+        wall_math.knots.to_vec(),
+    )
+    .map_err(|e| OperationError::NumericalError(format!("wall curve: {e:?}")))?;
+
+    // Tube meridian (same winding as the analytic-band tube: outer-bottom →
+    // outer-top → inner-top → inner-bottom). The outer wall is the smooth NURBS;
+    // the bore is a straight cylinder; the caps are annular planes. No vertex sits
+    // on the axis, so the analytic one-surface band path applies to the wall.
+    let v_out_bot = model.vertices.add(r0, 0.0, z0);
+    let v_out_top = model.vertices.add(r1, 0.0, z1);
+    let v_in_top = model.vertices.add(bore_radius, 0.0, z1);
+    let v_in_bot = model.vertices.add(bore_radius, 0.0, z0);
+
+    let c_wall = model.curves.add(Box::new(wall_curve));
+    let c_top = model.curves.add(Box::new(Line::new(
+        Point3::new(r1, 0.0, z1),
+        Point3::new(bore_radius, 0.0, z1),
+    )));
+    let c_bore = model.curves.add(Box::new(Line::new(
+        Point3::new(bore_radius, 0.0, z1),
+        Point3::new(bore_radius, 0.0, z0),
+    )));
+    let c_bottom = model.curves.add(Box::new(Line::new(
+        Point3::new(bore_radius, 0.0, z0),
+        Point3::new(r0, 0.0, z0),
+    )));
+
+    let edges = vec![
+        model.edges.add(Edge::new(
+            0,
+            v_out_bot,
+            v_out_top,
+            c_wall,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_out_top,
+            v_in_top,
+            c_top,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_top,
+            v_in_bot,
+            c_bore,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_bot,
+            v_out_bot,
+            c_bottom,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+    ];
+
+    let solid = revolve_profile(model, edges, options)?;
+
+    // Retain the outer wall meridian (construction geometry) for edit→regenerate.
+    let meridian_pts: Vec<Point3> = wall_rz
+        .iter()
+        .map(|&(r, z)| Point3::new(r, 0.0, z))
+        .collect();
+    model.set_solid_construction(
+        solid,
+        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+    );
+    Ok(solid)
+}
+
+/// Parametric revolve of a SMOOTH constant-thickness AXISYMMETRIC SHELL — the
+/// correct primitive for a Rao bell nozzle (or any contoured vessel). `inner_rz`
+/// is the FLOW/inner meridian (the `(r, z)` contour, inlet→exit, every `r > 0`);
+/// the outer wall is `inner` offset radially by `wall_thickness`. BOTH contours
+/// are interpolated by degree-3 NURBS and revolved, so the inner AND outer walls
+/// are each ONE smooth `SurfaceOfRevolution` — EXACT circular cross-sections AND
+/// a smooth contour, with NO band rings (the faceted-revolve artifact) and NO
+/// loft seam (the nurbs_loft notch). Two planar annular rims close it into a
+/// watertight wall. The inner contour is retained as construction geometry for
+/// the edit→regenerate loop.
+pub fn revolve_smooth_nozzle(
+    model: &mut BRepModel,
+    inner_rz: &[(f64, f64)],
+    wall_thickness: f64,
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+    use crate::primitives::curve::{Line, NurbsCurve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+
+    if inner_rz.len() < 4 {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_nozzle: need at least 4 inner contour points".to_string(),
+        ));
+    }
+    if !(wall_thickness > 0.0) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_nozzle: wall_thickness must be > 0".to_string(),
+        ));
+    }
+    if inner_rz.iter().any(|&(r, _)| r <= 0.0) {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_nozzle: every inner radius must be > 0".to_string(),
+        ));
+    }
+
+    let axis_origin = options.axis_origin;
+    let (ir0, z0) = inner_rz[0]; // inner inlet
+    let (ir1, z1) = inner_rz[inner_rz.len() - 1]; // inner exit
+    let (or0, or1) = (ir0 + wall_thickness, ir1 + wall_thickness);
+
+    let fit = |pts: Vec<(f64, f64)>| -> OperationResult<NurbsCurve> {
+        let rmin = pts.iter().map(|&(r, _)| r).fold(f64::INFINITY, f64::min);
+        let rmax = pts
+            .iter()
+            .map(|&(r, _)| r)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let p: Vec<Point3> = pts.iter().map(|&(r, z)| Point3::new(r, 0.0, z)).collect();
+        let m = interpolate_nurbs_curve(&p, 3, ParameterizationType::ChordLength)
+            .map_err(|e| OperationError::NumericalError(format!("nozzle spline fit: {e}")))?;
+        // Clamp the control-point RADII to the contour's [rmin, rmax]. A B-spline
+        // lies inside its control hull, so a control point whose radius exceeds the
+        // data range bulges the curve past the contour — cubic interpolation
+        // overshoot at the sharp chamber/throat corners (chord-length overshot to
+        // r≈60, centripetal to r≈66, from a max contour radius of 52), and the
+        // revolved seam captured the spike → a non-rotationally-symmetric wall.
+        // Clamping the radius guarantees no overshoot; the throat (rmin) and exit
+        // (rmax) sit at the bounds so they are preserved.
+        let cps: Vec<Point3> = m
+            .control_points
+            .iter()
+            .map(|&cp| Point3::new(cp.x.clamp(rmin, rmax), cp.y, cp.z))
+            .collect();
+        NurbsCurve::new(m.degree, cps, m.weights, m.knots.to_vec())
+            .map_err(|e| OperationError::NumericalError(format!("nozzle curve: {e:?}")))
+    };
+
+    // Outer wall = inner offset radially by wall_thickness (so the inlet/exit rims
+    // stay planar annuli). Inner is reversed (exit→inlet) so its forward edge runs
+    // the inner-exit→inner-inlet leg of the tube loop.
+    let outer_curve = fit(inner_rz
+        .iter()
+        .map(|&(r, z)| (r + wall_thickness, z))
+        .collect())?;
+    let inner_curve = fit(inner_rz.iter().rev().cloned().collect())?;
+
+    // Tube winding: outer-inlet → outer-exit → inner-exit → inner-inlet.
+    let v_out_bot = model.vertices.add(or0, 0.0, z0);
+    let v_out_top = model.vertices.add(or1, 0.0, z1);
+    let v_in_top = model.vertices.add(ir1, 0.0, z1);
+    let v_in_bot = model.vertices.add(ir0, 0.0, z0);
+
+    let c_outer = model.curves.add(Box::new(outer_curve));
+    let c_exit = model.curves.add(Box::new(Line::new(
+        Point3::new(or1, 0.0, z1),
+        Point3::new(ir1, 0.0, z1),
+    )));
+    let c_inner = model.curves.add(Box::new(inner_curve));
+    let c_inlet = model.curves.add(Box::new(Line::new(
+        Point3::new(ir0, 0.0, z0),
+        Point3::new(or0, 0.0, z0),
+    )));
+
+    let edges = vec![
+        model.edges.add(Edge::new(
+            0,
+            v_out_bot,
+            v_out_top,
+            c_outer,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_out_top,
+            v_in_top,
+            c_exit,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_top,
+            v_in_bot,
+            c_inner,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_in_bot,
+            v_out_bot,
+            c_inlet,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+    ];
+
+    let solid = revolve_profile(model, edges, options)?;
+
+    let meridian_pts: Vec<Point3> = inner_rz
+        .iter()
+        .map(|&(r, z)| Point3::new(r, 0.0, z))
+        .collect();
+    model.set_solid_construction(
+        solid,
+        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+    );
+    Ok(solid)
+}
+
 /// Create a pure revolution (no helical component) as a watertight B-Rep.
 ///
 /// Builds a SHARED vertex/edge grid rather than independent per-quad islands:
@@ -536,8 +874,13 @@ fn try_analytic_band_revolution(
         .ok_or_else(|| OperationError::InvalidGeometry("revolve: base loop not found".into()))?
         .clone();
 
-    // Oriented profile vertex pairs; require every edge linear.
-    let mut prof: Vec<(VertexId, VertexId)> = Vec::new();
+    // Oriented profile vertex pairs, each carrying its curve id + whether it is
+    // linear. Linear edges → Cylinder / Cone / annular-Plane bands; a CURVED edge
+    // → ONE `SurfaceOfRevolution` band for the whole 360° (the #21 fix: a smooth
+    // revolved wall is ONE analytic face, not `segments` angular patches). A bad
+    // curved-band attempt fails the self-check below and rolls back to the proven
+    // grid path, so this never regresses a working revolve.
+    let mut prof: Vec<(VertexId, VertexId, u32, bool)> = Vec::new();
     for (idx, &eid) in base_loop.edges.iter().enumerate() {
         let e = model
             .edges
@@ -547,22 +890,21 @@ fn try_analytic_band_revolution(
             .curves
             .get(e.curve_id)
             .ok_or_else(|| OperationError::InvalidGeometry("revolve: profile curve".into()))?;
-        if !curve.is_linear(crate::math::Tolerance::default()) {
-            return Ok(None); // curved profile → grid fallback
-        }
+        let is_linear = curve.is_linear(crate::math::Tolerance::default());
+        let curve_id = e.curve_id;
         let fwd = base_loop.orientations.get(idx).copied().unwrap_or(true);
         let (s, en) = if fwd {
             (e.start_vertex, e.end_vertex)
         } else {
             (e.end_vertex, e.start_vertex)
         };
-        prof.push((s, en));
+        prof.push((s, en, curve_id, is_linear));
     }
 
     // Eligibility: every profile vertex radius > 1e-4 (annular caps + finite
     // cone/cylinder walls, no apex/disc — those remain grid fallback). Vertical
     // edges → Cylinder, horizontal → annular Plane, sloped → Cone frustum.
-    for &(s, en) in &prof {
+    for &(s, en, _, _) in &prof {
         let (_, r0, _) = ring_geometry(model, s, axis_origin, axis)?;
         let (_, r1, _) = ring_geometry(model, en, axis_origin, axis)?;
         if r0 < 1e-4 || r1 < 1e-4 {
@@ -595,7 +937,7 @@ fn build_analytic_bands(
     base_face: &Face,
     base_face_id: FaceId,
     base_loop: &Loop,
-    prof: &[(VertexId, VertexId)],
+    prof: &[(VertexId, VertexId, u32, bool)],
     axis_origin: Point3,
     axis: Vector3,
 ) -> OperationResult<SolidId> {
@@ -618,7 +960,7 @@ fn build_analytic_bands(
 
     // One SHARED closed circle edge per unique profile vertex.
     let mut uniq: Vec<VertexId> = Vec::new();
-    for &(s, en) in prof {
+    for &(s, en, _, _) in prof {
         for v in [s, en] {
             if !uniq.contains(&v) {
                 uniq.push(v);
@@ -656,7 +998,7 @@ fn build_analytic_bands(
 
     // One analytic face per band.
     let mut faces: Vec<FaceId> = Vec::new();
-    for &(s, en) in prof {
+    for &(s, en, curve_id, is_linear) in prof {
         let (c0, r0, t0) = ring_geo[&s];
         let (c1, r1, t1) = ring_geo[&en];
         let sp0 = model
@@ -684,7 +1026,81 @@ fn build_analytic_bands(
         let vertical = (r0 - r1).abs() < eps;
         let horizontal = (t0 - t1).abs() < eps;
 
-        if horizontal {
+        if !is_linear {
+            // CURVED profile edge → ONE SurfaceOfRevolution face for the full
+            // 360° band (#21: a smooth revolved wall is one analytic face, not
+            // `segments` patches). The seam meridian is the profile curve rotated
+            // onto the canonical ref_dir so its endpoints meet the shared ring
+            // seam vertices; the surface revolves that same curve through 2π. A
+            // misaligned seam fails the watertight self-check → rollback to grid.
+            let pv = model
+                .vertices
+                .get_position(if r0 > 1e-4 { s } else { en })
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry("revolve: curved band angle vertex".into())
+                })?;
+            let pv = Vector3::new(pv[0], pv[1], pv[2]);
+            let rel = pv - axis_origin;
+            let radial = rel - axis * rel.dot(&axis);
+            let rhat = radial.normalize()?;
+            let cos_t = ref_dir.dot(&rhat).clamp(-1.0, 1.0);
+            let sin_t = axis.dot(&ref_dir.cross(&rhat));
+            let theta = sin_t.atan2(cos_t);
+            let rot = Matrix4::from_axis_angle(&axis, -theta)?;
+
+            let base_curve = model.curves.get(curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: curved profile curve".into())
+            })?;
+            let mut seam_curve = base_curve.clone_box().transform(&rot);
+            // Orient the seam from ring_seamv[s] → ring_seamv[en].
+            let c0p = seam_curve
+                .evaluate(0.0)
+                .map_err(|e| OperationError::NumericalError(format!("revolve curved seam: {e}")))?
+                .position;
+            let want = model.vertices.get_position(ring_seamv[&s]).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: curved seam start".into())
+            })?;
+            let want = Point3::new(want[0], want[1], want[2]);
+            if (c0p - want).magnitude() > tol.distance() {
+                seam_curve = seam_curve.reversed();
+            }
+
+            let sor = crate::primitives::surface::SurfaceOfRevolution::new(
+                axis_origin,
+                axis,
+                seam_curve.clone_box(),
+                std::f64::consts::TAU,
+            )
+            .map_err(|e| OperationError::NumericalError(format!("revolve sor: {e}")))?;
+            let surf_id = model.surfaces.add(Box::new(sor));
+            let seam_cid = model.curves.add(seam_curve);
+            let seam_eid = model.edges.add(Edge::new(
+                0,
+                ring_seamv[&s],
+                ring_seamv[&en],
+                seam_cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            ));
+
+            // Lateral loop: bottom_circle(fwd) seam(fwd) top_circle(bwd) seam(bwd).
+            let mut lp = Loop::new(0, LoopType::Outer);
+            lp.add_edge(ring_edge[&s], true);
+            lp.add_edge(seam_eid, true);
+            lp.add_edge(ring_edge[&en], false);
+            lp.add_edge(seam_eid, false);
+            let lp_id = model.loops.add(lp);
+
+            let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
+            let surf = model
+                .surfaces
+                .get(surf_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: sor surface".into()))?;
+            let orient = orient_face_for_outward(surf, target)?;
+            let mut f = Face::new(0, surf_id, lp_id, orient);
+            f.outer_loop = lp_id;
+            faces.push(model.faces.add(f));
+        } else if horizontal {
             // Annular plane cap at constant axial. Outer = larger-radius circle.
             let (outer_v, inner_v) = if r0 >= r1 { (s, en) } else { (en, s) };
             let plane = Plane::from_point_normal(c0, axis)

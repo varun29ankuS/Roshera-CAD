@@ -8,8 +8,11 @@
 //! zero-regression contract: cone/stepped profiles still produce a watertight
 //! solid (via fallback), just not the minimal analytic face set yet (v2).
 use geometry_engine::math::{Point3, Tolerance, Vector3};
-use geometry_engine::operations::revolve::{revolve_profile, RevolveOptions};
-use geometry_engine::primitives::curve::{Line, ParameterRange};
+use geometry_engine::operations::revolve::{
+    get_revolve_meridian, revolve_meridian, revolve_profile, revolve_smooth_nozzle,
+    revolve_spline_meridian, RevolveOptions,
+};
+use geometry_engine::primitives::curve::{Arc, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::surface::{Cylinder, SurfaceType};
@@ -190,5 +193,333 @@ fn revolved_washer_bore_is_not_filled() {
     assert_eq!(
         filling, 0,
         "{filling} tessellation triangle(s) fill the bore (centroid inside the Ø16 bore)"
+    );
+}
+
+/// #21 — a CURVED meridian edge revolves to ONE `SurfaceOfRevolution` face for
+/// the whole 360°, not `segments` patches. An annular barrel: the outer wall is
+/// an ARC (r bulges 8→13→8 over z 0→10), inner wall straight (r=5), annular caps
+/// — all radii > 0 so the analytic-band path is eligible. Proves the curved arm
+/// engaged: a grid fallback would emit 48 SurfaceOfRevolution patches just for
+/// the outer wall.
+#[test]
+fn curved_meridian_revolves_to_one_surface_of_revolution() {
+    let mut m = BRepModel::new();
+    let v_bo = m.vertices.add(8.0, 0.0, 0.0); // bottom outer
+    let v_to = m.vertices.add(8.0, 0.0, 10.0); // top outer
+    let v_ti = m.vertices.add(5.0, 0.0, 10.0); // top inner
+    let v_bi = m.vertices.add(5.0, 0.0, 0.0); // bottom inner
+
+    // Outer wall arc: center (8,0,5), r=5, normal +Y; start π = (8,0,0),
+    // sweep -π ends at (8,0,10) bulging through (13,0,5).
+    let arc = Arc::new(
+        Point3::new(8.0, 0.0, 5.0),
+        Vector3::Y,
+        5.0,
+        std::f64::consts::PI,
+        -std::f64::consts::PI,
+    )
+    .expect("arc");
+    let arc_cid = m.curves.add(Box::new(arc));
+    let e_outer = m.edges.add(Edge::new(
+        0,
+        v_bo,
+        v_to,
+        arc_cid,
+        EdgeOrientation::Forward,
+        ParameterRange::new(0.0, 1.0),
+    ));
+    let mut line = |m: &mut BRepModel, a: (f64, f64), b: (f64, f64), s, e| {
+        let l = Line::new(Point3::new(a.0, 0.0, a.1), Point3::new(b.0, 0.0, b.1));
+        let cid = m.curves.add(Box::new(l));
+        m.edges.add(Edge::new(
+            0,
+            s,
+            e,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ))
+    };
+    let e_top = line(&mut m, (8.0, 10.0), (5.0, 10.0), v_to, v_ti);
+    let e_inner = line(&mut m, (5.0, 10.0), (5.0, 0.0), v_ti, v_bi);
+    let e_bot = line(&mut m, (5.0, 0.0), (8.0, 0.0), v_bi, v_bo);
+
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let sid = revolve_profile(&mut m, vec![e_outer, e_top, e_inner, e_bot], opts)
+        .unwrap_or_else(|e| panic!("revolve: {e:?}"));
+
+    let kinds = face_kinds(&m, sid);
+    assert_eq!(
+        count(&kinds, SurfaceType::SurfaceOfRevolution),
+        1,
+        "curved outer wall must be ONE SurfaceOfRevolution face (analytic path), got {kinds:?}"
+    );
+    assert!(
+        kinds.len() <= 6,
+        "barrel must be a handful of analytic faces, not 48× patches: {} faces {kinds:?}",
+        kinds.len()
+    );
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "curved revolve must be a valid solid"
+    );
+}
+
+/// #25.1 — a PARAMETRIC revolve (`revolve_meridian`) builds a valid solid AND
+/// RETAINS its generating meridian as construction geometry, so the part
+/// remembers how it was made (the foundation of the edit→regenerate workflow:
+/// the profile is recoverable for editing).
+#[test]
+fn revolve_meridian_retains_its_generating_profile() {
+    let mut m = BRepModel::new();
+    // Solid cylinder meridian (CCW in r-z): axis-bottom → outer-bottom →
+    // outer-top → axis-top.
+    let profile = [(0.0, 0.0), (5.0, 0.0), (5.0, 10.0), (0.0, 10.0)];
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let sid = revolve_meridian(&mut m, &profile, opts)
+        .unwrap_or_else(|e| panic!("revolve_meridian: {e:?}"));
+
+    // The part REMEMBERS its meridian (all 4 points, recoverable for editing).
+    let cg = m
+        .solid_construction(sid)
+        .expect("revolve_meridian must retain the generating meridian");
+    assert_eq!(
+        cg.profile_points.len(),
+        4,
+        "all 4 meridian points retained as construction geometry"
+    );
+
+    // And it is a valid solid of revolution.
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "revolve_meridian must build a valid solid"
+    );
+}
+
+/// #25.2 — the kernel edit→regenerate loop: RECOVER a part's meridian, EDIT it,
+/// and re-revolve to a new part. Widening the profile must yield a larger solid,
+/// and the regenerated part must retain the edited meridian.
+#[test]
+fn revolve_meridian_edit_regenerate_loop() {
+    let opts = || RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let mut m = BRepModel::new();
+    let profile = [(0.0, 0.0), (5.0, 0.0), (5.0, 10.0), (0.0, 10.0)];
+    let sid = revolve_meridian(&mut m, &profile, opts()).expect("revolve");
+
+    // RECOVER the editable meridian (matches the original).
+    let recovered = get_revolve_meridian(&m, sid).expect("recover meridian");
+    assert_eq!(recovered.len(), 4);
+    for (got, want) in recovered.iter().zip(profile.iter()) {
+        assert!(
+            (got.0 - want.0).abs() < 1e-9 && (got.1 - want.1).abs() < 1e-9,
+            "recovered {got:?} != original {want:?}"
+        );
+    }
+    let v_orig = m.mass_properties_for(sid).expect("mp").volume;
+
+    // EDIT: widen the outer radius 5 → 8, then REGENERATE.
+    let edited: Vec<(f64, f64)> = recovered
+        .iter()
+        .map(|&(r, z)| (if r > 0.0 { 8.0 } else { r }, z))
+        .collect();
+    let mut m2 = BRepModel::new();
+    let sid2 = revolve_meridian(&mut m2, &edited, opts()).expect("regenerate");
+    let v_new = m2.mass_properties_for(sid2).expect("mp2").volume;
+
+    // π·8²·10 ≈ 2.56× π·5²·10 — the edit regenerated a substantially larger part.
+    assert!(
+        v_new > v_orig * 1.5,
+        "widened profile must regenerate a larger part: {v_new} vs {v_orig}"
+    );
+    // The regenerated part retains the EDITED meridian (r = 8).
+    let re2 = get_revolve_meridian(&m2, sid2).expect("recover2");
+    assert!(
+        (re2[1].0 - 8.0).abs() < 1e-9,
+        "regenerated part must retain the edit: {re2:?}"
+    );
+}
+
+/// #9 — a SMOOTH (NURBS-spline) wall revolves to ONE `SurfaceOfRevolution`, not a
+/// faceted polyline of `P × segments` tiny faces (the original nozzle complaint).
+/// A curved bell wall → one revolution surface + plane caps, valid, and the wall
+/// profile stays recoverable for editing.
+#[test]
+fn revolve_spline_meridian_is_one_smooth_wall() {
+    let mut m = BRepModel::new();
+    // A bell/vase outer wall: a smooth curve through r = 5→3→4→7 over z = 0→12,
+    // hollowed by a Ø4 bore (radius 2) so it is a tube (no axis-touching).
+    let wall = [(5.0, 0.0), (3.0, 4.0), (4.0, 8.0), (7.0, 12.0)];
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 48,
+        ..Default::default()
+    };
+    let sid = revolve_spline_meridian(&mut m, &wall, 2.0, opts)
+        .unwrap_or_else(|e| panic!("revolve_spline_meridian: {e:?}"));
+
+    let k = face_kinds(&m, sid);
+    // The smooth outer wall is ONE revolution surface (NOT planar facets) …
+    assert!(
+        count(&k, SurfaceType::SurfaceOfRevolution) >= 1,
+        "the smooth wall must be a SurfaceOfRevolution: {k:?}"
+    );
+    // … and there is NO per-segment explosion: a faceted/grid wall would be ~48+
+    // faces; the analytic collapse gives wall + bore + 2 caps.
+    assert!(
+        k.len() <= 5,
+        "smooth wall must not explode into per-segment faces: {} faces {k:?}",
+        k.len()
+    );
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "spline revolve must be a valid solid"
+    );
+    // The editable wall profile is retained.
+    assert_eq!(
+        get_revolve_meridian(&m, sid).expect("recover").len(),
+        4,
+        "the wall profile is recoverable for editing"
+    );
+}
+
+/// HARNESS — face economy + smoothness (the invariant that was MISSING when the
+/// faceted "so many circles" revolve shipped): a smooth axisymmetric nozzle must
+/// revolve to O(1) analytic faces — ONE `SurfaceOfRevolution` per wall + 2 rims
+/// = 4 — NOT O(points) faceted bands. A valid, watertight, 90-face solid passes
+/// every OTHER check; only this gate fails it.
+#[test]
+fn smooth_nozzle_is_two_revolution_walls_not_faceted() {
+    let mut m = BRepModel::new();
+    // A bell inner/flow contour: chamber r12 → throat r4 @ z12 → exit r10, sampled
+    // at 15 stations (a faceted revolve would explode to ~15 bands per wall).
+    let inner: Vec<(f64, f64)> = (0..15)
+        .map(|i| {
+            let z = i as f64 * 3.0;
+            let r = if z <= 12.0 {
+                12.0 - 8.0 * (z / 12.0)
+            } else {
+                4.0 + 6.0 * ((z - 12.0) / 30.0)
+            };
+            (r, z)
+        })
+        .collect();
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 64,
+        ..Default::default()
+    };
+    let sid = revolve_smooth_nozzle(&mut m, &inner, 2.0, opts)
+        .unwrap_or_else(|e| panic!("revolve_smooth_nozzle: {e:?}"));
+
+    let k = face_kinds(&m, sid);
+    // The inner flow wall and the outer wall are EACH one smooth SurfaceOfRevolution.
+    assert_eq!(
+        count(&k, SurfaceType::SurfaceOfRevolution),
+        2,
+        "inner + outer must each be ONE SurfaceOfRevolution (face economy): {k:?}"
+    );
+    // O(1) faces total — 2 walls + 2 annular rims — never O(points) bands.
+    assert!(
+        k.len() <= 4,
+        "smooth nozzle must be 4 faces (2 walls + 2 rims), not faceted: {} {k:?}",
+        k.len()
+    );
+    assert!(
+        validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "smooth nozzle must be a valid solid"
+    );
+    // And the flow contour is recoverable for editing.
+    assert_eq!(get_revolve_meridian(&m, sid).expect("recover").len(), 15);
+}
+
+/// HARNESS — ROTATIONAL SYMMETRY (the automatic visual-verification invariant,
+/// geometric form): a Z-axis revolve is axisymmetric, so the tessellated mesh's
+/// X-extent must equal its Y-extent. A VALID, watertight nozzle can still be
+/// DEFORMED (non-circular) — exactly what shipped (cert said sound, dims were
+/// 114≠104). This invariant catches that class. Uses a Rao-like contour with a
+/// throat + a sharp chamber corner (the case that warped live).
+///
+/// This gate guards the SurfaceOfRevolution seam-tessellation fix: the wedge
+/// path (`tessellate_revolution_wedge`) used to Coons-blend interior nodes, which
+/// overshoots OFF a curved meridian and spiked the seam to r≈60 on a wall of true
+/// radius ≤52 (octant_max_r=[60,52,…,52,60], x=112≠y=104). The fix rotates the
+/// cached seam about the surface's true axis instead — exact, so the mesh is a
+/// flat 52 in every octant and x==y. Regression marker: if the Coons path (or any
+/// non-surface interior) returns, this fails first.
+#[test]
+fn smooth_nozzle_revolve_is_rotationally_symmetric() {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let mut m = BRepModel::new();
+    let inner: Vec<(f64, f64)> = vec![
+        (30.0, 0.0),
+        (30.0, 6.0),
+        (30.0, 12.0),
+        (24.0, 17.0),
+        (18.0, 21.0),
+        (13.0, 24.0),
+        (10.0, 27.0),
+        (10.5, 29.0),
+        (13.0, 35.0),
+        (18.0, 45.0),
+        (24.0, 60.0),
+        (30.0, 80.0),
+        (38.0, 105.0),
+        (45.0, 130.0),
+        (50.0, 156.0),
+    ];
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 96,
+        ..Default::default()
+    };
+    let sid = revolve_smooth_nozzle(&mut m, &inner, 2.0, opts)
+        .unwrap_or_else(|e| panic!("revolve_smooth_nozzle: {e:?}"));
+    let solid = m.solids.get(sid).expect("solid");
+    let mesh = tessellate_solid(solid, &m, &TessellationParams::default());
+
+    let (mut xmin, mut xmax, mut ymin, mut ymax) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for v in &mesh.vertices {
+        let p = v.position;
+        xmin = xmin.min(p.x);
+        xmax = xmax.max(p.x);
+        ymin = ymin.min(p.y);
+        ymax = ymax.max(p.y);
+    }
+    let (xext, yext) = (xmax - xmin, ymax - ymin);
+
+    assert!(
+        (xext - yext).abs() < 0.01 * xext.max(yext),
+        "a Z-axis revolve must be rotationally symmetric (X-extent ≈ Y-extent); \
+         deformed: x={xext:.3} y={yext:.3}"
     );
 }
