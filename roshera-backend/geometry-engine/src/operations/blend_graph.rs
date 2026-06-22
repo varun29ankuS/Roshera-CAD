@@ -1780,6 +1780,154 @@ pub fn solve_corner_junctions_post_surgery(
     })
 }
 
+/// The three **axially-retracted** inner-triangle corners of a 1C2F
+/// mixed corner — the analogue of the gold-standard all-fillet apex
+/// triangle, generalised to one chamfer-bevel rail + two cylinder
+/// fillet rails.
+///
+/// Unlike [`PostSurgeryCornerSolution`]'s `j1`/`j2`/`p12` (which sit on
+/// the cube edges, un-retracted, and are irreducibly non-manifold to
+/// cap — see `OVERNIGHT_FIX_CAMPAIGN.md`), these three corners are
+/// pulled inboard along each fillet's cylinder axis by the apex
+/// setback, so the cap rims they bound lie **off** every cube-face
+/// plane (mirroring the all-fillet
+/// [`crate::operations::fillet`]`::apply_triangular_nurbs_corner`
+/// path). The cube faces then close with straight cut edges
+/// (manifold-2 cube∧blend) and the cap rims are shared cap∧fillet /
+/// cap∧bevel only.
+#[derive(Debug, Clone, Copy)]
+pub struct RetractedCornerTriangle {
+    /// Apex anchor `A` (least-squares concurrent point of the two
+    /// fillet cylinder axes) — the same value as
+    /// [`PostSurgeryCornerSolution::apex`].
+    pub apex: Point3,
+    /// `P_12` — intersection of the two fillets' **apex-retracted**
+    /// V-cap circles (each centred at the foot of `A` on its axis).
+    /// The shared fillet∧fillet corner of the inner triangle.
+    pub p12: Point3,
+    /// `K_1` — intersection of `fillet_faces[0]`'s apex-retracted cap
+    /// circle with the chamfer-bevel plane. The shared
+    /// fillet[0]∧chamfer corner.
+    pub k1: Point3,
+    /// `K_2` — intersection of `fillet_faces[1]`'s apex-retracted cap
+    /// circle with the chamfer-bevel plane. The shared
+    /// fillet[1]∧chamfer corner.
+    pub k2: Point3,
+}
+
+/// Solve the **axially-retracted** inner-triangle corners of a 1C2F
+/// mixed corner from its post-surgery state.
+///
+/// Companion to [`solve_corner_junctions_post_surgery`]. That solver
+/// reports the rim corners as the live (broken) path leaves them — on
+/// the cube edges. This one reports the corners the watertight fix
+/// needs: each fillet's V-cap circle is re-centred at the foot of the
+/// **apex** `A` on its cylinder axis (rather than the foot of `V`),
+/// which retracts the cap rims off the cube planes by exactly the apex
+/// setback `|(A − q)·û|`. The three corners are then:
+///
+/// * `p12` — the two apex-retracted fillet cap circles' apex-side
+///   crossing (via [`two_cylinder_apex_intersection`]).
+/// * `k1` / `k2` — each apex-retracted fillet cap circle ∩ the chamfer
+///   bevel plane (via [`plane_cylinder_apex_intersection`]).
+///
+/// For the live unit-cube 1C2F corner (cube `10³`, chamfer `D = 1`,
+/// fillets `r = 1`, `V = (5,5,5)`), `A = (4,4,4)` and the retracted
+/// triangle is `p12 = (4,5,4)`, `k1 = (4,4,5)`, `k2 = (5,4,4)` — every
+/// corner off the cube edges, exactly mirroring the all-fillet apex
+/// triangle.
+///
+/// # Errors
+///
+/// Typed [`PostSurgeryCornerError`]; never panics. Pure function.
+pub fn solve_retracted_corner_triangle(
+    model: &BRepModel,
+    v_pos: Point3,
+    chamfer_bevel_face: FaceId,
+    fillet_faces: [FaceId; 2],
+) -> Result<RetractedCornerTriangle, PostSurgeryCornerError> {
+    let bevel_plane = reconstruct_bevel_plane(model, chamfer_bevel_face)?;
+    let bevel_normal = bevel_plane.normal;
+    let bevel_point = bevel_plane.origin;
+
+    let spine_0 = fillet_cap_spine(model, fillet_faces[0], v_pos)?;
+    let spine_1 = fillet_cap_spine(model, fillet_faces[1], v_pos)?;
+
+    // Apex anchor A (two cylinder-axis rows — uniquely determines A
+    // for a rectilinear corner; the bevel-plane row is exactly
+    // consistent with them).
+    let apex = least_squares_concurrent_point(&[
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_0.q,
+            axis_dir: spine_0.axis_dir,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_1.q,
+            axis_dir: spine_1.axis_dir,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+    ])
+    .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
+
+    let outward = (v_pos - apex)
+        .normalize()
+        .map_err(|_| PostSurgeryCornerError::DegenerateAxisSystem)?;
+
+    // Apex-retracted cap-circle centres: the foot of A on each axis
+    // (vs the foot of V in `solve_corner_junctions_post_surgery`).
+    // C' = q + ((A − q)·û)·û.
+    let retract_centre = |spine: &FilletCapSpine| -> Point3 {
+        let w = apex - spine.q;
+        let t = w.dot(&spine.axis_dir);
+        Point3::new(
+            spine.q.x + t * spine.axis_dir.x,
+            spine.q.y + t * spine.axis_dir.y,
+            spine.q.z + t * spine.axis_dir.z,
+        )
+    };
+    let c0 = retract_centre(&spine_0);
+    let c1 = retract_centre(&spine_1);
+
+    let k1 = plane_cylinder_apex_intersection(
+        bevel_normal,
+        bevel_point,
+        c0,
+        spine_0.axis_dir,
+        spine_0.radius,
+        v_pos,
+        outward,
+    )
+    .map_err(PostSurgeryCornerError::from_junction)?;
+    let k2 = plane_cylinder_apex_intersection(
+        bevel_normal,
+        bevel_point,
+        c1,
+        spine_1.axis_dir,
+        spine_1.radius,
+        v_pos,
+        outward,
+    )
+    .map_err(PostSurgeryCornerError::from_junction)?;
+    let p12 = two_cylinder_apex_intersection(
+        c0,
+        spine_0.axis_dir,
+        spine_0.radius,
+        c1,
+        spine_1.axis_dir,
+        spine_1.radius,
+        v_pos,
+        outward,
+    )
+    .map_err(PostSurgeryCornerError::from_junction)?;
+
+    Ok(RetractedCornerTriangle { apex, p12, k1, k2 })
+}
+
 /// V-end cap-circle spine of one post-surgery fillet face.
 struct FilletCapSpine {
     /// Cap-circle centre: the foot of `V` on the cylinder axis line.

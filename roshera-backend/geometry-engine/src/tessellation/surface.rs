@@ -210,7 +210,12 @@ pub fn tessellate_face(
         // `closest_point` boundary inversion is unreliable at the seam and emits
         // an empty mesh. Open NURBS patches keep the curved-CDT path.
         "NurbsSurface" => {
-            if !(surface.is_closed_u()
+            // CF-γ.7 corner-cap apex fan: a small degenerate-column
+            // triangular cap (3-rim loop + apex hint) that curved-CDT's
+            // UV inversion rejects. Welds via the cached rim; falls
+            // through for every other NURBS face.
+            if tessellate_corner_cap_apex_fan(face, model, surface, cache, mesh) {
+            } else if !(surface.is_closed_u()
                 && tessellate_nurbs_skin_lateral(surface, face, model, params, cache, mesh))
             {
                 tessellate_nurbs_face(face, model, params, cache, mesh);
@@ -1354,6 +1359,133 @@ fn loop_rim_samples(
         rim.pop();
     }
     rim
+}
+
+/// Apex-fan tessellation of a small triangular corner-cap NURBS patch
+/// (CF-γ.7, the 1C2F mixed corner cap). The patch is a degenerate-
+/// column rational bi-quadratic whose three rims (two fillet arcs + one
+/// chamfer chord) meet at a single collapsed apex; curved-CDT's
+/// `closest_point` UV inversion is singular at that apex and rejects the
+/// patch (`PointOnFixedEdge`). This path sidesteps the inversion:
+///
+/// * the rim comes VERBATIM from the [`EdgeSampleCache`]
+///   ([`loop_rim_samples`]), so it welds bit-exactly to the fillet /
+///   bevel faces that share those rim edges;
+/// * interior triangles fan each consecutive rim pair to the patch
+///   apex (the [`BRepModel::cap_apex_hint`] for this face), lifted onto
+///   the cap surface so the mesh follows curvature.
+///
+/// The cap is star-shaped from its apex (a small convex corner patch),
+/// so the fan is crack-free and self-intersection-free. Returns `false`
+/// (so the caller falls through to curved-CDT) when the face has no apex
+/// hint or its rim cannot be sampled — i.e. for every NURBS face that is
+/// not a CF-γ.7 corner cap.
+fn tessellate_corner_cap_apex_fan(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(hint) = model.cap_apex_hint.get(&face.id) else {
+        return false;
+    };
+    let apex = *hint.value();
+    let Some(lp) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    // Only the 3-rim corner cap routes here (2 fillet arcs + 1 chamfer
+    // chord). A larger / different loop is not a CF-γ.7 cap.
+    if lp.edges.len() != 3 {
+        return false;
+    }
+    let rim = loop_rim_samples(lp, model, cache);
+    let m = rim.len();
+    if m < 3 {
+        return false;
+    }
+
+    // Outward face normal: the patch's parametric normal at the centre,
+    // signed by the face orientation. Used to wind every fan triangle
+    // consistently outward.
+    let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+    let n_face = surface
+        .normal_at(0.5 * (u0 + u1), 0.5 * (v0 + v1))
+        .ok()
+        .map(|n| n * face.orientation.sign())
+        .unwrap_or(Vector3::Z);
+
+    // Wind ALL fan triangles together by the rim's net orientation (not
+    // per-triangle, which can flip individual slivers and desynchronise
+    // the shared-edge directed-edge parity). The Newell normal of the
+    // rim ring gives the loop's geometric facing; if it opposes the
+    // outward face normal, the whole fan is emitted reversed.
+    let mut newell = Vector3::ZERO;
+    for i in 0..m {
+        let a = rim[i];
+        let b = rim[(i + 1) % m];
+        newell.x += (a.y - b.y) * (a.z + b.z);
+        newell.y += (a.z - b.z) * (a.x + b.x);
+        newell.z += (a.x - b.x) * (a.y + b.y);
+    }
+    let forward = newell.dot(&n_face) >= 0.0;
+
+    // First pass: build the triangle index list (winding all triangles
+    // consistently by the net rim orientation) and accumulate each
+    // triangle's outward geometric normal onto its vertices so the
+    // per-vertex stored normals AGREE with the winding (the curved
+    // patch's own surface normal near the collapsed apex is unreliable,
+    // and the tess-quality oracle requires `normal_agreement == 1`).
+    let mut accum: Vec<Vector3> = vec![Vector3::ZERO; m + 1]; // rim[0..m] + apex
+    let mut tri_local: Vec<[usize; 3]> = Vec::with_capacity(m);
+    for i in 0..m {
+        let pa = rim[i];
+        let pb = rim[(i + 1) % m];
+        // Skip a degenerate fan triangle (rim pair coincident with each
+        // other or with the apex) — a zero-area facet fails tess-quality.
+        if (pb - pa).magnitude() < 1e-9
+            || (apex - pa).magnitude() < 1e-9
+            || (pb - pa).cross(&(apex - pa)).magnitude() < 1e-12
+        {
+            continue;
+        }
+        let (i0, i1, i2) = if forward {
+            (i, (i + 1) % m, m)
+        } else {
+            ((i + 1) % m, i, m)
+        };
+        let p0 = if i0 == m { apex } else { rim[i0] };
+        let p1 = if i1 == m { apex } else { rim[i1] };
+        let p2 = if i2 == m { apex } else { rim[i2] };
+        let gn = (p1 - p0).cross(&(p2 - p0));
+        accum[i0] = accum[i0] + gn;
+        accum[i1] = accum[i1] + gn;
+        accum[i2] = accum[i2] + gn;
+        tri_local.push([i0, i1, i2]);
+    }
+
+    let base = mesh.vertices.len() as u32;
+    for i in 0..m {
+        mesh.vertices.push(MeshVertex {
+            position: rim[i],
+            normal: accum[i].normalize().unwrap_or(n_face),
+            uv: None,
+        });
+    }
+    mesh.vertices.push(MeshVertex {
+        position: apex,
+        normal: accum[m].normalize().unwrap_or(n_face),
+        uv: None,
+    });
+
+    for t in tri_local {
+        mesh.triangles
+            .push([base + t[0] as u32, base + t[1] as u32, base + t[2] as u32]);
+    }
+    true
 }
 
 /// Boundary-conforming tessellation of a spherical CENTRAL region (sphere minus
