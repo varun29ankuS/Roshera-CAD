@@ -963,8 +963,70 @@ impl Arc {
         // `perpendicular()` returns a cross product whose sign depends on
         // the seed axis, which is mathematically valid but surprising.
         // Right-handed cyclic mapping: ±Z→+X, ±X→+Y, ±Y→+Z.
+        let x_axis = Self::canonical_x_axis(normal);
+
+        Ok(Self {
+            center,
+            normal,
+            x_axis,
+            radius,
+            start_angle,
+            sweep_angle,
+            range: ParameterRange::unit(),
+        })
+    }
+
+    /// Create full circle
+    pub fn circle(center: Point3, normal: Vector3, radius: f64) -> MathResult<Self> {
+        Self::new(center, normal, radius, 0.0, consts::TWO_PI)
+    }
+
+    /// Create an arc with an EXPLICIT in-plane reference direction.
+    ///
+    /// Unlike [`Arc::new`], which derives a canonical `x_axis` from the
+    /// normal, this preserves a caller-supplied `x_axis` — required by
+    /// rigid transforms, which map the arc's own `t = 0` reference under
+    /// the same motion (a circle rotated about its center keeps its
+    /// parametrisation, not a re-derived canonical one). The supplied
+    /// `x_axis` is re-orthogonalised against the (normalised) `normal` so
+    /// the frame stays exactly orthonormal under accumulated float error;
+    /// if it is parallel to the normal (degenerate), the canonical
+    /// `Arc::new` axis is used instead.
+    pub fn with_x_axis(
+        center: Point3,
+        normal: Vector3,
+        x_axis: Vector3,
+        radius: f64,
+        start_angle: f64,
+        sweep_angle: f64,
+    ) -> MathResult<Self> {
+        let normal = normal.normalize()?;
+        // Project x_axis into the plane (remove any normal component) and
+        // renormalise. `reject` fails only if `normal` is zero-length,
+        // which `normalize` above already ruled out; a parallel x_axis
+        // rejects to ~0 and fails to normalise — fall back to canonical.
+        let x_axis = x_axis
+            .reject(&normal)
+            .ok()
+            .and_then(|v| v.normalize().ok())
+            .unwrap_or_else(|| Self::canonical_x_axis(normal));
+        Ok(Self {
+            center,
+            normal,
+            x_axis,
+            radius,
+            start_angle,
+            sweep_angle,
+            range: ParameterRange::unit(),
+        })
+    }
+
+    /// Canonical in-plane reference for a (unit) normal — the convention
+    /// `Arc::new` applies (±Z→+X, ±X→+Y, ±Y→+Z; otherwise
+    /// `normal.perpendicular()`).
+    fn canonical_x_axis(normal: Vector3) -> Vector3 {
         const AXIS_EPS: f64 = 1e-10;
-        let x_axis = if (normal - Vector3::Z).magnitude() < AXIS_EPS
+        if (normal - Vector3::Z).magnitude() < AXIS_EPS
             || (normal + Vector3::Z).magnitude() < AXIS_EPS
         {
             Vector3::X
@@ -981,22 +1043,54 @@ impl Arc {
                 .perpendicular()
                 .normalize()
                 .unwrap_or(Vector3::new(1.0, 0.0, 0.0))
-        };
-
-        Ok(Self {
-            center,
-            normal,
-            x_axis,
-            radius,
-            start_angle,
-            sweep_angle,
-            range: ParameterRange::unit(),
-        })
+        }
     }
 
-    /// Create full circle
-    pub fn circle(center: Point3, normal: Vector3, radius: f64) -> MathResult<Self> {
-        Self::new(center, normal, radius, 0.0, consts::TWO_PI)
+    /// Apply a transform and return the analytic-arc image, or `None` when
+    /// the motion is not a similarity (rigid + uniform scale) and the image
+    /// is therefore a genuine ellipse (callers fall back to NURBS).
+    ///
+    /// A circle/arc maps to a circle/arc under any similarity: the centre
+    /// moves with the point transform, the supporting-plane normal and the
+    /// in-plane `t = 0` reference move with the vector transform (preserving
+    /// the parametrisation — a rotated rim's `t = 0` rotates with it), and
+    /// the radius scales by the uniform factor. We detect a similarity by
+    /// checking that the normal, the in-plane x-axis, AND the in-plane
+    /// perpendicular all scale by the same magnitude.
+    pub(crate) fn transformed_arc(&self, matrix: &Matrix4) -> Option<Arc> {
+        let new_center = matrix.transform_point(&self.center);
+        let new_normal = matrix.transform_vector(&self.normal);
+        let new_x_axis = matrix.transform_vector(&self.x_axis);
+        // The third frame direction must scale identically for the cross-
+        // section to stay circular (otherwise the image is an ellipse).
+        let new_y_axis = matrix.transform_vector(&self.y_axis());
+
+        let scale_normal = new_normal.magnitude();
+        let scale_x = new_x_axis.magnitude();
+        let scale_y = new_y_axis.magnitude();
+
+        const SCALE_TOLERANCE: f64 = 1e-10;
+        if (scale_x - scale_normal).abs() >= SCALE_TOLERANCE
+            || (scale_x - scale_y).abs() >= SCALE_TOLERANCE
+        {
+            return None;
+        }
+
+        let new_normal_unit = new_normal.normalize().ok()?;
+        let new_radius = self.radius * scale_x;
+        // Preserve the transformed in-plane reference so the arc's
+        // parametrisation tracks the rigid motion; `with_x_axis`
+        // re-orthogonalises against the new normal and falls back to the
+        // canonical axis only if the transformed x-axis degenerates.
+        Arc::with_x_axis(
+            new_center,
+            new_normal_unit,
+            new_x_axis,
+            new_radius,
+            self.start_angle,
+            self.sweep_angle,
+        )
+        .ok()
     }
 
     /// Get y-axis from x-axis and normal
@@ -1152,41 +1246,14 @@ impl Curve for Arc {
     }
 
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Curve> {
-        // Handle special transformations that preserve arc properties
-
-        // Transform center, x_axis, and normal
-        let new_center = matrix.transform_point(&self.center);
-        let new_x_axis = matrix.transform_vector(&self.x_axis);
-        let new_normal = matrix.transform_vector(&self.normal);
-
-        // Check if transformation preserves arc properties
-        let scale_x = new_x_axis.magnitude();
-        let scale_normal = new_normal.magnitude();
-
-        // Normalize the vectors
-        let _new_x_axis_normalized = new_x_axis.normalize().unwrap_or(self.x_axis);
-        let new_normal_normalized = new_normal.normalize().unwrap_or(self.normal);
-
-        // Check if scales are uniform (within tolerance)
-        let scale_tolerance = 1e-10;
-        if (scale_x - scale_normal).abs() < scale_tolerance {
-            // Uniform scale - arc remains an arc
-            let new_radius = self.radius * scale_x;
-
-            Arc::new(
-                new_center,
-                new_normal_normalized,
-                new_radius,
-                self.start_angle,
-                self.sweep_angle,
-            )
+        self.transformed_arc(matrix)
             .map(|arc| Box::new(arc) as Box<dyn Curve>)
-            .unwrap_or_else(|_| Box::new(Line::new(self.center, self.center)) as Box<dyn Curve>)
-        } else {
-            // Non-uniform scale - must convert to NURBS
-            let nurbs = self.to_nurbs();
-            nurbs.transform(matrix)
-        }
+            .unwrap_or_else(|| {
+                // Non-uniform / shearing motion: the image is a true
+                // ellipse and cannot be carried as an analytic arc.
+                // Fall back to the exact rational NURBS image.
+                self.to_nurbs().transform(matrix)
+            })
     }
 
     fn arc_length_between(&self, t1: f64, t2: f64, _tolerance: Tolerance) -> MathResult<f64> {
@@ -3634,7 +3701,16 @@ impl Curve for Circle {
     }
 
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Curve> {
-        self.arc.transform(matrix)
+        // A circle maps to a circle under any similarity (rigid motion +
+        // uniform scale). Preserve the `Circle` type — delegating to
+        // `Arc::transform` would re-type the rim as an `Arc`, breaking
+        // `select_edge(curve_kind = circle)` after a translate/rotate.
+        // Only a non-uniform/shear motion (genuine ellipse image) falls
+        // back to the rational NURBS curve.
+        match self.arc.transformed_arc(matrix) {
+            Some(arc) => Box::new(Circle { arc }),
+            None => self.arc.to_nurbs().transform(matrix),
+        }
     }
 
     fn arc_length_between(&self, t1: f64, t2: f64, tolerance: Tolerance) -> MathResult<f64> {
