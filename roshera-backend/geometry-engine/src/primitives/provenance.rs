@@ -10,7 +10,7 @@
 //! kernel can answer "what did you actually make, and which parts are real?"
 //! without consulting the LLM.
 
-use crate::math::{Matrix4, Point3};
+use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::persistent_id::PrimitiveKind;
 use crate::primitives::solid::SolidId;
 
@@ -110,12 +110,20 @@ impl SolidProvenance {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstructionGeometry {
     /// World-space origin of the source sketch plane (the lift of plane
-    /// (0, 0)).
+    /// (0, 0)). For a revolved part this is the axis origin.
     pub plane_origin: Point3,
     /// World-space points of the drawn profile (the lifted sketch loop
     /// vertices). Used to derive the construction bbox for the
     /// co-location check; never empty for a recorded sketch.
     pub profile_points: Vec<Point3>,
+    /// For a SOLID OF REVOLUTION: the world-space unit revolution axis the
+    /// meridian was lifted onto (`profile_points` lie in the
+    /// `(plane_origin, axis, ê1)` half-plane). `None` for a sketch-derived
+    /// solid (extrude / revolve-from-sketch), where there is no single axis to
+    /// record. Stored so the `(r, z)` meridian is recoverable EXACTLY for ANY
+    /// axis (no heuristic) — the inverse lift needs the axis direction, which a
+    /// planar point set alone cannot disambiguate from the radial reference.
+    pub revolution_axis: Option<Vector3>,
 }
 
 impl ConstructionGeometry {
@@ -123,12 +131,26 @@ impl ConstructionGeometry {
         Self {
             plane_origin,
             profile_points,
+            revolution_axis: None,
+        }
+    }
+
+    /// Construct revolved-part construction geometry, recording the world-space
+    /// revolution axis (origin + unit direction) so the `(r, z)` meridian can be
+    /// recovered exactly. The axis direction is normalised by the caller.
+    pub fn revolution(axis_origin: Point3, axis: Vector3, profile_points: Vec<Point3>) -> Self {
+        Self {
+            plane_origin: axis_origin,
+            profile_points,
+            revolution_axis: Some(axis),
         }
     }
 
     /// Apply an affine transform to every stored point (FIX 1). Keeps the
     /// construction geometry rigidly attached to the solid it built so a
-    /// `transform_solid` can never leave the sketch behind.
+    /// `transform_solid` can never leave the sketch behind. The revolution axis
+    /// is a DIRECTION, so it is rotated/scaled by the transform's linear part
+    /// (no translation) and re-normalised; a degenerate (zero) result drops it.
     pub fn transformed(&self, m: &Matrix4) -> Self {
         Self {
             plane_origin: m.transform_point(&self.plane_origin),
@@ -137,6 +159,9 @@ impl ConstructionGeometry {
                 .iter()
                 .map(|p| m.transform_point(p))
                 .collect(),
+            revolution_axis: self
+                .revolution_axis
+                .and_then(|a| m.transform_vector(&a).normalize().ok()),
         }
     }
 
