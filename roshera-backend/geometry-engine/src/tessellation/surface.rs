@@ -4504,9 +4504,18 @@ fn tessellate_nurbs_skin_lateral(
         None => return false,
     };
     // Cylinder-style loop: two distinct CLOSED ring edges + one seam edge used
-    // twice (4 loop entries).
+    // twice (4 loop entries). A boolean that cuts a notch THROUGH a cap rim (the
+    // box reaches above/below the barrel cap, so the cut crosses the planar
+    // cap↔lateral edge) leaves the lateral fragment's top (or bottom) ring
+    // BROKEN by an angular gap, with the notch's side/bottom cut edges threaded
+    // into the single outer loop (no inner loop, edge count ≠ 4). The
+    // structured ring stitch below cannot represent that gap; route it to the
+    // cap-edge-notch mesher, which unrolls the periodic wall into a clean UV
+    // rectangle with the notch carved out of the rim. It self-declines (→
+    // curved-CDT) for any loop that is not this notched-rim form, so the clean
+    // 4-edge barrel and every already-watertight case are untouched.
     if loop_data.edges.len() != 4 {
-        return false;
+        return tessellate_nurbs_skin_lateral_cap_notch(surface, face, model, params, cache, mesh);
     }
     let mut ring_edges: Vec<crate::primitives::edge::EdgeId> = Vec::new();
     for &eid in &loop_data.edges {
@@ -4613,6 +4622,564 @@ fn tessellate_nurbs_skin_lateral(
     true
 }
 
+/// Tessellate a CLOSED-in-u NURBS skin lateral whose top OR bottom cap rim is
+/// breached by a boolean notch (task #17 watertight, the cap-edge case). When a
+/// cutter reaches above (or below) the barrel's planar cap, the difference's cut
+/// curves cross the cap↔lateral rim edge; the lateral fragment then carries a
+/// single outer loop in which one ring is interrupted by an angular GAP and the
+/// notch's side/bottom cut edges are threaded inline (no inner loop, edge count
+/// ≠ 4). Neither the clean ring-stitch nor the hole-window mesher fits this form,
+/// and the generic curved-CDT path folds at the periodic seam (its
+/// `closest_point` boundary inversion maps both seam sides to one u), so the
+/// fragment tessellated with overlapping, off-surface facets (non-manifold mesh).
+///
+/// This unrolls the periodic wall into a SINGLE simple UV polygon: the seam edge
+/// (the only edge walked twice by the loop) is split into the rectangle's two
+/// vertical sides (u=0 on one traversal, u=1 on the other) — exactly the
+/// structural seam split the hole-window mesher uses — while every other edge is
+/// projected to (u,v) by `closest_point` and unwrapped monotonically along the
+/// walk, so the notch becomes a clean bite out of the rim. The polygon is
+/// triangulated by the shared CDT (`curved_cdt::run_cdt`) with a structured
+/// interior Steiner grid; boundary vertices take their 3D VERBATIM from the
+/// `EdgeSampleCache` (welding bit-exactly to the adjacent cap, box-wall and
+/// pocket faces), interior vertices use `surface.point_at`. Returns `false`
+/// (caller → curved-CDT) for any loop that is not this notched-rim form, so the
+/// clean barrel and the already-watertight pocket/slot cases are never affected.
+fn tessellate_nurbs_skin_lateral_cap_notch(
+    surface: &dyn Surface,
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::edge::EdgeId;
+    let tol = Tolerance::default();
+
+    let Some(loop_data) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if loop_data.edges.len() < 6 {
+        return false;
+    }
+
+    // The skin-lateral seam is the unique edge the outer loop walks TWICE (once
+    // up, once down). A notched-rim fragment still carries it; if no edge repeats
+    // this is not the closed-u skin form — decline.
+    let mut seen: HashMap<EdgeId, u32> = HashMap::new();
+    for &eid in &loop_data.edges {
+        *seen.entry(eid).or_insert(0) += 1;
+    }
+    let seam_candidates: Vec<EdgeId> = seen
+        .iter()
+        .filter(|(_, &c)| c == 2)
+        .map(|(&e, _)| e)
+        .collect();
+    if seam_candidates.len() != 1 {
+        return false;
+    }
+    let seam_edge = seam_candidates[0];
+
+    // Surface seam endpoints (u=0 column): S(0,0) bottom, S(0,1) top.
+    let (Ok(p00), Ok(p01)) = (surface.point_at(0.0, 0.0), surface.point_at(0.0, 1.0)) else {
+        return false;
+    };
+
+    // Rotate the loop's edge list so it STARTS at the first seam occurrence. The
+    // walk is then: seam · segmentA · seam · segmentB, and the two seam
+    // traversals bracket the two non-seam runs cleanly.
+    let Some(seam_first) = loop_data.edges.iter().position(|&e| e == seam_edge) else {
+        return false;
+    };
+    let n_edges = loop_data.edges.len();
+    let rot_edges: Vec<EdgeId> = (0..n_edges)
+        .map(|k| loop_data.edges[(seam_first + k) % n_edges])
+        .collect();
+    let rot_orient: Vec<bool> = (0..n_edges)
+        .map(|k| {
+            loop_data
+                .orientations
+                .get((seam_first + k) % n_edges)
+                .copied()
+                .unwrap_or(true)
+        })
+        .collect();
+
+    // A `Vert` is one contour vertex: its unrolled (u,v) and its resolved 3D
+    // (verbatim cache for every boundary sample → watertight weld).
+    struct Vert {
+        u: f64,
+        v: f64,
+        p: Point3,
+    }
+    let mut contour: Vec<Vert> = Vec::new();
+
+    // Emit one edge's cache samples into the contour. `pin_u` (when Some) forces
+    // every sample's u (the seam sides → u=0 / u=1); otherwise `closest_point`
+    // gives u and it is unwrapped to stay continuous with the previous vertex.
+    // The last sample of each edge is dropped (shared with the next edge's
+    // first), matching the loop-walk convention used elsewhere.
+    let mut last_u: Option<f64> = None;
+    let mut emit_edge = |eid: EdgeId,
+                         fwd: bool,
+                         pin_u: Option<f64>,
+                         contour: &mut Vec<Vert>,
+                         last_u: &mut Option<f64>|
+     -> bool {
+        let samples = cache.get_or_compute(eid, model);
+        if samples.len() < 2 {
+            return false;
+        }
+        let ordered: Vec<Point3> = if fwd {
+            samples.to_vec()
+        } else {
+            samples.iter().rev().copied().collect()
+        };
+        for p in &ordered[..ordered.len() - 1] {
+            let (u, v) = match pin_u {
+                Some(pu) => {
+                    // Seam side: v from closest_point (the height along the
+                    // seam), u pinned to the rectangle wall.
+                    let v = surface.closest_point(p, tol).map(|(_, v)| v).unwrap_or(0.0);
+                    (pu, v)
+                }
+                None => {
+                    let Ok((mut u, v)) = surface.closest_point(p, tol) else {
+                        return false;
+                    };
+                    if let Some(pu) = *last_u {
+                        while u - pu > 0.5 {
+                            u -= 1.0;
+                        }
+                        while u - pu < -0.5 {
+                            u += 1.0;
+                        }
+                    }
+                    (u, v)
+                }
+            };
+            *last_u = Some(u);
+            contour.push(Vert { u, v, p: *p });
+        }
+        true
+    };
+
+    // Walk: seam#1 (right wall, u=1) · segmentA · seam#2 (left wall, u=0) ·
+    // segmentB. Determine each seam traversal's vertical direction from its
+    // sample order so the contour stays a simple CCW-or-CW ring; CDT is
+    // orientation-agnostic and the winding is fixed at emission.
+    let mut walked_first_seam = false;
+    for k in 0..n_edges {
+        let eid = rot_edges[k];
+        let fwd = rot_orient[k];
+        if eid == seam_edge {
+            let pin = if !walked_first_seam { 1.0 } else { 0.0 };
+            walked_first_seam = true;
+            // Reset the unwrap anchor to the pinned wall so the following
+            // segment unwraps from the correct side.
+            if !emit_edge(eid, fwd, Some(pin), &mut contour, &mut last_u) {
+                return false;
+            }
+            last_u = Some(pin);
+        } else if !emit_edge(eid, fwd, None, &mut contour, &mut last_u) {
+            return false;
+        }
+    }
+
+    if contour.len() < 6 {
+        return false;
+    }
+
+    // The unrolled contour must stay inside [0,1] in u (a small epsilon margin)
+    // and span a non-trivial u-range; otherwise the seam split mis-fired and we
+    // must not emit a folded patch — decline to curved-CDT.
+    let (mut u_lo, mut u_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for w in &contour {
+        u_lo = u_lo.min(w.u);
+        u_hi = u_hi.max(w.u);
+    }
+    if !u_lo.is_finite() || !u_hi.is_finite() {
+        return false;
+    }
+    if u_lo < -1e-6 || u_hi > 1.0 + 1e-6 || (u_hi - u_lo) < 0.5 {
+        return false;
+    }
+
+    // Outer UV polygon for the CDT.
+    let outer_uv: Vec<(f64, f64)> = contour.iter().map(|w| (w.u, w.v)).collect();
+    // Reject a self-touching / zero-area unrolled polygon (a mis-classified seam
+    // would collapse the rectangle).
+    let area = cap_notch_polygon_area(&outer_uv);
+    if area.abs() < 1e-6 {
+        return false;
+    }
+
+    // Structured interior Steiner grid: ring u-columns (the distinct boundary
+    // u-values) × chord-driven v-bands. Each candidate is kept only if it lies
+    // strictly inside the unrolled outer polygon, so the notch bite stays empty.
+    let m_bands = {
+        let probe = 32;
+        let mut prev = p00;
+        let mut length = 0.0;
+        for k in 1..=probe {
+            let v = k as f64 / probe as f64;
+            if let Ok(p) = surface.point_at(0.0, v) {
+                length += (p - prev).magnitude();
+                prev = p;
+            }
+        }
+        linear_steps_for_quality(length, params).max(2)
+    };
+    // u-columns: sample a uniform set across (0,1) plus the boundary u's, so the
+    // interior is well-graded regardless of the ring sampling density.
+    let n_cols = {
+        let circumference = {
+            let mut prev = p01;
+            let mut length = 0.0;
+            let probe = 48;
+            for k in 1..=probe {
+                let u = k as f64 / probe as f64;
+                if let Ok(p) = surface.point_at(u, 1.0) {
+                    length += (p - prev).magnitude();
+                    prev = p;
+                }
+            }
+            length
+        };
+        linear_steps_for_quality(circumference, params).max(8)
+    };
+    let mut steiner: Vec<(f64, f64)> = Vec::new();
+    for ci in 1..n_cols {
+        let u = ci as f64 / n_cols as f64;
+        for bj in 1..m_bands {
+            let v = bj as f64 / m_bands as f64;
+            if cap_notch_point_in_polygon(u, v, &outer_uv) {
+                steiner.push((u, v));
+            }
+        }
+    }
+
+    // Detach the NOTCH-BOTTOM cut arc from the free CDT and tessellate the thin
+    // strip just inside it as a STRUCTURED quad band. The notch's bottom cut edge
+    // is the box-cut plane ∩ the barrel — a verbatim-cached arc SHARED with the
+    // box-bottom planar face (decimating it would unweld the seam), so the lateral
+    // must carry its full dense sample stream. That stream is far denser in u than
+    // the interior grid, and its samples are coplanar (in the box's horizontal cut
+    // plane); a constrained Delaunay over it inevitably triangulates three
+    // consecutive arc samples into a facet that is flat in the cut plane and so
+    // folds tens of degrees off the true (radial) wall normal — and no interior
+    // Steiner point can prevent it (the constrained arc edges force the fan).
+    //
+    // Instead: build a parallel OFFSET ROW one band below the arc (real
+    // `point_at` samples, off the cut plane), feed the CDT the offset row as its
+    // bottom boundary (so the dense flat arc never enters the Delaunay), and stitch
+    // the arc → offset row as an explicit quad strip. Every strip triangle spans
+    // z=cut down into the wall, so none is flat; the arc samples weld to the box
+    // face verbatim and the offset row welds to the CDT region — watertight.
+    let band_h = 1.0 / m_bands as f64;
+    let mut arc_run: Vec<usize> = Vec::new();
+    {
+        // The notch-bottom arc is the maximal contiguous block of contour vertices
+        // that are cut samples (not ring, not seam) sitting within half a band of
+        // the lowest cut v — the horizontal arc, distinct from the side edges that
+        // climb to the rim.
+        let on_ring = |w: &Vert| w.v <= 1e-4 || w.v >= 1.0 - 1e-4;
+        let on_seam = |w: &Vert| w.u <= 1e-4 || w.u >= 1.0 - 1e-4;
+        let is_cut = |w: &Vert| !on_ring(w) && !on_seam(w);
+        let nc = contour.len();
+        let cut_idx: Vec<usize> = (0..nc).filter(|&i| is_cut(&contour[i])).collect();
+        if cut_idx.len() >= 3 {
+            let v_min = cut_idx
+                .iter()
+                .map(|&i| contour[i].v)
+                .fold(f64::INFINITY, f64::min);
+            let is_bottom = |i: usize| is_cut(&contour[i]) && contour[i].v <= v_min + 0.5 * band_h;
+            // Find the contiguous (cyclic) bottom run. Pick a start index that is a
+            // bottom vertex whose predecessor is NOT, so the run is a single block.
+            if (0..nc).any(is_bottom) && !(0..nc).all(is_bottom) {
+                let start = (0..nc)
+                    .find(|&i| is_bottom(i) && !is_bottom((i + nc - 1) % nc))
+                    .unwrap_or(0);
+                let mut k = start;
+                while is_bottom(k) {
+                    arc_run.push(k);
+                    k = (k + 1) % nc;
+                    if k == start {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Require a genuine multi-sample arc to detach; otherwise leave the contour as
+    // is (the plain CDT path handles a 1–2 sample bottom without flat fans).
+    if arc_run.len() < 3 {
+        arc_run.clear();
+    }
+
+    // Build the offset row (uv + resolved 3D) parallel to the arc INTERIOR, one
+    // band below. The arc's two END vertices are the notch corners (shared with
+    // the box side faces) — they STAY in the CDT contour at the cut plane so those
+    // welds are preserved; only the interior arc samples are replaced. Resolve 3D
+    // via `point_at`; if any sample fails, abandon the detour and fall back to the
+    // plain CDT over the original contour.
+    let mut offset_uv: Vec<(f64, f64)> = Vec::new();
+    let mut offset_p: Vec<Point3> = Vec::new();
+    if arc_run.len() >= 3 {
+        // Interior arc vertices = arc_run[1..len-1].
+        for &i in &arc_run[1..arc_run.len() - 1] {
+            let (ou, ov) = (contour[i].u, (contour[i].v - band_h).max(1e-4));
+            match surface.point_at(ou, ov) {
+                Ok(p) => {
+                    offset_uv.push((ou, ov));
+                    offset_p.push(p);
+                }
+                Err(_) => {
+                    arc_run.clear();
+                    offset_uv.clear();
+                    offset_p.clear();
+                    break;
+                }
+            }
+        }
+        if offset_uv.is_empty() {
+            arc_run.clear();
+        }
+    } else {
+        arc_run.clear();
+    }
+
+    // Assemble the CDT contour. When the arc is detached, the arc INTERIOR is
+    // replaced (in walk order) by the offset row; the two corner vertices remain.
+    // The bottom boundary of the CDT region is therefore: corner_left → offset row
+    // → corner_right. Track, per CDT-contour index, the resolved 3D + true (u,v).
+    struct CVert {
+        u: f64,
+        v: f64,
+        p: Point3,
+    }
+    let cdt_contour: Vec<CVert> = if arc_run.is_empty() {
+        contour
+            .iter()
+            .map(|w| CVert {
+                u: w.u,
+                v: w.v,
+                p: w.p,
+            })
+            .collect()
+    } else {
+        // arc_run is contiguous; replace its INTERIOR span with the offset row,
+        // keeping the first/last (corner) vertices. Walk the contour; at the first
+        // INTERIOR arc vertex, splice in the offset row, then skip the rest of the
+        // interior; the corner vertices fall through as ordinary contour vertices.
+        let interior: std::collections::HashSet<usize> =
+            arc_run[1..arc_run.len() - 1].iter().copied().collect();
+        let interior_first = arc_run[1];
+        let mut out: Vec<CVert> = Vec::with_capacity(contour.len());
+        for i in 0..contour.len() {
+            if i == interior_first {
+                for (k, &(ou, ov)) in offset_uv.iter().enumerate() {
+                    out.push(CVert {
+                        u: ou,
+                        v: ov,
+                        p: offset_p[k],
+                    });
+                }
+            } else if interior.contains(&i) {
+                continue;
+            } else {
+                out.push(CVert {
+                    u: contour[i].u,
+                    v: contour[i].v,
+                    p: contour[i].p,
+                });
+            }
+        }
+        out
+    };
+
+    let outer_uv: Vec<(f64, f64)> = cdt_contour.iter().map(|w| (w.u, w.v)).collect();
+    // Drop interior Steiner candidates that fell into the thin arc→offset strip we
+    // now own explicitly (between the offset row and the original arc v).
+    if !arc_run.is_empty() {
+        let v_arc = arc_run
+            .iter()
+            .map(|&i| contour[i].v)
+            .fold(f64::NEG_INFINITY, f64::max);
+        steiner.retain(|&(_, sv)| sv <= v_arc - band_h + 1e-9 || sv >= v_arc + 1e-9);
+        steiner.retain(|&(su, sv)| cap_notch_point_in_polygon(su, sv, &outer_uv) || sv < v_arc);
+    }
+
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+        eprintln!(
+            "[capnotch] face={:?} contour={} cdt_contour={} arc_run={} steiner={} u=[{:.3},{:.3}] m_bands={} n_cols={}",
+            face.id,
+            contour.len(),
+            cdt_contour.len(),
+            arc_run.len(),
+            steiner.len(),
+            u_lo,
+            u_hi,
+            m_bands,
+            n_cols
+        );
+    }
+
+    // Triangulate the unrolled rectangle-with-notch (bottom boundary = offset row
+    // when the arc was detached).
+    let inner_uvs: Vec<Vec<(f64, f64)>> = Vec::new();
+    let (pts2d, triangles) = match super::curved_cdt::run_cdt(&outer_uv, &inner_uvs, &steiner) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // Resolve every CDT vertex to 3D: a boundary vertex (index < cdt_contour.len())
+    // takes its resolved 3D (verbatim cache for true boundary samples, `point_at`
+    // for the offset row); an interior Steiner vertex uses `surface.point_at`.
+    let orient_sign = face.orientation.sign();
+    let n_boundary = cdt_contour.len();
+    let vertex_base = mesh.vertices.len() as u32;
+    for (i, &(u, v)) in pts2d.iter().enumerate() {
+        let (position, nu, nv) = if i < n_boundary {
+            (cdt_contour[i].p, cdt_contour[i].u, cdt_contour[i].v)
+        } else {
+            match surface.point_at(u, v) {
+                Ok(p) => (p, u, v),
+                Err(_) => return false,
+            }
+        };
+        let normal = surface
+            .normal_at(nu, nv)
+            .map(|nn| nn * orient_sign)
+            .unwrap_or(Vector3::Z);
+        mesh.add_vertex(MeshVertex {
+            position,
+            normal,
+            uv: Some((nu, nv)),
+        });
+    }
+    // Wind each triangle outward against the stored (orientation-corrected)
+    // normals — the CDT's UV winding does not encode the 3D outward sense.
+    for tri in &triangles {
+        emit_outward_triangle(
+            mesh,
+            vertex_base + tri[0] as u32,
+            vertex_base + tri[1] as u32,
+            vertex_base + tri[2] as u32,
+        );
+    }
+
+    // Stitch the detached arc → offset row as a structured quad strip. The strip's
+    // TOP row is the full arc (corners + interior); its BOTTOM row is the offset
+    // row bracketed by the SAME two corners. The corners and the offset row are
+    // already CDT-contour vertices (so they weld to the side edges and the CDT
+    // region); their mesh indices are `vertex_base + their cdt_contour position`.
+    // Only the interior arc samples (verbatim cut-plane cache) are added fresh.
+    // Every strip triangle spans the cut plane down to the off-plane offset row, so
+    // none is flat.
+    if !arc_run.is_empty() {
+        // Map original contour index → cdt_contour position, for the vertices that
+        // survived into the CDT contour (everything except the arc interior). The
+        // offset row was spliced where the first interior arc vertex sat.
+        let interior: std::collections::HashSet<usize> =
+            arc_run[1..arc_run.len() - 1].iter().copied().collect();
+        let interior_first = arc_run[1];
+        let mut cdt_pos: HashMap<usize, usize> = HashMap::new();
+        let mut offset_start = 0usize;
+        {
+            let mut pos = 0usize;
+            for i in 0..contour.len() {
+                if i == interior_first {
+                    offset_start = pos;
+                    pos += offset_uv.len();
+                } else if interior.contains(&i) {
+                    continue;
+                } else {
+                    cdt_pos.insert(i, pos);
+                    pos += 1;
+                }
+            }
+        }
+        let corner_l = arc_run[0];
+        let corner_r = arc_run[arc_run.len() - 1];
+        let (Some(&cl_pos), Some(&cr_pos)) = (cdt_pos.get(&corner_l), cdt_pos.get(&corner_r))
+        else {
+            return true; // corners not in CDT contour (should not happen) — skip strip
+        };
+        let cl_idx = vertex_base + cl_pos as u32;
+        let cr_idx = vertex_base + cr_pos as u32;
+        // Bottom row: [corner_l, offset[0..], corner_r].
+        let mut bottom: Vec<u32> = Vec::with_capacity(arc_run.len());
+        bottom.push(cl_idx);
+        for k in 0..offset_uv.len() {
+            bottom.push(vertex_base + (offset_start + k) as u32);
+        }
+        bottom.push(cr_idx);
+        // Top row: [corner_l, fresh(interior arc samples), corner_r].
+        let mut top: Vec<u32> = Vec::with_capacity(arc_run.len());
+        top.push(cl_idx);
+        for &i in &arc_run[1..arc_run.len() - 1] {
+            let normal = surface
+                .normal_at(contour[i].u, contour[i].v)
+                .map(|nn| nn * orient_sign)
+                .unwrap_or(Vector3::Z);
+            top.push(mesh.add_vertex(MeshVertex {
+                position: contour[i].p,
+                normal,
+                uv: Some((contour[i].u, contour[i].v)),
+            }));
+        }
+        top.push(cr_idx);
+        // Stitch the equal-length rows as a quad strip.
+        if top.len() == bottom.len() {
+            for j in 0..top.len() - 1 {
+                emit_outward_triangle(mesh, top[j], top[j + 1], bottom[j + 1]);
+                emit_outward_triangle(mesh, top[j], bottom[j + 1], bottom[j]);
+            }
+        }
+    }
+
+    true
+}
+
+/// Signed area of a 2D polygon (shoelace). Sign encodes winding; magnitude is
+/// the area. Local to the cap-notch mesher's degeneracy guard.
+fn cap_notch_polygon_area(poly: &[(f64, f64)]) -> f64 {
+    let n = poly.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0;
+    let mut j = n - 1;
+    for i in 0..n {
+        a += (poly[j].0 + poly[i].0) * (poly[j].1 - poly[i].1);
+        j = i;
+    }
+    0.5 * a
+}
+
+/// Even-odd point-in-polygon for the cap-notch interior Steiner filter.
+fn cap_notch_point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > py) != (yj > py) {
+            let x_int = (xj - xi) * (py - yi) / (yj - yi) + xi;
+            if px < x_int {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Ray-cast point-in-polygon in 2D (even-odd rule). Local to the skin-lateral
 /// hole mesher; a Steiner grid point landing inside a pocket rim must be
 /// skipped so the CDT hole stays empty.
@@ -4654,6 +5221,94 @@ fn uv_point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
 /// Returns `false` (caller falls back to curved-CDT) on any structural surprise
 /// — wrong loop arity, missing seam edge, CDT failure — so this never silently
 /// drops the wall.
+///
+/// Choose the u at which the structured tessellation grid places its wrap (seam)
+/// column for a holed skin lateral. The grid brackets each hole in a contiguous
+/// column block inside `[0, 1)` and keeps the wrap cell structured, so the wrap
+/// column must avoid every hole's u-extent. Returns `0.0` (no shift, original
+/// layout) when no hole straddles the seam — the off-seam case. When a hole DOES
+/// straddle u=0, returns the centre of the WIDEST hole-free u-gap (mod 1), so the
+/// wrap column lands cleanly behind the pocket. `hole_uv_polys` u-coordinates are
+/// the per-rim unwrapped values (a seam-straddling rim therefore reaches below 0
+/// or above 1).
+fn compute_skin_seam_shift(hole_uv_polys: &[Vec<(f64, f64)>]) -> f64 {
+    // Collect each hole's occupied u-interval, wrapped into [0,1) as one or two
+    // sub-intervals (a straddling rim splits at the seam).
+    let mut occupied: Vec<(f64, f64)> = Vec::new();
+    let mut straddles = false;
+    for poly in hole_uv_polys {
+        let mut ulo = f64::INFINITY;
+        let mut uhi = f64::NEG_INFINITY;
+        for &(u, _) in poly {
+            ulo = ulo.min(u);
+            uhi = uhi.max(u);
+        }
+        if !ulo.is_finite() || !uhi.is_finite() {
+            continue;
+        }
+        if ulo < -1e-9 || uhi > 1.0 + 1e-9 {
+            straddles = true;
+        }
+        // Add a small margin so the gap search keeps clear of the rim.
+        let margin = 1e-3;
+        let lo = ulo - margin;
+        let hi = uhi + margin;
+        // Split into [0,1) pieces.
+        let mut push_wrapped = |a: f64, b: f64, occ: &mut Vec<(f64, f64)>| {
+            let a = a.rem_euclid(1.0);
+            let b = b.rem_euclid(1.0);
+            if a <= b {
+                occ.push((a, b));
+            } else {
+                occ.push((a, 1.0));
+                occ.push((0.0, b));
+            }
+        };
+        push_wrapped(lo, hi, &mut occupied);
+    }
+    // No hole crosses the seam → keep the original layout exactly.
+    if !straddles || occupied.is_empty() {
+        return 0.0;
+    }
+    // Find the widest gap on the circle [0,1) not covered by any occupied
+    // interval. Sort interval starts; sweep with coverage merge.
+    occupied.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Merge overlapping intervals.
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for &(a, b) in &occupied {
+        if let Some(last) = merged.last_mut() {
+            if a <= last.1 + 1e-9 {
+                last.1 = last.1.max(b);
+                continue;
+            }
+        }
+        merged.push((a, b));
+    }
+    if merged.is_empty() {
+        return 0.0;
+    }
+    // Gaps are between consecutive merged intervals, plus the wrap gap from the
+    // last interval's end back to the first's start (+1).
+    let mut best_gap = -1.0;
+    let mut best_mid = 0.0;
+    for w in merged.windows(2) {
+        let gap = w[1].0 - w[0].1;
+        if gap > best_gap {
+            best_gap = gap;
+            best_mid = 0.5 * (w[0].1 + w[1].0);
+        }
+    }
+    let wrap_gap = (merged[0].0 + 1.0) - merged[merged.len() - 1].1;
+    if wrap_gap > best_gap {
+        best_gap = wrap_gap;
+        best_mid = (0.5 * ((merged[merged.len() - 1].1) + (merged[0].0 + 1.0))).rem_euclid(1.0);
+    }
+    if best_gap <= 0.0 {
+        return 0.0;
+    }
+    best_mid
+}
+
 fn tessellate_nurbs_skin_lateral_with_holes(
     surface: &dyn Surface,
     face: &Face,
@@ -4781,7 +5436,15 @@ fn tessellate_nurbs_skin_lateral_with_holes(
     // opposite sides (they then dedup away, leaving the CDT to chord across the
     // gap → leaks). The ring is rotated so the seam point is index 0 (u=0); the
     // sequence is strictly increasing in u and spans [0, 1).
-    let ring_uv = |ring: &[Point3], seam_pt: Point3| -> Vec<(f64, Point3)> {
+    // Returns, per ring vertex: (chord_frac_layout_u, true_surface_u, 3D).
+    //  * chord_frac drives the CDT/grid LAYOUT (clean, monotone, seam-anchored).
+    //  * true_surface_u is the actual NURBS u-parameter (recovered by inverting
+    //    the cached 3D point), used to SAMPLE interior rows so they land at the
+    //    same angular position as the rings. The skin's u-parameterisation is
+    //    NOT chord-proportional (a chord fraction of 0.53 can map to surface-u
+    //    on the OPPOSITE side of the barrel), so sampling interiors with the
+    //    chord fraction folded the near-ring facets ~90° off the true normal.
+    let ring_uv = |ring: &[Point3], seam_pt: Point3| -> Vec<(f64, f64, Point3)> {
         if ring.len() < 3 {
             return Vec::new();
         }
@@ -4807,14 +5470,42 @@ fn tessellate_nurbs_skin_lateral_with_holes(
         if closing <= 1e-12 {
             return Vec::new();
         }
+        // Recover the true surface u for each vertex, monotonically unwrapped
+        // forward from the seam (true_u[0] = 0) so it stays in [0, 1).
+        let mut last_u: Option<f64> = None;
         rotated
             .iter()
             .zip(cum.iter())
-            .map(|(p, c)| (c / closing, *p))
+            .map(|(p, c)| {
+                let cf = c / closing;
+                let true_u = match surface.closest_point(p, tol) {
+                    Ok((mut su, _)) => {
+                        if let Some(pu) = last_u {
+                            while su - pu > 0.5 {
+                                su -= 1.0;
+                            }
+                            while su - pu < -0.5 {
+                                su += 1.0;
+                            }
+                        } else {
+                            // First (seam) vertex: pin to 0.
+                            su = 0.0;
+                        }
+                        last_u = Some(su);
+                        su
+                    }
+                    Err(_) => {
+                        let f = cf;
+                        last_u = Some(f);
+                        f
+                    }
+                };
+                (cf, true_u, *p)
+            })
             .collect()
     };
-    let bottom_uv = ring_uv(bottom_ring, seam_bottom);
-    let top_uv = ring_uv(top_ring, seam_top);
+    let mut bottom_uv = ring_uv(bottom_ring, seam_bottom);
+    let mut top_uv = ring_uv(top_ring, seam_top);
     if bottom_uv.len() < 3 || top_uv.len() < 3 {
         return false;
     }
@@ -4822,41 +5513,15 @@ fn tessellate_nurbs_skin_lateral_with_holes(
     if bottom_uv[0].0 > 1e-9 || top_uv[0].0 > 1e-9 {
         return false;
     }
-    let seam_interior: Vec<Point3> = seam_up[1..seam_up.len() - 1].to_vec();
+    let mut seam_bottom = seam_bottom;
+    let mut seam_top = seam_top;
+    let mut seam_interior: Vec<Point3> = seam_up[1..seam_up.len() - 1].to_vec();
     let ns = seam_interior.len();
 
-    let mut outer: Vec<usize> = Vec::new();
-    // Bottom ring, ascending u from 0 (seam) through (0,1).
-    for &(u, p) in &bottom_uv {
-        outer.push(push(u, 0.0, Some(p), &mut uv, &mut pos3d));
-    }
-    // Bottom-right corner (u=1, v=0) = seam bottom (duplicated 3D → welds).
-    outer.push(push(1.0, 0.0, Some(seam_bottom), &mut uv, &mut pos3d));
-    // Right seam column, ascending v.
-    for (k, p) in seam_interior.iter().enumerate() {
-        let v = (k + 1) as f64 / (ns + 1) as f64;
-        outer.push(push(1.0, v, Some(*p), &mut uv, &mut pos3d));
-    }
-    // Top-right corner (u=1, v=1) = seam top.
-    outer.push(push(1.0, 1.0, Some(seam_top), &mut uv, &mut pos3d));
-    // Top ring, descending u from (0,1) toward u=0 (seam). Skip the u=0 seam
-    // entry here — the left column closes back to it.
-    for &(u, p) in top_uv.iter().rev() {
-        if u <= 1e-9 {
-            continue;
-        }
-        outer.push(push(u, 1.0, Some(p), &mut uv, &mut pos3d));
-    }
-    // Top-left corner (u=0, v=1) = seam top.
-    outer.push(push(0.0, 1.0, Some(seam_top), &mut uv, &mut pos3d));
-    // Left seam column, descending v (back down to the bottom seam at u=0).
-    for k in 0..ns {
-        let kk = ns - 1 - k;
-        let v = (kk + 1) as f64 / (ns + 1) as f64;
-        outer.push(push(0.0, v, Some(seam_interior[kk]), &mut uv, &mut pos3d));
-    }
-
-    // ---- Hole contours: project each inner-loop rim's cache 3D to UV. ----
+    // ---- Hole contours: project each inner-loop rim's cache 3D to UV. The
+    //      rim vertices carry their VERBATIM cached 3D so they weld bit-exactly
+    //      to the adjacent pocket-wall faces; the structured grid below consumes
+    //      these (`uv`/`pos3d`) as the inner-contour anchors of the hole band. ----
     let mut hole_contours: Vec<Vec<usize>> = Vec::new();
     let mut hole_uv_polys: Vec<Vec<(f64, f64)>> = Vec::new();
     for &inner_id in &face.inner_loops {
@@ -4905,8 +5570,110 @@ fn tessellate_nurbs_skin_lateral_with_holes(
         hole_uv_polys.push(poly);
     }
 
-    // ---- Interior Steiner grid (skip points inside any hole or on the
-    //      seam columns, which the outer contour already supplies). ----
+    // SEAM-STRADDLING pocket rebase (task #17 watertight). The structured
+    // u-column grid below brackets each hole in a CONTIGUOUS column block inside
+    // [0, 1] and keeps the wrap (seam) cell structured — valid only while every
+    // pocket rim stays clear of the u=0 seam. A pocket placed ON the seam (the
+    // +X seam wall) has a rim whose unwrapped u-span crosses 0 (e.g.
+    // [-0.04, 0.04]), so a [0,1] column block cannot bracket its negative-u half
+    // and the wall tessellates with a crack along the seam.
+    //
+    // The lateral is PERIODIC in u, so the tessellation seam (the doubled wrap
+    // column) may sit at ANY u — it need not coincide with the B-Rep seam edge.
+    // Shift the whole u-layout by `u_shift` so the wrap column lands in the
+    // widest hole-free gap (the back of the barrel, opposite the pocket). Every
+    // u-coordinate (rings, holes, parent rim samples) moves to the rebased frame
+    // `(u - u_shift) mod 1`; the seam column then samples
+    // `surface.point_at(u_shift, v)` — a regular interior point, equally
+    // watertight (the cells either side share it). Off-seam pockets get
+    // `u_shift == 0` (the gap is already at u=0) and keep the layout bit-for-bit.
+    let u_shift = compute_skin_seam_shift(&hole_uv_polys);
+    if u_shift != 0.0 {
+        let rebase = |u: f64| -> f64 { (u - u_shift).rem_euclid(1.0) };
+        // Re-unwrap a rebased u-sequence forward from its first element so a
+        // contiguous rim/ring never splits across the new wrap boundary.
+        let reunwrap = |seq: &mut [f64]| {
+            let mut last: Option<f64> = None;
+            for u in seq.iter_mut() {
+                let mut r = rebase(*u);
+                if let Some(pu) = last {
+                    while r - pu > 0.5 {
+                        r -= 1.0;
+                    }
+                    while r - pu < -0.5 {
+                        r += 1.0;
+                    }
+                }
+                last = Some(r);
+                *u = r;
+            }
+        };
+        // Rebase ring layout u and true-surface u. Both fields shift by the same
+        // amount; the rings are sorted into ascending u after rebase below.
+        for entry in bottom_uv.iter_mut().chain(top_uv.iter_mut()) {
+            entry.0 = rebase(entry.0); // chord-fraction layout u
+            entry.1 = rebase(entry.1); // true surface u
+        }
+        bottom_uv.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        top_uv.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Rebase each hole rim poly and the matching parent-uv entries (the CDT
+        // window reads `uv` for the rim vertices), keeping the rim contiguous via
+        // re-unwrap. `hole_contours[h]` holds the parent-`uv` index per rim
+        // vertex, in the same order as `hole_uv_polys[h]`.
+        for (poly, contour) in hole_uv_polys.iter_mut().zip(hole_contours.iter()) {
+            let mut us: Vec<f64> = poly.iter().map(|&(u, _)| u).collect();
+            reunwrap(&mut us);
+            for (k, entry) in poly.iter_mut().enumerate() {
+                entry.0 = us[k];
+                if let Some(&pidx) = contour.get(k) {
+                    if let Some(slot) = uv.get_mut(pidx) {
+                        slot.0 = us[k];
+                    }
+                }
+            }
+        }
+        // The wrap (seam) column now sits at rebased u=0 (original u = u_shift).
+        // Its v=0 / v=1 rows MUST be a CACHED ring sample (verbatim 3D), not a
+        // fresh `point_at(u_shift, ·)`: the bottom/top cap disc faces tessellate
+        // their rim from the SAME cached ring edge, so only a shared cached point
+        // welds the lateral's seam column to the cap. Pick the cached ring vertex
+        // whose rebased true-u is nearest the wrap boundary (0 ≡ 1) — it lies in
+        // the hole-free gap, so it is a clean, pocket-free seam anchor.
+        let nearest_ring_at_wrap = |ring: &[(f64, f64, Point3)]| -> Option<Point3> {
+            ring.iter()
+                .min_by(|a, b| {
+                    // Circular distance of the true-u to the wrap boundary {0,1}.
+                    let da = a.1.rem_euclid(1.0).min(1.0 - a.1.rem_euclid(1.0));
+                    let db = b.1.rem_euclid(1.0).min(1.0 - b.1.rem_euclid(1.0));
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|&(_, _, p)| p)
+        };
+        if let Some(p) = nearest_ring_at_wrap(&bottom_uv) {
+            seam_bottom = p;
+        }
+        if let Some(p) = nearest_ring_at_wrap(&top_uv) {
+            seam_top = p;
+        }
+        if ns > 0 {
+            let mut new_interior = Vec::with_capacity(ns);
+            for idx in 0..ns {
+                let v = (idx + 1) as f64 / (ns + 1) as f64;
+                match surface.point_at(u_shift, v) {
+                    Ok(p) => new_interior.push(p),
+                    Err(_) => {
+                        new_interior.clear();
+                        break;
+                    }
+                }
+            }
+            if new_interior.len() == ns {
+                seam_interior = new_interior;
+            }
+        }
+    }
+
+    // ---- v-resolution (number of horizontal bands). ----
     let m_bands = {
         let probe = 32;
         let mut prev = p00;
@@ -4920,87 +5687,510 @@ fn tessellate_nurbs_skin_lateral_with_holes(
         }
         linear_steps_for_quality(length, params).max(2)
     };
-    let n_u = bottom_uv.len().max(top_uv.len()).max(8);
-    for j in 1..m_bands {
-        let v = j as f64 / m_bands as f64;
-        for i in 1..n_u {
-            let u = i as f64 / n_u as f64;
-            let inside_hole = hole_uv_polys
-                .iter()
-                .any(|poly| uv_point_in_polygon(u, v, poly));
-            if inside_hole {
+
+    // Structured columns, indexed by the TRUE NURBS surface u (recovered from the
+    // cached ring vertices, monotonically unwrapped from the seam). Sampling and
+    // layout share this single u-space, so interior rows (`point_at(true_u, v)`)
+    // land at the rings' angular position and the hole rim (also recovered via
+    // `closest_point` → true u) lies in the SAME space — eliminating the
+    // chord-fraction/surface-u mismatch that folded near-ring facets ~90° off
+    // the true normal. Each column keeps the cached ring 3D (`bot`/`top`) so the
+    // v=0/v=1 rows weld bit-exactly to the caps. The seam column (u=0) is added
+    // by `build_row`; the strip wraps from the last column back to it.
+    struct SkinCol {
+        u: f64,
+        bot: Option<Point3>,
+        top: Option<Point3>,
+    }
+    let mut columns: Vec<SkinCol> = Vec::new();
+    {
+        let mut merged: Vec<(f64, Option<Point3>, Option<Point3>)> = Vec::new();
+        for &(_, tu, p) in &bottom_uv {
+            if tu <= 1e-6 || tu >= 1.0 - 1e-6 {
                 continue;
             }
-            push(u, v, None, &mut uv, &mut pos3d);
+            merged.push((tu, Some(p), None));
+        }
+        for &(_, tu, p) in &top_uv {
+            if tu <= 1e-6 || tu >= 1.0 - 1e-6 {
+                continue;
+            }
+            if let Some(slot) = merged.iter_mut().find(|m| (m.0 - tu).abs() <= 1e-6) {
+                slot.2 = Some(p);
+            } else {
+                merged.push((tu, None, Some(p)));
+            }
+        }
+        merged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        merged.dedup_by(|a, b| (a.0 - b.0).abs() <= 1e-6);
+        for (u, bot, top) in merged {
+            columns.push(SkinCol { u, bot, top });
+        }
+    }
+    if columns.is_empty() {
+        let n_u = bottom_uv.len().max(top_uv.len()).max(8);
+        for i in 1..n_u {
+            let u = i as f64 / n_u as f64;
+            columns.push(SkinCol {
+                u,
+                bot: None,
+                top: None,
+            });
+        }
+    }
+    let col_us: Vec<f64> = columns.iter().map(|c| c.u).collect();
+
+    // Hole UV bounding boxes (v-extent drives the band split; u-extent the
+    // per-cell skip). A tiny margin keeps a cell that merely grazes a rim in
+    // the CDT region rather than the structured region.
+    const HOLE_MARGIN: f64 = 1e-6;
+    let hole_vbox: Vec<(f64, f64)> = hole_uv_polys
+        .iter()
+        .map(|poly| {
+            let mut vlo = f64::INFINITY;
+            let mut vhi = f64::NEG_INFINITY;
+            for &(_, v) in poly {
+                vlo = vlo.min(v);
+                vhi = vhi.max(v);
+            }
+            (vlo - HOLE_MARGIN, vhi + HOLE_MARGIN)
+        })
+        .collect();
+
+    // The structured grid replaces the previous single global CDT, which fed
+    // the third-party `cdt` crate a ~12k-point quasi-regular lattice whose
+    // exactly-collinear ring rows it triangulated into long sliver fans — flat
+    // in UV but, because the barrel curves most at its crest, folded ~90° off
+    // the true surface normal at v≈0/v≈1 (the cut-region mesh-quality defect:
+    // worst_aspect≈60, max_normal_dev≈90°). Here every band whose v-extent is
+    // clear of all hole rims is emitted as column-aligned quads (two triangles
+    // per cell), which are watertight and faithful by construction; only the
+    // thin band(s) the hole rim actually crosses fall to a LOCAL CDT, where a
+    // residual sliver spans at most one band height (small chord → small fold).
+    let orient_sign = face.orientation.sign();
+
+    // Build a structured row of mesh-vertex indices at the given v over the
+    // wrap columns [0 (seam), col_us..., 1 (seam)]. The two seam columns share
+    // the SAME cached seam 3D so the periodic seam welds shut. v=0/v=1 rows take
+    // their 3D verbatim from the cached ring at the col u (exact: col_us derives
+    // from the ring vertices); interior rows use `point_at`. `ring` (when given)
+    // is the sorted (u, Point3) ring used to look the 3D up.
+    let seam_at = |v: f64| -> Point3 {
+        if v <= 1e-9 {
+            seam_bottom
+        } else if v >= 1.0 - 1e-9 {
+            seam_top
+        } else {
+            // Interior seam point: nearest cached seam-column sample.
+            let idx = ((v * (ns + 1) as f64).round() as usize).clamp(1, ns) - 1;
+            seam_interior[idx]
+        }
+    };
+    // A structured row is PERIODIC: one seam column at u=0 (no duplicate at
+    // u=1). The strip wraps — the last cell joins the last column back to the
+    // seam column. A single wrapping seam column tessellates the seam exactly as
+    // the (clean) hole-free `stitch_closed_rings` path does. v=0/v=1 rows take
+    // the cached ring 3D verbatim (welds to the caps); interior rows sample
+    // `point_at(true_u, v)` so they line up with the rings.
+    // Map a LAYOUT u (rebased frame, [0,1)) to the ORIGINAL surface u for
+    // sampling/normals. `u_shift == 0` makes this the identity, so the off-seam
+    // fast path is bit-for-bit unchanged.
+    let to_surface_u = |u: f64| -> f64 { (u + u_shift).rem_euclid(1.0) };
+    let build_row = |mesh: &mut TriangleMesh, v: f64| -> Vec<u32> {
+        let mut row: Vec<u32> = Vec::with_capacity(columns.len() + 1);
+        let mut add = |p: Point3, u: f64, mesh: &mut TriangleMesh| {
+            let normal = surface
+                .normal_at(to_surface_u(u), v)
+                .map(|nn| nn * orient_sign)
+                .unwrap_or(Vector3::Z);
+            row.push(mesh.add_vertex(MeshVertex {
+                position: p,
+                normal,
+                uv: None,
+            }));
+        };
+        // Seam column (rebased u=0; 3D supplied by `seam_at`, already at u_shift).
+        add(seam_at(v), 0.0, mesh);
+        for col in &columns {
+            let p = if v <= 1e-9 {
+                col.bot
+            } else if v >= 1.0 - 1e-9 {
+                col.top
+            } else {
+                None
+            };
+            let p = match p.or_else(|| surface.point_at(to_surface_u(col.u), v).ok()) {
+                Some(p) => p,
+                None => seam_at(v),
+            };
+            add(p, col.u, mesh);
+        }
+        row
+    };
+
+    // Column lattice (u-coordinates): seam column at u=0 then col_us. The wrap
+    // cell (index col_us.len()) spans grid_us.last()..1.0 back to column 0.
+    let grid_us: Vec<f64> = std::iter::once(0.0).chain(col_us.iter().copied()).collect();
+    let ncols = grid_us.len();
+    // Per-hole u-extent in grid-column indices: the CDT only owns the smallest
+    // contiguous block of cells [c_lo, c_hi) that fully brackets the hole's u
+    // span (plus one cell of margin each side). Everything else in the hole's
+    // v-band stays structured quads. A pocket rim never reaches the seam column,
+    // so c_lo ≥ 0 and c_hi ≤ ncols-1 (the wrap cell is always structured).
+    let hole_ucols: Vec<(usize, usize)> = hole_uv_polys
+        .iter()
+        .map(|poly| {
+            let (mut ulo, mut uhi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &(u, _) in poly {
+                ulo = ulo.min(u);
+                uhi = uhi.max(u);
+            }
+            let mut c_lo = 0usize;
+            while c_lo + 1 < ncols && grid_us[c_lo + 1] <= ulo - HOLE_MARGIN {
+                c_lo += 1;
+            }
+            let mut c_hi = ncols - 1;
+            while c_hi > 0 && grid_us[c_hi - 1] >= uhi + HOLE_MARGIN {
+                c_hi -= 1;
+            }
+            (c_lo, c_hi.max(c_lo + 1).min(ncols - 1))
+        })
+        .collect();
+    // A grid cell `c` (joining column c to column c+1) is owned by a hole CDT
+    // region if it lies in that hole's column block AND v-band.
+    let cell_owned_by_cdt = |c: usize, v_a: f64, v_b: f64| -> bool {
+        hole_vbox
+            .iter()
+            .zip(hole_ucols.iter())
+            .any(|(&(hlo, hhi), &(c_lo, c_hi))| v_b >= hlo && v_a <= hhi && c >= c_lo && c < c_hi)
+    };
+
+    // Emit the structured quad strip between two periodic rows, skipping cells
+    // owned by a hole CDT region. Cell `c` joins column c to column (c+1) mod
+    // ncols; the final cell (c = ncols-1) is the seam wrap.
+    let emit_quad_strip = |mesh: &mut TriangleMesh, lo: &[u32], hi: &[u32], v_a: f64, v_b: f64| {
+        for c in 0..ncols {
+            if cell_owned_by_cdt(c, v_a, v_b) {
+                continue;
+            }
+            let cn = (c + 1) % ncols;
+            let (a, b, cc, d) = (lo[c], lo[cn], hi[cn], hi[c]);
+            emit_outward_triangle(mesh, a, b, cc);
+            emit_outward_triangle(mesh, a, cc, d);
+        }
+    };
+
+    // Pre-build every structured row.
+    let v_of = |j: usize| j as f64 / m_bands as f64;
+    let mut rows: Vec<Vec<u32>> = Vec::with_capacity(m_bands + 1);
+    for j in 0..=m_bands {
+        rows.push(build_row(mesh, v_of(j)));
+    }
+
+    // Structured quads everywhere (skipping hole-owned cells).
+    for j in 0..m_bands {
+        emit_quad_strip(mesh, &rows[j], &rows[j + 1], v_of(j), v_of(j + 1));
+    }
+
+    // Local CDT for each hole's small u×v window. The window's bottom/top rows
+    // sample the SAME grid columns as the structured strips (so the seam is the
+    // shared grid columns), and its left/right boundary columns are exactly the
+    // structured grid columns grid_us[c_lo] / grid_us[c_hi] — the CDT vertices
+    // there coincide bit-exactly with the structured rows' vertices, so the two
+    // regions weld. The hole rim is carved as an inner contour (verbatim cached
+    // 3D). A residual CDT sliver now spans at most one band and a few columns,
+    // far from the curved crest, so it cannot fold off-surface.
+    let mut cdt_ok = true;
+    for (hi_idx, &(vlo, vhi)) in hole_vbox.iter().enumerate() {
+        // Snap the hole's v-band to the band grid (inclusive of the bands it
+        // touches) so the window edges coincide with structured rows.
+        let mut jlo = 0usize;
+        while jlo + 1 <= m_bands && v_of(jlo + 1) <= vlo {
+            jlo += 1;
+        }
+        let mut jhi = m_bands;
+        while jhi > 0 && v_of(jhi - 1) >= vhi {
+            jhi -= 1;
+        }
+        if jhi <= jlo {
+            continue;
+        }
+        let (c_lo, c_hi) = hole_ucols[hi_idx];
+        if !tessellate_skin_hole_window(
+            surface,
+            &grid_us,
+            c_lo,
+            c_hi,
+            v_of(jlo),
+            v_of(jhi),
+            &rows,
+            jlo,
+            jhi,
+            &hole_contours[hi_idx],
+            &uv,
+            &pos3d,
+            orient_sign,
+            u_shift,
+            mesh,
+        ) {
+            cdt_ok = false;
+            break;
+        }
+    }
+    cdt_ok
+}
+
+/// Tessellate one hole's small u×v window in a holed NURBS skin lateral: the
+/// sub-rectangle `[grid_us[c_lo], grid_us[c_hi]] × [v_lo, v_hi]` that brackets a
+/// single pocket rim, with the rim carved as an inner CDT contour.
+///
+/// The window's four boundaries REUSE the structured grid's existing mesh-vertex
+/// indices (`rows[j][c]` for the band rows `jlo..=jhi`, columns `c_lo..=c_hi`),
+/// so the CDT patch welds to the surrounding structured quads bit-exactly — no
+/// re-created boundary vertex, no T-junction. Only the interior Steiner points
+/// and the hole rim vertices are new. The rim is taken VERBATIM from the cached
+/// rim samples (`hole_contour` indexes into `parent_uv`/`parent_pos`), so it
+/// welds to the adjacent pocket-wall face. Returns `false` (caller aborts the
+/// holed path → curved-CDT fallback) on any CDT failure, so the wall is never
+/// silently dropped.
+#[allow(clippy::too_many_arguments)]
+fn tessellate_skin_hole_window(
+    surface: &dyn Surface,
+    grid_us: &[f64],
+    c_lo: usize,
+    c_hi: usize,
+    v_lo: f64,
+    v_hi: f64,
+    rows: &[Vec<u32>],
+    jlo: usize,
+    jhi: usize,
+    hole_contour: &[usize],
+    parent_uv: &[(f64, f64)],
+    parent_pos: &[Option<Point3>],
+    orient_sign: f64,
+    u_shift: f64,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    if v_hi <= v_lo || c_hi <= c_lo || jhi <= jlo || hole_contour.len() < 3 {
+        return false;
+    }
+    // Layout-u (rebased frame) → original surface u for sampling/normals. Identity
+    // when `u_shift == 0` (off-seam pockets), so their mesh is unchanged.
+    let to_surface_u = |u: f64| -> f64 { (u + u_shift).rem_euclid(1.0) };
+    // Local CDT point set. Each entry is (u, v) plus a RESOLUTION: an already-
+    // existing mesh-vertex index (boundary, welds to the structured grid) OR a
+    // verbatim 3D position (hole rim) OR `None` (interior Steiner, filled by
+    // `point_at`).
+    enum Loc {
+        Vid(u32),
+        Pos(Point3),
+        Interior,
+    }
+    let mut luv: Vec<(f64, f64)> = Vec::new();
+    let mut lloc: Vec<Loc> = Vec::new();
+    let mut lpush = |u: f64, v: f64, loc: Loc| -> usize {
+        let i = luv.len();
+        luv.push((u, v));
+        lloc.push(loc);
+        i
+    };
+
+    // Outer contour CCW in (u, v): bottom edge (columns c_lo→c_hi at row jlo),
+    // right edge (rows jlo→jhi at column c_hi), top edge (c_hi→c_lo at jhi),
+    // left edge (jhi→jlo at column c_lo). Each vertex reuses the structured
+    // grid's mesh-vertex index, so the patch boundary IS the structured grid.
+    let mut outer: Vec<usize> = Vec::new();
+    for c in c_lo..=c_hi {
+        outer.push(lpush(grid_us[c], v_lo, Loc::Vid(rows[jlo][c])));
+    }
+    for j in (jlo + 1)..jhi {
+        outer.push(lpush(
+            grid_us[c_hi],
+            v_of_row(j, jlo, jhi, v_lo, v_hi),
+            Loc::Vid(rows[j][c_hi]),
+        ));
+    }
+    for c in (c_lo..=c_hi).rev() {
+        outer.push(lpush(grid_us[c], v_hi, Loc::Vid(rows[jhi][c])));
+    }
+    for j in ((jlo + 1)..jhi).rev() {
+        outer.push(lpush(
+            grid_us[c_lo],
+            v_of_row(j, jlo, jhi, v_lo, v_hi),
+            Loc::Vid(rows[j][c_lo]),
+        ));
+    }
+
+    // Hole rim as the inner contour (verbatim cached 3D from the parent).
+    let mut rim: Vec<usize> = Vec::with_capacity(hole_contour.len());
+    let mut rim_poly: Vec<(f64, f64)> = Vec::with_capacity(hole_contour.len());
+    for &k in hole_contour {
+        let (u, v) = parent_uv[k];
+        let loc = match parent_pos[k] {
+            Some(p) => Loc::Pos(p),
+            None => Loc::Interior,
+        };
+        rim.push(lpush(u, v, loc));
+        rim_poly.push((u, v));
+    }
+
+    // A box pocket rim is a rectangle of STRAIGHT edges, each collinear in 3D
+    // and in UV. A CDT triangulates a region bounded by a dense collinear edge
+    // into in-plane slivers (the edge fans to a single distant opposite vertex);
+    // on the vertical wall those slivers lie in the rim-edge plane and read
+    // ~90° off the true (radial) surface normal. To break every rim edge's fan,
+    // seed a HALO of Steiner anchors just OUTSIDE the rim — one per rim vertex,
+    // offset outward (away from the rim centroid) by a fraction of the local rim
+    // segment length. Each rim edge then triangulates against its two adjacent
+    // halo points (a near-equilateral quad split), not a remote interior vertex,
+    // so no in-plane sliver survives.
+    let rim_centroid = {
+        let (mut su, mut sv) = (0.0, 0.0);
+        for &(u, v) in &rim_poly {
+            su += u;
+            sv += v;
+        }
+        let n = rim_poly.len().max(1) as f64;
+        (su / n, sv / n)
+    };
+    // Halo offset: a fraction of the window height, the depth at which a halo
+    // anchor sits clearly OUT from the rim. Halo points carry their own UV
+    // distance from the rim, so the CDT triangulates each rim edge against an
+    // anchor with genuine perpendicular depth — no in-plane sliver.
+    let halo_off = (0.18 * (v_hi - v_lo)).max(1e-4);
+    let nrim = rim_poly.len();
+    // Per-EDGE outward-perpendicular halo midpoints break the collinear fan that
+    // a per-vertex (centroid-radial) halo misses on a long straight rim edge.
+    let mut halo: Vec<(f64, f64)> = Vec::with_capacity(2 * nrim);
+    for i in 0..nrim {
+        let (u0, v0) = rim_poly[i];
+        let (u1, v1) = rim_poly[(i + 1) % nrim];
+        let (mu, mv) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+        // Edge direction → outward perpendicular (rotate ±90°, pick the side
+        // away from the rim centroid).
+        let (ex, ey) = (u1 - u0, v1 - v0);
+        let em = (ex * ex + ey * ey).sqrt();
+        let (px, py) = if em > 1e-12 {
+            (-ey / em, ex / em)
+        } else {
+            let (cx, cy) = (mu - rim_centroid.0, mv - rim_centroid.1);
+            let cm = (cx * cx + cy * cy).sqrt().max(1e-12);
+            (cx / cm, cy / cm)
+        };
+        let outward = (mu - rim_centroid.0) * px + (mv - rim_centroid.1) * py;
+        let sign = if outward >= 0.0 { 1.0 } else { -1.0 };
+        halo.push((mu + sign * px * halo_off, mv + sign * py * halo_off));
+    }
+    for &(hu, hv) in &halo {
+        if uv_point_in_polygon(hu, hv, &rim_poly) {
+            continue;
+        }
+        if hu <= grid_us[c_lo] || hu >= grid_us[c_hi] || hv <= v_lo || hv >= v_hi {
+            continue;
+        }
+        lpush(hu, hv, Loc::Interior);
+    }
+
+    // Background interior lattice within the window (finer than one band in v so
+    // any residual gap between the halo and the window boundary is well-shaped).
+    // Skip points within the halo offset of the rim so they do not crowd the
+    // halo anchors into competing slivers.
+    let sub = 4usize;
+    let n_sub = (jhi - jlo) * sub;
+    let near_rim = |u: f64, v: f64| -> bool {
+        rim_poly
+            .iter()
+            .any(|&(ru, rv)| (ru - u).abs() < 0.6 * halo_off && (rv - v).abs() < 0.6 * halo_off)
+    };
+    for jj in 1..n_sub {
+        let v = v_lo + (v_hi - v_lo) * jj as f64 / n_sub as f64;
+        for c in (c_lo + 1)..c_hi {
+            let u = grid_us[c];
+            if uv_point_in_polygon(u, v, &rim_poly) || near_rim(u, v) {
+                continue;
+            }
+            lpush(u, v, Loc::Interior);
         }
     }
 
-    // ---- CDT in UV with the hole contours. ----
-    let mut contours: Vec<Vec<usize>> = Vec::with_capacity(1 + hole_contours.len());
-    let outer_closed: Vec<usize> = outer
-        .iter()
-        .copied()
-        .chain(std::iter::once(outer[0]))
-        .collect();
-    contours.push(outer_closed);
-    for hc in &hole_contours {
-        let closed: Vec<usize> = hc.iter().copied().chain(std::iter::once(hc[0])).collect();
-        contours.push(closed);
-    }
+    let mut contours: Vec<Vec<usize>> = Vec::with_capacity(2);
+    contours.push(
+        outer
+            .iter()
+            .copied()
+            .chain(std::iter::once(outer[0]))
+            .collect(),
+    );
+    contours.push(rim.iter().copied().chain(std::iter::once(rim[0])).collect());
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cdt::triangulate_contours(&uv, &contours)
+        cdt::triangulate_contours(&luv, &contours)
     }));
     let tris = match outcome {
-        Ok(Ok(tris)) => tris,
+        Ok(Ok(t)) => t,
         _ => return false,
     };
     if tris.is_empty() {
         return false;
     }
 
-    // ---- Map each UV vertex to 3D (cached boundary / point_at interior) and
-    //      emit. ----
-    let orient_sign = face.orientation.sign();
-    let mut vidx: Vec<Option<u32>> = vec![None; uv.len()];
-    let mut resolve = |k: usize,
-                       uv: &[(f64, f64)],
-                       pos3d: &[Option<Point3>],
-                       mesh: &mut TriangleMesh,
-                       vidx: &mut Vec<Option<u32>>|
-     -> Option<u32> {
-        if let Some(v) = vidx[k] {
-            return Some(v);
-        }
-        let (u, vv) = uv[k];
-        let p = match pos3d[k] {
-            Some(p) => p,
-            None => surface.point_at(u.rem_euclid(1.0), vv).ok()?,
+    let mut vidx: Vec<Option<u32>> = vec![None; luv.len()];
+    let mut resolve =
+        |k: usize, mesh: &mut TriangleMesh, vidx: &mut Vec<Option<u32>>| -> Option<u32> {
+            if let Some(v) = vidx[k] {
+                return Some(v);
+            }
+            let (u, vv) = luv[k];
+            let id = match lloc[k] {
+                Loc::Vid(id) => id,
+                Loc::Pos(p) => {
+                    let normal = surface
+                        .normal_at(to_surface_u(u), vv)
+                        .map(|nn| nn * orient_sign)
+                        .unwrap_or(Vector3::Z);
+                    mesh.add_vertex(MeshVertex {
+                        position: p,
+                        normal,
+                        uv: None,
+                    })
+                }
+                Loc::Interior => {
+                    let p = surface.point_at(to_surface_u(u), vv).ok()?;
+                    let normal = surface
+                        .normal_at(to_surface_u(u), vv)
+                        .map(|nn| nn * orient_sign)
+                        .unwrap_or(Vector3::Z);
+                    mesh.add_vertex(MeshVertex {
+                        position: p,
+                        normal,
+                        uv: None,
+                    })
+                }
+            };
+            vidx[k] = Some(id);
+            Some(id)
         };
-        let normal = surface
-            .normal_at(u.rem_euclid(1.0), vv)
-            .map(|nn| nn * orient_sign)
-            .unwrap_or(Vector3::Z);
-        let id = mesh.add_vertex(MeshVertex {
-            position: p,
-            normal,
-            uv: None,
-        });
-        vidx[k] = Some(id);
-        Some(id)
-    };
-
     for (a, b, c) in tris {
         let (Some(ia), Some(ib), Some(ic)) = (
-            resolve(a, &uv, &pos3d, mesh, &mut vidx),
-            resolve(b, &uv, &pos3d, mesh, &mut vidx),
-            resolve(c, &uv, &pos3d, mesh, &mut vidx),
+            resolve(a, mesh, &mut vidx),
+            resolve(b, mesh, &mut vidx),
+            resolve(c, mesh, &mut vidx),
         ) else {
             return false;
         };
         emit_outward_triangle(mesh, ia, ib, ic);
     }
     true
+}
+
+/// The v-coordinate of structured band-row `j` within a window spanning rows
+/// `[jlo, jhi]` mapped to `[v_lo, v_hi]` — linear in the row index, matching the
+/// `v_of` lattice the structured rows were built on.
+fn v_of_row(j: usize, jlo: usize, jhi: usize, v_lo: f64, v_hi: f64) -> f64 {
+    if jhi == jlo {
+        return v_lo;
+    }
+    v_lo + (v_hi - v_lo) * (j - jlo) as f64 / (jhi - jlo) as f64
 }
 
 /// Triangulate the strip between two CLOSED rings of mesh-vertex indices that are
