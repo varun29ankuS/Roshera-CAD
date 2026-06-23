@@ -161,13 +161,70 @@ pub fn revolve_profile(
     })
 }
 
+/// Orthonormal `(â, ê1, ê2)` frame of a revolution axis, with `ê1` the canonical
+/// radial reference direction at which a `(r, z)` meridian's `r` is laid out.
+///
+/// `ê1` follows the SAME convention as [`crate::primitives::curve::Arc::new`]'s
+/// `x_axis` (±Z→+X, ±X→+Y, ±Y→+Z, otherwise `axis.perpendicular()`), so that:
+///   * the default axis (`+Z`) gives `ê1 = +X` — a `(r, z)` point lifts to the
+///     world `(r, 0, z)` half-plane, IDENTICAL to the original behaviour (no
+///     regression for the overwhelmingly common default-axis case), and
+///   * the radial reference lines up with the seam direction the analytic-band
+///     and meridian-arc paths already anchor to (`Circle::x_axis()`), so the
+///     lifted profile, its ring seams, and the revolved surface all agree.
+///
+/// `ê2 = â × ê1` completes a right-handed frame. The result is the foundation of
+/// the fix for a NON-ORIGIN / NON-Z axis: `(r, z)` is (radius-from-axis,
+/// height-along-axis) in THIS frame, never world coordinates — so `axis_origin`
+/// translates the whole solid and `r` stays a pure radius, instead of the axis
+/// offset leaking into the radius/bbox.
+fn axis_frame(axis_direction: Vector3) -> OperationResult<(Vector3, Vector3, Vector3)> {
+    let a = axis_direction.normalize()?;
+    const AXIS_EPS: f64 = 1e-10;
+    let e1 = if (a - Vector3::Z).magnitude() < AXIS_EPS || (a + Vector3::Z).magnitude() < AXIS_EPS {
+        Vector3::X
+    } else if (a - Vector3::X).magnitude() < AXIS_EPS || (a + Vector3::X).magnitude() < AXIS_EPS {
+        Vector3::Y
+    } else if (a - Vector3::Y).magnitude() < AXIS_EPS || (a + Vector3::Y).magnitude() < AXIS_EPS {
+        Vector3::Z
+    } else {
+        a.perpendicular().normalize()?
+    };
+    let e2 = a.cross(&e1).normalize()?;
+    Ok((a, e1, e2))
+}
+
+/// Lift a `(r, z)` meridian point into world space in the axis frame:
+/// `axis_origin + z·â + r·ê1`. This is the single point where the half-plane
+/// profile becomes a world point; every revolve builder routes its profile
+/// vertices AND its retained construction geometry through it, so the geometry
+/// and the consistency check always agree on where the profile lives.
+fn lift_meridian(axis_origin: Point3, axis: Vector3, e1: Vector3, r: f64, z: f64) -> Point3 {
+    axis_origin + axis * z + e1 * r
+}
+
+/// Recover the `(r, z)` of a lifted world meridian point — the inverse of
+/// [`lift_meridian`]: `z = (p − origin)·â`, `r = |(p − origin) − z·â|`. Used by
+/// [`get_revolve_meridian`] so a part built about ANY axis still reads back its
+/// editable half-plane profile.
+fn unlift_meridian(axis_origin: Point3, axis: Vector3, p: Point3) -> (f64, f64) {
+    let rel = p - axis_origin;
+    let z = rel.dot(&axis);
+    let r = (rel - axis * z).magnitude();
+    (r, z)
+}
+
 /// Parametric revolve from a MERIDIAN profile — the scientist-facing form of a
 /// solid of revolution. `profile_rz` is the `(r, z)` half-plane meridian (r =
-/// radius from the axis, z = height along it); it is lifted to the `(r, 0, z)`
-/// plane, joined by line edges (auto-closed last→first) and revolved. The
-/// generating meridian is RETAINED as the solid's construction geometry, so the
-/// part remembers how it was made — the foundation of the edit→regenerate
-/// workflow (#25): an edit recovers this profile, changes it, and re-revolves.
+/// radius from the axis, z = height along it); it is lifted into the axis frame
+/// (`axis_origin + z·â + r·ê1`), joined by line edges (auto-closed last→first)
+/// and revolved. For the default axis this is the world `(r, 0, z)` plane; for an
+/// offset/rotated axis the profile rides the axis so `axis_origin` translates the
+/// whole solid and `r` stays a pure radius (the offset never leaks into the
+/// radius/bbox). The generating meridian is RETAINED as the solid's construction
+/// geometry, so the part remembers how it was made — the foundation of the
+/// edit→regenerate workflow (#25): an edit recovers this profile, changes it, and
+/// re-revolves.
 pub fn revolve_meridian(
     model: &mut BRepModel,
     profile_rz: &[(f64, f64)],
@@ -183,19 +240,22 @@ pub fn revolve_meridian(
     }
 
     let axis_origin = options.axis_origin;
+    let (axis, e1, _e2) = axis_frame(options.axis_direction)?;
     let n = profile_rz.len();
-    let verts: Vec<_> = profile_rz
+    let lifted: Vec<Point3> = profile_rz
         .iter()
-        .map(|&(r, z)| model.vertices.add(r, 0.0, z))
+        .map(|&(r, z)| lift_meridian(axis_origin, axis, e1, r, z))
+        .collect();
+    let verts: Vec<_> = lifted
+        .iter()
+        .map(|p| model.vertices.add(p.x, p.y, p.z))
         .collect();
     let mut edges = Vec::with_capacity(n);
     let mut meridian_pts = Vec::with_capacity(n);
     for i in 0..n {
         let j = (i + 1) % n;
-        let (ri, zi) = profile_rz[i];
-        let (rj, zj) = profile_rz[j];
-        meridian_pts.push(Point3::new(ri, 0.0, zi));
-        let line = Line::new(Point3::new(ri, 0.0, zi), Point3::new(rj, 0.0, zj));
+        meridian_pts.push(lifted[i]);
+        let line = Line::new(lifted[i], lifted[j]);
         let cid = model.curves.add(Box::new(line));
         edges.push(model.edges.add(Edge::new(
             0,
@@ -214,20 +274,39 @@ pub fn revolve_meridian(
     // remembers its profile for the edit→regenerate workflow.
     model.set_solid_construction(
         solid,
-        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+        crate::primitives::provenance::ConstructionGeometry::revolution(
+            axis_origin,
+            axis,
+            meridian_pts,
+        ),
     );
     Ok(solid)
 }
 
 /// Recover the `(r, z)` meridian a revolved part was built from, read back from
 /// its retained construction geometry — the editable profile a scientist opens,
-/// changes, and re-revolves with [`revolve_meridian`]. The stored points live in
-/// the `(r, 0, z)` half-plane, so `r = x`, `z = z`. Returns `None` when the solid
-/// carries no retained meridian (it was not built by `revolve_meridian`),
-/// completing the edit→regenerate loop's recover step (#25).
+/// changes, and re-revolves with [`revolve_meridian`]. The stored points are the
+/// world-frame lift of the half-plane profile; the EXACT revolution axis is read
+/// from the construction geometry (`plane_origin` = axis origin,
+/// `revolution_axis` = unit direction) and each world point is projected back to
+/// `(r, z)` (radius from axis, height along it) via [`unlift_meridian`]. For the
+/// default `+Z`-through-origin axis this reduces to `r = x`, `z = z`. Returns
+/// `None` when the solid carries no retained REVOLVED meridian (it was not built
+/// by a revolve meridian builder), completing the edit→regenerate loop's recover
+/// step (#25). A transform rotates the stored axis in lock-step, so the readback
+/// stays exact after the part is moved.
 pub fn get_revolve_meridian(model: &BRepModel, solid: SolidId) -> Option<Vec<(f64, f64)>> {
     let cg = model.solid_construction(solid)?;
-    Some(cg.profile_points.iter().map(|p| (p.x, p.z)).collect())
+    // Only a revolved part carries a recorded revolution axis; a sketch-derived
+    // construction record (extrude) has none and is not an editable meridian.
+    let axis = cg.revolution_axis?;
+    let axis_origin = cg.plane_origin;
+    Some(
+        cg.profile_points
+            .iter()
+            .map(|&p| unlift_meridian(axis_origin, axis, p))
+            .collect(),
+    )
 }
 
 /// Parametric revolve of a SMOOTH (NURBS-spline) walled TUBE — the smooth-meridian
@@ -267,15 +346,14 @@ pub fn revolve_spline_meridian(
     }
 
     let axis_origin = options.axis_origin;
+    let (axis, e1, _e2) = axis_frame(options.axis_direction)?;
+    let lift = |r: f64, z: f64| lift_meridian(axis_origin, axis, e1, r, z);
     let (r0, z0) = wall_rz[0];
     let (r1, z1) = wall_rz[wall_rz.len() - 1];
 
-    // Fit a degree-3 NURBS through the outer wall meridian (in the (r,0,z)
-    // half-plane) — the single smooth wall curve.
-    let wall_pts: Vec<Point3> = wall_rz
-        .iter()
-        .map(|&(r, z)| Point3::new(r, 0.0, z))
-        .collect();
+    // Fit a degree-3 NURBS through the outer wall meridian (lifted into the axis
+    // frame) — the single smooth wall curve.
+    let wall_pts: Vec<Point3> = wall_rz.iter().map(|&(r, z)| lift(r, z)).collect();
     let wall_math = interpolate_nurbs_curve(&wall_pts, 3, ParameterizationType::ChordLength)
         .map_err(|e| OperationError::NumericalError(format!("wall spline fit: {e}")))?;
     let wall_curve = NurbsCurve::new(
@@ -290,24 +368,19 @@ pub fn revolve_spline_meridian(
     // outer-top → inner-top → inner-bottom). The outer wall is the smooth NURBS;
     // the bore is a straight cylinder; the caps are annular planes. No vertex sits
     // on the axis, so the analytic one-surface band path applies to the wall.
-    let v_out_bot = model.vertices.add(r0, 0.0, z0);
-    let v_out_top = model.vertices.add(r1, 0.0, z1);
-    let v_in_top = model.vertices.add(bore_radius, 0.0, z1);
-    let v_in_bot = model.vertices.add(bore_radius, 0.0, z0);
+    let p_out_bot = lift(r0, z0);
+    let p_out_top = lift(r1, z1);
+    let p_in_top = lift(bore_radius, z1);
+    let p_in_bot = lift(bore_radius, z0);
+    let v_out_bot = model.vertices.add(p_out_bot.x, p_out_bot.y, p_out_bot.z);
+    let v_out_top = model.vertices.add(p_out_top.x, p_out_top.y, p_out_top.z);
+    let v_in_top = model.vertices.add(p_in_top.x, p_in_top.y, p_in_top.z);
+    let v_in_bot = model.vertices.add(p_in_bot.x, p_in_bot.y, p_in_bot.z);
 
     let c_wall = model.curves.add(Box::new(wall_curve));
-    let c_top = model.curves.add(Box::new(Line::new(
-        Point3::new(r1, 0.0, z1),
-        Point3::new(bore_radius, 0.0, z1),
-    )));
-    let c_bore = model.curves.add(Box::new(Line::new(
-        Point3::new(bore_radius, 0.0, z1),
-        Point3::new(bore_radius, 0.0, z0),
-    )));
-    let c_bottom = model.curves.add(Box::new(Line::new(
-        Point3::new(bore_radius, 0.0, z0),
-        Point3::new(r0, 0.0, z0),
-    )));
+    let c_top = model.curves.add(Box::new(Line::new(p_out_top, p_in_top)));
+    let c_bore = model.curves.add(Box::new(Line::new(p_in_top, p_in_bot)));
+    let c_bottom = model.curves.add(Box::new(Line::new(p_in_bot, p_out_bot)));
 
     let edges = vec![
         model.edges.add(Edge::new(
@@ -346,14 +419,16 @@ pub fn revolve_spline_meridian(
 
     let solid = revolve_profile(model, edges, options)?;
 
-    // Retain the outer wall meridian (construction geometry) for edit→regenerate.
-    let meridian_pts: Vec<Point3> = wall_rz
-        .iter()
-        .map(|&(r, z)| Point3::new(r, 0.0, z))
-        .collect();
+    // Retain the outer wall meridian (lifted construction geometry) for
+    // edit→regenerate, co-located with the solid for the consistency check.
+    let meridian_pts: Vec<Point3> = wall_rz.iter().map(|&(r, z)| lift(r, z)).collect();
     model.set_solid_construction(
         solid,
-        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+        crate::primitives::provenance::ConstructionGeometry::revolution(
+            axis_origin,
+            axis,
+            meridian_pts,
+        ),
     );
     Ok(solid)
 }
@@ -395,16 +470,25 @@ pub fn revolve_smooth_nozzle(
     }
 
     let axis_origin = options.axis_origin;
+    let (axis, e1, _e2) = axis_frame(options.axis_direction)?;
+    let lift = |r: f64, z: f64| lift_meridian(axis_origin, axis, e1, r, z);
     let (ir0, z0) = inner_rz[0]; // inner inlet
     let (ir1, z1) = inner_rz[inner_rz.len() - 1]; // inner exit
     let (or0, or1) = (ir0 + wall_thickness, ir1 + wall_thickness);
 
+    // Fit a degree-3 NURBS through the `(r, z)` contour, clamp the control-point
+    // RADII in the half-plane, THEN lift the (clamped) control points into the
+    // axis frame. The radius clamp MUST happen in `(r, z)` space — `r` is the
+    // radial coordinate regardless of where the axis sits — so it stays correct
+    // for an offset/rotated axis (the old `cp.x` clamp assumed a world-X radius).
     let fit = |pts: Vec<(f64, f64)>| -> OperationResult<NurbsCurve> {
         let rmin = pts.iter().map(|&(r, _)| r).fold(f64::INFINITY, f64::min);
         let rmax = pts
             .iter()
             .map(|&(r, _)| r)
             .fold(f64::NEG_INFINITY, f64::max);
+        // Fit in the canonical `(r, 0, z)` half-plane (so the clamp axis is X),
+        // identical numerics to the original for any axis.
         let p: Vec<Point3> = pts.iter().map(|&(r, z)| Point3::new(r, 0.0, z)).collect();
         let m = interpolate_nurbs_curve(&p, 3, ParameterizationType::ChordLength)
             .map_err(|e| OperationError::NumericalError(format!("nozzle spline fit: {e}")))?;
@@ -415,11 +499,12 @@ pub fn revolve_smooth_nozzle(
         // r≈60, centripetal to r≈66, from a max contour radius of 52), and the
         // revolved seam captured the spike → a non-rotationally-symmetric wall.
         // Clamping the radius guarantees no overshoot; the throat (rmin) and exit
-        // (rmax) sit at the bounds so they are preserved.
+        // (rmax) sit at the bounds so they are preserved. Lift each clamped CP into
+        // the axis frame (`(r, z)` → `axis_origin + z·â + r·ê1`).
         let cps: Vec<Point3> = m
             .control_points
             .iter()
-            .map(|&cp| Point3::new(cp.x.clamp(rmin, rmax), cp.y, cp.z))
+            .map(|&cp| lift(cp.x.clamp(rmin, rmax), cp.z))
             .collect();
         NurbsCurve::new(m.degree, cps, m.weights, m.knots.to_vec())
             .map_err(|e| OperationError::NumericalError(format!("nozzle curve: {e:?}")))
@@ -435,21 +520,19 @@ pub fn revolve_smooth_nozzle(
     let inner_curve = fit(inner_rz.iter().rev().cloned().collect())?;
 
     // Tube winding: outer-inlet → outer-exit → inner-exit → inner-inlet.
-    let v_out_bot = model.vertices.add(or0, 0.0, z0);
-    let v_out_top = model.vertices.add(or1, 0.0, z1);
-    let v_in_top = model.vertices.add(ir1, 0.0, z1);
-    let v_in_bot = model.vertices.add(ir0, 0.0, z0);
+    let p_out_bot = lift(or0, z0);
+    let p_out_top = lift(or1, z1);
+    let p_in_top = lift(ir1, z1);
+    let p_in_bot = lift(ir0, z0);
+    let v_out_bot = model.vertices.add(p_out_bot.x, p_out_bot.y, p_out_bot.z);
+    let v_out_top = model.vertices.add(p_out_top.x, p_out_top.y, p_out_top.z);
+    let v_in_top = model.vertices.add(p_in_top.x, p_in_top.y, p_in_top.z);
+    let v_in_bot = model.vertices.add(p_in_bot.x, p_in_bot.y, p_in_bot.z);
 
     let c_outer = model.curves.add(Box::new(outer_curve));
-    let c_exit = model.curves.add(Box::new(Line::new(
-        Point3::new(or1, 0.0, z1),
-        Point3::new(ir1, 0.0, z1),
-    )));
+    let c_exit = model.curves.add(Box::new(Line::new(p_out_top, p_in_top)));
     let c_inner = model.curves.add(Box::new(inner_curve));
-    let c_inlet = model.curves.add(Box::new(Line::new(
-        Point3::new(ir0, 0.0, z0),
-        Point3::new(or0, 0.0, z0),
-    )));
+    let c_inlet = model.curves.add(Box::new(Line::new(p_in_bot, p_out_bot)));
 
     let edges = vec![
         model.edges.add(Edge::new(
@@ -488,13 +571,14 @@ pub fn revolve_smooth_nozzle(
 
     let solid = revolve_profile(model, edges, options)?;
 
-    let meridian_pts: Vec<Point3> = inner_rz
-        .iter()
-        .map(|&(r, z)| Point3::new(r, 0.0, z))
-        .collect();
+    let meridian_pts: Vec<Point3> = inner_rz.iter().map(|&(r, z)| lift(r, z)).collect();
     model.set_solid_construction(
         solid,
-        crate::primitives::provenance::ConstructionGeometry::new(axis_origin, meridian_pts),
+        crate::primitives::provenance::ConstructionGeometry::revolution(
+            axis_origin,
+            axis,
+            meridian_pts,
+        ),
     );
     Ok(solid)
 }
