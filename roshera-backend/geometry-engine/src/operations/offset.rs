@@ -1009,6 +1009,14 @@ fn create_shell_walls(
 
     let mut wall_faces = Vec::new();
 
+    // Corner side-edges are shared by adjacent walls. Track them across EVERY
+    // removed face's rims (keyed on the unordered vertex pair) so two walls
+    // that meet at a corner reuse one edge instead of each minting a dangling
+    // duplicate — the difference between a closed watertight cup and an open,
+    // Euler≠2 husk.
+    let mut corner_edges: std::collections::HashMap<(VertexId, VertexId), EdgeId> =
+        std::collections::HashMap::new();
+
     for &face_id in faces_to_remove {
         // Get boundary edges of removed face
         let face = model
@@ -1094,6 +1102,7 @@ fn create_shell_walls(
                         tol,
                         original_to_offset_edge,
                         vertex_insets,
+                        &mut corner_edges,
                     )?;
                     wall_faces.push(wall_face);
                 }
@@ -1619,12 +1628,69 @@ fn rebuild_offset_rim_curve(
     Ok(())
 }
 
+/// Add (or reuse) the straight corner edge shared by two adjacent walls.
+///
+/// Two walls meet at every removed-face boundary vertex; the corner edge
+/// running from that boundary vertex to its inset partner is common to BOTH
+/// walls. `corner_edges` (keyed on the unordered vertex pair, scoped to the
+/// shell op) ensures the edge is created exactly once and reused by the second
+/// wall — without it each wall makes its own coincident edge and every corner
+/// edge is used by a single face, leaving the shell open.
+///
+/// Returns `(edge_id, forward)` where `forward` is the loop-orientation flag:
+/// `true` when the stored edge already runs `start → end`, `false` when the
+/// caller traverses it in reverse (the reusing wall walks the shared edge the
+/// opposite way). The reused edge's straight curve is geometrically identical
+/// to the one the caller would have built (same two endpoints), so reusing it
+/// is exact.
+fn add_or_find_corner_edge(
+    model: &mut BRepModel,
+    corner_edges: &mut std::collections::HashMap<(VertexId, VertexId), EdgeId>,
+    start: VertexId,
+    end: VertexId,
+    p_start: Vector3,
+    p_end: Vector3,
+) -> OperationResult<(EdgeId, bool)> {
+    use crate::primitives::curve::Line;
+    use crate::primitives::edge::EdgeOrientation;
+
+    let key = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    if let Some(&existing) = corner_edges.get(&key) {
+        let edge = model.edges.get(existing).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "add_or_find_corner_edge: cached corner edge {existing} not found"
+            ))
+        })?;
+        // The shared edge has a fixed stored orientation. If it already runs
+        // start→end this wall traverses it forward; otherwise backward.
+        let forward = edge.start_vertex == start && edge.end_vertex == end;
+        return Ok((existing, forward));
+    }
+
+    let line = Line::new(p_start, p_end);
+    let curve_id = model.curves.add(Box::new(line));
+    let edge_id = model.edges.add(Edge::new_auto_range(
+        0,
+        start,
+        end,
+        curve_id,
+        EdgeOrientation::Forward,
+    ));
+    corner_edges.insert(key, edge_id);
+    Ok((edge_id, true))
+}
+
 /// Create a wall face between outer and inner edges.
 ///
 /// `removed_face_outward_normal` is the outward normal of the face being
 /// removed (i.e., the opening). Walls extend along `-thickness *
 /// outward_normal` so they meet the inward-offset interior faces in a
 /// coplanar fashion at the boundary loop.
+#[allow(clippy::too_many_arguments)]
 fn create_wall_face(
     model: &mut BRepModel,
     outer_edge_id: EdgeId,
@@ -1634,6 +1700,7 @@ fn create_wall_face(
     tol: f64,
     original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
     vertex_insets: &HashMap<VertexId, Point3>,
+    corner_edges: &mut std::collections::HashMap<(VertexId, VertexId), EdgeId>,
 ) -> OperationResult<FaceId> {
     use crate::primitives::curve::Line;
     use crate::primitives::edge::EdgeOrientation;
@@ -1736,17 +1803,26 @@ fn create_wall_face(
     let v3 = model.vertices.add_or_find(p3.x, p3.y, p3.z, tol);
     let v4 = model.vertices.add_or_find(p4.x, p4.y, p4.z, tol);
 
-    // Create four edges for the rectangular face
+    // Create four edges for the rectangular face.
+    //
+    // The two SIDE edges (e_right / e_left) run from a removed-face boundary
+    // vertex (e.g. a box corner) to its inset partner. EVERY such side edge is
+    // shared by the TWO adjacent walls meeting at that corner — wall A's
+    // e_right and the neighbour wall B's e_left span the identical vertex pair.
+    // The boundary-loop vertices are already dedup'd (the rim vertices via the
+    // shared outer loop, the insets via `add_or_find` below), so the two walls
+    // request the SAME (start,end) vertex pair. Creating a fresh edge per wall
+    // left each corner edge used by exactly one face — 8 dangling boundary
+    // edges on a top-removed cube, an OPEN (non-watertight, Euler≠2) B-Rep.
+    //
+    // Deduplicate the side edges through `corner_edges`, keyed on the
+    // unordered vertex pair and scoped to this shell op. The first wall to
+    // reach a corner creates the edge; the second reuses it, traversing it in
+    // whichever direction its loop needs (the stored edge has a fixed
+    // start→end orientation, so the reuse carries the matching loop flag).
     let e_top = outer_edge_id; // reuse outer edge
-    let line_right = Line::new(p2, p3);
-    let c_right = model.curves.add(Box::new(line_right));
-    let e_right = model.edges.add(Edge::new_auto_range(
-        0,
-        outer_edge.end_vertex,
-        v3,
-        c_right,
-        EdgeOrientation::Forward,
-    ));
+    let (e_right, e_right_forward) =
+        add_or_find_corner_edge(model, corner_edges, outer_edge.end_vertex, v3, p2, p3)?;
 
     // If the adjacent face was offset, the interior offset face has already
     // created the edge that runs along the wall/interior boundary. Reuse
@@ -1777,22 +1853,15 @@ fn create_wall_face(
             (edge, true)
         };
 
-    let line_left = Line::new(p4, p1);
-    let c_left = model.curves.add(Box::new(line_left));
-    let e_left = model.edges.add(Edge::new_auto_range(
-        0,
-        v4,
-        outer_edge.start_vertex,
-        c_left,
-        EdgeOrientation::Forward,
-    ));
+    let (e_left, e_left_forward) =
+        add_or_find_corner_edge(model, corner_edges, v4, outer_edge.start_vertex, p4, p1)?;
 
     // Create loop
     let mut wall_loop = Loop::new(0, LoopType::Outer);
     wall_loop.add_edge(e_top, forward);
-    wall_loop.add_edge(e_right, true);
+    wall_loop.add_edge(e_right, e_right_forward);
     wall_loop.add_edge(e_bottom, e_bottom_forward);
-    wall_loop.add_edge(e_left, true);
+    wall_loop.add_edge(e_left, e_left_forward);
     let loop_id = model.loops.add(wall_loop);
 
     // The wall lies in the plane of the removed face, so its outward
@@ -2519,6 +2588,122 @@ mod tests {
         assert!(
             result.is_err(),
             "face from a different solid must not be accepted for removal"
+        );
+    }
+
+    /// B1 GATE: shelling a box with the top face removed (an open tray /
+    /// cup) must produce a topologically CLOSED, watertight solid shell.
+    ///
+    /// "Open as a container, closed as a solid": the opening is bounded by
+    /// rim walls that join the outer box walls to the inward-offset inner
+    /// walls, so every edge is used by exactly two faces. Before the corner
+    /// side-edge dedup fix, each of the four walls minted its own copy of the
+    /// two corner edges it shares with its neighbours → 8 single-use boundary
+    /// edges → an OPEN B-Rep with Euler ≠ 2 and `sound = false`.
+    ///
+    /// This gate asserts the full ground-truth path: B-Rep validity (the
+    /// `validate_solid_scoped` Standard sweep, which fails on any boundary
+    /// edge), watertightness + Euler = 2 (via `validate_shell_closure`'s exact
+    /// per-edge tally), and the self-certified `ValidityCertificate` soundness
+    /// flag.
+    #[test]
+    fn shell_top_removed_tray_is_closed_watertight_euler2_sound() {
+        use crate::primitives::validation::{
+            validate_shell_closure, validate_solid_scoped, ValidationLevel,
+        };
+
+        let (mut model, solid_id, top_face_id) = box_with_top_face();
+        let thickness = 1.0;
+
+        // Run the op WITH result validation on: a non-stitched rim makes
+        // `validate_shell_solid` reject the result, so success here already
+        // proves the rim is closed at the B-Rep level.
+        let options = OffsetOptions {
+            common: CommonOptions {
+                validate_result: true,
+                ..CommonOptions::default()
+            },
+            offset_type: OffsetType::Distance(thickness),
+            intersection_handling: IntersectionHandling::Trim,
+            max_deviation: 1e-3,
+        };
+        let hollow_id = offset_solid(&mut model, solid_id, thickness, vec![top_face_id], options)
+            .expect("offset_solid on a top-removed cube must produce a valid closed shell");
+
+        let hollow = model.solids.get(hollow_id).expect("hollow solid").clone();
+
+        // (1) Exact per-edge closure: zero boundary AND zero non-manifold
+        //     edges. This is the direct watertight / manifold oracle.
+        let closure_errors = validate_shell_closure(&model, hollow.outer_shell);
+        assert!(
+            closure_errors.is_empty(),
+            "shelled tray is not watertight — {} unstitched/non-manifold edge(s): {:?}",
+            closure_errors.len(),
+            closure_errors
+                .iter()
+                .take(8)
+                .map(|e| format!("{e:?}"))
+                .collect::<Vec<_>>()
+        );
+
+        // (2) Euler characteristic V − E + F = 2 (genus-0 closed shell). Tally
+        //     the distinct vertices / edges / faces over the shell's faces.
+        let shell = model.shells.get(hollow.outer_shell).expect("shell").clone();
+        let mut vset = std::collections::HashSet::new();
+        let mut eset = std::collections::HashSet::new();
+        for &fid in &shell.faces {
+            let face = model.faces.get(fid).expect("face");
+            let mut loops = vec![face.outer_loop];
+            loops.extend(face.inner_loops.iter().copied());
+            for lid in loops {
+                let lp = model.loops.get(lid).expect("loop");
+                for &eid in &lp.edges {
+                    eset.insert(eid);
+                    if let Some(edge) = model.edges.get(eid) {
+                        vset.insert(edge.start_vertex);
+                        vset.insert(edge.end_vertex);
+                    }
+                }
+            }
+        }
+        let euler = vset.len() as i64 - eset.len() as i64 + shell.faces.len() as i64;
+        assert_eq!(
+            euler,
+            2,
+            "shelled tray Euler V−E+F = {} (V={}, E={}, F={}), expected 2",
+            euler,
+            vset.len(),
+            eset.len(),
+            shell.faces.len()
+        );
+
+        // (3) Full B-Rep validity (Standard) scoped to the shelled solid —
+        //     the same sweep `validate_shell_solid` runs. No boundary-edge gaps.
+        let result = validate_solid_scoped(
+            &model,
+            hollow_id,
+            Tolerance::default(),
+            ValidationLevel::Standard,
+        );
+        assert!(
+            result.is_valid,
+            "shelled tray failed B-Rep validation ({} errors): {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(5)
+                .map(|e| format!("{e:?}"))
+                .collect::<Vec<_>>()
+        );
+
+        // (4) Self-certified ground truth: the validity certificate must mark
+        //     the shelled solid SOUND (brep_valid + watertight + manifold +
+        //     self-intersection-free + tessellation/mesh clean).
+        let cert = model.certify_solid(hollow_id);
+        assert!(
+            cert.is_sound(),
+            "shelled tray ValidityCertificate is not sound: {cert:?}"
         );
     }
 }
