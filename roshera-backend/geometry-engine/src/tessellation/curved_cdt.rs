@@ -118,6 +118,100 @@ struct ProjectedLoop {
 /// Bounding box in UV (u_min, u_max, v_min, v_max).
 type UvBBox = (f64, f64, f64, f64);
 
+/// U-period of a surface **as the curved-CDT loop unwrap needs it**.
+///
+/// `surface.period_u()` reports a period only when the surface advertises
+/// itself as closed/periodic in U (`is_closed_u()` = first control row ==
+/// last). That signal is SILENT for a genuinely periodic NURBS built with a
+/// WRAPPED control net (`skin_surface_periodic_u`): the first and last control
+/// rows differ even though `S(u_min, v) == S(u_max, v)` for every `v` (a smooth
+/// closed seam). Without a period the seam-crossing trim loop's UV samples jump
+/// the full domain at the seam, the polygon folds, and the face tessellates with
+/// a crack along the seam — the exact boundary-edge leak a seam-straddling pocket
+/// on a lofted barrel produces (#17 watertight). This mirrors the arrangement's
+/// `effective_period_u`: take the advertised period, else probe geometrically.
+/// Confined to this module so the surface's globally-reported periodicity (and
+/// therefore every other tessellation/routing decision) is unchanged.
+fn effective_period_u_tess(surface: &dyn Surface) -> Option<f64> {
+    if let Some(p) = surface.period_u() {
+        return Some(p);
+    }
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    if seam_closes_in_u_tess(surface, u_min, u_max, v_min, v_max) {
+        Some(u_max - u_min)
+    } else {
+        None
+    }
+}
+
+/// V-axis analogue of [`effective_period_u_tess`].
+fn effective_period_v_tess(surface: &dyn Surface) -> Option<f64> {
+    if let Some(p) = surface.period_v() {
+        return Some(p);
+    }
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    if seam_closes_in_v_tess(surface, u_min, u_max, v_min, v_max) {
+        Some(v_max - v_min)
+    } else {
+        None
+    }
+}
+
+/// Geometric closure probe: `true` when `S(u_min, v) == S(u_max, v)` across a
+/// short `v` sweep, i.e. the surface seams onto itself in U.
+fn seam_closes_in_u_tess(
+    surface: &dyn Surface,
+    u_min: f64,
+    u_max: f64,
+    v_min: f64,
+    v_max: f64,
+) -> bool {
+    if !(u_max > u_min) {
+        return false;
+    }
+    const SAMPLES: usize = 5;
+    const SEAM_TOL: f64 = 1e-7;
+    for k in 0..=SAMPLES {
+        let t = k as f64 / SAMPLES as f64;
+        let v = v_min + (v_max - v_min) * t;
+        let (a, b) = match (surface.point_at(u_min, v), surface.point_at(u_max, v)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return false,
+        };
+        if (a - b).magnitude() > SEAM_TOL {
+            return false;
+        }
+    }
+    true
+}
+
+/// V-axis analogue of [`seam_closes_in_u_tess`].
+fn seam_closes_in_v_tess(
+    surface: &dyn Surface,
+    u_min: f64,
+    u_max: f64,
+    v_min: f64,
+    v_max: f64,
+) -> bool {
+    if !(v_max > v_min) {
+        return false;
+    }
+    const SAMPLES: usize = 5;
+    const SEAM_TOL: f64 = 1e-7;
+    for k in 0..=SAMPLES {
+        let t = k as f64 / SAMPLES as f64;
+        let u = u_min + (u_max - u_min) * t;
+        let (a, b) = match (surface.point_at(u, v_min), surface.point_at(u, v_max)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return false,
+        };
+        if (a - b).magnitude() > SEAM_TOL {
+            return false;
+        }
+    }
+    true
+}
+
 /// Walk one B-Rep loop, fetch cached 3D samples per edge in canonical
 /// curve-forward order honoring `loop.orientations`, project each 3D
 /// sample to UV via `surface.closest_point`, and apply periodicity-
@@ -145,8 +239,8 @@ fn project_loop_to_uv(
     cache: &EdgeSampleCache,
     surface: &dyn Surface,
 ) -> Result<ProjectedLoop, CurvedCdtError> {
-    let u_period = surface.period_u();
-    let v_period = surface.period_v();
+    let u_period = effective_period_u_tess(surface);
+    let v_period = effective_period_v_tess(surface);
 
     let mut points_3d: Vec<Point3> = Vec::new();
     let mut points_uv: Vec<(f64, f64)> = Vec::new();

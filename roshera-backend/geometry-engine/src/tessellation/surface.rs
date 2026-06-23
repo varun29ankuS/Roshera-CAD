@@ -4654,6 +4654,94 @@ fn uv_point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
 /// Returns `false` (caller falls back to curved-CDT) on any structural surprise
 /// — wrong loop arity, missing seam edge, CDT failure — so this never silently
 /// drops the wall.
+///
+/// Choose the u at which the structured tessellation grid places its wrap (seam)
+/// column for a holed skin lateral. The grid brackets each hole in a contiguous
+/// column block inside `[0, 1)` and keeps the wrap cell structured, so the wrap
+/// column must avoid every hole's u-extent. Returns `0.0` (no shift, original
+/// layout) when no hole straddles the seam — the off-seam case. When a hole DOES
+/// straddle u=0, returns the centre of the WIDEST hole-free u-gap (mod 1), so the
+/// wrap column lands cleanly behind the pocket. `hole_uv_polys` u-coordinates are
+/// the per-rim unwrapped values (a seam-straddling rim therefore reaches below 0
+/// or above 1).
+fn compute_skin_seam_shift(hole_uv_polys: &[Vec<(f64, f64)>]) -> f64 {
+    // Collect each hole's occupied u-interval, wrapped into [0,1) as one or two
+    // sub-intervals (a straddling rim splits at the seam).
+    let mut occupied: Vec<(f64, f64)> = Vec::new();
+    let mut straddles = false;
+    for poly in hole_uv_polys {
+        let mut ulo = f64::INFINITY;
+        let mut uhi = f64::NEG_INFINITY;
+        for &(u, _) in poly {
+            ulo = ulo.min(u);
+            uhi = uhi.max(u);
+        }
+        if !ulo.is_finite() || !uhi.is_finite() {
+            continue;
+        }
+        if ulo < -1e-9 || uhi > 1.0 + 1e-9 {
+            straddles = true;
+        }
+        // Add a small margin so the gap search keeps clear of the rim.
+        let margin = 1e-3;
+        let lo = ulo - margin;
+        let hi = uhi + margin;
+        // Split into [0,1) pieces.
+        let mut push_wrapped = |a: f64, b: f64, occ: &mut Vec<(f64, f64)>| {
+            let a = a.rem_euclid(1.0);
+            let b = b.rem_euclid(1.0);
+            if a <= b {
+                occ.push((a, b));
+            } else {
+                occ.push((a, 1.0));
+                occ.push((0.0, b));
+            }
+        };
+        push_wrapped(lo, hi, &mut occupied);
+    }
+    // No hole crosses the seam → keep the original layout exactly.
+    if !straddles || occupied.is_empty() {
+        return 0.0;
+    }
+    // Find the widest gap on the circle [0,1) not covered by any occupied
+    // interval. Sort interval starts; sweep with coverage merge.
+    occupied.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Merge overlapping intervals.
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for &(a, b) in &occupied {
+        if let Some(last) = merged.last_mut() {
+            if a <= last.1 + 1e-9 {
+                last.1 = last.1.max(b);
+                continue;
+            }
+        }
+        merged.push((a, b));
+    }
+    if merged.is_empty() {
+        return 0.0;
+    }
+    // Gaps are between consecutive merged intervals, plus the wrap gap from the
+    // last interval's end back to the first's start (+1).
+    let mut best_gap = -1.0;
+    let mut best_mid = 0.0;
+    for w in merged.windows(2) {
+        let gap = w[1].0 - w[0].1;
+        if gap > best_gap {
+            best_gap = gap;
+            best_mid = 0.5 * (w[0].1 + w[1].0);
+        }
+    }
+    let wrap_gap = (merged[0].0 + 1.0) - merged[merged.len() - 1].1;
+    if wrap_gap > best_gap {
+        best_gap = wrap_gap;
+        best_mid = (0.5 * ((merged[merged.len() - 1].1) + (merged[0].0 + 1.0))).rem_euclid(1.0);
+    }
+    if best_gap <= 0.0 {
+        return 0.0;
+    }
+    best_mid
+}
+
 fn tessellate_nurbs_skin_lateral_with_holes(
     surface: &dyn Surface,
     face: &Face,
@@ -4849,8 +4937,8 @@ fn tessellate_nurbs_skin_lateral_with_holes(
             })
             .collect()
     };
-    let bottom_uv = ring_uv(bottom_ring, seam_bottom);
-    let top_uv = ring_uv(top_ring, seam_top);
+    let mut bottom_uv = ring_uv(bottom_ring, seam_bottom);
+    let mut top_uv = ring_uv(top_ring, seam_top);
     if bottom_uv.len() < 3 || top_uv.len() < 3 {
         return false;
     }
@@ -4858,7 +4946,9 @@ fn tessellate_nurbs_skin_lateral_with_holes(
     if bottom_uv[0].0 > 1e-9 || top_uv[0].0 > 1e-9 {
         return false;
     }
-    let seam_interior: Vec<Point3> = seam_up[1..seam_up.len() - 1].to_vec();
+    let mut seam_bottom = seam_bottom;
+    let mut seam_top = seam_top;
+    let mut seam_interior: Vec<Point3> = seam_up[1..seam_up.len() - 1].to_vec();
     let ns = seam_interior.len();
 
     // ---- Hole contours: project each inner-loop rim's cache 3D to UV. The
@@ -4911,6 +5001,109 @@ fn tessellate_nurbs_skin_lateral_with_holes(
         }
         hole_contours.push(contour);
         hole_uv_polys.push(poly);
+    }
+
+    // SEAM-STRADDLING pocket rebase (task #17 watertight). The structured
+    // u-column grid below brackets each hole in a CONTIGUOUS column block inside
+    // [0, 1] and keeps the wrap (seam) cell structured — valid only while every
+    // pocket rim stays clear of the u=0 seam. A pocket placed ON the seam (the
+    // +X seam wall) has a rim whose unwrapped u-span crosses 0 (e.g.
+    // [-0.04, 0.04]), so a [0,1] column block cannot bracket its negative-u half
+    // and the wall tessellates with a crack along the seam.
+    //
+    // The lateral is PERIODIC in u, so the tessellation seam (the doubled wrap
+    // column) may sit at ANY u — it need not coincide with the B-Rep seam edge.
+    // Shift the whole u-layout by `u_shift` so the wrap column lands in the
+    // widest hole-free gap (the back of the barrel, opposite the pocket). Every
+    // u-coordinate (rings, holes, parent rim samples) moves to the rebased frame
+    // `(u - u_shift) mod 1`; the seam column then samples
+    // `surface.point_at(u_shift, v)` — a regular interior point, equally
+    // watertight (the cells either side share it). Off-seam pockets get
+    // `u_shift == 0` (the gap is already at u=0) and keep the layout bit-for-bit.
+    let u_shift = compute_skin_seam_shift(&hole_uv_polys);
+    if u_shift != 0.0 {
+        let rebase = |u: f64| -> f64 { (u - u_shift).rem_euclid(1.0) };
+        // Re-unwrap a rebased u-sequence forward from its first element so a
+        // contiguous rim/ring never splits across the new wrap boundary.
+        let reunwrap = |seq: &mut [f64]| {
+            let mut last: Option<f64> = None;
+            for u in seq.iter_mut() {
+                let mut r = rebase(*u);
+                if let Some(pu) = last {
+                    while r - pu > 0.5 {
+                        r -= 1.0;
+                    }
+                    while r - pu < -0.5 {
+                        r += 1.0;
+                    }
+                }
+                last = Some(r);
+                *u = r;
+            }
+        };
+        // Rebase ring layout u and true-surface u. Both fields shift by the same
+        // amount; the rings are sorted into ascending u after rebase below.
+        for entry in bottom_uv.iter_mut().chain(top_uv.iter_mut()) {
+            entry.0 = rebase(entry.0); // chord-fraction layout u
+            entry.1 = rebase(entry.1); // true surface u
+        }
+        bottom_uv.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        top_uv.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Rebase each hole rim poly and the matching parent-uv entries (the CDT
+        // window reads `uv` for the rim vertices), keeping the rim contiguous via
+        // re-unwrap. `hole_contours[h]` holds the parent-`uv` index per rim
+        // vertex, in the same order as `hole_uv_polys[h]`.
+        for (poly, contour) in hole_uv_polys.iter_mut().zip(hole_contours.iter()) {
+            let mut us: Vec<f64> = poly.iter().map(|&(u, _)| u).collect();
+            reunwrap(&mut us);
+            for (k, entry) in poly.iter_mut().enumerate() {
+                entry.0 = us[k];
+                if let Some(&pidx) = contour.get(k) {
+                    if let Some(slot) = uv.get_mut(pidx) {
+                        slot.0 = us[k];
+                    }
+                }
+            }
+        }
+        // The wrap (seam) column now sits at rebased u=0 (original u = u_shift).
+        // Its v=0 / v=1 rows MUST be a CACHED ring sample (verbatim 3D), not a
+        // fresh `point_at(u_shift, ·)`: the bottom/top cap disc faces tessellate
+        // their rim from the SAME cached ring edge, so only a shared cached point
+        // welds the lateral's seam column to the cap. Pick the cached ring vertex
+        // whose rebased true-u is nearest the wrap boundary (0 ≡ 1) — it lies in
+        // the hole-free gap, so it is a clean, pocket-free seam anchor.
+        let nearest_ring_at_wrap = |ring: &[(f64, f64, Point3)]| -> Option<Point3> {
+            ring.iter()
+                .min_by(|a, b| {
+                    // Circular distance of the true-u to the wrap boundary {0,1}.
+                    let da = a.1.rem_euclid(1.0).min(1.0 - a.1.rem_euclid(1.0));
+                    let db = b.1.rem_euclid(1.0).min(1.0 - b.1.rem_euclid(1.0));
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|&(_, _, p)| p)
+        };
+        if let Some(p) = nearest_ring_at_wrap(&bottom_uv) {
+            seam_bottom = p;
+        }
+        if let Some(p) = nearest_ring_at_wrap(&top_uv) {
+            seam_top = p;
+        }
+        if ns > 0 {
+            let mut new_interior = Vec::with_capacity(ns);
+            for idx in 0..ns {
+                let v = (idx + 1) as f64 / (ns + 1) as f64;
+                match surface.point_at(u_shift, v) {
+                    Ok(p) => new_interior.push(p),
+                    Err(_) => {
+                        new_interior.clear();
+                        break;
+                    }
+                }
+            }
+            if new_interior.len() == ns {
+                seam_interior = new_interior;
+            }
+        }
     }
 
     // ---- v-resolution (number of horizontal bands). ----
@@ -5032,11 +5225,15 @@ fn tessellate_nurbs_skin_lateral_with_holes(
     // the (clean) hole-free `stitch_closed_rings` path does. v=0/v=1 rows take
     // the cached ring 3D verbatim (welds to the caps); interior rows sample
     // `point_at(true_u, v)` so they line up with the rings.
+    // Map a LAYOUT u (rebased frame, [0,1)) to the ORIGINAL surface u for
+    // sampling/normals. `u_shift == 0` makes this the identity, so the off-seam
+    // fast path is bit-for-bit unchanged.
+    let to_surface_u = |u: f64| -> f64 { (u + u_shift).rem_euclid(1.0) };
     let build_row = |mesh: &mut TriangleMesh, v: f64| -> Vec<u32> {
         let mut row: Vec<u32> = Vec::with_capacity(columns.len() + 1);
         let mut add = |p: Point3, u: f64, mesh: &mut TriangleMesh| {
             let normal = surface
-                .normal_at(u.rem_euclid(1.0), v)
+                .normal_at(to_surface_u(u), v)
                 .map(|nn| nn * orient_sign)
                 .unwrap_or(Vector3::Z);
             row.push(mesh.add_vertex(MeshVertex {
@@ -5045,7 +5242,7 @@ fn tessellate_nurbs_skin_lateral_with_holes(
                 uv: None,
             }));
         };
-        // Seam column (u=0).
+        // Seam column (rebased u=0; 3D supplied by `seam_at`, already at u_shift).
         add(seam_at(v), 0.0, mesh);
         for col in &columns {
             let p = if v <= 1e-9 {
@@ -5055,7 +5252,7 @@ fn tessellate_nurbs_skin_lateral_with_holes(
             } else {
                 None
             };
-            let p = match p.or_else(|| surface.point_at(col.u, v).ok()) {
+            let p = match p.or_else(|| surface.point_at(to_surface_u(col.u), v).ok()) {
                 Some(p) => p,
                 None => seam_at(v),
             };
@@ -5166,6 +5363,7 @@ fn tessellate_nurbs_skin_lateral_with_holes(
             &uv,
             &pos3d,
             orient_sign,
+            u_shift,
             mesh,
         ) {
             cdt_ok = false;
@@ -5203,11 +5401,15 @@ fn tessellate_skin_hole_window(
     parent_uv: &[(f64, f64)],
     parent_pos: &[Option<Point3>],
     orient_sign: f64,
+    u_shift: f64,
     mesh: &mut TriangleMesh,
 ) -> bool {
     if v_hi <= v_lo || c_hi <= c_lo || jhi <= jlo || hole_contour.len() < 3 {
         return false;
     }
+    // Layout-u (rebased frame) → original surface u for sampling/normals. Identity
+    // when `u_shift == 0` (off-seam pockets), so their mesh is unchanged.
+    let to_surface_u = |u: f64| -> f64 { (u + u_shift).rem_euclid(1.0) };
     // Local CDT point set. Each entry is (u, v) plus a RESOLUTION: an already-
     // existing mesh-vertex index (boundary, welds to the structured grid) OR a
     // verbatim 3D position (hole rim) OR `None` (interior Steiner, filled by
@@ -5376,7 +5578,7 @@ fn tessellate_skin_hole_window(
                 Loc::Vid(id) => id,
                 Loc::Pos(p) => {
                     let normal = surface
-                        .normal_at(u.rem_euclid(1.0), vv)
+                        .normal_at(to_surface_u(u), vv)
                         .map(|nn| nn * orient_sign)
                         .unwrap_or(Vector3::Z);
                     mesh.add_vertex(MeshVertex {
@@ -5386,9 +5588,9 @@ fn tessellate_skin_hole_window(
                     })
                 }
                 Loc::Interior => {
-                    let p = surface.point_at(u.rem_euclid(1.0), vv).ok()?;
+                    let p = surface.point_at(to_surface_u(u), vv).ok()?;
                     let normal = surface
-                        .normal_at(u.rem_euclid(1.0), vv)
+                        .normal_at(to_surface_u(u), vv)
                         .map(|nn| nn * orient_sign)
                         .unwrap_or(Vector3::Z);
                     mesh.add_vertex(MeshVertex {
