@@ -4414,11 +4414,11 @@ fn tessellate_revolution_wedge(
 
     // Emit grid vertices. Shading normals are taken from local grid tangents
     // (positions are what matter for watertightness; normals need only be
-    // smooth), oriented to agree with the face's outward triangle winding.
+    // smooth), oriented to agree with the face's OUTWARD direction.
     let pos: Vec<Vec<Point3>> = (0..n)
         .map(|i| (0..m).map(|j| node(i, j)).collect())
         .collect();
-    let normal_at = |i: usize, j: usize| -> Vector3 {
+    let grid_normal = |i: usize, j: usize| -> Vector3 {
         let ip = pos[(i + 1).min(n - 1)][j];
         let im = pos[i.saturating_sub(1)][j];
         let jp = pos[i][(j + 1).min(m - 1)];
@@ -4428,23 +4428,68 @@ fn tessellate_revolution_wedge(
             .normalize()
             .unwrap_or(Vector3::Z)
     };
+
+    // The OUTWARD direction at each node = the TRUE surface normal (oriented by
+    // the face sign), with the grid-tangent normal as a fallback. The grid (i, j)
+    // index runs (angle, profile) for a revolution wall, so the grid-tangent
+    // cross product (i+)×(j+) = dv×du = −natural — i.e. the raw grid normal does
+    // NOT robustly encode the surface's natural normal sign. Keying the triangle
+    // winding on `face.orientation` alone (the old code) therefore inverted the
+    // whole 360° band (off-surface normals, max-deviation ≈ 179°). Instead derive
+    // the outward target from the surface normal itself and wind each triangle
+    // geometrically to match it — exactly the self-consistent rule the unequal-
+    // count branch above already uses, and independent of any i/j↔u/v convention.
+    let surf = model.surfaces.get(face.surface_id);
+    let ang = surf.map(|s| s.parameter_bounds().1 .1).unwrap_or(0.0);
+    let sign = face.orientation.sign();
+    let surf_outward = |i: usize, j: usize| -> Option<Vector3> {
+        // Grid maps to the SurfaceOfRevolution params as u=profile∈[0,1] (the j
+        // index, normalised over the seam chain), v=angle∈[0,angle] (the i index,
+        // normalised over the ring chain). When chain `a` is the seam these roles
+        // swap, mirroring the `node` closure above.
+        let (u, vf) = if a_is_seam {
+            (i as f64 / (n - 1) as f64, j as f64 / (m - 1) as f64)
+        } else {
+            (j as f64 / (m - 1) as f64, i as f64 / (n - 1) as f64)
+        };
+        surf.and_then(|s| s.evaluate_full(u, vf * ang).ok())
+            .map(|sp| sp.normal * sign)
+            .and_then(|nv| nv.normalize().ok())
+    };
+
     let mut grid: Vec<Vec<u32>> = vec![vec![0u32; m]; n];
     for i in 0..n {
         for j in 0..m {
+            // Shading normal: prefer the true surface normal (oriented outward);
+            // fall back to the grid-tangent normal flipped onto the outward side.
+            let normal = surf_outward(i, j).unwrap_or_else(|| {
+                let gn = grid_normal(i, j);
+                let reference = surf_outward(i.min(n - 1), j.min(m - 1));
+                match reference {
+                    Some(r) if gn.dot(&r) < 0.0 => -gn,
+                    _ => gn,
+                }
+            });
             grid[i][j] = mesh.add_vertex(MeshVertex {
                 position: pos[i][j],
-                normal: normal_at(i, j),
+                normal,
                 uv: None,
             });
         }
     }
 
-    // Emit two triangles per cell. The loop is walked CCW about the surface's
-    // NATURAL normal, and with i along chain A and j along chain D-reversed we
-    // have (i+)×(j+) = +natural. The mesh must wind CCW about the OUTWARD normal
-    // (= natural · orientation.sign): a Forward face (outward = +natural) needs
-    // triangle normal +natural, i.e. winding (v00, v10, v01); a Backward face
-    // takes the mirror.
+    // Emit two triangles per cell, winding each so its geometric normal agrees
+    // with the cell's OUTWARD direction (true surface normal × face sign). This
+    // is robust to the grid's i/j orientation: a Forward face winds +natural, a
+    // Backward face −natural, with no reliance on the (i+)×(j+) sign convention.
+    let cell_outward = |i: usize, j: usize| -> Vector3 {
+        surf_outward(i, j)
+            .or_else(|| surf_outward(i + 1, j + 1))
+            .unwrap_or_else(|| {
+                let gn = grid_normal(i, j);
+                gn * if sign >= 0.0 { 1.0 } else { -1.0 }
+            })
+    };
     for i in 0..n - 1 {
         for j in 0..m - 1 {
             let (v00, v10, v01, v11) = (
@@ -4453,11 +4498,19 @@ fn tessellate_revolution_wedge(
                 grid[i][j + 1],
                 grid[i + 1][j + 1],
             );
-            if face.orientation == crate::primitives::face::FaceOrientation::Forward {
+            let out = cell_outward(i, j);
+            // Triangle 1 (v00, v10, v01): geometric normal sign decides winding.
+            let g1 = (pos[i + 1][j] - pos[i][j]).cross(&(pos[i][j + 1] - pos[i][j]));
+            if g1.dot(&out) >= 0.0 {
                 mesh.add_triangle(v00, v10, v01);
-                mesh.add_triangle(v10, v11, v01);
             } else {
                 mesh.add_triangle(v00, v01, v10);
+            }
+            // Triangle 2 (v10, v11, v01).
+            let g2 = (pos[i + 1][j + 1] - pos[i + 1][j]).cross(&(pos[i][j + 1] - pos[i + 1][j]));
+            if g2.dot(&out) >= 0.0 {
+                mesh.add_triangle(v10, v11, v01);
+            } else {
                 mesh.add_triangle(v10, v01, v11);
             }
         }

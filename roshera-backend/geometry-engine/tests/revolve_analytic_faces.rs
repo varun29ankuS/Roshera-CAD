@@ -523,3 +523,166 @@ fn smooth_nozzle_revolve_is_rotationally_symmetric() {
          deformed: x={xext:.3} y={yext:.3}"
     );
 }
+
+/// Fraction of non-degenerate facets whose winding normal sits in the SAME
+/// hemisphere as the TRUE surface normal (oriented by the owning face's sense),
+/// plus the worst deviation in degrees. This is the cheap, coarse-mesh form of
+/// the `tessellation_quality` / `mesh_quality` certificate's ground-truth check:
+/// an inverted wall (the B3 bug — every facet wound against its own surface)
+/// scores ~0.0 and ~180°. Coarse params keep the per-facet `closest_point` count
+/// in the hundreds (the `fine()` cert runs ~40k facets → minutes), while gross
+/// inversion is a coarse fault visible at any density.
+fn revolve_facet_soundness(m: &BRepModel, sid: SolidId) -> (f64, f64) {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    let solid = m.solids.get(sid).expect("solid");
+    let mesh = tessellate_solid(solid, m, &TessellationParams::coarse());
+    let has_faces = mesh.face_map.len() == mesh.triangles.len();
+    let tol = Tolerance::default();
+    let (mut agree, mut comparable) = (0usize, 0usize);
+    let mut max_dev = 0.0_f64;
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        let p0 = mesh.vertices[tri[0] as usize].position;
+        let p1 = mesh.vertices[tri[1] as usize].position;
+        let p2 = mesh.vertices[tri[2] as usize].position;
+        let geo = (p1 - p0).cross(&(p2 - p0));
+        if geo.magnitude() <= 1e-12 {
+            continue;
+        }
+        comparable += 1;
+        let fid = if has_faces { mesh.face_map[i] } else { 0 };
+        let face = match m.faces.get(fid) {
+            Some(f) => f,
+            None => {
+                agree += 1;
+                continue;
+            }
+        };
+        let surface = match m.surfaces.get(face.surface_id) {
+            Some(s) => s,
+            None => {
+                agree += 1;
+                continue;
+            }
+        };
+        let centroid = Point3::new(
+            (p0.x + p1.x + p2.x) / 3.0,
+            (p0.y + p1.y + p2.y) / 3.0,
+            (p0.z + p1.z + p2.z) / 3.0,
+        );
+        let oriented = match surface
+            .closest_point(&centroid, tol)
+            .ok()
+            .and_then(|(u, v)| surface.normal_at(u, v).ok())
+        {
+            Some(n) => n * face.orientation.sign(),
+            None => {
+                agree += 1;
+                continue;
+            }
+        };
+        if let (Ok(g), Ok(o)) = (geo.normalize(), oriented.normalize()) {
+            let dot = g.dot(&o).clamp(-1.0, 1.0);
+            if dot > 0.0 {
+                agree += 1;
+            }
+            max_dev = max_dev.max(dot.acos().to_degrees());
+        } else {
+            agree += 1;
+        }
+    }
+    let frac = if comparable == 0 {
+        1.0
+    } else {
+        agree as f64 / comparable as f64
+    };
+    (frac, max_dev)
+}
+
+/// SOUNDNESS GATE — `revolve` + `wall_thickness` (smooth-nozzle) must tessellate
+/// to facets that AGREE with their true surface normals, not just be watertight.
+///
+/// The B3 bug: the NACELLE flow contour (a near-CONSTANT-radius body section —
+/// r = 2.6 at z = 4 AND z = 8 — plus a shallow bulge) built a watertight, valid,
+/// rotationally-symmetric wall whose ENTIRE tessellation was INVERTED (every
+/// facet wound against its own `SurfaceOfRevolution`: normal_agreement ≈ 0.01,
+/// max deviation ≈ 179°, ~40 000/40 400 off-surface facets) — `sound = false`
+/// despite passing every watertight/bbox check. Root cause: the full-360°
+/// revolution band's structured-grid tessellation keyed its triangle winding on
+/// `face.orientation` under the assumption `(i+)×(j+) = +natural`, but for a
+/// revolution wall the grid index runs (angle, profile), so the cross product is
+/// `dv×du = −natural` — the winding inverted. The fix winds each facet to match
+/// the TRUE surface normal (× face sign), independent of the i/j convention.
+///
+/// This gate asserts BOTH the failing nacelle and the originally-sound nozzle are
+/// facet-sound. Watertight ≠ sound — `revolve_watertight.rs` checks the former;
+/// this checks the latter. Regression marker: if the grid winding reverts, the
+/// nacelle agreement collapses to ~0 and this fails first.
+#[test]
+fn smooth_nozzle_wall_tessellation_is_facet_sound() {
+    let cases: &[(&str, &[(f64, f64)], f64)] = &[
+        (
+            "nacelle",
+            &[
+                (2.2, 0.0),
+                (2.5, 1.5),
+                (2.6, 4.0),
+                (2.6, 8.0),
+                (2.3, 10.5),
+                (2.0, 12.0),
+            ],
+            0.4,
+        ),
+        (
+            "nozzle",
+            &[
+                (6.0, 0.0),
+                (5.2, 2.0),
+                (4.0, 3.5),
+                (2.8, 5.0),
+                (2.1, 6.0),
+                (2.0, 6.5),
+                (2.5, 7.2),
+                (3.2, 8.4),
+                (4.0, 10.2),
+                (4.8, 13.0),
+                (5.5, 16.0),
+                (5.9, 18.5),
+            ],
+            0.3,
+        ),
+    ];
+    for &(name, inner, wt) in cases {
+        for (label, origin) in [
+            ("origin", Point3::ZERO),
+            ("offset", Point3::new(5.0, 0.0, 0.0)),
+        ] {
+            let mut m = BRepModel::new();
+            let opts = RevolveOptions {
+                axis_origin: origin,
+                axis_direction: Vector3::Z,
+                angle: std::f64::consts::TAU,
+                segments: 32,
+                ..Default::default()
+            };
+            let sid = revolve_smooth_nozzle(&mut m, inner, wt, opts)
+                .unwrap_or_else(|e| panic!("{name}@{label}: build {e:?}"));
+            assert!(
+                validate_solid_scoped(&m, sid, Tolerance::default(), ValidationLevel::Standard)
+                    .is_valid,
+                "{name}@{label}: must be a valid solid"
+            );
+            let (agree, max_dev) = revolve_facet_soundness(&m, sid);
+            assert!(
+                agree >= 0.999,
+                "{name}@{label}: revolve+wall_thickness tessellation must be facet-sound \
+                 (winding agrees with the true surface normal); got agreement={agree:.4} \
+                 max_deviation={max_dev:.1}° — the wall is INVERTED"
+            );
+            assert!(
+                max_dev < 40.0,
+                "{name}@{label}: worst facet normal deviation {max_dev:.1}° exceeds 40° \
+                 (off-surface / inverted facets)"
+            );
+        }
+    }
+}
