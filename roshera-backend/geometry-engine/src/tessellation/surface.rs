@@ -4504,9 +4504,18 @@ fn tessellate_nurbs_skin_lateral(
         None => return false,
     };
     // Cylinder-style loop: two distinct CLOSED ring edges + one seam edge used
-    // twice (4 loop entries).
+    // twice (4 loop entries). A boolean that cuts a notch THROUGH a cap rim (the
+    // box reaches above/below the barrel cap, so the cut crosses the planar
+    // cap↔lateral edge) leaves the lateral fragment's top (or bottom) ring
+    // BROKEN by an angular gap, with the notch's side/bottom cut edges threaded
+    // into the single outer loop (no inner loop, edge count ≠ 4). The
+    // structured ring stitch below cannot represent that gap; route it to the
+    // cap-edge-notch mesher, which unrolls the periodic wall into a clean UV
+    // rectangle with the notch carved out of the rim. It self-declines (→
+    // curved-CDT) for any loop that is not this notched-rim form, so the clean
+    // 4-edge barrel and every already-watertight case are untouched.
     if loop_data.edges.len() != 4 {
-        return false;
+        return tessellate_nurbs_skin_lateral_cap_notch(surface, face, model, params, cache, mesh);
     }
     let mut ring_edges: Vec<crate::primitives::edge::EdgeId> = Vec::new();
     for &eid in &loop_data.edges {
@@ -4611,6 +4620,564 @@ fn tessellate_nurbs_skin_lateral(
         stitch_closed_rings(&rows[band].clone(), &rows[band + 1].clone(), mesh);
     }
     true
+}
+
+/// Tessellate a CLOSED-in-u NURBS skin lateral whose top OR bottom cap rim is
+/// breached by a boolean notch (task #17 watertight, the cap-edge case). When a
+/// cutter reaches above (or below) the barrel's planar cap, the difference's cut
+/// curves cross the cap↔lateral rim edge; the lateral fragment then carries a
+/// single outer loop in which one ring is interrupted by an angular GAP and the
+/// notch's side/bottom cut edges are threaded inline (no inner loop, edge count
+/// ≠ 4). Neither the clean ring-stitch nor the hole-window mesher fits this form,
+/// and the generic curved-CDT path folds at the periodic seam (its
+/// `closest_point` boundary inversion maps both seam sides to one u), so the
+/// fragment tessellated with overlapping, off-surface facets (non-manifold mesh).
+///
+/// This unrolls the periodic wall into a SINGLE simple UV polygon: the seam edge
+/// (the only edge walked twice by the loop) is split into the rectangle's two
+/// vertical sides (u=0 on one traversal, u=1 on the other) — exactly the
+/// structural seam split the hole-window mesher uses — while every other edge is
+/// projected to (u,v) by `closest_point` and unwrapped monotonically along the
+/// walk, so the notch becomes a clean bite out of the rim. The polygon is
+/// triangulated by the shared CDT (`curved_cdt::run_cdt`) with a structured
+/// interior Steiner grid; boundary vertices take their 3D VERBATIM from the
+/// `EdgeSampleCache` (welding bit-exactly to the adjacent cap, box-wall and
+/// pocket faces), interior vertices use `surface.point_at`. Returns `false`
+/// (caller → curved-CDT) for any loop that is not this notched-rim form, so the
+/// clean barrel and the already-watertight pocket/slot cases are never affected.
+fn tessellate_nurbs_skin_lateral_cap_notch(
+    surface: &dyn Surface,
+    face: &Face,
+    model: &BRepModel,
+    params: &TessellationParams,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::edge::EdgeId;
+    let tol = Tolerance::default();
+
+    let Some(loop_data) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if loop_data.edges.len() < 6 {
+        return false;
+    }
+
+    // The skin-lateral seam is the unique edge the outer loop walks TWICE (once
+    // up, once down). A notched-rim fragment still carries it; if no edge repeats
+    // this is not the closed-u skin form — decline.
+    let mut seen: HashMap<EdgeId, u32> = HashMap::new();
+    for &eid in &loop_data.edges {
+        *seen.entry(eid).or_insert(0) += 1;
+    }
+    let seam_candidates: Vec<EdgeId> = seen
+        .iter()
+        .filter(|(_, &c)| c == 2)
+        .map(|(&e, _)| e)
+        .collect();
+    if seam_candidates.len() != 1 {
+        return false;
+    }
+    let seam_edge = seam_candidates[0];
+
+    // Surface seam endpoints (u=0 column): S(0,0) bottom, S(0,1) top.
+    let (Ok(p00), Ok(p01)) = (surface.point_at(0.0, 0.0), surface.point_at(0.0, 1.0)) else {
+        return false;
+    };
+
+    // Rotate the loop's edge list so it STARTS at the first seam occurrence. The
+    // walk is then: seam · segmentA · seam · segmentB, and the two seam
+    // traversals bracket the two non-seam runs cleanly.
+    let Some(seam_first) = loop_data.edges.iter().position(|&e| e == seam_edge) else {
+        return false;
+    };
+    let n_edges = loop_data.edges.len();
+    let rot_edges: Vec<EdgeId> = (0..n_edges)
+        .map(|k| loop_data.edges[(seam_first + k) % n_edges])
+        .collect();
+    let rot_orient: Vec<bool> = (0..n_edges)
+        .map(|k| {
+            loop_data
+                .orientations
+                .get((seam_first + k) % n_edges)
+                .copied()
+                .unwrap_or(true)
+        })
+        .collect();
+
+    // A `Vert` is one contour vertex: its unrolled (u,v) and its resolved 3D
+    // (verbatim cache for every boundary sample → watertight weld).
+    struct Vert {
+        u: f64,
+        v: f64,
+        p: Point3,
+    }
+    let mut contour: Vec<Vert> = Vec::new();
+
+    // Emit one edge's cache samples into the contour. `pin_u` (when Some) forces
+    // every sample's u (the seam sides → u=0 / u=1); otherwise `closest_point`
+    // gives u and it is unwrapped to stay continuous with the previous vertex.
+    // The last sample of each edge is dropped (shared with the next edge's
+    // first), matching the loop-walk convention used elsewhere.
+    let mut last_u: Option<f64> = None;
+    let mut emit_edge = |eid: EdgeId,
+                         fwd: bool,
+                         pin_u: Option<f64>,
+                         contour: &mut Vec<Vert>,
+                         last_u: &mut Option<f64>|
+     -> bool {
+        let samples = cache.get_or_compute(eid, model);
+        if samples.len() < 2 {
+            return false;
+        }
+        let ordered: Vec<Point3> = if fwd {
+            samples.to_vec()
+        } else {
+            samples.iter().rev().copied().collect()
+        };
+        for p in &ordered[..ordered.len() - 1] {
+            let (u, v) = match pin_u {
+                Some(pu) => {
+                    // Seam side: v from closest_point (the height along the
+                    // seam), u pinned to the rectangle wall.
+                    let v = surface.closest_point(p, tol).map(|(_, v)| v).unwrap_or(0.0);
+                    (pu, v)
+                }
+                None => {
+                    let Ok((mut u, v)) = surface.closest_point(p, tol) else {
+                        return false;
+                    };
+                    if let Some(pu) = *last_u {
+                        while u - pu > 0.5 {
+                            u -= 1.0;
+                        }
+                        while u - pu < -0.5 {
+                            u += 1.0;
+                        }
+                    }
+                    (u, v)
+                }
+            };
+            *last_u = Some(u);
+            contour.push(Vert { u, v, p: *p });
+        }
+        true
+    };
+
+    // Walk: seam#1 (right wall, u=1) · segmentA · seam#2 (left wall, u=0) ·
+    // segmentB. Determine each seam traversal's vertical direction from its
+    // sample order so the contour stays a simple CCW-or-CW ring; CDT is
+    // orientation-agnostic and the winding is fixed at emission.
+    let mut walked_first_seam = false;
+    for k in 0..n_edges {
+        let eid = rot_edges[k];
+        let fwd = rot_orient[k];
+        if eid == seam_edge {
+            let pin = if !walked_first_seam { 1.0 } else { 0.0 };
+            walked_first_seam = true;
+            // Reset the unwrap anchor to the pinned wall so the following
+            // segment unwraps from the correct side.
+            if !emit_edge(eid, fwd, Some(pin), &mut contour, &mut last_u) {
+                return false;
+            }
+            last_u = Some(pin);
+        } else if !emit_edge(eid, fwd, None, &mut contour, &mut last_u) {
+            return false;
+        }
+    }
+
+    if contour.len() < 6 {
+        return false;
+    }
+
+    // The unrolled contour must stay inside [0,1] in u (a small epsilon margin)
+    // and span a non-trivial u-range; otherwise the seam split mis-fired and we
+    // must not emit a folded patch — decline to curved-CDT.
+    let (mut u_lo, mut u_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for w in &contour {
+        u_lo = u_lo.min(w.u);
+        u_hi = u_hi.max(w.u);
+    }
+    if !u_lo.is_finite() || !u_hi.is_finite() {
+        return false;
+    }
+    if u_lo < -1e-6 || u_hi > 1.0 + 1e-6 || (u_hi - u_lo) < 0.5 {
+        return false;
+    }
+
+    // Outer UV polygon for the CDT.
+    let outer_uv: Vec<(f64, f64)> = contour.iter().map(|w| (w.u, w.v)).collect();
+    // Reject a self-touching / zero-area unrolled polygon (a mis-classified seam
+    // would collapse the rectangle).
+    let area = cap_notch_polygon_area(&outer_uv);
+    if area.abs() < 1e-6 {
+        return false;
+    }
+
+    // Structured interior Steiner grid: ring u-columns (the distinct boundary
+    // u-values) × chord-driven v-bands. Each candidate is kept only if it lies
+    // strictly inside the unrolled outer polygon, so the notch bite stays empty.
+    let m_bands = {
+        let probe = 32;
+        let mut prev = p00;
+        let mut length = 0.0;
+        for k in 1..=probe {
+            let v = k as f64 / probe as f64;
+            if let Ok(p) = surface.point_at(0.0, v) {
+                length += (p - prev).magnitude();
+                prev = p;
+            }
+        }
+        linear_steps_for_quality(length, params).max(2)
+    };
+    // u-columns: sample a uniform set across (0,1) plus the boundary u's, so the
+    // interior is well-graded regardless of the ring sampling density.
+    let n_cols = {
+        let circumference = {
+            let mut prev = p01;
+            let mut length = 0.0;
+            let probe = 48;
+            for k in 1..=probe {
+                let u = k as f64 / probe as f64;
+                if let Ok(p) = surface.point_at(u, 1.0) {
+                    length += (p - prev).magnitude();
+                    prev = p;
+                }
+            }
+            length
+        };
+        linear_steps_for_quality(circumference, params).max(8)
+    };
+    let mut steiner: Vec<(f64, f64)> = Vec::new();
+    for ci in 1..n_cols {
+        let u = ci as f64 / n_cols as f64;
+        for bj in 1..m_bands {
+            let v = bj as f64 / m_bands as f64;
+            if cap_notch_point_in_polygon(u, v, &outer_uv) {
+                steiner.push((u, v));
+            }
+        }
+    }
+
+    // Detach the NOTCH-BOTTOM cut arc from the free CDT and tessellate the thin
+    // strip just inside it as a STRUCTURED quad band. The notch's bottom cut edge
+    // is the box-cut plane ∩ the barrel — a verbatim-cached arc SHARED with the
+    // box-bottom planar face (decimating it would unweld the seam), so the lateral
+    // must carry its full dense sample stream. That stream is far denser in u than
+    // the interior grid, and its samples are coplanar (in the box's horizontal cut
+    // plane); a constrained Delaunay over it inevitably triangulates three
+    // consecutive arc samples into a facet that is flat in the cut plane and so
+    // folds tens of degrees off the true (radial) wall normal — and no interior
+    // Steiner point can prevent it (the constrained arc edges force the fan).
+    //
+    // Instead: build a parallel OFFSET ROW one band below the arc (real
+    // `point_at` samples, off the cut plane), feed the CDT the offset row as its
+    // bottom boundary (so the dense flat arc never enters the Delaunay), and stitch
+    // the arc → offset row as an explicit quad strip. Every strip triangle spans
+    // z=cut down into the wall, so none is flat; the arc samples weld to the box
+    // face verbatim and the offset row welds to the CDT region — watertight.
+    let band_h = 1.0 / m_bands as f64;
+    let mut arc_run: Vec<usize> = Vec::new();
+    {
+        // The notch-bottom arc is the maximal contiguous block of contour vertices
+        // that are cut samples (not ring, not seam) sitting within half a band of
+        // the lowest cut v — the horizontal arc, distinct from the side edges that
+        // climb to the rim.
+        let on_ring = |w: &Vert| w.v <= 1e-4 || w.v >= 1.0 - 1e-4;
+        let on_seam = |w: &Vert| w.u <= 1e-4 || w.u >= 1.0 - 1e-4;
+        let is_cut = |w: &Vert| !on_ring(w) && !on_seam(w);
+        let nc = contour.len();
+        let cut_idx: Vec<usize> = (0..nc).filter(|&i| is_cut(&contour[i])).collect();
+        if cut_idx.len() >= 3 {
+            let v_min = cut_idx
+                .iter()
+                .map(|&i| contour[i].v)
+                .fold(f64::INFINITY, f64::min);
+            let is_bottom = |i: usize| is_cut(&contour[i]) && contour[i].v <= v_min + 0.5 * band_h;
+            // Find the contiguous (cyclic) bottom run. Pick a start index that is a
+            // bottom vertex whose predecessor is NOT, so the run is a single block.
+            if (0..nc).any(is_bottom) && !(0..nc).all(is_bottom) {
+                let start = (0..nc)
+                    .find(|&i| is_bottom(i) && !is_bottom((i + nc - 1) % nc))
+                    .unwrap_or(0);
+                let mut k = start;
+                while is_bottom(k) {
+                    arc_run.push(k);
+                    k = (k + 1) % nc;
+                    if k == start {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Require a genuine multi-sample arc to detach; otherwise leave the contour as
+    // is (the plain CDT path handles a 1–2 sample bottom without flat fans).
+    if arc_run.len() < 3 {
+        arc_run.clear();
+    }
+
+    // Build the offset row (uv + resolved 3D) parallel to the arc INTERIOR, one
+    // band below. The arc's two END vertices are the notch corners (shared with
+    // the box side faces) — they STAY in the CDT contour at the cut plane so those
+    // welds are preserved; only the interior arc samples are replaced. Resolve 3D
+    // via `point_at`; if any sample fails, abandon the detour and fall back to the
+    // plain CDT over the original contour.
+    let mut offset_uv: Vec<(f64, f64)> = Vec::new();
+    let mut offset_p: Vec<Point3> = Vec::new();
+    if arc_run.len() >= 3 {
+        // Interior arc vertices = arc_run[1..len-1].
+        for &i in &arc_run[1..arc_run.len() - 1] {
+            let (ou, ov) = (contour[i].u, (contour[i].v - band_h).max(1e-4));
+            match surface.point_at(ou, ov) {
+                Ok(p) => {
+                    offset_uv.push((ou, ov));
+                    offset_p.push(p);
+                }
+                Err(_) => {
+                    arc_run.clear();
+                    offset_uv.clear();
+                    offset_p.clear();
+                    break;
+                }
+            }
+        }
+        if offset_uv.is_empty() {
+            arc_run.clear();
+        }
+    } else {
+        arc_run.clear();
+    }
+
+    // Assemble the CDT contour. When the arc is detached, the arc INTERIOR is
+    // replaced (in walk order) by the offset row; the two corner vertices remain.
+    // The bottom boundary of the CDT region is therefore: corner_left → offset row
+    // → corner_right. Track, per CDT-contour index, the resolved 3D + true (u,v).
+    struct CVert {
+        u: f64,
+        v: f64,
+        p: Point3,
+    }
+    let cdt_contour: Vec<CVert> = if arc_run.is_empty() {
+        contour
+            .iter()
+            .map(|w| CVert {
+                u: w.u,
+                v: w.v,
+                p: w.p,
+            })
+            .collect()
+    } else {
+        // arc_run is contiguous; replace its INTERIOR span with the offset row,
+        // keeping the first/last (corner) vertices. Walk the contour; at the first
+        // INTERIOR arc vertex, splice in the offset row, then skip the rest of the
+        // interior; the corner vertices fall through as ordinary contour vertices.
+        let interior: std::collections::HashSet<usize> =
+            arc_run[1..arc_run.len() - 1].iter().copied().collect();
+        let interior_first = arc_run[1];
+        let mut out: Vec<CVert> = Vec::with_capacity(contour.len());
+        for i in 0..contour.len() {
+            if i == interior_first {
+                for (k, &(ou, ov)) in offset_uv.iter().enumerate() {
+                    out.push(CVert {
+                        u: ou,
+                        v: ov,
+                        p: offset_p[k],
+                    });
+                }
+            } else if interior.contains(&i) {
+                continue;
+            } else {
+                out.push(CVert {
+                    u: contour[i].u,
+                    v: contour[i].v,
+                    p: contour[i].p,
+                });
+            }
+        }
+        out
+    };
+
+    let outer_uv: Vec<(f64, f64)> = cdt_contour.iter().map(|w| (w.u, w.v)).collect();
+    // Drop interior Steiner candidates that fell into the thin arc→offset strip we
+    // now own explicitly (between the offset row and the original arc v).
+    if !arc_run.is_empty() {
+        let v_arc = arc_run
+            .iter()
+            .map(|&i| contour[i].v)
+            .fold(f64::NEG_INFINITY, f64::max);
+        steiner.retain(|&(_, sv)| sv <= v_arc - band_h + 1e-9 || sv >= v_arc + 1e-9);
+        steiner.retain(|&(su, sv)| cap_notch_point_in_polygon(su, sv, &outer_uv) || sv < v_arc);
+    }
+
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+        eprintln!(
+            "[capnotch] face={:?} contour={} cdt_contour={} arc_run={} steiner={} u=[{:.3},{:.3}] m_bands={} n_cols={}",
+            face.id,
+            contour.len(),
+            cdt_contour.len(),
+            arc_run.len(),
+            steiner.len(),
+            u_lo,
+            u_hi,
+            m_bands,
+            n_cols
+        );
+    }
+
+    // Triangulate the unrolled rectangle-with-notch (bottom boundary = offset row
+    // when the arc was detached).
+    let inner_uvs: Vec<Vec<(f64, f64)>> = Vec::new();
+    let (pts2d, triangles) = match super::curved_cdt::run_cdt(&outer_uv, &inner_uvs, &steiner) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // Resolve every CDT vertex to 3D: a boundary vertex (index < cdt_contour.len())
+    // takes its resolved 3D (verbatim cache for true boundary samples, `point_at`
+    // for the offset row); an interior Steiner vertex uses `surface.point_at`.
+    let orient_sign = face.orientation.sign();
+    let n_boundary = cdt_contour.len();
+    let vertex_base = mesh.vertices.len() as u32;
+    for (i, &(u, v)) in pts2d.iter().enumerate() {
+        let (position, nu, nv) = if i < n_boundary {
+            (cdt_contour[i].p, cdt_contour[i].u, cdt_contour[i].v)
+        } else {
+            match surface.point_at(u, v) {
+                Ok(p) => (p, u, v),
+                Err(_) => return false,
+            }
+        };
+        let normal = surface
+            .normal_at(nu, nv)
+            .map(|nn| nn * orient_sign)
+            .unwrap_or(Vector3::Z);
+        mesh.add_vertex(MeshVertex {
+            position,
+            normal,
+            uv: Some((nu, nv)),
+        });
+    }
+    // Wind each triangle outward against the stored (orientation-corrected)
+    // normals — the CDT's UV winding does not encode the 3D outward sense.
+    for tri in &triangles {
+        emit_outward_triangle(
+            mesh,
+            vertex_base + tri[0] as u32,
+            vertex_base + tri[1] as u32,
+            vertex_base + tri[2] as u32,
+        );
+    }
+
+    // Stitch the detached arc → offset row as a structured quad strip. The strip's
+    // TOP row is the full arc (corners + interior); its BOTTOM row is the offset
+    // row bracketed by the SAME two corners. The corners and the offset row are
+    // already CDT-contour vertices (so they weld to the side edges and the CDT
+    // region); their mesh indices are `vertex_base + their cdt_contour position`.
+    // Only the interior arc samples (verbatim cut-plane cache) are added fresh.
+    // Every strip triangle spans the cut plane down to the off-plane offset row, so
+    // none is flat.
+    if !arc_run.is_empty() {
+        // Map original contour index → cdt_contour position, for the vertices that
+        // survived into the CDT contour (everything except the arc interior). The
+        // offset row was spliced where the first interior arc vertex sat.
+        let interior: std::collections::HashSet<usize> =
+            arc_run[1..arc_run.len() - 1].iter().copied().collect();
+        let interior_first = arc_run[1];
+        let mut cdt_pos: HashMap<usize, usize> = HashMap::new();
+        let mut offset_start = 0usize;
+        {
+            let mut pos = 0usize;
+            for i in 0..contour.len() {
+                if i == interior_first {
+                    offset_start = pos;
+                    pos += offset_uv.len();
+                } else if interior.contains(&i) {
+                    continue;
+                } else {
+                    cdt_pos.insert(i, pos);
+                    pos += 1;
+                }
+            }
+        }
+        let corner_l = arc_run[0];
+        let corner_r = arc_run[arc_run.len() - 1];
+        let (Some(&cl_pos), Some(&cr_pos)) = (cdt_pos.get(&corner_l), cdt_pos.get(&corner_r))
+        else {
+            return true; // corners not in CDT contour (should not happen) — skip strip
+        };
+        let cl_idx = vertex_base + cl_pos as u32;
+        let cr_idx = vertex_base + cr_pos as u32;
+        // Bottom row: [corner_l, offset[0..], corner_r].
+        let mut bottom: Vec<u32> = Vec::with_capacity(arc_run.len());
+        bottom.push(cl_idx);
+        for k in 0..offset_uv.len() {
+            bottom.push(vertex_base + (offset_start + k) as u32);
+        }
+        bottom.push(cr_idx);
+        // Top row: [corner_l, fresh(interior arc samples), corner_r].
+        let mut top: Vec<u32> = Vec::with_capacity(arc_run.len());
+        top.push(cl_idx);
+        for &i in &arc_run[1..arc_run.len() - 1] {
+            let normal = surface
+                .normal_at(contour[i].u, contour[i].v)
+                .map(|nn| nn * orient_sign)
+                .unwrap_or(Vector3::Z);
+            top.push(mesh.add_vertex(MeshVertex {
+                position: contour[i].p,
+                normal,
+                uv: Some((contour[i].u, contour[i].v)),
+            }));
+        }
+        top.push(cr_idx);
+        // Stitch the equal-length rows as a quad strip.
+        if top.len() == bottom.len() {
+            for j in 0..top.len() - 1 {
+                emit_outward_triangle(mesh, top[j], top[j + 1], bottom[j + 1]);
+                emit_outward_triangle(mesh, top[j], bottom[j + 1], bottom[j]);
+            }
+        }
+    }
+
+    true
+}
+
+/// Signed area of a 2D polygon (shoelace). Sign encodes winding; magnitude is
+/// the area. Local to the cap-notch mesher's degeneracy guard.
+fn cap_notch_polygon_area(poly: &[(f64, f64)]) -> f64 {
+    let n = poly.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0;
+    let mut j = n - 1;
+    for i in 0..n {
+        a += (poly[j].0 + poly[i].0) * (poly[j].1 - poly[i].1);
+        j = i;
+    }
+    0.5 * a
+}
+
+/// Even-odd point-in-polygon for the cap-notch interior Steiner filter.
+fn cap_notch_point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > py) != (yj > py) {
+            let x_int = (xj - xi) * (py - yi) / (yj - yi) + xi;
+            if px < x_int {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
 }
 
 /// Ray-cast point-in-polygon in 2D (even-odd rule). Local to the skin-lateral
