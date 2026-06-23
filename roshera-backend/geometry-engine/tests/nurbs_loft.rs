@@ -13,6 +13,7 @@ use geometry_engine::operations::nurbs_loft::{nurbs_loft, NurbsLoftOptions};
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 
 /// Sample a circle of `n` points (NOT closed — `nurbs_loft` closes the ring)
 /// at height `z`, radius `r`, centred on the Z axis.
@@ -97,6 +98,138 @@ fn nurbs_loft_straight_tube_is_watertight() {
     ];
     let s = nurbs_loft(&mut m, sections, NurbsLoftOptions::default()).expect("nurbs_loft tube");
     assert_nurbs_solid_sound(&m, s, "tube");
+}
+
+/// A SLENDER, high-aspect (7.5:1 fineness) missile body — a tangent-ogive nose
+/// blending into a constant-radius cylindrical body and tapering to a boattail,
+/// lofted through 13 unevenly-spaced circular rings (the body rings sit 17 units
+/// apart at z=16→33→50). This is the dogfooded shape whose lateral skin used to
+/// under-tessellate (the v-sampling between the widely-spaced body rings collapsed
+/// the silhouette to less than the true radius) and crack at the cap↔lateral rim.
+///
+/// The gate pins BOTH coupled defects shut, durably and across the whole display
+/// preset matrix (not just the cert's `default()` chord): the mesh must be
+/// watertight (zero boundary edges) at every preset a viewport/export path can
+/// pick, AND every mesh must resolve the true Ø8 body — a v/u under-sample would
+/// shrink the meshed silhouette below the real radius. The cert (`ground_truth`)
+/// must report `sound`.
+#[test]
+fn nurbs_loft_slender_missile_is_watertight() {
+    // (z, radius) — tangent-ogive nose → cylindrical body (r=4) → boattail.
+    let profile = [
+        (0.0, 0.10),
+        (2.0, 0.984),
+        (4.0, 1.812),
+        (6.0, 2.496),
+        (8.0, 3.045),
+        (10.0, 3.466),
+        (12.0, 3.764),
+        (14.0, 3.941),
+        (16.0, 4.0),
+        (33.0, 4.0),
+        (50.0, 4.0),
+        (55.0, 3.5),
+        (60.0, 3.0),
+    ];
+    let sections: Vec<Vec<Point3>> = profile.iter().map(|&(z, r)| ring(16, r, z)).collect();
+
+    let mut m = BRepModel::new();
+    let s = nurbs_loft(&mut m, sections, NurbsLoftOptions::default()).expect("nurbs_loft missile");
+
+    // B-Rep + cert: a valid, watertight, sound NURBS solid.
+    assert_nurbs_solid_sound(&m, s, "missile");
+    let gt = m.ground_truth(s).expect("missile ground truth");
+    assert!(
+        gt.certificate.is_sound(),
+        "missile: cert NOT sound — {}",
+        gt.summary()
+    );
+
+    // Body envelope: Ø8 (radius 4) × 60 tall. The whole point of the bug — the
+    // mesh must reach the full body radius, not a collapsed Ø6.
+    let bbox = m.solid_world_bbox(s).expect("bbox");
+    let sz = bbox.size();
+    assert!(
+        (sz.x - 8.0).abs() < 0.3 && (sz.y - 8.0).abs() < 0.3 && (sz.z - 60.0).abs() < 0.01,
+        "missile envelope wrong (expected ~Ø8 × 60): {sz:?}"
+    );
+
+    // Display-preset matrix: every quality a viewport / export / preview path can
+    // select must tessellate the slender skin watertight AND resolve the true Ø8
+    // body. A v/u under-sample (the original defect) shows up here as boundary
+    // edges (cap↔lateral cracks) or a meshed diameter short of Ø8.
+    let presets: [(&str, TessellationParams); 5] = [
+        ("default", TessellationParams::default()),
+        ("coarse", TessellationParams::coarse()),
+        ("fine", TessellationParams::fine()),
+        ("display", TessellationParams::display()),
+        ("realtime", TessellationParams::realtime()),
+    ];
+    for (name, params) in &presets {
+        let solid_ref = m.solids.get(s).expect("solid");
+        let mesh = tessellate_solid(solid_ref, &m, params);
+        assert!(
+            !mesh.triangles.is_empty(),
+            "missile {name}: empty tessellation"
+        );
+
+        // Weld by quantised position and count undirected-edge multiplicities.
+        let eps = 1e-6_f64;
+        let key = |p: &Point3| {
+            (
+                (p.x / eps).round() as i64,
+                (p.y / eps).round() as i64,
+                (p.z / eps).round() as i64,
+            )
+        };
+        let mut weld: std::collections::HashMap<(i64, i64, i64), u32> =
+            std::collections::HashMap::new();
+        let mut widx: Vec<u32> = Vec::with_capacity(mesh.vertices.len());
+        for vtx in &mesh.vertices {
+            let k = key(&vtx.position);
+            let next = weld.len() as u32;
+            widx.push(*weld.entry(k).or_insert(next));
+        }
+        let mut undirected: std::collections::HashMap<(u32, u32), u32> =
+            std::collections::HashMap::new();
+        let mut dia = (0.0_f64, 0.0_f64); // (x-extent, y-extent)
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for vtx in &mesh.vertices {
+            lo[0] = lo[0].min(vtx.position.x);
+            hi[0] = hi[0].max(vtx.position.x);
+            lo[1] = lo[1].min(vtx.position.y);
+            hi[1] = hi[1].max(vtx.position.y);
+        }
+        dia.0 = hi[0] - lo[0];
+        dia.1 = hi[1] - lo[1];
+        for tri in &mesh.triangles {
+            let (a, b, c) = (
+                widx[tri[0] as usize],
+                widx[tri[1] as usize],
+                widx[tri[2] as usize],
+            );
+            if a == b || b == c || c == a {
+                continue;
+            }
+            for (x, y) in [(a, b), (b, c), (c, a)] {
+                let e = if x < y { (x, y) } else { (y, x) };
+                *undirected.entry(e).or_insert(0) += 1;
+            }
+        }
+        let boundary = undirected.values().filter(|&&n| n == 1).count();
+        let nonmanifold = undirected.values().filter(|&&n| n >= 3).count();
+        assert_eq!(
+            (boundary, nonmanifold),
+            (0, 0),
+            "missile {name}: not watertight (boundary_edges={boundary}, nonmanifold={nonmanifold})"
+        );
+        let meshed_dia = dia.0.max(dia.1);
+        assert!(
+            meshed_dia >= 7.6,
+            "missile {name}: meshed silhouette Ø{meshed_dia:.3} < Ø8 body — skin under-sampled"
+        );
+    }
 }
 
 /// A non-circular (super-ellipse-ish) freeform section lofted with a twist of
