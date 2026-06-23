@@ -1899,20 +1899,47 @@ pub async fn extrude_sketch(
     let result_solid_id = build_result?;
 
     // Link the source sketch to the resulting solid in the kernel
-    // (FIX 1 / FIX 2). Record the sketch plane origin + every lifted
+    // (FIX 1 / FIX 2). Record the sketch frame anchor + every lifted
     // profile point as the solid's construction geometry. From here the
     // kernel owns the solid↔sketch link: a later `transform_solid` carries
     // the sketch with the solid, and the validity certificate certifies
     // the two stay co-located. The lifted profile points (`.3`) are the
     // world-space sketch loop vertices for every shape in the session.
     {
-        let frame_origin = session.plane.lift(0.0, 0.0);
         let mut profile_points: Vec<geometry_engine::math::Point3> = Vec::new();
         for (_id, _tool, _polygon_2d, lifted) in &shape_polygons {
             profile_points.extend_from_slice(lifted);
         }
+        // Anchor the construction frame on the profile CENTROID, not the
+        // plane's parametric `lift(0,0)`. The (0,0) point of a sketch plane
+        // is an arbitrary frame origin: for a profile drawn at an offset
+        // (cx,cy ≠ 0) or on any non-world plane (e.g. 'yz' → lift(0,0) is the
+        // world origin) it can sit far from the drawn shape, leaving the
+        // construction geometry geometrically stranded from the solid even
+        // though the profile itself is perfectly co-located. The centroid is
+        // a convex combination of in-plane profile vertices, so it provably
+        // lies ON the sketch plane AND within the profile's hull — i.e. on
+        // the solid's base face — making the anchor a genuine spatial point
+        // of the part (mirroring revolve, whose anchor is the on-axis origin).
+        // The profile points still carry the full co-location claim the
+        // orphaned-sketch invariant checks; the centroid only stops a
+        // perfect, offset/custom-plane profile from being falsely flagged
+        // Inconsistent. `profile_points` is non-empty here (every region
+        // contributes its lifted loop vertices), so the divisor is ≥ 1.
+        let frame_anchor = {
+            let n = profile_points.len().max(1) as f64;
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+            let mut sz = 0.0;
+            for p in &profile_points {
+                sx += p.x;
+                sy += p.y;
+                sz += p.z;
+            }
+            geometry_engine::math::Point3::new(sx / n, sy / n, sz / n)
+        };
         let construction = geometry_engine::primitives::provenance::ConstructionGeometry::new(
-            frame_origin,
+            frame_anchor,
             profile_points,
         );
         let mut model = model_handle.write().await;
@@ -3687,5 +3714,176 @@ mod tests {
             .get(*shell.faces.last().expect("top cap"))
             .expect("top face");
         assert_eq!(top_face.inner_loops.len(), 2, "top cap carries both holes");
+    }
+
+    // ---------------------------------------------------------------
+    // B4 — construction-consistency gate for create_box / extrude
+    //
+    // A geometrically-perfect box built on an OFFSET or CUSTOM ('yz')
+    // plane must certify `construction_consistent != Inconsistent` and
+    // `is_sound() == true`. The live defect (aircraft-design loop): a
+    // 'yz' box at (cx=17, cy=28, 26×14×1) was watertight + manifold +
+    // tessellation-clean yet `construction_consistent=Inconsistent` →
+    // sound=false, because the construction frame was anchored on the
+    // plane's `lift(0,0)` (the WORLD ORIGIN for 'yz'), which sits far
+    // from the drawn profile. The fix anchors the frame on the profile
+    // CENTROID (a point provably on the solid's base face); the profile
+    // points still carry the full orphaned-sketch co-location claim.
+    // ---------------------------------------------------------------
+
+    /// How the construction-frame anchor is chosen — the production
+    /// CENTROID (the fix) vs the legacy `lift(0,0)` plane origin (the
+    /// defect). The gate runs both to prove the test is non-vacuous: the
+    /// legacy anchor MUST flag a perfect offset box `Inconsistent`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum AnchorMode {
+        Centroid,
+        PlaneOrigin,
+    }
+
+    /// Build a single-rectangle box via the kernel extrude path and link
+    /// its construction geometry exactly as the production `extrude_sketch`
+    /// handler does, with the chosen anchor mode. Returns the certified
+    /// solid's verdict + soundness.
+    fn box_construction_verdict(
+        session: &SketchSession,
+        direction: Vector3,
+        distance: f64,
+        anchor: AnchorMode,
+    ) -> (
+        geometry_engine::primitives::provenance::ConstructionConsistency,
+        bool,
+    ) {
+        // Mirror the production lift so the linked profile points match
+        // exactly what the handler records.
+        let mut profile_points: Vec<Point3> = Vec::new();
+        for shape in session.shapes.iter().filter(|s| !s.points.is_empty()) {
+            let polygon_2d =
+                materialise_shape(shape, session.circle_segments).expect("materialise");
+            profile_points.extend(lift_polygon(session, &polygon_2d));
+        }
+        assert!(
+            !profile_points.is_empty(),
+            "gate session must produce a profile"
+        );
+
+        let frame_anchor = match anchor {
+            AnchorMode::Centroid => {
+                let n = profile_points.len() as f64;
+                let (mut sx, mut sy, mut sz) = (0.0, 0.0, 0.0);
+                for p in &profile_points {
+                    sx += p.x;
+                    sy += p.y;
+                    sz += p.z;
+                }
+                Point3::new(sx / n, sy / n, sz / n)
+            }
+            AnchorMode::PlaneOrigin => session.plane.lift(0.0, 0.0),
+        };
+
+        let (mut model, solid_id) = extrude_session_via_kernel(session, direction, distance);
+        let construction = geometry_engine::primitives::provenance::ConstructionGeometry::new(
+            frame_anchor,
+            profile_points,
+        );
+        model.set_solid_construction(solid_id, construction);
+        let cert = model.certify_solid(solid_id);
+        (cert.construction_consistent, cert.is_sound())
+    }
+
+    fn yz_box_session() -> SketchSession {
+        // The live repro: 'yz' plane, centred at (cx=17, cy=28), 26×14.
+        let cx = 17.0;
+        let cy = 28.0;
+        let w = 26.0;
+        let d = 14.0;
+        SketchSession {
+            id: Uuid::new_v4(),
+            plane: SketchPlane::YZ,
+            shapes: vec![SketchShape {
+                id: Uuid::new_v4(),
+                tool: SketchTool::Rectangle,
+                points: vec![[cx - w / 2.0, cy - d / 2.0], [cx + w / 2.0, cy + d / 2.0]],
+            }],
+            circle_segments: 32,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn default_box_session() -> SketchSession {
+        // Default xy plane, also OFFSET from the origin so even the
+        // standard-plane path exercises a non-origin profile.
+        SketchSession {
+            id: Uuid::new_v4(),
+            plane: SketchPlane::XY,
+            shapes: vec![SketchShape {
+                id: Uuid::new_v4(),
+                tool: SketchTool::Rectangle,
+                points: vec![[10.0, 20.0], [30.0, 40.0]],
+            }],
+            circle_segments: 32,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn b4_custom_plane_box_is_construction_consistent_and_sound() {
+        use geometry_engine::primitives::provenance::ConstructionConsistency;
+        // 'yz' box extrudes along +X (the plane normal) by height 1.
+        let (verdict, sound) =
+            box_construction_verdict(&yz_box_session(), Vector3::X, 1.0, AnchorMode::Centroid);
+        assert_ne!(
+            verdict,
+            ConstructionConsistency::Inconsistent,
+            "a geometrically-perfect custom-plane ('yz') box must NOT be Inconsistent"
+        );
+        assert_eq!(
+            verdict,
+            ConstructionConsistency::Consistent,
+            "the profile-centroid anchor co-locates with the solid"
+        );
+        assert!(
+            sound,
+            "a watertight, manifold, tessellation-clean offset box must be sound"
+        );
+    }
+
+    #[test]
+    fn b4_default_plane_offset_box_is_construction_consistent_and_sound() {
+        use geometry_engine::primitives::provenance::ConstructionConsistency;
+        let (verdict, sound) = box_construction_verdict(
+            &default_box_session(),
+            Vector3::Z,
+            5.0,
+            AnchorMode::Centroid,
+        );
+        assert_eq!(
+            verdict,
+            ConstructionConsistency::Consistent,
+            "an offset xy box must also be construction-consistent"
+        );
+        assert!(sound, "offset xy box must be sound");
+    }
+
+    #[test]
+    fn b4_gate_is_non_vacuous_legacy_anchor_flags_inconsistent() {
+        use geometry_engine::primitives::provenance::ConstructionConsistency;
+        // Proof the fix is load-bearing: with the OLD `lift(0,0)` anchor
+        // the same perfect 'yz' box certifies Inconsistent + unsound. If
+        // this ever stops failing, the anchor choice no longer matters and
+        // the gate above would be vacuous.
+        let (verdict, sound) =
+            box_construction_verdict(&yz_box_session(), Vector3::X, 1.0, AnchorMode::PlaneOrigin);
+        assert_eq!(
+            verdict,
+            ConstructionConsistency::Inconsistent,
+            "legacy plane-origin anchor MUST strand the construction frame (non-vacuous gate)"
+        );
+        assert!(
+            !sound,
+            "Inconsistent construction geometry MUST fold sound→false"
+        );
     }
 }
