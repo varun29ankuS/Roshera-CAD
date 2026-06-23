@@ -2907,6 +2907,36 @@ pub fn interpolate_nurbs_curve(
         }
     };
 
+    interpolate_nurbs_curve_with_params(points, degree, &params)
+}
+
+/// Global NURBS interpolation through `points` against an EXPLICIT, caller-supplied
+/// parameter assignment `params` (one normalized value in `[0, 1]` per data point,
+/// strictly increasing, `params[0] == 0`, `params[last] == 1`). This is the core
+/// [`interpolate_nurbs_curve`] dispatches to once it has chosen a parameterization;
+/// exposing it lets a skinning loft pin EVERY control-column to a SINGLE shared
+/// parameterization (so the columns all yield the identical knot vector — the
+/// rectangular-grid precondition a tensor-product surface requires) instead of each
+/// column deriving its own chord-length params and disagreeing.
+///
+/// Method: averaged knots (Piegl & Tiller A9.2, `u_{j} = (1/p) Σ ū_{i}`) over the
+/// supplied parameters, then the banded totally-positive collocation solve
+/// (A9.1) — identical to [`interpolate_nurbs_curve`]. The resulting curve passes
+/// through every data point at its assigned parameter.
+pub fn interpolate_nurbs_curve_with_params(
+    points: &[Point3],
+    degree: usize,
+    params: &[f64],
+) -> Result<NurbsCurve, &'static str> {
+    if points.len() < degree + 1 {
+        return Err("Not enough points for the requested degree");
+    }
+    if params.len() != points.len() {
+        return Err("interpolate_nurbs_curve_with_params: params/points length mismatch");
+    }
+    let n = points.len() - 1;
+    let params = params.to_vec();
+
     // Compute knot vector
     let mut knots = vec![0.0; degree + 1];
 
@@ -3194,11 +3224,54 @@ pub fn skin_surface_periodic_u(
     };
 
     // Stage 2 — clamped degree_v interpolate down each U control column.
+    //
+    // The V-parameterization is CENTRIPETAL over the section spacing, computed ONCE
+    // and SHARED by every column. Uniform v-params (the previous choice) force the
+    // degree-v cubic to traverse a wide inter-section gap in the same parameter span
+    // as a narrow one; through UNEVENLY spaced sections (e.g. a slender loft whose
+    // nose rings sit 2 units apart but whose body rings sit 17 apart) that drives a
+    // dv-velocity OVERSHOOT at the spacing/curvature break, tilting ∂S/∂v inward far
+    // enough to flip du×dv — the lateral normal then points INWARD in a band, so the
+    // display mesh folds (watertight but off-surface). Centripetal (√chord) spacing
+    // is the standard skinning cure for this overshoot (Piegl & Tiller §9.2.2/§10.3;
+    // Lee 1989): it matches the parameter interval to the physical section spacing,
+    // damped by the sqrt so a single large gap cannot dominate the knot averaging.
+    //
+    // The spacing is measured between SECTION CENTROIDS (one representative distance
+    // per inter-section step) so all columns share the identical v-parameterization
+    // and therefore the identical knots_v — the rectangular-grid precondition the
+    // tensor-product `NurbsSurface` requires. Degenerate (zero total) spacing falls
+    // back to uniform.
+    let v_params: Vec<f64> = {
+        let centroid = |sec: &[Point3]| -> Point3 {
+            let (mut sx, mut sy, mut sz) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for p in sec {
+                sx += p.x;
+                sy += p.y;
+                sz += p.z;
+            }
+            let k = sec.len().max(1) as f64;
+            Point3::new(sx / k, sy / k, sz / k)
+        };
+        let centroids: Vec<Point3> = sections.iter().map(|s| centroid(s)).collect();
+        let mut acc = vec![0.0_f64; n_v];
+        let mut total = 0.0_f64;
+        for i in 1..n_v {
+            total += (centroids[i] - centroids[i - 1]).magnitude().sqrt();
+            acc[i] = total;
+        }
+        if total > 1e-12 {
+            acc.iter().map(|a| a / total).collect()
+        } else {
+            (0..n_v).map(|i| i as f64 / (n_v - 1) as f64).collect()
+        }
+    };
+
     let mut knots_v: Option<Vec<f64>> = None;
     let mut control_points: Vec<Vec<Point3>> = Vec::with_capacity(m_u);
     for k in 0..m_u {
         let column: Vec<Point3> = (0..n_v).map(|v| row_ctrl[v][k]).collect();
-        let curve = interpolate_nurbs_curve(&column, degree_v, ParameterizationType::Uniform)?;
+        let curve = interpolate_nurbs_curve_with_params(&column, degree_v, &v_params)?;
         if curve.control_points.len() != n_v {
             return Err("skin_surface_periodic_u: V interpolation changed control-point count");
         }
