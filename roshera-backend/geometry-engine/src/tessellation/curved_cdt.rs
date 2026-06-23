@@ -797,7 +797,7 @@ fn generate_steiner_candidates(
 /// when emitting the mesh) and the resulting triangle index triples.
 ///
 /// On `cdt::Error`, returns `Err(CdtFailed(_))`.
-fn run_cdt(
+pub(crate) fn run_cdt(
     outer_uv: &[(f64, f64)],
     inner_uvs: &[Vec<(f64, f64)>],
     steiner: &[(f64, f64)],
