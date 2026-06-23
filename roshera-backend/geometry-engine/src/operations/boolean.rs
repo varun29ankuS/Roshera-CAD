@@ -8003,13 +8003,39 @@ fn compute_split_face_interior_points(
         })
         .collect();
 
+    // Per-loop EdgeId set, for the adjacency test below.
+    let loop_edge_sets: Vec<HashSet<EdgeId>> = loops
+        .iter()
+        .map(|cycle| cycle.iter().map(|&(eid, _)| eid).collect())
+        .collect();
+
     // Sibling-containment graph: children[i] = indices of loops whose 2D
     // centroid lies inside loop i's 2D polygon.
+    //
+    // ADJACENCY GUARD: a true hole (inner loop) shares NO edge with its
+    // container — the two boundaries are disjoint. Two ADJACENT arrangement
+    // cells, by contrast, share the edge they straddle. So a sibling that
+    // shares an edge with loop i can only be a NEIGHBOUR, never a hole, and
+    // must be excluded from `children` even if its centroid projects inside
+    // loop i's polygon. Without this, a cell bounded by a curved cut that bulges
+    // across the nominal split line (the lofted-barrel slot floor: the
+    // slot-mouth SSI dips ~0.2 mm past the adjacent cap-band cut) reports its
+    // edge-sharing neighbour as a phantom hole, the override then routes the
+    // interior sample around that phantom hole to a cell-edge point on the
+    // barrel surface, and the floor mis-classifies and drops (the w05
+    // full-height-slot leak). The guard cannot mask a real hole: a real hole
+    // never shares an edge with its face.
     let n = loops.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
         for j in 0..n {
             if i == j {
+                continue;
+            }
+            if loop_edge_sets[i]
+                .iter()
+                .any(|e| loop_edge_sets[j].contains(e))
+            {
                 continue;
             }
             let (cx, cy) = loop_centroids_2d[j];
@@ -11713,23 +11739,103 @@ pub(super) fn compute_edge_intersections(
     }
     let mut split_ops: Vec<SplitOp> = Vec::new();
 
-    for (eid_a, eid_b, point, t_a, t_b, dist) in &new_intersections {
-        // Create a real vertex in the model. `dist` is propagated as the
-        // geometric residual so the new vertex is stamped with a tolerance
-        // of at least max(global_tol, dist) — this is what lets the
-        // tolerant-modeling merge predicate downstream see the same
-        // uncertainty radius the intersection finder did.
-        let vid = find_or_create_intersection_vertex(model, graph, *point, tolerance, *dist);
+    // Parametric terminal epsilon: an intersection whose parameter on an edge
+    // sits within this of 0 or 1 falls ON that edge's own start/end vertex.
+    // This is a PARAMETRIC terminal test (literally "is this the curve's
+    // endpoint"), distinct from the length-scaled proximity threshold the
+    // split-application loop deliberately avoids.
+    const TERMINAL_EPS: f64 = 1e-9;
 
-        // Record intersection points as split ops on each edge.
-        if graph.edges.contains_key(eid_a) {
+    for (eid_a, eid_b, point, t_a, t_b, dist) in &new_intersections {
+        // ONE-SIDED T-JUNCTION endpoint reuse (narrow, conservative).
+        //
+        // The general case mints ONE fresh vertex at the intersection point and
+        // splits BOTH edges there. That is correct for an interior crossing, but
+        // when EXACTLY ONE edge is hit at its own parametric terminal while the
+        // OTHER is hit in its interior, the hit is a T-junction: the terminal
+        // edge already OWNS a vertex at that point. Reuse that existing endpoint
+        // vertex as the T-junction vertex (so the interior edge splits ONTO it)
+        // and don't split the terminal edge (splitting at a terminal only
+        // manufactures a zero-length sub-edge).
+        //
+        // Why this matters: `build_shared_corner_endpoints` may have retargeted
+        // that terminal endpoint to a clustered shared corner sitting a fit-
+        // residual (~1e-3) from the raw curve-evaluated point. Minting a fresh
+        // vertex at the raw point strands the welded corner — the terminal edge
+        // gets a degenerate [0,0]/[1,1] stub between corner and raw point, the
+        // stub is later dropped, and the cut arc detaches from the operand
+        // boundary (the w05 full-height-slot leak). Reusing the welded corner
+        // makes the T-junction exact.
+        //
+        // Scope guard — applied ONLY for a ONE-SIDED T-junction (exactly one
+        // edge terminal, the other interior) whose TERMINAL edge rides a
+        // FREEFORM (NURBS/B-spline/ruled/...) carrier curve. This is the
+        // surface–surface-intersection corefinement case: an SSI cut whose
+        // terminal endpoint `build_shared_corner_endpoints` retargeted to a
+        // clustered shared corner (a few ×1e-3 from the raw curve-evaluated
+        // point). Reusing that welded corner as the T-junction vertex closes the
+        // cut against the operand boundary; minting a fresh raw-point vertex
+        // strands it (the w05 leak).
+        //
+        // The freeform gate is load-bearing: an ANALYTIC cut arc (a box-poke
+        // circle/line) carries NO fit residual, its terminal IS its exact corner,
+        // and reusing-vs-minting is a no-op geometrically — BUT suppressing the
+        // analytic arc's terminal split corrupts the analytic arrangement (the
+        // cylinder axial/horizontal-poke cells). So analytic terminals keep the
+        // verbatim mint-and-split, leaving the analytic core (poke_matrix)
+        // untouched, while only a freeform SSI terminal takes the reuse path.
+        let edge_curve_is_freeform = |eid: EdgeId| -> bool {
+            model
+                .edges
+                .get(eid)
+                .and_then(|e| model.curves.get(e.curve_id))
+                .map(|c| c.type_name() == "NURBS")
+                .unwrap_or(false)
+        };
+        let terminal_vertex = |eid: EdgeId, t: f64| -> Option<VertexId> {
+            if !edge_curve_is_freeform(eid) {
+                return None;
+            }
+            let edge = model.edges.get(eid)?;
+            let v = if t <= TERMINAL_EPS {
+                edge.start_vertex
+            } else if t >= 1.0 - TERMINAL_EPS {
+                edge.end_vertex
+            } else {
+                return None;
+            };
+            if v == u32::MAX || v == crate::primitives::vertex::INVALID_VERTEX_ID {
+                return None;
+            }
+            Some(v)
+        };
+        let a_terminal = terminal_vertex(*eid_a, *t_a);
+        let b_terminal = terminal_vertex(*eid_b, *t_b);
+
+        // Reuse the terminal endpoint vertex only for a one-sided T-junction;
+        // otherwise mint a fresh vertex exactly as before. `dist` stamps the
+        // minted vertex with the intersection's geometric residual.
+        let (vid, skip_split_a, skip_split_b) = match (a_terminal, b_terminal) {
+            (Some(va), None) => (va, true, false),
+            (None, Some(vb)) => (vb, false, true),
+            _ => (
+                find_or_create_intersection_vertex(model, graph, *point, tolerance, *dist),
+                false,
+                false,
+            ),
+        };
+
+        // Record split ops. A terminal edge in a one-sided T-junction is not
+        // split (it already ends at `vid`); every other edge splits at its
+        // parameter against `vid`.
+        if !skip_split_a && graph.edges.contains_key(eid_a) {
             split_ops.push(SplitOp {
                 edge_id: *eid_a,
                 parameter: *t_a,
                 vertex_id: vid,
             });
         }
-        if graph.edges.contains_key(eid_b) {
+        if !skip_split_b && graph.edges.contains_key(eid_b) {
             split_ops.push(SplitOp {
                 edge_id: *eid_b,
                 parameter: *t_b,
