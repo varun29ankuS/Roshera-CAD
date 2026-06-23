@@ -8074,7 +8074,32 @@ fn compute_split_face_interior_points(
         }
         if let Some((u, v)) = found {
             let p = Vector3::new(origin.x, origin.y, origin.z) + e1 * u + e2 * v;
-            result[i] = Some(Point3::new(p.x, p.y, p.z));
+            let candidate = Point3::new(p.x, p.y, p.z);
+            // ON-SURFACE GUARD. The flat tangent-plane projection is exact for a
+            // PLANE but only locally faithful on a curved face. When a loop
+            // WRAPS the lateral (a freeform body loop = the whole barrel minus
+            // the pocket), its flattened polygon folds back over itself, the
+            // containment/nudge can land on the far fold, and the back-projected
+            // 3D point sits OFF the surface — e.g. the w03 through-slot barrel
+            // islands resolved to (4.1, 3.9, 2.1), |xy| ≈ 5.7 ≫ r = 4. Such a
+            // point classifies against the wrong material and either keeps a
+            // removed patch (w03 doubled wall) or drops a kept one. Accept the
+            // correction only when the candidate actually lies on the face's
+            // surface; otherwise leave `None` so `get_face_interior_point` falls
+            // back to the boundary-midpoint centroid (an on-surface point for
+            // these small convex islands). Planar faces always pass the guard,
+            // so their behaviour — and every planar-boolean / poke_matrix
+            // verdict — is unchanged.
+            let on_surface = match surface.closest_point(&candidate, tol) {
+                Ok((cu, cv)) => match surface.point_at(cu, cv) {
+                    Ok(foot) => (foot - candidate).magnitude() <= tol.distance().max(1.0e-6),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if on_surface {
+                result[i] = Some(candidate);
+            }
         }
     }
 
@@ -14383,6 +14408,252 @@ fn reconstruct_topology(
 /// the canonical edge for a duplicate that ran in the opposite
 /// direction, we flip `forward` so the loop's geometric walk is
 /// unchanged.
+/// Weld imprint-RESIDUAL duplicate vertices left after the per-face splits.
+///
+/// `build_shared_corner_endpoints` clusters the cut-arc ENDPOINTS into one
+/// welded corner per pocket corner *before* the arrangements run, so the
+/// freeform operand's opening closes into a clean loop on identical corner
+/// vertices. But a planar cutter face (a box cap / wall) can re-introduce a
+/// near-duplicate of a welded corner DURING its own arrangement: where the same
+/// imprinted arc is split against that face's boundary, the split lands at the
+/// arc's RAW (pre-weld) endpoint position rather than the welded corner. The
+/// two vertices then sit a tiny imprint RESIDUAL apart — above the global weld
+/// tolerance (so `canonicalise_face_edges_by_position`'s 1e-12 position match
+/// never unifies them) yet far below any real feature dimension.
+///
+/// Concretely, the w03 through-slot: the +Y opening corner is welded at
+/// y = 3.8667, but the z = const box-cap face splits the shared arc at the raw
+/// y = 3.8612 — a 0.0055 residual. The box-cap arc therefore becomes
+/// `corner → raw → raw → corner` (two ~0.0055 slivers around the real middle
+/// piece), shares no edge with the barrel opening's single full arc, and the
+/// tunnel wall strands into its own shell (euler -5, 72 boundary edges).
+///
+/// This pass closes that gap WITHOUT touching the global weld tolerance or the
+/// mesh: it detects the residual band the same way `build_shared_corner_
+/// endpoints` does — the widest multiplicative jump in the sorted cross-vertex
+/// distance list, required to be ≥4× and capped below the feature band so two
+/// distinct features can never merge — then, for vertices within that band,
+/// retargets each face-loop edge's model endpoints to a single canonical vertex
+/// and DROPS any edge that collapses to zero extent (a sliver). The middle
+/// piece's endpoints become the welded corners, so it now keys identically to
+/// the freeform arc and `canonicalise` unifies them into one shared edge ⇒ one
+/// shell. Purely topological: vertex POSITIONS are never moved, so geometry and
+/// every analytic-boolean verdict (poke_matrix) are unchanged when no residual
+/// band exists (the common case — the pass is then a no-op).
+fn weld_imprint_residual_vertices(
+    model: &mut BRepModel,
+    faces: &mut [SplitFace],
+    tolerance: &Tolerance,
+) {
+    // GATE: this residual only exists for FREEFORM corefinement. A
+    // surface–surface intersection curve between two freeform (or freeform ×
+    // analytic) faces is FITTED independently per cutter face, so a shared
+    // pocket corner is reproduced at slightly different positions on each face
+    // (the SSI fit residual) — exactly what `build_shared_corner_endpoints`
+    // partly welds and this pass finishes. A boolean among ANALYTIC faces only
+    // (plane/cylinder/sphere/cone) has its corners minted EXACTLY by the
+    // analytic splitters; there is no fit residual, and the gap-jump heuristic
+    // must never run there (it would mistake a small-but-REAL analytic feature
+    // — e.g. a sphere corner-poke cap, a cone axial-poke band — for a residual
+    // and merge distinct vertices, corrupting the analytic core / poke_matrix).
+    // Require at least one non-analytic surface among the faces before acting.
+    let any_freeform = faces.iter().any(|f| {
+        model
+            .surfaces
+            .get(f.surface)
+            .map(|s| {
+                matches!(
+                    s.surface_type(),
+                    SurfaceType::NURBS
+                        | SurfaceType::BSpline
+                        | SurfaceType::Ruled
+                        | SurfaceType::SurfaceOfRevolution
+                        | SurfaceType::Offset
+                )
+            })
+            .unwrap_or(false)
+    });
+    if !any_freeform {
+        return;
+    }
+
+    // Collect every vertex any face loop touches, with its position, deduped.
+    let mut verts: Vec<(VertexId, Point3)> = Vec::new();
+    {
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        for face in faces.iter() {
+            for &(eid, _) in face
+                .boundary_edges
+                .iter()
+                .chain(face.inner_loops.iter().flatten())
+            {
+                if let Some(edge) = model.edges.get(eid) {
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if vid == crate::primitives::vertex::INVALID_VERTEX_ID {
+                            continue;
+                        }
+                        if !seen.insert(vid) {
+                            continue;
+                        }
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            verts.push((vid, Point3::new(p[0], p[1], p[2])));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let n = verts.len();
+    if n < 2 {
+        return;
+    }
+
+    let global_tol = tolerance.distance();
+
+    // Cross-vertex distances, ascending. Pairs already within the global weld
+    // tolerance are excluded — those are exact duplicates `canonicalise` handles.
+    let mut pair_dists: Vec<f64> = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = (verts[i].1 - verts[j].1).magnitude();
+            if d > global_tol {
+                pair_dists.push(d);
+            }
+        }
+    }
+    if pair_dists.is_empty() {
+        return;
+    }
+    pair_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Residual band = the LOW tail below the widest ≥4× multiplicative jump in
+    // the sorted distance list. A fit residual (~1e-2) sits orders below any
+    // real feature dimension, so the two are separated by a wide multiplicative
+    // gap. We anchor the band radius at the GEOMETRIC MEAN of that gap
+    // (`√(lo·hi)`) — the natural separator of two multiplicative bands — rather
+    // than the arithmetic midpoint, so the radius hugs the residual side and
+    // can NEVER reach toward a real feature even when the upper band is large
+    // (e.g. a 2 mm slot above 5 µm residuals: arithmetic midpoint ≈ 1 mm would
+    // be perilously permissive; geometric mean ≈ 0.1 mm stays an order below the
+    // feature). The ≥4× jump requirement guarantees two distinct features are
+    // never linked. No qualifying jump ⇒ no residual duplicates ⇒ nothing to do.
+    let radius = {
+        let mut radius = global_tol;
+        let mut best_ratio = 4.0;
+        for w in pair_dists.windows(2) {
+            let (lo, hi) = (w[0], w[1]);
+            if lo <= global_tol {
+                continue;
+            }
+            let ratio = hi / lo;
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                radius = (lo * hi).sqrt();
+            }
+        }
+        radius
+    };
+    if radius <= global_tol {
+        return;
+    }
+    let radius_sq = radius * radius;
+
+    // Single-linkage union-find over the residual band.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut linked = false;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if (verts[i].1 - verts[j].1).magnitude_squared() <= radius_sq {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                    linked = true;
+                }
+            }
+        }
+    }
+    if !linked {
+        return;
+    }
+
+    // Canonical VertexId per cluster: the smallest id in the cluster (stable and
+    // deterministic). Map every member vertex to it.
+    let mut cluster_min: HashMap<usize, VertexId> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        let entry = cluster_min.entry(r).or_insert(verts[i].0);
+        if verts[i].0 < *entry {
+            *entry = verts[i].0;
+        }
+    }
+    let mut canon: HashMap<VertexId, VertexId> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        if let Some(&cv) = cluster_min.get(&r) {
+            canon.insert(verts[i].0, cv);
+        }
+    }
+
+    // Retarget each loop edge's model endpoints to canonical vertices; drop any
+    // edge whose endpoints collapse to one (a residual sliver). A genuine
+    // closed-curve edge (start == end by construction) is left intact.
+    let rewrite = |entries: &mut Vec<(EdgeId, bool)>, model: &mut BRepModel| {
+        let mut out: Vec<(EdgeId, bool)> = Vec::with_capacity(entries.len());
+        for &(eid, fwd) in entries.iter() {
+            let Some(edge) = model.edges.get(eid) else {
+                out.push((eid, fwd));
+                continue;
+            };
+            let closed = edge.start_vertex == edge.end_vertex;
+            let cs = *canon.get(&edge.start_vertex).unwrap_or(&edge.start_vertex);
+            let ce = *canon.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
+            if cs == ce && !closed {
+                // Residual sliver — collapses to a point. Drop from the loop.
+                continue;
+            }
+            if let Some(e) = model.edges.get_mut(eid) {
+                e.start_vertex = cs;
+                e.end_vertex = ce;
+            }
+            out.push((eid, fwd));
+        }
+        *entries = out;
+    };
+
+    let mut bedges: Vec<Vec<(EdgeId, bool)>> = Vec::with_capacity(faces.len());
+    let mut iloops: Vec<Vec<Vec<(EdgeId, bool)>>> = Vec::with_capacity(faces.len());
+    for face in faces.iter() {
+        bedges.push(face.boundary_edges.clone());
+        iloops.push(face.inner_loops.clone());
+    }
+    for be in bedges.iter_mut() {
+        rewrite(be, model);
+    }
+    for il in iloops.iter_mut() {
+        for hole in il.iter_mut() {
+            rewrite(hole, model);
+        }
+    }
+    for (idx, face) in faces.iter_mut().enumerate() {
+        face.boundary_edges = std::mem::take(&mut bedges[idx]);
+        face.inner_loops = std::mem::take(&mut iloops[idx]);
+    }
+
+    if pipeline_trace_enabled() {
+        let merged = canon.iter().filter(|(v, c)| v != c).count();
+        eprintln!(
+            "[bool] stage=weld_imprint_residual_vertices radius={radius:.5} merged_vertices={merged}"
+        );
+    }
+}
+
 /// Resolve T-junctions left by *asymmetric* per-face splitting before
 /// canonicalisation.
 ///
@@ -14843,6 +15114,7 @@ fn build_shells_from_faces(
     // within tolerance). Orientation is preserved: when the canonical
     // edge runs against the face's traversal direction, flip the
     // `forward` bit.
+    weld_imprint_residual_vertices(model, &mut faces, &options.common.tolerance);
     heal_t_junctions_across_faces(model, &mut faces, &options.common.tolerance);
     canonicalise_face_edges_by_position(model, &mut faces);
 
