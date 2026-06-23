@@ -8,10 +8,22 @@
 //! Trace a case: `ROSHERA_BOOL_TRACE=1 cargo test ... -- --nocapture <name>`.
 //!
 //! ── FINDINGS (iteration 1, this worktree) ──────────────────────────────────
-//!   F1 holed-operand union   — BROKEN: manifold=false, nm≈298, euler=-4.
-//!                               Root: union over a corner overlap that contains
-//!                               a bore hole — coplanar imprint + an inner loop
-//!                               in the same overlap region. Deep.
+//!   F1 holed-operand union   — FIXED (was manifold=false, nm≈298, euler=-4).
+//!                               Root: the union imprint outline (pad footprint)
+//!                               CROSSED a pre-existing bore-hole inner loop on
+//!                               the cap face; the DCEL walked the slice of the
+//!                               bore's VOID that the imprint bounds into its own
+//!                               fragment, which classified Outside and was kept,
+//!                               re-using the bore-rim arcs a THIRD time (8 edges
+//!                               shared by 3 faces). Fix: drop arrangement
+//!                               fragments lying entirely inside a pre-existing
+//!                               hole (the fragment-level analogue of the #27
+//!                               void-cut filter), in `split_face_by_curves`.
+//!                               Now SOUND. NOTE: the SEPARATE coincident-
+//!                               coplanar-face overlap (#32) still bites when the
+//!                               pad bottom is COINCIDENT with the cap AND crosses
+//!                               a bore — pinned in `f1b_coincident_bottom_over_
+//!                               bore_is_broken` as a distinct, deeper defect.
 //!   F2 curved union          — BROKEN: watertight=false, bnd≈269, euler=1.
 //!                               Root: a cylinder LATERAL crossing two planar
 //!                               walls — plane↔cylinder SSI/corefinement leaves
@@ -137,21 +149,64 @@ fn plate_with_4_holes(m: &mut BRepModel) -> SolidId {
 }
 
 #[test]
-fn f1_holed_operand_union_is_broken() {
+fn f1_holed_operand_union_is_sound() {
     let mut m = BRepModel::new();
     let plate = plate_with_4_holes(&mut m);
     assert_operand_sound(&mut m, plate, "f1 plate operand");
-    // box overlapping a corner of the plate (interpenetrating, over a bore hole).
-    let pad = box_at(&mut m, 10.0, 10.0, 10.0, 15.0, 15.0, 3.0);
+    // Box pad overlapping a corner of the plate, fully INTERPENETRATING (z∈[-5,8],
+    // below the plate's z=-2 bottom so there is NO coincident bottom face — that
+    // would be the separate #32 coincident-coplanar overlap, pinned below). The
+    // pad's footprint (x,y ∈ [10,20]) CROSSES the Ø8 bore hole at (12,12): the
+    // pad edges enter the bore at two points. This is the bug the fix targets —
+    // the imprint outline crossing a pre-existing inner loop.
+    let pad = box_at(&mut m, 10.0, 10.0, 13.0, 15.0, 15.0, 1.5); // z∈[-5,8]
     assert_operand_sound(&mut m, pad, "f1 pad operand");
     let r = union(&mut m, plate, pad);
-    let (sound, _bnd, nm, _euler) = metrics(&mut m, r, "f1 holed-union");
-    // FIXME(#F1): holed-operand union is non-manifold. The corner overlap region
-    // contains a Ø8 bore hole; the coplanar imprint-merge over a face that
-    // already carries an inner loop (the hole) fails to weld the rims.
-    // (Ranked: deep — coplanar + inner loops + corner overlap combined.)
-    assert!(!sound, "f1: expected BROKEN (kernel flagged it)");
-    assert!(nm > 0, "f1: expected non-manifold edges");
+    let (sound, bnd, nm, _euler) = metrics(&mut m, r, "f1 holed-union");
+    // FIXED: the bore-void slice the pad imprint bounded is now dropped as a
+    // void fragment in `split_face_by_curves`, so the bore-rim arcs are used by
+    // exactly two faces (the cap and the bore wall) → manifold + watertight.
+    assert!(
+        sound,
+        "f1: holed-operand union over a crossed bore must be sound"
+    );
+    assert_eq!(nm, 0, "f1: no non-manifold edges");
+    assert_eq!(bnd, 0, "f1: watertight (no boundary edges)");
+}
+
+// ── #1b coincident-bottom-over-bore (SEPARATE #32 family, still broken) ──
+//
+// The SAME corner pad but with its bottom COINCIDENT with the plate bottom
+// (pad z∈[-2,8]) AND crossing a bore. The void-fragment fix (F1) removes the
+// bore-void slices, but the coincident-coplanar overlap of the pad bottom and
+// the (notched) cap bottom is the #32 same-domain-cull family: the two
+// coincident OnBoundary faces are NOT identical (the cap copy carries the bore
+// notch, the pad copy is a full square), so the dedup leaves open rims
+// (boundary edges, watertight=false). DISTINCT from F1's arrangement defect —
+// it is the coincident-face overlap, a deeper core-weld problem. Pinned BROKEN.
+#[test]
+fn f1b_coincident_bottom_over_bore_is_broken() {
+    let mut m = BRepModel::new();
+    let plate = plate_with_4_holes(&mut m);
+    assert_operand_sound(&mut m, plate, "f1b plate operand");
+    // pad z∈[-2,8]: bottom coincident with the plate bottom AND footprint crosses
+    // the (12,12) bore.
+    let pad = box_at(&mut m, 10.0, 10.0, 10.0, 15.0, 15.0, 3.0);
+    assert_operand_sound(&mut m, pad, "f1b pad operand");
+    let r = union(&mut m, plate, pad);
+    let (sound, bnd, _nm, _euler) = metrics(&mut m, r, "f1b coincident-bore-union");
+    // The void-fragment fix already cleared the non-manifold edges (nm=0); the
+    // RESIDUAL is the coincident-coplanar overlap (#32) leaving open boundary
+    // edges. Honest pin: not watertight until the same-domain coincident-face
+    // weld handles a notched-vs-full coincident pair.
+    assert!(
+        !sound,
+        "f1b: coincident-bottom-over-bore still broken (#32)"
+    );
+    assert!(
+        bnd > 0,
+        "f1b: open boundary edges from the coincident overlap"
+    );
 }
 
 // ───────── #2 curved union: cylinder lateral ∪ L-bracket ─────────

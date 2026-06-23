@@ -7259,9 +7259,46 @@ fn split_face_by_curves(
     // boundary-midpoint centroid.
     let interior_points = compute_split_face_interior_points(&loops, model, surface_id);
 
+    // Void-fragment drop (#35 overlapping-loop superset). When a coplanar
+    // imprint outline from the OTHER operand CROSSES a pre-existing inner loop
+    // (a bore hole from a prior boolean) on this planar face, the DCEL
+    // arrangement walks the slice of the hole's VOID that the imprint bounds
+    // into its own region. Example (plate-with-bore ∪ corner-pad): the pad
+    // footprint edges enter the Ø8 bore at two points, so the bit of the bore
+    // disc between those crossings is extracted as a fragment whose interior
+    // point lies INSIDE the hole. That fragment bounds void, not material — yet
+    // it classifies `Outside` (it is genuinely outside the pad solid) and is
+    // kept, re-using the bore-rim arcs a THIRD time (the kept main cap loop and
+    // the bore wall already use them) → 8 edges shared by 3 faces → euler=-4,
+    // non-manifold.
+    //
+    // The existing `lies_in_preexisting_hole` cut-level filter (#27) only drops
+    // a cut whose every sample lies in a hole; a cut that CROSSES the hole rim
+    // has samples on both sides and is correctly retained — so the void slice it
+    // bounds must be removed here at the FRAGMENT level instead. This is the
+    // planar-arrangement analogue of that filter: drop any surviving fragment
+    // whose representative interior point lies strictly inside one of the source
+    // face's pre-existing holes. A pristine hole cycle was already routed into
+    // `attached_holes` by `partition_outer_and_pre_existing_hole_cycles`, so it
+    // never reaches here; only the crossed-hole void slivers do.
+    //
+    // Scoped to planar faces with pre-existing inner loops. Curved analytic
+    // faces (sphere/cone/cylinder/torus) return early via their dedicated
+    // splitters above and never reach this code, so the closed-surface guard is
+    // preserved — no periodic face is ever coalesced or dropped by this pass.
+    let void_fragment = void_fragments_in_preexisting_holes(&loops, model, surface_id, face_id);
+
     // Create split faces from loops
     let mut split_faces = Vec::new();
     for (idx, loop_edges) in loops.into_iter().enumerate() {
+        if void_fragment.get(idx).copied().unwrap_or(false) {
+            if pipeline_trace_enabled() {
+                eprintln!(
+                    "[bool]     dropping void fragment idx={idx} on face={face_id:?} (lies inside a pre-existing hole)"
+                );
+            }
+            continue;
+        }
         let mut split_face = create_split_face(surface_id, loop_edges, face_id, origin_solid)?;
         split_face.interior_point = interior_points.get(idx).copied().flatten();
         if let Some(holes) = attached_holes.get(idx) {
@@ -7272,6 +7309,202 @@ fn split_face_by_curves(
     }
 
     Ok(split_faces)
+}
+
+/// Identify arrangement fragments that bound a pre-existing hole's VOID rather
+/// than material — the void slivers produced when a coplanar imprint outline
+/// crosses a pre-existing inner loop (#35 overlapping-loop superset).
+///
+/// Returns a `Vec<bool>` aligned with `loops`; `true` marks a fragment to drop.
+/// A fragment is a void sliver when it lies ENTIRELY within one of `face_id`'s
+/// pre-existing inner loops on this planar surface (every boundary-edge midpoint
+/// projects inside the hole — its rim arcs sit on the hole boundary, its imprint
+/// chords cut across the hole's interior).
+///
+/// Scoped to PLANAR source faces carrying pre-existing inner loops. For any
+/// other face (no holes, or a curved analytic surface — which never reaches
+/// this code path anyway) the result is all-`false`: a no-op. The hole polygons
+/// are densified (arc-following) so a few-arc circular bore rim is matched
+/// faithfully (same #35/#85b lineage as the merge/partition containment tests).
+fn void_fragments_in_preexisting_holes(
+    loops: &[Vec<(EdgeId, bool)>],
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+) -> Vec<bool> {
+    let n = loops.len();
+    let none = vec![false; n];
+    if n == 0 {
+        return none;
+    }
+
+    // Planar gate: the hole polygon projects exactly into the face's plane.
+    let is_planar = model
+        .surfaces
+        .get(surface_id)
+        .map(|s| {
+            matches!(
+                s.surface_type(),
+                crate::primitives::surface::SurfaceType::Plane
+            )
+        })
+        .unwrap_or(false);
+    if !is_planar {
+        return none;
+    }
+
+    // Source face's pre-existing inner loops (holes from a prior boolean).
+    let inner_edge_lists: Vec<Vec<EdgeId>> = match model.faces.get(face_id) {
+        Some(face) => face
+            .inner_loops
+            .iter()
+            .filter_map(|&lid| model.loops.get(lid).map(|l| l.edges.clone()))
+            .collect(),
+        None => return none,
+    };
+    if inner_edge_lists.is_empty() {
+        return none;
+    }
+
+    // Tangent frame at the hole-vertex centroid (planar → constant over the
+    // face; same construction as the cut-level `preexisting_hole_filter` and
+    // `partition_outer_and_pre_existing_hole_cycles`).
+    let inner_verts_3d: Vec<Vec<Point3>> = inner_edge_lists
+        .iter()
+        .map(|edges| extract_cycle_vertices_3d(edges, model))
+        .collect();
+    let (mut sx, mut sy, mut sz, mut cnt) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+    for v in inner_verts_3d.iter().flatten() {
+        sx += v.x;
+        sy += v.y;
+        sz += v.z;
+        cnt += 1;
+    }
+    if cnt == 0 {
+        return none;
+    }
+    let anchor = Point3::new(sx / cnt as f64, sy / cnt as f64, sz / cnt as f64);
+    let Some(surface) = model.surfaces.get(surface_id) else {
+        return none;
+    };
+    let Ok((u0, v0)) = surface.closest_point(&anchor, Tolerance::default()) else {
+        return none;
+    };
+    let Ok(sp) = surface.evaluate_full(u0, v0) else {
+        return none;
+    };
+    let Ok(e1) = sp.du.normalize() else {
+        return none;
+    };
+    let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
+    let Ok(e2) = dv_perp.normalize() else {
+        return none;
+    };
+    let origin = sp.position;
+    let project = |p: &Point3| -> (f64, f64) {
+        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        (d.dot(&e1), d.dot(&e2))
+    };
+
+    // Densified (arc-following) hole polygons.
+    const SAMPLES: usize = 8;
+    let hole_polys: Vec<Vec<(f64, f64)>> = inner_edge_lists
+        .iter()
+        .map(|edges| {
+            let mut poly: Vec<(f64, f64)> = Vec::with_capacity(edges.len() * SAMPLES);
+            for &eid in edges {
+                let Some(edge) = model.edges.get(eid) else {
+                    continue;
+                };
+                let Some(curve) = model.curves.get(edge.curve_id) else {
+                    continue;
+                };
+                let (a, b) = (edge.param_range.start, edge.param_range.end);
+                for k in 0..SAMPLES {
+                    let f = k as f64 / SAMPLES as f64;
+                    let t = a + (b - a) * f;
+                    if let Ok(p) = curve.point_at(t) {
+                        poly.push(project(&p));
+                    }
+                }
+            }
+            poly
+        })
+        .filter(|poly| poly.len() >= 3)
+        .collect();
+    if hole_polys.is_empty() {
+        return none;
+    }
+
+    // A fragment is a void sliver when it lies ENTIRELY within a pre-existing
+    // hole — its outer boundary is composed only of the hole's rim arcs and of
+    // imprint chords that cut across the hole's interior. Test that EVERY
+    // boundary-edge midpoint of the fragment projects inside-or-on a single
+    // hole. (Just the centroid is unreliable for a thin non-convex sliver: its
+    // area-centroid can fall outside the sliver, and the classifier's
+    // boundary-midpoint centroid can drift onto an imprint chord that grazes the
+    // rim.) The rim arcs sit ON the hole boundary and the cross chords sit
+    // strictly inside, so an all-midpoints-inside test cleanly separates a void
+    // sliver from a genuine material fragment (which has at least one midpoint
+    // well outside every hole).
+    //
+    // The hole polygon is densified to follow the rim arc; an arc midpoint then
+    // lies marginally inside its own (inscribed) sampled polygon — but a coarse
+    // few-arc rim could place it marginally OUTSIDE. Test each midpoint against
+    // a hole polygon expanded outward by a hair about its centroid so rim-arc
+    // midpoints reliably count as inside; a genuine material midpoint is far
+    // outside and unaffected by the tiny expansion.
+    let mut drop = vec![false; n];
+    for (idx, cycle) in loops.iter().enumerate() {
+        if cycle.is_empty() {
+            continue;
+        }
+        // Per-fragment boundary-edge midpoints (projected).
+        let mut mids: Vec<(f64, f64)> = Vec::with_capacity(cycle.len());
+        for &(eid, _) in cycle {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let t_mid = 0.5 * (edge.param_range.start + edge.param_range.end);
+            if let Ok(p) = curve.point_at(t_mid) {
+                mids.push(project(&p));
+            }
+        }
+        if mids.is_empty() {
+            continue;
+        }
+        for poly in &hole_polys {
+            // Expand the hole polygon outward by a hair about its centroid so a
+            // rim-arc midpoint (on the inscribed sampled boundary) counts inside.
+            let (mut cx, mut cy) = (0.0f64, 0.0f64);
+            for &(x, y) in poly {
+                cx += x;
+                cy += y;
+            }
+            let m = poly.len() as f64;
+            let (cx, cy) = (cx / m, cy / m);
+            const EXPAND: f64 = 1.0 + 1.0e-6;
+            let grown: Vec<(f64, f64)> = poly
+                .iter()
+                .map(|&(x, y)| (cx + (x - cx) * EXPAND, cy + (y - cy) * EXPAND))
+                .collect();
+            if mids.iter().all(|&(u, v)| point_in_polygon_2d(u, v, &grown)) {
+                drop[idx] = true;
+                break;
+            }
+        }
+    }
+
+    // Safety: never drop EVERY fragment. If the whole-face arrangement collapsed
+    // to void slivers something upstream is wrong; the unsplit face is safer
+    // than emitting nothing (which would open the solid).
+    if drop.iter().all(|&d| d) {
+        return none;
+    }
+    drop
 }
 
 /// Remove any inner loop (hole) strictly contained within ANOTHER inner
