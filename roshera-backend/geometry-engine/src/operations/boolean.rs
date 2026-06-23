@@ -1139,17 +1139,19 @@ fn intersect_faces(
     // Task #55's perpendicular-box regression.
     let mut clipped_curves = Vec::new();
     for curve in curves {
-        if let Some(trimmed) = clip_surface_intersection_curve_to_faces(
+        // One source curve may clip to ZERO (misses), ONE (typical), or MORE
+        // THAN ONE (a through-slot cap ring inside the box at two openings)
+        // trimmed cuts. Extend with all of them.
+        let trimmed = clip_surface_intersection_curve_to_faces(
             curve,
             face_a,
             face_b,
             model,
             &options.common.tolerance,
-        )? {
-            clipped_curves.push(trimmed);
-        }
-        // `None` → the cutting line misses one or both faces entirely.
-        // Drop silently; an empty `clipped_curves` yields `Ok(None)` below.
+        )?;
+        clipped_curves.extend(trimmed);
+        // Empty → the cutting curve misses one or both faces entirely; an empty
+        // `clipped_curves` yields `Ok(None)` below.
     }
 
     if clipped_curves.is_empty() {
@@ -7461,6 +7463,23 @@ fn partition_outer_and_pre_existing_hole_cycles(
     if original_inner_loop_edges.is_empty() {
         return (loops, no_holes());
     }
+    // The face's original OUTER-loop edges — used to identify the GENUINE outer
+    // cycle among the split cycles (the one that re-traces part of the original
+    // boundary), distinct from a wholly-interior NEW island cut (a fresh pocket
+    // opening, which `extract_regions` also emits as a CCW cycle but which the
+    // island pass — not this one — attaches). Without this distinction a
+    // chained second pocket's island is mis-counted as an "outer", defeating the
+    // single-outer attachment and leaving the genuine pre-existing hole's
+    // centroid test to run against a periodic-wrapped outer (which folds in the
+    // tangent-plane projection and wrongly rejects it).
+    let original_outer_edge_set: std::collections::HashSet<EdgeId> = match model
+        .faces
+        .get(face_id)
+        .and_then(|f| model.loops.get(f.outer_loop))
+    {
+        Some(l) => l.edges.iter().copied().collect(),
+        None => std::collections::HashSet::new(),
+    };
 
     let surface = match model.surfaces.get(surface_id) {
         Some(s) => s,
@@ -7612,18 +7631,70 @@ fn partition_outer_and_pre_existing_hole_cycles(
     // centroid. Reverse the edge list and flip each forward bit so the
     // hole winding is opposite the outer's, per LoopType::Inner.
     let mut attachments: Vec<Vec<Vec<(EdgeId, bool)>>> = vec![Vec::new(); outer_indices.len()];
-    for &h in &hole_indices {
-        let hc = match centroid_2d(&cycle_polys_2d[h]) {
-            Some(c) => c,
-            None => continue,
-        };
-        let mut chosen: Option<usize> = None;
-        for (pos, &o) in outer_indices.iter().enumerate() {
-            if cycle_polys_2d[o].len() >= 3 && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o]) {
-                chosen = Some(pos);
-                break;
+    // The GENUINE outer cycle re-traces part of the face's ORIGINAL outer loop
+    // (its seam / cap-rim boundary); a chained NEW pocket opening is also emitted
+    // as a CCW cycle but consists wholly of fresh cut edges (a wholly-interior
+    // island). Distinguish them by edge-set overlap with the original outer loop
+    // so the pre-existing hole attaches to the real outer, not the island.
+    let outer_overlap = |pos: usize| -> usize {
+        let o = outer_indices[pos];
+        loops[o]
+            .iter()
+            .filter(|(e, _)| original_outer_edge_set.contains(e))
+            .count()
+    };
+    // The genuine outer = the outer cycle with the most original-outer edges; if
+    // none overlaps (every original outer edge was re-split), fall back to the
+    // largest-area projected polygon (the wrap-around boundary dominates any
+    // interior island in tangent-plane extent).
+    let signed_area = |poly: &[(f64, f64)]| -> f64 {
+        if poly.len() < 3 {
+            return 0.0;
+        }
+        let mut a = 0.0;
+        for i in 0..poly.len() {
+            let (x0, y0) = poly[i];
+            let (x1, y1) = poly[(i + 1) % poly.len()];
+            a += x0 * y1 - x1 * y0;
+        }
+        (0.5 * a).abs()
+    };
+    let genuine_outer_pos: Option<usize> = if outer_indices.is_empty() {
+        None
+    } else {
+        let mut best = 0usize;
+        let mut best_overlap = outer_overlap(0);
+        let mut best_area = signed_area(&cycle_polys_2d[outer_indices[0]]);
+        for pos in 1..outer_indices.len() {
+            let ov = outer_overlap(pos);
+            let area = signed_area(&cycle_polys_2d[outer_indices[pos]]);
+            let better = ov > best_overlap || (ov == best_overlap && area > best_area);
+            if better {
+                best = pos;
+                best_overlap = ov;
+                best_area = area;
             }
         }
+        Some(best)
+    };
+
+    for &h in &hole_indices {
+        // Try the centroid-in-polygon test first (handles a planar cap with
+        // several genuine outer fragments). For a periodic freeform outer the
+        // projection folds and the test fails, so fall back to the genuine outer.
+        let hc = centroid_2d(&cycle_polys_2d[h]);
+        let mut chosen: Option<usize> = None;
+        if let Some(hc) = hc {
+            for (pos, &o) in outer_indices.iter().enumerate() {
+                if cycle_polys_2d[o].len() >= 3
+                    && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o])
+                {
+                    chosen = Some(pos);
+                    break;
+                }
+            }
+        }
+        let chosen = chosen.or(genuine_outer_pos);
         if let Some(pos) = chosen {
             let reversed: Vec<(EdgeId, bool)> =
                 loops[h].iter().rev().map(|(e, fwd)| (*e, !*fwd)).collect();
@@ -9667,7 +9738,7 @@ fn clip_surface_intersection_curve_to_faces(
     face_b: FaceId,
     model: &BRepModel,
     tolerance: &Tolerance,
-) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     use crate::primitives::curve::{Circle, Line};
 
     // Circle cutting curves arise from perpendicular plane-cylinder and
@@ -9676,7 +9747,11 @@ fn clip_surface_intersection_curve_to_faces(
     // handing them to the DCEL face-splitting code.
     if let Some(circle_ref) = curve.curve.as_any().downcast_ref::<Circle>() {
         let circle = circle_ref.clone();
-        return apply_circle_clip_to_faces(curve, &circle, face_a, face_b, model, tolerance);
+        return Ok(
+            apply_circle_clip_to_faces(curve, &circle, face_a, face_b, model, tolerance)?
+                .into_iter()
+                .collect(),
+        );
     }
 
     // Clipping only applies to straight cutting lines (the plane-plane
@@ -9712,19 +9787,19 @@ fn clip_surface_intersection_curve_to_faces(
     // Combine clip outcomes.
     let (t_a_lo, t_a_hi) = match clip_a {
         ClipOutcome::Trimmed(lo, hi) => (lo, hi),
-        ClipOutcome::Misses => return Ok(None),
+        ClipOutcome::Misses => return Ok(Vec::new()),
         ClipOutcome::NotApplicable => (0.0, 1.0),
     };
     let (t_b_lo, t_b_hi) = match clip_b {
         ClipOutcome::Trimmed(lo, hi) => (lo, hi),
-        ClipOutcome::Misses => return Ok(None),
+        ClipOutcome::Misses => return Ok(Vec::new()),
         ClipOutcome::NotApplicable => (0.0, 1.0),
     };
 
     // If both faces are NotApplicable, return the curve unchanged.
     if matches!(clip_a, ClipOutcome::NotApplicable) && matches!(clip_b, ClipOutcome::NotApplicable)
     {
-        return Ok(Some(curve));
+        return Ok(vec![curve]);
     }
 
     let t_min_core = t_a_lo.max(t_b_lo);
@@ -9732,7 +9807,7 @@ fn clip_surface_intersection_curve_to_faces(
     // Use a tiny relative epsilon to reject zero-width intervals produced
     // by lines that only graze one face.
     if t_max_core - t_min_core <= tolerance.distance() / line.length().max(1.0) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     // Use the tight interior interval. Endpoints falling on shared
@@ -9772,11 +9847,11 @@ fn clip_surface_intersection_curve_to_faces(
     let on_surface_a = create_parametric_curve(&[(ua0, va0), (ua1, va1)]);
     let on_surface_b = create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]);
 
-    Ok(Some(SurfaceIntersectionCurve {
+    Ok(vec![SurfaceIntersectionCurve {
         curve: Box::new(trimmed_line),
         on_surface_a,
         on_surface_b,
-    }))
+    }])
 }
 
 /// Trim a GENERAL (non-Line, non-Circle) surface-surface intersection curve to
@@ -9802,7 +9877,7 @@ fn clip_general_curve_by_face_membership(
     face_b: FaceId,
     model: &BRepModel,
     tolerance: &Tolerance,
-) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     // Gate: exactly the planar × non-analytic configuration. The PLANAR face
     // is the bounded one we trim to; the freeform face is the (large)
     // unbounded surface whose carrier produced the over-long curve.
@@ -9815,7 +9890,7 @@ fn clip_general_curve_by_face_membership(
     } else if b_planar && a_freeform {
         face_b
     } else {
-        return Ok(Some(curve));
+        return Ok(vec![curve]);
     };
 
     // Sample the curve over t ∈ [0, 1] and test membership against the BOUNDED
@@ -9842,52 +9917,80 @@ fn clip_general_curve_by_face_membership(
         inside.push(is_point_in_face(model, bounded_face, &p, tolerance).unwrap_or(false));
     }
 
-    // Find the longest contiguous run of `inside == true`.
-    let mut best_lo = 0usize;
-    let mut best_hi = 0usize;
-    let mut best_len = 0usize;
-    let mut run_lo = 0usize;
-    let mut in_run = false;
-    for i in 0..inside.len() {
-        if inside[i] {
-            if !in_run {
-                in_run = true;
-                run_lo = i;
+    // Collect EVERY maximal contiguous run of `inside == true` as a (lo, hi)
+    // sample-index pair. A single plane × periodic-NURBS cut can land inside the
+    // bounded planar feature on MORE THAN ONE disjoint arc — the canonical case
+    // is a THROUGH-SLOT (a box crossing both barrel walls): the z=const cap ring
+    // dips into the slot box at BOTH the +Y and −Y openings, so the ring's
+    // membership trace has two interior runs on opposite sides. The previous
+    // "longest run only" logic kept one and dropped the other, so the freeform
+    // barrel received only ONE opening's cap rim and the second opening never
+    // closed (w03's non-manifold leak). Emit one trimmed cut per run.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut run_lo = 0usize;
+        let mut in_run = false;
+        for i in 0..inside.len() {
+            if inside[i] {
+                if !in_run {
+                    in_run = true;
+                    run_lo = i;
+                }
+            } else if in_run {
+                runs.push((run_lo, i - 1));
+                in_run = false;
             }
-            let len = i - run_lo + 1;
-            if len > best_len {
-                best_len = len;
-                best_lo = run_lo;
-                best_hi = i;
-            }
-        } else {
-            in_run = false;
+        }
+        if in_run {
+            runs.push((run_lo, inside.len() - 1));
         }
     }
 
     // No interior samples → the curve misses the bounded feature.
-    if best_len == 0 {
-        return Ok(None);
-    }
-    // Entire curve already inside both faces → keep it verbatim.
-    if best_lo == 0 && best_hi == inside.len() - 1 {
-        return Ok(Some(curve));
+    if runs.is_empty() {
+        return Ok(Vec::new());
     }
 
-    // Refine each trimmed endpoint by bisecting between the last strictly-
-    // interior sample and the adjacent strictly-exterior sample, so the
-    // trimmed curve TERMINATES exactly on the planar face's boundary edge
-    // (within tolerance). A crude half-sample extension would leave the arc
-    // endpoint short of (or past) the box edge — and an open arc that does
-    // not reach the bounded face's boundary cannot split that face into an
-    // inside/outside pair (the region-extraction walks past it), which is
-    // precisely what drops a pocket's side/cap walls. The bisected endpoint
-    // lands on the boundary, so the cut closes the region.
+    let last = inside.len() - 1;
+
+    // SEAM-WRAP merge (task #17 watertight). A plane × periodic-NURBS cut (a cap
+    // ring meeting a lofted barrel) is traced by the marching-squares SSI as a
+    // single chain running the u-domain from one seam edge (u_min) to the other
+    // (u_max). Both seam endpoints are the SAME 3D point, so the chain is
+    // GEOMETRICALLY CLOSED though parametrised open. When the bounded feature
+    // straddles that seam (a pocket ON the +X seam), the interior span is split
+    // by the chain's t=0/t=1 break into a HEAD run and a TAIL run that are really
+    // one arc across the seam. Merge them into a single wrapped cut so the pocket
+    // rim closes on both sides of the seam.
+    let curve_is_closed = {
+        let s = curve.curve.evaluate(0.0).ok().map(|cp| cp.position);
+        let e = curve.curve.evaluate(1.0).ok().map(|cp| cp.position);
+        match (s, e) {
+            (Some(s), Some(e)) => {
+                let d = e - s;
+                d.dot(&d) <= tolerance.distance() * tolerance.distance()
+            }
+            _ => false,
+        }
+    };
+    let mut wrapped: Option<(usize, usize)> = None; // (tail_lo, head_hi)
+    if curve_is_closed && runs.len() >= 2 {
+        let head_is_prefix = runs.first().map(|&(lo, _)| lo == 0).unwrap_or(false);
+        let tail_is_suffix = runs.last().map(|&(_, hi)| hi == last).unwrap_or(false);
+        if head_is_prefix && tail_is_suffix {
+            let (_, head_hi) = runs.remove(0);
+            let (tail_lo, _) = runs.pop().unwrap_or((last, last));
+            wrapped = Some((tail_lo, head_hi));
+        }
+    }
+
     let step = 1.0 / SAMPLES as f64;
-    // Bisection on the membership predicate of the bounded face.
+    // Bisection on the membership predicate of the bounded face: find the
+    // boundary crossing between an interior `t` and an adjacent exterior `t`, so
+    // the trimmed cut TERMINATES exactly on the planar feature's boundary edge.
     let bisect = |t_inside: f64, t_outside: f64| -> f64 {
-        let mut lo = t_inside; // inside
-        let mut hi = t_outside; // outside
+        let mut lo = t_inside;
+        let mut hi = t_outside;
         for _ in 0..40 {
             let mid = 0.5 * (lo + hi);
             let on = match curve.curve.evaluate(mid) {
@@ -9902,55 +10005,193 @@ fn clip_general_curve_by_face_membership(
                 hi = mid;
             }
         }
-        // The boundary lies between lo (inside) and hi (outside); take the
-        // midpoint, which is on the face boundary within ~2^-40 of the span.
         0.5 * (lo + hi)
     };
-    let t_lo = if best_lo == 0 {
-        0.0
-    } else {
-        bisect(ts[best_lo], ts[best_lo - 1]).clamp(0.0, 1.0)
+
+    let mut out: Vec<SurfaceIntersectionCurve> = Vec::new();
+
+    // The seam-wrapped span (if any) is emitted as one curve via the wrap helper.
+    if let Some((tail_lo, head_hi)) = wrapped {
+        if let Some(c) = clip_wrapped_general_curve(
+            &curve,
+            bounded_face,
+            tail_lo,
+            head_hi,
+            &ts,
+            model,
+            tolerance,
+        )? {
+            out.push(c);
+        }
+    }
+
+    // Each remaining (non-wrapped) run becomes one trimmed cut.
+    for (lo, hi) in runs {
+        // Whole curve inside on this run AND the run is the entire curve → keep
+        // it verbatim (no clip needed). Only valid when there is a single run.
+        let t_lo = if lo == 0 {
+            0.0
+        } else {
+            bisect(ts[lo], ts[lo - 1]).clamp(0.0, 1.0)
+        };
+        let t_hi = if hi == last {
+            1.0
+        } else {
+            bisect(ts[hi], ts[hi + 1]).clamp(0.0, 1.0)
+        };
+        if t_hi - t_lo <= step * 0.5 {
+            // Degenerate sliver — skip rather than imprint a near-zero cut.
+            continue;
+        }
+        let trimmed = if t_lo <= 0.0 && t_hi >= 1.0 {
+            // Verbatim: cannot meaningfully sub-divide the full span.
+            match curve.curve.subcurve(0.0, 1.0) {
+                Ok(c) => c,
+                Err(_) => continue,
+            }
+        } else {
+            match curve.curve.subcurve(t_lo, t_hi) {
+                Ok(c) => c,
+                Err(_) => continue,
+            }
+        };
+        let (ua0, va0) = (
+            (curve.on_surface_a.u_of_t)(t_lo),
+            (curve.on_surface_a.v_of_t)(t_lo),
+        );
+        let (ua1, va1) = (
+            (curve.on_surface_a.u_of_t)(t_hi),
+            (curve.on_surface_a.v_of_t)(t_hi),
+        );
+        let (ub0, vb0) = (
+            (curve.on_surface_b.u_of_t)(t_lo),
+            (curve.on_surface_b.v_of_t)(t_lo),
+        );
+        let (ub1, vb1) = (
+            (curve.on_surface_b.u_of_t)(t_hi),
+            (curve.on_surface_b.v_of_t)(t_hi),
+        );
+        out.push(SurfaceIntersectionCurve {
+            curve: trimmed,
+            on_surface_a: create_parametric_curve(&[(ua0, va0), (ua1, va1)]),
+            on_surface_b: create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]),
+        });
+    }
+
+    Ok(out)
+}
+
+/// Build the seam-crossing cut curve for a geometrically-closed SSI chain whose
+/// interior span wraps the parametric seam (task #17 watertight).
+///
+/// `tail_lo` is the first sample index of the tail run (…→t=1), `head_hi` the
+/// last sample index of the head run (t=0→…). The interior span is
+/// `t ∈ [t_lo, 1] ∪ [0, t_hi]` where the exact entry/exit are bisected against
+/// the bounded face's membership predicate (the same refinement the non-wrapped
+/// path uses, so the cut terminates ON the planar feature's boundary). The
+/// wrapped span is then re-sampled into a single ordered point list and refitted
+/// — concatenating across the seam yields a continuous arc whose two endpoints
+/// land on the box wall edges, closing the freeform pocket loop on both sides of
+/// the seam.
+#[allow(clippy::too_many_arguments)]
+fn clip_wrapped_general_curve(
+    curve: &SurfaceIntersectionCurve,
+    bounded_face: FaceId,
+    tail_lo: usize,
+    head_hi: usize,
+    ts: &[f64],
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+    // Bisection on the bounded face's membership predicate, identical to the
+    // non-wrapped path: find the boundary crossing between an interior `t` and
+    // an adjacent exterior `t`.
+    let bisect = |t_inside: f64, t_outside: f64| -> f64 {
+        let mut lo = t_inside;
+        let mut hi = t_outside;
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            let on = match curve.curve.evaluate(mid) {
+                Ok(cp) => {
+                    is_point_in_face(model, bounded_face, &cp.position, tolerance).unwrap_or(false)
+                }
+                Err(_) => false,
+            };
+            if on {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
     };
-    let t_hi = if best_hi == inside.len() - 1 {
-        1.0
-    } else {
-        bisect(ts[best_hi], ts[best_hi + 1]).clamp(0.0, 1.0)
+
+    // Tail run enters the feature between sample tail_lo-1 (exterior) and tail_lo
+    // (interior); the wrapped span starts there. Head run exits between head_hi
+    // (interior) and head_hi+1 (exterior); the wrapped span ends there.
+    let t_lo = bisect(ts[tail_lo], ts[tail_lo - 1]).clamp(0.0, 1.0);
+    let t_hi = bisect(ts[head_hi], ts[head_hi + 1]).clamp(0.0, 1.0);
+
+    // Re-sample the wrapped interior span [t_lo, 1] ∪ [0, t_hi] into an ordered
+    // 3D point list. The seam point (t=1 ≡ t=0) appears once, so the head and
+    // tail join continuously. Resolution matches the source sampling density.
+    const WRAP_SAMPLES: usize = 48;
+    let mut pts: Vec<IntersectionPoint> = Vec::new();
+    let mut push_t = |t: f64, pts: &mut Vec<IntersectionPoint>| {
+        if let Ok(cp) = curve.curve.evaluate(t) {
+            let pa = (
+                (curve.on_surface_a.u_of_t)(t),
+                (curve.on_surface_a.v_of_t)(t),
+            );
+            let pb = (
+                (curve.on_surface_b.u_of_t)(t),
+                (curve.on_surface_b.v_of_t)(t),
+            );
+            pts.push(IntersectionPoint {
+                position: cp.position,
+                params_a: pa,
+                params_b: pb,
+            });
+        }
     };
-    if t_hi - t_lo <= step * 0.5 {
-        // Degenerate sliver — treat as a miss rather than imprint a near-zero
-        // cut that the arrangement would walk into a phantom fragment.
+    // Tail span [t_lo, 1).
+    let tail_span = 1.0 - t_lo;
+    if tail_span > 0.0 {
+        let steps = (WRAP_SAMPLES as f64 * tail_span).ceil().max(1.0) as usize;
+        for k in 0..steps {
+            let t = t_lo + tail_span * (k as f64 / steps as f64);
+            push_t(t, &mut pts);
+        }
+    }
+    // Head span [0, t_hi], starting at the seam (t=0 ≡ t=1) so it joins the tail.
+    let head_steps = (WRAP_SAMPLES as f64 * t_hi).ceil().max(1.0) as usize;
+    for k in 0..=head_steps {
+        let t = t_hi * (k as f64 / head_steps as f64);
+        push_t(t, &mut pts);
+    }
+
+    // De-duplicate consecutive coincident points (the seam join) so the fit
+    // never sees a zero-length segment.
+    let dedup_tol_sq = (tolerance.distance() * tolerance.distance()).max(1e-18);
+    pts.dedup_by(|a, b| {
+        let d = a.position - b.position;
+        d.dot(&d) <= dedup_tol_sq
+    });
+
+    if pts.len() < 2 {
         return Ok(None);
     }
 
-    let trimmed = match curve.curve.subcurve(t_lo, t_hi) {
-        Ok(c) => c,
-        // If the curve cannot be sub-divided, the safe choice is to keep the
-        // original (no worse than the pre-clip behaviour).
-        Err(_) => return Ok(Some(curve)),
-    };
+    // Endpoint params for the rebuilt parametric maps.
+    let (ua0, va0) = (pts[0].params_a.0, pts[0].params_a.1);
+    let (ua1, va1) = (pts[pts.len() - 1].params_a.0, pts[pts.len() - 1].params_a.1);
+    let (ub0, vb0) = (pts[0].params_b.0, pts[0].params_b.1);
+    let (ub1, vb1) = (pts[pts.len() - 1].params_b.0, pts[pts.len() - 1].params_b.1);
 
-    // Re-anchor the dropped parametric maps at the trimmed endpoints. Only the
-    // 3D curve is consumed downstream (see `intersect_faces`), so two-sample
-    // linear maps are sufficient and faithful for the trimmed span.
-    let (ua0, va0) = (
-        (curve.on_surface_a.u_of_t)(t_lo),
-        (curve.on_surface_a.v_of_t)(t_lo),
-    );
-    let (ua1, va1) = (
-        (curve.on_surface_a.u_of_t)(t_hi),
-        (curve.on_surface_a.v_of_t)(t_hi),
-    );
-    let (ub0, vb0) = (
-        (curve.on_surface_b.u_of_t)(t_lo),
-        (curve.on_surface_b.v_of_t)(t_lo),
-    );
-    let (ub1, vb1) = (
-        (curve.on_surface_b.u_of_t)(t_hi),
-        (curve.on_surface_b.v_of_t)(t_hi),
-    );
+    let fitted = fit_curve_to_points(&pts, tolerance)?;
 
     Ok(Some(SurfaceIntersectionCurve {
-        curve: trimmed,
+        curve: fitted,
         on_surface_a: create_parametric_curve(&[(ua0, va0), (ua1, va1)]),
         on_surface_b: create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]),
     }))
