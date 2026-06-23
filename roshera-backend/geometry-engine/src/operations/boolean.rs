@@ -1139,17 +1139,19 @@ fn intersect_faces(
     // Task #55's perpendicular-box regression.
     let mut clipped_curves = Vec::new();
     for curve in curves {
-        if let Some(trimmed) = clip_surface_intersection_curve_to_faces(
+        // One source curve may clip to ZERO (misses), ONE (typical), or MORE
+        // THAN ONE (a through-slot cap ring inside the box at two openings)
+        // trimmed cuts. Extend with all of them.
+        let trimmed = clip_surface_intersection_curve_to_faces(
             curve,
             face_a,
             face_b,
             model,
             &options.common.tolerance,
-        )? {
-            clipped_curves.push(trimmed);
-        }
-        // `None` → the cutting line misses one or both faces entirely.
-        // Drop silently; an empty `clipped_curves` yields `Ok(None)` below.
+        )?;
+        clipped_curves.extend(trimmed);
+        // Empty → the cutting curve misses one or both faces entirely; an empty
+        // `clipped_curves` yields `Ok(None)` below.
     }
 
     if clipped_curves.is_empty() {
@@ -7461,6 +7463,23 @@ fn partition_outer_and_pre_existing_hole_cycles(
     if original_inner_loop_edges.is_empty() {
         return (loops, no_holes());
     }
+    // The face's original OUTER-loop edges — used to identify the GENUINE outer
+    // cycle among the split cycles (the one that re-traces part of the original
+    // boundary), distinct from a wholly-interior NEW island cut (a fresh pocket
+    // opening, which `extract_regions` also emits as a CCW cycle but which the
+    // island pass — not this one — attaches). Without this distinction a
+    // chained second pocket's island is mis-counted as an "outer", defeating the
+    // single-outer attachment and leaving the genuine pre-existing hole's
+    // centroid test to run against a periodic-wrapped outer (which folds in the
+    // tangent-plane projection and wrongly rejects it).
+    let original_outer_edge_set: std::collections::HashSet<EdgeId> = match model
+        .faces
+        .get(face_id)
+        .and_then(|f| model.loops.get(f.outer_loop))
+    {
+        Some(l) => l.edges.iter().copied().collect(),
+        None => std::collections::HashSet::new(),
+    };
 
     let surface = match model.surfaces.get(surface_id) {
         Some(s) => s,
@@ -7612,18 +7631,70 @@ fn partition_outer_and_pre_existing_hole_cycles(
     // centroid. Reverse the edge list and flip each forward bit so the
     // hole winding is opposite the outer's, per LoopType::Inner.
     let mut attachments: Vec<Vec<Vec<(EdgeId, bool)>>> = vec![Vec::new(); outer_indices.len()];
-    for &h in &hole_indices {
-        let hc = match centroid_2d(&cycle_polys_2d[h]) {
-            Some(c) => c,
-            None => continue,
-        };
-        let mut chosen: Option<usize> = None;
-        for (pos, &o) in outer_indices.iter().enumerate() {
-            if cycle_polys_2d[o].len() >= 3 && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o]) {
-                chosen = Some(pos);
-                break;
+    // The GENUINE outer cycle re-traces part of the face's ORIGINAL outer loop
+    // (its seam / cap-rim boundary); a chained NEW pocket opening is also emitted
+    // as a CCW cycle but consists wholly of fresh cut edges (a wholly-interior
+    // island). Distinguish them by edge-set overlap with the original outer loop
+    // so the pre-existing hole attaches to the real outer, not the island.
+    let outer_overlap = |pos: usize| -> usize {
+        let o = outer_indices[pos];
+        loops[o]
+            .iter()
+            .filter(|(e, _)| original_outer_edge_set.contains(e))
+            .count()
+    };
+    // The genuine outer = the outer cycle with the most original-outer edges; if
+    // none overlaps (every original outer edge was re-split), fall back to the
+    // largest-area projected polygon (the wrap-around boundary dominates any
+    // interior island in tangent-plane extent).
+    let signed_area = |poly: &[(f64, f64)]| -> f64 {
+        if poly.len() < 3 {
+            return 0.0;
+        }
+        let mut a = 0.0;
+        for i in 0..poly.len() {
+            let (x0, y0) = poly[i];
+            let (x1, y1) = poly[(i + 1) % poly.len()];
+            a += x0 * y1 - x1 * y0;
+        }
+        (0.5 * a).abs()
+    };
+    let genuine_outer_pos: Option<usize> = if outer_indices.is_empty() {
+        None
+    } else {
+        let mut best = 0usize;
+        let mut best_overlap = outer_overlap(0);
+        let mut best_area = signed_area(&cycle_polys_2d[outer_indices[0]]);
+        for pos in 1..outer_indices.len() {
+            let ov = outer_overlap(pos);
+            let area = signed_area(&cycle_polys_2d[outer_indices[pos]]);
+            let better = ov > best_overlap || (ov == best_overlap && area > best_area);
+            if better {
+                best = pos;
+                best_overlap = ov;
+                best_area = area;
             }
         }
+        Some(best)
+    };
+
+    for &h in &hole_indices {
+        // Try the centroid-in-polygon test first (handles a planar cap with
+        // several genuine outer fragments). For a periodic freeform outer the
+        // projection folds and the test fails, so fall back to the genuine outer.
+        let hc = centroid_2d(&cycle_polys_2d[h]);
+        let mut chosen: Option<usize> = None;
+        if let Some(hc) = hc {
+            for (pos, &o) in outer_indices.iter().enumerate() {
+                if cycle_polys_2d[o].len() >= 3
+                    && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o])
+                {
+                    chosen = Some(pos);
+                    break;
+                }
+            }
+        }
+        let chosen = chosen.or(genuine_outer_pos);
         if let Some(pos) = chosen {
             let reversed: Vec<(EdgeId, bool)> =
                 loops[h].iter().rev().map(|(e, fwd)| (*e, !*fwd)).collect();
@@ -7932,13 +8003,39 @@ fn compute_split_face_interior_points(
         })
         .collect();
 
+    // Per-loop EdgeId set, for the adjacency test below.
+    let loop_edge_sets: Vec<HashSet<EdgeId>> = loops
+        .iter()
+        .map(|cycle| cycle.iter().map(|&(eid, _)| eid).collect())
+        .collect();
+
     // Sibling-containment graph: children[i] = indices of loops whose 2D
     // centroid lies inside loop i's 2D polygon.
+    //
+    // ADJACENCY GUARD: a true hole (inner loop) shares NO edge with its
+    // container — the two boundaries are disjoint. Two ADJACENT arrangement
+    // cells, by contrast, share the edge they straddle. So a sibling that
+    // shares an edge with loop i can only be a NEIGHBOUR, never a hole, and
+    // must be excluded from `children` even if its centroid projects inside
+    // loop i's polygon. Without this, a cell bounded by a curved cut that bulges
+    // across the nominal split line (the lofted-barrel slot floor: the
+    // slot-mouth SSI dips ~0.2 mm past the adjacent cap-band cut) reports its
+    // edge-sharing neighbour as a phantom hole, the override then routes the
+    // interior sample around that phantom hole to a cell-edge point on the
+    // barrel surface, and the floor mis-classifies and drops (the w05
+    // full-height-slot leak). The guard cannot mask a real hole: a real hole
+    // never shares an edge with its face.
     let n = loops.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
         for j in 0..n {
             if i == j {
+                continue;
+            }
+            if loop_edge_sets[i]
+                .iter()
+                .any(|e| loop_edge_sets[j].contains(e))
+            {
                 continue;
             }
             let (cx, cy) = loop_centroids_2d[j];
@@ -8003,7 +8100,32 @@ fn compute_split_face_interior_points(
         }
         if let Some((u, v)) = found {
             let p = Vector3::new(origin.x, origin.y, origin.z) + e1 * u + e2 * v;
-            result[i] = Some(Point3::new(p.x, p.y, p.z));
+            let candidate = Point3::new(p.x, p.y, p.z);
+            // ON-SURFACE GUARD. The flat tangent-plane projection is exact for a
+            // PLANE but only locally faithful on a curved face. When a loop
+            // WRAPS the lateral (a freeform body loop = the whole barrel minus
+            // the pocket), its flattened polygon folds back over itself, the
+            // containment/nudge can land on the far fold, and the back-projected
+            // 3D point sits OFF the surface — e.g. the w03 through-slot barrel
+            // islands resolved to (4.1, 3.9, 2.1), |xy| ≈ 5.7 ≫ r = 4. Such a
+            // point classifies against the wrong material and either keeps a
+            // removed patch (w03 doubled wall) or drops a kept one. Accept the
+            // correction only when the candidate actually lies on the face's
+            // surface; otherwise leave `None` so `get_face_interior_point` falls
+            // back to the boundary-midpoint centroid (an on-surface point for
+            // these small convex islands). Planar faces always pass the guard,
+            // so their behaviour — and every planar-boolean / poke_matrix
+            // verdict — is unchanged.
+            let on_surface = match surface.closest_point(&candidate, tol) {
+                Ok((cu, cv)) => match surface.point_at(cu, cv) {
+                    Ok(foot) => (foot - candidate).magnitude() <= tol.distance().max(1.0e-6),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if on_surface {
+                result[i] = Some(candidate);
+            }
         }
     }
 
@@ -9667,7 +9789,7 @@ fn clip_surface_intersection_curve_to_faces(
     face_b: FaceId,
     model: &BRepModel,
     tolerance: &Tolerance,
-) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     use crate::primitives::curve::{Circle, Line};
 
     // Circle cutting curves arise from perpendicular plane-cylinder and
@@ -9676,7 +9798,11 @@ fn clip_surface_intersection_curve_to_faces(
     // handing them to the DCEL face-splitting code.
     if let Some(circle_ref) = curve.curve.as_any().downcast_ref::<Circle>() {
         let circle = circle_ref.clone();
-        return apply_circle_clip_to_faces(curve, &circle, face_a, face_b, model, tolerance);
+        return Ok(
+            apply_circle_clip_to_faces(curve, &circle, face_a, face_b, model, tolerance)?
+                .into_iter()
+                .collect(),
+        );
     }
 
     // Clipping only applies to straight cutting lines (the plane-plane
@@ -9712,19 +9838,19 @@ fn clip_surface_intersection_curve_to_faces(
     // Combine clip outcomes.
     let (t_a_lo, t_a_hi) = match clip_a {
         ClipOutcome::Trimmed(lo, hi) => (lo, hi),
-        ClipOutcome::Misses => return Ok(None),
+        ClipOutcome::Misses => return Ok(Vec::new()),
         ClipOutcome::NotApplicable => (0.0, 1.0),
     };
     let (t_b_lo, t_b_hi) = match clip_b {
         ClipOutcome::Trimmed(lo, hi) => (lo, hi),
-        ClipOutcome::Misses => return Ok(None),
+        ClipOutcome::Misses => return Ok(Vec::new()),
         ClipOutcome::NotApplicable => (0.0, 1.0),
     };
 
     // If both faces are NotApplicable, return the curve unchanged.
     if matches!(clip_a, ClipOutcome::NotApplicable) && matches!(clip_b, ClipOutcome::NotApplicable)
     {
-        return Ok(Some(curve));
+        return Ok(vec![curve]);
     }
 
     let t_min_core = t_a_lo.max(t_b_lo);
@@ -9732,7 +9858,7 @@ fn clip_surface_intersection_curve_to_faces(
     // Use a tiny relative epsilon to reject zero-width intervals produced
     // by lines that only graze one face.
     if t_max_core - t_min_core <= tolerance.distance() / line.length().max(1.0) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     // Use the tight interior interval. Endpoints falling on shared
@@ -9772,11 +9898,11 @@ fn clip_surface_intersection_curve_to_faces(
     let on_surface_a = create_parametric_curve(&[(ua0, va0), (ua1, va1)]);
     let on_surface_b = create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]);
 
-    Ok(Some(SurfaceIntersectionCurve {
+    Ok(vec![SurfaceIntersectionCurve {
         curve: Box::new(trimmed_line),
         on_surface_a,
         on_surface_b,
-    }))
+    }])
 }
 
 /// Trim a GENERAL (non-Line, non-Circle) surface-surface intersection curve to
@@ -9802,7 +9928,7 @@ fn clip_general_curve_by_face_membership(
     face_b: FaceId,
     model: &BRepModel,
     tolerance: &Tolerance,
-) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
     // Gate: exactly the planar × non-analytic configuration. The PLANAR face
     // is the bounded one we trim to; the freeform face is the (large)
     // unbounded surface whose carrier produced the over-long curve.
@@ -9815,7 +9941,7 @@ fn clip_general_curve_by_face_membership(
     } else if b_planar && a_freeform {
         face_b
     } else {
-        return Ok(Some(curve));
+        return Ok(vec![curve]);
     };
 
     // Sample the curve over t ∈ [0, 1] and test membership against the BOUNDED
@@ -9842,52 +9968,80 @@ fn clip_general_curve_by_face_membership(
         inside.push(is_point_in_face(model, bounded_face, &p, tolerance).unwrap_or(false));
     }
 
-    // Find the longest contiguous run of `inside == true`.
-    let mut best_lo = 0usize;
-    let mut best_hi = 0usize;
-    let mut best_len = 0usize;
-    let mut run_lo = 0usize;
-    let mut in_run = false;
-    for i in 0..inside.len() {
-        if inside[i] {
-            if !in_run {
-                in_run = true;
-                run_lo = i;
+    // Collect EVERY maximal contiguous run of `inside == true` as a (lo, hi)
+    // sample-index pair. A single plane × periodic-NURBS cut can land inside the
+    // bounded planar feature on MORE THAN ONE disjoint arc — the canonical case
+    // is a THROUGH-SLOT (a box crossing both barrel walls): the z=const cap ring
+    // dips into the slot box at BOTH the +Y and −Y openings, so the ring's
+    // membership trace has two interior runs on opposite sides. The previous
+    // "longest run only" logic kept one and dropped the other, so the freeform
+    // barrel received only ONE opening's cap rim and the second opening never
+    // closed (w03's non-manifold leak). Emit one trimmed cut per run.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut run_lo = 0usize;
+        let mut in_run = false;
+        for i in 0..inside.len() {
+            if inside[i] {
+                if !in_run {
+                    in_run = true;
+                    run_lo = i;
+                }
+            } else if in_run {
+                runs.push((run_lo, i - 1));
+                in_run = false;
             }
-            let len = i - run_lo + 1;
-            if len > best_len {
-                best_len = len;
-                best_lo = run_lo;
-                best_hi = i;
-            }
-        } else {
-            in_run = false;
+        }
+        if in_run {
+            runs.push((run_lo, inside.len() - 1));
         }
     }
 
     // No interior samples → the curve misses the bounded feature.
-    if best_len == 0 {
-        return Ok(None);
-    }
-    // Entire curve already inside both faces → keep it verbatim.
-    if best_lo == 0 && best_hi == inside.len() - 1 {
-        return Ok(Some(curve));
+    if runs.is_empty() {
+        return Ok(Vec::new());
     }
 
-    // Refine each trimmed endpoint by bisecting between the last strictly-
-    // interior sample and the adjacent strictly-exterior sample, so the
-    // trimmed curve TERMINATES exactly on the planar face's boundary edge
-    // (within tolerance). A crude half-sample extension would leave the arc
-    // endpoint short of (or past) the box edge — and an open arc that does
-    // not reach the bounded face's boundary cannot split that face into an
-    // inside/outside pair (the region-extraction walks past it), which is
-    // precisely what drops a pocket's side/cap walls. The bisected endpoint
-    // lands on the boundary, so the cut closes the region.
+    let last = inside.len() - 1;
+
+    // SEAM-WRAP merge (task #17 watertight). A plane × periodic-NURBS cut (a cap
+    // ring meeting a lofted barrel) is traced by the marching-squares SSI as a
+    // single chain running the u-domain from one seam edge (u_min) to the other
+    // (u_max). Both seam endpoints are the SAME 3D point, so the chain is
+    // GEOMETRICALLY CLOSED though parametrised open. When the bounded feature
+    // straddles that seam (a pocket ON the +X seam), the interior span is split
+    // by the chain's t=0/t=1 break into a HEAD run and a TAIL run that are really
+    // one arc across the seam. Merge them into a single wrapped cut so the pocket
+    // rim closes on both sides of the seam.
+    let curve_is_closed = {
+        let s = curve.curve.evaluate(0.0).ok().map(|cp| cp.position);
+        let e = curve.curve.evaluate(1.0).ok().map(|cp| cp.position);
+        match (s, e) {
+            (Some(s), Some(e)) => {
+                let d = e - s;
+                d.dot(&d) <= tolerance.distance() * tolerance.distance()
+            }
+            _ => false,
+        }
+    };
+    let mut wrapped: Option<(usize, usize)> = None; // (tail_lo, head_hi)
+    if curve_is_closed && runs.len() >= 2 {
+        let head_is_prefix = runs.first().map(|&(lo, _)| lo == 0).unwrap_or(false);
+        let tail_is_suffix = runs.last().map(|&(_, hi)| hi == last).unwrap_or(false);
+        if head_is_prefix && tail_is_suffix {
+            let (_, head_hi) = runs.remove(0);
+            let (tail_lo, _) = runs.pop().unwrap_or((last, last));
+            wrapped = Some((tail_lo, head_hi));
+        }
+    }
+
     let step = 1.0 / SAMPLES as f64;
-    // Bisection on the membership predicate of the bounded face.
+    // Bisection on the membership predicate of the bounded face: find the
+    // boundary crossing between an interior `t` and an adjacent exterior `t`, so
+    // the trimmed cut TERMINATES exactly on the planar feature's boundary edge.
     let bisect = |t_inside: f64, t_outside: f64| -> f64 {
-        let mut lo = t_inside; // inside
-        let mut hi = t_outside; // outside
+        let mut lo = t_inside;
+        let mut hi = t_outside;
         for _ in 0..40 {
             let mid = 0.5 * (lo + hi);
             let on = match curve.curve.evaluate(mid) {
@@ -9902,55 +10056,193 @@ fn clip_general_curve_by_face_membership(
                 hi = mid;
             }
         }
-        // The boundary lies between lo (inside) and hi (outside); take the
-        // midpoint, which is on the face boundary within ~2^-40 of the span.
         0.5 * (lo + hi)
     };
-    let t_lo = if best_lo == 0 {
-        0.0
-    } else {
-        bisect(ts[best_lo], ts[best_lo - 1]).clamp(0.0, 1.0)
+
+    let mut out: Vec<SurfaceIntersectionCurve> = Vec::new();
+
+    // The seam-wrapped span (if any) is emitted as one curve via the wrap helper.
+    if let Some((tail_lo, head_hi)) = wrapped {
+        if let Some(c) = clip_wrapped_general_curve(
+            &curve,
+            bounded_face,
+            tail_lo,
+            head_hi,
+            &ts,
+            model,
+            tolerance,
+        )? {
+            out.push(c);
+        }
+    }
+
+    // Each remaining (non-wrapped) run becomes one trimmed cut.
+    for (lo, hi) in runs {
+        // Whole curve inside on this run AND the run is the entire curve → keep
+        // it verbatim (no clip needed). Only valid when there is a single run.
+        let t_lo = if lo == 0 {
+            0.0
+        } else {
+            bisect(ts[lo], ts[lo - 1]).clamp(0.0, 1.0)
+        };
+        let t_hi = if hi == last {
+            1.0
+        } else {
+            bisect(ts[hi], ts[hi + 1]).clamp(0.0, 1.0)
+        };
+        if t_hi - t_lo <= step * 0.5 {
+            // Degenerate sliver — skip rather than imprint a near-zero cut.
+            continue;
+        }
+        let trimmed = if t_lo <= 0.0 && t_hi >= 1.0 {
+            // Verbatim: cannot meaningfully sub-divide the full span.
+            match curve.curve.subcurve(0.0, 1.0) {
+                Ok(c) => c,
+                Err(_) => continue,
+            }
+        } else {
+            match curve.curve.subcurve(t_lo, t_hi) {
+                Ok(c) => c,
+                Err(_) => continue,
+            }
+        };
+        let (ua0, va0) = (
+            (curve.on_surface_a.u_of_t)(t_lo),
+            (curve.on_surface_a.v_of_t)(t_lo),
+        );
+        let (ua1, va1) = (
+            (curve.on_surface_a.u_of_t)(t_hi),
+            (curve.on_surface_a.v_of_t)(t_hi),
+        );
+        let (ub0, vb0) = (
+            (curve.on_surface_b.u_of_t)(t_lo),
+            (curve.on_surface_b.v_of_t)(t_lo),
+        );
+        let (ub1, vb1) = (
+            (curve.on_surface_b.u_of_t)(t_hi),
+            (curve.on_surface_b.v_of_t)(t_hi),
+        );
+        out.push(SurfaceIntersectionCurve {
+            curve: trimmed,
+            on_surface_a: create_parametric_curve(&[(ua0, va0), (ua1, va1)]),
+            on_surface_b: create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]),
+        });
+    }
+
+    Ok(out)
+}
+
+/// Build the seam-crossing cut curve for a geometrically-closed SSI chain whose
+/// interior span wraps the parametric seam (task #17 watertight).
+///
+/// `tail_lo` is the first sample index of the tail run (…→t=1), `head_hi` the
+/// last sample index of the head run (t=0→…). The interior span is
+/// `t ∈ [t_lo, 1] ∪ [0, t_hi]` where the exact entry/exit are bisected against
+/// the bounded face's membership predicate (the same refinement the non-wrapped
+/// path uses, so the cut terminates ON the planar feature's boundary). The
+/// wrapped span is then re-sampled into a single ordered point list and refitted
+/// — concatenating across the seam yields a continuous arc whose two endpoints
+/// land on the box wall edges, closing the freeform pocket loop on both sides of
+/// the seam.
+#[allow(clippy::too_many_arguments)]
+fn clip_wrapped_general_curve(
+    curve: &SurfaceIntersectionCurve,
+    bounded_face: FaceId,
+    tail_lo: usize,
+    head_hi: usize,
+    ts: &[f64],
+    model: &BRepModel,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<SurfaceIntersectionCurve>> {
+    // Bisection on the bounded face's membership predicate, identical to the
+    // non-wrapped path: find the boundary crossing between an interior `t` and
+    // an adjacent exterior `t`.
+    let bisect = |t_inside: f64, t_outside: f64| -> f64 {
+        let mut lo = t_inside;
+        let mut hi = t_outside;
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            let on = match curve.curve.evaluate(mid) {
+                Ok(cp) => {
+                    is_point_in_face(model, bounded_face, &cp.position, tolerance).unwrap_or(false)
+                }
+                Err(_) => false,
+            };
+            if on {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
     };
-    let t_hi = if best_hi == inside.len() - 1 {
-        1.0
-    } else {
-        bisect(ts[best_hi], ts[best_hi + 1]).clamp(0.0, 1.0)
+
+    // Tail run enters the feature between sample tail_lo-1 (exterior) and tail_lo
+    // (interior); the wrapped span starts there. Head run exits between head_hi
+    // (interior) and head_hi+1 (exterior); the wrapped span ends there.
+    let t_lo = bisect(ts[tail_lo], ts[tail_lo - 1]).clamp(0.0, 1.0);
+    let t_hi = bisect(ts[head_hi], ts[head_hi + 1]).clamp(0.0, 1.0);
+
+    // Re-sample the wrapped interior span [t_lo, 1] ∪ [0, t_hi] into an ordered
+    // 3D point list. The seam point (t=1 ≡ t=0) appears once, so the head and
+    // tail join continuously. Resolution matches the source sampling density.
+    const WRAP_SAMPLES: usize = 48;
+    let mut pts: Vec<IntersectionPoint> = Vec::new();
+    let mut push_t = |t: f64, pts: &mut Vec<IntersectionPoint>| {
+        if let Ok(cp) = curve.curve.evaluate(t) {
+            let pa = (
+                (curve.on_surface_a.u_of_t)(t),
+                (curve.on_surface_a.v_of_t)(t),
+            );
+            let pb = (
+                (curve.on_surface_b.u_of_t)(t),
+                (curve.on_surface_b.v_of_t)(t),
+            );
+            pts.push(IntersectionPoint {
+                position: cp.position,
+                params_a: pa,
+                params_b: pb,
+            });
+        }
     };
-    if t_hi - t_lo <= step * 0.5 {
-        // Degenerate sliver — treat as a miss rather than imprint a near-zero
-        // cut that the arrangement would walk into a phantom fragment.
+    // Tail span [t_lo, 1).
+    let tail_span = 1.0 - t_lo;
+    if tail_span > 0.0 {
+        let steps = (WRAP_SAMPLES as f64 * tail_span).ceil().max(1.0) as usize;
+        for k in 0..steps {
+            let t = t_lo + tail_span * (k as f64 / steps as f64);
+            push_t(t, &mut pts);
+        }
+    }
+    // Head span [0, t_hi], starting at the seam (t=0 ≡ t=1) so it joins the tail.
+    let head_steps = (WRAP_SAMPLES as f64 * t_hi).ceil().max(1.0) as usize;
+    for k in 0..=head_steps {
+        let t = t_hi * (k as f64 / head_steps as f64);
+        push_t(t, &mut pts);
+    }
+
+    // De-duplicate consecutive coincident points (the seam join) so the fit
+    // never sees a zero-length segment.
+    let dedup_tol_sq = (tolerance.distance() * tolerance.distance()).max(1e-18);
+    pts.dedup_by(|a, b| {
+        let d = a.position - b.position;
+        d.dot(&d) <= dedup_tol_sq
+    });
+
+    if pts.len() < 2 {
         return Ok(None);
     }
 
-    let trimmed = match curve.curve.subcurve(t_lo, t_hi) {
-        Ok(c) => c,
-        // If the curve cannot be sub-divided, the safe choice is to keep the
-        // original (no worse than the pre-clip behaviour).
-        Err(_) => return Ok(Some(curve)),
-    };
+    // Endpoint params for the rebuilt parametric maps.
+    let (ua0, va0) = (pts[0].params_a.0, pts[0].params_a.1);
+    let (ua1, va1) = (pts[pts.len() - 1].params_a.0, pts[pts.len() - 1].params_a.1);
+    let (ub0, vb0) = (pts[0].params_b.0, pts[0].params_b.1);
+    let (ub1, vb1) = (pts[pts.len() - 1].params_b.0, pts[pts.len() - 1].params_b.1);
 
-    // Re-anchor the dropped parametric maps at the trimmed endpoints. Only the
-    // 3D curve is consumed downstream (see `intersect_faces`), so two-sample
-    // linear maps are sufficient and faithful for the trimmed span.
-    let (ua0, va0) = (
-        (curve.on_surface_a.u_of_t)(t_lo),
-        (curve.on_surface_a.v_of_t)(t_lo),
-    );
-    let (ua1, va1) = (
-        (curve.on_surface_a.u_of_t)(t_hi),
-        (curve.on_surface_a.v_of_t)(t_hi),
-    );
-    let (ub0, vb0) = (
-        (curve.on_surface_b.u_of_t)(t_lo),
-        (curve.on_surface_b.v_of_t)(t_lo),
-    );
-    let (ub1, vb1) = (
-        (curve.on_surface_b.u_of_t)(t_hi),
-        (curve.on_surface_b.v_of_t)(t_hi),
-    );
+    let fitted = fit_curve_to_points(&pts, tolerance)?;
 
     Ok(Some(SurfaceIntersectionCurve {
-        curve: trimmed,
+        curve: fitted,
         on_surface_a: create_parametric_curve(&[(ua0, va0), (ua1, va1)]),
         on_surface_b: create_parametric_curve(&[(ub0, vb0), (ub1, vb1)]),
     }))
@@ -11447,23 +11739,103 @@ pub(super) fn compute_edge_intersections(
     }
     let mut split_ops: Vec<SplitOp> = Vec::new();
 
-    for (eid_a, eid_b, point, t_a, t_b, dist) in &new_intersections {
-        // Create a real vertex in the model. `dist` is propagated as the
-        // geometric residual so the new vertex is stamped with a tolerance
-        // of at least max(global_tol, dist) — this is what lets the
-        // tolerant-modeling merge predicate downstream see the same
-        // uncertainty radius the intersection finder did.
-        let vid = find_or_create_intersection_vertex(model, graph, *point, tolerance, *dist);
+    // Parametric terminal epsilon: an intersection whose parameter on an edge
+    // sits within this of 0 or 1 falls ON that edge's own start/end vertex.
+    // This is a PARAMETRIC terminal test (literally "is this the curve's
+    // endpoint"), distinct from the length-scaled proximity threshold the
+    // split-application loop deliberately avoids.
+    const TERMINAL_EPS: f64 = 1e-9;
 
-        // Record intersection points as split ops on each edge.
-        if graph.edges.contains_key(eid_a) {
+    for (eid_a, eid_b, point, t_a, t_b, dist) in &new_intersections {
+        // ONE-SIDED T-JUNCTION endpoint reuse (narrow, conservative).
+        //
+        // The general case mints ONE fresh vertex at the intersection point and
+        // splits BOTH edges there. That is correct for an interior crossing, but
+        // when EXACTLY ONE edge is hit at its own parametric terminal while the
+        // OTHER is hit in its interior, the hit is a T-junction: the terminal
+        // edge already OWNS a vertex at that point. Reuse that existing endpoint
+        // vertex as the T-junction vertex (so the interior edge splits ONTO it)
+        // and don't split the terminal edge (splitting at a terminal only
+        // manufactures a zero-length sub-edge).
+        //
+        // Why this matters: `build_shared_corner_endpoints` may have retargeted
+        // that terminal endpoint to a clustered shared corner sitting a fit-
+        // residual (~1e-3) from the raw curve-evaluated point. Minting a fresh
+        // vertex at the raw point strands the welded corner — the terminal edge
+        // gets a degenerate [0,0]/[1,1] stub between corner and raw point, the
+        // stub is later dropped, and the cut arc detaches from the operand
+        // boundary (the w05 full-height-slot leak). Reusing the welded corner
+        // makes the T-junction exact.
+        //
+        // Scope guard — applied ONLY for a ONE-SIDED T-junction (exactly one
+        // edge terminal, the other interior) whose TERMINAL edge rides a
+        // FREEFORM (NURBS/B-spline/ruled/...) carrier curve. This is the
+        // surface–surface-intersection corefinement case: an SSI cut whose
+        // terminal endpoint `build_shared_corner_endpoints` retargeted to a
+        // clustered shared corner (a few ×1e-3 from the raw curve-evaluated
+        // point). Reusing that welded corner as the T-junction vertex closes the
+        // cut against the operand boundary; minting a fresh raw-point vertex
+        // strands it (the w05 leak).
+        //
+        // The freeform gate is load-bearing: an ANALYTIC cut arc (a box-poke
+        // circle/line) carries NO fit residual, its terminal IS its exact corner,
+        // and reusing-vs-minting is a no-op geometrically — BUT suppressing the
+        // analytic arc's terminal split corrupts the analytic arrangement (the
+        // cylinder axial/horizontal-poke cells). So analytic terminals keep the
+        // verbatim mint-and-split, leaving the analytic core (poke_matrix)
+        // untouched, while only a freeform SSI terminal takes the reuse path.
+        let edge_curve_is_freeform = |eid: EdgeId| -> bool {
+            model
+                .edges
+                .get(eid)
+                .and_then(|e| model.curves.get(e.curve_id))
+                .map(|c| c.type_name() == "NURBS")
+                .unwrap_or(false)
+        };
+        let terminal_vertex = |eid: EdgeId, t: f64| -> Option<VertexId> {
+            if !edge_curve_is_freeform(eid) {
+                return None;
+            }
+            let edge = model.edges.get(eid)?;
+            let v = if t <= TERMINAL_EPS {
+                edge.start_vertex
+            } else if t >= 1.0 - TERMINAL_EPS {
+                edge.end_vertex
+            } else {
+                return None;
+            };
+            if v == u32::MAX || v == crate::primitives::vertex::INVALID_VERTEX_ID {
+                return None;
+            }
+            Some(v)
+        };
+        let a_terminal = terminal_vertex(*eid_a, *t_a);
+        let b_terminal = terminal_vertex(*eid_b, *t_b);
+
+        // Reuse the terminal endpoint vertex only for a one-sided T-junction;
+        // otherwise mint a fresh vertex exactly as before. `dist` stamps the
+        // minted vertex with the intersection's geometric residual.
+        let (vid, skip_split_a, skip_split_b) = match (a_terminal, b_terminal) {
+            (Some(va), None) => (va, true, false),
+            (None, Some(vb)) => (vb, false, true),
+            _ => (
+                find_or_create_intersection_vertex(model, graph, *point, tolerance, *dist),
+                false,
+                false,
+            ),
+        };
+
+        // Record split ops. A terminal edge in a one-sided T-junction is not
+        // split (it already ends at `vid`); every other edge splits at its
+        // parameter against `vid`.
+        if !skip_split_a && graph.edges.contains_key(eid_a) {
             split_ops.push(SplitOp {
                 edge_id: *eid_a,
                 parameter: *t_a,
                 vertex_id: vid,
             });
         }
-        if graph.edges.contains_key(eid_b) {
+        if !skip_split_b && graph.edges.contains_key(eid_b) {
             split_ops.push(SplitOp {
                 edge_id: *eid_b,
                 parameter: *t_b,
@@ -14142,6 +14514,252 @@ fn reconstruct_topology(
 /// the canonical edge for a duplicate that ran in the opposite
 /// direction, we flip `forward` so the loop's geometric walk is
 /// unchanged.
+/// Weld imprint-RESIDUAL duplicate vertices left after the per-face splits.
+///
+/// `build_shared_corner_endpoints` clusters the cut-arc ENDPOINTS into one
+/// welded corner per pocket corner *before* the arrangements run, so the
+/// freeform operand's opening closes into a clean loop on identical corner
+/// vertices. But a planar cutter face (a box cap / wall) can re-introduce a
+/// near-duplicate of a welded corner DURING its own arrangement: where the same
+/// imprinted arc is split against that face's boundary, the split lands at the
+/// arc's RAW (pre-weld) endpoint position rather than the welded corner. The
+/// two vertices then sit a tiny imprint RESIDUAL apart — above the global weld
+/// tolerance (so `canonicalise_face_edges_by_position`'s 1e-12 position match
+/// never unifies them) yet far below any real feature dimension.
+///
+/// Concretely, the w03 through-slot: the +Y opening corner is welded at
+/// y = 3.8667, but the z = const box-cap face splits the shared arc at the raw
+/// y = 3.8612 — a 0.0055 residual. The box-cap arc therefore becomes
+/// `corner → raw → raw → corner` (two ~0.0055 slivers around the real middle
+/// piece), shares no edge with the barrel opening's single full arc, and the
+/// tunnel wall strands into its own shell (euler -5, 72 boundary edges).
+///
+/// This pass closes that gap WITHOUT touching the global weld tolerance or the
+/// mesh: it detects the residual band the same way `build_shared_corner_
+/// endpoints` does — the widest multiplicative jump in the sorted cross-vertex
+/// distance list, required to be ≥4× and capped below the feature band so two
+/// distinct features can never merge — then, for vertices within that band,
+/// retargets each face-loop edge's model endpoints to a single canonical vertex
+/// and DROPS any edge that collapses to zero extent (a sliver). The middle
+/// piece's endpoints become the welded corners, so it now keys identically to
+/// the freeform arc and `canonicalise` unifies them into one shared edge ⇒ one
+/// shell. Purely topological: vertex POSITIONS are never moved, so geometry and
+/// every analytic-boolean verdict (poke_matrix) are unchanged when no residual
+/// band exists (the common case — the pass is then a no-op).
+fn weld_imprint_residual_vertices(
+    model: &mut BRepModel,
+    faces: &mut [SplitFace],
+    tolerance: &Tolerance,
+) {
+    // GATE: this residual only exists for FREEFORM corefinement. A
+    // surface–surface intersection curve between two freeform (or freeform ×
+    // analytic) faces is FITTED independently per cutter face, so a shared
+    // pocket corner is reproduced at slightly different positions on each face
+    // (the SSI fit residual) — exactly what `build_shared_corner_endpoints`
+    // partly welds and this pass finishes. A boolean among ANALYTIC faces only
+    // (plane/cylinder/sphere/cone) has its corners minted EXACTLY by the
+    // analytic splitters; there is no fit residual, and the gap-jump heuristic
+    // must never run there (it would mistake a small-but-REAL analytic feature
+    // — e.g. a sphere corner-poke cap, a cone axial-poke band — for a residual
+    // and merge distinct vertices, corrupting the analytic core / poke_matrix).
+    // Require at least one non-analytic surface among the faces before acting.
+    let any_freeform = faces.iter().any(|f| {
+        model
+            .surfaces
+            .get(f.surface)
+            .map(|s| {
+                matches!(
+                    s.surface_type(),
+                    SurfaceType::NURBS
+                        | SurfaceType::BSpline
+                        | SurfaceType::Ruled
+                        | SurfaceType::SurfaceOfRevolution
+                        | SurfaceType::Offset
+                )
+            })
+            .unwrap_or(false)
+    });
+    if !any_freeform {
+        return;
+    }
+
+    // Collect every vertex any face loop touches, with its position, deduped.
+    let mut verts: Vec<(VertexId, Point3)> = Vec::new();
+    {
+        let mut seen: HashSet<VertexId> = HashSet::new();
+        for face in faces.iter() {
+            for &(eid, _) in face
+                .boundary_edges
+                .iter()
+                .chain(face.inner_loops.iter().flatten())
+            {
+                if let Some(edge) = model.edges.get(eid) {
+                    for vid in [edge.start_vertex, edge.end_vertex] {
+                        if vid == crate::primitives::vertex::INVALID_VERTEX_ID {
+                            continue;
+                        }
+                        if !seen.insert(vid) {
+                            continue;
+                        }
+                        if let Some(p) = model.vertices.get_position(vid) {
+                            verts.push((vid, Point3::new(p[0], p[1], p[2])));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let n = verts.len();
+    if n < 2 {
+        return;
+    }
+
+    let global_tol = tolerance.distance();
+
+    // Cross-vertex distances, ascending. Pairs already within the global weld
+    // tolerance are excluded — those are exact duplicates `canonicalise` handles.
+    let mut pair_dists: Vec<f64> = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = (verts[i].1 - verts[j].1).magnitude();
+            if d > global_tol {
+                pair_dists.push(d);
+            }
+        }
+    }
+    if pair_dists.is_empty() {
+        return;
+    }
+    pair_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Residual band = the LOW tail below the widest ≥4× multiplicative jump in
+    // the sorted distance list. A fit residual (~1e-2) sits orders below any
+    // real feature dimension, so the two are separated by a wide multiplicative
+    // gap. We anchor the band radius at the GEOMETRIC MEAN of that gap
+    // (`√(lo·hi)`) — the natural separator of two multiplicative bands — rather
+    // than the arithmetic midpoint, so the radius hugs the residual side and
+    // can NEVER reach toward a real feature even when the upper band is large
+    // (e.g. a 2 mm slot above 5 µm residuals: arithmetic midpoint ≈ 1 mm would
+    // be perilously permissive; geometric mean ≈ 0.1 mm stays an order below the
+    // feature). The ≥4× jump requirement guarantees two distinct features are
+    // never linked. No qualifying jump ⇒ no residual duplicates ⇒ nothing to do.
+    let radius = {
+        let mut radius = global_tol;
+        let mut best_ratio = 4.0;
+        for w in pair_dists.windows(2) {
+            let (lo, hi) = (w[0], w[1]);
+            if lo <= global_tol {
+                continue;
+            }
+            let ratio = hi / lo;
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                radius = (lo * hi).sqrt();
+            }
+        }
+        radius
+    };
+    if radius <= global_tol {
+        return;
+    }
+    let radius_sq = radius * radius;
+
+    // Single-linkage union-find over the residual band.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut linked = false;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if (verts[i].1 - verts[j].1).magnitude_squared() <= radius_sq {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                    linked = true;
+                }
+            }
+        }
+    }
+    if !linked {
+        return;
+    }
+
+    // Canonical VertexId per cluster: the smallest id in the cluster (stable and
+    // deterministic). Map every member vertex to it.
+    let mut cluster_min: HashMap<usize, VertexId> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        let entry = cluster_min.entry(r).or_insert(verts[i].0);
+        if verts[i].0 < *entry {
+            *entry = verts[i].0;
+        }
+    }
+    let mut canon: HashMap<VertexId, VertexId> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        if let Some(&cv) = cluster_min.get(&r) {
+            canon.insert(verts[i].0, cv);
+        }
+    }
+
+    // Retarget each loop edge's model endpoints to canonical vertices; drop any
+    // edge whose endpoints collapse to one (a residual sliver). A genuine
+    // closed-curve edge (start == end by construction) is left intact.
+    let rewrite = |entries: &mut Vec<(EdgeId, bool)>, model: &mut BRepModel| {
+        let mut out: Vec<(EdgeId, bool)> = Vec::with_capacity(entries.len());
+        for &(eid, fwd) in entries.iter() {
+            let Some(edge) = model.edges.get(eid) else {
+                out.push((eid, fwd));
+                continue;
+            };
+            let closed = edge.start_vertex == edge.end_vertex;
+            let cs = *canon.get(&edge.start_vertex).unwrap_or(&edge.start_vertex);
+            let ce = *canon.get(&edge.end_vertex).unwrap_or(&edge.end_vertex);
+            if cs == ce && !closed {
+                // Residual sliver — collapses to a point. Drop from the loop.
+                continue;
+            }
+            if let Some(e) = model.edges.get_mut(eid) {
+                e.start_vertex = cs;
+                e.end_vertex = ce;
+            }
+            out.push((eid, fwd));
+        }
+        *entries = out;
+    };
+
+    let mut bedges: Vec<Vec<(EdgeId, bool)>> = Vec::with_capacity(faces.len());
+    let mut iloops: Vec<Vec<Vec<(EdgeId, bool)>>> = Vec::with_capacity(faces.len());
+    for face in faces.iter() {
+        bedges.push(face.boundary_edges.clone());
+        iloops.push(face.inner_loops.clone());
+    }
+    for be in bedges.iter_mut() {
+        rewrite(be, model);
+    }
+    for il in iloops.iter_mut() {
+        for hole in il.iter_mut() {
+            rewrite(hole, model);
+        }
+    }
+    for (idx, face) in faces.iter_mut().enumerate() {
+        face.boundary_edges = std::mem::take(&mut bedges[idx]);
+        face.inner_loops = std::mem::take(&mut iloops[idx]);
+    }
+
+    if pipeline_trace_enabled() {
+        let merged = canon.iter().filter(|(v, c)| v != c).count();
+        eprintln!(
+            "[bool] stage=weld_imprint_residual_vertices radius={radius:.5} merged_vertices={merged}"
+        );
+    }
+}
+
 /// Resolve T-junctions left by *asymmetric* per-face splitting before
 /// canonicalisation.
 ///
@@ -14602,6 +15220,7 @@ fn build_shells_from_faces(
     // within tolerance). Orientation is preserved: when the canonical
     // edge runs against the face's traversal direction, flip the
     // `forward` bit.
+    weld_imprint_residual_vertices(model, &mut faces, &options.common.tolerance);
     heal_t_junctions_across_faces(model, &mut faces, &options.common.tolerance);
     canonicalise_face_edges_by_position(model, &mut faces);
 
