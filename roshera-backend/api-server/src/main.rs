@@ -689,8 +689,8 @@ async fn create_geometry(
     // Feedback-as-default: a primitive is sound by construction, but report the
     // SOUND (B-Rep) verdict anyway so EVERY mutating op has a uniform contract.
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
     };
     Ok(Json(serde_json::json!({
         "success": true,
@@ -892,10 +892,12 @@ fn mesh_open_nonmanifold(mesh: &geometry_engine::tessellation::TriangleMesh) -> 
     (open, nm)
 }
 
-/// FEEDBACK-AS-DEFAULT: the perception block every mutating endpoint embeds in
-/// its response so the caller learns the result's soundness from the operation
-/// itself — watertight (open/nonmanifold off the mesh in hand), valid B-Rep
-/// (`validate_solid_scoped`), and world dims (`solid_world_bbox`). No 2nd query.
+/// FEEDBACK-AS-DEFAULT: the LIGHTWEIGHT perception block (~5ms) — watertight
+/// (open/nonmanifold off the mesh in hand), valid B-Rep (`validate_solid_scoped`),
+/// and world dims (`solid_world_bbox`). This is the `?fast=1` opt-out payload and
+/// the inner core every mutating endpoint embeds. The DEFAULT path
+/// ([`certified_response`]) wraps this with the FULL kernel certificate so the
+/// kernel can never hand back a solid without its full soundness verdict.
 fn perception_json(
     model: &geometry_engine::primitives::topology_builder::BRepModel,
     solid_id: geometry_engine::primitives::solid::SolidId,
@@ -960,6 +962,130 @@ fn perception_json(
         "dims":              dims,
         "provenance":        provenance,
     })
+}
+
+/// Serialize a computed [`ValidityCertificate`](geometry_engine::primitives::provenance::ValidityCertificate)
+/// to the same wire shape as `GET /api/agent/parts/{id}/truth`. The single source
+/// of truth for cert JSON, so the ambient (mutating-endpoint) and on-demand
+/// (truth endpoint) paths can never drift in what they report.
+///
+/// `sound` here is the FULL verdict (`is_sound()` — brep_valid ∧ watertight ∧
+/// manifold ∧ self-intersection-free ∧ construction-consistent ∧
+/// tessellation-clean ∧ mesh-quality-clean), not the shallow B-Rep-only flag the
+/// lightweight perception reports.
+pub(crate) fn certificate_json(
+    c: &geometry_engine::primitives::provenance::ValidityCertificate,
+) -> serde_json::Value {
+    let tess = &c.tessellation;
+    let mq = &c.mesh_quality;
+    serde_json::json!({
+        "sound":                   c.is_sound(),
+        "brep_valid":              c.brep_valid,
+        "watertight":              c.watertight,
+        "manifold":                c.manifold,
+        "self_intersection_free":  c.self_intersection_free,
+        "euler_characteristic":    c.euler_characteristic,
+        "boundary_edges":          c.boundary_edges,
+        "nonmanifold_edges":       c.nonmanifold_edges,
+        "construction_consistent": c.construction_consistent.label(),
+        "labels_consistent":       c.labels_consistent.label(),
+        "tessellation_clean":      tess.clean,
+        "tessellation": {
+            "clean":                      tess.clean,
+            "triangles":                  tess.triangles,
+            "degenerate_triangles":       tess.degenerate_triangles,
+            "normal_agreement":           tess.normal_agreement,
+            "analytic_normal_agreement":  tess.analytic_normal_agreement,
+            "inconsistent_facets":        tess.inconsistent_facets,
+            "off_surface_facets":         tess.off_surface_facets,
+            "worst_face": tess.worst_face.as_ref().map(|w| serde_json::json!({
+                "face_id":                   w.face_id,
+                "triangles":                 w.triangles,
+                "degenerate_triangles":      w.degenerate_triangles,
+                "normal_agreement":          w.normal_agreement,
+                "analytic_normal_agreement": w.analytic_normal_agreement,
+            })),
+        },
+        "mesh_quality_clean":      mq.clean,
+        "mesh_quality": {
+            "clean":                    mq.clean,
+            "triangles":                mq.triangles,
+            "worst_aspect_ratio":       mq.worst_aspect_ratio,
+            "min_angle_deg":            mq.min_angle_deg,
+            "max_normal_deviation_deg": mq.max_normal_deviation_deg,
+            "boundary_crossing_facets": mq.boundary_crossing_facets,
+            "worst_face": mq.worst_face.as_ref().map(|w| serde_json::json!({
+                "face_id":                   w.face_id,
+                "worst_aspect_ratio":        w.worst_aspect_ratio,
+                "min_angle_deg":             w.min_angle_deg,
+                "max_normal_deviation_deg":  w.max_normal_deviation_deg,
+                "boundary_crossing_facets":  w.boundary_crossing_facets,
+            })),
+        },
+        "errors":                  c.errors,
+    })
+}
+
+/// THE CHOKEPOINT (AMBIENT VERIFICATION). The perception block every mutating
+/// endpoint embeds in its response — upgraded so the kernel can NOT hand back a
+/// solid without its FULL soundness certificate.
+///
+/// * DEFAULT (`fast == false`): runs the full kernel certificate
+///   `model.certify_solid(solid_id)` (B-Rep validity + watertight/manifold/Euler
+///   + self-intersection + construction-consistency + labels + tessellation- and
+///   mesh-quality). `certify_solid` is internally COARSE/bounded (manifold @ chord
+///   0.1, self-intersection + mesh-quality @ chord 0.5 — never the fine display
+///   density), so the auto-cert stays within a bounded latency budget. The full
+///   verdict is attached as `cert` and the top-level `sound`/`watertight` are
+///   overridden to the FULL verdict so a caller reading just `sound` sees the
+///   authoritative answer.
+/// * OPT-OUT (`fast == true`, via `?fast=1` or a `"fast": true` body flag): only
+///   the lightweight [`perception_json`] (~5ms, B-Rep validity + mesh counts) for
+///   latency-critical callers. Automatic-full is the default; fast is opt-OUT.
+///
+/// Takes `&mut model` because `certify_solid` warms a per-face centroid cache when
+/// re-running the D4 label selectors (the same `&mut` contract the readable query
+/// path uses); the geometry itself is never mutated.
+fn certified_response(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    mesh: &geometry_engine::tessellation::TriangleMesh,
+    fast: bool,
+) -> serde_json::Value {
+    let mut base = perception_json(model, solid_id, mesh);
+    if fast {
+        return base;
+    }
+    // DEFAULT: attach the FULL certificate and elevate the top-level verdict to
+    // the full `is_sound()` answer so a caller that reads only `sound`/`watertight`
+    // gets the authoritative result, not the shallow B-Rep-only signal.
+    let cert = model.certify_solid(solid_id);
+    let sound = cert.is_sound();
+    if let serde_json::Value::Object(map) = &mut base {
+        map.insert("sound".into(), serde_json::json!(sound));
+        map.insert("watertight".into(), serde_json::json!(cert.watertight));
+        map.insert("cert".into(), certificate_json(&cert));
+        let verdict = if sound {
+            "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)"
+        } else {
+            "UNSOUND — full kernel certificate flags a defect (see cert)"
+        };
+        map.insert("verdict".into(), serde_json::json!(verdict));
+    }
+    base
+}
+
+/// Read the `fast` opt-out from a JSON request body: `"fast": true` (bool) or
+/// `"fast": 1` (number) → skip the full certificate. Absent / anything else →
+/// `false` (the automatic-full default). Query-param `?fast=1` callers are handled
+/// where the endpoint sees the raw query.
+fn body_fast_flag(payload: &serde_json::Value) -> bool {
+    match payload.get("fast") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_i64().map(|v| v != 0).unwrap_or(false),
+        Some(serde_json::Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
 }
 
 async fn boolean_operation(
@@ -1126,8 +1252,13 @@ async fn boolean_operation(
     // operation itself, no second query. open/nonmanifold are read off the mesh
     // we already tessellated (no extra work); valid + dims from the kernel.
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, result_solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
     };
 
     Ok(Json(serde_json::json!({
@@ -1323,8 +1454,13 @@ async fn shell_solid(
     // Feedback-as-default: shell can leave a self-intersecting or open wall, so
     // it reports its own SOUND (B-Rep) verdict like the boolean.
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, result_solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
     };
     Ok(Json(serde_json::json!({
         "success":  true,
@@ -1508,10 +1644,17 @@ async fn mirror_solid(
         [0.0, 0.0, 0.0],
     );
 
+    // AMBIENT VERIFICATION (outlier closed): mirror previously emitted no verdict.
+    let perception = {
+        let mut model = model_handle.write().await;
+        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
         "consumed": [],
+        "perception": perception,
         "object": {
             "id":         result_id_str,
             "name":       display_name,
@@ -2016,8 +2159,8 @@ async fn fillet_edges_endpoint(
     );
 
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
     };
 
     Ok(Json(serde_json::json!({
@@ -2238,8 +2381,8 @@ async fn chamfer_edges_endpoint(
     );
 
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
     };
 
     Ok(Json(serde_json::json!({
@@ -2425,9 +2568,20 @@ async fn transform_geometry_endpoint(
         &face_ids,
         [0.0, 0.0, 0.0],
     );
-    Ok(Json(
-        serde_json::json!({ "success": true, "object": object_uuid.to_string() }),
-    ))
+    // AMBIENT VERIFICATION (outlier closed): a transform can drift a sketch off
+    // its solid (the construction-consistency defect) — so this endpoint, which
+    // previously returned a solid with NO verdict, now routes through the same
+    // certified response as every other mutating op.
+    let perception = {
+        let mut model = model_handle.write().await;
+        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+    };
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "object": object_uuid.to_string(),
+        "solid_id": solid_id,
+        "perception": perception,
+    })))
 }
 
 async fn pattern_linear_endpoint(
@@ -2966,8 +3120,13 @@ async fn create_extrude(
     );
 
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, result_solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
     };
 
     Ok(Json(serde_json::json!({
@@ -3119,9 +3278,22 @@ async fn create_cylinder_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    // AMBIENT VERIFICATION (outlier closed): the dedicated cylinder primitive
+    // previously emitted no verdict; it now carries the full certificate.
+    let perception = {
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
+        "perception": perception,
         "object": {
             "id":         result_id_str,
             "name":       name,
@@ -3285,8 +3457,13 @@ async fn create_cone_primitive(
     );
 
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, result_solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
     };
     Ok(Json(serde_json::json!({
         "success":  true,
@@ -3512,8 +3689,13 @@ async fn create_revolve_primitive(
     // Feedback-as-default: a self-intersecting / axis-touching profile can yield
     // an unsound solid, so revolve reports its own SOUND (B-Rep) verdict.
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, result_solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
     };
     Ok(Json(serde_json::json!({
         "success":  true,
@@ -3640,8 +3822,8 @@ async fn import_step_geometry(
         );
 
         let perception = {
-            let model = model_handle.read().await;
-            perception_json(&model, solid_id, &tri_mesh)
+            let mut model = model_handle.write().await;
+            certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
         };
         objects.push(serde_json::json!({
             "id":         id_str,
@@ -3803,8 +3985,13 @@ async fn create_nurbs_loft_primitive(
     );
 
     let perception = {
-        let model = model_handle.read().await;
-        perception_json(&model, result_solid_id, &tri_mesh)
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
     };
     Ok(Json(serde_json::json!({
         "success":  true,
@@ -4029,10 +4216,24 @@ async fn extrude_face_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    // AMBIENT VERIFICATION (outlier closed): face-extrude previously returned a
+    // solid with NO verdict; it now carries the full certificate like every
+    // other mutating op.
+    let perception = {
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_fast_flag(&payload),
+        )
+    };
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
         "consumed": [],
+        "perception": perception,
         "object": {
             "id":         result_id_str,
             "name":       name,

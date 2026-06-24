@@ -97,10 +97,13 @@ async function newestPartId(): Promise<number | null> {
 
 /**
  * Automatic perception — the ambient default. After any mutating op, fetch the
- * result part's validity verdict + structural facts so the agent never operates
- * blind. Watertightness comes from the diagnostic render (open / non-manifold
- * edge counts, the same source `verify_part` uses); face-count / volume / bbox
- * from the part query. Default-ON; disable per process with
+ * result part's FULL soundness certificate + structural facts so the agent never
+ * operates blind. `/perception` now returns the full kernel certificate by
+ * default (the api-server runs `certify_solid` in its bounded/coarse mode), so
+ * `sound` here is the AUTHORITATIVE full verdict — brep_valid ∧ watertight ∧
+ * manifold ∧ self-intersection-free ∧ construction-consistent ∧ tessellation-
+ * clean ∧ mesh-quality-clean — not the shallow B-Rep-only signal. Face-count /
+ * volume come from the part query. Default-ON; disable per process with
  * `ROSHERA_MCP_AUTOVERIFY=0`. Best-effort: returns `undefined` (no perception
  * block, never an error) if anything fails, so it can't break a real result.
  */
@@ -109,28 +112,39 @@ async function perceive(partId: number | null): Promise<any> {
     return undefined;
   }
   try {
-    // SOUND channel: /perception reports the B-Rep validity verdict
-    // (validate_solid_scoped, mesh-independent) plus a manifold check.
-    // The B-Rep verdict is authoritative — a valid solid whose DISPLAY
-    // tessellation has T-junctions is NOT broken (see KNOWN_BUGS #65 /
-    // EYE-SOUND). We never judge soundness off the display render.
+    // FULL SOUNDNESS channel: /perception (default) runs the kernel's full
+    // certificate. `sound` is the authoritative verdict the kernel cannot fake;
+    // `cert` carries every dimension so the agent sees mesh-quality / inverted-
+    // normal / construction-consistency defects the shallow B-Rep check
+    // (KNOWN_BUGS #65 / EYE-SOUND) could not catch.
     const p = await api("GET", `/api/agent/parts/${partId}/perception`);
     const part = await api("GET", `/api/agent/parts/${partId}`).catch(() => null);
-    const valid = p?.valid === true;
-    const meshClean = p?.watertight === true;
+    const cert = p?.cert ?? null;
+    // `sound` is the full verdict when the certificate is present, else the
+    // B-Rep-only flag (a server too old to certify, or the ?fast path).
+    const sound = p?.sound === true;
+    const brepValid = cert?.brep_valid ?? p?.valid ?? null;
+    const watertight = cert?.watertight ?? p?.watertight ?? null;
     return {
-      brep_valid: valid,
-      watertight: meshClean,
-      open_edges: p?.open_edges ?? null,
-      nonmanifold_edges: p?.nonmanifold_edges ?? null,
+      sound,
+      brep_valid: brepValid,
+      watertight,
+      manifold: cert?.manifold ?? null,
+      self_intersection_free: cert?.self_intersection_free ?? null,
+      construction_consistent: cert?.construction_consistent ?? null,
+      labels_consistent: cert?.labels_consistent ?? null,
+      tessellation_clean: cert?.tessellation_clean ?? null,
+      mesh_quality_clean: cert?.mesh_quality_clean ?? null,
+      euler_characteristic: cert?.euler_characteristic ?? null,
+      open_edges: p?.open_edges ?? cert?.boundary_edges ?? null,
+      nonmanifold_edges: p?.nonmanifold_edges ?? cert?.nonmanifold_edges ?? null,
       dims: p?.dims ?? null,
       face_count: part?.topology?.face_count ?? null,
       volume: part?.volume ?? null,
-      verdict: !valid
-        ? "BROKEN — B-Rep invalid (real topological defect)"
-        : meshClean
-          ? "OK — valid closed solid"
-          : "OK — valid B-Rep; display mesh has tessellation T-junctions only (not a defect)",
+      errors: cert?.errors ?? null,
+      // Full certificate breakdown (worst-face pointers — the optimisation oracle).
+      cert: cert ?? undefined,
+      verdict: p?.verdict ?? (sound ? "SOUND" : "UNSOUND — see cert"),
     };
   } catch {
     return undefined;
