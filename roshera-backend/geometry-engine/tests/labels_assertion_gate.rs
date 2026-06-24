@@ -151,6 +151,19 @@ fn selector_label_resolves_then_goes_stale_when_assertion_breaks() {
     }
     assert!(removed, "throat face removed from its shell");
 
+    // This test performs raw shell surgery (white-box) instead of going through
+    // a recorded kernel op. A production face-removal op would emit a
+    // `RecordedOperation` naming this solid, which fires the certificate
+    // invalidation funnel; we replicate that single funnel call here so the
+    // subsequent `certify_solid` recomputes against the mutated geometry rather
+    // than returning the cached pre-surgery verdict. (The cached-certificate
+    // intrinsic-invalidation contract is gated independently in
+    // `tests/certificate_cache.rs`.)
+    m.record_operation(
+        geometry_engine::operations::recorder::RecordedOperation::new("test_shell_face_removal")
+            .with_output_solids([solid as u64]),
+    );
+
     // The selector now resolves to a face that is NOT the labelled throat.
     let now = resolve_face(&mut m, solid, &throat_selector());
     assert!(

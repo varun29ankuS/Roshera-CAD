@@ -393,7 +393,7 @@ impl std::fmt::Display for VertexBlendKindSet {
 }
 
 /// Solid representation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Solid {
     /// Unique identifier
     pub id: SolidId,
@@ -418,6 +418,28 @@ pub struct Solid {
     cached_mass_props: Option<SolidMassProperties>,
     /// Cached statistics
     cached_stats: Option<SolidStats>,
+    /// Lazily-computed structural-validity certificate (the kernel's own
+    /// ground-truth verdict). `None` = dirty / never computed; `Some` = the
+    /// last freshly-computed certificate, valid until the next mutation marks
+    /// it dirty again. Mirrors the `cached_mass_props` lazy-cache contract,
+    /// but wrapped in a [`RwLock`] for two reasons the mass-props cache does
+    /// not need:
+    ///
+    /// 1. **`Send + Sync` preservation.** The assembly path holds the model
+    ///    behind an `Arc<RwLock<BRepModel>>` that crosses thread boundaries;
+    ///    an interior-mutable cell here keeps `Solid` (and therefore the
+    ///    whole `BRepModel`) `Sync`.
+    /// 2. **Invalidation through `&self`.** The intrinsic invalidation seam
+    ///    lives in [`BRepModel::record_operation`], which is `&self`. A plain
+    ///    `Option` field cannot be cleared through a shared borrow; the
+    ///    `RwLock` lets the funnel seam dirty the cert without a `&mut Solid`.
+    ///
+    /// The accessor [`crate::primitives::topology_builder::BRepModel::certificate`]
+    /// NEVER holds the inner lock across the heavy compute (read → drop guard
+    /// → compute → write), so racing readers recompute idempotently
+    /// (identical geometry ⇒ identical certificate) with last-write-wins and
+    /// no torn state.
+    cached_certificate: RwLock<Option<crate::primitives::provenance::ValidityCertificate>>,
     /// Parent assembly (if part of assembly)
     pub parent_assembly: Option<u32>,
     /// Parametric history
@@ -522,6 +544,43 @@ pub struct Solid {
     pub(crate) corner_cap_rim_edges: HashMap<VertexId, Vec<(EdgeId, BlendKind)>>,
 }
 
+/// Manual `Clone` for `Solid`.
+///
+/// `Solid` can no longer `#[derive(Clone)]` because `cached_certificate`
+/// is a [`RwLock`] (chosen so the struct stays `Sync` and the cert can be
+/// dirtied through `&self`), and `RwLock` is not `Clone`. This impl
+/// reproduces the EXACT field-by-field behavior the derived `Clone`
+/// previously had — in particular `features` and `history` are
+/// `Arc`-bumped (reference-shared), NOT deep-copied; the dedicated
+/// [`Solid::deep_copy`] is the snapshot-safe variant. The cert cache is
+/// snapshotted under a read guard into a fresh `RwLock`, so a clone carries
+/// the current cert value (identical geometry ⇒ identical cert) without
+/// aliasing the original's lock.
+impl Clone for Solid {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            outer_shell: self.outer_shell,
+            inner_shells: self.inner_shells.clone(),
+            name: self.name.clone(),
+            features: self.features.clone(),
+            attributes: self.attributes.clone(),
+            anchor: self.anchor.clone(),
+            cached_mass_props: self.cached_mass_props.clone(),
+            cached_stats: self.cached_stats.clone(),
+            cached_certificate: RwLock::new(self.cached_certificate.read().clone()),
+            parent_assembly: self.parent_assembly,
+            history: self.history.clone(),
+            collision_tree: self.collision_tree.clone(),
+            blended_edges: self.blended_edges.clone(),
+            blended_vertices: self.blended_vertices.clone(),
+            blend_faces_by_kind: self.blend_faces_by_kind.clone(),
+            pending_mixed_kind_corners: self.pending_mixed_kind_corners.clone(),
+            corner_cap_rim_edges: self.corner_cap_rim_edges.clone(),
+        }
+    }
+}
+
 /// Top-level AABB used as a conservative collision proxy. The detailed
 /// hierarchical descent (per-face BVH / OBB nodes) lives in
 /// `topology::accel_tree`; this struct caches only the root box so the
@@ -546,6 +605,7 @@ impl Solid {
             anchor: SolidAnchor::world_origin(),
             cached_mass_props: None,
             cached_stats: None,
+            cached_certificate: RwLock::new(None),
             parent_assembly: None,
             history: Arc::new(RwLock::new(Vec::new())),
             collision_tree: None,
@@ -595,6 +655,7 @@ impl Solid {
             anchor: self.anchor.clone(),
             cached_mass_props: self.cached_mass_props.clone(),
             cached_stats: self.cached_stats.clone(),
+            cached_certificate: RwLock::new(self.cached_certificate.read().clone()),
             parent_assembly: self.parent_assembly,
             history: Arc::new(RwLock::new(history_snapshot)),
             collision_tree: self.collision_tree.clone(),
@@ -1124,6 +1185,38 @@ impl Solid {
         self.cached_mass_props = None;
     }
 
+    /// Mark the structural-validity certificate dirty through a SHARED borrow.
+    ///
+    /// The certificate cache lives behind a [`RwLock`] specifically so the
+    /// intrinsic invalidation seams can fire without a `&mut Solid`:
+    /// [`crate::primitives::topology_builder::BRepModel::record_operation`]
+    /// (the funnel seam) holds only `&self`. After this call the next
+    /// [`crate::primitives::topology_builder::BRepModel::certificate`] read
+    /// recomputes from scratch. Idempotent.
+    pub(crate) fn invalidate_certificate(&self) {
+        *self.cached_certificate.write() = None;
+    }
+
+    /// The cached certificate snapshot, or `None` when dirty / never computed.
+    /// Hot path of the accessor — a clone of the stored value taken under a
+    /// short read guard (the guard is dropped before the caller does anything
+    /// with the result).
+    pub(crate) fn cached_certificate(
+        &self,
+    ) -> Option<crate::primitives::provenance::ValidityCertificate> {
+        self.cached_certificate.read().clone()
+    }
+
+    /// Install a freshly-computed certificate into the cache (last-write-wins).
+    /// Called by the accessor AFTER the heavy compute has finished and the
+    /// inner lock has been released for the duration of that compute.
+    pub(crate) fn store_certificate(
+        &self,
+        cert: crate::primitives::provenance::ValidityCertificate,
+    ) {
+        *self.cached_certificate.write() = Some(cert);
+    }
+
     /// Transform solid
     pub fn transform(&mut self, matrix: &Matrix4) -> MathResult<()> {
         // Transform would modify all vertices
@@ -1630,7 +1723,16 @@ impl SolidStore {
 
     #[inline(always)]
     pub fn get_mut(&mut self, id: SolidId) -> Option<&mut Solid> {
-        self.solids.get_mut(&id)
+        let solid = self.solids.get_mut(&id)?;
+        // Backstop invalidation seam: ANY `&mut Solid` access is treated as a
+        // potential mutation, so the cached certificate is dirtied here before
+        // the caller can touch the geometry. Conservative (a read-only
+        // `get_mut` spuriously recomputes the cert on its next read) but never
+        // incorrect — no `&mut` path can hand back a solid carrying a stale
+        // cert. The funnel seam in `record_operation` is the precise,
+        // replay-safe complement to this blanket one.
+        solid.invalidate_certificate();
+        Some(solid)
     }
 
     /// Remove a solid from the store.

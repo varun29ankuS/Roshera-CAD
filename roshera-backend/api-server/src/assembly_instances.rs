@@ -240,14 +240,10 @@ fn build_summary(
     for inst in assembly.instances() {
         let resolved_solid = state.get_local_id(&inst.part_id);
         let sound = match resolved_solid {
-            Some(sid) => {
-                if model.solids.get(sid).is_some() {
-                    let cert = model.certify_solid(sid);
-                    Some(cert.is_sound())
-                } else {
-                    None
-                }
-            }
+            Some(sid) => match model.certificate(sid) {
+                Some(cert) => Some(cert.is_sound()),
+                None => None,
+            },
             None => None,
         };
         if sound != Some(true) {
