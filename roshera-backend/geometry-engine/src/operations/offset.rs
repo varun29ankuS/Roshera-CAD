@@ -819,11 +819,44 @@ fn compute_vertex_insets(
                     break;
                 }
             };
-            if surface.surface_type() != SurfaceType::Plane {
+            // Accept any GEOMETRICALLY planar face, not only the `Plane`
+            // primitive. The live user path builds a box by extruding a
+            // sketched rectangle (api-server `extrude_sketch` → `extrude_face`),
+            // whose four side walls are flat `RuledSurface`s (a ruled surface
+            // between two parallel straight edges is planar) rather than `Plane`
+            // primitives. Gating on `SurfaceType::Plane` alone omitted every
+            // rim-corner vertex of the extruded box from the inset solve, so the
+            // shell walls fell back to per-face offsets and minted two divergent
+            // inset corners per rim vertex — leaving 8 dangling corner edges
+            // (open B-Rep, V−E+F=6, genus −2) that the primitive-box path never
+            // hit. `is_planar` samples the surface normal across its parameter
+            // domain and confirms a single constant normal, so the plane
+            // constraint `n·x = n·V − t` below is exact for these flat walls.
+            // A genuinely curved wall still fails `is_planar` and is omitted,
+            // preserving the per-face-offset fallback for curved shells.
+            let planar =
+                surface.surface_type() == SurfaceType::Plane || surface.is_planar(STRICT_TOLERANCE);
+            if !planar {
                 all_planar = false;
                 break;
             }
-            let n = compute_surface_normal_at_point(surface, vpos)?;
+            // Outward face normal at the vertex. The inset-plane RHS below
+            // (`n·V − t`) shifts the plane a distance `t` along `−n`, so for the
+            // inset to move INTO the material `n` must point OUT of it. The
+            // surface's intrinsic `normal_at` follows its own u×v
+            // parameterisation — for a `Plane` box face that is already outward,
+            // but a `RuledSurface` extrude wall can be parameterised either way,
+            // so honour the face orientation (matching `create_shell_walls`'
+            // `removed_normal` handling). Sign errors here would inset the corner
+            // OUTWARD and reintroduce the divergent-corner gap.
+            let face_orientation = face.orientation;
+            let mut n = compute_surface_normal_at_point(surface, vpos)?;
+            if matches!(
+                face_orientation,
+                crate::primitives::face::FaceOrientation::Backward
+            ) {
+                n = -n;
+            }
             let n_dot_v = n.x * vpos.x + n.y * vpos.y + n.z * vpos.z;
             let rhs = if removed.contains(&face_id) {
                 n_dot_v
@@ -913,7 +946,39 @@ fn create_interior_offset_faces(
             .clone();
 
         // Create offset surface and loop, capturing the per-edge map.
-        let offset_surface = create_offset_surface(model, &face, thickness)?;
+        //
+        // `thickness` here is the inward offset magnitude (`-thickness.abs()`,
+        // set by the caller). For a PLANAR face the per-surface offset helper
+        // (`create_offset_plane`, and the trait `offset` for a flat ruled wall)
+        // shifts along the surface's RAW intrinsic normal, which equals the
+        // outward normal only when the face is `Forward`. A `Backward` planar
+        // face — e.g. the bottom cap of an EXTRUDED box, whose profile-plane
+        // normal is +Z but whose outward normal is −Z — would then offset to the
+        // WRONG side (the bottom interior surface fell to z=−1 while its inset
+        // loop sat at z=+1, a 2·t = 2.0 mismatch the validator flagged as "edge
+        // lies off face"). Flip the signed distance for `Backward` PLANAR faces
+        // so the offset is taken along the outward normal, matching the
+        // orientation-corrected inset loop.
+        //
+        // Analytic CURVED surfaces (cylinder / sphere / cone / torus / NURBS /
+        // curved ruled / revolution) are NOT flipped: their offset helpers
+        // encode the outward direction in the sign of `distance` relative to the
+        // canonical outward (radial) normal — `create_offset_cylinder` does
+        // `radius + distance`, so `-|t|` shrinks the wall inward regardless of
+        // the face-orientation flag. Flipping them by orientation would GROW the
+        // radius outward and break curved shells (cylinder / revolved tube).
+        let surface_is_planar = {
+            let surf = model.surfaces.get(face.surface_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Face surface not found".to_string())
+            })?;
+            surf.surface_type() == crate::primitives::surface::SurfaceType::Plane
+                || surf.is_planar(crate::math::STRICT_TOLERANCE)
+        };
+        let oriented_thickness = match (surface_is_planar, face.orientation) {
+            (true, crate::primitives::face::FaceOrientation::Backward) => -thickness,
+            _ => thickness,
+        };
+        let offset_surface = create_offset_surface(model, &face, oriented_thickness)?;
         let surface_id = model.surfaces.add(offset_surface);
 
         // `original_to_offset` doubles as the cross-face dedup map: an edge
@@ -2114,6 +2179,103 @@ mod tests {
         (model, solid_id, top_face_id)
     }
 
+    /// Build a 10×10×10 box via the LIVE user construction path: a sketched
+    /// rectangle profile face extruded to a prism, NOT the `create_box_3d`
+    /// primitive. This is the exact kernel sequence that `extrude_sketch`
+    /// (api-server) drives: four `Line` edges → `create_face_from_profile_
+    /// with_plane` → `extrude_face`. The resulting B-Rep is what the live
+    /// `POST /api/geometry/shell` actually shells, so it is the only faithful
+    /// reproduction of the live failure. Returns (model, solid_id,
+    /// top_face_id) with the +Z cap located by surface normal.
+    fn extruded_box_with_top_face() -> (BRepModel, SolidId, FaceId) {
+        use crate::operations::extrude::{
+            create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
+        };
+        use crate::primitives::curve::Line;
+        use crate::primitives::edge::EdgeOrientation;
+
+        let mut model = BRepModel::new();
+
+        // Rectangle [0,10]×[0,10] on the XY plane, four corner vertices
+        // shared between adjacent edges (each corner used by exactly two
+        // edges — the same sharing the api-server `build_loop_edges` emits).
+        let tol = Tolerance::default().distance();
+        let v0 = model.vertices.add_or_find(0.0, 0.0, 0.0, tol);
+        let v1 = model.vertices.add_or_find(10.0, 0.0, 0.0, tol);
+        let v2 = model.vertices.add_or_find(10.0, 10.0, 0.0, tol);
+        let v3 = model.vertices.add_or_find(0.0, 10.0, 0.0, tol);
+        let mut add_line = |model: &mut BRepModel, a: VertexId, b: VertexId| -> EdgeId {
+            let pa = model.vertices.get_position(a).expect("vertex a");
+            let pb = model.vertices.get_position(b).expect("vertex b");
+            let line = Line::new(
+                Point3::new(pa[0], pa[1], pa[2]),
+                Point3::new(pb[0], pb[1], pb[2]),
+            );
+            let curve_id = model.curves.add(Box::new(line));
+            model.edges.add(Edge::new_auto_range(
+                0,
+                a,
+                b,
+                curve_id,
+                EdgeOrientation::Forward,
+            ))
+        };
+        let profile_edges = vec![
+            add_line(&mut model, v0, v1),
+            add_line(&mut model, v1, v2),
+            add_line(&mut model, v2, v3),
+            add_line(&mut model, v3, v0),
+        ];
+
+        let face_id = create_face_from_profile_with_plane(
+            &mut model,
+            profile_edges,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::Z,
+        )
+        .expect("profile face construction must succeed");
+
+        let opts = ExtrudeOptions {
+            distance: 10.0,
+            direction: Vector3::Z,
+            cap_ends: true,
+            common: CommonOptions {
+                validate_result: false,
+                ..CommonOptions::default()
+            },
+            ..Default::default()
+        };
+        let solid_id =
+            extrude_face(&mut model, face_id, opts).expect("extrude_face on profile must succeed");
+
+        let solid = model.solids.get(solid_id).expect("solid").clone();
+        let shell = model
+            .shells
+            .get(solid.outer_shell)
+            .expect("outer shell")
+            .clone();
+        let mut top_face = None;
+        for &fid in &shell.faces {
+            let face = model.faces.get(fid).expect("face");
+            let surface = model.surfaces.get(face.surface_id).expect("surface");
+            let mut n = surface.normal_at(0.5, 0.5).expect("normal_at");
+            if matches!(
+                face.orientation,
+                crate::primitives::face::FaceOrientation::Backward
+            ) {
+                n = -n;
+            }
+            // The +Z cap sits at z = 10; pick the face whose outward normal
+            // is +Z and whose plane passes through the top.
+            if (n.z - 1.0).abs() < 1e-6 && n.x.abs() < 1e-6 && n.y.abs() < 1e-6 {
+                top_face = Some(fid);
+                break;
+            }
+        }
+        let top_face_id = top_face.expect("extruded box must have a +Z cap face");
+        (model, solid_id, top_face_id)
+    }
+
     /// Collect the 3D positions of every distinct vertex referenced by
     /// the outer loop of `face_id`. Walks the loop's edges, deduplicating
     /// by VertexId.
@@ -2704,6 +2866,111 @@ mod tests {
         assert!(
             cert.is_sound(),
             "shelled tray ValidityCertificate is not sound: {cert:?}"
+        );
+    }
+
+    /// LIVE-PATH gate: shell an EXTRUDED box (sketched rectangle → `extrude_
+    /// face`), the exact B-Rep the user's `POST /api/geometry/shell` operates
+    /// on, with the top cap removed and thickness 1. The primitive-box gate
+    /// above passes on `create_box_3d`, but the extrude path produces a
+    /// different vertex/edge structure, and a corner-edge dedup that worked
+    /// for the primitive box can still leave dangling boundary edges here.
+    ///
+    /// This asserts the same four ground-truth pillars (per-edge closure,
+    /// Euler = 2, Standard B-Rep validity, ValidityCertificate soundness) on
+    /// the extrude-path tray. It is NON-VACUOUS: before the root fix it fails
+    /// with boundary edges and Euler ≠ 2 (the live "17 errors / negative
+    /// genus −2" failure).
+    #[test]
+    fn shell_top_removed_extruded_tray_is_closed_watertight_euler2_sound() {
+        use crate::primitives::validation::{
+            validate_shell_closure, validate_solid_scoped, ValidationLevel,
+        };
+
+        let (mut model, solid_id, top_face_id) = extruded_box_with_top_face();
+        let thickness = 1.0;
+
+        let options = OffsetOptions {
+            common: CommonOptions {
+                validate_result: true,
+                ..CommonOptions::default()
+            },
+            offset_type: OffsetType::Distance(thickness),
+            intersection_handling: IntersectionHandling::Trim,
+            max_deviation: 1e-3,
+        };
+        let hollow_id = offset_solid(&mut model, solid_id, thickness, vec![top_face_id], options)
+            .expect("offset_solid on a top-removed EXTRUDED box must produce a valid closed shell");
+
+        let hollow = model.solids.get(hollow_id).expect("hollow solid").clone();
+
+        // (1) Exact per-edge closure: zero boundary AND zero non-manifold edges.
+        let closure_errors = validate_shell_closure(&model, hollow.outer_shell);
+        assert!(
+            closure_errors.is_empty(),
+            "extruded tray is not watertight — {} unstitched/non-manifold edge(s): {:?}",
+            closure_errors.len(),
+            closure_errors
+                .iter()
+                .take(8)
+                .map(|e| format!("{e:?}"))
+                .collect::<Vec<_>>()
+        );
+
+        // (2) Euler characteristic V − E + F = 2 (genus-0 closed shell).
+        let shell = model.shells.get(hollow.outer_shell).expect("shell").clone();
+        let mut vset = std::collections::HashSet::new();
+        let mut eset = std::collections::HashSet::new();
+        for &fid in &shell.faces {
+            let face = model.faces.get(fid).expect("face");
+            let mut loops = vec![face.outer_loop];
+            loops.extend(face.inner_loops.iter().copied());
+            for lid in loops {
+                let lp = model.loops.get(lid).expect("loop");
+                for &eid in &lp.edges {
+                    eset.insert(eid);
+                    if let Some(edge) = model.edges.get(eid) {
+                        vset.insert(edge.start_vertex);
+                        vset.insert(edge.end_vertex);
+                    }
+                }
+            }
+        }
+        let euler = vset.len() as i64 - eset.len() as i64 + shell.faces.len() as i64;
+        assert_eq!(
+            euler,
+            2,
+            "extruded tray Euler V−E+F = {} (V={}, E={}, F={}), expected 2",
+            euler,
+            vset.len(),
+            eset.len(),
+            shell.faces.len()
+        );
+
+        // (3) Full B-Rep validity (Standard) scoped to the shelled solid.
+        let result = validate_solid_scoped(
+            &model,
+            hollow_id,
+            Tolerance::default(),
+            ValidationLevel::Standard,
+        );
+        assert!(
+            result.is_valid,
+            "extruded tray failed B-Rep validation ({} errors): {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(5)
+                .map(|e| format!("{e:?}"))
+                .collect::<Vec<_>>()
+        );
+
+        // (4) Self-certified ground truth: SOUND.
+        let cert = model.certify_solid(hollow_id);
+        assert!(
+            cert.is_sound(),
+            "extruded tray ValidityCertificate is not sound: {cert:?}"
         );
     }
 }
