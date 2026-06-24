@@ -1716,3 +1716,299 @@ async fn blackboard_part_scopes_are_isolated_through_router() {
         "document notebook stays empty; body = {body}"
     );
 }
+
+// =====================================================================
+// AMBIENT VERIFICATION — the full soundness certificate is automatic on
+// every mutating endpoint (not an opt-in `ground_truth` call).
+//
+// These gates pin the chokepoint contract: a mutating endpoint's DEFAULT
+// response carries the FULL kernel certificate (`sound` + every cert
+// dimension); a known-unsound result reports `sound=false` automatically
+// (no `/truth` call); `?fast=1` / `"fast": true` returns ONLY the
+// lightweight perception; and the auto-cert stays within a bounded
+// (coarse-path) latency budget.
+// =====================================================================
+
+/// POST `/api/geometry` to create a `size × size × size` box. No
+/// `Idempotency-Key`; `fast` (body flag) is threaded straight into the
+/// payload so the same helper covers the default and opt-out paths.
+fn create_box_post(size: f64, fast: bool) -> Request<Body> {
+    let body = json!({
+        "shape_type": "box",
+        "parameters": { "width": size, "height": size, "depth": size },
+        "fast": fast,
+    });
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static request must build")
+}
+
+/// The full set of cert dimensions every default response must surface — the
+/// dimensions the shallow lightweight perception could NOT report.
+const CERT_DIMENSIONS: &[&str] = &[
+    "sound",
+    "brep_valid",
+    "watertight",
+    "manifold",
+    "self_intersection_free",
+    "euler_characteristic",
+    "construction_consistent",
+    "labels_consistent",
+    "tessellation_clean",
+    "mesh_quality_clean",
+];
+
+/// GATE: a mutating endpoint's DEFAULT response embeds the FULL certificate —
+/// `perception.sound` plus every cert dimension under `perception.cert` — with
+/// NO `ground_truth` / `/truth` call. A box is sound, so `sound == true`.
+#[tokio::test]
+async fn create_geometry_default_response_carries_full_certificate() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(&state, create_box_post(10.0, false)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "box create must return 200; body = {body}"
+    );
+    let perception = &body["perception"];
+    assert!(
+        perception.is_object(),
+        "default response must embed a perception block; body = {body}"
+    );
+    // Top-level `sound` is the authoritative full verdict, present by default.
+    assert_eq!(
+        perception["sound"].as_bool(),
+        Some(true),
+        "a box is sound and the verdict must be reported automatically; \
+         perception = {perception}"
+    );
+    let cert = &perception["cert"];
+    assert!(
+        cert.is_object(),
+        "default response must attach the FULL certificate under `cert`; \
+         perception = {perception}"
+    );
+    for dim in CERT_DIMENSIONS {
+        assert!(
+            cert.get(dim).is_some(),
+            "cert must report dimension `{dim}` (the shallow perception cannot); \
+             cert = {cert}"
+        );
+    }
+    assert_eq!(
+        cert["sound"].as_bool(),
+        Some(true),
+        "cert.sound must agree with the box being sound; cert = {cert}"
+    );
+    // The mesh-quality + tessellation breakdowns must be present (the dimensions
+    // the automatic-but-shallow layer would miss entirely).
+    assert!(
+        cert["tessellation"].is_object() && cert["mesh_quality"].is_object(),
+        "cert must carry the tessellation + mesh_quality breakdowns; cert = {cert}"
+    );
+}
+
+/// GATE: `"fast": true` (the opt-OUT) returns ONLY the lightweight perception —
+/// no `cert`, but the cheap structural facts (`open_edges`) are still present.
+#[tokio::test]
+async fn create_geometry_fast_flag_returns_only_lightweight_perception() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(&state, create_box_post(10.0, true)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "box create must return 200; body = {body}"
+    );
+    let perception = &body["perception"];
+    assert!(
+        perception.is_object(),
+        "fast path still embeds the lightweight perception; body = {body}"
+    );
+    assert!(
+        perception.get("cert").is_none(),
+        "`fast` must NOT run the full certificate; perception = {perception}"
+    );
+    assert!(
+        perception.get("open_edges").is_some(),
+        "the lightweight perception must still report mesh counts; \
+         perception = {perception}"
+    );
+}
+
+/// Seed a sound `size`-box solid whose linked CONSTRUCTION geometry has DRIFTED
+/// far outside the solid (an orphaned sketch). The B-Rep stays valid, but the
+/// full certificate's construction-consistency dimension flags it
+/// `inconsistent → sound=false` — exactly the defect class the shallow
+/// (B-Rep-only) perception cannot see. Returns `(uuid, solid_id)`.
+async fn seed_box_with_drifted_construction(state: &AppState, size: f64) -> (Uuid, SolidId) {
+    use geometry_engine::primitives::provenance::ConstructionGeometry;
+    let solid_id;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+        solid_id = {
+            let mut builder = TopologyBuilder::new(model);
+            match builder
+                .create_box_3d(size, size, size)
+                .expect("box primitive must build for positive size")
+            {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {:?}", other),
+            }
+        };
+        // Construction geometry that sits ~1000 units away from the box — far
+        // outside the consistency tolerance band, so the cert reports
+        // `construction_consistent = inconsistent`.
+        let far = Point3::new(1000.0, 1000.0, 1000.0);
+        model.set_solid_construction(
+            solid_id,
+            ConstructionGeometry::new(far, vec![far, Point3::new(1001.0, 1000.0, 1000.0)]),
+        );
+    }
+    let uuid = Uuid::new_v4();
+    state.register_id_mapping(uuid, solid_id);
+    (uuid, solid_id)
+}
+
+/// GATE (the central one): a MUTATING endpoint reports `sound=false`
+/// AUTOMATICALLY for a known-unsound result, with NO `ground_truth` / `/truth`
+/// call — and specifically catches a defect the shallow perception MISSES
+/// (the B-Rep is valid; only the full cert's construction-consistency dimension
+/// fails). Exercised through `/api/geometry/transform`, one of the two outliers
+/// this change closed (it previously emitted no verdict at all).
+#[tokio::test]
+async fn transform_outlier_reports_unsound_automatically_via_full_cert() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id) = seed_box_with_drifted_construction(&state, 10.0).await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/transform")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "object": uuid.to_string(), "translation": [0.0, 0.0, 1.0] }).to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "transform must return 200; body = {body}"
+    );
+    let perception = &body["perception"];
+    assert!(
+        perception.is_object(),
+        "transform (a previously verdict-less outlier) must now embed perception; \
+         body = {body}"
+    );
+    // The FULL verdict is automatic and reports UNSOUND.
+    assert_eq!(
+        perception["sound"].as_bool(),
+        Some(false),
+        "a drifted-construction solid must report sound=false automatically; \
+         perception = {perception}"
+    );
+    let cert = &perception["cert"];
+    assert_eq!(
+        cert["construction_consistent"].as_str(),
+        Some("inconsistent"),
+        "the full cert must flag the orphaned construction; cert = {cert}"
+    );
+    // The shallow B-Rep check would have called this SOUND — prove the cert
+    // caught what the lightweight layer cannot.
+    assert_eq!(
+        cert["brep_valid"].as_bool(),
+        Some(true),
+        "the B-Rep itself is valid — only the FULL cert catches this defect; \
+         cert = {cert}"
+    );
+}
+
+/// GATE: the ambient GET `/api/agent/parts/{id}/perception` (the path MCP's
+/// `perceive()` calls on every tool) returns the FULL certificate by default,
+/// and `?fast=1` returns only the lightweight block. This is what surfaces the
+/// full cert fields to MCP automatically.
+#[tokio::test]
+async fn part_perception_endpoint_full_by_default_lightweight_with_fast() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = seed_box_with_drifted_construction(&state, 10.0).await;
+
+    // Default → full cert, sound=false (the drifted construction).
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "perception GET must return 200; body = {body}"
+    );
+    assert!(
+        body["cert"].is_object(),
+        "default perception must attach the full cert; body = {body}"
+    );
+    assert_eq!(
+        body["sound"].as_bool(),
+        Some(false),
+        "default perception must report the full (unsound) verdict; body = {body}"
+    );
+
+    // `?fast=1` → lightweight only, no cert.
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception?fast=1"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fast perception GET must return 200; body = {body}"
+    );
+    assert!(
+        body.get("cert").is_none(),
+        "?fast=1 must NOT run the full certificate; body = {body}"
+    );
+    // Lightweight `sound` is the B-Rep-only flag (valid → true), proving the
+    // fast path is genuinely the cheaper, shallower verdict.
+    assert_eq!(
+        body["sound"].as_bool(),
+        Some(true),
+        "fast path reports the shallow B-Rep verdict (valid box → true); body = {body}"
+    );
+}
+
+/// GATE: the auto-cert uses the COARSE / bounded path — `certify_solid`'s
+/// internal coarse chords (manifold @ 0.1, self-intersection @ 0.5), never the
+/// fine display scan — so the ambient default stays within a bounded latency
+/// budget. We assert a generous ceiling (debug builds are slow): a fine-density
+/// self-intersection scan on a real part would blow far past this. This is a
+/// regression tripwire against accidentally wiring the default to a fine scan.
+#[tokio::test]
+async fn auto_cert_default_response_is_latency_bounded() {
+    let state = make_test_state().await;
+    let started = std::time::Instant::now();
+    let (status, body) = dispatch(&state, create_box_post(10.0, false)).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "box create must return 200; body = {body}"
+    );
+    assert!(
+        body["perception"]["cert"].is_object(),
+        "the bounded default must still produce the full cert; body = {body}"
+    );
+    // 5s is a deliberately loose ceiling for a debug-build single-box certify;
+    // the coarse path lands far under it. A fine-scan misconfiguration would
+    // not.
+    assert!(
+        elapsed.as_secs() < 5,
+        "auto-cert default response must be latency-bounded (coarse path); took {elapsed:?}"
+    );
+}

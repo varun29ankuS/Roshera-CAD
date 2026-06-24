@@ -2096,19 +2096,51 @@ pub struct PartPerception {
     pub dims: Option<[f64; 3]>,
 }
 
-/// `GET /api/agent/parts/{id}/perception` — the part's validity in one cheap
-/// query: watertight (open=0 ∧ nonmanifold=0), valid B-Rep, and L×W×H. Read
-/// lock only; `404` on unknown id / empty tessellation.
+/// Query for `GET /api/agent/parts/{id}/perception` — the AMBIENT-VERIFICATION
+/// opt-out. `?fast=1` (or `fast=true`) returns ONLY the lightweight perception
+/// (B-Rep validity + mesh counts, ~5ms) for latency-critical callers. Absent /
+/// anything else → the DEFAULT, which additionally runs the FULL kernel
+/// certificate so a caller (notably MCP `perceive()`) sees the full soundness
+/// verdict automatically.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PerceptionQuery {
+    #[serde(default)]
+    pub fast: Option<String>,
+}
+
+impl PerceptionQuery {
+    fn is_fast(&self) -> bool {
+        self.fast
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+}
+
+/// `GET /api/agent/parts/{id}/perception` — the part's validity verdict.
+///
+/// DEFAULT (ambient full): the lightweight perception (watertight, valid B-Rep,
+/// L×W×H) PLUS the FULL kernel certificate under `cert` (`sound` =
+/// `certify_solid().is_sound()`, every dimension: self-intersection, construction-
+/// consistency, labels, tessellation- and mesh-quality). This is the path MCP's
+/// `perceive()` calls on every tool, so the full verdict is surfaced ambiently.
+/// `?fast=1` returns only the lightweight block. `404` on unknown id / empty
+/// tessellation.
+///
+/// Write lock (default path): `certify_solid` warms a per-face centroid cache when
+/// re-running the D4 label selectors; the geometry is never mutated.
 pub async fn part_perception(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<PartPerception>, StatusCode> {
+    Query(q): Query<PerceptionQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     use geometry_engine::harness::watertight::manifold_report;
     use geometry_engine::math::Tolerance;
     use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 
-    let model = model_handle.read().await;
+    let fast = q.is_fast();
+    let mut model = model_handle.write().await;
     let sid = id as SolidId;
     if model.solids.get(sid).is_none() {
         return Err(StatusCode::NOT_FOUND);
@@ -2120,24 +2152,53 @@ pub async fn part_perception(
         let s = b.size();
         [s.x, s.y, s.z]
     });
-    let watertight = report.boundary_edges == 0 && report.nonmanifold_edges == 0;
-    let verdict = if !valid {
-        "BROKEN — B-Rep invalid (a real topological defect)".to_string()
-    } else if watertight {
-        "OK — valid closed solid; export mesh watertight".to_string()
+    let mesh_watertight = report.boundary_edges == 0 && report.nonmanifold_edges == 0;
+
+    if fast {
+        let verdict = if !valid {
+            "BROKEN — B-Rep invalid (a real topological defect)".to_string()
+        } else if mesh_watertight {
+            "OK — valid closed solid; export mesh watertight".to_string()
+        } else {
+            "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)"
+                .to_string()
+        };
+        return Ok(Json(
+            serde_json::to_value(PartPerception {
+                solid_id: id,
+                sound: valid,
+                verdict,
+                watertight: mesh_watertight,
+                open_edges: report.boundary_edges,
+                nonmanifold_edges: report.nonmanifold_edges,
+                valid,
+                dims,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ));
+    }
+
+    // DEFAULT: attach the FULL certificate and elevate `sound` to the full verdict.
+    let cert = model.certify_solid(sid);
+    let sound = cert.is_sound();
+    let verdict = if sound {
+        "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)".to_string()
     } else {
-        "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)".to_string()
+        "UNSOUND — full kernel certificate flags a defect (see cert)".to_string()
     };
-    Ok(Json(PartPerception {
-        solid_id: id,
-        sound: valid,
-        verdict,
-        watertight,
-        open_edges: report.boundary_edges,
-        nonmanifold_edges: report.nonmanifold_edges,
-        valid,
-        dims,
-    }))
+    Ok(Json(serde_json::json!({
+        "solid_id":          id,
+        "sound":             sound,
+        "verdict":           verdict,
+        // B-Rep + export-mesh facts (kept for backward compatibility).
+        "valid":             valid,
+        "watertight":        cert.watertight,
+        "open_edges":        report.boundary_edges,
+        "nonmanifold_edges": report.nonmanifold_edges,
+        "dims":              dims,
+        // The full kernel certificate — every soundness dimension.
+        "cert":              crate::certificate_json(&cert),
+    })))
 }
 
 // ───────────────────── features + measure (EYE-4) ───────────────────
