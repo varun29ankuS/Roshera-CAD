@@ -69,6 +69,23 @@ pub fn entity_ref(kind: &str, id: u64) -> String {
     format!("{}:{}", kind, id)
 }
 
+/// Parse a `"solid:<id>"` wire reference back to a [`SolidId`](crate::primitives::solid::SolidId).
+///
+/// Total and non-panicking: returns `None` for any reference whose kind tag
+/// is not [`ENTITY_SOLID`], whose `<id>` is missing, or whose `<id>` does not
+/// parse as a `SolidId` (or overflows it). Inverse of
+/// `entity_ref(ENTITY_SOLID, id)`. Used by the certificate-invalidation funnel
+/// in `BRepModel::record_operation` to recover the solids an operation
+/// touched from its `inputs` / `outputs` lists.
+#[inline]
+pub fn parse_solid_ref(reference: &str) -> Option<crate::primitives::solid::SolidId> {
+    let (kind, id) = reference.split_once(':')?;
+    if kind != ENTITY_SOLID {
+        return None;
+    }
+    id.parse::<crate::primitives::solid::SolidId>().ok()
+}
+
 /// A structured description of one geometry operation that has just
 /// completed successfully.
 ///

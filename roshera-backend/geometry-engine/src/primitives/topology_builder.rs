@@ -2275,6 +2275,25 @@ impl BRepModel {
     /// returns an error (the operation has already mutated the model —
     /// recorder failures never become geometry failures).
     pub fn record_operation(&self, operation: crate::operations::recorder::RecordedOperation) {
+        // ── Funnel invalidation seam (the intrinsic guarantee) ──────────────
+        // EVERY mutating kernel op records itself here, listing the solids it
+        // consumed (`inputs`) and produced (`outputs`) in canonical wire form.
+        // Dirtying each named solid's cached certificate at this single funnel
+        // makes invalidation intrinsic: present and future ops invalidate for
+        // free, with no per-op wiring. This runs BEFORE the recorder-forward
+        // guard so it fires even when the recorder is DETACHED — which it is
+        // during timeline replay, where ops re-execute against fresh SolidIds
+        // (already dirty by construction) but a re-touched pre-existing solid
+        // must still be invalidated. `record_operation` is `&self`; the cert
+        // cache is interior-mutable (`RwLock`), so no signature change.
+        for reference in operation.inputs.iter().chain(operation.outputs.iter()) {
+            if let Some(sid) = crate::operations::recorder::parse_solid_ref(reference) {
+                if let Some(solid) = self.solids.get(sid) {
+                    solid.invalidate_certificate();
+                }
+            }
+        }
+
         if let Some(rec) = self.recorder.as_ref() {
             if let Err(e) = rec.record(operation) {
                 tracing::warn!("operation recorder returned error: {}", e);
@@ -2318,6 +2337,15 @@ impl BRepModel {
         construction: crate::primitives::provenance::ConstructionGeometry,
     ) {
         self.solid_construction.insert(solid_id, construction);
+        // The linked construction geometry is a certificate INPUT (the
+        // `construction_consistent` cross-entity check). This sidecar write
+        // does not pass through the `get_mut` backstop or the `record_operation`
+        // funnel, so it must dirty the cert itself — otherwise a prior
+        // certify would leave a stale verdict that no longer reflects the
+        // re-linked (or orphaned) sketch.
+        if let Some(solid) = self.solids.get(solid_id) {
+            solid.invalidate_certificate();
+        }
     }
 
     /// The construction geometry linked to a solid, if any.
@@ -2384,16 +2412,74 @@ impl BRepModel {
         }
     }
 
+    /// The canonical certificate accessor: return the solid's CURRENT-or-
+    /// freshly-recomputed [`ValidityCertificate`], mirroring the lazy-cache
+    /// contract of `compute_solid_mass_properties` / `cached_mass_props`.
+    ///
+    /// Hot path: a cached certificate (cache is `Some`) is cloned and returned
+    /// without re-touching geometry. Cold path: the cert is dirty (`None` —
+    /// either never computed or invalidated by a mutating op), so it is
+    /// recomputed by [`Self::compute_certificate`] and stored before returning.
+    ///
+    /// ## The intrinsic guarantee
+    ///
+    /// No code path can obtain a stale certificate: the cache is set to `None`
+    /// by every mutating seam (the [`Solid::get_mut`](crate::primitives::solid::SolidStore::get_mut)
+    /// backstop and the [`Self::record_operation`] funnel), and replayed ops
+    /// always mint fresh `SolidId`s that are born dirty. A `Some` here is
+    /// therefore always a certificate that was current as of the last
+    /// mutation; otherwise we recompute now.
+    ///
+    /// ## Lock discipline (no re-entrant deadlock, no torn state)
+    ///
+    /// The inner per-solid `RwLock` is NEVER held across the heavy compute:
+    /// we take a short read guard to check the cache, DROP it, run
+    /// `compute_certificate` (which must never call back into `certificate`),
+    /// then take a short write guard to store. Racing readers on a single
+    /// `BRepModel` recompute idempotently (identical geometry ⇒ identical
+    /// cert) with last-write-wins.
+    ///
+    /// `&mut self` because the cold-path `compute_certificate` re-runs the D4
+    /// label selectors, which warm a per-face derived-stats cache (see that
+    /// method). The hot path is logically read-only; the `&mut` is the
+    /// conservative ceiling shared with the mass-props accessor. `None` is
+    /// returned only when `solid_id` is unknown to the model.
+    pub fn certificate(
+        &mut self,
+        solid_id: SolidId,
+    ) -> Option<crate::primitives::provenance::ValidityCertificate> {
+        // Hot path: a live cached cert. Read guard taken and dropped here.
+        if let Some(solid) = self.solids.get(solid_id) {
+            if let Some(cert) = solid.cached_certificate() {
+                return Some(cert);
+            }
+        } else {
+            return None;
+        }
+        // Cold path: dirty. Compute WITHOUT any cert lock held, then store.
+        let cert = self.compute_certificate(solid_id);
+        if let Some(solid) = self.solids.get(solid_id) {
+            solid.store_certificate(cert.clone());
+        }
+        Some(cert)
+    }
+
     /// COMPUTE (never accept) a solid's validity certificate: B-Rep validity
     /// (`validate_solid_scoped`) + watertight/manifold/Euler from the tessellated
     /// mesh (`manifold_report`). This is the kernel's own verdict — the agent
     /// cannot fake it.
     ///
+    /// Private: the public surface is [`Self::certificate`] (lazy-cached) and
+    /// the thin wrappers [`Self::certify_solid`] / [`Self::ground_truth`].
+    /// This function ALWAYS recomputes from geometry and never consults the
+    /// cache, so it must NOT call [`Self::certificate`] (re-entrancy would be a
+    /// deadlock under the per-solid cert lock).
+    ///
     /// `&mut self` because computing the D4 `labels_consistent` flag re-runs
     /// each label's Pillar-3 selector, and `queries::select::resolve_*` warms a
     /// per-face centroid cache (the same `&mut` contract the readable query path
     /// uses). The geometry itself is never mutated.
-    pub fn certify_solid(
+    fn compute_certificate(
         &mut self,
         solid_id: SolidId,
     ) -> crate::primitives::provenance::ValidityCertificate {
@@ -2451,18 +2537,37 @@ impl BRepModel {
         }
     }
 
+    /// Thin public wrapper over [`Self::certificate`] — the historical name
+    /// every caller already uses (construction_consistency tests, `sketch.rs`,
+    /// `assembly_instances.rs`, `offset.rs`). Now goes through the lazy cache,
+    /// so a repeated call on an unmutated solid returns the cached value rather
+    /// than recomputing.
+    ///
+    /// A non-existent `solid_id` cannot produce a meaningful certificate; the
+    /// accessor returns `None` there, and this wrapper falls back to a fresh
+    /// `compute_certificate` so the long-standing total signature (returns a
+    /// certificate, not an `Option`) is preserved for every existing caller.
+    pub fn certify_solid(
+        &mut self,
+        solid_id: SolidId,
+    ) -> crate::primitives::provenance::ValidityCertificate {
+        match self.certificate(solid_id) {
+            Some(cert) => cert,
+            None => self.compute_certificate(solid_id),
+        }
+    }
+
     /// The kernel's ground-truth answer for a solid: provenance + computed
     /// certificate. `None` if the solid does not exist. PILLAR 1.
     ///
-    /// `&mut self` for the same reason as [`Self::certify_solid`] (the D4 labels
+    /// `&mut self` for the same reason as [`Self::certificate`] (the D4 labels
     /// flag re-runs Pillar-3 selectors, which warm the centroid cache).
     pub fn ground_truth(
         &mut self,
         solid_id: SolidId,
     ) -> Option<crate::primitives::provenance::GroundTruth> {
-        self.solids.get(solid_id)?;
+        let certificate = self.certificate(solid_id)?;
         let provenance = self.solid_provenance.get(&solid_id).cloned();
-        let certificate = self.certify_solid(solid_id);
         Some(crate::primitives::provenance::GroundTruth {
             solid_id,
             provenance,
