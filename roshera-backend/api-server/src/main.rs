@@ -983,10 +983,12 @@ pub(crate) fn certificate_json(
         "brep_valid":              c.brep_valid,
         "watertight":              c.watertight,
         "manifold":                c.manifold,
+        "oriented":                c.oriented,
         "self_intersection_free":  c.self_intersection_free,
         "euler_characteristic":    c.euler_characteristic,
         "boundary_edges":          c.boundary_edges,
         "nonmanifold_edges":       c.nonmanifold_edges,
+        "inconsistent_directed_edges": c.inconsistent_directed_edges,
         "construction_consistent": c.construction_consistent.label(),
         "labels_consistent":       c.labels_consistent.label(),
         "tessellation_clean":      tess.clean,
@@ -7674,6 +7676,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/agent/parts/distance/uuid/{a}/{b}",
             get(handlers::agent::part_distance_by_uuid),
+        )
+        // Spatial primitives — point / ray / region (SDF-verified kernel core).
+        .route(
+            "/api/agent/parts/{id}/point-query",
+            post(handlers::agent::point_query),
+        )
+        .route(
+            "/api/agent/parts/{id}/ray-query",
+            post(handlers::agent::ray_query),
+        )
+        .route(
+            "/api/agent/region-query",
+            post(handlers::agent::region_query),
         )
         .route("/api/agent/datums", get(handlers::agent::list_datums))
         .route(

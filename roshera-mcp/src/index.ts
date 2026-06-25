@@ -757,6 +757,169 @@ server.tool(
   },
 );
 
+server.tool(
+  "part_distance",
+  "MEASURE the spatial relationship between two parts from their world AABBs: " +
+    "the gap (clearance when separated), the overlap (penetration when they " +
+    "interpenetrate), the center-to-center distance, and the unit DIRECTION from " +
+    "a to b. Use it to check clearance, confirm a mate seats, or decide which way " +
+    "to nudge a part. Both ids are kernel part ids from list_parts.",
+  {
+    part_a: z.number().int().describe("kernel part id of the first part"),
+    part_b: z.number().int().describe("kernel part id of the second part"),
+  },
+  async ({ part_a, part_b }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/distance/${part_a}/${part_b}`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "part_features",
+  "READ a part's analytic FEATURE sizes straight off the B-Rep: every face's " +
+    "feature dimension (cylinder diameters + axes for bores/bosses, plane normals) " +
+    "PLUS a distinct-diameter summary (each unique bore/boss diameter and how many " +
+    "occur). The way to ask 'what holes and bosses does this have and how big' " +
+    "without measuring pixels — values are exact, read off the analytic surfaces.",
+  { part_id: z.number().int().describe("kernel part id from list_parts") },
+  async ({ part_id }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/${part_id}/features`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "part_coverage",
+  "COVERAGE honesty (EYE-5): report which faces the 4 standard views (front / " +
+    "top / right / iso) actually SHOW versus leave unseen, so you know when a face " +
+    "is hidden and you must request another camera angle (scene_view with a custom " +
+    "az/el) instead of assuming you saw the whole part. Returns seen vs unseen face " +
+    "ids and the per-view visibility.",
+  { part_id: z.number().int().describe("kernel part id from list_parts") },
+  async ({ part_id }) => {
+    try {
+      return ok(await api("GET", `/api/agent/parts/${part_id}/coverage`));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ---- spatial primitives: point / ray / region ------------------------
+// SDF-verified kernel queries (point-in-solid + nearest, analytic ray-cast,
+// region intersection). The agent's continuous handle on the solid — probe a
+// point, shoot a ray, ask what is inside a box/sphere — all exact-analytic.
+
+server.tool(
+  "point_query",
+  "PROBE a world point against a part: returns the SIGNED DISTANCE to the solid " +
+    "(negative INSIDE the material, positive OUTSIDE, ~0 on the surface), the " +
+    "inside/outside/on classification, and the NEAREST boundary face id + the exact " +
+    "closest point on it. Exact-analytic (ray-parity sign + analytic nearest), never " +
+    "a mesh lookup — a point in a through-hole reads OUTSIDE because the hole is not " +
+    "material. Use it for clearance probes, to test if a coordinate is inside a part, " +
+    "or to find the nearest surface to a location.",
+  {
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    point: z
+      .tuple([z.number(), z.number(), z.number()])
+      .describe("world-space query point [x, y, z]"),
+  },
+  async ({ part_id, point }) => {
+    try {
+      return ok(
+        await api("POST", `/api/agent/parts/${part_id}/point-query`, { point }),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "ray_query",
+  "CAST a ray through a part and get the ORDERED list of face crossings along it " +
+    "(face id, exact world hit point, oriented surface normal, distance from the " +
+    "origin), sorted near→far. Exact analytic surface intersections clipped to each " +
+    "face's real trim loops — never a mesh approximation; a missing face renders as " +
+    "see-through (no phantom hit). Use it to find what a sightline hits, measure a " +
+    "wall's two crossings (thickness), or locate a feature along a direction. An " +
+    "empty hits list means the ray missed.",
+  {
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    origin: z
+      .tuple([z.number(), z.number(), z.number()])
+      .describe("ray origin [x, y, z]"),
+    direction: z
+      .tuple([z.number(), z.number(), z.number()])
+      .describe("ray direction [x, y, z] (need not be unit length)"),
+  },
+  async ({ part_id, origin, direction }) => {
+    try {
+      return ok(
+        await api("POST", `/api/agent/parts/${part_id}/ray-query`, {
+          origin,
+          direction,
+        }),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "region_query",
+  "ASK 'what is in here?': given an axis-aligned BOX (center + half_extents) OR a " +
+    "SPHERE (center + radius), return which parts and which of their face ids meet " +
+    "the volume, and whether the region is EMPTY. Pass `part_id` to query one part, " +
+    "or omit it to scan the WHOLE scene (e.g. 'is anything inside this clearance " +
+    "envelope?'). Face extents are exact trim-curve envelopes, not the mesh. Give " +
+    "either half_extents (box) or radius (sphere); box wins if both are supplied.",
+  {
+    center: z
+      .tuple([z.number(), z.number(), z.number()])
+      .describe("region center [x, y, z]"),
+    half_extents: z
+      .tuple([z.number(), z.number(), z.number()])
+      .optional()
+      .describe("box half-extents [hx, hy, hz] — supply for a BOX region"),
+    radius: z
+      .number()
+      .positive()
+      .optional()
+      .describe("sphere radius — supply for a SPHERE region (ignored if half_extents given)"),
+    part_id: z
+      .number()
+      .int()
+      .optional()
+      .describe("restrict to one part; omit to scan every part in the scene"),
+  },
+  async ({ center, half_extents, radius, part_id }) => {
+    try {
+      if (!half_extents && radius === undefined) {
+        return fail(new Error("provide half_extents (box) or radius (sphere)"));
+      }
+      return ok(
+        await api("POST", "/api/agent/region-query", {
+          center,
+          ...(half_extents ? { half_extents } : {}),
+          ...(radius !== undefined ? { radius } : {}),
+          ...(part_id !== undefined ? { part_id } : {}),
+        }),
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
 // ---- mutation: deletion ----------------------------------------------
 
 server.tool(

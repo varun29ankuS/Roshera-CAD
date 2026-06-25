@@ -491,6 +491,16 @@ pub struct ValidityCertificate {
     pub euler_characteristic: i64,
     pub boundary_edges: usize,
     pub nonmanifold_edges: usize,
+    /// Every *directed* mesh edge is traversed at most once — the consistently-
+    /// wound, correctly-oriented closed surface. `false` flags a flipped-normal /
+    /// non-oriented mesh (the `nurbs_loft` "B2a" class): a mesh can close (no
+    /// boundary edges) and be manifold (no 3+-fan edges) yet still have two
+    /// triangles winding the SAME way across a shared edge — invisible to
+    /// `watertight`/`manifold`, caught only here. ANDed into `is_sound()`.
+    pub oriented: bool,
+    /// Directed mesh edges traversed by more than one triangle — the count behind
+    /// `oriented == false`. `0` on a correctly-oriented closed mesh.
+    pub inconsistent_directed_edges: usize,
     /// No two non-adjacent faces cross (geometrically non-self-overlapping). A
     /// solid can be valid + watertight yet self-intersect (#70-class); this is
     /// the only check that catches it.
@@ -526,6 +536,7 @@ impl ValidityCertificate {
         self.brep_valid
             && self.watertight
             && self.manifold
+            && self.oriented
             && self.self_intersection_free
             && self.construction_consistent.is_sound()
             && self.tessellation.clean
@@ -551,7 +562,7 @@ impl GroundTruth {
             .map(|p| p.created_by.label())
             .unwrap_or_else(|| "unrecorded".into());
         format!(
-            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} euler={} construction={} labels={} tess_clean={} normal_agreement={:.3} degenerate={})",
+            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} oriented={} euler={} construction={} labels={} tess_clean={} normal_agreement={:.3} degenerate={})",
             self.solid_id,
             origin,
             self.provenance
@@ -562,6 +573,7 @@ impl GroundTruth {
             self.certificate.brep_valid,
             self.certificate.watertight,
             self.certificate.manifold,
+            self.certificate.oriented,
             self.certificate.euler_characteristic,
             self.certificate.construction_consistent.label(),
             self.certificate.labels_consistent.label(),
