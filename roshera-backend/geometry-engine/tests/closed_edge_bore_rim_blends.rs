@@ -90,6 +90,36 @@ fn assert_valid_watertight(m: &mut BRepModel, s: SolidId, what: &str) {
     );
 }
 
+/// Stricter companion to [`assert_valid_watertight`]: in addition to B-Rep
+/// validity + volume-agreement watertightness, require the welded DISPLAY mesh
+/// to be a closed, 2-manifold, CONSISTENTLY-WOUND boundary.
+///
+/// `is_watertight` compares the `.abs()` of the divergence-theorem volume, so a
+/// CONSISTENTLY-FLIPPED or T-junction-leaking blend mesh can still pass it — the
+/// exact blind spot that let the #89 cone-rim mis-weld (mesh `oriented == false`
+/// + open edges on the narrow rim) pass "fixed". This gate closes it so a
+/// mis-oriented cone-rim blend can never regress unnoticed.
+fn assert_valid_watertight_oriented(m: &mut BRepModel, s: SolidId, what: &str) {
+    assert_valid_watertight(m, s, what);
+    let report = geometry_engine::harness::watertight::manifold_report(m, s, 0.1, 1e-6)
+        .unwrap_or_else(|| panic!("{what}: solid did not tessellate"));
+    assert_eq!(
+        report.boundary_edges, 0,
+        "{what}: mesh not closed ({} open edges)",
+        report.boundary_edges
+    );
+    assert_eq!(
+        report.nonmanifold_edges, 0,
+        "{what}: mesh not 2-manifold ({} non-manifold edges)",
+        report.nonmanifold_edges
+    );
+    assert!(
+        report.oriented,
+        "{what}: mesh not consistently oriented ({} inconsistent directed edges)",
+        report.inconsistent_directed_edges
+    );
+}
+
 fn count_surface(m: &BRepModel, s: SolidId, want: SurfaceType) -> usize {
     let solid = m.solids.get(s).expect("solid");
     let mut shells = vec![solid.outer_shell];
@@ -224,5 +254,8 @@ fn cone_walled_rim_fillet_succeeds() {
         "expected one torus blend face, got {}",
         blend.len()
     );
-    assert_valid_watertight(&mut m, s, "cone-walled outer-top rim fillet");
+    // #89 cone-rim mis-weld regression: require a consistently-oriented mesh
+    // (not just volume-agreement watertight), so a flipped/torn cone-rim blend
+    // can never pass "fixed" again.
+    assert_valid_watertight_oriented(&mut m, s, "cone-walled outer-top rim fillet");
 }

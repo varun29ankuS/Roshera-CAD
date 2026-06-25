@@ -111,6 +111,39 @@ impl Verdict {
     }
 }
 
+/// Permanent regression gate for the cone-rim (Plane–Cone) fillet blend: the
+/// blend must BUILD, produce a consistently-WOUND welded mesh (`oriented`,
+/// 0 open / 0 non-manifold edges) and be self-certified SOUND. Pins the #89
+/// cone-rim mis-weld (built + watertight-by-volume but `oriented == false`,
+/// `is_sound() == false`) so it can never silently pass "fixed" again.
+fn assert_cone_rim_oriented_sound(v: &Verdict, what: &str) {
+    assert!(v.built, "{what}: DID-NOT-BUILD: {}", v.err);
+    let mesh = v
+        .mesh
+        .as_ref()
+        .unwrap_or_else(|| panic!("{what}: solid did not tessellate"));
+    assert_eq!(
+        mesh.boundary_edges, 0,
+        "{what}: mesh not closed ({} open edges)",
+        mesh.boundary_edges
+    );
+    assert_eq!(
+        mesh.nonmanifold_edges, 0,
+        "{what}: mesh not 2-manifold ({} non-manifold edges)",
+        mesh.nonmanifold_edges
+    );
+    assert!(
+        mesh.oriented,
+        "{what}: mesh NOT consistently oriented ({} inconsistent directed edges)",
+        mesh.inconsistent_directed_edges
+    );
+    assert!(
+        v.sound,
+        "{what}: solid NOT self-certified sound [{}]",
+        v.cert_line
+    );
+}
+
 /// Run all three oracles on `solid` after an op `result`.
 fn judge(model: &mut BRepModel, solid: SolidId, result: Result<(), String>) -> Verdict {
     if let Err(e) = result {
@@ -516,7 +549,12 @@ fn blends_on_non_box_solids() {
         );
     }
 
-    // 5c: fillet a cone's base rim.
+    // 5c: fillet a cone's base rim (BOTH rims). GATED — the cone-rim Plane–Cone
+    // blend must build a watertight, consistently-WOUND, self-certified-SOUND
+    // solid. Regression net for the #89 cone-rim mis-weld (mesh `oriented=false`
+    // + 330 open edges on the narrow rim) fixed in `cone_rim_fillet` (seam-side
+    // orientation pick) + `tessellate_blend_torus_conforming` (cache-conforming
+    // blend band).
     {
         let mut model = BRepModel::new();
         let solid = sid(TopologyBuilder::new(&mut model)
@@ -525,6 +563,7 @@ fn blends_on_non_box_solids() {
         let rims = circular_edges(&model, solid);
         let n = rims.len();
         let v = fillet_and_judge(&mut model, solid, rims, 0.8);
+        assert_cone_rim_oriented_sound(&v, "cone both-rims fillet (r=0.8)");
         table.add(&format!("cone r5→2 h12: fillet {n} rims (r=0.8)"), &v);
     }
 
@@ -559,6 +598,7 @@ fn blends_on_non_box_solids() {
             .into_iter()
             .collect::<Vec<_>>();
         let v = fillet_and_judge(&mut model, solid, base_rim, 0.8);
+        assert_cone_rim_oriented_sound(&v, "cone single base-rim fillet (r=0.8) [#89 probe]");
         table.add(
             "cone r5→2 h12: fillet ONLY base rim r5 (r=0.8) [#89 probe]",
             &v,
