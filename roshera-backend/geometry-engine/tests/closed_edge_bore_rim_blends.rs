@@ -188,7 +188,7 @@ fn bore_rim_chamfer_succeeds_watertight_with_cone() {
         cones_before + 1,
         "bore chamfer must add exactly one cone blend face"
     );
-    assert_valid_watertight(&mut m, s, "bore-rim chamfer");
+    assert_valid_watertight_oriented(&mut m, s, "bore-rim chamfer");
 }
 
 #[test]
