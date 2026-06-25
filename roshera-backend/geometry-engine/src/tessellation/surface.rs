@@ -3204,6 +3204,17 @@ fn tessellate_conical_face(
         None => return,
     };
 
+    // Boundary-conforming path for a CHAMFER-blend cone frustum (the truncated
+    // cone created by `create_closed_edge_chamfer` on a cylinder rim). Takes both
+    // trim circles VERBATIM from the cache and stitches the ruled band, so the
+    // blend welds bit-exactly to its cap (plane) and lateral (cylinder)
+    // neighbours — the direct analogue of `tessellate_blend_torus_conforming` for
+    // the fillet. Returns false for any non-frustum / boolean-cut cone, which
+    // falls through to the paths below.
+    if tessellate_blend_cone_conforming(face, model, surface, cache, mesh) {
+        return;
+    }
+
     // Boundary-conforming path for cone faces cut into bands by a curved
     // Boolean (apex tip cap / frustum band). Falls through for the analytic
     // grid otherwise.
@@ -3893,6 +3904,168 @@ fn tessellate_toroidal_trimmed(
         }
         stitch_rings(&bound, &rim_ord, &outward_at, mesh);
     }
+    true
+}
+
+/// Conforming tessellation of a chamfer-BLEND cone frustum (the truncated cone
+/// produced by `create_closed_edge_chamfer` when a cylinder rim — outer OR bore
+/// — is chamfered).
+///
+/// Such a blend is a RULED frustum band carrying `height_limits` and the
+/// canonical seamed-rectangle boundary: a single 4-edge outer loop (lateral trim
+/// circle, seam line, cap trim circle, seam line) with no inner loops. The two
+/// trim circles are the v-boundaries; the seam line (appearing twice,
+/// forward+backward) is the u=0≡2π meridian seam, so the patch is a closed
+/// straight-walled band between the two coaxial trim circles.
+///
+/// The generic curved-CDT path samples that band's boundary independently of the
+/// shared [`EdgeSampleCache`], so the chamfer cone's two rims do NOT coincide
+/// with the neighbour cap (plane) and lateral (cylinder) tessellations at the
+/// seam — leaving a ring of open boundary edges along both trim circles (the
+/// bore-rim chamfer leak: 4 open edges at the u=0 seam, the direct analogue of
+/// the #89 cone-rim FILLET mis-weld).
+///
+/// This mesher takes BOTH v-boundary rings VERBATIM from the cache (bit-identical
+/// to the cap/lateral tessellation of the same edges, so they weld for ANY
+/// radius) and stitches them directly. A cone frustum is ruled — zero curvature
+/// along the slant — so a single direct ring stitch is exact; no interior rows
+/// are needed. Returns `false` for any non-frustum cone (apex-singular cones,
+/// boolean-cut cone bands with single-circle cut loops, or any blend whose rings
+/// cannot be sampled) so those keep their existing dedicated meshers untouched.
+fn tessellate_blend_cone_conforming(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Cone;
+
+    let Some(cone) = surface.as_any().downcast_ref::<Cone>() else {
+        return false;
+    };
+    // Only a truncated frustum (the chamfer blend) qualifies; an apex-singular
+    // cone has no second rim and keeps the apex-fan / grid path.
+    if cone.height_limits.is_none() {
+        return false;
+    }
+    // The blend is the seamed-rectangle: exactly one outer loop of 4 edges and no
+    // inner holes. A boolean-trimmed cone carries cut ovals as inner loops and is
+    // excluded here (it has its own conforming cut mesher).
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(outer) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if outer.edges.len() != 4 {
+        return false;
+    }
+
+    // The two CLOSED edges of the loop are the trim circles (start == end
+    // vertex); the OPEN edge (the seam line, present twice) is the meridian seam.
+    let mut ring_edges: Vec<crate::primitives::edge::EdgeId> = Vec::new();
+    for &eid in &outer.edges {
+        let Some(e) = model.edges.get(eid) else {
+            return false;
+        };
+        if e.start_vertex == e.end_vertex && !ring_edges.contains(&eid) {
+            ring_edges.push(eid);
+        }
+    }
+    if ring_edges.len() != 2 {
+        return false;
+    }
+
+    // Sample each trim circle VERBATIM from the cache: these are the exact
+    // polylines the neighbouring cap (plane) and lateral (cylinder) faces weld
+    // onto. Both trim circles are built with `Arc::circle(center, axis, r)`,
+    // whose t=0 anchors to the same +ref_dir meridian, so both rings start at the
+    // shared seam vertex.
+    let ring_a: Vec<Point3> = cache.get_or_compute(ring_edges[0], model).as_ref().clone();
+    let ring_b: Vec<Point3> = cache.get_or_compute(ring_edges[1], model).as_ref().clone();
+    // Drop the duplicated closing sample (closed-edge cache emits n+1 with
+    // first == last) so each ring is a clean cycle of distinct vertices.
+    let trim = |mut r: Vec<Point3>| -> Vec<Point3> {
+        if r.len() >= 2 {
+            if let (Some(&f), Some(&l)) = (r.first(), r.last()) {
+                if (f - l).magnitude() < 1e-9 {
+                    r.pop();
+                }
+            }
+        }
+        r
+    };
+    let ring_a = trim(ring_a);
+    let ring_b = trim(ring_b);
+    if ring_a.len() < 3 || ring_b.len() < 3 {
+        return false;
+    }
+
+    // Normalise BOTH cached rings to the SAME rotational sense about the cone
+    // axis. The two trim circles are anchored to the same seam vertex but can be
+    // built advancing OPPOSITE ways about the axis (the cap and lateral loops
+    // unwrap with opposite chirality). Without re-aligning them the merge walk
+    // would pair a +u ring against a −u ring and emit ring-spanning garbage.
+    // Re-aligning keeps every ring CCW about the axis so the band stitches
+    // cleanly; the seam vertex (index 0) is shared by both, so re-aligning never
+    // breaks the weld.
+    let axis = cone.axis;
+    let ring_turn = |ring: &[Point3]| -> f64 {
+        let mut acc = 0.0;
+        for w in 0..ring.len() {
+            let p0 = ring[w] - cone.apex;
+            let p1 = ring[(w + 1) % ring.len()] - cone.apex;
+            let r0 = p0 - axis * p0.dot(&axis);
+            let r1 = p1 - axis * p1.dot(&axis);
+            acc += r0.cross(&r1).dot(&axis);
+        }
+        acc
+    };
+    let to_ccw = |mut ring: Vec<Point3>| -> Vec<Point3> {
+        if ring_turn(&ring) < 0.0 {
+            // Reverse but keep the seam vertex (index 0) first.
+            ring[1..].reverse();
+        }
+        ring
+    };
+    let ring_a = to_ccw(ring_a);
+    let ring_b = to_ccw(ring_b);
+
+    // Outward normal at a band vertex: the cone's analytic normal flipped to
+    // match the face orientation. Falls back to the radial-from-axis direction if
+    // the inversion fails (degenerate sample), which is the same outward sense.
+    let osign = face.orientation.sign();
+    let outward_normal = |p: Point3| -> Vector3 {
+        surface
+            .closest_point(&p, Tolerance::default())
+            .and_then(|(u, v)| surface.normal_at(u, v))
+            .map(|n| n * osign)
+            .unwrap_or_else(|_| {
+                let w = p - cone.apex;
+                (w - axis * w.dot(&axis)).normalize().unwrap_or(axis) * osign
+            })
+    };
+
+    let mut add_ring = |ring: &[Point3], mesh: &mut TriangleMesh| -> Vec<u32> {
+        ring.iter()
+            .map(|&p| {
+                mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal: outward_normal(p),
+                    uv: None,
+                })
+            })
+            .collect()
+    };
+
+    // A cone frustum is ruled (straight in v), so the band between the two cached
+    // rim rings needs no interior rows — a single direct stitch is exact. Reuse
+    // the torus blend's per-facet-winding ring stitch (tolerates unequal ring
+    // counts and orients each facet by its baked outward normals).
+    let lower = add_ring(&ring_a, mesh);
+    let upper = add_ring(&ring_b, mesh);
+    stitch_blend_rings(&lower, &upper, mesh);
     true
 }
 
