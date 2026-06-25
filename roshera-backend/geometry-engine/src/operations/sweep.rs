@@ -218,6 +218,21 @@ fn sweep_profile_body(
         SweepType::BiRail => create_frame_driven_sweep(model, profile_face, &path_edge, &options)?,
     };
 
+    // Drop the scratch profile face. `profile_face` is only a TEMPLATE: every
+    // sweep section (start cap, lateral rings, end cap) is built from a fresh
+    // `transform_face_full` copy with its own vertices/edges/loop, so the
+    // original profile face — and its profile edges — are never part of the
+    // result solid's shell. Left in the model they remain single-use faces, and
+    // the whole-model validator (`validate_model_enhanced`, which
+    // `validate_solid_scoped` runs and whose model-global, unattributed gap
+    // errors are NOT filtered out by solid id) flags each profile edge as a
+    // boundary-edge "gap in topology" — making a perfectly watertight straight
+    // prism report `brep_valid = false`. Removing the scratch face (and its
+    // edges not shared with the solid shell) clears those phantom gaps while
+    // leaving the clean swept mesh untouched. Mirrors loft's
+    // `remove_scratch_profile_faces`.
+    remove_scratch_profile_face(model, profile_face, solid_id);
+
     // Validate result if requested
     if options.common.validate_result {
         validate_swept_solid(model, solid_id)?;
@@ -1232,6 +1247,70 @@ fn validate_sweep_inputs(
     }
 
     Ok(())
+}
+
+/// Remove the scratch profile face (the sweep TEMPLATE) from the model after
+/// the result solid is built.
+///
+/// `create_profile_face` builds a planar face from the caller's profile edges
+/// purely so each sweep section can be produced as a transformed COPY of it
+/// (`transform_face_full` → fresh surface/loop/edges/vertices). The original
+/// face is therefore never wired into the result solid's shell. Left behind it
+/// is a single-use face whose profile edges the whole-model validator reports
+/// as boundary-edge gaps (those gap errors carry no solid id, so
+/// `validate_solid_scoped` cannot filter them out), spuriously failing the
+/// B-Rep validity of an otherwise-watertight prism.
+///
+/// Each profile edge is removed only when it is NOT also referenced by the
+/// result solid's shell, so a sweep variant that happened to share an input
+/// edge with a lateral/cap face never loses a live edge. Directly mirrors
+/// loft's `remove_scratch_profile_faces`.
+fn remove_scratch_profile_face(model: &mut BRepModel, profile_face: FaceId, solid_id: SolidId) {
+    use std::collections::HashSet;
+
+    // Edges referenced by the result solid's shell faces (outer + inner shells).
+    let mut solid_edges: HashSet<EdgeId> = HashSet::new();
+    if let Some(solid) = model.solids.get(solid_id) {
+        let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .collect();
+        for shid in shell_ids {
+            let shell_faces: Vec<FaceId> = model
+                .shells
+                .get(shid)
+                .map(|s| s.faces.clone())
+                .unwrap_or_default();
+            for fid in shell_faces {
+                if let Some(face) = model.faces.get(fid) {
+                    let loops =
+                        std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied());
+                    for lid in loops {
+                        if let Some(lp) = model.loops.get(lid) {
+                            for &e in &lp.edges {
+                                solid_edges.insert(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (outer, inner) = match model.faces.get(profile_face) {
+        Some(f) => (f.outer_loop, f.inner_loops.clone()),
+        None => return,
+    };
+    for lid in std::iter::once(outer).chain(inner) {
+        if let Some(lp) = model.loops.get(lid).cloned() {
+            for e in lp.edges {
+                if !solid_edges.contains(&e) {
+                    model.edges.remove(e);
+                }
+            }
+        }
+        model.loops.remove(lid);
+    }
+    model.faces.remove(profile_face);
 }
 
 /// Validate swept solid
