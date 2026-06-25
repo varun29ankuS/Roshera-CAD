@@ -2508,7 +2508,19 @@ fn cone_rim_fillet(
     // Outward at the corner diagonal: from the ball centre toward the original
     // sharp rim point.
     let blend_outward_target = q - center;
-    let blend_orientation = orient_face_for_outward(&torus, blend_outward_target)?;
+    // Sample the torus normal at the SEAM (u = 0), NOT the parametric midpoint
+    // (u = π). The blend sweeps the full major circle (u ∈ [0, 2π]); its
+    // midpoint lands on the FAR side of the axis, where the surface's outward
+    // radial component is −u_rad — the opposite sign to the seam where the
+    // outward `target` (q − centre, anchored at u_rad) was derived. Comparing
+    // the far-side normal to the near-side target flips the orientation pick,
+    // winding the whole blend inward (mis-oriented mesh: `oriented == false`).
+    // The seam u = 0 is exactly where `q`, `center` and the target live, so the
+    // surface normal there is collinear with the outward target and the sign is
+    // unambiguous. v is taken at the meridian midpoint (well inside [v0, v1],
+    // away from the trim boundaries).
+    let v_mid = 0.5 * (v0 + v1);
+    let blend_orientation = orient_face_for_outward_at(&torus, blend_outward_target, 0.0, v_mid)?;
     let torus_surface_id = model.surfaces.add(Box::new(torus));
 
     let mut blend_loop = Loop::new(0, LoopType::Outer);

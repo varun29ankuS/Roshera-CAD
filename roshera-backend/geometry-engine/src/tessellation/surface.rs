@@ -200,7 +200,8 @@ pub fn tessellate_face(
             // Trimmed torus (boolean rim-poke main body / bump) → conforming
             // grid+stitch mesher; untrimmed full torus falls through to the fast
             // structured grid.
-            if !tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
+            if tessellate_blend_torus_conforming(face, model, surface, cache, params, mesh) {
+            } else if !tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
                 tessellate_toroidal_face(face, model, params, cache, mesh);
             }
         }
@@ -3893,6 +3894,311 @@ fn tessellate_toroidal_trimmed(
         stitch_rings(&bound, &rim_ord, &outward_at, mesh);
     }
     true
+}
+
+/// Conforming tessellation of a fillet-BLEND torus (cylinder-rim or cone-rim
+/// quarter-torus produced by `cylinder_rim_fillet` / `cone_rim_fillet`).
+///
+/// Such a blend carries `param_limits` (a trimmed `[0,2π] × [v0,v1]` window) and
+/// the canonical seamed-rectangle boundary: a single 4-edge outer loop
+/// (lateral trim circle, seam arc, cap trim circle, seam arc) with no inner
+/// loops. The two trim circles are the v-boundaries; the seam arc (appearing
+/// twice, forward+backward) is the periodic u=0≡2π meridian seam, so the patch
+/// is a closed tube-band between the two coaxial trim circles.
+///
+/// The naive structured grid in [`tessellate_toroidal_face`] samples that band
+/// from `surface.point_at(u,v)` at its OWN `u`-step count, which coincides with
+/// the neighbour cap/cone edge samples only when the step counts happen to be
+/// equal — true for a wide rim (both trim circles hit the segment ceiling →
+/// equal counts), false for a narrow one (the smaller cap circle gets fewer
+/// samples). The mismatch leaves the whole blend patch un-welded: a floating
+/// band of boundary edges along both trim circles (the cone-rim mis-weld #89,
+/// `oriented`-true but `watertight`-false).
+///
+/// This mesher instead takes the two v-boundary rings VERBATIM from the shared
+/// [`EdgeSampleCache`] (so they are bit-identical to the cap/cone tessellation
+/// of the same edges and weld for ANY radius), fills interior meridian rows
+/// from the torus surface for chord fidelity, and stitches consecutive rings
+/// with an angle-merge band that tolerates unequal ring counts. Returns `false`
+/// for every other torus (untrimmed full torus, boolean rim-poke trimmed torus
+/// with inner loops, or any blend whose rings cannot be sampled) so those keep
+/// their existing dedicated meshers untouched.
+fn tessellate_blend_torus_conforming(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Torus;
+
+    let Some(torus) = surface.as_any().downcast_ref::<Torus>() else {
+        return false;
+    };
+    // Only a trimmed-window torus (the fillet blend) qualifies; the full torus
+    // and the boolean rim-poke body keep their structured/stitch meshers.
+    let Some([_, _, v_lo, v_hi]) = torus.param_limits else {
+        return false;
+    };
+    // The blend is the seamed-rectangle: exactly one outer loop of 4 edges and
+    // no inner holes. A boolean-trimmed torus carries cut ovals as inner loops
+    // and is excluded here (it has its own conforming stitch mesher).
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let Some(outer) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if outer.edges.len() != 4 {
+        return false;
+    }
+
+    // The two CLOSED edges of the loop are the trim circles (start == end
+    // vertex); the OPEN edge (the seam arc, present twice) is the meridian seam.
+    let mut ring_edges: Vec<crate::primitives::edge::EdgeId> = Vec::new();
+    for &eid in &outer.edges {
+        let Some(e) = model.edges.get(eid) else {
+            return false;
+        };
+        if e.start_vertex == e.end_vertex && !ring_edges.contains(&eid) {
+            ring_edges.push(eid);
+        }
+    }
+    if ring_edges.len() != 2 {
+        return false;
+    }
+
+    // Sample each trim circle VERBATIM from the cache: these are the exact
+    // polylines the neighbouring cap (plane) and lateral (cone/cylinder) faces
+    // weld onto. `get_or_compute` samples a closed circular edge over its full
+    // param range starting at the curve's t=0, which the blend builders anchor
+    // to the torus `ref_dir` (u = 0 seam) — so both rings start at the same
+    // meridian and share the seam vertices.
+    let ring_a: Vec<Point3> = cache.get_or_compute(ring_edges[0], model).as_ref().clone();
+    let ring_b: Vec<Point3> = cache.get_or_compute(ring_edges[1], model).as_ref().clone();
+    // Drop the duplicated closing sample (closed-edge cache emits n+1 with
+    // first == last) so each ring is a clean cycle of distinct vertices.
+    let trim = |mut r: Vec<Point3>| -> Vec<Point3> {
+        if r.len() >= 2 {
+            if let (Some(&f), Some(&l)) = (r.first(), r.last()) {
+                if (f - l).magnitude() < 1e-9 {
+                    r.pop();
+                }
+            }
+        }
+        r
+    };
+    let ring_a = trim(ring_a);
+    let ring_b = trim(ring_b);
+    if ring_a.len() < 3 || ring_b.len() < 3 {
+        return false;
+    }
+
+    // Normalise BOTH cached rings to the SAME rotational sense about the torus
+    // axis (the +u / CCW sense the interior rows are sampled in). The two trim
+    // circles are anchored to the same seam but can be built advancing OPPOSITE
+    // ways about the axis (`cylinder_rim_fillet` / `cone_rim_fillet` sweep the
+    // lateral trim circle with −TAU and the cap trim circle with +TAU so each
+    // face's own loop unwraps cleanly). Without re-aligning them the merge walk
+    // would pair a +u ring against a −u ring and emit ring-spanning garbage
+    // triangles. Re-aligning keeps every ring CCW so the band stitches cleanly;
+    // the seam vertex (index 0) is shared by both, so re-aligning never breaks
+    // the weld.
+    let axis = torus.axis;
+    let ring_turn = |ring: &[Point3]| -> f64 {
+        // Signed turning about the axis: sum of cross-products of consecutive
+        // radial vectors, projected on the axis. Sign > 0 ⇒ CCW about +axis.
+        let mut acc = 0.0;
+        for w in 0..ring.len() {
+            let p0 = ring[w] - torus.center;
+            let p1 = ring[(w + 1) % ring.len()] - torus.center;
+            let r0 = p0 - axis * p0.dot(&axis);
+            let r1 = p1 - axis * p1.dot(&axis);
+            acc += r0.cross(&r1).dot(&axis);
+        }
+        acc
+    };
+    let to_ccw = |mut ring: Vec<Point3>| -> Vec<Point3> {
+        if ring_turn(&ring) < 0.0 {
+            // Reverse but keep the seam vertex (index 0) first.
+            ring[1..].reverse();
+        }
+        ring
+    };
+    let ring_a = to_ccw(ring_a);
+    let ring_b = to_ccw(ring_b);
+
+    // Map each cached ring to its torus v-parameter so interior rows can be
+    // sampled BETWEEN them. `closest_point` returns the signed v the blend
+    // window uses (`v_straddles_seam`). Average over a few ring points for
+    // robustness against per-sample noise.
+    let v_of_ring = |ring: &[Point3]| -> f64 {
+        let mut acc = 0.0;
+        let mut n = 0.0;
+        for &p in ring.iter().take(8) {
+            if let Ok((_, v)) = surface.closest_point(&p, Tolerance::default()) {
+                acc += v;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            acc / n
+        } else {
+            0.0
+        }
+    };
+    let va = v_of_ring(&ring_a);
+    let vb = v_of_ring(&ring_b);
+    // Order rings by ascending v: row 0 = low-v boundary, last row = high-v.
+    let (v_low_ring, v_high_ring, v_low, v_high) = if va <= vb {
+        (&ring_a, &ring_b, va, vb)
+    } else {
+        (&ring_b, &ring_a, vb, va)
+    };
+    // Guard: the ring v's must bracket the declared window (else this is not a
+    // clean blend band and we defer to the structured grid).
+    let v_span = (v_hi - v_lo).abs();
+    if v_span < 1e-9 {
+        return false;
+    }
+
+    // Number of interior meridian rows for chord fidelity across the minor
+    // (tube) circle. The two boundary rows already exist; add enough interior
+    // rows that the v-chord error stays within tolerance.
+    let v_steps = arc_steps_for_quality((v_high - v_low).abs(), torus.minor_radius, params).max(1);
+
+    // Build the rows. Row 0 and row `v_steps` are the cached rings (verbatim);
+    // interior rows are torus-surface samples at the SEAM-anchored u-angles of
+    // the larger ring so adjacent rows align in u as closely as possible (the
+    // angle-merge stitch tolerates any residual count difference).
+    let interior_cols = v_low_ring.len().max(v_high_ring.len());
+    let outward_normal = |p: Point3| -> Vector3 {
+        surface
+            .closest_point(&p, Tolerance::default())
+            .and_then(|(u, v)| surface.normal_at(u, v))
+            .map(|n| n * face.orientation.sign())
+            .unwrap_or(torus.axis)
+    };
+
+    // Add a ring of vertices, return their mesh indices in ring order.
+    let mut add_ring = |ring: &[Point3], mesh: &mut TriangleMesh| -> Vec<u32> {
+        ring.iter()
+            .map(|&p| {
+                mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal: outward_normal(p),
+                    uv: None,
+                })
+            })
+            .collect()
+    };
+
+    let mut rows: Vec<Vec<u32>> = Vec::with_capacity(v_steps + 1);
+    rows.push(add_ring(v_low_ring, mesh));
+    for k in 1..v_steps {
+        let v = v_low + (v_high - v_low) * (k as f64) / (v_steps as f64);
+        let mut row_pts: Vec<Point3> = Vec::with_capacity(interior_cols);
+        for i in 0..interior_cols {
+            let u = std::f64::consts::TAU * (i as f64) / (interior_cols as f64);
+            match surface.point_at(u, v) {
+                Ok(p) => row_pts.push(p),
+                Err(_) => return false,
+            }
+        }
+        rows.push(add_ring(&row_pts, mesh));
+    }
+    rows.push(add_ring(v_high_ring, mesh));
+
+    // Stitch consecutive rings. Both rings are closed cycles starting at the
+    // u = 0 seam and advancing in the SAME angular direction (cache forward
+    // order == curve param order == +u). A normalized-parameter merge walks
+    // both rings monotonically, emitting a triangle off whichever ring is
+    // "behind" in normalized position — the standard unequal-count tube stitch,
+    // crack-free because every ring vertex is consumed exactly once.
+    for w in 0..rows.len() - 1 {
+        stitch_blend_rings(&rows[w], &rows[w + 1], mesh);
+    }
+    true
+}
+
+/// Stitch two closed vertex rings (a tube band) into triangles, tolerating
+/// unequal ring lengths. Both rings start at the same seam and advance in the
+/// same angular direction; the walk advances whichever ring is behind in
+/// normalized [0,1) position, so every vertex of both rings is used and the
+/// band is crack-free.
+///
+/// Each triangle's winding is set per-facet by agreement with its vertices'
+/// outward normals (already baked when the rings were added: `surface.normal_at
+/// × face.orientation.sign()`). This makes the band's facet orientation match
+/// the face's oriented outward direction unconditionally — independent of the
+/// merge-walk traversal sense — so it is consistently wound with the cap and
+/// lateral neighbours that share its two boundary rings.
+fn stitch_blend_rings(lower: &[u32], upper: &[u32], mesh: &mut TriangleMesh) {
+    let nl = lower.len();
+    let nu = upper.len();
+    if nl == 0 || nu == 0 {
+        return;
+    }
+    // Per-facet winding by agreement with the baked outward vertex normals:
+    // each triangle is emitted with the winding whose geometric normal has a
+    // non-negative dot with the mean of its three vertices' (outward) normals.
+    // This makes the band's facet orientation match the face's oriented outward
+    // direction unconditionally, so it is consistently wound with the cap and
+    // lateral neighbours that share its two boundary rings — independent of the
+    // rings' rotational sense or the merge-walk traversal order.
+    let mut emit = |a: u32, b: u32, c: u32, mesh: &mut TriangleMesh| {
+        if a == b || b == c || c == a {
+            return;
+        }
+        let (pa, pb, pc) = (
+            mesh.vertices[a as usize].position,
+            mesh.vertices[b as usize].position,
+            mesh.vertices[c as usize].position,
+        );
+        let geo = (pb - pa).cross(&(pc - pa));
+        let outward = mesh.vertices[a as usize].normal
+            + mesh.vertices[b as usize].normal
+            + mesh.vertices[c as usize].normal;
+        if geo.dot(&outward) >= 0.0 {
+            mesh.add_triangle(a, b, c);
+        } else {
+            mesh.add_triangle(a, c, b);
+        }
+    };
+    let mut il = 0usize;
+    let mut iu = 0usize;
+    // Walk until both rings have been fully traversed (each index reaches its
+    // length). Normalized position of the NEXT boundary on each ring decides
+    // which side advances.
+    while il < nl || iu < nu {
+        let pl = il as f64 / nl as f64;
+        let pu = iu as f64 / nu as f64;
+        let lower_behind = if il >= nl {
+            false
+        } else if iu >= nu {
+            true
+        } else {
+            pl <= pu
+        };
+        if lower_behind {
+            // Advance the lower ring: triangle (L[il], L[il+1], U[iu]).
+            let a = lower[il % nl];
+            let b = lower[(il + 1) % nl];
+            let c = upper[iu % nu];
+            emit(a, b, c, mesh);
+            il += 1;
+        } else {
+            // Advance the upper ring: triangle (L[il], U[iu+1], U[iu]). Same
+            // (lower→upper) traversal sense as the lower-advance case, so both
+            // triangle kinds carry one consistent winding across the band.
+            let a = lower[il % nl];
+            let b = upper[(iu + 1) % nu];
+            let c = upper[iu % nu];
+            emit(a, b, c, mesh);
+            iu += 1;
+        }
+    }
 }
 
 fn tessellate_toroidal_face(
