@@ -154,9 +154,10 @@ function perceptionFromBody(r: any): any {
 }
 
 function ok(data: unknown) {
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
-  };
+  const content: any[] = [
+    { type: "text" as const, text: JSON.stringify(data, null, 2) },
+  ];
+  return { content };
 }
 
 function fail(e: unknown) {
@@ -184,6 +185,26 @@ async function newestPartId(): Promise<number | null> {
   const parts = await api("GET", "/api/agent/parts");
   if (!Array.isArray(parts) || parts.length === 0) return null;
   return parts.reduce((m: number, p: any) => Math.max(m, p.id), 0);
+}
+
+/**
+ * STRUCTURE channel: attach the SDF occupancy X-ray (slice-stack of '#'/'.', n=16)
+ * to a perception object — reveals internal cavities, wall thickness and through-
+ * holes the validity verdict and a shaded render can't show. Sampled from the
+ * kernel's EXACT solid, so it can't be fooled by tessellation. Suppressed by
+ * ROSHERA_AMBIENT_PERCEPTION=cert. Best-effort: a failure just omits the X-ray.
+ */
+async function addOccupancyXray(target: Record<string, any>, partId: number): Promise<void> {
+  if (process.env.ROSHERA_AMBIENT_PERCEPTION === "cert") return;
+  try {
+    const occ = await api("GET", `/api/agent/parts/${partId}/occupancy?n=16`);
+    if (occ?.slices !== undefined) {
+      target.occupancy_xray = occ.slices;
+      target.fill_fraction = occ.fill_fraction ?? null;
+    }
+  } catch {
+    // omit the X-ray; cert stands
+  }
 }
 
 /**
@@ -223,6 +244,7 @@ async function perceive(partId: number | null): Promise<any> {
         if (p.face_count == null) p.face_count = part?.topology?.face_count ?? null;
         if (p.volume == null) p.volume = part?.volume ?? null;
       }
+      await addOccupancyXray(p, partId);
       return p;
     }
     // FULL SOUNDNESS channel: /perception (default) runs the kernel's full
@@ -238,7 +260,7 @@ async function perceive(partId: number | null): Promise<any> {
     const sound = p?.sound === true;
     const brepValid = cert?.brep_valid ?? p?.valid ?? null;
     const watertight = cert?.watertight ?? p?.watertight ?? null;
-    return {
+    const result: Record<string, unknown> = {
       sound,
       brep_valid: brepValid,
       watertight,
@@ -259,15 +281,55 @@ async function perceive(partId: number | null): Promise<any> {
       cert: cert ?? undefined,
       verdict: p?.verdict ?? (sound ? "SOUND" : "UNSOUND — see cert"),
     };
+    await addOccupancyXray(result, partId);
+    return result;
   } catch {
     return undefined;
   }
 }
 
-/** `ok()` plus an automatic perception verdict for the resulting part. */
+/**
+ * Fetch a small shaded iso render as an MCP image content block — the FORM
+ * channel of ambient perception. Same source `render_part` uses. Cheap (size
+ * 320). Best-effort: returns `undefined` on any failure so the op's text result
+ * still stands.
+ */
+async function ambientRender(partId: number): Promise<any | undefined> {
+  try {
+    const r = await api(
+      "GET",
+      `/api/agent/parts/${partId}/render?mode=shaded&view=iso&size=320`,
+    );
+    if (!r?.png_base64) return undefined;
+    return { type: "image" as const, data: r.png_base64, mimeType: "image/png" };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `ok()` plus AMBIENT PERCEPTION for the resulting part — every mutating op
+ * carries all three modalities with no extra tool call:
+ *  - TRUTH + STRUCTURE: the perception object (cert + occupancy X-ray) as text;
+ *  - FORM: a small shaded render as an image content block.
+ * `ROSHERA_AMBIENT_PERCEPTION=full` (default) attaches cert + occupancy + render;
+ * `=cert` returns just the cert (today's behaviour). `ROSHERA_MCP_AUTOVERIFY=0`
+ * is the master off switch (no perception at all). Each channel is independently
+ * try/caught inside its fetch, so any single failure degrades gracefully.
+ */
 async function okp(data: Record<string, unknown>, partId: number | null) {
   const perception = await perceive(partId);
-  return ok(perception === undefined ? data : { ...data, perception });
+  const base = ok(perception === undefined ? data : { ...data, perception });
+  if (
+    partId === null ||
+    process.env.ROSHERA_MCP_AUTOVERIFY === "0" ||
+    process.env.ROSHERA_AMBIENT_PERCEPTION === "cert"
+  ) {
+    return base;
+  }
+  const image = await ambientRender(partId);
+  if (image) base.content.push(image);
+  return base;
 }
 
 // ─── Server + tools ────────────────────────────────────────────────────
