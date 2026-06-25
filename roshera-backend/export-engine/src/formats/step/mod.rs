@@ -39,6 +39,7 @@ pub mod dispatch;
 pub mod handlers;
 pub mod merge;
 pub mod parser;
+pub mod pcurve;
 pub mod registry;
 pub mod writer;
 

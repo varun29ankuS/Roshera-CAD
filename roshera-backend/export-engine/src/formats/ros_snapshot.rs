@@ -612,7 +612,12 @@ impl Default for BRepSnapshot {
 // ── Helper functions for model extraction ──
 
 /// Convert a u32/u64 topology ID to a deterministic UUID (namespace-based)
-fn id_to_uuid(id: u64) -> Uuid {
+///
+/// `pub(crate)` so the STEP pcurve builder can key its parameter-curve map by
+/// the SAME deterministic UUIDs the snapshot uses for edges/faces, letting the
+/// writer look up a pcurve by the snapshot edge id without re-deriving the
+/// mapping.
+pub(crate) fn id_to_uuid(id: u64) -> Uuid {
     // Use a fixed namespace to make IDs deterministic and reversible
     let bytes = id.to_le_bytes();
     let mut uuid_bytes = [0u8; 16];
