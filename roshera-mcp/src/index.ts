@@ -35,22 +35,51 @@ class ApiError extends Error {
   }
 }
 
+// Per-request timeout. A heavy kernel op (boolean over a complex part, fine
+// tessellation, full re-cert) can legitimately take many seconds; the default
+// is generous so we never abort a real computation, but it is bounded so a
+// genuinely wedged backend surfaces as a clear 504 rather than hanging the
+// agent forever. Override per process with ROSHERA_MCP_TIMEOUT_MS.
+const TIMEOUT_MS = (() => {
+  const raw = process.env.ROSHERA_MCP_TIMEOUT_MS;
+  const n = raw !== undefined ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 120000;
+})();
+
 async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   body?: unknown,
 ): Promise<any> {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    headers: {
-      // Timeline attribution: the backend's agent_author_layer records
-      // every kernel op from this request as Author::AIAgent("Claude"),
-      // so agent-built features show amber Ⓒ in the Timeline strip.
-      "X-Roshera-Agent": "Claude",
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method,
+      headers: {
+        // Timeline attribution: the backend's agent_author_layer records
+        // every kernel op from this request as Author::AIAgent("Claude"),
+        // so agent-built features show amber Ⓒ in the Timeline strip.
+        "X-Roshera-Agent": "Claude",
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      // AbortSignal.timeout fires a TimeoutError after TIMEOUT_MS; older
+      // runtimes surface the abort as AbortError. Either way we map it to a
+      // 504 so the agent gets an actionable message, not a raw stack.
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+  } catch (err) {
+    const name = (err as { name?: string })?.name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      throw new ApiError(
+        `${method} ${path} → timed out after ${TIMEOUT_MS}ms (backend may still be computing a heavy op; raise ROSHERA_MCP_TIMEOUT_MS)`,
+        504,
+        "",
+      );
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new ApiError(`${method} ${path} → network error: ${msg}`, 0, "");
+  }
   const text = await res.text();
   if (!res.ok) {
     throw new ApiError(
@@ -59,7 +88,69 @@ async function api(
       text,
     );
   }
-  return text.length ? JSON.parse(text) : null;
+  const parsed = text.length ? JSON.parse(text) : null;
+  // DOUBLE-CERT ELIMINATION: every mutating geometry endpoint already embeds
+  // the FULL kernel certificate in its own response (certified_response). Stash
+  // it so the following perceive() reuses THIS cert instead of firing a second
+  // GET /perception that re-runs certify_solid (the expensive self-intersection
+  // pass) under the model write lock. We only stash for mutating verbs; GETs
+  // (including /perception itself) never overwrite the stash.
+  if (method !== "GET" && parsed && typeof parsed === "object") {
+    const embedded = perceptionFromBody(parsed);
+    if (embedded !== undefined) {
+      lastEmbeddedPerception = {
+        id: parsed.solid_id ?? parsed.id ?? null,
+        perception: embedded,
+      };
+    }
+  }
+  return parsed;
+}
+
+// ─── Embedded-perception reuse (no double certification) ───────────────
+
+/**
+ * The cert carried by the most recent mutating response. `perceive()` consumes
+ * this in preference to re-fetching /perception, so the agent sees the SAME
+ * certificate the REST op computed — never a second, redundant re-cert.
+ */
+let lastEmbeddedPerception: { id: number | null; perception: any } | null = null;
+
+/**
+ * Project a raw mutating response into the exact shape `perceive()` returns,
+ * reusing the certificate the endpoint already embedded. The `cert` object lives
+ * at `r.cert` on the certified-response path (it may also appear nested at
+ * `r.perception.cert` if a handler wrapped it). Returns `undefined` when there
+ * is no embedded cert — i.e. the `?fast` opt-out path or a server too old to
+ * certify — so the caller falls back to the live /perception fetch.
+ */
+function perceptionFromBody(r: any): any {
+  if (!r || typeof r !== "object") return undefined;
+  const cert = r.cert ?? r.perception?.cert ?? null;
+  if (!cert) return undefined;
+  const sound = (r.sound ?? r.perception?.sound) === true;
+  return {
+    sound,
+    brep_valid: cert.brep_valid ?? r.valid ?? null,
+    watertight: cert.watertight ?? r.watertight ?? null,
+    manifold: cert.manifold ?? null,
+    self_intersection_free: cert.self_intersection_free ?? null,
+    construction_consistent: cert.construction_consistent ?? null,
+    labels_consistent: cert.labels_consistent ?? null,
+    tessellation_clean: cert.tessellation_clean ?? null,
+    mesh_quality_clean: cert.mesh_quality_clean ?? null,
+    euler_characteristic: cert.euler_characteristic ?? null,
+    open_edges: r.open_edges ?? cert.boundary_edges ?? null,
+    nonmanifold_edges: r.nonmanifold_edges ?? cert.nonmanifold_edges ?? null,
+    dims: r.dims ?? null,
+    // Structural counts (face_count / volume) are NOT in the cert; perceive()
+    // fills them from a cheap part GET when missing.
+    face_count: null,
+    volume: null,
+    errors: cert.errors ?? null,
+    cert: cert ?? undefined,
+    verdict: (r.verdict ?? r.perception?.verdict) ?? (sound ? "SOUND" : "UNSOUND — see cert"),
+  };
 }
 
 function ok(data: unknown) {
@@ -112,6 +203,28 @@ async function perceive(partId: number | null): Promise<any> {
     return undefined;
   }
   try {
+    // FAST PATH (no double certification): the mutating op that produced this
+    // part ALREADY ran the full certificate and embedded it in its response,
+    // which api() stashed. Reuse it verbatim — the `sound`/`cert` surfaced here
+    // are byte-identical to what the REST op computed. We never re-run
+    // certify_solid. The stash matches when its id equals partId, or when the
+    // op did not report a solid_id (id === null) — in which case this single
+    // in-flight perception is unambiguously for the part we just touched.
+    if (
+      lastEmbeddedPerception &&
+      (lastEmbeddedPerception.id === partId || lastEmbeddedPerception.id === null)
+    ) {
+      const p = lastEmbeddedPerception.perception;
+      lastEmbeddedPerception = null;
+      // The cert carries no face_count/volume; backfill with ONE light part GET
+      // (read lock, no cert) only when they are missing.
+      if (p.face_count == null || p.volume == null) {
+        const part = await api("GET", `/api/agent/parts/${partId}`).catch(() => null);
+        if (p.face_count == null) p.face_count = part?.topology?.face_count ?? null;
+        if (p.volume == null) p.volume = part?.volume ?? null;
+      }
+      return p;
+    }
     // FULL SOUNDNESS channel: /perception (default) runs the kernel's full
     // certificate. `sound` is the authoritative verdict the kernel cannot fake;
     // `cert` carries every dimension so the agent sees mesh-quality / inverted-
