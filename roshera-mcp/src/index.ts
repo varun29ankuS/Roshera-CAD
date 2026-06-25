@@ -188,6 +188,56 @@ async function newestPartId(): Promise<number | null> {
 }
 
 /**
+ * Resolve a kernel integer part_id to its public object UUID.
+ *
+ * The `/api/geometry/{fillet,chamfer,shell,…}` endpoints address solids by the
+ * public UUID (`object` field), not the kernel SolidId the agent surface speaks
+ * in (`list_parts`, `render_part`, every `/api/agent/parts/{id}` route). The
+ * UUID↔SolidId map lives only in the backend's AppState and is never returned by
+ * an agent route, so we recover it from the scene snapshot — every object there
+ * carries both `id` (UUID) and `analytical_geometry.solid_id` (the integer id).
+ * Throws a clear error when no live solid matches, so the tool fails loudly
+ * instead of POSTing a bogus `object`.
+ */
+async function uuidForPart(partId: number): Promise<string> {
+  const snap = await api("GET", "/api/scene/snapshot");
+  const objects = Array.isArray(snap?.objects) ? snap.objects : [];
+  for (const o of objects) {
+    if (o?.analytical_geometry?.solid_id === partId && typeof o?.id === "string") {
+      return o.id;
+    }
+  }
+  throw new Error(
+    `no live solid found for part_id ${partId} (run list_parts to see current ids)`,
+  );
+}
+
+/**
+ * Enumerate EVERY edge id of a solid via the agent select-edge endpoint with the
+ * widest possible query (`curve_kind:any`, `blend:any`, no extremal). For a real
+ * solid (>1 edge) the kernel REFUSES to pick one and returns the full candidate
+ * set as an `ambiguous` 409 — which is exactly the all-edges list we want. A
+ * single-edge solid resolves directly. The blend tools use this for their
+ * all-edges mode (omitted `edge_ids`).
+ */
+async function allEdgeIds(partId: number): Promise<number[]> {
+  const res = await fetch(`${BASE}/api/agent/parts/${partId}/select-edge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ curve_kind: "any", blend: "any", extremal: "none" }),
+  });
+  const j: any = await res.json().catch(() => null);
+  if (j?.resolved === true && typeof j.edge_id === "number") return [j.edge_id];
+  if (Array.isArray(j?.candidates)) {
+    return j.candidates.filter((e: unknown): e is number => typeof e === "number");
+  }
+  throw new Error(
+    `could not enumerate edges for part_id ${partId}` +
+      (j?.message ? `: ${j.message}` : ""),
+  );
+}
+
+/**
  * STRUCTURE channel: attach the SDF occupancy X-ray (slice-stack of '#'/'.', n=16)
  * to a perception object — reveals internal cavities, wall thickness and through-
  * holes the validity verdict and a shaded render can't show. Sampled from the
@@ -1496,6 +1546,107 @@ server.tool(
           placement: part_id !== null ? await placement(part_id) : null,
         },
         part_id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "fillet_edges",
+  "ROUND (fillet) one or more edges of a solid with a constant radius — the " +
+    "blend that turns a sharp edge into a smooth cylindrical/spherical arc. Give " +
+    "the kernel `part_id` (from list_parts) and the `radius` (> 0, in model " +
+    "units). `edge_ids` selects which edges to blend (get them from select_edge / " +
+    "render_part mode:'ids'); OMIT `edge_ids` to blend ALL edges of the solid at " +
+    "once. Identity-preserving: the body keeps its part id/UUID. Filleting can " +
+    "self-intersect or fail to close at tight corners, so the result is always " +
+    "perception-verified — check the returned cert (sound / watertight) before " +
+    "trusting it.",
+  {
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    radius: z.number().positive().describe("fillet radius in model units (> 0)"),
+    edge_ids: z
+      .array(z.number().int().nonnegative())
+      .optional()
+      .describe(
+        "edge ids to round (from select_edge / render_part ids); omit to blend ALL edges of the solid",
+      ),
+  },
+  async ({ part_id, radius, edge_ids }) => {
+    try {
+      const object = await uuidForPart(part_id);
+      const edges =
+        edge_ids && edge_ids.length > 0 ? edge_ids : await allEdgeIds(part_id);
+      const r = await api("POST", "/api/geometry/fillet", {
+        object,
+        edges,
+        radius,
+      });
+      const id = r.solid_id ?? part_id;
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? object, // identity-preserving: same uuid
+          part_id: id,
+          filleted_edges: edges,
+          all_edges: !(edge_ids && edge_ids.length > 0),
+          triangles: r?.stats?.triangle_count ?? null,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
+      );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "chamfer_edges",
+  "BEVEL (chamfer) one or more edges of a solid with an equal-distance flat — the " +
+    "blend that replaces a sharp edge with an angled face set back `distance` from " +
+    "the edge on each adjacent face. Give the kernel `part_id` (from list_parts) " +
+    "and the `distance` (> 0, in model units). `edge_ids` selects which edges to " +
+    "bevel (get them from select_edge / render_part mode:'ids'); OMIT `edge_ids` " +
+    "to chamfer ALL edges of the solid at once. Identity-preserving: the body " +
+    "keeps its part id/UUID. Chamfering can self-intersect or fail to close at " +
+    "tight corners, so the result is always perception-verified — check the " +
+    "returned cert (sound / watertight) before trusting it.",
+  {
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    distance: z
+      .number()
+      .positive()
+      .describe("chamfer setback distance in model units (> 0)"),
+    edge_ids: z
+      .array(z.number().int().nonnegative())
+      .optional()
+      .describe(
+        "edge ids to bevel (from select_edge / render_part ids); omit to blend ALL edges of the solid",
+      ),
+  },
+  async ({ part_id, distance, edge_ids }) => {
+    try {
+      const object = await uuidForPart(part_id);
+      const edges =
+        edge_ids && edge_ids.length > 0 ? edge_ids : await allEdgeIds(part_id);
+      const r = await api("POST", "/api/geometry/chamfer", {
+        object,
+        edges,
+        distance,
+      });
+      const id = r.solid_id ?? part_id;
+      return await okp(
+        {
+          object_uuid: r.object?.id ?? object, // identity-preserving: same uuid
+          part_id: id,
+          chamfered_edges: edges,
+          all_edges: !(edge_ids && edge_ids.length > 0),
+          triangles: r?.stats?.triangle_count ?? null,
+          placement: id !== null ? await placement(id) : null,
+        },
+        id,
       );
     } catch (e) {
       return fail(e);
