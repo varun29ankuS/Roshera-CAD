@@ -1181,6 +1181,76 @@ pub async fn part_truth(
     }))
 }
 
+// ───────────────────── occupancy X-ray ──────────────────────────────
+
+/// Query for `GET /api/agent/parts/{id}/occupancy?n=20` — the grid resolution.
+/// Clamped to `[4, 48]`; larger grids are rejected because the ASCII slice-stack
+/// and the full-grid SDF cost both blow up cubically. Defaults to 20.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OccupancyQuery {
+    pub n: Option<usize>,
+}
+
+/// Response for the occupancy X-ray. `dims` is `[x, y, z]` (all `n` for the
+/// cubic grid). `slices` is the fixed ASCII slice-stack (`'#'`=inside,
+/// `'.'`=outside; per-z header `z=k`, then `n` rows of `n` chars, rows by y,
+/// cols by x).
+#[derive(Debug, Clone, Serialize)]
+pub struct OccupancyResponse {
+    pub n: usize,
+    pub bbox: OccupancyBBoxWire,
+    pub dims: [usize; 3],
+    pub fill_fraction: f64,
+    pub slices: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OccupancyBBoxWire {
+    pub min: Vec3Wire,
+    pub max: Vec3Wire,
+}
+
+/// `GET /api/agent/parts/{id}/occupancy?n=20` — the SDF X-ray.
+///
+/// Samples the part's EXACT signed-distance field into a coarse `n×n×n`
+/// occupancy grid over its (margin-expanded) world bbox and returns it as an
+/// ASCII slice-stack — the non-deceivable structural complement to the shaded
+/// render and the certificate. Reveals internal cavities, wall thickness, gaps
+/// and through-holes a render can occlude. Read lock only (`signed_distance` is
+/// a read-only query); `n` clamped to `[4, 48]`; `404` on unknown id.
+pub async fn part_occupancy(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Query(q): Query<OccupancyQuery>,
+) -> Result<Json<OccupancyResponse>, StatusCode> {
+    use geometry_engine::queries::occupancy::{occupancy_grid, to_slice_stack};
+
+    // Clamp to the supported range: below 4 the X-ray is too coarse to read,
+    // above 48 the ASCII and full-grid SDF cost blow up cubically.
+    let n = q.n.unwrap_or(20).clamp(4, 48);
+
+    let model = model_handle.read().await;
+    // Unknown id (or a solid with no boundary face) → 404 rather than an
+    // all-empty grid, so the agent fails loudly on a bad reference.
+    if model.solids.get(id as SolidId).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let grid = occupancy_grid(&model, id as SolidId, n, 0.1);
+    let slices = to_slice_stack(&grid);
+
+    Ok(Json(OccupancyResponse {
+        n: grid.n,
+        bbox: OccupancyBBoxWire {
+            min: grid.bbox_min.into(),
+            max: grid.bbox_max.into(),
+        },
+        dims: [grid.n, grid.n, grid.n],
+        fill_fraction: grid.fill_fraction,
+        slices,
+    }))
+}
+
 /// Body for `POST /api/agent/parts/{id}/color` — RGB 0..255.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ColorBody {
