@@ -361,6 +361,40 @@ server.tool(
 );
 
 server.tool(
+  "occupancy_view",
+  "SEE a part's STRUCTURE as a non-deceivable SDF X-ray — a coarse occupancy " +
+    "slice-stack ('#'=solid, '.'=empty) that reveals internal cavities, wall " +
+    "thickness, gaps and through-holes a shaded render can hide. Complements " +
+    "render_part (form) and ground_truth (validity). The kernel samples its EXACT " +
+    "signed-distance field on an n×n×n grid over the part's bbox; each layer is a " +
+    "z-slice (header 'z=k', then n rows of n chars, rows by y, cols by x). Larger " +
+    "n is a sharper X-ray (capped at 48).",
+  {
+    part_id: z.number().int().describe("kernel part id from list_parts"),
+    n: z
+      .number()
+      .int()
+      .optional()
+      .default(20)
+      .describe("grid resolution per axis (clamped to 4..48)"),
+  },
+  async ({ part_id, n }) => {
+    try {
+      const r = await api("GET", `/api/agent/parts/${part_id}/occupancy?n=${n}`);
+      const summary = `occupancy n=${r.n} dims=${JSON.stringify(r.dims)} fill_fraction=${r.fill_fraction.toFixed(3)} bbox=${JSON.stringify(r.bbox)}`;
+      return {
+        content: [
+          { type: "text" as const, text: summary },
+          { type: "text" as const, text: r.slices },
+        ],
+      };
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "scene_view",
   "SEE THE WHOLE SCENE: composite EVERY part into one image from an arbitrary " +
     "camera (azimuth/elevation, world-Z up), auto-framed to the combined bounds. " +
