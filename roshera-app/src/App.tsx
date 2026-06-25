@@ -110,7 +110,7 @@ export function App() {
                   feature tree ("features"). Only the header carries its
                   own outline, so the chip stays as an anchor even when
                   the tree is hidden. */}
-              <div className="absolute top-2 left-2 z-10 w-56 max-h-[calc(100%-1rem)] flex flex-col overflow-hidden">
+              <div className="absolute top-2 bottom-2 left-2 z-10 w-56 flex flex-col overflow-hidden">
                 <ModelTree
                   expanded={browserOpen}
                   onToggle={() => setBrowserOpen((open) => !open)}
