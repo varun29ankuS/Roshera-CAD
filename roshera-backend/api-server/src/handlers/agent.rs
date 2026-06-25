@@ -2677,3 +2677,291 @@ pub async fn verify_edge_tolerances(
     let samples = q.samples.unwrap_or(64).clamp(2, 4096);
     Ok(Json(model.verify_edge_conformance(edge_id, samples)))
 }
+
+// ───────────────────── spatial primitives (point / ray / region) ────
+//
+// Thin Axum wrappers over the kernel's SDF-verified spatial-query core
+// (`geometry-engine::queries::{field, raycast, region}`). The kernel is the
+// single source of truth — these handlers add only HTTP framing, UUID/id
+// resolution, and read-lock discipline. They never recompute geometry.
+
+/// Request body for `POST /api/agent/parts/{id}/point-query`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PointQueryRequest {
+    /// World-space query point `[x, y, z]`.
+    pub point: [f64; 3],
+}
+
+/// Response for `point_query`: signed distance to the solid (negative inside,
+/// positive outside, ~0 on the boundary), the inside/outside classification,
+/// and the nearest boundary face + the exact point on it.
+#[derive(Debug, Clone, Serialize)]
+pub struct PointQueryResponse {
+    pub solid_id: u32,
+    pub point: Vec3Wire,
+    /// Signed distance: negative inside the material, positive outside.
+    pub signed_distance: f64,
+    /// `true` when the query point lies inside the material.
+    pub inside: bool,
+    /// `inside` / `outside` / `on` — exact ray-parity classification.
+    pub classification: String,
+    /// Nearest boundary face id (recoverable to the B-Rep).
+    pub nearest_face_id: u32,
+    /// Exact closest point on that face.
+    pub nearest_point: Vec3Wire,
+    /// Distance to the nearest boundary point (unsigned).
+    pub distance: f64,
+}
+
+/// `POST /api/agent/parts/{id}/point-query` — exact SDF probe of a single point.
+///
+/// Returns signed distance (negative inside / positive outside), the
+/// inside/outside/on classification, and the nearest boundary face + point. All
+/// values come from the kernel's analytic `signed_distance` / `nearest_on_solid`
+/// (ray-parity sign, analytic nearest magnitude) — never a tessellation lookup.
+/// Read lock only; `404` on unknown id or a degenerate solid with no reachable
+/// boundary face.
+pub async fn point_query(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(req): Json<PointQueryRequest>,
+) -> Result<Json<PointQueryResponse>, StatusCode> {
+    use geometry_engine::math::{Point3, Tolerance};
+    use geometry_engine::queries::{classify_point, nearest_on_solid, signed_distance, PointClass};
+
+    let sid = id as SolidId;
+    let p = Point3::new(req.point[0], req.point[1], req.point[2]);
+
+    let model = model_handle.read().await;
+    if model.solids.get(sid).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // Nearest boundary point + face (the recoverable handle) and the signed
+    // distance share the same analytic nearest; compute both honestly.
+    let (face_id, near_pt, dist) = nearest_on_solid(&model, sid, p).ok_or(StatusCode::NOT_FOUND)?;
+    let (sd, _) = signed_distance(&model, sid, p).ok_or(StatusCode::NOT_FOUND)?;
+    let class = classify_point(&model, sid, p, Tolerance::default().distance());
+    let classification = match class {
+        PointClass::Inside => "inside",
+        PointClass::Outside => "outside",
+        PointClass::On => "on",
+    };
+
+    Ok(Json(PointQueryResponse {
+        solid_id: id,
+        point: Vec3Wire {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+        },
+        signed_distance: sd,
+        inside: sd < 0.0,
+        classification: classification.to_string(),
+        nearest_face_id: face_id,
+        nearest_point: Vec3Wire {
+            x: near_pt.x,
+            y: near_pt.y,
+            z: near_pt.z,
+        },
+        distance: dist,
+    }))
+}
+
+/// Request body for `POST /api/agent/parts/{id}/ray-query`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RayQueryRequest {
+    /// Ray origin `[x, y, z]`.
+    pub origin: [f64; 3],
+    /// Ray direction `[x, y, z]` (need not be unit length).
+    pub direction: [f64; 3],
+}
+
+/// One ordered hit along the ray.
+#[derive(Debug, Clone, Serialize)]
+pub struct RayHitWire {
+    pub face_id: u32,
+    pub point: Vec3Wire,
+    /// Outward-oriented surface normal at the hit.
+    pub normal: Vec3Wire,
+    /// Distance from the origin (ray parameter along the unit direction).
+    pub distance: f64,
+}
+
+/// Response for `ray_query`: every face crossing along the ray, sorted near→far.
+#[derive(Debug, Clone, Serialize)]
+pub struct RayQueryResponse {
+    pub solid_id: u32,
+    pub origin: Vec3Wire,
+    pub direction: Vec3Wire,
+    pub hit_count: usize,
+    pub hits: Vec<RayHitWire>,
+}
+
+/// `POST /api/agent/parts/{id}/ray-query` — analytic ray-cast against the solid.
+///
+/// Returns the ordered list of face crossings (face id, exact world point,
+/// oriented normal, distance) from the kernel's `raycast_all` — exact analytic
+/// surface intersections clipped to each face's real trim loops, never a mesh
+/// approximation. A missing face renders as see-through (no phantom hit). Read
+/// lock only; `404` on unknown id. An empty `hits` list means the ray missed.
+pub async fn ray_query(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(req): Json<RayQueryRequest>,
+) -> Result<Json<RayQueryResponse>, StatusCode> {
+    use geometry_engine::math::{Point3, Vector3};
+    use geometry_engine::queries::raycast_all;
+
+    let sid = id as SolidId;
+    let origin = Point3::new(req.origin[0], req.origin[1], req.origin[2]);
+    let direction = Vector3::new(req.direction[0], req.direction[1], req.direction[2]);
+
+    let model = model_handle.read().await;
+    if model.solids.get(sid).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let hits: Vec<RayHitWire> = raycast_all(&model, sid, origin, direction)
+        .into_iter()
+        .map(|h| RayHitWire {
+            face_id: h.face_id,
+            point: Vec3Wire {
+                x: h.point.x,
+                y: h.point.y,
+                z: h.point.z,
+            },
+            normal: Vec3Wire {
+                x: h.normal.x,
+                y: h.normal.y,
+                z: h.normal.z,
+            },
+            distance: h.distance,
+        })
+        .collect();
+
+    Ok(Json(RayQueryResponse {
+        solid_id: id,
+        origin: Vec3Wire {
+            x: origin.x,
+            y: origin.y,
+            z: origin.z,
+        },
+        direction: Vec3Wire {
+            x: direction.x,
+            y: direction.y,
+            z: direction.z,
+        },
+        hit_count: hits.len(),
+        hits,
+    }))
+}
+
+/// Region shape for `POST /api/agent/region-query`. Exactly one of `box`/
+/// `sphere` describes the query volume.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegionQueryRequest {
+    /// Box region: centre `[x,y,z]` + half-extents `[hx,hy,hz]`.
+    #[serde(default)]
+    pub center: Option<[f64; 3]>,
+    #[serde(default)]
+    pub half_extents: Option<[f64; 3]>,
+    /// Sphere region: centre `[x,y,z]` (reuses `center`) + `radius`.
+    #[serde(default)]
+    pub radius: Option<f64>,
+    /// Restrict to one solid; omit to scan every part in the scene.
+    #[serde(default)]
+    pub part_id: Option<u32>,
+}
+
+/// Per-part intersection result.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegionPartHit {
+    pub solid_id: u32,
+    /// Face ids of this part whose world extent meets the query volume.
+    pub face_ids: Vec<u32>,
+}
+
+/// Response for `region_query`: which parts/faces intersect the region and
+/// whether the region is empty.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegionQueryResponse {
+    /// `box` or `sphere`.
+    pub region: String,
+    /// `true` when no part/face meets the query volume.
+    pub empty: bool,
+    pub parts: Vec<RegionPartHit>,
+}
+
+/// `POST /api/agent/region-query` — "what is in here?". Given an axis-aligned
+/// box (`center` + `half_extents`) OR a sphere (`center` + `radius`), returns
+/// the part/face ids whose sound world extent meets the volume, and whether the
+/// region is empty. Operates over one part (`part_id`) or the whole scene.
+///
+/// Face extents come from the kernel's `faces_in_box` / `faces_in_sphere`
+/// (exact trim-curve envelopes, never the mesh). Read lock only; `400` when the
+/// region is under-specified (neither a complete box nor a sphere).
+pub async fn region_query(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(req): Json<RegionQueryRequest>,
+) -> Result<Json<RegionQueryResponse>, StatusCode> {
+    use geometry_engine::math::Point3;
+    use geometry_engine::queries::{faces_in_box, faces_in_sphere, WorldBox};
+
+    let model = model_handle.read().await;
+
+    // Which solids to scan: one part, or every part in the scene.
+    let ids: Vec<SolidId> = match req.part_id {
+        Some(pid) => {
+            let sid = pid as SolidId;
+            if model.solids.get(sid).is_none() {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            vec![sid]
+        }
+        None => model.solids.iter().map(|(id, _)| id).collect(),
+    };
+
+    // Resolve the query volume. A box needs both centre + half-extents; a sphere
+    // needs centre + radius. Box wins when both are fully specified.
+    let center = req.center;
+    let (region_kind, eval): (&str, Box<dyn Fn(SolidId) -> Vec<u32>>) =
+        match (center, req.half_extents, req.radius) {
+            (Some(c), Some(h), _) => {
+                let bx = WorldBox::from_center_half(
+                    Point3::new(c[0], c[1], c[2]),
+                    Point3::new(h[0].abs(), h[1].abs(), h[2].abs()),
+                );
+                let model_ref = &model;
+                ("box", Box::new(move |sid| faces_in_box(model_ref, sid, bx)))
+            }
+            (Some(c), None, Some(r)) => {
+                let centre = Point3::new(c[0], c[1], c[2]);
+                let radius = r.abs();
+                let model_ref = &model;
+                (
+                    "sphere",
+                    Box::new(move |sid| faces_in_sphere(model_ref, sid, centre, radius)),
+                )
+            }
+            _ => return Err(StatusCode::BAD_REQUEST),
+        };
+
+    let mut parts = Vec::new();
+    for sid in ids {
+        let face_ids = eval(sid);
+        if !face_ids.is_empty() {
+            parts.push(RegionPartHit {
+                solid_id: sid,
+                face_ids,
+            });
+        }
+    }
+
+    Ok(Json(RegionQueryResponse {
+        region: region_kind.to_string(),
+        empty: parts.is_empty(),
+        parts,
+    }))
+}

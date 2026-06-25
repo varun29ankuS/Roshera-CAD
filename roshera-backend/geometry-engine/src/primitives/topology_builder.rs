@@ -2486,16 +2486,24 @@ impl BRepModel {
         use crate::primitives::provenance::ValidityCertificate;
         use crate::primitives::validation::{validate_solid_scoped, ValidationLevel};
         let v = validate_solid_scoped(self, solid_id, self.tolerance, ValidationLevel::Standard);
-        let (watertight, manifold, euler, be, nm) =
+        // `oriented` / `inconsistent_directed_edges` close a LIVE hole: a mesh can
+        // be watertight (no boundary edges) and manifold (no 3+-fan edges) yet
+        // still have two triangles winding the SAME way across a shared edge — a
+        // flipped-normal / non-oriented surface (the `nurbs_loft` "B2a" class).
+        // `manifold_report` already computes the directed-edge consistency; extract
+        // it so `is_sound()` can AND it in.
+        let (watertight, manifold, oriented, euler, be, nm, ide) =
             match crate::harness::watertight::manifold_report(self, solid_id, 0.1, 1e-6) {
                 Some(r) => (
                     r.boundary_edges == 0,
                     r.nonmanifold_edges == 0,
+                    r.oriented,
                     r.euler_characteristic,
                     r.boundary_edges,
                     r.nonmanifold_edges,
+                    r.inconsistent_directed_edges,
                 ),
-                None => (false, false, 0, 0, 0),
+                None => (false, false, false, 0, 0, 0, 0),
             };
         // Self-intersection at a COARSE chord (gross self-overlap is visible at
         // low density; keeps the O(n²) pair scan cheap for this on-demand check).
@@ -2525,6 +2533,8 @@ impl BRepModel {
             brep_valid: v.is_valid,
             watertight,
             manifold,
+            oriented,
+            inconsistent_directed_edges: ide,
             euler_characteristic: euler,
             boundary_edges: be,
             nonmanifold_edges: nm,
@@ -8168,6 +8178,74 @@ mod anchor_tests {
         let after = model.datums.get(derived).expect("derived").transform;
         assert!((after.get(0, 3) - 9.0).abs() < 1e-9);
         assert!((after.get(1, 3) - 5.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod oriented_certificate_gate {
+    //! Gate for guard 0.1 — `oriented` is now ANDed into the live certificate's
+    //! `is_sound()`. A flipped-normal / non-oriented mesh (two triangles winding
+    //! the SAME way across a shared edge — the `nurbs_loft` "B2a" class) is closed
+    //! and manifold, so `watertight`/`manifold` both pass; only `oriented` catches
+    //! it. NON-VACUOUS: a clean box certifies sound with `oriented == true`, and a
+    //! box with one face's orientation flipped certifies UNSOUND with
+    //! `oriented == false`.
+    use super::*;
+    use crate::primitives::face::FaceOrientation;
+
+    fn box_solid(model: &mut BRepModel) -> SolidId {
+        match TopologyBuilder::new(model)
+            .create_box_3d(20.0, 14.0, 10.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_box_certifies_oriented_and_sound() {
+        let mut model = BRepModel::new();
+        let sid = box_solid(&mut model);
+        let cert = model.certify_solid(sid);
+        assert!(
+            cert.oriented,
+            "a clean box's mesh is consistently wound: {cert:?}"
+        );
+        assert_eq!(cert.inconsistent_directed_edges, 0);
+        assert!(cert.is_sound(), "a clean box must certify sound: {cert:?}");
+    }
+
+    #[test]
+    fn flipped_face_breaks_oriented_and_fails_soundness() {
+        let mut model = BRepModel::new();
+        let sid = box_solid(&mut model);
+        // Flip ONE face's orientation: its facets now wind the same way across
+        // every shared edge as the neighbour, so the directed-edge multiset has
+        // repeats — a non-oriented (flipped-normal) mesh that still closes and is
+        // manifold. This is exactly the hole `oriented` closes.
+        let face_id = {
+            let solid = model.solids.get(sid).expect("solid");
+            let shell = model.shells.get(solid.outer_shell).expect("shell");
+            *shell.faces.first().expect("box has faces")
+        };
+        {
+            let face = model.faces.get_mut(face_id).expect("face");
+            face.orientation = face.orientation.flipped();
+        }
+        let cert = model.certify_solid(sid);
+        assert!(
+            !cert.oriented,
+            "a flipped-face mesh must report oriented == false: {cert:?}"
+        );
+        assert!(
+            cert.inconsistent_directed_edges > 0,
+            "the flipped face must produce repeated directed edges: {cert:?}"
+        );
+        assert!(
+            !cert.is_sound(),
+            "the kernel must NOT certify a non-oriented mesh as sound: {cert:?}"
+        );
     }
 }
 
