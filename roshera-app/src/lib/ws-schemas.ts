@@ -198,6 +198,18 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('ObjectDeleted'),
     payload: z.object({ id: z.string() }),
   }),
+  // Live recolour of an existing object's display material. Emitted by
+  // `set_part_color` (`broadcast_object_color`) so the colour registry the
+  // agent-eye render already consumes also reaches the live 3D viewport.
+  // Lightweight — no mesh re-send; just the object UUID and an RGB triple in
+  // 0..=255 (matches the backend `[u8; 3]` serialisation).
+  z.object({
+    type: z.literal('ObjectColor'),
+    payload: z.object({
+      object_id: z.string(),
+      color: tuple3,
+    }),
+  }),
   z.object({
     type: z.literal('SceneSync'),
     payload: z.object({ objects: z.array(cadObjectSchema) }),

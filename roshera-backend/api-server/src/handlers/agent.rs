@@ -1198,6 +1198,13 @@ pub async fn set_part_color(
     Json(c): Json<ColorBody>,
 ) -> Json<serde_json::Value> {
     state.solid_colors.insert(id, [c.r, c.g, c.b]);
+    // Push the colour to the live viewport: resolve the kernel solid id to its
+    // public object UUID and broadcast an `ObjectColor` frame. Registry-only
+    // when there's no UUID mapping (e.g. a solid never surfaced to the scene) —
+    // the colour is still stored for the scene-eye, we just skip the broadcast.
+    if let Some(uuid) = state.get_uuid(id) {
+        crate::broadcast_object_color(&uuid.to_string(), [c.r, c.g, c.b]);
+    }
     Json(serde_json::json!({
         "success": true,
         "part_id": id,

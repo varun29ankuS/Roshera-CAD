@@ -278,6 +278,14 @@ function handleServerMessage(msg: ServerMessage) {
       break
     }
 
+    case 'ObjectColor': {
+      // Backend `set_part_color` recoloured a part; apply it to the live
+      // mesh. `color` is [r,g,b] in 0..=255 — scene-store swaps in a new
+      // material so CADMesh's color-keyed memo recomputes.
+      scene.setObjectColor(msg.payload.object_id, msg.payload.color)
+      break
+    }
+
     case 'SceneSync': {
       // Full scene sync — replace all objects.
       scene.clearScene()

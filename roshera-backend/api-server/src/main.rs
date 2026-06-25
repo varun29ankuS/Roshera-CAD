@@ -6286,6 +6286,27 @@ pub(crate) fn broadcast_object_updated(
     }
 }
 
+/// Publish an `ObjectColor` frame so every connected viewer recolours the
+/// solid in its live 3D viewport. Lightweight (no mesh re-send) — the body
+/// is the existing object UUID plus an RGB triple in 0..=255. The WS bridge
+/// maps this onto the scene-store object's material (see `setObjectColor`),
+/// keeping the live viewport in sync with the colour registry that the
+/// agent-eye render (`/api/agent/scene/orbit`) already consumes. This closes
+/// the "#12" wiring: `set_part_color` now reaches the browser, not just the
+/// render. Frame shape mirrors `ObjectDeleted` (thin `type` + `payload`).
+pub(crate) fn broadcast_object_color(object_id: &str, color: [u8; 3]) {
+    let frame = serde_json::json!({
+        "type": "ObjectColor",
+        "payload": {
+            "object_id": object_id,
+            "color": color,
+        }
+    });
+    if let Ok(text) = serde_json::to_string(&frame) {
+        let _ = GEOMETRY_BROADCASTER.send(text);
+    }
+}
+
 // SSE endpoint for streaming logs
 async fn stream_logs() -> Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
     let mut rx = LOG_BROADCASTER.subscribe();
