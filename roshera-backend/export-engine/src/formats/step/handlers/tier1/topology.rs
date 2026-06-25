@@ -77,7 +77,7 @@ use crate::formats::step::{
     context::{ImportContext, StepCircleGeom, StepLineGeom},
     diagnostics::{Severity, Warning},
     dispatch::{EntityDispatch, EntityHandler, HandlerOutcome, Phase},
-    registry::EntityRegistry,
+    registry::{EntityKind, EntityRegistry},
 };
 
 use super::healing::{check_edge_vertex_snap, check_loop_closure};
@@ -98,6 +98,47 @@ mod names {
     pub const CLOSED_SHELL: &str = "CLOSED_SHELL";
     pub const MANIFOLD_SOLID_BREP: &str = "MANIFOLD_SOLID_BREP";
     pub const VERTEX_POINT: &str = "VERTEX_POINT";
+}
+
+/// If `geom_ref` points to a `SURFACE_CURVE` or `SEAM_CURVE` (an
+/// ISO 10303-42 wrapper that pairs a 3D `curve_3d` with its parameter-space
+/// pcurve(s)), follow it to the underlying 3D curve reference and return that;
+/// otherwise return `geom_ref` unchanged.
+///
+/// `(SURFACE|SEAM)_CURVE('', curve_3d, (pcurves), master)` — field index 1
+/// (after the label) is the 3D curve. Roshera emits these for edges on
+/// non-planar parametric faces to give readers an explicit seam trim; on
+/// re-import the kernel only needs the 3D curve (pcurves carry no topology).
+/// Unbounded recursion is impossible (a curve cannot wrap itself), but we cap
+/// the follow depth defensively.
+fn unwrap_surface_curve(geom_ref: u64, registry: &EntityRegistry) -> u64 {
+    let mut current = geom_ref;
+    for _ in 0..4 {
+        let Some(entry) = registry.get(current) else {
+            return current;
+        };
+        let record = match &entry.kind {
+            EntityKind::Simple(rec) => rec,
+            // A SURFACE_CURVE/SEAM_CURVE is always a simple entity.
+            EntityKind::Complex(_) => return current,
+        };
+        if record.name != "SURFACE_CURVE" && record.name != "SEAM_CURVE" {
+            return current;
+        }
+        let fields = match params::record_fields(&record.parameter, &record.name, current) {
+            Ok(f) => f,
+            Err(_) => return current,
+        };
+        // field[0] = label, field[1] = curve_3d.
+        match fields.get(1) {
+            Some(p) => match params::as_entity_ref(p, &record.name, current, "curve_3d") {
+                Ok(next) => current = next,
+                Err(_) => return current,
+            },
+            None => return current,
+        }
+    }
+    current
 }
 
 // =========================================================================
@@ -177,6 +218,15 @@ impl EntityHandler for EdgeCurveHandler {
                     };
                 }
             };
+        // The `edge_geometry` may be a `SURFACE_CURVE` / `SEAM_CURVE` that
+        // wraps the actual 3D curve together with its parameter-space pcurve(s)
+        // (the form Roshera now exports for edges on parametric faces, and a
+        // standard ISO 10303-42 form other systems emit too). We import the 3D
+        // curve only — pcurves are a trimming hint for downstream readers and
+        // carry no topology the kernel needs. Follow the wrapper's first field
+        // (`curve_3d`) to the underlying geometry.
+        let geom_ref = unwrap_surface_curve(geom_ref, registry);
+
         let same_sense =
             match params::as_bool(&fields[4], names::EDGE_CURVE, instance, "same_sense") {
                 Ok(Some(b)) => b,

@@ -77,6 +77,10 @@ pub struct StepWriter<W: Write> {
     entity_counter: u32,
     /// Application protocol declared in the FILE_SCHEMA header.
     protocol: StepApplicationProtocol,
+    /// Lazily-created shared 2D parametric representation context id, anchoring
+    /// every pcurve `DEFINITIONAL_REPRESENTATION`. `None` until the first
+    /// pcurve is emitted (a model with no parametric faces never creates it).
+    parametric_context_id: Option<StepId>,
 }
 
 impl<W: Write> StepWriter<W> {
@@ -94,6 +98,7 @@ impl<W: Write> StepWriter<W> {
             writer: BufWriter::new(writer),
             entity_counter: 1,
             protocol,
+            parametric_context_id: None,
         }
     }
 
@@ -176,6 +181,21 @@ impl<W: Write> StepWriter<W> {
             "{}=CARTESIAN_POINT('',({}));",
             id,
             format_real_list(&[point[0], point[1], point[2]])
+        )?;
+        Ok(id)
+    }
+
+    /// Write a 2D `CARTESIAN_POINT` (a parameter-space `(u, v)` point) used
+    /// inside the `DEFINITIONAL_REPRESENTATION` of a pcurve. STEP distinguishes
+    /// 2D and 3D points solely by the length of the coordinate list, so a
+    /// two-coordinate `CARTESIAN_POINT` is a valid parameter-space point.
+    fn write_cartesian_point_2d(&mut self, point: &[f64; 2]) -> std::io::Result<StepId> {
+        let id = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=CARTESIAN_POINT('',({}));",
+            id,
+            format_real_list(&[point[0], point[1]])
         )?;
         Ok(id)
     }
@@ -332,7 +352,14 @@ impl<W: Write> StepWriter<W> {
         Ok(id)
     }
 
-    /// Write a B-spline curve with knots
+    /// Write a B-spline curve with knots.
+    ///
+    /// `closed` sets the ISO 10303-42 `closed_curve` flag. A geometrically
+    /// closed curve (start point == end point — e.g. a loft's iso-`v` ring)
+    /// emitted with `closed_curve = .F.` is read by OpenCascade with a
+    /// COLLAPSED zero-length 3D parameter range when its knots are uniform/
+    /// non-clamped, which manufactures degenerate edges and renders the
+    /// adjacent periodic face unorientable. Declaring closure fixes the range.
     pub fn write_b_spline_curve(
         &mut self,
         degree: u32,
@@ -341,7 +368,9 @@ impl<W: Write> StepWriter<W> {
         multiplicities: &[u32],
         rational: bool,
         weights: Option<&[f64]>,
+        closed: bool,
     ) -> std::io::Result<StepId> {
+        let closed_flag = if closed { ".T." } else { ".F." };
         // Write control points
         let mut cp_ids = Vec::new();
         for cp in control_points {
@@ -386,13 +415,14 @@ impl<W: Write> StepWriter<W> {
             let weights_slice =
                 weights.expect("weights.is_some() verified by enclosing `if` guard");
             writeln!(self.writer,
-                "{id}=( BOUNDED_CURVE() B_SPLINE_CURVE({degree},({cps}),.UNSPECIFIED.,.F.,.F.) B_SPLINE_CURVE_WITH_KNOTS(({mults}),({knots}),.UNSPECIFIED.) CURVE() GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(({weights})) REPRESENTATION_ITEM('') );",
+                "{id}=( BOUNDED_CURVE() B_SPLINE_CURVE({degree},({cps}),.UNSPECIFIED.,{closed_flag},.F.) B_SPLINE_CURVE_WITH_KNOTS(({mults}),({knots}),.UNSPECIFIED.) CURVE() GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(({weights})) REPRESENTATION_ITEM('') );",
                 id = id,
                 degree = degree,
                 cps = format_id_list(&cp_ids),
                 mults = format_int_list(multiplicities),
                 knots = format_real_list(&knot_values),
                 weights = format_real_list(weights_slice),
+                closed_flag = closed_flag,
             )?;
         } else {
             // Non-rational B-spline. ISO 10303-42: the entity's FIRST field
@@ -405,10 +435,11 @@ impl<W: Write> StepWriter<W> {
             // lofted/freeform part exports unopenable. The surface writer
             // already carries its `''`; this brings the curve into line.
             writeln!(self.writer,
-                "{}=B_SPLINE_CURVE_WITH_KNOTS('',{},({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);",
+                "{}=B_SPLINE_CURVE_WITH_KNOTS('',{},({}),.UNSPECIFIED.,{},.F.,({}),({}),.UNSPECIFIED.);",
                 id,
                 degree,
                 format_id_list(&cp_ids),
+                closed_flag,
                 format_int_list(multiplicities),
                 format_real_list(&knot_values)
             )?;
@@ -421,10 +452,14 @@ impl<W: Write> StepWriter<W> {
     ///
     /// `_vertex_map` is unused: curve geometry carries its own
     /// coordinates in the snapshot, independent of the vertex topology.
+    /// `closed` flags a geometrically closed B-spline/NURBS curve (a loft's
+    /// iso-`v` ring) so its `closed_curve` flag is set — see
+    /// [`Self::write_b_spline_curve`].
     pub fn write_curve(
         &mut self,
         curve: &crate::formats::ros_snapshot::CurveData,
         _vertex_map: &HashMap<&uuid::Uuid, StepId>,
+        closed: bool,
     ) -> std::io::Result<StepId> {
         use crate::formats::ros_snapshot::CurveData;
 
@@ -491,6 +526,7 @@ impl<W: Write> StepWriter<W> {
                     &multiplicities,
                     false, // Not rational
                     None,  // No weights for regular B-spline
+                    closed,
                 )
             }
             CurveData::Nurbs {
@@ -527,6 +563,7 @@ impl<W: Write> StepWriter<W> {
                     &multiplicities,
                     true, // Rational
                     Some(weights),
+                    closed,
                 )
             }
             CurveData::Arc {
@@ -553,10 +590,19 @@ impl<W: Write> StepWriter<W> {
         }
     }
 
-    /// Write a surface entity
+    /// Write a surface entity.
+    ///
+    /// `closed_u` / `closed_v` set the ISO 10303-42 `u_closed` / `v_closed`
+    /// flags on a B-spline / NURBS surface. A u-periodic lofted lateral
+    /// emitted with `u_closed = .F.` is read by OpenCascade with a degenerate
+    /// seam (its iso-curves collapse to zero-length 3D ranges) → the face is
+    /// unorientable; declaring closure fixes it. The flags are inert for the
+    /// analytic surfaces (plane/cylinder/…), which carry no such field.
     pub fn write_surface(
         &mut self,
         surface: &crate::formats::ros_snapshot::SurfaceData,
+        closed_u: bool,
+        closed_v: bool,
     ) -> std::io::Result<StepId> {
         use crate::formats::ros_snapshot::SurfaceData;
 
@@ -672,6 +718,8 @@ impl<W: Write> StepWriter<W> {
                 knots_u,
                 knots_v,
                 None,
+                closed_u,
+                closed_v,
             ),
             SurfaceData::Nurbs {
                 control_points,
@@ -687,6 +735,8 @@ impl<W: Write> StepWriter<W> {
                 knots_u,
                 knots_v,
                 Some(weights),
+                closed_u,
+                closed_v,
             ),
             SurfaceData::SurfaceOfRevolution {
                 axis_origin,
@@ -701,7 +751,9 @@ impl<W: Write> StepWriter<W> {
                 // trimming face, not the surface entity, so `angle` is not emitted.
                 let empty_map: std::collections::HashMap<&uuid::Uuid, StepId> =
                     std::collections::HashMap::new();
-                let curve_id = self.write_curve(profile, &empty_map)?;
+                // A revolution profile is an OPEN generating curve, never the
+                // closed iso-`v` case, so `closed = false`.
+                let curve_id = self.write_curve(profile, &empty_map, false)?;
                 let axis_id = self.write_axis1_placement(axis_origin, axis_direction)?;
                 let id = self.next_id();
                 writeln!(
@@ -729,7 +781,11 @@ impl<W: Write> StepWriter<W> {
         knots_u: &[f64],
         knots_v: &[f64],
         weights: Option<&[Vec<f64>]>,
+        closed_u: bool,
+        closed_v: bool,
     ) -> std::io::Result<StepId> {
+        let u_closed_flag = if closed_u { ".T." } else { ".F." };
+        let v_closed_flag = if closed_v { ".T." } else { ".F." };
         // Emit the control-point grid as CARTESIAN_POINTs and collect a
         // list-of-lists of their ids in [u][v] order.
         let mut row_id_lists: Vec<String> = Vec::with_capacity(control_points.len());
@@ -785,11 +841,13 @@ impl<W: Write> StepWriter<W> {
                 .collect::<Vec<_>>()
                 .join(",");
             writeln!(self.writer,
-                "{id}=( BOUNDED_SURFACE() B_SPLINE_SURFACE({du},{dv},({cps}),.UNSPECIFIED.,.F.,.F.,.F.) B_SPLINE_SURFACE_WITH_KNOTS(({um}),({vm}),({uk}),({vk}),.UNSPECIFIED.) GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_SURFACE(({weights})) REPRESENTATION_ITEM('') SURFACE() );",
+                "{id}=( BOUNDED_SURFACE() B_SPLINE_SURFACE({du},{dv},({cps}),.UNSPECIFIED.,{uc},{vc},.F.) B_SPLINE_SURFACE_WITH_KNOTS(({um}),({vm}),({uk}),({vk}),.UNSPECIFIED.) GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_SURFACE(({weights})) REPRESENTATION_ITEM('') SURFACE() );",
                 id = id,
                 du = degree_u,
                 dv = degree_v,
                 cps = cp_grid,
+                uc = u_closed_flag,
+                vc = v_closed_flag,
                 um = format_int_list(&u_mults),
                 vm = format_int_list(&v_mults),
                 uk = format_real_list(&u_knots),
@@ -798,11 +856,13 @@ impl<W: Write> StepWriter<W> {
             )?;
         } else {
             writeln!(self.writer,
-                "{id}=B_SPLINE_SURFACE_WITH_KNOTS('',{du},{dv},({cps}),.UNSPECIFIED.,.F.,.F.,.F.,({um}),({vm}),({uk}),({vk}),.UNSPECIFIED.);",
+                "{id}=B_SPLINE_SURFACE_WITH_KNOTS('',{du},{dv},({cps}),.UNSPECIFIED.,{uc},{vc},.F.,({um}),({vm}),({uk}),({vk}),.UNSPECIFIED.);",
                 id = id,
                 du = degree_u,
                 dv = degree_v,
                 cps = cp_grid,
+                uc = u_closed_flag,
+                vc = v_closed_flag,
                 um = format_int_list(&u_mults),
                 vm = format_int_list(&v_mults),
                 uk = format_real_list(&u_knots),
@@ -833,6 +893,159 @@ impl<W: Write> StepWriter<W> {
         Ok(id)
     }
 
+    /// Emit a 2D parameter-space curve and return its id.
+    ///
+    /// BOTH variants are emitted as a degree-1 (polyline) 2D
+    /// `B_SPLINE_CURVE_WITH_KNOTS` — a [`Pcurve2d::Line`] is the two-point
+    /// case. A B-spline is used in preference to a 2D `LINE` because a `LINE`'s
+    /// parameter is the signed distance along its direction vector, so a
+    /// reader must re-derive the trim's start/end parameters from the 3D
+    /// edge — when the 2D length and the 3D arc-length disagree (they always
+    /// do for an iso-curve on a non-uniformly-parameterised surface) the
+    /// reconstructed endpoints blow up. A clamped B-spline carries its own
+    /// `[0, n-1]` domain, so its endpoints are exactly the first/last control
+    /// points regardless of the 3D parameterisation. The curve is a
+    /// geometric-representation-item in the surface's parameter space, ready
+    /// to be wrapped in a `DEFINITIONAL_REPRESENTATION`.
+    fn write_pcurve_2d_geometry(
+        &mut self,
+        curve: &crate::formats::step::pcurve::Pcurve2d,
+    ) -> std::io::Result<StepId> {
+        use crate::formats::step::pcurve::Pcurve2d;
+        let points: Vec<[f64; 2]> = match curve {
+            Pcurve2d::Line { start, end } => vec![[start.x, start.y], [end.x, end.y]],
+            Pcurve2d::Polyline { points } => points.iter().map(|p| [p.x, p.y]).collect(),
+        };
+        self.write_pcurve_polyline_2d(&points)
+    }
+
+    /// Emit an ordered `(u, v)` polyline as a degree-1 clamped
+    /// `B_SPLINE_CURVE_WITH_KNOTS` and return its id.
+    fn write_pcurve_polyline_2d(&mut self, points: &[[f64; 2]]) -> std::io::Result<StepId> {
+        {
+            // Degree-1 clamped B-spline through the (u, v) samples. The
+            // clamped uniform knot vector for n control points at degree 1
+            // is [0, 0, 1, 2, …, n-2, n-1, n-1]; collapsed to distinct
+            // knots that is values 0..=n-1 with end multiplicities 2.
+            let mut cp_ids = Vec::with_capacity(points.len());
+            for p in points {
+                cp_ids.push(self.write_cartesian_point_2d(p)?);
+            }
+            let n = points.len();
+            // Distinct interior knot values 0..=n-1.
+            let distinct: Vec<f64> = (0..n).map(|k| k as f64).collect();
+            // Multiplicities: 2 at each end, 1 interior (degree-1 clamped).
+            let mut mults: Vec<u32> = vec![1; n];
+            if n >= 2 {
+                mults[0] = 2;
+                mults[n - 1] = 2;
+            }
+            let id = self.next_id();
+            writeln!(
+                self.writer,
+                "{}=B_SPLINE_CURVE_WITH_KNOTS('',1,({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.);",
+                id,
+                format_id_list(&cp_ids),
+                format_int_list(&mults),
+                format_real_list(&distinct)
+            )?;
+            Ok(id)
+        }
+    }
+
+    /// Wrap a 2D pcurve geometry in the `DEFINITIONAL_REPRESENTATION` →
+    /// `PCURVE` pair ISO 10303-42 requires, returning the `PCURVE` id. The
+    /// `PCURVE` binds the 2D curve to the 3D `surface_id` whose parameter
+    /// space it lives in.
+    fn write_pcurve(
+        &mut self,
+        surface_id: StepId,
+        curve: &crate::formats::step::pcurve::Pcurve2d,
+    ) -> std::io::Result<StepId> {
+        let geom_2d = self.write_pcurve_2d_geometry(curve)?;
+        let def_rep = self.next_id();
+        // A DEFINITIONAL_REPRESENTATION needs a representation context; reuse
+        // the dedicated 2D parametric context (created lazily, shared).
+        let ctx = self.parametric_context()?;
+        writeln!(
+            self.writer,
+            "{}=DEFINITIONAL_REPRESENTATION('',({}),{});",
+            def_rep, geom_2d, ctx
+        )?;
+        let pcurve_id = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=PCURVE('',{},{});",
+            pcurve_id, surface_id, def_rep
+        )?;
+        Ok(pcurve_id)
+    }
+
+    /// Lazily create (and cache) the 2D `(PARAMETRIC_REPRESENTATION_CONTEXT)
+    /// (REPRESENTATION_CONTEXT)` shared by every `DEFINITIONAL_REPRESENTATION`.
+    /// ISO 10303-42 anchors a pcurve's 2D representation in a parametric
+    /// context distinct from the 3D geometric context.
+    fn parametric_context(&mut self) -> std::io::Result<StepId> {
+        if let Some(id) = self.parametric_context_id {
+            return Ok(id);
+        }
+        let id = self.next_id();
+        writeln!(
+            self.writer,
+            "{}=( GEOMETRIC_REPRESENTATION_CONTEXT(2) PARAMETRIC_REPRESENTATION_CONTEXT() REPRESENTATION_CONTEXT('2D','parameter space') );",
+            id
+        )?;
+        self.parametric_context_id = Some(id);
+        Ok(id)
+    }
+
+    /// Emit a `SURFACE_CURVE`/`SEAM_CURVE` that carries the edge's 3D curve
+    /// together with its parameter-space pcurve(s), returning the id the
+    /// `EDGE_CURVE` should reference as its `edge_geometry`.
+    ///
+    /// - [`EdgePcurves::Surface`] → `SURFACE_CURVE('',<3d>,(PCURVE),.PCURVE_S1.)`
+    /// - [`EdgePcurves::Seam`] → `SEAM_CURVE('',<3d>,(PCURVE_low,PCURVE_high),.PCURVE_S1.)`
+    ///
+    /// The `.PCURVE_S1.` master representation declares the FIRST associated
+    /// pcurve the master parameterisation — what OCC reads back to trim.
+    fn write_edge_geometry_with_pcurves(
+        &mut self,
+        curve_3d_id: StepId,
+        pcurves: &crate::formats::step::pcurve::EdgePcurves,
+        surface_map: &HashMap<&uuid::Uuid, StepId>,
+    ) -> std::io::Result<Option<StepId>> {
+        use crate::formats::step::pcurve::EdgePcurves;
+        match pcurves {
+            EdgePcurves::Surface(fp) => {
+                let Some(&surface_id) = surface_map.get(&fp.surface_uuid) else {
+                    return Ok(None);
+                };
+                let pcurve_id = self.write_pcurve(surface_id, &fp.curve)?;
+                let id = self.next_id();
+                writeln!(
+                    self.writer,
+                    "{}=SURFACE_CURVE('',{},({}),.PCURVE_S1.);",
+                    id, curve_3d_id, pcurve_id
+                )?;
+                Ok(Some(id))
+            }
+            EdgePcurves::Seam { low, high } => {
+                let Some(&surface_id) = surface_map.get(&low.surface_uuid) else {
+                    return Ok(None);
+                };
+                let pcurve_low = self.write_pcurve(surface_id, &low.curve)?;
+                let pcurve_high = self.write_pcurve(surface_id, &high.curve)?;
+                let id = self.next_id();
+                writeln!(
+                    self.writer,
+                    "{}=SEAM_CURVE('',{},({},{}),.PCURVE_S1.);",
+                    id, curve_3d_id, pcurve_low, pcurve_high
+                )?;
+                Ok(Some(id))
+            }
+        }
+    }
+
     /// Write an `EDGE_CURVE` entity.
     ///
     /// `vertex_point_map` maps each vertex UUID to an already-emitted
@@ -843,10 +1056,13 @@ impl<W: Write> StepWriter<W> {
     /// (line / circle / b-spline) when present.
     fn write_edge_curve(
         &mut self,
+        edge_uuid: &uuid::Uuid,
         edge: &crate::formats::ros_snapshot::EdgeData,
         vertex_point_map: &HashMap<&uuid::Uuid, StepId>,
         vertex_geom_map: &HashMap<&uuid::Uuid, StepId>,
         curve_map: &HashMap<&uuid::Uuid, StepId>,
+        surface_map: &HashMap<&uuid::Uuid, StepId>,
+        pcurve_map: &crate::formats::step::pcurve::PcurveMap,
     ) -> std::io::Result<StepId> {
         let v1_id = vertex_point_map
             .get(&edge.start_vertex)
@@ -865,7 +1081,7 @@ impl<W: Write> StepWriter<W> {
         // straight LINE when there genuinely is no curve to reference
         // (a degenerate snapshot) — never silently when a curved edge's
         // curve simply wasn't emitted.
-        let curve_id = match edge.curve.as_ref().and_then(|c| curve_map.get(c).copied()) {
+        let curve_3d_id = match edge.curve.as_ref().and_then(|c| curve_map.get(c).copied()) {
             Some(id) => id,
             None => {
                 let s = vertex_geom_map.get(&edge.start_vertex).copied();
@@ -882,12 +1098,25 @@ impl<W: Write> StepWriter<W> {
             }
         };
 
+        // If a pcurve was computed for this edge (it bounds a non-planar
+        // parametric face), wrap the 3D curve in a SURFACE_CURVE / SEAM_CURVE
+        // that carries the explicit parameter-space image so a reader trims
+        // the face WITHOUT reprojecting (the seam-ambiguity fix). If the
+        // wrapper cannot be emitted (surface unresolved), fall back to the
+        // bare 3D curve so the edge still resolves.
+        let edge_geometry_id = match pcurve_map.get(edge_uuid) {
+            Some(pcurves) => self
+                .write_edge_geometry_with_pcurves(curve_3d_id, pcurves, surface_map)?
+                .unwrap_or(curve_3d_id),
+            None => curve_3d_id,
+        };
+
         let same_sense = if edge.orientation { ".T." } else { ".F." };
         let id = self.next_id();
         writeln!(
             self.writer,
             "{}=EDGE_CURVE('',{},{},{},{});",
-            id, v1_id, v2_id, curve_id, same_sense
+            id, v1_id, v2_id, edge_geometry_id, same_sense
         )?;
         Ok(id)
     }
@@ -1225,7 +1454,9 @@ impl<W: Write> StepWriter<W> {
         snapshot: &BRepSnapshot,
         context_id: StepId,
         model_name: &str,
+        pcurve_export: &crate::formats::step::pcurve::PcurveExport,
     ) -> std::io::Result<usize> {
+        let pcurve_map = &pcurve_export.pcurves;
         // Vertices: one CARTESIAN_POINT + one VERTEX_POINT each, shared
         // by every edge that references the vertex.
         let mut vertex_geom_map: HashMap<&Uuid, StepId> = HashMap::new();
@@ -1238,25 +1469,42 @@ impl<W: Write> StepWriter<W> {
             vertex_point_map.insert(vid, vp);
         }
 
-        // Curves.
+        // Curves. A closed iso-`v` ring curve (recorded in
+        // `pcurve_export.closed_curves`) is emitted with its `closed_curve`
+        // flag set so a reader reads its full parameter range.
         let mut curve_map: HashMap<&Uuid, StepId> = HashMap::new();
         for (cid, curve) in &snapshot.curves {
-            let step_id = self.write_curve(curve, &vertex_geom_map)?;
+            let closed = pcurve_export.closed_curves.contains(cid);
+            let step_id = self.write_curve(curve, &vertex_geom_map, closed)?;
             curve_map.insert(cid, step_id);
         }
 
-        // Surfaces.
+        // Surfaces. A periodic lateral (recorded in
+        // `pcurve_export.periodic_u_surfaces` / `_v_surfaces`) is emitted with
+        // its `u_closed` / `v_closed` flag set so the seam reads correctly.
         let mut surface_map: HashMap<&Uuid, StepId> = HashMap::new();
         for (sid, surface) in &snapshot.surfaces {
-            let step_id = self.write_surface(surface)?;
+            let closed_u = pcurve_export.periodic_u_surfaces.contains(sid);
+            let closed_v = pcurve_export.periodic_v_surfaces.contains(sid);
+            let step_id = self.write_surface(surface, closed_u, closed_v)?;
             surface_map.insert(sid, step_id);
         }
 
-        // Edges (EDGE_CURVE).
+        // Edges (EDGE_CURVE). When an edge bounds a non-planar parametric
+        // face the writer wraps its 3D curve in a SURFACE_CURVE/SEAM_CURVE
+        // carrying the explicit pcurve(s) (resolved through `surface_map`), so
+        // a reader trims the face without reprojecting onto the seam.
         let mut edge_map: HashMap<&Uuid, StepId> = HashMap::new();
         for (eid, edge) in &snapshot.edges {
-            let step_id =
-                self.write_edge_curve(edge, &vertex_point_map, &vertex_geom_map, &curve_map)?;
+            let step_id = self.write_edge_curve(
+                eid,
+                edge,
+                &vertex_point_map,
+                &vertex_geom_map,
+                &curve_map,
+                &surface_map,
+                pcurve_map,
+            )?;
             edge_map.insert(eid, step_id);
         }
 
@@ -1469,6 +1717,13 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
     // Convert to snapshot for easier iteration.
     let snapshot = BRepSnapshot::from_model(model);
 
+    // Compute parameter-space curves (pcurves) + periodicity metadata for
+    // every edge bounding a non-planar parametric face FROM THE LIVE MODEL —
+    // the snapshot has flattened away the analytic surfaces and face↔edge
+    // topology this needs. Keyed by the same deterministic UUIDs the snapshot
+    // uses, so the writer resolves each by snapshot id.
+    let pcurve_export = crate::formats::step::pcurve::build_pcurve_export(model);
+
     // One geometric_representation_context shared across every solid.
     let context_id = writer
         .write_geometric_context()
@@ -1483,7 +1738,7 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
         .unwrap_or_else(|| "Roshera Model".to_string());
 
     writer
-        .write_brep_model(&snapshot, context_id, &model_name)
+        .write_brep_model(&snapshot, context_id, &model_name, &pcurve_export)
         .map_err(|e| ExportError::ExportFailed {
             reason: format!("Failed to write B-Rep model: {}", e),
         })?;
@@ -1544,13 +1799,14 @@ pub async fn export_assembly_to_step(
     for (idx, component) in assembly.components().enumerate() {
         if !component.properties.suppressed {
             let snapshot = BRepSnapshot::from_model(&component.part);
+            let pcurve_export = crate::formats::step::pcurve::build_pcurve_export(&component.part);
             let comp_name = snapshot
                 .solids
                 .iter()
                 .find_map(|(_, s)| s.feature_type.clone())
                 .unwrap_or_else(|| format!("{}_component_{}", assembly.name, idx));
             writer
-                .write_brep_model(&snapshot, context_id, &comp_name)
+                .write_brep_model(&snapshot, context_id, &comp_name, &pcurve_export)
                 .map_err(|e| ExportError::ExportFailed {
                     reason: format!("Failed to write assembly component: {}", e),
                 })?;
@@ -1967,7 +2223,7 @@ mod tests {
         let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let mults = vec![3, 3];
         let out = write_into(|w| {
-            w.write_b_spline_curve(2, &cps, &knots, &mults, false, None)?;
+            w.write_b_spline_curve(2, &cps, &knots, &mults, false, None, false)?;
             Ok(())
         });
         assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS"));
@@ -1992,7 +2248,7 @@ mod tests {
         let mults = vec![3, 3];
         let weights = vec![1.0, 0.5, 1.0];
         let out = write_into(|w| {
-            w.write_b_spline_curve(2, &cps, &knots, &mults, true, Some(&weights))?;
+            w.write_b_spline_curve(2, &cps, &knots, &mults, true, Some(&weights), false)?;
             Ok(())
         });
         assert!(out.contains("RATIONAL_B_SPLINE_CURVE"));
@@ -2008,7 +2264,7 @@ mod tests {
         let knots = vec![0.0, 0.0, 1.0, 1.0];
         let mults = vec![2, 2];
         let out = write_into(|w| {
-            w.write_b_spline_curve(1, &cps, &knots, &mults, true, None)?;
+            w.write_b_spline_curve(1, &cps, &knots, &mults, true, None, false)?;
             Ok(())
         });
         assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS"));
@@ -2025,7 +2281,7 @@ mod tests {
                 end: [1.0, 0.0, 0.0],
             };
             let vmap: HashMap<&Uuid, StepId> = HashMap::new();
-            w.write_curve(&curve, &vmap)?;
+            w.write_curve(&curve, &vmap, false)?;
             Ok(())
         });
         assert!(out.contains("LINE"));
@@ -2042,7 +2298,7 @@ mod tests {
                 radius: 5.0,
             };
             let vmap: HashMap<&Uuid, StepId> = HashMap::new();
-            w.write_curve(&curve, &vmap)?;
+            w.write_curve(&curve, &vmap, false)?;
             Ok(())
         });
         assert!(out.contains("CIRCLE"));
@@ -2062,7 +2318,7 @@ mod tests {
                 end_angle: std::f64::consts::PI,
             };
             let vmap: HashMap<&Uuid, StepId> = HashMap::new();
-            w.write_curve(&curve, &vmap)?;
+            w.write_curve(&curve, &vmap, false)?;
             Ok(())
         });
         assert!(out.contains("CIRCLE"));
@@ -2082,7 +2338,7 @@ mod tests {
                 degree: 2,
             };
             let vmap: HashMap<&Uuid, StepId> = HashMap::new();
-            w.write_curve(&curve, &vmap)?;
+            w.write_curve(&curve, &vmap, false)?;
             Ok(())
         });
         assert!(out.contains("B_SPLINE_CURVE_WITH_KNOTS"));
@@ -2099,7 +2355,7 @@ mod tests {
                 degree: 2,
             };
             let vmap: HashMap<&Uuid, StepId> = HashMap::new();
-            w.write_curve(&curve, &vmap)?;
+            w.write_curve(&curve, &vmap, false)?;
             Ok(())
         });
         assert!(out.contains("RATIONAL_B_SPLINE_CURVE"));
@@ -2114,7 +2370,7 @@ mod tests {
                 origin: [0.0, 0.0, 0.0],
                 normal: [0.0, 0.0, 1.0],
             };
-            w.write_surface(&s)?;
+            w.write_surface(&s, false, false)?;
             Ok(())
         });
         assert!(out.contains("AXIS2_PLACEMENT_3D"));
@@ -2129,7 +2385,7 @@ mod tests {
                 axis: [0.0, 0.0, 1.0],
                 radius: 3.0,
             };
-            w.write_surface(&s)?;
+            w.write_surface(&s, false, false)?;
             Ok(())
         });
         assert!(out.contains("CYLINDRICAL_SURFACE"));
@@ -2143,7 +2399,7 @@ mod tests {
                 center: [0.0, 0.0, 0.0],
                 radius: 2.5,
             };
-            w.write_surface(&s)?;
+            w.write_surface(&s, false, false)?;
             Ok(())
         });
         assert!(out.contains("SPHERICAL_SURFACE"));
@@ -2163,7 +2419,7 @@ mod tests {
                 major_radius: 5.0,
                 minor_radius: 1.0,
             };
-            w.write_surface(&s)?;
+            w.write_surface(&s, false, false)?;
             Ok(())
         });
         assert!(out.contains("TOROIDAL_SURFACE"));
@@ -2341,7 +2597,7 @@ mod tests {
         let knots = vec![0.0, 0.0, 1.0, 1.0];
         let mults = vec![2, 2];
         let out = write_into(|w| {
-            w.write_b_spline_curve(1, &cps, &knots, &mults, false, None)?;
+            w.write_b_spline_curve(1, &cps, &knots, &mults, false, None, false)?;
             Ok(())
         });
         // The bug was a missing leading `.` on the trailing UNSPECIFIED
@@ -2361,7 +2617,7 @@ mod tests {
                 axis: [0.0, 0.0, 1.0],
                 half_angle: std::f64::consts::FRAC_PI_4,
             };
-            w.write_surface(&s)?;
+            w.write_surface(&s, false, false)?;
             Ok(())
         });
         assert!(out.contains("CONICAL_SURFACE"));
@@ -2390,7 +2646,7 @@ mod tests {
                 degree_u: 1,
                 degree_v: 1,
             };
-            w.write_surface(&s)?;
+            w.write_surface(&s, false, false)?;
             Ok(())
         });
         assert!(out.contains("B_SPLINE_SURFACE_WITH_KNOTS"), "got: {out}");
@@ -2437,7 +2693,8 @@ mod tests {
 
         let out = write_into(|w| {
             let ctx = w.write_geometric_context()?;
-            w.write_brep_model(&snap, ctx, "hollow_block")?;
+            let empty = crate::formats::step::pcurve::PcurveExport::default();
+            w.write_brep_model(&snap, ctx, "hollow_block", &empty)?;
             Ok(())
         });
         assert!(
