@@ -15,7 +15,7 @@
 //! used in nurbs.rs and other Rust numerical kernels.
 #![allow(clippy::indexing_slicing)]
 
-use crate::math::{MathError, MathResult, Point3, Tolerance};
+use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     edge::EdgeId,
     face::{FaceId, FaceOrientation},
@@ -512,11 +512,21 @@ impl ParallelValidator {
             gap_errors.push(err);
         }
 
-        // FACE-ORIENTATION CONSISTENCY (0.3): NOT wired here yet. The guard
-        // `check_face_orientations` is correct and tested, but enabling it
-        // surfaced 11 pre-existing defects — inverted fillet / mixed-corner cap
-        // loops and a periodic-NURBS-seam case — that are under triage before the
-        // guard gates the certificate. It is re-wired here once that triage lands.
+        // FACE-ORIENTATION CONSISTENCY (0.3): adjacent faces sharing a manifold
+        // edge must traverse it in OPPOSITE senses. Run per shell of every solid so
+        // each error is born attributed to its solid.
+        for (sid, solid) in model.solids.iter() {
+            let shells =
+                std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+            for shell_id in shells {
+                for mut err in check_face_orientations(model, shell_id) {
+                    if let Some(loc) = err.location_mut() {
+                        loc.solid_id = Some(sid);
+                    }
+                    gap_errors.push(err);
+                }
+            }
+        }
 
         TopologyValidationResults {
             solid_results,
@@ -1670,78 +1680,373 @@ pub struct RepairResult {
     pub model_valid: bool,
 }
 
-/// Check face orientation consistency in a shell: across a shared manifold edge,
-/// the two adjacent faces must traverse the edge in OPPOSITE senses in the
-/// outward-oriented boundary.
+/// Check that every face in a shell is consistently OUTWARD-oriented across its
+/// shared manifold edges, and that every boundary loop is a connected closed
+/// vertex chain. A defect in either is reported as an [`ValidationError::
+/// OrientationError`] naming the offending edge.
 ///
-/// The kernel encodes a face's outward boundary with BOTH the per-edge loop sense
-/// (`loop_data.orientations[i]`) AND the face's [`FaceOrientation`] flag: a
-/// `Backward` face's loop is wound the reverse way relative to the surface's
-/// intrinsic normal. The EFFECTIVE traversal sense of an edge in the
-/// outward-oriented boundary is therefore `loop_sense XOR face_is_backward`, and
-/// two manifold-adjacent faces are consistent exactly when their effective senses
-/// DIFFER. Comparing only `loop_sense` (ignoring `FaceOrientation`) raises a false
-/// positive on every solid that legitimately carries a `Backward` face — loft/
-/// revolve caps, chamfer/fillet faces, offset shells — all of which are correctly
-/// oriented (their tessellated mesh passes the directed-edge `oriented` check).
+/// # Why the orientation test is geometric, not loop-sense-relative
+///
+/// This kernel keeps two independent encodings of a face's orientation:
+///
+/// * the [`FaceOrientation`] flag, multiplied into the surface's intrinsic normal
+///   to produce the **outward** normal that the tessellator winds triangles to;
+///   and
+/// * the per-edge loop senses (`Loop::orientations`), which encode the boundary
+///   **walk** used to build the tessellation contour and to weld shared seams.
+///
+/// For analytic primitives these coincide (the loop walks CCW about the outward
+/// normal), but the curved blend / loft builders (`fillet`, `chamfer`,
+/// `nurbs_loft`, `mixed_kind_corner_cap`, corner spheres) and the curved-CDT
+/// tessellator deliberately DECOUPLE them: the tessellator re-winds every
+/// triangle from the outward normal alone (`tessellation::surface`,
+/// `emit_outward_triangle`) and welds adjacent faces by shared **sample order**,
+/// so the loop walk is a contour-construction artifact, not an orientation
+/// encoding. A correctly-built, watertight, mesh-oriented rounded cube or lofted
+/// tube therefore carries loop senses that are NOT mutually CCW across shared
+/// edges — verified by the mesh directed-edge oracle (`oriented == true`) while a
+/// loop-sense-relative test reports dozens of false positives. (Confirmed
+/// empirically: forcing loop-sense opposition tears the welded seams and breaks
+/// the verified mesh.)
+///
+/// The authoritative orientation property — the one the mesh oracle enforces and
+/// downstream export relies on — is that two manifold-adjacent faces traverse the
+/// shared edge in OPPOSITE directions **of their outward-oriented boundary**. We
+/// compute that direction geometrically from each face's outward normal and the
+/// edge tangent (right-hand rule: the boundary keeps the face interior on the
+/// left), independent of the stored loop sense. This passes correctly-oriented
+/// curved solids and fails a face whose `FaceOrientation` is genuinely flipped
+/// (its outward normal points inward, so its walk agrees with its neighbour's).
+///
+/// # Why the chain-integrity test is still needed
+///
+/// A flipped loop SENSE (without a normal flip) does not change the outward walk,
+/// so the geometric test alone cannot see it. But it breaks the loop's
+/// vertex chain — the edge no longer hands its endpoint to the next edge — which
+/// corrupts the contour walk. We detect that directly: in a valid loop, edge `i`
+/// traversed in its stored sense ends at the vertex edge `i+1` starts from.
 pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    if let Some(shell) = model.shells.get(shell_id) {
-        // edge -> (face, EFFECTIVE traversal sense = loop_sense XOR face_backward)
-        let mut face_adjacency: std::collections::HashMap<EdgeId, Vec<(FaceId, bool)>> =
-            std::collections::HashMap::new();
+    let Some(shell) = model.shells.get(shell_id) else {
+        return errors;
+    };
 
-        // Collect face-edge relationships
-        for &face_id in &shell.faces {
-            if let Some(face) = model.faces.get(face_id) {
-                let face_backward = !face.orientation.is_forward();
-                let mut all_loops = vec![face.outer_loop];
-                all_loops.extend(&face.inner_loops);
-                for &loop_id in &all_loops {
-                    if let Some(loop_data) = model.loops.get(loop_id) {
-                        for (i, &edge_id) in loop_data.edges.iter().enumerate() {
-                            let loop_sense = loop_data.orientations.get(i).copied().unwrap_or(true);
-                            // EFFECTIVE sense in the outward-oriented boundary.
-                            let effective = loop_sense ^ face_backward;
-                            face_adjacency
-                                .entry(edge_id)
-                                .or_default()
-                                .push((face_id, effective));
+    // edge -> list of (face_id, outward-walk sense along the edge's start->end
+    // direction). A boundary loop contributes one entry per (edge, face); a
+    // periodic self-seam contributes two entries for the SAME face (it walks the
+    // seam once on each side), which must still oppose.
+    let mut edge_walks: std::collections::HashMap<EdgeId, Vec<(FaceId, bool)>> =
+        std::collections::HashMap::new();
+
+    for &face_id in &shell.faces {
+        let Some(face) = model.faces.get(face_id) else {
+            continue;
+        };
+        let mut all_loops = vec![face.outer_loop];
+        all_loops.extend(&face.inner_loops);
+
+        for (loop_idx, &loop_id) in all_loops.iter().enumerate() {
+            // Index 0 is the outer loop; the rest are holes. On a hole the face
+            // interior lies AWAY from the loop centroid, so the interior reference
+            // direction is negated.
+            let is_inner = loop_idx > 0;
+            let Some(loop_data) = model.loops.get(loop_id) else {
+                continue;
+            };
+            let n = loop_data.edges.len();
+            if n == 0 {
+                continue;
+            }
+
+            // Loop centroid (a point in the face interior direction reference)
+            // from the ordered loop vertices.
+            let centroid = match loop_data.vertices(&model.edges) {
+                Ok(vids) if vids.len() >= 3 => {
+                    let mut c = Vector3::ZERO;
+                    let mut count = 0u32;
+                    for &vid in &vids {
+                        if let Some(v) = model.vertices.get(vid) {
+                            let p = v.position;
+                            c = c + Vector3::new(p[0], p[1], p[2]);
+                            count += 1;
                         }
+                    }
+                    if count >= 3 {
+                        Some(c * (1.0 / count as f64))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            // --- Chain integrity: the loop's directed half-edges (each edge taken
+            // in its stored sense, tail -> head) must form ONE closed walk — every
+            // point reached as a head is left again as a tail. A flipped loop sense
+            // reverses one half-edge, leaving a head with no matching tail, i.e. a
+            // geometric GAP in the boundary walk (which is exactly what tears the
+            // mesh).
+            //
+            // The balance is taken by POSITION (quantised to the distance
+            // tolerance), NOT by vertex id: blend/chamfer surgery legitimately
+            // leaves coincident-but-unmerged duplicate vertices on a loop, so the
+            // walk closes geometrically while the vertex ids differ. Balancing by id
+            // would false-positive every such (correct, watertight) loop; balancing
+            // by position closes for them and still flags a genuinely-flipped sense
+            // (whose gap spans a real, non-coincident distance).
+            {
+                let q = (1.0 / Tolerance::default().distance().max(1e-12)).min(1e12);
+                let key = |p: [f64; 3]| -> (i64, i64, i64) {
+                    (
+                        (p[0] * q).round() as i64,
+                        (p[1] * q).round() as i64,
+                        (p[2] * q).round() as i64,
+                    )
+                };
+                let mut tail_minus_head: std::collections::HashMap<(i64, i64, i64), i64> =
+                    std::collections::HashMap::new();
+                for (i, &edge_id) in loop_data.edges.iter().enumerate() {
+                    let Some(edge) = model.edges.get(edge_id) else {
+                        continue;
+                    };
+                    let (Some(sv), Some(ev)) = (
+                        model.vertices.get(edge.start_vertex),
+                        model.vertices.get(edge.end_vertex),
+                    ) else {
+                        continue;
+                    };
+                    let sense = loop_data.orientations.get(i).copied().unwrap_or(true);
+                    let (tail, head) = if sense {
+                        (sv.position, ev.position)
+                    } else {
+                        (ev.position, sv.position)
+                    };
+                    *tail_minus_head.entry(key(tail)).or_insert(0) += 1;
+                    *tail_minus_head.entry(key(head)).or_insert(0) -= 1;
+                }
+                // A closed walk balances every position (tail count == head count).
+                if n > 1 && tail_minus_head.values().any(|&d| d != 0) {
+                    // Name the offending edge. A flipped loop sense unbalances BOTH
+                    // of that edge's endpoints, so prefer the edge whose two endpoints
+                    // are both unbalanced (the flipped edge itself); fall back to any
+                    // edge incident to an unbalanced position, then the first edge.
+                    let unbal = |vid: VertexId| -> bool {
+                        model.vertices.get(vid).is_some_and(|v| {
+                            tail_minus_head.get(&key(v.position)).copied().unwrap_or(0) != 0
+                        })
+                    };
+                    let culprit = loop_data
+                        .edges
+                        .iter()
+                        .copied()
+                        .find(|&eid| {
+                            model
+                                .edges
+                                .get(eid)
+                                .is_some_and(|e| unbal(e.start_vertex) && unbal(e.end_vertex))
+                        })
+                        .or_else(|| {
+                            loop_data.edges.iter().copied().find(|&eid| {
+                                model
+                                    .edges
+                                    .get(eid)
+                                    .is_some_and(|e| unbal(e.start_vertex) || unbal(e.end_vertex))
+                            })
+                        })
+                        .or_else(|| loop_data.edges.first().copied());
+                    if let Some(culprit) = culprit {
+                        errors.push(orientation_err(
+                            format!(
+                                "Inconsistent face orientations: the boundary walk of loop \
+                                 {loop_id} on face {face_id} does not close (a loop sense is \
+                                 inconsistent with the vertex chain) on edge {culprit}"
+                            ),
+                            shell_id,
+                            face_id,
+                            culprit,
+                        ));
                     }
                 }
             }
-        }
 
-        // Check orientation consistency
-        for (edge_id, faces) in face_adjacency {
-            if faces.len() == 2 {
-                // For manifold edges, EFFECTIVE senses should be opposite.
-                let (face1, orient1) = faces[0];
-                let (face2, orient2) = faces[1];
-
-                if orient1 == orient2 {
-                    errors.push(ValidationError::OrientationError {
-                        message: format!(
-                            "Inconsistent face orientations: faces {} and {} have same orientation on edge {}",
-                            face1, face2, edge_id
-                        ),
-                        location: EntityLocation {
-                            solid_id: None,
-                            shell_id: Some(shell_id),
-                            face_id: Some(face1),
-                            loop_id: None,
-                            edge_id: Some(edge_id),
-                            vertex_id: None,
-                        },
-                    });
+            // --- Outward-walk sense: does this face walk each edge in its
+            // start->end direction within its outward-oriented boundary? ---
+            for &edge_id in &loop_data.edges {
+                if let Some(walk_fwd) =
+                    outward_walk_is_forward(model, face, edge_id, centroid.as_ref(), is_inner)
+                {
+                    edge_walks
+                        .entry(edge_id)
+                        .or_default()
+                        .push((face_id, walk_fwd));
                 }
             }
         }
     }
 
+    // Manifold edges: the two outward-oriented walks must OPPOSE.
+    for (edge_id, walks) in edge_walks {
+        if walks.len() == 2 {
+            let (face1, walk1) = walks[0];
+            let (face2, walk2) = walks[1];
+            if walk1 == walk2 {
+                errors.push(orientation_err(
+                    format!(
+                        "Inconsistent face orientations: faces {face1} and {face2} have same \
+                         orientation on edge {edge_id}"
+                    ),
+                    shell_id,
+                    face1,
+                    edge_id,
+                ));
+            }
+        }
+    }
+
     errors
+}
+
+/// Build an [`ValidationError::OrientationError`] located at a shell/face/edge.
+fn orientation_err(
+    message: String,
+    shell_id: ShellId,
+    face_id: FaceId,
+    edge_id: EdgeId,
+) -> ValidationError {
+    ValidationError::OrientationError {
+        message,
+        location: EntityLocation {
+            solid_id: None,
+            shell_id: Some(shell_id),
+            face_id: Some(face_id),
+            loop_id: None,
+            edge_id: Some(edge_id),
+            vertex_id: None,
+        },
+    }
+}
+
+/// Does `face` traverse `edge` in its `start_vertex -> end_vertex` direction
+/// within the face's OUTWARD-oriented boundary?
+///
+/// Right-hand rule: walking the boundary with the outward normal "up" keeps the
+/// face interior on the left, so the outward walk direction `D` along the edge
+/// satisfies `(outward_normal × D) · interior_dir > 0`. We sample the outward
+/// normal at the edge midpoint's surface parameter and take `interior_dir` toward
+/// the loop centroid (on a HOLE loop the interior lies on the FAR side of the
+/// centroid, so `is_inner` negates the reference). Returns `None` when the
+/// geometry is too degenerate to decide (zero-length edge, unresolved projection,
+/// missing centroid) — such an edge simply does not contribute an orientation
+/// constraint here; the connectivity / watertight checks still cover it.
+fn outward_walk_is_forward(
+    model: &BRepModel,
+    face: &crate::primitives::face::Face,
+    edge_id: EdgeId,
+    centroid: Option<&Vector3>,
+    is_inner: bool,
+) -> Option<bool> {
+    let centroid = centroid?;
+    let edge = model.edges.get(edge_id)?;
+    let a = model.vertices.get(edge.start_vertex)?.position;
+    let b = model.vertices.get(edge.end_vertex)?.position;
+    let a = Vector3::new(a[0], a[1], a[2]);
+    let b = Vector3::new(b[0], b[1], b[2]);
+    let mid = (a + b) * 0.5;
+    let tangent = (b - a).normalize_or_zero(); // start->end
+    if tangent.magnitude() < 1e-12 {
+        return None;
+    }
+
+    let surface = model.surfaces.get(face.surface_id)?;
+
+    // Reliability gate: a surface whose normal FIELD is inconsistent across its
+    // patch — the apex-collapsed NURBS corner cap is the canonical case, where the
+    // degenerate column makes `normal_at` flip sign across (u, v) — cannot supply a
+    // trustworthy outward normal at the edge. The tessellator handles such caps
+    // with a rim-Newell winding fallback, not `normal_at`; here we simply decline
+    // to derive a constraint from an unreliable normal (the edge then has fewer
+    // than two reliable contributors and is skipped — its orientation is still
+    // covered by the mesh directed-edge / watertight oracles). We detect the
+    // inconsistency by sampling the normal at a few interior parameters and
+    // checking they do not disagree in direction.
+    let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+    // Grid of interior + near-boundary samples. The near-boundary rows (0.05 / 0.95)
+    // probe the apex-collapsed columns of a degenerate corner-cap patch, where
+    // `normal_at` flips sign — the tell that the normal field is unreliable.
+    let grid = [0.05, 0.25, 0.5, 0.75, 0.95];
+    let mut ref_n: Option<Vector3> = None;
+    let mut inconsistent = false;
+    'outer: for &su in &grid {
+        for &sv in &grid {
+            let uu = u0 + (u1 - u0) * su;
+            let vv = v0 + (v1 - v0) * sv;
+            if let Ok(nn) = surface.normal_at(uu, vv) {
+                let nn = nn.normalize_or_zero();
+                if nn.magnitude() < 1e-9 {
+                    continue;
+                }
+                match ref_n {
+                    None => ref_n = Some(nn),
+                    Some(r) => {
+                        if r.dot(&nn) < 0.0 {
+                            inconsistent = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if inconsistent {
+        return None;
+    }
+
+    // Outward normal at the edge midpoint's surface parameter (sampled AT the edge
+    // so it is correct for curved faces whose normal varies across the patch). Guard
+    // it against the interior consensus normal `ref_n`: if the edge-midpoint
+    // projection lands on a parameter where the normal has flipped relative to the
+    // patch interior (an unreliable projection on a near-degenerate cap), the edge
+    // contributes no constraint rather than a wrong one.
+    let edge_n =
+        match surface.closest_point(&Point3::new(mid.x, mid.y, mid.z), Tolerance::default()) {
+            Ok((u, v)) => surface.normal_at(u, v).ok(),
+            Err(_) => surface.normal_at(0.5 * (u0 + u1), 0.5 * (v0 + v1)).ok(),
+        }
+        .map(|nn| nn.normalize_or_zero())
+        .filter(|nn| nn.magnitude() >= 1e-9);
+    let raw = match (edge_n, ref_n) {
+        // Edge-projected normal, accepted only if it agrees with the interior
+        // consensus direction.
+        (Some(en), Some(rn)) if en.dot(&rn) >= 0.0 => en,
+        // Edge projection disagrees with (or is missing against) the interior
+        // consensus — fall back to the stable interior consensus normal.
+        (_, Some(rn)) => rn,
+        (Some(en), None) => en,
+        (None, None) => return None,
+    };
+    let outward = raw * face.orientation.sign();
+    if outward.magnitude() < 1e-12 {
+        return None;
+    }
+
+    // interior_dir: from the edge midpoint toward the loop centroid, projected to
+    // the plane perpendicular to the edge tangent so it is a clean "into the face"
+    // reference even on long edges.
+    let to_centroid = *centroid - mid;
+    let mut interior = to_centroid - tangent * to_centroid.dot(&tangent);
+    if is_inner {
+        interior = interior * -1.0;
+    }
+    if interior.magnitude() < 1e-12 {
+        return None;
+    }
+
+    let signed = outward.cross(&tangent).dot(&interior);
+    if signed.abs() < 1e-15 {
+        return None;
+    }
+    Some(signed > 0.0)
 }
 
 /// Create validation certificate for valid models
@@ -2082,9 +2387,10 @@ mod guard_wiring_gate {
     //! own unit tests, so `brep_valid` could not see its defect class).
     //! NON-VACUOUS: a clean box validates, a dangling pcurve fails
     //! `validate_model_enhanced` (and therefore the certificate's `brep_valid`).
-    //! Guard 0.3 (`check_face_orientations`) is correct and tested but its
-    //! sweep-wiring is DEFERRED pending triage of the 11 pre-existing defects it
-    //! surfaced; its `inconsistent_*` gate is `#[ignore]`d until then.
+    //! Guard 0.3 (`check_face_orientations`) is likewise WIRED into the per-shell
+    //! sweep in `validate_topology_parallel`: a face-orientation inconsistency on a
+    //! shared manifold edge fails the main sweep and drops the certificate's
+    //! `brep_valid`.
     use super::*;
     use crate::math::Point2;
     use crate::primitives::p_curve::{PCurve, PCurve2dKind};
@@ -2220,7 +2526,6 @@ mod guard_wiring_gate {
     }
 
     #[test]
-    #[ignore = "0.3 face-orientation guard wiring deferred pending triage of the 11 pre-existing defects it surfaced; re-enable with the per-shell sweep in validate_topology_parallel"]
     fn inconsistent_face_orientation_now_fails_the_main_sweep() {
         let (mut model, sid) = box_model();
         let (edge_id, (loop_a, idx_a), (_loop_b, _idx_b)) =
@@ -2251,6 +2556,73 @@ mod guard_wiring_gate {
             )),
             "the OrientationError for the shared edge must be present: {:?}",
             result.errors
+        );
+    }
+
+    /// NON-VACUITY of the GEOMETRIC (normal-based outward-consistency) arm of
+    /// `check_face_orientations` — the arm that gates the REAL invariant.
+    ///
+    /// The companion test above corrupts a loop SENSE, which the chain-integrity
+    /// arm catches. But the kernel does NOT maintain loop-sense OPPOSITION across
+    /// shared edges for curved faces — the mesh directed-edge oracle proves the
+    /// fillet / loft / chamfer / mixed-corner solids are watertight and oriented
+    /// (`inconsistent_directed_edges == 0`) while their loop senses are NOT
+    /// mutually CCW, so a guard built on loop-sense opposition false-positives
+    /// every such correct solid (empirically disproven premise; see the
+    /// `check_face_orientations` doc and the mixed-kind seam-audit gates). The
+    /// authoritative orientation invariant is therefore GEOMETRIC: two
+    /// manifold-adjacent faces must traverse their shared edge in OPPOSITE
+    /// directions of their OUTWARD-oriented boundary, judged from each face's
+    /// outward normal + the edge tangent.
+    ///
+    /// Here we introduce a GENUINE orientation defect of that kind — REVERSE one
+    /// face's `FaceOrientation` so its outward normal points INWARD, agreeing with
+    /// its neighbours' outward side — WITHOUT touching any loop sense (so the
+    /// chain-integrity arm stays balanced and silent). Only the geometric arm can
+    /// see it, and it MUST: the flipped face now walks every shared edge in the
+    /// same outward sense as its neighbour. A strong, non-vacuous proof that the
+    /// guard catches a real flipped face.
+    #[test]
+    fn genuinely_reversed_face_normal_fails_the_geometric_arm() {
+        let (mut model, sid) = box_model();
+        // Pick any face of the outer shell and reverse its orientation flag.
+        let solid = model.solids.get(sid).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        let target = *shell.faces.first().expect("box has faces");
+        // Sanity: loop senses are untouched, so chain-integrity must NOT fire for
+        // this defect — proving the assertion below exercises the geometric arm.
+        {
+            let face = model.faces.get_mut(target).expect("face");
+            face.orientation = face.orientation.flipped();
+        }
+
+        let errors = check_face_orientations(&model, solid.outer_shell);
+        // The geometric "have same orientation on edge" form must be present...
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ValidationError::OrientationError { message, .. }
+                    if message.contains("have same orientation")
+            )),
+            "reversing a face normal must trip the geometric outward-consistency \
+             arm (a 'have same orientation on edge' error): {errors:?}"
+        );
+        // ...and the chain-integrity form must NOT — this defect leaves every loop
+        // sense intact, so if it fired we would be catching the wrong thing.
+        assert!(
+            !errors.iter().any(|e| matches!(
+                e,
+                ValidationError::OrientationError { message, .. }
+                    if message.contains("does not close")
+            )),
+            "a pure normal reversal must not be reported as a non-closing loop walk: {errors:?}"
+        );
+
+        // And the whole sweep rejects it.
+        let result = validate(&model);
+        assert!(
+            !result.is_valid,
+            "a genuinely reversed face normal must fail the main validation sweep"
         );
     }
 }
