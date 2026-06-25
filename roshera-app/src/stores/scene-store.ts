@@ -624,6 +624,7 @@ interface SceneState {
   // Actions
   addObject: (obj: CADObject) => void
   updateObject: (id: string, patch: Partial<CADObject>) => void
+  setObjectColor: (id: string, rgb: [number, number, number]) => void
   removeObject: (id: string) => void
   clearScene: () => void
 
@@ -1025,6 +1026,31 @@ const sceneCreator: StateCreator<
             ? null
             : state.hoveredSubElement
         return { objects, subElementSelections, hoveredSubElement }
+      }),
+
+    // Recolour a live object from a backend `ObjectColor` broadcast
+    // (`set_part_color` → `broadcast_object_color`). `rgb` is 0..=255 per
+    // channel. CRITICAL: CADMesh's material `useMemo` is keyed on
+    // `object.material`, so a NEW material object must be installed (not a
+    // mutated `color` field) or the mesh never re-renders. We keep the rest
+    // of the material (metalness/roughness/opacity) and swap only `color`,
+    // expressed as the `#rrggbb` hex string the rest of the material path
+    // (`convertMaterial` → `MeshStandardMaterial({ color })`) already uses.
+    setObjectColor: (id, rgb) =>
+      set((state) => {
+        const existing = state.objects.get(id)
+        if (!existing) return state
+        const clamp = (n: number) =>
+          Math.max(0, Math.min(255, Math.round(n)))
+        const hex = `#${rgb
+          .map((c) => clamp(c).toString(16).padStart(2, '0'))
+          .join('')}`
+        const objects = new Map(state.objects)
+        objects.set(id, {
+          ...existing,
+          material: { ...existing.material, color: hex },
+        })
+        return { objects }
       }),
 
     removeObject: (id) =>
