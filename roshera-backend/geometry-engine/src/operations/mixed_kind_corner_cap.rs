@@ -845,6 +845,15 @@ pub(crate) fn filter_pending_corner_errors(
                 if v_adjacent_faces.contains(&fid) && message.starts_with("Boundary edge") {
                     return false;
                 }
+                // CF-β.5.2-A — the same deliberate open boundary also shows up as a
+                // non-closing boundary WALK on the V-adjacent host face (the face-
+                // orientation guard's chain-integrity check): the partial corner
+                // leaves the host loop open at the pending vertex. Drop it on the
+                // V-adjacent neighbourhood exactly as the boundary-edge form above;
+                // every closed-boundary orientation defect still surfaces.
+                if v_adjacent_faces.contains(&fid) && message.contains("does not close") {
+                    return false;
+                }
             }
             true
         })
