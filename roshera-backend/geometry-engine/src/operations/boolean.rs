@@ -13509,6 +13509,35 @@ fn face_with_hole_interior_point(model: &BRepModel, face: &SplitFace) -> Option<
         return None;
     }
 
+    polygon_interior_point_3d(model, face.surface, &outer_3d, &hole_3d)
+}
+
+/// Find a point in the genuine MATERIAL interior of a planar (or planar-tangent)
+/// face given its outer boundary cycle and any hole cycles, all as 3-D points.
+///
+/// The boundary-edge-midpoint centroid that `get_face_interior_point` uses by
+/// default is correct only for a CONVEX outer loop with no hole containing it.
+/// It fails on two common boolean fragments:
+///   * a face-with-hole (annulus): the centroid lands in the void;
+///   * a NON-CONVEX simple fragment (an L-shaped sub-face, the standard product
+///     of a corner-octant box∖box / box∩box overlap): the centroid can land in
+///     the reflex notch, OFF the material — and when that notch corner sits on
+///     the OTHER operand's edge the face spuriously classifies `OnBoundary` and
+///     is dropped (the #34/#80 corner-octant leak).
+///
+/// This routine projects the cycles into the surface tangent plane, then returns
+/// the first candidate that is strictly inside the outer loop and outside every
+/// hole: the outer centroid if material, else an outer-edge midpoint nudged
+/// inward toward the centroid by an increasing fraction.
+fn polygon_interior_point_3d(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    outer_3d: &[Point3],
+    hole_3d: &[Vec<Point3>],
+) -> Option<Point3> {
+    if outer_3d.len() < 3 {
+        return None;
+    }
     // Tangent frame at the outer-vertex centroid (same construction as
     // partition_outer_and_pre_existing_hole_cycles).
     let n = outer_3d.len() as f64;
@@ -13518,7 +13547,7 @@ fn face_with_hole_interior_point(model: &BRepModel, face: &SplitFace) -> Option<
         });
         Point3::new(s.x / n, s.y / n, s.z / n)
     };
-    let surface = model.surfaces.get(face.surface)?;
+    let surface = model.surfaces.get(surface_id)?;
     let tol = Tolerance::default();
     let (u0, v0) = surface.closest_point(&anchor, tol).ok()?;
     let sp = surface.evaluate_full(u0, v0).ok()?;
@@ -13549,20 +13578,78 @@ fn face_with_hole_interior_point(model: &BRepModel, face: &SplitFace) -> Option<
             && holes_2d.iter().all(|h| !point_in_polygon_2d(u, v, h))
     };
 
-    // Candidate 1: the outer centroid (correct for any face whose hole
-    // does not contain the centroid).
+    // Minimum perpendicular distance from (u,v) to any segment of `poly`.
+    // Used to reject a candidate that is technically "inside" by ray-cast but
+    // sits ON a boundary edge or vertex — the signature of the reflex-notch
+    // centroid that motivated this routine. A genuine interior sample clears
+    // every edge by a positive margin.
+    let dist_to_polygon = |u: f64, v: f64, poly: &[(f64, f64)]| -> f64 {
+        let mut best = f64::INFINITY;
+        let m = poly.len();
+        for k in 0..m {
+            let (x1, y1) = poly[k];
+            let (x2, y2) = poly[(k + 1) % m];
+            let (dx, dy) = (x2 - x1, y2 - y1);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 {
+                (((u - x1) * dx + (v - y1) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (px, py) = (x1 + t * dx, y1 + t * dy);
+            let d = ((u - px).powi(2) + (v - py).powi(2)).sqrt();
+            if d < best {
+                best = d;
+            }
+        }
+        best
+    };
+    // Clearance an interior sample must keep from every boundary: scale-relative
+    // to the polygon's extent so it is unit-independent, with a small absolute
+    // floor. A convex face's centroid clears its edges by ~half the inradius, far
+    // above this; only the degenerate reflex-vertex centroid is rejected.
+    let extent = {
+        let (mut lo, mut hi) = (
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        );
+        for &(x, y) in &outer_2d {
+            lo.0 = lo.0.min(x);
+            lo.1 = lo.1.min(y);
+            hi.0 = hi.0.max(x);
+            hi.1 = hi.1.max(y);
+        }
+        ((hi.0 - lo.0).max(hi.1 - lo.1)).max(0.0)
+    };
+    let clearance = (extent * 1.0e-3).max(1.0e-9);
+    let strictly_interior = |u: f64, v: f64| -> bool {
+        is_material(u, v)
+            && dist_to_polygon(u, v, &outer_2d) > clearance
+            && holes_2d
+                .iter()
+                .all(|h| dist_to_polygon(u, v, h) > clearance)
+    };
+
+    // Candidate 1: the outer centroid. For a CONVEX outer loop with no
+    // containing hole this is a well-clear interior point (preserving the
+    // historical fast path exactly). For a NON-CONVEX loop the centroid can land
+    // ON the reflex notch vertex — strictly_interior rejects it, so the routine
+    // falls through to the guaranteed-interior edge-midpoint nudges below.
     let (cx, cy) = outer_2d
         .iter()
         .fold((0.0, 0.0), |(ax, ay), &(x, y)| (ax + x, ay + y));
     let centroid_2d = (cx / outer_2d.len() as f64, cy / outer_2d.len() as f64);
-    if is_material(centroid_2d.0, centroid_2d.1) {
+    if strictly_interior(centroid_2d.0, centroid_2d.1) {
         return Some(unproject(centroid_2d.0, centroid_2d.1));
     }
 
     // Candidate 2: each outer-edge midpoint nudged inward toward the
     // centroid by an increasing fraction. The first small nudge lands in
-    // the material band of an annulus.
-    const FRACTIONS: [f64; 6] = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5];
+    // the material band of an annulus or the body of an L-shaped fragment.
+    // We require `strictly_interior` so the returned point clears every edge —
+    // never a boundary/vertex point that would re-introduce a spurious
+    // OnBoundary classification.
+    const FRACTIONS: [f64; 7] = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75];
     for i in 0..outer_2d.len() {
         let (ax, ay) = outer_2d[i];
         let (bx, by) = outer_2d[(i + 1) % outer_2d.len()];
@@ -13571,7 +13658,25 @@ fn face_with_hole_interior_point(model: &BRepModel, face: &SplitFace) -> Option<
         for f in FRACTIONS {
             let u = mx + f * (centroid_2d.0 - mx);
             let v = my + f * (centroid_2d.1 - my);
-            if is_material(u, v) {
+            if strictly_interior(u, v) {
+                return Some(unproject(u, v));
+            }
+        }
+    }
+    // Candidate 3: ear/diagonal midpoints. For a non-convex polygon where no
+    // edge-midpoint→centroid nudge clears (a deep notch), sample the midpoint of
+    // each vertex-to-next-next chord pulled slightly inward. Guarantees a hit on
+    // any simple polygon with positive area.
+    let m = outer_2d.len();
+    for i in 0..m {
+        let (ax, ay) = outer_2d[i];
+        let (bx, by) = outer_2d[(i + 2) % m];
+        let mx = 0.5 * (ax + bx);
+        let my = 0.5 * (ay + by);
+        for f in [0.0f64, 0.05, 0.1, 0.2, 0.35] {
+            let u = mx + f * (centroid_2d.0 - mx);
+            let v = my + f * (centroid_2d.1 - my);
+            if strictly_interior(u, v) {
                 return Some(unproject(u, v));
             }
         }
@@ -13656,6 +13761,28 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
                         v
                     };
                     if let Ok(p) = surface.point_at(u, v_used) {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+        // PLANAR fragment: the boundary-edge-midpoint centroid is a genuine
+        // interior point only for a CONVEX outer loop. A boolean overlap commonly
+        // produces a NON-CONVEX simple fragment (an L-shaped sub-face from a
+        // corner-octant box∖box / box∩box overlap), and an L's midpoint centroid
+        // lands in the reflex notch — OFF the material. When that notch corner
+        // happens to sit on the OTHER operand's edge the fragment spuriously
+        // classifies `OnBoundary` and is dropped (the #34/#80 corner-octant leak:
+        // ∖ leaks open, ∩ goes non-manifold). Detect the off-material centroid via
+        // point-in-polygon and replace it with a guaranteed-interior sample.
+        if let Some(surface) = model.surfaces.get(face.surface) {
+            use crate::primitives::surface::SurfaceType;
+            if matches!(surface.surface_type(), SurfaceType::Plane) {
+                let outer_eids: Vec<EdgeId> = face.boundary_edges.iter().map(|&(e, _)| e).collect();
+                let outer_3d = extract_cycle_vertices_3d(&outer_eids, model);
+                if outer_3d.len() >= 3 {
+                    if let Some(p) = polygon_interior_point_3d(model, face.surface, &outer_3d, &[])
+                    {
                         return Ok(p);
                     }
                 }
