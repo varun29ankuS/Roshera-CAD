@@ -46,10 +46,24 @@ const TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 120000;
 })();
 
+// AMBIENT-PERCEPTION timeout — a SHORT, separate budget for the best-effort
+// perception fetches (`/perception`, the part GET, the X-ray, the render) that
+// run after every mutating op. These are advisory: a slow or wedged perception
+// must NEVER hang the op the agent actually requested. Bounded tight so the op
+// result returns promptly even if the perception layer is slow; on timeout the
+// perception is simply omitted (the op result still stands). Override with
+// ROSHERA_MCP_PERCEPTION_TIMEOUT_MS.
+const PERCEPTION_TIMEOUT_MS = (() => {
+  const raw = process.env.ROSHERA_MCP_PERCEPTION_TIMEOUT_MS;
+  const n = raw !== undefined ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 4000;
+})();
+
 async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   body?: unknown,
+  timeoutMs: number = TIMEOUT_MS,
 ): Promise<any> {
   let res: Response;
   try {
@@ -63,16 +77,17 @@ async function api(
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      // AbortSignal.timeout fires a TimeoutError after TIMEOUT_MS; older
+      // AbortSignal.timeout fires a TimeoutError after the budget; older
       // runtimes surface the abort as AbortError. Either way we map it to a
-      // 504 so the agent gets an actionable message, not a raw stack.
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      // 504 so the agent gets an actionable message, not a raw stack. The
+      // ambient-perception fetches pass the short PERCEPTION_TIMEOUT_MS.
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     const name = (err as { name?: string })?.name;
     if (name === "TimeoutError" || name === "AbortError") {
       throw new ApiError(
-        `${method} ${path} → timed out after ${TIMEOUT_MS}ms (backend may still be computing a heavy op; raise ROSHERA_MCP_TIMEOUT_MS)`,
+        `${method} ${path} → timed out after ${timeoutMs}ms (backend may still be computing a heavy op; raise ROSHERA_MCP_TIMEOUT_MS)`,
         504,
         "",
       );
@@ -89,12 +104,13 @@ async function api(
     );
   }
   const parsed = text.length ? JSON.parse(text) : null;
-  // DOUBLE-CERT ELIMINATION: every mutating geometry endpoint already embeds
-  // the FULL kernel certificate in its own response (certified_response). Stash
-  // it so the following perceive() reuses THIS cert instead of firing a second
-  // GET /perception that re-runs certify_solid (the expensive self-intersection
-  // pass) under the model write lock. We only stash for mutating verbs; GETs
-  // (including /perception itself) never overwrite the stash.
+  // EMBEDDED-PERCEPTION REUSE (no redundant round-trip / no double cert). Every
+  // mutating geometry endpoint already embeds its CHEAP perception verdict
+  // (brep_valid, watertight/open_edges, dims, volume, face_count — and the FULL
+  // `cert` only on the explicit `verify:true` opt-in path). Stash it so the
+  // following perceive() reuses THIS verdict instead of firing a second
+  // GET /perception. We only stash for mutating verbs; GETs (including
+  // /perception itself) never overwrite the stash.
   if (method !== "GET" && parsed && typeof parsed === "object") {
     const embedded = perceptionFromBody(parsed);
     if (embedded !== undefined) {
@@ -110,46 +126,65 @@ async function api(
 // ─── Embedded-perception reuse (no double certification) ───────────────
 
 /**
- * The cert carried by the most recent mutating response. `perceive()` consumes
- * this in preference to re-fetching /perception, so the agent sees the SAME
- * certificate the REST op computed — never a second, redundant re-cert.
+ * The perception verdict carried by the most recent mutating response.
+ * `perceive()` consumes this in preference to re-fetching /perception, so the
+ * agent sees the SAME verdict the REST op computed — never a redundant re-fetch.
  */
 let lastEmbeddedPerception: { id: number | null; perception: any } | null = null;
 
 /**
- * Project a raw mutating response into the exact shape `perceive()` returns,
- * reusing the certificate the endpoint already embedded. The `cert` object lives
- * at `r.cert` on the certified-response path (it may also appear nested at
- * `r.perception.cert` if a handler wrapped it). Returns `undefined` when there
- * is no embedded cert — i.e. the `?fast` opt-out path or a server too old to
- * certify — so the caller falls back to the live /perception fetch.
+ * Project a raw mutating response into the shape `perceive()` returns, reusing
+ * the verdict the endpoint already embedded.
+ *
+ * The DEFAULT (sub-second) op response carries the CHEAP verdict inline
+ * (`sound`/`valid`, `watertight`, `open_edges`, `dims`, `volume`, `face_count`)
+ * and NO `cert`. The explicit `verify:true` opt-in additionally embeds the FULL
+ * `cert`. We build a perception from whichever is present, preferring the full
+ * cert's fields when it is. Returns `undefined` only when the response carries no
+ * usable verdict at all (a server too old to perceive) — then the caller falls
+ * back to the live GET /perception fetch (which is itself cheap by default).
+ *
+ * The expensive certificate dimensions (manifold, self_intersection_free,
+ * tessellation/mesh-quality) are present ONLY when a full `cert` was embedded;
+ * otherwise they are reported `null`, signalling "not computed on the hot path —
+ * call verify_part / ground_truth to certify". They are never fabricated.
  */
 function perceptionFromBody(r: any): any {
   if (!r || typeof r !== "object") return undefined;
   const cert = r.cert ?? r.perception?.cert ?? null;
-  if (!cert) return undefined;
-  const sound = (r.sound ?? r.perception?.sound) === true;
+  const soundRaw = r.sound ?? r.perception?.sound;
+  const validRaw = r.valid ?? r.perception?.valid;
+  // Nothing to reuse — let perceive() fetch /perception.
+  if (cert === null && soundRaw === undefined && validRaw === undefined) {
+    return undefined;
+  }
+  const sound = (soundRaw ?? validRaw) === true;
   return {
     sound,
-    brep_valid: cert.brep_valid ?? r.valid ?? null,
-    watertight: cert.watertight ?? r.watertight ?? null,
-    manifold: cert.manifold ?? null,
-    self_intersection_free: cert.self_intersection_free ?? null,
-    construction_consistent: cert.construction_consistent ?? null,
-    labels_consistent: cert.labels_consistent ?? null,
-    tessellation_clean: cert.tessellation_clean ?? null,
-    mesh_quality_clean: cert.mesh_quality_clean ?? null,
-    euler_characteristic: cert.euler_characteristic ?? null,
-    open_edges: r.open_edges ?? cert.boundary_edges ?? null,
-    nonmanifold_edges: r.nonmanifold_edges ?? cert.nonmanifold_edges ?? null,
-    dims: r.dims ?? null,
-    // Structural counts (face_count / volume) are NOT in the cert; perceive()
-    // fills them from a cheap part GET when missing.
-    face_count: null,
-    volume: null,
-    errors: cert.errors ?? null,
+    brep_valid: cert?.brep_valid ?? validRaw ?? null,
+    watertight: cert?.watertight ?? r.watertight ?? r.perception?.watertight ?? null,
+    // Full-cert-only dimensions: null when no cert was embedded (cheap path) —
+    // explicitly "not certified on the hot path", never a fabricated verdict.
+    manifold: cert?.manifold ?? null,
+    self_intersection_free: cert?.self_intersection_free ?? null,
+    construction_consistent: cert?.construction_consistent ?? null,
+    labels_consistent: cert?.labels_consistent ?? null,
+    tessellation_clean: cert?.tessellation_clean ?? null,
+    mesh_quality_clean: cert?.mesh_quality_clean ?? null,
+    euler_characteristic: cert?.euler_characteristic ?? null,
+    open_edges: r.open_edges ?? r.perception?.open_edges ?? cert?.boundary_edges ?? null,
+    nonmanifold_edges:
+      r.nonmanifold_edges ?? r.perception?.nonmanifold_edges ?? cert?.nonmanifold_edges ?? null,
+    dims: r.dims ?? r.perception?.dims ?? null,
+    // Cheap structural facts the op now returns inline; backfilled by perceive()
+    // from a light part GET only if absent.
+    face_count: r.face_count ?? r.perception?.face_count ?? null,
+    volume: r.volume ?? r.perception?.volume ?? null,
+    errors: cert?.errors ?? null,
     cert: cert ?? undefined,
-    verdict: (r.verdict ?? r.perception?.verdict) ?? (sound ? "SOUND" : "UNSOUND — see cert"),
+    verdict:
+      (r.verdict ?? r.perception?.verdict) ??
+      (sound ? "OK — valid closed solid (cheap verdict; verify_part to certify)" : "UNSOUND — see verify_part"),
   };
 }
 
@@ -241,13 +276,23 @@ async function allEdgeIds(partId: number): Promise<number[]> {
  * STRUCTURE channel: attach the SDF occupancy X-ray (slice-stack of '#'/'.', n=16)
  * to a perception object — reveals internal cavities, wall thickness and through-
  * holes the validity verdict and a shaded render can't show. Sampled from the
- * kernel's EXACT solid, so it can't be fooled by tessellation. Suppressed by
- * ROSHERA_AMBIENT_PERCEPTION=cert. Best-effort: a failure just omits the X-ray.
+ * kernel's EXACT solid, so it can't be fooled by tessellation.
+ *
+ * LATENCY: the X-ray is an n³ SDF sample (n=16 → 4096 exact point-in-solid
+ * tests), too expensive to run after EVERY mutating op. It is therefore OFF the
+ * ambient hot path — `perceive()` no longer calls it. It runs only on the
+ * explicit `occupancy_view` tool, or ambiently when the operator opts in with
+ * `ROSHERA_AMBIENT_PERCEPTION=xray`. Best-effort + short timeout: a slow/failed
+ * X-ray just omits itself; it can never hang the op.
  */
 async function addOccupancyXray(target: Record<string, any>, partId: number): Promise<void> {
-  if (process.env.ROSHERA_AMBIENT_PERCEPTION === "cert") return;
   try {
-    const occ = await api("GET", `/api/agent/parts/${partId}/occupancy?n=16`);
+    const occ = await api(
+      "GET",
+      `/api/agent/parts/${partId}/occupancy?n=16`,
+      undefined,
+      PERCEPTION_TIMEOUT_MS,
+    );
     if (occ?.slices !== undefined) {
       target.occupancy_xray = occ.slices;
       target.fill_fraction = occ.fill_fraction ?? null;
@@ -287,27 +332,46 @@ async function perceive(partId: number | null): Promise<any> {
     ) {
       const p = lastEmbeddedPerception.perception;
       lastEmbeddedPerception = null;
-      // The cert carries no face_count/volume; backfill with ONE light part GET
-      // (read lock, no cert) only when they are missing.
+      // Backfill face_count/volume only when the embedded perception didn't
+      // already carry them (the cheap O(n) verdict now does). ONE light part GET
+      // (read lock, no cert), short timeout — never blocks the op.
       if (p.face_count == null || p.volume == null) {
-        const part = await api("GET", `/api/agent/parts/${partId}`).catch(() => null);
+        const part = await api(
+          "GET",
+          `/api/agent/parts/${partId}`,
+          undefined,
+          PERCEPTION_TIMEOUT_MS,
+        ).catch(() => null);
         if (p.face_count == null) p.face_count = part?.topology?.face_count ?? null;
         if (p.volume == null) p.volume = part?.volume ?? null;
       }
-      await addOccupancyXray(p, partId);
+      if (process.env.ROSHERA_AMBIENT_PERCEPTION === "xray") {
+        await addOccupancyXray(p, partId);
+      }
       return p;
     }
-    // FULL SOUNDNESS channel: /perception (default) runs the kernel's full
-    // certificate. `sound` is the authoritative verdict the kernel cannot fake;
-    // `cert` carries every dimension so the agent sees mesh-quality / inverted-
-    // normal / construction-consistency defects the shallow B-Rep check
-    // (KNOWN_BUGS #65 / EYE-SOUND) could not catch.
-    const p = await api("GET", `/api/agent/parts/${partId}/perception`);
-    const part = await api("GET", `/api/agent/parts/${partId}`).catch(() => null);
+    // FALLBACK CHEAP-VERDICT channel: GET /perception (default) is the CHEAP,
+    // sub-second verdict — B-Rep validity + coarse mesh counts + dims, no O(n²)
+    // certificate. `cert` is absent here (it's the explicit verify_part /
+    // ground_truth path now), so manifold / self-intersection / mesh-quality
+    // report `null` = "not certified on the hot path". Short timeout: a slow
+    // perception is omitted, never blocks the op.
+    const p = await api(
+      "GET",
+      `/api/agent/parts/${partId}/perception`,
+      undefined,
+      PERCEPTION_TIMEOUT_MS,
+    );
+    const part = await api(
+      "GET",
+      `/api/agent/parts/${partId}`,
+      undefined,
+      PERCEPTION_TIMEOUT_MS,
+    ).catch(() => null);
     const cert = p?.cert ?? null;
-    // `sound` is the full verdict when the certificate is present, else the
-    // B-Rep-only flag (a server too old to certify, or the ?fast path).
-    const sound = p?.sound === true;
+    // `sound` is the full verdict when a cert is present (only via ?full), else
+    // the cheap B-Rep validity flag.
+    const sound = (p?.sound ?? p?.valid) === true;
     const brepValid = cert?.brep_valid ?? p?.valid ?? null;
     const watertight = cert?.watertight ?? p?.watertight ?? null;
     const result: Record<string, unknown> = {
@@ -327,11 +391,20 @@ async function perceive(partId: number | null): Promise<any> {
       face_count: part?.topology?.face_count ?? null,
       volume: part?.volume ?? null,
       errors: cert?.errors ?? null,
-      // Full certificate breakdown (worst-face pointers — the optimisation oracle).
+      // Full certificate breakdown present only on the ?full path (worst-face
+      // pointers — the optimisation oracle).
       cert: cert ?? undefined,
-      verdict: p?.verdict ?? (sound ? "SOUND" : "UNSOUND — see cert"),
+      verdict:
+        p?.verdict ??
+        (sound
+          ? "OK — valid closed solid (cheap verdict; verify_part to certify)"
+          : "UNSOUND — see verify_part"),
     };
-    await addOccupancyXray(result, partId);
+    // X-ray is OFF the ambient hot path (n³ SDF) — opt in with
+    // ROSHERA_AMBIENT_PERCEPTION=xray, or use the explicit occupancy_view tool.
+    if (process.env.ROSHERA_AMBIENT_PERCEPTION === "xray") {
+      await addOccupancyXray(result, partId);
+    }
     return result;
   } catch {
     return undefined;
@@ -653,27 +726,34 @@ server.tool(
 
 server.tool(
   "verify_part",
-  "SELF-CHECK a part's geometry. The verdict is the SOUND, mesh-independent " +
-    "B-Rep check (validate_solid_scoped via /perception): brep_valid is the " +
-    "authoritative 'is this a real closed solid' answer. The display mesh's " +
-    "open/non-manifold edge counts are reported separately as DISPLAY quality " +
-    "— a valid B-Rep can still tessellate with T-junctions (KNOWN_BUGS #65), " +
-    "which is a rendering artifact, NOT a broken solid. ALWAYS call this after " +
-    "a boolean or multi-feature build. Returns the iso diagnostic image so you " +
-    "can SEE where any real (red=open / magenta=non-manifold) defect is.",
+  "SELF-CHECK a part's geometry — the EXPLICIT FULL CERTIFICATE (the expensive " +
+    "checks the sub-second ambient verdict deliberately skips). Runs the kernel's " +
+    "complete certificate (`?full=1`): brep_valid + watertight + manifold + " +
+    "self-intersection-free + construction-consistency + tessellation- and " +
+    "mesh-quality — the authoritative, non-fakeable 'is this a real, closed, " +
+    "non-self-overlapping solid' answer. Display-mesh open/non-manifold edge " +
+    "counts are reported separately as render quality (a valid B-Rep can still " +
+    "tessellate with T-junctions — KNOWN_BUGS #65 — which is not a defect). " +
+    "ALWAYS call this after a boolean or multi-feature build. Returns the iso " +
+    "diagnostic image so you can SEE where any real (red=open / magenta=" +
+    "non-manifold) defect is.",
   {
     part_id: z.number().int().describe("kernel part id from list_parts"),
     view: z.enum(["iso", "front", "top", "right"]).default("iso"),
   },
   async ({ part_id, view }) => {
     try {
-      // Sound verdict from the B-Rep; image + display-mesh counts from the render.
-      const p = await api("GET", `/api/agent/parts/${part_id}/perception`);
+      // EXPLICIT FULL CERT: ?full=1 runs the complete (O(n²)) certificate. This
+      // is the verify path, so the full budget (TIMEOUT_MS) applies — we WANT the
+      // expensive checks here. Image + display-mesh counts from the render.
+      const p = await api("GET", `/api/agent/parts/${part_id}/perception?full=1`);
       const r = await api(
         "GET",
         `/api/agent/parts/${part_id}/render?mode=diagnostic&view=${view}&size=720`,
       );
-      const valid = p.valid === true;
+      const cert = p?.cert ?? null;
+      const valid = (cert?.brep_valid ?? p.valid) === true;
+      const sound = p?.sound === true;
       const meshClean = r.open_edges === 0 && r.nonmanifold_edges === 0;
       return {
         content: [
@@ -682,19 +762,27 @@ server.tool(
             text: JSON.stringify(
               {
                 part_id,
+                sound,
                 brep_valid: valid,
-                brep_watertight: p.watertight === true,
-                verdict: !valid
-                  ? "BROKEN — B-Rep invalid (a real topological defect; see the image)"
-                  : meshClean
-                    ? "OK — valid closed solid"
-                    : "OK — valid solid; display mesh has tessellation T-junctions only (not a defect)",
+                brep_watertight: (cert?.watertight ?? p.watertight) === true,
+                manifold: cert?.manifold ?? null,
+                self_intersection_free: cert?.self_intersection_free ?? null,
+                tessellation_clean: cert?.tessellation_clean ?? null,
+                mesh_quality_clean: cert?.mesh_quality_clean ?? null,
+                construction_consistent: cert?.construction_consistent ?? null,
+                verdict: p?.verdict ??
+                  (!valid
+                    ? "BROKEN — B-Rep invalid (a real topological defect; see the image)"
+                    : meshClean
+                      ? "OK — valid closed solid"
+                      : "OK — valid solid; display mesh has tessellation T-junctions only (not a defect)"),
                 display_mesh: {
                   open_edges: r.open_edges,
                   nonmanifold_edges: r.nonmanifold_edges,
                   note: "display tessellation quality only — does NOT determine validity",
                 },
                 dims: p.dims ?? null,
+                cert: cert ?? undefined,
               },
               null,
               2,

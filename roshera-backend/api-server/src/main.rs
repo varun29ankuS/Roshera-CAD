@@ -690,7 +690,7 @@ async fn create_geometry(
     // SOUND (B-Rep) verdict anyway so EVERY mutating op has a uniform contract.
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
     };
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1029,38 +1029,62 @@ pub(crate) fn certificate_json(
 }
 
 /// THE CHOKEPOINT (AMBIENT VERIFICATION). The perception block every mutating
-/// endpoint embeds in its response — upgraded so the kernel can NOT hand back a
-/// solid without its FULL soundness certificate.
+/// endpoint embeds in its response.
 ///
-/// * DEFAULT (`fast == false`): runs the full kernel certificate
-///   `model.certify_solid(solid_id)` (B-Rep validity + watertight/manifold/Euler
-///   + self-intersection + construction-consistency + labels + tessellation- and
-///   mesh-quality). `certify_solid` is internally COARSE/bounded (manifold @ chord
-///   0.1, self-intersection + mesh-quality @ chord 0.5 — never the fine display
-///   density), so the auto-cert stays within a bounded latency budget. The full
-///   verdict is attached as `cert` and the top-level `sound`/`watertight` are
-///   overridden to the FULL verdict so a caller reading just `sound` sees the
-///   authoritative answer.
-/// * OPT-OUT (`fast == true`, via `?fast=1` or a `"fast": true` body flag): only
-///   the lightweight [`perception_json`] (~5ms, B-Rep validity + mesh counts) for
-///   latency-critical callers. Automatic-full is the default; fast is opt-OUT.
+/// LATENCY CONTRACT (the per-op hot path must be sub-second). This runs
+/// SYNCHRONOUSLY, under the model write lock, on EVERY create/loft/boolean/etc.
+/// Therefore the default carries ONLY the CHEAP O(n) verdict — exactly the
+/// fast "is it a valid closed solid" signal:
 ///
-/// Takes `&mut model` because `certify_solid` warms a per-face centroid cache when
-/// re-running the D4 label selectors (the same `&mut` contract the readable query
-/// path uses); the geometry itself is never mutated.
+/// * brep_valid (`validate_solid_scoped`, Standard — the authoritative,
+///   mesh-independent soundness answer),
+/// * watertight / open_edges / nonmanifold_edges (off the mesh already in hand —
+///   no re-tessellation),
+/// * dims (`solid_world_bbox`), volume (`calculate_solid_volume`),
+///   face_count (outer-shell face count), provenance.
+///
+/// The EXPENSIVE work — the O(n²) self-intersection pass and the mesh-quality
+/// scan inside `certify_solid` — is deliberately NOT run here. It would dominate
+/// op latency (minutes on real parts) for a signal the agent only needs on an
+/// explicit check. The FULL certificate is computed on demand, UNCHANGED in
+/// content, by the explicit verify surface: `GET /api/agent/parts/{id}/truth`,
+/// `GET …/perception?full=1`, and the MCP `verify_part` / `ground_truth` tools.
+/// Its correctness is identical; only WHERE it runs moved off the hot path.
+///
+/// * OPT-IN (`full == true`, via a `"verify": true` body flag): additionally
+///   attaches the FULL certificate and elevates `sound`/`watertight`/`verdict`
+///   to the full `is_sound()` answer, for a caller that wants the authoritative
+///   verdict inline and accepts the cost.
+///
+/// Takes `&mut model` because `calculate_solid_volume` warms the per-solid
+/// mass-props cache (and `certify_solid`, on the opt-in path, warms the per-face
+/// centroid cache); the geometry itself is never mutated.
 fn certified_response(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
     solid_id: geometry_engine::primitives::solid::SolidId,
     mesh: &geometry_engine::tessellation::TriangleMesh,
-    fast: bool,
+    full: bool,
 ) -> serde_json::Value {
     let mut base = perception_json(model, solid_id, mesh);
-    if fast {
+
+    // CHEAP structural facts (O(n)): the agent's fast "what is this" signal,
+    // computed without the certificate. `calculate_solid_volume` hits the
+    // per-solid mass-props cache; `face_count` is an outer-shell length read.
+    let volume = model.calculate_solid_volume(solid_id);
+    let face_count = model.solid_outer_face_count(solid_id);
+    if let serde_json::Value::Object(map) = &mut base {
+        map.insert("volume".into(), serde_json::json!(volume));
+        map.insert("face_count".into(), serde_json::json!(face_count));
+    }
+
+    if !full {
         return base;
     }
-    // DEFAULT: attach the FULL certificate and elevate the top-level verdict to
-    // the full `is_sound()` answer so a caller that reads only `sound`/`watertight`
-    // gets the authoritative result, not the shallow B-Rep-only signal.
+
+    // OPT-IN (explicit verify): attach the FULL certificate and elevate the
+    // top-level verdict to the full `is_sound()` answer. Same computation the
+    // /truth endpoint runs — its correctness is unchanged; this is just the
+    // inline-on-request placement.
     let cert = model.certify_solid(solid_id);
     let sound = cert.is_sound();
     if let serde_json::Value::Object(map) = &mut base {
@@ -1077,17 +1101,20 @@ fn certified_response(
     base
 }
 
-/// Read the `fast` opt-out from a JSON request body: `"fast": true` (bool) or
-/// `"fast": 1` (number) → skip the full certificate. Absent / anything else →
-/// `false` (the automatic-full default). Query-param `?fast=1` callers are handled
-/// where the endpoint sees the raw query.
-fn body_fast_flag(payload: &serde_json::Value) -> bool {
-    match payload.get("fast") {
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::Number(n)) => n.as_i64().map(|v| v != 0).unwrap_or(false),
-        Some(serde_json::Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+/// Read the explicit-full-verify opt-in from a JSON request body: `"verify": true`
+/// (bool) / `"verify": 1` (number) / `"verify": "1"` (string) → additionally run
+/// the FULL certificate inline. Absent / anything else → the cheap default
+/// (sub-second hot path; the full cert remains available on the explicit verify
+/// endpoints). The historical `"fast"` flag is still honoured as a NO-OP alias
+/// (the response is already fast by default) so older callers don't error.
+fn body_verify_flag(payload: &serde_json::Value) -> bool {
+    let truthy = |v: &serde_json::Value| match v {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_i64().map(|x| x != 0).unwrap_or(false),
+        serde_json::Value::String(s) => s == "1" || s.eq_ignore_ascii_case("true"),
         _ => false,
-    }
+    };
+    payload.get("verify").map(truthy).unwrap_or(false)
 }
 
 async fn boolean_operation(
@@ -1259,7 +1286,7 @@ async fn boolean_operation(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
 
@@ -1461,7 +1488,7 @@ async fn shell_solid(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
     Ok(Json(serde_json::json!({
@@ -1649,7 +1676,7 @@ async fn mirror_solid(
     // AMBIENT VERIFICATION (outlier closed): mirror previously emitted no verdict.
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
     };
 
     Ok(Json(serde_json::json!({
@@ -2162,7 +2189,7 @@ async fn fillet_edges_endpoint(
 
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
     };
 
     Ok(Json(serde_json::json!({
@@ -2384,7 +2411,7 @@ async fn chamfer_edges_endpoint(
 
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
     };
 
     Ok(Json(serde_json::json!({
@@ -2576,7 +2603,7 @@ async fn transform_geometry_endpoint(
     // certified response as every other mutating op.
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
     };
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3127,7 +3154,7 @@ async fn create_extrude(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
 
@@ -3288,7 +3315,7 @@ async fn create_cylinder_primitive(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
 
@@ -3464,7 +3491,7 @@ async fn create_cone_primitive(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
     Ok(Json(serde_json::json!({
@@ -3696,7 +3723,7 @@ async fn create_revolve_primitive(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
     Ok(Json(serde_json::json!({
@@ -3825,7 +3852,7 @@ async fn import_step_geometry(
 
         let perception = {
             let mut model = model_handle.write().await;
-            certified_response(&mut model, solid_id, &tri_mesh, body_fast_flag(&payload))
+            certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
         };
         objects.push(serde_json::json!({
             "id":         id_str,
@@ -3992,7 +4019,7 @@ async fn create_nurbs_loft_primitive(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
     Ok(Json(serde_json::json!({
@@ -4227,7 +4254,7 @@ async fn extrude_face_endpoint(
             &mut model,
             result_solid_id,
             &tri_mesh,
-            body_fast_flag(&payload),
+            body_verify_flag(&payload),
         )
     };
 
