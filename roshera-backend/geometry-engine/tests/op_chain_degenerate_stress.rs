@@ -1006,6 +1006,137 @@ fn iter3_revolve_axis_touching_profile() {
     };
 }
 
+/// GATE (partial-angle axis-seam regression). A PARTIAL-angle revolve of an
+/// axis-TOUCHING profile (a profile vertex at radius 0) must produce a
+/// watertight + manifold + oriented + sound solid — NOT merely reported. Root
+/// cause (fixed in `create_revolution` + `build_revolution_cap`): the profile
+/// edge running ALONG the axis (both endpoints at radius 0) bounds no wall face,
+/// so for a partial revolution it is the axis SEAM shared by the start and end
+/// caps. The old path built each cap its OWN per-station copy of that axis edge,
+/// leaving each single-use → two boundary (open) edges along the axis and an odd
+/// Euler χ=1, so `brep_valid=false` / `watertight=false` / `is_sound()=false`.
+/// The fix builds ONE shared axis-seam edge both caps reference (opposite face
+/// orientations make its two uses opposite → manifold), closing the degenerate
+/// axis seam. The full 360° path is untouched (it wraps and never caps). This is
+/// a HARD assertion across several partial angles; the same oracles the hunt uses.
+#[test]
+fn gate_partial_revolve_axis_touching_is_watertight() {
+    for (label, angle, segs) in [
+        ("90", std::f64::consts::FRAC_PI_2, 12_u32),
+        ("180", PI, 24),
+        ("270", 3.0 * std::f64::consts::FRAC_PI_2, 36),
+    ] {
+        let mut m = BRepModel::new();
+        let edges = rect_xz(&mut m, 0.0, 4.0, 0.0, 3.0); // x0=0 ⇒ touches the axis
+        let solid = revolve_profile(
+            &mut m,
+            edges,
+            RevolveOptions {
+                angle,
+                segments: segs,
+                cap_ends: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("partial {label}° axis-touching revolve must BUILD: {e:?}"));
+
+        let val = validate_solid_scoped(
+            &mut m,
+            solid,
+            Tolerance::default(),
+            ValidationLevel::Standard,
+        );
+        assert!(
+            val.is_valid,
+            "partial {label}° axis-touching revolve B-Rep invalid: {:?}",
+            val.errors
+        );
+        let mr = manifold_report(&mut m, solid, CHORD, WELD)
+            .unwrap_or_else(|| panic!("partial {label}° axis-touching revolve must tessellate"));
+        assert_eq!(
+            mr.boundary_edges, 0,
+            "partial {label}° axis-touching revolve leaks: {} boundary (open) edges (the axis seam regressed): {mr:?}",
+            mr.boundary_edges
+        );
+        assert_eq!(
+            mr.nonmanifold_edges, 0,
+            "partial {label}° axis-touching revolve non-manifold: {mr:?}"
+        );
+        assert!(
+            mr.oriented,
+            "partial {label}° axis-touching revolve not oriented: {mr:?}"
+        );
+        let cert = m.certify_solid(solid);
+        assert!(
+            cert.is_sound(),
+            "partial {label}° axis-touching revolve certificate not sound (watertight={}): {cert:?}",
+            cert.watertight
+        );
+    }
+}
+
+/// COMPANION GATE: the regressions the fix must NOT introduce. The full 360°
+/// axis-touching revolve (untouched wrap path) AND offset (non-axis-touching)
+/// partial revolves at 90/180/270° must each stay watertight + sound — the
+/// shared-seam closure must only fire for the apex-apex axis edge and must not
+/// disturb ordinary caps.
+#[test]
+fn gate_axis_touching_neighbours_stay_watertight() {
+    // 360° axis-touching (a solid cylinder built from an axis-touching rect).
+    {
+        let mut m = BRepModel::new();
+        let edges = rect_xz(&mut m, 0.0, 4.0, 0.0, 6.0);
+        let solid = revolve_profile(
+            &mut m,
+            edges,
+            RevolveOptions {
+                angle: TAU,
+                segments: 32,
+                cap_ends: true,
+                ..Default::default()
+            },
+        )
+        .expect("full 360 axis-touching revolve must build");
+        let mr = manifold_report(&mut m, solid, CHORD, WELD)
+            .expect("full 360 axis-touching revolve must tessellate");
+        assert_eq!(mr.boundary_edges, 0, "full 360 axis-touching leaks: {mr:?}");
+        assert!(
+            m.certify_solid(solid).is_sound(),
+            "full 360 axis-touching revolve not sound"
+        );
+    }
+    // Offset (non-axis-touching) partial revolves must stay sound.
+    for (label, angle, segs) in [
+        ("90", std::f64::consts::FRAC_PI_2, 12_u32),
+        ("180", PI, 24),
+        ("270", 3.0 * std::f64::consts::FRAC_PI_2, 36),
+    ] {
+        let mut m = BRepModel::new();
+        let edges = rect_xz(&mut m, 2.0, 5.0, 0.0, 3.0); // offset from the axis
+        let solid = revolve_profile(
+            &mut m,
+            edges,
+            RevolveOptions {
+                angle,
+                segments: segs,
+                cap_ends: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("offset partial {label}° revolve must build: {e:?}"));
+        let mr = manifold_report(&mut m, solid, CHORD, WELD)
+            .unwrap_or_else(|| panic!("offset partial {label}° revolve must tessellate"));
+        assert_eq!(
+            mr.boundary_edges, 0,
+            "offset partial {label}° revolve leaks: {mr:?}"
+        );
+        assert!(
+            m.certify_solid(solid).is_sound(),
+            "offset partial {label}° revolve not sound"
+        );
+    }
+}
+
 #[test]
 fn iter3_revolve_full_axis_touching() {
     // Same but full 360° — the classic solid-of-revolution (e.g. a cone/dome).
