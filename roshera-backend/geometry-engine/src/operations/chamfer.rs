@@ -940,12 +940,39 @@ fn create_closed_edge_chamfer(
     let height = h_high - h_low;
 
     // ---------- step 0b: rim sign. ----------
-    // sign = +1 for top rim (cap normal aligned with cylinder axis),
-    //      = -1 for bottom rim (cap normal opposite the cylinder axis).
-    let sign: f64 = if plane.normal.dot(&axis) > 0.0 {
-        1.0
-    } else {
-        -1.0
+    // sign = +1 for the rim at the cylinder's HIGH axial end (h_high),
+    //      = -1 for the rim at the LOW axial end (h_low).
+    //
+    // This must be derived from the rim's actual axial position, NOT from
+    // `plane.normal.dot(&axis)`. A `Plane`'s stored `normal` is the raw
+    // surface normal as constructed and is NOT guaranteed to be the
+    // OUTWARD-oriented normal — face orientation is carried separately by
+    // `FaceOrientation`. In particular `revolve` (and `revolve_meridian`)
+    // stores BOTH the bottom (z = h_low) and the top (z = h_high) annular
+    // cap planes with the SAME +axis normal, so the dot test mis-classifies
+    // the bottom rim as a top rim and pulls the whole chamfer to the wrong
+    // end of the cylinder (cap circle, lateral seam, and cone apex all land
+    // off their host faces → "edge lies off surface" validation failure).
+    //
+    // The rim circle lies in the cap plane; project any rim vertex onto the
+    // cylinder axis to recover its axial height and compare to the two
+    // cylinder ends. Whichever end it coincides with fixes the sign
+    // unambiguously, independent of how the cap surface was constructed.
+    let sign: f64 = {
+        let rim_v = model
+            .edges
+            .get(rim_edge_id)
+            .map(|e| e.start_vertex)
+            .ok_or_else(|| OperationError::InvalidGeometry("Rim edge not found".to_string()))?;
+        let rim_pos = model.vertices.get_position(rim_v).ok_or_else(|| {
+            OperationError::InvalidGeometry("Rim vertex position missing".to_string())
+        })?;
+        let h_rim = (Point3::new(rim_pos[0], rim_pos[1], rim_pos[2]) - origin).dot(&axis);
+        if (h_rim - h_high).abs() <= (h_rim - h_low).abs() {
+            1.0
+        } else {
+            -1.0
+        }
     };
 
     // ---------- step 0c: outer vs bore rim. ----------
