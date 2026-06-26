@@ -440,6 +440,58 @@ fn revolved_flange_outer_rim_closed() {
 }
 
 // ===========================================================================
+// CLASS 8b — BOTTOM outer rim of the same revolved flange. The flange has
+// TWO closed circles at radius 4 (its outer wall spans z = 0 … 0.5): the
+// TOP outer rim at z = 0.5 (CLASS 8) and the BOTTOM outer rim at z = 0.
+// This is the EXACT case the user dogfooded that CLASS 8 did NOT cover.
+//
+// Root cause (real GEOMETRY bug, fixed in `create_closed_edge_chamfer`):
+// the closed-edge rim chamfer derived the rim's top/bottom "sign" from the
+// cap `Plane`'s stored surface normal (`plane.normal.dot(&axis)`). But a
+// `Plane`'s stored normal is NOT the outward-oriented normal — `revolve`
+// stores BOTH the z=0 and z=0.5 annular cap planes with the SAME +Z normal.
+// So the BOTTOM rim was mis-classified as a TOP rim: the cap trim circle
+// landed at z=0.5 (0.5 = disc thickness off the z=0 plane) and the lateral
+// seam circle at z=0.4 (0.1 = chamfer distance off where it belongs) →
+// "edge N lies 5.000e-1 off face 1's Plane / 1.000e-1 off face 2's Cylinder".
+// Fix: derive the sign from the rim's actual axial position relative to the
+// cylinder's two ends, which is construction-independent.
+// ===========================================================================
+#[test]
+fn revolved_flange_bottom_outer_rim_closed() {
+    let mut model = BRepModel::new();
+    let meridian = [
+        (1.0, 0.0),
+        (4.0, 0.0),
+        (4.0, 0.5),
+        (1.8, 0.5),
+        (1.8, 1.5),
+        (1.0, 1.5),
+    ];
+    let flange =
+        revolve_meridian(&mut model, &meridian, RevolveOptions::default()).expect("revolve flange");
+    // BOTTOM outer rim: closed circle at radius 4, z = 0.0 (base of the
+    // outer wall). The TOP outer rim (z = 0.5) is exercised by CLASS 8.
+    let rim = circular_edges(&model, flange).into_iter().find(|&e| {
+        let Some(ed) = model.edges.get(e) else {
+            return false;
+        };
+        if !ed.is_loop() {
+            return false;
+        }
+        let Some(p) = model.vertices.get_position(ed.start_vertex) else {
+            return false;
+        };
+        let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+        (r - 4.0).abs() < 1e-6 && p[2].abs() < 1e-6
+    });
+    let rim = rim.expect("flange BOTTOM outer rim is a closed circle at r=4, z=0");
+    chamfer_edges(&mut model, flange, vec![rim], chamfer_opts(0.1))
+        .expect("flange bottom outer-rim chamfer");
+    assert_world_class(&mut model, flange, "revolved flange BOTTOM outer rim d=0.1");
+}
+
+// ===========================================================================
 // GRACEFUL REFUSAL — co-circular revolve-seam rim arcs (θ ≈ π tangent
 // junction). Chamfer corner-patch setback is genuinely undefined here; the
 // op must REFUSE with a typed error and leave the model UNCHANGED + sound.
