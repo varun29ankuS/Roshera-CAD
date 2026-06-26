@@ -125,8 +125,10 @@ const G = {
     api("/api/geometry", { shape_type: "box", parameters: { width: w, height: h, depth: d } }),
   cyl: (center, axis, radius, height) =>
     api("/api/geometry/cylinder", { center, axis, radius, height }),
-  boolean: (operation, a, b) =>
-    api("/api/geometry/boolean", { operation, solid_a: a, solid_b: b }),
+  // The boolean endpoint takes operand UUIDs (object_a/object_b) and returns the
+  // result solid (uuid + solid_id) embedded like every other mutating endpoint.
+  boolean: (operation, uuidA, uuidB) =>
+    api("/api/geometry/boolean", { operation, object_a: uuidA, object_b: uuidB }),
   revolve: (profile, axis_origin, axis_direction, segments = 48) =>
     api("/api/geometry/revolve", { profile, axis_origin, axis_direction, segments }),
   nurbsLoft: (sections, degree_u = 3, degree_v = 3) =>
@@ -163,7 +165,7 @@ function corpus() {
         ctx.record("box", block);
         const bore = await G.cyl([0, 0, -10], [0, 0, 1], r, 20);
         ctx.record("bore_cyl", bore);
-        const diff = await G.boolean("difference", idOf(block), idOf(bore));
+        const diff = await G.boolean("difference", uuidOf(block), uuidOf(bore));
         ctx.record("difference", diff);
         // Closed hollow (no faces_to_remove) — exercises the offset self-
         // intersection without needing a discovered cap face id.
@@ -185,7 +187,7 @@ function corpus() {
       for (const [cx, cy] of [[-12, -12], [12, -12], [-12, 12], [12, 12]]) {
         const hole = await G.cyl([cx, cy, -5], [0, 0, 1], 3, 10);
         ctx.record("hole_cyl", hole);
-        plate = await G.boolean("difference", idOf(plate), idOf(hole));
+        plate = await G.boolean("difference", uuidOf(plate), uuidOf(hole));
         ctx.record("difference", plate);
       }
     },
@@ -200,11 +202,11 @@ function corpus() {
       ctx.record("block", block);
       const bz = await G.cyl([0, 0, -16], [0, 0, 1], 6, 32);
       ctx.record("bore_z", bz);
-      block = await G.boolean("difference", idOf(block), idOf(bz));
+      block = await G.boolean("difference", uuidOf(block), uuidOf(bz));
       ctx.record("difference_z", block);
       const bx = await G.cyl([-16, 0, 0], [1, 0, 0], 6, 32);
       ctx.record("bore_x", bx);
-      block = await G.boolean("difference", idOf(block), idOf(bx));
+      block = await G.boolean("difference", uuidOf(block), uuidOf(bx));
       ctx.record("difference_x", block);
     },
   });
@@ -242,7 +244,7 @@ function corpus() {
       ctx.record("base", base);
       const post = await G.cyl([0, 0, 3], [0, 0, 1], 5, 14);
       ctx.record("post", post);
-      const u = await G.boolean("union", idOf(base), idOf(post));
+      const u = await G.boolean("union", uuidOf(base), uuidOf(post));
       ctx.record("union", u);
     },
   });
@@ -272,23 +274,44 @@ async function runDesign(design) {
     finding.error = { msg: e.message, http: e.http ?? null, body: e.bodyText ?? null };
   }
 
-  // For any DEFERRED final step, pull the authoritative full cert (off the hot
-  // path) so the ledger records ground truth, not "unknown".
+  // ALWAYS pull the authoritative FULL certificate on the design's final solid
+  // (off the MCP hot path, via ?full=1). The per-op EMBEDDED verdict on a create
+  // endpoint is the CHEAP B-Rep perception — it can report sound:true while the
+  // full cert reports self-intersection / non-watertight false (exactly the
+  // verification gap). So we never trust the embedded sound:true as the design
+  // verdict; the full cert is ground truth.
   const last = finding.steps[finding.steps.length - 1];
-  if (last && (last.sound === null || last.full_soundness === "deferred") && last.solid_id != null) {
+  if (last && last.solid_id != null) {
     const fc = await fullCert(last.solid_id);
     if (fc) {
       last.resolved_full_sound = fc.sound;
+      last.resolved_cert = fc.cert
+        ? {
+            watertight: fc.cert.watertight,
+            self_intersection_free: fc.cert.self_intersection_free,
+            manifold: fc.cert.manifold,
+            brep_valid: fc.cert.brep_valid,
+          }
+        : null;
       if (fc.sound === false && finding.firstDefect == null) {
-        finding.firstDefect = { label: last.label, verdict: fc.verdict, via: "full_cert" };
+        finding.firstDefect = {
+          label: last.label,
+          verdict: fc.verdict,
+          via: "full_cert",
+          cert: last.resolved_cert,
+        };
       }
     }
   }
 
+  // Design verdict: ERROR > UNSOUND (a real defect, from full cert or an op's
+  // embedded sound:false) > DEFERRED (a step over budget, unresolved) > SOUND.
   finding.verdict =
     finding.error ? "ERROR" :
     finding.firstDefect ? "UNSOUND" :
-    finding.steps.some((s) => s.sound === null) ? "DEFERRED" : "SOUND";
+    last && last.resolved_full_sound === false ? "UNSOUND" :
+    finding.steps.some((s) => s.sound === null && s.resolved_full_sound == null) ? "DEFERRED" :
+    "SOUND";
   return finding;
 }
 
