@@ -114,9 +114,16 @@ pub enum DihedralClass {
 
 /// Find every face whose outer or inner loop references `edge_id`.
 ///
-/// Walks all shells of all solids — F2-α is a model-wide pass, not a
-/// per-solid one. The returned vector preserves discovery order so
-/// callers that pick the first two for dihedral computation get
+/// Walks every shell that is REACHABLE from a live solid (each solid's
+/// outer shell + its inner/void shells) — F2-α is a model-wide pass over
+/// the live B-Rep, not a per-solid one. ORPHANED shells (left in the
+/// shell store by a boolean/modify op that produced a fresh result solid
+/// but did not evict the operands' shells) are EXCLUDED: their faces still
+/// reference the shared edge-id space, so scanning them double- or
+/// triple-counts an edge's incident faces and mis-reports a perfectly
+/// manifold edge as `NonManifold` (the spurious-CLIFF root cause for any
+/// part built through booleans). The returned vector preserves discovery
+/// order so callers that pick the first two for dihedral computation get
 /// deterministic results across runs.
 pub fn find_adjacent_faces(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
     let mut faces = Vec::with_capacity(2);
@@ -125,8 +132,23 @@ pub fn find_adjacent_faces(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
     let loops = &model.loops;
     let face_store = &model.faces;
 
+    // Collect the live shell ids (outer + inner) of every solid. Scanning
+    // only these excludes orphaned shells whose faces would corrupt the
+    // manifold-incidence count.
+    let mut live_shells: std::collections::HashSet<crate::primitives::shell::ShellId> =
+        std::collections::HashSet::new();
+    for (_sid, solid) in model.solids.iter() {
+        live_shells.insert(solid.outer_shell);
+        for &inner in &solid.inner_shells {
+            live_shells.insert(inner);
+        }
+    }
+
     for shell_entry in model.shells.iter() {
-        let (_shell_id, shell) = shell_entry;
+        let (shell_id, shell) = shell_entry;
+        if !live_shells.contains(&shell_id) {
+            continue;
+        }
         for &face_id in &shell.faces {
             if visited.contains(&face_id) {
                 continue;
