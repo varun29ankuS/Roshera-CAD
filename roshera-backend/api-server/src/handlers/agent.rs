@@ -2173,21 +2173,27 @@ pub struct PartPerception {
     pub dims: Option<[f64; 3]>,
 }
 
-/// Query for `GET /api/agent/parts/{id}/perception` — the AMBIENT-VERIFICATION
-/// opt-out. `?fast=1` (or `fast=true`) returns ONLY the lightweight perception
-/// (B-Rep validity + mesh counts, ~5ms) for latency-critical callers. Absent /
-/// anything else → the DEFAULT, which additionally runs the FULL kernel
-/// certificate so a caller (notably MCP `perceive()`) sees the full soundness
-/// verdict automatically.
+/// Query for `GET /api/agent/parts/{id}/perception`.
+///
+/// LATENCY CONTRACT: the DEFAULT is the CHEAP O(n) perception (B-Rep validity +
+/// mesh counts + dims, ~5ms). MCP `perceive()` falls back to this on every op, so
+/// it must never run the expensive O(n²) certificate. `?full=1` (or `full=true`)
+/// OPTS IN to the FULL kernel certificate inline — the explicit verify path
+/// (`verify_part`), identical in content to `GET …/truth`. The legacy `?fast=1`
+/// flag is accepted as a NO-OP (the default is already fast).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PerceptionQuery {
     #[serde(default)]
     pub fast: Option<String>,
+    #[serde(default)]
+    pub full: Option<String>,
 }
 
 impl PerceptionQuery {
-    fn is_fast(&self) -> bool {
-        self.fast
+    /// True iff the caller explicitly opted IN to the full certificate via
+    /// `?full=1` / `?full=true`.
+    fn wants_full(&self) -> bool {
+        self.full
             .as_deref()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
@@ -2196,16 +2202,17 @@ impl PerceptionQuery {
 
 /// `GET /api/agent/parts/{id}/perception` — the part's validity verdict.
 ///
-/// DEFAULT (ambient full): the lightweight perception (watertight, valid B-Rep,
-/// L×W×H) PLUS the FULL kernel certificate under `cert` (`sound` =
+/// LATENCY CONTRACT: the DEFAULT is the CHEAP perception (watertight, valid
+/// B-Rep, L×W×H — ~5ms, read lock only). MCP `perceive()` falls back to this on
+/// every op, so the default never runs the expensive O(n²) certificate. `?full=1`
+/// OPTS IN to the FULL kernel certificate under `cert` (`sound` =
 /// `certify_solid().is_sound()`, every dimension: self-intersection, construction-
-/// consistency, labels, tessellation- and mesh-quality). This is the path MCP's
-/// `perceive()` calls on every tool, so the full verdict is surfaced ambiently.
-/// `?fast=1` returns only the lightweight block. `404` on unknown id / empty
-/// tessellation.
+/// consistency, labels, tessellation- and mesh-quality) — the explicit verify
+/// path, identical to `GET …/truth`. `404` on unknown id / empty tessellation.
 ///
-/// Write lock (default path): `certify_solid` warms a per-face centroid cache when
-/// re-running the D4 label selectors; the geometry is never mutated.
+/// Write lock taken only on the `?full=1` path: `certify_solid` warms a per-face
+/// centroid cache when re-running the D4 label selectors; geometry is never
+/// mutated. The default path is read-only.
 pub async fn part_perception(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -2216,22 +2223,23 @@ pub async fn part_perception(
     use geometry_engine::math::Tolerance;
     use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 
-    let fast = q.is_fast();
-    let mut model = model_handle.write().await;
     let sid = id as SolidId;
-    if model.solids.get(sid).is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
-    let valid = validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard)
-        .is_valid;
-    let dims = model.solid_world_bbox(sid).map(|b| {
-        let s = b.size();
-        [s.x, s.y, s.z]
-    });
-    let mesh_watertight = report.boundary_edges == 0 && report.nonmanifold_edges == 0;
 
-    if fast {
+    if !q.wants_full() {
+        // DEFAULT (cheap, read lock): B-Rep validity + coarse mesh counts + dims.
+        let model = model_handle.read().await;
+        if model.solids.get(sid).is_none() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
+        let valid =
+            validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard)
+                .is_valid;
+        let dims = model.solid_world_bbox(sid).map(|b| {
+            let s = b.size();
+            [s.x, s.y, s.z]
+        });
+        let mesh_watertight = report.boundary_edges == 0 && report.nonmanifold_edges == 0;
         let verdict = if !valid {
             "BROKEN — B-Rep invalid (a real topological defect)".to_string()
         } else if mesh_watertight {
@@ -2255,7 +2263,19 @@ pub async fn part_perception(
         ));
     }
 
-    // DEFAULT: attach the FULL certificate and elevate `sound` to the full verdict.
+    // OPT-IN (`?full=1`): the FULL certificate. Write lock — `certify_solid` warms
+    // a per-face centroid cache.
+    let mut model = model_handle.write().await;
+    if model.solids.get(sid).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
+    let valid = validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard)
+        .is_valid;
+    let dims = model.solid_world_bbox(sid).map(|b| {
+        let s = b.size();
+        [s.x, s.y, s.z]
+    });
     let cert = model.certify_solid(sid);
     let sound = cert.is_sound();
     let verdict = if sound {

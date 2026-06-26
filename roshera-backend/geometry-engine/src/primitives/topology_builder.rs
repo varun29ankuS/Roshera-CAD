@@ -3533,6 +3533,16 @@ impl BRepModel {
             .map(|p| p.surface_area)
     }
 
+    /// Number of faces on a solid's outer shell — the cheap O(1) structural
+    /// count surfaced in the ambient (per-op) perception block alongside
+    /// `volume`/`dims`. A single shell-length read, no mass-props or
+    /// certificate work. `None` when the solid (or its shell) is unknown.
+    pub fn solid_outer_face_count(&self, solid_id: u32) -> Option<usize> {
+        let solid = self.solids.get(solid_id)?;
+        let shell = self.shells.get(solid.outer_shell)?;
+        Some(shell.faces.len())
+    }
+
     /// Unified mass-properties entry point. Returns volume, surface
     /// area, centre of mass, inertia tensor, principal moments,
     /// principal axes and radius of gyration in a single
