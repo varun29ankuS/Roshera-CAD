@@ -7935,12 +7935,34 @@ pub(crate) fn weld_mesh_watertight_range(
     // oracle, STL export (triangle soup), BVH — re-welds by position anyway,
     // so nothing downstream depends on the sharp seam being index-welded.
     //
-    // `cos 60°`: a smooth seam's adjacent normals are near-parallel (dot ≈ 1);
-    // a genuine feature edge is ≥ 60° (a box edge is 90°, dot 0; a cap rim is
-    // obtuse, dot < 0). The gate splits the latter and merges the former,
-    // leaving every smooth-seam weld (the watertight curved-primitive path)
-    // bit-for-bit unchanged.
-    const WELD_NORMAL_DOT_MIN: f64 = 0.5;
+    // The gate is set to the SAME cone the G1 smoothing pass below uses, so the
+    // index-weld and the normal-average stay consistent: a coincident pair is
+    // welded into one shared vertex ONLY when that vertex's resulting normal
+    // would also be G1-smoothed (a genuine smooth seam). Two normals at
+    // dihedral θ average to a mean of length cos(θ/2); the G1 pass keeps the
+    // average only when |mean| ≥ `G1_SMOOTHNESS_THRESHOLD` (0.95), i.e.
+    // θ ≤ 2·acos(0.95) ≈ 36.4°, which corresponds to a pairwise dot of
+    // cos(36.4°) ≈ 0.805. Above that the faces meet at a genuine feature edge
+    // (a box edge is 90°/dot 0; a 45° flat chamfer is dot ≈ 0.707; a cap rim is
+    // obtuse/dot < 0) and MUST stay distinct so each face keeps its own shading
+    // normal — otherwise a flat chamfer (a Cone with a straight cross-section)
+    // index-welds into its cap/wall neighbours and the single shared normal
+    // Phong-interpolates a soft gradient across the crease, making the bevel
+    // render ROUNDED like a fillet (the user-reported chamfer-smoothing bug).
+    //
+    // A true smooth seam — a cylinder/sphere/NURBS u- or v-wrap, or two
+    // G1-tangent-continuous faces (fillet ↔ wall) — evaluates to near-identical
+    // normals (dot ≈ 1) on both sides, so it sits far inside this cone and welds
+    // exactly as before; the watertight curved-primitive path is unchanged. The
+    // mesh stays *geometrically* watertight at split creases (the samples are
+    // bit-exact coincident), and every consumer that needs shared-index topology
+    // — the manifold oracle, STL export (triangle soup), BVH — re-welds by
+    // position anyway, so nothing downstream depends on a sharp crease being
+    // index-welded.
+    //
+    // Derived from `G1_SMOOTHNESS_THRESHOLD` so the two gates can never drift:
+    // cos(2·acos(0.95)) = 2·0.95² − 1.
+    const WELD_NORMAL_DOT_MIN: f64 = 2.0 * G1_SMOOTHNESS_THRESHOLD * G1_SMOOTHNESS_THRESHOLD - 1.0;
 
     // remap[i] = canonical index for vertex i, only meaningful for
     // i >= v_start. Earlier vertices are identity-mapped (we don't
