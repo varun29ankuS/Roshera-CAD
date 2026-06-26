@@ -345,10 +345,16 @@ async function onePass(passIdx) {
     console.log(`  [${flag}] ${design.name.padEnd(22)} ${f.steps.length} steps${where}`);
     // Keep only the most recent finding per design, plus first-seen timestamp.
     const prev = ledger.findings[design.name];
+    const changed = prev && prev.verdict !== f.verdict ? `${prev.verdict}→${f.verdict}` : null;
+    if (changed) {
+      // Surface verdict FLIPS on the console (the events worth waking up for):
+      // a regression (SOUND→UNSOUND) or a fix landing (UNSOUND→SOUND).
+      console.log(`  *** VERDICT CHANGED: ${design.name} ${changed} ***`);
+    }
     ledger.findings[design.name] = {
       ...f,
       first_seen: prev?.first_seen ?? f.at,
-      verdict_changed: prev && prev.verdict !== f.verdict ? `${prev.verdict}→${f.verdict}` : null,
+      verdict_changed: changed,
     };
     await sleep(PACE_MS); // pacing: release the write lock so MCP reads interleave
   }
