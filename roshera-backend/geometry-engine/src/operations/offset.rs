@@ -174,6 +174,22 @@ fn offset_solid_body(
         .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?
         .clone();
 
+    // Expand the opening across COPLANAR, EDGE-CONNECTED kept fragments.
+    //
+    // A boolean routinely FRAGMENTS one planar cap into several coplanar faces
+    // (box∪box → three coplanar top pieces, FACE14/15/19). When the caller opens
+    // the cap (removes a fragment), the user intent — and the only watertight
+    // result — is to open the whole coplanar region: a kept coplanar fragment
+    // would otherwise be offset axially to its own floor and CONFLICT at the
+    // shared rim vertex (the same top vertex must be both the wall rim corner at
+    // the cap plane AND a floor corner one thickness below — irreconcilable).
+    // Growing the removal set across coplanar, edge-adjacent fragments turns the
+    // fragmented cap back into one opening whose rim is the region's true
+    // silhouette (the L-prism's reentrant outline), which the rim-corner mitre
+    // below resolves cleanly. A simple unfragmented cap (plain box / loft / plate
+    // top = one face) has no coplanar neighbour, so the set is unchanged.
+    let faces_to_remove = expand_coplanar_opening(model, &solid, faces_to_remove)?;
+
     // Pre-compute the inset position of every original vertex by intersecting
     // the inward-offset planes of the faces meeting there (planar shells only;
     // see `compute_vertex_insets`). Using these shared corner positions in BOTH
@@ -181,7 +197,24 @@ fn offset_solid_body(
     // to the cavity footprint and makes their corners coincide (dedup-merge)
     // instead of self-intersecting. Vertices on any non-planar face are absent
     // from the map and fall back to the per-face normal offset.
-    let vertex_insets = compute_vertex_insets(model, &solid, &faces_to_remove, thickness.abs())?;
+    let mut vertex_insets =
+        compute_vertex_insets(model, &solid, &faces_to_remove, thickness.abs())?;
+
+    // Supplement with rim-corner mitres for removed-face rim vertices that the
+    // plane-intersection solver left out. A boolean can FRAGMENT a planar cap
+    // into coplanar pieces (box∪box → 3 coplanar top faces); a rim vertex
+    // interior to that flat cap (e.g. the L-shape's reentrant corner) is shared
+    // only by coplanar faces, so its inward-offset planes are parallel and the
+    // 3-plane solve is singular → no inset. Without a shared corner there, the
+    // two walls meeting at that vertex inset along their own edge perpendiculars
+    // and DIVERGE (a convex corner one way, a reentrant corner the other),
+    // leaving dangling corner edges. The rim-corner solver intersects the two
+    // adjacent rim edges' inward-offset lines IN the cap plane — the correct
+    // mitre for convex AND reentrant corners alike — and fills only the gaps the
+    // plane solver missed (never overriding a sound 3-plane inset). The same
+    // value feeds the interior offset of any KEPT coplanar fragment sharing that
+    // vertex, so wall and floor weld at one point.
+    compute_rim_corner_insets(model, &faces_to_remove, thickness.abs(), &mut vertex_insets)?;
 
     // Create offset faces for interior. Capture the per-edge map so
     // that walls erected over removed faces can reuse the offset edges
@@ -422,9 +455,36 @@ fn create_offset_loop(
     options: &OffsetOptions,
     shared_offset_edges: &mut HashMap<EdgeId, EdgeId>,
 ) -> OperationResult<(Loop, Vec<(EdgeId, EdgeId)>)> {
+    create_offset_loop_for(
+        model,
+        face,
+        face.outer_loop,
+        distance,
+        vertex_insets,
+        options,
+        shared_offset_edges,
+    )
+}
+
+/// Offset a SPECIFIC loop (outer or any inner/hole loop) of `face`.
+///
+/// Splitting `create_offset_loop` to take an explicit `loop_id` lets the
+/// interior offset of a face with HOLES (a box∖cylinder cap, an annular plate)
+/// carry its inner loops through to the offset face. Without offsetting the
+/// inner loops too, the inset cap loses its bore — leaving the bore wall with
+/// nothing to weld its inner offset rim to (a 4.2-class leak).
+fn create_offset_loop_for(
+    model: &mut BRepModel,
+    face: &Face,
+    loop_id: u32,
+    distance: f64,
+    vertex_insets: &HashMap<VertexId, Point3>,
+    options: &OffsetOptions,
+    shared_offset_edges: &mut HashMap<EdgeId, EdgeId>,
+) -> OperationResult<(Loop, Vec<(EdgeId, EdgeId)>)> {
     let original_loop = model
         .loops
-        .get(face.outer_loop)
+        .get(loop_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
 
@@ -502,25 +562,71 @@ fn create_offset_edge(
 ) -> OperationResult<EdgeId> {
     let tol = options.common.tolerance.distance();
 
-    // Planar-shell fast path: when both endpoints have a pre-computed corner
-    // inset, the offset edge is the straight segment between the two inset
-    // corners (the intersection lines of the inward-offset planes). Using these
-    // shared corners — identical to the ones the wall rims use — is what trims
-    // the inner face to the cavity footprint and lets adjacent inner edges and
-    // walls dedup-merge at the corner. (Falls through to the per-face normal
-    // offset below when either endpoint is on a non-planar face.)
+    // Planar-shell fast path: when at least one endpoint has a pre-computed
+    // corner inset and the edge is a straight Line, the offset edge is the
+    // segment between the two RESOLVED endpoints — each endpoint taken from its
+    // shared corner inset if present, else from the per-face axial normal offset
+    // of that endpoint. Using the shared corners — identical to the ones the wall
+    // rims use — is what trims the inner face to the cavity footprint and lets
+    // adjacent inner edges and walls dedup-merge at the corner.
+    //
+    // Resolving the two endpoints INDEPENDENTLY (rather than all-or-nothing on
+    // both) is essential for a coplanar-FRAGMENTED cap: a seam edge there runs
+    // from a MITERED silhouette corner (inset present) to an INTERIOR seam vertex
+    // (only the parallel coplanar planes meet → no 3-plane inset → axial). The
+    // old both-or-neither rule offset such an edge wholly axially, placing the
+    // mitered endpoint at its un-mitered position on this edge while the adjacent
+    // silhouette edge placed it at the mitre — two positions for one source
+    // vertex, so the interior offset loop did not close (the box∪box bottom
+    // fragments). Per-endpoint resolution gives every edge sharing a vertex the
+    // same position, closing the loop. (Falls through to the curved path below
+    // when the edge is non-linear; a straight edge with NEITHER endpoint inset
+    // also falls through, preserving the legacy per-face offset for plain
+    // unfragmented shells.)
     {
         let edge = model.edges.get(edge_id).ok_or_else(|| {
             OperationError::InvalidGeometry(format!("create_offset_edge: edge {edge_id} not found"))
         })?;
-        let (sv, ev, orient, prange) = (
+        let (sv, ev, orient, prange, curve_id_src) = (
             edge.start_vertex,
             edge.end_vertex,
             edge.orientation,
             edge.param_range,
+            edge.curve_id,
         );
-        if let (Some(&sp), Some(&ep)) = (vertex_insets.get(&sv), vertex_insets.get(&ev)) {
+        let start_inset = vertex_insets.get(&sv).copied();
+        let end_inset = vertex_insets.get(&ev).copied();
+        let edge_is_linear = model
+            .curves
+            .get(curve_id_src)
+            .map(|c| c.is_linear(Tolerance::new(tol, tol)))
+            .unwrap_or(false);
+        if edge_is_linear && (start_inset.is_some() || end_inset.is_some()) {
             use crate::primitives::curve::Line;
+            // Axial fallback for an endpoint without a shared inset: offset its
+            // stored position along the source surface normal by `distance`.
+            let surface = model.surfaces.get(surface_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("create_offset_edge: surface not found".into())
+            })?;
+            let resolve = |vid: VertexId, inset: Option<Point3>| -> OperationResult<Point3> {
+                if let Some(p) = inset {
+                    return Ok(p);
+                }
+                let pos = model.vertices.get(vid).ok_or_else(|| {
+                    OperationError::InvalidGeometry(
+                        "create_offset_edge: endpoint vertex not found".into(),
+                    )
+                })?;
+                let p = pos.point();
+                let nrm = compute_surface_normal_at_point(surface, p)?;
+                Ok(Point3::new(
+                    p.x + nrm.x * distance,
+                    p.y + nrm.y * distance,
+                    p.z + nrm.z * distance,
+                ))
+            };
+            let sp = resolve(sv, start_inset)?;
+            let ep = resolve(ev, end_inset)?;
             let vs = model.vertices.add_or_find(sp.x, sp.y, sp.z, tol);
             let ve = model.vertices.add_or_find(ep.x, ep.y, ep.z, tol);
             let curve_id = model.curves.add(Box::new(Line::new(sp, ep)));
@@ -889,6 +995,332 @@ fn compute_vertex_insets(
     Ok(insets)
 }
 
+/// Grow the opening across coplanar, edge-connected kept fragments.
+///
+/// A boolean can split one planar cap into several coplanar faces; opening one
+/// fragment must open the whole coplanar region for the result to be watertight
+/// (see the call-site note). BFS from each seed removed face over the outer
+/// shell's edge adjacency, absorbing every kept face that (a) shares a boundary
+/// edge with a face already in the set and (b) is geometrically coplanar with it
+/// (parallel outward normals AND the same supporting plane). Curved faces and
+/// non-coplanar neighbours stop the growth, so the opening never bleeds past the
+/// flat cap region. An unfragmented cap returns the input set unchanged.
+fn expand_coplanar_opening(
+    model: &BRepModel,
+    solid: &Solid,
+    seeds: Vec<FaceId>,
+) -> OperationResult<Vec<FaceId>> {
+    use crate::primitives::surface::SurfaceType;
+
+    let shell = model
+        .shells
+        .get(solid.outer_shell)
+        .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
+
+    // edge → faces of the outer shell (outer + inner loops).
+    let mut edge_faces: HashMap<EdgeId, Vec<FaceId>> = HashMap::new();
+    for &fid in &shell.faces {
+        if let Some(f) = model.faces.get(fid) {
+            for lid in f.all_loops() {
+                if let Some(lp) = model.loops.get(lid) {
+                    for &eid in &lp.edges {
+                        edge_faces.entry(eid).or_default().push(fid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Outward plane (point + normal) of a planar face, else None.
+    let plane_of = |fid: FaceId| -> Option<(Point3, Vector3)> {
+        let f = model.faces.get(fid)?;
+        let s = model.surfaces.get(f.surface_id)?;
+        if !(s.surface_type() == SurfaceType::Plane || s.is_planar(crate::math::STRICT_TOLERANCE)) {
+            return None;
+        }
+        let mut n = s.normal_at(0.5, 0.5).ok()?;
+        if matches!(
+            f.orientation,
+            crate::primitives::face::FaceOrientation::Backward
+        ) {
+            n = -n;
+        }
+        let n = n.normalize().ok()?;
+        let p = s.point_at(0.5, 0.5).ok()?;
+        Some((p, n))
+    };
+
+    let coplanar = |a: (Point3, Vector3), b: (Point3, Vector3)| -> bool {
+        if a.1.dot(&b.1) < 1.0 - 1e-6 {
+            return false;
+        }
+        let gap = (b.0 - a.0).dot(&a.1).abs();
+        let scale = a.0.x.abs().max(a.0.y.abs()).max(a.0.z.abs()).max(1.0);
+        gap <= scale * 1e-6
+    };
+
+    let mut in_set: std::collections::HashSet<FaceId> = seeds.iter().copied().collect();
+    let mut queue: std::collections::VecDeque<FaceId> = seeds.iter().copied().collect();
+
+    while let Some(cur) = queue.pop_front() {
+        let Some(cur_plane) = plane_of(cur) else {
+            continue; // a curved seed never grows a coplanar region
+        };
+        let Some(cur_face) = model.faces.get(cur) else {
+            continue;
+        };
+        for lid in cur_face.all_loops() {
+            let Some(lp) = model.loops.get(lid) else {
+                continue;
+            };
+            for &eid in &lp.edges {
+                let Some(faces) = edge_faces.get(&eid) else {
+                    continue;
+                };
+                for &nbr in faces {
+                    if nbr == cur || in_set.contains(&nbr) {
+                        continue;
+                    }
+                    if let Some(nbr_plane) = plane_of(nbr) {
+                        if coplanar(cur_plane, nbr_plane) {
+                            in_set.insert(nbr);
+                            queue.push_back(nbr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Preserve the seed order, then append newly absorbed faces deterministically.
+    let mut out = seeds;
+    let seed_set: std::collections::HashSet<FaceId> = out.iter().copied().collect();
+    let mut extra: Vec<FaceId> = in_set
+        .into_iter()
+        .filter(|f| !seed_set.contains(f))
+        .collect();
+    extra.sort_unstable();
+    out.extend(extra);
+    Ok(out)
+}
+
+/// For each edge, how many of the REMOVED faces reference it (over all their
+/// loops). An edge with count ≥ 2 is an INTERNAL SEAM of the merged opening (it
+/// lay between two coplanar cap fragments that were both removed); it is not on
+/// the opening silhouette, so no wall belongs there and it is not a rim corner.
+/// An edge with count 1 is a true opening-boundary edge (shared with a kept side
+/// face or open to free space).
+fn removed_face_edge_counts(
+    model: &BRepModel,
+    faces_to_remove: &[FaceId],
+) -> HashMap<EdgeId, usize> {
+    let mut counts: HashMap<EdgeId, usize> = HashMap::new();
+    for &fid in faces_to_remove {
+        if let Some(f) = model.faces.get(fid) {
+            for lid in f.all_loops() {
+                if let Some(lp) = model.loops.get(lid) {
+                    for &eid in &lp.edges {
+                        *counts.entry(eid).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Mitre the inset of every removed-face RIM corner, in the plane of the removed
+/// (cap) face, filling the gaps `compute_vertex_insets` left behind.
+///
+/// `compute_vertex_insets` solves a 3-plane intersection and so covers only
+/// vertices where ≥3 non-parallel planar faces meet — the ordinary box rim
+/// corner (top cap + two side walls). A boolean that FRAGMENTS a planar cap into
+/// coplanar pieces creates rim vertices interior to that flat cap (the L-shape
+/// reentrant corner shared only by two COPLANAR top faces). Their inward-offset
+/// planes are parallel, the 3-plane solve is singular, and the vertex is omitted
+/// — so the two walls meeting there each inset along their own edge
+/// perpendicular and diverge, leaving dangling corner edges.
+///
+/// This solver works purely from the two adjacent RIM edges in the cap plane.
+/// At a rim vertex `V` shared by an incoming rim edge (direction `d_in` along the
+/// loop) and an outgoing rim edge (`d_out`), each edge's wall insets `V` toward
+/// the cap interior along `m = n × d` (the same inward perpendicular
+/// `create_wall_face` uses), a distance `t`. The mitre corner is the
+/// intersection of the two inset lines, found by the 3×3 solve
+///   (Q−V)·m_in = t,  (Q−V)·m_out = t,  (Q−V)·n = 0.
+/// A convex corner insets one way and a reentrant corner the other — the
+/// intersection lands on the correct side automatically. Only fills vertices
+/// absent from `vertex_insets` (never overrides a sound 3-plane inset) and only
+/// for straight-edged corners on a PLANAR removed face (curved rim seams keep
+/// their dedicated path). Skips near-straight (collinear) corners where the two
+/// inset lines are parallel.
+fn compute_rim_corner_insets(
+    model: &BRepModel,
+    faces_to_remove: &[FaceId],
+    thickness: f64,
+    vertex_insets: &mut HashMap<VertexId, Point3>,
+) -> OperationResult<()> {
+    use crate::math::{linear_solver, STRICT_TOLERANCE};
+    use crate::primitives::surface::SurfaceType;
+
+    // Edges shared by ≥2 removed faces are internal seams of the merged opening,
+    // not silhouette boundary — exclude them (the corner geometry is defined by
+    // the opening's true outer boundary edges only).
+    let removed_counts = removed_face_edge_counts(model, faces_to_remove);
+
+    // Collect the opening's BOUNDARY edges. A boundary edge belongs to exactly
+    // one removed face's loop and is referenced by exactly one removed face
+    // (count == 1). For each, record its inward in-plane perpendicular `m`
+    // (= n × loop_edge_dir, the same direction `create_wall_face` insets along),
+    // the cap normal `n`, the two endpoint vertices and positions, and whether
+    // it is straight. Build a vertex → incident-boundary-edges adjacency so a
+    // corner can be mitred from the two boundary edges meeting there even when
+    // they live on DIFFERENT removed fragments (the merged-opening rim crosses
+    // fragment seams). This is what lets the L-prism's reentrant outer corner be
+    // mitred consistently across the three coplanar top pieces.
+    struct BEdge {
+        v_start: VertexId,
+        v_end: VertexId,
+        p_start: Point3,
+        p_end: Point3,
+        m: Vector3,
+        n: Vector3,
+        straight: bool,
+    }
+    let mut bedges: Vec<BEdge> = Vec::new();
+    // vertex → indices into `bedges`.
+    let mut vert_bedges: HashMap<VertexId, Vec<usize>> = HashMap::new();
+
+    for &face_id in faces_to_remove {
+        let face = match model.faces.get(face_id) {
+            Some(f) => f,
+            None => continue,
+        };
+        let surface = match model.surfaces.get(face.surface_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !(surface.surface_type() == SurfaceType::Plane || surface.is_planar(STRICT_TOLERANCE)) {
+            continue;
+        }
+        let mut n = surface.normal_at(0.5, 0.5)?;
+        if matches!(
+            face.orientation,
+            crate::primitives::face::FaceOrientation::Backward
+        ) {
+            n = -n;
+        }
+        let n = match n.normalize() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        for lid in face.all_loops() {
+            let lp = match model.loops.get(lid) {
+                Some(l) => l,
+                None => continue,
+            };
+            for (i, &eid) in lp.edges.iter().enumerate() {
+                // Skip internal seams (shared by ≥2 removed faces).
+                if removed_counts.get(&eid).copied().unwrap_or(0) >= 2 {
+                    continue;
+                }
+                let edge = match model.edges.get(eid) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let fwd = lp.orientations[i];
+                let (sv, ev) = if fwd {
+                    (edge.start_vertex, edge.end_vertex)
+                } else {
+                    (edge.end_vertex, edge.start_vertex)
+                };
+                let sp = match model.vertices.get(sv) {
+                    Some(v) => v.point(),
+                    None => continue,
+                };
+                let ep = match model.vertices.get(ev) {
+                    Some(v) => v.point(),
+                    None => continue,
+                };
+                let straight = model
+                    .curves
+                    .get(edge.curve_id)
+                    .map(|c| c.is_linear(Tolerance::default()))
+                    .unwrap_or(false);
+                // Inward in-plane perpendicular along the loop direction.
+                let m = match (ep - sp)
+                    .normalize()
+                    .ok()
+                    .and_then(|d| n.cross(&d).normalize().ok())
+                {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let idx = bedges.len();
+                bedges.push(BEdge {
+                    v_start: sv,
+                    v_end: ev,
+                    p_start: sp,
+                    p_end: ep,
+                    m,
+                    n,
+                    straight,
+                });
+                vert_bedges.entry(sv).or_default().push(idx);
+                vert_bedges.entry(ev).or_default().push(idx);
+            }
+        }
+    }
+
+    // Mitre every vertex where exactly two STRAIGHT boundary edges meet.
+    for (&v, incident) in &vert_bedges {
+        if incident.len() != 2 {
+            continue; // open end, non-manifold rim, or seam endpoint — skip
+        }
+        if vertex_insets.contains_key(&v) {
+            continue; // a sound 3-plane inset already covers this corner
+        }
+        let e0 = &bedges[incident[0]];
+        let e1 = &bedges[incident[1]];
+        if !(e0.straight && e1.straight) {
+            continue; // a curved neighbour keeps the dedicated curved-rim path
+        }
+        // Same cap plane on both edges (they share a coplanar opening).
+        if e0.n.dot(&e1.n) < 1.0 - 1e-6 {
+            continue;
+        }
+        let vp = match model.vertices.get(v) {
+            Some(vx) => vx.point(),
+            None => continue,
+        };
+        let (m_in, m_out) = (e0.m, e1.m);
+        // Near-collinear corner (parallel inset lines): no distinct mitre.
+        if m_in.cross(&m_out).magnitude() < 1e-6 {
+            continue;
+        }
+        let n = e0.n;
+        // Solve  (Q−V)·m_in = t, (Q−V)·m_out = t, (Q−V)·n = 0  for Q.
+        let a = vec![
+            vec![m_in.x, m_in.y, m_in.z],
+            vec![m_out.x, m_out.y, m_out.z],
+            vec![n.x, n.y, n.z],
+        ];
+        let b = vec![
+            thickness + (m_in.x * vp.x + m_in.y * vp.y + m_in.z * vp.z),
+            thickness + (m_out.x * vp.x + m_out.y * vp.y + m_out.z * vp.z),
+            n.x * vp.x + n.y * vp.y + n.z * vp.z,
+        ];
+        if let Ok(x) = linear_solver::gaussian_elimination(a, b, STRICT_TOLERANCE) {
+            if x.len() == 3 && x.iter().all(|c| c.is_finite()) {
+                vertex_insets.insert(v, Point3::new(x[0], x[1], x[2]));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Create interior offset faces for shell.
 ///
 /// Returns the new face IDs alongside a `(source_edge_id ->
@@ -961,22 +1393,25 @@ fn create_interior_offset_faces(
         // orientation-corrected inset loop.
         //
         // Analytic CURVED surfaces (cylinder / sphere / cone / torus / NURBS /
-        // curved ruled / revolution) are NOT flipped: their offset helpers
-        // encode the outward direction in the sign of `distance` relative to the
-        // canonical outward (radial) normal — `create_offset_cylinder` does
-        // `radius + distance`, so `-|t|` shrinks the wall inward regardless of
-        // the face-orientation flag. Flipping them by orientation would GROW the
-        // radius outward and break curved shells (cylinder / revolved tube).
-        let surface_is_planar = {
-            let surf = model.surfaces.get(face.surface_id).ok_or_else(|| {
-                OperationError::InvalidGeometry("Face surface not found".to_string())
-            })?;
-            surf.surface_type() == crate::primitives::surface::SurfaceType::Plane
-                || surf.is_planar(crate::math::STRICT_TOLERANCE)
-        };
-        let oriented_thickness = match (surface_is_planar, face.orientation) {
-            (true, crate::primitives::face::FaceOrientation::Backward) => -thickness,
-            _ => thickness,
+        // curved ruled / revolution) encode their offset direction in the sign of
+        // `distance` relative to the CANONICAL outward (radial) normal —
+        // `create_offset_cylinder` does `radius + distance`, so `-|t|` shrinks the
+        // wall toward the canonical-inward side. That side is the into-MATERIAL
+        // side only when the face's outward normal IS the canonical normal, i.e.
+        // the face is `Forward` (a convex boss / tube OUTER wall: outward = +radial
+        // → into-material = −radial → `-|t|`, r shrinks). A `Backward` analytic
+        // face is a CONCAVE wall — the canonical example is a through-hole BORE
+        // cylinder, whose outward (out-of-material) normal points toward the axis
+        // (−radial); shelling into the material there moves AWAY from the axis, so
+        // the radius must GROW (r → r+|t|, e.g. an r=3 bore → r=4 cavity wall).
+        // The same sign argument holds for planar faces (a `Backward` bottom cap
+        // whose canonical normal is +Z but outward is −Z). So the rule is uniform:
+        // a `Backward` face flips the inward-offset sign, for planar AND analytic
+        // curved alike. (A `Forward` curved boss/tube is left untouched — flipping
+        // it would grow the radius outward and break the convex curved shells.)
+        let oriented_thickness = match face.orientation {
+            crate::primitives::face::FaceOrientation::Backward => -thickness,
+            crate::primitives::face::FaceOrientation::Forward => thickness,
         };
         let offset_surface = create_offset_surface(model, &face, oriented_thickness)?;
         let surface_id = model.surfaces.add(offset_surface);
@@ -986,10 +1421,20 @@ fn create_interior_offset_faces(
         // a box edge shared by two side faces) is offset once and reused, so
         // the two offset faces meet on ONE shared edge (2-manifold) instead of
         // two coincident single-use edges.
+        //
+        // Offset the BOUNDARY edges by the SAME orientation-corrected signed
+        // distance as the surface (`oriented_thickness`). For a `Backward`
+        // analytic face — a through-hole BORE — the surface offset grows the
+        // radius (r→r+|t|) while a raw `-|t|` edge offset would SHRINK the bore
+        // arcs (r→r−|t|): the offset arcs would then sit on r=2 while the offset
+        // cylinder is at r=4, tearing the bore collar (the ~400-edge box∖cyl shell
+        // leak). Planar edges still resolve through `vertex_insets` (which already
+        // encode the oriented inset), so this only re-signs the curved arc edges
+        // and the planar axial fallback — both to the geometrically correct side.
         let (offset_loop, edge_map) = create_offset_loop(
             model,
             &face,
-            thickness,
+            oriented_thickness,
             vertex_insets,
             &offset_options,
             &mut original_to_offset,
@@ -1008,12 +1453,36 @@ fn create_interior_offset_faces(
             FaceOrientation::Forward => FaceOrientation::Backward,
             FaceOrientation::Backward => FaceOrientation::Forward,
         };
-        let offset_face_obj = Face::new(
+        let mut offset_face_obj = Face::new(
             0, // ID assigned by store
             surface_id,
             loop_id,
             inner_orientation,
         );
+
+        // Offset every INNER loop (hole) too, so a face with holes — a
+        // box∖cylinder cap, an annular plate, a washer — keeps its bore in the
+        // inset interior face. Each inner loop's edges go through the same
+        // `original_to_offset` dedup map, so the bore wall (built over the
+        // removed cap's bore rim) and this inset cap share the single offset bore
+        // edge and weld 2-manifold. Without this the inset cap is solid across
+        // the bore and the bore wall has nothing to close against (a 4.2 leak).
+        let mut inner_edge_maps: Vec<(EdgeId, EdgeId)> = Vec::new();
+        for &inner_lid in &face.inner_loops {
+            let (inner_offset_loop, inner_edge_map) = create_offset_loop_for(
+                model,
+                &face,
+                inner_lid,
+                oriented_thickness,
+                vertex_insets,
+                &offset_options,
+                &mut original_to_offset,
+            )?;
+            let inner_loop_id = model.loops.add(inner_offset_loop);
+            offset_face_obj.add_inner_loop(inner_loop_id);
+            inner_edge_maps.extend(inner_edge_map);
+        }
+
         let offset_face_id = model.faces.add(offset_face_obj);
         interior_faces.push(offset_face_id);
 
@@ -1023,7 +1492,7 @@ fn create_interior_offset_faces(
         // curved cap wall can rebuild the offset rim as that surface's exact
         // iso-curve (the cap rim is offset exactly once — by its adjacent kept
         // lateral — so the mapping is unambiguous for the rim).
-        for (source_edge, _offset_edge) in &edge_map {
+        for (source_edge, _offset_edge) in edge_map.iter().chain(inner_edge_maps.iter()) {
             source_to_offset_surface.insert(*source_edge, surface_id);
         }
     }
@@ -1081,6 +1550,15 @@ fn create_shell_walls(
     // Euler≠2 husk.
     let mut corner_edges: std::collections::HashMap<(VertexId, VertexId), EdgeId> =
         std::collections::HashMap::new();
+
+    // An edge shared by ≥2 removed faces is an INTERNAL SEAM of the merged
+    // opening (it lay between two coplanar cap fragments that were both removed
+    // by the coplanar-opening expansion). It is interior to the flat opening, not
+    // on the silhouette, so NO wall belongs there — both removed fragments are
+    // gone and there is nothing for a wall to close against. Erecting one would
+    // add a spurious dangling face. Skip those edges; build walls only on the
+    // opening's true boundary (count == 1).
+    let removed_counts = removed_face_edge_counts(model, faces_to_remove);
 
     for &face_id in faces_to_remove {
         // Get boundary edges of removed face
@@ -1147,16 +1625,47 @@ fn create_shell_walls(
         for loop_data in &rim_loops {
             for (i, &edge_id) in loop_data.edges.iter().enumerate() {
                 let forward = loop_data.orientations[i];
+                // Internal seam of the merged opening (shared by ≥2 removed
+                // fragments) — interior to the flat opening, no wall belongs.
+                if removed_counts.get(&edge_id).copied().unwrap_or(0) >= 2 {
+                    continue;
+                }
                 if edge_is_closed_or_curved(model, edge_id, tol)? {
-                    let wall_face = create_curved_rim_wall(
-                        model,
-                        edge_id,
-                        face.surface_id,
-                        removed_normal,
-                        original_to_offset_edge,
-                        source_to_offset_surface,
-                    )?;
-                    wall_faces.push(wall_face);
+                    // A CLOSED rim (the cap seam, start==end / periodic) gets the
+                    // annular / ruled-band wall. An OPEN curved arc — a bore rim
+                    // IMPRINTED by a boolean is split into several arcs each with
+                    // DISTINCT endpoints (a box∖cylinder through-hole leaves three
+                    // 120° bore arcs) — is NOT a closed ring: the annular path
+                    // would weld a non-existent seam and leak. Build a 4-sided
+                    // curved band (arc + offset arc + two shared straight sides)
+                    // instead, the curved analogue of `create_wall_face`.
+                    let edge = model.edges.get(edge_id).ok_or_else(|| {
+                        OperationError::InvalidGeometry(format!(
+                            "create_shell_walls: rim edge {edge_id} not found"
+                        ))
+                    })?;
+                    let is_open_arc = !edge.is_loop() && edge.start_vertex != edge.end_vertex;
+                    if is_open_arc {
+                        let wall_face = create_arc_rim_wall(
+                            model,
+                            edge_id,
+                            forward,
+                            removed_normal,
+                            original_to_offset_edge,
+                            &mut corner_edges,
+                        )?;
+                        wall_faces.push(wall_face);
+                    } else {
+                        let wall_face = create_curved_rim_wall(
+                            model,
+                            edge_id,
+                            face.surface_id,
+                            removed_normal,
+                            original_to_offset_edge,
+                            source_to_offset_surface,
+                        )?;
+                        wall_faces.push(wall_face);
+                    }
                 } else {
                     let wall_face = create_wall_face(
                         model,
@@ -1176,6 +1685,128 @@ fn create_shell_walls(
     }
 
     Ok(wall_faces)
+}
+
+/// Build the curved BAND wall over an OPEN curved rim arc (an imprinted bore-rim
+/// segment) — the curved analogue of `create_wall_face`.
+///
+/// A boolean that pierces a face with a cylinder splits the resulting bore rim
+/// into several OPEN arcs, each with distinct endpoints (a box∖cylinder
+/// through-hole yields three 120° arcs). When the cap is opened (removed), each
+/// such arc needs a wall joining it to its inward offset — but the arc is NOT a
+/// closed ring, so the annular/seam path (`create_curved_rim_wall`) cannot span
+/// it. This builds a 4-sided band: outer = the cap-rim ARC; the OFFSET arc the
+/// adjacent kept lateral's interior offset already created (reused via the dedup
+/// map, so wall and inner lateral share it 2-manifold); and two STRAIGHT side
+/// edges connecting the arc endpoints to the offset-arc endpoints, deduped
+/// through `corner_edges` so the neighbouring arc walls reuse one shared side
+/// edge each (closing the bore-rim band into a watertight collar).
+fn create_arc_rim_wall(
+    model: &mut BRepModel,
+    rim_arc_id: EdgeId,
+    forward: bool,
+    removed_face_outward_normal: Vector3,
+    original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
+    corner_edges: &mut std::collections::HashMap<(VertexId, VertexId), EdgeId>,
+) -> OperationResult<FaceId> {
+    use crate::primitives::face::FaceOrientation;
+    use crate::primitives::r#loop::LoopType;
+    use crate::primitives::surface::RuledSurface;
+
+    use super::orientation::orient_face_for_outward;
+
+    // The adjacent kept lateral's interior offset already created the offset arc
+    // for this rim arc; reuse it so the band and the inner lateral share it.
+    let &offset_arc_id = original_to_offset_edge.get(&rim_arc_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "create_arc_rim_wall: no offset edge for bore rim arc {rim_arc_id}; \
+             the adjacent lateral must be a kept, offset face"
+        ))
+    })?;
+
+    let (rim_sv, rim_ev, rim_curve) = {
+        let e = model.edges.get(rim_arc_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_arc_rim_wall: rim arc {rim_arc_id} not found"
+            ))
+        })?;
+        let c = model.curves.get(e.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("create_arc_rim_wall: rim curve not found".into())
+        })?;
+        (e.start_vertex, e.end_vertex, c.clone_box())
+    };
+    let (off_sv, off_ev, off_curve) = {
+        let e = model.edges.get(offset_arc_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "create_arc_rim_wall: offset arc {offset_arc_id} not found"
+            ))
+        })?;
+        let c = model.curves.get(e.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry("create_arc_rim_wall: offset curve not found".into())
+        })?;
+        (e.start_vertex, e.end_vertex, c.clone_box())
+    };
+
+    // Vertex positions for the two straight side edges.
+    let pos = |vid: VertexId| -> OperationResult<Vector3> {
+        let p = model
+            .vertices
+            .get_position(vid)
+            .ok_or_else(|| OperationError::InvalidGeometry("arc-wall vertex missing".into()))?;
+        Ok(Vector3::new(p[0], p[1], p[2]))
+    };
+    // The offset edge's stored direction is start(off_sv)→end(off_ev), built from
+    // offset(rim.start)→offset(rim.end), so off_sv pairs with rim_sv and off_ev
+    // with rim_ev positionally. The band's two side edges therefore connect
+    // rim_ev↔off_ev and off_sv↔rim_sv.
+    let (p_rim_sv, p_rim_ev) = (pos(rim_sv)?, pos(rim_ev)?);
+    let (p_off_sv, p_off_ev) = (pos(off_sv)?, pos(off_ev)?);
+
+    // Wall surface = ruled band between the rim arc and the offset arc.
+    let ruled = RuledSurface::new(rim_curve, off_curve);
+    let surface_id = model.surfaces.add(Box::new(ruled));
+
+    // Build the band loop so it CLOSES, honouring the cap-loop sense `forward`
+    // with which the rim arc is traversed. The offset edge is stored off_sv→off_ev
+    // (positionally aligned: off_sv↔rim_sv, off_ev↔rim_ev).
+    //
+    //   forward = true : rim arc sv→ev, side ev→off_ev, offset arc off_ev→off_sv,
+    //                    side off_sv→sv.
+    //   forward = false: rim arc ev→sv, side sv→off_sv, offset arc off_sv→off_ev,
+    //                    side off_ev→ev.
+    //
+    // Both side edges go through `corner_edges` so the two arcs meeting at each
+    // bore-rim seam vertex reuse ONE shared side edge (manifold collar).
+    let mut wall_loop = Loop::new(0, LoopType::Outer);
+    if forward {
+        let (e_re, e_re_f) =
+            add_or_find_corner_edge(model, corner_edges, rim_ev, off_ev, p_rim_ev, p_off_ev)?;
+        let (e_le, e_le_f) =
+            add_or_find_corner_edge(model, corner_edges, off_sv, rim_sv, p_off_sv, p_rim_sv)?;
+        wall_loop.add_edge(rim_arc_id, true);
+        wall_loop.add_edge(e_re, e_re_f);
+        wall_loop.add_edge(offset_arc_id, false); // off_ev→off_sv
+        wall_loop.add_edge(e_le, e_le_f);
+    } else {
+        let (e_le, e_le_f) =
+            add_or_find_corner_edge(model, corner_edges, rim_sv, off_sv, p_rim_sv, p_off_sv)?;
+        let (e_re, e_re_f) =
+            add_or_find_corner_edge(model, corner_edges, off_ev, rim_ev, p_off_ev, p_rim_ev)?;
+        wall_loop.add_edge(rim_arc_id, false); // ev→sv
+        wall_loop.add_edge(e_le, e_le_f);
+        wall_loop.add_edge(offset_arc_id, true); // off_sv→off_ev
+        wall_loop.add_edge(e_re, e_re_f);
+    }
+    let loop_id = model.loops.add(wall_loop);
+
+    let surface_ref = model.surfaces.get(surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry("create_arc_rim_wall: surface vanished".into())
+    })?;
+    let orientation = orient_face_for_outward(surface_ref, removed_face_outward_normal)
+        .unwrap_or(FaceOrientation::Forward);
+
+    let wall_face = Face::new(0, surface_id, loop_id, orientation);
+    Ok(model.faces.add(wall_face))
 }
 
 /// True when a removed-face boundary edge cannot be spanned by a straight
@@ -1793,15 +2424,20 @@ fn create_wall_face(
     let p2 = Vector3::new(p2_arr[0], p2_arr[1], p2_arr[2]);
 
     // Validate the edge's curve is consistent with its endpoints: the
-    // curve mid-point must lie on the segment between the stored vertex
+    // edge mid-point must lie on the segment between the stored vertex
     // positions. A drift here means the curve and vertices disagree;
     // building a wall on inconsistent geometry would silently corrupt
     // the result.
-    let edge_curve = model
-        .curves
-        .get(outer_edge.curve_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge curve not found".into()))?;
-    let mid = edge_curve.evaluate(0.5)?.position;
+    //
+    // Evaluate the EDGE at t=0.5 (honouring `param_range` + `orientation`),
+    // NOT the raw curve at its own parameter 0.5. A boolean imprint splits a
+    // host edge into sub-edges that keep the FULL host curve and narrow only
+    // `param_range`; the raw curve's midpoint then lands at the HOST midpoint
+    // (far from the sub-edge's own endpoints), producing a spurious "drift"
+    // that aborts the wall on perfectly consistent geometry (the CASE-3
+    // box∪box→shell failure: the imprinted L-rim sub-edge reported drift 2.0
+    // on a length-4 edge whose true midpoint is exactly on its chord).
+    let mid = outer_edge.evaluate(0.5, &model.curves)?;
     let segment_mid = (p1 + p2) * 0.5;
     let drift = (mid - segment_mid).magnitude();
     // Use 0.5% of the edge length as the per-edge consistency budget;

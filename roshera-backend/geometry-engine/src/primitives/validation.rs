@@ -1760,26 +1760,40 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
             }
 
             // Loop centroid (a point in the face interior direction reference)
-            // from the ordered loop vertices.
-            let centroid = match loop_data.vertices(&model.edges) {
+            // from the ordered loop vertices, AND the ordered vertex polygon
+            // itself. The centroid is a robust interior reference only for a
+            // CONVEX loop; for a NON-CONVEX loop (an L-shaped face from a boolean
+            // that fragments a cap, or a shelled L-pocket floor) the centroid can
+            // fall outside the polygon or on the wrong side of a particular edge,
+            // giving a wrong "into the face" direction and false-positive
+            // orientation errors on a geometrically sound solid. So also carry the
+            // ordered polygon so `outward_walk_is_forward` can decide the interior
+            // side of each edge LOCALLY by a point-in-polygon test (exact for any
+            // simple polygon), using the centroid only as a degenerate fallback.
+            let loop_polygon: Option<Vec<Vector3>> = match loop_data.vertices(&model.edges) {
                 Ok(vids) if vids.len() >= 3 => {
-                    let mut c = Vector3::ZERO;
-                    let mut count = 0u32;
+                    let mut pts = Vec::with_capacity(vids.len());
                     for &vid in &vids {
                         if let Some(v) = model.vertices.get(vid) {
                             let p = v.position;
-                            c = c + Vector3::new(p[0], p[1], p[2]);
-                            count += 1;
+                            pts.push(Vector3::new(p[0], p[1], p[2]));
                         }
                     }
-                    if count >= 3 {
-                        Some(c * (1.0 / count as f64))
+                    if pts.len() >= 3 {
+                        Some(pts)
                     } else {
                         None
                     }
                 }
                 _ => None,
             };
+            let centroid = loop_polygon.as_ref().map(|pts| {
+                let mut c = Vector3::ZERO;
+                for p in pts {
+                    c = c + *p;
+                }
+                c * (1.0 / pts.len() as f64)
+            });
 
             // --- Chain integrity: the loop's directed half-edges (each edge taken
             // in its stored sense, tail -> head) must form ONE closed walk — every
@@ -1873,9 +1887,14 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
             // --- Outward-walk sense: does this face walk each edge in its
             // start->end direction within its outward-oriented boundary? ---
             for &edge_id in &loop_data.edges {
-                if let Some(walk_fwd) =
-                    outward_walk_is_forward(model, face, edge_id, centroid.as_ref(), is_inner)
-                {
+                if let Some(walk_fwd) = outward_walk_is_forward(
+                    model,
+                    face,
+                    edge_id,
+                    centroid.as_ref(),
+                    loop_polygon.as_deref(),
+                    is_inner,
+                ) {
                     edge_walks
                         .entry(edge_id)
                         .or_default()
@@ -1944,6 +1963,7 @@ fn outward_walk_is_forward(
     face: &crate::primitives::face::Face,
     edge_id: EdgeId,
     centroid: Option<&Vector3>,
+    loop_polygon: Option<&[Vector3]>,
     is_inner: bool,
 ) -> Option<bool> {
     let centroid = centroid?;
@@ -2030,14 +2050,52 @@ fn outward_walk_is_forward(
         return None;
     }
 
-    // interior_dir: from the edge midpoint toward the loop centroid, projected to
-    // the plane perpendicular to the edge tangent so it is a clean "into the face"
-    // reference even on long edges.
-    let to_centroid = *centroid - mid;
-    let mut interior = to_centroid - tangent * to_centroid.dot(&tangent);
-    if is_inner {
-        interior = interior * -1.0;
+    // interior_dir: a unit "into the face" reference at the edge midpoint, in the
+    // face plane and perpendicular to the edge tangent. The in-plane perpendicular
+    // is `perp = outward × tangent` (a candidate interior direction); its correct
+    // sign — which of the two sides is the face INTERIOR — is decided LOCALLY by a
+    // point-in-polygon test against this loop, exact for any simple polygon
+    // (convex or not). The historical centroid heuristic only works for a convex
+    // loop: on an L-shaped (non-convex) face the centroid can sit outside the
+    // polygon or on the wrong side of a given edge, mislabelling the interior and
+    // false-positiving a sound solid. The polygon test removes that fragility
+    // while still flipping with a genuinely reversed face normal (`outward`
+    // reverses → `perp` reverses → the walk sense flips and ceases to oppose the
+    // neighbour), so the real defect the arm guards stays caught.
+    let perp = outward.cross(&tangent);
+    if perp.magnitude() < 1e-12 {
+        return None;
     }
+    let perp = perp.normalize_or_zero();
+    if perp.magnitude() < 1e-12 {
+        return None;
+    }
+
+    let interior = match loop_polygon
+        .filter(|poly| poly.len() >= 3)
+        .map(|poly| point_in_loop_polygon(poly, mid + perp * 1e-6, outward))
+    {
+        // Stepping a hair along `+perp` from the edge lands INSIDE the face → that
+        // is the interior direction. On a HOLE loop the material is on the FAR
+        // side, so the in/out sense is negated below.
+        Some(Some(inside_plus)) => {
+            let mut dir = if inside_plus { perp } else { perp * -1.0 };
+            if is_inner {
+                dir = dir * -1.0;
+            }
+            dir
+        }
+        // Degenerate / undecidable polygon test → fall back to the centroid
+        // reference (correct for the common convex case).
+        _ => {
+            let to_centroid = *centroid - mid;
+            let mut dir = to_centroid - tangent * to_centroid.dot(&tangent);
+            if is_inner {
+                dir = dir * -1.0;
+            }
+            dir
+        }
+    };
     if interior.magnitude() < 1e-12 {
         return None;
     }
@@ -2047,6 +2105,70 @@ fn outward_walk_is_forward(
         return None;
     }
     Some(signed > 0.0)
+}
+
+/// Point-in-polygon test for a planar 3D loop, used to decide which side of an
+/// edge is the face interior. Projects the polygon and the query point onto the
+/// dominant axis-plane of `plane_normal` and runs a robust even–odd ray-crossing
+/// test. Returns `Some(true)` when the point is strictly inside, `Some(false)`
+/// when outside, and `None` when the projection is degenerate (zero area) so the
+/// caller can fall back. Self-contained (no winding assumption), so it is exact
+/// for convex AND non-convex simple polygons alike.
+fn point_in_loop_polygon(
+    polygon: &[Vector3],
+    query: Vector3,
+    plane_normal: Vector3,
+) -> Option<bool> {
+    if polygon.len() < 3 {
+        return None;
+    }
+    // Project to 2D by dropping the dominant component of the plane normal.
+    let n = plane_normal.normalize_or_zero();
+    if n.magnitude() < 1e-12 {
+        return None;
+    }
+    let (ax, ay) = {
+        let (nx, ny, nz) = (n.x.abs(), n.y.abs(), n.z.abs());
+        if nx >= ny && nx >= nz {
+            (1usize, 2usize) // drop X → use (Y,Z)
+        } else if ny >= nx && ny >= nz {
+            (0usize, 2usize) // drop Y → use (X,Z)
+        } else {
+            (0usize, 1usize) // drop Z → use (X,Y)
+        }
+    };
+    let comp = |v: &Vector3, i: usize| -> f64 {
+        match i {
+            0 => v.x,
+            1 => v.y,
+            _ => v.z,
+        }
+    };
+    let qx = comp(&query, ax);
+    let qy = comp(&query, ay);
+
+    let mut inside = false;
+    let m = polygon.len();
+    let mut j = m - 1;
+    for i in 0..m {
+        let xi = comp(&polygon[i], ax);
+        let yi = comp(&polygon[i], ay);
+        let xj = comp(&polygon[j], ax);
+        let yj = comp(&polygon[j], ay);
+        // Even–odd ray cast along +x: the edge (j→i) straddles the horizontal ray
+        // at height qy, and the crossing x is to the right of the query.
+        if (yi > qy) != (yj > qy) {
+            let dy = yj - yi;
+            if dy.abs() > f64::MIN_POSITIVE {
+                let x_cross = (xj - xi) * (qy - yi) / dy + xi;
+                if qx < x_cross {
+                    inside = !inside;
+                }
+            }
+        }
+        j = i;
+    }
+    Some(inside)
 }
 
 /// Create validation certificate for valid models
