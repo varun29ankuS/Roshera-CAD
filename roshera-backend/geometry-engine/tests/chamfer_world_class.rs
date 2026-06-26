@@ -492,6 +492,73 @@ fn revolved_flange_bottom_outer_rim_closed() {
 }
 
 // ===========================================================================
+// CLASS 8c — BOTH outer rims of the same short cylinder, chamfered in
+// SEQUENCE on the SAME part (identity-preserving editing). The flange's
+// outer wall (r = 4) spans only z = 0 … 0.5, so chamfering the bottom rim
+// (z = 0) and THEN the top rim (z = 0.5) drives two closed-edge chamfers
+// onto the very same cylinder from opposite ends.
+//
+// Root cause (real GEOMETRY bug, fixed in `create_closed_edge_chamfer`):
+// step 9 shortens the lateral cylinder by REPLACING its surface with a
+// fresh `Cylinder::new_finite(...)`, which re-derives `ref_dir` from
+// `axis.perpendicular()` — for a +Z axis that is NOT +X. The new seam
+// vertices were placed using the ORIGINAL ref_dir (θ = 0 = +X), so the
+// shortened cylinder's angular frame no longer matched. On a single rim
+// the mismatch was latent; the SECOND chamfer read the replaced surface's
+// ref_dir to place ITS seam vertex (landing at θ ≈ −90°, (0,−4,·)) while
+// the first chamfer's seam vertex was still at θ = 0, (4,0,·) — so the
+// shared lateral seam edge cut diagonally across the cylinder
+// ("edge N lies 1.172e0 off face's Cylinder surface"). Fix: carry the
+// original `ref_dir` onto the replacement cylinder so every chamfer shares
+// one angular frame.
+// ===========================================================================
+#[test]
+fn flange_both_outer_rims_same_cylinder() {
+    let mut model = BRepModel::new();
+    let meridian = [
+        (1.0, 0.0),
+        (4.0, 0.0),
+        (4.0, 0.5),
+        (1.8, 0.5),
+        (1.8, 1.5),
+        (1.0, 1.5),
+    ];
+    let flange =
+        revolve_meridian(&mut model, &meridian, RevolveOptions::default()).expect("revolve flange");
+
+    let find_rim = |model: &BRepModel, z: f64| -> Option<EdgeId> {
+        circular_edges(model, flange).into_iter().find(|&e| {
+            let Some(ed) = model.edges.get(e) else {
+                return false;
+            };
+            if !ed.is_loop() {
+                return false;
+            }
+            let Some(p) = model.vertices.get_position(ed.start_vertex) else {
+                return false;
+            };
+            let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            (r - 4.0).abs() < 1e-6 && (p[2] - z).abs() < 1e-6
+        })
+    };
+
+    // First chamfer: the BOTTOM outer rim (z = 0). This shortens the r=4
+    // cylinder from z∈[0,0.5] to z∈[0.1,0.5].
+    let bottom = find_rim(&model, 0.0).expect("flange bottom outer rim at z=0");
+    chamfer_edges(&mut model, flange, vec![bottom], chamfer_opts(0.1))
+        .expect("flange bottom outer-rim chamfer");
+    assert_world_class(&mut model, flange, "flange bottom rim (1st of 2)");
+
+    // Second chamfer on the SAME part: the TOP outer rim (z = 0.5) of the
+    // now-shortened cylinder. This is the sequential-edit case that exposed
+    // the ref_dir-reset bug.
+    let top = find_rim(&model, 0.5).expect("flange top outer rim at z=0.5");
+    chamfer_edges(&mut model, flange, vec![top], chamfer_opts(0.1))
+        .expect("flange top outer-rim chamfer on already-chamfered cylinder");
+    assert_world_class(&mut model, flange, "flange BOTH outer rims (same cylinder)");
+}
+
+// ===========================================================================
 // GRACEFUL REFUSAL — co-circular revolve-seam rim arcs (θ ≈ π tangent
 // junction). Chamfer corner-patch setback is genuinely undefined here; the
 // op must REFUSE with a typed error and leave the model UNCHANGED + sound.
