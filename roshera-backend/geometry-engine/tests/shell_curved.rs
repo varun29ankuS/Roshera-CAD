@@ -254,3 +254,68 @@ fn shell_nurbs_barrel_both_caps_removed() {
         "nurbs-barrel-tube: certificate not sound: {cert:?}"
     );
 }
+
+/// CASE 4 — the CURVED-meets-PLANAR corner inset: shell a box∖cylinder
+/// (a through-bore drilled through a box) with the top removed.
+///
+/// The imprinted bore rim is shared by an INSET planar floor cap (which offsets
+/// AXIALLY) and the OFFSET cylindrical bore lateral (which offsets RADIALLY).
+/// Dedup-by-source-edge forces ONE shared offset edge for that rim, but the two
+/// neighbours demand incompatible positions for it (the cap wants it in the new
+/// floor plane, the cylinder on the new radius). `offset_solid` reconciles them
+/// to the analytic corner — the offset cylinder's circle lying in the inset
+/// floor plane — and trims the offset lateral to that plane, so the bore wall,
+/// the inset floor inner rim, and the offset lateral all weld at one ring. The
+/// open bore rim at the removed top becomes ONE flat annular wall (not three
+/// coplanar ruled bands). Without the reconciliation the shared rim sits a wall-
+/// thickness off the floor plane and the mesh tears (~445 boundary edges).
+///
+/// Full gate: sound B-Rep AND closed 2-manifold mesh (boundary_edges == 0,
+/// nonmanifold_edges == 0, oriented) AND a sound certificate.
+#[test]
+fn shell_box_difference_cylinder_open_top() {
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+
+    let mut model = BRepModel::new();
+    let box_solid = sid(TopologyBuilder::new(&mut model)
+        .create_box_3d(12.0, 12.0, 12.0)
+        .expect("box"));
+    let cyl = sid(TopologyBuilder::new(&mut model)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -7.0), Vector3::Z, 3.0, 14.0)
+        .expect("bore cylinder"));
+    let bored = boolean_operation(
+        &mut model,
+        box_solid,
+        cyl,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("box ∖ cylinder (through-hole)");
+
+    // The +Z planar cap is the top to open. (`create_box_3d` is centred on the
+    // origin, so the +Z face sits at z = +6.)
+    let top = planar_caps_along(&model, bored, Vector3::Z)
+        .into_iter()
+        .find(|&fid| {
+            model
+                .faces
+                .get(fid)
+                .and_then(|f| model.surfaces.get(f.surface_id))
+                .and_then(|s| s.point_at(0.5, 0.5).ok())
+                .map(|p| p.z > 0.0)
+                .unwrap_or(false)
+        })
+        .expect("difference kept a +Z planar cap");
+
+    let hollow = offset_solid(&mut model, bored, 1.0, vec![top], shell_options())
+        .expect("shell box∖cylinder open-top");
+
+    assert_shell_watertight(&mut model, hollow, 12.0, "box-minus-cyl-open-top");
+    assert_brep_sound(&model, hollow, "box-minus-cyl-open-top");
+
+    let cert = model.certify_solid(hollow);
+    assert!(
+        cert.is_sound(),
+        "box-minus-cyl-open-top: certificate not sound: {cert:?}"
+    );
+}
