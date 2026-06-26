@@ -432,6 +432,46 @@ fn sample_count_from_length_angle(
         params.min_segments
     };
 
+    // SUB-TOLERANCE FEATURE GUARD (tiny-fillet watertightness).
+    //
+    // The angle constraint (`n_angle`) forces a fixed segment count from the
+    // total turning angle ALONE — independent of the feature's physical size.
+    // For an arc whose ENTIRE chord length is at or below the faceting
+    // tolerance (e.g. the ~r·√2-long end-cap chord of an r=0.01 fillet on a
+    // 20-unit box), honouring `n_angle` packs ~16 samples into a cluster
+    // smaller than `chord_tolerance`. That cluster is below the working
+    // precision of the planar CDT (whose robust predicates resolve relative to
+    // the ~20-unit face extent) and of the weld lattice, so the neighbouring
+    // trimmed planar face collapses the cluster to its two gross endpoints and
+    // DROPS the cap chord — while the fillet face still emits it — leaving the
+    // shared cap edge un-welded (a 6-boundary-edge leak the cert flags
+    // `watertight=false`). A larger-radius fillet has a cap chord above
+    // `chord_tolerance`, so its cluster is resolvable and it stays watertight.
+    //
+    // The chord-tolerance contract makes the correct count here unambiguous: an
+    // arc whose total chord length is `L ≤ chord_tolerance` deviates from its
+    // straight chord by at most its sagitta `≤ L/2 < chord_tolerance`, so a
+    // SINGLE segment already represents it within tolerance. Subdividing it
+    // further only manufactures the sub-resolvable cluster. We therefore cap
+    // the count by the chord-length budget (`ceil(L / chord_tolerance)`),
+    // bypassing the angle term and the `min_segments` floor — BUT only for
+    // OPEN arcs (`total_angle < 2π - ε`). A closed loop (full circle, e.g. a
+    // tiny circular hole) has `total_angle ≈ 2π` and must keep ≥3 samples to
+    // remain a triangulable ring, so it is excluded from the collapse. The
+    // count never drops below 1 (a single segment / two endpoint samples), and
+    // because the count is a pure function of `(L, angle, params)`, every face
+    // bounding the edge derives the identical value — shared-edge coherence,
+    // and thus watertightness, is preserved by construction.
+    let is_open_arc = total_angle < std::f64::consts::TAU - 1e-6;
+    if is_open_arc
+        && params.chord_tolerance > 0.0
+        && total_length > 0.0
+        && total_length <= params.chord_tolerance
+    {
+        let n_chord = (total_length / params.chord_tolerance).ceil() as usize;
+        return n_chord.max(1).min(params.max_segments);
+    }
+
     n_len
         .max(n_angle)
         .max(n_sag)
@@ -523,6 +563,29 @@ fn compute_face_boundary_sample_count(
     }
     // Flat / ruled-along-the-edge boundary: no surface-curvature demand.
     if total_angle <= 1e-9 {
+        return 0;
+    }
+
+    // SUB-TOLERANCE FEATURE GUARD (tiny-fillet watertightness). Mirrors the
+    // guard in `sample_count_from_length_angle`. The `n_angle` term below would
+    // densify this boundary purely from how far the adjacent surface's normal
+    // turns along it (e.g. a fillet cylinder bends 90° across its end-cap arc),
+    // independent of the feature's physical size. For the end-cap arc of an
+    // r=0.01 fillet that is ~16 samples packed into a ~0.014-long chord — a
+    // cluster below the planar CDT's working precision (relative to the ~20-unit
+    // host face) AND below the weld lattice, so the trimmed planar neighbour
+    // collapses it and the shared cap edge is dropped on one side → an open
+    // seam the cert flags `watertight=false`. When the boundary's total chord
+    // length is at or below `chord_tolerance`, its straight chord already lies
+    // within tolerance of the true curve (max deviation ≤ sagitta ≤ L/2 <
+    // chord_tolerance), so NO surface-curvature densification is warranted —
+    // return 0 and let the curve-only count (also collapsed to its endpoints by
+    // the matching guard) govern. This keeps the cap edge a single shared
+    // segment on BOTH the fillet face and the trimmed planar neighbour, so the
+    // seam welds. Larger radii have a cap chord above `chord_tolerance` and are
+    // unaffected (the cluster is resolvable and stays watertight).
+    if params.chord_tolerance > 0.0 && total_length > 0.0 && total_length <= params.chord_tolerance
+    {
         return 0;
     }
 
