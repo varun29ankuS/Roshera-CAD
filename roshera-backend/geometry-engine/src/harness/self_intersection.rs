@@ -89,9 +89,13 @@ fn aabb_disjoint(a: &([f64; 3], [f64; 3]), b: &([f64; 3], [f64; 3])) -> bool {
 }
 
 /// `true` if the solid's tessellated mesh self-intersects at chord `chord`.
-/// Pairs sharing a welded vertex (topological neighbours) are skipped; AABB
-/// overlap prunes the O(n²) scan. Use a COARSE chord for a fast certificate
-/// check — self-overlap is a gross geometric fault, visible at low density.
+/// Pairs sharing a welded vertex (topological neighbours) are skipped; a
+/// UNIFORM SPATIAL-HASH GRID over the triangle AABBs supplies broad-phase
+/// candidate pairs so the narrow-phase (segment/triangle) test runs only on
+/// triangles that actually share a grid cell — turning the historical O(n²)
+/// all-pairs scan into ~O(n) for the spatially-coherent meshes a CAD solid
+/// produces. Use a COARSE chord for a fast certificate check — self-overlap is
+/// a gross geometric fault, visible at low density.
 pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bool {
     let solid_ref = match model.solids.get(solid) {
         Some(s) => s,
@@ -164,19 +168,102 @@ pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bo
     let aabbs: Vec<([f64; 3], [f64; 3])> = tris.iter().map(tri_aabb).collect();
 
     let n = tris.len();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            // Skip topological neighbours (any shared welded vertex).
-            let wi = wtri[i];
-            let wj = wtri[j];
-            if wi.iter().any(|x| wj.contains(x)) {
-                continue;
+
+    // BROAD PHASE — uniform spatial-hash grid. The legacy all-pairs loop was
+    // O(n²); a curved-Boolean part tessellates to tens of thousands of
+    // triangles, so that scan dominated the per-op certificate cost (and was
+    // the reason the full cert was pulled off the hot path). Binning each
+    // triangle into the grid cells its AABB overlaps and testing only
+    // same-cell pairs makes the broad phase ~O(n) on the spatially-coherent
+    // meshes a solid produces, while remaining EXACT — the grid only prunes
+    // pairs whose AABBs cannot overlap, never a real crossing (a genuine
+    // self-intersection forces overlapping AABBs, hence a shared cell).
+    //
+    // Cell size = mean triangle-AABB diagonal (a standard sizing heuristic):
+    // big enough that a triangle spans only a handful of cells, small enough
+    // that few unrelated triangles share one. Degenerate (zero-size) meshes
+    // fall back to a single cell, recovering the all-pairs scan safely.
+    let mut diag_sum = 0.0f64;
+    let mut scene_lo = [f64::INFINITY; 3];
+    let mut scene_hi = [f64::NEG_INFINITY; 3];
+    for (lo, hi) in &aabbs {
+        let mut d2 = 0.0;
+        for i in 0..3 {
+            let e = hi[i] - lo[i];
+            d2 += e * e;
+            scene_lo[i] = scene_lo[i].min(lo[i]);
+            scene_hi[i] = scene_hi[i].max(hi[i]);
+        }
+        diag_sum += d2.sqrt();
+    }
+    let mut cell = diag_sum / n as f64;
+    if !(cell.is_finite() && cell > 0.0) {
+        // All-degenerate mesh (no extent): one bucket, exact all-pairs.
+        let mut max_ext = 0.0f64;
+        for i in 0..3 {
+            max_ext = max_ext.max(scene_hi[i] - scene_lo[i]);
+        }
+        cell = if max_ext.is_finite() && max_ext > 0.0 {
+            max_ext
+        } else {
+            1.0
+        };
+    }
+    let inv_cell = 1.0 / cell;
+    let cell_of = |c: f64, origin: f64| -> i64 { ((c - origin) * inv_cell).floor() as i64 };
+
+    // Map cell → triangle indices. A triangle is inserted into every cell its
+    // AABB spans; the per-pair shared-welded-vertex and exact AABB tests below
+    // reject the false candidates a coarse cell admits, so correctness is
+    // independent of the cell size — only speed depends on it.
+    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    for (idx, (lo, hi)) in aabbs.iter().enumerate() {
+        let (cx0, cy0, cz0) = (
+            cell_of(lo[0], scene_lo[0]),
+            cell_of(lo[1], scene_lo[1]),
+            cell_of(lo[2], scene_lo[2]),
+        );
+        let (cx1, cy1, cz1) = (
+            cell_of(hi[0], scene_lo[0]),
+            cell_of(hi[1], scene_lo[1]),
+            cell_of(hi[2], scene_lo[2]),
+        );
+        for cx in cx0..=cx1 {
+            for cy in cy0..=cy1 {
+                for cz in cz0..=cz1 {
+                    grid.entry((cx, cy, cz)).or_default().push(idx as u32);
+                }
             }
-            if aabb_disjoint(&aabbs[i], &aabbs[j]) {
-                continue;
-            }
-            if triangles_intersect(tris[i], tris[j]) {
-                return true;
+        }
+    }
+
+    // NARROW PHASE — only triangles co-located in a cell are candidates. A pair
+    // whose AABBs span multiple shared cells may be revisited in more than one
+    // bucket; the triangle/triangle test is symmetric, idempotent, and returns
+    // immediately on a hit, so a redundant test of a NON-crossing pair only
+    // costs a handful of flops (cheaper than maintaining a visited-set). The
+    // exact per-pair AABB-disjoint test below is what guarantees the grid never
+    // turns a true non-crossing into a false positive; the grid only ever
+    // PRUNES pairs that cannot overlap.
+    let _ = n; // `n` is the (now-bypassed) all-pairs bound; kept for clarity above.
+    for bucket in grid.values() {
+        let m = bucket.len();
+        for a in 0..m {
+            let i = bucket[a] as usize;
+            for &jb in bucket.iter().skip(a + 1) {
+                let j = jb as usize;
+                // Skip topological neighbours (any shared welded vertex).
+                let wi = wtri[i];
+                let wj = wtri[j];
+                if wi.iter().any(|x| wj.contains(x)) {
+                    continue;
+                }
+                if aabb_disjoint(&aabbs[i], &aabbs[j]) {
+                    continue;
+                }
+                if triangles_intersect(tris[i], tris[j]) {
+                    return true;
+                }
             }
         }
     }

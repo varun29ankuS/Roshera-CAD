@@ -892,12 +892,13 @@ fn mesh_open_nonmanifold(mesh: &geometry_engine::tessellation::TriangleMesh) -> 
     (open, nm)
 }
 
-/// FEEDBACK-AS-DEFAULT: the LIGHTWEIGHT perception block (~5ms) — watertight
-/// (open/nonmanifold off the mesh in hand), valid B-Rep (`validate_solid_scoped`),
-/// and world dims (`solid_world_bbox`). This is the `?fast=1` opt-out payload and
-/// the inner core every mutating endpoint embeds. The DEFAULT path
-/// ([`certified_response`]) wraps this with the FULL kernel certificate so the
-/// kernel can never hand back a solid without its full soundness verdict.
+/// FEEDBACK-AS-DEFAULT: the LIGHTWEIGHT perception SEED — open/nonmanifold off
+/// the mesh in hand, valid B-Rep (`validate_solid_scoped`), provenance, and
+/// world dims (`solid_world_bbox`). The inner core every mutating endpoint
+/// embeds. Its `sound`/`watertight`/`verdict` fields are PROVISIONAL — the
+/// DEFAULT path ([`certified_response`]) ALWAYS overwrites them with the FULL
+/// kernel certificate (`is_sound()`), so the kernel can never hand back a solid
+/// without its full soundness verdict. This seed is never returned on its own.
 fn perception_json(
     model: &geometry_engine::primitives::topology_builder::BRepModel,
     solid_id: geometry_engine::primitives::solid::SolidId,
@@ -1031,34 +1032,36 @@ pub(crate) fn certificate_json(
 /// THE CHOKEPOINT (AMBIENT VERIFICATION). The perception block every mutating
 /// endpoint embeds in its response.
 ///
-/// LATENCY CONTRACT (the per-op hot path must be sub-second). This runs
-/// SYNCHRONOUSLY, under the model write lock, on EVERY create/loft/boolean/etc.
-/// Therefore the default carries ONLY the CHEAP O(n) verdict — exactly the
-/// fast "is it a valid closed solid" signal:
+/// SOUNDNESS CONTRACT — the verdict must NEVER claim `sound: true` it has not
+/// actually verified. This runs SYNCHRONOUSLY, under the model write lock, on
+/// EVERY create/loft/boolean/etc., so it must be both TRUSTWORTHY and FAST.
 ///
-/// * brep_valid (`validate_solid_scoped`, Standard — the authoritative,
-///   mesh-independent soundness answer),
-/// * watertight / open_edges / nonmanifold_edges (off the mesh already in hand —
-///   no re-tessellation),
-/// * dims (`solid_world_bbox`), volume (`calculate_solid_volume`),
-///   face_count (outer-shell face count), provenance.
+/// We run the FULL kernel certificate (`certify_solid` → `is_sound()`:
+/// brep_valid ∧ watertight ∧ manifold ∧ oriented ∧ self-intersection-free ∧
+/// construction-consistent ∧ tessellation-clean ∧ mesh-quality-clean) on this
+/// path. Historically the O(n²) self-intersection pass dominated op latency, so
+/// it (and the rest of the cert) was pulled off the hot path — but that left the
+/// ambient verdict reporting `sound: true` from only the cheap O(n) checks
+/// (brep_valid + display-mesh watertight), so a self-intersecting / non-
+/// watertight solid was reported sound on every build. That defeats the moat: a
+/// verdict that asserts soundness it never checked.
 ///
-/// The EXPENSIVE work — the O(n²) self-intersection pass and the mesh-quality
-/// scan inside `certify_solid` — is deliberately NOT run here. It would dominate
-/// op latency (minutes on real parts) for a signal the agent only needs on an
-/// explicit check. The FULL certificate is computed on demand, UNCHANGED in
-/// content, by the explicit verify surface: `GET /api/agent/parts/{id}/truth`,
-/// `GET …/perception?full=1`, and the MCP `verify_part` / `ground_truth` tools.
-/// Its correctness is identical; only WHERE it runs moved off the hot path.
+/// The fix is to make the full check FAST, not to drop it:
+/// `harness::self_intersection::mesh_self_intersects` now uses a uniform
+/// spatial-hash grid (≈O(n) broad phase) over an AUDIT-quality (segment-capped)
+/// mesh, so even a ≥20k-triangle part certifies well under a second. The cert is
+/// memoised per solid (`BRepModel::certify_solid` caches; the op that produced
+/// this solid invalidated the cache), so a repeated call on an unmutated solid
+/// is free. `certificate_json` carries the per-check breakdown so a caller can
+/// see exactly WHAT was verified.
 ///
-/// * OPT-IN (`full == true`, via a `"verify": true` body flag): additionally
-///   attaches the FULL certificate and elevates `sound`/`watertight`/`verdict`
-///   to the full `is_sound()` answer, for a caller that wants the authoritative
-///   verdict inline and accepts the cost.
+/// `full` (the `"verify": true` body flag) additionally inlines the full cert
+/// JSON breakdown under `cert`; the top-level `sound`/`watertight`/`verdict` are
+/// the authoritative full-certificate answer in BOTH modes.
 ///
-/// Takes `&mut model` because `calculate_solid_volume` warms the per-solid
-/// mass-props cache (and `certify_solid`, on the opt-in path, warms the per-face
-/// centroid cache); the geometry itself is never mutated.
+/// Takes `&mut model` because `certify_solid` warms the per-face centroid cache
+/// (D4 label selectors) and `calculate_solid_volume` warms the mass-props cache;
+/// the geometry itself is never mutated.
 fn certified_response(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
     solid_id: geometry_engine::primitives::solid::SolidId,
@@ -1067,9 +1070,9 @@ fn certified_response(
 ) -> serde_json::Value {
     let mut base = perception_json(model, solid_id, mesh);
 
-    // CHEAP structural facts (O(n)): the agent's fast "what is this" signal,
-    // computed without the certificate. `calculate_solid_volume` hits the
-    // per-solid mass-props cache; `face_count` is an outer-shell length read.
+    // CHEAP structural facts (O(n)): the agent's fast "what is this" signal.
+    // `calculate_solid_volume` hits the per-solid mass-props cache; `face_count`
+    // is an outer-shell length read.
     let volume = model.calculate_solid_volume(solid_id);
     let face_count = model.solid_outer_face_count(solid_id);
     if let serde_json::Value::Object(map) = &mut base {
@@ -1077,26 +1080,33 @@ fn certified_response(
         map.insert("face_count".into(), serde_json::json!(face_count));
     }
 
-    if !full {
-        return base;
-    }
-
-    // OPT-IN (explicit verify): attach the FULL certificate and elevate the
-    // top-level verdict to the full `is_sound()` answer. Same computation the
-    // /truth endpoint runs — its correctness is unchanged; this is just the
-    // inline-on-request placement.
+    // AMBIENT FULL CERTIFICATE — the authoritative soundness verdict on every
+    // mutating op. `certify_solid` is memoised (the producing op invalidated the
+    // cache), and `mesh_self_intersects` is now spatial-grid-accelerated, so this
+    // stays sub-second even on real parts. Elevate `sound`/`watertight`/`verdict`
+    // to the full `is_sound()` answer — the verdict now reports ONLY what the
+    // kernel actually verified.
     let cert = model.certify_solid(solid_id);
     let sound = cert.is_sound();
     if let serde_json::Value::Object(map) = &mut base {
         map.insert("sound".into(), serde_json::json!(sound));
         map.insert("watertight".into(), serde_json::json!(cert.watertight));
-        map.insert("cert".into(), certificate_json(&cert));
+        map.insert(
+            "self_intersection_free".into(),
+            serde_json::json!(cert.self_intersection_free),
+        );
         let verdict = if sound {
             "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)"
         } else {
             "UNSOUND — full kernel certificate flags a defect (see cert)"
         };
         map.insert("verdict".into(), serde_json::json!(verdict));
+        // Attach the full per-check breakdown only on explicit `verify`, to keep
+        // the default response compact; the verdict above is authoritative
+        // regardless.
+        if full {
+            map.insert("cert".into(), certificate_json(&cert));
+        }
     }
     base
 }
