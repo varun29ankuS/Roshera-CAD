@@ -26,6 +26,23 @@ use crate::primitives::{
 };
 use std::collections::HashMap;
 
+/// One kept face's contribution to a SHARED source rim edge: the offset surface
+/// its interior offset face was built on, the source face's orientation, and
+/// whether the source face was geometrically planar.
+///
+/// A rim edge shared by a planar cap and a curved lateral (a cylinder/cone cap
+/// rim, an imprinted bore rim) is offset once per kept neighbour through the
+/// cross-face dedup map. Recording BOTH neighbours' offset surfaces against that
+/// source edge is what lets `reconcile_curved_planar_rim_corners` place the one
+/// shared offset edge at the analytic corner (offset-curved ∩ inset-plane) and
+/// trim the offset curved surface to the cap plane — the curved analogue of the
+/// planar rim-corner mitre.
+#[derive(Clone, Copy)]
+struct RimRef {
+    offset_surface_id: u32,
+    source_planar: bool,
+}
+
 /// Options for offset operations
 #[derive(Debug)]
 pub struct OffsetOptions {
@@ -225,7 +242,7 @@ fn offset_solid_body(
     // OFFSET SURFACE its adjacent interior face was built on, so a curved cap
     // wall can rebuild the offset rim as that surface's exact iso-curve (see
     // `create_curved_rim_wall`).
-    let (interior_faces, original_to_offset_edge, source_to_offset_surface) =
+    let (interior_faces, original_to_offset_edge, source_to_offset_surface, rim_refs) =
         create_interior_offset_faces(
             model,
             &solid,
@@ -234,6 +251,32 @@ fn offset_solid_body(
             &vertex_insets,
             &options,
         )?;
+
+    // CURVED-MEETS-PLANAR corner reconciliation (the curved sibling of
+    // `compute_rim_corner_insets`). A rim source edge shared by an INSET planar
+    // cap and an OFFSET curved lateral (the box∖cylinder bore rim; a cone-bore
+    // rim) is offset once through the dedup map, but the two neighbours demand
+    // INCOMPATIBLE positions for that single shared edge: the inset cap wants it
+    // in the cap's offset PLANE (shifted axially by the wall thickness, radius
+    // unchanged), while the offset curved lateral wants it on the offset CYLINDER
+    // (radius shifted, axial position unchanged). The geometrically correct inner
+    // corner is the intersection of the two offset surfaces — the circle of the
+    // offset radius lying in the inset cap plane. This pass derives that corner
+    // analytically, reshapes the one shared offset edge onto it (moving its
+    // vertices), and TRIMS the offset curved surface's axial limit to the inset
+    // plane so the lateral stops exactly at the new floor. Without it the shared
+    // bore rim sits one wall-thickness off the inset cap plane and the mesh tears
+    // (~445 boundary edges on the box∖cyl shell). Curved laterals adjacent only to
+    // REMOVED caps (no inset plane — the cylinder/​revolved both-caps-removed
+    // tube) are reconciled to the in-plane radial inset of the cap rim instead.
+    reconcile_curved_planar_rim_corners(
+        model,
+        &solid,
+        thickness.abs(),
+        &faces_to_remove,
+        &original_to_offset_edge,
+        &rim_refs,
+    )?;
 
     // Create side walls for removed faces
     let wall_faces = create_shell_walls(
@@ -352,6 +395,15 @@ fn create_offset_cylinder(
     let mut offset = Cylinder::new(cyl.origin, cyl.axis, new_radius)?;
     offset.height_limits = cyl.height_limits;
     offset.angle_limits = cyl.angle_limits;
+    // Preserve the source cylinder's seam frame. `Cylinder::new` re-derives
+    // `ref_dir` as `axis.perpendicular()`, which is in general π/2 away from the
+    // source seam (which a primitive cylinder pins to its rim circle's canonical
+    // `x_axis`). The offset rim ARC edges keep the source seam (their t=0 stays at
+    // the source `ref_dir`); if the offset SURFACE's u=0 lands elsewhere, the
+    // curved-CDT tessellation projects a 2π span that STRADDLES the seam vertex
+    // and tears the lateral (the documented CDT-γ.3 failure). Carry `ref_dir` so
+    // the offset lateral's seam coincides with its rim arcs' seam.
+    offset.ref_dir = cyl.ref_dir;
     Ok(Box::new(offset))
 }
 
@@ -1321,6 +1373,415 @@ fn compute_rim_corner_insets(
     Ok(())
 }
 
+/// The CURVED-meets-PLANAR corner-inset: place the rim edge shared by an OFFSET
+/// curved lateral and an INSET planar cap at the analytic corner of their two
+/// offset surfaces, and trim the curved lateral to that cap plane.
+///
+/// `compute_rim_corner_insets` mitres a corner where two PLANAR faces meet. This
+/// is its curved sibling. A boolean that pierces a planar cap with a cylinder
+/// (box∖cylinder through-hole) leaves a rim where a PLANAR cap and a CYLINDRICAL
+/// bore lateral share a curved edge. Under a shell the cap offsets AXIALLY (its
+/// inset plane shifts a wall-thickness along the cap normal, radius unchanged)
+/// while the bore lateral offsets RADIALLY (its radius shifts, axial position
+/// unchanged). Dedup-by-source-edge forces ONE shared offset edge for that rim,
+/// but the two neighbours demand incompatible positions for it — the inset cap
+/// wants it in the new cap plane, the offset cylinder on the new radius. The
+/// geometrically correct inner corner is the INTERSECTION of the two offset
+/// surfaces: the circle/arc of the offset radius lying in the inset cap plane.
+///
+/// For each source rim edge shared by exactly such a pair this:
+///   1. derives the corner — for a `Cylinder` lateral whose axis is perpendicular
+///      to the (planar) cap, the corner is the offset cylinder's circle/arc moved
+///      so its plane is the inset cap plane (offset radius, cap-plane axial
+///      coordinate);
+///   2. reshapes the shared offset edge's curve onto that corner and moves both
+///      its endpoint vertices there (so the bore wall, the inset cap inner rim,
+///      and the offset lateral all weld at one ring); and
+///   3. TRIMS the offset cylinder's `height_limits` so the lateral ends exactly
+///      at the inset cap plane (otherwise the lateral surface still spans to the
+///      un-inset cap and the wall tessellation runs off its own surface).
+///
+/// Only analytic `Cylinder`/`Cone` laterals whose axis is parallel to the cap
+/// normal are handled (the perpendicular-cap case, where the intersection is a
+/// single planar circle). A skew or non-analytic lateral is left to the existing
+/// per-face offset + curved-rim-wall path. The pass is a no-op for a plain box
+/// shell (no curved rim) and for a curved lateral whose only cap neighbours were
+/// REMOVED (the cylinder/​revolved both-caps-removed tube — handled by the
+/// in-plane rim rebuild in the wall path).
+fn reconcile_curved_planar_rim_corners(
+    model: &mut BRepModel,
+    solid: &Solid,
+    thickness: f64,
+    faces_to_remove: &[FaceId],
+    original_to_offset_edge: &HashMap<EdgeId, EdgeId>,
+    rim_refs: &HashMap<EdgeId, Vec<RimRef>>,
+) -> OperationResult<()> {
+    use crate::primitives::curve::{Arc, Line};
+    use crate::primitives::surface::{Cylinder, SurfaceType};
+
+    let _ = (solid, faces_to_remove); // removed caps are absent from `rim_refs`
+    let tol = Tolerance::default().distance();
+
+    // ── Edit kinds ───────────────────────────────────────────────────────────
+    // A — re-seat a CIRCULAR offset edge onto the offset cylinder (correct
+    //     radius, axial position kept) and, if it borders an inset cap, also
+    //     move it axially to the inset cap plane (the corner) + trim the cyl.
+    // B — re-seat a LINEAR offset edge (the seam ruling) onto the offset cylinder
+    //     by projecting its endpoints (taken from the SOURCE seam vertices)
+    //     radially to the offset radius.
+    struct ArcEdit {
+        offset_edge: EdgeId,
+        center: Point3,
+        radius: f64,
+        normal: Vector3,
+        x_axis: Vector3,
+        start_angle: f64,
+        sweep_angle: f64,
+        // Some(v) ⇒ also trim the cylinder's height to this axial coordinate.
+        trim: Option<(u32, f64)>,
+    }
+    // The seam offset edges are re-derived AFTER the arc edits (which re-seat the
+    // shared bore-rim corner vertices onto the offset cylinder), so the seam can
+    // SNAP its endpoints onto those corners and share one collar vertex with the
+    // arcs. Carry enough to project the SOURCE seam vertices onto the offset
+    // cylinder and locate the matching corner:
+    //   (offset_edge, cyl axis, cyl origin, cyl radius, source start, source end).
+    let mut seam_edges: Vec<(EdgeId, Vector3, Point3, f64, Point3, Point3)> = Vec::new();
+    let mut arc_edits: Vec<ArcEdit> = Vec::new();
+
+    // Cylinder geometry of an offset surface, if it is one.
+    let cyl_of = |sid: u32| -> Option<(Vector3, Point3, f64)> {
+        let s = model.surfaces.get(sid)?;
+        if s.surface_type() != SurfaceType::Cylinder {
+            return None;
+        }
+        let cyl = s.as_any().downcast_ref::<Cylinder>()?;
+        Some((cyl.axis.normalize().ok()?, cyl.origin, cyl.radius))
+    };
+    // Inset plane (point, unit normal) of an offset surface, if it is a plane.
+    let plane_of = |sid: u32| -> Option<(Point3, Vector3)> {
+        let s = model.surfaces.get(sid)?;
+        if s.surface_type() != SurfaceType::Plane {
+            return None;
+        }
+        Some((
+            s.point_at(0.5, 0.5).ok()?,
+            s.normal_at(0.5, 0.5).ok()?.normalize().ok()?,
+        ))
+    };
+
+    for (&source_edge, refs) in rim_refs {
+        // The curved neighbour whose offset surface is an analytic cylinder.
+        let Some((cyl_surface_id, axis, cyl_origin, cyl_radius)) =
+            refs.iter().filter(|r| !r.source_planar).find_map(|r| {
+                cyl_of(r.offset_surface_id).map(|(a, o, rr)| (r.offset_surface_id, a, o, rr))
+            })
+        else {
+            continue;
+        };
+
+        let &offset_edge = match original_to_offset_edge.get(&source_edge) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // Source edge geometry.
+        let (src_curve_linear, src_arc, src_sv_pos, src_ev_pos) = {
+            let edge = match model.edges.get(source_edge) {
+                Some(e) => e,
+                None => continue,
+            };
+            let curve = match model.curves.get(edge.curve_id) {
+                Some(c) => c,
+                None => continue,
+            };
+            let linear = curve.is_linear(Tolerance::new(tol, tol));
+            let arc = arc_geometry(curve);
+            let sp = model.vertices.get(edge.start_vertex).map(|v| v.point());
+            let ep = model.vertices.get(edge.end_vertex).map(|v| v.point());
+            (linear, arc, sp, ep)
+        };
+
+        // ── B: linear seam ruling on the cylinder. ──
+        if src_curve_linear {
+            // The generic surface-normal offset is degenerate AT the seam
+            // (u=0≡2π) and drifts tangentially. Re-derive the seam ruling from the
+            // SOURCE seam vertices projected radially onto the offset cylinder,
+            // then snap each endpoint onto the coincident bore-rim arc corner
+            // (which the arc edits re-seated) so the seam and the arcs share one
+            // collar vertex instead of two duplicates.
+            let (Some(sp), Some(ep)) = (src_sv_pos, src_ev_pos) else {
+                continue;
+            };
+            seam_edges.push((offset_edge, axis, cyl_origin, cyl_radius, sp, ep));
+            continue;
+        }
+
+        // ── A: circular rim arc on the cylinder. ──
+        let Some((src_center, _src_radius, src_normal, src_x, src_start, src_sweep)) = src_arc
+        else {
+            continue;
+        };
+        let rim_n = match src_normal.normalize() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Rim normal (anti)parallel to the cylinder axis → the rim is a cross
+        // section circle of the cylinder (the perpendicular-cap case).
+        if rim_n.dot(&axis).abs() < 1.0 - 1e-6 {
+            continue;
+        }
+
+        // Default: keep the source rim's axial position, take the offset radius.
+        // (A rim bordering a REMOVED cap stays at its own cap plane — the cap is
+        // an opening, not inset.)
+        let mut s_axial = (src_center - cyl_origin).dot(&axis);
+
+        // If this rim ALSO borders an INSET planar cap (a KEPT cap that was
+        // offset), move it to the curved-meets-planar corner: the offset
+        // cylinder's circle lying in the inset cap plane.
+        if let Some((plane_point, plane_n)) = refs
+            .iter()
+            .filter(|r| r.source_planar)
+            .find_map(|r| plane_of(r.offset_surface_id))
+        {
+            let denom = axis.dot(&plane_n);
+            // Cap plane perpendicular to the axis (normal ∥ axis).
+            if plane_n.dot(&axis).abs() >= 1.0 - 1e-6 && denom.abs() >= 1e-9 {
+                let s = (plane_point - cyl_origin).dot(&plane_n) / denom;
+                let corner_center = cyl_origin + axis * s;
+                // The corner must sit ~one wall-thickness off the source rim
+                // plane (otherwise the surfaces are not the expected pair).
+                let axial_shift = (corner_center - src_center).dot(&axis).abs();
+                if (axial_shift - thickness).abs() <= thickness.max(1.0) * 0.5 {
+                    s_axial = s;
+                }
+            }
+        }
+        let center = cyl_origin + axis * s_axial;
+        // Always trim the offset cylinder's height limit to THIS rim's axial
+        // coordinate. The offset of a finite cylinder preserves the source
+        // height_limits, which span the FULL through-bore (e.g. z=−7..7 for a
+        // bore drilled past both faces); the cavity bore wall must end exactly at
+        // its two real rims (the inset floor corner below, the open top rim
+        // above), or the lateral over-runs its rims and the mesh leaks at the
+        // overshoot (a z=7 band beyond the z=6 top). Each of the cylinder's two
+        // end rims sets the nearer limit; together they clamp it to [floor, top].
+        let trim = Some((cyl_surface_id, s_axial));
+
+        arc_edits.push(ArcEdit {
+            offset_edge,
+            center,
+            radius: cyl_radius,
+            normal: rim_n,
+            x_axis: src_x,
+            start_angle: src_start,
+            sweep_angle: src_sweep,
+            trim,
+        });
+    }
+
+    // ── Apply arc edits. ── Track every re-seated arc-endpoint vertex (id +
+    // its new position) so a seam ruling sharing a bore-rim corner can SNAP its
+    // own (separately created) endpoint vertex onto that corner — the offset of
+    // the seam and the offset of the arcs were welded independently at creation
+    // time with their OLD (wrong) positions, so they did not dedup; re-seating
+    // them apart would tear the bore collar.
+    let mut corner_verts: Vec<(VertexId, Point3)> = Vec::new();
+    for e in arc_edits {
+        let new_arc = Arc::with_x_axis(
+            e.center,
+            e.normal,
+            e.x_axis,
+            e.radius,
+            e.start_angle,
+            e.sweep_angle,
+        )
+        .or_else(|_| Arc::new(e.center, e.normal, e.radius, e.start_angle, e.sweep_angle));
+        let new_arc = match new_arc {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        // The new arc is the FULL circle (or full source arc) at the offset
+        // radius / inset centre; the offset EDGE keeps its source `param_range`,
+        // which sub-selects the imprinted bore SEGMENT (a box∖cylinder bore rim is
+        // three 120° edges over one full circle). So install the curve first, then
+        // read the endpoint positions through `edge.evaluate` (which applies
+        // `param_range` + orientation). Using the raw `point_at(0/1)` of the full
+        // circle would place every segment's endpoints at the seam (angle 0),
+        // collapsing all three arcs to one point.
+        let new_curve_id = model.curves.add(Box::new(new_arc));
+        let (sv, ev) = {
+            let edge = match model.edges.get(e.offset_edge) {
+                Some(ed) => ed,
+                None => continue,
+            };
+            (edge.start_vertex, edge.end_vertex)
+        };
+        if let Some(edge) = model.edges.get_mut(e.offset_edge) {
+            edge.curve_id = new_curve_id;
+        }
+        let (p0, p1) = {
+            let edge = match model.edges.get(e.offset_edge) {
+                Some(ed) => ed,
+                None => continue,
+            };
+            (
+                edge.evaluate(0.0, &model.curves).ok(),
+                edge.evaluate(1.0, &model.curves).ok(),
+            )
+        };
+        if let Some(p) = p0 {
+            model.vertices.set_position(sv, p.x, p.y, p.z);
+            corner_verts.push((sv, p));
+        }
+        if let Some(p) = p1 {
+            if ev != sv {
+                model.vertices.set_position(ev, p.x, p.y, p.z);
+            }
+            corner_verts.push((ev, p));
+        }
+
+        // Trim the offset cylinder's height limits to the inset cap plane so the
+        // lateral ends exactly at the new floor. The surface store holds trait
+        // objects, so build a trimmed copy and replace it.
+        if let Some((cyl_surface_id, trim_v)) = e.trim {
+            let trimmed: Option<Box<dyn crate::primitives::surface::Surface>> = model
+                .surfaces
+                .get(cyl_surface_id)
+                .and_then(|s| s.as_any().downcast_ref::<Cylinder>())
+                .and_then(|cyl| {
+                    let [lo, hi] = cyl.height_limits?;
+                    let new_limits = if (trim_v - lo).abs() <= (trim_v - hi).abs() {
+                        [trim_v, hi]
+                    } else {
+                        [lo, trim_v]
+                    };
+                    let mut copy = *cyl;
+                    copy.height_limits = Some(new_limits);
+                    Some(Box::new(copy) as Box<dyn crate::primitives::surface::Surface>)
+                });
+            if let Some(t) = trimmed {
+                model.surfaces.replace(cyl_surface_id, t);
+            }
+        }
+    }
+
+    // ── Apply seam (linear ruling) edits, AFTER the arcs re-seated the shared
+    //    corner vertices. ──
+    let snap_tol = tol.max(1e-9) * 100.0;
+    for (offset_edge, axis, cyl_origin, cyl_radius, src_sp, src_ep) in seam_edges {
+        // Project a source seam vertex radially onto the offset cylinder.
+        let project = |p: Point3| -> Option<Point3> {
+            let along = (p - cyl_origin).dot(&axis);
+            let foot = cyl_origin + axis * along;
+            let radial = (p - foot).normalize().ok()?;
+            Some(foot + radial * cyl_radius)
+        };
+        let target_s = match project(src_sp) {
+            Some(p) => p,
+            None => continue,
+        };
+        let target_e = match project(src_ep) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Snap each seam end to the coincident bore-rim arc corner the arc edits
+        // re-seated, so the seam and the arcs share ONE collar vertex. The corner
+        // was moved AXIALLY to the inset cap plane (z shifted by the wall
+        // thickness), so a full-3D distance match against the SOURCE-z projected
+        // target would miss it (it is ~`thickness` away in z). Match instead on
+        // the IN-PLANE (perpendicular-to-axis) position — same angle, same radius
+        // — and pick the corner on the SAME axial END as this seam endpoint; that
+        // identifies the reconciled corner regardless of the axial inset, so the
+        // seam adopts the corner's true (inset) z. Only when no arc corner lies on
+        // this seam's angular ray (an unreconciled rim) does the seam keep its own
+        // vertex at the projected target.
+        let in_plane = |p: Point3| -> Vector3 {
+            let along = (p - cyl_origin).dot(&axis);
+            p - (cyl_origin + axis * along)
+        };
+        let target_along = |p: Point3| (p - cyl_origin).dot(&axis);
+        let (sv, ev) = {
+            let edge = match model.edges.get(offset_edge) {
+                Some(ed) => ed,
+                None => continue,
+            };
+            (edge.start_vertex, edge.end_vertex)
+        };
+        // Resolve each end to a final (vertex_id, position): among the arc corners
+        // on this seam's angular ray (in-plane match), pick the one on the SAME
+        // axial END as this seam endpoint (smallest axial distance). When no corner
+        // lies on the ray the seam keeps its own vertex at the projected target.
+        let resolve = |own: VertexId, target: Point3| -> (VertexId, Point3) {
+            let t_al = target_along(target);
+            let t_ip = in_plane(target);
+            let best = corner_verts
+                .iter()
+                .filter(|(_, p)| (in_plane(*p) - t_ip).magnitude() <= snap_tol)
+                .min_by(|a, b| {
+                    (target_along(a.1) - t_al)
+                        .abs()
+                        .partial_cmp(&(target_along(b.1) - t_al).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .copied();
+            match best {
+                Some((cv, cp)) => (cv, cp),
+                None => (own, target),
+            }
+        };
+        let (new_sv, p_s) = resolve(sv, target_s);
+        let (new_ev, p_e) = resolve(ev, target_e);
+        // If the seam keeps its own vertex (no corner to snap to), move it.
+        if new_sv == sv {
+            model.vertices.set_position(sv, p_s.x, p_s.y, p_s.z);
+        }
+        if new_ev == ev && new_ev != new_sv {
+            model.vertices.set_position(ev, p_e.x, p_e.y, p_e.z);
+        }
+        let new_curve_id = model.curves.add(Box::new(Line::new(p_s, p_e)));
+        if let Some(edge) = model.edges.get_mut(offset_edge) {
+            edge.start_vertex = new_sv;
+            edge.end_vertex = new_ev;
+            edge.curve_id = new_curve_id;
+        }
+    }
+
+    Ok(())
+}
+
+/// Recover circle/arc geometry (centre, radius, normal, x-axis, start & sweep
+/// angles) from a curve that is a `Circle` or `Arc`. Returns `None` for any
+/// other curve type (e.g. a NURBS rim), routing the caller to its generic path.
+fn arc_geometry(
+    curve: &dyn crate::primitives::curve::Curve,
+) -> Option<(Point3, f64, Vector3, Vector3, f64, f64)> {
+    use crate::primitives::curve::{Arc, Circle};
+    if let Some(a) = curve.as_any().downcast_ref::<Arc>() {
+        return Some((
+            a.center,
+            a.radius,
+            a.normal,
+            a.x_axis,
+            a.start_angle,
+            a.sweep_angle,
+        ));
+    }
+    if let Some(c) = curve.as_any().downcast_ref::<Circle>() {
+        // A full circle: start angle 0, sweep 2π, normal/x-axis from the circle.
+        return Some((
+            c.center(),
+            c.radius(),
+            c.normal(),
+            c.x_axis(),
+            0.0,
+            std::f64::consts::TAU,
+        ));
+    }
+    None
+}
+
 /// Create interior offset faces for shell.
 ///
 /// Returns the new face IDs alongside a `(source_edge_id ->
@@ -1345,7 +1806,10 @@ fn create_interior_offset_faces(
     Vec<FaceId>,
     std::collections::HashMap<EdgeId, EdgeId>,
     std::collections::HashMap<EdgeId, u32>,
+    std::collections::HashMap<EdgeId, Vec<RimRef>>,
 )> {
+    use crate::primitives::surface::SurfaceType;
+
     let shell = model
         .shells
         .get(solid.outer_shell)
@@ -1355,6 +1819,9 @@ fn create_interior_offset_faces(
     let mut interior_faces = Vec::new();
     let mut original_to_offset = std::collections::HashMap::new();
     let mut source_to_offset_surface: std::collections::HashMap<EdgeId, u32> =
+        std::collections::HashMap::new();
+    // source edge -> every kept neighbour's offset-surface contribution.
+    let mut rim_refs: std::collections::HashMap<EdgeId, Vec<RimRef>> =
         std::collections::HashMap::new();
 
     let offset_options = OffsetOptions {
@@ -1495,9 +1962,45 @@ fn create_interior_offset_faces(
         for (source_edge, _offset_edge) in edge_map.iter().chain(inner_edge_maps.iter()) {
             source_to_offset_surface.insert(*source_edge, surface_id);
         }
+
+        // Record this face's offset-surface contribution against EVERY source
+        // edge it bounds (outer + inner loops), NOT only the edges it freshly
+        // created. A rim edge shared with a neighbour that was offset FIRST is
+        // returned from the dedup map and so is absent from `edge_map` — but this
+        // face still bounds it and its offset surface is one half of that rim's
+        // curved-meets-planar corner. Walking the source loops directly captures
+        // both neighbours of every shared rim, which `reconcile_curved_planar_
+        // rim_corners` needs to find the (planar-cap, curved-lateral) pairs.
+        let source_planar = {
+            let s = model.surfaces.get(face.surface_id);
+            s.map(|s| {
+                s.surface_type() == SurfaceType::Plane || s.is_planar(crate::math::STRICT_TOLERANCE)
+            })
+            .unwrap_or(false)
+        };
+        for lid in face.all_loops() {
+            if let Some(lp) = model.loops.get(lid) {
+                for &src_edge in &lp.edges {
+                    let entry = rim_refs.entry(src_edge).or_default();
+                    // Avoid double-recording the same face (a seam edge appears
+                    // twice in a loop).
+                    if !entry.iter().any(|r| r.offset_surface_id == surface_id) {
+                        entry.push(RimRef {
+                            offset_surface_id: surface_id,
+                            source_planar,
+                        });
+                    }
+                }
+            }
+        }
     }
 
-    Ok((interior_faces, original_to_offset, source_to_offset_surface))
+    Ok((
+        interior_faces,
+        original_to_offset,
+        source_to_offset_surface,
+        rim_refs,
+    ))
 }
 
 /// Create wall faces for shell openings.
@@ -1622,7 +2125,36 @@ fn create_shell_walls(
         // the ruled wall; otherwise keep the straight-quad path so box shells
         // (straight Line rim edges) do not regress.
         let tol = options.common.tolerance.distance();
+        // Which loop ids are inner (hole) loops of this removed face — a bore
+        // through a planar cap. The first `rim_loops` entry is the outer loop.
+        let inner_loop_set: std::collections::HashSet<u32> =
+            face.inner_loops.iter().copied().collect();
         for loop_data in &rim_loops {
+            // A removed PLANAR cap's INNER loop that is a CLOSED RING of open
+            // arcs (a boolean-imprinted bore rim, e.g. the box∖cylinder bore) is
+            // best closed by ONE flat annular wall on the cap plane — outer loop =
+            // the offset arcs (now reseated by the curved-planar reconciliation),
+            // inner loop = the rim arcs. Three independent coplanar ruled BANDS
+            // (one per arc) instead share radial seams that the orientation oracle
+            // reads as inconsistent (two coplanar faces meeting at one edge), and
+            // leave an odd Euler characteristic. The single annulus is the same
+            // proven structure `create_curved_rim_wall` builds for a one-piece
+            // closed cap rim. Falls through to the per-edge path when the loop is
+            // not such a ring (the outer rim, a non-planar cap, a partial bore).
+            if inner_loop_set.contains(&loop_data.id) && removed_surface_is_planar(model, &face) {
+                if let Some(wall_face) = try_create_arc_ring_annular_wall(
+                    model,
+                    loop_data,
+                    face.surface_id,
+                    removed_normal,
+                    original_to_offset_edge,
+                    &removed_counts,
+                    tol,
+                )? {
+                    wall_faces.push(wall_face);
+                    continue;
+                }
+            }
             for (i, &edge_id) in loop_data.edges.iter().enumerate() {
                 let forward = loop_data.orientations[i];
                 // Internal seam of the merged opening (shared by ≥2 removed
@@ -1685,6 +2217,237 @@ fn create_shell_walls(
     }
 
     Ok(wall_faces)
+}
+
+/// Chain a set of edges head-to-tail into a single CLOSED loop, returning each
+/// edge paired with the traversal flag (`true` = stored start→end) that makes the
+/// chain connected. Returns `None` if the edges do not form exactly one closed
+/// ring (a dangling end, a fork, or a disconnected piece) — the caller then
+/// declines the annulus and falls back to per-arc walls.
+///
+/// Greedy walk: start at the first edge (forward), then repeatedly append the
+/// unused edge incident to the current chain tail (matching by vertex id), using
+/// whichever of its endpoints touches the tail to set the flag. The ring closes
+/// when the tail returns to the start vertex with all edges consumed.
+fn chain_edge_ring(model: &BRepModel, edges: &[EdgeId], _tol: f64) -> Option<Vec<(EdgeId, bool)>> {
+    if edges.len() < 2 {
+        return None;
+    }
+    // endpoints[i] = (start_vertex, end_vertex) of edges[i].
+    let mut ends: Vec<(EdgeId, VertexId, VertexId)> = Vec::with_capacity(edges.len());
+    for &e in edges {
+        let edge = model.edges.get(e)?;
+        ends.push((e, edge.start_vertex, edge.end_vertex));
+    }
+    let mut used = vec![false; ends.len()];
+    let mut chain: Vec<(EdgeId, bool)> = Vec::with_capacity(ends.len());
+
+    // Seed with the first edge, forward.
+    let (e0, s0, t0) = ends[0];
+    used[0] = true;
+    chain.push((e0, true));
+    let start_vertex = s0;
+    let mut tail = t0;
+
+    while chain.len() < ends.len() {
+        let mut advanced = false;
+        for i in 0..ends.len() {
+            if used[i] {
+                continue;
+            }
+            let (e, s, t) = ends[i];
+            if s == tail {
+                used[i] = true;
+                chain.push((e, true));
+                tail = t;
+                advanced = true;
+                break;
+            } else if t == tail {
+                used[i] = true;
+                chain.push((e, false));
+                tail = s;
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            return None; // dangling / disconnected — not a single ring
+        }
+    }
+    // The ring must close back to the start.
+    if tail != start_vertex {
+        return None;
+    }
+    Some(chain)
+}
+
+/// True when the removed face's supporting surface is geometrically planar.
+fn removed_surface_is_planar(model: &BRepModel, face: &Face) -> bool {
+    use crate::primitives::surface::SurfaceType;
+    model
+        .surfaces
+        .get(face.surface_id)
+        .map(|s| {
+            s.surface_type() == SurfaceType::Plane || s.is_planar(crate::math::STRICT_TOLERANCE)
+        })
+        .unwrap_or(false)
+}
+
+/// Build ONE flat annular wall over a removed planar cap's INNER loop that is a
+/// CLOSED RING of open arcs (a boolean-imprinted bore rim through a flat cap).
+///
+/// The bore rim through a planar cap is split by the boolean into several open
+/// arcs (a box∖cylinder bore → three 120° arcs), but those arcs together form a
+/// CLOSED ring. After the curved-meets-planar reconciliation reseated their
+/// offsets onto the offset cylinder (same cap plane), the wall closing the rim to
+/// its offset is a flat ANNULUS lying in the cap plane: outer loop = the offset
+/// arcs (the larger ring), inner loop = the rim arcs. Building it as one annular
+/// face — the proven `create_curved_rim_wall` flat structure, generalised from a
+/// one-edge seam ring to a multi-arc ring — closes the bore opening watertight
+/// and 2-manifold. Per-arc ruled BANDS instead share radial seam edges that the
+/// orientation oracle flags (two coplanar faces on one edge) and leave an odd
+/// Euler characteristic.
+///
+/// Returns `Ok(None)` (caller falls back to the per-arc bands) unless the loop is
+/// a genuine closed ring of ≥2 open arcs whose every edge has a reseated offset
+/// edge in the dedup map and whose offset ring is concentric with (and a
+/// different radius from) the rim ring — i.e. exactly the reconciled bore.
+#[allow(clippy::too_many_arguments)]
+fn try_create_arc_ring_annular_wall(
+    model: &mut BRepModel,
+    loop_data: &Loop,
+    cap_surface_id: u32,
+    removed_face_outward_normal: Vector3,
+    original_to_offset_edge: &std::collections::HashMap<EdgeId, EdgeId>,
+    removed_counts: &HashMap<EdgeId, usize>,
+    tol: f64,
+) -> OperationResult<Option<FaceId>> {
+    use crate::primitives::face::FaceOrientation;
+    use crate::primitives::r#loop::LoopType;
+
+    use super::orientation::orient_face_for_outward;
+
+    // Gather the rim arcs (open, curved) and their reseated offset arcs.
+    let mut rim_arcs: Vec<EdgeId> = Vec::new();
+    let mut offset_arcs: Vec<EdgeId> = Vec::new();
+    for &edge_id in &loop_data.edges {
+        // A merged-opening internal seam never belongs to a single bore ring.
+        if removed_counts.get(&edge_id).copied().unwrap_or(0) >= 2 {
+            return Ok(None);
+        }
+        let edge = match model.edges.get(edge_id) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        // Every edge of the ring must be an OPEN curved arc.
+        if edge.is_loop() || edge.start_vertex == edge.end_vertex {
+            return Ok(None);
+        }
+        let curve_linear = model
+            .curves
+            .get(edge.curve_id)
+            .map(|c| c.is_linear(Tolerance::new(tol, tol)))
+            .unwrap_or(true);
+        if curve_linear {
+            return Ok(None);
+        }
+        let off = match original_to_offset_edge.get(&edge_id) {
+            Some(&o) => o,
+            None => return Ok(None),
+        };
+        rim_arcs.push(edge_id);
+        offset_arcs.push(off);
+    }
+    if rim_arcs.len() < 2 {
+        return Ok(None);
+    }
+
+    // Rim ring and offset ring radii about their shared centroid: the annulus is
+    // valid only when the two rings are concentric and a different size (the
+    // reconciled bore: rim r vs offset r±t).
+    let ring_radius = |edges: &[EdgeId]| -> Option<(Point3, f64)> {
+        let mut pts: Vec<Point3> = Vec::new();
+        for &e in edges {
+            let edge = model.edges.get(e)?;
+            let curve = model.curves.get(edge.curve_id)?;
+            for k in 0..6 {
+                if let Ok(p) = curve.point_at(k as f64 / 6.0) {
+                    pts.push(p);
+                }
+            }
+        }
+        if pts.len() < 3 {
+            return None;
+        }
+        let mut c = Point3::new(0.0, 0.0, 0.0);
+        for p in &pts {
+            c = c + *p;
+        }
+        c = c * (1.0 / pts.len() as f64);
+        let r = pts.iter().map(|p| (*p - c).magnitude()).sum::<f64>() / pts.len() as f64;
+        Some((c, r))
+    };
+    let (rim_c, rim_r) = match ring_radius(&rim_arcs) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let (off_c, off_r) = match ring_radius(&offset_arcs) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    // Concentric (shared centre) and meaningfully different radius.
+    if (rim_c - off_c).magnitude() > rim_r.max(1.0) * 1e-3 {
+        return Ok(None);
+    }
+    if (rim_r - off_r).abs() <= tol {
+        return Ok(None);
+    }
+
+    // Larger ring is the annulus OUTER loop; smaller is the hole.
+    let (outer_edges, inner_edges): (Vec<EdgeId>, Vec<EdgeId>) = if off_r > rim_r {
+        (offset_arcs, rim_arcs)
+    } else {
+        (rim_arcs, offset_arcs)
+    };
+
+    // Chain each ring's arcs head-to-tail into a CONNECTED closed loop with the
+    // correct per-edge traversal flag. The arcs are stored with arbitrary
+    // start→end directions and arbitrary order; a planar-annulus CDT needs each
+    // loop to be a single simple polygon, so adding them in input order all-
+    // forward (which leaves gaps and self-crossings) makes the CDT abort with
+    // `CrossingFixedEdge` and emit zero triangles (the bore-collar leak).
+    let outer_chain = match chain_edge_ring(model, &outer_edges, tol) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let inner_chain = match chain_edge_ring(model, &inner_edges, tol) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    let mut outer_loop = Loop::new(0, LoopType::Outer);
+    for (e, fwd) in outer_chain {
+        outer_loop.add_edge(e, fwd);
+    }
+    let outer_loop_id = model.loops.add(outer_loop);
+
+    let mut inner_loop = Loop::new(0, LoopType::Inner);
+    for (e, fwd) in inner_chain {
+        inner_loop.add_edge(e, fwd);
+    }
+    let inner_loop_id = model.loops.add(inner_loop);
+
+    let cap_surface = model.surfaces.get(cap_surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "try_create_arc_ring_annular_wall: cap surface {cap_surface_id} not found"
+        ))
+    })?;
+    let orientation = orient_face_for_outward(cap_surface, removed_face_outward_normal)
+        .unwrap_or(FaceOrientation::Forward);
+
+    let mut wall_face = Face::new(0, cap_surface_id, outer_loop_id, orientation);
+    wall_face.add_inner_loop(inner_loop_id);
+    Ok(Some(model.faces.add(wall_face)))
 }
 
 /// Build the curved BAND wall over an OPEN curved rim arc (an imprinted bore-rim
