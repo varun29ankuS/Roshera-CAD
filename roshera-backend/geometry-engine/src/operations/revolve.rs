@@ -736,8 +736,36 @@ fn create_revolution(
 
     // Profile-arc edges: a rotated copy of each profile edge at each station,
     // sharing the ring vertices. Full revolution wraps station `segments` → 0.
+    //
+    // A profile edge whose BOTH endpoints lie on the axis runs ALONG the axis:
+    // every rotated copy is the SAME zero-radius axis segment between the same two
+    // apex vertices. Such an edge bounds no wall face (its wall faces are skipped),
+    // and for a PARTIAL revolution it is the axis seam SHARED by the start and end
+    // caps. Building a fresh per-station copy would give each cap its OWN axis edge
+    // — single-use on both → two boundary edges + an odd Euler χ (the
+    // partial-angle axis-seam leak). Instead build ONE shared seam edge and route
+    // both caps through it (forward at the start cap, reversed at the end cap), so
+    // the axis seam is used by exactly two faces — watertight + manifold. The full
+    // revolution has no caps, so this map stays empty there.
     let mut arcs: HashMap<(usize, u32), EdgeId> = HashMap::new();
+    let mut axis_seam: HashMap<usize, EdgeId> = HashMap::new();
     for (e_idx, &(curve_id, sp, ep)) in prof.iter().enumerate() {
+        if apex[&sp] && apex[&ep] {
+            // Single shared axis-seam edge (apex→apex line, station-invariant).
+            let curve = model.curves.get(curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: profile curve not found".to_string())
+            })?;
+            let new_cid = model.curves.add(curve.clone_box());
+            let edge = Edge::new_auto_range(
+                0,
+                vid_at(sp, 0),
+                vid_at(ep, 0),
+                new_cid,
+                EdgeOrientation::Forward,
+            );
+            axis_seam.insert(e_idx, model.edges.add(edge));
+            continue;
+        }
         for s in 0..n_stations {
             let xf = rot_about_axis(seg_angle * s as f64)?;
             let curve = model.curves.get(curve_id).ok_or_else(|| {
@@ -859,6 +887,7 @@ fn create_revolution(
             model,
             &prof,
             &arcs,
+            &axis_seam,
             0,
             base_surface_id,
             axis_origin,
@@ -870,6 +899,7 @@ fn create_revolution(
             model,
             &prof,
             &arcs,
+            &axis_seam,
             segments,
             base_surface_id,
             axis_origin,
@@ -1373,6 +1403,7 @@ fn build_revolution_cap(
     model: &mut BRepModel,
     prof: &[(u32, VertexId, VertexId)],
     arcs: &std::collections::HashMap<(usize, u32), EdgeId>,
+    axis_seam: &std::collections::HashMap<usize, EdgeId>,
     station: u32,
     base_surface_id: u32,
     axis_origin: Point3,
@@ -1382,14 +1413,26 @@ fn build_revolution_cap(
 ) -> OperationResult<FaceId> {
     use crate::primitives::r#loop::LoopType;
 
-    // Closed loop of the profile arcs at this station (profile order).
+    // Closed loop of the profile arcs at this station (profile order). A profile
+    // edge that runs ALONG the axis (both endpoints on it) contributes the SHARED
+    // axis-seam edge instead of a per-station arc — the seam where the start and
+    // end caps meet. Both caps add it in profile order (its endpoints are the same
+    // axis apex vertices at every station, so each cap loop still closes
+    // v0→…→v3→v0); the two caps carry OPPOSITE face orientations, so the seam's two
+    // uses are opposite in 3D — manifold + watertight. Without the shared seam the
+    // two caps each own a single-use axis edge → a boundary-edge leak + odd
+    // Euler χ (the partial-angle axis-seam defect).
     let mut fl = Loop::new(0, LoopType::Outer);
     let mut centroid = Vector3::ZERO;
     let mut n = 0.0;
     for (e_idx, &(_, sp, _)) in prof.iter().enumerate() {
-        let eid = *arcs.get(&(e_idx, station)).ok_or_else(|| {
-            OperationError::InvalidGeometry("revolve: cap arc not found".to_string())
-        })?;
+        let eid = if let Some(&seam) = axis_seam.get(&e_idx) {
+            seam
+        } else {
+            *arcs.get(&(e_idx, station)).ok_or_else(|| {
+                OperationError::InvalidGeometry("revolve: cap arc not found".to_string())
+            })?
+        };
         fl.add_edge(eid, true);
         let _ = sp;
         if let Some(q) = model.edges.get(eid).and_then(|e| {
