@@ -1884,9 +1884,70 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
                 }
             }
 
+            // --- Periodic self-seam edges: an edge that appears TWICE within
+            // this single loop is the parametric seam of a periodic face
+            // (cylinder/cone/torus/sphere lateral, or a chamfer/fillet rim
+            // blend). The face walks the seam once on each side; the two
+            // occurrences MUST carry opposite loop senses (one forward, one
+            // backward) — that is the structural guarantee that makes the seam
+            // a closed, consistently-wound boundary.
+            //
+            // The geometric `outward_walk_is_forward` heuristic CANNOT decide a
+            // seam's sidedness: it derives the walk from the edge's fixed
+            // start->end geometry plus a single loop centroid, which is identical
+            // for both occurrences (u=0 and u=2π collapse to the same world
+            // edge). It therefore returns the SAME sense twice and the manifold
+            // opposition check below would false-positive every correct periodic
+            // seam (empirically: the cone-rim chamfer blend's seam — its welded
+            // display mesh is watertight + 2-manifold + consistently oriented,
+            // yet a geometric per-walk test reports "same orientation"). So a
+            // self-seam is validated HERE by its loop senses and EXCLUDED from
+            // the geometric `edge_walks` accumulation. A genuine defect — both
+            // occurrences sharing the same sense — is still caught, now by the
+            // authoritative structural test rather than the unreliable geometric
+            // one.
+            let mut seam_occurrences: std::collections::HashMap<EdgeId, Vec<bool>> =
+                std::collections::HashMap::new();
+            for (i, &edge_id) in loop_data.edges.iter().enumerate() {
+                let sense = loop_data.orientations.get(i).copied().unwrap_or(true);
+                seam_occurrences.entry(edge_id).or_default().push(sense);
+            }
+
             // --- Outward-walk sense: does this face walk each edge in its
             // start->end direction within its outward-oriented boundary? ---
-            for &edge_id in &loop_data.edges {
+            for (i, &edge_id) in loop_data.edges.iter().enumerate() {
+                // Self-seam handling: an edge present more than once in this loop
+                // is the periodic seam. Validate sense-opposition once (when we
+                // reach the FIRST occurrence) and skip the geometric arm for it.
+                if let Some(senses) = seam_occurrences.get(&edge_id) {
+                    if senses.len() >= 2 {
+                        let first_idx = loop_data
+                            .edges
+                            .iter()
+                            .position(|&e| e == edge_id)
+                            .unwrap_or(i);
+                        if i == first_idx {
+                            // Exactly two opposite senses ⇒ a well-formed seam.
+                            // Anything else (same sense twice, or an odd count)
+                            // is a genuine seam-winding defect.
+                            let has_fwd = senses.iter().any(|&s| s);
+                            let has_bwd = senses.iter().any(|&s| !s);
+                            if !(senses.len() == 2 && has_fwd && has_bwd) {
+                                errors.push(orientation_err(
+                                    format!(
+                                        "Inconsistent face orientations: periodic seam edge \
+                                         {edge_id} on face {face_id} is not traversed in \
+                                         opposite senses (loop {loop_id} senses: {senses:?})"
+                                    ),
+                                    shell_id,
+                                    face_id,
+                                    edge_id,
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if let Some(walk_fwd) = outward_walk_is_forward(
                     model,
                     face,
