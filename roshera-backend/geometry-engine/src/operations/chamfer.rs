@@ -915,7 +915,10 @@ fn create_closed_edge_chamfer(
     let plane2 = surf2.as_any().downcast_ref::<Plane>();
     let cyl2 = surf2.as_any().downcast_ref::<Cylinder>();
 
-    let (cap_face_id, lat_face_id, plane, cylinder) = if let (Some(p), Some(c)) = (plane1, cyl2) {
+    // `_plane` is bound for the destructure but no longer read: the rim
+    // top/bottom sign is now derived from the rim's axial position (step 0b),
+    // not the cap plane's (unreliable) stored normal.
+    let (cap_face_id, lat_face_id, _plane, cylinder) = if let (Some(p), Some(c)) = (plane1, cyl2) {
         (face1_id, face2_id, *p, *c)
     } else if let (Some(c), Some(p)) = (cyl1, plane2) {
         (face2_id, face1_id, *p, *c)
@@ -1311,8 +1314,23 @@ fn create_closed_edge_chamfer(
         })?;
     let new_height = new_height_limits[1] - new_height_limits[0];
     let new_origin = origin + axis * new_height_limits[0];
-    let new_cylinder = Cylinder::new_finite(new_origin, axis, big_r, new_height)
+    let mut new_cylinder = Cylinder::new_finite(new_origin, axis, big_r, new_height)
         .map_err(|e| OperationError::NumericalError(format!("Shortened cylinder: {e}")))?;
+    // Preserve the ORIGINAL cylinder's angular reference direction. The new
+    // seam vertices (lat_seam_pos / cap_seam_pos in steps 3-4) and the cone
+    // surface (step 10) were all placed using `ref_dir` for θ = 0. But
+    // `Cylinder::new_finite` derives a FRESH ref_dir from `axis.perpendicular()`
+    // — which for a +Z axis is NOT +X. If left default, the lateral surface's
+    // θ = 0 generator would point in a different direction than where the seam
+    // vertices were placed. On a SINGLE rim chamfer the seam vertices and the
+    // shortened cylinder are not re-read together so the mismatch is latent;
+    // but a SECOND closed-edge chamfer on the SAME cylinder (e.g. the opposite
+    // rim) reads this surface's ref_dir to place its own seam vertex, landing
+    // it at the wrong angle (≈ −90°) while the first chamfer's seam vertex is
+    // still at θ = 0 — so the shared lateral seam edge cuts diagonally across
+    // the cylinder ("edge lies off Cylinder surface"). Carrying ref_dir
+    // forward keeps every chamfer's angular frame consistent.
+    new_cylinder.ref_dir = ref_dir;
     if model
         .surfaces
         .replace(lat_surface_id, Box::new(new_cylinder))
