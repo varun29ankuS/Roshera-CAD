@@ -36,7 +36,7 @@ impl InterferenceReport {
 }
 
 /// World isometry of an instance (`translation` + unit quaternion `[x, y, z, w]`).
-fn instance_isometry(instance: &Instance) -> Isometry3<f64> {
+pub(crate) fn instance_isometry(instance: &Instance) -> Isometry3<f64> {
     let translation = Translation3::new(
         instance.translation[0],
         instance.translation[1],
