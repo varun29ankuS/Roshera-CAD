@@ -1059,48 +1059,6 @@ pub(crate) fn certificate_json(
 /// JSON breakdown under `cert`; the top-level `sound`/`watertight`/`verdict` are
 /// the authoritative full-certificate answer in BOTH modes.
 ///
-/// INLINE-CERT TRIANGLE BUDGET — the MCP-RESPONSIVENESS guard.
-///
-/// `certified_response` runs SYNCHRONOUSLY under the model WRITE lock, and every
-/// MCP read tool (`perceive`, `list_parts`, `get_part`, …) takes the SAME lock
-/// to read. So the time the full certificate spends here is time MCP reads are
-/// blocked. The self-intersection scan is now spatial-grid-accelerated and the
-/// cert is memoised, so for any moderate part the full cert is well under the
-/// lock-hold budget — but a single pathological operand (a curved-Boolean
-/// arrangement cell that tessellates to hundreds of thousands of triangles) must
-/// NOT be allowed to stall the write lock and freeze MCP.
-///
-/// The display mesh is already in hand (no extra tessellation), so its triangle
-/// count is a free, conservative proxy for the cert cost (the audit mesh the
-/// self-intersection scan rebuilds is segment-capped BELOW this). Under the
-/// budget → run the full cert inline and report the authoritative verdict. Over
-/// the budget → report the cheap O(n) checks and mark full soundness DEFERRED
-/// (never `sound: true` unchecked); the caller runs the explicit verify surface
-/// (`?full=1` / `verify_part` / `/truth`), which is off the hot path.
-///
-/// 60k triangles keeps the worst-case inline cert (grid-accelerated
-/// self-intersection + mesh-quality scan) comfortably sub-second on the release
-/// build while covering essentially every hand-built part; only a degenerate
-/// curved-Boolean cell exceeds it, and that is exactly the case that must not
-/// hold the lock.
-const INLINE_CERT_TRIANGLE_BUDGET: usize = 60_000;
-
-/// The effective inline-cert triangle budget. Defaults to
-/// [`INLINE_CERT_TRIANGLE_BUDGET`]; overridable at process start via
-/// `ROSHERA_INLINE_CERT_TRI_BUDGET` so an operator can tighten it on a
-/// constrained host (or a test can force the deferred path) without a rebuild.
-/// Read once and cached; a malformed value falls back to the default.
-fn inline_cert_triangle_budget() -> usize {
-    use std::sync::OnceLock;
-    static BUDGET: OnceLock<usize> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("ROSHERA_INLINE_CERT_TRI_BUDGET")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(INLINE_CERT_TRIANGLE_BUDGET)
-    })
-}
-
 /// Takes `&mut model` because `certify_solid` warms the per-face centroid cache
 /// (D4 label selectors) and `calculate_solid_volume` warms the mass-props cache;
 /// the geometry itself is never mutated.
@@ -1109,20 +1067,6 @@ fn certified_response(
     solid_id: geometry_engine::primitives::solid::SolidId,
     mesh: &geometry_engine::tessellation::TriangleMesh,
     full: bool,
-) -> serde_json::Value {
-    certified_response_with_budget(model, solid_id, mesh, full, inline_cert_triangle_budget())
-}
-
-/// Budget-parameterised core of [`certified_response`] — separated so the
-/// MCP-responsiveness guard (the deferred-when-over-budget branch and its
-/// honesty contract) can be tested deterministically without constructing a
-/// 60k-triangle solid. The public wrapper supplies the env-derived budget.
-fn certified_response_with_budget(
-    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
-    solid_id: geometry_engine::primitives::solid::SolidId,
-    mesh: &geometry_engine::tessellation::TriangleMesh,
-    full: bool,
-    budget: usize,
 ) -> serde_json::Value {
     let mut base = perception_json(model, solid_id, mesh);
 
@@ -1136,42 +1080,12 @@ fn certified_response_with_budget(
         map.insert("face_count".into(), serde_json::json!(face_count));
     }
 
-    // MCP-RESPONSIVENESS GUARD: only run the synchronous full certificate when
-    // the part is within the inline budget. `full` (explicit `verify`) always
-    // forces it — the caller has accepted the cost.
-    let tri_count = mesh.triangles.len();
-    let run_inline_cert = full || tri_count <= budget;
-
-    if !run_inline_cert {
-        // OVER BUDGET — do NOT block the write lock (MCP would stall). Report the
-        // cheap verdict and mark full soundness DEFERRED. CRITICAL HONESTY RULE:
-        // never claim `sound: true` we did not fully verify. `perception_json`
-        // set `sound`/`watertight` from the cheap B-Rep check; downgrade `sound`
-        // to `null` (unknown) so no caller reads a cheap pass as a full pass, and
-        // tell them exactly which checks were skipped + where to get them.
-        if let serde_json::Value::Object(map) = &mut base {
-            map.insert("sound".into(), serde_json::Value::Null);
-            map.insert("self_intersection_checked".into(), serde_json::json!(false));
-            map.insert("full_soundness".into(), serde_json::json!("deferred"));
-            map.insert("triangle_count".into(), serde_json::json!(tri_count));
-            map.insert(
-                "verdict".into(),
-                serde_json::json!(format!(
-                    "VALID B-Rep; FULL soundness DEFERRED — part has {tri_count} triangles \
-                     (> {budget} inline budget, kept off the hot path so MCP stays responsive). \
-                     Run verify (?full=1 / verify_part / /truth) for the authoritative \
-                     self-intersection + mesh-quality verdict."
-                )),
-            );
-        }
-        return base;
-    }
-
-    // WITHIN BUDGET — the authoritative soundness verdict on every op.
-    // `certify_solid` is memoised (the producing op invalidated the cache), and
-    // `mesh_self_intersects` is spatial-grid-accelerated, so this stays
-    // sub-second. Elevate `sound`/`watertight`/`verdict` to the full `is_sound()`
-    // answer — the verdict reports ONLY what the kernel actually verified.
+    // AMBIENT FULL CERTIFICATE — the authoritative soundness verdict on every
+    // mutating op. `certify_solid` is memoised (the producing op invalidated the
+    // cache), and `mesh_self_intersects` is now spatial-grid-accelerated, so this
+    // stays sub-second even on real parts. Elevate `sound`/`watertight`/`verdict`
+    // to the full `is_sound()` answer — the verdict now reports ONLY what the
+    // kernel actually verified.
     let cert = model.certify_solid(solid_id);
     let sound = cert.is_sound();
     if let serde_json::Value::Object(map) = &mut base {
@@ -1181,7 +1095,6 @@ fn certified_response_with_budget(
             "self_intersection_free".into(),
             serde_json::json!(cert.self_intersection_free),
         );
-        map.insert("self_intersection_checked".into(), serde_json::json!(true));
         let verdict = if sound {
             "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)"
         } else {
@@ -8141,123 +8054,4 @@ fn build_cors_layer() -> CorsLayer {
 
     base.allow_origin(AllowOrigin::list(parsed))
         .allow_credentials(true)
-}
-
-#[cfg(test)]
-mod certified_response_guard_tests {
-    //! Pins the MCP-RESPONSIVENESS guard's HONESTY contract: when a part is over
-    //! the inline-cert triangle budget, the per-op verdict must NEVER claim
-    //! `sound: true` it did not verify — it reports `sound: null` and marks full
-    //! soundness `deferred`. Under budget, it reports the authoritative full
-    //! certificate. Removing the guard (always-defer) or weakening it (claiming
-    //! sound while deferred) breaks these tests.
-
-    use super::{certified_response_with_budget, INLINE_CERT_TRIANGLE_BUDGET};
-    use geometry_engine::primitives::solid::SolidId;
-    use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
-    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
-
-    fn box_model() -> (
-        BRepModel,
-        SolidId,
-        geometry_engine::tessellation::TriangleMesh,
-    ) {
-        let mut model = BRepModel::new();
-        let sid = match TopologyBuilder::new(&mut model)
-            .create_box_3d(20.0, 16.0, 12.0)
-            .expect("create box")
-        {
-            GeometryId::Solid(s) => s,
-            o => panic!("expected solid, got {o:?}"),
-        };
-        let mesh = {
-            let solid = model.solids.get(sid).expect("solid").clone();
-            tessellate_solid(&solid, &model, &TessellationParams::default())
-        };
-        (model, sid, mesh)
-    }
-
-    /// WITHIN BUDGET: a clean box returns the authoritative full verdict —
-    /// `sound: true`, `self_intersection_checked: true`, no `deferred` marker.
-    #[test]
-    fn within_budget_reports_authoritative_sound() {
-        let (mut model, sid, mesh) = box_model();
-        let v = certified_response_with_budget(
-            &mut model,
-            sid,
-            &mesh,
-            false,
-            INLINE_CERT_TRIANGLE_BUDGET,
-        );
-        assert_eq!(
-            v.get("sound").and_then(|s| s.as_bool()),
-            Some(true),
-            "a clean box within budget must report the authoritative sound:true verdict; got {v}"
-        );
-        assert_eq!(
-            v.get("self_intersection_checked").and_then(|s| s.as_bool()),
-            Some(true),
-            "within budget the self-intersection check must have run"
-        );
-        assert!(
-            v.get("full_soundness").is_none(),
-            "within budget there is no deferral marker"
-        );
-    }
-
-    /// OVER BUDGET (forced via budget = 0): the HONESTY contract — `sound` is
-    /// `null` (NOT `true`), the self-intersection check is marked NOT run, and
-    /// the verdict tells the caller soundness is deferred. This is the exact
-    /// guard that keeps MCP responsive on a pathological part WITHOUT ever
-    /// reporting unverified soundness (the verification-gap regression).
-    #[test]
-    fn over_budget_never_claims_sound_and_marks_deferred() {
-        let (mut model, sid, mesh) = box_model();
-        // Budget 0 forces the deferred path even for a trivial box (non-`full`).
-        let v = certified_response_with_budget(&mut model, sid, &mesh, false, 0);
-
-        assert!(
-            v.get("sound").map(|s| s.is_null()).unwrap_or(false),
-            "over budget, `sound` must be null (unknown) — never a claimed bool; got {v}"
-        );
-        assert_ne!(
-            v.get("sound").and_then(|s| s.as_bool()),
-            Some(true),
-            "over budget MUST NOT claim sound:true (the verification gap)"
-        );
-        assert_eq!(
-            v.get("self_intersection_checked").and_then(|s| s.as_bool()),
-            Some(false),
-            "over budget, the self-intersection check is explicitly NOT run"
-        );
-        assert_eq!(
-            v.get("full_soundness").and_then(|s| s.as_str()),
-            Some("deferred"),
-            "over budget, full soundness is explicitly marked deferred"
-        );
-        assert!(
-            v.get("verdict")
-                .and_then(|s| s.as_str())
-                .map(|s| s.contains("DEFERRED"))
-                .unwrap_or(false),
-            "the verdict string must tell the caller soundness is deferred"
-        );
-    }
-
-    /// EXPLICIT VERIFY OVERRIDES THE BUDGET: `full == true` always runs the full
-    /// certificate even at budget 0 — the caller accepted the cost.
-    #[test]
-    fn explicit_full_forces_cert_even_over_budget() {
-        let (mut model, sid, mesh) = box_model();
-        let v = certified_response_with_budget(&mut model, sid, &mesh, true, 0);
-        assert_eq!(
-            v.get("sound").and_then(|s| s.as_bool()),
-            Some(true),
-            "explicit full=true must run the cert regardless of budget; got {v}"
-        );
-        assert!(
-            v.get("cert").is_some(),
-            "explicit full=true attaches the full cert breakdown"
-        );
-    }
 }
