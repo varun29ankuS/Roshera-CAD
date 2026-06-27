@@ -197,10 +197,44 @@ function ok(data: unknown) {
 
 function fail(e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
+  const hint = errorHint(msg);
   return {
-    content: [{ type: "text" as const, text: `ERROR: ${msg}` }],
+    content: [
+      {
+        type: "text" as const,
+        text: hint ? `ERROR: ${msg}\nHINT: ${hint}` : `ERROR: ${msg}`,
+      },
+    ],
     isError: true as const,
   };
+}
+
+/**
+ * Translate a common kernel refusal into ONE actionable next step. The kernel
+ * refuses rather than ship bad geometry (the moat); this turns its terse,
+ * correct error into guidance the agent can act on. Returns null when the raw
+ * message is already clear.
+ */
+function errorHint(msg: string): string | null {
+  const m = msg.toLowerCase();
+  if (
+    m.includes("invalidradius") ||
+    (m.includes("radius") && m.includes("not greater"))
+  )
+    return "radius is non-positive or larger than an edge's available corner room — retry with a smaller radius, or pass explicit edge_ids to blend only the edges that fit.";
+  if (m.includes("self-intersect") || m.includes("self intersect"))
+    return "the result would self-intersect — reduce the radius/distance, or apply the blend to fewer edges.";
+  if (m.includes("not found in any face") || m.includes("3-valent corner"))
+    return "an edge could not be blended at a degenerate corner — try a smaller radius or a subset of edges; if it persists the part topology needs healing.";
+  if (
+    m.includes("unsound") ||
+    m.includes("non-manifold") ||
+    m.includes("not certified")
+  )
+    return "the kernel produced an unsound result and refused it (the moat held) — inspect with verify_part / ground_truth; do NOT assume the geometry is valid.";
+  if (m.includes("no live solid") || m.includes("not found"))
+    return "the part_id may be stale or consumed (booleans consume their operands) — call list_parts for the current ids.";
+  return null;
 }
 
 /** Fetch a part's placement so create-tools can echo where things landed. */
@@ -1662,10 +1696,12 @@ server.tool(
     "the kernel `part_id` (from list_parts) and the `radius` (> 0, in model " +
     "units). `edge_ids` selects which edges to blend (get them from select_edge / " +
     "render_part mode:'ids'); OMIT `edge_ids` to blend ALL edges of the solid at " +
-    "once. Identity-preserving: the body keeps its part id/UUID. Filleting can " +
-    "self-intersect or fail to close at tight corners, so the result is always " +
-    "perception-verified — check the returned cert (sound / watertight) before " +
-    "trusting it.",
+    "once — including parts built through booleans (drilled holes, unions): a " +
+    "hole's over-split rim is auto-healed into one edge and seams / over-radius " +
+    "edges are skipped, so it ROUNDS EVERYTHING IT CAN rather than refusing the " +
+    "whole op. Identity-preserving: the body keeps its part id/UUID. The result " +
+    "is always perception-verified — check the returned cert (sound / watertight) " +
+    "before trusting it.",
   {
     part_id: z.number().int().describe("kernel part id from list_parts"),
     radius: z.number().positive().describe("fillet radius in model units (> 0)"),
