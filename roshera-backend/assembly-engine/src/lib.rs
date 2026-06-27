@@ -19,6 +19,7 @@
 
 pub mod grounding;
 pub mod interference;
+pub mod mate_residual;
 pub mod report;
 pub mod types;
 
