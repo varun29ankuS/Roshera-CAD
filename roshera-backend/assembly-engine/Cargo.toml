@@ -8,9 +8,11 @@ license = "Apache-2.0"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 
-# NOTE (loop S2): parry3d-f64 is added when the static-interference slice lands.
-# Slice 1 is the topological data model + grounding (no geometry numerics), so it
-# carries no external collision dep and compiles fast.
+# Parry (f64 build) — the commodity collision/CCD engine. Each instance's kernel
+# tessellation becomes a TriMesh in its local frame; the instance pose is the
+# world isometry. Static interference now; broad-phase + swept CCD in later
+# slices. The mate-solve and the certificate stay ours.
+parry3d-f64 = "0.17"
 
 [lints]
 workspace = true

@@ -18,7 +18,9 @@
 //! commodity collision/CCD engine underneath.
 
 pub mod grounding;
+pub mod interference;
 pub mod types;
 
 pub use grounding::GroundingReport;
+pub use interference::{InterferencePair, InterferenceReport};
 pub use types::{Assembly, FeatureRef, Instance, InstanceId, Mate, MateKind, Mesh};
