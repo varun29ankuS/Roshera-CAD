@@ -7918,12 +7918,28 @@ fn partition_outer_and_pre_existing_hole_cycles(
         let hc = centroid_2d(&cycle_polys_2d[h]);
         let mut chosen: Option<usize> = None;
         if let Some(hc) = hc {
+            // A pre-existing hole belongs to the TIGHTEST (smallest-area)
+            // containing outer cycle, not merely the first one found. When a
+            // cut circle splits the face into a larger outer ring AND a smaller
+            // inner disc, BOTH contain the hole's centroid — but the hole is
+            // part of the inner disc. Taking the first match (often the larger
+            // original boundary) attaches the hole to the ring, which
+            // Intersection then DROPS, stranding the hole's wall as open edges
+            // (a single-hole plate ∩ cylinder collapsed to a solid disc with
+            // hundreds of open edges). Smallest-area selection is operation-
+            // independent and correct: a point belongs to the innermost region
+            // that encloses it. Non-nested cases keep one candidate, so this is
+            // a no-op there (e.g. the #35 chained-difference multi-hole cap).
+            let mut best_area = f64::INFINITY;
             for (pos, &o) in outer_indices.iter().enumerate() {
                 if cycle_polys_2d[o].len() >= 3
                     && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o])
                 {
-                    chosen = Some(pos);
-                    break;
+                    let area = signed_area(&cycle_polys_2d[o]);
+                    if area < best_area {
+                        best_area = area;
+                        chosen = Some(pos);
+                    }
                 }
             }
         }
