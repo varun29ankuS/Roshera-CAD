@@ -1,18 +1,20 @@
 //! The SE(3) constraint solver + DOF analysis.
 //!
-//! **S5a (this slice): degrees-of-freedom analysis.** An assembly's mobility is
-//! the dimension of the null space of its constraint Jacobian:
-//! `DOF = 6·M − rank(J)`, where `M` is the number of non-ground instances and
-//! `J = ∂g/∂q` is the Jacobian of the stacked mate residuals `g` with respect to
-//! each non-ground instance's 6-DOF pose tangent (3 translation + 3 rotation
-//! about the world axes). `J` is built by **central** finite differences so the
-//! null directions land near machine zero and the rank separates cleanly.
+//! **DOF analysis (S5a).** An assembly's mobility is the dimension of the null
+//! space of its constraint Jacobian: `DOF = 6·M − rank(J)`, where `M` is the
+//! number of non-ground instances and `J = ∂g/∂q` is the Jacobian of the stacked
+//! mate residuals `g` with respect to each non-ground instance's 6-DOF pose
+//! tangent (3 translation + 3 rotation about the world axes). `J` is built by
+//! **central** finite differences so the null directions land near machine zero
+//! and the rank separates cleanly.
 //!
-//! S5b adds the Gauss-Newton solve that drives `g → 0` and writes the solved
-//! poses back.
+//! **Gauss-Newton solve (S5b).** `solve()` drives `g → 0` by stepping each
+//! non-ground pose along `−J⁺·g` (the SVD pseudo-inverse) until the residual is
+//! within tolerance or the step stagnates. A conflicting (over-constrained) mate
+//! set is detected as a stagnated step whose residual stays above tolerance.
 
-use crate::types::Assembly;
-use parry3d_f64::na::{DMatrix, Quaternion, UnitQuaternion, Vector3};
+use crate::types::{Assembly, Instance};
+use parry3d_f64::na::{DMatrix, DVector, Quaternion, UnitQuaternion, Vector3};
 
 /// How constrained an assembly's mate graph leaves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,17 @@ pub struct DofReport {
     pub mobility: Mobility,
 }
 
+/// The outcome of a constraint solve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SolveReport {
+    /// Every mate satisfied within tolerance.
+    pub converged: bool,
+    pub iterations: usize,
+    /// `‖g‖` at the final pose. Stays above tolerance for a conflicting
+    /// (over-constrained) mate set even once the step size has stagnated.
+    pub final_residual_norm: f64,
+}
+
 /// Indices (into `instances`) of the non-ground instances; each carries 6 DOF.
 fn nonground(assembly: &Assembly) -> Vec<usize> {
     assembly
@@ -55,26 +68,37 @@ fn residual_vector(assembly: &Assembly) -> Vec<f64> {
     g
 }
 
+/// Euclidean norm of a residual vector.
+fn residual_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+/// Apply a 6-DOF tangent step to an instance pose IN PLACE: `translation +=
+/// step[0..3]`; `rotation = exp(step[3..6]) · rotation` (a world-frame rotation
+/// increment). Shared by the finite-difference Jacobian and the solve.
+fn apply_tangent_step(instance: &mut Instance, step: &[f64; 6]) {
+    instance.translation[0] += step[0];
+    instance.translation[1] += step[1];
+    instance.translation[2] += step[2];
+    let delta = UnitQuaternion::from_scaled_axis(Vector3::new(step[3], step[4], step[5]));
+    let current = UnitQuaternion::from_quaternion(Quaternion::new(
+        instance.rotation[3],
+        instance.rotation[0],
+        instance.rotation[1],
+        instance.rotation[2],
+    ));
+    let updated = (delta * current).quaternion().to_owned();
+    instance.rotation = [updated.i, updated.j, updated.k, updated.w];
+}
+
 /// Perturb instance `inst_idx`'s pose by `eps` along tangent component `k`
 /// (0..3 = translation x/y/z, 3..6 = rotation about world x/y/z), on a clone.
 fn perturbed(assembly: &Assembly, inst_idx: usize, k: usize, eps: f64) -> Assembly {
     let mut clone = assembly.clone();
     if let Some(instance) = clone.instances.get_mut(inst_idx) {
-        if k < 3 {
-            instance.translation[k] += eps;
-        } else {
-            let mut axis = Vector3::zeros();
-            axis[k - 3] = 1.0;
-            let delta = UnitQuaternion::from_scaled_axis(axis * eps);
-            let current = UnitQuaternion::from_quaternion(Quaternion::new(
-                instance.rotation[3],
-                instance.rotation[0],
-                instance.rotation[1],
-                instance.rotation[2],
-            ));
-            let updated = (delta * current).quaternion().to_owned();
-            instance.rotation = [updated.i, updated.j, updated.k, updated.w];
-        }
+        let mut step = [0.0_f64; 6];
+        step[k] = eps;
+        apply_tangent_step(instance, &step);
     }
     clone
 }
@@ -127,6 +151,54 @@ impl Assembly {
             mobility,
         }
     }
+
+    /// Gauss-Newton solve: drive the mate residuals to zero by stepping each
+    /// non-ground instance's pose along `−J⁺·g` until `‖g‖ < tol` or the step
+    /// stagnates, writing the solved poses back. A conflicting (over-constrained)
+    /// mate set leaves `final_residual_norm > tol` with `converged == false`.
+    pub fn solve(&mut self) -> SolveReport {
+        const TOL: f64 = 1e-9;
+        const MAX_ITERS: usize = 200;
+        const STEP_TOL: f64 = 1e-13;
+        let ng = nonground(self);
+        let mut iterations = 0;
+        let mut norm = residual_norm(&residual_vector(self));
+        while iterations < MAX_ITERS && norm > TOL {
+            let g = residual_vector(self);
+            if g.is_empty() {
+                break;
+            }
+            let jac = self.constraint_jacobian();
+            let pinv = match jac.pseudo_inverse(1e-9) {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if pinv.ncols() != g.len() {
+                break;
+            }
+            let step = -(pinv * DVector::from_vec(g));
+            let step_norm = step.norm();
+            for (block, &inst_idx) in ng.iter().enumerate() {
+                let mut s = [0.0_f64; 6];
+                for (k, slot) in s.iter_mut().enumerate() {
+                    *slot = step.get(6 * block + k).copied().unwrap_or(0.0);
+                }
+                if let Some(instance) = self.instances.get_mut(inst_idx) {
+                    apply_tangent_step(instance, &s);
+                }
+            }
+            iterations += 1;
+            norm = residual_norm(&residual_vector(self));
+            if step_norm < STEP_TOL {
+                break;
+            }
+        }
+        SolveReport {
+            converged: norm <= TOL,
+            iterations,
+            final_residual_norm: norm,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +243,22 @@ mod tests {
         }
     }
 
+    fn plane_mate(a_point: [f64; 3], b_point: [f64; 3]) -> Mate {
+        Mate {
+            kind: MateKind::Coincident,
+            a: InstanceId(0),
+            feature_a: FeatureRef::Face {
+                point: a_point,
+                normal: [0.0, 0.0, 1.0],
+            },
+            b: InstanceId(1),
+            feature_b: FeatureRef::Face {
+                point: b_point,
+                normal: [0.0, 0.0, -1.0],
+            },
+        }
+    }
+
     #[test]
     fn single_concentric_leaves_two_dof() {
         // A shaft in a bore: free to spin about the axis and slide along it.
@@ -209,5 +297,57 @@ mod tests {
         let report = assembly.dof_analysis();
         assert_eq!(report.dof, 6);
         assert_eq!(report.mobility, Mobility::Mobile);
+    }
+
+    #[test]
+    fn solve_centers_a_perturbed_concentric_pair() {
+        let mut assembly = Assembly::new(InstanceId(0));
+        assembly.add_instance(part(0)); // ground at origin
+        let mut p1 = part(1);
+        p1.translation = [3.0, 0.0, 0.0]; // off the z-axis by 3
+        assembly.add_instance(p1);
+        assembly.add_mate(concentric([0.0, 0.0, 1.0]));
+
+        let report = assembly.solve();
+        assert!(
+            report.converged,
+            "concentric is satisfiable; final={}",
+            report.final_residual_norm
+        );
+        assert!(report.final_residual_norm < 1e-6);
+        let x = assembly
+            .instance(InstanceId(1))
+            .map(|i| i.translation[0])
+            .unwrap_or(99.0);
+        assert!(x.abs() < 1e-6, "expected on-axis, x={x}");
+    }
+
+    #[test]
+    fn solve_flags_conflicting_mates() {
+        // The same face of part 1 told to lie in two different planes (z=0, z=5).
+        let mut assembly = Assembly::new(InstanceId(0));
+        assembly.add_instance(part(0));
+        assembly.add_instance(part(1));
+        assembly.add_mate(plane_mate([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]));
+        assembly.add_mate(plane_mate([0.0, 0.0, 5.0], [0.0, 0.0, 0.0]));
+
+        let report = assembly.solve();
+        assert!(!report.converged, "conflicting mates cannot both hold");
+        assert!(
+            report.final_residual_norm > 1.0,
+            "residual stuck high: {}",
+            report.final_residual_norm
+        );
+    }
+
+    #[test]
+    fn solve_is_idempotent_on_a_satisfied_assembly() {
+        let mut assembly = Assembly::new(InstanceId(0));
+        assembly.add_instance(part(0));
+        assembly.add_instance(part(1)); // already on the axis at origin
+        assembly.add_mate(concentric([0.0, 0.0, 1.0]));
+        let report = assembly.solve();
+        assert!(report.converged);
+        assert!(report.final_residual_norm < 1e-9);
     }
 }
