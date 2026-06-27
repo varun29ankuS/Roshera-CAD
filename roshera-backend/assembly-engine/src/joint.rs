@@ -8,9 +8,10 @@
 
 use crate::types::Instance;
 use parry3d_f64::na::{Point3, Quaternion, UnitQuaternion, Vector3};
+use serde::{Deserialize, Serialize};
 
 /// A kinematic joint, parameterized by its free DOF.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Joint {
     /// 1 DOF — rotation by an angle about an axis LINE.
     Revolute {

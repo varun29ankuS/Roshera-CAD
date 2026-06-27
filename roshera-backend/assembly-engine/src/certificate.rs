@@ -16,9 +16,10 @@ use crate::joint::Joint;
 use crate::solver::Mobility;
 use crate::sweep::swept_clearance;
 use crate::types::{Assembly, InstanceId};
+use serde::{Deserialize, Serialize};
 
 /// A mechanism to verify swept clearance for during certification.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mechanism {
     pub moving: InstanceId,
     pub joint: Joint,
@@ -29,7 +30,7 @@ pub struct Mechanism {
 }
 
 /// The full assembly certificate.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssemblyCertificate {
     /// The mate system is satisfiable (the Gauss-Newton solve converges).
     pub mates_consistent: bool,

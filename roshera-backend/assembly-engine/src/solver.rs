@@ -15,9 +15,10 @@
 
 use crate::types::{Assembly, Instance};
 use parry3d_f64::na::{DMatrix, DVector, Quaternion, UnitQuaternion, Vector3};
+use serde::{Deserialize, Serialize};
 
 /// How constrained an assembly's mate graph leaves it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mobility {
     /// Zero remaining freedom — every part is exactly located.
     FullyConstrained,
