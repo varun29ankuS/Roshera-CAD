@@ -1,0 +1,24 @@
+//! Roshera assembly module — **kinematic**.
+//!
+//! An assembly is not a static arrangement of positioned parts; it is a
+//! kinematic system whose mechanisms (gimbal, actuators, shafts) are degrees of
+//! freedom in a mate graph. "Sound assembly" means interference-free across
+//! every reachable configuration of those DOF — not just the current pose.
+//!
+//! Design: `Roshera-vault/Development-Journal/assembly-module-design.md`.
+//!
+//! Layering (built slice by slice via `ASSEMBLY_LOOP.md`):
+//!   * data model — instances + mates on named features                (this slice)
+//!   * grounding — the no-float check                                   (this slice)
+//!   * Parry — broad/narrow-phase interference, then CCD swept clearance (S2+)
+//!   * mate solver — SE(3) geometric constraint solve + DOF analysis     (S4+)
+//!   * assembly certificate — grounded · dof-as-designed · clear         (S8)
+//!
+//! The mate-solve and the certificate are OURS (the moat); Parry is the
+//! commodity collision/CCD engine underneath.
+
+pub mod grounding;
+pub mod types;
+
+pub use grounding::GroundingReport;
+pub use types::{Assembly, FeatureRef, Instance, InstanceId, Mate, MateKind, Mesh};

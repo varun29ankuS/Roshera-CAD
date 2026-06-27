@@ -8,7 +8,8 @@ members = [
     "ai-integration",
     "export-engine",
     "ros-format",
-    "verdict-harness"
+    "verdict-harness",
+    "assembly-engine"
 ]
 resolver = "2"
 
