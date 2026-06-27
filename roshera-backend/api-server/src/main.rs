@@ -1129,6 +1129,129 @@ fn body_verify_flag(payload: &serde_json::Value) -> bool {
     payload.get("verify").map(truthy).unwrap_or(false)
 }
 
+/// POST /api/assembly/verify — certify a kinematic assembly declared over the
+/// LIVE kernel parts. The agent works in part UUIDs + instance ids; the server
+/// tessellates each part into the assembly mesh, runs the kinematic certificate
+/// (grounding · mate-consistency · DOF · static interference · swept clearance),
+/// and returns the verdict. Body:
+/// ```json
+/// { "ground": <u32>,
+///   "parts": [{ "object": "<uuid>", "instance_id": <u32>,
+///               "translation": [x,y,z], "rotation": [x,y,z,w] }],
+///   "mates": [ <Mate> ... ], "mechanisms": [ <Mechanism> ... ], "epsilon": <f64> }
+/// ```
+async fn assembly_verify(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use assembly_engine::{Assembly, Instance, InstanceId, Mate, Mechanism, Mesh};
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let ground = payload
+        .get("ground")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ApiError::missing_field("ground"))? as u32;
+    let parts = payload
+        .get("parts")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError::missing_field("parts"))?;
+
+    let mut assembly = Assembly::new(InstanceId(ground));
+    {
+        // Tessellation is read-only; hold the read lock for all parts.
+        let model = model_handle.read().await;
+        for part in parts {
+            let uuid_s = part
+                .get("object")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ApiError::missing_field("parts[].object"))?;
+            let uuid = Uuid::parse_str(uuid_s).map_err(|_| {
+                ApiError::new(ErrorCode::InvalidParameter, format!("bad uuid: {uuid_s}"))
+            })?;
+            let solid_id = state.get_local_id(&uuid).ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::SolidNotFound,
+                    format!("no kernel solid registered for {uuid}"),
+                )
+            })?;
+            let instance_id = part
+                .get("instance_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ApiError::missing_field("parts[].instance_id"))?
+                as u32;
+
+            let solid = model.solids.get(solid_id).ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::SolidNotFound,
+                    format!("kernel solid for {uuid} missing from the model"),
+                )
+            })?;
+            let tri = tessellate_solid(solid, &model, &TessellationParams::default());
+            let mesh = Mesh {
+                vertices: tri
+                    .vertices
+                    .iter()
+                    .map(|v| [v.position.x, v.position.y, v.position.z])
+                    .collect(),
+                triangles: tri.triangles.clone(),
+            };
+            let mut instance =
+                Instance::new(InstanceId(instance_id), format!("part_{instance_id}"), mesh);
+            if let Some(t) = part.get("translation").and_then(|v| v.as_array()) {
+                for (k, slot) in instance.translation.iter_mut().enumerate() {
+                    if let Some(x) = t.get(k).and_then(|v| v.as_f64()) {
+                        *slot = x;
+                    }
+                }
+            }
+            if let Some(r) = part.get("rotation").and_then(|v| v.as_array()) {
+                for (k, slot) in instance.rotation.iter_mut().enumerate() {
+                    if let Some(x) = r.get(k).and_then(|v| v.as_f64()) {
+                        *slot = x;
+                    }
+                }
+            }
+            assembly.add_instance(instance);
+        }
+        // model read guard drops here
+    }
+
+    // Mates + mechanisms deserialize directly off the assembly-engine serde types.
+    if let Some(v) = payload.get("mates") {
+        let mates: Vec<Mate> = serde_json::from_value(v.clone())
+            .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, format!("mates: {e}")))?;
+        for mate in mates {
+            assembly.add_mate(mate);
+        }
+    }
+    let mechanisms: Vec<Mechanism> = match payload.get("mechanisms") {
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, format!("mechanisms: {e}")))?,
+        None => Vec::new(),
+    };
+    let epsilon = payload
+        .get("epsilon")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let cert = assembly.certify(&mechanisms, epsilon);
+    let grounding = assembly.grounding_report();
+    let verdict = if cert.is_sound() {
+        "SOUND — the assembly goes together and moves without collision"
+    } else {
+        "NOT SOUND — a certificate dimension failed (see floating / mates / interference / clearance)"
+    };
+
+    Ok(Json(serde_json::json!({
+        "is_sound": cert.is_sound(),
+        "certificate": serde_json::to_value(&cert).unwrap_or(serde_json::Value::Null),
+        "floating_instances": grounding.floating.iter().map(|i| i.0).collect::<Vec<_>>(),
+        "verdict": verdict,
+    })))
+}
+
 async fn boolean_operation(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -7318,6 +7441,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 auth_middleware::require_modify_geometry,
             )),
         )
+        .route("/api/assembly/verify", post(assembly_verify))
         .route(
             "/api/geometry/extrude",
             post(create_extrude).route_layer(axum::middleware::from_fn(
