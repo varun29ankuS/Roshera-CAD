@@ -23,6 +23,7 @@ pub mod joint;
 pub mod mate_residual;
 pub mod report;
 pub mod solver;
+pub mod sweep;
 pub mod types;
 
 pub use grounding::GroundingReport;
@@ -30,4 +31,5 @@ pub use interference::{InterferencePair, InterferenceReport};
 pub use joint::Joint;
 pub use report::AssemblyReport;
 pub use solver::{DofReport, Mobility, SolveReport};
+pub use sweep::{swept_clearance, SweptClearance};
 pub use types::{Assembly, FeatureRef, Instance, InstanceId, Mate, MateKind, Mesh};
