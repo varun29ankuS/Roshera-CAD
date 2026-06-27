@@ -322,3 +322,56 @@ fn probe_x_bore_thick_wall_is_sound() {
     );
     assert_eq!(euler, 0, "a clean through-hole is genus-1 (euler=0)");
 }
+
+// ───────── #5 taller-upstand coincident L-bracket (live dogfood #32) ─────────
+//
+// Live MCP dogfood (2026-06-27): the SIMPLEST functional L-bracket — a base
+// plate with a TALLER upstand flush on its back edge — is non-manifold. Base
+// [x:-12..12, y:-6..6, z:0..3] ∪ upstand [x:-12..12, y:3..6, z:0..15]. The
+// upstand's back face (y=6) is COINCIDENT with the base's back (a SUBSET: base
+// back z[0,3] ⊂ upstand back z[0,15]) and its bottom (z=0) coincident with the
+// base bottom, while the upstand PIERCES the base top (z=3). Cert: nm=5
+// (3-faces/edge) + 1 boundary gap, euler=3. The non-identical coincident-face
+// overlap (#32) — distinct from the flat-L `l_bracket` (same z-extent) which is
+// sound. Pinned to flip SOUND when the coincident-face weld is fixed.
+#[test]
+fn f5_taller_upstand_coincident_l_bracket_is_sound() {
+    let mut m = BRepModel::new();
+    let base = box_at(&mut m, 24.0, 12.0, 3.0, 0.0, 0.0, 1.5); // z∈[0,3]
+    let upstand = box_at(&mut m, 24.0, 3.0, 15.0, 0.0, 4.5, 7.5); // y∈[3,6], z∈[0,15]
+    assert_operand_sound(&mut m, base, "f5 base operand");
+    assert_operand_sound(&mut m, upstand, "f5 upstand operand");
+    let r = union(&mut m, base, upstand);
+    let (sound, bnd, nm, _euler) = metrics(&mut m, r, "f5 taller-upstand");
+    assert!(
+        sound,
+        "f5: taller-upstand coincident L-bracket must be sound"
+    );
+    assert_eq!(nm, 0, "f5: no non-manifold edges");
+    assert_eq!(bnd, 0, "f5: watertight (no boundary gap)");
+}
+
+// Diagnostic: at what ε on the coincident back face does the union break? The
+// MCP path anchors the upstand via a Matrix4; if that leaves its back face a
+// hair off the base's (instead of bit-exact y=6), and the boolean is fragile to
+// that, this prints the break threshold. eps=0 is the sound f5 case.
+#[test]
+fn f5_epsilon_sensitivity_of_coincident_face() {
+    for eps in [0.0_f64, 1e-15, 1e-12, 1e-9, 1e-6, 1e-3] {
+        let mut m = BRepModel::new();
+        let base = box_at(&mut m, 24.0, 12.0, 3.0, 0.0, 0.0, 1.5);
+        let upstand = box_at(&mut m, 24.0, 3.0, 15.0, 0.0, 4.5 + eps, 7.5);
+        let _ = (base, upstand);
+        let r = union(&mut m, base, upstand);
+        let gt = m.ground_truth(r).expect("ground truth");
+        let mr = manifold_report(&mut m, r, 0.05, 1.0e-5).expect("manifold report");
+        eprintln!(
+            "[eps={:>9.0e}] sound={} nm={} bnd={} euler={}",
+            eps,
+            gt.certificate.is_sound(),
+            mr.nonmanifold_edges,
+            mr.boundary_edges,
+            mr.euler_characteristic,
+        );
+    }
+}

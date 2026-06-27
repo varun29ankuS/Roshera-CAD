@@ -3590,6 +3590,133 @@ mod tests {
         (model, region_solids[0])
     }
 
+    /// Build ONE sketch-extruded box (rectangle profile on XY, extruded +Z)
+    /// into a SHARED model — the exact kernel path MCP `create_box` drives
+    /// (sketch rectangle → create_face_from_profile → extrude_face). Two of
+    /// these in one model reproduce the live L-bracket union.
+    fn extrude_rect_into(model: &mut BRepModel, c0: [f64; 2], c1: [f64; 2], height: f64) -> u32 {
+        let tol = geometry_engine::math::Tolerance::default();
+        let rect: Vec<Point3> = vec![
+            Point3::new(c0[0], c0[1], 0.0),
+            Point3::new(c1[0], c0[1], 0.0),
+            Point3::new(c1[0], c1[1], 0.0),
+            Point3::new(c0[0], c1[1], 0.0),
+        ];
+        let edges = build_loop_edges_for_test(model, &rect, tol.distance());
+        let face_id = create_face_from_profile_with_plane(
+            model,
+            edges,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::Z,
+        )
+        .expect("create_face_from_profile_with_plane");
+        let options = ExtrudeOptions {
+            direction: Vector3::Z,
+            distance: height,
+            common: geometry_engine::operations::CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..ExtrudeOptions::default()
+        };
+        extrude_face(model, face_id, options).expect("extrude_face")
+    }
+
+    // ★ Repro of the live MCP `create_box` L-bracket. create_box = sketch +
+    // extrude (NOT the create_box_3d primitive). Base [x:-12..12,y:-6..6,z:0..3]
+    // ∪ upstand [x:-12..12,y:3..6,z:0..15], both SKETCH-EXTRUDED, sharing y=6.
+    // The create_box_3d-primitive version is SOUND (boolean_bracket_robustness
+    // f5); this pins whether the SKETCH-EXTRUDE construction is what breaks it.
+    #[test]
+    fn mcp_sketch_extrude_lbracket_union_repro() {
+        use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+        let mut model = BRepModel::new();
+        let base = extrude_rect_into(&mut model, [-12.0, -6.0], [12.0, 6.0], 3.0);
+        let upstand = extrude_rect_into(&mut model, [-12.0, 3.0], [12.0, 6.0], 15.0);
+        let base_sound = model
+            .ground_truth(base)
+            .expect("base gt")
+            .certificate
+            .is_sound();
+        let up_sound = model
+            .ground_truth(upstand)
+            .expect("up gt")
+            .certificate
+            .is_sound();
+        let r = boolean_operation(
+            &mut model,
+            base,
+            upstand,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("union must complete");
+        let gt = model.ground_truth(r).expect("union gt");
+        eprintln!("[sketch-extrude operands] base_sound={base_sound} upstand_sound={up_sound}");
+        eprintln!(
+            "[sketch-extrude L-bracket UNION] sound={} | {}",
+            gt.certificate.is_sound(),
+            gt.summary()
+        );
+        let rep = geometry_engine::harness::brep_integrity::brep_integrity(&model, r, 1e-6);
+        eprintln!(
+            "[union] orient_inconsistent_edges={:?}",
+            rep.orientation_inconsistent_edges
+        );
+        dump_faces(&model, r, "union    ");
+        assert!(
+            base_sound && up_sound,
+            "operands must be individually sound (base={base_sound} up={up_sound})"
+        );
+    }
+
+    fn dump_faces(model: &BRepModel, solid: u32, label: &str) {
+        let Some(sref) = model.solids.get(solid) else {
+            return;
+        };
+        let shell_id = sref.outer_shell;
+        let Some(shell) = model.shells.get(shell_id) else {
+            return;
+        };
+        let fids: Vec<u32> = shell.faces.clone();
+        for fid in fids {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            let n = model
+                .surfaces
+                .get(face.surface_id)
+                .and_then(|s| s.evaluate_full(0.5, 0.5).ok())
+                .map(|e| e.normal)
+                .unwrap_or(Vector3::ZERO);
+            eprintln!(
+                "[{label}] face={fid} orient={:?} surf_normal=({:+.2},{:+.2},{:+.2})",
+                face.orientation, n.x, n.y, n.z
+            );
+        }
+    }
+
+    // Compare the FACE-ORIENTATION CONVENTION of a sketch-EXTRUDED box vs the
+    // create_box_3d PRIMITIVE. The boolean inherits each operand face's
+    // orientation raw (boolean.rs:15752); if extrude emits Backward faces where
+    // the primitive emits Forward, the union mis-winds (B root).
+    #[test]
+    fn diag_extrude_vs_primitive_box_face_convention() {
+        use geometry_engine::primitives::topology_builder::{GeometryId, TopologyBuilder};
+        let mut m1 = BRepModel::new();
+        let ext = extrude_rect_into(&mut m1, [-12.0, -6.0], [12.0, 6.0], 3.0);
+        dump_faces(&m1, ext, "extrude  ");
+        let mut m2 = BRepModel::new();
+        let prim = match TopologyBuilder::new(&mut m2)
+            .create_box_3d(24.0, 12.0, 3.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        dump_faces(&m2, prim, "primitive");
+    }
+
     #[test]
     fn slice_b_extrudes_rectangle_with_circle_hole_inside_single_region() {
         // Real-world workflow: rectangle outer + circle in the centre,
