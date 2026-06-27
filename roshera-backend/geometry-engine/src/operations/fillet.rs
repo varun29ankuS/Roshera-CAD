@@ -626,16 +626,51 @@ pub fn fillet_edges(
             })
             .collect();
 
+        // Resolve every selected edge's two adjacent faces ONCE, up front,
+        // against the ORIGINAL topology. Two things are handled here:
+        //   * Edges that resolve to NO face on this solid are DROPPED, not
+        //     fatal. `propagate_edge_selection` walks the edge store by shared
+        //     vertex, so it can pull in ORPHANED edges left behind by a
+        //     consumed boolean operand (e.g. a drilled hole's cutter cylinder,
+        //     whose edges still linger sharing the rim vertices) — those are
+        //     not part of THIS solid's boundary and must not abort the fillet.
+        //   * The surviving (edge → faces) map is resolved BEFORE the chain
+        //     loop, so one chain's blend cannot strand a later chain's edge by
+        //     trimming a shared face out from under it. A blend surface depends
+        //     only on the carrier surfaces of its two faces (not their trimmed
+        //     loops), so pre-mutation resolution is correct; the topology
+        //     splice is deferred to `update_adjacent_faces` below.
+        let mut edge_face_map: HashMap<EdgeId, (FaceId, FaceId)> =
+            HashMap::with_capacity(selected_edges.len());
+        let mut grounded_edges: Vec<EdgeId> = Vec::with_capacity(selected_edges.len());
+        for &e in &selected_edges {
+            if let Ok(faces) = get_adjacent_faces(model, solid_id, e) {
+                edge_face_map.insert(e, faces);
+                grounded_edges.push(e);
+            }
+        }
+        if grounded_edges.is_empty() {
+            return Err(OperationError::InvalidGeometry(
+                "fillet: no selected edge lies on the solid's boundary".to_string(),
+            ));
+        }
+
         // Group edges into fillet chains
-        let edge_chains = group_edges_into_chains(model, &selected_edges)?;
+        let edge_chains = group_edges_into_chains(model, &grounded_edges)?;
 
         // Create fillet surfaces for each chain
         let mut fillet_faces: Vec<FaceId> = Vec::new();
         let mut edge_to_face: HashMap<EdgeId, FaceId> = HashMap::new();
         let mut surgeries = Vec::new();
         for chain in edge_chains {
-            let (chain_edge_faces, chain_surgeries) =
-                create_fillet_chain(model, solid_id, chain, &options, &blend_graph)?;
+            let (chain_edge_faces, chain_surgeries) = create_fillet_chain(
+                model,
+                solid_id,
+                chain,
+                &options,
+                &blend_graph,
+                &edge_face_map,
+            )?;
             for (edge_id, face_id) in &chain_edge_faces {
                 edge_to_face.insert(*edge_id, *face_id);
                 fillet_faces.push(*face_id);
@@ -1027,6 +1062,7 @@ fn create_fillet_chain(
     edges: Vec<EdgeId>,
     options: &FilletOptions,
     blend_graph: &BlendGraph,
+    edge_face_map: &HashMap<EdgeId, (FaceId, FaceId)>,
 ) -> OperationResult<(Vec<(EdgeId, FaceId)>, Vec<BlendEdgeSurgery>)> {
     let mut edge_faces: Vec<(EdgeId, FaceId)> = Vec::new();
     let mut surgeries = Vec::new();
@@ -1039,9 +1075,18 @@ fn create_fillet_chain(
     // straight/constant decisions.
     let tol = options.common.tolerance;
 
+    // Look each edge's two adjacent faces up from the caller's pre-resolved
+    // map, built against the ORIGINAL topology before any chain mutated a
+    // shared face (see the call site in `fillet_edges`). Resolving here would
+    // re-read the now-mutated model and fail with "edge not found in any face"
+    // on a cross-chain edge an earlier chain trimmed out of its loop.
     for &edge_id in &edges {
-        // Get the two faces adjacent to this edge
-        let (face1_id, face2_id) = get_adjacent_faces(model, solid_id, edge_id)?;
+        let (face1_id, face2_id) = edge_face_map.get(&edge_id).copied().ok_or_else(|| {
+            OperationError::InternalError(format!(
+                "create_fillet_chain: edge {} missing from the pre-resolved face map",
+                edge_id
+            ))
+        })?;
 
         // Create fillet surface between the faces
         let (fillet_face, surgery) = match &options.fillet_type {

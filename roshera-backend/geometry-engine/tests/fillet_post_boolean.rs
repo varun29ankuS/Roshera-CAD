@@ -107,17 +107,21 @@ fn build_holed_block(m: &mut BRepModel) -> SolidId {
 
 #[test]
 fn fillet_all_on_holed_block_clears_the_refusal_layers() {
-    // PROGRESS PIN. The three all-or-nothing REFUSALS are fixed: `fillet all
-    // edges` on a drilled-hole part no longer aborts at a seam Cliff, an
-    // infeasible-radius edge, or a collinear pass-through — it now reaches the
-    // blend SURGERY. A deeper layer remains: `create_fillet_chain` mutates a
-    // face while building one edge's blend, so a later edge in the same pass
-    // finds its (now-replaced) face missing ("edge not found in any face").
-    // Fixing that is a geometry-pass rework (resolve all blends against the
-    // ORIGINAL topology, or re-resolve per edge) — the next fillet target.
+    // PROGRESS PIN. `fillet all edges` on a drilled-hole part is a LAYERED
+    // failure; each fix exposed the next. FIXED so far: the three all-or-
+    // nothing refusals (seam Cliff, infeasible radius, collinear pass-through);
+    // the per-edge face lookup going stale across chains (faces are now
+    // resolved UP FRONT into a map); and orphaned consumed-operand edges that
+    // `propagate_edge_selection` pulled in (dropped as not-on-this-solid).
     //
-    // This pin asserts the three refusals STAY fixed, and upgrades to a full
-    // soundness gate the moment the surgery layer is fixed too.
+    // REMAINING (the next fillet target): the blend SURGERY assumes every blend
+    // vertex is a 3-VALENT corner (edge_blend_topology.rs). On this part a hole
+    // edge dropped from the selection leaves a partial / non-3-valent corner,
+    // and `find_perpendicular_face` can't resolve it ("surgery requires a
+    // 3-valent corner"). Fixing that is an N-valent / partial-corner surgery
+    // rework. This pin asserts the FIXED layers stay fixed (the error, if any,
+    // must NOT be one of them) and upgrades to a full soundness gate once the
+    // surgery handles the general corner.
     let mut m = BRepModel::new();
     let block = build_holed_block(&mut m);
     assert!(
@@ -157,10 +161,11 @@ fn fillet_all_on_holed_block_clears_the_refusal_layers() {
             assert!(
                 !msg.contains("rank-deficient")
                     && !msg.contains("CLIFF")
-                    && !msg.to_lowercase().contains("invalidradius"),
-                "a FIXED fillet refusal layer regressed (must be the surgery layer only): {msg}"
+                    && !msg.to_lowercase().contains("invalidradius")
+                    && !msg.contains("Edge not found in any face"),
+                "a FIXED fillet layer regressed (only the 3-valent-corner surgery may remain): {msg}"
             );
-            eprintln!("[fillet pin] refusals cleared; remaining surgery-layer error: {msg}");
+            eprintln!("[fillet pin] fixed layers cleared; remaining surgery-layer error: {msg}");
         }
     }
 }
