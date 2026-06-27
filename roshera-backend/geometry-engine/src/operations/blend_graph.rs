@@ -308,6 +308,7 @@ pub fn build(
     let mut edge_radius: HashMap<EdgeId, BlendRadius> = HashMap::new();
     let mut endpoints: HashMap<EdgeId, (VertexId, VertexId)> = HashMap::new();
 
+    let mut dropped_unfilletable: Vec<EdgeId> = Vec::new();
     for (edge_id, radius) in selection {
         if edge_radius.contains_key(edge_id) {
             continue;
@@ -316,9 +317,38 @@ pub fn build(
             Some(e) => e,
             None => continue,
         };
+        // A blend edge must be a genuine manifold edge with a defined
+        // dihedral. SEAM edges — the closing seam of a cylinder / sphere /
+        // torus wall, where the SAME face meets itself, so only one
+        // distinct adjacent face is found and the edge is cached as
+        // `Boundary` with `dihedral_angle == None` — are NOT filletable:
+        // the surface is smooth (C1) across a seam, there is no convex /
+        // concave corner to roll a ball into. Open boundary edges (a
+        // genuinely one-sided edge) are likewise unblendable.
+        //
+        // Dropping them HERE, rather than letting them reach the corner
+        // classifier (which flags their endpoints as `Cliff` and refuses
+        // the WHOLE operation), is what lets `fillet all edges` succeed on
+        // any part built through booleans — a drilled hole leaves a
+        // cylindrical wall whose vertical seam would otherwise abort the
+        // entire fillet. The real convex / concave edges still blend.
+        let filletable = matches!(edge.attributes.manifold_kind, ManifoldKind::Manifold)
+            && edge.attributes.dihedral_angle.is_some();
+        if !filletable {
+            dropped_unfilletable.push(*edge_id);
+            continue;
+        }
         edge_radius.insert(*edge_id, radius.clone());
         endpoints.insert(*edge_id, (edge.start_vertex, edge.end_vertex));
         ordered_edges.push(*edge_id);
+    }
+    if !dropped_unfilletable.is_empty() {
+        tracing::debug!(
+            target: "geometry_engine::blend",
+            "blend_graph: dropped {} non-filletable edge(s) (seam / open boundary, no dihedral): {:?}",
+            dropped_unfilletable.len(),
+            dropped_unfilletable,
+        );
     }
 
     if ordered_edges.is_empty() {
@@ -673,12 +703,17 @@ pub fn compute_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> OperationR
                     vertex_id, theta_min
                 )));
             }
-            if (std::f64::consts::PI - theta_min) < PARALLEL_RAD {
-                return Err(OperationError::InvalidGeometry(format!(
-                    "vertex {} corner is rank-deficient: outgoing tangents nearly anti-parallel (θ_min = {:.3e} rad)",
-                    vertex_id, theta_min
-                )));
-            }
+            // Anti-parallel outgoing tangents (θ_min ≈ π) mean the two
+            // tightest blend edges at this vertex are COLLINEAR — a straight
+            // edge that a boolean split into two segments, or a smooth arc
+            // continuation. That is a PASS-THROUGH, not a corner: the
+            // rolling-ball blends join straight, and the Hoffmann setback
+            // `r·cos(θ_min/2)` below evaluates to ≈ 0 (no retraction), which
+            // is exactly right. Previously this was refused as
+            // "rank-deficient", which aborted `fillet all edges` on any part
+            // whose boolean had split an edge across a vertex. The genuinely
+            // degenerate PARALLEL case (θ_min ≈ 0 — two edges folded back
+            // onto each other) is still rejected above.
 
             // Conservative radius = minimum value over the schedule.
             // For Constant this is the radius itself; for Linear /

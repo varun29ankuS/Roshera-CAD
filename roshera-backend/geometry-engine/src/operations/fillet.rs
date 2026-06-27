@@ -268,7 +268,7 @@ pub enum FilletQuality {
 pub fn fillet_edges(
     model: &mut BRepModel,
     solid_id: SolidId,
-    edges: Vec<EdgeId>,
+    mut edges: Vec<EdgeId>,
     options: FilletOptions,
 ) -> OperationResult<Vec<FaceId>> {
     // F2-δ pre-flight: cheap input validation + setback-aware
@@ -403,6 +403,15 @@ pub fn fillet_edges(
             validate_variable_stations(samples)?;
         }
 
+        // RESILIENT pre-flight: collect the edges that can actually be
+        // blended at their requested radius and DROP the rest, instead of
+        // aborting the whole fillet on the first un-blendable edge. A
+        // `fillet all edges` request on a real (booleaned) part routinely
+        // mixes blendable edges with ones whose radius overruns a short
+        // neighbour; we round everything we can. If NOTHING is blendable the
+        // first concrete per-edge reason is surfaced (single-edge contract).
+        let mut feasible: Vec<EdgeId> = Vec::with_capacity(edges.len());
+        let mut first_reject: Option<OperationError> = None;
         for &edge_id in &edges {
             let radii_to_check: Vec<f64> = match &options.fillet_type {
                 FilletType::Constant(r) => vec![*r],
@@ -448,10 +457,38 @@ pub fn fillet_edges(
                 FilletType::Function(_) => vec![1.0],
                 FilletType::Chord(c) => vec![*c],
             };
+            let mut edge_ok = true;
             for radius in radii_to_check {
-                validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)?;
+                if let Err(e) =
+                    validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)
+                {
+                    first_reject.get_or_insert(e);
+                    edge_ok = false;
+                    break;
+                }
+            }
+            if edge_ok {
+                feasible.push(edge_id);
             }
         }
+        if feasible.is_empty() {
+            return Err(first_reject.unwrap_or_else(|| {
+                OperationError::InvalidGeometry(
+                    "fillet: no blendable edges in the selection".to_string(),
+                )
+            }));
+        }
+        if feasible.len() < edges.len() {
+            tracing::debug!(
+                target: "geometry_engine::blend",
+                "fillet: dropped {} edge(s) whose radius overran the available corner room; \
+                 blending {} of {} requested",
+                edges.len() - feasible.len(),
+                feasible.len(),
+                edges.len(),
+            );
+        }
+        edges = feasible;
 
         // Get radius value(s)
         let radius = match &options.fillet_type {
@@ -7542,29 +7579,36 @@ fn get_adjacent_faces(
     solid_id: SolidId,
     edge_id: EdgeId,
 ) -> OperationResult<(FaceId, FaceId)> {
-    // Get the solid and its shell
+    // Get the solid.
     let solid = model
         .solids
         .get(solid_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?;
 
-    let shell = model
-        .shells
-        .get(solid.outer_shell)
-        .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
+    // Search this solid's OUTER shell and every INNER (void) shell for the
+    // faces that use this edge. A boolean — e.g. a drilled through-hole — can
+    // place a blend edge's face on an inner shell; the old outer-shell-only
+    // scan then found zero faces and aborted the whole fillet with "edge not
+    // found in any face". Scoping to THIS solid's shells (rather than the
+    // entire face store) excludes consumed-operand orphan faces that would
+    // otherwise over-count the edge's incidence.
+    let mut shell_ids = Vec::with_capacity(1 + solid.inner_shells.len());
+    shell_ids.push(solid.outer_shell);
+    shell_ids.extend_from_slice(&solid.inner_shells);
 
-    // Search through all faces in the shell to find which ones use this edge
     let mut adjacent_faces = Vec::new();
-
-    for &face_id in &shell.faces {
-        let face = model
-            .faces
-            .get(face_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
-
-        // Check if this face's outer loop contains the edge
-        if face_contains_edge(model, face, edge_id)? {
-            adjacent_faces.push(face_id);
+    for shell_id in shell_ids {
+        let Some(shell) = model.shells.get(shell_id) else {
+            continue;
+        };
+        for &face_id in &shell.faces {
+            let face = model
+                .faces
+                .get(face_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
+            if face_contains_edge(model, face, edge_id)? {
+                adjacent_faces.push(face_id);
+            }
         }
     }
 
