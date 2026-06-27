@@ -3658,15 +3658,18 @@ mod tests {
             gt.certificate.is_sound(),
             gt.summary()
         );
-        let rep = geometry_engine::harness::brep_integrity::brep_integrity(&model, r, 1e-6);
-        eprintln!(
-            "[union] orient_inconsistent_edges={:?}",
-            rep.orientation_inconsistent_edges
-        );
-        dump_faces(&model, r, "union    ");
         assert!(
             base_sound && up_sound,
             "operands must be individually sound (base={base_sound} up={up_sound})"
+        );
+        // B fix (2026-06-27): straight extrude walls now emit analytic Planes
+        // (create_ruled_surface), so two sketch-extruded boxes union cleanly. Was
+        // non-manifold / oriented=false — the extrude's RuledSurface walls routed
+        // through the generic-face split and mis-split into a malformed wall.
+        assert!(
+            gt.certificate.is_sound(),
+            "B: sketch-extrude L-bracket union must be SOUND — {}",
+            gt.summary()
         );
     }
 

@@ -1432,6 +1432,39 @@ fn create_ruled_surface(
                 top_edge, top_range.start, top_range.end, e
             ))
         })?;
+    // A STRAIGHT wall — both rails are `Line`s (a box/prism side, or one
+    // segment of a polyline-extruded profile) — is geometrically a PLANE.
+    // Emit an analytic `Plane` (matching create_box_3d's walls) instead of a
+    // generic `RuledSurface`: the boolean's split + coincident-face handling is
+    // exact on Planes, whereas a flat `RuledSurface` routes through the generic-
+    // face path and MIS-SPLITS (a malformed multi-edge wall) — the defect that
+    // makes two sketch-extruded boxes union non-manifold. Curved rails
+    // (Arc/NURBS) keep the `RuledSurface`. (B fix 2026-06-27; gate:
+    // api-server sketch::mcp_sketch_extrude_lbracket_union_repro.)
+    {
+        use crate::primitives::curve::Line;
+        use crate::primitives::surface::Plane;
+        if bottom_curve.as_any().downcast_ref::<Line>().is_some()
+            && top_curve.as_any().downcast_ref::<Line>().is_some()
+        {
+            let bp = bottom_curve.parameter_range();
+            let tp = top_curve.parameter_range();
+            if let (Ok(s_b), Ok(e_b), Ok(s_t)) = (
+                bottom_curve.point_at(bp.start),
+                bottom_curve.point_at(bp.end),
+                top_curve.point_at(tp.start),
+            ) {
+                let along = e_b - s_b; // bottom-rail direction
+                let up = s_t - s_b; // extrusion direction
+                if let Ok(normal) = along.cross(&up).normalize() {
+                    if let Ok(plane) = Plane::from_point_normal(s_b, normal) {
+                        return Ok(Box::new(plane));
+                    }
+                }
+            }
+        }
+    }
+
     let surface = RuledSurface::new(bottom_curve, top_curve);
     Ok(Box::new(surface))
 }

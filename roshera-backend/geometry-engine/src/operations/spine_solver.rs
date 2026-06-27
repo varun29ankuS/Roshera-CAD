@@ -3707,13 +3707,11 @@ mod tests {
     #[test]
     fn extrude_prism_side_walls_route_through_analytic_plane_plane() {
         // Integration check at the spine-solver layer: extruding a
-        // triangular profile creates a prism whose three vertical
-        // side faces are [`RuledSurface`]s. With F3-δ.1 promotion
-        // the dispatch routes a vertical-edge fillet (between two
-        // RuledSurface side walls) through the plane/plane analytic
-        // arm. Without promotion it would fall through to the
-        // wildcard arm and either march (and fail on noise) or
-        // return Ok(None).
+        // triangular profile creates a prism whose three vertical side
+        // faces are analytic Planes — a straight-edge extrude wall emits a
+        // Plane, not a RuledSurface (B fix 2026-06-27). A vertical-edge
+        // fillet between two Plane walls routes through the plane/plane
+        // analytic arm directly.
         use crate::operations::extrude::{extrude_profile, ExtrudeOptions};
         use crate::primitives::edge::{Edge, EdgeOrientation};
 
@@ -3748,36 +3746,36 @@ mod tests {
 
         // Find an edge whose two adjacent faces are both Ruled — a
         // vertical seam of the prism.
-        let mut ruled_pair: Option<(EdgeId, FaceId, FaceId)> = None;
+        let mut planar_pair: Option<(EdgeId, FaceId, FaceId)> = None;
         for (edge_id, _) in model.edges.iter() {
             let faces = find_adjacent_faces(&model, edge_id);
             if faces.len() != 2 {
                 continue;
             }
-            let both_ruled = faces.iter().all(|&fid| {
+            let both_planar = faces.iter().all(|&fid| {
                 model
                     .faces
                     .get(fid)
                     .and_then(|f| model.surfaces.get(f.surface_id))
-                    .map(|s| s.surface_type() == SurfaceType::Ruled)
+                    .map(|s| s.surface_type() == SurfaceType::Plane)
                     .unwrap_or(false)
             });
-            if both_ruled {
-                ruled_pair = Some((edge_id, faces[0], faces[1]));
+            if both_planar {
+                planar_pair = Some((edge_id, faces[0], faces[1]));
                 break;
             }
         }
         let (edge_id, face_a, face_b) =
-            ruled_pair.expect("prism must have a ruled/ruled vertical edge");
+            planar_pair.expect("prism must have a plane/plane vertical seam edge");
 
         let opts = SpineOptions::default();
         let rail = solve_spine_for_edge(&model, edge_id, face_a, face_b, 0.1, &opts)
             .expect("solve")
-            .expect("planar ruled walls must promote to plane/plane analytic");
+            .expect("plane/plane prism walls must solve to plane/plane analytic");
         assert_eq!(
             rail.solver_kind,
             SolverKind::AnalyticPlanePlane,
-            "F3-δ.1: extruded ruled walls must promote to plane/plane analytic"
+            "extruded straight (now Plane) prism walls solve to plane/plane analytic"
         );
     }
 }
