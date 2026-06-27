@@ -1080,31 +1080,33 @@ fn certified_response(
         map.insert("face_count".into(), serde_json::json!(face_count));
     }
 
-    // AMBIENT FULL CERTIFICATE — the authoritative soundness verdict on every
-    // mutating op. `certify_solid` is memoised (the producing op invalidated the
-    // cache), and `mesh_self_intersects` is now spatial-grid-accelerated, so this
-    // stays sub-second even on real parts. Elevate `sound`/`watertight`/`verdict`
-    // to the full `is_sound()` answer — the verdict now reports ONLY what the
-    // kernel actually verified.
-    let cert = model.certify_solid(solid_id);
-    let sound = cert.is_sound();
-    if let serde_json::Value::Object(map) = &mut base {
-        map.insert("sound".into(), serde_json::json!(sound));
-        map.insert("watertight".into(), serde_json::json!(cert.watertight));
-        map.insert(
-            "self_intersection_free".into(),
-            serde_json::json!(cert.self_intersection_free),
-        );
-        let verdict = if sound {
-            "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)"
-        } else {
-            "UNSOUND — full kernel certificate flags a defect (see cert)"
-        };
-        map.insert("verdict".into(), serde_json::json!(verdict));
-        // Attach the full per-check breakdown only on explicit `verify`, to keep
-        // the default response compact; the verdict above is authoritative
-        // regardless.
-        if full {
+    // FULL CERTIFICATE — only on explicit verify (`verify:true` / verify_part /
+    // GET .../truth). The heavy mesh self-intersection scan + mesh-quality pass are
+    // O(n) over the WHOLE mesh and stall the interactive hot path on a real part: a
+    // 40k-tri chamber takes multi-second, run under the model write lock, which is
+    // the auto-cert perf regression (froze the backend on real builds). They are
+    // kept OFF the default op response, which now carries the CHEAP, exact B-Rep
+    // structural verdict that `perception_json` already computed
+    // (`validate_solid_scoped`, Standard: B-Rep validity + shell closure,
+    // mesh-independent, O(faces)). The full self-intersection / mesh-quality
+    // certificate stays one explicit call away (verify_part / .../truth), so the
+    // moat holds — it just no longer costs interactive latency on every op.
+    if full {
+        let cert = model.certify_solid(solid_id);
+        let sound = cert.is_sound();
+        if let serde_json::Value::Object(map) = &mut base {
+            map.insert("sound".into(), serde_json::json!(sound));
+            map.insert("watertight".into(), serde_json::json!(cert.watertight));
+            map.insert(
+                "self_intersection_free".into(),
+                serde_json::json!(cert.self_intersection_free),
+            );
+            let verdict = if sound {
+                "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)"
+            } else {
+                "UNSOUND — full kernel certificate flags a defect (see cert)"
+            };
+            map.insert("verdict".into(), serde_json::json!(verdict));
             map.insert("cert".into(), certificate_json(&cert));
         }
     }
