@@ -1312,8 +1312,11 @@ server.tool(
 
 server.tool(
   "create_box",
-  "ONE-CALL box: width × depth centered at (cx, cy) on the chosen plane, " +
-    "extruded by height. Returns part id + world placement.",
+  "ONE-CALL analytic box: width × depth centered at (cx, cy) on the chosen " +
+    "plane, extruded by height along the plane normal. Uses the analytic box " +
+    "primitive (canonical, all-Forward faces) — NOT sketch+extrude, which left a " +
+    "non-canonical bottom cap that broke unions (two boxes → non-manifold). " +
+    "Returns part id + world placement.",
   {
     plane: PlaneSchema.default("xy"),
     cx: z.number().default(0),
@@ -1325,15 +1328,26 @@ server.tool(
   },
   async ({ plane, cx, cy, width, depth, height, name }) => {
     try {
-      const s = await api("POST", "/api/sketch", { plane, tool: "rectangle" });
-      await api("POST", `/api/sketch/${s.id}/point`, {
-        point: [cx - width / 2, cy - depth / 2],
-      });
-      await api("POST", `/api/sketch/${s.id}/point`, {
-        point: [cx + width / 2, cy + depth / 2],
-      });
-      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
-        distance: height,
+      // Resolve the plane to a world origin + in-plane (u, v) basis (same as
+      // create_cylinder). The box base centre = origin + cx·u + cy·v; the
+      // analytic /api/geometry/box endpoint extrudes it by `height` along u×v.
+      const std: Record<string, { o: number[]; u: number[]; v: number[] }> = {
+        xy: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 1, 0] },
+        xz: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 0, 1] },
+        yz: { o: [0, 0, 0], u: [0, 1, 0], v: [0, 0, 1] },
+      };
+      const p =
+        typeof plane === "string"
+          ? std[plane]
+          : { o: plane.origin, u: plane.u_axis, v: plane.v_axis };
+      const center = [0, 1, 2].map((i) => p.o[i] + cx * p.u[i] + cy * p.v[i]);
+      const r = await api("POST", "/api/geometry/box", {
+        center,
+        u_axis: p.u,
+        v_axis: p.v,
+        width,
+        depth,
+        height,
         name: name ?? null,
       });
       const id = await newestPartId();

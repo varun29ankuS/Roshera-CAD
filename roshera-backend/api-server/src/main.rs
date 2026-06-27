@@ -3356,6 +3356,200 @@ async fn create_cylinder_primitive(
     })))
 }
 
+/// POST /api/geometry/box — create an ANALYTIC box primitive placed on a frame.
+/// `create_box` uses THIS instead of sketch+extrude: a sketch-extruded box
+/// carries a non-canonical (Backward, inward-normal) bottom cap that breaks the
+/// boolean's coincident-face dedup in unions (two such boxes → non-manifold,
+/// oriented=false) — the same "inside-out" class that moved `create_cylinder`
+/// onto the analytic primitive. The box is `width`×`depth` on the (u, v) frame,
+/// its BASE at `center`, extruded by `height` along u×v.
+///
+/// Request: `{ "center":[x,y,z], "u_axis":[x,y,z], "v_axis":[x,y,z],
+///             "width":w, "depth":d, "height":h, "name"?:s }`
+/// (center defaults to origin, u_axis to +X, v_axis to +Y).
+async fn create_box_primitive(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::math::Matrix4;
+    use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+    use geometry_engine::primitives::topology_builder::{GeometryId, TopologyBuilder};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    let arr3 = |key: &str, default: Option<[f64; 3]>| -> Result<[f64; 3], ApiError> {
+        match payload.get(key) {
+            Some(v) => {
+                let a = v.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("'{key}' must be an array of 3 numbers"),
+                    )
+                })?;
+                Ok([
+                    a[0].as_f64().unwrap_or(0.0),
+                    a[1].as_f64().unwrap_or(0.0),
+                    a[2].as_f64().unwrap_or(0.0),
+                ])
+            }
+            None => default.ok_or_else(|| ApiError::missing_field(key)),
+        }
+    };
+    let center = arr3("center", Some([0.0, 0.0, 0.0]))?;
+    let u = arr3("u_axis", Some([1.0, 0.0, 0.0]))?;
+    let v = arr3("v_axis", Some([0.0, 1.0, 0.0]))?;
+    let num = |key: &str| -> Result<f64, ApiError> {
+        payload
+            .get(key)
+            .and_then(|x| x.as_f64())
+            .ok_or_else(|| ApiError::missing_field(key))
+    };
+    let width = num("width")?;
+    let depth = num("depth")?;
+    let height = num("height")?;
+    if !(width.is_finite() && width > 0.0)
+        || !(depth.is_finite() && depth > 0.0)
+        || !(height.is_finite() && height > 0.0)
+    {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "width, depth, height must be positive and finite".to_string(),
+        ));
+    }
+    let display_name = payload
+        .get("name")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+
+    let result_solid_id = {
+        let mut model = model_handle.write().await;
+        // Centered box at the origin, dims (x=width, y=depth, z=height).
+        let gid = TopologyBuilder::new(&mut model)
+            .create_box_3d(width, depth, height)
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("create_box_3d failed: {e:?}"),
+                )
+            })?;
+        let solid_id = match gid {
+            GeometryId::Solid(id) => id,
+            other => {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("create_box_3d returned {other:?}, expected a solid"),
+                ))
+            }
+        };
+        // Place the centered box on the (u, v) frame: local x→u, y→v, z→normal
+        // (u×v). The local origin maps to `center + (height/2)·normal`, so the
+        // box BASE rests on the plane at `center` and extrudes by `height`. For
+        // the default xy plane this is a pure translation → bit-exact (no
+        // frame-math ε), so it never trips the coincident-face tolerance gap.
+        let uv = Vector3::new(u[0], u[1], u[2]);
+        let vv = Vector3::new(v[0], v[1], v[2]);
+        let nv = uv.cross(&vv).normalize().map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("u_axis × v_axis is degenerate: {e:?}"),
+            )
+        })?;
+        let box_origin = Vector3::new(
+            center[0] + nv.x * height / 2.0,
+            center[1] + nv.y * height / 2.0,
+            center[2] + nv.z * height / 2.0,
+        );
+        let placement = Matrix4::from_cols(uv, vv, nv, box_origin);
+        transform_solid(&mut model, solid_id, placement, TransformOptions::default()).map_err(
+            |e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("box placement transform failed: {e:?}"),
+                )
+            },
+        )?;
+        solid_id
+    };
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let t = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        (mesh, t.elapsed().as_millis() as u64)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+
+    let name = display_name.unwrap_or_else(|| format!("Box {result_solid_id}"));
+    let parameters = serde_json::json!({
+        "center": center, "u_axis": u, "v_axis": v,
+        "width": width, "depth": depth, "height": height,
+    });
+    broadcast_object_created(
+        &result_id_str,
+        &name,
+        result_solid_id,
+        "box",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    let perception = {
+        let mut model = model_handle.write().await;
+        certified_response(
+            &mut model,
+            result_solid_id,
+            &tri_mesh,
+            body_verify_flag(&payload),
+        )
+    };
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": result_solid_id,
+        "perception": perception,
+        "object": {
+            "id":         result_id_str,
+            "name":       name,
+            "objectType": "box",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+        }
+    })))
+}
+
 /// POST /api/geometry/cone — create an ANALYTIC cone OR frustum primitive with
 /// full control over placement and both radii. This is the round nozzle /
 /// taper / countersink primitive. Unlike the generic `/api/geometry` "cone"
@@ -7125,6 +7319,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/geometry/extrude",
             post(create_extrude).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
+            "/api/geometry/box",
+            post(create_box_primitive).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_create_geometry,
             )),
         )
