@@ -17,6 +17,7 @@
 //! The mate-solve and the certificate are OURS (the moat); Parry is the
 //! commodity collision/CCD engine underneath.
 
+pub mod certificate;
 pub mod grounding;
 pub mod interference;
 pub mod joint;
@@ -26,6 +27,7 @@ pub mod solver;
 pub mod sweep;
 pub mod types;
 
+pub use certificate::{AssemblyCertificate, Mechanism};
 pub use grounding::GroundingReport;
 pub use interference::{InterferencePair, InterferenceReport};
 pub use joint::Joint;
