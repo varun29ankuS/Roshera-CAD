@@ -27,5 +27,5 @@ pub mod types;
 pub use grounding::GroundingReport;
 pub use interference::{InterferencePair, InterferenceReport};
 pub use report::AssemblyReport;
-pub use solver::{DofReport, Mobility};
+pub use solver::{DofReport, Mobility, SolveReport};
 pub use types::{Assembly, FeatureRef, Instance, InstanceId, Mate, MateKind, Mesh};
