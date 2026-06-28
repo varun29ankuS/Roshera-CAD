@@ -13,7 +13,7 @@
 //! within tolerance or the step stagnates. A conflicting (over-constrained) mate
 //! set is detected as a stagnated step whose residual stays above tolerance.
 
-use crate::types::{Assembly, Instance};
+use crate::types::{Assembly, Instance, InstanceId};
 use parry3d_f64::na::{DMatrix, DVector, Quaternion, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,14 @@ pub struct SolveReport {
     /// `‖g‖` at the final pose. Stays above tolerance for a conflicting
     /// (over-constrained) mate set even once the step size has stagnated.
     pub final_residual_norm: f64,
+}
+
+/// Where a single instance ends up after the constraint solve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SolvedPose {
+    pub instance: InstanceId,
+    pub translation: [f64; 3],
+    pub rotation: [f64; 4],
 }
 
 /// Indices (into `instances`) of the non-ground instances; each carries 6 DOF.
@@ -200,6 +208,24 @@ impl Assembly {
             final_residual_norm: norm,
         }
     }
+
+    /// Solve the mate system and report where each instance ends up. The fixed
+    /// (ground) instance never moves; every other instance is POSITIONED by the
+    /// solve relative to it. Runs on a clone, so `self` is left unchanged.
+    pub fn solved_poses(&self) -> (SolveReport, Vec<SolvedPose>) {
+        let mut work = self.clone();
+        let report = work.solve();
+        let poses = work
+            .instances
+            .iter()
+            .map(|instance| SolvedPose {
+                instance: instance.id,
+                translation: instance.translation,
+                rotation: instance.rotation,
+            })
+            .collect();
+        (report, poses)
+    }
 }
 
 #[cfg(test)]
@@ -350,5 +376,53 @@ mod tests {
         let report = assembly.solve();
         assert!(report.converged);
         assert!(report.final_residual_norm < 1e-9);
+    }
+
+    #[test]
+    fn solver_seats_a_misplaced_part_from_any_start() {
+        // The fixed chamber is GROUND at the origin; its top face is the z=16
+        // plane. The injector is dropped at deliberately WRONG poses (off-axis /
+        // far / tilted). Concentric (axis) + coincident (base on the chamber top)
+        // must SOLVE it onto the chamber every time — the mates do the placing,
+        // the answer is DERIVED, not authored.
+        for &(t, r) in &[
+            ([8.0, 8.0, 30.0], [0.0, 0.0, 0.0, 1.0]),
+            ([-12.0, 4.0, 55.0], [0.0, 0.0, 0.0, 1.0]),
+            ([3.0, -6.0, 25.0], [0.1, 0.05, 0.0, 0.993]),
+        ] {
+            let mut assembly = Assembly::new(InstanceId(0));
+            assembly.add_instance(part(0)); // chamber = ground at the origin
+            let mut injector = part(1);
+            injector.translation = t;
+            injector.rotation = r;
+            assembly.add_instance(injector);
+            assembly.add_mate(concentric([0.0, 0.0, 1.0]));
+            assembly.add_mate(plane_mate([0.0, 0.0, 16.0], [0.0, 0.0, 0.0]));
+
+            let (report, poses) = assembly.solved_poses();
+            assert!(
+                report.converged,
+                "the mates are satisfiable from t={t:?}: {report:?}"
+            );
+            let inj = poses
+                .iter()
+                .find(|p| p.instance == InstanceId(1))
+                .map(|p| p.translation)
+                .unwrap_or([f64::NAN; 3]);
+            assert!(
+                inj[0].abs() < 1e-3 && inj[1].abs() < 1e-3,
+                "injector pulled onto the z-axis from t={t:?}, got {inj:?}"
+            );
+            assert!(
+                (inj[2] - 16.0).abs() < 1e-3,
+                "injector base seated on the chamber top (z=16) from t={t:?}, got {inj:?}"
+            );
+            let ground = poses
+                .iter()
+                .find(|p| p.instance == InstanceId(0))
+                .map(|p| p.translation)
+                .unwrap_or([f64::NAN; 3]);
+            assert_eq!(ground, [0.0, 0.0, 0.0], "the fixed chamber must not move");
+        }
     }
 }
