@@ -32,6 +32,6 @@ pub use grounding::GroundingReport;
 pub use interference::{InterferencePair, InterferenceReport};
 pub use joint::Joint;
 pub use report::AssemblyReport;
-pub use solver::{DofReport, Mobility, SolveReport};
+pub use solver::{DofReport, Mobility, SolveReport, SolvedPose};
 pub use sweep::{swept_clearance, SweptClearance};
 pub use types::{Assembly, FeatureRef, Instance, InstanceId, Mate, MateKind, Mesh};
