@@ -46,17 +46,21 @@ pub struct AssemblyCertificate {
     /// Every mate's features sit on their parts' real geometry — no part is
     /// grounded through a constraint declared against an invented coordinate.
     pub mates_anchored: bool,
+    /// Every mated pair actually touches — no part is joined to another only on
+    /// paper, sitting coaxial-but-floating with a gap between them.
+    pub mates_in_contact: bool,
 }
 
 impl AssemblyCertificate {
     /// The single verdict: assembles, and moves without collision — through
-    /// joints that actually exist.
+    /// joints that actually exist AND actually connect.
     pub fn is_sound(&self) -> bool {
         self.mates_consistent
             && self.fully_grounded
             && self.no_static_interference
             && self.swept_clearance_ok
             && self.mates_anchored
+            && self.mates_in_contact
     }
 }
 
@@ -68,6 +72,9 @@ impl Assembly {
         // A mate feature may float at most this far off its part before the
         // joint is judged fabricated (a constraint to a coordinate, not a part).
         const MATE_ANCHOR_TOL: f64 = 0.5;
+        // A mated pair must close to within this gap or the joint is judged a
+        // paper joint (parts coaxial-but-floating, not actually touching).
+        const MATE_CONTACT_TOL: f64 = 0.25;
 
         let fully_grounded = self.grounding_report().fully_grounded();
         // Anchoring is pose-independent (features are local), so it reads the
@@ -79,6 +86,11 @@ impl Assembly {
 
         let dof_report = solved.dof_analysis();
         let no_static_interference = solved.interference_report().no_static_interference();
+        // Contact is judged at the SOLVED pose — the configuration the mates
+        // actually produce — so a mate that the solve pulls into contact passes.
+        let mates_in_contact = solved
+            .mate_contact_report(MATE_CONTACT_TOL)
+            .all_in_contact();
 
         let swept_clearance_ok = mechanisms.iter().all(|m| {
             !swept_clearance(
@@ -102,6 +114,7 @@ impl Assembly {
             no_static_interference,
             swept_clearance_ok,
             mates_anchored,
+            mates_in_contact,
         }
     }
 }
@@ -185,14 +198,15 @@ mod tests {
     #[test]
     fn clean_assembly_is_sound() {
         let mut assembly = Assembly::new(InstanceId(0));
-        assembly.add_instance(cube_at(0, [0.0, 0.0, 0.0])); // ground
-        assembly.add_instance(cube_at(1, [20.0, 0.0, 0.0])); // far, grounded
-        assembly.add_mate(concentric_to(1, [20.0, 0.0, 0.0]));
+        assembly.add_instance(cube_at(0, [0.0, 0.0, 0.0])); // ground, z in [-1, 1]
+        assembly.add_instance(cube_at(1, [0.0, 0.0, 2.0])); // seated on top, touching at z=1
+        assembly.add_mate(concentric_to(1, [0.0, 0.0, 0.0]));
 
         let cert = assembly.certify(&[], 0.01);
         assert!(cert.is_sound(), "{cert:?}");
         assert!(cert.mates_consistent && cert.fully_grounded);
         assert!(cert.no_static_interference && cert.swept_clearance_ok);
+        assert!(cert.mates_anchored && cert.mates_in_contact);
     }
 
     #[test]
@@ -266,8 +280,8 @@ mod tests {
         // dimension. Check across the sound case and several broken ones.
         let mut sound = Assembly::new(InstanceId(0));
         sound.add_instance(cube_at(0, [0.0, 0.0, 0.0]));
-        sound.add_instance(cube_at(1, [20.0, 0.0, 0.0]));
-        sound.add_mate(concentric_to(1, [20.0, 0.0, 0.0]));
+        sound.add_instance(cube_at(1, [0.0, 0.0, 2.0])); // seated on top, touching
+        sound.add_mate(concentric_to(1, [0.0, 0.0, 0.0]));
 
         let mut floating = Assembly::new(InstanceId(0));
         floating.add_instance(cube_at(0, [0.0, 0.0, 0.0]));

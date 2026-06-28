@@ -61,13 +61,14 @@ fn mount(b: u32, axis_origin: [f64; 3]) -> Mate {
     }
 }
 
-/// chamber (ground) + injector (mounted on top) + turbopump (off to the side).
+/// chamber (ground) + injector (seated on top) + turbopump (seated to the side).
+/// Parts in `part_at` are 4-unit cubes, so these seat flush against the chamber.
 fn engine() -> Assembly {
-    let mut engine = Assembly::new(InstanceId(0)); // chamber is ground
+    let mut engine = Assembly::new(InstanceId(0)); // chamber is ground, [-2,2]^3
     engine.add_instance(part_at(0, "thrust_chamber", [0.0, 0.0, 0.0]));
-    engine.add_instance(part_at(1, "injector", [0.0, 0.0, 8.0]));
-    engine.add_instance(part_at(2, "turbopump", [21.0, 0.0, 0.0]));
-    engine.add_mate(mount(1, [0.0, 0.0, 8.0])); // injector bolted to the chamber axis
+    engine.add_instance(part_at(1, "injector", [0.0, 0.0, 4.0])); // on top, touching at z=2
+    engine.add_instance(part_at(2, "turbopump", [4.0, 0.0, 0.0])); // to the side, touching at x=2
+    engine.add_mate(mount(1, [0.0, 0.0, 0.0])); // injector bolted to the chamber axis
     engine
 }
 
@@ -92,12 +93,19 @@ fn the_floating_turbopump_is_caught() {
 fn a_mount_bracket_grounds_it() {
     // Add the bracket that ties the turbopump to the structure — now nothing floats.
     let mut engine = engine();
-    engine.add_mate(mount(2, [21.0, 0.0, 0.0])); // turbopump mount bracket
+    engine.add_mate(mount(2, [4.0, 0.0, 0.0])); // turbopump mounted to the chamber
     let cert = engine.certify(&[], 0.01);
-    assert!(cert.fully_grounded, "the bracket grounds the turbopump");
-    assert!(cert.no_static_interference, "the parts are spaced apart");
+    assert!(cert.fully_grounded, "the mount grounds the turbopump");
+    assert!(
+        cert.no_static_interference,
+        "the parts seat flush — contact, not penetration"
+    );
+    assert!(
+        cert.mates_in_contact,
+        "every mated part actually touches the structure"
+    );
     assert!(
         cert.is_sound(),
-        "fully mounted, spaced, solvable → sound: {cert:?}"
+        "mounted, seated, solvable → sound: {cert:?}"
     );
 }
