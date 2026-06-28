@@ -43,15 +43,20 @@ pub struct AssemblyCertificate {
     pub no_static_interference: bool,
     /// Every supplied mechanism stays clear across its full range of motion.
     pub swept_clearance_ok: bool,
+    /// Every mate's features sit on their parts' real geometry — no part is
+    /// grounded through a constraint declared against an invented coordinate.
+    pub mates_anchored: bool,
 }
 
 impl AssemblyCertificate {
-    /// The single verdict: assembles, and moves without collision.
+    /// The single verdict: assembles, and moves without collision — through
+    /// joints that actually exist.
     pub fn is_sound(&self) -> bool {
         self.mates_consistent
             && self.fully_grounded
             && self.no_static_interference
             && self.swept_clearance_ok
+            && self.mates_anchored
     }
 }
 
@@ -60,7 +65,14 @@ impl Assembly {
     /// swept checks then run at that solved configuration — the pose the mates
     /// actually produce, not the raw authored coordinates.
     pub fn certify(&self, mechanisms: &[Mechanism], epsilon: f64) -> AssemblyCertificate {
+        // A mate feature may float at most this far off its part before the
+        // joint is judged fabricated (a constraint to a coordinate, not a part).
+        const MATE_ANCHOR_TOL: f64 = 0.5;
+
         let fully_grounded = self.grounding_report().fully_grounded();
+        // Anchoring is pose-independent (features are local), so it reads the
+        // assembly as declared — before the solve can paper over a fake joint.
+        let mates_anchored = self.mate_anchor_report(MATE_ANCHOR_TOL).all_anchored();
 
         let mut solved = self.clone();
         let mates_consistent = solved.solve().converged;
@@ -89,6 +101,7 @@ impl Assembly {
             mobility: dof_report.mobility,
             no_static_interference,
             swept_clearance_ok,
+            mates_anchored,
         }
     }
 }
@@ -267,6 +280,7 @@ mod tests {
                 assert!(cert.fully_grounded);
                 assert!(cert.no_static_interference);
                 assert!(cert.swept_clearance_ok);
+                assert!(cert.mates_anchored);
             }
         }
     }
