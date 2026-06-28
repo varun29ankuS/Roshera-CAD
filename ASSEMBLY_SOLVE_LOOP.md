@@ -38,16 +38,15 @@ Then `cargo fmt`, commit + push the green slice, update STATE, advance.
       boolean fallback for EPA-degenerate / unsupported pairs. Convex hull = exact
       for convex parts, conservative for concave (until convex decomposition).
       HARNESS: `flush_faces_touch_but_do_not_interfere` + `overlapping_parts_interfere`.
-      ✅ 38 tests. (Live re-verify after the backend rebuild → engine should certify SOUND.)
+      ✅ 38 tests. **LIVE-VERIFIED:** same assembled engine that read NOT SOUND (flush
+      contact = interference) before now certifies `is_sound:true` after the rebuild.
 
 ## STATE
-- **LOOP COMPLETE — AS1→AS3.** The mate solver now POSITIONS parts, not just checks
-  them: `solved_poses()` (AS1) → endpoint returns them (AS2) → live demo derived the
-  whole assembled config from all-three-at-the-origin (AS3). One part fixed, the rest
-  solved around it.
-- Last green: **AS3** live (chamber `[0,0,0]`, injector `[0,0,16]`, turbopump `[20,0,0]`).
-- **FOLLOW-UP surfaced by AS3 (CONTACT vs PENETRATION):** the seated injector sits FLUSH
-  on the chamber (mating faces touch), and `no_static_interference` reads that contact as
-  interference → cert returns `is_sound:false` though the placement is correct. A real
-  assembly's mating faces touch BY DESIGN; the interference check must distinguish
-  tangential CONTACT (allowed) from PENETRATION (overlap). Next slice candidate.
+- **LOOP COMPLETE — AS1→AS4, all live-verified.** The mate solver POSITIONS parts
+  (`solved_poses()` AS1 → endpoint AS2 → live derive-from-origin AS3) AND the cert
+  distinguishes contact from penetration (AS4). The assembled engine — chamber fixed,
+  injector seated flush, turbopump mounted — certifies `is_sound:true`.
+- Last green: **AS4** live (flush mating contact allowed; engine SOUND).
+- Open refinements (not blocking): convex-hull interference is conservative for CONCAVE
+  parts → convex decomposition is the exact fix; EPA degenerates on exact coincidence
+  (caught by the boolean fallback). Both noted, neither affects the convex parts here.
