@@ -1,16 +1,18 @@
 //! The full assembly certificate — the non-fakeable "does this physically go
 //! together and move without collision?" verdict.
 //!
-//! Five dimensions, fused at the SOLVED configuration (we solve a clone first so
+//! Seven dimensions, fused at the SOLVED configuration (we solve a clone first so
 //! the static and swept checks run at the pose the mates actually produce):
 //!   * `mates_consistent`     — the constraint system is satisfiable (the solve converges)
 //!   * `fully_grounded`       — every part reaches ground (nothing floats)
 //!   * `dof` / `mobility`     — the assembly's residual freedom
 //!   * `no_static_interference` — no two parts overlap at the solved pose
 //!   * `swept_clearance_ok`   — every mechanism stays clear across its full motion
+//!   * `mates_anchored`       — every mate's features sit on real geometry (no fabricated joint)
+//!   * `mates_in_contact`     — every mated pair actually touches (no paper joint)
 //!
-//! The kernel cannot return a `sound` assembly that doesn't assemble or that
-//! self-collides through its own motion.
+//! The kernel cannot return a `sound` assembly that doesn't assemble, self-
+//! collides through its motion, or is held together by joints that aren't there.
 
 use crate::joint::Joint;
 use crate::solver::Mobility;
