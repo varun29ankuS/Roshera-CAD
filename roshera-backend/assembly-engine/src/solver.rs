@@ -425,4 +425,26 @@ mod tests {
             assert_eq!(ground, [0.0, 0.0, 0.0], "the fixed chamber must not move");
         }
     }
+
+    #[test]
+    fn solved_pose_serde_round_trips() {
+        // The endpoint serializes solved poses to JSON; InstanceId must serialize
+        // as a bare number and the pose must survive a round-trip unchanged.
+        let p = SolvedPose {
+            instance: InstanceId(2),
+            translation: [1.5, -2.0, 16.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        let json = serde_json::to_string(&p).unwrap_or_default();
+        assert!(
+            json.contains("\"instance\":2"),
+            "InstanceId serializes as a bare number: {json}"
+        );
+        let back: SolvedPose = serde_json::from_str(&json).unwrap_or(SolvedPose {
+            instance: InstanceId(99),
+            translation: [0.0; 3],
+            rotation: [0.0; 4],
+        });
+        assert_eq!(back, p, "solved pose round-trips through JSON");
+    }
 }
