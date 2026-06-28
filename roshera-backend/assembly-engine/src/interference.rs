@@ -9,16 +9,15 @@
 use crate::types::{Assembly, Instance, InstanceId};
 use parry3d_f64::na::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
 use parry3d_f64::query;
-use parry3d_f64::shape::TriMesh;
+use parry3d_f64::shape::{ConvexPolyhedron, TriMesh};
 
 /// Two instances found overlapping in world space.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InterferencePair {
     pub a: InstanceId,
     pub b: InstanceId,
-    /// Best-effort separation at detection (≤ 0 ⇒ overlapping). `None` when the
-    /// exact distance is unsupported for the shape pair — the overlap is still
-    /// reported.
+    /// Penetration depth at detection (negative ⇒ the parts overlap by that
+    /// much), or the fallback separation. `Some` whenever a pair is reported.
     pub clearance: Option<f64>,
 }
 
@@ -67,18 +66,46 @@ fn instance_trimesh(instance: &Instance) -> Option<TriMesh> {
     Some(TriMesh::new(vertices, instance.mesh.triangles.clone()))
 }
 
+/// The instance's CONVEX HULL as a Parry `ConvexPolyhedron` (local frame). Used
+/// for the penetration-DEPTH interference test: Parry's exact EPA depth on a
+/// convex pair distinguishes a flush mating contact (depth ~0) from real overlap
+/// — a TriMesh contact can't (its surface-touch reads ~0 for both). Exact for
+/// convex parts (cylinders, blocks); a conservative over-approximation for a
+/// concave part until convex decomposition lands. `None` if the hull degenerates.
+fn instance_convex(instance: &Instance) -> Option<ConvexPolyhedron> {
+    if instance.mesh.vertices.len() < 4 {
+        return None;
+    }
+    let points: Vec<Point3<f64>> = instance
+        .mesh
+        .vertices
+        .iter()
+        .map(|v| Point3::new(v[0], v[1], v[2]))
+        .collect();
+    ConvexPolyhedron::from_convex_hull(&points)
+}
+
 impl Assembly {
-    /// Pairwise static interference across the assembly. O(n²) for now — broad-
-    /// phase BVH pruning is a later slice.
+    /// Pairwise static interference across the assembly — PENETRATION, not mere
+    /// contact. A real assembly's mating faces touch by design (a bolt seats
+    /// flush, a shaft bottoms in a bore); tangential contact is allowed and only
+    /// overlapping VOLUME (beyond a small contact tolerance) is flagged. O(n²) for
+    /// now — broad-phase BVH pruning is a later slice.
     pub fn interference_report(&self) -> InterferenceReport {
-        let prepared: Vec<(InstanceId, Isometry3<f64>, Option<TriMesh>)> = self
+        // Overlap beyond CONTACT_TOL is interference; touching (tangential
+        // contact — mating faces seat flush) is not. The penetration depth is
+        // Parry's EPA on each part's convex hull; PREDICTION is the band within
+        // which a contact is evaluated at all.
+        const CONTACT_TOL: f64 = 1.0e-3;
+        const PREDICTION: f64 = 1.0e-2;
+        let prepared: Vec<(InstanceId, Isometry3<f64>, Option<ConvexPolyhedron>)> = self
             .instances
             .iter()
             .map(|instance| {
                 (
                     instance.id,
                     instance_isometry(instance),
-                    instance_trimesh(instance),
+                    instance_convex(instance),
                 )
             })
             .collect();
@@ -86,19 +113,36 @@ impl Assembly {
         let mut interfering = Vec::new();
         for i in 0..prepared.len() {
             for j in (i + 1)..prepared.len() {
-                let (Some((id_a, pos_a, mesh_a)), Some((id_b, pos_b, mesh_b))) =
+                let (Some((id_a, pos_a, conv_a)), Some((id_b, pos_b, conv_b))) =
                     (prepared.get(i), prepared.get(j))
                 else {
                     continue;
                 };
-                let (Some(ma), Some(mb)) = (mesh_a, mesh_b) else {
-                    continue; // a mesh-less instance cannot interfere geometrically
+                let (Some(ca), Some(cb)) = (conv_a, conv_b) else {
+                    continue; // a degenerate / mesh-less instance cannot interfere
                 };
-                if query::intersection_test(pos_a, ma, pos_b, mb).unwrap_or(false) {
+                let interfered = match query::contact(pos_a, ca, pos_b, cb, PREDICTION) {
+                    // EPA penetration depth: negative when the hulls overlap.
+                    Ok(Some(c)) if c.dist < -CONTACT_TOL => Some(c.dist),
+                    // Touching contact (mating faces seat flush) ⇒ allowed.
+                    Ok(Some(_)) => None,
+                    // None (separated, OR an EPA degeneracy on a deep/exact
+                    // overlap) or Err (unsupported pair): disambiguate
+                    // conservatively with the boolean overlap test. This cannot
+                    // re-flag a flush contact, which returns `Some`, not `None`.
+                    _ => {
+                        if query::intersection_test(pos_a, ca, pos_b, cb).unwrap_or(false) {
+                            Some(0.0)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(depth) = interfered {
                     interfering.push(InterferencePair {
                         a: *id_a,
                         b: *id_b,
-                        clearance: query::distance(pos_a, ma, pos_b, mb).ok(),
+                        clearance: Some(depth),
                     });
                 }
             }
@@ -173,6 +217,21 @@ mod tests {
         let report = assembly.interference_report();
         assert!(!report.no_static_interference());
         assert_eq!(report.interfering.len(), 1);
+    }
+
+    #[test]
+    fn flush_faces_touch_but_do_not_interfere() {
+        // Two cubes seated face-to-face — the right face of one ON the left face
+        // of the other. Tangential CONTACT, the way parts MATE. Not interference.
+        let mut assembly = Assembly::new(InstanceId(0));
+        assembly.add_instance(cube_at(0, 1.0, 0.0)); // x in [-1, 1]
+        assembly.add_instance(cube_at(1, 1.0, 2.0)); // x in [1, 3] — touches at x=1
+        let report = assembly.interference_report();
+        assert!(
+            report.no_static_interference(),
+            "flush mating faces are contact, not interference: {:?}",
+            report.interfering
+        );
     }
 
     #[test]

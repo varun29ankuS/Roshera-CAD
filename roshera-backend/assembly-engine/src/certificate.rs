@@ -206,12 +206,13 @@ mod tests {
 
     #[test]
     fn an_interfering_pair_is_not_sound() {
-        // Grounded and consistent, but two parts share the origin — only the
-        // interference dimension fails.
+        // Grounded and consistent, but part 1 is driven deep into the ground part
+        // (overlapping by 1.2, not merely touching) — only the interference
+        // dimension fails.
         let mut assembly = Assembly::new(InstanceId(0));
-        assembly.add_instance(cube_at(0, [0.0, 0.0, 0.0]));
-        assembly.add_instance(cube_at(1, [0.0, 0.0, 0.0])); // overlaps ground
-        assembly.add_mate(concentric_to(1, [0.0, 0.0, 0.0]));
+        assembly.add_instance(cube_at(0, [0.0, 0.0, 0.0])); // [-1, 1]^3
+        assembly.add_instance(cube_at(1, [0.8, 0.0, 0.0])); // overlaps by 1.2 in x
+        assembly.add_mate(concentric_to(1, [0.8, 0.0, 0.0]));
         let cert = assembly.certify(&[], 0.01);
         assert!(!cert.is_sound());
         assert!(cert.mates_consistent && cert.fully_grounded);
