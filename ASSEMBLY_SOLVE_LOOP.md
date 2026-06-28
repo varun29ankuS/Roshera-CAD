@@ -32,6 +32,13 @@ Then `cargo fmt`, commit + push the green slice, update STATE, advance.
       `[0,0,0]` (fixed), injector `[0,0,16]` (seated on top), turbopump `[20,0,0]`
       (on its mount); converged in 2 iters, residual ~1e-25; applied to the scene
       → assembled engine. HARNESS met: live solved poses == expected. ✅
+- [x] **AS4** — interference = PENETRATION, not contact: `no_static_interference`
+      uses Parry EPA penetration depth on each part's CONVEX HULL (flush mating
+      contact ~0 is allowed; only overlap beyond CONTACT_TOL=1e-3 flags), with a
+      boolean fallback for EPA-degenerate / unsupported pairs. Convex hull = exact
+      for convex parts, conservative for concave (until convex decomposition).
+      HARNESS: `flush_faces_touch_but_do_not_interfere` + `overlapping_parts_interfere`.
+      ✅ 38 tests. (Live re-verify after the backend rebuild → engine should certify SOUND.)
 
 ## STATE
 - **LOOP COMPLETE — AS1→AS3.** The mate solver now POSITIONS parts, not just checks
