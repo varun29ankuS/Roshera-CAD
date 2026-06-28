@@ -580,6 +580,90 @@ server.tool(
 );
 
 server.tool(
+  "assembly_verify",
+  "CERTIFY A KINEMATIC ASSEMBLY — the non-fakeable 'does this physically go " +
+    "together AND move without collision?' verdict over LIVE kernel parts. You " +
+    "declare how parts MATE (which axes are concentric, which faces are " +
+    "coincident) and which are MECHANISMS (a gimbal, an actuator); the kernel " +
+    "tessellates each part, solves the mate constraints, and returns a 5-dimension " +
+    "certificate: `mates_consistent` (the constraint system is satisfiable), " +
+    "`fully_grounded` (every part reaches the ground part through a mate path — a " +
+    "part with NO mate to ground is FLOATING and named in `floating_instances`), " +
+    "`dof`+`mobility` (residual freedom), `no_static_interference` (no two parts " +
+    "overlap at the solved pose), `swept_clearance_ok` (every mechanism stays " +
+    "clear across its FULL range of motion — Parry CCD, made conservative by " +
+    "`epsilon`). `is_sound` is the AND of all five. USE THIS to prove an assembly " +
+    "is not a floating massing: a part placed by coordinate with no mate is caught " +
+    "here even when a shaded render and a per-part 'SOUND' verdict cannot see it.\n\n" +
+    "MATE format (get face geometry from plane_from_face; an axis is the part's " +
+    "build axis): { \"kind\":\"Concentric\"|\"Coincident\"|\"Fixed\", \"a\":<instance_id>, " +
+    "\"feature_a\":{\"Axis\":{\"origin\":[x,y,z],\"direction\":[x,y,z]}} OR " +
+    "{\"Face\":{\"point\":[x,y,z],\"normal\":[x,y,z]}}, \"b\":<instance_id>, \"feature_b\":{...} }. " +
+    "Concentric takes two Axis features; Coincident two Face features (mating faces " +
+    "have ANTIPARALLEL normals).\n" +
+    "MECHANISM format: { \"moving\":<instance_id>, \"joint\":" +
+    "{\"Revolute\":{\"axis_origin\":[..],\"axis_dir\":[..]}} OR {\"Prismatic\":{\"axis_origin\":[..]," +
+    "\"axis_dir\":[..]}} OR {\"Spherical\":{\"center\":[..]}} OR \"Fixed\", " +
+    "\"base_translation\":[x,y,z], \"base_rotation\":[x,y,z,w], \"range\":[lo,hi], \"samples\":<n> }.",
+  {
+    ground: z
+      .number()
+      .int()
+      .describe("instance_id of the grounded (fixed reference) part"),
+    parts: z
+      .array(
+        z.object({
+          object: z.string().describe("the part's object_uuid"),
+          instance_id: z
+            .number()
+            .int()
+            .describe("this occurrence's id, referenced by mates/mechanisms"),
+          translation: z
+            .array(z.number())
+            .length(3)
+            .optional()
+            .describe("world position [x,y,z] (default origin)"),
+          rotation: z
+            .array(z.number())
+            .length(4)
+            .optional()
+            .describe("unit quaternion [x,y,z,w] (default identity)"),
+        }),
+      )
+      .describe("every part in the assembly, as an instance"),
+    mates: z
+      .array(z.any())
+      .optional()
+      .describe("mate constraints — see the MATE format in the description"),
+    mechanisms: z
+      .array(z.any())
+      .optional()
+      .describe("mechanisms for swept-clearance — see the MECHANISM format"),
+    epsilon: z
+      .number()
+      .optional()
+      .default(0.0)
+      .describe(
+        "tessellation deviation bound; certified clearance = parry_distance − epsilon (conservative)",
+      ),
+  },
+  async ({ ground, parts, mates, mechanisms, epsilon }) => {
+    try {
+      const body = {
+        ground,
+        parts,
+        mates: mates ?? [],
+        mechanisms: mechanisms ?? [],
+        epsilon: epsilon ?? 0.0,
+      };
+      return ok(await api("POST", "/api/assembly/verify", body));
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
   "occupancy_view",
   "SEE a part's STRUCTURE as a non-deceivable SDF X-ray — a coarse occupancy " +
     "slice-stack ('#'=solid, '.'=empty) that reveals internal cavities, wall " +
