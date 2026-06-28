@@ -28,13 +28,19 @@ Then `cargo fmt`, commit + push the green slice, update STATE, advance.
       ✅ 36 tests (b92b89e)
 - [x] **AS2** — api-server: `assembly_verify` returns `solve` + `solved_poses`;
       HARNESS: SolvedPose serde round-trips; cargo check green. ✅ 37 tests
-- [ ] **AS3** — rebuild backend + LIVE: drop the injector + turbopump at WRONG
-      poses, declare their mates, call `assembly_verify`; the returned solved poses
-      snap them onto the fixed chamber. **HARNESS:** the live solved poses match
-      the expected seated positions (chamber fixed, injector on top, turbopump on
-      its mount) within tolerance.
+- [x] **AS3** — LIVE: all 3 parts dumped at the origin → the solve DERIVED chamber
+      `[0,0,0]` (fixed), injector `[0,0,16]` (seated on top), turbopump `[20,0,0]`
+      (on its mount); converged in 2 iters, residual ~1e-25; applied to the scene
+      → assembled engine. HARNESS met: live solved poses == expected. ✅
 
 ## STATE
-- Current: **AS3** (rebuild backend + live demo of the solver placing parts).
-- Last green: **AS2** — endpoint returns solved poses, 37 tests + cargo check green.
-- Blockers: none. AS3 needs a backend release rebuild (~15 min); no MCP reconnect (the tool just gets extra fields back).
+- **LOOP COMPLETE — AS1→AS3.** The mate solver now POSITIONS parts, not just checks
+  them: `solved_poses()` (AS1) → endpoint returns them (AS2) → live demo derived the
+  whole assembled config from all-three-at-the-origin (AS3). One part fixed, the rest
+  solved around it.
+- Last green: **AS3** live (chamber `[0,0,0]`, injector `[0,0,16]`, turbopump `[20,0,0]`).
+- **FOLLOW-UP surfaced by AS3 (CONTACT vs PENETRATION):** the seated injector sits FLUSH
+  on the chamber (mating faces touch), and `no_static_interference` reads that contact as
+  interference → cert returns `is_sound:false` though the placement is correct. A real
+  assembly's mating faces touch BY DESIGN; the interference check must distinguish
+  tangential CONTACT (allowed) from PENETRATION (overlap). Next slice candidate.
