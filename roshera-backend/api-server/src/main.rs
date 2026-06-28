@@ -1238,6 +1238,10 @@ async fn assembly_verify(
 
     let cert = assembly.certify(&mechanisms, epsilon);
     let grounding = assembly.grounding_report();
+    // Where the constraint solve actually PLACES each part: the fixed ground
+    // instance stays put, every other part is positioned by its mates relative
+    // to it. This is the assembly being SOLVED, not merely checked.
+    let (solve_report, solved) = assembly.solved_poses();
     let verdict = if cert.is_sound() {
         "SOUND — the assembly goes together and moves without collision"
     } else {
@@ -1248,6 +1252,12 @@ async fn assembly_verify(
         "is_sound": cert.is_sound(),
         "certificate": serde_json::to_value(&cert).unwrap_or(serde_json::Value::Null),
         "floating_instances": grounding.floating.iter().map(|i| i.0).collect::<Vec<_>>(),
+        "solve": {
+            "converged": solve_report.converged,
+            "iterations": solve_report.iterations,
+            "residual_norm": solve_report.final_residual_norm,
+        },
+        "solved_poses": serde_json::to_value(&solved).unwrap_or(serde_json::Value::Null),
         "verdict": verdict,
     })))
 }

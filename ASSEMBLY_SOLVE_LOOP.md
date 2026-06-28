@@ -23,15 +23,11 @@ Then `cargo fmt`, commit + push the green slice, update STATE, advance.
 - Run tests under a timeout. NEVER commit a red slice.
 
 ## Slices
-- [ ] **AS1** — assembly-engine: `solved_poses() -> (SolveReport, Vec<SolvedPose>)`
-      returns where the solve puts each instance (ground never moves).
-      **HARNESS:** an injector dropped at several deliberately WRONG poses
-      (off-axis / far / tilted), mated concentric + coincident to the fixed
-      chamber, SOLVES to the seated pose — on the z-axis, base on the chamber top
-      (z=16) — `converged` and translation within 1e-3, for every starting pose.
-- [ ] **AS2** — api-server: `assembly_verify` returns `solved` (per-instance
-      translation + rotation) and the solve report alongside the certificate.
-      **HARNESS:** SolvedPose serde round-trips; cargo check green.
+- [x] **AS1** — `solved_poses() -> (SolveReport, Vec<SolvedPose>)`; HARNESS: an
+      injector dropped at 3 WRONG poses solves onto the fixed chamber every time.
+      ✅ 36 tests (b92b89e)
+- [x] **AS2** — api-server: `assembly_verify` returns `solve` + `solved_poses`;
+      HARNESS: SolvedPose serde round-trips; cargo check green. ✅ 37 tests
 - [ ] **AS3** — rebuild backend + LIVE: drop the injector + turbopump at WRONG
       poses, declare their mates, call `assembly_verify`; the returned solved poses
       snap them onto the fixed chamber. **HARNESS:** the live solved poses match
@@ -39,6 +35,6 @@ Then `cargo fmt`, commit + push the green slice, update STATE, advance.
       its mount) within tolerance.
 
 ## STATE
-- Current: **AS1**.
-- Last green: — (start).
-- Blockers: none.
+- Current: **AS3** (rebuild backend + live demo of the solver placing parts).
+- Last green: **AS2** — endpoint returns solved poses, 37 tests + cargo check green.
+- Blockers: none. AS3 needs a backend release rebuild (~15 min); no MCP reconnect (the tool just gets extra fields back).
