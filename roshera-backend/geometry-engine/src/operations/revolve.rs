@@ -1015,16 +1015,14 @@ fn try_analytic_band_revolution(
         prof.push((s, en, curve_id, is_linear));
     }
 
-    // Eligibility: every profile vertex radius > 1e-4 (annular caps + finite
-    // cone/cylinder walls, no apex/disc — those remain grid fallback). Vertical
-    // edges → Cylinder, horizontal → annular Plane, sloped → Cone frustum.
-    for &(s, en, _, _) in &prof {
-        let (_, r0, _) = ring_geometry(model, s, axis_origin, axis)?;
-        let (_, r1, _) = ring_geometry(model, en, axis_origin, axis)?;
-        if r0 < 1e-4 || r1 < 1e-4 {
-            return Ok(None);
-        }
-    }
+    // Eligibility: a full-revolution closed meridian. Pole-touching vertices
+    // (radius ≈ 0) are now first-class — a band that closes to the axis becomes
+    // ONE cone / SurfaceOfRevolution face to the apex, a full disc when the cap is
+    // horizontal, and the pure axis segment bounds no face. (Before this, ANY r≈0
+    // vertex — every nose cone, dome, and pressure-vessel cap — bailed to the grid
+    // path and exploded to profile×`segments` faces.) build_analytic_bands
+    // self-checks and rolls back to the grid path on any failure, so an apex
+    // profile the analytic path can't yet seal never regresses a working revolve.
 
     // Build + self-check inside a rollback: Err restores the model so the grid
     // path runs clean.
@@ -1081,12 +1079,26 @@ fn build_analytic_bands(
             }
         }
     }
+    // A vertex within `apex_eps` of the axis is a POLE — a single point, not a
+    // ring circle. Its seam vertex is the axis point itself; adjacent bands'
+    // seam meridians terminate there.
+    let apex_eps = 1e-4;
     let mut ring_edge: HashMap<VertexId, EdgeId> = HashMap::new();
     let mut ring_seamv: HashMap<VertexId, VertexId> = HashMap::new();
     let mut ring_geo: HashMap<VertexId, (Point3, f64, f64)> = HashMap::new();
+    let mut is_apex: HashMap<VertexId, bool> = HashMap::new();
     for &v in &uniq {
         let (center, radius, axial) = ring_geometry(model, v, axis_origin, axis)?;
         ring_geo.insert(v, (center, radius, axial));
+        if radius < apex_eps {
+            is_apex.insert(v, true);
+            let av = model
+                .vertices
+                .add_or_find(center.x, center.y, center.z, tol.distance());
+            ring_seamv.insert(v, av);
+            continue;
+        }
+        is_apex.insert(v, false);
         let seam_pos = Point3::new(
             center.x + ref_dir.x * radius,
             center.y + ref_dir.y * radius,
@@ -1113,6 +1125,13 @@ fn build_analytic_bands(
     // One analytic face per band.
     let mut faces: Vec<FaceId> = Vec::new();
     for &(s, en, curve_id, is_linear) in prof {
+        let apex_s = is_apex.get(&s).copied().unwrap_or(false);
+        let apex_en = is_apex.get(&en).copied().unwrap_or(false);
+        // A profile edge running ALONG the axis (both endpoints poles) bounds no
+        // surface — the adjacent bands' seams already meet at the shared apex.
+        if apex_s && apex_en {
+            continue;
+        }
         let (c0, r0, t0) = ring_geo[&s];
         let (c1, r1, t1) = ring_geo[&en];
         let sp0 = model
@@ -1187,23 +1206,33 @@ fn build_analytic_bands(
             )
             .map_err(|e| OperationError::NumericalError(format!("revolve sor: {e}")))?;
             let surf_id = model.surfaces.add(Box::new(sor));
-            let seam_cid = model.curves.add(seam_curve);
-            let seam_eid = model.edges.add(Edge::new(
-                0,
-                ring_seamv[&s],
-                ring_seamv[&en],
-                seam_cid,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            ));
-
-            // Lateral loop: bottom_circle(fwd) seam(fwd) top_circle(bwd) seam(bwd).
-            let mut lp = Loop::new(0, LoopType::Outer);
-            lp.add_edge(ring_edge[&s], true);
-            lp.add_edge(seam_eid, true);
-            lp.add_edge(ring_edge[&en], false);
-            lp.add_edge(seam_eid, false);
-            let lp_id = model.loops.add(lp);
+            // Lateral loop. A pole end → the revolution surface closes to its
+            // apex: the ONLY boundary is the rim circle (the apex is the surface's
+            // singularity, not topology — mirrors ConePrimitive's single-edge apex
+            // loop), no seam. Two finite ends → a periodic band with a seam
+            // meridian: bottom_circle(fwd) seam(fwd) top_circle(bwd) seam(bwd).
+            let lp_id = if apex_s || apex_en {
+                let rim_v = if apex_s { en } else { s };
+                let mut lp = Loop::new(0, LoopType::Outer);
+                lp.add_edge(ring_edge[&rim_v], true);
+                model.loops.add(lp)
+            } else {
+                let seam_cid = model.curves.add(seam_curve);
+                let seam_eid = model.edges.add(Edge::new(
+                    0,
+                    ring_seamv[&s],
+                    ring_seamv[&en],
+                    seam_cid,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                ));
+                let mut lp = Loop::new(0, LoopType::Outer);
+                lp.add_edge(ring_edge[&s], true);
+                lp.add_edge(seam_eid, true);
+                lp.add_edge(ring_edge[&en], false);
+                lp.add_edge(seam_eid, false);
+                model.loops.add(lp)
+            };
 
             let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
             let surf = model
@@ -1215,18 +1244,16 @@ fn build_analytic_bands(
             f.outer_loop = lp_id;
             faces.push(model.faces.add(f));
         } else if horizontal {
-            // Annular plane cap at constant axial. Outer = larger-radius circle.
-            let (outer_v, inner_v) = if r0 >= r1 { (s, en) } else { (en, s) };
+            // Plane cap at constant axial. A pole end → full DISC (outer circle
+            // only); two finite radii → annular ring (outer rim + inner hole).
             let plane = Plane::from_point_normal(c0, axis)
                 .map_err(|e| OperationError::NumericalError(format!("revolve plane: {e}")))?;
             let surf_id = model.surfaces.add(Box::new(plane));
+            let rim_v = if r0 >= r1 { s } else { en };
 
             let mut lp = Loop::new(0, LoopType::Outer);
-            lp.add_edge(ring_edge[&outer_v], true);
+            lp.add_edge(ring_edge[&rim_v], true);
             let lp_id = model.loops.add(lp);
-            let mut inner = Loop::new(0, LoopType::Inner);
-            inner.add_edge(ring_edge[&inner_v], true);
-            let inner_id = model.loops.add(inner);
 
             // Plane outward0 is constant ±axis over the whole face → sample midpoint.
             let surf = model
@@ -1236,7 +1263,14 @@ fn build_analytic_bands(
             let orient = orient_face_for_outward(surf, outward0)?;
             let mut f = Face::new(0, surf_id, lp_id, orient);
             f.outer_loop = lp_id;
-            f.add_inner_loop(inner_id);
+            if !(apex_s || apex_en) {
+                // Annular ring: the smaller-radius circle is the central hole.
+                let inner_v = if r0 >= r1 { en } else { s };
+                let mut inner = Loop::new(0, LoopType::Inner);
+                inner.add_edge(ring_edge[&inner_v], true);
+                let inner_id = model.loops.add(inner);
+                f.add_inner_loop(inner_id);
+            }
             faces.push(model.faces.add(f));
         } else {
             // Periodic seam band: Cylinder (vertical edge) or Cone frustum
@@ -1277,36 +1311,45 @@ fn build_analytic_bands(
                 model.surfaces.add(Box::new(cone))
             };
 
-            // Seam meridian between the two ring seam vertices (profile order).
-            let svs = model
-                .vertices
-                .get_position(ring_seamv[&s])
-                .ok_or_else(|| OperationError::InvalidGeometry("revolve: seam vtx s".into()))?;
-            let sve = model
-                .vertices
-                .get_position(ring_seamv[&en])
-                .ok_or_else(|| OperationError::InvalidGeometry("revolve: seam vtx e".into()))?;
-            let seam_line = Line::new(
-                Point3::new(svs[0], svs[1], svs[2]),
-                Point3::new(sve[0], sve[1], sve[2]),
-            );
-            let seam_cid = model.curves.add(Box::new(seam_line));
-            let seam_eid = model.edges.add(Edge::new(
-                0,
-                ring_seamv[&s],
-                ring_seamv[&en],
-                seam_cid,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            ));
-
-            // Lateral loop: bottom_circle(fwd) seam(fwd) top_circle(bwd) seam(bwd).
-            let mut lp = Loop::new(0, LoopType::Outer);
-            lp.add_edge(ring_edge[&s], true);
-            lp.add_edge(seam_eid, true);
-            lp.add_edge(ring_edge[&en], false);
-            lp.add_edge(seam_eid, false);
-            let lp_id = model.loops.add(lp);
+            // Lateral loop. A pole end → a cone closing to its apex: its ONLY
+            // boundary is the rim circle (the apex is the surface's singularity,
+            // not topology — mirrors ConePrimitive's single-edge apex loop), no
+            // seam. Two finite ends → a periodic band with a seam meridian:
+            // bottom_circle(fwd) seam(fwd) top_circle(bwd) seam(bwd).
+            let lp_id = if apex_s || apex_en {
+                let rim_v = if apex_s { en } else { s };
+                let mut lp = Loop::new(0, LoopType::Outer);
+                lp.add_edge(ring_edge[&rim_v], true);
+                model.loops.add(lp)
+            } else {
+                let svs = model
+                    .vertices
+                    .get_position(ring_seamv[&s])
+                    .ok_or_else(|| OperationError::InvalidGeometry("revolve: seam vtx s".into()))?;
+                let sve = model
+                    .vertices
+                    .get_position(ring_seamv[&en])
+                    .ok_or_else(|| OperationError::InvalidGeometry("revolve: seam vtx e".into()))?;
+                let seam_line = Line::new(
+                    Point3::new(svs[0], svs[1], svs[2]),
+                    Point3::new(sve[0], sve[1], sve[2]),
+                );
+                let seam_cid = model.curves.add(Box::new(seam_line));
+                let seam_eid = model.edges.add(Edge::new(
+                    0,
+                    ring_seamv[&s],
+                    ring_seamv[&en],
+                    seam_cid,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                ));
+                let mut lp = Loop::new(0, LoopType::Outer);
+                lp.add_edge(ring_edge[&s], true);
+                lp.add_edge(seam_eid, true);
+                lp.add_edge(ring_edge[&en], false);
+                lp.add_edge(seam_eid, false);
+                model.loops.add(lp)
+            };
 
             // orient_face_for_outward samples u=π; rotate outward0 (at angle 0) there.
             let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
