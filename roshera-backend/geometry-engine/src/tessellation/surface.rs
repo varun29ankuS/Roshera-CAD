@@ -4670,6 +4670,158 @@ fn tessellate_revolution_wedge(
         return true;
     }
 
+    // 1-EDGE FULL POLE (smooth SOLID revolve): the loop is a SINGLE closed rim
+    // circle and the SurfaceOfRevolution closes to a POLE (apex) at the opposite
+    // profile end — a smooth revolved wall that comes to a point (nose cone,
+    // dome, teardrop, bullet). The quad/Coons paths need ≥4 corners and a `Cone`
+    // gets a dedicated apex collapse, so a CURVED pole wall fell through to
+    // curved-CDT, which left the apex OPEN (boundary-edge leak → not watertight,
+    // the analytic revolve self-check rolls back to per-segment bands). Mesh it
+    // as a fan: the rim ring (EXACT edge-cache samples → watertight with the base
+    // disc) marched up through intermediate ON-SURFACE rings to a single
+    // collapsed apex vertex.
+    if loop_data.edges.len() == 1 {
+        let surf = match model.surfaces.get(face.surface_id) {
+            Some(s) => s,
+            None => return false,
+        };
+        let rim_eid = loop_data.edges[0];
+        let mut rim: Vec<Point3> = cache
+            .get_or_compute(rim_eid, model)
+            .iter()
+            .copied()
+            .collect();
+        if !loop_data.orientations.first().copied().unwrap_or(true) {
+            rim.reverse();
+        }
+        // Drop the duplicated closing sample of the closed circle.
+        if rim.len() >= 2 && (rim[0] - rim[rim.len() - 1]).magnitude() < 1e-6 {
+            rim.pop();
+        }
+        let na = rim.len();
+        if na < 3 {
+            return false;
+        }
+        let ((u_lo, u_hi), (v_lo, v_hi)) = surf.parameter_bounds();
+        // A profile end is a POLE when all angular samples there collapse to one
+        // point. Identify it; without a pole this is not our case.
+        let is_pole = |u: f64| match (
+            surf.evaluate_full(u, v_lo).ok(),
+            surf.evaluate_full(u, 0.5 * (v_lo + v_hi)).ok(),
+        ) {
+            (Some(a), Some(b)) => (a.position - b.position).magnitude() < 1e-6,
+            _ => false,
+        };
+        let (u_rim, u_apex) = if is_pole(u_hi) {
+            (u_lo, u_hi)
+        } else if is_pole(u_lo) {
+            (u_hi, u_lo)
+        } else {
+            return false;
+        };
+        let apex_p = match surf.evaluate_full(u_apex, v_lo) {
+            Ok(sp) => sp.position,
+            Err(_) => return false,
+        };
+        // Outward sense from the real rim ring (CCW about the surface normal).
+        let outward = newell_normal(&rim)
+            .map(|nv| nv * face.orientation.sign())
+            .unwrap_or(Vector3::Z);
+        // Angle of rim sample i (uniform from the seam, matching the circle edge
+        // cache) — used to sample the intermediate rings so they align
+        // index-for-index with the exact rim ring above.
+        let ang_at = |i: usize| v_lo + (v_hi - v_lo) * (i as f64) / (na as f64);
+        // Meridian resolution: interior-only, so watertightness rides entirely on
+        // the shared rim ring; pick enough rings for a smooth wall.
+        let m = na.clamp(16, 64);
+        let wind =
+            |a: u32, b: u32, c: u32, pa: Point3, pb: Point3, pc: Point3| -> (u32, u32, u32) {
+                let gn = (pb - pa).cross(&(pc - pa));
+                if gn.dot(&outward) >= 0.0 {
+                    (a, b, c)
+                } else {
+                    (a, c, b)
+                }
+            };
+        // Ring stack: ring 0 = exact rim; rings 1..m march on the surface toward
+        // the apex.
+        let mut rings: Vec<Vec<(u32, Point3)>> = Vec::with_capacity(m);
+        let mut row0 = Vec::with_capacity(na);
+        for i in 0..na {
+            let normal = surf
+                .evaluate_full(u_rim, ang_at(i))
+                .ok()
+                .map(|sp| {
+                    if sp.normal.dot(&outward) < 0.0 {
+                        -sp.normal
+                    } else {
+                        sp.normal
+                    }
+                })
+                .unwrap_or(outward);
+            let id = mesh.add_vertex(MeshVertex {
+                position: rim[i],
+                normal,
+                uv: None,
+            });
+            row0.push((id, rim[i]));
+        }
+        rings.push(row0);
+        for k in 1..m {
+            let t = k as f64 / m as f64;
+            let u = u_rim + (u_apex - u_rim) * t;
+            let mut row = Vec::with_capacity(na);
+            for i in 0..na {
+                let sp = match surf.evaluate_full(u, ang_at(i)) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                let normal = if sp.normal.dot(&outward) < 0.0 {
+                    -sp.normal
+                } else {
+                    sp.normal
+                };
+                let id = mesh.add_vertex(MeshVertex {
+                    position: sp.position,
+                    normal,
+                    uv: None,
+                });
+                row.push((id, sp.position));
+            }
+            rings.push(row);
+        }
+        let apex_id = mesh.add_vertex(MeshVertex {
+            position: apex_p,
+            normal: outward,
+            uv: None,
+        });
+        // Quad strips between consecutive rings (wrap i → i+1 mod na).
+        for k in 0..rings.len() - 1 {
+            for i in 0..na {
+                let j = (i + 1) % na;
+                let (a, pa) = rings[k][i];
+                let (b, pb) = rings[k][j];
+                let (c, pc) = rings[k + 1][j];
+                let (d, pd) = rings[k + 1][i];
+                let (x, y, z) = wind(a, b, c, pa, pb, pc);
+                mesh.add_triangle(x, y, z);
+                let (x, y, z) = wind(a, c, d, pa, pc, pd);
+                mesh.add_triangle(x, y, z);
+            }
+        }
+        // Apex fan from the last ring.
+        if let Some(last) = rings.last() {
+            for i in 0..na {
+                let j = (i + 1) % na;
+                let (a, pa) = last[i];
+                let (b, pb) = last[j];
+                let (x, y, z) = wind(a, b, apex_id, pa, pb, apex_p);
+                mesh.add_triangle(x, y, z);
+            }
+        }
+        return true;
+    }
+
     if loop_data.edges.len() != 4 {
         return false;
     }

@@ -3883,7 +3883,8 @@ async fn create_revolve_primitive(
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
     use geometry_engine::operations::revolve::{
-        revolve_meridian, revolve_smooth_nozzle, revolve_spline_meridian, RevolveOptions,
+        revolve_meridian, revolve_smooth_nozzle, revolve_smooth_solid, revolve_spline_meridian,
+        RevolveOptions,
     };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
@@ -3990,11 +3991,21 @@ async fn create_revolve_primitive(
                     format!("smooth nozzle revolve failed: {e:?}"),
                 )
             })?
-        } else if smooth {
+        } else if smooth && bore_radius > 0.0 {
             revolve_spline_meridian(&mut model, &profile, bore_radius, opts).map_err(|e| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
                     format!("smooth revolve failed: {e:?}"),
+                )
+            })?
+        } else if smooth {
+            // Smooth SOLID of revolution (no bore): fit ONE NURBS wall → one
+            // SurfaceOfRevolution face that closes to the apex (nose cone / dome /
+            // teardrop) — zero meridian band rings.
+            revolve_smooth_solid(&mut model, &profile, opts).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("smooth solid revolve failed: {e:?}"),
                 )
             })?
         } else {

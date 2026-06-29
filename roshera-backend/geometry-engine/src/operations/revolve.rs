@@ -433,6 +433,138 @@ pub fn revolve_spline_meridian(
     Ok(solid)
 }
 
+/// Parametric revolve of a SMOOTH SOLID of revolution — the solid analogue of
+/// `revolve_spline_meridian` (which is hollow). Fits ONE degree-3 NURBS through
+/// the wall meridian and revolves it to a SINGLE `SurfaceOfRevolution` face, so a
+/// nose cone / dome / teardrop / bullet is ONE smooth wall + flat cap(s) with
+/// ZERO meridian band rings — not `P` cone-frustum bands welded rim-to-rim.
+///
+/// `profile_rz` is the meridian `(r, z)`; a leading on-axis point (the base
+/// centre) is dropped and rebuilt as the disc closure. The wall runs base-rim →
+/// tip; an APEX tip (`r ≈ 0`) closes straight down the axis (the pole the
+/// analytic revolve + pole-fan tessellation now handle), a FINITE tip gets a
+/// second disc. The wall meridian is retained as construction geometry.
+pub fn revolve_smooth_solid(
+    model: &mut BRepModel,
+    profile_rz: &[(f64, f64)],
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+    use crate::primitives::curve::{Line, NurbsCurve, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+
+    let eps = 1e-4;
+    // Drop a leading on-axis (base-centre) pole; the wall is the rest.
+    let wall: &[(f64, f64)] = match profile_rz.first() {
+        Some(&(r, _)) if r < eps => &profile_rz[1..],
+        _ => profile_rz,
+    };
+    if wall.len() < 4 {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_solid: need at least 4 wall points for a cubic spline".to_string(),
+        ));
+    }
+    if wall[0].0 < eps {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_smooth_solid: wall must start at a finite base rim".to_string(),
+        ));
+    }
+
+    let axis_origin = options.axis_origin;
+    let (axis, e1, _e2) = axis_frame(options.axis_direction)?;
+    let lift = |r: f64, z: f64| lift_meridian(axis_origin, axis, e1, r, z);
+
+    // ONE degree-3 NURBS through the wall meridian (lifted into the axis frame).
+    let wall_pts: Vec<Point3> = wall.iter().map(|&(r, z)| lift(r, z)).collect();
+    let wall_math = interpolate_nurbs_curve(&wall_pts, 3, ParameterizationType::ChordLength)
+        .map_err(|e| OperationError::NumericalError(format!("wall spline fit: {e}")))?;
+    let wall_curve = NurbsCurve::new(
+        wall_math.degree,
+        wall_math.control_points,
+        wall_math.weights,
+        wall_math.knots.to_vec(),
+    )
+    .map_err(|e| OperationError::NumericalError(format!("wall curve: {e:?}")))?;
+
+    let (r_rim, z_rim) = wall[0];
+    let (r_tip, z_tip) = wall[wall.len() - 1];
+    let p_rim = lift(r_rim, z_rim);
+    let p_tip = lift(r_tip, z_tip);
+    let p_base_c = lift(0.0, z_rim); // base centre on the axis
+    let v_rim = model.vertices.add(p_rim.x, p_rim.y, p_rim.z);
+    let v_tip = model.vertices.add(p_tip.x, p_tip.y, p_tip.z);
+    let v_base_c = model.vertices.add(p_base_c.x, p_base_c.y, p_base_c.z);
+
+    let c_base = model.curves.add(Box::new(Line::new(p_base_c, p_rim))); // base disc radius
+    let c_wall = model.curves.add(Box::new(wall_curve)); // the smooth wall
+
+    let mut edges = vec![
+        model.edges.add(Edge::new(
+            0,
+            v_base_c,
+            v_rim,
+            c_base,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+        model.edges.add(Edge::new(
+            0,
+            v_rim,
+            v_tip,
+            c_wall,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )),
+    ];
+    if r_tip < eps {
+        // Apex on the axis → close the meridian straight down the axis.
+        let c_axis = model.curves.add(Box::new(Line::new(p_tip, p_base_c)));
+        edges.push(model.edges.add(Edge::new(
+            0,
+            v_tip,
+            v_base_c,
+            c_axis,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+    } else {
+        // Finite (blunt) tip → a second disc cap, then the axis closure.
+        let p_tip_c = lift(0.0, z_tip);
+        let v_tip_c = model.vertices.add(p_tip_c.x, p_tip_c.y, p_tip_c.z);
+        let c_tip = model.curves.add(Box::new(Line::new(p_tip, p_tip_c)));
+        let c_axis = model.curves.add(Box::new(Line::new(p_tip_c, p_base_c)));
+        edges.push(model.edges.add(Edge::new(
+            0,
+            v_tip,
+            v_tip_c,
+            c_tip,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+        edges.push(model.edges.add(Edge::new(
+            0,
+            v_tip_c,
+            v_base_c,
+            c_axis,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        )));
+    }
+
+    let solid = revolve_profile(model, edges, options)?;
+
+    let meridian_pts: Vec<Point3> = wall.iter().map(|&(r, z)| lift(r, z)).collect();
+    model.set_solid_construction(
+        solid,
+        crate::primitives::provenance::ConstructionGeometry::revolution(
+            axis_origin,
+            axis,
+            meridian_pts,
+        ),
+    );
+    Ok(solid)
+}
+
 /// Parametric revolve of a SMOOTH constant-thickness AXISYMMETRIC SHELL — the
 /// correct primitive for a Rao bell nozzle (or any contoured vessel). `inner_rz`
 /// is the FLOW/inner meridian (the `(r, z)` contour, inlet→exit, every `r > 0`);
