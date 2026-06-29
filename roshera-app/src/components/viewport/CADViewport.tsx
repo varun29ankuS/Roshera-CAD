@@ -162,12 +162,16 @@ export function CADViewport() {
       className="absolute inset-0 overflow-hidden bg-[var(--cad-viewport-bg)]"
     >
       <Canvas
-        // Three.js r170+ deprecated PCFSoftShadowMap (the default that
-        // `shadows` / `shadows={true}` resolves to) and now silently
-        // remaps it to PCFShadowMap with a console warning. Pin to
-        // PCFShadowMap explicitly so the warning is gone and the actual
-        // shadow algorithm matches what the renderer is using.
-        shadows="percentage"
+        // Shadows OFF: `shadows="percentage"` (PCSS soft shadows) re-renders
+        // every shadow-casting mesh into a soft-sampled shadow map each frame —
+        // negligible for a couple of parts, but it collapses the frame rate once
+        // a full assembly (e.g. a ~30-part robot) is visible, which reads as the
+        // viewport "holding the mouse" during orbit. This is a line-based
+        // blueprint UI where cast shadows are nearly invisible anyway, so the
+        // shadow pass is pure cost. Drop it; the per-mesh castShadow/receiveShadow
+        // flags become no-ops. (A cheap baked contact shadow can be added later
+        // if grounding is wanted — without the per-frame multi-mesh shadow pass.)
+        shadows={false}
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}
         onCreated={handleCreated}

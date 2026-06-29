@@ -6,6 +6,7 @@ import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useAssemblyStore } from '@/stores/assembly-store'
 import { resolveCssVar } from '@/lib/css-color'
 import { wsClient } from '@/lib/ws-client'
+import { isRaycastSuppressed } from './orbit-raycast-gate'
 import * as THREE from 'three'
 import type { ThreeEvent } from '@react-three/fiber'
 
@@ -358,6 +359,19 @@ export function CADMesh({ object, isHovered }: CADMeshProps) {
     document.body.style.cursor = 'default'
   }, [sketchActive, setHovered, setHoveredSubElement])
 
+  // Skip the (un-BVH'd, triangle-precise) raycast while the camera is being
+  // orbited — R3F would otherwise run it on every pointermove across every
+  // pickable mesh, stalling the drag once a full assembly is on screen. Hover
+  // is restored the instant the drag ends (see orbit-raycast-gate).
+  const handleRaycast = useCallback(
+    (raycaster: THREE.Raycaster, intersects: THREE.Intersection[]) => {
+      if (isRaycastSuppressed()) return
+      const mesh = meshRef.current
+      if (mesh) THREE.Mesh.prototype.raycast.call(mesh, raycaster, intersects)
+    },
+    [],
+  )
+
   return (
     <mesh
       ref={meshRef}
@@ -366,6 +380,7 @@ export function CADMesh({ object, isHovered }: CADMeshProps) {
       position={object.position}
       rotation={object.rotation}
       scale={object.scale}
+      raycast={handleRaycast}
       castShadow
       receiveShadow
       onClick={handleClick}
