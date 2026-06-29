@@ -10,7 +10,7 @@
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::revolve::{
     get_revolve_meridian, revolve_meridian, revolve_profile, revolve_smooth_nozzle,
-    revolve_spline_meridian, RevolveOptions,
+    revolve_smooth_solid, revolve_spline_meridian, RevolveOptions,
 };
 use geometry_engine::primitives::curve::{Arc, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
@@ -746,4 +746,47 @@ fn nose_cone_ogive_is_o_profile_faces_not_band_explosion() {
     );
     let v = validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard);
     assert!(v.is_valid, "nose cone invalid: {:?}", v.errors);
+}
+
+/// SOLID SMOOTH revolve — a nose cone fit to ONE NURBS wall is ONE
+/// `SurfaceOfRevolution` + a disc base = 2 faces, ZERO meridian band rings (the
+/// "why so many concentric rings" complaint). This drives BOTH the analytic
+/// pole-band topology AND the pole-fan tessellation: a getting-this-to-2-faces
+/// result means the SurfaceOfRevolution closed its apex WATERTIGHT (else the
+/// self-check rolls back to per-segment bands and this is 100+ faces).
+#[test]
+fn smooth_solid_nose_is_one_surface_plus_disc() {
+    let (r, l) = (30.0_f64, 78.0_f64);
+    let rho = (r * r + l * l) / (2.0 * r);
+    let mut pts = vec![(0.0_f64, 0.0_f64)]; // base centre on the axis
+    for i in 0..20 {
+        let z = l * i as f64 / 19.0;
+        let rr = ((rho * rho - z * z).sqrt() - (rho - r)).max(0.0);
+        pts.push((rr, z));
+    }
+    *pts.last_mut().expect("nonempty") = (0.0, l); // exact apex
+    let opts = RevolveOptions {
+        axis_origin: Point3::ZERO,
+        axis_direction: Vector3::Z,
+        angle: std::f64::consts::TAU,
+        segments: 96,
+        ..Default::default()
+    };
+    let mut m = BRepModel::new();
+    let s = revolve_smooth_solid(&mut m, &pts, opts)
+        .unwrap_or_else(|e| panic!("revolve_smooth_solid: {e:?}"));
+    let k = face_kinds(&m, s);
+    assert_eq!(
+        count(&k, SurfaceType::SurfaceOfRevolution),
+        1,
+        "the wall must be ONE smooth SurfaceOfRevolution (no band rings): {k:?}"
+    );
+    assert!(
+        k.len() <= 2,
+        "smooth solid nose = one wall + one disc base = 2 faces: {} {k:?}",
+        k.len()
+    );
+    let v = validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard);
+    assert!(v.is_valid, "smooth solid nose invalid: {:?}", v.errors);
+    assert!(get_revolve_meridian(&m, s).is_some());
 }
