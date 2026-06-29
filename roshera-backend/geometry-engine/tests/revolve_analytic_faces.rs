@@ -686,3 +686,64 @@ fn smooth_nozzle_wall_tessellation_is_facet_sound() {
         }
     }
 }
+
+/// FUNDAMENTAL FIX — a solid of revolution that CLOSES TO THE AXIS (an apex /
+/// pole) must be O(profile) analytic faces, NOT profile×`segments`. This is the
+/// nose-cone / dome / vessel-cap class that fell to the grid path and exploded
+/// (a live nose cone = 3,840 faces), bloating the STEP export until FreeCAD
+/// crashed. The apex band is ONE cone-to-apex face, the base ONE disc, and the
+/// pure axis segment bounds no face.
+#[test]
+fn solid_cone_to_apex_is_two_analytic_faces() {
+    let mut m = BRepModel::new();
+    // base centre → base rim → apex (auto-closes apex→centre along the axis).
+    let s = revolve(&mut m, &[(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)], 64);
+    let k = face_kinds(&m, s);
+    assert!(
+        k.len() <= 3,
+        "solid cone must be ~2 analytic faces, not 64× bands: {} {k:?}",
+        k.len()
+    );
+    assert_eq!(count(&k, SurfaceType::Cone), 1, "one cone-to-apex lateral");
+    assert_eq!(count(&k, SurfaceType::Plane), 1, "one disc base");
+    assert_eq!(
+        count(&k, SurfaceType::SurfaceOfRevolution),
+        0,
+        "no faceted patches"
+    );
+    let v = validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard);
+    assert!(v.is_valid, "solid cone invalid: {:?}", v.errors);
+}
+
+/// The exact failing case: a tangent-ogive NOSE CONE (polyline meridian to the
+/// apex). 20 profile points → ~19 cone bands + apex + disc — O(profile). Before
+/// the fix this hit the grid path and emitted profile×`segments` ≈ 1,800+ faces
+/// (the live nose was 3,840), which bloated the STEP and crashed FreeCAD. Pin it:
+/// under 60 faces, no faceted patches, and a valid solid.
+#[test]
+fn nose_cone_ogive_is_o_profile_faces_not_band_explosion() {
+    let (r, l) = (30.0_f64, 78.0_f64);
+    let rho = (r * r + l * l) / (2.0 * r);
+    let mut pts = vec![(0.0_f64, 0.0_f64)];
+    for i in 0..20 {
+        let z = l * i as f64 / 19.0;
+        let rr = ((rho * rho - z * z).sqrt() - (rho - r)).max(0.0);
+        pts.push((rr, z));
+    }
+    *pts.last_mut().expect("nonempty") = (0.0, l); // exact apex on the axis
+    let mut m = BRepModel::new();
+    let s = revolve(&mut m, &pts, 96);
+    let k = face_kinds(&m, s);
+    assert!(
+        k.len() < 60,
+        "nose cone must be O(profile) faces (~22), not O(profile×segments) ≈ 1800: {} faces",
+        k.len()
+    );
+    assert_eq!(
+        count(&k, SurfaceType::SurfaceOfRevolution),
+        0,
+        "polyline ogive bands are Cones, not faceted SurfaceOfRevolution patches: {k:?}"
+    );
+    let v = validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard);
+    assert!(v.is_valid, "nose cone invalid: {:?}", v.errors);
+}
