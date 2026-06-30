@@ -43,6 +43,20 @@ pub enum RecognizedFeature {
 }
 
 impl RecognizedFeature {
+    /// Every topological face this feature occupies (for cross-checking that a
+    /// recognized feature's faces are live and visible). Used by the dual-eye
+    /// reconcile.
+    pub fn face_ids(&self) -> Vec<u32> {
+        match self {
+            RecognizedFeature::ThroughHole { face_id, .. }
+            | RecognizedFeature::BlindHole { face_id, .. }
+            | RecognizedFeature::CylindricalBoss { face_id, .. }
+            | RecognizedFeature::SphericalFeature { face_id, .. } => vec![*face_id],
+            RecognizedFeature::Fillet { face_ids, .. }
+            | RecognizedFeature::Chamfer { face_ids, .. } => face_ids.clone(),
+        }
+    }
+
     /// Human-readable description of the feature.
     pub fn to_description(&self) -> String {
         match self {
@@ -357,5 +371,29 @@ mod tests {
         assert!(desc.contains("fillet"));
         assert!(desc.contains("2.5"));
         assert!(desc.contains("3 faces"));
+    }
+}
+
+#[cfg(test)]
+mod face_ids_tests {
+    use super::*;
+
+    #[test]
+    fn through_hole_reports_single_face() {
+        let f = RecognizedFeature::ThroughHole {
+            diameter: 2.0,
+            axis: [0.0, 0.0, 1.0],
+            face_id: 7,
+        };
+        assert_eq!(f.face_ids(), vec![7]);
+    }
+
+    #[test]
+    fn fillet_reports_all_faces() {
+        let f = RecognizedFeature::Fillet {
+            radius: 1.0,
+            face_ids: vec![3, 4, 5],
+        };
+        assert_eq!(f.face_ids(), vec![3, 4, 5]);
     }
 }
