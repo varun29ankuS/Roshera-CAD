@@ -4,11 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::primitives::feature_recognition::RecognizedFeature;
-use crate::primitives::provenance::ValidityCertificate;
-use crate::render::RenderFrame;
-use std::collections::HashSet;
-
 /// Which pair of eyes a discrepancy is between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReconcileAxis {
