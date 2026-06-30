@@ -2,7 +2,9 @@
 //! (feature recognition). Pure logic only — the api-server does all rendering
 //! and passes frames in, keeping these functions unit-testable with no I/O.
 
+use crate::primitives::feature_recognition::RecognizedFeature;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Which pair of eyes a discrepancy is between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +63,37 @@ pub struct ReconcileReport {
     pub duration_ms: u64,
 }
 
+/// Verdict from the render-free cross-check (maps onto the certificate's
+/// `EyesConsistency` dimension). Kept separate from the cert enum so this module
+/// has no dependency cycle with `provenance`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EyesVerdict {
+    Consistent,
+    Inconsistent,
+    NotApplicable,
+}
+
+/// Render-free deterministic cross-check (Truth↔Semantic): every recognized
+/// feature must reference a live face. `NotApplicable` when there is nothing to
+/// cross-check. This is the SOLE check that gates `is_sound`.
+pub fn check_eyes_consistent(
+    live_face_ids: &HashSet<u32>,
+    features: &[RecognizedFeature],
+) -> EyesVerdict {
+    if features.is_empty() {
+        return EyesVerdict::NotApplicable;
+    }
+    let all_live = features
+        .iter()
+        .flat_map(|f| f.face_ids())
+        .all(|fid| live_face_ids.contains(&fid));
+    if all_live {
+        EyesVerdict::Consistent
+    } else {
+        EyesVerdict::Inconsistent
+    }
+}
+
 #[cfg(test)]
 mod type_tests {
     use super::*;
@@ -93,5 +126,49 @@ mod type_tests {
         let back: ReconcileReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.status, ReconcileStatus::DiscrepanciesFound);
         assert_eq!(back.coverage.unseen, vec![9]);
+    }
+}
+
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+    use crate::primitives::feature_recognition::RecognizedFeature;
+    use std::collections::HashSet;
+
+    fn live(ids: &[u32]) -> HashSet<u32> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn no_features_is_not_applicable() {
+        assert_eq!(
+            check_eyes_consistent(&live(&[1, 2]), &[]),
+            EyesVerdict::NotApplicable
+        );
+    }
+
+    #[test]
+    fn all_feature_faces_live_is_consistent() {
+        let f = vec![RecognizedFeature::ThroughHole {
+            diameter: 2.0,
+            axis: [0.0, 0.0, 1.0],
+            face_id: 2,
+        }];
+        assert_eq!(
+            check_eyes_consistent(&live(&[1, 2, 3]), &f),
+            EyesVerdict::Consistent
+        );
+    }
+
+    #[test]
+    fn feature_on_dead_face_is_inconsistent() {
+        let f = vec![RecognizedFeature::Fillet {
+            radius: 1.0,
+            face_ids: vec![2, 99],
+        }];
+        assert_eq!(
+            check_eyes_consistent(&live(&[1, 2, 3]), &f),
+            EyesVerdict::Inconsistent
+        );
     }
 }
