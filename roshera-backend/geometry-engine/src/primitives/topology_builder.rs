@@ -2541,6 +2541,8 @@ impl BRepModel {
             self_intersection_free,
             construction_consistent,
             labels_consistent,
+            // Placeholder: Task 5 replaces this with the real dual-eye reconcile result.
+            eyes_consistent: crate::primitives::provenance::EyesConsistency::NotApplicable,
             tessellation,
             mesh_quality,
             errors,

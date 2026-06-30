@@ -243,6 +243,31 @@ impl LabelsConsistency {
     }
 }
 
+/// Tri-state verdict from the dual-eye reconcile's render-free cross-check
+/// (Truth↔Semantic): are all recognized features backed by live faces?
+/// `NotApplicable` when the solid has no recognizable features — sound by
+/// construction, so featureless primitives never regress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EyesConsistency {
+    Consistent,
+    Inconsistent,
+    NotApplicable,
+}
+
+impl EyesConsistency {
+    pub fn label(&self) -> &'static str {
+        match self {
+            EyesConsistency::Consistent => "consistent",
+            EyesConsistency::Inconsistent => "inconsistent",
+            EyesConsistency::NotApplicable => "not_applicable",
+        }
+    }
+    /// Anything but `Inconsistent` is sound.
+    pub fn is_sound(&self) -> bool {
+        !matches!(self, EyesConsistency::Inconsistent)
+    }
+}
+
 /// Per-face display-tessellation defect — lets an agent point at exactly which
 /// face renders wrong, without rendering a pixel. Returned as the single worst
 /// face inside [`TessellationQuality`].
@@ -516,6 +541,11 @@ pub struct ValidityCertificate {
     /// `Inconsistent` verdict does NOT affect `is_sound()` — it is its own
     /// honest flag the agent/frontend can surface (stale labels rendered amber).
     pub labels_consistent: LabelsConsistency,
+    /// Dual-eye reconcile (render-free Truth↔Semantic): every recognized feature
+    /// references a live face. `Inconsistent` blocks `is_sound()` (a feature on a
+    /// stale/dead face is a real defect). The render-based reconcile axes are
+    /// advisory and live in the async `ReconcileReport`, not here.
+    pub eyes_consistent: EyesConsistency,
     /// Display-tessellation quality — the render-mesh analogue of the topological
     /// checks above. A degenerate / inverted-normal mesh (the inner-bore scribble)
     /// is a real defect the closure/manifold checks cannot see; `clean == false`
@@ -539,6 +569,7 @@ impl ValidityCertificate {
             && self.oriented
             && self.self_intersection_free
             && self.construction_consistent.is_sound()
+            && self.eyes_consistent.is_sound()
             && self.tessellation.clean
             && self.mesh_quality.clean
     }
@@ -590,5 +621,50 @@ impl GroundTruth {
             self.certificate.mesh_quality.max_normal_deviation_deg,
             self.certificate.mesh_quality.boundary_crossing_facets,
         )
+    }
+}
+
+#[cfg(test)]
+impl ValidityCertificate {
+    /// Construct a fully-sound certificate for use in unit tests. Every field
+    /// is set to its sound value; callers mutate individual fields to exercise
+    /// specific blocking conditions.
+    pub fn fully_sound_for_test() -> Self {
+        Self {
+            brep_valid: true,
+            watertight: true,
+            manifold: true,
+            oriented: true,
+            self_intersection_free: true,
+            construction_consistent: ConstructionConsistency::NotApplicable,
+            labels_consistent: LabelsConsistency::NotApplicable,
+            eyes_consistent: EyesConsistency::Consistent,
+            tessellation: TessellationQuality::empty(),
+            mesh_quality: MeshQuality::empty(),
+            euler_characteristic: 2,
+            boundary_edges: 0,
+            nonmanifold_edges: 0,
+            inconsistent_directed_edges: 0,
+            errors: vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eyes_inconsistent_blocks_soundness() {
+        // Build a minimal otherwise-sound certificate and flip eyes_consistent.
+        let mut cert = ValidityCertificate::fully_sound_for_test();
+        assert!(cert.is_sound());
+        cert.eyes_consistent = EyesConsistency::Inconsistent;
+        assert!(!cert.is_sound(), "Inconsistent eyes must block is_sound");
+        cert.eyes_consistent = EyesConsistency::NotApplicable;
+        assert!(
+            cert.is_sound(),
+            "NotApplicable must not regress a sound part"
+        );
     }
 }
