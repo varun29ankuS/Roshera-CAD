@@ -65,12 +65,17 @@ Prior art in the repo (to reuse, not duplicate): `tests/agent_build_eval.rs` alr
 
 Runs inside `certify_solid` (it already holds the mesh and can call `recognize_features`):
 
-- **Truth↔Semantic (deterministic):** every `RecognizedFeature`'s `face_id`s exist and are **not** in
-  the cert's flagged/degenerate set. O(features).
-- **Truth↔Scene, exact count slice (deterministic):** the certified mesh's
-  `open_edges`/`nonmanifold_edges` equal the cert's `boundary_edges`/`nonmanifold_edges`. O(1) given
-  the cert. (The *visual* per-face Truth↔Scene confirmation is the heavy/heuristic tier below; this
-  count slice is its deterministic, gating part.)
+- **Truth↔Semantic (deterministic, render-free):** every `RecognizedFeature`'s `face_id`s resolve to a
+  live face in the solid, and no recognized feature is built on the cert's flagged `worst_face`
+  (tessellation/mesh-quality). O(features). This is the ONLY check that is both render-free (safe on the
+  inline hot path) and genuinely cross-channel, so it is the sole gating check.
+
+> **Refinement (during planning, 2026-06-30):** the exact open/non-manifold count comparison only has
+> teeth across *different tessellation chords* (cert chord vs display chord), which costs an extra
+> tessellation — so it moved to the heavy async tier as advisory, not the inline gate. Gating from an
+> async tier is impossible anyway, so all render/tessellation-dependent checks are advisory. `is_sound`
+> is gated solely by the render-free Truth↔Semantic check (modest teeth today, grows as
+> feature-recognition and cert flagging deepen).
 
 Result is a **new tri-state certificate dimension `eyes_consistent`**
 (`NotApplicable | Consistent | Inconsistent`), beside `construction_consistent`/`labels_consistent`,
