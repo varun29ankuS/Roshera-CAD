@@ -9,6 +9,7 @@ pub mod harness;
 pub mod labels;
 pub mod math;
 pub mod operations;
+pub mod perception;
 pub mod performance;
 pub mod primitives;
 pub mod queries;
