@@ -172,6 +172,9 @@ function perceptionFromBody(r: any): any {
     tessellation_clean: cert?.tessellation_clean ?? null,
     mesh_quality_clean: cert?.mesh_quality_clean ?? null,
     euler_characteristic: cert?.euler_characteristic ?? null,
+    // Dual-eye gate — null on cheap hot path (cert not run), real tri-state when
+    // full cert is embedded (verify:true opt-in). Never fabricated.
+    eyes_consistent: cert?.eyes_consistent ?? null,
     open_edges: r.open_edges ?? r.perception?.open_edges ?? cert?.boundary_edges ?? null,
     nonmanifold_edges:
       r.nonmanifold_edges ?? r.perception?.nonmanifold_edges ?? cert?.nonmanifold_edges ?? null,
@@ -888,6 +891,10 @@ server.tool(
                 tessellation_clean: cert?.tessellation_clean ?? null,
                 mesh_quality_clean: cert?.mesh_quality_clean ?? null,
                 construction_consistent: cert?.construction_consistent ?? null,
+                // Dual-eye gate: "consistent" | "inconsistent" | "not_applicable".
+                // Feeds `sound` — an inconsistent dual-eye means the B-Rep cert and the
+                // mesh cert disagree; the solid is flagged UNSOUND.
+                eyes_consistent: cert?.eyes_consistent ?? "not_applicable",
                 verdict: p?.verdict ??
                   (!valid
                     ? "BROKEN — B-Rep invalid (a real topological defect; see the image)"
@@ -900,6 +907,10 @@ server.tool(
                   note: "display tessellation quality only — does NOT determine validity",
                 },
                 dims: p.dims ?? null,
+                // Advisory dual-eye reconcile report. {"status":"pending"} when the async
+                // worker has not yet completed for the current solid state. When ready:
+                // {status, discrepancies:[{severity, kind, description}], coverage:{seen,total}}.
+                reconcile: p?.reconcile ?? { status: "pending" },
                 cert: cert ?? undefined,
               },
               null,
