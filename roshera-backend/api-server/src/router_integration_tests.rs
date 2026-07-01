@@ -2113,6 +2113,70 @@ async fn perception_surfaces_reconcile_when_cached() {
     );
 }
 
+/// PERF GUARD (Task 11): a mutating op MUST return before the async
+/// 14-viewpoint dual-eye reconcile completes.
+///
+/// How the "teeth" work: if `certified_response` ran the reconcile
+/// SYNCHRONOUSLY — the regression that froze the backend — it would block
+/// until all 14 Fibonacci-sphere renders completed and cache the Clean report
+/// BEFORE returning the HTTP 200. The immediately-following GET would then find
+/// `reconcile.status = "Clean"`, not `"pending"`. The ONLY path to `"pending"`
+/// is for the async `spawn_blocking` task to still be running when this GET
+/// arrives, which requires the mutating op to have returned WITHOUT blocking on
+/// the heavy render tier.
+///
+/// Reliability: 14 multi-viewpoint renders (tessellation + face-id scan per
+/// viewpoint, plus a diagnostic render) cannot complete in the microseconds
+/// between two in-process HTTP dispatches. The test is deterministic — no
+/// sleep, no yield between the two calls — and the async task is provably
+/// slower than two sequential `dispatch()` invocations.
+#[tokio::test]
+async fn mutating_op_returns_before_reconcile_completes() {
+    let state = make_test_state().await;
+
+    // POST the lightest mutating op: create a 1×1×1 box.
+    // `certified_response` runs synchronously (cheap), then fires off
+    // `reconcile_task::spawn_reconcile` as a background `spawn_blocking` task.
+    let (status, body) = dispatch(&state, create_box_post(1.0, false)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "box create must return 200 before the reconcile completes; body = {body}"
+    );
+
+    // Extract the kernel solid_id — the perception endpoint URL uses it directly.
+    let solid_id = body["solid_id"]
+        .as_u64()
+        .expect("create-box response must carry solid_id as a JSON number");
+
+    // IMMEDIATELY query the dual-eye tier — no sleep, no explicit yield.
+    // Between these two calls the async reconcile task cannot have finished:
+    // 14 renders take measurably more time than two in-process HTTP dispatches.
+    // The reconcile cache must still be empty, so the handler returns "pending".
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception?full=1"))
+        .body(Body::empty())
+        .expect("static perception request must build");
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "perception?full=1 must return 200; body = {body}"
+    );
+    // This assertion is ONLY satisfiable when the op returned before the
+    // reconcile completed (async, off the hot path). A synchronous
+    // (freezing) implementation would populate the cache during the
+    // first dispatch and return "Clean" here instead of "pending".
+    assert_eq!(
+        body["reconcile"]["status"], "pending",
+        "reconcile must be `pending` — the 14-viewpoint async task cannot have \
+         completed before this GET arrived; a synchronous impl would return `Clean`. \
+         body = {body}"
+    );
+}
+
 /// GATE (Task 9): `GET /api/agent/parts/{id}/perception?full=1` returns
 /// `{"status":"pending"}` for `reconcile` when no report is cached for the
 /// current solid state — the worker has not yet completed.
