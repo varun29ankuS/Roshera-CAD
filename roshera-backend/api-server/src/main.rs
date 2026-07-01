@@ -1025,8 +1025,22 @@ pub(crate) fn certificate_json(
                 "boundary_crossing_facets":  w.boundary_crossing_facets,
             })),
         },
+        "eyes_consistent":         c.eyes_consistent.label(),
         "errors":                  c.errors,
     })
+}
+
+/// Stable per-state fingerprint of a certificate — changes iff the solid changed.
+/// Ties an async reconcile report to the exact cert it reconciled.
+pub(crate) fn cert_fingerprint(
+    cert: &geometry_engine::primitives::provenance::ValidityCertificate,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Hash the JSON representation — covers every dimension without requiring
+    // Hash on the certificate type or its composite reports.
+    certificate_json(cert).to_string().hash(&mut h);
+    h.finish()
 }
 
 /// THE CHOKEPOINT (AMBIENT VERIFICATION). The perception block every mutating
@@ -7083,6 +7097,63 @@ mod tests {
         let parsed = parse_partial_corner_vertices(&payload)
             .expect("array at exactly MAX_PARTIAL_CORNER_VERTICES must parse");
         assert_eq!(parsed.len(), MAX_PARTIAL_CORNER_VERTICES);
+    }
+
+    // Task 7 — eyes_consistent serialization + cert_fingerprint helper.
+    // Uses a real kernel cert (box primitive → certify_solid) because
+    // fully_sound_for_test() is #[cfg(test)] inside geometry-engine and
+    // is not visible from this crate's tests.
+
+    #[test]
+    fn certificate_json_includes_eyes_consistent() {
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+        let mut m = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut m)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box build must succeed");
+        let sid = match gid {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        let cert = m.certify_solid(sid);
+        let v = certificate_json(&cert);
+        assert!(
+            v["eyes_consistent"].is_string(),
+            "certificate_json must include eyes_consistent as a string; got {:?}",
+            v["eyes_consistent"]
+        );
+        // A bare box has no recognized features → NotApplicable.
+        assert_eq!(
+            v["eyes_consistent"],
+            serde_json::json!("not_applicable"),
+            "bare box must produce not_applicable; got {:?}",
+            v["eyes_consistent"]
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_with_cert() {
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+        let mut m = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut m)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box build must succeed");
+        let sid = match gid {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        let a = m.certify_solid(sid);
+        let mut b = a.clone();
+        b.boundary_edges = 7;
+        assert_ne!(
+            cert_fingerprint(&a),
+            cert_fingerprint(&b),
+            "fingerprint must change when boundary_edges differs"
+        );
     }
 }
 
