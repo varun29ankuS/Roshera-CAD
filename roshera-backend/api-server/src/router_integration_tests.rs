@@ -2017,3 +2017,139 @@ async fn auto_cert_default_response_is_latency_bounded() {
         "auto-cert default response must be latency-bounded (coarse path); took {elapsed:?}"
     );
 }
+
+// =====================================================================
+// Task 9 — dual-eye reconcile surfaced on the perception endpoint
+// =====================================================================
+
+/// GATE (Task 9 RED→GREEN): `GET /api/agent/parts/{id}/perception?full=1`
+/// surfaces the dual-eye reconcile report when a completed report is cached for
+/// the current solid state.
+///
+/// Fingerprint reproducibility proof: the test computes `fp` from the SAME
+/// four fields the write path uses in `certified_response` / `perception_fingerprint`
+/// and inserts a `ReconcileReport { status: Clean }` at `(solid_id, fp)`.
+/// The handler must hash identically — any divergence makes the lookup miss and
+/// returns `"pending"`, failing the assertion.
+#[tokio::test]
+async fn perception_surfaces_reconcile_when_cached() {
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::perception::reconcile::{Coverage, ReconcileReport, ReconcileStatus};
+    use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
+
+    let state = make_test_state().await;
+
+    // Build a 2×3×4 box directly in the kernel.
+    let solid_id: SolidId;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+        let mut builder = TopologyBuilder::new(model);
+        // allow-expect-in-tests = true (clippy.toml): invariant holds for
+        // positive finite dimensions.
+        let geom_id = builder
+            .create_box_3d(2.0, 3.0, 4.0)
+            .expect("box primitive must build for positive finite dimensions");
+        solid_id = match geom_id {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid from create_box_3d, got {:?}", other),
+        };
+    }
+
+    // Compute the fingerprint identically to the write path (certified_response
+    // in main.rs), then insert a Clean report into the cache at that key.
+    let fp: u64;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+
+        let brep_valid = validate_solid_scoped(
+            model,
+            solid_id,
+            Tolerance::default(),
+            ValidationLevel::Standard,
+        )
+        .is_valid;
+        let face_count = model.solid_outer_face_count(solid_id).unwrap_or(0) as u64;
+        let volume = model.calculate_solid_volume(solid_id).unwrap_or(0.0);
+        fp = crate::perception_fingerprint(solid_id, brep_valid, face_count, volume);
+    }
+
+    let report = ReconcileReport {
+        solid_id,
+        cert_fingerprint: fp,
+        status: ReconcileStatus::Clean,
+        discrepancies: vec![],
+        coverage: Coverage {
+            seen: vec![],
+            unseen: vec![],
+            total: 0,
+        },
+        viewpoints: 0,
+        duration_ms: 0,
+    };
+    state
+        .reconcile_cache
+        .insert((solid_id, fp), std::sync::Arc::new(report));
+
+    // Drive the full perception handler — the handler must reproduce the same fp
+    // and find the cached report.
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception?full=1"))
+        .body(Body::empty())
+        .expect("static perception request must build");
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "perception?full=1 must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["reconcile"]["status"], "Clean",
+        "reconcile status must be `Clean` when a Clean report is cached at the \
+         current (solid_id, fingerprint); body = {body}"
+    );
+}
+
+/// GATE (Task 9): `GET /api/agent/parts/{id}/perception?full=1` returns
+/// `{"status":"pending"}` for `reconcile` when no report is cached for the
+/// current solid state — the worker has not yet completed.
+#[tokio::test]
+async fn perception_returns_pending_when_not_cached() {
+    let state = make_test_state().await;
+
+    let solid_id: SolidId;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+        let mut builder = TopologyBuilder::new(model);
+        // allow-expect-in-tests = true (clippy.toml).
+        let geom_id = builder
+            .create_box_3d(1.0, 1.0, 1.0)
+            .expect("box primitive must build for positive finite dimensions");
+        solid_id = match geom_id {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid from create_box_3d, got {:?}", other),
+        };
+    }
+    // No entry inserted into reconcile_cache — the async worker hasn't run yet.
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception?full=1"))
+        .body(Body::empty())
+        .expect("static perception request must build");
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "perception?full=1 must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["reconcile"]["status"], "pending",
+        "reconcile must be `pending` when no report is cached; body = {body}"
+    );
+}
