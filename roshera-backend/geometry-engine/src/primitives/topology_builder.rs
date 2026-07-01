@@ -2538,31 +2538,42 @@ impl BRepModel {
             .get(solid_id)
             .map(|s| s.all_shells())
             .unwrap_or_default();
-        // Phase 2: collect face ids for each shell.
-        let live_face_ids: std::collections::HashSet<u32> = {
-            let mut ids = std::collections::HashSet::new();
-            for shell_id in shell_ids {
-                if let Some(shell) = self.shells.get(shell_id) {
-                    for &face_id in &shell.faces {
-                        ids.insert(face_id);
+        // Phase 2: collect live face ids AND each face's surface type in one
+        // traversal — the render-free gate needs both to verify that every
+        // recognized feature sits on the surface type its semantic label implies.
+        let mut live_face_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut face_surfaces: std::collections::HashMap<
+            u32,
+            crate::primitives::surface::SurfaceType,
+        > = std::collections::HashMap::new();
+        for shell_id in shell_ids {
+            if let Some(shell) = self.shells.get(shell_id) {
+                for &face_id in &shell.faces {
+                    live_face_ids.insert(face_id);
+                    if let Some(face) = self.faces.get(face_id) {
+                        if let Some(surf) = self.surfaces.get(face.surface_id) {
+                            face_surfaces.insert(face_id, surf.surface_type());
+                        }
                     }
                 }
             }
-            ids
-        };
+        }
         let features = crate::primitives::feature_recognition::recognize_features(solid_id, self);
-        let eyes_consistent =
-            match crate::perception::reconcile::check_eyes_consistent(&live_face_ids, &features) {
-                crate::perception::reconcile::EyesVerdict::Consistent => {
-                    crate::primitives::provenance::EyesConsistency::Consistent
-                }
-                crate::perception::reconcile::EyesVerdict::Inconsistent => {
-                    crate::primitives::provenance::EyesConsistency::Inconsistent
-                }
-                crate::perception::reconcile::EyesVerdict::NotApplicable => {
-                    crate::primitives::provenance::EyesConsistency::NotApplicable
-                }
-            };
+        let eyes_consistent = match crate::perception::reconcile::check_eyes_consistent(
+            &live_face_ids,
+            &face_surfaces,
+            &features,
+        ) {
+            crate::perception::reconcile::EyesVerdict::Consistent => {
+                crate::primitives::provenance::EyesConsistency::Consistent
+            }
+            crate::perception::reconcile::EyesVerdict::Inconsistent => {
+                crate::primitives::provenance::EyesConsistency::Inconsistent
+            }
+            crate::perception::reconcile::EyesVerdict::NotApplicable => {
+                crate::primitives::provenance::EyesConsistency::NotApplicable
+            }
+        };
         ValidityCertificate {
             brep_valid: v.is_valid,
             watertight,
