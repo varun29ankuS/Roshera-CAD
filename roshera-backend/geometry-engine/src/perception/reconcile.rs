@@ -938,4 +938,92 @@ mod reconcile_full_tests {
             "a fully clean part must have no Error/Warning discrepancies"
         );
     }
+
+    /// THE FUNDRAISING BENCHMARK — "the cert says sound; the dual-eye catches
+    /// what a single eye cannot."
+    ///
+    /// A solid with three live faces: 10 (outer wall A), 11 (outer wall B), and
+    /// 12 (an internal cavity wall — topologically live, geometrically enclosed).
+    /// The kernel certifies it SOUND: B-Rep valid, watertight, manifold,
+    /// self-intersection-free. Every viewpoint render sees ONLY the outer walls;
+    /// face 12 is permanently occluded — no orbit direction reveals it.
+    ///
+    /// A cert-only system returns `is_sound() == true` and has no further signal:
+    /// it cannot distinguish "face 12 is inspectable" from "face 12 is a blind
+    /// cavity". The dual-eye's second tier (scene renders) adds: "face 12 never
+    /// appears in any render." Together they surface the Coverage discrepancy the
+    /// truth cert alone cannot produce.
+    ///
+    /// This is the class of defect a Siemens NX / CATIA inspector would call
+    /// "a face the probe cannot reach" — a sound solid whose internal geometry is
+    /// a manufacturing blind spot. The dual-eye raises the flag so the agent can
+    /// explicitly acknowledge the occlusion rather than treating the solid as
+    /// fully inspected when it is not.
+    ///
+    /// Genuine TDD: the assertion `r.coverage.unseen.contains(&12)` and the
+    /// Coverage discrepancy for face 12 are RED before this feature existed
+    /// (reconcile behaviour absent) and GREEN after.
+    #[test]
+    fn reconcile_catches_a_face_no_eye_can_see() {
+        // Three live faces: outer walls (10, 11) plus internal cavity wall (12).
+        let live_faces = live(&[10, 11, 12]);
+
+        // Three viewpoints — each sees only the outer walls. The cavity (12) is
+        // permanently occluded and never appears in any render legend.
+        let frames = vec![
+            face_frame(&[10, 11]),
+            face_frame(&[10, 11]),
+            face_frame(&[10, 11]),
+        ];
+
+        // Diagnostic frame: edge counts agree with the cert (boundary=0, nonmanifold=0).
+        // This means NO TruthScene Warning — the cert and scene diagnostic AGREE.
+        // The ONLY signal the dual-eye adds is Coverage: face 12 was never seen.
+        let cert = ValidityCertificate::fully_sound_for_test();
+
+        // Precondition: the truth eye gives a clean bill of health.
+        // The whole point is that the cert ALONE cannot detect the blind cavity.
+        assert!(
+            cert.is_sound(),
+            "the truth cert must report sound — the test exercises the scene eye's extra signal"
+        );
+
+        let report = reconcile_full(
+            42,
+            7,
+            &live_faces,
+            &cert,
+            &[], // no semantic features — only the cert + scene axes are exercised
+            &frames,
+            &diag_frame(0, 0),
+            3,
+            0,
+        );
+
+        // The scene eye surfaces what the truth cert cannot: face 12 was never rendered.
+        assert!(
+            report.coverage.unseen.contains(&12),
+            "face 12 (internal cavity) must land in coverage.unseen; unseen = {:?}",
+            report.coverage.unseen
+        );
+
+        // A Coverage discrepancy is raised for face 12 — the dual-eye's caught-a-lie
+        // signal. The cert says sound; the scene eye catches the blindspot.
+        assert!(
+            report
+                .discrepancies
+                .iter()
+                .any(|d| d.axis == ReconcileAxis::Coverage && d.faces.contains(&12)),
+            "face 12 must yield a Coverage discrepancy; discrepancies: {:?}",
+            report.discrepancies
+        );
+
+        // Outer walls are visible and correctly accounted for.
+        assert_eq!(
+            report.coverage.seen,
+            vec![10, 11],
+            "outer walls must be seen"
+        );
+        assert_eq!(report.coverage.total, 3);
+    }
 }
