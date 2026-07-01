@@ -39,7 +39,7 @@ use geometry_engine::tessellation::TessellationParams;
 /// Shared model handle (the ACTIVE model — may be a branch model, not
 /// `AppState::model`, so it must be passed in explicitly).
 pub type ModelHandle = Arc<RwLock<BRepModel>>;
-/// Completed reports, keyed by `(solid_id, cert_fingerprint)`.
+/// Completed reports, keyed by `(solid_id, perception_fingerprint)`.
 pub type ReconcileCache = Arc<DashMap<(u32, u64), Arc<ReconcileReport>>>;
 /// In-flight guard set, keyed identically to the cache.
 pub type ReconcileInflight = Arc<DashMap<(u32, u64), ()>>;
