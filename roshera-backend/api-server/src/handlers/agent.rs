@@ -2214,7 +2214,7 @@ impl PerceptionQuery {
 /// centroid cache when re-running the D4 label selectors; geometry is never
 /// mutated. The default path is read-only.
 pub async fn part_perception(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<PerceptionQuery>,
@@ -2248,19 +2248,28 @@ pub async fn part_perception(
             "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)"
                 .to_string()
         };
-        return Ok(Json(
-            serde_json::to_value(PartPerception {
-                solid_id: id,
-                sound: valid,
-                verdict,
-                watertight: mesh_watertight,
-                open_edges: report.boundary_edges,
-                nonmanifold_edges: report.nonmanifold_edges,
-                valid,
-                dims,
-            })
-            .unwrap_or_else(|_| serde_json::json!({})),
-        ));
+        // Reconcile: always pending on the cheap path — no write lock means no
+        // `calculate_solid_volume`, so the write-path fingerprint cannot be
+        // reproduced without upgrading the lock (which would break the latency
+        // contract). Agents that want the reconcile report should call ?full=1.
+        let mut perception_val = serde_json::to_value(PartPerception {
+            solid_id: id,
+            sound: valid,
+            verdict,
+            watertight: mesh_watertight,
+            open_edges: report.boundary_edges,
+            nonmanifold_edges: report.nonmanifold_edges,
+            valid,
+            dims,
+        })
+        .unwrap_or_else(|_| serde_json::json!({}));
+        if let serde_json::Value::Object(ref mut map) = perception_val {
+            map.insert(
+                "reconcile".to_string(),
+                serde_json::json!({ "status": "pending" }),
+            );
+        }
+        return Ok(Json(perception_val));
     }
 
     // OPT-IN (`?full=1`): the FULL certificate. Write lock — `certify_solid` warms
@@ -2283,6 +2292,18 @@ pub async fn part_perception(
     } else {
         "UNSOUND — full kernel certificate flags a defect (see cert)".to_string()
     };
+    // Reconcile cache lookup — mirrors the write path (certified_response in
+    // main.rs): same four inputs, same `perception_fingerprint` function.
+    // The write lock is already held so `calculate_solid_volume` (which warms
+    // the mass-props cache) is safe here.
+    let face_count = model.solid_outer_face_count(sid).unwrap_or(0) as u64;
+    let volume = model.calculate_solid_volume(sid).unwrap_or(0.0);
+    let fp = crate::perception_fingerprint(id, valid, face_count, volume);
+    let reconcile_json = match state.reconcile_cache.get(&(id, fp)) {
+        Some(rep) => serde_json::to_value(rep.value().as_ref())
+            .unwrap_or_else(|_| serde_json::json!({ "status": "pending" })),
+        None => serde_json::json!({ "status": "pending" }),
+    };
     Ok(Json(serde_json::json!({
         "solid_id":          id,
         "sound":             sound,
@@ -2295,6 +2316,9 @@ pub async fn part_perception(
         "dims":              dims,
         // The full kernel certificate — every soundness dimension.
         "cert":              crate::certificate_json(&cert),
+        // Advisory dual-eye reconcile report, or {"status":"pending"} when the
+        // async worker has not yet completed a report for the current solid state.
+        "reconcile":         reconcile_json,
     })))
 }
 
