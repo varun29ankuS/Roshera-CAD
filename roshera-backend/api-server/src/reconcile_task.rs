@@ -54,6 +54,28 @@ const VIEWPOINTS: u32 = 14;
 /// bursts are the machine-safety hazard this cap exists to remove.
 pub const MAX_CONCURRENT_RECONCILES: usize = 2;
 
+/// RAII guard: removes the in-flight slot and releases the semaphore permit on
+/// both normal completion and panic-unwind inside the `spawn_blocking` closure.
+///
+/// Without this guard, any panic inside the closure (from `snap.restore`,
+/// `certify_solid`, `recognize_features`, `render_solids_dir`, or
+/// `reconcile_full` — this worker deliberately runs on possibly-UNSOUND solids,
+/// the most panic-prone path) would unwind past `inflight.remove(&key)`, leaving
+/// the `(solid_id, fingerprint)` entry leaked permanently. Every subsequent
+/// reconcile for that solid state would then be silently skipped (the
+/// in-flight marker is never cleared, so `spawn_reconcile` backs off forever).
+struct InflightGuard {
+    inflight: ReconcileInflight,
+    key: (u32, u64),
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.remove(&self.key);
+    }
+}
+
 /// Near-uniform unit directions on the sphere (no clustering). Fibonacci-sphere
 /// sampling (Saff–Kuijlaars / González) — the standard even-coverage NBV seed.
 /// Every returned vector is unit length.
@@ -137,17 +159,25 @@ pub fn spawn_reconcile(
     if inflight.insert(key, ()).is_some() {
         return;
     }
+    // RAII guard: owns both the inflight slot and the permit. Drops on normal
+    // return AND on panic-unwind, so neither leaks on any exit path.
+    let guard = InflightGuard {
+        inflight: inflight.clone(),
+        key,
+        _permit: permit,
+    };
     // Spawning requires a Tokio runtime. Every mutating handler runs on one;
     // guard anyway so a non-runtime caller (e.g. a unit test) degrades to a
-    // no-op instead of panicking.
+    // no-op instead of panicking. `guard` drops here on the early return,
+    // cleaning up the inflight slot and releasing the permit.
     if tokio::runtime::Handle::try_current().is_err() {
-        inflight.remove(&key);
         return;
     }
 
     tokio::task::spawn_blocking(move || {
-        // Hold the permit for the whole task; released on drop.
-        let _permit = permit;
+        // Guard owns the permit; drops (releasing both the inflight slot and the
+        // permit) on normal completion or on panic-unwind — whichever comes first.
+        let _guard = guard;
         let started = std::time::Instant::now();
 
         // --- snapshot phase: BRIEF read lock, deep-copy, DROP the guard ---
@@ -220,7 +250,7 @@ pub fn spawn_reconcile(
             started.elapsed().as_millis() as u64,
         );
         cache.insert(key, Arc::new(report));
-        inflight.remove(&key);
+        // No explicit inflight.remove — _guard.drop() handles it on every exit path.
     });
 }
 

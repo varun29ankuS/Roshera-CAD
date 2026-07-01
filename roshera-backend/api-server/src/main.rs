@@ -1122,13 +1122,17 @@ fn certified_response(
         map.insert("face_count".into(), serde_json::json!(face_count));
     }
 
-    // Reconcile cache key. Derived from the CHEAP structural perception block
-    // (valid/dims/volume/face_count/provenance) BEFORE the heavy `full` cert is
-    // inlined below, so the key is identical whether or not this call verifies —
-    // a verify and a plain op on the same solid state map to the same report.
-    // NOT the full-cert hash (`cert_fingerprint`): that is only available after
-    // the expensive certify the auto-cert regression forbids on this hot path.
-    let fingerprint = perception_fingerprint(&base);
+    // Reconcile cache key — derived from cheap, mesh-render-INDEPENDENT structural
+    // facts so both this write path and the read path (perception endpoint) can
+    // reproduce the same key without re-tessellating or running certify_solid.
+    // Fields: see `perception_fingerprint` doc comment for the exact sequence
+    // Task 9 must match.
+    let fingerprint = perception_fingerprint(
+        solid_id,
+        base.get("valid").and_then(|v| v.as_bool()).unwrap_or(false),
+        face_count.unwrap_or(0) as u64,
+        volume.unwrap_or(0.0),
+    );
 
     // FULL CERTIFICATE — only on explicit verify (`verify:true` / verify_part /
     // GET .../truth). The heavy mesh self-intersection scan + mesh-quality pass are
@@ -1175,15 +1179,41 @@ fn certified_response(
     base
 }
 
-/// A cheap, stable fingerprint of the structural perception block — the
-/// reconcile cache key. Hashes the JSON so any change to
-/// valid/dims/volume/face_count/provenance re-keys the report; identical solid
-/// state (verify or not) yields the same key. Deliberately NOT the full-cert
-/// hash (`cert_fingerprint`), which is unavailable cheaply on the hot path.
-fn perception_fingerprint(base: &serde_json::Value) -> u64 {
+/// Stable, mesh-render-independent reconcile cache key.
+///
+/// Hashes a FIXED tuple of cheap, structural fields in this EXACT order.
+/// Task 9's read path (`part_perception` / `GET …/perception`) must call this
+/// function with the same arguments — derived identically from the cheap O(n)
+/// per-solid verdicts — so the lookup always hits the cached report:
+///
+///   1. `solid_id: u32`
+///   2. `brep_valid: bool`  — `validate_solid_scoped(…, Standard).is_valid`
+///   3. `face_count: u64`   — `solid_outer_face_count(solid_id).unwrap_or(0) as u64`
+///   4. `volume_scaled: i64` — `(volume.unwrap_or(0.0) * 1_000_000.0).round() as i64`
+///
+/// Fields intentionally OMITTED (unavailable without a tessellation render or
+/// the expensive `certify_solid` pass):
+///   - `boundary_edges`, `nonmanifold_edges`: depend on the display mesh quality;
+///     the write and read paths would use different tessellations → omitted to
+///     keep the key reproducible.
+///   - `watertight`, `manifold`, `oriented`, `self_intersection_free`,
+///     `euler_characteristic`: require `certify_solid` (O(n²) on the hot path).
+///
+/// NOT the full-cert hash (`cert_fingerprint`), which requires the expensive
+/// per-mesh self-intersection scan that is off the interactive hot path.
+pub(crate) fn perception_fingerprint(
+    solid_id: u32,
+    brep_valid: bool,
+    face_count: u64,
+    volume: f64,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    base.to_string().hash(&mut h);
+    solid_id.hash(&mut h);
+    brep_valid.hash(&mut h);
+    face_count.hash(&mut h);
+    let volume_scaled = (volume * 1_000_000.0).round() as i64;
+    volume_scaled.hash(&mut h);
     h.finish()
 }
 
@@ -7243,6 +7273,73 @@ mod tests {
             serde_json::json!("not_applicable"),
             "bare box must produce not_applicable; got {:?}",
             v["eyes_consistent"]
+        );
+    }
+
+    // Task 8 — perception_fingerprint is mesh-independent and field-sensitive.
+    // RED-first intent: the OLD implementation hashed a JSON blob and would
+    // produce a DIFFERENT key for identical solid state (same solid, same
+    // topology) whenever float formatting or tessellation varied — these tests
+    // would fail against the old implementation because they verify stability
+    // from raw primitives, not from a JSON string.
+
+    #[test]
+    fn perception_fingerprint_stable_across_identical_inputs() {
+        // Calling with the same arguments twice must produce the same key.
+        let a = perception_fingerprint(42, true, 6, 1234.5678);
+        let b = perception_fingerprint(42, true, 6, 1234.5678);
+        assert_eq!(a, b, "perception_fingerprint must be deterministic");
+    }
+
+    #[test]
+    fn perception_fingerprint_changes_when_face_count_changes() {
+        let base = perception_fingerprint(1, true, 6, 100.0);
+        let other = perception_fingerprint(1, true, 7, 100.0);
+        assert_ne!(
+            base, other,
+            "perception_fingerprint must change when face_count changes"
+        );
+    }
+
+    #[test]
+    fn perception_fingerprint_changes_when_solid_id_changes() {
+        let a = perception_fingerprint(1, true, 6, 100.0);
+        let b = perception_fingerprint(2, true, 6, 100.0);
+        assert_ne!(
+            a, b,
+            "perception_fingerprint must change when solid_id changes"
+        );
+    }
+
+    #[test]
+    fn perception_fingerprint_changes_when_brep_valid_changes() {
+        let a = perception_fingerprint(1, true, 6, 100.0);
+        let b = perception_fingerprint(1, false, 6, 100.0);
+        assert_ne!(
+            a, b,
+            "perception_fingerprint must change when brep_valid changes"
+        );
+    }
+
+    #[test]
+    fn perception_fingerprint_volume_stable_to_sub_microcube() {
+        // Volumes differing by < 1e-6 (below the rounding threshold) map to
+        // the same scaled integer and must produce the same key.
+        let a = perception_fingerprint(1, true, 6, 1000.000_000_1);
+        let b = perception_fingerprint(1, true, 6, 1000.000_000_2);
+        assert_eq!(
+            a, b,
+            "sub-microsub-unit volume noise must not change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn perception_fingerprint_changes_when_volume_changes() {
+        let a = perception_fingerprint(1, true, 6, 100.0);
+        let b = perception_fingerprint(1, true, 6, 101.0);
+        assert_ne!(
+            a, b,
+            "perception_fingerprint must change when volume changes by 1.0"
         );
     }
 
