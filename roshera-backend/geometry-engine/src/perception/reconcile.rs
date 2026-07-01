@@ -3,9 +3,14 @@
 //! and passes frames in, keeping these functions unit-testable with no I/O.
 
 use crate::primitives::feature_recognition::RecognizedFeature;
+use crate::primitives::provenance::ValidityCertificate;
 use crate::primitives::surface::SurfaceType;
+use crate::render::RenderFrame;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+/// A live face visible from at most this many viewpoints is "barely inspected".
+const LOW_COVERAGE_VIEWS: usize = 2;
 
 /// Which pair of eyes a discrepancy is between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +132,245 @@ pub fn check_eyes_consistent(
         }
     }
     EyesVerdict::Consistent
+}
+
+/// The DEEP advisory cross-eye reconcile. Renders are done by the api-server
+/// and passed in as `faceid_frames` (one FaceIds frame per viewpoint) and a
+/// single `diagnostic_frame`; this function is pure so the whole reconcile is
+/// unit-testable with no I/O. It NEVER changes `is_sound` — every finding is
+/// advisory. Four axes:
+///
+/// 1. **Coverage** — per-face SEEN-COUNT across viewpoints (not binary): unseen
+///    faces and barely-inspected (low-coverage) faces are flagged `Info`. A single
+///    normal is meaningless for a curved face, so we make NO internal-vs-occluded
+///    claim — seen-count is the only honest signal.
+/// 2. **Truth↔Scene** — the diagnostic render's open/non-manifold edge counts vs
+///    the certificate's (`Warning` on disagreement), plus a worst-face visual
+///    confirmation: if the cert names a worst tessellation/mesh-quality face that
+///    no viewpoint saw, the scene eye cannot corroborate the truth eye's own worst
+///    finding (`Info`).
+/// 3. **Scene↔Semantic** — per-feature MIN coverage (a feature is only as visible
+///    as its least-visible face): never-visible → `Warning`, barely-visible → `Info`.
+/// 4. **Truth↔Semantic mirror** — a feature referencing a dead (non-live) face is
+///    an `Error` (mirrors the cert's gating `eyes_consistent` into the report).
+///
+/// `status` is `DiscrepanciesFound` iff any discrepancy is `Error`/`Warning`;
+/// `Info`-only reports are `Clean` (coverage notes are observations, not defects).
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_full(
+    solid_id: u32,
+    cert_fingerprint: u64,
+    live_face_ids: &HashSet<u32>,
+    cert: &ValidityCertificate,
+    features: &[RecognizedFeature],
+    faceid_frames: &[RenderFrame],
+    diagnostic_frame: &RenderFrame,
+    viewpoints: u32,
+    duration_ms: u64,
+) -> ReconcileReport {
+    let mut discrepancies: Vec<Discrepancy> = Vec::new();
+
+    // ---- Axis 1: Coverage — per-face seen-count across the FaceIds frames. ----
+    let mut seen_count: HashMap<u32, usize> = HashMap::with_capacity(live_face_ids.len());
+    for &fid in live_face_ids {
+        let count = faceid_frames
+            .iter()
+            .filter(|frame| frame.face_legend.iter().any(|(id, _)| *id == fid))
+            .count();
+        seen_count.insert(fid, count);
+    }
+    // Deterministic, sorted partition into seen / unseen.
+    let mut by_face: Vec<(u32, usize)> = seen_count.iter().map(|(&f, &c)| (f, c)).collect();
+    by_face.sort_unstable();
+    let seen: Vec<u32> = by_face
+        .iter()
+        .filter(|(_, c)| *c > 0)
+        .map(|(f, _)| *f)
+        .collect();
+    let unseen: Vec<u32> = by_face
+        .iter()
+        .filter(|(_, c)| *c == 0)
+        .map(|(f, _)| *f)
+        .collect();
+    let seen_set: HashSet<u32> = seen.iter().copied().collect();
+
+    for (fid, count) in &by_face {
+        if *count == 0 {
+            discrepancies.push(Discrepancy {
+                axis: ReconcileAxis::Coverage,
+                severity: Severity::Info,
+                faces: vec![*fid],
+                edges: vec![],
+                message: format!(
+                    "face {fid} not visible from any of {viewpoints} viewpoints (internal, occluded, or degenerate)"
+                ),
+                truth_says: "face is part of the certified solid".into(),
+                scene_says: "face never appears in any render".into(),
+                semantic_says: "n/a".into(),
+            });
+        } else if *count <= LOW_COVERAGE_VIEWS {
+            discrepancies.push(Discrepancy {
+                axis: ReconcileAxis::Coverage,
+                severity: Severity::Info,
+                faces: vec![*fid],
+                edges: vec![],
+                message: format!(
+                    "face {fid} barely inspected: seen from only {count}/{viewpoints} viewpoints"
+                ),
+                truth_says: "face is part of the certified solid".into(),
+                scene_says: format!("seen from {count} viewpoint(s)"),
+                semantic_says: "n/a".into(),
+            });
+        }
+    }
+
+    // ---- Axis 2: Truth↔Scene — edge-count agreement. ----
+    if diagnostic_frame.open_edges != cert.boundary_edges
+        || diagnostic_frame.nonmanifold_edges != cert.nonmanifold_edges
+    {
+        discrepancies.push(Discrepancy {
+            axis: ReconcileAxis::TruthScene,
+            severity: Severity::Warning,
+            faces: vec![],
+            edges: vec![],
+            message:
+                "certificate boundary/non-manifold edge counts disagree with the diagnostic render"
+                    .into(),
+            truth_says: format!(
+                "boundary={} nonmanifold={}",
+                cert.boundary_edges, cert.nonmanifold_edges
+            ),
+            scene_says: format!(
+                "open={} nonmanifold={}",
+                diagnostic_frame.open_edges, diagnostic_frame.nonmanifold_edges
+            ),
+            semantic_says: "n/a".into(),
+        });
+    }
+
+    // ---- Axis 2 (cont.): worst-face visual confirmation. ----
+    // Both defect structs expose a `face_id`, so the cert's own worst-quality face
+    // is resolvable. If that face was never rendered, the scene eye cannot
+    // corroborate the truth eye's worst finding.
+    let mut worst_ids: Vec<u64> = Vec::new();
+    if let Some(defect) = &cert.tessellation.worst_face {
+        worst_ids.push(defect.face_id);
+    }
+    if let Some(defect) = &cert.mesh_quality.worst_face {
+        worst_ids.push(defect.face_id);
+    }
+    worst_ids.sort_unstable();
+    worst_ids.dedup();
+    for wid in worst_ids {
+        // Face legends are u32; a worst id outside u32 can never match a rendered
+        // face, so we cannot correlate it and honestly skip rather than guess.
+        if let Ok(w32) = u32::try_from(wid) {
+            if !seen_set.contains(&w32) {
+                discrepancies.push(Discrepancy {
+                    axis: ReconcileAxis::TruthScene,
+                    severity: Severity::Info,
+                    faces: vec![w32],
+                    edges: vec![],
+                    message: format!(
+                        "certificate's worst-quality face {w32} is not visible from any viewpoint — the scene eye cannot corroborate the truth eye's own worst finding"
+                    ),
+                    truth_says: "certificate names this its worst-quality face".into(),
+                    scene_says: "face not visible in any render".into(),
+                    semantic_says: "n/a".into(),
+                });
+            }
+        }
+    }
+
+    // ---- Axes 3 & 4: per-feature Scene↔Semantic and Truth↔Semantic. ----
+    for feature in features {
+        let ids = feature.face_ids();
+
+        // Truth↔Semantic mirror: dead (non-live) face references are an Error.
+        let dead: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|fid| !live_face_ids.contains(fid))
+            .collect();
+        if !dead.is_empty() {
+            discrepancies.push(Discrepancy {
+                axis: ReconcileAxis::TruthSemantic,
+                severity: Severity::Error,
+                faces: dead.clone(),
+                edges: vec![],
+                message: format!(
+                    "recognized {} references dead face(s) {:?}",
+                    feature.feature_type(),
+                    dead
+                ),
+                truth_says: "these face ids are not in the live topology".into(),
+                scene_says: "n/a".into(),
+                semantic_says: feature.to_description(),
+            });
+        }
+
+        // Scene↔Semantic: a feature is only as visible as its least-visible face.
+        // A face absent from `seen_count` (dead) counts as 0.
+        let min_seen = ids
+            .iter()
+            .map(|fid| seen_count.get(fid).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        if min_seen == 0 {
+            discrepancies.push(Discrepancy {
+                axis: ReconcileAxis::SceneSemantic,
+                severity: Severity::Warning,
+                faces: ids.clone(),
+                edges: vec![],
+                message: format!(
+                    "recognized {} is never visible in any render",
+                    feature.feature_type()
+                ),
+                truth_says: "n/a".into(),
+                scene_says: "no face of this feature appears in any render".into(),
+                semantic_says: feature.to_description(),
+            });
+        } else if min_seen <= LOW_COVERAGE_VIEWS {
+            discrepancies.push(Discrepancy {
+                axis: ReconcileAxis::SceneSemantic,
+                severity: Severity::Info,
+                faces: ids.clone(),
+                edges: vec![],
+                message: format!(
+                    "recognized {} barely visible: {}/{} viewpoints",
+                    feature.feature_type(),
+                    min_seen,
+                    viewpoints
+                ),
+                truth_says: "n/a".into(),
+                scene_says: format!("least-visible face seen from {min_seen} viewpoint(s)"),
+                semantic_says: feature.to_description(),
+            });
+        }
+    }
+
+    let status = if discrepancies
+        .iter()
+        .any(|d| matches!(d.severity, Severity::Error | Severity::Warning))
+    {
+        ReconcileStatus::DiscrepanciesFound
+    } else {
+        ReconcileStatus::Clean
+    };
+
+    ReconcileReport {
+        solid_id,
+        cert_fingerprint,
+        status,
+        discrepancies,
+        coverage: Coverage {
+            seen,
+            unseen,
+            total: live_face_ids.len(),
+        },
+        viewpoints,
+        duration_ms,
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +567,375 @@ mod consistency_tests {
                 &f
             ),
             EyesVerdict::Inconsistent
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconcile_full_tests {
+    use super::*;
+    use crate::primitives::feature_recognition::RecognizedFeature;
+    use crate::primitives::provenance::{TessFaceDefect, ValidityCertificate};
+    use crate::render::RenderFrame;
+    use std::collections::HashSet;
+
+    /// A FaceIds render frame whose legend contains exactly `ids`.
+    fn face_frame(ids: &[u32]) -> RenderFrame {
+        RenderFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![],
+            face_legend: ids.iter().map(|&id| (id, [10, 20, 30])).collect(),
+            open_edges: 0,
+            nonmanifold_edges: 0,
+        }
+    }
+
+    /// A Diagnostic render frame carrying the two edge counts.
+    fn diag_frame(open: usize, nonmanifold: usize) -> RenderFrame {
+        RenderFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![],
+            face_legend: vec![],
+            open_edges: open,
+            nonmanifold_edges: nonmanifold,
+        }
+    }
+
+    fn live(ids: &[u32]) -> HashSet<u32> {
+        ids.iter().copied().collect()
+    }
+
+    /// Find the first discrepancy on `axis` at `severity` whose faces contain `fid`.
+    fn find_for_face<'a>(
+        report: &'a ReconcileReport,
+        axis: ReconcileAxis,
+        severity: Severity,
+        fid: u32,
+    ) -> Option<&'a Discrepancy> {
+        report
+            .discrepancies
+            .iter()
+            .find(|d| d.axis == axis && d.severity == severity && d.faces.contains(&fid))
+    }
+
+    #[test]
+    fn unseen_face_becomes_coverage_info() {
+        // Faces 1,2 covered by three frames each; face 3 in no legend.
+        let frames = vec![
+            face_frame(&[1, 2]),
+            face_frame(&[1, 2]),
+            face_frame(&[1, 2]),
+        ];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1, 2, 3]),
+            &cert,
+            &[],
+            &frames,
+            &diag_frame(0, 0),
+            3,
+            5,
+        );
+        let d = find_for_face(&report, ReconcileAxis::Coverage, Severity::Info, 3)
+            .expect("unseen face 3 must yield a Coverage Info discrepancy");
+        assert!(d.message.contains("not visible"), "message: {}", d.message);
+        assert_eq!(report.coverage.unseen, vec![3]);
+        assert_eq!(report.coverage.seen, vec![1, 2]);
+        assert_eq!(report.coverage.total, 3);
+    }
+
+    #[test]
+    fn low_coverage_face_flagged() {
+        // Five frames; face 1 appears in exactly one (seen_count == 1 <= 2).
+        let frames = vec![
+            face_frame(&[1]),
+            face_frame(&[]),
+            face_frame(&[]),
+            face_frame(&[]),
+            face_frame(&[]),
+        ];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1]),
+            &cert,
+            &[],
+            &frames,
+            &diag_frame(0, 0),
+            5,
+            0,
+        );
+        let d = find_for_face(&report, ReconcileAxis::Coverage, Severity::Info, 1)
+            .expect("low-coverage face 1 must yield a Coverage Info discrepancy");
+        assert!(
+            d.message.contains("barely inspected") && d.message.contains("1/5"),
+            "message: {}",
+            d.message
+        );
+        assert!(report.coverage.seen.contains(&1));
+        assert!(report.coverage.unseen.is_empty());
+    }
+
+    #[test]
+    fn well_covered_face_no_flag() {
+        // Face 1 seen in all five frames — no coverage discrepancy for it.
+        let frames = vec![
+            face_frame(&[1]),
+            face_frame(&[1]),
+            face_frame(&[1]),
+            face_frame(&[1]),
+            face_frame(&[1]),
+        ];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1]),
+            &cert,
+            &[],
+            &frames,
+            &diag_frame(0, 0),
+            5,
+            0,
+        );
+        assert!(
+            report
+                .discrepancies
+                .iter()
+                .all(|d| d.axis != ReconcileAxis::Coverage),
+            "a well-covered face must not raise any Coverage discrepancy"
+        );
+    }
+
+    #[test]
+    fn count_mismatch_is_truthscene_warning() {
+        // Diagnostic reports 4 open edges; cert says 0 boundary edges.
+        let frames = vec![face_frame(&[1]), face_frame(&[1]), face_frame(&[1])];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1]),
+            &cert,
+            &[],
+            &frames,
+            &diag_frame(4, 0),
+            3,
+            0,
+        );
+        let d = report
+            .discrepancies
+            .iter()
+            .find(|d| d.axis == ReconcileAxis::TruthScene && d.severity == Severity::Warning)
+            .expect("count mismatch must yield a TruthScene Warning");
+        assert!(
+            d.truth_says.contains("boundary=0"),
+            "truth: {}",
+            d.truth_says
+        );
+        assert!(d.scene_says.contains("open=4"), "scene: {}", d.scene_says);
+        assert_eq!(report.status, ReconcileStatus::DiscrepanciesFound);
+    }
+
+    #[test]
+    fn counts_match_no_truthscene_warning() {
+        let frames = vec![face_frame(&[1]), face_frame(&[1]), face_frame(&[1])];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1]),
+            &cert,
+            &[],
+            &frames,
+            &diag_frame(0, 0),
+            3,
+            0,
+        );
+        assert!(
+            report
+                .discrepancies
+                .iter()
+                .all(|d| !(d.axis == ReconcileAxis::TruthScene && d.severity == Severity::Warning)),
+            "matching counts must not raise a TruthScene Warning"
+        );
+    }
+
+    #[test]
+    fn worst_face_not_visible_is_info() {
+        // Cert names face 7 as its worst tessellation face; it appears in no legend.
+        let frames = vec![face_frame(&[1]), face_frame(&[1]), face_frame(&[1])];
+        let mut cert = ValidityCertificate::fully_sound_for_test();
+        cert.tessellation.worst_face = Some(TessFaceDefect {
+            face_id: 7,
+            triangles: 12,
+            degenerate_triangles: 0,
+            normal_agreement: 0.4,
+            analytic_normal_agreement: 0.4,
+        });
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1, 7]),
+            &cert,
+            &[],
+            &frames,
+            &diag_frame(0, 0),
+            3,
+            0,
+        );
+        let d = find_for_face(&report, ReconcileAxis::TruthScene, Severity::Info, 7)
+            .expect("an invisible worst face must yield a TruthScene Info");
+        assert!(
+            d.message.contains("worst-quality face"),
+            "message: {}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn feature_never_visible_is_scenesemantic_warning() {
+        // Feature on face 5; face 5 is live but appears in no legend.
+        let frames = vec![face_frame(&[1]), face_frame(&[1]), face_frame(&[1])];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let feature = RecognizedFeature::ThroughHole {
+            diameter: 2.0,
+            axis: [0.0, 0.0, 1.0],
+            face_id: 5,
+        };
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1, 5]),
+            &cert,
+            std::slice::from_ref(&feature),
+            &frames,
+            &diag_frame(0, 0),
+            3,
+            0,
+        );
+        let d = report
+            .discrepancies
+            .iter()
+            .find(|d| d.axis == ReconcileAxis::SceneSemantic && d.severity == Severity::Warning)
+            .expect("an invisible feature must yield a SceneSemantic Warning");
+        assert_eq!(d.semantic_says, feature.to_description());
+        assert!(
+            d.message.contains("never visible"),
+            "message: {}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn feature_barely_visible_is_scenesemantic_info() {
+        // Feature on face 5, seen in one of five frames -> Info, not Warning.
+        let frames = vec![
+            face_frame(&[5]),
+            face_frame(&[]),
+            face_frame(&[]),
+            face_frame(&[]),
+            face_frame(&[]),
+        ];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let feature = RecognizedFeature::ThroughHole {
+            diameter: 2.0,
+            axis: [0.0, 0.0, 1.0],
+            face_id: 5,
+        };
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[5]),
+            &cert,
+            std::slice::from_ref(&feature),
+            &frames,
+            &diag_frame(0, 0),
+            5,
+            0,
+        );
+        let info = report
+            .discrepancies
+            .iter()
+            .find(|d| d.axis == ReconcileAxis::SceneSemantic && d.severity == Severity::Info)
+            .expect("a barely-visible feature must yield a SceneSemantic Info");
+        assert!(info.message.contains("1/5"), "message: {}", info.message);
+        assert!(
+            report
+                .discrepancies
+                .iter()
+                .all(|d| !(d.axis == ReconcileAxis::SceneSemantic
+                    && d.severity == Severity::Warning)),
+            "a barely-visible (but seen) feature must not be a Warning"
+        );
+    }
+
+    #[test]
+    fn dead_feature_face_is_truthsemantic_error() {
+        // Feature references face 99, which is not live.
+        let frames = vec![face_frame(&[1]), face_frame(&[1]), face_frame(&[1])];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let feature = RecognizedFeature::ThroughHole {
+            diameter: 2.0,
+            axis: [0.0, 0.0, 1.0],
+            face_id: 99,
+        };
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1]),
+            &cert,
+            std::slice::from_ref(&feature),
+            &frames,
+            &diag_frame(0, 0),
+            3,
+            0,
+        );
+        let d = find_for_face(&report, ReconcileAxis::TruthSemantic, Severity::Error, 99)
+            .expect("a dead feature face must yield a TruthSemantic Error");
+        assert!(d.message.contains("dead face"), "message: {}", d.message);
+        assert_eq!(report.status, ReconcileStatus::DiscrepanciesFound);
+    }
+
+    #[test]
+    fn all_clean_is_clean_status() {
+        // Every live face well covered; feature visible; counts match; no dead faces.
+        let frames = vec![
+            face_frame(&[1, 2]),
+            face_frame(&[1, 2]),
+            face_frame(&[1, 2]),
+            face_frame(&[1, 2]),
+            face_frame(&[1, 2]),
+        ];
+        let cert = ValidityCertificate::fully_sound_for_test();
+        let feature = RecognizedFeature::ThroughHole {
+            diameter: 2.0,
+            axis: [0.0, 0.0, 1.0],
+            face_id: 1,
+        };
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1, 2]),
+            &cert,
+            std::slice::from_ref(&feature),
+            &frames,
+            &diag_frame(0, 0),
+            5,
+            0,
+        );
+        assert_eq!(report.status, ReconcileStatus::Clean);
+        assert!(
+            report
+                .discrepancies
+                .iter()
+                .all(|d| d.severity == Severity::Info),
+            "a fully clean part must have no Error/Warning discrepancies"
         );
     }
 }
