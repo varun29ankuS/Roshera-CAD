@@ -235,7 +235,7 @@ pub struct AppState {
     pub blackboard: Arc<blackboard::BlackboardManager>,
 
     /// Dual-eye reconcile: completed advisory reports keyed by
-    /// `(solid_id, cert_fingerprint)`. Populated OFF the write lock by
+    /// `(solid_id, perception_fingerprint)`. Populated OFF the write lock by
     /// `reconcile_task::spawn_reconcile`; read by the reconcile GET path.
     pub reconcile_cache: reconcile_task::ReconcileCache,
     /// In-flight guard set (same key) so a burst of ops does not spawn
@@ -1050,19 +1050,6 @@ pub(crate) fn certificate_json(
     })
 }
 
-/// Stable per-state fingerprint of a certificate — changes iff the solid changed.
-/// Ties an async reconcile report to the exact cert it reconciled.
-pub(crate) fn cert_fingerprint(
-    cert: &geometry_engine::primitives::provenance::ValidityCertificate,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    // Hash the JSON representation — covers every dimension without requiring
-    // Hash on the certificate type or its composite reports.
-    certificate_json(cert).to_string().hash(&mut h);
-    h.finish()
-}
-
 /// THE CHOKEPOINT (AMBIENT VERIFICATION). The perception block every mutating
 /// endpoint embeds in its response.
 ///
@@ -1199,7 +1186,7 @@ fn certified_response(
 ///   - `watertight`, `manifold`, `oriented`, `self_intersection_free`,
 ///     `euler_characteristic`: require `certify_solid` (O(n²) on the hot path).
 ///
-/// NOT the full-cert hash (`cert_fingerprint`), which requires the expensive
+/// NOT the full-cert hash (`perception_fingerprint`), which requires the expensive
 /// per-mesh self-intersection scan that is off the interactive hot path.
 pub(crate) fn perception_fingerprint(
     solid_id: u32,
@@ -7242,7 +7229,7 @@ mod tests {
         assert_eq!(parsed.len(), MAX_PARTIAL_CORNER_VERTICES);
     }
 
-    // Task 7 — eyes_consistent serialization + cert_fingerprint helper.
+    // Task 7 — eyes_consistent serialization.
     // Uses a real kernel cert (box primitive → certify_solid) because
     // fully_sound_for_test() is #[cfg(test)] inside geometry-engine and
     // is not visible from this crate's tests.
@@ -7340,29 +7327,6 @@ mod tests {
         assert_ne!(
             a, b,
             "perception_fingerprint must change when volume changes by 1.0"
-        );
-    }
-
-    #[test]
-    fn fingerprint_changes_with_cert() {
-        use geometry_engine::primitives::topology_builder::{
-            BRepModel, GeometryId, TopologyBuilder,
-        };
-        let mut m = BRepModel::new();
-        let gid = TopologyBuilder::new(&mut m)
-            .create_box_3d(10.0, 10.0, 10.0)
-            .expect("box build must succeed");
-        let sid = match gid {
-            GeometryId::Solid(s) => s,
-            o => panic!("expected solid, got {o:?}"),
-        };
-        let a = m.certify_solid(sid);
-        let mut b = a.clone();
-        b.boundary_edges = 7;
-        assert_ne!(
-            cert_fingerprint(&a),
-            cert_fingerprint(&b),
-            "fingerprint must change when boundary_edges differs"
         );
     }
 }
