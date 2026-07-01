@@ -2529,6 +2529,40 @@ impl BRepModel {
         let mesh_quality = crate::harness::watertight::mesh_quality(self, solid_id)
             .unwrap_or_else(crate::primitives::provenance::MeshQuality::empty);
         let errors = v.errors.iter().map(|e| format!("{e:?}")).collect();
+        // Dual-eye render-free cross-check (Truth↔Semantic): recognized features
+        // must reference live faces. Gates is_sound via EyesConsistency.
+        // Phase 1: collect shell ids without holding the solid Ref across the
+        // shells DashMap lookup (avoids any borrow-checker ambiguity on &mut self).
+        let shell_ids: Vec<u32> = self
+            .solids
+            .get(solid_id)
+            .map(|s| s.all_shells())
+            .unwrap_or_default();
+        // Phase 2: collect face ids for each shell.
+        let live_face_ids: std::collections::HashSet<u32> = {
+            let mut ids = std::collections::HashSet::new();
+            for shell_id in shell_ids {
+                if let Some(shell) = self.shells.get(shell_id) {
+                    for &face_id in &shell.faces {
+                        ids.insert(face_id);
+                    }
+                }
+            }
+            ids
+        };
+        let features = crate::primitives::feature_recognition::recognize_features(solid_id, self);
+        let eyes_consistent =
+            match crate::perception::reconcile::check_eyes_consistent(&live_face_ids, &features) {
+                crate::perception::reconcile::EyesVerdict::Consistent => {
+                    crate::primitives::provenance::EyesConsistency::Consistent
+                }
+                crate::perception::reconcile::EyesVerdict::Inconsistent => {
+                    crate::primitives::provenance::EyesConsistency::Inconsistent
+                }
+                crate::perception::reconcile::EyesVerdict::NotApplicable => {
+                    crate::primitives::provenance::EyesConsistency::NotApplicable
+                }
+            };
         ValidityCertificate {
             brep_valid: v.is_valid,
             watertight,
@@ -2541,8 +2575,7 @@ impl BRepModel {
             self_intersection_free,
             construction_consistent,
             labels_consistent,
-            // Placeholder: Task 5 replaces this with the real dual-eye reconcile result.
-            eyes_consistent: crate::primitives::provenance::EyesConsistency::NotApplicable,
+            eyes_consistent,
             tessellation,
             mesh_quality,
             errors,
