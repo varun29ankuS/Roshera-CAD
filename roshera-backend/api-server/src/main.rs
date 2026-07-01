@@ -27,6 +27,7 @@ mod kernel_state;
 mod metrics;
 mod part_mgr;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
+mod reconcile_task;
 #[cfg(test)]
 mod router_integration_tests;
 mod sketch;
@@ -232,6 +233,18 @@ pub struct AppState {
     /// a frontend reload rehydrates from here instead of `localStorage`.
     /// See `blackboard.rs`.
     pub blackboard: Arc<blackboard::BlackboardManager>,
+
+    /// Dual-eye reconcile: completed advisory reports keyed by
+    /// `(solid_id, cert_fingerprint)`. Populated OFF the write lock by
+    /// `reconcile_task::spawn_reconcile`; read by the reconcile GET path.
+    pub reconcile_cache: reconcile_task::ReconcileCache,
+    /// In-flight guard set (same key) so a burst of ops does not spawn
+    /// duplicate reconciles for one solid state.
+    pub reconcile_inflight: reconcile_task::ReconcileInflight,
+    /// Global concurrency cap on reconcile workers
+    /// (`MAX_CONCURRENT_RECONCILES`). Machine-safety: concurrent multi-
+    /// viewpoint renders are the burst hazard this bounds.
+    pub reconcile_limiter: reconcile_task::ReconcileLimiter,
 }
 
 impl AppState {
@@ -690,7 +703,14 @@ async fn create_geometry(
     // SOUND (B-Rep) verdict anyway so EVERY mutating op has a uniform contract.
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
+        certified_response(
+            &mut model,
+            &model_handle,
+            &state,
+            solid_id,
+            &tri_mesh,
+            body_verify_flag(&payload),
+        )
     };
     Ok(Json(serde_json::json!({
         "success": true,
@@ -1076,8 +1096,16 @@ pub(crate) fn cert_fingerprint(
 /// Takes `&mut model` because `certify_solid` warms the per-face centroid cache
 /// (D4 label selectors) and `calculate_solid_volume` warms the mass-props cache;
 /// the geometry itself is never mutated.
+///
+/// After the response is built, it spawns the ADVISORY dual-eye reconcile OFF
+/// this write lock (`reconcile_task::spawn_reconcile`): the worker deep-copies
+/// the model under a brief read lock — waiting microseconds for THIS caller's
+/// write guard to drop — then renders/certifies lock-free. `model_arc` is the
+/// ACTIVE model handle (may be a branch model, not `state.model`).
 fn certified_response(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    model_arc: &reconcile_task::ModelHandle,
+    state: &AppState,
     solid_id: geometry_engine::primitives::solid::SolidId,
     mesh: &geometry_engine::tessellation::TriangleMesh,
     full: bool,
@@ -1093,6 +1121,14 @@ fn certified_response(
         map.insert("volume".into(), serde_json::json!(volume));
         map.insert("face_count".into(), serde_json::json!(face_count));
     }
+
+    // Reconcile cache key. Derived from the CHEAP structural perception block
+    // (valid/dims/volume/face_count/provenance) BEFORE the heavy `full` cert is
+    // inlined below, so the key is identical whether or not this call verifies —
+    // a verify and a plain op on the same solid state map to the same report.
+    // NOT the full-cert hash (`cert_fingerprint`): that is only available after
+    // the expensive certify the auto-cert regression forbids on this hot path.
+    let fingerprint = perception_fingerprint(&base);
 
     // FULL CERTIFICATE — only on explicit verify (`verify:true` / verify_part /
     // GET .../truth). The heavy mesh self-intersection scan + mesh-quality pass are
@@ -1124,7 +1160,31 @@ fn certified_response(
             map.insert("cert".into(), certificate_json(&cert));
         }
     }
+
+    // Advisory dual-eye reconcile, OFF this write lock (fire-and-forget; skips
+    // if already cached/in-flight or the concurrency cap is reached).
+    reconcile_task::spawn_reconcile(
+        model_arc.clone(),
+        state.reconcile_cache.clone(),
+        state.reconcile_inflight.clone(),
+        state.reconcile_limiter.clone(),
+        solid_id,
+        fingerprint,
+    );
+
     base
+}
+
+/// A cheap, stable fingerprint of the structural perception block — the
+/// reconcile cache key. Hashes the JSON so any change to
+/// valid/dims/volume/face_count/provenance re-keys the report; identical solid
+/// state (verify or not) yields the same key. Deliberately NOT the full-cert
+/// hash (`cert_fingerprint`), which is unavailable cheaply on the hot path.
+fn perception_fingerprint(base: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    base.to_string().hash(&mut h);
+    h.finish()
 }
 
 /// Read the explicit-full-verify opt-in from a JSON request body: `"verify": true`
@@ -1443,6 +1503,8 @@ async fn boolean_operation(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -1645,6 +1707,8 @@ async fn shell_solid(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -1835,7 +1899,14 @@ async fn mirror_solid(
     // AMBIENT VERIFICATION (outlier closed): mirror previously emitted no verdict.
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
+        certified_response(
+            &mut model,
+            &model_handle,
+            &state,
+            solid_id,
+            &tri_mesh,
+            body_verify_flag(&payload),
+        )
     };
 
     Ok(Json(serde_json::json!({
@@ -2348,7 +2419,14 @@ async fn fillet_edges_endpoint(
 
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
+        certified_response(
+            &mut model,
+            &model_handle,
+            &state,
+            solid_id,
+            &tri_mesh,
+            body_verify_flag(&payload),
+        )
     };
 
     Ok(Json(serde_json::json!({
@@ -2570,7 +2648,14 @@ async fn chamfer_edges_endpoint(
 
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
+        certified_response(
+            &mut model,
+            &model_handle,
+            &state,
+            solid_id,
+            &tri_mesh,
+            body_verify_flag(&payload),
+        )
     };
 
     Ok(Json(serde_json::json!({
@@ -2762,7 +2847,14 @@ async fn transform_geometry_endpoint(
     // certified response as every other mutating op.
     let perception = {
         let mut model = model_handle.write().await;
-        certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
+        certified_response(
+            &mut model,
+            &model_handle,
+            &state,
+            solid_id,
+            &tri_mesh,
+            body_verify_flag(&payload),
+        )
     };
     Ok(Json(serde_json::json!({
         "success": true,
@@ -3311,6 +3403,8 @@ async fn create_extrude(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -3472,6 +3566,8 @@ async fn create_cylinder_primitive(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -3666,6 +3762,8 @@ async fn create_box_primitive(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -3842,6 +3940,8 @@ async fn create_cone_primitive(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -4085,6 +4185,8 @@ async fn create_revolve_primitive(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -4216,7 +4318,14 @@ async fn import_step_geometry(
 
         let perception = {
             let mut model = model_handle.write().await;
-            certified_response(&mut model, solid_id, &tri_mesh, body_verify_flag(&payload))
+            certified_response(
+                &mut model,
+                &model_handle,
+                &state,
+                solid_id,
+                &tri_mesh,
+                body_verify_flag(&payload),
+            )
         };
         objects.push(serde_json::json!({
             "id":         id_str,
@@ -4381,6 +4490,8 @@ async fn create_nurbs_loft_primitive(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -4616,6 +4727,8 @@ async fn extrude_face_endpoint(
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
+            &model_handle,
+            &state,
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
@@ -7411,6 +7524,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Shared Blackboard notebook store. In-memory + event-logged; the
         // single default notebook is created lazily on first access.
         blackboard: Arc::new(blackboard::BlackboardManager::new()),
+
+        // Dual-eye reconcile substrate. Reports/in-flight are DashMaps; the
+        // limiter bounds concurrent workers to MAX_CONCURRENT_RECONCILES.
+        reconcile_cache: Arc::new(DashMap::new()),
+        reconcile_inflight: Arc::new(DashMap::new()),
+        reconcile_limiter: Arc::new(tokio::sync::Semaphore::new(
+            reconcile_task::MAX_CONCURRENT_RECONCILES,
+        )),
     };
 
     // Background sweeper for expired transactions. The TX_TTL inside

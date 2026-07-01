@@ -219,6 +219,11 @@ async fn make_test_state() -> AppState {
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
         blackboard: Arc::new(crate::blackboard::BlackboardManager::new()),
+        reconcile_cache: Arc::new(DashMap::new()),
+        reconcile_inflight: Arc::new(DashMap::new()),
+        reconcile_limiter: Arc::new(tokio::sync::Semaphore::new(
+            crate::reconcile_task::MAX_CONCURRENT_RECONCILES,
+        )),
     }
 }
 
