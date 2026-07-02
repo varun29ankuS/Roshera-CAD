@@ -263,6 +263,14 @@ fn g2_kill_overlapping_holes() {
     // Honest outcome: either REFUSED or CERT-KILLED (not sound). A sound result
     // would mean the overlap was NOT a real failure — that is the thing under test.
     if let Some(reason) = &out.refusal {
+        // The refusal must be the OverlappingHoles guard specifically — any other
+        // refusal variant firing here would mean the overlap regime was rejected
+        // for the wrong reason (review finding: an assertion-free branch could
+        // pass silently on e.g. InvalidParams).
+        assert!(
+            reason.contains("OverlappingHoles"),
+            "[G2 overlap] expected the OverlappingHoles guard, got refusal: {reason}"
+        );
         eprintln!("[G2 overlap] outcome=REFUSED reason={reason}");
     } else {
         assert_eq!(

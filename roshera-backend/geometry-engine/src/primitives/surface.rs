@@ -5335,6 +5335,9 @@ impl Surface for SurfaceOfRevolution {
             .profile_curve
             .closest_point(&reference_point, _tolerance)
         {
+            // Only the curve parameter matters here; the second tuple element
+            // (the curve's closest 3D point) is unused — position is
+            // re-evaluated through the surface's own point_at below.
             Ok((u, _)) => u.clamp(0.0, 1.0),
             Err(_) => {
                 let mut best_u = 0.0;
