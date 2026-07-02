@@ -19,6 +19,7 @@ pub mod boolean;
 pub mod brep_integrity;
 pub mod cd;
 pub mod chamfer;
+pub mod defect_injection;
 pub mod extrude;
 pub mod fillet;
 pub mod integration;
