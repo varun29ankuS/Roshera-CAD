@@ -203,6 +203,24 @@ fn face_color(n: usize) -> [u8; 3] {
     ]
 }
 
+/// Rasterize a raw [`TriangleMesh`] to a [`RenderFrame`] from the canonical
+/// view direction in `opts.view` (auto-framed). Back-face culling is OFF in
+/// [`RenderMode::Shaded`] — so a flipped-normal defect still produces a solid-
+/// looking render, which is exactly what makes it invisible to a VLM while the
+/// cert catches it analytically.
+///
+/// This exposes the core rasterizer to callers that already hold a mesh (e.g.
+/// the injected-defect benchmark that mutates a tessellated mesh and renders it
+/// WITHOUT going through a B-Rep solid). `opts.tessellation` is ignored here
+/// (the caller owns the mesh); all other fields of `opts` apply as usual.
+///
+/// Returns `None` if `mesh` has no triangles.
+pub fn render_mesh(mesh: &TriangleMesh, opts: &RenderOptions) -> Option<RenderFrame> {
+    let dir = opts.view.direction();
+    let up_hint = opts.view.up_hint();
+    render_mesh_dir(mesh, dir, up_hint, opts, None, &[])
+}
+
 /// Render one solid to a framebuffer.
 ///
 /// Returns `None` when the solid does not exist or tessellates to an

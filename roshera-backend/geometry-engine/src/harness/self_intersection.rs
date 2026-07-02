@@ -16,6 +16,7 @@
 use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
+use crate::tessellation::mesh::TriangleMesh;
 use crate::tessellation::{tessellate_solid, TessellationParams};
 use std::collections::HashMap;
 
@@ -88,33 +89,16 @@ fn aabb_disjoint(a: &([f64; 3], [f64; 3]), b: &([f64; 3], [f64; 3])) -> bool {
     false
 }
 
-/// `true` if the solid's tessellated mesh self-intersects at chord `chord`.
-/// Pairs sharing a welded vertex (topological neighbours) are skipped; a
-/// UNIFORM SPATIAL-HASH GRID over the triangle AABBs supplies broad-phase
-/// candidate pairs so the narrow-phase (segment/triangle) test runs only on
-/// triangles that actually share a grid cell — turning the historical O(n²)
-/// all-pairs scan into ~O(n) for the spatially-coherent meshes a CAD solid
-/// produces. Use a COARSE chord for a fast certificate check — self-overlap is
-/// a gross geometric fault, visible at low density.
-pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bool {
-    let solid_ref = match model.solids.get(solid) {
-        Some(s) => s,
-        None => return false,
-    };
-    // AUDIT-bounded tessellation: this is a coarse self-overlap certificate, and
-    // the pair scan below is O(n²) in the triangle count. `default()`'s 100-
-    // segment ceiling lets a curved-Boolean arrangement-cell fragment (whose rim
-    // can sample thousands of points) explode the triangle count, making the
-    // quadratic scan run for tens of seconds — it was the dominant cost of the
-    // per-op certificate audit. `audit()` caps segments at 24 (and the spherical-
-    // fan budget scales with it), bounding `n` so the scan is fast. Gross self-
-    // overlap is visible at this density (the check's stated contract), so the
-    // coarser mesh does not blind it. The caller's `chord` stays the quality knob.
-    let params = TessellationParams {
-        chord_tolerance: chord,
-        ..TessellationParams::audit()
-    };
-    let mesh = tessellate_solid(solid_ref, model, &params);
+/// Test whether a pre-built [`TriangleMesh`] self-intersects — the shared core
+/// of [`mesh_self_intersects`] (which tessellates first) and any caller that
+/// already holds a mesh (e.g. the injected-defect benchmark that mutates a
+/// tessellated mesh and re-certifies it without touching the B-Rep).
+///
+/// Uses the same uniform spatial-hash broad-phase and segment/triangle
+/// narrow-phase as [`mesh_self_intersects`]. Pairs sharing a welded vertex
+/// (topological neighbours) are excluded — they touch, not cross. Returns
+/// `false` for meshes with fewer than 2 triangles.
+pub fn mesh_self_intersects_mesh(mesh: &TriangleMesh) -> bool {
     if mesh.triangles.len() < 2 {
         return false;
     }
@@ -268,6 +252,40 @@ pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bo
         }
     }
     false
+}
+
+/// `true` if the solid's tessellated mesh self-intersects at chord `chord`.
+/// Pairs sharing a welded vertex (topological neighbours) are skipped; a
+/// UNIFORM SPATIAL-HASH GRID over the triangle AABBs supplies broad-phase
+/// candidate pairs so the narrow-phase (segment/triangle) test runs only on
+/// triangles that actually share a grid cell — turning the historical O(n²)
+/// all-pairs scan into ~O(n) for the spatially-coherent meshes a CAD solid
+/// produces. Use a COARSE chord for a fast certificate check — self-overlap is
+/// a gross geometric fault, visible at low density.
+///
+/// The analysis logic lives in [`mesh_self_intersects_mesh`]; this wrapper
+/// tessellates (using [`TessellationParams::audit`] to bound the triangle
+/// count) then delegates.
+pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bool {
+    let solid_ref = match model.solids.get(solid) {
+        Some(s) => s,
+        None => return false,
+    };
+    // AUDIT-bounded tessellation: this is a coarse self-overlap certificate, and
+    // the pair scan below is O(n²) in the triangle count. `default()`'s 100-
+    // segment ceiling lets a curved-Boolean arrangement-cell fragment (whose rim
+    // can sample thousands of points) explode the triangle count, making the
+    // quadratic scan run for tens of seconds — it was the dominant cost of the
+    // per-op certificate audit. `audit()` caps segments at 24 (and the spherical-
+    // fan budget scales with it), bounding `n` so the scan is fast. Gross self-
+    // overlap is visible at this density (the check's stated contract), so the
+    // coarser mesh does not blind it. The caller's `chord` stays the quality knob.
+    let params = TessellationParams {
+        chord_tolerance: chord,
+        ..TessellationParams::audit()
+    };
+    let mesh = tessellate_solid(solid_ref, model, &params);
+    mesh_self_intersects_mesh(&mesh)
 }
 
 #[cfg(test)]

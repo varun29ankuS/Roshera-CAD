@@ -15,6 +15,7 @@
 
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
+use crate::tessellation::mesh::TriangleMesh;
 use crate::tessellation::{tessellate_solid, TessellationParams};
 use std::collections::HashMap;
 
@@ -144,28 +145,18 @@ fn weld_key(p: &crate::math::vector3::Point3, eps: f64) -> (i64, i64, i64) {
     )
 }
 
-/// Tessellate `solid` and analyse the mesh's topological connectivity. `None`
-/// if the solid is missing or tessellates to nothing.
+/// Analyse the topological connectivity of a pre-built triangle mesh — the
+/// shared core of [`manifold_report`] (which tessellates first) and any caller
+/// that already holds a [`TriangleMesh`] (e.g. the injected-defect benchmark
+/// that mutates a tessellated mesh and re-certifies it without touching the
+/// B-Rep).
 ///
 /// `weld_eps` is the absolute distance below which two mesh vertices are treated
-/// as the same point. Choose well under the chord length but comfortably above
-/// f64 noise — `1e-6` works for the unit-to-ten-unit solids the harness builds.
-pub fn manifold_report(
-    model: &BRepModel,
-    solid: SolidId,
-    chord: f64,
-    weld_eps: f64,
-) -> Option<ManifoldReport> {
-    let solid_ref = model.solids.get(solid)?;
-    // Caller-driven `chord` with `default()`'s segment ceiling (see `mesh_volume`
-    // for why this side is not coarsened to `audit()`). Connectivity is a
-    // topological verdict the `max_segments`-scaled fan-budget guard keeps
-    // bounded; the audit's cost was the `fine()` analytic volume, not this.
-    let params = TessellationParams {
-        chord_tolerance: chord,
-        ..TessellationParams::default()
-    };
-    let mesh = tessellate_solid(solid_ref, model, &params);
+/// as the same point. Returns `None` if the mesh has no triangles.
+///
+/// This fn contains the entire connectivity analysis that was previously inlined
+/// in [`manifold_report`]; the wrapper now delegates here after tessellating.
+pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<ManifoldReport> {
     if mesh.triangles.is_empty() {
         return None;
     }
@@ -272,6 +263,35 @@ pub fn manifold_report(
         manifold: nonmanifold_edges == 0,
         oriented: inconsistent_directed_edges == 0,
     })
+}
+
+/// Tessellate `solid` and analyse the mesh's topological connectivity. `None`
+/// if the solid is missing or tessellates to nothing.
+///
+/// `weld_eps` is the absolute distance below which two mesh vertices are treated
+/// as the same point. Choose well under the chord length but comfortably above
+/// f64 noise — `1e-6` works for the unit-to-ten-unit solids the harness builds.
+///
+/// The analysis logic lives in [`manifold_report_mesh`]; this wrapper tessellates
+/// then delegates, keeping both the wrapper's behaviour and the mesh-core's
+/// public reachability.
+pub fn manifold_report(
+    model: &BRepModel,
+    solid: SolidId,
+    chord: f64,
+    weld_eps: f64,
+) -> Option<ManifoldReport> {
+    let solid_ref = model.solids.get(solid)?;
+    // Caller-driven `chord` with `default()`'s segment ceiling (see `mesh_volume`
+    // for why this side is not coarsened to `audit()`). Connectivity is a
+    // topological verdict the `max_segments`-scaled fan-budget guard keeps
+    // bounded; the audit's cost was the `fine()` analytic volume, not this.
+    let params = TessellationParams {
+        chord_tolerance: chord,
+        ..TessellationParams::default()
+    };
+    let mesh = tessellate_solid(solid_ref, model, &params);
+    manifold_report_mesh(&mesh, weld_eps)
 }
 
 /// Diagnostic: the 3D segments of every BOUNDARY edge (an undirected mesh edge
