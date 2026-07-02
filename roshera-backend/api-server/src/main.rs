@@ -1121,17 +1121,14 @@ fn certified_response(
         volume.unwrap_or(0.0),
     );
 
-    // FULL CERTIFICATE — only on explicit verify (`verify:true` / verify_part /
-    // GET .../truth). The heavy mesh self-intersection scan + mesh-quality pass are
-    // O(n) over the WHOLE mesh and stall the interactive hot path on a real part: a
-    // 40k-tri chamber takes multi-second, run under the model write lock, which is
-    // the auto-cert perf regression (froze the backend on real builds). They are
-    // kept OFF the default op response, which now carries the CHEAP, exact B-Rep
-    // structural verdict that `perception_json` already computed
-    // (`validate_solid_scoped`, Standard: B-Rep validity + shell closure,
-    // mesh-independent, O(faces)). The full self-intersection / mesh-quality
-    // certificate stays one explicit call away (verify_part / .../truth), so the
-    // moat holds — it just no longer costs interactive latency on every op.
+    // FULL CERTIFICATE — DEFAULT on every mutating op response. `certify_solid`
+    // uses a COARSE internal tessellation (manifold @ chord 0.1, self-intersection
+    // @ chord 0.5) and is MEMOIZED per solid (repeat calls on an unmutated solid
+    // are O(1) cache hits). The previously measured ~44 ms ceiling on a 19.8k-tri
+    // part (release) is acceptable on the hot path; the O(n) spatial-hash
+    // self-intersection pass no longer hangs. Callers that genuinely need lower
+    // latency opt OUT via `"fast": true` in the request body, which skips this
+    // block and returns only the lightweight perception block.
     if full {
         let cert = model.certify_solid(solid_id);
         let sound = cert.is_sound();
@@ -1204,12 +1201,15 @@ pub(crate) fn perception_fingerprint(
     h.finish()
 }
 
-/// Read the explicit-full-verify opt-in from a JSON request body: `"verify": true`
-/// (bool) / `"verify": 1` (number) / `"verify": "1"` (string) → additionally run
-/// the FULL certificate inline. Absent / anything else → the cheap default
-/// (sub-second hot path; the full cert remains available on the explicit verify
-/// endpoints). The historical `"fast"` flag is still honoured as a NO-OP alias
-/// (the response is already fast by default) so older callers don't error.
+/// Determine whether the full certificate should run for this request body.
+///
+/// DEFAULT (absent / `"fast": false`) → `true` (full cert runs on every mutating
+/// op response). Callers opt OUT via `"fast": true` / `"fast": 1` / `"fast": "1"`,
+/// which returns `false` — only the lightweight perception block is emitted.
+///
+/// The historical `"verify": true` flag is still accepted as an explicit no-op
+/// confirmation (the full cert already runs by default), so older callers that
+/// sent `"verify": true` continue to receive the full cert without error.
 fn body_verify_flag(payload: &serde_json::Value) -> bool {
     let truthy = |v: &serde_json::Value| match v {
         serde_json::Value::Bool(b) => *b,
@@ -1217,7 +1217,9 @@ fn body_verify_flag(payload: &serde_json::Value) -> bool {
         serde_json::Value::String(s) => s == "1" || s.eq_ignore_ascii_case("true"),
         _ => false,
     };
-    payload.get("verify").map(truthy).unwrap_or(false)
+    // `"fast": true` is the OPT-OUT; everything else (absent, false, "0") keeps
+    // the full cert on (return true).
+    !payload.get("fast").map(truthy).unwrap_or(false)
 }
 
 /// POST /api/assembly/verify — certify a kinematic assembly declared over the

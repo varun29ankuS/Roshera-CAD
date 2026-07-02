@@ -2175,12 +2175,11 @@ pub struct PartPerception {
 
 /// Query for `GET /api/agent/parts/{id}/perception`.
 ///
-/// LATENCY CONTRACT: the DEFAULT is the CHEAP O(n) perception (B-Rep validity +
-/// mesh counts + dims, ~5ms). MCP `perceive()` falls back to this on every op, so
-/// it must never run the expensive O(n²) certificate. `?full=1` (or `full=true`)
-/// OPTS IN to the FULL kernel certificate inline — the explicit verify path
-/// (`verify_part`), identical in content to `GET …/truth`. The legacy `?fast=1`
-/// flag is accepted as a NO-OP (the default is already fast).
+/// DEFAULT: the FULL kernel certificate (`certify_solid` — coarse internal
+/// tessellation, memoized, O(n) spatial hash for self-intersection).
+/// Callers opt OUT via `?fast=1` to get only the lightweight B-Rep + mesh-count
+/// block (~5 ms, read lock only). `?full=1` is accepted as a no-op confirmation
+/// (full cert is the default) for backward compatibility.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PerceptionQuery {
     #[serde(default)]
@@ -2190,10 +2189,10 @@ pub struct PerceptionQuery {
 }
 
 impl PerceptionQuery {
-    /// True iff the caller explicitly opted IN to the full certificate via
-    /// `?full=1` / `?full=true`.
-    fn wants_full(&self) -> bool {
-        self.full
+    /// True iff the caller explicitly opted OUT of the full certificate via
+    /// `?fast=1` / `?fast=true`.
+    fn wants_fast(&self) -> bool {
+        self.fast
             .as_deref()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
@@ -2202,17 +2201,17 @@ impl PerceptionQuery {
 
 /// `GET /api/agent/parts/{id}/perception` — the part's validity verdict.
 ///
-/// LATENCY CONTRACT: the DEFAULT is the CHEAP perception (watertight, valid
-/// B-Rep, L×W×H — ~5ms, read lock only). MCP `perceive()` falls back to this on
-/// every op, so the default never runs the expensive O(n²) certificate. `?full=1`
-/// OPTS IN to the FULL kernel certificate under `cert` (`sound` =
-/// `certify_solid().is_sound()`, every dimension: self-intersection, construction-
-/// consistency, labels, tessellation- and mesh-quality) — the explicit verify
-/// path, identical to `GET …/truth`. `404` on unknown id / empty tessellation.
+/// DEFAULT: the FULL kernel certificate (`sound` = `certify_solid().is_sound()`,
+/// every dimension: self-intersection, construction-consistency, labels,
+/// tessellation- and mesh-quality). `certify_solid` uses a COARSE internal
+/// tessellation (manifold @ chord 0.1, self-intersection @ chord 0.5) and is
+/// MEMOIZED per solid (repeat calls are cache hits). Write lock — `certify_solid`
+/// warms a per-face centroid cache; geometry is never mutated.
 ///
-/// Write lock taken only on the `?full=1` path: `certify_solid` warms a per-face
-/// centroid cache when re-running the D4 label selectors; geometry is never
-/// mutated. The default path is read-only.
+/// `?fast=1` OPTS OUT to the lightweight block (B-Rep validity + coarse mesh
+/// counts + L×W×H, ~5 ms, read lock only). `?full=1` is a no-op alias that
+/// continues to return the full cert (for backward compatibility). `404` on
+/// unknown id / empty tessellation.
 pub async fn part_perception(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -2225,8 +2224,8 @@ pub async fn part_perception(
 
     let sid = id as SolidId;
 
-    if !q.wants_full() {
-        // DEFAULT (cheap, read lock): B-Rep validity + coarse mesh counts + dims.
+    if q.wants_fast() {
+        // OPT-OUT (`?fast=1`): lightweight (cheap, read lock): B-Rep validity + coarse mesh counts + dims.
         let model = model_handle.read().await;
         if model.solids.get(sid).is_none() {
             return Err(StatusCode::NOT_FOUND);
@@ -2248,10 +2247,10 @@ pub async fn part_perception(
             "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)"
                 .to_string()
         };
-        // Reconcile: always pending on the cheap path — no write lock means no
+        // Reconcile: always pending on the fast path — no write lock means no
         // `calculate_solid_volume`, so the write-path fingerprint cannot be
-        // reproduced without upgrading the lock (which would break the latency
-        // contract). Agents that want the reconcile report should call ?full=1.
+        // reproduced without upgrading the lock. Use the default (full) path to
+        // get the reconcile report.
         let mut perception_val = serde_json::to_value(PartPerception {
             solid_id: id,
             sound: valid,
@@ -2272,8 +2271,8 @@ pub async fn part_perception(
         return Ok(Json(perception_val));
     }
 
-    // OPT-IN (`?full=1`): the FULL certificate. Write lock — `certify_solid` warms
-    // a per-face centroid cache.
+    // DEFAULT (and `?full=1` no-op alias): the FULL certificate. Write lock —
+    // `certify_solid` warms a per-face centroid cache; geometry is never mutated.
     let mut model = model_handle.write().await;
     if model.solids.get(sid).is_none() {
         return Err(StatusCode::NOT_FOUND);
