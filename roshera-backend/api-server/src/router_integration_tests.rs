@@ -2018,6 +2018,73 @@ async fn auto_cert_default_response_is_latency_bounded() {
     );
 }
 
+/// PERF GUARD: the ambient full certificate stays within a bounded latency on a
+/// LARGE part (≥20k display triangles from the default tessellation — a sphere of
+/// radius 300 hits the `max_segments=100` cap and produces ~20k triangles).
+///
+/// This proves the cert's internal tessellation uses the COARSE path (chord 0.5
+/// for self-intersection, chord 0.1 for manifold) and never regresses to a
+/// fine-scan that would blow far past this ceiling on a part of this size.
+///
+/// The triangle count is verified from `stats.triangle_count` so the test is
+/// non-vacuous: if the sphere produces fewer than 20 000 display triangles the
+/// assertion fails, revealing a tessellation-parameter regression, not a
+/// cert-performance pass.
+#[tokio::test]
+async fn ambient_cert_large_sphere_stays_within_latency_bound() {
+    let state = make_test_state().await;
+
+    let body_json = json!({
+        "shape_type": "sphere",
+        "parameters": { "radius": 300.0 },
+        // default (no "fast") → full ambient cert
+    });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry")
+        .header("content-type", "application/json")
+        .body(Body::from(body_json.to_string()))
+        .expect("static sphere request must build");
+
+    let started = std::time::Instant::now();
+    let (status, body) = dispatch(&state, request).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sphere create must return 200; body = {body}"
+    );
+    // Full cert must be present in the default response (no fast flag).
+    assert!(
+        body["perception"]["cert"].is_object(),
+        "default ambient cert must be present even for a large sphere; body = {body}"
+    );
+    assert_eq!(
+        body["perception"]["cert"]["sound"].as_bool(),
+        Some(true),
+        "a sphere is sound; body = {body}"
+    );
+    // Verify the part is genuinely large: the display mesh must have ≥19 000
+    // triangles. With max_segments=100, a sphere produces exactly
+    // 2 * 100 * 99 = 19 800 triangles — the `max_segments` cap. If this fails
+    // the sphere was tessellated too coarsely and the perf guard would be vacuous.
+    let triangle_count = body["stats"]["triangle_count"].as_u64().unwrap_or(0);
+    assert!(
+        triangle_count >= 19_000,
+        "sphere radius 300 must produce ≥19 000 display triangles (max_segments=100 cap → 19 800); \
+         got {triangle_count}"
+    );
+    // 10 s is a generous ceiling for a debug-build sphere certify using the coarse
+    // internal path. A fine-scan regression on a 20k-tri part would exceed this
+    // ceiling by orders of magnitude.
+    assert!(
+        elapsed.as_secs() < 10,
+        "ambient cert on a large sphere must stay within the coarse-path budget; \
+         took {elapsed:?}"
+    );
+}
+
 // =====================================================================
 // Task 9 — dual-eye reconcile surfaced on the perception endpoint
 // =====================================================================
