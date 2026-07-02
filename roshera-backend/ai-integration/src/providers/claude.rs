@@ -100,6 +100,70 @@ impl ClaudeProvider {
         self.config.tool_tier = tier;
     }
 
+    /// Send a text prompt alongside a PNG image to Claude and return the plain-text reply.
+    ///
+    /// Uses the Anthropic multimodal messages API: the PNG is base64-encoded and
+    /// placed as an `image` content block ahead of the `text` block, matching the
+    /// layout Claude's vision tier expects.  All transport details (endpoint,
+    /// model, `max_tokens`, auth header) come from the provider's existing
+    /// `ClaudeConfig` — no extra configuration is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::ProviderUnavailable` when no `ANTHROPIC_API_KEY`
+    /// is configured — identical to the policy enforced by every other entry
+    /// point on this provider.  All network / decode failures surface as
+    /// `ProviderError::InferenceError`.
+    pub async fn generate_with_image(
+        &self,
+        prompt: &str,
+        png_bytes: &[u8],
+    ) -> Result<String, ProviderError> {
+        let key = match &self.config.api_key {
+            Some(k) if !k.is_empty() => k,
+            _ => {
+                return Err(ProviderError::ProviderUnavailable(
+                    "Claude provider has no ANTHROPIC_API_KEY configured; \
+                     refusing to send a multimodal request without a key"
+                        .to_string(),
+                ));
+            }
+        };
+
+        let request_body = build_image_message_body(
+            &self.config.model,
+            self.config.max_tokens,
+            prompt,
+            png_bytes,
+        );
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/v1/messages", self.config.api_base))
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::InferenceError(format!("API request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::InferenceError(format!(
+                "Anthropic API returned {}: {}",
+                status, body
+            )));
+        }
+
+        let body: Value = response.json().await.map_err(|e| {
+            ProviderError::InferenceError(format!("Failed to parse response: {}", e))
+        })?;
+
+        extract_text_from_response(&body)
+    }
+
     /// Process input via the Anthropic API with tool_use.
     ///
     /// Sends the prompt + tool definitions → receives tool_use blocks → dispatches.
@@ -446,6 +510,57 @@ fn extract_text_from_response(response: &Value) -> Result<String, ProviderError>
     }
 }
 
+/// Build the JSON request body for a multimodal (image + text) Anthropic API call.
+///
+/// Produces the exact shape the Anthropic `/v1/messages` endpoint expects:
+///
+/// ```json
+/// {
+///   "model": "…",
+///   "max_tokens": N,
+///   "messages": [{
+///     "role": "user",
+///     "content": [
+///       { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "…" } },
+///       { "type": "text", "text": "…" }
+///     ]
+///   }]
+/// }
+/// ```
+///
+/// Separated from the network path so tests can assert the body shape without
+/// a live API key or network connection.
+fn build_image_message_body(
+    model: &str,
+    max_tokens: usize,
+    prompt: &str,
+    png_bytes: &[u8],
+) -> Value {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let b64 = STANDARD.encode(png_bytes);
+    serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": b64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
+        }]
+    })
+}
+
 /// Parse Anthropic's `text/event-stream` byte stream into a stream of
 /// text deltas.
 ///
@@ -723,6 +838,60 @@ mod tests {
         assert!(
             !rendered.contains("<redacted>"),
             "Absent key must not be labelled redacted; got: {rendered}"
+        );
+    }
+
+    // --- generate_with_image TDD ---
+
+    /// RED → GREEN: the JSON body built for a multimodal request must have the
+    /// Anthropic-specified shape: a single user message whose `content` array
+    /// carries an `image` block (base64/png) followed by a `text` block.
+    #[test]
+    fn build_image_message_body_has_multimodal_content_blocks() {
+        let png_bytes = b"\x89PNG\r\n\x1a\n"; // 8-byte PNG magic header
+        let body =
+            build_image_message_body("claude-test-model", 512, "describe this part", png_bytes);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            2,
+            "expected exactly two content blocks: image then text"
+        );
+
+        // First block must be an image block with base64/png source.
+        assert_eq!(content[0]["type"].as_str().unwrap(), "image");
+        assert_eq!(content[0]["source"]["type"].as_str().unwrap(), "base64");
+        assert_eq!(
+            content[0]["source"]["media_type"].as_str().unwrap(),
+            "image/png"
+        );
+        let data = content[0]["source"]["data"].as_str().unwrap();
+        assert!(
+            !data.is_empty(),
+            "base64 data must be non-empty for non-empty input"
+        );
+
+        // Second block must be the text prompt.
+        assert_eq!(content[1]["type"].as_str().unwrap(), "text");
+        assert_eq!(content[1]["text"].as_str().unwrap(), "describe this part");
+    }
+
+    /// RED → GREEN: `generate_with_image` without an API key must return
+    /// `ProviderUnavailable` — matching the policy enforced by `generate`.
+    #[tokio::test]
+    async fn generate_with_image_returns_unavailable_without_key() {
+        let provider = ClaudeProvider::new(); // no API key set
+        let result = provider
+            .generate_with_image("does this part look sound?", b"\x89PNG")
+            .await;
+        assert!(
+            matches!(result, Err(ProviderError::ProviderUnavailable(_))),
+            "expected ProviderUnavailable when no key is configured, got {:?}",
+            result
         );
     }
 }
