@@ -21,6 +21,7 @@ pub mod cd;
 pub mod chamfer;
 pub mod defect_injection;
 pub mod engine_variant;
+pub mod exploration;
 pub mod extrude;
 pub mod fillet;
 pub mod integration;
