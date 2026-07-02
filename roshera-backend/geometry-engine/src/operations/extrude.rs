@@ -198,7 +198,22 @@ fn create_side_face_shared(
     // does not bias the sign. `inner_sign` flips it for hole loops.
     let target = {
         let ((umn, umx), (vmn, vmx)) = surface.parameter_bounds();
-        match surface.point_at(0.5 * (umn + umx), 0.5 * (vmn + vmx)) {
+        // Guard infinite bounds (e.g. Plane returns ±∞): computing
+        // 0.5*(−∞ + +∞) yields NaN, which propagates into point_at and
+        // forces the fallback to Vector3::Z.  For surfaces with infinite
+        // extents the analytic origin (u=0, v=0) is always a valid,
+        // finite sample point, so we use it in place of the midpoint.
+        let u_mid = if umn.is_finite() && umx.is_finite() {
+            0.5 * (umn + umx)
+        } else {
+            0.0
+        };
+        let v_mid = if vmn.is_finite() && vmx.is_finite() {
+            0.5 * (vmn + vmx)
+        } else {
+            0.0
+        };
+        match surface.point_at(u_mid, v_mid) {
             Ok(sp) => {
                 let radial = (sp - loop_centroid) * inner_sign;
                 if radial.magnitude_squared() > 1e-20 {
