@@ -2089,9 +2089,10 @@ async fn ambient_cert_large_sphere_stays_within_latency_bound() {
 // Task 9 — dual-eye reconcile surfaced on the perception endpoint
 // =====================================================================
 
-/// GATE (Task 9 RED→GREEN): `GET /api/agent/parts/{id}/perception?full=1`
-/// surfaces the dual-eye reconcile report when a completed report is cached for
-/// the current solid state.
+/// GATE (Task 9 RED→GREEN): `GET /api/agent/parts/{id}/perception` surfaces the
+/// dual-eye reconcile report by default when a completed report is cached for the
+/// current solid state. (`?full=1` is now a backward-compat no-op alias — the
+/// reconcile is surfaced on the DEFAULT path since the ambient-cert change.)
 ///
 /// Fingerprint reproducibility proof: the test computes `fp` from the SAME
 /// four fields the write path uses in `certified_response` / `perception_fingerprint`

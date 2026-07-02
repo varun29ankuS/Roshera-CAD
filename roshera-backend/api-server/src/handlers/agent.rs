@@ -2184,8 +2184,10 @@ pub struct PartPerception {
 pub struct PerceptionQuery {
     #[serde(default)]
     pub fast: Option<String>,
-    #[serde(default)]
-    pub full: Option<String>,
+    // NOTE: `?full=1` is a backward-compat no-op alias — full cert is now the
+    // default. Axum's Query extractor ignores unknown params, so `?full=1`
+    // requests still deserialize and route to the default full-cert path; no
+    // field is needed for it.
 }
 
 impl PerceptionQuery {
