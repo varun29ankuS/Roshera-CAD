@@ -156,6 +156,14 @@ pub enum VariantRefusal {
     PlatePrimitive(String),
     /// A hole-drilling boolean difference was rejected.
     HoleDrill(String),
+    /// Adjacent injector bores would overlap on the ring. Drilling mutually
+    /// intersecting cylindrical cuts hits the unresolved cyl-cyl saddle regime in
+    /// the boolean core (each successive difference on the growing self-intersecting
+    /// cavity degrades super-linearly and eventually hangs — see the memory topic
+    /// `boolean-cyl-cyl-saddle-35.md`). The recipe refuses this regime up front so
+    /// the certified sweep proceeds honestly rather than freezing; once the saddle
+    /// boolean is fixed this guard can be lifted.
+    OverlappingHoles(String),
 }
 
 impl std::fmt::Display for VariantRefusal {
@@ -165,6 +173,7 @@ impl std::fmt::Display for VariantRefusal {
             VariantRefusal::Revolve(m) => write!(f, "revolve refused: {m}"),
             VariantRefusal::PlatePrimitive(m) => write!(f, "plate primitive refused: {m}"),
             VariantRefusal::HoleDrill(m) => write!(f, "hole drill refused: {m}"),
+            VariantRefusal::OverlappingHoles(m) => write!(f, "overlapping holes refused: {m}"),
         }
     }
 }
@@ -224,6 +233,32 @@ pub fn build_variant(
     let ring_r = p.ring_frac * plate_radius;
     let overhang = plate_thickness.max(1.0);
     let drill_h = plate_thickness + 2.0 * overhang;
+
+    // Refuse a regime the boolean core cannot yet handle: MUTUALLY OVERLAPPING
+    // bores. Adjacent holes on the ring are spaced `2·ring_r·sin(π/n)` centre-to-
+    // centre; when that is below `2·hole_r` the drilled cylinders intersect, and
+    // subtracting intersecting cuts drives the boolean into the unresolved cyl-cyl
+    // saddle (measured: each successive difference on the growing self-intersecting
+    // cavity degrades super-linearly — ~0.1 s → 16 s over ten holes, then hangs).
+    // A clean typed refusal keeps the certified sweep honest and non-blocking; the
+    // guard is geometric (independent of the boolean bug) and lifts automatically
+    // once the saddle boolean is fixed. See `boolean-cyl-cyl-saddle-35.md`.
+    if p.hole_count >= 2 {
+        let spacing = 2.0 * ring_r * (std::f64::consts::PI / p.hole_count as f64).sin();
+        // 1 % of the hole radius as a hair of margin so exactly-tangent bores (which
+        // share a single edge and are already a boolean edge case) are also excluded.
+        if spacing < 2.0 * p.hole_r * (1.0 + 1.0e-2) {
+            return Err(VariantRefusal::OverlappingHoles(format!(
+                "{} bores of r={} on a ring of r={:.3} are spaced {:.3} < 2·r={:.3} (they intersect)",
+                p.hole_count,
+                p.hole_r,
+                ring_r,
+                spacing,
+                2.0 * p.hole_r
+            )));
+        }
+    }
+
     let bopts = BooleanOptions::default();
     for i in 0..p.hole_count {
         let theta = std::f64::consts::TAU * (i as f64) / (p.hole_count.max(1) as f64);

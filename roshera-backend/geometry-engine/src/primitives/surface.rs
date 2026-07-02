@@ -5251,6 +5251,23 @@ impl Surface for SurfaceOfRevolution {
         })
     }
 
+    /// Position-only evaluation. The default `Surface::point_at` routes through
+    /// `evaluate_full`, which — for a surface of revolution — costs six profile
+    /// NURBS evaluations plus the full first/second fundamental forms and both
+    /// principal curvatures, all discarded to keep only the position. `closest_point`
+    /// below samples the profile 51 times, and the certificate's tessellation /
+    /// mesh-quality checks call `closest_point` once per triangle, so the discarded
+    /// work compounds to O(triangles × 51 × 6) NURBS evals — minutes on a 40k-triangle
+    /// nozzle (Move-3 hang). Overriding `point_at` with the closed-form position
+    /// (one profile eval + one rotation) removes that overhead at the source.
+    fn point_at(&self, u: f64, v: f64) -> MathResult<Point3> {
+        let profile_point = self.profile_curve.point_at(u)?;
+        let (height, radius, radial_dir) = self.decompose_profile_point(profile_point);
+        let binormal = self.axis_direction.cross(&radial_dir);
+        let radial_v = radial_dir * v.cos() + binormal * v.sin();
+        Ok(self.axis_origin + self.axis_direction * height + radial_v * radius)
+    }
+
     fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
         ((0.0, 1.0), (0.0, self.angle))
     }
@@ -5286,12 +5303,14 @@ impl Surface for SurfaceOfRevolution {
         let radial = to_point - self.axis_direction * height;
         let radius = radial.magnitude();
 
-        // Find v (rotation angle) from the radial direction
+        // Reference meridian direction (profile plane at v = 0).
+        let p0 = self.profile_curve.point_at(0.0)?;
+        let (_, _, ref_dir) = self.decompose_profile_point(p0);
+
+        // Find v (rotation angle) from the radial direction, measured from the
+        // reference meridian.
         let v = if radius > 1e-15 {
             let radial_dir = radial * (1.0 / radius);
-            // Get reference direction from profile curve at u=0
-            let p0 = self.profile_curve.point_at(0.0)?;
-            let (_, _, ref_dir) = self.decompose_profile_point(p0);
             let binormal = self.axis_direction.cross(&ref_dir);
             let cos_v = radial_dir.dot(&ref_dir);
             let sin_v = radial_dir.dot(&binormal);
@@ -5305,21 +5324,35 @@ impl Surface for SurfaceOfRevolution {
             0.0
         };
 
-        // Find u by searching along profile curve for closest match
-        // The reconstructed point at (u, v) should be closest to the input point
-        let mut best_u = 0.0;
-        let mut best_dist = f64::MAX;
-        const SAMPLES: usize = 50;
-        for i in 0..=SAMPLES {
-            let u = i as f64 / SAMPLES as f64;
-            if let Ok(pt) = self.point_at(u, v) {
-                let dist = (*point - pt).magnitude();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_u = u;
+        // Find u: rotate the query point back onto the reference meridian (its
+        // (height, radius) are rotation-invariant, so the closest u there is the
+        // closest u on the surface), then project onto the profile curve. The
+        // profile's own closest_point (analytic for a NURBS / Line meridian) is
+        // both faster and more accurate than a fixed-density sample scan; on any
+        // failure fall back to the sample scan so robustness is never reduced.
+        let reference_point = self.axis_origin + self.axis_direction * height + ref_dir * radius;
+        let best_u = match self
+            .profile_curve
+            .closest_point(&reference_point, _tolerance)
+        {
+            Ok((u, _)) => u.clamp(0.0, 1.0),
+            Err(_) => {
+                let mut best_u = 0.0;
+                let mut best_dist = f64::MAX;
+                const SAMPLES: usize = 50;
+                for i in 0..=SAMPLES {
+                    let u = i as f64 / SAMPLES as f64;
+                    if let Ok(pt) = self.point_at(u, v) {
+                        let dist = (*point - pt).magnitude();
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_u = u;
+                        }
+                    }
                 }
+                best_u
             }
-        }
+        };
 
         Ok((best_u, v.clamp(0.0, self.angle)))
     }
