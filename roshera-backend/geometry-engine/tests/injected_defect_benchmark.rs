@@ -140,6 +140,22 @@ fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Render a MEASURED defect-row verdict as a table cell. The artifact must
+/// report what was measured, never a hardcoded claim — a benchmark about lies
+/// must not hardcode its own table.
+fn verdict_cell(caught: bool) -> String {
+    if caught { "CATCH" } else { "PASS (lie)" }.to_string()
+}
+
+/// Measured sanity-row cell: the untouched base should pass everything.
+fn sanity_cell(pass: bool) -> String {
+    if pass {
+        "PASS (sound)".to_string()
+    } else {
+        "FAIL (unsound base)".to_string()
+    }
+}
+
 /// Emit `benchmark_results.md` + `benchmark_results.json` under
 /// `target/injected_defect_benchmark/` (a test may write under target/).
 fn write_artifacts(rows: &[Row], cert_caught: usize, b1_caught: usize, b2_caught: usize) {
@@ -180,6 +196,13 @@ fn write_artifacts(rows: &[Row], cert_caught: usize, b1_caught: usize, b2_caught
         4 - b1_caught,
         4 - b2_caught,
     ));
+    md.push_str(
+        "\n> **Why B1 passes every lie:** B1 validates the *B-Rep solid*, which the \
+         mesh mutations never touch — it is blind *architecturally*, because it never \
+         looks at the delivered mesh. That is precisely the gap: a system that trusts \
+         B-Rep validity alone will ship a lying mesh. The certified eye analyses the \
+         delivered mesh itself, so the lie has nowhere to hide.\n",
+    );
     std::fs::write(dir.join("benchmark_results.md"), md).expect("write md");
 
     // JSON.
@@ -250,15 +273,17 @@ fn injected_defect_benchmark() {
         "sanity: base must be self-intersection-free"
     );
     assert!(sane.sound(), "sanity: base cert must be sound");
-    assert!(b1_brep_valid(&model, solid), "sanity: B1 must pass base");
-    assert!(b2_looks_closed(&base), "sanity: B2 must pass base");
+    let b1_base = b1_brep_valid(&model, solid);
+    let b2_base = b2_looks_closed(&base);
+    assert!(b1_base, "sanity: B1 must pass base");
+    assert!(b2_base, "sanity: B2 must pass base");
     rows.push(Row {
         defect: "(none) sound base".into(),
         injection: "untouched Ø6 sphere tessellation".into(),
         cert_dimension: "—".into(),
-        b1: "PASS (sound)".into(),
-        b2: "PASS (sound)".into(),
-        cert: "PASS (sound)".into(),
+        b1: sanity_cell(b1_base),
+        b2: sanity_cell(b2_base),
+        cert: sanity_cell(sane.sound()),
     });
 
     // B1 is computed on the untouched solid → identical for every defect.
@@ -292,22 +317,24 @@ fn injected_defect_benchmark() {
             "flip: B2 (mesh-count) is fooled — a directed flip is invisible to undirected counts"
         );
         assert_renders_to_png(&m, "flip_normal");
-        cert_caught += 1; // caught (unsound)
-        if b1 {
-        } else {
+        // Derived verdicts — counters and cells report what was MEASURED.
+        let (cert_sound, b2_pass) = (c.sound(), b2_looks_closed(&m));
+        if !cert_sound {
+            cert_caught += 1;
+        }
+        if !b1 {
             b1_caught += 1;
         }
-        if b2_looks_closed(&m) {
-        } else {
+        if !b2_pass {
             b2_caught += 1;
         }
         rows.push(Row {
             defect: "flipped face normal".into(),
             injection: "reverse one triangle's winding [a,b,c]→[a,c,b]".into(),
             cert_dimension: "oriented".into(),
-            b1: "PASS (lie)".into(),
-            b2: "PASS (lie)".into(),
-            cert: "CATCH".into(),
+            b1: verdict_cell(!b1),
+            b2: verdict_cell(!b2_pass),
+            cert: verdict_cell(!cert_sound),
         });
     }
 
@@ -335,22 +362,24 @@ fn injected_defect_benchmark() {
             "self-int: B2 (mesh-count) is fooled — crossing walls still count closed"
         );
         assert_renders_to_png(&m, "inject_self_intersection");
-        cert_caught += 1;
-        if b1 {
-        } else {
+        // Derived verdicts — counters and cells report what was MEASURED.
+        let (cert_sound, b2_pass) = (c.sound(), b2_looks_closed(&m));
+        if !cert_sound {
+            cert_caught += 1;
+        }
+        if !b1 {
             b1_caught += 1;
         }
-        if b2_looks_closed(&m) {
-        } else {
+        if !b2_pass {
             b2_caught += 1;
         }
         rows.push(Row {
             defect: "self-intersection (crossing walls)".into(),
             injection: "translate the +X welded vertex group a full span past −X".into(),
             cert_dimension: "self_intersection_free".into(),
-            b1: "PASS (lie)".into(),
-            b2: "PASS (lie)".into(),
-            cert: "CATCH".into(),
+            b1: verdict_cell(!b1),
+            b2: verdict_cell(!b2_pass),
+            cert: verdict_cell(!cert_sound),
         });
     }
 
@@ -377,22 +406,24 @@ fn injected_defect_benchmark() {
             !b2_looks_closed(&m),
             "delete: B2 (mesh-count) CATCHES the boundary edges (honest control)"
         );
-        cert_caught += 1;
-        if b1 {
-        } else {
+        // Derived verdicts — counters and cells report what was MEASURED.
+        let (cert_sound, b2_pass) = (c.sound(), b2_looks_closed(&m));
+        if !cert_sound {
+            cert_caught += 1;
+        }
+        if !b1 {
             b1_caught += 1;
         }
-        if b2_looks_closed(&m) {
-        } else {
+        if !b2_pass {
             b2_caught += 1;
         }
         rows.push(Row {
             defect: "torn facet (gap / unwelded seam)".into(),
             injection: "delete one triangle → 3 boundary edges".into(),
             cert_dimension: "watertight".into(),
-            b1: "PASS (lie)".into(),
-            b2: "CATCH".into(),
-            cert: "CATCH".into(),
+            b1: verdict_cell(!b1),
+            b2: verdict_cell(!b2_pass),
+            cert: verdict_cell(!cert_sound),
         });
     }
 
@@ -409,8 +440,14 @@ fn injected_defect_benchmark() {
             c.self_intersection_free,
             "duplicate: coincident facet is not an interior crossing"
         );
-        // (oriented ALSO flips here — a same-winding duplicate repeats directed
-        // edges — which is fine; the INTENDED dimension is manifold.)
+        // oriented ALSO fires here — a same-winding duplicate repeats directed
+        // edges. Assert it so the second dimension is a verified fact, not an
+        // unchecked comment; `manifold` remains the NAMED/authoritative dimension
+        // for this defect class in the artifact.
+        assert!(
+            !c.oriented,
+            "duplicate: oriented also flags the repeated directed edges"
+        );
         assert!(!c.sound(), "duplicate: cert verdict must be unsound");
         assert!(
             b1,
@@ -420,22 +457,24 @@ fn injected_defect_benchmark() {
             !b2_looks_closed(&m),
             "duplicate: B2 (mesh-count) CATCHES the non-manifold edges (honest control)"
         );
-        cert_caught += 1;
-        if b1 {
-        } else {
+        // Derived verdicts — counters and cells report what was MEASURED.
+        let (cert_sound, b2_pass) = (c.sound(), b2_looks_closed(&m));
+        if !cert_sound {
+            cert_caught += 1;
+        }
+        if !b1 {
             b1_caught += 1;
         }
-        if b2_looks_closed(&m) {
-        } else {
+        if !b2_pass {
             b2_caught += 1;
         }
         rows.push(Row {
             defect: "duplicated facet (non-manifold)".into(),
             injection: "append a copy of one triangle → 3 non-manifold edges".into(),
-            cert_dimension: "manifold".into(),
-            b1: "PASS (lie)".into(),
-            b2: "CATCH".into(),
-            cert: "CATCH".into(),
+            cert_dimension: "manifold (oriented also fires)".into(),
+            b1: verdict_cell(!b1),
+            b2: verdict_cell(!b2_pass),
+            cert: verdict_cell(!cert_sound),
         });
     }
 
