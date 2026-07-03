@@ -20,12 +20,17 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use geometry_engine::harness::engine_variant::{build_variant, Envelope};
 use geometry_engine::harness::exploration::{
     explore, winner, ExplorationReport, VariantOutcome, VariantRow,
 };
+use geometry_engine::math::vector3::Vector3;
+use geometry_engine::primitives::topology_builder::BRepModel;
+use geometry_engine::render::{render_solids_dir, RenderMode, RenderOptions};
+use geometry_engine::tessellation::TessellationParams;
 
 /// Parsed CLI args.
 struct Args {
@@ -110,7 +115,20 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let md = render_markdown(&report, internal_target, win);
+    // Hero renders (Part C): rebuild the winner in a fresh model and shoot a
+    // small shaded orbit set; rebuild the top cert-killed variant and shoot a
+    // Diagnostic render so its defect (red open edges) is visible. The example
+    // fails LOUDLY (nonzero exit) if any render returns None — a claimed image
+    // that could not be produced is a lie the artifact must never carry.
+    let renders = match render_hero_set(&out_dir, &report.envelope, win, top_cert_kill(&report)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("render failure: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let md = render_markdown(&report, internal_target, win, &renders);
     let json = render_json(&report, internal_target, win);
 
     let md_path = out_dir.join("exploration_results.md");
@@ -127,8 +145,171 @@ fn main() -> ExitCode {
     println!("\nartifacts:");
     println!("  {}", md_path.display());
     println!("  {}", json_path.display());
+    for p in &renders.winner_pngs {
+        println!("  {}", p.display());
+    }
+    for p in &renders.kill_pngs {
+        println!("  {}", p.display());
+    }
 
     ExitCode::SUCCESS
+}
+
+/// The set of hero PNGs produced for the artifact (relative-friendly full paths).
+struct RenderSet {
+    winner_pngs: Vec<PathBuf>,
+    kill_pngs: Vec<PathBuf>,
+}
+
+/// The single most-defective CERT_KILLED row (most failed cert dimensions,
+/// label-tiebroken) — the most photogenic kill for a Diagnostic render. `None`
+/// if the sweep produced no cert kills.
+fn top_cert_kill(report: &ExplorationReport) -> Option<&VariantRow> {
+    report
+        .rows
+        .iter()
+        .filter(|r| matches!(r.outcome, VariantOutcome::CertKilled(_)))
+        .max_by(|a, b| {
+            let na = match &a.outcome {
+                VariantOutcome::CertKilled(d) => d.len(),
+                _ => 0,
+            };
+            let nb = match &b.outcome {
+                VariantOutcome::CertKilled(d) => d.len(),
+                _ => 0,
+            };
+            na.cmp(&nb).then_with(|| b.label.cmp(&a.label))
+        })
+}
+
+/// A camera direction (camera→scene) from azimuth/elevation degrees, world Z up
+/// — matching the viewpoint module's convention (camera position is the unit
+/// vector at `(az, el)`; the view direction points the opposite way).
+fn dir_from_az_el(az_deg: f64, el_deg: f64) -> Vector3 {
+    let az = az_deg.to_radians();
+    let el = el_deg.to_radians();
+    let pos = Vector3::new(el.cos() * az.cos(), el.cos() * az.sin(), el.sin());
+    // dir = camera → scene = -position.
+    Vector3::new(-pos.x, -pos.y, -pos.z)
+}
+
+/// Rebuild the winner and the top kill in fresh models and write their PNGs.
+/// Copper chamber+nozzle, steel plate — the live-demo palette family. Returns
+/// the written paths; errors (rebuild refusal, empty render, PNG/IO failure) are
+/// surfaced so the caller can exit nonzero.
+fn render_hero_set(
+    out_dir: &Path,
+    envelope: &Envelope,
+    win: Option<&VariantRow>,
+    kill: Option<&VariantRow>,
+) -> Result<RenderSet, String> {
+    // Copper chamber+nozzle, steel-grey plate.
+    const COPPER: [u8; 3] = [184, 115, 51];
+    const STEEL: [u8; 3] = [140, 146, 152];
+
+    let mut winner_pngs = Vec::new();
+    let mut kill_pngs = Vec::new();
+
+    // ---- Winner orbit set (3 shaded views) --------------------------------
+    if let Some(w) = win {
+        let winner_dir = out_dir.join("winner");
+        fs::create_dir_all(&winner_dir).map_err(|e| format!("mkdir winner: {e}"))?;
+
+        let mut model = BRepModel::new();
+        let variant = build_variant(&mut model, &w.params)
+            .map_err(|e| format!("winner rebuild refused (was SOUND in sweep): {e}"))?;
+        let solids = [variant.chamber_nozzle, variant.injector_plate];
+        let colors = [COPPER, STEEL];
+
+        let opts = RenderOptions {
+            width: 1000,
+            height: 1000,
+            view: geometry_engine::render::CanonicalView::Isometric, // ignored by *_dir
+            mode: RenderMode::Shaded,
+            tessellation: TessellationParams::fine(),
+        };
+
+        // az 30/el 12 (three-quarter), az 120/el −20 (looking up the bell),
+        // az 210/el 30 (opposite three-quarter, high).
+        let views = [(30.0, 12.0), (120.0, -20.0), (210.0, 30.0)];
+        for (i, (az, el)) in views.iter().enumerate() {
+            let dir = dir_from_az_el(*az, *el);
+            let frame = render_solids_dir(&model, &solids, &colors, dir, Vector3::Z, &opts)
+                .ok_or_else(|| {
+                    format!("winner view az{az}/el{el} rendered an empty frame (None)")
+                })?;
+            let png = frame.to_png().map_err(|e| format!("winner png: {e}"))?;
+            let name = format!("winner_az{}_el{}.png", fmt_deg(*az), fmt_deg(*el));
+            let path = winner_dir.join(&name);
+            fs::write(&path, &png).map_err(|e| format!("write {}: {e}", path.display()))?;
+            println!(
+                "winner render {}/3: {} ({} bytes)",
+                i + 1,
+                path.display(),
+                png.len()
+            );
+            winner_pngs.push(path);
+        }
+        // Silence the unused-envelope lint honestly: the winner already passed
+        // the envelope during the sweep; we assert it here as a build-time echo.
+        let _ = envelope;
+    } else {
+        println!("no winner to render (no sound in-envelope in-band candidate)");
+    }
+
+    // ---- Top cert-kill diagnostic render ----------------------------------
+    if let Some(k) = kill {
+        let kills_dir = out_dir.join("kills");
+        fs::create_dir_all(&kills_dir).map_err(|e| format!("mkdir kills: {e}"))?;
+
+        let mut model = BRepModel::new();
+        // A cert-killed variant BUILT (the certificate, not an op, rejected it),
+        // so the rebuild must succeed; a refusal here means the outcome taxonomy
+        // is inconsistent and should fail loudly.
+        let variant = build_variant(&mut model, &k.params)
+            .map_err(|e| format!("cert-killed variant refused on rebuild (taxonomy bug): {e}"))?;
+        let solids = [variant.chamber_nozzle, variant.injector_plate];
+        let colors = [COPPER, STEEL];
+
+        let opts = RenderOptions {
+            width: 1000,
+            height: 1000,
+            view: geometry_engine::render::CanonicalView::Isometric,
+            mode: RenderMode::Diagnostic,
+            tessellation: TessellationParams::fine(),
+        };
+        let dir = dir_from_az_el(120.0, -20.0);
+        let frame = render_solids_dir(&model, &solids, &colors, dir, Vector3::Z, &opts)
+            .ok_or_else(|| "top cert-kill rendered an empty frame (None)".to_string())?;
+        let png = frame.to_png().map_err(|e| format!("kill png: {e}"))?;
+        let path = kills_dir.join("top_cert_kill_diagnostic.png");
+        fs::write(&path, &png).map_err(|e| format!("write {}: {e}", path.display()))?;
+        println!(
+            "top cert-kill diagnostic: {} ({} bytes, open_edges={} nonmanifold_edges={})",
+            path.display(),
+            png.len(),
+            frame.open_edges,
+            frame.nonmanifold_edges
+        );
+        kill_pngs.push(path);
+    } else {
+        println!("no cert kills to render diagnostically (0 CERT_KILLED)");
+    }
+
+    Ok(RenderSet {
+        winner_pngs,
+        kill_pngs,
+    })
+}
+
+/// Degrees as a filesystem-safe token (negative → `n`, no dot).
+fn fmt_deg(d: f64) -> String {
+    let r = d.round() as i64;
+    if r < 0 {
+        format!("n{}", -r)
+    } else {
+        r.to_string()
+    }
 }
 
 /// Median internal cavity volume among SOUND, in-envelope, volume-bearing rows.
@@ -198,6 +379,7 @@ fn render_markdown(
     report: &ExplorationReport,
     internal_target: Option<f64>,
     win: Option<&VariantRow>,
+    renders: &RenderSet,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# Certified Exploration Sweep");
@@ -313,6 +495,43 @@ fn render_markdown(
         }
         None => {
             let _ = writeln!(s, "_none_");
+        }
+    }
+    let _ = writeln!(s);
+
+    let _ = writeln!(s, "## Renders");
+    let _ = writeln!(s);
+    if renders.winner_pngs.is_empty() {
+        let _ = writeln!(s, "_no winner renders_");
+    } else {
+        let _ = writeln!(
+            s,
+            "Winner hero orbit (copper chamber+nozzle, steel plate, shaded, fine):"
+        );
+        let _ = writeln!(s);
+        for p in &renders.winner_pngs {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unnamed>");
+            let _ = writeln!(s, "- `winner/{name}`");
+        }
+    }
+    let _ = writeln!(s);
+    if renders.kill_pngs.is_empty() {
+        let _ = writeln!(s, "_no cert-kill diagnostic render (0 cert kills)_");
+    } else {
+        let _ = writeln!(
+            s,
+            "Top cert-kill diagnostic (Diagnostic mode — open edges in red):"
+        );
+        let _ = writeln!(s);
+        for p in &renders.kill_pngs {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unnamed>");
+            let _ = writeln!(s, "- `kills/{name}`");
         }
     }
     let _ = writeln!(s);
