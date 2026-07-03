@@ -2070,59 +2070,12 @@ server.tool(
   },
 );
 
-server.tool(
-  "create_plate_with_holes",
-  "ONE-CALL plate: rectangle (width × depth at cx,cy) with circular holes, " +
-    "extruded. Holes are [hx, hy, radius] triples in plane coordinates.",
-  {
-    plane: PlaneSchema.default("xy"),
-    cx: z.number().default(0),
-    cy: z.number().default(0),
-    width: z.number().positive(),
-    depth: z.number().positive(),
-    height: z.number(),
-    holes: z.array(z.tuple([z.number(), z.number(), z.number()])).default([]),
-    name: z.string().optional(),
-  },
-  async ({ plane, cx, cy, width, depth, height, holes, name }) => {
-    try {
-      const s = await api("POST", "/api/sketch", { plane, tool: "rectangle" });
-      await api("POST", `/api/sketch/${s.id}/point`, {
-        point: [cx - width / 2, cy - depth / 2],
-      });
-      await api("POST", `/api/sketch/${s.id}/point`, {
-        point: [cx + width / 2, cy + depth / 2],
-      });
-      for (const [hx, hy, r] of holes) {
-        const sh = await api("POST", `/api/sketch/${s.id}/shape`, {
-          tool: "circle",
-        });
-        const idx = (sh.shapes?.length ?? 1) - 1;
-        await api("POST", `/api/sketch/${s.id}/shape/${idx}/point`, {
-          point: [hx, hy],
-        });
-        await api("POST", `/api/sketch/${s.id}/shape/${idx}/point`, {
-          point: [hx + r, hy],
-        });
-      }
-      const r = await api("POST", `/api/sketch/${s.id}/extrude`, {
-        distance: height,
-        name: name ?? null,
-      });
-      const id = await newestPartId();
-      return await okp(
-        {
-          object_uuid: r.object?.id ?? null, // operand for boolean / transform
-          part_id: id,
-          placement: id !== null ? await placement(id) : null,
-        },
-        id,
-      );
-    } catch (e) {
-      return fail(e);
-    }
-  },
-);
+// `create_plate_with_holes` was RETIRED here: it composed the plate via the
+// sketch+extrude path — the exact path documented to produce inside-out
+// lateral meshes (⅓ volume, negative inertia), which is why create_box and
+// create_cylinder were moved to analytic primitives. Its replacement is the
+// honest pair: create_cylinder / create_box for the blank + `drill_pattern`
+// (below) for the holes — analytic primitives and certified booleans only.
 
 
 // ---- mutation: boolean (feature stacking) -----------------------------
@@ -2160,6 +2113,195 @@ server.tool(
         },
         part_id,
       );
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+// ---- mutation: batch tools (one call, many features) -------------------
+
+/** Standard plane name or custom {origin,u_axis,v_axis} → {o,u,v} basis. */
+function resolvePlane(plane: any): { o: number[]; u: number[]; v: number[] } {
+  const std: Record<string, { o: number[]; u: number[]; v: number[] }> = {
+    xy: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 1, 0] },
+    xz: { o: [0, 0, 0], u: [1, 0, 0], v: [0, 0, 1] },
+    yz: { o: [0, 0, 0], u: [0, 1, 0], v: [0, 0, 1] },
+  };
+  return typeof plane === "string"
+    ? std[plane]
+    : { o: plane.origin, u: plane.u_axis, v: plane.v_axis };
+}
+
+const cross3 = (a: number[], b: number[]) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0],
+];
+const unit3 = (a: number[]) => {
+  const m = Math.hypot(a[0], a[1], a[2]);
+  return [a[0] / m, a[1] / m, a[2] / m];
+};
+
+server.tool(
+  "boolean_many",
+  "BATCH boolean: apply ONE op (difference or union) of MANY tool solids " +
+    "against a base, sequentially, in a single call — e.g. drill 9 bores " +
+    "with one tool call instead of 9. Every step is ambient-certified; the " +
+    "batch HALTS at the first step that leaves the base unsound and reports " +
+    "which tool did it. The base keeps its uuid; consumed tools are gone.",
+  {
+    op: z.enum(["union", "difference"]),
+    base: z.string().uuid().describe("object_uuid of the base solid"),
+    tools: z
+      .array(z.string().uuid())
+      .min(1)
+      .max(64)
+      .describe("object_uuids applied in order; all consumed"),
+  },
+  async ({ op, base, tools }) => {
+    try {
+      let lastId: number | null = null;
+      for (let i = 0; i < tools.length; i++) {
+        await api("POST", "/api/geometry/boolean", {
+          operation: op,
+          object_a: base,
+          object_b: tools[i],
+        });
+        lastId = await newestPartId();
+        const p = await perceive(lastId);
+        if (p && p.sound !== true) {
+          return ok({
+            object_uuid: base,
+            part_id: lastId,
+            completed: i + 1,
+            of: tools.length,
+            halted: `step ${i + 1} (${tools[i]}) left the base UNSOUND — ${compactVerdict(p)}`,
+          });
+        }
+      }
+      const p = await perceive(lastId);
+      return ok({
+        object_uuid: base,
+        part_id: lastId,
+        completed: tools.length,
+        of: tools.length,
+        placement: lastId !== null ? await placement(lastId) : null,
+        perception: p ? compactVerdict(p) : null,
+      });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "drill_pattern",
+  "ONE-CALL hole pattern: drill `count` bores of radius `hole_r` on a ring " +
+    "of radius `ring_r` (centered at cx,cy on `plane`) through a target " +
+    "solid — creates the bore cylinders AND subtracts them, all in a single " +
+    "call (9 holes = 1 call, not 18). Bores run along the plane normal " +
+    "starting `z_offset` below the plane for `depth` — size them to " +
+    "OVERSHOOT both faces of the target. REFUSES overlapping adjacent holes " +
+    "up front (2·ring_r·sin(π/count) must exceed 2·hole_r): that regime " +
+    "drives a known open boolean bug. Every drill is ambient-certified and " +
+    "the batch halts on the first unsound step. Replaces the retired " +
+    "create_plate_with_holes.",
+  {
+    object: z.string().uuid().describe("object_uuid of the solid to drill"),
+    plane: PlaneSchema.default("xy"),
+    cx: z.number().default(0).describe("pattern center (plane coords)"),
+    cy: z.number().default(0),
+    count: z.number().int().min(1).max(64),
+    ring_r: z.number().positive().describe("ring radius the hole centers sit on"),
+    hole_r: z.number().positive(),
+    depth: z
+      .number()
+      .positive()
+      .describe("bore length along the plane normal (overshoot the part!)"),
+    z_offset: z
+      .number()
+      .default(-1)
+      .describe("bore start along the normal (default −1 = 1mm under the plane)"),
+    start_angle_deg: z.number().default(0),
+  },
+  async ({
+    object,
+    plane,
+    cx,
+    cy,
+    count,
+    ring_r,
+    hole_r,
+    depth,
+    z_offset,
+    start_angle_deg,
+  }) => {
+    try {
+      // The same guard the kernel's exploration recipe uses: adjacent holes
+      // whose chord spacing is below 2·hole_r intersect each other, and the
+      // resulting cyl∩cyl saddle boolean is a known open kernel bug — refuse
+      // loudly instead of hanging.
+      if (count >= 2) {
+        const spacing = 2 * ring_r * Math.sin(Math.PI / count);
+        if (spacing <= 2 * hole_r) {
+          return fail(
+            new Error(
+              `REFUSED: ${count} holes of r=${hole_r} on a ring of r=${ring_r} ` +
+                `are spaced ${spacing.toFixed(3)} < 2·r=${(2 * hole_r).toFixed(3)} ` +
+                `(adjacent holes intersect). Reduce count/hole_r or grow ring_r.`,
+            ),
+          );
+        }
+      }
+      const p = resolvePlane(plane);
+      const n = unit3(cross3(p.u, p.v));
+      const bores: string[] = [];
+      for (let k = 0; k < count; k++) {
+        const th = ((start_angle_deg + (360 * k) / count) * Math.PI) / 180;
+        const hx = cx + ring_r * Math.cos(th);
+        const hy = cy + ring_r * Math.sin(th);
+        const center = [0, 1, 2].map(
+          (i) => p.o[i] + hx * p.u[i] + hy * p.v[i] + z_offset * n[i],
+        );
+        const r = await api("POST", "/api/geometry/cylinder", {
+          center,
+          axis: n,
+          radius: hole_r,
+          height: depth,
+          name: `bore ${k + 1}/${count}`,
+        });
+        const uuid = r.object?.id;
+        if (!uuid) throw new Error(`bore ${k + 1}/${count}: no uuid returned`);
+        bores.push(uuid);
+      }
+      let lastId: number | null = null;
+      for (let k = 0; k < bores.length; k++) {
+        await api("POST", "/api/geometry/boolean", {
+          operation: "difference",
+          object_a: object,
+          object_b: bores[k],
+        });
+        lastId = await newestPartId();
+        const pv = await perceive(lastId);
+        if (pv && pv.sound !== true) {
+          return ok({
+            object_uuid: object,
+            part_id: lastId,
+            holes_completed: k + 1,
+            of: count,
+            halted: `hole ${k + 1} left the part UNSOUND — ${compactVerdict(pv)}`,
+          });
+        }
+      }
+      const pv = await perceive(lastId);
+      return ok({
+        object_uuid: object,
+        part_id: lastId,
+        holes: count,
+        placement: lastId !== null ? await placement(lastId) : null,
+        perception: pv ? compactVerdict(pv) : null,
+      });
     } catch (e) {
       return fail(e);
     }
