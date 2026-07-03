@@ -273,61 +273,70 @@ fn emit_view_polylines(
 
 /// Emit view-label and dimension-text TEXT entities from the layout model.
 ///
-/// Reads [`SheetItemKind::ViewLabel`] and [`SheetItemKind::DimensionText`]
-/// items from [`compute_layout`] and converts their SVG-space bboxes to DXF
-/// y-up coordinates before calling [`add_text`]. This is the single
-/// authoritative placement path for annotation text; the SVG renderer uses
-/// the same layout items.
+/// View labels come from the layout's [`SheetItemKind::ViewLabel`] items
+/// (SVG anchor = `bbox.x0`, baseline = `bbox.y1`). Dimension text comes
+/// directly from `SheetLayout.dimensions` — each [`PlacedDimension`] carries
+/// the exact `text_anchor` and `text_rot_deg` the SVG renderer inks, so the
+/// DXF mirrors the SVG for BOTH horizontal and rotated (vertical) callouts.
+/// This is the single authoritative placement path for annotation text.
 ///
-/// **DXF y-up conversion:** the layout's `bbox.y1` is the text baseline in
-/// SVG (+y down) coordinates. In DXF (+y up): `y_dxf = sheet_h − bbox.y1`.
-/// The x coordinate (`bbox.x0`) is unchanged.
+/// **DXF y-up conversion:** `y_dxf = sheet_h − y_svg` for positions.
+/// **Rotation conversion:** SVG's y-down frame negates angles relative to
+/// DXF's y-up frame, so `rot_dxf = −text_rot_deg`. The SVG's vertical dim
+/// text (`rotate(-90 …)`, reading bottom-to-top) becomes +90° in the DXF —
+/// still reading bottom-to-top on the printed sheet.
+///
+/// [`PlacedDimension`]: super::layout::PlacedDimension
 fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64) {
     let layout = compute_layout(drawing);
+
+    // ── View labels ─────────────────────────────────────────────────────
     for item in &layout.items {
-        match item.kind {
-            SheetItemKind::ViewLabel => {
-                let text = item.text.as_deref().unwrap_or("");
-                if text.is_empty() {
-                    continue;
-                }
-                // SVG text-anchor is bbox.x0; SVG baseline is bbox.y1 (y-down).
-                let x = item.bbox.x0;
-                let y = sheet_h - item.bbox.y1;
-                add_text(
-                    dxf,
-                    LAYER_VIEW_LABELS,
-                    x,
-                    y,
-                    3.6, // VIEW_LABEL_FONT_MM — matches the SVG stylesheet
-                    text,
-                    HorizontalTextJustification::Left,
-                );
-            }
-            SheetItemKind::DimensionText => {
-                let text = item.text.as_deref().unwrap_or("");
-                if text.is_empty() {
-                    continue;
-                }
-                // bbox.x0 is the left edge of the centred text span.
-                // Use the horizontal centre as the text anchor to match
-                // the SVG `text-anchor: middle` convention for dim labels.
-                let cx = 0.5 * (item.bbox.x0 + item.bbox.x1);
-                // bbox.y0 is the top of the glyph (ascender), y1 is the baseline.
-                let y = sheet_h - item.bbox.y1;
-                add_text(
-                    dxf,
-                    LAYER_DIMENSIONS,
-                    cx,
-                    y,
-                    3.1, // DIM_TEXT_FONT_MM — matches the SVG stylesheet
-                    text,
-                    HorizontalTextJustification::Center,
-                );
-            }
-            // Geometry and title-block items are handled by their own emitters.
-            SheetItemKind::ViewGeometry | SheetItemKind::TitleBlock => {}
+        if item.kind != SheetItemKind::ViewLabel {
+            continue;
         }
+        let text = item.text.as_deref().unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        // SVG text-anchor is bbox.x0; SVG baseline is bbox.y1 (y-down).
+        let x = item.bbox.x0;
+        let y = sheet_h - item.bbox.y1;
+        add_text(
+            dxf,
+            LAYER_VIEW_LABELS,
+            x,
+            y,
+            3.6, // VIEW_LABEL_FONT_MM — matches the SVG stylesheet
+            0.0, // view labels are always horizontal
+            text,
+            HorizontalTextJustification::Left,
+        );
+    }
+
+    // ── Dimension callout text ──────────────────────────────────────────
+    // Emitted from PlacedDimension (anchor + rotation), NOT from the
+    // DimensionText items' bboxes: a rotated label's bbox midpoint is NOT
+    // its anchor, and the bbox carries no orientation. The SVG's dim_text
+    // inks `x=anchor, y=anchor, rotate(text_rot_deg about anchor)` — the
+    // DXF mirrors that exactly with the y-flip / angle negation above.
+    for pd in &layout.dimensions {
+        if pd.label.is_empty() {
+            continue;
+        }
+        let x = pd.text_anchor[0];
+        let y = sheet_h - pd.text_anchor[1];
+        let rotation_deg = -pd.text_rot_deg;
+        add_text(
+            dxf,
+            LAYER_DIMENSIONS,
+            x,
+            y,
+            3.1, // DIM_TEXT_FONT_MM — matches the SVG stylesheet
+            rotation_deg,
+            &pd.label,
+            HorizontalTextJustification::Center,
+        );
     }
 }
 
@@ -374,6 +383,7 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
         mid_x + mid_w * 0.5,
         title_top + (tb_h - title_h) * 0.50,
         6.5,
+        0.0,
         &drawing.name,
         HorizontalTextJustification::Center,
     );
@@ -384,6 +394,7 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
         mid_x + 2.0,
         y1 - 3.6,
         2.4,
+        0.0,
         "TITLE",
         HorizontalTextJustification::Left,
     );
@@ -411,6 +422,7 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
             cx + 1.8,
             y0 + id_h - 2.8,
             2.4,
+            0.0,
             label,
             HorizontalTextJustification::Left,
         );
@@ -420,6 +432,7 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
             cx + 1.8,
             y0 + id_h * 0.30,
             3.6,
+            0.0,
             value,
             HorizontalTextJustification::Left,
         );
@@ -435,6 +448,7 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
         right_x + 2.0,
         y1 - 3.6,
         2.4,
+        0.0,
         "DRAWING NO.",
         HorizontalTextJustification::Left,
     );
@@ -451,6 +465,7 @@ fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
         right_x + right_w * 0.5,
         dwg_top + (tb_h - dwg_h) * 0.45,
         5.4,
+        0.0,
         &drwg_no,
         HorizontalTextJustification::Center,
     );
@@ -497,6 +512,7 @@ fn emit_grid_cell(dxf: &mut DxfDrawing, x: f64, y: f64, h: f64, label: &str, val
         x + 1.8,
         y + h - 2.8,
         2.4,
+        0.0,
         label,
         HorizontalTextJustification::Left,
     );
@@ -506,6 +522,7 @@ fn emit_grid_cell(dxf: &mut DxfDrawing, x: f64, y: f64, h: f64, label: &str, val
         x + 1.8,
         y + h * 0.30,
         3.6,
+        0.0,
         value,
         HorizontalTextJustification::Left,
     );
@@ -524,6 +541,7 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, sheet: &SheetSize) {
         x,
         y0,
         2.4,
+        0.0,
         "GENERAL TOLERANCES: LINEAR \u{00B1}0.1 MM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m.",
         HorizontalTextJustification::Left,
     );
@@ -533,6 +551,7 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, sheet: &SheetSize) {
         x,
         y1,
         2.4,
+        0.0,
         "ALL DIMENSIONS IN MILLIMETRES UNLESS OTHERWISE STATED.",
         HorizontalTextJustification::Left,
     );
@@ -542,6 +561,7 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, sheet: &SheetSize) {
         x,
         y2,
         2.4,
+        0.0,
         "THIRD-ANGLE PROJECTION.",
         HorizontalTextJustification::Left,
     );
@@ -569,18 +589,26 @@ fn add_line(dxf: &mut DxfDrawing, layer: &str, x0: f64, y0: f64, x1: f64, y1: f6
     dxf.add_entity(ent);
 }
 
+/// Add a TEXT entity. `rotation_deg` is the DXF rotation (group code 50):
+/// degrees, counterclockwise, in DXF's +Y-up model space. Pass 0.0 for
+/// ordinary horizontal text. A vertical dimension label reading
+/// bottom-to-top is +90 in this frame (the SVG equivalent is
+/// `rotate(-90 …)` because SVG's y-down frame negates angles).
+#[allow(clippy::too_many_arguments)]
 fn add_text(
     dxf: &mut DxfDrawing,
     layer: &str,
     x: f64,
     y: f64,
     height: f64,
+    rotation_deg: f64,
     value: &str,
     justify: HorizontalTextJustification,
 ) {
     let mut text = Text::default();
     text.value = value.to_string();
     text.text_height = height;
+    text.rotation = rotation_deg;
     text.horizontal_text_justification = justify;
     // Place the text. The DXF spec uses `location` for left-justified
     // text and the "alignment point" `second_alignment_point` for
@@ -621,6 +649,72 @@ mod tests {
     use super::*;
     use crate::drawing::layout::{compute_layout, SheetItemKind};
     use crate::drawing::types::{Drawing, SheetSize};
+
+    /// A parsed DXF TEXT entity: position, rotation, and value.
+    #[derive(Debug)]
+    struct ParsedText {
+        x: f64,
+        y: f64,
+        rotation: f64,
+        value: String,
+    }
+
+    /// Parse DXF TEXT entities into `ParsedText` records.
+    /// DXF group codes: 10=x, 20=y, 50=rotation (degrees, CCW, y-up), 1=value.
+    /// Each value follows immediately after its group code line.
+    fn parse_text_entities(dxf: &str) -> Vec<ParsedText> {
+        let mut result = Vec::new();
+        let lines: Vec<&str> = dxf.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let code = lines[i].trim();
+            if code == "TEXT" {
+                // Found a TEXT entity — scan forward for group codes 10, 20, 50, 1.
+                let mut x = 0.0_f64;
+                let mut y = 0.0_f64;
+                let mut rotation = 0.0_f64;
+                let mut val = String::new();
+                let mut j = i + 1;
+                // Scan up to 60 lines to collect the entity's fields.
+                while j < lines.len() && j < i + 60 {
+                    let gc = lines[j].trim();
+                    if let Some(next) = lines.get(j + 1) {
+                        match gc {
+                            "10" => {
+                                x = next.trim().parse().unwrap_or(0.0);
+                            }
+                            "20" => {
+                                y = next.trim().parse().unwrap_or(0.0);
+                            }
+                            "50" => {
+                                rotation = next.trim().parse().unwrap_or(0.0);
+                            }
+                            "1" => {
+                                val = next.trim().to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Stop at next entity marker (a line containing just "0"
+                    // followed by an entity/section keyword).
+                    if gc == "0" && j > i {
+                        break;
+                    }
+                    j += 2;
+                }
+                if !val.is_empty() {
+                    result.push(ParsedText {
+                        x,
+                        y,
+                        rotation,
+                        value: val,
+                    });
+                }
+            }
+            i += 1;
+        }
+        result
+    }
 
     /// Smoke test: an empty drawing produces a DXF that starts with
     /// the AutoCAD section marker (`0\nSECTION`). DXF is text with a
@@ -741,55 +835,6 @@ mod tests {
         }
 
         let all_texts = text_values(&dxf_text);
-
-        // Parse DXF TEXT entities into (x, y, value) triples.
-        // DXF group codes: 10=x, 20=y, 1=text value. Each follows immediately
-        // after the group code line. We extract all triples in order.
-        fn parse_text_entities(dxf: &str) -> Vec<(f64, f64, String)> {
-            let mut result = Vec::new();
-            let lines: Vec<&str> = dxf.lines().collect();
-            let mut i = 0;
-            while i < lines.len() {
-                let code = lines[i].trim();
-                if code == "TEXT" {
-                    // Found a TEXT entity — scan forward for group codes 10, 20, 1.
-                    let mut x = 0.0_f64;
-                    let mut y = 0.0_f64;
-                    let mut val = String::new();
-                    let mut j = i + 1;
-                    // Scan up to 60 lines to collect the entity's fields.
-                    while j < lines.len() && j < i + 60 {
-                        let gc = lines[j].trim();
-                        if let Some(next) = lines.get(j + 1) {
-                            match gc {
-                                "10" => {
-                                    x = next.trim().parse().unwrap_or(0.0);
-                                }
-                                "20" => {
-                                    y = next.trim().parse().unwrap_or(0.0);
-                                }
-                                "1" => {
-                                    val = next.trim().to_string();
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Stop at next entity marker (a line containing just "0"
-                        // followed by an entity/section keyword).
-                        if gc == "0" && j > i {
-                            break;
-                        }
-                        j += 2;
-                    }
-                    if !val.is_empty() {
-                        result.push((x, y, val));
-                    }
-                }
-                i += 1;
-            }
-            result
-        }
-
         let text_entities = parse_text_entities(&dxf_text);
 
         for item in layout
@@ -808,13 +853,128 @@ mod tests {
             let x_expected = item.bbox.x0;
             // y_dxf = sheet_h − bbox.y1  (SVG baseline → DXF y-up)
             let y_expected = sheet_h - item.bbox.y1;
-            let found = text_entities.iter().find(|(x, y, v)| {
-                v.as_str() == label && (x - x_expected).abs() < 0.5 && (y - y_expected).abs() < 0.5
+            let found = text_entities.iter().find(|t| {
+                t.value == label && (t.x - x_expected).abs() < 0.5 && (t.y - y_expected).abs() < 0.5
             });
             assert!(
                 found.is_some(),
                 "label '{label}' TEXT entity not found at x≈{x_expected:.2} y≈{y_expected:.2} \
                  (DXF y-up coords); entities: {text_entities:?}"
+            );
+        }
+    }
+
+    /// Vertical dimension callouts must carry their rotation into the DXF.
+    ///
+    /// The SVG inks a vertical dim as `<text transform="rotate(-90 ax ay)">`
+    /// at the PlacedDimension's `text_anchor` — text reading bottom-to-top.
+    /// The DXF mirror must emit the TEXT at the same anchor (y-flipped:
+    /// `y_dxf = sheet_h − ay`) with rotation group code 50 = +90°:
+    /// SVG's y-down frame negates angles relative to DXF's y-up frame,
+    /// so `rot_dxf = −text_rot_deg` (−(−90) = +90, still bottom-to-top).
+    ///
+    /// RED gate: fails while the DXF emits dim text from bbox midpoints
+    /// with no rotation.
+    #[test]
+    fn vertical_dimension_text_carries_rotation_and_anchor() {
+        use crate::drawing::dimensioning::Dimension2d;
+        use crate::drawing::types::{
+            Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
+        };
+        let mut drawing = Drawing::new("VertDim", SheetSize::A3);
+        let sheet_h = drawing.sheet_size.height();
+
+        // One FRONT view with a horizontal AND a vertical dimension —
+        // the vertical one (dy > dx) is placed rotated (text_rot_deg = -90).
+        drawing.views.push(ProjectedView {
+            id: ProjectedViewId::new(),
+            name: "FRONT".to_string(),
+            projection: ProjectionType::Front,
+            source: ViewSource::Part {
+                part_id: uuid::Uuid::nil(),
+                solid_id: 0,
+            },
+            position_mm: [100.0, 120.0],
+            scale: 1.0,
+            polylines: vec![Polyline2d::from_points(vec![
+                [0.0, 0.0],
+                [40.0, 0.0],
+                [40.0, 30.0],
+                [0.0, 30.0],
+                [0.0, 0.0],
+            ])],
+            extent: ViewExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 40.0,
+                max_y: 30.0,
+            },
+            dimensions: vec![
+                Dimension2d {
+                    id: "w".to_string(),
+                    kind: "length".to_string(),
+                    value: 40.0,
+                    unit: "mm".to_string(),
+                    label: "40.00".to_string(),
+                    a: [0.0, 0.0],
+                    b: [40.0, 0.0],
+                    entities: Vec::new(),
+                    axis3: None,
+                    dir3: None,
+                },
+                Dimension2d {
+                    id: "h".to_string(),
+                    kind: "length".to_string(),
+                    value: 30.0,
+                    unit: "mm".to_string(),
+                    label: "30.00".to_string(),
+                    a: [0.0, 0.0],
+                    b: [0.0, 30.0],
+                    entities: Vec::new(),
+                    axis3: None,
+                    dir3: None,
+                },
+            ],
+            centerlines: Vec::new(),
+            hidden_polylines: Vec::new(),
+            circles: Vec::new(),
+            hidden_circles: Vec::new(),
+        });
+
+        let layout = compute_layout(&drawing);
+        let dxf_bytes = render_drawing_dxf(&drawing).expect("dxf render");
+        let dxf_text = String::from_utf8_lossy(&dxf_bytes);
+        let text_entities = parse_text_entities(&dxf_text);
+
+        // The layout must contain at least one vertical (rotated) dimension —
+        // otherwise this test proves nothing.
+        let verticals: Vec<_> = layout
+            .dimensions
+            .iter()
+            .filter(|pd| (pd.text_rot_deg - (-90.0)).abs() < 1e-9)
+            .collect();
+        assert!(
+            !verticals.is_empty(),
+            "fixture must produce a vertical dimension (text_rot_deg = -90)"
+        );
+
+        // Every placed dimension's DXF TEXT must be at the text_anchor
+        // (y-flipped) with rot_dxf = -text_rot_deg.
+        for pd in &layout.dimensions {
+            let x_expected = pd.text_anchor[0];
+            let y_expected = sheet_h - pd.text_anchor[1];
+            let rot_expected = -pd.text_rot_deg; // SVG y-down → DXF y-up negates angles
+            let found = text_entities.iter().find(|t| {
+                t.value == pd.label
+                    && (t.x - x_expected).abs() < 0.05
+                    && (t.y - y_expected).abs() < 0.05
+                    && (t.rotation - rot_expected).abs() < 0.05
+            });
+            assert!(
+                found.is_some(),
+                "dim '{}' TEXT entity not found at x≈{x_expected:.2} y≈{y_expected:.2} \
+                 rot≈{rot_expected:.1} (DXF y-up); entities: {text_entities:?}",
+                pd.label
             );
         }
     }
