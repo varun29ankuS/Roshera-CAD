@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#status"><img src="https://img.shields.io/badge/status-work%20in%20progress-yellow" alt="Status" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-dual-blue" alt="License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue" alt="License" /></a>
 </p>
 
 ---
@@ -240,6 +240,16 @@ The Roshera mark is a Boolean union of a rectangle (2x × 3.236x) and a circle (
 
 ## License
 
-Dual licensed. Free for non-commercial use (research, education, personal projects). Commercial use requires a paid license.
+**[Functional Source License 1.1 (FSL-1.1-Apache-2.0)](LICENSE)** — Fair Source.
 
-See [LICENSE](LICENSE) for details. Contact 29.varuns@gmail.com for commercial licensing.
+You may use, copy, modify, and redistribute Roshera for any purpose — including
+commercial use — **except** offering a product or service that competes with it
+(e.g. a competing geometry kernel, CAD engine, or hosted service built on this
+code). Internal use, education, research, and building non-competing products
+on top of Roshera are all permitted.
+
+**Every release automatically converts to [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+two years after publication** — today's code is tomorrow's open source.
+
+For licensing beyond the grant (OEM/embedding, competing-use exceptions):
+29.varuns@gmail.com.

@@ -3,7 +3,7 @@ name = "shared-types"
 version = "0.1.0"
 edition = "2021"
 description = "Core data structures for Roshera CAD"
-license = "Apache-2.0"
+license = "FSL-1.1-Apache-2.0"
 
 [dependencies]
 serde        = { workspace = true }

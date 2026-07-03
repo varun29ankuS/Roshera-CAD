@@ -3,7 +3,7 @@ name = "geometry-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Geometry generation and operations for Roshera CAD"
-license = "Apache-2.0"
+license = "FSL-1.1-Apache-2.0"
 
 [dependencies]
 num-traits = "0.2"

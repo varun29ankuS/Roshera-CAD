@@ -3,7 +3,7 @@ name = "ros-format"
 version = "0.1.0"
 edition = "2021"
 description = "Roshera .ros v3.1 file format core — header, chunks, crypto, audit. Geometry-free; suitable for bridge/SDK consumers."
-license = "Apache-2.0"
+license = "FSL-1.1-Apache-2.0"
 
 [dependencies]
 serde = { workspace = true }

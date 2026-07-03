@@ -2,6 +2,7 @@
 name = "timeline-engine"
 version = "0.1.0"
 edition = "2021"
+license = "FSL-1.1-Apache-2.0"
 authors = ["Roshera Team"]
 description = "Event-sourced timeline engine for CAD history management"
 

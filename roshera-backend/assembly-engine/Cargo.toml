@@ -3,7 +3,7 @@ name = "assembly-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Kinematic assembly module for Roshera CAD — mates, grounding, clearance (Parry-backed)"
-license = "Apache-2.0"
+license = "FSL-1.1-Apache-2.0"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
