@@ -196,7 +196,7 @@ pub struct SheetLayout {
 /// view has no polylines yet.
 ///
 /// This is the single canonical implementation used by both `compute_layout`
-/// and `compute_dim_text_items`. The earlier `view_sheet_bbox_arr` helper
+/// and `place_dimensions`. The earlier `view_sheet_bbox_arr` helper
 /// (which duplicated this logic returning `[f64;4]` instead of `Rect2`) has
 /// been removed; callers that need the array form destructure `Rect2` directly.
 pub(crate) fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
@@ -523,8 +523,8 @@ pub(crate) fn place_dimensions(
 
         if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
             // Leader-free point/angle callout: text at (a[0]+2, a[1]-2).
-            // The dim-text element in svg.rs is start-anchored (no -c class)
-            // so text_anchor matches the x/y attrs directly.
+            // Inked via dim_text(), which always emits the CENTRED
+            // `dim-text-c` class — the bbox below is centred to match.
             let ax = a[0] + 2.0;
             let ay = a[1] - 2.0;
             result.push(PlacedDimension {
