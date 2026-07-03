@@ -1005,8 +1005,100 @@ server.tool(
               } advisory issue(s))`
             : `LAYOUT ISSUES — ${q.issues?.length ?? 0} finding(s); see quality.issues`
           : "drawing created (no quality report)",
-        note: "Open in the Drawing workspace, or GET /api/drawings/<id>/svg|pdf|dxf.",
+        note: "Open in the Drawing workspace, or fetch_drawing to save PDF/DXF/SVG to disk.",
       });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+/** Save raw bytes fetched from a backend path to an absolute file on disk. */
+async function saveBinary(urlPath: string, savePath: string): Promise<number> {
+  const res = await fetch(`${BASE}${urlPath}`);
+  if (!res.ok) {
+    throw new Error(`GET ${urlPath} → ${res.status}`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  const { writeFile, mkdir } = await import("node:fs/promises");
+  const { dirname } = await import("node:path");
+  await mkdir(dirname(savePath), { recursive: true });
+  await writeFile(savePath, buf);
+  return buf.length;
+}
+
+/** Default save directory: ~/Desktop (falls back to the home dir). */
+async function defaultSaveDir(): Promise<string> {
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+  return join(homedir(), "Desktop");
+}
+
+server.tool(
+  "export_part",
+  "EXPORT one or more parts to a real CAD file on disk — STEP (AP242, mm), " +
+    "STL, or OBJ — and return the absolute file path. This is the " +
+    "production hand-off: the STEP opens in FreeCAD/SolidWorks/slicers. " +
+    "`objects` are object_uuids (empty = every solid in the scene). Saves " +
+    "to `save_path` if given, else ~/Desktop/<file_name>.",
+  {
+    format: z.enum(["STEP", "STL", "OBJ"]).default("STEP"),
+    objects: z.array(z.string().uuid()).default([]),
+    file_name: z
+      .string()
+      .regex(/^[\w.-]+$/)
+      .describe("file name without directory, e.g. flange_2in.step"),
+    save_path: z
+      .string()
+      .optional()
+      .describe("absolute destination path; overrides file_name/Desktop"),
+    quality: z.enum(["Low", "Medium", "High"]).default("High"),
+  },
+  async ({ format, objects, file_name, save_path, quality }) => {
+    try {
+      const r = await api("POST", "/api/export", { format, objects, quality });
+      if (!r?.download_url) {
+        throw new Error(`export returned no download_url: ${JSON.stringify(r)}`);
+      }
+      const { join } = await import("node:path");
+      const dest = save_path ?? join(await defaultSaveDir(), file_name);
+      const bytes = await saveBinary(r.download_url, dest);
+      return ok({
+        saved_to: dest,
+        bytes,
+        format,
+        parts_exported: objects.length === 0 ? "all" : objects.length,
+        export_time_ms: r.export_time_ms ?? null,
+      });
+    } catch (e) {
+      return fail(e);
+    }
+  },
+);
+
+server.tool(
+  "fetch_drawing",
+  "SAVE a drawing produced by make_drawing to disk as PDF, DXF, or SVG and " +
+    "return the absolute file path — the shop-ready sheet without leaving " +
+    "the conversation.",
+  {
+    drawing_id: z.string().uuid().describe("drawing_id returned by make_drawing"),
+    format: z.enum(["pdf", "dxf", "svg"]).default("pdf"),
+    file_name: z
+      .string()
+      .regex(/^[\w.-]+$/)
+      .describe("file name without directory, e.g. flange_drawing.pdf"),
+    save_path: z
+      .string()
+      .optional()
+      .describe("absolute destination path; overrides file_name/Desktop"),
+  },
+  async ({ drawing_id, format, file_name, save_path }) => {
+    try {
+      const { join } = await import("node:path");
+      const dest = save_path ?? join(await defaultSaveDir(), file_name);
+      const bytes = await saveBinary(`/api/drawings/${drawing_id}/${format}`, dest);
+      return ok({ saved_to: dest, bytes, format });
     } catch (e) {
       return fail(e);
     }
@@ -2163,10 +2255,13 @@ server.tool(
     try {
       let lastId: number | null = null;
       for (let i = 0; i < tools.length; i++) {
+        // fast:true skips the endpoint's own full cert — the perceive() below
+        // is the single certification gate per step (was 2× cert work/step).
         await api("POST", "/api/geometry/boolean", {
           operation: op,
           object_a: base,
           object_b: tools[i],
+          fast: true,
         });
         lastId = await newestPartId();
         const p = await perceive(lastId);
@@ -2264,12 +2359,15 @@ server.tool(
         const center = [0, 1, 2].map(
           (i) => p.o[i] + hx * p.u[i] + hy * p.v[i] + z_offset * n[i],
         );
+        // fast:true — bore blanks are analytic primitives; the difference
+        // step's perceive() certifies the merged result that actually matters.
         const r = await api("POST", "/api/geometry/cylinder", {
           center,
           axis: n,
           radius: hole_r,
           height: depth,
           name: `bore ${k + 1}/${count}`,
+          fast: true,
         });
         const uuid = r.object?.id;
         if (!uuid) throw new Error(`bore ${k + 1}/${count}: no uuid returned`);
@@ -2277,10 +2375,12 @@ server.tool(
       }
       let lastId: number | null = null;
       for (let k = 0; k < bores.length; k++) {
+        // fast:true — perceive() below is the single per-hole cert gate.
         await api("POST", "/api/geometry/boolean", {
           operation: "difference",
           object_a: object,
           object_b: bores[k],
+          fast: true,
         });
         lastId = await newestPartId();
         const pv = await perceive(lastId);
