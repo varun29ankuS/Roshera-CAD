@@ -66,6 +66,30 @@ fn dim(label: &str, a: [f64; 2], b: [f64; 2]) -> Dimension2d {
     }
 }
 
+/// Dimension carrying named B-Rep entity ids — used to exercise the
+/// cross-view redundancy detector, which ignores whole-part extents
+/// (empty entities) and only fires on named feature measurements.
+fn dim_with_entities(
+    label: &str,
+    a: [f64; 2],
+    b: [f64; 2],
+    kind: &str,
+    entities: Vec<u32>,
+) -> Dimension2d {
+    Dimension2d {
+        id: label.to_string(),
+        kind: kind.to_string(),
+        value: 0.0,
+        unit: "mm".to_string(),
+        label: label.to_string(),
+        a,
+        b,
+        entities,
+        axis3: None,
+        dir3: None,
+    }
+}
+
 /// A clean, standards-conformant third-angle layout: Top above Front,
 /// Right beside Front, dimensions offset clear of every silhouette.
 fn clean_drawing() -> Drawing {
@@ -322,6 +346,143 @@ fn six_hole_plate_sheet_is_clean() {
             "view label '{name}' inked exactly once"
         );
     }
+}
+
+/// DETECTOR PROOF — `RedundantDimension`, cross-view mode (permanent invariant).
+///
+/// Two views carry the SAME B-Rep feature dimension (same non-empty entity ids,
+/// same kind, same span label). The cross-view detector in
+/// `check_redundant_dimensions` must fire `RedundantDimension` with
+/// `Severity::Error`, failing the report.
+///
+/// Mutation proof: gut `check_redundant_dimensions` (return immediately without
+/// pushing issues) → this test turns RED because `passed` stays `true` and
+/// `has(RedundantDimension)` returns `false`.
+#[test]
+fn redundant_dimension_cross_view_flagged() {
+    // Two views of the same part. Both call out the same bore feature
+    // (entities [1, 2], kind "diameter"). The dedup pipeline removes one
+    // before drawing generation, but a hand-built Drawing bypasses dedup —
+    // exactly the class of sheet the detector must catch.
+    let mut d = Drawing::new("RedundantCrossView", SheetSize::A3);
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [80.0, 150.0],
+        100.0,
+        80.0,
+        vec![dim_with_entities(
+            "Ø10.00",
+            [20.0, 40.0],
+            [20.0, 40.0],
+            "diameter",
+            vec![1, 2],
+        )],
+    ));
+    d.add_view(rect_view(
+        "TOP",
+        ProjectionType::Top,
+        [80.0, 260.0],
+        100.0,
+        80.0,
+        vec![dim_with_entities(
+            "Ø10.00",
+            [20.0, 40.0],
+            [20.0, 40.0],
+            "diameter",
+            vec![1, 2],
+        )],
+    ));
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::RedundantDimension),
+        "cross-view entity duplicate must be flagged; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "RedundantDimension is Severity::Error");
+}
+
+/// DETECTOR PROOF — `RedundantDimension`, same-view same-interval mode
+/// (permanent invariant).
+///
+/// One view contains two dimensions (different labels, same orientation) whose
+/// projected endpoints coincide within 0.5 mm in sheet space. The same-view
+/// detector in `check_redundant_dimensions` must fire `RedundantDimension`.
+///
+/// Mutation proof: gut `check_redundant_dimensions` → this test turns RED.
+#[test]
+fn redundant_dimension_same_view_same_interval_flagged() {
+    // One FRONT view at position [100, 100], scale 1. Sheet height for A3 = 297.
+    // Dims with identical horizontal span: a=[5,−6]→b=[95,−6] in view-space.
+    // Both map to the same sheet x-interval (both are H-oriented, coincident lo/hi).
+    // The detector fires because both bracket the same interval (same lo, same hi
+    // within 0.5 mm).
+    let mut d = Drawing::new("RedundantSameView", SheetSize::A3);
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [100.0, 100.0],
+        100.0,
+        60.0,
+        vec![
+            dim("100.00a", [5.0, -6.0], [95.0, -6.0]),
+            dim("100.00b", [5.0, -6.0], [95.0, -6.0]),
+        ],
+    ));
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::RedundantDimension),
+        "same-view same-interval duplicate must be flagged; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "RedundantDimension is Severity::Error");
+}
+
+/// DETECTOR PROOF — `ViewLabelCollision` via label-on-neighbour-geometry
+/// (I-2 silent-success window, permanent invariant).
+///
+/// Construction: view A is a large rectangle that covers all four candidate
+/// label positions for view B. The label placer exhausts all slots (all
+/// collide with A's geometry), falls back to the least-overlap slot, and
+/// places B's label on top of A's geometry. The verifier must flag
+/// `ViewLabelCollision` (label bbox intersects a DIFFERENT view's ViewGeometry
+/// item) — no silent success.
+///
+/// Sheet: A3 (420×297 mm). View A: pos=[175,143], size=70×33. View B: pos=[200,150],
+/// size=20×20. B's geometry rect in sheet space: x∈[200,220], y∈[127,147].
+/// A's geometry rect in sheet space: x∈[175,245], y∈[121,154]. All four of B's
+/// candidate label slots land inside A's geometry rect, so the fallback fires and
+/// the residual overlap is non-zero.
+#[test]
+fn view_label_on_neighbour_geometry_flagged() {
+    let mut d = Drawing::new("LabelOnGeom", SheetSize::A3);
+    // View A: large rect whose sheet bbox covers all four candidate label
+    // positions for view B (see construction above).
+    d.add_view(rect_view(
+        "A",
+        ProjectionType::Front,
+        [175.0, 143.0],
+        70.0,
+        33.0,
+        vec![],
+    ));
+    // View B: small rect entirely surrounded by A in sheet space. Its label
+    // cannot escape A's geometry in any of the four candidate slots.
+    d.add_view(rect_view(
+        "B",
+        ProjectionType::Top,
+        [200.0, 150.0],
+        20.0,
+        20.0,
+        vec![],
+    ));
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::ViewLabelCollision),
+        "label forced onto neighbour geometry must be flagged; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "ViewLabelCollision is Severity::Error");
 }
 
 /// DETECTOR PROOF (permanent invariant): views so tightly packed that the

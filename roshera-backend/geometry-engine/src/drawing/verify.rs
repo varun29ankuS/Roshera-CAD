@@ -17,6 +17,14 @@
 //! reported collision corresponds 1:1 to what the renderer draws. A view
 //! point `(vx, vy)` maps to the sheet as
 //! `(pos.x + vx·scale, (sheet_h − pos.y) − vy·scale)`.
+//!
+//! # Declared-but-unwired invariant kinds
+//! The following [`DrawingIssueKind`] variants are declared but **never
+//! emitted** by any current check — they are reserved for future wiring
+//! under the verification-comprehensiveness campaign:
+//! - [`DrawingIssueKind::DimensionOnGeometry`]
+//! - [`DrawingIssueKind::DimensionLabelCollision`]
+//! - [`DrawingIssueKind::UndimensionedView`]
 
 use std::collections::HashMap;
 
@@ -280,10 +288,19 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     check_alignment(drawing, &layout, &mut issues);
 
     // ── ViewLabelCollision detection ─────────────────────────────────────
-    // Check every (ViewLabel, *) pair for overlap using the layout already
-    // computed above. At least one of the two items must be a ViewLabel —
-    // dim-text pairs fall under the existing DimensionLabelCollision kind.
-    let texts: Vec<&super::layout::SheetItem> = layout
+    // Two sub-checks, both using the layout already computed above:
+    //
+    // (a) ViewLabel × {ViewLabel | DimensionText}: at least one item must be
+    //     a ViewLabel — dim-text↔dim-text collision is currently unchecked;
+    //     DimensionLabelCollision is a declared-but-unwired kind (see module doc).
+    //
+    // (b) ViewLabel × ViewGeometry of a DIFFERENT view: a label legitimately
+    //     sits near its OWN view's geometry (placement avoids it, but same-view
+    //     pairing would false-positive on the fallback slots). Cross-view overlap
+    //     IS a placement failure — placement treats all geometry rects as
+    //     obstacles, so any such overlap indicates the fallback landed on a
+    //     neighbour's geometry.
+    let label_items: Vec<&super::layout::SheetItem> = layout
         .items
         .iter()
         .filter(|it| {
@@ -293,17 +310,48 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
             )
         })
         .collect();
-    for i in 0..texts.len() {
-        for j in (i + 1)..texts.len() {
-            let pair_has_label = texts[i].kind == SheetItemKind::ViewLabel
-                || texts[j].kind == SheetItemKind::ViewLabel;
-            if pair_has_label && texts[i].bbox.intersects(&texts[j].bbox, 0.2) {
+    for i in 0..label_items.len() {
+        for j in (i + 1)..label_items.len() {
+            let pair_has_label = label_items[i].kind == SheetItemKind::ViewLabel
+                || label_items[j].kind == SheetItemKind::ViewLabel;
+            if pair_has_label && label_items[i].bbox.intersects(&label_items[j].bbox, 0.2) {
                 issues.push(error(
                     DrawingIssueKind::ViewLabelCollision,
                     format!(
                         "text '{}' collides with '{}'",
-                        texts[i].text.as_deref().unwrap_or("?"),
-                        texts[j].text.as_deref().unwrap_or("?")
+                        label_items[i].text.as_deref().unwrap_or("?"),
+                        label_items[j].text.as_deref().unwrap_or("?")
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+    // (b) ViewLabel bbox intersecting a ViewGeometry item of a DIFFERENT view.
+    let view_labels: Vec<&super::layout::SheetItem> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::ViewLabel)
+        .collect();
+    let view_geoms: Vec<&super::layout::SheetItem> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::ViewGeometry)
+        .collect();
+    for lbl in &view_labels {
+        for geo in &view_geoms {
+            // Skip same-view pair: a label may legitimately sit near its own
+            // geometry (it is anchored to it), so same-view pairing would
+            // false-positive on the fallback slots.
+            if lbl.owner_view == geo.owner_view {
+                continue;
+            }
+            if lbl.bbox.intersects(&geo.bbox, 0.2) {
+                issues.push(error(
+                    DrawingIssueKind::ViewLabelCollision,
+                    format!(
+                        "label '{}' overlaps the geometry of another view",
+                        lbl.text.as_deref().unwrap_or("?"),
                     ),
                     None,
                 ));

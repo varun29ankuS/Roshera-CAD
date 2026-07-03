@@ -24,9 +24,6 @@ use super::types::{Drawing, ProjectedView};
 /// view's `scale(sx, -sx)` group, so the font is invariant to view scale.
 pub const VIEW_LABEL_FONT_MM: f64 = 3.6;
 
-/// Alias used by callers that predate the rename.
-pub const VIEW_LABEL_FONT_BASE_MM: f64 = VIEW_LABEL_FONT_MM;
-
 /// CSS font size of the `.dim-text` class (px == mm). Dimension text is
 /// emitted in sheet space so this is the actual ink height.
 pub const DIM_TEXT_FONT_MM: f64 = 3.1;
@@ -373,9 +370,9 @@ pub fn place_view_labels(drawing: &Drawing, placed: &[SheetItem]) -> Vec<SheetIt
 ///   constant `VIEW_LABEL_FONT_MM` font, anchored to the view's OWN geometry
 ///   rect, collision-resolved. The renderer inks these same items, so a
 ///   collision the renderer draws is structurally visible to the verifier.
-/// - `DimensionText` items: replicate the Lin-sort stacking logic from
-///   `svg.rs::render_dimensions` (STANDOFF/STACK/TGAP) to compute each
-///   label's anchor, then bbox via `text_bbox` with centred-x.
+/// - `DimensionText` items: the Lin-sort stacking logic (STANDOFF/STACK/TGAP)
+///   lives here, in `place_dimensions` — not in `svg.rs`. Each label's anchor
+///   is computed once here; both the renderer and the verifier consume it.
 /// - `TitleBlock` item from `svg::{frame_margins, title_block_size}`.
 pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     let w = drawing.sheet_size.width();
