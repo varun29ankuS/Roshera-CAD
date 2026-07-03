@@ -37,11 +37,6 @@ pub const DIM_TEXT_FONT_MM: f64 = 3.1;
 /// never under-detected).
 pub const GLYPH_ADVANCE_EM: f64 = 0.62;
 
-// Dimension stacking constants from svg.rs render_dimensions.
-const STANDOFF: f64 = 11.0; // first dim line clear of the silhouette
-const STACK: f64 = 8.0; // gap between successive parallel dim lines
-const TGAP: f64 = 1.4; // label sits TGAP above the dim line
-
 /// Gap between a view's geometry rect edge and its label baseline (mm).
 const LABEL_GAP: f64 = 2.0;
 
@@ -129,6 +124,57 @@ pub struct SheetItem {
     pub text: Option<String>,
 }
 
+// ── Dimension placement ────────────────────────────────────────────────────────
+
+/// Constants for dimension stacking (ISO 129 drafting practice).
+/// Moved here from `svg.rs::render_dimensions` so placement lives once.
+pub(crate) const STANDOFF: f64 = 11.0; // first dim line, clear of the silhouette
+pub(crate) const STACK: f64 = 8.0; // gap between successive parallel dim lines
+pub(crate) const GAP: f64 = 1.5; // extension-line gap from the part
+pub(crate) const EXT: f64 = 1.5; // extension-line overshoot past the dim line
+pub(crate) const AR_L: f64 = 2.6; // arrowhead length
+pub(crate) const AR_W: f64 = 0.85; // arrowhead half-width
+pub(crate) const TGAP: f64 = 1.4; // label sits TGAP above/beside the dim line
+
+/// Arrowhead specification: tip point and direction vector (unit, pointing
+/// AWAY from the tip — i.e. the shaft direction, not the stab direction).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ArrowSpec {
+    pub tip: [f64; 2],
+    /// Unit vector from the tip toward the base of the arrowhead.
+    pub dir: [f64; 2],
+}
+
+/// The fully-placed geometry of one dimension callout in sheet space.
+///
+/// Horizontal dimensions are stacked below the part; vertical to the left.
+/// Angle / point callouts are leader-free (empty `line`/`ext`/`arrows`
+/// encoded as `[[0.0; 2]; 2]` / `[[[0.0; 2]; 2]; 2]` / unit arrows at
+/// `text_anchor`) — the renderer skips drawing lines/arrows when they are
+/// degenerate (line start == end).
+///
+/// `text_anchor` matches the `x=` and `y=` attributes emitted by
+/// `svg::dim_text` for BOTH horizontal (rot=0) and rotated (rot=-90)
+/// variants, so the test needle `format!("x=\"{:.3}\" y=\"{:.3}\"", …)`
+/// is always exact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacedDimension {
+    /// The main dimension line segment: `[[x1,y1],[x2,y2]]`.
+    pub line: [[f64; 2]; 2],
+    /// Two extension line segments: `[[[x1,y1],[x2,y2]], [[x1,y1],[x2,y2]]]`.
+    pub ext: [[[f64; 2]; 2]; 2],
+    /// Two arrowhead specs (one per end of the dim line).
+    pub arrows: [ArrowSpec; 2],
+    /// Sheet-space anchor of the text label (matches `x=` / `y=` in SVG).
+    pub text_anchor: [f64; 2],
+    /// Rotation in degrees for the text (0 = horizontal, -90 = vertical).
+    pub text_rot_deg: f64,
+    /// The rendered string.
+    pub label: String,
+    /// Index into `drawing.views`.
+    pub owner_view: usize,
+}
+
 // ── Sheet layout ───────────────────────────────────────────────────────────────
 
 /// Complete layout model for one drawing: the sheet rect and every ink item.
@@ -137,6 +183,10 @@ pub struct SheetLayout {
     /// Sheet bounding box (always `0,0,w,h`).
     pub sheet: Rect2,
     pub items: Vec<SheetItem>,
+    /// Every placed dimension callout (geometry + text anchor).
+    /// The renderer inks these directly; the verifier checks text bboxes
+    /// derived from `text_anchor` — one model, no re-computation.
+    pub dimensions: Vec<PlacedDimension>,
 }
 
 // ── view_geometry_rect (canonical, single implementation) ──────────────────────
@@ -372,10 +422,43 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     let label_items = place_view_labels(drawing, &items);
     items.extend(label_items);
 
-    // ── DimensionText items ───────────────────────────────────────────────
+    // ── Placed dimensions + DimensionText items ───────────────────────
+    // `place_dimensions` is the single source of truth for callout
+    // geometry. DimensionText bboxes are derived from `PlacedDimension`
+    // anchors so the verifier sees exactly the same model the renderer
+    // inks — no independent recomputation.
+    let mut all_placed: Vec<PlacedDimension> = Vec::new();
     for (idx, view) in drawing.views.iter().enumerate() {
-        let dim_items = compute_dim_text_items(view, h, idx);
-        items.extend(dim_items);
+        let pds = place_dimensions(view, h, idx);
+        for pd in &pds {
+            let font = DIM_TEXT_FONT_MM;
+            let text_w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
+            let (bx0, by0, bx1, by1) = if pd.text_rot_deg.abs() < 1e-6 {
+                // Horizontal: centred text, baseline at text_anchor[1].
+                let cx = pd.text_anchor[0];
+                let cy = pd.text_anchor[1];
+                (cx - text_w * 0.5, cy - font, cx + text_w * 0.5, cy)
+            } else {
+                // Vertical: rotated -90° about text_anchor.
+                // rotate(-90) maps the centred text span along ±y:
+                // x ∈ [ax − font, ax], y ∈ [ay − w/2, ay + w/2].
+                let ax = pd.text_anchor[0];
+                let ay = pd.text_anchor[1];
+                (ax - font, ay - text_w * 0.5, ax, ay + text_w * 0.5)
+            };
+            items.push(SheetItem {
+                kind: SheetItemKind::DimensionText,
+                bbox: Rect2 {
+                    x0: bx0,
+                    y0: by0,
+                    x1: bx1,
+                    y1: by1,
+                },
+                owner_view: Some(idx),
+                text: Some(pd.label.clone()),
+            });
+        }
+        all_placed.extend(pds);
     }
 
     SheetLayout {
@@ -386,10 +469,11 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
             y1: h,
         },
         items,
+        dimensions: all_placed,
     }
 }
 
-// ── Dimension text layout helper ───────────────────────────────────────────────
+// ── Dimension placement ────────────────────────────────────────────────────────
 
 /// Map a view-space point to SVG sheet coordinates.
 fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
@@ -399,11 +483,23 @@ fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
     ]
 }
 
-/// Replicate the Lin-sort stacking logic from `svg.rs::render_dimensions` to
-/// produce bboxes for each dim-text label. Text is centred on the dim line
-/// anchor (`dim_text` in svg.rs uses `text-anchor: middle`).
-fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> Vec<SheetItem> {
-    // Use view_geometry_rect (the canonical impl) and destructure its fields.
+/// Place all dimension callouts for one view in sheet space.
+///
+/// This is the **single implementation** of the Lin-sort stacking logic
+/// (STANDOFF / STACK / TGAP). Both the SVG renderer (`svg.rs`) and the
+/// quality verifier (`verify.rs`) consume `PlacedDimension` produced here
+/// — neither re-computes placement.
+///
+/// Horizontal extents are stacked below the part (increasing sheet-y).
+/// Vertical extents are stacked to the left (decreasing sheet-x).
+/// Angle / point callouts become leader-free `PlacedDimension` entries
+/// with degenerate (zero-length) `line` / `ext` / arrows positioned at
+/// the label anchor — the renderer skips drawing lines/arrows for those.
+pub(crate) fn place_dimensions(
+    view: &ProjectedView,
+    sheet_h: f64,
+    owner: usize,
+) -> Vec<PlacedDimension> {
     let Some(gr) = view_geometry_rect(view, sheet_h) else {
         return Vec::new();
     };
@@ -417,7 +513,7 @@ fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> V
     }
     let mut horiz: Vec<Lin> = Vec::new();
     let mut vert: Vec<Lin> = Vec::new();
-    let mut result: Vec<SheetItem> = Vec::new();
+    let mut result: Vec<PlacedDimension> = Vec::new();
 
     for d in &view.dimensions {
         let a = dim_to_sheet(view, sheet_h, d.a);
@@ -426,22 +522,29 @@ fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> V
         let dy = (a[1] - b[1]).abs();
 
         if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
-            // Angle / point callout: leader-free label at (a[0]+2, a[1]-2),
-            // start-anchored (svg.rs uses plain .dim-text, no -c class).
-            let font = DIM_TEXT_FONT_MM;
-            let w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
+            // Leader-free point/angle callout: text at (a[0]+2, a[1]-2).
+            // The dim-text element in svg.rs is start-anchored (no -c class)
+            // so text_anchor matches the x/y attrs directly.
             let ax = a[0] + 2.0;
             let ay = a[1] - 2.0;
-            result.push(SheetItem {
-                kind: SheetItemKind::DimensionText,
-                bbox: Rect2 {
-                    x0: ax,
-                    y0: ay - font,
-                    x1: ax + w,
-                    y1: ay,
-                },
-                owner_view: Some(owner),
-                text: Some(d.label.clone()),
+            result.push(PlacedDimension {
+                // Degenerate geometry: zero-length line at anchor point.
+                line: [[ax, ay], [ax, ay]],
+                ext: [[[ax, ay], [ax, ay]], [[ax, ay], [ax, ay]]],
+                arrows: [
+                    ArrowSpec {
+                        tip: [ax, ay],
+                        dir: [1.0, 0.0],
+                    },
+                    ArrowSpec {
+                        tip: [ax, ay],
+                        dir: [1.0, 0.0],
+                    },
+                ],
+                text_anchor: [ax, ay],
+                text_rot_deg: 0.0,
+                label: d.label.clone(),
+                owner_view: owner,
             });
             continue;
         }
@@ -463,8 +566,8 @@ fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> V
         }
     }
 
-    // Smallest span nearest the part (ascending) — same order svg.rs uses,
-    // so each modeled label lands on the level its ink is drawn at.
+    // Smallest span nearest the part (ascending), so extension lines never
+    // cross and the overall dimension sits outermost.
     let by_span = |x: &Lin, y: &Lin| {
         x.span
             .partial_cmp(&y.span)
@@ -473,51 +576,67 @@ fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> V
     horiz.sort_by(by_span);
     vert.sort_by(by_span);
 
-    // Horizontal extents — stacked below the part (increasing y).
+    // Horizontal extents — stacked below the part (increasing sheet-y).
     let mut level = bbox[3] + STANDOFF;
     for d in &horiz {
-        // dim_text is centred (.dim-text-c): x-anchor = mid of (lo..hi),
-        // baseline y = level - TGAP.
-        let cx = 0.5 * (d.lo + d.hi);
-        let cy = level - TGAP;
-        let font = DIM_TEXT_FONT_MM;
-        let w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
-        result.push(SheetItem {
-            kind: SheetItemKind::DimensionText,
-            bbox: Rect2 {
-                x0: cx - w * 0.5,
-                y0: cy - font,
-                x1: cx + w * 0.5,
-                y1: cy,
-            },
-            owner_view: Some(owner),
-            text: Some(d.label.clone()),
+        // Extension lines from part edge → level + EXT (overshoot).
+        let ext_a = [[d.lo, bbox[3] + GAP], [d.lo, level + EXT]];
+        let ext_b = [[d.hi, bbox[3] + GAP], [d.hi, level + EXT]];
+        // Dim line at `level`.
+        let line = [[d.lo, level], [d.hi, level]];
+        // Inward arrowheads: left tip points right (+x), right tip points left (-x).
+        let ar_a = ArrowSpec {
+            tip: [d.lo, level],
+            dir: [1.0, 0.0],
+        };
+        let ar_b = ArrowSpec {
+            tip: [d.hi, level],
+            dir: [-1.0, 0.0],
+        };
+        // Text centred on the span, TGAP above the dim line.
+        let tx = 0.5 * (d.lo + d.hi);
+        let ty = level - TGAP;
+        result.push(PlacedDimension {
+            line,
+            ext: [ext_a, ext_b],
+            arrows: [ar_a, ar_b],
+            text_anchor: [tx, ty],
+            text_rot_deg: 0.0,
+            label: d.label.clone(),
+            owner_view: owner,
         });
         level += STACK;
     }
 
-    // Vertical extents — stacked left of the part (decreasing x).
+    // Vertical extents — stacked to the left of the part (decreasing sheet-x).
     let mut level = bbox[0] - STANDOFF;
     for d in &vert {
-        // Vertical dim text: rotate(-90) about the centred anchor
-        // (level - TGAP, mid(lo,hi)). rotate(-90) maps the ascent vector
-        // (0, -font) to (-font, 0) and spreads the centred text width along
-        // ±y, so the rotated bbox is x ∈ [ax - font, ax], y ∈ [ay - w/2,
-        // ay + w/2].
-        let ax = level - TGAP;
-        let ay = 0.5 * (d.lo + d.hi);
-        let font = DIM_TEXT_FONT_MM;
-        let text_w = d.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
-        result.push(SheetItem {
-            kind: SheetItemKind::DimensionText,
-            bbox: Rect2 {
-                x0: ax - font,
-                y0: ay - text_w * 0.5,
-                x1: ax,
-                y1: ay + text_w * 0.5,
-            },
-            owner_view: Some(owner),
-            text: Some(d.label.clone()),
+        // Extension lines from part edge → level − EXT (overshoot).
+        let ext_a = [[bbox[0] - GAP, d.lo], [level - EXT, d.lo]];
+        let ext_b = [[bbox[0] - GAP, d.hi], [level - EXT, d.hi]];
+        // Dim line at `level`.
+        let line = [[level, d.lo], [level, d.hi]];
+        // Inward arrowheads: bottom tip points down (+y), top tip points up (-y).
+        let ar_a = ArrowSpec {
+            tip: [level, d.lo],
+            dir: [0.0, 1.0],
+        };
+        let ar_b = ArrowSpec {
+            tip: [level, d.hi],
+            dir: [0.0, -1.0],
+        };
+        // Text centred vertically, TGAP to the right of the dim line (x decreases
+        // leftward, so the text x-anchor = level − TGAP, rotated -90°).
+        let tx = level - TGAP;
+        let ty = 0.5 * (d.lo + d.hi);
+        result.push(PlacedDimension {
+            line,
+            ext: [ext_a, ext_b],
+            arrows: [ar_a, ar_b],
+            text_anchor: [tx, ty],
+            text_rot_deg: -90.0,
+            label: d.label.clone(),
+            owner_view: owner,
         });
         level -= STACK;
     }
@@ -530,7 +649,8 @@ fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drawing::dimensioning::standard_drawing_auto;
+    use crate::drawing::dimensioning::{standard_drawing, standard_drawing_auto};
+    use crate::drawing::svg::render_drawing_svg;
     use crate::drawing::types::{
         Drawing, Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize, ViewExtent,
         ViewSource,
@@ -613,6 +733,40 @@ mod tests {
                 "label must stay within 30 mm of its view; dx={dx:.1} dy={dy:.1}"
             );
         }
+    }
+
+    /// SVG must ink every dimension at the EXACT anchor the layout computed.
+    ///
+    /// For horizontal dims the anchor is the text's `x=` / `y=` attrs in
+    /// the `dim-text-c` element. For vertical dims the same attrs are used
+    /// (the rotation is applied via a `transform` attr, not by moving x/y).
+    /// `PlacedDimension.text_anchor` matches both cases — the test is
+    /// meaningful for any orientation.
+    #[test]
+    fn svg_inks_dimensions_exactly_where_layout_placed_them() {
+        let mut m = BRepModel::new();
+        let b = match TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let dwg = standard_drawing(&m, b, uuid::Uuid::nil(), SheetSize::A3, 1.0).expect("sheet");
+        let layout = compute_layout(&dwg);
+        let svg = render_drawing_svg(&dwg);
+        for pd in &layout.dimensions {
+            let needle = format!(
+                "x=\"{:.3}\" y=\"{:.3}\"",
+                pd.text_anchor[0], pd.text_anchor[1]
+            );
+            assert!(
+                svg.contains(&needle),
+                "dim '{}' anchor {needle} not found in SVG",
+                pd.label
+            );
+        }
+        assert!(!layout.dimensions.is_empty());
     }
 
     /// `compute_layout` must be a pure function of the drawing — calling it

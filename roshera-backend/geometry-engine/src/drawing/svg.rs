@@ -30,7 +30,7 @@
 
 use std::fmt::Write;
 
-use super::layout::{compute_layout, SheetItemKind};
+use super::layout::{compute_layout, ArrowSpec, SheetItemKind, SheetLayout, AR_L, AR_W};
 use super::types::{Drawing, ProjectedView, SheetSize};
 
 /// Render a [`Drawing`] to a complete SVG document string.
@@ -44,6 +44,11 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     let frame_y = mt;
     let frame_w = (w - ml - mr).max(0.0);
     let frame_h = (h - mt - mb).max(0.0);
+
+    // Compute the layout ONCE — both view-label ink and dimension ink read from
+    // the same model. This eliminates the previous double call (render_view_labels
+    // called compute_layout internally; now both share the one result).
+    let layout = compute_layout(drawing);
 
     let mut out = String::with_capacity(8192);
     let _ = write!(
@@ -78,15 +83,14 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
 
     // Dimensions in a second pass (sheet space) so they sit on top of all
     // geometry and stay a constant size regardless of view scale.
-    for view in &drawing.views {
-        render_dimensions(&mut out, view, h);
-    }
+    // Pure ink loop over PlacedDimension — no placement logic here.
+    render_dimensions(&mut out, &layout);
 
     // View labels: inked from the layout model in sheet space at a constant
     // 3.6 mm font. This pass runs AFTER all view groups so labels sit on top
     // of geometry, and the items here are exactly what verify_drawing checks —
     // one representation, so a collision the verifier reports is what renders.
-    render_view_labels(&mut out, drawing);
+    render_view_labels(&mut out, &layout);
 
     // Notes strip in the bottom-left corner of the frame.
     render_notes_strip(&mut out, frame_x, frame_y + frame_h);
@@ -325,153 +329,78 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
 // Dimensions (sheet-space — constant size, offset clear of the part)
 // ---------------------------------------------------------------------
 
-/// Map a view-space point to SVG sheet coordinates (origin top-left, y
-/// DOWN), matching the transform baked into the view's `<g>` group.
-fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
-    [
-        view.position_mm[0] + p[0] * view.scale,
-        (sheet_h - view.position_mm[1]) - p[1] * view.scale,
-    ]
-}
-
-/// Sheet-space bounding box `[x0, y0, x1, y1]` of a view's drawn edges.
-fn view_sheet_bbox(view: &ProjectedView, sheet_h: f64) -> Option<[f64; 4]> {
-    let mut x0 = f64::INFINITY;
-    let mut y0 = f64::INFINITY;
-    let mut x1 = f64::NEG_INFINITY;
-    let mut y1 = f64::NEG_INFINITY;
-    let mut any = false;
-    for pl in view.polylines.iter().chain(view.hidden_polylines.iter()) {
-        for &p in &pl.points {
-            let s = dim_to_sheet(view, sheet_h, p);
-            x0 = x0.min(s[0]);
-            x1 = x1.max(s[0]);
-            y0 = y0.min(s[1]);
-            y1 = y1.max(s[1]);
-            any = true;
-        }
-    }
-    if any && x1 > x0 && y1 > y0 {
-        Some([x0, y0, x1, y1])
-    } else {
-        None
-    }
-}
-
-/// Draw all of a view's dimension callouts in sheet space: horizontal
-/// extents stacked below the part, vertical extents stacked to its left,
-/// each with extension lines, inward arrowheads, and a constant-size value
-/// label.
+/// Ink all placed dimension callouts from the layout.
 ///
-/// Placement follows ISO 129 drafting practice: parallel callouts are
-/// ordered by SPAN with the SMALLEST nearest the part and the largest
-/// outermost, so the extension lines never cross and the widest dimension
-/// line never runs back across the geometry it brackets. The previous code
-/// placed callouts in arbitrary `view.dimensions` order, so on a real part
-/// the overall (widest) dimension often landed closest to the part — its
-/// line cutting through the view while narrower callouts stacked outside it.
-fn render_dimensions(out: &mut String, view: &ProjectedView, sheet_h: f64) {
-    let Some(bbox) = view_sheet_bbox(view, sheet_h) else {
-        return;
-    };
-    // All constants are sheet millimetres (the SVG user unit).
-    const STANDOFF: f64 = 11.0; // first dimension line, clear of the silhouette
-    const STACK: f64 = 8.0; // gap between successive parallel dimension lines
-    const GAP: f64 = 1.5; // extension-line gap from the part
-    const EXT: f64 = 1.5; // extension-line overshoot past the dimension line
-    const AR_L: f64 = 2.6;
-    const AR_W: f64 = 0.85;
-    const TGAP: f64 = 1.4;
-
-    // A linear callout reduced to its on-sheet bracket: [lo, hi] along the
-    // measured axis + the span used to order the stack.
-    struct Lin {
-        lo: f64,
-        hi: f64,
-        span: f64,
-        label: String,
-    }
-    let mut horiz: Vec<Lin> = Vec::new();
-    let mut vert: Vec<Lin> = Vec::new();
-
-    for d in &view.dimensions {
-        let a = dim_to_sheet(view, sheet_h, d.a);
-        let b = dim_to_sheet(view, sheet_h, d.b);
-        let dx = (a[0] - b[0]).abs();
-        let dy = (a[1] - b[1]).abs();
-
-        // Angle / point callouts have no linear span — leader-free label just
-        // outside the nearest corner.
-        if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
-            let _ = write!(
+/// Pure ink loop: no placement logic. The geometry (line, ext, arrows,
+/// text_anchor, text_rot_deg) was computed ONCE by `layout::place_dimensions`
+/// and stored in `SheetLayout.dimensions`. This function reads those values
+/// and emits the SVG elements — nothing more.
+///
+/// Angle / point callouts have degenerate `line` (start == end), which the
+/// `dim_line` helper emits as a zero-length line that is invisible on the
+/// page; the text is the meaningful ink for those.
+fn render_dimensions(out: &mut String, layout: &SheetLayout) {
+    for pd in &layout.dimensions {
+        // Extension lines — skip degenerate (angle / point callouts).
+        let is_degenerate = {
+            let [p0, p1] = pd.line;
+            (p0[0] - p1[0]).abs() < 1e-9 && (p0[1] - p1[1]).abs() < 1e-9
+        };
+        if !is_degenerate {
+            for seg in &pd.ext {
+                dim_line(out, seg[0][0], seg[0][1], seg[1][0], seg[1][1]);
+            }
+            dim_line(
                 out,
-                "  <text class=\"dim-text\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
-                a[0] + 2.0,
-                a[1] - 2.0,
-                escape_xml(&d.label)
+                pd.line[0][0],
+                pd.line[0][1],
+                pd.line[1][0],
+                pd.line[1][1],
             );
-            continue;
+            for ar in &pd.arrows {
+                ink_arrow(out, ar, AR_L, AR_W);
+            }
         }
-
-        if dx >= dy {
-            horiz.push(Lin {
-                lo: a[0].min(b[0]),
-                hi: a[0].max(b[0]),
-                span: dx,
-                label: d.label.clone(),
-            });
-        } else {
-            vert.push(Lin {
-                lo: a[1].min(b[1]),
-                hi: a[1].max(b[1]),
-                span: dy,
-                label: d.label.clone(),
-            });
-        }
-    }
-
-    // Smallest span nearest the part (ascending), so extension lines never
-    // cross and the overall dimension sits outermost.
-    let by_span = |x: &Lin, y: &Lin| {
-        x.span
-            .partial_cmp(&y.span)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    };
-    horiz.sort_by(by_span);
-    vert.sort_by(by_span);
-
-    // Horizontal extents → stacked below the part.
-    let mut level = bbox[3] + STANDOFF;
-    for d in &horiz {
-        dim_line(out, d.lo, bbox[3] + GAP, d.lo, level + EXT);
-        dim_line(out, d.hi, bbox[3] + GAP, d.hi, level + EXT);
-        dim_line(out, d.lo, level, d.hi, level);
-        arrow_h(out, d.lo, level, 1.0, AR_L, AR_W);
-        arrow_h(out, d.hi, level, -1.0, AR_L, AR_W);
-        dim_text(out, 0.5 * (d.lo + d.hi), level - TGAP, &d.label, 0.0);
-        level += STACK;
-    }
-
-    // Vertical extents → stacked to the left of the part.
-    let mut level = bbox[0] - STANDOFF;
-    for d in &vert {
-        dim_line(out, bbox[0] - GAP, d.lo, level - EXT, d.lo);
-        dim_line(out, bbox[0] - GAP, d.hi, level - EXT, d.hi);
-        dim_line(out, level, d.lo, level, d.hi);
-        arrow_v(out, level, d.lo, 1.0, AR_L, AR_W);
-        arrow_v(out, level, d.hi, -1.0, AR_L, AR_W);
-        dim_text(out, level - TGAP, 0.5 * (d.lo + d.hi), &d.label, -90.0);
-        level -= STACK;
+        dim_text(
+            out,
+            pd.text_anchor[0],
+            pd.text_anchor[1],
+            &pd.label,
+            pd.text_rot_deg,
+        );
     }
 }
 
-/// Ink the `ViewLabel` items from the sheet layout at their computed
-/// sheet-space positions. Each label is a `<text class="label">` element
-/// at a constant 3.6 px (= mm) font — never inside a scaled view group,
-/// so the font is invariant to view scale and label positions are the same
-/// coordinates the verifier checks.
-fn render_view_labels(out: &mut String, drawing: &Drawing) {
-    let layout = compute_layout(drawing);
+/// Ink one arrowhead from an [`ArrowSpec`].
+///
+/// `dir` is the unit vector pointing AWAY from the tip (toward the base).
+/// `len` is the arrowhead length; `half_w` the half-width.
+fn ink_arrow(out: &mut String, ar: &ArrowSpec, len: f64, half_w: f64) {
+    let [tx, ty] = ar.tip;
+    let [dx, dy] = ar.dir;
+    // Base centre: tip + dir * len.
+    let bx = tx + dx * len;
+    let by = ty + dy * len;
+    // Perpendicular: rotate dir by +90°: (−dy, dx).
+    let px = -dy * half_w;
+    let py = dx * half_w;
+    let _ =
+        write!(
+        out,
+        "  <polygon class=\"dim-arrow\" points=\"{tx:.3},{ty:.3} {:.3},{:.3} {:.3},{:.3}\" />\n",
+        bx - px, by - py,
+        bx + px, by + py,
+    );
+}
+
+/// Ink the `ViewLabel` items from the pre-computed sheet layout.
+///
+/// Each label is a `<text class="label">` element at a constant 3.6 px
+/// (= mm) font — never inside a scaled view group, so the font is invariant
+/// to view scale and label positions are the same coordinates the verifier
+/// checks. Accepts the already-computed layout so `render_drawing_svg` does
+/// not call `compute_layout` a second time.
+fn render_view_labels(out: &mut String, layout: &SheetLayout) {
     for item in layout
         .items
         .iter()
@@ -492,30 +421,6 @@ fn dim_line(out: &mut String, x1: f64, y1: f64, x2: f64, y2: f64) {
     let _ = write!(
         out,
         "  <line class=\"dim-line\" x1=\"{x1:.3}\" y1=\"{y1:.3}\" x2=\"{x2:.3}\" y2=\"{y2:.3}\" />\n"
-    );
-}
-
-/// Filled horizontal arrowhead: tip at `(x, y)`, opening toward `dir`
-/// (+1 = points right, −1 = points left).
-fn arrow_h(out: &mut String, x: f64, y: f64, dir: f64, len: f64, half_w: f64) {
-    let bx = x + dir * len;
-    let _ = write!(
-        out,
-        "  <polygon class=\"dim-arrow\" points=\"{x:.3},{y:.3} {bx:.3},{:.3} {bx:.3},{:.3}\" />\n",
-        y - half_w,
-        y + half_w
-    );
-}
-
-/// Filled vertical arrowhead: tip at `(x, y)`, opening toward `dir`
-/// (+1 = points down, −1 = points up).
-fn arrow_v(out: &mut String, x: f64, y: f64, dir: f64, len: f64, half_w: f64) {
-    let by = y + dir * len;
-    let _ = write!(
-        out,
-        "  <polygon class=\"dim-arrow\" points=\"{x:.3},{y:.3} {:.3},{by:.3} {:.3},{by:.3}\" />\n",
-        x - half_w,
-        x + half_w
     );
 }
 
