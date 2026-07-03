@@ -97,7 +97,10 @@ pub fn auto_dimensions(
             b,
             entities: d.entities,
             axis3: d.axis,
-            dir3: Some(d.direction),
+            // Defensively normalised: the extraction emits unit directions, but
+            // the cross-view dedup quantises components (×100), so a non-unit
+            // vector would silently change hash keys.
+            dir3: Some(unit3_or_zero(d.direction)),
         });
     }
     out
@@ -205,6 +208,17 @@ fn view_dir(p: &ProjectionType) -> Option<[f64; 3]> {
 }
 
 /// Dot product of two `[f64; 3]` arrays.
+/// Unit-normalise, or return the zero vector for degenerate input (a zero
+/// direction hashes to the "directionless" key and never falsely groups).
+fn unit3_or_zero(v: [f64; 3]) -> [f64; 3] {
+    let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if m > 1e-12 {
+        [v[0] / m, v[1] / m, v[2] / m]
+    } else {
+        [0.0, 0.0, 0.0]
+    }
+}
+
 fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -300,6 +314,10 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                     // = first occurrence).
                     if lins[j].rank < lins[i].rank {
                         keep[lins[i].idx] = false;
+                        // i is dead: stop comparing it against later dims — a
+                        // dead entry must not kill survivors it happens to
+                        // match (the survivor j runs its own outer pass).
+                        break;
                     } else {
                         keep[lins[j].idx] = false;
                     }
@@ -379,11 +397,15 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
                 // Feature dim — key is sorted entity ids + kind + value.
                 let mut sorted_ents = d.entities.clone();
                 sorted_ents.sort_unstable();
-                // Is this view axial for the feature (|axis3 · view_dir| > 0.99)?
-                let is_axial = match (d.axis3, vdir) {
-                    (Some(ax), Some(vd)) => dot3(ax, vd).abs() > 0.99,
-                    _ => false,
-                };
+                // Axial-view preference applies ONLY to diameters/radii (the
+                // "dimension the hole where it shows as a circle" convention).
+                // A length dim must never prefer its axial view — there its
+                // span projects to zero and the callout is unreadable.
+                let is_axial = matches!(d.kind.as_str(), "diameter" | "radius")
+                    && match (d.axis3, vdir) {
+                        (Some(ax), Some(vd)) => dot3(ax, vd).abs() > 0.99,
+                        _ => false,
+                    };
                 let span = d.projected_span();
                 entity_groups
                     .entry((sorted_ents, d.kind.clone(), qval))
