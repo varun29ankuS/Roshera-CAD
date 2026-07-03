@@ -937,7 +937,7 @@ fn short_drawing_id(drawing: &Drawing) -> String {
     format!("RSH-{}", prefix.to_uppercase())
 }
 
-fn format_scale(scale: f64) -> String {
+pub(crate) fn format_scale(scale: f64) -> String {
     if scale >= 1.0 {
         format!("{:.0}:1", scale)
     } else if scale > 0.0 {

@@ -26,6 +26,7 @@
 pub mod centerlines;
 pub mod dimensioning;
 pub mod dxf;
+pub mod layout;
 pub mod pdf;
 pub mod projection;
 pub mod section_view;

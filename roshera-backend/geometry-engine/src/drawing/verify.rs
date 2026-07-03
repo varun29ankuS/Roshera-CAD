@@ -18,8 +18,11 @@
 //! point `(vx, vy)` maps to the sheet as
 //! `(pos.x + vx·scale, (sheet_h − pos.y) − vy·scale)`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
+use super::layout::{compute_layout, view_geometry_rect, SheetItemKind};
 use super::svg::{frame_margins, title_block_size};
 use super::types::{Drawing, ProjectedView, ProjectionType};
 
@@ -59,6 +62,13 @@ pub enum DrawingIssueKind {
     DimensionLabelCollision,
     /// A view shows geometry but carries no dimensions.
     UndimensionedView,
+    /// Two view labels (or a view label and another text item) overlap on
+    /// the sheet — the viewer cannot read which view is which.
+    ViewLabelCollision,
+    /// The same dimension (same quantized value, same orientation, same
+    /// measured interval) appears more than once on the sheet, making the
+    /// drawing redundant and potentially misleading.
+    RedundantDimension,
 }
 
 /// A single quality finding.
@@ -145,45 +155,13 @@ impl Rect {
     }
 }
 
-/// Map a view-space point to SVG sheet coordinates.
-fn to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
-    [
-        view.position_mm[0] + p[0] * view.scale,
-        (sheet_h - view.position_mm[1]) - p[1] * view.scale,
-    ]
-}
-
-/// Bounding rectangle (sheet coords) of a view's drawn edges — visible +
-/// hidden polylines, falling back to the stored `extent` corners when a
-/// view has no polylines yet.
-fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect> {
-    let mut x0 = f64::INFINITY;
-    let mut y0 = f64::INFINITY;
-    let mut x1 = f64::NEG_INFINITY;
-    let mut y1 = f64::NEG_INFINITY;
-    let mut any = false;
-    let mut fold = |p: [f64; 2]| {
-        let s = to_sheet(view, sheet_h, p);
-        x0 = x0.min(s[0]);
-        x1 = x1.max(s[0]);
-        y0 = y0.min(s[1]);
-        y1 = y1.max(s[1]);
-    };
-    for pl in view.polylines.iter().chain(view.hidden_polylines.iter()) {
-        for &p in &pl.points {
-            fold(p);
-            any = true;
-        }
-    }
-    if !any && !view.extent.is_empty() {
-        fold([view.extent.min_x, view.extent.min_y]);
-        fold([view.extent.max_x, view.extent.max_y]);
-        any = true;
-    }
-    if any && x1 > x0 && y1 > y0 {
-        Some(Rect { x0, y0, x1, y1 })
-    } else {
-        None
+/// Convert a `layout::Rect2` to the internal `Rect` used by the verifier.
+fn rect_from_layout(r: super::layout::Rect2) -> Rect {
+    Rect {
+        x0: r.x0,
+        y0: r.y0,
+        x1: r.x1,
+        y1: r.y1,
     }
 }
 
@@ -245,7 +223,8 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
             ));
         }
 
-        if let Some(r) = view_geometry_rect(v, h) {
+        if let Some(r2) = view_geometry_rect(v, h) {
+            let r = rect_from_layout(r2);
             ink_area += r.area();
             // Dimensions render offset LEFT of and BELOW the view (see
             // svg::render_dimensions), so the space they occupy is part of
@@ -309,6 +288,42 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
 
     check_alignment(drawing, h, &mut issues);
 
+    // ── ViewLabelCollision detection ─────────────────────────────────────
+    // Build the layout and check every (ViewLabel, *) pair for overlap.
+    // At least one of the two items must be a ViewLabel — dim-text pairs
+    // fall under the existing DimensionLabelCollision kind.
+    let layout = compute_layout(drawing);
+    let texts: Vec<&super::layout::SheetItem> = layout
+        .items
+        .iter()
+        .filter(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::ViewLabel | SheetItemKind::DimensionText
+            )
+        })
+        .collect();
+    for i in 0..texts.len() {
+        for j in (i + 1)..texts.len() {
+            let pair_has_label = texts[i].kind == SheetItemKind::ViewLabel
+                || texts[j].kind == SheetItemKind::ViewLabel;
+            if pair_has_label && texts[i].bbox.intersects(&texts[j].bbox, 0.2) {
+                issues.push(error(
+                    DrawingIssueKind::ViewLabelCollision,
+                    format!(
+                        "text '{}' collides with '{}'",
+                        texts[i].text.as_deref().unwrap_or("?"),
+                        texts[j].text.as_deref().unwrap_or("?")
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
+    // ── RedundantDimension detection ─────────────────────────────────────
+    check_redundant_dimensions(drawing, h, &mut issues);
+
     finalize(issues, utilization)
 }
 
@@ -321,6 +336,7 @@ fn check_alignment(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<DrawingIssu
             .iter()
             .find(|v| want(&v.projection))
             .and_then(|v| view_geometry_rect(v, sheet_h))
+            .map(rect_from_layout)
     };
     let front = rect_of(|p| matches!(p, ProjectionType::Front));
     let top = rect_of(|p| matches!(p, ProjectionType::Top));
@@ -343,6 +359,119 @@ fn check_alignment(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<DrawingIssu
                     .to_string(),
                 None,
             ));
+        }
+    }
+}
+
+/// Detect dimensions that are logically redundant.
+///
+/// Two detection modes:
+///
+/// 1. **Cross-view entity duplicate**: the same B-Rep face set (`d.entities`,
+///    non-empty) and dimension kind appears on more than one view — the same
+///    named feature is being called out twice. Whole-part extents
+///    (`entities` is empty) are skipped here; they legitimately appear in
+///    multiple views to give context.
+///
+/// 2. **Same-view same-interval**: within one view, two dimensions with the
+///    same orientation (H or V) have interval endpoints that coincide within
+///    0.5 mm in sheet space. This catches "10.00 plate-thickness + 10.00
+///    bore-length both stacked on the same vertical interval in FRONT".
+fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<DrawingIssue>) {
+    // ── Cross-view entity check ──────────────────────────────────────────
+    // Key: (sorted entity ids, kind) → Vec<view_name>. Only for non-empty
+    // entity lists (named features, not whole-part extents).
+    {
+        let mut entity_key: HashMap<(Vec<u32>, String), Vec<String>> = HashMap::new();
+        for v in &drawing.views {
+            for d in &v.dimensions {
+                if d.entities.is_empty() {
+                    continue;
+                }
+                let mut sorted = d.entities.clone();
+                sorted.sort_unstable();
+                entity_key
+                    .entry((sorted, d.kind.clone()))
+                    .or_default()
+                    .push(v.name.clone());
+            }
+        }
+        for ((_, kind), views) in &entity_key {
+            if views.len() < 2 {
+                continue;
+            }
+            // Report each pair once.
+            for i in 0..views.len() {
+                for j in (i + 1)..views.len() {
+                    issues.push(error(
+                        DrawingIssueKind::RedundantDimension,
+                        format!(
+                            "{} dimension for the same feature appears in both '{}' and '{}'",
+                            kind, views[i], views[j]
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Same-view same-interval check ────────────────────────────────────
+    // Within each view, look for pairs of dimensions with the same orientation
+    // whose projected intervals (lo..hi in sheet space) coincide within 0.5 mm.
+    for v in &drawing.views {
+        struct Lin {
+            lo: f64,
+            hi: f64,
+            orient: char,
+            label: String,
+        }
+        let mut lins: Vec<Lin> = Vec::new();
+        for d in &v.dimensions {
+            let a = [
+                v.position_mm[0] + d.a[0] * v.scale,
+                (sheet_h - v.position_mm[1]) - d.a[1] * v.scale,
+            ];
+            let b = [
+                v.position_mm[0] + d.b[0] * v.scale,
+                (sheet_h - v.position_mm[1]) - d.b[1] * v.scale,
+            ];
+            let dx = (a[0] - b[0]).abs();
+            let dy = (a[1] - b[1]).abs();
+            if d.kind == "angle" || (dx < 1e-6 && dy < 1e-6) {
+                continue;
+            }
+            let orient = if dx >= dy { 'H' } else { 'V' };
+            let (lo, hi) = if orient == 'H' {
+                (a[0].min(b[0]), a[0].max(b[0]))
+            } else {
+                (a[1].min(b[1]), a[1].max(b[1]))
+            };
+            lins.push(Lin {
+                lo,
+                hi,
+                orient,
+                label: d.label.clone(),
+            });
+        }
+        for i in 0..lins.len() {
+            for j in (i + 1)..lins.len() {
+                if lins[i].orient != lins[j].orient {
+                    continue;
+                }
+                let lo_match = (lins[i].lo - lins[j].lo).abs() < 0.5;
+                let hi_match = (lins[i].hi - lins[j].hi).abs() < 0.5;
+                if lo_match && hi_match {
+                    issues.push(error(
+                        DrawingIssueKind::RedundantDimension,
+                        format!(
+                            "view '{}': '{}' and '{}' bracket the same interval",
+                            v.name, lins[i].label, lins[j].label
+                        ),
+                        Some(v.name.clone()),
+                    ));
+                }
+            }
         }
     }
 }
