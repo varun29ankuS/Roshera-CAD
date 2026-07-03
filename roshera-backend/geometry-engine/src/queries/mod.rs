@@ -21,7 +21,7 @@ pub mod relational;
 pub mod select;
 pub mod trim;
 
-pub use field::{sample_field, signed_distance, ScalarField};
+pub use field::{sample_field_adaptive, signed_distance, AdaptiveField, FieldCell};
 pub use occupancy::{occupancy_grid, to_slice_stack, OccupancyGrid};
 pub use point::{classify_point, nearest_on_solid, PointClass};
 pub use raycast::{raycast_all, raycast_solid, RayHit};

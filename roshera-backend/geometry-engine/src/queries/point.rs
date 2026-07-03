@@ -24,9 +24,12 @@ pub enum PointClass {
 }
 
 /// Closest point on the solid's boundary to `p`, as `(face_id, surface_point,
-/// distance)`. Slice 1 uses each face's surface closest-point clipped to its
-/// trim; a query point whose true nearest is a trim EDGE (not a face interior)
-/// is a refinement.
+/// distance)`. Minimizes over face interiors AND trim edges (edge endpoints
+/// included, so vertices are covered too): a query point whose nearest feature
+/// is an edge or a corner — the entire Voronoi wedge outside a box corner, for
+/// example — gets the exact edge/vertex distance. (Slice 1 considered face
+/// interiors only, so those wedges returned `None`, which a dense sampler then
+/// silently recorded as `+inf`.)
 pub fn nearest_on_solid(
     model: &BRepModel,
     solid_id: SolidId,
@@ -37,6 +40,12 @@ pub fn nearest_on_solid(
     shells.extend_from_slice(&solid.inner_shells);
 
     let mut best: Option<(FaceId, Point3, f64)> = None;
+    // Edges to try after the face pass, each attributed to the first face that
+    // walks it (deterministic: shell/face/loop order is deterministic), so an
+    // edge-nearest answer stays recoverable to a real face.
+    let mut edge_owner: Vec<(u32, FaceId)> = Vec::new();
+    let mut seen_edges = std::collections::HashSet::new();
+
     for shell_id in shells {
         let shell = match model.shells.get(shell_id) {
             Some(s) => s,
@@ -47,6 +56,18 @@ pub fn nearest_on_solid(
                 Some(f) => f,
                 None => continue,
             };
+            // Collect this face's boundary edges for the edge pass.
+            let mut loops = vec![face.outer_loop];
+            loops.extend_from_slice(&face.inner_loops);
+            for loop_id in loops {
+                if let Some(lp) = model.loops.get(loop_id) {
+                    for &eid in &lp.edges {
+                        if seen_edges.insert(eid) {
+                            edge_owner.push((eid, face_id));
+                        }
+                    }
+                }
+            }
             let surface = match model.surfaces.get(face.surface_id) {
                 Some(s) => s,
                 None => continue,
@@ -65,6 +86,39 @@ pub fn nearest_on_solid(
             let d = (p - sp).magnitude();
             if best.map(|b| d < b.2).unwrap_or(true) {
                 best = Some((face_id, sp, d));
+            }
+        }
+    }
+
+    // Edge pass: exact nearest on each boundary edge, clamped to the edge's
+    // parameter range; the range endpoints are always candidates, which covers
+    // vertices. For periodic curves the clamp is conservative — the endpoint
+    // candidates keep it correct at seams.
+    for (eid, face_id) in edge_owner {
+        let edge = match model.edges.get(eid) {
+            Some(e) => e,
+            None => continue,
+        };
+        let curve = match model.curves.get(edge.curve_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        let (t0, t1) = {
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            (a.min(b), a.max(b))
+        };
+        let mut candidates = [t0, t1, t0];
+        if let Ok((t, _)) = curve.closest_point(&p, model.tolerance()) {
+            candidates[2] = t.clamp(t0, t1);
+        }
+        for t in candidates {
+            let cp = match curve.point_at(t) {
+                Ok(cp) => cp,
+                Err(_) => continue,
+            };
+            let d = (p - cp).magnitude();
+            if best.map(|b| d < b.2).unwrap_or(true) {
+                best = Some((face_id, cp, d));
             }
         }
     }

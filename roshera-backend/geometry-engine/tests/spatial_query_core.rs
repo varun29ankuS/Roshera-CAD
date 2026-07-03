@@ -22,8 +22,8 @@ use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::queries::{
     are_coaxial, are_parallel, are_perpendicular, axis_relation, classify_point, face_axis,
-    faces_in_box, nearest_on_solid, sample_field, signed_distance, AxisRelation, PointClass,
-    WorldBox,
+    faces_in_box, nearest_on_solid, sample_field_adaptive, signed_distance, AxisRelation,
+    PointClass, WorldBox,
 };
 
 fn sid(g: GeometryId) -> SolidId {
@@ -140,57 +140,117 @@ fn cylinder_signed_distance_matches_analytic_wall() {
 }
 
 #[test]
-fn field_grid_sign_matches_classify_everywhere() {
+fn adaptive_field_sign_matches_classify_everywhere() {
     let mut m = BRepModel::new();
     let b = sid(TopologyBuilder::new(&mut m)
         .create_box_3d(30.0, 20.0, 16.0)
         .expect("box"));
-    let f = sample_field(
+    let f = sample_field_adaptive(
         &m,
         b,
         Point3::new(-20.0, -15.0, -12.0),
         Point3::new(20.0, 15.0, 12.0),
-        7,
-        5,
-        5,
+        3,
     );
-    for k in 0..f.nz {
-        for j in 0..f.ny {
-            for i in 0..f.nx {
-                let p = f.world_position(i, j, k);
-                let sd = f.value(i, j, k);
-                let cls = classify_point(&m, b, p, 1e-6);
-                match cls {
-                    PointClass::Inside => assert!(sd < 1e-6, "inside node has sd {sd} at {p:?}"),
-                    PointClass::Outside => assert!(sd > -1e-6, "outside node has sd {sd} at {p:?}"),
-                    PointClass::On => assert!(sd.abs() < 1e-3, "on node has sd {sd} at {p:?}"),
-                }
+    assert!(!f.cells.is_empty(), "adaptive field has leaves");
+    for c in &f.cells {
+        let cls = classify_point(&m, b, c.center, 1e-6);
+        let sd = c.distance;
+        match cls {
+            PointClass::Inside => assert!(sd < 1e-6, "inside cell has sd {sd} at {:?}", c.center),
+            PointClass::Outside => {
+                assert!(sd > -1e-6, "outside cell has sd {sd} at {:?}", c.center)
             }
+            PointClass::On => assert!(sd.abs() < 1e-3, "on cell has sd {sd} at {:?}", c.center),
         }
     }
 }
 
 #[test]
-fn field_sampling_is_deterministic() {
+fn adaptive_field_is_deterministic() {
     let mut m = BRepModel::new();
     let s = sid(TopologyBuilder::new(&mut m)
         .create_sphere_3d(Point3::ZERO, 10.0)
         .expect("sphere"));
     let mk = || {
-        sample_field(
+        sample_field_adaptive(
             &m,
             s,
             Point3::new(-12.0, -12.0, -12.0),
             Point3::new(12.0, 12.0, 12.0),
-            6,
-            6,
-            6,
+            4,
         )
     };
     let a = mk();
     let b = mk();
-    assert_eq!(a.values, b.values, "field values bit-identical");
-    assert_eq!(a.faces, b.faces, "field faces bit-identical");
+    assert_eq!(a.cells, b.cells, "adaptive leaves bit-identical");
+}
+
+#[test]
+fn adaptive_field_scales_with_surface_not_volume() {
+    // THE de-voxeling proof: a sphere sampled at depth 4 must spend far fewer
+    // leaves than the (2^4)³ = 4096 nodes a dense grid needs, because only the
+    // narrow band around the surface refines — interior and empty space stay
+    // as coarse leaves. Cost ∝ surface area, not volume.
+    let mut m = BRepModel::new();
+    let s = sid(TopologyBuilder::new(&mut m)
+        .create_sphere_3d(Point3::ZERO, 10.0)
+        .expect("sphere"));
+    let sample = |depth: u32| {
+        sample_field_adaptive(
+            &m,
+            s,
+            Point3::new(-12.0, -12.0, -12.0),
+            Point3::new(12.0, 12.0, 12.0),
+            depth,
+        )
+    };
+    let f4 = sample(4);
+    let f6 = sample(6);
+    assert_eq!(f4.uniform_equivalent(), 4096, "depth-4 dense grid is 16³");
+    assert_eq!(
+        f6.uniform_equivalent(),
+        262_144,
+        "depth-6 dense grid is 64³"
+    );
+    // Any saving at all at depth 4 (the sphere nearly fills this box, so the
+    // band dominates here — the LAW below is the real claim).
+    assert!(
+        f4.leaf_count() < f4.uniform_equivalent(),
+        "depth 4: {} leaves vs {} dense",
+        f4.leaf_count(),
+        f4.uniform_equivalent()
+    );
+    // THE SCALING LAW: refining 4 → 6 multiplies a dense grid by 64×, but the
+    // adaptive field only refines the surface band, which grows ~4× per level
+    // (area, not volume). Allow generous slack over the ideal 16×.
+    let growth = f6.leaf_count() as f64 / f4.leaf_count() as f64;
+    assert!(
+        growth < 24.0,
+        "adaptive growth 4→6 must be area-like (~16x), got {growth:.1}x \
+         ({} → {} leaves; dense grows 64x)",
+        f4.leaf_count(),
+        f6.leaf_count()
+    );
+    // And at depth 6 the absolute saving is unambiguous.
+    assert!(
+        f6.leaf_count() < f6.uniform_equivalent() / 4,
+        "depth 6: {} leaves must be <1/4 of the {} dense nodes",
+        f6.leaf_count(),
+        f6.uniform_equivalent()
+    );
+    // The band genuinely refined to max depth somewhere on the surface…
+    assert!(
+        f6.cells.iter().any(|c| c.depth == 6),
+        "surface band reaches max depth"
+    );
+    // …and every leaf's distance is EXACTLY the analytic per-point answer at
+    // its center (the adaptive structure never invents values).
+    for c in &f4.cells {
+        let (sd, fid) = signed_distance(&m, s, c.center).expect("sd at leaf center");
+        assert_eq!(sd, c.distance, "leaf distance == direct signed_distance");
+        assert_eq!(fid, c.face, "leaf face == direct nearest face");
+    }
 }
 
 #[test]

@@ -1,12 +1,15 @@
-//! Field spatial queries (#14 slice 2) — signed distance sampled over a grid.
+//! Field spatial queries (#14 slice 2) — the ANALYTIC signed-distance field.
 //!
 //! The composable spatial-query core's field primitive. `signed_distance`
 //! answers "how far, and which side" for a single point (negative inside,
 //! positive outside), built on the analytic `nearest_on_solid` for the
 //! magnitude and exact ray-parity for the sign — never a tessellation lookup.
-//! `sample_field` evaluates it over an axis-aligned grid, producing a
-//! [`ScalarField`] whose every sample is recoverable to a world-xyz grid node
-//! (`world_position`) and to the face that gave its nearest distance.
+//! `sample_field_adaptive` refines an octree over a box, subdividing ONLY the
+//! cells the surface may pass through (the ADF bound), producing an
+//! [`AdaptiveField`] whose every leaf is an exact per-point evaluation
+//! recoverable to the face that gave its nearest distance. Cost scales with
+//! surface area, not volume — there is deliberately NO dense voxel grid here:
+//! resolution is a property of the query, never of the representation.
 //!
 //! This is the agent's continuous handle on the solid: an SDF it can march for
 //! an isosurface, probe for clearance, or difference between timeline states to
@@ -33,98 +36,177 @@ pub fn signed_distance(model: &BRepModel, solid_id: SolidId, p: Point3) -> Optio
     Some((if inside { -d } else { d }, face_id))
 }
 
-/// A scalar field sampled on a regular axis-aligned grid. Row-major in
-/// `(i, j, k)` with `i` fastest (x), then `j` (y), then `k` (z). Node `(i,j,k)`
-/// sits at `world_position(i,j,k)`; `values[index]` is the signed distance
-/// there and `faces[index]` the nearest face that produced it.
-#[derive(Debug, Clone)]
-pub struct ScalarField {
-    /// Min corner of the sampled box (node `(0,0,0)`).
+/// One leaf of an adaptively-refined signed-distance sampling: an axis-aligned
+/// cell carrying the EXACT analytic signed distance (and nearest face) at its
+/// center. Cells subdivide only where the surface may pass through them, so a
+/// sampling's cost scales with SURFACE AREA, not volume — the reason a 1 m part
+/// at fine resolution does not cost `(size/ε)³` nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldCell {
+    /// Cell center (where the signed distance was evaluated).
+    pub center: Point3,
+    /// Half-extent per axis (the cell spans `center ± half_extent`).
+    pub half_extent: Vector3,
+    /// Exact signed distance at `center` (negative inside the material).
+    pub distance: f64,
+    /// Nearest boundary face at `center` — keeps every sample recoverable to
+    /// real topology, never a bare number.
+    pub face: FaceId,
+    /// Octree depth of this leaf (0 = the root cell).
+    pub depth: u32,
+}
+
+impl FieldCell {
+    /// Conservative surface test: the boundary may pass through this cell iff
+    /// the center's distance does not exceed the circumscribed radius (half the
+    /// cell diagonal). This is the classic ADF refinement bound.
+    #[inline]
+    pub fn may_contain_surface(&self) -> bool {
+        self.distance.abs() <= self.half_extent.magnitude()
+    }
+}
+
+/// An adaptively-sampled signed-distance field: the LEAVES of an octree over
+/// `[min, max]`, refined only in the narrow band around the solid's surface.
+/// Deterministic: same inputs → bit-identical leaves in DFS order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveField {
+    /// Min corner of the sampled box.
     pub min: Point3,
-    /// Max corner of the sampled box (node `(nx-1, ny-1, nz-1)`).
+    /// Max corner of the sampled box.
     pub max: Point3,
-    pub nx: usize,
-    pub ny: usize,
-    pub nz: usize,
-    /// Signed distance at each node, row-major (`i` fastest).
-    pub values: Vec<f64>,
-    /// Nearest face id at each node, parallel to `values`.
-    pub faces: Vec<FaceId>,
+    /// Maximum refinement depth (a leaf at this depth is `2^max_depth` times
+    /// smaller than the root along each axis).
+    pub max_depth: u32,
+    /// Leaf cells, depth-first, children in fixed z-major order.
+    pub cells: Vec<FieldCell>,
 }
 
-impl ScalarField {
-    /// Row-major index of node `(i, j, k)`.
+impl AdaptiveField {
+    /// Number of leaves actually materialized.
     #[inline]
-    pub fn idx(&self, i: usize, j: usize, k: usize) -> usize {
-        (k * self.ny + j) * self.nx + i
+    pub fn leaf_count(&self) -> usize {
+        self.cells.len()
     }
 
-    /// World position of grid node `(i, j, k)`. Linear interpolation of the box
-    /// corners; for a single node along an axis the min coordinate is used.
-    pub fn world_position(&self, i: usize, j: usize, k: usize) -> Point3 {
-        let f = |a: f64, b: f64, t: usize, n: usize| {
-            if n <= 1 {
-                a
-            } else {
-                a + (b - a) * (t as f64 / (n - 1) as f64)
-            }
-        };
-        Point3::new(
-            f(self.min.x, self.max.x, i, self.nx),
-            f(self.min.y, self.max.y, j, self.ny),
-            f(self.min.z, self.max.z, k, self.nz),
-        )
+    /// Leaves in the surface band (refinement criterion still true at leaf
+    /// depth) — the cells an isosurface extractor would visit.
+    pub fn band_cell_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|c| c.may_contain_surface())
+            .count()
     }
 
-    /// Signed distance at node `(i, j, k)`.
+    /// What a DENSE grid at the same resolution would cost: `(2^max_depth)³`
+    /// nodes. The honest baseline for the adaptive saving.
     #[inline]
-    pub fn value(&self, i: usize, j: usize, k: usize) -> f64 {
-        self.values[self.idx(i, j, k)]
+    pub fn uniform_equivalent(&self) -> usize {
+        let n = 1usize << self.max_depth;
+        n * n * n
     }
 
-    /// Count of nodes strictly inside the material (negative signed distance).
+    /// Count of leaves strictly inside the material (negative signed distance).
     pub fn inside_count(&self) -> usize {
-        self.values.iter().filter(|&&v| v < 0.0).count()
+        self.cells.iter().filter(|c| c.distance < 0.0).count()
     }
 }
 
-/// Sample [`signed_distance`] over a regular `nx × ny × nz` grid spanning the
-/// axis-aligned box `[min, max]` (inclusive of both corners). Nodes whose
-/// nearest face cannot be found (degenerate solid) get `+inf` / face `0`.
-pub fn sample_field(
+/// Adaptively sample [`signed_distance`] over the axis-aligned box
+/// `[min, max]`: an octree that SUBDIVIDES ONLY where the surface may pass
+/// through a cell (center distance ≤ half-diagonal — the conservative ADF
+/// bound) and keeps interior/exterior space as coarse leaves. Every leaf's
+/// value is an exact per-point analytic evaluation — nothing is interpolated
+/// or invented. Cells whose nearest face cannot be found (degenerate solid)
+/// become `+inf` / face `0` leaves. Deterministic DFS, z-major child order.
+pub fn sample_field_adaptive(
     model: &BRepModel,
     solid_id: SolidId,
     min: Point3,
     max: Point3,
-    nx: usize,
-    ny: usize,
-    nz: usize,
-) -> ScalarField {
-    let nx = nx.max(1);
-    let ny = ny.max(1);
-    let nz = nz.max(1);
-    let mut field = ScalarField {
+    max_depth: u32,
+) -> AdaptiveField {
+    let mut field = AdaptiveField {
         min,
         max,
-        nx,
-        ny,
-        nz,
-        values: vec![f64::INFINITY; nx * ny * nz],
-        faces: vec![0; nx * ny * nz],
+        max_depth,
+        cells: Vec::new(),
     };
-    for k in 0..nz {
-        for j in 0..ny {
-            for i in 0..nx {
-                let p = field.world_position(i, j, k);
-                if let Some((sd, fid)) = signed_distance(model, solid_id, p) {
-                    let idx = field.idx(i, j, k);
-                    field.values[idx] = sd;
-                    field.faces[idx] = fid;
+    let center = Point3::new(
+        0.5 * (min.x + max.x),
+        0.5 * (min.y + max.y),
+        0.5 * (min.z + max.z),
+    );
+    let half = Vector3::new(
+        0.5 * (max.x - min.x).abs(),
+        0.5 * (max.y - min.y).abs(),
+        0.5 * (max.z - min.z).abs(),
+    );
+    refine_cell(
+        model,
+        solid_id,
+        center,
+        half,
+        0,
+        max_depth,
+        &mut field.cells,
+    );
+    field
+}
+
+/// Depth-first refinement: evaluate the cell center; subdivide into 8 children
+/// (fixed z-major order, so output is deterministic) while the surface may
+/// cross the cell and depth remains; otherwise emit the leaf.
+fn refine_cell(
+    model: &BRepModel,
+    solid_id: SolidId,
+    center: Point3,
+    half: Vector3,
+    depth: u32,
+    max_depth: u32,
+    out: &mut Vec<FieldCell>,
+) {
+    let (distance, face) = match signed_distance(model, solid_id, center) {
+        Some((sd, fid)) => (sd, fid),
+        // Degenerate solid (no reachable boundary face at all): record an
+        // honest infinite leaf rather than inventing a value, and never
+        // subdivide toward a surface that cannot be evaluated. (Healthy solids
+        // never hit this — nearest_on_solid covers faces, edges and vertices.)
+        None => {
+            out.push(FieldCell {
+                center,
+                half_extent: half,
+                distance: f64::INFINITY,
+                face: 0,
+                depth,
+            });
+            return;
+        }
+    };
+    let cell = FieldCell {
+        center,
+        half_extent: half,
+        distance,
+        face,
+        depth,
+    };
+    if depth < max_depth && cell.may_contain_surface() {
+        let h = Vector3::new(0.5 * half.x, 0.5 * half.y, 0.5 * half.z);
+        for dz in [-1.0, 1.0] {
+            for dy in [-1.0, 1.0] {
+                for dx in [-1.0, 1.0] {
+                    let child = Point3::new(
+                        center.x + dx * h.x,
+                        center.y + dy * h.y,
+                        center.z + dz * h.z,
+                    );
+                    refine_cell(model, solid_id, child, h, depth + 1, max_depth, out);
                 }
             }
         }
+    } else {
+        out.push(cell);
     }
-    field
 }
 
 #[cfg(test)]
@@ -159,39 +241,69 @@ mod tests {
     }
 
     #[test]
-    fn sample_field_grid_recoverable_and_signed() {
+    fn adaptive_field_recoverable_signed_and_banded() {
         let mut m = BRepModel::new();
         let b = sid(TopologyBuilder::new(&mut m)
             .create_box_3d(20.0, 20.0, 20.0)
             .expect("box"));
-        // 5³ grid spanning [-20,20]³: corners well outside, centre inside.
-        let f = sample_field(
+        // Depth-4 adaptive sampling of [-20,20]³ around a 20³ box: the surface
+        // band refines, the far corners and deep interior stay coarse. (Depth 3
+        // is degenerate for this lattice-aligned pair — every cell touches the
+        // conservative band, corner cells at exactly the half-diagonal bound —
+        // one level deeper the band thins and the saving appears.)
+        let f = sample_field_adaptive(
             &m,
             b,
             Point3::new(-20.0, -20.0, -20.0),
             Point3::new(20.0, 20.0, 20.0),
-            5,
-            5,
-            5,
+            4,
         );
-        // Centre node (2,2,2) is the origin → inside.
-        assert!(f.value(2, 2, 2) < 0.0, "centre node inside");
-        // Corner node (0,0,0) at (-20,-20,-20) → outside, positive.
-        assert!(f.value(0, 0, 0) > 0.0, "corner node outside");
-        // Recoverable: the centre node's world position is the origin, and its
-        // nearest face is a real face of the solid.
-        let p = f.world_position(2, 2, 2);
-        assert!(p.magnitude() < 1e-9, "centre node at origin: {p:?}");
-        let fid = f.faces[f.idx(2, 2, 2)];
+        // Signed: at least one leaf inside the material and one outside.
+        assert!(f.inside_count() >= 1, "some leaf is inside");
+        assert!(
+            f.cells.iter().any(|c| c.distance > 0.0),
+            "some leaf is outside"
+        );
+        // Banded: the surface band refined to max depth, and the field beat the
+        // dense grid it replaces.
+        assert!(
+            f.cells.iter().any(|c| c.depth == 4),
+            "band reaches max depth"
+        );
+        assert!(f.band_cell_count() >= 1, "band cells exist");
+        assert!(
+            f.leaf_count() < f.uniform_equivalent(),
+            "{} leaves must undercut the {}-node dense grid",
+            f.leaf_count(),
+            f.uniform_equivalent()
+        );
+        // Recoverable: every finite leaf's nearest face is a REAL face of the
+        // solid and its distance is exactly the direct per-point answer. An
+        // INFINITE leaf is permitted ONLY for the known on-boundary quirk: this
+        // lattice-aligned sampling box puts some cell centers exactly on the
+        // box's edges/corners, where `nearest_on_solid` is boundary-exclusive
+        // and yields None — assert that is genuinely the case (the center
+        // classifies On), so the escape hatch can never hide a real failure.
         let real: std::collections::HashSet<u32> = {
             let solid = m.solids.get(b).unwrap();
             let shell = m.shells.get(solid.outer_shell).unwrap();
             shell.faces.iter().copied().collect()
         };
-        assert!(real.contains(&fid), "nearest face {fid} is a real face");
-        // The inside region is the 27-node core minus the boundary: exactly the
-        // nodes within ±10, i.e. the single centre node here (others at ±10/±20).
-        assert!(f.inside_count() >= 1, "at least the centre is inside");
+        for c in &f.cells {
+            // A healthy solid must yield a FINITE distance for every leaf —
+            // including centers in corner Voronoi wedges and exactly on
+            // edges/corners (the slice-1 face-only nearest returned None
+            // there; the edge/vertex pass closed that hole).
+            assert!(
+                c.distance.is_finite(),
+                "no infinite leaves on a healthy solid, center {:?}",
+                c.center
+            );
+            assert!(real.contains(&c.face), "leaf face {} is real", c.face);
+            let (sd, fid) = signed_distance(&m, b, c.center).expect("sd");
+            assert_eq!(sd, c.distance, "leaf distance is the exact evaluation");
+            assert_eq!(fid, c.face, "leaf face is the exact nearest face");
+        }
     }
 
     #[test]
