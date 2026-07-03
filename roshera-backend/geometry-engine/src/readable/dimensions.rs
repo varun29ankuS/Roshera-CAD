@@ -39,6 +39,11 @@ pub struct DimensionRecord {
     pub anchor: [f64; 3],
     /// World direction the dimension is measured along (unit-ish).
     pub direction: [f64; 3],
+    /// Feature axis for axis-bearing features (cylinder/cone): the 3D
+    /// direction a drawing view must look along to see the feature as a
+    /// true circle. `None` for extents and spheres.
+    #[serde(default)]
+    pub axis: Option<[f64; 3]>,
 }
 
 /// Min/max world AABB accumulated from sampled points.
@@ -238,6 +243,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                 entities: Vec::new(),
                 anchor,
                 direction: dirs[axis],
+                axis: None,
             });
         }
     }
@@ -279,6 +285,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     cyl.origin.y + axis.y * mid + rd.y * cyl.radius,
                     cyl.origin.z + axis.z * mid + rd.z * cyl.radius,
                 ];
+                let axis_arr = [axis.x, axis.y, axis.z];
                 out.push(DimensionRecord {
                     id: id(),
                     kind: "diameter".into(),
@@ -288,6 +295,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     entities: vec![fid],
                     anchor,
                     direction: [rd.x, rd.y, rd.z],
+                    axis: Some(axis_arr),
                 });
                 let length = (hi - lo).abs();
                 if length > 1e-9 {
@@ -300,6 +308,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         entities: vec![fid],
                         anchor,
                         direction: [axis.x, axis.y, axis.z],
+                        axis: Some(axis_arr),
                     });
                 }
             } else if let Some(sph) = any.downcast_ref::<Sphere>() {
@@ -312,10 +321,12 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     entities: vec![fid],
                     anchor: [sph.center.x + sph.radius, sph.center.y, sph.center.z],
                     direction: [1.0, 0.0, 0.0],
+                    axis: None,
                 });
             } else if let Some(cone) = any.downcast_ref::<Cone>() {
                 let deg = cone.half_angle.to_degrees();
                 let axis = cone.axis.normalize().unwrap_or(cone.axis);
+                let cone_axis_arr = [axis.x, axis.y, axis.z];
                 let h = match cone.height_limits {
                     Some([a, b]) => a.abs().max(b.abs()),
                     None => 0.0,
@@ -335,6 +346,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     entities: vec![fid],
                     anchor,
                     direction: [axis.x, axis.y, axis.z],
+                    axis: None,
                 });
                 if base_r > 1e-9 {
                     out.push(DimensionRecord {
@@ -346,6 +358,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         entities: vec![fid],
                         anchor,
                         direction: [1.0, 0.0, 0.0],
+                        axis: Some(cone_axis_arr),
                     });
                 }
             }

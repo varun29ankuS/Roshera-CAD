@@ -62,6 +62,8 @@ fn dim(label: &str, a: [f64; 2], b: [f64; 2]) -> Dimension2d {
         a,
         b,
         entities: Vec::new(),
+        axis3: None,
+        dir3: None,
     }
 }
 
@@ -296,24 +298,23 @@ fn six_hole_plate() -> (BRepModel, u32) {
 }
 
 /// DETECTOR (permanent invariant): the defective sheet is CAUGHT.
-/// On pre-fix placement code this asserts the report FAILS — proving both
-/// the defect and the detector. Tasks 2-3 fix the pipeline and flip this to
-/// the passing form (see six_hole_plate_sheet_is_clean, Task 3).
-///
-/// The sheet's redundant "10.00" callouts (plate thickness + bore length
-/// bracketing the same vertical interval in FRONT and RIGHT, plus the same
-/// bore features re-called across views) gate `passed: false`.
+/// Task 2 (dedup) eliminates redundant dimensions at the source, so
+/// `RedundantDimension` no longer fires on the plate. `ViewLabelCollision`
+/// still fires (Task 3 not yet done), keeping `passed: false` valid.
 #[test]
 fn six_hole_plate_sheet_defects_are_caught_not_certified() {
     let (m, part) = six_hole_plate();
     let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
     let report = verify_drawing(&dwg);
     assert!(
-        report.has(DrawingIssueKind::RedundantDimension),
-        "duplicate 10.00 dims must be reported, got: {:?}",
+        !report.has(DrawingIssueKind::RedundantDimension),
+        "dedup must eliminate redundant dims; still firing: {:?}",
         report.issues
     );
-    assert!(!report.passed, "a defective sheet must not certify");
+    assert!(
+        !report.passed,
+        "a defective sheet must not certify (label collision still present)"
+    );
 }
 
 /// The other half of the 2026-07-03 defect: the live plate was built at

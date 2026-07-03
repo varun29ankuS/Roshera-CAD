@@ -35,6 +35,16 @@ pub struct Dimension2d {
     pub b: [f64; 2],
     /// B-Rep face ids the dimension spans (empty for whole-part extents).
     pub entities: Vec<u32>,
+    /// Feature axis (world-space unit vector): the 3D direction a view must
+    /// look along to see this feature as a true circle. Propagated from
+    /// `DimensionRecord::axis`; `None` for extents and spheres.
+    #[serde(default)]
+    pub axis3: Option<[f64; 3]>,
+    /// World-space direction the dimension is measured along (unit-ish).
+    /// Used by the extent dedup to distinguish same-value different-axis extents
+    /// (e.g. X 40.00 vs Y 40.00 on a cube).
+    #[serde(default)]
+    pub dir3: Option<[f64; 3]>,
 }
 
 impl Dimension2d {
@@ -86,6 +96,8 @@ pub fn auto_dimensions(
             a,
             b,
             entities: d.entities,
+            axis3: d.axis,
+            dir3: Some(d.direction),
         });
     }
     out
@@ -178,6 +190,269 @@ fn select_dimensions(mut dims: Vec<Dimension2d>) -> Vec<Dimension2d> {
     dims
 }
 
+/// World-space view direction (unit vector, pointing INTO the scene) that a
+/// standard projection camera looks along. Used by `dedup_dimensions_global`
+/// to decide which view is "axial" for a diameter callout.
+fn view_dir(p: &ProjectionType) -> Option<[f64; 3]> {
+    match p {
+        ProjectionType::Front => Some([0.0, -1.0, 0.0]),
+        ProjectionType::Top => Some([0.0, 0.0, -1.0]),
+        ProjectionType::Right => Some([-1.0, 0.0, 0.0]),
+        ProjectionType::Bottom => Some([0.0, 0.0, 1.0]),
+        ProjectionType::Left => Some([1.0, 0.0, 0.0]),
+        _ => None,
+    }
+}
+
+/// Dot product of two `[f64; 3]` arrays.
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Each feature dimensioned exactly once, where it reads best (ISO 129-1
+/// §5.1). Two passes:
+///
+/// **Pass A — same-view dedup**: within each view, equal value (within 0.01 mm)
+/// + same orientation (H or V, as `svg.rs` classifies by dx≥dy) + same
+/// projected interval endpoints (within 0.5 mm sheet-space) → keep the
+/// highest-priority one. Priority rank: extent (0) > diameter/radius (1) >
+/// length (2); equal rank → first occurrence.
+///
+/// **Pass B — cross-view dedup**: the same (sorted entity ids, kind, quantized
+/// value) in multiple views → keep one. Diameters/radii keep the AXIAL view
+/// (`|axis3 · view_dir| > 0.99`), else keep the view with the largest
+/// projected span, tie → lowest view index. Whole-part extents (empty
+/// `entities`) are deduplicated by (kind, quantized value, quantized 3D
+/// direction) — identical direction+value = duplicate; different direction at
+/// same value = not a duplicate and must survive.
+///
+/// Angle dimensions are exempt from both passes.
+pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
+    // ── Pass A: same-view same-interval dedup ────────────────────────────────
+    for view in &mut drawing.views {
+        // Classification helper: orientation 'H' or 'V', and projected
+        // interval [lo, hi] in view-space (pre-scale; scale cancels within
+        // one view because we're comparing within the same view). We use
+        // view-space coordinates (d.a, d.b) directly — they are in view-space
+        // mm already, and scale is uniform across the view.
+        struct Lin {
+            idx: usize,
+            orient: char,
+            lo: f64,
+            hi: f64,
+            rank: u8,
+        }
+        let mut lins: Vec<Lin> = Vec::new();
+        for (idx, d) in view.dimensions.iter().enumerate() {
+            if d.kind == "angle" {
+                continue;
+            }
+            let dx = (d.a[0] - d.b[0]).abs();
+            let dy = (d.a[1] - d.b[1]).abs();
+            if dx < 1e-6 && dy < 1e-6 {
+                continue;
+            }
+            let orient = if dx >= dy { 'H' } else { 'V' };
+            let (lo, hi) = if orient == 'H' {
+                (d.a[0].min(d.b[0]), d.a[0].max(d.b[0]))
+            } else {
+                (d.a[1].min(d.b[1]), d.a[1].max(d.b[1]))
+            };
+            let rank: u8 = match d.kind.as_str() {
+                "extent" => 0,
+                "diameter" | "radius" => 1,
+                _ => 2,
+            };
+            lins.push(Lin {
+                idx,
+                orient,
+                lo,
+                hi,
+                rank,
+            });
+        }
+
+        // Mark duplicates: for each group with same orient+interval, keep
+        // the minimum-rank (highest-priority) one, then first by index.
+        let mut keep = vec![true; view.dimensions.len()];
+        let tol_val = 0.01_f64;
+        let tol_int = 0.5_f64;
+        for i in 0..lins.len() {
+            if !keep[lins[i].idx] {
+                continue;
+            }
+            let vi = &view.dimensions[lins[i].idx];
+            for j in (i + 1)..lins.len() {
+                if !keep[lins[j].idx] {
+                    continue;
+                }
+                let vj = &view.dimensions[lins[j].idx];
+                if lins[i].orient != lins[j].orient {
+                    continue;
+                }
+                if (vi.value - vj.value).abs() > tol_val {
+                    continue;
+                }
+                let lo_match = (lins[i].lo - lins[j].lo).abs() < tol_int;
+                let hi_match = (lins[i].hi - lins[j].hi).abs() < tol_int;
+                if lo_match && hi_match {
+                    // Drop the lower-priority one; if equal rank, drop j (keep i
+                    // = first occurrence).
+                    if lins[j].rank < lins[i].rank {
+                        keep[lins[i].idx] = false;
+                    } else {
+                        keep[lins[j].idx] = false;
+                    }
+                }
+            }
+        }
+        let mut ki = 0_usize;
+        view.dimensions.retain(|_| {
+            let r = keep[ki];
+            ki += 1;
+            r
+        });
+    }
+
+    // ── Pass B: cross-view dedup ─────────────────────────────────────────────
+
+    // We need the view projection types to decide axial preference. Collect
+    // them up front so we can borrow immutably later.
+    let projs: Vec<ProjectionType> = drawing.views.iter().map(|v| v.projection).collect();
+    let n_views = drawing.views.len();
+
+    // Two separate group maps: one for entity-bearing dims (non-empty entities),
+    // one for whole-part extents (empty entities, keyed by dir3 too).
+    //
+    // For entity dims key = (sorted entities, kind, quantized value ×100).
+    // For extents key = (kind, quantized value ×100, quantized dir3 ×100).
+
+    // Collect all dims into a flat list: (view_idx, dim_idx, …fields…)
+    // We will decide which view keeps each group, then mark the rest for removal.
+
+    // entity key → Vec<(view_idx, dim_idx, projected_span, is_axial)>
+    let mut entity_groups: std::collections::HashMap<
+        (Vec<u32>, String, i64),
+        Vec<(usize, usize, f64, bool)>,
+    > = std::collections::HashMap::new();
+
+    // extent key → Vec<(view_idx, dim_idx, projected_span)>
+    let mut extent_groups: std::collections::HashMap<
+        (String, i64, [i64; 3]),
+        Vec<(usize, usize, f64)>,
+    > = std::collections::HashMap::new();
+
+    for vi in 0..n_views {
+        let vdir = view_dir(&projs[vi]);
+        for di in 0..drawing.views[vi].dimensions.len() {
+            let d = &drawing.views[vi].dimensions[di];
+            if d.kind == "angle" {
+                continue;
+            }
+            let qval = (d.value * 100.0).round() as i64;
+            if d.entities.is_empty() {
+                // Whole-part extent — key includes quantized direction.
+                let dir = d.dir3.unwrap_or([0.0, 0.0, 0.0]);
+                let qdir = [
+                    (dir[0] * 100.0).round() as i64,
+                    (dir[1] * 100.0).round() as i64,
+                    (dir[2] * 100.0).round() as i64,
+                ];
+                // Normalise sign: the direction (100,0,0) and (-100,0,0) are the
+                // same axis — pick the form whose first non-zero component is
+                // positive so X 40.00 from the +X direction and -X direction hash
+                // together.
+                let qdir = {
+                    let first_nonzero = qdir.iter().find(|&&v| v != 0).copied().unwrap_or(0);
+                    if first_nonzero < 0 {
+                        [-qdir[0], -qdir[1], -qdir[2]]
+                    } else {
+                        qdir
+                    }
+                };
+                let span = d.projected_span();
+                extent_groups
+                    .entry((d.kind.clone(), qval, qdir))
+                    .or_default()
+                    .push((vi, di, span));
+            } else {
+                // Feature dim — key is sorted entity ids + kind + value.
+                let mut sorted_ents = d.entities.clone();
+                sorted_ents.sort_unstable();
+                // Is this view axial for the feature (|axis3 · view_dir| > 0.99)?
+                let is_axial = match (d.axis3, vdir) {
+                    (Some(ax), Some(vd)) => dot3(ax, vd).abs() > 0.99,
+                    _ => false,
+                };
+                let span = d.projected_span();
+                entity_groups
+                    .entry((sorted_ents, d.kind.clone(), qval))
+                    .or_default()
+                    .push((vi, di, span, is_axial));
+            }
+        }
+    }
+
+    // Build a removal set: (view_idx, dim_idx).
+    let mut remove: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+    // Entity groups: keep one per group.
+    for (_, mut entries) in entity_groups {
+        if entries.len() < 2 {
+            continue;
+        }
+        // Prefer the axial view for diameters/radii; among those, or if none
+        // are axial, keep the view with the largest projected span. Tie → lowest
+        // view index.
+        let axial_idx = entries.iter().position(|e| e.3); // is_axial
+        let keeper_view_idx = if let Some(ai) = axial_idx {
+            entries[ai].0
+        } else {
+            // Largest span wins; tie → smallest view index.
+            entries.sort_by(|a, b| {
+                b.2.partial_cmp(&a.2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            entries[0].0
+        };
+        for (vi, di, _, _) in &entries {
+            if *vi != keeper_view_idx {
+                remove.insert((*vi, *di));
+            }
+        }
+    }
+
+    // Extent groups: keep the view with the largest projected span, tie → lowest
+    // view index.
+    for (_, mut entries) in extent_groups {
+        if entries.len() < 2 {
+            continue;
+        }
+        entries.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        let keeper_view_idx = entries[0].0;
+        for (vi, di, _) in &entries {
+            if *vi != keeper_view_idx {
+                remove.insert((*vi, *di));
+            }
+        }
+    }
+
+    // Apply removals.
+    for vi in 0..n_views {
+        let mut di = 0_usize;
+        drawing.views[vi].dimensions.retain(|_| {
+            let r = !remove.contains(&(vi, di));
+            di += 1;
+            r
+        });
+    }
+}
+
 /// Assemble a standard third-angle engineering drawing — Front, Top, Right —
 /// of a solid, with the analytic dimensions auto-placed on each view (each view
 /// carries only the callouts that READ in it; edge-on ones are dropped). The
@@ -213,6 +488,7 @@ pub fn standard_drawing(
         view.centerlines = super::centerlines::centerlines(model, solid_id, proj);
         drawing.add_view(view);
     }
+    dedup_dimensions_global(&mut drawing);
     Ok(drawing)
 }
 
@@ -247,6 +523,7 @@ pub fn standard_drawing_hlr(
             model, solid_id, source, proj, name, pos, scale, min_span,
         )?);
     }
+    dedup_dimensions_global(&mut drawing);
     Ok(drawing)
 }
 
@@ -533,6 +810,7 @@ pub fn standard_drawing_auto(
         }
         drawing.add_view(view);
     }
+    dedup_dimensions_global(&mut drawing);
     Ok(drawing)
 }
 
@@ -612,14 +890,26 @@ mod tests {
         )
         .expect("standard drawing");
         assert_eq!(dwg.views.len(), 3, "front/top/right");
-        assert!(
-            dwg.views.iter().all(|v| !v.dimensions.is_empty()),
-            "every view auto-dimensioned"
-        );
+
+        // After dedup, each extent value appears EXACTLY once sheet-wide.
+        // A plain box (no cylinders) has three extents: X=40, Y=30, Z=20.
+        // Each shows in the view where it has its best (largest) projected span,
+        // which for a box at the standard layout is: FRONT (X+Z), TOP (Y).
+        // Some views may have zero callouts after dedup — that is correct.
+        let sheet_dims: Vec<&Dimension2d> = dwg.views.iter().flat_map(|v| &v.dimensions).collect();
+        let count = |kind: &str, val: f64| {
+            sheet_dims
+                .iter()
+                .filter(|d| d.kind == kind && (d.value - val).abs() < 1e-3)
+                .count()
+        };
+        assert_eq!(count("extent", 40.0), 1, "X=40 once sheet-wide");
+        assert_eq!(count("extent", 30.0), 1, "Y=30 once sheet-wide");
+        assert_eq!(count("extent", 20.0), 1, "Z=20 once sheet-wide");
+
         let svg = crate::drawing::render_drawing_svg(&dwg);
         // The drawing carries ISO dimension lines (offset, with arrowheads)
-        // and the EXACT values — 40 / 30 / 20 each read in the view that
-        // reveals them.
+        // and the EXACT values — 40 / 30 / 20 each appear in the SVG ink.
         assert!(svg.contains("dim-line"), "dimension lines rendered");
         assert!(svg.contains("dim-arrow"), "dimension arrowheads rendered");
         assert!(svg.contains("40.00"), "40mm extent value drawn");
@@ -663,5 +953,83 @@ mod tests {
             "label carries the value: {}",
             dia.label
         );
+    }
+
+    /// Build the shared 40×40×10 plate-with-Ø5-bore fixture used by the dedup
+    /// tests. A 2.5-radius (Ø5) cylinder drilled Z-axis through a 40×40×10
+    /// plate.
+    fn bored_plate_5mm() -> (crate::primitives::topology_builder::BRepModel, SolidId) {
+        let mut m = BRepModel::new();
+        let plate = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 40.0, 10.0)
+            .expect("plate"));
+        let bore = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -6.0), Vector3::Z, 2.5, 12.0)
+            .expect("bore"));
+        let part = crate::operations::boolean::boolean_operation(
+            &mut m,
+            plate,
+            bore,
+            crate::operations::boolean::BooleanOp::Difference,
+            crate::operations::boolean::BooleanOptions::default(),
+        )
+        .expect("drill");
+        (m, part)
+    }
+
+    #[test]
+    fn same_view_equal_value_parallel_same_interval_collapses_to_one() {
+        // Plate 40×40×10 with one Ø5 through-bore: FRONT shows the Z extent
+        // (10.00) AND the bore length (10.00) — same value, both vertical,
+        // same z-interval. Exactly one must survive, and it is the extent.
+        let (m, part) = bored_plate_5mm();
+        let mut dwg = standard_drawing(
+            &m,
+            part,
+            uuid::Uuid::nil(),
+            super::super::types::SheetSize::A3,
+            1.0,
+        )
+        .expect("sheet");
+        dedup_dimensions_global(&mut dwg);
+        let front = dwg.views.iter().find(|v| v.name == "FRONT").expect("front");
+        let tens: Vec<_> = front
+            .dimensions
+            .iter()
+            .filter(|d| (d.value - 10.0).abs() < 1e-6)
+            .collect();
+        assert_eq!(tens.len(), 1, "one 10.00 in FRONT, got {tens:?}");
+        assert_eq!(tens[0].kind, "extent", "the envelope extent wins the tie");
+    }
+
+    #[test]
+    fn cross_view_diameter_survives_only_in_axial_view() {
+        // The bore's Ø5 reads in TOP (axial view: camera −Z ∥ bore axis Z,
+        // hole shows as a true circle) and in FRONT (rectangle). It must
+        // survive ONLY in TOP.
+        let (m, part) = bored_plate_5mm();
+        let mut dwg = standard_drawing(
+            &m,
+            part,
+            uuid::Uuid::nil(),
+            super::super::types::SheetSize::A3,
+            1.0,
+        )
+        .expect("sheet");
+        dedup_dimensions_global(&mut dwg);
+        let in_view = |name: &str| {
+            dwg.views
+                .iter()
+                .find(|v| v.name == name)
+                .map(|v| {
+                    v.dimensions
+                        .iter()
+                        .any(|d| d.kind == "diameter" && (d.value - 5.0).abs() < 1e-6)
+                })
+                .unwrap_or(false)
+        };
+        assert!(in_view("TOP"), "Ø5 dimensioned in its circle view");
+        assert!(!in_view("FRONT"), "Ø5 not repeated in FRONT");
+        assert!(!in_view("RIGHT"), "Ø5 not repeated in RIGHT");
     }
 }
