@@ -1,0 +1,313 @@
+/** Perception tools — the agent's eyes: renders, X-rays, sections, certs. */
+
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { api, ok, fail, ApiError } from "../core.js";
+
+export function registerPerceptionTools(server: McpServer) {
+  server.tool(
+    "render_part",
+    "SEE a part: deterministic offscreen render as an image. mode 'ids' paints " +
+      "each face a flat color + returns a color→face_id legend (address " +
+      "topology); 'diagnostic' highlights defects; 'depth'/'normals' are exact " +
+      "G-buffer channels.",
+    {
+      part_id: z.number().int().describe("kernel part id from list_parts"),
+      mode: z
+        .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
+        .default("shaded"),
+      view: z.enum(["iso", "front", "top", "right"]).default("iso"),
+      size: z.number().int().min(64).max(2048).default(512),
+    },
+    async ({ part_id, mode, view, size }) => {
+      try {
+        const r = await api(
+          "GET",
+          `/api/agent/parts/${part_id}/render?mode=${mode}&view=${view}&size=${size}`,
+        );
+        const content: any[] = [
+          { type: "image", data: r.png_base64, mimeType: "image/png" },
+        ];
+        if (mode === "ids") {
+          content.push({
+            type: "text",
+            text: `face legend (rgb → face_id): ${JSON.stringify(r.face_legend)}`,
+          });
+        }
+        if (mode === "diagnostic") {
+          content.push({
+            type: "text",
+            text:
+              `defects — open_edges (red hole rims, missing faces): ${r.open_edges}; ` +
+              `nonmanifold_edges (magenta, overlapping faces): ${r.nonmanifold_edges}. ` +
+              `Both 0 = watertight. Front-face culled, so missing/flipped faces read as see-through holes.`,
+          });
+        }
+        return { content };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "ground_truth",
+    "The kernel's OWN account of a part — not a guess. Returns PROVENANCE " +
+      "(designed surface via revolve/loft/boolean/… vs a bare primitive " +
+      "stand-in), the computed validity certificate (brep_valid, watertight, " +
+      "manifold, euler, sound), and the display-mesh verdict " +
+      "(tessellation_clean + worst_face). Non-fakeable: `designed:false` or " +
+      "`sound:false` means stop and fix, not ship.",
+    { part_id: z.number().int().describe("kernel part id from list_parts") },
+    async ({ part_id }) => {
+      try {
+        return ok(await api("GET", `/api/agent/parts/${part_id}/truth`));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "occupancy_view",
+    "Non-deceivable SDF X-ray: a slice-stack ('#'=solid, '.'=empty) sampled " +
+      "from the kernel's EXACT solid — reveals internal cavities, wall " +
+      "thickness and through-holes a shaded render can hide. Each layer is a " +
+      "z-slice (rows by y, cols by x).",
+    {
+      part_id: z.number().int().describe("kernel part id from list_parts"),
+      n: z
+        .number()
+        .int()
+        .optional()
+        .default(20)
+        .describe("grid resolution per axis (clamped to 4..48)"),
+    },
+    async ({ part_id, n }) => {
+      try {
+        const r = await api("GET", `/api/agent/parts/${part_id}/occupancy?n=${n}`);
+        const summary = `occupancy n=${r.n} dims=${JSON.stringify(r.dims)} fill_fraction=${r.fill_fraction.toFixed(3)} bbox=${JSON.stringify(r.bbox)}`;
+        return {
+          content: [
+            { type: "text" as const, text: summary },
+            { type: "text" as const, text: r.slices },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "scene_view",
+    "SEE THE WHOLE SCENE: composite every part into one image from an orbit " +
+      "camera (azimuth/elevation, world-Z up), auto-framed. The way to inspect " +
+      "a multi-part scene from any angle. mode 'diagnostic' highlights open " +
+      "(red) / non-manifold (magenta) edges.",
+    {
+      az: z.number().default(35).describe("azimuth degrees around world Z"),
+      el: z.number().default(20).describe("elevation degrees above the horizon"),
+      mode: z
+        .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
+        .default("shaded"),
+      size: z.number().int().min(64).max(2048).default(720),
+      quality: z
+        .enum(["coarse", "medium", "fine"])
+        .default("medium")
+        .describe("coarse=fast, fine=resolve curved silhouettes"),
+    },
+    async ({ az, el, mode, size, quality }) => {
+      try {
+        const r = await api(
+          "GET",
+          `/api/agent/scene/orbit?az=${az}&el=${el}&mode=${mode}&size=${size}&quality=${quality}`,
+        );
+        return {
+          content: [
+            { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+            {
+              type: "text" as const,
+              text: `scene az=${az}° el=${el}° dir=${JSON.stringify(r.dir)} open=${r.open_edges} nm=${r.nonmanifold_edges}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "verify_part",
+    "EXPLICIT FULL CERTIFICATE — the expensive checks the ambient verdict " +
+      "skips: brep_valid + watertight + manifold + self-intersection-free + " +
+      "construction/tessellation/mesh-quality. The authoritative 'is this a " +
+      "real closed solid' answer; display-mesh edge counts are reported " +
+      "separately (T-junctions are render quality, not a defect). ALWAYS call " +
+      "after a boolean or multi-feature build. Returns the diagnostic image " +
+      "(red=open, magenta=non-manifold).",
+    {
+      part_id: z.number().int().describe("kernel part id from list_parts"),
+      view: z.enum(["iso", "front", "top", "right"]).default("iso"),
+    },
+    async ({ part_id, view }) => {
+      try {
+        // EXPLICIT FULL CERT: ?full=1 runs the complete (O(n²)) certificate. This
+        // is the verify path, so the full budget (TIMEOUT_MS) applies — we WANT the
+        // expensive checks here. Image + display-mesh counts from the render.
+        const p = await api("GET", `/api/agent/parts/${part_id}/perception?full=1`);
+        const r = await api(
+          "GET",
+          `/api/agent/parts/${part_id}/render?mode=diagnostic&view=${view}&size=720`,
+        );
+        const cert = p?.cert ?? null;
+        const valid = (cert?.brep_valid ?? p.valid) === true;
+        const sound = p?.sound === true;
+        const meshClean = r.open_edges === 0 && r.nonmanifold_edges === 0;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  part_id,
+                  sound,
+                  brep_valid: valid,
+                  brep_watertight: (cert?.watertight ?? p.watertight) === true,
+                  manifold: cert?.manifold ?? null,
+                  self_intersection_free: cert?.self_intersection_free ?? null,
+                  tessellation_clean: cert?.tessellation_clean ?? null,
+                  mesh_quality_clean: cert?.mesh_quality_clean ?? null,
+                  construction_consistent: cert?.construction_consistent ?? null,
+                  // Dual-eye gate: "consistent" | "inconsistent" | "not_applicable".
+                  // Feeds `sound` — an inconsistent dual-eye means the B-Rep cert and the
+                  // mesh cert disagree; the solid is flagged UNSOUND.
+                  eyes_consistent: cert?.eyes_consistent ?? "not_applicable",
+                  verdict: p?.verdict ??
+                    (!valid
+                      ? "BROKEN — B-Rep invalid (a real topological defect; see the image)"
+                      : meshClean
+                        ? "OK — valid closed solid"
+                        : "OK — valid solid; display mesh has tessellation T-junctions only (not a defect)"),
+                  display_mesh: {
+                    open_edges: r.open_edges,
+                    nonmanifold_edges: r.nonmanifold_edges,
+                    note: "display tessellation quality only — does NOT determine validity",
+                  },
+                  dims: p.dims ?? null,
+                  // Advisory dual-eye reconcile report. {"status":"pending"} when the async
+                  // worker has not yet completed for the current solid state. When ready:
+                  // {status, discrepancies:[{severity, kind, description}], coverage:{seen,total}}.
+                  reconcile: p?.reconcile ?? { status: "pending" },
+                  cert: cert ?? undefined,
+                },
+                null,
+                2,
+              ),
+            },
+            { type: "image", data: r.png_base64, mimeType: "image/png" },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "get_pointer",
+    "What is the HUMAN pointing at in the viewport? Returns their latest click " +
+      "(object, face_id, world position) joined with the kernel's hover report. " +
+      "Grounds 'this face / this hole / here'.",
+    {},
+    async () => {
+      try {
+        return ok(await api("GET", "/api/agent/pointer"));
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) {
+          return ok({ pointer: null, note: "user has not clicked anything yet" });
+        }
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "section_view",
+    "CUTAWAY: slice a part with a plane (point `p` + `normal`) and return the " +
+      "cross-section image + section area. The way to SEE a hollow interior, " +
+      "wall thickness, bores.",
+    {
+      part_id: z.number().int(),
+      p: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
+      normal: z.tuple([z.number(), z.number(), z.number()]).default([1, 0, 0]),
+    },
+    async ({ part_id, p, normal }) => {
+      try {
+        const q = `nx=${normal[0]}&ny=${normal[1]}&nz=${normal[2]}&px=${p[0]}&py=${p[1]}&pz=${p[2]}`;
+        const r = await api("GET", `/api/agent/parts/${part_id}/section?${q}`);
+        return {
+          content: [
+            { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+            {
+              type: "text" as const,
+              text: `section area=${r.section_area?.toFixed?.(2)} extent_u=${r.extent_u?.toFixed?.(2)} extent_v=${r.extent_v?.toFixed?.(2)} units=${r.units}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "dimension_part",
+    "DIMENSION a part in one call: a 2×2 multi-view image with leader+label " +
+      "callouts AND the structured table (id, kind, value, face ids, 3D " +
+      "anchor). Values read off analytic surfaces, never measured from pixels.",
+    { part_id: z.number().int().describe("kernel part id from list_parts") },
+    async ({ part_id }) => {
+      try {
+        const r = await api("GET", `/api/agent/parts/${part_id}/dimensions`);
+        const rows = (r.dimensions ?? [])
+          .map(
+            (d: any) =>
+              `${d.id}  ${d.label}  (${d.kind} ${d.value.toFixed(2)}${
+                d.unit === "deg" ? "°" : ""
+              })  faces=[${d.entities.join(",")}]  @[${d.anchor
+                .map((c: number) => c.toFixed(1))
+                .join(", ")}]`,
+          )
+          .join("\n");
+        const overall = `overall L×W×H = ${r.dims.l.toFixed(2)} × ${r.dims.w.toFixed(
+          2,
+        )} × ${r.dims.h.toFixed(2)} ${r.units}`;
+        return {
+          content: [
+            { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
+            { type: "text" as const, text: `${overall}\n${rows}` },
+          ],
+        };
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "part_coverage",
+    "COVERAGE honesty: which faces the 4 standard views actually SHOW vs leave " +
+      "unseen — so you know when to request another camera angle instead of " +
+      "assuming you saw the whole part.",
+    { part_id: z.number().int().describe("kernel part id from list_parts") },
+    async ({ part_id }) => {
+      try {
+        return ok(await api("GET", `/api/agent/parts/${part_id}/coverage`));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+}
