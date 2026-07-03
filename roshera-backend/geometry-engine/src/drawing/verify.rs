@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use super::layout::{compute_layout, view_geometry_rect, SheetItemKind};
 use super::svg::{frame_margins, title_block_size};
-use super::types::{Drawing, ProjectedView, ProjectionType};
+use super::types::{Drawing, ProjectionType};
 
 /// Severity of a single quality finding. `Error` fails the report;
 /// `Warning` is advisory (the drawing is usable but sub-standard).
