@@ -37,6 +37,7 @@ use dxf::tables::Layer;
 use dxf::{Color, Drawing as DxfDrawing, LwPolylineVertex, Point};
 use thiserror::Error;
 
+use super::layout::{compute_layout, SheetItemKind};
 use super::types::{Drawing, ProjectedView, SheetSize};
 
 /// Errors produced during DXF rendering.
@@ -55,6 +56,12 @@ const LAYER_FRAME: &str = "FRAME";
 const LAYER_TITLEBLOCK: &str = "TITLEBLOCK";
 const LAYER_TITLEBLOCK_TEXT: &str = "TITLEBLOCK_TEXT";
 const LAYER_NOTES: &str = "NOTES";
+/// Layer for view label TEXT entities (`FRONT (1:1)`, `TOP (2:1)`, …).
+/// Separate from per-view geometry layers so the user can toggle annotations
+/// independently of the edge geometry.
+const LAYER_VIEW_LABELS: &str = "VIEW_LABELS";
+/// Layer for dimension callout TEXT entities.
+const LAYER_DIMENSIONS: &str = "DIMENSIONS";
 
 // AutoCAD Color Index (ACI) values used for layer colours. ACI 7 is
 // the "ByLayer" default that renders black on a white background and
@@ -65,6 +72,20 @@ const ACI_BLACK: u8 = 7;
 const ACI_GREY: u8 = 8;
 
 /// Render a [`Drawing`] to a DXF byte buffer.
+///
+/// Label and dimension TEXT entities are derived from [`compute_layout`] —
+/// the same placement model the SVG renderer inks and `verify_drawing`
+/// checks. This guarantees that the DXF and SVG/PDF carry identical text
+/// positions; a label that the verifier certifies as non-colliding is
+/// equally non-colliding in the DXF.
+///
+/// # Coordinate convention
+///
+/// DXF model-space uses +Y-up (AutoCAD convention), while the layout uses
+/// SVG sheet coordinates (+Y-down). The conversion is:
+///   `y_dxf = sheet_h − y_svg`
+/// Applied to `bbox.y1` (the SVG baseline of a text item):
+///   `y_dxf = sheet_h − bbox.y1`
 pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> {
     let mut dxf = DxfDrawing::new();
 
@@ -73,6 +94,8 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     register_layer(&mut dxf, LAYER_TITLEBLOCK, ACI_BLACK);
     register_layer(&mut dxf, LAYER_TITLEBLOCK_TEXT, ACI_BLACK);
     register_layer(&mut dxf, LAYER_NOTES, ACI_BLACK);
+    register_layer(&mut dxf, LAYER_VIEW_LABELS, ACI_BLACK);
+    register_layer(&mut dxf, LAYER_DIMENSIONS, ACI_BLACK);
     // One layer per view, named after the view. Duplicate names are
     // resolved by suffixing with an index — AutoCAD requires layer
     // names to be unique, and two views legitimately can share a
@@ -90,6 +113,12 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     for (view, layer) in drawing.views.iter().zip(view_layers.iter()) {
         emit_view_polylines(&mut dxf, view, layer, sheet_h);
     }
+
+    // -- View labels + dimension text from the layout ------------------
+    // `compute_layout` is the single canonical placement model shared by
+    // SVG ink, PDF transcode, and now DXF. Labels and dimension texts are
+    // converted from SVG y-down to DXF y-up: y_dxf = sheet_h − y_svg.
+    emit_labels_from_layout(&mut dxf, drawing, sheet_h);
 
     // -- Title block ---------------------------------------------------
     emit_title_block(&mut dxf, drawing);
@@ -239,6 +268,66 @@ fn emit_view_polylines(
         let mut ent = Entity::new(EntityType::LwPolyline(lw));
         ent.common = common;
         dxf.add_entity(ent);
+    }
+}
+
+/// Emit view-label and dimension-text TEXT entities from the layout model.
+///
+/// Reads [`SheetItemKind::ViewLabel`] and [`SheetItemKind::DimensionText`]
+/// items from [`compute_layout`] and converts their SVG-space bboxes to DXF
+/// y-up coordinates before calling [`add_text`]. This is the single
+/// authoritative placement path for annotation text; the SVG renderer uses
+/// the same layout items.
+///
+/// **DXF y-up conversion:** the layout's `bbox.y1` is the text baseline in
+/// SVG (+y down) coordinates. In DXF (+y up): `y_dxf = sheet_h − bbox.y1`.
+/// The x coordinate (`bbox.x0`) is unchanged.
+fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64) {
+    let layout = compute_layout(drawing);
+    for item in &layout.items {
+        match item.kind {
+            SheetItemKind::ViewLabel => {
+                let text = item.text.as_deref().unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                // SVG text-anchor is bbox.x0; SVG baseline is bbox.y1 (y-down).
+                let x = item.bbox.x0;
+                let y = sheet_h - item.bbox.y1;
+                add_text(
+                    dxf,
+                    LAYER_VIEW_LABELS,
+                    x,
+                    y,
+                    3.6, // VIEW_LABEL_FONT_MM — matches the SVG stylesheet
+                    text,
+                    HorizontalTextJustification::Left,
+                );
+            }
+            SheetItemKind::DimensionText => {
+                let text = item.text.as_deref().unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                // bbox.x0 is the left edge of the centred text span.
+                // Use the horizontal centre as the text anchor to match
+                // the SVG `text-anchor: middle` convention for dim labels.
+                let cx = 0.5 * (item.bbox.x0 + item.bbox.x1);
+                // bbox.y0 is the top of the glyph (ascender), y1 is the baseline.
+                let y = sheet_h - item.bbox.y1;
+                add_text(
+                    dxf,
+                    LAYER_DIMENSIONS,
+                    cx,
+                    y,
+                    3.1, // DIM_TEXT_FONT_MM — matches the SVG stylesheet
+                    text,
+                    HorizontalTextJustification::Center,
+                );
+            }
+            // Geometry and title-block items are handled by their own emitters.
+            SheetItemKind::ViewGeometry | SheetItemKind::TitleBlock => {}
+        }
     }
 }
 
@@ -530,6 +619,7 @@ fn format_scale(scale: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drawing::layout::{compute_layout, SheetItemKind};
     use crate::drawing::types::{Drawing, SheetSize};
 
     /// Smoke test: an empty drawing produces a DXF that starts with
@@ -576,6 +666,157 @@ mod tests {
         }
         let layers = assign_view_layers(&drawing.views);
         assert_eq!(layers, vec!["Detail", "Detail_2", "Detail_3"]);
+    }
+
+    /// Every view label appears EXACTLY ONCE in the DXF TEXT entities, at the
+    /// layout item's converted coordinates (DXF +Y-up: y_dxf = sheet_h − y_svg).
+    ///
+    /// The SVG renderer places each label at `(bbox.x0, bbox.y1)` in sheet
+    /// coords (y1 is the baseline in y-down space). The DXF mirror must use the
+    /// same source (`SheetItemKind::ViewLabel` items from `compute_layout`) and
+    /// convert to DXF y-up: `x_dxf = bbox.x0`, `y_dxf = sheet_h − bbox.y1`.
+    ///
+    /// This test is the RED gate: it fails until `render_drawing_dxf` is
+    /// updated to emit view labels from the layout.
+    #[test]
+    fn view_labels_emitted_from_layout_coordinates() {
+        use crate::drawing::types::{
+            Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
+        };
+        let mut drawing = Drawing::new("LabelTest", SheetSize::A3);
+        let sheet_h = drawing.sheet_size.height();
+
+        for (name, proj, pos) in [
+            ("FRONT", ProjectionType::Front, [80.0, 110.0_f64]),
+            ("TOP", ProjectionType::Top, [80.0, 200.0]),
+        ] {
+            drawing.views.push(ProjectedView {
+                id: ProjectedViewId::new(),
+                name: name.to_string(),
+                projection: proj,
+                source: ViewSource::Part {
+                    part_id: uuid::Uuid::nil(),
+                    solid_id: 0,
+                },
+                position_mm: pos,
+                scale: 1.0,
+                polylines: vec![Polyline2d::from_points(vec![
+                    [0.0, 0.0],
+                    [40.0, 0.0],
+                    [40.0, 30.0],
+                    [0.0, 30.0],
+                    [0.0, 0.0],
+                ])],
+                extent: ViewExtent {
+                    min_x: 0.0,
+                    min_y: 0.0,
+                    max_x: 40.0,
+                    max_y: 30.0,
+                },
+                dimensions: Vec::new(),
+                centerlines: Vec::new(),
+                hidden_polylines: Vec::new(),
+                circles: Vec::new(),
+                hidden_circles: Vec::new(),
+            });
+        }
+
+        let layout = compute_layout(&drawing);
+        let dxf_bytes = render_drawing_dxf(&drawing).expect("dxf render");
+        let dxf_text = String::from_utf8_lossy(&dxf_bytes);
+
+        // Collect all TEXT value strings from the DXF output.
+        // DXF TEXT entities encode the value after a "  1\n" group code.
+        fn text_values(dxf: &str) -> Vec<String> {
+            let mut vals = Vec::new();
+            let mut lines = dxf.lines().peekable();
+            while let Some(line) = lines.next() {
+                if line.trim() == "1" {
+                    if let Some(val) = lines.next() {
+                        vals.push(val.trim().to_string());
+                    }
+                }
+            }
+            vals
+        }
+
+        let all_texts = text_values(&dxf_text);
+
+        // Parse DXF TEXT entities into (x, y, value) triples.
+        // DXF group codes: 10=x, 20=y, 1=text value. Each follows immediately
+        // after the group code line. We extract all triples in order.
+        fn parse_text_entities(dxf: &str) -> Vec<(f64, f64, String)> {
+            let mut result = Vec::new();
+            let lines: Vec<&str> = dxf.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                let code = lines[i].trim();
+                if code == "TEXT" {
+                    // Found a TEXT entity — scan forward for group codes 10, 20, 1.
+                    let mut x = 0.0_f64;
+                    let mut y = 0.0_f64;
+                    let mut val = String::new();
+                    let mut j = i + 1;
+                    // Scan up to 60 lines to collect the entity's fields.
+                    while j < lines.len() && j < i + 60 {
+                        let gc = lines[j].trim();
+                        if let Some(next) = lines.get(j + 1) {
+                            match gc {
+                                "10" => {
+                                    x = next.trim().parse().unwrap_or(0.0);
+                                }
+                                "20" => {
+                                    y = next.trim().parse().unwrap_or(0.0);
+                                }
+                                "1" => {
+                                    val = next.trim().to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Stop at next entity marker (a line containing just "0"
+                        // followed by an entity/section keyword).
+                        if gc == "0" && j > i {
+                            break;
+                        }
+                        j += 2;
+                    }
+                    if !val.is_empty() {
+                        result.push((x, y, val));
+                    }
+                }
+                i += 1;
+            }
+            result
+        }
+
+        let text_entities = parse_text_entities(&dxf_text);
+
+        for item in layout
+            .items
+            .iter()
+            .filter(|i| i.kind == SheetItemKind::ViewLabel)
+        {
+            let label = item.text.as_deref().unwrap_or("");
+            // Each label must appear EXACTLY ONCE.
+            let count = all_texts.iter().filter(|t| t.as_str() == label).count();
+            assert_eq!(
+                count, 1,
+                "label '{label}' must appear exactly once in DXF TEXT entities (found {count})"
+            );
+            // The DXF TEXT entity for this label must be at the layout-derived coords.
+            let x_expected = item.bbox.x0;
+            // y_dxf = sheet_h − bbox.y1  (SVG baseline → DXF y-up)
+            let y_expected = sheet_h - item.bbox.y1;
+            let found = text_entities.iter().find(|(x, y, v)| {
+                v.as_str() == label && (x - x_expected).abs() < 0.5 && (y - y_expected).abs() < 0.5
+            });
+            assert!(
+                found.is_some(),
+                "label '{label}' TEXT entity not found at x≈{x_expected:.2} y≈{y_expected:.2} \
+                 (DXF y-up coords); entities: {text_entities:?}"
+            );
+        }
     }
 
     /// Layer names with DXF-reserved characters must be sanitised.

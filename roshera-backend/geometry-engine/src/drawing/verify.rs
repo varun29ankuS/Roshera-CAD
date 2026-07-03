@@ -22,8 +22,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::layout::{compute_layout, view_geometry_rect, SheetItemKind};
-use super::svg::{frame_margins, title_block_size};
+use super::layout::{compute_layout, Rect2, SheetItemKind};
+use super::svg::frame_margins;
 use super::types::{Drawing, ProjectionType};
 
 /// Severity of a single quality finding. `Error` fails the report;
@@ -114,55 +114,14 @@ impl DrawingQualityReport {
     }
 }
 
-// ── Internal rectangle (SVG coords, y down) ─────────────────────────
+// ── Rect2 helpers used only by this module ────────────────────────────
 
-#[derive(Clone, Copy)]
-struct Rect {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
-}
-
-impl Rect {
-    fn w(&self) -> f64 {
-        (self.x1 - self.x0).max(0.0)
-    }
-    fn h(&self) -> f64 {
-        (self.y1 - self.y0).max(0.0)
-    }
-    fn area(&self) -> f64 {
-        self.w() * self.h()
-    }
-    fn cx(&self) -> f64 {
-        0.5 * (self.x0 + self.x1)
-    }
-    fn cy(&self) -> f64 {
-        0.5 * (self.y0 + self.y1)
-    }
-
-    /// Overlap with positive interior area beyond `tol` mm of slack.
-    fn intersects(&self, o: &Rect, tol: f64) -> bool {
-        self.x0 < o.x1 - tol && o.x0 < self.x1 - tol && self.y0 < o.y1 - tol && o.y0 < self.y1 - tol
-    }
-
-    /// Is `o` fully inside `self` (allowing `tol` mm of overhang)?
-    fn contains_rect(&self, o: &Rect, tol: f64) -> bool {
-        o.x0 >= self.x0 - tol
-            && o.x1 <= self.x1 + tol
-            && o.y0 >= self.y0 - tol
-            && o.y1 <= self.y1 + tol
-    }
-}
-
-/// Convert a `layout::Rect2` to the internal `Rect` used by the verifier.
-fn rect_from_layout(r: super::layout::Rect2) -> Rect {
-    Rect {
-        x0: r.x0,
-        y0: r.y0,
-        x1: r.x1,
-        y1: r.y1,
-    }
+/// True when `inner` is fully inside `outer` (allowing `tol` mm of overhang).
+fn rect_contains(outer: &Rect2, inner: &Rect2, tol: f64) -> bool {
+    inner.x0 >= outer.x0 - tol
+        && inner.x1 <= outer.x1 + tol
+        && inner.y0 >= outer.y0 - tol
+        && inner.y1 <= outer.y1 + tol
 }
 
 // ── Tunables (all millimetres) ──────────────────────────────────────
@@ -194,25 +153,49 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
 
     let w = drawing.sheet_size.width();
     let h = drawing.sheet_size.height();
+
+    // ── Single layout computation — all geometry reads come from here ────
+    // `compute_layout` is the one canonical placement model: it owns
+    // ViewGeometry bboxes, the TitleBlock rect, ViewLabel placements, and
+    // PlacedDimension anchors. `verify_drawing` reads from it; it does not
+    // recompute any geometry independently.
+    let layout = compute_layout(drawing);
+
+    // Derive the drawing frame from the sheet margins. The frame is the
+    // inset rectangle that encloses all view geometry and labels; it is
+    // NOT a layout item (layout items live inside the frame), but it must
+    // be consistent with what the renderer draws. `frame_margins` is the
+    // single definition shared by svg.rs, layout.rs, and verify.rs.
     let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
-    let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
-    let frame = Rect {
+    let frame = Rect2 {
         x0: ml,
         y0: mt,
         x1: w - mr,
         y1: h - mb,
     };
-    let title_block = Rect {
-        x0: frame.x1 - tb_w,
-        y0: frame.y1 - tb_h,
-        x1: frame.x1,
-        y1: frame.y1,
-    };
 
-    let mut rects: Vec<(String, Rect)> = Vec::new();
+    // The title-block rect is read directly from the layout's TitleBlock
+    // item — the same rect the renderer draws and the viewer sees.
+    let title_block: Rect2 = layout
+        .items
+        .iter()
+        .find(|it| it.kind == SheetItemKind::TitleBlock)
+        .map(|it| it.bbox)
+        .unwrap_or_else(|| {
+            // Degenerate (zero-view) drawing: use an empty rect at the
+            // bottom-right corner so overlap checks never fire spuriously.
+            Rect2 {
+                x0: frame.x1,
+                y0: frame.y1,
+                x1: frame.x1,
+                y1: frame.y1,
+            }
+        });
+
+    let mut rects: Vec<(String, Rect2)> = Vec::new();
     let mut ink_area = 0.0;
 
-    for v in &drawing.views {
+    for (idx, v) in drawing.views.iter().enumerate() {
         let name = v.name.clone();
 
         if v.polylines.is_empty() && v.hidden_polylines.is_empty() {
@@ -223,8 +206,16 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
             ));
         }
 
-        if let Some(r2) = view_geometry_rect(v, h) {
-            let r = rect_from_layout(r2);
+        // Read the view's geometry rect from the layout's ViewGeometry item
+        // (keyed by owner_view index) instead of calling view_geometry_rect
+        // independently. This is the same rect the renderer uses.
+        let geo = layout
+            .items
+            .iter()
+            .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(idx))
+            .map(|it| it.bbox);
+
+        if let Some(r) = geo {
             ink_area += r.area();
             // Dimensions render offset LEFT of and BELOW the view (see
             // svg::render_dimensions), so the space they occupy is part of
@@ -234,14 +225,14 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
             let footprint = if v.dimensions.is_empty() {
                 r
             } else {
-                Rect {
+                Rect2 {
                     x0: r.x0 - DIM_MARGIN_MM,
                     y0: r.y0,
                     x1: r.x1,
                     y1: r.y1 + DIM_MARGIN_MM,
                 }
             };
-            if !frame.contains_rect(&footprint, SLACK_MM) {
+            if !rect_contains(&frame, &footprint, SLACK_MM) {
                 issues.push(error(
                     DrawingIssueKind::ViewOutsideFrame,
                     format!("view '{name}' (with its dimensions) extends past the drawing frame"),
@@ -286,13 +277,12 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
         ));
     }
 
-    check_alignment(drawing, h, &mut issues);
+    check_alignment(drawing, &layout, &mut issues);
 
     // ── ViewLabelCollision detection ─────────────────────────────────────
-    // Build the layout and check every (ViewLabel, *) pair for overlap.
-    // At least one of the two items must be a ViewLabel — dim-text pairs
-    // fall under the existing DimensionLabelCollision kind.
-    let layout = compute_layout(drawing);
+    // Check every (ViewLabel, *) pair for overlap using the layout already
+    // computed above. At least one of the two items must be a ViewLabel —
+    // dim-text pairs fall under the existing DimensionLabelCollision kind.
     let texts: Vec<&super::layout::SheetItem> = layout
         .items
         .iter()
@@ -329,21 +319,41 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
 
 /// Third-angle arrangement: Top directly above Front (shared x-centre),
 /// Right directly beside Front (shared y-centre).
-fn check_alignment(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<DrawingIssue>) {
-    let rect_of = |want: fn(&ProjectionType) -> bool| -> Option<Rect> {
+///
+/// Reads each view's geometry rect from the `layout`'s `ViewGeometry` items
+/// (keyed by `owner_view` index into `drawing.views`) — no independent
+/// coordinate computation. The drawing reference is needed only to look up
+/// each view's `ProjectionType`.
+fn check_alignment(
+    drawing: &Drawing,
+    layout: &super::layout::SheetLayout,
+    issues: &mut Vec<DrawingIssue>,
+) {
+    // For each projection kind, find the ViewGeometry item whose owner_view
+    // index points to a view with that projection.
+    let rect_of = |want: fn(&ProjectionType) -> bool| -> Option<Rect2> {
         drawing
             .views
             .iter()
-            .find(|v| want(&v.projection))
-            .and_then(|v| view_geometry_rect(v, sheet_h))
-            .map(rect_from_layout)
+            .enumerate()
+            .find(|(_, v)| want(&v.projection))
+            .and_then(|(idx, _)| {
+                layout
+                    .items
+                    .iter()
+                    .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(idx))
+                    .map(|it| it.bbox)
+            })
     };
+
     let front = rect_of(|p| matches!(p, ProjectionType::Front));
     let top = rect_of(|p| matches!(p, ProjectionType::Top));
     let right = rect_of(|p| matches!(p, ProjectionType::Right));
 
     if let (Some(f), Some(t)) = (front, top) {
-        if (f.cx() - t.cx()).abs() > ALIGN_TOL_MM {
+        let fcx = 0.5 * (f.x0 + f.x1);
+        let tcx = 0.5 * (t.x0 + t.x1);
+        if (fcx - tcx).abs() > ALIGN_TOL_MM {
             issues.push(warning(
                 DrawingIssueKind::ProjectionMisaligned,
                 "Top view is not vertically aligned over the Front view (third-angle)".to_string(),
@@ -352,7 +362,9 @@ fn check_alignment(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<DrawingIssu
         }
     }
     if let (Some(f), Some(r)) = (front, right) {
-        if (f.cy() - r.cy()).abs() > ALIGN_TOL_MM {
+        let fcy = 0.5 * (f.y0 + f.y1);
+        let rcy = 0.5 * (r.y0 + r.y1);
+        if (fcy - rcy).abs() > ALIGN_TOL_MM {
             issues.push(warning(
                 DrawingIssueKind::ProjectionMisaligned,
                 "Right view is not horizontally aligned with the Front view (third-angle)"
