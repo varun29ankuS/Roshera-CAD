@@ -242,6 +242,14 @@ fn auto_drawing_passes_quality() {
 /// 10.00 dims while the quality report said passed:true. These tests make
 /// that lie impossible.
 fn six_hole_plate() -> (BRepModel, u32) {
+    // The exact live-defect geometry from 2026-07-03: the plate was built at
+    // world x = −80, NOT at the origin. The offset is load-bearing — the
+    // legacy view label anchors at view-local x = 0 (the projection of the
+    // WORLD ORIGIN), so an off-origin part's labels drift ~80·scale mm to
+    // the right of their own view and garble into the neighbouring cell
+    // ("RIGHT FR(2:1)ONT" on the live PDF). An origin-centred fixture hides
+    // the defect entirely.
+    const CX: f64 = -80.0;
     let mut m = BRepModel::new();
     let plate = match TopologyBuilder::new(&mut m)
         .create_box_3d(40.0, 40.0, 10.0)
@@ -250,12 +258,22 @@ fn six_hole_plate() -> (BRepModel, u32) {
         GeometryId::Solid(s) => s,
         o => panic!("expected solid, got {o:?}"),
     };
+    // Move the blank off-origin BEFORE any boolean (translate-after-boolean
+    // is a known open kernel bug; a plain primitive translates cleanly).
+    geometry_engine::operations::transform::translate(
+        &mut m,
+        vec![plate],
+        Vector3::new(-1.0, 0.0, 0.0),
+        80.0,
+        geometry_engine::operations::transform::TransformOptions::default(),
+    )
+    .expect("translate plate off-origin");
     let mut part = plate;
     for k in 0..6 {
         let th = (60.0 * k as f64).to_radians();
         let bore = match TopologyBuilder::new(&mut m)
             .create_cylinder_3d(
-                Point3::new(12.0 * th.cos(), 12.0 * th.sin(), -6.0),
+                Point3::new(CX + 12.0 * th.cos(), 12.0 * th.sin(), -6.0),
                 Vector3::Z,
                 2.5,
                 12.0,
@@ -298,16 +316,14 @@ fn six_hole_plate_sheet_defects_are_caught_not_certified() {
     assert!(!report.passed, "a defective sheet must not certify");
 }
 
-/// BLOCKED half of the 2026-07-03 defect (see task-1-report.md): the brief
-/// expected the six-hole-plate's legacy view labels to collide. Modeling
-/// the TRUE ink positions (and the brief's below-view formula as well)
-/// shows the current 4-view auto layout keeps every label >= 2.2 mm clear
-/// of all other text on this fixture — no bbox pair overlaps. The DETECTOR
-/// itself is proven by `overlapping_view_labels_flagged` below. Un-ignore
-/// once a fixture that genuinely collides is identified (or if Task 2/3
-/// layout churn re-introduces the risk this assertion guards).
+/// The other half of the 2026-07-03 defect: the live plate was built at
+/// x = −80, and because the legacy label anchors at the WORLD ORIGIN's
+/// projection (view-local x = 0), every label drifts ~80·scale mm right of
+/// its own view — FRONT's label lands on RIGHT's ("RIGHT FR(2:1)ONT" on
+/// the live PDF). With the fixture now off-origin like the live part, the
+/// collision must be caught. (An origin-centred plate genuinely does not
+/// collide — that near-miss hid this defect from the earlier fixture.)
 #[test]
-#[ignore = "BLOCKED: six-hole-plate labels do not overlap under the current auto layout — see .superpowers/sdd/task-1-report.md bbox dump"]
 fn six_hole_plate_view_labels_collide() {
     let (m, part) = six_hole_plate();
     let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
@@ -386,31 +402,52 @@ fn layout_label_model_matches_svg_ink() {
         .filter(|i| i.kind == SheetItemKind::ViewLabel)
         .collect();
     assert_eq!(modeled.len(), dwg.views.len(), "one label item per view");
-    // Check view 0 anchor against the resolved SVG ink position.
-    let v = &dwg.views[0];
-    let sheet_h = dwg.sheet_size.height();
-    let ink_x = v.position_mm[0];
-    let ink_y = (sheet_h - v.position_mm[1]) + v.scale * (v.extent.min_y - 4.0);
-    let lbl = modeled
-        .iter()
-        .find(|i| i.owner_view == Some(0))
-        .expect("view0 label");
-    assert!(
-        (lbl.bbox.x0 - ink_x).abs() < 0.1,
-        "x {} vs ink {}",
-        lbl.bbox.x0,
-        ink_x
-    );
-    assert!(
-        (lbl.bbox.y1 - ink_y).abs() < 0.1,
-        "baseline {} vs ink {}",
-        lbl.bbox.y1,
-        ink_y
-    );
-    // The SVG must still contain the legacy in-group label (removed in
-    // Task 3), with the raw local coordinates the ink formula starts from.
-    assert!(
-        svg.contains("<text class=\"label\""),
-        "legacy label present pre-fix"
-    );
+
+    // Parse the ACTUAL ink from the emitted SVG — never recompute the
+    // model's own formula (that would make this test tautological). Each
+    // view group is `translate(tx ty) scale(sx -sx)`, its label
+    // `<text class="label" x="0" y="{ylocal}" transform="scale(1 -1)">`,
+    // and SVG composes transforms parent-then-element, so the anchor inks
+    // at (tx, ty + sx·ylocal).
+    fn num_after<'a>(s: &'a str, key: &str) -> (f64, &'a str) {
+        let start = s.find(key).map(|i| i + key.len());
+        let rest = start.map(|i| &s[i..]).unwrap_or("");
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .unwrap_or(rest.len());
+        (rest[..end].parse::<f64>().unwrap_or(f64::NAN), &rest[end..])
+    }
+    let mut ink: Vec<(f64, f64)> = Vec::new();
+    for chunk in svg.split("<g class=\"view\"").skip(1) {
+        let (tx, rest) = num_after(chunk, "translate(");
+        let (ty, rest) = num_after(rest, " ");
+        let (sx, rest) = num_after(rest, "scale(");
+        let (ylocal, _) = num_after(rest, "<text class=\"label\" x=\"0\" y=\"");
+        assert!(
+            tx.is_finite() && ty.is_finite() && sx.is_finite() && ylocal.is_finite(),
+            "failed to parse a view group's label ink from the SVG"
+        );
+        ink.push((tx, ty + sx * ylocal));
+    }
+    assert_eq!(ink.len(), dwg.views.len(), "one inked label per view");
+
+    // The model must match the ink for EVERY view, not just the first.
+    for (i, (ink_x, ink_y)) in ink.iter().enumerate() {
+        let lbl = modeled
+            .iter()
+            .find(|it| it.owner_view == Some(i))
+            .expect("modeled label for view");
+        assert!(
+            (lbl.bbox.x0 - ink_x).abs() < 0.1,
+            "view {i}: modeled x {} vs ink {}",
+            lbl.bbox.x0,
+            ink_x
+        );
+        assert!(
+            (lbl.bbox.y1 - ink_y).abs() < 0.1,
+            "view {i}: modeled baseline {} vs ink {}",
+            lbl.bbox.y1,
+            ink_y
+        );
+    }
 }
