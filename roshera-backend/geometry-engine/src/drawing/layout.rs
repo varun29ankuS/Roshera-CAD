@@ -19,10 +19,13 @@ use super::types::{Drawing, ProjectedView};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Unscaled CSS font size of the `.label` class (px == mm in viewBox units).
-/// The label element sits INSIDE the view's `scale(sx, -sx)` group so the
-/// actual ink height is `VIEW_LABEL_FONT_BASE_MM * view.scale`.
-pub const VIEW_LABEL_FONT_BASE_MM: f64 = 3.6;
+/// Constant CSS font size of the `.label` class (px == mm in viewBox units).
+/// Labels are placed in sheet space at this fixed size — never inside a
+/// view's `scale(sx, -sx)` group, so the font is invariant to view scale.
+pub const VIEW_LABEL_FONT_MM: f64 = 3.6;
+
+/// Alias used by callers that predate the rename.
+pub const VIEW_LABEL_FONT_BASE_MM: f64 = VIEW_LABEL_FONT_MM;
 
 /// CSS font size of the `.dim-text` class (px == mm). Dimension text is
 /// emitted in sheet space so this is the actual ink height.
@@ -38,6 +41,13 @@ pub const GLYPH_ADVANCE_EM: f64 = 0.62;
 const STANDOFF: f64 = 11.0; // first dim line clear of the silhouette
 const STACK: f64 = 8.0; // gap between successive parallel dim lines
 const TGAP: f64 = 1.4; // label sits TGAP above the dim line
+
+/// Gap between a view's geometry rect edge and its label baseline (mm).
+const LABEL_GAP: f64 = 2.0;
+
+/// Collision tolerance: two label boxes overlap only when they share more
+/// than this many mm of positive interior.
+const LABEL_TOL: f64 = 0.2;
 
 // ── Rect2 ──────────────────────────────────────────────────────────────────────
 
@@ -65,6 +75,15 @@ impl Rect2 {
     /// interior intersection.
     pub fn intersects(&self, o: &Rect2, tol: f64) -> bool {
         self.x0 < o.x1 - tol && o.x0 < self.x1 - tol && self.y0 < o.y1 - tol && o.y0 < self.y1 - tol
+    }
+
+    /// Total area of intersection with `o` (zero if they don't overlap).
+    fn overlap_area(&self, o: &Rect2) -> f64 {
+        let ix0 = self.x0.max(o.x0);
+        let ix1 = self.x1.min(o.x1);
+        let iy0 = self.y0.max(o.y0);
+        let iy1 = self.y1.min(o.y1);
+        ((ix1 - ix0).max(0.0)) * ((iy1 - iy0).max(0.0))
     }
 }
 
@@ -120,14 +139,16 @@ pub struct SheetLayout {
     pub items: Vec<SheetItem>,
 }
 
-// ── view_geometry_rect ─────────────────────────────────────────────────────────
+// ── view_geometry_rect (canonical, single implementation) ──────────────────────
 
 /// Bounding rectangle (sheet coords) of a view's drawn edges — visible +
 /// hidden polylines, falling back to the stored `extent` corners when a
 /// view has no polylines yet.
 ///
-/// Matches the `view_geometry_rect` that `verify.rs` previously owned; moved
-/// here so the layout model and the verifier share one implementation.
+/// This is the single canonical implementation used by both `compute_layout`
+/// and `compute_dim_text_items`. The earlier `view_sheet_bbox_arr` helper
+/// (which duplicated this logic returning `[f64;4]` instead of `Rect2`) has
+/// been removed; callers that need the array form destructure `Rect2` directly.
 pub(crate) fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<Rect2> {
     let mut x0 = f64::INFINITY;
     let mut y0 = f64::INFINITY;
@@ -162,23 +183,150 @@ pub(crate) fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<R
     }
 }
 
+// ── place_view_labels ─────────────────────────────────────────────────────────
+
+/// Place view labels in sheet space with deterministic collision fallback.
+///
+/// Placement rules (in order):
+/// 1. 2 mm ABOVE the view's own geometry rect, left-aligned (top-left slot).
+/// 2. 2 mm above the rect, horizontally centred (top-centre slot).
+/// 3. 2 mm BELOW the geometry rect, left-aligned (bottom-left slot).
+/// 4. 2 mm to the RIGHT of the rect's top-right corner (right-of-top slot).
+/// 5. If all four slots collide with already-placed items, choose the slot
+///    with the least total overlap area (least-overlap fallback). The
+///    verifier will flag the residual collision via `ViewLabelCollision`.
+///
+/// Views are processed in index order so the output is deterministic.
+/// Collision is checked against every already-placed label AND every
+/// `ViewGeometry` item AND the title block, with `LABEL_TOL` tolerance.
+pub fn place_view_labels(drawing: &Drawing, placed: &[SheetItem]) -> Vec<SheetItem> {
+    let h = drawing.sheet_size.height();
+    let mut result: Vec<SheetItem> = Vec::new();
+
+    for (idx, view) in drawing.views.iter().enumerate() {
+        let label_text = format!("{} ({})", view.name, format_scale(view.scale));
+        let font = VIEW_LABEL_FONT_MM;
+
+        let gr = view_geometry_rect(view, h);
+
+        // Generate the four candidate label positions from the view's own rect.
+        // When the view has no computable geometry rect (degenerate / empty), fall
+        // back to the view's declared position_mm as the anchor.
+        let candidates: [(f64, f64); 4] = match gr {
+            Some(r) => {
+                let text_w = label_text.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
+                // (anchor_x, baseline_y) for each slot:
+                // 1. Above-left: baseline at r.y0 − LABEL_GAP
+                // 2. Above-centre: centred horizontally, same y
+                // 3. Below-left: baseline at r.y1 + LABEL_GAP + font
+                // 4. Right-of-top: left-edge at r.x1 + LABEL_GAP, same y as slot 1
+                let above_y = r.y0 - LABEL_GAP;
+                let below_y = r.y1 + LABEL_GAP + font;
+                let centre_x = (r.x0 + r.x1) * 0.5 - text_w * 0.5;
+                let right_x = r.x1 + LABEL_GAP;
+                [
+                    (r.x0, above_y),
+                    (centre_x, above_y),
+                    (r.x0, below_y),
+                    (right_x, r.y0 - LABEL_GAP),
+                ]
+            }
+            None => {
+                // Degenerate view: place relative to position_mm only.
+                let sheet_y = h - view.position_mm[1];
+                let ax = view.position_mm[0];
+                [
+                    (ax, sheet_y - LABEL_GAP),
+                    (ax, sheet_y - LABEL_GAP),
+                    (ax, sheet_y + font + LABEL_GAP),
+                    (ax, sheet_y - LABEL_GAP),
+                ]
+            }
+        };
+
+        // Build candidate bboxes.
+        let candidate_bboxes: [(f64, f64, Rect2); 4] = {
+            let mut arr = [(
+                0.0,
+                0.0,
+                Rect2 {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 0.0,
+                    y1: 0.0,
+                },
+            ); 4];
+            for (i, &(ax, ay)) in candidates.iter().enumerate() {
+                arr[i] = (ax, ay, text_bbox(&label_text, font, ax, ay));
+            }
+            arr
+        };
+
+        // Obstacles: geometry items of ALL views + already-placed labels + title block.
+        let obstacles: Vec<&Rect2> = placed
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it.kind,
+                    SheetItemKind::ViewGeometry
+                        | SheetItemKind::ViewLabel
+                        | SheetItemKind::TitleBlock
+                )
+            })
+            .chain(result.iter())
+            .map(|it| &it.bbox)
+            .collect();
+
+        // Find the first non-colliding candidate.
+        let mut chosen: Option<(f64, f64, Rect2)> = None;
+        for &(ax, ay, ref bbox) in &candidate_bboxes {
+            let collides = obstacles.iter().any(|o| bbox.intersects(o, LABEL_TOL));
+            if !collides {
+                chosen = Some((ax, ay, *bbox));
+                break;
+            }
+        }
+
+        // If all candidates collide, pick the one with the least total overlap.
+        let (ax, ay, bbox) = chosen.unwrap_or_else(|| {
+            let best = candidate_bboxes
+                .iter()
+                .min_by(|(_, _, b1), (_, _, b2)| {
+                    let o1: f64 = obstacles.iter().map(|o| b1.overlap_area(o)).sum();
+                    let o2: f64 = obstacles.iter().map(|o| b2.overlap_area(o)).sum();
+                    o1.partial_cmp(&o2).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                // SAFETY: candidate_bboxes always has 4 elements.
+                .copied()
+                .unwrap_or(candidate_bboxes[0]);
+            best
+        });
+        let _ = (ax, ay); // anchor coords are embedded in bbox
+
+        result.push(SheetItem {
+            kind: SheetItemKind::ViewLabel,
+            bbox,
+            owner_view: Some(idx),
+            text: Some(label_text),
+        });
+    }
+
+    result
+}
+
 // ── compute_layout ─────────────────────────────────────────────────────────────
 
 /// Build the complete layout for a drawing.
 ///
-/// **Task-1 scope** (legacy-ink model):
 /// - `ViewGeometry` items: exact sheet bbox of each view's polylines.
-/// - `ViewLabel` items: legacy in-group label at its CURRENT ink position
-///   (inside `scale(sx, -sx)` so the effective font grows with scale — the
-///   bug being detected). The model matches `svg.rs::render_view` exactly
-///   so `layout_label_model_matches_svg_ink` can pin it.
+/// - `ViewLabel` items: sheet-space placement via `place_view_labels` —
+///   constant `VIEW_LABEL_FONT_MM` font, anchored to the view's OWN geometry
+///   rect, collision-resolved. The renderer inks these same items, so a
+///   collision the renderer draws is structurally visible to the verifier.
 /// - `DimensionText` items: replicate the Lin-sort stacking logic from
 ///   `svg.rs::render_dimensions` (STANDOFF/STACK/TGAP) to compute each
 ///   label's anchor, then bbox via `text_bbox` with centred-x.
 /// - `TitleBlock` item from `svg::{frame_margins, title_block_size}`.
-///
-/// Task 3 replaces the legacy label placement with sheet-space
-/// collision-resolved placement and makes svg.rs consume these items.
 pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     let w = drawing.sheet_size.width();
     let h = drawing.sheet_size.height();
@@ -205,9 +353,8 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         text: None,
     });
 
-    // ── Per-view items ────────────────────────────────────────────────────
+    // ── Per-view geometry items ───────────────────────────────────────────
     for (idx, view) in drawing.views.iter().enumerate() {
-        // ViewGeometry
         if let Some(gr) = view_geometry_rect(view, h) {
             items.push(SheetItem {
                 kind: SheetItemKind::ViewGeometry,
@@ -216,45 +363,17 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
                 text: None,
             });
         }
+    }
 
-        // ViewLabel (legacy ink position)
-        //
-        // svg.rs render_view emits:
-        //   <g transform="translate(tx ty) scale(sx -sx)">
-        //     <text class="label" x="0" y="{min_y - 4.0}" transform="scale(1 -1)">
-        //       {name} ({scale_str})
-        //     </text>
-        //
-        // SVG semantics: an element's x/y attributes are evaluated in the
-        // user space established by its OWN transform, so the composed CTM
-        // for the label is
-        //   translate(tx,ty) · scale(sx,-sx) · scale(1,-1)
-        //   = translate(tx,ty) · scale(sx, sx)
-        // and the anchor (0, min_y − 4) inks at:
-        //   sheet_x = tx                    = position_mm[0]
-        //   sheet_y = ty + sx·(min_y − 4)
-        //           = (h − position_mm[1]) + scale·(min_y − 4)
-        // Since min_y − 4 < 0 for any origin-spanning view, the label lands
-        // ABOVE the view. The renderer author intended it 4 mm BELOW the
-        // silhouette (view-space min_y − 4), but the double Y-flip relocates
-        // it — one of the legacy quirks this model exists to expose.
-        //
-        // Effective font height = VIEW_LABEL_FONT_BASE_MM * scale (the
-        // in-group scaling bug: labels grow with view scale instead of
-        // staying a constant annotation size).
-        let label_text = format!("{} ({})", view.name, format_scale(view.scale));
-        let font_mm = VIEW_LABEL_FONT_BASE_MM * view.scale;
-        let anchor_x = view.position_mm[0];
-        let baseline_y = (h - view.position_mm[1]) + view.scale * (view.extent.min_y - 4.0);
-        let bbox = text_bbox(&label_text, font_mm, anchor_x, baseline_y);
-        items.push(SheetItem {
-            kind: SheetItemKind::ViewLabel,
-            bbox,
-            owner_view: Some(idx),
-            text: Some(label_text),
-        });
+    // ── ViewLabel items — sheet-space placement ───────────────────────────
+    // place_view_labels reads the geometry items already in `items` (title
+    // block + all ViewGeometry) as obstacles, then adds labels in view-index
+    // order so placement is deterministic.
+    let label_items = place_view_labels(drawing, &items);
+    items.extend(label_items);
 
-        // DimensionText items — replicate svg.rs::render_dimensions stacking.
+    // ── DimensionText items ───────────────────────────────────────────────
+    for (idx, view) in drawing.views.iter().enumerate() {
         let dim_items = compute_dim_text_items(view, h, idx);
         items.extend(dim_items);
     }
@@ -280,52 +399,15 @@ fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
     ]
 }
 
-/// Sheet-space bbox of a view's drawn edges (matching svg.rs view_sheet_bbox).
-fn view_sheet_bbox_arr(view: &ProjectedView, sheet_h: f64) -> Option<[f64; 4]> {
-    let mut x0 = f64::INFINITY;
-    let mut y0 = f64::INFINITY;
-    let mut x1 = f64::NEG_INFINITY;
-    let mut y1 = f64::NEG_INFINITY;
-    let mut any = false;
-    for pl in view.polylines.iter().chain(view.hidden_polylines.iter()) {
-        for &p in &pl.points {
-            let s = dim_to_sheet(view, sheet_h, p);
-            x0 = x0.min(s[0]);
-            x1 = x1.max(s[0]);
-            y0 = y0.min(s[1]);
-            y1 = y1.max(s[1]);
-            any = true;
-        }
-    }
-    // Fall back to extent if no polylines.
-    if !any && !view.extent.is_empty() {
-        let corners = [
-            [view.extent.min_x, view.extent.min_y],
-            [view.extent.max_x, view.extent.max_y],
-        ];
-        for &p in &corners {
-            let s = dim_to_sheet(view, sheet_h, p);
-            x0 = x0.min(s[0]);
-            x1 = x1.max(s[0]);
-            y0 = y0.min(s[1]);
-            y1 = y1.max(s[1]);
-        }
-        any = true;
-    }
-    if any && x1 > x0 && y1 > y0 {
-        Some([x0, y0, x1, y1])
-    } else {
-        None
-    }
-}
-
 /// Replicate the Lin-sort stacking logic from `svg.rs::render_dimensions` to
 /// produce bboxes for each dim-text label. Text is centred on the dim line
 /// anchor (`dim_text` in svg.rs uses `text-anchor: middle`).
 fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> Vec<SheetItem> {
-    let Some(bbox) = view_sheet_bbox_arr(view, sheet_h) else {
+    // Use view_geometry_rect (the canonical impl) and destructure its fields.
+    let Some(gr) = view_geometry_rect(view, sheet_h) else {
         return Vec::new();
     };
+    let bbox = [gr.x0, gr.y0, gr.x1, gr.y1];
 
     struct Lin {
         lo: f64,
@@ -441,4 +523,113 @@ fn compute_dim_text_items(view: &ProjectedView, sheet_h: f64, owner: usize) -> V
     }
 
     result
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drawing::dimensioning::standard_drawing_auto;
+    use crate::drawing::types::{
+        Drawing, Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize, ViewExtent,
+        ViewSource,
+    };
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    fn simple_view(name: &str, proj: ProjectionType, pos: [f64; 2]) -> ProjectedView {
+        let outline = Polyline2d::from_points(vec![
+            [-10.0, -10.0],
+            [10.0, -10.0],
+            [10.0, 10.0],
+            [-10.0, 10.0],
+            [-10.0, -10.0],
+        ]);
+        ProjectedView {
+            id: ProjectedViewId::new(),
+            name: name.to_string(),
+            projection: proj,
+            source: ViewSource::Part {
+                part_id: uuid::Uuid::nil(),
+                solid_id: 0,
+            },
+            position_mm: pos,
+            scale: 1.0,
+            polylines: vec![outline],
+            extent: ViewExtent {
+                min_x: -10.0,
+                min_y: -10.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+            dimensions: Vec::new(),
+            centerlines: Vec::new(),
+            hidden_polylines: Vec::new(),
+            circles: Vec::new(),
+            hidden_circles: Vec::new(),
+        }
+    }
+
+    /// Two views stacked so naive top-left labels would land at the same y.
+    /// The second label must take a fallback slot, and neither label must
+    /// collide with the other after placement.
+    #[test]
+    fn labels_anchor_to_their_own_view_and_never_collide() {
+        let mut dwg = Drawing::new("t", SheetSize::A4);
+        // FRONT at y=150, RIGHT at y=138 — adjacent; their geometry rects are
+        // 20 mm tall so their naïve above-left slots sit at identical y.
+        dwg.add_view(simple_view("FRONT", ProjectionType::Front, [100.0, 150.0]));
+        dwg.add_view(simple_view("RIGHT", ProjectionType::Right, [100.0, 138.0]));
+
+        let layout = compute_layout(&dwg);
+        let labels: Vec<&SheetItem> = layout
+            .items
+            .iter()
+            .filter(|i| i.kind == SheetItemKind::ViewLabel)
+            .collect();
+        assert_eq!(labels.len(), 2, "one label per view");
+        assert!(
+            !labels[0].bbox.intersects(&labels[1].bbox, 0.0),
+            "labels must not collide; got {:?} vs {:?}",
+            labels[0].bbox,
+            labels[1].bbox
+        );
+
+        for l in &labels {
+            let g = layout
+                .items
+                .iter()
+                .find(|i| i.kind == SheetItemKind::ViewGeometry && i.owner_view == l.owner_view)
+                .expect("own view geometry rect");
+            // Label must be within 30 mm of its own view rect on both axes.
+            let dx = (l.bbox.x0 - g.bbox.x0)
+                .abs()
+                .min((l.bbox.x1 - g.bbox.x1).abs());
+            let dy = (l.bbox.y1 - g.bbox.y0)
+                .abs()
+                .min((l.bbox.y0 - g.bbox.y1).abs());
+            assert!(
+                dx < 30.0 && dy < 30.0,
+                "label must stay within 30 mm of its view; dx={dx:.1} dy={dy:.1}"
+            );
+        }
+    }
+
+    /// `compute_layout` must be a pure function of the drawing — calling it
+    /// twice on the same drawing must produce identical JSON.
+    #[test]
+    fn layout_is_deterministic() {
+        let mut model = BRepModel::new();
+        let sid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let dwg = standard_drawing_auto(&model, sid, uuid::Uuid::nil()).expect("sheet");
+        let a = serde_json::to_string(&compute_layout(&dwg)).expect("ser");
+        let b = serde_json::to_string(&compute_layout(&dwg)).expect("ser");
+        assert_eq!(a, b, "compute_layout must be deterministic");
+    }
 }

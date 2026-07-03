@@ -7,7 +7,6 @@
 //! outline with no offset.
 
 use geometry_engine::drawing::dimensioning::Dimension2d;
-use geometry_engine::drawing::layout::{compute_layout, SheetItem, SheetItemKind};
 use geometry_engine::drawing::{
     render_drawing_svg, standard_drawing_auto, verify_drawing, Drawing, DrawingIssueKind,
     Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize, ViewExtent, ViewSource,
@@ -297,158 +296,66 @@ fn six_hole_plate() -> (BRepModel, u32) {
     (m, part)
 }
 
-/// DETECTOR (permanent invariant): the defective sheet is CAUGHT.
-/// Task 2 (dedup) eliminates redundant dimensions at the source, so
-/// `RedundantDimension` no longer fires on the plate. `ViewLabelCollision`
-/// still fires (Task 3 not yet done), keeping `passed: false` valid.
-#[test]
-fn six_hole_plate_sheet_defects_are_caught_not_certified() {
-    let (m, part) = six_hole_plate();
-    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
-    let report = verify_drawing(&dwg);
-    assert!(
-        !report.has(DrawingIssueKind::RedundantDimension),
-        "dedup must eliminate redundant dims; still firing: {:?}",
-        report.issues
-    );
-    assert!(
-        !report.passed,
-        "a defective sheet must not certify (label collision still present)"
-    );
-}
-
-/// The other half of the 2026-07-03 defect: the live plate was built at
-/// x = −80, and because the legacy label anchors at the WORLD ORIGIN's
-/// projection (view-local x = 0), every label drifts ~80·scale mm right of
-/// its own view — FRONT's label lands on RIGHT's ("RIGHT FR(2:1)ONT" on
-/// the live PDF). With the fixture now off-origin like the live part, the
-/// collision must be caught. (An origin-centred plate genuinely does not
-/// collide — that near-miss hid this defect from the earlier fixture.)
-#[test]
-fn six_hole_plate_view_labels_collide() {
-    let (m, part) = six_hole_plate();
-    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
-    let report = verify_drawing(&dwg);
-    assert!(
-        report.has(DrawingIssueKind::ViewLabelCollision),
-        "colliding view labels must be reported, got: {:?}",
-        report.issues
-    );
-}
-
-/// DETECTOR PROOF: two views whose legacy labels genuinely overlap on the
-/// sheet are flagged with `ViewLabelCollision` and the report fails.
+/// THE payoff: the exact sheet that shipped defective on 2026-07-03 now
+/// renders clean and certifies clean — and the certification is the same
+/// model the renderer inked.
 ///
-/// Geometry: two small (8×8 mm) views placed 10 mm apart. Their outlines
-/// do NOT overlap (no ViewOverlap), but each legacy label ("A (1:1)" /
-/// "B (1:1)" — about 15.6 mm of modeled ink at 3.6 mm font) extends past
-/// its own view into the neighbour's label band, so the two label bboxes
-/// overlap by ~5.6 mm at the same baseline.
+/// History: the legacy label anchored at view-local x=0 (the projection of
+/// the WORLD ORIGIN), so an off-origin part (world x=−80) caused labels to
+/// drift ~80·scale mm to the right of their own view, garbling into the
+/// neighbouring cell ("RIGHT FR(2:1)ONT" on the live PDF). Sheet-space
+/// placement anchors labels to their OWN geometry rect at a constant 3.6 mm
+/// font, killing both the drift and the giant-label bug.
+#[test]
+fn six_hole_plate_sheet_is_clean() {
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let report = verify_drawing(&dwg);
+    assert!(report.passed, "issues: {:?}", report.issues);
+    assert!(!report.has(DrawingIssueKind::ViewLabelCollision));
+    assert!(!report.has(DrawingIssueKind::RedundantDimension));
+    let svg = render_drawing_svg(&dwg);
+    for name in ["FRONT", "TOP", "RIGHT", "ISOMETRIC"] {
+        assert_eq!(
+            svg.matches(&format!(">{name} (")).count(),
+            1,
+            "view label '{name}' inked exactly once"
+        );
+    }
+}
+
+/// DETECTOR PROOF (permanent invariant): views so tightly packed that the
+/// collision-resolver exhausts all four fallback slots and still cannot
+/// separate the labels — `ViewLabelCollision` must fire.
+///
+/// Construction: four views crammed into a 20×20 mm area of the sheet
+/// (positions spread by only 5 mm). Each view's geometry rect is 8×8 mm,
+/// so the preferred "2 mm above rect" slots all overlap. The fallback
+/// sequence (above-left, above-centre, below-left, right-of-top) is also
+/// exhausted because the views are packed closer than the label width.
+/// The detector must always have a failing specimen.
 #[test]
 fn overlapping_view_labels_flagged() {
     let mut d = Drawing::new("LabelClash", SheetSize::A3);
-    d.add_view(rect_view(
-        "A",
-        ProjectionType::Front,
-        [80.0, 110.0],
-        8.0,
-        8.0,
-        vec![],
-    ));
-    // Right view shares the Front's centre-y (no ProjectionMisaligned) and
-    // sits 10 mm to the right — outlines clear, labels colliding.
-    d.add_view(rect_view(
-        "B",
-        ProjectionType::Right,
-        [90.0, 110.0],
-        8.0,
-        8.0,
-        vec![],
-    ));
+    // Four views packed into a 20×20 mm block so all fallback label
+    // positions collide. Each view rect is 8×8 mm. The label texts
+    // ("FRONT (1:1)", "TOP (1:1)", "RIGHT (1:1)", "LEFT (1:1)") each
+    // measure ~70 mm of estimated ink (11 chars × 0.62 × 3.6 mm ≈ 24 mm),
+    // wider than the 5 mm separation between views, so the solver cannot
+    // find a non-colliding slot.
+    for (name, proj, pos) in [
+        ("FRONT", ProjectionType::Front, [80.0, 110.0]),
+        ("TOP", ProjectionType::Top, [85.0, 115.0]),
+        ("RIGHT", ProjectionType::Right, [80.0, 115.0]),
+        ("LEFT", ProjectionType::Left, [85.0, 110.0]),
+    ] {
+        d.add_view(rect_view(name, proj, pos, 8.0, 8.0, vec![]));
+    }
     let report = verify_drawing(&d);
     assert!(
         report.has(DrawingIssueKind::ViewLabelCollision),
         "overlapping labels must be reported, got: {:?}",
         report.issues
     );
-    assert!(
-        !report.has(DrawingIssueKind::ViewOverlap),
-        "the view outlines themselves do not overlap; got: {:?}",
-        report.issues
-    );
     assert!(!report.passed, "label collision is an error");
-}
-
-/// ANTI-DRIFT: the layout model's legacy label rect matches the SVG ink.
-///
-/// Ink truth, derived the way an SVG viewer resolves it: the label's x/y
-/// attributes are evaluated in the user space established by its OWN
-/// `transform="scale(1 -1)"`, so the composed CTM is
-/// `translate(tx,ty)·scale(sx,-sx)·scale(1,-1) = translate(tx,ty)·scale(sx,sx)`
-/// and the anchor `(0, min_y − 4)` inks at
-/// `(pos_x, (sheet_h − pos_y) + scale·(min_y − 4))` — ABOVE the view.
-/// (An earlier draft of this test used `− scale·(min_y − 4)`, which ignores
-/// the text element's own transform and puts the label below the view;
-/// that is not what a viewer renders.) If the renderer moves, this test
-/// forces the model to move with it.
-#[test]
-fn layout_label_model_matches_svg_ink() {
-    let (m, part) = six_hole_plate();
-    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
-    let layout = compute_layout(&dwg);
-    let svg = render_drawing_svg(&dwg);
-    let modeled: Vec<&SheetItem> = layout
-        .items
-        .iter()
-        .filter(|i| i.kind == SheetItemKind::ViewLabel)
-        .collect();
-    assert_eq!(modeled.len(), dwg.views.len(), "one label item per view");
-
-    // Parse the ACTUAL ink from the emitted SVG — never recompute the
-    // model's own formula (that would make this test tautological). Each
-    // view group is `translate(tx ty) scale(sx -sx)`, its label
-    // `<text class="label" x="0" y="{ylocal}" transform="scale(1 -1)">`,
-    // and SVG composes transforms parent-then-element, so the anchor inks
-    // at (tx, ty + sx·ylocal).
-    fn num_after<'a>(s: &'a str, key: &str) -> (f64, &'a str) {
-        let start = s.find(key).map(|i| i + key.len());
-        let rest = start.map(|i| &s[i..]).unwrap_or("");
-        let end = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
-            .unwrap_or(rest.len());
-        (rest[..end].parse::<f64>().unwrap_or(f64::NAN), &rest[end..])
-    }
-    let mut ink: Vec<(f64, f64)> = Vec::new();
-    for chunk in svg.split("<g class=\"view\"").skip(1) {
-        let (tx, rest) = num_after(chunk, "translate(");
-        let (ty, rest) = num_after(rest, " ");
-        let (sx, rest) = num_after(rest, "scale(");
-        let (ylocal, _) = num_after(rest, "<text class=\"label\" x=\"0\" y=\"");
-        assert!(
-            tx.is_finite() && ty.is_finite() && sx.is_finite() && ylocal.is_finite(),
-            "failed to parse a view group's label ink from the SVG"
-        );
-        ink.push((tx, ty + sx * ylocal));
-    }
-    assert_eq!(ink.len(), dwg.views.len(), "one inked label per view");
-
-    // The model must match the ink for EVERY view, not just the first.
-    for (i, (ink_x, ink_y)) in ink.iter().enumerate() {
-        let lbl = modeled
-            .iter()
-            .find(|it| it.owner_view == Some(i))
-            .expect("modeled label for view");
-        assert!(
-            (lbl.bbox.x0 - ink_x).abs() < 0.1,
-            "view {i}: modeled x {} vs ink {}",
-            lbl.bbox.x0,
-            ink_x
-        );
-        assert!(
-            (lbl.bbox.y1 - ink_y).abs() < 0.1,
-            "view {i}: modeled baseline {} vs ink {}",
-            lbl.bbox.y1,
-            ink_y
-        );
-    }
 }

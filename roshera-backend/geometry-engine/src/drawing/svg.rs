@@ -30,6 +30,7 @@
 
 use std::fmt::Write;
 
+use super::layout::{compute_layout, SheetItemKind};
 use super::types::{Drawing, ProjectedView, SheetSize};
 
 /// Render a [`Drawing`] to a complete SVG document string.
@@ -80,6 +81,12 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     for view in &drawing.views {
         render_dimensions(&mut out, view, h);
     }
+
+    // View labels: inked from the layout model in sheet space at a constant
+    // 3.6 mm font. This pass runs AFTER all view groups so labels sit on top
+    // of geometry, and the items here are exactly what verify_drawing checks —
+    // one representation, so a collision the verifier reports is what renders.
+    render_view_labels(&mut out, drawing);
 
     // Notes strip in the bottom-left corner of the frame.
     render_notes_strip(&mut out, frame_x, frame_y + frame_h);
@@ -238,14 +245,10 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
         view.projection.label(),
         neg = -sx
     );
-    let _ = write!(
-        out,
-        "    <text class=\"label\" x=\"0\" y=\"{:.3}\" \
-         transform=\"scale(1 -1)\">{} ({})</text>\n",
-        view.extent.min_y - 4.0,
-        escape_xml(&view.name),
-        format_scale(view.scale),
-    );
+    // Labels are NOT drawn here. They are placed in sheet space by
+    // `render_view_labels` (called after all view groups) so they use a
+    // constant font size, are anchored to their own view's geometry rect, and
+    // are collision-resolved — the same items that `verify_drawing` checks.
 
     for pl in &view.polylines {
         if pl.points.len() < 2 {
@@ -459,6 +462,29 @@ fn render_dimensions(out: &mut String, view: &ProjectedView, sheet_h: f64) {
         arrow_v(out, level, d.hi, -1.0, AR_L, AR_W);
         dim_text(out, level - TGAP, 0.5 * (d.lo + d.hi), &d.label, -90.0);
         level -= STACK;
+    }
+}
+
+/// Ink the `ViewLabel` items from the sheet layout at their computed
+/// sheet-space positions. Each label is a `<text class="label">` element
+/// at a constant 3.6 px (= mm) font — never inside a scaled view group,
+/// so the font is invariant to view scale and label positions are the same
+/// coordinates the verifier checks.
+fn render_view_labels(out: &mut String, drawing: &Drawing) {
+    let layout = compute_layout(drawing);
+    for item in layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::ViewLabel)
+    {
+        let text = item.text.as_deref().unwrap_or("");
+        let _ = write!(
+            out,
+            "  <text class=\"label\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
+            item.bbox.x0,
+            item.bbox.y1,
+            escape_xml(text)
+        );
     }
 }
 
