@@ -468,23 +468,71 @@ async function ambientRender(partId: number): Promise<any | undefined> {
 }
 
 /**
+ * Project a full perception object onto ONE honest line — the TOKEN-DIET form
+ * of ambient verification. The verdict is never dropped and never softened:
+ * a sound part lists exactly the dimensions that were verified true; an
+ * unsound part names every failed dimension loudly and points at verify_part
+ * (full certificate + diagnostic render). Dimensions the hot path did not
+ * compute (`null`) are reported as unverified, never fabricated.
+ */
+function compactVerdict(p: any): string {
+  const DIMS: [string, string][] = [
+    ["brep_valid", "brep"],
+    ["watertight", "watertight"],
+    ["manifold", "manifold"],
+    ["self_intersection_free", "no-self-intersect"],
+    ["tessellation_clean", "tess"],
+    ["mesh_quality_clean", "mesh-quality"],
+  ];
+  const failed = DIMS.filter(([k]) => p?.[k] === false).map(([, n]) => n);
+  const unverified = DIMS.filter(([k]) => p?.[k] == null).map(([, n]) => n);
+  const facts: string[] = [];
+  if (p?.euler_characteristic != null) facts.push(`χ=${p.euler_characteristic}`);
+  if (typeof p?.volume === "number") facts.push(`vol=${p.volume.toFixed(1)}mm³`);
+  if (p?.face_count != null) facts.push(`${p.face_count} faces`);
+  if (p?.open_edges) facts.push(`⚠ ${p.open_edges} open edges`);
+  if (p?.nonmanifold_edges) facts.push(`⚠ ${p.nonmanifold_edges} non-manifold edges`);
+  if (p?.eyes_consistent === "inconsistent") failed.push("eyes-consistent");
+  const tail = facts.length ? ` | ${facts.join(" | ")}` : "";
+  if (p?.sound === true && failed.length === 0) {
+    const verified = DIMS.filter(([k]) => p?.[k] === true).map(([, n]) => n);
+    const suffix = unverified.length
+      ? ` (unverified: ${unverified.join(",")} — verify_part to certify)`
+      : "";
+    return `SOUND ✓ ${verified.join("·")}${suffix}${tail}`;
+  }
+  const why = failed.length ? failed.join(", ") : "cheap verdict false";
+  return `UNSOUND ✗ failed: ${why}${tail} — run verify_part for the full certificate + diagnostic render`;
+}
+
+/**
  * `ok()` plus AMBIENT PERCEPTION for the resulting part — every mutating op
- * carries all three modalities with no extra tool call:
- *  - TRUTH + STRUCTURE: the perception object (cert + occupancy X-ray) as text;
- *  - FORM: a small shaded render as an image content block.
- * `ROSHERA_AMBIENT_PERCEPTION=full` (default) attaches cert + occupancy + render;
- * `=cert` returns just the cert (today's behaviour). `ROSHERA_MCP_AUTOVERIFY=0`
- * is the master off switch (no perception at all). Each channel is independently
- * try/caught inside its fetch, so any single failure degrades gracefully.
+ * carries its verdict with no extra tool call. Modes via
+ * `ROSHERA_AMBIENT_PERCEPTION`:
+ *  - `compact` (DEFAULT — the token diet): ONE honest verdict line
+ *    (sound/unsound + verified/failed dimensions + χ/volume/faces). No image,
+ *    no cert JSON. Depth on demand: verify_part (full certificate +
+ *    diagnostic), render_part (form), ground_truth (provenance).
+ *  - `full`: the legacy firehose — full perception object as text PLUS a
+ *    shaded render image on every op.
+ *  - `cert`: full perception object, no image.
+ *  - `xray` (composes with the above fetch): adds the occupancy slice-stack.
+ * `ROSHERA_MCP_AUTOVERIFY=0` is the master off switch (no perception at all).
+ * Every channel degrades gracefully on fetch failure.
  */
 async function okp(data: Record<string, unknown>, partId: number | null) {
+  if (process.env.ROSHERA_MCP_AUTOVERIFY === "0") return ok(data);
   const perception = await perceive(partId);
-  const base = ok(perception === undefined ? data : { ...data, perception });
-  if (
-    partId === null ||
-    process.env.ROSHERA_MCP_AUTOVERIFY === "0" ||
-    process.env.ROSHERA_AMBIENT_PERCEPTION === "cert"
-  ) {
+  const mode = process.env.ROSHERA_AMBIENT_PERCEPTION ?? "compact";
+  if (perception === undefined) return ok(data);
+  if (mode === "compact" || mode === "") {
+    // The token-diet default: one verdict line, no image, no cert JSON.
+    return ok({ ...data, perception: compactVerdict(perception) });
+  }
+  // Legacy verbose modes keep their full behaviour: full/xray = perception
+  // object + shaded render; cert = perception object only.
+  const base = ok({ ...data, perception });
+  if (partId === null || mode === "cert") {
     return base;
   }
   const image = await ambientRender(partId);
