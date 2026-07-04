@@ -217,6 +217,10 @@ function isLinear(kind: string): boolean {
  * the machinist. Ø / SØ / ∠ prefixes carry meaning and are untouched.
  * The wire label is NEVER modified; this runs at render time only.
  */
+// Known-safe non-stripped prefixes: "A " (face_info area), "Ø"/"SØ"
+// (diameters), "∠" (angles). If a future kind introduces a label
+// starting with a bare X/Y/Z/L that must SURVIVE display, extend
+// this regex guard — silent stripping is the failure mode.
 function displayLabel(label: string): string {
   return label.replace(/^[XYZL]\s+/, '')
 }
