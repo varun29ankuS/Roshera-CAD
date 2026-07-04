@@ -1270,6 +1270,9 @@ export function ToolBar() {
   const setActiveTool = useSceneStore((s) => s.setActiveTool)
   const selectionMode = useSceneStore((s) => s.selectionMode)
   const setSelectionMode = useSceneStore((s) => s.setSelectionMode)
+  const selectedIds = useSceneStore((s) => s.selectedIds)
+  const showDimensions = useSceneStore((s) => s.showDimensions)
+  const toggleDimensions = useSceneStore((s) => s.toggleDimensions)
   const [openId, setOpenId] = useState<string | null>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
   // Industry-standard modify panel — fillet / chamfer / shell. Single state
@@ -1486,6 +1489,30 @@ export function ToolBar() {
         {
           label: 'Analyze',
           items: [
+            {
+              icon: Ruler,
+              label: 'Dimensions',
+              active: (() => {
+                // The toggle acts on the single selected object. Show active
+                // when exactly one object is selected and its dimensions are on.
+                const [singleId] = selectedIds.size === 1
+                  ? Array.from(selectedIds)
+                  : [undefined]
+                return singleId !== undefined && showDimensions.has(singleId)
+              })(),
+              action: () => {
+                const ids = Array.from(useSceneStore.getState().selectedIds)
+                if (ids.length !== 1) {
+                  const { addMessage } = useChatStore.getState()
+                  addMessage({
+                    role: 'assistant',
+                    content: 'Select exactly one object before toggling Dimensions.',
+                  })
+                  return
+                }
+                toggleDimensions(ids[0])
+              },
+            },
             { icon: Ruler, label: 'Measure Distance', action: () => sendDirectMeasureDistance() },
             { icon: Pipette, label: 'Mass Properties', action: () => sendDirectMassProperties() },
             { icon: Eye, label: 'Section View', action: () => toggleSectionViewWithFeedback() },

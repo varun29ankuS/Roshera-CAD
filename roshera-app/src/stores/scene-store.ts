@@ -74,6 +74,14 @@ export interface AnalyticalGeometry {
   // numbers, booleans/extrudes ship strings/arrays. Consumers (e.g.
   // PropertiesPanel) format defensively per-value.
   params: Record<string, unknown>
+  /**
+   * Kernel-local integer id for the solid (matches `solid_id` on the
+   * wire). Used by `PartDimensions` to call
+   * `GET /api/agent/parts/{solidId}/dimensions` without knowing the
+   * backend part UUID — the kernel dimensions endpoint is keyed on
+   * this integer, matching how drawings and the agent tools address it.
+   */
+  solidId: number
 }
 
 export interface CADObject {
@@ -568,6 +576,14 @@ interface SceneState {
    */
   labelsVisible: boolean
 
+  /**
+   * Set of object ids whose kernel dimension table is currently visible
+   * in the viewport as leader + billboard annotations (see
+   * `PartDimensions`). Empty by default. Uses Set replacement (never
+   * mutation) matching the `selectedIds` pattern.
+   */
+  showDimensions: Set<string>
+
   /** Cutting-plane state for Section View. See {@link SectionViewState}. */
   sectionView: SectionViewState
 
@@ -658,6 +674,12 @@ interface SceneState {
   setGridSettings: (settings: Partial<GridSettings>) => void
   /** Toggle the LABELLER viewport overlay on/off. */
   toggleLabelsVisible: () => void
+  /**
+   * Toggle the dimension layer for a single object on or off. Adds the
+   * id to `showDimensions` when absent; removes it when present. Uses
+   * Set replacement (never mutation), matching the `selectedIds` pattern.
+   */
+  toggleDimensions: (objectId: string) => void
   setSectionView: (settings: Partial<SectionViewState>) => void
   toggleSectionView: () => void
   /** Replace the live cap set with the result of the most recent
@@ -931,6 +953,7 @@ const sceneCreator: StateCreator<
       infiniteGrid: true,
     },
     labelsVisible: false,
+    showDimensions: new Set<string>(),
     sectionView: {
       enabled: false,
       axis: 'x',
@@ -1191,6 +1214,17 @@ const sceneCreator: StateCreator<
 
     toggleLabelsVisible: () =>
       set((state) => ({ labelsVisible: !state.labelsVisible })),
+
+    toggleDimensions: (objectId) =>
+      set((state) => {
+        const next = new Set(state.showDimensions)
+        if (next.has(objectId)) {
+          next.delete(objectId)
+        } else {
+          next.add(objectId)
+        }
+        return { showDimensions: next }
+      }),
 
     setSectionView: (settings) =>
       set((state) => ({

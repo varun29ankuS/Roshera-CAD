@@ -18,6 +18,7 @@ import { ViewportContextMenu } from './ViewportContextMenu'
 import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
 import { LabelHoverTooltip } from './LabelHoverTooltip'
 import { PartLabels } from './PartLabels'
+import { PartDimensions } from './PartDimensions'
 import { SketchOverlay } from './SketchOverlay'
 import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
@@ -193,6 +194,7 @@ export function CADViewport() {
         <SketchOverlay />
         <ServerSketches />
         <PartLabels />
+        <PartDimensions />
       </Canvas>
 
       <ViewportFrame />
