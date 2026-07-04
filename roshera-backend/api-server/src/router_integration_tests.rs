@@ -2285,3 +2285,365 @@ async fn perception_returns_pending_when_not_cached() {
         "reconcile must be `pending` when no report is cached; body = {body}"
     );
 }
+
+// =====================================================================
+// POST /api/agent/measure — interactive measurement
+// =====================================================================
+
+/// Locate the face whose outward plane normal most closely aligns with
+/// `target` in the given solid. Used to find the top, bottom, and side
+/// faces of a box for measurement tests.
+fn find_plane_face_near(model: &BRepModel, solid_id: SolidId, target: Vector3) -> Option<u32> {
+    use geometry_engine::primitives::surface::Plane;
+
+    let solid = model.solids.get(solid_id)?;
+    let shell = model.shells.get(solid.outer_shell)?;
+    let mut best: Option<(f64, u32)> = None;
+    for &fid in &shell.faces {
+        let face = model.faces.get(fid)?;
+        let surf = model.surfaces.get(face.surface_id)?;
+        if let Some(pln) = surf.as_any().downcast_ref::<Plane>() {
+            let n = pln.normal.normalize().unwrap_or(Vector3::Z) * face.orientation.sign();
+            let d = n.dot(&target);
+            if best.map_or(true, |(prev, _)| d > prev) {
+                best = Some((d, fid));
+            }
+        }
+    }
+    Some(best?.1)
+}
+
+/// Locate the first cylindrical face in the given solid.
+fn find_cyl_face(model: &BRepModel, solid_id: SolidId) -> Option<u32> {
+    use geometry_engine::primitives::surface::Cylinder;
+
+    let solid = model.solids.get(solid_id)?;
+    let shell = model.shells.get(solid.outer_shell)?;
+    for &fid in &shell.faces {
+        let face = model.faces.get(fid)?;
+        let surf = model.surfaces.get(face.surface_id)?;
+        if surf.as_any().downcast_ref::<Cylinder>().is_some() {
+            return Some(fid);
+        }
+    }
+    None
+}
+
+/// Seed a box of given dimensions, register a UUID, and return
+/// `(solid_id, top_face_id, bottom_face_id)` — the ±Z faces.
+async fn seed_box_for_measure(state: &AppState, x: f64, y: f64, z: f64) -> (SolidId, u32, u32) {
+    let solid_id;
+    let top_fid;
+    let bot_fid;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+        let mut builder = TopologyBuilder::new(model);
+        let geom_id = builder
+            .create_box_3d(x, y, z)
+            .expect("box primitive must build");
+        solid_id = match geom_id {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        top_fid =
+            find_plane_face_near(model, solid_id, Vector3::Z).expect("box must have a +Z face");
+        bot_fid = find_plane_face_near(model, solid_id, Vector3::new(0.0, 0.0, -1.0))
+            .expect("box must have a −Z face");
+    }
+    (solid_id, top_fid, bot_fid)
+}
+
+/// Seed a cylinder, register a UUID, and return
+/// `(solid_id, cyl_face_id)`.
+async fn seed_cyl_for_measure(state: &AppState, radius: f64, height: f64) -> (SolidId, u32) {
+    let solid_id;
+    let cyl_fid;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+        let mut builder = TopologyBuilder::new(model);
+        let geom_id = builder
+            .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, radius, height)
+            .expect("cylinder primitive must build");
+        solid_id = match geom_id {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        cyl_fid = find_cyl_face(model, solid_id).expect("cylinder must expose a cylindrical face");
+    }
+    (solid_id, cyl_fid)
+}
+
+fn measure_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/agent/measure")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static measure request must build")
+}
+
+// ── RED first: route must exist (missing route would give 404 on a
+// well-formed body — this is the baseline this harness was written against
+// before the route was wired).
+
+/// A well-formed measure request for two parallel box faces must return
+/// 200 with `kind = "distance"` and `relation = "plane_plane"`.  This
+/// pins the full round-trip: URL routing, `Json` extractor, write-lock
+/// acquisition, kernel dispatch, and wire-shape serialization.
+#[tokio::test]
+async fn measure_parallel_box_faces_returns_plane_plane_distance() {
+    let state = make_test_state().await;
+    let (solid_id, top_fid, bot_fid) = seed_box_for_measure(&state, 40.0, 40.0, 10.0).await;
+
+    let request = measure_post(json!({
+        "a": { "part_id": solid_id, "kind": "face", "id": top_fid },
+        "b": { "part_id": solid_id, "kind": "face", "id": bot_fid },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "parallel faces must resolve as 200; body = {body}"
+    );
+    assert_eq!(
+        body["kind"], "distance",
+        "plane‖plane must produce kind=distance; body = {body}"
+    );
+    assert_eq!(
+        body["relation"], "plane_plane",
+        "parallel planes must carry relation=plane_plane; body = {body}"
+    );
+    let value = body["value"].as_f64().expect("value must be a JSON number");
+    assert!(
+        (value - 10.0).abs() < 1e-9,
+        "40×40×10 box top-bottom distance must be 10 mm; got {value}"
+    );
+    assert_eq!(body["unit"], "mm", "distance must be in mm; body = {body}");
+    assert!(
+        body["pid"].is_null(),
+        "pid must always be null for interactive measurements; body = {body}"
+    );
+}
+
+/// A single cylindrical face must return 200 with `kind = "diameter"`.
+/// Pins the single-face measurement path through the router.
+#[tokio::test]
+async fn measure_single_cylinder_face_returns_diameter() {
+    let state = make_test_state().await;
+    let (solid_id, cyl_fid) = seed_cyl_for_measure(&state, 5.0, 20.0).await;
+
+    let request = measure_post(json!({
+        "a": { "part_id": solid_id, "kind": "face", "id": cyl_fid },
+        "b": null,
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "single cylinder face must resolve as 200; body = {body}"
+    );
+    assert_eq!(
+        body["kind"], "diameter",
+        "single cylinder face must produce kind=diameter; body = {body}"
+    );
+    let value = body["value"].as_f64().expect("value must be a JSON number");
+    assert!(
+        (value - 10.0).abs() < 1e-9,
+        "radius=5 → diameter must be 10 mm; got {value}"
+    );
+    assert_eq!(body["unit"], "mm", "diameter must be in mm; body = {body}");
+}
+
+/// A non-existent solid id must return 404 with `error = "not_found"`.
+/// Pins the error-mapping branch for `MeasureError::NotFound`.
+#[tokio::test]
+async fn measure_unknown_solid_returns_404() {
+    let state = make_test_state().await;
+
+    let request = measure_post(json!({
+        "a": { "part_id": 999_999u32, "kind": "face", "id": 0u32 },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown solid must return 404; body = {body}"
+    );
+    assert_eq!(
+        body["error"], "not_found",
+        "404 must carry error=not_found; body = {body}"
+    );
+    assert!(
+        body["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "404 must carry a non-empty reason; body = {body}"
+    );
+}
+
+/// An unsupported measure (skew-axis cylinder pair) must return 422
+/// with `error = "unsupported_measure"` and the kernel's verbatim reason.
+/// Pins the 422 wire shape end-to-end through the router.
+#[tokio::test]
+async fn measure_skew_cylinders_returns_422_with_reason() {
+    let state = make_test_state().await;
+
+    // Two cylinders with perpendicular axes — guaranteed Unsupported from kernel.
+    let solid_z;
+    let cyl_fid_z;
+    let solid_x;
+    let cyl_fid_x;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+        let mut builder = TopologyBuilder::new(model);
+        let gz = builder
+            .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 4.0, 20.0)
+            .expect("cyl Z must build");
+        solid_z = match gz {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        cyl_fid_z = find_cyl_face(model, solid_z).expect("cyl Z must have a cyl face");
+
+        let mut builder_x = TopologyBuilder::new(model);
+        let gx = builder_x
+            .create_cylinder_3d(Point3::new(0.0, 10.0, 0.0), Vector3::X, 4.0, 20.0)
+            .expect("cyl X must build");
+        solid_x = match gx {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        cyl_fid_x = find_cyl_face(model, solid_x).expect("cyl X must have a cyl face");
+    }
+
+    let request = measure_post(json!({
+        "a": { "part_id": solid_z, "kind": "face", "id": cyl_fid_z },
+        "b": { "part_id": solid_x, "kind": "face", "id": cyl_fid_x },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "skew-axis cylinders must return 422; body = {body}"
+    );
+    assert_eq!(
+        body["error"], "unsupported_measure",
+        "422 must carry error=unsupported_measure; body = {body}"
+    );
+    let reason = body["reason"].as_str().expect("reason must be a string");
+    assert!(!reason.is_empty(), "422 reason must not be empty");
+}
+
+/// `map_measure_result` pure-function unit test: Distance result maps
+/// to the expected wire shape without touching the router or the kernel.
+#[test]
+fn map_measure_result_distance_wire_shape() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+
+    let result = MeasureResult::Distance {
+        value: 10.0,
+        anchor: [0.0, 0.0, 5.0],
+        direction: [0.0, 0.0, 1.0],
+        kind: "plane_plane",
+    };
+    let wire: MeasureResponse = map_measure_result(result, 1u32, Some(2u32));
+    assert_eq!(wire.kind, "distance");
+    assert_eq!(wire.relation.as_deref(), Some("plane_plane"));
+    assert!((wire.value - 10.0).abs() < 1e-12);
+    assert_eq!(wire.unit, "mm");
+    assert!(
+        wire.label.contains("10.00"),
+        "label must contain '10.00'; got {:?}",
+        wire.label
+    );
+    assert_eq!(wire.entities, vec![1u32, 2u32]);
+    assert!(wire.pid.is_none());
+}
+
+/// `map_measure_result` pure-function unit test: Angle result maps
+/// to `kind="angle"`, `unit="deg"`, `∠` prefix in label.
+#[test]
+fn map_measure_result_angle_wire_shape() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+
+    let result = MeasureResult::Angle {
+        degrees: 90.0,
+        anchor: [0.0, 0.0, 0.0],
+    };
+    let wire: MeasureResponse = map_measure_result(result, 3u32, Some(4u32));
+    assert_eq!(wire.kind, "angle");
+    assert!(wire.relation.is_none());
+    assert!((wire.value - 90.0).abs() < 1e-12);
+    assert_eq!(wire.unit, "deg");
+    assert!(
+        wire.label.contains("90.0"),
+        "angle label must contain the value; got {:?}",
+        wire.label
+    );
+    assert!(wire.pid.is_none());
+}
+
+/// `map_measure_result` pure-function unit test: Diameter result maps
+/// to `kind="diameter"` and label starts with `Ø`.
+#[test]
+fn map_measure_result_diameter_wire_shape() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+
+    let result = MeasureResult::Diameter {
+        value: 8.0,
+        anchor: [0.0, 0.0, 0.0],
+        axis: [0.0, 0.0, 1.0],
+    };
+    let wire: MeasureResponse = map_measure_result(result, 5u32, None);
+    assert_eq!(wire.kind, "diameter");
+    assert_eq!(wire.unit, "mm");
+    // The Ø prefix is U+00D8.
+    assert!(
+        wire.label.starts_with('\u{00d8}'),
+        "diameter label must start with Ø; got {:?}",
+        wire.label
+    );
+    assert!(
+        wire.label.contains("8.00"),
+        "diameter label must contain '8.00'; got {:?}",
+        wire.label
+    );
+    assert_eq!(wire.entities, vec![5u32]);
+    assert!(wire.pid.is_none());
+}
+
+/// `map_measure_result` pure-function unit test: FaceInfo result maps
+/// to `kind="face_info"` and label uses `A ` prefix.
+#[test]
+fn map_measure_result_face_info_wire_shape() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+
+    let result = MeasureResult::FaceInfo {
+        area: 100.0,
+        normal: Some([0.0, 0.0, 1.0]),
+        anchor: [0.0, 0.0, 0.0],
+    };
+    let wire: MeasureResponse = map_measure_result(result, 7u32, None);
+    assert_eq!(wire.kind, "face_info");
+    assert_eq!(wire.unit, "mm");
+    assert!(
+        wire.label.starts_with("A "),
+        "face_info label must start with 'A '; got {:?}",
+        wire.label
+    );
+    assert!(
+        wire.label.contains("100.0"),
+        "face_info label must contain '100.0'; got {:?}",
+        wire.label
+    );
+    assert!(wire.pid.is_none());
+}

@@ -8333,6 +8333,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/region-query",
             post(handlers::agent::region_query),
         )
+        .route("/api/agent/measure", post(handlers::agent::measure))
         .route("/api/agent/datums", get(handlers::agent::list_datums))
         .route(
             "/api/agent/datums/{id}/parts",

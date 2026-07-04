@@ -2513,6 +2513,9 @@ pub struct DimensionWire {
     pub entities: Vec<u32>,
     pub anchor: [f64; 3],
     pub direction: [f64; 3],
+    /// Durable cross-session identity derived via UUIDv5 from entity
+    /// PersistentIds. `null` for pre-PID solids (honest absence).
+    pub pid: Option<String>,
 }
 
 /// Wire shape for the single-call dimensioning answer: the callout-annotated
@@ -2610,6 +2613,7 @@ pub async fn part_dimensions(
                 entities: d.entities,
                 anchor: d.anchor,
                 direction: d.direction,
+                pid: d.pid,
             })
             .collect(),
         views: frame
@@ -3079,4 +3083,240 @@ pub async fn region_query(
         empty: parts.is_empty(),
         parts,
     }))
+}
+
+// ─── Interactive measurement ──────────────────────────────────────────────────
+
+/// One face reference in the `POST /api/agent/measure` body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeasureSubjectWire {
+    /// Kernel solid id (the `u32` from `list_parts` / `render_part`).
+    pub part_id: u32,
+    /// Always `"face"` for now; extensible to `"edge"` later.
+    pub kind: String,
+    /// Kernel face id.
+    pub id: u32,
+}
+
+/// Request body for `POST /api/agent/measure`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeasureRequest {
+    pub a: MeasureSubjectWire,
+    pub b: Option<MeasureSubjectWire>,
+}
+
+/// DimensionRecord-shaped response from `POST /api/agent/measure`.
+///
+/// Fields mirror [`DimensionWire`] so the frontend renders interactive
+/// measurements with the same component as ambient ambient dimensions.
+/// `pid` is always `null` — interactive measurements are session-local
+/// and have no durable identity to derive.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeasureResponse {
+    /// "distance" | "angle" | "diameter" | "face_info"
+    pub kind: String,
+    /// "plane_plane" | "axis_axis" | "axis_plane" | "nearest" | null
+    pub relation: Option<String>,
+    pub value: f64,
+    /// "mm" | "deg"
+    pub unit: String,
+    /// Human label formatted like `readable/dimensions.rs`:
+    /// `"Ø8.00"`, `"∠ 120.0°"`, `"10.00"`, `"A 123.4mm²"`.
+    pub label: String,
+    /// World-space anchor for the callout leader.
+    pub anchor: [f64; 3],
+    /// Unit direction the measurement is along (`null` for angles and
+    /// face-info).
+    pub direction: Option<[f64; 3]>,
+    /// Face ids that participated in the measurement.
+    pub entities: Vec<u32>,
+    /// Always `null` — interactive measurements have no durable pid.
+    pub pid: Option<String>,
+}
+
+/// Map a kernel [`MeasureResult`] to the wire shape, given the input face ids.
+///
+/// Pure function — factored out so it can be unit-tested independently of the
+/// async handler and the live router.
+pub fn map_measure_result(
+    result: geometry_engine::queries::measure::MeasureResult,
+    fa: u32,
+    fb: Option<u32>,
+) -> MeasureResponse {
+    use geometry_engine::queries::measure::MeasureResult;
+
+    let mut entities: Vec<u32> = vec![fa];
+    if let Some(b) = fb {
+        entities.push(b);
+    }
+
+    match result {
+        MeasureResult::Distance {
+            value,
+            anchor,
+            direction,
+            kind,
+        } => {
+            let label = format!("{:.2}", value);
+            MeasureResponse {
+                kind: "distance".to_string(),
+                relation: Some(kind.to_string()),
+                value,
+                unit: "mm".to_string(),
+                label,
+                anchor,
+                direction: Some(direction),
+                entities,
+                pid: None,
+            }
+        }
+        MeasureResult::Angle { degrees, anchor } => {
+            let label = format!("\u{2220} {:.1}\u{00b0}", degrees);
+            MeasureResponse {
+                kind: "angle".to_string(),
+                relation: None,
+                value: degrees,
+                unit: "deg".to_string(),
+                label,
+                anchor,
+                direction: None,
+                entities,
+                pid: None,
+            }
+        }
+        MeasureResult::Diameter {
+            value,
+            anchor,
+            axis,
+        } => {
+            let label = format!("\u{00d8}{:.2}", value);
+            MeasureResponse {
+                kind: "diameter".to_string(),
+                relation: None,
+                value,
+                unit: "mm".to_string(),
+                label,
+                anchor,
+                direction: Some(axis),
+                entities,
+                pid: None,
+            }
+        }
+        MeasureResult::FaceInfo {
+            area,
+            normal,
+            anchor,
+        } => {
+            let label = format!("A {:.1}mm\u{00b2}", area);
+            MeasureResponse {
+                kind: "face_info".to_string(),
+                relation: None,
+                value: area,
+                unit: "mm".to_string(),
+                label,
+                anchor,
+                direction: normal,
+                entities,
+                pid: None,
+            }
+        }
+    }
+}
+
+/// `POST /api/agent/measure` — kernel-exact face-pair (or single-face)
+/// measurement.
+///
+/// Body: `{ "a": {"part_id": u32, "kind": "face", "id": u32},
+///          "b": {"part_id": u32, "kind": "face", "id": u32} | null }`.
+///
+/// A single cylindrical face returns `Diameter`; a single planar face
+/// returns `FaceInfo` with area + normal. A face pair resolves to the
+/// best analytic relation (plane‖plane → distance, plane∠plane → dihedral
+/// angle, cyl↔cyl → axis-axis distance, cyl↔plane → axis-plane distance,
+/// fallback → nearest-point).
+///
+/// The response is DimensionRecord-shaped so the frontend renders
+/// interactive measurements with the same component as ambient dimensions.
+///
+/// 404 — solid or face not found in the active model.
+/// 422 — face pair does not admit the requested measurement; the kernel's
+///        actionable reason is surfaced verbatim (never a guessed number).
+pub async fn measure(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(req): Json<MeasureRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::primitives::face::FaceId;
+    use geometry_engine::primitives::solid::SolidId;
+    use geometry_engine::queries::measure::measure as kernel_measure;
+    use geometry_engine::queries::{MeasureError, MeasureSubject};
+
+    if req.a.kind != "face" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "unsupported_measure",
+                "reason": format!(
+                    "Subject kind {:?} is not supported; only \"face\" is accepted.",
+                    req.a.kind
+                ),
+            })),
+        );
+    }
+    if let Some(ref b) = req.b {
+        if b.kind != "face" {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "unsupported_measure",
+                    "reason": format!(
+                        "Subject kind {:?} is not supported; only \"face\" is accepted.",
+                        b.kind
+                    ),
+                })),
+            );
+        }
+    }
+
+    let subj_a = MeasureSubject::Face {
+        solid: req.a.part_id as SolidId,
+        face: req.a.id as FaceId,
+    };
+    let subj_b = req.b.as_ref().map(|b| MeasureSubject::Face {
+        solid: b.part_id as SolidId,
+        face: b.id as FaceId,
+    });
+
+    let fa_id = req.a.id;
+    let fb_id = req.b.as_ref().map(|b| b.id);
+
+    // Write lock: `measure` takes `&mut BRepModel` to warm the area cache on
+    // first call (matches the pattern established by `query_face`).
+    let mut model = model_handle.write().await;
+    match kernel_measure(&mut model, subj_a, subj_b) {
+        Ok(result) => {
+            let wire = map_measure_result(result, fa_id, fb_id);
+            // `MeasureResponse` contains only f64/String/Option — serialization
+            // to `serde_json::Value` cannot fail for these primitive types.
+            // `unwrap_or_else` (not `unwrap`) is the safe fallback pattern.
+            let body = serde_json::to_value(&wire).unwrap_or_else(
+                |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
+            );
+            (StatusCode::OK, Json(body))
+        }
+        Err(MeasureError::NotFound { solid, face }) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not_found",
+                "reason": format!("Solid {solid} or face {face} not found in the active model."),
+            })),
+        ),
+        Err(MeasureError::Unsupported { reason }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "unsupported_measure",
+                "reason": reason,
+            })),
+        ),
+    }
 }
