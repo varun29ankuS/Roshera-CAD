@@ -2,7 +2,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { api, ok, fail, BASE } from "../core.js";
+import { api, ok, fail, BASE, ApiError, setDocumentUnitCache } from "../core.js";
 
 export function registerInspectTools(server: McpServer) {
   server.tool(
@@ -257,6 +257,47 @@ export function registerInspectTools(server: McpServer) {
         const res = await api("POST", `/api/agent/parts/${part_id}/color`, { r, g, b });
         return ok(res);
       } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "document_units",
+    "Display-only document unit setting (mm/cm/m/in/ft). The model stays " +
+      "mm-native forever; switching units re-renders all labels and verdicts " +
+      "in the chosen unit at display time — geometry, certificates, and stored " +
+      "values are never converted. No arg → GET current unit. With arg → PATCH " +
+      "and echo the new state. See dimension_part / measure_faces — their " +
+      "labels already follow this setting server-side.",
+    {
+      unit: z
+        .enum(["mm", "cm", "m", "in", "ft"])
+        .optional()
+        .describe("omit to read; provide to set"),
+    },
+    async ({ unit }) => {
+      try {
+        if (unit === undefined) {
+          // GET current unit
+          const r = await api("GET", "/api/document/units");
+          setDocumentUnitCache(r.unit);
+          return ok({ unit: r.unit });
+        }
+        // PATCH new unit
+        const r = await api("PATCH", "/api/document/units", { unit });
+        setDocumentUnitCache(r.unit);
+        return ok({ unit: r.unit });
+      } catch (e) {
+        // Surface 400 refusals verbatim (invalid unit token from backend).
+        if (e instanceof ApiError && e.status === 400) {
+          try {
+            const body = JSON.parse(e.body);
+            return fail(new Error(`REFUSED: ${body.reason ?? e.body}`));
+          } catch {
+            return fail(e);
+          }
+        }
         return fail(e);
       }
     },

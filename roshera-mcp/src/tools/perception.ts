@@ -268,7 +268,8 @@ export function registerPerceptionTools(server: McpServer) {
       "callouts AND the structured table (id, kind, value, face ids, 3D " +
       "anchor). Includes POSITION rows — each bore/boss axis's X/Y offsets " +
       "from a NAMED datum (part corner by default), the dims a machinist " +
-      "locates holes with. Values read off analytic surfaces, never pixels.",
+      "locates holes with. Values read off analytic surfaces, never pixels. " +
+      "Labels follow the document unit (see document_units).",
     { part_id: z.number().int().describe("kernel part id from list_parts") },
     async ({ part_id }) => {
       try {
@@ -328,7 +329,8 @@ export function registerPerceptionTools(server: McpServer) {
       "cylindrical face → Ø, single plane → area+normal. Kernel-exact; " +
       "REFUSES with a reason when faces don't admit the relation (skew axes, " +
       "footpoint outside the face's trimmed boundary, consumed face) — never " +
-      "a guessed number. Face ids from select_face / render 'ids' legend.",
+      "a guessed number. Face ids from select_face / render 'ids' legend. " +
+      "Labels follow the document unit (see document_units).",
     {
       part_a: z.number().int().describe("kernel part id of the first face's solid"),
       face_a: z.number().int().describe("first face id"),

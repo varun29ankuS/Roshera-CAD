@@ -106,6 +106,82 @@ export async function api(
   return parsed;
 }
 
+// ─── Document-unit cache (display-only; geometry stays mm-native) ──────
+
+/**
+ * Display-unit facts for the current document. Null until first use or a
+ * document_units tool call. Refreshed whenever document_units GETs or PATCHes
+ * the endpoint; lazily populated on the first compactVerdict call via a
+ * best-effort GET (PERCEPTION_TIMEOUT_MS budget; failure stays null so the
+ * fallback mm path is unchanged).
+ *
+ * Precision table (drafting convention, mirrors kernel units.rs):
+ *   mm  → 1 dp   (today's compact verdict format)
+ *   cm  → 3 dp
+ *   m   → 3 dp
+ *   in  → 3 dp
+ *   ft  → 3 dp
+ *
+ * Volume converts as mm³ × perMm³ where perMm = (1 mm in the unit)⁻¹,
+ * so perMm³ = perMm³.
+ */
+export interface DocumentUnitInfo {
+  token: string;   // "mm" | "cm" | "m" | "in" | "ft"
+  suffix: string;  // display suffix, same as token
+  perMm: number;   // how many of this unit equals 1 mm
+  dp: number;      // decimal places for volume display
+}
+
+const UNIT_TABLE: Record<string, Omit<DocumentUnitInfo, "token">> = {
+  mm: { suffix: "mm", perMm: 1,            dp: 1 },
+  cm: { suffix: "cm", perMm: 0.1,          dp: 3 },
+  m:  { suffix: "m",  perMm: 0.001,        dp: 3 },
+  in: { suffix: "in", perMm: 1 / 25.4,     dp: 3 },
+  ft: { suffix: "ft", perMm: 1 / 304.8,    dp: 3 },
+};
+
+/** Cached document unit; null = unknown (will fetch lazily). */
+let documentUnit: DocumentUnitInfo | null = null;
+/** True while a lazy fetch is in flight — prevents parallel stampede. */
+let documentUnitFetching = false;
+
+/**
+ * Called by the document_units tool to prime or update the cache after any
+ * GET or PATCH. `token` is the unit string returned by the backend.
+ */
+export function setDocumentUnitCache(token: string): void {
+  const entry = UNIT_TABLE[token];
+  if (entry) documentUnit = { token, ...entry };
+}
+
+/**
+ * Best-effort lazy fetch of the document unit. Fires at most once at a time.
+ * On failure, leaves `documentUnit` null (compact verdict falls back to mm).
+ */
+async function fetchDocumentUnitOnce(): Promise<void> {
+  if (documentUnit !== null || documentUnitFetching) return;
+  documentUnitFetching = true;
+  try {
+    const r = await api("GET", "/api/document/units", undefined, PERCEPTION_TIMEOUT_MS);
+    if (r && typeof r.unit === "string") setDocumentUnitCache(r.unit);
+  } catch {
+    // best-effort: fallback stays mm
+  } finally {
+    documentUnitFetching = false;
+  }
+}
+
+/**
+ * Format a raw mm³ volume value for display in the document unit.
+ * Falls back to today's `vol=...mm³` when the unit is unknown.
+ */
+export function formatVolume(mm3: number): string {
+  const u = documentUnit;
+  if (!u || u.token === "mm") return `vol=${mm3.toFixed(1)}mm³`;
+  const converted = mm3 * Math.pow(u.perMm, 3);
+  return `vol=${converted.toFixed(u.dp)}${u.suffix}³`;
+}
+
 // ─── Embedded-perception reuse (no double certification) ───────────────
 
 /**
@@ -459,6 +535,10 @@ async function ambientRender(partId: number): Promise<any | undefined> {
  * compute (`null`) are reported as unverified, never fabricated.
  */
 export function compactVerdict(p: any): string {
+  // Kick off a lazy unit fetch (no await — best-effort, won't affect this call
+  // but primes the cache for the NEXT verdict so it converges quickly).
+  void fetchDocumentUnitOnce();
+
   const DIMS: [string, string][] = [
     ["brep_valid", "brep"],
     ["watertight", "watertight"],
@@ -471,7 +551,7 @@ export function compactVerdict(p: any): string {
   const unverified = DIMS.filter(([k]) => p?.[k] == null).map(([, n]) => n);
   const facts: string[] = [];
   if (p?.euler_characteristic != null) facts.push(`χ=${p.euler_characteristic}`);
-  if (typeof p?.volume === "number") facts.push(`vol=${p.volume.toFixed(1)}mm³`);
+  if (typeof p?.volume === "number") facts.push(formatVolume(p.volume));
   if (p?.face_count != null) facts.push(`${p.face_count} faces`);
   if (p?.open_edges) facts.push(`⚠ ${p.open_edges} open edges`);
   if (p?.nonmanifold_edges) facts.push(`⚠ ${p.nonmanifold_edges} non-manifold edges`);
