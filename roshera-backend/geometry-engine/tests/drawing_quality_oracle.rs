@@ -1871,7 +1871,7 @@ fn six_hole_plate_has_section_view() {
 /// On A4, the isometric is replaced by the section, so "ISOMETRIC" is absent —
 /// but FRONT/TOP/RIGHT are still present.
 ///
-/// This test targets A3 (the six-hole fixture is placed on A3 by `standard_drawing_auto`
+/// This test targets A3 (the six-hole fixture stays on A4 under `standard_drawing_auto` (asserted below; the section replaces the ISO per the A4 ReplaceIso rule)
 /// because the part + section is too wide for A4).
 ///
 /// Mutation proof: accidentally remove the FRONT view → assert fires → RED.
@@ -1879,6 +1879,14 @@ fn six_hole_plate_has_section_view() {
 fn six_hole_plate_orthographic_labels_intact_after_task9() {
     let (m, part) = six_hole_plate();
     let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    // Settle the A3-vs-A4 question with an assertion instead of comments
+    // (review: two tests carried contradictory claims). The section view
+    // widens the sheet demand past A4.
+    assert_eq!(
+        dwg.sheet_size,
+        SheetSize::A4,
+        "six-hole plate stays on A4 - the section REPLACES the isometric (ReplaceIso rule)"
+    );
     let svg = render_drawing_svg(&dwg);
 
     // Orthographic view labels must appear exactly once each.

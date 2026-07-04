@@ -113,8 +113,8 @@ pub fn section_view(
         let mut cur: Option<(f64, f64)> = None;
         for (s0, s1) in spans {
             match cur {
-                Some((_, e1)) if s0 <= e1 + 1e-9 => {
-                    cur = Some((cur.unwrap().0, e1.max(s1)));
+                Some((b0, e1)) if s0 <= e1 + 1e-9 => {
+                    cur = Some((b0, e1.max(s1)));
                 }
                 Some((b0, b1)) => {
                     polylines.push(Polyline2d::from_points(vec![[b0, b0 + c], [b1, b1 + c]]));
