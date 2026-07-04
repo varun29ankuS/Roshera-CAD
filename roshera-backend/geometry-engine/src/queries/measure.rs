@@ -13,11 +13,11 @@
 //! | single Cylinder face                      | `Diameter { 2r, axis }`       |
 //! | single Plane face                         | `FaceInfo { area, normal }`   |
 //! | single other face                         | `FaceInfo { area, None }`     |
-//! | Plane × Plane, `|n·n| > 0.9999`          | `Distance { plane_plane }`    |
-//! | Plane × Plane, non-parallel               | `Angle { dihedral° }`         |
+//! | Plane × Plane, parallel                   | `Distance { plane_plane }`    |
+//! | Plane × Plane, non-parallel               | `Angle { degrees ∈ [0°,180°] between OUTWARD normals }` |
 //! | Cylinder × Cylinder, parallel axes        | `Distance { axis_axis }`      |
 //! | Cylinder × Cylinder, skew axes            | `Unsupported`                 |
-//! | Cylinder × Plane, axis ⊥ normal (`<1e-4`)| `Distance { axis_plane }`     |
+//! | Cylinder × Plane, axis ⊥ normal           | `Distance { axis_plane }`     |
 //! | Cylinder × Plane, not ⊥                   | `Unsupported`                 |
 //! | any other pair                            | `Distance { nearest }` or `Unsupported` |
 //!
@@ -31,6 +31,24 @@ use crate::primitives::face::FaceId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::surface::{Cylinder, Plane};
 use crate::primitives::topology_builder::BRepModel;
+
+// ─── Tolerances ───────────────────────────────────────────────────────────────
+
+/// `|n_a · n_b|` ABOVE this ⇒ the two directions count as PARALLEL
+/// (cone half-angle ≈ 0.81°).  Deliberately loose: a parallel-plate thickness
+/// measurement should tolerate drafting slop — a plate tilted a fraction of a
+/// degree still has one honest thickness.
+const PARALLEL_DOT_TOL: f64 = 0.9999;
+
+/// `|a · n|` BELOW this ⇒ the two directions count as PERPENDICULAR
+/// (≈ 0.0057°).  Four orders of magnitude tighter than [`PARALLEL_DOT_TOL`]
+/// on purpose: an axis⟂plane distance is only well-defined while the axis
+/// stays parallel to the plane — the moment the axis tilts, every point of
+/// the axis is at a different distance and "the" distance stops existing, so
+/// the gate must be near-exact.  Also used as the sine bound for cylinder
+/// axis parallelism (`|a×b| ≤ tol`), where the same argument applies to the
+/// axis-to-axis distance.
+const PERP_DOT_TOL: f64 = 1e-4;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -55,7 +73,13 @@ pub enum MeasureResult {
         direction: [f64; 3],
         kind: &'static str,
     },
-    /// Dihedral angle between two non-parallel planes.
+    /// Angle between two non-parallel planar faces, measured between their
+    /// OUTWARD normals: `degrees = acos(n_a · n_b) ∈ [0°, 180°]`.
+    ///
+    /// The full range is reported — an obtuse relation (e.g. a 120° bevel)
+    /// reads 120°, never its folded acute supplement 60°.  (Exactly parallel
+    /// or anti-parallel pairs never reach this variant; they report
+    /// `Distance { kind: "plane_plane" }` instead.)
     ///
     /// `anchor` is the midpoint between the two plane origins.
     Angle { degrees: f64, anchor: [f64; 3] },
@@ -67,7 +91,8 @@ pub enum MeasureResult {
     },
     /// Generic face information returned for a single-face query.
     ///
-    /// `normal` is present only when the face is planar.
+    /// `normal` is present only when the face is planar, and is the OUTWARD
+    /// normal (surface normal flipped when the face is oriented Backward).
     /// `anchor` is an approximation of the face centroid.
     FaceInfo {
         area: f64,
@@ -116,7 +141,21 @@ fn measure_one(model: &mut BRepModel, subj: MeasureSubject) -> Result<MeasureRes
     let anchor = face_surface_midpoint(model, face)
         .map(pt_to_arr)
         .unwrap_or([0.0, 0.0, 0.0]);
-    let area = face_area(model, face);
+
+    // Area is only needed for the FaceInfo branches; a cylinder's diameter is
+    // read straight off the surface and must not be refused because the area
+    // integral failed.  When the area cannot be computed we refuse with a
+    // typed reason — never a fabricated 0.0 (a real zero-area face and a
+    // failed computation must stay distinguishable).
+    let area_or_refuse = |model: &mut BRepModel| -> Result<f64, MeasureError> {
+        face_area(model, face).ok_or_else(|| MeasureError::Unsupported {
+            reason: format!(
+                "Face {face} resolved but its trimmed area could not be computed \
+                 (area integral failed on the supporting surface). \
+                 The face may have a degenerate trim loop."
+            ),
+        })
+    };
 
     match classified {
         Classified::Cylinder {
@@ -129,12 +168,12 @@ fn measure_one(model: &mut BRepModel, subj: MeasureSubject) -> Result<MeasureRes
             axis: vec_to_arr(axis),
         }),
         Classified::Plane { normal, .. } => Ok(MeasureResult::FaceInfo {
-            area,
+            area: area_or_refuse(model)?,
             normal: Some(vec_to_arr(normal)),
             anchor,
         }),
         Classified::Other => Ok(MeasureResult::FaceInfo {
-            area,
+            area: area_or_refuse(model)?,
             normal: None,
             anchor,
         }),
@@ -226,8 +265,9 @@ fn measure_plane_plane(
     nb: Vector3,
     ob: Point3,
 ) -> Result<MeasureResult, MeasureError> {
-    let dot = na.dot(&nb).abs();
-    if dot > 0.9999 {
+    // Parallelism uses |dot| so anti-parallel (facing) planes — the common
+    // plate-thickness case — also measure as a distance.
+    if na.dot(&nb).abs() > PARALLEL_DOT_TOL {
         // Parallel planes: perpendicular offset.
         let signed = (ob - oa).dot(&na);
         let value = signed.abs();
@@ -239,9 +279,11 @@ fn measure_plane_plane(
             kind: "plane_plane",
         })
     } else {
-        // Non-parallel: dihedral angle.
+        // Non-parallel: angle between OUTWARD normals, full [0°, 180°] range.
+        // No |·| fold — a 120° relation reports 120°, not 60° (see the Angle
+        // variant doc).
         let cos_theta = na.dot(&nb).clamp(-1.0, 1.0);
-        let degrees = cos_theta.abs().acos().to_degrees();
+        let degrees = cos_theta.acos().to_degrees();
         let anchor = pt_to_arr(midpoint(oa, ob));
         Ok(MeasureResult::Angle { degrees, anchor })
     }
@@ -255,9 +297,10 @@ fn measure_cyl_cyl(
     ab: Vector3,
     pb: Point3,
 ) -> Result<MeasureResult, MeasureError> {
-    // Parallel iff |aa × ab| ≈ 0.
+    // Parallel iff |aa × ab| ≈ 0 (sine of the inter-axis angle; same bound as
+    // the perpendicularity gate — see PERP_DOT_TOL for why it is tight).
     let cross_mag = aa.cross(&ab).magnitude();
-    if cross_mag > 1e-4 {
+    if cross_mag > PERP_DOT_TOL {
         return Err(MeasureError::Unsupported {
             reason: "Skew-axis cylinder pair: axis-to-axis distance for non-parallel \
                      cylinders is not yet supported. \
@@ -304,7 +347,7 @@ fn measure_cyl_plane(
 ) -> Result<MeasureResult, MeasureError> {
     // Axis perpendicular to plane normal iff |axis · normal| ≈ 0.
     let dot = cyl_axis.dot(&plane_normal).abs();
-    if dot > 1e-4 {
+    if dot > PERP_DOT_TOL {
         return Err(MeasureError::Unsupported {
             reason: format!(
                 "Cylinder axis is not perpendicular to the plane normal \
@@ -334,6 +377,15 @@ fn measure_cyl_plane(
 
 // ─── Nearest-point fallback ───────────────────────────────────────────────────
 
+/// Maximum alternating-projection sweeps for the nearest fallback.  The
+/// projection contracts linearly with ratio ≈ r/d (surface curvature radius
+/// over separation); 256 sweeps cover ratios up to ~0.9 to full f64 precision.
+const NEAREST_MAX_ITERS: usize = 256;
+
+/// Iteration stops when the realized distance changes by less than this
+/// between sweeps (mm — far below manufacturing relevance).
+const NEAREST_CONVERGENCE_TOL: f64 = 1e-12;
+
 fn measure_nearest(
     model: &mut BRepModel,
     fa: FaceId,
@@ -341,27 +393,66 @@ fn measure_nearest(
 ) -> Result<MeasureResult, MeasureError> {
     use crate::queries::trim::closest_point_on_face;
 
-    // Seed: UV-midpoint of face a → closest point on face b.
+    // Seed: UV-midpoint of face a.
     let seed_a = face_surface_midpoint(model, fa).ok_or_else(|| MeasureError::Unsupported {
         reason: "Cannot compute a seed point for nearest-point iteration: \
                  face a not found or its surface has no evaluable midpoint."
             .to_string(),
     })?;
 
-    let cpb =
-        closest_point_on_face(model, fb, seed_a).ok_or_else(|| MeasureError::Unsupported {
-            reason: "Nearest-point iteration did not converge for face b. \
-                 The face pair may be degenerate or have an unsupported surface type."
+    // Alternating projection (Cheney–Goldstein): project onto face b, then
+    // back onto face a, until the realized distance stops improving.  Each
+    // projection is the exact surface closest-point (Newton-refined); the
+    // distance sequence is non-increasing, so convergence-or-refusal is
+    // guaranteed within the sweep budget.
+    let mut q = seed_a;
+    let mut prev_dist = f64::INFINITY;
+    let mut converged = false;
+    let mut pair: Option<(
+        crate::queries::trim::FaceClosestPoint,
+        crate::queries::trim::FaceClosestPoint,
+    )> = None;
+
+    for _ in 0..NEAREST_MAX_ITERS {
+        let cpb = closest_point_on_face(model, fb, q).ok_or_else(|| MeasureError::Unsupported {
+            reason: "Nearest-point projection failed on face b. \
+                         The face pair may be degenerate or have an unsupported surface type."
                 .to_string(),
+        })?;
+        let cpa = closest_point_on_face(model, fa, cpb.point).ok_or_else(|| {
+            MeasureError::Unsupported {
+                reason: "Nearest-point projection failed on face a. \
+                         The face pair may be degenerate or have an unsupported surface type."
+                    .to_string(),
+            }
         })?;
 
-    // Refine: closest point on face a from the point found on face b.
-    let cpa =
-        closest_point_on_face(model, fa, cpb.point).ok_or_else(|| MeasureError::Unsupported {
-            reason: "Nearest-point iteration did not converge for face a. \
-                 The face pair may be degenerate or have an unsupported surface type."
-                .to_string(),
-        })?;
+        let d = cpa.point.distance(&cpb.point);
+        let improved = prev_dist - d;
+        q = cpa.point;
+        pair = Some((cpa, cpb));
+        if improved.abs() < NEAREST_CONVERGENCE_TOL {
+            converged = true;
+            break;
+        }
+        prev_dist = d;
+    }
+
+    let Some((cpa, cpb)) = pair else {
+        return Err(MeasureError::Unsupported {
+            reason: "Nearest-point iteration produced no footpoint pair.".to_string(),
+        });
+    };
+    if !converged {
+        return Err(MeasureError::Unsupported {
+            reason: format!(
+                "Nearest-point iteration did not converge within {NEAREST_MAX_ITERS} sweeps \
+                 (last distance {prev_dist:.6} mm still improving). \
+                 The face pair may oscillate between multiple local minima; \
+                 try a geometrically crisper pair (plane/plane, cylinder/cylinder)."
+            ),
+        });
+    }
 
     // Reject if the converged footpoints both lie outside their trim domains —
     // the faces do not face each other.
@@ -444,7 +535,12 @@ fn surface_classify(
     }
 
     if let Some(pln) = surf.as_any().downcast_ref::<Plane>() {
-        let normal = pln.normal.normalize().unwrap_or(Vector3::Z);
+        // OUTWARD normal: flip the surface normal when the face is oriented
+        // Backward relative to its surface (same convention as
+        // `cd::face_outward_normal_at`).  The Angle result's [0°, 180°] range
+        // is only meaningful over outward normals; distance cases use |·| and
+        // are sign-invariant.
+        let normal = pln.normal.normalize().unwrap_or(Vector3::Z) * face.orientation.sign();
         return Ok(Classified::Plane {
             normal,
             origin: pln.origin,
@@ -456,26 +552,25 @@ fn surface_classify(
 
 // ─── Area helper ─────────────────────────────────────────────────────────────
 
-/// Compute the area of a face (warms the face's internal cache).
+/// Compute the trimmed area of a face.
 ///
-/// Returns `0.0` when the face is not found or area computation fails.
-fn face_area(model: &mut BRepModel, face_id: FaceId) -> f64 {
+/// Returns `None` when the face is not found or the area integral fails —
+/// NEVER a sentinel value, so a genuine zero-area face and a failed
+/// computation stay distinguishable.  Callers convert `None` into a typed
+/// `Unsupported` refusal rather than forwarding a fabricated number.
+fn face_area(model: &mut BRepModel, face_id: FaceId) -> Option<f64> {
     // Read the face tolerance (immutable path).
     let tol = model
         .faces
         .get(face_id)
-        .map(|f| crate::math::Tolerance::from_distance(f.tolerance))
-        .unwrap_or_else(|| crate::math::Tolerance::from_distance(1e-6));
+        .map(|f| crate::math::Tolerance::from_distance(f.tolerance))?;
 
     // `Face::area` requires `&mut Face` and `&mut LoopStore`.
     // We cannot split the borrow (`faces` and `loops` are both fields of `model`).
     // Pattern (same as readable/query.rs): clone the face, run area on the clone
     // against the model's stores. The cache is NOT warmed on the original (the
     // clone is discarded), which is acceptable for a query path.
-    let mut face_clone = match model.faces.get(face_id) {
-        Some(f) => f.clone(),
-        None => return 0.0,
-    };
+    let mut face_clone = model.faces.get(face_id)?.clone();
     face_clone
         .area(
             &mut model.loops,
@@ -485,7 +580,7 @@ fn face_area(model: &mut BRepModel, face_id: FaceId) -> f64 {
             &model.surfaces,
             tol,
         )
-        .unwrap_or(0.0)
+        .ok()
 }
 
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
@@ -531,6 +626,21 @@ mod tests {
         }
     }
 
+    /// First face whose supporting surface is a [`Sphere`].
+    fn first_sphere_face(m: &BRepModel, solid: SolidId) -> FaceId {
+        use crate::primitives::surface::Sphere;
+        let s = m.solids.get(solid).expect("solid");
+        let sh = m.shells.get(s.outer_shell).expect("shell");
+        for &fid in &sh.faces {
+            let f = m.faces.get(fid).expect("face");
+            let surf = m.surfaces.get(f.surface_id).expect("surface");
+            if surf.as_any().downcast_ref::<Sphere>().is_some() {
+                return fid;
+            }
+        }
+        panic!("no sphere face in solid {solid}");
+    }
+
     /// First face whose supporting surface is a [`Cylinder`].
     fn first_cyl_face(m: &BRepModel, solid: SolidId) -> FaceId {
         let s = m.solids.get(solid).expect("solid");
@@ -545,7 +655,9 @@ mod tests {
         panic!("no cylinder face in solid {solid}");
     }
 
-    /// Face whose plane normal most closely aligns with `target` (unit vector).
+    /// Face whose plane OUTWARD normal most closely aligns with `target`
+    /// (unit vector).  Outward = surface normal × orientation sign, the same
+    /// convention `measure` itself uses.
     fn plane_face_near(m: &BRepModel, solid: SolidId, target: Vector3) -> FaceId {
         let s = m.solids.get(solid).expect("solid");
         let sh = m.shells.get(s.outer_shell).expect("shell");
@@ -554,7 +666,7 @@ mod tests {
             let f = m.faces.get(fid).expect("face");
             let surf = m.surfaces.get(f.surface_id).expect("surface");
             if let Some(p) = surf.as_any().downcast_ref::<Plane>() {
-                let n = p.normal.normalize().unwrap_or(Vector3::Z);
+                let n = p.normal.normalize().unwrap_or(Vector3::Z) * f.orientation.sign();
                 let d = n.dot(&target);
                 if best.map_or(true, |(prev, _)| d > prev) {
                     best = Some((d, fid));
@@ -776,6 +888,117 @@ mod tests {
                 );
             }
             other => panic!("expected FaceInfo, got {other:?}"),
+        }
+    }
+
+    // ── Case 2b: obtuse dihedral must NOT fold to its acute supplement ───────
+    //
+    // Derivation of the expected value:
+    //   Box A's top face outward normal:  nA = (0, 0, 1).
+    //   Box B is rotated 120° about the X axis through its centre; its top
+    //   face outward normal (0,0,1) rotates to
+    //     nB = (0, −sin 120°, cos 120°) = (0, −√3/2, −1/2).
+    //   dot(nA, nB) = −1/2  →  acos(−1/2) = 120°.
+    // The folded convention acos(|dot|) would report 60° — the wrong number.
+    #[test]
+    fn obtuse_dihedral_reports_full_angle() {
+        use crate::operations::transform::{rotate, TransformOptions};
+
+        let mut m = BRepModel::new();
+        let a = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(20.0, 20.0, 20.0)
+                .expect("box A"),
+        );
+        let b = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(20.0, 20.0, 20.0)
+                .expect("box B"),
+        );
+        // Rotate box B 120° about the X axis through its centre (the origin —
+        // create_box_3d builds centred on the origin).
+        rotate(
+            &mut m,
+            vec![b],
+            Point3::ZERO,
+            Vector3::X,
+            120.0_f64.to_radians(),
+            TransformOptions::default(),
+        )
+        .expect("rotate box B");
+
+        let top_a = plane_face_near(&m, a, Vector3::Z);
+        // B's rotated top face: outward normal (0, −√3/2, −1/2).
+        let rot_normal = Vector3::new(0.0, -(3.0_f64.sqrt()) / 2.0, -0.5);
+        let top_b = plane_face_near(&m, b, rot_normal);
+
+        let result = measure(
+            &mut m,
+            MeasureSubject::Face {
+                solid: a,
+                face: top_a,
+            },
+            Some(MeasureSubject::Face {
+                solid: b,
+                face: top_b,
+            }),
+        )
+        .expect("measure succeeded");
+
+        match result {
+            MeasureResult::Angle { degrees, .. } => {
+                assert!(
+                    (degrees - 120.0).abs() < 1e-9,
+                    "expected 120.0° (angle between outward normals), got {degrees}"
+                );
+            }
+            other => panic!("expected Angle, got {other:?}"),
+        }
+    }
+
+    // ── Case 8: sphere × plane → nearest distance, analytically exact ─────────
+    //
+    // Box 40×40×20 centred at origin → top face is the plane z = +10.
+    // Sphere r = 6 centred at (0, 0, 20) → lowest point (0, 0, 14).
+    // Nearest gap = 20 − 10 − 6 = 4.0 exactly.
+    #[test]
+    fn sphere_plane_nearest_exact() {
+        let mut m = BRepModel::new();
+        let plate = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(40.0, 40.0, 20.0)
+                .expect("plate"),
+        );
+        let ball = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_sphere_3d(Point3::new(0.0, 0.0, 20.0), 6.0)
+                .expect("sphere"),
+        );
+        let sphere_f = first_sphere_face(&m, ball);
+        let top_f = plane_face_near(&m, plate, Vector3::Z);
+
+        let result = measure(
+            &mut m,
+            MeasureSubject::Face {
+                solid: ball,
+                face: sphere_f,
+            },
+            Some(MeasureSubject::Face {
+                solid: plate,
+                face: top_f,
+            }),
+        )
+        .expect("measure succeeded");
+
+        match result {
+            MeasureResult::Distance { value, kind, .. } => {
+                assert_eq!(kind, "nearest");
+                assert!(
+                    (value - 4.0).abs() < 1e-6,
+                    "expected 4.0 mm (20 − 10 − 6), got {value}"
+                );
+            }
+            other => panic!("expected Distance(nearest), got {other:?}"),
         }
     }
 
