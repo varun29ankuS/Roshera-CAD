@@ -65,6 +65,11 @@ struct CircleGroup {
     all_visible: bool,
     all_hidden: bool,
     fallback: Vec<(bool, Polyline2d)>,
+    /// All B-Rep face ids adjacent to any arc-edge of this rim (cap face +
+    /// lateral face). Threaded onto [`ProjectedCircle::face_ids`] so downstream
+    /// consumers (hole-table tag assignment) can resolve a circle back to the
+    /// feature that produced it by entity identity.
+    face_ids: Vec<u32>,
 }
 
 /// Into-scene view direction (unit) for a projection: the third row of the
@@ -211,6 +216,36 @@ pub fn project_solid_edges_visibility(
     shell_ids.extend_from_slice(&solid.inner_shells);
     let _ = shell; // outer shell fetched above only to validate existence.
 
+    // Edge → adjacent-faces reverse map. The main walk below visits each edge
+    // ONCE (from whichever face's loop reaches it first), but a rim edge is
+    // shared by TWO faces (planar cap + lateral cylinder) and the circle's
+    // entity identity must carry BOTH — the hole-table tag assigner matches
+    // on the LATERAL face id, which may not be the walk-encounter face.
+    let mut edge_faces: std::collections::HashMap<EdgeId, Vec<u32>> =
+        std::collections::HashMap::new();
+    for sh in &shell_ids {
+        let Some(shell) = model.shells.get(*sh) else {
+            continue;
+        };
+        for face_id in &shell.faces {
+            let Some(face) = model.faces.get(*face_id) else {
+                continue;
+            };
+            let loop_ids = std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied());
+            for loop_id in loop_ids {
+                let Some(topo_loop) = model.loops.get(loop_id) else {
+                    continue;
+                };
+                for edge_id in &topo_loop.edges {
+                    let faces = edge_faces.entry(*edge_id).or_default();
+                    if !faces.contains(face_id) {
+                        faces.push(*face_id);
+                    }
+                }
+            }
+        }
+    }
+
     for sh in shell_ids {
         let shell = match model.shells.get(sh) {
             Some(s) => s,
@@ -317,7 +352,18 @@ pub fn project_solid_edges_visibility(
                                 all_visible: true,
                                 all_hidden: true,
                                 fallback: Vec::new(),
+                                face_ids: Vec::new(),
                             });
+                            // Entity identity: ALL faces adjacent to this arc
+                            // edge (not just the walk-encounter face) join the
+                            // rim's face-id set.
+                            if let Some(adj) = edge_faces.get(edge_id) {
+                                for f in adj {
+                                    if !g.face_ids.contains(f) {
+                                        g.face_ids.push(*f);
+                                    }
+                                }
+                            }
                             let arc_vis = runs.iter().all(|(v, _)| *v);
                             let arc_hid = runs.iter().all(|(v, _)| !*v);
                             g.all_visible &= arc_vis;
@@ -355,6 +401,7 @@ pub fn project_solid_edges_visibility(
             cx: g.cx,
             cy: g.cy,
             r: g.r,
+            face_ids: g.face_ids.clone(),
         };
         if g.all_visible {
             out.circles.push(circ);

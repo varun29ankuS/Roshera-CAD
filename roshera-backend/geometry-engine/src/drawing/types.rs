@@ -255,11 +255,22 @@ pub struct ProjectedView {
 }
 
 /// A circular edge projected to a true circle in view-space (mm, pre-scale).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectedCircle {
     pub cx: f64,
     pub cy: f64,
     pub r: f64,
+    /// B-Rep face ids adjacent to the rim edges that produced this circle
+    /// (both the cap/planar face and the bore's lateral face for a hole rim).
+    ///
+    /// This is the ENTITY IDENTITY link from ink back to topology: the
+    /// hole-table tag assigner matches a `HoleSite` (which carries the bore's
+    /// lateral-face ids from the diameter extraction record) to its own
+    /// projected circle by face-id intersection — no coordinate heuristics.
+    /// Populated at the projection site (`project_solid_edges_visibility`);
+    /// serde-defaulted so pre-existing serialized drawings still load.
+    #[serde(default)]
+    pub face_ids: Vec<u32>,
 }
 
 /// Paper sizes, ISO 216 series. Dimensions in millimetres, landscape

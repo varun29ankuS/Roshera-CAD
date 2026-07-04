@@ -569,8 +569,20 @@ fn select_circles(
     let mut seen: HashSet<(i64, i64, i64)> = HashSet::new();
     let mut groups: HashMap<(i64, i64), Vec<super::types::ProjectedCircle>> = HashMap::new();
     for c in circles {
-        if seen.insert((q(c.cx), q(c.cy), q(c.r))) {
-            groups.entry((q(c.cx), q(c.cy))).or_default().push(c);
+        let key = (q(c.cx), q(c.cy), q(c.r));
+        if seen.insert(key) {
+            groups.entry((key.0, key.1)).or_default().push(c);
+        } else if let Some(g) = groups.get_mut(&(key.0, key.1)) {
+            // Coincident duplicate: keep ONE drawn circle but MERGE the entity
+            // identity — dropping the duplicate's face_ids would sever the
+            // link from a coaxial feature's rim back to its face.
+            if let Some(kept) = g.iter_mut().find(|k| q(k.r) == key.2) {
+                for f in &c.face_ids {
+                    if !kept.face_ids.contains(f) {
+                        kept.face_ids.push(*f);
+                    }
+                }
+            }
         }
     }
     let mut out = Vec::new();
@@ -869,8 +881,20 @@ fn attach_hole_table(
 
     let dims = extract_dimensions(model, solid_id);
 
-    // Determine part extents for THRU detection. Use the world AABB edges.
-    // We approximate from the overall extent records (X/Y/Z).
+    // Determine part extents for THRU detection from the whole-part extent
+    // records (X/Y/Z).
+    //
+    // CONTRACT (with `extract_dimensions` in readable/dimensions.rs): the
+    // whole-part AABB extents are emitted with `kind == "extent"` AND an
+    // EMPTY `entities` list — that emptiness is the discriminator between
+    // "whole-part extent" and any future face-scoped extent record. `kind`
+    // is the primary key here; `entities.is_empty()` is the whole-part
+    // qualifier. If extraction ever starts emitting extent records WITH
+    // entity ids, those are face-scoped and must NOT feed part_extents —
+    // this filter is therefore load-bearing for THRU detection: dropping
+    // it would shrink part_extents to a face extent and misclassify THRU
+    // bores as blind (and vice versa if the filter silently matched
+    // nothing, every bore would fall back to BLIND via f64::MAX below).
     let mut part_extents = [f64::INFINITY; 3];
     for d in &dims {
         if d.kind == "extent" && d.entities.is_empty() {
@@ -1071,122 +1095,39 @@ fn attach_hole_table(
             }
         };
 
-        // Build a list of (view-space centre, bore_diameter, entity_key) for
-        // all bores so we can match to circles by nearest unassigned.
-        struct BoreCandidate {
-            vc: [f64; 2],
-            dia: f64,
-            ents: Vec<u32>,
-        }
-        let mut bore_candidates: Vec<BoreCandidate> = bore_centres
-            .iter()
-            .filter_map(|(ents, &world_c)| {
-                let dia = dims
-                    .iter()
-                    .find(|d| {
-                        d.kind == "diameter" && !d.entities.is_empty() && {
-                            let mut k = d.entities.clone();
-                            k.sort_unstable();
-                            &k == ents
-                        }
-                    })
-                    .map(|d| d.value)?;
-                let vc = project_world(world_c);
-                Some(BoreCandidate {
-                    vc,
-                    dia,
-                    ents: ents.clone(),
-                })
-            })
-            .collect();
-
-        // Match bore candidates to circles: greedy nearest-circle assignment.
-        // Use a mutable "available" list of circles.
-        let mut available_circles: Vec<(usize, f64, f64, f64)> = view
-            .circles
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, c.cx, c.cy, c.r))
-            .collect();
-
-        // For each bore candidate, find the closest available circle with
-        // matching radius (within 5% + 0.1 mm tolerance).
-        let mut ent_to_circle: std::collections::HashMap<Vec<u32>, [f64; 2]> =
-            std::collections::HashMap::new();
-
-        // Sort bore candidates so smaller-radius bores match first (stable, deterministic).
-        bore_candidates.sort_by(|a, b| {
-            a.dia
-                .partial_cmp(&b.dia)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        for bc in &bore_candidates {
-            let r_target = bc.dia * 0.5;
-            // Find the closest available circle with matching radius.
-            let best_idx = available_circles
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, _, _, r))| (r - r_target).abs() < r_target * 0.05 + 0.1)
-                .min_by(|(_, (_, cx1, cy1, _)), (_, (_, cx2, cy2, _))| {
-                    let d1 = (cx1 - bc.vc[0]).powi(2) + (cy1 - bc.vc[1]).powi(2);
-                    let d2 = (cx2 - bc.vc[0]).powi(2) + (cy2 - bc.vc[1]).powi(2);
-                    d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(avail_idx, _)| avail_idx);
-
-            if let Some(ai) = best_idx {
-                let (_, cx, cy, _) = available_circles[ai];
-                ent_to_circle.insert(bc.ents.clone(), [cx, cy]);
-                available_circles.remove(ai);
-            } else {
-                // No circle matched → use projected bore centre directly.
-                ent_to_circle.insert(bc.ents.clone(), bc.vc);
-            }
-        }
-
-        // Now assign axial centres to sites. We match each site by (x_mm, y_mm)
-        // to a bore candidate using the bore_centres lookup.
-        // Since HoleSite doesn't carry entities, we match by position proximity.
-        let mut used_circles: Vec<[f64; 2]> = Vec::new();
-
+        // ── Entity-keyed site → circle assignment ──────────────────────────
+        //
+        // The projected circle carries `face_ids` — every B-Rep face adjacent
+        // to the rim edges that produced it (populated at the projection site
+        // in `project_solid_edges_visibility`). The site carries the bore's
+        // lateral-face ids (`HoleSite::face_entities`, from the diameter
+        // extraction record). A non-empty intersection IS this bore's rim:
+        // no coordinate heuristics, no greedy consumption, correct for
+        // off-origin and transformed parts by construction. A through-bore
+        // has two coaxial rims (top + bottom) sharing the lateral face; in
+        // the axial view they project to the same centre, so matching either
+        // anchors the tag identically. The radius gate keeps a same-face but
+        // different-radius rim (e.g. a chamfer ring) from matching.
         for site in &mut sites {
-            // Find the bore candidate whose projected world centre is closest
-            // to the site's (x_mm, y_mm) position values.
-            //
-            // The site's x_mm / y_mm are offsets from the part corner. The bore
-            // world centre in the perpendicular plane ≈ (datum_origin + offset).
-            // For matching, we compare vc (the projected world centre) against
-            // the bore candidates.
-            //
-            // Since we built bore_candidates from the same dim records as the
-            // hole table, we can match by finding the candidate whose projected
-            // centre hasn't been used yet and whose diameter matches.
-            let best = bore_candidates
+            let r_target = site.diameter_mm * 0.5;
+            let r_ok = |r: f64| (r - r_target).abs() < r_target * 0.05 + 0.1;
+            let matched = view
+                .circles
                 .iter()
-                .filter(|bc| {
-                    (bc.dia - site.diameter_mm).abs() < 0.01
-                        && !used_circles.iter().any(|u| {
-                            let mapped = ent_to_circle.get(&bc.ents).copied().unwrap_or(bc.vc);
-                            (mapped[0] - u[0]).abs() < 0.1 && (mapped[1] - u[1]).abs() < 0.1
-                        })
-                })
-                .min_by(|a, b| {
-                    // Pick the candidate whose x_mm / y_mm offsets match the site.
-                    // Use a simple distance heuristic: |bc.vc[0] - site.x_mm| +
-                    // |bc.vc[1] - site.y_mm|. This is approximate since x_mm and
-                    // y_mm are offsets (not absolute coords), but for typical
-                    // workpieces (part centred near origin) the relative order is
-                    // preserved. For off-origin parts the circles disambiguate.
-                    let da = (a.vc[0] - site.x_mm).abs() + (a.vc[1] - site.y_mm).abs();
-                    let db = (b.vc[0] - site.x_mm).abs() + (b.vc[1] - site.y_mm).abs();
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-            if let Some(bc) = best {
-                let circle_centre = ent_to_circle.get(&bc.ents).copied().unwrap_or(bc.vc);
-                site.axial_centre = Some(circle_centre);
-                used_circles.push(circle_centre);
+                .chain(view.hidden_circles.iter())
+                .find(|c| r_ok(c.r) && c.face_ids.iter().any(|f| site.face_entities.contains(f)));
+            if let Some(c) = matched {
+                site.axial_centre = Some([c.cx, c.cy]);
+                continue;
+            }
+            // Fallback: the rim did not survive projection as an analytic
+            // circle (e.g. a mixed-visibility rim rendered as arc polylines).
+            // Project the bore's analytic world centre from the extraction
+            // records — still exact data, just not snapped to drawn ink.
+            let mut key = site.face_entities.clone();
+            key.sort_unstable();
+            if let Some(&wc) = bore_centres.get(&key) {
+                site.axial_centre = Some(project_world(wc));
             }
         }
     }

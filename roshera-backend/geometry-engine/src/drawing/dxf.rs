@@ -93,6 +93,16 @@ const ACI_GREY: u8 = 8;
 pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> {
     let mut dxf = DxfDrawing::new();
 
+    // -- File version ----------------------------------------------------
+    // The dxf crate defaults `$ACADVER` to R12 and, on save, SILENTLY DROPS
+    // any entity whose spec MinVersion exceeds the header version.
+    // LWPOLYLINE is MinVersion=R14 — under the default every view-geometry
+    // and hole-table-border polyline vanished from the written file while
+    // TEXT/LINE survived, so the sheet exported as floating annotations
+    // with no part edges. R2000 (AC1015) is the universally-readable
+    // baseline that supports LWPOLYLINE.
+    dxf.header.version = dxf::enums::AcadVersion::R2000;
+
     // -- Layers --------------------------------------------------------
     register_layer(&mut dxf, LAYER_FRAME, ACI_GREY);
     register_layer(&mut dxf, LAYER_TITLEBLOCK, ACI_BLACK);

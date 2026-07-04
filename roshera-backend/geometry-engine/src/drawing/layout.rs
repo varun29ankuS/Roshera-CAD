@@ -550,9 +550,9 @@ fn place_hole_table(
     existing: &[SheetItem],
 ) -> (Vec<PlacedHoleTag>, Vec<SheetItem>) {
     let w = drawing.sheet_size.width();
-    let (ml, _mr, mt, mb) = frame_margins(&drawing.sheet_size);
+    let (ml, mr, mt, mb) = frame_margins(&drawing.sheet_size);
     let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
-    let frame_w = w - ml - _mr;
+    let frame_w = w - ml - mr;
     let frame_h = sheet_h - mt - mb;
 
     // Title block occupies the bottom-right corner of the frame.

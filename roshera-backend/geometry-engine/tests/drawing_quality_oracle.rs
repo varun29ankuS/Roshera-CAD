@@ -1449,4 +1449,136 @@ fn hole_table_and_tags_emitted_in_dxf() {
             text
         );
     }
+
+    // ── Border parity: one HOLE_TABLE LWPOLYLINE per HoleTableBorder item ──
+    // Mutation proof: gut the HoleTableBorder emission in
+    // `emit_labels_from_layout` (skip the border loop) → count drops to 0 →
+    // this assert turns RED. Transcript in task-7-report.md (7b review fixes).
+    let border_items = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::HoleTableBorder)
+        .count();
+    assert!(
+        border_items > 0,
+        "layout must carry HoleTableBorder items for a tabled part"
+    );
+    fn count_hole_table_polylines(dxf: &str) -> usize {
+        let lines: Vec<&str> = dxf.lines().collect();
+        let mut count = 0;
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() == "LWPOLYLINE" {
+                // Scan this entity's (code, value) pairs for layer 8 = HOLE_TABLE,
+                // stopping at the next entity separator (group code 0).
+                let mut j = i + 1;
+                while j + 1 < lines.len() {
+                    let gc = lines[j].trim();
+                    if gc == "0" {
+                        break;
+                    }
+                    if gc == "8" && lines[j + 1].trim() == "HOLE_TABLE" {
+                        count += 1;
+                        break;
+                    }
+                    j += 2;
+                }
+            }
+            i += 1;
+        }
+        count
+    }
+    assert_eq!(
+        count_hole_table_polylines(&dxf_text),
+        border_items,
+        "DXF must emit exactly one HOLE_TABLE-layer LWPOLYLINE per \
+         HoleTableBorder layout item (outer border + separators)"
+    );
+}
+
+// ── Task 7 review fix (SEV-2-A): entity-keyed bore→circle assignment ─────────
+
+/// Bore-to-circle/tag assignment must be keyed on ENTITY IDENTITY, not a
+/// coordinate heuristic.
+///
+/// The old site→circle assignment compared the circle's projected ABSOLUTE
+/// view-space centre (`bc.vc`) against the site's datum-RELATIVE offsets
+/// (`site.x_mm` / `site.y_mm`) — two different coordinate frames. On an
+/// origin-centred part they roughly coincide and the heuristic survives; on
+/// an off-origin part (house repro convention: built at world x = −80) they
+/// diverge by the part offset and the nearest-by-that-metric candidate can be
+/// the WRONG bore of the same diameter: tag A1 lands on A2's circle while the
+/// table rows stay correct — a silent lie on the sheet.
+///
+/// This fixture: 40×40×10 plate centred at x = −80 (spans x ∈ [−100,−60],
+/// y ∈ [−20,20]); two Ø5 THRU bores at world (−90,−10) and (−65,10), plus one
+/// Ø8 at (−75,0) for the different-diameter case. For A1 (datum offsets
+/// x=10, y=10) the heuristic distance to its OWN circle is
+/// |−90−10| + |−10−10| = 120, but to A2's circle only |−65−10| + |10−10| = 75
+/// — the heuristic provably swaps A1 and A2. Entity-keyed matching (the
+/// projected circle carries the face ids adjacent to its rim edges; the site
+/// carries the bore's lateral-face ids) cannot swap.
+///
+/// Mutation proof: revert the site→circle assignment to the coordinate
+/// heuristic → A1/A2 anchors swap → RED.
+#[test]
+fn off_origin_bore_tags_land_on_their_own_circles() {
+    let mut m = BRepModel::new();
+    let plate = match TopologyBuilder::new(&mut m)
+        .create_box_3d(40.0, 40.0, 10.0)
+        .expect("plate")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    geometry_engine::operations::transform::translate(
+        &mut m,
+        vec![plate],
+        Vector3::new(-1.0, 0.0, 0.0),
+        80.0,
+        geometry_engine::operations::transform::TransformOptions::default(),
+    )
+    .expect("translate plate off-origin");
+    let mut part = plate;
+    // (world_x, world_y, radius): two Ø5 + one Ø8, all THRU along Z.
+    for (bx, by, r) in [(-90.0, -10.0, 2.5), (-65.0, 10.0, 2.5), (-75.0, 0.0, 4.0)] {
+        let bore = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(bx, by, -6.0), Vector3::Z, r, 12.0)
+            .expect("bore")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        part = boolean_operation(
+            &mut m,
+            part,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("drill");
+    }
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    assert_eq!(dwg.hole_sites.len(), 3, "three tabled bores");
+
+    // Every site's tag anchor must be ITS OWN bore's projected centre.
+    // Datum = plate AABB min corner (−100, −20); the axial (TOP) view
+    // projects world (x, y) → view (x, y), so each bore's true view-space
+    // centre is datum + (x_mm, y_mm).
+    for site in &dwg.hole_sites {
+        let centre = site
+            .axial_centre
+            .unwrap_or_else(|| panic!("site {} has no axial centre", site.tag));
+        let expected = [-100.0 + site.x_mm, -20.0 + site.y_mm];
+        assert!(
+            (centre[0] - expected[0]).abs() < 0.5 && (centre[1] - expected[1]).abs() < 0.5,
+            "tag {} anchored at ({:.2}, {:.2}) but its own bore projects to \
+             ({:.2}, {:.2}) — the tag landed on the wrong circle",
+            site.tag,
+            centre[0],
+            centre[1],
+            expected[0],
+            expected[1]
+        );
+    }
 }
