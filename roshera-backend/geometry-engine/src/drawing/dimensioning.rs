@@ -125,7 +125,7 @@ pub fn visible_dimensions(
     // ∠ (angle) prefixes are kept; they are not axis tags.
     for d in &mut dims {
         let first = d.label.chars().next();
-        if matches!(first, Some(c) if c.is_ascii_uppercase() && c != 'R') {
+        if matches!(first, Some(c) if c.is_ascii_uppercase() && c != 'R' && c != 'S') {
             if let Some(rest) = d.label.strip_prefix(|c: char| c.is_ascii_uppercase()) {
                 if let Some(num) = rest.strip_prefix(' ') {
                     d.label = num.to_string();

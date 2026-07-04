@@ -458,30 +458,26 @@ impl DedupeKey {
 /// (sorted, deduped). The `id` and `pid` of the FIRST occurrence win so that
 /// downstream handles remain stable.
 fn dedupe_coincident(rows: Vec<DimensionRecord>) -> Vec<DimensionRecord> {
-    // `order` preserves insertion order of keys for deterministic output.
-    let mut order: Vec<DedupeKey> = Vec::new();
+    // Output order = first-occurrence insertion order (the `out` Vec itself);
+    // the map only resolves duplicates to their surviving row's index.
     let mut map: std::collections::HashMap<DedupeKey, usize> = std::collections::HashMap::new();
     let mut out: Vec<DimensionRecord> = Vec::new();
 
     for row in rows {
         let key = DedupeKey::from_record(&row);
         if let Some(&idx) = map.get(&key) {
-            // Merge entities into the existing row.
-            for eid in row.entities {
-                if !out[idx].entities.contains(&eid) {
-                    out[idx].entities.push(eid);
-                }
-            }
+            // Merge entities into the existing row; sort+dedup once at the
+            // end of the merge (O(k log k), not a per-element linear scan).
+            out[idx].entities.extend(row.entities);
             out[idx].entities.sort_unstable();
+            out[idx].entities.dedup();
         } else {
             let idx = out.len();
-            map.insert(key.clone(), idx);
-            order.push(key);
+            map.insert(key, idx);
             out.push(row);
         }
     }
 
-    let _ = order; // kept for clarity; map provides the index
     out
 }
 
