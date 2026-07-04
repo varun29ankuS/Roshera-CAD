@@ -159,7 +159,9 @@ pub(crate) const STACK: f64 = 8.0; // gap between successive parallel dim lines
 pub(crate) const GAP: f64 = 1.5; // extension-line gap from the part
 pub(crate) const EXT: f64 = 1.5; // extension-line overshoot past the dim line
 pub(crate) const AR_L: f64 = 2.6; // arrowhead length
-pub(crate) const AR_W: f64 = 0.85; // arrowhead half-width
+pub(crate) const AR_W: f64 = 0.433; // arrowhead HALF-width: full base 0.866mm
+                                    // against AR_L 2.6mm length = 3:1 (ISO 128). 0.85 was a half-width mistaken
+                                    // for full width (rendered 1.53:1 — squat arrows).
 pub(crate) const TGAP: f64 = 1.4; // label sits TGAP above/beside the dim line
 
 /// Arrowhead specification: tip point and direction vector (unit, pointing
@@ -674,7 +676,6 @@ pub(crate) fn place_note_items(
     drawing: &super::types::Drawing,
     frame_bottom: f64,
 ) -> Vec<SheetItem> {
-    use super::svg::frame_margins;
     let (ml, _mr, _mt, _mb) = frame_margins(&drawing.sheet_size);
     let x = ml + 2.5;
     let font = NOTES_FONT_MM;

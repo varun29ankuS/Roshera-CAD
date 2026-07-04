@@ -301,6 +301,10 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
         .filter(|it| {
             matches!(
                 it.kind,
+                // ProjectionSymbol is deliberately EXCLUDED from text-collision pairs:
+                // it lives inside the title-block zone, which the view-placement checks
+                // already treat as an obstacle - pairing it here would double-report
+                // every title-block intrusion.
                 SheetItemKind::ViewLabel | SheetItemKind::DimensionText | SheetItemKind::NoteText
             )
         })
