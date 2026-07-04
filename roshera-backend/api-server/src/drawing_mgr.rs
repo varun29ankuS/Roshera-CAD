@@ -1048,13 +1048,22 @@ mod tests {
         let drawing =
             standard_drawing_hlr(&model, sid, Uuid::nil(), SheetSize::A3, 1.0).expect("hlr sheet");
 
-        // Three orthographic views, each with auto dimensions.
+        // Three orthographic views. Under the global dedup (ISO 129-1: each
+        // feature dimensioned exactly once, in the view where it reads best —
+        // drawing-correctness campaign, 2026-07-04) a view may legitimately
+        // carry zero dims when its features read better elsewhere, so the
+        // per-view non-empty assertion is replaced by the sheet-wide claims:
+        // dimensions exist, and no (kind, value) is stated twice.
         assert_eq!(drawing.views.len(), 3, "Front/Top/Right");
-        for v in &drawing.views {
+        let all_dims: Vec<_> = drawing.views.iter().flat_map(|v| &v.dimensions).collect();
+        assert!(!all_dims.is_empty(), "the sheet carries auto dimensions");
+        let mut seen = std::collections::HashSet::new();
+        for d in &all_dims {
             assert!(
-                !v.dimensions.is_empty(),
-                "view {} must carry auto dimensions",
-                v.name
+                seen.insert((d.kind.clone(), (d.value * 100.0).round() as i64)),
+                "dimension {} {:.2} stated twice on the sheet",
+                d.kind,
+                d.value
             );
         }
 
