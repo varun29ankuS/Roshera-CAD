@@ -403,8 +403,104 @@ fn face_axial_extent(
     }
 }
 
+/// Quantise a `f64` anchor/direction component for coincident-row dedupe.
+///
+/// `scale` determines the resolution: 0.01 for values (mm), 0.1 for anchors,
+/// and 100.0 for direction components (unit vectors ×100 rounded to int).
+#[inline]
+fn quantise(v: f64, scale: f64) -> i64 {
+    (v / scale).round() as i64
+}
+
+/// Key used to identify coincident (duplicate) dimension rows.
+///
+/// Two rows are considered coincident when they have the same:
+/// - `kind` string,
+/// - `value` quantised to 0.01 mm,
+/// - 3D anchor quantised to 0.1 mm per component,
+/// - direction quantised to integer components (×100 — unit vectors).
+///
+/// When coincident rows are found the first is kept; its `entities` list
+/// is extended with the merged, sorted, deduped entity ids of all duplicates.
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct DedupeKey {
+    kind: String,
+    qvalue: i64,
+    qanchor: [i64; 3],
+    qdir: [i64; 3],
+}
+
+impl DedupeKey {
+    fn from_record(d: &DimensionRecord) -> Self {
+        DedupeKey {
+            kind: d.kind.clone(),
+            qvalue: quantise(d.value, 0.01),
+            qanchor: [
+                quantise(d.anchor[0], 0.1),
+                quantise(d.anchor[1], 0.1),
+                quantise(d.anchor[2], 0.1),
+            ],
+            qdir: [
+                quantise(d.direction[0] * 100.0, 1.0),
+                quantise(d.direction[1] * 100.0, 1.0),
+                quantise(d.direction[2] * 100.0, 1.0),
+            ],
+        }
+    }
+}
+
+/// Deduplicate coincident dimension rows (in-place).
+///
+/// A bore whose lateral wall is seam-split into two faces by the boolean
+/// emits identical diameter/length/position rows — one per face — with only
+/// the `entities` list differing. Merge them: keep the first occurrence's row
+/// and extend its `entities` with those from every coincident duplicate
+/// (sorted, deduped). The `id` and `pid` of the FIRST occurrence win so that
+/// downstream handles remain stable.
+fn dedupe_coincident(rows: Vec<DimensionRecord>) -> Vec<DimensionRecord> {
+    // `order` preserves insertion order of keys for deterministic output.
+    let mut order: Vec<DedupeKey> = Vec::new();
+    let mut map: std::collections::HashMap<DedupeKey, usize> = std::collections::HashMap::new();
+    let mut out: Vec<DimensionRecord> = Vec::new();
+
+    for row in rows {
+        let key = DedupeKey::from_record(&row);
+        if let Some(&idx) = map.get(&key) {
+            // Merge entities into the existing row.
+            for eid in row.entities {
+                if !out[idx].entities.contains(&eid) {
+                    out[idx].entities.push(eid);
+                }
+            }
+            out[idx].entities.sort_unstable();
+        } else {
+            let idx = out.len();
+            map.insert(key.clone(), idx);
+            order.push(key);
+            out.push(row);
+        }
+    }
+
+    let _ = order; // kept for clarity; map provides the index
+    out
+}
+
 /// Assemble the full analytic dimension table for `solid_id`.
+///
+/// Labels are formatted via `model.document_unit`: the numeric part is
+/// converted from kernel-native mm to the document unit, formatted to the
+/// unit's drafting precision, and the unit suffix is appended. Prefixes
+/// (Ø, SØ, ∠, L, X, Y, Z) are preserved unchanged.
+///
+/// Angles always use degrees regardless of `document_unit`.
+///
+/// Coincident rows (same kind + quantized value + quantized anchor + quantized
+/// direction) are merged: the first row is kept and its `entities` list is
+/// extended with the entity ids of every duplicate — so a seam-split bore face
+/// emits exactly ONE diameter record naming BOTH faces.
 pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<DimensionRecord> {
+    let unit = model.document_unit();
+    let unit_suffix = unit.suffix();
     let mut out: Vec<DimensionRecord> = Vec::new();
     let mut next = 0usize;
     let mut id = || {
@@ -431,8 +527,8 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                 id: id(),
                 kind: "extent".into(),
                 value,
-                unit: "mm".into(),
-                label: format!("{} {:.2}", names[axis], value),
+                unit: unit_suffix.into(),
+                label: format!("{} {}", names[axis], unit.format_len(value)),
                 entities: Vec::new(),
                 anchor,
                 direction: dirs[axis],
@@ -446,7 +542,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
     // ── Per analytic surface: bores/bosses, spheres, cones ────────────────────
     let solid = match model.solids.get(solid_id) {
         Some(s) => s,
-        None => return out,
+        None => return dedupe_coincident(out),
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
@@ -485,8 +581,8 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     id: id(),
                     kind: "diameter".into(),
                     value: cyl.radius * 2.0,
-                    unit: "mm".into(),
-                    label: format!("Ø{:.2}", cyl.radius * 2.0),
+                    unit: unit_suffix.into(),
+                    label: format!("Ø{}", unit.format_len(cyl.radius * 2.0)),
                     entities: vec![fid],
                     anchor,
                     direction: [rd.x, rd.y, rd.z],
@@ -500,8 +596,8 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         id: id(),
                         kind: "length".into(),
                         value: length,
-                        unit: "mm".into(),
-                        label: format!("L {length:.2}"),
+                        unit: unit_suffix.into(),
+                        label: format!("L {}", unit.format_len(length)),
                         entities: vec![fid],
                         anchor,
                         direction: [axis.x, axis.y, axis.z],
@@ -587,13 +683,14 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                             let mut dir = world_axes[perp_idx];
                             dir[perp_idx] *= sign;
 
-                            let label = format!("{} {:.2}", axis_names[perp_idx], offset);
+                            let label =
+                                format!("{} {}", axis_names[perp_idx], unit.format_len(offset));
 
                             out.push(DimensionRecord {
                                 id: id(),
                                 kind: "position".into(),
                                 value: offset,
-                                unit: "mm".into(),
+                                unit: unit_suffix.into(),
                                 label,
                                 entities: vec![fid],
                                 anchor: pos_anchor,
@@ -610,8 +707,8 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     id: id(),
                     kind: "diameter".into(),
                     value: sph.radius * 2.0,
-                    unit: "mm".into(),
-                    label: format!("SØ{:.2}", sph.radius * 2.0),
+                    unit: unit_suffix.into(),
+                    label: format!("SØ{}", unit.format_len(sph.radius * 2.0)),
                     entities: vec![fid],
                     anchor: [sph.center.x + sph.radius, sph.center.y, sph.center.z],
                     direction: [1.0, 0.0, 0.0],
@@ -633,6 +730,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     cone.apex.y + axis.y * h,
                     cone.apex.z + axis.z * h,
                 ];
+                // Angles always in degrees regardless of document_unit.
                 out.push(DimensionRecord {
                     id: id(),
                     kind: "angle".into(),
@@ -651,8 +749,8 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         id: id(),
                         kind: "diameter".into(),
                         value: base_r * 2.0,
-                        unit: "mm".into(),
-                        label: format!("Ø{:.2}", base_r * 2.0),
+                        unit: unit_suffix.into(),
+                        label: format!("Ø{}", unit.format_len(base_r * 2.0)),
                         entities: vec![fid],
                         anchor,
                         direction: [1.0, 0.0, 0.0],
@@ -665,7 +763,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
         }
     }
 
-    out
+    dedupe_coincident(out)
 }
 
 #[cfg(test)]
@@ -752,5 +850,78 @@ mod tests {
         assert!(find(&dims, "extent", 50.0), "Z extent should be height 50");
         assert!(find(&dims, "diameter", 30.0), "Ø30 missing");
         assert!(find(&dims, "length", 50.0), "length 50 missing");
+    }
+
+    // ── Coincident-row dedupe (Task 1, ui-units campaign) ─────────────────────
+
+    /// `dedupe_coincident` merges two records that are geometrically identical
+    /// (same kind + quantized value + quantized anchor + quantized direction)
+    /// into ONE record with both face ids in `entities` — and leaves the first
+    /// record's `id` and `pid` unchanged.
+    #[test]
+    fn dedupe_coincident_merges_identical_rows_and_keeps_first_id() {
+        fn make_rec(id: &str, eid: u32) -> DimensionRecord {
+            DimensionRecord {
+                id: id.to_string(),
+                kind: "diameter".to_string(),
+                value: 20.0,
+                unit: "mm".to_string(),
+                label: "Ø20.00mm".to_string(),
+                entities: vec![eid],
+                anchor: [5.0, 10.0, 15.0],
+                direction: [1.0, 0.0, 0.0],
+                axis: None,
+                pid: Some(id.to_string()),
+                datum: None,
+            }
+        }
+
+        // Two records with different face ids but identical geometry.
+        let rows = vec![make_rec("d0", 7), make_rec("d1", 11)];
+        let merged = dedupe_coincident(rows);
+
+        assert_eq!(merged.len(), 1, "two coincident rows must merge into one");
+        assert_eq!(merged[0].id, "d0", "first id wins");
+        assert_eq!(merged[0].pid.as_deref(), Some("d0"), "first pid wins");
+        assert!(
+            merged[0].entities.contains(&7),
+            "original face id must be present"
+        );
+        assert!(
+            merged[0].entities.contains(&11),
+            "merged face id must be present"
+        );
+        assert_eq!(
+            merged[0].entities.len(),
+            2,
+            "exactly two entity ids after merge"
+        );
+    }
+
+    /// Two records with different values (20mm vs 30mm) must NOT be merged.
+    #[test]
+    fn dedupe_coincident_keeps_distinct_values_separate() {
+        fn make_rec(id: &str, val: f64, eid: u32) -> DimensionRecord {
+            DimensionRecord {
+                id: id.to_string(),
+                kind: "diameter".to_string(),
+                value: val,
+                unit: "mm".to_string(),
+                label: "label".to_string(),
+                entities: vec![eid],
+                anchor: [0.0, 0.0, 0.0],
+                direction: [1.0, 0.0, 0.0],
+                axis: None,
+                pid: None,
+                datum: None,
+            }
+        }
+        let rows = vec![make_rec("d0", 20.0, 1), make_rec("d1", 30.0, 2)];
+        let merged = dedupe_coincident(rows);
+        assert_eq!(
+            merged.len(),
+            2,
+            "records with different values must not merge: {merged:?}"
+        );
     }
 }

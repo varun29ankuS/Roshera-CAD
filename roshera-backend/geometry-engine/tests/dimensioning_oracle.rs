@@ -474,9 +474,10 @@ fn bore_position_from_part_corner_exact() {
         y_rec.value
     );
 
-    // Labels must use drawing-style format "X 15.00" / "Y 25.00".
-    assert_eq!(x_rec.label, "X 15.00", "label mismatch: {x_rec:?}");
-    assert_eq!(y_rec.label, "Y 25.00", "label mismatch: {y_rec:?}");
+    // Labels use drawing-style format: axis prefix + formatted value + unit suffix.
+    // Model default is Millimetre (2 dp) so: "X 15.00mm" / "Y 25.00mm".
+    assert_eq!(x_rec.label, "X 15.00mm", "label mismatch: {x_rec:?}");
+    assert_eq!(y_rec.label, "Y 25.00mm", "label mismatch: {y_rec:?}");
 
     // Datum must be Some with kind "part_corner".
     let x_datum = x_rec.datum.as_ref().expect("X position must carry a datum");
@@ -584,5 +585,134 @@ fn diagonal_axis_cylinder_emits_no_position_records() {
     assert!(
         pos_records.is_empty(),
         "diagonal-axis cylinder must NOT emit position records (honest absence): {pos_records:?}"
+    );
+}
+
+// ── Task 1 (ui-units campaign): unit-aware labels + coincident-row dedupe ──────
+
+/// Labels are formatted via `document_unit`. With the default Millimetre unit
+/// a Ø20 bore must label "Ø20.00mm" and its length must label "L 20.00mm".
+#[test]
+fn labels_include_unit_suffix_in_default_mm() {
+    let mut m = BRepModel::new();
+    // Model default is Millimetre.
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(40.0, 40.0, 20.0)
+        .expect("plate"));
+    let bore_cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -30.0), Vector3::Z, 10.0, 80.0)
+        .expect("bore"));
+    let part = diff(&mut m, plate, bore_cyl);
+    let dims = extract_dimensions(&m, part);
+
+    // Diameter label must carry the "mm" suffix.
+    let dia = dims
+        .iter()
+        .find(|d| d.kind == "diameter" && (d.value - 20.0).abs() < 1e-3)
+        .expect("Ø20 diameter record must exist");
+    assert_eq!(
+        dia.label, "Ø20.00mm",
+        "diameter label must include mm suffix: got {:?}",
+        dia.label
+    );
+    assert_eq!(dia.unit, "mm", "unit field must be 'mm'");
+
+    // Length label must carry the "mm" suffix.
+    let len = dims
+        .iter()
+        .find(|d| d.kind == "length" && (d.value - 20.0).abs() < 1e-3)
+        .expect("bore length 20mm record must exist");
+    assert!(
+        len.label.starts_with("L ") && len.label.ends_with("mm"),
+        "length label must be 'L <value>mm': got {:?}",
+        len.label
+    );
+
+    // Extent labels carry the unit suffix too.
+    let ext_x = dims
+        .iter()
+        .find(|d| d.kind == "extent" && (d.value - 40.0).abs() < 1e-3)
+        .expect("X/Y 40mm extent record must exist");
+    assert!(
+        ext_x.label.ends_with("mm"),
+        "extent label must end with 'mm': got {:?}",
+        ext_x.label
+    );
+}
+
+/// With document_unit set to Inch, labels show the converted value + "in".
+#[test]
+fn labels_reflect_inch_document_unit() {
+    use geometry_engine::units::LengthUnit;
+    let mut m = BRepModel::new();
+    m.set_document_unit(LengthUnit::Inch);
+    // 25.4mm bore → Ø1.000in.
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.8, 50.8, 25.4)
+        .expect("plate"));
+    let bore_cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -30.0), Vector3::Z, 12.7, 80.0)
+        .expect("bore"));
+    let part = diff(&mut m, plate, bore_cyl);
+    let dims = extract_dimensions(&m, part);
+
+    // Ø25.4mm → "Ø1.000in".
+    let dia = dims
+        .iter()
+        .find(|d| d.kind == "diameter" && (d.value - 25.4).abs() < 1e-3)
+        .expect("Ø25.4mm bore must exist");
+    assert_eq!(
+        dia.label, "Ø1.000in",
+        "diameter label must be in inches: got {:?}",
+        dia.label
+    );
+    assert_eq!(dia.unit, "in", "unit field must be 'in'");
+}
+
+/// Coincident-row dedupe: the flange bolt-circle fixture has 4× Ø6mm through-
+/// bores. Each bore may produce one or more lateral face entries (the boolean
+/// may seam-split a cylindrical wall). After dedupe, there must be exactly 4
+/// distinct diameter records for Ø6, not more — the dedupe merges any
+/// geometrically-coincident rows that arise from seam-split faces while
+/// preserving the per-bore distinction.
+///
+/// This is also the regression guard for the A2 wire finding: "the
+/// viewport showed duplicate Ø6 callouts in the bolt-circle view".
+#[test]
+fn flange_bolt_bores_exactly_four_diameter_records_after_dedupe() {
+    let mut m = BRepModel::new();
+    let disc = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 40.0, 12.0)
+        .expect("disc"));
+    let central = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -10.0), Vector3::Z, 12.0, 40.0)
+        .expect("central"));
+    let mut part = diff(&mut m, disc, central);
+    for i in 0..4 {
+        let a = std::f64::consts::TAU * i as f64 / 4.0;
+        let bolt = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(28.0 * a.cos(), 28.0 * a.sin(), -10.0),
+                Vector3::Z,
+                3.0,
+                40.0,
+            )
+            .expect("bolt"));
+        part = diff(&mut m, part, bolt);
+    }
+    let dims = extract_dimensions(&m, part);
+
+    // After dedupe: exactly 4 Ø6 diameter records (one per bolt bore, no
+    // seam-split duplicates).
+    let dia6: Vec<_> = dims
+        .iter()
+        .filter(|d| d.kind == "diameter" && (d.value - 6.0).abs() < 1e-3)
+        .collect();
+    assert_eq!(
+        dia6.len(),
+        4,
+        "4× Ø6mm bolt bores: expected exactly 4 diameter records after dedupe, \
+         got {}: {dia6:?}",
+        dia6.len()
     );
 }
