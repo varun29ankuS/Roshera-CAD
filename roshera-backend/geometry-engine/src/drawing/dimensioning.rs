@@ -871,6 +871,45 @@ pub fn standard_drawing_auto(
     Ok(drawing)
 }
 
+/// Whole-part AABB extents `[x, y, z]` from the extraction's extent records.
+///
+/// CONTRACT (with `extract_dimensions` in readable/dimensions.rs): the
+/// whole-part AABB extents are emitted with `kind == "extent"` AND an
+/// EMPTY `entities` list — that emptiness is the discriminator between
+/// "whole-part extent" and any future face-scoped extent record. `kind`
+/// is the primary key here; `entities.is_empty()` is the whole-part
+/// qualifier. If extraction ever starts emitting extent records WITH
+/// entity ids, those are face-scoped and must NOT feed part_extents —
+/// this filter is load-bearing for THRU detection AND the section-plane
+/// interior-bore rule: dropping it would shrink an extent to a face
+/// extent and misclassify THRU bores as blind / interior bores as
+/// breakout. Axes with no extent record fall back to `f64::MAX`
+/// (conservative: everything reads as blind / interior on that axis).
+fn whole_part_extents(dims: &[crate::readable::DimensionRecord]) -> [f64; 3] {
+    let mut ext = [f64::INFINITY; 3];
+    for d in dims {
+        if d.kind == "extent" && d.entities.is_empty() {
+            let ax = d.direction;
+            let idx = if ax[0].abs() >= ax[1].abs() && ax[0].abs() >= ax[2].abs() {
+                0
+            } else if ax[1].abs() >= ax[2].abs() {
+                1
+            } else {
+                2
+            };
+            // Take the minimum of what we see (extent records are one per axis).
+            if d.value < ext[idx] {
+                ext[idx] = d.value;
+            }
+        }
+    }
+    [
+        if ext[0].is_finite() { ext[0] } else { f64::MAX },
+        if ext[1].is_finite() { ext[1] } else { f64::MAX },
+        if ext[2].is_finite() { ext[2] } else { f64::MAX },
+    ]
+}
+
 /// Populate `drawing.hole_sites` and `drawing.axial_view_idx` from
 /// pre-computed dimension records.  Called from `standard_drawing_auto`
 /// which extracts `dims` once and shares them with the section builder.
@@ -900,56 +939,9 @@ fn attach_hole_table_from_dims(
         .cloned()
         .collect();
 
-    // Determine part extents for THRU detection from the whole-part extent
-    // records (X/Y/Z).
-    //
-    // CONTRACT (with `extract_dimensions` in readable/dimensions.rs): the
-    // whole-part AABB extents are emitted with `kind == "extent"` AND an
-    // EMPTY `entities` list — that emptiness is the discriminator between
-    // "whole-part extent" and any future face-scoped extent record. `kind`
-    // is the primary key here; `entities.is_empty()` is the whole-part
-    // qualifier. If extraction ever starts emitting extent records WITH
-    // entity ids, those are face-scoped and must NOT feed part_extents —
-    // this filter is therefore load-bearing for THRU detection: dropping
-    // it would shrink part_extents to a face extent and misclassify THRU
-    // bores as blind (and vice versa if the filter silently matched
-    // nothing, every bore would fall back to BLIND via f64::MAX below).
-    let mut part_extents = [f64::INFINITY; 3];
-    for d in &dims {
-        if d.kind == "extent" && d.entities.is_empty() {
-            let ax = d.direction;
-            let idx = if ax[0].abs() >= ax[1].abs() && ax[0].abs() >= ax[2].abs() {
-                0
-            } else if ax[1].abs() >= ax[2].abs() {
-                1
-            } else {
-                2
-            };
-            // Take the minimum of what we see (extent records are one per axis).
-            if d.value < part_extents[idx] {
-                part_extents[idx] = d.value;
-            }
-        }
-    }
-    // Fallback: if no extent records (degenerate part), use large value so
-    // everything is treated as blind (conservative).
-    let part_extents = [
-        if part_extents[0].is_finite() {
-            part_extents[0]
-        } else {
-            f64::MAX
-        },
-        if part_extents[1].is_finite() {
-            part_extents[1]
-        } else {
-            f64::MAX
-        },
-        if part_extents[2].is_finite() {
-            part_extents[2]
-        } else {
-            f64::MAX
-        },
-    ];
+    // Part extents for THRU detection (see `whole_part_extents` for the
+    // extraction contract this depends on).
+    let part_extents = whole_part_extents(&dims);
 
     let mut sites = build_hole_table(&dims, part_extents);
     if sites.is_empty() {
@@ -1325,34 +1317,38 @@ fn choose_section_plane(
         Vector3::new(0.0, 0.0, 1.0)
     };
 
-    // The cutting-plane normal is perpendicular to the bore axis and parallel to
-    // the axial view's "right" direction. For a Z-axis bore, the axial view is
-    // TOP (camera −Z). We want to cut along the X-axis (so the section reveals
-    // the bore profile when you look in the −Y / FRONT direction). The rule:
-    // normal = bore_axis × world_up_for_axial, normalised.
-    // For Z-bore / TOP view: normal = Z × X = Y, giving a YZ plane. But that
-    // cuts along Y-axis, which in FRONT (X,Z) still reveals the bore as a circle.
-    // We choose normal = X (1,0,0) so the section view looks in the +Y direction,
-    // matching the FRONT view orientation and giving the most informative cut.
-    //
-    // General rule: cut normal = perpendicular to bore axis that gives the best
-    // read in the equivalent of the FRONT view. For Z-bore: normal = (1,0,0).
-    // For Y-bore: normal = (0,0,1). For X-bore: normal = (0,1,0).
-    let cut_normal: Vector3 = {
-        let n = bore_axis.normalize().unwrap_or(Vector3::new(0.0, 0.0, 1.0));
-        let nx = n.x.abs();
-        let ny = n.y.abs();
-        let nz = n.z.abs();
-        if nz >= nx && nz >= ny {
-            // Z-dominant bore → cut in X direction
-            Vector3::new(1.0, 0.0, 0.0)
-        } else if ny >= nx {
-            // Y-dominant bore → cut in Z direction
-            Vector3::new(0.0, 0.0, 1.0)
+    // The cutting-plane normal is perpendicular to the bore axis, chosen among
+    // the two perpendicular WORLD axes. Legacy default order (first candidate):
+    // Z-bore → X normal (the cut reads FRONT-style), Y-bore → Z, X-bore → Y.
+    // When hole sites exist, the choice below prefers the candidate whose cut
+    // line passes through more INTERIOR bores (see the rule at the use site).
+    let bore_n = bore_axis.normalize().unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+    let dom_ax = {
+        let a = [bore_n.x.abs(), bore_n.y.abs(), bore_n.z.abs()];
+        if a[0] >= a[1] && a[0] >= a[2] {
+            0
+        } else if a[1] >= a[2] {
+            1
         } else {
-            // X-dominant bore → cut in Y direction
-            Vector3::new(0.0, 1.0, 0.0)
+            2
         }
+    };
+    let perps = match dom_ax {
+        0 => [1usize, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    let world_axis = |i: usize| -> Vector3 {
+        match i {
+            0 => Vector3::new(1.0, 0.0, 0.0),
+            1 => Vector3::new(0.0, 1.0, 0.0),
+            _ => Vector3::new(0.0, 0.0, 1.0),
+        }
+    };
+    let candidates: [usize; 2] = match dom_ax {
+        2 => [0, 1], // Z-bore: X first, then Y
+        1 => [2, 0], // Y-bore: Z first, then X
+        _ => [1, 2], // X-bore: Y first, then Z
     };
 
     // Attempt to find a meaningful plane origin from hole sites.
@@ -1376,29 +1372,71 @@ fn choose_section_plane(
             .and_then(|d| d.datum.as_ref().map(|dt| dt.origin))
             .unwrap_or([0.0; 3]);
 
-        // Determine which two world axes are the "perpendicular" ones (not the bore axis).
-        let bore_n = bore_axis.normalize().unwrap_or(Vector3::new(0.0, 0.0, 1.0));
-        let dom_ax = {
-            let a = [bore_n.x.abs(), bore_n.y.abs(), bore_n.z.abs()];
-            if a[0] >= a[1] && a[0] >= a[2] {
-                0
-            } else if a[1] >= a[2] {
-                1
-            } else {
-                2
-            }
-        };
-        let perps = match dom_ax {
-            0 => [1usize, 2],
-            1 => [0, 2],
-            _ => [0, 1],
-        };
         let mut origin = datum_origin;
         origin[perps[0]] += cx_offset;
         origin[perps[1]] += cy_offset;
 
-        return (Point3::new(origin[0], origin[1], origin[2]), cut_normal);
+        // ── Cut-normal choice: pass through INTERIOR bores ────────────────
+        // A section is informative when the plane passes through bore
+        // centerlines whose voids actually appear as gaps in the cut. A bore
+        // that BREAKS OUT of the part's side (centre ± radius outside the
+        // part extent on a perpendicular axis) leaves no closed void — the
+        // cut legitimately draws a shorter solid band, which reads as a lie
+        // next to the axial view (live ring-plate defect: ring 18 + Ø6 on a
+        // 40-deep plate → the X-cut bores break out the Y sides and
+        // SECTION A-A showed one unbroken hatched band).
+        //
+        // Deterministic rule: for each candidate normal (legacy order
+        // first), count hole sites whose centre lies ON the plane through
+        // the chosen origin AND whose bore is fully interior on both
+        // perpendicular axes. Pick the candidate with MORE qualifying
+        // bores; ties keep the legacy default.
+        let part_extents = whole_part_extents(dims);
+        let interior = |s: &super::hole_table::HoleSite| -> bool {
+            let r = s.diameter_mm * 0.5;
+            s.x_mm - r >= -1e-6
+                && s.x_mm + r <= part_extents[perps[0]] + 1e-6
+                && s.y_mm - r >= -1e-6
+                && s.y_mm + r <= part_extents[perps[1]] + 1e-6
+        };
+        // Site offset along a world axis: x_mm is measured along perps[0],
+        // y_mm along perps[1].
+        let site_offset = |s: &super::hole_table::HoleSite, axis: usize| -> Option<f64> {
+            if axis == perps[0] {
+                Some(s.x_mm)
+            } else if axis == perps[1] {
+                Some(s.y_mm)
+            } else {
+                None
+            }
+        };
+        let plane_hits = |axis: usize| -> usize {
+            let plane_coord = origin[axis] - datum_origin[axis];
+            drawing
+                .hole_sites
+                .iter()
+                .filter(|s| {
+                    site_offset(s, axis)
+                        .map(|off| (off - plane_coord).abs() < 0.5)
+                        .unwrap_or(false)
+                        && interior(s)
+                })
+                .count()
+        };
+        let hits = [plane_hits(candidates[0]), plane_hits(candidates[1])];
+        let chosen_axis = if hits[1] > hits[0] {
+            candidates[1]
+        } else {
+            candidates[0]
+        };
+        return (
+            Point3::new(origin[0], origin[1], origin[2]),
+            world_axis(chosen_axis),
+        );
     }
+
+    // No hole sites: the legacy default normal (first candidate).
+    let cut_normal = world_axis(candidates[0]);
 
     // Fallback: use the part's AABB centroid (from extent records).
     let mut centroid = [0.0_f64; 3];
@@ -1502,15 +1540,21 @@ pub(crate) fn attach_section_view(
     // section extent in place of (or appended to) the ISO slot.  This guarantees
     // the section view fits within the frame at the scale chosen by the solver.
     //
-    // NOTE: this may produce a DIFFERENT `section_scale` from `scale` (the
-    // four-view scale). The section view is built at `section_scale`; the four
-    // existing views keep their original scale. The section view fits by design.
+    // The solve is applied to EVERY view, not just the section slot. The
+    // original four-view solve sized the sheet around the ISOMETRIC extent;
+    // on the ReplaceIso path that extent leaves with the ISO, and keeping
+    // the old (usually much smaller) scale for the remaining views
+    // under-fills the sheet — the live ring-plate sheet rendered at 10%
+    // utilization because the big discarded ISO silhouette had pinned the
+    // orthographic views at 1:1. Re-placing all views is safe: view content
+    // (polylines / circles / dims / cutting-plane line) is stored in VIEW
+    // SPACE; `scale` and `position_mm` are pure placement consumed
+    // downstream by `compute_layout` and the renderers.
     let (section_scale, section_pos): (f64, [f64; 2]) = match rule {
         SectionSlotRule::ReplaceIso => {
             // Substitute the SECTION extent into the ISO slot and recompute the
-            // layout. This guarantees the section view fits in the ISO cell at
-            // a valid scale, even if the section extent is larger than the ISO extent.
-            let front_ext = drawing.views.get(0).map(|v| v.extent).unwrap_or_default();
+            // layout: one solve, one scale, full fill for all four slots.
+            let front_ext = drawing.views.first().map(|v| v.extent).unwrap_or_default();
             let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
             let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
             let (s, pos) = layout_four_view(
@@ -1520,13 +1564,17 @@ pub(crate) fn attach_section_view(
                 right_ext,
                 section_unit.extent, // ISO slot carries section extent
             );
+            for (i, v) in drawing.views.iter_mut().take(3).enumerate() {
+                v.scale = s;
+                v.position_mm = pos[i];
+            }
             (s, pos[3])
         }
         SectionSlotRule::FifthSlot => {
             // Place the SECTION view to the right of the ISO column.
             // Compute it via layout_five_view so the solver finds a scale that
-            // fits all five views within the frame.
-            let front_ext = drawing.views.get(0).map(|v| v.extent).unwrap_or_default();
+            // fits all five views within the frame, applied to all of them.
+            let front_ext = drawing.views.first().map(|v| v.extent).unwrap_or_default();
             let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
             let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
             let iso_ext = drawing.views.get(3).map(|v| v.extent).unwrap_or_default();
@@ -1538,6 +1586,10 @@ pub(crate) fn attach_section_view(
                 iso_ext,
                 section_unit.extent,
             );
+            for (i, v) in drawing.views.iter_mut().take(4).enumerate() {
+                v.scale = s;
+                v.position_mm = pos[i];
+            }
             (s, pos[4])
         }
     };

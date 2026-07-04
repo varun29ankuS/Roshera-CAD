@@ -455,6 +455,33 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
         ent.common = common;
         dxf.add_entity(ent);
     }
+
+    // ── Datum-origin marker (SVG parity) ─────────────────────────────────
+    // Crosshair LINEs + "0,0" TEXT at the hole table's X/Y reference corner,
+    // from the same DatumMarker layout item the SVG renderer inks.
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::DatumMarker)
+    {
+        let cx = 0.5 * (item.bbox.x0 + item.bbox.x1);
+        let cy_svg = 0.5 * (item.bbox.y0 + item.bbox.y1);
+        let cy = sheet_h - cy_svg; // DXF y-up
+        let arm = 3.0;
+        add_line(dxf, LAYER_HOLE_TABLE, cx - arm, cy, cx + arm, cy);
+        add_line(dxf, LAYER_HOLE_TABLE, cx, cy - arm, cx, cy + arm);
+        let text = item.text.as_deref().unwrap_or("0,0");
+        add_text(
+            dxf,
+            LAYER_HOLE_TABLE,
+            cx - 7.0,
+            cy - 4.2,
+            2.6,
+            0.0,
+            text,
+            HorizontalTextJustification::Left,
+        );
+    }
 }
 
 /// Emit the three-column title block as LINE + TEXT entities on

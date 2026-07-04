@@ -1597,6 +1597,362 @@ fn off_origin_bore_tags_land_on_their_own_circles() {
     }
 }
 
+// ── Finishing wave: the LIVE regenerated ring-plate sheet ─────────────────────
+
+/// The exact fixture from the live regenerated sheet that failed its own
+/// quality report on 2026-07-05: 60×40×12 plate, four Ø6 THRU bores on a
+/// ring of radius 18 (Z axis). Rectangular (not square) plate + a wide ring
+/// exposes placement/scale defects the square six-hole fixture missed.
+fn ring_plate() -> (BRepModel, u32) {
+    let mut m = BRepModel::new();
+    let plate = match TopologyBuilder::new(&mut m)
+        .create_box_3d(60.0, 40.0, 12.0)
+        .expect("plate")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let mut part = plate;
+    for k in 0..4 {
+        let th = (90.0 * k as f64).to_radians();
+        let bore = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(18.0 * th.cos(), 18.0 * th.sin(), -7.0),
+                Vector3::Z,
+                3.0,
+                14.0,
+            )
+            .expect("bore")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        part = boolean_operation(
+            &mut m,
+            part,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("drill");
+    }
+    (m, part)
+}
+
+/// (A)+(B)+(D) — the live ring-plate sheet passes its own quality report.
+///
+/// RED evidence (pre-fix, captured 2026-07-05 on the same fixture):
+///   - utilization 0.099 (views pinned at 1:1 by the DISCARDED iso extent),
+///   - `DimensionLabelCollision: 'Ø6.00mm' overlaps callout 'A'`,
+///   - hole table planted on the FRONT view's dim band (unreported —
+///     coverage gap G, see the forced specimen below).
+///
+/// GREEN pins:
+///   - report passes (collisions resolved via layout-consulting placement),
+///   - utilization > 0.15 (the pre-fix sheet hit 0.099; the re-solved
+///     ReplaceIso layout reaches ~0.22),
+///   - the hole-table region intersects NO DimensionText / ViewGeometry ink.
+#[test]
+fn ring_plate_sheet_passes_quality_with_utilization() {
+    let (m, part) = ring_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let report = verify_drawing(&dwg);
+    assert!(
+        !report.has(DrawingIssueKind::DimensionLabelCollision),
+        "no callout collisions on the regenerated sheet; issues: {:?}",
+        report.issues
+    );
+    assert!(report.passed, "issues: {:?}", report.issues);
+    assert!(
+        report.sheet_utilization > 0.15,
+        "sheet utilization {:.3} must exceed 0.15 (pre-fix: 0.099)",
+        report.sheet_utilization
+    );
+
+    // Belt + braces for (A): the table region must be clear of dim text and
+    // view geometry even below the verifier's threshold.
+    let layout = compute_layout(&dwg);
+    let table_region = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::HoleTableBorder)
+        .map(|it| it.bbox)
+        .reduce(|a, b| geometry_engine::drawing::layout::Rect2 {
+            x0: a.x0.min(b.x0),
+            y0: a.y0.min(b.y0),
+            x1: a.x1.max(b.x1),
+            y1: a.y1.max(b.y1),
+        })
+        .expect("hole table present");
+    for it in layout.items.iter().filter(|it| {
+        matches!(
+            it.kind,
+            SheetItemKind::DimensionText | SheetItemKind::ViewGeometry
+        )
+    }) {
+        assert!(
+            !table_region.intersects(&it.bbox, 0.0),
+            "hole table region must not touch {:?} '{}'",
+            it.kind,
+            it.text.as_deref().unwrap_or("")
+        );
+    }
+}
+
+/// (C) — SECTION A-A must show the bore voids.
+///
+/// RED evidence (pre-fix): `choose_section_plane` hardcoded cut_normal = +X;
+/// on this fixture the X-plane passes through the bores at (0,±18), which
+/// BREAK OUT of the 40 mm-deep plate's sides (18 + 3 = 21 > 20) — the cut
+/// legitimately produced one unbroken 30 mm hatched band (extent ±15), which
+/// reads as "hatched solid through two bores" next to the axial view. The
+/// interior-bore rule now picks the Y-normal cut through (±18, 0).
+///
+/// GREEN pins (all in section view space; u spans the plate's 60 mm width,
+/// mid = 0, THRU-bore voids at u ∈ (−21,−15) and (15,21)):
+///   1. cutting line HORIZONTAL in the TOP view (Y-normal cut), arrows
+///      perpendicular (direction of sight −Y → view [0,−1]);
+///   2. no 45° hatch segment's u-interval enters either void band;
+///   3. vertical void-boundary edges exist at u ≈ ±15 and ±21.
+#[test]
+fn ring_plate_section_shows_bore_voids() {
+    let (m, part) = ring_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+
+    // 1 — cutting line + arrows.
+    let cpl = dwg.cutting_plane_line.as_ref().expect("cutting plane");
+    assert!(
+        (cpl.p0[1] - cpl.p1[1]).abs() < 1e-9,
+        "cut line must be horizontal (Y-normal cut through the interior bores); \
+         p0={:?} p1={:?}",
+        cpl.p0,
+        cpl.p1
+    );
+    assert!(
+        cpl.arrow_dir[0].abs() < 1e-6 && (cpl.arrow_dir[1] - (-1.0)).abs() < 1e-6,
+        "arrows point in the direction of sight (−Y) → view [0,−1]; got {:?}",
+        cpl.arrow_dir
+    );
+
+    // Section view: 60 wide (u) × 12 tall (v).
+    let sv = dwg
+        .views
+        .iter()
+        .find(|v| v.name.contains("SECTION"))
+        .expect("section view");
+    let w = sv.extent.max_x - sv.extent.min_x;
+    let h = sv.extent.max_y - sv.extent.min_y;
+    assert!(
+        (w - 60.0).abs() < 0.5 && (h - 12.0).abs() < 0.5,
+        "section must span the full 60×12 cross-section (world-up kept \
+         vertical); got {w:.1}×{h:.1}"
+    );
+    let mid = 0.5 * (sv.extent.min_x + sv.extent.max_x);
+
+    // Segment classification: outline = axis-parallel, hatch = 45°.
+    let mut hatch_intervals: Vec<(f64, f64)> = Vec::new();
+    let mut vertical_edges_x: Vec<f64> = Vec::new();
+    for pl in &sv.polylines {
+        for pts in pl.points.windows(2) {
+            let dx = pts[1][0] - pts[0][0];
+            let dy = pts[1][1] - pts[0][1];
+            if dx.abs() < 1e-6 && dy.abs() > 1e-6 {
+                vertical_edges_x.push(pts[0][0]);
+            } else if dx.abs() > 1e-6 && dy.abs() > 1e-6 {
+                // 45° hatch (the only oblique ink in a section view).
+                hatch_intervals.push((pts[0][0].min(pts[1][0]), pts[0][0].max(pts[1][0])));
+            }
+        }
+    }
+    assert!(!hatch_intervals.is_empty(), "section must be hatched");
+
+    // 2 — hatch must not cross the void bands (0.5 mm guard inside the band).
+    for &(lo, hi) in &hatch_intervals {
+        for band in [
+            (mid - 20.5, mid - 15.5), // left bore void interior
+            (mid + 15.5, mid + 20.5), // right bore void interior
+        ] {
+            let overlap = hi.min(band.1) - lo.max(band.0);
+            assert!(
+                overlap <= 0.0,
+                "hatch segment [{lo:.2},{hi:.2}] crosses the bore-void band \
+                 ({:.1},{:.1}) — hatched through a hole",
+                band.0,
+                band.1
+            );
+        }
+    }
+
+    // 3 — void boundary edges: vertical outline lines at u ≈ mid ±15, ±21.
+    for expect in [mid - 21.0, mid - 15.0, mid + 15.0, mid + 21.0] {
+        assert!(
+            vertical_edges_x.iter().any(|&x| (x - expect).abs() < 0.5),
+            "void boundary edge expected at u≈{expect:.1}; vertical edges: {:?}",
+            vertical_edges_x
+                .iter()
+                .map(|x| (x * 10.0).round() / 10.0)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// (F) — the hole table's X/Y datum origin is VISIBLE on the sheet: a
+/// `DatumMarker` layout item sits at the axial view's datum corner (the
+/// projected part-corner the table's X/Y columns measure from), and the SVG
+/// inks the crosshair + "0,0" label.
+///
+/// Mutation proof: remove the `place_datum_marker` call from
+/// `compute_layout` → no DatumMarker item → RED.
+#[test]
+fn ring_plate_datum_marker_at_table_origin() {
+    let (m, part) = ring_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let layout = compute_layout(&dwg);
+
+    let marker = layout
+        .items
+        .iter()
+        .find(|it| it.kind == SheetItemKind::DatumMarker)
+        .expect("DatumMarker item must be placed for a tabled sheet");
+
+    // Expected position: the axial (TOP) view's extent min corner in sheet
+    // coords — the projection of the part AABB min corner, which is the
+    // "part_corner" datum every X/Y table value measures from.
+    let ax = dwg.axial_view_idx.expect("axial view");
+    let view = &dwg.views[ax];
+    let sheet_h = dwg.sheet_size.height();
+    let sx = view.position_mm[0] + view.extent.min_x * view.scale;
+    let sy = (sheet_h - view.position_mm[1]) - view.extent.min_y * view.scale;
+    let cx = 0.5 * (marker.bbox.x0 + marker.bbox.x1);
+    let cy = 0.5 * (marker.bbox.y0 + marker.bbox.y1);
+    assert!(
+        (cx - sx).abs() < 0.1 && (cy - sy).abs() < 0.1,
+        "marker centred on the datum corner: expected ({sx:.2},{sy:.2}), got ({cx:.2},{cy:.2})"
+    );
+
+    // SVG parity: crosshair class + "0,0" label inked.
+    let svg = render_drawing_svg(&dwg);
+    assert!(
+        svg.contains("class=\"datum-marker\""),
+        "datum marker crosshair must be inked"
+    );
+    assert!(svg.contains(">0,0<"), "datum origin label '0,0' inked");
+}
+
+/// (E) — the projection symbol stays inside the SCALE cell, clear of the
+/// SIZE cell and its value text.
+///
+/// A4 title-block geometry (pinned literals, derived from
+/// `title_block_size(A4) = (170, 42)` and `frame_margins(A4) = (15,10,10,10)`
+/// on the 297×210 sheet): title block x ∈ [117, 287], y ∈ [158, 200]; right
+/// column width clamp(170·0.24, 42, 60) = 42 → x ∈ [245, 287]; the SCALE|SIZE
+/// divider sits at 245 + 21 = 266 and the SIZE value text ("A4") is inked
+/// from x = 267.8. Pre-fix the symbol was CENTRED on the divider
+/// (bbox 258..274) — across the SIZE text.
+#[test]
+fn projection_symbol_clear_of_size_cell() {
+    let (m, part) = ring_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    assert!(
+        matches!(dwg.sheet_size, SheetSize::A4),
+        "fixture must land on A4 for the pinned title-block literals"
+    );
+    let layout = compute_layout(&dwg);
+    let sym = layout
+        .items
+        .iter()
+        .find(|it| it.kind == SheetItemKind::ProjectionSymbol)
+        .expect("projection symbol item");
+    const COL_DIVIDER_X: f64 = 266.0;
+    assert!(
+        sym.bbox.x1 <= COL_DIVIDER_X - 0.5,
+        "symbol must stay inside the SCALE cell (left of the divider at \
+         x={COL_DIVIDER_X}); bbox x1 = {:.2}",
+        sym.bbox.x1
+    );
+    assert!(
+        sym.bbox.x0 >= 245.0,
+        "symbol must stay inside the right column; bbox x0 = {:.2}",
+        sym.bbox.x0
+    );
+}
+
+/// (G) — COVERAGE: the hole-table region × DimensionText pair fires
+/// `DimensionLabelCollision`. On the live ring-plate sheet the table sat on
+/// the FRONT view's dim band and NOTHING reported it (only tag×Ø pairs were
+/// checked).
+///
+/// Construction: an A4 drawing with one huge TOP view whose geometry covers
+/// the BOTTOM-LEFT and BELOW-AXIAL table slots, so placement falls back to
+/// the RIGHT slot — where a leader-free angle callout is planted. The check
+/// must name the hole table.
+///
+/// Mutation proof: remove the table-region × DimensionText block from
+/// `check_dimension_label_collisions` → no "hole table" message → RED.
+#[test]
+fn hole_table_on_dimension_text_fires_collision() {
+    use geometry_engine::drawing::hole_table::HoleSite;
+
+    let angle = |label: &str, a: [f64; 2]| Dimension2d {
+        id: label.to_string(),
+        kind: "angle".to_string(),
+        value: 0.0,
+        unit: "deg".to_string(),
+        label: label.to_string(),
+        a,
+        b: a,
+        entities: Vec::new(),
+        axis3: None,
+        dir3: None,
+    };
+
+    let mut d = Drawing::new("TableCollision", SheetSize::A4);
+    // A 200×140 TOP view at pos [30, 25] (sheet h = 210, pos_y measured
+    // from the sheet BOTTOM): geometry spans sheet x ∈ [30, 230],
+    // y ∈ [45, 185] — covering the BOTTOM-LEFT slot; the BELOW-AXIAL slot
+    // (y ≥ 191) runs off the frame. Placement therefore falls back to the
+    // RIGHT slot (~x 66..114, y 144..155 above the title block).
+    d.add_view(rect_view(
+        "TOP",
+        ProjectionType::Top,
+        [30.0, 25.0],
+        200.0,
+        140.0,
+        vec![
+            // Leader-free angle callout: view-space anchor a = (55, 37) →
+            // sheet (30+55, 185−37) = (85, 148) — inside the RIGHT slot's
+            // table rect.
+            angle("60.000\u{00B0}", [55.0, 37.0]),
+        ],
+    ));
+    d.axial_view_idx = Some(0);
+    d.hole_sites = vec![HoleSite {
+        tag: "A1".to_string(),
+        group: "A".to_string(),
+        diameter_mm: 5.0,
+        x_label: "5.00".to_string(),
+        y_label: "5.00".to_string(),
+        x_mm: 5.0,
+        y_mm: 5.0,
+        dia_label: "\u{00D8}5.00".to_string(),
+        depth_label: "THRU".to_string(),
+        is_through: true,
+        axial_centre: Some([10.0, 10.0]),
+        face_entities: vec![7],
+    }];
+
+    let report = verify_drawing(&d);
+    assert!(
+        report.issues.iter().any(|i| {
+            i.kind == DrawingIssueKind::DimensionLabelCollision && i.message.contains("hole table")
+        }),
+        "a hole table planted on dimension text must fire \
+         DimensionLabelCollision naming the hole table; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "DimensionLabelCollision is Severity::Error");
+}
+
 // ── Final-review I-1: hole table qualifies BORES only (material side) ────────
 
 /// A hole table must table CAVITIES, not the part's own outer silhouette.
@@ -1707,16 +2063,19 @@ fn solid_cylinder_has_no_hole_table() {
 /// ISO 128-44: the arrows on a cutting-plane line sit at its ends and point
 /// PERPENDICULAR to the line, in the direction of sight of the section.
 ///
-/// Derivation for the six-hole fixture (Z-bores → axial view TOP,
-/// `choose_section_plane` picks cut_normal = +X): `section_view` draws the cut
-/// in the plane frame (u, v = n×u) with u×v = n, so the section eye looks
-/// along −n = −X (n points at the viewer). Projected into TOP view space
-/// (world x,y → view x,y): the cutting line is vertical (constant x) and the
-/// direction of sight projects to (−1, 0) — perpendicular to the line.
+/// Derivation for the six-hole fixture (Z-bores → axial view TOP): the six
+/// 60°-ring bores sit at local x ∈ {±12, ±6} — NONE on the centroid's
+/// X-plane, while the Y-plane through the centroid passes through the two
+/// interior bores at (±12, 0). The interior-bore rule in
+/// `choose_section_plane` therefore picks cut_normal = +Y (the historical
+/// hardcoded +X cut passed through no bore centerline at all and sectioned
+/// solid material). `section_view` keeps u × v = n, so the section eye
+/// looks along −n = −Y; projected into TOP view space (world x,y →
+/// view x,y): the cutting line is HORIZONTAL (constant y) and the direction
+/// of sight projects to (0, −1) — perpendicular to the line.
 ///
-/// The pre-fix code set arrow_dir = [0,1] for vertical lines — parallel to
-/// the line itself, indicating a +Y (FRONT) viewing that contradicts the
-/// ±X-viewed section actually drawn.
+/// The original defect (Task-9 review I-2): arrow_dir was set parallel to
+/// the line itself, indicating a viewing that contradicts the drawn section.
 #[test]
 fn cutting_plane_arrows_point_in_viewing_direction() {
     let (m, part) = six_hole_plate();
@@ -1741,11 +2100,11 @@ fn cutting_plane_arrows_point_in_viewing_direction() {
         cpl.arrow_dir
     );
 
-    // Correct sign: Z-bores → cut_normal = +X → section eye looks along −X →
-    // TOP view projection (−1, 0).
+    // Correct sign: Y-normal cut through the (±12, 0) bores → section eye
+    // looks along −Y → TOP view projection (0, −1).
     assert!(
-        (cpl.arrow_dir[0] - (-1.0)).abs() < 1e-6 && cpl.arrow_dir[1].abs() < 1e-6,
-        "arrow_dir must be the projected direction of sight [-1, 0]; got {:?}",
+        cpl.arrow_dir[0].abs() < 1e-6 && (cpl.arrow_dir[1] - (-1.0)).abs() < 1e-6,
+        "arrow_dir must be the projected direction of sight [0, -1]; got {:?}",
         cpl.arrow_dir
     );
 }

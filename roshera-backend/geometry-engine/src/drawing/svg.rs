@@ -100,6 +100,8 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     if !drawing.hole_sites.is_empty() {
         render_hole_tags(&mut out, &layout);
         render_hole_table(&mut out, &layout);
+        // Datum-origin marker: where the table's X/Y columns measure from.
+        render_datum_marker(&mut out, &layout);
     }
 
     // Cutting-plane indicator (Task 9): ISO 128 style — chain-line body with
@@ -263,6 +265,10 @@ fn write_stylesheet(out: &mut String) {
         "    .cutting-plane-label { font: 700 3.6px sans-serif; fill: #111; \
          text-anchor: middle; dominant-baseline: alphabetic; }\n",
     );
+    // Datum-origin marker (hole-table X/Y reference corner): thin crosshair
+    // + open circle + small "0,0" label.
+    out.push_str("    .datum-marker { fill: none; stroke: #111; stroke-width: 0.18; }\n");
+    out.push_str("    .datum-marker-label { font: 500 2.6px sans-serif; fill: #111; }\n");
     out.push_str("  </style>\n");
 }
 
@@ -584,6 +590,51 @@ fn render_hole_table(out: &mut String, layout: &SheetLayout) {
             "  <text class=\"hole-table-text\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
             item.bbox.x0,
             item.bbox.y1,
+            escape_xml(text)
+        );
+    }
+}
+
+/// Ink the datum-origin marker from the `DatumMarker` layout item: a
+/// crosshair through the datum corner, a small circle, and the "0,0" label
+/// placed diagonally outward (down-left in sheet space — away from the view
+/// interior, which extends up-right from the min corner in every axial
+/// projection this marker supports).
+fn render_datum_marker(out: &mut String, layout: &SheetLayout) {
+    for item in layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::DatumMarker)
+    {
+        let cx = 0.5 * (item.bbox.x0 + item.bbox.x1);
+        let cy = 0.5 * (item.bbox.y0 + item.bbox.y1);
+        let r = 1.4;
+        let arm = 3.0;
+        // Crosshair.
+        let _ = write!(
+            out,
+            "  <line class=\"datum-marker\" x1=\"{:.3}\" y1=\"{cy:.3}\" x2=\"{:.3}\" y2=\"{cy:.3}\" />\n",
+            cx - arm,
+            cx + arm
+        );
+        let _ = write!(
+            out,
+            "  <line class=\"datum-marker\" x1=\"{cx:.3}\" y1=\"{:.3}\" x2=\"{cx:.3}\" y2=\"{:.3}\" />\n",
+            cy - arm,
+            cy + arm
+        );
+        // Open circle.
+        let _ = write!(
+            out,
+            "  <circle class=\"datum-marker\" cx=\"{cx:.3}\" cy=\"{cy:.3}\" r=\"{r:.3}\" />\n"
+        );
+        // "0,0" label, down-left of the corner (outside the part).
+        let text = item.text.as_deref().unwrap_or("0,0");
+        let _ = write!(
+            out,
+            "  <text class=\"datum-marker-label\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
+            cx - 7.0,
+            cy + 4.2,
             escape_xml(text)
         );
     }

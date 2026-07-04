@@ -55,8 +55,31 @@ pub fn section_view(
     }
 
     let n = plane_normal.normalize().ok()?;
-    let u = n.perpendicular().normalize().ok()?;
-    let v = n.cross(&u);
+    // In-plane frame (u = view right, v = view up). Keep the WORLD-VERTICAL
+    // axis vertical on paper: v = world-Z projected into the plane. The
+    // previous arbitrary `n.perpendicular()` frame could land the part's
+    // long axis VERTICAL in the view — a tall sliver that starves the
+    // layout solver of scale (live ring-plate sheet: 10% utilization with
+    // a 12×60 upright section in the ISO slot).
+    //
+    // Orientation invariant (load-bearing for the cutting-plane arrows):
+    // u × v = n, i.e. n points OUT of the drawn section toward its viewer,
+    // so SECTION A-A is what you see looking along −n. With v ⊥ n unit,
+    // u = v × n gives u × v = (v×n)×v = n(v·v) − v(v·n) = n. ✓
+    let v = {
+        let world_up = Vector3::new(0.0, 0.0, 1.0);
+        let proj = world_up - n * n.dot(&world_up);
+        match proj.normalize() {
+            Ok(p) => p,
+            Err(_) => {
+                // n ∥ Z (horizontal section plane): world Y plays "up".
+                let alt = Vector3::new(0.0, 1.0, 0.0);
+                let p = alt - n * n.dot(&alt);
+                p.normalize().ok()?
+            }
+        }
+    };
+    let u = v.cross(&n);
     let to2d = |p: Point3| -> [f64; 2] {
         let d = p - plane_origin;
         [d.dot(&u), d.dot(&v)]

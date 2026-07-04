@@ -139,6 +139,16 @@ pub enum SheetItemKind {
     /// The letter "A" at each end of the cutting-plane line in the axial view
     /// (ISO 128: section indicator label). Collision-policed like all text items.
     CuttingPlaneLabel,
+    /// The datum-origin marker at the part corner in the axial view: a small
+    /// crosshair + circle + "0,0" label showing WHERE the hole table's X/Y
+    /// columns measure from. Without it a machinist cannot locate the datum.
+    ///
+    /// Deliberately EXCLUDED from the text-collision pairs (like
+    /// `ProjectionSymbol`): the marker sits at the corner where the
+    /// horizontal and vertical dimension stacks' extension lines legitimately
+    /// converge, so pairing it would false-positive on every dimensioned
+    /// axial view. The bbox is centred on the datum corner.
+    DatumMarker,
 }
 
 /// One piece of ink on the sheet, with its bounding box in sheet coordinates.
@@ -529,6 +539,12 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         let (tags, table_items) = place_hole_table(drawing, h, &items);
         hole_tags = tags;
         items.extend(table_items);
+        // Datum-origin marker: the hole table's X/Y columns measure from the
+        // part's AABB min corner — ink that corner in the axial view so the
+        // reference is VISIBLE on the sheet (X=0, Y=0 for the table rows).
+        if let Some(marker) = place_datum_marker(drawing, h) {
+            items.push(marker);
+        }
     }
 
     // ── Zone-grid reference marks ─────────────────────────────────────
@@ -563,7 +579,7 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // at the line's sheet-space endpoints as CuttingPlaneLabel items.
     // These enter the layout so text-collision invariants cover them.
     if let Some(cpl) = &drawing.cutting_plane_line {
-        let cp_label_items = place_cutting_plane_labels(drawing, cpl, h);
+        let cp_label_items = place_cutting_plane_labels(drawing, cpl, h, &items);
         items.extend(cp_label_items);
     }
 
@@ -731,13 +747,18 @@ pub(crate) fn place_projection_symbol(tb_x: f64, tb_y: f64, tb_w: f64, tb_h: f64
     let dwg_h = tb_h * 0.55;
     let grid_h = tb_h - dwg_h;
     let cell_h = grid_h * 0.5;
-    // Symbol lives in the top row of the 2×2 grid (SCALE/SIZE row).
-    // Centre it in the left half of that row (SCALE cell = [right_x, right_x + right_w/2]).
-    let sym_cx = right_x + right_w * 0.5;
+    // The symbol lives INSIDE the SCALE cell (left half of the SCALE|SIZE
+    // row), right-aligned against the column divider. The previous placement
+    // centred it on the divider itself, which planted the glyph across the
+    // SIZE cell and over its value text ("A4"). Right-aligning inside SCALE
+    // keeps it clear of BOTH cells' text: the SCALE label/value hug the
+    // cell's left edge (`render_cell` inks at x + 1.8), the symbol hugs the
+    // right, and the divider bounds it away from the SIZE cell entirely.
+    let col_mid = right_x + right_w * 0.5;
+    let sym_w = 11.0_f64.min(right_w * 0.5 - 4.0);
+    let sym_h = 6.5_f64.min(cell_h * 0.7);
+    let sym_cx = col_mid - 1.5 - sym_w * 0.5;
     let sym_cy = tb_y + dwg_h + cell_h * 0.5;
-    // Bounding box: ~16 mm wide × 8 mm tall for the cone glyph.
-    let sym_w = 16.0_f64.min(right_w * 0.8);
-    let sym_h = 8.0_f64.min(cell_h * 0.7);
 
     SheetItem {
         kind: SheetItemKind::ProjectionSymbol,
@@ -773,12 +794,24 @@ const TABLE_MARGIN: f64 = 3.0;
 ///   `HoleTableText` items to append to the layout's `items` Vec.
 ///
 /// Table placement: right side of the sheet, just above the title block,
-/// flush with the title block's left edge (or inset `TABLE_MARGIN` from
-/// the frame right edge if the title block is narrower than the frame).
-/// Deterministic rule: always right-side; if it doesn't fit (table height
-/// exceeds available space above the title block), shift left until it fits
-/// or runs out of room (in which case the table is placed as far right as
-/// possible and the verifier will report the collision).
+/// Table placement consults the layout: candidate anchor slots are tried
+/// in a fixed, documented order and the first slot whose table rect stays
+/// inside the frame AND intersects no existing ink (`ViewGeometry`,
+/// `DimensionText`, `ViewLabel`, `HoleTag` items — the same obstacle
+/// discipline as view-label fallback) wins:
+///
+/// 1. **RIGHT slot** — right-aligned to the title block's left edge −
+///    `TABLE_MARGIN`, bottom at the title-block top − `TABLE_MARGIN`
+///    (the legacy spot).
+/// 2. **BOTTOM-LEFT slot** — left edge at frame-left + 2 mm, bottom at
+///    frame-bottom − 12 mm (clear of the three-line notes strip, which is
+///    placed after the table).
+/// 3. **BELOW-AXIAL slot** — left-aligned under the axial view's geometry
+///    rect, 6 mm below it.
+///
+/// If no slot is collision-free the RIGHT slot is used and the verifier's
+/// collision checks report the residual overlap honestly (same fallback
+/// discipline as view labels — placement never silently hides a defect).
 fn place_hole_table(
     drawing: &Drawing,
     sheet_h: f64,
@@ -826,12 +859,86 @@ fn place_hole_table(
     let total_rows = 1 + sites.len();
     let total_h = total_rows as f64 * TABLE_ROW_H;
 
-    // Table top-left: above the title block, right-aligned to its left edge.
-    // Prefer to align right edge of table to the title-block left edge - margin.
-    let table_x1 = tb_x0 - TABLE_MARGIN;
-    let table_x0 = (table_x1 - total_w).max(ml + 1.0);
-    let table_y1 = tb_y0 - TABLE_MARGIN;
-    let table_y0 = (table_y1 - total_h).max(mt + 1.0);
+    // ── Candidate anchor slots (see the doc comment for the rule) ────────────
+    // Each candidate is the table rect (x0, y0, x1, y1).
+    let right_slot = {
+        let x1 = tb_x0 - TABLE_MARGIN;
+        let x0 = (x1 - total_w).max(ml + 1.0);
+        let y1 = tb_y0 - TABLE_MARGIN;
+        let y0 = (y1 - total_h).max(mt + 1.0);
+        Rect2 { x0, y0, x1, y1 }
+    };
+    let bottom_left_slot = {
+        // Clear of the notes strip: three 3 mm-pitch lines above the frame
+        // bottom → reserve 12 mm.
+        let x0 = ml + 2.0;
+        let y1 = (mt + frame_h) - 12.0;
+        Rect2 {
+            x0,
+            y0: y1 - total_h,
+            x1: x0 + total_w,
+            y1,
+        }
+    };
+    let below_axial_slot = drawing.axial_view_idx.and_then(|ax_idx| {
+        existing
+            .iter()
+            .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(ax_idx))
+            .map(|geo| Rect2 {
+                x0: geo.bbox.x0,
+                y0: geo.bbox.y1 + 6.0,
+                x1: geo.bbox.x0 + total_w,
+                y1: geo.bbox.y1 + 6.0 + total_h,
+            })
+    });
+
+    // A slot FITS when it stays inside the frame, clear of the title block,
+    // and intersects no existing ink item.
+    let frame_rect = Rect2 {
+        x0: ml,
+        y0: mt,
+        x1: ml + frame_w,
+        y1: mt + frame_h,
+    };
+    let title_rect = Rect2 {
+        x0: tb_x0,
+        y0: tb_y0,
+        x1: ml + frame_w,
+        y1: mt + frame_h,
+    };
+    // NOTE on the tolerance sign: `Rect2::intersects(o, tol)` SHRINKS the
+    // test by `tol` (overlap must exceed `tol` to count). Placement wants
+    // CLEARANCE, so a NEGATIVE tol expands the test: −1.0 rejects any slot
+    // closer than 1 mm to existing ink — strictly tighter than the
+    // verifier's 0.2 mm collision threshold, so a slot that "fits" here can
+    // never fire the verifier's table-collision check.
+    let fits = |r: &Rect2| -> bool {
+        let inside = r.x0 >= frame_rect.x0
+            && r.y0 >= frame_rect.y0
+            && r.x1 <= frame_rect.x1
+            && r.y1 <= frame_rect.y1;
+        if !inside || r.intersects(&title_rect, -1.0) {
+            return false;
+        }
+        !existing.iter().any(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::ViewGeometry
+                    | SheetItemKind::DimensionText
+                    | SheetItemKind::ViewLabel
+                    | SheetItemKind::HoleTag
+            ) && r.intersects(&it.bbox, -1.0)
+        })
+    };
+
+    let chosen = [Some(right_slot), Some(bottom_left_slot), below_axial_slot]
+        .into_iter()
+        .flatten()
+        .find(fits)
+        // Fallback: RIGHT slot — the verifier reports the residual overlap.
+        .unwrap_or(right_slot);
+
+    let (table_x0, table_y0, table_x1, table_y1) = (chosen.x0, chosen.y0, chosen.x1, chosen.y1);
 
     let mut new_items: Vec<SheetItem> = Vec::new();
 
@@ -1039,20 +1146,71 @@ fn place_hole_table(
     (placed_tags, new_items)
 }
 
+// ── Datum-origin marker placement ─────────────────────────────────────────────
+
+/// Bounding-box half-size of the datum marker glyph (crosshair + circle), mm.
+pub(crate) const DATUM_MARKER_HALF_MM: f64 = 3.0;
+
+/// Place the datum-origin marker at the hole table's X/Y reference corner in
+/// the axial view.
+///
+/// The hole table's X/Y columns measure from the part's AABB min corner on
+/// the two axes perpendicular to the bore axis (`extract_dimensions` datum
+/// contract: "part_corner"). This marker inks that corner — crosshair +
+/// circle + a small "0,0" label — so a machinist reading the table can see
+/// where X=0, Y=0 sits. The datum corner in AXIAL-VIEW space is the view
+/// extent corner corresponding to (perp₀ min, perp₁ min); view-x sign flips
+/// per projection (Right/Left/Bottom mirror one axis).
+///
+/// Returns `None` when the drawing has no axial view.
+pub(crate) fn place_datum_marker(drawing: &Drawing, sheet_h: f64) -> Option<SheetItem> {
+    let ax_idx = drawing.axial_view_idx?;
+    let view = drawing.views.get(ax_idx)?;
+    let ext = &view.extent;
+    // View-space datum corner: the projection of the world AABB min corner
+    // on the two perpendicular axes. Where the projection negates an axis
+    // (Right: view_x = −world_y; Bottom: view_y = −world_y; Left: none of
+    // the handled axes), the world MIN maps to the view MAX.
+    let (vx, vy) = match view.projection {
+        super::types::ProjectionType::Top => (ext.min_x, ext.min_y),
+        super::types::ProjectionType::Front => (ext.min_x, ext.min_y),
+        super::types::ProjectionType::Right => (ext.max_x, ext.min_y),
+        super::types::ProjectionType::Bottom => (ext.min_x, ext.max_y),
+        super::types::ProjectionType::Left => (ext.min_x, ext.min_y),
+        _ => (ext.min_x, ext.min_y),
+    };
+    let sx = view.position_mm[0] + vx * view.scale;
+    let sy = (sheet_h - view.position_mm[1]) - vy * view.scale;
+    Some(SheetItem {
+        kind: SheetItemKind::DatumMarker,
+        bbox: Rect2 {
+            x0: sx - DATUM_MARKER_HALF_MM,
+            y0: sy - DATUM_MARKER_HALF_MM,
+            x1: sx + DATUM_MARKER_HALF_MM,
+            y1: sy + DATUM_MARKER_HALF_MM,
+        },
+        owner_view: Some(ax_idx),
+        text: Some("0,0".to_string()),
+    })
+}
+
 // ── Cutting-plane label placement (Task 9) ────────────────────────────────────
 
 /// Place the two "A" letters at the ends of the cutting-plane line in the axial
 /// view as `CuttingPlaneLabel` layout items.
 ///
-/// Each label is placed 4 mm beyond the line endpoint (further out from the part)
-/// to clear the thick end cap and arrowhead.  The font is the same 3.6 mm as the
-/// view label font (`VIEW_LABEL_FONT_MM`) — ISO practice for section letters.
+/// Each label prefers the spot 4 mm beyond the line endpoint (clear of the
+/// thick end cap and arrowhead); when that bbox would land on existing ink
+/// (`existing` items) it falls through the deterministic candidate list
+/// documented at `place_end`.  The font is the same 3.6 mm as the view label
+/// font (`VIEW_LABEL_FONT_MM`) — ISO practice for section letters.
 ///
 /// Both items are collision-policed through the layout like all other text items.
 pub(crate) fn place_cutting_plane_labels(
     drawing: &Drawing,
     cpl: &super::dimensioning::CuttingPlaneLine,
     sheet_h: f64,
+    existing: &[SheetItem],
 ) -> Vec<SheetItem> {
     let Some(ax_view) = drawing.views.get(cpl.ax_view_idx) else {
         return Vec::new();
@@ -1070,38 +1228,85 @@ pub(crate) fn place_cutting_plane_labels(
     let sp0 = to_sheet(cpl.p0);
     let sp1 = to_sheet(cpl.p1);
 
-    // The label sits 4 mm beyond the endpoint in the direction away from p1→p0
-    // (i.e. beyond the tip of the line).
-    let offset = 4.0_f64;
-    // Direction from p1 to p0 (for the p0 end) and from p0 to p1 (for the p1 end).
+    // Direction from p0 to p1 (unit, sheet space).
     let dx = sp1[0] - sp0[0];
     let dy = sp1[1] - sp0[1];
     let len = (dx * dx + dy * dy).sqrt().max(1e-9);
     let (udx, udy) = (dx / len, dy / len);
-
-    // p0 end: label at sp0 − offset * (p1→p0 direction) = sp0 − offset*(udx,udy)
-    let lp0 = [sp0[0] - offset * udx, sp0[1] - offset * udy];
-    // p1 end: label at sp1 + offset * (p0→p1 direction)
-    let lp1 = [sp1[0] + offset * udx, sp1[1] + offset * udy];
+    // Perpendicular to the line (for the sideways fallback candidates).
+    let (pdx, pdy) = (-udy, udx);
 
     let label_text = "A";
     let half_w = GLYPH_ADVANCE_EM * font * 0.5;
 
-    let make_item = |cx: f64, cy: f64, view_idx: usize| SheetItem {
-        kind: SheetItemKind::CuttingPlaneLabel,
-        bbox: Rect2 {
+    let bbox_at = |cx: f64, cy: f64| -> Rect2 {
+        Rect2 {
             x0: cx - half_w,
             y0: cy - font,
             x1: cx + half_w,
             y1: cy,
-        },
-        owner_view: Some(view_idx),
-        text: Some(label_text.to_string()),
+        }
+    };
+    // Collision-fallback (same discipline as view labels): a candidate is
+    // rejected when its bbox intersects existing text or geometry ink. The
+    // live ring-plate sheet planted an "A" on the TOP view's Ø callout —
+    // nudged constants can't fix that class; consulting the layout can.
+    let collides = |r: &Rect2| -> bool {
+        existing.iter().any(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::ViewGeometry
+                    | SheetItemKind::DimensionText
+                    | SheetItemKind::ViewLabel
+                    | SheetItemKind::HoleTag
+                    | SheetItemKind::NoteText
+                    | SheetItemKind::HoleTableText
+                    | SheetItemKind::HoleTableBorder // Negative tol = clearance (see `place_hole_table::fits`):
+                                                     // reject candidates within 0.5 mm of existing ink, tighter
+                                                     // than the verifier's 0.2 mm overlap threshold.
+            ) && r.intersects(&it.bbox, -0.5)
+        })
+    };
+    // Candidate anchors per end, deterministic order: walk OUTWARD along
+    // the line (4 / 8 / 12 / 16 mm beyond the tip — far enough to clear a
+    // full dimension-text lane, which is ~10 mm wide), then perpendicular
+    // nudges (±4 mm at 4 mm out, ±4 mm at 12 mm out). First non-colliding
+    // candidate wins; if all collide the legacy 4 mm anchor is used and the
+    // verifier reports the overlap.
+    let place_end = |tip: [f64; 2], out_dx: f64, out_dy: f64| -> SheetItem {
+        let at = |out: f64, perp: f64| -> [f64; 2] {
+            [
+                tip[0] + out * out_dx + perp * pdx,
+                tip[1] + out * out_dy + perp * pdy,
+            ]
+        };
+        let candidates = [
+            at(4.0, 0.0),
+            at(8.0, 0.0),
+            at(12.0, 0.0),
+            at(16.0, 0.0),
+            at(4.0, 4.0),
+            at(4.0, -4.0),
+            at(12.0, 4.0),
+            at(12.0, -4.0),
+        ];
+        let chosen = candidates
+            .into_iter()
+            .find(|c| !collides(&bbox_at(c[0], c[1])))
+            .unwrap_or(candidates[0]);
+        SheetItem {
+            kind: SheetItemKind::CuttingPlaneLabel,
+            bbox: bbox_at(chosen[0], chosen[1]),
+            owner_view: Some(cpl.ax_view_idx),
+            text: Some(label_text.to_string()),
+        }
     };
 
     vec![
-        make_item(lp0[0], lp0[1], cpl.ax_view_idx),
-        make_item(lp1[0], lp1[1], cpl.ax_view_idx),
+        // p0 end: outward = away from p1.
+        place_end(sp0, -udx, -udy),
+        // p1 end: outward = away from p0.
+        place_end(sp1, udx, udy),
     ]
 }
 

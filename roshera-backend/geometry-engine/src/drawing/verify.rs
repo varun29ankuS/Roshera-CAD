@@ -616,6 +616,43 @@ fn check_dimension_label_collisions(
             }
         }
     }
+
+    // ── Hole-table region × dimension text ────────────────────────────────
+    // The table (borders + cells) must not sit on any dimension callout.
+    // Coverage gap found on the live ring-plate sheet (2026-07-05): the
+    // table was planted across the FRONT view's dim band and only the
+    // tag×Ø pair was reported. The table REGION is the union of its
+    // HoleTableBorder bboxes (the outer border spans the whole table), so
+    // one check per offending dim text — not one per separator line.
+    let table_region: Option<super::layout::Rect2> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::HoleTableBorder)
+        .map(|it| it.bbox)
+        .reduce(|a, b| super::layout::Rect2 {
+            x0: a.x0.min(b.x0),
+            y0: a.y0.min(b.y0),
+            x1: a.x1.max(b.x1),
+            y1: a.y1.max(b.y1),
+        });
+    if let Some(tr) = table_region {
+        for dt in layout
+            .items
+            .iter()
+            .filter(|it| it.kind == SheetItemKind::DimensionText)
+        {
+            if tr.intersects(&dt.bbox, DIM_TEXT_COLLISION_TOL_MM) {
+                issues.push(error(
+                    DrawingIssueKind::DimensionLabelCollision,
+                    format!(
+                        "hole table overlaps dimension callout '{}'",
+                        dt.text.as_deref().unwrap_or("?"),
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
 }
 
 /// Detect dimension-text bboxes that intersect their OWN view's `ViewGeometry`
