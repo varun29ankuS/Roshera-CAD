@@ -11,6 +11,7 @@ pub mod features;
 pub mod field;
 pub mod kinematics;
 pub mod lmd;
+pub mod measure;
 pub mod newton;
 pub mod occupancy;
 pub mod point;
@@ -22,6 +23,7 @@ pub mod select;
 pub mod trim;
 
 pub use field::{sample_field_adaptive, signed_distance, AdaptiveField, FieldCell};
+pub use measure::{measure, MeasureError, MeasureResult, MeasureSubject};
 pub use occupancy::{occupancy_grid, to_slice_stack, OccupancyGrid};
 pub use point::{classify_point, nearest_on_solid, PointClass};
 pub use raycast::{raycast_all, raycast_solid, RayHit};
