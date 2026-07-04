@@ -19,6 +19,79 @@ use crate::primitives::solid::SolidId;
 use crate::primitives::surface::{Cone, Cylinder, Sphere};
 use crate::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Project-unique namespace for all Roshera dimension pids.
+///
+/// Encoded as `6e5a1f00-0000-4000-8000-526f73686572` — the trailing bytes
+/// spell "Rosher" in ASCII hex (52=R, 6f=o, 73=s, 68=h, 65=e, 72=r).
+///
+/// **FROZEN FOREVER.** Changing this constant invalids every pid ever minted;
+/// downstream systems that hold a pid will silently lose their references.
+const ROSHERA_DIM_NS: Uuid = Uuid::from_u128(0x6e5a_1f00_0000_4000_8000_526f_7368_6572);
+
+/// Derive a stable `pid` for a **feature** dimension (diameter/length/angle).
+///
+/// Input: the face ids the dimension spans (`entities`) and the dimension
+/// `kind` string.  The face pids are looked up in `model.face_pids`; if any
+/// entity has no recorded pid the function returns `None` — honest absence,
+/// never a fabricated stand-in.
+///
+/// Derivation: UUIDv5 over `ROSHERA_DIM_NS` + sorted entity pids (as
+/// big-endian u128 bytes) + kind bytes, length-prefixed to prevent aliasing.
+fn feature_dim_pid(model: &BRepModel, entities: &[u32], kind: &str) -> Option<String> {
+    if entities.is_empty() {
+        return None;
+    }
+    // Collect entity pids; bail on any missing.
+    let mut entity_pids: Vec<u128> = Vec::with_capacity(entities.len());
+    for &fid in entities {
+        let pid = model.face_pids.get(&fid)?;
+        entity_pids.push(pid.as_u128());
+    }
+    // Sort for determinism (face-id order is insertion-dependent).
+    entity_pids.sort_unstable();
+
+    // Build the hash input: len-prefixed entity pids then len-prefixed kind.
+    let kind_bytes = kind.as_bytes();
+    let mut buf: Vec<u8> = Vec::with_capacity(4 + entity_pids.len() * 16 + 4 + kind_bytes.len());
+    buf.extend_from_slice(&(entity_pids.len() as u32).to_be_bytes());
+    for p in entity_pids {
+        buf.extend_from_slice(&p.to_be_bytes());
+    }
+    buf.extend_from_slice(&(kind_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(kind_bytes);
+
+    Some(Uuid::new_v5(&ROSHERA_DIM_NS, &buf).hyphenated().to_string())
+}
+
+/// Derive a stable `pid` for a **whole-part extent** dimension.
+///
+/// Input: the solid's pid (`model.solid_pids`) + `"extent"` + the dominant
+/// axis tag (`"x"`, `"y"`, or `"z"` — largest absolute component of
+/// `direction`).  Returns `None` when the solid has no recorded pid.
+fn extent_dim_pid(model: &BRepModel, solid_id: SolidId, direction: &[f64; 3]) -> Option<String> {
+    let solid_pid = model.solid_pids.get(&solid_id)?;
+
+    // Dominant axis of the direction vector.
+    let axis_tag =
+        if direction[0].abs() >= direction[1].abs() && direction[0].abs() >= direction[2].abs() {
+            b"x" as &[u8]
+        } else if direction[1].abs() >= direction[2].abs() {
+            b"y"
+        } else {
+            b"z"
+        };
+
+    let solid_bytes = solid_pid.as_u128().to_be_bytes();
+    // Layout: solid_pid (16 bytes) + "extent" (6) + axis tag (1).
+    let mut buf: Vec<u8> = Vec::with_capacity(16 + 6 + 1);
+    buf.extend_from_slice(&solid_bytes);
+    buf.extend_from_slice(b"extent");
+    buf.extend_from_slice(axis_tag);
+
+    Some(Uuid::new_v5(&ROSHERA_DIM_NS, &buf).hyphenated().to_string())
+}
 
 /// One recoverable dimension callout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +117,14 @@ pub struct DimensionRecord {
     /// true circle. `None` for extents and spheres.
     #[serde(default)]
     pub axis: Option<[f64; 3]>,
+    /// Durable, cross-session identity for this dimension, derived via UUIDv5
+    /// from the entity PersistentIds it spans (feature dims) or from the solid
+    /// PersistentId + axis tag (extents).  `None` when the underlying entities
+    /// have no recorded PersistentId (pre-PID solids, or operations not yet
+    /// wired in slice 40-B…G).  The per-call `id` (`d0…`) is preserved for
+    /// backwards compatibility; `pid` is the durable handle.
+    #[serde(default)]
+    pub pid: Option<String>,
 }
 
 /// Min/max world AABB accumulated from sampled points.
@@ -244,6 +325,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                 anchor,
                 direction: dirs[axis],
                 axis: None,
+                pid: extent_dim_pid(model, solid_id, &dirs[axis]),
             });
         }
     }
@@ -296,6 +378,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     anchor,
                     direction: [rd.x, rd.y, rd.z],
                     axis: Some(axis_arr),
+                    pid: feature_dim_pid(model, &[fid], "diameter"),
                 });
                 let length = (hi - lo).abs();
                 if length > 1e-9 {
@@ -309,6 +392,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         anchor,
                         direction: [axis.x, axis.y, axis.z],
                         axis: Some(axis_arr),
+                        pid: feature_dim_pid(model, &[fid], "length"),
                     });
                 }
             } else if let Some(sph) = any.downcast_ref::<Sphere>() {
@@ -322,6 +406,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     anchor: [sph.center.x + sph.radius, sph.center.y, sph.center.z],
                     direction: [1.0, 0.0, 0.0],
                     axis: None,
+                    pid: feature_dim_pid(model, &[fid], "diameter"),
                 });
             } else if let Some(cone) = any.downcast_ref::<Cone>() {
                 let deg = cone.half_angle.to_degrees();
@@ -347,6 +432,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     anchor,
                     direction: [axis.x, axis.y, axis.z],
                     axis: None,
+                    pid: feature_dim_pid(model, &[fid], "angle"),
                 });
                 if base_r > 1e-9 {
                     out.push(DimensionRecord {
@@ -359,6 +445,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         anchor,
                         direction: [1.0, 0.0, 0.0],
                         axis: Some(cone_axis_arr),
+                        pid: feature_dim_pid(model, &[fid], "diameter"),
                     });
                 }
             }

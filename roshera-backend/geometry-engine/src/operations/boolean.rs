@@ -15909,7 +15909,16 @@ fn assign_boolean_face_pids(
         parents.push(parent_pid);
 
         if result_faces.len() == 1 {
-            let pid = PersistentId::derive(&parents, &op_tag, &role);
+            // When a face survives the boolean without being split (1:1 from
+            // parent), inherit the parent's PID directly.  Identity follows
+            // the entity — a face that merely passes through an unrelated cut
+            // must not have its PID re-derived through the new operation's
+            // context, or dimension pids will drift on every successive boolean.
+            let pid = if model.face_pids.contains_key(&parent) {
+                parent_pid
+            } else {
+                PersistentId::derive(&parents, &op_tag, &role)
+            };
             model.set_face_pid(result_faces[0], pid);
         } else {
             // Several fragments of one parent: order by centroid for a stable

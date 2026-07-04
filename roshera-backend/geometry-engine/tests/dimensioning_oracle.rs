@@ -220,3 +220,100 @@ fn boss_on_plate_matches_built() {
     assert!(has(&dims, "extent", 60.0), "plate extent 60");
     assert_recoverable(&m, part, &dims, "boss on plate");
 }
+
+// ── Persistent dimension identity (Task 1: Viewport Dimensions campaign) ──────
+
+/// A dimension's PID must be stable across unrelated edits.  Bore A is drilled
+/// first; then an independent bore B is added.  Bore A's diameter record must
+/// keep the exact same `pid`; bore B gets a different one.
+#[test]
+fn bore_diameter_pid_survives_unrelated_edit() {
+    let mut m = BRepModel::new();
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(60.0, 60.0, 10.0)
+        .expect("plate"));
+    let bore_a_cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(-15.0, 0.0, -6.0), Vector3::Z, 4.0, 12.0)
+        .expect("bore_a_cyl"));
+    let part = diff(&mut m, plate, bore_a_cyl);
+
+    // Capture bore A's diameter pid.
+    let pid_a = extract_dimensions(&m, part)
+        .into_iter()
+        .find(|d| d.kind == "diameter" && (d.value - 8.0).abs() < 1e-6)
+        .and_then(|d| d.pid.clone())
+        .expect("bore A diameter must carry a pid");
+
+    // Drill an unrelated bore B.
+    let bore_b_cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(15.0, 0.0, -6.0), Vector3::Z, 2.0, 12.0)
+        .expect("bore_b_cyl"));
+    let part2 = diff(&mut m, part, bore_b_cyl);
+
+    let dims2 = extract_dimensions(&m, part2);
+
+    // Bore A's pid must be unchanged.
+    let pid_a2 = dims2
+        .iter()
+        .find(|d| d.kind == "diameter" && (d.value - 8.0).abs() < 1e-6)
+        .and_then(|d| d.pid.clone())
+        .expect("bore A diameter must still carry a pid after bore B was added");
+    assert_eq!(
+        pid_a, pid_a2,
+        "bore A identity follows its entity across unrelated edits"
+    );
+
+    // Bore B has a distinct pid.
+    let pid_b = dims2
+        .iter()
+        .find(|d| d.kind == "diameter" && (d.value - 4.0).abs() < 1e-6)
+        .and_then(|d| d.pid.clone())
+        .expect("bore B diameter must carry a pid");
+    assert_ne!(pid_a, pid_b, "bore A and bore B must have distinct pids");
+}
+
+/// Extents for a box must each carry a pid; all three must be distinct; and
+/// re-extracting the same model must return identical pids (determinism).
+#[test]
+fn extent_pid_stable_and_axis_distinct() {
+    let mut m = BRepModel::new();
+    let b1 = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(40.0, 30.0, 20.0)
+        .expect("box"));
+    let dims = extract_dimensions(&m, b1);
+
+    let pids: Vec<Option<String>> = dims
+        .iter()
+        .filter(|d| d.kind == "extent")
+        .map(|d| d.pid.clone())
+        .collect();
+    assert_eq!(
+        pids.len(),
+        3,
+        "expected 3 extent records, got {}",
+        pids.len()
+    );
+    assert!(
+        pids.iter().all(|p| p.is_some()),
+        "all extent records must carry a pid: {pids:?}"
+    );
+
+    // All three axis pids must be distinct.
+    let uniq: std::collections::HashSet<_> = pids.iter().collect();
+    assert_eq!(
+        uniq.len(),
+        3,
+        "X/Y/Z extents must have distinct pids: {pids:?}"
+    );
+
+    // Re-extract → identical pids (deterministic).
+    let again: Vec<Option<String>> = extract_dimensions(&m, b1)
+        .into_iter()
+        .filter(|d| d.kind == "extent")
+        .map(|d| d.pid)
+        .collect();
+    assert_eq!(
+        pids, again,
+        "pids must be deterministic across re-extraction"
+    );
+}
