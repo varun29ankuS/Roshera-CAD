@@ -14,7 +14,7 @@
  * isolated: scene-store is already very large and the unit lives at
  * document level, not object level. The store is tiny and intentionally
  * has no persistence — the authoritative source is the backend; the app
- * GETs it at mount (App.tsx) and stays in sync via the selector's PATCH
+ * GETs it at mount (TopBar.tsx) and stays in sync via the selector's PATCH
  * round-trip.
  *
  * ## Replacement not mutation

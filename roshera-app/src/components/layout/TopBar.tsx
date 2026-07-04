@@ -104,9 +104,15 @@ export function TopBar() {
   // loop. The selector PATCH path is authoritative; this is purely a
   // cold-start sync so the selector shows the right initial value.
   useEffect(() => {
+    // Guard against the cold-start race: if the user PATCHes a unit while
+    // this GET is in flight, the epoch advances and the stale response must
+    // NOT clobber the newer choice.
+    const epochAtMount = useUnitsStore.getState().unitEpoch
     getDocumentUnit()
       .then((unit) => {
-        setDocumentUnitState(unit)
+        if (useUnitsStore.getState().unitEpoch === epochAtMount) {
+          setDocumentUnitState(unit)
+        }
       })
       .catch(() => {
         // Best-effort: leave default "mm" untouched.
