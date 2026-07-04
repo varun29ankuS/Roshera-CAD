@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { Html, Line } from '@react-three/drei'
 import * as THREE from 'three'
 import { useSceneStore } from '@/stores/scene-store'
@@ -44,29 +45,28 @@ export function PartDimensions() {
   const objects = useSceneStore((s) => s.objects)
   const objectOrder = useSceneStore((s) => s.objectOrder)
 
-  // Collect objects that have dimensions toggled on and carry a solidId.
-  const active = objectOrder.filter((id) => {
-    if (!showDimensions.has(id)) return false
-    const obj = objects.get(id)
-    return obj?.analyticalGeometry?.solidId !== undefined
-  })
+  // Collect objects that have dimensions toggled on and carry a solidId,
+  // pairing each id with its (narrowed) kernel solid id up front so the
+  // render below needs no non-null assertions.
+  const active: Array<{ objectId: string; solidId: number }> = []
+  for (const id of objectOrder) {
+    if (!showDimensions.has(id)) continue
+    const solidId = objects.get(id)?.analyticalGeometry?.solidId
+    if (solidId === undefined) continue
+    active.push({ objectId: id, solidId })
+  }
 
   if (active.length === 0) return null
 
   return (
     <group name="part-dimensions">
-      {active.map((objectId) => {
-        const obj = objects.get(objectId)
-        // Type narrowed by the filter above — solidId is present.
-        const solidId = obj!.analyticalGeometry!.solidId
-        return (
-          <ObjectDimensions
-            key={objectId}
-            objectId={objectId}
-            solidId={solidId}
-          />
-        )
-      })}
+      {active.map(({ objectId, solidId }) => (
+        <ObjectDimensions
+          key={objectId}
+          objectId={objectId}
+          solidId={solidId}
+        />
+      ))}
     </group>
   )
 }
@@ -186,17 +186,27 @@ interface DimensionAnnotationProps {
 }
 
 function DimensionAnnotation({ row }: DimensionAnnotationProps) {
-  const anchorVec = new THREE.Vector3(...row.anchor)
-  const dirVec = new THREE.Vector3(...row.direction)
+  // Memoised per row: the row object identity only changes when a fresh
+  // fetch lands, so the Vector3s (anchor, leader endpoint) are computed
+  // once per fetch instead of on every render of every annotation.
+  const { anchorVec, endVec } = useMemo(() => {
+    const anchor = new THREE.Vector3(...row.anchor)
+    if (isExtent(row.kind)) {
+      return { anchorVec: anchor, endVec: null }
+    }
+    const dir = new THREE.Vector3(...row.direction)
+    return { anchorVec: anchor, endVec: leaderEndpoint(anchor, dir) }
+  }, [row])
 
-  if (isExtent(row.kind)) {
+  if (endVec === null) {
     // Extents: billboard directly at the anchor, no leader.
     return <DimBadge position={anchorVec} text={row.label} />
   }
 
-  // Feature dimensions: leader from anchor to offset endpoint.
-  const endVec = leaderEndpoint(anchorVec, dirVec)
-
+  // Feature dimensions: leader from anchor to offset endpoint. The
+  // leader must never be a raycast target — `raycast={() => null}`
+  // removes it from Three.js hit-testing entirely so orbit / selection
+  // clicks pass straight through.
   return (
     <>
       <Line
@@ -205,6 +215,7 @@ function DimensionAnnotation({ row }: DimensionAnnotationProps) {
         lineWidth={1}
         opacity={0.7}
         transparent
+        raycast={() => null}
       />
       <DimBadge position={endVec} text={row.label} />
     </>

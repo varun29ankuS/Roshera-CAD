@@ -20,6 +20,7 @@ import {
   Diff,
   SquaresIntersect,
   PenTool,
+  PencilRuler,
   Ruler,
   Grid3x3,
   Copy,
@@ -1490,7 +1491,7 @@ export function ToolBar() {
           label: 'Analyze',
           items: [
             {
-              icon: Ruler,
+              icon: PencilRuler,
               label: 'Dimensions',
               active: (() => {
                 // The toggle acts on the single selected object. Show active

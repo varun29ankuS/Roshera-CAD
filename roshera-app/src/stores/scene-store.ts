@@ -80,8 +80,13 @@ export interface AnalyticalGeometry {
    * `GET /api/agent/parts/{solidId}/dimensions` without knowing the
    * backend part UUID — the kernel dimensions endpoint is keyed on
    * this integer, matching how drawings and the agent tools address it.
+   *
+   * Optional as an honest type: today the backend ships `solid_id` on
+   * every `analytical_geometry` payload, but a future shape that omits
+   * it must surface as `undefined` at the type level (consumers already
+   * guard with `?.solidId !== undefined`), not as a lying `number`.
    */
-  solidId: number
+  solidId?: number
 }
 
 export interface CADObject {
@@ -1082,11 +1087,17 @@ const sceneCreator: StateCreator<
         objects.delete(id)
         const selectedIds = new Set(state.selectedIds)
         selectedIds.delete(id)
+        // Dimension-layer lifecycle: a deleted object must not leave its
+        // id in `showDimensions` (stale-set leak; a reused id would
+        // inherit a toggled-on state it never asked for).
+        const showDimensions = new Set(state.showDimensions)
+        showDimensions.delete(id)
         return {
           objects,
           objectOrder: state.objectOrder.filter((oid) => oid !== id),
           selectedIds,
           hoveredId: state.hoveredId === id ? null : state.hoveredId,
+          showDimensions,
         }
       }),
 
@@ -1099,6 +1110,7 @@ const sceneCreator: StateCreator<
         subElementSelections: [],
         serverSketches: new Map(),
         hiddenSketchIds: new Set(),
+        showDimensions: new Set(),
       }),
 
     selectObject: (id, additive) =>
