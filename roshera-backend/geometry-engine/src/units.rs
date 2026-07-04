@@ -186,24 +186,6 @@ impl LengthUnit {
             prec = self.precision()
         )
     }
-
-    /// Format a kernel-native (millimetre) length for display, e.g.
-    /// `"17.5 mm"` (with a space). Kept for backwards compatibility with
-    /// callers that still use the space-separated form; new code should use
-    /// [`Self::format_len`] instead.
-    ///
-    /// PHASE-1 CONTRACT: the numeric value is *labelled*, NOT rescaled. The
-    /// displayed number is the `value_str` argument with the document-unit
-    /// label appended. When the true-conversion phase lands it will route
-    /// through [`Self::from_mm`] here; until then `format_length` for any
-    /// non-mm unit still shows the mm magnitude (honest: the label is the
-    /// document unit, the number is the kernel measurement, and the two are
-    /// not silently inconsistent because the default — and only wired —
-    /// document unit is millimetres).
-    pub fn format_length(self, mm: f64, value_str: &str) -> String {
-        let _ = mm;
-        format!("{} {}", value_str, self.label())
-    }
 }
 
 #[cfg(test)]
@@ -315,7 +297,7 @@ mod tests {
         assert_eq!(LengthUnit::Foot.precision(), 4);
     }
 
-    // ── Backwards compat: mm_per_unit and format_length still work ───────────
+    // ── Backwards compat: mm_per_unit alias still works ──────────────────────
 
     #[test]
     fn mm_per_unit_alias_works() {

@@ -124,7 +124,7 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     emit_title_block(&mut dxf, drawing);
 
     // -- Notes strip ---------------------------------------------------
-    emit_notes_strip(&mut dxf, &drawing.sheet_size);
+    emit_notes_strip(&mut dxf, drawing);
 
     // -- Serialise -----------------------------------------------------
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
@@ -528,7 +528,8 @@ fn emit_grid_cell(dxf: &mut DxfDrawing, x: f64, y: f64, h: f64, label: &str, val
     );
 }
 
-fn emit_notes_strip(dxf: &mut DxfDrawing, sheet: &SheetSize) {
+fn emit_notes_strip(dxf: &mut DxfDrawing, drawing: &Drawing) {
+    let sheet = &drawing.sheet_size;
     let (ml, _mr, _mt, mb) = frame_margins(sheet);
     // Engineering notes drift up from the bottom-left of the frame.
     let x = ml + 2.5;
@@ -542,7 +543,9 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, sheet: &SheetSize) {
         y0,
         2.4,
         0.0,
-        "GENERAL TOLERANCES: LINEAR \u{00B1}0.1 MM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m.",
+        // Unit-aware notes stored on the Drawing at build time (same source
+        // the SVG renders) - DXF and SVG can never disagree.
+        &drawing.tolerance_note,
         HorizontalTextJustification::Left,
     );
     add_text(
@@ -552,7 +555,7 @@ fn emit_notes_strip(dxf: &mut DxfDrawing, sheet: &SheetSize) {
         y1,
         2.4,
         0.0,
-        "ALL DIMENSIONS IN MILLIMETRES UNLESS OTHERWISE STATED.",
+        &drawing.unit_note,
         HorizontalTextJustification::Left,
     );
     add_text(
