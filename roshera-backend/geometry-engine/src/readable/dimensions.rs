@@ -524,7 +524,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                 // records are emitted in that case (honest absence over
                 // misleading fabricated numbers).
                 if let Some(ref bb) = bb {
-                    if let Some((_dominant, perps)) =
+                    if let Some((dominant_idx, perps)) =
                         axis_perpendicular_pair([axis.x, axis.y, axis.z])
                     {
                         // Cylinder axis in world space: decompose the axis origin
@@ -546,13 +546,9 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         //
                         // This is the machinist's natural reference: clamp the
                         // part at its two perpendicular min edges.
-                        let dominant_idx = if perps[0] == 1 && perps[1] == 2 {
-                            0
-                        } else if perps[0] == 0 && perps[1] == 2 {
-                            1
-                        } else {
-                            2
-                        };
+                        // dominant_idx comes straight from axis_perpendicular_pair
+                        // (review I-1: re-deriving it from `perps` was fragile
+                        // against any future reordering of the returned pair).
                         let mut corner = bb.min;
                         corner[dominant_idx] = p_lo[dominant_idx];
 
@@ -564,6 +560,9 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
 
                         let world_axes = [[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
                         let axis_names = ["X", "Y", "Z"];
+                        // Suffix indexed by WORLD axis of the offset (x/y/z): a Y-dominant
+                        // bore legitimately offsets along X and Z, hence three entries even
+                        // though the common Z-bore case uses only x/y.
                         let pid_suffixes = ["position_x", "position_y", "position_z"];
 
                         for &perp_idx in &perps {
