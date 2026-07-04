@@ -2484,6 +2484,35 @@ async fn measure_unknown_solid_returns_404() {
     );
 }
 
+/// An unknown subject kind (e.g. "edge" — not yet supported) must reject
+/// cleanly with 422, never panic. Pins the request-validation branch no
+/// other integration test drives.
+#[tokio::test]
+async fn measure_unknown_kind_returns_422() {
+    let state = make_test_state().await;
+
+    let request = measure_post(json!({
+        "a": { "part_id": 0u32, "kind": "edge", "id": 0u32 },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown kind must 422; body = {body}"
+    );
+    assert_eq!(
+        body["error"], "unsupported_measure",
+        "422 must carry error=unsupported_measure; body = {body}"
+    );
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("edge") || r.contains("kind")),
+        "reason names the unsupported kind; body = {body}"
+    );
+}
+
 /// An unsupported measure (skew-axis cylinder pair) must return 422
 /// with `error = "unsupported_measure"` and the kernel's verbatim reason.
 /// Pins the 422 wire shape end-to-end through the router.
@@ -2587,6 +2616,18 @@ fn map_measure_result_angle_wire_shape() {
         "angle label must contain the value; got {:?}",
         wire.label
     );
+    // Prefix/suffix pinned: dropping the angle glyph or the degree sign is
+    // a regression the value-substring check above cannot see.
+    assert!(
+        wire.label.starts_with('\u{2220}'),
+        "angle label must start with the angle glyph; got {:?}",
+        wire.label
+    );
+    assert!(
+        wire.label.contains('\u{00b0}'),
+        "angle label must carry the degree sign; got {:?}",
+        wire.label
+    );
     assert!(wire.pid.is_none());
 }
 
@@ -2634,7 +2675,9 @@ fn map_measure_result_face_info_wire_shape() {
     };
     let wire: MeasureResponse = map_measure_result(result, 7u32, None);
     assert_eq!(wire.kind, "face_info");
-    assert_eq!(wire.unit, "mm");
+    // Areas are mm² on the wire — "mm" for an area was the M-3 dishonesty
+    // this assertion previously pinned.
+    assert_eq!(wire.unit, "mm\u{00b2}");
     assert!(
         wire.label.starts_with("A "),
         "face_info label must start with 'A '; got {:?}",

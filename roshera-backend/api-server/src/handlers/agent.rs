@@ -3212,7 +3212,9 @@ pub fn map_measure_result(
                 kind: "face_info".to_string(),
                 relation: None,
                 value: area,
-                unit: "mm".to_string(),
+                // Areas are mm2 - the one wire unit beyond the spec mm|deg
+                // pair; the frontend renderer treats unit as display-opaque.
+                unit: "mm\u{00b2}".to_string(),
                 label,
                 anchor,
                 direction: normal,
