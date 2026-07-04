@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
+import { useUnitsStore } from '@/stores/units-store'
 import type { DimensionRow } from '@/lib/measure-api'
 
 // Re-exported so viewport consumers can keep importing the row type
@@ -45,18 +46,22 @@ export function usePartDimensions(
 ): { dimensions: DimensionRow[]; loading: boolean } {
   const objectOrder = useSceneStore((s) => s.objectOrder)
   const objects = useSceneStore((s) => s.objects)
+  const unitEpoch = useUnitsStore((s) => s.unitEpoch)
 
   // Geometry fingerprint: objectOrder joined with each solid's vertex
   // count. Stable string so React's dependency comparison works by value.
   // Topology mutations (create / extrude / boolean / transform) all flow
   // through the WS pipeline and change this fingerprint, triggering a
   // refetch of the kernel's current dimension table.
-  const geometryKey = objectOrder
-    .map((id) => {
-      const o = objects.get(id)
-      return `${id}:${o ? o.mesh.vertices.length : 0}`
-    })
-    .join('|')
+  // The `unitEpoch` suffix ensures a unit change (which does not alter
+  // topology) also re-fires the fetch so labels arrive in the new unit.
+  const geometryKey =
+    objectOrder
+      .map((id) => {
+        const o = objects.get(id)
+        return `${id}:${o ? o.mesh.vertices.length : 0}`
+      })
+      .join('|') + `|u${unitEpoch}`
 
   const [dimensions, setDimensions] = useState<DimensionRow[]>([])
   const [loading, setLoading] = useState(false)

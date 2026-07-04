@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
+import { useUnitsStore } from '@/stores/units-store'
 import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
 
 /**
@@ -38,16 +39,20 @@ import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
 export function usePinnedMeasurementsRevalidation(): void {
   const objectOrder = useSceneStore((s) => s.objectOrder)
   const objects = useSceneStore((s) => s.objects)
+  const unitEpoch = useUnitsStore((s) => s.unitEpoch)
 
   // Same geometry fingerprint as use-part-dimensions / use-part-labels:
   // object id list + per-object vertex count. Any topology change
   // (create / boolean / transform / re-tessellate) changes this string.
-  const geometryKey = objectOrder
-    .map((id) => {
-      const o = objects.get(id)
-      return `${id}:${o ? o.mesh.vertices.length : 0}`
-    })
-    .join('|')
+  // The `unitEpoch` suffix makes a unit change also trigger re-POSTing
+  // every pin so the returned labels are in the new unit.
+  const geometryKey =
+    objectOrder
+      .map((id) => {
+        const o = objects.get(id)
+        return `${id}:${o ? o.mesh.vertices.length : 0}`
+      })
+      .join('|') + `|u${unitEpoch}`
 
   // Previous key, `null` until the first effect run. Re-validation only
   // fires on an actual change — the first observed key is the baseline

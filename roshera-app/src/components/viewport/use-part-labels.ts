@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
+import { useUnitsStore } from '@/stores/units-store'
 import { listLabels, type Label } from '@/lib/labels-api'
 
 /**
@@ -28,18 +29,22 @@ export function usePartLabels(enabled: boolean): {
 } {
   const objectOrder = useSceneStore((s) => s.objectOrder)
   const objects = useSceneStore((s) => s.objects)
+  const unitEpoch = useUnitsStore((s) => s.unitEpoch)
 
   // Fingerprint the geometry so the effect re-runs on any topology
   // change without depending on the (frequently re-created) Map identity
   // alone. Mesh vertex length is a cheap proxy for "this solid changed
   // shape"; combined with the object id list it captures add / remove /
   // re-tessellate. Stable string so React's dep compare is by value.
-  const geometryKey = objectOrder
-    .map((id) => {
-      const o = objects.get(id)
-      return `${id}:${o ? o.mesh.vertices.length : 0}`
-    })
-    .join('|')
+  // The `unitEpoch` suffix ensures a unit change also triggers a re-fetch
+  // so label strings arrive in the new unit without a topology mutation.
+  const geometryKey =
+    objectOrder
+      .map((id) => {
+        const o = objects.get(id)
+        return `${id}:${o ? o.mesh.vertices.length : 0}`
+      })
+      .join('|') + `|u${unitEpoch}`
 
   const [labels, setLabels] = useState<Label[]>([])
   const [loading, setLoading] = useState(false)

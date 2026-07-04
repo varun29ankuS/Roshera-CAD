@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useEffect } from 'react'
 import {
   Menubar,
   MenubarContent,
@@ -16,11 +16,14 @@ import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
+import { useUnitsStore } from '@/stores/units-store'
 import { Badge } from '@/components/ui/badge'
 import { Sun, Moon } from 'lucide-react'
 import { wsClient } from '@/lib/ws-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { useChatStore } from '@/stores/chat-store'
+import { getDocumentUnit } from '@/lib/units-api'
+import { UnitSelector } from '@/components/layout/UnitSelector'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -93,6 +96,24 @@ export function TopBar() {
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   const setDocMode = useDocModeStore((s) => s.setMode)
   const openCommandPalette = useCommandPaletteStore((s) => s.openWith)
+  const setDocumentUnitState = useUnitsStore((s) => s.setDocumentUnitState)
+
+  // On mount: GET the backend's current document unit and seed the store.
+  // Best-effort: a failure (backend not yet reachable) silently leaves
+  // the default "mm" in place — no error surface, no spinner, no retry
+  // loop. The selector PATCH path is authoritative; this is purely a
+  // cold-start sync so the selector shows the right initial value.
+  useEffect(() => {
+    getDocumentUnit()
+      .then((unit) => {
+        setDocumentUnitState(unit)
+      })
+      .catch(() => {
+        // Best-effort: leave default "mm" untouched.
+      })
+  // Run once on mount only.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleNewProject = useCallback(() => {
     clearScene()
@@ -267,6 +288,14 @@ export function TopBar() {
               : 'Ctrl K'}
           </kbd>
         </button>
+
+        {/* Document unit selector. Document-level display setting — sits
+            alongside the workspace switcher because both are document-scope
+            controls that live at the top-right, never competing with the
+            geometry tools on the left. Changing the unit PATCHes the backend
+            and bumps `unitEpoch` so every dimension/label/pin fetch re-fires
+            in the new unit; the frontend performs zero conversion math. */}
+        <UnitSelector />
 
         {/* Workspace switcher. Tucked into the right-side TopBar so
             it is reachable from anywhere but never competes with the
