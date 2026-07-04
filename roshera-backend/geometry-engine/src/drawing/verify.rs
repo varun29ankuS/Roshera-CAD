@@ -17,14 +17,6 @@
 //! reported collision corresponds 1:1 to what the renderer draws. A view
 //! point `(vx, vy)` maps to the sheet as
 //! `(pos.x + vx·scale, (sheet_h − pos.y) − vy·scale)`.
-//!
-//! # Declared-but-unwired invariant kinds
-//! The following [`DrawingIssueKind`] variants are declared but **never
-//! emitted** by any current check — they are reserved for future wiring
-//! under the verification-comprehensiveness campaign:
-//! - [`DrawingIssueKind::DimensionOnGeometry`]
-//! - [`DrawingIssueKind::DimensionLabelCollision`]
-//! - [`DrawingIssueKind::UndimensionedView`]
 
 use std::collections::HashMap;
 
@@ -362,6 +354,15 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     // ── RedundantDimension detection ─────────────────────────────────────
     check_redundant_dimensions(drawing, h, &mut issues);
 
+    // ── DimensionLabelCollision detection ─────────────────────────────────
+    check_dimension_label_collisions(&layout, &mut issues);
+
+    // ── DimensionOnGeometry detection ─────────────────────────────────────
+    check_dimension_on_geometry(&layout, drawing, &mut issues);
+
+    // ── UndimensionedView detection ───────────────────────────────────────
+    check_undimensioned_views(drawing, &mut issues);
+
     finalize(issues, utilization)
 }
 
@@ -532,6 +533,129 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
                     ));
                 }
             }
+        }
+    }
+}
+
+/// Collision tolerance for dimension-text bounding boxes (ISO 129 practice).
+const DIM_TEXT_COLLISION_TOL_MM: f64 = 0.2;
+
+/// Detect pairs of `DimensionText` bboxes that overlap — regardless of which
+/// view they belong to (ISO 129 prohibits callout stacks that merge into one
+/// unreadable blob). Tolerates up to 0.2 mm of positive interior overlap
+/// (printer registration noise). Any larger overlap is an `Error`.
+fn check_dimension_label_collisions(
+    layout: &super::layout::SheetLayout,
+    issues: &mut Vec<DrawingIssue>,
+) {
+    let dim_texts: Vec<&super::layout::SheetItem> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::DimensionText)
+        .collect();
+
+    for i in 0..dim_texts.len() {
+        for j in (i + 1)..dim_texts.len() {
+            if dim_texts[i]
+                .bbox
+                .intersects(&dim_texts[j].bbox, DIM_TEXT_COLLISION_TOL_MM)
+            {
+                issues.push(error(
+                    DrawingIssueKind::DimensionLabelCollision,
+                    format!(
+                        "dimension '{}' overlaps dimension '{}'",
+                        dim_texts[i].text.as_deref().unwrap_or("?"),
+                        dim_texts[j].text.as_deref().unwrap_or("?"),
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+}
+
+/// Detect dimension-text bboxes that intersect their OWN view's `ViewGeometry`
+/// rect (ISO 129 §10: callout text must be offset clear of the part silhouette
+/// via extension lines — text landing on the outline is a genuine annotation
+/// defect, not merely an aesthetic preference).
+///
+/// Only the SAME view pairing is tested: a `DimensionText` item with
+/// `owner_view = Some(idx)` is checked against the `ViewGeometry` item with
+/// `owner_view = Some(idx)`. Cross-view pairings are ignored because the
+/// verifier already catches cross-view overlaps via `ViewOverlap`.
+fn check_dimension_on_geometry(
+    layout: &super::layout::SheetLayout,
+    drawing: &super::types::Drawing,
+    issues: &mut Vec<DrawingIssue>,
+) {
+    for dt in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::DimensionText)
+    {
+        let Some(view_idx) = dt.owner_view else {
+            continue;
+        };
+        // Find the ViewGeometry item for this exact view.
+        let Some(geo) = layout
+            .items
+            .iter()
+            .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(view_idx))
+        else {
+            continue;
+        };
+        if dt.bbox.intersects(&geo.bbox, DIM_TEXT_COLLISION_TOL_MM) {
+            let view_name = drawing
+                .views
+                .get(view_idx)
+                .map(|v| v.name.as_str())
+                .unwrap_or("?");
+            issues.push(error(
+                DrawingIssueKind::DimensionOnGeometry,
+                format!(
+                    "view '{}': dimension '{}' text bbox overlaps the part silhouette (ISO 129: extend callouts clear of the outline)",
+                    view_name,
+                    dt.text.as_deref().unwrap_or("?"),
+                ),
+                Some(view_name.to_string()),
+            ));
+        }
+    }
+}
+
+/// Detect orthographic views that carry visible geometry but no dimension
+/// callouts (`Warning`, not `Error`).
+///
+/// **Rationale for Warning severity:** under the global deduplication
+/// strategy, a view can legitimately carry zero dimensions when its
+/// features read best from a different view (e.g. the isometric carries
+/// no dims by design; a third orthographic may repeat only whole-part
+/// extents already called out in `FRONT`). The drawing is usable —
+/// `passed` is NOT gated on this finding — but the drafter should
+/// confirm the omission is intentional rather than an oversight.
+///
+/// `Isometric` and `Custom` projections are skipped: isometric views are
+/// never dimensioned (ISO 128-30) and custom views are caller-controlled.
+fn check_undimensioned_views(drawing: &super::types::Drawing, issues: &mut Vec<DrawingIssue>) {
+    for v in &drawing.views {
+        // Skip non-standard projections that are never conventionally dimensioned.
+        match v.projection {
+            super::types::ProjectionType::Isometric
+            | super::types::ProjectionType::Custom { .. } => {
+                continue;
+            }
+            _ => {}
+        }
+        let has_geometry = !v.polylines.is_empty() || !v.hidden_polylines.is_empty();
+        if has_geometry && v.dimensions.is_empty() {
+            issues.push(warning(
+                DrawingIssueKind::UndimensionedView,
+                format!(
+                    "view '{}' shows geometry but carries no dimension callouts — confirm omission is intentional",
+                    v.name,
+                ),
+                Some(v.name.clone()),
+            ));
         }
     }
 }

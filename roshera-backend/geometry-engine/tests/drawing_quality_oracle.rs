@@ -485,6 +485,159 @@ fn view_label_on_neighbour_geometry_flagged() {
     assert!(!report.passed, "ViewLabelCollision is Severity::Error");
 }
 
+/// DETECTOR PROOF — `DimensionLabelCollision` (permanent invariant, Error severity).
+///
+/// Construction: one FRONT view carries two `kind="angle"` callouts whose
+/// view-space `a` endpoint is identical. `place_dimensions` classifies both
+/// as degenerate (point callouts) and anchors their text boxes at the same
+/// sheet coordinate, producing 100% bbox overlap. The tolerance is 0.2 mm;
+/// full overlap always exceeds it.
+///
+/// `passed` must be `false` — `DimensionLabelCollision` is `Severity::Error`.
+///
+/// Mutation proof: gut `check_dimension_label_collisions` (return early without
+/// pushing issues) → `report.has(DimensionLabelCollision)` returns `false` →
+/// `assert!(report.has(...))` → RED. Restore → GREEN.
+#[test]
+fn dimension_label_collision_flagged() {
+    // One FRONT view, 100×70 outline at pos=[100, 150] on A3. Two angle
+    // callouts at the same view-space point ([50, 35] = centre of outline).
+    // Both become degenerate callouts; both land at the same sheet-space
+    // text_anchor → identical DimensionText bboxes → collision fires.
+    let mut d = Drawing::new("DimLabelCollision", SheetSize::A3);
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [100.0, 150.0],
+        100.0,
+        70.0,
+        vec![
+            Dimension2d {
+                id: "angle_a".to_string(),
+                kind: "angle".to_string(),
+                value: 45.0,
+                unit: "deg".to_string(),
+                label: "45.00°".to_string(),
+                a: [50.0, 35.0],
+                b: [50.0, 35.0],
+                entities: Vec::new(),
+                axis3: None,
+                dir3: None,
+            },
+            Dimension2d {
+                id: "angle_b".to_string(),
+                kind: "angle".to_string(),
+                value: 90.0,
+                unit: "deg".to_string(),
+                label: "90.00°".to_string(),
+                a: [50.0, 35.0],
+                b: [50.0, 35.0],
+                entities: Vec::new(),
+                axis3: None,
+                dir3: None,
+            },
+        ],
+    ));
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::DimensionLabelCollision),
+        "co-located angle callouts must be flagged; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "DimensionLabelCollision is Severity::Error");
+}
+
+/// DETECTOR PROOF — `DimensionOnGeometry` (permanent invariant, Error severity).
+///
+/// Construction: one FRONT view carries one `kind="angle"` callout whose
+/// view-space `a` endpoint sits at the geometric centre of the view outline
+/// (50, 35). `place_dimensions` produces a degenerate callout anchored at
+/// sheet-space `(a_sheet + (2, −2))`. The ViewGeometry rect spans the outline
+/// [0,0]×[100,70] in view-space, which maps to the same region in sheet space.
+/// The text anchor is therefore inside the geometry rect → DimensionText bbox
+/// intersects ViewGeometry bbox → `DimensionOnGeometry` fires.
+///
+/// `passed` must be `false` — `DimensionOnGeometry` is `Severity::Error`.
+///
+/// Mutation proof: gut `check_dimension_on_geometry` (return early) →
+/// `report.has(DimensionOnGeometry)` returns `false` → RED. Restore → GREEN.
+#[test]
+fn dimension_on_geometry_flagged() {
+    // FRONT view: 100×70 outline at pos=[100, 150] on A3 (h=297).
+    // View-space centre: (50, 35).
+    // Sheet-space centre: x = 100+50=150, y = (297-150)-35 = 112.
+    // Degenerate text_anchor: (152, 110) — inside geometry rect.
+    let mut d = Drawing::new("DimOnGeom", SheetSize::A3);
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [100.0, 150.0],
+        100.0,
+        70.0,
+        vec![Dimension2d {
+            id: "on_silhouette".to_string(),
+            kind: "angle".to_string(),
+            value: 0.0,
+            unit: "deg".to_string(),
+            label: "0.00°".to_string(),
+            a: [50.0, 35.0],
+            b: [50.0, 35.0],
+            entities: Vec::new(),
+            axis3: None,
+            dir3: None,
+        }],
+    ));
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::DimensionOnGeometry),
+        "on-silhouette callout must be flagged; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "DimensionOnGeometry is Severity::Error");
+}
+
+/// DETECTOR PROOF — `UndimensionedView` (permanent invariant, Warning severity).
+///
+/// Construction: one FRONT view with geometry but no dimension callouts.
+/// `check_undimensioned_views` must emit a `Warning`-severity finding.
+///
+/// CRITICAL: `passed` MUST remain `true` because `UndimensionedView` is
+/// `Severity::Warning`, not `Error`. Both assertions are load-bearing: the
+/// first confirms detection, the second confirms Warning does not gate the report.
+///
+/// Rationale for Warning: a view can legitimately carry zero dims when its
+/// features read best from a sibling view (e.g. a depth dimension on FRONT
+/// is clear from TOP). The drafter must confirm the omission is intentional.
+///
+/// Mutation proof: gut `check_undimensioned_views` (return early) →
+/// `report.has(UndimensionedView)` returns `false` → RED. Restore → GREEN.
+#[test]
+fn undimensioned_view_warns_but_passes() {
+    // Single FRONT view with a 50×40 outline but no dimensions. The
+    // absence of dims on an orthographic view with visible geometry must
+    // trigger a Warning; the report must still `passed = true`.
+    let mut d = Drawing::new("UndimensionedView", SheetSize::A3);
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [100.0, 150.0],
+        50.0,
+        40.0,
+        vec![], // deliberately no dimensions
+    ));
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::UndimensionedView),
+        "bare orthographic view must trigger UndimensionedView warning; issues={:?}",
+        report.issues
+    );
+    assert!(
+        report.passed,
+        "UndimensionedView is Warning-only — passed must stay true; issues={:?}",
+        report.issues
+    );
+}
+
 /// DETECTOR PROOF (permanent invariant): views so tightly packed that the
 /// collision-resolver exhausts all four fallback slots and still cannot
 /// separate the labels — `ViewLabelCollision` must fire.
