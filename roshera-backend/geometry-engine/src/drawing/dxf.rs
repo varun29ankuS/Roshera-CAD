@@ -62,6 +62,10 @@ const LAYER_NOTES: &str = "NOTES";
 const LAYER_VIEW_LABELS: &str = "VIEW_LABELS";
 /// Layer for dimension callout TEXT entities.
 const LAYER_DIMENSIONS: &str = "DIMENSIONS";
+/// Layer for hole-tag callout TEXT entities ("A1", "B2", …) in the axial view.
+const LAYER_HOLE_TAGS: &str = "HOLE_TAGS";
+/// Layer for hole-table border LWPOLYLINE entities and cell TEXT entities.
+const LAYER_HOLE_TABLE: &str = "HOLE_TABLE";
 
 // AutoCAD Color Index (ACI) values used for layer colours. ACI 7 is
 // the "ByLayer" default that renders black on a white background and
@@ -96,6 +100,8 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     register_layer(&mut dxf, LAYER_NOTES, ACI_BLACK);
     register_layer(&mut dxf, LAYER_VIEW_LABELS, ACI_BLACK);
     register_layer(&mut dxf, LAYER_DIMENSIONS, ACI_BLACK);
+    register_layer(&mut dxf, LAYER_HOLE_TAGS, ACI_BLACK);
+    register_layer(&mut dxf, LAYER_HOLE_TABLE, ACI_BLACK);
     // One layer per view, named after the view. Duplicate names are
     // resolved by suffixing with an index — AutoCAD requires layer
     // names to be unique, and two views legitimately can share a
@@ -271,22 +277,32 @@ fn emit_view_polylines(
     }
 }
 
-/// Emit view-label and dimension-text TEXT entities from the layout model.
+/// Emit view-label, dimension-text, hole-tag, and hole-table TEXT/LWPOLYLINE
+/// entities from the layout model.
 ///
 /// View labels come from the layout's [`SheetItemKind::ViewLabel`] items
 /// (SVG anchor = `bbox.x0`, baseline = `bbox.y1`). Dimension text comes
 /// directly from `SheetLayout.dimensions` — each [`PlacedDimension`] carries
 /// the exact `text_anchor` and `text_rot_deg` the SVG renderer inks, so the
 /// DXF mirrors the SVG for BOTH horizontal and rotated (vertical) callouts.
-/// This is the single authoritative placement path for annotation text.
+///
+/// Hole-tag callouts come from `SheetLayout.hole_tags` (the same
+/// [`PlacedHoleTag`] list the SVG renderer inks). Each tag becomes a centred
+/// TEXT on `LAYER_HOLE_TAGS`.
+///
+/// Hole-table cells are emitted from the layout's
+/// [`SheetItemKind::HoleTableText`] items (TEXT on `LAYER_HOLE_TABLE`) and
+/// [`SheetItemKind::HoleTableBorder`] items (LWPOLYLINE rectangles on
+/// `LAYER_HOLE_TABLE`). This guarantees SVG/DXF parity: both consume the
+/// same layout items, so a layout the verifier certifies is equally correct
+/// in both output formats.
 ///
 /// **DXF y-up conversion:** `y_dxf = sheet_h − y_svg` for positions.
 /// **Rotation conversion:** SVG's y-down frame negates angles relative to
-/// DXF's y-up frame, so `rot_dxf = −text_rot_deg`. The SVG's vertical dim
-/// text (`rotate(-90 …)`, reading bottom-to-top) becomes +90° in the DXF —
-/// still reading bottom-to-top on the printed sheet.
+/// DXF's y-up frame, so `rot_dxf = −text_rot_deg`.
 ///
 /// [`PlacedDimension`]: super::layout::PlacedDimension
+/// [`PlacedHoleTag`]: super::layout::PlacedHoleTag
 fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64) {
     let layout = compute_layout(drawing);
 
@@ -338,13 +354,104 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
             HorizontalTextJustification::Center,
         );
     }
+
+    // ── Hole-tag callouts ───────────────────────────────────────────────
+    // One centred TEXT per placed hole tag. The SVG renderer uses the tag
+    // bbox centre; here we use the PlacedHoleTag.text_anchor directly
+    // (same value: the bore's axial-view centre after collision offset).
+    // y_dxf = sheet_h − y_svg (y-up conversion).
+    for ht in &layout.hole_tags {
+        let x = ht.text_anchor[0];
+        let y = sheet_h - ht.text_anchor[1];
+        add_text(
+            dxf,
+            LAYER_HOLE_TAGS,
+            x,
+            y,
+            2.6, // HOLE_TAG_FONT_MM — matches the SVG stylesheet
+            0.0,
+            &ht.tag,
+            HorizontalTextJustification::Center,
+        );
+    }
+
+    // ── Hole-table text cells ───────────────────────────────────────────
+    // Emit a TEXT entity for every HoleTableText item. The SVG baseline
+    // is bbox.y1 (y-down); DXF y-up = sheet_h − bbox.y1.
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::HoleTableText)
+    {
+        let text = item.text.as_deref().unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        let x = item.bbox.x0;
+        let y = sheet_h - item.bbox.y1;
+        add_text(
+            dxf,
+            LAYER_HOLE_TABLE,
+            x,
+            y,
+            2.6, // TABLE_TEXT_FONT_MM — matches the SVG stylesheet
+            0.0,
+            text,
+            HorizontalTextJustification::Left,
+        );
+    }
+
+    // ── Hole-table border LWPOLYLINE entities ───────────────────────────
+    // Every HoleTableBorder item (outer rect or thin separator) becomes an
+    // LWPOLYLINE on LAYER_HOLE_TABLE. Separators have a thin dimension in
+    // one axis (≈0.2 mm); we emit the full bbox rectangle in both cases
+    // (AutoCAD / BricsCAD will display them as the appropriate thin line
+    // once the layer line-weight is set). y_dxf = sheet_h − y_svg, so the
+    // SVG y0 (top in y-down) becomes the DXF y1 (top in y-up), and vice
+    // versa — the four corners are emitted in CCW order.
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::HoleTableBorder)
+    {
+        let b = &item.bbox;
+        // DXF y-up: y_dxf = sheet_h − y_svg
+        let y_bottom = sheet_h - b.y1; // SVG y1 (y-down bottom) → DXF bottom
+        let y_top = sheet_h - b.y0; // SVG y0 (y-down top) → DXF top
+                                    // Emit a closed rectangle as a 5-vertex open LWPOLYLINE (first vertex
+                                    // repeated as the last). The dxf crate does not expose an is_closed
+                                    // setter on LwPolyline — repeating the start vertex achieves the same
+                                    // visual result in every AutoCAD-compatible reader.
+        let mut lw = LwPolyline::default();
+        let corners = [
+            (b.x0, y_bottom),
+            (b.x1, y_bottom),
+            (b.x1, y_top),
+            (b.x0, y_top),
+            (b.x0, y_bottom), // close the rectangle
+        ];
+        lw.vertices = corners
+            .iter()
+            .map(|&(x, y)| {
+                let mut v = LwPolylineVertex::default();
+                v.x = x;
+                v.y = y;
+                v
+            })
+            .collect();
+        let mut common = EntityCommon::default();
+        common.layer = LAYER_HOLE_TABLE.to_string();
+        let mut ent = Entity::new(EntityType::LwPolyline(lw));
+        ent.common = common;
+        dxf.add_entity(ent);
+    }
 }
 
 /// Emit the three-column title block as LINE + TEXT entities on
 /// LAYER_TITLEBLOCK / LAYER_TITLEBLOCK_TEXT.
 fn emit_title_block(dxf: &mut DxfDrawing, drawing: &Drawing) {
     let sheet = &drawing.sheet_size;
-    let (ml, mr, _mt, mb) = frame_margins(sheet);
+    let (_ml, mr, _mt, mb) = frame_margins(sheet);
     let (tb_w, tb_h) = title_block_size(sheet);
     // Title block sits in the bottom-right corner of the inner frame.
     let frame_right = sheet.width() - mr;

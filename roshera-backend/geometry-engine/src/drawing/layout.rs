@@ -449,9 +449,18 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // geometry. DimensionText bboxes are derived from `PlacedDimension`
     // anchors so the verifier sees exactly the same model the renderer
     // inks — no independent recomputation.
+    //
+    // Build the tabled-face-id set once from the drawing's hole sites so
+    // `place_dimensions` can suppress position dims for tabled bores.
+    let tabled_face_ids: std::collections::HashSet<u32> = drawing
+        .hole_sites
+        .iter()
+        .flat_map(|s| s.face_entities.iter().copied())
+        .collect();
+
     let mut all_placed: Vec<PlacedDimension> = Vec::new();
     for (idx, view) in drawing.views.iter().enumerate() {
-        let pds = place_dimensions(view, h, idx);
+        let pds = place_dimensions(view, h, idx, &tabled_face_ids);
         for pd in &pds {
             let font = DIM_TEXT_FONT_MM;
             let text_w = pd.label.chars().count() as f64 * GLYPH_ADVANCE_EM * font;
@@ -818,10 +827,35 @@ fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
 /// Angle / point callouts become leader-free `PlacedDimension` entries
 /// with degenerate (zero-length) `line` / `ext` / arrows positioned at
 /// the label anchor — the renderer skips drawing lines/arrows for those.
+///
+/// # Tabled-position suppression
+///
+/// When `tabled_face_ids` is non-empty, every dimension with
+/// `kind == "position"` whose entity set intersects `tabled_face_ids`
+/// is DROPPED from the general dimension stack. These positions are
+/// represented in the hole table (X/Y columns) and tag callouts;
+/// rendering them again as stacked dim lines would be redundant and
+/// confusing for the machinist.
+///
+/// Interaction with `qualifies_for_baseline`: the baseline oracle applies
+/// only to the remaining (untabled) position dims. With all bores tabled,
+/// no baseline stack is drawn at all — the hole table IS the baseline.
+///
+/// # Baseline-or-nothing for untabled positions (Deliverable 3 rule)
+///
+/// The untabled position dims render ONLY as an ISO 129-1 BASELINE stack:
+/// when this view carries ≥3 of them sharing one datum edge
+/// ([`qualifies_for_baseline`](super::hole_table::qualifies_for_baseline)),
+/// they join the `horiz`/`vert` stacks below, where the ascending-span sort
+/// produces exactly the baseline arrangement — one shared datum extension
+/// coordinate, parallel dim lines, smallest span nearest the part. With <3
+/// qualifying positions nothing renders (a lone corner offset is not
+/// chained; honest omission beats a nonstandard callout).
 pub(crate) fn place_dimensions(
     view: &ProjectedView,
     sheet_h: f64,
     owner: usize,
+    tabled_face_ids: &std::collections::HashSet<u32>,
 ) -> Vec<PlacedDimension> {
     let Some(gr) = view_geometry_rect(view, sheet_h) else {
         return Vec::new();
@@ -838,7 +872,37 @@ pub(crate) fn place_dimensions(
     let mut vert: Vec<Lin> = Vec::new();
     let mut result: Vec<PlacedDimension> = Vec::new();
 
+    // Tabled-position predicate: this bore's X/Y live in the hole table.
+    let is_tabled = |d: &crate::drawing::dimensioning::Dimension2d| -> bool {
+        d.kind == "position"
+            && !tabled_face_ids.is_empty()
+            && d.entities.iter().any(|eid| tabled_face_ids.contains(eid))
+    };
+
+    // Baseline qualification is decided on the UNTABLED positions only —
+    // a tabled bore's position must neither render nor help its untabled
+    // neighbours reach the ≥3 threshold.
+    let untabled_positions: Vec<crate::drawing::dimensioning::Dimension2d> = view
+        .dimensions
+        .iter()
+        .filter(|d| d.kind == "position" && !is_tabled(d))
+        .cloned()
+        .collect();
+    let baseline = super::hole_table::qualifies_for_baseline(&untabled_positions);
+
     for d in &view.dimensions {
+        // Tabled-position suppression: skip position dims whose entity set
+        // intersects any tabled bore's face ids. These X/Y positions are
+        // represented in the hole table and must not appear again in the
+        // general dimension stack.
+        if is_tabled(d) {
+            continue;
+        }
+        // Baseline-or-nothing: untabled positions render only as a
+        // qualifying baseline stack (see doc comment above).
+        if d.kind == "position" && !baseline {
+            continue;
+        }
         let a = dim_to_sheet(view, sheet_h, d.a);
         let b = dim_to_sheet(view, sheet_h, d.b);
         let dx = (a[0] - b[0]).abs();
@@ -1090,6 +1154,76 @@ mod tests {
             );
         }
         assert!(!layout.dimensions.is_empty());
+    }
+
+    fn pos_dim(label: &str, a: [f64; 2], b: [f64; 2]) -> crate::drawing::dimensioning::Dimension2d {
+        crate::drawing::dimensioning::Dimension2d {
+            id: label.to_string(),
+            kind: "position".to_string(),
+            value: 0.0,
+            unit: "mm".to_string(),
+            label: label.to_string(),
+            a,
+            b,
+            entities: vec![9],
+            axis3: None,
+            dir3: None,
+        }
+    }
+
+    /// Deliverable 3 RULE: untabled position dims render ONLY as a baseline
+    /// stack — a view carrying fewer than three of them draws none at all
+    /// (tabled bores carry their positions in the hole table; a lone corner
+    /// offset is not chained).
+    ///
+    /// Mutation proof: remove the `qualifies_for_baseline` gate in
+    /// `place_dimensions` → both positions render → RED.
+    #[test]
+    fn positions_below_baseline_threshold_are_suppressed() {
+        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 150.0]);
+        view.dimensions = vec![
+            pos_dim("8.00", [-10.0, -8.0], [-2.0, -8.0]),
+            pos_dim("14.00", [-10.0, -4.0], [4.0, -4.0]),
+        ];
+        let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
+        assert!(
+            placed.is_empty(),
+            "2 position dims must not render as a chained stack; got {:?}",
+            placed.iter().map(|p| &p.label).collect::<Vec<_>>()
+        );
+    }
+
+    /// ≥3 untabled positions sharing a datum edge render as an ISO 129-1
+    /// BASELINE stack: every dim line starts at the shared datum coordinate,
+    /// the lines are parallel, and the stack ascends smallest-first (nearest
+    /// the part), so extension lines never cross.
+    #[test]
+    fn three_positions_from_one_datum_render_as_baseline_stack() {
+        let mut view = simple_view("TOP", ProjectionType::Top, [100.0, 150.0]);
+        // Three horizontal positions from the view's left datum edge
+        // (view-space x = −10 → sheet x = 100 + (−10) = 90).
+        view.dimensions = vec![
+            pos_dim("16.00", [-10.0, 0.0], [6.0, 0.0]),
+            pos_dim("8.00", [-10.0, -8.0], [-2.0, -8.0]),
+            pos_dim("12.00", [-10.0, -4.0], [2.0, -4.0]),
+        ];
+        let placed = place_dimensions(&view, 297.0, 0, &std::collections::HashSet::new());
+        assert_eq!(placed.len(), 3, "baseline mode renders all three positions");
+        for p in &placed {
+            assert!(
+                (p.line[0][0] - 90.0).abs() < 1e-9,
+                "every baseline dim line starts at the shared datum x; got {:?}",
+                p.line
+            );
+        }
+        // Ascending: smallest span nearest the part, stack levels increasing.
+        let labels: Vec<&str> = placed.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["8.00", "12.00", "16.00"], "ascending span order");
+        assert!(
+            placed[0].line[0][1] < placed[1].line[0][1]
+                && placed[1].line[0][1] < placed[2].line[0][1],
+            "parallel dim lines stacked ascending below the part"
+        );
     }
 
     /// `compute_layout` must be a pure function of the drawing — calling it

@@ -78,6 +78,14 @@ pub struct HoleSite {
     pub is_through: bool,
     /// View-space centre of the bore in the axial view (used for tag callout).
     pub axial_centre: Option<[f64; 2]>,
+    /// B-Rep face entity ids for this bore (from the diameter record).
+    ///
+    /// Used by the dimension-placement filter to suppress `kind == "position"`
+    /// dimensions whose entity set intersects this bore's faces — those positions
+    /// are represented in the hole table's X/Y columns and must NOT also appear
+    /// in the general dimension stack (`place_dimensions` tabled-position suppression).
+    #[serde(default)]
+    pub face_entities: Vec<u32>,
 }
 
 // ── Group key ─────────────────────────────────────────────────────────────────
@@ -160,6 +168,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
         y_label: String,
         is_through: bool,
         depth_label: String,
+        face_entities: Vec<u32>,
     }
 
     let mut raw: Vec<RawSite> = Vec::new();
@@ -246,6 +255,10 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             .unwrap_or((0.0, "—".to_string()));
 
         let key = GroupKey::new(diameter_mm, is_through);
+        // Capture the bore's face entity ids from the diameter record.
+        // These are propagated to HoleSite.face_entities so the dimension
+        // placement filter can suppress tabled position dims.
+        let face_entities = ents.clone();
 
         raw.push(RawSite {
             key,
@@ -257,6 +270,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             y_label,
             is_through,
             depth_label,
+            face_entities,
         });
     }
 
@@ -317,6 +331,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             depth_label: s.depth_label.clone(),
             is_through: s.is_through,
             axial_centre: None, // filled by the drawing layer
+            face_entities: s.face_entities.clone(),
         });
     }
 
@@ -325,49 +340,53 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
 
 // ── Baseline detection ────────────────────────────────────────────────────────
 
-/// True when a view carries ≥3 position dimensions all referencing the
-/// same datum origin (within 0.5 mm), qualifying for ISO 129-1 baseline
-/// (ordinate) dimensioning.
+/// True when a view carries ≥3 position dimensions measured from one shared
+/// datum EDGE, qualifying for ISO 129-1 baseline dimensioning.
 ///
-/// When baseline mode is active, position dimensions are NOT rendered as
-/// individual stacked callouts; instead they appear ONLY in the hole table
-/// (as X/Y columns), and the view shows only a baseline tick at the datum
-/// edge.
+/// # Datum-edge semantics (not datum-point)
+///
+/// Baseline dims share a datum EDGE of the part, not a single point: three
+/// X offsets from the left edge start at the same x but each runs at its own
+/// bore's y. So positions are grouped by orientation — horizontal (dx ≥ dy)
+/// versus vertical — exactly as `place_dimensions` classifies them, and a
+/// group qualifies when it has ≥3 members whose min endpoint coordinate
+/// ALONG the measured axis coincides within 0.5 mm (the extraction measures
+/// offsets from the AABB min corner, so the datum end is always the min end).
+///
+/// # Interplay with the hole table (Deliverable 3 rule)
+///
+/// Position dims reach the sheet through exactly two channels:
+/// 1. **Tabled bores** — the hole table's X/Y columns. `place_dimensions`
+///    drops their position dims from the general stack (keyed by
+///    `HoleSite::face_entities`), so this oracle never sees them.
+/// 2. **Untabled positions** — a BASELINE stack, rendered iff this oracle
+///    returns `true` for the untabled remainder. With every bore tabled
+///    (the common case) no baseline stack is drawn: the hole table IS the
+///    baseline. With <3 qualifying positions nothing renders — honest
+///    omission beats a nonstandard chained callout.
 pub fn qualifies_for_baseline(view_dims: &[crate::drawing::dimensioning::Dimension2d]) -> bool {
-    let positions: Vec<_> = view_dims.iter().filter(|d| d.kind == "position").collect();
-    if positions.len() < 3 {
-        return false;
-    }
-    // All position dims must share the same datum (same direction sign and
-    // similar anchor coordinates — the datum origin is the fixed endpoint).
-    // Use the direction to identify the datum edge. Two dims share a datum
-    // if their min-coord endpoint (a or b, whichever is closer to the datum)
-    // coincides within 0.5 mm in view-space.
-    let datum_end = |d: &crate::drawing::dimensioning::Dimension2d| -> [f64; 2] {
-        // The datum endpoint is the one whose position is smaller (closer to
-        // the part corner origin in view-space).
-        let dx = d.a[0] - d.b[0];
-        let dy = d.a[1] - d.b[1];
-        if dx.abs() > dy.abs() {
-            if d.a[0] < d.b[0] {
-                d.a
-            } else {
-                d.b
-            }
+    // Datum coordinate of each position span, keyed by orientation.
+    let mut h_datums: Vec<f64> = Vec::new(); // x of horizontal spans' min end
+    let mut v_datums: Vec<f64> = Vec::new(); // y of vertical spans' min end
+    for d in view_dims.iter().filter(|d| d.kind == "position") {
+        let dx = (d.a[0] - d.b[0]).abs();
+        let dy = (d.a[1] - d.b[1]).abs();
+        if dx < 1e-6 && dy < 1e-6 {
+            continue; // degenerate span carries no datum information
+        }
+        if dx >= dy {
+            h_datums.push(d.a[0].min(d.b[0]));
         } else {
-            if d.a[1] < d.b[1] {
-                d.a
-            } else {
-                d.b
-            }
+            v_datums.push(d.a[1].min(d.b[1]));
+        }
+    }
+    let shares_edge = |coords: &[f64]| -> bool {
+        coords.len() >= 3 && {
+            let r = coords[0];
+            coords.iter().all(|&c| (c - r).abs() < 0.5)
         }
     };
-    let ref_end = datum_end(positions[0]);
-    positions[1..].iter().all(|p| {
-        let e = datum_end(p);
-        let dist = ((e[0] - ref_end[0]).powi(2) + (e[1] - ref_end[1]).powi(2)).sqrt();
-        dist < 0.5
-    })
+    shares_edge(&h_datums) || shares_edge(&v_datums)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -535,5 +554,51 @@ mod tests {
         assert_eq!(tag_letter(25), "Z");
         assert_eq!(tag_letter(26), "AA");
         assert_eq!(tag_letter(27), "AB");
+    }
+
+    fn pos2d(label: &str, a: [f64; 2], b: [f64; 2]) -> crate::drawing::dimensioning::Dimension2d {
+        crate::drawing::dimensioning::Dimension2d {
+            id: label.to_string(),
+            kind: "position".to_string(),
+            value: 0.0,
+            unit: "mm".to_string(),
+            label: label.to_string(),
+            a,
+            b,
+            entities: vec![1],
+            axis3: None,
+            dir3: None,
+        }
+    }
+
+    /// ISO 129-1 baseline qualification is per datum EDGE, not per datum
+    /// point: three horizontal position spans all starting at x = 0 but at
+    /// DIFFERENT heights (each bore has its own cross-section row) share the
+    /// part's left datum edge and must qualify. Two positions never qualify,
+    /// and three spans with scattered start coordinates share no datum.
+    #[test]
+    fn baseline_requires_three_positions_sharing_a_datum_edge() {
+        let three = vec![
+            pos2d("8.00", [0.0, 2.0], [8.0, 2.0]),
+            pos2d("14.00", [0.0, 6.0], [14.0, 6.0]),
+            pos2d("20.00", [0.0, 10.0], [20.0, 10.0]),
+        ];
+        assert!(
+            qualifies_for_baseline(&three),
+            "3 positions from one datum edge (shared x=0, differing y) qualify"
+        );
+        assert!(
+            !qualifies_for_baseline(&three[..2]),
+            "2 positions never qualify for a baseline stack"
+        );
+        let scattered = vec![
+            pos2d("8.00", [0.0, 2.0], [8.0, 2.0]),
+            pos2d("14.00", [3.0, 6.0], [17.0, 6.0]),
+            pos2d("20.00", [7.0, 10.0], [27.0, 10.0]),
+        ];
+        assert!(
+            !qualifies_for_baseline(&scattered),
+            "scattered datum coordinates do not qualify"
+        );
     }
 }

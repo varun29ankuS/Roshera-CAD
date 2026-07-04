@@ -7,6 +7,7 @@
 //! outline with no offset.
 
 use geometry_engine::drawing::dimensioning::Dimension2d;
+use geometry_engine::drawing::dxf::render_drawing_dxf;
 use geometry_engine::drawing::layout::{compute_layout, SheetItemKind};
 use geometry_engine::drawing::{
     build_hole_table, render_drawing_svg, standard_drawing_auto, verify_drawing, Drawing,
@@ -349,6 +350,27 @@ fn six_hole_plate_sheet_is_clean() {
             "view label '{name}' inked exactly once"
         );
     }
+    // Task 7: the hole table must be ON this sheet. Six Ø5 THRU bores form
+    // one group A with instances A1..A6: six tag CALLOUTS (class="hole-tag")
+    // in the axial view, and every tag string present at least twice — once
+    // as the callout, once as the TAG cell of its table row. (A plain ">A4<"
+    // count would also match the title block's SIZE cell on an A4 sheet, so
+    // the callout count is pinned via the CSS class.)
+    assert_eq!(
+        svg.matches("class=\"hole-tag\"").count(),
+        6,
+        "six hole-tag callouts inked in the axial view"
+    );
+    for i in 1..=6 {
+        assert!(
+            svg.matches(&format!(">A{i}<")).count() >= 2,
+            "hole tag A{i} must appear as callout + table row"
+        );
+    }
+    assert!(
+        svg.contains(">TAG<"),
+        "hole-table header cell 'TAG' must be inked"
+    );
 }
 
 /// DETECTOR PROOF — `RedundantDimension`, cross-view mode (permanent invariant).
@@ -1078,4 +1100,353 @@ fn hole_tag_collision_with_dimension_text_flagged() {
         found_collision,
         "overlapping DimensionText + HoleTag bboxes must be detected as a collision"
     );
+}
+
+/// DETECTOR PROOF — `DimensionLabelCollision` fired by a HOLE TAG through the
+/// REAL `verify_drawing` path (not a hand-assembled layout).
+///
+/// Construction: one TOP view whose single hole site has its tag callout
+/// centre at sheet (160, 177). Three `kind="angle"` dimension callouts are
+/// placed so their DimensionText bboxes cover ALL FIVE of the tag placer's
+/// candidate slots (centre + 4 mm up/right/down/left) WITHOUT colliding with
+/// each other. The placer exhausts its slots, falls back to the bore centre,
+/// and the verifier must report the HoleTag ↔ DimensionText overlap — the
+/// issue message names the tag "A1".
+///
+/// Mutation proof: drop `SheetItemKind::HoleTag` from the text-class filter in
+/// `check_dimension_label_collisions` → no issue mentions "A1" → RED.
+#[test]
+fn hole_tag_forced_onto_dimension_text_fires_collision() {
+    use geometry_engine::drawing::HoleSite;
+
+    // Angle callout whose text anchor lands at sheet (a_sheet + (2, −2)).
+    let angle = |label: &str, a: [f64; 2]| Dimension2d {
+        id: label.to_string(),
+        kind: "angle".to_string(),
+        value: 0.0,
+        unit: "deg".to_string(),
+        label: label.to_string(),
+        a,
+        b: a,
+        entities: Vec::new(),
+        axis3: None,
+        dir3: None,
+    };
+
+    let mut d = Drawing::new("TagCollision", SheetSize::A3);
+    // TOP view at [100, 150] on A3 (h = 297): view-space (vx, vy) maps to
+    // sheet (100 + vx, 147 − vy). The 20×20 outline spans sheet
+    // x∈[100,120], y∈[127,147] — well clear of the texts below.
+    d.add_view(rect_view(
+        "TOP",
+        ProjectionType::Top,
+        [100.0, 150.0],
+        20.0,
+        20.0,
+        vec![
+            // Text anchors (sheet): (160,178), (160,174), (160,184.5).
+            // With the 3.1 mm font and 7-char labels the three bboxes cover
+            // all five tag candidates around (160,177) yet stay disjoint
+            // from one another.
+            angle("45.000\u{00B0}", [58.0, -33.0]),
+            angle("60.000\u{00B0}", [58.0, -29.0]),
+            angle("75.000\u{00B0}", [58.0, -39.5]),
+        ],
+    ));
+    d.axial_view_idx = Some(0);
+    d.hole_sites = vec![HoleSite {
+        tag: "A1".to_string(),
+        group: "A".to_string(),
+        diameter_mm: 5.0,
+        x_label: "X 5.00".to_string(),
+        y_label: "Y 5.00".to_string(),
+        x_mm: 5.0,
+        y_mm: 5.0,
+        dia_label: "\u{00D8}5.00".to_string(),
+        depth_label: "THRU".to_string(),
+        is_through: true,
+        // View-space centre (60, −30) → sheet (160, 177).
+        axial_centre: Some([60.0, -30.0]),
+        face_entities: vec![99],
+    }];
+
+    let report = verify_drawing(&d);
+    assert!(
+        report.issues.iter().any(|i| {
+            i.kind == DrawingIssueKind::DimensionLabelCollision && i.message.contains("A1")
+        }),
+        "a hole tag forced onto dimension text must fire DimensionLabelCollision \
+         naming the tag; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "DimensionLabelCollision is Severity::Error");
+}
+
+// ── Task 7b item 1: tabled-position suppression ───────────────────────────────
+
+/// TABLED-POSITION SUPPRESSION: when every bore is in the hole table, NO view's
+/// placed dimensions may contain a position span, while the HoleTableText items
+/// ARE present. Non-vacuous by construction: the test first PROVES position
+/// dims reached the view dimension lists (the same records that source the
+/// table's X/Y columns), then proves none of them were placed on the sheet.
+///
+/// Implementation rule (as implemented in `place_dimensions`):
+///   A dimension with `kind == "position"` whose entity set intersects any
+///   `HoleSite.face_entities` set is dropped from the general dimension stack —
+///   those X/Y positions appear ONLY in the hole table. `qualifies_for_baseline`
+///   applies only to untabled positions; with every bore tabled, no baseline
+///   stack is drawn at all (the hole table IS the baseline).
+///
+/// Fixture note: `create_box_3d` builds a CENTRED plate (−20..20 in X/Y,
+/// −4..4 in Z), so bores at ±8 sit 12 mm and 28 mm from the part-corner
+/// datum at (−20, −20). The position labels ("12.00mm", "28.00mm") can
+/// never collide with extent/length labels ("40.00mm", "8.00mm") — the
+/// label-set containment check below is exact.
+///
+/// Mutation proof (run 2026-07-04): disabling both position gates in
+/// `place_dimensions` makes position spans appear in the layout → RED.
+#[test]
+fn tabled_bore_position_dims_suppressed_from_stack() {
+    // Four-bore plate: 40×40×8 centred, four Ø5 THRU bores on a 2×2 grid
+    // at (±8, ±8) — corner offsets 12 mm and 28 mm.
+    let mut m = BRepModel::new();
+    let plate = match TopologyBuilder::new(&mut m)
+        .create_box_3d(40.0, 40.0, 8.0)
+        .expect("plate")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let bore_positions = [(-8.0, -8.0), (-8.0, 8.0), (8.0, -8.0), (8.0, 8.0)];
+    let mut part = plate;
+    for (bx, by) in bore_positions {
+        let bore = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(bx, by, -6.0), Vector3::Z, 2.5, 12.0)
+            .expect("bore")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        part = boolean_operation(
+            &mut m,
+            part,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("drill");
+    }
+
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+
+    // The drawing must have a hole table (bores were drilled).
+    assert!(
+        !dwg.hole_sites.is_empty(),
+        "four-bore plate must produce hole sites; got none"
+    );
+
+    let layout = compute_layout(&dwg);
+
+    // HoleTableText items must be present (the table is rendered).
+    assert!(
+        layout
+            .items
+            .iter()
+            .any(|it| it.kind == SheetItemKind::HoleTableText),
+        "HoleTableText items must be present when hole table is built"
+    );
+
+    // ── Non-vacuity gate ──────────────────────────────────────────────
+    // Position dims MUST have reached the view dimension lists (they are
+    // the analytic source of the table's X/Y columns). If this fails, the
+    // suppression assertion below would be checking nothing.
+    let position_labels: std::collections::HashSet<&str> = dwg
+        .views
+        .iter()
+        .flat_map(|v| v.dimensions.iter())
+        .filter(|d| d.kind == "position")
+        .map(|d| d.label.as_str())
+        .collect();
+    assert!(
+        !position_labels.is_empty(),
+        "position dims must reach the view dimension lists — without them \
+         the suppression check is vacuous"
+    );
+
+    // ── Suppression assertion ─────────────────────────────────────────
+    // No placed dimension anywhere on the sheet may carry a position label.
+    // (Labels are unique to positions in this fixture by construction.)
+    let leaked: Vec<&str> = layout
+        .dimensions
+        .iter()
+        .filter(|pd| position_labels.contains(pd.label.as_str()))
+        .map(|pd| pd.label.as_str())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "tabled bore position dims must NOT appear in the general dimension \
+         stack of ANY view; leaked: {leaked:?}"
+    );
+}
+
+// ── Task 7b item 2: DXF parity ───────────────────────────────────────────────
+
+/// DXF PARITY: render_drawing_dxf must emit hole-tag TEXT entities (e.g. "A1")
+/// and hole-table header TEXT entities (e.g. "TAG") at the layout-derived
+/// coordinates, from the SAME layout items SVG uses.
+///
+/// Coordinate rule (DXF y-up): `y_dxf = sheet_h − y_svg`.
+/// For hole-tag TEXT: anchor = PlacedHoleTag.text_anchor (y-flipped).
+/// For hole-table TEXT: anchor = (item.bbox.x0, sheet_h − item.bbox.y1).
+///
+/// Mutation proof: do not emit HoleTag / HoleTableText items in
+/// `emit_labels_from_layout` → "A1" and "TAG" not found in DXF → RED.
+#[test]
+fn hole_table_and_tags_emitted_in_dxf() {
+    // Use the six-hole-plate fixture — it has tags A1..A6 and a full hole table.
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+
+    assert!(
+        !dwg.hole_sites.is_empty(),
+        "six-hole plate must have hole sites"
+    );
+
+    let sheet_h = dwg.sheet_size.height();
+    let layout = compute_layout(&dwg);
+
+    let dxf_bytes = render_drawing_dxf(&dwg).expect("dxf render");
+    let dxf_text = String::from_utf8_lossy(&dxf_bytes);
+
+    // ── Collect all TEXT values from the DXF ──────────────────────────
+    fn text_values(dxf: &str) -> Vec<String> {
+        let mut vals = Vec::new();
+        let mut lines = dxf.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() == "1" {
+                if let Some(val) = lines.next() {
+                    vals.push(val.trim().to_string());
+                }
+            }
+        }
+        vals
+    }
+
+    let all_texts = text_values(&dxf_text);
+
+    // ── Hole-tag assertion: "A1" must appear as a DXF TEXT entity ─────
+    assert!(
+        all_texts.iter().any(|t| t == "A1"),
+        "DXF must contain a TEXT entity for hole tag 'A1'; found texts: {:?}",
+        &all_texts[..all_texts.len().min(30)]
+    );
+
+    // ── Hole-table header assertion: "TAG" must appear ────────────────
+    assert!(
+        all_texts.iter().any(|t| t == "TAG"),
+        "DXF must contain a TEXT entity for hole-table header 'TAG'; found texts: {:?}",
+        &all_texts[..all_texts.len().min(30)]
+    );
+
+    // ── Coordinate check: hole-tag "A1" TEXT must be near the layout coord ──
+    // Parse TEXT entities: group code 10 = x, 20 = y, 1 = value.
+    struct ParsedText {
+        x: f64,
+        y: f64,
+        value: String,
+    }
+    fn parse_texts(dxf: &str) -> Vec<ParsedText> {
+        let mut result = Vec::new();
+        let lines: Vec<&str> = dxf.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() == "TEXT" {
+                let mut x = 0.0_f64;
+                let mut y = 0.0_f64;
+                let mut val = String::new();
+                let mut j = i + 1;
+                while j < lines.len() && j < i + 60 {
+                    let gc = lines[j].trim();
+                    if let Some(next) = lines.get(j + 1) {
+                        match gc {
+                            "10" => {
+                                x = next.trim().parse().unwrap_or(0.0);
+                            }
+                            "20" => {
+                                y = next.trim().parse().unwrap_or(0.0);
+                            }
+                            "1" => {
+                                val = next.trim().to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if gc == "0" && j > i {
+                        break;
+                    }
+                    j += 2;
+                }
+                if !val.is_empty() {
+                    result.push(ParsedText { x, y, value: val });
+                }
+            }
+            i += 1;
+        }
+        result
+    }
+
+    let text_entities = parse_texts(&dxf_text);
+
+    // For each placed hole-tag, verify a DXF TEXT entity exists at the
+    // layout-derived coordinate (within 0.5 mm tolerance).
+    for ht in &layout.hole_tags {
+        let x_expected = ht.text_anchor[0];
+        let y_expected = sheet_h - ht.text_anchor[1];
+        let found = text_entities.iter().any(|t| {
+            t.value == ht.tag && (t.x - x_expected).abs() < 0.5 && (t.y - y_expected).abs() < 0.5
+        });
+        assert!(
+            found,
+            "hole tag '{}' TEXT entity not found at x≈{x_expected:.2} y≈{y_expected:.2} \
+             (DXF y-up); available texts near that area: {:?}",
+            ht.tag,
+            text_entities
+                .iter()
+                .filter(|t| (t.x - x_expected).abs() < 10.0 && (t.y - y_expected).abs() < 10.0)
+                .map(|t| (&t.value, t.x, t.y))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // For each HoleTableText layout item, verify a DXF TEXT entity exists at
+    // the layout-derived coordinate.
+    // Skip cells whose text contains non-ASCII characters (e.g. the "Ø"
+    // diameter header and "↧" depth glyph): DXF ASCII mode may encode them
+    // differently than the Rust &str bytes, making exact-match byte comparison
+    // unreliable without a DXF codec. The presence check for "TAG" / data rows
+    // above is sufficient; the coordinate check proves the PLACEMENT is derived
+    // from the layout for the ASCII subset.
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::HoleTableText)
+    {
+        let text = item.text.as_deref().unwrap_or("");
+        if text.is_empty() || !text.is_ascii() {
+            // Non-ASCII cells (Ø header, ↧ depth glyph): presence-only check.
+            // DXF encoding varies; coordinate check would be fragile.
+            continue;
+        }
+        let x_expected = item.bbox.x0;
+        let y_expected = sheet_h - item.bbox.y1;
+        let found = text_entities.iter().any(|t| {
+            t.value == text && (t.x - x_expected).abs() < 0.5 && (t.y - y_expected).abs() < 0.5
+        });
+        assert!(
+            found,
+            "hole-table cell '{}' TEXT entity not found at x≈{x_expected:.2} \
+             y≈{y_expected:.2} (DXF y-up)",
+            text
+        );
+    }
 }

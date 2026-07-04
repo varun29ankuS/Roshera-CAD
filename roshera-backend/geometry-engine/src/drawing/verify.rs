@@ -435,11 +435,27 @@ fn check_alignment(
 ///    (`entities` is empty) are skipped here; they legitimately appear in
 ///    multiple views to give context.
 ///
+///    **Tabled-position exception**: `kind == "position"` dimensions whose
+///    entity set intersects a tabled bore's `face_entities` are excluded from
+///    this check. Position dims for tabled bores are represented in the hole
+///    table (X/Y columns) rather than the general dim stack, so their
+///    appearance in multiple views is by design — both views carry the dim for
+///    view-space completeness, but neither is rendered as a redundant callout.
+///
 /// 2. **Same-view same-interval**: within one view, two dimensions with the
 ///    same orientation (H or V) have interval endpoints that coincide within
 ///    0.5 mm in sheet space. This catches "10.00 plate-thickness + 10.00
 ///    bore-length both stacked on the same vertical interval in FRONT".
 fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<DrawingIssue>) {
+    // Build the tabled-face-id set from the drawing's hole sites (same set
+    // that `place_dimensions` uses to suppress rendering). Position dims for
+    // tabled bores are excluded from the cross-view duplicate check.
+    let tabled_face_ids: std::collections::HashSet<u32> = drawing
+        .hole_sites
+        .iter()
+        .flat_map(|s| s.face_entities.iter().copied())
+        .collect();
+
     // ── Cross-view entity check ──────────────────────────────────────────
     // Key: (sorted entity ids, kind) → Vec<view_name>. Only for non-empty
     // entity lists (named features, not whole-part extents).
@@ -448,6 +464,15 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
         for v in &drawing.views {
             for d in &v.dimensions {
                 if d.entities.is_empty() {
+                    continue;
+                }
+                // Tabled-position exception: skip position dims for tabled bores.
+                // These are correctly in multiple views for projection purposes but
+                // rendered only in the hole table, not as redundant dim callouts.
+                if d.kind == "position"
+                    && !tabled_face_ids.is_empty()
+                    && d.entities.iter().any(|eid| tabled_face_ids.contains(eid))
+                {
                     continue;
                 }
                 let mut sorted = d.entities.clone();

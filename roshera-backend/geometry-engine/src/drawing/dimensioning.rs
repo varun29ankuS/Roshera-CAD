@@ -64,6 +64,11 @@ impl Dimension2d {
 ///   * diameter — across the feature: `anchor → anchor − direction·value`
 ///   * length / extent — along the axis, centred on the anchor:
 ///     `anchor ∓ direction·(value/2)`
+///   * position — from the part-corner datum to the bore axis. The
+///     extraction anchors position records at the MIDPOINT between the
+///     datum corner and the axis with `direction` pointing corner→axis,
+///     so the same centred-span formula recovers the true span:
+///     `p0` = the datum-corner end, `p1` = the bore axis.
 ///   * angle — a point callout at the anchor.
 /// Both endpoints are projected through `projection`, so a callout that
 /// measures a direction perpendicular to the view collapses to a near-zero
@@ -79,7 +84,7 @@ pub fn auto_dimensions(
         let dir = Vector3::new(d.direction[0], d.direction[1], d.direction[2]);
         let (p0, p1) = match d.kind.as_str() {
             "diameter" | "radius" => (anchor, anchor - dir * d.value),
-            "length" | "extent" => (
+            "length" | "extent" | "position" => (
                 anchor - dir * (d.value * 0.5),
                 anchor + dir * (d.value * 0.5),
             ),
