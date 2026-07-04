@@ -530,6 +530,21 @@ export interface PinnedMeasurement {
   row: DimensionRow
 }
 
+// ─── Dimension kind filter ───────────────────────────────────────────
+/**
+ * The chip-filterable dimension kinds (ui-units polish, spec section 4).
+ * `diameter` also covers kernel `radius` rows (one Ø chip); kinds not
+ * listed here (angles, interactive-measure kinds) are never filtered.
+ * Shared by the scene store default, the `DimensionKindChips` UI, and
+ * the `PartDimensions` row filter so all three stay in lock-step.
+ */
+export const ALL_DIMENSION_KINDS = [
+  'extent',
+  'diameter',
+  'length',
+  'position',
+] as const
+
 // ─── Scene store ─────────────────────────────────────────────────────
 interface SceneState {
   // Objects
@@ -612,6 +627,17 @@ interface SceneState {
    * mutation) matching the `selectedIds` pattern.
    */
   showDimensions: Set<string>
+
+  /**
+   * Which dimension-kind chips are visible in the dimension layer.
+   * Members are chip keys from {@link ALL_DIMENSION_KINDS}; default is
+   * all-on. Kinds not governed by a chip (angles, measure results) are
+   * always visible. Reset to all-on when the layer empties
+   * (`removeObject` dropping the last dimensioned object, `clearScene`)
+   * so a new session never inherits a half-filtered view. Set
+   * replacement, never mutation.
+   */
+  dimensionKindFilter: Set<string>
 
   /**
    * User-pinned interactive measurements. See {@link PinnedMeasurement}.
@@ -717,6 +743,11 @@ interface SceneState {
    * Set replacement (never mutation), matching the `selectedIds` pattern.
    */
   toggleDimensions: (objectId: string) => void
+  /**
+   * Toggle one dimension-kind chip on/off. `kind` is a member of
+   * {@link ALL_DIMENSION_KINDS}. Set replacement, never mutation.
+   */
+  toggleDimensionKind: (kind: string) => void
   /** Append a pinned measurement (id must be unique — caller generates it). */
   pinMeasurement: (measurement: PinnedMeasurement) => void
   /** Remove a pinned measurement by pin id. No-op when absent. */
@@ -1002,6 +1033,7 @@ const sceneCreator: StateCreator<
     },
     labelsVisible: false,
     showDimensions: new Set<string>(),
+    dimensionKindFilter: new Set<string>(ALL_DIMENSION_KINDS),
     pinnedMeasurements: [],
     sectionView: {
       enabled: false,
@@ -1141,6 +1173,14 @@ const sceneCreator: StateCreator<
         const pinnedMeasurements = state.pinnedMeasurements.filter(
           (p) => p.a.objectId !== id && p.b?.objectId !== id,
         )
+        // Kind filter is layer-global (not per-object), so per-id
+        // cleanup doesn't apply — but when the last dimensioned object
+        // leaves, reset to all-on so the next session never inherits a
+        // half-filtered view from a scene that no longer exists.
+        const dimensionKindFilter =
+          showDimensions.size === 0
+            ? new Set<string>(ALL_DIMENSION_KINDS)
+            : state.dimensionKindFilter
         return {
           objects,
           objectOrder: state.objectOrder.filter((oid) => oid !== id),
@@ -1148,6 +1188,7 @@ const sceneCreator: StateCreator<
           hoveredId: state.hoveredId === id ? null : state.hoveredId,
           showDimensions,
           pinnedMeasurements,
+          dimensionKindFilter,
         }
       }),
 
@@ -1161,6 +1202,7 @@ const sceneCreator: StateCreator<
         serverSketches: new Map(),
         hiddenSketchIds: new Set(),
         showDimensions: new Set(),
+        dimensionKindFilter: new Set<string>(ALL_DIMENSION_KINDS),
         pinnedMeasurements: [],
       }),
 
@@ -1287,6 +1329,17 @@ const sceneCreator: StateCreator<
           next.add(objectId)
         }
         return { showDimensions: next }
+      }),
+
+    toggleDimensionKind: (kind) =>
+      set((state) => {
+        const next = new Set(state.dimensionKindFilter)
+        if (next.has(kind)) {
+          next.delete(kind)
+        } else {
+          next.add(kind)
+        }
+        return { dimensionKindFilter: next }
       }),
 
     pinMeasurement: (measurement) =>

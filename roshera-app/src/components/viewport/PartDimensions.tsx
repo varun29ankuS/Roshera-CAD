@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Html, Line } from '@react-three/drei'
 import * as THREE from 'three'
 import { X } from 'lucide-react'
@@ -13,6 +13,11 @@ import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
  * Renders inside the R3F `<Canvas>` scene graph so all positions track
  * camera orbit / pan / zoom automatically via drei's `<Html>` and
  * `<Line>`.
+ *
+ * Labels arrive unit-formatted from the kernel (e.g. "Ø0.236in") and are
+ * displayed VERBATIM (minus the axis-prefix strip below) — this layer
+ * performs zero unit conversion; a document-unit change re-fires the
+ * fetch via `unitEpoch` (see use-part-dimensions).
  *
  * ## Render forms (Amendment A2)
  * Three per-row forms, routed by kind:
@@ -34,36 +39,53 @@ import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
  * Rows carrying a `datum` additionally contribute a datum marker glyph
  * (deduped by origin) so position numbers visibly reference it.
  *
+ * ## Display polish (ui-units spec section 4)
+ *   - **Model-locked text scale**: every annotation `<Html>` carries
+ *     `distanceFactor={HTML_DISTANCE_FACTOR}` so the text scales WITH
+ *     the dimension graphics (which are world-sized lines/cones) — the
+ *     badge keeps the same apparent size relative to the model and its
+ *     own arrows at any zoom, exactly like text on the 2D sheet. The
+ *     value is tuned to reproduce the previous on-screen size at the
+ *     default camera distance (see the constant's doc).
+ *   - **Stacked standoffs**: linear dims sharing a span axis + lane are
+ *     staggered deterministically (see {@link computeStandoffs}).
+ *   - **Kind filter**: rows whose chip (`extent` / `diameter` /
+ *     `length` / `position`) is toggled off in
+ *     `dimensionKindFilter` are skipped — including their standoff
+ *     slots and datum markers, so hiding positions also hides the
+ *     datums nothing references anymore. Chips UI lives in CADViewport.
+ *   - **Hover linking**: hovering a badge tints the row's entity faces
+ *     (same per-triangle faceIds fan-out as PartLabels' LabelFaceTints)
+ *     and emphasizes the row's datum marker. Hover state is local to
+ *     each ObjectDimensions instance — never global store.
+ *
  * ## Display labels
  * Bare axis/length prefixes ("X " / "Y " / "Z " / "L ") are stripped
- * from DISPLAYED text only — the graphics now carry the direction, so
- * "X 60.00" reads as a clean "60.00" on an X-spanning dimension line.
+ * from DISPLAYED text only — the graphics now carry the direction.
  * Ø / SØ / ∠ prefixes are kept (they are meaning, not axis shorthand).
  * The wire `label` is never modified — drawings still consume it.
  *
  * ## Perpendicular choice
- * All perpendiculars (leader offset, extension ticks, text offset) come
- * from one deterministic rule: cross the dimension direction with
- * world-Y, falling back to world-X when the direction is near-parallel
- * to Y (|dot| > 0.9). Computed from kernel vectors, never from the
- * camera — stable across orbit.
+ * All perpendiculars (leader offset, extension ticks, text offset,
+ * standoff direction) come from one deterministic rule: cross the
+ * dimension direction with world-Y, falling back to world-X when the
+ * direction is near-parallel to Y (|dot| > 0.9). Computed from kernel
+ * vectors, never from the camera — stable across orbit.
  *
  * ## Depth strategy
  * All dimension graphics (span, ticks, arrow cones, datum glyph) render
  * with `depthTest={false}` + `depthWrite={false}` — the house overlay
  * style (`SubElementHighlight` edge lines and vertex marks, `Datums`'
- * origin marker). Annotations draw on top of the part, so they can
- * never z-fight it and a driller can always read them; this beats a
- * surface-offset approach here because dimension lines legitimately lie
- * ON part edges (extents run along the AABB edge).
+ * origin marker). The hover face tint instead follows LabelFaceTints:
+ * inflated 0.002 proud of the surface with the depth test ON, so the
+ * tint reads as paint on the face, not as x-ray.
  *
  * ## pointerEvents
- * Ambient annotations are read-only (`pointerEvents="none"` on `<Html>`,
- * `raycast={() => null}` on every `<Line>`/`<mesh>`) so this layer never
- * intercepts orbit, selection, or sketch clicks. Pinned measurements are
- * the one exception: their ✕ dismiss button re-enables pointer events on
- * JUST that button (CSS `pointer-events: auto` inside a `pointer-events:
- * none` wrapper) — the rest of the pin chip stays click-through.
+ * Lines / cones / tints are never raycast targets
+ * (`raycast={() => null}`). `<Html>` wrappers stay
+ * `pointerEvents="none"`; ONLY badge divs that participate in hover
+ * linking re-enable events locally (`pointer-events-auto`), and the
+ * pinned ✕ button keeps its existing click affordance.
  *
  * ## Pinned measurements
  * Rendered in the app's primary accent tone (visually distinct from the
@@ -120,10 +142,28 @@ interface ObjectDimensionsProps {
 }
 
 /**
+ * Map a kernel row kind to its filter chip, or `null` for kinds no chip
+ * governs (angles, interactive-measure kinds) — those always render.
+ * `radius` shares the Ø chip: both are hole/boss size callouts.
+ */
+function chipKindOf(kind: string): string | null {
+  if (kind === 'extent' || kind === 'length' || kind === 'position') {
+    return kind
+  }
+  if (kind === 'diameter' || kind === 'radius') return 'diameter'
+  return null
+}
+
+/**
  * Fetches the dimension table for one solid and renders its rows plus
  * one datum marker per DISTINCT datum (deduped by origin — every
  * position row of a part typically shares the same part-corner datum,
  * which must render as one glyph, not one per row).
+ *
+ * Also owns the layer-local hover state: the hovered row's entity
+ * faces get a tint overlay and its datum marker is emphasized. State
+ * lives here (per object) rather than in the store — hover is a
+ * transient, render-local concern.
  *
  * Isolated so each toggled object has its own fetch lifecycle and
  * loading state, without coupling the render of one solid to the
@@ -131,30 +171,75 @@ interface ObjectDimensionsProps {
  */
 function ObjectDimensions({ objectId, solidId }: ObjectDimensionsProps) {
   const { dimensions } = usePartDimensions(solidId, true)
+  const kindFilter = useSceneStore((s) => s.dimensionKindFilter)
+  const [hovered, setHovered] = useState<DimensionRow | null>(null)
 
-  // Distinct datums referenced by this part's rows, keyed by origin.
-  // Dedupe is by origin (not name): two descriptors at the same point
-  // are one physical reference; the first row's descriptor wins.
+  // Kind filter runs BEFORE standoffs and datum dedupe: a hidden kind
+  // must not reserve a stagger slot, and datums referenced only by
+  // hidden position rows must not render.
+  const visible = useMemo(
+    () =>
+      dimensions.filter((row) => {
+        const chip = chipKindOf(row.kind)
+        return chip === null || kindFilter.has(chip)
+      }),
+    [dimensions, kindFilter],
+  )
+
+  const standoffs = useMemo(() => computeStandoffs(visible), [visible])
+
+  // Distinct datums referenced by this part's visible rows, keyed by
+  // origin. Dedupe is by origin (not name): two descriptors at the same
+  // point are one physical reference; the first row's descriptor wins.
   const datums = useMemo(() => {
     const map = new Map<string, DatumDescriptor>()
-    for (const row of dimensions) {
+    for (const row of visible) {
       if (!row.datum) continue
       const key = row.datum.origin.join(',')
       if (!map.has(key)) map.set(key, row.datum)
     }
     return Array.from(map.entries())
-  }, [dimensions])
+  }, [visible])
 
-  if (dimensions.length === 0) return null
+  // Derive (don't effect): a hovered row that a fresh fetch or a chip
+  // toggle removed simply stops linking — no set-state-in-effect needed;
+  // the stale reference is dropped on the next hover.
+  const hoveredRow = hovered !== null && visible.includes(hovered) ? hovered : null
+  const hoveredDatumKey = hoveredRow?.datum
+    ? hoveredRow.datum.origin.join(',')
+    : null
+
+  if (visible.length === 0) return null
 
   return (
     <group name={`part-dimensions-${objectId}`}>
-      {dimensions.map((row) => (
-        <DimensionAnnotation key={row.id} row={row} />
+      {visible.map((row) => (
+        <DimensionAnnotation
+          key={row.id}
+          row={row}
+          standoff={standoffs.get(row.id) ?? null}
+          // Hover linking only pays off when there is something to
+          // link: entity faces to tint or a datum to emphasize.
+          onHoverChange={
+            row.entities.length > 0 || row.datum
+              ? (hovering) => setHovered(hovering ? row : null)
+              : undefined
+          }
+        />
       ))}
       {datums.map(([key, datum]) => (
-        <DatumMarker key={key} datum={datum} />
+        <DatumMarker
+          key={key}
+          datum={datum}
+          emphasized={key === hoveredDatumKey}
+        />
       ))}
+      {hoveredRow !== null && hoveredRow.entities.length > 0 && (
+        <DimensionFaceTints
+          objectId={objectId}
+          entityIds={hoveredRow.entities}
+        />
+      )}
     </group>
   )
 }
@@ -225,7 +310,126 @@ function displayLabel(label: string): string {
   return label.replace(/^[XYZL]\s+/, '')
 }
 
+// ─── Stacked standoffs ───────────────────────────────────────────────
+
+/**
+ * Stagger step between successive dims in one stack. ~3.5 mm world at
+ * default zoom — a badge-height of clearance, inside the spec's 3–4 mm
+ * guidance.
+ */
+const STANDOFF_STEP_MM = 3.5
+
+/**
+ * Lane quantisation for "measured along the same line". Two spans whose
+ * anchors sit within one bin of each other perpendicular to the span
+ * axis are treated as sharing a lane and get staggered apart. 4 mm ≈
+ * the visual thickness of a dimension (line + text) at default zoom.
+ */
+const LANE_BIN_MM = 4
+
+/**
+ * Sign-canonicalise a unit direction so +d and −d land in the same
+ * stack group (a span along −X shares the corner edge with one along
+ * +X): flip so the first non-zero component is positive.
+ */
+function canonicalDirection(d: THREE.Vector3): THREE.Vector3 {
+  const c = d.clone()
+  const eps = 1e-6
+  const flip =
+    c.x < -eps ||
+    (Math.abs(c.x) <= eps &&
+      (c.y < -eps || (Math.abs(c.y) <= eps && c.z < -eps)))
+  return flip ? c.negate() : c
+}
+
+/**
+ * Deterministic ISO-129-style stacking (ui-units polish item 2).
+ *
+ * Groups the LINEAR rows by (sign-canonicalised unit direction, rough
+ * perpendicular lane) — the lane is the anchor's component perpendicular
+ * to the span axis, binned to {@link LANE_BIN_MM} so near-collinear dims
+ * (e.g. two X-position dims sharing the datum corner edge, or the X
+ * extent along the same edge) fall in one group. Within a group, rows
+ * sort by value ascending (ties broken by row id for total determinism);
+ * the smallest stays at its kernel position and each successive row is
+ * offset k·{@link STANDOFF_STEP_MM} along the group's canonical
+ * perpendicular. Non-linear rows never stack (leader form has no span).
+ *
+ * Pure function of the row list — same rows in, same offsets out, every
+ * render, every orbit.
+ */
+function computeStandoffs(
+  rows: DimensionRow[],
+): Map<string, THREE.Vector3> {
+  const groups = new Map<string, DimensionRow[]>()
+
+  for (const row of rows) {
+    if (!isLinear(row.kind) || row.direction === null) continue
+    const dir = canonicalDirection(
+      new THREE.Vector3(...row.direction).normalize(),
+    )
+    const anchor = new THREE.Vector3(...row.anchor)
+    // Lane = anchor with its along-span component removed, binned.
+    const residual = anchor.clone().addScaledVector(dir, -anchor.dot(dir))
+    const key = [
+      dir.x.toFixed(3),
+      dir.y.toFixed(3),
+      dir.z.toFixed(3),
+      Math.round(residual.x / LANE_BIN_MM),
+      Math.round(residual.y / LANE_BIN_MM),
+      Math.round(residual.z / LANE_BIN_MM),
+    ].join('|')
+    const group = groups.get(key)
+    if (group) {
+      group.push(row)
+    } else {
+      groups.set(key, [row])
+    }
+  }
+
+  const out = new Map<string, THREE.Vector3>()
+  for (const group of groups.values()) {
+    if (group.length < 2) continue
+    group.sort(
+      (a, b) => a.value - b.value || a.id.localeCompare(b.id),
+    )
+    // One shared perpendicular per group (from the canonical direction)
+    // so every member staggers to the SAME side in consistent steps.
+    const first = group[0]
+    const dir0 = canonicalDirection(
+      new THREE.Vector3(
+        ...(first.direction as [number, number, number]),
+      ).normalize(),
+    )
+    const perp = stablePerpendicular(dir0)
+    group.forEach((row, i) => {
+      if (i === 0) return // smallest span stays at the kernel position
+      out.set(row.id, perp.clone().multiplyScalar(i * STANDOFF_STEP_MM))
+    })
+  }
+  return out
+}
+
 // ─── DimBadge ────────────────────────────────────────────────────────
+
+/**
+ * Apparent-size factor for every annotation `<Html>` in this layer.
+ *
+ * With `distanceFactor`, drei scales the HTML like a world-space object
+ * (scale = factor / (2·tan(fov/2)·distance) for the perspective camera,
+ * factor·zoom for the orthographic one), so the text zooms WITH the
+ * dimension graphics instead of staying a fixed pixel size — readable
+ * when zoomed out relative to everything else on screen, never
+ * billboard-huge over a small part.
+ *
+ * PartLabels does not use distanceFactor (its chips are pick-targets
+ * that must stay finger-sized), so per the spec the value is tuned to
+ * reproduce this layer's previous on-screen size at the DEFAULT camera:
+ * scale = 1 wants factor = 2·tan(fov/2)·distance with the app's
+ * PERSPECTIVE_FOV = 50 (CameraController) and the ~30-unit default
+ * camera distance (CAMERA_PRESETS): 2·tan(25°)·30 ≈ 28.
+ */
+const HTML_DISTANCE_FACTOR = 28
 
 /**
  * Read-only annotation badge rendered via drei `<Html>`. Replicates
@@ -238,18 +442,40 @@ function displayLabel(label: string): string {
  * interactive editing which this read-only layer does not need. A
  * `DimBadge` here avoids entangling the dimension layer with the sketch
  * store state that `SketchOverlay` depends on, and keeps the import
- * graph clean. The visual output is identical to the read-only
- * `DimLabel` variant (no `onCommit`).
+ * graph clean.
+ *
+ * When `onHoverChange` is provided the badge div (and ONLY the div —
+ * the `<Html>` wrapper stays `pointerEvents="none"`) re-enables pointer
+ * events for hover linking; leaders and span lines stay raycast-null,
+ * so the badge is the layer's single hoverable surface.
  */
-function DimBadge({ position, text }: { position: THREE.Vector3; text: string }) {
+function DimBadge({
+  position,
+  text,
+  onHoverChange,
+}: {
+  position: THREE.Vector3
+  text: string
+  onHoverChange?: (hovering: boolean) => void
+}) {
+  const hoverable = onHoverChange !== undefined
   return (
     <Html
       position={position}
       center
       pointerEvents="none"
       zIndexRange={[100, 0]}
+      distanceFactor={HTML_DISTANCE_FACTOR}
     >
-      <div className="px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/80 border border-border/60 text-foreground backdrop-blur-sm whitespace-nowrap select-none pointer-events-none">
+      <div
+        onPointerEnter={hoverable ? () => onHoverChange(true) : undefined}
+        onPointerLeave={hoverable ? () => onHoverChange(false) : undefined}
+        className={`px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/80 border border-border/60 text-foreground backdrop-blur-sm whitespace-nowrap select-none ${
+          hoverable
+            ? 'pointer-events-auto cursor-default hover:border-foreground/60'
+            : 'pointer-events-none'
+        }`}
+      >
         {text}
       </div>
     </Html>
@@ -301,14 +527,27 @@ interface ArrowTransform {
  * extension tick at each endpoint, and the value billboard centred on
  * the span offset off the line.
  *
+ * `standoff` (from {@link computeStandoffs}) translates the WHOLE
+ * graphic — span, ticks, arrows, text — perpendicular to the span so
+ * stacked dims in one lane don't overlap.
+ *
  * Everything here is DISPLAY geometry derived from kernel-provided
  * `anchor` / `direction` / `value` — no value is computed frontend-side.
  */
-function LinearDimensionGraphic({ row }: { row: DimensionRow }) {
+function LinearDimensionGraphic({
+  row,
+  standoff,
+  onHoverChange,
+}: {
+  row: DimensionRow
+  standoff: THREE.Vector3 | null
+  onHoverChange?: (hovering: boolean) => void
+}) {
   const geo = useMemo(() => {
     // Router guarantees direction is non-null for linear rows.
     const dir = new THREE.Vector3(...(row.direction as [number, number, number])).normalize()
     const anchor = new THREE.Vector3(...row.anchor)
+    if (standoff) anchor.add(standoff)
     const half = row.value / 2
     const p1 = anchor.clone().addScaledVector(dir, -half)
     const p2 = anchor.clone().addScaledVector(dir, half)
@@ -341,7 +580,7 @@ function LinearDimensionGraphic({ row }: { row: DimensionRow }) {
     const textPos = anchor.clone().addScaledVector(perp, TEXT_OFFSET_MM)
 
     return { p1, p2, ext1, ext2, arrow1, arrow2, textPos }
-  }, [row])
+  }, [row, standoff])
 
   return (
     <>
@@ -395,7 +634,11 @@ function LinearDimensionGraphic({ row }: { row: DimensionRow }) {
           />
         </mesh>
       ))}
-      <DimBadge position={geo.textPos} text={displayLabel(row.label)} />
+      <DimBadge
+        position={geo.textPos}
+        text={displayLabel(row.label)}
+        onHoverChange={onHoverChange}
+      />
     </>
   )
 }
@@ -417,10 +660,20 @@ const DATUM_LABEL_OFFSET = new THREE.Vector3(1, 1, 1)
  * bracket a machinist clamps against) plus a tiny name billboard. The
  * driller must SEE what the position numbers reference.
  *
+ * `emphasized` (hover linking): while a position dim referencing this
+ * datum is hovered, the arms render thicker and fully opaque so the
+ * eye jumps from the number to its reference.
+ *
  * Same depth strategy as the dimension graphics: `depthTest={false}` so
  * the reference marker is always visible, even inside the part corner.
  */
-function DatumMarker({ datum }: { datum: DatumDescriptor }) {
+function DatumMarker({
+  datum,
+  emphasized,
+}: {
+  datum: DatumDescriptor
+  emphasized: boolean
+}) {
   const geo = useMemo(() => {
     const origin = new THREE.Vector3(...datum.origin)
     const arms: Array<[THREE.Vector3, THREE.Vector3]> = [
@@ -439,8 +692,8 @@ function DatumMarker({ datum }: { datum: DatumDescriptor }) {
           key={i}
           points={points}
           color={DATUM_AXIS_COLORS[i]}
-          lineWidth={2}
-          opacity={0.9}
+          lineWidth={emphasized ? 3.5 : 2}
+          opacity={emphasized ? 1 : 0.9}
           transparent
           depthTest={false}
           depthWrite={false}
@@ -452,18 +705,152 @@ function DatumMarker({ datum }: { datum: DatumDescriptor }) {
   )
 }
 
+// ─── Hover face tint ─────────────────────────────────────────────────
+
+// Amber, not the blue selection accent: hover linking must read as
+// "this face belongs to that number" without impersonating (or hiding
+// under) the SubElementHighlight selection fill, which is the blue
+// accent at higher opacity. Same hue family as the Datums origin
+// marker (#f1c40f).
+const HOVER_TINT_COLOR = '#f1c40f'
+// Matches TINT_OFFSET in PartLabels' LabelFaceTints / the picking
+// highlight: inflate just proud of the surface so the tint wins the
+// depth test without z-fighting.
+const HOVER_TINT_OFFSET = 0.002
+
+/**
+ * Paints the triangles of the hovered dimension's entity faces, using
+ * the SAME per-triangle `faceIds` fan-out as PartLabels'
+ * `LabelFaceTints` (and the picking highlight): every triangle whose
+ * `faceIds[t]` is one of the row's `entities` belongs to a referenced
+ * B-Rep face. Unlike LabelFaceTints we already KNOW the owning object
+ * (dimensions are per-part), so there is no cross-solid search — one
+ * merged inflated geometry, one draw call.
+ *
+ * Depth test stays ON (tint = paint on the face, matching the
+ * house tint pattern), unlike the always-on-top dimension lines.
+ */
+function DimensionFaceTints({
+  objectId,
+  entityIds,
+}: {
+  objectId: string
+  entityIds: number[]
+}) {
+  const meshRefs = useSceneStore((s) => s.meshRefs)
+  const objects = useSceneStore((s) => s.objects)
+
+  const positions = useMemo(() => {
+    const obj = objects.get(objectId)
+    const faceIds = obj?.mesh.faceIds
+    if (!obj || !faceIds) return null
+    const mesh = meshRefs.get(objectId)
+    const geom = mesh?.geometry
+    if (!mesh || !geom) return null
+    const posAttr = geom.getAttribute('position') as
+      | THREE.BufferAttribute
+      | undefined
+    if (!posAttr) return null
+    const indexAttr = geom.getIndex()
+    mesh.updateWorldMatrix(true, false)
+    const world = mesh.matrixWorld
+    const wanted = new Set(entityIds)
+
+    const tris: number[] = []
+    const a = new THREE.Vector3()
+    const b = new THREE.Vector3()
+    const c = new THREE.Vector3()
+    const ab = new THREE.Vector3()
+    const ac = new THREE.Vector3()
+    const n = new THREE.Vector3()
+
+    for (let t = 0; t < faceIds.length; t++) {
+      if (!wanted.has(faceIds[t])) continue
+      const i0 = t * 3
+      let vi0: number, vi1: number, vi2: number
+      if (indexAttr) {
+        if (i0 + 2 >= indexAttr.count) continue
+        vi0 = indexAttr.getX(i0)
+        vi1 = indexAttr.getX(i0 + 1)
+        vi2 = indexAttr.getX(i0 + 2)
+      } else {
+        vi0 = i0
+        vi1 = i0 + 1
+        vi2 = i0 + 2
+      }
+      if (
+        vi0 >= posAttr.count ||
+        vi1 >= posAttr.count ||
+        vi2 >= posAttr.count
+      ) {
+        continue
+      }
+      a.fromBufferAttribute(posAttr, vi0).applyMatrix4(world)
+      b.fromBufferAttribute(posAttr, vi1).applyMatrix4(world)
+      c.fromBufferAttribute(posAttr, vi2).applyMatrix4(world)
+      ab.subVectors(b, a)
+      ac.subVectors(c, a)
+      n.crossVectors(ab, ac).normalize()
+      tris.push(
+        a.x + n.x * HOVER_TINT_OFFSET, a.y + n.y * HOVER_TINT_OFFSET, a.z + n.z * HOVER_TINT_OFFSET,
+        b.x + n.x * HOVER_TINT_OFFSET, b.y + n.y * HOVER_TINT_OFFSET, b.z + n.z * HOVER_TINT_OFFSET,
+        c.x + n.x * HOVER_TINT_OFFSET, c.y + n.y * HOVER_TINT_OFFSET, c.z + n.z * HOVER_TINT_OFFSET,
+      )
+    }
+    return tris.length > 0 ? new Float32Array(tris) : null
+  }, [objectId, entityIds, meshRefs, objects])
+
+  const geometry = useMemo(() => {
+    if (!positions) return null
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    g.computeVertexNormals()
+    return g
+  }, [positions])
+
+  // Hover tints mount/unmount constantly — dispose the GPU buffer on
+  // replacement/unmount (CADMesh's discipline, not LabelFaceTints'
+  // leak-on-unmount).
+  useEffect(() => {
+    return () => {
+      geometry?.dispose()
+    }
+  }, [geometry])
+
+  if (!geometry) return null
+
+  return (
+    <mesh geometry={geometry} raycast={() => null}>
+      <meshBasicMaterial
+        color={HOVER_TINT_COLOR}
+        side={THREE.DoubleSide}
+        transparent
+        opacity={0.3}
+        depthWrite={false}
+      />
+    </mesh>
+  )
+}
+
 // ─── Single annotation (kind router) ─────────────────────────────────
 
 interface DimensionAnnotationProps {
   row: DimensionRow
+  standoff: THREE.Vector3 | null
+  onHoverChange?: (hovering: boolean) => void
 }
 
 /**
  * Route one row to its render form: linear → full dimension graphics;
  * direction-less → bare badge at the anchor; everything else
- * (diameter / radius / angle) → the leader + badge form.
+ * (diameter / radius / angle) → the leader + badge form. Standoffs
+ * apply to linear rows only (leader forms have no span to stack).
  */
-function DimensionAnnotation({ row }: DimensionAnnotationProps) {
+function DimensionAnnotation({
+  row,
+  standoff,
+  onHoverChange,
+}: DimensionAnnotationProps) {
   // Memoised per row: the row object identity only changes when a fresh
   // fetch lands, so the Vector3s (anchor, leader endpoint) are computed
   // once per fetch instead of on every render of every annotation.
@@ -479,12 +866,24 @@ function DimensionAnnotation({ row }: DimensionAnnotationProps) {
   }, [row])
 
   if (isLinear(row.kind) && row.direction !== null) {
-    return <LinearDimensionGraphic row={row} />
+    return (
+      <LinearDimensionGraphic
+        row={row}
+        standoff={standoff}
+        onHoverChange={onHoverChange}
+      />
+    )
   }
 
   if (endVec === null) {
     // No direction to draw with: badge at the anchor, no graphics.
-    return <DimBadge position={anchorVec} text={displayLabel(row.label)} />
+    return (
+      <DimBadge
+        position={anchorVec}
+        text={displayLabel(row.label)}
+        onHoverChange={onHoverChange}
+      />
+    )
   }
 
   // Leader form (diameter / radius / angle): leader from anchor to the
@@ -503,7 +902,11 @@ function DimensionAnnotation({ row }: DimensionAnnotationProps) {
         depthWrite={false}
         raycast={() => null}
       />
-      <DimBadge position={endVec} text={displayLabel(row.label)} />
+      <DimBadge
+        position={endVec}
+        text={displayLabel(row.label)}
+        onHoverChange={onHoverChange}
+      />
     </>
   )
 }
@@ -523,7 +926,8 @@ function DimensionAnnotation({ row }: DimensionAnnotationProps) {
  * The outer `<Html>` keeps `pointerEvents="none"` so the chip never
  * blocks orbit; `pointer-events` is an inherited CSS property, so the
  * ✕ button re-enables it locally with `pointer-events-auto`. Only that
- * button is clickable.
+ * button is clickable. Same `distanceFactor` as every other annotation
+ * in the layer so pins scale with the model too.
  */
 function PinnedMeasurementAnnotation({ pin }: { pin: PinnedMeasurement }) {
   const dismissMeasurement = useSceneStore((s) => s.dismissMeasurement)
@@ -539,6 +943,7 @@ function PinnedMeasurementAnnotation({ pin }: { pin: PinnedMeasurement }) {
       center
       pointerEvents="none"
       zIndexRange={[110, 0]}
+      distanceFactor={HTML_DISTANCE_FACTOR}
     >
       <div className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/85 border border-primary/70 text-primary backdrop-blur-sm whitespace-nowrap select-none">
         <span>{pin.row.label}</span>

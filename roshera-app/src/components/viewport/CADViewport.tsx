@@ -23,7 +23,12 @@ import { SketchOverlay } from './SketchOverlay'
 import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
 import { MateSuggestionPopover } from '@/components/panels/MateSuggestionPopover'
-import { isStandardPlane, useSceneStore, type SketchPlane } from '@/stores/scene-store'
+import {
+  ALL_DIMENSION_KINDS,
+  isStandardPlane,
+  useSceneStore,
+  type SketchPlane,
+} from '@/stores/scene-store'
 import { useAssemblyStore } from '@/stores/assembly-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { fetchSectionPreview } from '@/lib/section-api'
@@ -201,6 +206,7 @@ export function CADViewport() {
       <ViewportControls />
       <ViewportReadout />
       <SketchCoordReadout />
+      <DimensionKindChips />
       <ViewportHints />
       <ModeBanner />
       <MatePickHintBanner />
@@ -211,6 +217,72 @@ export function CADViewport() {
       <CSketchDofHud />
       <SketchPanel />
       <MateSuggestionPopover />
+    </div>
+  )
+}
+
+/**
+ * Human-readable chip labels for the dimension-kind filter, in display
+ * order. Keys are the store's {@link ALL_DIMENSION_KINDS}; "Ø" also
+ * covers kernel `radius` rows (see PartDimensions' chipKindOf).
+ */
+const DIMENSION_KIND_LABELS: Record<
+  (typeof ALL_DIMENSION_KINDS)[number],
+  string
+> = {
+  extent: 'Extents',
+  diameter: 'Ø',
+  length: 'Lengths',
+  position: 'Positions',
+}
+
+/**
+ * Floating chip row filtering the dimension layer by kind (ui-units
+ * polish item 3): Extents · Ø · Lengths · Positions. Screen-space UI
+ * (house `cad-panel` style, same overlay pattern as SectionViewPanel /
+ * SketchCoordReadout), NOT an in-canvas billboard.
+ *
+ * Mounts only while at least one object has its dimensions toggled on —
+ * the chips govern a layer that otherwise isn't rendering. State lives
+ * in the scene store (`dimensionKindFilter`, default all-on, reset when
+ * the layer empties); `PartDimensions` consumes the same set to skip
+ * rows, so the chip press and the annotation disappearing are one
+ * store update apart.
+ */
+function DimensionKindChips() {
+  const showDimensions = useSceneStore((s) => s.showDimensions)
+  const kindFilter = useSceneStore((s) => s.dimensionKindFilter)
+  const toggleDimensionKind = useSceneStore((s) => s.toggleDimensionKind)
+
+  if (showDimensions.size === 0) return null
+
+  return (
+    <div className="absolute top-3 left-3 cad-panel px-1.5 py-1 flex items-center gap-1 text-[10px] uppercase tracking-wider">
+      <span className="px-1 text-muted-foreground/70 select-none">Dims</span>
+      {ALL_DIMENSION_KINDS.map((kind) => {
+        const active = kindFilter.has(kind)
+        return (
+          <button
+            key={kind}
+            type="button"
+            onClick={() => toggleDimensionKind(kind)}
+            aria-pressed={active}
+            title={
+              active
+                ? `Hide ${DIMENSION_KIND_LABELS[kind]}`
+                : `Show ${DIMENSION_KIND_LABELS[kind]}`
+            }
+            className={[
+              'px-2 py-0.5 border transition-colors',
+              active
+                ? 'border-border text-foreground bg-accent'
+                : 'border-border/40 text-muted-foreground hover:text-foreground',
+            ].join(' ')}
+          >
+            {DIMENSION_KIND_LABELS[kind]}
+          </button>
+        )
+      })}
     </div>
   )
 }
