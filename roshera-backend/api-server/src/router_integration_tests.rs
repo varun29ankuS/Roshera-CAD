@@ -2574,6 +2574,7 @@ async fn measure_skew_cylinders_returns_422_with_reason() {
 fn map_measure_result_distance_wire_shape() {
     use crate::handlers::agent::{map_measure_result, MeasureResponse};
     use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
 
     let result = MeasureResult::Distance {
         value: 10.0,
@@ -2581,7 +2582,8 @@ fn map_measure_result_distance_wire_shape() {
         direction: [0.0, 0.0, 1.0],
         kind: "plane_plane",
     };
-    let wire: MeasureResponse = map_measure_result(result, 1u32, Some(2u32));
+    let wire: MeasureResponse =
+        map_measure_result(result, 1u32, Some(2u32), LengthUnit::Millimetre);
     assert_eq!(wire.kind, "distance");
     assert_eq!(wire.relation.as_deref(), Some("plane_plane"));
     assert!((wire.value - 10.0).abs() < 1e-12);
@@ -2601,12 +2603,14 @@ fn map_measure_result_distance_wire_shape() {
 fn map_measure_result_angle_wire_shape() {
     use crate::handlers::agent::{map_measure_result, MeasureResponse};
     use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
 
     let result = MeasureResult::Angle {
         degrees: 90.0,
         anchor: [0.0, 0.0, 0.0],
     };
-    let wire: MeasureResponse = map_measure_result(result, 3u32, Some(4u32));
+    let wire: MeasureResponse =
+        map_measure_result(result, 3u32, Some(4u32), LengthUnit::Millimetre);
     assert_eq!(wire.kind, "angle");
     assert!(wire.relation.is_none());
     assert!((wire.value - 90.0).abs() < 1e-12);
@@ -2637,13 +2641,14 @@ fn map_measure_result_angle_wire_shape() {
 fn map_measure_result_diameter_wire_shape() {
     use crate::handlers::agent::{map_measure_result, MeasureResponse};
     use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
 
     let result = MeasureResult::Diameter {
         value: 8.0,
         anchor: [0.0, 0.0, 0.0],
         axis: [0.0, 0.0, 1.0],
     };
-    let wire: MeasureResponse = map_measure_result(result, 5u32, None);
+    let wire: MeasureResponse = map_measure_result(result, 5u32, None, LengthUnit::Millimetre);
     assert_eq!(wire.kind, "diameter");
     assert_eq!(wire.unit, "mm");
     // The Ø prefix is U+00D8.
@@ -2667,13 +2672,14 @@ fn map_measure_result_diameter_wire_shape() {
 fn map_measure_result_face_info_wire_shape() {
     use crate::handlers::agent::{map_measure_result, MeasureResponse};
     use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
 
     let result = MeasureResult::FaceInfo {
         area: 100.0,
         normal: Some([0.0, 0.0, 1.0]),
         anchor: [0.0, 0.0, 0.0],
     };
-    let wire: MeasureResponse = map_measure_result(result, 7u32, None);
+    let wire: MeasureResponse = map_measure_result(result, 7u32, None, LengthUnit::Millimetre);
     assert_eq!(wire.kind, "face_info");
     // Areas are mm² on the wire — "mm" for an area was the M-3 dishonesty
     // this assertion previously pinned.
@@ -2689,4 +2695,260 @@ fn map_measure_result_face_info_wire_shape() {
         wire.label
     );
     assert!(wire.pid.is_none());
+}
+
+// ─── Document units endpoint ──────────────────────────────────────────────────
+
+fn units_get() -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri("/api/document/units")
+        .body(Body::empty())
+        .expect("GET /api/document/units must build")
+}
+
+fn units_patch(token: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::PATCH)
+        .uri("/api/document/units")
+        .header("content-type", "application/json")
+        .body(Body::from(format!("{{\"unit\":\"{}\"}}", token)))
+        .expect("PATCH /api/document/units must build")
+}
+
+/// `GET /api/document/units` must return 200 with `{"unit":"mm"}` on a
+/// freshly-initialised model (the kernel default is Millimetre).
+#[tokio::test]
+async fn document_units_get_default_is_mm() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(&state, units_get()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /api/document/units must be 200; body = {body}"
+    );
+    assert_eq!(
+        body["unit"].as_str(),
+        Some("mm"),
+        "default unit must be mm; body = {body}"
+    );
+}
+
+/// Round-trip: PATCH to \"in\", then GET confirms it.
+#[tokio::test]
+async fn document_units_patch_round_trip() {
+    let state = make_test_state().await;
+
+    // PATCH to inches.
+    let (status, body) = dispatch(&state, units_patch("in")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "PATCH /api/document/units with 'in' must succeed; body = {body}"
+    );
+    assert_eq!(
+        body["unit"].as_str(),
+        Some("in"),
+        "PATCH response must echo the new unit; body = {body}"
+    );
+
+    // GET must reflect the change.
+    let (status, body) = dispatch(&state, units_get()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["unit"].as_str(),
+        Some("in"),
+        "GET after PATCH must return the new unit; body = {body}"
+    );
+}
+
+/// PATCH with an unknown token must return 400 with `error = "invalid_unit"`.
+#[tokio::test]
+async fn document_units_patch_unknown_token_returns_400() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(&state, units_patch("parsecs")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown unit token must give 400; body = {body}"
+    );
+    assert_eq!(
+        body["error"].as_str(),
+        Some("invalid_unit"),
+        "400 must carry error=invalid_unit; body = {body}"
+    );
+    // The `reason` must mention the valid tokens.
+    let reason = body["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("mm") || reason.contains("in"),
+        "reason must list valid tokens; got {:?}",
+        reason
+    );
+}
+
+// ─── Measure formatting in non-default unit ───────────────────────────────────
+
+/// Setting document_unit to Inch then measuring a 10 mm gap should produce
+/// a label containing "0.394" (10 / 25.4 = 0.3937… → 3 dp = "0.394in").
+///
+/// This pins the full round-trip:
+/// PATCH /api/document/units → POST /api/agent/measure → label in inches.
+#[tokio::test]
+async fn measure_label_in_inches_after_unit_switch() {
+    // 10 mm gap between two flat faces.
+    let state = make_test_state().await;
+
+    // Seed two parallel planar faces 10 mm apart.
+    let (solid_id, top_fid, bot_fid) = seed_box_for_measure(&state, 40.0, 40.0, 10.0).await;
+
+    // Switch to inches.
+    let (status, _) = dispatch(&state, units_patch("in")).await;
+    assert_eq!(status, StatusCode::OK, "PATCH to 'in' must succeed");
+
+    // Measure the 10 mm gap.
+    let request = measure_post(json!({
+        "a": { "part_id": solid_id, "kind": "face", "id": top_fid },
+        "b": { "part_id": solid_id, "kind": "face", "id": bot_fid },
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "measure must succeed; body = {body}"
+    );
+
+    assert_eq!(body["unit"].as_str(), Some("in"), "unit field must be 'in'");
+    let label = body["label"].as_str().unwrap_or("");
+    assert!(
+        label.contains("0.394"),
+        "10 mm in inches must contain '0.394'; label = {:?}",
+        label
+    );
+    assert!(
+        label.ends_with("in"),
+        "label must end with 'in'; label = {:?}",
+        label
+    );
+}
+
+// ─── map_measure_result unit-format tests ────────────────────────────────────
+
+/// Distance in inches: 25.4 mm should format as "1.000in".
+#[test]
+fn map_measure_result_distance_in_inches() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
+
+    let result = MeasureResult::Distance {
+        value: 25.4,
+        anchor: [0.0, 0.0, 0.0],
+        direction: [0.0, 0.0, 1.0],
+        kind: "plane_plane",
+    };
+    let wire: MeasureResponse = map_measure_result(result, 1u32, None, LengthUnit::Inch);
+    assert_eq!(wire.unit, "in");
+    assert_eq!(wire.label, "1.000in", "25.4 mm must label as '1.000in'");
+}
+
+/// Diameter in inches: Ø prefix + formatted length.
+#[test]
+fn map_measure_result_diameter_in_inches() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
+
+    let result = MeasureResult::Diameter {
+        value: 25.4,
+        anchor: [0.0, 0.0, 0.0],
+        axis: [0.0, 0.0, 1.0],
+    };
+    let wire: MeasureResponse = map_measure_result(result, 2u32, None, LengthUnit::Inch);
+    assert_eq!(wire.unit, "in");
+    assert!(
+        wire.label.starts_with('\u{00d8}'),
+        "diameter label must start with Ø; got {:?}",
+        wire.label
+    );
+    assert!(
+        wire.label.contains("1.000in"),
+        "diameter label must contain '1.000in'; got {:?}",
+        wire.label
+    );
+}
+
+/// Area in inches: "A " prefix + formatted area.
+#[test]
+fn map_measure_result_face_info_in_inches() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
+
+    // 1 in² = 645.16 mm².
+    let area_mm2 = 25.4 * 25.4;
+    let result = MeasureResult::FaceInfo {
+        area: area_mm2,
+        normal: Some([0.0, 0.0, 1.0]),
+        anchor: [0.0, 0.0, 0.0],
+    };
+    let wire: MeasureResponse = map_measure_result(result, 3u32, None, LengthUnit::Inch);
+    assert_eq!(wire.unit, "in²");
+    assert!(
+        wire.label.starts_with("A "),
+        "face_info label must start with 'A '; got {:?}",
+        wire.label
+    );
+    assert!(
+        wire.label.contains("1.000in²"),
+        "1 in² area must label as 'A 1.000in²'; got {:?}",
+        wire.label
+    );
+}
+
+/// Angle results are always "deg" regardless of document unit.
+#[test]
+fn map_measure_result_angle_unit_is_always_deg() {
+    use crate::handlers::agent::{map_measure_result, MeasureResponse};
+    use geometry_engine::queries::MeasureResult;
+    use geometry_engine::units::LengthUnit;
+
+    let result = MeasureResult::Angle {
+        degrees: 45.0,
+        anchor: [0.0, 0.0, 0.0],
+    };
+    let wire: MeasureResponse = map_measure_result(result, 4u32, None, LengthUnit::Foot);
+    assert_eq!(wire.unit, "deg", "angle unit must always be 'deg'");
+}
+
+// ─── Drawing title-block note per unit ───────────────────────────────────────
+
+/// Building a standard drawing with document_unit = Inch must produce SVG that
+/// contains "ALL DIMENSIONS IN INCHES UNLESS OTHERWISE STATED."
+#[test]
+fn drawing_title_block_note_in_inches() {
+    use geometry_engine::drawing::{render_drawing_svg, standard_drawing_auto};
+    use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+    use geometry_engine::units::LengthUnit;
+
+    let mut model = BRepModel::new();
+    // Set document unit to Inch before building the drawing.
+    model.set_document_unit(LengthUnit::Inch);
+
+    let sid = {
+        let mut b = TopologyBuilder::new(&mut model);
+        match b.create_box_3d(40.0, 40.0, 10.0).expect("box must build") {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid; got {:?}", other),
+        }
+    };
+
+    let drawing = standard_drawing_auto(&model, sid, uuid::Uuid::nil())
+        .expect("standard_drawing_auto must succeed");
+    let svg = render_drawing_svg(&drawing);
+
+    assert!(
+        svg.contains("ALL DIMENSIONS IN INCHES UNLESS OTHERWISE STATED."),
+        "SVG must contain the INCHES unit note; first 2000 chars:\n{}",
+        &svg[..svg.len().min(2000)]
+    );
 }

@@ -492,6 +492,7 @@ pub fn standard_drawing(
     use super::types::{Drawing, ViewSource};
 
     let mut drawing = Drawing::new("Auto Drawing", sheet);
+    drawing.set_unit_notes(model.document_unit());
     let source = ViewSource::Part {
         part_id: part_uuid,
         solid_id,
@@ -530,6 +531,7 @@ pub fn standard_drawing_hlr(
     use super::types::{Drawing, ViewSource};
 
     let mut drawing = Drawing::new("Auto Drawing (HLR)", sheet);
+    drawing.set_unit_notes(model.document_unit());
     let source = ViewSource::Part {
         part_id: part_uuid,
         solid_id,
@@ -816,6 +818,7 @@ pub fn standard_drawing_auto(
 
     // Pass 2 — build the placed, scaled views.
     let mut drawing = Drawing::new("Auto Drawing", sheet);
+    drawing.set_unit_notes(model.document_unit());
     for (i, (proj, name, dimensioned)) in specs.iter().enumerate() {
         let mut view = build_hlr_view(
             model,

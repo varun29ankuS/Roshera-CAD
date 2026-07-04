@@ -374,9 +374,29 @@ pub struct Drawing {
     /// patched via `PATCH /api/drawings/{id}/title-block`.
     #[serde(default)]
     pub title_block: TitleBlock,
+    /// The full "ALL DIMENSIONS IN … UNLESS OTHERWISE STATED" note rendered in
+    /// the notes strip. Set at build time from the model's `document_unit`;
+    /// `#[serde(default)]` keeps older serialized drawings (pre-units) parsing
+    /// and defaults to the millimetre phrasing.
+    #[serde(default = "Drawing::default_unit_note")]
+    pub unit_note: String,
+    /// General-tolerance line rendered below the unit note, e.g.
+    /// "GENERAL TOLERANCES: LINEAR ±0.1 MM, ANGULAR ±0.5°, ISO 2768-m."
+    /// Adjusted to the document unit at build time.
+    #[serde(default = "Drawing::default_tolerance_note")]
+    pub tolerance_note: String,
 }
 
 impl Drawing {
+    fn default_unit_note() -> String {
+        "ALL DIMENSIONS IN MILLIMETRES UNLESS OTHERWISE STATED.".to_string()
+    }
+
+    fn default_tolerance_note() -> String {
+        "GENERAL TOLERANCES: LINEAR \u{00B1}0.1 MM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
+            .to_string()
+    }
+
     pub fn new(name: impl Into<String>, sheet_size: SheetSize) -> Self {
         Self {
             id: DrawingId::new(),
@@ -384,6 +404,8 @@ impl Drawing {
             sheet_size,
             views: Vec::new(),
             title_block: TitleBlock::default(),
+            unit_note: Self::default_unit_note(),
+            tolerance_note: Self::default_tolerance_note(),
         }
     }
 
@@ -404,5 +426,54 @@ impl Drawing {
         let before = self.views.len();
         self.views.retain(|v| v.id != id);
         before != self.views.len()
+    }
+
+    /// Populate [`Self::unit_note`] and [`Self::tolerance_note`] from a
+    /// [`crate::units::LengthUnit`]. Called at drawing-build time so the notes
+    /// are stored on the [`Drawing`] and `render_drawing_svg` stays a pure
+    /// `&Drawing → String` function (no extra parameters).
+    ///
+    /// Unit-name spelling follows engineering convention:
+    /// MILLIMETRES / CENTIMETRES / METRES / INCHES / FEET.
+    ///
+    /// General-tolerance values:
+    /// - Metric (mm/cm/m): ±0.1 MM (LINEAR), ±0.5°, ISO 2768-m
+    /// - Imperial (in/ft): ±0.004 IN (LINEAR), ±0.5°
+    ///
+    /// The cm and m variants scale the ±0.1 mm reference:
+    /// - cm: ±0.01 CM  (0.1 mm ÷ 10)
+    /// - m:  ±0.0001 M (0.1 mm ÷ 1000)
+    pub fn set_unit_notes(&mut self, unit: crate::units::LengthUnit) {
+        use crate::units::LengthUnit;
+        let unit_name = match unit {
+            LengthUnit::Millimetre => "MILLIMETRES",
+            LengthUnit::Centimetre => "CENTIMETRES",
+            LengthUnit::Metre => "METRES",
+            LengthUnit::Inch => "INCHES",
+            LengthUnit::Foot => "FEET",
+        };
+        self.unit_note = format!("ALL DIMENSIONS IN {unit_name} UNLESS OTHERWISE STATED.");
+        self.tolerance_note = match unit {
+            LengthUnit::Millimetre => {
+                "GENERAL TOLERANCES: LINEAR \u{00B1}0.1 MM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
+                    .to_string()
+            }
+            LengthUnit::Centimetre => {
+                "GENERAL TOLERANCES: LINEAR \u{00B1}0.01 CM, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
+                    .to_string()
+            }
+            LengthUnit::Metre => {
+                "GENERAL TOLERANCES: LINEAR \u{00B1}0.0001 M, ANGULAR \u{00B1}0.5\u{00B0}, ISO 2768-m."
+                    .to_string()
+            }
+            LengthUnit::Inch => {
+                "GENERAL TOLERANCES: LINEAR \u{00B1}0.004 IN, ANGULAR \u{00B1}0.5\u{00B0}."
+                    .to_string()
+            }
+            LengthUnit::Foot => {
+                "GENERAL TOLERANCES: LINEAR \u{00B1}0.004 IN, ANGULAR \u{00B1}0.5\u{00B0}."
+                    .to_string()
+            }
+        };
     }
 }

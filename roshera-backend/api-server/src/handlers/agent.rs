@@ -3139,14 +3139,18 @@ pub struct MeasureResponse {
     pub pid: Option<String>,
 }
 
-/// Map a kernel [`MeasureResult`] to the wire shape, given the input face ids.
+/// Map a kernel [`MeasureResult`] to the wire shape, given the input face ids
+/// and the document display unit.
 ///
 /// Pure function — factored out so it can be unit-tested independently of the
-/// async handler and the live router.
+/// async handler and the live router. `unit` must be the model's
+/// `document_unit()` at call time; it drives label and `unit` field formatting.
+/// Angles are always "deg" (no unit conversion).
 pub fn map_measure_result(
     result: geometry_engine::queries::measure::MeasureResult,
     fa: u32,
     fb: Option<u32>,
+    unit: geometry_engine::units::LengthUnit,
 ) -> MeasureResponse {
     use geometry_engine::queries::measure::MeasureResult;
 
@@ -3162,12 +3166,13 @@ pub fn map_measure_result(
             direction,
             kind,
         } => {
-            let label = format!("{:.2}", value);
+            let label = unit.format_len(value);
+            let unit_str = unit.suffix().to_string();
             MeasureResponse {
                 kind: "distance".to_string(),
                 relation: Some(kind.to_string()),
                 value,
-                unit: "mm".to_string(),
+                unit: unit_str,
                 label,
                 anchor,
                 direction: Some(direction),
@@ -3194,12 +3199,14 @@ pub fn map_measure_result(
             anchor,
             axis,
         } => {
-            let label = format!("\u{00d8}{:.2}", value);
+            // Ø prefix (U+00D8) then the formatted length.
+            let label = format!("\u{00d8}{}", unit.format_len(value));
+            let unit_str = unit.suffix().to_string();
             MeasureResponse {
                 kind: "diameter".to_string(),
                 relation: None,
                 value,
-                unit: "mm".to_string(),
+                unit: unit_str,
                 label,
                 anchor,
                 direction: Some(axis),
@@ -3212,14 +3219,16 @@ pub fn map_measure_result(
             normal,
             anchor,
         } => {
-            let label = format!("A {:.1}mm\u{00b2}", area);
+            // "A " prefix then formatted area (e.g. "A 2.48in²").
+            let formatted_area = unit.format_area(area);
+            let label = format!("A {}", formatted_area);
+            // Unit for area = suffix + "²".
+            let unit_str = format!("{}²", unit.suffix());
             MeasureResponse {
                 kind: "face_info".to_string(),
                 relation: None,
                 value: area,
-                // Areas are mm2 - the one wire unit beyond the spec mm|deg
-                // pair; the frontend renderer treats unit as display-opaque.
-                unit: "mm\u{00b2}".to_string(),
+                unit: unit_str,
                 label,
                 anchor,
                 direction: normal,
@@ -3300,9 +3309,10 @@ pub async fn measure(
     // Write lock: `measure` takes `&mut BRepModel` to warm the area cache on
     // first call (matches the pattern established by `query_face`).
     let mut model = model_handle.write().await;
+    let doc_unit = model.document_unit();
     match kernel_measure(&mut model, subj_a, subj_b) {
         Ok(result) => {
-            let wire = map_measure_result(result, fa_id, fb_id);
+            let wire = map_measure_result(result, fa_id, fb_id, doc_unit);
             // `MeasureResponse` contains only f64/String/Option — serialization
             // to `serde_json::Value` cannot fail for these primitive types.
             // `unwrap_or_else` (not `unwrap`) is the safe fallback pattern.

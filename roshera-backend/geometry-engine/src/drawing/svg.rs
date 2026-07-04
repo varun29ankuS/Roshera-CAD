@@ -93,7 +93,7 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     render_view_labels(&mut out, &layout);
 
     // Notes strip in the bottom-left corner of the frame.
-    render_notes_strip(&mut out, frame_x, frame_y + frame_h);
+    render_notes_strip(&mut out, drawing, frame_x, frame_y + frame_h);
 
     // Title block in the bottom-right corner of the frame.
     let tb_x = frame_x + frame_w - tb_w;
@@ -447,7 +447,7 @@ fn dim_text(out: &mut String, x: f64, y: f64, label: &str, rot: f64) {
 // Notes strip (units + default tolerance)
 // ---------------------------------------------------------------------
 
-fn render_notes_strip(out: &mut String, frame_x: f64, frame_bottom: f64) {
+fn render_notes_strip(out: &mut String, drawing: &Drawing, frame_x: f64, frame_bottom: f64) {
     // Three-line note strip anchored to the bottom-left of the frame:
     // units, default tolerance, and projection convention. Sits above
     // the bottom edge so it doesn't clash with the title block on the
@@ -463,14 +463,13 @@ fn render_notes_strip(out: &mut String, frame_x: f64, frame_bottom: f64) {
     );
     let _ = write!(
         out,
-        "  <text class=\"notes-strip\" x=\"{x:.3}\" y=\"{y_top:.3}\">\
-         ALL DIMENSIONS IN MILLIMETRES UNLESS OTHERWISE STATED.</text>\n"
+        "  <text class=\"notes-strip\" x=\"{x:.3}\" y=\"{y_top:.3}\">{}</text>\n",
+        escape_xml(&drawing.unit_note)
     );
     let _ = write!(
         out,
-        "  <text class=\"notes-strip\" x=\"{x:.3}\" y=\"{y_bot:.3}\">\
-         GENERAL TOLERANCES: LINEAR \u{00B1}0.1 MM, ANGULAR \u{00B1}0.5\u{00B0}, \
-         ISO 2768-m.</text>\n"
+        "  <text class=\"notes-strip\" x=\"{x:.3}\" y=\"{y_bot:.3}\">{}</text>\n",
+        escape_xml(&drawing.tolerance_note)
     );
 }
 

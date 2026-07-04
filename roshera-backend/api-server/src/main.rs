@@ -8013,6 +8013,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/assemblies/{id}/simulate",
             post(assembly_mgr::simulate_motion),
         )
+        // Document-level settings — display unit (not a timeline event).
+        .route(
+            "/api/document/units",
+            get(handlers::document::get_document_units)
+                .patch(handlers::document::patch_document_units),
+        )
         // Kernel drawings — 2D projected views of solids, SVG export.
         // Distinct from assemblies; see `drawing_mgr.rs`.
         .route(

@@ -7,6 +7,7 @@ pub mod agent;
 pub mod auth;
 pub mod capabilities;
 pub mod datums;
+pub mod document;
 pub mod export;
 pub mod geometry;
 pub mod hierarchy;
