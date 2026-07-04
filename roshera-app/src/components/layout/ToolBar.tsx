@@ -21,6 +21,7 @@ import {
   SquaresIntersect,
   PenTool,
   PencilRuler,
+  DraftingCompass,
   Ruler,
   Grid3x3,
   Copy,
@@ -46,6 +47,7 @@ import { useSceneStore, type TransformTool } from '@/stores/scene-store'
 import { useChatStore } from '@/stores/chat-store'
 import { processUserMessage } from '@/lib/ai-client'
 import { exportSceneAs } from '@/lib/export-api'
+import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
 import { cn } from '@/lib/utils'
 import {
   ModifyDialog,
@@ -872,6 +874,82 @@ async function sendDirectCircularPattern(
 }
 
 /**
+ * Kernel-exact interactive measure between the two currently picked
+ * FACES (spec section 3, "Interactive measure"). Requires exactly two
+ * face sub-element selections (`Face` selection mode → click two
+ * faces); each face's objectId resolves to its kernel solid id via
+ * `analyticalGeometry.solidId` (the same resolution `PartDimensions`
+ * uses), and `SubElementSelection.index` in face mode IS the kernel
+ * `FaceId` (see CADMesh's `resolveFaceId`).
+ *
+ * POSTs `/api/agent/measure`. On success the DimensionRecord-shaped
+ * result is pinned in the viewport (`pinMeasurement`) and echoed to
+ * the chat. On refusal (422/404) the kernel's `reason` is surfaced
+ * VERBATIM — never paraphrased, never approximated with a fallback
+ * number.
+ */
+async function sendDirectMeasureFaces() {
+  const { addMessage, setProcessing } = useChatStore.getState()
+  const scene = useSceneStore.getState()
+  const faces = scene.subElementSelections.filter((s) => s.type === 'face')
+
+  if (faces.length !== 2) {
+    addMessage({
+      role: 'assistant',
+      content:
+        'Pick exactly two faces (Face selection mode → click two faces) before running Measure.',
+    })
+    return
+  }
+
+  const [fa, fb] = faces
+  const solidA = scene.objects.get(fa.objectId)?.analyticalGeometry?.solidId
+  const solidB = scene.objects.get(fb.objectId)?.analyticalGeometry?.solidId
+  if (solidA === undefined || solidB === undefined) {
+    addMessage({
+      role: 'assistant',
+      content:
+        'Measure needs kernel-backed solids — one of the picked faces belongs to an object without a kernel solid id.',
+    })
+    return
+  }
+
+  addMessage({
+    role: 'user',
+    content: `Measure face ${fa.index} of ${fa.objectId.slice(0, 6)} ↔ face ${fb.index} of ${fb.objectId.slice(0, 6)}`,
+  })
+  setProcessing(true)
+
+  try {
+    const row = await measureFaces(
+      { part_id: solidA, kind: 'face', id: fa.index },
+      { part_id: solidB, kind: 'face', id: fb.index },
+    )
+    useSceneStore.getState().pinMeasurement({
+      id: crypto.randomUUID(),
+      a: { objectId: fa.objectId, faceId: fa.index },
+      b: { objectId: fb.objectId, faceId: fb.index },
+      row,
+    })
+    addMessage({
+      role: 'assistant',
+      content: `Measured: ${row.label} — pinned in the viewport.`,
+      objectsAffected: [fa.objectId, fb.objectId],
+    })
+  } catch (err) {
+    if (err instanceof MeasureRefusalError) {
+      // The kernel's refusal reason, verbatim — no paraphrase.
+      addMessage({ role: 'assistant', content: err.reason })
+    } else {
+      const msg = err instanceof Error ? err.message : String(err)
+      addMessage({ role: 'assistant', content: `Measure failed: ${msg}` })
+    }
+  } finally {
+    setProcessing(false)
+  }
+}
+
+/**
  * Direct REST measure distance between the two currently selected
  * solids. Hits `GET /api/agent/parts/distance/uuid/{a}/{b}`, which
  * resolves both UUIDs to kernel SolidIds and returns center-to-center
@@ -1514,7 +1592,8 @@ export function ToolBar() {
                 toggleDimensions(ids[0])
               },
             },
-            { icon: Ruler, label: 'Measure Distance', action: () => sendDirectMeasureDistance() },
+            { icon: DraftingCompass, label: 'Measure', action: () => sendDirectMeasureFaces() },
+            { icon: Ruler, label: 'Measure Distance (bounds)', action: () => sendDirectMeasureDistance() },
             { icon: Pipette, label: 'Mass Properties', action: () => sendDirectMassProperties() },
             { icon: Eye, label: 'Section View', action: () => toggleSectionViewWithFeedback() },
             { icon: Wrench, label: 'Interference', action: () => sendDirectInterference() },

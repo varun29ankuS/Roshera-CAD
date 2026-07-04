@@ -1,47 +1,14 @@
 import { useEffect, useState } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
+import type { DimensionRow } from '@/lib/measure-api'
+
+// Re-exported so viewport consumers can keep importing the row type
+// from the hook that produces it. The definition lives in
+// `lib/measure-api.ts` because the scene store's `PinnedMeasurement`
+// needs it too and the store must not import from a component file.
+export type { DimensionRow }
 
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
-
-/**
- * Wire shape of a single dimension row from
- * `GET /api/agent/parts/{id}/dimensions`.
- *
- * Mirrors the backend `DimensionRecord` exactly, including the additive
- * `pid` field from spec section 1 (`None` arrives as `null`).
- */
-export interface DimensionRow {
-  /** Per-call id (d0, d1, …) — stable only within a single response. */
-  id: string
-  /** Semantic kind: `diameter`, `radius`, `length`, `angle`, `extent_x`, etc. */
-  kind: string
-  /** Numeric magnitude in `unit`. All computation is kernel-side. */
-  value: number
-  /** Unit string, e.g. `"mm"` or `"deg"`. */
-  unit: string
-  /** Human-readable label already formatted by the kernel, e.g. `"Ø 10 mm"`. */
-  label: string
-  /** Kernel entity ids this dimension references. Empty for whole-part extents. */
-  entities: number[]
-  /**
-   * World-space anchor point `[x, y, z]` where the leader line starts
-   * (and where extent-kind labels sit, sans leader).
-   */
-  anchor: [number, number, number]
-  /**
-   * Unit direction vector `[x, y, z]` pointing outward from the feature.
-   * Used to derive the leader perpendicular for non-extent rows.
-   */
-  direction: [number, number, number]
-  /** Optional rotation axis for angle dimensions — `null` when absent. */
-  axis: [number, number, number] | null
-  /**
-   * Durable persistent id (UUIDv5) — `null` for pre-PID solids and
-   * whole-part extents that lack entity PIDs. The frontend displays the
-   * annotation regardless; only pinning requires a non-null pid.
-   */
-  pid: string | null
-}
 
 /**
  * Fetch + cache the dimension table for a single kernel solid, refreshing

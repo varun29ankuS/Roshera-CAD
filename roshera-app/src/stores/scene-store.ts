@@ -20,6 +20,7 @@ import {
   type SolveOptions,
 } from '@/lib/csketch-api'
 import type { SectionCapMesh } from '@/lib/section-api'
+import type { DimensionRow } from '@/lib/measure-api'
 
 // Re-exported so consumers (panels, overlays) can import the
 // SketchShape wire type from the same module they import the rest
@@ -506,6 +507,29 @@ export interface CSketchState {
   activeTool: CSketchTool | null
 }
 
+// ─── Pinned measurements ─────────────────────────────────────────────
+/**
+ * One user-pinned interactive measurement (spec section 3, "Interactive
+ * measure"). Session-local only — never persisted kernel-side.
+ *
+ * `a` / `b` record which faces were measured (`faceId` is the kernel
+ * `FaceId`, the same value `SubElementSelection.index` carries in face
+ * mode) so the pin can be re-validated against `/api/agent/measure`
+ * whenever the geometry changes. `b` is `null` for single-face
+ * measurements (e.g. a lone cylindrical face measuring its diameter).
+ *
+ * `row` is the kernel's DimensionRecord-shaped result verbatim; the
+ * viewport renders it with the same annotation component as ambient
+ * dimensions, in a distinct accent tone with a dismiss control.
+ */
+export interface PinnedMeasurement {
+  /** Client-generated UUID identifying this pin. */
+  id: string
+  a: { objectId: string; faceId: number }
+  b: { objectId: string; faceId: number } | null
+  row: DimensionRow
+}
+
 // ─── Scene store ─────────────────────────────────────────────────────
 interface SceneState {
   // Objects
@@ -588,6 +612,14 @@ interface SceneState {
    * mutation) matching the `selectedIds` pattern.
    */
   showDimensions: Set<string>
+
+  /**
+   * User-pinned interactive measurements. See {@link PinnedMeasurement}.
+   * Session-local; re-validated on geometry change (dismissed with a
+   * chat note when the measured faces no longer resolve — a stale
+   * number is worse than none). Array replacement, never mutation.
+   */
+  pinnedMeasurements: PinnedMeasurement[]
 
   /** Cutting-plane state for Section View. See {@link SectionViewState}. */
   sectionView: SectionViewState
@@ -685,6 +717,17 @@ interface SceneState {
    * Set replacement (never mutation), matching the `selectedIds` pattern.
    */
   toggleDimensions: (objectId: string) => void
+  /** Append a pinned measurement (id must be unique — caller generates it). */
+  pinMeasurement: (measurement: PinnedMeasurement) => void
+  /** Remove a pinned measurement by pin id. No-op when absent. */
+  dismissMeasurement: (id: string) => void
+  /**
+   * Replace a pin's kernel result row in place (same pin identity,
+   * fresh value/anchor). Used by re-validation after a geometry change
+   * — a successful re-measure updates the annotation rather than
+   * dismiss-and-re-pin, so the pin's id (and React key) stays stable.
+   */
+  updatePinnedMeasurement: (id: string, row: DimensionRow) => void
   setSectionView: (settings: Partial<SectionViewState>) => void
   toggleSectionView: () => void
   /** Replace the live cap set with the result of the most recent
@@ -959,6 +1002,7 @@ const sceneCreator: StateCreator<
     },
     labelsVisible: false,
     showDimensions: new Set<string>(),
+    pinnedMeasurements: [],
     sectionView: {
       enabled: false,
       axis: 'x',
@@ -1089,15 +1133,21 @@ const sceneCreator: StateCreator<
         selectedIds.delete(id)
         // Dimension-layer lifecycle: a deleted object must not leave its
         // id in `showDimensions` (stale-set leak; a reused id would
-        // inherit a toggled-on state it never asked for).
+        // inherit a toggled-on state it never asked for), and any pinned
+        // measurement referencing it is dead — re-validation would only
+        // discover that later; drop it now.
         const showDimensions = new Set(state.showDimensions)
         showDimensions.delete(id)
+        const pinnedMeasurements = state.pinnedMeasurements.filter(
+          (p) => p.a.objectId !== id && p.b?.objectId !== id,
+        )
         return {
           objects,
           objectOrder: state.objectOrder.filter((oid) => oid !== id),
           selectedIds,
           hoveredId: state.hoveredId === id ? null : state.hoveredId,
           showDimensions,
+          pinnedMeasurements,
         }
       }),
 
@@ -1111,6 +1161,7 @@ const sceneCreator: StateCreator<
         serverSketches: new Map(),
         hiddenSketchIds: new Set(),
         showDimensions: new Set(),
+        pinnedMeasurements: [],
       }),
 
     selectObject: (id, additive) =>
@@ -1237,6 +1288,25 @@ const sceneCreator: StateCreator<
         }
         return { showDimensions: next }
       }),
+
+    pinMeasurement: (measurement) =>
+      set((state) => ({
+        pinnedMeasurements: [...state.pinnedMeasurements, measurement],
+      })),
+
+    dismissMeasurement: (id) =>
+      set((state) => ({
+        pinnedMeasurements: state.pinnedMeasurements.filter(
+          (p) => p.id !== id,
+        ),
+      })),
+
+    updatePinnedMeasurement: (id, row) =>
+      set((state) => ({
+        pinnedMeasurements: state.pinnedMeasurements.map((p) =>
+          p.id === id ? { ...p, row } : p,
+        ),
+      })),
 
     setSectionView: (settings) =>
       set((state) => ({

@@ -1,14 +1,17 @@
 import { useMemo } from 'react'
 import { Html, Line } from '@react-three/drei'
 import * as THREE from 'three'
-import { useSceneStore } from '@/stores/scene-store'
+import { X } from 'lucide-react'
+import { useSceneStore, type PinnedMeasurement } from '@/stores/scene-store'
 import { usePartDimensions, type DimensionRow } from './use-part-dimensions'
+import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
 
 /**
  * Live kernel dimension annotations for every object whose id is in
- * `showDimensions`. Renders inside the R3F `<Canvas>` scene graph so
- * all positions track camera orbit / pan / zoom automatically via
- * drei's `<Html>` and `<Line>`.
+ * `showDimensions`, plus the user's pinned interactive measurements.
+ * Renders inside the R3F `<Canvas>` scene graph so all positions track
+ * camera orbit / pan / zoom automatically via drei's `<Html>` and
+ * `<Line>`.
  *
  * ## Layout
  * Each `DimensionRow` renders as:
@@ -36,14 +39,30 @@ import { usePartDimensions, type DimensionRow } from './use-part-dimensions'
  * equivalent, matching the neutral annotation tones used by `PartLabels`.
  *
  * ## pointerEvents
- * All annotations are read-only (`pointerEvents="none"` on `<Html>`,
+ * Ambient annotations are read-only (`pointerEvents="none"` on `<Html>`,
  * `raycast={() => null}` on `<Line>`) so this layer never intercepts
- * orbit, selection, or sketch clicks.
+ * orbit, selection, or sketch clicks. Pinned measurements are the one
+ * exception: their ✕ dismiss button re-enables pointer events on JUST
+ * that button (CSS `pointer-events: auto` inside a `pointer-events:
+ * none` wrapper) — the rest of the pin chip stays click-through.
+ *
+ * ## Pinned measurements
+ * Rendered in the app's primary accent tone (visually distinct from the
+ * neutral ambient dimensions) at `row.anchor`, no leader. Re-validated
+ * on every geometry change by `usePinnedMeasurementsRevalidation`,
+ * mounted here because this component is the single place pins can be
+ * visible (see that hook's doc for the full policy).
  */
 export function PartDimensions() {
   const showDimensions = useSceneStore((s) => s.showDimensions)
   const objects = useSceneStore((s) => s.objects)
   const objectOrder = useSceneStore((s) => s.objectOrder)
+  const pinnedMeasurements = useSceneStore((s) => s.pinnedMeasurements)
+
+  // Keep every pinned measurement honest against the current geometry.
+  // Must be called unconditionally (before any early return) — pins can
+  // exist and need re-validation even when no ambient layer is toggled.
+  usePinnedMeasurementsRevalidation()
 
   // Collect objects that have dimensions toggled on and carry a solidId,
   // pairing each id with its (narrowed) kernel solid id up front so the
@@ -56,7 +75,7 @@ export function PartDimensions() {
     active.push({ objectId: id, solidId })
   }
 
-  if (active.length === 0) return null
+  if (active.length === 0 && pinnedMeasurements.length === 0) return null
 
   return (
     <group name="part-dimensions">
@@ -66,6 +85,9 @@ export function PartDimensions() {
           objectId={objectId}
           solidId={solidId}
         />
+      ))}
+      {pinnedMeasurements.map((pin) => (
+        <PinnedMeasurementAnnotation key={pin.id} pin={pin} />
       ))}
     </group>
   )
@@ -219,5 +241,53 @@ function DimensionAnnotation({ row }: DimensionAnnotationProps) {
       />
       <DimBadge position={endVec} text={row.label} />
     </>
+  )
+}
+
+// ─── Pinned measurement annotation ───────────────────────────────────
+
+/**
+ * One user-pinned interactive measurement. Anchored at `row.anchor`,
+ * no leader (the measured relation spans two faces — a single-anchor
+ * leader would point at only one of them).
+ *
+ * Visually distinct from ambient dimensions: the app's primary accent
+ * tone (`border-primary/70 text-primary`) instead of the neutral
+ * `border-border/60 text-foreground` — the same distinction the spec
+ * calls for ("visually distinct accent color").
+ *
+ * The outer `<Html>` keeps `pointerEvents="none"` so the chip never
+ * blocks orbit; `pointer-events` is an inherited CSS property, so the
+ * ✕ button re-enables it locally with `pointer-events-auto`. Only that
+ * button is clickable.
+ */
+function PinnedMeasurementAnnotation({ pin }: { pin: PinnedMeasurement }) {
+  const dismissMeasurement = useSceneStore((s) => s.dismissMeasurement)
+
+  const anchorVec = useMemo(
+    () => new THREE.Vector3(...pin.row.anchor),
+    [pin.row],
+  )
+
+  return (
+    <Html
+      position={anchorVec}
+      center
+      pointerEvents="none"
+      zIndexRange={[110, 0]}
+    >
+      <div className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/85 border border-primary/70 text-primary backdrop-blur-sm whitespace-nowrap select-none">
+        <span>{pin.row.label}</span>
+        <button
+          type="button"
+          onClick={() => dismissMeasurement(pin.id)}
+          className="pointer-events-auto cursor-pointer shrink-0 text-primary/70 hover:text-primary transition-colors"
+          title="Dismiss measurement"
+          aria-label="Dismiss measurement"
+        >
+          <X className="w-3 h-3" aria-hidden />
+        </button>
+      </div>
+    </Html>
   )
 }
