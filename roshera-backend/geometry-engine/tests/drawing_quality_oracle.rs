@@ -501,7 +501,9 @@ fn view_label_on_neighbour_geometry_flagged() {
 #[test]
 fn dimension_label_collision_flagged() {
     // One FRONT view, 100×70 outline at pos=[100, 150] on A3. Two angle
-    // callouts at the same view-space point ([50, 35] = centre of outline).
+    // callouts at the same view-space point ([50, -20] = BELOW the outline,
+    // outside the geometry rect, so DimensionOnGeometry stays silent and this
+    // specimen isolates DimensionLabelCollision).
     // Both become degenerate callouts; both land at the same sheet-space
     // text_anchor → identical DimensionText bboxes → collision fires.
     let mut d = Drawing::new("DimLabelCollision", SheetSize::A3);
@@ -518,8 +520,8 @@ fn dimension_label_collision_flagged() {
                 value: 45.0,
                 unit: "deg".to_string(),
                 label: "45.00°".to_string(),
-                a: [50.0, 35.0],
-                b: [50.0, 35.0],
+                a: [50.0, -20.0],
+                b: [50.0, -20.0],
                 entities: Vec::new(),
                 axis3: None,
                 dir3: None,
@@ -530,8 +532,8 @@ fn dimension_label_collision_flagged() {
                 value: 90.0,
                 unit: "deg".to_string(),
                 label: "90.00°".to_string(),
-                a: [50.0, 35.0],
-                b: [50.0, 35.0],
+                a: [50.0, -20.0],
+                b: [50.0, -20.0],
                 entities: Vec::new(),
                 axis3: None,
                 dir3: None,
@@ -542,6 +544,13 @@ fn dimension_label_collision_flagged() {
     assert!(
         report.has(DrawingIssueKind::DimensionLabelCollision),
         "co-located angle callouts must be flagged; issues={:?}",
+        report.issues
+    );
+    // Kind isolation: the anchors sit outside the outline, so a refactor
+    // conflating this check with DimensionOnGeometry cannot pass here.
+    assert!(
+        !report.has(DrawingIssueKind::DimensionOnGeometry),
+        "specimen must isolate DimensionLabelCollision; issues={:?}",
         report.issues
     );
     assert!(!report.passed, "DimensionLabelCollision is Severity::Error");

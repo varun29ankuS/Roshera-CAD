@@ -284,7 +284,8 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     //
     // (a) ViewLabel × {ViewLabel | DimensionText}: at least one item must be
     //     a ViewLabel — dim-text↔dim-text collision is currently unchecked;
-    //     DimensionLabelCollision is a declared-but-unwired kind (see module doc).
+    //     dim-text↔dim-text collisions are handled separately by
+    //     check_dimension_label_collisions (DimensionLabelCollision).
     //
     // (b) ViewLabel × ViewGeometry of a DIFFERENT view: a label legitimately
     //     sits near its OWN view's geometry (placement avoids it, but same-view
