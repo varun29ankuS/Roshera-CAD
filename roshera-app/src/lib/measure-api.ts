@@ -21,7 +21,7 @@ const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
 export interface DimensionRow {
   /** Per-call id (d0, d1, …) — stable only within a single response. */
   id: string
-  /** Semantic kind: `diameter`, `radius`, `length`, `angle`, `extent_x`, etc. */
+  /** Semantic kind: `diameter`, `radius`, `length`, `angle`, `extent`, etc. */
   kind: string
   /** Numeric magnitude in `unit`. All computation is kernel-side. */
   value: number
@@ -39,10 +39,11 @@ export interface DimensionRow {
   /**
    * Unit direction vector `[x, y, z]` pointing outward from the feature.
    * Used to derive the leader perpendicular for non-extent rows.
+   * `null` for angle and face-info results, which have no single direction.
    */
-  direction: [number, number, number]
+  direction: [number, number, number] | null
   /** Optional rotation axis for angle dimensions — `null` when absent. */
-  axis: [number, number, number] | null
+  axis?: [number, number, number] | null
   /**
    * Durable persistent id (UUIDv5) — `null` for pre-PID solids,
    * whole-part extents lacking entity PIDs, and interactive measure

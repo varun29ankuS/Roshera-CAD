@@ -156,10 +156,10 @@ function leaderEndpoint(
  * bounding box, so a short feature leader adds noise rather than
  * clarity. They render at their anchor directly, no leader.
  *
- * Kernel kind strings for extents: `extent_x`, `extent_y`, `extent_z`.
+ * Kernel kind string for extents: `"extent"` (readable/dimensions.rs).
  */
 function isExtent(kind: string): boolean {
-  return kind.startsWith('extent_')
+  return kind === 'extent'
 }
 
 // ─── DimBadge ────────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ function DimensionAnnotation({ row }: DimensionAnnotationProps) {
   // once per fetch instead of on every render of every annotation.
   const { anchorVec, endVec } = useMemo(() => {
     const anchor = new THREE.Vector3(...row.anchor)
-    if (isExtent(row.kind)) {
+    if (isExtent(row.kind) || row.direction === null) {
       return { anchorVec: anchor, endVec: null }
     }
     const dir = new THREE.Vector3(...row.direction)

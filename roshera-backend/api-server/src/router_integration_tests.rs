@@ -2329,7 +2329,7 @@ fn find_cyl_face(model: &BRepModel, solid_id: SolidId) -> Option<u32> {
     None
 }
 
-/// Seed a box of given dimensions, register a UUID, and return
+/// Seed a box of given dimensions into the model and return
 /// `(solid_id, top_face_id, bottom_face_id)` — the ±Z faces.
 async fn seed_box_for_measure(state: &AppState, x: f64, y: f64, z: f64) -> (SolidId, u32, u32) {
     let solid_id;
@@ -2354,7 +2354,7 @@ async fn seed_box_for_measure(state: &AppState, x: f64, y: f64, z: f64) -> (Soli
     (solid_id, top_fid, bot_fid)
 }
 
-/// Seed a cylinder, register a UUID, and return
+/// Seed a cylinder into the model and return
 /// `(solid_id, cyl_face_id)`.
 async fn seed_cyl_for_measure(state: &AppState, radius: f64, height: f64) -> (SolidId, u32) {
     let solid_id;

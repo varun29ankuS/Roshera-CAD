@@ -3108,7 +3108,7 @@ pub struct MeasureRequest {
 /// DimensionRecord-shaped response from `POST /api/agent/measure`.
 ///
 /// Fields mirror [`DimensionWire`] so the frontend renders interactive
-/// measurements with the same component as ambient ambient dimensions.
+/// measurements with the same component as ambient dimensions.
 /// `pid` is always `null` — interactive measurements are session-local
 /// and have no durable identity to derive.
 #[derive(Debug, Clone, Serialize)]
@@ -3310,7 +3310,11 @@ pub async fn measure(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "not_found",
-                "reason": format!("Solid {solid} or face {face} not found in the active model."),
+                "reason": format!(
+                    "Face {face} is not part of solid {solid} — \
+                     it may have been consumed by a later operation, \
+                     or the solid/face id is unknown.",
+                ),
             })),
         ),
         Err(MeasureError::Unsupported { reason }) => (

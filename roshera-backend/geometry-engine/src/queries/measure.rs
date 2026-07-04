@@ -116,8 +116,13 @@ pub enum MeasureResult {
 /// Errors returned by [`measure`].
 #[derive(Debug, thiserror::Error)]
 pub enum MeasureError {
-    /// A referenced solid or face id was not found in the model.
-    #[error("Entity not found: solid {solid}, face {face}")]
+    /// A referenced solid or face id was not found in the model, or the face
+    /// does not belong to the requested solid (it may have been consumed by a
+    /// later boolean or other mutating operation and persists only in the
+    /// arena, not in any shell of the solid).
+    #[error(
+        "Face {face} is not part of solid {solid} — it may have been consumed by a later operation"
+    )]
     NotFound { solid: SolidId, face: FaceId },
 
     /// The face pair does not admit the requested measurement; `reason` is
@@ -548,11 +553,46 @@ fn surface_classify(
     solid: SolidId,
     face_id: FaceId,
 ) -> Result<Classified, MeasureError> {
-    // Verify the solid exists (we do not verify face ∈ solid to keep it O(1)).
-    let _solid_check = model.solids.get(solid).ok_or(MeasureError::NotFound {
+    // Verify the solid exists.
+    let solid_data = model.solids.get(solid).ok_or(MeasureError::NotFound {
         solid,
         face: face_id,
     })?;
+
+    // Verify the face BELONGS to this solid — walk its outer shell and all
+    // inner shells. Input solids persist in the model arena after booleans
+    // (pid lineage relies on this), so a face that was consumed by a later
+    // operation resolves by id but no longer belongs to any shell of the
+    // solid the caller named. Measuring against a dead face fabricates a
+    // stale number; the honest answer is NotFound.
+    //
+    // Complexity: O(faces in solid's shells) — bounded by the solid's own
+    // face count, not the total arena size. Typical solids have O(10..100)
+    // faces; this check is negligible next to the surface evaluation that
+    // follows.
+    let face_in_solid = {
+        let outer_shell = model.shells.get(solid_data.outer_shell);
+        let in_outer = outer_shell
+            .map(|sh| sh.faces.contains(&face_id))
+            .unwrap_or(false);
+        if in_outer {
+            true
+        } else {
+            solid_data.inner_shells.iter().any(|&shell_id| {
+                model
+                    .shells
+                    .get(shell_id)
+                    .map(|sh| sh.faces.contains(&face_id))
+                    .unwrap_or(false)
+            })
+        }
+    };
+    if !face_in_solid {
+        return Err(MeasureError::NotFound {
+            solid,
+            face: face_id,
+        });
+    }
 
     let face = model.faces.get(face_id).ok_or(MeasureError::NotFound {
         solid,
@@ -1092,6 +1132,102 @@ mod tests {
                 assert!(!reason.is_empty(), "reason must not be empty");
             }
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // ── Case I-2 (RED → GREEN): stale face from a consumed solid → NotFound ────
+    //
+    // Specimen: a 40×40×10 plate. Its top (+Z) face has id `old_top_fid`.
+    // A 20×20×20 cutter centred at the origin is boolean-differenced out of
+    // the plate, producing `new_solid` — the result is a notched plate whose
+    // original top face was SPLIT by the cut (the old face id no longer
+    // belongs to any shell of new_solid). The old top face persists in the
+    // model arena (the pid lineage tests rely on arena persistence) but it
+    // does NOT belong to `new_solid`. Measuring (new_solid, old_top_fid) must
+    // be a `NotFound` refusal — a confident stale number is worse than none.
+    //
+    // RED transcript (pre-fix behaviour captured 2026-07-04):
+    //   `measure(new_solid, old_top_fid)` returned
+    //   `Ok(FaceInfo { area: 1600.0, normal: Some([0.0, 0.0, 1.0]),
+    //   anchor: [-0.5, 0.5, 5.0] })` — the kernel measured the pre-cut face
+    //   directly from the arena without verifying it belongs to new_solid,
+    //   fabricating a stale area of 1600 mm² (the old full 40×40 top face)
+    //   even though that face was split by the boolean and no longer exists
+    //   on any shell of new_solid. This is the "stale number" the spec (§3)
+    //   forbids: "REMOVED … if the faces no longer resolve — a stale number
+    //   is worse than none."
+    //
+    // GREEN: after the membership check in `surface_classify` the same call
+    //   returns `Err(MeasureError::NotFound { solid: new_solid, face: old_top_fid })`.
+    #[test]
+    fn stale_face_from_consumed_solid_gives_not_found() {
+        use crate::operations::{boolean_operation, BooleanOp, BooleanOptions};
+
+        let mut m = BRepModel::new();
+        // Build a 40×40×10 plate centred at the origin.
+        // Faces at z = +5 (top) and z = -5 (bottom), footprint ±20 in x,y.
+        let plate = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(40.0, 40.0, 10.0)
+                .expect("plate box"),
+        );
+        // Capture the id of the top (+Z) face BEFORE the boolean. This face
+        // will be SPLIT by the cut — the split produces new faces in new_solid
+        // but the original face id is not reused in the result shell.
+        let old_top_fid = plane_face_near(&m, plate, Vector3::Z);
+
+        // A 20×20×20 cutter centred at the origin (z = -10..+10) — it
+        // intersects the plate and cuts a 20×20 pocket all the way through,
+        // splitting the top face into two pieces. The old top face id is not
+        // present in new_solid's outer shell after the Difference.
+        let cutter = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(20.0, 20.0, 20.0)
+                .expect("cutter box"),
+        );
+
+        // Boolean Difference: plate − cutter → new_solid.
+        // Both `plate` and `cutter` are removed from model.solids; their
+        // faces persist in model.faces (the arena).
+        let new_solid = boolean_operation(
+            &mut m,
+            plate,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("boolean difference must succeed — plate notched by cutter");
+
+        // Confirm old_top_fid is still in the arena (this is what makes the
+        // bug possible: the face resolves by id even though new_solid never
+        // owns it).
+        assert!(
+            m.faces.get(old_top_fid).is_some(),
+            "old top face must persist in the arena after the boolean"
+        );
+
+        // The old top face must NOT belong to new_solid. Measuring
+        // (new_solid, old_top_fid) must be a NotFound refusal — not a stale
+        // success measured against the dead face in the arena.
+        let err = measure(
+            &mut m,
+            MeasureSubject::Face {
+                solid: new_solid,
+                face: old_top_fid,
+            },
+            None,
+        )
+        .expect_err("stale face (consumed by boolean) must give NotFound, not a fabricated result");
+
+        match &err {
+            MeasureError::NotFound { solid, face } => {
+                assert_eq!(*solid, new_solid, "NotFound must name the requested solid");
+                assert_eq!(*face, old_top_fid, "NotFound must name the stale face");
+            }
+            other => panic!(
+                "expected NotFound for stale face, got {other:?} — \
+                 the membership check in surface_classify is missing"
+            ),
         }
     }
 
