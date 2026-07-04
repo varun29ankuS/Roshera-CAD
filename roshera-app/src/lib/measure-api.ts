@@ -18,10 +18,29 @@ const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
  * DimensionRecord-shaped so the frontend renders measurements with the
  * same component as ambient dimensions; see spec section 2).
  */
+/**
+ * The reference a `position` dimension is measured FROM (Amendment A2).
+ * Every position record names its datum — a driller must never see an
+ * offset without knowing what it references.
+ *
+ * `kind: "part_corner"` is the kernel default (AABB min corner of the
+ * drilled face — machinist edge convention); `kind: "datum"` is a
+ * user-designated kernel Datum. `origin` is the world-space point the
+ * viewport marks with the datum glyph.
+ */
+export interface DatumDescriptor {
+  kind: 'part_corner' | 'datum'
+  name: string
+  origin: [number, number, number]
+}
+
 export interface DimensionRow {
   /** Per-call id (d0, d1, …) — stable only within a single response. */
   id: string
-  /** Semantic kind: `diameter`, `radius`, `length`, `angle`, `extent`, etc. */
+  /**
+   * Semantic kind: `diameter`, `radius`, `length`, `angle`, `extent`,
+   * `position` (X/Y offset of a bore axis from a datum — Amendment A2).
+   */
   kind: string
   /** Numeric magnitude in `unit`. All computation is kernel-side. */
   value: number
@@ -50,6 +69,12 @@ export interface DimensionRow {
    * results (which are session-local by design).
    */
   pid: string | null
+  /**
+   * Reference frame for `position` rows. Absent on every other kind —
+   * the backend uses `skip_serializing_if`, so the field is simply
+   * omitted from the JSON rather than sent as `null`.
+   */
+  datum?: DatumDescriptor
 }
 
 /** One leg of a measure request — a kernel face on a kernel solid. */

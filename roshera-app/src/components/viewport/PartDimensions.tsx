@@ -3,6 +3,7 @@ import { Html, Line } from '@react-three/drei'
 import * as THREE from 'three'
 import { X } from 'lucide-react'
 import { useSceneStore, type PinnedMeasurement } from '@/stores/scene-store'
+import type { DatumDescriptor } from '@/lib/measure-api'
 import { usePartDimensions, type DimensionRow } from './use-part-dimensions'
 import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
 
@@ -13,37 +14,55 @@ import { usePinnedMeasurementsRevalidation } from './use-pinned-measurements'
  * camera orbit / pan / zoom automatically via drei's `<Html>` and
  * `<Line>`.
  *
- * ## Layout
- * Each `DimensionRow` renders as:
- *   - **Non-extent rows** (feature dimensions — diameter, length, angle,
- *     radius): a short `<Line>` leader from `row.anchor` to a label
- *     endpoint offset ~6 mm perpendicularly from `row.direction`, then a
- *     `<Html>` billboard showing `row.label` at the leader tip.
- *   - **Extent rows** (whole-part bounding-box extents): a `<Html>`
- *     billboard at `row.anchor` directly — no leader. Extents span the
- *     whole solid so a leader from one anchor would just clutter the scene.
+ * ## Render forms (Amendment A2)
+ * Three per-row forms, routed by kind:
+ *   - **Linear rows** (`extent`, `length`, `position`): real ISO-129
+ *     style dimension graphics — endpoints at `anchor ± direction ·
+ *     value/2` (the same math the 2D sheet uses; the kernel constructs
+ *     anchor as the span midpoint and direction as the span axis for
+ *     all three kinds — see readable/dimensions.rs), a span `<Line>`
+ *     with an arrowhead cone at each end pointing outward, two short
+ *     extension ticks perpendicular at the endpoints, and the text
+ *     billboard centred on the span, offset a couple mm perpendicular
+ *     so it doesn't sit on the line.
+ *   - **Leader rows** (`diameter`, `radius`, `angle`, any future kind
+ *     with a direction): unchanged — a short leader from `anchor` to a
+ *     6 mm perpendicular offset, badge at the tip (Ø / ∠ prefixes are
+ *     part of the kernel label).
+ *   - **Direction-less rows** (`direction === null`, e.g. face-info
+ *     measure results): badge at the anchor, no graphics.
+ * Rows carrying a `datum` additionally contribute a datum marker glyph
+ * (deduped by origin) so position numbers visibly reference it.
  *
- * ## Perpendicular offset choice
- * The leader endpoint is `anchor + 6mm * perp(direction)` where `perp`
- * picks the stable perpendicular via the classic "cross with world-Y;
- * fall back to world-X when direction is near-parallel to Y" approach.
- * This produces the same perp as engineering drawings draw witness lines
- * — consistent across orbit because it is computed from the kernel
- * direction vector, not from the screen.
+ * ## Display labels
+ * Bare axis/length prefixes ("X " / "Y " / "Z " / "L ") are stripped
+ * from DISPLAYED text only — the graphics now carry the direction, so
+ * "X 60.00" reads as a clean "60.00" on an X-spanning dimension line.
+ * Ø / SØ / ∠ prefixes are kept (they are meaning, not axis shorthand).
+ * The wire `label` is never modified — drawings still consume it.
  *
- * ## Visual language
- * Styling mirrors `SketchOverlay.tsx`'s `DimLabel` function (which is
- * file-local and not exported). A local `DimBadge` replicates the same
- * CSS class string exactly so the annotation palette is identical. The
- * `<Line>` color uses the app's `--cad-tick` CSS variable via its hex
- * equivalent, matching the neutral annotation tones used by `PartLabels`.
+ * ## Perpendicular choice
+ * All perpendiculars (leader offset, extension ticks, text offset) come
+ * from one deterministic rule: cross the dimension direction with
+ * world-Y, falling back to world-X when the direction is near-parallel
+ * to Y (|dot| > 0.9). Computed from kernel vectors, never from the
+ * camera — stable across orbit.
+ *
+ * ## Depth strategy
+ * All dimension graphics (span, ticks, arrow cones, datum glyph) render
+ * with `depthTest={false}` + `depthWrite={false}` — the house overlay
+ * style (`SubElementHighlight` edge lines and vertex marks, `Datums`'
+ * origin marker). Annotations draw on top of the part, so they can
+ * never z-fight it and a driller can always read them; this beats a
+ * surface-offset approach here because dimension lines legitimately lie
+ * ON part edges (extents run along the AABB edge).
  *
  * ## pointerEvents
  * Ambient annotations are read-only (`pointerEvents="none"` on `<Html>`,
- * `raycast={() => null}` on `<Line>`) so this layer never intercepts
- * orbit, selection, or sketch clicks. Pinned measurements are the one
- * exception: their ✕ dismiss button re-enables pointer events on JUST
- * that button (CSS `pointer-events: auto` inside a `pointer-events:
+ * `raycast={() => null}` on every `<Line>`/`<mesh>`) so this layer never
+ * intercepts orbit, selection, or sketch clicks. Pinned measurements are
+ * the one exception: their ✕ dismiss button re-enables pointer events on
+ * JUST that button (CSS `pointer-events: auto` inside a `pointer-events:
  * none` wrapper) — the rest of the pin chip stays click-through.
  *
  * ## Pinned measurements
@@ -101,13 +120,30 @@ interface ObjectDimensionsProps {
 }
 
 /**
- * Fetches the dimension table for one solid and renders its rows.
+ * Fetches the dimension table for one solid and renders its rows plus
+ * one datum marker per DISTINCT datum (deduped by origin — every
+ * position row of a part typically shares the same part-corner datum,
+ * which must render as one glyph, not one per row).
+ *
  * Isolated so each toggled object has its own fetch lifecycle and
  * loading state, without coupling the render of one solid to the
  * in-flight request of another.
  */
 function ObjectDimensions({ objectId, solidId }: ObjectDimensionsProps) {
   const { dimensions } = usePartDimensions(solidId, true)
+
+  // Distinct datums referenced by this part's rows, keyed by origin.
+  // Dedupe is by origin (not name): two descriptors at the same point
+  // are one physical reference; the first row's descriptor wins.
+  const datums = useMemo(() => {
+    const map = new Map<string, DatumDescriptor>()
+    for (const row of dimensions) {
+      if (!row.datum) continue
+      const key = row.datum.origin.join(',')
+      if (!map.has(key)) map.set(key, row.datum)
+    }
+    return Array.from(map.entries())
+  }, [dimensions])
 
   if (dimensions.length === 0) return null
 
@@ -116,22 +152,32 @@ function ObjectDimensions({ objectId, solidId }: ObjectDimensionsProps) {
       {dimensions.map((row) => (
         <DimensionAnnotation key={row.id} row={row} />
       ))}
+      {datums.map(([key, datum]) => (
+        <DatumMarker key={key} datum={datum} />
+      ))}
     </group>
   )
 }
 
-// ─── Leader offset computation ────────────────────────────────────────
+// ─── Geometry helpers ─────────────────────────────────────────────────
 
 /**
- * Derive a stable perpendicular to `dir` for positioning the leader
- * endpoint. Uses the cross-product approach: cross with world-Y and
- * normalise. When `dir` is near-parallel to Y (|dot| > 0.9), fall back
- * to crossing with world-X. This gives a single deterministic result
- * that doesn't depend on camera orientation.
- *
- * 6 mm offset: matches the witness-line gap used in engineering drawing
- * templates and is visible at typical model scales without obscuring
- * the feature.
+ * Deterministic perpendicular to `dir`: cross with world-Y, falling
+ * back to world-X when `dir` is near-parallel to Y (|dot| > 0.9).
+ * Computed from the kernel direction vector, never the camera — the
+ * same annotation geometry every frame, every orbit.
+ */
+function stablePerpendicular(dir: THREE.Vector3): THREE.Vector3 {
+  const worldY = new THREE.Vector3(0, 1, 0)
+  const worldX = new THREE.Vector3(1, 0, 0)
+  const ref = Math.abs(dir.dot(worldY)) > 0.9 ? worldX : worldY
+  return new THREE.Vector3().crossVectors(dir, ref).normalize()
+}
+
+/**
+ * Leader tip for leader-form rows (diameter / radius / angle): 6 mm
+ * from the anchor along the stable perpendicular — the witness-line
+ * gap used in engineering drawing templates.
  */
 const LEADER_OFFSET_MM = 6
 
@@ -139,27 +185,40 @@ function leaderEndpoint(
   anchor: THREE.Vector3,
   direction: THREE.Vector3,
 ): THREE.Vector3 {
-  const worldY = new THREE.Vector3(0, 1, 0)
-  const worldX = new THREE.Vector3(1, 0, 0)
-  const ref =
-    Math.abs(direction.dot(worldY)) > 0.9 ? worldX : worldY
-  const perp = new THREE.Vector3()
-    .crossVectors(direction, ref)
-    .normalize()
-  return anchor.clone().addScaledVector(perp, LEADER_OFFSET_MM)
+  return anchor
+    .clone()
+    .addScaledVector(stablePerpendicular(direction), LEADER_OFFSET_MM)
 }
 
-// ─── Extent kind check ───────────────────────────────────────────────
+// ─── Kind routing ────────────────────────────────────────────────────
 
 /**
- * Returns true for whole-part extent rows. Extents span the full solid
- * bounding box, so a short feature leader adds noise rather than
- * clarity. They render at their anchor directly, no leader.
- *
- * Kernel kind string for extents: `"extent"` (readable/dimensions.rs).
+ * Linear kinds render as real dimension graphics (span + arrows +
+ * extension ticks). For all three the kernel constructs `anchor` as the
+ * span MIDPOINT and `direction` as the span axis, so the endpoints are
+ * exactly `anchor ± direction · value/2` (verified against
+ * readable/dimensions.rs):
+ *   - `extent`: anchor = AABB axis midpoint on the min-min edge,
+ *     direction = world axis → spans bb.min→bb.max.
+ *   - `length`: anchor = cylinder lateral at mid-height, direction =
+ *     cylinder axis → spans the face's axial extent.
+ *   - `position`: anchor = midpoint between datum corner and bore axis,
+ *     direction = signed world axis toward the axis → spans
+ *     corner→axis (Amendment A2).
  */
-function isExtent(kind: string): boolean {
-  return kind === 'extent'
+function isLinear(kind: string): boolean {
+  return kind === 'extent' || kind === 'length' || kind === 'position'
+}
+
+/**
+ * Display-only label cleanup (Amendment A2 item 3): strip a bare
+ * leading axis / length shorthand ("X " / "Y " / "Z " / "L ") — the
+ * dimension graphics now show the direction, so the prefix is noise for
+ * the machinist. Ø / SØ / ∠ prefixes carry meaning and are untouched.
+ * The wire label is NEVER modified; this runs at render time only.
+ */
+function displayLabel(label: string): string {
+  return label.replace(/^[XYZL]\s+/, '')
 }
 
 // ─── DimBadge ────────────────────────────────────────────────────────
@@ -193,7 +252,7 @@ function DimBadge({ position, text }: { position: THREE.Vector3; text: string })
   )
 }
 
-// ─── Single annotation ───────────────────────────────────────────────
+// ─── Dimension graphics constants ────────────────────────────────────
 
 // Annotation tint: a neutral blueprint grey matching the --cad-tick
 // CSS variable used by CADMesh edge overlays and the sketch plane
@@ -203,32 +262,231 @@ function DimBadge({ position, text }: { position: THREE.Vector3; text: string })
 // neutral chip tone.
 const LEADER_COLOR = '#4a5568'
 
+/** Arrowhead cone: length along the span, base radius. ISO-ish 3:1. */
+const ARROW_LEN_MM = 1.6
+const ARROW_RADIUS_MM = 0.5
+/** Extension tick half-length each side of the endpoint. */
+const EXT_TICK_MM = 2
+/** Text billboard offset from the span line, along the perpendicular. */
+const TEXT_OFFSET_MM = 2.5
+
+// One shared cone geometry for every arrowhead in the layer (module
+// scope — created once, never disposed; ~100 B of GPU memory). Cone
+// apex is at +Y·(len/2) in local space; each arrow orients it via a
+// quaternion so the apex lands exactly on the span endpoint.
+const ARROW_GEOMETRY = new THREE.ConeGeometry(
+  ARROW_RADIUS_MM,
+  ARROW_LEN_MM,
+  8,
+)
+
+const UNIT_Y = new THREE.Vector3(0, 1, 0)
+
+// ─── Linear dimension graphics ───────────────────────────────────────
+
+interface ArrowTransform {
+  position: THREE.Vector3
+  quaternion: THREE.Quaternion
+}
+
+/**
+ * Real dimension graphics for one linear row: span line between the
+ * kernel-defined endpoints, an arrowhead cone at each end pointing
+ * outward (apex ON the endpoint, body toward the span centre — the
+ * standard inside-arrows dimension form), a short perpendicular
+ * extension tick at each endpoint, and the value billboard centred on
+ * the span offset off the line.
+ *
+ * Everything here is DISPLAY geometry derived from kernel-provided
+ * `anchor` / `direction` / `value` — no value is computed frontend-side.
+ */
+function LinearDimensionGraphic({ row }: { row: DimensionRow }) {
+  const geo = useMemo(() => {
+    // Router guarantees direction is non-null for linear rows.
+    const dir = new THREE.Vector3(...(row.direction as [number, number, number])).normalize()
+    const anchor = new THREE.Vector3(...row.anchor)
+    const half = row.value / 2
+    const p1 = anchor.clone().addScaledVector(dir, -half)
+    const p2 = anchor.clone().addScaledVector(dir, half)
+    const perp = stablePerpendicular(dir)
+
+    const ext1: [THREE.Vector3, THREE.Vector3] = [
+      p1.clone().addScaledVector(perp, -EXT_TICK_MM),
+      p1.clone().addScaledVector(perp, EXT_TICK_MM),
+    ]
+    const ext2: [THREE.Vector3, THREE.Vector3] = [
+      p2.clone().addScaledVector(perp, -EXT_TICK_MM),
+      p2.clone().addScaledVector(perp, EXT_TICK_MM),
+    ]
+
+    // Arrow at p1: apex exactly at p1 pointing outward (-dir), body
+    // toward the centre. ConeGeometry's apex is +Y·(len/2) from its
+    // centre, so the mesh centre sits half a length inside the span.
+    const arrow1: ArrowTransform = {
+      position: p1.clone().addScaledVector(dir, ARROW_LEN_MM / 2),
+      quaternion: new THREE.Quaternion().setFromUnitVectors(
+        UNIT_Y,
+        dir.clone().negate(),
+      ),
+    }
+    const arrow2: ArrowTransform = {
+      position: p2.clone().addScaledVector(dir, -ARROW_LEN_MM / 2),
+      quaternion: new THREE.Quaternion().setFromUnitVectors(UNIT_Y, dir),
+    }
+
+    const textPos = anchor.clone().addScaledVector(perp, TEXT_OFFSET_MM)
+
+    return { p1, p2, ext1, ext2, arrow1, arrow2, textPos }
+  }, [row])
+
+  return (
+    <>
+      {/* Span line between the kernel endpoints. */}
+      <Line
+        points={[geo.p1, geo.p2]}
+        color={LEADER_COLOR}
+        lineWidth={1}
+        opacity={0.85}
+        transparent
+        depthTest={false}
+        depthWrite={false}
+        raycast={() => null}
+      />
+      {/* Extension ticks, perpendicular at each endpoint. */}
+      <Line
+        points={geo.ext1}
+        color={LEADER_COLOR}
+        lineWidth={1}
+        opacity={0.6}
+        transparent
+        depthTest={false}
+        depthWrite={false}
+        raycast={() => null}
+      />
+      <Line
+        points={geo.ext2}
+        color={LEADER_COLOR}
+        lineWidth={1}
+        opacity={0.6}
+        transparent
+        depthTest={false}
+        depthWrite={false}
+        raycast={() => null}
+      />
+      {/* Arrowhead cones, apex on the endpoints, pointing outward. */}
+      {[geo.arrow1, geo.arrow2].map((a, i) => (
+        <mesh
+          key={i}
+          geometry={ARROW_GEOMETRY}
+          position={a.position}
+          quaternion={a.quaternion}
+          raycast={() => null}
+        >
+          <meshBasicMaterial
+            color={LEADER_COLOR}
+            transparent
+            opacity={0.9}
+            depthTest={false}
+            depthWrite={false}
+          />
+        </mesh>
+      ))}
+      <DimBadge position={geo.textPos} text={displayLabel(row.label)} />
+    </>
+  )
+}
+
+// ─── Datum marker ────────────────────────────────────────────────────
+
+// Axis triad colors — same palette as `Datums.tsx` (X red / Y green /
+// Z blue) so the glyph reads with the app's existing axis vocabulary.
+const DATUM_AXIS_COLORS = ['#e74c3c', '#2ecc71', '#3498db'] as const
+const DATUM_ARM_MM = 4
+/** Label offset along the body diagonal so it clears the triad glyph. */
+const DATUM_LABEL_OFFSET = new THREE.Vector3(1, 1, 1)
+  .normalize()
+  .multiplyScalar(5)
+
+/**
+ * Anchor glyph for one distinct datum: a small axis-colored triad
+ * (three 4 mm arms along +X/+Y/+Z from the datum origin — the corner
+ * bracket a machinist clamps against) plus a tiny name billboard. The
+ * driller must SEE what the position numbers reference.
+ *
+ * Same depth strategy as the dimension graphics: `depthTest={false}` so
+ * the reference marker is always visible, even inside the part corner.
+ */
+function DatumMarker({ datum }: { datum: DatumDescriptor }) {
+  const geo = useMemo(() => {
+    const origin = new THREE.Vector3(...datum.origin)
+    const arms: Array<[THREE.Vector3, THREE.Vector3]> = [
+      [origin, origin.clone().add(new THREE.Vector3(DATUM_ARM_MM, 0, 0))],
+      [origin, origin.clone().add(new THREE.Vector3(0, DATUM_ARM_MM, 0))],
+      [origin, origin.clone().add(new THREE.Vector3(0, 0, DATUM_ARM_MM))],
+    ]
+    const labelPos = origin.clone().add(DATUM_LABEL_OFFSET)
+    return { arms, labelPos }
+  }, [datum])
+
+  return (
+    <group name={`datum-${datum.name}`}>
+      {geo.arms.map((points, i) => (
+        <Line
+          key={i}
+          points={points}
+          color={DATUM_AXIS_COLORS[i]}
+          lineWidth={2}
+          opacity={0.9}
+          transparent
+          depthTest={false}
+          depthWrite={false}
+          raycast={() => null}
+        />
+      ))}
+      <DimBadge position={geo.labelPos} text={datum.name} />
+    </group>
+  )
+}
+
+// ─── Single annotation (kind router) ─────────────────────────────────
+
 interface DimensionAnnotationProps {
   row: DimensionRow
 }
 
+/**
+ * Route one row to its render form: linear → full dimension graphics;
+ * direction-less → bare badge at the anchor; everything else
+ * (diameter / radius / angle) → the leader + badge form.
+ */
 function DimensionAnnotation({ row }: DimensionAnnotationProps) {
   // Memoised per row: the row object identity only changes when a fresh
   // fetch lands, so the Vector3s (anchor, leader endpoint) are computed
   // once per fetch instead of on every render of every annotation.
   const { anchorVec, endVec } = useMemo(() => {
     const anchor = new THREE.Vector3(...row.anchor)
-    if (isExtent(row.kind) || row.direction === null) {
+    if (isLinear(row.kind) || row.direction === null) {
+      // Linear rows build their own geometry in LinearDimensionGraphic;
+      // direction-less rows need no leader. Neither uses endVec.
       return { anchorVec: anchor, endVec: null }
     }
     const dir = new THREE.Vector3(...row.direction)
     return { anchorVec: anchor, endVec: leaderEndpoint(anchor, dir) }
   }, [row])
 
-  if (endVec === null) {
-    // Extents: billboard directly at the anchor, no leader.
-    return <DimBadge position={anchorVec} text={row.label} />
+  if (isLinear(row.kind) && row.direction !== null) {
+    return <LinearDimensionGraphic row={row} />
   }
 
-  // Feature dimensions: leader from anchor to offset endpoint. The
-  // leader must never be a raycast target — `raycast={() => null}`
-  // removes it from Three.js hit-testing entirely so orbit / selection
-  // clicks pass straight through.
+  if (endVec === null) {
+    // No direction to draw with: badge at the anchor, no graphics.
+    return <DimBadge position={anchorVec} text={displayLabel(row.label)} />
+  }
+
+  // Leader form (diameter / radius / angle): leader from anchor to the
+  // perpendicular offset tip. The leader must never be a raycast target
+  // — `raycast={() => null}` removes it from Three.js hit-testing
+  // entirely so orbit / selection clicks pass straight through.
   return (
     <>
       <Line
@@ -237,9 +495,11 @@ function DimensionAnnotation({ row }: DimensionAnnotationProps) {
         lineWidth={1}
         opacity={0.7}
         transparent
+        depthTest={false}
+        depthWrite={false}
         raycast={() => null}
       />
-      <DimBadge position={endVec} text={row.label} />
+      <DimBadge position={endVec} text={displayLabel(row.label)} />
     </>
   )
 }
