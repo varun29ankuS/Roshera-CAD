@@ -28,6 +28,20 @@ pub const VIEW_LABEL_FONT_MM: f64 = 3.6;
 /// emitted in sheet space so this is the actual ink height.
 pub const DIM_TEXT_FONT_MM: f64 = 3.1;
 
+/// CSS font size of the `.notes-strip` class (px == mm).
+/// General notes (unit note, tolerance note, projection note) printed near
+/// the bottom-left of the frame.
+pub const NOTES_FONT_MM: f64 = 2.4;
+
+/// CSS font size for hole-table header/data cells (px == mm).
+/// Also used for hole-tag callouts in the axial view.
+pub const TABLE_TEXT_FONT_MM: f64 = 2.6;
+
+/// CSS font size of the large drawing title text in the title block (px == mm).
+/// ISO 7200 §8.4 calls for the title to be the largest lettering on the block;
+/// 7 mm is the nominal height for A3/A2 sheets.
+pub const TITLE_FONT_MM: f64 = 7.0;
+
 /// Mean glyph advance as a fraction of font size (conservative / wide).
 /// Digits and uppercase in common sans faces advance ≈ 0.56–0.62 em.
 /// Using 0.62 means bboxes are over-estimated (collisions over-detected,
@@ -113,6 +127,15 @@ pub enum SheetItemKind {
     HoleTableBorder,
     /// A text cell in the hole table (header or data).
     HoleTableText,
+    /// A zone-grid reference mark in the frame margin (letter or number).
+    /// Zone refs are layout items so text-collision invariants cover them.
+    ZoneRef,
+    /// The third-angle projection symbol near the title block.
+    /// Stored as a bbox item so the verifier can confirm its presence.
+    ProjectionSymbol,
+    /// A line from the general-notes strip (unit note, tolerance note,
+    /// projection note). Routed through layout so text-collision checks apply.
+    NoteText,
 }
 
 /// One piece of ink on the sheet, with its bounding box in sheet coordinates.
@@ -503,6 +526,33 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         items.extend(table_items);
     }
 
+    // ── Zone-grid reference marks ─────────────────────────────────────
+    // Zone letters (vertical axis) and numbers (horizontal axis) placed
+    // in the frame margin at the standard ~50 mm pitch. Zone marks enter
+    // the layout model so the text-collision invariants cover them; the
+    // renderer reads these items instead of re-computing positions.
+    // frame top-left in sheet coords: (ml, mt).
+    if let Some(target) = super::svg::zone_target_width(&drawing.sheet_size) {
+        let zone_items = place_zone_refs(ml, mt, frame_w, frame_h, target);
+        items.extend(zone_items);
+    }
+
+    // ── General-notes strip ───────────────────────────────────────────
+    // Three-line notes strip anchored to the bottom-left of the frame.
+    // Routing through layout items means text-collision checks cover
+    // the notes just like all other text — campaign-B debt retired.
+    // frame_bottom (SVG y-down) = mt + frame_h.
+    let note_items = place_note_items(drawing, mt + frame_h);
+    items.extend(note_items);
+
+    // ── Third-angle projection symbol ─────────────────────────────────
+    // The truncated-cone two-view glyph placed in the right column of the
+    // title block (near the SCALE/SIZE cells). This is a bbox item so the
+    // verifier can assert its presence; the renderer inks it from the item.
+    // tb_x0 / tb_y0 are already computed above.
+    let proj_sym_item = place_projection_symbol(tb_x0, tb_y0, tb_w, tb_h);
+    items.push(proj_sym_item);
+
     SheetLayout {
         sheet: Rect2 {
             x0: 0.0,
@@ -516,12 +566,184 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     }
 }
 
+// ── Zone-ref placement ────────────────────────────────────────────────────────
+
+/// Pitch constant used when computing zone cells: keeps layout and renderer in
+/// sync without a separate file-level const in svg.rs.
+const ZONE_FONT_MM: f64 = 3.0;
+
+/// Place zone-grid reference marks in the frame margin.
+///
+/// Letters (A, B, C…, skipping I and O) run along the vertical edges;
+/// numbers (1, 2, 3…) along the horizontal edges, at `target` mm pitch.
+/// Each mark becomes a `ZoneRef` layout item with a bbox sized to the
+/// label text so the collision checker can include them.
+///
+/// The bboxes are placed OUTSIDE the inner frame (in the margin strip)
+/// so they never collide with view geometry or dimension text.
+pub(crate) fn place_zone_refs(fx: f64, fy: f64, fw: f64, fh: f64, target: f64) -> Vec<SheetItem> {
+    let nx = (fw / target).round().max(2.0) as usize;
+    let ny = (fh / target).round().max(2.0) as usize;
+    let dx = fw / nx as f64;
+    let dy = fh / ny as f64;
+
+    let mut items: Vec<SheetItem> = Vec::new();
+    let font = ZONE_FONT_MM;
+
+    // Horizontal zone numbers — top and bottom margins.
+    for i in 0..nx {
+        let cx = fx + dx * (i as f64 + 0.5);
+        let label = (i + 1).to_string();
+        let w_est = label.len() as f64 * GLYPH_ADVANCE_EM * font;
+        // Top margin: bbox above the frame.
+        items.push(SheetItem {
+            kind: SheetItemKind::ZoneRef,
+            bbox: Rect2 {
+                x0: cx - w_est * 0.5,
+                y0: fy - font - 2.0,
+                x1: cx + w_est * 0.5,
+                y1: fy - 2.0,
+            },
+            owner_view: None,
+            text: Some(label.clone()),
+        });
+        // Bottom margin: bbox below the frame.
+        items.push(SheetItem {
+            kind: SheetItemKind::ZoneRef,
+            bbox: Rect2 {
+                x0: cx - w_est * 0.5,
+                y0: fy + fh + 2.0,
+                x1: cx + w_est * 0.5,
+                y1: fy + fh + font + 2.0,
+            },
+            owner_view: None,
+            text: Some(label),
+        });
+    }
+
+    // Vertical zone letters — left and right margins.
+    for j in 0..ny {
+        let cy = fy + dy * (j as f64 + 0.5);
+        let letter = zone_letter(j);
+        let label = letter.to_string();
+        let w_est = GLYPH_ADVANCE_EM * font; // single character
+                                             // Left margin.
+        items.push(SheetItem {
+            kind: SheetItemKind::ZoneRef,
+            bbox: Rect2 {
+                x0: fx - w_est - 3.0,
+                y0: cy - font * 0.5,
+                x1: fx - 3.0,
+                y1: cy + font * 0.5,
+            },
+            owner_view: None,
+            text: Some(label.clone()),
+        });
+        // Right margin.
+        items.push(SheetItem {
+            kind: SheetItemKind::ZoneRef,
+            bbox: Rect2 {
+                x0: fx + fw + 3.0,
+                y0: cy - font * 0.5,
+                x1: fx + fw + w_est + 3.0,
+                y1: cy + font * 0.5,
+            },
+            owner_view: None,
+            text: Some(label),
+        });
+    }
+
+    items
+}
+
+/// Zone letter sequence: A-Z skipping I and O (look like 1 and 0).
+fn zone_letter(j: usize) -> char {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    ALPHABET[j % ALPHABET.len()] as char
+}
+
+// ── Notes-strip placement ─────────────────────────────────────────────────────
+
+/// Place the three general-note lines as `NoteText` layout items.
+///
+/// The notes are anchored to the bottom-left of the frame (at `frame_bottom`
+/// in SVG y-down coordinates). Routing them through the layout model means
+/// `ViewLabelCollision` checks cover them by construction — this retires the
+/// campaign-B debt of direct-inked notes that the verifier couldn't see.
+pub(crate) fn place_note_items(
+    drawing: &super::types::Drawing,
+    frame_bottom: f64,
+) -> Vec<SheetItem> {
+    use super::svg::frame_margins;
+    let (ml, _mr, _mt, _mb) = frame_margins(&drawing.sheet_size);
+    let x = ml + 2.5;
+    let font = NOTES_FONT_MM;
+
+    // Three lines, 3 mm apart, reading upward from the frame bottom.
+    // y_proj is the topmost (farthest from bottom), y_bot the closest.
+    let y_proj = frame_bottom - 9.0; // "THIRD-ANGLE PROJECTION."
+    let y_top = frame_bottom - 6.0; // unit note
+    let y_bot = frame_bottom - 3.0; // tolerance note
+
+    let notes = [
+        ("THIRD-ANGLE PROJECTION.", y_proj),
+        (drawing.unit_note.as_str(), y_top),
+        (drawing.tolerance_note.as_str(), y_bot),
+    ];
+
+    notes
+        .iter()
+        .map(|&(text, baseline_y)| SheetItem {
+            kind: SheetItemKind::NoteText,
+            bbox: text_bbox(text, font, x, baseline_y),
+            owner_view: None,
+            text: Some(text.to_string()),
+        })
+        .collect()
+}
+
+// ── Projection-symbol placement ────────────────────────────────────────────────
+
+/// Place the third-angle projection symbol as a `ProjectionSymbol` layout item.
+///
+/// The symbol (a truncated-cone two-view glyph per ISO 128-30) is drawn in the
+/// right column of the title block between the DRAWING NO. headline and the 2×2
+/// grid. The bbox covers the glyph area so the verifier can assert its presence.
+pub(crate) fn place_projection_symbol(tb_x: f64, tb_y: f64, tb_w: f64, tb_h: f64) -> SheetItem {
+    // Right column occupies the right 24% of the title block (mirrors svg.rs).
+    let right_w = (tb_w * 0.24).clamp(42.0, 60.0);
+    let right_x = tb_x + tb_w - right_w;
+
+    // Drawing-number headline: 55% of tb_h.
+    let dwg_h = tb_h * 0.55;
+    let grid_h = tb_h - dwg_h;
+    let cell_h = grid_h * 0.5;
+    // Symbol lives in the top row of the 2×2 grid (SCALE/SIZE row).
+    // Centre it in the left half of that row (SCALE cell = [right_x, right_x + right_w/2]).
+    let sym_cx = right_x + right_w * 0.5;
+    let sym_cy = tb_y + dwg_h + cell_h * 0.5;
+    // Bounding box: ~16 mm wide × 8 mm tall for the cone glyph.
+    let sym_w = 16.0_f64.min(right_w * 0.8);
+    let sym_h = 8.0_f64.min(cell_h * 0.7);
+
+    SheetItem {
+        kind: SheetItemKind::ProjectionSymbol,
+        bbox: Rect2 {
+            x0: sym_cx - sym_w * 0.5,
+            y0: sym_cy - sym_h * 0.5,
+            x1: sym_cx + sym_w * 0.5,
+            y1: sym_cy + sym_h * 0.5,
+        },
+        owner_view: None,
+        text: None,
+    }
+}
+
 // ── Hole table placement ───────────────────────────────────────────────────────
 
 /// Font size for hole-tag callouts in the axial view (mm).
-pub(crate) const HOLE_TAG_FONT_MM: f64 = 2.6;
-/// Font size for hole-table header/data cells (mm).
-const TABLE_TEXT_FONT_MM: f64 = 2.6;
+/// Matches TABLE_TEXT_FONT_MM — both are the 2.6 mm table-text tier.
+pub(crate) const HOLE_TAG_FONT_MM: f64 = TABLE_TEXT_FONT_MM;
 /// Cell padding (mm) around text inside table cells.
 const TABLE_CELL_PAD: f64 = 1.0;
 /// Row height (mm) for the table.

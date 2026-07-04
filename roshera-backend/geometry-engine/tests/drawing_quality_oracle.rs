@@ -1582,3 +1582,174 @@ fn off_origin_bore_tags_land_on_their_own_circles() {
         );
     }
 }
+
+// ── Task 8: Sheet visual excellence ──────────────────────────────────────────
+
+/// TASK 8 — LAYOUT ITEMS: the six-hole-plate auto sheet must carry
+/// `ProjectionSymbol`, `ZoneRef`, and `NoteText` layout items in addition to
+/// the Task 7 hole-table items. This proves the new furniture entered the layout
+/// model and the "cannot-lie" property extends to it.
+///
+/// Mutation proof (permanent invariant):
+///   - Remove `place_zone_refs` call in `compute_layout` → no ZoneRef items → RED.
+///   - Remove `place_note_items` call → no NoteText items → RED.
+///   - Remove `place_projection_symbol` call → no ProjectionSymbol items → RED.
+#[test]
+fn six_hole_plate_sheet_has_zone_refs_notes_and_projection_symbol() {
+    use geometry_engine::drawing::layout::SheetItemKind;
+
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+
+    // A3 sheet qualifies for zone refs (target_width = 50 mm).
+    // The standard_drawing_auto may produce A3 or larger; we only assert
+    // if zone refs ARE present (A4 has none by spec). Check the sheet size.
+    let layout = compute_layout(&dwg);
+
+    // NoteText items: always present (three note lines on any sheet).
+    let note_count = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::NoteText)
+        .count();
+    assert_eq!(
+        note_count, 3,
+        "every sheet must carry exactly 3 NoteText items (unit, tolerance, projection note); \
+         got {note_count}"
+    );
+
+    // Check that the three note texts contain expected content.
+    let note_texts: Vec<&str> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::NoteText)
+        .map(|it| it.text.as_deref().unwrap_or(""))
+        .collect();
+    assert!(
+        note_texts.iter().any(|t| t.contains("THIRD-ANGLE")),
+        "notes must include the projection note; got {note_texts:?}"
+    );
+
+    // ProjectionSymbol: always present (one symbol per sheet).
+    let sym_count = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::ProjectionSymbol)
+        .count();
+    assert_eq!(
+        sym_count, 1,
+        "every sheet must carry exactly 1 ProjectionSymbol item; got {sym_count}"
+    );
+
+    // ZoneRef items: present on A3+ sheets; check the sheet size.
+    let zone_count = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::ZoneRef)
+        .count();
+    match dwg.sheet_size {
+        geometry_engine::drawing::SheetSize::A4 => {
+            // A4 carries no zone refs by spec (too small).
+        }
+        _ => {
+            assert!(
+                zone_count >= 4,
+                "A3+ sheets must have ≥ 4 ZoneRef items (2 along each axis × 2 margins); \
+                 got {zone_count}"
+            );
+        }
+    }
+}
+
+/// TASK 8 — SVG FURNITURE: the auto sheet's SVG must ink the projection symbol
+/// (`.proj-sym` class) and note-strip text from layout items.
+///
+/// Mutation proof: removing `render_projection_symbol_from_layout` or
+/// `render_notes_from_layout` → respective class missing from SVG → RED.
+#[test]
+fn six_hole_plate_svg_has_projection_symbol_and_notes() {
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let svg = render_drawing_svg(&dwg);
+
+    // Projection symbol: the SVG must contain the `.proj-sym` polygon
+    // (third-angle truncated-cone glyph).
+    assert!(
+        svg.contains("class=\"proj-sym\""),
+        "SVG must contain the projection symbol (class=\"proj-sym\"); snippet: {}",
+        &svg[..svg.len().min(2000)]
+    );
+
+    // Notes strip: the NoteText items must be inked as `.notes-strip` elements.
+    assert!(
+        svg.contains("class=\"notes-strip\""),
+        "SVG must ink NoteText items as class=\"notes-strip\" elements"
+    );
+    assert!(
+        svg.contains("THIRD-ANGLE"),
+        "SVG must include the projection note text"
+    );
+}
+
+/// TASK 8 — COLLISION SPECIMEN: a view placed so it overlaps the notes strip
+/// (bottom-left of the frame) fires `ViewLabelCollision`.
+///
+/// Construction: a FRONT view is placed at the bottom-left corner of the frame
+/// so its geometry overlaps the NoteText items (which sit 3–9 mm above the
+/// frame bottom). The view's label must collide with at least one NoteText item.
+/// Since NoteText items now participate in the collision check (label_items
+/// filter includes SheetItemKind::NoteText), the verifier must flag
+/// `ViewLabelCollision`.
+///
+/// Mutation proof: remove `SheetItemKind::NoteText` from the `label_items`
+/// filter in `verify_drawing` → no collision is found → `report.has(...)` = false
+/// → `assert!` turns RED.
+#[test]
+fn view_label_colliding_with_notes_strip_flagged() {
+    // A3 sheet: frame bottom at y = 297 − 10 = 287 (SVG y-down).
+    // Notes strip at frame_bottom − 9 .. frame_bottom − 2 (baselines).
+    // To force a label collision, place a view so its geometry rect is near
+    // the bottom-left of the frame, then use a very wide geometry so the
+    // view label text (≥ 3.6 mm) will land close to (or on) the notes bbox.
+    //
+    // A3: frame_x = 20, frame_bottom = 287.
+    // NoteText bbox y0 ≈ 278 (baseline − font = 281 − 3), y1 ≈ 281.
+    // Place the view at pos = [22, 12] (SVG: top of view at 297-12=285,
+    // bottom of geometry at 297-12+h = 285+h). Use h=1 so the geometry
+    // rect is at y ∈ [284, 285]. The view label sits 2 mm ABOVE the rect
+    // at y ≈ 282, which overlaps the notes bbox (y0≈278, y1≈281) — but
+    // only if the label is wide enough to cover the x-range.
+    //
+    // A simpler approach: construct the view so it IS the notes area. Place
+    // a 100×5 view at pos=[22, 11] so geometry rect ≈ sheet [22,122]×[281,286].
+    // The notes strip labels have bboxes in x ∈ [22.5, ~80], y ∈ [278,281].
+    // The label for this view ("FRONT (1:1)") is ≈ 26 mm wide at 3.6 mm font.
+    // It sits 2 mm above the geometry top (at y ≈ 279), right in the notes band.
+    let mut d = Drawing::new("NotesCollision", SheetSize::A3);
+    // View placed at the notes-strip band: pos_mm = [22, 11] on A3 (h=297).
+    // Sheet top of geometry: 297 - 11 = 286; geometry spans y ∈ [286−5, 286] = [281, 286].
+    // Label slot 1 (above, preferred): baseline at y_sheet = 281 − 2 = 279.
+    // The topmost note line ("THIRD-ANGLE PROJECTION.") has baseline at 297−10−9=278
+    // → bbox y0=275, y1=278.
+    // The middle note has baseline 281 → bbox y0=278, y1=281.
+    // The bottom note has baseline 284 → bbox y0=281, y1=284.
+    // The label bbox y0 ≈ 279 − 3.6 = 275.4, y1 ≈ 279.
+    // This overlaps the middle note bbox (y0=278, y1=281) by ~0.6 mm > LABEL_TOL.
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [22.0, 11.0],
+        100.0,
+        5.0,
+        vec![],
+    ));
+
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::ViewLabelCollision),
+        "a view label overlapping the notes strip must fire ViewLabelCollision; \
+         issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "ViewLabelCollision is Severity::Error");
+}

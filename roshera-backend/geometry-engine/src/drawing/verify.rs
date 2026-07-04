@@ -282,9 +282,11 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     // ── ViewLabelCollision detection ─────────────────────────────────────
     // Two sub-checks, both using the layout already computed above:
     //
-    // (a) ViewLabel × {ViewLabel | DimensionText}: at least one item must be
-    //     a ViewLabel — dim-text↔dim-text collision is currently unchecked;
-    //     dim-text↔dim-text collisions are handled separately by
+    // (a) ViewLabel × {ViewLabel | DimensionText | NoteText}: at least one
+    //     item must be a ViewLabel. NoteText items (unit/tolerance/projection
+    //     note lines) are included: they are layout items since Task 8 and
+    //     must not be obscured by view geometry or labels.
+    //     DimText↔DimText collision is handled separately by
     //     check_dimension_label_collisions (DimensionLabelCollision).
     //
     // (b) ViewLabel × ViewGeometry of a DIFFERENT view: a label legitimately
@@ -299,7 +301,7 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
         .filter(|it| {
             matches!(
                 it.kind,
-                SheetItemKind::ViewLabel | SheetItemKind::DimensionText
+                SheetItemKind::ViewLabel | SheetItemKind::DimensionText | SheetItemKind::NoteText
             )
         })
         .collect();

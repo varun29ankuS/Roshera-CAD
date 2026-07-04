@@ -73,8 +73,11 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
          width=\"{frame_w:.3}\" height=\"{frame_h:.3}\" />\n"
     );
 
-    if let Some(target) = zone_target_width(&drawing.sheet_size) {
-        render_zone_markers(&mut out, frame_x, frame_y, frame_w, frame_h, target);
+    // Zone-grid markers from layout items (Task 8: zone refs are layout items
+    // so the verifier covers them). Still uses the same tick-mark rendering;
+    // labels come from the ZoneRef items.
+    if zone_target_width(&drawing.sheet_size).is_some() {
+        render_zone_markers_from_layout(&mut out, frame_x, frame_y, frame_w, frame_h, &layout);
     }
 
     for view in &drawing.views {
@@ -99,13 +102,17 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
         render_hole_table(&mut out, &layout);
     }
 
-    // Notes strip in the bottom-left corner of the frame.
-    render_notes_strip(&mut out, drawing, frame_x, frame_y + frame_h);
+    // Notes strip — inked from NoteText layout items (campaign-B debt retired).
+    // Routed through layout so text-collision invariants cover them.
+    render_notes_from_layout(&mut out, &layout);
 
     // Title block in the bottom-right corner of the frame.
     let tb_x = frame_x + frame_w - tb_w;
     let tb_y = frame_y + frame_h - tb_h;
     render_title_block(&mut out, drawing, tb_x, tb_y, tb_w, tb_h);
+
+    // Third-angle projection symbol — inked from the ProjectionSymbol layout item.
+    render_projection_symbol_from_layout(&mut out, &layout);
 
     out.push_str("</svg>\n");
     out
@@ -123,43 +130,68 @@ fn write_stylesheet(out: &mut String) {
     // `mm` here would lock fonts to physical 96 DPI millimetres,
     // which is why earlier revisions looked enormous and overlapping
     // in a fit-to-window viewer.
+    //
+    // LINE-WEIGHT HIERARCHY (ISO 128):
+    //   visible edges       0.50 mm  — heavy, reads as the part silhouette
+    //   hidden lines        0.25 mm  — half-weight dashed (occluded edges)
+    //   centerlines         0.18 mm  — chain long-short-long (ISO 04.1)
+    //   dim / extension     0.18 mm  — same thin tier as centerlines (ISO 129)
+    //   hole-table borders  0.25 mm outer / 0.18 mm inner separators
+    //   frame / titleblock  0.50 mm outer / 0.25 mm inner
+    //
+    // ARROWHEAD RATIO (ISO 128): length:width = 3:1
+    //   AR_L = 2.6 mm, AR_W = 0.85 mm → ratio ≈ 3.06:1  (within spec)
+    //
+    // TEXT HIERARCHY (ISO 7200 / ISO 128):
+    //   dim values    3.1 mm  (.dim-text)
+    //   view labels   3.6 mm  (.label)
+    //   title block   7.0 mm  (.title-value, layout::TITLE_FONT_MM)
+    //   table text    2.6 mm  (.hole-table-text, .hole-tag)
+    //   notes strip   2.4 mm  (.notes-strip)
     out.push_str("  <style>\n");
     out.push_str("    .sheet { fill: white; stroke: #aaa; stroke-width: 0.2; }\n");
-    out.push_str("    .frame { fill: none; stroke: #111; stroke-width: 0.6; }\n");
-    out.push_str("    .titleblock { fill: none; stroke: #111; stroke-width: 0.45; }\n");
-    out.push_str("    .titleblock-inner { fill: none; stroke: #111; stroke-width: 0.2; }\n");
+    // Frame outer border — ISO 128 heavy line (0.50 mm).
+    out.push_str("    .frame { fill: none; stroke: #111; stroke-width: 0.50; }\n");
+    // Title-block outer border — heavy (0.50 mm); inner separators thin (0.25 mm).
+    out.push_str("    .titleblock { fill: none; stroke: #111; stroke-width: 0.50; }\n");
+    out.push_str("    .titleblock-inner { fill: none; stroke: #111; stroke-width: 0.25; }\n");
+    // Visible edges — ISO 128 heavy visible line, 0.50 mm.
     out.push_str(
-        "    .view polyline { fill: none; stroke: #111; stroke-width: 0.2; \
+        "    .view polyline { fill: none; stroke: #111; stroke-width: 0.50; \
          stroke-linejoin: round; stroke-linecap: round; }\n",
     );
-    // Hidden line: thin dashed line, ISO 128 type-04 (occluded edges).
+    // Hidden line — ISO 128 type-04 dashed, 0.25 mm, dash 4 mm / gap 2 mm.
     out.push_str(
-        "    .view polyline.hidden { fill: none; stroke: #111; stroke-width: 0.18; \
-         stroke-dasharray: 2 1.2; stroke-linejoin: round; stroke-linecap: butt; }\n",
+        "    .view polyline.hidden { fill: none; stroke: #111; stroke-width: 0.25; \
+         stroke-dasharray: 4 2; stroke-linejoin: round; stroke-linecap: butt; }\n",
     );
-    // Analytic circles — same visible/hidden styling as the edge polylines.
-    out.push_str("    .view circle { fill: none; stroke: #111; stroke-width: 0.2; }\n");
+    // Analytic circles — same visible/hidden weighting as polylines.
+    out.push_str("    .view circle { fill: none; stroke: #111; stroke-width: 0.50; }\n");
     out.push_str(
-        "    .view circle.hidden { fill: none; stroke: #111; stroke-width: 0.18; \
-         stroke-dasharray: 2 1.2; }\n",
+        "    .view circle.hidden { fill: none; stroke: #111; stroke-width: 0.25; \
+         stroke-dasharray: 4 2; }\n",
     );
-    // Centerline: thin chain (dash-dot) line, ISO 128 convention.
+    // Centerline — ISO 128 chain line (long-short-long), 0.18 mm thin tier.
+    // Dash pattern: 8 mm dash, 1 mm gap, 1 mm dot, 1 mm gap (long-short-long).
     out.push_str(
         "    .centerline { stroke: #111; stroke-width: 0.18; fill: none; \
-         stroke-dasharray: 4 1 1 1; stroke-linecap: round; }\n",
+         stroke-dasharray: 8 1 1 1; stroke-linecap: round; }\n",
     );
+    // View labels — 3.6 mm, slightly muted so they don't compete with the part.
     out.push_str("    .label { font: 3.6px sans-serif; fill: #444; }\n");
-    // ISO 129 dimensions: thin black lines + filled arrowheads + a
-    // constant-size value label (centred via .dim-text-c).
+    // ISO 129 dimensions — thin tier 0.18 mm + filled arrowheads + 3.1 mm text.
     out.push_str("    .dim-line { stroke: #111; stroke-width: 0.18; fill: none; }\n");
     out.push_str("    .dim-arrow { fill: #111; stroke: none; }\n");
     out.push_str("    .dim-text { font: 3.1px sans-serif; fill: #111; }\n");
     out.push_str("    .dim-text-c { text-anchor: middle; dominant-baseline: alphabetic; }\n");
+    // Zone markers — 3 mm bold, centred in the margin cells.
     out.push_str(
         "    .zone { font: 700 3px sans-serif; fill: #111; text-anchor: middle; \
          dominant-baseline: middle; }\n",
     );
-    out.push_str("    .zone-mark { stroke: #111; stroke-width: 0.2; fill: none; }\n");
+    // Zone tick marks — 0.18 mm thin (same as dimension tier).
+    out.push_str("    .zone-mark { stroke: #111; stroke-width: 0.18; fill: none; }\n");
+    // Title-block field labels and values.
     out.push_str(
         "    .field-label { font: 700 2.4px sans-serif; fill: #555; \
          letter-spacing: 0.08px; }\n",
@@ -169,8 +201,9 @@ fn write_stylesheet(out: &mut String) {
         "    .field-value-mono { font: 700 3.6px 'Consolas', 'Menlo', monospace; \
          fill: #111; }\n",
     );
+    // Title-value: 7 mm per TITLE_FONT_MM / ISO 7200 §8.4 (large lettering).
     out.push_str(
-        "    .title-value { font: 700 6.5px sans-serif; fill: #111; \
+        "    .title-value { font: 700 7px sans-serif; fill: #111; \
          text-anchor: middle; }\n",
     );
     out.push_str(
@@ -190,16 +223,22 @@ fn write_stylesheet(out: &mut String) {
          dominant-baseline: middle; }\n",
     );
     out.push_str("    .logo-mark-fill { fill: #111; stroke: #111; stroke-width: 0.2; }\n");
+    // Notes strip — 2.4 mm, NOTES_FONT_MM tier.
     out.push_str(
         "    .notes-strip { font: 500 2.4px sans-serif; fill: #333; \
          letter-spacing: 0.06px; }\n",
     );
-    // Hole-table / hole-tag styles (Task 7).
+    // Projection symbol — pure thin lines (0.18 mm) + filled circles.
+    out.push_str("    .proj-sym { fill: none; stroke: #111; stroke-width: 0.18; }\n");
+    out.push_str("    .proj-sym-fill { fill: #111; stroke: none; }\n");
+    // Hole-table / hole-tag styles (Task 7) — TABLE_TEXT_FONT_MM = 2.6 mm.
     out.push_str(
         "    .hole-tag { font: 700 2.6px sans-serif; fill: #111; \
          text-anchor: middle; dominant-baseline: alphabetic; }\n",
     );
-    out.push_str("    .hole-table-border { fill: none; stroke: #111; stroke-width: 0.2; }\n");
+    // Hole-table outer border — 0.25 mm; inner separators handled as thin lines.
+    out.push_str("    .hole-table-border { fill: none; stroke: #111; stroke-width: 0.25; }\n");
+    out.push_str("    .hole-table-inner { fill: none; stroke: #111; stroke-width: 0.18; }\n");
     out.push_str("    .hole-table-text { font: 500 2.6px sans-serif; fill: #111; }\n");
     out.push_str("  </style>\n");
 }
@@ -237,7 +276,7 @@ pub(crate) fn title_block_size(sheet: &SheetSize) -> (f64, f64) {
     }
 }
 
-fn zone_target_width(sheet: &SheetSize) -> Option<f64> {
+pub(crate) fn zone_target_width(sheet: &SheetSize) -> Option<f64> {
     match sheet {
         SheetSize::A4 => None,
         SheetSize::A3 | SheetSize::A2 => Some(50.0),
@@ -482,7 +521,9 @@ fn render_hole_table(out: &mut String, layout: &SheetLayout) {
             b.height()
         );
     }
-    // Remaining borders are separator lines (thin bboxes).
+    // Remaining borders are separator lines (thin bboxes). Inner separators
+    // use `.hole-table-inner` (0.18 mm) while the outer border uses
+    // `.hole-table-border` (0.25 mm) — ISO 128 heavy/thin distinction.
     for sep in borders.iter().skip(1) {
         let b = &sep.bbox;
         // Determine orientation: a horizontal separator has height ≈ 0.2,
@@ -492,7 +533,7 @@ fn render_hole_table(out: &mut String, layout: &SheetLayout) {
             let y = 0.5 * (b.y0 + b.y1);
             let _ = write!(
                 out,
-                "  <line class=\"hole-table-border\" x1=\"{:.3}\" y1=\"{y:.3}\" \
+                "  <line class=\"hole-table-inner\" x1=\"{:.3}\" y1=\"{y:.3}\" \
                  x2=\"{:.3}\" y2=\"{y:.3}\" />\n",
                 b.x0, b.x1
             );
@@ -501,7 +542,7 @@ fn render_hole_table(out: &mut String, layout: &SheetLayout) {
             let x = 0.5 * (b.x0 + b.x1);
             let _ = write!(
                 out,
-                "  <line class=\"hole-table-border\" x1=\"{x:.3}\" y1=\"{:.3}\" \
+                "  <line class=\"hole-table-inner\" x1=\"{x:.3}\" y1=\"{:.3}\" \
                  x2=\"{x:.3}\" y2=\"{:.3}\" />\n",
                 b.y0, b.y1
             );
@@ -552,33 +593,31 @@ fn dim_text(out: &mut String, x: f64, y: f64, label: &str, rot: f64) {
 }
 
 // ---------------------------------------------------------------------
-// Notes strip (units + default tolerance)
+// Notes strip (from layout items — campaign-B debt retired)
 // ---------------------------------------------------------------------
 
-fn render_notes_strip(out: &mut String, drawing: &Drawing, frame_x: f64, frame_bottom: f64) {
-    // Three-line note strip anchored to the bottom-left of the frame:
-    // units, default tolerance, and projection convention. Sits above
-    // the bottom edge so it doesn't clash with the title block on the
-    // right.
-    let x = frame_x + 2.5;
-    let y_proj = frame_bottom - 9.0;
-    let y_top = frame_bottom - 6.0;
-    let y_bot = frame_bottom - 3.0;
-    let _ = write!(
-        out,
-        "  <text class=\"notes-strip\" x=\"{x:.3}\" y=\"{y_proj:.3}\">\
-         THIRD-ANGLE PROJECTION.</text>\n"
-    );
-    let _ = write!(
-        out,
-        "  <text class=\"notes-strip\" x=\"{x:.3}\" y=\"{y_top:.3}\">{}</text>\n",
-        escape_xml(&drawing.unit_note)
-    );
-    let _ = write!(
-        out,
-        "  <text class=\"notes-strip\" x=\"{x:.3}\" y=\"{y_bot:.3}\">{}</text>\n",
-        escape_xml(&drawing.tolerance_note)
-    );
+/// Ink NoteText layout items as `<text class="notes-strip">` elements.
+///
+/// Placement was computed once in `layout::place_note_items`; this function
+/// is a pure ink loop. Using the same items the verifier checks means a notes
+/// line that collides with a view label is caught — the old direct-ink path
+/// was invisible to the collision detector.
+fn render_notes_from_layout(out: &mut String, layout: &SheetLayout) {
+    for item in layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::NoteText)
+    {
+        let text = item.text.as_deref().unwrap_or("");
+        // NoteText bbox: y1 = baseline (same model as text_bbox helper).
+        let _ = write!(
+            out,
+            "  <text class=\"notes-strip\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
+            item.bbox.x0,
+            item.bbox.y1,
+            escape_xml(text)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -882,31 +921,57 @@ fn render_roshera_logo(out: &mut String, x: f64, y: f64, w: f64, h: f64) {
 }
 
 // ---------------------------------------------------------------------
-// Zone markers
+// Zone markers (Task 8: driven from layout items)
 // ---------------------------------------------------------------------
 
-fn render_zone_markers(out: &mut String, fx: f64, fy: f64, fw: f64, fh: f64, target_width: f64) {
-    let nx = (fw / target_width).round().max(2.0) as usize;
-    let ny = (fh / target_width).round().max(2.0) as usize;
-    let dx = fw / nx as f64;
-    let dy = fh / ny as f64;
-
+/// Ink zone-grid markers from the layout's `ZoneRef` items + tick marks.
+///
+/// The `ZoneRef` items carry the label text and bbox computed by
+/// `layout::place_zone_refs`; this function is a pure ink loop. Tick marks
+/// (short lines at zone-cell boundaries inside the frame margin) are still
+/// generated here from the frame geometry because they are pure decoration
+/// with no collision footprint.
+fn render_zone_markers_from_layout(
+    out: &mut String,
+    fx: f64,
+    fy: f64,
+    fw: f64,
+    fh: f64,
+    layout: &SheetLayout,
+) {
     out.push_str("  <g class=\"zones\">\n");
 
-    for i in 0..nx {
-        let cx = fx + dx * (i as f64 + 0.5);
-        let label = (i + 1).to_string();
+    // Ink text labels from ZoneRef items.
+    for item in layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::ZoneRef)
+    {
+        let text = item.text.as_deref().unwrap_or("");
+        let cx = 0.5 * (item.bbox.x0 + item.bbox.x1);
+        let cy = 0.5 * (item.bbox.y0 + item.bbox.y1);
         let _ = write!(
             out,
-            "    <text class=\"zone\" x=\"{cx:.3}\" y=\"{:.3}\">{label}</text>\n",
-            fy - 4.0
+            "    <text class=\"zone\" x=\"{cx:.3}\" y=\"{cy:.3}\">{}</text>\n",
+            escape_xml(text)
         );
-        let _ = write!(
-            out,
-            "    <text class=\"zone\" x=\"{cx:.3}\" y=\"{:.3}\">{label}</text>\n",
-            fy + fh + 4.0
-        );
-        if i > 0 {
+    }
+
+    // Tick marks at cell boundaries — generated from frame geometry, no items.
+    // Horizontal boundaries (top/bottom): tick at each column separator.
+    // Determine nx/ny from the first ZoneRef items' bboxes (or fall back to 0).
+    // We derive the counts by counting unique cx (horizontal) and cy (vertical)
+    // positions in the ZoneRef items placed in the TOP margin.
+    let top_refs: Vec<f64> = layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::ZoneRef && i.bbox.y1 < fy)
+        .map(|i| 0.5 * (i.bbox.x0 + i.bbox.x1))
+        .collect();
+    let nx = top_refs.len();
+    if nx > 1 {
+        let dx = fw / nx as f64;
+        for i in 1..nx {
             let x = fx + dx * i as f64;
             let _ = write!(
                 out,
@@ -925,20 +990,16 @@ fn render_zone_markers(out: &mut String, fx: f64, fy: f64, fw: f64, fh: f64, tar
         }
     }
 
-    for j in 0..ny {
-        let cy = fy + dy * (j as f64 + 0.5);
-        let letter = zone_letter(j);
-        let _ = write!(
-            out,
-            "    <text class=\"zone\" x=\"{:.3}\" y=\"{cy:.3}\">{letter}</text>\n",
-            fx - 4.5
-        );
-        let _ = write!(
-            out,
-            "    <text class=\"zone\" x=\"{:.3}\" y=\"{cy:.3}\">{letter}</text>\n",
-            fx + fw + 4.5
-        );
-        if j > 0 {
+    let left_refs: Vec<f64> = layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::ZoneRef && i.bbox.x1 < fx)
+        .map(|i| 0.5 * (i.bbox.y0 + i.bbox.y1))
+        .collect();
+    let ny = left_refs.len();
+    if ny > 1 {
+        let dy = fh / ny as f64;
+        for j in 1..ny {
             let yy = fy + dy * j as f64;
             let _ = write!(
                 out,
@@ -960,9 +1021,74 @@ fn render_zone_markers(out: &mut String, fx: f64, fy: f64, fw: f64, fh: f64, tar
     out.push_str("  </g>\n");
 }
 
-fn zone_letter(j: usize) -> char {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
-    ALPHABET[j % ALPHABET.len()] as char
+// ---------------------------------------------------------------------
+// Projection symbol (Task 8: third-angle truncated-cone glyph)
+// ---------------------------------------------------------------------
+
+/// Ink the third-angle projection symbol from the `ProjectionSymbol` layout item.
+///
+/// The glyph is the ISO 128-30 truncated-cone two-view symbol: a front view
+/// of the cone (an isosceles trapezoid) flanked by the side view (a filled
+/// circle + concentric outline). Drawn with thin ISO lines (0.18 mm).
+///
+/// Placement comes from the `ProjectionSymbol` layout item's bbox centre —
+/// no independent coordinate computation.
+fn render_projection_symbol_from_layout(out: &mut String, layout: &SheetLayout) {
+    let Some(item) = layout
+        .items
+        .iter()
+        .find(|i| i.kind == SheetItemKind::ProjectionSymbol)
+    else {
+        return;
+    };
+
+    let b = &item.bbox;
+    let cx = 0.5 * (b.x0 + b.x1);
+    let cy = 0.5 * (b.y0 + b.y1);
+    let sym_w = b.width();
+    let sym_h = b.height();
+
+    // The glyph consists of two parts separated by a gap:
+    //   Left half: front view = isosceles trapezoid (large base left, small base right)
+    //   Right half: side view = filled small circle inside a larger circle outline
+    //
+    // Dimensions scaled to sym_w × sym_h to fit the bbox.
+    let half_gap = sym_w * 0.05; // gap between the two views
+    let trap_w = sym_w * 0.45;
+    let circ_area_w = sym_w * 0.45;
+    let trap_x1 = cx - half_gap; // right edge of trapezoid
+    let trap_x0 = trap_x1 - trap_w; // left edge of trapezoid
+
+    // Trapezoid: large base height = sym_h * 0.8, small base height = sym_h * 0.4
+    let large_h = sym_h * 0.8;
+    let small_h = sym_h * 0.4;
+    let trap_y_top_large = cy - large_h * 0.5;
+    let trap_y_bot_large = cy + large_h * 0.5;
+    let trap_y_top_small = cy - small_h * 0.5;
+    let trap_y_bot_small = cy + small_h * 0.5;
+
+    // Trapezoid: four vertices (top-left, top-right, bottom-right, bottom-left)
+    let _ = write!(
+        out,
+        "  <polygon class=\"proj-sym\" points=\"{:.3},{:.3} {:.3},{:.3} {:.3},{:.3} {:.3},{:.3}\" />\n",
+        trap_x0, trap_y_top_large,
+        trap_x1, trap_y_top_small,
+        trap_x1, trap_y_bot_small,
+        trap_x0, trap_y_bot_large,
+    );
+
+    // Circle pair: large circle outline + small filled circle.
+    let circ_cx = cx + half_gap + circ_area_w * 0.5;
+    let r_outer = sym_h * 0.38;
+    let r_inner = sym_h * 0.15;
+    let _ = write!(
+        out,
+        "  <circle class=\"proj-sym\" cx=\"{circ_cx:.3}\" cy=\"{cy:.3}\" r=\"{r_outer:.3}\" />\n"
+    );
+    let _ = write!(
+        out,
+        "  <circle class=\"proj-sym-fill\" cx=\"{circ_cx:.3}\" cy=\"{cy:.3}\" r=\"{r_inner:.3}\" />\n"
+    );
 }
 
 // ---------------------------------------------------------------------
