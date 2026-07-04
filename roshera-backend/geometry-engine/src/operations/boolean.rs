@@ -254,6 +254,20 @@ struct SplitFace {
     /// this field to `vec![]` and only the merge pass writes non-empty
     /// values.
     inner_loops: Vec<Vec<(EdgeId, bool)>>,
+    /// Whether this face went through the split pipeline
+    /// (`split_face_by_curves` / an analytic arrangement) rather than
+    /// being copied whole by `add_non_intersecting_faces`.
+    ///
+    /// Consumed by `assign_boolean_face_pids`: only a NON-split 1:1
+    /// survivor may inherit its parent face's `PersistentId`. A split
+    /// face — even one producing a single result fragment, e.g. a plate
+    /// top face that gained a bore's inner loop — is a geometrically
+    /// different entity and must receive a freshly DERIVED pid;
+    /// inheriting there would silently re-bind labels/GD&T anchored to
+    /// the pre-cut face. Conservative by construction: any face that
+    /// entered the split pipeline is `true`, even the rare
+    /// all-cuts-void early return that emits the face unsplit.
+    was_split: bool,
 }
 
 /// Classification of face relative to other solid
@@ -4385,6 +4399,9 @@ fn add_non_intersecting_faces(
         // holed face — A's hole vanished).
         let (boundary_edges, inner_loops) = get_face_outer_and_inner_loops(model, face_id)?;
         out.push(SplitFace {
+            // True passthrough: copied whole, geometry untouched by the
+            // boolean — the ONLY origin allowed to inherit its parent PID.
+            was_split: false,
             original_face: face_id,
             surface: surface_id,
             boundary_edges,
@@ -4926,6 +4943,7 @@ fn assemble_multi_component_sphere_regions(
                 Some(c)
             })?;
         out.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: lp.clone(),
@@ -5352,6 +5370,7 @@ fn split_sphere_face_by_circles(
                     continue;
                 };
                 faces.push(SplitFace {
+                    was_split: true,
                     original_face: face_id,
                     surface: surface_id,
                     boundary_edges: loop_edges,
@@ -5446,6 +5465,7 @@ fn split_sphere_face_by_circles(
         let dir = (c_center - center).normalize().unwrap_or(c_axis);
         let cap_interior = center + dir * radius;
         cap_faces.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: ordered,
@@ -5505,6 +5525,7 @@ fn split_sphere_face_by_circles(
             .collect();
         let mut result = cap_faces;
         result.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: reversed,
@@ -5519,6 +5540,7 @@ fn split_sphere_face_by_circles(
     let mut result = cap_faces;
     if let Some(ci) = central_interior {
         result.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: Vec::new(),
@@ -5664,6 +5686,7 @@ fn split_cone_face_by_circles(
     let mut faces = Vec::new();
     // Apex tip band: apex .. circles[0]. One boundary loop.
     faces.push(SplitFace {
+        was_split: true,
         original_face: face_id,
         surface: surface_id,
         boundary_edges: circles[0].1.clone(),
@@ -5677,6 +5700,7 @@ fn split_cone_face_by_circles(
         let (v_lo, lo_loop) = (&circles[i].0, &circles[i].1);
         let (v_hi, hi_loop) = (&circles[i + 1].0, &circles[i + 1].1);
         faces.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: lo_loop.clone(),
@@ -5891,6 +5915,7 @@ fn split_cylinder_lateral_by_window(
     Some(vec![
         // The window patch (interior of the cut loop, inside the cutting solid).
         SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: window_loop.clone(),
@@ -5902,6 +5927,7 @@ fn split_cylinder_lateral_by_window(
         // The complement: full original lateral boundary with the window as a
         // hole. CDT meshes lateral-minus-window; bands stay welded to the caps.
         SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: boundary_edges.to_vec(),
@@ -6110,6 +6136,7 @@ fn split_cylinder_lateral_by_sectors(
         let radial = u1 * th_mid.cos() + u2 * th_mid.sin();
         let interior = origin + axis * mid_axial + radial * radius;
         faces.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: loop_edges,
@@ -6302,6 +6329,7 @@ fn split_cone_face_by_sectors(
         let radial = u1 * th_mid.cos() + u2 * th_mid.sin();
         let interior = apex + axis * v_mid + radial * (v_mid * k);
         faces.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: loop_edges,
@@ -6419,6 +6447,7 @@ fn split_torus_face_by_ovals(
         let u_center = su.atan2(cu);
         let bump_pt = torus.point_at(u_center, 0.0).ok()?;
         faces.push(SplitFace {
+            was_split: true,
             original_face: face_id,
             surface: surface_id,
             boundary_edges: oval.clone(),
@@ -6435,6 +6464,7 @@ fn split_torus_face_by_ovals(
 
     let main_pt = torus.point_at(0.0, std::f64::consts::PI).ok()?;
     faces.push(SplitFace {
+        was_split: true,
         original_face: face_id,
         surface: surface_id,
         boundary_edges: boundary_edges.to_vec(),
@@ -6931,6 +6961,7 @@ fn split_face_by_curves(
             );
         }
         return Ok(vec![SplitFace {
+            was_split: true,
             original_face,
             surface,
             boundary_edges: outer_only,
@@ -12535,6 +12566,7 @@ fn create_split_face(
     origin_solid: SolidId,
 ) -> OperationResult<SplitFace> {
     Ok(SplitFace {
+        was_split: true,
         original_face,
         surface: surface_id,
         boundary_edges: edges,
@@ -15686,7 +15718,7 @@ fn build_shells_from_faces(
     // the TRUE parent input face (`SplitFace.original_face`) + which operand it
     // came from, so each result face's PID derives from its real source. Filled
     // at the face-creation seam below; consumed by `assign_boolean_face_pids`.
-    let mut face_lineage: Vec<(FaceId, FaceId, SolidId)> = Vec::new();
+    let mut face_lineage: Vec<(FaceId, FaceId, SolidId, bool)> = Vec::new();
 
     for component in components {
         // Pick shell type per options: when non-manifold is permitted, we may
@@ -15810,7 +15842,12 @@ fn build_shells_from_faces(
                 }
             }
 
-            face_lineage.push((face_id, split_face.original_face, split_face.from_solid));
+            face_lineage.push((
+                face_id,
+                split_face.original_face,
+                split_face.from_solid,
+                split_face.was_split,
+            ));
             shell.add_face(face_id);
         }
 
@@ -15863,9 +15900,19 @@ fn boolean_face_centroid(model: &BRepModel, face_id: FaceId) -> [f64; 3] {
 /// mould, best-effort under a split-reordering edit (a fully topological
 /// fragment key — bounding cut-face set — is the documented deepening, needing
 /// per-result-edge source-face lineage).
+///
+/// Inheritance vs derivation: a TRUE passthrough — `was_split == false`
+/// (copied whole by `add_non_intersecting_faces`), exactly one result face,
+/// and a parent that already carries a PID — INHERITS that PID, so identity
+/// follows the entity across unrelated successive booleans (dimension pids
+/// must not drift). Anything that went through the split pipeline gets a
+/// freshly DERIVED pid even when it produced a single fragment: a plate top
+/// face that gained a bore's inner loop is a geometrically different entity,
+/// and inheriting there would silently re-bind labels/GD&T anchored to the
+/// pre-cut face.
 fn assign_boolean_face_pids(
     model: &mut BRepModel,
-    lineage: &[(FaceId, FaceId, SolidId)],
+    lineage: &[(FaceId, FaceId, SolidId, bool)],
     operation: BooleanOp,
     solid_b: SolidId,
 ) {
@@ -15874,13 +15921,32 @@ fn assign_boolean_face_pids(
 
     let op_tag = format!("boolean_{operation:?}");
 
-    // Group result faces by their (parent input face, operand).
-    let mut groups: HashMap<(FaceId, SolidId), Vec<FaceId>> = HashMap::new();
-    for &(result, parent, from) in lineage {
-        groups.entry((parent, from)).or_default().push(result);
+    // Group result faces by their (parent input face, operand); a parent's
+    // fragments all come from ONE origin path, so `was_split` is OR-folded
+    // (conservative: any split evidence forces derivation).
+    let mut groups: HashMap<(FaceId, SolidId), (Vec<FaceId>, bool)> = HashMap::new();
+    for &(result, parent, from, was_split) in lineage {
+        let entry = groups.entry((parent, from)).or_default();
+        entry.0.push(result);
+        entry.1 |= was_split;
     }
 
-    for ((parent, from), mut result_faces) in groups {
+    // Uniqueness guard (test builds only): the same PersistentId must never
+    // be assigned to two DIFFERENT result faces within one boolean's pass —
+    // a collision here means `pid_to_face` silently lost an entry.
+    let mut assigned_this_pass: HashMap<PersistentId, FaceId> = HashMap::new();
+    let mut guard_and_set = |model: &mut BRepModel, face: FaceId, pid: PersistentId| {
+        if let Some(prev) = assigned_this_pass.insert(pid, face) {
+            debug_assert_eq!(
+                prev, face,
+                "assign_boolean_face_pids: PID {pid:?} assigned to two different \
+                 result faces ({prev} and {face}) in one boolean pass"
+            );
+        }
+        model.set_face_pid(face, pid);
+    };
+
+    for ((parent, from), (mut result_faces, was_split)) in groups {
         // Parent face PID — the real source identity. Fall back to a mint keyed
         // on the operand PID when the input carried no lineage (e.g. a solid
         // built without an event key); still traceable, just not mould-stable.
@@ -15909,17 +15975,18 @@ fn assign_boolean_face_pids(
         parents.push(parent_pid);
 
         if result_faces.len() == 1 {
-            // When a face survives the boolean without being split (1:1 from
-            // parent), inherit the parent's PID directly.  Identity follows
-            // the entity — a face that merely passes through an unrelated cut
-            // must not have its PID re-derived through the new operation's
-            // context, or dimension pids will drift on every successive boolean.
-            let pid = if model.face_pids.contains_key(&parent) {
+            // Inherit ONLY for a true passthrough: the face was copied whole
+            // (never entered the split pipeline) AND its parent carries a
+            // real PID. A single-fragment SPLIT survivor is a different
+            // entity (e.g. an annular top face after a bore) and must be
+            // derived, or labels/GD&T bound to the pre-cut face silently
+            // re-bind to the trimmed one.
+            let pid = if !was_split && model.face_pids.contains_key(&parent) {
                 parent_pid
             } else {
                 PersistentId::derive(&parents, &op_tag, &role)
             };
-            model.set_face_pid(result_faces[0], pid);
+            guard_and_set(model, result_faces[0], pid);
         } else {
             // Several fragments of one parent: order by centroid for a stable
             // discriminator, fold the ordinal into the op tag.
@@ -15931,7 +15998,7 @@ fn assign_boolean_face_pids(
             for (i, &face) in result_faces.iter().enumerate() {
                 let tag = format!("{op_tag}#{i}");
                 let pid = PersistentId::derive(&parents, &tag, &role);
-                model.set_face_pid(face, pid);
+                guard_and_set(model, face, pid);
             }
         }
     }
@@ -16442,6 +16509,7 @@ mod tests {
         // don't-care fixture value (the test exercises only adjacency).
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![(1, true), (2, true), (3, true)],
@@ -16451,6 +16519,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![(4, true), (5, true), (6, true)],
@@ -16473,6 +16542,7 @@ mod tests {
         // don't-care fixture value (the test exercises only adjacency).
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![(1, true), (2, true), (3, true)],
@@ -16482,6 +16552,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![(3, true), (4, true), (5, true)],
@@ -16491,6 +16562,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![(10, true), (11, true), (12, true)],
@@ -16560,6 +16632,7 @@ mod tests {
         // Origins: face 0 from A, face 1 from B, face 2 boundary from A.
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![],
@@ -16569,6 +16642,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
@@ -16578,6 +16652,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
@@ -16599,6 +16674,7 @@ mod tests {
     fn test_select_faces_intersection() {
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![],
@@ -16608,6 +16684,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
@@ -16617,6 +16694,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
@@ -16638,6 +16716,7 @@ mod tests {
     fn test_select_faces_difference() {
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face: 0,
                 surface: 0,
                 boundary_edges: vec![],
@@ -16647,6 +16726,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 1,
                 surface: 1,
                 boundary_edges: vec![],
@@ -16656,6 +16736,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 2,
                 surface: 2,
                 boundary_edges: vec![],
@@ -16665,6 +16746,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 3,
                 surface: 3,
                 boundary_edges: vec![],
@@ -18659,6 +18741,7 @@ mod tests {
         let from_solid: SolidId = 0; // solid_a
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: outer_edges,
@@ -18668,6 +18751,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_edges.clone(),
@@ -18735,6 +18819,7 @@ mod tests {
         let from_solid: SolidId = 0;
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: outer_edges,
@@ -18744,6 +18829,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_edges,
@@ -18873,6 +18959,7 @@ mod tests {
         let from_solid: SolidId = 0;
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: vec![(ae0, true), (ae1, true), (ae2, true), (ae3, true)],
@@ -18882,6 +18969,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: vec![(be0, true), (be1, true), (be2, true), (be3, true)],
@@ -19027,6 +19115,7 @@ mod tests {
         let original_face: FaceId = 99;
         let from_solid: SolidId = 0;
         let faces = vec![SplitFace {
+            was_split: true,
             original_face,
             surface: surface_id,
             boundary_edges: outer_edges.clone(),
@@ -19065,6 +19154,7 @@ mod tests {
         let original_face: FaceId = 99;
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: outer_edges,
@@ -19074,6 +19164,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_edges,
@@ -19115,6 +19206,7 @@ mod tests {
 
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face: 99,
                 surface: surface_id,
                 boundary_edges: outer_edges,
@@ -19124,6 +19216,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face: 100, // different source face
                 surface: surface_id,
                 boundary_edges: inner_edges,
@@ -19189,6 +19282,7 @@ mod tests {
         let from_solid: SolidId = 0;
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: outer_edges,
@@ -19198,6 +19292,7 @@ mod tests {
                 inner_loops: vec![pre_existing.clone()],
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_edges,
@@ -19255,6 +19350,7 @@ mod tests {
         let from_solid: SolidId = 0;
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: outer,
@@ -19264,6 +19360,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_a,
@@ -19273,6 +19370,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_b,
@@ -19332,6 +19430,7 @@ mod tests {
         let from_solid: SolidId = 0; // solid_a, so Outside is kept by Difference
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: outer_edges,
@@ -19341,6 +19440,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_edges,
@@ -19397,6 +19497,7 @@ mod tests {
         let from_solid: SolidId = 0;
         let faces = vec![
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: outer_edges,
@@ -19406,6 +19507,7 @@ mod tests {
                 inner_loops: Vec::new(),
             },
             SplitFace {
+                was_split: true,
                 original_face,
                 surface: surface_id,
                 boundary_edges: inner_edges,

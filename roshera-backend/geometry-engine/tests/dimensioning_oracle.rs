@@ -7,6 +7,7 @@
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::primitives::solid::SolidId;
+use geometry_engine::primitives::surface::Plane;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::readable::{extract_dimensions, DimensionRecord};
 
@@ -315,5 +316,106 @@ fn extent_pid_stable_and_axis_distinct() {
     assert_eq!(
         pids, again,
         "pids must be deterministic across re-extraction"
+    );
+}
+
+/// Raw PersistentId (u128) of the planar face of `s` whose plane normal is
+/// parallel to `axis` and whose plane origin projects to `offset` along it.
+/// Panics if no such face exists (test precondition).
+fn plane_face_pid(m: &BRepModel, s: SolidId, axis: Vector3, offset: f64) -> Option<u128> {
+    for fid in face_ids(m, s) {
+        let face = match m.faces.get(fid) {
+            Some(f) => f,
+            None => continue,
+        };
+        let surf = match m.surfaces.get(face.surface_id) {
+            Some(s) => s,
+            None => continue,
+        };
+        let pl = match surf.as_any().downcast_ref::<Plane>() {
+            Some(p) => p,
+            None => continue,
+        };
+        let along = pl.normal.x * axis.x + pl.normal.y * axis.y + pl.normal.z * axis.z;
+        if along.abs() < 0.999 {
+            continue;
+        }
+        let origin_proj = pl.origin.x * axis.x + pl.origin.y * axis.y + pl.origin.z * axis.z;
+        if (origin_proj - offset).abs() > 1e-6 {
+            continue;
+        }
+        return m.face_pids.get(&fid).map(|p| p.as_u128());
+    }
+    panic!("no planar face with normal ∥ {axis:?} at offset {offset} on solid {s:?}");
+}
+
+/// A face the boolean geometrically ALTERED (the plate top face gains the
+/// bore's inner loop → it is an annular face, a different entity) must get a
+/// NEW pid — while a face the boolean never touched (a side wall) keeps its
+/// pid (true passthrough). Guards against the corruption case where a
+/// single-fragment split survivor inherits its parent's PID and labels/GD&T
+/// bound to the pre-cut face silently re-bind to the trimmed one.
+#[test]
+fn trimmed_face_pid_changes_untouched_face_pid_survives() {
+    let mut m = BRepModel::new();
+    // Box 60×60×10 centred at origin: top plane z=+5, side plane x=+30.
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(60.0, 60.0, 10.0)
+        .expect("plate"));
+    let top_before = plane_face_pid(&m, plate, Vector3::Z, 5.0).expect("plate top face has a pid");
+    let side_before =
+        plane_face_pid(&m, plate, Vector3::X, 30.0).expect("plate side face has a pid");
+
+    // Bore through the middle: cuts top and bottom, never touches the sides.
+    let bore = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -6.0), Vector3::Z, 4.0, 12.0)
+        .expect("bore"));
+    let part = diff(&mut m, plate, bore);
+
+    let top_after = plane_face_pid(&m, part, Vector3::Z, 5.0).expect("bored top face has a pid");
+    let side_after = plane_face_pid(&m, part, Vector3::X, 30.0).expect("side face still has a pid");
+
+    assert_eq!(
+        side_before, side_after,
+        "untouched side face is a true passthrough — its pid must survive"
+    );
+    assert_ne!(
+        top_before, top_after,
+        "the bored (annular) top face is a DIFFERENT entity from the flat \
+         pre-cut face — inheriting the old pid silently re-binds labels/GD&T"
+    );
+}
+
+/// Identity follows the ENTITY, not the shape: recreating a geometrically
+/// identical bore (fresh plate, fresh cutter, same numbers) is a new feature
+/// instance and must yield a DIFFERENT dimension pid.
+#[test]
+fn recreated_identical_bore_gets_new_pid() {
+    let mut m = BRepModel::new();
+
+    let bore_pid = |m: &mut BRepModel| -> String {
+        let plate = sid(TopologyBuilder::new(m)
+            .create_box_3d(60.0, 60.0, 10.0)
+            .expect("plate"));
+        let cutter = sid(TopologyBuilder::new(m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -6.0), Vector3::Z, 4.0, 12.0)
+            .expect("cutter"));
+        let part = diff(m, plate, cutter);
+        extract_dimensions(m, part)
+            .into_iter()
+            .find(|d| d.kind == "diameter" && (d.value - 8.0).abs() < 1e-6)
+            .and_then(|d| d.pid)
+            .expect("bore diameter must carry a pid")
+    };
+
+    // Build the bored plate, then "delete and recreate": build an identical
+    // one from scratch in the same model — same geometry, new entities.
+    let pid_first = bore_pid(&mut m);
+    let pid_recreated = bore_pid(&mut m);
+
+    assert_ne!(
+        pid_first, pid_recreated,
+        "a recreated identical bore is a NEW feature instance — identity \
+         follows the entity, not the shape"
     );
 }

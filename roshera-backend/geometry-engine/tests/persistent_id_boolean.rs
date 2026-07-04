@@ -2,13 +2,15 @@
 //!
 //! Boolean is where lineage is easy to fake and hard to do right. These checks
 //! verify it is SOUND, not cosmetic:
-//!   * REAL parent attribution — a surviving face's PID equals the *principled
-//!     derivation* from its TRUE parent input face (recomputed independently),
-//!     not a positional label;
+//!   * REAL parent attribution — an untouched passthrough face INHERITS its
+//!     TRUE parent input face's PID (identity follows the entity across
+//!     unrelated booleans — no per-operation drift), while a face the boolean
+//!     geometrically altered gets a fresh *principled derivation* from its
+//!     parent, never a positional label;
 //!   * coverage + distinctness — every result face carries a distinct,
 //!     round-trippable PID across union / difference / intersection;
-//!   * correct operand side — a face from the cutter derives via BooleanFromB,
-//!     a face from the body via BooleanFromA;
+//!   * correct operand side — a split face from the cutter derives via
+//!     BooleanFromB, a split face from the body via BooleanFromA;
 //!   * MOULD stability — editing an operand's dimension and re-evaluating
 //!     preserves the PIDs of the faces that survive unchanged.
 
@@ -144,24 +146,33 @@ fn every_result_face_has_a_distinct_recoverable_pid() {
 }
 
 #[test]
-fn surviving_face_pid_is_the_principled_derivation_from_its_true_parent() {
-    // The deep check: the +X side face survives the bore untouched, so its
-    // result PID must EQUAL the independent derivation from the block's +X face
-    // PID — proving the lineage traces to the real parent, not a guess.
+fn untouched_passthrough_face_inherits_its_parent_pid() {
+    // The deep check, updated to the inheritance doctrine (Viewport Dimensions
+    // Task 1): the +X side face survives the bore UNTOUCHED — a true
+    // passthrough copied whole by `add_non_intersecting_faces` — so its result
+    // PID must EQUAL its parent's PID (identity follows the entity). It must
+    // NOT be the per-boolean BooleanFromA derivation: re-deriving through
+    // each operation's context is exactly the drift that made dimension /
+    // label / GD&T anchors rot across unrelated successive booleans.
     let b = build_bored_block(8.0);
     let res_px = planar_face(&b.m, b.result, 0, 20.0).expect("result +X face");
     let got = b.m.face_pid(res_px).expect("result +X face pid");
 
-    let expected = PersistentId::derive(
+    assert_eq!(
+        got, b.block_px_pid,
+        "an untouched passthrough face INHERITS its true parent's PID"
+    );
+    let per_boolean_derivation = PersistentId::derive(
         &[b.block_solid_pid, b.block_px_pid],
         "boolean_Difference",
         &Role::BooleanFromA {
             source_face_pid: b.block_px_pid,
         },
     );
-    assert_eq!(
-        got, expected,
-        "surviving face PID is the principled BooleanFromA derivation from its true parent"
+    assert_ne!(
+        got, per_boolean_derivation,
+        "passthrough PID must not be re-derived through the boolean's context \
+         (that re-derivation is the identity-drift bug)"
     );
 }
 
