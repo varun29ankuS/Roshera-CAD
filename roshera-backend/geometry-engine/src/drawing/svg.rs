@@ -102,6 +102,12 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
         render_hole_table(&mut out, &layout);
     }
 
+    // Cutting-plane indicator (Task 9): ISO 128 style — chain-line body with
+    // thick ends, arrows at both ends, "A" letters from CuttingPlaneLabel items.
+    if let Some(cpl) = &drawing.cutting_plane_line {
+        render_cutting_plane(&mut out, drawing, cpl, h, &layout);
+    }
+
     // Notes strip — inked from NoteText layout items (campaign-B debt retired).
     // Routed through layout so text-collision invariants cover them.
     render_notes_from_layout(&mut out, &layout);
@@ -240,6 +246,23 @@ fn write_stylesheet(out: &mut String) {
     out.push_str("    .hole-table-border { fill: none; stroke: #111; stroke-width: 0.25; }\n");
     out.push_str("    .hole-table-inner { fill: none; stroke: #111; stroke-width: 0.18; }\n");
     out.push_str("    .hole-table-text { font: 500 2.6px sans-serif; fill: #111; }\n");
+    // Cutting-plane indicator (Task 9, ISO 128):
+    //   - Body: chain line 0.18 mm (same as centerline tier).
+    //   - Thick ends: 0.50 mm heavy segments at each tip (ISO 128 §7.3).
+    //   - Arrows and "A" labels: 0.18 mm stroke, 3.6 mm font (view-label tier).
+    out.push_str(
+        "    .cutting-plane { stroke: #111; stroke-width: 0.18; fill: none; \
+         stroke-dasharray: 8 1 1 1; stroke-linecap: round; }\n",
+    );
+    out.push_str(
+        "    .cutting-plane-end { stroke: #111; stroke-width: 0.50; fill: none; \
+         stroke-linecap: round; }\n",
+    );
+    out.push_str("    .cutting-plane-arrow { fill: #111; stroke: none; }\n");
+    out.push_str(
+        "    .cutting-plane-label { font: 700 3.6px sans-serif; fill: #111; \
+         text-anchor: middle; dominant-baseline: alphabetic; }\n",
+    );
     out.push_str("  </style>\n");
 }
 
@@ -1134,4 +1157,136 @@ fn escape_xml(input: &str) -> String {
         }
     }
     out
+}
+
+// ── Cutting-plane indicator (Task 9) ──────────────────────────────────────────
+
+/// Render the ISO 128 cutting-plane indicator in the axial view:
+///
+/// - Chain-line body (`.cutting-plane` class, 0.18 mm, long-short-long dash).
+/// - Thick end segments (`.cutting-plane-end`, 0.50 mm) at each tip.
+/// - Filled arrowheads (`.cutting-plane-arrow`) pointing in the section
+///   viewing direction.
+/// - "A" letters (`.cutting-plane-label`, 3.6 mm font) at each end,
+///   inked from the `CuttingPlaneLabel` layout items.
+///
+/// All geometry is in SHEET space (the axial view has already been
+/// coordinate-transformed via `position_mm` + `scale`).
+fn render_cutting_plane(
+    out: &mut String,
+    drawing: &super::types::Drawing,
+    cpl: &super::dimensioning::CuttingPlaneLine,
+    sheet_h: f64,
+    layout: &super::layout::SheetLayout,
+) {
+    use super::layout::SheetItemKind;
+
+    let Some(ax_view) = drawing.views.get(cpl.ax_view_idx) else {
+        return;
+    };
+
+    // Convert view-space endpoints to sheet space.
+    let to_sheet = |p: [f64; 2]| -> [f64; 2] {
+        [
+            ax_view.position_mm[0] + p[0] * ax_view.scale,
+            (sheet_h - ax_view.position_mm[1]) - p[1] * ax_view.scale,
+        ]
+    };
+
+    let sp0 = to_sheet(cpl.p0);
+    let sp1 = to_sheet(cpl.p1);
+
+    // Arrow direction in sheet space. The arrow_dir is in axial view space;
+    // the Y axis is flipped in SVG (+y down vs +y up in view space), so
+    // we negate the y component when converting to sheet space.
+    let (adx, ady) = (cpl.arrow_dir[0], -cpl.arrow_dir[1]);
+    let alen = (adx * adx + ady * ady).sqrt().max(1e-9);
+    let (adx, ady) = (adx / alen, ady / alen);
+
+    // Line direction (sp0 → sp1), normalised.
+    let ldx = sp1[0] - sp0[0];
+    let ldy = sp1[1] - sp0[1];
+    let llen = (ldx * ldx + ldy * ldy).sqrt().max(1e-9);
+    let (udx, udy) = (ldx / llen, ldy / llen);
+
+    // Thick-end segment length: 4 mm each tip.
+    const END_LEN: f64 = 4.0;
+    // Chain-line body: from sp0 + END_LEN to sp1 − END_LEN.
+    let body_s = [sp0[0] + END_LEN * udx, sp0[1] + END_LEN * udy];
+    let body_e = [sp1[0] - END_LEN * udx, sp1[1] - END_LEN * udy];
+
+    // ── Chain-line body ────────────────────────────────────────────────────────
+    let _ = write!(
+        out,
+        "  <line class=\"cutting-plane\" \
+         x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\" />\n",
+        body_s[0], body_s[1], body_e[0], body_e[1]
+    );
+
+    // ── Thick ends ─────────────────────────────────────────────────────────────
+    let _ = write!(
+        out,
+        "  <line class=\"cutting-plane-end\" \
+         x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\" />\n",
+        sp0[0], sp0[1], body_s[0], body_s[1]
+    );
+    let _ = write!(
+        out,
+        "  <line class=\"cutting-plane-end\" \
+         x1=\"{:.3}\" y1=\"{:.3}\" x2=\"{:.3}\" y2=\"{:.3}\" />\n",
+        sp1[0], sp1[1], body_e[0], body_e[1]
+    );
+
+    // ── Arrowheads at both ends ────────────────────────────────────────────────
+    // Arrowhead at sp0: tip at sp0, pointing in arrow_dir.
+    let ar_l = super::layout::AR_L;
+    let ar_w = super::layout::AR_W;
+    // Perpendicular to arrow direction (for arrowhead base width).
+    let (perp_x, perp_y) = (-ady, adx);
+
+    // Arrow at sp0: tip = sp0, base = sp0 - ar_l * arrow_dir ± ar_w * perp.
+    let base0_a = [
+        sp0[0] - ar_l * adx + ar_w * perp_x,
+        sp0[1] - ar_l * ady + ar_w * perp_y,
+    ];
+    let base0_b = [
+        sp0[0] - ar_l * adx - ar_w * perp_x,
+        sp0[1] - ar_l * ady - ar_w * perp_y,
+    ];
+    let _ = write!(
+        out,
+        "  <polygon class=\"cutting-plane-arrow\" points=\"{:.3},{:.3} {:.3},{:.3} {:.3},{:.3}\" />\n",
+        sp0[0], sp0[1], base0_a[0], base0_a[1], base0_b[0], base0_b[1]
+    );
+
+    // Arrow at sp1: tip = sp1, pointing in arrow_dir (same direction — both arrows
+    // point toward the section viewer, as per ISO 128 §7.3).
+    let base1_a = [
+        sp1[0] - ar_l * adx + ar_w * perp_x,
+        sp1[1] - ar_l * ady + ar_w * perp_y,
+    ];
+    let base1_b = [
+        sp1[0] - ar_l * adx - ar_w * perp_x,
+        sp1[1] - ar_l * ady - ar_w * perp_y,
+    ];
+    let _ = write!(
+        out,
+        "  <polygon class=\"cutting-plane-arrow\" points=\"{:.3},{:.3} {:.3},{:.3} {:.3},{:.3}\" />\n",
+        sp1[0], sp1[1], base1_a[0], base1_a[1], base1_b[0], base1_b[1]
+    );
+
+    // ── "A" labels from CuttingPlaneLabel layout items ────────────────────────
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::CuttingPlaneLabel)
+    {
+        // Ink at the horizontal centre / top of the bbox.
+        let cx = (item.bbox.x0 + item.bbox.x1) * 0.5;
+        let cy = item.bbox.y1; // baseline = bbox bottom (matching text_bbox convention)
+        let _ = write!(
+            out,
+            "  <text class=\"cutting-plane-label\" x=\"{cx:.3}\" y=\"{cy:.3}\">A</text>\n"
+        );
+    }
 }

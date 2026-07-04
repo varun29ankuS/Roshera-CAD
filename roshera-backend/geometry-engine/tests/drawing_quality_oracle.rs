@@ -10,9 +10,9 @@ use geometry_engine::drawing::dimensioning::Dimension2d;
 use geometry_engine::drawing::dxf::render_drawing_dxf;
 use geometry_engine::drawing::layout::{compute_layout, SheetItemKind};
 use geometry_engine::drawing::{
-    build_hole_table, render_drawing_svg, standard_drawing_auto, verify_drawing, Drawing,
-    DrawingIssueKind, Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, SheetSize,
-    ViewExtent, ViewSource,
+    build_hole_table, render_drawing_svg, section_slot_rule, standard_drawing_auto, verify_drawing,
+    CuttingPlaneLine, Drawing, DrawingIssueKind, Polyline2d, ProjectedView, ProjectedViewId,
+    ProjectionType, SectionSlotRule, SheetSize, ViewExtent, ViewSource,
 };
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
@@ -343,13 +343,27 @@ fn six_hole_plate_sheet_is_clean() {
     assert!(!report.has(DrawingIssueKind::ViewLabelCollision));
     assert!(!report.has(DrawingIssueKind::RedundantDimension));
     let svg = render_drawing_svg(&dwg);
-    for name in ["FRONT", "TOP", "RIGHT", "ISOMETRIC"] {
+    // Task 9: on A4 the ISOMETRIC slot is replaced by SECTION A-A.
+    // The six-hole plate (40 mm) lands on A4. Assert the three orthographic
+    // labels are each inked once, and SECTION A-A appears once.
+    for name in ["FRONT", "TOP", "RIGHT"] {
         assert_eq!(
             svg.matches(&format!(">{name} (")).count(),
             1,
             "view label '{name}' inked exactly once"
         );
     }
+    assert_eq!(
+        svg.matches(">SECTION A-A (").count(),
+        1,
+        "view label 'SECTION A-A' must be inked exactly once on A4 (replaces ISO)"
+    );
+    // ISOMETRIC is gone on A4 (replaced by SECTION A-A).
+    assert_eq!(
+        svg.matches(">ISOMETRIC (").count(),
+        0,
+        "ISOMETRIC must NOT appear on A4 — it is replaced by SECTION A-A"
+    );
     // Task 7: the hole table must be ON this sheet. Six Ø5 THRU bores form
     // one group A with instances A1..A6: six tag CALLOUTS (class="hole-tag")
     // in the axial view, and every tag string present at least twice — once
@@ -1752,4 +1766,183 @@ fn view_label_colliding_with_notes_strip_flagged() {
         report.issues
     );
     assert!(!report.passed, "ViewLabelCollision is Severity::Error");
+}
+
+// ── Task 9: Section A-A ───────────────────────────────────────────────────────
+
+/// UNIT TEST — `section_slot_rule` both branches.
+///
+/// A4 → `ReplaceIso` (the SECTION view replaces the isometric slot because the
+/// sheet is too small for a genuine fifth slot).
+/// A3 (and all larger formats) → `FifthSlot` (a proper fifth view column).
+///
+/// Mutation proof: swap the match arms → one of the two asserts turns RED.
+#[test]
+fn section_slot_rule_a4_replace_a3_fifth() {
+    assert_eq!(
+        section_slot_rule(&SheetSize::A4),
+        SectionSlotRule::ReplaceIso,
+        "A4 is too small for a fifth slot — replace ISO"
+    );
+    assert_eq!(
+        section_slot_rule(&SheetSize::A3),
+        SectionSlotRule::FifthSlot,
+        "A3 has room for a genuine fifth slot"
+    );
+}
+
+/// UNIT TEST — `section_slot_rule` for A2.
+///
+/// A2 is larger than A3 so it must also use `FifthSlot`.
+///
+/// Mutation proof: return `ReplaceIso` unconditionally → this fails → RED.
+#[test]
+fn section_slot_rule_a2_fifth() {
+    assert_eq!(
+        section_slot_rule(&SheetSize::A2),
+        SectionSlotRule::FifthSlot,
+        "A2 gets a genuine fifth slot"
+    );
+}
+
+/// INTEGRATION TEST — six-hole-plate gains SECTION A-A.
+///
+/// The six-hole plate has internal bore features, so `standard_drawing_auto`
+/// must produce a SECTION A-A view.  The sheet must:
+/// - Have 5 views (or at least one named "SECTION A-A").
+/// - Pass the quality oracle.
+/// - Ink at least one `<text … class="cutting-plane-label"` element (the "A"
+///   letters at each end of the cutting-plane line).
+/// - Ink at least one hatch line — the section cut body.
+///
+/// Mutation proof: delete the `attach_section_view` call in
+/// `standard_drawing_auto` → no "SECTION A-A" view → `has_section` = false
+/// → assert fires → RED.
+#[test]
+fn six_hole_plate_has_section_view() {
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+
+    let has_section = dwg.views.iter().any(|v| v.name == "SECTION A-A");
+    assert!(
+        has_section,
+        "six-hole-plate sheet must contain SECTION A-A view"
+    );
+
+    let report = verify_drawing(&dwg);
+    assert!(
+        report.passed,
+        "sheet with SECTION A-A must pass quality oracle; issues={:?}",
+        report.issues
+    );
+
+    let svg = render_drawing_svg(&dwg);
+
+    // Cutting-plane "A" labels must be inked (two — one per end).
+    let cp_label_count = svg.matches("class=\"cutting-plane-label\"").count();
+    assert!(
+        cp_label_count >= 2,
+        "cutting-plane 'A' labels must be inked at both ends of the line (got {cp_label_count})"
+    );
+
+    // The SECTION A-A view must carry its cross-section body as polylines.
+    // section_view uses ProjectionType::Custom → the SVG <g> has data-projection="Custom".
+    // The view group must contain at least one <polyline (hatch + boundary outlines).
+    let has_section_group = svg.contains("data-projection=\"Custom\"");
+    assert!(
+        has_section_group,
+        "SECTION A-A must be rendered as a Custom-projection group"
+    );
+    // Confirm the section group contains at least one polyline.
+    let has_polylines_after_custom = {
+        let pos = svg.find("data-projection=\"Custom\"").unwrap_or(0);
+        svg[pos..].contains("<polyline")
+    };
+    assert!(
+        has_polylines_after_custom,
+        "SECTION A-A cross-section body must contain polylines (hatch + boundary)"
+    );
+}
+
+/// INTEGRATION TEST — the existing four-view labels are still correct on the
+/// six-hole plate.  Task 9 must not break the pre-existing label layout.
+///
+/// On A3 (five-slot), the four orthographic views still each appear exactly once.
+/// On A4, the isometric is replaced by the section, so "ISOMETRIC" is absent —
+/// but FRONT/TOP/RIGHT are still present.
+///
+/// This test targets A3 (the six-hole fixture is placed on A3 by `standard_drawing_auto`
+/// because the part + section is too wide for A4).
+///
+/// Mutation proof: accidentally remove the FRONT view → assert fires → RED.
+#[test]
+fn six_hole_plate_orthographic_labels_intact_after_task9() {
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let svg = render_drawing_svg(&dwg);
+
+    // Orthographic view labels must appear exactly once each.
+    for name in ["FRONT", "TOP", "RIGHT"] {
+        assert_eq!(
+            svg.matches(&format!(">{name} (")).count(),
+            1,
+            "view label '{name}' must be inked exactly once after Task 9 changes"
+        );
+    }
+    // SECTION A-A label must be inked exactly once.
+    assert_eq!(
+        svg.matches(">SECTION A-A (").count(),
+        1,
+        "SECTION A-A label must be inked exactly once"
+    );
+}
+
+/// UNIT TEST — `CuttingPlaneLine` round-trips through the layout.
+///
+/// Constructs a minimal `Drawing` with a single view and a `CuttingPlaneLine`,
+/// calls `compute_layout`, and checks that exactly two `CuttingPlaneLabel`
+/// items are emitted — one per end of the line.
+///
+/// Mutation proof: remove `place_cutting_plane_labels` call from `compute_layout`
+/// → count is 0 → assert fires → RED.
+#[test]
+fn cutting_plane_labels_appear_in_layout() {
+    let mut d = Drawing::new("CplLayout", SheetSize::A3);
+    // A single "FRONT" view at the axial position.
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [60.0, 100.0],
+        80.0,
+        50.0,
+        vec![],
+    ));
+    // Cutting-plane line through the middle of the view (view-space y = 25),
+    // horizontal (p0 left, p1 right), arrows pointing downward (section viewer
+    // looks from below = −Y view-space direction).
+    d.cutting_plane_line = Some(CuttingPlaneLine {
+        ax_view_idx: 0,
+        p0: [0.0, 25.0],
+        p1: [80.0, 25.0],
+        arrow_dir: [0.0, -1.0],
+    });
+
+    let layout = compute_layout(&d);
+    let cp_labels: Vec<_> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::CuttingPlaneLabel)
+        .collect();
+    assert_eq!(
+        cp_labels.len(),
+        2,
+        "exactly two CuttingPlaneLabel items must be emitted (one per end)"
+    );
+    // The two labels must be at different x positions (they bracket the line endpoints).
+    let x0 = (cp_labels[0].bbox.x0 + cp_labels[0].bbox.x1) * 0.5;
+    let x1 = (cp_labels[1].bbox.x0 + cp_labels[1].bbox.x1) * 0.5;
+    assert!(
+        (x0 - x1).abs() > 5.0,
+        "the two 'A' labels must be at different sheet x-positions (got {x0:.1} and {x1:.1})"
+    );
 }

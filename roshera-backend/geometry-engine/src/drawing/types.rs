@@ -115,7 +115,7 @@ impl Polyline2d {
 
 /// Axis-aligned bounding box of a projected view in view-space units
 /// (mm). Used to lay views out on a sheet without overlap.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ViewExtent {
     pub min_x: f64,
     pub min_y: f64,
@@ -203,6 +203,13 @@ impl ViewSource {
                 let prefix: String = id.chars().take(8).collect();
                 format!("part:{prefix}#{solid_id}")
             }
+        }
+    }
+
+    /// Extract the part uuid. Always available for the `Part` variant.
+    pub fn part_id(&self) -> Uuid {
+        match self {
+            Self::Part { part_id, .. } => *part_id,
         }
     }
 }
@@ -409,6 +416,16 @@ pub struct Drawing {
     /// part or no suitable axial view.
     #[serde(default)]
     pub axial_view_idx: Option<usize>,
+    /// Optional cutting-plane line for the SECTION A-A view (Task 9).
+    ///
+    /// When present, the renderer draws an ISO 128 cutting-plane indicator in the
+    /// axial view: chain-line body with 0.5 mm thick ends, arrows at both ends
+    /// pointing in the section-viewing direction, and "A" letters at each end.
+    ///
+    /// `None` for parts with no section view.  `serde(default)` keeps older
+    /// serialised drawings (pre-Task-9) parsing cleanly.
+    #[serde(default)]
+    pub cutting_plane_line: Option<super::dimensioning::CuttingPlaneLine>,
 }
 
 impl Drawing {
@@ -432,6 +449,7 @@ impl Drawing {
             tolerance_note: Self::default_tolerance_note(),
             hole_sites: Vec::new(),
             axial_view_idx: None,
+            cutting_plane_line: None,
         }
     }
 

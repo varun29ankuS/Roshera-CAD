@@ -136,6 +136,9 @@ pub enum SheetItemKind {
     /// A line from the general-notes strip (unit note, tolerance note,
     /// projection note). Routed through layout so text-collision checks apply.
     NoteText,
+    /// The letter "A" at each end of the cutting-plane line in the axial view
+    /// (ISO 128: section indicator label). Collision-policed like all text items.
+    CuttingPlaneLabel,
 }
 
 /// One piece of ink on the sheet, with its bounding box in sheet coordinates.
@@ -554,6 +557,15 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     // tb_x0 / tb_y0 are already computed above.
     let proj_sym_item = place_projection_symbol(tb_x0, tb_y0, tb_w, tb_h);
     items.push(proj_sym_item);
+
+    // ── Cutting-plane "A" label items (Task 9) ────────────────────────
+    // When the drawing has a cutting-plane line, place the two "A" labels
+    // at the line's sheet-space endpoints as CuttingPlaneLabel items.
+    // These enter the layout so text-collision invariants cover them.
+    if let Some(cpl) = &drawing.cutting_plane_line {
+        let cp_label_items = place_cutting_plane_labels(drawing, cpl, h);
+        items.extend(cp_label_items);
+    }
 
     SheetLayout {
         sheet: Rect2 {
@@ -1026,6 +1038,72 @@ fn place_hole_table(
     }
 
     (placed_tags, new_items)
+}
+
+// ── Cutting-plane label placement (Task 9) ────────────────────────────────────
+
+/// Place the two "A" letters at the ends of the cutting-plane line in the axial
+/// view as `CuttingPlaneLabel` layout items.
+///
+/// Each label is placed 4 mm beyond the line endpoint (further out from the part)
+/// to clear the thick end cap and arrowhead.  The font is the same 3.6 mm as the
+/// view label font (`VIEW_LABEL_FONT_MM`) — ISO practice for section letters.
+///
+/// Both items are collision-policed through the layout like all other text items.
+pub(crate) fn place_cutting_plane_labels(
+    drawing: &Drawing,
+    cpl: &super::dimensioning::CuttingPlaneLine,
+    sheet_h: f64,
+) -> Vec<SheetItem> {
+    let Some(ax_view) = drawing.views.get(cpl.ax_view_idx) else {
+        return Vec::new();
+    };
+
+    let font = VIEW_LABEL_FONT_MM;
+    // Convert view-space endpoints to sheet space.
+    let to_sheet = |p: [f64; 2]| -> [f64; 2] {
+        [
+            ax_view.position_mm[0] + p[0] * ax_view.scale,
+            (sheet_h - ax_view.position_mm[1]) - p[1] * ax_view.scale,
+        ]
+    };
+
+    let sp0 = to_sheet(cpl.p0);
+    let sp1 = to_sheet(cpl.p1);
+
+    // The label sits 4 mm beyond the endpoint in the direction away from p1→p0
+    // (i.e. beyond the tip of the line).
+    let offset = 4.0_f64;
+    // Direction from p1 to p0 (for the p0 end) and from p0 to p1 (for the p1 end).
+    let dx = sp1[0] - sp0[0];
+    let dy = sp1[1] - sp0[1];
+    let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+    let (udx, udy) = (dx / len, dy / len);
+
+    // p0 end: label at sp0 − offset * (p1→p0 direction) = sp0 − offset*(udx,udy)
+    let lp0 = [sp0[0] - offset * udx, sp0[1] - offset * udy];
+    // p1 end: label at sp1 + offset * (p0→p1 direction)
+    let lp1 = [sp1[0] + offset * udx, sp1[1] + offset * udy];
+
+    let label_text = "A";
+    let half_w = GLYPH_ADVANCE_EM * font * 0.5;
+
+    let make_item = |cx: f64, cy: f64, view_idx: usize| SheetItem {
+        kind: SheetItemKind::CuttingPlaneLabel,
+        bbox: Rect2 {
+            x0: cx - half_w,
+            y0: cy - font,
+            x1: cx + half_w,
+            y1: cy,
+        },
+        owner_view: Some(view_idx),
+        text: Some(label_text.to_string()),
+    };
+
+    vec![
+        make_item(lp0[0], lp0[1], cpl.ax_view_idx),
+        make_item(lp1[0], lp1[1], cpl.ax_view_idx),
+    ]
 }
 
 // ── Dimension placement ────────────────────────────────────────────────────────

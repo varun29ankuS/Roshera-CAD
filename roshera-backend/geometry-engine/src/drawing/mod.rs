@@ -38,8 +38,8 @@ pub mod visibility;
 
 pub use centerlines::{centerlines, Centerline};
 pub use dimensioning::{
-    auto_dimensions, standard_drawing, standard_drawing_auto, standard_drawing_hlr,
-    visible_dimensions, Dimension2d,
+    auto_dimensions, section_slot_rule, standard_drawing, standard_drawing_auto,
+    standard_drawing_hlr, visible_dimensions, CuttingPlaneLine, Dimension2d, SectionSlotRule,
 };
 pub use dxf::{render_drawing_dxf, DxfRenderError};
 pub use hole_table::{build_hole_table, qualifies_for_baseline, tag_letter, HoleSite};

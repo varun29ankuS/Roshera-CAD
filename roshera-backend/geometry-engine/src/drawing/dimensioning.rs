@@ -857,29 +857,26 @@ pub fn standard_drawing_auto(
     // ── Hole table population ──────────────────────────────────────────────────
     // Extract all dimension records for the solid and derive the hole table.
     // This must happen AFTER dedup so entity merging is stable.
-    attach_hole_table(model, solid_id, scale, &mut drawing);
+    let dims = extract_dimensions(model, solid_id);
+    attach_hole_table_from_dims(&dims, scale, &mut drawing);
+
+    // ── Section view (Task 9) ─────────────────────────────────────────────────
+    // When the part has internal features (bore sites populated above), add
+    // SECTION A-A placed by the deterministic section_slot_rule.
+    attach_section_view(model, solid_id, &mut drawing, &dims);
 
     Ok(drawing)
 }
 
-/// Populate `drawing.hole_sites` and `drawing.axial_view_idx` from the
-/// kernel's analytic dimension table.
-///
-/// - `scale`: the drawing scale (used to convert world-space anchor coords
-///   into the axial view's view-space so tag callouts land on the circles).
-/// - Bore axial centres in the TOP view are derived by projecting the bore's
-///   world anchor through the TOP projection (camera looks down −Z:
-///   view_x = world_x, view_y = world_y).
-fn attach_hole_table(
-    model: &crate::primitives::topology_builder::BRepModel,
-    solid_id: SolidId,
+/// Populate `drawing.hole_sites` and `drawing.axial_view_idx` from
+/// pre-computed dimension records.  Called from `standard_drawing_auto`
+/// which extracts `dims` once and shares them with the section builder.
+fn attach_hole_table_from_dims(
+    dims: &[crate::readable::DimensionRecord],
     _scale: f64,
     drawing: &mut super::types::Drawing,
 ) {
     use super::hole_table::build_hole_table;
-    use crate::readable::extract_dimensions;
-
-    let dims = extract_dimensions(model, solid_id);
 
     // Determine part extents for THRU detection from the whole-part extent
     // records (X/Y/Z).
@@ -896,7 +893,7 @@ fn attach_hole_table(
     // bores as blind (and vice versa if the filter silently matched
     // nothing, every bore would fall back to BLIND via f64::MAX below).
     let mut part_extents = [f64::INFINITY; 3];
-    for d in &dims {
+    for d in dims {
         if d.kind == "extent" && d.entities.is_empty() {
             let ax = d.direction;
             let idx = if ax[0].abs() >= ax[1].abs() && ax[0].abs() >= ax[2].abs() {
@@ -941,7 +938,7 @@ fn attach_hole_table(
     // Find the axial view. The bore axes are stored in the diameter records.
     // Collect the dominant bore axis (most common dominant axis among bore records).
     let mut axis_votes = [0usize; 3];
-    for d in &dims {
+    for d in dims {
         if d.kind != "diameter" || d.entities.is_empty() {
             continue;
         }
@@ -1013,7 +1010,7 @@ fn attach_hole_table(
             Vec<u32>,
             Vec<&crate::readable::DimensionRecord>,
         > = std::collections::HashMap::new();
-        for d in &dims {
+        for d in dims {
             if d.kind == "position" && !d.entities.is_empty() {
                 let mut key = d.entities.clone();
                 key.sort_unstable();
@@ -1021,7 +1018,7 @@ fn attach_hole_table(
             }
         }
 
-        for d in &dims {
+        for d in dims {
             if d.kind == "diameter" && !d.entities.is_empty() {
                 let mut key = d.entities.clone();
                 key.sort_unstable();
@@ -1133,6 +1130,537 @@ fn attach_hole_table(
     }
 
     drawing.hole_sites = sites;
+}
+
+// ── Section view (Task 9) ──────────────────────────────────────────────────────
+
+/// Deterministic rule: which slot does SECTION A-A occupy?
+///
+/// - **A4 sheets**: SECTION A-A replaces the ISOMETRIC (the top-right slot).
+///   A4 is too narrow to add a true fifth column without making everything
+///   unreadably small; replacing ISO with the section keeps the part viewable.
+/// - **A3 and larger**: add a genuine fifth slot to the right of the ISO,
+///   giving the sheet a two-row-by-three-column arrangement:
+///   ```text
+///     TOP    ISO    SECTION A-A
+///     FRONT  RIGHT
+///   ```
+///
+/// The rule is deterministic (no random, no per-sheet tuning) and
+/// encoded entirely here so unit tests can verify both branches without
+/// building a full model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionSlotRule {
+    /// SECTION A-A replaces the ISOMETRIC on space-constrained sheets (A4).
+    ReplaceIso,
+    /// SECTION A-A occupies a genuine fifth slot (A3 and larger).
+    FifthSlot,
+}
+
+/// Apply the deterministic sheet-size rule to decide the section slot.
+///
+/// Mutation-proof: this function is the single decision gate; tests for
+/// both branches assert on `SectionSlotRule` directly.
+pub fn section_slot_rule(sheet: &super::types::SheetSize) -> SectionSlotRule {
+    match sheet {
+        super::types::SheetSize::A4 => SectionSlotRule::ReplaceIso,
+        _ => SectionSlotRule::FifthSlot,
+    }
+}
+
+/// Extend the four-view layout to accommodate a fifth view (SECTION A-A) in the
+/// top-right column, producing a 2-row × 3-column arrangement:
+///
+/// ```text
+///   TOP    ISO    SECTION
+///   FRONT  RIGHT  (empty)
+/// ```
+///
+/// The scale and the first four positions are identical to `layout_four_view`;
+/// the fifth position is placed centred in a new right column whose width
+/// equals the section view's extent width at the computed scale.
+///
+/// Returns `(scale, [front, top, right, iso, section] position_mm)`.
+fn layout_five_view(
+    sheet: &super::types::SheetSize,
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+    se: super::types::ViewExtent,
+) -> (f64, [[f64; 2]; 5]) {
+    let w = sheet.width();
+    let h = sheet.height();
+    let (ml, mr, mt, mb) = super::svg::frame_margins(sheet);
+    let (_tb_w, tb_h) = super::svg::title_block_size(sheet);
+
+    const PAD_LEFT: f64 = 22.0;
+    const PAD_BOTTOM: f64 = 18.0;
+    const VGAP: f64 = 32.0;
+    const HGAP: f64 = 30.0;
+
+    let avail_x0 = ml + PAD_LEFT;
+    let avail_x1 = w - mr;
+    let avail_y0 = mt;
+    let avail_y1 = h - mb - tb_h - PAD_BOTTOM;
+    let avail_w = (avail_x1 - avail_x0).max(10.0);
+    let avail_h = (avail_y1 - avail_y0).max(10.0);
+
+    let (fw, fh) = (fe.width(), fe.height());
+    let (tw, th) = (te.width(), te.height());
+    let (rw, rh) = (re.width(), re.height());
+    let (iw, ih) = (ie.width(), ie.height());
+    let (sw, sh) = (se.width(), se.height());
+
+    // Three columns: left = max(Front, Top), centre = max(Right, Iso), right = Section.
+    let left_w = fw.max(tw);
+    let mid_w = rw.max(iw);
+    let right_w = sw;
+
+    let top_h = th.max(ih).max(sh);
+    let bot_h = fh.max(rh);
+
+    let unit_w = (left_w + mid_w + right_w).max(1e-6);
+    let unit_h = (top_h + bot_h).max(1e-6);
+    let s_w = (avail_w - 2.0 * HGAP) / unit_w;
+    let s_h = (avail_h - VGAP) / unit_h;
+    let mut scale = 0.9 * s_w.min(s_h);
+    if !scale.is_finite() || scale <= 0.0 {
+        scale = 1.0;
+    }
+    scale = snap_scale(scale);
+
+    let lw = left_w * scale;
+    let mwc = mid_w * scale;
+    let rwc = right_w * scale;
+    let trh = top_h * scale;
+    let brh = bot_h * scale;
+    let g_w = lw + HGAP + mwc + HGAP + rwc;
+    let g_h = trh + VGAP + brh;
+    let gx = avail_x0 + 0.5 * (avail_w - g_w);
+    let gy = avail_y0 + 0.5 * (avail_h - g_h);
+
+    let left_cx = gx + 0.5 * lw;
+    let mid_cx = gx + lw + HGAP + 0.5 * mwc;
+    let right_cx = gx + lw + HGAP + mwc + HGAP + 0.5 * rwc;
+    let top_cy = gy + 0.5 * trh;
+    let bot_cy = gy + trh + VGAP + 0.5 * brh;
+
+    let place = |cx: f64, cy: f64, e: super::types::ViewExtent| -> [f64; 2] {
+        let xtl = cx - 0.5 * e.width() * scale;
+        let ytl = cy - 0.5 * e.height() * scale;
+        [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
+    };
+
+    (
+        scale,
+        [
+            place(left_cx, bot_cy, fe),  // FRONT  (bottom-left)
+            place(left_cx, top_cy, te),  // TOP    (top-left)
+            place(mid_cx, bot_cy, re),   // RIGHT  (bottom-centre)
+            place(mid_cx, top_cy, ie),   // ISO    (top-centre)
+            place(right_cx, top_cy, se), // SECTION (top-right)
+        ],
+    )
+}
+
+/// Choose the cutting-plane normal and origin for the section cut.
+///
+/// # Rule (deterministic, documented)
+///
+/// When the drawing has hole sites (bore centres in the axial view), the
+/// cutting plane passes through the **first hole-group row's centroid** along
+/// the dominant bore axis direction.  Specifically:
+///
+/// 1. Collect the first group's hole-site entries (those sharing `group == sites[0].group`).
+/// 2. Average their X/Y positions to get the group centroid.
+/// 3. Reconstruct the 3D centroid using the part's bounding-box datum origin
+///    (read from the first position record in `dims`).
+/// 4. The cutting plane's **origin** is the 3D centroid; its **normal** is the
+///    dominant bore axis (the Z axis for Z-axis bores, etc.).
+///
+/// Fallback: when no hole sites are present (non-bored part, or the caller
+/// requests a section anyway), the plane passes through the part's 3D centroid
+/// (AABB midpoint from extent records) with a normal equal to the axial view's
+/// camera direction.
+///
+/// Returns `(plane_origin, plane_normal)` in kernel world space (mm).
+fn choose_section_plane(
+    drawing: &super::types::Drawing,
+    dims: &[crate::readable::DimensionRecord],
+) -> (crate::math::Point3, crate::math::Vector3) {
+    use crate::math::{Point3, Vector3};
+
+    // Determine the dominant bore axis from the drawing's axial view index.
+    let bore_axis: Vector3 = if let Some(ax_idx) = drawing.axial_view_idx {
+        match drawing.views.get(ax_idx).map(|v| v.projection) {
+            Some(super::types::ProjectionType::Top) => Vector3::new(0.0, 0.0, 1.0),
+            Some(super::types::ProjectionType::Front) => Vector3::new(0.0, 1.0, 0.0),
+            Some(super::types::ProjectionType::Right) => Vector3::new(1.0, 0.0, 0.0),
+            _ => Vector3::new(0.0, 0.0, 1.0),
+        }
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+
+    // The cutting-plane normal is perpendicular to the bore axis and parallel to
+    // the axial view's "right" direction. For a Z-axis bore, the axial view is
+    // TOP (camera −Z). We want to cut along the X-axis (so the section reveals
+    // the bore profile when you look in the −Y / FRONT direction). The rule:
+    // normal = bore_axis × world_up_for_axial, normalised.
+    // For Z-bore / TOP view: normal = Z × X = Y, giving a YZ plane. But that
+    // cuts along Y-axis, which in FRONT (X,Z) still reveals the bore as a circle.
+    // We choose normal = X (1,0,0) so the section view looks in the +Y direction,
+    // matching the FRONT view orientation and giving the most informative cut.
+    //
+    // General rule: cut normal = perpendicular to bore axis that gives the best
+    // read in the equivalent of the FRONT view. For Z-bore: normal = (1,0,0).
+    // For Y-bore: normal = (0,0,1). For X-bore: normal = (0,1,0).
+    let cut_normal: Vector3 = {
+        let n = bore_axis.normalize().unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+        let nx = n.x.abs();
+        let ny = n.y.abs();
+        let nz = n.z.abs();
+        if nz >= nx && nz >= ny {
+            // Z-dominant bore → cut in X direction
+            Vector3::new(1.0, 0.0, 0.0)
+        } else if ny >= nx {
+            // Y-dominant bore → cut in Z direction
+            Vector3::new(0.0, 0.0, 1.0)
+        } else {
+            // X-dominant bore → cut in Y direction
+            Vector3::new(0.0, 1.0, 0.0)
+        }
+    };
+
+    // Attempt to find a meaningful plane origin from hole sites.
+    if !drawing.hole_sites.is_empty() {
+        let first_group = &drawing.hole_sites[0].group;
+        let group_sites: Vec<&super::hole_table::HoleSite> = drawing
+            .hole_sites
+            .iter()
+            .filter(|s| &s.group == first_group)
+            .collect();
+
+        // Average the group's X/Y position offsets to get a centroid.
+        let n = group_sites.len() as f64;
+        let cx_offset = group_sites.iter().map(|s| s.x_mm).sum::<f64>() / n;
+        let cy_offset = group_sites.iter().map(|s| s.y_mm).sum::<f64>() / n;
+
+        // Recover the datum origin from the first position record in `dims`.
+        let datum_origin: [f64; 3] = dims
+            .iter()
+            .find(|d| d.kind == "position" && !d.entities.is_empty())
+            .and_then(|d| d.datum.as_ref().map(|dt| dt.origin))
+            .unwrap_or([0.0; 3]);
+
+        // Determine which two world axes are the "perpendicular" ones (not the bore axis).
+        let bore_n = bore_axis.normalize().unwrap_or(Vector3::new(0.0, 0.0, 1.0));
+        let dom_ax = {
+            let a = [bore_n.x.abs(), bore_n.y.abs(), bore_n.z.abs()];
+            if a[0] >= a[1] && a[0] >= a[2] {
+                0
+            } else if a[1] >= a[2] {
+                1
+            } else {
+                2
+            }
+        };
+        let perps = match dom_ax {
+            0 => [1usize, 2],
+            1 => [0, 2],
+            _ => [0, 1],
+        };
+        let mut origin = datum_origin;
+        origin[perps[0]] += cx_offset;
+        origin[perps[1]] += cy_offset;
+
+        return (Point3::new(origin[0], origin[1], origin[2]), cut_normal);
+    }
+
+    // Fallback: use the part's AABB centroid (from extent records).
+    let mut centroid = [0.0_f64; 3];
+    let mut extent_sums = [0.0_f64; 3];
+    let mut extent_counts = [0usize; 3];
+    for d in dims {
+        if d.kind == "extent" && d.entities.is_empty() {
+            let ax = d.direction;
+            let idx = if ax[0].abs() >= ax[1].abs() && ax[0].abs() >= ax[2].abs() {
+                0
+            } else if ax[1].abs() >= ax[2].abs() {
+                1
+            } else {
+                2
+            };
+            // Anchor is at the centroid of the extent's span (midpoint of direction * value/2).
+            extent_sums[idx] += d.anchor[idx];
+            extent_counts[idx] += 1;
+        }
+    }
+    for i in 0..3 {
+        if extent_counts[i] > 0 {
+            centroid[i] = extent_sums[i] / extent_counts[i] as f64;
+        }
+    }
+
+    (
+        Point3::new(centroid[0], centroid[1], centroid[2]),
+        cut_normal,
+    )
+}
+
+/// Build and attach the SECTION A-A view to the drawing.
+///
+/// This function is called after `attach_hole_table` in `standard_drawing_auto`.
+/// It only runs when internal features are detected (bore sites or cavity heuristic).
+///
+/// # Cutting-plane indication
+///
+/// The cutting-plane line is added to the AXIAL view (the one whose camera looks
+/// along the bore axis). The line spans the full width of the view's geometry at
+/// the section-plane's intersection coordinate, with thick ends per ISO 128.
+///
+/// Two "A" letters (one at each end) are added as `CuttingPlaneLabel` layout items
+/// so the collision checker can police them.
+///
+/// # Section view placement
+///
+/// The section view is placed in the slot determined by `section_slot_rule`:
+/// - A4: replaces the ISOMETRIC view (index 3).
+/// - A3+: added as a fifth view.
+///
+/// # Name
+///
+/// The section view name is `"SECTION A-A"`.
+pub(crate) fn attach_section_view(
+    model: &BRepModel,
+    solid_id: SolidId,
+    drawing: &mut super::types::Drawing,
+    dims: &[crate::readable::DimensionRecord],
+) {
+    use super::section_view::section_view;
+    use super::types::ViewSource;
+
+    // Only section when there are internal features.
+    if drawing.hole_sites.is_empty() {
+        return;
+    }
+
+    let (plane_origin, cut_normal) = choose_section_plane(drawing, dims);
+
+    let source = ViewSource::Part {
+        part_id: match drawing.views.first() {
+            Some(v) => match v.source {
+                ViewSource::Part { part_id, .. } => part_id,
+            },
+            None => return,
+        },
+        solid_id,
+    };
+
+    // Build the section view at unit scale first to get its extent.
+    let section_unit = section_view(
+        model,
+        solid_id,
+        source.part_id(),
+        plane_origin,
+        cut_normal,
+        "SECTION A-A",
+        [0.0, 0.0],
+        1.0,
+    );
+    let Some(section_unit) = section_unit else {
+        // Plane missed the solid — skip the section.
+        return;
+    };
+
+    let rule = section_slot_rule(&drawing.sheet_size);
+
+    // Compute the section view's position by running the layout solver with the
+    // section extent in place of (or appended to) the ISO slot.  This guarantees
+    // the section view fits within the frame at the scale chosen by the solver.
+    //
+    // NOTE: this may produce a DIFFERENT `section_scale` from `scale` (the
+    // four-view scale). The section view is built at `section_scale`; the four
+    // existing views keep their original scale. The section view fits by design.
+    let (section_scale, section_pos): (f64, [f64; 2]) = match rule {
+        SectionSlotRule::ReplaceIso => {
+            // Substitute the SECTION extent into the ISO slot and recompute the
+            // layout. This guarantees the section view fits in the ISO cell at
+            // a valid scale, even if the section extent is larger than the ISO extent.
+            let front_ext = drawing.views.get(0).map(|v| v.extent).unwrap_or_default();
+            let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
+            let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
+            let (s, pos) = layout_four_view(
+                &drawing.sheet_size,
+                front_ext,
+                top_ext,
+                right_ext,
+                section_unit.extent, // ISO slot carries section extent
+            );
+            (s, pos[3])
+        }
+        SectionSlotRule::FifthSlot => {
+            // Place the SECTION view to the right of the ISO column.
+            // Compute it via layout_five_view so the solver finds a scale that
+            // fits all five views within the frame.
+            let front_ext = drawing.views.get(0).map(|v| v.extent).unwrap_or_default();
+            let top_ext = drawing.views.get(1).map(|v| v.extent).unwrap_or_default();
+            let right_ext = drawing.views.get(2).map(|v| v.extent).unwrap_or_default();
+            let iso_ext = drawing.views.get(3).map(|v| v.extent).unwrap_or_default();
+            let (s, pos) = layout_five_view(
+                &drawing.sheet_size,
+                front_ext,
+                top_ext,
+                right_ext,
+                iso_ext,
+                section_unit.extent,
+            );
+            (s, pos[4])
+        }
+    };
+
+    // Build the final placed section view at the layout-solver's scale.
+    // `section_scale` was computed by the slot-rule layout solver to guarantee
+    // the section view fits within the frame; it may differ from `scale` (the
+    // four-view scale) when the section's extent is significantly larger or
+    // smaller than the ISO slot it occupies.
+    let section_placed = section_view(
+        model,
+        solid_id,
+        source.part_id(),
+        plane_origin,
+        cut_normal,
+        "SECTION A-A",
+        section_pos,
+        section_scale,
+    );
+    let Some(section_placed) = section_placed else {
+        return;
+    };
+
+    // ── Cutting-plane indication in the axial view ────────────────────────────
+    // Add a cutting-plane line across the axial view at the section coordinate.
+    // The line is a Polyline2d with the `.cutting-plane` class emitted by the
+    // renderer. We encode it as a regular polyline that the renderer styles
+    // with cutting-plane CSS (thick ends, chain-line middle).
+    //
+    // For a Z-bore / TOP axial view:
+    //   - The cut_normal = (1,0,0) means the section passes through x = cx.
+    //   - In the TOP view (world X → view X, world Y → view Y), the
+    //     cutting-plane line runs vertically (constant view X = cx).
+    //   - Arrows point in the +Y direction (the viewing direction of the section).
+    //
+    // General rule: project the plane's intersection with the view's extents.
+    if let Some(ax_idx) = drawing.axial_view_idx {
+        if let Some(ax_view) = drawing.views.get_mut(ax_idx) {
+            let ext = &ax_view.extent;
+            // Project the cut position to the axial view's 2D frame.
+            // The cut position in world space is plane_origin.
+            // In the TOP view: (view_x, view_y) = (world_x, world_y).
+            // In the FRONT view: (view_x, view_y) = (world_x, world_z).
+            // In the RIGHT view: (view_x, view_y) = (-world_y, world_z).
+            let proj = ax_view.projection;
+            let (cut_view_x, cut_view_y) = match proj {
+                super::types::ProjectionType::Top => (plane_origin.x, plane_origin.y),
+                super::types::ProjectionType::Front => (plane_origin.x, plane_origin.z),
+                super::types::ProjectionType::Right => (-plane_origin.y, plane_origin.z),
+                super::types::ProjectionType::Bottom => (plane_origin.x, -plane_origin.y),
+                super::types::ProjectionType::Left => (plane_origin.y, plane_origin.z),
+                _ => (plane_origin.x, plane_origin.y),
+            };
+
+            // The cutting-plane line runs perpendicular to the cut normal in view space.
+            // For cut_normal = (1,0,0) in TOP view: the line is horizontal (varying y,
+            // constant x = cut_view_x). Wait — we need the line to run perpendicular
+            // to the viewing direction of the section. The section is viewed in the
+            // FRONT direction (+Y into scene), so the cutting plane in the TOP view
+            // is a horizontal line (constant view Y = cut_view_y). Let me reconsider:
+            //
+            // The cut plane's normal in 3D is cut_normal = (1,0,0).
+            // In TOP view (X→right, Y→up), this normal projects to (1,0) — so the
+            // plane appears as a VERTICAL line (constant view_x = cut_view_x).
+            // The arrows point in the +Y direction (the viewing direction of the section).
+            //
+            // General: project cut_normal into 2D for the axial view.
+            let (cn_view_x, _cn_view_y) = match proj {
+                super::types::ProjectionType::Top => (cut_normal.x, cut_normal.y),
+                super::types::ProjectionType::Front => (cut_normal.x, cut_normal.z),
+                super::types::ProjectionType::Right => (-cut_normal.y, cut_normal.z),
+                super::types::ProjectionType::Bottom => (cut_normal.x, -cut_normal.y),
+                super::types::ProjectionType::Left => (cut_normal.y, cut_normal.z),
+                _ => (cut_normal.x, cut_normal.y),
+            };
+            // The cutting-plane line runs perpendicular to the projected normal.
+            // If cn_view_x dominates → line is vertical (run along Y); else horizontal.
+            let line_vertical = cn_view_x.abs() > 0.5;
+
+            // The cutting-plane line endpoints span the axial view geometry plus
+            // a 5 mm overhang at each end (for the thick-end cap and arrow).
+            let (p0, p1) = if line_vertical {
+                // Vertical line at view_x = cut_view_x, spanning the view Y extent.
+                ([cut_view_x, ext.min_y - 5.0], [cut_view_x, ext.max_y + 5.0])
+            } else {
+                // Horizontal line at view_y = cut_view_y, spanning the view X extent.
+                ([ext.min_x - 5.0, cut_view_y], [ext.max_x + 5.0, cut_view_y])
+            };
+
+            drawing.cutting_plane_line = Some(CuttingPlaneLine {
+                ax_view_idx: ax_idx,
+                p0,
+                p1,
+                // Arrow direction points in the section-view direction.
+                // For a FRONT section (section viewed from +Y): in TOP view (+Y is up),
+                // arrows point toward positive Y. So in view-space, +Y direction.
+                // General: the arrow direction in 2D is the projection of the
+                // negative cut_normal cross bore_axis... but let's simplify:
+                // the arrow_dir_view is the direction the eye moves when viewing the section.
+                // For Z-bore / TOP axial view: section viewed from +Y (FRONT).
+                // In TOP view: +Y world → +Y view direction = up.
+                // So arrow direction in view = (0, 1) normalized.
+                // For Y-bore / FRONT axial: section viewed from +X (RIGHT).
+                // In FRONT view: +X world → +X view direction = right.
+                // Arrow in view = (1, 0).
+                arrow_dir: if line_vertical {
+                    [0.0, 1.0]
+                } else {
+                    [1.0, 0.0]
+                },
+            });
+        }
+    }
+
+    // Add the section view (replace ISO on A4, append on A3+).
+    match rule {
+        SectionSlotRule::ReplaceIso => {
+            // Replace index 3 (ISO) with the section.
+            if drawing.views.len() > 3 {
+                drawing.views[3] = section_placed;
+            } else {
+                drawing.views.push(section_placed);
+            }
+        }
+        SectionSlotRule::FifthSlot => {
+            drawing.views.push(section_placed);
+        }
+    }
+}
+
+/// A cutting-plane line stored on the Drawing for the axial view.
+///
+/// The renderer reads this to ink the ISO 128-style cutting-plane indicator:
+/// thick endpoints, chain-line body, "A" letters at each end with arrows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CuttingPlaneLine {
+    /// Index into `Drawing::views` of the axial view.
+    pub ax_view_idx: usize,
+    /// First endpoint in axial-view space (view-space mm, pre-scale).
+    pub p0: [f64; 2],
+    /// Second endpoint in axial-view space (view-space mm, pre-scale).
+    pub p1: [f64; 2],
+    /// Arrow direction in axial-view space (unit vector, pointing in the
+    /// direction the section eye looks — i.e. toward the viewer of SECTION A-A).
+    pub arrow_dir: [f64; 2],
 }
 
 #[cfg(test)]

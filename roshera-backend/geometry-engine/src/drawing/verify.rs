@@ -305,7 +305,10 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
                 // it lives inside the title-block zone, which the view-placement checks
                 // already treat as an obstacle - pairing it here would double-report
                 // every title-block intrusion.
-                SheetItemKind::ViewLabel | SheetItemKind::DimensionText | SheetItemKind::NoteText
+                SheetItemKind::ViewLabel
+                    | SheetItemKind::DimensionText
+                    | SheetItemKind::NoteText
+                    | SheetItemKind::CuttingPlaneLabel
             )
         })
         .collect();
@@ -581,14 +584,16 @@ fn check_dimension_label_collisions(
     layout: &super::layout::SheetLayout,
     issues: &mut Vec<DrawingIssue>,
 ) {
-    // Both DimensionText and HoleTag carry callout text that must not overlap.
+    // DimensionText, HoleTag, and CuttingPlaneLabel carry callout text that must not overlap.
     let dim_texts: Vec<&super::layout::SheetItem> = layout
         .items
         .iter()
         .filter(|it| {
             matches!(
                 it.kind,
-                SheetItemKind::DimensionText | SheetItemKind::HoleTag
+                SheetItemKind::DimensionText
+                    | SheetItemKind::HoleTag
+                    | SheetItemKind::CuttingPlaneLabel
             )
         })
         .collect();
