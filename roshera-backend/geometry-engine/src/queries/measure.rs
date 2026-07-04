@@ -67,6 +67,13 @@ pub enum MeasureResult {
     /// * `anchor`    — representative world-space point on the gap
     /// * `direction` — unit vector pointing from surface a toward surface b
     /// * `kind`      — one of `"plane_plane"`, `"axis_axis"`, `"axis_plane"`, `"nearest"`
+    ///
+    /// The analytic kinds (`plane_plane`, `axis_axis`, `axis_plane`) are
+    /// exact.  `"nearest"` is the LOCAL minimum found by alternating
+    /// projection from a deterministic seed (face a's UV mid-point) with
+    /// both footpoints verified inside their trims — for non-convex face
+    /// pairs with multiple closest-approach candidates it is not certified
+    /// to be the global nearest.
     Distance {
         value: f64,
         anchor: [f64; 3],
@@ -76,10 +83,15 @@ pub enum MeasureResult {
     /// Angle between two non-parallel planar faces, measured between their
     /// OUTWARD normals: `degrees = acos(n_a · n_b) ∈ [0°, 180°]`.
     ///
-    /// The full range is reported — an obtuse relation (e.g. a 120° bevel)
-    /// reads 120°, never its folded acute supplement 60°.  (Exactly parallel
-    /// or anti-parallel pairs never reach this variant; they report
-    /// `Distance { kind: "plane_plane" }` instead.)
+    /// The full range is reported — no folding into [0°, 90°].  Convention
+    /// notes: for two faces of the SAME solid meeting at a common edge, the
+    /// outward-normal angle is the SUPPLEMENT of the interior dihedral —
+    /// a box corner (90° interior) reads 90°, faces meeting at a 120°
+    /// interior bevel read 60°, and near-coplanar neighbours read near 0°.
+    /// Two faces of DIFFERENT bodies tilted θ apart read θ directly (e.g.
+    /// a plate rotated 120° against a reference plate reads 120°, never the
+    /// folded 60°).  Exactly parallel or anti-parallel pairs never reach
+    /// this variant; they report `Distance { kind: "plane_plane" }` instead.
     ///
     /// `anchor` is the midpoint between the two plane origins.
     Angle { degrees: f64, anchor: [f64; 3] },
@@ -382,9 +394,19 @@ fn measure_cyl_plane(
 /// over separation); 256 sweeps cover ratios up to ~0.9 to full f64 precision.
 const NEAREST_MAX_ITERS: usize = 256;
 
-/// Iteration stops when the realized distance changes by less than this
-/// between sweeps (mm — far below manufacturing relevance).
+/// Absolute floor of the convergence test: iteration stops when the realized
+/// distance changes by less than this between sweeps (mm — far below
+/// manufacturing relevance).  Combined with [`NEAREST_RELATIVE_TOL`] so the
+/// effective tolerance scales with the distance being measured.
 const NEAREST_CONVERGENCE_TOL: f64 = 1e-12;
+
+/// Relative component of the convergence test: `tol = max(ABS, REL × d)`.
+/// For geometry far from the origin the distance value carries ulp-scale
+/// noise proportional to its own magnitude (an f64 near 1e6 mm has ulps of
+/// ~1e-10 mm), so a purely absolute 1e-12 test could oscillate forever and
+/// refuse spuriously.  1e-9 relative keeps nine significant digits — far
+/// beyond any manufacturing tolerance — while making the test scale-free.
+const NEAREST_RELATIVE_TOL: f64 = 1e-9;
 
 fn measure_nearest(
     model: &mut BRepModel,
@@ -431,7 +453,11 @@ fn measure_nearest(
         let improved = prev_dist - d;
         q = cpa.point;
         pair = Some((cpa, cpb));
-        if improved.abs() < NEAREST_CONVERGENCE_TOL {
+        // Scale-aware convergence: absolute floor for near-touching pairs,
+        // relative term so far-from-origin geometry doesn't spuriously
+        // refuse on ulp-scale oscillation of the distance value.
+        let tol = NEAREST_CONVERGENCE_TOL.max(NEAREST_RELATIVE_TOL * d);
+        if improved.abs() < tol {
             converged = true;
             break;
         }
@@ -454,14 +480,30 @@ fn measure_nearest(
         });
     }
 
-    // Reject if the converged footpoints both lie outside their trim domains —
-    // the faces do not face each other.
-    if !cpa.inside && !cpb.inside {
+    // Refuse when EITHER converged footpoint lies outside its face's trimmed
+    // boundary.  The iteration runs on the UNTRIMMED supporting surfaces, so
+    // an outside footpoint means the reported distance would be measured to a
+    // point where no face material exists — a fabricated number (e.g. a
+    // sphere hovering past a plate's edge would read the gap to phantom
+    // plate).  The honest answer in that configuration is the distance to
+    // the trim BOUNDARY (edge), which needs boundary-constrained iteration —
+    // a documented future upgrade, not silently approximated here.
+    if !cpa.inside || !cpb.inside {
+        let culprit = if !cpa.inside && !cpb.inside {
+            "both faces' nearest points lie"
+        } else if !cpa.inside {
+            "the first face's nearest point lies"
+        } else {
+            "the second face's nearest point lies"
+        };
         return Err(MeasureError::Unsupported {
-            reason: "Nearest-point projection landed outside the trimmed face for both faces. \
-                     The faces may not face each other. \
-                     Try selecting faces with a clear line-of-sight between them."
-                .to_string(),
+            reason: format!(
+                "Nearest-point iteration converged, but {culprit} outside that face's \
+                 trimmed boundary — the distance would be measured to a point where no \
+                 face material exists. Distance to a trimmed boundary (face edge) is \
+                 not yet supported; select faces whose closest approach is interior \
+                 to both faces."
+            ),
         });
     }
 
@@ -999,6 +1041,57 @@ mod tests {
                 );
             }
             other => panic!("expected Distance(nearest), got {other:?}"),
+        }
+    }
+
+    // ── Case 8b (R-4): footpoint outside trim → REFUSE, never phantom material ─
+    //
+    // Construction (deterministic — a box face trim IS bounded):
+    //   Plate 40×40×20 centred at origin → top face is the plane z = +10
+    //   TRIMMED to x, y ∈ [−20, 20].
+    //   Sphere r = 6 centred at (30, 0, 20) — laterally 10 mm PAST the
+    //   plate's x = +20 edge.
+    //   The alternating projection converges on the UNTRIMMED plane to the
+    //   footpoint (30, 0, 10), which is outside the trim (inside = false);
+    //   the sphere footpoint (30, 0, 14) is inside (full sphere).
+    //   An untrimmed answer would report a 4.0 mm gap to a point where the
+    //   plate does not exist; the true trimmed distance (to the plate edge
+    //   at x = 20) is √(10² + 10²) − 6 ≈ 8.14 mm.  The kernel must REFUSE
+    //   rather than fabricate the 4.0.
+    #[test]
+    fn sphere_past_plate_edge_refuses_phantom_distance() {
+        let mut m = BRepModel::new();
+        let plate = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_box_3d(40.0, 40.0, 20.0)
+                .expect("plate"),
+        );
+        let ball = make_solid(
+            TopologyBuilder::new(&mut m)
+                .create_sphere_3d(Point3::new(30.0, 0.0, 20.0), 6.0)
+                .expect("sphere"),
+        );
+        let sphere_f = first_sphere_face(&m, ball);
+        let top_f = plane_face_near(&m, plate, Vector3::Z);
+
+        let err = measure(
+            &mut m,
+            MeasureSubject::Face {
+                solid: ball,
+                face: sphere_f,
+            },
+            Some(MeasureSubject::Face {
+                solid: plate,
+                face: top_f,
+            }),
+        )
+        .expect_err("must refuse: nearest point lies beyond the plate's trimmed boundary");
+
+        match &err {
+            MeasureError::Unsupported { reason } => {
+                assert!(!reason.is_empty(), "reason must not be empty");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 
