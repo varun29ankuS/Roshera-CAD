@@ -355,6 +355,56 @@ fn world_aabb(model: &BRepModel, solid_id: SolidId) -> Option<Aabb> {
     }
 }
 
+/// Face ids of the solid's BORE walls: concave cylindrical faces whose
+/// material-out normal points TOWARD the axis.
+///
+/// # The material-side rule (reused, not invented)
+///
+/// [`Cylinder`]'s `normal_at` returns the +radial direction (away from the
+/// axis) by construction — see `evaluate_full` (`normal = radial.normalize()`).
+/// The face's true outward (material-out) normal applies the orientation sign
+/// on top, exactly as `queries::raycast::oriented_normal` does:
+/// `Forward → +1`, `Backward → −1`. Therefore:
+///
+/// - **Bore** (cavity wall): material surrounds the cylinder → outward normal
+///   points toward the axis → sign −1 → `FaceOrientation::Backward`.
+/// - **Boss / OD** (outer silhouette): material fills the cylinder → outward
+///   normal points away from the axis → `FaceOrientation::Forward`.
+///
+/// This is the honest discriminator the hole table needs: `extract_dimensions`
+/// emits diameter/length/position records for EVERY cylindrical lateral face,
+/// and without this set a flange's own OD would table as a "THRU hole".
+pub fn bore_face_ids(model: &BRepModel, solid_id: SolidId) -> std::collections::HashSet<u32> {
+    use crate::primitives::face::FaceOrientation;
+
+    let mut out = std::collections::HashSet::new();
+    let Some(solid) = model.solids.get(solid_id) else {
+        return out;
+    };
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+    for sh in shells {
+        let Some(shell) = model.shells.get(sh) else {
+            continue;
+        };
+        for &fid in &shell.faces {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            let Some(surface) = model.surfaces.get(face.surface_id) else {
+                continue;
+            };
+            if surface.as_any().downcast_ref::<Cylinder>().is_none() {
+                continue;
+            }
+            if face.orientation == FaceOrientation::Backward {
+                out.insert(fid);
+            }
+        }
+    }
+    out
+}
+
 /// True axial extent of a face from its trim EDGES, as `(min, max)` projected
 /// onto `axis` relative to `origin`. Used for a cylinder face's real length:
 /// the surface's `height_limits` is the *uncut* bound and goes stale after a

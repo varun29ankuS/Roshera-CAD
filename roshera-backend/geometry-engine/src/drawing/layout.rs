@@ -850,7 +850,7 @@ fn place_hole_table(
 
     // ── Column separators (vertical lines inside the table) ─────────────────
     let mut cx = table_x0;
-    for (ci, &cw) in col_widths.iter().enumerate().take(col_widths.len() - 1) {
+    for &cw in col_widths.iter().take(col_widths.len() - 1) {
         cx += cw;
         // Vertical separator from top to bottom
         new_items.push(SheetItem {
@@ -864,7 +864,6 @@ fn place_hole_table(
             owner_view: None,
             text: None,
         });
-        let _ = ci; // suppress lint
     }
 
     // ── Header row separator (horizontal line after header) ─────────────────

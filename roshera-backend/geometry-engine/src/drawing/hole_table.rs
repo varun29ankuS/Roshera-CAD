@@ -16,8 +16,19 @@
 //!    the same face entities) to the overall part extent along that axis.
 //!    When the bore length equals the part extent within 0.01 mm the bore
 //!    is THRU; otherwise it is blind and the depth string is "↧ {depth}".
-//! 5. X / Y values are taken verbatim from the `"position"` records' labels
-//!    (already unit-formatted by `extract_dimensions`).
+//! 5. X / Y values come from the `"position"` records' labels (already
+//!    unit-formatted by `extract_dimensions`) with the axis prefix stripped —
+//!    the table's X/Y column headers already name the axis.
+//!
+//! # Bore qualification happens at the CALLER
+//!
+//! This function tables every diameter record it is given. `extract_dimensions`
+//! emits diameter records for every cylindrical lateral face — bore, boss, or
+//! the part's own OD — so the caller (`attach_hole_table_from_dims`) MUST
+//! pre-filter to bores using the material-side rule in
+//! [`crate::readable::bore_face_ids`] (concave = outward normal toward the
+//! axis). Feeding unfiltered records here puts the part's silhouette in the
+//! hole table.
 //!
 //! # Layout integration
 //!
@@ -238,20 +249,25 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             })
         };
 
+        // The extraction label carries an axis prefix ("X 12.00mm"). The
+        // table's X/Y COLUMN HEADERS already name the axis, so the cell
+        // shows just the value ("12.00mm") — repeating the prefix under the
+        // header is redundant ink (same strip rule the viewport applies).
+        let strip_axis = |label: &str| -> String {
+            label
+                .strip_prefix("X ")
+                .or_else(|| label.strip_prefix("Y "))
+                .or_else(|| label.strip_prefix("Z "))
+                .unwrap_or(label)
+                .to_string()
+        };
+
         let (x_mm, x_label) = find_pos(perps[0])
-            .map(|(r, _)| {
-                let label = r.label.clone();
-                // Strip the axis prefix "X " / "Y " / "Z " to get just the numeric part,
-                // then use the original label as the display (it already has the prefix).
-                (r.value, label)
-            })
+            .map(|(r, _)| (r.value, strip_axis(&r.label)))
             .unwrap_or((0.0, "—".to_string()));
 
         let (y_mm, y_label) = find_pos(perps[1])
-            .map(|(r, _)| {
-                let label = r.label.clone();
-                (r.value, label)
-            })
+            .map(|(r, _)| (r.value, strip_axis(&r.label)))
             .unwrap_or((0.0, "—".to_string()));
 
         let key = GroupKey::new(diameter_mm, is_through);

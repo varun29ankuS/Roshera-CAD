@@ -856,9 +856,12 @@ pub fn standard_drawing_auto(
 
     // ── Hole table population ──────────────────────────────────────────────────
     // Extract all dimension records for the solid and derive the hole table.
-    // This must happen AFTER dedup so entity merging is stable.
+    // This must happen AFTER dedup so entity merging is stable. The
+    // material-side qualifier (bore = concave cylindrical face) keeps the
+    // part's own OD / boss faces out of the table.
     let dims = extract_dimensions(model, solid_id);
-    attach_hole_table_from_dims(&dims, scale, &mut drawing);
+    let bore_faces = crate::readable::bore_face_ids(model, solid_id);
+    attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
 
     // ── Section view (Task 9) ─────────────────────────────────────────────────
     // When the part has internal features (bore sites populated above), add
@@ -871,12 +874,31 @@ pub fn standard_drawing_auto(
 /// Populate `drawing.hole_sites` and `drawing.axial_view_idx` from
 /// pre-computed dimension records.  Called from `standard_drawing_auto`
 /// which extracts `dims` once and shares them with the section builder.
+///
+/// `bore_faces` is the material-side qualifier from
+/// [`crate::readable::bore_face_ids`]: face ids of CONCAVE cylindrical faces
+/// (outward normal toward the axis). Only diameter records whose entity set
+/// intersects it feed the hole table — a boss or the part's own OD face also
+/// gets diameter/length/position records from extraction, but those are the
+/// part's silhouette, not holes, and tabling them would both put a lying
+/// "THRU" row on the sheet and wrongly suppress their position dims.
 fn attach_hole_table_from_dims(
-    dims: &[crate::readable::DimensionRecord],
-    _scale: f64,
+    all_dims: &[crate::readable::DimensionRecord],
+    bore_faces: &std::collections::HashSet<u32>,
     drawing: &mut super::types::Drawing,
 ) {
     use super::hole_table::build_hole_table;
+
+    // Bore-only qualification (final-review I-1): drop diameter records whose
+    // faces are not cavities. Length/position records keyed to those faces
+    // become inert (build_hole_table only creates sites from diameter
+    // records), and the axis-vote / bore-centre passes below then see bores
+    // only. Non-feature records (empty entities: whole-part extents) pass.
+    let dims: Vec<crate::readable::DimensionRecord> = all_dims
+        .iter()
+        .filter(|d| d.kind != "diameter" || d.entities.iter().any(|e| bore_faces.contains(e)))
+        .cloned()
+        .collect();
 
     // Determine part extents for THRU detection from the whole-part extent
     // records (X/Y/Z).
@@ -893,7 +915,7 @@ fn attach_hole_table_from_dims(
     // bores as blind (and vice versa if the filter silently matched
     // nothing, every bore would fall back to BLIND via f64::MAX below).
     let mut part_extents = [f64::INFINITY; 3];
-    for d in dims {
+    for d in &dims {
         if d.kind == "extent" && d.entities.is_empty() {
             let ax = d.direction;
             let idx = if ax[0].abs() >= ax[1].abs() && ax[0].abs() >= ax[2].abs() {
@@ -938,7 +960,7 @@ fn attach_hole_table_from_dims(
     // Find the axial view. The bore axes are stored in the diameter records.
     // Collect the dominant bore axis (most common dominant axis among bore records).
     let mut axis_votes = [0usize; 3];
-    for d in dims {
+    for d in &dims {
         if d.kind != "diameter" || d.entities.is_empty() {
             continue;
         }
@@ -1010,7 +1032,7 @@ fn attach_hole_table_from_dims(
             Vec<u32>,
             Vec<&crate::readable::DimensionRecord>,
         > = std::collections::HashMap::new();
-        for d in dims {
+        for d in &dims {
             if d.kind == "position" && !d.entities.is_empty() {
                 let mut key = d.entities.clone();
                 key.sort_unstable();
@@ -1018,7 +1040,7 @@ fn attach_hole_table_from_dims(
             }
         }
 
-        for d in dims {
+        for d in &dims {
             if d.kind == "diameter" && !d.entities.is_empty() {
                 let mut key = d.entities.clone();
                 key.sort_unstable();
@@ -1570,20 +1592,12 @@ pub(crate) fn attach_section_view(
                 _ => (plane_origin.x, plane_origin.y),
             };
 
-            // The cutting-plane line runs perpendicular to the cut normal in view space.
-            // For cut_normal = (1,0,0) in TOP view: the line is horizontal (varying y,
-            // constant x = cut_view_x). Wait — we need the line to run perpendicular
-            // to the viewing direction of the section. The section is viewed in the
-            // FRONT direction (+Y into scene), so the cutting plane in the TOP view
-            // is a horizontal line (constant view Y = cut_view_y). Let me reconsider:
-            //
-            // The cut plane's normal in 3D is cut_normal = (1,0,0).
-            // In TOP view (X→right, Y→up), this normal projects to (1,0) — so the
-            // plane appears as a VERTICAL line (constant view_x = cut_view_x).
-            // The arrows point in the +Y direction (the viewing direction of the section).
-            //
-            // General: project cut_normal into 2D for the axial view.
-            let (cn_view_x, _cn_view_y) = match proj {
+            // The cutting-plane line is the section plane's TRACE in the
+            // axial view: the plane contains the (projected-to-a-point) bore
+            // axis, so it appears as a straight line perpendicular to the
+            // projected cut normal. Project cut_normal into the axial view's
+            // 2D frame with the same map used for positions above.
+            let (cn_view_x, cn_view_y) = match proj {
                 super::types::ProjectionType::Top => (cut_normal.x, cut_normal.y),
                 super::types::ProjectionType::Front => (cut_normal.x, cut_normal.z),
                 super::types::ProjectionType::Right => (-cut_normal.y, cut_normal.z),
@@ -1591,8 +1605,10 @@ pub(crate) fn attach_section_view(
                 super::types::ProjectionType::Left => (cut_normal.y, cut_normal.z),
                 _ => (cut_normal.x, cut_normal.y),
             };
-            // The cutting-plane line runs perpendicular to the projected normal.
-            // If cn_view_x dominates → line is vertical (run along Y); else horizontal.
+            // Line orientation: perpendicular to the projected normal. When
+            // the normal projects mostly onto view X (e.g. Z-bore/TOP with
+            // cut_normal = +X → projected (1,0)), the trace is VERTICAL
+            // (constant view_x); otherwise horizontal.
             let line_vertical = cn_view_x.abs() > 0.5;
 
             // The cutting-plane line endpoints span the axial view geometry plus
@@ -1605,27 +1621,32 @@ pub(crate) fn attach_section_view(
                 ([ext.min_x - 5.0, cut_view_y], [ext.max_x + 5.0, cut_view_y])
             };
 
+            // ── Arrow direction (ISO 128-44): the DIRECTION OF SIGHT ─────────
+            // The arrows sit at the line's ends and point perpendicular to it,
+            // showing which way the section is viewed.
+            //
+            // Derivation of the sign: `section_view` draws the cut in the
+            // plane's own frame (u = n.perpendicular(), v = n × u). Since
+            // u × v = n, the plane normal points OUT of the drawn section
+            // toward its viewer — i.e. SECTION A-A is what you see looking
+            // along −cut_normal. The direction of sight in the axial view is
+            // therefore the projection of −cut_normal, which is automatically
+            // perpendicular to the trace line (the line is the plane seen
+            // edge-on). For the Z-bore default (cut_normal = +X, TOP axial
+            // view): sight = −X → view-space (−1, 0), perpendicular to the
+            // vertical trace. cut_normal ⊥ bore axis and the axial camera
+            // looks along the bore axis, so the projection never degenerates;
+            // normalise defensively anyway.
+            let alen = (cn_view_x * cn_view_x + cn_view_y * cn_view_y)
+                .sqrt()
+                .max(1e-12);
+            let arrow_dir = [-cn_view_x / alen, -cn_view_y / alen];
+
             drawing.cutting_plane_line = Some(CuttingPlaneLine {
                 ax_view_idx: ax_idx,
                 p0,
                 p1,
-                // Arrow direction points in the section-view direction.
-                // For a FRONT section (section viewed from +Y): in TOP view (+Y is up),
-                // arrows point toward positive Y. So in view-space, +Y direction.
-                // General: the arrow direction in 2D is the projection of the
-                // negative cut_normal cross bore_axis... but let's simplify:
-                // the arrow_dir_view is the direction the eye moves when viewing the section.
-                // For Z-bore / TOP axial view: section viewed from +Y (FRONT).
-                // In TOP view: +Y world → +Y view direction = up.
-                // So arrow direction in view = (0, 1) normalized.
-                // For Y-bore / FRONT axial: section viewed from +X (RIGHT).
-                // In FRONT view: +X world → +X view direction = right.
-                // Arrow in view = (1, 0).
-                arrow_dir: if line_vertical {
-                    [0.0, 1.0]
-                } else {
-                    [1.0, 0.0]
-                },
+                arrow_dir,
             });
         }
     }

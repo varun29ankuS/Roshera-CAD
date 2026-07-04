@@ -1597,6 +1597,159 @@ fn off_origin_bore_tags_land_on_their_own_circles() {
     }
 }
 
+// ── Final-review I-1: hole table qualifies BORES only (material side) ────────
+
+/// A hole table must table CAVITIES, not the part's own outer silhouette.
+///
+/// `extract_dimensions` emits diameter+length+position records for EVERY
+/// cylindrical lateral face — bore, boss, or OD. The bore/boss discriminator
+/// is material side: `Cylinder::normal_at` is +radial (away from the axis) by
+/// construction, and the face's material-out normal applies the orientation
+/// sign (`queries::raycast::oriented_normal`), so a BORE wall is exactly a
+/// cylinder face with `FaceOrientation::Backward` (outward normal points
+/// TOWARD the axis — concave), while a boss/OD face is `Forward`.
+///
+/// Fixture: 40×40×10 plate with ONE Ø6 THRU bore (difference) and ONE Ø10
+/// boss unioned on top. Exactly the bore may appear in the table.
+///
+/// Mutation proof: drop the bore-face filter in `attach_hole_table_from_dims`
+/// → the boss's lateral face is tabled too → site count 2 → RED.
+#[test]
+fn boss_and_od_faces_are_not_tabled_as_holes() {
+    let mut m = BRepModel::new();
+    let plate = match TopologyBuilder::new(&mut m)
+        .create_box_3d(40.0, 40.0, 10.0)
+        .expect("plate")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    // Ø6 THRU bore at (5,5): plate spans z ∈ [−5,5]; cylinder z ∈ [−6,6].
+    let bore = match TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(5.0, 5.0, -6.0), Vector3::Z, 3.0, 12.0)
+        .expect("bore")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let part = boolean_operation(
+        &mut m,
+        plate,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("drill");
+    // Ø10 boss standing on the top face at (−8,−8): overlaps the plate top
+    // (base at z = 4) and rises to z = 14.
+    let boss = match TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(-8.0, -8.0, 4.0), Vector3::Z, 5.0, 10.0)
+        .expect("boss")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let part = boolean_operation(
+        &mut m,
+        part,
+        boss,
+        BooleanOp::Union,
+        BooleanOptions::default(),
+    )
+    .expect("weld boss");
+
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let tabled: Vec<(String, f64)> = dwg
+        .hole_sites
+        .iter()
+        .map(|s| (s.tag.clone(), s.diameter_mm))
+        .collect();
+    assert_eq!(
+        dwg.hole_sites.len(),
+        1,
+        "exactly the bore is a hole — the boss must NOT be tabled; tabled: {tabled:?}"
+    );
+    assert!(
+        (dwg.hole_sites[0].diameter_mm - 6.0).abs() < 0.01,
+        "the one tabled site must be the Ø6 bore, got Ø{:.2}",
+        dwg.hole_sites[0].diameter_mm
+    );
+}
+
+/// The flange-family case: a plain solid cylinder has ONE cylindrical face —
+/// its own OD. That face is convex (material-out normal AWAY from the axis)
+/// and must produce NO hole table at all: a part with no cavities has no
+/// holes, whatever its silhouette.
+#[test]
+fn solid_cylinder_has_no_hole_table() {
+    let mut m = BRepModel::new();
+    let part = match TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 40.0, 12.0)
+        .expect("disc")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let tabled: Vec<(String, f64)> = dwg
+        .hole_sites
+        .iter()
+        .map(|s| (s.tag.clone(), s.diameter_mm))
+        .collect();
+    assert!(
+        dwg.hole_sites.is_empty(),
+        "a solid cylinder's OD is not a hole — hole table must be empty; tabled: {tabled:?}"
+    );
+}
+
+// ── Final-review I-2: cutting-plane arrows point in the VIEWING direction ────
+
+/// ISO 128-44: the arrows on a cutting-plane line sit at its ends and point
+/// PERPENDICULAR to the line, in the direction of sight of the section.
+///
+/// Derivation for the six-hole fixture (Z-bores → axial view TOP,
+/// `choose_section_plane` picks cut_normal = +X): `section_view` draws the cut
+/// in the plane frame (u, v = n×u) with u×v = n, so the section eye looks
+/// along −n = −X (n points at the viewer). Projected into TOP view space
+/// (world x,y → view x,y): the cutting line is vertical (constant x) and the
+/// direction of sight projects to (−1, 0) — perpendicular to the line.
+///
+/// The pre-fix code set arrow_dir = [0,1] for vertical lines — parallel to
+/// the line itself, indicating a +Y (FRONT) viewing that contradicts the
+/// ±X-viewed section actually drawn.
+#[test]
+fn cutting_plane_arrows_point_in_viewing_direction() {
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let cpl = dwg
+        .cutting_plane_line
+        .as_ref()
+        .expect("bored sheet must carry a cutting-plane line");
+
+    // Unit line direction.
+    let (ldx, ldy) = (cpl.p1[0] - cpl.p0[0], cpl.p1[1] - cpl.p0[1]);
+    let llen = (ldx * ldx + ldy * ldy).sqrt();
+    assert!(llen > 1e-9, "degenerate cutting-plane line");
+    let (ldx, ldy) = (ldx / llen, ldy / llen);
+
+    // Perpendicularity: arrow ⟂ cutting line.
+    let dot = ldx * cpl.arrow_dir[0] + ldy * cpl.arrow_dir[1];
+    assert!(
+        dot.abs() < 1e-6,
+        "cutting-plane arrows must be PERPENDICULAR to the line \
+         (direction of sight); line=({ldx:.3},{ldy:.3}) arrow={:?} dot={dot:.3}",
+        cpl.arrow_dir
+    );
+
+    // Correct sign: Z-bores → cut_normal = +X → section eye looks along −X →
+    // TOP view projection (−1, 0).
+    assert!(
+        (cpl.arrow_dir[0] - (-1.0)).abs() < 1e-6 && cpl.arrow_dir[1].abs() < 1e-6,
+        "arrow_dir must be the projected direction of sight [-1, 0]; got {:?}",
+        cpl.arrow_dir
+    );
+}
+
 // ── Task 8: Sheet visual excellence ──────────────────────────────────────────
 
 /// TASK 8 — LAYOUT ITEMS: the six-hole-plate auto sheet must carry
