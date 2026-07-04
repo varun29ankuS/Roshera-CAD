@@ -836,7 +836,357 @@ pub fn standard_drawing_auto(
         drawing.add_view(view);
     }
     dedup_dimensions_global(&mut drawing);
+
+    // ── Hole table population ──────────────────────────────────────────────────
+    // Extract all dimension records for the solid and derive the hole table.
+    // This must happen AFTER dedup so entity merging is stable.
+    attach_hole_table(model, solid_id, scale, &mut drawing);
+
     Ok(drawing)
+}
+
+/// Populate `drawing.hole_sites` and `drawing.axial_view_idx` from the
+/// kernel's analytic dimension table.
+///
+/// - `scale`: the drawing scale (used to convert world-space anchor coords
+///   into the axial view's view-space so tag callouts land on the circles).
+/// - Bore axial centres in the TOP view are derived by projecting the bore's
+///   world anchor through the TOP projection (camera looks down −Z:
+///   view_x = world_x, view_y = world_y).
+fn attach_hole_table(
+    model: &crate::primitives::topology_builder::BRepModel,
+    solid_id: SolidId,
+    _scale: f64,
+    drawing: &mut super::types::Drawing,
+) {
+    use super::hole_table::build_hole_table;
+    use crate::readable::extract_dimensions;
+
+    let dims = extract_dimensions(model, solid_id);
+
+    // Determine part extents for THRU detection. Use the world AABB edges.
+    // We approximate from the overall extent records (X/Y/Z).
+    let mut part_extents = [f64::INFINITY; 3];
+    for d in &dims {
+        if d.kind == "extent" && d.entities.is_empty() {
+            let ax = d.direction;
+            let idx = if ax[0].abs() >= ax[1].abs() && ax[0].abs() >= ax[2].abs() {
+                0
+            } else if ax[1].abs() >= ax[2].abs() {
+                1
+            } else {
+                2
+            };
+            // Take the minimum of what we see (extent records are one per axis).
+            if d.value < part_extents[idx] {
+                part_extents[idx] = d.value;
+            }
+        }
+    }
+    // Fallback: if no extent records (degenerate part), use large value so
+    // everything is treated as blind (conservative).
+    let part_extents = [
+        if part_extents[0].is_finite() {
+            part_extents[0]
+        } else {
+            f64::MAX
+        },
+        if part_extents[1].is_finite() {
+            part_extents[1]
+        } else {
+            f64::MAX
+        },
+        if part_extents[2].is_finite() {
+            part_extents[2]
+        } else {
+            f64::MAX
+        },
+    ];
+
+    let mut sites = build_hole_table(&dims, part_extents);
+    if sites.is_empty() {
+        // No cylindrical bores — no hole table.
+        return;
+    }
+
+    // Find the axial view. The bore axes are stored in the diameter records.
+    // Collect the dominant bore axis (most common dominant axis among bore records).
+    let mut axis_votes = [0usize; 3];
+    for d in &dims {
+        if d.kind != "diameter" || d.entities.is_empty() {
+            continue;
+        }
+        if let Some(ax) = d.axis {
+            let abs = [ax[0].abs(), ax[1].abs(), ax[2].abs()];
+            let dom = if abs[0] >= abs[1] && abs[0] >= abs[2] {
+                0
+            } else if abs[1] >= abs[2] {
+                1
+            } else {
+                2
+            };
+            axis_votes[dom] += 1;
+        }
+    }
+    let dominant_bore_axis = axis_votes
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &v)| v)
+        .map(|(i, _)| i)
+        .unwrap_or(2); // default Z
+
+    // Find the view that is axial for the dominant bore axis: the camera
+    // must look nearly along that axis.
+    // view_dir returns the direction the camera looks INTO the scene:
+    //   Front → [0,-1,0], Top → [0,0,-1], Right → [-1,0,0]
+    let axial_view_idx = drawing.views.iter().enumerate().find_map(|(i, v)| {
+        let vd = match v.projection {
+            ProjectionType::Front => [0.0_f64, -1.0, 0.0],
+            ProjectionType::Top => [0.0, 0.0, -1.0],
+            ProjectionType::Right => [-1.0, 0.0, 0.0],
+            ProjectionType::Bottom => [0.0, 0.0, 1.0],
+            ProjectionType::Left => [1.0, 0.0, 0.0],
+            _ => return None,
+        };
+        // The camera is axial when |vd[dominant]| ≈ 1.
+        if vd[dominant_bore_axis].abs() > 0.9 {
+            Some(i)
+        } else {
+            None
+        }
+    });
+    drawing.axial_view_idx = axial_view_idx;
+
+    // Attach axial-view 2D centres to each site.
+    //
+    // Strategy: for each HoleSite, we know its (x_mm, y_mm) position offsets
+    // from the part corner datum. The position records carry the datum origin
+    // in `datum.origin`. So the bore world-centre along the two perpendicular
+    // axes is: datum.origin[perp_i] + site.x_mm (or y_mm).
+    //
+    // We then project that 3D centre into the axial view (2D) and match it
+    // to the nearest unassigned circle in that view (by distance to circle
+    // centre, within 1 mm tolerance). Each circle is consumed exactly once so
+    // no two sites share a circle.
+    if let Some(ax_idx) = axial_view_idx {
+        // Collect bore world centres keyed by (x_mm, y_mm) from position records.
+        // For a Z-axis bore the datum.origin gives the part corner in world space.
+        // bore_world[perp0] = datum.origin[perp0] + position_value[perp0]
+        // bore_world[perp1] = datum.origin[perp1] + position_value[perp1]
+        // bore_world[dominant] = datum.origin[dominant] (at the drilled-face plane)
+        //
+        // Build per-entity-set → bore_world_centre.
+        let mut bore_centres: std::collections::HashMap<Vec<u32>, [f64; 3]> =
+            std::collections::HashMap::new();
+
+        // Collect position records grouped by entity set.
+        let mut pos_by_ent: std::collections::HashMap<
+            Vec<u32>,
+            Vec<&crate::readable::DimensionRecord>,
+        > = std::collections::HashMap::new();
+        for d in &dims {
+            if d.kind == "position" && !d.entities.is_empty() {
+                let mut key = d.entities.clone();
+                key.sort_unstable();
+                pos_by_ent.entry(key).or_default().push(d);
+            }
+        }
+
+        for d in &dims {
+            if d.kind == "diameter" && !d.entities.is_empty() {
+                let mut key = d.entities.clone();
+                key.sort_unstable();
+                if bore_centres.contains_key(&key) {
+                    continue; // already computed
+                }
+                let axis = match d.axis {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let abs = [axis[0].abs(), axis[1].abs(), axis[2].abs()];
+                let dominant = if abs[0] >= abs[1] && abs[0] >= abs[2] {
+                    0
+                } else if abs[1] >= abs[2] {
+                    1
+                } else {
+                    2
+                };
+                let perps = match dominant {
+                    0 => [1usize, 2],
+                    1 => [0, 2],
+                    _ => [0, 1],
+                };
+
+                if let Some(pos_recs) = pos_by_ent.get(&key) {
+                    // Use the datum origin from the first position record.
+                    let datum_origin = pos_recs
+                        .iter()
+                        .find_map(|r| r.datum.as_ref().map(|dt| dt.origin))
+                        .unwrap_or([0.0; 3]);
+                    let mut centre = datum_origin;
+                    for pr in pos_recs {
+                        // Direction tells us which perpendicular axis this is.
+                        let dir = pr.direction;
+                        let perp_idx = if dir[perps[0]].abs() > dir[perps[1]].abs() {
+                            perps[0]
+                        } else {
+                            perps[1]
+                        };
+                        let sign = if dir[perp_idx] >= 0.0 { 1.0 } else { -1.0 };
+                        centre[perp_idx] = datum_origin[perp_idx] + pr.value * sign;
+                    }
+                    bore_centres.insert(key, centre);
+                } else {
+                    // No position records: fall back to the diameter record anchor
+                    // minus the bore radius in the seam direction (anchor is on the
+                    // lateral face rim, so subtract radius to get the axis).
+                    let rd = d.direction; // seam direction (from axis toward rim)
+                    let radius = d.value * 0.5;
+                    let centre = [
+                        d.anchor[0] - rd[0] * radius,
+                        d.anchor[1] - rd[1] * radius,
+                        d.anchor[2] - rd[2] * radius,
+                    ];
+                    bore_centres.insert(key, centre);
+                }
+            }
+        }
+
+        let view = &drawing.views[ax_idx];
+
+        // Project a world 3D point to the axial view's 2D view-space.
+        let project_world = |p: [f64; 3]| -> [f64; 2] {
+            match view.projection {
+                ProjectionType::Top => [p[0], p[1]],
+                ProjectionType::Front => [p[0], p[2]],
+                ProjectionType::Right => [-p[1], p[2]],
+                ProjectionType::Bottom => [p[0], p[1]],
+                ProjectionType::Left => [p[1], p[2]],
+                _ => [p[0], p[1]],
+            }
+        };
+
+        // Build a list of (view-space centre, bore_diameter, entity_key) for
+        // all bores so we can match to circles by nearest unassigned.
+        struct BoreCandidate {
+            vc: [f64; 2],
+            dia: f64,
+            ents: Vec<u32>,
+        }
+        let mut bore_candidates: Vec<BoreCandidate> = bore_centres
+            .iter()
+            .filter_map(|(ents, &world_c)| {
+                let dia = dims
+                    .iter()
+                    .find(|d| {
+                        d.kind == "diameter" && !d.entities.is_empty() && {
+                            let mut k = d.entities.clone();
+                            k.sort_unstable();
+                            &k == ents
+                        }
+                    })
+                    .map(|d| d.value)?;
+                let vc = project_world(world_c);
+                Some(BoreCandidate {
+                    vc,
+                    dia,
+                    ents: ents.clone(),
+                })
+            })
+            .collect();
+
+        // Match bore candidates to circles: greedy nearest-circle assignment.
+        // Use a mutable "available" list of circles.
+        let mut available_circles: Vec<(usize, f64, f64, f64)> = view
+            .circles
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.cx, c.cy, c.r))
+            .collect();
+
+        // For each bore candidate, find the closest available circle with
+        // matching radius (within 5% + 0.1 mm tolerance).
+        let mut ent_to_circle: std::collections::HashMap<Vec<u32>, [f64; 2]> =
+            std::collections::HashMap::new();
+
+        // Sort bore candidates so smaller-radius bores match first (stable, deterministic).
+        bore_candidates.sort_by(|a, b| {
+            a.dia
+                .partial_cmp(&b.dia)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for bc in &bore_candidates {
+            let r_target = bc.dia * 0.5;
+            // Find the closest available circle with matching radius.
+            let best_idx = available_circles
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, _, r))| (r - r_target).abs() < r_target * 0.05 + 0.1)
+                .min_by(|(_, (_, cx1, cy1, _)), (_, (_, cx2, cy2, _))| {
+                    let d1 = (cx1 - bc.vc[0]).powi(2) + (cy1 - bc.vc[1]).powi(2);
+                    let d2 = (cx2 - bc.vc[0]).powi(2) + (cy2 - bc.vc[1]).powi(2);
+                    d1.partial_cmp(&d2).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(avail_idx, _)| avail_idx);
+
+            if let Some(ai) = best_idx {
+                let (_, cx, cy, _) = available_circles[ai];
+                ent_to_circle.insert(bc.ents.clone(), [cx, cy]);
+                available_circles.remove(ai);
+            } else {
+                // No circle matched → use projected bore centre directly.
+                ent_to_circle.insert(bc.ents.clone(), bc.vc);
+            }
+        }
+
+        // Now assign axial centres to sites. We match each site by (x_mm, y_mm)
+        // to a bore candidate using the bore_centres lookup.
+        // Since HoleSite doesn't carry entities, we match by position proximity.
+        let mut used_circles: Vec<[f64; 2]> = Vec::new();
+
+        for site in &mut sites {
+            // Find the bore candidate whose projected world centre is closest
+            // to the site's (x_mm, y_mm) position values.
+            //
+            // The site's x_mm / y_mm are offsets from the part corner. The bore
+            // world centre in the perpendicular plane ≈ (datum_origin + offset).
+            // For matching, we compare vc (the projected world centre) against
+            // the bore candidates.
+            //
+            // Since we built bore_candidates from the same dim records as the
+            // hole table, we can match by finding the candidate whose projected
+            // centre hasn't been used yet and whose diameter matches.
+            let best = bore_candidates
+                .iter()
+                .filter(|bc| {
+                    (bc.dia - site.diameter_mm).abs() < 0.01
+                        && !used_circles.iter().any(|u| {
+                            let mapped = ent_to_circle.get(&bc.ents).copied().unwrap_or(bc.vc);
+                            (mapped[0] - u[0]).abs() < 0.1 && (mapped[1] - u[1]).abs() < 0.1
+                        })
+                })
+                .min_by(|a, b| {
+                    // Pick the candidate whose x_mm / y_mm offsets match the site.
+                    // Use a simple distance heuristic: |bc.vc[0] - site.x_mm| +
+                    // |bc.vc[1] - site.y_mm|. This is approximate since x_mm and
+                    // y_mm are offsets (not absolute coords), but for typical
+                    // workpieces (part centred near origin) the relative order is
+                    // preserved. For off-origin parts the circles disambiguate.
+                    let da = (a.vc[0] - site.x_mm).abs() + (a.vc[1] - site.y_mm).abs();
+                    let db = (b.vc[0] - site.x_mm).abs() + (b.vc[1] - site.y_mm).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+            if let Some(bc) = best {
+                let circle_centre = ent_to_circle.get(&bc.ents).copied().unwrap_or(bc.vc);
+                site.axial_centre = Some(circle_centre);
+                used_circles.push(circle_centre);
+            }
+        }
+    }
+
+    drawing.hole_sites = sites;
 }
 
 #[cfg(test)]

@@ -385,6 +385,19 @@ pub struct Drawing {
     /// Adjusted to the document unit at build time.
     #[serde(default = "Drawing::default_tolerance_note")]
     pub tolerance_note: String,
+    /// Pre-computed hole table for drawings of bored parts.
+    ///
+    /// Populated by `standard_drawing_auto` when the part has cylindrical bores.
+    /// Empty for parts without any bore features. `serde(default)` keeps pre-Task-7
+    /// serialised drawings loading cleanly (they simply have no hole table).
+    #[serde(default)]
+    pub hole_sites: Vec<super::hole_table::HoleSite>,
+    /// View index (into `views`) of the TOP (axial) view — the view whose
+    /// camera looks along the bore axis, so hole circles project as true circles
+    /// and tag callouts land at the bore centres. `None` when there is no bored
+    /// part or no suitable axial view.
+    #[serde(default)]
+    pub axial_view_idx: Option<usize>,
 }
 
 impl Drawing {
@@ -406,6 +419,8 @@ impl Drawing {
             title_block: TitleBlock::default(),
             unit_note: Self::default_unit_note(),
             tolerance_note: Self::default_tolerance_note(),
+            hole_sites: Vec::new(),
+            axial_view_idx: None,
         }
     }
 

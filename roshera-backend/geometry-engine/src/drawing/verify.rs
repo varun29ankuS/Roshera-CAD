@@ -541,18 +541,25 @@ fn check_redundant_dimensions(drawing: &Drawing, sheet_h: f64, issues: &mut Vec<
 /// Collision tolerance for dimension-text bounding boxes (ISO 129 practice).
 const DIM_TEXT_COLLISION_TOL_MM: f64 = 0.2;
 
-/// Detect pairs of `DimensionText` bboxes that overlap — regardless of which
-/// view they belong to (ISO 129 prohibits callout stacks that merge into one
-/// unreadable blob). Tolerates up to 0.2 mm of positive interior overlap
-/// (printer registration noise). Any larger overlap is an `Error`.
+/// Detect pairs of text-class bboxes that overlap — `DimensionText` and
+/// `HoleTag` items both carry text that must not collide (ISO 129 prohibits
+/// callout stacks that merge into one unreadable blob). Tolerates up to
+/// 0.2 mm of positive interior overlap (printer registration noise). Any
+/// larger overlap is an `Error`.
 fn check_dimension_label_collisions(
     layout: &super::layout::SheetLayout,
     issues: &mut Vec<DrawingIssue>,
 ) {
+    // Both DimensionText and HoleTag carry callout text that must not overlap.
     let dim_texts: Vec<&super::layout::SheetItem> = layout
         .items
         .iter()
-        .filter(|it| it.kind == SheetItemKind::DimensionText)
+        .filter(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::DimensionText | SheetItemKind::HoleTag
+            )
+        })
         .collect();
 
     for i in 0..dim_texts.len() {
@@ -564,7 +571,7 @@ fn check_dimension_label_collisions(
                 issues.push(error(
                     DrawingIssueKind::DimensionLabelCollision,
                     format!(
-                        "dimension '{}' overlaps dimension '{}'",
+                        "callout '{}' overlaps callout '{}'",
                         dim_texts[i].text.as_deref().unwrap_or("?"),
                         dim_texts[j].text.as_deref().unwrap_or("?"),
                     ),

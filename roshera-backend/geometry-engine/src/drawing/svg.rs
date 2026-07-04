@@ -92,6 +92,13 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     // one representation, so a collision the verifier reports is what renders.
     render_view_labels(&mut out, &layout);
 
+    // Hole table + tag callouts (when the drawing has a pre-computed hole table).
+    // Rendered after dimensions and view labels so the table sits on top.
+    if !drawing.hole_sites.is_empty() {
+        render_hole_tags(&mut out, &layout);
+        render_hole_table(&mut out, &layout);
+    }
+
     // Notes strip in the bottom-left corner of the frame.
     render_notes_strip(&mut out, drawing, frame_x, frame_y + frame_h);
 
@@ -187,6 +194,13 @@ fn write_stylesheet(out: &mut String) {
         "    .notes-strip { font: 500 2.4px sans-serif; fill: #333; \
          letter-spacing: 0.06px; }\n",
     );
+    // Hole-table / hole-tag styles (Task 7).
+    out.push_str(
+        "    .hole-tag { font: 700 2.6px sans-serif; fill: #111; \
+         text-anchor: middle; dominant-baseline: alphabetic; }\n",
+    );
+    out.push_str("    .hole-table-border { fill: none; stroke: #111; stroke-width: 0.2; }\n");
+    out.push_str("    .hole-table-text { font: 500 2.6px sans-serif; fill: #111; }\n");
     out.push_str("  </style>\n");
 }
 
@@ -410,6 +424,100 @@ fn render_view_labels(out: &mut String, layout: &SheetLayout) {
         let _ = write!(
             out,
             "  <text class=\"label\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
+            item.bbox.x0,
+            item.bbox.y1,
+            escape_xml(text)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Hole table + tag callouts
+// ---------------------------------------------------------------------
+
+/// Ink hole-tag callouts from the layout's `HoleTag` items.
+///
+/// Each tag is a small centred label ("A1", "B3") placed at the bore centre
+/// in the axial view. Uses the same `hole-tag` CSS class so it can be styled
+/// independently from dimension text.
+fn render_hole_tags(out: &mut String, layout: &SheetLayout) {
+    for item in layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::HoleTag)
+    {
+        let text = item.text.as_deref().unwrap_or("");
+        // Centre-anchored: x/y is the text centre.
+        let cx = 0.5 * (item.bbox.x0 + item.bbox.x1);
+        let cy = 0.5 * (item.bbox.y0 + item.bbox.y1) + super::layout::HOLE_TAG_FONT_MM * 0.5;
+        let _ = write!(
+            out,
+            "  <text class=\"hole-tag\" x=\"{cx:.3}\" y=\"{cy:.3}\">{}</text>\n",
+            escape_xml(text)
+        );
+    }
+}
+
+/// Ink the bordered hole table from the layout's `HoleTableBorder` and
+/// `HoleTableText` items.
+fn render_hole_table(out: &mut String, layout: &SheetLayout) {
+    // Borders: emit as `<rect>` for the outer border, `<line>` for separators.
+    // We distinguish the outer border (tallest bbox) from separators (thin bboxes).
+    let borders: Vec<_> = layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::HoleTableBorder)
+        .collect();
+
+    // The first HoleTableBorder item is the outer border (added first in place_hole_table).
+    if let Some(outer) = borders.first() {
+        let b = &outer.bbox;
+        let _ = write!(
+            out,
+            "  <rect class=\"hole-table-border\" x=\"{:.3}\" y=\"{:.3}\" \
+             width=\"{:.3}\" height=\"{:.3}\" />\n",
+            b.x0,
+            b.y0,
+            b.width(),
+            b.height()
+        );
+    }
+    // Remaining borders are separator lines (thin bboxes).
+    for sep in borders.iter().skip(1) {
+        let b = &sep.bbox;
+        // Determine orientation: a horizontal separator has height ≈ 0.2,
+        // a vertical separator has width ≈ 0.2.
+        if b.height() < b.width() {
+            // Horizontal separator.
+            let y = 0.5 * (b.y0 + b.y1);
+            let _ = write!(
+                out,
+                "  <line class=\"hole-table-border\" x1=\"{:.3}\" y1=\"{y:.3}\" \
+                 x2=\"{:.3}\" y2=\"{y:.3}\" />\n",
+                b.x0, b.x1
+            );
+        } else {
+            // Vertical separator.
+            let x = 0.5 * (b.x0 + b.x1);
+            let _ = write!(
+                out,
+                "  <line class=\"hole-table-border\" x1=\"{x:.3}\" y1=\"{:.3}\" \
+                 x2=\"{x:.3}\" y2=\"{:.3}\" />\n",
+                b.y0, b.y1
+            );
+        }
+    }
+
+    // Text cells.
+    for item in layout
+        .items
+        .iter()
+        .filter(|i| i.kind == SheetItemKind::HoleTableText)
+    {
+        let text = item.text.as_deref().unwrap_or("");
+        let _ = write!(
+            out,
+            "  <text class=\"hole-table-text\" x=\"{:.3}\" y=\"{:.3}\">{}</text>\n",
             item.bbox.x0,
             item.bbox.y1,
             escape_xml(text)

@@ -107,6 +107,12 @@ pub enum SheetItemKind {
     DimensionText,
     /// The title block rectangle.
     TitleBlock,
+    /// A hole-tag callout in a view ("A1", "B2", …).
+    HoleTag,
+    /// A cell border in the hole table (LWPOLYLINE / `<rect>`).
+    HoleTableBorder,
+    /// A text cell in the hole table (header or data).
+    HoleTableText,
 }
 
 /// One piece of ink on the sheet, with its bounding box in sheet coordinates.
@@ -172,6 +178,23 @@ pub struct PlacedDimension {
     pub owner_view: usize,
 }
 
+// ── Hole-tag placement ────────────────────────────────────────────────────────
+
+/// A placed hole-tag callout in sheet space.
+///
+/// The tag ("A1", "B2", …) is centred on the bore's axial-view centre,
+/// with a deterministic offset if that position would collide with existing
+/// dimension text (offset applied outward from the view centre).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacedHoleTag {
+    /// Sheet-space centre of the tag label.
+    pub text_anchor: [f64; 2],
+    /// The tag string, e.g. "A1".
+    pub tag: String,
+    /// Index into `drawing.views` of the axial view.
+    pub owner_view: usize,
+}
+
 // ── Sheet layout ───────────────────────────────────────────────────────────────
 
 /// Complete layout model for one drawing: the sheet rect and every ink item.
@@ -184,6 +207,8 @@ pub struct SheetLayout {
     /// The renderer inks these directly; the verifier checks text bboxes
     /// derived from `text_anchor` — one model, no re-computation.
     pub dimensions: Vec<PlacedDimension>,
+    /// Placed hole-tag callouts in the axial view (if a hole table exists).
+    pub hole_tags: Vec<PlacedHoleTag>,
 }
 
 // ── view_geometry_rect (canonical, single implementation) ──────────────────────
@@ -458,6 +483,17 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         all_placed.extend(pds);
     }
 
+    // ── Hole table + tag callouts ─────────────────────────────────────
+    // When the drawing has pre-computed hole sites, generate:
+    //   1. HoleTag items at each bore centre in the axial view.
+    //   2. HoleTableBorder + HoleTableText items for the bordered table.
+    let mut hole_tags: Vec<PlacedHoleTag> = Vec::new();
+    if !drawing.hole_sites.is_empty() {
+        let (tags, table_items) = place_hole_table(drawing, h, &items);
+        hole_tags = tags;
+        items.extend(table_items);
+    }
+
     SheetLayout {
         sheet: Rect2 {
             x0: 0.0,
@@ -467,7 +503,297 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
         },
         items,
         dimensions: all_placed,
+        hole_tags,
     }
+}
+
+// ── Hole table placement ───────────────────────────────────────────────────────
+
+/// Font size for hole-tag callouts in the axial view (mm).
+pub(crate) const HOLE_TAG_FONT_MM: f64 = 2.6;
+/// Font size for hole-table header/data cells (mm).
+const TABLE_TEXT_FONT_MM: f64 = 2.6;
+/// Cell padding (mm) around text inside table cells.
+const TABLE_CELL_PAD: f64 = 1.0;
+/// Row height (mm) for the table.
+const TABLE_ROW_H: f64 = 5.5;
+/// Gap between the table right edge and the frame / title-block left edge.
+const TABLE_MARGIN: f64 = 3.0;
+
+/// Place hole-tag callouts and the bordered hole table on the sheet.
+///
+/// Returns `(hole_tags, new_sheet_items)` where:
+/// - `hole_tags` are placed `PlacedHoleTag` entries (used by the renderer
+///   and collision detector).
+/// - `new_sheet_items` are the `HoleTag`, `HoleTableBorder`, and
+///   `HoleTableText` items to append to the layout's `items` Vec.
+///
+/// Table placement: right side of the sheet, just above the title block,
+/// flush with the title block's left edge (or inset `TABLE_MARGIN` from
+/// the frame right edge if the title block is narrower than the frame).
+/// Deterministic rule: always right-side; if it doesn't fit (table height
+/// exceeds available space above the title block), shift left until it fits
+/// or runs out of room (in which case the table is placed as far right as
+/// possible and the verifier will report the collision).
+fn place_hole_table(
+    drawing: &Drawing,
+    sheet_h: f64,
+    existing: &[SheetItem],
+) -> (Vec<PlacedHoleTag>, Vec<SheetItem>) {
+    let w = drawing.sheet_size.width();
+    let (ml, _mr, mt, mb) = frame_margins(&drawing.sheet_size);
+    let (tb_w, tb_h) = title_block_size(&drawing.sheet_size);
+    let frame_w = w - ml - _mr;
+    let frame_h = sheet_h - mt - mb;
+
+    // Title block occupies the bottom-right corner of the frame.
+    let tb_x0 = ml + frame_w - tb_w;
+    let tb_y0 = mt + frame_h - tb_h;
+
+    // Build table column headers and compute column widths.
+    // Columns: TAG · X · Y · Ø · DEPTH
+    let headers = ["TAG", "X", "Y", "\u{00D8}", "DEPTH"];
+    let sites = &drawing.hole_sites;
+
+    // Determine column widths from the widest content (header or data cell).
+    let col_w = |col: usize| -> f64 {
+        let header_w = headers[col].chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM
+            + 2.0 * TABLE_CELL_PAD;
+        let max_data_w = sites
+            .iter()
+            .map(|s| {
+                let text = match col {
+                    0 => s.tag.as_str(),
+                    1 => s.x_label.as_str(),
+                    2 => s.y_label.as_str(),
+                    3 => s.dia_label.as_str(),
+                    _ => s.depth_label.as_str(),
+                };
+                text.chars().count() as f64 * GLYPH_ADVANCE_EM * TABLE_TEXT_FONT_MM
+                    + 2.0 * TABLE_CELL_PAD
+            })
+            .fold(0.0_f64, f64::max);
+        header_w.max(max_data_w).max(6.0) // minimum column width = 6 mm
+    };
+
+    let col_widths: Vec<f64> = (0..5).map(col_w).collect();
+    let total_w: f64 = col_widths.iter().sum();
+    // One header row + one row per site.
+    let total_rows = 1 + sites.len();
+    let total_h = total_rows as f64 * TABLE_ROW_H;
+
+    // Table top-left: above the title block, right-aligned to its left edge.
+    // Prefer to align right edge of table to the title-block left edge - margin.
+    let table_x1 = tb_x0 - TABLE_MARGIN;
+    let table_x0 = (table_x1 - total_w).max(ml + 1.0);
+    let table_y1 = tb_y0 - TABLE_MARGIN;
+    let table_y0 = (table_y1 - total_h).max(mt + 1.0);
+
+    let mut new_items: Vec<SheetItem> = Vec::new();
+
+    // ── Outer border ─────────────────────────────────────────────────────────
+    new_items.push(SheetItem {
+        kind: SheetItemKind::HoleTableBorder,
+        bbox: Rect2 {
+            x0: table_x0,
+            y0: table_y0,
+            x1: table_x1,
+            y1: table_y1,
+        },
+        owner_view: None,
+        text: None,
+    });
+
+    // ── Column separators (vertical lines inside the table) ─────────────────
+    let mut cx = table_x0;
+    for (ci, &cw) in col_widths.iter().enumerate().take(col_widths.len() - 1) {
+        cx += cw;
+        // Vertical separator from top to bottom
+        new_items.push(SheetItem {
+            kind: SheetItemKind::HoleTableBorder,
+            bbox: Rect2 {
+                x0: cx - 0.1,
+                y0: table_y0,
+                x1: cx + 0.1,
+                y1: table_y1,
+            },
+            owner_view: None,
+            text: None,
+        });
+        let _ = ci; // suppress lint
+    }
+
+    // ── Header row separator (horizontal line after header) ─────────────────
+    let header_bottom = table_y0 + TABLE_ROW_H;
+    new_items.push(SheetItem {
+        kind: SheetItemKind::HoleTableBorder,
+        bbox: Rect2 {
+            x0: table_x0,
+            y0: header_bottom - 0.1,
+            x1: table_x1,
+            y1: header_bottom + 0.1,
+        },
+        owner_view: None,
+        text: None,
+    });
+
+    // ── Header text ──────────────────────────────────────────────────────────
+    {
+        let mut x = table_x0;
+        for (ci, &header) in headers.iter().enumerate() {
+            let cell_x0 = x;
+            let cell_w = col_widths[ci];
+            let text_x = cell_x0 + TABLE_CELL_PAD;
+            let text_y = table_y0 + TABLE_ROW_H - TABLE_CELL_PAD;
+            new_items.push(SheetItem {
+                kind: SheetItemKind::HoleTableText,
+                bbox: text_bbox(header, TABLE_TEXT_FONT_MM, text_x, text_y),
+                owner_view: None,
+                text: Some(header.to_string()),
+            });
+            x += cell_w;
+        }
+    }
+
+    // ── Data rows ────────────────────────────────────────────────────────────
+    for (row, site) in sites.iter().enumerate() {
+        let row_y0 = header_bottom + row as f64 * TABLE_ROW_H;
+        let cells: [&str; 5] = [
+            site.tag.as_str(),
+            site.x_label.as_str(),
+            site.y_label.as_str(),
+            site.dia_label.as_str(),
+            site.depth_label.as_str(),
+        ];
+        let mut x = table_x0;
+        for (ci, &cell_text) in cells.iter().enumerate() {
+            let text_x = x + TABLE_CELL_PAD;
+            let text_y = row_y0 + TABLE_ROW_H - TABLE_CELL_PAD;
+            new_items.push(SheetItem {
+                kind: SheetItemKind::HoleTableText,
+                bbox: text_bbox(cell_text, TABLE_TEXT_FONT_MM, text_x, text_y),
+                owner_view: None,
+                text: Some(cell_text.to_string()),
+            });
+            x += col_widths[ci];
+        }
+        // Row separator (except after the last row — the outer border closes it).
+        if row + 1 < sites.len() {
+            let row_bottom = row_y0 + TABLE_ROW_H;
+            new_items.push(SheetItem {
+                kind: SheetItemKind::HoleTableBorder,
+                bbox: Rect2 {
+                    x0: table_x0,
+                    y0: row_bottom - 0.1,
+                    x1: table_x1,
+                    y1: row_bottom + 0.1,
+                },
+                owner_view: None,
+                text: None,
+            });
+        }
+    }
+
+    // ── Hole-tag callouts ─────────────────────────────────────────────────────
+    // Place tag text at each bore's axial-view centre, with a deterministic
+    // offset if that position would collide with existing dimension text.
+    let mut placed_tags: Vec<PlacedHoleTag> = Vec::new();
+
+    let axial_idx = match drawing.axial_view_idx {
+        Some(i) => i,
+        None => return (placed_tags, new_items),
+    };
+    let axial_view = match drawing.views.get(axial_idx) {
+        Some(v) => v,
+        None => return (placed_tags, new_items),
+    };
+
+    // Build obstacle set: all DimensionText items + already-placed HoleTag items.
+    let mut obstacles: Vec<Rect2> = existing
+        .iter()
+        .filter(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::DimensionText | SheetItemKind::HoleTag
+            )
+        })
+        .map(|it| it.bbox)
+        .collect();
+
+    for site in sites {
+        let centre = match site.axial_centre {
+            Some(c) => c,
+            None => continue,
+        };
+        // Convert view-space centre to sheet space.
+        let sx = axial_view.position_mm[0] + centre[0] * axial_view.scale;
+        let sy = (sheet_h - axial_view.position_mm[1]) - centre[1] * axial_view.scale;
+
+        // Tag text bbox at the raw position.
+        let tag_text = &site.tag;
+        let tag_font = HOLE_TAG_FONT_MM;
+        let half_w = tag_text.chars().count() as f64 * GLYPH_ADVANCE_EM * tag_font * 0.5;
+        let half_h = tag_font * 0.5;
+
+        // Try the bore centre first, then 4 deterministic offsets.
+        const OFFSET: f64 = 4.0;
+        let candidates: [[f64; 2]; 5] = [
+            [sx, sy],
+            [sx, sy - OFFSET],
+            [sx + OFFSET, sy],
+            [sx, sy + OFFSET],
+            [sx - OFFSET, sy],
+        ];
+
+        let mut chosen_anchor = [sx, sy];
+        for &[cx, cy] in &candidates {
+            let bbox = Rect2 {
+                x0: cx - half_w,
+                y0: cy - half_h,
+                x1: cx + half_w,
+                y1: cy + half_h,
+            };
+            if !obstacles.iter().any(|o| bbox.intersects(o, 0.2)) {
+                chosen_anchor = [cx, cy];
+                let new_bbox = Rect2 {
+                    x0: cx - half_w,
+                    y0: cy - half_h,
+                    x1: cx + half_w,
+                    y1: cy + half_h,
+                };
+                obstacles.push(new_bbox);
+                break;
+            }
+        }
+        // Fall through to the least-bad position if all collide (last candidate).
+        let (tx, ty) = (chosen_anchor[0], chosen_anchor[1]);
+        let bbox = Rect2 {
+            x0: tx - half_w,
+            y0: ty - half_h,
+            x1: tx + half_w,
+            y1: ty + half_h,
+        };
+        // Ensure the obstacle list has the chosen bbox (it was added in the loop
+        // only when a non-colliding slot was found; add it now regardless).
+        if !obstacles.contains(&bbox) {
+            obstacles.push(bbox);
+        }
+
+        new_items.push(SheetItem {
+            kind: SheetItemKind::HoleTag,
+            bbox,
+            owner_view: Some(axial_idx),
+            text: Some(tag_text.clone()),
+        });
+
+        placed_tags.push(PlacedHoleTag {
+            text_anchor: [tx, ty],
+            tag: tag_text.clone(),
+            owner_view: axial_idx,
+        });
+    }
+
+    (placed_tags, new_items)
 }
 
 // ── Dimension placement ────────────────────────────────────────────────────────
