@@ -419,3 +419,170 @@ fn recreated_identical_bore_gets_new_pid() {
          follows the entity, not the shape"
     );
 }
+
+// ── Amendment A2: position dimensions (Task 8) ────────────────────────────────
+
+/// Helper: find position records with a given axis tag ("x" or "y").
+fn position_records<'a>(dims: &'a [DimensionRecord], axis: &str) -> Vec<&'a DimensionRecord> {
+    let prefix = format!("{} ", axis.to_uppercase());
+    dims.iter()
+        .filter(|d| d.kind == "position" && d.label.starts_with(&prefix))
+        .collect()
+}
+
+/// A 60×40 plate with one Z-axis bore at world centre (−15, 5):
+///   - plate runs from x=−30..+30, y=−20..+20 (centred at world origin via
+///     TopologyBuilder — 60×40 box is origin-centred).
+///   - bore axis at (−15, 5): X offset from min corner (−30) = 15.00;
+///                             Y offset from min corner (−20) = 25.00.
+///   - datum origin should be (−30, −20, <z_of_top_face>).
+///   - datum kind = "part_corner".
+#[test]
+fn bore_position_from_part_corner_exact() {
+    let mut m = BRepModel::new();
+    // 60×40×10 box — TopologyBuilder centres it, so spans x=−30..+30, y=−20..+20, z=−5..+5.
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(60.0, 40.0, 10.0)
+        .expect("plate"));
+    // Bore axis at (−15, 5), drilling all the way through along Z.
+    let cutter = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(-15.0, 5.0, -20.0), Vector3::Z, 4.0, 80.0)
+        .expect("bore cutter"));
+    let part = diff(&mut m, plate, cutter);
+
+    let dims = extract_dimensions(&m, part);
+
+    // Exactly one X-position and one Y-position record.
+    let x_recs = position_records(&dims, "x");
+    assert_eq!(x_recs.len(), 1, "expected 1 X position record: {dims:?}");
+    let y_recs = position_records(&dims, "y");
+    assert_eq!(y_recs.len(), 1, "expected 1 Y position record: {dims:?}");
+
+    let x_rec = x_recs[0];
+    let y_rec = y_recs[0];
+
+    // X offset: bore axis x (−15) − AABB min_x (−30) = 15.00
+    assert!(
+        (x_rec.value - 15.0).abs() < 1e-3,
+        "X offset should be 15.00, got {}: {x_rec:?}",
+        x_rec.value
+    );
+    // Y offset: bore axis y (5) − AABB min_y (−20) = 25.00
+    assert!(
+        (y_rec.value - 25.0).abs() < 1e-3,
+        "Y offset should be 25.00, got {}: {y_rec:?}",
+        y_rec.value
+    );
+
+    // Labels must use drawing-style format "X 15.00" / "Y 25.00".
+    assert_eq!(x_rec.label, "X 15.00", "label mismatch: {x_rec:?}");
+    assert_eq!(y_rec.label, "Y 25.00", "label mismatch: {y_rec:?}");
+
+    // Datum must be Some with kind "part_corner".
+    let x_datum = x_rec.datum.as_ref().expect("X position must carry a datum");
+    assert_eq!(
+        x_datum.kind, "part_corner",
+        "datum kind must be part_corner: {x_datum:?}"
+    );
+    let y_datum = y_rec.datum.as_ref().expect("Y position must carry a datum");
+    assert_eq!(
+        y_datum.kind, "part_corner",
+        "datum kind must be part_corner: {y_datum:?}"
+    );
+
+    // Datum origin: (min_x, min_y, z_at_drilled_face).
+    // For a Z-axis bore the "drilled face height" = AABB min_z (= −5 for our 60×40×10 box).
+    let ox = x_datum.origin[0];
+    let oy = x_datum.origin[1];
+    assert!(
+        (ox - (-30.0)).abs() < 1e-3,
+        "datum origin x should be −30 (AABB min_x), got {ox}"
+    );
+    assert!(
+        (oy - (-20.0)).abs() < 1e-3,
+        "datum origin y should be −20 (AABB min_y), got {oy}"
+    );
+    assert_eq!(
+        x_datum.name, "part corner",
+        "datum name must be 'part corner'"
+    );
+
+    // Entities must reference the cylindrical face.
+    assert!(
+        !x_rec.entities.is_empty(),
+        "X position must reference the bore face"
+    );
+    assert!(
+        !y_rec.entities.is_empty(),
+        "Y position must reference the bore face"
+    );
+
+    // Anchors must be finite.
+    assert!(
+        x_rec.anchor.iter().all(|c: &f64| c.is_finite()),
+        "X position anchor must be finite"
+    );
+    assert!(
+        y_rec.anchor.iter().all(|c: &f64| c.is_finite()),
+        "Y position anchor must be finite"
+    );
+}
+
+/// Position pids must be stable across an unrelated second bore.
+#[test]
+fn position_pid_survives_unrelated_bore() {
+    let mut m = BRepModel::new();
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(60.0, 60.0, 10.0)
+        .expect("plate"));
+    let bore_a = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(-10.0, 0.0, -20.0), Vector3::Z, 4.0, 80.0)
+        .expect("bore_a"));
+    let part = diff(&mut m, plate, bore_a);
+
+    // Capture bore A's X-position pid.
+    let pid_x_a = extract_dimensions(&m, part)
+        .into_iter()
+        .find(|d| d.kind == "position" && d.label.starts_with("X "))
+        .and_then(|d| d.pid.clone())
+        .expect("bore A X-position must carry a pid");
+
+    // Drill an unrelated bore B.
+    let bore_b = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(10.0, 0.0, -20.0), Vector3::Z, 3.0, 80.0)
+        .expect("bore_b"));
+    let part2 = diff(&mut m, part, bore_b);
+
+    let dims2 = extract_dimensions(&m, part2);
+    // The X-position record from bore A (value ~ 20.00: axis x=−10, min_x=−30) must survive.
+    let pid_x_a2 = dims2
+        .iter()
+        .filter(|d| d.kind == "position" && d.label.starts_with("X "))
+        .find(|d| (d.value - 20.0).abs() < 1e-3)
+        .and_then(|d| d.pid.clone())
+        .expect("bore A X-position pid must survive after bore B added");
+
+    assert_eq!(
+        pid_x_a, pid_x_a2,
+        "bore A X-position pid must be stable across unrelated edits"
+    );
+}
+
+/// A diagonal-axis cylinder (axis not aligned with X, Y, or Z beyond the
+/// degenerate-threshold) must NOT emit any position records.
+#[test]
+fn diagonal_axis_cylinder_emits_no_position_records() {
+    let mut m = BRepModel::new();
+    // Axis = (1,1,1) normalised — all three components equal → no dominant axis
+    // → two perpendicular axes cannot be unambiguously chosen → no position records.
+    let diagonal_axis = Vector3::new(1.0, 1.0, 1.0);
+    let cyl = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::ZERO, diagonal_axis, 5.0, 20.0)
+        .expect("diagonal cyl"));
+    let dims = extract_dimensions(&m, cyl);
+    let pos_records: Vec<_> = dims.iter().filter(|d| d.kind == "position").collect();
+    assert!(
+        pos_records.is_empty(),
+        "diagonal-axis cylinder must NOT emit position records (honest absence): {pos_records:?}"
+    );
+}

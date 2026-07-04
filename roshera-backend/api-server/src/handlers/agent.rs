@@ -45,8 +45,8 @@ use geometry_engine::readable::claim::{
     verify_claim, CheckableClaim, ClaimBinding, ClaimVerdict, Measurement,
 };
 use geometry_engine::readable::{
-    DatumSummary, DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter,
-    MassPropertiesReport, OrientedBBox, PartProximity, PartReport, PartSummary,
+    DatumDescriptor, DatumSummary, DistanceReport, EdgeReport, FaceReport, HoverReport,
+    ListPartsFilter, MassPropertiesReport, OrientedBBox, PartProximity, PartReport, PartSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2516,6 +2516,10 @@ pub struct DimensionWire {
     /// Durable cross-session identity derived via UUIDv5 from entity
     /// PersistentIds. `null` for pre-PID solids (honest absence).
     pub pid: Option<String>,
+    /// Reference datum for `"position"` kind records. `null` for all
+    /// other kinds (additive — existing consumers see no change).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datum: Option<DatumDescriptor>,
 }
 
 /// Wire shape for the single-call dimensioning answer: the callout-annotated
@@ -2614,6 +2618,7 @@ pub async fn part_dimensions(
                 anchor: d.anchor,
                 direction: d.direction,
                 pid: d.pid,
+                datum: d.datum,
             })
             .collect(),
         views: frame

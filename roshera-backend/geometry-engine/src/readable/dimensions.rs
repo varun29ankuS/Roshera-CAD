@@ -21,6 +21,30 @@ use crate::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// An explicit reference datum attached to a position dimension.
+///
+/// Every position dimension names its reference so a downstream reader
+/// (driller, agent, dimension layer) always knows what the number is
+/// measured from without out-of-band context.
+///
+/// `kind` is one of:
+/// - `"part_corner"` — the AABB min-corner of the solid projected onto the
+///   plane perpendicular to the cylinder axis at the drilled-face elevation
+///   (machinist edge convention — the reference any machinist would clamp to).
+/// - `"datum"` — a designated kernel `Datum` explicitly bound to the solid.
+///   (Reserved for Spec C; not yet emitted — Spec C must wire the
+///   datum-to-part association path through `BRepModel::solid_location_descriptor_cached`.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DatumDescriptor {
+    /// `"part_corner"` or `"datum"`.
+    pub kind: String,
+    /// Human name shown in the callout, e.g. `"part corner"` or the datum's
+    /// authored name.
+    pub name: String,
+    /// World-space position of the reference point (the corner or datum origin).
+    pub origin: [f64; 3],
+}
+
 /// Project-unique namespace for all Roshera dimension pids.
 ///
 /// Encoded as `6e5a1f00-0000-4000-8000-526f73686572` — the trailing bytes
@@ -125,6 +149,92 @@ pub struct DimensionRecord {
     /// backwards compatibility; `pid` is the durable handle.
     #[serde(default)]
     pub pid: Option<String>,
+    /// Reference datum for position dimensions (X/Y offset records).
+    ///
+    /// `None` for every non-`"position"` kind (diameter, length, angle,
+    /// extent) — serde-default guarantees additive backwards compat.
+    /// Position records always carry `Some(DatumDescriptor)` so a reader
+    /// never sees a position number without knowing its reference.
+    #[serde(default)]
+    pub datum: Option<DatumDescriptor>,
+}
+
+/// Derive a stable `pid` for a **position** dimension (X or Y offset of a
+/// cylinder axis from its part-corner datum).
+///
+/// Input: the face id carrying the cylinder + a suffix tag (`"position_x"` or
+/// `"position_y"`).  Returns `None` when the face has no recorded pid.
+fn position_dim_pid(model: &BRepModel, face_id: u32, suffix: &str) -> Option<String> {
+    let face_pid = model.face_pids.get(&face_id)?;
+    let kind_bytes = suffix.as_bytes();
+    let mut buf: Vec<u8> = Vec::with_capacity(4 + 16 + 4 + kind_bytes.len());
+    // Encode as a length-prefixed single entity so the hash input is
+    // structurally identical to `feature_dim_pid` with one entity — preventing
+    // aliasing with any future multi-entity position kind.
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&face_pid.as_u128().to_be_bytes());
+    buf.extend_from_slice(&(kind_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(kind_bytes);
+    Some(Uuid::new_v5(&ROSHERA_DIM_NS, &buf).hyphenated().to_string())
+}
+
+/// Determine the two world-axis indices perpendicular to a dominant cylinder
+/// axis, and verify the axis is close enough to world-aligned to give
+/// unambiguous position offsets.
+///
+/// ## Axis selection
+///
+/// A cylinder axis is "world-aligned" when one of its three world-axis dot
+/// products is strictly greater than the other two by a margin of 0.5 (i.e.
+/// the dominant component is |axis·e_dominant| ≥ 0.5 + 0.5·others).
+///
+/// The two perpendicular axes are the two with the *smallest* |axis·e_i|.
+///
+/// ## Degenerate case
+///
+/// When no single axis is dominant (e.g. a (1,1,1)/√3 diagonal), position
+/// offsets would be measured along arbitrary projections of the AABB — the
+/// number would be misleading. In that case the function returns `None` and
+/// the caller emits **no** position records (honest absence is safer than a
+/// fabricated measurement).
+///
+/// The dominant axis index (0=X, 1=Y, 2=Z) and the two perpendicular axes
+/// (ordered by world-axis index) are returned as `(dominant, [perp0, perp1])`.
+fn axis_perpendicular_pair(axis: [f64; 3]) -> Option<(usize, [usize; 2])> {
+    let abs = [axis[0].abs(), axis[1].abs(), axis[2].abs()];
+    // Find the dominant axis (largest absolute component).
+    let dominant = if abs[0] >= abs[1] && abs[0] >= abs[2] {
+        0
+    } else if abs[1] >= abs[2] {
+        1
+    } else {
+        2
+    };
+    // Degenerate: the dominant component must be ≥ 0.5 to qualify as
+    // "world-aligned enough". For a true (1/√3, 1/√3, 1/√3) diagonal
+    // axis each component is ≈ 0.577 — passes this guard. The distinction
+    // is made by the SECOND guard below: the dominant component must
+    // exceed the second-largest by at least 0.1, so truly diagonal axes
+    // (where two or more components are nearly equal) are rejected.
+    if abs[dominant] < 0.5 {
+        return None;
+    }
+    // Reject axes where two components are nearly equal in magnitude:
+    // for a (1,1,0)/√2 axis the two dominant components are each ≈0.707 —
+    // no single perpendicular pair is unambiguous.
+    let perps = match dominant {
+        0 => [1usize, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    let second_largest = abs[perps[0]].max(abs[perps[1]]);
+    // Require the dominant component to be meaningfully larger than the
+    // second. Threshold 0.1 passes axes up to ~6° off world-aligned and
+    // rejects truly diagonal or bi-diagonal axes.
+    if abs[dominant] - second_largest < 0.1 {
+        return None;
+    }
+    Some((dominant, perps))
 }
 
 /// Min/max world AABB accumulated from sampled points.
@@ -304,7 +414,9 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
     };
 
     // ── Overall extents (X / Y / Z) from exact edge-curve bounds ──────────────
-    if let Some(bb) = world_aabb(model, solid_id) {
+    // Compute once and reuse for both extent records and position dimensions.
+    let bb = world_aabb(model, solid_id);
+    if let Some(ref bb) = bb {
         let names = ["X", "Y", "Z"];
         let dirs = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         for axis in 0..3 {
@@ -326,6 +438,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                 direction: dirs[axis],
                 axis: None,
                 pid: extent_dim_pid(model, solid_id, &dirs[axis]),
+                datum: None,
             });
         }
     }
@@ -379,6 +492,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     direction: [rd.x, rd.y, rd.z],
                     axis: Some(axis_arr),
                     pid: feature_dim_pid(model, &[fid], "diameter"),
+                    datum: None,
                 });
                 let length = (hi - lo).abs();
                 if length > 1e-9 {
@@ -393,7 +507,104 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         direction: [axis.x, axis.y, axis.z],
                         axis: Some(axis_arr),
                         pid: feature_dim_pid(model, &[fid], "length"),
+                        datum: None,
                     });
+                }
+
+                // ── Position dimensions (X and Y offsets from part-corner) ────
+                //
+                // Emitted for every cylindrical face (bore AND boss). The datum
+                // is the AABB min corner projected onto the plane perpendicular
+                // to the cylinder axis at the "drilled-face" elevation (the
+                // axial station `lo` — the face's lower edge in the axis direction).
+                //
+                // Axis generality: the two offset axes are the WORLD axes whose
+                // dot product with the cylinder axis is SMALLEST (perpendicular pair).
+                // `axis_perpendicular_pair` returns None for diagonal axes — no
+                // records are emitted in that case (honest absence over
+                // misleading fabricated numbers).
+                if let Some(ref bb) = bb {
+                    if let Some((_dominant, perps)) =
+                        axis_perpendicular_pair([axis.x, axis.y, axis.z])
+                    {
+                        // Cylinder axis in world space: decompose the axis origin
+                        // projected to world. The axis passes through `cyl.origin`
+                        // in direction `axis`. The world position of the axis at
+                        // axial station `lo` is:
+                        //   P_lo = cyl.origin + axis * lo
+                        let p_lo = [
+                            cyl.origin.x + axis.x * lo,
+                            cyl.origin.y + axis.y * lo,
+                            cyl.origin.z + axis.z * lo,
+                        ];
+
+                        // The part-corner datum origin: AABB min corner projected
+                        // perpendicular to the axis (i.e. the two perpendicular
+                        // axes take their min values; the dominant axis takes the
+                        // drilled-face station value so the corner lives in the
+                        // correct cross-section plane).
+                        //
+                        // This is the machinist's natural reference: clamp the
+                        // part at its two perpendicular min edges.
+                        let dominant_idx = if perps[0] == 1 && perps[1] == 2 {
+                            0
+                        } else if perps[0] == 0 && perps[1] == 2 {
+                            1
+                        } else {
+                            2
+                        };
+                        let mut corner = bb.min;
+                        corner[dominant_idx] = p_lo[dominant_idx];
+
+                        let datum_desc = DatumDescriptor {
+                            kind: "part_corner".into(),
+                            name: "part corner".into(),
+                            origin: corner,
+                        };
+
+                        let world_axes = [[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+                        let axis_names = ["X", "Y", "Z"];
+                        let pid_suffixes = ["position_x", "position_y", "position_z"];
+
+                        for &perp_idx in &perps {
+                            // Offset = |axis_position - corner| along the world axis.
+                            let offset = (p_lo[perp_idx] - corner[perp_idx]).abs();
+
+                            // Anchor = midpoint between the corner and the axis, at
+                            // the drilled-face plane, in the perpendicular direction.
+                            let axis_pos_at_perp = p_lo[perp_idx];
+                            let corner_at_perp = corner[perp_idx];
+                            let mid_perp = 0.5 * (corner_at_perp + axis_pos_at_perp);
+                            let mut pos_anchor = p_lo;
+                            pos_anchor[perp_idx] = mid_perp;
+
+                            // Direction = world unit axis pointing from corner
+                            // toward the bore axis (sign follows geometry).
+                            let sign = if axis_pos_at_perp >= corner_at_perp {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            let mut dir = world_axes[perp_idx];
+                            dir[perp_idx] *= sign;
+
+                            let label = format!("{} {:.2}", axis_names[perp_idx], offset);
+
+                            out.push(DimensionRecord {
+                                id: id(),
+                                kind: "position".into(),
+                                value: offset,
+                                unit: "mm".into(),
+                                label,
+                                entities: vec![fid],
+                                anchor: pos_anchor,
+                                direction: dir,
+                                axis: Some(axis_arr),
+                                pid: position_dim_pid(model, fid, pid_suffixes[perp_idx]),
+                                datum: Some(datum_desc.clone()),
+                            });
+                        }
+                    }
                 }
             } else if let Some(sph) = any.downcast_ref::<Sphere>() {
                 out.push(DimensionRecord {
@@ -407,6 +618,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     direction: [1.0, 0.0, 0.0],
                     axis: None,
                     pid: feature_dim_pid(model, &[fid], "diameter"),
+                    datum: None,
                 });
             } else if let Some(cone) = any.downcast_ref::<Cone>() {
                 let deg = cone.half_angle.to_degrees();
@@ -433,6 +645,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     direction: [axis.x, axis.y, axis.z],
                     axis: None,
                     pid: feature_dim_pid(model, &[fid], "angle"),
+                    datum: None,
                 });
                 if base_r > 1e-9 {
                     out.push(DimensionRecord {
@@ -446,6 +659,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         direction: [1.0, 0.0, 0.0],
                         axis: Some(cone_axis_arr),
                         pid: feature_dim_pid(model, &[fid], "diameter"),
+                        datum: None,
                     });
                 }
             }

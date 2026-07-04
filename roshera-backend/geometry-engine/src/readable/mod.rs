@@ -38,7 +38,7 @@ pub mod features;
 pub mod part;
 pub mod query;
 
-pub use dimensions::{extract_dimensions, DimensionRecord};
+pub use dimensions::{extract_dimensions, DatumDescriptor, DimensionRecord};
 pub use features::{
     cylindrical_diameters, distance, extract_features, point_to_plane_signed, FeatureDim,
 };
