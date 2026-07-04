@@ -118,12 +118,11 @@ export async function api(
  * Precision table (drafting convention, mirrors kernel units.rs):
  *   mm  → 1 dp   (today's compact verdict format)
  *   cm  → 3 dp
- *   m   → 3 dp
+ *   m   → 4 dp   (kernel formatter parity)
  *   in  → 3 dp
- *   ft  → 3 dp
+ *   ft  → 4 dp   (kernel formatter parity)
  *
- * Volume converts as mm³ × perMm³ where perMm = (1 mm in the unit)⁻¹,
- * so perMm³ = perMm³.
+ * Volume converts as mm³ × perMm³ (perMm = the unit-per-millimetre factor).
  */
 export interface DocumentUnitInfo {
   token: string;   // "mm" | "cm" | "m" | "in" | "ft"
@@ -135,9 +134,9 @@ export interface DocumentUnitInfo {
 const UNIT_TABLE: Record<string, Omit<DocumentUnitInfo, "token">> = {
   mm: { suffix: "mm", perMm: 1,            dp: 1 },
   cm: { suffix: "cm", perMm: 0.1,          dp: 3 },
-  m:  { suffix: "m",  perMm: 0.001,        dp: 3 },
+  m:  { suffix: "m",  perMm: 0.001,        dp: 4 },
   in: { suffix: "in", perMm: 1 / 25.4,     dp: 3 },
-  ft: { suffix: "ft", perMm: 1 / 304.8,    dp: 3 },
+  ft: { suffix: "ft", perMm: 1 / 304.8,    dp: 4 },
 };
 
 /** Cached document unit; null = unknown (will fetch lazily). */
