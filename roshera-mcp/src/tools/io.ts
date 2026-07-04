@@ -118,9 +118,11 @@ export function registerIoTools(server: McpServer) {
     "make_drawing",
     "Generate a 2D engineering DRAWING: the standard four-view sheet (Front/" +
       "Top/Right + iso) with hidden-line removal, centerlines, automatic " +
-      "dimensions; sheet size/scale auto-fit. Returns the drawing id AND a " +
-      "QUALITY report (layout passed, utilization, issues) — treat it like " +
-      "watertightness for 3D.",
+      "dimensions (each feature dimensioned once, in its best view — ISO " +
+      "129-1 dedup). Returns the drawing id AND a QUALITY report whose " +
+      "invariants CANNOT be fooled (label collisions, redundant/on-geometry " +
+      "dimensions — the verifier reads the exact boxes the renderer inks). " +
+      "Treat passed:false like a watertightness failure.",
     {
       part_id: z.number().int().describe("kernel part/solid id from list_parts"),
       name: z.string().optional().describe("title-block name for the sheet"),

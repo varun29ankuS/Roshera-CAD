@@ -266,31 +266,106 @@ export function registerPerceptionTools(server: McpServer) {
     "dimension_part",
     "DIMENSION a part in one call: a 2×2 multi-view image with leader+label " +
       "callouts AND the structured table (id, kind, value, face ids, 3D " +
-      "anchor). Values read off analytic surfaces, never measured from pixels.",
+      "anchor). Includes POSITION rows — each bore/boss axis's X/Y offsets " +
+      "from a NAMED datum (part corner by default), the dims a machinist " +
+      "locates holes with. Values read off analytic surfaces, never pixels.",
     { part_id: z.number().int().describe("kernel part id from list_parts") },
     async ({ part_id }) => {
       try {
         const r = await api("GET", `/api/agent/parts/${part_id}/dimensions`);
-        const rows = (r.dimensions ?? [])
-          .map(
-            (d: any) =>
-              `${d.id}  ${d.label}  (${d.kind} ${d.value.toFixed(2)}${
-                d.unit === "deg" ? "°" : ""
-              })  faces=[${d.entities.join(",")}]  @[${d.anchor
-                .map((c: number) => c.toFixed(1))
-                .join(", ")}]`,
-          )
+        const dims: any[] = r.dimensions ?? [];
+        const rows = dims
+          .map((d: any) => {
+            const base = `${d.id}  ${d.label}  (${d.kind} ${d.value.toFixed(2)}${
+              d.unit === "deg" ? "°" : ""
+            })  faces=[${d.entities.join(",")}]  @[${d.anchor
+              .map((c: number) => c.toFixed(1))
+              .join(", ")}]`;
+            return d.datum
+              ? `${base}  from ${d.datum.name} @[${d.datum.origin
+                  .map((c: number) => c.toFixed(1))
+                  .join(", ")}]`
+              : base;
+          })
           .join("\n");
         const overall = `overall L×W×H = ${r.dims.l.toFixed(2)} × ${r.dims.w.toFixed(
           2,
         )} × ${r.dims.h.toFixed(2)} ${r.units}`;
+        // One line naming each distinct datum so the reference is explicit.
+        const datums = [
+          ...new Map(
+            dims
+              .filter((d: any) => d.datum)
+              .map((d: any) => [JSON.stringify(d.datum.origin), d.datum]),
+          ).values(),
+        ]
+          .map(
+            (dt: any) =>
+              `datum: ${dt.name} (${dt.kind}) @[${dt.origin
+                .map((c: number) => c.toFixed(1))
+                .join(", ")}]`,
+          )
+          .join("\n");
+        const text = datums ? `${overall}\n${datums}\n${rows}` : `${overall}\n${rows}`;
         return {
           content: [
             { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
-            { type: "text" as const, text: `${overall}\n${rows}` },
+            { type: "text" as const, text },
           ],
         };
       } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "measure_faces",
+    "MEASURE the exact relation between two faces (or inspect one): " +
+      "plane‖plane → distance, planes at an angle → dihedral (outward-normal " +
+      "convention, 0–180°), parallel cylinder axes → center distance (bolt " +
+      "circles), cylinder axis ⟂ plane → axis-to-plane distance, single " +
+      "cylindrical face → Ø, single plane → area+normal. Kernel-exact; " +
+      "REFUSES with a reason when faces don't admit the relation (skew axes, " +
+      "footpoint outside the face's trimmed boundary, consumed face) — never " +
+      "a guessed number. Face ids from select_face / render 'ids' legend.",
+    {
+      part_a: z.number().int().describe("kernel part id of the first face's solid"),
+      face_a: z.number().int().describe("first face id"),
+      part_b: z.number().int().optional().describe("second face's solid (omit with face_b for single-face info)"),
+      face_b: z.number().int().optional().describe("second face id (omit for single-face info)"),
+    },
+    async ({ part_a, face_a, part_b, face_b }) => {
+      try {
+        const body: Record<string, unknown> = {
+          a: { part_id: part_a, kind: "face", id: face_a },
+          b:
+            face_b !== undefined
+              ? { part_id: part_b ?? part_a, kind: "face", id: face_b }
+              : null,
+        };
+        const r = await api("POST", "/api/agent/measure", body);
+        return ok({
+          kind: r.kind,
+          relation: r.relation ?? null,
+          value: r.value,
+          unit: r.unit,
+          label: r.label,
+          anchor: r.anchor,
+          direction: r.direction ?? null,
+          entities: r.entities,
+        });
+      } catch (e) {
+        // Surface kernel refusals (422) with the verbatim reason — the honest
+        // "cannot measure that" answer, distinct from transport errors.
+        if (e instanceof ApiError && (e.status === 422 || e.status === 404)) {
+          try {
+            const body = JSON.parse(e.body);
+            return fail(new Error(`REFUSED: ${body.reason ?? e.body}`));
+          } catch {
+            return fail(e);
+          }
+        }
         return fail(e);
       }
     },
