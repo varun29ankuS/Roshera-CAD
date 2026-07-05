@@ -1589,8 +1589,17 @@ fn evaluate_position(
     };
 
     // The exact axis, evaluated at the feature's axial mid-height (see the
-    // doc comment): Cylinder parameterisation puts v along the axis.
-    let v_mid = 0.5 * (f.uv_bounds[2] + f.uv_bounds[3]);
+    // doc comment): Cylinder parameterisation puts v along the axis. The
+    // surface's OWN height_limits are authoritative — Face::new defaults
+    // uv_bounds to [0,1]² and the cylinder builder never overwrites it
+    // (re-review Minor: v_mid=0.5 was wrong for any tilted bore; the
+    // in-plane position of a vertical bore is v-independent, which is why
+    // the axis-aligned fixtures could not catch it).
+    let v_mid = cyl
+        .height_limits
+        .map_or(0.5 * (f.uv_bounds[2] + f.uv_bounds[3]), |[v0, v1]| {
+            0.5 * (v0 + v1)
+        });
     let q_mid = cyl.origin + cyl.axis * v_mid;
 
     let actual_x = q_mid.dot(&x_prime);
