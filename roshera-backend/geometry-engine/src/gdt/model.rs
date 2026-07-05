@@ -93,6 +93,39 @@ impl GeometricCharacteristic {
         }
     }
 
+    /// The ISO 1101 / ASME Y14.5 Unicode symbol for this characteristic.
+    ///
+    /// Used by the drawing builder to fill the glyph cell of a placed
+    /// [`super::super::drawing::types::PlacedFcfBlock`]. The glyphs are the
+    /// Unicode equivalents of the standard feature control frame symbols; all
+    /// code points are in the BMP and render correctly with common sans-serif
+    /// web fonts.
+    ///
+    /// Reference: ISO 1101:2017 Table 1; ASME Y14.5-2018 Figure 1-2.
+    pub fn iso_glyph(self) -> &'static str {
+        match self {
+            // Form family (ISO 1101 Table 1, row 1–4)
+            GeometricCharacteristic::Straightness => "\u{23E4}", // ⏤
+            GeometricCharacteristic::Flatness => "\u{23E5}",     // ⏥
+            GeometricCharacteristic::Circularity => "\u{25CB}",  // ○
+            GeometricCharacteristic::Cylindricity => "\u{232D}", // ⌭
+            // Profile (rows 5–6)
+            GeometricCharacteristic::ProfileLine => "\u{2312}", // ⌒
+            GeometricCharacteristic::ProfileSurface => "\u{2313}", // ⌓
+            // Orientation (rows 7–9)
+            GeometricCharacteristic::Parallelism => "\u{2225}", // ∥
+            GeometricCharacteristic::Perpendicularity => "\u{22A5}", // ⊥
+            GeometricCharacteristic::Angularity => "\u{2220}",  // ∠
+            // Location (rows 10–12)
+            GeometricCharacteristic::Position => "\u{2316}", // ⌖
+            GeometricCharacteristic::Concentricity => "\u{25CE}", // ◎
+            GeometricCharacteristic::Symmetry => "\u{2261}", // ≡
+            // Runout (rows 13–14)
+            GeometricCharacteristic::CircularRunout => "\u{21D7}", // ⇗ (closest BMP approx.)
+            GeometricCharacteristic::TotalRunout => "\u{27F2}",    // ⟲
+        }
+    }
+
     /// True when the characteristic is meaningless without a datum reference
     /// frame — orientation, location, and runout. The form family is datum-free
     /// and is the set this phase actually *verifies*. Profile is treated as

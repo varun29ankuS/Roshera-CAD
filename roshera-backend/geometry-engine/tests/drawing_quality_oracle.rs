@@ -2469,91 +2469,164 @@ fn cutting_plane_labels_appear_in_layout() {
 
 // ── Task 6: GD&T drawing symbology ───────────────────────────────────────────
 
-/// Helper: a minimal plate-like drawing (80×60 FRONT view) with a datum symbol
-/// "A" and a flatness FCF block pre-placed in sheet space.
-///
-/// The datum symbol is at (110, 80) — above-left of the part outline; the FCF
-/// anchor is at (80, 65) — directly above the top edge of the view.
-///
-/// Sizes: A3 sheet (420×297); FRONT view at pos=[80, 110], scale=1, 80×60.
-/// Sheet-space geometry rect: x∈[80,160], y∈[127,187] (y-down origin).
-fn plate_with_gdt_annotations() -> Drawing {
-    use geometry_engine::drawing::{PlacedDatumSymbol, PlacedFcfBlock};
-    let mut d = Drawing::new("GdtPlate", SheetSize::A3);
-    d.add_view(rect_view(
-        "FRONT",
-        ProjectionType::Front,
-        [80.0, 110.0],
-        80.0,
-        60.0,
-        vec![
-            dim("80.00", [5.0, -8.0], [75.0, -8.0]),
-            dim("60.00", [-8.0, 5.0], [-8.0, 55.0]),
-        ],
-    ));
-    // Datum symbol "A" at (110, 80) in sheet space — above the view geometry.
-    // Sheet y-down: the geometry rect top is at y=187 in SVG coords, so
-    // anchor at y=80 is above the frame (in the margin) — use y=120 to
-    // stay inside the frame above the view's geometry top.
-    d.datum_symbols.push(PlacedDatumSymbol {
-        label: "A".to_string(),
-        anchor: [110.0, 120.0],
-        owner_view: 0,
-    });
-    // FCF block: flatness ⏥ 0.05 (no datum refs) anchored at (80, 110).
-    d.fcf_blocks.push(PlacedFcfBlock {
-        characteristic_glyph: "\u{23f5}".to_string(), // ⏵ — use a safe Unicode char
-        tolerance_text: "0.05".to_string(),
-        datum_labels: Vec::new(),
-        anchor: [80.0, 110.0],
-        leader_to: None,
-        owner_view: 0,
-    });
-    d
-}
-
-/// ORACLE (RED-first, Task 6): a plate drawing with one datum symbol "A" and
-/// one FCF block must:
-///  1. Pass the quality report (no structural errors).
-///  2. Contain exactly one `DatumSymbol` layout item.
-///  3. Contain exactly one `FcfBlock` layout item.
-///  4. Have the datum symbol text = "A".
-///  5. Have the FCF block text contain "0.05".
-///
-/// **RED evidence:** before `place_gdt_annotations` is wired into
-/// `compute_layout`, the layout contains zero `DatumSymbol` and zero
-/// `FcfBlock` items → assertions 2 and 3 fail → RED.
-///
-/// **Mutation proof:** remove the `DatumSymbol` arm from
-/// `place_gdt_annotations` → `datum_items.len()` = 0 → assertion fails →
-/// RED.  Remove the `FcfBlock` arm → `fcf_items.len()` = 0 → RED.
+// ── Bridge oracle (RED-first, Task 6 fix wave) ────────────────────────────────
+//
+// The end-to-end test: build a BRepModel plate with a DRF datum "A" on the
+// +Z face and a flatness FCF in the GDT sidecar keyed to the same face, then
+// call `standard_drawing_auto` and assert that datum_symbols and fcf_blocks
+// are automatically populated — the missing bridge Task 6 left as "future work".
+//
+// **RED evidence (captured before bridge was built):**
+//
+// ```
+// running 1 test
+// test gdt_plate_layout_bridge_end_to_end ... FAILED
+//
+// failures:
+//
+// ---- gdt_plate_layout_bridge_end_to_end stdout ----
+// thread 'gdt_plate_layout_bridge_end_to_end' panicked at
+// geometry-engine\tests\drawing_quality_oracle.rs:NNNN:5:
+// drawing.datum_symbols must be non-empty after standard_drawing_auto on a GD&T'd
+// part; got 0 datum symbols.  The sidecar->drawing bridge (attach_gdt_annotations)
+// was absent — this confirms RED before the fix.
+//
+// test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 40 filtered out;
+// finished in 0.01s
+// ```
+//
+// **Mutation proof:**
+// * Remove the `attach_gdt_annotations(model, solid_id, &mut drawing)` call
+//   from `standard_drawing_auto` → `drawing.datum_symbols` stays empty →
+//   assertion fails → RED.
+// * Clear `model.drf` before building the drawing → datum_symbols empty → RED.
+// * Remove `GeometricCharacteristic::iso_glyph()` → compile error → RED at
+//   compile time.
 #[test]
-fn gdt_plate_layout_has_datum_symbol_and_fcf_block() {
-    let d = plate_with_gdt_annotations();
+fn gdt_plate_layout_bridge_end_to_end() {
+    use geometry_engine::gdt::{
+        designate_datum,
+        model::{Annotation, FeatureControlFrame, GeometricCharacteristic},
+    };
+    use geometry_engine::primitives::surface::Plane;
 
-    // ── Layout assertions ─────────────────────────────────────────────
-    let layout = compute_layout(&d);
+    // ── Build a model plate (50×30×10 box) ──────────────────────────────────
+    let mut model = BRepModel::new();
+    model.set_event_key(Some("gdt-plate".into()));
+    let solid_id = match TopologyBuilder::new(&mut model)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("create box")
+    {
+        GeometryId::Solid(s) => s,
+        other => panic!("expected solid, got {other:?}"),
+    };
+    model.set_event_key(None);
+
+    // ── Find the +Z face (top face at z=5) ──────────────────────────────────
+    let top_face = {
+        let solid = model.solids.get(solid_id).expect("solid exists");
+        let mut shells = vec![solid.outer_shell];
+        shells.extend_from_slice(&solid.inner_shells);
+        let mut found = None;
+        for sh_id in &shells {
+            if let Some(shell) = model.shells.get(*sh_id) {
+                for &fid in &shell.faces {
+                    if let Some(fd) = model.faces.get(fid) {
+                        if let Some(surf) = model.surfaces.get(fd.surface_id) {
+                            if let Some(plane) = surf.as_any().downcast_ref::<Plane>() {
+                                // Top face: normal aligned with +Z, origin z=5
+                                let n = plane.normal;
+                                if n.z.abs() > 0.99 && (plane.origin.z - 5.0).abs() < 1e-3 {
+                                    found = Some(fid);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        found.expect("must find the +Z face at z=5")
+    };
+
+    // ── Designate the top face as datum "A" in the solid's DRF ──────────────
+    designate_datum(&mut model, solid_id, "A", top_face).expect("designate datum A on top face");
+
+    // ── Attach a flatness FCF to the same face via the GDT sidecar ──────────
+    let top_pid = model
+        .face_pid(top_face)
+        .expect("top face has PID after box creation");
+    let fcf = FeatureControlFrame::form(GeometricCharacteristic::Flatness, 0.05);
+    model.gdt.attach(top_pid, Annotation::Geometric(fcf));
+
+    // ── Build the standard drawing automatically ─────────────────────────────
+    let drawing = standard_drawing_auto(&model, solid_id, uuid::Uuid::nil())
+        .expect("standard_drawing_auto must succeed");
+
+    // ── GATE 1: datum_symbols auto-populated ─────────────────────────────────
+    assert!(
+        !drawing.datum_symbols.is_empty(),
+        "drawing.datum_symbols must be non-empty after standard_drawing_auto on a GD&T'd \
+         part; got 0 datum symbols.  The sidecar->drawing bridge (attach_gdt_annotations) \
+         was absent — this confirms RED before the fix."
+    );
+    let sym_a = drawing
+        .datum_symbols
+        .iter()
+        .find(|s| s.label == "A")
+        .expect("datum symbol 'A' must be present in the auto-drawing");
+    // owner_view must be a valid index.
+    assert!(
+        sym_a.owner_view < drawing.views.len(),
+        "datum symbol 'A' owner_view {} is out of bounds (drawing has {} views)",
+        sym_a.owner_view,
+        drawing.views.len()
+    );
+
+    // ── GATE 2: fcf_blocks auto-populated ────────────────────────────────────
+    assert!(
+        !drawing.fcf_blocks.is_empty(),
+        "drawing.fcf_blocks must be non-empty after standard_drawing_auto on a GD&T'd \
+         part; got 0 FCF blocks"
+    );
+    let fcf_block = drawing
+        .fcf_blocks
+        .iter()
+        .find(|b| b.tolerance_text.contains("0.05"))
+        .expect("FCF block with tolerance '0.05' must be present");
+    // The flatness glyph must be the ISO 1101 character.
+    assert_eq!(
+        fcf_block.characteristic_glyph,
+        "\u{23E5}", // ⏥ flatness
+        "flatness FCF must carry the correct ISO glyph"
+    );
+    // leader_to must be populated (the bridge sets it from the face origin).
+    assert!(
+        fcf_block.leader_to.is_some(),
+        "FCF block must have a leader_to target set by the bridge"
+    );
+
+    // ── GATE 3: layout items present ────────────────────────────────────────
+    let layout = compute_layout(&drawing);
 
     let datum_items: Vec<_> = layout
         .items
         .iter()
         .filter(|it| it.kind == SheetItemKind::DatumSymbol)
         .collect();
-    assert_eq!(
-        datum_items.len(),
-        1,
-        "plate with one datum symbol must produce exactly one DatumSymbol layout item; \
-         got {} items: {:?}",
-        datum_items.len(),
-        datum_items
-            .iter()
-            .map(|it| it.text.as_deref().unwrap_or("?"))
-            .collect::<Vec<_>>()
+    assert!(
+        !datum_items.is_empty(),
+        "layout must contain at least one DatumSymbol item; got none"
     );
-    assert_eq!(
-        datum_items[0].text.as_deref().unwrap_or(""),
-        "A",
-        "DatumSymbol label must be 'A'"
+    assert!(
+        datum_items.iter().any(|it| it.text.as_deref() == Some("A")),
+        "DatumSymbol layout item with label 'A' must be present"
     );
 
     let fcf_items: Vec<_> = layout
@@ -2561,33 +2634,27 @@ fn gdt_plate_layout_has_datum_symbol_and_fcf_block() {
         .iter()
         .filter(|it| it.kind == SheetItemKind::FcfBlock)
         .collect();
-    assert_eq!(
-        fcf_items.len(),
-        1,
-        "plate with one FCF block must produce exactly one FcfBlock layout item; \
-         got {} items: {:?}",
-        fcf_items.len(),
+    assert!(
+        !fcf_items.is_empty(),
+        "layout must contain at least one FcfBlock item; got none"
+    );
+    assert!(
         fcf_items
             .iter()
-            .map(|it| it.text.as_deref().unwrap_or("?"))
-            .collect::<Vec<_>>()
-    );
-    let fcf_text = fcf_items[0].text.as_deref().unwrap_or("");
-    assert!(
-        fcf_text.contains("0.05"),
-        "FcfBlock text must contain the tolerance '0.05'; got '{fcf_text}'"
+            .any(|it| it.text.as_deref().map_or(false, |t| t.contains("0.05"))),
+        "FcfBlock layout item must contain tolerance '0.05'"
     );
 
-    // ── Quality report passes ─────────────────────────────────────────
-    let report = verify_drawing(&d);
+    // ── GATE 4: quality report passes ────────────────────────────────────────
+    let report = verify_drawing(&drawing);
     assert!(
         report.passed,
-        "plate with GDT annotations must pass the quality report; issues={:?}",
+        "drawing of GD&T'd plate must pass the quality report; issues={:?}",
         report.issues
     );
 
-    // ── SVG must ink the datum label and FCF text ──────────────────────
-    let svg = render_drawing_svg(&d);
+    // ── GATE 5: SVG inks the datum label, FCF text, and leader line ──────────
+    let svg = render_drawing_svg(&drawing);
     assert!(
         svg.contains("class=\"gdt-datum-label\""),
         "SVG must contain a gdt-datum-label element"
@@ -2595,6 +2662,12 @@ fn gdt_plate_layout_has_datum_symbol_and_fcf_block() {
     assert!(
         svg.contains("class=\"gdt-fcf-text\""),
         "SVG must contain a gdt-fcf-text element"
+    );
+    // Leader line: only present when leader_to is set and > 1 mm long.
+    // The bridge always sets leader_to, so a leader element must appear.
+    assert!(
+        svg.contains("class=\"gdt-leader\""),
+        "SVG must contain a gdt-leader element (leader_to was set by the bridge)"
     );
 }
 

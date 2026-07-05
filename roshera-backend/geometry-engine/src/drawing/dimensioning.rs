@@ -868,7 +868,274 @@ pub fn standard_drawing_auto(
     // SECTION A-A placed by the deterministic section_slot_rule.
     attach_section_view(model, solid_id, &mut drawing, &dims);
 
+    // ── GD&T sidecar bridge (Task 6 fix wave) ────────────────────────────────
+    // Iterate the model's DRF (datum designations) and GDT sidecar
+    // (annotations) for this solid and auto-populate datum_symbols +
+    // fcf_blocks.  Dangling PIDs (face consumed by a later operation) are
+    // silently skipped — "stored annotations only, dangling targets skipped"
+    // per the spec.
+    attach_gdt_annotations(model, solid_id, &mut drawing);
+
     Ok(drawing)
+}
+
+// ── GD&T sidecar → drawing builder bridge (Task 6 fix wave) ──────────────────
+
+/// Format a GD&T tolerance value as a canonical string using the document unit
+/// already chosen at drawing build time.
+///
+/// Engineering convention:
+/// - Values ≥ 1.0: up to 2 decimal places, trailing zeros stripped.
+/// - Values < 1.0: always 2 decimal places (e.g. "0.05", "0.10").
+///
+/// The caller already holds the value in model units (mm); the drawing's unit
+/// note records the conversion context but the numeric value on the FCF is
+/// stated in the SAME model units the verification engine used.  The ISO 1101
+/// convention is: write the number, not the unit, inside the frame.
+fn fmt_tolerance(v: f64) -> String {
+    if v >= 1.0 {
+        // Strip trailing decimal zeros for clean readout ("2.50" → "2.5").
+        let s = format!("{:.2}", v);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        format!("{:.2}", v)
+    }
+}
+
+/// Project a world-space 3D point to 2-D view-space coordinates for the given
+/// [`ProjectionType`], delegating to the canonical `project_point` in the
+/// projection module so the drawing-bridge and the edge-projection pipeline
+/// share a single transform implementation.
+fn project_to_view(proj: ProjectionType, p: [f64; 3]) -> [f64; 2] {
+    use crate::math::Point3;
+    super::projection::project_point(proj, Point3::new(p[0], p[1], p[2]))
+}
+
+/// Convert a view-space point `(vx, vy)` to sheet space.
+///
+/// Sheet coordinates follow SVG convention (y-down, origin top-left).
+/// `sheet_h` is the sheet height in mm; `pos` is the view's `position_mm`.
+fn view_to_sheet(vx: f64, vy: f64, pos: [f64; 2], scale: f64, sheet_h: f64) -> [f64; 2] {
+    [pos[0] + vx * scale, (sheet_h - pos[1]) - vy * scale]
+}
+
+/// Choose the best view index for a GD&T annotation whose feature surface
+/// is a plane with the given outward normal `normal_w` (world-space, unit).
+///
+/// Rule: prefer the view whose camera looks MOST NEARLY along the normal so
+/// the feature silhouette is a clear edge — the standard engineering
+/// convention for dimension and annotation placement.  Among views with equal
+/// alignment (|dot| < 0.5) fall back to view 0.
+fn best_view_for_plane_normal(normal_w: [f64; 3], views: &[super::types::ProjectedView]) -> usize {
+    let mut best_idx = 0_usize;
+    let mut best_dot = f64::NEG_INFINITY;
+    for (i, v) in views.iter().enumerate() {
+        // Camera look-at direction (pointing INTO the scene, −ve of camera
+        // position). Mirrors `view_dir` in the dedup logic above.
+        let cam: [f64; 3] = match v.projection {
+            ProjectionType::Front => [0.0, -1.0, 0.0],
+            ProjectionType::Top => [0.0, 0.0, -1.0],
+            ProjectionType::Right => [-1.0, 0.0, 0.0],
+            ProjectionType::Bottom => [0.0, 0.0, 1.0],
+            ProjectionType::Left => [1.0, 0.0, 0.0],
+            _ => continue, // skip Isometric / Custom for annotation views
+        };
+        // A plane whose outward normal ≈ cam direction reads as an edge in
+        // that view — that is where datum triangles and FCF leaders land.
+        let dot = cam[0] * normal_w[0] + cam[1] * normal_w[1] + cam[2] * normal_w[2];
+        let adot = dot.abs();
+        if adot > best_dot {
+            best_dot = adot;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+/// Auto-populate `drawing.datum_symbols` and `drawing.fcf_blocks` from the
+/// model's GDT sidecar and DRF for `solid_id`.
+///
+/// # Contract (spec §4 "stored annotations only")
+///
+/// * **Dangling targets** (a PID that no longer maps to a live face) are
+///   SKIPPED silently.  A dangling datum produces no `PlacedDatumSymbol`;
+///   a dangling annotation produces no `PlacedFcfBlock`.  No error is
+///   surfaced — the sheet is silent on features whose geometry was consumed.
+/// * **Leader targets** (`PlacedFcfBlock::leader_to`) are set to the
+///   feature face's surface origin projected into the chosen view's sheet
+///   space.  This gives the SVG renderer a concrete target to draw the
+///   leader toward — the face-edge position in sheet coordinates.
+/// * **View choice** follows the plane-normal alignment heuristic
+///   (`best_view_for_plane_normal`): annotations land in the view where
+///   the feature reads as a clear silhouette edge.
+///
+/// # Called from
+///
+/// `standard_drawing_auto` — after hole-table and section-view attachment,
+/// so all views are placed and the sheet/scale layout is final.
+pub(crate) fn attach_gdt_annotations(
+    model: &crate::primitives::topology_builder::BRepModel,
+    solid_id: crate::primitives::solid::SolidId,
+    drawing: &mut super::types::Drawing,
+) {
+    use super::types::{PlacedDatumSymbol, PlacedFcfBlock};
+    use crate::gdt::drf::{resolve_datum, DatumResolution};
+    use crate::gdt::model::Annotation;
+    use crate::primitives::surface::{Cylinder, Plane};
+
+    let sheet_h = drawing.sheet_size.height();
+
+    // ── Step 1: DRF → datum symbols ──────────────────────────────────────────
+    //
+    // Each Datum in the DRF for this solid becomes one PlacedDatumSymbol in
+    // the view that best shows the datum's feature face edge.
+    if let Some(drf) = model.drf.get(&solid_id) {
+        for datum in &drf.datums {
+            // Resolve the PID to live geometry.  Dangling → skip.
+            let res = resolve_datum(model, solid_id, datum);
+            let (origin_w, normal_w) = match res {
+                DatumResolution::Live { origin, direction } => (
+                    [origin.x, origin.y, origin.z],
+                    [direction.x, direction.y, direction.z],
+                ),
+                DatumResolution::Dangling => continue,
+            };
+
+            // Choose the best orthographic view.
+            let view_idx = best_view_for_plane_normal(normal_w, &drawing.views);
+            let Some(view) = drawing.views.get(view_idx) else {
+                continue;
+            };
+
+            // Project the datum feature origin to sheet space (the symbol
+            // anchor point).  The symbol box is centred on this point.
+            let vp = project_to_view(view.projection, origin_w);
+            let anchor = view_to_sheet(vp[0], vp[1], view.position_mm, view.scale, sheet_h);
+
+            drawing.datum_symbols.push(PlacedDatumSymbol {
+                label: datum.label.clone(),
+                anchor,
+                owner_view: view_idx,
+            });
+        }
+    }
+
+    // ── Step 2: GDT sidecar annotations → FCF blocks ─────────────────────────
+    //
+    // Each (feature, annotation) pair in the sidecar produces one
+    // PlacedFcfBlock.  The feature face is resolved to get:
+    //   - its surface origin (→ leader_to)
+    //   - its surface normal (→ view choice)
+    for (feature_pid, annotations) in model.gdt.iter() {
+        // Resolve the PID to a live face.  Dangling → skip the whole feature.
+        let Some(face_id) = model.face_by_pid(feature_pid) else {
+            continue;
+        };
+        let Some(face_data) = model.faces.get(face_id) else {
+            continue;
+        };
+        let Some(surface) = model.surfaces.get(face_data.surface_id) else {
+            continue;
+        };
+
+        // Extract world-space position and normal for this face's surface.
+        // We support Plane and Cylinder (the two kinds `designate_datum`
+        // accepts); other surfaces produce a fallback position at the origin.
+        let (origin_w, normal_w): ([f64; 3], [f64; 3]) =
+            if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
+                let n = plane.normal * face_data.orientation.sign();
+                (
+                    [plane.origin.x, plane.origin.y, plane.origin.z],
+                    [n.x, n.y, n.z],
+                )
+            } else if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+                (
+                    [cyl.origin.x, cyl.origin.y, cyl.origin.z],
+                    [cyl.axis.x, cyl.axis.y, cyl.axis.z],
+                )
+            } else {
+                // Unknown surface kind: fall back to world origin with Z normal.
+                // A dangling-equivalent situation — the FCF still renders but
+                // its leader will point at (0,0,0) in the first view, which is
+                // visually wrong. Accept this honestly; the honesty contract
+                // only guarantees no fabrication, not perfect aesthetics.
+                ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+            };
+
+        // Choose the view for this annotation.
+        let view_idx = best_view_for_plane_normal(normal_w, &drawing.views);
+        let Some(view) = drawing.views.get(view_idx) else {
+            continue;
+        };
+
+        // Project the feature origin → sheet space (leader target).
+        let vp = project_to_view(view.projection, origin_w);
+        let leader_to = view_to_sheet(vp[0], vp[1], view.position_mm, view.scale, sheet_h);
+
+        // Build one PlacedFcfBlock per annotation on this feature.
+        for ann in annotations {
+            let (glyph, tol_text, datum_labels) = match ann {
+                Annotation::Geometric(fcf) => {
+                    let glyph = fcf.characteristic.iso_glyph().to_string();
+                    let tol_text = fmt_tolerance(fcf.tolerance_value);
+                    let labels: Vec<String> =
+                        fcf.datum_refs.iter().map(|d| d.label.clone()).collect();
+                    (glyph, tol_text, labels)
+                }
+                Annotation::Dimensional(dim_tol) => {
+                    // Dimensional tolerances: render as ±-value or limits.
+                    // No glyph for size tolerances; use an empty string.
+                    let tol_text = match &dim_tol.bound {
+                        crate::gdt::model::ToleranceBound::PlusMinus { plus, minus } => {
+                            if (plus - minus).abs() < 1e-9 {
+                                format!("\u{00B1}{}", fmt_tolerance(*plus))
+                            } else {
+                                format!(
+                                    "+{}/\u{2212}{}",
+                                    fmt_tolerance(*plus),
+                                    fmt_tolerance(*minus)
+                                )
+                            }
+                        }
+                        crate::gdt::model::ToleranceBound::Limits { upper, lower } => {
+                            format!("{}/{}", fmt_tolerance(*upper), fmt_tolerance(*lower))
+                        }
+                        crate::gdt::model::ToleranceBound::Fit(fc) => fc.designation.clone(),
+                    };
+                    (String::new(), tol_text, Vec::new())
+                }
+            };
+
+            // The anchor (top-left of the FCF frame) is placed 8 mm outside the
+            // leader target, in the direction of the datum feature's normal
+            // projected into the view.  This gives a clean standoff from the
+            // feature edge so the frame doesn't overlap the geometry.
+            // NOTE: layout.rs place_gdt_annotations will reposition via the
+            // collision ladder; the anchor here is the initial preferred position
+            // that the ladder starts from.
+            let nv = project_to_view(view.projection, normal_w);
+            let len = (nv[0] * nv[0] + nv[1] * nv[1]).sqrt().max(1e-9);
+            let (unx, uny) = (nv[0] / len, nv[1] / len);
+            const STANDOFF_GDT: f64 = 12.0; // mm from the feature edge to the FCF frame
+            let anchor_v = [vp[0] + unx * STANDOFF_GDT, vp[1] + uny * STANDOFF_GDT];
+            let anchor = view_to_sheet(
+                anchor_v[0],
+                anchor_v[1],
+                view.position_mm,
+                view.scale,
+                sheet_h,
+            );
+
+            drawing.fcf_blocks.push(PlacedFcfBlock {
+                characteristic_glyph: glyph,
+                tolerance_text: tol_text,
+                datum_labels,
+                anchor,
+                leader_to: Some(leader_to),
+                owner_view: view_idx,
+            });
+        }
+    }
 }
 
 /// Whole-part AABB extents `[x, y, z]` from the extraction's extent records.

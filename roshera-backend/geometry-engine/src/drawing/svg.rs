@@ -126,7 +126,9 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     // FcfBlock layout items.  Rendered last so callouts sit on top of all
     // other ink.  Stored annotations only: dangling targets were filtered at
     // build time and are absent from the layout.
-    render_gdt_annotations(&mut out, &layout);
+    // The drawing is passed through to access `fcf_blocks[].leader_to` for
+    // leader-line rendering (Task 6 fix wave: concern 2).
+    render_gdt_annotations(&mut out, drawing, &layout);
 
     out.push_str("</svg>\n");
     out
@@ -694,8 +696,41 @@ fn render_datum_marker(out: &mut String, layout: &SheetLayout) {
 /// Both item kinds are collision-policed by `compute_layout` (they are
 /// layout items with text-carrying `text` fields) exactly like every
 /// other piece of ink on the sheet.
-fn render_gdt_annotations(out: &mut String, layout: &SheetLayout) {
+/// Render GD&T datum symbols and FCF blocks from the layout's `DatumSymbol`
+/// and `FcfBlock` items.
+///
+/// ## Leader lines (Task 6 fix wave, concern 2)
+///
+/// `PlacedFcfBlock::leader_to` is the sheet-space feature-edge location the
+/// callout points at.  When set, a thin (0.18 mm, `.gdt-leader` class) line
+/// is drawn from the FCF frame's bottom-centre to the leader target, following
+/// the same "house leader" style used by section labels and hole-table tags.
+///
+/// The `drawing` parameter gives access to `drawing.fcf_blocks` so the leader
+/// target can be retrieved by matching the FCF's `owner_view` and `text` fields
+/// against the stored `PlacedFcfBlock` list.
+///
+/// ## DXF triangle hatch omission (Task 6, concern 3 — accepted)
+///
+/// The filled datum-feature triangle is emitted in SVG only. The DXF renderer
+/// emits the box + label but not the hatched triangle because the `dxf` crate's
+/// HATCH entity support for R2000 portable output is incomplete.  The SVG is
+/// the authoritative shopfloor output; the DXF is for CAD re-editing.
+fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, layout: &SheetLayout) {
     use super::layout::{GDT_BLOCK_H, GDT_BOX_HALF, GDT_FONT_MM};
+
+    // Build an index from (owner_view, full_text) → leader_to for FCF blocks
+    // so we can look up the leader target in O(1) when rendering.
+    // `full_text()` is the same key both the placement code and the items use
+    // (items carry text = fcf.full_text()).
+    let fcf_leader_map: std::collections::HashMap<(usize, String), [f64; 2]> = drawing
+        .fcf_blocks
+        .iter()
+        .filter_map(|fcf| {
+            fcf.leader_to
+                .map(|lt| ((fcf.owner_view, fcf.full_text()), lt))
+        })
+        .collect();
 
     for item in layout
         .items
@@ -776,6 +811,28 @@ fn render_gdt_annotations(out: &mut String, layout: &SheetLayout) {
                          x2=\"{sep1_x:.3}\" y2=\"{:.3}\" />\n",
                         b.y0, b.y1
                     );
+                }
+
+                // ── Leader line (Task 6 fix wave, concern 2) ──────────────
+                // Draw a thin line from the FCF frame's bottom-centre to the
+                // feature-edge location stored in `PlacedFcfBlock::leader_to`.
+                // The house leader style: 0.18 mm, `.gdt-leader` CSS class,
+                // matching section labels and hole-table tags.
+                let key = (item.owner_view.unwrap_or(0), text.to_string());
+                if let Some(&[lx, ly]) = fcf_leader_map.get(&key) {
+                    // Leader origin: bottom-centre of the FCF frame.
+                    let lx0 = tx; // already computed as horizontal centre
+                    let ly0 = b.y1;
+                    // Only draw the leader if it has meaningful length (> 1 mm).
+                    let len = ((lx - lx0).powi(2) + (ly - ly0).powi(2)).sqrt();
+                    if len > 1.0 {
+                        let _ = write!(
+                            out,
+                            "  <line class=\"gdt-leader\" \
+                             x1=\"{lx0:.3}\" y1=\"{ly0:.3}\" \
+                             x2=\"{lx:.3}\" y2=\"{ly:.3}\" />\n"
+                        );
+                    }
                 }
             }
             _ => {}

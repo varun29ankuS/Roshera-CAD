@@ -569,6 +569,38 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
         dxf.add_entity(ent);
     }
 
+    // ── GD&T FCF leader lines (Task 6 fix wave, concern 2) ───────────────
+    // Leader lines from each FCF block's bottom-centre to its stored
+    // `leader_to` feature-edge position.  Emitted as DXF LINE entities on
+    // the GDT_FCF layer, matching the house leader style (thin tier).
+    // The filled datum-feature triangle is NOT emitted in DXF (DXF hatch
+    // portability constraint — documented in Task 6 concern 3).
+    for fcf in &drawing.fcf_blocks {
+        if let Some([lx, ly_svg]) = fcf.leader_to {
+            // Find the matching FcfBlock layout item to get the frame bbox
+            // (needed for the leader origin = bottom-centre of the frame).
+            let full = fcf.full_text();
+            let frame_item = layout.items.iter().find(|it| {
+                it.kind == SheetItemKind::FcfBlock
+                    && it.owner_view == Some(fcf.owner_view)
+                    && it.text.as_deref() == Some(full.as_str())
+            });
+            if let Some(frame) = frame_item {
+                let b = &frame.bbox;
+                let lx0 = 0.5 * (b.x0 + b.x1);
+                let ly0_svg = b.y1; // SVG y-down bottom of frame
+                let lx0_dxf = lx0;
+                let ly0_dxf = sheet_h - ly0_svg; // DXF y-up
+                let lx1_dxf = lx;
+                let ly1_dxf = sheet_h - ly_svg;
+                let len = ((lx1_dxf - lx0_dxf).powi(2) + (ly1_dxf - ly0_dxf).powi(2)).sqrt();
+                if len > 1.0 {
+                    add_line(dxf, LAYER_GDT_FCF, lx0_dxf, ly0_dxf, lx1_dxf, ly1_dxf);
+                }
+            }
+        }
+    }
+
     // ── Datum-origin marker (SVG parity) ─────────────────────────────────
     // Crosshair LINEs + "0,0" TEXT at the hole table's X/Y reference corner,
     // from the same DatumMarker layout item the SVG renderer inks.
