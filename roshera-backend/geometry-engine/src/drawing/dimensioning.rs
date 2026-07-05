@@ -881,27 +881,6 @@ pub fn standard_drawing_auto(
 
 // ── GD&T sidecar → drawing builder bridge (Task 6 fix wave) ──────────────────
 
-/// Format a GD&T tolerance value as a canonical string using the document unit
-/// already chosen at drawing build time.
-///
-/// Engineering convention:
-/// - Values ≥ 1.0: up to 2 decimal places, trailing zeros stripped.
-/// - Values < 1.0: always 2 decimal places (e.g. "0.05", "0.10").
-///
-/// The caller already holds the value in model units (mm); the drawing's unit
-/// note records the conversion context but the numeric value on the FCF is
-/// stated in the SAME model units the verification engine used.  The ISO 1101
-/// convention is: write the number, not the unit, inside the frame.
-fn fmt_tolerance(v: f64) -> String {
-    if v >= 1.0 {
-        // Strip trailing decimal zeros for clean readout ("2.50" → "2.5").
-        let s = format!("{:.2}", v);
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        format!("{:.2}", v)
-    }
-}
-
 /// Project a world-space 3D point to 2-D view-space coordinates for the given
 /// [`ProjectionType`], delegating to the canonical `project_point` in the
 /// projection module so the drawing-bridge and the edge-projection pipeline
@@ -924,10 +903,20 @@ fn view_to_sheet(vx: f64, vy: f64, pos: [f64; 2], scale: f64, sheet_h: f64) -> [
 ///
 /// Rule: prefer the view whose camera looks MOST NEARLY along the normal so
 /// the feature silhouette is a clear edge — the standard engineering
-/// convention for dimension and annotation placement.  Among views with equal
-/// alignment (|dot| < 0.5) fall back to view 0.
-fn best_view_for_plane_normal(normal_w: [f64; 3], views: &[super::types::ProjectedView]) -> usize {
-    let mut best_idx = 0_usize;
+/// convention for dimension and annotation placement.
+///
+/// Returns `None` when no orthographic view is present in the drawing.
+/// Callers **must** skip placement in that case: placing a GD&T symbol in a
+/// non-orthographic (isometric / custom) view produces a geometrically wrong
+/// position, never a graceful degradation.  A drawing without orthographic
+/// views is uncommon but not forbidden (e.g. an isometric-only pictorial
+/// reference); it is documented: no orthographic view → no sheet symbology
+/// for that item.
+fn best_view_for_plane_normal(
+    normal_w: [f64; 3],
+    views: &[super::types::ProjectedView],
+) -> Option<usize> {
+    let mut best_idx: Option<usize> = None;
     let mut best_dot = f64::NEG_INFINITY;
     for (i, v) in views.iter().enumerate() {
         // Camera look-at direction (pointing INTO the scene, −ve of camera
@@ -946,7 +935,7 @@ fn best_view_for_plane_normal(normal_w: [f64; 3], views: &[super::types::Project
         let adot = dot.abs();
         if adot > best_dot {
             best_dot = adot;
-            best_idx = i;
+            best_idx = Some(i);
         }
     }
     best_idx
@@ -983,6 +972,13 @@ pub(crate) fn attach_gdt_annotations(
     use crate::gdt::model::Annotation;
     use crate::primitives::surface::{Cylinder, Plane};
 
+    // ISO 1101 §7.2: tolerances inside FCF cells are bare numbers — no unit
+    // suffix.  Route through the canonical `format_gdt_tolerance` which shares
+    // the same conversion/precision core as `format_len`, differing only in
+    // suffix omission.  The sheet's title-block unit note governs the unit.
+    let doc_unit = model.document_unit();
+    let fmt_tol = |v: f64| doc_unit.format_gdt_tolerance(v);
+
     let sheet_h = drawing.sheet_size.height();
 
     // ── Step 1: DRF → datum symbols ──────────────────────────────────────────
@@ -1001,8 +997,12 @@ pub(crate) fn attach_gdt_annotations(
                 DatumResolution::Dangling => continue,
             };
 
-            // Choose the best orthographic view.
-            let view_idx = best_view_for_plane_normal(normal_w, &drawing.views);
+            // Choose the best orthographic view.  Skip when none exists —
+            // placing a datum symbol in a non-orthographic view would produce
+            // a geometrically wrong position (m4: no-orthographic-view guard).
+            let Some(view_idx) = best_view_for_plane_normal(normal_w, &drawing.views) else {
+                continue;
+            };
             let Some(view) = drawing.views.get(view_idx) else {
                 continue;
             };
@@ -1062,8 +1062,12 @@ pub(crate) fn attach_gdt_annotations(
                 ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])
             };
 
-        // Choose the view for this annotation.
-        let view_idx = best_view_for_plane_normal(normal_w, &drawing.views);
+        // Choose the view for this annotation.  Skip when no orthographic
+        // view exists — placing an FCF in a non-orthographic view produces
+        // a wrong position (m4: no-orthographic-view guard).
+        let Some(view_idx) = best_view_for_plane_normal(normal_w, &drawing.views) else {
+            continue;
+        };
         let Some(view) = drawing.views.get(view_idx) else {
             continue;
         };
@@ -1077,7 +1081,7 @@ pub(crate) fn attach_gdt_annotations(
             let (glyph, tol_text, datum_labels) = match ann {
                 Annotation::Geometric(fcf) => {
                     let glyph = fcf.characteristic.iso_glyph().to_string();
-                    let tol_text = fmt_tolerance(fcf.tolerance_value);
+                    let tol_text = fmt_tol(fcf.tolerance_value);
                     let labels: Vec<String> =
                         fcf.datum_refs.iter().map(|d| d.label.clone()).collect();
                     (glyph, tol_text, labels)
@@ -1088,17 +1092,13 @@ pub(crate) fn attach_gdt_annotations(
                     let tol_text = match &dim_tol.bound {
                         crate::gdt::model::ToleranceBound::PlusMinus { plus, minus } => {
                             if (plus - minus).abs() < 1e-9 {
-                                format!("\u{00B1}{}", fmt_tolerance(*plus))
+                                format!("\u{00B1}{}", fmt_tol(*plus))
                             } else {
-                                format!(
-                                    "+{}/\u{2212}{}",
-                                    fmt_tolerance(*plus),
-                                    fmt_tolerance(*minus)
-                                )
+                                format!("+{}/\u{2212}{}", fmt_tol(*plus), fmt_tol(*minus))
                             }
                         }
                         crate::gdt::model::ToleranceBound::Limits { upper, lower } => {
-                            format!("{}/{}", fmt_tolerance(*upper), fmt_tolerance(*lower))
+                            format!("{}/{}", fmt_tol(*upper), fmt_tol(*lower))
                         }
                         crate::gdt::model::ToleranceBound::Fit(fc) => fc.designation.clone(),
                     };
@@ -1116,8 +1116,17 @@ pub(crate) fn attach_gdt_annotations(
             let nv = project_to_view(view.projection, normal_w);
             let len = (nv[0] * nv[0] + nv[1] * nv[1]).sqrt().max(1e-9);
             let (unx, uny) = (nv[0] / len, nv[1] / len);
-            const STANDOFF_GDT: f64 = 12.0; // mm from the feature edge to the FCF frame
-            let anchor_v = [vp[0] + unx * STANDOFF_GDT, vp[1] + uny * STANDOFF_GDT];
+            // Initial FCF anchor offset along the projected feature normal.
+            // This is the *preferred* position that the layout collision ladder
+            // in `layout.rs::place_gdt_annotations` starts from.  It is NOT the
+            // same as `layout.rs::GDT_STANDOFF` (8 mm), which is the minimum
+            // clear-of-view-geometry distance the layout engine enforces.  The
+            // extra 4 mm here gives the collision ladder room to step inward.
+            const GDT_ANCHOR_STANDOFF: f64 = 12.0;
+            let anchor_v = [
+                vp[0] + unx * GDT_ANCHOR_STANDOFF,
+                vp[1] + uny * GDT_ANCHOR_STANDOFF,
+            ];
             let anchor = view_to_sheet(
                 anchor_v[0],
                 anchor_v[1],

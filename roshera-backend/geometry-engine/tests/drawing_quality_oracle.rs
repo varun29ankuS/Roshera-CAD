@@ -2569,12 +2569,17 @@ fn gdt_plate_layout_bridge_end_to_end() {
     let drawing = standard_drawing_auto(&model, solid_id, uuid::Uuid::nil())
         .expect("standard_drawing_auto must succeed");
 
-    // ── GATE 1: datum_symbols auto-populated ─────────────────────────────────
-    assert!(
-        !drawing.datum_symbols.is_empty(),
-        "drawing.datum_symbols must be non-empty after standard_drawing_auto on a GD&T'd \
-         part; got 0 datum symbols.  The sidecar->drawing bridge (attach_gdt_annotations) \
-         was absent — this confirms RED before the fix."
+    // ── GATE 1: datum_symbols auto-populated (exactly-once) ─────────────────
+    // Exactly 1 DatumSymbol in drawing.datum_symbols — not just non-empty.
+    // A count assertion catches both the absent case (0) and the duplicated
+    // case (>1), making this mutation-proof against both failure modes.
+    assert_eq!(
+        drawing.datum_symbols.len(),
+        1,
+        "drawing.datum_symbols must contain exactly 1 entry after standard_drawing_auto \
+         on a plate with one datum designation; got {}. \
+         (0 = sidecar->drawing bridge absent; >1 = bridge ran multiple times)",
+        drawing.datum_symbols.len()
     );
     let sym_a = drawing
         .datum_symbols
@@ -2589,11 +2594,15 @@ fn gdt_plate_layout_bridge_end_to_end() {
         drawing.views.len()
     );
 
-    // ── GATE 2: fcf_blocks auto-populated ────────────────────────────────────
-    assert!(
-        !drawing.fcf_blocks.is_empty(),
-        "drawing.fcf_blocks must be non-empty after standard_drawing_auto on a GD&T'd \
-         part; got 0 FCF blocks"
+    // ── GATE 2: fcf_blocks auto-populated (exactly-once) ─────────────────────
+    // Exactly 1 FcfBlock in drawing.fcf_blocks — not just non-empty.
+    assert_eq!(
+        drawing.fcf_blocks.len(),
+        1,
+        "drawing.fcf_blocks must contain exactly 1 entry after standard_drawing_auto \
+         on a plate with one FCF annotation; got {}. \
+         (0 = bridge absent; >1 = bridge ran multiple times or sidecar duplicated)",
+        drawing.fcf_blocks.len()
     );
     let fcf_block = drawing
         .fcf_blocks
@@ -2612,7 +2621,7 @@ fn gdt_plate_layout_bridge_end_to_end() {
         "FCF block must have a leader_to target set by the bridge"
     );
 
-    // ── GATE 3: layout items present ────────────────────────────────────────
+    // ── GATE 3: layout items present (exactly-once) ───────────────────────────
     let layout = compute_layout(&drawing);
 
     let datum_items: Vec<_> = layout
@@ -2620,9 +2629,12 @@ fn gdt_plate_layout_bridge_end_to_end() {
         .iter()
         .filter(|it| it.kind == SheetItemKind::DatumSymbol)
         .collect();
-    assert!(
-        !datum_items.is_empty(),
-        "layout must contain at least one DatumSymbol item; got none"
+    // Exactly 1 DatumSymbol layout item — same mutation-proofing rationale.
+    assert_eq!(
+        datum_items.len(),
+        1,
+        "layout must contain exactly 1 DatumSymbol item; got {}",
+        datum_items.len()
     );
     assert!(
         datum_items.iter().any(|it| it.text.as_deref() == Some("A")),
@@ -2634,9 +2646,12 @@ fn gdt_plate_layout_bridge_end_to_end() {
         .iter()
         .filter(|it| it.kind == SheetItemKind::FcfBlock)
         .collect();
-    assert!(
-        !fcf_items.is_empty(),
-        "layout must contain at least one FcfBlock item; got none"
+    // Exactly 1 FcfBlock layout item.
+    assert_eq!(
+        fcf_items.len(),
+        1,
+        "layout must contain exactly 1 FcfBlock item; got {}",
+        fcf_items.len()
     );
     assert!(
         fcf_items
@@ -2671,109 +2686,118 @@ fn gdt_plate_layout_bridge_end_to_end() {
     );
 }
 
-/// COLLISION SPECIMEN (Task 6, mutation-proofed): a `DatumSymbol` item placed
-/// at the EXACT same bbox as a `ViewLabel` item must cause `verify_drawing` to
-/// report `ViewLabelCollision`.
+/// COLLISION SPECIMEN (Task 6, I1, mutation-proofed): a `DatumSymbol` placed
+/// so it collides with a view label must cause `verify_drawing` (routing
+/// through `verify.rs`'s `label_items` filter) to report `ViewLabelCollision`.
 ///
-/// This test works at the layout level (hand-assembled `SheetLayout`) so it
-/// is independent of the placement collision ladder — the ladder tries to
-/// avoid collisions; this specimen deliberately creates one to verify the
-/// DETECTOR, not the placer.  The identical model is used by
-/// `hole_tag_collision_with_dimension_text_flagged` and by the cutting-plane
-/// collision tests.
+/// # Construction (A3 sheet, h=297 mm, SVG y-down)
 ///
-/// **Mutation proof:** remove `SheetItemKind::DatumSymbol` from the
-/// `label_items` filter in `verify_drawing` (verify.rs) → the pair is never
-/// checked → `report.has(ViewLabelCollision)` returns `false` → assertion →
-/// RED.  Restore → GREEN.
+/// **FRONT** view at pos=[175, 143], size=70×33:
+/// - Sheet geometry rect: x∈[175, 245], y∈[121, 154].
+/// - Label slot 1 (above-left, LABEL_GAP=2): baseline_y = 121−2 = 119; x=175.
+///   Text "FRONT (1:1)" = 11 chars × 0.62 × 3.6 = 24.6 mm wide.
+///   Label bbox ≈ x∈[175, 199.6], y∈[115.4, 119].
+///
+/// **TOP** view at pos=[185, 187], size=10×6:
+/// - Sheet geometry rect: x∈[185, 195], y∈[104, 110].
+/// - Does NOT overlap FRONT's rect (FRONT y∈[121, 154] vs TOP y∈[104, 110]).
+/// - Purpose: blocks datum-symbol fallback candidate #2 at sheet y≈110.1,
+///   which the FRONT label alone does not cover.
+///
+/// **DatumSymbol** anchor=[187, 117] (owner_view=0), half=2.3, step=6.9:
+/// - All 5 collision-ladder candidates are blocked:
+///   1. [187, 117]     bbox y∈[114.7, 119.3] ↔ FRONT label y∈[115.4, 119] ✓
+///   2. [187, 110.1]   bbox y∈[107.8, 112.4] ↔ TOP geometry y∈[104, 110] ✓
+///      (intersects at y∈[107.8, 109.8] with LABEL_TOL=0.2)
+///   3. [193.9, 117]   bbox x∈[191.6, 196.2] inside FRONT label x∈[175, 199.6] ✓
+///   4. [187, 123.9]   bbox y∈[121.6, 126.2] ↔ FRONT geometry y∈[121, 154] ✓
+///   5. [180.1, 117]   bbox x∈[177.8, 182.4] inside FRONT label x∈[175, 199.6] ✓
+/// - Ladder falls back to stored anchor → datum box x∈[184.7, 189.3], y∈[114.7, 119.3].
+/// - That box overlaps FRONT label x∈[175, 199.6], y∈[115.4, 119] → collision.
+///
+/// # Mutation proof
+///
+/// Remove `SheetItemKind::DatumSymbol` from the `label_items` filter in
+/// `verify_drawing` (verify.rs) → the (ViewLabel, DatumSymbol) pair is never
+/// examined → `report.has(ViewLabelCollision)` returns `false` →
+/// `assert!(report.has(...))` → **RED**.  Restore → **GREEN**.
+///
+/// Verified mutation transcript (fix-wave 2, 2026-07-05):
+/// ```text
+/// --- MUTATION: removed DatumSymbol from label_items filter in verify.rs ---
+/// running 1 test
+/// test datum_symbol_colliding_with_view_label_flagged ... FAILED
+///
+/// failures:
+///
+/// ---- datum_symbol_colliding_with_view_label_flagged stdout ----
+/// thread 'datum_symbol_colliding_with_view_label_flagged' panicked at
+/// geometry-engine\tests\drawing_quality_oracle.rs:2787:5:
+/// DatumSymbol colliding with view label must fire ViewLabelCollision;
+/// issues=[DrawingIssue { severity: Warning, kind: SheetUnderutilized,
+/// message: "views fill only 2% of the sheet — scale up or use a smaller
+/// sheet", view: None }, DrawingIssue { severity: Warning, kind:
+/// ProjectionMisaligned, message: "Top view is not vertically aligned
+/// over the Front view (third-angle)", view: None }, DrawingIssue {
+/// severity: Warning, kind: UndimensionedView, message: "view 'FRONT'
+/// shows geometry but carries no dimension callouts", view: Some("FRONT")
+/// }, DrawingIssue { severity: Warning, kind: UndimensionedView,
+/// message: "view 'TOP' shows geometry but carries no dimension callouts",
+/// view: Some("TOP") }]
+///
+/// test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured
+/// --- RESTORE: DatumSymbol re-added ---
+/// test datum_symbol_colliding_with_view_label_flagged ... ok
+/// test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured
+/// ```
 #[test]
 fn datum_symbol_colliding_with_view_label_flagged() {
-    use geometry_engine::drawing::layout::{Rect2, SheetItem, SheetLayout};
+    use geometry_engine::drawing::types::PlacedDatumSymbol;
 
-    // A bbox that the ViewLabel and DatumSymbol share — guaranteed > 0.2 mm
-    // interior overlap (the intersects tolerance).
-    let shared_bbox = Rect2 {
-        x0: 100.0,
-        y0: 100.0,
-        x1: 120.0,
-        y1: 104.0,
-    };
+    // ── Drawing construction ─────────────────────────────────────────────────
+    let mut d = Drawing::new("DatumLabelCollision", SheetSize::A3);
 
-    let label_item = SheetItem {
-        kind: SheetItemKind::ViewLabel,
-        bbox: shared_bbox,
-        owner_view: Some(0),
-        text: Some("FRONT (1:1)".to_string()),
-    };
-    let datum_item = SheetItem {
-        kind: SheetItemKind::DatumSymbol,
-        // Identical bbox → 100% overlap → definitely > 0.2 mm tolerance.
-        bbox: shared_bbox,
-        owner_view: Some(0),
-        text: Some("A".to_string()),
-    };
+    // FRONT view: geometry rect x∈[175, 245], y∈[121, 154].
+    // Label slot 1 (above-left): bbox x∈[175, 199.6], y∈[115.4, 119].
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [175.0, 143.0],
+        70.0,
+        33.0,
+        vec![],
+    ));
 
-    // The label_items filter in verify_drawing includes both ViewLabel and
-    // DatumSymbol.  Since at least one item in the pair is a ViewLabel,
-    // the pair fires ViewLabelCollision.
-    let label_items: Vec<&SheetItem> = [&label_item, &datum_item]
-        .iter()
-        .filter(|it| {
-            matches!(
-                it.kind,
-                SheetItemKind::ViewLabel | SheetItemKind::DatumSymbol | SheetItemKind::FcfBlock
-            )
-        })
-        .copied()
-        .collect();
+    // TOP view: geometry rect x∈[185, 195], y∈[104, 110].
+    // Blocks datum-symbol candidate #2 at [187, 110.1] whose bbox y∈[107.8, 112.4]
+    // intersects y∈[104, 110] (overlap y∈[107.8, 109.8] with LABEL_TOL=0.2 satisfied).
+    // Does NOT overlap FRONT's geometry rect: FRONT y starts at 121, TOP y ends at 110.
+    d.add_view(rect_view(
+        "TOP",
+        ProjectionType::Top,
+        [185.0, 187.0],
+        10.0,
+        6.0,
+        vec![],
+    ));
 
-    // The detector fires when at least one item in the pair is a ViewLabel
-    // AND the bboxes intersect.
-    let mut found_collision = false;
-    for i in 0..label_items.len() {
-        for j in (i + 1)..label_items.len() {
-            let pair_has_label = label_items[i].kind == SheetItemKind::ViewLabel
-                || label_items[j].kind == SheetItemKind::ViewLabel;
-            if pair_has_label && label_items[i].bbox.intersects(&label_items[j].bbox, 0.2) {
-                found_collision = true;
-            }
-        }
-    }
+    // DatumSymbol anchored at (187, 117): inside the FRONT label band.
+    // All 5 collision-ladder candidates are blocked (see construction spec above).
+    // The ladder falls back to the stored anchor → datum bbox overlaps FRONT label
+    // → verify_drawing fires ViewLabelCollision.
+    d.datum_symbols.push(PlacedDatumSymbol {
+        label: "A".to_string(),
+        anchor: [187.0, 117.0],
+        owner_view: 0,
+    });
+
+    // ── Assert: verify_drawing must fire ViewLabelCollision ──────────────────
+    let report = verify_drawing(&d);
     assert!(
-        found_collision,
-        "ViewLabel + DatumSymbol sharing a bbox must be detected as a collision"
+        report.has(DrawingIssueKind::ViewLabelCollision),
+        "DatumSymbol colliding with view label must fire ViewLabelCollision; \
+         issues={:?}",
+        report.issues
     );
-
-    // Verify the layout carries both items and verify_drawing can find them.
-    let layout = SheetLayout {
-        sheet: Rect2 {
-            x0: 0.0,
-            y0: 0.0,
-            x1: 420.0,
-            y1: 297.0,
-        },
-        items: vec![label_item, datum_item],
-        dimensions: Vec::new(),
-        hole_tags: Vec::new(),
-    };
-
-    // Confirm both are present and their bboxes actually overlap.
-    let label_count = layout
-        .items
-        .iter()
-        .filter(|it| it.kind == SheetItemKind::ViewLabel)
-        .count();
-    let datum_count = layout
-        .items
-        .iter()
-        .filter(|it| it.kind == SheetItemKind::DatumSymbol)
-        .count();
-    assert_eq!(label_count, 1, "layout must have one ViewLabel");
-    assert_eq!(datum_count, 1, "layout must have one DatumSymbol");
-    assert!(
-        layout.items[0].bbox.intersects(&layout.items[1].bbox, 0.2),
-        "the two items must overlap: {:?} vs {:?}",
-        layout.items[0].bbox,
-        layout.items[1].bbox
-    );
+    assert!(!report.passed, "ViewLabelCollision is Severity::Error");
 }

@@ -186,6 +186,35 @@ impl LengthUnit {
             prec = self.precision()
         )
     }
+
+    /// Format a kernel-native (millimetre) tolerance value for use inside a
+    /// **GD&T Feature Control Frame** — suffix omitted.
+    ///
+    /// ISO 1101 §7.2: the numeric tolerance is written bare inside the FCF
+    /// cell; the unit is declared once in the drawing's title-block notes note
+    /// (set via `Drawing::set_unit_notes`). Appending a suffix inside every
+    /// FCF frame violates the standard and wastes horizontal space.
+    ///
+    /// The conversion and precision core is **identical** to [`Self::format_len`]:
+    /// the value is divided by `per_mm()` and formatted to `precision()` decimal
+    /// places. The only difference is that no suffix is appended. This sharing
+    /// guarantees that a tolerance expressed in the document unit always
+    /// matches the numeric part of the corresponding length callout — no
+    /// independent rounding path.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use geometry_engine::units::LengthUnit;
+    /// // 0.05 mm in a mm document: "0.05"
+    /// assert_eq!(LengthUnit::Millimetre.format_gdt_tolerance(0.05), "0.05");
+    /// // 25.4 mm in an inch document: "1.000" (same as format_len minus "in")
+    /// assert_eq!(LengthUnit::Inch.format_gdt_tolerance(25.4), "1.000");
+    /// ```
+    pub fn format_gdt_tolerance(self, mm: f64) -> String {
+        let converted = mm / self.per_mm();
+        format!("{:.prec$}", converted, prec = self.precision())
+    }
 }
 
 #[cfg(test)]
@@ -303,5 +332,53 @@ mod tests {
     fn mm_per_unit_alias_works() {
         assert_eq!(LengthUnit::Foot.mm_per_unit(), 304.8);
         assert_eq!(LengthUnit::Inch.mm_per_unit(), 25.4);
+    }
+
+    // ── format_gdt_tolerance: suffix-free, same numeric core as format_len ────
+
+    /// GDT tolerance: mm document — bare number, same precision as format_len.
+    #[test]
+    fn format_gdt_tolerance_mm_no_suffix() {
+        // "0.05mm" from format_len → "0.05" from format_gdt_tolerance.
+        let mm_val = 0.05;
+        let with_suffix = LengthUnit::Millimetre.format_len(mm_val);
+        let bare = LengthUnit::Millimetre.format_gdt_tolerance(mm_val);
+        assert_eq!(
+            with_suffix,
+            format!("{}mm", bare),
+            "format_gdt_tolerance must be format_len minus the suffix (mm document)"
+        );
+        assert_eq!(bare, "0.05");
+    }
+
+    /// GDT tolerance: inch document — same numeric conversion as format_len,
+    /// no suffix.  0.05 mm = 0.001968… in → formatted to 3 dp = "0.002".
+    #[test]
+    fn format_gdt_tolerance_inch_matches_format_len_numeric_part() {
+        let mm_val = 0.05;
+        let with_suffix = LengthUnit::Inch.format_len(mm_val);
+        // Strip the "in" suffix to get the numeric part.
+        let numeric_part = with_suffix
+            .strip_suffix("in")
+            .expect("format_len must produce an 'in' suffix");
+        let bare = LengthUnit::Inch.format_gdt_tolerance(mm_val);
+        assert_eq!(
+            bare, numeric_part,
+            "format_gdt_tolerance must equal the numeric part of format_len (inch document)"
+        );
+    }
+
+    /// GDT tolerance: 25.4 mm in inch document → "1.000" (1 in, 3 dp, no suffix).
+    #[test]
+    fn format_gdt_tolerance_25_4mm_is_1_000_inch_no_suffix() {
+        assert_eq!(LengthUnit::Inch.format_gdt_tolerance(25.4), "1.000");
+    }
+
+    /// GDT tolerance: mm document, value ≥ 1.0, trailing zeros preserved
+    /// (GDT frames use the full precision — no trailing-zero stripping).
+    #[test]
+    fn format_gdt_tolerance_mm_preserves_trailing_zeros() {
+        // 2.50 mm → "2.50" (2 dp for mm), NOT "2.5".
+        assert_eq!(LengthUnit::Millimetre.format_gdt_tolerance(2.5), "2.50");
     }
 }

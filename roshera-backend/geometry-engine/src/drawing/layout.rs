@@ -1357,9 +1357,14 @@ pub(crate) const GDT_BLOCK_H: f64 = 4.6;
 /// Internal horizontal padding inside each FCF cell, mm.
 const GDT_CELL_PAD: f64 = 1.0;
 
-/// Leader standoff from the FCF block to the feature edge, mm.
-/// The block is placed this far from the view geometry rect (clear of the
-/// visible outline but not so far that it loses its geometric reference).
+/// Minimum clear distance from the view geometry rect to a placed FCF block, mm.
+///
+/// This is the layout engine's floor: after the collision ladder, the chosen
+/// slot must be at least this far from the visible outline so the frame does
+/// not overlap the part silhouette.  Distinct from `dimensioning.rs`'s
+/// `GDT_ANCHOR_STANDOFF` (12 mm), which is the *initial preferred offset*
+/// along the projected feature normal that the collision ladder starts from.
+/// The 4 mm headroom between them gives the ladder room to step inward.
 const GDT_STANDOFF: f64 = 8.0;
 
 /// Place GD&T datum symbols and FCF blocks from `drawing.datum_symbols` and
@@ -1387,7 +1392,6 @@ const GDT_STANDOFF: f64 = 8.0;
 /// from the lists).  A fresh `Drawing::new()` with empty lists produces no
 /// GDT items — this is correct and by design.
 pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -> Vec<SheetItem> {
-    let h = drawing.sheet_size.height();
     let mut result: Vec<SheetItem> = Vec::new();
 
     // Collision check against existing items + newly-placed GDT items.
@@ -1491,7 +1495,6 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
         });
     }
 
-    let _ = h; // sheet height — retained for future anchor-to-view-coord conversions
     result
 }
 

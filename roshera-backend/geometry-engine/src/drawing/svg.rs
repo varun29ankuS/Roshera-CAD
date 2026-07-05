@@ -674,45 +674,38 @@ fn render_datum_marker(out: &mut String, layout: &SheetLayout) {
 // GD&T symbols (Task 6)
 // ---------------------------------------------------------------------
 
-/// Ink GD&T datum symbols and FCF blocks from the layout.
+/// Render GD&T datum symbols and FCF blocks from the layout's `DatumSymbol`
+/// and `FcfBlock` items.
 ///
 /// **DatumSymbol items** render as an ISO 1101 / ASME Y14.5 datum feature
-/// symbol: a square box (the same size as `GDT_BOX_HALF * 2` per side)
-/// containing the datum letter, centred at `bbox` centre, with a filled
-/// equilateral triangle pointing downward from the box bottom edge.  The
-/// triangle base matches the box width; its height is approximately half
-/// the box height (ISO 1101 §4.7 proportions).
+/// symbol: a square box (`GDT_BOX_HALF * 2` per side) containing the datum
+/// letter, centred at `bbox` centre, with a filled equilateral triangle
+/// pointing downward from the box bottom edge.  The triangle base matches the
+/// box width; its height is approximately half the box height (ISO 1101 §4.7).
 ///
 /// **FcfBlock items** render as a multi-cell bordered rectangle:
 /// `[glyph | tolerance | datum…]`.  The outer border is the full `bbox`;
 /// inner vertical separators divide cells equally; the full text string
 /// (stored in `item.text`) is rendered centred in the bbox — a single
-/// `<text>` element for simplicity (individual cell centering is a
-/// cosmetic refinement deferred to the viewport overlay, which has exact
-/// font-metric access).  A leader line, if present in the source
-/// `PlacedFcfBlock`, is read from `drawing.fcf_blocks` keyed by
-/// `owner_view` + `text` to find the matching leader target.
+/// `<text>` element for simplicity (individual cell centring is a cosmetic
+/// refinement deferred to the viewport overlay, which has exact font-metric
+/// access).
 ///
-/// Both item kinds are collision-policed by `compute_layout` (they are
-/// layout items with text-carrying `text` fields) exactly like every
-/// other piece of ink on the sheet.
-/// Render GD&T datum symbols and FCF blocks from the layout's `DatumSymbol`
-/// and `FcfBlock` items.
+/// Both item kinds are collision-policed by `compute_layout` exactly like
+/// every other piece of ink on the sheet.
 ///
-/// ## Leader lines (Task 6 fix wave, concern 2)
+/// ## Leader lines
 ///
 /// `PlacedFcfBlock::leader_to` is the sheet-space feature-edge location the
 /// callout points at.  When set, a thin (0.18 mm, `.gdt-leader` class) line
 /// is drawn from the FCF frame's bottom-centre to the leader target, following
 /// the same "house leader" style used by section labels and hole-table tags.
+/// The leader target is looked up by `(owner_view, full_text)` from
+/// `drawing.fcf_blocks` so the index is O(1).
 ///
-/// The `drawing` parameter gives access to `drawing.fcf_blocks` so the leader
-/// target can be retrieved by matching the FCF's `owner_view` and `text` fields
-/// against the stored `PlacedFcfBlock` list.
+/// ## DXF triangle hatch omission (accepted limitation)
 ///
-/// ## DXF triangle hatch omission (Task 6, concern 3 — accepted)
-///
-/// The filled datum-feature triangle is emitted in SVG only. The DXF renderer
+/// The filled datum-feature triangle is emitted in SVG only.  The DXF renderer
 /// emits the box + label but not the hatched triangle because the `dxf` crate's
 /// HATCH entity support for R2000 portable output is incomplete.  The SVG is
 /// the authoritative shopfloor output; the DXF is for CAD re-editing.
