@@ -321,8 +321,27 @@ pub struct FeatureControlFrame {
     /// datum-free form family.
     #[serde(default)]
     pub datum_refs: Vec<DatumRef>,
-    /// Basic dimensions [x, y] in millimetres relative to the DRF origin.
+    /// Basic dimensions [x, y] in millimetres, measured from the datum
+    /// reference frame's derived origin along its in-plane axes (X′, Y′).
     /// Required for Position; `None` for all other characteristics.
+    ///
+    /// **What `basic [x, y]` MEANS (the documented DRF conventions,
+    /// enforced by `verify::evaluate_position`):**
+    /// * Z′ is always the primary Plane datum's outward normal.
+    /// * **Two Plane datums (A|B):** X′ = datum B's inward normal projected
+    ///   into the datum-A plane (positive basics point INTO the material from
+    ///   B); Y′ = Z′ × X′. The origin's X′ coordinate is the A∩B intersection
+    ///   line (derived from the plane equations, independent of surface
+    ///   parameterisation); its Y′ coordinate — the translation A|B leaves
+    ///   unconstrained per Y14.5 — is completed from the PART CORNER: the
+    ///   minimum of the solid's B-Rep vertices along Y′.
+    /// * **Single Plane datum (A):** X′ = the world X axis projected into the
+    ///   datum plane (world Y seed when the normal is within ~26° of world X);
+    ///   Y′ = Z′ × X′; both origin coordinates come from the part corner
+    ///   (minimum vertex coordinate along X′ / Y′).
+    ///
+    /// For the canonical plate whose datum faces sit on the min-X/min-Y sides,
+    /// this reads exactly like the drawing: distances from the part edges.
     /// Serde default omits the field in legacy JSON (additive deserialization).
     #[serde(default)]
     pub basic: Option<[f64; 2]>,

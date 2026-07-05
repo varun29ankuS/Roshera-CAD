@@ -130,10 +130,12 @@ impl DatumReferenceFrame {
 
 // ---------------------------------------------------------------------------
 // Helper: collect all FaceIds belonging to a solid (outer + inner shells).
-// This is a module-private copy of the idiom used across queries/cd.rs,
+// This is a gdt-module copy of the idiom used across queries/cd.rs,
 // queries/features.rs, etc. — there is no shared free function yet.
+// `pub(crate)` so `verify::evaluate` enforces the same Spec-A face∈solid
+// membership discipline that `designate_datum` does.
 // ---------------------------------------------------------------------------
-fn solid_face_ids(model: &BRepModel, solid_id: SolidId) -> Vec<FaceId> {
+pub(crate) fn solid_face_ids(model: &BRepModel, solid_id: SolidId) -> Vec<FaceId> {
     let mut out = Vec::new();
     let Some(solid) = model.solids.get(solid_id) else {
         return out;
