@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { Canvas } from '@react-three/fiber'
-import { Box, Grid3x3, SquareDashed, Tags } from 'lucide-react'
+import { Box, Grid3x3, Ruler, SquareDashed, Tags } from 'lucide-react'
 import { CADGrid } from './CADGrid'
 import { GizmoNav } from './GizmoNav'
 import { SceneLighting } from './SceneLighting'
@@ -19,6 +19,7 @@ import { ExtrudeHoverTooltip } from './ExtrudeHoverTooltip'
 import { LabelHoverTooltip } from './LabelHoverTooltip'
 import { PartLabels } from './PartLabels'
 import { PartDimensions } from './PartDimensions'
+import { GdtAnnotations } from './GdtAnnotations'
 import { SketchOverlay } from './SketchOverlay'
 import { ServerSketches } from './ServerSketches'
 import { SketchPanel } from '@/components/panels/SketchPanel'
@@ -200,6 +201,7 @@ export function CADViewport() {
         <ServerSketches />
         <PartLabels />
         <PartDimensions />
+        <GdtAnnotations />
       </Canvas>
 
       <ViewportFrame />
@@ -597,6 +599,8 @@ function ViewportControls() {
   const toggleProjection = useSceneStore((s) => s.toggleCameraProjection)
   const labelsVisible = useSceneStore((s) => s.labelsVisible)
   const toggleLabelsVisible = useSceneStore((s) => s.toggleLabelsVisible)
+  const gdtVisible = useSceneStore((s) => s.gdtVisible)
+  const toggleGdtVisible = useSceneStore((s) => s.toggleGdtVisible)
 
   const toggleGrid = useCallback(() => {
     setGridSettings({ visible: !gridVisible })
@@ -652,6 +656,20 @@ function ViewportControls() {
         ].join(' ')}
       >
         <Tags className="w-3.5 h-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={toggleGdtVisible}
+        title={gdtVisible ? 'Hide GD&T annotations' : 'Show GD&T annotations'}
+        aria-pressed={gdtVisible}
+        className={[
+          'cad-panel w-7 h-7 flex items-center justify-center transition-colors',
+          gdtVisible
+            ? 'text-foreground border-border'
+            : 'text-muted-foreground/70 border-border/60 hover:text-foreground',
+        ].join(' ')}
+      >
+        <Ruler className="w-3.5 h-3.5" />
       </button>
     </div>
   )

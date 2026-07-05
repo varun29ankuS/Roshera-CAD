@@ -621,6 +621,16 @@ interface SceneState {
   labelsVisible: boolean
 
   /**
+   * Whether the GD&T overlay is shown in the viewport — datum flags and
+   * FCF badges anchored to their toleranced features (see
+   * `GdtAnnotations`). Off by default; toggled from the viewport controls.
+   * Session-persistence honesty: the backend's GD&T state does not survive
+   * a server restart, so when the toggle is on but the GET returns empty
+   * arrays the layer renders nothing — no placeholder chrome.
+   */
+  gdtVisible: boolean
+
+  /**
    * Set of object ids whose kernel dimension table is currently visible
    * in the viewport as leader + billboard annotations (see
    * `PartDimensions`). Empty by default. Uses Set replacement (never
@@ -737,6 +747,8 @@ interface SceneState {
   setGridSettings: (settings: Partial<GridSettings>) => void
   /** Toggle the LABELLER viewport overlay on/off. */
   toggleLabelsVisible: () => void
+  /** Toggle the GD&T annotation overlay on/off. */
+  toggleGdtVisible: () => void
   /**
    * Toggle the dimension layer for a single object on or off. Adds the
    * id to `showDimensions` when absent; removes it when present. Uses
@@ -1032,6 +1044,7 @@ const sceneCreator: StateCreator<
       infiniteGrid: true,
     },
     labelsVisible: false,
+    gdtVisible: false,
     showDimensions: new Set<string>(),
     dimensionKindFilter: new Set<string>(ALL_DIMENSION_KINDS),
     pinnedMeasurements: [],
@@ -1319,6 +1332,9 @@ const sceneCreator: StateCreator<
 
     toggleLabelsVisible: () =>
       set((state) => ({ labelsVisible: !state.labelsVisible })),
+
+    toggleGdtVisible: () =>
+      set((state) => ({ gdtVisible: !state.gdtVisible })),
 
     toggleDimensions: (objectId) =>
       set((state) => {
