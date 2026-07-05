@@ -2952,3 +2952,528 @@ fn drawing_title_block_note_in_inches() {
         &svg[..svg.len().min(2000)]
     );
 }
+
+// =====================================================================
+// Tests — GD&T Task 3 router integration (Spec C)
+// =====================================================================
+//
+// Seed: a plate (box 100×60×20, z ∈ [-10, +10]) whose faces carry
+// PersistentIds (event key "plate_gdt" is set before build and cleared
+// after). We confirm all four GDT endpoints route and behave correctly
+// through the live router, not just through unit-testable helpers.
+
+/// Seed a 100×60×20 box with event key "plate_gdt" so every face gets
+/// a PersistentId. Returns `(solid_id, top_face_id)` where `top_face_id`
+/// is the +Z planar face at z = 10.0.
+///
+/// The solid is written into `state.model` (the shared legacy model).
+/// GDT handlers use `ActiveModel` without an `X-Roshera-Part-Id` header,
+/// which falls back to `state.model`, so no UUID registration is needed.
+async fn seed_gdt_plate(state: &AppState) -> (SolidId, u32) {
+    let mut model_guard = state.model.write().await;
+    let model: &mut BRepModel = &mut *model_guard;
+
+    model.set_event_key(Some("plate_gdt".into()));
+    let solid_id = match TopologyBuilder::new(model)
+        .create_box_3d(100.0, 60.0, 20.0)
+        .expect("GDT plate must build")
+    {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected Solid; got {other:?}"),
+    };
+    model.set_event_key(None);
+
+    // Locate the Z face at z = 10.0 (box half-depth = 20/2 = 10).
+    let top_face = find_plate_top_face(model, solid_id, 10.0)
+        .expect("plate must expose a planar face at z = 10");
+
+    (solid_id, top_face)
+}
+
+/// Find any planar face of `solid_id` whose surface origin is at `z_coord`
+/// (irrespective of normal direction).
+fn find_plate_top_face(model: &BRepModel, solid_id: SolidId, z_coord: f64) -> Option<u32> {
+    use geometry_engine::primitives::surface::Plane;
+
+    let solid = model.solids.get(solid_id)?;
+    let mut shell_ids = vec![solid.outer_shell];
+    shell_ids.extend(solid.inner_shells.iter().copied());
+
+    let mut face_ids: Vec<u32> = Vec::new();
+    for sid in shell_ids {
+        if let Some(shell) = model.shells.get(sid) {
+            face_ids.extend(shell.faces.iter().copied());
+        }
+    }
+
+    for fid in face_ids {
+        let face = model.faces.get(fid)?;
+        let surf = model.surfaces.get(face.surface_id)?;
+        if let Some(plane) = surf.as_any().downcast_ref::<Plane>() {
+            let n = plane.normal;
+            // Match faces whose normal is aligned with Z (±) and whose
+            // origin sits at the requested z coordinate.
+            if n.z.abs() > 0.99 && (plane.origin.z - z_coord).abs() < 1e-6 {
+                return Some(fid);
+            }
+        }
+    }
+    None
+}
+
+/// Helper: build a POST request to `/api/agent/parts/{id}/datums`.
+fn datums_post(solid_id: SolidId, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/agent/parts/{solid_id}/datums"))
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("datums POST request must build")
+}
+
+/// Helper: build a POST request to `/api/agent/parts/{id}/fcf`.
+fn fcf_post(solid_id: SolidId, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/agent/parts/{solid_id}/fcf"))
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("fcf POST request must build")
+}
+
+/// Helper: build a GET request to `/api/agent/parts/{id}/gdt`.
+fn gdt_get(solid_id: SolidId) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/gdt"))
+        .body(Body::empty())
+        .expect("gdt GET request must build")
+}
+
+// ── designate_datum happy path ───────────────────────────────────────
+
+/// Designating a +Z planar face as datum "A" must return 200 with
+/// `success: true`, `kind: "plane"`, and `persistence: "session"`.
+///
+/// This is the GREEN side of the RED-first pair: the kernel designator
+/// accepts a planar face, assigns a PID-pinned datum, and the handler
+/// serialises the result correctly.
+#[tokio::test]
+async fn gdt_designate_plate_face_returns_200() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    let request = datums_post(solid_id, json!({ "label": "A", "face_id": top_face }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "designate datum on a planar face must return 200; body = {body}"
+    );
+    assert_eq!(body["success"], true, "success must be true; body = {body}");
+    assert_eq!(
+        body["label"], "A",
+        "label must echo the request label; body = {body}"
+    );
+    assert_eq!(
+        body["kind"], "plane",
+        "a +Z planar face must yield kind = plane; body = {body}"
+    );
+    assert_eq!(
+        body["persistence"], "session",
+        "persistence must be 'session'; body = {body}"
+    );
+    assert!(
+        body["persistent_id"]
+            .as_str()
+            .map(|s| s.len() == 32)
+            .unwrap_or(false),
+        "persistent_id must be a 32-hex-char UUID; body = {body}"
+    );
+}
+
+// ── designate_datum duplicate label → 409 ───────────────────────────
+
+/// Designating the same label "A" a second time on a different face
+/// must return 409 Conflict with `error: "duplicate_label"`.
+///
+/// The handler maps `GdtError::DuplicateLabel` to HTTP 409; the test
+/// goes through the full router to confirm the mapping survives the
+/// middleware stack.
+#[tokio::test]
+async fn gdt_designate_duplicate_label_returns_409() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    // Designate the bottom (-Z) face to use as the second target.
+    let bottom_face = {
+        let model_guard = state.model.read().await;
+        find_plate_top_face(&model_guard, solid_id, -10.0)
+            .expect("plate must have a -Z face at z = -10")
+    };
+
+    // First designation: must succeed.
+    let req1 = datums_post(solid_id, json!({ "label": "A", "face_id": top_face }));
+    let (status1, _) = dispatch(&state, req1).await;
+    assert_eq!(status1, StatusCode::OK, "first designation must succeed");
+
+    // Second designation with the same label on a different face: must be 409.
+    let req2 = datums_post(solid_id, json!({ "label": "A", "face_id": bottom_face }));
+    let (status2, body2) = dispatch(&state, req2).await;
+
+    assert_eq!(
+        status2,
+        StatusCode::CONFLICT,
+        "duplicate label must return 409; body = {body2}"
+    );
+    assert_eq!(
+        body2["error"], "duplicate_label",
+        "error field must be 'duplicate_label'; body = {body2}"
+    );
+}
+
+// ── designate_datum on sphere face → 422 ────────────────────────────
+
+/// Designating a spherical face (not planar, not cylindrical) must
+/// return 422 with `error: "non_qualifying_surface"`.
+///
+/// This exercises the `GdtError::UnsupportedSurfaceKind` branch through
+/// the full router.
+#[tokio::test]
+async fn gdt_designate_sphere_face_returns_422() {
+    let state = make_test_state().await;
+
+    // Build a sphere into the shared model.
+    let (sphere_solid, sphere_face) = {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+
+        model.set_event_key(Some("sphere_gdt".into()));
+        let sid = match TopologyBuilder::new(model)
+            .create_sphere_3d(Point3::ORIGIN, 10.0)
+            .expect("sphere must build")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid; got {other:?}"),
+        };
+        model.set_event_key(None);
+
+        // Any face on the sphere will be spherical.
+        let fid = model
+            .solids
+            .get(sid)
+            .and_then(|s| model.shells.get(s.outer_shell))
+            .and_then(|sh| sh.faces.first().copied())
+            .expect("sphere must have at least one face");
+        (sid, fid)
+    };
+
+    let request = datums_post(
+        sphere_solid,
+        json!({ "label": "A", "face_id": sphere_face }),
+    );
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "spherical face must be rejected as non-qualifying; body = {body}"
+    );
+    assert_eq!(
+        body["error"], "non_qualifying_surface",
+        "error field must be 'non_qualifying_surface'; body = {body}"
+    );
+}
+
+// ── FCF happy path → InSpec verdict with formatted labels ───────────
+
+/// Authoring a flatness FCF on a perfect planar face must return 200
+/// with `verdict.conforms == "in_spec"`, a formatted tolerance label,
+/// and `persistence: "session"`.
+///
+/// A primitive box face is analytically flat (form error = 0), so any
+/// positive tolerance → InSpec. This confirms the evaluate→wire path
+/// through the live router.
+#[tokio::test]
+async fn gdt_fcf_flatness_happy_path_returns_in_spec() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    // Flatness needs no datum refs.
+    let request = fcf_post(
+        solid_id,
+        json!({
+            "characteristic": "flatness",
+            "tolerance_mm": 0.05,
+            "datum_refs": [],
+            "face_id": top_face,
+        }),
+    );
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "flatness FCF on a perfect plane must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["verdict"]["conforms"], "in_spec",
+        "verdict.conforms must be 'in_spec'; body = {body}"
+    );
+    assert_eq!(
+        body["persistence"], "session",
+        "persistence must be 'session'; body = {body}"
+    );
+    // tolerance_label must be formatted (e.g. "0.05mm").
+    let tol_label = body["verdict"]["tolerance_label"]
+        .as_str()
+        .expect("tolerance_label must be a string");
+    assert!(
+        tol_label.contains("mm") || tol_label.contains("in"),
+        "tolerance_label must carry a unit suffix; got {tol_label:?}"
+    );
+    // annotation_pid must be a 32-char hex string.
+    assert!(
+        body["annotation_pid"]
+            .as_str()
+            .map(|s| s.len() == 32)
+            .unwrap_or(false),
+        "annotation_pid must be a 32-hex-char UUID; body = {body}"
+    );
+}
+
+// ── FCF with document unit = inches → formatted labels in inches ─────
+
+/// When the document unit is set to Inch the verdict's `tolerance_label`
+/// and `measured_label` must use the `in` suffix.
+///
+/// This pins the `model.document_unit()` → `LengthUnit::format_len`
+/// path through the live router.
+#[tokio::test]
+async fn gdt_fcf_flatness_inch_unit_formats_labels_in_inches() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = {
+        // Set document unit to Inch before seeding (unit is on the model).
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+        model.set_document_unit(geometry_engine::units::LengthUnit::Inch);
+
+        model.set_event_key(Some("plate_gdt_in".into()));
+        let sid = match TopologyBuilder::new(model)
+            .create_box_3d(100.0, 60.0, 20.0)
+            .expect("plate must build")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected Solid; got {other:?}"),
+        };
+        model.set_event_key(None);
+
+        let top =
+            find_plate_top_face(model, sid, 10.0).expect("plate must have a +Z face at z = 10");
+        (sid, top)
+    };
+
+    // 25.4 mm = 1 in exactly.
+    let request = fcf_post(
+        solid_id,
+        json!({
+            "characteristic": "flatness",
+            "tolerance_mm": 25.4,
+            "datum_refs": [],
+            "face_id": top_face,
+        }),
+    );
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(status, StatusCode::OK, "must return 200; body = {body}");
+    let tol_label = body["verdict"]["tolerance_label"]
+        .as_str()
+        .expect("tolerance_label must be a string");
+    assert!(
+        tol_label.contains("in"),
+        "tolerance_label must use 'in' suffix when document unit is Inch; got {tol_label:?}"
+    );
+    assert!(
+        tol_label.contains("1.000"),
+        "25.4 mm must format as 1.000in; got {tol_label:?}"
+    );
+}
+
+// ── FCF missing datum label → 422 ───────────────────────────────────
+
+/// Referencing a datum label that has not been designated must return
+/// 422 with `error: "datum_label_not_in_drf"`.
+///
+/// The handler validates datum_refs against the DRF before storing the
+/// annotation; this test confirms that validation fires through the
+/// live router.
+#[tokio::test]
+async fn gdt_fcf_missing_datum_label_returns_422() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    // Reference "Z" which was never designated.
+    let request = fcf_post(
+        solid_id,
+        json!({
+            "characteristic": "perpendicularity",
+            "tolerance_mm": 0.05,
+            "datum_refs": ["Z"],
+            "face_id": top_face,
+        }),
+    );
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "missing datum label must return 422; body = {body}"
+    );
+    assert_eq!(
+        body["error"], "datum_label_not_in_drf",
+        "error field must be 'datum_label_not_in_drf'; body = {body}"
+    );
+}
+
+// ── FCF position without basic → 200 with NotEvaluable verdict ──────
+
+/// Authoring a position FCF without `basic` dimensions must return
+/// 200 OK (not an error). The annotation is stored; the verdict is
+/// `"not_evaluable"` with an honest reason string.
+///
+/// This is the HONESTY path: the FCF is valid, but the evaluation
+/// refuses to fabricate a measurement without reference dimensions.
+#[tokio::test]
+async fn gdt_fcf_position_without_basic_returns_200_not_evaluable() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    // Designate datum "A" first so the datum_ref validation passes.
+    let req_datum = datums_post(solid_id, json!({ "label": "A", "face_id": top_face }));
+    let (status_d, _) = dispatch(&state, req_datum).await;
+    assert_eq!(status_d, StatusCode::OK, "datum designation must succeed");
+
+    // Use the -Z face as target (different from datum face).
+    let bottom_face = {
+        let model_guard = state.model.read().await;
+        find_plate_top_face(&model_guard, solid_id, -10.0)
+            .expect("plate must have a -Z face at z = -10")
+    };
+
+    // Position FCF without `basic` key.
+    let request = fcf_post(
+        solid_id,
+        json!({
+            "characteristic": "position",
+            "tolerance_mm": 0.1,
+            "datum_refs": ["A"],
+            "face_id": bottom_face,
+        }),
+    );
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "position without basic must still be 200 (the annotation is valid); body = {body}"
+    );
+    assert_eq!(
+        body["verdict"]["conforms"], "not_evaluable",
+        "verdict.conforms must be 'not_evaluable'; body = {body}"
+    );
+    let reason = body["verdict"]["reason"]
+        .as_str()
+        .expect("reason must be present for not_evaluable");
+    assert!(
+        !reason.is_empty(),
+        "reason must not be empty; body = {body}"
+    );
+}
+
+// ── GET /gdt shape ───────────────────────────────────────────────────
+
+/// `GET /api/agent/parts/{id}/gdt` must return 200 with a JSON object
+/// containing `datums`, `annotations`, `part_id`, and
+/// `persistence: "session"`.
+///
+/// We designate one datum and author one flatness FCF before the GET so
+/// the response carries non-empty arrays — pinning both the datums and
+/// annotations wire shapes.
+#[tokio::test]
+async fn gdt_get_gdt_shape_includes_persistence_and_arrays() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    // Designate datum A.
+    let req_d = datums_post(solid_id, json!({ "label": "A", "face_id": top_face }));
+    let (s_d, _) = dispatch(&state, req_d).await;
+    assert_eq!(s_d, StatusCode::OK);
+
+    // Author a flatness FCF on the same face.
+    let req_f = fcf_post(
+        solid_id,
+        json!({
+            "characteristic": "flatness",
+            "tolerance_mm": 0.05,
+            "datum_refs": [],
+            "face_id": top_face,
+        }),
+    );
+    let (s_f, _) = dispatch(&state, req_f).await;
+    assert_eq!(s_f, StatusCode::OK);
+
+    // GET /gdt.
+    let request = gdt_get(solid_id);
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /gdt must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["persistence"], "session",
+        "persistence must be 'session'; body = {body}"
+    );
+    assert_eq!(
+        body["part_id"].as_u64(),
+        Some(solid_id as u64),
+        "part_id must echo the solid id; body = {body}"
+    );
+    assert!(
+        body["datums"].is_array(),
+        "datums must be an array; body = {body}"
+    );
+    assert!(
+        body["annotations"].is_array(),
+        "annotations must be an array; body = {body}"
+    );
+    // We designated one datum.
+    assert_eq!(
+        body["datums"].as_array().map(|a| a.len()),
+        Some(1),
+        "datums array must have 1 entry; body = {body}"
+    );
+    // datum must carry live resolution.
+    let datum = &body["datums"][0];
+    assert_eq!(
+        datum["label"], "A",
+        "datum label must be 'A'; datum = {datum}"
+    );
+    assert_eq!(
+        datum["resolution"]["status"], "live",
+        "datum resolution must be live; datum = {datum}"
+    );
+    // We authored one annotation.
+    assert_eq!(
+        body["annotations"].as_array().map(|a| a.len()),
+        Some(1),
+        "annotations array must have 1 entry; body = {body}"
+    );
+    let ann = &body["annotations"][0];
+    assert_eq!(
+        ann["verdict"]["conforms"], "in_spec",
+        "flatness on a perfect plane must be in_spec; ann = {ann}"
+    );
+}

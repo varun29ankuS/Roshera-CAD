@@ -8309,6 +8309,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/parts/{id}/edges/{edge_id}/verify",
             get(handlers::agent::verify_edge_tolerances),
         )
+        // ── GD&T (Spec C) — datum reference frames + feature control frames ──
+        .route(
+            "/api/agent/parts/{id}/datums",
+            post(handlers::gdt::designate_datum_handler).get(handlers::gdt::list_datums_handler),
+        )
+        .route(
+            "/api/agent/parts/{id}/fcf",
+            post(handlers::gdt::author_fcf_handler),
+        )
+        .route(
+            "/api/agent/parts/{id}/gdt",
+            get(handlers::gdt::get_gdt_handler),
+        )
         .route(
             "/api/agent/pointer",
             get(handlers::agent::get_pointer).post(handlers::agent::set_pointer),

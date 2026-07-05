@@ -9,6 +9,7 @@ pub mod capabilities;
 pub mod datums;
 pub mod document;
 pub mod export;
+pub mod gdt;
 pub mod geometry;
 pub mod hierarchy;
 pub mod session;
