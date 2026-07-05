@@ -34,11 +34,13 @@
 //! - ASME Y14.5-2018, *Dimensioning and Tolerancing*.
 //! - ISO 1101:2017, *Geometrical tolerancing*.
 
+pub mod drf;
 pub mod fit;
 pub mod model;
 pub mod sidecar;
 pub mod verify;
 
+pub use drf::{designate_datum, resolve_datum, DatumReferenceFrame, DatumResolution, GdtError};
 pub use model::{
     Annotation, Datum, DatumKind, DatumRef, DimensionalTolerance, FeatureControlFrame, FitClass,
     GeometricCharacteristic, MaterialModifier, ToleranceBound,

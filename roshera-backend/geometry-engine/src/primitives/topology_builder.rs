@@ -624,6 +624,15 @@ pub struct BRepModel {
     /// snapshot/restore and emptied by `clear_geometry`. Empty by default — a
     /// supported state for any model with no tolerances authored.
     pub gdt: crate::gdt::sidecar::GdtSidecar,
+    /// Datum Reference Frame sidecar (GD&T campaign, Task 1): per-solid DRF
+    /// designations keyed by [`SolidId`]. Each entry is a
+    /// [`crate::gdt::drf::DatumReferenceFrame`] — an ordered set of datum
+    /// designations (A/B/C…) pinned to features by
+    /// [`crate::primitives::persistent_id::PersistentId`]. Sidecar (like the PID
+    /// maps + provenance + GD&T annotation sidecar) to keep the SoA stores lean.
+    /// Serde-persisted with the model; cleared by `clear_geometry` because DRFs
+    /// are bound to the topology being discarded. Empty by default.
+    pub drf: std::collections::HashMap<SolidId, crate::gdt::drf::DatumReferenceFrame>,
     /// Human-readable labels (the LABELLER): a NAME pinned to a topological
     /// entity (by [`crate::primitives::persistent_id::PersistentId`]) or a named
     /// cross-section plane, so the agent and the user share one vocabulary for
@@ -705,6 +714,7 @@ impl BRepModel {
             solid_construction: std::collections::HashMap::new(),
             document_unit: crate::units::LengthUnit::default(),
             gdt: crate::gdt::sidecar::GdtSidecar::new(),
+            drf: std::collections::HashMap::new(),
             labels: crate::labels::LabelSidecar::new(),
         }
     }
@@ -779,6 +789,8 @@ impl BRepModel {
         self.root_counter = 0;
         // GD&T annotations are bound to the topology being discarded.
         self.gdt.clear();
+        // DRF designations are bound to the solids being discarded.
+        self.drf.clear();
         // Construction geometry is bound to the solids being discarded —
         // clear it so a recycled solid id can't inherit a stale orphan
         // sketch and certify falsely Inconsistent.
