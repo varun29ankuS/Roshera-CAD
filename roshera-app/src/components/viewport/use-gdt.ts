@@ -46,6 +46,21 @@ export interface VerdictWire {
 export interface GdtAnnotationWire {
   feature_pid: string
   verdict: VerdictWire
+  /**
+   * Live-resolved kernel face id for the annotated feature.
+   * `null` when the feature is dangling (PID no longer resolves to a face).
+   * Used by the viewport to fan-out the hover tint via the per-triangle
+   * `faceIds[t]` map — the same path as `DimensionFaceTints`.
+   */
+  target_face_id: number | null
+  /**
+   * A world-space point ON the toleranced feature in mm.
+   * - Planar face: the analytic `Plane::origin`.
+   * - Cylindrical face: `cyl.origin + cyl.axis * v_mid` (axial mid-height).
+   * `null` when the feature is dangling or the surface kind has no anchor
+   * convention in current scope.
+   */
+  anchor_mm: [number, number, number] | null
 }
 
 /** Full GET /api/agent/parts/{id}/gdt response shape. */

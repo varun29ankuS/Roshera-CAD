@@ -178,6 +178,25 @@ pub struct AnnotationWire {
     /// Hex-encoded PersistentId of the annotated feature.
     pub feature_pid: String,
     pub verdict: VerdictWire,
+    /// Live-resolved kernel face id for the annotated feature.
+    ///
+    /// `Some(fid)` when the feature PID still maps to an existing face in
+    /// the current model (used by the viewport to fan-out the hover tint to
+    /// all triangles whose per-triangle `faceIds[t]` equals this value).
+    /// `None` when the feature is dangling (PID no longer resolves to a
+    /// face) — the viewport must not attempt a tint in that case.
+    pub target_face_id: Option<u32>,
+    /// A world-space point ON the toleranced feature, used to anchor the
+    /// FCF badge near the actual geometry rather than at the first datum's
+    /// origin.
+    ///
+    /// - **Planar target**: the analytic `Plane::origin` — a point guaranteed
+    ///   to lie on the plane (the surface parameterisation origin).
+    /// - **Cylindrical target**: `cyl.origin + cyl.axis · v_mid` where
+    ///   `v_mid` is the axial mid-height, exactly as `evaluate_position` reads
+    ///   the bore axis (consistent with how GD&T evaluation reads the feature).
+    /// - `None` when the feature is dangling (no face → no geometry → no point).
+    pub anchor_mm: Option<[f64; 3]>,
 }
 
 /// Response for `GET /api/agent/parts/{id}/gdt`.
@@ -376,6 +395,63 @@ fn drf_for_solid(
     solid: SolidId,
 ) -> DatumReferenceFrame {
     model.drf.get(&solid).cloned().unwrap_or_default()
+}
+
+/// Resolve a feature PID to its live face id and a world-space anchor point.
+///
+/// ## Anchor computation (analytic-first, mirrors `evaluate_position`)
+///
+/// | Surface kind  | Anchor point                                          |
+/// |---------------|-------------------------------------------------------|
+/// | Plane         | `plane.origin` — the analytic plane's representative  |
+/// |               | point, guaranteed to lie on the face's plane.         |
+/// | Cylinder      | `cyl.origin + cyl.axis · v_mid` at the axial          |
+/// |               | mid-height — the same point `evaluate_position`       |
+/// |               | uses to read the bore axis position.                  |
+/// | Other / gone  | `None` for both.                                      |
+///
+/// Returns `(None, None)` when the PID is dangling.
+pub(crate) fn resolve_annotation_anchor(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    pid: geometry_engine::primitives::persistent_id::PersistentId,
+) -> (Option<u32>, Option<[f64; 3]>) {
+    use geometry_engine::primitives::surface::{Cylinder, Plane};
+
+    let Some(face_id) = model.face_by_pid(pid) else {
+        return (None, None);
+    };
+    let Some(face_data) = model.faces.get(face_id) else {
+        return (None, None);
+    };
+    let Some(surface) = model.surfaces.get(face_data.surface_id) else {
+        return (None, None);
+    };
+
+    let anchor: [f64; 3] = if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
+        // Analytic plane: `plane.origin` is a canonical representative point
+        // on the surface — not the face centroid (vertex averaging is cheaper
+        // but the origin IS on the surface by construction and requires no
+        // loop traversal).
+        [plane.origin.x, plane.origin.y, plane.origin.z]
+    } else if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+        // Cylinder: axis mid-height, matching evaluate_position exactly.
+        // Cylinder parameterisation: p(u,v) = origin + radial(u) + axis*v.
+        // height_limits gives the analytic v-range; fall back to uv_bounds[2..4]
+        // (the builder's default [0,1]) when no explicit limits are stored.
+        let v_mid = cyl.height_limits.map_or(
+            0.5 * (face_data.uv_bounds[2] + face_data.uv_bounds[3]),
+            |[v0, v1]| 0.5 * (v0 + v1),
+        );
+        let q = cyl.origin + cyl.axis * v_mid;
+        [q.x, q.y, q.z]
+    } else {
+        // Neither plane nor cylinder — no defined anchor convention for this
+        // surface kind in Task 2 scope. Return None rather than a misleading
+        // point.
+        return (Some(face_id), None);
+    };
+
+    (Some(face_id), Some(anchor))
 }
 
 /// Collect the set of face ids belonging to `solid` (outer shell + inner
@@ -748,6 +824,10 @@ pub async fn get_gdt_handler(
             }
         }
 
+        // Resolve anchor_mm and target_face_id once per PID (shared by all
+        // annotations on the same face — they all reference the same feature).
+        let (target_face_id, anchor_mm) = resolve_annotation_anchor(&model, feature_pid);
+
         for ann in ann_list {
             let verdict_raw = if let Some(fid) = face_opt {
                 evaluate(&model, solid, fid, ann, &drf)
@@ -773,6 +853,8 @@ pub async fn get_gdt_handler(
             annotations.push(AnnotationWire {
                 feature_pid: pid_str.clone(),
                 verdict: verdict_to_wire(verdict_raw, doc_unit),
+                target_face_id,
+                anchor_mm,
             });
         }
     }
@@ -1138,5 +1220,96 @@ mod tests {
                 "characteristic_wire_name and parse_characteristic must be inverses for {c:?}"
             );
         }
+    }
+
+    // ── Unit tests: resolve_annotation_anchor ────────────────────────────────
+
+    /// A flatness FCF stored on the box top face (+Z, z = 5.0) must resolve to:
+    ///   - `target_face_id = Some(<fid>)` — the live face id.
+    ///   - `anchor_mm = Some([_, _, z])` where `z ≈ 5.0` — the Plane origin lies
+    ///     on the +Z face, whose plane passes through z = 5.0 (half-height of the
+    ///     50×30×10 box centred at the origin: height = 10, so top at z = 5.0).
+    ///
+    /// RED evidence: before `target_face_id` and `anchor_mm` fields were added to
+    /// `AnnotationWire`, this test failed to compile — the fields did not exist.
+    /// GREEN: fields present and computed by `resolve_annotation_anchor`.
+    #[test]
+    fn annotation_anchor_resolves_for_planar_face() {
+        let (mut m, solid) = new_model_with_box();
+        // Box is 50 × 30 × 10, centred at origin → top face at z = 5.0.
+        let top = planar_face_at_z(&m, solid, 5.0).expect("+Z face at z=5");
+        let pid = m.face_pid(top).expect("face PID must exist on a keyed box");
+
+        let (face_id_opt, anchor_opt) = super::resolve_annotation_anchor(&m, pid);
+
+        assert_eq!(
+            face_id_opt,
+            Some(top),
+            "live face must resolve to its kernel FaceId"
+        );
+
+        let anchor = anchor_opt.expect("planar face must yield a Some(anchor_mm)");
+        // The Plane origin for the top face lies on the z = 5.0 plane.
+        assert!(
+            (anchor[2] - 5.0).abs() < 1e-6,
+            "anchor z-coordinate must equal plate top height 5.0 mm, got {}",
+            anchor[2]
+        );
+    }
+
+    /// A dangling PID (face stripped from the model) must resolve to (None, None).
+    #[test]
+    fn annotation_anchor_dangling_returns_none() {
+        let (mut m, solid) = new_model_with_box();
+        let top = planar_face_at_z(&m, solid, 5.0).expect("+Z face");
+        let pid = m.face_pid(top).expect("PID");
+
+        // Simulate the face being consumed: remove from the PID→face map.
+        m.face_pids.remove(&top);
+        m.pid_to_face.remove(&pid);
+
+        let (face_id_opt, anchor_opt) = super::resolve_annotation_anchor(&m, pid);
+        assert!(
+            face_id_opt.is_none(),
+            "dangling PID must return None for face_id"
+        );
+        assert!(
+            anchor_opt.is_none(),
+            "dangling PID must return None for anchor_mm"
+        );
+    }
+
+    /// Serialisation of `AnnotationWire` must include `target_face_id` and
+    /// `anchor_mm` keys — the frontend depends on their presence in the JSON
+    /// even when both are null.
+    #[test]
+    fn annotation_wire_serialises_new_fields() {
+        use geometry_engine::units::LengthUnit;
+        let wire = AnnotationWire {
+            feature_pid: "deadbeef".to_string(),
+            verdict: VerdictWire {
+                characteristic: "flatness".to_string(),
+                tolerance_mm: 0.05,
+                tolerance_label: "0.05mm".to_string(),
+                measured_mm: None,
+                measured_label: None,
+                conforms: "not_evaluable".to_string(),
+                reason: Some("dangling".to_string()),
+                fit_residual_mm: None,
+                datum_statuses: Vec::new(),
+            },
+            target_face_id: None,
+            anchor_mm: None,
+        };
+        let _ = LengthUnit::Millimetre; // ensure units crate is linked
+        let json = serde_json::to_value(&wire).expect("must serialize");
+        assert!(
+            json.get("target_face_id").is_some(),
+            "target_face_id key must be present in JSON (null is acceptable)"
+        );
+        assert!(
+            json.get("anchor_mm").is_some(),
+            "anchor_mm key must be present in JSON (null is acceptable)"
+        );
     }
 }

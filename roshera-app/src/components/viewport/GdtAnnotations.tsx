@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Html, Line } from '@react-three/drei'
 import * as THREE from 'three'
 import { useSceneStore } from '@/stores/scene-store'
@@ -97,7 +97,7 @@ interface ObjectGdtAnnotationsProps {
  * state, without coupling the render of one solid to the in-flight
  * request of another.
  */
-function ObjectGdtAnnotations({ solidId }: ObjectGdtAnnotationsProps) {
+function ObjectGdtAnnotations({ objectId, solidId }: ObjectGdtAnnotationsProps) {
   const gdtVisible = useSceneStore((s) => s.gdtVisible)
   const { datums, annotations } = useGdt(solidId, gdtVisible)
 
@@ -113,6 +113,7 @@ function ObjectGdtAnnotations({ solidId }: ObjectGdtAnnotationsProps) {
           key={`${ann.feature_pid}-${i}`}
           annotation={ann}
           datums={datums}
+          objectId={objectId}
         />
       ))}
     </group>
@@ -222,27 +223,40 @@ function resolutionToAnchor(
 }
 
 /**
- * Resolve the badge position for an FCF annotation. Prefers the first
- * datum reference's live origin (the toleranced feature is typically
- * near its datum), falling back to world origin when no live datum is
- * available. This is PURELY an anchor choice for the badge position;
- * no verdict math is performed.
+ * Resolve the badge position for an FCF annotation.
+ *
+ * Priority order (kernel-computed, no frontend math):
+ * 1. `ann.anchor_mm` — a world point ON the toleranced feature, supplied
+ *    by the Rust handler from the actual analytic surface. This is the
+ *    correct anchor for the badge regardless of datum positions.
+ * 2. First live referenced datum's origin (legacy fallback for older servers
+ *    that do not supply `anchor_mm`, or for dangling targets whose anchor
+ *    could not be resolved).
+ * 3. World origin (fully dangling — no live datum and no anchor).
+ *
+ * No verdict math is performed here; all positions come from kernel fields.
  */
 function annotationAnchor(
   ann: GdtAnnotationWire,
   datums: GdtDatumWire[],
 ): THREE.Vector3 {
-  // Find a datum referenced by this annotation that is live.
+  // Prefer the kernel-supplied feature anchor when available.
+  if (ann.anchor_mm !== null) {
+    return new THREE.Vector3(...ann.anchor_mm)
+  }
+
+  // Fallback: first live referenced datum origin, offset so the FCF badge
+  // doesn't overlap the datum flag glyph.
   for (const ds of ann.verdict.datum_statuses) {
     const datum = datums.find((d) => d.label === ds.label)
     if (!datum) continue
     const anchor = resolutionToAnchor(datum.resolution)
     if (anchor) {
-      // Offset slightly so the FCF badge doesn't overlap the datum flag.
       return anchor.clone().add(new THREE.Vector3(0, DATUM_STANDOFF_MM * 2, 0))
     }
   }
-  // No referenced datum is live — render at world origin (dangling context).
+
+  // Fully dangling — render at world origin.
   return new THREE.Vector3(0, 0, 0)
 }
 
@@ -373,23 +387,42 @@ function DatumFlag({ datum }: { datum: GdtDatumWire }) {
   )
 }
 
+// ─── GDT face tint constants ──────────────────────────────────────────
+
+// Teal, distinct from the amber used by DimensionFaceTints and the blue
+// used by SubElementHighlight. A GDT hover tint must read as "this face
+// is the toleranced feature" — a different semantic from "this face
+// belongs to a dimension number".
+const GDT_TINT_COLOR = '#0891b2'
+// Inflate just proud of the surface so the tint wins the depth test
+// without z-fighting — same value as DimensionFaceTints / LabelFaceTints.
+const GDT_TINT_OFFSET = 0.002
+
 // ─── FcfBadge ────────────────────────────────────────────────────────
 
 /**
  * One FCF badge: a bordered frame text annotation near the toleranced
  * feature, conformance-coloured (green / red / grey). Hover reveals a
- * tooltip panel showing measured vs tolerance + fit residual, all
- * verbatim from the kernel's unit-formatted `*_label` fields.
+ * tooltip panel showing measured vs tolerance + fit residual (all verbatim
+ * from the kernel's unit-formatted `*_label` fields) AND tints the
+ * toleranced feature's face via the same per-triangle `faceIds[t]` fan-out
+ * as `DimensionFaceTints` — using the `target_face_id` returned by the
+ * Rust handler.
  *
- * The badge is the only hover target in this group — the leader line
- * never intercepts pointer events.
+ * The badge is the only hover target in this group — the tint mesh and
+ * any future leader lines are never raycast targets.
+ *
+ * Dangling annotations (`target_face_id === null`) render the badge but
+ * produce no tint on hover — `FcfFaceTint` guards against null face ids.
  */
 function FcfBadge({
   annotation,
   datums,
+  objectId,
 }: {
   annotation: GdtAnnotationWire
   datums: GdtDatumWire[]
+  objectId: string
 }) {
   const [hovered, setHovered] = useState(false)
 
@@ -425,7 +458,137 @@ function FcfBadge({
           )}
         </div>
       </Html>
+      {/* Hover tint: paints the toleranced feature face on hover.
+          Mounted/unmounted with `hovered` state — FcfFaceTint disposes
+          the GPU buffer on unmount matching DimensionFaceTints' discipline.
+          Only rendered when target_face_id is non-null (live feature). */}
+      {hovered && annotation.target_face_id !== null && (
+        <FcfFaceTint
+          objectId={objectId}
+          faceId={annotation.target_face_id}
+        />
+      )}
     </group>
+  )
+}
+
+// ─── FcfFaceTint ─────────────────────────────────────────────────────
+
+/**
+ * Tints the triangles of the hovered FCF's target face using the SAME
+ * per-triangle `faceIds[t]` fan-out as `DimensionFaceTints`:
+ * - Reads the object's mesh from the scene store (`objects.get(objectId)`).
+ * - Reads the mesh ref (GPU geometry) from `meshRefs`.
+ * - For every triangle `t` where `faceIds[t] === faceId`, inflates the
+ *   vertices 0.002 mm along the face normal and emits them into a tint
+ *   mesh.
+ *
+ * Depth test ON (tint = paint on the face, not x-ray — matching the
+ * house tint pattern). Disposes the BufferGeometry on unmount/replacement
+ * following CADMesh's discipline (matching DimensionFaceTints).
+ */
+function FcfFaceTint({
+  objectId,
+  faceId,
+}: {
+  objectId: string
+  faceId: number
+}) {
+  const meshRefs = useSceneStore((s) => s.meshRefs)
+  const objects = useSceneStore((s) => s.objects)
+
+  const positions = useMemo(() => {
+    const obj = objects.get(objectId)
+    const faceIds = obj?.mesh.faceIds
+    if (!obj || !faceIds) return null
+    const mesh = meshRefs.get(objectId)
+    const geom = mesh?.geometry
+    if (!mesh || !geom) return null
+    const posAttr = geom.getAttribute('position') as
+      | THREE.BufferAttribute
+      | undefined
+    if (!posAttr) return null
+    const indexAttr = geom.getIndex()
+    mesh.updateWorldMatrix(true, false)
+    const world = mesh.matrixWorld
+
+    const tris: number[] = []
+    const a = new THREE.Vector3()
+    const b = new THREE.Vector3()
+    const c = new THREE.Vector3()
+    const ab = new THREE.Vector3()
+    const ac = new THREE.Vector3()
+    const n = new THREE.Vector3()
+
+    for (let t = 0; t < faceIds.length; t++) {
+      if (faceIds[t] !== faceId) continue
+      const i0 = t * 3
+      let vi0: number, vi1: number, vi2: number
+      if (indexAttr) {
+        if (i0 + 2 >= indexAttr.count) continue
+        vi0 = indexAttr.getX(i0)
+        vi1 = indexAttr.getX(i0 + 1)
+        vi2 = indexAttr.getX(i0 + 2)
+      } else {
+        vi0 = i0
+        vi1 = i0 + 1
+        vi2 = i0 + 2
+      }
+      if (
+        vi0 >= posAttr.count ||
+        vi1 >= posAttr.count ||
+        vi2 >= posAttr.count
+      ) {
+        continue
+      }
+      a.fromBufferAttribute(posAttr, vi0).applyMatrix4(world)
+      b.fromBufferAttribute(posAttr, vi1).applyMatrix4(world)
+      c.fromBufferAttribute(posAttr, vi2).applyMatrix4(world)
+      ab.subVectors(b, a)
+      ac.subVectors(c, a)
+      n.crossVectors(ab, ac).normalize()
+      tris.push(
+        a.x + n.x * GDT_TINT_OFFSET,
+        a.y + n.y * GDT_TINT_OFFSET,
+        a.z + n.z * GDT_TINT_OFFSET,
+        b.x + n.x * GDT_TINT_OFFSET,
+        b.y + n.y * GDT_TINT_OFFSET,
+        b.z + n.z * GDT_TINT_OFFSET,
+        c.x + n.x * GDT_TINT_OFFSET,
+        c.y + n.y * GDT_TINT_OFFSET,
+        c.z + n.z * GDT_TINT_OFFSET,
+      )
+    }
+    return tris.length > 0 ? new Float32Array(tris) : null
+  }, [objectId, faceId, meshRefs, objects])
+
+  const geometry = useMemo(() => {
+    if (!positions) return null
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+    g.computeVertexNormals()
+    return g
+  }, [positions])
+
+  // Dispose GPU buffer on replacement/unmount — matching DimensionFaceTints.
+  useEffect(() => {
+    return () => {
+      geometry?.dispose()
+    }
+  }, [geometry])
+
+  if (!geometry) return null
+
+  return (
+    <mesh geometry={geometry} raycast={() => null}>
+      <meshBasicMaterial
+        color={GDT_TINT_COLOR}
+        side={THREE.DoubleSide}
+        transparent
+        opacity={0.35}
+        depthWrite={false}
+      />
+    </mesh>
   )
 }
 
