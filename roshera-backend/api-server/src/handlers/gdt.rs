@@ -22,11 +22,10 @@
 //! ## Lock discipline
 //!
 //! `POST /datums` and `POST /fcf` mutate the model → write lock.
-//! `GET /datums` and `GET /gdt` re-evaluate live datums and annotations
-//! → write lock (evaluation is read-only on the geometry but
-//! `verify::evaluate` borrows `&BRepModel` so a read lock suffices;
-//! however these handlers also call `document_unit()` which is `&self`,
-//! so a read lock is sufficient for the GET paths).
+//! `GET /datums` and `GET /gdt` use a read lock: re-evaluation is
+//! read-only on the geometry (`verify::evaluate` borrows `&BRepModel`,
+//! and `document_unit()` is `&self`). No guard is held across an
+//! `.await`.
 //!
 //! ## Face resolution
 //!
@@ -379,6 +378,26 @@ fn drf_for_solid(
     model.drf.get(&solid).cloned().unwrap_or_default()
 }
 
+/// Collect the set of face ids belonging to `solid` (outer shell + inner
+/// shells). Used by `GET /gdt` to scope the model-wide GDT sidecar to the
+/// requested solid.
+fn solid_face_ids(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    solid: SolidId,
+) -> std::collections::HashSet<FaceId> {
+    let mut faces = std::collections::HashSet::new();
+    if let Some(solid_data) = model.solids.get(solid) {
+        let mut shell_ids = vec![solid_data.outer_shell];
+        shell_ids.extend(solid_data.inner_shells.iter().copied());
+        for sid in shell_ids {
+            if let Some(shell) = model.shells.get(sid) {
+                faces.extend(shell.faces.iter().copied());
+            }
+        }
+    }
+    faces
+}
+
 /// Collect [`DatumWire`] entries for all datums in a DRF by resolving each at
 /// call time.
 fn datums_to_wire(
@@ -667,6 +686,23 @@ pub async fn author_fcf_handler(
 /// `GET /api/agent/parts/{id}/gdt` — all datums + annotations, re-evaluated
 /// live.
 ///
+/// ## Solid scoping
+///
+/// The GDT sidecar is model-wide (keyed by PID), so the handler filters
+/// annotations to the requested solid: an annotation whose feature face
+/// resolves to a DIFFERENT solid is skipped — part 1's response never
+/// carries part 2's annotations. Annotations whose PID no longer resolves
+/// to any face (dangling) cannot be attributed to a solid, so they are
+/// reported on every solid's response with an honest `"not_evaluable"`
+/// dangling reason rather than silently dropped.
+///
+/// ## Annotation storage is append-only
+///
+/// `GdtSidecar::attach` pushes onto a `Vec<Annotation>` per PID; a face can
+/// carry several FCFs (e.g. flatness + perpendicularity). There is no
+/// partial-remove API — only `clear_feature`, which drops ALL annotations
+/// on a face.
+///
 /// Dangling datums are reported honestly (`"status": "dangling"`). Annotations
 /// on dangling-datum faces evaluate as `"not_evaluable"`.
 ///
@@ -691,12 +727,26 @@ pub async fn get_gdt_handler(
     // Re-evaluate every annotation stored on faces that belong to this solid.
     // The GDT sidecar is keyed by PID — we iterate it and resolve PID → FaceId
     // at call time, reporting dangling for any feature whose face is gone.
+    //
+    // Solid scoping (review S-1): the sidecar is model-wide, so skip
+    // annotations whose face resolves to a DIFFERENT solid. Dangling PIDs
+    // (face gone) cannot be attributed to a solid; they are kept and
+    // reported honestly.
+    let this_solid_faces = solid_face_ids(&model, solid);
     let mut annotations: Vec<AnnotationWire> = Vec::new();
     for (feature_pid, ann_list) in model.gdt.iter() {
         let pid_str = format!("{:032x}", feature_pid.as_u128());
         // Resolve PID → FaceId. If the face no longer exists, every annotation
         // on it is not_evaluable with a dangling reason.
         let face_opt = model.face_by_pid(feature_pid);
+
+        // Foreign-solid annotation: the face exists but belongs to another
+        // solid — not part of this response.
+        if let Some(fid) = face_opt {
+            if !this_solid_faces.contains(&fid) {
+                continue;
+            }
+        }
 
         for ann in ann_list {
             let verdict_raw = if let Some(fid) = face_opt {

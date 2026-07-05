@@ -3031,6 +3031,15 @@ fn datums_post(solid_id: SolidId, payload: Value) -> Request<Body> {
         .expect("datums POST request must build")
 }
 
+/// Helper: build a GET request to `/api/agent/parts/{id}/datums`.
+fn datums_get(solid_id: SolidId) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/datums"))
+        .body(Body::empty())
+        .expect("datums GET request must build")
+}
+
 /// Helper: build a POST request to `/api/agent/parts/{id}/fcf`.
 fn fcf_post(solid_id: SolidId, payload: Value) -> Request<Body> {
     Request::builder()
@@ -3475,5 +3484,217 @@ async fn gdt_get_gdt_shape_includes_persistence_and_arrays() {
     assert_eq!(
         ann["verdict"]["conforms"], "in_spec",
         "flatness on a perfect plane must be in_spec; ann = {ann}"
+    );
+}
+
+// ── GET /gdt solid scoping (review S-1) ─────────────────────────────
+
+/// Seed a SECOND plate (80×40×30, z ∈ [-15, +15]) with its own event key
+/// so its faces carry distinct PersistentIds. Returns
+/// `(solid_id, top_face_id)` for the second plate.
+async fn seed_second_gdt_plate(state: &AppState) -> (SolidId, u32) {
+    let mut model_guard = state.model.write().await;
+    let model: &mut BRepModel = &mut *model_guard;
+
+    model.set_event_key(Some("plate_gdt_2".into()));
+    let solid_id = match TopologyBuilder::new(model)
+        .create_box_3d(80.0, 40.0, 30.0)
+        .expect("second GDT plate must build")
+    {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected Solid; got {other:?}"),
+    };
+    model.set_event_key(None);
+
+    let top_face = find_plate_top_face(model, solid_id, 15.0)
+        .expect("second plate must expose a planar face at z = 15");
+
+    (solid_id, top_face)
+}
+
+/// In a two-solid model with one annotation authored on EACH solid,
+/// `GET /api/agent/parts/{id}/gdt` for solid 1 must return EXACTLY solid
+/// 1's own annotation — never solid 2's.
+///
+/// RED source (review S-1): the handler iterated the model-wide
+/// `GdtSidecar` unfiltered, so part 1's response included part 2's
+/// annotation as `not_evaluable` noise ("face N is not a member of
+/// solid M"). The fix scopes the iteration to faces that belong to the
+/// requested solid.
+#[tokio::test]
+async fn gdt_get_gdt_scopes_annotations_to_requested_solid() {
+    let state = make_test_state().await;
+    let (solid_1, top_1) = seed_gdt_plate(&state).await;
+    let (solid_2, top_2) = seed_second_gdt_plate(&state).await;
+
+    // Author one flatness FCF on each solid.
+    for (sid, fid) in [(solid_1, top_1), (solid_2, top_2)] {
+        let req = fcf_post(
+            sid,
+            json!({
+                "characteristic": "flatness",
+                "tolerance_mm": 0.05,
+                "datum_refs": [],
+                "face_id": fid,
+            }),
+        );
+        let (status, body) = dispatch(&state, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "FCF authoring on solid {sid} must succeed; body = {body}"
+        );
+    }
+
+    // GET /gdt for solid 1 must contain EXACTLY 1 annotation — its own.
+    let (status_1, body_1) = dispatch(&state, gdt_get(solid_1)).await;
+    assert_eq!(
+        status_1,
+        StatusCode::OK,
+        "GET /gdt solid 1; body = {body_1}"
+    );
+    assert_eq!(
+        body_1["annotations"].as_array().map(|a| a.len()),
+        Some(1),
+        "solid 1's response must contain exactly its own annotation, \
+         not solid 2's; body = {body_1}"
+    );
+    assert_eq!(
+        body_1["annotations"][0]["verdict"]["conforms"], "in_spec",
+        "solid 1's own annotation must be in_spec (perfect plane); body = {body_1}"
+    );
+
+    // And symmetrically for solid 2.
+    let (status_2, body_2) = dispatch(&state, gdt_get(solid_2)).await;
+    assert_eq!(
+        status_2,
+        StatusCode::OK,
+        "GET /gdt solid 2; body = {body_2}"
+    );
+    assert_eq!(
+        body_2["annotations"].as_array().map(|a| a.len()),
+        Some(1),
+        "solid 2's response must contain exactly its own annotation, \
+         not solid 1's; body = {body_2}"
+    );
+    assert_eq!(
+        body_2["annotations"][0]["verdict"]["conforms"], "in_spec",
+        "solid 2's own annotation must be in_spec (perfect plane); body = {body_2}"
+    );
+}
+
+// ── GET /datums router integration (review S-2) ─────────────────────
+
+/// `GET /api/agent/parts/{id}/datums` end-to-end: after designating
+/// datum "A" on the top face, the response must carry `part_id`, a
+/// one-element `datums` array with label/kind/live resolution, and
+/// `persistence: "session"`.
+#[tokio::test]
+async fn gdt_get_datums_shape_includes_persistence_end_to_end() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    let req_d = datums_post(solid_id, json!({ "label": "A", "face_id": top_face }));
+    let (s_d, _) = dispatch(&state, req_d).await;
+    assert_eq!(s_d, StatusCode::OK, "datum designation must succeed");
+
+    let (status, body) = dispatch(&state, datums_get(solid_id)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /datums must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["persistence"], "session",
+        "persistence must be 'session' end-to-end; body = {body}"
+    );
+    assert_eq!(
+        body["part_id"].as_u64(),
+        Some(solid_id as u64),
+        "part_id must echo the solid id; body = {body}"
+    );
+    assert_eq!(
+        body["datums"].as_array().map(|a| a.len()),
+        Some(1),
+        "datums array must have exactly 1 entry; body = {body}"
+    );
+    let datum = &body["datums"][0];
+    assert_eq!(datum["label"], "A", "label must be 'A'; datum = {datum}");
+    assert_eq!(
+        datum["kind"], "plane",
+        "a planar face must yield kind = plane; datum = {datum}"
+    );
+    assert_eq!(
+        datum["resolution"]["status"], "live",
+        "resolution must be live; datum = {datum}"
+    );
+    assert!(
+        datum["persistent_id"]
+            .as_str()
+            .map(|s| s.len() == 32)
+            .unwrap_or(false),
+        "persistent_id must be a 32-hex-char UUID; datum = {datum}"
+    );
+}
+
+// ── FCF refusal shapes through the router (review S-3) ──────────────
+
+/// An unsupported characteristic string must be refused with 422
+/// `unknown_characteristic` through the live router.
+#[tokio::test]
+async fn gdt_fcf_unknown_characteristic_returns_422() {
+    let state = make_test_state().await;
+    let (solid_id, top_face) = seed_gdt_plate(&state).await;
+
+    let request = fcf_post(
+        solid_id,
+        json!({
+            "characteristic": "runout",
+            "tolerance_mm": 0.05,
+            "datum_refs": [],
+            "face_id": top_face,
+        }),
+    );
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported characteristic must return 422; body = {body}"
+    );
+    assert_eq!(
+        body["error"], "unknown_characteristic",
+        "error field must be 'unknown_characteristic'; body = {body}"
+    );
+    let msg = body["message"].as_str().expect("message must be a string");
+    assert!(
+        msg.contains("runout"),
+        "message must name the rejected characteristic; got {msg:?}"
+    );
+}
+
+/// Designating a face that exists in the model but belongs to a DIFFERENT
+/// solid must be refused with 422 `face_not_in_solid` through the router.
+///
+/// This exercises the `GdtError::FaceNotInSolid` mapping end-to-end.
+#[tokio::test]
+async fn gdt_designate_face_from_other_solid_returns_422() {
+    let state = make_test_state().await;
+    let (solid_1, _top_1) = seed_gdt_plate(&state).await;
+    let (_solid_2, top_2) = seed_second_gdt_plate(&state).await;
+
+    // Try to designate solid 2's face on solid 1's URL.
+    let request = datums_post(solid_1, json!({ "label": "A", "face_id": top_2 }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a face from another solid must be refused with 422; body = {body}"
+    );
+    assert_eq!(
+        body["error"], "face_not_in_solid",
+        "error field must be 'face_not_in_solid'; body = {body}"
     );
 }
