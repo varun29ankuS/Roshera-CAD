@@ -321,6 +321,11 @@ pub struct FeatureControlFrame {
     /// datum-free form family.
     #[serde(default)]
     pub datum_refs: Vec<DatumRef>,
+    /// Basic dimensions [x, y] in millimetres relative to the DRF origin.
+    /// Required for Position; `None` for all other characteristics.
+    /// Serde default omits the field in legacy JSON (additive deserialization).
+    #[serde(default)]
+    pub basic: Option<[f64; 2]>,
 }
 
 impl FeatureControlFrame {
@@ -333,6 +338,39 @@ impl FeatureControlFrame {
             diametral_zone: false,
             modifier: MaterialModifier::Rfs,
             datum_refs: Vec::new(),
+            basic: None,
+        }
+    }
+
+    /// An orientation FCF (perpendicularity/parallelism) referencing datum `label`.
+    pub fn orientation(
+        characteristic: GeometricCharacteristic,
+        tolerance_value: f64,
+        datum_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            characteristic,
+            tolerance_value,
+            diametral_zone: false,
+            modifier: MaterialModifier::Rfs,
+            datum_refs: vec![DatumRef::new(datum_label)],
+            basic: None,
+        }
+    }
+
+    /// A position FCF referencing datum labels (in order) with basic dimensions.
+    pub fn position(
+        tolerance_value: f64,
+        datum_labels: impl IntoIterator<Item = impl Into<String>>,
+        basic: [f64; 2],
+    ) -> Self {
+        Self {
+            characteristic: GeometricCharacteristic::Position,
+            tolerance_value,
+            diametral_zone: true,
+            modifier: MaterialModifier::Rfs,
+            datum_refs: datum_labels.into_iter().map(|l| DatumRef::new(l)).collect(),
+            basic: Some(basic),
         }
     }
 

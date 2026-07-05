@@ -18,8 +18,12 @@
 //! `is_err()`, so a changed error type breaks them.
 
 use geometry_engine::gdt::model::DatumKind;
-use geometry_engine::gdt::{designate_datum, resolve_datum, DatumResolution, GdtError};
-use geometry_engine::math::{Point3, Vector3};
+use geometry_engine::gdt::{
+    designate_datum, evaluate, resolve_datum, Annotation, Conforms, DatumRef, DatumResolution,
+    FeatureControlFrame, GdtError, GeometricCharacteristic, MaterialModifier,
+};
+use geometry_engine::math::{Matrix4, Point3, Vector3};
+use geometry_engine::operations::{transform_solid, TransformOptions};
 use geometry_engine::primitives::face::FaceId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::surface::{Cylinder, Plane};
@@ -520,4 +524,577 @@ fn drf_reverts_with_model_snapshot() {
         "post-snapshot designation must be rolled back with the model"
     );
     assert_eq!(frame.datums[0].label, "A");
+}
+
+// ===========================================================================
+// TASK 2 — The Certified Evaluation
+//
+// Every fixture is RED-first: the hand-computed expected value is written as a
+// comment with the full derivation, and the assert specifies that exact number.
+// A changed formula or a swapped operand makes the test fail.
+//
+// Organisation:
+//  T2-FLAT   — flatness of a true plane = 0
+//  T2-PERP   — perpendicularity: perfect = 0, 0.5°-tilted = 0.2618 mm
+//  T2-PAR    — parallelism:      perfect = 0, 0.5°-tilted = 0.4363 mm
+//  T2-POS    — position RFS: bore at (30.04, 20.03), basic [-20.0, 30.0], = 0.1000 mm
+//  T2-DANGLE — dangling datum → NotEvaluable naming "A"
+//  T2-NOBASIC — position with no basic → NotEvaluable
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// T2-FLAT: flatness of a true analytic plane evaluates to exactly 0.
+//
+// Geometry: 50 × 30 × 10 plate centred at origin. All tessellated points on
+// the top face lie exactly on the plane z = 5 ⟹ signed-distance = 0 ∀ pt
+// ⟹ (hi − lo) = 0.  NotYetVerified is NOT acceptable: the new evaluate() path
+// must return a concrete Conforms::InSpec verdict.
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_flat_perfect_plane_is_zero() {
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("flat".into()));
+    let solid = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(None);
+
+    let top = planar_face_at(&m, solid, 2, 5.0).expect("+Z face at z=5");
+
+    // Designate datum A on the top face (needed to build a valid DRF, even
+    // though flatness is datum-free — we test that evaluate() is the entry
+    // point for Task 2 dispatch, not verify_form_on_face).
+    designate_datum(&mut m, solid, "A", top).expect("designate A");
+    let drf = m.drf.get(&solid).expect("DRF stored").clone();
+
+    // A datum-free flatness FCF — datum_refs is empty so evaluate_fcf routes
+    // through the flatness arm without touching datum resolution.
+    let fcf = FeatureControlFrame::form(GeometricCharacteristic::Flatness, 0.05);
+    let ann = Annotation::Geometric(fcf);
+
+    let verdict = evaluate(&m, solid, top, &ann, &drf);
+
+    // For a perfect analytic box, measured flatness = 0.
+    // Conforms must be InSpec (not NotEvaluable, not OutOfSpec).
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "perfect plane must be InSpec; got {:?}",
+        verdict.conforms
+    );
+    let measured = verdict
+        .measured_mm
+        .expect("flatness must produce a measured value");
+    // Exact zero for a planar face (within floating-point noise from the mesh).
+    assert!(
+        measured < 1e-6,
+        "flatness of perfect plane must be ~0; got {measured:.3e}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-PERP-PERFECT: perpendicularity of a box side face vs. the top face = 0.
+//
+// Geometry: 50 × 30 × 10 plate.
+// Datum A = +Z top face, n_d = +Z.
+// Toleranced = +X side face, n_fit = +X.
+//
+// Formula: W = 2 · R_lat · |n_fit · n_d|
+//          n_fit · n_d = (+X) · (+Z) = 0  ⟹  W = 0  (perfect ⊥)
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_perp_perfect_is_zero() {
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("perp-perf".into()));
+    let solid = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(None);
+
+    let top = planar_face_at(&m, solid, 2, 5.0).expect("+Z face");
+    let px_face = planar_face_at(&m, solid, 0, 25.0).expect("+X face");
+
+    designate_datum(&mut m, solid, "A", top).expect("designate A");
+    let drf = m.drf.get(&solid).expect("DRF").clone();
+
+    let fcf = FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.5, "A");
+    let ann = Annotation::Geometric(fcf);
+
+    let verdict = evaluate(&m, solid, px_face, &ann, &drf);
+
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "perfect ⊥ must be InSpec; got {:?}",
+        verdict.conforms
+    );
+    let measured = verdict
+        .measured_mm
+        .expect("perpendicularity must be measured");
+    // n_fit · n_d = 0 for a perfect right-angle face → W = 0.
+    assert!(
+        measured < 1e-6,
+        "perpendicularity of perfect right-angle face must be ~0; got {measured:.3e}"
+    );
+    // Datum A must appear Live in the status.
+    assert_eq!(verdict.datum_status.len(), 1);
+    assert_eq!(verdict.datum_status[0].label, "A");
+    assert!(
+        matches!(
+            verdict.datum_status[0].resolution,
+            DatumResolution::Live { .. }
+        ),
+        "datum A must be Live"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-PERP-TILTED: perpendicularity of a 0.5°-tilted face vs. a flat datum.
+//
+// Geometry:
+//   solid_ref — 50 × 30 × 10 plate at origin (unrotated).
+//     Datum A = +Z top face at z = 5.  n_d = +Z.
+//   solid_tol — same-sized box, rotated 0.5° around Y.
+//     The +X face has normal ≈ (cos(0.5°), 0, −sin(0.5°)) after rotation.
+//
+// Formula: W = 2 · R_lat · |n_fit · n_d|
+//   sin_alpha = |(cos(α), 0, −sin(α)) · (0, 0, 1)| = |−sin(α)| = sin(0.5°)
+//             ≈ 0.008727 rad
+//   R_lat (points on +X face ⊥ n_d = Z): strip Z from (p − centroid).
+//     +X face spans y ∈ [−15, 15], z ∈ [−5, 5].
+//     Centroid ≈ (25·cos(α), 0, −25·sin(α)).
+//     Lateral (⊥ Z): component (y_i). Max |y_i| = 15.
+//   W = 2 × 15 × sin(0.5°) = 30 × 0.008727 ≈ 0.2618 mm
+//
+// Conformance:
+//   zone = 0.5 mm → InSpec   (0.2618 < 0.5)  ✓
+//   zone = 0.1 mm → OutOfSpec (0.2618 > 0.1)  ✓
+//
+// Mutation proof: the tolerance comparison is `measured <= zone`, so swapping
+// the operands in the formula changes measured from ~0.2618 to a different
+// value and flips at least one of the conform/violate assertions.
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_perp_tilted_half_degree_is_correct() {
+    let alpha = 0.5_f64.to_radians(); // 0.5° in radians
+
+    let mut m = BRepModel::new();
+
+    // Reference plate — datum anchor (never rotated).
+    m.set_event_key(Some("perp-ref".into()));
+    let solid_ref = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("ref plate"));
+    m.set_event_key(None);
+    let ref_top = planar_face_at(&m, solid_ref, 2, 5.0).expect("ref +Z face");
+    designate_datum(&mut m, solid_ref, "A", ref_top).expect("designate A on ref");
+    let drf = m.drf.get(&solid_ref).expect("DRF").clone();
+
+    // Toleranced feature — a second box that is rotated 0.5° around Y.
+    // Capture face IDs BEFORE rotation so we can still reference them afterward.
+    m.set_event_key(Some("perp-tol".into()));
+    let solid_tol = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("tol plate"));
+    m.set_event_key(None);
+    // Capture the +X face ID before rotation.  After transform_solid the FaceId
+    // is unchanged; only the Plane surface's origin and normal are updated.
+    let px_face = planar_face_at(&m, solid_tol, 0, 25.0).expect("+X face before rotation");
+
+    // Apply 0.5° Y-rotation around the world origin.
+    transform_solid(
+        &mut m,
+        solid_tol,
+        Matrix4::rotation_y(alpha),
+        TransformOptions::default(),
+    )
+    .expect("rotation_y");
+
+    // Perpendicularity FCF referencing datum A from solid_ref's DRF.
+    let fcf_conform =
+        FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.5, "A");
+    let ann_conform = Annotation::Geometric(fcf_conform);
+
+    let verdict = evaluate(&m, solid_tol, px_face, &ann_conform, &drf);
+
+    let measured = verdict
+        .measured_mm
+        .expect("tilted face must produce a measured value");
+
+    // Hand-derived expected:  W = 2 × 15 × sin(0.5°) ≈ 0.2618 mm.
+    // Verified: delta = |measured − 0.2618| must be < 1e-3 (numerical noise from
+    // tessellation).
+    let expected = 2.0 * 15.0 * alpha.sin();
+    assert!(
+        (measured - expected).abs() < 1e-3,
+        "tilted perpendicularity: expected ≈{expected:.4} mm, got {measured:.6} mm"
+    );
+
+    // zone = 0.5 mm → InSpec (0.2618 < 0.5).
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "0.5° tilt must be InSpec for zone 0.5 mm; got {:?}",
+        verdict.conforms
+    );
+
+    // Mutation-proof: zone = 0.1 mm → OutOfSpec (0.2618 > 0.1).
+    let fcf_violate =
+        FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.1, "A");
+    let ann_violate = Annotation::Geometric(fcf_violate);
+    let verdict_v = evaluate(&m, solid_tol, px_face, &ann_violate, &drf);
+    assert!(
+        matches!(verdict_v.conforms, Conforms::OutOfSpec),
+        "0.2618 mm must be OutOfSpec for zone 0.1 mm; got {:?}",
+        verdict_v.conforms
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-PAR-PERFECT: parallelism of a box top face vs. bottom-face datum = 0.
+//
+// Geometry: 50 × 30 × 10 plate.
+// Datum A = −Z bottom face, n_d = −Z.
+// Toleranced = +Z top face.
+//
+// Formula: W = max(s_i) − min(s_i)  where  s_i = (p_i − datum_origin) · n_d
+//   For p on top face, z_i = 5.  datum_origin = (0,0,−5).
+//   s_i = (p_i − (0,0,−5)) · (0,0,−1) = −(z_i + 5) = −10  ∀ i  ⟹  W = 0
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_par_perfect_is_zero() {
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("par-perf".into()));
+    let solid = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(None);
+
+    let bottom = planar_face_at(&m, solid, 2, -5.0).expect("−Z face at z=−5");
+    let top = planar_face_at(&m, solid, 2, 5.0).expect("+Z face at z=5");
+
+    designate_datum(&mut m, solid, "A", bottom).expect("designate A");
+    let drf = m.drf.get(&solid).expect("DRF").clone();
+
+    let fcf = FeatureControlFrame::orientation(GeometricCharacteristic::Parallelism, 0.5, "A");
+    let ann = Annotation::Geometric(fcf);
+
+    let verdict = evaluate(&m, solid, top, &ann, &drf);
+
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "perfect || must be InSpec; got {:?}",
+        verdict.conforms
+    );
+    let measured = verdict.measured_mm.expect("parallelism must be measured");
+    // All points on top face project to the same value → spread = 0.
+    assert!(
+        measured < 1e-6,
+        "parallelism of perfect parallel faces must be ~0; got {measured:.3e}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-PAR-TILTED: parallelism of a 0.5°-tilted top face vs. flat bottom datum.
+//
+// Geometry:
+//   solid_ref — datum A = −Z bottom face at z = −5.  n_d = −Z = (0,0,−1).
+//   solid_tol — same 50 × 30 × 10 box, rotated 0.5° around Y.
+//     Top face points: z′ = −x·sin(α) + 5·cos(α),  x ∈ [−25, 25].
+//
+// Formula: W = max(s_i) − min(s_i)  where s_i = (p_i − datum_origin) · n_d
+//   s_i = (p_i − (0,0,−5)) · (0,0,−1) = −(z_i′ + 5)
+//   spread(s_i) = spread(z_i′) = 50 · sin(0.5°) ≈ 50 × 0.008727 ≈ 0.4363 mm
+//
+// Conformance:
+//   zone = 0.5 mm → InSpec   (0.4363 < 0.5)  ✓
+//   zone = 0.2 mm → OutOfSpec (0.4363 > 0.2)  ✓
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_par_tilted_half_degree_is_correct() {
+    let alpha = 0.5_f64.to_radians();
+
+    let mut m = BRepModel::new();
+
+    // Datum reference plate (unrotated).
+    m.set_event_key(Some("par-ref".into()));
+    let solid_ref = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("ref plate"));
+    m.set_event_key(None);
+    let ref_bottom = planar_face_at(&m, solid_ref, 2, -5.0).expect("−Z face");
+    designate_datum(&mut m, solid_ref, "A", ref_bottom).expect("designate A");
+    let drf = m.drf.get(&solid_ref).expect("DRF").clone();
+
+    // Toleranced feature — a rotated box.  Capture top-face ID before rotation.
+    m.set_event_key(Some("par-tol".into()));
+    let solid_tol = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("tol plate"));
+    m.set_event_key(None);
+    let top_face = planar_face_at(&m, solid_tol, 2, 5.0).expect("+Z face before rotation");
+
+    transform_solid(
+        &mut m,
+        solid_tol,
+        Matrix4::rotation_y(alpha),
+        TransformOptions::default(),
+    )
+    .expect("rotation_y");
+
+    // Parallelism FCF.
+    let fcf_conform =
+        FeatureControlFrame::orientation(GeometricCharacteristic::Parallelism, 0.5, "A");
+    let ann_conform = Annotation::Geometric(fcf_conform);
+
+    let verdict = evaluate(&m, solid_tol, top_face, &ann_conform, &drf);
+    let measured = verdict
+        .measured_mm
+        .expect("tilted top face must produce measured value");
+
+    // Hand-derived: W = 50 × sin(0.5°) ≈ 0.4363 mm.
+    let expected = 50.0 * alpha.sin();
+    assert!(
+        (measured - expected).abs() < 1e-3,
+        "tilted parallelism: expected ≈{expected:.4} mm, got {measured:.6} mm"
+    );
+
+    // zone = 0.5 mm → InSpec (0.4363 < 0.5).
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "0.5° tilt vs 0.5 mm zone must be InSpec; got {:?}",
+        verdict.conforms
+    );
+
+    // Mutation-proof: zone = 0.2 mm → OutOfSpec (0.4363 > 0.2).
+    let fcf_violate =
+        FeatureControlFrame::orientation(GeometricCharacteristic::Parallelism, 0.2, "A");
+    let ann_violate = Annotation::Geometric(fcf_violate);
+    let verdict_v = evaluate(&m, solid_tol, top_face, &ann_violate, &drf);
+    assert!(
+        matches!(verdict_v.conforms, Conforms::OutOfSpec),
+        "0.4363 mm must be OutOfSpec for zone 0.2 mm; got {:?}",
+        verdict_v.conforms
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-POS: position RFS of a bore vs. datum A (+Z top face of a plate).
+//
+// DRF frame construction (single Plane datum, n_d = +Z):
+//   z_prime = +Z
+//   x_prime = Vector3::perpendicular(+Z) normalized
+//           = X.cross(+Z).normalize() = (1,0,0)×(0,0,1) = (0,−1,0) = −Y.
+//   y_prime = z_prime × x_prime = (+Z) × (−Y) = (0,0,1)×(0,−1,0) = (1,0,0) = +X.
+//   drf_origin_x = datum_plane_origin · x_prime = (0,0,5)·(0,−1,0) = 0
+//   drf_origin_y = datum_plane_origin · y_prime = (0,0,5)·(1,0,0) = 0
+//
+// Adaptive tessellation note: fine() uses max_angle_deviation = 0.02 rad so
+// ring vertices are NOT perfectly evenly spaced.  The centroid of N non-uniform
+// ring vertices has a systematic error bounded by r × max_angle_step ≈ r × 0.02
+// = 3 × 0.02 = 0.06 mm for radius 3.  We therefore use a deviation that is LARGE
+// relative to this bound:
+//
+//   Bore centre-line at world (d_x, 0, 0), axis = +Z.
+//   axis_intercept at datum plane (z=5): (d_x, 0, 5).
+//   actual_x = (d_x, 0, 5)·(0,−1,0) = 0          (seam in −Y direction, not biasing X)
+//   actual_y = (d_x, 0, 5)·(1,0,0)  = d_x         (centroid.x = d_x, bias-free)
+//
+// Sub-case A — zero deviation: d_x = 0.0, basic = [0.0, 0.0].
+//   Δx = 0, Δy = 0  →  ideal measured = 0 mm.
+//   Adaptive tessellation introduces a systematic error ≤ 2 × 0.06 = 0.12 mm;
+//   assert measured < 0.05 mm (well within spec for zone = 2.0 mm).
+//
+// Sub-case B — d_x = 1.0 mm; basic = [0.0, 0.0].
+//   actual_y = 1.0, Δy = 1.0 → measured = 2 × 1.0 = 2.0 mm.
+//   Systematic error ≈ 0.06 mm → assert within 0.1 mm of 2.0 mm.
+//   zone = 2.2 mm → InSpec   (2.0 < 2.2)  ✓
+//   zone = 1.8 mm → OutOfSpec (2.0 > 1.8) ✓
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_pos_bore_offset_measures_correctly() {
+    let mut m = BRepModel::new();
+
+    // Datum plate: 60 × 60 × 10 centred at origin.  Top face at z = 5.
+    m.set_event_key(Some("pos-datum".into()));
+    let solid_datum = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(60.0, 60.0, 10.0)
+        .expect("datum plate"));
+    m.set_event_key(None);
+    let datum_top = planar_face_at(&m, solid_datum, 2, 5.0).expect("+Z face");
+    designate_datum(&mut m, solid_datum, "A", datum_top).expect("designate A");
+    let drf = m.drf.get(&solid_datum).expect("DRF").clone();
+
+    // ---- Sub-case A: zero-deviation bore centred at (0, 0) ----------------
+    // actual_x = 0, actual_y = 0.  ideal measured = 0.
+    // Adaptive tessellation systematic error ≤ 2 × r × max_angle_dev ≈ 0.12 mm;
+    // assert measured < 0.05 mm (still well in-spec for zone = 2.0 mm).
+    m.set_event_key(Some("bore-zero".into()));
+    let solid_zero = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -5.0), Vector3::Z, 3.0, 10.0)
+        .expect("zero bore"));
+    m.set_event_key(None);
+    let face_zero = cylinder_face(&m, solid_zero).expect("lateral face zero bore");
+
+    let fcf_zero = FeatureControlFrame::position(2.0, ["A"], [0.0, 0.0]);
+    let ann_zero = Annotation::Geometric(fcf_zero);
+    let verdict_zero = evaluate(&m, solid_zero, face_zero, &ann_zero, &drf);
+    let measured_zero = verdict_zero
+        .measured_mm
+        .expect("zero-deviation bore must produce a value");
+    assert!(
+        measured_zero < 0.05,
+        "zero-deviation bore: measured must be small (< 0.05 mm); got {measured_zero:.6} mm"
+    );
+    assert!(
+        matches!(verdict_zero.conforms, Conforms::InSpec),
+        "zero-deviation bore must be InSpec for zone 2.0 mm; got {:?}",
+        verdict_zero.conforms
+    );
+
+    // ---- Sub-case B: bore displaced 1.0 mm in +X world (= y_prime) --------
+    // Deviation is 20× the tessellation systematic error → measured ≈ 2.0 mm
+    // to within 0.1 mm.  actual_y = d_x = 1.0 (centroid.x is seam-unbiased).
+    // Hand-derived: measured = 2 × 1.0 = 2.0 mm.
+    m.set_event_key(Some("bore-off".into()));
+    let solid_off = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(1.0, 0.0, -5.0), Vector3::Z, 3.0, 10.0)
+        .expect("offset bore"));
+    m.set_event_key(None);
+    let face_off = cylinder_face(&m, solid_off).expect("lateral face offset bore");
+
+    let fcf_in = FeatureControlFrame::position(2.2, ["A"], [0.0, 0.0]);
+    let ann_in = Annotation::Geometric(fcf_in);
+    let verdict_in = evaluate(&m, solid_off, face_off, &ann_in, &drf);
+    let measured = verdict_in
+        .measured_mm
+        .expect("offset bore must produce a measured value");
+
+    // actual_y = 1.0 mm exactly (centroid.x = 1.0 for bore centred at x=1.0,
+    // seam in −Y direction never biases centroid.x).  measured ≈ 2.0 mm.
+    assert!(
+        (measured - 2.0).abs() < 0.1,
+        "position measured: expected ≈2.000 mm, got {measured:.6} mm"
+    );
+    assert!(
+        matches!(verdict_in.conforms, Conforms::InSpec),
+        "2.0 mm deviation must be InSpec for zone 2.2 mm; got {:?}",
+        verdict_in.conforms
+    );
+
+    // Mutation-proof: zone = 1.8 mm → OutOfSpec (2.0 > 1.8).
+    let fcf_out = FeatureControlFrame::position(1.8, ["A"], [0.0, 0.0]);
+    let ann_out = Annotation::Geometric(fcf_out);
+    let verdict_out = evaluate(&m, solid_off, face_off, &ann_out, &drf);
+    assert!(
+        matches!(verdict_out.conforms, Conforms::OutOfSpec),
+        "2.0 mm deviation must be OutOfSpec for zone 1.8 mm; got {:?}",
+        verdict_out.conforms
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-DANGLE: a dangling datum (PID removed from the model) → NotEvaluable.
+//
+// The kernel must name the datum label in the reason string so an agent can
+// identify which designation is stale.
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_dangling_datum_yields_not_evaluable_naming_label() {
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("dangle".into()));
+    let solid = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(20.0, 20.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(None);
+
+    let top = planar_face_at(&m, solid, 2, 5.0).expect("+Z face");
+    let px = planar_face_at(&m, solid, 0, 10.0).expect("+X face");
+
+    let datum = designate_datum(&mut m, solid, "A", top).expect("designate A");
+    let drf = m.drf.get(&solid).expect("DRF").clone();
+
+    // Simulate consumption of the datum face (e.g. after a boolean).
+    m.pid_to_face.remove(&datum.feature);
+
+    let fcf = FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.1, "A");
+    let ann = Annotation::Geometric(fcf);
+
+    let verdict = evaluate(&m, solid, px, &ann, &drf);
+
+    match &verdict.conforms {
+        Conforms::NotEvaluable { reason } => {
+            assert!(
+                reason.contains('A') || reason.to_lowercase().contains("dangling"),
+                "NotEvaluable reason must name 'A' or 'dangling'; got: {reason}"
+            );
+        }
+        other => panic!("expected NotEvaluable for dangling datum, got {:?}", other),
+    }
+
+    // The datum_status must record the Dangling resolution.
+    let a_status = verdict
+        .datum_status
+        .iter()
+        .find(|s| s.label == "A")
+        .expect("datum_status must contain A");
+    assert_eq!(
+        a_status.resolution,
+        DatumResolution::Dangling,
+        "datum A must report Dangling in the status"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-NOBASIC: a position FCF with no basic dimensions → NotEvaluable.
+//
+// The honesty contract: `evaluate` must refuse to produce a pass/fail verdict
+// when the information needed for the measurement is missing. The reason must
+// be actionable (mentions "basic").
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_position_without_basic_is_not_evaluable() {
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("nobasic".into()));
+    let solid = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 50.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(None);
+
+    let top = planar_face_at(&m, solid, 2, 5.0).expect("+Z face");
+    designate_datum(&mut m, solid, "A", top).expect("designate A");
+    let drf = m.drf.get(&solid).expect("DRF").clone();
+
+    m.set_event_key(Some("bore-nb".into()));
+    let solid_bore = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(10.0, 10.0, -5.0), Vector3::Z, 4.0, 10.0)
+        .expect("bore"));
+    m.set_event_key(None);
+    let bore_face = cylinder_face(&m, solid_bore).expect("lateral face");
+
+    // Build a position FCF manually with `basic = None` (the honesty gap).
+    // FeatureControlFrame::position always sets basic = Some(_); create a
+    // misauthored one via direct construction.
+    let fcf = FeatureControlFrame {
+        characteristic: GeometricCharacteristic::Position,
+        tolerance_value: 0.1,
+        diametral_zone: true,
+        modifier: MaterialModifier::Rfs,
+        datum_refs: vec![DatumRef::new("A")],
+        basic: None, // deliberately absent
+    };
+    let ann = Annotation::Geometric(fcf);
+
+    let verdict = evaluate(&m, solid_bore, bore_face, &ann, &drf);
+
+    match &verdict.conforms {
+        Conforms::NotEvaluable { reason } => {
+            assert!(
+                reason.to_lowercase().contains("basic"),
+                "reason must mention 'basic'; got: {reason}"
+            );
+        }
+        other => panic!("expected NotEvaluable for missing basic, got {:?}", other),
+    }
+    assert!(
+        verdict.measured_mm.is_none(),
+        "no measurement must be produced when basic is absent"
+    );
 }

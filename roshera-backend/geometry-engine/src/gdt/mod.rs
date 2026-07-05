@@ -46,4 +46,4 @@ pub use model::{
     GeometricCharacteristic, MaterialModifier, ToleranceBound,
 };
 pub use sidecar::GdtSidecar;
-pub use verify::{Conformance, ConformanceResult};
+pub use verify::{evaluate, Conformance, ConformanceResult, Conforms, DatumStatus, Verdict};
