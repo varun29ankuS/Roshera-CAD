@@ -12,7 +12,7 @@ use geometry_engine::drawing::layout::{compute_layout, SheetItemKind};
 use geometry_engine::drawing::{
     build_hole_table, render_drawing_svg, section_slot_rule, standard_drawing_auto, verify_drawing,
     CuttingPlaneLine, Drawing, DrawingIssueKind, Polyline2d, ProjectedView, ProjectedViewId,
-    ProjectionType, SectionSlotRule, Severity, SheetSize, ViewExtent, ViewSource,
+    ProjectionType, SectionSlotRule, SheetSize, ViewExtent, ViewSource,
 };
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
@@ -2660,22 +2660,17 @@ fn gdt_plate_layout_bridge_end_to_end() {
         "FcfBlock layout item must contain tolerance '0.05'"
     );
 
-    // ── GATE 4: quality report — no non-GDT errors ───────────────────────────
-    // The bridge places the datum symbol and FCF block using the same face
-    // anchor on a plate with one face (the top face is both the datum target
-    // and the FCF feature), so they may land in overlapping positions when
-    // the collision ladder exhausts all fallback slots.  The new
-    // `GdtSymbolCollision` invariant (I-new-1) correctly surfaces this;
-    // the verifier MUST not have any OTHER error-severity issues.
+    // ── GATE 4: quality report — full clean pass ─────────────────────────────
+    // The datum symbol and FCF block are on the SAME face (top face is both
+    // datum target and FCF feature), but place_gdt_annotations threads each
+    // successfully-placed GD&T item's bbox into the obstacle set consulted by
+    // subsequent items, so they land in distinct non-overlapping slots.
+    // The plate fixture has ample space and placement MUST succeed without any
+    // GdtSymbolCollision or other error.
     let report = verify_drawing(&drawing);
-    let non_gdt_errors: Vec<_> = report
-        .issues
-        .iter()
-        .filter(|i| i.severity == Severity::Error && i.kind != DrawingIssueKind::GdtSymbolCollision)
-        .collect();
     assert!(
-        non_gdt_errors.is_empty(),
-        "drawing of GD&T'd plate must have no non-GDT errors; issues={:?}",
+        report.passed,
+        "drawing of GD&T'd plate must pass the quality oracle; issues={:?}",
         report.issues
     );
 

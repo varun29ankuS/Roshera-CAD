@@ -1455,14 +1455,6 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
         // Primary position: stored anchor (top-left of the glyph cell).
         let [ax, ay] = fcf.anchor;
 
-        // Four candidate positions: stored, then three offsets.
-        let step = block_h + 2.0;
-        let candidates: [[f64; 2]; 4] = [
-            [ax, ay],
-            [ax, ay - step],
-            [ax, ay + step],
-            [ax + text_w + 4.0, ay],
-        ];
         let bbox_at = |x0: f64, y0: f64| -> Rect2 {
             Rect2 {
                 x0,
@@ -1471,11 +1463,54 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
                 y1: y0 + block_h,
             }
         };
-        let chosen = candidates
+
+        // ── Candidate ladder ─────────────────────────────────────────────
+        // The primary anchor may be degenerate (e.g. when the face normal
+        // projects to zero-length in the chosen view — a Z-normal face in
+        // the TOP view — making the standoff in `attach_gdt_annotations`
+        // collapse to zero, placing the FCF at the same sheet point as the
+        // datum symbol for the same face).  The ladder must escape both the
+        // datum symbol (already in `result`) AND any view geometry by
+        // including candidates anchored OUTSIDE the owner view's geometry rect.
+        //
+        // Phase 1: stored anchor + three close-range offsets (legacy).
+        let step = block_h + 2.0;
+        let phase1: &[[f64; 2]] = &[
+            [ax, ay],
+            [ax, ay - step],
+            [ax, ay + step],
+            [ax + text_w + 4.0, ay],
+        ];
+
+        // Phase 2: candidates anchored to the OUTSIDE of the owner view's
+        // geometry rect — guaranteed clear of view geometry and far enough
+        // from a centrally-placed datum symbol that they escape that too.
+        // `LABEL_GAP` (2 mm) matches the standard standoff used by view labels.
+        let geo_rect = existing.iter().find(|it| {
+            it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(fcf.owner_view)
+        });
+        let phase2: Vec<[f64; 2]> = match geo_rect {
+            Some(gr) => vec![
+                // Above the view — FCF bottom at gr.y0 − LABEL_GAP.
+                [gr.bbox.x0, gr.bbox.y0 - LABEL_GAP - block_h],
+                // Below the view.
+                [gr.bbox.x0, gr.bbox.y1 + LABEL_GAP],
+                // Right of the view.
+                [gr.bbox.x1 + LABEL_GAP, gr.bbox.y0],
+                // Left of the view (right-aligned to the view's left edge).
+                [gr.bbox.x0 - text_w - LABEL_GAP, gr.bbox.y0],
+            ],
+            None => Vec::new(),
+        };
+
+        // Try Phase 1 candidates first, then Phase 2.
+        let chosen = phase1
             .iter()
+            .chain(phase2.iter())
             .find(|&&[x0, y0]| !collides(&bbox_at(x0, y0), &result))
             .copied()
             .unwrap_or([ax, ay]);
+
         let [x0, y0] = chosen;
         result.push(SheetItem {
             kind: SheetItemKind::FcfBlock,
