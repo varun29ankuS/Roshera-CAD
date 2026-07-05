@@ -712,18 +712,25 @@ fn render_datum_marker(out: &mut String, layout: &SheetLayout) {
 fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, layout: &SheetLayout) {
     use super::layout::{GDT_BLOCK_H, GDT_BOX_HALF, GDT_FONT_MM};
 
-    // Build an index from (owner_view, full_text) → leader_to for FCF blocks
-    // so we can look up the leader target in O(1) when rendering.
-    // `full_text()` is the same key both the placement code and the items use
-    // (items carry text = fcf.full_text()).
-    let fcf_leader_map: std::collections::HashMap<(usize, String), [f64; 2]> = drawing
-        .fcf_blocks
-        .iter()
-        .filter_map(|fcf| {
-            fcf.leader_to
-                .map(|lt| ((fcf.owner_view, fcf.full_text()), lt))
-        })
-        .collect();
+    // Build an index from ordering-index → leader_to for FCF blocks.
+    //
+    // Keying by (owner_view, full_text) would silently overwrite duplicate
+    // FCFs that share the same text and view — the second entry wins and the
+    // first gets the wrong leader target.  Keying by the position in
+    // `drawing.fcf_blocks` is always unique.  The layout's FcfBlock items are
+    // emitted in the same order as `drawing.fcf_blocks` by
+    // `place_gdt_annotations`, so the n-th FcfBlock layout item corresponds
+    // to `drawing.fcf_blocks[n]`, and the index below is stable.
+    let fcf_leaders: Vec<Option<[f64; 2]>> =
+        drawing.fcf_blocks.iter().map(|fcf| fcf.leader_to).collect();
+
+    // Track how many FcfBlock items we have rendered so far — used to index
+    // into `fcf_leaders` (which mirrors the ordering of `drawing.fcf_blocks`).
+    // `place_gdt_annotations` emits one FcfBlock item per entry in
+    // `drawing.fcf_blocks`, in the same order, so the n-th FcfBlock item in
+    // the layout corresponds to `drawing.fcf_blocks[n]` and
+    // `fcf_leaders[n]`.
+    let mut fcf_item_idx: usize = 0;
 
     for item in layout
         .items
@@ -809,10 +816,11 @@ fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, lay
                 // ── Leader line (Task 6 fix wave, concern 2) ──────────────
                 // Draw a thin line from the FCF frame's bottom-centre to the
                 // feature-edge location stored in `PlacedFcfBlock::leader_to`.
-                // The house leader style: 0.18 mm, `.gdt-leader` CSS class,
-                // matching section labels and hole-table tags.
-                let key = (item.owner_view.unwrap_or(0), text.to_string());
-                if let Some(&[lx, ly]) = fcf_leader_map.get(&key) {
+                // Keyed by ordering index (not full_text): two identical FCFs
+                // in the same view would previously overwrite each other in a
+                // HashMap keyed by (owner_view, text), routing both leaders to
+                // the second entry's target.  Index is always unique.
+                if let Some(Some([lx, ly])) = fcf_leaders.get(fcf_item_idx) {
                     // Leader origin: bottom-centre of the FCF frame.
                     let lx0 = tx; // already computed as horizontal centre
                     let ly0 = b.y1;
@@ -827,6 +835,7 @@ fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, lay
                         );
                     }
                 }
+                fcf_item_idx += 1;
             }
             _ => {}
         }

@@ -575,17 +575,23 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
     // the GDT_FCF layer, matching the house leader style (thin tier).
     // The filled datum-feature triangle is NOT emitted in DXF (DXF hatch
     // portability constraint — documented in Task 6 concern 3).
-    for fcf in &drawing.fcf_blocks {
-        if let Some([lx, ly_svg]) = fcf.leader_to {
-            // Find the matching FcfBlock layout item to get the frame bbox
-            // (needed for the leader origin = bottom-centre of the frame).
-            let full = fcf.full_text();
-            let frame_item = layout.items.iter().find(|it| {
-                it.kind == SheetItemKind::FcfBlock
-                    && it.owner_view == Some(fcf.owner_view)
-                    && it.text.as_deref() == Some(full.as_str())
-            });
-            if let Some(frame) = frame_item {
+    //
+    // The layout's FcfBlock items are emitted in the same order as
+    // `drawing.fcf_blocks` by `place_gdt_annotations`, so the n-th FcfBlock
+    // layout item corresponds to `drawing.fcf_blocks[n]`.  We key by ordering
+    // index (not by full_text): two identical FCFs in the same view would
+    // otherwise map to the same (owner_view, text) key and the first would get
+    // the second's leader bbox.
+    {
+        let mut fcf_layout_items = layout
+            .items
+            .iter()
+            .filter(|it| it.kind == SheetItemKind::FcfBlock);
+
+        for fcf in &drawing.fcf_blocks {
+            // Advance the layout-item iterator in lock-step with fcf_blocks.
+            let frame_item = fcf_layout_items.next();
+            if let (Some([lx, ly_svg]), Some(frame)) = (fcf.leader_to, frame_item) {
                 let b = &frame.bbox;
                 let lx0 = 0.5 * (b.x0 + b.x1);
                 let ly0_svg = b.y1; // SVG y-down bottom of frame

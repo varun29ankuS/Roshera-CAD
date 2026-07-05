@@ -1357,16 +1357,6 @@ pub(crate) const GDT_BLOCK_H: f64 = 4.6;
 /// Internal horizontal padding inside each FCF cell, mm.
 const GDT_CELL_PAD: f64 = 1.0;
 
-/// Minimum clear distance from the view geometry rect to a placed FCF block, mm.
-///
-/// This is the layout engine's floor: after the collision ladder, the chosen
-/// slot must be at least this far from the visible outline so the frame does
-/// not overlap the part silhouette.  Distinct from `dimensioning.rs`'s
-/// `GDT_ANCHOR_STANDOFF` (12 mm), which is the *initial preferred offset*
-/// along the projected feature normal that the collision ladder starts from.
-/// The 4 mm headroom between them gives the ladder room to step inward.
-const GDT_STANDOFF: f64 = 8.0;
-
 /// Place GD&T datum symbols and FCF blocks from `drawing.datum_symbols` and
 /// `drawing.fcf_blocks` as [`SheetItem`]s.
 ///
@@ -1380,9 +1370,9 @@ const GDT_STANDOFF: f64 = 8.0;
 /// all candidates collide, the stored `anchor` is used as-is (the verifier
 /// will report the overlap honestly — same discipline as view labels).
 ///
-/// Each FCF block is placed `GDT_STANDOFF` mm above the view's geometry
-/// rect (the canonical position for a flatness/perpendicularity callout on
-/// the top face).  Collision fallback applies the same ladder.
+/// Each FCF block is placed relative to its stored `anchor` (the top-left of
+/// the glyph cell, computed at drawing-build time by `attach_gdt_annotations`).
+/// Collision fallback applies the same ladder.
 ///
 /// # Stored annotations only
 ///

@@ -65,6 +65,13 @@ pub enum DrawingIssueKind {
     /// Two view labels (or a view label and another text item) overlap on
     /// the sheet — the viewer cannot read which view is which.
     ViewLabelCollision,
+    /// Two GD&T sheet items (DatumSymbol and/or FcfBlock) overlap each other
+    /// with no ViewLabel in the pair — the annotation is unreadable.
+    ///
+    /// Complements `ViewLabelCollision`: that invariant polices pairs where
+    /// at least one item is a ViewLabel; this one polices GD&T-only pairs
+    /// that would otherwise slip through the `pair_has_label` guard.
+    GdtSymbolCollision,
     /// The same dimension (same quantized value, same orientation, same
     /// measured interval) appears more than once on the sheet, making the
     /// drawing redundant and potentially misleading.
@@ -279,17 +286,23 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
 
     check_alignment(drawing, &layout, &mut issues);
 
-    // ── ViewLabelCollision detection ─────────────────────────────────────
+    // ── ViewLabelCollision + GdtSymbolCollision detection ────────────────
     // Two sub-checks, both using the layout already computed above:
     //
-    // (a) ViewLabel × {ViewLabel | DimensionText | NoteText}: at least one
-    //     item must be a ViewLabel. NoteText items (unit/tolerance/projection
-    //     note lines) are included: they are layout items since Task 8 and
-    //     must not be obscured by view geometry or labels.
+    // (a) ViewLabel × {ViewLabel | DimensionText | NoteText | GD&T items}:
+    //     at least one item must be a ViewLabel → fires ViewLabelCollision.
+    //     NoteText items (unit/tolerance/projection note lines) are included:
+    //     they are layout items since Task 8 and must not be obscured by view
+    //     geometry or labels.
     //     DimText↔DimText collision is handled separately by
     //     check_dimension_label_collisions (DimensionLabelCollision).
     //
-    // (b) ViewLabel × ViewGeometry of a DIFFERENT view: a label legitimately
+    // (b) GD&T × GD&T pairs (DatumSymbol or FcfBlock, NO ViewLabel in pair):
+    //     fires GdtSymbolCollision.  These pairs were previously invisible to
+    //     the verifier because the `pair_has_label` guard short-circuited
+    //     before reaching them — a coverage gap closed here.
+    //
+    // (c) ViewLabel × ViewGeometry of a DIFFERENT view: a label legitimately
     //     sits near its OWN view's geometry (placement avoids it, but same-view
     //     pairing would false-positive on the fallback slots). Cross-view overlap
     //     IS a placement failure — placement treats all geometry rects as
@@ -305,11 +318,6 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
                 // it lives inside the title-block zone, which the view-placement checks
                 // already treat as an obstacle - pairing it here would double-report
                 // every title-block intrusion.
-                //
-                // DatumSymbol and FcfBlock ARE included: they are layout items with
-                // text fields and must not collide with view labels or each other.
-                // The existing ViewLabelCollision invariant covers them automatically
-                // because any pair where one item is a ViewLabel triggers the check.
                 SheetItemKind::ViewLabel
                     | SheetItemKind::DimensionText
                     | SheetItemKind::NoteText
@@ -321,13 +329,33 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
         .collect();
     for i in 0..label_items.len() {
         for j in (i + 1)..label_items.len() {
+            if !label_items[i].bbox.intersects(&label_items[j].bbox, 0.2) {
+                continue;
+            }
             let pair_has_label = label_items[i].kind == SheetItemKind::ViewLabel
                 || label_items[j].kind == SheetItemKind::ViewLabel;
-            if pair_has_label && label_items[i].bbox.intersects(&label_items[j].bbox, 0.2) {
+            let pair_is_gdt = matches!(
+                label_items[i].kind,
+                SheetItemKind::DatumSymbol | SheetItemKind::FcfBlock
+            ) && matches!(
+                label_items[j].kind,
+                SheetItemKind::DatumSymbol | SheetItemKind::FcfBlock
+            );
+            if pair_has_label {
                 issues.push(error(
                     DrawingIssueKind::ViewLabelCollision,
                     format!(
                         "text '{}' collides with '{}'",
+                        label_items[i].text.as_deref().unwrap_or("?"),
+                        label_items[j].text.as_deref().unwrap_or("?")
+                    ),
+                    None,
+                ));
+            } else if pair_is_gdt {
+                issues.push(error(
+                    DrawingIssueKind::GdtSymbolCollision,
+                    format!(
+                        "GD&T annotation '{}' overlaps '{}'",
                         label_items[i].text.as_deref().unwrap_or("?"),
                         label_items[j].text.as_deref().unwrap_or("?")
                     ),

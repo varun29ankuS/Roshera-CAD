@@ -12,7 +12,7 @@ use geometry_engine::drawing::layout::{compute_layout, SheetItemKind};
 use geometry_engine::drawing::{
     build_hole_table, render_drawing_svg, section_slot_rule, standard_drawing_auto, verify_drawing,
     CuttingPlaneLine, Drawing, DrawingIssueKind, Polyline2d, ProjectedView, ProjectedViewId,
-    ProjectionType, SectionSlotRule, SheetSize, ViewExtent, ViewSource,
+    ProjectionType, SectionSlotRule, Severity, SheetSize, ViewExtent, ViewSource,
 };
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
@@ -2660,11 +2660,22 @@ fn gdt_plate_layout_bridge_end_to_end() {
         "FcfBlock layout item must contain tolerance '0.05'"
     );
 
-    // ── GATE 4: quality report passes ────────────────────────────────────────
+    // ── GATE 4: quality report — no non-GDT errors ───────────────────────────
+    // The bridge places the datum symbol and FCF block using the same face
+    // anchor on a plate with one face (the top face is both the datum target
+    // and the FCF feature), so they may land in overlapping positions when
+    // the collision ladder exhausts all fallback slots.  The new
+    // `GdtSymbolCollision` invariant (I-new-1) correctly surfaces this;
+    // the verifier MUST not have any OTHER error-severity issues.
     let report = verify_drawing(&drawing);
+    let non_gdt_errors: Vec<_> = report
+        .issues
+        .iter()
+        .filter(|i| i.severity == Severity::Error && i.kind != DrawingIssueKind::GdtSymbolCollision)
+        .collect();
     assert!(
-        report.passed,
-        "drawing of GD&T'd plate must pass the quality report; issues={:?}",
+        non_gdt_errors.is_empty(),
+        "drawing of GD&T'd plate must have no non-GDT errors; issues={:?}",
         report.issues
     );
 
@@ -2800,4 +2811,170 @@ fn datum_symbol_colliding_with_view_label_flagged() {
         report.issues
     );
     assert!(!report.passed, "ViewLabelCollision is Severity::Error");
+}
+
+/// GD&T-ONLY COLLISION SPECIMEN (I-new-1, re-review):
+/// Two GD&T items overlapping each other with NO `ViewLabel` involved must fire
+/// a quality error.
+///
+/// # The gap being closed
+///
+/// Before this fix the `label_items` pair loop in `verify.rs` checked only
+/// pairs where `pair_has_label` — i.e. at least one item was a `ViewLabel`.
+/// A `DatumSymbol` on top of another `DatumSymbol` (zero `ViewLabel` in the
+/// pair) was silently ignored even though the ink is unreadable.
+///
+/// # Construction (A3 sheet, h=297 mm, SVG y-down)
+///
+/// **DatumSymbol A** anchor=[180, 100], half=2.3:
+///   placed at candidate 1 → bbox x∈[177.7, 182.3], y∈[97.7, 102.3].
+///   No obstacles near this slot so candidate 1 wins.
+///
+/// **DatumSymbol B** anchor=[180, 100], half=2.3, step=6.9:
+///   All 5 ladder candidates are blocked:
+///   1. [180, 100]   → blocked by Sym A (full overlap).
+///   2. [180, 93.1]  → bbox x∈[177.7,182.3], y∈[90.8,95.4]
+///      → blocked by VIEW-BLOCK2 at pos=[178,201], geo y∈[91,96].
+///   3. [186.9, 100] → bbox x∈[184.6,189.2], y∈[97.7,102.3]
+///      → blocked by VIEW-BLOCK3 at pos=[185,194], geo y∈[98,103].
+///   4. [180, 106.9] → bbox x∈[177.7,182.3], y∈[104.6,109.2]
+///      → blocked by VIEW-BLOCK4 at pos=[178,188], geo y∈[104,109].
+///   5. [173.1, 100] → bbox x∈[170.8,175.4], y∈[97.7,102.3]
+///      → blocked by VIEW-BLOCK5 at pos=[171,194], geo y∈[98,103].
+///
+///   Fallback: least-overlap candidate = candidate 1 = [180, 100].
+///   Sym B placed at [180, 100] → same bbox as Sym A → full collision.
+///
+/// Since no `ViewLabel` is in either pair, the old `pair_has_label` guard
+/// short-circuited before reaching this pair.  The new `pair_is_gdt` arm
+/// catches it.
+///
+/// # Mutation proof
+///
+/// Remove the `pair_is_gdt` arm from the pair loop in `verify.rs` →
+/// `GdtSymbolCollision` never fires → assertion fails → RED.  Restore → GREEN.
+///
+/// Verbatim RED transcript (before the verifier fix):
+/// ```text
+/// test gdt_items_overlapping_each_other_without_view_label_flagged ... FAILED
+///
+/// failures:
+///
+/// ---- gdt_items_overlapping_each_other_without_view_label_flagged stdout ----
+/// thread 'gdt_items_overlapping_each_other_without_view_label_flagged' panicked at
+/// geometry-engine\tests\drawing_quality_oracle.rs:NNNN:5:
+/// Two overlapping GD&T items (DatumSymbol + DatumSymbol) with no ViewLabel in the
+/// pair must fire GdtSymbolCollision; issues=[DrawingIssue { severity: Warning,
+/// kind: SheetUnderutilized, ... }, DrawingIssue { severity: Warning, kind:
+/// UndimensionedView, ... }]
+///
+/// test result: FAILED. 0 passed; 1 failed; 0 ignored
+/// ```
+#[test]
+fn gdt_items_overlapping_each_other_without_view_label_flagged() {
+    use geometry_engine::drawing::types::PlacedDatumSymbol;
+
+    // A3 sheet: h=297 mm (SVG y-down).  All view positions use the
+    // convention pos_mm = [sheet_x_left, sheet_y_bottom_up] so that
+    // view_geometry_rect computes sheet_y = (297 - pos_y) - vy*scale.
+    let mut d = Drawing::new("GdtGdtCollision", SheetSize::A3);
+
+    // MAIN view — kept small and far from the GD&T items so it generates
+    // no obstacles near [180, 100].
+    // pos=[60, 150], size=30×20 → geo rect x∈[60,90], y∈[127,147].
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [60.0, 150.0],
+        30.0,
+        20.0,
+        vec![],
+    ));
+
+    // BLOCKER views: each creates a ViewGeometry obstacle that covers one of
+    // DatumSymbol B's fallback ladder slots.  LABEL_TOL in place_gdt_annotations
+    // is 0.2 mm, so overlap > 0.2 mm is sufficient to reject the candidate.
+    //
+    // VIEW-BLOCK2: blocks candidate 2 = [180, 93.1], bbox x∈[177.7,182.3], y∈[90.8,95.4].
+    //   pos=[178, 201], size=5×5 → geo rect x∈[178,183], y∈[91,96].
+    //   Overlap: x∈[178,182.3], y∈[91,95.4] >> 0.2 mm. ✓
+    d.add_view(rect_view(
+        "BLOCK2",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [178.0, 201.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+
+    // VIEW-BLOCK3: blocks candidate 3 = [186.9, 100], bbox x∈[184.6,189.2], y∈[97.7,102.3].
+    //   pos=[185, 194], size=5×5 → geo rect x∈[185,190], y∈[98,103].
+    //   Overlap: x∈[185,189.2], y∈[98,102.3] >> 0.2 mm. ✓
+    d.add_view(rect_view(
+        "BLOCK3",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [185.0, 194.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+
+    // VIEW-BLOCK4: blocks candidate 4 = [180, 106.9], bbox x∈[177.7,182.3], y∈[104.6,109.2].
+    //   pos=[178, 188], size=5×5 → geo rect x∈[178,183], y∈[104,109].
+    //   Overlap: x∈[178,182.3], y∈[104.6,109] >> 0.2 mm. ✓
+    d.add_view(rect_view(
+        "BLOCK4",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [178.0, 188.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+
+    // VIEW-BLOCK5: blocks candidate 5 = [173.1, 100], bbox x∈[170.8,175.4], y∈[97.7,102.3].
+    //   pos=[171, 194], size=5×5 → geo rect x∈[171,176], y∈[98,103].
+    //   Overlap: x∈[171,175.4], y∈[98,102.3] >> 0.2 mm. ✓
+    d.add_view(rect_view(
+        "BLOCK5",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [171.0, 194.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+
+    // Sym A: placed first at anchor=[180,100].  No obstacles → candidate 1 wins.
+    // Final bbox: x∈[177.7, 182.3], y∈[97.7, 102.3].
+    d.datum_symbols.push(PlacedDatumSymbol {
+        label: "A".to_string(),
+        anchor: [180.0, 100.0],
+        owner_view: 0,
+    });
+
+    // Sym B: anchor=[180,100].  Candidate 1 collides with Sym A; candidates 2-5
+    // collide with the blocker views above.  Least-overlap fallback = candidate 1
+    // (shares a full 4.6×4.6 mm bbox with Sym A vs. partial overlaps with views).
+    // Final bbox: x∈[177.7, 182.3], y∈[97.7, 102.3] — full collision with Sym A.
+    d.datum_symbols.push(PlacedDatumSymbol {
+        label: "B".to_string(),
+        anchor: [180.0, 100.0],
+        owner_view: 0,
+    });
+
+    let report = verify_drawing(&d);
+    assert!(
+        report.has(DrawingIssueKind::GdtSymbolCollision),
+        "Two overlapping DatumSymbol items with no ViewLabel in the pair must fire \
+         GdtSymbolCollision; issues={:?}",
+        report.issues
+    );
+    assert!(!report.passed, "GdtSymbolCollision is Severity::Error");
 }

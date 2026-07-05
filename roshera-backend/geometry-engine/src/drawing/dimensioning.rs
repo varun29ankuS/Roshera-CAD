@@ -1116,12 +1116,9 @@ pub(crate) fn attach_gdt_annotations(
             let nv = project_to_view(view.projection, normal_w);
             let len = (nv[0] * nv[0] + nv[1] * nv[1]).sqrt().max(1e-9);
             let (unx, uny) = (nv[0] / len, nv[1] / len);
-            // Initial FCF anchor offset along the projected feature normal.
-            // This is the *preferred* position that the layout collision ladder
-            // in `layout.rs::place_gdt_annotations` starts from.  It is NOT the
-            // same as `layout.rs::GDT_STANDOFF` (8 mm), which is the minimum
-            // clear-of-view-geometry distance the layout engine enforces.  The
-            // extra 4 mm here gives the collision ladder room to step inward.
+            // Initial FCF anchor offset along the projected feature normal —
+            // the preferred starting position that the layout collision ladder
+            // in `layout.rs::place_gdt_annotations` starts from.
             const GDT_ANCHOR_STANDOFF: f64 = 12.0;
             let anchor_v = [
                 vp[0] + unx * GDT_ANCHOR_STANDOFF,
