@@ -102,6 +102,10 @@ pub struct ModelSnapshot {
     /// GD&T annotation sidecar. Keyed by persistent id (also snapshotted), so a
     /// rolled-back op that authored a tolerance is undone with the geometry.
     gdt: crate::gdt::sidecar::GdtSidecar,
+    drf: std::collections::HashMap<
+        crate::primitives::solid::SolidId,
+        crate::gdt::drf::DatumReferenceFrame,
+    >,
     /// Construction-geometry sidecar (FIX 1). Snapshotted so a rolled-back
     /// transform that moved a solid's source sketch is undone in lock-step
     /// with the geometry — otherwise the sketch would stay moved while the
@@ -149,6 +153,7 @@ impl ModelSnapshot {
             pid_to_solid: model.pid_to_solid.clone(),
             root_counter: model.root_counter,
             gdt: model.gdt.clone(),
+            drf: model.drf.clone(),
             solid_construction: model.solid_construction.clone(),
             labels: model.labels.clone(),
         }
@@ -183,6 +188,7 @@ impl ModelSnapshot {
         model.pid_to_solid = self.pid_to_solid;
         model.root_counter = self.root_counter;
         model.gdt = self.gdt;
+        model.drf = self.drf;
         model.solid_construction = self.solid_construction;
         model.labels = self.labels;
     }

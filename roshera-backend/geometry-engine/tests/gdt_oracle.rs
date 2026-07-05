@@ -488,3 +488,36 @@ fn oracle_drf_round_trips_through_json() {
     assert_eq!(back.datums[0].kind, DatumKind::Plane);
     assert_eq!(back.datums[0].feature, datum.feature);
 }
+
+/// C-1 regression (Task 1 review): the DRF sidecar must participate in
+/// model snapshots — a rolled-back operation must NOT leave ghost datum
+/// designations pointing at reverted topology.
+#[test]
+fn drf_reverts_with_model_snapshot() {
+    use geometry_engine::primitives::snapshot::ModelSnapshot;
+
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("snap-plate".into()));
+    let solid = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(None);
+    let top = planar_face_at(&m, solid, 2, 5.0).expect("+Z face");
+    designate_datum(&mut m, solid, "A", top).expect("designate A before snapshot");
+
+    let snap = ModelSnapshot::take(&m);
+
+    // A second designation AFTER the snapshot must vanish on restore.
+    let side = planar_face_at(&m, solid, 0, 25.0).expect("+X face");
+    designate_datum(&mut m, solid, "B", side).expect("designate B after snapshot");
+    assert_eq!(m.drf.get(&solid).map(|f| f.datums.len()), Some(2));
+
+    snap.restore(&mut m);
+    let frame = m.drf.get(&solid).expect("DRF survives restore");
+    assert_eq!(
+        frame.datums.len(),
+        1,
+        "post-snapshot designation must be rolled back with the model"
+    );
+    assert_eq!(frame.datums[0].label, "A");
+}

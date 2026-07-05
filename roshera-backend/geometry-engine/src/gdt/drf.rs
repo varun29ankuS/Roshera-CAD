@@ -244,6 +244,10 @@ pub fn designate_datum(
 ///   direction is the same regardless of face orientation).
 /// * **Point datum**: not yet designated by `designate_datum`; would resolve
 ///   similarly when added.
+/// NOTE (single-solid scope): PID lookup is model-wide — a face that
+/// migrates to ANOTHER solid across a boolean still resolves Live for
+/// the original DRF. Sound while DRFs are used single-solid (Tasks 1-3);
+/// assembly scoping must add a face-in-solid cross-check.
 pub fn resolve_datum(model: &BRepModel, _solid: SolidId, datum: &Datum) -> DatumResolution {
     // PID→FaceId lookup. Missing → Dangling.
     let Some(face_id) = model.face_by_pid(datum.feature) else {
