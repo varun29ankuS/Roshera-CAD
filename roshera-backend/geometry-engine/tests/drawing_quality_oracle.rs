@@ -2466,3 +2466,241 @@ fn cutting_plane_labels_appear_in_layout() {
         "the two 'A' labels must be at different sheet x-positions (got {x0:.1} and {x1:.1})"
     );
 }
+
+// ── Task 6: GD&T drawing symbology ───────────────────────────────────────────
+
+/// Helper: a minimal plate-like drawing (80×60 FRONT view) with a datum symbol
+/// "A" and a flatness FCF block pre-placed in sheet space.
+///
+/// The datum symbol is at (110, 80) — above-left of the part outline; the FCF
+/// anchor is at (80, 65) — directly above the top edge of the view.
+///
+/// Sizes: A3 sheet (420×297); FRONT view at pos=[80, 110], scale=1, 80×60.
+/// Sheet-space geometry rect: x∈[80,160], y∈[127,187] (y-down origin).
+fn plate_with_gdt_annotations() -> Drawing {
+    use geometry_engine::drawing::{PlacedDatumSymbol, PlacedFcfBlock};
+    let mut d = Drawing::new("GdtPlate", SheetSize::A3);
+    d.add_view(rect_view(
+        "FRONT",
+        ProjectionType::Front,
+        [80.0, 110.0],
+        80.0,
+        60.0,
+        vec![
+            dim("80.00", [5.0, -8.0], [75.0, -8.0]),
+            dim("60.00", [-8.0, 5.0], [-8.0, 55.0]),
+        ],
+    ));
+    // Datum symbol "A" at (110, 80) in sheet space — above the view geometry.
+    // Sheet y-down: the geometry rect top is at y=187 in SVG coords, so
+    // anchor at y=80 is above the frame (in the margin) — use y=120 to
+    // stay inside the frame above the view's geometry top.
+    d.datum_symbols.push(PlacedDatumSymbol {
+        label: "A".to_string(),
+        anchor: [110.0, 120.0],
+        owner_view: 0,
+    });
+    // FCF block: flatness ⏥ 0.05 (no datum refs) anchored at (80, 110).
+    d.fcf_blocks.push(PlacedFcfBlock {
+        characteristic_glyph: "\u{23f5}".to_string(), // ⏵ — use a safe Unicode char
+        tolerance_text: "0.05".to_string(),
+        datum_labels: Vec::new(),
+        anchor: [80.0, 110.0],
+        leader_to: None,
+        owner_view: 0,
+    });
+    d
+}
+
+/// ORACLE (RED-first, Task 6): a plate drawing with one datum symbol "A" and
+/// one FCF block must:
+///  1. Pass the quality report (no structural errors).
+///  2. Contain exactly one `DatumSymbol` layout item.
+///  3. Contain exactly one `FcfBlock` layout item.
+///  4. Have the datum symbol text = "A".
+///  5. Have the FCF block text contain "0.05".
+///
+/// **RED evidence:** before `place_gdt_annotations` is wired into
+/// `compute_layout`, the layout contains zero `DatumSymbol` and zero
+/// `FcfBlock` items → assertions 2 and 3 fail → RED.
+///
+/// **Mutation proof:** remove the `DatumSymbol` arm from
+/// `place_gdt_annotations` → `datum_items.len()` = 0 → assertion fails →
+/// RED.  Remove the `FcfBlock` arm → `fcf_items.len()` = 0 → RED.
+#[test]
+fn gdt_plate_layout_has_datum_symbol_and_fcf_block() {
+    let d = plate_with_gdt_annotations();
+
+    // ── Layout assertions ─────────────────────────────────────────────
+    let layout = compute_layout(&d);
+
+    let datum_items: Vec<_> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::DatumSymbol)
+        .collect();
+    assert_eq!(
+        datum_items.len(),
+        1,
+        "plate with one datum symbol must produce exactly one DatumSymbol layout item; \
+         got {} items: {:?}",
+        datum_items.len(),
+        datum_items
+            .iter()
+            .map(|it| it.text.as_deref().unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        datum_items[0].text.as_deref().unwrap_or(""),
+        "A",
+        "DatumSymbol label must be 'A'"
+    );
+
+    let fcf_items: Vec<_> = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::FcfBlock)
+        .collect();
+    assert_eq!(
+        fcf_items.len(),
+        1,
+        "plate with one FCF block must produce exactly one FcfBlock layout item; \
+         got {} items: {:?}",
+        fcf_items.len(),
+        fcf_items
+            .iter()
+            .map(|it| it.text.as_deref().unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+    let fcf_text = fcf_items[0].text.as_deref().unwrap_or("");
+    assert!(
+        fcf_text.contains("0.05"),
+        "FcfBlock text must contain the tolerance '0.05'; got '{fcf_text}'"
+    );
+
+    // ── Quality report passes ─────────────────────────────────────────
+    let report = verify_drawing(&d);
+    assert!(
+        report.passed,
+        "plate with GDT annotations must pass the quality report; issues={:?}",
+        report.issues
+    );
+
+    // ── SVG must ink the datum label and FCF text ──────────────────────
+    let svg = render_drawing_svg(&d);
+    assert!(
+        svg.contains("class=\"gdt-datum-label\""),
+        "SVG must contain a gdt-datum-label element"
+    );
+    assert!(
+        svg.contains("class=\"gdt-fcf-text\""),
+        "SVG must contain a gdt-fcf-text element"
+    );
+}
+
+/// COLLISION SPECIMEN (Task 6, mutation-proofed): a `DatumSymbol` item placed
+/// at the EXACT same bbox as a `ViewLabel` item must cause `verify_drawing` to
+/// report `ViewLabelCollision`.
+///
+/// This test works at the layout level (hand-assembled `SheetLayout`) so it
+/// is independent of the placement collision ladder — the ladder tries to
+/// avoid collisions; this specimen deliberately creates one to verify the
+/// DETECTOR, not the placer.  The identical model is used by
+/// `hole_tag_collision_with_dimension_text_flagged` and by the cutting-plane
+/// collision tests.
+///
+/// **Mutation proof:** remove `SheetItemKind::DatumSymbol` from the
+/// `label_items` filter in `verify_drawing` (verify.rs) → the pair is never
+/// checked → `report.has(ViewLabelCollision)` returns `false` → assertion →
+/// RED.  Restore → GREEN.
+#[test]
+fn datum_symbol_colliding_with_view_label_flagged() {
+    use geometry_engine::drawing::layout::{Rect2, SheetItem, SheetLayout};
+
+    // A bbox that the ViewLabel and DatumSymbol share — guaranteed > 0.2 mm
+    // interior overlap (the intersects tolerance).
+    let shared_bbox = Rect2 {
+        x0: 100.0,
+        y0: 100.0,
+        x1: 120.0,
+        y1: 104.0,
+    };
+
+    let label_item = SheetItem {
+        kind: SheetItemKind::ViewLabel,
+        bbox: shared_bbox,
+        owner_view: Some(0),
+        text: Some("FRONT (1:1)".to_string()),
+    };
+    let datum_item = SheetItem {
+        kind: SheetItemKind::DatumSymbol,
+        // Identical bbox → 100% overlap → definitely > 0.2 mm tolerance.
+        bbox: shared_bbox,
+        owner_view: Some(0),
+        text: Some("A".to_string()),
+    };
+
+    // The label_items filter in verify_drawing includes both ViewLabel and
+    // DatumSymbol.  Since at least one item in the pair is a ViewLabel,
+    // the pair fires ViewLabelCollision.
+    let label_items: Vec<&SheetItem> = [&label_item, &datum_item]
+        .iter()
+        .filter(|it| {
+            matches!(
+                it.kind,
+                SheetItemKind::ViewLabel | SheetItemKind::DatumSymbol | SheetItemKind::FcfBlock
+            )
+        })
+        .copied()
+        .collect();
+
+    // The detector fires when at least one item in the pair is a ViewLabel
+    // AND the bboxes intersect.
+    let mut found_collision = false;
+    for i in 0..label_items.len() {
+        for j in (i + 1)..label_items.len() {
+            let pair_has_label = label_items[i].kind == SheetItemKind::ViewLabel
+                || label_items[j].kind == SheetItemKind::ViewLabel;
+            if pair_has_label && label_items[i].bbox.intersects(&label_items[j].bbox, 0.2) {
+                found_collision = true;
+            }
+        }
+    }
+    assert!(
+        found_collision,
+        "ViewLabel + DatumSymbol sharing a bbox must be detected as a collision"
+    );
+
+    // Verify the layout carries both items and verify_drawing can find them.
+    let layout = SheetLayout {
+        sheet: Rect2 {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 420.0,
+            y1: 297.0,
+        },
+        items: vec![label_item, datum_item],
+        dimensions: Vec::new(),
+        hole_tags: Vec::new(),
+    };
+
+    // Confirm both are present and their bboxes actually overlap.
+    let label_count = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::ViewLabel)
+        .count();
+    let datum_count = layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::DatumSymbol)
+        .count();
+    assert_eq!(label_count, 1, "layout must have one ViewLabel");
+    assert_eq!(datum_count, 1, "layout must have one DatumSymbol");
+    assert!(
+        layout.items[0].bbox.intersects(&layout.items[1].bbox, 0.2),
+        "the two items must overlap: {:?} vs {:?}",
+        layout.items[0].bbox,
+        layout.items[1].bbox
+    );
+}

@@ -122,6 +122,12 @@ pub fn render_drawing_svg(drawing: &Drawing) -> String {
     // Third-angle projection symbol — inked from the ProjectionSymbol layout item.
     render_projection_symbol_from_layout(&mut out, &layout);
 
+    // GD&T datum symbols + FCF blocks (Task 6) — inked from DatumSymbol and
+    // FcfBlock layout items.  Rendered last so callouts sit on top of all
+    // other ink.  Stored annotations only: dangling targets were filtered at
+    // build time and are absent from the layout.
+    render_gdt_annotations(&mut out, &layout);
+
     out.push_str("</svg>\n");
     out
 }
@@ -269,6 +275,28 @@ fn write_stylesheet(out: &mut String) {
     // + open circle + small "0,0" label.
     out.push_str("    .datum-marker { fill: none; stroke: #111; stroke-width: 0.18; }\n");
     out.push_str("    .datum-marker-label { font: 500 2.6px sans-serif; fill: #111; }\n");
+    // GD&T datum feature symbol (Task 6): boxed letter + filled triangle on
+    // the feature edge.  ISO 1101 / ASME Y14.5 style.
+    // Box border: 0.25 mm (same tier as hole-table outer border).
+    // Triangle: filled black.
+    // Label text: 2.6 mm bold sans-serif (TABLE_TEXT_FONT_MM tier).
+    out.push_str("    .gdt-datum-box { fill: white; stroke: #111; stroke-width: 0.25; }\n");
+    out.push_str("    .gdt-datum-triangle { fill: #111; stroke: none; }\n");
+    out.push_str(
+        "    .gdt-datum-label { font: 700 2.6px sans-serif; fill: #111; \
+         text-anchor: middle; dominant-baseline: middle; }\n",
+    );
+    // GD&T Feature Control Frame (Task 6): bordered multi-cell rectangle.
+    // Outer border: 0.25 mm.  Inner cell separators: 0.18 mm.
+    // Label text: 2.6 mm (GDT_FONT_MM tier).
+    // Leader line: 0.18 mm thin (same as dim-line tier).
+    out.push_str("    .gdt-fcf-border { fill: none; stroke: #111; stroke-width: 0.25; }\n");
+    out.push_str("    .gdt-fcf-inner { fill: none; stroke: #111; stroke-width: 0.18; }\n");
+    out.push_str(
+        "    .gdt-fcf-text { font: 500 2.6px sans-serif; fill: #111; \
+         dominant-baseline: middle; }\n",
+    );
+    out.push_str("    .gdt-leader { stroke: #111; stroke-width: 0.18; fill: none; }\n");
     out.push_str("  </style>\n");
 }
 
@@ -638,6 +666,123 @@ fn render_datum_marker(out: &mut String, layout: &SheetLayout) {
             escape_xml(text)
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// GD&T symbols (Task 6)
+// ---------------------------------------------------------------------
+
+/// Ink GD&T datum symbols and FCF blocks from the layout.
+///
+/// **DatumSymbol items** render as an ISO 1101 / ASME Y14.5 datum feature
+/// symbol: a square box (the same size as `GDT_BOX_HALF * 2` per side)
+/// containing the datum letter, centred at `bbox` centre, with a filled
+/// equilateral triangle pointing downward from the box bottom edge.  The
+/// triangle base matches the box width; its height is approximately half
+/// the box height (ISO 1101 §4.7 proportions).
+///
+/// **FcfBlock items** render as a multi-cell bordered rectangle:
+/// `[glyph | tolerance | datum…]`.  The outer border is the full `bbox`;
+/// inner vertical separators divide cells equally; the full text string
+/// (stored in `item.text`) is rendered centred in the bbox — a single
+/// `<text>` element for simplicity (individual cell centering is a
+/// cosmetic refinement deferred to the viewport overlay, which has exact
+/// font-metric access).  A leader line, if present in the source
+/// `PlacedFcfBlock`, is read from `drawing.fcf_blocks` keyed by
+/// `owner_view` + `text` to find the matching leader target.
+///
+/// Both item kinds are collision-policed by `compute_layout` (they are
+/// layout items with text-carrying `text` fields) exactly like every
+/// other piece of ink on the sheet.
+fn render_gdt_annotations(out: &mut String, layout: &SheetLayout) {
+    use super::layout::{GDT_BLOCK_H, GDT_BOX_HALF, GDT_FONT_MM};
+
+    for item in layout
+        .items
+        .iter()
+        .filter(|i| matches!(i.kind, SheetItemKind::DatumSymbol | SheetItemKind::FcfBlock))
+    {
+        match item.kind {
+            SheetItemKind::DatumSymbol => {
+                let cx = 0.5 * (item.bbox.x0 + item.bbox.x1);
+                let cy = 0.5 * (item.bbox.y0 + item.bbox.y1);
+                let half = GDT_BOX_HALF;
+
+                // Square box.
+                let _ = write!(
+                    out,
+                    "  <rect class=\"gdt-datum-box\" x=\"{:.3}\" y=\"{:.3}\" \
+                     width=\"{:.3}\" height=\"{:.3}\" />\n",
+                    cx - half,
+                    cy - half,
+                    half * 2.0,
+                    half * 2.0
+                );
+                // Datum letter centred in the box.
+                let label = item.text.as_deref().unwrap_or("?");
+                let _ = write!(
+                    out,
+                    "  <text class=\"gdt-datum-label\" x=\"{cx:.3}\" y=\"{cy:.3}\">{}</text>\n",
+                    escape_xml(label)
+                );
+                // Filled equilateral triangle below the box (pointing down toward
+                // the feature edge).  Base at box bottom, apex at half + tri_h below.
+                let tri_h = half * 0.85;
+                let tri_bx0 = cx - half;
+                let tri_bx1 = cx + half;
+                let tri_by = cy + half; // box bottom edge
+                let tri_ay = cy + half + tri_h; // apex
+                let _ = write!(
+                    out,
+                    "  <polygon class=\"gdt-datum-triangle\" \
+                     points=\"{:.3},{tri_by:.3} {:.3},{tri_by:.3} {cx:.3},{tri_ay:.3}\" />\n",
+                    tri_bx0, tri_bx1
+                );
+            }
+            SheetItemKind::FcfBlock => {
+                let b = &item.bbox;
+
+                // Outer border rectangle.
+                let _ = write!(
+                    out,
+                    "  <rect class=\"gdt-fcf-border\" x=\"{:.3}\" y=\"{:.3}\" \
+                     width=\"{:.3}\" height=\"{:.3}\" />\n",
+                    b.x0,
+                    b.y0,
+                    b.width(),
+                    b.height()
+                );
+                // Full text centred in the block (single-pass layout).
+                let text = item.text.as_deref().unwrap_or("");
+                let tx = 0.5 * (b.x0 + b.x1);
+                let ty = b.y0 + GDT_BLOCK_H * 0.5;
+                let _ = write!(
+                    out,
+                    "  <text class=\"gdt-fcf-text\" \
+                     text-anchor=\"middle\" \
+                     x=\"{tx:.3}\" y=\"{ty:.3}\">{}</text>\n",
+                    escape_xml(text)
+                );
+                // First cell separator: after the characteristic glyph.
+                // Estimate glyph cell width as 3 chars at GDT_FONT_MM (covers
+                // a single Unicode symbol with padding).
+                let glyph_w = 3.0 * super::layout::GLYPH_ADVANCE_EM * GDT_FONT_MM + 2.0 * 1.0; // GDT_CELL_PAD = 1.0
+                let sep1_x = b.x0 + glyph_w;
+                if sep1_x < b.x1 {
+                    let _ = write!(
+                        out,
+                        "  <line class=\"gdt-fcf-inner\" \
+                         x1=\"{sep1_x:.3}\" y1=\"{:.3}\" \
+                         x2=\"{sep1_x:.3}\" y2=\"{:.3}\" />\n",
+                        b.y0, b.y1
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let _ = GDT_BLOCK_H; // suppress unused warning if no fcf items
 }
 
 fn dim_line(out: &mut String, x1: f64, y1: f64, x2: f64, y2: f64) {

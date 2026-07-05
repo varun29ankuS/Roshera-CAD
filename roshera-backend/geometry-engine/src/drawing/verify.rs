@@ -305,10 +305,17 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
                 // it lives inside the title-block zone, which the view-placement checks
                 // already treat as an obstacle - pairing it here would double-report
                 // every title-block intrusion.
+                //
+                // DatumSymbol and FcfBlock ARE included: they are layout items with
+                // text fields and must not collide with view labels or each other.
+                // The existing ViewLabelCollision invariant covers them automatically
+                // because any pair where one item is a ViewLabel triggers the check.
                 SheetItemKind::ViewLabel
                     | SheetItemKind::DimensionText
                     | SheetItemKind::NoteText
                     | SheetItemKind::CuttingPlaneLabel
+                    | SheetItemKind::DatumSymbol
+                    | SheetItemKind::FcfBlock
             )
         })
         .collect();

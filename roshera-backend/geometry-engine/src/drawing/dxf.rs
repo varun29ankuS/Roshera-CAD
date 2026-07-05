@@ -66,6 +66,10 @@ const LAYER_DIMENSIONS: &str = "DIMENSIONS";
 const LAYER_HOLE_TAGS: &str = "HOLE_TAGS";
 /// Layer for hole-table border LWPOLYLINE entities and cell TEXT entities.
 const LAYER_HOLE_TABLE: &str = "HOLE_TABLE";
+/// Layer for GD&T datum feature symbol TEXT and LWPOLYLINE entities (Task 6).
+const LAYER_GDT_DATUM: &str = "GDT_DATUM";
+/// Layer for GD&T Feature Control Frame TEXT and LWPOLYLINE entities (Task 6).
+const LAYER_GDT_FCF: &str = "GDT_FCF";
 
 // AutoCAD Color Index (ACI) values used for layer colours. ACI 7 is
 // the "ByLayer" default that renders black on a white background and
@@ -112,6 +116,8 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     register_layer(&mut dxf, LAYER_DIMENSIONS, ACI_BLACK);
     register_layer(&mut dxf, LAYER_HOLE_TAGS, ACI_BLACK);
     register_layer(&mut dxf, LAYER_HOLE_TABLE, ACI_BLACK);
+    register_layer(&mut dxf, LAYER_GDT_DATUM, ACI_BLACK);
+    register_layer(&mut dxf, LAYER_GDT_FCF, ACI_BLACK);
     // One layer per view, named after the view. Duplicate names are
     // resolved by suffixing with an index — AutoCAD requires layer
     // names to be unique, and two views legitimately can share a
@@ -451,6 +457,113 @@ fn emit_labels_from_layout(dxf: &mut DxfDrawing, drawing: &Drawing, sheet_h: f64
             .collect();
         let mut common = EntityCommon::default();
         common.layer = LAYER_HOLE_TABLE.to_string();
+        let mut ent = Entity::new(EntityType::LwPolyline(lw));
+        ent.common = common;
+        dxf.add_entity(ent);
+    }
+
+    // ── GD&T datum symbols (Task 6) ───────────────────────────────────────
+    // Each DatumSymbol item emits: a TEXT entity for the label (centred in
+    // the bbox), and an LWPOLYLINE rectangle for the datum box border.
+    // The filled triangle is omitted in DXF (no hatch entity for portability);
+    // the box + label is sufficient for CAD import / re-editing.
+    // y_dxf = sheet_h − y_svg (y-up conversion).
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::DatumSymbol)
+    {
+        let b = &item.bbox;
+        let cx = 0.5 * (b.x0 + b.x1);
+        let cy_svg = 0.5 * (b.y0 + b.y1);
+        let cy = sheet_h - cy_svg;
+        let text = item.text.as_deref().unwrap_or("?");
+        // Centred TEXT for the label.
+        add_text(
+            dxf,
+            LAYER_GDT_DATUM,
+            cx,
+            cy,
+            2.6, // GDT_FONT_MM
+            0.0,
+            text,
+            HorizontalTextJustification::Center,
+        );
+        // Datum box border LWPOLYLINE (closed rectangle).
+        // DXF y-up: y_bottom = sheet_h − b.y1, y_top = sheet_h − b.y0.
+        let y_bottom = sheet_h - b.y1;
+        let y_top = sheet_h - b.y0;
+        let mut lw = LwPolyline::default();
+        let corners = [
+            (b.x0, y_bottom),
+            (b.x1, y_bottom),
+            (b.x1, y_top),
+            (b.x0, y_top),
+            (b.x0, y_bottom),
+        ];
+        lw.vertices = corners
+            .iter()
+            .map(|&(x, y)| {
+                let mut v = LwPolylineVertex::default();
+                v.x = x;
+                v.y = y;
+                v
+            })
+            .collect();
+        let mut common = EntityCommon::default();
+        common.layer = LAYER_GDT_DATUM.to_string();
+        let mut ent = Entity::new(EntityType::LwPolyline(lw));
+        ent.common = common;
+        dxf.add_entity(ent);
+    }
+
+    // ── GD&T FCF blocks (Task 6) ──────────────────────────────────────────
+    // Each FcfBlock item emits: a TEXT entity (centred in the bbox) and an
+    // LWPOLYLINE rectangle for the outer border.  Inner cell separators are
+    // omitted for DXF portability (the text is the critical information).
+    // y_dxf = sheet_h − y_svg.
+    for item in layout
+        .items
+        .iter()
+        .filter(|it| it.kind == SheetItemKind::FcfBlock)
+    {
+        let b = &item.bbox;
+        let cx = 0.5 * (b.x0 + b.x1);
+        let cy_svg = 0.5 * (b.y0 + b.y1);
+        let cy = sheet_h - cy_svg;
+        let text = item.text.as_deref().unwrap_or("");
+        add_text(
+            dxf,
+            LAYER_GDT_FCF,
+            cx,
+            cy,
+            2.6, // GDT_FONT_MM
+            0.0,
+            text,
+            HorizontalTextJustification::Center,
+        );
+        // Outer border LWPOLYLINE.
+        let y_bottom = sheet_h - b.y1;
+        let y_top = sheet_h - b.y0;
+        let mut lw = LwPolyline::default();
+        let corners = [
+            (b.x0, y_bottom),
+            (b.x1, y_bottom),
+            (b.x1, y_top),
+            (b.x0, y_top),
+            (b.x0, y_bottom),
+        ];
+        lw.vertices = corners
+            .iter()
+            .map(|&(x, y)| {
+                let mut v = LwPolylineVertex::default();
+                v.x = x;
+                v.y = y;
+                v
+            })
+            .collect();
+        let mut common = EntityCommon::default();
+        common.layer = LAYER_GDT_FCF.to_string();
         let mut ent = Entity::new(EntityType::LwPolyline(lw));
         ent.common = common;
         dxf.add_entity(ent);

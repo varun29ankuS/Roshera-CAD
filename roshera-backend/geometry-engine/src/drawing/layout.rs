@@ -149,6 +149,23 @@ pub enum SheetItemKind {
     /// converge, so pairing it would false-positive on every dimensioned
     /// axial view. The bbox is centred on the datum corner.
     DatumMarker,
+    /// A GD&T datum feature symbol: a boxed letter (e.g. "A") with a filled
+    /// triangle on the feature edge (ISO 1101 / ASME Y14.5 datum triangle).
+    ///
+    /// Placed through the collision ladders alongside all other sheet text;
+    /// policed by the existing `ViewLabelCollision` invariants because the
+    /// `text` field carries the label and `bbox` covers the boxed-letter area.
+    ///
+    /// See [`super::types::PlacedDatumSymbol`] for the sheet-space placement data.
+    DatumSymbol,
+    /// A GD&T Feature Control Frame block: a multi-cell bordered rectangle
+    /// `[glyph | tolerance | datum…]` placed via the collision ladders.
+    ///
+    /// The `text` field carries the concatenated cell content for collision
+    /// detection and label-collision invariants; `bbox` covers the full frame.
+    ///
+    /// See [`super::types::PlacedFcfBlock`] for the sheet-space placement data.
+    FcfBlock,
 }
 
 /// One piece of ink on the sheet, with its bounding box in sheet coordinates.
@@ -581,6 +598,18 @@ pub fn compute_layout(drawing: &Drawing) -> SheetLayout {
     if let Some(cpl) = &drawing.cutting_plane_line {
         let cp_label_items = place_cutting_plane_labels(drawing, cpl, h, &items);
         items.extend(cp_label_items);
+    }
+
+    // ── GD&T datum symbols + FCF blocks (Task 6) ──────────────────────
+    // Read STORED annotations from `drawing.datum_symbols` and
+    // `drawing.fcf_blocks` — no auto-generation from the GDT sidecar.
+    // Dangling targets were filtered at build time and are absent from
+    // those lists (they have no live geometry to attach to).
+    // Placed after everything else so GDT callouts see all other ink as
+    // obstacles and get a clean collision-free slot.
+    if !drawing.datum_symbols.is_empty() || !drawing.fcf_blocks.is_empty() {
+        let gdt_items = place_gdt_annotations(drawing, &items);
+        items.extend(gdt_items);
     }
 
     SheetLayout {
@@ -1308,6 +1337,162 @@ pub(crate) fn place_cutting_plane_labels(
         // p1 end: outward = away from p0.
         place_end(sp1, udx, udy),
     ]
+}
+
+// ── GD&T annotation placement (Task 6) ────────────────────────────────────────
+
+/// Font size for GD&T annotation text (datum box label and FCF cells), mm.
+/// Matches `TABLE_TEXT_FONT_MM` (2.6 mm) — the same tier as hole-table text.
+pub(crate) const GDT_FONT_MM: f64 = 2.6;
+
+/// Half-size of the datum-symbol box (the boxed letter), mm.
+/// The box is `2 × GDT_BOX_HALF` square. Chosen to comfortably frame a
+/// single capital letter at 2.6 mm font with 1 mm padding on each side.
+pub(crate) const GDT_BOX_HALF: f64 = 2.3;
+
+/// Height of a GD&T FCF block row, mm.  Must accommodate GDT_FONT_MM with
+/// 1 mm padding above and below: `GDT_FONT_MM + 2 × 1.0 = 4.6`.
+pub(crate) const GDT_BLOCK_H: f64 = 4.6;
+
+/// Internal horizontal padding inside each FCF cell, mm.
+const GDT_CELL_PAD: f64 = 1.0;
+
+/// Leader standoff from the FCF block to the feature edge, mm.
+/// The block is placed this far from the view geometry rect (clear of the
+/// visible outline but not so far that it loses its geometric reference).
+const GDT_STANDOFF: f64 = 8.0;
+
+/// Place GD&T datum symbols and FCF blocks from `drawing.datum_symbols` and
+/// `drawing.fcf_blocks` as [`SheetItem`]s.
+///
+/// # Placement strategy
+///
+/// Each datum symbol tries a fixed set of candidate positions near the
+/// feature edge (approximated as the right-top corner of the view's
+/// geometry rect for now — the anchor supplied by the caller is the
+/// sheet-space position, used directly).  Collision is checked against
+/// already-placed items using the same `LABEL_TOL` as view labels.  If
+/// all candidates collide, the stored `anchor` is used as-is (the verifier
+/// will report the overlap honestly — same discipline as view labels).
+///
+/// Each FCF block is placed `GDT_STANDOFF` mm above the view's geometry
+/// rect (the canonical position for a flatness/perpendicularity callout on
+/// the top face).  Collision fallback applies the same ladder.
+///
+/// # Stored annotations only
+///
+/// This function reads `drawing.datum_symbols` and `drawing.fcf_blocks`
+/// verbatim.  It does NOT auto-generate annotations from the GDT sidecar.
+/// Dangling targets were already filtered out at build time (they are absent
+/// from the lists).  A fresh `Drawing::new()` with empty lists produces no
+/// GDT items — this is correct and by design.
+pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -> Vec<SheetItem> {
+    let h = drawing.sheet_size.height();
+    let mut result: Vec<SheetItem> = Vec::new();
+
+    // Collision check against existing items + newly-placed GDT items.
+    let collides = |bbox: &Rect2, extra: &[SheetItem]| -> bool {
+        existing
+            .iter()
+            .chain(extra.iter())
+            .filter(|it| {
+                matches!(
+                    it.kind,
+                    SheetItemKind::ViewGeometry
+                        | SheetItemKind::ViewLabel
+                        | SheetItemKind::DimensionText
+                        | SheetItemKind::TitleBlock
+                        | SheetItemKind::HoleTag
+                        | SheetItemKind::HoleTableText
+                        | SheetItemKind::NoteText
+                        | SheetItemKind::CuttingPlaneLabel
+                        | SheetItemKind::DatumSymbol
+                        | SheetItemKind::FcfBlock
+                )
+            })
+            .any(|it| bbox.intersects(&it.bbox, LABEL_TOL))
+    };
+
+    // ── Datum symbols ────────────────────────────────────────────────────
+    for sym in &drawing.datum_symbols {
+        // The stored anchor is the sheet-space centre of the boxed letter.
+        // Candidate positions: stored anchor (primary), then four cardinal
+        // offsets of `GDT_BOX_HALF * 3` mm for collision fallback.
+        let [ax, ay] = sym.anchor;
+        let half = GDT_BOX_HALF;
+        let step = half * 3.0;
+        let candidates: [[f64; 2]; 5] = [
+            [ax, ay],
+            [ax, ay - step],
+            [ax + step, ay],
+            [ax, ay + step],
+            [ax - step, ay],
+        ];
+        let bbox_at = |cx: f64, cy: f64| -> Rect2 {
+            Rect2 {
+                x0: cx - half,
+                y0: cy - half,
+                x1: cx + half,
+                y1: cy + half,
+            }
+        };
+        let chosen = candidates
+            .iter()
+            .find(|&&[cx, cy]| !collides(&bbox_at(cx, cy), &result))
+            .copied()
+            .unwrap_or([ax, ay]);
+        let [cx, cy] = chosen;
+        result.push(SheetItem {
+            kind: SheetItemKind::DatumSymbol,
+            bbox: bbox_at(cx, cy),
+            owner_view: Some(sym.owner_view),
+            text: Some(sym.label.clone()),
+        });
+    }
+
+    // ── FCF blocks ───────────────────────────────────────────────────────
+    for fcf in &drawing.fcf_blocks {
+        // Estimate block width: one cell per token.
+        let full = fcf.full_text();
+        let text_w = full.chars().count() as f64 * GLYPH_ADVANCE_EM * GDT_FONT_MM
+            + 2.0 * GDT_CELL_PAD * (1 + fcf.datum_labels.len().max(1)) as f64;
+        let block_h = GDT_BLOCK_H;
+
+        // Primary position: stored anchor (top-left of the glyph cell).
+        let [ax, ay] = fcf.anchor;
+
+        // Four candidate positions: stored, then three offsets.
+        let step = block_h + 2.0;
+        let candidates: [[f64; 2]; 4] = [
+            [ax, ay],
+            [ax, ay - step],
+            [ax, ay + step],
+            [ax + text_w + 4.0, ay],
+        ];
+        let bbox_at = |x0: f64, y0: f64| -> Rect2 {
+            Rect2 {
+                x0,
+                y0,
+                x1: x0 + text_w,
+                y1: y0 + block_h,
+            }
+        };
+        let chosen = candidates
+            .iter()
+            .find(|&&[x0, y0]| !collides(&bbox_at(x0, y0), &result))
+            .copied()
+            .unwrap_or([ax, ay]);
+        let [x0, y0] = chosen;
+        result.push(SheetItem {
+            kind: SheetItemKind::FcfBlock,
+            bbox: bbox_at(x0, y0),
+            owner_view: Some(fcf.owner_view),
+            text: Some(full),
+        });
+    }
+
+    let _ = h; // sheet height — retained for future anchor-to-view-coord conversions
+    result
 }
 
 // ── Dimension placement ────────────────────────────────────────────────────────

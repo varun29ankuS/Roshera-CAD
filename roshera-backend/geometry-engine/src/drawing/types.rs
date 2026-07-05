@@ -380,6 +380,77 @@ impl Default for TitleBlock {
     }
 }
 
+// ── GD&T sheet annotations ────────────────────────────────────────────────────
+
+/// A datum feature symbol placed on a drawing sheet.
+///
+/// The symbol consists of:
+/// - A boxed letter (e.g. "A") anchored to a feature edge in the view.
+/// - A small filled triangle pointing from the box toward the feature edge.
+///
+/// `anchor` is in sheet space (SVG y-down, mm). The datum triangle points
+/// from `anchor` toward the feature edge; the box is drawn at `anchor`.
+///
+/// **Stored annotations only** — the drawing pipeline iterates the GDT
+/// sidecar/DRF at build time and writes these items; the renderer reads them.
+/// Dangling targets (the feature's PID resolves to nothing) are SKIPPED at
+/// build time and never appear here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacedDatumSymbol {
+    /// Datum label letter, e.g. `"A"`, `"B"`, `"C"`.
+    pub label: String,
+    /// Sheet-space anchor point (centre of the boxed letter), mm.
+    pub anchor: [f64; 2],
+    /// Index into `Drawing.views` of the view this annotation belongs to.
+    pub owner_view: usize,
+}
+
+/// A Feature Control Frame (FCF) placed on a drawing sheet.
+///
+/// The FCF is a multi-cell bordered frame: `[glyph | tolerance | datum…]`.
+/// Cells are separated by thin vertical lines; the outer border is the full
+/// frame bbox. A leader line runs from `leader_from` to `leader_to`, giving
+/// the feature edge the callout points at.
+///
+/// `anchor` is in sheet space (SVG y-down, mm): the top-left corner of the
+/// first (glyph) cell.
+///
+/// **Stored annotations only** — same build-time-only contract as
+/// [`PlacedDatumSymbol`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacedFcfBlock {
+    /// GD&T characteristic glyph, e.g. `"⏥"` (flatness), `"⊥"` (perp),
+    /// `"∥"` (parallelism), `"⌖"` (position).
+    pub characteristic_glyph: String,
+    /// Tolerance value rendered as a string with canonical units formatting.
+    pub tolerance_text: String,
+    /// Datum reference letters in order, e.g. `["A"]`, `["A", "B"]`. Empty
+    /// for datum-free form tolerances (flatness, cylindricity…).
+    pub datum_labels: Vec<String>,
+    /// Sheet-space anchor: top-left of the glyph cell, mm.
+    pub anchor: [f64; 2],
+    /// Sheet-space endpoint of the leader that originates from the FCF frame.
+    /// When `None` the block has no leader (e.g. the feature is obvious from
+    /// context, or the view is too small to route one cleanly).
+    pub leader_to: Option<[f64; 2]>,
+    /// Index into `Drawing.views` of the view this annotation belongs to.
+    pub owner_view: usize,
+}
+
+impl PlacedFcfBlock {
+    /// Full text content of the FCF frame, concatenated for bbox estimation.
+    pub fn full_text(&self) -> String {
+        let mut s = self.characteristic_glyph.clone();
+        s.push(' ');
+        s.push_str(&self.tolerance_text);
+        for d in &self.datum_labels {
+            s.push(' ');
+            s.push_str(d);
+        }
+        s
+    }
+}
+
 /// A drawing document — a collection of [`ProjectedView`]s on a single
 /// sheet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +497,24 @@ pub struct Drawing {
     /// serialised drawings (pre-Task-9) parsing cleanly.
     #[serde(default)]
     pub cutting_plane_line: Option<super::dimensioning::CuttingPlaneLine>,
+    /// GD&T datum feature symbols placed on this sheet (Task 6).
+    ///
+    /// Populated at drawing build time by iterating the GDT sidecar/DRF for
+    /// the drawn solid and converting each datum designation into a sheet-space
+    /// `PlacedDatumSymbol`.  The renderer reads these items directly; it does
+    /// not re-consult the sidecar.  Dangling targets (PID resolves to nothing
+    /// at build time) are SKIPPED — they never appear in this list.
+    /// `serde(default)` keeps older serialised drawings (pre-Task-6) parsing.
+    #[serde(default)]
+    pub datum_symbols: Vec<PlacedDatumSymbol>,
+    /// GD&T Feature Control Frame blocks placed on this sheet (Task 6).
+    ///
+    /// Same build-time-only contract as `datum_symbols`: the sidecar is read
+    /// once at build time, items are placed via the collision ladders, and the
+    /// renderer inks exactly what is here.  Dangling annotation targets are
+    /// SKIPPED (no live feature → no sheet ink).
+    #[serde(default)]
+    pub fcf_blocks: Vec<PlacedFcfBlock>,
 }
 
 impl Drawing {
@@ -450,6 +539,8 @@ impl Drawing {
             hole_sites: Vec::new(),
             axial_view_idx: None,
             cutting_plane_line: None,
+            datum_symbols: Vec::new(),
+            fcf_blocks: Vec::new(),
         }
     }
 
