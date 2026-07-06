@@ -401,3 +401,144 @@ fn box_corner_mixed_kind_topology_hash_order_invariant() {
         "chamfer-first and fillet-first must produce structurally identical solids"
     );
 }
+
+/// Task 3A (3B review finding M5) — affirmative pin of the **2C1F**
+/// first-call retraction: two chamfered edges + one filleted edge on
+/// the same box corner, in BOTH call orders, with blocking validation
+/// (`validate_result: true`) at EVERY call. The chamfer-first order's
+/// first call exercises `retract_partial_two_chamfer_corner`
+/// (chamfer.rs first-call arm); the fillet-first order's finalize
+/// exercises `retract_mixed_2c1f_corner`'s fresh-rim path. Both must
+/// pass the B1/fort validators without any carve-out widening, close
+/// watertight, and hash order-invariant — the genuine-green evidence
+/// that the 2C1F retraction is honest end-to-end, not merely
+/// "fails later than it used to".
+#[test]
+fn box_corner_2c1f_order_invariant_watertight_under_blocking_validation() {
+    // Order A: chamfer-first — two edges beveled with the opt-in,
+    // then the third edge filleted (auto-detected finalize).
+    let mut model_a = BRepModel::new();
+    let solid_a = make_cube(&mut model_a, BOX_SIZE);
+    let edges_a = corner_edges(&model_a);
+    let corner_a = vertex_at(&model_a, HALF_BOX, HALF_BOX, HALF_BOX);
+    chamfer_edges(
+        &mut model_a,
+        solid_a,
+        vec![edges_a[0], edges_a[1]],
+        chamfer_opts_with_partial_corner(D, vec![corner_a]),
+    )
+    .expect("2C1F order A: first chamfer (two edges) passes blocking validation");
+    fillet_edges(
+        &mut model_a,
+        solid_a,
+        vec![edges_a[2]],
+        fillet_opts_constant(D),
+    )
+    .expect("2C1F order A: second fillet closes the corner under blocking validation");
+    assert_eq!(
+        non_manifold_edge_count(&model_a, solid_a),
+        0,
+        "2C1F chamfer-first final state must be watertight"
+    );
+    let (va, ea, fa) = shell_census(&model_a, solid_a);
+    assert_eq!(
+        va as i64 - ea as i64 + fa as i64,
+        2,
+        "2C1F chamfer-first Euler-Poincaré census"
+    );
+    let hash_a = topology_hash(&model_a, solid_a);
+
+    // Order B: fillet-first — one edge filleted with the opt-in,
+    // then the remaining two edges beveled (auto-detected finalize).
+    let mut model_b = BRepModel::new();
+    let solid_b = make_cube(&mut model_b, BOX_SIZE);
+    let edges_b = corner_edges(&model_b);
+    let corner_b = vertex_at(&model_b, HALF_BOX, HALF_BOX, HALF_BOX);
+    fillet_edges(
+        &mut model_b,
+        solid_b,
+        vec![edges_b[2]],
+        fillet_opts_with_partial_corner(D, vec![corner_b]),
+    )
+    .expect("2C1F order B: first fillet (one edge) passes blocking validation");
+    chamfer_edges(
+        &mut model_b,
+        solid_b,
+        vec![edges_b[0], edges_b[1]],
+        chamfer_opts_equal(D),
+    )
+    .expect("2C1F order B: second chamfer (two edges) closes the corner under blocking validation");
+    assert_eq!(
+        non_manifold_edge_count(&model_b, solid_b),
+        0,
+        "2C1F fillet-first final state must be watertight"
+    );
+    let (vb, eb, fb) = shell_census(&model_b, solid_b);
+    assert_eq!(
+        vb as i64 - eb as i64 + fb as i64,
+        2,
+        "2C1F fillet-first Euler-Poincaré census"
+    );
+    let hash_b = topology_hash(&model_b, solid_b);
+
+    assert_eq!(
+        hash_a, hash_b,
+        "2C1F chamfer-first and fillet-first must produce structurally identical solids"
+    );
+}
+
+/// Task 3A (3B review finding M2) — the stale-pending window is only
+/// *defensively* reachable through the public API: the one same-call
+/// route that could kill a marked vertex after the (pre-dispatch)
+/// registration is a redundant opt-in on a corner whose three edges
+/// are all filleted at once, and that call REJECTS atomically today
+/// (the opt-in clears the corner's apex setbacks, so the homogeneous
+/// apex-sphere path refuses with `NonManifoldNeighbourhood`; the
+/// `with_rollback` wrapper then restores the pre-call model, pending
+/// registry included). This test pins that atomicity: even the error
+/// path leaves no stale `pending_mixed_kind_corners` entry, so the
+/// shell-scoped Invalid-Euler carve-out arm can never be latched open
+/// by a dead vertex id. The sweep itself
+/// (`mixed_kind_corner_cap::sweep_dead_pending_corners`, run
+/// post-dispatch inside `fillet_edges`) is covered by unit tests on
+/// the function.
+#[test]
+fn redundant_partial_corner_opt_in_rejects_atomically_without_stale_pending() {
+    let mut model = BRepModel::new();
+    let solid_id = make_cube(&mut model, BOX_SIZE);
+    let edges = corner_edges(&model);
+    let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
+
+    let err = fillet_edges(
+        &mut model,
+        solid_id,
+        vec![edges[0], edges[1], edges[2]],
+        fillet_opts_with_partial_corner(D, vec![corner]),
+    )
+    .expect_err(
+        "redundant opt-in on a fully-selected 3-edge corner rejects (apex setbacks \
+         cleared by the opt-in disable the homogeneous apex-sphere path)",
+    );
+    assert!(
+        matches!(err, OperationError::BlendFailed(_)),
+        "reject stays a typed BlendFailed; got {:?}",
+        err
+    );
+
+    // Atomic rollback: the failed call must leave no trace — in
+    // particular no pending entry for a vertex the rolled-back model
+    // still owns (or worse, a dead id).
+    let solid = model.solids.get(solid_id).expect("solid exists");
+    assert!(
+        solid.pending_mixed_kind_corners().is_empty(),
+        "failed call must not leave pending entries; got {:?}",
+        solid.pending_mixed_kind_corners()
+    );
+    assert_eq!(
+        non_manifold_edge_count(&model, solid_id),
+        0,
+        "rolled-back cube is still watertight"
+    );
+    let (v, e, f) = shell_census(&model, solid_id);
+    assert_eq!((v, e, f), (8, 12, 6), "rolled-back cube census unchanged");
+}

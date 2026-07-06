@@ -895,6 +895,18 @@ pub fn fillet_edges(
         )?;
         fillet_faces.extend(corner_faces);
 
+        // Task 3A (3B review finding M2) — pending registration now
+        // happens BEFORE the dispatch above, so a vertex marked
+        // pending and then consumed by this same call's transitions
+        // (e.g. a redundant opt-in on a corner whose three edges were
+        // all filleted here — the homogeneous apex-sphere path closes
+        // the corner and drops V) would leave a permanently-stale
+        // entry whose mere existence keeps the shell-scoped
+        // Invalid-Euler carve-out arm active on every future
+        // validation of this solid. Sweep the corpses before the
+        // validate gate runs.
+        let _ = super::mixed_kind_corner_cap::sweep_dead_pending_corners(model, solid_id);
+
         // Validate result if requested
         if options.common.validate_result {
             validate_filleted_solid(model, solid_id)?;
@@ -5357,29 +5369,48 @@ pub(crate) fn retract_mixed_2c1f_corner(
         )
     })?;
 
-    // --- 3. Map the arc's endpoints. Each old endpoint is the V-level
-    //        junction with one chamfer rim (shared vertex); after
-    //        retraction the fillet-track generator through it lands on
-    //        the corner shared with the OTHER bevel (the triangle
-    //        "rotates", exactly like the 1C2F shared-vertex swap).
-    let rim0 = cap_arc_endpoint_vertices(model, chamfer_rim_edges[0])?;
-    let rim1 = cap_arc_endpoint_vertices(model, chamfer_rim_edges[1])?;
-    let (arc_start, arc_end) = cap_arc_endpoint_vertices(model, fillet_cap_arc)?;
-    let map_endpoint = |v: VertexId| -> OperationResult<Point3> {
-        if v == rim0.0 || v == rim0.1 {
-            Ok(tri.a2)
-        } else if v == rim1.0 || v == rim1.1 {
-            Ok(tri.a1)
-        } else {
-            Err(OperationError::InvalidGeometry(format!(
-                "retract_mixed_2c1f_corner: fillet cap-arc endpoint {} shares no \
-                 vertex with either chamfer rim",
-                v
-            )))
-        }
+    // --- 2b. Task 3A idempotency gate: are the chamfer rims already
+    //         on the retracted triangle? (chamfer-first ordering — the
+    //         first call's partial retraction
+    //         [`retract_partial_two_chamfer_corner`] already placed
+    //         them.) Mirrors the 1C2F arc gate in
+    //         [`retract_mixed_1c2f_corner`].
+    let endpoint_positions = |m: &BRepModel, eid: EdgeId| -> OperationResult<(Point3, Point3)> {
+        let (sv, ev) = cap_arc_endpoint_vertices(m, eid)?;
+        let sp = m.vertices.get_position(sv).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "retract_mixed_2c1f_corner: vertex {} missing",
+                sv
+            ))
+        })?;
+        let ep = m.vertices.get_position(ev).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "retract_mixed_2c1f_corner: vertex {} missing",
+                ev
+            ))
+        })?;
+        Ok((
+            Point3::new(sp[0], sp[1], sp[2]),
+            Point3::new(ep[0], ep[1], ep[2]),
+        ))
     };
-    let new_start_p = map_endpoint(arc_start)?;
-    let new_end_p = map_endpoint(arc_end)?;
+    let matches_unordered = |pair: (Point3, Point3), a: Point3, b: Point3| -> bool {
+        let (s, e) = pair;
+        ((s - a).magnitude() <= tolerance && (e - b).magnitude() <= tolerance)
+            || ((s - b).magnitude() <= tolerance && (e - a).magnitude() <= tolerance)
+    };
+    let rim0_pts = endpoint_positions(model, chamfer_rim_edges[0])?;
+    let rim1_pts = endpoint_positions(model, chamfer_rim_edges[1])?;
+    let rim0_retracted = matches_unordered(rim0_pts, tri.a1, tri.q12);
+    let rim1_retracted = matches_unordered(rim1_pts, tri.a2, tri.q12);
+    if rim0_retracted != rim1_retracted {
+        return Err(OperationError::InvalidGeometry(
+            "retract_mixed_2c1f_corner: inconsistent retraction state — one chamfer rim \
+             is apex-retracted and the other is not"
+                .to_string(),
+        ));
+    }
+    let rims_already_retracted = rim0_retracted && rim1_retracted;
 
     let descriptor =
         extract_fillet_cylinder_descriptor(model, fillet_face_id).ok_or_else(|| {
@@ -5393,6 +5424,68 @@ pub(crate) fn retract_mixed_2c1f_corner(
             "retract_mixed_2c1f_corner: degenerate fillet axis".to_string(),
         )
     })?;
+
+    // --- 3. Map the arc's endpoints. Each old endpoint is the V-level
+    //        junction with one chamfer rim (shared vertex); after
+    //        retraction the fillet-track generator through it lands on
+    //        the corner shared with the OTHER bevel (the triangle
+    //        "rotates", exactly like the 1C2F shared-vertex swap).
+    //
+    //        Task 3A — chamfer-first ordering: the rims were already
+    //        retracted by the first call, so the fresh V-level fillet
+    //        arc shares NO vertex with them. Map each arc endpoint by
+    //        sliding it along its cylinder ruling (the fillet axis) to
+    //        the apex's axial station and snapping to the nearer
+    //        retracted fillet∧bevel corner {A_1, A_2}. Exact for the
+    //        equal-displacement family (the slid point IS the corner);
+    //        the pre-existing d ≠ r caveat of the #72 retraction
+    //        design applies unchanged.
+    let rim0 = cap_arc_endpoint_vertices(model, chamfer_rim_edges[0])?;
+    let rim1 = cap_arc_endpoint_vertices(model, chamfer_rim_edges[1])?;
+    let (arc_start, arc_end) = cap_arc_endpoint_vertices(model, fillet_cap_arc)?;
+    let (new_start_p, new_end_p) = if rims_already_retracted {
+        let slide_snap = |vid: VertexId| -> OperationResult<Point3> {
+            let p = model.vertices.get_position(vid).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
+                    "retract_mixed_2c1f_corner: vertex {} missing",
+                    vid
+                ))
+            })?;
+            let p = Point3::new(p[0], p[1], p[2]);
+            let s = (tri.apex - p).dot(&axis);
+            let q = Point3::new(p.x + s * axis.x, p.y + s * axis.y, p.z + s * axis.z);
+            Ok(if (q - tri.a1).magnitude() <= (q - tri.a2).magnitude() {
+                tri.a1
+            } else {
+                tri.a2
+            })
+        };
+        let ns = slide_snap(arc_start)?;
+        let ne = slide_snap(arc_end)?;
+        if (ns - ne).magnitude() <= tolerance {
+            return Err(OperationError::InvalidGeometry(
+                "retract_mixed_2c1f_corner: both fillet cap-arc endpoints snap to the \
+                 same retracted corner"
+                    .to_string(),
+            ));
+        }
+        (ns, ne)
+    } else {
+        let map_endpoint = |v: VertexId| -> OperationResult<Point3> {
+            if v == rim0.0 || v == rim0.1 {
+                Ok(tri.a2)
+            } else if v == rim1.0 || v == rim1.1 {
+                Ok(tri.a1)
+            } else {
+                Err(OperationError::InvalidGeometry(format!(
+                    "retract_mixed_2c1f_corner: fillet cap-arc endpoint {} shares no \
+                     vertex with either chamfer rim",
+                    v
+                )))
+            }
+        };
+        (map_endpoint(arc_start)?, map_endpoint(arc_end)?)
+    };
     let w = tri.apex - descriptor.axis_origin;
     let t = w.dot(&axis);
     let centre = Point3::new(
@@ -5423,15 +5516,21 @@ pub(crate) fn retract_mixed_2c1f_corner(
     }
 
     // --- 4. Re-anchor each chamfer-bevel rail to (A_i, Q_12). --------
-    let a_for = [tri.a1, tri.a2];
-    for (i, &rim) in chamfer_rim_edges.iter().enumerate() {
-        let (old_s, old_e) = cap_arc_endpoint_vertices(model, rim)?;
-        let (new_s, new_e) = reanchor_chamfer_rim(model, rim, a_for[i], tri.q12, tolerance)?;
-        if old_s != new_s {
-            retract_boundary_tracks(model, bevel_faces[i], rim, old_s, new_s)?;
-        }
-        if old_e != new_e {
-            retract_boundary_tracks(model, bevel_faces[i], rim, old_e, new_e)?;
+    // Task 3A — skipped when the first call already retracted the
+    // rims: their endpoints (and every boundary track anchored to
+    // them) are already on the solved triangle, and a redundant
+    // re-anchor would only churn curve ids.
+    if !rims_already_retracted {
+        let a_for = [tri.a1, tri.a2];
+        for (i, &rim) in chamfer_rim_edges.iter().enumerate() {
+            let (old_s, old_e) = cap_arc_endpoint_vertices(model, rim)?;
+            let (new_s, new_e) = reanchor_chamfer_rim(model, rim, a_for[i], tri.q12, tolerance)?;
+            if old_s != new_s {
+                retract_boundary_tracks(model, bevel_faces[i], rim, old_s, new_s)?;
+            }
+            if old_e != new_e {
+                retract_boundary_tracks(model, bevel_faces[i], rim, old_e, new_e)?;
+            }
         }
     }
 
@@ -5573,6 +5672,150 @@ fn retract_partial_two_fillet_corner(
     if !shares_vertex {
         return Err(OperationError::InvalidGeometry(
             "retract_partial_two_fillet_corner: retracted cap arcs share no P_12 vertex \
+             — apex stations disagree"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Task 3A — first-call retraction of a **partial** two-chamfer mixed
+/// corner (chamfer-first ordering, 2C1F): the opt-in first call blends
+/// two of the three corner edges, leaving the third for a follow-up
+/// fillet. The mirror of [`retract_partial_two_fillet_corner`] with
+/// the rail kinds swapped (burndown-diag-cf.md sub-group A).
+///
+/// Un-retracted, each chamfer's V-side cap rim is a `Line` lying *in*
+/// the plane of the host face that lost both its corner edges, and
+/// that face's boundary chain is left open between the two rims' track
+/// endpoints — the loop-walk / same-orientation defects the B1/fort
+/// validators (correctly) reject at the first call.
+///
+/// The fix retracts the two rims that exist at first-call time: each
+/// rim endpoint slides along its bevel's *spine* (the intersection
+/// line of the two offset host planes — the direction of every
+/// boundary track of that bevel, so the slide stays on the tracks) to
+/// the apex's axial station, where the apex is the least-squares
+/// concurrent point of the two chamfer spines
+/// ([`blend_graph::solve_chamfer_pair_apex`]). The two far endpoints
+/// land on the SAME point (`Q_12`, the crossing of the doubly-notched
+/// host face's two tracks — closing that face watertight), and each
+/// shared-side endpoint lands on the surviving-host-plane corner of
+/// its retracted rim (`A_i`). For the equal-displacement family these
+/// are exactly the corners the finalize-time
+/// [`blend_graph::solve_retracted_corner_triangle_2c1f`] reproduces,
+/// so [`retract_mixed_2c1f_corner`]'s idempotency gate skips the rim
+/// moves at the second call.
+///
+/// The corner remains deliberately open at V (faces adjacent to the
+/// un-blended third edge keep boundary edges near V) — precisely the
+/// boundary-edge / does-not-close / Euler forms the CF-β.4.2
+/// carve-out already covers.
+pub(crate) fn retract_partial_two_chamfer_corner(
+    model: &mut BRepModel,
+    chamfer_rim_edges: &[EdgeId; 2],
+    tolerance: f64,
+) -> OperationResult<()> {
+    use crate::operations::edge_classification::find_adjacent_faces;
+
+    // Locate each rim's bevel face (its RuledSurface neighbour) —
+    // same discovery as `retract_mixed_2c1f_corner` step 1.
+    let mut bevel_faces: [FaceId; 2] = [0; 2];
+    for (i, &rim) in chamfer_rim_edges.iter().enumerate() {
+        bevel_faces[i] = find_adjacent_faces(model, rim)
+            .into_iter()
+            .find(|&fid| {
+                model
+                    .faces
+                    .get(fid)
+                    .and_then(|f| model.surfaces.get(f.surface_id))
+                    .map(|s| s.type_name() == "RuledSurface")
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
+                    "retract_partial_two_chamfer_corner: chamfer bevel face not found \
+                     for rim {}",
+                    rim
+                ))
+            })?;
+    }
+
+    let (apex, spines) = blend_graph::solve_chamfer_pair_apex(
+        model,
+        bevel_faces,
+        [chamfer_rim_edges[0], chamfer_rim_edges[1]],
+    )
+    .map_err(|e| {
+        OperationError::InvalidGeometry(format!(
+            "retract_partial_two_chamfer_corner: apex solve failed: {:?}",
+            e
+        ))
+    })?;
+
+    for i in 0..2 {
+        let (_, spine_dir) = spines[i];
+        let (old_start, old_end) = cap_arc_endpoint_vertices(model, chamfer_rim_edges[i])?;
+        // Slide each endpoint along its bevel's spine direction to the
+        // apex's axial station. Exact: both rim endpoints of a partial
+        // two-chamfer corner sit on this bevel's own straight boundary
+        // tracks, which run parallel to the spine.
+        let slide = |vid: VertexId| -> OperationResult<Point3> {
+            let p = model.vertices.get_position(vid).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
+                    "retract_partial_two_chamfer_corner: vertex {} missing",
+                    vid
+                ))
+            })?;
+            let p = Point3::new(p[0], p[1], p[2]);
+            let s = (apex - p).dot(&spine_dir);
+            Ok(Point3::new(
+                p.x + s * spine_dir.x,
+                p.y + s * spine_dir.y,
+                p.z + s * spine_dir.z,
+            ))
+        };
+        let new_start_p = slide(old_start)?;
+        let new_end_p = slide(old_end)?;
+
+        let (new_start, new_end) = reanchor_chamfer_rim(
+            model,
+            chamfer_rim_edges[i],
+            new_start_p,
+            new_end_p,
+            tolerance,
+        )?;
+        if old_start != new_start {
+            retract_boundary_tracks(
+                model,
+                bevel_faces[i],
+                chamfer_rim_edges[i],
+                old_start,
+                new_start,
+            )?;
+        }
+        if old_end != new_end {
+            retract_boundary_tracks(
+                model,
+                bevel_faces[i],
+                chamfer_rim_edges[i],
+                old_end,
+                new_end,
+            )?;
+        }
+    }
+
+    // Honesty guard: the two far endpoints must have merged into one
+    // shared Q_12 vertex — that is what closes the doubly-notched host
+    // face. If they didn't dedup, the retraction solved two different
+    // stations and the state would still be dishonest.
+    let (s0, e0) = cap_arc_endpoint_vertices(model, chamfer_rim_edges[0])?;
+    let (s1, e1) = cap_arc_endpoint_vertices(model, chamfer_rim_edges[1])?;
+    let shares_vertex = s0 == s1 || s0 == e1 || e0 == s1 || e0 == e1;
+    if !shares_vertex {
+        return Err(OperationError::InvalidGeometry(
+            "retract_partial_two_chamfer_corner: retracted cap rims share no Q_12 vertex \
              — apex stations disagree"
                 .to_string(),
         ));

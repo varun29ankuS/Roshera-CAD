@@ -842,6 +842,50 @@ pub(crate) fn retract_and_cap_mixed_corner(
     Ok(face_ids)
 }
 
+/// Task 3A (3B review finding M2) — remove pending-mixed-corner
+/// entries whose vertex no longer exists in the model.
+///
+/// Task 3B moved the fillet-side pending registration BEFORE the
+/// corner-blend dispatch (`create_fillet_transitions`) so the
+/// first-call retraction arm can recognise a pending corner. The cost:
+/// a vertex marked pending and then *consumed by the same call's
+/// dispatch* (e.g. a redundant opt-in on a corner whose three edges
+/// are all filleted in one call — the homogeneous apex-sphere path
+/// closes the corner and drops V) would leave a permanently-stale
+/// entry. A stale entry is a lie window: a dead vertex has no incident
+/// edges so the local carve-out arms of
+/// [`filter_pending_corner_errors`] never fire, but the mere
+/// non-emptiness of the pending set keeps its shell-scoped
+/// "Invalid Euler" arm active on every future `validate_result` gate
+/// of the solid.
+///
+/// Call this after any dispatch that may consume marked vertices.
+/// Returns the number of entries removed.
+pub(crate) fn sweep_dead_pending_corners(model: &mut BRepModel, solid_id: SolidId) -> usize {
+    let dead: Vec<VertexId> = match model.solids.get(solid_id) {
+        Some(solid) => solid
+            .pending_mixed_kind_corners()
+            .keys()
+            .copied()
+            .filter(|&vid| model.vertices.get(vid).is_none())
+            .collect(),
+        None => return 0,
+    };
+    if dead.is_empty() {
+        return 0;
+    }
+    if let Some(solid) = model.solids.get_mut(solid_id) {
+        for &vid in &dead {
+            solid.clear_pending_mixed_kind_corner(vid);
+            // The cap-rim side-registry is keyed by the same vertex; a
+            // dead vertex can never be finalized, so its entries are
+            // equally stale. Idempotent — no-op when absent.
+            let _ = solid.clear_corner_cap_edges(vid);
+        }
+    }
+    dead.len()
+}
+
 /// CF-β.4 — filter `errors` down to the subset that *cannot* be
 /// explained by a deliberate partially-blended open boundary at a
 /// pending mixed-kind corner.
@@ -1020,12 +1064,19 @@ pub(crate) fn filter_pending_corner_errors(
                     return false;
                 }
                 // CF-β.5.2-A — the same deliberate open boundary also shows up as a
-                // non-closing boundary WALK on the V-adjacent host face (the face-
-                // orientation guard's chain-integrity check): the partial corner
-                // leaves the host loop open at the pending vertex. Drop it on the
-                // V-adjacent neighbourhood exactly as the boundary-edge form above;
-                // every closed-boundary orientation defect still surfaces.
-                if v_adjacent_faces.contains(&fid) && message.contains("does not close") {
+                // non-closing boundary WALK on the host face (the face-orientation
+                // guard's chain-integrity check): the partial corner leaves the
+                // host loop open at the pending vertex. Task 3A SHRINK: with the
+                // first-call retraction honest on every path (1C2F and 2C1F, both
+                // operators), a non-closing chain can only occur on a face whose
+                // loop still VISITS the pending vertex — the 1-ring `v_faces`,
+                // not the 2-ring `v_adjacent_faces` this arm used to cover (the
+                // doubly-notched host face now closes watertight at P_12/Q_12 at
+                // first-call time; blend-face loops are closed by construction).
+                // Every closed-boundary orientation defect still surfaces, and
+                // the "same orientation" / "self-overlaps" forms remain
+                // unfilterable everywhere.
+                if v_faces.contains(&fid) && message.contains("does not close") {
                     return false;
                 }
             }
@@ -1559,6 +1610,70 @@ mod tests {
             }];
             let kept = filter_pending_corner_errors(&model, &pending, errors);
             assert_eq!(kept.len(), 1);
+        }
+    }
+
+    /// Task 3A (3B review finding M2) — pin the stale-pending sweep:
+    /// entries whose vertex died are removed (with their cap-rim
+    /// side-registry), entries whose vertex is alive survive.
+    mod sweep_dead_pending_corners_tests {
+        use super::super::sweep_dead_pending_corners;
+        use super::fresh_solid_with_outer_shell;
+        use crate::primitives::solid::BlendKind;
+
+        #[test]
+        fn removes_entries_for_dead_vertices_only() {
+            let (mut model, solid_id, _shell) = fresh_solid_with_outer_shell();
+            let alive = model.vertices.add(0.0, 0.0, 0.0);
+            let doomed = model.vertices.add(1.0, 1.0, 1.0);
+            {
+                let solid = model.solids.get_mut(solid_id).expect("solid exists");
+                solid.mark_pending_mixed_kind_corner(alive, 3);
+                solid.mark_pending_mixed_kind_corner(doomed, 3);
+                solid.record_corner_cap_edge(doomed, 12345, BlendKind::Chamfer);
+            }
+            // Kill the doomed vertex — simulates a same-call dispatch
+            // (apex-sphere corner) consuming a marked vertex after the
+            // pre-dispatch registration.
+            model.vertices.remove(doomed);
+
+            let removed = sweep_dead_pending_corners(&mut model, solid_id);
+            assert_eq!(removed, 1, "exactly the dead entry is swept");
+
+            let solid = model.solids.get(solid_id).expect("solid exists");
+            assert!(
+                solid.is_mixed_kind_corner_pending(alive),
+                "live pending entry must survive the sweep"
+            );
+            assert!(
+                !solid.is_mixed_kind_corner_pending(doomed),
+                "dead pending entry must be removed — a stale entry keeps the \
+                 shell-scoped Invalid-Euler carve-out arm permanently active"
+            );
+            assert!(
+                solid.corner_cap_edges(doomed).is_none(),
+                "dead vertex's cap-rim side-registry entries are equally stale"
+            );
+        }
+
+        #[test]
+        fn noop_when_all_pending_vertices_alive() {
+            let (mut model, solid_id, _shell) = fresh_solid_with_outer_shell();
+            let alive = model.vertices.add(0.0, 0.0, 0.0);
+            {
+                let solid = model.solids.get_mut(solid_id).expect("solid exists");
+                solid.mark_pending_mixed_kind_corner(alive, 3);
+            }
+            assert_eq!(sweep_dead_pending_corners(&mut model, solid_id), 0);
+            let solid = model.solids.get(solid_id).expect("solid exists");
+            assert!(solid.is_mixed_kind_corner_pending(alive));
+        }
+
+        #[test]
+        fn noop_on_missing_solid_or_empty_registry() {
+            let (mut model, solid_id, _shell) = fresh_solid_with_outer_shell();
+            assert_eq!(sweep_dead_pending_corners(&mut model, solid_id), 0);
+            assert_eq!(sweep_dead_pending_corners(&mut model, 9999), 0);
         }
     }
 

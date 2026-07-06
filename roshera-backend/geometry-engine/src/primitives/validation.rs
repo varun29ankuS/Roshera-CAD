@@ -1846,6 +1846,7 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
             // would false-positive every such (correct, watertight) loop; balancing
             // by position closes for them and still flags a genuinely-flipped sense
             // (whose gap spans a real, non-coincident distance).
+            let mut chain_closed = true;
             {
                 let q = (1.0 / Tolerance::default().distance().max(1e-12)).min(1e12);
                 let key = |p: [f64; 3]| -> (i64, i64, i64) {
@@ -1878,6 +1879,7 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
                 }
                 // A closed walk balances every position (tail count == head count).
                 if n > 1 && tail_minus_head.values().any(|&d| d != 0) {
+                    chain_closed = false;
                     // Name the offending edge. A flipped loop sense unbalances BOTH
                     // of that edge's endpoints, so prefer the edge whose two endpoints
                     // are both unbalanced (the flipped edge itself); fall back to any
@@ -1919,6 +1921,24 @@ pub fn check_face_orientations(model: &BRepModel, shell_id: ShellId) -> Vec<Vali
                         ));
                     }
                 }
+            }
+
+            // Task 3A — a walk sense derived from a NON-CLOSING chain is not
+            // evidence. The tail-vertex polygon `loop_data.vertices()` builds
+            // for a broken chain silently bridges the gap with a phantom
+            // segment (it lists each traversed edge's tail only), so the
+            // point-in-polygon interior test below can land on the wrong side
+            // of edges adjacent to the gap and FABRICATE a "same orientation"
+            // error against a perfectly-honest neighbour (observed live: a
+            // deliberately-open pending mixed-kind corner whose host face
+            // carries the un-blended third corner edge). The loop is already
+            // rejected by the chain-integrity error above, so skipping its
+            // seam / geometric contributions hides nothing: any genuinely
+            // flipped loop sense still blocks via "does not close", and a
+            // genuinely reversed face NORMAL keeps its chain intact so the
+            // geometric arm below still catches it.
+            if !chain_closed {
+                continue;
             }
 
             // --- Periodic self-seam edges: an edge that appears TWICE within

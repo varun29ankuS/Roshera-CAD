@@ -294,6 +294,64 @@ pub fn chamfer_edges(
             chamfer_faces.extend(cap_faces);
         }
 
+        // Task 3A — FIRST-CALL partial retraction (chamfer-first
+        // ordering, burndown-diag-cf.md sub-group A; the mirror of the
+        // fillet-side arm in `create_fillet_transitions`).
+        //
+        // The opt-in first call of a chamfer-first mixed pair bevels
+        // two of the three edges of an original degree-3 corner with
+        // no prior fillet at V. Un-retracted, the two V-side cap rims
+        // lie in the plane of the host face that lost both its corner
+        // edges, and that face's boundary chain is open between the
+        // rims' track endpoints — the loop-walk / same-orientation
+        // defects the B1/fort validators (correctly) reject. Retract
+        // the two rims that exist NOW to the apex station along each
+        // bevel's spine (`retract_partial_two_chamfer_corner`): the
+        // doubly-notched host face closes watertight at Q_12 and the
+        // corner becomes a genuinely manifold-with-boundary open
+        // corner whose only validation deltas are the boundary-edge /
+        // does-not-close / Euler forms the CF-β.4.2 carve-out covers.
+        // The follow-up fillet's finalize re-solves the same triangle
+        // (idempotently, for the equal-displacement family) and caps
+        // it via the shared constructor. Gated to opt-in corners of
+        // original degree 3 with exactly two chamfer rims and no
+        // prior fillet, so every other path (single-edge first calls,
+        // finalize calls, exotic degree-4 opt-ins) is untouched.
+        for &vid in &options.partial_corner_vertices {
+            if model.vertices.get(vid).is_none() {
+                continue;
+            }
+            if partial_corner_original_degrees.get(&vid).copied() != Some(3) {
+                continue;
+            }
+            let has_prior_fillet = model
+                .solids
+                .get(solid_id)
+                .and_then(|s| s.vertex_blend_set(vid))
+                .map(|set| set.contains(BlendKind::Fillet))
+                .unwrap_or(false);
+            if has_prior_fillet {
+                continue;
+            }
+            let mut rims = super::mixed_kind_corner_cap::find_blend_cap_edges_at_vertex(
+                model,
+                solid_id,
+                vid,
+                BlendKind::Chamfer,
+            );
+            if rims.len() != 2 {
+                continue;
+            }
+            // The registry hands back a set — order it for
+            // deterministic vertex/curve id assignment across runs.
+            rims.sort_unstable();
+            super::fillet::retract_partial_two_chamfer_corner(
+                model,
+                &[rims[0], rims[1]],
+                Tolerance::default().distance(),
+            )?;
+        }
+
         // CF-β.5.2-A — register every opt-in partial-mixed corner
         // vertex in the host solid's `pending_mixed_kind_corners`
         // set BEFORE the `validate_result` gate runs. The β.4.2

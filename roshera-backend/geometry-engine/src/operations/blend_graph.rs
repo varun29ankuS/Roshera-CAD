@@ -2083,6 +2083,56 @@ pub fn solve_fillet_pair_apex(
     .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)
 }
 
+/// Apex anchor of a **partial** two-chamfer corner: the least-squares
+/// concurrent point of the two post-surgery chamfer spines (each spine
+/// is the intersection line of its two offset host planes, recovered
+/// via [`chamfer_bevel_spine`]), plus the spines themselves so the
+/// caller can slide each rim endpoint to the apex station along its
+/// own spine direction.
+///
+/// Task 3A (burndown-diag-cf.md sub-group A) — the chamfer-first
+/// mirror of [`solve_fillet_pair_apex`]: the first call of a
+/// chamfer-first mixed-kind pair blends two of the three corner edges
+/// with the partial-corner opt-in and must leave an *honest*
+/// intermediate state. The apex is computable *without* the
+/// not-yet-existing fillet — for the equal-displacement family the
+/// finalize-time [`solve_retracted_corner_triangle_2c1f`] reproduces
+/// the same apex, so the second call's re-placement is idempotent on
+/// the already-retracted rims.
+///
+/// Returned spines are `(point_on_spine, unit_direction)` in
+/// `bevel_faces` order.
+///
+/// # Errors
+///
+/// Typed [`PostSurgeryCornerError`]; never panics. Pure function.
+pub(crate) fn solve_chamfer_pair_apex(
+    model: &BRepModel,
+    bevel_faces: [FaceId; 2],
+    bevel_rim_edges: [EdgeId; 2],
+) -> Result<(Point3, [(Point3, Vector3); 2]), PostSurgeryCornerError> {
+    let spine_0 = chamfer_bevel_spine(model, bevel_faces[0], bevel_rim_edges[0])?;
+    let spine_1 = chamfer_bevel_spine(model, bevel_faces[1], bevel_rim_edges[1])?;
+    let apex = least_squares_concurrent_point(&[
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_0.0,
+            axis_dir: spine_0.1,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_1.0,
+            axis_dir: spine_1.1,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+    ])
+    .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
+    Ok((apex, [spine_0, spine_1]))
+}
+
 /// The three **axially-retracted** inner-triangle corners of a 2C1F
 /// mixed corner (two chamfer-bevel rails + one cylinder-fillet rail) —
 /// the mirror of [`RetractedCornerTriangle`] with the rail kinds
@@ -2229,24 +2279,39 @@ pub fn solve_retracted_corner_triangle_2c1f(
     )
     .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
     let q12 = {
-        // Station the line at the apex level of whichever chamfer
-        // spine is transverse to it.
-        let mut station: Option<Point3> = None;
+        // Task 3A (3B review finding M3) — SYMMETRIC stationing: the
+        // retracted rim of chamfer `i` lies in the plane
+        // `spine_i_dir · x = spine_i_dir · A`, so each transverse
+        // spine yields one station of the bevel∧bevel line. The old
+        // break-on-first made Q_12 depend on the *input order* of the
+        // bevels whenever the spines are not exactly concurrent (the
+        // least-squares apex then sits off one or both spines and the
+        // two stations differ) — and the rim order arrives from an
+        // unordered registry. Averaging the stations (the 1-D
+        // least-squares point on the line) removes the order
+        // dependence; for exactly-concurrent spines (rectilinear
+        // corner) the stations coincide and the average is exact.
+        let mut s_acc = 0.0;
+        let mut n_transverse = 0usize;
         for spine_dir in [spine_c1_dir, spine_c2_dir] {
             let denom = spine_dir.dot(&line_dir);
             if denom.abs() > 1.0e-9 {
                 let s = (spine_dir.dot(&(apex - Point3::new(0.0, 0.0, 0.0)))
                     - spine_dir.dot(&(p0 - Point3::new(0.0, 0.0, 0.0))))
                     / denom;
-                station = Some(Point3::new(
-                    p0.x + s * line_dir.x,
-                    p0.y + s * line_dir.y,
-                    p0.z + s * line_dir.z,
-                ));
-                break;
+                s_acc += s;
+                n_transverse += 1;
             }
         }
-        station.ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?
+        if n_transverse == 0 {
+            return Err(PostSurgeryCornerError::DegenerateAxisSystem);
+        }
+        let s = s_acc / (n_transverse as f64);
+        Point3::new(
+            p0.x + s * line_dir.x,
+            p0.y + s * line_dir.y,
+            p0.z + s * line_dir.z,
+        )
     };
 
     Ok(Retracted2c1fCornerTriangle { apex, a1, a2, q12 })
