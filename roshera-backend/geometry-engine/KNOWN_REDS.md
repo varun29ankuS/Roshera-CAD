@@ -62,8 +62,5 @@ diag_cone_radial::cone_corner_gate  # diag: burndown-diag-drawing-tess.md#family
 # Family: gap finder chamfer (1 test) -- diag: burndown-diag-drawing-tess.md#family-43
 gap_finder_fuzz::gap_finder_smoke  # diag: burndown-diag-drawing-tess.md#family-43
 
-# Family: torus B1 false positive (1 test) -- diag: burndown-diag-drawing-tess.md#family-44
-operation_composition_invariants::torus_mass_props_rigid_invariant  # diag: burndown-diag-drawing-tess.md#family-44
-
 # Family: extrude wall orientation (1 test) -- diag: burndown-diag-drawing-tess.md#family-45
 fillet_chamfer_dihedral_matrix::matrix_helpers_build_valid_prisms_with_expected_vertical_edge_counts  # diag: burndown-diag-drawing-tess.md#family-45

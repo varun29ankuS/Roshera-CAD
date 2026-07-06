@@ -651,6 +651,24 @@ impl ParallelValidator {
 
                 // 1c — DEGENERATE FACE: an outer loop that collapses to ~a point
                 // (zero spatial extent) is a face with no area, a real defect.
+                //
+                // NARROW EXEMPTION — single-vertex commutator loop on a doubly-closed surface:
+                //
+                // A torus is represented as ONE closed face whose outer loop is the
+                // commutator a·b·a⁻¹·b⁻¹ (all four edge-uses share the single seam
+                // vertex, established by `e943758`). Every edge's `start_vertex` is
+                // the same vertex → the vertex-position hull spans 0 → naively looks
+                // degenerate. The face is NOT degenerate: the surface wraps around in
+                // both parametric directions and fills the full (0..2π)×(0..2π) patch.
+                //
+                // We exempt ONLY this configuration: fewer than 3 *distinct* vertex
+                // positions in the loop (after dedup within tolerance) AND the surface
+                // is closed in both parametric directions (is_closed_u && is_closed_v).
+                // Two independent gates make the exemption NARROW:
+                //   • "< 3 distinct" alone would exempt degenerate loops on open surfaces.
+                //   • "closed both ways" alone would let a real tiny degenerate patch
+                //     on a torus sneak through.
+                // Together they describe only the commutator topology.
                 let mut loop_pts: Vec<Point3> = Vec::new();
                 if let Some(lp) = model.loops.get(face.outer_loop) {
                     for &eid in &lp.edges {
@@ -662,28 +680,43 @@ impl ParallelValidator {
                     }
                 }
                 if loop_pts.len() >= 3 {
-                    let mut mn = loop_pts[0];
-                    let mut mx = loop_pts[0];
-                    for p in &loop_pts {
-                        mn = Point3::new(mn.x.min(p.x), mn.y.min(p.y), mn.z.min(p.z));
-                        mx = Point3::new(mx.x.max(p.x), mx.y.max(p.y), mx.z.max(p.z));
+                    // Count distinct vertex positions within tolerance.
+                    let tol_d = tolerance.distance();
+                    let mut distinct: Vec<Point3> = Vec::with_capacity(loop_pts.len());
+                    for &p in &loop_pts {
+                        if !distinct.iter().any(|q| q.distance(&p) < tol_d) {
+                            distinct.push(p);
+                        }
                     }
-                    let diag = mn.distance(&mx);
-                    if diag < tolerance.distance() {
-                        // 1c — BLOCKING (exact).
-                        errs.push(ValidationError::GeometryError {
-                            location: EntityLocation {
-                                solid_id: None,
-                                shell_id: None,
-                                face_id: Some(face_id),
-                                loop_id: Some(face.outer_loop),
-                                edge_id: None,
-                                vertex_id: None,
-                            },
-                            message: format!(
-                                "face {face_id} is degenerate: outer loop spans only {diag:.3e}"
-                            ),
-                        });
+                    // Exempt genuine single-vertex commutator loops on doubly-closed
+                    // surfaces (torus). Both conditions must hold — see note above.
+                    let is_commutator_loop = distinct.len() < 3
+                        && surface.is_closed_u()
+                        && surface.is_closed_v();
+                    if !is_commutator_loop {
+                        let mut mn = loop_pts[0];
+                        let mut mx = loop_pts[0];
+                        for p in &loop_pts {
+                            mn = Point3::new(mn.x.min(p.x), mn.y.min(p.y), mn.z.min(p.z));
+                            mx = Point3::new(mx.x.max(p.x), mx.y.max(p.y), mx.z.max(p.z));
+                        }
+                        let diag = mn.distance(&mx);
+                        if diag < tol_d {
+                            // 1c — BLOCKING (exact).
+                            errs.push(ValidationError::GeometryError {
+                                location: EntityLocation {
+                                    solid_id: None,
+                                    shell_id: None,
+                                    face_id: Some(face_id),
+                                    loop_id: Some(face.outer_loop),
+                                    edge_id: None,
+                                    vertex_id: None,
+                                },
+                                message: format!(
+                                    "face {face_id} is degenerate: outer loop spans only {diag:.3e}"
+                                ),
+                            });
+                        }
                     }
                 }
 

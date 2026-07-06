@@ -15,11 +15,15 @@
 //! `V - E + F - R = 2(S - G)` from the validator's side: face-hole solids
 //! must validate, and a genuinely-open shell must not.
 
-use geometry_engine::math::{Matrix4, Tolerance, Vector3};
+use geometry_engine::math::{Matrix4, Point3, Tolerance, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::operations::transform::{transform_solid, TransformOptions};
-use geometry_engine::primitives::face::FaceId;
+use geometry_engine::primitives::curve::{Line, ParameterRange};
+use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+use geometry_engine::primitives::face::{Face, FaceId, FaceOrientation};
+use geometry_engine::primitives::r#loop::{Loop, LoopType};
 use geometry_engine::primitives::solid::SolidId;
+use geometry_engine::primitives::surface::Cylinder;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::primitives::validation::{
     validate_faces_scoped, validate_model_enhanced, ValidationLevel,
@@ -157,5 +161,98 @@ fn scoped_validation_ignores_unrelated_invalid_solid() {
         "validation scoped to A's faces must ignore the unrelated defect on B; \
          errors: {:?}",
         scoped.errors
+    );
+}
+
+/// MUTATION-PROOF GUARD for the 1c torus-commutator exemption (Task 1B).
+///
+/// The torus-commutator fix exempts a single-vertex closed loop ONLY when
+/// the surface is doubly-closed (is_closed_u AND is_closed_v). This test
+/// pins the narrowness of that gate: a degenerate zero-span loop on a
+/// CYLINDER (closed in u, NOT in v) must still be flagged by check-1c.
+///
+/// Mutation transcript (narrowness proof):
+///   Widen the exemption → remove the `is_closed_v()` requirement so that
+///   ANY single-vertex loop on a closed-in-u surface escapes.
+///   Under that widened predicate this test goes RED because the cylinder
+///   face is not flagged. Restore the `is_closed_v()` gate → GREEN.
+///
+/// This confirms the exemption cannot silently absorb genuine degenerate
+/// faces on singly-closed or open surfaces.
+#[test]
+fn check_1c_still_flags_degenerate_loop_on_singly_closed_surface() {
+    // Build a minimal model: one cylinder surface (is_closed_u=true,
+    // is_closed_v=false) with a face whose outer loop has three edges all
+    // sharing the same single vertex — zero spatial span, genuine defect.
+    let mut model = BRepModel::new();
+
+    // Cylinder: origin=origin, axis=Z, radius=5, no height limits.
+    let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 5.0).expect("cylinder surface");
+    let surf_id = model.surfaces.add(Box::new(cyl));
+
+    // Single seam vertex at origin.
+    let vid = model.vertices.add(0.0, 0.0, 0.0);
+
+    // Degenerate point-curve: start == end, zero length.
+    let degenerate_line = Line::new(Point3::ORIGIN, Point3::ORIGIN);
+
+    // Three degenerate edges, all start_vertex = end_vertex = vid.
+    let curve_a = model.curves.add(Box::new(degenerate_line.clone()));
+    let edge_a = model.edges.add(Edge::new(
+        0,
+        vid,
+        vid,
+        curve_a,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
+    ));
+
+    let curve_b = model.curves.add(Box::new(degenerate_line.clone()));
+    let edge_b = model.edges.add(Edge::new(
+        0,
+        vid,
+        vid,
+        curve_b,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
+    ));
+
+    let curve_c = model.curves.add(Box::new(degenerate_line));
+    let edge_c = model.edges.add(Edge::new(
+        0,
+        vid,
+        vid,
+        curve_c,
+        EdgeOrientation::Forward,
+        ParameterRange::unit(),
+    ));
+
+    // Outer loop with those three edges.
+    let mut outer = Loop::new(0, LoopType::Outer);
+    outer.add_edge(edge_a, true);
+    outer.add_edge(edge_b, true);
+    outer.add_edge(edge_c, true);
+    let loop_id = model.loops.add(outer);
+
+    // Face on the cylinder surface.
+    model
+        .faces
+        .add(Face::new(0, surf_id, loop_id, FaceOrientation::Forward));
+
+    // check-1c must fire: the loop has one distinct vertex (all at origin),
+    // span = 0, but the cylinder is NOT doubly-closed, so the torus-commutator
+    // exemption does NOT apply.
+    let result = validate_model_enhanced(&model, Tolerance::default(), ValidationLevel::Standard);
+    let has_degenerate_error = result.errors.iter().any(|e| {
+        matches!(e,
+            geometry_engine::primitives::validation::ValidationError::GeometryError { message, .. }
+            if message.contains("degenerate")
+        )
+    });
+    assert!(
+        has_degenerate_error,
+        "check-1c must flag a zero-span loop on a cylinder (singly-closed surface); \
+         errors: {:?}",
+        result.errors
     );
 }
