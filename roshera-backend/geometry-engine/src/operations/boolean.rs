@@ -15768,20 +15768,6 @@ fn build_shells_from_faces(
 
     // Post-canonicalization degenerate-face purge: `canonicalise_face_edges_by_position`
     // can collapse two geometrically-coincident cut edges in a coplanar-wall split to the
-    // same canonical EdgeId, producing a boundary loop like [E_k, E_k] (a single EdgeId
-    // appearing in both traversal directions). Such a "self-loop" face has zero area and
-    // is a topological impossibility in a valid B-Rep shell. It arises from an operand-
-    // order asymmetry in `dedup_coplanar_imprint_duplicates`: A∪B and B∪A suppress
-    // different intersection curves, so one ordering's wall fragment receives two
-    // redundant cut edges that, after canonicalization, share a single EdgeId and cancel.
-    // Dropping these before adjacency grouping prevents a spurious +1 face count in the
-    // B∪A result that would break commutativity.
-    //
-    // Guard: a face is degenerate iff its boundary contains fewer than 2 distinct EdgeIds
-    // (a one-edge self-loop). Two distinct edges is a valid digon in curved geometry
-    // (two arcs meeting at two shared vertices) and must not be removed here.
-    // Post-canonicalization degenerate-face purge: `canonicalise_face_edges_by_position`
-    // can collapse two geometrically-coincident cut edges in a coplanar-wall split to the
     // same canonical EdgeId, producing a boundary loop like [(E_k, fwd), (E_k, rev)].
     // This is a zero-area "lune" — the two half-edges traverse the same geometric arc in
     // opposite directions and immediately cancel. Such a face is a topological impossibility
