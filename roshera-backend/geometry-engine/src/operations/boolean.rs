@@ -13832,21 +13832,74 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
             }
         }
         // PLANAR fragment: the boundary-edge-midpoint centroid is a genuine
-        // interior point only for a CONVEX outer loop. A boolean overlap commonly
-        // produces a NON-CONVEX simple fragment (an L-shaped sub-face from a
-        // corner-octant box∖box / box∩box overlap), and an L's midpoint centroid
-        // lands in the reflex notch — OFF the material. When that notch corner
-        // happens to sit on the OTHER operand's edge the fragment spuriously
-        // classifies `OnBoundary` and is dropped (the #34/#80 corner-octant leak:
-        // ∖ leaks open, ∩ goes non-manifold). Detect the off-material centroid via
-        // point-in-polygon and replace it with a guaranteed-interior sample.
+        // interior point only for a CONVEX outer loop with no holes. A boolean
+        // overlap commonly produces:
+        //   (a) a NON-CONVEX simple fragment (L-shaped sub-face from corner-octant
+        //       box∖box / box∩box): centroid lands in the reflex notch → off-material;
+        //   (b) an ARC-BOUNDED fragment (crescent from a bore slicing a wall): the
+        //       chord polygon built from vertices only is smaller than the real arc
+        //       boundary — a point inside the chord polygon can lie on the void side
+        //       of the arc (between chord and arc); broken by ce2a28f.
+        //   (c) an ANNULAR fragment with pre-existing inner loops (bore on an already-
+        //       holed face): the inner loops were passed as &[] → interior-point test
+        //       ignored holes, finding a point inside a hole region; broken by ce2a28f.
+        // Fix: (i) densify arc/circle boundary edges (sample SAMPLES points per edge,
+        // following the arc, not just the chord), (ii) pass the fragment's actual inner
+        // loops as hole polygons, (iii) only enter this path for planar faces where the
+        // centroid may be unreliable — polygon_interior_point_3d handles convex faces
+        // efficiently via its centroid candidate-1 fast path.
         if let Some(surface) = model.surfaces.get(face.surface) {
             use crate::primitives::surface::SurfaceType;
             if matches!(surface.surface_type(), SurfaceType::Plane) {
-                let outer_eids: Vec<EdgeId> = face.boundary_edges.iter().map(|&(e, _)| e).collect();
-                let outer_3d = extract_cycle_vertices_3d(&outer_eids, model);
+                // Arc-densified 3-D polygon for one loop (boundary_edges or inner_loop).
+                // Using raw vertex positions (extract_cycle_vertices_3d) builds the
+                // inscribed CHORD polygon for arc edges — for a crescent bounded by a
+                // bore's r7 arc, the chord polygon is meaningfully smaller than the arc
+                // region, and a "strictly interior" candidate from the chord polygon can
+                // sit on the void side of the arc. Sample each edge at SAMPLES points in
+                // traversal order so the polygon follows the arc.
+                let densify_3d = |loop_edges: &[(EdgeId, bool)]| -> Vec<Point3> {
+                    const SAMPLES: usize = 8;
+                    let mut pts: Vec<Point3> = Vec::with_capacity(loop_edges.len() * SAMPLES);
+                    for &(eid, fwd) in loop_edges {
+                        let Some(edge) = model.edges.get(eid) else {
+                            continue;
+                        };
+                        let Some(curve) = model.curves.get(edge.curve_id) else {
+                            continue;
+                        };
+                        let (a, b) = (edge.param_range.start, edge.param_range.end);
+                        for k in 0..SAMPLES {
+                            let f = k as f64 / SAMPLES as f64;
+                            let t = if fwd {
+                                a + (b - a) * f
+                            } else {
+                                b - (b - a) * f
+                            };
+                            if let Ok(p) = curve.point_at(t) {
+                                pts.push(p);
+                            }
+                        }
+                    }
+                    pts
+                };
+
+                let outer_3d = densify_3d(&face.boundary_edges);
                 if outer_3d.len() >= 3 {
-                    if let Some(p) = polygon_interior_point_3d(model, face.surface, &outer_3d, &[])
+                    // Densify inner loops (holes). Without this, a planar fragment that
+                    // already carries a pre-existing hole (e.g. the wall face of a
+                    // previously drilled bore, now being sliced again) has its hole
+                    // ignored by the interior-point search → the returned point can land
+                    // inside the hole → the face is filed as material in a void region.
+                    let hole_3d: Vec<Vec<Point3>> = face
+                        .inner_loops
+                        .iter()
+                        .map(|lp| densify_3d(lp))
+                        .filter(|v| v.len() >= 3)
+                        .collect();
+
+                    if let Some(p) =
+                        polygon_interior_point_3d(model, face.surface, &outer_3d, &hole_3d)
                     {
                         return Ok(p);
                     }

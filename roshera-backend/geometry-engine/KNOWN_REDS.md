@@ -12,10 +12,6 @@
 #
 # Gate script: roshera-backend/scripts/red-gate.ps1
 
-# Family: boolean bracket / F4 sever (1 test) -- diag: burndown-diag-boolean.md#sub-group-b
-boolean_bracket_robustness::f4_oversized_bore_severs_into_two_bodies  # diag: burndown-diag-boolean.md#sub-group-b
-
-
 # Family: hexagon commutativity (1 test) -- diag: burndown-diag-boolean.md#sub-group-d
 polyline_cut_harness::union_commutative_polyline_hexagons  # diag: burndown-diag-boolean.md#sub-group-d
 
