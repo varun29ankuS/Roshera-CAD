@@ -7315,26 +7315,43 @@ fn create_trimmed_fillet_face(
         0.5 * (cap_v0_center.z + cap_v1_center.z),
     );
     let outward_target = surface_mid_pt - rolling_ball_mid;
-    // If the surface midpoint coincides with the rolling-ball midpoint
-    // (radius collapses to 0, degenerate three-sided limit), fall back
-    // to the bisector of the two face1 / face2 normals at the edge
-    // midpoint — that direction points away from the dihedral.
+    // Bisector of the two adjacent faces' ORIENTED outward normals at
+    // the edge midpoint. Because both normals point away from the
+    // material, their sum points into the material-free region for any
+    // dihedral (convex wedge OR concave notch) short of the degenerate
+    // 180° case.
+    let edge_mid = Point3::new(
+        0.5 * (start_pos[0] + end_pos[0]),
+        0.5 * (start_pos[1] + end_pos[1]),
+        0.5 * (start_pos[2] + end_pos[2]),
+    );
+    let n1 = get_face_oriented_normal(model, face1_id, &edge_mid).unwrap_or(Vector3::ZERO);
+    let n2 = get_face_oriented_normal(model, face2_id, &edge_mid).unwrap_or(Vector3::ZERO);
+    let bisector = n1 + n2;
     let outward_target = if outward_target.magnitude_squared() > 1e-20 {
-        outward_target
-    } else {
-        let edge_mid = Point3::new(
-            0.5 * (start_pos[0] + end_pos[0]),
-            0.5 * (start_pos[1] + end_pos[1]),
-            0.5 * (start_pos[2] + end_pos[2]),
-        );
-        let n1 = get_face_oriented_normal(model, face1_id, &edge_mid).unwrap_or(Vector3::Z);
-        let n2 = get_face_oriented_normal(model, face2_id, &edge_mid).unwrap_or(Vector3::Z);
-        let bisector = n1 + n2;
-        if bisector.magnitude_squared() > 1e-20 {
-            bisector
+        // CONCAVITY SIGN (surfaced by the Family 4.5 extrude fix, which
+        // made non-convex prisms valid enough to reach this code):
+        // `surface_mid − ball_mid` points away from the material only
+        // for CONVEX edges, where the rolling ball travels inside the
+        // material. At a concave (reflex) edge the ball rolls in the
+        // void and the material lies on the ball side of the blend —
+        // the outward direction is TOWARD the ball. The bisector
+        // arbitrates: flip the (co-located, well-scaled) ball target
+        // when it lands on the material side. Convex results are
+        // untouched — their ball target already agrees with the
+        // bisector.
+        if bisector.magnitude_squared() > 1e-20 && outward_target.dot(&bisector) < 0.0 {
+            -outward_target
         } else {
-            Vector3::Z
+            outward_target
         }
+    } else if bisector.magnitude_squared() > 1e-20 {
+        // Surface midpoint coincides with the rolling-ball midpoint
+        // (radius collapses to 0, degenerate three-sided limit): the
+        // bisector itself is the outward direction.
+        bisector
+    } else {
+        Vector3::Z
     };
     let surface_ref = model
         .surfaces

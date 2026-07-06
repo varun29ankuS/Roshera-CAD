@@ -12,5 +12,7 @@
 #
 # Gate script: roshera-backend/scripts/red-gate.ps1
 
-# Family: extrude wall orientation (1 test) -- diag: burndown-diag-drawing-tess.md#family-45
-fillet_chamfer_dihedral_matrix::matrix_helpers_build_valid_prisms_with_expected_vertical_edge_counts  # diag: burndown-diag-drawing-tess.md#family-45
+
+# ALLOWLIST EMPTY as of 2026-07-07 (red-burndown campaign complete): all 30
+# pre-existing reds fixed at root. Any future entry requires a diagnosis doc
+# per the ratchet rule above.

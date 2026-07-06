@@ -139,23 +139,53 @@ fn build_extrusion_loop_topology(
     })
 }
 
+/// Per-loop context for deciding each wall face's outward orientation.
+///
+/// `newell_normal` is the loop's traversal-ordered Newell normal: the
+/// unit vector about which the loop, walked in its stored edge order
+/// and orientations, winds counter-clockwise. It is exact (a signed-
+/// area integral) for ANY simple planar profile — convex or not — so
+/// per-wall outward directions derived from it carry no star-shaped
+/// assumption. `None` when the Newell vector was degenerate (zero-area
+/// loop); walls then fall back to the centroid-radial heuristic.
+///
+/// `centroid` + `inner_sign` remain for the two places the radial test
+/// is still the right tool: full-circle walls collapsed to an analytic
+/// `Cylinder` (whose own parameterisation seam breaks curve-parameter
+/// co-location — EXTRUDE-CYL-MESH-INVERTED) and the degenerate
+/// fallback. For a circle loop the centroid test is exact (convex).
+struct WallOrientationContext {
+    centroid: Point3,
+    newell_normal: Option<Vector3>,
+    inner_sign: f64,
+}
+
 /// Create one side face that walks bottom-edge → right-vertical →
 /// top-edge (reversed) → left-vertical (reversed). The vertical edges
 /// come from the shared topology, so the next side face along the
 /// loop will reference the same right-vertical edge as its left-vertical
 /// — that's what makes the shell watertight.
 ///
-/// `outward_target` is the geometric direction the face's oriented
-/// normal must align with. For an outer-loop wall it points away from
-/// the loop centroid (away from the solid material); for an inner-loop
-/// (hole) wall it points toward the loop centroid (into the hole = away
-/// from solid material). Caller is responsible for computing this. The
-/// helper picks `FaceOrientation::Forward` or `Backward` so the ruled-
-/// surface intrinsic normal × orientation.sign() aligns with the target
-/// — without this fix the orientation was always `Forward` regardless
-/// of the ruled-surface u × v parameterisation direction, and downstream
-/// fillet/chamfer at non-90° dihedrals would carve material from the
-/// wrong side of the edge.
+/// The face's outward direction is decided PER WALL from the wall's own
+/// adjacent profile region: for a loop walked CCW about its Newell
+/// normal `N`, the enclosed region lies to the LEFT of the traversal
+/// tangent `t`, so `t × N` points away from the enclosed region at
+/// every boundary point — locally, with no assumption about the profile
+/// being star-shaped. For an outer loop the enclosed region is the
+/// solid material (outward = `t × N`); for an inner (hole) loop the
+/// enclosed region is the void, so the material-outward direction is
+/// the negation — both covered by `inner_sign`. The previous
+/// implementation aimed the wall away from the GLOBAL loop centroid,
+/// which misorients walls of non-convex profiles whose centroid falls
+/// on the wrong side locally (the L-shaped-profile notch walls,
+/// Family 4.5). The helper picks `FaceOrientation::Forward` or
+/// `Backward` so the surface's intrinsic normal × orientation.sign()
+/// aligns with the computed target.
+///
+/// `curve_forward` reports whether the loop traverses the bottom edge
+/// along increasing curve parameter (loop orientation combined with
+/// the edge's own orientation relative to its curve); it fixes the
+/// traversal sign of the sampled tangent.
 fn create_side_face_shared(
     model: &mut BRepModel,
     bottom_edge_id: EdgeId,
@@ -164,8 +194,8 @@ fn create_side_face_shared(
     bottom_end_v: VertexId,
     top_edge_id: EdgeId,
     topology: &ExtrusionLoopTopology,
-    loop_centroid: Point3,
-    inner_sign: f64,
+    orientation_ctx: &WallOrientationContext,
+    curve_forward: bool,
 ) -> OperationResult<FaceId> {
     let left_vertical = *topology.vertical_edge.get(&bottom_start_v).ok_or_else(|| {
         OperationError::InvalidGeometry("Vertical edge map miss (left)".to_string())
@@ -185,37 +215,92 @@ fn create_side_face_shared(
     let loop_id = model.loops.add(face_loop);
 
     let surface = create_ruled_surface(model, bottom_edge_id, top_edge_id)?;
-    // Compute the outward target AT THE SURFACE'S OWN sample point, co-located
-    // with the normal that `orient_face_for_outward` reads at the parametric
-    // midpoint. The previous caller-supplied target was evaluated at the LOOP
-    // edge-midpoint, which for a closed-circle lateral (the extruded-circle
-    // cylinder) sits at a DIFFERENT angle than the surface seam — the normal and
-    // target then come out ~perpendicular and the orientation defaults to the
-    // wrong side (EXTRUDE-CYL-MESH-INVERTED: ⅓ volume, inward lateral). Sampling
-    // the surface midpoint makes the radial-out direction and the normal share a
-    // location, so the dot product is decisive. The axial component of
-    // `sample - centroid` is orthogonal to the (radial) lateral normal, so it
-    // does not bias the sign. `inner_sign` flips it for hole loops.
-    let target = {
-        let ((umn, umx), (vmn, vmx)) = surface.parameter_bounds();
-        // Guard infinite bounds (e.g. Plane returns ±∞): computing
-        // 0.5*(−∞ + +∞) yields NaN, which propagates into point_at and
-        // forces the fallback to Vector3::Z.  For surfaces with infinite
-        // extents the analytic origin (u=0, v=0) is always a valid,
-        // finite sample point, so we use it in place of the midpoint.
-        let u_mid = if umn.is_finite() && umx.is_finite() {
-            0.5 * (umn + umx)
+    let ((umn, umx), (vmn, vmx)) = surface.parameter_bounds();
+    // Guard infinite bounds (e.g. Plane returns ±∞): computing
+    // 0.5*(−∞ + +∞) yields NaN, which propagates into point_at and
+    // forces the fallback to Vector3::Z.  For surfaces with infinite
+    // extents the analytic origin (u=0, v=0) is always a valid,
+    // finite sample point, so we use it in place of the midpoint.
+    let u_mid = if umn.is_finite() && umx.is_finite() {
+        0.5 * (umn + umx)
+    } else {
+        0.0
+    };
+    let v_mid = if vmn.is_finite() && vmx.is_finite() {
+        0.5 * (vmn + vmx)
+    } else {
+        0.0
+    };
+
+    // PER-WALL LOCAL OUTWARD (Family 4.5). The wall's outward direction
+    // is `inner_sign · (t_trav × N)` where `t_trav` is the profile
+    // tangent in loop-traversal direction and `N` the loop's traversal
+    // Newell normal — the material side of THIS edge, determined by the
+    // edge's own adjacent region, independent of where the global
+    // centroid happens to sit. On convex profiles this agrees with the
+    // old centroid test by construction: a convex region lies entirely
+    // in the inner half-plane of each boundary edge, so
+    // (sample − centroid) · (t_trav × N) > 0 for any interior centroid
+    // and `orient_face_for_outward` (which only consumes the sign of
+    // one dot product) receives a target in the same half-space.
+    //
+    // Co-location with the normal sample: `orient_face_for_outward`
+    // reads the surface normal at (u_mid, v_mid). For a `RuledSurface`
+    // wall, u maps RAW onto its `curve1` (the bottom sub-curve), so the
+    // tangent is sampled from that very curve at the very same u_mid —
+    // the normal and tangent share a footprint exactly. Planar walls
+    // have constant normal/tangent, so the model-edge parameter
+    // midpoint is equally exact.
+    //
+    // Full-circle walls collapsed to an analytic `Cylinder` keep the
+    // centroid-radial test: the Cylinder's own angular parameterisation
+    // is seam-shifted relative to the profile curve's (the
+    // EXTRUDE-CYL-MESH-INVERTED trap), and for the single-full-circle
+    // loop — the only loop shape that produces a Cylinder wall — the
+    // centroid test is exact (a circle is convex).
+    let mut target: Option<Vector3> = None;
+    let is_cylinder_wall = surface.as_any().downcast_ref::<Cylinder>().is_some();
+    if let (false, Some(newell)) = (is_cylinder_wall, orientation_ctx.newell_normal) {
+        let tangent = if let Some(ruled) = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::RuledSurface>()
+        {
+            ruled.curve1.tangent_at(u_mid).ok()
         } else {
-            0.0
+            // Planar wall (or any other non-ruled carrier): sample the
+            // model's own bottom curve at the edge's parameter midpoint.
+            let edge = model.edges.get(bottom_edge_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Bottom edge not found".to_string())
+            })?;
+            let range = edge.param_range;
+            let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
+                OperationError::InvalidGeometry("Bottom curve not found".to_string())
+            })?;
+            curve.tangent_at(0.5 * (range.start + range.end)).ok()
         };
-        let v_mid = if vmn.is_finite() && vmx.is_finite() {
-            0.5 * (vmn + vmx)
-        } else {
-            0.0
-        };
-        match surface.point_at(u_mid, v_mid) {
+        if let Some(t) = tangent {
+            let traversal_sign = if curve_forward { 1.0 } else { -1.0 };
+            let candidate = t.cross(&newell) * (traversal_sign * orientation_ctx.inner_sign);
+            if candidate.magnitude_squared() > 1e-20 {
+                target = Some(candidate);
+            }
+        }
+    }
+
+    // Cylinder walls and degenerate fallbacks: outward target AT THE
+    // SURFACE'S OWN sample point, co-located with the normal that
+    // `orient_face_for_outward` reads at the parametric midpoint
+    // (EXTRUDE-CYL-MESH-INVERTED: sampling at the loop edge-midpoint
+    // instead left the normal and target ~perpendicular on the
+    // closed-circle lateral and the orientation defaulted to the wrong
+    // side). The axial component of `sample - centroid` is orthogonal
+    // to the (radial) lateral normal, so it does not bias the sign.
+    // `inner_sign` flips it for hole loops.
+    let target = match target {
+        Some(t) => t,
+        None => match surface.point_at(u_mid, v_mid) {
             Ok(sp) => {
-                let radial = (sp - loop_centroid) * inner_sign;
+                let radial = (sp - orientation_ctx.centroid) * orientation_ctx.inner_sign;
                 if radial.magnitude_squared() > 1e-20 {
                     radial
                 } else {
@@ -223,7 +308,7 @@ fn create_side_face_shared(
                 }
             }
             Err(_) => Vector3::Z,
-        }
+        },
     };
     let orientation = orient_face_for_outward(surface.as_ref(), target)?;
     let surface_id = model.surfaces.add(surface);
@@ -868,13 +953,16 @@ fn assign_fresh_extrude_pids(
 /// Build one side face per edge of `base_loop`, pushing each new `FaceId`
 /// onto `out_faces`. Shared between outer and inner loop extrusion paths.
 ///
-/// For each side face the outward target is computed as the in-plane
-/// direction from the loop centroid to the bottom-edge midpoint, then
-/// negated for inner (hole) loops — so a hole wall's oriented outward
-/// normal points into the hole, away from the surrounding solid
-/// material. The target is passed to `create_side_face_shared` which
-/// hands it to `orient_face_for_outward` to pick the correct
-/// `FaceOrientation` for the ruled surface.
+/// Each side face's outward direction is decided from ITS OWN adjacent
+/// profile region: the loop's traversal-ordered Newell normal `N` is
+/// computed once, and each wall's outward target is the local
+/// `traversal_tangent × N`, negated for inner (hole) loops — so a hole
+/// wall's oriented outward normal points into the hole, away from the
+/// surrounding solid material. This is exact for any simple planar
+/// profile; the previous global-centroid heuristic misoriented walls of
+/// non-convex profiles (Family 4.5). The context is passed to
+/// `create_side_face_shared` which hands the computed target to
+/// `orient_face_for_outward` to pick the correct `FaceOrientation`.
 /// Sample a point on an edge's underlying curve at fraction `f` of its
 /// parameter sub-range. Unlike reading the edge's endpoint vertices, this
 /// is correct for a closed curved edge (e.g. a full-circle loop, whose
@@ -952,7 +1040,7 @@ fn build_loop_side_faces(
     topology: &ExtrusionLoopTopology,
     out_faces: &mut Vec<FaceId>,
 ) -> OperationResult<()> {
-    let bottom_endpoints: Vec<(VertexId, VertexId)> = base_loop
+    let bottom_endpoints: Vec<(VertexId, VertexId, bool)> = base_loop
         .edges
         .iter()
         .map(|&edge_id| {
@@ -960,7 +1048,7 @@ fn build_loop_side_faces(
                 .edges
                 .get(edge_id)
                 .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))
-                .map(|e| (e.start_vertex, e.end_vertex))
+                .map(|e| (e.start_vertex, e.end_vertex, e.orientation.is_forward()))
         })
         .collect::<OperationResult<Vec<_>>>()?;
 
@@ -1014,21 +1102,72 @@ fn build_loop_side_faces(
         _ => 1.0,
     };
 
+    // Traversal-ordered Newell normal of the loop — the axis about which
+    // the loop, walked in stored edge order with stored orientations,
+    // winds counter-clockwise. Exact (signed-area vector) for any simple
+    // planar loop, convex or not; this is what lets each wall's outward
+    // direction be decided from its OWN adjacent region (tangent × N)
+    // instead of the global-centroid heuristic, which misjudges walls of
+    // non-convex profiles (Family 4.5: the L-shaped profile's two notch
+    // walls came out flipped because the centroid sits outside the
+    // material near the reflex corner). Samples come from the edge
+    // CURVES so a single-full-circle loop contributes a real polygon,
+    // and each edge's samples are appended in TRAVERSAL order (curve
+    // parameter direction reconciled through both the loop orientation
+    // and the edge's orientation relative to its curve) so the winding
+    // sign is trustworthy. Newell's sum is translation-invariant, so no
+    // recentring is needed.
+    let newell_normal: Option<Vector3> = {
+        const SAMPLES_PER_EDGE: usize = 8;
+        let mut polygon: Vec<Point3> = Vec::with_capacity(base_loop.edges.len() * SAMPLES_PER_EDGE);
+        for (i, &edge_id) in base_loop.edges.iter().enumerate() {
+            let curve_forward = base_loop.orientations[i] == bottom_endpoints[i].2;
+            for k in 0..SAMPLES_PER_EDGE {
+                let f_traversal = k as f64 / SAMPLES_PER_EDGE as f64;
+                let f = if curve_forward {
+                    f_traversal
+                } else {
+                    1.0 - f_traversal
+                };
+                polygon.push(sample_edge_point(model, edge_id, f)?);
+            }
+        }
+        let mut newell = Vector3::ZERO;
+        for i in 0..polygon.len() {
+            let a = polygon[i];
+            let b = polygon[(i + 1) % polygon.len()];
+            let av = Vector3::new(a.x, a.y, a.z);
+            let bv = Vector3::new(b.x, b.y, b.z);
+            newell = newell + av.cross(&bv);
+        }
+        newell.normalize().ok()
+    };
+
+    let orientation_ctx = WallOrientationContext {
+        centroid,
+        newell_normal,
+        inner_sign,
+    };
+
     for (i, &bottom_edge_id) in base_loop.edges.iter().enumerate() {
         let bottom_forward = base_loop.orientations[i];
-        let (raw_start, raw_end) = bottom_endpoints[i];
+        let (raw_start, raw_end, edge_orientation_forward) = bottom_endpoints[i];
         let (loop_start, loop_end) = if bottom_forward {
             (raw_start, raw_end)
         } else {
             (raw_end, raw_start)
         };
+        // Loop traversal runs along increasing curve parameter iff the
+        // loop walks the edge start→end AND the edge follows its curve,
+        // or both are reversed.
+        let curve_forward = bottom_forward == edge_orientation_forward;
 
-        // The wall's outward direction is derived inside `create_side_face_shared`
-        // from the SURFACE's own sample point (co-located with the orientation
-        // normal) using `loop_centroid` + `inner_sign` — passing the loop
-        // edge-midpoint here was the EXTRUDE-CYL-MESH-INVERTED bug (the
-        // closed-circle lateral's seam sits at a different angle than the loop
-        // sample, so normal and target came out perpendicular).
+        // The wall's outward direction is derived inside
+        // `create_side_face_shared` from THIS wall's own adjacent profile
+        // region (traversal tangent × loop Newell normal, flipped for
+        // hole loops), sampled co-located with the orientation normal;
+        // the centroid rides along only for the Cylinder-wall and
+        // degenerate fallbacks (EXTRUDE-CYL-MESH-INVERTED).
         let side_face = create_side_face_shared(
             model,
             bottom_edge_id,
@@ -1037,8 +1176,8 @@ fn build_loop_side_faces(
             loop_end,
             topology.top_edges[i],
             topology,
-            centroid,
-            inner_sign,
+            &orientation_ctx,
+            curve_forward,
         )?;
         out_faces.push(side_face);
     }
