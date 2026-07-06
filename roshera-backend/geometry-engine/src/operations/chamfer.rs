@@ -3522,6 +3522,42 @@ fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationRe
     // remains available as a diagnostic (used by the integration harness), and the
     // niche chamfer-crosses-fillet case (#70) stays documented there; the real fix
     // is the junction reconstruction (#72), not a blanket reject.
+
+    // PHYSICAL-SOUNDNESS GATE — the acceptance predicate must run the SAME
+    // mesh-soundness check that the mass-properties REFUSE gate enforces
+    // downstream (`topology_builder::mesh_based_mass_properties_at` →
+    // `check_mass_properties_physical`). A chamfer that passes the B-Rep
+    // structural check but produces a non-physical inertia tensor (negative
+    // principal moment, asymmetric tensor) has introduced a geometric defect
+    // — typically: the chamfer setback crossed an existing blend scar (the
+    // fillet-scar family, #70) producing a partially-cancelled mesh whose
+    // divergence-theorem integration yields a non-physical result.
+    //
+    // `audit_mass_properties` runs the same Tonon (2004) integration +
+    // physical-validity gate as the downstream path, at `default()` resolution
+    // (cheaper than `fine()`; the gate's principal-moment check is robust at
+    // this quality). A `None` return means the gate fired — the solid is not
+    // certifiable — and the chamfer must be refused here so the
+    // `with_rollback` wrapper restores the pre-call model.
+    //
+    // Skip this gate for partially-blended corners (`pending` non-empty):
+    // those intentionally have an open corner topology (mid-blend, not a
+    // final state) whose mesh is legitimately non-closed, so mass-props will
+    // fail for an expected structural reason unrelated to the scar-crossing
+    // defect this gate targets.
+    if pending.is_empty() {
+        if model.audit_mass_properties(solid_id).is_none() {
+            return Err(OperationError::InvalidBRep(format!(
+                "Chamfered solid {} is structurally valid but produces a \
+                 non-physical inertia tensor (negative principal moment or \
+                 non-finite volume) — the chamfer setback likely crossed an \
+                 existing blend scar; the operation is refused to prevent \
+                 emitting an unsound solid",
+                solid_id
+            )));
+        }
+    }
+
     Ok(())
 }
 
