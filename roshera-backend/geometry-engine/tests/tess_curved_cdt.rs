@@ -3,11 +3,14 @@
 //!
 //! The curved-CDT module is `pub(crate)` so these tests exercise it
 //! through the public `tessellate_face` entry point, which routes
-//! `"NURBS"` surfaces directly into the CDT-α dispatcher (and falls
-//! back to the legacy quadtree on `Err`). What's pinned here is the
-//! end-to-end contract, not the internal CDT details — the in-crate
-//! `curved_cdt::tests` module already covers the algorithmic
-//! invariants at unit-test granularity.
+//! `"NurbsSurface"` (the `type_name()` a `GeneralNurbsSurface`
+//! reports) into the CDT dispatcher. Historical note (Task 4C): the
+//! dispatch arm originally matched `"NURBS"`, which no surface ever
+//! reported — the arm was dead from birth and these tests were green
+//! via fallback paths until `d394dc7` activated the honest route.
+//! What's pinned here is the end-to-end contract, not the internal
+//! CDT details — the in-crate `curved_cdt::tests` module already
+//! covers the algorithmic invariants at unit-test granularity.
 
 // AUDIT-H13: Reason for `#![allow(clippy::expect_used)]` — test-only file.
 // `expect(...)` on fixture/scaffolding code surfaces invariant violations
@@ -35,8 +38,8 @@ use geometry_engine::tessellation::{
 
 /// Build a bilinear-degree NURBS face spanning the unit square in
 /// XY at z = 0, with a CCW rectangular outer trim. Routes through
-/// `"NURBS"` surface_type so `tessellate_face` dispatches via
-/// `tessellate_nurbs_face` → `curved_cdt::tessellate_curved_cdt`.
+/// the `"NurbsSurface"` surface_type so `tessellate_face` dispatches
+/// via `tessellate_nurbs_face` → `curved_cdt::tessellate_curved_cdt`.
 fn build_flat_nurbs_unit_square(
     model: &mut BRepModel,
     (x0, y0): (f64, f64),

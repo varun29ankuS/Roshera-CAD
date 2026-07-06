@@ -641,9 +641,11 @@ fn generate_steiner_candidates(
     // Collapse such a direction to `min_segments`: geometry-preserving (the
     // removed rows/columns are collinear, so boundary, validity, watertightness
     // and normals are unchanged) and the now-elongated interior triangles are
-    // ACCEPTED downstream because the Ruppert skinny pass is gated on
-    // `triangle_fails_fidelity` — without that gate refinement re-added the
-    // rows, which is why this collapse alone (earlier attempt) only cut ~20%.
+    // ACCEPTED downstream because developable surfaces skip Ruppert refinement
+    // entirely (`refine_to_convergence` fast-path; the skinny scan's
+    // `triangle_fails_fidelity` gate is the developable-only backstop) —
+    // without that, refinement re-added the rows, which is why this collapse
+    // alone (earlier attempt) only cut ~20%.
     // The sagitta criterion above already returns `min_segments` for a straight
     // direction, so this is a belt-and-braces clamp that also neutralises any
     // sampling noise in the chord measure for an exactly-collinear chain.
@@ -756,11 +758,28 @@ fn generate_steiner_candidates(
         })
     };
     let v_eps = v_span * 1e-3;
+    // Grid-row keepout (Task 4C sliver factory). A boundary vertex whose
+    // TRUE height coincides with a main grid row projects with
+    // `closest_point` solver noise (~1e-7), so its trim row would run
+    // PARALLEL to the grid row at a sub-cell offset, sharing the exact
+    // same u columns — the CDT then triangulates the empty micro-strip
+    // between the two rows as degenerate ribbons (measured: 276
+    // slivers at 0.001° on the bicubic bump fixture, rows 7.6e-7
+    // apart). A trim height within a quarter cell of a grid row is
+    // already served by that row (worst local aspect ~4, versus the
+    // ~98 bridge the trim rows exist to prevent), so skip it. Quarter
+    // cell matches the constraint-edge keepout philosophy above.
+    let v_row_keepout = 0.25 * v_cell;
+    let near_grid_row = |v: f64| -> bool {
+        let rel = (v - v_lo) / v_span * (nv as f64);
+        (rel - rel.round()).abs() * v_cell < v_row_keepout
+    };
     let mut trim_vs: Vec<f64> = Vec::new();
     for poly in std::iter::once(outer_polygon).chain(inner_polygons.iter().map(|p| p.as_slice())) {
         for &(_, v) in poly {
             if v > v_lo + v_eps
                 && v < v_hi - v_eps
+                && !near_grid_row(v)
                 && !trim_vs.iter().any(|&t| (t - v).abs() < v_eps)
             {
                 trim_vs.push(v);
@@ -1099,12 +1118,22 @@ fn triangle_fails_fidelity(
 /// the UV centroid, lift it to 3D, and compare against the planar
 /// triangle formed by the three corner 3D positions. If chord error
 /// exceeds `params.chord_tolerance` OR the max corner-normal
-/// deviation exceeds `params.max_angle_deviation`, push the centroid
-/// UV into a refinement set.
+/// deviation exceeds `params.max_angle_deviation`, push a refinement
+/// candidate for the triangle.
 ///
-/// Returns the (possibly empty) refinement set. Bounded at one pass
-/// in α — `tessellate_curved_cdt` calls this once and re-runs CDT
-/// at most once.
+/// Insertion location (Task 4C): the UV CIRCUMCENTER when it is a
+/// valid interior site, falling back to the centroid otherwise.
+/// Ruppert/Chew's analysis (Shewchuk 1996, §3) is specific about WHY:
+/// the circumcenter of a Delaunay triangle is at least a circumradius
+/// away from every existing vertex, so its insertion kills the
+/// triangle without manufacturing short edges. The centroid carries no
+/// such guarantee — on an already-anisotropic triangle it lands close
+/// to the long edge, and iterating centroid insertions is what ground
+/// the bump-patch fixture down to 0.57° slivers. The centroid remains
+/// the fallback because it is unconditionally interior to its (domain-
+/// contained) triangle, so a candidate is never lost — only relocated.
+///
+/// Returns the (possibly empty) refinement set.
 fn collect_refinement_centroids(
     triangles: &[[usize; 3]],
     pts2d: &[(f64, f64)],
@@ -1114,8 +1143,12 @@ fn collect_refinement_centroids(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
-) -> Vec<(f64, f64)> {
-    let mut out: Vec<(f64, f64)> = Vec::new();
+) -> Vec<((f64, f64), f64)> {
+    use crate::math::circumcircle::{circumcircle_2d, radius_edge_ratio_sq};
+    use crate::math::Vector2;
+
+    let keepout = boundary_keepout_uv(outer);
+    let mut out: Vec<((f64, f64), f64)> = Vec::new();
     for tri in triangles {
         let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
         if ia >= pts2d.len() || ib >= pts2d.len() || ic >= pts2d.len() {
@@ -1196,7 +1229,42 @@ fn collect_refinement_centroids(
         let chord_fail = params.chord_tolerance > 0.0 && chord_error > params.chord_tolerance;
         let angle_fail = params.max_angle_deviation > 0.0 && max_dev > params.max_angle_deviation;
         if chord_fail || angle_fail {
-            out.push((u_c, v_c));
+            // Circumcenter when it is a valid interior insertion site
+            // (inside the outer trim, outside every hole, clear of the
+            // fixed constraint segments); centroid fallback otherwise.
+            let a2 = Vector2::new(ua, va);
+            let b2 = Vector2::new(ub, vb);
+            let c2 = Vector2::new(uc, vc);
+            let circumcenter = circumcircle_2d(a2, b2, c2)
+                .map(|(center, r_sq)| ((center.x, center.y), r_sq.max(0.0).sqrt()))
+                .filter(|&(cc, _r)| {
+                    is_inside_uv_polygon(cc, &outer.points_uv)
+                        && !inners
+                            .iter()
+                            .any(|p| is_inside_uv_polygon(cc, &p.points_uv))
+                        && !near_boundary_segment(cc, outer, inners, keepout)
+                });
+            match circumcenter {
+                Some(candidate) => out.push(candidate),
+                // The centroid fallback is only sound for a WELL-SHAPED
+                // triangle. For a skinny one whose circumcenter is not a
+                // valid interior site, the triangle is structurally
+                // unfixable by interior insertion — splitting a
+                // near-degenerate UV ribbon at its centroid just halves
+                // it into two finer ribbons (the pre-Task-4C sliver
+                // cascade: 84 slivers at 0.57°). Skip it; the skinny
+                // scan owns the quality criterion and its circumcenter
+                // rejection is the same verdict.
+                None if radius_edge_ratio_sq(a2, b2, c2) <= RADIUS_EDGE_LIMIT_SQ => {
+                    // Fallback spacing radius: the centroid's clearance
+                    // to the nearest corner (the centroid is
+                    // unconditionally interior to its triangle, so this
+                    // is a genuine local length scale).
+                    let d = |x: f64, y: f64| ((u_c - x).powi(2) + (v_c - y).powi(2)).sqrt();
+                    out.push(((u_c, v_c), d(ua, va).min(d(ub, vb)).min(d(uc, vc))));
+                }
+                None => {}
+            }
         }
     }
     out
@@ -1210,19 +1278,38 @@ fn collect_refinement_centroids(
 /// practice well-behaved curved faces converge in 1–3 passes.
 const RUPPERT_MAX_PASSES: usize = 12;
 
-/// Cumulative interior-Steiner budget, as a multiple of the boundary
-/// vertex count. For a chord-tolerance surface mesh the interior vertex
-/// count scales with the boundary's, so a healthy refinement converges
-/// well under this. Exceeding it means refinement is NOT converging —
-/// the classic case is a boundary already sampled *at* `chord_tolerance`
-/// (so boundary-adjacent triangles sit at the threshold) on a high-aspect
-/// face: interior insertion cannot beat the immutable per-edge cache
-/// resolution, so the same borderline triangles are re-flagged every
-/// pass. We then freeze on the densest valid triangulation rather than
-/// pile on an ever-denser, near-degenerate point set (which also tips the
-/// `cdt` crate into its internal `assert!`). 16× is generous: real faces
-/// converge far below it.
+/// Boundary-scaled component of the interior-Steiner budget. For a
+/// chord-tolerance surface mesh whose density is boundary-driven, the
+/// interior vertex count scales with the boundary's, so a healthy
+/// refinement converges well under this. Exceeding it means refinement
+/// is NOT converging — the classic case is a boundary already sampled
+/// *at* `chord_tolerance` (so boundary-adjacent triangles sit at the
+/// threshold) on a high-aspect face: interior insertion cannot beat the
+/// immutable per-edge cache resolution, so the same borderline
+/// triangles are re-flagged every pass. We then freeze on the densest
+/// valid triangulation rather than pile on an ever-denser,
+/// near-degenerate point set (which also tips the `cdt` crate into its
+/// internal `assert!`). 16× is generous: real faces converge far below
+/// it.
 const STEINER_BUDGET_FACTOR: usize = 16;
+
+/// Curvature-scaled component of the interior-Steiner budget, as a
+/// multiple of the Step-2 seed size. The sagitta-driven Steiner grid
+/// (`generate_steiner_candidates` + `chord_segments`) is itself the
+/// MEASURED estimate of how many interior points the face's curvature
+/// demands at `chord_tolerance`, so it — not the boundary count — is
+/// the right yardstick on a face whose trim edges are geometrically
+/// straight (a doubly-curved NURBS patch bounded by lines: 4 boundary
+/// points, hundreds of curvature-demanded interior points). Before
+/// Task 4C the budget was `16 × boundary` with the seed COUNTED AGAINST
+/// it, so such a face froze on pass 0 with zero effective refinement
+/// (tess_curved_cdt: 8.3 % chord violators, 0.57° slivers). Refinement
+/// may now add up to 4× the seed on top of the seed — bounded (the seed
+/// is finite and curvature-proportional; [`RUPPERT_MAX_PASSES`] still
+/// caps the pass count), so the #58 developable-explosion guard-budget
+/// discipline is preserved (developables never reach refinement at all
+/// — see the `is_developable` fast-path).
+const SEED_BUDGET_FACTOR: usize = 4;
 
 /// Skinny-triangle threshold: squared radius-edge ratio. Triangles
 /// with `circumradius² / shortest_edge² > 2.0` (equivalent to min
@@ -1235,6 +1322,26 @@ const RADIUS_EDGE_LIMIT_SQ: f64 = 2.0;
 /// near-duplicate refinement candidates separated by sub-tolerance
 /// distance are still kept distinct (the `cdt` crate tolerates them).
 const STEINER_DEDUP_TOL: f64 = 1e-12;
+
+/// Batch-insertion spacing factor (fraction of a candidate's own
+/// circumradius). Ruppert's termination proof assumes SEQUENTIAL
+/// insertion: each circumcenter is ≥ its circumradius from every
+/// existing vertex (empty-circumcircle property), so no short edge is
+/// ever created. Our per-pass batch re-runs CDT once for MANY
+/// candidates, and two adjacent flagged triangles have near-cocircular
+/// circumcircles — their circumcenters can be arbitrarily close to
+/// EACH OTHER, manufacturing a tiny edge that spawns new slivers and
+/// cascades (instrumented on the bump-patch fixture: 1764 → 5508 tris
+/// in 3 passes with the worst angle collapsing to 0.01°). The filter
+/// restores the guarantee within the batch: candidates are accepted
+/// greedily in descending-circumradius order, and a candidate closer
+/// than `0.7 × its own circumradius` to an already-accepted one is
+/// deferred to the next pass (its triangle is usually killed by the
+/// accepted neighbour's insertion anyway). 0.7 ≈ 1/√2: a skinny
+/// triangle's shortest edge is < r/√2 by definition (radius-edge
+/// ratio > √2), so accepted insertions never create an edge shorter
+/// than the local existing scale.
+const BATCH_SPACING_FACTOR: f64 = 0.7;
 
 /// Outcome of a single Ruppert pass over the current triangulation.
 struct RefinementDelta {
@@ -1284,6 +1391,45 @@ fn boundary_total(outer_uv_len: usize, inner_uv_lens: &[usize]) -> usize {
     outer_uv_len + inner_uv_lens.iter().copied().sum::<usize>()
 }
 
+/// True when `p` lies within `keepout` of any boundary (constraint)
+/// segment of the outer or any inner loop. Refinement candidates this
+/// close to a fixed edge must be rejected BEFORE the CDT re-run: the
+/// `cdt` crate rejects (or `assert!`s on) a floating point coincident
+/// with a fixed-edge interior (`PointOnFixedEdge`), which would freeze
+/// refinement on the pre-insertion triangulation. The classic producer
+/// is a right triangle with its hypotenuse ON the boundary — its
+/// circumcenter is exactly the hypotenuse midpoint.
+fn near_boundary_segment(
+    p: (f64, f64),
+    outer: &ProjectedLoop,
+    inners: &[ProjectedLoop],
+    keepout: f64,
+) -> bool {
+    let near_poly = |poly: &[(f64, f64)]| -> bool {
+        let m = poly.len();
+        if m < 2 {
+            return false;
+        }
+        (0..m).any(|k| point_segment_distance_uv(p, poly[k], poly[(k + 1) % m]) < keepout)
+    };
+    near_poly(&outer.points_uv) || inners.iter().any(|i| near_poly(&i.points_uv))
+}
+
+/// Constraint-segment keepout distance for refinement candidates,
+/// relative to the outer loop's UV extent. Wide enough to clear the
+/// `cdt` crate's on-fixed-edge detection, narrow enough never to
+/// exclude a genuinely interior insertion site.
+fn boundary_keepout_uv(outer: &ProjectedLoop) -> f64 {
+    match uv_bbox_of(&outer.points_uv) {
+        Some((u_lo, u_hi, v_lo, v_hi)) => {
+            let du = u_hi - u_lo;
+            let dv = v_hi - v_lo;
+            (du * du + dv * dv).sqrt().max(f64::MIN_POSITIVE) * 1e-7
+        }
+        None => 1e-9,
+    }
+}
+
 /// Scan for skinny triangles (squared radius-edge ratio above
 /// [`RADIUS_EDGE_LIMIT_SQ`]) and return their circumcenters as
 /// refinement candidates, filtered to the face's UV domain.
@@ -1295,13 +1441,19 @@ fn boundary_total(outer_uv_len: usize, inner_uv_lens: &[usize]) -> usize {
 /// [`collect_refinement_centroids`] may still flag it on a
 /// subsequent pass.
 ///
-/// Skinny refinement is GATED on [`triangle_fails_fidelity`]: a skinny
-/// triangle that is already faithful to the surface (chord + normal within
-/// tolerance) is accepted as-is. This is what a CAD display/export mesh
-/// wants — Parasolid/ACIS facet a cylinder wall with long thin triangles —
-/// and it stops the Ruppert quality pass from exploding developable
-/// (cylinder/cone) laterals (BOOL #86 / TESS-PERF). Doubly-curved slivers
-/// (sphere/torus) fail fidelity and are still split.
+/// On a DEVELOPABLE surface, skinny refinement is GATED on
+/// [`triangle_fails_fidelity`]: a skinny triangle that is already faithful
+/// to the surface (chord + normal within tolerance) is accepted as-is.
+/// This is what a CAD display/export mesh wants — Parasolid/ACIS facet a
+/// cylinder wall with long thin triangles — and it stops the Ruppert
+/// quality pass from exploding developable (cylinder/cone) laterals
+/// (BOOL #86 / TESS-PERF). Developables normally never even reach this
+/// scan (see the `is_developable` fast-path in [`refine_to_convergence`]);
+/// the gate here is defence-in-depth. On a doubly-curved surface
+/// (sphere/torus/NURBS) the gate is NOT applied — a skinny-but-faithful
+/// triangle in a locally-flat region of a NURBS patch is still a mesh-
+/// quality defect (the CDT-β.1 18°/5 % spec), and skipping it left 0.57°
+/// slivers on the bump-patch fixture (Task 4C).
 #[allow(clippy::too_many_arguments)]
 fn scan_skinny_triangles(
     triangles: &[[usize; 3]],
@@ -1312,11 +1464,13 @@ fn scan_skinny_triangles(
     face: &Face,
     model: &BRepModel,
     params: &TessellationParams,
-) -> Vec<(f64, f64)> {
+) -> Vec<((f64, f64), f64)> {
     use crate::math::circumcircle::{circumcircle_2d, radius_edge_ratio_sq};
     use crate::math::Vector2;
     use crate::tessellation::surface::calculate_winding_number;
 
+    let keepout = boundary_keepout_uv(outer);
+    let developable = surface.is_developable();
     let mut out = Vec::new();
     for tri in triangles {
         let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
@@ -1329,12 +1483,17 @@ fn scan_skinny_triangles(
         if radius_edge_ratio_sq(a, b, c) <= RADIUS_EDGE_LIMIT_SQ {
             continue;
         }
-        // Quality refinement only where it buys geometric fidelity: a skinny
-        // but faithful triangle (developable lateral) is left alone.
-        if !triangle_fails_fidelity(tri, pts2d, outer, inners, surface, face, model, params) {
+        // Developable lateral only: quality refinement only where it buys
+        // geometric fidelity — a skinny but faithful triangle is left alone
+        // (see the doc comment). Doubly-curved surfaces refine every skinny
+        // triangle: the 18°/5 % spec is a mesh-quality bar, not a fidelity
+        // bar.
+        if developable
+            && !triangle_fails_fidelity(tri, pts2d, outer, inners, surface, face, model, params)
+        {
             continue;
         }
-        let (center, _r_sq) = match circumcircle_2d(a, b, c) {
+        let (center, r_sq) = match circumcircle_2d(a, b, c) {
             Some(x) => x,
             None => continue,
         };
@@ -1354,7 +1513,13 @@ fn scan_skinny_triangles(
         if in_any_hole {
             continue;
         }
-        out.push((center.x, center.y));
+        // Never hand the CDT a floating point ON a fixed edge (the
+        // right-triangle hypotenuse-midpoint case) — it aborts the whole
+        // re-run and freezes refinement.
+        if near_boundary_segment(center_pt, outer, inners, keepout) {
+            continue;
+        }
+        out.push((center_pt, r_sq.max(0.0).sqrt()));
     }
     out
 }
@@ -1425,17 +1590,39 @@ fn scan_one_pass(
     model: &BRepModel,
     params: &TessellationParams,
 ) -> RefinementDelta {
-    // (1) α-style chord & normal violations.
-    let mut additions = collect_refinement_centroids(
+    // (1) α-style chord & normal violations (circumcenter insertion,
+    //     centroid fallback).
+    let mut candidates = collect_refinement_centroids(
         triangles, pts2d, outer, inners, surface, face, model, params,
     );
 
-    // (2) Skinny-triangle circumcenters (gated on geometric fidelity).
-    additions.extend(scan_skinny_triangles(
+    // (2) Skinny-triangle circumcenters (fidelity-gated on developables
+    //     only).
+    candidates.extend(scan_skinny_triangles(
         triangles, pts2d, outer, inners, surface, face, model, params,
     ));
 
-    // (3) Drop any candidate equal to (or within dedup tolerance of)
+    // (3) Batch-insertion conflict filter: greedy independent set in
+    //     descending-circumradius order; a candidate closer than
+    //     `BATCH_SPACING_FACTOR ×` its own spacing radius to an
+    //     already-accepted candidate is deferred (its triangle is
+    //     re-scanned next pass if it survives). Restores Ruppert's
+    //     no-short-edge guarantee within the batch — without it the
+    //     batch cascaded into ever-finer slivers.
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut additions: Vec<(f64, f64)> = Vec::with_capacity(candidates.len());
+    for &((u, v), r) in &candidates {
+        let min_sep = BATCH_SPACING_FACTOR * r;
+        let min_sep_sq = min_sep * min_sep;
+        let clear = additions
+            .iter()
+            .all(|&(au, av)| (au - u).powi(2) + (av - v).powi(2) >= min_sep_sq);
+        if clear {
+            additions.push((u, v));
+        }
+    }
+
+    // (4) Drop any candidate equal to (or within dedup tolerance of)
     //     an interior Steiner that's encroaching a boundary segment.
     //     The boundary itself is never mutated (per-edge cache contract).
     let drops = scan_encroached_segments(pts2d, outer_uv_len, inner_uv_lens);
@@ -1498,7 +1685,16 @@ fn refine_to_convergence(
     let outer_uv_len = outer.points_uv.len();
     let inner_uv_lens: Vec<usize> = inners.iter().map(|p| p.points_uv.len()).collect();
     let boundary_points = outer_uv_len + inner_uv_lens.iter().sum::<usize>();
-    let steiner_budget = boundary_points.saturating_mul(STEINER_BUDGET_FACTOR);
+    // Refinement allowance ON TOP of the Step-2 curvature-driven seed:
+    // the larger of the boundary-scaled and the seed-scaled (measured
+    // face curvature) components. The seed itself is never charged
+    // against the allowance — it is the demanded starting density, not
+    // refinement churn. See `SEED_BUDGET_FACTOR`.
+    let seed_len = initial_steiner.len();
+    let refinement_allowance = boundary_points
+        .saturating_mul(STEINER_BUDGET_FACTOR)
+        .max(seed_len.saturating_mul(SEED_BUDGET_FACTOR));
+    let steiner_budget = seed_len.saturating_add(refinement_allowance);
 
     let mut steiner = initial_steiner;
     let mut pts2d = initial_pts2d;
@@ -1517,6 +1713,18 @@ fn refine_to_convergence(
             model,
             params,
         );
+        if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+            eprintln!(
+                "[refine] pass={} tris={} steiner={} budget={} boundary={} new={} converged={}",
+                _pass,
+                triangles.len(),
+                steiner.len(),
+                steiner_budget,
+                boundary_points,
+                delta.new_steiner.len(),
+                delta.converged
+            );
+        }
         if delta.converged {
             return (pts2d, triangles);
         }
@@ -1536,6 +1744,14 @@ fn refine_to_convergence(
         // the last successful triangulation rather than re-running CDT on
         // an ever-denser, near-degenerate set. See `STEINER_BUDGET_FACTOR`.
         if steiner.len() > steiner_budget {
+            if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                eprintln!(
+                    "[refine] BUDGET FREEZE at pass={} steiner={} budget={}",
+                    _pass,
+                    steiner.len(),
+                    steiner_budget
+                );
+            }
             return (pts2d, triangles);
         }
 
@@ -1586,7 +1802,7 @@ pub(crate) fn tessellate_curved_cdt(
 
     // Step 2 — Steiner candidates on a curvature-driven grid.
     let inner_polygons: Vec<Vec<(f64, f64)>> = inners.iter().map(|p| p.points_uv.clone()).collect();
-    let mut steiner = generate_steiner_candidates(
+    let steiner = generate_steiner_candidates(
         surface,
         outer_bbox,
         &outer.points_uv,

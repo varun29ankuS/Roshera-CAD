@@ -124,26 +124,31 @@ impl EdgeSampleCache {
         }
         let mut index: std::collections::HashMap<EdgeId, Vec<FaceId>> =
             std::collections::HashMap::new();
-        for (_shell_id, shell) in model.shells.iter() {
-            for &face_id in &shell.faces {
-                let face = match model.faces.get(face_id) {
-                    Some(f) => f,
-                    None => continue,
-                };
-                let mut push_loop_edges = |loop_id| {
-                    if let Some(l) = model.loops.get(loop_id) {
-                        for &e in &l.edges {
-                            let faces = index.entry(e).or_default();
-                            if !faces.contains(&face_id) {
-                                faces.push(face_id);
-                            }
+        // Walk every LIVE face in the store, not the shell membership
+        // lists. `FaceStore::iter` already skips tombstoned slots, so a
+        // shelled solid yields exactly the same face set as the old
+        // shell walk — but a free-standing face (a face tessellated
+        // before shell assembly, or a standalone trimmed patch as in the
+        // curved-CDT integration fixtures) is now indexed too. Task 4C:
+        // the shell-gated walk left such faces with an EMPTY adjacency,
+        // so the CDT-γ.1 surface-curvature boundary densification below
+        // silently never fired on them — a straight trim edge on a
+        // doubly-curved NURBS patch collapsed to its 2 endpoints and
+        // Ruppert refinement was starved of boundary resolution.
+        for (face_id, face) in model.faces.iter() {
+            let mut push_loop_edges = |loop_id| {
+                if let Some(l) = model.loops.get(loop_id) {
+                    for &e in &l.edges {
+                        let faces = index.entry(e).or_default();
+                        if !faces.contains(&face_id) {
+                            faces.push(face_id);
                         }
                     }
-                };
-                push_loop_edges(face.outer_loop);
-                for &il in &face.inner_loops {
-                    push_loop_edges(il);
                 }
+            };
+            push_loop_edges(face.outer_loop);
+            for &il in &face.inner_loops {
+                push_loop_edges(il);
             }
         }
         let map = Arc::new(index);
