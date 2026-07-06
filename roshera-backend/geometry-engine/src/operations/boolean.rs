@@ -959,6 +959,24 @@ fn dedup_coplanar_imprint_duplicates(
     solid_b: SolidId,
 ) {
     use std::collections::HashSet;
+    // Canonical (min, max) face-id pairs whose surface-surface curves are
+    // redundant with coplanar imprint cuts and must be suppressed.
+    //
+    // Using canonical ordering (min, max) rather than (face_a, face_b)
+    // ensures A∪B and B∪A suppress the SAME set of pairs. Without this,
+    // the pair (hexB_wall11, hexA_top) is inserted in B∪A (where hexB is
+    // solid_a) but the lookup key is (face_a_id=hexB_wall, face_b_id=hexA_top),
+    // which matches; in A∪B the same physical pair has face_a=hexA_top and
+    // face_b=hexB_wall (different key) — so the wall×top surface curves are
+    // suppressed in B∪A but not in A∪B, leaving hexB_wall11 with different
+    // splits and an extra degenerate OnBoundary face in B∪A (14 vs 15 result).
+    let canon_pair = |a: FaceId, b: FaceId| -> (FaceId, FaceId) {
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    };
     let mut skip_pairs: HashSet<(FaceId, FaceId)> = HashSet::new();
 
     for fi in intersections.iter() {
@@ -976,10 +994,10 @@ fn dedup_coplanar_imprint_duplicates(
         // inaccuracies on polyline outlines. Both are non-additive cuts
         // and should be dropped before split_face_by_curves.
         for fz in faces_sharing_edges_with(model, fi.face_b_id, solid_b) {
-            skip_pairs.insert((fi.face_a_id, fz));
+            skip_pairs.insert(canon_pair(fi.face_a_id, fz));
         }
         for fz in faces_sharing_edges_with(model, fi.face_a_id, solid_a) {
-            skip_pairs.insert((fz, fi.face_b_id));
+            skip_pairs.insert(canon_pair(fz, fi.face_b_id));
         }
     }
 
@@ -988,7 +1006,7 @@ fn dedup_coplanar_imprint_duplicates(
     }
 
     intersections.retain_mut(|fi| {
-        let key = (fi.face_a_id, fi.face_b_id);
+        let key = canon_pair(fi.face_a_id, fi.face_b_id);
         if skip_pairs.contains(&key) {
             // Drop surface-surface curves only; the coplanar arrays on
             // a different pair already account for the shared geometry.
@@ -12851,7 +12869,53 @@ fn merge_same_origin_fragments(
         // strict test is directional and correctly rejects siblings
         // whose UV bboxes overlap without one fully enclosing the
         // other.
-        for &outer_idx in indices {
+        //
+        // CANONICAL ORDERING (fix for #17 shared-cut-edge regression):
+        // `7a7dbab` introduced a shared cut-edge registry keyed by
+        // curve_id. The registry processes faces in FaceId order, which
+        // depends on which operand is A and which is B — so A∪B and B∪A
+        // assign different FaceIds to geometrically-identical fragments
+        // of the coplanar cap. The `indices` vector inherits that
+        // operand-order-dependent FaceId ordering; the greedy first-
+        // outer-wins loop below then merges differently in each ordering
+        // (one order's "first" is a small inner fragment; the other's
+        // "first" is the large outer fragment), yielding 14 vs 15 faces.
+        //
+        // Fix: sort `indices` by DESCENDING absolute UV polygon area
+        // before the outer/inner loops so the geometrically-largest
+        // fragment is always visited first as the outer candidate.
+        // Polygon area is a purely geometric property, invariant to
+        // FaceId assignment and operand order. Fragments with no polygon
+        // entry (area = 0.0) sort to the end — they are never valid
+        // outer candidates and would have been skipped by the `None`
+        // guard anyway. This is the minimal change: only the visitation
+        // order is canonicalised; the containment algorithm is unchanged.
+        let uv_poly_area = |idx: usize| -> f64 {
+            // Shoelace formula for UV polygon area (unsigned).
+            polygons.get(&idx).map_or(0.0_f64, |poly| {
+                let n = poly.len();
+                if n < 3 {
+                    return 0.0;
+                }
+                let mut acc = 0.0_f64;
+                for k in 0..n {
+                    let (u1, v1) = poly[k];
+                    let (u2, v2) = poly[(k + 1) % n];
+                    acc += u1 * v2 - u2 * v1;
+                }
+                acc.abs() * 0.5
+            })
+        };
+        // Build a sorted copy of `indices` (largest area first). The
+        // source `indices` slice is owned by `groups` and is not
+        // mutated here; the sort is local to this group's iteration.
+        let mut sorted_indices: Vec<usize> = indices.clone();
+        sorted_indices.sort_by(|&a, &b| {
+            uv_poly_area(b)
+                .partial_cmp(&uv_poly_area(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &outer_idx in &sorted_indices {
             let outer_poly = match polygons.get(&outer_idx) {
                 Some(p) => p,
                 None => continue,
@@ -12860,7 +12924,7 @@ fn merge_same_origin_fragments(
                 continue;
             }
 
-            for &inner_idx in indices {
+            for &inner_idx in &sorted_indices {
                 if outer_idx == inner_idx {
                     continue;
                 }
@@ -15701,6 +15765,46 @@ fn build_shells_from_faces(
     weld_imprint_residual_vertices(model, &mut faces, &options.common.tolerance);
     heal_t_junctions_across_faces(model, &mut faces, &options.common.tolerance);
     canonicalise_face_edges_by_position(model, &mut faces);
+
+    // Post-canonicalization degenerate-face purge: `canonicalise_face_edges_by_position`
+    // can collapse two geometrically-coincident cut edges in a coplanar-wall split to the
+    // same canonical EdgeId, producing a boundary loop like [E_k, E_k] (a single EdgeId
+    // appearing in both traversal directions). Such a "self-loop" face has zero area and
+    // is a topological impossibility in a valid B-Rep shell. It arises from an operand-
+    // order asymmetry in `dedup_coplanar_imprint_duplicates`: A∪B and B∪A suppress
+    // different intersection curves, so one ordering's wall fragment receives two
+    // redundant cut edges that, after canonicalization, share a single EdgeId and cancel.
+    // Dropping these before adjacency grouping prevents a spurious +1 face count in the
+    // B∪A result that would break commutativity.
+    //
+    // Guard: a face is degenerate iff its boundary contains fewer than 2 distinct EdgeIds
+    // (a one-edge self-loop). Two distinct edges is a valid digon in curved geometry
+    // (two arcs meeting at two shared vertices) and must not be removed here.
+    // Post-canonicalization degenerate-face purge: `canonicalise_face_edges_by_position`
+    // can collapse two geometrically-coincident cut edges in a coplanar-wall split to the
+    // same canonical EdgeId, producing a boundary loop like [(E_k, fwd), (E_k, rev)].
+    // This is a zero-area "lune" — the two half-edges traverse the same geometric arc in
+    // opposite directions and immediately cancel. Such a face is a topological impossibility
+    // in a valid B-Rep shell: a loop with two entries that share a single EdgeId in opposing
+    // orientations bounds exactly zero area.
+    //
+    // This artefact arises from an operand-order asymmetry in the coplanar-imprint pipeline:
+    // A∪B and B∪A suppress different intersection curves, so one ordering's wall fragment
+    // receives two redundant cut edges that collapse to the same canonical EdgeId after
+    // position-welding, yielding the cancelled 2-entry lune.
+    //
+    // Criterion: the loop has EXACTLY 2 entries AND both entries share the same EdgeId.
+    // This is the minimal discriminant that targets only the degenerate case:
+    //   - Closed-seam cylinder/sphere caps: boundary_edges.len() == 1 (single seam), not 2.
+    //   - Valid curved digons (two arcs, two vertices): boundary_edges.len() == 2 but the two
+    //     EdgeIds are DIFFERENT (e.g. [(E_arc1, fwd), (E_arc2, fwd)]).
+    //   - Lune artefact: boundary_edges.len() == 2 and edge_ids[0] == edge_ids[1].
+    faces.retain(|face| {
+        let be = &face.boundary_edges;
+        // Only the 2-entry same-EdgeId loop is guaranteed degenerate.
+        let is_lune = be.len() == 2 && be[0].0 == be[1].0;
+        !is_lune
+    });
 
     // Group faces into connected components by shared edges
     let components = group_faces_by_adjacency(&faces, model);

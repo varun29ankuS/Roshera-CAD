@@ -12,9 +12,6 @@
 #
 # Gate script: roshera-backend/scripts/red-gate.ps1
 
-# Family: hexagon commutativity (1 test) -- diag: burndown-diag-boolean.md#sub-group-d
-polyline_cut_harness::union_commutative_polyline_hexagons  # diag: burndown-diag-boolean.md#sub-group-d
-
 # Family: CF-beta mixed-kind corner (3 tests) -- diag: burndown-diag-cf.md#sub-group-a and #sub-group-b
 cf_beta_mixed_kind_corner::box_corner_two_fillets_then_chamfer_synthesises_mixed_cap  # diag: burndown-diag-cf.md#sub-group-a
 cf_beta_mixed_kind_corner::box_corner_mixed_kind_intermediate_state_skips_watertight_validation  # diag: burndown-diag-cf.md#sub-group-a
