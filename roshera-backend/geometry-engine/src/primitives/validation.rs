@@ -661,14 +661,18 @@ impl ParallelValidator {
                 // degenerate. The face is NOT degenerate: the surface wraps around in
                 // both parametric directions and fills the full (0..2π)×(0..2π) patch.
                 //
-                // We exempt ONLY this configuration: fewer than 3 *distinct* vertex
-                // positions in the loop (after dedup within tolerance) AND the surface
+                // We exempt ONLY this configuration: exactly ONE *distinct* vertex
+                // position in the loop (after dedup within tolerance) AND the surface
                 // is closed in both parametric directions (is_closed_u && is_closed_v).
                 // Two independent gates make the exemption NARROW:
-                //   • "< 3 distinct" alone would exempt degenerate loops on open surfaces.
+                //   • "== 1 distinct" alone would exempt degenerate loops on open surfaces.
                 //   • "closed both ways" alone would let a real tiny degenerate patch
-                //     on a torus sneak through.
-                // Together they describe only the commutator topology.
+                //     on a torus sneak through — and it also fires on doubly-closed
+                //     GeneralNurbsSurface / ToroidalFillet, so the vertex bound must
+                //     be exact: a 2-distinct-vertex collapsed face on any of those
+                //     surfaces is a REAL zero-span degeneracy and must still be caught.
+                // Together they describe only the commutator topology (all edge-uses
+                // share the single seam vertex).
                 let mut loop_pts: Vec<Point3> = Vec::new();
                 if let Some(lp) = model.loops.get(face.outer_loop) {
                     for &eid in &lp.edges {
@@ -690,7 +694,7 @@ impl ParallelValidator {
                     }
                     // Exempt genuine single-vertex commutator loops on doubly-closed
                     // surfaces (torus). Both conditions must hold — see note above.
-                    let is_commutator_loop = distinct.len() < 3
+                    let is_commutator_loop = distinct.len() == 1
                         && surface.is_closed_u()
                         && surface.is_closed_v();
                     if !is_commutator_loop {
