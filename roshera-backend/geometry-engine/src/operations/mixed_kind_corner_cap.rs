@@ -66,7 +66,7 @@ use super::chamfer::{cap_vertices_coplanar, verify_cap_edges_form_closed_polygon
 use super::diagnostics::{BlendFailure, MixedKindRejectDetail, VertexBlendUnsupportedReason};
 use super::orientation::orient_face_for_outward;
 use super::{OperationError, OperationResult};
-use crate::math::{Point3, Vector3};
+use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::{Arc, Line},
     edge::EdgeId,
@@ -141,6 +141,25 @@ impl From<BlendKind> for RimKind {
         }
     }
 }
+
+/// Task 3C — angular acceptance bar (radians) for the *measured*
+/// rim-midpoint seam kink of the single-patch mixed-corner cap under
+/// a [`SeamContinuity::G1`] request.
+///
+/// Derivation mirrors the seam audit's rim-midpoint bar (the
+/// `G1_RIM_BAR_RAD = 1e-2` constant in
+/// `tests/cf_gamma_g1_mixed_kind_seam_audit.rs`): a genuinely G1 cap
+/// gated at its interior solver stations shows only inter-station
+/// interpolation drift at the rim midpoint — empirically O(5e-3) rad
+/// on the unit-curvature box fixture — so `1e-2` rad gives 2×
+/// headroom above a true-G1 cap while sitting ~50× below the
+/// rational bi-quadratic collapsed-apex cap's actual G0 kinks
+/// (measured 0.514 rad on 1C2F, 0.849 rad on 2C1F). A cap that
+/// measures above this bar is not G1 by any honest reading;
+/// delivering it under a G1 request would be the silent downgrade
+/// Task 3C exists to abolish (burndown-diag-cf.md sub-group C:
+/// "the silent G1 downgrade must go — that part is not optional").
+pub const G1_CAP_KINK_TOLERANCE_RAD: f64 = 1.0e-2;
 
 /// CF-γ.6.1 — one sub-face of a mixed-kind cap.
 ///
@@ -636,12 +655,14 @@ fn corner_kind_for_degree(degree: usize) -> super::blend_graph::BlendVertexKind 
 /// empty vector and blocked the synthesizer at "≥ 3 cap edges" even
 /// when the geometry was sound.
 ///
-/// Returned order is unspecified — the dispatch sites stitch this list
-/// into the heterogeneous cap loop alongside the current call's own
-/// rim edges and pass the union to [`synthesize_mixed_kind_corner_cap`],
-/// which delegates ordering to [`verify_mixed_cap_loop`]'s endpoint
-/// chain walker. So the caller-side ordering does not need to be
-/// cyclic.
+/// Returned order is ascending `EdgeId` (Task 3C determinism fix —
+/// see the note at the collection tail). The dispatch sites stitch
+/// this list into the heterogeneous cap loop alongside the current
+/// call's own rim edges and pass the union to
+/// [`synthesize_mixed_kind_corner_cap`], which delegates ordering to
+/// [`verify_mixed_cap_loop`]'s endpoint chain walker — but the
+/// single-patch constructor's collapsed-apex corner IS input-order
+/// sensitive, so the order here must be deterministic.
 pub(crate) fn find_blend_cap_edges_at_vertex(
     model: &BRepModel,
     solid_id: SolidId,
@@ -665,7 +686,19 @@ pub(crate) fn find_blend_cap_edges_at_vertex(
         }
         out.insert(eid);
     }
-    out.into_iter().collect()
+    // Task 3C determinism fix: return in ascending-EdgeId order, not
+    // HashSet iteration order. The single-patch cap constructor's
+    // collapsed-apex corner is chosen by rim ORDER, so a randomized
+    // registry order (per-instance `RandomState`) made the delivered
+    // cap's geometry — and its measured seam kink — vary RUN TO RUN
+    // whenever the registry held ≥ 2 rims (observed live: the same
+    // 1C2F fillet-first fixture measured 1.047 rad in one process and
+    // 0.752 rad in the next). A HashSet leaking iteration order into
+    // geometry is exactly the defect class the replay-determinism
+    // suites exist to catch.
+    let mut out: Vec<EdgeId> = out.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 /// Task 3B — the ONE kind-agnostic retracted-cap constructor for
@@ -713,27 +746,31 @@ pub(crate) fn retract_and_cap_mixed_corner(
     vertex_pos: Point3,
     cap_edges_with_kind: &[(EdgeId, RimKind)],
     requested_kind: BlendKind,
+    seam_continuity: SeamContinuity,
     tolerance: f64,
 ) -> OperationResult<Vec<FaceId>> {
     use crate::operations::edge_classification::find_adjacent_faces;
     use crate::primitives::fillet_surfaces::CylindricalFillet;
 
-    // Split rims by kind and resolve each arc rim's fillet face (the
-    // adjacent face carrying a CylindricalFillet surface).
-    let mut arc_rims: Vec<(FaceId, EdgeId)> = Vec::with_capacity(2);
-    let mut line_rims: Vec<EdgeId> = Vec::with_capacity(2);
+    // Split rims by kind. Each arc rim resolves its fillet face (the
+    // adjacent face carrying a CylindricalFillet surface) plus that
+    // surface's radius; each line rim resolves its chamfer bevel face
+    // (the adjacent RuledSurface face) — both needed by the M1
+    // displacement pre-gate below and by the retraction dispatch.
+    let mut arc_rims: Vec<(FaceId, EdgeId, f64)> = Vec::with_capacity(2);
+    let mut line_rims: Vec<(FaceId, EdgeId)> = Vec::with_capacity(2);
     for &(eid, kind) in cap_edges_with_kind {
         match kind {
             RimKind::ArcRim => {
-                let fillet_face = find_adjacent_faces(model, eid)
+                let (fillet_face, radius) = find_adjacent_faces(model, eid)
                     .into_iter()
-                    .find(|&fid| {
+                    .find_map(|fid| {
                         model
                             .faces
                             .get(fid)
                             .and_then(|f| model.surfaces.get(f.surface_id))
-                            .map(|s| s.as_any().downcast_ref::<CylindricalFillet>().is_some())
-                            .unwrap_or(false)
+                            .and_then(|s| s.as_any().downcast_ref::<CylindricalFillet>())
+                            .map(|cf| (fid, cf.radius))
                     })
                     .ok_or_else(|| {
                         OperationError::InvalidGeometry(format!(
@@ -742,10 +779,72 @@ pub(crate) fn retract_and_cap_mixed_corner(
                             eid
                         ))
                     })?;
-                arc_rims.push((fillet_face, eid));
+                arc_rims.push((fillet_face, eid, radius));
             }
-            RimKind::LinearRim => line_rims.push(eid),
+            RimKind::LinearRim => {
+                let bevel_face = find_adjacent_faces(model, eid)
+                    .into_iter()
+                    .find(|&fid| {
+                        model
+                            .faces
+                            .get(fid)
+                            .and_then(|f| model.surfaces.get(f.surface_id))
+                            .map(|s| s.type_name() == "RuledSurface")
+                            .unwrap_or(false)
+                    })
+                    .ok_or_else(|| {
+                        OperationError::InvalidGeometry(format!(
+                            "retract_and_cap_mixed_corner: no RuledSurface bevel face \
+                             adjacent to line rim {}",
+                            eid
+                        ))
+                    })?;
+                line_rims.push((bevel_face, eid));
+            }
         }
+    }
+
+    // Task 3C (3B review finding M1) — typed d ≠ r pre-gate. The
+    // retracted-triangle solves and the endpoint dedup/snap moves
+    // downstream all assume the equal-displacement family (chamfer
+    // offset == fillet radius); off it they fail with opaque
+    // downstream validator/solve errors, and pre-3B the chamfer-side
+    // finalize's coplanarity path carried the typed reject that Task
+    // 3B's shared constructor lost. Restore it here, pre-flight and
+    // retraction-invariant: fillet radii read from the CylindricalFillet
+    // surfaces, chamfer offsets recovered per host plane from the
+    // bevel side tracks' far endpoints
+    // ([`super::blend_graph::chamfer_rim_host_offsets`] — untouched
+    // by any prior first-call apex retraction of the V-side rims).
+    let radii: Vec<f64> = arc_rims.iter().map(|&(_, _, r)| r).collect();
+    let mut offsets: Vec<f64> = Vec::with_capacity(2 * line_rims.len());
+    for &(bevel_face, eid) in &line_rims {
+        let pair = super::blend_graph::chamfer_rim_host_offsets(model, bevel_face, eid, vertex_pos)
+            .map_err(|e| {
+                OperationError::InvalidGeometry(format!(
+                    "retract_and_cap_mixed_corner: chamfer offset recovery failed \
+                     for line rim {}: {:?}",
+                    eid, e
+                ))
+            })?;
+        offsets.extend_from_slice(&pair);
+    }
+    let displacements = radii.iter().chain(offsets.iter());
+    let disp_min = displacements.clone().copied().fold(f64::INFINITY, f64::min);
+    let disp_max = displacements.copied().fold(f64::NEG_INFINITY, f64::max);
+    if disp_max - disp_min > tolerance {
+        let existing = existing_kind_set_or_default(model, solid_id, vertex_id);
+        return Err(OperationError::BlendFailed(Box::new(
+            BlendFailure::VertexBlendUnsupported {
+                vertex: vertex_id,
+                kind: corner_kind_for_degree(cap_edges_with_kind.len()),
+                reason: VertexBlendUnsupportedReason::MixedKindUnsupported {
+                    existing,
+                    requested: requested_kind,
+                    detail: MixedKindRejectDetail::MixedDisplacements { offsets, radii },
+                },
+            },
+        )));
     }
 
     match (arc_rims.len(), line_rims.len()) {
@@ -757,7 +856,7 @@ pub(crate) fn retract_and_cap_mixed_corner(
                 vertex_pos,
                 &fillet_face_pair,
                 &cap_arc_pair,
-                line_rims[0],
+                line_rims[0].1,
                 tolerance,
             )?;
         }
@@ -767,7 +866,7 @@ pub(crate) fn retract_and_cap_mixed_corner(
                 vertex_pos,
                 arc_rims[0].0,
                 arc_rims[0].1,
-                &[line_rims[0], line_rims[1]],
+                &[line_rims[0].1, line_rims[1].1],
                 tolerance,
             )?;
         }
@@ -821,6 +920,76 @@ pub(crate) fn retract_and_cap_mixed_corner(
         cap_edges_with_kind,
         vertex_outward,
     )?;
+
+    // Task 3C — the cap quality contract (Varun-approved option C-1,
+    // burndown-diag-cf.md sub-group C). MEASURE the seam kink at
+    // synthesis: for every cap rim, sample the cap-face normal
+    // against the adjacent trim-face normal at the rim's parametric
+    // midpoint — the identical measurement the post-hoc seam audit
+    // performs, so gate and audit can never disagree. Then:
+    //
+    // * kink ≤ [`G1_CAP_KINK_TOLERANCE_RAD`] → the cap is G1, proceed;
+    // * kink > bar AND the caller requested `SeamContinuity::G1` →
+    //   typed [`BlendFailure::G1NotAchievable`] refusal — the
+    //   operation fails loudly (caller-side `with_rollback` restores
+    //   the model) rather than delivering a silent downgrade;
+    // * `C0`/default → the cap is delivered as-is; the kink is
+    //   honest, documented behaviour observable through
+    //   [`super::mixed_kind_seam_audit::audit_mixed_kind_seam_continuity`].
+    //
+    // Every lookup failure inside the measurement is a hard typed
+    // error — a gate that silently skips a rim it cannot measure
+    // would be a lie window of exactly the class this task removes.
+    if seam_continuity == SeamContinuity::G1 {
+        let cap_face = face_ids.first().copied().ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "retract_and_cap_mixed_corner: single-patch cap returned no face".to_string(),
+            )
+        })?;
+        let mut worst: Option<(EdgeId, f64)> = None;
+        for &(eid, _) in cap_edges_with_kind {
+            let anchor = super::mixed_kind_seam_audit::shared_edge_midpoint(model, eid)
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry(format!(
+                        "retract_and_cap_mixed_corner: G1 kink gate could not evaluate \
+                         the midpoint of cap rim {}",
+                        eid
+                    ))
+                })?;
+            let trim_face = find_adjacent_faces(model, eid)
+                .into_iter()
+                .find(|fid| !face_ids.contains(fid))
+                .ok_or_else(|| {
+                    OperationError::InvalidGeometry(format!(
+                        "retract_and_cap_mixed_corner: G1 kink gate found no trim face \
+                         adjacent to cap rim {}",
+                        eid
+                    ))
+                })?;
+            let kink = super::mixed_kind_seam_audit::compute_face_pair_residual(
+                model,
+                cap_face,
+                trim_face,
+                anchor,
+                Tolerance::default(),
+            )?;
+            if worst.map(|(_, w)| kink > w).unwrap_or(true) {
+                worst = Some((eid, kink));
+            }
+        }
+        if let Some((rim_edge, measured_kink_rad)) = worst {
+            if measured_kink_rad > G1_CAP_KINK_TOLERANCE_RAD {
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::G1NotAchievable {
+                        vertex: vertex_id,
+                        rim_edge,
+                        measured_kink_rad,
+                        tolerance_rad: G1_CAP_KINK_TOLERANCE_RAD,
+                    },
+                )));
+            }
+        }
+    }
 
     // Registry tail — mirrors `finalize_mixed_kind_cap_face` steps 7–8.
     let still_referenced = model

@@ -2354,6 +2354,72 @@ fn chamfer_bevel_spine(
     bevel_face: FaceId,
     rim_edge: EdgeId,
 ) -> Result<(Point3, Vector3), PostSurgeryCornerError> {
+    let BevelSideTracks {
+        host_normals,
+        far_points,
+    } = bevel_side_tracks(model, bevel_face, rim_edge)?;
+
+    let n1 = host_normals[0];
+    let n2 = host_normals[1];
+    // Offset plane constants: host 1 translated to pass through the
+    // track in host 2, and vice versa.
+    let c1 = n1.dot(&(far_points[1] - Point3::new(0.0, 0.0, 0.0)));
+    let c2 = n2.dot(&(far_points[0] - Point3::new(0.0, 0.0, 0.0)));
+    let dir = n1
+        .cross(&n2)
+        .normalize()
+        .map_err(|_| PostSurgeryCornerError::DegenerateAxisSystem)?;
+    let point = two_plane_intersection_point(n1, c1, n2, c2)
+        .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
+    Ok((point, dir))
+}
+
+/// Task 3C (3B review finding M1) — recover the chamfer's per-host
+/// offset displacements from a post-surgery bevel face, robustly to
+/// any prior apex retraction of its V-side rim.
+///
+/// The bevel's two side boundary tracks each lie in one host-face
+/// plane at the chamfer offset from the *other* host plane. Since the
+/// corner vertex `V` lies on both host planes (it is the original
+/// sharp corner), the offset of the track running in host `j` from
+/// host plane `i` is exactly `|(track_far_point_j − V) · n_i|` — the
+/// chamfer offset `d_i` measured on host face `i`. The far track
+/// endpoints are untouched by the V-side apex retraction
+/// (`retract_boundary_tracks` retrims only the V-end), so this read
+/// is retraction-invariant, unlike the rim endpoints themselves.
+///
+/// Returns `[d_0, d_1]` — for the symmetric `EqualDistance` chamfer
+/// family the two agree to machine precision.
+pub(crate) fn chamfer_rim_host_offsets(
+    model: &BRepModel,
+    bevel_face: FaceId,
+    rim_edge: EdgeId,
+    v_pos: Point3,
+) -> Result<[f64; 2], PostSurgeryCornerError> {
+    let BevelSideTracks {
+        host_normals,
+        far_points,
+    } = bevel_side_tracks(model, bevel_face, rim_edge)?;
+    Ok([
+        (far_points[1] - v_pos).dot(&host_normals[0]).abs(),
+        (far_points[0] - v_pos).dot(&host_normals[1]).abs(),
+    ])
+}
+
+/// The two side boundary tracks of a chamfer bevel face: each track's
+/// host-plane unit normal plus its far (non-rim-side) endpoint.
+/// Shared discovery for [`chamfer_bevel_spine`] and
+/// [`chamfer_rim_host_offsets`].
+struct BevelSideTracks {
+    host_normals: [Vector3; 2],
+    far_points: [Point3; 2],
+}
+
+fn bevel_side_tracks(
+    model: &BRepModel,
+    bevel_face: FaceId,
+    rim_edge: EdgeId,
+) -> Result<BevelSideTracks, PostSurgeryCornerError> {
     use crate::operations::edge_classification::find_adjacent_faces;
     use crate::primitives::surface::Plane as PlaneSurface;
 
@@ -2433,19 +2499,10 @@ fn chamfer_bevel_spine(
         track_points[i] = Point3::new(p[0], p[1], p[2]);
     }
 
-    let n1 = host_normals[0];
-    let n2 = host_normals[1];
-    // Offset plane constants: host 1 translated to pass through the
-    // track in host 2, and vice versa.
-    let c1 = n1.dot(&(track_points[1] - Point3::new(0.0, 0.0, 0.0)));
-    let c2 = n2.dot(&(track_points[0] - Point3::new(0.0, 0.0, 0.0)));
-    let dir = n1
-        .cross(&n2)
-        .normalize()
-        .map_err(|_| PostSurgeryCornerError::DegenerateAxisSystem)?;
-    let point = two_plane_intersection_point(n1, c1, n2, c2)
-        .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
-    Ok((point, dir))
+    Ok(BevelSideTracks {
+        host_normals,
+        far_points: track_points,
+    })
 }
 
 /// Reconstruct the chamfer bevel plane from a post-surgery bevel face.

@@ -1,39 +1,39 @@
 //! CF-γ — face-adjacent seam continuity audit (chamfer ↔ fillet)
-//! integration suite.
+//! integration suite. Task 3C re-pinned to the honest single-patch
+//! cap contract (burndown-diag-cf.md sub-group C, option C-1).
 //!
 //! Companion to `cf_gamma_g1_mixed_kind_corner.rs`. That file pins
-//! the *cap topology* contract (ΔF = +3, 1 NURBS rim per cap, etc.).
-//! This file pins the *cross-rim normal residual* contract along
-//! each cap rim: the audit samples the cap-face normal and the
-//! adjacent trim-face normal at the parametric midpoint of every
-//! shared rim edge and reports the angular residual.
+//! the cap-topology + typed-refusal contract; this file pins the
+//! *cross-rim normal residual* the audit measures: the cap-face
+//! normal vs the adjacent trim-face normal at the parametric
+//! midpoint of every shared rim edge.
 //!
-//! ## Bar derivation: [`G1_RIM_BAR_RAD`]
+//! ## Why the old `audit_passes_after_..._g1_synthesis` pins were stale
 //!
-//! CF-γ.6 enforces G1 via least-squares at `K_STATIONS = 4` interior
-//! stations along each rim (u ∈ {0.2, 0.4, 0.6, 0.8}) and gates the
-//! worst-station residual at `G1_TOLERANCE = 1e-6` rad. Between
-//! stations the bicubic patch interpolates the constraints; the
-//! inter-station residual is bounded analytically by
-//! `O(curvature_mismatch × rim_arc_length)`. For a unit-radius
-//! cylinder rim adjacent to a flat chamfer (the 10³ cube + D=1
-//! fixture used here), curvature mismatch ≈ 1 / unit and rim arc
-//! length ≈ 1 unit, so the inter-station residual is empirically
-//! O(1e-3) rad with 2× headroom for cap-orientation-dependent
-//! variation. The audit samples at the parametric midpoint (which
-//! lies between the 0.4 and 0.6 stations), so the test bar must
-//! reflect inter-station drift, NOT `G1_TOLERANCE`'s station-only
-//! 1e-6 gate. [`G1_RIM_BAR_RAD`] = 1e-2 rad gives 2× safety margin
-//! above worst observed (~5e-3) while remaining ~150× tighter than
-//! the C0 planar-cap gap (≈ π/2). This bar catches a regression
-//! that doubled the inter-station residual *before* the bicubic
-//! drift would become visible at the tessellation stage.
+//! They asserted every residual ≤ 1e-2 rad on a G1-requested build —
+//! but the diagnosis proved that build was a lie the audit itself
+//! caught: "the single-patch cap is G0 at the fillet rims, not G1. A
+//! user requesting `SeamContinuity::G1` silently receives a **29°
+//! normal kink** with no `SeamContinuityUnreachable` gate (the
+//! retracted arm bypasses the dispatcher and its gate entirely).
+//! Under the certificate-cannot-lie thesis this is a real
+//! regression: the G1 request is accepted and not honoured, and
+//! nothing says so." (burndown-diag-cf.md sub-group C.)
+//!
+//! ## The honest contract pinned here (Task 3C)
+//!
+//! * **G1 request** → the synthesis-time kink gate refuses typed
+//!   ([`BlendFailure::G1NotAchievable`]) on the finalizing call —
+//!   the audit never sees a lying cap because no cap claiming G1 is
+//!   ever delivered.
+//! * **C0 build** → the single-patch cap is delivered; the audit
+//!   measures its rim kink and REPORTS it honestly (≈ 0.514 rad on
+//!   1C2F, ≈ 0.849 rad on 2C1F — the same numbers the synthesis
+//!   gate would refuse under G1) while the solid stays watertight.
 //!
 //! The audit is verify-only — no geometry is mutated. These tests
 //! exercise it end-to-end through the production
-//! `chamfer_edges` / `fillet_edges` pipeline so any regression in
-//! cap synthesis that would silently introduce a normal kink at the
-//! shared corner trips here, not at a later visual-artefact stage.
+//! `chamfer_edges` / `fillet_edges` pipeline.
 
 // AUDIT-H13: Reason for `#![allow(clippy::expect_used)]` — test-only file.
 // `expect(...)` on fixture/scaffolding code surfaces invariant violations
@@ -54,7 +54,9 @@ use geometry_engine::operations::chamfer::{
 };
 use geometry_engine::operations::diagnostics::BlendFailure;
 use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletProp};
-use geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity;
+use geometry_engine::operations::mixed_kind_corner_cap::{
+    SeamContinuity, G1_CAP_KINK_TOLERANCE_RAD,
+};
 use geometry_engine::operations::mixed_kind_seam_audit::{
     assert_mixed_kind_seam_continuity_within, audit_mixed_kind_seam_continuity,
 };
@@ -66,12 +68,11 @@ const BOX_SIZE: f64 = 10.0;
 const HALF_BOX: f64 = BOX_SIZE / 2.0;
 const D: f64 = 1.0;
 
-/// Acceptance bar for the cross-rim normal residual sampled at the
-/// rim parametric midpoint. See the module header for derivation —
-/// reflects bicubic inter-station drift on the unit-curvature
-/// fixture used here, NOT CF-γ.6's internal `G1_TOLERANCE = 1e-6`
-/// (which gates only at the 4 interior solver stations).
-const G1_RIM_BAR_RAD: f64 = 1.0e-2;
+/// Expected honest kink windows of the delivered C0 single-patch cap
+/// on the 10³ cube / D = 1 fixture (Task 3A report §6 measurements:
+/// 1C2F 0.5137540531736079 rad, 2C1F 0.8495533668413231 rad).
+const KINK_1C2F_RANGE: (f64, f64) = (0.45, 0.60);
+const KINK_2C1F_RANGE: (f64, f64) = (0.78, 0.92);
 
 fn chamfer_opts(distance: f64, partial: Vec<VertexId>, g1: bool) -> ChamferOptions {
     ChamferOptions {
@@ -125,12 +126,23 @@ fn corner_edges_sorted(model: &BRepModel) -> Vec<geometry_engine::primitives::ed
     edges
 }
 
-/// Build a 1C2F mixed-kind corner with G1 caps and confirm the
-/// audit reports no cross-rim residual above the rim-midpoint
-/// acceptance bar [`G1_RIM_BAR_RAD`]. See the module header for
-/// the bar's analytical derivation.
+/// Task 3C re-pin of `audit_passes_after_cf_gamma_g1_synthesis_1c2f`.
+///
+/// The old pin asserted every residual ≤ 1e-2 on a G1-requested
+/// build — the diagnosis proved that assertion was catching a real
+/// lie (burndown-diag-cf.md sub-group C): "the single-patch cap is
+/// G0 at the fillet rims, not G1. A user requesting
+/// `SeamContinuity::G1` silently receives a 29° normal kink with no
+/// `SeamContinuityUnreachable` gate". The honest re-pin:
+///
+/// 1. G1 request → the finalizing call refuses typed
+///    (`G1NotAchievable`) — the audit never sees a lying cap.
+/// 2. C0 build → the audit measures the kink and surfaces it
+///    (≈ 0.514 rad, well above the G1 bar) while the solid is sound;
+///    the strict assertion helper rejects at the G1 bar, typed.
 #[test]
-fn audit_passes_after_cf_gamma_g1_synthesis_1c2f() {
+fn g1_refuses_typed_and_c0_audit_reports_kink_honestly_1c2f() {
+    // --- 1. G1 request: typed refusal on the finalizing call. -----
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = corner_at_half(&model);
@@ -143,61 +155,118 @@ fn audit_passes_after_cf_gamma_g1_synthesis_1c2f() {
         chamfer_opts(D, vec![corner], true),
     )
     .expect("1C2F chamfer-first succeeds");
-    fillet_edges(
+    let err = fillet_edges(
         &mut model,
         solid_id,
         vec![edges[1], edges[2]],
         fillet_opts(D, vec![], true),
     )
-    .expect("1C2F fillet-second closes mixed-kind corner with G1 cap");
+    .expect_err("G1-requested 1C2F finalize must refuse typed — the single-patch cap is not G1");
+    match err {
+        OperationError::BlendFailed(boxed) => match *boxed {
+            BlendFailure::G1NotAchievable {
+                measured_kink_rad,
+                tolerance_rad,
+                ..
+            } => {
+                assert_eq!(tolerance_rad, G1_CAP_KINK_TOLERANCE_RAD);
+                assert!(
+                    measured_kink_rad > tolerance_rad,
+                    "refusal carries measured kink {} > tolerance {}",
+                    measured_kink_rad,
+                    tolerance_rad
+                );
+            }
+            other => panic!("expected G1NotAchievable, got {:?}", other),
+        },
+        other => panic!("expected BlendFailed(G1NotAchievable), got {:?}", other),
+    }
+
+    // --- 2. C0 build: audit surfaces the honest kink; solid sound. -
+    let mut model = BRepModel::new();
+    let solid_id = make_cube(&mut model, BOX_SIZE);
+    let corner = corner_at_half(&model);
+    let edges = corner_edges_sorted(&model);
+    chamfer_edges(
+        &mut model,
+        solid_id,
+        vec![edges[0]],
+        chamfer_opts(D, vec![corner], false),
+    )
+    .expect("C0 1C2F chamfer-first succeeds");
+    fillet_edges(
+        &mut model,
+        solid_id,
+        vec![edges[1], edges[2]],
+        fillet_opts(D, vec![], false),
+    )
+    .expect("C0 1C2F fillet-second delivers the single-patch cap");
+
+    assert_eq!(
+        non_manifold_edge_count(&model, solid_id),
+        0,
+        "delivered C0 1C2F cap must be watertight"
+    );
 
     let report = audit_mixed_kind_seam_continuity(&model, solid_id)
-        .expect("seam audit succeeds on G1 1C2F corner");
+        .expect("seam audit succeeds on the delivered C0 1C2F corner");
     assert!(
         !report.is_empty(),
-        "1C2F G1 corner must produce at least one cap-rim seam record"
+        "1C2F corner must produce at least one cap-rim seam record"
     );
     for r in &report {
         assert!(
-            r.residual_rad.is_finite(),
-            "seam residual must be a finite scalar; got {}",
+            r.residual_rad.is_finite() && r.residual_rad >= 0.0,
+            "seam residual must be a non-negative finite scalar; got {}",
             r.residual_rad
         );
-        assert!(
-            r.residual_rad <= G1_RIM_BAR_RAD,
-            "G1 1C2F corner residual {} must be ≤ rim-midpoint bar {} at \
-             (trim face {}, cap face {}, seam {}, vertex {})",
-            r.residual_rad,
-            G1_RIM_BAR_RAD,
-            r.blend_face_id,
-            r.cap_face_id,
-            r.seam_kind,
-            r.vertex_id
-        );
     }
-
-    // The strict-assertion helper agrees when fed the same bar.
-    // `Tolerance::new(distance, angle)` lets us reuse the audit's
-    // angular gate via the helper's `tolerance.angle()` accessor;
-    // the distance slot is irrelevant for the rim-G1 check and is
-    // kept at the default 1e-9 for consistency with the rest of
-    // the suite.
-    let bar_tol = Tolerance::new(1.0e-9, G1_RIM_BAR_RAD);
-    let strict_report = assert_mixed_kind_seam_continuity_within(&model, solid_id, bar_tol)
-        .expect("strict assertion accepts G1 1C2F corner under rim-midpoint bar");
-    assert_eq!(
-        strict_report.len(),
-        report.len(),
-        "strict assertion returns the same record set when it accepts"
+    let worst = report
+        .iter()
+        .map(|r| r.residual_rad)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        worst > KINK_1C2F_RANGE.0 && worst < KINK_1C2F_RANGE.1,
+        "the audit must surface the 1C2F cap's honest kink (~0.514 rad); got {}",
+        worst
     );
+
+    // The strict helper rejects the delivered cap at the G1 bar —
+    // typed, carrying the same measured residual class.
+    let bar_tol = Tolerance::new(1.0e-9, G1_CAP_KINK_TOLERANCE_RAD);
+    match assert_mixed_kind_seam_continuity_within(&model, solid_id, bar_tol) {
+        Err(OperationError::BlendFailed(boxed)) => match *boxed {
+            BlendFailure::MixedKindSeamResidualExceeded {
+                residual,
+                tolerance,
+                ..
+            } => {
+                assert!(
+                    residual > tolerance,
+                    "strict rejection carries residual {} > tolerance {}",
+                    residual,
+                    tolerance
+                );
+            }
+            other => panic!("expected MixedKindSeamResidualExceeded, got {:?}", other),
+        },
+        Ok(report) => panic!(
+            "strict assertion must reject the C0 cap at the G1 bar; got Ok({} records)",
+            report.len()
+        ),
+        Err(other) => panic!("expected BlendFailed, got {:?}", other),
+    }
 }
 
-/// Build a 2C1F mixed-kind corner with G1 caps and confirm the
-/// audit reports no cross-rim residual above tolerance. The 2C1F
-/// topology exercises the symmetric (fillet-rim adjacent to two
-/// chamfer-rims) case of the cap synthesizer.
+/// Task 3C re-pin of `audit_passes_after_cf_gamma_g1_synthesis_2c1f`
+/// — same honest contract as the 1C2F re-pin above (diagnosis quote
+/// there; burndown-diag-cf.md sub-group C: "the silent G1 downgrade
+/// must go — that part is not optional"). The 2C1F topology
+/// exercises the symmetric (fillet-rim adjacent to two chamfer-rims)
+/// case; its measured kink is worse (≈ 0.849 rad).
 #[test]
-fn audit_passes_after_cf_gamma_g1_synthesis_2c1f() {
+fn g1_refuses_typed_and_c0_audit_reports_kink_honestly_2c1f() {
+    // --- 1. G1 request: typed refusal on the finalizing call. -----
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let corner = corner_at_half(&model);
@@ -210,33 +279,74 @@ fn audit_passes_after_cf_gamma_g1_synthesis_2c1f() {
         chamfer_opts(D, vec![corner], true),
     )
     .expect("2C1F chamfer-first (two edges) succeeds");
-    fillet_edges(
+    let err = fillet_edges(
         &mut model,
         solid_id,
         vec![edges[2]],
         fillet_opts(D, vec![], true),
     )
-    .expect("2C1F fillet-second closes mixed-kind corner with G1 cap");
+    .expect_err("G1-requested 2C1F finalize must refuse typed — the single-patch cap is not G1");
+    match err {
+        OperationError::BlendFailed(boxed) => match *boxed {
+            BlendFailure::G1NotAchievable {
+                measured_kink_rad,
+                tolerance_rad,
+                ..
+            } => {
+                assert_eq!(tolerance_rad, G1_CAP_KINK_TOLERANCE_RAD);
+                assert!(
+                    measured_kink_rad > tolerance_rad,
+                    "refusal carries measured kink {} > tolerance {}",
+                    measured_kink_rad,
+                    tolerance_rad
+                );
+            }
+            other => panic!("expected G1NotAchievable, got {:?}", other),
+        },
+        other => panic!("expected BlendFailed(G1NotAchievable), got {:?}", other),
+    }
+
+    // --- 2. C0 build: audit surfaces the honest kink; solid sound. -
+    let mut model = BRepModel::new();
+    let solid_id = make_cube(&mut model, BOX_SIZE);
+    let corner = corner_at_half(&model);
+    let edges = corner_edges_sorted(&model);
+    chamfer_edges(
+        &mut model,
+        solid_id,
+        vec![edges[0], edges[1]],
+        chamfer_opts(D, vec![corner], false),
+    )
+    .expect("C0 2C1F chamfer-first succeeds");
+    fillet_edges(
+        &mut model,
+        solid_id,
+        vec![edges[2]],
+        fillet_opts(D, vec![], false),
+    )
+    .expect("C0 2C1F fillet-second delivers the single-patch cap");
+
+    assert_eq!(
+        non_manifold_edge_count(&model, solid_id),
+        0,
+        "delivered C0 2C1F cap must be watertight"
+    );
 
     let report = audit_mixed_kind_seam_continuity(&model, solid_id)
-        .expect("seam audit succeeds on G1 2C1F corner");
+        .expect("seam audit succeeds on the delivered C0 2C1F corner");
     assert!(
         !report.is_empty(),
-        "2C1F G1 corner must produce at least one cap-rim seam record"
+        "2C1F corner must produce at least one cap-rim seam record"
     );
-    for r in &report {
-        assert!(
-            r.residual_rad <= G1_RIM_BAR_RAD,
-            "G1 2C1F corner residual {} must be ≤ rim-midpoint bar {} at \
-             (trim face {}, cap face {}, seam {}, vertex {})",
-            r.residual_rad,
-            G1_RIM_BAR_RAD,
-            r.blend_face_id,
-            r.cap_face_id,
-            r.seam_kind,
-            r.vertex_id
-        );
-    }
+    let worst = report
+        .iter()
+        .map(|r| r.residual_rad)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        worst > KINK_2C1F_RANGE.0 && worst < KINK_2C1F_RANGE.1,
+        "the audit must surface the 2C1F cap's honest kink (~0.849 rad); got {}",
+        worst
+    );
 }
 
 /// Documents the CF-β legacy gap: with `SeamContinuity::C0` the cap

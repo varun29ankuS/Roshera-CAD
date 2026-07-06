@@ -430,7 +430,7 @@ fn is_topological_cap_face(
 /// On any curve evaluation failure the function returns
 /// `None`, and the caller silently skips the edge (preserves
 /// the audit's read-only, fault-tolerant contract).
-fn shared_edge_midpoint(model: &BRepModel, edge_id: EdgeId) -> Option<Point3> {
+pub(crate) fn shared_edge_midpoint(model: &BRepModel, edge_id: EdgeId) -> Option<Point3> {
     let edge = model.edges.get(edge_id)?;
     let t_mid = 0.5 * (edge.param_range.start + edge.param_range.end);
     if let Some(curve) = model.curves.get(edge.curve_id) {
@@ -491,7 +491,12 @@ fn sample_face_normal_at(
 
 /// Angular residual between two face normals sampled at the same
 /// query point. Uses `|dot|` to be face-orientation-agnostic.
-fn compute_face_pair_residual(
+///
+/// `pub(crate)`: Task 3C's synthesis-time G1 kink gate
+/// ([`super::mixed_kind_corner_cap::retract_and_cap_mixed_corner`])
+/// reuses this exact measurement so the gate and the post-hoc audit
+/// can never disagree about what the kink *is*.
+pub(crate) fn compute_face_pair_residual(
     model: &BRepModel,
     face_a: FaceId,
     face_b: FaceId,
@@ -640,8 +645,16 @@ mod tests {
         );
     }
 
+    // Task 3C re-pin: this fixture used to request G1 on the 1C2F
+    // corner. Diagnosis (burndown-diag-cf.md sub-group C): "the
+    // single-patch cap is G0 at the fillet rims, not G1. A user
+    // requesting `SeamContinuity::G1` silently receives a 29° normal
+    // kink with no gate" — Task 3C installs that gate, so a G1
+    // request on this corner now refuses typed (`G1NotAchievable`)
+    // and never produces a cap to audit. The audit's record contract
+    // is pinned on the *delivered* C0 cap instead.
     #[test]
-    fn audit_records_chamfer_and_fillet_rims_for_g1_mixed_corner() {
+    fn audit_records_chamfer_and_fillet_rims_for_c0_mixed_corner() {
         let mut model = BRepModel::new();
         let solid_id = make_cube(&mut model);
         let corner = vertex_at(&model, HALF, HALF, HALF);
@@ -650,22 +663,22 @@ mod tests {
             &mut model,
             solid_id,
             vec![edges[0]],
-            chamfer_opts(D, vec![corner], true),
+            chamfer_opts(D, vec![corner], false),
         )
         .expect("1C2F chamfer-first succeeds");
         fillet_edges(
             &mut model,
             solid_id,
             vec![edges[1], edges[2]],
-            fillet_opts(D, vec![], true),
+            fillet_opts(D, vec![], false),
         )
-        .expect("1C2F fillet-second closes corner with G1 cap");
+        .expect("1C2F fillet-second closes corner with C0 cap");
 
         let report =
-            audit_mixed_kind_seam_continuity(&model, solid_id).expect("G1 1C2F audit succeeds");
+            audit_mixed_kind_seam_continuity(&model, solid_id).expect("C0 1C2F audit succeeds");
         assert!(
             !report.is_empty(),
-            "G1 1C2F must yield at least one cap-rim seam record at the mixed corner"
+            "C0 1C2F must yield at least one cap-rim seam record at the mixed corner"
         );
         // Every record's residual is non-negative and finite, and
         // the record carries a valid seam_kind.
@@ -685,11 +698,11 @@ mod tests {
         }
         assert!(
             saw_chamfer_to_cap,
-            "1C2F G1 corner must yield at least one ChamferToCap rim"
+            "1C2F C0 corner must yield at least one ChamferToCap rim"
         );
         assert!(
             saw_cap_to_fillet,
-            "1C2F G1 corner must yield at least one CapToFillet rim"
+            "1C2F C0 corner must yield at least one CapToFillet rim"
         );
     }
 

@@ -542,3 +542,133 @@ fn redundant_partial_corner_opt_in_rejects_atomically_without_stale_pending() {
     let (v, e, f) = shell_census(&model, solid_id);
     assert_eq!((v, e, f), (8, 12, 6), "rolled-back cube census unchanged");
 }
+
+/// Task 3C (3B review finding M1) — the typed d ≠ r pre-gate at the
+/// shared retracted-cap constructor, 1C2F ordering.
+///
+/// Pre-3B the chamfer-side finalize's synthesis path carried a typed
+/// reject for displacement mismatch; the Task 3B unification onto
+/// `retract_and_cap_mixed_corner` lost it, leaving unequal
+/// displacements to fail in opaque downstream solves/validators (the
+/// "d ≠ r caveat" both the 3B and 3A reports banked). The restored
+/// contract: a mixed corner whose chamfer offset and fillet radius
+/// disagree refuses pre-flight with
+/// `MixedKindRejectDetail::MixedDisplacements`, carrying the measured
+/// offsets and radii.
+#[test]
+fn box_corner_1c2f_unequal_displacements_reject_typed_mixed_displacements() {
+    let d_chamfer = 0.5;
+    let r_fillet = 1.0;
+    let mut model = BRepModel::new();
+    let solid_id = make_cube(&mut model, BOX_SIZE);
+    let edges = corner_edges(&model);
+    let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
+
+    chamfer_edges(
+        &mut model,
+        solid_id,
+        vec![edges[0]],
+        chamfer_opts_with_partial_corner(d_chamfer, vec![corner]),
+    )
+    .expect("first chamfer (d=0.5) with partial-corner opt-in succeeds");
+
+    let err = fillet_edges(
+        &mut model,
+        solid_id,
+        vec![edges[1], edges[2]],
+        fillet_opts_constant(r_fillet),
+    )
+    .expect_err("finalize with r=1.0 against a d=0.5 chamfer must refuse typed");
+
+    match err {
+        OperationError::BlendFailed(boxed) => match *boxed {
+            BlendFailure::VertexBlendUnsupported {
+                reason: VertexBlendUnsupportedReason::MixedKindUnsupported { detail, .. },
+                ..
+            } => match detail {
+                MixedKindRejectDetail::MixedDisplacements { offsets, radii } => {
+                    assert!(
+                        !offsets.is_empty() && !radii.is_empty(),
+                        "payload carries both measured offset and radius sets"
+                    );
+                    assert!(
+                        offsets.iter().all(|o| (o - d_chamfer).abs() < 1.0e-6),
+                        "measured chamfer offsets must be ~{d_chamfer}; got {offsets:?}"
+                    );
+                    assert!(
+                        radii.iter().all(|r| (r - r_fillet).abs() < 1.0e-6),
+                        "measured fillet radii must be ~{r_fillet}; got {radii:?}"
+                    );
+                }
+                other => panic!("expected MixedDisplacements, got {:?}", other),
+            },
+            other => panic!("expected MixedKindUnsupported, got {:?}", other),
+        },
+        other => panic!("expected BlendFailed, got {:?}", other),
+    }
+
+    // The refusal is atomic — the model is back at the post-chamfer
+    // pending state (V still open, no cap, no stale registries beyond
+    // the deliberate pending entry).
+    let solid = model.solids.get(solid_id).expect("solid exists");
+    assert!(
+        solid.is_mixed_kind_corner_pending(corner),
+        "rolled-back second call leaves the corner pending from call 1"
+    );
+}
+
+/// Task 3C (3B review finding M1) — d ≠ r pre-gate, 2C1F chamfer-first
+/// ordering. This exercises the retraction-invariant offset recovery:
+/// the two-edge first chamfer performs the first-call apex retraction
+/// (Task 3A), so at finalize the chamfer rims no longer sit at
+/// offset-distance endpoints — the gate must recover d from the bevel
+/// side tracks' far endpoints instead, and still refuse typed.
+#[test]
+fn box_corner_2c1f_unequal_displacements_reject_typed_after_first_call_retraction() {
+    let d_chamfer = 1.0;
+    let r_fillet = 0.5;
+    let mut model = BRepModel::new();
+    let solid_id = make_cube(&mut model, BOX_SIZE);
+    let edges = corner_edges(&model);
+    let corner = vertex_at(&model, HALF_BOX, HALF_BOX, HALF_BOX);
+
+    chamfer_edges(
+        &mut model,
+        solid_id,
+        vec![edges[0], edges[1]],
+        chamfer_opts_with_partial_corner(d_chamfer, vec![corner]),
+    )
+    .expect("first chamfer (two edges, d=1.0) with partial-corner opt-in succeeds");
+
+    let err = fillet_edges(
+        &mut model,
+        solid_id,
+        vec![edges[2]],
+        fillet_opts_constant(r_fillet),
+    )
+    .expect_err("finalize with r=0.5 against d=1.0 chamfers must refuse typed");
+
+    match err {
+        OperationError::BlendFailed(boxed) => match *boxed {
+            BlendFailure::VertexBlendUnsupported {
+                reason: VertexBlendUnsupportedReason::MixedKindUnsupported { detail, .. },
+                ..
+            } => match detail {
+                MixedKindRejectDetail::MixedDisplacements { offsets, radii } => {
+                    assert!(
+                        offsets.iter().all(|o| (o - d_chamfer).abs() < 1.0e-6),
+                        "offset recovery must be retraction-invariant (~{d_chamfer}); \
+                         got {offsets:?}"
+                    );
+                    assert!(
+                        radii.iter().all(|r| (r - r_fillet).abs() < 1.0e-6),
+                        "measured fillet radii must be ~{r_fillet}; got {radii:?}"
+                    );
+                }
+                other => panic!("expected MixedDisplacements, got {:?}", other),
+            },
+            other => panic!("expected MixedKindUnsupported, got {:?}", other),
+        },
+        other => panic!("expected BlendFailed, got {:?}", other),
+    }
+}

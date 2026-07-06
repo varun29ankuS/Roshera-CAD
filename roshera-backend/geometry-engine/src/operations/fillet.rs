@@ -7566,6 +7566,7 @@ fn create_fillet_transitions(
                     vertex_pos,
                     &cap_edges_with_kind,
                     BlendKind::Fillet,
+                    seam_continuity,
                     Tolerance::default().distance(),
                 )?
             } else {
@@ -7932,6 +7933,19 @@ fn create_fillet_transitions(
             .unwrap_or(false);
 
         if radii_equal && has_prior_chamfer {
+            // Task 3B/3C review finding M4 — this CF-β.3.4 arm handles
+            // the (3 arc, N line) rim mix: a fillet call that blends
+            // ALL THREE corner edges at a vertex still carrying prior
+            // chamfer cap rims in the side-registry (a degree > 3 cap
+            // loop). It PREDATES the Task 3B shared retracted-cap
+            // constructor (`retract_and_cap_mixed_corner`) and is
+            // outside its (2,1)/(1,2) degree-3 contract, so it still
+            // routes through the legacy synthesize/G1 dispatcher below
+            // — including its pre-#72 un-retracted cap geometry.
+            // Documented as-is; unifying the (3,N) mix onto the shared
+            // constructor is follow-up work, not a Task 3C behaviour
+            // change.
+            //
             // Collect the per-fillet-face V-side cap arcs of this
             // call. For equal radii the sphere centre coincides with
             // `corner_apex`, so `find_cap_arc_edge_at_vertex` matches

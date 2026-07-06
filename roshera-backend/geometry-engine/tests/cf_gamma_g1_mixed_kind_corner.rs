@@ -1,30 +1,40 @@
-//! CF-γ.6.2 — G1 mixed-kind corner integration suite.
+//! Task 3C — the mixed-kind corner cap QUALITY CONTRACT
+//! (Varun-approved option C-1, burndown-diag-cf.md sub-group C).
 //!
-//! The CF-γ.2 single-degenerate-bicubic synthesizer hit a structural
-//! rank limit (4×4 control net with one collapsed apex column vs 3
-//! rims × K=5 stations × 1 normal-direction = 15 G1 constraints) and
-//! was rolled back to the typed `SeamContinuityUnreachable` sentinel.
-//! CF-γ.6 replaces it with a **3-sub-patch** topology: three bicubic
-//! NURBS sub-patches sharing a central apex vertex, each sub-patch
-//! owning one rim's G1 constraint independently. γ.6.2 ships the
-//! watertight C0 topology with planar-fairing seed CPs; γ.6.3 lifts
-//! the seed to the coupled rim-G1 + internal-C1 solver and adds the
-//! 1e-6 rad residual gate.
+//! ## History / why this file was re-pinned
 //!
-//! This file pins the γ.6.2 contract end-to-end:
+//! This suite previously pinned the CF-γ.6.2 **3-sub-patch** G1 cap
+//! (ΔF = +3, three bicubic NURBS sub-patches sharing a central apex).
+//! The diagnosis (burndown-diag-cf.md sub-group C) found that
+//! architecture superseded: "`b6f91bb` (#72): retracted 1C2F corners
+//! get **one** rational bi-quadratic collapsed-apex patch (same as
+//! the all-fillet corner), explicitly *instead of* the 'fragile
+//! 3-sub-patch G1 synthesizer (over-tessellates, can emit an empty
+//! sub-patch at this small scale)' … The ΔF=+3 / 3-edge-loop /
+//! per-sub-patch byte-determinism contracts are pinned against dead
+//! architecture." Tasks 3B/3A unified both operators and both rim
+//! mixes (1C2F, 2C1F) onto that single retracted cap.
 //!
-//! * Each of the 4 mixed-kind topologies the kernel supports on a
-//!   box corner (1C2F × {chamfer-first, fillet-first} and 2C1F ×
-//!   {chamfer-first, fillet-first}) lands both calls successfully.
-//! * The second call (the one that synthesizes the cap) creates
-//!   **exactly 3 new NURBS-backed faces** in the shell (ΔF = +3)
-//!   with `non_manifold_edge_count == 0`.
-//! * Each cap face's outer loop has exactly 3 edges (1 rim + 2
-//!   spokes meeting at the central apex).
-//! * The C0 default path is unchanged — same fixture with
-//!   `SeamContinuity::C0` (the [`Default`] impl) still produces a
-//!   `Plane`-backed N-gon cap. Catches an accidental flip of the
-//!   default that would silently change CF-β semantics.
+//! The one honest defect the old suite masked: "A user requesting
+//! `SeamContinuity::G1` silently receives a **29° normal kink** with
+//! no `SeamContinuityUnreachable` gate … Under the
+//! certificate-cannot-lie thesis this is a real regression." and
+//! "Either way the **silent G1 downgrade must go** — that part is
+//! not optional."
+//!
+//! ## The honest contract pinned here (Task 3C)
+//!
+//! * The kernel MEASURES the cap's rim-seam kink at synthesis.
+//! * A `SeamContinuity::G1` request on a corner whose single-patch
+//!   cap kinks above
+//!   [`geometry_engine::operations::mixed_kind_corner_cap::G1_CAP_KINK_TOLERANCE_RAD`]
+//!   refuses with the typed [`BlendFailure::G1NotAchievable`] —
+//!   loudly, on the second (finalizing) call, with the measured kink
+//!   in the payload.
+//! * A `C0`/default request delivers the single-patch cap as-is:
+//!   ONE NURBS cap face, watertight — the kink is honest, documented
+//!   C0 behaviour (observable via the seam audit, pinned in the
+//!   companion `cf_gamma_g1_mixed_kind_seam_audit` suite).
 
 // AUDIT-H13: Reason for `#![allow(clippy::expect_used)]` — test-only file.
 // `expect(...)` on fixture/scaffolding code surfaces invariant violations
@@ -42,10 +52,14 @@ use blend_fixtures::*;
 use geometry_engine::operations::chamfer::{
     chamfer_edges, ChamferOptions, ChamferType, PropagationMode as ChamferProp,
 };
+use geometry_engine::operations::diagnostics::BlendFailure;
 use geometry_engine::operations::fillet::{FilletType, PropagationMode as FilletProp};
-use geometry_engine::operations::mixed_kind_corner_cap::SeamContinuity;
-use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions};
+use geometry_engine::operations::mixed_kind_corner_cap::{
+    SeamContinuity, G1_CAP_KINK_TOLERANCE_RAD,
+};
+use geometry_engine::operations::{fillet_edges, CommonOptions, FilletOptions, OperationError};
 use geometry_engine::primitives::edge::EdgeId;
+use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::surface::{GeneralNurbsSurface, Plane};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::primitives::vertex::VertexId;
@@ -54,16 +68,35 @@ const BOX_SIZE: f64 = 10.0;
 const HALF_BOX: f64 = BOX_SIZE / 2.0;
 const D: f64 = 1.0;
 
+/// Measured worst-rim kink windows on the 10³ cube / D = 1 fixture,
+/// per (rim mix, call order). The single-patch cap's collapsed-apex
+/// corner is chosen by rim input order, and the two operators
+/// assemble the rim list in opposite kind orders — so the DELIVERED
+/// cap geometry (and its kink) differs by call order even though the
+/// topology is order-invariant (WL-hash equal). Measured live
+/// (deterministic after the Task 3C ascending-EdgeId registry fix):
+/// 1C2F chamfer-first 0.5137540…, 1C2F fillet-first 1.0471975…
+/// (= π/3), 2C1F chamfer-first 0.8495533…, 2C1F fillet-first
+/// 0.6619083… rad. The cross-order geometric variance is a
+/// pre-existing #72 single-patch artifact, banked for review — every
+/// value sits far above the 1e-2 G1 bar, so the refusal contract is
+/// order-invariant.
+const KINK_1C2F_CHAMFER_FIRST_RANGE: (f64, f64) = (0.45, 0.60);
+const KINK_1C2F_FILLET_FIRST_RANGE: (f64, f64) = (0.99, 1.10);
+const KINK_2C1F_CHAMFER_FIRST_RANGE: (f64, f64) = (0.80, 0.90);
+const KINK_2C1F_FILLET_FIRST_RANGE: (f64, f64) = (0.60, 0.72);
+
 // ---------------------------------------------------------------------------
 // Option helpers
 // ---------------------------------------------------------------------------
 
-fn fillet_g1_opts(radius: f64) -> FilletOptions {
+fn fillet_opts(radius: f64, partial: Vec<VertexId>, continuity: SeamContinuity) -> FilletOptions {
     FilletOptions {
         fillet_type: FilletType::Constant(radius),
         radius,
         propagation: FilletProp::None,
-        seam_continuity: SeamContinuity::G1,
+        seam_continuity: continuity,
+        partial_corner_vertices: partial,
         common: CommonOptions {
             validate_result: true,
             ..Default::default()
@@ -72,49 +105,24 @@ fn fillet_g1_opts(radius: f64) -> FilletOptions {
     }
 }
 
-fn fillet_g1_opts_with_partial(radius: f64, partial: Vec<VertexId>) -> FilletOptions {
-    FilletOptions {
-        partial_corner_vertices: partial,
-        ..fillet_g1_opts(radius)
-    }
-}
-
-fn chamfer_g1_opts(distance: f64) -> ChamferOptions {
+fn chamfer_opts(
+    distance: f64,
+    partial: Vec<VertexId>,
+    continuity: SeamContinuity,
+) -> ChamferOptions {
     ChamferOptions {
         chamfer_type: ChamferType::EqualDistance(distance),
         distance1: distance,
         distance2: distance,
         symmetric: true,
         propagation: ChamferProp::None,
-        seam_continuity: SeamContinuity::G1,
+        seam_continuity: continuity,
+        partial_corner_vertices: partial,
         common: CommonOptions {
             validate_result: true,
             ..Default::default()
         },
         ..Default::default()
-    }
-}
-
-fn chamfer_g1_opts_with_partial(distance: f64, partial: Vec<VertexId>) -> ChamferOptions {
-    ChamferOptions {
-        partial_corner_vertices: partial,
-        ..chamfer_g1_opts(distance)
-    }
-}
-
-/// C0 default opts — used by `c0_default_still_produces_planar_cap`
-/// to pin the CF-β regression boundary.
-fn chamfer_c0_opts_with_partial(distance: f64, partial: Vec<VertexId>) -> ChamferOptions {
-    ChamferOptions {
-        seam_continuity: SeamContinuity::C0,
-        ..chamfer_g1_opts_with_partial(distance, partial)
-    }
-}
-
-fn fillet_c0_opts(radius: f64) -> FilletOptions {
-    FilletOptions {
-        seam_continuity: SeamContinuity::C0,
-        ..fillet_g1_opts(radius)
     }
 }
 
@@ -134,12 +142,9 @@ fn corner_edges(model: &BRepModel) -> Vec<EdgeId> {
 /// Count the NURBS-backed faces in the outer shell of `solid_id`.
 /// On a box, no other operation in these fixtures produces a
 /// `GeneralNurbsSurface` (cube faces are `Plane`; fillet faces are
-/// `Cylinder`; chamfer faces are `Plane`), so this count isolates
-/// the γ.6.2 sub-patch cap faces.
-fn count_nurbs_faces_in_shell(
-    model: &BRepModel,
-    solid_id: geometry_engine::primitives::solid::SolidId,
-) -> usize {
+/// `CylindricalFillet`; chamfer faces are `RuledSurface`), so this
+/// count isolates the mixed-corner cap face.
+fn count_nurbs_faces_in_shell(model: &BRepModel, solid_id: SolidId) -> usize {
     let solid = model.solids.get(solid_id).expect("solid exists");
     let shell = model
         .shells
@@ -160,79 +165,76 @@ fn count_nurbs_faces_in_shell(
     n
 }
 
-/// Collect every NURBS-backed face in the outer shell paired with
-/// its outer-loop edge count. Used by the per-face loop assertion.
-fn nurbs_faces_with_loop_edge_counts(
-    model: &BRepModel,
-    solid_id: geometry_engine::primitives::solid::SolidId,
-) -> Vec<usize> {
-    let solid = model.solids.get(solid_id).expect("solid exists");
-    let shell = model
-        .shells
-        .get(solid.outer_shell)
-        .expect("outer shell exists");
-    let mut out = Vec::new();
-    for &fid in &shell.faces {
-        let face = model.faces.get(fid).expect("face exists");
-        let surface = model.surfaces.get(face.surface_id).expect("surface exists");
-        if surface
-            .as_any()
-            .downcast_ref::<GeneralNurbsSurface>()
-            .is_some()
-        {
-            let outer = model
-                .loops
-                .get(face.outer_loop)
-                .expect("NURBS cap face outer loop exists");
-            out.push(outer.edges.len());
-        }
-    }
-    out
-}
-
-/// γ.6.2 success-contract assertion. After both calls land, the
-/// shell must contain exactly 3 NURBS-backed cap faces, each with
-/// an outer loop of 3 edges (1 rim + 2 spokes meeting at the apex),
-/// and the cap must be watertight (zero non-manifold edges).
-fn assert_three_subpatch_cap(
-    model: &BRepModel,
-    solid_id: geometry_engine::primitives::solid::SolidId,
-    label: &str,
-) {
+/// Task 3C success-contract assertion for the DELIVERED (C0) cap:
+/// exactly ONE NURBS-backed single-patch cap face, watertight shell.
+fn assert_single_patch_cap(model: &BRepModel, solid_id: SolidId, label: &str) {
     assert_eq!(
         non_manifold_edge_count(model, solid_id),
         0,
-        "{label}: 3-sub-patch G1 cap must be watertight",
+        "{label}: single-patch mixed cap must be watertight",
     );
     let nurbs_count = count_nurbs_faces_in_shell(model, solid_id);
     assert_eq!(
-        nurbs_count, 3,
-        "{label}: γ.6.2 must emit exactly 3 NURBS sub-patch faces; got {nurbs_count}",
+        nurbs_count, 1,
+        "{label}: the retracted mixed corner must carry exactly ONE \
+         rational bi-quadratic NURBS cap face; got {nurbs_count}",
     );
-    let loop_sizes = nurbs_faces_with_loop_edge_counts(model, solid_id);
-    for size in &loop_sizes {
-        assert_eq!(
-            *size, 3,
-            "{label}: each γ.6.2 sub-patch face must have a 3-edge outer loop \
-             (1 rim + 2 spokes); got {size}",
-        );
+}
+
+/// Unwrap the typed Task 3C refusal and pin its payload: the measured
+/// kink must exceed the gate tolerance and fall inside the expected
+/// window for this rim mix.
+fn assert_g1_not_achievable(err: OperationError, label: &str, kink_range: (f64, f64)) {
+    match err {
+        OperationError::BlendFailed(boxed) => match *boxed {
+            BlendFailure::G1NotAchievable {
+                measured_kink_rad,
+                tolerance_rad,
+                ..
+            } => {
+                assert_eq!(
+                    tolerance_rad, G1_CAP_KINK_TOLERANCE_RAD,
+                    "{label}: refusal must carry the kernel gate tolerance"
+                );
+                assert!(
+                    measured_kink_rad > tolerance_rad,
+                    "{label}: refusal must carry measured kink > tolerance \
+                     (got kink={measured_kink_rad}, tolerance={tolerance_rad})"
+                );
+                assert!(
+                    measured_kink_rad > kink_range.0 && measured_kink_rad < kink_range.1,
+                    "{label}: measured kink {measured_kink_rad} outside the pinned \
+                     window ({}, {})",
+                    kink_range.0,
+                    kink_range.1
+                );
+            }
+            other => panic!("{label}: expected G1NotAchievable, got {other:?}"),
+        },
+        other => panic!("{label}: expected BlendFailed(G1NotAchievable), got {other:?}"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Headline tests — γ.6.2: 3 NURBS sub-patch faces, watertight, no G1 gate
-// ---------------------------------------------------------------------------
+// Headline tests — G1 request on a kinked corner refuses typed;
+// C0 delivers the single-patch cap.
 //
-// In each test the first call (chamfer or fillet) opens the corner
-// under the `partial_corner_vertices` opt-in — no cap is synthesized
-// yet because the opt-in pins the corner vertex open. The second
-// call finalises the mixed-kind corner; γ.6.2 routes the G1 arm
-// through `synthesize_mixed_kind_corner_cap_g1`, emitting 3
-// bicubic-NURBS sub-patches sharing a central apex vertex. γ.6.3
-// will extend each test with a rim-G1 residual assertion.
+// Task 3C re-pin. The predecessors of these four tests
+// (`g1_*_emits_three_subpatch_cap`) asserted ΔF = +3 sub-patch
+// topology. Diagnosis quote (burndown-diag-cf.md sub-group C): the
+// 3-sub-patch architecture was "deliberately superseded" by #70/#72 —
+// "the ΔF=+3 / 3-edge-loop / per-sub-patch byte-determinism contracts
+// are pinned against dead architecture". The honest contract is: the
+// single patch is delivered under C0, and a G1 request that the patch
+// cannot honour (measured kink 0.514 / 0.849 rad ≫ 1e-2 bar) refuses
+// with the typed `G1NotAchievable` instead of the pre-3C silent
+// downgrade ("G1 requested … ~29° kink delivered, gate silently
+// bypassed").
+// ---------------------------------------------------------------------------
 
-#[test]
-fn g1_1c2f_chamfer_first_emits_three_subpatch_cap() {
+fn run_1c2f_chamfer_first(
+    continuity: SeamContinuity,
+) -> (BRepModel, SolidId, Result<(), OperationError>) {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -241,21 +243,22 @@ fn g1_1c2f_chamfer_first_emits_three_subpatch_cap() {
         &mut model,
         solid_id,
         vec![edges[0]],
-        chamfer_g1_opts_with_partial(D, vec![corner]),
+        chamfer_opts(D, vec![corner], continuity),
     )
     .expect("1C2F chamfer-first: first chamfer with partial-corner opt-in succeeds");
-    fillet_edges(
+    let second = fillet_edges(
         &mut model,
         solid_id,
         vec![edges[1], edges[2]],
-        fillet_g1_opts(D),
+        fillet_opts(D, vec![], continuity),
     )
-    .expect("1C2F chamfer-first: second fillet must close the corner with 3-sub-patch G1 cap");
-    assert_three_subpatch_cap(&model, solid_id, "1C2F chamfer-first");
+    .map(|_| ());
+    (model, solid_id, second)
 }
 
-#[test]
-fn g1_1c2f_fillet_first_emits_three_subpatch_cap() {
+fn run_1c2f_fillet_first(
+    continuity: SeamContinuity,
+) -> (BRepModel, SolidId, Result<(), OperationError>) {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -264,16 +267,22 @@ fn g1_1c2f_fillet_first_emits_three_subpatch_cap() {
         &mut model,
         solid_id,
         vec![edges[1], edges[2]],
-        fillet_g1_opts_with_partial(D, vec![corner]),
+        fillet_opts(D, vec![corner], continuity),
     )
     .expect("1C2F fillet-first: first fillet with partial-corner opt-in succeeds");
-    chamfer_edges(&mut model, solid_id, vec![edges[0]], chamfer_g1_opts(D))
-        .expect("1C2F fillet-first: second chamfer must close the corner with 3-sub-patch G1 cap");
-    assert_three_subpatch_cap(&model, solid_id, "1C2F fillet-first");
+    let second = chamfer_edges(
+        &mut model,
+        solid_id,
+        vec![edges[0]],
+        chamfer_opts(D, vec![], continuity),
+    )
+    .map(|_| ());
+    (model, solid_id, second)
 }
 
-#[test]
-fn g1_2c1f_chamfer_first_emits_three_subpatch_cap() {
+fn run_2c1f_chamfer_first(
+    continuity: SeamContinuity,
+) -> (BRepModel, SolidId, Result<(), OperationError>) {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -282,16 +291,22 @@ fn g1_2c1f_chamfer_first_emits_three_subpatch_cap() {
         &mut model,
         solid_id,
         vec![edges[0], edges[1]],
-        chamfer_g1_opts_with_partial(D, vec![corner]),
+        chamfer_opts(D, vec![corner], continuity),
     )
     .expect("2C1F chamfer-first: first chamfer (two edges) with partial-corner opt-in succeeds");
-    fillet_edges(&mut model, solid_id, vec![edges[2]], fillet_g1_opts(D))
-        .expect("2C1F chamfer-first: second fillet must close the corner with 3-sub-patch G1 cap");
-    assert_three_subpatch_cap(&model, solid_id, "2C1F chamfer-first");
+    let second = fillet_edges(
+        &mut model,
+        solid_id,
+        vec![edges[2]],
+        fillet_opts(D, vec![], continuity),
+    )
+    .map(|_| ());
+    (model, solid_id, second)
 }
 
-#[test]
-fn g1_2c1f_fillet_first_emits_three_subpatch_cap() {
+fn run_2c1f_fillet_first(
+    continuity: SeamContinuity,
+) -> (BRepModel, SolidId, Result<(), OperationError>) {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -300,29 +315,96 @@ fn g1_2c1f_fillet_first_emits_three_subpatch_cap() {
         &mut model,
         solid_id,
         vec![edges[2]],
-        fillet_g1_opts_with_partial(D, vec![corner]),
+        fillet_opts(D, vec![corner], continuity),
     )
     .expect("2C1F fillet-first: first fillet (one edge) with partial-corner opt-in succeeds");
-    chamfer_edges(
+    let second = chamfer_edges(
         &mut model,
         solid_id,
         vec![edges[0], edges[1]],
-        chamfer_g1_opts(D),
+        chamfer_opts(D, vec![], continuity),
     )
-    .expect("2C1F fillet-first: second chamfer must close the corner with 3-sub-patch G1 cap");
-    assert_three_subpatch_cap(&model, solid_id, "2C1F fillet-first");
+    .map(|_| ());
+    (model, solid_id, second)
+}
+
+#[test]
+fn g1_request_on_kinked_1c2f_chamfer_first_corner_refuses_typed() {
+    let (_, _, second) = run_1c2f_chamfer_first(SeamContinuity::G1);
+    let err = second.expect_err(
+        "1C2F chamfer-first: G1-requested finalize on a corner whose single-patch \
+         cap kinks ~0.514 rad must refuse typed, not silently downgrade",
+    );
+    assert_g1_not_achievable(err, "1C2F chamfer-first", KINK_1C2F_CHAMFER_FIRST_RANGE);
+
+    // The identical fixture under C0/default delivers the cap honestly.
+    let (model, solid_id, second) = run_1c2f_chamfer_first(SeamContinuity::C0);
+    second.expect("1C2F chamfer-first: C0 finalize delivers the single-patch cap");
+    assert_single_patch_cap(&model, solid_id, "1C2F chamfer-first (C0)");
+}
+
+#[test]
+fn g1_request_on_kinked_1c2f_fillet_first_corner_refuses_typed() {
+    let (_, _, second) = run_1c2f_fillet_first(SeamContinuity::G1);
+    let err = second.expect_err(
+        "1C2F fillet-first: G1-requested finalize on a corner whose single-patch \
+         cap kinks ~0.514 rad must refuse typed, not silently downgrade",
+    );
+    assert_g1_not_achievable(err, "1C2F fillet-first", KINK_1C2F_FILLET_FIRST_RANGE);
+
+    let (model, solid_id, second) = run_1c2f_fillet_first(SeamContinuity::C0);
+    second.expect("1C2F fillet-first: C0 finalize delivers the single-patch cap");
+    assert_single_patch_cap(&model, solid_id, "1C2F fillet-first (C0)");
+}
+
+#[test]
+fn g1_request_on_kinked_2c1f_chamfer_first_corner_refuses_typed() {
+    let (_, _, second) = run_2c1f_chamfer_first(SeamContinuity::G1);
+    let err = second.expect_err(
+        "2C1F chamfer-first: G1-requested finalize on a corner whose single-patch \
+         cap kinks ~0.849 rad must refuse typed, not silently downgrade",
+    );
+    assert_g1_not_achievable(err, "2C1F chamfer-first", KINK_2C1F_CHAMFER_FIRST_RANGE);
+
+    let (model, solid_id, second) = run_2c1f_chamfer_first(SeamContinuity::C0);
+    second.expect("2C1F chamfer-first: C0 finalize delivers the single-patch cap");
+    assert_single_patch_cap(&model, solid_id, "2C1F chamfer-first (C0)");
+}
+
+#[test]
+fn g1_request_on_kinked_2c1f_fillet_first_corner_refuses_typed() {
+    let (_, _, second) = run_2c1f_fillet_first(SeamContinuity::G1);
+    let err = second.expect_err(
+        "2C1F fillet-first: G1-requested finalize on a corner whose single-patch \
+         cap kinks ~0.849 rad must refuse typed, not silently downgrade",
+    );
+    assert_g1_not_achievable(err, "2C1F fillet-first", KINK_2C1F_FILLET_FIRST_RANGE);
+
+    let (model, solid_id, second) = run_2c1f_fillet_first(SeamContinuity::C0);
+    second.expect("2C1F fillet-first: C0 finalize delivers the single-patch cap");
+    assert_single_patch_cap(&model, solid_id, "2C1F fillet-first (C0)");
 }
 
 // ---------------------------------------------------------------------------
-// CF-β regression boundary — C0 default still produces a planar cap
+// C0 default — the cap for an arc-rimmed corner is CURVED, never planar.
 // ---------------------------------------------------------------------------
 
-/// Omitting the G1 opt-in (default [`SeamContinuity::C0`]) must
-/// still produce the CF-β planar N-gon cap — a `Plane`-backed face,
-/// not a NURBS one. Catches an accidental flip of
-/// `SeamContinuity::default()` in a future refactor.
+/// Task 3C re-pin of `c0_default_still_produces_planar_cap`. That
+/// test pinned a planar 3-gon cap and rejected any NURBS cap — but
+/// the diagnosis found planar-C0 was the #70 BUG, not the contract
+/// (burndown-diag-cf.md sub-group C): "`5df874a` (#70 defect 1): a
+/// **flat planar cap cannot bound arc rims** (the unit fillet cap arc
+/// bulges ~0.24 out of the corner plane) — C0 with any arc rim now
+/// routes to the curved builder. The `c0_default` test pins the
+/// geometrically-impossible planar contract; the NURBS cap it rejects
+/// **is the fix**." And: "Do NOT 'fix' the kernel back to planar-C0 —
+/// that was the #70 bug."
+///
+/// Honest assertion: the C0/default build of an arc-rimmed mixed
+/// corner produces the CURVED single-patch NURBS cap (never a planar
+/// 3-gon), watertight.
 #[test]
-fn c0_default_still_produces_planar_cap() {
+fn c0_default_produces_curved_single_patch_cap_for_arc_rimmed_corner() {
     let mut model = BRepModel::new();
     let solid_id = make_cube(&mut model, BOX_SIZE);
     let edges = corner_edges(&model);
@@ -331,48 +413,37 @@ fn c0_default_still_produces_planar_cap() {
         &mut model,
         solid_id,
         vec![edges[0]],
-        chamfer_c0_opts_with_partial(D, vec![corner]),
+        chamfer_opts(D, vec![corner], SeamContinuity::C0),
     )
     .expect("C0 1C2F chamfer-first: first chamfer succeeds");
     fillet_edges(
         &mut model,
         solid_id,
         vec![edges[1], edges[2]],
-        fillet_c0_opts(D),
+        fillet_opts(D, vec![], SeamContinuity::C0),
     )
-    .expect("C0 1C2F chamfer-first: second fillet synthesizes planar cap");
+    .expect("C0 1C2F chamfer-first: second fillet synthesizes the curved single-patch cap");
 
-    assert_eq!(non_manifold_edge_count(&model, solid_id), 0);
+    assert_single_patch_cap(&model, solid_id, "C0 default 1C2F");
+
+    // Never planar: no Plane-backed 3-gon cap face may exist — a flat
+    // cap cannot contain the fillet arc rims (#70).
     let solid = model.solids.get(solid_id).expect("solid exists");
     let shell = model.shells.get(solid.outer_shell).expect("shell exists");
-    let mut nurbs_cap_present = false;
-    let mut planar_3gon_cap_present = false;
     for &fid in &shell.faces {
         let face = model.faces.get(fid).expect("face exists");
         let surface = model.surfaces.get(face.surface_id).expect("surface exists");
-        if surface
-            .as_any()
-            .downcast_ref::<GeneralNurbsSurface>()
-            .is_some()
-        {
-            nurbs_cap_present = true;
-        }
         if surface.as_any().downcast_ref::<Plane>().is_some() {
             let outer = model
                 .loops
                 .get(face.outer_loop)
                 .expect("planar face outer loop");
-            if outer.edges.len() == 3 {
-                planar_3gon_cap_present = true;
-            }
+            assert_ne!(
+                outer.edges.len(),
+                3,
+                "C0 default path must not produce a planar 3-gon cap — the #70 bug \
+                 (a flat cap cannot bound arc rims); face {fid} is a Plane 3-gon",
+            );
         }
     }
-    assert!(
-        !nurbs_cap_present,
-        "C0 default path must not produce a NURBS cap; SeamContinuity::default() flipped?"
-    );
-    assert!(
-        planar_3gon_cap_present,
-        "C0 default path must produce a 3-edge planar cap face"
-    );
 }

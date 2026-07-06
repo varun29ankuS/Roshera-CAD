@@ -3036,6 +3036,7 @@ fn handle_chamfer_vertices(
                     corner.position,
                     &cap_edges_with_kind,
                     BlendKind::Chamfer,
+                    seam_continuity,
                     tolerance,
                 )?
             } else {

@@ -439,6 +439,40 @@ pub enum BlendFailure {
         /// Angular tolerance the residual was compared against (radians).
         tolerance: f64,
     },
+    /// Task 3C (burndown-diag-cf.md sub-group C, option C-1) — the
+    /// caller requested
+    /// [`crate::operations::mixed_kind_corner_cap::SeamContinuity::G1`]
+    /// at a mixed-kind corner, the single rational bi-quadratic
+    /// collapsed-apex cap was synthesized, and the **measured**
+    /// worst-case rim-seam normal kink exceeds the G1 acceptance bar.
+    /// The operation refuses loudly instead of delivering a silent
+    /// downgrade — pre-3C the retracted-cap arm bypassed every G1
+    /// gate and shipped a ~29° kink under a G1 request (the
+    /// `audit_1c2f` honest defect).
+    ///
+    /// Unlike [`SeamContinuityUnreachable`][Self::SeamContinuityUnreachable]
+    /// (a *solver*-side residual at an interior sample station), this
+    /// is a *post-synthesis measurement*: the kink is sampled at the
+    /// parametric midpoint of each cap rim by comparing the cap-face
+    /// normal against the adjacent trim-face normal — the same
+    /// measurement `audit_mixed_kind_seam_continuity` performs after
+    /// the fact, run at synthesis time so the certificate cannot lie.
+    ///
+    /// Agents recover by retrying with `seam_continuity: C0` — the
+    /// same cap is then delivered as documented C0 behaviour (the
+    /// kink stays measurable through the seam audit).
+    G1NotAchievable {
+        /// Mixed-kind corner vertex the cap was synthesised at.
+        vertex: VertexId,
+        /// Cap-rim edge carrying the worst-case kink.
+        rim_edge: EdgeId,
+        /// Measured worst-case rim-midpoint normal kink (radians).
+        measured_kink_rad: f64,
+        /// Angular acceptance bar the kink was compared against
+        /// (radians) —
+        /// [`crate::operations::mixed_kind_corner_cap::G1_CAP_KINK_TOLERANCE_RAD`].
+        tolerance_rad: f64,
+    },
     /// Catch-all for irreducible failures not yet classified. The
     /// `detail` string is freeform; when a recurring `detail` pattern
     /// emerges in production telemetry, promote it to a structured
@@ -546,6 +580,18 @@ impl std::fmt::Display for BlendFailure {
                 "mixed-kind {} seam residual at vertex {} between trim face {} and cap face {} exceeded tolerance (residual {} > {})",
                 seam_kind, vertex, blend_face, cap_face, residual, tolerance
             ),
+            BlendFailure::G1NotAchievable {
+                vertex,
+                rim_edge,
+                measured_kink_rad,
+                tolerance_rad,
+            } => write!(
+                f,
+                "G1 requested at mixed-kind corner vertex {} but the single-patch cap's \
+                 measured rim kink is {} rad at rim edge {} (> tolerance {} rad); \
+                 retry with seam_continuity C0 to accept the cap with the declared kink",
+                vertex, measured_kink_rad, rim_edge, tolerance_rad
+            ),
             BlendFailure::TopologyViolation { detail } => {
                 write!(f, "topology violation: {}", detail)
             }
@@ -605,6 +651,11 @@ impl From<BlendFailure> for OperationError {
             BlendFailure::MixedKindSeamResidualExceeded { .. } => {
                 OperationError::BlendFailed(Box::new(failure))
             }
+            // Task 3C: G1NotAchievable carries the measured-kink
+            // payload agents branch on (retry-with-C0 vs adjust
+            // displacements) — typed BlendFailed, same rationale as
+            // SeamContinuityUnreachable.
+            BlendFailure::G1NotAchievable { .. } => OperationError::BlendFailed(Box::new(failure)),
             BlendFailure::RadiusExceedsCurvature { .. }
             | BlendFailure::SetbackTooLong { .. }
             | BlendFailure::VertexBlendUnsupported { .. }
