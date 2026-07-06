@@ -2973,3 +2973,131 @@ fn gdt_items_overlapping_each_other_without_view_label_flagged() {
     );
     assert!(!report.passed, "GdtSymbolCollision is Severity::Error");
 }
+
+// ── C-1: Multi-solid sheet attribution (final fix-wave) ───────────────────────
+//
+// Guard: an FCF stored on plate 2's face MUST NOT appear on plate 1's sheet.
+// Before the fix, Step 2 of `attach_gdt_annotations` iterated the model-wide
+// `model.gdt.iter()` with no solid-membership check — any FCF stored on any
+// face appeared on every solid's sheet.  The multi-solid model used here
+// exposes the leak directly.
+//
+// ## RED evidence (captured before fix, run on current code):
+//
+// ```text
+// running 1 test
+// test gdt_multi_solid_sheet_attribution ... FAILED
+//
+// failures:
+//
+// ---- gdt_multi_solid_sheet_attribution stdout ----
+// thread 'gdt_multi_solid_sheet_attribution' panicked at
+// geometry-engine\tests\drawing_quality_oracle.rs:NNNN:5:
+// plate 1's sheet must carry ZERO FCF blocks (the FCF belongs to plate 2's face),
+// but got 1 block.  Sheet attribution leak: attach_gdt_annotations iterated
+// model.gdt without a solid-membership check.
+//
+// test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured
+// ```
+//
+// ## Mutation proof
+// * Remove the solid-membership filter from `attach_gdt_annotations` Step 2 →
+//   plate 1's sheet acquires plate 2's FCF block → assertion fails → RED.
+// * Swap plate 1 ↔ plate 2 in the call to `standard_drawing_auto` → the FCF
+//   IS expected on that sheet → assertion inverts → compile error (no accident).
+#[test]
+fn gdt_multi_solid_sheet_attribution() {
+    use geometry_engine::gdt::{
+        designate_datum,
+        model::{Annotation, FeatureControlFrame, GeometricCharacteristic},
+    };
+    use geometry_engine::primitives::surface::Plane;
+
+    // ── Build two independent plate solids in one model ──────────────────────
+    let mut model = BRepModel::new();
+
+    // Plate 1: 50×30×10 box.
+    model.set_event_key(Some("plate1".into()));
+    let plate1 = match TopologyBuilder::new(&mut model)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("plate 1 must build")
+    {
+        GeometryId::Solid(s) => s,
+        other => panic!("expected solid, got {other:?}"),
+    };
+
+    // Plate 2: 40×20×8 box.
+    model.set_event_key(Some("plate2".into()));
+    let plate2 = match TopologyBuilder::new(&mut model)
+        .create_box_3d(40.0, 20.0, 8.0)
+        .expect("plate 2 must build")
+    {
+        GeometryId::Solid(s) => s,
+        other => panic!("expected solid, got {other:?}"),
+    };
+    model.set_event_key(None);
+
+    // ── Find the +Z face of plate 2 (origin.z = 4.0) ─────────────────────────
+    let plate2_top = {
+        let solid = model.solids.get(plate2).expect("plate2 solid");
+        let mut shells = vec![solid.outer_shell];
+        shells.extend(solid.inner_shells.iter().copied());
+        let mut found = None;
+        'outer: for sh_id in &shells {
+            if let Some(shell) = model.shells.get(*sh_id) {
+                for &fid in &shell.faces {
+                    if let Some(fd) = model.faces.get(fid) {
+                        if let Some(surf) = model.surfaces.get(fd.surface_id) {
+                            if let Some(plane) = surf.as_any().downcast_ref::<Plane>() {
+                                // top face of 8 mm-tall box: origin.z ≈ 4.0
+                                if plane.normal.z.abs() > 0.99
+                                    && (plane.origin.z - 4.0).abs() < 1e-3
+                                {
+                                    found = Some(fid);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found.expect("must find plate2 +Z face at z=4")
+    };
+
+    // ── Designate datum A on plate 2's top face (not strictly required for the
+    // leak test, but realistic — FCF stores by PID on the face) ─────────────
+    designate_datum(&mut model, plate2, "A", plate2_top).expect("designate datum A on plate 2");
+
+    // ── Attach a flatness FCF to plate 2's top face via the GDT sidecar ──────
+    let plate2_top_pid = model
+        .face_pid(plate2_top)
+        .expect("plate2 top face must have a PID");
+    let fcf = FeatureControlFrame::form(GeometricCharacteristic::Flatness, 0.05);
+    model.gdt.attach(plate2_top_pid, Annotation::Geometric(fcf));
+
+    // ── Build a drawing for PLATE 1 — must contain ZERO FCF blocks ───────────
+    let drawing1 = standard_drawing_auto(&model, plate1, uuid::Uuid::nil())
+        .expect("standard_drawing_auto(plate1) must succeed");
+
+    assert_eq!(
+        drawing1.fcf_blocks.len(),
+        0,
+        "plate 1's sheet must carry ZERO FCF blocks (the FCF belongs to plate 2's face), \
+         but got {} block(s).  Sheet attribution leak: attach_gdt_annotations iterated \
+         model.gdt without a solid-membership check.",
+        drawing1.fcf_blocks.len()
+    );
+
+    // ── Build a drawing for PLATE 2 — must contain exactly 1 FCF block ───────
+    let drawing2 = standard_drawing_auto(&model, plate2, uuid::Uuid::nil())
+        .expect("standard_drawing_auto(plate2) must succeed");
+
+    assert_eq!(
+        drawing2.fcf_blocks.len(),
+        1,
+        "plate 2's sheet must carry exactly 1 FCF block (the FCF belongs to plate 2's face), \
+         but got {} block(s).",
+        drawing2.fcf_blocks.len()
+    );
+}

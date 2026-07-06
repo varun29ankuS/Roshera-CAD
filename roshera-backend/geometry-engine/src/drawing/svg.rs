@@ -840,8 +840,6 @@ fn render_gdt_annotations(out: &mut String, drawing: &super::types::Drawing, lay
             _ => {}
         }
     }
-
-    let _ = GDT_BLOCK_H; // suppress unused warning if no fcf items
 }
 
 fn dim_line(out: &mut String, x1: f64, y1: f64, x2: f64, y2: f64) {

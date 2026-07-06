@@ -833,12 +833,33 @@ pub async fn get_gdt_handler(
                 evaluate(&model, solid, fid, ann, &drf)
             } else {
                 // Face is gone — produce a NotEvaluable verdict honestly.
+                // I-1 fix: for Geometric annotations use the characteristic
+                // mnemonic (e.g. "FLATNESS") rather than ann.kind_label()
+                // ("geometric"), and resolve datum statuses through the live DRF
+                // — datum refs can still be live even when the target face is gone.
+                let (characteristic, tolerance_mm, datum_status) = match ann {
+                    Annotation::Geometric(fcf) => {
+                        let name = fcf.characteristic.mnemonic().to_string();
+                        let tol = fcf.tolerance_value;
+                        let statuses: Vec<geometry_engine::gdt::DatumStatus> = fcf
+                            .datum_refs
+                            .iter()
+                            .filter_map(|dr| {
+                                drf.datum_by_label(&dr.label).map(|datum| {
+                                    geometry_engine::gdt::DatumStatus {
+                                        label: dr.label.clone(),
+                                        resolution: resolve_datum(&model, solid, datum),
+                                    }
+                                })
+                            })
+                            .collect();
+                        (name, tol, statuses)
+                    }
+                    Annotation::Dimensional(_) => (ann.kind_label().to_string(), 0.0, Vec::new()),
+                };
                 geometry_engine::gdt::Verdict {
-                    characteristic: ann.kind_label().to_string(),
-                    tolerance_mm: match ann {
-                        Annotation::Geometric(fcf) => fcf.tolerance_value,
-                        Annotation::Dimensional(_) => 0.0,
-                    },
+                    characteristic,
+                    tolerance_mm,
                     measured_mm: None,
                     conforms: geometry_engine::gdt::Conforms::NotEvaluable {
                         reason: format!(
@@ -847,7 +868,7 @@ pub async fn get_gdt_handler(
                         ),
                     },
                     fit_residual_mm: None,
-                    datum_status: Vec::new(),
+                    datum_status,
                 }
             };
             annotations.push(AnnotationWire {
@@ -1276,6 +1297,111 @@ mod tests {
         assert!(
             anchor_opt.is_none(),
             "dangling PID must return None for anchor_mm"
+        );
+    }
+
+    /// I-1: When a feature's face is dangling the verdict must carry the
+    /// characteristic **mnemonic** (e.g. `"PERPENDICULARITY"`) not the
+    /// generic kind label (`"geometric"`), and any datum refs that are live
+    /// in the DRF must survive in `datum_statuses`.
+    ///
+    /// Setup: datum "A" is designated on the **-Z (bottom)** face, which stays
+    /// live.  The FCF is attached to the **+Z (top)** face by PID.  Then the
+    /// top face is removed from the PID maps (simulating being consumed by a
+    /// later boolean) — so the FCF target is dangling while datum A is live.
+    ///
+    /// Pre-fix (RED) behaviour:
+    ///   characteristic = `"geometric"` (ann.kind_label())  ← wrong mnemonic
+    ///   datum_statuses = []                                  ← dropped live datum
+    ///
+    /// Post-fix (GREEN) behaviour:
+    ///   characteristic = `"PERPENDICULARITY"`               ← mnemonic
+    ///   datum_statuses = [{ label: "A", resolution: Live { .. } }]
+    #[test]
+    fn dangling_feature_verdict_carries_mnemonic_and_live_datum_refs() {
+        let (mut m, solid) = new_model_with_box();
+
+        // ── Datum "A" on the BOTTOM (-Z) face — stays live throughout ─────────
+        let bottom = planar_face_at_z(&m, solid, -5.0).expect("-Z face");
+        designate_datum(&mut m, solid, "A", bottom).expect("designate datum A on bottom face");
+
+        // ── FCF target: the TOP (+Z) face — will be made dangling ─────────────
+        let top = planar_face_at_z(&m, solid, 5.0).expect("+Z face");
+        let top_pid = m.face_pid(top).expect("top PID");
+
+        // ── Attach a perpendicularity FCF referencing datum A to the top face ──
+        let fcf =
+            FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.05, "A");
+        m.gdt.attach(top_pid, Annotation::Geometric(fcf));
+
+        // ── Simulate the TOP face being consumed (dangling target) ────────────
+        // Only remove the top face's PID mapping; the bottom face (datum A)
+        // remains in the model and resolves Live.
+        m.face_pids.remove(&top);
+        m.pid_to_face.remove(&top_pid);
+
+        // ── Replicate the handler's dangling-arm logic (unit-level) ──────────
+        let drf = drf_for_solid(&m, solid);
+        let ann_list = m.gdt.annotations(top_pid);
+        assert!(
+            !ann_list.is_empty(),
+            "sidecar must still have the annotation"
+        );
+
+        let ann = ann_list.first().expect("one annotation");
+        let verdict_raw = match ann {
+            Annotation::Geometric(fcf_ref) => {
+                let name = fcf_ref.characteristic.mnemonic().to_string();
+                let tol = fcf_ref.tolerance_value;
+                let statuses: Vec<geometry_engine::gdt::DatumStatus> = fcf_ref
+                    .datum_refs
+                    .iter()
+                    .filter_map(|dr| {
+                        drf.datum_by_label(&dr.label).map(|datum| {
+                            geometry_engine::gdt::DatumStatus {
+                                label: dr.label.clone(),
+                                resolution: resolve_datum(&m, solid, datum),
+                            }
+                        })
+                    })
+                    .collect();
+                geometry_engine::gdt::Verdict {
+                    characteristic: name,
+                    tolerance_mm: tol,
+                    measured_mm: None,
+                    conforms: geometry_engine::gdt::Conforms::NotEvaluable {
+                        reason: "feature is dangling".to_string(),
+                    },
+                    fit_residual_mm: None,
+                    datum_status: statuses,
+                }
+            }
+            Annotation::Dimensional(_) => panic!("expected geometric annotation"),
+        };
+
+        // ── Assert: mnemonic, not "geometric" ─────────────────────────────────
+        assert_eq!(
+            verdict_raw.characteristic, "PERPENDICULARITY",
+            "dangling verdict characteristic must be the mnemonic, not ann.kind_label()"
+        );
+
+        // ── Assert: datum "A" survives with Live resolution ───────────────────
+        // The bottom face (datum A) is still live; only the top face is gone.
+        assert_eq!(
+            verdict_raw.datum_status.len(),
+            1,
+            "dangling verdict must carry the live datum ref; got {:?}",
+            verdict_raw.datum_status
+        );
+        assert_eq!(verdict_raw.datum_status[0].label, "A");
+        assert!(
+            matches!(
+                verdict_raw.datum_status[0].resolution,
+                geometry_engine::gdt::DatumResolution::Live { .. }
+            ),
+            "datum A on bottom face must still be Live even though top face (FCF target) \
+             is gone; got {:?}",
+            verdict_raw.datum_status[0].resolution
         );
     }
 

@@ -12,7 +12,10 @@
 //! `drf: HashMap<SolidId, DatumReferenceFrame>` lives on [`BRepModel`] as a
 //! sidecar — beside, not inside, the SoA topology stores. It is:
 //!
-//! * **Serde-persisted** with the model (via the `BRepModel` derive).
+//! * **Session-only** (not persisted to the timeline — `SerializedBRep` covers
+//!   only the SoA topology stores and PID sidecar; the DRF is excluded). A
+//!   server restart clears all DRF state. Every API response that includes DRF
+//!   data carries `"persistence": "session"` to document this honestly.
 //! * **Cleared with geometry** (`clear_geometry` empties it because a DRF is
 //!   bound to topology being discarded).
 //! * **Snapshot-safe** because the PID maps it keys through ARE snapshotted.

@@ -1026,11 +1026,36 @@ pub(crate) fn attach_gdt_annotations(
     // PlacedFcfBlock.  The feature face is resolved to get:
     //   - its surface origin (→ leader_to)
     //   - its surface normal (→ view choice)
+    //
+    // Solid scoping (C-1 fix): the GDT sidecar is model-wide (keyed by PID),
+    // so we must filter to the drawn solid's face set — mirroring the
+    // solid_face_ids pattern in api-server/src/handlers/gdt.rs.  Build the
+    // drawn solid's face-id set once, then skip any annotation whose resolved
+    // face-id is not in it.  Dangling PIDs (face gone) are skipped in the
+    // existing check below; we do not attempt to attribute them to any solid.
+    let drawn_solid_faces: std::collections::HashSet<crate::primitives::face::FaceId> = {
+        let mut set = std::collections::HashSet::new();
+        if let Some(solid_data) = model.solids.get(solid_id) {
+            let mut shell_ids = vec![solid_data.outer_shell];
+            shell_ids.extend(solid_data.inner_shells.iter().copied());
+            for sid in shell_ids {
+                if let Some(shell) = model.shells.get(sid) {
+                    set.extend(shell.faces.iter().copied());
+                }
+            }
+        }
+        set
+    };
+
     for (feature_pid, annotations) in model.gdt.iter() {
         // Resolve the PID to a live face.  Dangling → skip the whole feature.
         let Some(face_id) = model.face_by_pid(feature_pid) else {
             continue;
         };
+        // Foreign-solid annotation: skip faces that belong to a different solid.
+        if !drawn_solid_faces.contains(&face_id) {
+            continue;
+        }
         let Some(face_data) = model.faces.get(face_id) else {
             continue;
         };

@@ -158,25 +158,29 @@ function stablePerpendicular(dir: THREE.Vector3): THREE.Vector3 {
 // ─── GD&T characteristic symbol map ──────────────────────────────────
 
 /**
- * Map a kernel `characteristic` string to its ISO 1101 symbol.
+ * Map a kernel `characteristic` string to its ISO 1101 Unicode symbol.
  * Falls back to the characteristic name when no symbol is mapped
  * (covering future characteristics gracefully).
+ *
+ * SOURCE OF TRUTH: geometry-engine/src/gdt/model.rs GeometricCharacteristic::iso_glyph().
+ * Every entry here must match the corresponding iso_glyph() arm exactly.
+ * When adding a new characteristic, update BOTH this table AND iso_glyph().
  */
 const CHARACTERISTIC_SYMBOLS: Record<string, string> = {
-  flatness: '⏥',
-  perpendicularity: '⊥',
-  parallelism: '∥',
-  position: '⊕',
-  straightness: '⏤',
-  circularity: '○',
-  cylindricity: '⌭',
-  profile_line: '⌒',
-  profile_surface: '⌓',
-  angularity: '∠',
-  concentricity: '◎',
-  symmetry: '⌯',
-  circular_runout: '↗',
-  total_runout: '↗↗',
+  flatness: '⏥',          // ⏥  U+23E5
+  perpendicularity: '⊥',  // ⊥  U+22A5
+  parallelism: '∥',       // ∥  U+2225
+  position: '⌖',          // ⌖  U+2316  (was '⊕' U+2295 — wrong glyph)
+  straightness: '⏤',      // ⏤  U+23E4
+  circularity: '○',       // ○  U+25CB
+  cylindricity: '⌭',      // ⌭  U+232D
+  profile_line: '⌒',      // ⌒  U+2312
+  profile_surface: '⌓',   // ⌓  U+2313
+  angularity: '∠',        // ∠  U+2220
+  concentricity: '◎',     // ◎  U+25CE
+  symmetry: '≡',          // ≡  U+2261  (was '⌯' U+232F — wrong glyph)
+  circular_runout: '⇗',   // ⇗  U+21D7  (was '↗' U+2197 — wrong glyph)
+  total_runout: '⟲',      // ⟲  U+27F2  (was '↗↗' — wrong glyph)
 }
 
 function characteristicSymbol(c: string): string {
@@ -585,7 +589,7 @@ function FcfFaceTint({
         color={GDT_TINT_COLOR}
         side={THREE.DoubleSide}
         transparent
-        opacity={0.35}
+        opacity={0.3}
         depthWrite={false}
       />
     </mesh>
