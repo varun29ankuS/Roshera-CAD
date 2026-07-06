@@ -214,22 +214,36 @@ proptest! {
     /// have identical success/failure parity. Different outcomes mean the
     /// classification pipeline diverged on operand order, which is a real
     /// regression even at the current Tier-1 ceiling.
+    ///
+    /// Each ordering gets its own fresh BRepModel. Since b129a96 ("fix #36
+    /// boolean operand husks") boolean_operation CONSUMES both operand solids
+    /// on success, so a second call on the same model operates on deleted
+    /// solids and always fails — hiding any real parity regression. Fresh
+    /// models eliminate the artifact and make the property genuinely test
+    /// operand-order independence.
     #[test]
     fn union_commutativity_parity(
         a in arb_box_dims(),
         b in arb_box_dims(),
     ) {
-        let mut model = BRepModel::new();
-        let solid_a = make_box(&mut model, a);
-        let solid_b = make_box(&mut model, b);
+        // A ∪ B — fresh model so the operands are live when consumed.
+        let mut model_ab = BRepModel::new();
+        let solid_a = make_box(&mut model_ab, a);
+        let solid_b = make_box(&mut model_ab, b);
         let r_ab = boolean_operation(
-            &mut model, solid_a, solid_b, BooleanOp::Union, BooleanOptions::default(),
+            &mut model_ab, solid_a, solid_b, BooleanOp::Union, BooleanOptions::default(),
         );
+        check_tier1(&r_ab, &model_ab, BooleanOp::Union)?;
+
+        // B ∪ A — independent fresh model; same geometry, reversed operand roles.
+        let mut model_ba = BRepModel::new();
+        let solid_b2 = make_box(&mut model_ba, b);
+        let solid_a2 = make_box(&mut model_ba, a);
         let r_ba = boolean_operation(
-            &mut model, solid_b, solid_a, BooleanOp::Union, BooleanOptions::default(),
+            &mut model_ba, solid_b2, solid_a2, BooleanOp::Union, BooleanOptions::default(),
         );
-        check_tier1(&r_ab, &model, BooleanOp::Union)?;
-        check_tier1(&r_ba, &model, BooleanOp::Union)?;
+        check_tier1(&r_ba, &model_ba, BooleanOp::Union)?;
+
         prop_assert_eq!(
             r_ab.is_ok(),
             r_ba.is_ok(),
@@ -241,22 +255,32 @@ proptest! {
 
     /// Intersection is set-theoretically commutative; same parity rule
     /// as union.
+    ///
+    /// Each ordering gets its own fresh BRepModel for the same reason as
+    /// union_commutativity_parity (operand-consume contract of b129a96).
     #[test]
     fn intersection_commutativity_parity(
         a in arb_box_dims(),
         b in arb_box_dims(),
     ) {
-        let mut model = BRepModel::new();
-        let solid_a = make_box(&mut model, a);
-        let solid_b = make_box(&mut model, b);
+        // A ∩ B
+        let mut model_ab = BRepModel::new();
+        let solid_a = make_box(&mut model_ab, a);
+        let solid_b = make_box(&mut model_ab, b);
         let r_ab = boolean_operation(
-            &mut model, solid_a, solid_b, BooleanOp::Intersection, BooleanOptions::default(),
+            &mut model_ab, solid_a, solid_b, BooleanOp::Intersection, BooleanOptions::default(),
         );
+        check_tier1(&r_ab, &model_ab, BooleanOp::Intersection)?;
+
+        // B ∩ A — independent fresh model.
+        let mut model_ba = BRepModel::new();
+        let solid_b2 = make_box(&mut model_ba, b);
+        let solid_a2 = make_box(&mut model_ba, a);
         let r_ba = boolean_operation(
-            &mut model, solid_b, solid_a, BooleanOp::Intersection, BooleanOptions::default(),
+            &mut model_ba, solid_b2, solid_a2, BooleanOp::Intersection, BooleanOptions::default(),
         );
-        check_tier1(&r_ab, &model, BooleanOp::Intersection)?;
-        check_tier1(&r_ba, &model, BooleanOp::Intersection)?;
+        check_tier1(&r_ba, &model_ba, BooleanOp::Intersection)?;
+
         prop_assert_eq!(
             r_ab.is_ok(),
             r_ba.is_ok(),
@@ -271,21 +295,31 @@ proptest! {
     /// This catches operand-direction-specific regressions in the
     /// difference pipeline that would otherwise hide behind the
     /// commutative operations above.
+    ///
+    /// Each ordering gets its own fresh BRepModel so the second call runs
+    /// on live solids rather than on the consumed (deleted) operands from
+    /// the first call (operand-consume contract of b129a96).
     #[test]
     fn difference_both_orderings_terminate(
         a in arb_box_dims(),
         b in arb_box_dims(),
     ) {
-        let mut model = BRepModel::new();
-        let solid_a = make_box(&mut model, a);
-        let solid_b = make_box(&mut model, b);
+        // A − B
+        let mut model_ab = BRepModel::new();
+        let solid_a = make_box(&mut model_ab, a);
+        let solid_b = make_box(&mut model_ab, b);
         let r_ab = boolean_operation(
-            &mut model, solid_a, solid_b, BooleanOp::Difference, BooleanOptions::default(),
+            &mut model_ab, solid_a, solid_b, BooleanOp::Difference, BooleanOptions::default(),
         );
+        check_tier1(&r_ab, &model_ab, BooleanOp::Difference)?;
+
+        // B − A — independent fresh model.
+        let mut model_ba = BRepModel::new();
+        let solid_b2 = make_box(&mut model_ba, b);
+        let solid_a2 = make_box(&mut model_ba, a);
         let r_ba = boolean_operation(
-            &mut model, solid_b, solid_a, BooleanOp::Difference, BooleanOptions::default(),
+            &mut model_ba, solid_b2, solid_a2, BooleanOp::Difference, BooleanOptions::default(),
         );
-        check_tier1(&r_ab, &model, BooleanOp::Difference)?;
-        check_tier1(&r_ba, &model, BooleanOp::Difference)?;
+        check_tier1(&r_ba, &model_ba, BooleanOp::Difference)?;
     }
 }

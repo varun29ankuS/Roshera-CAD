@@ -21,9 +21,6 @@ agent_build_eval::gen_flanged_housing  # diag: burndown-diag-boolean.md#sub-grou
 # Family: boolean bracket / F4 sever (1 test) -- diag: burndown-diag-boolean.md#sub-group-b
 boolean_bracket_robustness::f4_oversized_bore_severs_into_two_bodies  # diag: burndown-diag-boolean.md#sub-group-b
 
-# Family: boolean parity proptests (2 tests) -- diag: burndown-diag-boolean.md#sub-group-c
-boolean_proptest::union_commutativity_parity  # diag: burndown-diag-boolean.md#sub-group-c
-boolean_proptest::intersection_commutativity_parity  # diag: burndown-diag-boolean.md#sub-group-c
 
 # Family: hexagon commutativity (1 test) -- diag: burndown-diag-boolean.md#sub-group-d
 polyline_cut_harness::union_commutative_polyline_hexagons  # diag: burndown-diag-boolean.md#sub-group-d
@@ -54,9 +51,6 @@ cf_gamma_g1_mixed_kind_seam_audit::audit_passes_after_cf_gamma_g1_synthesis_2c1f
 # Family: CF-gamma G1 replay determinism (1 test) -- diag: burndown-diag-cf.md#sub-group-c
 cf_gamma_g1_replay_determinism::cf_gamma_g1_1c2f_chamfer_first_subpatch_cps_byte_equal_across_ten_runs  # diag: burndown-diag-cf.md#sub-group-c
 
-# Family: drawing dash pair (2 tests) -- diag: burndown-diag-drawing-tess.md#family-3
-drawing_centerlines::bored_plate_drawing_carries_recoverable_centerlines  # diag: burndown-diag-drawing-tess.md#family-3
-drawing_hlr::hlr_drawing_has_dashed_hidden_edges_wireframe_does_not  # diag: burndown-diag-drawing-tess.md#family-3
 
 # Family: tessellation CDT (2 tests) -- diag: burndown-diag-drawing-tess.md#family-41
 tess_curved_cdt::high_curvature_nurbs_no_skinny_triangles  # diag: burndown-diag-drawing-tess.md#family-41

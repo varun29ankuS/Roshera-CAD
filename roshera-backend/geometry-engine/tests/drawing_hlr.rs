@@ -41,9 +41,13 @@ fn hlr_drawing_has_dashed_hidden_edges_wireframe_does_not() {
         svg.contains("polyline class=\"hidden\""),
         "HLR SVG renders dashed hidden polylines"
     );
+    // ISO 128-2 line type 02.1 "dashed narrow" (hidden edges):
+    // dash 4 mm, gap 2 mm at 0.25 mm mid-tier.
+    // Pinned to c489a85 (Task 8 ISO 128 weight hierarchy); the new values are
+    // standard drafting practice and correct per the 2:1 visible/hidden/thin hierarchy.
     assert!(
-        svg.contains("stroke-dasharray: 2 1.2"),
-        "hidden lines use the ISO 128 type-04 dash"
+        svg.contains("stroke-dasharray: 4 2"),
+        "hidden lines use ISO 128 type 02.1 dashed narrow pattern (4 2 at 0.25 mm)"
     );
 
     // Plain wireframe drawing: no hidden set, no dashed hidden elements.

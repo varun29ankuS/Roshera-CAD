@@ -89,9 +89,13 @@ fn bored_plate_drawing_carries_recoverable_centerlines() {
         svg.contains("class=\"centerline\""),
         "SVG renders chain-line centerlines"
     );
+    // ISO 128-2 line type 04.1 "long-dashed dotted narrow" (centerline / chain line):
+    // long-dash 8 mm, gap 1 mm, dot 1 mm, gap 1 mm at 0.18 mm thin tier.
+    // Pinned to c489a85 (Task 8 ISO 128 weight hierarchy); the new values are
+    // standard drafting practice and correct per the 2:1 visible/hidden/thin hierarchy.
     assert!(
-        svg.contains("stroke-dasharray: 4 1 1 1"),
-        "centerline uses the ISO 128 dash-dot pattern"
+        svg.contains("stroke-dasharray: 8 1 1 1"),
+        "centerline uses ISO 128 type 04.1 long-dashed dotted pattern (8 1 1 1 at 0.18 mm)"
     );
 }
 

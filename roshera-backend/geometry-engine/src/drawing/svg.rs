@@ -176,7 +176,7 @@ fn write_stylesheet(out: &mut String) {
         "    .view polyline { fill: none; stroke: #111; stroke-width: 0.50; \
          stroke-linejoin: round; stroke-linecap: round; }\n",
     );
-    // Hidden line — ISO 128 type-04 dashed, 0.25 mm, dash 4 mm / gap 2 mm.
+    // Hidden line — ISO 128 type 02.1 "dashed narrow", 0.25 mm, dash 4 mm / gap 2 mm.
     out.push_str(
         "    .view polyline.hidden { fill: none; stroke: #111; stroke-width: 0.25; \
          stroke-dasharray: 4 2; stroke-linejoin: round; stroke-linecap: butt; }\n",
