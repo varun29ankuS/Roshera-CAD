@@ -12,18 +12,6 @@
 #
 # Gate script: roshera-backend/scripts/red-gate.ps1
 
-# Family: CF-beta mixed-kind corner (3 tests) -- diag: burndown-diag-cf.md#sub-group-a and #sub-group-b
-cf_beta_mixed_kind_corner::box_corner_two_fillets_then_chamfer_synthesises_mixed_cap  # diag: burndown-diag-cf.md#sub-group-a
-cf_beta_mixed_kind_corner::box_corner_mixed_kind_intermediate_state_skips_watertight_validation  # diag: burndown-diag-cf.md#sub-group-a
-cf_beta_mixed_kind_corner::box_corner_mixed_kind_topology_hash_order_invariant  # diag: burndown-diag-cf.md#sub-group-b
-
-# Family: CF-beta property (1 test) -- diag: burndown-diag-cf.md#sub-group-a
-cf_beta_property::prop_mixed_kind_corner_topology_order_invariant  # diag: burndown-diag-cf.md#sub-group-a
-
-# Family: CF-beta replay determinism (2 tests) -- diag: burndown-diag-cf.md#sub-group-a and #sub-group-b
-cf_beta_replay_determinism::cf_beta_chamfer_first_and_fillet_first_agree_at_d_equals_one  # diag: burndown-diag-cf.md#sub-group-a
-cf_beta_replay_determinism::cf_beta_fillet_first_ordering_is_deterministic_across_ten_runs  # diag: burndown-diag-cf.md#sub-group-b
-
 # Family: CF-gamma G1 mixed-kind corner (5 tests) -- diag: burndown-diag-cf.md#sub-group-a #sub-group-b #sub-group-c
 cf_gamma_g1_mixed_kind_corner::g1_1c2f_fillet_first_emits_three_subpatch_cap  # diag: burndown-diag-cf.md#sub-group-a
 cf_gamma_g1_mixed_kind_corner::g1_2c1f_chamfer_first_emits_three_subpatch_cap  # diag: burndown-diag-cf.md#sub-group-b

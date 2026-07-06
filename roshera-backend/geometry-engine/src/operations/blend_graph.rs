@@ -2040,6 +2040,349 @@ fn fillet_cap_spine(
     })
 }
 
+/// Apex anchor of a **partial** two-fillet corner: the least-squares
+/// concurrent point of the two post-surgery fillet cylinder axes.
+///
+/// Task 3B (burndown-diag-cf.md sub-groups A+B) — the first call of a
+/// fillet-first mixed-kind pair blends two of the three corner edges
+/// with the partial-corner opt-in and must leave an *honest*
+/// intermediate state: each fillet's V-cap arc is retracted off the
+/// host-face planes to the apex-level cap circle. The apex is exactly
+/// the anchor [`solve_retracted_corner_triangle`] uses (two
+/// cylinder-axis rows), computable *without* the not-yet-existing
+/// chamfer bevel — the finalize-time solve then reproduces the same
+/// triangle for the equal-displacement family, so the second call's
+/// re-placement is idempotent on the already-retracted rims.
+///
+/// # Errors
+///
+/// Typed [`PostSurgeryCornerError`]; never panics. Pure function.
+pub fn solve_fillet_pair_apex(
+    model: &BRepModel,
+    v_pos: Point3,
+    fillet_faces: [FaceId; 2],
+) -> Result<Point3, PostSurgeryCornerError> {
+    let spine_0 = fillet_cap_spine(model, fillet_faces[0], v_pos)?;
+    let spine_1 = fillet_cap_spine(model, fillet_faces[1], v_pos)?;
+    least_squares_concurrent_point(&[
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_0.q,
+            axis_dir: spine_0.axis_dir,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_1.q,
+            axis_dir: spine_1.axis_dir,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+    ])
+    .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)
+}
+
+/// The three **axially-retracted** inner-triangle corners of a 2C1F
+/// mixed corner (two chamfer-bevel rails + one cylinder-fillet rail) —
+/// the mirror of [`RetractedCornerTriangle`] with the rail kinds
+/// swapped.
+#[derive(Debug, Clone, Copy)]
+pub struct Retracted2c1fCornerTriangle {
+    /// Apex anchor `A` — least-squares concurrent point of the fillet
+    /// cylinder axis and the two chamfer spines (each chamfer spine is
+    /// the intersection line of its two offset host planes; for a
+    /// rectilinear corner all three lines concur).
+    pub apex: Point3,
+    /// `A_1` — `bevel_faces[0]`'s plane ∩ the fillet's apex-retracted
+    /// cap circle. The shared chamfer[0]∧fillet corner.
+    pub a1: Point3,
+    /// `A_2` — mirror for `bevel_faces[1]`.
+    pub a2: Point3,
+    /// `Q_12` — intersection of the two apex-retracted chamfer rim
+    /// lines (each rim line = its bevel plane ∩ the plane through `A`
+    /// perpendicular to its chamfer spine). The shared
+    /// chamfer[0]∧chamfer[1] corner.
+    pub q12: Point3,
+}
+
+/// Solve the **axially-retracted** inner-triangle corners of a 2C1F
+/// mixed corner from its post-surgery state.
+///
+/// Companion to [`solve_retracted_corner_triangle`] (the 1C2F solve),
+/// generalised to the opposite rail mix: one cylinder fillet + two
+/// planar chamfer bevels. The unified retraction rule is the same:
+/// every rail's retracted rim lies in the plane through the apex `A`
+/// perpendicular to that rail's *spine* — for the fillet this is the
+/// apex-retracted cap circle (radius `r` about the axis foot of `A`);
+/// for each chamfer it is the line where that perpendicular plane
+/// meets the bevel plane. The chamfer spine is recovered from the
+/// post-surgery model as the intersection line of the two *offset*
+/// host planes (host plane `i` translated to pass through the bevel's
+/// boundary track lying in the *other* host).
+///
+/// For the live unit-cube 2C1F corner (cube `10³`, chamfers `d = 1`
+/// on two corner edges, fillet `r = 1` on the third, `V = (5,5,5)`),
+/// `A = (4,4,4)` and the retracted triangle corners are the same
+/// three points as the 1C2F case — `(4,5,4)`, `(5,4,4)`, `(4,4,5)` —
+/// with the rail kinds reassigned.
+///
+/// # Errors
+///
+/// Typed [`PostSurgeryCornerError`]; never panics. Pure function.
+pub fn solve_retracted_corner_triangle_2c1f(
+    model: &BRepModel,
+    v_pos: Point3,
+    bevel_faces: [FaceId; 2],
+    bevel_rim_edges: [EdgeId; 2],
+    fillet_face: FaceId,
+) -> Result<Retracted2c1fCornerTriangle, PostSurgeryCornerError> {
+    let bevel_plane_1 = reconstruct_bevel_plane(model, bevel_faces[0])?;
+    let bevel_plane_2 = reconstruct_bevel_plane(model, bevel_faces[1])?;
+
+    let spine_f = fillet_cap_spine(model, fillet_face, v_pos)?;
+    let (spine_c1_q, spine_c1_dir) =
+        chamfer_bevel_spine(model, bevel_faces[0], bevel_rim_edges[0])?;
+    let (spine_c2_q, spine_c2_dir) =
+        chamfer_bevel_spine(model, bevel_faces[1], bevel_rim_edges[1])?;
+
+    // Apex anchor A — three spine rows (one cylinder axis + two
+    // chamfer offset-plane intersection lines; exactly consistent for
+    // a rectilinear corner, least-squares otherwise).
+    let apex = least_squares_concurrent_point(&[
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_f.q,
+            axis_dir: spine_f.axis_dir,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_c1_q,
+            axis_dir: spine_c1_dir,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+        CornerBlendAxis {
+            edge_id: 0,
+            q: spine_c2_q,
+            axis_dir: spine_c2_dir,
+            is_start: true,
+            face_normals: [Vector3::new(0.0, 0.0, 0.0); 2],
+        },
+    ])
+    .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
+
+    let outward = (v_pos - apex)
+        .normalize()
+        .map_err(|_| PostSurgeryCornerError::DegenerateAxisSystem)?;
+
+    // Apex-retracted cap-circle centre: the foot of A on the fillet
+    // axis (mirrors the 1C2F solve).
+    let w = apex - spine_f.q;
+    let t = w.dot(&spine_f.axis_dir);
+    let centre = Point3::new(
+        spine_f.q.x + t * spine_f.axis_dir.x,
+        spine_f.q.y + t * spine_f.axis_dir.y,
+        spine_f.q.z + t * spine_f.axis_dir.z,
+    );
+
+    let a1 = plane_cylinder_apex_intersection(
+        bevel_plane_1.normal,
+        bevel_plane_1.origin,
+        centre,
+        spine_f.axis_dir,
+        spine_f.radius,
+        v_pos,
+        outward,
+    )
+    .map_err(PostSurgeryCornerError::from_junction)?;
+    let a2 = plane_cylinder_apex_intersection(
+        bevel_plane_2.normal,
+        bevel_plane_2.origin,
+        centre,
+        spine_f.axis_dir,
+        spine_f.radius,
+        v_pos,
+        outward,
+    )
+    .map_err(PostSurgeryCornerError::from_junction)?;
+
+    // Q_12 — the retracted chamfer∧chamfer corner. It lies on the
+    // bevel∧bevel intersection line at the apex's axial station along
+    // either chamfer spine (the retracted rim of chamfer `i` lies in
+    // the plane `spine_i_dir · x = spine_i_dir · A`).
+    let line_dir_raw = bevel_plane_1.normal.cross(&bevel_plane_2.normal);
+    let line_dir = line_dir_raw
+        .normalize()
+        .map_err(|_| PostSurgeryCornerError::DegenerateAxisSystem)?;
+    let p0 = two_plane_intersection_point(
+        bevel_plane_1.normal,
+        bevel_plane_1
+            .normal
+            .dot(&(bevel_plane_1.origin - Point3::new(0.0, 0.0, 0.0))),
+        bevel_plane_2.normal,
+        bevel_plane_2
+            .normal
+            .dot(&(bevel_plane_2.origin - Point3::new(0.0, 0.0, 0.0))),
+    )
+    .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
+    let q12 = {
+        // Station the line at the apex level of whichever chamfer
+        // spine is transverse to it.
+        let mut station: Option<Point3> = None;
+        for spine_dir in [spine_c1_dir, spine_c2_dir] {
+            let denom = spine_dir.dot(&line_dir);
+            if denom.abs() > 1.0e-9 {
+                let s = (spine_dir.dot(&(apex - Point3::new(0.0, 0.0, 0.0)))
+                    - spine_dir.dot(&(p0 - Point3::new(0.0, 0.0, 0.0))))
+                    / denom;
+                station = Some(Point3::new(
+                    p0.x + s * line_dir.x,
+                    p0.y + s * line_dir.y,
+                    p0.z + s * line_dir.z,
+                ));
+                break;
+            }
+        }
+        station.ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?
+    };
+
+    Ok(Retracted2c1fCornerTriangle { apex, a1, a2, q12 })
+}
+
+/// Point on the intersection line of two planes `n_i · x = c_i`
+/// (unit normals). Standard closed form; `None` when the planes are
+/// (near-)parallel.
+fn two_plane_intersection_point(n1: Vector3, c1: f64, n2: Vector3, c2: f64) -> Option<Point3> {
+    let n1n2 = n1.dot(&n2);
+    let det = 1.0 - n1n2 * n1n2;
+    if det.abs() < 1.0e-12 {
+        return None;
+    }
+    let k1 = (c1 - c2 * n1n2) / det;
+    let k2 = (c2 - c1 * n1n2) / det;
+    Some(Point3::new(
+        k1 * n1.x + k2 * n2.x,
+        k1 * n1.y + k2 * n2.y,
+        k1 * n1.z + k2 * n2.z,
+    ))
+}
+
+/// Recover a chamfer's **spine** (the intersection line of its two
+/// offset host planes) from the post-surgery bevel face.
+///
+/// The bevel's two side boundary tracks each lie in one host-face
+/// plane; the spine is the line `{ n_1 · x = n_1 · P_2, n_2 · x =
+/// n_2 · P_1 }` where `n_i` is host plane `i`'s unit normal and `P_j`
+/// is any point on the track lying in the *other* host — i.e. each
+/// host plane translated inward by its chamfer offset. The side
+/// tracks are identified as the loop edges sharing a vertex with the
+/// V-side rim edge (the far cap edge shares none).
+///
+/// # Errors
+///
+/// Typed [`PostSurgeryCornerError`]; never panics. Pure function.
+fn chamfer_bevel_spine(
+    model: &BRepModel,
+    bevel_face: FaceId,
+    rim_edge: EdgeId,
+) -> Result<(Point3, Vector3), PostSurgeryCornerError> {
+    use crate::operations::edge_classification::find_adjacent_faces;
+    use crate::primitives::surface::Plane as PlaneSurface;
+
+    let face = model
+        .faces
+        .get(bevel_face)
+        .ok_or(PostSurgeryCornerError::MissingTopology)?;
+    let loop_ref = model
+        .loops
+        .get(face.outer_loop)
+        .ok_or(PostSurgeryCornerError::MissingTopology)?;
+    let rim = model
+        .edges
+        .get(rim_edge)
+        .ok_or(PostSurgeryCornerError::MissingTopology)?;
+    let rim_vs = [rim.start_vertex, rim.end_vertex];
+
+    // Side tracks: loop edges (≠ rim) sharing exactly one vertex with
+    // the rim.
+    let mut tracks: Vec<EdgeId> = Vec::with_capacity(2);
+    for &eid in &loop_ref.edges {
+        if eid == rim_edge {
+            continue;
+        }
+        let Some(e) = model.edges.get(eid) else {
+            continue;
+        };
+        if rim_vs.contains(&e.start_vertex) || rim_vs.contains(&e.end_vertex) {
+            tracks.push(eid);
+        }
+    }
+    if tracks.len() != 2 {
+        return Err(PostSurgeryCornerError::MissingTopology);
+    }
+
+    // Host plane of each track: the adjacent planar face that is not
+    // the bevel itself.
+    let mut host_normals: [Vector3; 2] = [Vector3::new(0.0, 0.0, 0.0); 2];
+    let mut track_points: [Point3; 2] = [Point3::new(0.0, 0.0, 0.0); 2];
+    for (i, &tid) in tracks.iter().enumerate() {
+        let host = find_adjacent_faces(model, tid)
+            .into_iter()
+            .find(|&fid| fid != bevel_face)
+            .ok_or(PostSurgeryCornerError::MissingTopology)?;
+        let host_face = model
+            .faces
+            .get(host)
+            .ok_or(PostSurgeryCornerError::MissingTopology)?;
+        let host_surface = model
+            .surfaces
+            .get(host_face.surface_id)
+            .ok_or(PostSurgeryCornerError::MissingTopology)?;
+        let plane = host_surface
+            .as_any()
+            .downcast_ref::<PlaneSurface>()
+            .ok_or(PostSurgeryCornerError::DegenerateBevelPlane)?;
+        host_normals[i] = plane
+            .normal
+            .normalize()
+            .map_err(|_| PostSurgeryCornerError::DegenerateBevelPlane)?;
+        // Far endpoint of the track (the one NOT on the rim) — any
+        // point on the track works; the far end is farther from the
+        // dedup-sensitive corner cluster.
+        let e = model
+            .edges
+            .get(tid)
+            .ok_or(PostSurgeryCornerError::MissingTopology)?;
+        let far_v = if rim_vs.contains(&e.start_vertex) {
+            e.end_vertex
+        } else {
+            e.start_vertex
+        };
+        let p = model
+            .vertices
+            .get_position(far_v)
+            .ok_or(PostSurgeryCornerError::MissingTopology)?;
+        track_points[i] = Point3::new(p[0], p[1], p[2]);
+    }
+
+    let n1 = host_normals[0];
+    let n2 = host_normals[1];
+    // Offset plane constants: host 1 translated to pass through the
+    // track in host 2, and vice versa.
+    let c1 = n1.dot(&(track_points[1] - Point3::new(0.0, 0.0, 0.0)));
+    let c2 = n2.dot(&(track_points[0] - Point3::new(0.0, 0.0, 0.0)));
+    let dir = n1
+        .cross(&n2)
+        .normalize()
+        .map_err(|_| PostSurgeryCornerError::DegenerateAxisSystem)?;
+    let point = two_plane_intersection_point(n1, c1, n2, c2)
+        .ok_or(PostSurgeryCornerError::DegenerateAxisSystem)?;
+    Ok((point, dir))
+}
+
 /// Reconstruct the chamfer bevel plane from a post-surgery bevel face.
 ///
 /// The bevel surface is a [`crate::primitives::surface::RuledSurface`]

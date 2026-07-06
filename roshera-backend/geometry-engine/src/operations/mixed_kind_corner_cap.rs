@@ -668,6 +668,180 @@ pub(crate) fn find_blend_cap_edges_at_vertex(
     out.into_iter().collect()
 }
 
+/// Task 3B — the ONE kind-agnostic retracted-cap constructor for
+/// degree-3 mixed-kind corners (burndown-diag-cf.md sub-group B).
+///
+/// #72 (`b6f91bb`) introduced apex-retraction + the single rational
+/// bi-quadratic collapsed-apex cap, but wired it only into the
+/// fillet-side finalize and only for the 1C2F rim mix — the
+/// chamfer-side finalize kept the pre-#72 synthesis, so the two call
+/// orders converged to *different* topologies (the WL-hash lie the
+/// order-invariance tests catch), and 2C1F had no retraction path at
+/// all. This constructor is the shared entry **both** operators'
+/// finalize dispatch calls for **both** mixed shapes:
+///
+/// * `(2 arc rims, 1 line rim)` — 1C2F: two cylinder fillets + one
+///   chamfer bevel ([`super::fillet::retract_mixed_1c2f_corner`]).
+/// * `(1 arc rim, 2 line rims)` — 2C1F: one cylinder fillet + two
+///   chamfer bevels ([`super::fillet::retract_mixed_2c1f_corner`]).
+///
+/// Both reduce to the same move set: solve the apex-retracted inner
+/// triangle, rebuild each arc rim on its apex-level cap circle,
+/// re-anchor each line rim as a fresh `Line` between its two triangle
+/// corners, retrim every boundary track onto the retracted corners,
+/// then cap the (now off-host-plane) rim triangle with the single
+/// rational bi-quadratic patch
+/// ([`super::fillet::apply_mixed_corner_single_patch_cap`]) — order
+/// invariance becomes true by construction. The retraction is
+/// idempotent: rims already retracted by a first-call partial
+/// retraction are detected and left in place.
+///
+/// The outward direction for cap orientation is derived from the
+/// post-retraction rim-endpoint centroid → `vertex_pos` vector (the
+/// same recipe the fillet-side #72 arm used), so both operators feed
+/// the orientation chooser identical data.
+///
+/// Ends with the same registry tail as
+/// [`finalize_mixed_kind_cap_face`]: drop V if unreferenced, record
+/// the cap face + vertex kind, clear the pending-corner mark and the
+/// cap-rim side-registry — the carve-out window closes the moment the
+/// corner is watertight.
+pub(crate) fn retract_and_cap_mixed_corner(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    vertex_id: VertexId,
+    vertex_pos: Point3,
+    cap_edges_with_kind: &[(EdgeId, RimKind)],
+    requested_kind: BlendKind,
+    tolerance: f64,
+) -> OperationResult<Vec<FaceId>> {
+    use crate::operations::edge_classification::find_adjacent_faces;
+    use crate::primitives::fillet_surfaces::CylindricalFillet;
+
+    // Split rims by kind and resolve each arc rim's fillet face (the
+    // adjacent face carrying a CylindricalFillet surface).
+    let mut arc_rims: Vec<(FaceId, EdgeId)> = Vec::with_capacity(2);
+    let mut line_rims: Vec<EdgeId> = Vec::with_capacity(2);
+    for &(eid, kind) in cap_edges_with_kind {
+        match kind {
+            RimKind::ArcRim => {
+                let fillet_face = find_adjacent_faces(model, eid)
+                    .into_iter()
+                    .find(|&fid| {
+                        model
+                            .faces
+                            .get(fid)
+                            .and_then(|f| model.surfaces.get(f.surface_id))
+                            .map(|s| s.as_any().downcast_ref::<CylindricalFillet>().is_some())
+                            .unwrap_or(false)
+                    })
+                    .ok_or_else(|| {
+                        OperationError::InvalidGeometry(format!(
+                            "retract_and_cap_mixed_corner: no CylindricalFillet face \
+                             adjacent to arc rim {}",
+                            eid
+                        ))
+                    })?;
+                arc_rims.push((fillet_face, eid));
+            }
+            RimKind::LinearRim => line_rims.push(eid),
+        }
+    }
+
+    match (arc_rims.len(), line_rims.len()) {
+        (2, 1) => {
+            let fillet_face_pair = [arc_rims[0].0, arc_rims[1].0];
+            let cap_arc_pair = [arc_rims[0].1, arc_rims[1].1];
+            super::fillet::retract_mixed_1c2f_corner(
+                model,
+                vertex_pos,
+                &fillet_face_pair,
+                &cap_arc_pair,
+                line_rims[0],
+                tolerance,
+            )?;
+        }
+        (1, 2) => {
+            super::fillet::retract_mixed_2c1f_corner(
+                model,
+                vertex_pos,
+                arc_rims[0].0,
+                arc_rims[0].1,
+                &[line_rims[0], line_rims[1]],
+                tolerance,
+            )?;
+        }
+        (a, l) => {
+            return Err(OperationError::InvalidGeometry(format!(
+                "retract_and_cap_mixed_corner: unsupported rim mix ({} arc, {} line) \
+                 — degree-3 mixed corners are (2,1) or (1,2)",
+                a, l
+            )));
+        }
+    }
+
+    // Outward direction at V from the post-retraction rim-endpoint
+    // centroid (identical recipe on both operator sides).
+    let mut centroid_acc = Vector3::new(0.0, 0.0, 0.0);
+    let mut centroid_count: usize = 0;
+    for &(eid, _) in cap_edges_with_kind {
+        if let Some(edge) = model.edges.get(eid) {
+            for vid in [edge.start_vertex, edge.end_vertex] {
+                if let Some(v) = model.vertices.get(vid) {
+                    centroid_acc.x += v.position[0];
+                    centroid_acc.y += v.position[1];
+                    centroid_acc.z += v.position[2];
+                    centroid_count += 1;
+                }
+            }
+        }
+    }
+    if centroid_count == 0 {
+        return Err(OperationError::InvalidGeometry(
+            "retract_and_cap_mixed_corner: no rim endpoints survive retraction".to_string(),
+        ));
+    }
+    let inv = 1.0 / (centroid_count as f64);
+    let centroid = Point3::new(
+        centroid_acc.x * inv,
+        centroid_acc.y * inv,
+        centroid_acc.z * inv,
+    );
+    let vertex_outward = (vertex_pos - centroid).normalize().map_err(|_| {
+        OperationError::InvalidGeometry(
+            "retract_and_cap_mixed_corner: degenerate outward direction \
+             (corner vertex coincides with rim centroid)"
+                .to_string(),
+        )
+    })?;
+
+    let face_ids = super::fillet::apply_mixed_corner_single_patch_cap(
+        model,
+        solid_id,
+        cap_edges_with_kind,
+        vertex_outward,
+    )?;
+
+    // Registry tail — mirrors `finalize_mixed_kind_cap_face` steps 7–8.
+    let still_referenced = model
+        .edges
+        .iter()
+        .any(|(_, e)| e.start_vertex == vertex_id || e.end_vertex == vertex_id);
+    if !still_referenced {
+        model.vertices.remove(vertex_id);
+    }
+    if let Some(solid) = model.solids.get_mut(solid_id) {
+        for &face_id in &face_ids {
+            solid.record_blend_face(face_id, requested_kind);
+        }
+        solid.record_blended_vertex(vertex_id, requested_kind);
+        solid.clear_pending_mixed_kind_corner(vertex_id);
+        let _ = solid.clear_corner_cap_edges(vertex_id);
+    }
+
+    Ok(face_ids)
+}
+
 /// CF-β.4 — filter `errors` down to the subset that *cannot* be
 /// explained by a deliberate partially-blended open boundary at a
 /// pending mixed-kind corner.

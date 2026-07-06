@@ -2954,39 +2954,67 @@ fn handle_chamfer_vertices(
             for arc_eid in &fillet_rim_arcs {
                 cap_edges_with_kind.push((*arc_eid, super::mixed_kind_corner_cap::RimKind::ArcRim));
             }
-            // CF-γ.6.2 dispatcher: branch on caller-selected seam
-            // continuity. `C0` keeps CF-β planar cap synthesis
-            // byte-identical (the historical path, single FaceId
-            // returned as a 1-element Vec). `G1` routes through the
-            // 3-sub-patch C0 synthesizer in
-            // `synthesize_mixed_kind_corner_cap_g1` — three bicubic
-            // NURBS sub-patches sharing a central apex vertex, each
-            // sub-patch owning one rim. CF-γ.6.3 lifts the seed CPs
-            // to the coupled rim-G1 + internal-C1 solver; γ.6.2 ships
-            // the watertight topology with planar-fairing CPs so the
-            // dispatcher contract stabilises before the solver lands.
-            match seam_continuity {
-                SeamContinuity::C0 => vec![
-                    super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
-                        model,
-                        solid_id,
-                        corner.vertex_id,
-                        &cap_edges_with_kind,
-                        corner.outward,
-                        tolerance,
-                        BlendKind::Chamfer,
-                    )?,
-                ],
-                SeamContinuity::G1 => {
-                    super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
-                        model,
-                        solid_id,
-                        corner.vertex_id,
-                        &cap_edges_with_kind,
-                        corner.outward,
-                        tolerance,
-                        BlendKind::Chamfer,
-                    )?
+            // Task 3B — degree-3 mixed corners (1C2F: 2 prior fillet
+            // arcs + this call's 1 chamfer rim; 2C1F: 1 prior fillet
+            // arc + this call's 2 chamfer rims) route through the ONE
+            // kind-agnostic retracted-cap constructor shared with the
+            // fillet-side finalize (`create_fillet_transitions`):
+            // apex retraction + single rational bi-quadratic
+            // collapsed-apex cap. Before this, the chamfer-side
+            // finalize still ran the pre-#72 synthesis on
+            // un-retracted rims — chamfer-first and fillet-first
+            // orders converged to different topologies (the WL-hash
+            // lie) and the fort validators rejected the chamfer-side
+            // final state (burndown-diag-cf.md sub-group B).
+            let mixed_degree3_shape = matches!(
+                (fillet_rim_arcs.len(), cap_edges_at_vertex.len()),
+                (2, 1) | (1, 2)
+            );
+            if mixed_degree3_shape {
+                super::mixed_kind_corner_cap::retract_and_cap_mixed_corner(
+                    model,
+                    solid_id,
+                    corner.vertex_id,
+                    corner.position,
+                    &cap_edges_with_kind,
+                    BlendKind::Chamfer,
+                    tolerance,
+                )?
+            } else {
+                // CF-γ.6.2 dispatcher: branch on caller-selected seam
+                // continuity. `C0` keeps CF-β planar cap synthesis
+                // byte-identical (the historical path, single FaceId
+                // returned as a 1-element Vec). `G1` routes through the
+                // 3-sub-patch C0 synthesizer in
+                // `synthesize_mixed_kind_corner_cap_g1` — three bicubic
+                // NURBS sub-patches sharing a central apex vertex, each
+                // sub-patch owning one rim. CF-γ.6.3 lifts the seed CPs
+                // to the coupled rim-G1 + internal-C1 solver; γ.6.2 ships
+                // the watertight topology with planar-fairing CPs so the
+                // dispatcher contract stabilises before the solver lands.
+                match seam_continuity {
+                    SeamContinuity::C0 => vec![
+                        super::mixed_kind_corner_cap::synthesize_mixed_kind_corner_cap(
+                            model,
+                            solid_id,
+                            corner.vertex_id,
+                            &cap_edges_with_kind,
+                            corner.outward,
+                            tolerance,
+                            BlendKind::Chamfer,
+                        )?,
+                    ],
+                    SeamContinuity::G1 => {
+                        super::mixed_kind_corner_cap_g1::synthesize_mixed_kind_corner_cap_g1(
+                            model,
+                            solid_id,
+                            corner.vertex_id,
+                            &cap_edges_with_kind,
+                            corner.outward,
+                            tolerance,
+                            BlendKind::Chamfer,
+                        )?
+                    }
                 }
             }
         } else {
