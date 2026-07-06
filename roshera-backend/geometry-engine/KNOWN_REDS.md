@@ -16,9 +16,6 @@
 tess_curved_cdt::high_curvature_nurbs_no_skinny_triangles  # diag: burndown-diag-drawing-tess.md#family-41
 tess_curved_cdt::chord_tolerance_actually_enforced_after_refinement  # diag: burndown-diag-drawing-tess.md#family-41
 
-# Family: cone corner boolean (1 test) -- diag: burndown-diag-drawing-tess.md#family-42
-diag_cone_radial::cone_corner_gate  # diag: burndown-diag-drawing-tess.md#family-42
-
 # Family: gap finder chamfer (1 test) -- diag: burndown-diag-drawing-tess.md#family-43
 gap_finder_fuzz::gap_finder_smoke  # diag: burndown-diag-drawing-tess.md#family-43
 

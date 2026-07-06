@@ -8416,29 +8416,54 @@ fn compute_split_face_interior_points(
         if let Some((u, v)) = found {
             let p = Vector3::new(origin.x, origin.y, origin.z) + e1 * u + e2 * v;
             let candidate = Point3::new(p.x, p.y, p.z);
-            // ON-SURFACE GUARD. The flat tangent-plane projection is exact for a
-            // PLANE but only locally faithful on a curved face. When a loop
-            // WRAPS the lateral (a freeform body loop = the whole barrel minus
-            // the pocket), its flattened polygon folds back over itself, the
-            // containment/nudge can land on the far fold, and the back-projected
-            // 3D point sits OFF the surface — e.g. the w03 through-slot barrel
-            // islands resolved to (4.1, 3.9, 2.1), |xy| ≈ 5.7 ≫ r = 4. Such a
-            // point classifies against the wrong material and either keeps a
-            // removed patch (w03 doubled wall) or drops a kept one. Accept the
-            // correction only when the candidate actually lies on the face's
-            // surface; otherwise leave `None` so `get_face_interior_point` falls
-            // back to the boundary-midpoint centroid (an on-surface point for
-            // these small convex islands). Planar faces always pass the guard,
-            // so their behaviour — and every planar-boolean / poke_matrix
-            // verdict — is unchanged.
-            let on_surface = match surface.closest_point(&candidate, tol) {
-                Ok((cu, cv)) => match surface.point_at(cu, cv) {
-                    Ok(foot) => (foot - candidate).magnitude() <= tol.distance().max(1.0e-6),
+            // ON-SURFACE GUARD — FREEFORM ONLY. The flat tangent-plane
+            // projection is exact for PLANE and well-conditioned for all
+            // analytic surfaces (cylinder, sphere, cone, torus): the surface
+            // is geometrically simple, `closest_point` is closed-form, and a
+            // loop on an analytic face never folds back over itself in the
+            // tangent plane, so the nudged candidate is always genuinely on
+            // the surface. Applying the round-trip check to analytic surfaces
+            // is therefore harmless in the happy path but catastrophic in the
+            // ill-conditioned near-apex / tight-arc corner case: the grid-
+            // search `closest_point` fails the round-trip for genuinely on-
+            // surface points (the cone_corner_gate regression, 6c51a1a), the
+            // fallback boundary centroid classifies against the wrong material,
+            // and the intersection retains ~8× extra cone-wall fragments.
+            //
+            // For FREEFORM surfaces (NURBS/BSpline/Ruled/SurfaceOfRevolution/
+            // Offset) the guard IS needed: a loop wrapping the whole lateral
+            // folds its flattened polygon back over itself, the nudged point
+            // can land on the far fold, and |xy| ≫ r → wrong-material
+            // classification (the w03 through-slot barrel case). The residual-
+            // weld pass (`weld_imprint_residual_vertices`) already carries an
+            // identical freeform gate for the same reason.
+            //
+            // Analytic surfaces classify interior points exactly; no guard
+            // required. Planar faces always passed the old check; they still
+            // skip it (the `is_planar` short-circuit above returns `continue`
+            // before this block for simple loops, and the tangent-plane is
+            // exact anyway).
+            let is_freeform = matches!(
+                surface.surface_type(),
+                SurfaceType::NURBS
+                    | SurfaceType::BSpline
+                    | SurfaceType::Ruled
+                    | SurfaceType::SurfaceOfRevolution
+                    | SurfaceType::Offset
+            );
+            let accept = if is_freeform {
+                match surface.closest_point(&candidate, tol) {
+                    Ok((cu, cv)) => match surface.point_at(cu, cv) {
+                        Ok(foot) => (foot - candidate).magnitude() <= tol.distance().max(1.0e-6),
+                        Err(_) => false,
+                    },
                     Err(_) => false,
-                },
-                Err(_) => false,
+                }
+            } else {
+                // Analytic surface: tangent-plane projection is always valid.
+                true
             };
-            if on_surface {
+            if accept {
                 result[i] = Some(candidate);
             }
         }
