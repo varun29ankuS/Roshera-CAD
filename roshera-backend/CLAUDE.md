@@ -39,6 +39,44 @@
 
 ---
 
+## Kernel merge gate
+
+**`cargo test --lib` passing is NEVER sufficient evidence for merging a
+`geometry-engine` branch.** Three independent bisection investigations
+confirmed that every red-introducing commit in history shipped with
+`--lib` green while integration test binaries silently went red — and
+a full-suite gate run *without* `--no-fail-fast` stopped at the
+alphabetically-first red binary, leaving ~130 more binaries unexecuted.
+
+### Required pre-merge steps for any `geometry-engine` branch
+
+1. Run `powershell -File roshera-backend/scripts/red-gate.ps1` from the
+   repo root (or `-Scoped <binary,...>` for a quick family check).
+2. The script runs `cargo test -p geometry-engine -j 4 --no-fail-fast`,
+   compares failures against `geometry-engine/KNOWN_REDS.md`, and exits:
+   - **0** — failures match the allowlist exactly (safe to merge)
+   - **1** — NEW_RED: a failure not in the allowlist (block the merge)
+   - **2** — RATCHET_VIOLATION: an allowlist entry is now passing (remove
+     it from `KNOWN_REDS.md` before re-running)
+   - **3** — both
+3. A new failure that the script surfaces must receive a diagnosis entry
+   in `.superpowers/sdd/burndown-diag-<family>.md` naming the breaking
+   commit and root cause before a line is added to `KNOWN_REDS.md`.
+
+### KNOWN_REDS.md ratchet
+
+`geometry-engine/KNOWN_REDS.md` is the machine-readable allowlist of
+pre-existing red tests. Lines are removed as tests are fixed; they are
+**never added without a diagnosis**. The gate enforces this — it exits 2
+(RATCHET_VIOLATION) for any allowlist entry that now passes, forcing the
+entry to be removed.
+
+The 30 pre-existing reds are documented in `.superpowers/sdd/`:
+`burndown-diag-cf.md`, `burndown-diag-boolean.md`,
+`burndown-diag-drawing-tess.md`.
+
+---
+
 ## Workspace layout (verified against `roshera-backend/Cargo.toml`)
 
 Seven crates, resolver = "2":
