@@ -7949,28 +7949,45 @@ fn partition_outer_and_pre_existing_hole_cycles(
         let hc = centroid_2d(&cycle_polys_2d[h]);
         let mut chosen: Option<usize> = None;
         if let Some(hc) = hc {
-            // A pre-existing hole belongs to the TIGHTEST (smallest-area)
-            // containing outer cycle, not merely the first one found. When a
-            // cut circle splits the face into a larger outer ring AND a smaller
-            // inner disc, BOTH contain the hole's centroid — but the hole is
-            // part of the inner disc. Taking the first match (often the larger
-            // original boundary) attaches the hole to the ring, which
-            // Intersection then DROPS, stranding the hole's wall as open edges
-            // (a single-hole plate ∩ cylinder collapsed to a solid disc with
-            // hundreds of open edges). Smallest-area selection is operation-
-            // independent and correct: a point belongs to the innermost region
-            // that encloses it. Non-nested cases keep one candidate, so this is
-            // a no-op there (e.g. the #35 chained-difference multi-hole cap).
+            // REGION-CONTAINMENT rule (fixes coaxial-bore Euler-odd regression,
+            // 118c6c0): a candidate outer cycle `o` may own pre-existing hole
+            // `h` ONLY IF:
+            //   (1) `o`'s polygon contains the hole's centroid, AND
+            //   (2) `o`'s area is strictly larger than `h`'s area — a
+            //       polygon smaller than the hole cannot wrap around it; it
+            //       must itself lie inside the hole.
+            //
+            // Without (2), a coaxial bore-cut disc (area ≈ π·r20²) that lies
+            // geometrically INSIDE a pre-existing boss-root hole (area ≈ π·r35²)
+            // wins the "tightest-area" competition: the origin is inside both
+            // the outer rect and the r20 disc, and the r20 is smaller. The
+            // area guard filters it out (area(r20) < area(r35 hole)), leaving
+            // only the genuine outer rect — which is correct. The 118c6c0
+            // repro (holed plate ∩ r15 cyl) is unaffected: the r15 disc
+            // (area ≈ π·r15²) is strictly larger than the r3 hole
+            // (area ≈ π·r3²), so it passes condition (2) and remains the
+            // owner. The guard is purely an area comparison — no centroid-
+            // vs-hole test — so it handles non-concentric cases correctly too:
+            // a small-but-non-concentric cut disc would similarly be rejected
+            // if it falls inside the hole boundary.
+            let hole_area = signed_area(&cycle_polys_2d[h]);
             let mut best_area = f64::INFINITY;
             for (pos, &o) in outer_indices.iter().enumerate() {
-                if cycle_polys_2d[o].len() >= 3
-                    && point_in_polygon_2d(hc.0, hc.1, &cycle_polys_2d[o])
-                {
-                    let area = signed_area(&cycle_polys_2d[o]);
-                    if area < best_area {
-                        best_area = area;
-                        chosen = Some(pos);
-                    }
+                let o_poly = &cycle_polys_2d[o];
+                if o_poly.len() < 3 || !point_in_polygon_2d(hc.0, hc.1, o_poly) {
+                    // Condition (1): outer must contain the hole's centroid.
+                    continue;
+                }
+                // Condition (2): outer must be larger than the hole. A
+                // polygon whose area is ≤ the hole's area cannot contain the
+                // hole — it is a void fragment nested inside it.
+                let area = signed_area(o_poly);
+                if area <= hole_area {
+                    continue;
+                }
+                if area < best_area {
+                    best_area = area;
+                    chosen = Some(pos);
                 }
             }
         }

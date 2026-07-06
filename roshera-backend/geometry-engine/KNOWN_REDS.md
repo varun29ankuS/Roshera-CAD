@@ -12,12 +12,6 @@
 #
 # Gate script: roshera-backend/scripts/red-gate.ps1
 
-# Family: coaxial-bore boolean (4 tests) -- diag: burndown-diag-boolean.md#sub-group-a
-agent_build_eval::extrude_boss_coaxial_bore_keeps_wall  # diag: burndown-diag-boolean.md#sub-group-a
-agent_build_eval::bearing_housing_coaxial_bore_is_sound  # diag: burndown-diag-boolean.md#sub-group-a
-agent_build_eval::eval_bossed_plate_with_coaxial_bore  # diag: burndown-diag-boolean.md#sub-group-a
-agent_build_eval::gen_flanged_housing  # diag: burndown-diag-boolean.md#sub-group-a
-
 # Family: boolean bracket / F4 sever (1 test) -- diag: burndown-diag-boolean.md#sub-group-b
 boolean_bracket_robustness::f4_oversized_bore_severs_into_two_bodies  # diag: burndown-diag-boolean.md#sub-group-b
 
