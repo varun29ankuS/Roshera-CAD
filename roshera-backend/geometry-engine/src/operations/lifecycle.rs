@@ -86,6 +86,13 @@ pub enum OpSpec<'a> {
         /// standard pre-flight (no carve-out). See
         /// [`crate::operations::fillet::FilletOptions::partial_corner_vertices`].
         partial_corner_vertices: &'a [VertexId],
+        /// D-1 — the request's largest blend displacement (max fillet
+        /// radius across the selection). Drives the same-kind
+        /// blend-scar proximity gate
+        /// ([`validate_same_kind_scar_adjacency`]): an endpoint within
+        /// this distance of an existing same-kind scar boundary marks
+        /// the unsupported sequential-adjacent surgery.
+        setback: f64,
     },
     /// `chamfer_edges(solid_id, edges, …)`.
     ChamferEdges {
@@ -94,6 +101,8 @@ pub enum OpSpec<'a> {
         /// CF-β.5.2-A — see
         /// [`crate::operations::chamfer::ChamferOptions::partial_corner_vertices`].
         partial_corner_vertices: &'a [VertexId],
+        /// D-1 — max chamfer setback distance; see the fillet variant.
+        setback: f64,
     },
     /// `boolean_operation(solid_a, solid_b, …)`.
     Boolean { solid_a: SolidId, solid_b: SolidId },
@@ -146,6 +155,7 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             solid_id,
             edges,
             partial_corner_vertices,
+            setback,
         } => {
             check_solid_exists(model, solid_id)?;
             // CF-α: typed cross-kind conflict gate. Runs BEFORE
@@ -168,12 +178,23 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             // explicit opt-in.
             let effective_partial =
                 effective_partial_corner_vertices(model, solid_id, partial_corner_vertices);
+            // D-1 — refuse the unsupported sequential-adjacent
+            // same-kind surgery before any topology is touched.
+            validate_same_kind_scar_adjacency(
+                model,
+                solid_id,
+                edges,
+                BlendKind::Fillet,
+                &effective_partial,
+                setback,
+            )?;
             validate_corner_compatibility(model, edges, BlendOpKind::Fillet, &effective_partial)
         }
         OpSpec::ChamferEdges {
             solid_id,
             edges,
             partial_corner_vertices,
+            setback,
         } => {
             check_solid_exists(model, solid_id)?;
             // CF-α: typed cross-kind conflict gate — see FilletEdges
@@ -184,6 +205,15 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             // see the FilletEdges arm for the rationale.
             let effective_partial =
                 effective_partial_corner_vertices(model, solid_id, partial_corner_vertices);
+            // D-1 — see the FilletEdges arm.
+            validate_same_kind_scar_adjacency(
+                model,
+                solid_id,
+                edges,
+                BlendKind::Chamfer,
+                &effective_partial,
+                setback,
+            )?;
             validate_corner_compatibility(model, edges, BlendOpKind::Chamfer, &effective_partial)
         }
         OpSpec::Boolean { solid_a, solid_b } => {
@@ -509,6 +539,150 @@ fn effective_partial_corner_vertices(
     out
 }
 
+/// D-1 (dogfood-diag-api-blend, divergence site #2) — refuse the
+/// unsupported *sequential-adjacent same-kind* blend surgery pre-flight.
+///
+/// The corrupting sequence: call 1 fillets edge `e_x`; call 2 fillets the
+/// adjacent edge `e_y` (sharing the original corner). Call 2's single-edge
+/// surgery re-trims the shared host faces assuming pristine planar
+/// boundaries, but call 1 left cap/setback arcs there — the trim curves
+/// cross, and the result is combinatorially valid (every loop closes,
+/// χ_BRep = 2) yet geometrically OPEN (hundreds of boundary chords at
+/// tessellation). Historically this shipped silently, or — with the
+/// placement transform — was caught only by the fragile inertia-tensor
+/// heuristic in `validate_chamfered_solid`. This gate replaces that
+/// accident with a deterministic, typed refusal.
+///
+/// ## Detection
+///
+/// For every requested edge endpoint `P` (skipping opted-in / pending
+/// partial-mixed corner vertices — the supported two-call protocol),
+/// measure the distance from `P` to the boundary chords of every LIVE
+/// blend face of the SAME kind recorded in the host solid's
+/// `blend_faces_by_kind` registry. `P` within `max(setback, tolerance)`
+/// of a scar boundary means the new surgery's trim region reaches the
+/// scar — refuse with [`BlendFailure::AdjacentSameKindBlendScar`].
+///
+/// ## Scoping (what still passes)
+///
+/// * First calls on pristine solids — no same-kind scar faces exist.
+/// * The mixed protocol's second call — it is the OPPOSITE kind, so the
+///   same-kind registry scan finds nothing (and its corner vertex is in
+///   the exempt list besides).
+/// * Sequential same-kind blends on well-separated edges (opposite box
+///   edges, both rims of a tall flange) — every endpoint clears the
+///   setback threshold. See `chamfer_world_class::flange_both_outer_rims`.
+///
+/// Cross-kind adjacency continues to route through the CF-β pending /
+/// feasibility machinery, not this gate.
+fn validate_same_kind_scar_adjacency(
+    model: &BRepModel,
+    solid_id: SolidId,
+    edges: &[EdgeId],
+    requested_kind: BlendKind,
+    exempt_vertices: &[VertexId],
+    setback: f64,
+) -> OperationResult<()> {
+    let solid = match model.solids.get(solid_id) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    // Live same-kind scar faces. The registry keys are pre-surgery face
+    // ids for faces later ops may have destroyed; filter to the living.
+    let scar_faces: Vec<FaceId> = solid
+        .blend_faces_by_kind
+        .iter()
+        .filter(|&(_, &kind)| kind == requested_kind)
+        .map(|(&fid, _)| fid)
+        .filter(|&fid| model.faces.get(fid).is_some())
+        .collect();
+    if scar_faces.is_empty() {
+        return Ok(());
+    }
+
+    let threshold = setback.max(model.tolerance.distance());
+
+    // Point-to-segment distance over the scar face's boundary chords.
+    // Chord sampling (vertex-to-vertex straight segments) is exact for
+    // the straight box/prism edges this defect family lives on and a
+    // conservative under-sample for curved rims — an under-sample can
+    // only let a request through, never falsely refuse it.
+    let point_segment_distance =
+        |p: crate::math::Point3, a: crate::math::Point3, b: crate::math::Point3| -> f64 {
+            let ab = b - a;
+            let len2 = ab.dot(&ab);
+            if len2 <= f64::EPSILON {
+                return (p - a).magnitude();
+            }
+            let t = ((p - a).dot(&ab) / len2).clamp(0.0, 1.0);
+            (p - (a + ab * t)).magnitude()
+        };
+
+    for &eid in edges {
+        let Some(edge) = model.edges.get(eid) else {
+            continue; // caught by check_edges_exist
+        };
+        for &vid in &[edge.start_vertex, edge.end_vertex] {
+            if exempt_vertices.contains(&vid) {
+                continue;
+            }
+            let Some(vertex) = model.vertices.get(vid) else {
+                continue;
+            };
+            let p = crate::math::Point3::new(
+                vertex.position[0],
+                vertex.position[1],
+                vertex.position[2],
+            );
+
+            for &fid in &scar_faces {
+                let Some(face) = model.faces.get(fid) else {
+                    continue;
+                };
+                let mut loops = vec![face.outer_loop];
+                loops.extend(face.inner_loops.iter().copied());
+                let mut nearest = f64::INFINITY;
+                for loop_id in loops {
+                    let Some(lp) = model.loops.get(loop_id) else {
+                        continue;
+                    };
+                    for &bid in &lp.edges {
+                        let Some(be) = model.edges.get(bid) else {
+                            continue;
+                        };
+                        let (Some(a), Some(b)) = (
+                            model.vertices.get(be.start_vertex),
+                            model.vertices.get(be.end_vertex),
+                        ) else {
+                            continue;
+                        };
+                        let pa =
+                            crate::math::Point3::new(a.position[0], a.position[1], a.position[2]);
+                        let pb =
+                            crate::math::Point3::new(b.position[0], b.position[1], b.position[2]);
+                        nearest = nearest.min(point_segment_distance(p, pa, pb));
+                    }
+                }
+                if nearest <= threshold {
+                    return Err(OperationError::from(
+                        BlendFailure::AdjacentSameKindBlendScar {
+                            edge: eid,
+                            vertex: vid,
+                            kind: requested_kind,
+                            scar_face: fid,
+                            distance: nearest,
+                            setback: threshold,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// F2-γ.1: setback-aware multi-edge corner compatibility check.
 ///
 /// Replaces the historical `validate_no_shared_corners` blanket
@@ -673,13 +847,24 @@ fn validate_corner_compatibility(
                     }
                 })
                 .unwrap_or(f64::NAN);
+            // D-1 (dogfood-diag-api-blend, divergence site #1): this
+            // message previously advised "apply each edge in a separate
+            // fillet/chamfer call" — which is EXACTLY the corrupting
+            // sequence the scar gate above now refuses. Name the
+            // supported route instead, including the concrete corner
+            // vertex id the caller needs for the opt-in.
             Err(OperationError::NotImplemented(format!(
                 "Edges {} and {} share corner vertex {} ({:?}). \
                  Setback is geometrically feasible (≈ {:.4} for a unit radius), \
-                 but corner-patch synthesis for this vertex kind is not yet \
-                 implemented (Task #82 / F5-γ / F5-δ). Apply each edge in a \
-                 separate fillet/chamfer call.",
-                ei, ej, vertex, vertex_kind, setback_summary
+                 but same-kind corner-patch synthesis for this vertex kind is not \
+                 yet implemented (Task #82 / F5-γ / F5-δ). Do NOT apply these edges \
+                 in separate single-edge calls — sequential single-edge blends at a \
+                 shared corner are unsupported (they corrupt the solid) and are \
+                 refused. For a mixed fillet+chamfer corner, pass \
+                 `partial_corner_vertices: [{}]` on a single call carrying ALL \
+                 same-kind edges at this corner, then apply the opposite blend kind \
+                 in a second call.",
+                ei, ej, vertex, vertex_kind, setback_summary, vertex
             )))
         }
         Err(setback_err) => match vertex_kind {
@@ -798,6 +983,7 @@ mod tests {
                 solid_id: 9999,
                 edges: &[],
                 partial_corner_vertices: &[],
+                setback: 1.0,
             },
         );
         match result {
@@ -823,6 +1009,7 @@ mod tests {
                 solid_id,
                 edges: &[9999_u32],
                 partial_corner_vertices: &[],
+                setback: 1.0,
             },
         );
         match result {
@@ -918,6 +1105,7 @@ mod tests {
                 solid_id,
                 edges: &corner_edges,
                 partial_corner_vertices: &[],
+                setback: 1.0,
             },
         );
         assert!(
@@ -959,6 +1147,7 @@ mod tests {
                 solid_id,
                 edges: &[e0, e1],
                 partial_corner_vertices: &[],
+                setback: 1.0,
             },
         );
         assert!(
@@ -1053,6 +1242,7 @@ mod tests {
                 solid_id,
                 edges: &[edge],
                 partial_corner_vertices: &[],
+                setback: 1.0,
             },
         )
         .expect_err("cross-kind at shared corner must be rejected (β.2 stub)");

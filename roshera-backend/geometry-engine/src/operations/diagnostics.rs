@@ -473,6 +473,34 @@ pub enum BlendFailure {
         /// [`crate::operations::mixed_kind_corner_cap::G1_CAP_KINK_TOLERANCE_RAD`].
         tolerance_rad: f64,
     },
+    /// D-1 (dogfood-diag-api-blend) — a requested blend's edge
+    /// terminates on (or within the requested setback of) the boundary
+    /// of an existing SAME-kind blend scar at a shared corner. The
+    /// second single-edge surgery would re-trim the host faces assuming
+    /// pristine planar boundaries and silently produce a
+    /// combinatorially-valid but geometrically-open solid (the
+    /// 2026-05-14 adjacent-corner corruption family), so the pre-flight
+    /// refuses instead.
+    ///
+    /// Recovery: for a mixed fillet+chamfer corner, pass
+    /// `partial_corner_vertices: [<corner vertex>]` on a SINGLE call
+    /// carrying ALL same-kind edges at that corner, then apply the
+    /// opposite kind in a second call (the supported two-call
+    /// protocol). Same-kind corner patches remain Task #82.
+    AdjacentSameKindBlendScar {
+        /// The requested edge whose endpoint neighbourhood carries the scar.
+        edge: EdgeId,
+        /// The requested edge's endpoint vertex nearest the scar.
+        vertex: VertexId,
+        /// Blend kind of both the scar and the request.
+        kind: BlendKind,
+        /// The existing blend face whose boundary the endpoint touches.
+        scar_face: FaceId,
+        /// Distance from the endpoint to the nearest scar-face boundary chord.
+        distance: f64,
+        /// The setback threshold `distance` was compared against.
+        setback: f64,
+    },
     /// Catch-all for irreducible failures not yet classified. The
     /// `detail` string is freeform; when a recurring `detail` pattern
     /// emerges in production telemetry, promote it to a structured
@@ -592,6 +620,23 @@ impl std::fmt::Display for BlendFailure {
                  retry with seam_continuity C0 to accept the cap with the declared kink",
                 vertex, measured_kink_rad, rim_edge, tolerance_rad
             ),
+            BlendFailure::AdjacentSameKindBlendScar {
+                edge,
+                vertex,
+                kind,
+                scar_face,
+                distance,
+                setback,
+            } => write!(
+                f,
+                "edge {edge} terminates at vertex {vertex}, within the requested blend \
+                 setback of an existing {kind} scar (face {scar_face}, distance {distance:.4} \
+                 <= setback {setback:.4}). Sequential separate single-edge fillet/chamfer \
+                 calls at a shared corner are unsupported — they corrupt the solid — and are \
+                 refused. For a mixed fillet+chamfer corner, pass `partial_corner_vertices: \
+                 [{vertex}]` on a single call carrying ALL same-kind edges at this corner, \
+                 then apply the opposite kind in a second call"
+            ),
             BlendFailure::TopologyViolation { detail } => {
                 write!(f, "topology violation: {}", detail)
             }
@@ -656,6 +701,14 @@ impl From<BlendFailure> for OperationError {
             // displacements) — typed BlendFailed, same rationale as
             // SeamContinuityUnreachable.
             BlendFailure::G1NotAchievable { .. } => OperationError::BlendFailed(Box::new(failure)),
+            // D-1: AdjacentSameKindBlendScar carries the typed payload
+            // (edge, corner vertex, scar face, distance vs setback)
+            // agents need to switch onto the supported
+            // `partial_corner_vertices` two-call protocol — typed
+            // BlendFailed, same rationale as MixedKindUnsupported.
+            BlendFailure::AdjacentSameKindBlendScar { .. } => {
+                OperationError::BlendFailed(Box::new(failure))
+            }
             BlendFailure::RadiusExceedsCurvature { .. }
             | BlendFailure::SetbackTooLong { .. }
             | BlendFailure::VertexBlendUnsupported { .. }

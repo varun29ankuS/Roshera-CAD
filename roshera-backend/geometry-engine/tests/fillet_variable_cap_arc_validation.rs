@@ -107,10 +107,24 @@ fn variable_radius_cap_edges_lie_on_fillet_surface() {
     let solid = make_box(&mut model, 10.0, 10.0, 10.0);
     let edge = first_open_edge(&model);
 
+    // `validate_result: false` — the subject here is the Task #84
+    // cap-arc CONSTRUCTION, which requires the op to land so the arcs
+    // can be inspected. The unequal-end variable band itself does not
+    // yet weld watertight against its neighbours (pre-existing kernel
+    // gap; the certificate has always reported these solids
+    // watertight=false), and the D-1 geometric-closure post-flight now
+    // honestly refuses that open result on the default path. Opting
+    // out of the post-flight keeps this geometry pin alive; the
+    // closure refusal for this family is pinned in
+    // `api-server::fillet_radius_harness::linear_profile_drives_kernel_variable_endpoints`.
     let opts = FilletOptions {
         fillet_type: FilletType::Variable(0.4, 0.8),
         radius: 0.4,
         propagation: PropagationMode::None,
+        common: geometry_engine::operations::CommonOptions {
+            validate_result: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let faces = fillet_edges(&mut model, solid, vec![edge], opts)
@@ -205,10 +219,18 @@ fn variable_radius_cap_edges_join_trim_endpoints() {
     let solid = make_box(&mut model, 10.0, 10.0, 10.0);
     let edge = first_open_edge(&model);
 
+    // `validate_result: false` — see the sibling test above: the
+    // subject is cap/trim topology wiring, and the unequal-end
+    // variable band's known open-mesh weld would otherwise be
+    // (correctly) refused by the D-1 closure post-flight.
     let opts = FilletOptions {
         fillet_type: FilletType::Variable(0.4, 0.8),
         radius: 0.4,
         propagation: PropagationMode::None,
+        common: geometry_engine::operations::CommonOptions {
+            validate_result: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let faces =

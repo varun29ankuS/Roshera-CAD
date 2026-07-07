@@ -185,9 +185,34 @@ async fn tagged_constant_round_trips_to_kernel_constant() {
 /// Linear profile — exactly the JSON `sendDirectFilletLinear` ships.
 /// Pinning this body verbatim guarantees the wire never drifts from
 /// what the frontend emits.
+///
+/// KERNEL CONTRACT UPDATE (D-1, dogfood-diag-api-blend): an
+/// unequal-end `Variable(1.0, 3.0)` fillet on a box edge produces a
+/// blend band that does not close against its neighbours — open at
+/// BOTH coarse (0.1) and display (0.001) chords, and the kernel
+/// certificate has ALWAYS reported it `watertight=false / sound=false`.
+/// Historically `fillet_edges` still returned `Ok`, so this harness
+/// pinned "kernel accepts" for a result the kernel's own certificate
+/// called unsound. The D-1 geometric-closure post-flight makes the op
+/// honest: it now REFUSES (typed, rolled back) instead of emitting the
+/// open solid. This test pins the full pipeline UNCHANGED up to the
+/// kernel call — the refusal text proves the `FilletType::Variable`
+/// surgery genuinely ran — plus the rollback contract.
+///
+/// Banked follow-up (pre-existing kernel gap, NOT a D-1 regression):
+/// make the unequal-end variable band weld watertight, then flip the
+/// drive expectation back to `Ok` + face-count growth. The equal-end
+/// stations profile (`variable_profile_drives_kernel_variable_stations`)
+/// closes fine and keeps pinning the accepting path.
 #[tokio::test]
 async fn linear_profile_drives_kernel_variable_endpoints() {
     let (mut model, solid_id, edge) = box_first_edge(20.0, 20.0, 20.0);
+    let face_count_before = model
+        .shells
+        .get(model.solids.get(solid_id).unwrap().outer_shell)
+        .unwrap()
+        .faces
+        .len();
 
     // Byte-for-byte the shape `sendDirectFilletLinear` POSTs.
     let payload = json!({
@@ -209,7 +234,34 @@ async fn linear_profile_drives_kernel_variable_endpoints() {
         other => panic!("expected Variable(1.0, 3.0), got {other:?}"),
     }
 
-    drive_kernel(&mut model, solid_id, edge, &radii);
+    // Drive the kernel: the wire-derived FilletType reaches the real
+    // variable-radius surgery, whose geometrically-open output the
+    // D-1 closure gate now refuses honestly instead of accepting.
+    let opts = FilletOptions {
+        fillet_type: radii.to_fillet_type(0),
+        propagation: PropagationMode::None,
+        ..FilletOptions::default()
+    };
+    let err = fillet_edges(&mut model, solid_id, vec![edge], opts)
+        .expect_err("unequal-end variable fillet (open band) must be refused post-flight");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("geometrically OPEN"),
+        "refusal must be the geometric-closure gate (proving the Variable \
+         surgery ran and its output was honestly measured); got {msg}"
+    );
+
+    // Rollback contract: the refused op must leave the box untouched.
+    let face_count_after = model
+        .shells
+        .get(model.solids.get(solid_id).unwrap().outer_shell)
+        .unwrap()
+        .faces
+        .len();
+    assert_eq!(
+        face_count_before, face_count_after,
+        "refused fillet must roll back cleanly"
+    );
 }
 
 /// Variable-station profile — exactly the JSON

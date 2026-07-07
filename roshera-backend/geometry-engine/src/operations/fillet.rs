@@ -412,15 +412,11 @@ pub fn fillet_edges(
     // `validate_no_shared_corners` blanket reject). Atomic — the
     // model is untouched if pre-flight fails.
     if options.common.validate_before {
-        lifecycle::validate_can_apply(
-            model,
-            OpSpec::FilletEdges {
-                solid_id,
-                edges: &edges,
-                partial_corner_vertices: &options.partial_corner_vertices,
-            },
-        )?;
-
+        // The selection's largest radius. Computed BEFORE
+        // `validate_can_apply` because the D-1 same-kind blend-scar
+        // gate uses it as its endpoint-proximity setback; F6-α below
+        // reuses it as the curvature-feasibility bound.
+        //
         // F6-α: radius vs. curvature feasibility gate. Catches the
         // common "rolling ball larger than the cylinder / sphere it
         // sits against" case before the spine solver burns its
@@ -469,6 +465,17 @@ pub fn fillet_edges(
             // downstream validation. Sampling them is F6-β.
             FilletType::Function(_) | FilletType::Chord(_) => 0.0,
         };
+
+        lifecycle::validate_can_apply(
+            model,
+            OpSpec::FilletEdges {
+                solid_id,
+                edges: &edges,
+                partial_corner_vertices: &options.partial_corner_vertices,
+                setback: max_radius,
+            },
+        )?;
+
         if max_radius > 0.0 {
             feasibility::validate_radius_against_curvature(model, &edges, max_radius)
                 .map_err(|f| OperationError::BlendFailed(Box::new(f)))?;
@@ -8955,7 +8962,56 @@ fn validate_filleted_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
             summary
         )));
     }
+
+    // D-1 (dogfood-diag-api-blend, divergence site #2) — GEOMETRIC
+    // closure gate. The combinatorial validation above accepts a solid
+    // whose loops all close and whose B-Rep Euler count is legal while
+    // the trim GEOMETRY is self-crossing — the sequential-adjacent
+    // fillet family tessellates to an open sliver mess (mesh χ = 0,
+    // hundreds of boundary chords) yet sailed through here. Require
+    // mesh-level closure at a COARSE chord (0.1 — the same chord the
+    // `certify_solid` watertight dimension uses, far coarser than the
+    // 0.001 display default, so this stays cheap and op-accepts can
+    // never contradict the certificate's watertight verdict). Runs
+    // inside the op on one solid — NOT as an ambient sync certificate
+    // under the write lock (autocert-perf-regression constraint).
+    //
+    // Skipped while a partial-mixed corner is pending: the protocol's
+    // intermediate state is EXPECTEDLY open at the corner (the same
+    // carve-out the CF-β.4 error filter above applies).
+    if pending.is_empty() {
+        validate_blend_geometric_closure(model, solid_id, "filleted")?;
+    }
     Ok(())
+}
+
+/// D-1 — shared mesh-level closure gate for the blend post-flights.
+///
+/// A blend result must tessellate to a CLOSED mesh at coarse chord;
+/// boundary chords mean the surgery emitted self-crossing / gapped trim
+/// geometry (combinatorially valid, geometrically open). Erring here
+/// hands control back to `with_rollback`, which restores the pre-call
+/// model — the caller gets a typed refusal instead of a corrupt solid.
+pub(super) fn validate_blend_geometric_closure(
+    model: &BRepModel,
+    solid_id: SolidId,
+    op_label: &str,
+) -> OperationResult<()> {
+    match crate::harness::watertight::manifold_report(model, solid_id, 0.1, 1e-6) {
+        Some(r) if r.boundary_edges == 0 => Ok(()),
+        Some(r) => Err(OperationError::InvalidBRep(format!(
+            "{op_label} solid {} is combinatorially valid but geometrically OPEN: \
+             {} boundary mesh edge(s) at coarse-chord tessellation (mesh χ = {}). \
+             The blend surgery produced self-crossing or gapped trim geometry; \
+             the operation is refused and rolled back",
+            solid_id, r.boundary_edges, r.euler_characteristic
+        ))),
+        None => Err(OperationError::InvalidBRep(format!(
+            "{op_label} solid {} tessellates to an empty mesh — the blend result \
+             has no renderable geometry; the operation is refused and rolled back",
+            solid_id
+        ))),
+    }
 }
 
 /// Validate fillet parameters

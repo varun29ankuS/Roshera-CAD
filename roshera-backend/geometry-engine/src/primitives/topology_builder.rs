@@ -2540,7 +2540,7 @@ impl BRepModel {
         // a bore (the "wing"), a far-off-surface normal, etc.
         let mesh_quality = crate::harness::watertight::mesh_quality(self, solid_id)
             .unwrap_or_else(crate::primitives::provenance::MeshQuality::empty);
-        let errors = v.errors.iter().map(|e| format!("{e:?}")).collect();
+        let mut errors: Vec<String> = v.errors.iter().map(|e| format!("{e:?}")).collect();
         // Dual-eye render-free cross-check (Truth↔Semantic): recognized features
         // must reference live faces. Gates is_sound via EyesConsistency.
         // Phase 1: collect shell ids without holding the solid Ref across the
@@ -2586,6 +2586,87 @@ impl BRepModel {
                 crate::primitives::provenance::EyesConsistency::NotApplicable
             }
         };
+        // D-1 (dogfood-diag-api-blend, item 4) — an unsound certificate must
+        // NEVER ship an empty (or dimension-blind) `errors` list. The entries
+        // above mirror B-Rep validation only, so a brep-valid solid whose MESH
+        // dimensions fail (the sequential-adjacent blend corruption: watertight
+        // = false, χ = 0, 329 boundary chords) previously certified
+        // `sound=false, errors: []` — an unactionable verdict. Synthesize one
+        // typed entry per failing gating dimension so the cert always names
+        // WHY it is unsound.
+        if !watertight {
+            errors.push(format!(
+                "cert: watertight=false — {be} boundary mesh edge(s) at coarse-chord \
+                 tessellation (mesh χ = {euler})"
+            ));
+        }
+        if !manifold {
+            errors.push(format!(
+                "cert: manifold=false — {nm} non-manifold (3+-fan) mesh edge(s)"
+            ));
+        }
+        if !oriented {
+            errors.push(format!(
+                "cert: oriented=false — {ide} inconsistently-directed mesh edge(s) \
+                 (same-winding triangle pair across a shared edge)"
+            ));
+        }
+        if !self_intersection_free {
+            errors.push(
+                "cert: self_intersection_free=false — coarse-chord mesh self-intersection \
+                 detected"
+                    .to_string(),
+            );
+        }
+        if matches!(
+            construction_consistent,
+            crate::primitives::provenance::ConstructionConsistency::Inconsistent
+        ) {
+            errors.push(
+                "cert: construction_consistent=inconsistent — the linked construction \
+                 geometry (source sketch) is no longer co-located with the solid"
+                    .to_string(),
+            );
+        }
+        if matches!(
+            eyes_consistent,
+            crate::primitives::provenance::EyesConsistency::Inconsistent
+        ) {
+            errors.push(
+                "cert: eyes_consistent=inconsistent — a recognized feature references a \
+                 dead face or a surface type contradicting its semantic label"
+                    .to_string(),
+            );
+        }
+        if !tessellation.clean {
+            let worst = tessellation
+                .worst_face
+                .as_ref()
+                .map(|w| format!(" (worst face {})", w.face_id))
+                .unwrap_or_default();
+            errors.push(format!(
+                "cert: tessellation_clean=false — {} degenerate facet(s), {} off-surface \
+                 facet(s), normal agreement {:.3}{worst}",
+                tessellation.degenerate_triangles,
+                tessellation.off_surface_facets,
+                tessellation.normal_agreement,
+            ));
+        }
+        if !mesh_quality.clean {
+            let worst = mesh_quality
+                .worst_face
+                .as_ref()
+                .map(|w| format!(" (worst face {})", w.face_id))
+                .unwrap_or_default();
+            errors.push(format!(
+                "cert: mesh_quality_clean=false — worst aspect ratio {:.1}, min angle \
+                 {:.2}°, max normal deviation {:.1}°, {} boundary-crossing facet(s){worst}",
+                mesh_quality.worst_aspect_ratio,
+                mesh_quality.min_angle_deg,
+                mesh_quality.max_normal_deviation_deg,
+                mesh_quality.boundary_crossing_facets,
+            ));
+        }
         ValidityCertificate {
             brep_valid: v.is_valid,
             watertight,

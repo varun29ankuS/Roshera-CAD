@@ -1336,21 +1336,31 @@ async fn chamfer_seam_continuity_unknown_string_returns_invalid_parameter_400() 
     );
 }
 
-// ---- Mixed-corner G1 cap dispatch → 3-sub-patch success end-to-end --
+// ---- Mixed-corner G1 cap dispatch → typed measured-kink refusal ----
 
-/// (4) — End-to-end CF-γ.6.2 3-sub-patch success through the HTTP
-/// stack. Driver: seed a box, chamfer one corner-incident edge with
+/// (4) — End-to-end Task-3C honest G1 contract through the HTTP stack.
+///
+/// Driver: seed a box, chamfer one corner-incident edge with
 /// `seam_continuity: "g1"` AND `partial_corner_vertices: [corner]`
 /// (the opt-in that keeps the corner open without synthesizing a
 /// cap), then fillet the remaining two corner-incident edges with
-/// `seam_continuity: "g1"`. The fillet call reaches the mixed-kind
-/// dispatcher's G1 arm and routes through
-/// `synthesize_mixed_kind_corner_cap_g1`, emitting three bicubic
-/// NURBS sub-patches sharing a central apex vertex. The HTTP stack
-/// must surface 200 OK (success) — the post-γ.6.2 contract; the
-/// pre-γ.6.2 sentinel 400 reject is no longer the expected shape.
+/// `seam_continuity: "g1"`. The finalize reaches the mixed-kind cap
+/// synthesizer, which (post Task 3C, commit 3b522d6) MEASURES the
+/// single-patch cap's rim-seam kink and — because this 1C2F corner's
+/// cap kinks far above `G1_CAP_KINK_TOLERANCE_RAD` — refuses loudly
+/// with the typed `G1NotAchievable` payload instead of the pre-3C
+/// silent downgrade. Agents recover by retrying with
+/// `seam_continuity: "c0"` (named in the payload's message).
+///
+/// History: this test previously pinned the superseded CF-γ.6.2
+/// 3-sub-patch 200 contract. Task 3C re-pinned the 8 cf_gamma KERNEL
+/// fixtures to the honest single-patch contract, but the api-server
+/// suite was not run then, leaving this router twin stale (found
+/// during D-1 gate (c) — verified pre-existing at the D-1 base by
+/// stash bisect). This is the router-level mirror of
+/// `cf_gamma_g1_mixed_kind_corner::assert_g1_not_achievable`.
 #[tokio::test]
-async fn fillet_g1_mixed_corner_returns_200_with_three_subpatch_cap() {
+async fn fillet_g1_mixed_corner_refuses_typed_g1_not_achievable() {
     let state = make_test_state().await;
     let (uuid, _solid_id, edges) = seed_box(&state, 4.0).await;
 
@@ -1393,8 +1403,8 @@ async fn fillet_g1_mixed_corner_returns_200_with_three_subpatch_cap() {
         "G1 + partial-corner chamfer must land; body = {first_body}"
     );
 
-    // Second call: fillet edge[1] + edge[2] with G1. Reaches the
-    // mixed-kind dispatcher → 3-sub-patch G1 cap synthesizer.
+    // Second call: fillet edge[1] + edge[2] with G1 — the finalize.
+    // The measured-kink gate refuses G1 on this corner, typed.
     let second_request = fillet_post(json!({
         "object": uuid.to_string(),
         "edges":  [edges[1], edges[2]],
@@ -1405,12 +1415,35 @@ async fn fillet_g1_mixed_corner_returns_200_with_three_subpatch_cap() {
 
     assert_eq!(
         status,
-        StatusCode::OK,
-        "γ.6.2 G1 mixed-corner fillet must surface 200 OK with 3-sub-patch cap; body = {body}"
+        StatusCode::BAD_REQUEST,
+        "Task-3C honest G1 contract: an unreachable-G1 mixed corner must refuse \
+         as 400 blend_failed; body = {body}"
     );
+    assert_eq!(body["success"], false);
     assert_eq!(
-        body["success"], true,
-        "γ.6.2 G1 mixed-corner fillet response must report success; body = {body}"
+        body["error_code"], "blend_failed",
+        "refusal must carry the typed blend_failed code; body = {body}"
+    );
+    let failure = &body["details"]["failure"];
+    assert_eq!(
+        failure["type"], "G1NotAchievable",
+        "details.failure.type must carry the typed measured-kink discriminator; \
+         failure = {failure}"
+    );
+    let kink = failure["measured_kink_rad"]
+        .as_f64()
+        .expect("measured_kink_rad must be a JSON number");
+    let tolerance = failure["tolerance_rad"]
+        .as_f64()
+        .expect("tolerance_rad must be a JSON number");
+    assert!(
+        kink > tolerance,
+        "refusal must carry measured kink > tolerance; failure = {failure}"
+    );
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("C0"),
+        "refusal must name the C0 recovery route; got {error_str:?}"
     );
 }
 
@@ -3696,5 +3729,321 @@ async fn gdt_designate_face_from_other_solid_returns_422() {
     assert_eq!(
         body["error"], "face_not_in_solid",
         "error field must be 'face_not_in_solid'; body = {body}"
+    );
+}
+
+// =====================================================================
+// D-1 (dogfood-diag-api-blend) — the mixed fillet/chamfer corner
+// honesty chain through the FULL HTTP surface. The missing test class
+// the diagnosis named: the kernel fixtures were green while the live
+// API broke, because no test drove the two-call protocol (or the
+// unsupported dogfood sequence) through the router.
+// =====================================================================
+
+/// Locate the corner vertex shared by all three seeded corner edges,
+/// and split the triple into the two TOP-plane edges (both endpoints at
+/// z = size/2) and the remaining vertical edge.
+fn classify_corner_edges(
+    model: &BRepModel,
+    edges: &[EdgeId; 3],
+    size: f64,
+) -> (VertexId, [EdgeId; 2], EdgeId) {
+    let half = size / 2.0;
+    let mut corner: Option<VertexId> = None;
+    for (vid, _) in model.vertices.iter() {
+        let count = edges
+            .iter()
+            .filter(|&&eid| {
+                let edge = model.edges.get(eid).expect("seeded edge id must resolve");
+                edge.start_vertex == vid || edge.end_vertex == vid
+            })
+            .count();
+        if count == 3 {
+            corner = Some(vid);
+            break;
+        }
+    }
+    let corner = corner.expect("box corner shared vertex must exist for seeded 3-edge set");
+
+    let is_top = |eid: EdgeId| -> bool {
+        let edge = model.edges.get(eid).expect("edge resolves");
+        let s = model
+            .vertices
+            .get(edge.start_vertex)
+            .expect("start vertex resolves")
+            .position;
+        let t = model
+            .vertices
+            .get(edge.end_vertex)
+            .expect("end vertex resolves")
+            .position;
+        (s[2] - half).abs() < 1e-9 && (t[2] - half).abs() < 1e-9
+    };
+    let top: Vec<EdgeId> = edges.iter().copied().filter(|&e| is_top(e)).collect();
+    let vertical: Vec<EdgeId> = edges.iter().copied().filter(|&e| !is_top(e)).collect();
+    assert_eq!(
+        top.len(),
+        2,
+        "corner must carry exactly two top-plane edges"
+    );
+    assert_eq!(
+        vertical.len(),
+        1,
+        "corner must carry exactly one vertical edge"
+    );
+    (corner, [top[0], top[1]], vertical[0])
+}
+
+/// The SUPPORTED two-call mixed-corner protocol over HTTP, asserting
+/// per-step certificate HONESTY (the class of assertion the diagnosis
+/// proved missing):
+///
+/// 1. `POST /api/geometry/fillet` — both top corner edges in ONE call
+///    with the `partial_corner_vertices` opt-in → 200, and the embedded
+///    full certificate reports the deliberately-open intermediate
+///    HONESTLY: `watertight=false`, `sound=false`, and (item 4) a
+///    non-empty `errors` list that NAMES the failing watertight
+///    dimension.
+/// 2. `POST /api/geometry/chamfer` — the third (vertical) corner edge →
+///    200; the finalize synthesizes the mixed cap and the certificate
+///    must report geometric closure: `watertight=true`,
+///    `euler_characteristic=2`, `self_intersection_free=true`.
+///
+/// The final state still reports `sound=false` from the KNOWN mixed-cap
+/// tessellation-quality residual (diagnosis finding 1b — separate
+/// ticket); per item 4 that residual must be NAMED in `cert.errors`,
+/// which this test pins (never an empty list). When 1b lands, ratchet
+/// the final assertion to `sound == true`.
+#[tokio::test]
+async fn blend_mixed_corner_protocol_reports_honest_certs_per_step() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 30.0).await;
+
+    let (corner, top_pair, vertical) = {
+        let guard = state.model.read().await;
+        classify_corner_edges(&guard, &edges, 30.0)
+    };
+
+    // Step 1 — the opt-in first call (all same-kind corner edges at once).
+    let first = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [top_pair[0], top_pair[1]],
+        "radius": 4.0,
+        "partial_corner_vertices": [corner],
+    }));
+    let (status, body) = dispatch(&state, first).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "protocol call 1 (opt-in two-edge fillet) must land; body = {body}"
+    );
+    let cert = &body["perception"]["cert"];
+    assert_eq!(
+        cert["watertight"], false,
+        "intermediate state must be reported honestly OPEN; cert = {cert}"
+    );
+    assert_eq!(
+        cert["sound"], false,
+        "intermediate state must be reported honestly unsound; cert = {cert}"
+    );
+    let errors = cert["errors"]
+        .as_array()
+        .expect("cert.errors must be an array");
+    assert!(
+        !errors.is_empty(),
+        "an unsound cert must never ship empty errors (item 4); cert = {cert}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.as_str().unwrap_or("").contains("watertight")),
+        "unsound intermediate cert errors must NAME the failing watertight \
+         dimension; errors = {errors:?}"
+    );
+
+    // Step 2 — the opposite-kind finalize on the vertical corner edge.
+    // The corner vertex survived call 1 (opt-in preserved it), so the
+    // vertical edge id is still live.
+    let second = chamfer_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [vertical],
+        "distance": 4.0,
+    }));
+    let (status, body) = dispatch(&state, second).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "protocol call 2 (opposite-kind finalize) must land; body = {body}"
+    );
+    let cert = &body["perception"]["cert"];
+    assert_eq!(
+        cert["watertight"], true,
+        "finalized corner must certify geometrically closed; cert = {cert}"
+    );
+    assert_eq!(
+        cert["euler_characteristic"], 2,
+        "finalized solid must have mesh Euler characteristic 2; cert = {cert}"
+    );
+    assert_eq!(
+        cert["self_intersection_free"], true,
+        "finalized solid must be self-intersection-free; cert = {cert}"
+    );
+    // Honest residual (1b): if the final state is unsound it must say WHY.
+    if cert["sound"] == false {
+        let errors = cert["errors"]
+            .as_array()
+            .expect("cert.errors must be an array");
+        assert!(
+            !errors.is_empty(),
+            "an unsound final cert must name its failing dimensions; cert = {cert}"
+        );
+    }
+}
+
+/// The UNSUPPORTED dogfood sequence over HTTP: single-edge fillet, then
+/// a second single-edge fillet on the ADJACENT top edge (no opt-in).
+/// Pre-fix this returned 200 and silently corrupted (cert
+/// watertight=false, 329 boundary chords, errors: []). Post-fix, call 2
+/// must be refused with the typed `blend_failed` /
+/// `AdjacentSameKindBlendScar` wire shape whose guidance names the
+/// supported `partial_corner_vertices` protocol.
+#[tokio::test]
+async fn dogfood_sequential_adjacent_fillet_refused_typed_over_http() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 30.0).await;
+
+    let (_corner, top_pair, _vertical) = {
+        let guard = state.model.read().await;
+        classify_corner_edges(&guard, &edges, 30.0)
+    };
+
+    // Remember the second edge's midpoint before call 1 shifts edge ids.
+    let (mx, my) = {
+        let guard = state.model.read().await;
+        let e = guard
+            .edges
+            .get(top_pair[1])
+            .expect("second top edge resolves");
+        let s = guard
+            .vertices
+            .get(e.start_vertex)
+            .expect("start vertex")
+            .position;
+        let t = guard
+            .vertices
+            .get(e.end_vertex)
+            .expect("end vertex")
+            .position;
+        (0.5 * (s[0] + t[0]), 0.5 * (s[1] + t[1]))
+    };
+
+    // Call 1 — single-edge fillet, lands.
+    let first = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [top_pair[0]],
+        "radius": 4.0,
+    }));
+    let (status, body) = dispatch(&state, first).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "first single-edge fillet must land; body = {body}"
+    );
+
+    // Re-locate the (shortened) adjacent top edge by midpoint.
+    let second_edge: EdgeId = {
+        let guard = state.model.read().await;
+        let mut found: Option<EdgeId> = None;
+        for (eid, edge) in guard.edges.iter() {
+            if edge.is_loop() {
+                continue;
+            }
+            let (Some(v0), Some(v1)) = (
+                guard.vertices.get(edge.start_vertex),
+                guard.vertices.get(edge.end_vertex),
+            ) else {
+                continue;
+            };
+            let (p0, p1) = (v0.position, v1.position);
+            if (p0[2] - 15.0).abs() < 1e-9 && (p1[2] - 15.0).abs() < 1e-9 {
+                let emx = 0.5 * (p0[0] + p1[0]);
+                let emy = 0.5 * (p0[1] + p1[1]);
+                if (emx - mx).hypot(emy - my) < 4.0 {
+                    found = Some(eid);
+                    break;
+                }
+            }
+        }
+        found.expect("adjacent top edge must survive the first fillet")
+    };
+
+    // Call 2 — the corrupting call. Must refuse typed.
+    let second = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [second_edge],
+        "radius": 4.0,
+    }));
+    let (status, body) = dispatch(&state, second).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the unsupported sequential-adjacent second fillet must refuse as 400; \
+         body = {body}"
+    );
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        body["error_code"], "blend_failed",
+        "refusal must carry the typed blend_failed code; body = {body}"
+    );
+    assert_eq!(
+        body["details"]["failure"]["type"], "AdjacentSameKindBlendScar",
+        "details.failure.type must carry the typed discriminator; body = {body}"
+    );
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("partial_corner_vertices"),
+        "refusal guidance must name the supported opt-in; got {error_str:?}"
+    );
+}
+
+/// Two same-kind corner edges in one call WITHOUT the opt-in: the
+/// Task-#82 refusal must now name the supported path — the
+/// `partial_corner_vertices` field and the concrete corner vertex id —
+/// and must not advise the corrupting separate-call sequence.
+#[tokio::test]
+async fn shared_corner_refusal_over_http_names_opt_in_and_vertex() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, edges) = seed_box(&state, 30.0).await;
+
+    let (corner, top_pair, _vertical) = {
+        let guard = state.model.read().await;
+        classify_corner_edges(&guard, &edges, 30.0)
+    };
+
+    let request = fillet_post(json!({
+        "object": uuid.to_string(),
+        "edges":  [top_pair[0], top_pair[1]],
+        "radius": 4.0,
+    }));
+    let (status, body) = dispatch(&state, request).await;
+
+    assert!(
+        !status.is_success(),
+        "two same-kind shared-corner edges without opt-in must refuse; body = {body}"
+    );
+    assert_eq!(body["success"], false);
+    let error_str = body["error"].as_str().unwrap_or("");
+    assert!(
+        error_str.contains("partial_corner_vertices"),
+        "refusal must name the partial_corner_vertices opt-in; got {error_str:?}"
+    );
+    assert!(
+        error_str.contains(&format!("[{corner}]")),
+        "refusal must name the corner vertex id {corner}; got {error_str:?}"
+    );
+    assert!(
+        !error_str.contains("separate fillet/chamfer call"),
+        "refusal must no longer advise the corrupting separate-call protocol; \
+         got {error_str:?}"
     );
 }

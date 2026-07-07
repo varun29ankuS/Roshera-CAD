@@ -123,12 +123,24 @@ pub fn chamfer_edges(
     // `validate_no_shared_corners` blanket reject). Atomic — the
     // model is untouched if pre-flight fails.
     if options.common.validate_before {
+        // D-1 — the request's largest setback distance, driving the
+        // same-kind blend-scar proximity gate inside
+        // `validate_can_apply`. Conservative upper bound across the
+        // chamfer-type variants; the `Angle` fallback consults the
+        // resolved distance fields.
+        let max_setback = match &options.chamfer_type {
+            ChamferType::EqualDistance(d) => *d,
+            ChamferType::TwoDistances(d1, d2) => d1.max(*d2),
+            ChamferType::DistanceAngle(d, a) => d.max(*d * a.tan().abs()),
+            ChamferType::Angle(_) => options.distance1.max(options.distance2),
+        };
         lifecycle::validate_can_apply(
             model,
             OpSpec::ChamferEdges {
                 solid_id,
                 edges: &edges,
                 partial_corner_vertices: &options.partial_corner_vertices,
+                setback: max_setback,
             },
         )?;
     }
@@ -3546,6 +3558,16 @@ fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationRe
     // fail for an expected structural reason unrelated to the scar-crossing
     // defect this gate targets.
     if pending.is_empty() {
+        // D-1 (dogfood-diag-api-blend) — GEOMETRIC closure gate. See
+        // `fillet::validate_blend_geometric_closure`: combinatorial
+        // validity does not imply mesh-level closure; the sequential-
+        // adjacent blend family is combinatorially legal yet open at
+        // tessellation. Coarse chord (0.1), one solid, inside the op —
+        // deterministic replacement for the fragile inertia-tensor
+        // catch below (which stays as defense-in-depth for
+        // partially-cancelled-but-closed meshes).
+        super::fillet::validate_blend_geometric_closure(model, solid_id, "chamfered")?;
+
         if model.audit_mass_properties(solid_id).is_none() {
             return Err(OperationError::InvalidBRep(format!(
                 "Chamfered solid {} is structurally valid but produces a \
