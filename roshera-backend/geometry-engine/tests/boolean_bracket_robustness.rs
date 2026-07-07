@@ -351,6 +351,140 @@ fn f5_taller_upstand_coincident_l_bracket_is_sound() {
     assert_eq!(bnd, 0, "f5: watertight (no boundary gap)");
 }
 
+// ───────── #6 overlapping boss + coaxial bore (dogfood D-2, live parts 8–12) ─────────
+//
+// Plate 60×60×10 (z∈[0,10]) ∪ boss cylinder r15 h20 base z=0 — OVERLAPPING
+// (interpenetrating z 0..10, not stacked). The union is SOUND, but its bottom
+// z=0 is legally FRAGMENTED into two coplanar faces (square-with-ring + r15
+// disk — the 2C coplanar-merge output). Then a coaxial bore r8 (z∈[-3,23])
+// difference fails two ways on that input (diagnosis
+// `.superpowers/sdd/dogfood-diag-api-blend.md` Bug 2):
+//   (a) cutter SKIRT leak — the bore wall is split at z=10 (the plate-top
+//       plane, which the bore never crosses: r8 < r15) but NOT at z=0
+//       against the coplanar disk face it genuinely crosses, so the
+//       out-of-solid piece z<0 is kept with its base-cap rim as boundary;
+//   (b) chordized rim — the r8 imprint on the coplanar bottom disk face
+//       comes out as straight polygon-clip CHORDS instead of the analytic
+//       circle, so the planar rim can never pair with the cutter wall's
+//       circular rim → unpaired rims, 3-face fans, χ=−34.
+// The stacked-boss fixtures never see this (no overlap volume → no coplanar
+// fragmented bottom → no cutter crossing a coincident face pair).
+
+/// plate ∪ overlapping boss (both base z=0) — the 2C-fragmented-bottom input.
+fn overlapping_boss_union(m: &mut BRepModel) -> SolidId {
+    let plate = box_at(m, 60.0, 60.0, 10.0, 0.0, 0.0, 5.0); // z∈[0,10]
+    let boss = cylinder(m, Point3::new(0.0, 0.0, 0.0), Vector3::Z, 15.0, 20.0); // z∈[0,20]
+    assert_operand_sound(m, plate, "f6 plate operand");
+    assert_operand_sound(m, boss, "f6 boss operand");
+    let u = union(m, plate, boss);
+    assert_operand_sound(m, u, "f6 union (coplanar-fragmented bottom)");
+    u
+}
+
+/// Every edge of `sid` whose BOTH endpoints lie on the z≈0 plane at `radius`
+/// from the z-axis (the bore-rim signature on the bottom face), as
+/// `(edge_id, curve_kind, midpoint_radius)`. A true analytic rim edge is an
+/// Arc/Circle whose midpoint also sits at `radius`; a polygon-clip CHORD is a
+/// Line/Polyline whose endpoints touch the circle but whose midpoint sags
+/// inside it.
+fn bottom_rim_edges(m: &BRepModel, sid: SolidId, radius: f64) -> Vec<(u32, String, f64)> {
+    use geometry_engine::primitives::curve::{Arc, Circle, Line, Polyline};
+    let solid = m.solids.get(sid).expect("solid");
+    let shell = m.shells.get(solid.outer_shell).expect("outer shell");
+    let mut edge_ids: Vec<u32> = Vec::new();
+    for &fid in &shell.faces {
+        let face = m.faces.get(fid).expect("face");
+        for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+            let lp = m.loops.get(lid).expect("loop");
+            for &eid in &lp.edges {
+                if !edge_ids.contains(&eid) {
+                    edge_ids.push(eid);
+                }
+            }
+        }
+    }
+    let on_rim = |p: [f64; 3]| -> bool {
+        p[2].abs() < 1e-6 && ((p[0] * p[0] + p[1] * p[1]).sqrt() - radius).abs() < 1e-6
+    };
+    let mut rim = Vec::new();
+    for eid in edge_ids {
+        let e = m.edges.get(eid).expect("edge");
+        let sp = m
+            .vertices
+            .get_position(e.start_vertex)
+            .expect("start vertex");
+        let ep = m.vertices.get_position(e.end_vertex).expect("end vertex");
+        if !(on_rim(sp) && on_rim(ep)) {
+            continue;
+        }
+        let curve = m.curves.get(e.curve_id).expect("curve");
+        let kind = if curve.as_any().downcast_ref::<Circle>().is_some() {
+            "Circle"
+        } else if curve.as_any().downcast_ref::<Arc>().is_some() {
+            "Arc"
+        } else if curve.as_any().downcast_ref::<Line>().is_some() {
+            "Line"
+        } else if curve.as_any().downcast_ref::<Polyline>().is_some() {
+            "Polyline"
+        } else {
+            "Other"
+        };
+        let t_mid = 0.5 * (e.param_range.start + e.param_range.end);
+        let mid = curve.point_at(t_mid).expect("curve midpoint");
+        let mid_r = (mid.x * mid.x + mid.y * mid.y).sqrt();
+        rim.push((eid, kind.to_string(), mid_r));
+    }
+    rim
+}
+
+#[test]
+fn f6_overlapping_boss_coaxial_bore_is_sound() {
+    let mut m = BRepModel::new();
+    let u = overlapping_boss_union(&mut m);
+    let bore = cylinder(&mut m, Point3::new(0.0, 0.0, -3.0), Vector3::Z, 8.0, 26.0); // z∈[-3,23]
+    assert_operand_sound(&mut m, bore, "f6 bore operand");
+    let r = diff(&mut m, u, bore);
+    let (sound, bnd, nm, euler) = metrics(&mut m, r, "f6 overlapping-boss bore");
+    assert!(
+        sound,
+        "f6: coaxial through-bore in an overlapping-boss union must be sound"
+    );
+    assert_eq!(nm, 0, "f6: no non-manifold edges");
+    assert_eq!(bnd, 0, "f6: watertight (no boundary edges)");
+    assert_eq!(euler, 0, "f6: one clean through-hole is genus-1 (euler=0)");
+}
+
+/// The no-chords pin: the bore rim imprinted on the (coplanar-fragmented)
+/// bottom face must be ANALYTIC circular geometry — Arc/Circle edges whose
+/// midpoints stay on the r8 circle — never straight polygon-clip chords.
+#[test]
+fn f6_bore_rim_on_bottom_face_is_analytic_circle() {
+    let mut m = BRepModel::new();
+    let u = overlapping_boss_union(&mut m);
+    let bore = cylinder(&mut m, Point3::new(0.0, 0.0, -3.0), Vector3::Z, 8.0, 26.0);
+    let r = diff(&mut m, u, bore);
+    let rim = bottom_rim_edges(&m, r, 8.0);
+    for (eid, kind, mid_r) in &rim {
+        eprintln!("[f6 rim] edge={eid} kind={kind} mid_radius={mid_r:.4}");
+    }
+    assert!(
+        !rim.is_empty(),
+        "f6 rim: the bore must imprint a rim on the bottom z=0 face"
+    );
+    for (eid, kind, mid_r) in &rim {
+        assert!(
+            kind == "Arc" || kind == "Circle",
+            "f6 rim: edge {eid} is a {kind} (chord fallback) — the r8 rim on the \
+             bottom face must be an analytic circular edge"
+        );
+        assert!(
+            (mid_r - 8.0).abs() < 1e-6,
+            "f6 rim: edge {eid} midpoint radius {mid_r:.6} sags off the r8 circle \
+             (chord, not arc)"
+        );
+    }
+}
+
 // Diagnostic: at what ε on the coincident back face does the union break? The
 // MCP path anchors the upstand via a Matrix4; if that leaves its back face a
 // hair off the base's (instead of bit-exact y=6), and the boolean is fragile to

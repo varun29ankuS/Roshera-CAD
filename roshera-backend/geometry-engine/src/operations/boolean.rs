@@ -826,7 +826,19 @@ fn compute_face_intersections(
                 ),
             }
         }
-        if let Some(intersection) = result {
+        if let Some(mut intersection) = result {
+            // Pair-level void filter (D-2): a meet curve lying wholly inside
+            // a pre-existing hole of EITHER trimmed face bounds void, not
+            // material — it must not split either operand's face. Filtering
+            // here (rather than one-sided in `split_face_by_curves`) keeps
+            // the cutter from being partitioned along phantom plane events.
+            drop_pair_curves_in_preexisting_holes(model, &mut intersection);
+            if intersection.curves.is_empty()
+                && intersection.coplanar_curves_a.is_empty()
+                && intersection.coplanar_curves_b.is_empty()
+            {
+                continue;
+            }
             entry.1 += intersection.curves.len(); // curves produced
             intersections.push(intersection);
         }
@@ -6688,83 +6700,15 @@ fn split_face_by_curves(
     // and the annular caps that trigger the bug are planar. Curved faces
     // route through the sphere/cone/cylinder/torus splitters below, which
     // must see every cut.
-    let preexisting_hole_filter: Option<(Point3, Vector3, Vector3, Vec<Vec<(f64, f64)>>)> = {
-        let is_planar = model
-            .surfaces
-            .get(surface_id)
-            .map(|s| {
-                matches!(
-                    s.surface_type(),
-                    crate::primitives::surface::SurfaceType::Plane
-                )
-            })
-            .unwrap_or(false);
-        let inner_edge_lists: Vec<Vec<EdgeId>> = match model.faces.get(face_id) {
-            Some(face) if is_planar => face
-                .inner_loops
-                .iter()
-                .filter_map(|&lid| model.loops.get(lid).map(|l| l.edges.clone()))
-                .collect(),
-            _ => Vec::new(),
-        };
-        if inner_edge_lists.is_empty() {
-            None
-        } else {
-            let inner_verts_3d: Vec<Vec<Point3>> = inner_edge_lists
-                .iter()
-                .map(|edges| extract_cycle_vertices_3d(edges, model))
-                .collect();
-            // Tangent frame at the hole-vertex centroid (planar → the frame
-            // is constant over the face, so the anchor is immaterial). Same
-            // construction as partition_outer_and_pre_existing_hole_cycles.
-            let mut sx = 0.0f64;
-            let mut sy = 0.0f64;
-            let mut sz = 0.0f64;
-            let mut cnt = 0usize;
-            for v in inner_verts_3d.iter().flatten() {
-                sx += v.x;
-                sy += v.y;
-                sz += v.z;
-                cnt += 1;
-            }
-            let frame = if cnt == 0 {
-                None
-            } else {
-                let anchor = Point3::new(sx / cnt as f64, sy / cnt as f64, sz / cnt as f64);
-                model.surfaces.get(surface_id).and_then(|surface| {
-                    let tol = Tolerance::default();
-                    let (u0, v0) = surface.closest_point(&anchor, tol).ok()?;
-                    let sp = surface.evaluate_full(u0, v0).ok()?;
-                    let e1 = sp.du.normalize().ok()?;
-                    let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
-                    let e2 = dv_perp.normalize().ok()?;
-                    Some((sp.position, e1, e2))
-                })
-            };
-            frame
-                .map(|(origin, e1, e2)| {
-                    let polys: Vec<Vec<(f64, f64)>> = inner_verts_3d
-                        .iter()
-                        .map(|verts| {
-                            verts
-                                .iter()
-                                .map(|p| {
-                                    let d = Vector3::new(
-                                        p.x - origin.x,
-                                        p.y - origin.y,
-                                        p.z - origin.z,
-                                    );
-                                    (d.dot(&e1), d.dot(&e2))
-                                })
-                                .collect::<Vec<(f64, f64)>>()
-                        })
-                        .filter(|poly| poly.len() >= 3)
-                        .collect();
-                    (origin, e1, e2, polys)
-                })
-                .filter(|(_, _, _, polys)| !polys.is_empty())
-        }
-    };
+    //
+    // The hole polygons are DENSIFIED (arc-following, shared helper with the
+    // #35 fragment-level filter and the pair-level curve filter): a hole
+    // bounded by a few circular arcs must be followed along the arcs, not
+    // reduced to its inscribed chord polygon — the chord polygon's incircle
+    // can be half the hole radius, so an in-hole cut wrongly classified as
+    // crossing material (the D-2 overlapping-boss phantom split plane).
+    let preexisting_hole_filter: Option<(Point3, Vector3, Vector3, Vec<Vec<(f64, f64)>>)> =
+        planar_face_hole_polygons(model, face_id);
 
     // Add splitting curves to graph
     let mut active_cut_count = 0usize;
@@ -7335,7 +7279,7 @@ fn split_face_by_curves(
     // faces (sphere/cone/cylinder/torus) return early via their dedicated
     // splitters above and never reach this code, so the closed-surface guard is
     // preserved — no periodic face is ever coalesced or dropped by this pass.
-    let void_fragment = void_fragments_in_preexisting_holes(&loops, model, surface_id, face_id);
+    let void_fragment = void_fragments_in_preexisting_holes(&loops, model, face_id);
 
     // Create split faces from loops
     let mut split_faces = Vec::new();
@@ -7360,64 +7304,47 @@ fn split_face_by_curves(
     Ok(split_faces)
 }
 
-/// Identify arrangement fragments that bound a pre-existing hole's VOID rather
-/// than material — the void slivers produced when a coplanar imprint outline
-/// crosses a pre-existing inner loop (#35 overlapping-loop superset).
+/// Densified (arc-following) PRE-EXISTING-HOLE polygons of a PLANAR face,
+/// projected into the face plane's tangent frame.
 ///
-/// Returns a `Vec<bool>` aligned with `loops`; `true` marks a fragment to drop.
-/// A fragment is a void sliver when it lies ENTIRELY within one of `face_id`'s
-/// pre-existing inner loops on this planar surface (every boundary-edge midpoint
-/// projects inside the hole — its rim arcs sit on the hole boundary, its imprint
-/// chords cut across the hole's interior).
+/// Shared foundation of the three void filters (pair-level curve filter,
+/// #27 cut-level filter, #35 fragment-level filter): each edge of every
+/// pre-existing inner loop is sampled at several interior parameters in walk
+/// order — not just the shared endpoints — so an arc-bounded hole (e.g. a
+/// circular bore rim split into 3 arcs) is followed faithfully instead of
+/// being reduced to its inscribed chord polygon. The chord polygon of a
+/// 3-arc circle is the inscribed triangle whose incircle is HALF the hole
+/// radius, so containment against it wrongly reports an in-hole curve as
+/// crossing material (the D-2 overlapping-boss phantom split plane).
 ///
-/// Scoped to PLANAR source faces carrying pre-existing inner loops. For any
-/// other face (no holes, or a curved analytic surface — which never reaches
-/// this code path anyway) the result is all-`false`: a no-op. The hole polygons
-/// are densified (arc-following) so a few-arc circular bore rim is matched
-/// faithfully (same #35/#85b lineage as the merge/partition containment tests).
-fn void_fragments_in_preexisting_holes(
-    loops: &[Vec<(EdgeId, bool)>],
+/// Returns `(origin, e1, e2, polygons)` — the projection frame plus one 2D
+/// polygon per hole — or `None` when the face is not planar, carries no
+/// pre-existing inner loops, or any topology/geometry lookup fails, so every
+/// caller falls back safely to "no filter".
+fn planar_face_hole_polygons(
     model: &BRepModel,
-    surface_id: SurfaceId,
     face_id: FaceId,
-) -> Vec<bool> {
-    let n = loops.len();
-    let none = vec![false; n];
-    if n == 0 {
-        return none;
+) -> Option<(Point3, Vector3, Vector3, Vec<Vec<(f64, f64)>>)> {
+    let face = model.faces.get(face_id)?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    if !matches!(
+        surface.surface_type(),
+        crate::primitives::surface::SurfaceType::Plane
+    ) {
+        return None;
     }
-
-    // Planar gate: the hole polygon projects exactly into the face's plane.
-    let is_planar = model
-        .surfaces
-        .get(surface_id)
-        .map(|s| {
-            matches!(
-                s.surface_type(),
-                crate::primitives::surface::SurfaceType::Plane
-            )
-        })
-        .unwrap_or(false);
-    if !is_planar {
-        return none;
-    }
-
-    // Source face's pre-existing inner loops (holes from a prior boolean).
-    let inner_edge_lists: Vec<Vec<EdgeId>> = match model.faces.get(face_id) {
-        Some(face) => face
-            .inner_loops
-            .iter()
-            .filter_map(|&lid| model.loops.get(lid).map(|l| l.edges.clone()))
-            .collect(),
-        None => return none,
-    };
+    let inner_edge_lists: Vec<Vec<EdgeId>> = face
+        .inner_loops
+        .iter()
+        .filter_map(|&lid| model.loops.get(lid).map(|l| l.edges.clone()))
+        .collect();
     if inner_edge_lists.is_empty() {
-        return none;
+        return None;
     }
 
-    // Tangent frame at the hole-vertex centroid (planar → constant over the
-    // face; same construction as the cut-level `preexisting_hole_filter` and
-    // `partition_outer_and_pre_existing_hole_cycles`).
+    // Tangent frame at the hole-vertex centroid (planar → the frame is
+    // constant over the face, so the anchor is immaterial; same construction
+    // as `partition_outer_and_pre_existing_hole_cycles`).
     let inner_verts_3d: Vec<Vec<Point3>> = inner_edge_lists
         .iter()
         .map(|edges| extract_cycle_vertices_3d(edges, model))
@@ -7430,30 +7357,15 @@ fn void_fragments_in_preexisting_holes(
         cnt += 1;
     }
     if cnt == 0 {
-        return none;
+        return None;
     }
     let anchor = Point3::new(sx / cnt as f64, sy / cnt as f64, sz / cnt as f64);
-    let Some(surface) = model.surfaces.get(surface_id) else {
-        return none;
-    };
-    let Ok((u0, v0)) = surface.closest_point(&anchor, Tolerance::default()) else {
-        return none;
-    };
-    let Ok(sp) = surface.evaluate_full(u0, v0) else {
-        return none;
-    };
-    let Ok(e1) = sp.du.normalize() else {
-        return none;
-    };
+    let (u0, v0) = surface.closest_point(&anchor, Tolerance::default()).ok()?;
+    let sp = surface.evaluate_full(u0, v0).ok()?;
+    let e1 = sp.du.normalize().ok()?;
     let dv_perp = sp.dv - e1 * sp.dv.dot(&e1);
-    let Ok(e2) = dv_perp.normalize() else {
-        return none;
-    };
+    let e2 = dv_perp.normalize().ok()?;
     let origin = sp.position;
-    let project = |p: &Point3| -> (f64, f64) {
-        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
-        (d.dot(&e1), d.dot(&e2))
-    };
 
     // Densified (arc-following) hole polygons.
     const SAMPLES: usize = 8;
@@ -7473,7 +7385,8 @@ fn void_fragments_in_preexisting_holes(
                     let f = k as f64 / SAMPLES as f64;
                     let t = a + (b - a) * f;
                     if let Ok(p) = curve.point_at(t) {
-                        poly.push(project(&p));
+                        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                        poly.push((d.dot(&e1), d.dot(&e2)));
                     }
                 }
             }
@@ -7482,8 +7395,113 @@ fn void_fragments_in_preexisting_holes(
         .filter(|poly| poly.len() >= 3)
         .collect();
     if hole_polys.is_empty() {
+        return None;
+    }
+    Some((origin, e1, e2, hole_polys))
+}
+
+/// Pair-level void-intersection filter (D-2 overlapping-boss coaxial bore;
+/// the #27 void-cut family applied at its SOURCE).
+///
+/// `intersect_faces` computes SURFACE-level meet curves; a curve lying
+/// entirely inside a PRE-EXISTING hole of either trimmed face is not a model
+/// intersection at all — the hole is not material. Such phantom curves arise
+/// whenever a prior boolean fragmented a region into ring + disk (the
+/// coplanar-merge output): a coaxial cutter then meets the ring face's PLANE
+/// inside the ring's hole, and every z-plane of the target stack repeats the
+/// phantom.
+///
+/// Crucially, `split_faces_along_curves` routes a pair's `curves` to BOTH
+/// faces, so the one-sided cut-level drop (#27, inside
+/// `split_face_by_curves`) is not enough: the planar face correctly skips
+/// the void cut, but the OTHER operand — e.g. the cutter's lateral — is
+/// still split along the phantom plane event. That mis-selects the cutter's
+/// split planes: the out-of-solid skirt below the target is kept (its cap
+/// rim left unpaired), the wall splits at a z-plane the bore never crosses,
+/// and a coplanar-fragmented bottom feeds the SAME rim circle twice
+/// (ring-pair + disk-pair), duplicating coincident cut edges that corrupt
+/// the cylinder arrangement (3-face fans, χ = −34). Dropping the curve at
+/// the PAIR level keeps both operands consistent.
+///
+/// Only the transverse `curves` are filtered. The coplanar per-face imprint
+/// cuts (`coplanar_curves_a/b`) are boundary segments of the OTHER face with
+/// their own containment handling downstream, and a curve merely CROSSING a
+/// hole keeps samples outside it, so it is retained and left to the DCEL
+/// arrangement — same conservative criterion as the cut-level filter.
+fn drop_pair_curves_in_preexisting_holes(model: &BRepModel, fi: &mut FaceIntersection) {
+    if fi.curves.is_empty() {
+        return;
+    }
+    for face_id in [fi.face_a_id, fi.face_b_id] {
+        let Some((origin, e1, e2, hole_polys)) = planar_face_hole_polygons(model, face_id) else {
+            continue;
+        };
+        fi.curves.retain(|ic| {
+            let Some(curve) = model.curves.get(ic.curve_id) else {
+                return true;
+            };
+            const SAMPLES: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
+            let in_hole = hole_polys.iter().any(|poly| {
+                SAMPLES.iter().all(|&t| match curve.evaluate(t) {
+                    Ok(cp) => {
+                        let p = cp.position;
+                        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+                        point_in_polygon_2d(d.dot(&e1), d.dot(&e2), poly)
+                    }
+                    Err(_) => false,
+                })
+            });
+            if in_hole && pipeline_trace_enabled() {
+                eprintln!(
+                    "[bool]   pair-void filter: curve={:?} lies inside a pre-existing hole of face={:?} — dropped for BOTH operands",
+                    ic.curve_id, face_id
+                );
+            }
+            !in_hole
+        });
+        if fi.curves.is_empty() {
+            return;
+        }
+    }
+}
+
+/// Identify arrangement fragments that bound a pre-existing hole's VOID rather
+/// than material — the void slivers produced when a coplanar imprint outline
+/// crosses a pre-existing inner loop (#35 overlapping-loop superset).
+///
+/// Returns a `Vec<bool>` aligned with `loops`; `true` marks a fragment to drop.
+/// A fragment is a void sliver when it lies ENTIRELY within one of `face_id`'s
+/// pre-existing inner loops on this planar surface (every boundary-edge midpoint
+/// projects inside the hole — its rim arcs sit on the hole boundary, its imprint
+/// chords cut across the hole's interior).
+///
+/// Scoped to PLANAR source faces carrying pre-existing inner loops. For any
+/// other face (no holes, or a curved analytic surface — which never reaches
+/// this code path anyway) the result is all-`false`: a no-op. The hole polygons
+/// are densified (arc-following) so a few-arc circular bore rim is matched
+/// faithfully (same #35/#85b lineage as the merge/partition containment tests).
+fn void_fragments_in_preexisting_holes(
+    loops: &[Vec<(EdgeId, bool)>],
+    model: &BRepModel,
+    face_id: FaceId,
+) -> Vec<bool> {
+    let n = loops.len();
+    let none = vec![false; n];
+    if n == 0 {
         return none;
     }
+
+    // Planar gate + tangent frame + densified (arc-following) hole polygons —
+    // shared helper with the #27 cut-level filter and the pair-level curve
+    // filter. `None` ⇒ not planar / no pre-existing holes / lookup failure ⇒
+    // nothing to drop.
+    let Some((origin, e1, e2, hole_polys)) = planar_face_hole_polygons(model, face_id) else {
+        return none;
+    };
+    let project = |p: &Point3| -> (f64, f64) {
+        let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        (d.dot(&e1), d.dot(&e2))
+    };
 
     // A fragment is a void sliver when it lies ENTIRELY within a pre-existing
     // hole — its outer boundary is composed only of the hole's rim arcs and of
