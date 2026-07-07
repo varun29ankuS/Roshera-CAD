@@ -7321,6 +7321,11 @@ fn split_face_by_curves(
 /// polygon per hole — or `None` when the face is not planar, carries no
 /// pre-existing inner loops, or any topology/geometry lookup fails, so every
 /// caller falls back safely to "no filter".
+// NOTE (review D-2 finding 1): the per-edge sampling loop (k in 0..SAMPLES)
+// intentionally skips each edge's terminal parameter — consecutive edges
+// share it — but the hole's LAST edge therefore contributes no terminal
+// vertex (24 pts for a 3-arc rim, not 25). Functionally safe at SAMPLES=8;
+// fold into the banked adaptive-densifier ticket if tightened.
 fn planar_face_hole_polygons(
     model: &BRepModel,
     face_id: FaceId,
@@ -7428,6 +7433,12 @@ fn planar_face_hole_polygons(
 /// their own containment handling downstream, and a curve merely CROSSING a
 /// hole keeps samples outside it, so it is retained and left to the DCEL
 /// arrangement — same conservative criterion as the cut-level filter.
+// LIMITATION (#32 same-domain-unify): a cutter rim that CROSSES the
+// ring/disk seam of a fragmented coplanar face is NOT filtered here —
+// neither face's hole wholly contains the curve, so BOTH bottom-face
+// pairs emit the full circle and the cutter receives duplicate coincident
+// cuts (same 3-face-fan corruption class, silent). Resolving coincident
+// coplanar fragments as one domain is the #32 campaign's charter.
 fn drop_pair_curves_in_preexisting_holes(model: &BRepModel, fi: &mut FaceIntersection) {
     if fi.curves.is_empty() {
         return;

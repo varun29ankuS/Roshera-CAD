@@ -365,6 +365,10 @@ fn f5_taller_upstand_coincident_l_bracket_is_sound() {
 //       out-of-solid piece z<0 is kept with its base-cap rim as boundary;
 //   (b) chordized rim — the r8 imprint on the coplanar bottom disk face
 //       comes out as straight polygon-clip CHORDS instead of the analytic
+//       NOTE (D-2): defect (b) did NOT reproduce at HEAD — the rim already
+//       imprinted as analytic Circle arcs even in the RED run; the live
+//       chord observation was a stale-binary artifact. The pin below is a
+//       permanent REGRESSION GUARD for the class, not a fix witness.
 //       circle, so the planar rim can never pair with the cutter wall's
 //       circular rim → unpaired rims, 3-face fans, χ=−34.
 // The stacked-boss fixtures never see this (no overlap volume → no coplanar
