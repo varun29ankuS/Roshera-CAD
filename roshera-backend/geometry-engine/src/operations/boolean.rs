@@ -8431,14 +8431,17 @@ fn compute_split_face_interior_points(
             // their `closest_point` is closed-form and reliable, so the
             // round-trip never false-rejects there.
             //
-            // The ONLY exemption is the CONE: its `closest_point` is a
-            // grid-search that is ill-conditioned near the apex and FALSE-
+            // The ONLY exemption is the CONE: its `closest_point` is an
+            // AXIAL projection whose error is amplified by ~1/cos(half-angle)
+            // and is ill-conditioned at the apex, so the round-trip FALSE-
             // REJECTS genuinely on-surface points (the cone_corner_gate
             // regression, 6c51a1a — intersection retained ~8× extra cone-
             // wall fragments). The cone's tangent-plane candidates are
-            // accepted unconditionally; if a folded cone loop ever produces
-            // an off-surface candidate the boundary-centroid fallback still
-            // applies downstream. Planar faces never reach this block (the
+            // accepted unconditionally — NOTE this means a hypothetical
+            // folded cone-lateral loop would have its candidate USED, not
+            // fall back to the boundary centroid (accept=true bypasses the
+            // fallback); that exposure equals the pre-6c51a1a baseline and
+            // has no known repro. Planar faces never reach this block (the
             // is_planar short-circuit above returns earlier).
             let guard_unreliable = matches!(surface.surface_type(), SurfaceType::Cone);
             let accept = if guard_unreliable {
