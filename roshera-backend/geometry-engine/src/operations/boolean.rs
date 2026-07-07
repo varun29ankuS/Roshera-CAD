@@ -8416,42 +8416,34 @@ fn compute_split_face_interior_points(
         if let Some((u, v)) = found {
             let p = Vector3::new(origin.x, origin.y, origin.z) + e1 * u + e2 * v;
             let candidate = Point3::new(p.x, p.y, p.z);
-            // ON-SURFACE GUARD — FREEFORM ONLY. The flat tangent-plane
-            // projection is exact for PLANE and well-conditioned for all
-            // analytic surfaces (cylinder, sphere, cone, torus): the surface
-            // is geometrically simple, `closest_point` is closed-form, and a
-            // loop on an analytic face never folds back over itself in the
-            // tangent plane, so the nudged candidate is always genuinely on
-            // the surface. Applying the round-trip check to analytic surfaces
-            // is therefore harmless in the happy path but catastrophic in the
-            // ill-conditioned near-apex / tight-arc corner case: the grid-
-            // search `closest_point` fails the round-trip for genuinely on-
-            // surface points (the cone_corner_gate regression, 6c51a1a), the
-            // fallback boundary centroid classifies against the wrong material,
-            // and the intersection retains ~8× extra cone-wall fragments.
-            //
-            // For FREEFORM surfaces (NURBS/BSpline/Ruled/SurfaceOfRevolution/
-            // Offset) the guard IS needed: a loop wrapping the whole lateral
+            // ON-SURFACE GUARD — CONE-EXEMPT. The round-trip check
+            // (closest_point → point_at → distance) protects against the
+            // FOLDED-FLATTENING failure: a loop wrapping a lateral surface
             // folds its flattened polygon back over itself, the nudged point
-            // can land on the far fold, and |xy| ≫ r → wrong-material
-            // classification (the w03 through-slot barrel case). The residual-
-            // weld pass (`weld_imprint_residual_vertices`) already carries an
-            // identical freeform gate for the same reason.
+            // can land on the far fold, and the back-projected candidate sits
+            // OFF the surface → wrong-material classification. This fold
+            // happens on ANY wrapping lateral — freeform barrels (the w03
+            // through-slot case) AND analytic cylinders (the box∪cyl
+            // conquered-band regression: r=0.5 lateral loop folds exactly
+            // like the freeform barrel, the unchecked candidate classified
+            // wrong, and the union produced NO result solid). So the guard
+            // must stay ON for every wrapping surface, analytic or freeform;
+            // their `closest_point` is closed-form and reliable, so the
+            // round-trip never false-rejects there.
             //
-            // Analytic surfaces classify interior points exactly; no guard
-            // required. Planar faces always passed the old check; they still
-            // skip it (the `is_planar` short-circuit above returns `continue`
-            // before this block for simple loops, and the tangent-plane is
-            // exact anyway).
-            let is_freeform = matches!(
-                surface.surface_type(),
-                SurfaceType::NURBS
-                    | SurfaceType::BSpline
-                    | SurfaceType::Ruled
-                    | SurfaceType::SurfaceOfRevolution
-                    | SurfaceType::Offset
-            );
-            let accept = if is_freeform {
+            // The ONLY exemption is the CONE: its `closest_point` is a
+            // grid-search that is ill-conditioned near the apex and FALSE-
+            // REJECTS genuinely on-surface points (the cone_corner_gate
+            // regression, 6c51a1a — intersection retained ~8× extra cone-
+            // wall fragments). The cone's tangent-plane candidates are
+            // accepted unconditionally; if a folded cone loop ever produces
+            // an off-surface candidate the boundary-centroid fallback still
+            // applies downstream. Planar faces never reach this block (the
+            // is_planar short-circuit above returns earlier).
+            let guard_unreliable = matches!(surface.surface_type(), SurfaceType::Cone);
+            let accept = if guard_unreliable {
+                true
+            } else {
                 match surface.closest_point(&candidate, tol) {
                     Ok((cu, cv)) => match surface.point_at(cu, cv) {
                         Ok(foot) => (foot - candidate).magnitude() <= tol.distance().max(1.0e-6),
@@ -8459,9 +8451,6 @@ fn compute_split_face_interior_points(
                     },
                     Err(_) => false,
                 }
-            } else {
-                // Analytic surface: tangent-plane projection is always valid.
-                true
             };
             if accept {
                 result[i] = Some(candidate);
