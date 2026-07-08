@@ -4620,6 +4620,116 @@ pub struct GeneralNurbsSurface {
     pub nurbs: crate::math::nurbs::NurbsSurface,
 }
 
+impl GeneralNurbsSurface {
+    /// Robust unit surface normal that survives a **collapsed control
+    /// row/column** — a degenerate parametric pole where one parametric
+    /// derivative vanishes so `du × dv` is ill-conditioned or exactly zero.
+    /// The mixed-corner cap patch (`operations/fillet.rs`) has such a pole:
+    /// its `u = u_max` row collapses to a single apex point, so `dv ≡ 0`
+    /// there and the naive `du × dv` normal is `0` — `evaluate_full` returns
+    /// `Err(DivisionByZero)` (the harness oracle then reads a spurious normal
+    /// on the apex-adjacent facets, or hides them as "unresolvable").
+    ///
+    /// At a well-conditioned `(u, v)` this returns EXACTLY `(du × dv)`
+    /// normalised — identical to `evaluate_full`'s normal, so every
+    /// non-degenerate query is unchanged. At a pole it retreats whichever
+    /// parameter sits on a domain boundary a minimal amount toward the
+    /// interior and returns the LIMITING tangent-plane normal (the surface
+    /// normal is continuous up to the pole). Deterministic and bounded: at
+    /// most `RETREAT_STEPS` evaluations, then a stable control-net fallback —
+    /// it never loops, never panics, never divides by zero.
+    fn robust_normal(&self, u: f64, v: f64) -> MathResult<Vector3> {
+        // Below this the `du × dv` cross is treated as degenerate.
+        const DEGEN: f64 = 1e-9;
+        // Minimal inward retreat as a fraction of span, doubling each step.
+        const BASE_FRAC: f64 = 1.0e-4;
+        const RETREAT_STEPS: i32 = 30;
+
+        let ((umin, umax), (vmin, vmax)) = self.parameter_bounds();
+        let span_u = (umax - umin).max(f64::EPSILON);
+        let span_v = (vmax - vmin).max(f64::EPSILON);
+
+        // Primary: the exact `du × dv` normal. This is the ONLY path taken by
+        // a well-conditioned point (the overwhelming majority of queries).
+        let e = self.nurbs.evaluate_derivatives(u, v, 1, 1);
+        if let (Some(du), Some(dv)) = (e.du, e.dv) {
+            let n = du.cross(&dv);
+            if n.magnitude() > DEGEN {
+                return n.normalize();
+            }
+        }
+
+        // Degenerate pole. Push whichever parameter is ON a domain boundary
+        // inward (that is the collapsed direction); if the point is interior
+        // yet still degenerate, nudge both toward the domain centre. The
+        // retreat starts minimal so the limiting normal is faithful, and
+        // grows geometrically so a degeneracy that occupies a band is still
+        // escaped within the bounded step budget.
+        let bnd = 1.0e-9;
+        let du_dir: f64 = if (u - umin).abs() <= bnd * (1.0 + span_u) {
+            1.0
+        } else if (umax - u).abs() <= bnd * (1.0 + span_u) {
+            -1.0
+        } else {
+            0.0
+        };
+        let dv_dir: f64 = if (v - vmin).abs() <= bnd * (1.0 + span_v) {
+            1.0
+        } else if (vmax - v).abs() <= bnd * (1.0 + span_v) {
+            -1.0
+        } else {
+            0.0
+        };
+        let cu = 0.5 * (umin + umax);
+        let cv = 0.5 * (vmin + vmax);
+        for k in 0..RETREAT_STEPS {
+            let frac = (BASE_FRAC * 2.0f64.powi(k)).min(1.0);
+            let (uu, vv) = if du_dir != 0.0 || dv_dir != 0.0 {
+                (
+                    if du_dir != 0.0 {
+                        u + du_dir * frac * span_u
+                    } else {
+                        u
+                    },
+                    if dv_dir != 0.0 {
+                        v + dv_dir * frac * span_v
+                    } else {
+                        v
+                    },
+                )
+            } else {
+                (u + (cu - u) * frac, v + (cv - v) * frac)
+            };
+            let uu = uu.clamp(umin, umax);
+            let vv = vv.clamp(vmin, vmax);
+            let e2 = self.nurbs.evaluate_derivatives(uu, vv, 1, 1);
+            if let (Some(du), Some(dv)) = (e2.du, e2.dv) {
+                let n = du.cross(&dv);
+                if n.magnitude() > DEGEN {
+                    return n.normalize();
+                }
+            }
+        }
+
+        // Deterministic fallback (reached only for a wholly degenerate net):
+        // the first well-formed control-net facet normal. Never panics.
+        let cp = &self.nurbs.control_points;
+        for row in cp.windows(2) {
+            let (r0, r1) = (&row[0], &row[1]);
+            let cols = r0.len().min(r1.len());
+            for j in 0..cols.saturating_sub(1) {
+                let e_u = r1[j] - r0[j];
+                let e_v = r0[j + 1] - r0[j];
+                let n = e_u.cross(&e_v);
+                if n.magnitude() > DEGEN {
+                    return n.normalize();
+                }
+            }
+        }
+        Err(MathError::DivisionByZero)
+    }
+}
+
 impl Surface for GeneralNurbsSurface {
     fn surface_type(&self) -> SurfaceType {
         SurfaceType::NURBS
@@ -4713,6 +4823,14 @@ impl Surface for GeneralNurbsSurface {
 
     fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
         self.nurbs.parameter_bounds()
+    }
+
+    /// Degeneracy-robust normal. Identical to the default (`du × dv`
+    /// normalised) at a well-conditioned point, but returns the LIMITING
+    /// normal at a collapsed control row/column (a parametric pole) instead
+    /// of `Err(DivisionByZero)`. See [`GeneralNurbsSurface::robust_normal`].
+    fn normal_at(&self, u: f64, v: f64) -> MathResult<Vector3> {
+        self.robust_normal(u, v)
     }
 
     fn is_closed_u(&self) -> bool {
@@ -4836,12 +4954,22 @@ impl Surface for GeneralNurbsSurface {
 
     #[allow(non_snake_case)] // E, F, G are standard First Fundamental Form names
     fn closest_point(&self, point: &Point3, tolerance: Tolerance) -> MathResult<(f64, f64)> {
-        // Use Newton-Raphson iteration to find closest point
+        // Newton-Raphson footpoint. CRITICAL: this uses the derivative-only
+        // evaluator (`evaluate_derivatives`, position + du + dv), NOT
+        // `evaluate_full` — on a collapsed control row (the mixed-corner cap's
+        // `u = u_max` apex) `evaluate_full` computes `du × dv` and returns
+        // `Err(DivisionByZero)`, which previously aborted the whole search and
+        // hid every apex-adjacent facet from the tessellation-soundness oracle.
+        // The footpoint needs only position and the two tangents, none of which
+        // is singular at the pole, so the search now converges to the apex row
+        // instead of erroring out.
         let (u_bounds, v_bounds) = self.parameter_bounds();
         let (u_min, u_max) = u_bounds;
         let (v_min, v_max) = v_bounds;
 
-        // Initial guess - use parameter space grid search
+        // Initial guess — parameter-space grid search. `evaluate` (order 0) is
+        // position-only and never fails on the degenerate row, so the seed grid
+        // can consider the apex region too.
         let samples = 10;
         let mut best_dist = f64::INFINITY;
         let mut best_u = (u_min + u_max) * 0.5;
@@ -4851,39 +4979,42 @@ impl Surface for GeneralNurbsSurface {
             let u = u_min + (u_max - u_min) * (i as f64) / (samples as f64);
             for j in 0..=samples {
                 let v = v_min + (v_max - v_min) * (j as f64) / (samples as f64);
-                if let Ok(p) = self.point_at(u, v) {
-                    let dist = point.distance(&p);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_u = u;
-                        best_v = v;
-                    }
+                let p = self.nurbs.evaluate(u, v).point;
+                let dist = point.distance(&p);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_u = u;
+                    best_v = v;
                 }
             }
         }
 
-        // Newton-Raphson refinement
+        // Newton-Raphson refinement.
         let mut u = best_u;
         let mut v = best_v;
         let max_iter = 20;
         let tol = tolerance.distance();
 
         for _ in 0..max_iter {
-            let eval = self.evaluate_full(u, v)?;
-            let diff = eval.position - *point;
+            let eval = self.nurbs.evaluate_derivatives(u, v, 1, 1);
+            let diff = eval.point - *point;
 
             // Check convergence
             if diff.magnitude() < tol {
                 break;
             }
 
-            // Compute Newton step
-            let dot_du = diff.dot(&eval.du);
-            let dot_dv = diff.dot(&eval.dv);
+            let (Some(du), Some(dv)) = (eval.du, eval.dv) else {
+                break;
+            };
 
-            let E = eval.du.dot(&eval.du);
-            let F = eval.du.dot(&eval.dv);
-            let G = eval.dv.dot(&eval.dv);
+            // Compute Newton step
+            let dot_du = diff.dot(&du);
+            let dot_dv = diff.dot(&dv);
+
+            let E = du.dot(&du);
+            let F = du.dot(&dv);
+            let G = dv.dot(&dv);
 
             let det = E * G - F * F;
             if det.abs() > 1e-10 {
