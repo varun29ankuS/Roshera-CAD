@@ -213,23 +213,38 @@ fn f1b_coincident_bottom_over_bore_is_broken() {
 //
 // A horizontal (axis +X) cylinder whose CURVED LATERAL crosses the L-bracket's
 // base top (z=4) and the upright's inner wall — the curved↔planar SSI must be
-// corefined into both planar faces. The deep #17 family.
+// corefined into both planar faces.
+//
+// FIXED by #32 Phase B (per-face coincident-curve dedup, `split_faces_along_
+// curves`). The cylinder lateral crossing two planar walls emitted the SAME cut
+// curve TWICE onto each wall face (faces 27/28, curves 50 ≡ 55 dropped) — the
+// duplicate-coincident-cut class. Those coincident cut edges were the
+// "unshared" boundary edges that left the union open (baseline: sound=false,
+// bnd=593). The dedup collapses each duplicate to one edge, and the weld now
+// closes CLEANLY: sound=true, watertight, manifold, euler=2 (genus-0). This is
+// a welcome generalisation of the straddling-rim fix into the #17 curved-
+// corefinement family — NOT a fixture-shaped tweak. GUARD: if this ever flips
+// back to broken, the #32 Phase B dedup regressed. (See
+// `.superpowers/sdd/dogfood-task-32b-report.md`.)
 #[test]
-fn f2_curved_union_is_broken() {
+fn f2_curved_union_is_sound() {
     let mut m = BRepModel::new();
     let bracket = l_bracket(&mut m);
     assert_operand_sound(&mut m, bracket, "f2 bracket operand");
     let boss = cylinder(&mut m, Point3::new(-25.0, 8.0, 4.0), Vector3::X, 6.0, 30.0);
     assert_operand_sound(&mut m, boss, "f2 boss operand");
     let r = union(&mut m, bracket, boss);
-    let (sound, bnd, _nm, _euler) = metrics(&mut m, r, "f2 curved-union");
-    // FIXME(#F2 / #17): a cylinder lateral crossing two planar walls — the
-    // plane↔cylinder SSI/corefinement leaves the cut edges unshared between
-    // operands (boundary edges, watertight=false). The deep curved-corefinement
-    // family — see memory `nurbs-corefinement-17`. (Ranked: deepest; needs a
-    // focused human-guided session, NOT a blind fix.)
-    assert!(!sound, "f2: expected BROKEN (kernel flagged it)");
-    assert!(bnd > 0, "f2: expected mesh boundary edges (not watertight)");
+    let (sound, bnd, nm, euler) = metrics(&mut m, r, "f2 curved-union");
+    assert!(
+        sound,
+        "f2: cylinder-lateral ∪ L-bracket must be sound (#32 Phase B duplicate-cut dedup)"
+    );
+    assert_eq!(
+        bnd, 0,
+        "f2: watertight — no unshared curved-corefinement edges"
+    );
+    assert_eq!(nm, 0, "f2: manifold — no duplicate coincident cut edges");
+    assert_eq!(euler, 2, "f2: clean genus-0 union");
 }
 
 // ───────── #3 partial-embed face-imprint: protruding pad ─────────
