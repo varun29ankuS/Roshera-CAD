@@ -4634,21 +4634,75 @@ pub(crate) fn apply_mixed_corner_single_patch_cap(
         wts[i] = w3;
     }
 
-    // The three cycle corners (a, b, c) = (P_ab.start, P_bc.start,
-    // P_ca.start). Patch layout mirrors apply_triangular_nurbs_corner:
-    //   v=0 row  : rim 0 (a → b)              = (a, T0, b)
-    //   v=1 row  : rim 1 reversed read for u=1 collapse
-    //   u=0 col  : rim 2 (c → a)
+    // Order the three rim edges into the cycle traversal a → b → c → a.
+    // `verify_cap_arcs_form_closed_triangle` fixes the cycle to START at
+    // input edge 0 (forward), but may visit the OTHER two edges in either
+    // input order: the edge incident to `b` comes second, the closing
+    // edge (c → a) third. Because the per-rim control triples `ctrl[..]`
+    // and weights `wts[..]` are indexed by INPUT order, the cap net must
+    // be read through this cycle permutation — NOT by raw input index.
+    //
+    // Reading `c = ctrl[1][2]` directly assumes input edge 1 is always the
+    // second cycle rim (b → c). When the caller happens to pass the two
+    // arc rims in the opposite order, input edge 1 is instead the CLOSING
+    // rim (c → a), so `ctrl[1][2]` evaluates to `a` — collapsing the
+    // patch's `u = 1` apex row onto corner `a` (the a ≡ c self-fold that
+    // makes the cap a non-injective, un-tessellatable surface). Indexing
+    // through `order` below makes the cap correct for any input rim order.
+    let traversal_ends = |i: usize| -> (VertexId, VertexId) {
+        // (leading, trailing) vertex of edge i under forwards[i].
+        let (s, e) = (ctrl_edge_endpoints[i].0, ctrl_edge_endpoints[i].1);
+        if forwards[i] {
+            (s, e)
+        } else {
+            (e, s)
+        }
+    };
+    let mut order = [0usize; 3];
+    let mut used = [false; 3];
+    order[0] = 0;
+    used[0] = true;
+    let mut trailing = traversal_ends(0).1;
+    for slot in 1..3 {
+        let mut picked = None;
+        for j in 0..3 {
+            if used[j] {
+                continue;
+            }
+            if traversal_ends(j).0 == trailing {
+                picked = Some(j);
+                break;
+            }
+        }
+        let j = picked.ok_or_else(|| {
+            OperationError::InvalidGeometry(
+                "apply_mixed_corner_single_patch_cap: cap rim edges do not chain into a cycle"
+                    .to_string(),
+            )
+        })?;
+        order[slot] = j;
+        used[j] = true;
+        trailing = traversal_ends(j).1;
+    }
+
+    // The three cycle corners (a, b, c), read through the permutation.
+    // Cycle rim 0 (input `order[0]`, always 0) runs a → b; cycle rim 1
+    // (`order[1]`) runs b → c; cycle rim 2 (`order[2]`) runs c → a. Patch
+    // layout mirrors apply_triangular_nurbs_corner:
+    //   v=0 row  : cycle rim 0 (a → b)         = (a, T0, b)
+    //   v=1 row  : cycle rim 1 (b → c) reversed read for u=1 collapse
+    //   u=0 col  : cycle rim 2 (c → a)
     //   u=1 col  : collapsed to corner c
-    let a = ctrl[0][0];
-    let b = ctrl[0][2];
-    let c = ctrl[1][2];
-    let t0 = ctrl[0][1];
-    let t1 = ctrl[1][1];
-    let t2 = ctrl[2][1];
-    let w0 = wts[0][1];
-    let w1 = wts[1][1];
-    let w2 = wts[2][1];
+    let (r0, r1, r2) = (order[0], order[1], order[2]);
+    let a = ctrl[r0][0];
+    let b = ctrl[r0][2];
+    let c = ctrl[r1][2];
+    let t0 = ctrl[r0][1];
+    let t1 = ctrl[r1][1];
+    let t2 = ctrl[r2][1];
+    let w0 = wts[r0][1];
+    let w1 = wts[r1][1];
+    let w2 = wts[r2][1];
     let _ = corners;
 
     let m_center = Point3::new(
@@ -4692,48 +4746,10 @@ pub(crate) fn apply_mixed_corner_single_patch_cap(
     )
     .unwrap_or(FaceOrientation::Forward);
 
-    // Order the three rim edges into a closed traversal cycle so the
-    // loop's consecutive edges share a vertex (brep-integrity requires a
-    // closed loop). `verify_cap_arcs_form_closed_triangle` gives a
-    // per-edge forward flag; walk from edge 0 picking, at each step, the
-    // remaining edge whose leading vertex (under its forward flag) equals
-    // the current trailing vertex.
-    let traversal_ends = |i: usize| -> (VertexId, VertexId) {
-        // (leading, trailing) vertex of edge i under forwards[i].
-        let (s, e) = (ctrl_edge_endpoints[i].0, ctrl_edge_endpoints[i].1);
-        if forwards[i] {
-            (s, e)
-        } else {
-            (e, s)
-        }
-    };
-    let mut order = [0usize; 3];
-    let mut used = [false; 3];
-    order[0] = 0;
-    used[0] = true;
-    let mut trailing = traversal_ends(0).1;
-    for slot in 1..3 {
-        let mut picked = None;
-        for j in 0..3 {
-            if used[j] {
-                continue;
-            }
-            if traversal_ends(j).0 == trailing {
-                picked = Some(j);
-                break;
-            }
-        }
-        let j = picked.ok_or_else(|| {
-            OperationError::InvalidGeometry(
-                "apply_mixed_corner_single_patch_cap: cap rim edges do not chain into a cycle"
-                    .to_string(),
-            )
-        })?;
-        order[slot] = j;
-        used[j] = true;
-        trailing = traversal_ends(j).1;
-    }
-
+    // The closed-loop traversal order (`order`, computed above from the
+    // same cycle chaining) also drives the boundary loop: consecutive
+    // edges must share a vertex (brep-integrity requires a closed loop),
+    // and `order` visits them in exactly that cycle sequence.
     let surface_id = model.surfaces.add(Box::new(corner_surface));
     let mut blend_loop = Loop::new(0, LoopType::Outer);
     for &i in &order {
