@@ -163,7 +163,6 @@ fn f7_coaxial_control_is_sound() {
 // through on one geometry.
 
 #[test]
-#[ignore = "#32 straddling-rim — Phase A diagnosis, see diag doc"]
 fn f7_straddling_offset_10_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 10.0);
@@ -178,7 +177,6 @@ fn f7_straddling_offset_10_is_sound() {
 }
 
 #[test]
-#[ignore = "#32 straddling-rim — Phase A diagnosis, see diag doc"]
 fn f7_straddling_offset_12_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 12.0);
