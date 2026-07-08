@@ -384,37 +384,144 @@ fn mixed_protocol_two_call_supported_path_still_passes() {
     );
 }
 
-/// BUG 1b (dogfood diagnosis §1b) — the SUPPORTED mixed-corner protocol
-/// closes topologically (watertight ∧ χ=2 ∧ selfint-free) but the FINAL
-/// solid still certifies `sound=false` from tessellation quality: the
-/// single rational cap patch and the retracted host faces mesh poorly
-/// (analytic-normal agreement collapses, a retracted host facet folds).
-/// This pins the honest target — a mixed-corner finalize must be
-/// tessellation-sound — and DUMPS the per-face breakdown for attribution.
+/// BUG 1b-4 root-cause witness — the mixed-corner cap NURBS patch must have
+/// THREE DISTINCT cycle corners. The retraction solves a non-degenerate
+/// inner triangle (P_12, K_1, K_2 pairwise ≈5.66 apart), so the single
+/// rational bi-quadratic cap's `v=0` row endpoints `(a, b)` and its
+/// collapsed `u=1` apex row `c` must all be distinct points.
 ///
-/// DEFERRED (`#[ignore]`) — NOT a live RED. The 1b probe
-/// (`.superpowers/sdd/dogfood-task-1b-report.md`) resolved the root cause
-/// to **Fork 3**: the analytic ground-truth measurement
-/// (`harness::watertight::analytic_facet_*` → `NurbsSurface::closest_point`
-/// → `normal_at`) is unreliable on the single COLLAPSED-APEX rational cap
-/// patch — it clamps facet centroids onto the degenerate boundaries
-/// (`u=1` apex row, `v=1` rim-to-apex) with reprojection error up to
-/// ~2.15 (≈ half the patch), so the sampled normal is 45–141° off the true
-/// local surface. ALL disagreements sit on those degenerate boundaries;
-/// there are ZERO interior disagreements, ruling out a genuine surface fold.
-/// The cap's `FaceOrientation` is also genuinely mis-picked (correct =
-/// `Backward`, area-majority 97.5%; the lone `(0.5,0.5)` sample lands on the
-/// `m_center` bulge and wrongly picks `Forward`), but flipping it reaches
-/// only analytic_agreement 0.975 (< MIN 0.999) and max_normal_deviation 45°
-/// (> MAX 40°) — necessary but NOT sufficient. Making this green needs
-/// either a singular-patch-robust analytic measurement or a cap rebuild
-/// (3-sub-patch, Task 3C) — a Varun-level decision. Ignored (not added to
-/// KNOWN_REDS) so the red-gate stays green while the pin stays in-tree;
-/// run with `--ignored` to reproduce the attribution dump.
+/// Pre-fix `apply_mixed_corner_single_patch_cap` read the per-rim control
+/// triples in raw INPUT order (`c = ctrl[1][2]`) while
+/// `verify_cap_arcs_form_closed_triangle` visits the two arc rims in the
+/// OPPOSITE cycle order for this repro (input edge 1 is the CLOSING rim
+/// c→a): `ctrl[1][2]` then evaluated to `a`, so the apex `c` collapsed
+/// exactly onto corner `a` (`|a − c| = 0`). That made the carrier a
+/// self-folding, un-tessellatable surface (117 off-surface facets, analytic
+/// agreement 0.774). The fix indexes the cap net through the cycle
+/// permutation `order`; this test fails on the pre-fix code (a ≡ c) and
+/// passes on the fixed code, and is the RED/GREEN witness for the
+/// construction fix (the full tessellation-soundness pin below stays
+/// deferred on the separable cap-mesh-quality residual).
 #[test]
-#[ignore = "BUG 1b Fork 3 — measurement unreliable on collapsed-apex cap patch; \
-            deferred to Task 3C (cap rebuild) / singular-patch-robust measurement. \
-            See .superpowers/sdd/dogfood-task-1b-report.md"]
+fn mixed_cap_patch_has_three_distinct_corners() {
+    use geometry_engine::primitives::surface::GeneralNurbsSurface;
+
+    let mut model = BRepModel::new();
+    let solid = make_box(&mut model);
+    let (e1, e2, corner) = adjacent_top_pair(&model);
+
+    fillet_edges(
+        &mut model,
+        solid,
+        vec![e1, e2],
+        fillet_opts(R, vec![corner]),
+    )
+    .expect("opt-in two-edge fillet (protocol call 1) must succeed");
+
+    let third: EdgeId = {
+        let mut found: Vec<EdgeId> = Vec::new();
+        for (eid, edge) in model.edges.iter() {
+            if edge.start_vertex == corner || edge.end_vertex == corner {
+                found.push(eid);
+            }
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly the vertical corner edge must remain; got {found:?}"
+        );
+        found[0]
+    };
+
+    chamfer_edges(&mut model, solid, vec![third], chamfer_opts(R))
+        .expect("opposite-kind finalize (protocol call 2) must succeed");
+
+    // Locate the mixed-corner cap face (the sole GeneralNurbsSurface) and
+    // read its control net.
+    let mut cap = None;
+    for (fid, face) in model.faces.iter() {
+        if let Some(surf) = model.surfaces.get(face.surface_id) {
+            if surf
+                .as_any()
+                .downcast_ref::<GeneralNurbsSurface>()
+                .is_some()
+            {
+                cap = Some(fid);
+            }
+        }
+    }
+    let cap = cap.expect("mixed corner must synthesize a NURBS cap face");
+    let face = model.faces.get(cap).expect("cap face stored");
+    let surf = model
+        .surfaces
+        .get(face.surface_id)
+        .expect("cap surface stored");
+    let gns = surf
+        .as_any()
+        .downcast_ref::<GeneralNurbsSurface>()
+        .expect("cap face carries a GeneralNurbsSurface");
+    let cp = &gns.nurbs.control_points;
+    assert_eq!(cp.len(), 3, "cap patch must be a 3-row bi-quadratic net");
+
+    // v=0 row = (a, T0, b); u=1 row = collapsed apex (c, c, c).
+    let a = cp[0][0];
+    let b = cp[0][2];
+    let c = cp[2][0];
+    let ac = (a - c).magnitude();
+    let bc = (b - c).magnitude();
+    let ab = (a - b).magnitude();
+    // The retracted triangle is ≈ equilateral with side ≈5.66; any healthy
+    // separation (well above dedup tolerance) proves the apex is a genuine
+    // distinct third corner, not collapsed onto a rim endpoint.
+    assert!(
+        ac > 1.0 && bc > 1.0 && ab > 1.0,
+        "mixed cap corners must be three DISTINCT points (pre-fix a ≡ c \
+         self-fold); got |a−c|={ac:.4} |b−c|={bc:.4} |a−b|={ab:.4} \
+         (a={a:?} b={b:?} c={c:?})"
+    );
+}
+
+/// BUG 1b (dogfood diagnosis §1b) — the SUPPORTED mixed-corner protocol
+/// closes topologically (watertight ∧ χ=2 ∧ selfint-free — pinned green by
+/// `mixed_protocol_two_call_supported_path_still_passes`) but the FINAL
+/// solid does not yet certify tessellation-sound. This pins the honest
+/// end target and DUMPS the per-face breakdown for attribution.
+///
+/// CORRECTED root cause (Task 1b-4,
+/// `.superpowers/sdd/dogfood-task-1b4-report.md`) — supersedes the Fork-3
+/// "measurement unreliable" and 1b-2/1b-3 "intrinsic self-fold /
+/// unreachable" framings. The a ≡ c coincidence those reports treated as
+/// intrinsic was a CONSTRUCTION BUG in `apply_mixed_corner_single_patch_cap`:
+/// the retraction solves a genuinely non-degenerate inner triangle
+/// (P_12, K_1, K_2 pairwise 5.66 apart, three distinct rim vertices) but
+/// the cap NURBS net read the per-rim control triples in raw INPUT order
+/// (`c = ctrl[1][2]`) while `verify_cap_arcs_form_closed_triangle` may
+/// visit the two arc rims in the opposite cycle order — when input edge 1
+/// is the CLOSING rim (c → a) not the second cycle rim (b → c),
+/// `ctrl[1][2]` read corner `a`, collapsing the apex onto `a`. That is now
+/// FIXED (index through the cycle permutation `order`); the self-fold is
+/// gone (off-surface facets 117 → 3, analytic agreement 0.774 → 0.994),
+/// pinned by `mixed_cap_patch_has_three_distinct_corners`.
+///
+/// STILL DEFERRED (`#[ignore]`): the RESIDUAL is now a separable
+/// cap-tessellation-quality problem, NOT a folded surface. The mixed cap
+/// is one collapsed-apex NURBS patch tessellated by the FLAT apex-fan
+/// (`tessellation/surface.rs::tessellate_corner_cap_apex_fan`), which
+/// chords across the patch curvature (~55° facet normal deviation > the
+/// 40° mesh gate) and seats a few apex-adjacent facet centroids off the
+/// surface, where `GeneralNurbsSurface::closest_point` clamps onto the
+/// collapsed `u=1` row and reads a spurious ~114° normal. Clearing the
+/// gate needs a boundary-conforming curvature-following cap mesh (the
+/// rim must stay the verbatim cache samples for watertight welding, so a
+/// naive param grid cracks) plus a singular-patch-robust `closest_point` /
+/// `normal_at` on the collapsed row — the "cap rebuild (Task 3C) /
+/// robust-measurement" work the reports flagged as Varun-level. Kept
+/// `#[ignore]`d (NOT in KNOWN_REDS) so the red-gate stays green; run with
+/// `--ignored` for the attribution dump.
+#[test]
+#[ignore = "BUG 1b — self-fold FIXED at construction (1b-4); residual is the \
+            separable flat-apex-fan cap-mesh quality + collapsed-apex \
+            closest_point measurement. See .superpowers/sdd/dogfood-task-1b4-report.md"]
 fn mixed_protocol_finalize_is_tessellation_sound() {
     let mut model = BRepModel::new();
     let solid = make_box(&mut model);
