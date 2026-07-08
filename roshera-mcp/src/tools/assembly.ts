@@ -139,12 +139,16 @@ export function registerAssemblyTools(server: McpServer) {
   server.tool(
     "assembly_add_instance",
     "Place an INSTANCE of an existing part into an assembly at a world pose " +
-      "(same part_id twice = two instances, no copy). Pose: `position` + " +
+      "(same object twice = two instances, no copy). Pose: `position` + " +
       "optional `rotation_deg` about `rotation_axis`, OR a raw row-major 4×4 " +
       "`transform`. Returns the instance id + assembly perception.",
     {
       assembly_id: z.string().describe("assembly id from assembly_create"),
-      part_id: z.number().int().describe("kernel part id from list_parts"),
+      object: z
+        .string()
+        .describe(
+          "the part's object_uuid (from a create_* response or boolean result) — same object twice = two instances",
+        ),
       position: z
         .array(z.number())
         .length(3)
@@ -170,7 +174,7 @@ export function registerAssemblyTools(server: McpServer) {
     },
     async ({
       assembly_id,
-      part_id,
+      object,
       position,
       rotation_deg,
       rotation_axis,
@@ -186,10 +190,12 @@ export function registerAssemblyTools(server: McpServer) {
             rotation_deg,
             rotation_axis as [number, number, number] | undefined,
           );
+        // Server keys assembly instances by the part's document UUID
+        // (`AddInstanceRequest.part_id: Uuid`), same handle as assembly_verify.
         const r = await api(
           "POST",
           `/api/assembly/${assembly_id}/instance`,
-          { part_id, transform: t, name, color },
+          { part_id: object, transform: t, name, color },
         );
         return ok(r);
       } catch (e) {
