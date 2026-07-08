@@ -4248,6 +4248,61 @@ fn split_faces_along_curves(
             .extend(intersection.coplanar_curves_b.iter().map(|c| c.curve_id));
     }
 
+    // #32 Phase B — straddling-rim coincident-curve dedup.
+    //
+    // When a prior boolean fragments a coplanar region into ring + disk faces
+    // (the 2C coplanar-merge output), a straddling cutter rim meets BOTH
+    // fragments' shared plane and each pair routes the SAME transverse circle
+    // onto the shared cutter face — curves 36 ≡ 37, two geometrically
+    // coincident cut rings. Their duplicate coincident cut edges corrupt the
+    // cutter's arrangement into 3-face fans (χ<0), silently. The D-2 pair-void
+    // filter (`drop_pair_curves_in_preexisting_holes`) has no purchase: the
+    // circle STRADDLES the ring's hole, so it is not wholly inside either
+    // trimmed face and both pairs legitimately emit it.
+    //
+    // Fix at the routing altitude: per TARGET face, drop any curve that is
+    // geometrically coincident with a curve already kept for that same face,
+    // keeping the FIRST (lowest-id) representative. Two coincident curves on
+    // one face always split it identically, so a single edge along the shared
+    // locus is all the DCEL needs — dropping the duplicate is geometrically
+    // neutral, never removing a distinct cut. This is PER-TARGET-FACE: each
+    // coplanar source fragment keeps its own single copy (its list has one
+    // curve, so the loop is a no-op there); only the shared cutter list
+    // `[36, 37, …]` collapses to `[36, …]`. It reuses the D-2 5-sample
+    // coincidence scheme at the boolean's OWN distance tolerance (no looser
+    // value), so concentric near-miss rims (radius gap ≥ tol) never merge.
+    //
+    // Determinism: the representative is the first occurrence in the per-face
+    // `Vec`, whose order is the deterministic `intersections`-slice iteration
+    // order (curve ids minted ascending within a batch → first == lowest id);
+    // the coincidence test is symmetric point sampling. Cross-face HashMap
+    // iteration order is immaterial — each face's kept list depends only on its
+    // own `Vec`. Determinism-sweep operands are hole-free primitives with no
+    // coincident coplanar fragments, so this loop provably no-ops there.
+    let dedup_tol = options.common.tolerance.distance();
+    for (fid, entry) in face_curves.iter_mut() {
+        let curves = &mut entry.1;
+        if curves.len() < 2 {
+            continue;
+        }
+        let mut kept: Vec<CurveId> = Vec::with_capacity(curves.len());
+        for &cid in curves.iter() {
+            if kept
+                .iter()
+                .any(|&k| curves_geometrically_coincident(model, k, cid, dedup_tol))
+            {
+                if pipeline_trace_enabled() {
+                    eprintln!(
+                        "[bool]   phase-B dedup: face={fid:?} curve={cid:?} coincident with a kept cut — dropped",
+                    );
+                }
+                continue;
+            }
+            kept.push(cid);
+        }
+        *curves = kept;
+    }
+
     // Split each face, carrying its origin solid through to the SplitFace.
     // Iterate in SORTED face-id order: `face_curves` is a HashMap whose order is
     // seeded per process, and that order becomes the order of the `split_faces`
@@ -7439,6 +7494,54 @@ fn planar_face_hole_polygons(
 // pairs emit the full circle and the cutter receives duplicate coincident
 // cuts (same 3-face-fan corruption class, silent). Resolving coincident
 // coplanar fragments as one domain is the #32 campaign's charter.
+/// Geometric-coincidence test for two intersection curves (#32 Phase B
+/// straddling-rim dedup).
+///
+/// Two curves are duplicates when their sampled points coincide along the full
+/// parametric extent within `tol` — the same 5-sample interior scheme
+/// (`0.1..0.9`) the D-2 pair-void filter uses. The interior samples avoid the
+/// closed-curve seam at `t = 0 ≡ 1`, so a full closed circle is matched without
+/// a period artefact. Both same-direction (`a[i] ≈ b[i]`) and reversed
+/// (`a[i] ≈ b[n−1−i]`) parameterisations count as coincident, so an oppositely
+/// wound duplicate of the same locus is still caught; a reversed match of five
+/// distinct points cannot arise between two genuinely different curves.
+///
+/// `tol` is the boolean's own distance tolerance (threaded from
+/// `options.common.tolerance`), NOT a looser value: two concentric circles
+/// whose radii differ by `≥ tol` keep every sample at least `tol` apart and are
+/// never merged. The comparison is strictly-less-than, so a radius gap of
+/// exactly `tol` is preserved as distinct.
+fn curves_geometrically_coincident(model: &BRepModel, a: CurveId, b: CurveId, tol: f64) -> bool {
+    let (Some(ca), Some(cb)) = (model.curves.get(a), model.curves.get(b)) else {
+        return false;
+    };
+    const SAMPLES: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
+    let mut pa: Vec<Point3> = Vec::with_capacity(SAMPLES.len());
+    let mut pb: Vec<Point3> = Vec::with_capacity(SAMPLES.len());
+    for &t in &SAMPLES {
+        match (ca.evaluate(t), cb.evaluate(t)) {
+            (Ok(x), Ok(y)) => {
+                pa.push(x.position);
+                pb.push(y.position);
+            }
+            // A curve that cannot be evaluated cannot be proven coincident;
+            // keep both (the safe, non-collapsing outcome).
+            _ => return false,
+        }
+    }
+    let tol2 = tol * tol;
+    let dist2 = |p: &Point3, q: &Point3| {
+        let dx = p.x - q.x;
+        let dy = p.y - q.y;
+        let dz = p.z - q.z;
+        dx * dx + dy * dy + dz * dz
+    };
+    let n = pa.len();
+    let forward = (0..n).all(|i| dist2(&pa[i], &pb[i]) < tol2);
+    let reversed = (0..n).all(|i| dist2(&pa[i], &pb[n - 1 - i]) < tol2);
+    forward || reversed
+}
+
 fn drop_pair_curves_in_preexisting_holes(model: &BRepModel, fi: &mut FaceIntersection) {
     if fi.curves.is_empty() {
         return;
