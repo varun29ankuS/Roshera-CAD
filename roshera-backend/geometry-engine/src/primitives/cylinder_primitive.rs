@@ -161,13 +161,21 @@ impl Primitive for CylinderPrimitive {
         };
 
         // ---- vertices: one seam vertex per cap. ----
-        let v_bottom = model.vertices.add_or_find(
+        // F1b: create PER-SOLID (fresh) vertices, never `add_or_find`. A
+        // model-wide coincident lookup would snap this cap's seam vertex
+        // onto a coincident vertex owned by an UNRELATED existing solid,
+        // so a later vertex-moving op (fillet `set_position`, transform,
+        // chamfer, shell) drags the shared vertex and corrupts the
+        // neighbour. Each seam vertex is distinct within this cylinder and
+        // its handle is threaded to every in-solid reference below, so a
+        // fresh add preserves this solid's own watertight structure.
+        let v_bottom = model.vertices.add_unchecked_with_tolerance(
             params.base_center.x + ref_dir.x * params.radius,
             params.base_center.y + ref_dir.y * params.radius,
             params.base_center.z + ref_dir.z * params.radius,
             tolerance.distance(),
         );
-        let v_top = model.vertices.add_or_find(
+        let v_top = model.vertices.add_unchecked_with_tolerance(
             top_center_pt.x + ref_dir.x * params.radius,
             top_center_pt.y + ref_dir.y * params.radius,
             top_center_pt.z + ref_dir.z * params.radius,

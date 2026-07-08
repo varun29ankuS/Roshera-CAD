@@ -5586,7 +5586,10 @@ impl<'a> TopologyBuilder<'a> {
             let local_z = if i & 4 == 0 { -ht } else { ht };
 
             let world_pt = center + u_dir * local_x + v_dir * local_y + normal * local_z;
-            vertices[i] = self.model.vertices.add_or_find(
+            // F1b: fresh per-solid vertex (never `add_or_find`) so this
+            // oriented box never snaps a corner onto an unrelated solid's
+            // coincident vertex. See `create_box_vertices`.
+            vertices[i] = self.model.vertices.add_unchecked_with_tolerance(
                 world_pt.x,
                 world_pt.y,
                 world_pt.z,
@@ -5652,10 +5655,19 @@ impl<'a> TopologyBuilder<'a> {
 
         let mut vertices = [0u32; 8];
         for (i, &(x, y, z)) in vertex_positions.iter().enumerate() {
-            vertices[i] = self
-                .model
-                .vertices
-                .add_or_find(x, y, z, self.tolerance.distance());
+            // F1b: create PER-SOLID (fresh) vertices, never `add_or_find`.
+            // A model-wide coincident lookup would snap a box corner onto a
+            // coincident vertex owned by an UNRELATED existing solid, so a
+            // later vertex-moving op (fillet, transform, chamfer, shell)
+            // drags the shared vertex and corrupts the neighbour. The 8
+            // corners are distinct; each handle is threaded to its 3 edges
+            // in `create_box_edges`.
+            vertices[i] = self.model.vertices.add_unchecked_with_tolerance(
+                x,
+                y,
+                z,
+                self.tolerance.distance(),
+            );
         }
 
         Ok(vertices)
@@ -5947,13 +5959,20 @@ impl<'a> TopologyBuilder<'a> {
         let ref_dir = bottom_circle.x_axis();
 
         // ---- vertices: one seam vertex per cap, on the circles' t=0. ----
-        let v_bottom = self.model.vertices.add_or_find(
+        // F1b: create PER-SOLID (fresh) vertices, never `add_or_find`. A
+        // model-wide coincident lookup would snap this cap's seam vertex
+        // onto a coincident vertex owned by an UNRELATED existing solid
+        // (e.g. a flange sharing the z=0 footprint), so filleting/moving
+        // this rim would drag the shared vertex and corrupt the neighbour
+        // (dogfood F1). Both seam vertices are distinct within this
+        // cylinder and threaded to every in-solid reference below.
+        let v_bottom = self.model.vertices.add_unchecked_with_tolerance(
             base_center.x + ref_dir.x * radius,
             base_center.y + ref_dir.y * radius,
             base_center.z + ref_dir.z * radius,
             self.tolerance.distance(),
         );
-        let v_top = self.model.vertices.add_or_find(
+        let v_top = self.model.vertices.add_unchecked_with_tolerance(
             top_center.x + ref_dir.x * radius,
             top_center.y + ref_dir.y * radius,
             top_center.z + ref_dir.z * radius,
@@ -6145,13 +6164,16 @@ impl<'a> TopologyBuilder<'a> {
         // `x_axis`, so a single `ref_dir` anchors both seam vertices.
         let ref_dir = bottom_circle.x_axis();
 
-        let v_bottom = self.model.vertices.add_or_find(
+        // F1b: create PER-SOLID (fresh) vertices, never `add_or_find` —
+        // same cross-solid merge hazard as the cylinder. Both seam
+        // vertices are distinct within this frustum and threaded below.
+        let v_bottom = self.model.vertices.add_unchecked_with_tolerance(
             base_center.x + ref_dir.x * base_radius,
             base_center.y + ref_dir.y * base_radius,
             base_center.z + ref_dir.z * base_radius,
             self.tolerance.distance(),
         );
-        let v_top = self.model.vertices.add_or_find(
+        let v_top = self.model.vertices.add_unchecked_with_tolerance(
             top_center.x + ref_dir.x * top_radius,
             top_center.y + ref_dir.y * top_radius,
             top_center.z + ref_dir.z * top_radius,

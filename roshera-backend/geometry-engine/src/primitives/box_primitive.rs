@@ -425,9 +425,18 @@ impl Primitive for BoxPrimitive {
                 pos = transform.transform_point(&pos);
             }
 
-            let vertex_id = model
-                .vertices
-                .add_or_find(pos.x, pos.y, pos.z, tolerance.distance());
+            // F1b: create PER-SOLID (fresh) vertices, never `add_or_find`.
+            // A model-wide coincident lookup would snap this corner onto a
+            // coincident vertex owned by an UNRELATED existing solid, so a
+            // later vertex-moving op would drag the shared vertex and
+            // corrupt the neighbour. The 8 corners are distinct and each
+            // handle is threaded to its 3 edges below.
+            let vertex_id = model.vertices.add_unchecked_with_tolerance(
+                pos.x,
+                pos.y,
+                pos.z,
+                tolerance.distance(),
+            );
             vertices.push(vertex_id);
         }
 

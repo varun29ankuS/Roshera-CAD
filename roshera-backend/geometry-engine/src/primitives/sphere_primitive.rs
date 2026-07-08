@@ -141,14 +141,20 @@ impl Primitive for SpherePrimitive {
         // (the loop traverses the seam twice — once going up, once coming back down
         // the "other side" — which is topologically valid for a closed surface).
 
-        // Vertices: north and south poles
-        let north_pole = model.vertices.add_or_find(
+        // Vertices: north and south poles.
+        // F1b: create PER-SOLID (fresh) vertices, never `add_or_find` — a
+        // model-wide coincident lookup would snap a pole onto a coincident
+        // vertex owned by an UNRELATED existing solid, so a later
+        // vertex-moving op would drag the shared vertex and corrupt the
+        // neighbour. Both poles are distinct and threaded to the seam edge
+        // below, so a fresh add keeps this sphere watertight.
+        let north_pole = model.vertices.add_unchecked_with_tolerance(
             params.center.x,
             params.center.y,
             params.center.z + params.radius,
             tolerance.distance(),
         );
-        let south_pole = model.vertices.add_or_find(
+        let south_pole = model.vertices.add_unchecked_with_tolerance(
             params.center.x,
             params.center.y,
             params.center.z - params.radius,
