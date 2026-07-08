@@ -503,25 +503,32 @@ fn mixed_cap_patch_has_three_distinct_corners() {
 /// gone (off-surface facets 117 → 3, analytic agreement 0.774 → 0.994),
 /// pinned by `mixed_cap_patch_has_three_distinct_corners`.
 ///
-/// STILL DEFERRED (`#[ignore]`): the RESIDUAL is now a separable
-/// cap-tessellation-quality problem, NOT a folded surface. The mixed cap
-/// is one collapsed-apex NURBS patch tessellated by the FLAT apex-fan
-/// (`tessellation/surface.rs::tessellate_corner_cap_apex_fan`), which
-/// chords across the patch curvature (~55° facet normal deviation > the
-/// 40° mesh gate) and seats a few apex-adjacent facet centroids off the
-/// surface, where `GeneralNurbsSurface::closest_point` clamps onto the
-/// collapsed `u=1` row and reads a spurious ~114° normal. Clearing the
-/// gate needs a boundary-conforming curvature-following cap mesh (the
-/// rim must stay the verbatim cache samples for watertight welding, so a
-/// naive param grid cracks) plus a singular-patch-robust `closest_point` /
-/// `normal_at` on the collapsed row — the "cap rebuild (Task 3C) /
-/// robust-measurement" work the reports flagged as Varun-level. Kept
-/// `#[ignore]`d (NOT in KNOWN_REDS) so the red-gate stays green; run with
-/// `--ignored` for the attribution dump.
+/// FIXED (Task 1b-5, `.superpowers/sdd/dogfood-task-1b5-report.md`) — the
+/// two separable post-de-fold residuals are now resolved, so this pin is
+/// LIVE (un-`#[ignore]`d):
+///
+/// * **R1 — flat-fan curvature under-resolution.** The cap was tessellated by
+///   a FLAT apex-fan (`tessellation/surface.rs::tessellate_corner_cap_apex_fan`)
+///   that chorded across the two fillet-arc rims in a single radial step
+///   (~55° facet normal deviation, 118/125 facets over the 40° mesh gate).
+///   The now-INJECTIVE patch (Jacobian handedness census 1521:0 — the 1b-3
+///   fold is gone) is meshed instead by a curvature-following radial LADDER
+///   between the two verbatim fillet-arc rims (verbatim base + apex), which
+///   drops every non-apex facet under ~20°.
+/// * **R2 — collapsed-apex oracle artifact.** The soundness oracle reads each
+///   facet's winding against `closest_point → normal_at`; on the collapsed
+///   `u = u_max` apex row `dv ≡ 0`, so `du × dv` was `0`, `normal_at` returned
+///   `Err(DivisionByZero)`, and `closest_point` aborted — the apex-adjacent
+///   facets read a spurious ~114° / were hidden. `GeneralNurbsSurface` now
+///   carries a limiting-normal `robust_normal` (retreat off the pole) and a
+///   derivative-only `closest_point`, so the apex facets read their true
+///   (small) deviation.
+///
+/// The rim stays the VERBATIM edge-cache samples (weld tolerance ~1e-6), so
+/// the cap still certifies watertight; the whole-solid cert asserts both
+/// `tessellation.clean` (off-surface == 0, analytic agreement ≥ 0.999) and
+/// `mesh_quality.clean` (max normal deviation ≤ 40°, boundary-crossing == 0).
 #[test]
-#[ignore = "BUG 1b — self-fold FIXED at construction (1b-4); residual is the \
-            separable flat-apex-fan cap-mesh quality + collapsed-apex \
-            closest_point measurement. See .superpowers/sdd/dogfood-task-1b4-report.md"]
 fn mixed_protocol_finalize_is_tessellation_sound() {
     let mut model = BRepModel::new();
     let solid = make_box(&mut model);
