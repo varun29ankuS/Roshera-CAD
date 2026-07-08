@@ -69,22 +69,29 @@ const HALF_BOX: f64 = BOX_SIZE / 2.0;
 const D: f64 = 1.0;
 
 /// Measured worst-rim kink windows on the 10³ cube / D = 1 fixture,
-/// per (rim mix, call order). The single-patch cap's collapsed-apex
-/// corner is chosen by rim input order, and the two operators
-/// assemble the rim list in opposite kind orders — so the DELIVERED
-/// cap geometry (and its kink) differs by call order even though the
-/// topology is order-invariant (WL-hash equal). Measured live
-/// (deterministic after the Task 3C ascending-EdgeId registry fix):
-/// 1C2F chamfer-first 0.5137540…, 1C2F fillet-first 1.0471975…
-/// (= π/3), 2C1F chamfer-first 0.8495533…, 2C1F fillet-first
-/// 0.6619083… rad. The cross-order geometric variance is a
-/// pre-existing #72 single-patch artifact, banked for review — every
-/// value sits far above the 1e-2 G1 bar, so the refusal contract is
-/// order-invariant.
+/// per (rim mix, call order). The two operators assemble the cap rim
+/// list in opposite kind orders; the DELIVERED cap geometry (and its
+/// kink) still differs slightly by call order even though the topology
+/// is order-invariant (WL-hash equal).
+///
+/// Task 1b-4 (`dogfood-task-1b4-report.md`) FIXED the dominant cause of
+/// the fillet-first divergence: `apply_mixed_corner_single_patch_cap`
+/// read the cap net's corners in raw rim INPUT order, so for the
+/// fillet-first orderings (input rim order ≠ cycle order) the collapsed
+/// apex was placed on corner `a` instead of the true third corner P_12 —
+/// a self-folding cap whose worst-rim kink read a degenerate 1C2F
+/// fillet-first 1.0471975… (= π/3 exactly, the tell-tale of the fold).
+/// With the apex now on the genuine retracted-triangle corner the
+/// fillet-first kinks are the real cap angles, and the cross-order
+/// variance shrinks (1C2F 0.514/0.752 vs the old 0.514/1.047; 2C1F
+/// 0.850/0.927 vs the old 0.850/0.662). The small residual cross-order
+/// variance is a separate #72 single-patch artifact, banked for review —
+/// every value sits far above the 1e-2 G1 bar, so the refusal contract
+/// is order-invariant.
 const KINK_1C2F_CHAMFER_FIRST_RANGE: (f64, f64) = (0.45, 0.60);
-const KINK_1C2F_FILLET_FIRST_RANGE: (f64, f64) = (0.99, 1.10);
+const KINK_1C2F_FILLET_FIRST_RANGE: (f64, f64) = (0.70, 0.80);
 const KINK_2C1F_CHAMFER_FIRST_RANGE: (f64, f64) = (0.80, 0.90);
-const KINK_2C1F_FILLET_FIRST_RANGE: (f64, f64) = (0.60, 0.72);
+const KINK_2C1F_FILLET_FIRST_RANGE: (f64, f64) = (0.88, 0.97);
 
 // ---------------------------------------------------------------------------
 // Option helpers
