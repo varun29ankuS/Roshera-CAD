@@ -15670,7 +15670,10 @@ fn heal_t_junctions_across_faces(
     }
 }
 
-fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace]) {
+fn canonicalise_face_edges_by_position(
+    model: &BRepModel,
+    faces: &mut [SplitFace],
+) -> HashMap<VertexId, VertexId> {
     // Step 1: collect every vertex touched by any face's edges, with
     // its 3D position. De-duplicate by VertexId so positions are read
     // exactly once.
@@ -15867,6 +15870,74 @@ fn canonicalise_face_edges_by_position(model: &BRepModel, faces: &mut [SplitFace
             total,
         ));
     }
+
+    canon_v
+}
+
+/// F1b throat-weld shim — complete `canonicalise_face_edges_by_position` by
+/// applying its position→canonical vertex map to the MODEL's edges, not just
+/// the per-face edge references.
+///
+/// Why this is needed: `canonicalise_face_edges_by_position` rewrites which
+/// `EdgeId` each face loop uses so geometrically-coincident edges collapse to
+/// one, but it never touches the underlying edges' stored endpoints. For most
+/// seams that is enough. It is NOT enough for two coincident CLOSED-CIRCLE
+/// rims meeting at a shared throat (a frustum∪frustum de-Laval nozzle, a
+/// cone-on-cylinder cap): each operand's throat rim is a full circle whose
+/// seam vertex is also the endpoint of that operand's LATERAL SEAM line. The
+/// two throat circle edges weld to one, but each operand's seam line still
+/// points at its OWN throat vertex — and after F1b those two throat vertices
+/// are DISTINCT (independent primitives no longer pre-share topology at
+/// creation). The survivor `Vt_d` is then a duplicate vertex coincident with
+/// the canonical `Vt_c`, referenced only through the seam line, giving an odd
+/// Euler characteristic (`V(4)-E(5)+F(4)`) — a B-Rep-invalid nozzle.
+///
+/// The fix is for the Boolean to weld its OWN operands' coincident vertices
+/// here (booleans imprint/weld their own operands — the same contract as the
+/// edge canonicalisation above), rather than depending on creation-time
+/// cross-solid vertex merge (which F1b deliberately removed).
+///
+/// STRICT SCOPE: the map is built ONLY from this operation's own split faces
+/// (`canon_v`), and only edges referenced by those faces are rewritten. It
+/// performs NO model-wide or cross-solid vertex search. Because F1b guarantees
+/// independent solids own disjoint vertices, the only edges that can carry a
+/// coincident-and-merged endpoint here are this operation's own operand edges —
+/// so the weld cannot reach any unrelated solid. Merged-away vertices are left
+/// in the store (harmless: the Euler/topology walk counts only vertices
+/// reachable through referenced edges, and deleting them would require a
+/// model-wide reference scan that this scope guard forbids).
+fn weld_canonical_vertices_into_model(
+    model: &mut BRepModel,
+    faces: &[SplitFace],
+    canon_v: &HashMap<VertexId, VertexId>,
+) {
+    // Only edges reachable through this operation's faces (post-remap) may be
+    // touched — the result shell's own boundary + hole loops.
+    let mut edge_ids: HashSet<EdgeId> = HashSet::new();
+    for face in faces.iter() {
+        for &(eid, _) in face
+            .boundary_edges
+            .iter()
+            .chain(face.inner_loops.iter().flatten())
+        {
+            edge_ids.insert(eid);
+        }
+    }
+
+    for eid in edge_ids {
+        if let Some(edge) = model.edges.get_mut(eid) {
+            if let Some(&cs) = canon_v.get(&edge.start_vertex) {
+                if cs != edge.start_vertex {
+                    edge.start_vertex = cs;
+                }
+            }
+            if let Some(&ce) = canon_v.get(&edge.end_vertex) {
+                if ce != edge.end_vertex {
+                    edge.end_vertex = ce;
+                }
+            }
+        }
+    }
 }
 
 /// Groups faces into connected shells by shared edges.
@@ -15913,7 +15984,13 @@ fn build_shells_from_faces(
     // `forward` bit.
     weld_imprint_residual_vertices(model, &mut faces, &options.common.tolerance);
     heal_t_junctions_across_faces(model, &mut faces, &options.common.tolerance);
-    canonicalise_face_edges_by_position(model, &mut faces);
+    let vertex_canon = canonicalise_face_edges_by_position(model, &mut faces);
+    // F1b throat-weld shim: complete the edge-reference canonicalisation by
+    // applying its position→canonical vertex map to the model's own operand
+    // edges, so a coincident closed-circle throat (frustum∪frustum) whose seam
+    // line still points at the operand's distinct throat vertex is welded to
+    // one vertex. Operation-scoped — see the function doc.
+    weld_canonical_vertices_into_model(model, &faces, &vertex_canon);
 
     // Post-canonicalization degenerate-face purge: `canonicalise_face_edges_by_position`
     // can collapse two geometrically-coincident cut edges in a coplanar-wall split to the
