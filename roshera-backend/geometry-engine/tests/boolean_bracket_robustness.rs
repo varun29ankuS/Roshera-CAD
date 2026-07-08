@@ -24,10 +24,13 @@
 //!                               pad bottom is COINCIDENT with the cap AND crosses
 //!                               a bore — pinned in `f1b_coincident_bottom_over_
 //!                               bore_is_broken` as a distinct, deeper defect.
-//!   F2 curved union          — BROKEN: watertight=false, bnd≈269, euler=1.
-//!                               Root: a cylinder LATERAL crossing two planar
-//!                               walls — plane↔cylinder SSI/corefinement leaves
-//!                               cut edges unshared (the deep #17 family).
+//!   F2 curved union          — FIXED by #32 Phase B (was watertight=false,
+//!                               bnd=593). A cylinder LATERAL crossing two planar
+//!                               walls emitted the SAME cut curve twice onto each
+//!                               wall face (the duplicate-coincident-cut class);
+//!                               the per-face dedup in `split_faces_along_curves`
+//!                               collapses the coincident pair and the weld now
+//!                               closes cleanly (sound, euler=2). Pinned SOUND.
 //!   F3 partial-embed imprint  — NO LONGER REPRODUCES with box primitives. The
 //!                               box∪box rectangular-imprint-on-a-face path is
 //!                               robust in the current kernel (the #35 chord-
