@@ -1393,6 +1393,194 @@ fn loop_rim_samples(
 /// (so the caller falls through to curved-CDT) when the face has no apex
 /// hint or its rim cannot be sampled — i.e. for every NURBS face that is
 /// not a CF-γ.7 corner cap.
+/// Curvature-following radial **ladder** mesh of the 1C2F mixed-corner cap
+/// (BUG 1b-5, R1). The now-injective cap patch (the 1b-4 de-fold removed the
+/// `a ≡ c` self-fold) is bounded by a straight chamfer chord (the "base",
+/// two verbatim edge-cache samples) and two equal-length fillet-arc rims that
+/// climb from the two base corners to the shared apex. A single flat fan from
+/// the apex chords across ~60° of arc curvature in ONE radial step (~55°
+/// facet-normal deviation — 118/125 facets over the 40° mesh gate); this lays
+/// down iso-level "rungs" between corresponding samples of the two arcs, so
+/// the radial resolution follows the arcs exactly and every facet sits on the
+/// surface (measured < ~20°).
+///
+/// Every boundary vertex is the VERBATIM edge-cache sample (base endpoints,
+/// both full arcs, apex), so the cap still welds bit-exactly to its fillet /
+/// chamfer neighbours — the whole-solid cert stays watertight. Winding is
+/// self-correcting against the outward face normal, and per-vertex normals
+/// accumulate the oriented facet normals so the stored-normal oracle agrees.
+///
+/// Returns `false` (caller falls back to the flat fan, preserving behaviour
+/// for every other cap kind) unless the loop is the exact CF-γ.7 shape: one
+/// straight 2-sample base edge and two apex-incident arc edges of equal
+/// sample count.
+fn emit_cap_ladder(
+    lp: &crate::primitives::r#loop::Loop,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    apex: Point3,
+    n_face: Vector3,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    // Weld tolerance for matching a sample to the apex / a base corner.
+    const WELD: f64 = 1e-6;
+
+    // Ordered samples of loop edge `idx` (respecting the loop's directed use),
+    // consecutive duplicates removed.
+    let edge_samples = |idx: usize| -> Vec<Point3> {
+        let eid = lp.edges[idx];
+        let s = cache.get_or_compute(eid, model);
+        let fwd = lp.orientations.get(idx).copied().unwrap_or(true);
+        let mut out: Vec<Point3> = Vec::with_capacity(s.len());
+        let mut push = |out: &mut Vec<Point3>, p: Point3| {
+            if out.last().map_or(true, |&q| (q - p).magnitude() > 1e-9) {
+                out.push(p);
+            }
+        };
+        if fwd {
+            for &p in s.iter() {
+                push(&mut out, p);
+            }
+        } else {
+            for &p in s.iter().rev() {
+                push(&mut out, p);
+            }
+        }
+        out
+    };
+
+    let is_apex = |p: Point3| (p - apex).magnitude() < WELD;
+
+    // Classify: exactly one base (neither endpoint the apex) and two arcs
+    // (one endpoint the apex).
+    let mut base: Option<Vec<Point3>> = None;
+    let mut arcs: Vec<Vec<Point3>> = Vec::new();
+    for i in 0..lp.edges.len() {
+        let s = edge_samples(i);
+        if s.len() < 2 {
+            return false;
+        }
+        let touches_apex = is_apex(s[0]) || is_apex(s[s.len() - 1]);
+        if touches_apex {
+            arcs.push(s);
+        } else if base.is_none() {
+            base = Some(s);
+        } else {
+            return false; // two non-apex edges — not the CF-γ.7 shape
+        }
+    }
+    let base = match base {
+        Some(b) => b,
+        None => return false,
+    };
+    if arcs.len() != 2 || base.len() != 2 {
+        return false;
+    }
+
+    // Orient each arc corner -> apex.
+    for a in arcs.iter_mut() {
+        if is_apex(a[0]) {
+            a.reverse();
+        }
+        match a.last() {
+            Some(&last) if is_apex(last) => {}
+            _ => return false, // an arc that does not actually reach the apex
+        }
+    }
+    let mut arc_b = arcs.remove(1);
+    let mut arc_a = arcs.remove(0);
+    // Equal counts give a clean rung pairing (the two equal-radius fillet arcs
+    // are cache-sampled identically); anything else falls back.
+    if arc_a.len() != arc_b.len() || arc_a.len() < 2 {
+        return false;
+    }
+    // Align arc_a to base corner 0.
+    if (arc_a[0] - base[0]).magnitude() > WELD {
+        std::mem::swap(&mut arc_a, &mut arc_b);
+    }
+    if (arc_a[0] - base[0]).magnitude() > WELD || (arc_b[0] - base[1]).magnitude() > WELD {
+        return false; // arcs do not meet the base corners as expected
+    }
+
+    let r = arc_a.len(); // rings 0..=r-1; ring r-1 is the (shared) apex
+                         // Rings 0..=r-2 carry two distinct vertices; the apex is one shared vertex.
+    let apex_local = 2 * (r - 1);
+    let n_verts = apex_local + 1;
+    let mut positions: Vec<Point3> = Vec::with_capacity(n_verts);
+    for s in 0..r - 1 {
+        positions.push(arc_a[s]);
+        positions.push(arc_b[s]);
+    }
+    positions.push(apex);
+    let ia = |s: usize| 2 * s; // arc_a vertex of ring s
+    let ib = |s: usize| 2 * s + 1; // arc_b vertex of ring s
+
+    let area_ok = |p0: Point3, p1: Point3, p2: Point3| -> bool {
+        (p1 - p0).cross(&(p2 - p0)).magnitude() > 1e-12
+    };
+    let mut tris: Vec<[usize; 3]> = Vec::new();
+    // Quad strips between consecutive non-apex rings.
+    for s in 0..r.saturating_sub(2) {
+        let (a0, b0, a1, b1) = (ia(s), ib(s), ia(s + 1), ib(s + 1));
+        if area_ok(positions[a0], positions[b0], positions[b1]) {
+            tris.push([a0, b0, b1]);
+        }
+        if area_ok(positions[a0], positions[b1], positions[a1]) {
+            tris.push([a0, b1, a1]);
+        }
+    }
+    // Apex cap: the last non-apex ring -> apex.
+    {
+        let s = r - 2;
+        let (a0, b0) = (ia(s), ib(s));
+        if area_ok(positions[a0], positions[b0], positions[apex_local]) {
+            tris.push([a0, b0, apex_local]);
+        }
+    }
+    if tris.is_empty() {
+        return false;
+    }
+
+    // Orient the whole ladder outward: flip every facet if the summed
+    // geometric normal opposes the outward face normal.
+    let mut sum = Vector3::ZERO;
+    for t in &tris {
+        sum = sum + (positions[t[1]] - positions[t[0]]).cross(&(positions[t[2]] - positions[t[0]]));
+    }
+    if sum.dot(&n_face) < 0.0 {
+        for t in tris.iter_mut() {
+            t.swap(1, 2);
+        }
+    }
+
+    // Per-vertex normals: accumulate the oriented facet normals so the
+    // stored-normal-agreement oracle sees winding-consistent normals.
+    let mut accum: Vec<Vector3> = vec![Vector3::ZERO; n_verts];
+    for t in &tris {
+        let gn = (positions[t[1]] - positions[t[0]]).cross(&(positions[t[2]] - positions[t[0]]));
+        accum[t[0]] = accum[t[0]] + gn;
+        accum[t[1]] = accum[t[1]] + gn;
+        accum[t[2]] = accum[t[2]] + gn;
+    }
+
+    let base_idx = mesh.vertices.len() as u32;
+    for i in 0..n_verts {
+        mesh.vertices.push(MeshVertex {
+            position: positions[i],
+            normal: accum[i].normalize().unwrap_or(n_face),
+            uv: None,
+        });
+    }
+    for t in tris {
+        mesh.triangles.push([
+            base_idx + t[0] as u32,
+            base_idx + t[1] as u32,
+            base_idx + t[2] as u32,
+        ]);
+    }
+    true
+}
+
 fn tessellate_corner_cap_apex_fan(
     face: &Face,
     model: &BRepModel,
@@ -1415,21 +1603,30 @@ fn tessellate_corner_cap_apex_fan(
     if lp.edges.len() != 3 {
         return false;
     }
-    let rim = loop_rim_samples(lp, model, cache);
-    let m = rim.len();
-    if m < 3 {
-        return false;
-    }
-
     // Outward face normal: the patch's parametric normal at the centre,
-    // signed by the face orientation. Used to wind every fan triangle
-    // consistently outward.
+    // signed by the face orientation. Used to wind every facet consistently
+    // outward.
     let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
     let n_face = surface
         .normal_at(0.5 * (u0 + u1), 0.5 * (v0 + v1))
         .ok()
         .map(|n| n * face.orientation.sign())
         .unwrap_or(Vector3::Z);
+
+    // Preferred path: a curvature-following radial LADDER between the two
+    // fillet-arc rims (see `emit_cap_ladder`), which resolves the arc
+    // curvature the flat fan below chords across. Falls through to the flat
+    // apex fan for any cap that is not the exact CF-γ.7 shape.
+    if emit_cap_ladder(lp, model, cache, apex, n_face, mesh) {
+        return true;
+    }
+
+    // Fallback: flat apex fan.
+    let rim = loop_rim_samples(lp, model, cache);
+    let m = rim.len();
+    if m < 3 {
+        return false;
+    }
 
     // Wind ALL fan triangles together by the rim's net orientation (not
     // per-triangle, which can flip individual slivers and desynchronise
