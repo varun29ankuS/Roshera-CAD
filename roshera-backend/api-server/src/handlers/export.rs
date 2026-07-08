@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub async fn export_mesh(
     State(state): State<AppState>,
     Json(request): Json<ExportRequest>,
-) -> Result<Json<ExportResponse>, StatusCode> {
+) -> Result<Json<ExportResponse>, (StatusCode, String)> {
     let start = Instant::now();
 
     // Hold a read guard for the duration of the export — both the
@@ -56,7 +56,10 @@ pub async fn export_mesh(
 
     if solids_to_export.is_empty() {
         tracing::error!("export: no solids to export");
-        return Err(StatusCode::NOT_FOUND);
+        return Err((
+            StatusCode::NOT_FOUND,
+            "export: no solids resolved to export (empty selection or unmapped ids)".to_string(),
+        ));
     }
 
     // Tessellate every selected solid and merge into a single
@@ -113,7 +116,10 @@ pub async fn export_mesh(
 
     if merged_indices.is_empty() {
         tracing::error!("export: every selected solid tessellated to empty");
-        return Err(StatusCode::NOT_FOUND);
+        return Err((
+            StatusCode::NOT_FOUND,
+            "export: every selected solid tessellated to zero triangles".to_string(),
+        ));
     }
 
     let final_mesh = Mesh {
@@ -145,6 +151,11 @@ pub async fn export_mesh(
         .collect::<String>();
 
     // Export based on format
+    // Honesty invariant: an export failure must NEVER return an empty 500.
+    // The typed `ExportError` (e.g. the STEP writer's "face has no resolvable
+    // bounds") is propagated verbatim into the response body so the caller —
+    // agent or human — can diagnose the exact failing surface/topology instead
+    // of a blank status code. (Dogfood finding F2.)
     let filename = match request.format {
         ExportFormat::STL => state
             .export_engine
@@ -152,7 +163,10 @@ pub async fn export_mesh(
             .await
             .map_err(|e| {
                 tracing::error!("STL export failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("STL export failed: {e}"),
+                )
             })?,
         ExportFormat::OBJ => state
             .export_engine
@@ -160,7 +174,10 @@ pub async fn export_mesh(
             .await
             .map_err(|e| {
                 tracing::error!("OBJ export failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("OBJ export failed: {e}"),
+                )
             })?,
         ExportFormat::ROS => state
             .export_engine
@@ -172,7 +189,10 @@ pub async fn export_mesh(
             .await
             .map_err(|e| {
                 tracing::error!("ROS export failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("ROS export failed: {e}"),
+                )
             })?,
         ExportFormat::STEP => state
             .export_engine
@@ -180,11 +200,17 @@ pub async fn export_mesh(
             .await
             .map_err(|e| {
                 tracing::error!("STEP export failed: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("STEP export failed: {e}"),
+                )
             })?,
         _ => {
             tracing::warn!("Unsupported export format: {:?}", request.format);
-            return Err(StatusCode::NOT_IMPLEMENTED);
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                format!("export format {:?} is not supported", request.format),
+            ));
         }
     };
 

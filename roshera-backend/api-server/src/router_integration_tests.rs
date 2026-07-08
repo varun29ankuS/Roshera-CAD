@@ -4047,3 +4047,85 @@ async fn shared_corner_refusal_over_http_names_opt_in_and_vertex() {
          got {error_str:?}"
     );
 }
+
+// =====================================================================
+// Tests — export error honesty (dogfood finding F2, fix (a))
+// =====================================================================
+
+/// Build a POST `/api/export` request with the given JSON payload.
+fn export_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/export")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+/// Dispatch through the live router and return `(status, raw body bytes)`.
+/// Export errors carry a PLAIN-STRING diagnostic body (not JSON), so this
+/// reads the raw bytes rather than JSON-parsing like [`dispatch`].
+async fn dispatch_raw(state: &AppState, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let router = build_router(state.clone());
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("router must produce a response (oneshot infallibility)");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body must serialize to finite bytes");
+    (status, bytes.to_vec())
+}
+
+/// F2 fix (a): a STEP export that resolves to no exportable geometry must
+/// return a NON-EMPTY diagnostic body, never a bare status code. Before the
+/// fix the handler returned `Err(StatusCode)`, which Axum renders with an
+/// EMPTY body — exactly the opaque, undiagnosable 500 the dogfood run hit.
+#[tokio::test]
+async fn export_step_empty_model_returns_nonempty_error_body() {
+    let state = make_test_state().await; // fresh, empty kernel model
+    let request = export_post(json!({
+        "format": "STEP",
+        "objects": [],
+    }));
+    let (status, body) = dispatch_raw(&state, request).await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "empty-model STEP export must be an error status; got {status}"
+    );
+    assert!(
+        !body.is_empty(),
+        "F2(a): an export error must carry a diagnostic body, not an empty {status}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.to_lowercase().contains("solid"),
+        "error body must explain the failure (no solids resolved); got {text:?}"
+    );
+}
+
+/// F2 fix (a): an unsupported export format must ALSO carry its reason in the
+/// body. IGES falls through the handler's format match to the NOT_IMPLEMENTED
+/// arm; the reason string must reach the client rather than a bare 501.
+#[tokio::test]
+async fn export_unsupported_format_returns_nonempty_error_body() {
+    let state = make_test_state().await;
+    let (uuid, _solid, _rim) = seed_cylinder(&state, 5.0, 10.0).await;
+    let request = export_post(json!({
+        "format": "IGES",
+        "objects": [uuid.to_string()],
+    }));
+    let (status, body) = dispatch_raw(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "IGES is unsupported -> 501; body = {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("IGES") || text.to_lowercase().contains("not supported"),
+        "F2(a): unsupported-format 501 must name the format/reason; got {text:?}"
+    );
+}
