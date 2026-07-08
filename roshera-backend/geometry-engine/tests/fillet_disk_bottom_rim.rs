@@ -19,6 +19,8 @@ use geometry_engine::operations::{fillet_edges, FilletOptions};
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+use geometry_engine::primitives::vertex::VertexId;
+use std::collections::BTreeSet;
 
 /// Mirror the MCP `create_cylinder` kernel path exactly (verified against
 /// `POST /api/geometry/cylinder` → `create_cylinder_3d`): an analytic
@@ -154,31 +156,89 @@ fn disk_bottom_rim_fillet_matches_top_rim() {
     );
 }
 
-/// F1 TRUE ROOT CAUSE (diagnostic, not a fillet bug). The live failure
-/// only appears when a *second, spatially-coincident* solid shares the
-/// disk's rim. `create_cylinder_topology` builds its seam vertices with
-/// `VertexStore::add_or_find`, which MERGES a coincident vertex from ANY
-/// pre-existing solid in the shared model. A neighbour flange sharing the
-/// z=0 rim footprint therefore shares the disk's bottom-rim seam vertex;
-/// filleting that rim moves the shared vertex and corrupts the neighbour
-/// (`edge N lies <radius> off face M's Plane surface`). The top rim, being
-/// interior to the neighbour, shares no vertex and fillets clean — which
-/// is the *entire* source of the reported top/bottom asymmetry.
+/// Every distinct vertex id referenced by a solid's boundary (walk
+/// shells → faces → outer+inner loops → edges → start/end vertices).
+fn solid_vertex_ids(model: &BRepModel, solid: SolidId) -> BTreeSet<VertexId> {
+    let mut out = BTreeSet::new();
+    let Some(s) = model.solids.get(solid) else {
+        return out;
+    };
+    for shell_id in s.shell_ids() {
+        let Some(shell) = model.shells.get(shell_id) else {
+            continue;
+        };
+        for &face_id in shell.face_ids() {
+            let Some(face) = model.faces.get(face_id) else {
+                continue;
+            };
+            let mut loops = vec![face.outer_loop];
+            loops.extend(&face.inner_loops);
+            for lid in loops {
+                if let Some(l) = model.loops.get(lid) {
+                    for &e in &l.edges {
+                        if let Some(edge) = model.edges.get(e) {
+                            out.insert(edge.start_vertex);
+                            out.insert(edge.end_vertex);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Position fingerprint of a solid's boundary vertices — the sorted
+/// multiset of raw f64 bit patterns. Stable and exact: any drag of a
+/// vertex (even by a shared-topology neighbour op) changes it.
+fn solid_position_fingerprint(model: &BRepModel, solid: SolidId) -> Vec<[u64; 3]> {
+    let mut v: Vec<[u64; 3]> = solid_vertex_ids(model, solid)
+        .into_iter()
+        .filter_map(|vid| {
+            model
+                .vertices
+                .get_position(vid)
+                .map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()])
+        })
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// F1b FIX (the post-fix correct behaviour). The live failure appeared
+/// only when a *second, spatially-coincident* solid shared the disk's rim:
+/// primitive builders called `VertexStore::add_or_find` against the WHOLE
+/// shared model, MERGING a coincident vertex owned by an unrelated solid.
+/// A neighbour flange sharing the z=0 footprint therefore shared the disk's
+/// bottom-rim seam vertex; filleting that rim moved the shared vertex and
+/// corrupted the neighbour (`edge N lies <radius> off face M's Plane
+/// surface`), rolling the op back.
 ///
-/// This test pins the CURRENT (buggy) behaviour so the finding is
-/// reproducible in-kernel. It is NOT the orientation sign bug F1
-/// hypothesised — the isolated disk above proves both rims are sound.
+/// After the per-solid fresh-vertex fix, the two solids are topologically
+/// DISJOINT: filleting the disk's shared-footprint rim (a) SUCCEEDS —
+/// the disk is now as isolated as the standalone disk above — and (b)
+/// leaves the neighbour untouched (sound + identical position fingerprint).
+///
+/// RED at HEAD: the fillet returns the off-surface TopologyError, so the
+/// `is_ok()` assertion fails.
 #[test]
-fn coincident_neighbor_shared_rim_fillet_corrupts_neighbor() {
+fn coincident_neighbor_shared_rim_fillet_leaves_neighbor_sound() {
     let (radius, height, fillet_r) = (60.0_f64, 16.0_f64, 3.0_f64);
 
     // Neighbour solid spanning z ∈ [0, 54] with the SAME Ø120 footprint,
     // built FIRST so its z=0 rim vertex is already in the store.
     let mut model = BRepModel::new();
-    let _neighbor = make_disk_axis(&mut model, Point3::ORIGIN, Vector3::Z, radius, 54.0);
-    // Disk built SECOND — its bottom-rim seam vertex (60,0,0) coincides
-    // with the neighbour's and is merged by add_or_find.
+    let neighbor = make_disk_axis(&mut model, Point3::ORIGIN, Vector3::Z, radius, 54.0);
+    // Disk built SECOND — its bottom-rim seam vertex (60,0,0) is coincident
+    // with the neighbour's z=0 seam vertex.
     let disk = make_disk_axis(&mut model, Point3::ORIGIN, Vector3::Z, radius, height);
+
+    // Baseline: the neighbour is sound and its vertex positions are pinned.
+    assert!(
+        model.certify_solid(neighbor).is_sound(),
+        "precondition: freshly-built neighbour must be sound"
+    );
+    let neighbor_before = solid_position_fingerprint(&model, neighbor);
 
     // Collect the DISK's own boundary rim edges (its two caps' loops).
     let disk_rims: Vec<EdgeId> = disk_boundary_rims(&model, disk);
@@ -191,22 +251,50 @@ fn coincident_neighbor_shared_rim_fillet_corrupts_neighbor() {
         })
         .expect("disk has rim edges");
 
-    // The disk's bottom-rim seam vertex is SHARED with the neighbour
-    // (add_or_find merge). Filleting it moves the shared vertex and breaks
-    // the neighbour → the live F1 failure ("... off face M's Plane surface").
+    // Fillet the disk's shared-footprint bottom rim.
     let res = fillet_edges(&mut model, disk, vec![disk_bottom], fillet_opts(fillet_r));
     assert!(
-        res.is_err(),
-        "REGRESSION MARKER: filleting a disk rim whose seam vertex is merged \
-         with a coincident neighbour must currently corrupt the neighbour and \
-         fail validation. If this now passes, the cross-solid vertex merge \
-         (add_or_find) has been isolated — update the F1 report."
+        res.is_ok(),
+        "F1b: filleting a coincident disk's shared-footprint rim must \
+         succeed once builders create per-solid vertices; got {:?}",
+        res.err()
     );
-    let msg = format!("{:?}", res.err());
+
+    // The neighbour must be untouched: still sound, positions unchanged.
+    let neighbor_after = solid_position_fingerprint(&model, neighbor);
+    assert_eq!(
+        neighbor_before, neighbor_after,
+        "F1b: filleting the disk must not drag any of the neighbour's \
+         vertices (no cross-solid topology sharing)"
+    );
     assert!(
-        msg.contains("off face") && msg.contains("surface"),
-        "expected an off-surface validation error from the corrupted \
-         neighbour; got: {msg}"
+        model.certify_solid(neighbor).is_sound(),
+        "F1b: the neighbour must remain sound after the disk is filleted"
+    );
+}
+
+/// F1b topology invariant: two spatially-coincident primitives built in ONE
+/// `BRepModel` must own DISJOINT vertex-id sets. Before the fix the two
+/// cylinders shared their coincident z=0 seam vertex (add_or_find merge),
+/// so this intersection was non-empty — RED at HEAD.
+#[test]
+fn coincident_primitives_have_disjoint_vertices() {
+    let radius = 60.0_f64;
+
+    let mut model = BRepModel::new();
+    // Two cylinders with the SAME base circle (z=0, Ø120) and axis: their
+    // bottom-cap seam vertices land on the exact same point.
+    let a = make_disk_axis(&mut model, Point3::ORIGIN, Vector3::Z, radius, 40.0);
+    let b = make_disk_axis(&mut model, Point3::ORIGIN, Vector3::Z, radius, 16.0);
+
+    let va = solid_vertex_ids(&model, a);
+    let vb = solid_vertex_ids(&model, b);
+    let shared: Vec<VertexId> = va.intersection(&vb).copied().collect();
+
+    assert!(
+        shared.is_empty(),
+        "F1b: independent primitives must not share topology, but solids {a} \
+         and {b} share vertex id(s) {shared:?} — cross-solid add_or_find merge"
     );
 }
 
