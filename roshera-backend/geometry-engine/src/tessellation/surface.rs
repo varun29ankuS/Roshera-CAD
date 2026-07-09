@@ -7862,7 +7862,7 @@ pub(crate) fn point_inside_face_uv(u: f64, v: f64, face: &Face, model: &BRepMode
 }
 
 /// Check if a parameter point is inside face boundaries using winding number algorithm
-fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool {
+pub(crate) fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool {
     // Robust path for a sphere trimmed by coplanar cut circles: an
     // iso-parametric cut circle has zero `(u, v)` area, so the winding test
     // below degenerates (a cap renders as the whole sphere; a multi-hole

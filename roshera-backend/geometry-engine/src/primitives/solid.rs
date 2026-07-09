@@ -1494,7 +1494,7 @@ impl VolumeIntegrals {
 ///
 /// Convergence: at most `MAX_SWEEPS` cyclic sweeps; in practice 5–10
 /// sweeps suffice for the off-diagonal sum to drop below `EPS`.
-fn compute_principal_inertia(inertia: &[[f64; 3]; 3]) -> (Vector3, [Vector3; 3]) {
+pub(crate) fn compute_principal_inertia(inertia: &[[f64; 3]; 3]) -> (Vector3, [Vector3; 3]) {
     const MAX_SWEEPS: usize = 50;
     const EPS: f64 = 1e-14;
 
