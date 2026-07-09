@@ -549,7 +549,16 @@ async fn create_geometry(
                     Some((datum_id, local)) => {
                         builder.create_sphere_3d_anchored(r, datum_id, local)
                     }
-                    None => builder.create_sphere_3d(Point3::new(0.0, 0.0, 0.0), r),
+                    // Build the sphere at `position` in the KERNEL (world-absolute
+                    // mesh), matching the dedicated /api/geometry/{cylinder,box,cone}
+                    // endpoints. Previously this hardcoded the origin and `position`
+                    // moved only the display transform, so booleans / mass-properties /
+                    // placement() all saw the sphere at (0,0,0) — see
+                    // dogfood-findings-primitive-placement-2026-07-09.md.
+                    None => builder.create_sphere_3d(
+                        Point3::new(position[0] as f64, position[1] as f64, position[2] as f64),
+                        r,
+                    ),
                 }
             }
             "cylinder" => {
@@ -682,6 +691,17 @@ async fn create_geometry(
 
     state.register_id_mapping(object_uuid, solid_id);
 
+    // The `sphere` arm bakes `position` into the kernel solid (world-absolute
+    // mesh), so its DISPLAY transform must be zero — echoing `position` too
+    // would double-offset it in the viewport. The other generic-handler shapes
+    // still build at the origin and carry `position` as a display transform
+    // (unchanged). See dogfood-findings-primitive-placement-2026-07-09.md.
+    let display_position: [f32; 3] = if shape_type == "sphere" {
+        [0.0, 0.0, 0.0]
+    } else {
+        position
+    };
+
     // Side-channel mutators (curl, AI runners, scripts) bypass the
     // frontend's REST→store path. Broadcast an `ObjectCreated` frame so
     // every connected WS subscriber sees the new solid in the viewport.
@@ -695,7 +715,7 @@ async fn create_geometry(
         &indices,
         &normals,
         &face_ids,
-        position,
+        display_position,
     );
 
     let shape_type_copy = shape_type.clone();
@@ -730,7 +750,7 @@ async fn create_geometry(
                 "type":   shape_type,
                 "params": parameters,
             },
-            "position": position,
+            "position": display_position,
             "rotation": [0.0_f32, 0.0, 0.0],
             "scale":    [1.0_f32, 1.0, 1.0],
         },

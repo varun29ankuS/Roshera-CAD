@@ -119,29 +119,41 @@ export function registerCreateTools(server: McpServer) {
     },
   );
 
-  server.tool(
+  server.registerTool(
     "create_box",
-    "ONE-CALL analytic box: width × depth centered at (cx, cy) on the plane, " +
-      "extruded by height along the plane normal. Analytic primitive (not " +
-      "sketch+extrude, whose bottom cap broke unions). Returns part id + " +
-      "placement.",
     {
-      plane: PlaneSchema.default("xy"),
-      cx: z.number().default(0),
-      cy: z.number().default(0),
-      width: z.number().positive(),
-      depth: z.number().positive(),
-      height: z.number(),
-      name: z.string().optional(),
+      description:
+        "ONE-CALL analytic box: width × depth extruded by height. Base centre " +
+        "is `center` [x,y,z] when given (any world point), else (cx, cy) on the " +
+        "named `plane`. Orientation follows the plane; height is along the " +
+        "plane normal. Returns part id + placement.",
+      inputSchema: z
+        .object({
+          plane: PlaneSchema.default("xy"),
+          cx: z.number().default(0),
+          cy: z.number().default(0),
+          center: z
+            .tuple([z.number(), z.number(), z.number()])
+            .optional()
+            .describe(
+              "explicit world base-centre [x,y,z]; overrides plane+cx+cy",
+            ),
+          width: z.number().positive(),
+          depth: z.number().positive(),
+          height: z.number(),
+          name: z.string().optional(),
+        })
+        .strict(),
     },
-    async ({ plane, cx, cy, width, depth, height, name }) => {
+    async ({ plane, cx, cy, center, width, depth, height, name }) => {
       try {
-        // Box base centre = plane origin + cx·u + cy·v; the analytic
-        // /api/geometry/box endpoint extrudes it by `height` along u×v.
+        // Base centre: explicit `center` wins; otherwise plane origin + cx·u + cy·v.
+        // Orientation (u/v axes and the height direction u×v) always follows the plane.
         const p = resolvePlane(plane);
-        const center = [0, 1, 2].map((i) => p.o[i] + cx * p.u[i] + cy * p.v[i]);
+        const base =
+          center ?? [0, 1, 2].map((i) => p.o[i] + cx * p.u[i] + cy * p.v[i]);
         const r = await api("POST", "/api/geometry/box", {
-          center,
+          center: base,
           u_axis: p.u,
           v_axis: p.v,
           width,
@@ -164,30 +176,46 @@ export function registerCreateTools(server: McpServer) {
     },
   );
 
-  server.tool(
+  server.registerTool(
     "create_cylinder",
-    "ONE-CALL analytic cylinder: radius at (cx, cy) on the plane, extruded by " +
-      "height along the plane normal. Analytic primitive with one smooth " +
-      "lateral face (not sketch+extrude, which produced inside-out meshes). " +
-      "Returns part id + placement.",
     {
-      plane: PlaneSchema.default("xy"),
-      cx: z.number().default(0),
-      cy: z.number().default(0),
-      radius: z.number().positive(),
-      height: z.number(),
-      name: z.string().optional(),
+      description:
+        "ONE-CALL analytic cylinder with one smooth lateral face. Base centre " +
+        "is `center` [x,y,z] when given (any world point), else (cx, cy) on the " +
+        "named `plane`. `axis` sets the extrusion direction (default = plane " +
+        "normal). Returns part id + placement.",
+      inputSchema: z
+        .object({
+          plane: PlaneSchema.default("xy"),
+          cx: z.number().default(0),
+          cy: z.number().default(0),
+          center: z
+            .tuple([z.number(), z.number(), z.number()])
+            .optional()
+            .describe(
+              "explicit world base-centre [x,y,z]; overrides plane+cx+cy",
+            ),
+          axis: z
+            .tuple([z.number(), z.number(), z.number()])
+            .optional()
+            .describe("extrusion axis [x,y,z]; defaults to the plane normal"),
+          radius: z.number().positive(),
+          height: z.number(),
+          name: z.string().optional(),
+        })
+        .strict(),
     },
-    async ({ plane, cx, cy, radius, height, name }) => {
+    async ({ plane, cx, cy, center, axis, radius, height, name }) => {
       try {
-        // Cylinder base centre = plane origin + cx·u + cy·v; axis = u × v (the
-        // plane normal), matching the old sketch-extrude placement.
+        // Base centre: explicit `center` wins; otherwise plane origin + cx·u + cy·v.
+        // Axis: explicit `axis` wins; otherwise u × v (the plane normal).
         const p = resolvePlane(plane);
-        const center = [0, 1, 2].map((i) => p.o[i] + cx * p.u[i] + cy * p.v[i]);
-        const axis = cross3(p.u, p.v);
+        const base =
+          center ?? [0, 1, 2].map((i) => p.o[i] + cx * p.u[i] + cy * p.v[i]);
+        const dir = axis ?? cross3(p.u, p.v);
         const r = await api("POST", "/api/geometry/cylinder", {
-          center,
-          axis,
+          center: base,
+          axis: dir,
           radius,
           height,
           name: name ?? null,
@@ -245,15 +273,31 @@ export function registerCreateTools(server: McpServer) {
     },
   );
 
-  server.tool(
+  server.registerTool(
     "create_sphere",
-    "ONE-CALL analytic sphere of `radius` at the origin. Returns part id + placement.",
-    { radius: z.number().positive(), name: z.string().optional() },
-    async ({ radius }) => {
+    {
+      description:
+        "ONE-CALL analytic sphere of `radius`, centred at `center` [x,y,z] " +
+        "(default origin). Returns part id + placement.",
+      inputSchema: z
+        .object({
+          radius: z.number().positive(),
+          center: z
+            .tuple([z.number(), z.number(), z.number()])
+            .optional()
+            .describe("world centre [x,y,z]; defaults to the origin"),
+          name: z.string().optional(),
+        })
+        .strict(),
+    },
+    async ({ radius, center }) => {
       try {
         const r = await api("POST", "/api/geometry", {
           shape_type: "sphere",
           parameters: { radius },
+          // Top-level `position` → the kernel builds the sphere there
+          // (world-absolute), matching create_cylinder/create_cone.
+          position: center ?? [0, 0, 0],
         });
         const id = await newestPartId();
         return await okp(

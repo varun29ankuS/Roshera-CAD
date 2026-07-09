@@ -2143,6 +2143,73 @@ async fn ambient_cert_large_sphere_stays_within_latency_bound() {
     );
 }
 
+/// DOGFOOD (dogfood-findings-primitive-placement-2026-07-09, Finding 2):
+/// `POST /api/geometry` with `shape_type:"sphere"` and a top-level `position`
+/// must build the sphere at that position IN THE KERNEL (world-absolute mesh),
+/// not at the origin with `position` echoed only as a display transform.
+///
+/// RED before the fix: the `sphere` match arm hardcodes `Point3::new(0,0,0)`,
+/// so the mesh centres on x≈0 and `object.position` echoes `[10,0,0]` — the
+/// kernel solid, booleans, and `placement()` all see it at the origin.
+/// GREEN after: mesh centres on x≈10 and `object.position` is `[0,0,0]`
+/// (matching the dedicated `/api/geometry/cylinder` convention).
+#[tokio::test]
+async fn sphere_honors_position_center() {
+    let state = make_test_state().await;
+
+    let body_json = json!({
+        "shape_type": "sphere",
+        "parameters": { "radius": 2.0 },
+        "position": [10.0, 0.0, 0.0],
+    });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry")
+        .header("content-type", "application/json")
+        .body(Body::from(body_json.to_string()))
+        .expect("sphere-with-position request must build");
+
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sphere create must be 200; body={body}"
+    );
+
+    // Mesh bbox centre in x — the sphere (r=2) must span x∈[8,12], centred on 10.
+    let verts = body["object"]["mesh"]["vertices"]
+        .as_array()
+        .expect("mesh vertices array present");
+    assert!(
+        !verts.is_empty(),
+        "sphere must tessellate to a non-empty mesh"
+    );
+    let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
+    for chunk in verts.chunks(3) {
+        let x = chunk[0].as_f64().expect("vertex x is a number");
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+    }
+    let center_x = 0.5 * (min_x + max_x);
+    assert!(
+        (8.0..=12.0).contains(&center_x),
+        "sphere built at position [10,0,0] must have its mesh centred on x≈10 \
+         (kernel-absolute); got center_x={center_x} (min={min_x}, max={max_x})"
+    );
+
+    // Display transform must be zero — the mesh is world-absolute, so echoing
+    // `position` too would double-offset the sphere in the viewport.
+    let pos = body["object"]["position"]
+        .as_array()
+        .expect("object.position present");
+    let dx = pos[0].as_f64().unwrap_or(f64::NAN);
+    assert_eq!(
+        dx, 0.0,
+        "sphere mesh is kernel-absolute at [10,0,0]; display position.x must be 0 \
+         to avoid a double offset, got {dx}"
+    );
+}
+
 // =====================================================================
 // Task 9 — dual-eye reconcile surfaced on the perception endpoint
 // =====================================================================
