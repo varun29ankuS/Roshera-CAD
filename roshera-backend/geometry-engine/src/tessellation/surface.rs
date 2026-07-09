@@ -8238,12 +8238,27 @@ pub(crate) fn weld_mesh_watertight_range(
         return;
     }
 
-    // Cell size: a few orders of magnitude larger than tolerance so two
-    // points within tolerance reliably share a cell or land in adjacent
-    // cells. Floor at 1e-9 to avoid pathological 0/negative tolerances
-    // collapsing every vertex onto the origin cell.
+    // Cell size ≈ the weld tolerance. The dedup only needs coincident
+    // (within-`safe_tol`) vertices to fall within the 3×3×3 neighbourhood
+    // scanned below, which holds whenever `grid_size >= safe_tol` (a
+    // within-tol pair is ≤ 1 cell apart per axis). A SMALL multiple keeps
+    // that guarantee while keeping buckets SPARSE.
+    //
+    // NO-HANGS (fine-mesh weld blowup): the previous `safe_tol * 1e3` made
+    // cells ~1000× the tolerance, so on a dense `fine()` mesh (vertex
+    // spacing ~`max_edge_length` 0.01, tol 0.0001 → cells 0.1) every cell
+    // held ~1000 vertices. The 3×3×3 scan then degraded to ~O(n·1000),
+    // i.e. quasi-quadratic: a 150k-triangle fillet corner-cap fragment
+    // (~76k verts) took minutes, wedging the api-server write lock via the
+    // mass-props `fine()` tessellation. Sizing cells at the tolerance keeps
+    // buckets to a handful (only bit-exact seam duplicates collide), so the
+    // weld is genuinely O(n). The `tol_sq` membership test below is
+    // unchanged, so the set of welded pairs — and the output mesh — is
+    // byte-identical; only the neighbourhood search is faster.
+    // Floor at 1e-9 to avoid pathological 0/negative tolerances collapsing
+    // every vertex onto the origin cell.
     let safe_tol = weld_tolerance.max(1e-9);
-    let grid_size = safe_tol * 1.0e3;
+    let grid_size = safe_tol * 2.0;
     let inv_grid = 1.0 / grid_size;
     let tol_sq = safe_tol * safe_tol;
 
