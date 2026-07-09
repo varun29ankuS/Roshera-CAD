@@ -83,9 +83,6 @@ fn peg_at(id: u32, h: f64, x: f64) -> Instance {
 /// [−2.8,−1.2] and [1.2,2.8]; the gap is (−1.2, 1.2). A peg of half-size 0.5 at
 /// x=0 spans [−0.5,0.5] — 0.7 clear of each lobe. Correct: no interference.
 #[test]
-#[ignore = "F6: interference uses the convex hull (interference.rs:75); it fills \
-            the dumbbell gap, so a peg seated clear IN the gap false-positives. \
-            Fix = VHACD convex decomposition of concave parts. Un-ignore then."]
 fn peg_in_concavity_is_clear_not_interfering() {
     let mut assembly = Assembly::new(InstanceId(0));
     assembly.add_instance({
