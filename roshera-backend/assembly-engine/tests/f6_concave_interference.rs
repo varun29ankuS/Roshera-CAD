@@ -79,6 +79,116 @@ fn peg_at(id: u32, h: f64, x: f64) -> Instance {
     inst
 }
 
+/// A square TUBE — outer half-size `o`, a square through-hole half-size `i`,
+/// z half-height `zh`. THIS is the faithful bore topology (a closed through-hole,
+/// unlike the open dumbbell gap): the convex hull of its 16 corners is the solid
+/// outer box, and convex decomposition of a ring still yields pieces whose hulls
+/// fill the hole — so a neighbour seated in the hole false-positives against the
+/// pieces. The exact TriMesh distance (this fix) sees the hole and clears it.
+fn square_tube(o: f64, i: f64, zh: f64) -> Mesh {
+    let vertices = vec![
+        [-o, -o, -zh],
+        [o, -o, -zh],
+        [o, o, -zh],
+        [-o, o, -zh], // 0-3 outer bottom
+        [-o, -o, zh],
+        [o, -o, zh],
+        [o, o, zh],
+        [-o, o, zh], // 4-7 outer top
+        [-i, -i, -zh],
+        [i, -i, -zh],
+        [i, i, -zh],
+        [-i, i, -zh], // 8-11 inner bottom
+        [-i, -i, zh],
+        [i, -i, zh],
+        [i, i, zh],
+        [-i, i, zh], // 12-15 inner top
+    ];
+    let triangles = vec![
+        // outer walls
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+        // inner walls (the hole surface)
+        [8, 12, 13],
+        [8, 13, 9],
+        [9, 13, 14],
+        [9, 14, 10],
+        [10, 14, 15],
+        [10, 15, 11],
+        [11, 15, 12],
+        [11, 12, 8],
+        // bottom annulus (outer 0-3 ↔ inner 8-11)
+        [0, 8, 9],
+        [0, 9, 1],
+        [1, 9, 10],
+        [1, 10, 2],
+        [2, 10, 11],
+        [2, 11, 3],
+        [3, 11, 8],
+        [3, 8, 0],
+        // top annulus (outer 4-7 ↔ inner 12-15)
+        [4, 5, 13],
+        [4, 13, 12],
+        [5, 6, 14],
+        [5, 14, 13],
+        [6, 7, 15],
+        [6, 15, 14],
+        [7, 4, 12],
+        [7, 12, 15],
+    ];
+    Mesh {
+        vertices,
+        triangles,
+    }
+}
+
+/// F6 (the original flange-bore case, faithfully): a peg seated CLEAR inside a
+/// square through-hole must NOT interfere. Tube hole half-size 1.5; peg half-size
+/// 0.5 at the centre → 1.0 clear of every wall. The convex pieces of the tube fill
+/// the hole (VHACD cannot empty a closed through-hole); only the exact TriMesh
+/// distance sees the 1.0 gap. This is what the dumbbell (open gap) missed.
+#[test]
+fn peg_in_a_through_hole_is_clear_not_interfering() {
+    let mut assembly = Assembly::new(InstanceId(0));
+    assembly.add_instance(Instance::new(
+        InstanceId(0),
+        "tube",
+        square_tube(3.0, 1.5, 3.0),
+    ));
+    assembly.add_instance(peg_at(1, 0.5, 0.0));
+    let report = assembly.interference_report();
+    assert!(
+        report.no_static_interference(),
+        "F6: a peg seated clear inside a through-hole must not interfere; got {:?}",
+        report.interfering
+    );
+}
+
+/// TEETH — a peg WIDER than the hole (half-size 1.8 > hole 1.5) bites into the
+/// tube walls: real interference, must still be flagged after the TriMesh gate.
+#[test]
+fn peg_wider_than_the_hole_is_real_interference() {
+    let mut assembly = Assembly::new(InstanceId(0));
+    assembly.add_instance(Instance::new(
+        InstanceId(0),
+        "tube",
+        square_tube(3.0, 1.5, 3.0),
+    ));
+    assembly.add_instance(peg_at(1, 1.8, 0.0));
+    let report = assembly.interference_report();
+    assert!(
+        !report.no_static_interference(),
+        "a peg wider than the hole overlaps the tube walls and must interfere: {:?}",
+        report.interfering
+    );
+}
+
 /// F6 PIN (ignored until convex decomposition lands). Dumbbell lobes span
 /// [−2.8,−1.2] and [1.2,2.8]; the gap is (−1.2, 1.2). A peg of half-size 0.5 at
 /// x=0 spans [−0.5,0.5] — 0.7 clear of each lobe. Correct: no interference.

@@ -7,7 +7,7 @@
 //! later slices; this is the correctness slice.
 
 use crate::types::{Assembly, Instance, InstanceId};
-use parry3d_f64::na::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
+use parry3d_f64::na::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion, Vector3};
 use parry3d_f64::query;
 use parry3d_f64::shape::{ConvexPolyhedron, TriMesh};
 use parry3d_f64::transformation::convex_hull;
@@ -66,6 +66,80 @@ fn instance_trimesh(instance: &Instance) -> Option<TriMesh> {
         .map(|v| Point3::new(v[0], v[1], v[2]))
         .collect();
     Some(TriMesh::new(vertices, instance.mesh.triangles.clone()))
+}
+
+/// Does ANY vertex of `inner` lie strictly inside the SOLID bounded by `outer`?
+/// True ⇒ `inner` penetrates / is enclosed by `outer` even when their surfaces do
+/// not touch — the enclosure case a surface-distance test alone misses. A vertex
+/// is a MATERIAL point of `inner` (unlike its centroid, which for a bored part
+/// sits in its own hole); a neighbour seated in `outer`'s through-HOLE has no
+/// vertex inside the solid, so this stays false there. Vertices are strided so a
+/// fine mesh cannot blow up the O(V·F) probe while still sampling the whole shell.
+fn any_vertex_in_solid(
+    inner: &TriMesh,
+    iso_inner: &Isometry3<f64>,
+    outer: &TriMesh,
+    iso_outer: &Isometry3<f64>,
+) -> bool {
+    let verts = inner.vertices();
+    if verts.is_empty() {
+        return false;
+    }
+    const MAX_SAMPLES: usize = 64;
+    let stride = (verts.len() / MAX_SAMPLES).max(1);
+    verts
+        .iter()
+        .step_by(stride)
+        .any(|v| point_in_solid(outer, iso_outer, &(iso_inner * v)))
+}
+
+/// Is `world_pt` inside the SOLID bounded by `mesh` (placed at `iso`)? Ray-parity:
+/// cast a ray from the point in a fixed generic direction and count triangle
+/// crossings — odd ⇒ inside. Winding-INDEPENDENT (no oriented-normal requirement),
+/// so it is robust on any watertight triangle soup regardless of the tessellator's
+/// convention. Used to tell a neighbour seated in a through-HOLE (outside the
+/// solid ⇒ NOT interference) from one ENCLOSED in the material (inside ⇒
+/// interference) when the two surfaces are separated.
+fn point_in_solid(mesh: &TriMesh, iso: &Isometry3<f64>, world_pt: &Point3<f64>) -> bool {
+    let p = iso.inverse_transform_point(world_pt);
+    // A generic direction dodges degenerate ray-through-edge / ray-through-vertex
+    // hits that would corrupt the parity count.
+    let dir = Vector3::new(1.0, 0.123_456_7, 0.061_803_4).normalize();
+    let verts = mesh.vertices();
+    let mut crossings = 0usize;
+    for tri in mesh.indices() {
+        let (Some(a), Some(b), Some(c)) = (
+            verts.get(tri[0] as usize),
+            verts.get(tri[1] as usize),
+            verts.get(tri[2] as usize),
+        ) else {
+            continue;
+        };
+        // Möller–Trumbore; count only forward crossings (t > 0).
+        let e1 = b - a;
+        let e2 = c - a;
+        let pv = dir.cross(&e2);
+        let det = e1.dot(&pv);
+        if det.abs() < 1.0e-12 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let tv = p - a;
+        let u = tv.dot(&pv) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let qv = tv.cross(&e1);
+        let v = dir.dot(&qv) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let t = e2.dot(&qv) * inv;
+        if t > 1.0e-9 {
+            crossings += 1;
+        }
+    }
+    crossings % 2 == 1
 }
 
 /// The instance's CONVEX HULL as a Parry `ConvexPolyhedron` (local frame). Used
@@ -229,13 +303,19 @@ impl Assembly {
         // Each instance is a SET of convex pieces (a concave part decomposes into
         // several). Decomposition is O(n) over instances — done once here, not in
         // the O(n²) pairwise loop below.
-        let prepared: Vec<(InstanceId, Isometry3<f64>, Vec<ConvexPolyhedron>)> = self
+        let prepared: Vec<(
+            InstanceId,
+            Isometry3<f64>,
+            Option<TriMesh>,
+            Vec<ConvexPolyhedron>,
+        )> = self
             .instances
             .iter()
             .map(|instance| {
                 (
                     instance.id,
                     instance_isometry(instance),
+                    instance_trimesh(instance),
                     instance_convex_pieces(instance),
                 )
             })
@@ -244,13 +324,37 @@ impl Assembly {
         let mut interfering = Vec::new();
         for i in 0..prepared.len() {
             for j in (i + 1)..prepared.len() {
-                let (Some((id_a, pos_a, pieces_a)), Some((id_b, pos_b, pieces_b))) =
+                let (Some((id_a, pos_a, mesh_a, pieces_a)), Some((id_b, pos_b, mesh_b, pieces_b))) =
                     (prepared.get(i), prepared.get(j))
                 else {
                     continue;
                 };
                 if pieces_a.is_empty() || pieces_b.is_empty() {
                     continue; // a degenerate / mesh-less instance cannot interfere
+                }
+
+                // F6 — EXACT mesh separation FIRST. The convex pieces of a bored /
+                // holed part (a flange bore, a washer) each fill the hole (an
+                // annulus's convex hull is a solid disc), so a neighbour seated in
+                // the hole with real clearance false-positives against the pieces —
+                // even VHACD cannot empty a closed through-hole. The exact TriMesh
+                // distance sees the ACTUAL hole. When the two SURFACES are separated
+                // beyond CONTACT_TOL the parts are clear, UNLESS one solid ENCLOSES
+                // the other (a fully-enclosed part also has separated surfaces yet
+                // IS interference) — a through-hole is NOT enclosure (the seated part
+                // sits outside the solid material), so the ray-parity point-in-solid
+                // test distinguishes them. When the surfaces touch / overlap
+                // (distance ~0) we fall through to the piece EPA, which tells a flush
+                // mating contact (depth ~0) from a real penetration.
+                if let (Some(ma), Some(mb)) = (mesh_a, mesh_b) {
+                    if matches!(query::distance(pos_a, ma, pos_b, mb), Ok(d) if d > CONTACT_TOL) {
+                        let enclosed = any_vertex_in_solid(ma, pos_a, mb, pos_b)
+                            || any_vertex_in_solid(mb, pos_b, ma, pos_a);
+                        if !enclosed {
+                            continue; // separated / seated-in-a-hole ⇒ clear
+                        }
+                        // enclosed ⇒ fall through to the piece EPA below
+                    }
                 }
 
                 // Two parts interfere when ANY piece of one overlaps ANY piece of
