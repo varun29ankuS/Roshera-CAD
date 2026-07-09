@@ -113,3 +113,38 @@ fn peg_overlapping_a_lobe_is_real_interference() {
         "real overlap of the peg with a lobe must be flagged as interference",
     );
 }
+
+/// TEETH — the "pipe OD > bore" analogue on a concave part. The dumbbell gap is
+/// (−1.2, 1.2), i.e. 2.4 wide. A peg of half-size 1.4 at x=0 spans [−1.4, 1.4],
+/// so it bites 0.2mm into BOTH lobes — a genuine press-past-fit. Decomposing the
+/// dumbbell into two lobes must still flag this: the fix must not turn every
+/// concave interference clear.
+#[test]
+fn oversized_peg_in_gap_is_real_interference() {
+    let mut assembly = Assembly::new(InstanceId(0));
+    assembly.add_instance(Instance::new(InstanceId(0), "dumbbell", dumbbell(0.8, 2.0)));
+    assembly.add_instance(peg_at(1, 1.4, 0.0));
+    let report = assembly.interference_report();
+    assert!(
+        !report.no_static_interference(),
+        "a peg wider than the gap overlaps both lobes and must interfere: {:?}",
+        report.interfering
+    );
+}
+
+/// TEETH — flush FIT inside the concavity. A peg of half-size 1.2 at x=0 spans
+/// [−1.2, 1.2], seating face-to-face against both lobe inner walls (x=∓1.2).
+/// That is mating CONTACT, not interference — the decomposition must preserve
+/// the flush-vs-overlap distinction inside a concavity, not just in open space.
+#[test]
+fn peg_flush_in_gap_is_contact_not_interference() {
+    let mut assembly = Assembly::new(InstanceId(0));
+    assembly.add_instance(Instance::new(InstanceId(0), "dumbbell", dumbbell(0.8, 2.0)));
+    assembly.add_instance(peg_at(1, 1.2, 0.0));
+    let report = assembly.interference_report();
+    assert!(
+        report.no_static_interference(),
+        "a peg seating flush against the gap walls is contact, not interference: {:?}",
+        report.interfering
+    );
+}

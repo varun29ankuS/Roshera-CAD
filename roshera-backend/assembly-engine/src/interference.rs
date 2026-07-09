@@ -10,6 +10,8 @@ use crate::types::{Assembly, Instance, InstanceId};
 use parry3d_f64::na::{Isometry3, Point3, Quaternion, Translation3, UnitQuaternion};
 use parry3d_f64::query;
 use parry3d_f64::shape::{ConvexPolyhedron, TriMesh};
+use parry3d_f64::transformation::convex_hull;
+use parry3d_f64::transformation::vhacd::{VHACDParameters, VHACD};
 
 /// Two instances found overlapping in world space.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,8 +72,9 @@ fn instance_trimesh(instance: &Instance) -> Option<TriMesh> {
 /// for the penetration-DEPTH interference test: Parry's exact EPA depth on a
 /// convex pair distinguishes a flush mating contact (depth ~0) from real overlap
 /// — a TriMesh contact can't (its surface-touch reads ~0 for both). Exact for
-/// convex parts (cylinders, blocks); a conservative over-approximation for a
-/// concave part until convex decomposition lands. `None` if the hull degenerates.
+/// convex parts (cylinders, blocks). `None` if the hull degenerates. This is the
+/// fallback the per-piece decomposition below reduces to when VHACD yields
+/// nothing usable.
 fn instance_convex(instance: &Instance) -> Option<ConvexPolyhedron> {
     if instance.mesh.vertices.len() < 4 {
         return None;
@@ -83,6 +86,131 @@ fn instance_convex(instance: &Instance) -> Option<ConvexPolyhedron> {
         .map(|v| Point3::new(v[0], v[1], v[2]))
         .collect();
     ConvexPolyhedron::from_convex_hull(&points)
+}
+
+/// VHACD parameters for the interference decomposition. Tuned for CAD parts
+/// (bores, pockets, slots), not organic meshes, and reached only for a part the
+/// convexity gate found genuinely concave:
+/// - `resolution: 16` — voxel-grid resolution along the longest axis. A
+///   bore/gap-class concavity (bore Ø30 in a ~50mm part → ~10 voxels across;
+///   the dumbbell gap → ~7) still separates cleanly, while keeping voxelization
+///   cheap: the DEBUG build voxelizes tens-of-thousands× slower than release, so
+///   the dim3 default of 64 made a single concave part take seconds unoptimized.
+///   Piece HULL precision is unaffected — `compute_exact_convex_hulls` re-derives
+///   hulls from the original triangles, so resolution only sets WHERE the cut
+///   lands (in the gap), not the face positions. Decomposition is O(n) per report
+///   (once per instance, not per pair).
+/// - `concavity: 0.01` (the dim3 default) — the split threshold. A part is kept
+///   whole only when its hull barely over-approximates it; a hull that fills a
+///   concavity (dumbbell gap, flange bore) is far above 0.01 and is split. A
+///   perfectly convex part (block, cylinder hull) has concavity 0 and stays one
+///   piece, so flush-mating semantics are unchanged.
+/// - `max_convex_hulls: 32` — a hard guard against piece-count explosion (and
+///   thus against O(pieces²) blow-up in the pairwise contact test). CAD bore /
+///   pocket concavities need a handful of pieces; 32 is generous headroom while
+///   bounding the worst case.
+fn vhacd_params() -> VHACDParameters {
+    VHACDParameters {
+        resolution: 16,
+        concavity: 0.01,
+        max_convex_hulls: 32,
+        ..VHACDParameters::default()
+    }
+}
+
+/// Enclosed volume of a closed triangle soup by the divergence theorem:
+/// `V = (1/6) Σ v0 · (v1 × v2)`. Winding only flips the sign, so the magnitude
+/// is the volume regardless of orientation convention. A garbage value on a
+/// non-closed / inconsistently-wound mesh only pushes the caller onto the
+/// (correct, slower) VHACD path — never the other way.
+fn triangle_soup_volume(points: &[Point3<f64>], indices: &[[u32; 3]]) -> f64 {
+    let mut six_v = 0.0;
+    for tri in indices {
+        let (Some(a), Some(b), Some(c)) = (
+            points.get(tri[0] as usize),
+            points.get(tri[1] as usize),
+            points.get(tri[2] as usize),
+        ) else {
+            continue;
+        };
+        six_v += a.coords.dot(&b.coords.cross(&c.coords));
+    }
+    (six_v / 6.0).abs()
+}
+
+/// Whether the part is (numerically) convex: its enclosed volume equals its
+/// convex hull's. A convex solid fills its own hull exactly; a concavity that
+/// matters for interference (a bore, a pocket, the dumbbell gap) removes a
+/// percent-level chunk of volume, far above the tolerance. The check is cheap
+/// (one hull build + two O(F) volume sums) and lets every convex part — the
+/// overwhelming common case — skip VHACD entirely. The tolerance is relative so
+/// it is scale-free; a sub-0.01% concavity cannot swallow a seated part, so
+/// calling it convex is correct, not a regression.
+fn is_convex(points: &[Point3<f64>], mesh_indices: &[[u32; 3]]) -> bool {
+    let (hull_points, hull_indices) = convex_hull(points);
+    let hull_volume = triangle_soup_volume(&hull_points, &hull_indices);
+    if hull_volume <= 0.0 {
+        return false; // degenerate hull ⇒ take the thorough path
+    }
+    let mesh_volume = triangle_soup_volume(points, mesh_indices);
+    const CONVEX_VOLUME_REL_TOL: f64 = 1.0e-4;
+    (hull_volume - mesh_volume).abs() <= CONVEX_VOLUME_REL_TOL * hull_volume
+}
+
+/// Decompose the instance mesh into a SET of convex pieces (local frame) via
+/// approximate convex decomposition (VHACD). A concave part — a bored flange, a
+/// pocket, the dumbbell gap — becomes several convex hulls, so a neighbour
+/// seated in the concavity is no longer swallowed by a single hull that fills
+/// it (finding F6). A convex part decomposes to a single piece equal to its own
+/// hull, so the flush-mating-vs-overlap distinction is unchanged.
+///
+/// `compute_exact_convex_hulls` re-derives each piece's hull from the ORIGINAL
+/// mesh primitives (not the voxel corners), so piece boundaries stay on the true
+/// part surface — essential for the flush-contact depth test to read ~0 at a
+/// real mating face rather than a voxel-inflated one.
+///
+/// Falls back to the single convex hull when the mesh is too small to voxelize
+/// or VHACD yields no usable piece, so a degenerate part behaves exactly as
+/// before (never a silent empty set that would hide a real overlap).
+fn instance_convex_pieces(instance: &Instance) -> Vec<ConvexPolyhedron> {
+    if instance.mesh.vertices.len() < 4 || instance.mesh.triangles.is_empty() {
+        return instance_convex(instance).into_iter().collect();
+    }
+    let points: Vec<Point3<f64>> = instance
+        .mesh
+        .vertices
+        .iter()
+        .map(|v| Point3::new(v[0], v[1], v[2]))
+        .collect();
+    let indices = instance.mesh.triangles.clone();
+
+    // Fast path: a convex part IS its own hull, so decomposition is a no-op —
+    // skip the (voxelization-heavy) VHACD entirely. This keeps every block,
+    // cylinder, sphere, and flush-mating part on the cheap single-hull path;
+    // only genuinely concave parts pay for decomposition.
+    if is_convex(&points, &indices) {
+        return instance_convex(instance).into_iter().collect();
+    }
+
+    // `keep_voxel_to_primitives_map = true` is required by
+    // `compute_exact_convex_hulls` (it maps voxels back to the source triangles).
+    let decomposition = VHACD::decompose(&vhacd_params(), &points, &indices, true);
+    let mut pieces: Vec<ConvexPolyhedron> = decomposition
+        .compute_exact_convex_hulls(&points, &indices)
+        .into_iter()
+        .filter_map(|(hull_points, _hull_indices)| {
+            if hull_points.len() < 4 {
+                None
+            } else {
+                ConvexPolyhedron::from_convex_hull(&hull_points)
+            }
+        })
+        .collect();
+
+    if pieces.is_empty() {
+        pieces.extend(instance_convex(instance));
+    }
+    pieces
 }
 
 impl Assembly {
@@ -98,14 +226,17 @@ impl Assembly {
         // which a contact is evaluated at all.
         const CONTACT_TOL: f64 = 1.0e-3;
         const PREDICTION: f64 = 1.0e-2;
-        let prepared: Vec<(InstanceId, Isometry3<f64>, Option<ConvexPolyhedron>)> = self
+        // Each instance is a SET of convex pieces (a concave part decomposes into
+        // several). Decomposition is O(n) over instances — done once here, not in
+        // the O(n²) pairwise loop below.
+        let prepared: Vec<(InstanceId, Isometry3<f64>, Vec<ConvexPolyhedron>)> = self
             .instances
             .iter()
             .map(|instance| {
                 (
                     instance.id,
                     instance_isometry(instance),
-                    instance_convex(instance),
+                    instance_convex_pieces(instance),
                 )
             })
             .collect();
@@ -113,32 +244,51 @@ impl Assembly {
         let mut interfering = Vec::new();
         for i in 0..prepared.len() {
             for j in (i + 1)..prepared.len() {
-                let (Some((id_a, pos_a, conv_a)), Some((id_b, pos_b, conv_b))) =
+                let (Some((id_a, pos_a, pieces_a)), Some((id_b, pos_b, pieces_b))) =
                     (prepared.get(i), prepared.get(j))
                 else {
                     continue;
                 };
-                let (Some(ca), Some(cb)) = (conv_a, conv_b) else {
+                if pieces_a.is_empty() || pieces_b.is_empty() {
                     continue; // a degenerate / mesh-less instance cannot interfere
-                };
-                let interfered = match query::contact(pos_a, ca, pos_b, cb, PREDICTION) {
-                    // EPA penetration depth: negative when the hulls overlap.
-                    Ok(Some(c)) if c.dist < -CONTACT_TOL => Some(c.dist),
-                    // Touching contact (mating faces seat flush) ⇒ allowed.
-                    Ok(Some(_)) => None,
-                    // None (separated, OR an EPA degeneracy on a deep/exact
-                    // overlap) or Err (unsupported pair): disambiguate
-                    // conservatively with the boolean overlap test. This cannot
-                    // re-flag a flush contact, which returns `Some`, not `None`.
-                    _ => {
-                        if query::intersection_test(pos_a, ca, pos_b, cb).unwrap_or(false) {
-                            Some(0.0)
-                        } else {
-                            None
+                }
+
+                // Two parts interfere when ANY piece of one overlaps ANY piece of
+                // the other beyond CONTACT_TOL. Flush mating between pieces reads
+                // depth ~0 (Some, > -CONTACT_TOL) and is NOT interference, exactly
+                // as with the single hull. Report the deepest penetration found.
+                let mut worst: Option<f64> = None;
+                'pairs: for ca in pieces_a {
+                    for cb in pieces_b {
+                        let depth = match query::contact(pos_a, ca, pos_b, cb, PREDICTION) {
+                            // EPA penetration depth: negative when the pieces overlap.
+                            Ok(Some(c)) if c.dist < -CONTACT_TOL => Some(c.dist),
+                            // Touching contact (mating faces seat flush) ⇒ allowed.
+                            Ok(Some(_)) => None,
+                            // None (separated, OR an EPA degeneracy on a deep/exact
+                            // overlap) or Err (unsupported pair): disambiguate
+                            // conservatively with the boolean overlap test. This
+                            // cannot re-flag a flush contact, which returns `Some`,
+                            // not `None`.
+                            _ => {
+                                if query::intersection_test(pos_a, ca, pos_b, cb).unwrap_or(false) {
+                                    Some(0.0)
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(d) = depth {
+                            worst = Some(worst.map_or(d, |w| w.min(d)));
+                            // A boolean-detected deep overlap (0.0) is already the
+                            // strongest possible verdict; no deeper depth to find.
+                            if d >= 0.0 {
+                                break 'pairs;
+                            }
                         }
                     }
-                };
-                if let Some(depth) = interfered {
+                }
+                if let Some(depth) = worst {
                     interfering.push(InterferencePair {
                         a: *id_a,
                         b: *id_b,
