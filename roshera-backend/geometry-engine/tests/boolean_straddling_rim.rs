@@ -186,9 +186,6 @@ fn f7_coaxial_control_is_sound() {
 // honest END target (fully certified sound) and stay ignored until Phase C.
 
 #[test]
-#[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
-            *_no_duplicate_fans); full soundness (nm=bnd=0) needs Phase C \
-            source-face material-extent arc-clip — escalated, see 32b report"]
 fn f7_straddling_offset_10_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 10.0);
@@ -203,9 +200,6 @@ fn f7_straddling_offset_10_is_sound() {
 }
 
 #[test]
-#[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
-            *_no_duplicate_fans); full soundness (nm=bnd=0) needs Phase C \
-            source-face material-extent arc-clip — escalated, see 32b report"]
 fn f7_straddling_offset_12_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 12.0);
