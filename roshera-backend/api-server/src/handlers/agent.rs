@@ -842,14 +842,14 @@ pub struct OrbitResponse {
 }
 
 pub async fn part_orbit(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<OrbitQuery>,
 ) -> Result<Json<OrbitResponse>, StatusCode> {
     use base64::Engine as _;
     use geometry_engine::math::Vector3;
-    use geometry_engine::render::{render_solid_dir, CanonicalView, RenderMode, RenderOptions};
+    use geometry_engine::render::{render_solids_dir, CanonicalView, RenderMode, RenderOptions};
 
     let az = q.az.unwrap_or(45.0).to_radians();
     let el = q.el.unwrap_or(30.0).to_radians();
@@ -873,15 +873,25 @@ pub async fn part_orbit(
     let size = q.size.unwrap_or(512).clamp(64, 2048);
 
     let model = model_handle.read().await;
-    let frame = render_solid_dir(
+    // F4c — honour the set_part_color registry so the Agent-Eye "Part" view
+    // shows the colour the user set (scene_orbit already does this for the
+    // "Assembly" view). render_solids_dir on a single id frames identically to
+    // render_solid_dir but takes a per-solid colour; default light grey.
+    let color = state
+        .solid_colors
+        .get(&(id as SolidId))
+        .map(|c| *c)
+        .unwrap_or([200, 200, 200]);
+    let frame = render_solids_dir(
         &model,
-        id as SolidId,
+        &[id as SolidId],
+        &[color],
         dir,
         up_hint,
         &RenderOptions {
             width: size,
             height: size,
-            view: CanonicalView::Isometric, // ignored by render_solid_dir
+            view: CanonicalView::Isometric, // ignored by the direction render
             mode,
             ..Default::default()
         },
