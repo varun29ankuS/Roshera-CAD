@@ -350,6 +350,31 @@ async fn seed_box(state: &AppState, size: f64) -> (Uuid, SolidId, [EdgeId; 3]) {
     (uuid, solid_id, corner_edges)
 }
 
+/// F4a — a reconnecting client's scene resync ships each object as a
+/// colourless `ObjectCreated`; the registry colour was dropped, so a part
+/// coloured before a reload came back grey. `current_scene_frames` must now
+/// re-emit the registered colour as an `ObjectColor` frame so the live path
+/// (which already works) repaints it.
+#[tokio::test]
+async fn scene_resync_replays_registered_colour() {
+    let state = make_test_state().await;
+    let (uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+    state.solid_colors.insert(solid_id, [200, 80, 60]);
+
+    let frames = crate::current_scene_frames(&state).await;
+    assert!(
+        frames.iter().any(|f| {
+            f.contains("\"type\":\"ObjectColor\"")
+                && f.contains(&uuid.to_string())
+                && f.contains("200")
+        }),
+        "F4a: scene-resync frames must include an ObjectColor for the coloured \
+         solid so it isn't grey after reload; got {} frame(s): {}",
+        frames.len(),
+        frames.join(" | ")
+    );
+}
+
 /// Seed a `size × size × size` box and return three *mutually
 /// vertex-disjoint* edges from it (no two share an endpoint).
 ///

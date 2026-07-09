@@ -6632,6 +6632,25 @@ pub(crate) async fn current_scene_frames(state: &AppState) -> Vec<String> {
         };
         if let Some(text) = build_object_created_frame(uuid, solid_id, solid, &model) {
             frames.push(text);
+            // F4a — the ObjectCreated frame carries the default material; the
+            // registry colour lives separately (set_part_color → solid_colors)
+            // and is normally applied by a live ObjectColor broadcast. On a
+            // reconnect/resync that broadcast is in the past, so re-emit it here
+            // — otherwise a part coloured before a reload comes back grey. Reuses
+            // the proven ObjectColor path (frontend `setObjectColor`); no-op when
+            // the solid has no registered colour.
+            if let Some(color) = state.solid_colors.get(&solid_id) {
+                let color_frame = serde_json::json!({
+                    "type": "ObjectColor",
+                    "payload": {
+                        "object_id": uuid.to_string(),
+                        "color": *color,
+                    }
+                });
+                if let Ok(color_text) = serde_json::to_string(&color_frame) {
+                    frames.push(color_text);
+                }
+            }
         }
     }
     frames
