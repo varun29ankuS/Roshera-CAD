@@ -158,3 +158,6 @@ TEST_PLAN.md
 .step_verify/
 loops-out/
 .nautilus.json
+
+# Obsidian docs vault (lives in-repo for convenience, not part of the codebase)
+Roshera-vault/
