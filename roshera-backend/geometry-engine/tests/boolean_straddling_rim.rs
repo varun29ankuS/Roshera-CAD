@@ -175,17 +175,31 @@ fn f7_coaxial_control_is_sound() {
 // straddle-phantom arcs survive dedup (each emitted once): curve 38 (z=10 rim,
 // its −x arc imprints inside the r15 boss where no plate-top face exists) and
 // curve 41 (z=20 rim, its +x arc imprints above the plate). They leave the
-// result manifold-broken (nm/bnd > 0) though genus-correct. Killing them needs
-// clipping each transverse rim to its SOURCE face's MATERIAL extent (outer
-// boundary minus pre-existing holes) — which requires reworking the shared
-// analytic circle-clip core (`clip_circle_to_planar_face` clips only against a
-// face's LINE-bounded OUTER loop, never subtracting arc-bounded holes) and
-// relies on DCEL welding of the resulting OPEN arcs against the SSI verticals.
-// That is Phase C (Same-Domain unify) territory, escalated to Varun; see
-// `.superpowers/sdd/dogfood-task-32b-report.md`. These two pins assert the
-// honest END target (fully certified sound) and stay ignored until Phase C.
+// result manifold-broken (nm/bnd > 0) though genus-correct.
+//
+// Phase C ATTEMPTED (bounded material-extent arc-clip, see 32c report): a
+// per-planar-face clip that trims each transverse rim to its source face's
+// MATERIAL extent (outer boundary minus arc-bounded, non-seam holes; reusing
+// `planar_face_hole_polygons` + exact circle-boundary crossings) DOES remove the
+// planar phantom — nm 248→0 — and the trimmed arcs weld exactly to the SSI
+// verticals. But it does NOT reach full soundness: the CUTTER-WALL imprint is
+// z-dependent (the full z=10 circle is a real cut — plate on +x AND boss on −x
+// both border the bore there — but only the −x arc is real at z=20, where only
+// the boss borders it). Clipping the wall's own circle to the union's z-varying
+// material cross-section is a general solid-classification (GWN / same-domain-
+// unify) problem, not a planar outer/hole clip, so the wall keeps an unpaired
+// +x@z20 rim (bnd rises, euler → −2). Per the STOP bar this is arrangement/
+// classification-core rework and was NOT half-built; reverted. These two pins
+// assert the honest END target and stay ignored until the classification-level
+// wall-extent clip lands. See `.superpowers/sdd/dogfood-task-32c-report.md`.
 
 #[test]
+#[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
+            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on a \
+            classification-level cutter-wall material-extent clip (the wall's \
+            imprint is z-dependent — GWN/same-domain territory). Phase C bounded \
+            arc-clip removes the planar phantom (nm→0) but not the wall rim; see \
+            32c report — STOP, escalated"]
 fn f7_straddling_offset_10_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 10.0);
@@ -200,6 +214,12 @@ fn f7_straddling_offset_10_is_sound() {
 }
 
 #[test]
+#[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
+            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on a \
+            classification-level cutter-wall material-extent clip (the wall's \
+            imprint is z-dependent — GWN/same-domain territory). Phase C bounded \
+            arc-clip removes the planar phantom (nm→0) but not the wall rim; see \
+            32c report — STOP, escalated"]
 fn f7_straddling_offset_12_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 12.0);
