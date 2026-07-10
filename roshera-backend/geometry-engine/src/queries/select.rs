@@ -262,6 +262,31 @@ impl BlendFilter {
     }
 }
 
+/// Convexity filter — addresses "the concave edges" / "the convex edges". The
+/// sign convention is the kernel's edge classification (`classify_edge` /
+/// `edge.attributes.convexity`): `+1` convex, `-1` concave, `0` straight / G1 /
+/// undefined. `Smooth` and undefined edges match NEITHER `Convex` nor `Concave`
+/// — a concave-corner blend must target genuinely re-entrant edges, not a
+/// tangent-continuous join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Convexity {
+    Any,
+    Convex,
+    Concave,
+}
+
+impl Convexity {
+    /// Match a classified convexity sign (`+1` convex, `-1` concave, `0`
+    /// smooth/undefined).
+    fn matches(self, convexity: i8) -> bool {
+        match self {
+            Convexity::Any => true,
+            Convexity::Convex => convexity == 1,
+            Convexity::Concave => convexity == -1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum EdgeExtremal {
     None,
@@ -276,6 +301,8 @@ pub enum EdgeExtremal {
 pub struct EdgeQuery {
     pub kind: CurveKind,
     pub blend: BlendFilter,
+    /// Require the edge's classified convexity (convex / concave / any).
+    pub convexity: Convexity,
     /// Require the edge's chord direction to align with this (sign-insensitive).
     pub direction: Option<Vector3>,
     pub angle_tol_deg: f64,
@@ -287,6 +314,7 @@ impl EdgeQuery {
         Self {
             kind,
             blend: BlendFilter::Any,
+            convexity: Convexity::Any,
             direction: None,
             angle_tol_deg: 12.0,
             extremal: EdgeExtremal::None,
@@ -294,6 +322,10 @@ impl EdgeQuery {
     }
     pub fn blend(mut self, b: BlendFilter) -> Self {
         self.blend = b;
+        self
+    }
+    pub fn convexity(mut self, c: Convexity) -> Self {
+        self.convexity = c;
         self
     }
     pub fn along(mut self, dir: Vector3) -> Self {
@@ -331,6 +363,27 @@ fn solid_edge_ids(model: &BRepModel, solid: SolidId) -> Vec<crate::primitives::e
         }
     }
     out
+}
+
+/// Classified convexity sign of an edge (`+1` convex, `-1` concave, `0`
+/// smooth/undefined). Prefers the F2-α cache when the edge is already
+/// classified; otherwise classifies it READ-ONLY from geometry via
+/// [`crate::operations::edge_classification::classify_edge`] (the same
+/// dihedral-sign classifier the blend graph uses). Read-only by design so it
+/// runs under the immutable-borrow candidate loop — resolving an edge never
+/// mutates the model, and the classifier's own result is deterministic whether
+/// or not it was cached. A classification failure yields `0` (matches neither
+/// Convex nor Concave), so an unclassifiable edge is honestly EXCLUDED rather
+/// than silently returned.
+fn edge_convexity_sign(model: &BRepModel, eid: crate::primitives::edge::EdgeId) -> i8 {
+    if let Some(edge) = model.edges.get(eid) {
+        if edge.attributes.is_classified() {
+            return edge.attributes.convexity;
+        }
+    }
+    crate::operations::edge_classification::classify_edge(model, eid)
+        .map(|c| c.convexity)
+        .unwrap_or(0)
 }
 
 /// Length (cached) or midpoint·dir for the extremal pick — split field borrows.
@@ -383,6 +436,12 @@ pub fn resolve_edge(
             .get(solid)
             .and_then(|s| s.blend_kind_at_edge(eid));
         if !q.blend.matches(blend) {
+            continue;
+        }
+        // Convexity is only classified when the filter asks for it — the
+        // default (Any) path stays borrow-for-borrow identical to before and
+        // pays no classification cost.
+        if q.convexity != Convexity::Any && !q.convexity.matches(edge_convexity_sign(model, eid)) {
             continue;
         }
         if let Some(d) = want_dir {

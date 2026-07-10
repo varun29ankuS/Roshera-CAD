@@ -209,19 +209,21 @@ export function registerInspectTools(server: McpServer) {
   server.tool(
     "select_edge",
     "Address an EDGE by description — resolves or REFUSES. `curve_kind`, a " +
-      "`blend` filter (filleted/chamfered/unblended), optional `direction`, " +
-      "optional `extremal`. Returns edge_id + persistent_id, or `ambiguous` / " +
-      "`not_found`.",
+      "`blend` filter (filleted/chamfered/unblended), optional `convexity` " +
+      "(convex/concave) — concave = re-entrant/interior edges, target these to " +
+      "fillet a concave corner — optional `direction`, optional `extremal`. " +
+      "Returns edge_id + persistent_id, or `ambiguous` / `not_found`.",
     {
       part_id: z.number().int(),
       curve_kind: z.enum(["any", "line", "arc", "circle", "nurbs"]).default("any"),
       blend: z.enum(["any", "filleted", "chamfered", "unblended"]).default("any"),
+      convexity: z.enum(["any", "convex", "concave"]).default("any"),
       direction: z.tuple([z.number(), z.number(), z.number()]).optional(),
       extremal: z.enum(["none", "longest", "shortest", "most_along"]).default("none"),
       along: z.tuple([z.number(), z.number(), z.number()]).optional(),
       angle_tol_deg: z.number().default(12),
     },
-    async ({ part_id, curve_kind, blend, direction, extremal, along, angle_tol_deg }) => {
+    async ({ part_id, curve_kind, blend, convexity, direction, extremal, along, angle_tol_deg }) => {
       try {
         const res = await fetch(`${BASE}/api/agent/parts/${part_id}/select-edge`, {
           method: "POST",
@@ -229,6 +231,7 @@ export function registerInspectTools(server: McpServer) {
           body: JSON.stringify({
             curve_kind,
             blend,
+            convexity,
             direction: direction ?? null,
             extremal,
             along: along ?? null,

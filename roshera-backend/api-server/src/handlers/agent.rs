@@ -1396,8 +1396,9 @@ pub async fn select_face(
 
 /// `POST /api/agent/parts/{id}/select-edge` — resolve an edge by DESCRIPTION, or
 /// REFUSE. Body: `{ "curve_kind": "line|arc|circle|nurbs|any", "blend":
-/// "any|filleted|chamfered|unblended", "direction": [x,y,z]?, "angle_tol_deg":
-/// 12?, "extremal": "none|longest|shortest|most_along", "along": [x,y,z]? }`.
+/// "any|filleted|chamfered|unblended", "convexity": "any|convex|concave",
+/// "direction": [x,y,z]?, "angle_tol_deg": 12?, "extremal":
+/// "none|longest|shortest|most_along", "along": [x,y,z]? }`.
 /// 200 → `{edge_id, persistent_id}`; 404 → not found; 409 → ambiguous (candidate
 /// edge ids). Mirrors `select_face`; the kernel never guesses.
 pub async fn select_edge(
@@ -1408,7 +1409,7 @@ pub async fn select_edge(
 ) -> (StatusCode, Json<serde_json::Value>) {
     use geometry_engine::math::Vector3;
     use geometry_engine::queries::select::{
-        resolve_edge, BlendFilter, CurveKind, EdgeExtremal, EdgeQuery, SelectError,
+        resolve_edge, BlendFilter, Convexity, CurveKind, EdgeExtremal, EdgeQuery, SelectError,
     };
 
     let curve_kind = match body
@@ -1427,6 +1428,15 @@ pub async fn select_edge(
         "chamfered" | "chamfer" => BlendFilter::Chamfered,
         "unblended" | "none" => BlendFilter::Unblended,
         _ => BlendFilter::Any,
+    };
+    let convexity = match body
+        .get("convexity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("any")
+    {
+        "convex" => Convexity::Convex,
+        "concave" => Convexity::Concave,
+        _ => Convexity::Any,
     };
     let vec3 = |key: &str| -> Option<Vector3> {
         body.get(key).and_then(|v| v.as_array()).and_then(|a| {
@@ -1451,6 +1461,7 @@ pub async fn select_edge(
     };
     let mut q = EdgeQuery::new(curve_kind);
     q.blend = blend;
+    q.convexity = convexity;
     q.direction = direction;
     q.extremal = extremal;
     if let Some(t) = body.get("angle_tol_deg").and_then(|v| v.as_f64()) {
