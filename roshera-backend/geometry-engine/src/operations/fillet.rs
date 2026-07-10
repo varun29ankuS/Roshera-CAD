@@ -691,7 +691,7 @@ pub fn fillet_edges(
         }
 
         // Propagate edge selection if requested
-        let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
+        let mut selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
 
         // F3-δ.4: build the F2-β blend graph for the full selection.
         // The graph carries per-edge convexity / dihedral / manifold-
@@ -709,6 +709,106 @@ pub fn fillet_edges(
             .map(|&eid| (eid, fillet_type_to_blend_radius(&options.fillet_type, eid)))
             .collect();
         let mut blend_graph = blend_graph::build(model, &blend_selection)?;
+
+        // RESILIENT corner pre-flight (live-dogfood fix, 2026-07-10): a
+        // `fillet all edges` request on a booleaned part (e.g. a corner-notched
+        // box) mixes edges whose shared corners the kernel CAN synthesize
+        // (degree-3 convex / concave apex spheres) with corners it CANNOT yet
+        // (Mixed convexity, Cliff, degree-2 sharp, degree≥4). The per-edge
+        // surgery removes a shared vertex on the FIRST incident edge's splice
+        // unless that vertex is flagged corner-shared (only degree-3 apex kinds
+        // are), so a later incident edge's `splice_blend_edge` referencing that
+        // now-consumed vertex failed validation with
+        // `BlendEdgeSurgery original_v? N missing from model` — a surgery
+        // bookkeeping crash / 500, not the graceful behaviour the `fillet_edges`
+        // contract promises ("seams / over-radius edges are SKIPPED — it rounds
+        // everything it can rather than refusing the whole op").
+        //
+        // Honour that contract by DROPPING the incident edges of every
+        // unsupported multi-edge corner up front (before any destructive
+        // surgery), rounding the rest. `classify_vertex_kind` is a pure function
+        // of the SELECTED edges' cached convexity, so the drop is a combinatorial
+        // fixpoint over the selection (dropping one edge can demote a neighbour
+        // corner's degree — e.g. a degree-3 box apex whose third edge fed a
+        // Mixed corner becomes an unsupported degree-2 — so we iterate to
+        // stability). No model mutation happens here; the reduced selection then
+        // flows through the normal pipeline, whose surgery only ever removes a
+        // shared vertex at a degree-3 apex it will re-cap.
+        // Corners handled by the mixed-kind (fillet+chamfer) machinery are NOT
+        // dropped: their shared vertex is preserved through surgery
+        // (`corner_shared = true`) and closed by the partial-mixed cap path, so
+        // the classifier's "unsupported sharp/mixed" verdict does not apply.
+        // Mirror the three `corner_shared` triggers at the surgery site
+        // (see `create_fillet_chain`): explicit opt-in, an auto-detected pending
+        // mixed-kind corner, and a vertex already carrying an opposite-kind
+        // (chamfer) blend from a first call.
+        let exempt_vertices: HashSet<VertexId> = {
+            let mut ex: HashSet<VertexId> =
+                options.partial_corner_vertices.iter().copied().collect();
+            if let Some(solid) = model.solids.get(solid_id) {
+                for &vid in solid.pending_mixed_kind_corners().keys() {
+                    ex.insert(vid);
+                }
+                for &eid in &selected_edges {
+                    if let Some(edge) = model.edges.get(eid) {
+                        for vid in [edge.start_vertex, edge.end_vertex] {
+                            if solid
+                                .vertex_blend_set(vid)
+                                .map(|set| set.contains(BlendKind::Chamfer))
+                                .unwrap_or(false)
+                            {
+                                ex.insert(vid);
+                            }
+                        }
+                    }
+                }
+            }
+            ex
+        };
+
+        // Only edges the graph accepted as FILLETABLE (manifold + defined
+        // dihedral) reach surgery — `blend_graph::build` already drops seam /
+        // open-boundary edges (a drilled-hole wall seam, etc.) and they never
+        // touch a shared corner. Confine the corner fixpoint to that universe so
+        // a seam edge's missing dihedral is not misread as a `Cliff` that would
+        // spuriously drop the real rim edges around it.
+        let filletable: HashSet<EdgeId> = blend_graph.edges.keys().copied().collect();
+        let retained = retain_synthesizable_corner_edges(model, &filletable, &exempt_vertices);
+        if retained.len() < filletable.len() {
+            if retained.is_empty() {
+                // Every filletable edge is incident to an unsupported corner —
+                // nothing can be rounded. Refuse cleanly (transactional via the
+                // enclosing `with_rollback`) with a typed reason naming an
+                // offending corner, never a surgery crash.
+                let (vertex, kind) = first_unsupported_corner(model, &filletable, &exempt_vertices)
+                    .unwrap_or((0, BlendVertexKind::Cliff));
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::VertexBlendUnsupported {
+                        vertex,
+                        kind,
+                        reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    },
+                )));
+            }
+            tracing::debug!(
+                target: "geometry_engine::blend",
+                "fillet: dropped {} edge(s) incident to unsupported (Mixed / Cliff / \
+                 non-apex-degree) corners; rounding {} of {} filletable",
+                filletable.len() - retained.len(),
+                retained.len(),
+                filletable.len(),
+            );
+            // Keep non-filletable selected edges as-is (build re-drops them
+            // consistently); drop only the problematic filletable ones.
+            let keep_filletable: HashSet<EdgeId> = retained.iter().copied().collect();
+            selected_edges.retain(|e| keep_filletable.contains(e) || !filletable.contains(e));
+            let blend_selection: Vec<(EdgeId, BlendRadius)> = selected_edges
+                .iter()
+                .map(|&eid| (eid, fillet_type_to_blend_radius(&options.fillet_type, eid)))
+                .collect();
+            blend_graph = blend_graph::build(model, &blend_selection)?;
+        }
+
         blend_graph::compute_setbacks(model, &mut blend_graph)?;
         // F5-α.3: refine setbacks at `ConvexCorner { degree: 3 }`
         // apex corners. The Hoffmann smooth-closure value from
@@ -1226,6 +1326,105 @@ fn is_three_edge_apex_corner(blend_graph: &BlendGraph, vertex: VertexId) -> bool
         Some(BlendVertexKind::ConvexCorner { degree: 3 })
             | Some(BlendVertexKind::ConcaveCorner { degree: 3 })
     )
+}
+
+/// A vertex shared by ≥2 selected blend edges is only SAFE for the per-edge
+/// surgery + corner-transition pipeline when the kernel can synthesize its
+/// corner patch. Today that is exactly the degree-3 convex / concave apex
+/// sphere (Task #82 Slice 1), plus the tangent-smooth degree-2 chain interior
+/// (`Smooth`), which carries the spine through continuously and needs no patch.
+/// Every other multi-edge classification (`Mixed`, `Cliff`, sharp degree-2,
+/// degree ≥ 4) has no patch synthesizer: filleting its incident edges runs the
+/// destructive splice that consumes the shared vertex and crashes the corner's
+/// remaining edges. Degree-1 vertices (a single incident edge) are always safe
+/// — the per-edge cylinder fillet closes its own termination.
+fn is_synthesizable_corner(kind: BlendVertexKind, kept_degree: usize) -> bool {
+    if kept_degree <= 1 {
+        return true;
+    }
+    matches!(
+        kind,
+        BlendVertexKind::ConvexCorner { degree: 3 }
+            | BlendVertexKind::ConcaveCorner { degree: 3 }
+            | BlendVertexKind::Smooth
+    )
+}
+
+/// Map every vertex touched by `edges` to the subset of `edges` incident to it.
+fn incident_edges_by_vertex(
+    model: &BRepModel,
+    edges: &HashSet<EdgeId>,
+) -> HashMap<VertexId, Vec<EdgeId>> {
+    let mut out: HashMap<VertexId, Vec<EdgeId>> = HashMap::new();
+    for &eid in edges {
+        if let Some(edge) = model.edges.get(eid) {
+            out.entry(edge.start_vertex).or_default().push(eid);
+            if edge.end_vertex != edge.start_vertex {
+                out.entry(edge.end_vertex).or_default().push(eid);
+            }
+        }
+    }
+    out
+}
+
+/// Combinatorial fixpoint: drop every edge incident to an unsupported multi-edge
+/// corner, iterating until the retained selection has ONLY synthesizable corners
+/// (see [`is_synthesizable_corner`]). Pure — reads cached edge classification via
+/// [`blend_graph::classify_vertex_kind`] and mutates nothing in `model`. The
+/// returned survivors are unordered — the caller re-derives selection order by
+/// filtering its own ordered edge list against this set.
+fn retain_synthesizable_corner_edges(
+    model: &BRepModel,
+    universe: &HashSet<EdgeId>,
+    exempt: &HashSet<VertexId>,
+) -> Vec<EdgeId> {
+    let mut keep: HashSet<EdgeId> = universe.clone();
+    loop {
+        let incidence = incident_edges_by_vertex(model, &keep);
+        let mut to_drop: HashSet<EdgeId> = HashSet::new();
+        for (vid, inc) in &incidence {
+            if inc.len() < 2 || exempt.contains(vid) {
+                continue;
+            }
+            let kind = blend_graph::classify_vertex_kind(model, inc);
+            if !is_synthesizable_corner(kind, inc.len()) {
+                to_drop.extend(inc.iter().copied());
+            }
+        }
+        if to_drop.is_empty() {
+            break;
+        }
+        keep.retain(|e| !to_drop.contains(e));
+        if keep.is_empty() {
+            break;
+        }
+    }
+    keep.into_iter().collect()
+}
+
+/// Locate the first vertex in `universe` whose corner the kernel cannot
+/// synthesize, for a typed refusal when NOTHING is roundable. Returns the
+/// vertex id and its classification.
+fn first_unsupported_corner(
+    model: &BRepModel,
+    universe: &HashSet<EdgeId>,
+    exempt: &HashSet<VertexId>,
+) -> Option<(VertexId, BlendVertexKind)> {
+    let incidence = incident_edges_by_vertex(model, universe);
+    // Deterministic: scan vertices in ascending id order.
+    let mut vids: Vec<VertexId> = incidence.keys().copied().collect();
+    vids.sort_unstable();
+    for vid in vids {
+        let inc = &incidence[&vid];
+        if inc.len() < 2 || exempt.contains(&vid) {
+            continue;
+        }
+        let kind = blend_graph::classify_vertex_kind(model, inc);
+        if !is_synthesizable_corner(kind, inc.len()) {
+            return Some((vid, kind));
+        }
+    }
+    None
 }
 
 fn create_fillet_chain(
