@@ -39,8 +39,8 @@ use crate::math::frame::{parallel_transport_frames, FrameAtStation};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::operations::blend_graph::{BlendGraph, BlendRadius};
 use crate::operations::diagnostics::BlendFailure;
-use crate::operations::edge_classification::find_adjacent_faces;
-use crate::operations::fillet::{edge_orientation_in_face, get_face_oriented_normal};
+use crate::operations::edge_classification::{find_adjacent_faces, geometry_signed_edge_tangent};
+use crate::operations::fillet::get_face_oriented_normal;
 use crate::operations::fillet_robust::robust_face_angle;
 use crate::operations::{OperationError, OperationResult};
 use crate::primitives::curve::{Arc, Curve, Line, NurbsCurve};
@@ -836,14 +836,14 @@ fn solve_plane_plane(
     // invariant rather than an artefact of the curve's parameter
     // direction. Identical to `compute_rolling_ball_positions`'
     // sign-correctness convention.
-    let raw_tangent = edge.tangent_at(0.5, &model.curves)?;
-    let face_a_loop_sign = edge_orientation_in_face(model, face_a, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face_a
-        ))
-    })?;
-    let edge_tangent_in_loop = raw_tangent * face_a_loop_sign;
+    // Fix A (wave-3): the loop-direction sign comes from face A's outward
+    // normal + edge-local interior geometry, NOT the stored loop-winding flag
+    // (which boolean Difference can leave inconsistent with the flipped normal
+    // on tool-derived Backward faces — mis-signing the dihedral and hence the
+    // ball-side/offset_sign below). Shared with the classifier + fillet +
+    // chamfer sites via `geometry_signed_edge_tangent`.
+    let edge_tangent_in_loop =
+        geometry_signed_edge_tangent(model, edge_id, face_a, &normal_a, &midpoint)?;
     let dihedral = robust_face_angle(
         &normal_a,
         &normal_b,
@@ -1036,14 +1036,12 @@ fn evaluate_plane_cyl_geometry(
     // Signed dihedral. Edge tangent rotated into face A's loop
     // direction so the sign is a geometric invariant — identical
     // convention to plane/plane and the legacy bisector.
-    let raw_tangent = edge.tangent_at(0.5, &model.curves)?;
-    let loop_sign = edge_orientation_in_face(model, plane_face, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, plane_face
-        ))
-    })?;
-    let edge_tan_in_loop = raw_tangent * loop_sign;
+    // Fix A (wave-3): geometry-derived loop-tangent sign (see solve_plane_plane).
+    // Note: face1 here is the PLANE, so its outward normal is exact; the curved
+    // cylinder's full correctness under the separate get_face_oriented_normal
+    // seed bug is a documented follow-up.
+    let edge_tan_in_loop =
+        geometry_signed_edge_tangent(model, edge_id, plane_face, &n_plane, &edge_mid)?;
     let dihedral = robust_face_angle(&n_plane, &n_cyl, &edge_tan_in_loop, &options.tolerance)
         .map_err(|e| OperationError::NumericalError(format!("Dihedral compute failed: {:?}", e)))?;
 
@@ -1617,14 +1615,11 @@ fn solve_plane_sphere(
     let n_plane = get_face_oriented_normal(model, plane_face, &edge_mid)?;
     let n_sphere = get_face_oriented_normal(model, sphere_face, &edge_mid)?;
 
-    let raw_tangent = edge.tangent_at(0.5, &model.curves)?;
-    let loop_sign = edge_orientation_in_face(model, plane_face, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, plane_face
-        ))
-    })?;
-    let edge_tan_in_loop = raw_tangent * loop_sign;
+    // Fix A (wave-3): geometry-derived loop-tangent sign (see solve_plane_plane).
+    // face1 is the PLANE (exact normal); the sphere's curved-face correctness is
+    // gated on the separate get_face_oriented_normal seed-bug follow-up.
+    let edge_tan_in_loop =
+        geometry_signed_edge_tangent(model, edge_id, plane_face, &n_plane, &edge_mid)?;
     let dihedral = robust_face_angle(&n_plane, &n_sphere, &edge_tan_in_loop, &options.tolerance)
         .map_err(|e| OperationError::NumericalError(format!("Dihedral compute failed: {:?}", e)))?;
 
@@ -2137,14 +2132,10 @@ fn solve_marching(
     let edge_mid = edge.evaluate(0.5, &model.curves)?;
     let n_a_mid = get_face_oriented_normal(model, face_a, &edge_mid)?;
     let n_b_mid = get_face_oriented_normal(model, _face_b, &edge_mid)?;
-    let raw_tangent = edge.tangent_at(0.5, &model.curves)?;
-    let face_a_loop_sign = edge_orientation_in_face(model, face_a, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face_a
-        ))
-    })?;
-    let edge_tangent_in_loop = raw_tangent * face_a_loop_sign;
+    // Fix A (wave-3): geometry-derived loop-tangent sign (see solve_plane_plane).
+    // Shared helper; face1 = face_a (its outward normal drives the tangent).
+    let edge_tangent_in_loop =
+        geometry_signed_edge_tangent(model, edge_id, face_a, &n_a_mid, &edge_mid)?;
     let dihedral = robust_face_angle(
         &n_a_mid,
         &n_b_mid,
