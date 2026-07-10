@@ -14,7 +14,9 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::blend_graph::{self, BlendGraph, BlendRadius, BlendVertexKind, EdgeFilletProfile};
-use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
+use super::diagnostics::{
+    BlendFailure, MixedKindRejectDetail, VertexBlendKindSet, VertexBlendUnsupportedReason,
+};
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
 use super::feasibility;
 use super::lifecycle::{self, OpSpec};
@@ -8036,6 +8038,28 @@ fn create_fillet_transitions(
             .and_then(|s| s.vertex_blend_set(corner.id))
             .map(|set| set.contains(BlendKind::Chamfer))
             .unwrap_or(false);
+
+        // Task #82 Slice 1 (whole-branch review MUST-FIX, cannot-lie hardening):
+        // the CF-β.3.4 mixed-kind synthesizer below is derived for CONVEX corners
+        // and would consume the concave-flipped `vertex_outward` (above) into
+        // convex-tuned cap geometry. This concave + prior-chamfer combination is
+        // unreachable today (lifecycle admits only pure ConcaveCorner{degree:3};
+        // a vertex also carrying a chamfer classifies mixed-kind), but guard it
+        // explicitly so a future scope widening cannot silently emit a corrupt
+        // cap — refuse honestly instead.
+        if has_prior_chamfer && matches!(corner_kind, BlendVertexKind::ConcaveCorner { .. }) {
+            return Err(OperationError::BlendFailed(Box::new(
+                BlendFailure::VertexBlendUnsupported {
+                    vertex: corner.id,
+                    kind: corner_kind,
+                    reason: VertexBlendUnsupportedReason::MixedKindUnsupported {
+                        existing: VertexBlendKindSet::single(BlendKind::Chamfer),
+                        requested: BlendKind::Fillet,
+                        detail: MixedKindRejectDetail::ConcaveOrCliff,
+                    },
+                },
+            )));
+        }
 
         if radii_equal && has_prior_chamfer {
             // Task 3B/3C review finding M4 — this CF-β.3.4 arm handles
