@@ -197,8 +197,8 @@ fn concave_three_edge_corner_chamfers_watertight() {
     // corner vertices sit near the origin in the (+,+,+) pocket region, one on
     // each notch wall at chamfer distance 3 from the origin along the two
     // in-wall axes — i.e. positions that are a permutation of (0, 3, 3). The
-    // cap plane is x + y + z = 3 (the chord plane cutting the re-entrant
-    // corner), so its outward normal is ±(1,1,1)/√3.
+    // cap plane is x + y + z = 6 (the chord plane cutting the re-entrant
+    // corner; each cap corner sums to 6), so its outward normal is ±(1,1,1)/√3.
     let solid = m.solids.get(s).expect("solid");
     let shell = m.shells.get(solid.outer_shell).expect("outer shell");
     let mut concave_cap: Option<(u32, Vector3, FaceOrientation)> = None;
