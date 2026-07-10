@@ -146,7 +146,7 @@ green). Boolean winding NOT touched.
 
 ## Commit
 `chamfer: derive offset direction from geometry, not raw loop winding (Fix C — concave chamfer correct without touching boolean winding)`
-Hash: <filled in below>
+Hash: 4365788 (parent 9eab76a)
 
 ## Concerns
 None material. The geometry helper's degenerate fallback
