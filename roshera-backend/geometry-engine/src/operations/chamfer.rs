@@ -2087,6 +2087,14 @@ struct ChamferCorner {
     /// original face normals, normalised). Drives the planar-cap
     /// orientation via [`orient_face_for_outward`].
     outward: Vector3,
+    /// Convexity classification of the corner — `ConvexCorner { degree }`
+    /// for an ordinary protruding corner, `ConcaveCorner { degree }` for a
+    /// re-entrant (pocket) corner (Task #82 Slice 1). Used ONLY to label
+    /// this corner's typed error variants honestly; it never steers the cap
+    /// geometry, which is convexity-agnostic (the planar cap's outward
+    /// orientation is fixed by `outward`). See
+    /// [`classify_planar_corner_kind`].
+    kind: BlendVertexKind,
 }
 
 /// Collection of admissible Chamfer-α corners + a `VertexId` set for
@@ -2164,12 +2172,24 @@ pub(crate) fn compute_corner_outward_normal(
     })
 }
 
-/// Chamfer-α — convexity test: every adjacent face normal agrees in
-/// sign with the candidate outward direction.
+/// Chamfer-α — planar-cap admissibility test: every adjacent face
+/// normal agrees in sign with the candidate outward direction
+/// (`n_i · outward > 0`).
 ///
-/// A convex corner has all `n_i · outward > 0`. A concave corner has
-/// all three opposite signs (rejected by Chamfer-γ). Mixed-sign
-/// "cliff" corners are rejected here as well (Task #78 dependency).
+/// NOTE (Task #82 Slice 1): despite the historical name this does NOT
+/// isolate *convex* corners. `outward` is the normalised sum of the
+/// adjacent face normals, so for three mutually-orthogonal planar faces
+/// `n_i · outward = 1 > 0` holds for a re-entrant (concave) corner just
+/// as it does for a protruding (convex) one — the test admits BOTH, and
+/// that is intentional: the planar corner cap is convexity-agnostic
+/// (`apply_planar_chamfer_cap` orients the cap purely from `outward`, which
+/// already points into free space for either sign). What this gate really
+/// rejects is a genuine mixed-sign "cliff" neighbourhood where some
+/// adjacent normal points back across the corner (`n_i · outward <= 0`).
+/// The authoritative convex/concave split is made by
+/// [`classify_planar_corner_kind`] (used only for honest error labelling)
+/// and, upstream, by `blend_graph::classify_vertex_kind` in the lifecycle
+/// pre-flight.
 fn is_convex_corner(
     model: &BRepModel,
     vertex_position: Point3,
@@ -2183,6 +2203,44 @@ fn is_convex_corner(
         }
     }
     Ok(true)
+}
+
+/// Task #82 Slice 1 — classify an admissible planar corner as convex or
+/// concave for HONEST typed-error reporting.
+///
+/// [`is_convex_corner`] cannot tell the two apart (all adjacent face
+/// normals agree with their own sum in BOTH cases), so a corner that has
+/// passed that gate is disambiguated here by its outgoing edge tangents.
+/// At a CONVEX corner the incident edges run into the solid, opposite the
+/// outward face-normal sum (`Σ tᵢ · outward < 0`); at a re-entrant CONCAVE
+/// corner they border the removed pocket and run along it
+/// (`Σ tᵢ · outward > 0`). Degenerate / unreadable tangents fall back to
+/// `ConvexCorner`, preserving the pre-#82 label.
+///
+/// The returned kind is threaded into the corner's typed error variants
+/// (`apply_planar_chamfer_cap`, the surgery-lookup failures in
+/// [`handle_chamfer_vertices`]) so a refusal names the corner's TRUE
+/// convexity rather than a hardcoded `ConvexCorner`. It never influences
+/// the synthesized cap geometry.
+fn classify_planar_corner_kind(
+    model: &BRepModel,
+    vertex_id: VertexId,
+    edge_ids: &[EdgeId],
+    outward: Vector3,
+) -> BlendVertexKind {
+    let degree = edge_ids.len();
+    let mut tangent_sum = Vector3::new(0.0, 0.0, 0.0);
+    for &eid in edge_ids {
+        match unit_dir_from_vertex(model, eid, vertex_id) {
+            Ok(t) => tangent_sum = tangent_sum + t,
+            Err(_) => return BlendVertexKind::ConvexCorner { degree },
+        }
+    }
+    if tangent_sum.dot(&outward) > 0.0 {
+        BlendVertexKind::ConcaveCorner { degree }
+    } else {
+        BlendVertexKind::ConvexCorner { degree }
+    }
 }
 
 /// Chamfer-β — pre-surgery corner detection.
@@ -2315,11 +2373,21 @@ fn identify_chamfer_corners(
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // Partial-mixed (fillet∪chamfer) corner. Its heterogeneous cap is
+            // built by the mixed-kind synthesizer, not `apply_planar_chamfer_cap`;
+            // keep the pre-#82 `ConvexCorner` label on this corner's error
+            // variants (the true kind is Mixed, which `classify_planar_corner_kind`
+            // does not model — labelling it Concave would be a new, different
+            // untruth). Byte-identical behaviour on the mixed-kind path.
+            let kind = BlendVertexKind::ConvexCorner {
+                degree: edge_indices.len(),
+            };
             corners.push(ChamferCorner {
                 vertex_id: *vertex_id,
                 position,
                 edge_indices: edge_indices.clone(),
                 outward,
+                kind,
             });
             continue;
         }
@@ -2363,6 +2431,12 @@ fn identify_chamfer_corners(
             continue;
         }
 
+        // Honest convex/concave classification for this corner's typed
+        // error variants (Task #82 Slice 1). Never steers cap geometry.
+        let corner_edge_ids: Vec<EdgeId> =
+            edge_indices.iter().map(|&ei| selected_edges[ei]).collect();
+        let kind = classify_planar_corner_kind(model, *vertex_id, &corner_edge_ids, outward);
+
         // edge_indices is the vertex's chamfered-edge incidence list
         // (length N ≥ 3, gated above).
         corners.push(ChamferCorner {
@@ -2370,6 +2444,7 @@ fn identify_chamfer_corners(
             position,
             edge_indices: edge_indices.clone(),
             outward,
+            kind,
         });
     }
 
@@ -2772,16 +2847,24 @@ pub(crate) fn cap_vertices_coplanar(positions: &[Point3], tol: f64) -> bool {
 ///    registers the new face on the outer shell.
 /// 5. Drops the original sharp corner vertex if no edge still
 ///    references it (same defensive scan as F5-α).
+///
+/// The synthesis is convexity-agnostic: `vertex_outward` (the adjacent
+/// face-normal sum) already points into free space for a protruding
+/// (convex) corner AND into the removed pocket for a re-entrant (concave)
+/// corner, so a re-entrant degree-3 corner (Task #82 Slice 1) flows through
+/// this same path unchanged and its cap normal correctly points into the
+/// pocket. `corner_kind` is carried in only so the typed error variants
+/// report the corner's TRUE convexity instead of a hardcoded `ConvexCorner`;
+/// it never affects the emitted geometry.
 fn apply_planar_chamfer_cap(
     model: &mut BRepModel,
     solid_id: SolidId,
     vertex_id: VertexId,
+    corner_kind: BlendVertexKind,
     cap_edges: &[EdgeId],
     vertex_outward: Vector3,
     tolerance: f64,
 ) -> OperationResult<FaceId> {
-    let degree = cap_edges.len();
-
     // Step 1 — verify the cap edges close a polygon and recover the
     // per-edge loop-forward flag. The caller resolves cap edge ids via
     // `BlendEdgeSurgery::cap_v{0,1}_edge` so no geometric search is
@@ -2805,7 +2888,7 @@ fn apply_planar_chamfer_cap(
         return Err(OperationError::BlendFailed(Box::new(
             BlendFailure::VertexBlendUnsupported {
                 vertex: vertex_id,
-                kind: BlendVertexKind::ConvexCorner { degree },
+                kind: corner_kind,
                 reason: VertexBlendUnsupportedReason::CurvedAdjacent,
             },
         )));
@@ -2975,7 +3058,7 @@ fn handle_chamfer_vertices(
                 .ok_or_else(|| {
                     OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
                         vertex: corner.vertex_id,
-                        kind: BlendVertexKind::ConvexCorner { degree },
+                        kind: corner.kind,
                         reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
                     }))
                 })?;
@@ -2987,7 +3070,7 @@ fn handle_chamfer_vertices(
                 return Err(OperationError::BlendFailed(Box::new(
                     BlendFailure::VertexBlendUnsupported {
                         vertex: corner.vertex_id,
-                        kind: BlendVertexKind::ConvexCorner { degree },
+                        kind: corner.kind,
                         reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
                     },
                 )));
@@ -3093,6 +3176,7 @@ fn handle_chamfer_vertices(
                 model,
                 solid_id,
                 corner.vertex_id,
+                corner.kind,
                 &cap_edges_at_vertex,
                 corner.outward,
                 tolerance,
@@ -3589,6 +3673,173 @@ fn validate_chamfered_solid(model: &BRepModel, solid_id: SolidId) -> OperationRe
 mod tests {
     use super::*;
     use crate::primitives::topology_builder::TopologyBuilder;
+
+    /// Adjacent faces of `solid` incident to `vid` (deduplicated).
+    fn faces_at_vertex(model: &BRepModel, solid: SolidId, vid: VertexId) -> Vec<FaceId> {
+        let mut out = Vec::new();
+        let Some(s) = model.solids.get(solid) else {
+            return out;
+        };
+        let Some(shell) = model.shells.get(s.outer_shell) else {
+            return out;
+        };
+        for &fid in &shell.faces {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            let touches = face.all_loops().iter().any(|&lid| {
+                model.loops.get(lid).is_some_and(|lp| {
+                    lp.edges.iter().any(|&e| {
+                        model
+                            .edges
+                            .get(e)
+                            .is_some_and(|ed| ed.start_vertex == vid || ed.end_vertex == vid)
+                    })
+                })
+            });
+            if touches {
+                out.push(fid);
+            }
+        }
+        out
+    }
+
+    /// Edges of `solid` incident to `vid`.
+    fn edges_at_vertex(model: &BRepModel, solid: SolidId, vid: VertexId) -> Vec<EdgeId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let Some(s) = model.solids.get(solid) else {
+            return out;
+        };
+        let Some(shell) = model.shells.get(s.outer_shell) else {
+            return out;
+        };
+        for &fid in &shell.faces {
+            let Some(face) = model.faces.get(fid) else {
+                continue;
+            };
+            for lid in face.all_loops() {
+                if let Some(lp) = model.loops.get(lid) {
+                    for &e in &lp.edges {
+                        let incident = model
+                            .edges
+                            .get(e)
+                            .is_some_and(|ed| ed.start_vertex == vid || ed.end_vertex == vid);
+                        if incident && seen.insert(e) {
+                            out.push(e);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn vertex_near(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
+        model
+            .vertices
+            .iter()
+            .find(|(_, v)| {
+                (v.position[0] - x).abs() < 1e-6
+                    && (v.position[1] - y).abs() < 1e-6
+                    && (v.position[2] - z).abs() < 1e-6
+            })
+            .map(|(id, _)| id)
+            .expect("vertex at requested position")
+    }
+
+    /// Task #82 Slice 1 — `classify_planar_corner_kind` must return the corner's
+    /// TRUE convexity, not a hardcoded `ConvexCorner`. A protruding box corner is
+    /// convex; the re-entrant corner of a notched box is concave. This pins the
+    /// honesty of the label threaded into the corner's typed error variants
+    /// (`apply_planar_chamfer_cap` / `handle_chamfer_vertices`).
+    #[test]
+    fn classify_planar_corner_kind_distinguishes_convex_from_concave() {
+        // Convex: the (+,+,+) corner of a centred 10³ box at (5,5,5).
+        let mut convex_m = BRepModel::new();
+        let box_solid = match TopologyBuilder::new(&mut convex_m).create_box_3d(10.0, 10.0, 10.0) {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(id)) => id,
+            _ => panic!("box"),
+        };
+        let cvx_v = vertex_near(&convex_m, 5.0, 5.0, 5.0);
+        let cvx_faces = faces_at_vertex(&convex_m, box_solid, cvx_v);
+        let cvx_pos = {
+            let v = convex_m.vertices.get(cvx_v).expect("v");
+            Point3::new(v.position[0], v.position[1], v.position[2])
+        };
+        let cvx_outward =
+            compute_corner_outward_normal(&convex_m, cvx_pos, &cvx_faces).expect("convex outward");
+        let cvx_edges = edges_at_vertex(&convex_m, box_solid, cvx_v);
+        assert_eq!(cvx_edges.len(), 3, "box corner has 3 edges");
+        assert_eq!(
+            classify_planar_corner_kind(&convex_m, cvx_v, &cvx_edges, cvx_outward),
+            BlendVertexKind::ConvexCorner { degree: 3 },
+            "protruding box corner must classify convex"
+        );
+
+        // Concave: the re-entrant origin corner of a 40³ box with a 20³ notch
+        // removed from the (+,+,+) octant.
+        let mut cm = BRepModel::new();
+        let base = match TopologyBuilder::new(&mut cm).create_box_3d(40.0, 40.0, 40.0) {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(id)) => id,
+            _ => panic!("base"),
+        };
+        let tool = match TopologyBuilder::new(&mut cm).create_box_3d(20.0, 20.0, 20.0) {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(id)) => id,
+            _ => panic!("tool"),
+        };
+        use crate::operations::transform::{translate, TransformOptions};
+        translate(
+            &mut cm,
+            vec![tool],
+            Vector3::X,
+            10.0,
+            TransformOptions::default(),
+        )
+        .expect("tx");
+        translate(
+            &mut cm,
+            vec![tool],
+            Vector3::Y,
+            10.0,
+            TransformOptions::default(),
+        )
+        .expect("ty");
+        translate(
+            &mut cm,
+            vec![tool],
+            Vector3::Z,
+            10.0,
+            TransformOptions::default(),
+        )
+        .expect("tz");
+        let notched = crate::operations::boolean::boolean_operation(
+            &mut cm,
+            base,
+            tool,
+            crate::operations::boolean::BooleanOp::Difference,
+            crate::operations::boolean::BooleanOptions::default(),
+        )
+        .expect("notch");
+        let ccv_v = vertex_near(&cm, 0.0, 0.0, 0.0);
+        let ccv_faces = faces_at_vertex(&cm, notched, ccv_v);
+        let ccv_outward =
+            compute_corner_outward_normal(&cm, Point3::ZERO, &ccv_faces).expect("concave outward");
+        // The face-normal sum at the re-entrant corner must already point into
+        // the pocket (+,+,+) — the property that makes the planar cap
+        // convexity-agnostic.
+        assert!(
+            ccv_outward.dot(&Vector3::new(1.0, 1.0, 1.0)) > 0.0,
+            "re-entrant corner outward must point into the pocket; got {ccv_outward:?}"
+        );
+        let ccv_edges = edges_at_vertex(&cm, notched, ccv_v);
+        assert_eq!(ccv_edges.len(), 3, "re-entrant corner has 3 edges");
+        assert_eq!(
+            classify_planar_corner_kind(&cm, ccv_v, &ccv_edges, ccv_outward),
+            BlendVertexKind::ConcaveCorner { degree: 3 },
+            "re-entrant notch corner must classify concave"
+        );
+    }
 
     #[test]
     fn test_chamfer_validation_rejects_zero_distance() {
