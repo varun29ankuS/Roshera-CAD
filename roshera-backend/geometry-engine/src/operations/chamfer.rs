@@ -18,7 +18,7 @@ use super::{CommonOptions, OperationError, OperationResult};
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::Curve,
-    edge::{Edge, EdgeId, EdgeOrientation},
+    edge::{Edge, EdgeId, EdgeOrientation, ManifoldKind},
     face::{Face, FaceId, FaceOrientation},
     r#loop::{Loop, LoopType},
     solid::{BlendKind, SolidId},
@@ -111,6 +111,32 @@ pub enum PropagationMode {
     Smooth,
 }
 
+/// Chamfer's synthesizable-corner predicate for the SHARED graceful-skip
+/// fixpoint ([`super::fillet::retain_synthesizable_corner_edges`], Finding 1b).
+///
+/// Chamfer caps a broader convex-degree set than fillet: the planar N-gon miter
+/// cap (Chamfer-β) closes any `ConvexCorner { degree >= 3 }`, the generalized
+/// planar cap (Task #82 Slice 1) closes the re-entrant `ConcaveCorner
+/// { degree: 3 }`, and a `Smooth` tangent chain needs no cap. A single-edge
+/// (`kept_degree <= 1`) vertex closes its own chamfer termination. Every other
+/// classification — `Mixed` convexity, `Cliff`, non-apex `ConcaveCorner`,
+/// convex degree < 3 — has no cap synthesizer; its incident edges are dropped
+/// up front so the per-edge surgery never leaves an uncappable open corner.
+///
+/// Contrast with fillet's [`super::fillet::is_synthesizable_corner`], which
+/// admits only the degree-3 convex/concave apex (fillet has no N-gon miter cap).
+fn chamfer_is_synthesizable_corner(kind: BlendVertexKind, kept_degree: usize) -> bool {
+    if kept_degree <= 1 {
+        return true;
+    }
+    match kind {
+        BlendVertexKind::ConvexCorner { degree } => degree >= 3,
+        BlendVertexKind::ConcaveCorner { degree } => degree == 3,
+        BlendVertexKind::Smooth => true,
+        _ => false,
+    }
+}
+
 /// Apply chamfer to edges
 pub fn chamfer_edges(
     model: &mut BRepModel,
@@ -193,6 +219,136 @@ pub fn chamfer_edges(
 
         // Propagate edge selection if requested
         let selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
+
+        // Finding 1b — RESILIENT corner pre-flight for chamfer-ALL, mirroring
+        // the fillet-side graceful skip. A `chamfer all edges` request on a
+        // booleaned part (e.g. a corner-notched box) mixes corners chamfer CAN
+        // cap (convex degree-N planar miter caps, the concave degree-3
+        // re-entrant apex) with corners it CANNOT (Mixed convexity, Cliff,
+        // non-apex configurations). The V-retention gate in
+        // `identify_chamfer_corners` keeps a Mixed corner's vertex alive through
+        // surgery (so the multi-edge splice does not crash) but then SKIPS its
+        // cap — leaving the shell geometrically OPEN, which the closure gate
+        // refuses and `with_rollback` rolls back: sound, but it rounds NOTHING.
+        // Honour the "round everything it can" contract by DROPPING the incident
+        // edges of every unsupported multi-edge corner up front via the shared
+        // graceful-skip fixpoint, parameterized by chamfer's synthesizable
+        // predicate. No model mutation happens here; the reduced selection then
+        // flows through the normal pipeline (identify + surgery + cap).
+        //
+        // Exempt exactly the corners chamfer's surgery + cap machinery genuinely
+        // closes despite an unsupported classification, mirroring the surgery
+        // `corner_shared` triggers that route to a real cap: explicit opt-in
+        // partial-mixed corners, and corners already carrying an opposite-kind
+        // (fillet) blend from a first call (the mixed-kind cap synthesizer
+        // stitches those). This deliberately does NOT include the whole
+        // `corner_ids` V-retention set — that set keeps uncappable Mixed corners
+        // alive, and those are exactly what the fixpoint must drop.
+        //
+        // Confine the fixpoint universe to open, manifold, defined-dihedral
+        // edges so a rim/seam edge's undefined dihedral is not misread as a
+        // `Cliff` that would spuriously drop good edges; loop rims and
+        // non-chamferable edges are kept as-is (they never touch a shared
+        // multi-edge corner and their inline surgery cannot crash on one).
+        //
+        // `dropped_unsupported_corners` records whether the fixpoint removed any
+        // edge — it steers the post-flight validation failure onto a TYPED
+        // refusal (see the `validate_result` gate below) so the -all path never
+        // leaks a raw open-geometry `InvalidBRep`.
+        let (selected_edges, dropped_unsupported_corners) = {
+            // Ensure edge convexity / dihedral attributes are cached before the
+            // classifier reads them (mirrors `blend_graph::build`, which
+            // classifies every blend edge up front). Non-destructive — stamps
+            // cached attributes only; boundary/seam edges resolve to
+            // `dihedral_angle == None` and are excluded from `chamferable`
+            // below. A classification error leaves the edge unclassified, which
+            // the `dihedral_angle.is_some()` filter also excludes.
+            for &eid in &selected_edges {
+                let _ = super::edge_classification::classify_and_cache(model, eid);
+            }
+            let exempt_vertices: HashSet<VertexId> = {
+                let mut ex: HashSet<VertexId> =
+                    options.partial_corner_vertices.iter().copied().collect();
+                if let Some(solid) = model.solids.get(solid_id) {
+                    for &eid in &selected_edges {
+                        if let Some(edge) = model.edges.get(eid) {
+                            for vid in [edge.start_vertex, edge.end_vertex] {
+                                if solid
+                                    .vertex_blend_set(vid)
+                                    .map(|set| set.contains(BlendKind::Fillet))
+                                    .unwrap_or(false)
+                                {
+                                    ex.insert(vid);
+                                }
+                            }
+                        }
+                    }
+                }
+                ex
+            };
+            let chamferable: HashSet<EdgeId> = selected_edges
+                .iter()
+                .copied()
+                .filter(|&eid| {
+                    model
+                        .edges
+                        .get(eid)
+                        .map(|e| {
+                            !e.is_loop()
+                                && matches!(e.attributes.manifold_kind, ManifoldKind::Manifold)
+                                && e.attributes.dihedral_angle.is_some()
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+            let retained = super::fillet::retain_synthesizable_corner_edges(
+                model,
+                &chamferable,
+                &exempt_vertices,
+                chamfer_is_synthesizable_corner,
+            );
+            if retained.len() < chamferable.len() {
+                if retained.is_empty() {
+                    // Every chamferable edge is incident to an unsupported
+                    // corner — nothing can be bevelled. Refuse cleanly
+                    // (transactional via the enclosing `with_rollback`) with a
+                    // typed reason naming an offending corner, never a whole-op
+                    // open-geometry rollback.
+                    let (vertex, kind) = super::fillet::first_unsupported_corner(
+                        model,
+                        &chamferable,
+                        &exempt_vertices,
+                        chamfer_is_synthesizable_corner,
+                    )
+                    .unwrap_or((0, BlendVertexKind::Cliff));
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::VertexBlendUnsupported {
+                            vertex,
+                            kind,
+                            reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                        },
+                    )));
+                }
+                tracing::debug!(
+                    target: "geometry_engine::blend",
+                    "chamfer: dropped {} edge(s) incident to unsupported (Mixed / Cliff / \
+                     non-apex) corners; bevelling {} of {} chamferable",
+                    chamferable.len() - retained.len(),
+                    retained.len(),
+                    chamferable.len(),
+                );
+                // Keep non-chamferable selected edges as-is; drop only the
+                // problematic chamferable ones.
+                let keep_chamferable: HashSet<EdgeId> = retained.iter().copied().collect();
+                let reduced: Vec<EdgeId> = selected_edges
+                    .into_iter()
+                    .filter(|e| keep_chamferable.contains(e) || !chamferable.contains(e))
+                    .collect();
+                (reduced, true)
+            } else {
+                (selected_edges, false)
+            }
+        };
 
         // Chamfer-α — identify degree-3 convex planar uniform-offset
         // corners BEFORE the per-edge surgery loop runs. The pre-surgery
@@ -397,9 +553,36 @@ pub fn chamfer_edges(
             }
         }
 
-        // Validate result if requested
+        // Validate result if requested.
         if options.common.validate_result {
-            validate_chamfered_solid(model, solid_id)?;
+            if let Err(e) = validate_chamfered_solid(model, solid_id) {
+                if dropped_unsupported_corners {
+                    // Finding 1b — the graceful-skip fixpoint already removed
+                    // every corner chamfer cannot cap, so a remaining validation
+                    // failure means the supported-corner SUBSET still exceeds
+                    // chamfer's current corner-surgery capability (fillet blends
+                    // the identical subset watertight; chamfer's miter/planar-cap
+                    // surgery at supported corners bordering a re-entrant notch
+                    // wall does not yet — an F5-δ chamfer-surgery gap, not a
+                    // graceful-skip defect). Refuse with a TYPED reason and let
+                    // the enclosing `with_rollback` restore the pre-op solid,
+                    // rather than leaking the raw open-geometry `InvalidBRep` the
+                    // caller cannot act on. This honours the -all contract: no
+                    // 500, no open-geometry rollback — a typed refusal instead.
+                    return Err(OperationError::BlendFailed(Box::new(
+                        BlendFailure::TopologyViolation {
+                            detail: format!(
+                                "chamfer-all dropped the unsupported (Mixed / non-apex) \
+                                 corners up front, but chamfer's corner surgery could not \
+                                 close the remaining supported subset soundly (F5-δ gap; \
+                                 fillet handles this subset). Refused and rolled back. \
+                                 Underlying validation: {e}"
+                            ),
+                        },
+                    )));
+                }
+                return Err(e);
+            }
         }
 
         // CF-α: populate the per-solid blend registry. Mirrors the

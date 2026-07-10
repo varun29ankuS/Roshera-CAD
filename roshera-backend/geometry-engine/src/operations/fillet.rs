@@ -789,15 +789,25 @@ pub fn fillet_edges(
         // a seam edge's missing dihedral is not misread as a `Cliff` that would
         // spuriously drop the real rim edges around it.
         let filletable: HashSet<EdgeId> = blend_graph.edges.keys().copied().collect();
-        let retained = retain_synthesizable_corner_edges(model, &filletable, &exempt_vertices);
+        let retained = retain_synthesizable_corner_edges(
+            model,
+            &filletable,
+            &exempt_vertices,
+            is_synthesizable_corner,
+        );
         if retained.len() < filletable.len() {
             if retained.is_empty() {
                 // Every filletable edge is incident to an unsupported corner —
                 // nothing can be rounded. Refuse cleanly (transactional via the
                 // enclosing `with_rollback`) with a typed reason naming an
                 // offending corner, never a surgery crash.
-                let (vertex, kind) = first_unsupported_corner(model, &filletable, &exempt_vertices)
-                    .unwrap_or((0, BlendVertexKind::Cliff));
+                let (vertex, kind) = first_unsupported_corner(
+                    model,
+                    &filletable,
+                    &exempt_vertices,
+                    is_synthesizable_corner,
+                )
+                .unwrap_or((0, BlendVertexKind::Cliff));
                 return Err(OperationError::BlendFailed(Box::new(
                     BlendFailure::VertexBlendUnsupported {
                         vertex,
@@ -1367,7 +1377,7 @@ fn is_synthesizable_corner(kind: BlendVertexKind, kept_degree: usize) -> bool {
 }
 
 /// Map every vertex touched by `edges` to the subset of `edges` incident to it.
-fn incident_edges_by_vertex(
+pub(crate) fn incident_edges_by_vertex(
     model: &BRepModel,
     edges: &HashSet<EdgeId>,
 ) -> HashMap<VertexId, Vec<EdgeId>> {
@@ -1384,16 +1394,27 @@ fn incident_edges_by_vertex(
 }
 
 /// Combinatorial fixpoint: drop every edge incident to an unsupported multi-edge
-/// corner, iterating until the retained selection has ONLY synthesizable corners
-/// (see [`is_synthesizable_corner`]). Pure — reads cached edge classification via
+/// corner, iterating until the retained selection has ONLY synthesizable corners.
+/// Pure — reads cached edge classification via
 /// [`blend_graph::classify_vertex_kind`] and mutates nothing in `model`. The
 /// returned survivors are unordered — the caller re-derives selection order by
 /// filtering its own ordered edge list against this set.
-fn retain_synthesizable_corner_edges(
+///
+/// `is_synth(kind, kept_degree)` is the op-specific "can this corner be
+/// synthesized?" predicate — fillet passes [`is_synthesizable_corner`] (degree-3
+/// apex + Smooth), chamfer passes its own broader convex-degree predicate (see
+/// `chamfer::chamfer_is_synthesizable_corner`). This is the SHARED graceful-skip
+/// helper wired by both blend ops (Finding 1b): the fixpoint skeleton is
+/// op-agnostic, only the synthesizable verdict differs.
+pub(crate) fn retain_synthesizable_corner_edges<F>(
     model: &BRepModel,
     universe: &HashSet<EdgeId>,
     exempt: &HashSet<VertexId>,
-) -> Vec<EdgeId> {
+    is_synth: F,
+) -> Vec<EdgeId>
+where
+    F: Fn(BlendVertexKind, usize) -> bool,
+{
     let mut keep: HashSet<EdgeId> = universe.clone();
     loop {
         let incidence = incident_edges_by_vertex(model, &keep);
@@ -1403,7 +1424,7 @@ fn retain_synthesizable_corner_edges(
                 continue;
             }
             let kind = blend_graph::classify_vertex_kind(model, inc);
-            if !is_synthesizable_corner(kind, inc.len()) {
+            if !is_synth(kind, inc.len()) {
                 to_drop.extend(inc.iter().copied());
             }
         }
@@ -1420,12 +1441,17 @@ fn retain_synthesizable_corner_edges(
 
 /// Locate the first vertex in `universe` whose corner the kernel cannot
 /// synthesize, for a typed refusal when NOTHING is roundable. Returns the
-/// vertex id and its classification.
-fn first_unsupported_corner(
+/// vertex id and its classification. `is_synth` is the same op-specific
+/// predicate threaded into [`retain_synthesizable_corner_edges`].
+pub(crate) fn first_unsupported_corner<F>(
     model: &BRepModel,
     universe: &HashSet<EdgeId>,
     exempt: &HashSet<VertexId>,
-) -> Option<(VertexId, BlendVertexKind)> {
+    is_synth: F,
+) -> Option<(VertexId, BlendVertexKind)>
+where
+    F: Fn(BlendVertexKind, usize) -> bool,
+{
     let incidence = incident_edges_by_vertex(model, universe);
     // Deterministic: scan vertices in ascending id order.
     let mut vids: Vec<VertexId> = incidence.keys().copied().collect();
@@ -1436,7 +1462,7 @@ fn first_unsupported_corner(
             continue;
         }
         let kind = blend_graph::classify_vertex_kind(model, inc);
-        if !is_synthesizable_corner(kind, inc.len()) {
+        if !is_synth(kind, inc.len()) {
             return Some((vid, kind));
         }
     }
