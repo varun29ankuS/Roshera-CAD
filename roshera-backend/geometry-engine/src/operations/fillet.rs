@@ -1204,19 +1204,25 @@ fn piecewise_linear_radius(samples: &[(f64, f64)], u: f64) -> f64 {
     samples[last].1
 }
 
-/// F5-α.2 — true when `vertex` is classified by `blend_graph` as a
-/// 3-edge convex apex (three convex blend edges in this pass share
-/// this vertex). When true, `BlendEdgeSurgery` flags this side of the
-/// edge as corner-shared so [`splice_blend_edge`] skips the V-side
-/// rewires + cap insertion + vertex removal, leaving that work to
-/// [`apply_apex_sphere_corner`] after every per-edge splice has run.
+/// F5-α.2 (+ Task #82 Slice 1) — true when `vertex` is classified by
+/// `blend_graph` as a 3-edge apex corner that routes through the
+/// apex-sphere synthesizer: either a `ConvexCorner { degree: 3 }` or a
+/// re-entrant `ConcaveCorner { degree: 3 }` (three same-convexity blend
+/// edges in this pass share this vertex). When true, `BlendEdgeSurgery`
+/// flags this side of the edge as corner-shared so [`splice_blend_edge`]
+/// skips the V-side rewires + cap insertion + vertex removal, leaving that
+/// work to [`apply_apex_sphere_corner`] after every per-edge splice has
+/// run. Without this flag the FIRST edge's splice at the corner drops the
+/// shared vertex, and the remaining two edges' surgeries fail validation
+/// with `BlendEdgeSurgery original_v? N missing from model`.
 ///
-/// Returns `false` for any other classification (degree ≠ 3, concave,
-/// mixed, smooth, cliff, or absent from the graph).
-fn is_three_edge_convex_corner(blend_graph: &BlendGraph, vertex: VertexId) -> bool {
+/// Returns `false` for any other classification (degree ≠ 3, mixed,
+/// smooth, cliff, or absent from the graph).
+fn is_three_edge_apex_corner(blend_graph: &BlendGraph, vertex: VertexId) -> bool {
     matches!(
         blend_graph.vertex(vertex).map(|v| v.kind),
         Some(BlendVertexKind::ConvexCorner { degree: 3 })
+            | Some(BlendVertexKind::ConcaveCorner { degree: 3 })
     )
 }
 
@@ -1444,10 +1450,10 @@ fn create_fillet_chain(
             // call of two) or auto-detected on the closing call.
             let v0_partial_opt_in = options.partial_corner_vertices.contains(&s.original_v0);
             let v1_partial_opt_in = options.partial_corner_vertices.contains(&s.original_v1);
-            s.original_v0_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v0)
+            s.original_v0_corner_shared = is_three_edge_apex_corner(blend_graph, s.original_v0)
                 || v0_prior_chamfer
                 || v0_partial_opt_in;
-            s.original_v1_corner_shared = is_three_edge_convex_corner(blend_graph, s.original_v1)
+            s.original_v1_corner_shared = is_three_edge_apex_corner(blend_graph, s.original_v1)
                 || v1_prior_chamfer
                 || v1_partial_opt_in;
             surgeries.push(s);
@@ -3765,10 +3771,12 @@ fn compute_concurrent_axes_center(
 /// between the sphere face and one fillet face each. V − E + F goes
 /// from `2 − 1 = 1` (open triangular hole) to `2`, restoring
 /// watertightness.
+#[allow(clippy::too_many_arguments)]
 fn apply_apex_sphere_corner(
     model: &mut BRepModel,
     solid_id: SolidId,
     vertex_id: VertexId,
+    corner_kind: BlendVertexKind,
     fillet_face_ids: &[FaceId; 3],
     sphere_center: Point3,
     sphere_radius: f64,
@@ -3781,7 +3789,7 @@ fn apply_apex_sphere_corner(
             find_cap_arc_edge_at_vertex(model, face_id, sphere_center).ok_or_else(|| {
                 OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
                     vertex: vertex_id,
-                    kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                    kind: corner_kind,
                     reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
                 }))
             })?;
@@ -3809,7 +3817,24 @@ fn apply_apex_sphere_corner(
     // for ~half the corners, so the all-edges fillet's spherical-octant volume
     // cancelled to ~0 (FILLET-MULTIEDGE-VOLUME). At the octant the dot is ±1, so
     // the pick is robust and run-to-run stable.
-    let octant_point = sphere_center + vertex_outward * sphere_radius;
+    //
+    // The corner-patch octant always sits on the VERTEX side of the sphere
+    // (toward the original sharp / re-entrant corner). For a CONVEX corner
+    // that side coincides with `vertex_outward` (the face outward normal
+    // points out through the rounded corner). For a CONCAVE corner the
+    // material wraps the sphere from OUTSIDE and `vertex_outward` was flipped
+    // by the caller to point INTO the void — the OPPOSITE of the cap-patch
+    // side. Sample the surface normal on the cap-patch side (`cap_side`) so
+    // the orientation pick reads the true patch normal (dot ≈ ±1, robust),
+    // while keeping the orientation TARGET as `vertex_outward` (the desired
+    // face-outward direction). For a convex corner `cap_side == vertex_outward`
+    // so this is byte-identical to the pre-#82 path.
+    let cap_side = if matches!(corner_kind, BlendVertexKind::ConcaveCorner { .. }) {
+        Vector3::new(-vertex_outward.x, -vertex_outward.y, -vertex_outward.z)
+    } else {
+        vertex_outward
+    };
+    let octant_point = sphere_center + cap_side * sphere_radius;
     let (u_oct, v_oct) = sphere
         .closest_point(&octant_point, Tolerance::default())
         .unwrap_or((0.0, 0.0));
@@ -7482,12 +7507,22 @@ fn create_fillet_transitions(
     let mut new_faces: Vec<FaceId> = Vec::new();
 
     for corner in blend_graph.corners() {
-        let degree = match corner.kind {
-            BlendVertexKind::ConvexCorner { degree } => degree,
-            // Concave / Mixed corners are F5-δ territory. The
-            // lifecycle gate already rejects them with the right
-            // typed surface; nothing for the transitions pass to
-            // do.
+        // `corner_kind` is carried forward so the apex-sphere dispatch and
+        // its typed error variants report the corner's TRUE convexity rather
+        // than a hardcoded `ConvexCorner`. Task #82 Slice 1 admits the
+        // re-entrant `ConcaveCorner { degree: 3 }` corner onto the same
+        // apex-sphere path (equal-radius arm): its geometry is the point
+        // reflection of the convex case — the rolling-ball centre lands in the
+        // void, so the synthesized sphere face's outward normal points into
+        // the pocket (handled by the flipped `vertex_outward` at the dispatch
+        // and the cap-side octant sampling inside `apply_apex_sphere_corner`).
+        let (corner_kind, degree) = match corner.kind {
+            k @ BlendVertexKind::ConvexCorner { degree } => (k, degree),
+            k @ BlendVertexKind::ConcaveCorner { degree: 3 } => (k, 3),
+            // Higher/lower-degree concave, Mixed and Cliff corners remain
+            // F5-δ / F5-γ territory. The lifecycle gate already rejects them
+            // with the right typed surface; nothing for the transitions pass
+            // to do.
             _ => continue,
         };
 
@@ -7880,7 +7915,7 @@ fn create_fillet_transitions(
                     return Err(OperationError::BlendFailed(Box::new(
                         BlendFailure::VertexBlendUnsupported {
                             vertex: corner.id,
-                            kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                            kind: corner_kind,
                             reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
                         },
                     )));
@@ -7943,7 +7978,7 @@ fn create_fillet_transitions(
                 return Err(OperationError::BlendFailed(Box::new(
                     BlendFailure::VertexBlendUnsupported {
                         vertex: corner.id,
-                        kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                        kind: corner_kind,
                         reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
                     },
                 )));
@@ -7963,13 +7998,27 @@ fn create_fillet_transitions(
             ))
         })?;
         let outward_raw = vertex_pos - corner_apex;
-        let vertex_outward = outward_raw.normalize().map_err(|_| {
+        let mut vertex_outward = outward_raw.normalize().map_err(|_| {
             OperationError::BlendFailed(Box::new(BlendFailure::VertexBlendUnsupported {
                 vertex: corner.id,
-                kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                kind: corner_kind,
                 reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
             }))
         })?;
+        // Convexity sign of the corner-patch outward normal. For a CONVEX
+        // corner the rolling-ball centre `corner_apex` sits INSIDE the
+        // material and `vertex_pos - corner_apex` points out through the
+        // rounded corner into free space — the correct face-outward
+        // direction. For a CONCAVE (re-entrant) corner the ball centre lands
+        // in the VOID (the removed pocket), so `vertex_pos - corner_apex`
+        // points from the void back INTO the surrounding material; the cap's
+        // outward normal must instead point INTO the pocket. Flip it. The
+        // resulting sphere-face orientation is adjudicated by the watertight
+        // + oriented certificate and the pocket-direction assertion in
+        // `fillet_concave_three_edge_corner.rs`.
+        if matches!(corner_kind, BlendVertexKind::ConcaveCorner { .. }) {
+            vertex_outward = Vector3::new(-vertex_outward.x, -vertex_outward.y, -vertex_outward.z);
+        }
 
         // CF-β.3.4 — mixed-kind dispatch. If `corner.id` already
         // carries a recorded *chamfer* blend on this solid (fillet-
@@ -8013,7 +8062,7 @@ fn create_fillet_transitions(
                         OperationError::BlendFailed(Box::new(
                             BlendFailure::VertexBlendUnsupported {
                                 vertex: corner.id,
-                                kind: BlendVertexKind::ConvexCorner { degree: 3 },
+                                kind: corner_kind,
                                 reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
                             },
                         ))
@@ -8071,12 +8120,28 @@ fn create_fillet_transitions(
                 model,
                 solid_id,
                 corner.id,
+                corner_kind,
                 &face_ids,
                 corner_apex,
                 r0,
                 vertex_outward,
             )?;
             new_faces.push(face_id);
+        } else if matches!(corner_kind, BlendVertexKind::ConcaveCorner { .. }) {
+            // Task #82 Slice 1 covers ONLY the equal-radius apex-sphere arm
+            // for a re-entrant corner. The mixed-radii triangular-NURBS path
+            // below is derived for the CONVEX octant and has not been
+            // generalized to the re-entrant case; admitting a concave corner
+            // there would risk emitting an incorrectly-oriented / mis-shaped
+            // patch. Refuse with the true kind so `with_rollback` restores the
+            // model rather than committing a corrupt shell.
+            return Err(OperationError::BlendFailed(Box::new(
+                BlendFailure::VertexBlendUnsupported {
+                    vertex: corner.id,
+                    kind: corner_kind,
+                    reason: VertexBlendUnsupportedReason::MixedRadii,
+                },
+            )));
         } else {
             let cylinder_axes: [(Point3, Vector3, f64); 3] = [
                 (

@@ -696,8 +696,9 @@ fn validate_same_kind_scar_adjacency(
 /// | `Smooth`           | n/a            | OK — F3 spine handles G1 chain naturally  |
 /// | `ConvexCorner{N}`  | succeeds       | reject with "corner-blend not implemented; setback feasible (= …) — Task #82" |
 /// | `ConvexCorner{N}`  | fails          | reject with the specific setback error    |
-/// | `ConcaveCorner{N}` | succeeds       | reject (same reason as Convex)            |
-/// | `ConcaveCorner{N}` | fails          | propagate specific setback error          |
+/// | `ConcaveCorner{3}` | n/a            | OK — Task #82 Slice 1 apex-sphere synthesis (re-entrant three-edge corner) |
+/// | `ConcaveCorner{N≠3}` | succeeds     | reject (same reason as Convex)            |
+/// | `ConcaveCorner{N≠3}` | fails        | propagate specific setback error          |
 /// | `Mixed`            | any            | reject "mixed convexity at corner …"      |
 /// | `Cliff`            | any            | reject "non-manifold / undefined dihedral at corner …" |
 ///
@@ -826,6 +827,14 @@ fn validate_corner_compatibility(
     // correct rejection layer, not this pre-flight.
     match (op_kind, vertex_kind) {
         (_, Some(BlendVertexKind::ConvexCorner { degree: 3 })) => return Ok(()),
+        // Task #82 Slice 1 — the re-entrant three-edge concave corner is now
+        // synthesized by `fillet::create_fillet_transitions` (equal-radius
+        // apex-sphere arm generalized to `ConcaveCorner`): the rolling-ball
+        // centre lands in the void and the cap face's outward normal points
+        // into the pocket. Admit it for BOTH fillet and chamfer op kinds.
+        // Only degree 3 is in scope; degree 1/2 concave, Mixed and Cliff
+        // corners continue to fall through to the typed refusals below.
+        (_, Some(BlendVertexKind::ConcaveCorner { degree: 3 })) => return Ok(()),
         (BlendOpKind::Chamfer, Some(BlendVertexKind::ConvexCorner { degree })) if degree >= 4 => {
             return Ok(());
         }

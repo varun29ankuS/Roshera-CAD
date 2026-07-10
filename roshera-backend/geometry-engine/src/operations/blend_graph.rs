@@ -829,7 +829,20 @@ pub fn compute_apex_setbacks(model: &BRepModel, graph: &mut BlendGraph) -> Opera
         .vertices
         .iter()
         .filter_map(|(vid, v)| match v.kind {
-            BlendVertexKind::ConvexCorner { degree: 3 } if v.incident_blend_edges.len() == 3 => {
+            // Task #82 Slice 1 — the re-entrant `ConcaveCorner { degree: 3 }`
+            // corner routes through the SAME apex retraction. Its per-edge
+            // cylinder axis origins `P_i = V − (r/(1+c))·(n_a+n_b)` are built
+            // from the ACTUAL oriented face normals, which for a re-entrant
+            // corner place the least-squares apex in the void (the removed
+            // pocket); the retraction magnitude `|(apex − P_i)·u_i|` is
+            // identical in form to the convex case. Only the octant SIDE
+            // differs, and that is handled downstream by the flipped
+            // `vertex_outward` / cap-side sampling in
+            // `apply_apex_sphere_corner`.
+            BlendVertexKind::ConvexCorner { degree: 3 }
+            | BlendVertexKind::ConcaveCorner { degree: 3 }
+                if v.incident_blend_edges.len() == 3 =>
+            {
                 Some((*vid, v.incident_blend_edges.clone()))
             }
             _ => None,
