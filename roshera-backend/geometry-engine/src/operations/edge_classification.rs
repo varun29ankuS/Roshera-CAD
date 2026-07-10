@@ -228,50 +228,44 @@ pub fn classify_dihedral(
     Ok(classify_edge(model, edge_id)?.dihedral_class())
 }
 
-/// Centroid of `face_id`'s outer-loop vertices — the interior sample that
-/// [`geometry_signed_edge_tangent`] uses to orient the loop tangent.
+/// Characteristic local length of `edge_id` — the max distance from its
+/// midpoint to a handful of uniformly sampled points along it.
 ///
-/// Robust for BOTH planar and curved faces. For a plane the centroid is the
-/// geometric centre of the face, unambiguously interior. For a curved face
-/// (cylinder / cone / sphere) the centroid sits *off* the surface — e.g. on
-/// a cylinder's axis — but that offset is directed purely along the surface
-/// NORMAL at the edge, and the tangent-sign criterion dots the interior
-/// direction with `n1 × tangent` (which is perpendicular to `n1`), so the
-/// off-surface normal component is annihilated. Only the in-surface
-/// "into the patch" component survives, which the centroid captures with the
-/// correct sign. Returns `None` if the face or its outer loop is missing or
-/// carries no live vertices (caller then falls back to the loop flag).
-fn face_outer_loop_centroid(model: &BRepModel, face_id: FaceId) -> Option<Point3> {
-    let face = model.faces.get(face_id)?;
-    let outer = model.loops.get(face.outer_loop)?;
-    let mut seen = std::collections::HashSet::with_capacity(outer.edges.len() * 2);
-    let mut sum = Vector3::ZERO;
-    let mut count = 0usize;
-    for &eid in &outer.edges {
-        let edge = model.edges.get(eid)?;
-        for vid in [edge.start_vertex, edge.end_vertex] {
-            if seen.insert(vid) {
-                if let Some(v) = model.vertices.get(vid) {
-                    sum = sum + v.point();
-                    count += 1;
-                }
+/// Used to scale the membership-probe step in [`loop_tangent_sign_core`] so it
+/// is invariant to the model's units. Non-zero even for a CLOSED (full-circle)
+/// edge, whose endpoints coincide but whose interior samples span its diameter,
+/// so a closed bore-rim edge still yields a usable scale. Returns `0.0` only if
+/// the edge or its evaluation is unavailable (caller then falls back).
+fn edge_probe_scale(model: &BRepModel, edge_id: EdgeId) -> f64 {
+    let edge = match model.edges.get(edge_id) {
+        Some(e) => e,
+        None => return 0.0,
+    };
+    let mid = match edge.evaluate(0.5, &model.curves) {
+        Ok(p) => p,
+        Err(_) => return 0.0,
+    };
+    let mut max_d = 0.0_f64;
+    for &t in &[0.0_f64, 0.25, 0.5, 0.75, 1.0] {
+        if let Ok(p) = edge.evaluate(t, &model.curves) {
+            let d = (p - mid).magnitude();
+            if d > max_d {
+                max_d = d;
             }
         }
     }
-    if count == 0 {
-        return None;
-    }
-    Some(sum * (1.0 / count as f64))
+    max_d
 }
 
 /// Loop-flag tangent sign — the LEGACY handedness source, kept only as the
-/// degenerate-geometry fallback for [`geometry_signed_edge_tangent`].
+/// degenerate-geometry fallback for [`loop_tangent_sign_core`].
 ///
 /// `+1` if `edge_id` is traversed in the `+curve` direction by a loop of
 /// `face1_id`, `-1` otherwise. Boolean Difference can leave this flag
 /// inconsistent with `face1`'s (correct) outward normal on tool-derived
 /// faces, which is exactly the bug Fix A removes — so this is the last
-/// resort, never the primary sign source.
+/// resort, reached only for genuinely degenerate micro-geometry, never the
+/// primary sign source.
 fn loop_flag_tangent_sign(
     model: &BRepModel,
     edge_id: EdgeId,
@@ -300,16 +294,17 @@ fn loop_flag_tangent_sign(
 ///
 /// This helper instead chooses the sign `s ∈ {+1, −1}` so that
 /// `(n1 × (raw_tangent · s)) · into_face ≥ 0`, where `n1` is `face1`'s outward
-/// normal at the edge and `into_face` is the (tangent-plane) direction from the
-/// edge midpoint toward `face1`'s interior. That makes the tangent handedness a
-/// pure function of the outward normal + face geometry — the inputs proven
-/// correct — and never trusts a loop flag Difference may have left stale.
+/// normal at the edge and `into_face` is the in-surface direction from the edge
+/// into `face1`'s trimmed material, determined by an EDGE-LOCAL membership test
+/// (see [`loop_tangent_sign_core`]). That makes the tangent handedness a pure
+/// function of the outward normal + local face geometry — the inputs proven
+/// correct — and, being edge-local, is correct for HOLED / annular,
+/// NON-CONVEX, and curved faces alike (unlike a whole-face centroid, which
+/// points across the hole of a bore's annular cap).
 ///
-/// Returns the SIGNED tangent evaluated at the edge midpoint (`raw_tangent ·
-/// s`). Callers that need only the scalar handedness (per-sample sweeps) read
-/// it back via [`geometry_loop_tangent_sign`]. Falls back to
-/// [`loop_flag_tangent_sign`] iff the interior sample is degenerate (missing,
-/// or collinear with the edge so `|into_face| ≈ 0`), documented inline.
+/// Returns the SIGNED tangent at the edge midpoint (`raw_tangent · s`).
+/// Callers needing only the scalar handedness (per-sample sweeps) read it back
+/// via [`geometry_loop_tangent_sign`].
 pub(crate) fn geometry_signed_edge_tangent(
     model: &BRepModel,
     edge_id: EdgeId,
@@ -317,15 +312,18 @@ pub(crate) fn geometry_signed_edge_tangent(
     n1: &Vector3,
     midpoint: &Point3,
 ) -> OperationResult<Vector3> {
-    let sign = geometry_loop_tangent_sign(model, edge_id, face1_id, n1, midpoint)?;
     let edge = model
         .edges
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry(format!("Edge {} not found", edge_id)))?;
+    // Evaluate the raw tangent ONCE and thread it through the sign core (the
+    // sign math and the returned tangent must agree; a second `tangent_at` was
+    // both redundant and a divergence risk).
     let raw_tangent = edge
         .tangent_at(0.5, &model.curves)
         .map_err(|e| OperationError::NumericalError(format!("tangent eval failed: {:?}", e)))?;
-    Ok(raw_tangent * sign)
+    let s = loop_tangent_sign_core(model, edge_id, face1_id, n1, midpoint, &raw_tangent)?;
+    Ok(raw_tangent * s)
 }
 
 /// Scalar handedness form of [`geometry_signed_edge_tangent`] — returns the
@@ -348,41 +346,76 @@ pub(crate) fn geometry_loop_tangent_sign(
     let raw_tangent = edge
         .tangent_at(0.5, &model.curves)
         .map_err(|e| OperationError::NumericalError(format!("tangent eval failed: {:?}", e)))?;
+    loop_tangent_sign_core(model, edge_id, face1_id, n1, midpoint, &raw_tangent)
+}
 
-    // Interior sample. If face geometry is unavailable, the geometric
-    // criterion cannot be evaluated — fall back to the loop flag.
-    let interior = match face_outer_loop_centroid(model, face1_id) {
-        Some(c) => c,
-        None => return loop_flag_tangent_sign(model, edge_id, face1_id),
-    };
-
-    // Into-face direction, projected perpendicular to the raw tangent so the
-    // subsequent cross-product test is not contaminated by any along-edge
-    // component of the centroid offset.
-    let to_interior = interior - *midpoint;
-    let t_hat = match raw_tangent.normalize() {
-        Ok(t) => t,
-        // Zero-length tangent (degenerate edge) — no usable handedness from
-        // geometry; defer to the loop flag.
-        Err(_) => return loop_flag_tangent_sign(model, edge_id, face1_id),
-    };
-    let in_perp = to_interior - t_hat * to_interior.dot(&t_hat);
-    let into_face = match in_perp.normalize() {
+/// The shared sign math for both public entry points. Given `face1`'s outward
+/// normal `n1`, the edge `midpoint`, and the (already-evaluated) `raw_tangent`,
+/// returns the handedness `s` such that `raw_tangent · s` is `face1`'s CCW loop
+/// tangent.
+///
+/// EDGE-LOCAL, so it never depends on the global face shape:
+/// 1. `d = n1 × raw_tangent` is the in-surface direction perpendicular to the
+///    edge (perpendicular to `n1` ⇒ tangent to `face1`; perpendicular to the
+///    edge tangent). The two candidate into-face directions are `±d̂`.
+/// 2. A MEMBERSHIP TEST at `midpoint ± ε·d̂` (via
+///    [`crate::queries::lmd::footpoint_in_face`], which projects the probe onto
+///    `face1`'s surface and runs its trimmed even-odd loop test — inner-loop
+///    HOLES excluded, curved faces handled by the surface projection) decides
+///    which side is inside `face1`'s material. `ε` is scaled to the edge's
+///    local size ([`edge_probe_scale`]) so it is unit-invariant; several
+///    fractions are tried and the first UNAMBIGUOUS one (exactly one side
+///    inside) wins — this "step both directions" scheme is robust to the exact
+///    `ε` and to which side the boundary sits on.
+/// 3. The CCW criterion `(n1 × (raw_tangent·s)) · into_face ≥ 0` reduces to
+///    `s = sign(d · into_face)`: `s = +1` if `+d̂` is inside, `−1` if `−d̂` is.
+///
+/// Falls back to [`loop_flag_tangent_sign`] ONLY when `d` is degenerate
+/// (`n1 ∥ raw_tangent`) or membership is indeterminate at every probe scale
+/// (both sides classified alike — a sliver/degenerate micro-face). This
+/// fallback is NOT reached for the holed / annular faces the old centroid
+/// mishandled: a real bore rim gives a decisive one-sided membership, so the
+/// fallback cannot silently reintroduce the bore-rim regression.
+fn loop_tangent_sign_core(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    n1: &Vector3,
+    midpoint: &Point3,
+    raw_tangent: &Vector3,
+) -> OperationResult<f64> {
+    // In-surface direction perpendicular to the edge.
+    let d_hat = match n1.cross(raw_tangent).normalize() {
         Ok(v) => v,
-        // Interior sample collinear with the edge ⇒ `|into_face| ≈ 0`, no
-        // usable into-face direction. Fall back to the stored loop flag for
-        // this one edge rather than guessing a handedness.
+        // n1 ∥ raw_tangent (near-tangent normal / zero-length tangent): no
+        // usable in-surface perpendicular — defer to the loop flag.
         Err(_) => return loop_flag_tangent_sign(model, edge_id, face1_id),
     };
 
-    // CCW-around-outward-normal: interior on the LEFT of the loop tangent, i.e.
-    // `(n1 × loop_tangent) · into_face ≥ 0`.
-    let s = if n1.cross(&raw_tangent).dot(&into_face) >= 0.0 {
-        1.0
-    } else {
-        -1.0
-    };
-    Ok(s)
+    let scale = edge_probe_scale(model, edge_id);
+    if scale > 0.0 {
+        // Progressive step fractions of the edge's local size. Small enough to
+        // stay on the face, large enough to resolve the trim test; the first
+        // decisive (exactly-one-side-inside) probe wins.
+        for &frac in &[5.0e-2_f64, 1.0e-2, 1.5e-1, 2.0e-3] {
+            let eps = scale * frac;
+            let p_plus = *midpoint + d_hat * eps;
+            let p_minus = *midpoint - d_hat * eps;
+            let inside_plus = crate::queries::lmd::footpoint_in_face(model, face1_id, &p_plus);
+            let inside_minus = crate::queries::lmd::footpoint_in_face(model, face1_id, &p_minus);
+            // `into_face = +d̂` ⇒ s = sign(d · into_face) = +1; `−d̂` ⇒ −1.
+            if inside_plus && !inside_minus {
+                return Ok(1.0);
+            }
+            if inside_minus && !inside_plus {
+                return Ok(-1.0);
+            }
+        }
+    }
+
+    // Membership indeterminate at every scale (or no usable scale): genuinely
+    // degenerate micro-geometry only. Fall back to the loop flag.
+    loop_flag_tangent_sign(model, edge_id, face1_id)
 }
 
 /// Two-face dihedral classification. The convexity-sign convention

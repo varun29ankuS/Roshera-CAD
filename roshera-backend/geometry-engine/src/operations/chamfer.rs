@@ -3356,14 +3356,16 @@ fn compute_face_angle(
     // input tangent — using the *loop* direction (rather than the raw
     // curve direction) makes the sign convention "positive = convex"
     // independent of how the underlying curve was parameterized.
-    let face1_loop_sign = super::fillet::edge_orientation_in_face(model, face1_id, edge_id)
-        .ok_or_else(|| {
-            OperationError::InvalidGeometry(format!(
-                "Edge {} not present in any loop of face {}",
-                edge_id, face1_id
-            ))
-        })?;
-    let edge_tangent = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
+    //
+    // Fix A: the handedness is derived from face1's outward normal +
+    // edge-local interior geometry, NOT the stored loop-winding flag (which
+    // boolean Difference can leave inconsistent with the flipped normal on
+    // tool-derived faces). Shared with the fillet + classifier sites via
+    // `edge_classification::geometry_signed_edge_tangent` — one copy of the
+    // sign math.
+    let edge_tangent = super::edge_classification::geometry_signed_edge_tangent(
+        model, edge_id, face1_id, &n1, &mid_point,
+    )?;
 
     let signed =
         super::fillet_robust::robust_face_angle(&n1, &n2, &edge_tangent, &Tolerance::default())
