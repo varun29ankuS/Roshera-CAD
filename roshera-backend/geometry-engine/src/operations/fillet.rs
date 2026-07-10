@@ -738,17 +738,33 @@ pub fn fillet_edges(
         // dropped: their shared vertex is preserved through surgery
         // (`corner_shared = true`) and closed by the partial-mixed cap path, so
         // the classifier's "unsupported sharp/mixed" verdict does not apply.
-        // Mirror the three `corner_shared` triggers at the surgery site
-        // (see `create_fillet_chain`): explicit opt-in, an auto-detected pending
-        // mixed-kind corner, and a vertex already carrying an opposite-kind
-        // (chamfer) blend from a first call.
+        //
+        // Review ⚠ (Finding 1) — the exemption set must mirror the surgery
+        // `corner_shared` condition EXACTLY, never looser. The surgery site
+        // (`create_fillet_chain`, see the `original_v*_corner_shared` stamp)
+        // sets `corner_shared = true` for exactly three cases: a degree-3 apex
+        // (`is_three_edge_apex_corner`), a vertex opted-in on THIS call
+        // (`options.partial_corner_vertices`), and a vertex already carrying an
+        // opposite-kind (chamfer) blend from a first call (`v?_prior_chamfer`).
+        // The apex case needs no exemption — it is already synthesizable per
+        // `is_synthesizable_corner`, so the fixpoint keeps it. That leaves the
+        // opt-in and prior-chamfer triggers, and those alone.
+        //
+        // Exempting every `pending_mixed_kind_corners` vertex (as before) was
+        // strictly LOOSER: a corner left pending by a first *fillet* opt-in call
+        // carries a prior *Fillet* (not Chamfer), and on a later fillet call
+        // WITHOUT opt-in it is neither opt-in nor prior-chamfer — so surgery
+        // stamps `corner_shared = false`, yet the pending exemption carved it
+        // out of the fixpoint. That unshared-but-exempt corner reaches the
+        // destructive splice and crashes (the exact 1dc1d12 bug). Over-exempting
+        // is the UNSAFE direction; dropping the pending carve-out aligns the two
+        // predicates. On the default public path the D-1
+        // `validate_same_kind_scar_adjacency` pre-flight already refuses that
+        // sequence, but the fixpoint must be sound on its own.
         let exempt_vertices: HashSet<VertexId> = {
             let mut ex: HashSet<VertexId> =
                 options.partial_corner_vertices.iter().copied().collect();
             if let Some(solid) = model.solids.get(solid_id) {
-                for &vid in solid.pending_mixed_kind_corners().keys() {
-                    ex.insert(vid);
-                }
                 for &eid in &selected_edges {
                     if let Some(edge) = model.edges.get(eid) {
                         for vid in [edge.start_vertex, edge.end_vertex] {

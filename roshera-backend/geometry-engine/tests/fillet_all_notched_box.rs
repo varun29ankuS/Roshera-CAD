@@ -23,6 +23,7 @@ use geometry_engine::operations::OperationError;
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+use geometry_engine::primitives::vertex::VertexId;
 
 /// A 40³ box centred at origin with a 20³ notch removed from the (+,+,+) octant
 /// corner. Concave degree-3 re-entrant vertex at the origin; three Mixed
@@ -91,6 +92,121 @@ fn fillet_opts(r: f64) -> FilletOptions {
         fillet_type: FilletType::Constant(r),
         radius: r,
         ..Default::default()
+    }
+}
+
+/// A plain axis-aligned cube of side `size` centred at the origin.
+fn plain_cube(m: &mut BRepModel, size: f64) -> SolidId {
+    match TopologyBuilder::new(m)
+        .create_box_3d(size, size, size)
+        .expect("cube")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected Solid geometry for cube, got {o:?}"),
+    }
+}
+
+/// FIX 1 (review ⚠, Finding 1) — the graceful-skip exemption must match the
+/// surgery `corner_shared` triggers EXACTLY, never looser.
+///
+/// The corrupting path the review flagged: a corner left PENDING by a first
+/// **fillet** opt-in call carries a prior *Fillet* (not Chamfer) blend and is
+/// NOT opt-in on a later `fillet_edges` call. The old exemption exempted every
+/// vertex in `pending_mixed_kind_corners` — so that corner was carved out of
+/// the corner fixpoint yet, at the surgery, `corner_shared` was `false` (not a
+/// degree-3 apex, not prior-chamfer, not opt-in on THIS call). An unsupported
+/// multi-edge corner could then reach the destructive splice unshared and
+/// crash with `BlendEdgeSurgery original_v? N missing from model` — the exact
+/// bug commit 1dc1d12 fixed for the un-pended case.
+///
+/// GREEN CONTRACT: the second call must NOT crash with a surgery-bookkeeping
+/// error. It either rounds gracefully or returns a typed refusal, and on the
+/// refusal path the model is transactionally restored to its intermediate state.
+///
+/// Reachability note (documented in the D-2 report): on the default public path
+/// this exact sequence is refused up front by the D-1
+/// `validate_same_kind_scar_adjacency` pre-flight gate (lifecycle.rs) — the
+/// second call's endpoints sit within setback of the first fillet's live scar
+/// faces — so the loose-exemption crash never surfaces here. The exemption
+/// tightening is therefore a defense-in-depth alignment: the corner fixpoint's
+/// exemption set must equal the surgery `corner_shared` triggers even though an
+/// upstream gate currently masks the divergence. This test pins the public
+/// contract (no surgery-bookkeeping crash, transactional refusal) and guards
+/// against the D-1 gate ever being relaxed without the fixpoint being sound.
+#[test]
+fn fillet_all_after_pending_fillet_corner_no_surgery_crash() {
+    let mut m = BRepModel::new();
+    let s = plain_cube(&mut m, 10.0);
+
+    // The (+,+,+) corner and its three incident edges.
+    let corner: VertexId = m
+        .vertices
+        .iter()
+        .find(|(_, v)| v.position[0] > 4.0 && v.position[1] > 4.0 && v.position[2] > 4.0)
+        .map(|(id, _)| id)
+        .expect("(+,+,+) cube corner vertex");
+    let mut corner_edges: Vec<EdgeId> = all_edges(&m, s)
+        .into_iter()
+        .filter(|&e| {
+            m.edges
+                .get(e)
+                .map(|ed| ed.start_vertex == corner || ed.end_vertex == corner)
+                .unwrap_or(false)
+        })
+        .collect();
+    corner_edges.sort_unstable();
+    assert_eq!(
+        corner_edges.len(),
+        3,
+        "a plain cube corner must have exactly three incident edges; got {corner_edges:?}"
+    );
+
+    // First call: fillet TWO of the three corner edges, declaring the corner
+    // partial-mixed (opt-in). This registers the corner in
+    // `pending_mixed_kind_corners` carrying a prior FILLET blend and leaves it
+    // deliberately open — the setup the second call must survive.
+    let mut first = fillet_opts(1.0);
+    first.partial_corner_vertices = vec![corner];
+    fillet_edges(&mut m, s, vec![corner_edges[1], corner_edges[2]], first)
+        .expect("first-call opt-in fillet on two of three corner edges succeeds");
+
+    // Snapshot the intermediate (intentionally-open) state before the second
+    // call so the refusal path can be checked for transactionality — the
+    // pending corner from call 1 is deliberately open, so "restored" means
+    // "identical to this intermediate state", NOT "brep_valid".
+    let pre2 = m.certify_solid(s);
+
+    // Second call: fillet ALL currently-live edges WITHOUT opt-in. The pending
+    // corner now carries a prior Fillet (not Chamfer) and is not opt-in here.
+    let edges = all_edges(&m, s);
+    let result = fillet_edges(&mut m, s, edges, fillet_opts(1.0));
+
+    if let Err(e) = result {
+        let is_surgery_crash = matches!(&e, OperationError::InternalError(_))
+            || matches!(&e,
+                OperationError::InvalidGeometry(msg) | OperationError::InvalidBRep(msg)
+                    if msg.contains("missing from model")
+            );
+        assert!(
+            !is_surgery_crash,
+            "fillet-all after a pending same-kind fillet corner crashed with a \
+             surgery-bookkeeping error instead of gracefully skipping or cleanly \
+             refusing: {e:?}",
+        );
+        // Typed refusal must be transactional — the model is restored to the
+        // pre-call-2 intermediate state (same boundary-edge count & validity).
+        let post = m.certify_solid(s);
+        assert_eq!(
+            (post.brep_valid, post.boundary_edges),
+            (pre2.brep_valid, pre2.boundary_edges),
+            "a typed refusal must roll back to the pre-call intermediate state; \
+             post=({}, {}) pre2=({}, {}) errors={:?}",
+            post.brep_valid,
+            post.boundary_edges,
+            pre2.brep_valid,
+            pre2.boundary_edges,
+            post.errors,
+        );
     }
 }
 
