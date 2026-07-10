@@ -1755,12 +1755,13 @@ fn plane_cylinder_intersection(
     let plane_normal = plane_eval.normal;
     let plane_point = plane_eval.position;
 
-    // Get cylinder properties by downcasting
-    use crate::primitives::surface::Cylinder;
-    let cylinder_any = cylinder.as_any();
-    let cylinder_impl = cylinder_any
-        .downcast_ref::<Cylinder>()
+    // Accept a real Cylinder OR an equivalent-cylinder fillet face (see
+    // `as_cylinder`) — so a plane can be intersected against a filleted body's
+    // cylindrical fillet faces without the concrete-type downcast crashing.
+    // Bind owned, reborrow so downstream `&Cylinder` consumers are unchanged.
+    let cylinder_owned = as_cylinder(cylinder)
         .ok_or_else(|| OperationError::InternalError("Failed to downcast cylinder".to_string()))?;
+    let cylinder_impl = &cylinder_owned;
 
     let cyl_axis = cylinder_impl.axis;
     let cyl_origin = cylinder_impl.origin;
@@ -2237,26 +2238,58 @@ fn compute_line_cylinder_parameters(
     Ok(params)
 }
 
+/// Extract an equivalent analytic [`Cylinder`] from a surface that
+/// [`analytical_surface_kind`] classified as `Cylinder`.
+///
+/// Handles the real [`Cylinder`] AND a straight-spine
+/// [`CylindricalFillet`]: a fillet on a straight edge is geometrically a
+/// cylindrical patch of `radius` about the spine (the rolling-ball centre
+/// line). `analytical_surface_kind` reports both as `Cylinder` (a
+/// `CylindricalFillet::surface_type()` returns `SurfaceType::Cylinder`), but the
+/// analytic intersection handlers previously downcast to the concrete
+/// `Cylinder` struct and errored on the fillet type — so booleans against any
+/// filleted body crashed with "Failed to downcast cylinder"
+/// (dogfood-findings, boolean-on-filleted-body). Returns `None` for a
+/// curved-spine fillet (not a cylinder → the caller falls back to marching).
+fn as_cylinder(surface: &dyn Surface) -> Option<crate::primitives::surface::Cylinder> {
+    use crate::primitives::surface::Cylinder;
+    if let Some(c) = surface.as_any().downcast_ref::<Cylinder>() {
+        return Some(c.clone());
+    }
+    let f = surface
+        .as_any()
+        .downcast_ref::<crate::primitives::fillet_surfaces::CylindricalFillet>()?;
+    let axis = f.axis_field.first()?.normalize().ok()?;
+    // A `CylindricalFillet` is a true cylinder only when its spine is straight
+    // (every spine tangent parallel to the first). A curved spine is not a
+    // cylinder — bail so the caller routes to the marching solver.
+    if !f
+        .axis_field
+        .iter()
+        .all(|a| a.cross(&axis).magnitude() < 1e-6)
+    {
+        return None;
+    }
+    let origin = f.spine.evaluate(0.0).ok()?.position;
+    Cylinder::new(origin, axis, f.radius).ok()
+}
+
 fn cylinder_cylinder_intersection(
     surface_a: &dyn Surface,
     surface_b: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    // Get cylinder properties by downcasting
-    use crate::primitives::surface::Cylinder;
-
-    let cyl_a = surface_a
-        .as_any()
-        .downcast_ref::<Cylinder>()
-        .ok_or_else(|| {
-            OperationError::InternalError("Failed to downcast first cylinder".to_string())
-        })?;
-    let cyl_b = surface_b
-        .as_any()
-        .downcast_ref::<Cylinder>()
-        .ok_or_else(|| {
-            OperationError::InternalError("Failed to downcast second cylinder".to_string())
-        })?;
+    // Accept a real Cylinder OR an equivalent-cylinder fillet face (see
+    // `as_cylinder`); binding owned values then reborrowing keeps the rest of
+    // the function (which expects `&Cylinder`) unchanged.
+    let cyl_a_owned = as_cylinder(surface_a).ok_or_else(|| {
+        OperationError::InternalError("Failed to downcast first cylinder".to_string())
+    })?;
+    let cyl_b_owned = as_cylinder(surface_b).ok_or_else(|| {
+        OperationError::InternalError("Failed to downcast second cylinder".to_string())
+    })?;
+    let cyl_a = &cyl_a_owned;
+    let cyl_b = &cyl_b_owned;
 
     // Check for special cases first
     if cylinders_are_coaxial(cyl_a, cyl_b, tolerance) {
