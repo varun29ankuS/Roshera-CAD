@@ -10,7 +10,7 @@
 use super::blend_graph::BlendVertexKind;
 use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
 use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
-use super::fillet::{edge_orientation_in_face, get_face_oriented_normal};
+use super::fillet::get_face_oriented_normal;
 use super::lifecycle::{self, OpSpec};
 use super::mixed_kind_corner_cap::SeamContinuity;
 use super::orientation::orient_face_for_outward;
@@ -1527,25 +1527,61 @@ fn compute_chamfer_offsets(
     // are NOT colinear; both correctly point toward each face's
     // interior.
     //
-    // The previous formulation derived loop direction from the sign
-    // of the dihedral, but `robust_face_angle`'s sign itself depends
-    // on the input tangent's parameterization, so the disambiguation
-    // was circular: edges whose curve was parameterized backwards
-    // relative to face1's loop would flip the chamfer to the wrong
-    // side, putting the offset outside the face polygon and the
-    // chamfer surface outside the solid.
-    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face1_id
-        ))
+    // Fix C: derive the loop-tangent SIGN from GEOMETRY, never the stored
+    // loop-winding flag. Boolean Difference flips a tool face's normal to
+    // `Backward` WITHOUT reversing its loop winding, so on tool-derived faces
+    // the raw `edge_orientation_in_face` flag disagrees with the
+    // (proven-correct) outward normal — the old `edge_dir_sign * loop_sign`
+    // product then points the offset OUTSIDE the face polygon, putting the
+    // chamfer surface outside the solid. `geometry_signed_edge_tangent` (the
+    // shared Fix-A helper, also used by the fillet + classifier sites) returns
+    // the edge tangent oriented CCW around the face's OUTWARD normal from an
+    // edge-local face-membership test — robust for annular / holed / curved
+    // faces alike. The loop-orientation sign is CONSTANT along the edge, so
+    // resolve it ONCE at the midpoint here and apply it per sample below.
+    //
+    // Frame note: this function walks the CURVE tangent directly
+    // (`edge_tangent = curve.tangent_at(t)`), whereas the helper's returned
+    // tangent is built from `Edge::tangent_at` (= curve tangent ×
+    // `edge.orientation.sign()`). Dotting the helper's geometry-correct loop
+    // tangent against the raw curve tangent at the midpoint yields the sign
+    // that maps THIS function's curve-tangent frame onto the loop direction,
+    // absorbing the `edge.orientation` composition automatically. On a
+    // consistent primitive face this reproduces `edge.orientation.sign() *
+    // loop_sign` exactly (byte-identical convex path); on a boolean-Difference
+    // tool face it corrects it.
+    let mid_point = curve.point_at(0.5).map_err(|e| {
+        OperationError::NumericalError(format!("Edge midpoint evaluation failed: {:?}", e))
     })?;
-    let face2_loop_sign = edge_orientation_in_face(model, face2_id, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face2_id
-        ))
+    let raw_mid_tangent = curve.tangent_at(0.5).map_err(|e| {
+        OperationError::NumericalError(format!("Edge midpoint tangent failed: {:?}", e))
     })?;
+    let mid_normal1 = face_normal_at_point(model, face1_id, &mid_point)?;
+    let mid_normal2 = face_normal_at_point(model, face2_id, &mid_point)?;
+    let t_geo1 = super::edge_classification::geometry_signed_edge_tangent(
+        model,
+        edge_id,
+        face1_id,
+        &mid_normal1,
+        &mid_point,
+    )?;
+    let t_geo2 = super::edge_classification::geometry_signed_edge_tangent(
+        model,
+        edge_id,
+        face2_id,
+        &mid_normal2,
+        &mid_point,
+    )?;
+    let face1_loop_sign = if t_geo1.dot(&raw_mid_tangent) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let face2_loop_sign = if t_geo2.dot(&raw_mid_tangent) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
 
     for i in 0..=num_samples {
         let t = i as f64 / num_samples as f64;
@@ -1565,14 +1601,12 @@ fn compute_chamfer_offsets(
         let face_normal1 = face_normal_at_point(model, face1_id, &edge_point)?;
         let face_normal2 = face_normal_at_point(model, face2_id, &edge_point)?;
 
-        // Project the curve tangent onto each face's loop direction.
-        // `edge.orientation` already maps curve param to edge param,
-        // and `loop_sign` then maps edge param to loop direction. We
-        // bypass `Edge::tangent_at` here because we walk the curve
-        // directly above; apply the same composition manually.
-        let edge_dir_sign = edge.orientation.sign();
-        let t_loop1 = edge_tangent * (edge_dir_sign * face1_loop_sign);
-        let t_loop2 = edge_tangent * (edge_dir_sign * face2_loop_sign);
+        // Orient this sample's curve tangent along each face's loop
+        // direction. The loop-orientation sign was resolved once from
+        // geometry at the edge midpoint above (constant along the edge);
+        // apply it directly to the per-sample curve tangent.
+        let t_loop1 = edge_tangent * face1_loop_sign;
+        let t_loop2 = edge_tangent * face2_loop_sign;
 
         let offset_dir1 = face_normal1.cross(&t_loop1).normalize().map_err(|e| {
             OperationError::NumericalError(format!(
