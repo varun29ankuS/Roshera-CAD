@@ -2827,13 +2827,17 @@ fn compute_variable_rolling_ball_positions(
     let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
     let face1_mid_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
     let face2_mid_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
-    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face1_id
-        ))
-    })?;
-    let edge_tangent_in_loop = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
+    // Fix A: tangent handedness from face1's outward normal + interior
+    // geometry, not the (Difference-stale) loop flag. See
+    // `edge_classification::geometry_signed_edge_tangent`.
+    let edge_tangent_in_loop =
+        crate::operations::edge_classification::geometry_signed_edge_tangent(
+            model,
+            edge_id,
+            face1_id,
+            &face1_mid_normal,
+            &edge_midpoint,
+        )?;
     let dihedral_angle = robust_face_angle(
         &face1_mid_normal,
         &face2_mid_normal,
@@ -3034,13 +3038,17 @@ fn compute_function_rolling_ball_positions(
     let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
     let face1_mid_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
     let face2_mid_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
-    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face1_id
-        ))
-    })?;
-    let edge_tangent_in_loop = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
+    // Fix A: tangent handedness from face1's outward normal + interior
+    // geometry, not the (Difference-stale) loop flag. See
+    // `edge_classification::geometry_signed_edge_tangent`.
+    let edge_tangent_in_loop =
+        crate::operations::edge_classification::geometry_signed_edge_tangent(
+            model,
+            edge_id,
+            face1_id,
+            &face1_mid_normal,
+            &edge_midpoint,
+        )?;
     let dihedral_angle = robust_face_angle(
         &face1_mid_normal,
         &face2_mid_normal,
@@ -6207,12 +6215,20 @@ fn detect_dihedral_inflection(
         .faces
         .get(face2_id)
         .ok_or_else(|| OperationError::InvalidGeometry(format!("Face {} missing", face2_id)))?;
-    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face1_id
-        ))
-    })?;
+    // Fix A: a single per-edge tangent handedness, derived from face1's
+    // outward normal + interior geometry at the midpoint rather than the
+    // (Difference-stale) loop flag. The per-sample raw tangent below is
+    // multiplied by this constant sign exactly as it previously was by the
+    // loop flag. See `edge_classification::geometry_loop_tangent_sign`.
+    let edge_midpoint = edge.evaluate(0.5, &model.curves)?;
+    let face1_mid_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
+    let face1_loop_sign = crate::operations::edge_classification::geometry_loop_tangent_sign(
+        model,
+        edge_id,
+        face1_id,
+        &face1_mid_normal,
+        &edge_midpoint,
+    )?;
 
     let tol = Tolerance::default();
     let mut signs = Vec::with_capacity(sample_count);
@@ -8668,10 +8684,12 @@ fn get_edges_at_vertex(
 /// (b) the edge tangent rotated into one face's CCW loop direction.
 /// Both corrections are applied here: normals come from
 /// `get_face_oriented_normal` which multiplies by
-/// `face.orientation.sign()`, and the tangent is multiplied by
-/// `face1_loop_sign` so its direction matches `face1`'s loop
-/// traversal regardless of which way the underlying curve happens to
-/// be parameterized.
+/// `face.orientation.sign()`, and the tangent is oriented into `face1`'s
+/// CCW loop direction by `edge_classification::geometry_signed_edge_tangent`
+/// — which derives the handedness from `face1`'s outward normal + interior
+/// geometry rather than the stored loop-winding flag (Fix A), so a boolean
+/// Difference that left the loop flag inconsistent with the flipped normal
+/// no longer mis-signs the dihedral.
 fn compute_face_angle(
     model: &BRepModel,
     edge_id: EdgeId,
@@ -8687,13 +8705,16 @@ fn compute_face_angle(
     let face1_normal = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
     let face2_normal = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
 
-    let face1_loop_sign = edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
-        OperationError::InvalidGeometry(format!(
-            "Edge {} not present in any loop of face {}",
-            edge_id, face1_id
-        ))
-    })?;
-    let edge_tangent = edge.tangent_at(0.5, &model.curves)? * face1_loop_sign;
+    // Fix A: tangent handedness from face1's outward normal + interior
+    // geometry, not the (Difference-stale) loop flag. See
+    // `edge_classification::geometry_signed_edge_tangent`.
+    let edge_tangent = crate::operations::edge_classification::geometry_signed_edge_tangent(
+        model,
+        edge_id,
+        face1_id,
+        &face1_normal,
+        &edge_midpoint,
+    )?;
 
     robust_face_angle(
         &face1_normal,

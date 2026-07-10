@@ -26,7 +26,7 @@
 //! Slices 2/3) and live in `operations/`. Moving them down to
 //! `primitives/` would invert the dependency edge.
 
-use crate::math::{Tolerance, Vector3};
+use crate::math::{Point3, Tolerance, Vector3};
 use crate::operations::fillet::{edge_orientation_in_face, get_face_oriented_normal};
 use crate::operations::fillet_robust::robust_face_angle;
 use crate::operations::{OperationError, OperationResult};
@@ -228,6 +228,163 @@ pub fn classify_dihedral(
     Ok(classify_edge(model, edge_id)?.dihedral_class())
 }
 
+/// Centroid of `face_id`'s outer-loop vertices — the interior sample that
+/// [`geometry_signed_edge_tangent`] uses to orient the loop tangent.
+///
+/// Robust for BOTH planar and curved faces. For a plane the centroid is the
+/// geometric centre of the face, unambiguously interior. For a curved face
+/// (cylinder / cone / sphere) the centroid sits *off* the surface — e.g. on
+/// a cylinder's axis — but that offset is directed purely along the surface
+/// NORMAL at the edge, and the tangent-sign criterion dots the interior
+/// direction with `n1 × tangent` (which is perpendicular to `n1`), so the
+/// off-surface normal component is annihilated. Only the in-surface
+/// "into the patch" component survives, which the centroid captures with the
+/// correct sign. Returns `None` if the face or its outer loop is missing or
+/// carries no live vertices (caller then falls back to the loop flag).
+fn face_outer_loop_centroid(model: &BRepModel, face_id: FaceId) -> Option<Point3> {
+    let face = model.faces.get(face_id)?;
+    let outer = model.loops.get(face.outer_loop)?;
+    let mut seen = std::collections::HashSet::with_capacity(outer.edges.len() * 2);
+    let mut sum = Vector3::ZERO;
+    let mut count = 0usize;
+    for &eid in &outer.edges {
+        let edge = model.edges.get(eid)?;
+        for vid in [edge.start_vertex, edge.end_vertex] {
+            if seen.insert(vid) {
+                if let Some(v) = model.vertices.get(vid) {
+                    sum = sum + v.point();
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(sum * (1.0 / count as f64))
+}
+
+/// Loop-flag tangent sign — the LEGACY handedness source, kept only as the
+/// degenerate-geometry fallback for [`geometry_signed_edge_tangent`].
+///
+/// `+1` if `edge_id` is traversed in the `+curve` direction by a loop of
+/// `face1_id`, `-1` otherwise. Boolean Difference can leave this flag
+/// inconsistent with `face1`'s (correct) outward normal on tool-derived
+/// faces, which is exactly the bug Fix A removes — so this is the last
+/// resort, never the primary sign source.
+fn loop_flag_tangent_sign(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+) -> OperationResult<f64> {
+    edge_orientation_in_face(model, face1_id, edge_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "Edge {} not present in any loop of face {}",
+            edge_id, face1_id
+        ))
+    })
+}
+
+/// Derive the sign that rotates an edge's raw curve tangent into `face1`'s
+/// CCW loop direction **from geometry**, not from the stored loop-winding
+/// flag (Fix A).
+///
+/// The dihedral-convexity classifier needs the edge tangent oriented so that
+/// `face1`'s interior lies on its LEFT when viewed from outside the solid
+/// (CCW-around-outward-normal). Historically that orientation was taken from
+/// `face1`'s stored loop winding — but boolean Difference flips a tool face's
+/// normal to `Backward` WITHOUT reversing its loop winding, so on edges whose
+/// driving face1 is tool-derived the loop flag disagrees with the
+/// (proven-correct) outward normal and the tangent handedness comes out wrong,
+/// signing a concave re-entrant edge as convex.
+///
+/// This helper instead chooses the sign `s ∈ {+1, −1}` so that
+/// `(n1 × (raw_tangent · s)) · into_face ≥ 0`, where `n1` is `face1`'s outward
+/// normal at the edge and `into_face` is the (tangent-plane) direction from the
+/// edge midpoint toward `face1`'s interior. That makes the tangent handedness a
+/// pure function of the outward normal + face geometry — the inputs proven
+/// correct — and never trusts a loop flag Difference may have left stale.
+///
+/// Returns the SIGNED tangent evaluated at the edge midpoint (`raw_tangent ·
+/// s`). Callers that need only the scalar handedness (per-sample sweeps) read
+/// it back via [`geometry_loop_tangent_sign`]. Falls back to
+/// [`loop_flag_tangent_sign`] iff the interior sample is degenerate (missing,
+/// or collinear with the edge so `|into_face| ≈ 0`), documented inline.
+pub(crate) fn geometry_signed_edge_tangent(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    n1: &Vector3,
+    midpoint: &Point3,
+) -> OperationResult<Vector3> {
+    let sign = geometry_loop_tangent_sign(model, edge_id, face1_id, n1, midpoint)?;
+    let edge = model
+        .edges
+        .get(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Edge {} not found", edge_id)))?;
+    let raw_tangent = edge
+        .tangent_at(0.5, &model.curves)
+        .map_err(|e| OperationError::NumericalError(format!("tangent eval failed: {:?}", e)))?;
+    Ok(raw_tangent * sign)
+}
+
+/// Scalar handedness form of [`geometry_signed_edge_tangent`] — returns the
+/// sign `s` that orients the raw curve tangent into `face1`'s CCW loop
+/// direction. Used by per-sample sweeps (e.g. inflection detection) that must
+/// multiply their own per-parameter raw tangent by a single per-edge sign,
+/// exactly as they previously multiplied by the loop flag. Keeping the sign
+/// math here means all consumers share one implementation.
+pub(crate) fn geometry_loop_tangent_sign(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    n1: &Vector3,
+    midpoint: &Point3,
+) -> OperationResult<f64> {
+    let edge = model
+        .edges
+        .get(edge_id)
+        .ok_or_else(|| OperationError::InvalidGeometry(format!("Edge {} not found", edge_id)))?;
+    let raw_tangent = edge
+        .tangent_at(0.5, &model.curves)
+        .map_err(|e| OperationError::NumericalError(format!("tangent eval failed: {:?}", e)))?;
+
+    // Interior sample. If face geometry is unavailable, the geometric
+    // criterion cannot be evaluated — fall back to the loop flag.
+    let interior = match face_outer_loop_centroid(model, face1_id) {
+        Some(c) => c,
+        None => return loop_flag_tangent_sign(model, edge_id, face1_id),
+    };
+
+    // Into-face direction, projected perpendicular to the raw tangent so the
+    // subsequent cross-product test is not contaminated by any along-edge
+    // component of the centroid offset.
+    let to_interior = interior - *midpoint;
+    let t_hat = match raw_tangent.normalize() {
+        Ok(t) => t,
+        // Zero-length tangent (degenerate edge) — no usable handedness from
+        // geometry; defer to the loop flag.
+        Err(_) => return loop_flag_tangent_sign(model, edge_id, face1_id),
+    };
+    let in_perp = to_interior - t_hat * to_interior.dot(&t_hat);
+    let into_face = match in_perp.normalize() {
+        Ok(v) => v,
+        // Interior sample collinear with the edge ⇒ `|into_face| ≈ 0`, no
+        // usable into-face direction. Fall back to the stored loop flag for
+        // this one edge rather than guessing a handedness.
+        Err(_) => return loop_flag_tangent_sign(model, edge_id, face1_id),
+    };
+
+    // CCW-around-outward-normal: interior on the LEFT of the loop tangent, i.e.
+    // `(n1 × loop_tangent) · into_face ≥ 0`.
+    let s = if n1.cross(&raw_tangent).dot(&into_face) >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    Ok(s)
+}
+
 /// Two-face dihedral classification. The convexity-sign convention
 /// matches `fillet::compute_face_angle` exactly — positive dihedrals
 /// are convex, negative are concave — because we reuse the same
@@ -251,22 +408,26 @@ fn classify_manifold_edge(
     let face1_normal: Vector3 = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
     let face2_normal: Vector3 = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
 
-    let face1_loop_sign = match edge_orientation_in_face(model, face1_id, edge_id) {
-        Some(s) => s,
-        None => {
-            return Ok(EdgeClassification {
-                manifold_kind: ManifoldKind::Manifold,
-                dihedral_angle: None,
-                convexity: 0,
-                sharpness: 1.0,
-            });
-        }
-    };
-
-    let edge_tangent = edge
-        .tangent_at(0.5, &model.curves)
-        .map_err(|e| OperationError::NumericalError(format!("tangent eval failed: {:?}", e)))?
-        * face1_loop_sign;
+    // Fix A: derive the edge-tangent handedness from face1's outward normal +
+    // interior geometry, NOT its stored loop-winding flag (which boolean
+    // Difference can leave inconsistent with the flipped normal on
+    // tool-derived faces, mis-signing concave re-entrant edges as convex).
+    // If geometry can't yield a handedness (degenerate edge/face), the helper
+    // falls back to the loop flag; a hard failure ⇒ soft manifold-undefined
+    // classification, matching the prior behaviour of a missing loop flag.
+    let edge_tangent =
+        match geometry_signed_edge_tangent(model, edge_id, face1_id, &face1_normal, &edge_midpoint)
+        {
+            Ok(t) => t,
+            Err(_) => {
+                return Ok(EdgeClassification {
+                    manifold_kind: ManifoldKind::Manifold,
+                    dihedral_angle: None,
+                    convexity: 0,
+                    sharpness: 1.0,
+                });
+            }
+        };
 
     let tolerance = Tolerance::default();
     let dihedral = match robust_face_angle(&face1_normal, &face2_normal, &edge_tangent, &tolerance)
