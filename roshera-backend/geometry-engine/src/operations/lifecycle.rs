@@ -837,16 +837,22 @@ fn validate_corner_compatibility(
             // Setbacks resolved — corner is geometrically feasible
             // but corner-patch synthesis for this vertex kind is not
             // yet implemented (F5-γ / F5-δ).
-            let setback_summary = graph
+            // Report the resolved setback only when a finite per-edge value
+            // was actually recorded. A `ConcaveCorner { degree: 1 }` resolves
+            // feasibly but stores no per-edge setback on THIS edge, so the old
+            // `.unwrap_or(f64::NAN)` printed a misleading "≈ NaN" — say what is
+            // true instead of fabricating a number.
+            let feasibility = match graph
                 .edge(ei)
-                .and_then(|e| {
-                    if let Some(v) = e.start_setback {
-                        Some(v)
-                    } else {
-                        e.end_setback
-                    }
-                })
-                .unwrap_or(f64::NAN);
+                .and_then(|e| e.start_setback.or(e.end_setback))
+            {
+                Some(v) if v.is_finite() => {
+                    format!("Setback is geometrically feasible (≈ {v:.4} for a unit radius)")
+                }
+                _ => "The setback solver accepted this corner (no per-edge setback \
+                      value is recorded for this vertex kind)"
+                    .to_string(),
+            };
             // D-1 (dogfood-diag-api-blend, divergence site #1): this
             // message previously advised "apply each edge in a separate
             // fillet/chamfer call" — which is EXACTLY the corrupting
@@ -854,8 +860,7 @@ fn validate_corner_compatibility(
             // supported route instead, including the concrete corner
             // vertex id the caller needs for the opt-in.
             Err(OperationError::NotImplemented(format!(
-                "Edges {} and {} share corner vertex {} ({:?}). \
-                 Setback is geometrically feasible (≈ {:.4} for a unit radius), \
+                "Edges {} and {} share corner vertex {} ({:?}). {}, \
                  but same-kind corner-patch synthesis for this vertex kind is not \
                  yet implemented (Task #82 / F5-γ / F5-δ). Do NOT apply these edges \
                  in separate single-edge calls — sequential single-edge blends at a \
@@ -864,7 +869,7 @@ fn validate_corner_compatibility(
                  `partial_corner_vertices: [{}]` on a single call carrying ALL \
                  same-kind edges at this corner, then apply the opposite blend kind \
                  in a second call.",
-                ei, ej, vertex, vertex_kind, setback_summary, vertex
+                ei, ej, vertex, vertex_kind, feasibility, vertex
             )))
         }
         Err(setback_err) => match vertex_kind {
