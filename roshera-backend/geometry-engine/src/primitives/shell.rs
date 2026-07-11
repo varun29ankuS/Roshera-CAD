@@ -19,7 +19,7 @@ use crate::math::{consts, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     curve::CurveStore,
     edge::{EdgeId, EdgeStore},
-    face::{Face, FaceId, FaceOrientation, FaceStore, INVALID_FACE_ID},
+    face::{Face, FaceId, FaceOrientation, FaceStore},
     r#loop::LoopStore,
     surface::SurfaceStore,
     vertex::VertexStore,
@@ -802,36 +802,6 @@ impl Shell {
         } else {
             false
         }
-    }
-
-    /// Create offset shell
-    pub fn offset(
-        &self,
-        distance: f64,
-        face_store: &FaceStore,
-        surface_store: &mut SurfaceStore,
-    ) -> MathResult<Shell> {
-        let offset_shell = Shell::new(INVALID_SHELL_ID, self.shell_type);
-
-        for &face_id in &self.faces {
-            if let Some(face) = face_store.get(face_id) {
-                // Create offset surface
-                if let Some(surface) = surface_store.get(face.surface_id) {
-                    let offset_surface = surface.offset(distance);
-                    let offset_surface_id = surface_store.add(offset_surface);
-
-                    // Create offset face
-                    let mut offset_face = face.clone();
-                    offset_face.id = INVALID_FACE_ID; // To be set by caller
-                    offset_face.surface_id = offset_surface_id;
-
-                    // Note: This is simplified - real implementation would
-                    // need to handle trim curves and topology changes
-                }
-            }
-        }
-
-        Ok(offset_shell)
     }
 }
 
