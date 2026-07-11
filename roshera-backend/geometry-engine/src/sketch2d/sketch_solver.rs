@@ -701,8 +701,20 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // mutable surface; the sketch is never written back. This keeps
     // `analyze_dofs` side-effect-free, matching its documented
     // contract.
+    // A constraint the solver recognises but cannot enforce (e.g.
+    // MinDistance, MomentOfInertia) removes zero DOF, so on its own it
+    // can leave a sketch looking structurally `FullyConstrained` while a
+    // constraint is being silently ignored. Detect any such constraint
+    // on supported entities and force the numerical diagnosis to run —
+    // the solver emits an irreducible residual for it, which surfaces as
+    // a conflict so the certificate refuses to call the sketch
+    // consistent rather than falsely certifying a solve.
+    let has_unenforced = sketch.all_constraints().iter().any(|c| {
+        !c.constraint_type.is_numerically_enforced()
+            && !c.entities.iter().any(|e| skipped_set.contains(e))
+    });
     let (redundant, conflicts) = match status {
-        DofStatus::FullyConstrained => (Vec::new(), Vec::new()),
+        DofStatus::FullyConstrained if !has_unenforced => (Vec::new(), Vec::new()),
         _ => diagnose_constraints(sketch, &skipped_set),
     };
 

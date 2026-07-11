@@ -397,14 +397,22 @@ impl Constraint {
                 // Advanced constraint types
                 GeometricConstraint::SmoothTangent => 1,
                 GeometricConstraint::CurvatureContinuity => 2,
-                GeometricConstraint::Offset => 1,
-                GeometricConstraint::MultiTangent => 1,
                 GeometricConstraint::EqualArea => 1,
                 GeometricConstraint::EqualPerimeter => 1,
                 GeometricConstraint::Centroid => 2,
-                GeometricConstraint::CurvatureExtremum => 1,
                 GeometricConstraint::IntersectionAngle(_) => 1,
-                GeometricConstraint::ContactConstraint => 1,
+
+                // Recognised but not yet enforceable by the numerical
+                // solver (no real residual equation). These remove ZERO
+                // DOF so they can never fake a "fully constrained"
+                // verdict; the solver additionally emits an irreducible
+                // residual (see `UNSUPPORTED_CONSTRAINT_RESIDUAL`) so a
+                // sketch carrying one is never reported solved. Keep this
+                // set in lock-step with `ConstraintType::is_numerically_enforced`.
+                GeometricConstraint::Offset
+                | GeometricConstraint::MultiTangent
+                | GeometricConstraint::CurvatureExtremum
+                | GeometricConstraint::ContactConstraint => 0,
             },
             ConstraintType::Dimensional(d) => match d {
                 DimensionalConstraint::Distance(_) => 1,
@@ -421,14 +429,48 @@ impl Constraint {
                 DimensionalConstraint::ArcLength(_) => 1,
                 DimensionalConstraint::Curvature(_) => 1,
                 DimensionalConstraint::Slope(_) => 1,
-                DimensionalConstraint::OffsetDistance(_) => 1,
                 DimensionalConstraint::AspectRatio(_) => 1,
-                DimensionalConstraint::MinDistance(_) => 1,
-                DimensionalConstraint::MaxDistance(_) => 1,
-                DimensionalConstraint::MomentOfInertia(_) => 1,
                 DimensionalConstraint::CenterOfMass { .. } => 2,
+
+                // Not yet enforceable — remove ZERO DOF (see the
+                // geometric note above). One-sided inequalities
+                // (Min/MaxDistance) are not equality residuals at all;
+                // MomentOfInertia and OffsetDistance are deferred.
+                DimensionalConstraint::OffsetDistance(_)
+                | DimensionalConstraint::MinDistance(_)
+                | DimensionalConstraint::MaxDistance(_)
+                | DimensionalConstraint::MomentOfInertia(_) => 0,
             },
         }
+    }
+}
+
+impl ConstraintType {
+    /// Whether the numerical constraint solver enforces this constraint
+    /// with a real residual equation.
+    ///
+    /// `false` for constraints that are recognised by the type system
+    /// but not yet backed by a residual — they remove zero degrees of
+    /// freedom and the solver emits an irreducible residual for them so
+    /// they can never contribute to a false "solved" verdict. The set
+    /// here MUST match the zero-DOF / refusal arms in
+    /// [`Constraint::degrees_of_freedom_removed`] and the solver's
+    /// `evaluate_geometric_constraint` / `evaluate_dimensional_constraint`.
+    pub fn is_numerically_enforced(&self) -> bool {
+        !matches!(
+            self,
+            ConstraintType::Geometric(
+                GeometricConstraint::Offset
+                    | GeometricConstraint::MultiTangent
+                    | GeometricConstraint::CurvatureExtremum
+                    | GeometricConstraint::ContactConstraint
+            ) | ConstraintType::Dimensional(
+                DimensionalConstraint::OffsetDistance(_)
+                    | DimensionalConstraint::MinDistance(_)
+                    | DimensionalConstraint::MaxDistance(_)
+                    | DimensionalConstraint::MomentOfInertia(_)
+            )
+        )
     }
 }
 

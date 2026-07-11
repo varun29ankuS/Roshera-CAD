@@ -255,6 +255,26 @@ fn control_points_from_parameters(parameters: &[f64]) -> Option<Vec<Point2d>> {
     Some(control_points)
 }
 
+/// Irreducible residual emitted for a constraint the solver recognises
+/// but cannot yet enforce with a real equation (e.g. `MinDistance`,
+/// `MomentOfInertia`, `MultiTangent`). It is a fixed, non-zero value with
+/// an all-zero Jacobian row (the residual does not depend on any
+/// parameter), so:
+/// - the Newton step is unaffected (the row contributes nothing to
+///   `Jᵀ·J` or `Jᵀ·e`), leaving the enforceable constraints to solve
+///   normally, and
+/// - the residual norm can never fall below tolerance, so the solver
+///   reports `NotConverged`/violation rather than silently claiming a
+///   solve for a constraint it is ignoring.
+///
+/// The magnitude (1.0) is deliberately above both the solver tolerance
+/// and `CONFLICT_RESIDUAL_THRESHOLD` in the sketch bridge so the
+/// unsupported constraint surfaces as a genuine conflict end-to-end.
+/// Paired with `degrees_of_freedom_removed() == 0` for the same kinds
+/// (see `constraints.rs`), the constraint neither fakes DOF accounting
+/// nor fakes a satisfied residual — the self-cert lie is closed.
+const UNSUPPORTED_CONSTRAINT_RESIDUAL: f64 = 1.0;
+
 impl ConstraintSolver {
     /// Create a new constraint solver
     pub fn new() -> Self {
@@ -666,7 +686,62 @@ impl ConstraintSolver {
                     vec![0.0, 0.0]
                 }
             }
-            _ => vec![0.0], // Other advanced constraints
+            GeometricConstraint::EqualArea => {
+                // Two closed entities enclose the same area: A₁ − A₂ = 0.
+                if entities.len() == 2 {
+                    match (
+                        self.entity_area(&entities[0]),
+                        self.entity_area(&entities[1]),
+                    ) {
+                        (Some(a1), Some(a2)) => vec![a1 - a2],
+                        // An entity kind with no defined area here — refuse
+                        // rather than fake a satisfied (zero) residual.
+                        _ => Self::unsupported_residual(),
+                    }
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            GeometricConstraint::EqualPerimeter => {
+                // Two closed entities have the same boundary length.
+                if entities.len() == 2 {
+                    match (
+                        self.entity_perimeter(&entities[0]),
+                        self.entity_perimeter(&entities[1]),
+                    ) {
+                        (Some(p1), Some(p2)) => vec![p1 - p2],
+                        _ => Self::unsupported_residual(),
+                    }
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            GeometricConstraint::Centroid => {
+                // entities = [point, closed_curve]; the point sits at the
+                // curve's centre of mass. Two residuals (Δx, Δy) — matches
+                // `constraint_error_count` and the 2 DOF it removes.
+                if entities.len() == 2 {
+                    if let (Some(p), Some(c)) = (
+                        self.get_point_position(&entities[0]),
+                        self.entity_centroid(&entities[1]),
+                    ) {
+                        vec![p.x - c.x, p.y - c.y]
+                    } else {
+                        // Keep the row budget (2) stable on failure.
+                        vec![0.0, 0.0]
+                    }
+                } else {
+                    vec![0.0, 0.0]
+                }
+            }
+            // Recognised but not yet enforceable with a real equation.
+            // Emit an irreducible residual so the solver refuses to claim
+            // a solve rather than silently DOF-counting them (they also
+            // remove 0 DOF — see `degrees_of_freedom_removed`).
+            GeometricConstraint::Offset
+            | GeometricConstraint::MultiTangent
+            | GeometricConstraint::CurvatureExtremum
+            | GeometricConstraint::ContactConstraint => Self::unsupported_residual(),
         }
     }
 
@@ -737,7 +812,128 @@ impl ConstraintSolver {
                     vec![0.0, 0.0]
                 }
             }
-            _ => vec![0.0], // Other constraints need full implementation
+            DimensionalConstraint::Length(target_len) => {
+                // Length of a line segment: |segment| − target.
+                if entities.len() == 1 {
+                    if let Some(len) = self.get_line_length(&entities[0]) {
+                        vec![len - target_len]
+                    } else {
+                        vec![0.0]
+                    }
+                } else {
+                    vec![0.0]
+                }
+            }
+            DimensionalConstraint::Diameter(target_dia) => {
+                // Diameter of a circle/arc: 2·radius − target.
+                if entities.len() == 1 {
+                    if let Some(radius) = self.get_circle_radius(&entities[0]) {
+                        vec![2.0 * radius - target_dia]
+                    } else {
+                        vec![0.0]
+                    }
+                } else {
+                    vec![0.0]
+                }
+            }
+            DimensionalConstraint::Area(target_area) => {
+                // Enclosed area of a closed entity: A − target.
+                if entities.len() == 1 {
+                    match self.entity_area(&entities[0]) {
+                        Some(area) => vec![area - target_area],
+                        None => Self::unsupported_residual(),
+                    }
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            DimensionalConstraint::Perimeter(target_perim) => {
+                // Boundary length of a closed entity: P − target.
+                if entities.len() == 1 {
+                    match self.entity_perimeter(&entities[0]) {
+                        Some(perim) => vec![perim - target_perim],
+                        None => Self::unsupported_residual(),
+                    }
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            DimensionalConstraint::ArcLength(target_len) => {
+                // Swept length of an arc/circle: L − target.
+                if entities.len() == 1 {
+                    match self.entity_arc_length(&entities[0]) {
+                        Some(len) => vec![len - target_len],
+                        None => Self::unsupported_residual(),
+                    }
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            DimensionalConstraint::Curvature(target_k) => {
+                // Curvature at the entity: κ − target (κ = 1/r for
+                // circle/arc, 0 for a line).
+                if entities.len() == 1 {
+                    match self.entity_curvature(&entities[0]) {
+                        Some(k) => vec![k - target_k],
+                        None => Self::unsupported_residual(),
+                    }
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            DimensionalConstraint::Slope(target_slope) => {
+                // Slope of a line: dy/dx = target, written in the
+                // division-free form dy − target·dx = 0 so the residual is
+                // finite for vertical directions and drives the direction
+                // to rotate rather than blow up.
+                if entities.len() == 1 {
+                    if let Some(dir) = self.get_line_direction(&entities[0]) {
+                        vec![dir.y - target_slope * dir.x]
+                    } else {
+                        vec![0.0]
+                    }
+                } else {
+                    vec![0.0]
+                }
+            }
+            DimensionalConstraint::AspectRatio(target_ratio) => {
+                // width/height = target for a rectangle, or
+                // semi_major/semi_minor = target for an ellipse, written
+                // division-free as dim0 − target·dim1 = 0.
+                if entities.len() == 1 {
+                    let dims = self
+                        .get_rectangle_dimensions(&entities[0])
+                        .or_else(|| self.get_ellipse_axes(&entities[0]));
+                    match dims {
+                        Some((major, minor)) => vec![major - target_ratio * minor],
+                        None => Self::unsupported_residual(),
+                    }
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            DimensionalConstraint::CenterOfMass { x, y } => {
+                // Centre of mass pinned to (x, y). Two residuals (Δx, Δy)
+                // — matches `constraint_error_count` and the 2 DOF removed.
+                if entities.len() == 1 {
+                    if let Some(c) = self.entity_centroid(&entities[0]) {
+                        vec![c.x - x, c.y - y]
+                    } else {
+                        vec![0.0, 0.0]
+                    }
+                } else {
+                    vec![0.0, 0.0]
+                }
+            }
+            // Recognised but not yet enforceable with a real equation:
+            // one-sided inequalities (Min/MaxDistance), moment of inertia,
+            // and the ambiguous offset distance. Emit an irreducible
+            // residual so the solver refuses to claim a solve — paired
+            // with `degrees_of_freedom_removed() == 0` for these kinds.
+            DimensionalConstraint::MinDistance(_)
+            | DimensionalConstraint::MaxDistance(_)
+            | DimensionalConstraint::MomentOfInertia(_)
+            | DimensionalConstraint::OffsetDistance(_) => Self::unsupported_residual(),
         }
     }
 
@@ -913,6 +1109,88 @@ impl ConstraintSolver {
             }),
             _ => None,
         }
+    }
+
+    /// Enclosed area of a closed entity.
+    ///
+    /// Defined for the closed primitive kinds the solver stores with a
+    /// size parameter: circle (`πr²`), rectangle (`w·h`), ellipse
+    /// (`π·a·b`). Returns `None` for open/ambiguous kinds (point, line,
+    /// arc, spline, polyline) so callers refuse rather than fabricate a
+    /// zero residual for an entity that has no well-defined area here.
+    fn entity_area(&self, entity: &EntityRef) -> Option<f64> {
+        use std::f64::consts::PI;
+        match entity {
+            EntityRef::Circle(_) => self.get_circle_radius(entity).map(|r| PI * r * r),
+            EntityRef::Rectangle(_) => self.get_rectangle_dimensions(entity).map(|(w, h)| w * h),
+            EntityRef::Ellipse(_) => self.get_ellipse_axes(entity).map(|(a, b)| PI * a * b),
+            _ => None,
+        }
+    }
+
+    /// Perimeter (closed-boundary length) of a closed entity.
+    ///
+    /// Circle: `2πr`. Rectangle: `2(w+h)`. Ellipse: Ramanujan's second
+    /// approximation `π[3(a+b) − √((3a+b)(a+3b))]` (relative error
+    /// < 1e-5 for all eccentricities — well inside sketch tolerance).
+    /// `None` for kinds without a closed boundary the solver can size.
+    fn entity_perimeter(&self, entity: &EntityRef) -> Option<f64> {
+        use std::f64::consts::PI;
+        match entity {
+            EntityRef::Circle(_) => self.get_circle_radius(entity).map(|r| 2.0 * PI * r),
+            EntityRef::Rectangle(_) => self
+                .get_rectangle_dimensions(entity)
+                .map(|(w, h)| 2.0 * (w + h)),
+            EntityRef::Ellipse(_) => self
+                .get_ellipse_axes(entity)
+                .map(|(a, b)| PI * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt())),
+            _ => None,
+        }
+    }
+
+    /// Length of a curve entity along its swept parameter.
+    ///
+    /// Arc: `r·|θ_end − θ_start|`. Circle (closed): `2πr`. `None` for
+    /// kinds whose swept length the solver cannot evaluate from its
+    /// stored parameters.
+    fn entity_arc_length(&self, entity: &EntityRef) -> Option<f64> {
+        use std::f64::consts::PI;
+        match entity {
+            EntityRef::Arc(_) => {
+                let r = self.get_circle_radius(entity)?;
+                let (start, end) = self.get_arc_angles(entity)?;
+                Some(r * (end - start).abs())
+            }
+            EntityRef::Circle(_) => self.get_circle_radius(entity).map(|r| 2.0 * PI * r),
+            _ => None,
+        }
+    }
+
+    /// Signed curvature magnitude of an entity: `1/r` for circle/arc,
+    /// `0` for a straight line. `None` for kinds with non-constant or
+    /// undefined curvature (handled elsewhere or refused).
+    fn entity_curvature(&self, entity: &EntityRef) -> Option<f64> {
+        match entity {
+            EntityRef::Circle(_) | EntityRef::Arc(_) => {
+                self.get_circle_radius(entity).map(|r| 1.0 / r)
+            }
+            EntityRef::Line(_) => Some(0.0),
+            _ => None,
+        }
+    }
+
+    /// Centre of mass of a closed primitive. For circle, arc, rectangle
+    /// and ellipse this is the stored centre (`get_circle_center`
+    /// already unifies those layouts). `None` for kinds whose centroid
+    /// the solver cannot read directly.
+    fn entity_centroid(&self, entity: &EntityRef) -> Option<Point2d> {
+        self.get_circle_center(entity)
+    }
+
+    /// The refusal residual for a recognised-but-unenforceable
+    /// constraint. See [`UNSUPPORTED_CONSTRAINT_RESIDUAL`].
+    fn unsupported_residual() -> Vec<f64> {
+        vec![UNSUPPORTED_CONSTRAINT_RESIDUAL]
     }
 
     /// Compute Jacobian matrix
@@ -1137,11 +1415,15 @@ impl ConstraintSolver {
                 }
                 // The angle residual (`angle_residual`) is a 2-vector.
                 GeometricConstraint::IntersectionAngle(_) => 2,
+                // Centroid pins a point to a centre of mass: (Δx, Δy).
+                GeometricConstraint::Centroid => 2,
                 _ => 1,
             },
             // `DimensionalConstraint::Angle` shares the 2-vector angle
-            // residual; every other dimensional constraint is scalar.
-            ConstraintType::Dimensional(DimensionalConstraint::Angle(_)) => 2,
+            // residual; `CenterOfMass` pins (x, y). Every other
+            // dimensional constraint is scalar.
+            ConstraintType::Dimensional(DimensionalConstraint::Angle(_))
+            | ConstraintType::Dimensional(DimensionalConstraint::CenterOfMass { .. }) => 2,
             ConstraintType::Dimensional(_) => 1,
         }
     }
@@ -2373,6 +2655,300 @@ mod tests {
             vec![p1, p2],
             ConstraintPriority::High,
         )
+    }
+
+    // ─────────── RED: silent-DOF-lie / inert-residual regression ───────
+    //
+    // Before the inert-constraint fix these constraints were DOF-counted
+    // but their residual body was `_ => vec![0.0]` — a violated constraint
+    // reported ZERO residual, so the solver called the sketch solved. Each
+    // test below evaluates the constraint on a configuration that VIOLATES
+    // it and asserts the residual is non-zero. They fail (residual 0) on the
+    // inert implementation and pass once the real equation is wired in.
+
+    fn residual_mag(errs: &[f64]) -> f64 {
+        errs.iter().map(|e| e * e).sum::<f64>().sqrt()
+    }
+
+    #[test]
+    fn red_diameter_residual_nonzero_when_violated() {
+        let s = ConstraintSolver::new();
+        let c = circle_ref();
+        // radius 3 → diameter 6, but we demand diameter 10 (violated by 4).
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 3.0, false, false),
+        );
+        let errs = s.evaluate_dimensional_constraint(&DimensionalConstraint::Diameter(10.0), &[c]);
+        assert!(
+            residual_mag(&errs) > 1e-9,
+            "Diameter must produce a non-zero residual when violated, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn red_length_residual_nonzero_when_violated() {
+        let s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let line = line_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(b, EntityState::point(Point2d::new(3.0, 4.0), false)); // length 5
+        s.add_entity(line, EntityState::segment_between(a, b));
+        let errs = s.evaluate_dimensional_constraint(&DimensionalConstraint::Length(10.0), &[line]);
+        assert!(
+            residual_mag(&errs) > 1e-9,
+            "Length must produce a non-zero residual when violated, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn red_area_residual_nonzero_when_violated() {
+        let s = ConstraintSolver::new();
+        let c = circle_ref();
+        // area = π·2² ≈ 12.566, demand 100 (violated).
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        let errs = s.evaluate_dimensional_constraint(&DimensionalConstraint::Area(100.0), &[c]);
+        assert!(
+            residual_mag(&errs) > 1e-9,
+            "Area must produce a non-zero residual when violated, got {errs:?}"
+        );
+    }
+
+    // ── GREEN: real residual drives the solver to satisfy the constraint ──
+
+    fn residual_of(s: &ConstraintSolver, c: &Constraint) -> f64 {
+        residual_mag(&s.evaluate_constraint_error(c))
+    }
+
+    #[test]
+    fn diameter_solver_drives_radius_to_target() {
+        let mut s = ConstraintSolver::new();
+        let c = circle_ref();
+        // Centre fixed, radius free. Diameter(10) ⇒ radius 5.
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 3.0, true, false),
+        );
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::Diameter(10.0),
+            vec![c],
+            ConstraintPriority::High,
+        );
+        s.set_constraints(vec![con.clone()]);
+        let _ = s.solve();
+        let r = s.get_circle_radius(&c).expect("radius");
+        assert!(approx_eq(r, 5.0, 1e-6), "radius should solve to 5, got {r}");
+        assert!(residual_of(&s, &con) < 1e-6);
+    }
+
+    #[test]
+    fn length_solver_drives_segment_to_target() {
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        let line = line_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), true)); // anchor fixed
+        s.add_entity(b, EntityState::point(Point2d::new(3.0, 4.0), false)); // free (len 5)
+        s.add_entity(line, EntityState::segment_between(a, b));
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::Length(10.0),
+            vec![line],
+            ConstraintPriority::High,
+        );
+        s.set_constraints(vec![con.clone()]);
+        let _ = s.solve();
+        let len = s.get_line_length(&line).expect("length");
+        assert!(
+            approx_eq(len, 10.0, 1e-6),
+            "length should solve to 10, got {len}"
+        );
+    }
+
+    #[test]
+    fn area_solver_drives_radius() {
+        let mut s = ConstraintSolver::new();
+        let c = circle_ref();
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, true, false),
+        );
+        let target = 100.0;
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::Area(target),
+            vec![c],
+            ConstraintPriority::High,
+        );
+        s.set_constraints(vec![con.clone()]);
+        let _ = s.solve();
+        let r = s.get_circle_radius(&c).expect("radius");
+        let expected = (target / std::f64::consts::PI).sqrt();
+        assert!(
+            approx_eq(r, expected, 1e-5),
+            "radius should solve to {expected}, got {r}"
+        );
+    }
+
+    #[test]
+    fn curvature_solver_drives_radius() {
+        let mut s = ConstraintSolver::new();
+        let c = circle_ref();
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 5.0, true, false),
+        );
+        // κ = 0.5 ⇒ r = 2.
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::Curvature(0.5),
+            vec![c],
+            ConstraintPriority::High,
+        );
+        s.set_constraints(vec![con.clone()]);
+        let _ = s.solve();
+        let r = s.get_circle_radius(&c).expect("radius");
+        assert!(approx_eq(r, 2.0, 1e-5), "radius should solve to 2, got {r}");
+    }
+
+    #[test]
+    fn center_of_mass_solver_moves_circle_centre() {
+        let mut s = ConstraintSolver::new();
+        let c = circle_ref();
+        // Centre free at (1,1); pin centroid to (0,0).
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(1.0, 1.0), 2.0, false, true),
+        );
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::CenterOfMass { x: 0.0, y: 0.0 },
+            vec![c],
+            ConstraintPriority::High,
+        );
+        s.set_constraints(vec![con.clone()]);
+        let _ = s.solve();
+        let centre = s.get_circle_center(&c).expect("centre");
+        assert!(
+            approx_eq(centre.x, 0.0, 1e-6) && approx_eq(centre.y, 0.0, 1e-6),
+            "centre should solve to origin, got {centre:?}"
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_residual_nonzero_then_solves_for_rectangle() {
+        let mut s = ConstraintSolver::new();
+        let r = rect_ref();
+        // width 1, height 1 (ratio 1); demand ratio 2. Width free.
+        s.add_entity(
+            r,
+            EntityState::rectangle(
+                Point2d::new(0.0, 0.0),
+                1.0,
+                1.0,
+                0.0,
+                true,
+                false,
+                true,
+                true,
+            ),
+        );
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::AspectRatio(2.0),
+            vec![r],
+            ConstraintPriority::High,
+        );
+        assert!(
+            residual_of(&s, &con) > 1e-9,
+            "ratio 1 vs demanded 2 must be violated"
+        );
+        s.set_constraints(vec![con.clone()]);
+        let _ = s.solve();
+        assert!(residual_of(&s, &con) < 1e-6, "aspect-ratio should solve");
+    }
+
+    #[test]
+    fn equal_area_residual_nonzero_when_radii_differ() {
+        let s = ConstraintSolver::new();
+        let c1 = circle_ref();
+        let c2 = circle_ref();
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(9.0, 0.0), 3.0, false, false),
+        );
+        let errs = s.evaluate_geometric_constraint(&GeometricConstraint::EqualArea, &[c1, c2]);
+        assert!(
+            residual_mag(&errs) > 1e-9,
+            "unequal areas must be nonzero, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn centroid_constraint_pins_point_to_circle_centre() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let c = circle_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(4.0, 4.0), false));
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, true, true),
+        );
+        let con = Constraint::new_geometric(
+            GeometricConstraint::Centroid,
+            vec![p, c],
+            ConstraintPriority::High,
+        );
+        // 2 residual rows, matching `constraint_error_count`.
+        assert_eq!(s.evaluate_constraint_error(&con).len(), 2);
+        assert!(residual_of(&s, &con) > 1e-9, "point off centre is violated");
+        s.set_constraints(vec![con.clone()]);
+        let _ = s.solve();
+        let pos = s.get_point_position(&p).expect("point");
+        assert!(
+            approx_eq(pos.x, 0.0, 1e-6) && approx_eq(pos.y, 0.0, 1e-6),
+            "point should land on centre, got {pos:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_constraint_refuses_solve_and_reports_violation() {
+        // MinDistance is recognised but has no residual equation. It must
+        // NOT be silently reported as satisfied: the solver emits an
+        // irreducible residual and never converges, and it removes 0 DOF.
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), true));
+        s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), true));
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::MinDistance(5.0),
+            vec![a, b],
+            ConstraintPriority::High,
+        );
+        // Irreducible non-zero residual (the refusal marker).
+        let errs = s.evaluate_constraint_error(&con);
+        assert!(
+            residual_mag(&errs) > 1e-3,
+            "unsupported constraint must not read as satisfied"
+        );
+        // Removes zero DOF — cannot fake a fully-constrained verdict.
+        assert_eq!(con.degrees_of_freedom_removed(), 0);
+        assert!(!con.constraint_type.is_numerically_enforced());
+        s.set_constraints(vec![con.clone()]);
+        let r = s.solve();
+        assert!(
+            !matches!(r.status, SolverStatus::Converged { .. }),
+            "solver must never claim Converged for an unsupported constraint: {:?}",
+            r.status
+        );
+        assert!(
+            !r.violations.is_empty(),
+            "unsupported constraint must surface as a violation"
+        );
     }
 
     // ───────────────────── A. Lifecycle & configuration ───────────────
