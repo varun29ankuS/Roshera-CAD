@@ -376,17 +376,19 @@ pub(crate) fn splice_blend_edge(
     Ok(())
 }
 
-/// Walk the outer shell of `solid_id` and return the first face that
-/// references `vertex` in its outer loop and is not in `exclude`.
+/// Walk the outer shell of `solid_id` and collect every face whose
+/// outer loop references `vertex` and that is not in `exclude`.
 ///
-/// In a 3-valent corner exactly one such face exists; if zero or two+
-/// match we error out rather than guess.
-fn find_third_face_at_vertex(
+/// Shared by [`find_third_face_at_vertex`] (which requires exactly one
+/// match to close a single-edge fillet cap) and
+/// [`third_face_candidate_count`] (the read-only pre-flight the all-edges
+/// graceful skip uses to detect a termination surgery could not close).
+fn outer_shell_faces_at_vertex(
     model: &BRepModel,
     solid_id: SolidId,
     vertex: VertexId,
     exclude: &[FaceId],
-) -> OperationResult<FaceId> {
+) -> OperationResult<Vec<FaceId>> {
     let solid = model
         .solids
         .get(solid_id)
@@ -420,6 +422,38 @@ fn find_third_face_at_vertex(
             }
         }
     }
+    Ok(matches)
+}
+
+/// Count the outer-shell faces incident to `vertex` other than those in
+/// `exclude` (typically a blend edge's two adjacent faces). Used by the
+/// all-edges graceful skip to decide, WITHOUT mutating topology, whether a
+/// single-edge fillet termination at `vertex` could be closed by surgery:
+/// [`find_third_face_at_vertex`] succeeds iff this count is exactly `1`
+/// (a clean 3-valent corner). Any other count — `0` ("no perpendicular
+/// face") or `≥2` (higher-valence, unsynthesised) — is a surgery crash the
+/// pre-filter must pre-empt by skipping the edge.
+pub(crate) fn third_face_candidate_count(
+    model: &BRepModel,
+    solid_id: SolidId,
+    vertex: VertexId,
+    exclude: &[FaceId],
+) -> OperationResult<usize> {
+    Ok(outer_shell_faces_at_vertex(model, solid_id, vertex, exclude)?.len())
+}
+
+/// Walk the outer shell of `solid_id` and return the first face that
+/// references `vertex` in its outer loop and is not in `exclude`.
+///
+/// In a 3-valent corner exactly one such face exists; if zero or two+
+/// match we error out rather than guess.
+fn find_third_face_at_vertex(
+    model: &BRepModel,
+    solid_id: SolidId,
+    vertex: VertexId,
+    exclude: &[FaceId],
+) -> OperationResult<FaceId> {
+    let matches = outer_shell_faces_at_vertex(model, solid_id, vertex, exclude)?;
 
     match matches.as_slice() {
         [only] => Ok(*only),

@@ -706,6 +706,7 @@ impl OperationsRegistry {
             quality: crate::operations::fillet::FilletQuality::Standard,
             partial_corner_vertices: Vec::new(),
             seam_continuity: crate::operations::mixed_kind_corner_cap::SeamContinuity::C0,
+            graceful_corner_skip: false,
         };
         // Get the solid_id from the first edge's parent face
         let solid_id = if !edge_ids.is_empty() {

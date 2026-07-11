@@ -93,6 +93,15 @@ pub enum OpSpec<'a> {
         /// this distance of an existing same-kind scar boundary marks
         /// the unsupported sequential-adjacent surgery.
         setback: f64,
+        /// ALL-edges "round what it can" mode
+        /// ([`crate::operations::fillet::FilletOptions::graceful_corner_skip`]).
+        /// When `true`, the caller has ALREADY pre-filtered the
+        /// selection down to synthesizable corners, so the
+        /// [`validate_corner_compatibility`] gate is skipped — an
+        /// unsupported shared corner must be SKIPPED (graceful), not
+        /// refused. When `false` (explicit `edge_ids`), the gate runs
+        /// and honest-refuses as before.
+        graceful_corner_skip: bool,
     },
     /// `chamfer_edges(solid_id, edges, …)`.
     ChamferEdges {
@@ -156,6 +165,7 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
             edges,
             partial_corner_vertices,
             setback,
+            graceful_corner_skip,
         } => {
             check_solid_exists(model, solid_id)?;
             // CF-α: typed cross-kind conflict gate. Runs BEFORE
@@ -188,7 +198,17 @@ pub fn validate_can_apply(model: &BRepModel, spec: OpSpec<'_>) -> OperationResul
                 &effective_partial,
                 setback,
             )?;
-            validate_corner_compatibility(model, edges, BlendOpKind::Fillet, &effective_partial)
+            // ALL-edges "round what it can" mode: the fillet entry point has
+            // already pre-filtered the selection to synthesizable corners and
+            // reports the skipped ones, so the corner-compatibility gate must
+            // NOT hard-refuse here (that is the exact bug — one unsupported
+            // corner refusing the whole op). The explicit `edge_ids` path
+            // (`graceful_corner_skip == false`) still runs the gate.
+            if graceful_corner_skip {
+                Ok(())
+            } else {
+                validate_corner_compatibility(model, edges, BlendOpKind::Fillet, &effective_partial)
+            }
         }
         OpSpec::ChamferEdges {
             solid_id,
@@ -998,6 +1018,7 @@ mod tests {
                 edges: &[],
                 partial_corner_vertices: &[],
                 setback: 1.0,
+                graceful_corner_skip: false,
             },
         );
         match result {
@@ -1024,6 +1045,7 @@ mod tests {
                 edges: &[9999_u32],
                 partial_corner_vertices: &[],
                 setback: 1.0,
+                graceful_corner_skip: false,
             },
         );
         match result {
@@ -1120,6 +1142,7 @@ mod tests {
                 edges: &corner_edges,
                 partial_corner_vertices: &[],
                 setback: 1.0,
+                graceful_corner_skip: false,
             },
         );
         assert!(
@@ -1162,6 +1185,7 @@ mod tests {
                 edges: &[e0, e1],
                 partial_corner_vertices: &[],
                 setback: 1.0,
+                graceful_corner_skip: false,
             },
         );
         assert!(
@@ -1257,6 +1281,7 @@ mod tests {
                 edges: &[edge],
                 partial_corner_vertices: &[],
                 setback: 1.0,
+                graceful_corner_skip: false,
             },
         )
         .expect_err("cross-kind at shared corner must be rejected (β.2 stub)");

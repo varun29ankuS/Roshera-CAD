@@ -2234,6 +2234,19 @@ async fn fillet_edges_endpoint(
     // cap behaviour) when absent.
     let seam_continuity = parse_seam_continuity(&payload)?;
 
+    // ALL-edges "round what it can" opt-in. The MCP `fillet_edges` tool sends
+    // `all_edges: true` when the caller omitted an explicit `edge_ids` list (it
+    // expanded the selection to every edge). In that mode the kernel
+    // PRE-DETECTS and SKIPS edges incident to corners whose same-kind patch
+    // synthesis is unimplemented (`ConcaveCorner{degree 1|2}`, `Mixed`, `Cliff`,
+    // non-apex degrees) and rounds the rest, instead of refusing the whole op on
+    // the first unsupported corner. Absent / false → the explicit-`edge_ids`
+    // path, which honest-refuses on an unsupported shared corner (unchanged).
+    let graceful_corner_skip = payload
+        .get("all_edges")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let solid_id = state.get_local_id(&object_uuid).ok_or_else(|| {
         ApiError::new(
             ErrorCode::SolidNotFound,
@@ -2312,6 +2325,7 @@ async fn fillet_edges_endpoint(
                 propagation: PropagationMode::None,
                 partial_corner_vertices: partial_corner_vertices.clone(),
                 seam_continuity,
+                graceful_corner_skip,
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
@@ -2321,6 +2335,7 @@ async fn fillet_edges_endpoint(
                 propagation: PropagationMode::None,
                 partial_corner_vertices: partial_corner_vertices.clone(),
                 seam_continuity,
+                graceful_corner_skip,
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
@@ -2345,6 +2360,7 @@ async fn fillet_edges_endpoint(
                 propagation: PropagationMode::None,
                 partial_corner_vertices: partial_corner_vertices.clone(),
                 seam_continuity,
+                graceful_corner_skip,
                 ..FilletOptions::default()
             };
             kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
@@ -2360,6 +2376,7 @@ async fn fillet_edges_endpoint(
                     propagation: PropagationMode::None,
                     partial_corner_vertices: partial_corner_vertices.clone(),
                     seam_continuity,
+                    graceful_corner_skip,
                     ..FilletOptions::default()
                 };
                 kernel_fillet(&mut model, solid_id, vec![edge_id], opts).map_err(ApiError::from)?;

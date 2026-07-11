@@ -17,7 +17,7 @@ use super::blend_graph::{self, BlendGraph, BlendRadius, BlendVertexKind, EdgeFil
 use super::diagnostics::{
     BlendFailure, MixedKindRejectDetail, VertexBlendKindSet, VertexBlendUnsupportedReason,
 };
-use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
+use super::edge_blend_topology::{splice_blend_edge, third_face_candidate_count, BlendEdgeSurgery};
 use super::feasibility;
 use super::lifecycle::{self, OpSpec};
 use super::mixed_kind_corner_cap::SeamContinuity;
@@ -100,6 +100,28 @@ pub struct FilletOptions {
     /// flow through `apply_apex_sphere_corner` /
     /// `apply_triangular_nurbs_corner`) it has no effect.
     pub seam_continuity: SeamContinuity,
+
+    /// ALL-edges "round what it can" opt-in (live-dogfood fix,
+    /// 2026-07-12). Set by the `fillet ALL edges` caller (the MCP
+    /// tool / api-server when the request omits an explicit
+    /// `edge_ids` list). When `true`, edges incident to a corner
+    /// whose same-kind corner-patch synthesis is **not yet
+    /// implemented** — a `ConcaveCorner { degree: 1 | 2 }`, a
+    /// `Mixed` / `Cliff` corner, or a single-edge termination that
+    /// is not a clean 3-valent corner — are PRE-DETECTED and
+    /// SKIPPED before any pre-flight refusal or destructive surgery,
+    /// and the rest of the selection is rounded. The skipped
+    /// corners are reported through the `geometry_engine::blend`
+    /// tracing target (never silently dropped).
+    ///
+    /// When `false` (the default), the EXPLICIT-`edge_ids` contract
+    /// is unchanged: a selection that lands on an unsupported shared
+    /// corner is HONEST-REFUSED up front by
+    /// [`lifecycle::validate_corner_compatibility`] with a typed,
+    /// specific reason. This flag does NOT relax that gate for
+    /// explicit selections — it only routes the all-edges request to
+    /// the graceful pre-filter.
+    pub graceful_corner_skip: bool,
 }
 
 impl Default for FilletOptions {
@@ -113,6 +135,7 @@ impl Default for FilletOptions {
             quality: FilletQuality::Standard,
             partial_corner_vertices: Vec::new(),
             seam_continuity: SeamContinuity::default(),
+            graceful_corner_skip: false,
         }
     }
 }
@@ -409,6 +432,59 @@ pub fn fillet_edges(
             .collect();
     }
 
+    // ALL-edges "round what it can" pre-filter (live-dogfood fix,
+    // 2026-07-12). When the caller opts into `graceful_corner_skip` (the
+    // `fillet ALL edges` path — no explicit `edge_ids`), DROP up front every
+    // edge incident to a corner whose same-kind patch synthesis is not yet
+    // implemented (`ConcaveCorner { degree: 1 | 2 }` — e.g. a blind bore rim
+    // meeting a pocket floor — `Mixed` / `Cliff`, non-apex convex degrees)
+    // AND every single-edge termination that is not a clean 3-valent corner
+    // (surgery's `find_third_face_at_vertex` would 500 with "No face
+    // perpendicular to blend … requires a 3-valent corner"). Rounding the
+    // rest honours the `fillet_edges` contract ("seams / over-radius edges
+    // are SKIPPED — it rounds everything it can rather than refusing the
+    // whole op"); without this, ONE unsupported corner made the entry-point
+    // `validate_corner_compatibility` (or later corner surgery) refuse the
+    // ENTIRE operation. Skipped corners are reported, never silently
+    // dropped. The EXPLICIT-`edge_ids` contract (`graceful_corner_skip ==
+    // false`) is untouched: it still honest-refuses via the pre-flight.
+    if options.graceful_corner_skip && edges.len() > 1 {
+        let (keep, skipped) = retain_all_mode_synthesizable_edges(
+            model,
+            solid_id,
+            &edges,
+            &options.partial_corner_vertices,
+        );
+        if keep.len() < edges.len() {
+            if keep.is_empty() {
+                // Nothing is roundable — refuse cleanly (transactionally: the
+                // model is untouched here) with a typed reason naming an
+                // offending corner rather than a surgery crash.
+                let (vertex, kind) = skipped
+                    .first()
+                    .copied()
+                    .unwrap_or((0, BlendVertexKind::Cliff));
+                return Err(OperationError::BlendFailed(Box::new(
+                    BlendFailure::VertexBlendUnsupported {
+                        vertex,
+                        kind,
+                        reason: VertexBlendUnsupportedReason::NonManifoldNeighbourhood,
+                    },
+                )));
+            }
+            tracing::warn!(
+                target: "geometry_engine::blend",
+                "fillet (all-edges): skipping {} corner(s) whose patch synthesis is \
+                 unimplemented — {:?}; rounding {} of {} candidate edge(s)",
+                skipped.len(),
+                skipped,
+                keep.len(),
+                edges.len(),
+            );
+            edges.retain(|e| keep.contains(e));
+        }
+    }
+
     // F2-δ pre-flight: cheap input validation + setback-aware
     // corner compatibility (replaces the historical
     // `validate_no_shared_corners` blanket reject). Atomic — the
@@ -475,6 +551,7 @@ pub fn fillet_edges(
                 edges: &edges,
                 partial_corner_vertices: &options.partial_corner_vertices,
                 setback: max_radius,
+                graceful_corner_skip: options.graceful_corner_skip,
             },
         )?;
 
@@ -1467,6 +1544,128 @@ where
         }
     }
     None
+}
+
+/// ALL-edges "round what it can" pre-filter (live-dogfood fix, 2026-07-12).
+///
+/// Reduce a fillet-ALL selection to the subset the pipeline can actually
+/// synthesise, PRE-DETECTING — before the `validate_corner_compatibility`
+/// pre-flight or any destructive surgery — the two unsupported-corner
+/// classes that otherwise hard-500 the whole op:
+///
+///   1. **Multi-edge corners** whose same-kind patch synthesis is not
+///      implemented — `ConcaveCorner { degree: 1 | 2 }`, `Mixed`, `Cliff`,
+///      and non-apex convex degrees. This is the same verdict
+///      [`is_synthesizable_corner`] + [`blend_graph::classify_vertex_kind`]
+///      feed the in-body fixpoint and that
+///      [`lifecycle::validate_corner_compatibility`] rejects on. A blind
+///      bore whose rim meets a pocket floor surfaces here as the
+///      `ConcaveCorner { degree: 1 }` the pre-flight refused live.
+///   2. **Single-edge terminations** at a vertex that is not a clean
+///      3-valent corner — surgery's [`find_third_face_at_vertex`] finds
+///      zero ("No face perpendicular to blend … requires a 3-valent
+///      corner") or ≥2 faces and errors. A pocket-opening corner where
+///      one filleted edge runs out surfaces here. Detected read-only via
+///      [`third_face_candidate_count`] over the same outer-shell walk the
+///      surgery uses.
+///
+/// Runs on a scratch copy (so `model` is untouched) whose blend graph
+/// gives both the filletable universe and the cached F2-α edge
+/// classification `classify_vertex_kind` reads. Iterates to a combinatorial
+/// fixpoint: dropping an edge can demote a neighbour corner (a degree-3
+/// apex losing its third edge becomes an unsupported degree-2) or open a
+/// new termination, so both rules re-run until stable.
+///
+/// Returns the retained edge id set and the deduplicated `(vertex, kind)`
+/// list of corners that were skipped, for honest reporting by the caller.
+/// On a blend-graph build failure the selection is returned unchanged (the
+/// normal pipeline + `with_rollback` then own the outcome) rather than
+/// guessing.
+fn retain_all_mode_synthesizable_edges(
+    model: &BRepModel,
+    solid_id: SolidId,
+    edges: &[EdgeId],
+    partial: &[VertexId],
+) -> (HashSet<EdgeId>, Vec<(VertexId, BlendVertexKind)>) {
+    let all: HashSet<EdgeId> = edges.iter().copied().collect();
+
+    // Scratch classification view — build the blend graph on a deep copy so
+    // the caller's model is never mutated (mirrors
+    // `validate_corner_compatibility`'s probe pattern).
+    let scratch = crate::primitives::snapshot::ModelSnapshot::take(model);
+    let mut probe = BRepModel::new();
+    scratch.restore(&mut probe);
+    let selection: Vec<(EdgeId, BlendRadius)> = edges
+        .iter()
+        .map(|&e| (e, BlendRadius::Constant(1.0)))
+        .collect();
+    let graph = match blend_graph::build(&mut probe, &selection) {
+        Ok(g) => g,
+        // Cannot classify — leave the selection intact and let the normal
+        // (transactional) pipeline decide.
+        Err(_) => return (all, Vec::new()),
+    };
+
+    let exempt: HashSet<VertexId> = partial.iter().copied().collect();
+    let mut keep: HashSet<EdgeId> = graph.edges.keys().copied().collect();
+    let mut skipped: Vec<(VertexId, BlendVertexKind)> = Vec::new();
+
+    loop {
+        let incidence = incident_edges_by_vertex(&probe, &keep);
+        let mut to_drop: HashSet<EdgeId> = HashSet::new();
+        for (&vid, inc) in &incidence {
+            if exempt.contains(&vid) {
+                continue;
+            }
+            let kind = blend_graph::classify_vertex_kind(&probe, inc);
+            if inc.len() >= 2 {
+                // Multi-edge corner: same verdict as the in-body fixpoint.
+                if !is_synthesizable_corner(kind, inc.len()) {
+                    to_drop.extend(inc.iter().copied());
+                    skipped.push((vid, kind));
+                }
+            } else if let Some(&e) = inc.first() {
+                // Single-edge termination. A closed edge (rim circle) has no
+                // corner endpoint and is handled by the closed-rim path;
+                // only OPEN terminations reach `find_third_face_at_vertex`.
+                let open = probe
+                    .edges
+                    .get(e)
+                    .map(|ed| ed.start_vertex != ed.end_vertex)
+                    .unwrap_or(false);
+                if open {
+                    if let Ok((f1, f2)) = get_adjacent_faces(&probe, solid_id, e) {
+                        // Surgery closes the cap iff exactly one other
+                        // outer-shell face touches the vertex.
+                        let cnt = third_face_candidate_count(&probe, solid_id, vid, &[f1, f2])
+                            .unwrap_or(0);
+                        if cnt != 1 {
+                            to_drop.insert(e);
+                            skipped.push((vid, kind));
+                        }
+                    }
+                }
+            }
+        }
+        if to_drop.is_empty() {
+            break;
+        }
+        keep.retain(|e| !to_drop.contains(e));
+        if keep.is_empty() {
+            break;
+        }
+    }
+
+    // Deduplicate skipped corners by vertex, preserving first-seen order.
+    let mut seen: HashSet<VertexId> = HashSet::new();
+    skipped.retain(|(v, _)| seen.insert(*v));
+
+    // `keep` holds the surviving FILLETABLE edges only; non-filletable seams
+    // / open-boundary edges the graph never accepted are intentionally
+    // dropped from the selection here (the downstream pipeline would drop
+    // them anyway, and removing them up front stops the corner-compatibility
+    // pre-flight from pairing a seam with a survivor at a skipped corner).
+    (keep, skipped)
 }
 
 fn create_fillet_chain(

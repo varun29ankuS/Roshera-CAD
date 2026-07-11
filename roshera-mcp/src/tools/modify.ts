@@ -104,12 +104,17 @@ export function registerModifyTools(server: McpServer) {
     async ({ part_id, radius, edge_ids }) => {
       try {
         const object = await uuidForPart(part_id);
+        const allEdges = !(edge_ids && edge_ids.length > 0);
         const edges =
           edge_ids && edge_ids.length > 0 ? edge_ids : await allEdgeIds(part_id);
+        // `all_edges` opts the kernel into "round what it can": edges incident to
+        // a corner whose patch synthesis is unimplemented are SKIPPED (not a
+        // whole-op refusal). Explicit `edge_ids` keep the honest-refuse contract.
         const r = await api("POST", "/api/geometry/fillet", {
           object,
           edges,
           radius,
+          all_edges: allEdges,
         });
         const id = r.solid_id ?? part_id;
         return await okp(
@@ -117,7 +122,7 @@ export function registerModifyTools(server: McpServer) {
             object_uuid: r.object?.id ?? object, // identity-preserving: same uuid
             part_id: id,
             filleted_edges: edges,
-            all_edges: !(edge_ids && edge_ids.length > 0),
+            all_edges: allEdges,
             triangles: r?.stats?.triangle_count ?? null,
             placement: id !== null ? await placement(id) : null,
           },
