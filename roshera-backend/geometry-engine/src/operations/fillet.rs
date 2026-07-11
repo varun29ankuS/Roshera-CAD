@@ -2117,9 +2117,35 @@ fn cylinder_rim_fillet(
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
     let axis = cylinder.axis;
-    let ref_dir = cylinder.ref_dir;
     let big_r = cylinder.radius;
     let origin = cylinder.origin;
+
+    // Angular reference direction for the seam. Derive it from the rim edge's
+    // OWN seam vertex (its radial offset from the axis), NOT from the cylinder
+    // surface's stored `ref_dir`. On a THROUGH-hole both bore rims share ONE
+    // wall cylinder; when the first rim's surgery rebuilds that surface with
+    // `Cylinder::new_finite` (step 7), `new_finite` resets `ref_dir` to
+    // `axis.perpendicular()` — a DIFFERENT angular anchor than the bore's
+    // original seam. The second rim, reading the rebuilt surface, would then
+    // seat its seam vertex at that new angle while the first rim's seam vertex
+    // still sits at the original angle, so the straight lateral seam LINE
+    // between them becomes a chord that bows `R(1 − cos(Δθ/2))` inside the wall
+    // (e.g. Δθ = 90° → 6(1 − 1/√2) = 1.757) and validation rejects it ("edge
+    // lies off Cylinder surface"). The seam vertex already lies at the true
+    // seam angle, so its radial projection onto the plane ⟂ axis is invariant
+    // to any prior rim's re-parameterization — this mirrors the `cap_h` pattern
+    // below (derive from rim-vertex geometry, not the stored surface params).
+    // Fall back to the stored `ref_dir` only if the vertex is unavailable or
+    // the radial component is degenerate.
+    let ref_dir = model
+        .edges
+        .get(rim_edge_id)
+        .and_then(|e| model.vertices.get_position(e.start_vertex))
+        .and_then(|p| {
+            let d = Point3::new(p[0], p[1], p[2]) - origin;
+            (d - axis * d.dot(&axis)).normalize().ok()
+        })
+        .unwrap_or(cylinder.ref_dir);
 
     let height_limits = cylinder.height_limits.ok_or_else(|| {
         OperationError::InvalidGeometry(
@@ -2205,7 +2231,22 @@ fn cylinder_rim_fillet(
     //     boundary shrinks from R to (R - r);
     //   - the lateral cylinder is shortened by r on the cap side, so
     //     its boundary on that side moves to lat_seam_h.
-    let cap_h = if sign > 0.0 { h_high } else { h_low };
+    //
+    // Derive the cap height from the rim edge's ACTUAL geometry, not the
+    // cylinder's stored `height_limits`. A boolean Difference that cuts this
+    // bore can leave `height_limits` describing the un-clipped cutter extent
+    // (taller than the surviving bore-wall face) — trusting `h_high`/`h_low`
+    // then seats the cap ring one fillet-radius beyond the shortened lateral
+    // cylinder, which validation rejects ("edge lies r off cylinder"). The rim
+    // circle lies in the cap plane, so its axial coordinate (projection onto
+    // the cylinder axis) is the true cap height. Fall back to the stored extent
+    // only if the rim vertex is somehow unavailable.
+    let cap_h = model
+        .edges
+        .get(rim_edge_id)
+        .and_then(|e| model.vertices.get_position(e.start_vertex))
+        .map(|p| (Point3::new(p[0], p[1], p[2]) - origin).dot(&axis))
+        .unwrap_or(if sign > 0.0 { h_high } else { h_low });
     let lat_seam_h = cap_h - sign * radius;
 
     let new_height_limits = if sign > 0.0 {
@@ -2487,26 +2528,28 @@ fn cylinder_rim_fillet(
         lat_loop.orientations[seam_idx_second] = s2;
     }
 
-    // ---- step 7: shorten the lateral cylinder surface in-place. ----
-    let lat_surface_id = model
-        .faces
-        .get(lat_face_id)
-        .map(|f| f.surface_id)
-        .ok_or_else(|| {
-            OperationError::InvalidGeometry("Lateral face missing for surface swap".to_string())
-        })?;
+    // ---- step 7: shorten the lateral cylinder surface. ----
+    // Assign the shortened cylinder to a FRESH surface object and repoint the
+    // lateral face at it, rather than mutating the existing surface in place. A
+    // boolean Difference can leave an ORPHANED cutter-cylinder face (in no
+    // shell) that SHARES this surface object with the live bore wall; shortening
+    // it in place strands the orphan's rim edges off the new (shorter) surface
+    // and — because an orphan is unattributed (`solid_id: None`) —
+    // `validate_solid_scoped` keeps that error and fails the whole fillet on an
+    // otherwise-watertight solid. A fresh surface leaves any such orphan
+    // self-consistent on its original extent, so the model stays globally valid.
     let new_height = new_height_limits[1] - new_height_limits[0];
     let new_origin = origin + axis * new_height_limits[0];
     let new_cylinder = Cylinder::new_finite(new_origin, axis, big_r, new_height)
         .map_err(|e| OperationError::NumericalError(format!("Shortened cylinder: {e}")))?;
-    if model
-        .surfaces
-        .replace(lat_surface_id, Box::new(new_cylinder))
-        .is_none()
-    {
-        return Err(OperationError::InvalidGeometry(format!(
-            "Failed to replace lateral surface {lat_surface_id}"
-        )));
+    let new_lat_surface_id = model.surfaces.add(Box::new(new_cylinder));
+    match model.faces.get_mut(lat_face_id) {
+        Some(f) => f.surface_id = new_lat_surface_id,
+        None => {
+            return Err(OperationError::InvalidGeometry(
+                "Lateral face missing for surface swap".to_string(),
+            ))
+        }
     }
 
     // ---- step 8: build the torus surface + blend face. ----
@@ -2526,10 +2569,42 @@ fn cylinder_rim_fillet(
     // Anchor u=0 to the same ref_dir as the cylinder so the torus seam
     // aligns with the new lateral seam edge.
     torus.ref_dir = ref_dir;
-    // Outward target at the corner diagonal: the average of the lateral-
-    // outward (+ref_dir·radial_out) and cap-outward (axis·sign) normals.
-    let blend_outward_target = torus_axis - ref_dir * radial_out;
-    let blend_orientation = orient_face_for_outward(&torus, blend_outward_target)?;
+    // Outward target at the corner diagonal = sum of the two neighbours'
+    // ORIENTED outward normals. Deriving from the raw `axis·sign` /
+    // `ref_dir·radial_out` is wrong on a boolean-cut BLIND-FLOOR rim: the cap
+    // plane's RAW normal points into the material (−Z) while its face flag is
+    // Backward (true outward +Z), so the `sign` at ~fillet.rs:2135 inverts
+    // `torus_axis` → the target lands exactly perpendicular to the blend normal
+    // → the `>=0` tie-break mis-picks Forward (oriented=false, 200 inconsistent
+    // edges). Building from the oriented FLAGS is the Fix-A pattern (trust the
+    // geometry, not the raw stored normal): floor → Backward (fixed), convex
+    // rims unchanged.
+    let cap_sign = model
+        .faces
+        .get(cap_face_id)
+        .map(|f| f.orientation.sign())
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry("cap face missing for blend target".to_string())
+        })?;
+    let lat_sign = model
+        .faces
+        .get(lat_face_id)
+        .map(|f| f.orientation.sign())
+        .ok_or_else(|| {
+            OperationError::InvalidGeometry("lateral face missing for blend target".to_string())
+        })?;
+    let blend_outward_target = plane.normal * cap_sign + ref_dir * lat_sign;
+    // Pick the face orientation by sampling the torus normal at the u=0 SEAM
+    // (where `blend_outward_target` is anchored via `torus.ref_dir`), NOT at the
+    // parametric midpoint u=π. On a symmetric rim (e.g. the blind-bore floor
+    // rim) the far-side normal at u=π cancels the target's `ref_dir` term
+    // exactly, collapsing `normal·target` to 0.0 — and the `>= 0` tie-break then
+    // mis-picks Forward, flipping the torus blend face (oriented=false, 200
+    // inconsistent directed edges). At u=0 the normal is collinear with the
+    // target so the sign is unambiguous. `cone_rim_fillet` already does this for
+    // the identical bug (task #89); `cylinder_rim_fillet` never got the fix.
+    let v_mid = 0.5 * (v_range[0] + v_range[1]);
+    let blend_orientation = orient_face_for_outward_at(&torus, blend_outward_target, 0.0, v_mid)?;
     let torus_surface_id = model.surfaces.add(Box::new(torus));
 
     // Loop sequence (parameter-space CCW for the outward-pointing torus).
@@ -6604,7 +6679,18 @@ pub(crate) fn get_face_oriented_normal(
         OperationError::InvalidGeometry(format!("Surface {} not found", face.surface_id))
     })?;
     let tolerance = &Tolerance::default();
-    let (u, v) = project_point_to_surface(point, surface, (0.5, 0.5), tolerance, 100)?;
+    // Seed the Newton projection from the surface's analytic footpoint
+    // (`closest_point`) rather than a hardcoded (0.5,0.5). For a Plane the
+    // footpoint is exact, so planar callers are byte-identical; for a periodic
+    // surface (Cylinder/Cone/Sphere) the fixed seed left the far side of the
+    // parametric domain basin-trapped — the query point at u=π converged to a
+    // ~180°-flipped normal, stamping a co-circular bore-rim arc as false
+    // concave. The analytic seed lands Newton in the correct basin. If the
+    // analytic solve fails, fall back to the previous fixed seed.
+    let seed = surface
+        .closest_point(point, *tolerance)
+        .unwrap_or((0.5, 0.5));
+    let (u, v) = project_point_to_surface(point, surface, seed, tolerance, 100)?;
     let normal = robust_surface_normal(surface, u, v, tolerance).map_err(|e| {
         OperationError::NumericalError(format!("Surface normal evaluation failed: {:?}", e))
     })?;

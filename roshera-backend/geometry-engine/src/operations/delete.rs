@@ -523,6 +523,71 @@ fn find_cascade_targets(
     cascade
 }
 
+/// Prune the orphan topology a boolean leaves after retiring its operand
+/// `Solid` records.
+///
+/// A boolean builds its result as brand-new faces/loops/shells and a fresh
+/// `Solid`, then removes only the operand `Solid` records — the operands'
+/// husk shells, their faces, loops, edges and vertices all remain in the
+/// stores. The result re-references the operands' SHARED edges and vertices
+/// (and their surfaces), so those must survive; but the husk shells, and the
+/// operand-only faces/loops/edges/vertices only they reach, are now
+/// unreachable from any live solid. Left in place they are orphan topology:
+/// `find_parent_solid` returns `None` for such a face, and its FaceId-keyed
+/// sidecars dangle.
+///
+/// This runs the existing reference-counted GC ([`find_orphaned_entities`])
+/// to a fixed point on the post-boolean model. An orphaned husk shell frees
+/// the faces only it referenced, freeing their loops, then edges, then
+/// vertices — each stratum re-tested against the LIVE result topology via
+/// `is_*_used`, so every entity the result still references is retained and
+/// only the operand husks drop. Depth is bounded (shell→face→loop→edge→vertex
+/// = 5 levels); we cap at 6 passes defensively, matching `heal_deletion_gaps`.
+///
+/// For every dropped face the FaceId-keyed sidecars (`cap_apex_hint`, and the
+/// PID maps `face_pids`/`pid_to_face`) are purged so no stale key dangles.
+/// Removing an orphan cutter face that legitimately has no sidecar entry is a
+/// no-op; the purge is defensive and correct. `gdt`/`labels`/`drf` are keyed
+/// by `PersistentId`/`SolidId`, not `FaceId`, so a face drop does not key them
+/// directly; the face's PID entry (which anchors any such annotation) is
+/// removed with the face.
+pub(crate) fn prune_boolean_orphan_topology(model: &mut BRepModel) -> OperationResult<()> {
+    for _ in 0..6 {
+        let orphans = find_orphaned_entities(model);
+        if orphans.is_empty() {
+            break;
+        }
+        for (entity_type, entity_id) in orphans {
+            if entity_type == EntityType::Face {
+                purge_face_sidecars(model, entity_id);
+            }
+            delete_entity(model, entity_type, entity_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove every FaceId-keyed sidecar entry for a face being dropped, so no
+/// dangling key survives its removal. `cap_apex_hint` is a direct
+/// `FaceId`-keyed map; the PID maps are cleaned in lock-step.
+///
+/// The forward `face_pids[face]` entry is always the dead face's own and is
+/// removed. The inverse `pid_to_face[pid]` is only removed when it STILL
+/// points at this face: a boolean passthrough result face INHERITS its
+/// parent operand face's PID (`assign_boolean_face_pids`), so after the
+/// result face is minted `pid_to_face[pid]` points at the LIVE result face
+/// while the retired parent still carries `face_pids[parent] = pid`. Blindly
+/// removing the inverse would clobber the live result face's round-trip;
+/// guarding on identity leaves the inherited mapping intact.
+fn purge_face_sidecars(model: &mut BRepModel, face_id: FaceId) {
+    model.cap_apex_hint.remove(&face_id);
+    if let Some(pid) = model.face_pids.remove(&face_id) {
+        if model.pid_to_face.get(&pid) == Some(&face_id) {
+            model.pid_to_face.remove(&pid);
+        }
+    }
+}
+
 fn find_orphaned_entities(model: &BRepModel) -> Vec<(EntityType, u32)> {
     let mut orphans = Vec::new();
 

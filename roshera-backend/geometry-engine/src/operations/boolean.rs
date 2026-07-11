@@ -569,6 +569,15 @@ pub fn boolean_operation(
             model.solids.remove(solid_b);
         }
 
+        // Drop the operand husk shells and the operand-only faces/loops/
+        // edges/vertices they alone still reach (Fix B). The result re-
+        // references the operands' SHARED edges/vertices, so the reference-
+        // counted GC retains those and drops only true orphans; FaceId-keyed
+        // sidecars are purged for each dropped face. Runs inside this
+        // `with_rollback` closure on the success path, so an earlier failure
+        // restores everything via the snapshot.
+        crate::operations::delete::prune_boolean_orphan_topology(model)?;
+
         Ok(result_solid)
     })
 }
@@ -16241,11 +16250,21 @@ fn build_shells_from_faces(
                     inherited_orientation
                 };
 
+            // Re-trim a surviving cylinder wall to THIS fragment's own
+            // axial extent (Fix A). The split pipeline aliases every
+            // fragment's `surface` to the parent face's `surface_id`
+            // verbatim, so a bore wall clipped by the boolean still points
+            // at the cutter cylinder's UN-clipped `height_limits`. Mint a
+            // fresh surface carrying this fragment's live extent; non-
+            // cylinder surfaces (and cylinders with no boundary geometry to
+            // measure) are returned unchanged.
+            let surface_id = retrimmed_cylinder_surface(model, split_face);
+
             // Create face with surface and outer loop, then attach
             // any inner hole loops via `Face::add_inner_loop`. Mutate
             // through the store after `add` so cache invalidation in
             // `add_inner_loop` fires on the live face.
-            let face = Face::new(0, split_face.surface, loop_id, inherited_orientation);
+            let face = Face::new(0, surface_id, loop_id, inherited_orientation);
             let face_id = model.faces.add(face);
             // Record the kept cap's apex (its interior point) so
             // `tessellate_spherical_cap` picks the correct hemisphere — the
@@ -16277,6 +16296,76 @@ fn build_shells_from_faces(
     assign_boolean_face_pids(model, &face_lineage, operation, solid_b);
 
     Ok(shell_ids)
+}
+
+/// For a boolean result wall face whose surface is a [`Cylinder`], mint a
+/// FRESH surface whose `height_limits` describe THIS fragment's own axial
+/// extent — its loop vertices projected onto the cylinder axis — and return
+/// its id. Non-cylinder surfaces, and cylinder fragments with no boundary
+/// geometry to measure, are returned unchanged (the original surface id).
+///
+/// WHY a fresh surface (append `add` of a copy), not an in-place `replace`:
+/// `SurfaceStore` ids are shared. The retired operand's original cutter face
+/// still aliases this same `SurfaceId` (until the orphan GC drops it), and a
+/// stepped bore can leave a sibling wall fragment on the same id with a
+/// DIFFERENT extent. Mutating in place would corrupt those. A per-face copy
+/// isolates this fragment's live extent; `SurfaceStore` is append-only, so
+/// the copy re-uses no id.
+///
+/// WHY re-trim at all: the split pipeline aliases every fragment's `surface`
+/// to the parent face's `surface_id` verbatim (`SplitFace.surface =
+/// face.surface_id`); nothing re-trims the surviving wall after it is clipped.
+/// The stale `height_limits` (the un-clipped cutter extent) then feed
+/// mass-properties Gauss quadrature, the analytic AABB broad-phase, and
+/// ray/section queries with a too-tall cylinder.
+fn retrimmed_cylinder_surface(model: &mut BRepModel, split_face: &SplitFace) -> SurfaceId {
+    use crate::primitives::surface::Cylinder;
+
+    let surface_id = split_face.surface;
+
+    // Downcast: only concrete cylinders are re-trimmed. `Cylinder` is `Copy`,
+    // so we take an owned copy while the immutable borrow is live, then drop
+    // the borrow before measuring / mutating the store.
+    let mut new_cyl = match model
+        .surfaces
+        .get(surface_id)
+        .and_then(|s| s.as_any().downcast_ref::<Cylinder>())
+    {
+        Some(cyl) => *cyl,
+        None => return surface_id,
+    };
+    let origin = new_cyl.origin;
+    let axis = new_cyl.axis;
+
+    // Measure this fragment's axial span from every vertex on its own loops
+    // (outer boundary + any inner holes), projected onto the cylinder axis.
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    for &(edge_id, _) in split_face
+        .boundary_edges
+        .iter()
+        .chain(split_face.inner_loops.iter().flatten())
+    {
+        if let Some(edge) = model.edges.get(edge_id) {
+            for vid in [edge.start_vertex, edge.end_vertex] {
+                if let Some(p) = model.vertices.get_position(vid) {
+                    let v = (Point3::new(p[0], p[1], p[2]) - origin).dot(&axis);
+                    v_min = v_min.min(v);
+                    v_max = v_max.max(v);
+                }
+            }
+        }
+    }
+
+    // No measurable extent (unsplit face copied from its original, or no
+    // boundary geometry) → leave the original surface untouched. A zero/
+    // inverted span is degenerate and likewise left alone.
+    if !(v_min.is_finite() && v_max.is_finite()) || v_max - v_min <= 0.0 {
+        return surface_id;
+    }
+
+    new_cyl.height_limits = Some([v_min, v_max]);
+    model.surfaces.add(Box::new(new_cyl))
 }
 
 /// Centroid of a face's outer-loop vertices (a stable-ordering anchor).
