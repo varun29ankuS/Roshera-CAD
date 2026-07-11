@@ -485,6 +485,57 @@ pub fn fillet_edges(
         }
     }
 
+    // ALL-edges over-height rim pre-filter (live-dogfood fix, 2026-07-12). A
+    // closed plane–cylinder rim whose fillet radius would exceed the wall's
+    // AVAILABLE axial height collapses the lateral surface; `cylinder_rim_fillet`
+    // rejects it mid-surgery ("exceeds available cylinder height … the lateral
+    // surface would collapse"). Under `graceful_corner_skip` that mid-surgery
+    // refusal would roll back and abort the WHOLE "round what it can" op on one
+    // bad rim — exactly the contract this mode promises to avoid. Mirror the
+    // corner pre-filter: DROP such rims up front (geometry-derived available
+    // height via `plane_cylinder_rim_available_height`, so a stale / inverted
+    // stored `height_limits` — degenerate or negative — is caught too) and round
+    // the rest, reporting the skip via `tracing::warn`. The explicit-`edge_ids`
+    // path (`graceful_corner_skip == false`) is untouched: it still hits the
+    // honest per-rim refusal.
+    if options.graceful_corner_skip && edges.len() > 1 {
+        let margin = options.common.tolerance.distance();
+        let over_height: Vec<EdgeId> = edges
+            .iter()
+            .copied()
+            .filter(|&e| {
+                let r = edge_representative_radius(&options, e);
+                r > 0.0
+                    && plane_cylinder_rim_available_height(model, e)
+                        .is_some_and(|avail| r >= avail - margin)
+            })
+            .collect();
+        if !over_height.is_empty() {
+            let kept = edges.len() - over_height.len();
+            if kept == 0 {
+                // Nothing roundable — refuse cleanly (model untouched here) with
+                // the concrete per-rim reason rather than a surgery crash.
+                let e = over_height[0];
+                let avail = plane_cylinder_rim_available_height(model, e).unwrap_or(0.0);
+                let r = edge_representative_radius(&options, e);
+                return Err(OperationError::InvalidGeometry(format!(
+                    "Fillet radius {r} too large for cylinder rim (edge {e}): exceeds \
+                     available cylinder height ({avail}); the lateral surface would collapse."
+                )));
+            }
+            tracing::warn!(
+                target: "geometry_engine::blend",
+                "fillet (all-edges): skipping {} over-height cylinder rim(s) {:?} (fillet \
+                 radius exceeds the available wall height); rounding {} of {} candidate edge(s)",
+                over_height.len(),
+                over_height,
+                kept,
+                edges.len(),
+            );
+            edges.retain(|e| !over_height.contains(e));
+        }
+    }
+
     // F2-δ pre-flight: cheap input validation + setback-aware
     // corner compatibility (replaces the historical
     // `validate_no_shared_corners` blanket reject). Atomic — the
@@ -2285,6 +2336,98 @@ fn face_outer_loop_max_radius(
     max_r
 }
 
+/// `(min, max)` axial coordinate of any vertex on a face's loops (outer +
+/// inner), projected onto `axis` from `origin`. `None` when the face carries no
+/// resolvable vertices. Used to read a lateral cylinder's TRUE available wall
+/// height from its own geometry, so a stale / inverted stored `height_limits`
+/// (from a boolean re-trim or a prior shared-wall rim surgery) cannot mislead
+/// the rim-fillet collapse guard.
+fn face_axial_extent(
+    model: &BRepModel,
+    face_id: FaceId,
+    origin: Point3,
+    axis: Vector3,
+) -> Option<(f64, f64)> {
+    let face = model.faces.get(face_id)?;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+        if let Some(l) = model.loops.get(lid) {
+            for &e in &l.edges {
+                if let Some(ed) = model.edges.get(e) {
+                    for v in [ed.start_vertex, ed.end_vertex] {
+                        if let Some(p) = model.vertices.get_position(v) {
+                            let h = (Point3::new(p[0], p[1], p[2]) - origin).dot(&axis);
+                            lo = lo.min(h);
+                            hi = hi.max(h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+}
+
+/// Geometry-derived available axial wall height for a CLOSED plane–cylinder rim
+/// edge, or `None` when the edge is not such a rim (so the caller leaves it to
+/// the normal pipeline). This is the same quantity the `cylinder_rim_fillet`
+/// collapse guard tests; exposing it lets the ALL-edges "round what it can"
+/// pre-filter DROP a rim whose fillet would exceed (or, on a degenerate /
+/// inverted stored extent, invert) the wall — up front, before any destructive
+/// surgery — instead of hard-failing the whole graceful op mid-surgery.
+fn plane_cylinder_rim_available_height(model: &BRepModel, edge_id: EdgeId) -> Option<f64> {
+    use crate::primitives::surface::Plane;
+    let edge = model.edges.get(edge_id)?;
+    if !edge.is_loop() {
+        return None;
+    }
+    let (f1, f2) = get_adjacent_faces_safe(model, edge_id).ok()?;
+    let surf_of = |fid: FaceId| -> Option<&dyn Surface> {
+        let face = model.faces.get(fid)?;
+        model.surfaces.get(face.surface_id)
+    };
+    // Identify the lateral (cylinder) face and require the other to be a plane
+    // cap — the only rim kind whose over-height the closed-edge fillet rejects.
+    let mut lateral: Option<(FaceId, Point3, Vector3)> = None;
+    let mut has_plane_cap = false;
+    for fid in [f1, f2] {
+        let Some(surf) = surf_of(fid) else {
+            return None;
+        };
+        if let Some(c) = surf.as_any().downcast_ref::<Cylinder>() {
+            lateral = Some((fid, c.origin, c.axis));
+        } else if surf.as_any().downcast_ref::<Plane>().is_some() {
+            has_plane_cap = true;
+        }
+    }
+    let (lat_face_id, origin, axis) = lateral?;
+    if !has_plane_cap {
+        return None;
+    }
+    let (lo, hi) = face_axial_extent(model, lat_face_id, origin, axis)?;
+    Some(hi - lo)
+}
+
+/// The representative fillet radius for a single edge under `options`, used by
+/// the ALL-edges over-height rim pre-filter. Conservative (the largest radius
+/// the edge could see) so a rim is skipped whenever ANY station would collapse
+/// the wall; the common `Constant` case is exact.
+fn edge_representative_radius(options: &FilletOptions, edge_id: EdgeId) -> f64 {
+    match &options.fillet_type {
+        FilletType::Constant(r) => *r,
+        FilletType::Variable(r1, r2) => r1.max(*r2),
+        FilletType::VariableStations(s) => s.iter().map(|&(_, r)| r).fold(0.0_f64, f64::max),
+        FilletType::PerEdgeConstant(m) => m.get(&edge_id).copied().unwrap_or(options.radius),
+        FilletType::PerEdgeProfile(m) => m
+            .get(&edge_id)
+            .map(|p| p.max_radius_bound())
+            .unwrap_or(options.radius),
+        FilletType::Chord(c) => *c,
+        FilletType::Function(_) => options.radius,
+    }
+}
+
 /// Build the quarter-torus blend that replaces a cylinder/cap rim.
 ///
 /// See [`create_closed_edge_fillet`] for the high-level recipe. This
@@ -2353,11 +2496,54 @@ fn cylinder_rim_fillet(
     })?;
     let h_low = height_limits[0];
     let h_high = height_limits[1];
-    let height = h_high - h_low;
 
-    // sign = +1 for top rim (cap normal aligned with cylinder axis),
-    //      = -1 for bottom rim (cap normal opposite the cylinder axis).
-    let sign: f64 = if plane.normal.dot(&axis) > 0.0 {
+    // Cap height + lateral wall extent come from the surviving GEOMETRY, NOT the
+    // cylinder surface's stored `height_limits`. A boolean Difference that cuts
+    // this bore can leave `height_limits` describing the un-clipped cutter
+    // extent; and on a THROUGH-hole whose two rims share ONE wall cylinder, the
+    // FIRST rim's surgery (step 7) rebuilds that surface via
+    // `Cylinder::new_finite`, storing the SHORTENED extent as a fresh
+    // `[0, new_height]`. When the shortening picks the wrong end (the pre-fix
+    // `sign` bug below) that stored height is even inverted/negative, so the
+    // SECOND rim mis-reads a bogus "available height" (e.g. -1.5) from
+    // `h_high - h_low` and the collapse guard refuses a rim that has ample wall.
+    // The rim circle lies in the cap plane, so its axial projection is the true
+    // cap height; the lateral face's own vertices give the true available wall.
+    // Fall back to the stored extent only when the geometry is unavailable.
+    let cap_h_geom = model
+        .edges
+        .get(rim_edge_id)
+        .and_then(|e| model.vertices.get_position(e.start_vertex))
+        .map(|p| (Point3::new(p[0], p[1], p[2]) - origin).dot(&axis));
+    let (lat_lo, lat_hi) = face_axial_extent(model, lat_face_id, origin, axis)
+        .unwrap_or((h_low.min(h_high), h_low.max(h_high)));
+    let available_height = lat_hi - lat_lo;
+    // Cap-height fallback: nearest stored bound by the cap-plane normal.
+    let cap_h = cap_h_geom.unwrap_or(if plane.normal.dot(&axis) > 0.0 {
+        h_high
+    } else {
+        h_low
+    });
+
+    // `sign` = +1 when the rim sits at the HIGH axial end of the lateral
+    // cylinder, -1 at the LOW end — i.e. the direction the rolling ball must
+    // RETRACT along the wall (away from the cap, into the body). This is the
+    // *intent* of the old rule ("+1 top rim / -1 bottom rim"), but derived from
+    // GEOMETRY (cap height vs the wall's axial midpoint) instead of the raw
+    // cap-plane normal. On a boolean-cut BLIND/POCKET floor the cap's stored
+    // normal points INTO the material (−axis) while the rim sits at the wall's
+    // HIGH end, so `plane.normal · axis` reported a bottom rim (-1) and the
+    // shortening inverted `new_height_limits` (the −1.5 live bug). This mirrors
+    // the Fix-A pattern the torus-orientation block below already applies (trust
+    // the geometry, not the raw stored normal). Fall back to the normal only for
+    // a degenerate wall where the midpoint test is meaningless.
+    let sign: f64 = if available_height > tol.distance() {
+        if cap_h >= 0.5 * (lat_lo + lat_hi) {
+            1.0
+        } else {
+            -1.0
+        }
+    } else if plane.normal.dot(&axis) > 0.0 {
         1.0
     } else {
         -1.0
@@ -2403,10 +2589,10 @@ fn cylinder_rim_fillet(
     // cap's outer edge.
     // AUDIT-H1: numerical safety margins use the caller-supplied tolerance.
     let margin = tol.distance();
-    if radius >= height - margin {
+    if radius >= available_height - margin {
         return Err(OperationError::InvalidGeometry(format!(
             "Fillet radius {radius} too large for cylinder rim: exceeds available \
-             cylinder height ({height}); the lateral surface would collapse."
+             cylinder height ({available_height}); the lateral surface would collapse."
         )));
     }
     if inner {
@@ -2431,27 +2617,19 @@ fn cylinder_rim_fillet(
     //   - the lateral cylinder is shortened by r on the cap side, so
     //     its boundary on that side moves to lat_seam_h.
     //
-    // Derive the cap height from the rim edge's ACTUAL geometry, not the
-    // cylinder's stored `height_limits`. A boolean Difference that cuts this
-    // bore can leave `height_limits` describing the un-clipped cutter extent
-    // (taller than the surviving bore-wall face) — trusting `h_high`/`h_low`
-    // then seats the cap ring one fillet-radius beyond the shortened lateral
-    // cylinder, which validation rejects ("edge lies r off cylinder"). The rim
-    // circle lies in the cap plane, so its axial coordinate (projection onto
-    // the cylinder axis) is the true cap height. Fall back to the stored extent
-    // only if the rim vertex is somehow unavailable.
-    let cap_h = model
-        .edges
-        .get(rim_edge_id)
-        .and_then(|e| model.vertices.get_position(e.start_vertex))
-        .map(|p| (Point3::new(p[0], p[1], p[2]) - origin).dot(&axis))
-        .unwrap_or(if sign > 0.0 { h_high } else { h_low });
+    // `cap_h` and the wall extent (`lat_lo`/`lat_hi`) were derived from geometry
+    // above (trust the geometry, not the stored `height_limits`). Because
+    // `lat_seam_h` retracts from the cap by `radius` toward the wall's interior
+    // (`sign` now names the true axial end), the new extent is ALWAYS the
+    // geometry span with the cap-side bound moved to `lat_seam_h` — sorted and
+    // non-degenerate (the collapse guard above proved `radius < available_height`),
+    // so the shared-wall surface can never again be handed an inverted interval.
     let lat_seam_h = cap_h - sign * radius;
 
     let new_height_limits = if sign > 0.0 {
-        [h_low, lat_seam_h]
+        [lat_lo, lat_seam_h]
     } else {
-        [lat_seam_h, h_high]
+        [lat_seam_h, lat_hi]
     };
 
     // World-frame positions of the two new rim seam vertices.
