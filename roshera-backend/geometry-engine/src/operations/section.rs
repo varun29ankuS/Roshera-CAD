@@ -62,7 +62,6 @@ use crate::math::surface_plane_intersection::{
 use crate::math::{Point3, Tolerance, Vector3};
 use crate::operations::{OperationError, OperationResult};
 use crate::primitives::face::{Face, FaceId};
-use crate::primitives::r#loop::LoopId;
 use crate::primitives::shell::ShellId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::surface::{Plane, SurfaceType};
@@ -264,59 +263,6 @@ struct Polyline3D {
     points: Vec<Point3>,
 }
 
-/// Ordered 3D boundary points of a loop, traversed in loop order. STRAIGHT
-/// edges contribute their start vertex only (a polygon corner); CURVED edges
-/// (arcs/circles/NURBS) are additionally sampled at interior points so the
-/// boundary used for line-clipping is the real curve and not a single vertex.
-///
-/// SECTION #85: a cylinder/disc cap is bounded by a single closed circular
-/// edge whose start_vertex == end_vertex (the seam), so the vertex-only walk
-/// yielded ONE point and the planar cut-line clip in `plane_face_fragments`
-/// saw `n < 2` and produced no fragments — an axial cut through a cylinder lost
-/// both end-cap diameter segments and never closed the rectangle. Sampling the
-/// curve restores the polygon. Straight-edge faces (boxes) are unchanged: a
-/// line contributes exactly its start vertex, preserving the exact #83 clip.
-fn loop_points(model: &BRepModel, loop_id: LoopId) -> Vec<Point3> {
-    // Interior samples per closed/curved edge — dense enough that a diameter
-    // crossing lands within chord tolerance of the true rim for tier-1 radii.
-    const CURVE_SAMPLES: usize = 64;
-    let tol = Tolerance::default();
-    let mut pts = Vec::new();
-    let lp = match model.loops.get(loop_id) {
-        Some(l) => l,
-        None => return pts,
-    };
-    for (i, &eid) in lp.edges.iter().enumerate() {
-        let e = match model.edges.get(eid) {
-            Some(e) => e,
-            None => continue,
-        };
-        let fwd = lp.orientations.get(i).copied().unwrap_or(true);
-        let vid = if fwd { e.start_vertex } else { e.end_vertex };
-        if let Some(v) = model.vertices.get(vid) {
-            pts.push(Point3::new(v.position[0], v.position[1], v.position[2]));
-        }
-        // Add interior curve samples for non-linear edges. `Edge::evaluate`
-        // takes a normalized t∈[0,1] that already honours the edge's own
-        // orientation; the loop traversal direction is applied on top of it.
-        let curved = model
-            .curves
-            .get(e.curve_id)
-            .map(|c| !c.is_linear(tol))
-            .unwrap_or(false);
-        if curved {
-            for k in 1..CURVE_SAMPLES {
-                let t = k as f64 / CURVE_SAMPLES as f64;
-                let te = if fwd { t } else { 1.0 - t };
-                if let Ok(p) = e.evaluate(te, &model.curves) {
-                    pts.push(p);
-                }
-            }
-        }
-    }
-    pts
-}
-
 /// Intersect the infinite 2D line `o + t·d` with segment `a→b`; return the line
 /// parameter `t` at the crossing if it lies within the segment.
 fn line_seg_intersect_2d(
@@ -387,21 +333,58 @@ fn plane_face_fragments(
     let o2 = to2(&p0);
     let d2 = (line_dir.dot(&plane.u_dir), line_dir.dot(&plane.v_dir));
 
-    // Crossings of the line with every loop edge (outer + holes).
+    // Crossings of the section line with every loop edge (outer + holes).
+    //
+    // STRAIGHT edges use the exact 2-D segment/line clip (#83). CURVED edges
+    // (circular bore rims, arcs) are crossed against the cut PLANE on the TRUE
+    // curve — sign-change bracket + bisection on the edge parameter — not against
+    // a chord sampling of the rim. #section-404: a 64-chord polyline of a bore
+    // rim placed the crossing up to the polygon sagitta (~1.7e-5 mm for a 64-gon
+    // of r2.5) off the real circle, so an OFF-AXIS cut's planar-face rim crossing
+    // no longer welded to the analytic cylinder-generator fragment at the shared
+    // 3-D corner (gap ≫ `weld_eps`=1e-6); the section loop never closed and the
+    // whole cap set came back empty → `render_section` None → HTTP 404. The
+    // on-axis cut escaped only because the crossing lands at the circle's
+    // x-extreme, where the chord sagitta is zero. Evaluating the crossing on the
+    // exact curve restores the weld. Ref: exact curve∩plane intersection.
+    let tol = Tolerance::default();
     let mut loops = vec![face.outer_loop];
     loops.extend_from_slice(&face.inner_loops);
     let mut ts: Vec<f64> = Vec::new();
     for lid in loops {
-        let pts = loop_points(model, lid);
-        let n = pts.len();
-        if n < 2 {
-            continue;
-        }
-        for i in 0..n {
-            let a = to2(&pts[i]);
-            let b = to2(&pts[(i + 1) % n]);
-            if let Some(t) = line_seg_intersect_2d(o2, d2, a, b) {
-                ts.push(t);
+        let lp = match model.loops.get(lid) {
+            Some(l) => l,
+            None => continue,
+        };
+        for &eid in &lp.edges {
+            let e = match model.edges.get(eid) {
+                Some(e) => e,
+                None => continue,
+            };
+            let linear = model
+                .curves
+                .get(e.curve_id)
+                .map(|c| c.is_linear(tol))
+                .unwrap_or(true);
+            if linear {
+                // Exact straight-segment clip in the face-plane 2-D basis. A
+                // segment is orientation-independent, so the raw endpoint
+                // vertices suffice.
+                let a = match model.vertices.get(e.start_vertex) {
+                    Some(v) => Point3::new(v.position[0], v.position[1], v.position[2]),
+                    None => continue,
+                };
+                let b = match model.vertices.get(e.end_vertex) {
+                    Some(v) => Point3::new(v.position[0], v.position[1], v.position[2]),
+                    None => continue,
+                };
+                if let Some(t) = line_seg_intersect_2d(o2, d2, to2(&a), to2(&b)) {
+                    ts.push(t);
+                }
+            } else {
+                edge_plane_crossings(
+                    e, model, &to2, o2, d2, cut_origin, cut_normal, p0, line_dir, &mut ts,
+                );
             }
         }
     }
@@ -437,6 +420,108 @@ fn plane_face_fragments(
             });
         }
         i += 2;
+    }
+}
+
+/// Push the section-line parameters at which a CURVED loop edge crosses the cut
+/// plane, evaluated on the TRUE underlying curve (never on the chord sampling).
+///
+/// A crossing is *located* the robust way — a chord between consecutive curve
+/// samples is tested against the section line with the SAME inclusive-endpoint
+/// clip the straight-edge path uses ([`line_seg_intersect_2d`]) — then the exact
+/// crossing is *refined* onto the real curve by bisecting the signed distance to
+/// the cut plane `g(s) = cut_normal · (curve(s) − cut_origin)` over the bracketing
+/// parameter interval. Locating on the chord (not on `g`'s strict sign) is what
+/// survives the degenerate on-axis cut, where the crossing lands exactly on a rim
+/// seam vertex and `g` there is `±ε` of arbitrary sign; refining onto the curve is
+/// what lets an OFF-axis rim crossing weld to the analytic cylinder-generator
+/// fragment at the shared 3-D corner (#section-404). `t` is the crossing's signed
+/// coordinate along `line_dir` from `p0` — the parameterisation the caller emits
+/// fragments in. Crossings coincident at a shared sample vertex are reported by
+/// both incident chords and collapsed by the caller's `xs` dedup.
+#[allow(clippy::too_many_arguments)]
+fn edge_plane_crossings(
+    edge: &crate::primitives::edge::Edge,
+    model: &BRepModel,
+    to2: &dyn Fn(&Point3) -> (f64, f64),
+    o2: (f64, f64),
+    d2: (f64, f64),
+    cut_origin: Point3,
+    cut_normal: Vector3,
+    p0: Point3,
+    line_dir: Vector3,
+    ts: &mut Vec<f64>,
+) {
+    // Enough chords to isolate both crossings of a section line with a closed rim
+    // circle, with margin for arcs of higher local curvature.
+    const SAMPLES: usize = 128;
+    let eval = |s: f64| -> Option<Point3> { edge.evaluate(s, &model.curves).ok() };
+    let signed = |p: &Point3| -> f64 {
+        cut_normal.dot(&Vector3::new(
+            p.x - cut_origin.x,
+            p.y - cut_origin.y,
+            p.z - cut_origin.z,
+        ))
+    };
+    let param_t = |p: &Point3| -> f64 {
+        (p.x - p0.x) * line_dir.x + (p.y - p0.y) * line_dir.y + (p.z - p0.z) * line_dir.z
+    };
+
+    let mut prev_s = 0.0;
+    let mut prev_p = match eval(0.0) {
+        Some(p) => p,
+        None => return,
+    };
+    for k in 1..=SAMPLES {
+        let s = k as f64 / SAMPLES as f64;
+        let p = match eval(s) {
+            Some(p) => p,
+            None => {
+                // Missing sample breaks the current chord; resume from the next.
+                prev_s = s;
+                continue;
+            }
+        };
+        // Robust detection: does the chord (prev_p → p) cross the section line?
+        if line_seg_intersect_2d(o2, d2, to2(&prev_p), to2(&p)).is_some() {
+            // Refine onto the exact curve by bisecting g over [prev_s, s].
+            let (mut lo, mut hi) = (prev_s, s);
+            let glo = signed(&prev_p);
+            let ghi = signed(&p);
+            let crossing = if glo == 0.0 {
+                Some(prev_p)
+            } else if ghi == 0.0 {
+                Some(p)
+            } else if (glo < 0.0) == (ghi < 0.0) {
+                // Same side of the plane: the chord was flagged only via the
+                // inclusive-endpoint tolerance, so the true crossing sits at the
+                // endpoint nearest the plane.
+                Some(if glo.abs() <= ghi.abs() { prev_p } else { p })
+            } else {
+                let side_lo = glo < 0.0;
+                let mut mid_p = prev_p;
+                for _ in 0..50 {
+                    let mid = 0.5 * (lo + hi);
+                    match eval(mid) {
+                        Some(pm) => {
+                            mid_p = pm;
+                            if (signed(&pm) < 0.0) == side_lo {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                Some(mid_p)
+            };
+            if let Some(cp) = crossing {
+                ts.push(param_t(&cp));
+            }
+        }
+        prev_s = s;
+        prev_p = p;
     }
 }
 
@@ -1443,7 +1528,319 @@ fn triangulate_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    fn sid(g: GeometryId) -> SolidId {
+        match g {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        }
+    }
+
+    fn cap_area(c: &SectionCap) -> f64 {
+        c.indices
+            .iter()
+            .map(|t| {
+                let a = c.vertices[t[0] as usize];
+                let b = c.vertices[t[1] as usize];
+                let e = c.vertices[t[2] as usize];
+                let e1 = Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+                let e2 = Vector3::new(e.x - a.x, e.y - a.y, e.z - a.z);
+                e1.cross(&e2).magnitude() * 0.5
+            })
+            .sum()
+    }
+
+    /// A box with a single vertical (Z-axis) through-bore, embedded (not a
+    /// standalone cylinder) — matches the live-reported #section-404 repro
+    /// shape (pocketed+4-bore block) minus the pocket and 3 of the 4 bores.
+    fn box_with_vertical_bore(bx: f64, by: f64, bz: f64, bore_r: f64) -> (BRepModel, SolidId) {
+        let mut model = BRepModel::new();
+        let block = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(bx, by, bz)
+            .expect("block"));
+        let bore = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -bz),
+                Vector3::new(0.0, 0.0, 1.0),
+                bore_r,
+                bz * 4.0,
+            )
+            .expect("bore"));
+        let s = boolean_operation(
+            &mut model,
+            block,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("through bore");
+        (model, s)
+    }
+
+    /// #section-404 investigation: TWO horizontal (Y-axis) through-bores at
+    /// different X positions, cut PERPENDICULAR to their axis (cut normal = Y
+    /// = bore axis) — the outer rectangle carries 2 separate circular HOLE
+    /// loops (true nesting, not the "comb" case below). This is one plausible
+    /// reading of the live repro ("bores at ±7.07" as horizontal cross-bores).
+    /// GUARD: multiple simultaneous holes in one cap must classify as depth-1
+    /// children of the SAME outer (one cap, not 3) and their combined area
+    /// must match the analytic rectangle-minus-2-circles value.
+    #[test]
+    fn section_perpendicular_cut_through_two_holes_nests_both_under_one_outer() {
+        let mut model = BRepModel::new();
+        let block = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(30.0, 30.0, 20.0)
+            .expect("block"));
+        let bore1 = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(7.07, -20.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+                3.0,
+                80.0,
+            )
+            .expect("bore1"));
+        let after1 = boolean_operation(
+            &mut model,
+            block,
+            bore1,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bore1 cut");
+        let bore2 = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(-7.07, -20.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+                3.0,
+                80.0,
+            )
+            .expect("bore2"));
+        let s = boolean_operation(
+            &mut model,
+            after1,
+            bore2,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bore2 cut");
+
+        let caps = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 7.07, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("section call must not error");
+        assert_eq!(
+            caps.len(),
+            1,
+            "2 holes nested under 1 outer must yield exactly 1 cap, got {}",
+            caps.len()
+        );
+        let expected = 30.0 * 20.0 - 2.0 * std::f64::consts::PI * 9.0;
+        let area = cap_area(&caps[0]);
+        let rel = (area - expected).abs() / expected;
+        assert!(
+            rel < 0.03,
+            "cap area {area:.3} vs analytic {expected:.3} (rel {rel})"
+        );
+    }
+
+    /// #section-404 investigation: a box with TWO vertical through-bores
+    /// (cascaded differences, matching the pocketed+4-bore block's
+    /// construction history), cut by a plane whose normal equals the world Y
+    /// axis at y = 7.07 (both bore centres sit at y=+7.07) — an AXIAL cut
+    /// through both bores simultaneously, the same shape as the live repro's
+    /// cutting plane. This is a "comb": the plane's own extent matches the
+    /// bores' full through-height, so the two notches split one outer into
+    /// 3 disjoint simple loops rather than nesting a hole inside one outer.
+    /// GUARD: all 3 strips must come back (not dropped by a broken chain)
+    /// and their combined area must match the analytic value.
+    #[test]
+    fn section_axial_cut_through_two_embedded_bores_yields_three_strips() {
+        let mut model = BRepModel::new();
+        let block = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(30.0, 30.0, 20.0)
+            .expect("block"));
+        let bore1 = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(7.07, 7.07, -20.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                3.0,
+                80.0,
+            )
+            .expect("bore1"));
+        let after1 = boolean_operation(
+            &mut model,
+            block,
+            bore1,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bore1 cut");
+        let bore2 = sid(TopologyBuilder::new(&mut model)
+            .create_cylinder_3d(
+                Point3::new(-7.07, 7.07, -20.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                3.0,
+                80.0,
+            )
+            .expect("bore2"));
+        let s = boolean_operation(
+            &mut model,
+            after1,
+            bore2,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bore2 cut");
+
+        let caps = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 7.07, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("section call must not error");
+        assert_eq!(
+            caps.len(),
+            3,
+            "axial cut through 2 through-bores must yield 3 disjoint strips, got {}",
+            caps.len()
+        );
+        let total: f64 = caps.iter().map(cap_area).sum();
+        let expected = 30.0 * 20.0 - 2.0 * (2.0 * 3.0) * 20.0;
+        let rel = (total - expected).abs() / expected;
+        assert!(
+            rel < 0.03,
+            "total strip area {total:.3} vs analytic {expected:.3} (rel {rel})"
+        );
+    }
+
+    /// #section-404 REPRO: the EXACT live-failing topology. Block 60×40×30
+    /// centred, SUBTRACT a top pocket (a 40×20×20 box raised +15 in z so it
+    /// removes the top 10 mm over a 40(x)×20(y) footprint — a REENTRANT outer
+    /// notch), then SUBTRACT 4 vertical through-bores r2.5 at (±7.07,±7.07).
+    /// Section by a Y-normal plane at y=7.07 that crosses BOTH the pocket notch
+    /// AND the 2 bores centred at y=+7.07.
+    ///
+    /// The y=7.07 cross-section is 3 DISJOINT pieces: two reentrant L-shaped
+    /// outer pieces (pocket carves the top-middle away) flanking one central
+    /// rectangle, split apart by the two bore slots (full-height at this y):
+    ///   left/right L  = (30−9.57)·20 + 10·10 = 508.6 each
+    ///   central rect  = (2·(7.07−2.5))·20    = 182.8
+    ///   total         = 1200 mm²
+    /// Bores-only (no pocket) works (3-strip test); pocket-only works (y=0 →
+    /// 1400). Their COMBINATION — reentrant outer + interior slots at once —
+    /// 404s live. This test MUST reproduce (empty / wrong area) before the fix.
+    #[test]
+    fn section_pocket_notch_plus_two_bores_yields_three_reentrant_pieces() {
+        use crate::math::Matrix4;
+        use crate::operations::transform::{transform_solid, TransformOptions};
+        let mut model = BRepModel::new();
+        // Block 60×40×30 centred: x∈[-30,30], y∈[-20,20], z∈[-15,15].
+        let block = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(60.0, 40.0, 30.0)
+            .expect("block"));
+        // Pocket 40×20×20, translated +15 in z → spans z∈[5,25], removing the
+        // block's top 10 mm over a 40(x)×20(y) footprint.
+        let pocket = sid(TopologyBuilder::new(&mut model)
+            .create_box_3d(40.0, 20.0, 20.0)
+            .expect("pocket"));
+        transform_solid(
+            &mut model,
+            pocket,
+            Matrix4::from_translation(&Vector3::new(0.0, 0.0, 15.0)),
+            TransformOptions::default(),
+        )
+        .expect("translate pocket");
+        let mut cur = boolean_operation(
+            &mut model,
+            block,
+            pocket,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("pocket cut");
+
+        // 4 vertical through-bores r2.5 at (±r45, ±r45), z∈[-30,30], where
+        // r45 = 10·cos(45°) = 7.0710678… — the EXACT ring-radius-10 hole centres
+        // the live `drill_pattern` computes. The section plane sits at y=7.07
+        // (below), so it does NOT pass exactly through the bore axis but is
+        // offset by ~1.07 µm — the near-axial (not on-axis) cut is what the
+        // live repro exercises.
+        let r45 = 10.0 * std::f64::consts::FRAC_1_SQRT_2;
+        for (cx, cy) in [(r45, r45), (-r45, r45), (r45, -r45), (-r45, -r45)] {
+            let bore = sid(TopologyBuilder::new(&mut model)
+                .create_cylinder_3d(
+                    Point3::new(cx, cy, -30.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    2.5,
+                    60.0,
+                )
+                .expect("bore"));
+            cur = boolean_operation(
+                &mut model,
+                cur,
+                bore,
+                BooleanOp::Difference,
+                BooleanOptions::default(),
+            )
+            .expect("bore cut");
+        }
+
+        let caps = section_solid_by_plane(
+            &model,
+            cur,
+            Point3::new(0.0, 7.07, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("section call must not error");
+
+        assert!(
+            !caps.is_empty(),
+            "pocket+bores section returned EMPTY caps (#section-404 repro)"
+        );
+        let total: f64 = caps.iter().map(cap_area).sum();
+        let expected = 1200.0;
+        let rel = (total - expected).abs() / expected;
+        assert!(
+            rel < 0.03,
+            "cap total area {total:.3} vs analytic {expected:.3} (rel {rel}); caps={}",
+            caps.len()
+        );
+    }
+
+    /// A single embedded through-bore, axial cut (cut plane contains the
+    /// bore's own Z axis) — the minimal case backing the two multi-bore
+    /// guards above. Splits one outer into 2 strips of equal area.
+    #[test]
+    fn section_axial_cut_through_one_embedded_bore_yields_two_strips() {
+        let (model, s) = box_with_vertical_bore(40.0, 40.0, 20.0, 5.0);
+        let caps = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("section call must not error");
+        assert_eq!(caps.len(), 2, "expected 2 strips, got {}", caps.len());
+        let expected_each = (20.0 - 5.0) * 20.0;
+        for (i, c) in caps.iter().enumerate() {
+            let area = cap_area(c);
+            let rel = (area - expected_each).abs() / expected_each;
+            assert!(
+                rel < 0.03,
+                "cap{i} area {area:.3} vs analytic {expected_each:.3} (rel {rel})"
+            );
+        }
+    }
 
     fn build_box_model(size: f64) -> (BRepModel, SolidId) {
         let mut model = BRepModel::new();
