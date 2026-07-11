@@ -20988,6 +20988,167 @@ mod tests {
         );
     }
 
+    /// #35 GUARD PROBE: does the boolean core have a deliberate, designed
+    /// refusal for the canonical two-PERPENDICULAR-EQUAL-RADIUS-cylinder
+    /// Steinmetz/saddle regime (axes crossing through a common point,
+    /// `boolean-cyl-cyl-saddle-35.md`), or does it hang, or does it silently
+    /// ship an unsound solid? Block bored by cylA (axis +X) then cylB (axis
+    /// +Y), both r=10, both centred on the SAME point so their axes
+    /// intersect exactly — the textbook bicylinder configuration that
+    /// `cylinder_cylinder_perpendicular_equal_radius` (this file) special-
+    /// cases into two analytic ellipses (confirmed via `ROSHERA_BOOL_TRACE`:
+    /// the special case matches and no marching fallback runs).
+    ///
+    /// CONFIRMED (2026-07-12): there is **no dedicated saddle guard** in the
+    /// boolean core. It does not hang either way (sub-second in every
+    /// configuration tried). What happens instead is GEOMETRY-DEPENDENT and
+    /// incidental:
+    ///   * THIS pair (60×60×60 block, 10mm overhang each side) trips an
+    ///     unrelated, generic shell-integrity check: `classify_split_faces`
+    ///     mis-culls the cylindrical lateral fragments out of
+    ///     `select_faces_for_operation` (trace shows the two bore-wall
+    ///     fragments classified `Inside`/`OnBoundary` and dropped, leaving
+    ///     only planar box-face fragments), so `build_shells_from_faces`
+    ///     later finds a component with 1 face and raises
+    ///     `InvalidBRep("component 1 has only 1 planar face(s); closed
+    ///     polyhedral manifold requires >=4 …")`. That is a downstream
+    ///     sanity check tripping on a broken intermediate result — not a
+    ///     purpose-built saddle detector.
+    ///   * The pre-existing `diff_intersecting_analytic_bores_35` test above
+    ///     (80×40×40 block, 5mm overhang) hits the SAME
+    ///     `cylinder_cylinder_perpendicular_equal_radius` path and the same
+    ///     underlying classification weakness, but for those dimensions
+    ///     `build_shells_from_faces` does NOT trip — it returns `Ok` with a
+    ///     600-open-edge, `brep_valid=false` solid instead (reproduced live:
+    ///     0.44 s, no hang, no error).
+    /// So "refuses vs. ships unsound" is not a designed choice — it is
+    /// whichever downstream check happens to notice the broken
+    /// classification first, and that varies with block/overhang geometry.
+    ///
+    /// The ONLY deliberate refusal in the codebase touching this family is
+    /// `harness::engine_variant::build_variant`'s `OverlappingHoles` check
+    /// (`geometry-engine/src/harness/engine_variant.rs:246-260`) — a call-
+    /// site pre-check scoped to the injector-faceplate drilling RECIPE
+    /// (rejects when >=2 holes on a ring are close enough to intersect,
+    /// guarding a DIFFERENT compounding scenario: repeated differences on
+    /// one growing self-intersecting cavity measured to degrade
+    /// super-linearly and hang after several holes). That guard lives
+    /// outside `boolean_operation` entirely and never runs for a bare
+    /// two-cylinder difference like this one.
+    ///
+    /// Kept as a permanent regression probe (not `#[ignore]`d — it passes
+    /// today because it accepts either a typed refusal or a watertight
+    /// `Ok`): if a future fix makes this specific pair succeed, the
+    /// `assert!` below will legitimately catch a regression to an open/
+    /// unsound solid.
+    #[test]
+    fn cyl_cyl_saddle_guard_probe_35() {
+        use crate::harness::watertight::manifold_report;
+        use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
+        use crate::primitives::topology_builder::GeometryId;
+
+        let sid = |g: GeometryId| match g {
+            GeometryId::Solid(id) => id,
+            other => {
+                // Not the classic `.expect`-on-Option/Result pattern the
+                // workspace lint targets — this documents an invariant of
+                // this test's own fixture construction, matching the
+                // sibling #35 tests in this file.
+                #[allow(clippy::panic)]
+                {
+                    panic!("expected Solid, got {other:?}")
+                }
+            }
+        };
+
+        let tol = Tolerance::default();
+        let mut m = BRepModel::new();
+
+        // 60 x 60 x 60 block, centred on the origin in Y/Z so the two bore
+        // axes below cross at the block's centre (30, 30, 30).
+        let block = extrude_polygon_regions(
+            &mut m,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::X,
+            Vector3::Y,
+            &[PolygonRegion {
+                outer: vec![[0.0, 0.0], [60.0, 0.0], [60.0, 60.0], [0.0, 60.0]],
+                holes: vec![],
+            }],
+            60.0,
+            None,
+            tol,
+        )
+        .expect("block");
+
+        // cylA: axis +X, r=10, through the block, centred at y=30,z=30.
+        let overhang = 10.0;
+        let cyl_a = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(-overhang, 30.0, 30.0),
+                Vector3::X,
+                10.0,
+                60.0 + 2.0 * overhang,
+            )
+            .expect("cylA"));
+        let after_a = boolean_operation(
+            &mut m,
+            block,
+            cyl_a,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("cylA difference");
+
+        // cylB: axis +Y, r=10 (EQUAL radius), through the SAME centre
+        // (30,_,30) — its axis crosses cylA's axis exactly at (30,30,30),
+        // the bicylinder/Steinmetz configuration.
+        let cyl_b = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(30.0, -overhang, 30.0),
+                Vector3::Y,
+                10.0,
+                60.0 + 2.0 * overhang,
+            )
+            .expect("cylB"));
+
+        let start = std::time::Instant::now();
+        let result = boolean_operation(
+            &mut m,
+            after_a,
+            cyl_b,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        );
+        let elapsed = start.elapsed();
+        eprintln!("[#35-guard-probe] cylB difference finished in {elapsed:?} (no hang)");
+
+        match result {
+            Err(e) => {
+                // The hoped-for outcome: a typed, fast refusal.
+                eprintln!("[#35-guard-probe] REFUSED: {e:?}");
+            }
+            Ok(res) => {
+                let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("manifold report");
+                eprintln!(
+                    "[#35-guard-probe] Ok but open_edges={} nonmanifold={} euler={} valid={}",
+                    r.boundary_edges,
+                    r.nonmanifold_edges,
+                    r.euler_characteristic,
+                    r.manifold && r.closed && r.oriented
+                );
+                assert!(
+                    r.boundary_edges == 0 && r.nonmanifold_edges == 0,
+                    "#35: the cyl-cyl saddle boolean neither refused NOR shipped a \
+                     watertight solid — open={}, nm={} (silent correctness bug, not a \
+                     guarded regime)",
+                    r.boundary_edges,
+                    r.nonmanifold_edges
+                );
+            }
+        }
+    }
+
     /// #40 REGRESSION: differencing a faceted (RuledSurface-walled) cutter
     /// from a solid that carries an ANALYTIC cylinder fillet face must NOT
     /// fail with the spurious "Invalid surface types for plane-cylinder
