@@ -32,7 +32,7 @@ use crate::primitives::{
     edge::{Edge, EdgeId, EdgeOrientation},
     face::{Face, FaceId},
     fillet_surfaces::{CylindricalFillet, ToroidalFillet, VariableRadiusFillet},
-    r#loop::{Loop, LoopType},
+    r#loop::{Loop, LoopId, LoopType},
     solid::{BlendKind, SolidId},
     surface::{Cylinder, Sphere, Surface},
     topology_builder::BRepModel,
@@ -416,6 +416,58 @@ pub fn fillet_edges(
                 edges.len(),
             );
             edges.retain(|e| !over_height.contains(e));
+        }
+    }
+
+    // ALL-edges bore-rim OVERRUN pre-filter (live-dogfood fix, 2026-07-12). A
+    // CONCAVE closed bore-rim fillet grows the planar cap's opening from the
+    // bore radius R to R+r. On a CROWDED cap — a bore close to the cap's edge or
+    // to an adjacent hole, e.g. a ring of bores through a pocket floor — that
+    // enlarged opening runs OFF the cap boundary. The surgery still yields a
+    // combinatorially valid B-Rep, but the cap face's 2D trimmed region
+    // self-overlaps (the enlarged hole contour crosses the outer boundary), so
+    // its CDT emits ZERO triangles → the whole solid tessellates "geometrically
+    // OPEN" and `validate_blend_geometric_closure` rolls the WHOLE graceful op
+    // back — the live symptom (a dense bored part 500s at an aggressive radius,
+    // succeeds at a small one, with a radius-independent boundary-edge count
+    // once the cap face fails entirely). Mirror the corner / over-height
+    // pre-filters: DROP such rims up front (geometry-derived clearance) and
+    // round the rest. The explicit-`edge_ids` path (`graceful_corner_skip ==
+    // false`) is untouched: it still hits the honest per-face closure refusal.
+    if options.graceful_corner_skip && edges.len() > 1 {
+        let overrun: Vec<EdgeId> = edges
+            .iter()
+            .copied()
+            .filter(|&e| {
+                plane_cap_bore_rim_fillet_overruns(
+                    model,
+                    e,
+                    edge_representative_radius(&options, e),
+                )
+            })
+            .collect();
+        if !overrun.is_empty() {
+            let kept = edges.len() - overrun.len();
+            if kept == 0 {
+                // Nothing roundable — refuse cleanly (model untouched here) with
+                // the concrete per-rim reason rather than a broken-mesh rollback.
+                let e = overrun[0];
+                let r = edge_representative_radius(&options, e);
+                return Err(OperationError::InvalidGeometry(format!(
+                    "Fillet radius {r} too large for bore rim (edge {e}): the rounded opening \
+                     would overrun the cap-face boundary (collide with a nearby wall or hole)."
+                )));
+            }
+            tracing::warn!(
+                target: "geometry_engine::blend",
+                "fillet (all-edges): skipping {} bore rim(s) {:?} whose fillet opening would \
+                 overrun the cap-face boundary; rounding {} of {} candidate edge(s)",
+                overrun.len(),
+                overrun,
+                kept,
+                edges.len(),
+            );
+            edges.retain(|e| !overrun.contains(e));
         }
     }
 
@@ -2309,6 +2361,181 @@ fn edge_representative_radius(options: &FilletOptions, edge_id: EdgeId) -> f64 {
         FilletType::Chord(c) => *c,
         FilletType::Function(_) => options.radius,
     }
+}
+
+/// Does `loop_id` contain `edge_id` among its edges?
+fn loop_contains_edge(model: &BRepModel, loop_id: LoopId, edge_id: EdgeId) -> bool {
+    model
+        .loops
+        .get(loop_id)
+        .is_some_and(|l| l.edges.contains(&edge_id))
+}
+
+/// Sample a loop into a closed 3D polyline (last point repeats the first) by
+/// walking its edges and sampling each edge's curve at a handful of stations —
+/// enough that a straight wall is exact at its endpoints and a curved boundary
+/// (an adjacent bore hole) is captured to sub-radius accuracy for a clearance
+/// query. Empty when the loop is missing or every edge is unfetchable.
+fn loop_sampled_polyline(model: &BRepModel, loop_id: LoopId) -> Vec<Point3> {
+    const STATIONS: usize = 12;
+    let mut out: Vec<Point3> = Vec::new();
+    let Some(lp) = model.loops.get(loop_id) else {
+        return out;
+    };
+    for &edge_id in &lp.edges {
+        let Some(edge) = model.edges.get(edge_id) else {
+            continue;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            continue;
+        };
+        let (t0, t1) = (edge.param_range.start, edge.param_range.end);
+        for j in 0..STATIONS {
+            let t = t0 + (j as f64) * (t1 - t0) / (STATIONS as f64);
+            if let Ok(p) = curve.point_at(t) {
+                out.push(p);
+            }
+        }
+    }
+    if out.len() >= 2 {
+        // Close the polyline so the final segment (last vertex → first) is
+        // measured too.
+        out.push(out[0]);
+    }
+    out
+}
+
+/// Centroid of a (closed) edge's curve, sampled — a robust circle centre for a
+/// bore rim regardless of the stored surface parameterisation. `None` if the
+/// edge / curve is unfetchable or evaluates to no points.
+fn edge_curve_centroid(model: &BRepModel, edge_id: EdgeId) -> Option<Point3> {
+    const STATIONS: usize = 24;
+    let edge = model.edges.get(edge_id)?;
+    let curve = model.curves.get(edge.curve_id)?;
+    let (t0, t1) = (edge.param_range.start, edge.param_range.end);
+    let (mut sx, mut sy, mut sz, mut n) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+    for j in 0..STATIONS {
+        let t = t0 + (j as f64) * (t1 - t0) / (STATIONS as f64);
+        if let Ok(p) = curve.point_at(t) {
+            sx += p.x;
+            sy += p.y;
+            sz += p.z;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| Point3::new(sx / n as f64, sy / n as f64, sz / n as f64))
+}
+
+/// Distance from point `p` to the segment `[a, b]`.
+fn point_to_segment_distance(p: Point3, a: Point3, b: Point3) -> f64 {
+    let ab = b - a;
+    let len2 = ab.dot(&ab);
+    if len2 <= f64::EPSILON {
+        return p.distance(&a);
+    }
+    let t = ((p - a).dot(&ab) / len2).clamp(0.0, 1.0);
+    let proj = a + ab * t;
+    p.distance(&proj)
+}
+
+/// A CLOSED bore-rim edge — a cylinder wall meeting a PLANAR cap where the rim
+/// is a HOLE in the cap — whose CONCAVE fillet would grow the cap's opening from
+/// the bore radius `R` to `R + radius` and OVERRUN the cap face's other boundary
+/// loops (run off the cap into a nearby wall, or into an adjacent hole).
+///
+/// Such a fillet still yields a combinatorially valid B-Rep, but the cap face's
+/// trimmed 2D region self-overlaps (the enlarged hole contour crosses the outer
+/// boundary), so the planar CDT refuses it and the face emits zero triangles —
+/// the "geometrically OPEN" mesh that `validate_blend_geometric_closure` rolls
+/// the WHOLE graceful op back on. This is the live dogfood symptom: a dense
+/// pocketed part with a ring of bores 500s at an aggressive radius (the rounded
+/// bore opening runs past the pocket wall) yet succeeds at a small one (the
+/// opening still fits).
+///
+/// `true` means the rim cannot be filleted at `radius` without colliding; the
+/// ALL-edges "round what it can" pre-filter DROPs it and rounds the rest.
+///
+/// Geometry-derived (samples the live loops), independent of stored surface
+/// parameters. Conservative — returns `false` (defer to the normal pipeline)
+/// whenever the edge is not a plane-cap bore rim, the rim is the cap's OUTER
+/// loop (filleting SHRINKS a disk — R − r, never overruns), or the clearance
+/// cannot be measured.
+fn plane_cap_bore_rim_fillet_overruns(model: &BRepModel, edge_id: EdgeId, radius: f64) -> bool {
+    use crate::primitives::surface::{Cylinder, Plane};
+    if radius <= 0.0 {
+        return false;
+    }
+    let Some(edge) = model.edges.get(edge_id) else {
+        return false;
+    };
+    if !edge.is_loop() {
+        return false;
+    }
+    let Ok((f1, f2)) = get_adjacent_faces_safe(model, edge_id) else {
+        return false;
+    };
+    // Identify the cylinder wall (bore radius R) and the planar cap face.
+    let mut bore_radius: Option<f64> = None;
+    let mut cap_face: Option<FaceId> = None;
+    for fid in [f1, f2] {
+        let Some(face) = model.faces.get(fid) else {
+            return false;
+        };
+        let Some(surf) = model.surfaces.get(face.surface_id) else {
+            return false;
+        };
+        if let Some(c) = surf.as_any().downcast_ref::<Cylinder>() {
+            bore_radius = Some(c.radius);
+        } else if surf.as_any().downcast_ref::<Plane>().is_some() {
+            cap_face = Some(fid);
+        }
+    }
+    let (Some(big_r), Some(cap_fid)) = (bore_radius, cap_face) else {
+        return false;
+    };
+    let Some(cap) = model.faces.get(cap_fid) else {
+        return false;
+    };
+    // The fillet GROWS the cap opening only when the rim is a HOLE (an inner
+    // loop) of the cap. On the cap's OUTER loop the fillet shrinks the disk
+    // (R − r), which cannot overrun — leave those to the pipeline.
+    let rim_is_hole = cap
+        .inner_loops
+        .iter()
+        .any(|&lid| loop_contains_edge(model, lid, edge_id));
+    if !rim_is_hole {
+        return false;
+    }
+    // Rim circle centre (sampled — robust to the stored parameterisation).
+    let Some(centre) = edge_curve_centroid(model, edge_id) else {
+        return false;
+    };
+    // Minimum clearance from the rim centre to every OTHER boundary loop of the
+    // cap face (its outer loop + any other hole), measured to the loop
+    // polylines' SEGMENTS so a straight wall sampled only at its endpoints still
+    // yields the true nearest distance.
+    let mut min_clear = f64::INFINITY;
+    for lid in std::iter::once(cap.outer_loop).chain(cap.inner_loops.iter().copied()) {
+        if loop_contains_edge(model, lid, edge_id) {
+            continue; // the rim's own loop
+        }
+        let poly = loop_sampled_polyline(model, lid);
+        for seg in poly.windows(2) {
+            let d = point_to_segment_distance(centre, seg[0], seg[1]);
+            if d < min_clear {
+                min_clear = d;
+            }
+        }
+    }
+    if !min_clear.is_finite() {
+        return false;
+    }
+    // The rounded opening reaches radius `R + radius`; if that meets or exceeds
+    // the nearest OTHER boundary, the cap face's trimmed region self-overlaps.
+    // The tolerance margin keeps a rim that only just fits (the small-radius
+    // case that still tessellates) on the ROUND side.
+    let margin = model.tolerance.distance();
+    big_r + radius >= min_clear - margin
 }
 
 /// Build the quarter-torus blend that replaces a cylinder/cap rim.
