@@ -55,6 +55,7 @@ use crate::primitives::{
     topology_builder::BRepModel,
     vertex::VertexId,
 };
+use std::collections::{HashMap, HashSet};
 
 /// Data captured at blend-face construction time, consumed by
 /// `splice_blend_edge` to re-stitch the surrounding topology.
@@ -932,6 +933,130 @@ mod surgery_tests {
         assert_eq!(trims[0].curve_id, 7000);
         assert_eq!(trims[1].curve_id, 7001);
     }
+}
+
+/// Coalesce maximal chains of co-curve, contiguous, smoothly-joined edges that
+/// meet at 2-valent (in-solid) vertices into single edges, IN PLACE.
+///
+/// A boolean can split one smooth curve — most commonly a drilled hole's rim
+/// circle — into several co-curve arcs joined at 2-valent smooth vertices.
+/// Blending that arc CHAIN per-edge cannot coordinate the shared adjacent
+/// faces: one arc's splice removes a sibling arc's edge that the sibling's
+/// splice still needs ("Face N outer loop does not contain edge M"), and the
+/// blend pre-flight reads the 2-valent joints as shared CORNER vertices and
+/// refuses. Merging the arcs back into the single canonical edge — for a
+/// closed rim, the standard cylinder-lateral closed-circle edge — restores the
+/// representation the closed-rim blend (fillet torus / chamfer cone) already
+/// handles soundly.
+///
+/// Returns a map from each removed edge id to its surviving edge id so the
+/// caller can remap any selection that referenced a merged-away arc. Idempotent
+/// and a no-op on already-canonical topology (clean boxes, prisms, single-edge
+/// rims), so it is safe to run before every fillet AND every chamfer. Shared by
+/// both blend entry points (`fillet::fillet_edges`,
+/// `chamfer::chamfer_edges`) so the healing stays byte-identical across kinds.
+pub(crate) fn coalesce_smooth_cocurve_chains(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+) -> HashMap<EdgeId, EdgeId> {
+    let mut merged: HashMap<EdgeId, EdgeId> = HashMap::new();
+    loop {
+        // In-solid edges = referenced by some face loop of `solid_id`.
+        let mut in_solid: HashSet<EdgeId> = HashSet::new();
+        if let Some(sol) = model.solids.get(solid_id) {
+            let mut shells = vec![sol.outer_shell];
+            shells.extend_from_slice(&sol.inner_shells);
+            for sh in shells {
+                let Some(shell) = model.shells.get(sh) else {
+                    continue;
+                };
+                for &fid in &shell.faces {
+                    let Some(f) = model.faces.get(fid) else {
+                        continue;
+                    };
+                    for lid in f.all_loops() {
+                        if let Some(lp) = model.loops.get(lid) {
+                            for &e in &lp.edges {
+                                in_solid.insert(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut ve: HashMap<VertexId, Vec<EdgeId>> = HashMap::new();
+        for &e in &in_solid {
+            if let Some(ed) = model.edges.get(e) {
+                ve.entry(ed.start_vertex).or_default().push(e);
+                if ed.end_vertex != ed.start_vertex {
+                    ve.entry(ed.end_vertex).or_default().push(e);
+                }
+            }
+        }
+        // Find a 2-valent vertex whose two edges are co-curve and forward-
+        // contiguous (one ends at v, the other starts at v, at the same param).
+        let mut act = None;
+        for (&v, es) in &ve {
+            if es.len() != 2 {
+                continue;
+            }
+            let (a, b) = (es[0], es[1]);
+            let (ea, eb) = match (model.edges.get(a), model.edges.get(b)) {
+                (Some(ea), Some(eb)) => (ea, eb),
+                _ => continue,
+            };
+            if ea.curve_id != eb.curve_id {
+                continue;
+            }
+            let (keep, drop) = if ea.end_vertex == v && eb.start_vertex == v {
+                (a, b)
+            } else if eb.end_vertex == v && ea.start_vertex == v {
+                (b, a)
+            } else {
+                continue;
+            };
+            let (ek, ed) = match (model.edges.get(keep), model.edges.get(drop)) {
+                (Some(ek), Some(ed)) => (ek, ed),
+                _ => continue,
+            };
+            if (ek.param_range.end - ed.param_range.start).abs() > 1.0e-9 {
+                continue;
+            }
+            act = Some((v, keep, drop, ed.end_vertex, ed.param_range.end));
+            break;
+        }
+        let Some((v, keep, drop, drop_end_v, drop_end_p)) = act else {
+            break;
+        };
+        if let Some(ek) = model.edges.get_mut(keep) {
+            ek.end_vertex = drop_end_v;
+            ek.param_range.end = drop_end_p;
+        }
+        for lid in (0..model.loops.len() as u32).map(LoopId::from) {
+            if let Some(lp) = model.loops.get_mut(lid) {
+                if let Some(idx) = lp.edges.iter().position(|&e| e == drop) {
+                    lp.remove_edge(idx);
+                }
+            }
+        }
+        model.edges.remove(drop);
+        model.vertices.remove(v);
+        merged.insert(drop, keep);
+    }
+    merged
+}
+
+/// Resolve an edge id through the coalesce map to its final surviving edge.
+pub(crate) fn resolve_coalesced(map: &HashMap<EdgeId, EdgeId>, mut e: EdgeId) -> EdgeId {
+    let mut guard = 0;
+    while let Some(&next) = map.get(&e) {
+        e = next;
+        guard += 1;
+        if guard > 1024 {
+            break;
+        }
+    }
+    e
 }
 
 /// Sanity helper used by tests / callers to check a loop is closed.

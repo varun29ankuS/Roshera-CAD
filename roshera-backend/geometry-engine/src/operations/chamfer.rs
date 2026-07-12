@@ -9,7 +9,9 @@
 
 use super::blend_graph::BlendVertexKind;
 use super::diagnostics::{BlendFailure, VertexBlendUnsupportedReason};
-use super::edge_blend_topology::{splice_blend_edge, BlendEdgeSurgery};
+use super::edge_blend_topology::{
+    coalesce_smooth_cocurve_chains, resolve_coalesced, splice_blend_edge, BlendEdgeSurgery,
+};
 use super::fillet::get_face_oriented_normal;
 use super::lifecycle::{self, OpSpec};
 use super::mixed_kind_corner_cap::SeamContinuity;
@@ -141,9 +143,34 @@ fn chamfer_is_synthesizable_corner(kind: BlendVertexKind, kept_degree: usize) ->
 pub fn chamfer_edges(
     model: &mut BRepModel,
     solid_id: SolidId,
-    edges: Vec<EdgeId>,
+    mut edges: Vec<EdgeId>,
     options: ChamferOptions,
 ) -> OperationResult<Vec<FaceId>> {
+    // Heal over-split topology before the corner pre-flight — the SAME
+    // shared healing `fillet_edges` runs at its own entry point. A boolean
+    // Difference (e.g. a drilled through-hole) splits one smooth rim circle
+    // into several co-curve arcs joined at 2-valent smooth vertices. Without
+    // healing, those 2-valent joints read as shared CORNER vertices, so the
+    // F2-δ corner pre-flight below refuses the rim with a `NotImplemented`
+    // same-kind corner-patch message — exactly the fillet/chamfer parity gap
+    // this closes. Coalescing merges each arc chain back into the single
+    // canonical closed rim edge, which `create_edge_chamfer` then routes to
+    // `create_closed_edge_chamfer` (the cone-frustum rim blend). The selection
+    // is remapped onto the surviving edges. No-op on already-canonical
+    // topology (clean boxes, prisms, single-edge rims), so the common path is
+    // untouched; when it DOES merge arcs the result is strictly canonical
+    // topology, so the pre-flight's atomicity contract still holds — a later
+    // refusal leaves a sound, normalized solid, never a torn one.
+    let coalesced = coalesce_smooth_cocurve_chains(model, solid_id);
+    if !coalesced.is_empty() {
+        let mut seen = HashSet::new();
+        edges = edges
+            .into_iter()
+            .map(|e| resolve_coalesced(&coalesced, e))
+            .filter(|&e| seen.insert(e))
+            .collect();
+    }
+
     // F2-δ pre-flight: cheap input validation + setback-aware
     // corner compatibility (replaces the historical
     // `validate_no_shared_corners` blanket reject). Atomic — the

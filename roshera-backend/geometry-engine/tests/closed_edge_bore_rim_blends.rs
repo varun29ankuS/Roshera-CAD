@@ -498,6 +498,75 @@ fn boxed_blind_bore_top_opening_rim_fillet_watertight() {
 }
 
 #[test]
+fn boxed_blind_bore_top_opening_rim_chamfer_watertight() {
+    // Fillet/chamfer PARITY (#82 successor): the SAME boolean-cut bore rim that
+    // `boxed_blind_bore_top_opening_rim_fillet_watertight` rounds must also
+    // CHAMFER. The Difference over-splits the rim into co-circular arcs joined
+    // at 2-valent smooth vertices; before the shared
+    // `coalesce_smooth_cocurve_chains` healing was wired into `chamfer_edges`,
+    // those joints read as shared CORNER vertices and the F2-δ corner pre-flight
+    // refused the whole op with a `NotImplemented` "share corner vertex … same-
+    // kind corner-patch synthesis … not yet implemented". Healing merges the
+    // arcs into one closed rim edge, which `create_edge_chamfer` routes to
+    // `create_closed_edge_chamfer` (cone-frustum rim blend). Assert the rim now
+    // chamfers SOUND: exactly one cone blend face, watertight + manifold +
+    // consistently oriented.
+    let (mut m, s, bore_r, top_z, _floor_z) = boxed_blind_bore(8.0, -5.0);
+    let rim = rim_arc_edges(&m, s, bore_r, top_z);
+    assert!(
+        !rim.is_empty(),
+        "expected to find the bore-top opening rim arcs"
+    );
+    assert!(
+        rim.len() >= 2,
+        "boolean Difference must over-split the rim into arcs, found {}",
+        rim.len()
+    );
+
+    let cones_before = count_surface(&m, s, SurfaceType::Cone);
+    let opts = ChamferOptions::default(); // symmetric 1.0
+    chamfer_edges(&mut m, s, rim, opts)
+        .expect("boolean-cut blind-bore TOP opening rim chamfer must succeed");
+
+    assert_eq!(
+        count_surface(&m, s, SurfaceType::Cone),
+        cones_before + 1,
+        "top opening rim chamfer must add exactly one cone blend face"
+    );
+    assert_valid_watertight_oriented(&mut m, s, "boxed blind-bore top opening rim chamfer");
+}
+
+#[test]
+fn through_bore_both_rims_chamfer_is_sound() {
+    // Chamfer parity for the through-hole shared-wall case (the fillet analogue
+    // is `through_bore_both_rims_fillet_is_sound`). Both boolean-split bore rims
+    // share ONE seamed wall cylinder; healing rebuilds each rim's closed edge so
+    // both rims chamfer on the shared wall. Before the shared coalescing was
+    // wired into chamfer, this refused at the corner pre-flight.
+    let mut m = BRepModel::new();
+    let s = holed_block(&mut m);
+
+    let rim_arcs = bore_rim_arc_edges(&m, s, 6.0);
+    assert!(
+        rim_arcs.len() >= 2,
+        "expected the over-split bore-rim arcs of both rims, found {}",
+        rim_arcs.len()
+    );
+
+    let cones_before = count_surface(&m, s, SurfaceType::Cone);
+    let opts = ChamferOptions::default(); // symmetric 1.0
+    chamfer_edges(&mut m, s, rim_arcs, opts)
+        .expect("chamfering both bore rims (shared wall) must succeed");
+
+    assert_eq!(
+        count_surface(&m, s, SurfaceType::Cone),
+        cones_before + 2,
+        "both bore rims must each add one cone blend face"
+    );
+    assert_valid_watertight_oriented(&mut m, s, "through-bore both rims chamfer");
+}
+
+#[test]
 fn boxed_blind_bore_bottom_floor_rim_fillet_watertight() {
     // The genuinely-concave blind-floor rim already worked pre-fix; this pins
     // that the cap-height-from-rim change does not regress it.
