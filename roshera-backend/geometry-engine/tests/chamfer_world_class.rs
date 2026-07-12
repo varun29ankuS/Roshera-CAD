@@ -560,11 +560,11 @@ fn flange_both_outer_rims_same_cylinder() {
 
 // ===========================================================================
 // GRACEFUL REFUSAL — co-circular revolve-seam rim arcs (θ ≈ π tangent
-// junction). Chamfer corner-patch setback is genuinely undefined here; the
-// op must REFUSE with a typed error and leave the model UNCHANGED + sound.
+// junction). Chamfer now heals the chain into one closed rim edge via the
+// shared arc-coalescing (fillet/chamfer parity) and chamfers it SOUNDLY.
 // ===========================================================================
 #[test]
-fn revolve_seam_rim_graceful_refusal() {
+fn revolve_seam_rim_chamfers_sound_via_coalescing() {
     use geometry_engine::operations::transform::{translate, TransformOptions};
     use geometry_engine::operations::{boolean_operation, BooleanOp, BooleanOptions};
 
@@ -645,21 +645,20 @@ fn revolve_seam_rim_graceful_refusal() {
     );
     let faces_before = model.faces.len();
 
-    let res = chamfer_edges(&mut model, flange, rim_arcs, chamfer_opts(0.2));
+    // Post fillet/chamfer arc-coalescing parity (shared
+    // coalesce_smooth_cocurve_chains): chamfer now HEALS the co-circular
+    // revolve-seam rim arc chain into one closed rim edge and chamfers it
+    // SOUNDLY, instead of refusing at the corner pre-flight. Verified the
+    // result is world-class (watertight + manifold + oriented + valid).
+    chamfer_edges(&mut model, flange, rim_arcs, chamfer_opts(0.2))
+        .expect("coalesced revolve-seam rim arc chain must chamfer (arc-coalescing parity)");
     assert!(
-        res.is_err(),
-        "co-circular θ≈π seam chamfer corner-patch is undefined → must refuse, not succeed"
+        model.faces.len() > faces_before,
+        "chamfering the coalesced revolve-seam rim must add blend topology"
     );
-
-    // The refusal must be TRANSACTIONAL: model unchanged + still sound.
-    assert_eq!(
-        model.faces.len(),
-        faces_before,
-        "graceful refusal must roll back all topology changes"
-    );
-    let cert_after = model.certify_solid(flange);
-    assert!(
-        cert_after.is_sound(),
-        "model must remain sound after a graceful chamfer refusal"
+    assert_world_class(
+        &mut model,
+        flange,
+        "revolve-seam outer rim (coalesced arc chain)",
     );
 }
