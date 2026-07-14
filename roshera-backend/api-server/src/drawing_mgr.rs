@@ -38,6 +38,7 @@ use geometry_engine::drawing::{
     DrawingQualityReport, ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
+use geometry_engine::primitives::snapshot::ModelSnapshot;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
@@ -561,22 +562,54 @@ pub async fn part_drawing_svg_by_uuid(
     drawing_svg_for_solid(model_handle, solid_id, uuid, q).await
 }
 
+/// Build the standard sheet OFF the model lock and OFF the async workers.
+///
+/// A high-face-count part's HLR + dimension pipeline is seconds of pure CPU (a
+/// 293-face gear once wedged the whole backend for minutes). Running it under
+/// the model read lock on a Tokio worker starved the runtime — `/health` and
+/// every other endpoint went dead until it finished. This mirrors the auto-cert
+/// reconcile fix: take a BRIEF read lock, deep-copy the model into a
+/// [`ModelSnapshot`], DROP the guard, then run the whole projection/HLR pipeline
+/// on an owned model inside [`spawn_blocking`](tokio::task::spawn_blocking). The
+/// response stays synchronous (the client waits), but no lock is held and no
+/// async worker is blocked while the drawing computes.
+async fn build_standard_drawing_off_lock(
+    model_handle: Arc<RwLock<BRepModel>>,
+    solid_id: SolidId,
+    part_uuid: Uuid,
+    scale: Option<f64>,
+) -> Result<Drawing, StatusCode> {
+    // Brief read lock: validate the solid exists, snapshot, release.
+    let snap = {
+        let model = model_handle.read().await;
+        if model.solids.get(solid_id).is_none() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        ModelSnapshot::take(&model)
+    };
+    // Heavy pipeline on an owned copy — no lock held, on a blocking thread.
+    tokio::task::spawn_blocking(move || {
+        let mut owned = BRepModel::new();
+        snap.restore(&mut owned);
+        match scale {
+            Some(scale) => standard_drawing_hlr(&owned, solid_id, part_uuid, SheetSize::A3, scale)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY),
+            None => standard_drawing_auto(&owned, solid_id, part_uuid)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY),
+        }
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
 async fn drawing_svg_for_solid(
     model_handle: std::sync::Arc<RwLock<BRepModel>>,
     solid_id: SolidId,
     part_uuid: Uuid,
     q: PartDrawingQuery,
 ) -> Result<Response, StatusCode> {
-    let model = model_handle.read().await;
-    if model.solids.get(solid_id).is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let drawing = match q.scale {
-        Some(scale) => standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
-            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
-        None => standard_drawing_auto(&model, solid_id, part_uuid)
-            .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
-    };
+    let drawing =
+        build_standard_drawing_off_lock(model_handle, solid_id, part_uuid, q.scale).await?;
     let svg = render_drawing_svg(&drawing);
     let content_type = if q.plain {
         "text/plain; charset=utf-8"
@@ -622,22 +655,13 @@ async fn create_part_drawing_inner(
     part_uuid: Uuid,
     q: PartDrawingQuery,
 ) -> Result<Json<PartDrawingResponse>, StatusCode> {
-    let mut drawing = {
-        let model = model_handle.read().await;
-        if model.solids.get(solid_id).is_none() {
-            return Err(StatusCode::NOT_FOUND);
-        }
-        // Fully automatic: picks the sheet size + fill scale, centers the
-        // four-view layout (Front/Top/Right + isometric), and draws proper
-        // offset dimensions. A manual `?scale=` override falls back to the
-        // fixed-A3 path for callers that want an exact ratio.
-        match q.scale {
-            Some(scale) => standard_drawing_hlr(&model, solid_id, part_uuid, SheetSize::A3, scale)
-                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
-            None => standard_drawing_auto(&model, solid_id, part_uuid)
-                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?,
-        }
-    };
+    // Fully automatic: picks the sheet size + fill scale, centers the four-view
+    // layout (Front/Top/Right + isometric), and draws proper offset dimensions.
+    // A manual `?scale=` override falls back to the fixed-A3 path for callers
+    // that want an exact ratio. Built OFF the model lock on a blocking thread so
+    // a heavy sheet never starves the runtime (see `build_standard_drawing_off_lock`).
+    let mut drawing =
+        build_standard_drawing_off_lock(model_handle, solid_id, part_uuid, q.scale).await?;
 
     // Name the sheet after the originating part when the caller didn't
     // supply one. The drawing title block renders this name, so a
@@ -1032,6 +1056,64 @@ mod tests {
         let hb = m.get(&id_b).unwrap();
         let _ga = ha.write().await;
         let _gb = hb.write().await; // would deadlock if locks were shared
+    }
+
+    // ── Off-lock drawing build (runtime-starvation fix) ─────────────
+
+    #[tokio::test]
+    async fn off_lock_drawing_builds_and_coexists_with_readers() {
+        // The heavy HLR pipeline must run on a snapshot inside spawn_blocking, so
+        // it neither holds the model lock across the compute nor starves the async
+        // runtime. Prove the functional contract (a real sheet is produced) AND
+        // that the build coexists with a CONCURRENT reader — the exact thing that
+        // went dead when a drawing pinned the model read lock for minutes.
+        let (model, sid) = build_box_model(40.0, 30.0, 20.0);
+        let handle = Arc::new(RwLock::new(model));
+
+        // Another reader (stands in for `/health` / any concurrent request) holds
+        // a read lock for the whole build. A shared read lock must not block the
+        // snapshot, and the compute happens off the lock entirely.
+        let reader = handle.clone();
+        let held = reader.read().await;
+
+        let drawing = build_standard_drawing_off_lock(handle.clone(), sid, Uuid::nil(), None)
+            .await
+            .expect("off-lock auto drawing");
+        assert!(
+            !drawing.views.is_empty(),
+            "off-lock build produced the standard views"
+        );
+        drop(held);
+
+        // Lock is free after the build (the snapshot guard was dropped before the
+        // spawn_blocking compute; nothing lingers).
+        assert!(
+            handle.try_write().is_ok(),
+            "model lock is released after an off-lock drawing build"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_lock_drawing_scale_override_uses_a3_hlr() {
+        // The `?scale=` override path (fixed A3, explicit ratio) must also route
+        // through the off-lock helper and return a valid sheet.
+        let (model, sid) = build_box_model(25.0, 25.0, 25.0);
+        let handle = Arc::new(RwLock::new(model));
+        let drawing = build_standard_drawing_off_lock(handle, sid, Uuid::nil(), Some(1.0))
+            .await
+            .expect("off-lock scaled drawing");
+        assert_eq!(drawing.sheet_size, SheetSize::A3, "scale override pins A3");
+        assert!(!drawing.views.is_empty());
+    }
+
+    #[tokio::test]
+    async fn off_lock_drawing_missing_solid_is_not_found() {
+        let model = BRepModel::new();
+        let handle = Arc::new(RwLock::new(model));
+        let err = build_standard_drawing_off_lock(handle, 9999, Uuid::nil(), None)
+            .await
+            .expect_err("unknown solid must be rejected");
+        assert_eq!(err, StatusCode::NOT_FOUND);
     }
 
     // ── One-call part drawing — registry insert path ────────────────

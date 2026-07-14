@@ -94,6 +94,48 @@ pub fn raycast_solid(
     best
 }
 
+/// Nearest positive ray parameter `t` (`> EPS`) at which the ray from `origin`
+/// along `direction` crosses face `face_id`, clipped to the face's real trim
+/// loops; `None` if the ray misses the trimmed face.
+///
+/// This is the single-face core of [`raycast_solid`] factored out so callers
+/// that already hold a spatially-culled candidate face set (e.g. drawing HLR's
+/// projected-AABB occlusion grid) can test faces one at a time without the
+/// whole-solid face loop. The trim clip and `EPS` gate match `raycast_solid`
+/// exactly, so an occlusion test built on this yields byte-identical
+/// visibility to the brute-force nearest-hit path.
+pub(crate) fn ray_hit_face_t(
+    model: &BRepModel,
+    face_id: FaceId,
+    origin: Point3,
+    dir: Vector3,
+) -> Option<f64> {
+    let face = model.faces.get(face_id)?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    let mut best: Option<f64> = None;
+    for t in surface_ray_ts(surface, origin, dir) {
+        if t <= EPS {
+            continue;
+        }
+        let p = Point3::new(
+            origin.x + dir.x * t,
+            origin.y + dir.y * t,
+            origin.z + dir.z * t,
+        );
+        let (u, v) = match surface.closest_point(&p, model.tolerance()) {
+            Ok(uv) => uv,
+            Err(_) => continue,
+        };
+        if !crate::tessellation::surface::point_inside_face_uv(u, v, face, model) {
+            continue;
+        }
+        if best.map(|b| t < b).unwrap_or(true) {
+            best = Some(t);
+        }
+    }
+    best
+}
+
 /// ALL ray–solid hits along the ray (every face crossing), sorted near→far.
 /// Used for point-in-solid parity and multi-hit field queries.
 pub fn raycast_all(

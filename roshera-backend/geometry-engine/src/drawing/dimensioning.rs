@@ -17,6 +17,14 @@ use crate::primitives::topology_builder::BRepModel;
 use crate::readable::extract_dimensions;
 use serde::{Deserialize, Serialize};
 
+/// Per-phase drawing-build profiling, opt-in via the `ROSHERA_DRAW_PROFILE`
+/// environment variable (any non-empty value). When set, [`standard_drawing_auto`]
+/// prints milliseconds spent in each phase to stderr — the instrumentation the
+/// HLR perf work (#22) is measured against. Zero cost when unset (one env read).
+fn draw_profile_enabled() -> bool {
+    std::env::var_os("ROSHERA_DRAW_PROFILE").is_some_and(|v| !v.is_empty())
+}
+
 /// A 2D dimension annotation in view-space (mm, pre-scale) — the same space the
 /// projected polylines live in, so the SVG/DXF renderer maps both uniformly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,10 +621,15 @@ fn build_hlr_view(
     min_span: f64,
 ) -> Result<super::types::ProjectedView, super::projection::ProjectionError> {
     use super::projection::{project_solid_view, DEFAULT_CURVE_SAMPLES};
-    use super::visibility::project_solid_edges_visibility;
+    use super::visibility::project_solid_edges_visibility_occ;
 
     let mut view = project_solid_view(model, source, proj, name, pos, scale)?;
-    let edges = project_solid_edges_visibility(model, solid_id, proj, DEFAULT_CURVE_SAMPLES)?;
+    // The isometric merges visible + hidden into one all-solid set below, so its
+    // occlusion pass is discarded work — skip it (`occlude = false`). Orthographic
+    // views keep true HLR.
+    let occlude = !matches!(proj, ProjectionType::Isometric);
+    let edges =
+        project_solid_edges_visibility_occ(model, solid_id, proj, DEFAULT_CURVE_SAMPLES, occlude)?;
     if matches!(proj, ProjectionType::Isometric) {
         // The isometric is a PICTORIAL reference, drawn as a clean solid
         // wireframe. Per-segment occlusion mis-classifies a curved rim in the
@@ -878,22 +891,29 @@ pub fn standard_drawing_auto(
         (ProjectionType::Isometric, "ISOMETRIC", false),
     ];
 
+    let prof = draw_profile_enabled();
+    let t_all = std::time::Instant::now();
+
     // Pass 1 — unit-scale extents to drive sheet + scale + placement. The
     // sheet size keys off the ORTHOGRAPHIC max dimension (true part size),
     // not the larger isometric silhouette.
+    //
+    // Extent-ONLY: the sheet/scale/placement key off the projected WIREFRAME
+    // extent, which `project_solid_view` computes directly. `build_hlr_view`
+    // never augments the extent past that wireframe, so running the full HLR +
+    // dimension + centerline build here would compute every view TWICE — and the
+    // visibility raytrace is the pipeline's dominant cost. Extent-only halves it.
+    let t_p1 = std::time::Instant::now();
     let mut extents = Vec::with_capacity(4);
     for (proj, name, _) in specs {
-        let v = build_hlr_view(
-            model,
-            solid_id,
-            source,
-            proj,
-            name,
-            [0.0, 0.0],
-            1.0,
-            min_span,
-        )?;
+        let v = super::projection::project_solid_view(model, source, proj, name, [0.0, 0.0], 1.0)?;
         extents.push(v.extent);
+    }
+    if prof {
+        eprintln!(
+            "[draw-profile] pass1_extents (project-only): {:.1} ms",
+            t_p1.elapsed().as_secs_f64() * 1e3
+        );
     }
     let max_dim = extents
         .iter()
@@ -906,9 +926,11 @@ pub fn standard_drawing_auto(
         layout_four_view(&sheet, extents[0], extents[1], extents[2], extents[3]);
 
     // Pass 2 — build the placed, scaled views.
+    let t_p2 = std::time::Instant::now();
     let mut drawing = Drawing::new("Auto Drawing", sheet);
     drawing.set_unit_notes(model.document_unit());
     for (i, (proj, name, dimensioned)) in specs.iter().enumerate() {
+        let t_v = std::time::Instant::now();
         let mut view = build_hlr_view(
             model,
             solid_id,
@@ -919,6 +941,12 @@ pub fn standard_drawing_auto(
             scale,
             min_span,
         )?;
+        if prof {
+            eprintln!(
+                "[draw-profile]   view[{name}] hlr+dims+centerlines: {:.1} ms",
+                t_v.elapsed().as_secs_f64() * 1e3
+            );
+        }
         if !dimensioned {
             view.dimensions.clear();
         }
@@ -933,6 +961,12 @@ pub fn standard_drawing_auto(
         }
         drawing.add_view(view);
     }
+    if prof {
+        eprintln!(
+            "[draw-profile] pass2_views (4 views): {:.1} ms",
+            t_p2.elapsed().as_secs_f64() * 1e3
+        );
+    }
     dedup_dimensions_global(&mut drawing);
 
     // ── Hole table population ──────────────────────────────────────────────────
@@ -940,6 +974,7 @@ pub fn standard_drawing_auto(
     // This must happen AFTER dedup so entity merging is stable. The
     // material-side qualifier (bore = concave cylindrical face) keeps the
     // part's own OD / boss faces out of the table.
+    let t_tail = std::time::Instant::now();
     let dims = extract_dimensions(model, solid_id);
     let bore_faces = crate::readable::bore_face_ids(model, solid_id);
     attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
@@ -964,6 +999,17 @@ pub fn standard_drawing_auto(
     // attach it as a compact pictorial in genuinely free sheet space. Runs
     // LAST so its free-space search sees every placed item as an obstacle.
     attach_pictorial_iso(model, solid_id, source, &mut drawing, extents[3], min_span);
+
+    if prof {
+        eprintln!(
+            "[draw-profile] tail (hole-table+section+gdt+pictorial): {:.1} ms",
+            t_tail.elapsed().as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "[draw-profile] TOTAL standard_drawing_auto: {:.1} ms",
+            t_all.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     Ok(drawing)
 }
