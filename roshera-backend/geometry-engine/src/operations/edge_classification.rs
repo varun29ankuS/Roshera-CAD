@@ -384,13 +384,44 @@ fn loop_tangent_sign_core(
     midpoint: &Point3,
     raw_tangent: &Vector3,
 ) -> OperationResult<f64> {
+    // Membership-derived sign is the primary source. When it cannot resolve
+    // (`n1 ∥ raw_tangent`, or the trim test is indeterminate at every scale —
+    // genuinely degenerate micro-geometry for a single-face caller), fall back
+    // to the stored loop flag.
+    match membership_tangent_sign(model, edge_id, face1_id, n1, midpoint, raw_tangent) {
+        Some(s) => Ok(s),
+        None => loop_flag_tangent_sign(model, edge_id, face1_id),
+    }
+}
+
+/// EDGE-LOCAL membership probe for the tangent handedness of ONE face —
+/// [`loop_tangent_sign_core`]'s core, WITHOUT the loop-flag fallback.
+///
+/// Returns `Some(+1)` if the `+d̂` in-surface direction (`d̂ = n1 × raw_tangent`)
+/// points into `face1`'s trimmed material, `Some(-1)` if `−d̂` does, and `None`
+/// when the probe cannot decide:
+/// * `n1 ∥ raw_tangent` — no usable in-surface perpendicular; or
+/// * the membership test is INDETERMINATE at every probe scale (both sides
+///   classify alike).
+///
+/// The indeterminate case is not merely degenerate micro-geometry: for a CURVED
+/// wall face (a bore cylinder) `d̂` is AXIAL, so both probe points sit exactly
+/// ON the wall, and the trimmed even-odd winding test cannot resolve the rim
+/// boundary — it reports both interior probes as OUTSIDE. Returning `None` lets
+/// the two-face classifier ([`classify_manifold_edge`]) recover from the OTHER
+/// (planar) face, whose radial probe is decisive, instead of silently trusting
+/// the stored loop flag (which a boolean tool face leaves inconsistent with its
+/// flipped outward normal — the concave-lie this whole path exists to avoid).
+fn membership_tangent_sign(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    n1: &Vector3,
+    midpoint: &Point3,
+    raw_tangent: &Vector3,
+) -> Option<f64> {
     // In-surface direction perpendicular to the edge.
-    let d_hat = match n1.cross(raw_tangent).normalize() {
-        Ok(v) => v,
-        // n1 ∥ raw_tangent (near-tangent normal / zero-length tangent): no
-        // usable in-surface perpendicular — defer to the loop flag.
-        Err(_) => return loop_flag_tangent_sign(model, edge_id, face1_id),
-    };
+    let d_hat = n1.cross(raw_tangent).normalize().ok()?;
 
     let scale = edge_probe_scale(model, edge_id);
     if scale > 0.0 {
@@ -405,17 +436,15 @@ fn loop_tangent_sign_core(
             let inside_minus = crate::queries::lmd::footpoint_in_face(model, face1_id, &p_minus);
             // `into_face = +d̂` ⇒ s = sign(d · into_face) = +1; `−d̂` ⇒ −1.
             if inside_plus && !inside_minus {
-                return Ok(1.0);
+                return Some(1.0);
             }
             if inside_minus && !inside_plus {
-                return Ok(-1.0);
+                return Some(-1.0);
             }
         }
     }
 
-    // Membership indeterminate at every scale (or no usable scale): genuinely
-    // degenerate micro-geometry only. Fall back to the loop flag.
-    loop_flag_tangent_sign(model, edge_id, face1_id)
+    None
 }
 
 /// Two-face dihedral classification. The convexity-sign convention
@@ -441,26 +470,70 @@ fn classify_manifold_edge(
     let face1_normal: Vector3 = get_face_oriented_normal(model, face1_id, &edge_midpoint)?;
     let face2_normal: Vector3 = get_face_oriented_normal(model, face2_id, &edge_midpoint)?;
 
-    // Fix A: derive the edge-tangent handedness from face1's outward normal +
-    // interior geometry, NOT its stored loop-winding flag (which boolean
-    // Difference can leave inconsistent with the flipped normal on
-    // tool-derived faces, mis-signing concave re-entrant edges as convex).
-    // If geometry can't yield a handedness (degenerate edge/face), the helper
-    // falls back to the loop flag; a hard failure ⇒ soft manifold-undefined
-    // classification, matching the prior behaviour of a missing loop flag.
-    let edge_tangent =
-        match geometry_signed_edge_tangent(model, edge_id, face1_id, &face1_normal, &edge_midpoint)
-        {
-            Ok(t) => t,
-            Err(_) => {
-                return Ok(EdgeClassification {
-                    manifold_kind: ManifoldKind::Manifold,
-                    dihedral_angle: None,
-                    convexity: 0,
-                    sharpness: 1.0,
-                });
-            }
-        };
+    // Fix A: derive the edge-tangent handedness from the faces' outward normals
+    // + interior geometry, NOT the stored loop-winding flag (which boolean
+    // Difference can leave inconsistent with the flipped normal on tool-derived
+    // faces, mis-signing concave re-entrant edges as convex).
+    //
+    // ORDER-INDEPENDENCE (drill-order survivor fix): `find_adjacent_faces`
+    // returns the two faces in discovery order, so which one is `face1` is
+    // arbitrary — and a boolean that creates all tool blanks up front before
+    // differencing them can make the LAST-drilled bore present its CYLINDER wall
+    // as `face1`, where the axial membership probe is INDETERMINATE (both probes
+    // sit on the curved wall; the trimmed winding test cannot resolve the rim
+    // boundary). Trusting the loop flag there flips the whole bore's rims to a
+    // false concave. So derive the sign from whichever face's membership test
+    // RESOLVES: try `face1`; if indeterminate, try `face2` and NEGATE (a
+    // manifold edge is traversed in OPPOSITE senses by its two faces' CCW loops,
+    // so `face2`'s handedness is the negative of `face1`'s). Only if BOTH are
+    // indeterminate do we fall back to the loop flag. This makes the result a
+    // pure function of geometry AND independent of the discovery order.
+    let raw_tangent = match edge.tangent_at(0.5, &model.curves) {
+        Ok(t) => t,
+        Err(_) => {
+            return Ok(EdgeClassification {
+                manifold_kind: ManifoldKind::Manifold,
+                dihedral_angle: None,
+                convexity: 0,
+                sharpness: 1.0,
+            });
+        }
+    };
+    let sign = match membership_tangent_sign(
+        model,
+        edge_id,
+        face1_id,
+        &face1_normal,
+        &edge_midpoint,
+        &raw_tangent,
+    ) {
+        Some(s) => s,
+        None => match membership_tangent_sign(
+            model,
+            edge_id,
+            face2_id,
+            &face2_normal,
+            &edge_midpoint,
+            &raw_tangent,
+        ) {
+            Some(s2) => -s2,
+            // Neither face's membership resolved: genuinely degenerate
+            // micro-geometry. Last resort — the stored loop flag; a hard failure
+            // ⇒ soft manifold-undefined classification.
+            None => match loop_flag_tangent_sign(model, edge_id, face1_id) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Ok(EdgeClassification {
+                        manifold_kind: ManifoldKind::Manifold,
+                        dihedral_angle: None,
+                        convexity: 0,
+                        sharpness: 1.0,
+                    });
+                }
+            },
+        },
+    };
+    let edge_tangent = raw_tangent * sign;
 
     let tolerance = Tolerance::default();
     let dihedral = match robust_face_angle(&face1_normal, &face2_normal, &edge_tangent, &tolerance)
