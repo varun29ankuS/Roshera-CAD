@@ -26,9 +26,23 @@ function glyphFor(characteristic: string): string {
 }
 
 /**
+ * Disclose the resolved position DRF (origin + derivation) as a compact
+ * suffix — self-certifying: the true position is
+ * `origin + basic.x·x_axis + basic.y·y_axis`. Empty when the verdict carries
+ * no frame (every non-position characteristic).
+ */
+function frameSuffix(verdict: any): string {
+  const f = verdict.frame;
+  if (f == null || !Array.isArray(f.origin)) return "";
+  const o = f.origin.map((v: number) => Number(v.toFixed(4))).join(", ");
+  const deriv = f.derivation != null ? `; ${f.derivation}` : "";
+  return ` [DRF origin (${o})${deriv}]`;
+}
+
+/**
  * Render one verdict as a single compact line — token-diet format:
  *   ⊥ 0.05 A → IN SPEC (measured 0.031mm, residual 2e-4)
- *   ⌖ 0.10 A B → OUT OF SPEC (measured 0.142mm, residual 1e-5)
+ *   ⌖ 0.10 A B → OUT OF SPEC (measured 0.142mm, residual 1e-5) [DRF origin (…)]
  *   ⏥ 0.05 → NOT EVALUABLE: datum 'A' is dangling
  */
 function compactGdtVerdict(verdict: any): string {
@@ -45,13 +59,13 @@ function compactGdtVerdict(verdict: any): string {
     const meas = verdict.measured_label ?? (verdict.measured_mm != null ? `${verdict.measured_mm}mm` : null);
     const res = verdict.fit_residual_mm != null ? `, residual ${verdict.fit_residual_mm.toExponential(0)}` : "";
     const measStr = meas != null ? ` (measured ${meas}${res})` : "";
-    return `${prefix} → IN SPEC${measStr}`;
+    return `${prefix} → IN SPEC${measStr}${frameSuffix(verdict)}`;
   }
   if (conforms === "out_of_spec") {
     const meas = verdict.measured_label ?? (verdict.measured_mm != null ? `${verdict.measured_mm}mm` : null);
     const res = verdict.fit_residual_mm != null ? `, residual ${verdict.fit_residual_mm.toExponential(0)}` : "";
     const measStr = meas != null ? ` (measured ${meas}${res})` : "";
-    return `${prefix} → OUT OF SPEC${measStr}`;
+    return `${prefix} → OUT OF SPEC${measStr}${frameSuffix(verdict)}`;
   }
   // not_evaluable
   const reason = verdict.reason ?? "unknown reason";
@@ -203,11 +217,17 @@ export function registerGdtTools(server: McpServer): void {
       "verdict. Verdicts are exact measurements against the B-Rep — not " +
       "pixel estimates, not mesh approximations. The FCF is stored and " +
       "re-evaluated on every gdt_report call. " +
-      "Characteristics: flatness (⏥, no datum), perpendicularity (⊥, datum " +
-      "plane), parallelism (∥, datum plane), position (⌖, datum plane/axis + " +
+      "Characteristics: flatness (⏥, no datum), perpendicularity (⊥) and " +
+      "parallelism (∥) against a datum PLANE — target may be a planar face OR " +
+      "a cylindrical feature (its AXIS: ⊥ measures L·sinθ tilt over the bore " +
+      "length; ∥ measures the axis's departure from the plane), position (⌖, " +
       "basic dims required). " +
-      "Position requires basic: [x, y] mm relative to the DRF origin (datum " +
-      "intersection; single datum → datum plane origin + part-corner fallback). " +
+      "Position frames: single datum plane (part-corner origin), two datum " +
+      "planes A|B (A∩B line origin), or plane + center-axis |A|B| (the " +
+      "bolt-circle callout — origin = datum axis B ∩ datum plane A, basic " +
+      "[x, y] is Cartesian from that center). basic: [x, y] mm. Position " +
+      "verdicts DISCLOSE their resolved DRF (origin + derivation) so the " +
+      "convention is self-certifying. " +
       "datum_refs must already be designated via gdt_datum or the request is " +
       "refused (422). State is session-only: server restart clears annotations.",
     {

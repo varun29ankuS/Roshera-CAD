@@ -152,6 +152,33 @@ pub struct VerdictWire {
     pub reason: Option<String>,
     pub fit_residual_mm: Option<f64>,
     pub datum_statuses: Vec<DatumStatusWire>,
+    /// The resolved datum reference frame (origin + axes) a POSITION verdict
+    /// was measured in — disclosed so the basic-dimension convention is
+    /// self-certifying. `None` for every other characteristic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<ResolvedFrameWire>,
+}
+
+/// Wire shape for a disclosed position DRF.
+#[derive(Debug, Serialize)]
+pub struct ResolvedFrameWire {
+    pub origin: [f64; 3],
+    pub x_axis: [f64; 3],
+    pub y_axis: [f64; 3],
+    pub z_axis: [f64; 3],
+    pub derivation: String,
+}
+
+impl From<geometry_engine::gdt::ResolvedFrame> for ResolvedFrameWire {
+    fn from(f: geometry_engine::gdt::ResolvedFrame) -> Self {
+        ResolvedFrameWire {
+            origin: f.origin,
+            x_axis: f.x_axis,
+            y_axis: f.y_axis,
+            z_axis: f.z_axis,
+            derivation: f.derivation,
+        }
+    }
 }
 
 /// Wire shape for one datum resolution status in a verdict.
@@ -280,6 +307,7 @@ pub(crate) fn verdict_to_wire(
         reason,
         fit_residual_mm: verdict.fit_residual_mm,
         datum_statuses,
+        frame: verdict.frame.map(ResolvedFrameWire::from),
     }
 }
 
@@ -869,6 +897,7 @@ pub async fn get_gdt_handler(
                     },
                     fit_residual_mm: None,
                     datum_status,
+                    frame: None,
                 }
             };
             annotations.push(AnnotationWire {
@@ -1005,6 +1034,7 @@ mod tests {
             conforms: geometry_engine::gdt::Conforms::InSpec,
             fit_residual_mm: Some(1e-9),
             datum_status: Vec::new(),
+            frame: None,
         };
         let wire = verdict_to_wire(v, LengthUnit::Millimetre);
         assert_eq!(wire.conforms, "in_spec");
@@ -1023,6 +1053,7 @@ mod tests {
             conforms: geometry_engine::gdt::Conforms::InSpec,
             fit_residual_mm: None,
             datum_status: Vec::new(),
+            frame: None,
         };
         let wire = verdict_to_wire(v, LengthUnit::Inch);
         assert_eq!(wire.tolerance_label, "1.000in");
@@ -1041,6 +1072,7 @@ mod tests {
             },
             fit_residual_mm: None,
             datum_status: Vec::new(),
+            frame: None,
         };
         let wire = verdict_to_wire(v, LengthUnit::Millimetre);
         assert_eq!(wire.conforms, "not_evaluable");
@@ -1058,6 +1090,7 @@ mod tests {
             conforms: geometry_engine::gdt::Conforms::OutOfSpec,
             fit_residual_mm: None,
             datum_status: Vec::new(),
+            frame: None,
         };
         let wire = verdict_to_wire(v, LengthUnit::Millimetre);
         assert_eq!(wire.conforms, "out_of_spec");
@@ -1374,6 +1407,7 @@ mod tests {
                     },
                     fit_residual_mm: None,
                     datum_status: statuses,
+                    frame: None,
                 }
             }
             Annotation::Dimensional(_) => panic!("expected geometric annotation"),
@@ -1423,6 +1457,7 @@ mod tests {
                 reason: Some("dangling".to_string()),
                 fit_residual_mm: None,
                 datum_statuses: Vec::new(),
+                frame: None,
             },
             target_face_id: None,
             anchor_mm: None,

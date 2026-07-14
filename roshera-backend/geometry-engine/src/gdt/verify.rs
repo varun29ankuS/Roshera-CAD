@@ -293,6 +293,25 @@ fn part_corner_coordinate(model: &BRepModel, solid: SolidId, dir: &Vector3) -> O
         })
 }
 
+/// The world basis axis (X̂, Ŷ, or Ẑ) most orthogonal to `dir` — the one whose
+/// dot product with `dir` has the smallest magnitude. Used to seed the in-plane
+/// X′ direction of a plane+axis position frame with a repeatable world-aligned
+/// axis (the datum axis pins the origin but leaves the in-plane rotation free).
+/// Ties resolve to the earliest of X, Y, Z, which is deterministic.
+fn world_axis_most_orthogonal(dir: &Vector3) -> Vector3 {
+    let candidates = [Vector3::X, Vector3::Y, Vector3::Z];
+    let mut best = Vector3::X;
+    let mut best_abs = f64::INFINITY;
+    for c in candidates {
+        let a = c.dot(dir).abs();
+        if a < best_abs {
+            best_abs = a;
+            best = c;
+        }
+    }
+    best
+}
+
 /// Spread (max − min) of the points projected onto `dir`. Zero for an empty
 /// set (callers guard for sufficient points before measuring).
 fn projected_spread(pts: &[Point3], dir: &Vector3) -> f64 {
@@ -685,6 +704,33 @@ pub struct DatumStatus {
     pub resolution: DatumResolution,
 }
 
+/// The resolved datum reference frame a POSITION measurement was taken in.
+///
+/// Position basics are Cartesian distances in this frame from `origin` along
+/// `x_axis`/`y_axis`; the frame's construction depends on the datum kinds
+/// (see [`evaluate_position`]). Disclosing it makes the basic-dimension
+/// convention self-certifying: a consumer can reproduce the exact true
+/// position from `origin + basic.x·x_axis + basic.y·y_axis` without knowing
+/// the kernel's internal conventions. `None` for non-position verdicts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResolvedFrame {
+    /// The DRF origin in world millimetres (the point from which `basic` is
+    /// measured). For A|B (plane|axis) it is the datum axis ∩ datum plane; for
+    /// two planes it is the A∩B line completed by the part corner; for a single
+    /// plane it is the part corner in the datum plane.
+    pub origin: [f64; 3],
+    /// The in-plane X′ axis (unit) — the direction `basic[0]` runs along.
+    pub x_axis: [f64; 3],
+    /// The in-plane Y′ axis (unit) — the direction `basic[1]` runs along.
+    pub y_axis: [f64; 3],
+    /// The out-of-plane Z′ axis (unit) — the primary datum plane's outward
+    /// normal.
+    pub z_axis: [f64; 3],
+    /// Human-readable one-line description of how the frame was derived, e.g.
+    /// "origin = datum axis 'B' ∩ datum plane 'A'; X′ = world X projected into A".
+    pub derivation: String,
+}
+
 /// The full certified verdict of a datum-referenced GD&T evaluation.
 ///
 /// This is the heart of what makes the kernel's GD&T non-fabricatable: every
@@ -712,6 +758,11 @@ pub struct Verdict {
     /// Resolution status of every datum referenced by the FCF, in the order of
     /// `fcf.datum_refs`. Dangling datums block evaluation.
     pub datum_status: Vec<DatumStatus>,
+    /// The resolved datum reference frame for a POSITION verdict (origin +
+    /// axes), disclosed so the basic-dimension convention is self-certifying.
+    /// `None` for every other characteristic and for non-evaluable verdicts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<ResolvedFrame>,
 }
 
 impl Verdict {
@@ -723,6 +774,7 @@ impl Verdict {
             conforms: Conforms::not_evaluable(reason),
             fit_residual_mm: None,
             datum_status: Vec::new(),
+            frame: None,
         }
     }
 
@@ -739,6 +791,7 @@ impl Verdict {
             conforms: Conforms::not_evaluable(reason),
             fit_residual_mm: None,
             datum_status,
+            frame: None,
         }
     }
 
@@ -760,7 +813,14 @@ impl Verdict {
             },
             fit_residual_mm: Some(fit_residual_mm),
             datum_status,
+            frame: None,
         }
+    }
+
+    /// Attach a resolved-frame disclosure (position verdicts only).
+    fn with_frame(mut self, frame: ResolvedFrame) -> Self {
+        self.frame = Some(frame);
+        self
     }
 }
 
@@ -781,6 +841,7 @@ fn verdict_from_form(r: ConformanceResult) -> Verdict {
         conforms,
         fit_residual_mm: r.fit_residual,
         datum_status: Vec::new(),
+        frame: None,
     }
 }
 
@@ -1079,9 +1140,11 @@ struct OrientedTarget {
 ///   outward by the face orientation sign, as `resolve_datum` does), and the
 ///   spread points are analytic boundary samples (extremes of a linear
 ///   functional over a planar face lie on its boundary). Fit residual 0.0.
-/// * Cylindrical target: orientation of an AXIS is a different zone
-///   construction (a cylinder about the datum direction) — honest refusal in
-///   Task 2 rather than a meaningless plane fit through cylinder samples.
+/// * Cylindrical target: the EXACT axis is read from the Cylinder surface and
+///   the zone is swept over the feature's own axial length L (derived from the
+///   face's boundary edges, never the stored `height_limits`).
+///   Perpendicularity = L·√(1 − (a·n_d)²); parallelism = L·|a·n_d|. See the
+///   inline derivation at the cylinder branch below.
 /// * Freeform target: analytic parameter-grid samples, `fit_plane` for the
 ///   normal, RMS residual reported; the spread uses the on-surface grid so
 ///   the zone contains the true surface.
@@ -1189,14 +1252,57 @@ fn evaluate_orientation(
                 points,
                 fit_residual: 0.0,
             }
-        } else if surface.as_any().downcast_ref::<Cylinder>().is_some() {
-            return Verdict::not_evaluable_with_status(
-                name,
-                tol,
-                "orientation of a cylindrical feature's axis is not implemented in \
-                 Task 2 — the toleranced target must be a planar face",
-                datum_statuses,
-            );
+        } else if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+            // AXIS orientation of a cylindrical feature against a datum PLANE
+            // (ASME Y14.5 §9). This is the most common shop callout: bore axis
+            // ⊥ datum face A (perpendicularity), or axis ∥ datum face
+            // (parallelism). The zone is a cylinder Ø t about the true
+            // orientation; the measured value is the axis's total run-out over
+            // the feature's own axial length L.
+            //
+            // Let `a` = the exact cylinder axis (unit) and `n_d` = the datum
+            // plane's unit normal. With `c = |a·n_d|` (magnitude handles an
+            // axis anti-parallel to the normal identically to parallel):
+            //   * Perpendicularity (axis ⊥ plane ⇔ axis ∥ n_d): the tilt from
+            //     square is θ = angle(a, n_d), so sin θ = √(1 − c²) and the
+            //     endpoint run-out over L is  measured = L·sin θ.
+            //   * Parallelism (axis ∥ plane): the axis's departure from the
+            //     plane is φ = angle between the axis and the plane, with
+            //     sin φ = c, so  measured = L·sin φ = L·c.
+            // A perfectly square bore (perp) or a perfectly in-plane axis (par)
+            // measures exactly 0.
+            //
+            // L is the feature's OWN axial extent, taken from the cylindrical
+            // face's boundary edges projected onto the axis — NOT the stored
+            // `height_limits` (that metadata has silently gone stale twice).
+            let axis = cyl.axis;
+            let boundary = face_boundary_points(model, face, BOUNDARY_EDGE_SAMPLES);
+            if boundary.len() < 2 {
+                return Verdict::not_evaluable_with_status(
+                    name,
+                    tol,
+                    "insufficient boundary samples to measure the cylindrical \
+                     feature's axial length",
+                    datum_statuses,
+                );
+            }
+            let l = projected_spread(&boundary, &axis);
+            if l <= 0.0 {
+                return Verdict::not_evaluable_with_status(
+                    name,
+                    tol,
+                    "the cylindrical feature has zero axial extent — no length \
+                     over which to sweep the orientation zone",
+                    datum_statuses,
+                );
+            }
+            let c = axis.dot(&datum_normal).abs().min(1.0);
+            let measured = match kind {
+                OrientationKind::Perpendicularity => l * (1.0 - c * c).max(0.0).sqrt(),
+                OrientationKind::Parallelism => l * c,
+            };
+            // Exact analytic axis read — no fit performed.
+            return Verdict::measured(name, tol, measured, 0.0, datum_statuses);
         } else {
             // Freeform fallback: on-surface analytic parameter grid + plane fit.
             let points = analytic_surface_grid(model, face, FORM_GRID_SAMPLES);
@@ -1324,10 +1430,31 @@ fn evaluate_orientation(
 /// Parallel datum planes cannot pin X′ → honest refusal naming the
 /// degeneracy.
 ///
+/// **Plane primary + Axis secondary (A|B — the bolt-circle callout):**
+/// ```text
+///   Z′ = n_A                                  (outward datum-A normal)
+///   origin = datum axis B ∩ datum plane A     (B pierces A at one point):
+///          t   = (o_A·n_A − o_B·n_A) / (d_B·n_A),   requires d_B·n_A ≠ 0
+///          O   = o_B + t·d_B                  (the pierce point, in plane A)
+///   X′ = the world basis axis MOST ORTHOGONAL to Z′, projected into plane A
+///        (a repeatable in-plane seed — the datum axis pins the origin but
+///        leaves the in-plane rotation free in an A|B frame);   Y′ = Z′ × X′
+///   x₀ = O·X′,  y₀ = O·Y′                      (both origin coords come from
+///                                              the pierce point — no part
+///                                              corner needed)
+/// ```
+/// A datum axis parallel to plane A never pierces it → honest refusal. Here
+/// `basic [x, y]` is Cartesian: distance along (X′, Y′) from the center-datum
+/// axis — exactly a bolt-hole's (x, y) from the center bore on the drawing.
+///
 /// **Single Plane datum (A):** X′/Y′ take the documented world-axis seed —
 /// `X′` = the world X axis projected into the datum plane (world Y seed when
 /// `|n_A·X̂| > 0.9`), `Y′ = Z′ × X′` — and BOTH in-plane origin coordinates
 /// come from the part corner: `x₀ = min v·X′`, `y₀ = min v·Y′`.
+///
+/// Every position verdict discloses its resolved frame (origin + axes +
+/// derivation text) in [`Verdict::frame`], so the basic-dimension convention
+/// is reproducible without knowing these internals.
 ///
 /// **The `basic [x, y]` meaning** (also documented on
 /// [`FeatureControlFrame::basic`]): millimetres from (x₀, y₀) along (X′, Y′).
@@ -1412,8 +1539,11 @@ fn evaluate_position(
     // ---- DRF frame (see the doc comment derivation) ------------------------
     let z_prime = primary_normal;
 
-    let (x_prime, y_prime, x0, y0) = if fcf.datum_refs.len() >= 2 {
-        // Secondary datum path: X′ from datum B, x₀ from the A∩B line.
+    let (x_prime, y_prime, x0, y0, frame_derivation) = if fcf.datum_refs.len() >= 2 {
+        // Secondary datum path. The secondary datum may be a PLANE (A|B two-plane
+        // frame) or an AXIS (A|B plane+axis frame — the canonical bolt-circle
+        // callout). Both seat Z′ on the primary plane; they differ in how X′ and
+        // the origin are pinned.
         let secondary_ref = &fcf.datum_refs[1];
         let secondary_datum = match drf.datum_by_label(&secondary_ref.label) {
             Some(d) => d,
@@ -1427,20 +1557,7 @@ fn evaluate_position(
             }
         };
 
-        if secondary_datum.kind != DatumKind::Plane {
-            return Verdict::not_evaluable_with_status(
-                name,
-                tol,
-                format!(
-                    "secondary datum '{}' is an Axis datum; position with mixed-kind \
-                     datum pairs is not implemented in Task 2",
-                    secondary_ref.label
-                ),
-                datum_statuses,
-            );
-        }
-
-        let Some((secondary_origin, secondary_normal)) =
+        let Some((secondary_origin, secondary_dir)) =
             live_datum_geometry(&datum_statuses, &secondary_ref.label)
         else {
             return Verdict::not_evaluable_with_status(
@@ -1451,72 +1568,161 @@ fn evaluate_position(
             );
         };
 
-        // X′ = the secondary datum's INWARD normal projected into the primary
-        // datum plane, so basics measure positive INTO the material.
-        let inward = -secondary_normal;
-        let x_raw = inward - z_prime * inward.dot(&z_prime);
-        let x_prime = match x_raw.normalize() {
-            Ok(v) => v,
-            Err(_) => {
+        match secondary_datum.kind {
+            DatumKind::Plane => {
+                // Two-plane frame: X′ = datum B's INWARD normal projected into
+                // the primary datum plane, so basics measure positive INTO the
+                // material. `secondary_dir` is B's outward normal.
+                let inward = -secondary_dir;
+                let x_raw = inward - z_prime * inward.dot(&z_prime);
+                let x_prime = match x_raw.normalize() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Verdict::not_evaluable_with_status(
+                            name,
+                            tol,
+                            format!(
+                                "secondary datum '{}' is parallel to primary datum '{}' — \
+                                 parallel planes cannot pin the X′ direction; choose a \
+                                 non-parallel secondary datum",
+                                secondary_ref.label, primary_ref.label
+                            ),
+                            datum_statuses,
+                        );
+                    }
+                };
+                let y_prime = match z_prime.cross(&x_prime).normalize() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Verdict::not_evaluable_with_status(
+                            name,
+                            tol,
+                            "degenerate DRF: Z′ × X′ is not a valid direction",
+                            datum_statuses,
+                        );
+                    }
+                };
+
+                // x₀ from the A∩B intersection line (plane-equation solve;
+                // invariant under surface re-parameterisation).
+                let d_a = primary_origin.dot(&primary_normal);
+                let d_b = secondary_origin.dot(&secondary_dir);
+                let c = primary_normal.dot(&secondary_dir);
+                let denom = 1.0 - c * c;
+                if denom.abs() < 1e-12 {
+                    return Verdict::not_evaluable_with_status(
+                        name,
+                        tol,
+                        format!(
+                            "datum planes '{}' and '{}' are parallel — no intersection \
+                             line to anchor the DRF origin",
+                            primary_ref.label, secondary_ref.label
+                        ),
+                        datum_statuses,
+                    );
+                }
+                let a = (d_a - c * d_b) / denom;
+                let b = (d_b - c * d_a) / denom;
+                let p0 = primary_normal * a + secondary_dir * b;
+                let x0 = p0.dot(&x_prime);
+
+                // y₀ = part-corner completion of the Y′ translation A|B leaves free.
+                let Some(y0) = part_corner_coordinate(model, solid, &y_prime) else {
+                    return Verdict::not_evaluable_with_status(
+                        name,
+                        tol,
+                        "the solid has no B-Rep vertices to complete the DRF origin from",
+                        datum_statuses,
+                    );
+                };
+
+                let derivation = format!(
+                    "origin = A∩B line '{}'∩'{}' for X′, part corner for Y′; \
+                     X′ = datum '{}' inward normal in plane '{}'; Z′ = datum '{}' normal",
+                    primary_ref.label,
+                    secondary_ref.label,
+                    secondary_ref.label,
+                    primary_ref.label,
+                    primary_ref.label
+                );
+                (x_prime, y_prime, x0, y0, derivation)
+            }
+
+            DatumKind::Axis => {
+                // Plane + axis frame (A|B): the DRF origin is where the datum
+                // axis B pierces the primary datum plane A; the in-plane axes
+                // come from the world frame. `secondary_dir` is B's axis (unit),
+                // `secondary_origin` a point on it.
+                let denom = secondary_dir.dot(&z_prime);
+                if denom.abs() < 1e-9 {
+                    return Verdict::not_evaluable_with_status(
+                        name,
+                        tol,
+                        format!(
+                            "datum axis '{}' is parallel to datum plane '{}' — the axis \
+                             never pierces the plane, so the DRF origin is undefined; \
+                             choose an axis that crosses the datum plane",
+                            secondary_ref.label, primary_ref.label
+                        ),
+                        datum_statuses,
+                    );
+                }
+                // origin = B ∩ A: solve (axis_origin + t·axis − p_A)·n_A = 0.
+                let d_a = primary_origin.dot(&z_prime);
+                let t = (d_a - secondary_origin.dot(&z_prime)) / denom;
+                let origin_pt = secondary_origin + secondary_dir * t;
+
+                // X′ = the world axis MOST ORTHOGONAL to Z′, projected into
+                // plane A (documented convention — a repeatable in-plane seed
+                // when the frame carries no rotational lock other than the axis).
+                let world = world_axis_most_orthogonal(&z_prime);
+                let x_raw = world - z_prime * world.dot(&z_prime);
+                let x_prime = match x_raw.normalize() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Verdict::not_evaluable_with_status(
+                            name,
+                            tol,
+                            "could not build an in-plane X′ axis from the datum normal",
+                            datum_statuses,
+                        );
+                    }
+                };
+                let y_prime = match z_prime.cross(&x_prime).normalize() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Verdict::not_evaluable_with_status(
+                            name,
+                            tol,
+                            "degenerate DRF: Z′ × X′ is not a valid direction",
+                            datum_statuses,
+                        );
+                    }
+                };
+                let x0 = origin_pt.dot(&x_prime);
+                let y0 = origin_pt.dot(&y_prime);
+
+                let derivation = format!(
+                    "origin = datum axis '{}' ∩ datum plane '{}'; X′ = world axis ⊥ Z′ \
+                     projected into '{}'; Y′ = Z′ × X′; Z′ = datum '{}' normal",
+                    secondary_ref.label, primary_ref.label, primary_ref.label, primary_ref.label
+                );
+                (x_prime, y_prime, x0, y0, derivation)
+            }
+
+            DatumKind::Point => {
                 return Verdict::not_evaluable_with_status(
                     name,
                     tol,
                     format!(
-                        "secondary datum '{}' is parallel to primary datum '{}' — \
-                         parallel planes cannot pin the X′ direction; choose a \
-                         non-parallel secondary datum",
-                        secondary_ref.label, primary_ref.label
+                        "secondary datum '{}' is a Point datum; position frames with a \
+                         point secondary are not implemented in Task 2",
+                        secondary_ref.label
                     ),
                     datum_statuses,
                 );
             }
-        };
-        let y_prime = match z_prime.cross(&x_prime).normalize() {
-            Ok(v) => v,
-            Err(_) => {
-                return Verdict::not_evaluable_with_status(
-                    name,
-                    tol,
-                    "degenerate DRF: Z′ × X′ is not a valid direction",
-                    datum_statuses,
-                );
-            }
-        };
-
-        // x₀ from the A∩B intersection line (plane-equation solve; invariant
-        // under surface re-parameterisation).
-        let d_a = primary_origin.dot(&primary_normal);
-        let d_b = secondary_origin.dot(&secondary_normal);
-        let c = primary_normal.dot(&secondary_normal);
-        let denom = 1.0 - c * c;
-        if denom.abs() < 1e-12 {
-            return Verdict::not_evaluable_with_status(
-                name,
-                tol,
-                format!(
-                    "datum planes '{}' and '{}' are parallel — no intersection line \
-                     to anchor the DRF origin",
-                    primary_ref.label, secondary_ref.label
-                ),
-                datum_statuses,
-            );
         }
-        let a = (d_a - c * d_b) / denom;
-        let b = (d_b - c * d_a) / denom;
-        let p0 = primary_normal * a + secondary_normal * b;
-        let x0 = p0.dot(&x_prime);
-
-        // y₀ = part-corner completion of the Y′ translation A|B leaves free.
-        let Some(y0) = part_corner_coordinate(model, solid, &y_prime) else {
-            return Verdict::not_evaluable_with_status(
-                name,
-                tol,
-                "the solid has no B-Rep vertices to complete the DRF origin from",
-                datum_statuses,
-            );
-        };
-
-        (x_prime, y_prime, x0, y0)
     } else {
         // Single-datum path: documented world-axis seed + part-corner origin.
         let seed = if z_prime.dot(&Vector3::X).abs() < 0.9 {
@@ -1563,7 +1769,12 @@ fn evaluate_position(
                 datum_statuses,
             );
         };
-        (x_prime, y_prime, x0, y0)
+        let derivation = format!(
+            "origin = part corner in datum plane '{}'; X′ = world seed projected into \
+             '{}'; Y′ = Z′ × X′; Z′ = datum '{}' normal",
+            primary_ref.label, primary_ref.label, primary_ref.label
+        );
+        (x_prime, y_prime, x0, y0, derivation)
     };
 
     // ---- Exact analytic feature read ---------------------------------------
@@ -1617,9 +1828,22 @@ fn evaluate_position(
     // zero corner → Δ = (0.04, 0.03) → measured = 2·0.05 = 0.100000 mm.
     let measured = 2.0 * (delta_x * delta_x + delta_y * delta_y).sqrt();
 
+    // Disclose the resolved DRF (origin + axes) so the basic-dimension
+    // convention is self-certifying. The origin is the point in plane A with
+    // in-plane coordinates (x0, y0): reconstruct it from the frame axes.
+    let d_a_plane = primary_origin.dot(&z_prime);
+    let origin_pt = x_prime * x0 + y_prime * y0 + z_prime * d_a_plane;
+    let frame = ResolvedFrame {
+        origin: [origin_pt.x, origin_pt.y, origin_pt.z],
+        x_axis: [x_prime.x, x_prime.y, x_prime.z],
+        y_axis: [y_prime.x, y_prime.y, y_prime.z],
+        z_axis: [z_prime.x, z_prime.y, z_prime.z],
+        derivation: frame_derivation,
+    };
+
     // Exact analytic read — no fit was performed, so the measurement carries
     // zero fitting uncertainty.
-    Verdict::measured(name, tol, measured, 0.0, datum_statuses)
+    Verdict::measured(name, tol, measured, 0.0, datum_statuses).with_frame(frame)
 }
 
 #[cfg(test)]

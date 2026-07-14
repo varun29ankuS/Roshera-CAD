@@ -83,6 +83,23 @@ fn cylinder_face(m: &BRepModel, solid: SolidId) -> Option<FaceId> {
     })
 }
 
+/// Find the cylindrical face of `solid` whose axis passes near (cx, cy) in the
+/// XY plane — distinguishes multiple bores drilled into one flange.
+fn cylinder_face_near(m: &BRepModel, solid: SolidId, cx: f64, cy: f64) -> Option<FaceId> {
+    faces_of(m, solid).into_iter().find(|&fid| {
+        let Some(f) = m.faces.get(fid) else {
+            return false;
+        };
+        let Some(s) = m.surfaces.get(f.surface_id) else {
+            return false;
+        };
+        s.as_any()
+            .downcast_ref::<Cylinder>()
+            .map(|c| (c.origin.x - cx).abs() < 0.5 && (c.origin.y - cy).abs() < 0.5)
+            .unwrap_or(false)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // ORACLE 1: Plate face designated "A" → Plane datum, resolves Live with the
 //           correct outward normal.
@@ -1419,12 +1436,16 @@ fn t2_face_not_in_solid_is_not_evaluable() {
 }
 
 // ---------------------------------------------------------------------------
-// T2-ORIENT-CYL: orientation of a CYLINDRICAL feature (its axis) is not a
-// Task-2 measurement — the kernel must refuse honestly rather than fit a
-// meaningless plane through cylinder samples and report a fabricated width.
+// T2-AXPERP-STRAIGHT: axis-perpendicularity of a bore whose axis is EXACTLY
+// perpendicular to datum plane A (axis ∥ n_A) evaluates to exactly 0.
+//
+// This is the canonical shop callout (bore axis ⊥ face A). The measured value
+// is the axis's total run-out over the feature length L:
+//     θ = angle(axis, n_A),   measured = L·sin θ.
+// A perfectly square bore has axis ∥ n_A → sin θ = 0 → measured 0 exactly.
 // ---------------------------------------------------------------------------
 #[test]
-fn t2_orientation_on_cylindrical_face_refused() {
+fn t2_axis_perp_straight_pin_is_zero() {
     let mut m = BRepModel::new();
     m.set_event_key(Some("orient-cyl".into()));
     let solid = sid(TopologyBuilder::new(&mut m)
@@ -1444,14 +1465,294 @@ fn t2_orientation_on_cylindrical_face_refused() {
     let fcf = FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.1, "A");
     let verdict = evaluate(&m, pin, lat, &Annotation::Geometric(fcf), &drf);
 
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "a bore square to datum A must be InSpec; got {:?}",
+        verdict.conforms
+    );
+    let measured = verdict
+        .measured_mm
+        .expect("axis-perpendicularity must produce a measured value");
+    assert!(
+        measured < 1e-9,
+        "axis-perpendicularity of a square bore must be exactly 0; got {measured:.3e}"
+    );
+    assert_eq!(verdict.datum_status.len(), 1);
+    assert_eq!(verdict.datum_status[0].label, "A");
+}
+
+// ---------------------------------------------------------------------------
+// T2-AXPERP-TILT: axis-perpendicularity of a bore tilted by a known angle.
+//
+// Geometry: a pin (r=4, h=20 along Z), rotated about Y by α = atan(0.001) so
+// its axis becomes (sin α, 0, cos α). Datum A = a plate's +Z top face, n_A = Z.
+//   axis·n_A = cos α  →  θ = α  →  measured = L·sin α = 20·sin(atan 0.001).
+// L is the feature's OWN axial extent, derived from the cylindrical face's
+// boundary edges (not the stored height_limits).
+//
+// Conformance: 20·sin α ≈ 0.02 mm → InSpec at 0.05, OutOfSpec at 0.01.
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_axis_perp_tilted_bore_measures_exact() {
+    let alpha = 0.001_f64.atan(); // tan α = 0.001 exactly
+    let height = 20.0_f64;
+
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("axperp-plate".into()));
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(Some("axperp-pin".into()));
+    let pin = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -10.0), Vector3::Z, 4.0, height)
+        .expect("pin"));
+    m.set_event_key(None);
+
+    // Tilt the pin a fraction of a degree about Y: axis → (sin α, 0, cos α).
+    transform_solid(
+        &mut m,
+        pin,
+        Matrix4::rotation_y(alpha),
+        TransformOptions::default(),
+    )
+    .expect("rotate pin");
+
+    let top = planar_face_at(&m, plate, 2, 5.0).expect("+Z face");
+    designate_datum(&mut m, plate, "A", top).expect("designate A");
+    let drf = m.drf.get(&plate).expect("DRF").clone();
+
+    let lat = cylinder_face(&m, pin).expect("pin lateral face");
+
+    let fcf_in =
+        FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.05, "A");
+    let verdict = evaluate(&m, pin, lat, &Annotation::Geometric(fcf_in), &drf);
+    let measured = verdict
+        .measured_mm
+        .expect("tilted bore must produce a measured value");
+
+    // Hand-derived exact truth: L·sin α = 20·sin(atan 0.001).
+    let expected = height * alpha.sin();
+    assert!(
+        (measured - expected).abs() < 1e-6,
+        "axis-perpendicularity: expected {expected:.9} mm, got {measured:.9} mm"
+    );
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "{expected:.6} mm must be InSpec for zone 0.05 mm; got {:?}",
+        verdict.conforms
+    );
+
+    let fcf_out =
+        FeatureControlFrame::orientation(GeometricCharacteristic::Perpendicularity, 0.01, "A");
+    let verdict_out = evaluate(&m, pin, lat, &Annotation::Geometric(fcf_out), &drf);
+    assert!(
+        matches!(verdict_out.conforms, Conforms::OutOfSpec),
+        "{expected:.6} mm must be OutOfSpec for zone 0.01 mm; got {:?}",
+        verdict_out.conforms
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-AXPAR: parallelism of a bore axis to a datum PLANE (axis ∥ plane).
+//
+// Datum A = a plate's +X side face (n_A = +X). Pin axis = +Z, which lies IN
+// the datum plane (axis·n_A = 0) → deviation = L·|axis·n_A| = 0 exactly.
+// This proves the parallelism-of-axis path is wired and drops out of the same
+// analytic axis read.
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_axis_parallel_to_plane_is_zero() {
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("axpar-plate".into()));
+    let plate = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(50.0, 30.0, 10.0)
+        .expect("plate"));
+    m.set_event_key(Some("axpar-pin".into()));
+    let pin = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -10.0), Vector3::Z, 4.0, 20.0)
+        .expect("pin"));
+    m.set_event_key(None);
+
+    let px = planar_face_at(&m, plate, 0, 25.0).expect("+X side face");
+    designate_datum(&mut m, plate, "A", px).expect("designate A on +X face");
+    let drf = m.drf.get(&plate).expect("DRF").clone();
+
+    let lat = cylinder_face(&m, pin).expect("pin lateral face");
+    let fcf = FeatureControlFrame::orientation(GeometricCharacteristic::Parallelism, 0.1, "A");
+    let verdict = evaluate(&m, pin, lat, &Annotation::Geometric(fcf), &drf);
+
+    assert!(
+        matches!(verdict.conforms, Conforms::InSpec),
+        "axis in the datum plane must be InSpec for parallelism; got {:?}",
+        verdict.conforms
+    );
+    let measured = verdict.measured_mm.expect("parallelism must be measured");
+    assert!(
+        measured < 1e-9,
+        "parallelism of an axis lying in the datum plane must be exactly 0; got {measured:.3e}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2-POS-AXIS-ONLY: position against an AXIS datum as PRIMARY is still not a
+// Task-2 measurement (no plane to seat Z′) — must remain NotEvaluable.
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_position_axis_primary_datum_refused() {
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("axprim".into()));
+    let solid = sid(TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 8.0, 20.0)
+        .expect("boss"));
+    m.set_event_key(None);
+
+    let lat = cylinder_face(&m, solid).expect("lateral face");
+    designate_datum(&mut m, solid, "A", lat).expect("designate axis datum A");
+    let drf = m.drf.get(&solid).expect("DRF").clone();
+
+    let fcf = FeatureControlFrame::position(0.1, ["A"], [0.0, 0.0]);
+    let verdict = evaluate(&m, solid, lat, &Annotation::Geometric(fcf), &drf);
+
     match &verdict.conforms {
         Conforms::NotEvaluable { reason } => {
             assert!(
-                reason.to_lowercase().contains("planar") || reason.to_lowercase().contains("axis"),
-                "reason must explain the planar-target scope; got: {reason}"
+                reason.to_lowercase().contains("axis"),
+                "reason must name the axis-primary limitation; got: {reason}"
             );
         }
-        other => panic!("expected NotEvaluable for cylindrical orientation target, got {other:?}"),
+        other => panic!("expected NotEvaluable for axis-primary position, got {other:?}"),
     }
     assert!(verdict.measured_mm.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// T2-POS-AB-MIXED: the canonical bolt-circle callout — position of a bolt hole
+// against |A|B| where A = a plane and B = the CENTER-BORE AXIS.
+//
+// Geometry (all hand-derived):
+//   Plate 80 × 60 × 10 translated to span [0,80] × [0,60] × [0,10].
+//   Datum A = top face (z = 10, outward +Z)  → primary plane: Z′ = +Z.
+//   Center bore r=5 at (40, 30) through Z     → datum B (AXIS).
+//   Bolt hole r=3 at (61, 30) through Z       → target, basic [21, 0] from B.
+//
+// Mixed-frame derivation (disclosed by the kernel):
+//   Z′ = n_A = +Z.
+//   Origin = datum-axis B ∩ plane A = (40, 30, 10).
+//   X′ = the world axis most orthogonal to Z′ (world X here), projected into
+//        plane A → +X.   Y′ = Z′ × X′ = +Y.
+//   `basic [x, y]` is Cartesian in (X′, Y′) from the origin → true position
+//        (40+21, 30+0, 10) = (61, 30, 10).
+//   Bolt axis ∩ plane A = (61, 30, 10) → Δ = 0 → measured 0 exactly.
+//   Misdrilled bolt at (61.1, 30): Δ = (0.1, 0) → measured 2·0.1 = 0.200000 mm.
+//
+// Conformance for the misdrill: OutOfSpec at 0.1, InSpec at 0.25.
+// ---------------------------------------------------------------------------
+#[test]
+fn t2_pos_plane_axis_mixed_drf_measures_exact() {
+    // Helper: build a drilled flange with the bolt hole at (bolt_x, 30).
+    fn build_flange(bolt_x: f64) -> (BRepModel, SolidId, DatumReferenceFrame) {
+        let mut m = BRepModel::new();
+        m.set_event_key(Some("flange".into()));
+        let plate = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(80.0, 60.0, 10.0)
+            .expect("plate"));
+        m.set_event_key(None);
+        transform_solid(
+            &mut m,
+            plate,
+            Matrix4::translation(40.0, 30.0, 5.0),
+            TransformOptions::default(),
+        )
+        .expect("translate plate to [0,80]×[0,60]×[0,10]");
+
+        // Center bore at (40, 30) → datum B (axis).
+        m.set_event_key(Some("center-bore".into()));
+        let center = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(40.0, 30.0, -1.0), Vector3::Z, 5.0, 12.0)
+            .expect("center bore"));
+        m.set_event_key(None);
+        let with_center = boolean_operation(
+            &mut m,
+            plate,
+            center,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("drill center bore");
+
+        // Bolt hole at (bolt_x, 30) → target.
+        m.set_event_key(Some("bolt-hole".into()));
+        let bolt = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(bolt_x, 30.0, -1.0), Vector3::Z, 3.0, 12.0)
+            .expect("bolt hole"));
+        m.set_event_key(None);
+        let drilled = boolean_operation(
+            &mut m,
+            with_center,
+            bolt,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("drill bolt hole");
+
+        let top = planar_face_at(&m, drilled, 2, 10.0).expect("+Z face at z=10");
+        let center_bore = cylinder_face_near(&m, drilled, 40.0, 30.0).expect("center bore face");
+        designate_datum(&mut m, drilled, "A", top).expect("designate A (plane)");
+        designate_datum(&mut m, drilled, "B", center_bore).expect("designate B (axis)");
+        let drf = m.drf.get(&drilled).expect("DRF").clone();
+        (m, drilled, drf)
+    }
+
+    // ---- Exact-on-position bolt hole at (61, 30): measured 0 ----------------
+    let (m0, solid0, drf0) = build_flange(61.0);
+    let bolt0 = cylinder_face_near(&m0, solid0, 61.0, 30.0).expect("bolt hole face");
+    let fcf0 = FeatureControlFrame::position(0.1, ["A", "B"], [21.0, 0.0]);
+    let v0 = evaluate(&m0, solid0, bolt0, &Annotation::Geometric(fcf0), &drf0);
+    let measured0 = v0
+        .measured_mm
+        .expect("mixed |A|B| must produce a measured value");
+    assert!(
+        measured0 < 1e-9,
+        "bolt drilled exactly at basic [21,0] must measure 0; got {measured0:.3e}"
+    );
+    assert!(
+        matches!(v0.conforms, Conforms::InSpec),
+        "exact bolt must be InSpec; got {:?}",
+        v0.conforms
+    );
+    // Both datums resolved Live, in FCF order.
+    assert_eq!(v0.datum_status.len(), 2);
+    assert_eq!(v0.datum_status[0].label, "A");
+    assert_eq!(v0.datum_status[1].label, "B");
+    assert!(v0
+        .datum_status
+        .iter()
+        .all(|s| matches!(s.resolution, DatumResolution::Live { .. })));
+
+    // ---- Misdrilled bolt at (61.1, 30): measured 0.200 mm diametral --------
+    let (m1, solid1, drf1) = build_flange(61.1);
+    let bolt1 = cylinder_face_near(&m1, solid1, 61.1, 30.0).expect("misdrilled bolt hole face");
+
+    let fcf_out = FeatureControlFrame::position(0.1, ["A", "B"], [21.0, 0.0]);
+    let v_out = evaluate(&m1, solid1, bolt1, &Annotation::Geometric(fcf_out), &drf1);
+    let measured1 = v_out
+        .measured_mm
+        .expect("misdrill must produce a measured value");
+    assert!(
+        (measured1 - 0.2).abs() < 1e-6,
+        "misdrill +0.1mm x → 0.200000 mm diametral, got {measured1:.9} mm"
+    );
+    assert!(
+        matches!(v_out.conforms, Conforms::OutOfSpec),
+        "0.200 mm must be OutOfSpec for zone 0.1 mm; got {:?}",
+        v_out.conforms
+    );
+
+    let fcf_in = FeatureControlFrame::position(0.25, ["A", "B"], [21.0, 0.0]);
+    let v_in = evaluate(&m1, solid1, bolt1, &Annotation::Geometric(fcf_in), &drf1);
+    assert!(
+        matches!(v_in.conforms, Conforms::InSpec),
+        "0.200 mm must be InSpec for zone 0.25 mm; got {:?}",
+        v_in.conforms
+    );
 }
