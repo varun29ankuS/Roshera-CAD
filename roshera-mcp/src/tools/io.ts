@@ -2,7 +2,6 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFile } from "node:fs/promises";
 import {
   api,
   ok,
@@ -33,15 +32,19 @@ export function registerIoTools(server: McpServer) {
     },
     async ({ path, content, name }) => {
       try {
-        let text = content;
-        if (!text && path) {
-          text = await readFile(path, "utf8");
-        }
-        if (!text) {
+        if (!content && !path) {
           return fail(new Error("provide either `path` or `content`"));
         }
+        // #34: a `path` is sent through as-is and read by the SERVER, not
+        // this process — a 16-tooth gear STEP export is already 3.3MB, and
+        // real CAD STEP files run 10-500MB. Reading it here and re-POSTing
+        // it as inline JSON `content` would (a) double the bytes crossing
+        // the wire for no reason and (b) still hit the same body-size wall
+        // remotely. `content` stays for the genuinely-remote case (the
+        // caller doesn't have server-local filesystem access).
         const r = await api("POST", "/api/geometry/import_step", {
-          content: text,
+          path: path ?? null,
+          content: content ?? null,
           name: name ?? null,
         });
         const objects = Array.isArray(r.objects) ? r.objects : [];

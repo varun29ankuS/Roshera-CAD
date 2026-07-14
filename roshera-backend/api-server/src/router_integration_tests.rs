@@ -4221,3 +4221,124 @@ async fn export_unsupported_format_returns_nonempty_error_body() {
         "F2(a): unsupported-format 501 must name the format/reason; got {text:?}"
     );
 }
+
+// =====================================================================
+// Tests — import_step body-limit + server-side `path` read (#34)
+// =====================================================================
+
+/// Build a POST `/api/geometry/import_step` request with the given JSON
+/// payload.
+fn import_step_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/import_step")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+/// #34 RED-first: Axum applies an implicit 2MB `DefaultBodyLimit` to every
+/// route unless it is overridden; before this fix `/api/geometry/import_step`
+/// carried no override, so any inline `content` import over ~2MB was
+/// rejected with a bare 413 before the handler (or the STEP parser) ever
+/// saw the request — a real 16-tooth gear STEP export is already 3.3MB.
+///
+/// This posts a >2MB JSON body and asserts the request is NOT rejected at
+/// the body-limit layer. The `content` here is deliberately NOT valid STEP
+/// text — the body-size gate is what's under test, not the parser — so a
+/// correct outcome is "reaches the handler and fails STEP parsing" (400
+/// `invalid_parameter`), not 413. Run this test on the pre-fix router (no
+/// `.route_layer(DefaultBodyLimit::max(..))` on the route) and it fails
+/// with `status == 413`; the route-level override added for #34 is what
+/// makes it pass.
+#[tokio::test]
+async fn import_step_accepts_body_over_default_2mb_limit() {
+    let state = make_test_state().await;
+    // > 2MB of content — well past axum's implicit 2MB default, comfortably
+    // under the route's raised 256MB ceiling (see `main.rs` route table).
+    let big_content = "A".repeat(3_000_000);
+    let request = import_step_post(json!({ "content": big_content }));
+    let (status, body) = dispatch_raw(&state, request).await;
+    assert_ne!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "#34: a >2MB import_step body must not be rejected at the body-limit \
+         layer (raised to 256MB for this route); got 413, body = {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// #34: a `path` field is read by the SERVER, not shipped through the client
+/// as inline JSON `content` — the whole point being that a caller with
+/// server-local filesystem access (the MCP bridge on the same box as the
+/// backend) never has to buffer a multi-hundred-MB STEP file into a JSON
+/// string just to hand it to this endpoint.
+///
+/// Builds a real single-box STEP file on disk with the same writer the
+/// export endpoint uses (`export_engine::formats::step::export_brep_to_step`),
+/// imports it via `path`, and confirms it splices a solid into the live
+/// model exactly like a `content` import would.
+#[tokio::test]
+async fn import_step_path_reads_file_serverside() {
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_step_path_test_{}.step",
+        Uuid::new_v4()
+    ));
+    export_engine::formats::step::export_brep_to_step(&fresh_model, &tmp_path)
+        .await
+        .expect("STEP export of a single box must succeed");
+
+    let state = make_test_state().await;
+    let request = import_step_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "#34: path-based import of a real STEP file must succeed; body = {body}"
+    );
+    let objects = body.get("objects").and_then(Value::as_array);
+    assert!(
+        objects.map(|o| !o.is_empty()).unwrap_or(false),
+        "#34: path-based import must splice at least one solid into the \
+         model; body = {body}"
+    );
+}
+
+/// #34: `path` pointing at a file that does not exist must fail with a
+/// typed, actionable `invalid_parameter` error — never a panic, never a
+/// silent no-op.
+#[tokio::test]
+async fn import_step_path_missing_file_is_typed_error() {
+    let state = make_test_state().await;
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_step_missing_{}.step",
+        Uuid::new_v4()
+    ));
+    let request = import_step_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    assert!(
+        status.is_client_error(),
+        "#34: a missing import path must be a 4xx, not a panic/500; got {status}, body = {body}"
+    );
+    assert_eq!(
+        body.get("error_code").and_then(Value::as_str),
+        Some("invalid_parameter"),
+        "#34: missing-file path import must carry the invalid_parameter code; body = {body}"
+    );
+}

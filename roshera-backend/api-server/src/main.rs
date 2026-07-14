@@ -35,7 +35,7 @@ mod transactions;
 mod viewport_bridge;
 // Using core geometry-engine directly
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Sse},
@@ -4293,8 +4293,14 @@ async fn create_revolve_primitive(
 /// (ISO 10303-21) exchange structure supplied inline and splice them
 /// into the live session model.
 ///
-/// Request: `{ "content": "ISO-10303-21;…", "name"?: "label" }`.
-/// `content` is the full text of a STEP file (AP203 / AP214 / AP242).
+/// Request: `{ "content": "ISO-10303-21;…", "name"?: "label" }` OR
+/// `{ "path": "C:/…/part.step", "name"?: "label" }`.
+/// `content` is the full text of a STEP file (AP203 / AP214 / AP242);
+/// `path` is a filesystem path the SERVER reads directly (#34 — a real
+/// CAD STEP export runs 10-500MB, so routing it through the client as
+/// inline JSON `content` is both wasteful and hits the HTTP body-size
+/// ceiling twice — once client→proxy, once here — for no benefit when
+/// the file already lives on a disk this process can read).
 ///
 /// Mirrors the export endpoint's shape: the geometry kernel
 /// reconstructs a genuine shared B-Rep via the phased import handlers
@@ -4313,20 +4319,61 @@ async fn import_step_geometry(
     use error_catalog::{ApiError, ErrorCode};
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 
-    let content = payload
-        .get("content")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::missing_field("content (STEP file text)"))?;
+    // Sanity ceiling for a server-local `path` read: generous for any
+    // real CAD STEP export, small enough that a caller pointing at the
+    // wrong (huge) file gets a clear error instead of a multi-minute
+    // stall reading it into memory.
+    const MAX_STEP_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
+
+    let path_field = payload.get("path").and_then(|v| v.as_str());
+    let content_field = payload.get("content").and_then(|v| v.as_str());
+
+    let content: String = if let Some(c) = content_field {
+        c.to_string()
+    } else if let Some(p) = path_field {
+        let metadata = tokio::fs::metadata(p).await.map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("cannot read STEP file at path {p:?}: {e}"),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("path {p:?} is not a regular file"),
+            ));
+        }
+        if metadata.len() > MAX_STEP_FILE_BYTES {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "STEP file at {p:?} is {} bytes, exceeds the {MAX_STEP_FILE_BYTES}-byte import ceiling",
+                    metadata.len()
+                ),
+            ));
+        }
+        tokio::fs::read_to_string(p).await.map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("failed to read STEP file at {p:?}: {e}"),
+            )
+        })?
+    } else {
+        return Err(ApiError::missing_field(
+            "content or path (STEP file text or a server-readable file location)",
+        ));
+    };
     let base_name = payload
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     // Reconstruct into a fresh model + honest report. This is a pure CPU
-    // pass (parse → dispatch → validate); no file I/O.
+    // pass (parse → dispatch → validate) once `content` is in memory —
+    // the only file I/O is the optional `path` read above.
     let (imported, report) = state
         .export_engine
-        .import_step_content(content, "api:/api/geometry/import_step")
+        .import_step_content(&content, "api:/api/geometry/import_step")
         .map_err(|e| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
@@ -7840,9 +7887,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/geometry/import_step",
-            post(import_step_geometry).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(import_step_geometry)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                // #34: real CAD STEP exports run 10-500MB inline `content`;
+                // axum's implicit default (2MB, via `DefaultBodyLimit`) is
+                // toy-scale for this route specifically. Raised HERE only —
+                // every other route keeps the 2MB default.
+                .route_layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
         )
         .route(
             "/api/geometry/face/extrude",
