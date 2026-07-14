@@ -265,12 +265,44 @@ pub struct ImportReport {
 
 /// Per-solid kernel-validation verdict, surfaced on
 /// [`ImportReport::validation`].
+///
+/// This is the SAME ground-truth [`ValidityCertificate`](geometry_engine::primitives::provenance::ValidityCertificate)
+/// (`BRepModel::certify_solid`) the ambient perception verdict reports — NOT
+/// the weaker B-Rep-only `validate_solid_scoped` check. A solid that has a
+/// valid B-Rep topology but does NOT close as a watertight, oriented, manifold
+/// display mesh (an open blend rim, a non-manifold seam) is reported here as
+/// `valid = false` / `sound = false`, so the import report can no longer claim
+/// `valid: true` on a solid the certificate calls UNSOUND.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolidValidation {
     /// Kernel solid id (local `u32`).
     pub solid_id: u32,
-    /// `true` when `validate_solid_scoped` returned `is_valid`.
+    /// FULL certificate verdict (`ValidityCertificate::is_sound`) — the honest
+    /// headline. Alias of [`Self::sound`]; retained under the historical field
+    /// name so existing consumers keep compiling, but its meaning is now the
+    /// full soundness verdict (brep_valid ∧ watertight ∧ manifold ∧ oriented ∧
+    /// self-intersection-free ∧ tessellation/mesh-quality clean), NOT the
+    /// B-Rep-only check.
     pub valid: bool,
+    /// B-Rep topology validity in isolation (`validate_solid_scoped` Standard,
+    /// mesh-independent). Retained as a COMPONENT so a caller can see WHY a
+    /// solid is unsound: `brep_valid = true` with `watertight = false` is a
+    /// valid B-Rep whose display mesh does not close (the blend-rim interop
+    /// defect), vs. `brep_valid = false` for a genuinely malformed shell.
+    #[serde(default)]
+    pub brep_valid: bool,
+    /// Display mesh closes with no boundary edges at the certification chord.
+    #[serde(default)]
+    pub watertight: bool,
+    /// Every mesh edge borders exactly two faces (no non-manifold seams).
+    #[serde(default)]
+    pub manifold: bool,
+    /// Mesh is consistently wound / correctly oriented.
+    #[serde(default)]
+    pub oriented: bool,
+    /// The honest full soundness verdict (`is_sound()`), named explicitly.
+    #[serde(default)]
+    pub sound: bool,
     /// Count of validation errors attributed to this solid.
     pub error_count: usize,
     /// First few human-readable error messages (capped to keep the

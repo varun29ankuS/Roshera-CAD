@@ -52,9 +52,7 @@ pub use writer::*;
 
 pub use diagnostics::ImportReport;
 
-use geometry_engine::math::Tolerance;
 use geometry_engine::primitives::topology_builder::BRepModel;
-use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 use std::path::Path;
 
 use crate::ExportError;
@@ -140,50 +138,48 @@ pub fn import_step_text_with_report(
     // Validation gate (IMP5). A solid that materialises topologically is
     // not yet trustworthy — STEP files in the wild deliver self-
     // intersecting faces, non-manifold seams, and open boundaries. Run
-    // the kernel's `validate_solid_scoped` on every imported solid and
-    // fold the verdict into `ImportReport::ok`: a manifold-but-invalid
-    // reconstruction is now reported `ok = false` rather than passing
-    // silently. The per-solid verdicts are surfaced on
-    // `report.validation` so the caller can see exactly which solid(s)
-    // failed and why.
-    // Modelling tolerance for the gate. The importer defaults to 1e-6 mm
-    // (the kernel canonical default) when the file omits an
-    // `UNCERTAINTY_MEASURE_WITH_UNIT`; the same value scopes validation.
-    let report_tolerance = 1e-6_f64;
+    // the kernel's FULL ground-truth certificate (`certify_solid` →
+    // `is_sound()`) on every imported solid and fold the verdict into
+    // `ImportReport::ok`. This is the SAME certificate the ambient
+    // perception verdict reports — deliberately NOT the weaker
+    // B-Rep-only `validate_solid_scoped`, which previously let the report
+    // claim `valid: true` on a solid whose display mesh did not close
+    // (the blend-rim interop defect: a valid B-Rep whose re-imported
+    // torus/cone boundary tessellated open). The per-solid verdicts are
+    // surfaced on `report.validation` — each carrying the component flags
+    // (`brep_valid`, `watertight`, `manifold`, `oriented`) alongside the
+    // full `sound` headline — so the caller sees exactly which solid(s)
+    // failed and why, and can never read a false green.
     let solid_ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
-    let mut all_solids_valid = true;
+    let mut all_solids_sound = true;
     for solid_id in solid_ids {
-        let verdict = validate_solid_scoped(
-            &model,
-            solid_id,
-            Tolerance::from_distance(report_tolerance),
-            ValidationLevel::Standard,
-        );
-        if !verdict.is_valid {
-            all_solids_valid = false;
+        let cert = model.certify_solid(solid_id);
+        let sound = cert.is_sound();
+        if !sound {
+            all_solids_sound = false;
         }
         // Cap the captured messages so a pathological shell can't bloat
         // the report; the count is always exact.
-        let errors: Vec<String> = verdict
-            .errors
-            .iter()
-            .take(8)
-            .map(|e| e.to_string())
-            .collect();
+        let errors: Vec<String> = cert.errors.iter().take(8).cloned().collect();
         report.validation.push(diagnostics::SolidValidation {
             solid_id,
-            valid: verdict.is_valid,
-            error_count: verdict.errors.len(),
+            valid: sound,
+            brep_valid: cert.brep_valid,
+            watertight: cert.watertight,
+            manifold: cert.manifold,
+            oriented: cert.oriented,
+            sound,
+            error_count: cert.errors.len(),
             errors,
         });
     }
 
     // `ok` now requires: at least one entity resolved, at least one
-    // kernel solid materialised, AND every materialised solid passed
-    // kernel validation. Honest partial: a file that yields a valid
-    // solid plus an invalid husk reports `ok = false` with the husk
-    // flagged in `report.validation`.
-    report.ok = resolved > 0 && !model.solids.is_empty() && all_solids_valid;
+    // kernel solid materialised, AND every materialised solid is SOUND by
+    // the full certificate. Honest partial: a file that yields a sound
+    // solid plus an unsound husk reports `ok = false` with the husk
+    // flagged (and its failing dimension named) in `report.validation`.
+    report.ok = resolved > 0 && !model.solids.is_empty() && all_solids_sound;
     Ok((model, report))
 }
 

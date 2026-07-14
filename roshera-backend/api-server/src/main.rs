@@ -996,6 +996,12 @@ fn perception_json(
     serde_json::json!({
         "sound":             valid,
         "valid":             valid,
+        // B-Rep topology validity, reported explicitly so a caller (and the MCP
+        // `import_step` surface) always has the mesh-independent half even on
+        // the lightweight seed. When the full certificate runs (`certified_response`
+        // with `full`), `sound`/`watertight` are overwritten with the TRUE mesh
+        // verdict while `brep_valid` stays this topology-only flag.
+        "brep_valid":        valid,
         "verdict":           verdict,
         "watertight":        valid,
         "open_edges":        open,
@@ -1154,7 +1160,10 @@ fn certified_response(
         let sound = cert.is_sound();
         if let serde_json::Value::Object(map) = &mut base {
             map.insert("sound".into(), serde_json::json!(sound));
+            map.insert("brep_valid".into(), serde_json::json!(cert.brep_valid));
             map.insert("watertight".into(), serde_json::json!(cert.watertight));
+            map.insert("manifold".into(), serde_json::json!(cert.manifold));
+            map.insert("oriented".into(), serde_json::json!(cert.oriented));
             map.insert(
                 "self_intersection_free".into(),
                 serde_json::json!(cert.self_intersection_free),
@@ -4374,14 +4383,14 @@ async fn import_step_geometry(
 
         let perception = {
             let mut model = model_handle.write().await;
-            certified_response(
-                &mut model,
-                &model_handle,
-                &state,
-                solid_id,
-                &tri_mesh,
-                body_verify_flag(&payload),
-            )
+            // FORCE the full certificate on import (ignore the request's
+            // `fast`/verify flag). A STEP file is UNTRUSTED external input — the
+            // exact case where the lightweight seed's "valid B-Rep ⟹ watertight"
+            // shortcut lies (a re-imported blend rim can be B-Rep-valid yet
+            // tessellate open). Running `certify_solid` here makes the per-object
+            // `perception.sound`/`watertight`/`brep_valid` the TRUE mesh verdict,
+            // matching the honest `report.validation` this endpoint also returns.
+            certified_response(&mut model, &model_handle, &state, solid_id, &tri_mesh, true)
         };
         objects.push(serde_json::json!({
             "id":         id_str,

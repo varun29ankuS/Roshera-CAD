@@ -19,8 +19,10 @@ export function registerIoTools(server: McpServer) {
     "IMPORT a STEP file (AP203/AP214/AP242) as real B-Rep solids — planar/" +
       "quadric/toroidal faces, NURBS curves+surfaces, revolution/extrusion " +
       "surfaces, voids, assembly instances. Give a `path` OR inline `content`. " +
-      "Every solid is kernel-VALIDATED; ok:false = imported but failed " +
-      "validation (see report). Unsupported entities are listed honestly.",
+      "Every solid gets the FULL kernel certificate (brep_valid ∧ watertight ∧ " +
+      "manifold ∧ oriented ∧ sound); ok:false = a solid imported but is NOT sound " +
+      "(see report.validation for the failing dimension per solid). Unsupported " +
+      "entities are listed honestly.",
     {
       path: z
         .string()
@@ -51,7 +53,14 @@ export function registerIoTools(server: McpServer) {
               object_uuid: o.id,
               part_id: o.solid_id,
               name: o.name,
+              // FULL certificate verdict (the import path forces it): the honest
+              // headline plus the components so a caller sees WHY a solid is
+              // unsound (valid B-Rep but open mesh vs. malformed topology).
+              sound: o.perception?.sound ?? null,
               brep_valid: o.perception?.brep_valid ?? null,
+              watertight: o.perception?.watertight ?? null,
+              manifold: o.perception?.manifold ?? null,
+              oriented: o.perception?.oriented ?? null,
             })),
             coverage: {
               schema: r.report?.schema ?? null,
@@ -62,7 +71,7 @@ export function registerIoTools(server: McpServer) {
             },
             note:
               r.success === false
-                ? "ok:false — a solid imported but failed kernel validation; see coverage.validation"
+                ? "ok:false — a solid imported but is NOT sound (open/non-manifold/mis-oriented mesh or invalid B-Rep); see coverage.validation for the failing dimension"
                 : "imported; render_part / scene_view to SEE the result",
           },
           id,

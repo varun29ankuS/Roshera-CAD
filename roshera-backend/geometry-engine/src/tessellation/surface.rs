@@ -4141,11 +4141,24 @@ fn tessellate_blend_cone_conforming(
     let Some(cone) = surface.as_any().downcast_ref::<Cone>() else {
         return false;
     };
-    // Only a truncated frustum (the chamfer blend) qualifies; an apex-singular
-    // cone has no second rim and keeps the apex-fan / grid path.
-    if cone.height_limits.is_none() {
-        return false;
-    }
+    // A truncated frustum (the chamfer blend) qualifies. The frustum window may
+    // be declared on the surface (`height_limits`, the kernel-built blend) or
+    // be IMPLICIT in the trim loop: a cone re-imported from STEP is always a
+    // full `CONICAL_SURFACE` (`height_limits == None`) — ISO 10303-42 has no
+    // partial conical surface, so the band lives ONLY in the face's trim loop.
+    // The band is stitched from the two cached trim RINGS regardless, so the
+    // declared window was never more than a gate; its absence is not
+    // disqualifying. The structural gate below (4-edge seamed-rectangle loop,
+    // exactly 2 closed trim rings, no inner loops) plus the iso-axial ring
+    // check after ring extraction are the real discriminators: an
+    // apex-singular cone has no second rim (fails the 2-ring check) and a
+    // boolean-cut cone band's cut ovals are not axis-perpendicular circles
+    // (fails iso-axial), so both keep their existing dedicated meshers.
+    // Without this, an IMPORTED chamfer frustum fell through to curved-CDT,
+    // which leaves the 4-open-edge quad hole at the u=0 seam this mesher was
+    // built to fix (the audit round-trip: 4 open edges per chamfered drilled
+    // rim).
+    //
     // The blend is the seamed-rectangle: exactly one outer loop of 4 edges and no
     // inner holes. A boolean-trimmed cone carries cut ovals as inner loops and is
     // excluded here (it has its own conforming cut mesher).
@@ -4196,6 +4209,38 @@ fn tessellate_blend_cone_conforming(
     let ring_a = trim(ring_a);
     let ring_b = trim(ring_b);
     if ring_a.len() < 3 || ring_b.len() < 3 {
+        return false;
+    }
+
+    // Disqualify anything whose two closed rings are not the frustum's trim
+    // circles. A chamfer blend's rings are both axis-PERPENDICULAR circles
+    // (constant axial coordinate each, at two DISTINCT heights). A cone face
+    // cut by a curved boolean can also present closed loops, but those ovals
+    // sweep along the axis (non-constant axial coordinate) — they must keep
+    // their dedicated cut mesher. Measured in the cone's own axis frame so an
+    // obliquely-placed blend is handled identically. This check replaces the
+    // discrimination the kernel-only `height_limits` gate used to provide, so
+    // an IMPORTED full cone trimmed by its loop is admitted while non-blend
+    // topologies still fall through.
+    let axial = |p: Point3| -> f64 { (p - cone.apex).dot(&cone.axis) };
+    let axial_range = |ring: &[Point3]| -> (f64, f64) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &p in ring {
+            let a = axial(p);
+            lo = lo.min(a);
+            hi = hi.max(a);
+        }
+        (lo, hi)
+    };
+    let (a_lo, a_hi) = axial_range(&ring_a);
+    let (b_lo, b_hi) = axial_range(&ring_b);
+    let gap = ((a_lo + a_hi) * 0.5 - (b_lo + b_hi) * 0.5).abs();
+    if gap < 1e-9 {
+        return false;
+    }
+    let iso_axial_tol = (gap * 0.05).max(1e-6);
+    if (a_hi - a_lo) > iso_axial_tol || (b_hi - b_lo) > iso_axial_tol {
         return false;
     }
 
@@ -4306,11 +4351,20 @@ fn tessellate_blend_torus_conforming(
     let Some(torus) = surface.as_any().downcast_ref::<Torus>() else {
         return false;
     };
-    // Only a trimmed-window torus (the fillet blend) qualifies; the full torus
-    // and the boolean rim-poke body keep their structured/stitch meshers.
-    let Some([_, _, v_lo, v_hi]) = torus.param_limits else {
-        return false;
-    };
+    // A trimmed-window torus (the fillet blend) qualifies. The window may be
+    // declared on the surface (`param_limits`, the kernel-built blend) or be
+    // IMPLICIT in the trim loop: a torus re-imported from STEP is always a full
+    // `TOROIDAL_SURFACE` (`param_limits == None`) — ISO 10303-42 has no partial
+    // toroidal surface, so the v-window lives ONLY in the face's trim loop
+    // (exactly how OCCT/FreeCAD also emit a fillet). Either way the band is
+    // stitched from the two cached trim RINGS and the ring-derived v's (see
+    // `v_of_ring` below); `param_limits` was never more than a gate plus a
+    // span sanity-check, so its absence is not disqualifying. The structural
+    // gate that follows (4 edges, exactly 2 closed trim rings, no inner loops)
+    // is the real discriminator, so the full torus primitive and the
+    // boolean rim-poke body/bump (which do not present that seamed-rectangle
+    // loop) still fall through to their own structured/stitch meshers.
+    //
     // The blend is the seamed-rectangle: exactly one outer loop of 4 edges and
     // no inner holes. A boolean-trimmed torus carries cut ovals as inner loops
     // and is excluded here (it has its own conforming stitch mesher).
@@ -4399,6 +4453,32 @@ fn tessellate_blend_torus_conforming(
     let ring_a = to_ccw(ring_a);
     let ring_b = to_ccw(ring_b);
 
+    // Disqualify the genuine FULL torus. Its single face's seam loop ALSO
+    // presents as four edges with two closed rings, but those rings are a
+    // MAJOR (v-seam) ring and a MINOR (u-seam) ring — the minor ring lies in a
+    // meridian plane CONTAINING the axis, so its axial coordinate sweeps
+    // ±minor_radius. A fillet blend's two trim rings are instead both MAJOR
+    // iso-v rings, each lying in a plane PERPENDICULAR to the axis (constant
+    // axial coordinate). Requiring both rings to be iso-axial keeps the full
+    // torus on its structured grid mesher (it was formerly excluded by the
+    // `param_limits.is_some()` gate, which a re-imported blend cannot satisfy)
+    // while still admitting the imported blend window. Measured in the torus's
+    // own axis frame, so an obliquely-placed blend is handled identically.
+    let axial_spread = |ring: &[Point3]| -> f64 {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &p in ring {
+            let a = (p - torus.center).dot(&torus.axis);
+            lo = lo.min(a);
+            hi = hi.max(a);
+        }
+        hi - lo
+    };
+    let iso_axial_tol = (torus.minor_radius * 0.05).max(1e-6);
+    if axial_spread(&ring_a) > iso_axial_tol || axial_spread(&ring_b) > iso_axial_tol {
+        return false;
+    }
+
     // Map each cached ring to its torus v-parameter so interior rows can be
     // sampled BETWEEN them. `closest_point` returns the signed v the blend
     // window uses (`v_straddles_seam`). Average over a few ring points for
@@ -4426,9 +4506,13 @@ fn tessellate_blend_torus_conforming(
     } else {
         (&ring_b, &ring_a, vb, va)
     };
-    // Guard: the ring v's must bracket the declared window (else this is not a
-    // clean blend band and we defer to the structured grid).
-    let v_span = (v_hi - v_lo).abs();
+    // Guard: the two trim rings must sit at DISTINCT v (else this is not a
+    // clean blend band — a degenerate/zero-height window — and we defer to the
+    // structured grid). The window is taken from the rings themselves, which is
+    // exactly what the declared `param_limits` window (when present) records; a
+    // re-imported full torus has no declared window, so the rings are the sole
+    // source of truth for the v-band and this guard is computed from them.
+    let v_span = (v_high - v_low).abs();
     if v_span < 1e-9 {
         return false;
     }
@@ -4442,7 +4526,36 @@ fn tessellate_blend_torus_conforming(
     // interior rows are torus-surface samples at the SEAM-anchored u-angles of
     // the larger ring so adjacent rows align in u as closely as possible (the
     // angle-merge stitch tolerates any residual count difference).
-    let interior_cols = v_low_ring.len().max(v_high_ring.len());
+    //
+    // Anchor each interior column to the ACTUAL angular position of the larger
+    // boundary ring rather than to the torus's own uniform `[0, 2π)` u-grid.
+    // The kernel blend builders align the torus `ref_dir` (u = 0 seam) to the
+    // trim rings, so the uniform grid coincided with the rings; but a torus
+    // re-imported from a STEP `TOROIDAL_SURFACE` derives its OWN `ref_dir`
+    // (`axis.perpendicular()`), which need not coincide with the trim circles'
+    // seam (their `AXIS2_PLACEMENT_3D` ref-direction is `$`/defaulted). On the
+    // uniform grid the interior rows are then rotated relative to the boundary
+    // rings — the band is internally consistent but twisted a fixed angle, so
+    // it welds to the cap/lateral neighbours with the OPPOSITE winding (the
+    // "oriented == false" round-trip symptom). Reading each column's u from the
+    // larger ring's own vertices puts every row on one shared meridian grid, so
+    // the stitch pairs aligned columns and the band winds with its neighbours
+    // regardless of where the imported surface placed its seam.
+    let ref_ring: &[Point3] = if v_low_ring.len() >= v_high_ring.len() {
+        v_low_ring
+    } else {
+        v_high_ring
+    };
+    let col_u: Vec<f64> = ref_ring
+        .iter()
+        .map(|p| {
+            surface
+                .closest_point(p, Tolerance::default())
+                .map(|(u, _)| u)
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let interior_cols = col_u.len();
     let outward_normal = |p: Point3| -> Vector3 {
         surface
             .closest_point(&p, Tolerance::default())
@@ -4469,8 +4582,7 @@ fn tessellate_blend_torus_conforming(
     for k in 1..v_steps {
         let v = v_low + (v_high - v_low) * (k as f64) / (v_steps as f64);
         let mut row_pts: Vec<Point3> = Vec::with_capacity(interior_cols);
-        for i in 0..interior_cols {
-            let u = std::f64::consts::TAU * (i as f64) / (interior_cols as f64);
+        for &u in &col_u {
             match surface.point_at(u, v) {
                 Ok(p) => row_pts.push(p),
                 Err(_) => return false,
