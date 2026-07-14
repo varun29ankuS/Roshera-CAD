@@ -271,6 +271,16 @@ fn delete_solid_body(
     model.solids.remove(solid_id);
     deleted.push((EntityType::Solid, solid_id));
 
+    // Sweep unattributed debris. Cascading the shells above frees this solid's
+    // own loops/edges/vertices, but deleting a part must ALSO purge any
+    // pre-existing orphan topology a broken boolean left in the stores (faces
+    // owned by no solid — the debris the model-level `model_debris_orphan_faces`
+    // accounting reports). `clear_parts` used to be the only thing that purged
+    // it; now `delete_part` does too, so an agent can clear a broken manifold's
+    // fallout without wiping the whole model. Runs inside this `with_rollback`
+    // closure, so a failure restores everything via the snapshot.
+    prune_boolean_orphan_topology(model)?;
+
     Ok(deleted)
 }
 

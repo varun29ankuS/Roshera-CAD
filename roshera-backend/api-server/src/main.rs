@@ -1073,6 +1073,11 @@ pub(crate) fn certificate_json(
         },
         "eyes_consistent":         c.eyes_consistent.label(),
         "errors":                  c.errors,
+        // MODEL-level debris — faces live in the store but owned by no solid
+        // (orphan topology a broken boolean can leave). NOT this part's fault
+        // and NOT ANDed into `sound`; surfaced so debris stays visible without
+        // poisoning this part's verdict. `0` on a clean model.
+        "model_debris_orphan_faces": c.model_debris_orphan_faces,
     })
 }
 

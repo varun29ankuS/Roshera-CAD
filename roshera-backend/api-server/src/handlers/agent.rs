@@ -1104,6 +1104,12 @@ pub struct TruthResponse {
     /// ∧ mesh-quality-clean).
     pub sound: bool,
     pub errors: Vec<String>,
+    /// MODEL-level debris count — faces live in the store but owned by no solid
+    /// (unattributed orphan topology a broken boolean can leave). NOT this
+    /// part's fault and does NOT affect `sound`; surfaced as an honest
+    /// model-health signal so debris stays visible without poisoning this
+    /// part's verdict. `0` on a clean model.
+    pub model_debris_orphan_faces: usize,
     pub summary: String,
 }
 
@@ -1187,6 +1193,7 @@ pub async fn part_truth(
         },
         sound: c.is_sound(),
         errors: c.errors.clone(),
+        model_debris_orphan_faces: c.model_debris_orphan_faces,
         summary: gt.summary(),
     }))
 }

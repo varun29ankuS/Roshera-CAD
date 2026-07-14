@@ -155,6 +155,26 @@ impl ValidationError {
         }
     }
 
+    /// Immutable access to the carried [`EntityLocation`], when the variant
+    /// has one. `None` for the model-global / unattributed variants
+    /// (`MissingEntity`, `ManufacturingError`, `ToleranceError`,
+    /// `FeatureError`, `AssemblyError`). Used by the per-solid scope
+    /// ([`validate_solid_scoped`]) to attribute a `solid_id: None` finding to
+    /// the solid whose topology actually carries the located entity.
+    pub fn location(&self) -> Option<&EntityLocation> {
+        match self {
+            ValidationError::TopologyError { location, .. }
+            | ValidationError::GeometryError { location, .. }
+            | ValidationError::OrientationError { location, .. }
+            | ValidationError::ConnectivityError { location, .. } => Some(location),
+            ValidationError::MissingEntity { .. }
+            | ValidationError::ManufacturingError { .. }
+            | ValidationError::ToleranceError { .. }
+            | ValidationError::FeatureError { .. }
+            | ValidationError::AssemblyError { .. } => None,
+        }
+    }
+
     /// Mutable access to the carried [`EntityLocation`], when the variant has one.
     /// `None` for model-global / unattributed variants. Used to re-stamp the
     /// owning solid onto a model-wide check's findings so the per-solid
@@ -1377,12 +1397,107 @@ pub fn validate_solid_scoped(
     level: ValidationLevel,
 ) -> ValidationResult {
     let mut result = validate_model_enhanced(model, tolerance, level);
-    result.errors.retain(|e| match e.solid_id() {
-        Some(sid) => sid == solid_id,
+    let face_owner = face_owner_map(model);
+    let shell_owner = shell_owner_map(model);
+    result.errors.retain(|e| match e.location() {
+        // No location at all → a genuinely model-global variant
+        // (`MissingEntity` / `ManufacturingError` / …). Keep for every
+        // part's verdict (unchanged behaviour).
         None => true,
+        // A LOCATED error — attribute it to the solid whose live topology
+        // actually carries the entity, even when the check stamped
+        // `solid_id: None`. Keep iff it belongs to THIS solid. An error on a
+        // DIFFERENT solid, or one whose face/shell is ORPHAN topology (owned
+        // by no live solid — the debris a broken boolean leaves), is NOT this
+        // part's fault, so it is dropped from this part's verdict. Orphan
+        // debris is NOT hidden: it is accounted once at model scope via
+        // [`count_orphan_faces`] and surfaced on the certificate as
+        // `model_debris_orphan_faces`.
+        Some(_) => resolve_error_owner(e, &face_owner, &shell_owner) == Some(solid_id),
     });
     result.is_valid = result.errors.is_empty();
     result
+}
+
+/// Build a `FaceId → owning SolidId` map by walking every live solid's shells.
+/// A face absent from this map is an ORPHAN — live in `model.faces` yet owned
+/// by no solid (the unattributed topology a broken boolean can leave).
+fn face_owner_map(model: &BRepModel) -> std::collections::HashMap<FaceId, SolidId> {
+    let mut map = std::collections::HashMap::new();
+    for (sid, solid) in model.solids.iter() {
+        let shells = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        for shid in shells {
+            if let Some(shell) = model.shells.get(shid) {
+                for &fid in &shell.faces {
+                    map.insert(fid, sid);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Build a `ShellId → owning SolidId` map over every live solid.
+fn shell_owner_map(model: &BRepModel) -> std::collections::HashMap<ShellId, SolidId> {
+    let mut map = std::collections::HashMap::new();
+    for (sid, solid) in model.solids.iter() {
+        map.insert(solid.outer_shell, sid);
+        for &shid in &solid.inner_shells {
+            map.insert(shid, sid);
+        }
+    }
+    map
+}
+
+/// Resolve the live solid a LOCATED error is attributed to, following its
+/// [`EntityLocation`] when the `solid_id` field itself is unset.
+///
+/// The model-wide topology-gap check ([`ParallelValidator::check_topology_gaps`])
+/// stamps a boundary-edge / connectivity finding with `solid_id: None` but
+/// records the `face_id` (and, in the shell path, `shell_id`) it was found on.
+/// Those resolve here to the OWNING solid, so a per-solid certificate can
+/// attribute the finding to the solid whose topology carries it rather than
+/// leaking it into every part's verdict.
+///
+/// Returns `Some(sid)` when the located entity belongs to live solid `sid`;
+/// `None` when the location points at ORPHAN topology (a face/shell owned by
+/// no live solid). Callers only invoke this for errors that HAVE a location.
+fn resolve_error_owner(
+    err: &ValidationError,
+    face_owner: &std::collections::HashMap<FaceId, SolidId>,
+    shell_owner: &std::collections::HashMap<ShellId, SolidId>,
+) -> Option<SolidId> {
+    let loc = err.location()?;
+    if let Some(sid) = loc.solid_id {
+        return Some(sid);
+    }
+    if let Some(face) = loc.face_id {
+        if let Some(&sid) = face_owner.get(&face) {
+            return Some(sid);
+        }
+    }
+    if let Some(shell) = loc.shell_id {
+        if let Some(&sid) = shell_owner.get(&shell) {
+            return Some(sid);
+        }
+    }
+    None
+}
+
+/// Count faces live in `model.faces` but owned by no solid — unattributed
+/// ORPHAN topology (the debris a broken boolean, or a partial op, can leave in
+/// the stores). This is the model-level health signal surfaced on every
+/// certificate as `model_debris_orphan_faces`; it does NOT affect any single
+/// part's soundness (a part's certificate reflects ITS OWN topology), but it
+/// keeps the debris loudly visible so the honesty doctrine holds even though
+/// the debris no longer poisons individual part verdicts.
+pub fn count_orphan_faces(model: &BRepModel) -> usize {
+    let owner = face_owner_map(model);
+    model
+        .faces
+        .iter()
+        .filter(|(fid, _)| !owner.contains_key(fid))
+        .count()
 }
 
 /// Like [`validate_solid_scoped`] but scoped to whichever solids OWN the
@@ -1413,9 +1528,17 @@ pub fn validate_faces_scoped(
     }
 
     let mut result = validate_model_enhanced(model, tolerance, level);
-    result.errors.retain(|e| match e.solid_id() {
-        Some(sid) => touched_solids.contains(&sid),
+    let face_owner = face_owner_map(model);
+    let shell_owner = shell_owner_map(model);
+    result.errors.retain(|e| match e.location() {
+        // Genuinely model-global (no location) — keep (unchanged behaviour).
         None => true,
+        // Located error — attribute to the owning solid (following the
+        // location when `solid_id` is unset) and keep iff that solid is one
+        // of the touched set. Orphan-topology debris (owner unresolved) and
+        // errors on untouched solids drop out.
+        Some(_) => resolve_error_owner(e, &face_owner, &shell_owner)
+            .is_some_and(|sid| touched_solids.contains(&sid)),
     });
     result.is_valid = result.errors.is_empty();
     result

@@ -2461,18 +2461,28 @@ impl BRepModel {
         solid_id: SolidId,
     ) -> Option<crate::primitives::provenance::ValidityCertificate> {
         // Hot path: a live cached cert. Read guard taken and dropped here.
-        if let Some(solid) = self.solids.get(solid_id) {
-            if let Some(cert) = solid.cached_certificate() {
-                return Some(cert);
-            }
+        let mut cert = if let Some(solid) = self.solids.get(solid_id) {
+            solid.cached_certificate()
         } else {
             return None;
-        }
+        };
         // Cold path: dirty. Compute WITHOUT any cert lock held, then store.
-        let cert = self.compute_certificate(solid_id);
-        if let Some(solid) = self.solids.get(solid_id) {
-            solid.store_certificate(cert.clone());
+        if cert.is_none() {
+            let computed = self.compute_certificate(solid_id);
+            if let Some(solid) = self.solids.get(solid_id) {
+                solid.store_certificate(computed.clone());
+            }
+            cert = Some(computed);
         }
+        let mut cert = cert?;
+        // `model_debris_orphan_faces` is a MODEL-level signal, not a per-solid
+        // fact: it changes when ANOTHER solid is created/deleted, which does
+        // NOT invalidate this solid's cached certificate. Re-stamp it fresh on
+        // every return so a cached cert never reports a stale debris count (a
+        // "⚠ model debris" note that outlived the debris would be a lie). The
+        // per-solid validation/tessellation stays cached; only this O(faces)
+        // model-scan re-runs.
+        cert.model_debris_orphan_faces = crate::primitives::validation::count_orphan_faces(self);
         Some(cert)
     }
 
@@ -2667,6 +2677,12 @@ impl BRepModel {
                 mesh_quality.boundary_crossing_facets,
             ));
         }
+        // MODEL-level debris accounting — orphan faces owned by no solid. NOT
+        // this part's fault and NOT ANDed into `is_sound()`; surfaced as its
+        // own honest signal so unattributed topology stays loudly visible
+        // instead of poisoning every part's `brep_valid` (the mis-attribution
+        // fixed in `validate_solid_scoped`).
+        let model_debris_orphan_faces = crate::primitives::validation::count_orphan_faces(self);
         ValidityCertificate {
             brep_valid: v.is_valid,
             watertight,
@@ -2683,6 +2699,7 @@ impl BRepModel {
             tessellation,
             mesh_quality,
             errors,
+            model_debris_orphan_faces,
         }
     }
 

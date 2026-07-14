@@ -559,6 +559,15 @@ pub struct ValidityCertificate {
     pub mesh_quality: MeshQuality,
     /// B-Rep validation errors (stringified), empty when `brep_valid`.
     pub errors: Vec<String>,
+    /// MODEL-level debris accounting — NOT this solid's fault and does NOT
+    /// affect `is_sound()`. Count of faces live in the model store but owned
+    /// by no solid: unattributed ORPHAN topology a broken boolean (or a
+    /// partial op) can leave behind. Before this field existed, those orphans'
+    /// boundary-edge errors carried `solid_id: None` and leaked into EVERY
+    /// part's `brep_valid` verdict; they are now attributed at model scope and
+    /// surfaced here instead, so a part's certificate reflects only ITS OWN
+    /// topology while the debris stays loudly visible. `0` on a clean model.
+    pub model_debris_orphan_faces: usize,
 }
 
 impl ValidityCertificate {
@@ -620,7 +629,16 @@ impl GroundTruth {
             self.certificate.mesh_quality.min_angle_deg,
             self.certificate.mesh_quality.max_normal_deviation_deg,
             self.certificate.mesh_quality.boundary_crossing_facets,
-        )
+        ) + &if self.certificate.model_debris_orphan_faces > 0 {
+            // Model-level honesty signal — NOT this part's fault, does not
+            // touch `sound`, but kept loudly visible in the ambient verdict.
+            format!(
+                " | ⚠ model debris: {} orphan face(s)",
+                self.certificate.model_debris_orphan_faces
+            )
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -646,6 +664,7 @@ impl ValidityCertificate {
             nonmanifold_edges: 0,
             inconsistent_directed_edges: 0,
             errors: vec![],
+            model_debris_orphan_faces: 0,
         }
     }
 }
