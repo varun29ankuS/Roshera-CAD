@@ -2711,13 +2711,21 @@ fn gdt_plate_layout_bridge_end_to_end() {
 ///   which the FRONT label alone does not cover.
 ///
 /// **DatumSymbol** anchor=[187, 117] (owner_view=0), half=2.3, step=6.9:
-/// - All 5 collision-ladder candidates are blocked:
+/// - All 5 Phase-1 collision-ladder candidates are blocked:
 ///   1. [187, 117]     bbox y∈[114.7, 119.3] ↔ FRONT label y∈[115.4, 119] ✓
 ///   2. [187, 110.1]   bbox y∈[107.8, 112.4] ↔ TOP geometry y∈[104, 110] ✓
 ///      (intersects at y∈[107.8, 109.8] with LABEL_TOL=0.2)
 ///   3. [193.9, 117]   bbox x∈[191.6, 196.2] inside FRONT label x∈[175, 199.6] ✓
 ///   4. [187, 123.9]   bbox y∈[121.6, 126.2] ↔ FRONT geometry y∈[121, 154] ✓
 ///   5. [180.1, 117]   bbox x∈[177.8, 182.4] inside FRONT label x∈[175, 199.6] ✓
+///
+/// Phase 2 (outside FRONT's own geometry rect x∈[175,245], y∈[121,154]) adds
+/// four more candidates, three of which need dedicated blockers (the "above"
+/// slot is already covered by the FRONT label itself):
+///   6. above  [177.3, 116.7] bbox x∈[175,179.6],  y∈[114.4,119.0] ↔ FRONT label ✓
+///   7. below  [177.3, 158.3] bbox x∈[175,179.6],  y∈[156.0,160.6] ↔ BLOCK-P2-BELOW ✓
+///   8. right  [249.3, 123.3] bbox x∈[247,251.6],  y∈[121.0,125.6] ↔ BLOCK-P2-RIGHT ✓
+///   9. left   [170.7, 123.3] bbox x∈[168.4,173.0],y∈[121.0,125.6] ↔ BLOCK-P2-LEFT ✓
 /// - Ladder falls back to stored anchor → datum box x∈[184.7, 189.3], y∈[114.7, 119.3].
 /// - That box overlaps FRONT label x∈[175, 199.6], y∈[115.4, 119] → collision.
 ///
@@ -2787,10 +2795,53 @@ fn datum_symbol_colliding_with_view_label_flagged() {
         vec![],
     ));
 
+    // Phase-2 blockers: close the three escape routes the Phase-1-only ladder
+    // used to leave open (the "above" slot is already covered by the FRONT
+    // label itself — see construction spec above).
+    // BLOCK-P2-BELOW: geo rect x∈[61,66], y∈[121,126] (pos=[61,171], 5×5)
+    //   blocks Phase-2 "below" candidate bbox x∈[175,179.6], y∈[156,160.6]...
+    // NOTE: computed directly against FRONT's rect, see per-view comments below.
+    d.add_view(rect_view(
+        "BLOCKP2BELOW",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [176.0, 135.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+    // geo rect x∈[176,181], y∈[157,162] — overlaps Phase-2 "below" bbox
+    // x∈[175,179.6], y∈[156,160.6].
+    d.add_view(rect_view(
+        "BLOCKP2RIGHT",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [248.0, 170.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+    // geo rect x∈[248,253], y∈[122,127] — overlaps Phase-2 "right" bbox
+    // x∈[247,251.6], y∈[121,125.6].
+    d.add_view(rect_view(
+        "BLOCKP2LEFT",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [169.0, 170.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+    // geo rect x∈[169,174], y∈[122,127] — overlaps Phase-2 "left" bbox
+    // x∈[168.4,173.0], y∈[121,125.6].
+
     // DatumSymbol anchored at (187, 117): inside the FRONT label band.
-    // All 5 collision-ladder candidates are blocked (see construction spec above).
-    // The ladder falls back to the stored anchor → datum bbox overlaps FRONT label
-    // → verify_drawing fires ViewLabelCollision.
+    // All 5 Phase-1 candidates plus all 4 Phase-2 candidates are blocked (see
+    // construction spec above). The ladder falls back to the stored anchor →
+    // datum bbox overlaps FRONT label → verify_drawing fires ViewLabelCollision.
     d.datum_symbols.push(PlacedDatumSymbol {
         label: "A".to_string(),
         anchor: [187.0, 117.0],
@@ -2826,7 +2877,7 @@ fn datum_symbol_colliding_with_view_label_flagged() {
 ///   No obstacles near this slot so candidate 1 wins.
 ///
 /// **DatumSymbol B** anchor=[180, 100], half=2.3, step=6.9:
-///   All 5 ladder candidates are blocked:
+///   All 5 Phase-1 ladder candidates are blocked:
 ///   1. [180, 100]   → blocked by Sym A (full overlap).
 ///   2. [180, 93.1]  → bbox x∈[177.7,182.3], y∈[90.8,95.4]
 ///      → blocked by VIEW-BLOCK2 at pos=[178,201], geo y∈[91,96].
@@ -2836,6 +2887,14 @@ fn datum_symbol_colliding_with_view_label_flagged() {
 ///      → blocked by VIEW-BLOCK4 at pos=[178,188], geo y∈[104,109].
 ///   5. [173.1, 100] → bbox x∈[170.8,175.4], y∈[97.7,102.3]
 ///      → blocked by VIEW-BLOCK5 at pos=[171,194], geo y∈[98,103].
+///
+///   Phase 2 (outside the MAIN/FRONT view's own geometry rect x∈[60,90],
+///   y∈[127,147], owner_view=0 for both symbols) adds four more candidates,
+///   also blocked by dedicated blockers:
+///   6. above [62.3, 122.7] bbox x∈[60,64.6], y∈[120.4,125.0] → BLOCKP2ABOVE.
+///   7. below [62.3, 151.3] bbox x∈[60,64.6], y∈[149.0,153.6] → BLOCKP2BELOW.
+///   8. right [94.3, 129.3] bbox x∈[92,96.6],  y∈[127.0,131.6] → BLOCKP2RIGHT.
+///   9. left  [55.7, 129.3] bbox x∈[53.4,58.0],y∈[127.0,131.6] → BLOCKP2LEFT.
 ///
 ///   Fallback: least-overlap candidate = candidate 1 = [180, 100].
 ///   Sym B placed at [180, 100] → same bbox as Sym A → full collision.
@@ -2945,6 +3004,58 @@ fn gdt_items_overlapping_each_other_without_view_label_flagged() {
         5.0,
         vec![],
     ));
+
+    // Phase-2 blockers: close the four escape routes outside the MAIN/FRONT
+    // view's own geometry rect x∈[60,90], y∈[127,147] (both symbols'
+    // owner_view=0), which the Phase-1-only ladder used to leave open.
+    d.add_view(rect_view(
+        "BLOCKP2ABOVE",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [61.0, 171.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+    // geo rect x∈[61,66], y∈[121,126] — overlaps Phase-2 "above" bbox
+    // x∈[60,64.6], y∈[120.4,125.0].
+    d.add_view(rect_view(
+        "BLOCKP2BELOW",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [61.0, 142.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+    // geo rect x∈[61,66], y∈[150,155] — overlaps Phase-2 "below" bbox
+    // x∈[60,64.6], y∈[149.0,153.6].
+    d.add_view(rect_view(
+        "BLOCKP2RIGHT",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [93.0, 164.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+    // geo rect x∈[93,98], y∈[128,133] — overlaps Phase-2 "right" bbox
+    // x∈[92,96.6], y∈[127.0,131.6].
+    d.add_view(rect_view(
+        "BLOCKP2LEFT",
+        ProjectionType::Custom {
+            rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        [54.0, 164.0],
+        5.0,
+        5.0,
+        vec![],
+    ));
+    // geo rect x∈[54,59], y∈[128,133] — overlaps Phase-2 "left" bbox
+    // x∈[53.4,58.0], y∈[127.0,131.6].
 
     // Sym A: placed first at anchor=[180,100].  No obstacles → candidate 1 wins.
     // Final bbox: x∈[177.7, 182.3], y∈[97.7, 102.3].
@@ -3099,5 +3210,130 @@ fn gdt_multi_solid_sheet_attribution() {
         "plate 2's sheet must carry exactly 1 FCF block (the FCF belongs to plate 2's face), \
          but got {} block(s).",
         drawing2.fcf_blocks.len()
+    );
+}
+
+// ── #28: coaxial datum-pair collision (Fix A) ─────────────────────────────────
+//
+// A hub flange (disc with a coaxial through-bore) with datum A on the bottom
+// planar face and datum B on the bore axis: `attach_gdt_annotations` projects
+// both features' surface ORIGIN (not an edge-offset point) to sheet space, and
+// for a coaxial part the plane's stored origin and the cylinder's stored axis
+// origin are the SAME 3D point — both datums resolve to the SAME view (their
+// normals are collinear, ±Z) and the SAME anchor. `place_gdt_annotations`'s
+// 5-candidate local ladder (anchor ± one step in each cardinal direction) then
+// fails for every candidate because the flange's ViewGeometry silhouette (a
+// 40 mm-radius disc) swallows all of them — the ladder was never given an
+// escape route OUTSIDE the view's own geometry (unlike `FcfBlock`, which has
+// exactly this "Phase 2" escape — see `place_gdt_annotations` in layout.rs).
+// Both datum symbols therefore fall back to the identical raw anchor and land
+// on top of each other — the verifier (correctly) reports it.
+//
+// **RED evidence (captured before the Phase-2 datum-symbol fix, this branch):**
+//
+// ```text
+// running 1 test
+// test coaxial_datum_pair_does_not_collide ... FAILED
+//
+// failures:
+//
+// ---- coaxial_datum_pair_does_not_collide stdout ----
+// thread 'coaxial_datum_pair_does_not_collide' panicked at
+// geometry-engine\tests\drawing_quality_oracle.rs:NNNN:5:
+// coaxial datum A/B must not collide; issues=[DrawingIssue { severity: Error,
+// kind: GdtSymbolCollision, message: "GD&T annotation 'A' overlaps 'B'",
+// view: None }, ...]
+//
+// test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured
+// ```
+//
+// ## Mutation proof
+// * Revert the Phase-2 (outside-view-rect) candidates added to the DatumSymbol
+//   loop in `place_gdt_annotations` → both candidates collapse back to the
+//   shared raw anchor → `GdtSymbolCollision` fires again → RED.
+#[test]
+fn coaxial_datum_pair_does_not_collide() {
+    use geometry_engine::gdt::designate_datum;
+    use geometry_engine::primitives::surface::{Cylinder, Plane};
+
+    // ── Hub flange: Ø80 x 15 disc with a coaxial Ø24 through-bore ────────────
+    let mut model = BRepModel::new();
+    let disc = match TopologyBuilder::new(&mut model)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 40.0, 15.0)
+        .expect("disc")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let bore = match TopologyBuilder::new(&mut model)
+        .create_cylinder_3d(Point3::new(0.0, 0.0, -1.0), Vector3::Z, 12.0, 17.0)
+        .expect("bore")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let solid_id = boolean_operation(
+        &mut model,
+        disc,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("drill coaxial bore");
+
+    // ── Find the bottom planar face (normal -Z, origin z≈0) and the bore's
+    // cylindrical face (radius≈12, distinct from the OD's radius≈40) ────────
+    let (bottom_face, bore_face) = {
+        let solid = model.solids.get(solid_id).expect("solid exists");
+        let mut shells = vec![solid.outer_shell];
+        shells.extend(solid.inner_shells.iter().copied());
+        let mut bottom = None;
+        let mut bore_f = None;
+        for sh_id in &shells {
+            if let Some(shell) = model.shells.get(*sh_id) {
+                for &fid in &shell.faces {
+                    let Some(fd) = model.faces.get(fid) else {
+                        continue;
+                    };
+                    let Some(surf) = model.surfaces.get(fd.surface_id) else {
+                        continue;
+                    };
+                    if let Some(plane) = surf.as_any().downcast_ref::<Plane>() {
+                        if plane.normal.z < -0.99 && plane.origin.z.abs() < 1e-3 {
+                            bottom = Some(fid);
+                        }
+                    } else if let Some(cyl) = surf.as_any().downcast_ref::<Cylinder>() {
+                        if (cyl.radius - 12.0).abs() < 1e-3 {
+                            bore_f = Some(fid);
+                        }
+                    }
+                }
+            }
+        }
+        (
+            bottom.expect("must find the bottom (-Z) planar face"),
+            bore_f.expect("must find the Ø24 bore's cylindrical face"),
+        )
+    };
+
+    // ── Designate datum A (bottom plane) and datum B (bore axis) ────────────
+    designate_datum(&mut model, solid_id, "A", bottom_face).expect("designate datum A");
+    designate_datum(&mut model, solid_id, "B", bore_face).expect("designate datum B");
+
+    // ── Build the standard drawing and verify: no GdtSymbolCollision ────────
+    let drawing = standard_drawing_auto(&model, solid_id, uuid::Uuid::nil())
+        .expect("standard_drawing_auto must succeed");
+    assert_eq!(
+        drawing.datum_symbols.len(),
+        2,
+        "expected exactly 2 datum symbols (A, B); got {}",
+        drawing.datum_symbols.len()
+    );
+
+    let report = verify_drawing(&drawing);
+    assert!(
+        !report.has(DrawingIssueKind::GdtSymbolCollision),
+        "coaxial datum A/B must not collide; issues={:?}",
+        report.issues
     );
 }

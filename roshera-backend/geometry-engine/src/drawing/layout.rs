@@ -1362,17 +1362,19 @@ const GDT_CELL_PAD: f64 = 1.0;
 ///
 /// # Placement strategy
 ///
-/// Each datum symbol tries a fixed set of candidate positions near the
-/// feature edge (approximated as the right-top corner of the view's
-/// geometry rect for now — the anchor supplied by the caller is the
-/// sheet-space position, used directly).  Collision is checked against
-/// already-placed items using the same `LABEL_TOL` as view labels.  If
-/// all candidates collide, the stored `anchor` is used as-is (the verifier
-/// will report the overlap honestly — same discipline as view labels).
-///
-/// Each FCF block is placed relative to its stored `anchor` (the top-left of
-/// the glyph cell, computed at drawing-build time by `attach_gdt_annotations`).
-/// Collision fallback applies the same ladder.
+/// Each datum symbol and each FCF block is placed via a two-phase candidate
+/// ladder: Phase 1 tries the stored `anchor` (the sheet-space position
+/// computed at drawing-build time by `attach_gdt_annotations`) plus four
+/// close-range cardinal offsets; Phase 2 — needed because two annotations
+/// whose feature origins coincide (e.g. a coaxial hub flange's bottom-face
+/// plane origin and bore-axis origin are the SAME 3D point, so both resolve
+/// to the same view and the same anchor) can have every Phase-1 candidate
+/// still fall inside the owner view's own ViewGeometry silhouette — tries
+/// candidates anchored OUTSIDE that view's geometry rect (above / below /
+/// left / right of it). Collision is checked against already-placed items
+/// using the same `LABEL_TOL` as view labels. If every candidate in both
+/// phases collides, the stored `anchor` is used as-is (the verifier will
+/// report the overlap honestly — same discipline as view labels).
 ///
 /// # Stored annotations only
 ///
@@ -1415,13 +1417,6 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
         let [ax, ay] = sym.anchor;
         let half = GDT_BOX_HALF;
         let step = half * 3.0;
-        let candidates: [[f64; 2]; 5] = [
-            [ax, ay],
-            [ax, ay - step],
-            [ax + step, ay],
-            [ax, ay + step],
-            [ax - step, ay],
-        ];
         let bbox_at = |cx: f64, cy: f64| -> Rect2 {
             Rect2 {
                 x0: cx - half,
@@ -1430,8 +1425,45 @@ pub(crate) fn place_gdt_annotations(drawing: &Drawing, existing: &[SheetItem]) -
                 y1: cy + half,
             }
         };
-        let chosen = candidates
+
+        // Phase 1: stored anchor + four cardinal offsets (legacy).
+        let phase1: [[f64; 2]; 5] = [
+            [ax, ay],
+            [ax, ay - step],
+            [ax + step, ay],
+            [ax, ay + step],
+            [ax - step, ay],
+        ];
+
+        // Phase 2: candidates anchored OUTSIDE the owner view's geometry rect
+        // — mirrors the `FcfBlock` ladder below. Needed because two datums
+        // whose feature origins coincide (e.g. a coaxial hub flange: the
+        // bottom face's plane origin and the bore's axis origin are the SAME
+        // 3D point) resolve to the SAME view and the SAME anchor. Phase 1
+        // alone can never separate them: every close-range candidate still
+        // sits inside the (typically much larger) ViewGeometry silhouette,
+        // so it is rejected regardless of which sibling datum got there
+        // first, and both fall back to the identical raw anchor.
+        let geo_rect = existing.iter().find(|it| {
+            it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(sym.owner_view)
+        });
+        let phase2: Vec<[f64; 2]> = match geo_rect {
+            Some(gr) => vec![
+                // Above the view, left-aligned to its geometry rect.
+                [gr.bbox.x0 + half, gr.bbox.y0 - LABEL_GAP - half],
+                // Below the view.
+                [gr.bbox.x0 + half, gr.bbox.y1 + LABEL_GAP + half],
+                // Right of the view.
+                [gr.bbox.x1 + LABEL_GAP + half, gr.bbox.y0 + half],
+                // Left of the view.
+                [gr.bbox.x0 - LABEL_GAP - half, gr.bbox.y0 + half],
+            ],
+            None => Vec::new(),
+        };
+
+        let chosen = phase1
             .iter()
+            .chain(phase2.iter())
             .find(|&&[cx, cy]| !collides(&bbox_at(cx, cy), &result))
             .copied()
             .unwrap_or([ax, ay]);
