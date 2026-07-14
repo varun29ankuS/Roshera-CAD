@@ -1141,6 +1141,83 @@ mod tests {
         );
     }
 
+    // ── Unit tests: resolve_target_face selector parity with select_face ────
+    //
+    // Audit finding: gdt_datum's `selector` is documented as "same shape as
+    // select_face" but was suspected of silently dropping `extremal`/`along`.
+    // `resolve_target_face` (above) and `select_face`
+    // (api-server/src/handlers/agent.rs) both build a `FaceQuery` from the
+    // raw JSON via the identical field set (kind, normal_dir, along,
+    // extremal, angle_tol_deg) and call the same `queries::select::resolve_face`.
+    // These tests exercise `resolve_target_face` directly with the exact
+    // selector shapes named in the audit and assert they resolve to the same
+    // face `select_face`'s underlying query would pick (cross-checked against
+    // `planar_face_at_z`, which finds the face by raw geometry, independent of
+    // the selector-parsing path under test).
+
+    #[test]
+    fn resolve_target_face_selector_with_extremal_most_along_and_along() {
+        let (mut m, solid) = new_model_with_box();
+        let bottom = planar_face_at_z(&m, solid, -5.0).expect("-Z face at z=-5");
+
+        // Exact selector from the audit finding: extremal + along, no normal_dir.
+        let selector = serde_json::json!({
+            "kind": "planar",
+            "extremal": "most_along",
+            "along": [0.0, 0.0, -1.0]
+        });
+        let resolved = resolve_target_face(&mut m, solid, None, Some(&selector))
+            .expect("selector with extremal+along must resolve, not be refused");
+        assert_eq!(
+            resolved, bottom,
+            "most_along [0,0,-1] must resolve the bottom (-Z) face"
+        );
+    }
+
+    #[test]
+    fn resolve_target_face_selector_with_normal_dir_and_extremal_largest_area() {
+        let (mut m, solid) = new_model_with_box();
+        let bottom = planar_face_at_z(&m, solid, -5.0).expect("-Z face at z=-5");
+
+        // Exact selector from the audit finding: normal_dir + extremal together.
+        let selector = serde_json::json!({
+            "kind": "planar",
+            "normal_dir": [0.0, 0.0, -1.0],
+            "extremal": "largest_area"
+        });
+        let resolved = resolve_target_face(&mut m, solid, None, Some(&selector))
+            .expect("selector with normal_dir+extremal must resolve, not be refused");
+        assert_eq!(
+            resolved, bottom,
+            "normal_dir [0,0,-1] + largest_area must resolve the bottom (-Z) face"
+        );
+    }
+
+    #[test]
+    fn resolve_target_face_selector_matches_bare_normal_dir_selector() {
+        // The selector known to work per the audit (`normal_dir` alone, no
+        // `extremal`) and the two selectors under test must resolve the SAME
+        // face — proving `extremal`/`along` are additive refinements, not
+        // silently-dropped fields that change the outcome.
+        let (mut m, solid) = new_model_with_box();
+
+        let bare = serde_json::json!({ "kind": "planar", "normal_dir": [0.0, 0.0, -1.0] });
+        let with_extremal = serde_json::json!({
+            "kind": "planar",
+            "normal_dir": [0.0, 0.0, -1.0],
+            "extremal": "largest_area"
+        });
+
+        let bare_resolved =
+            resolve_target_face(&mut m, solid, None, Some(&bare)).expect("bare selector resolves");
+        let extremal_resolved = resolve_target_face(&mut m, solid, None, Some(&with_extremal))
+            .expect("extremal selector resolves");
+        assert_eq!(
+            bare_resolved, extremal_resolved,
+            "adding extremal to an already-unambiguous selector must not change the resolved face"
+        );
+    }
+
     // ── Unit tests: FCF happy path evaluates InSpec verdict ──────────────────
 
     /// A perfectly flat face (part of a primitive box) must return InSpec
