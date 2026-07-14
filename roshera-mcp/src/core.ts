@@ -410,7 +410,13 @@ async function addOccupancyXray(target: Record<string, any>, partId: number): Pr
  * block, never an error) if anything fails, so it can't break a real result.
  */
 export async function perceive(partId: number | null): Promise<any> {
-  if (partId === null || process.env.ROSHERA_MCP_AUTOVERIFY === "0") {
+  lastPerceiveUnavailableReason = null;
+  if (partId === null) {
+    lastPerceiveUnavailableReason = "op produced no part id to certify";
+    return undefined;
+  }
+  if (process.env.ROSHERA_MCP_AUTOVERIFY === "0") {
+    lastPerceiveUnavailableReason = "ambient perception disabled (ROSHERA_MCP_AUTOVERIFY=0)";
     return undefined;
   }
   try {
@@ -501,9 +507,43 @@ export async function perceive(partId: number | null): Promise<any> {
       await addOccupancyXray(result, partId);
     }
     return result;
-  } catch {
+  } catch (err) {
+    // #37: THE reason a caller must never see when the perception field goes
+    // missing from a tool response — stash WHY so `perceptionField()` can
+    // surface a typed "⚠ cert unavailable: <reason>" instead of a silent
+    // omission/null. A timeout here is the common case: `PERCEPTION_TIMEOUT_MS`
+    // is deliberately short (4s default) so a slow cert can never hang the op
+    // that requested it, but that means sequential rapid-fire calls (e.g.
+    // drill_pattern's per-hole certify loop) can occasionally miss the window.
+    const msg = err instanceof Error ? err.message : String(err);
+    lastPerceiveUnavailableReason = `perception fetch failed: ${msg}`;
     return undefined;
   }
+}
+
+/**
+ * Sidecar set by the most recent `perceive()` call, naming WHY it returned
+ * `undefined` (disabled / no part id / timeout / network error). `undefined`
+ * itself is a legitimate, silent-by-convention JS value everywhere else in
+ * this codebase, but the ambient-perception WIRE FIELD must never degrade to
+ * a bare `null`/absent key with no explanation (#37) — every call site that
+ * surfaces a perception verdict to the agent should route through
+ * `perceptionField()` below rather than hand-rolling `p ? compactVerdict(p) : null`.
+ */
+let lastPerceiveUnavailableReason: string | null = null;
+
+/**
+ * Render a `perceive()` result as a string that is ALWAYS present and NEVER
+ * a silent `null` (#37 — the ambient-perception omission bug: drill_pattern's
+ * 3rd sequential call returned `"perception": null` and a sketch_extrude
+ * response omitted the field entirely, both traced to a fallible `perceive()`
+ * outcome being dropped on the floor instead of explained). Call this
+ * immediately after `await perceive(...)` — the reason sidecar is overwritten
+ * by the NEXT `perceive()` call.
+ */
+export function perceptionField(pv: any): string {
+  if (pv) return compactVerdict(pv);
+  return `⚠ cert unavailable: ${lastPerceiveUnavailableReason ?? "unknown reason"}`;
 }
 
 /**
@@ -579,14 +619,20 @@ export function compactVerdict(p: any): string {
  *    shaded render image on every op.
  *  - `cert`: full perception object, no image.
  *  - `xray` (composes with the above fetch): adds the occupancy slice-stack.
- * `ROSHERA_MCP_AUTOVERIFY=0` is the master off switch (no perception at all).
- * Every channel degrades gracefully on fetch failure.
+ * `ROSHERA_MCP_AUTOVERIFY=0` is the master off switch, but even then the
+ * `perception` field is present (a typed "disabled" string, never a missing
+ * key) — #37: the field is ALWAYS in the response, degradation is always
+ * explained, never silent.
  */
 export async function okp(data: Record<string, unknown>, partId: number | null) {
-  if (process.env.ROSHERA_MCP_AUTOVERIFY === "0") return ok(data);
   const perception = await perceive(partId);
   const mode = process.env.ROSHERA_AMBIENT_PERCEPTION ?? "compact";
-  if (perception === undefined) return ok(data);
+  if (perception === undefined) {
+    // #37: `perceive()` always records WHY before returning undefined
+    // (disabled / no part id / timeout / network error) — surface that
+    // reason instead of dropping the `perception` key from the response.
+    return ok({ ...data, perception: perceptionField(perception) });
+  }
   if (mode === "compact" || mode === "") {
     // The token-diet default: one verdict line, no image, no cert JSON.
     return ok({ ...data, perception: compactVerdict(perception) });

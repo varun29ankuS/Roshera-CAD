@@ -9,6 +9,7 @@ import {
   okp,
   perceive,
   compactVerdict,
+  perceptionField,
   placement,
   newestPartId,
   uuidForPart,
@@ -256,7 +257,10 @@ export function registerModifyTools(server: McpServer) {
           completed: tools.length,
           of: tools.length,
           placement: lastId !== null ? await placement(lastId) : null,
-          perception: p ? compactVerdict(p) : null,
+          // #37: never a bare null — perceptionField() names WHY when `p` is
+          // falsy (timeout / network error / no part id) instead of silently
+          // omitting the reason.
+          perception: perceptionField(p),
         });
       } catch (e) {
         return fail(e);
@@ -369,7 +373,12 @@ export function registerModifyTools(server: McpServer) {
           part_id: lastId,
           holes: count,
           placement: lastId !== null ? await placement(lastId) : null,
-          perception: pv ? compactVerdict(pv) : null,
+          // #37: never a bare null — perceptionField() names WHY when `pv` is
+          // falsy (this is exactly the bug that was hit here: a sequential
+          // per-hole perceive() occasionally missed the short ambient timeout
+          // window and returned undefined, which used to render as a silent
+          // `"perception": null`).
+          perception: perceptionField(pv),
         });
       } catch (e) {
         return fail(e);
