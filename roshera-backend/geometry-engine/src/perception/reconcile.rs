@@ -225,16 +225,59 @@ pub fn reconcile_full(
     }
 
     // ---- Axis 2: Truth↔Scene — edge-count agreement. ----
-    if diagnostic_frame.open_edges != cert.boundary_edges
-        || diagnostic_frame.nonmanifold_edges != cert.nonmanifold_edges
-    {
+    //
+    // The certificate and the diagnostic render tessellate the SAME B-Rep at
+    // DIFFERENT resolutions: `compute_certificate` re-tessellates with
+    // chord_tolerance=0.1 / max_segments=100 (`topology_builder.rs`), while
+    // the diagnostic render uses `TessellationParams::coarse()`
+    // (chord_tolerance=0.01 / max_segments=20 — tuned for speed across many
+    // reconcile viewpoints, see `reconcile_task.rs`). A single continuous
+    // boundary/non-manifold curve therefore chops into a DIFFERENT NUMBER of
+    // mesh edges under each tessellation, so the raw integer counts
+    // disagreeing is an expected artifact of that resolution difference, not
+    // itself evidence the two eyes disagree about the solid. The only
+    // methodology-independent signal is PRESENCE: does one eye see a defect
+    // (count > 0) while the other sees none?
+    let truth_has_open = cert.boundary_edges > 0;
+    let scene_has_open = diagnostic_frame.open_edges > 0;
+    let truth_has_nonmanifold = cert.nonmanifold_edges > 0;
+    let scene_has_nonmanifold = diagnostic_frame.nonmanifold_edges > 0;
+    let counts_differ = diagnostic_frame.open_edges != cert.boundary_edges
+        || diagnostic_frame.nonmanifold_edges != cert.nonmanifold_edges;
+    if truth_has_open != scene_has_open || truth_has_nonmanifold != scene_has_nonmanifold {
+        // A real cross-eye disagreement: one eye claims the solid is clean,
+        // the other claims it isn't. Tessellation resolution cannot explain
+        // a zero-vs-nonzero split, so this is worth a human's attention.
         discrepancies.push(Discrepancy {
             axis: ReconcileAxis::TruthScene,
             severity: Severity::Warning,
             faces: vec![],
             edges: vec![],
             message:
-                "certificate boundary/non-manifold edge counts disagree with the diagnostic render"
+                "certificate and diagnostic render DISAGREE on whether an open/non-manifold edge exists at all (not just on the count)"
+                    .into(),
+            truth_says: format!(
+                "boundary={} nonmanifold={}",
+                cert.boundary_edges, cert.nonmanifold_edges
+            ),
+            scene_says: format!(
+                "open={} nonmanifold={}",
+                diagnostic_frame.open_edges, diagnostic_frame.nonmanifold_edges
+            ),
+            semantic_says: "n/a".into(),
+        });
+    } else if counts_differ {
+        // Both eyes agree a defect exists (or that the solid is clean); the
+        // raw counts differ only because the two tessellations subdivide the
+        // same defect curve(s) at different resolutions. Advisory-only: not
+        // a sign the eyes disagree, so `Info` rather than `Warning`.
+        discrepancies.push(Discrepancy {
+            axis: ReconcileAxis::TruthScene,
+            severity: Severity::Info,
+            faces: vec![],
+            edges: vec![],
+            message:
+                "certificate and diagnostic render agree a defect exists but their edge counts differ — expected, since the two eyes tessellate the same B-Rep at different resolutions (cert: chord=0.1/max_segments=100; diagnostic: coarse chord=0.01/max_segments=20)"
                     .into(),
             truth_says: format!(
                 "boundary={} nonmanifold={}",
@@ -740,6 +783,55 @@ mod reconcile_full_tests {
         );
         assert!(d.scene_says.contains("open=4"), "scene: {}", d.scene_says);
         assert_eq!(report.status, ReconcileStatus::DiscrepanciesFound);
+    }
+
+    #[test]
+    fn count_mismatch_with_both_nonzero_is_info_not_warning() {
+        // Both eyes agree a defect exists (nonzero on both sides), but the
+        // raw counts differ because the cert and the diagnostic render
+        // tessellate the same B-Rep at different resolutions (see the Axis 2
+        // doc comment in `reconcile_full`). This must NOT be a Warning — the
+        // eyes are not actually disagreeing about the solid, only about how
+        // many mesh edges the same continuous defect curve chops into.
+        let frames = vec![face_frame(&[1]), face_frame(&[1]), face_frame(&[1])];
+        let mut cert = ValidityCertificate::fully_sound_for_test();
+        cert.boundary_edges = 100;
+        cert.nonmanifold_edges = 0;
+        let report = reconcile_full(
+            7,
+            99,
+            &live(&[1]),
+            &cert,
+            &[],
+            &frames,
+            &diag_frame(20, 0),
+            3,
+            0,
+        );
+        assert!(
+            report
+                .discrepancies
+                .iter()
+                .all(|d| !(d.axis == ReconcileAxis::TruthScene && d.severity == Severity::Warning)),
+            "both eyes agreeing a defect exists (just at different tessellation \
+             resolutions) must not raise a TruthScene Warning; discrepancies={:?}",
+            report.discrepancies
+        );
+        let info = report
+            .discrepancies
+            .iter()
+            .find(|d| d.axis == ReconcileAxis::TruthScene && d.severity == Severity::Info)
+            .expect("differing nonzero counts must still surface a TruthScene Info note");
+        assert!(
+            info.message.contains("different resolutions"),
+            "Info message must explain the tessellation-resolution artifact; message: {}",
+            info.message
+        );
+        assert_eq!(
+            report.status,
+            ReconcileStatus::Clean,
+            "Info-only discrepancies must not flip status away from Clean"
+        );
     }
 
     #[test]

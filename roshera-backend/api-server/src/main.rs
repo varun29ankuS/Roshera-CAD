@@ -7400,6 +7400,20 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load `roshera-backend/.env` into the process environment (gitignored —
+    // local dev only, never shipped). Fix #30: `dotenvy` has been a declared
+    // dependency since this crate's Cargo.toml was written, but nothing ever
+    // called it, so every var documented in `.env` (most importantly
+    // `ROSHERA_DEV_BRIDGE`, which mounts `/ws/viewport-bridge` +
+    // `/api/viewport/*` — see `viewport_bridge::enabled()`) silently had no
+    // effect unless the launching shell happened to export it directly. A
+    // dev running the server per the `.env` file's own inline docs ("Set to
+    // 1 to mount...") got a 404 on the frontend's bridge socket with no
+    // indication why. `.ok()`: a missing `.env` (e.g. a fresh checkout, or a
+    // production host with no such file) is not an error — every var falls
+    // back to being genuinely absent, matching today's behaviour exactly.
+    dotenvy::dotenv().ok();
+
     // Initialize tracing with timestamped, leveled output.
     //
     // Provenance requires every log line to carry a wall-clock
