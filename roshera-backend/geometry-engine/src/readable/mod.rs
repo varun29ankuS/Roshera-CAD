@@ -45,5 +45,6 @@ pub use features::{
 pub use part::{
     format_datum_kind, format_datum_subkind, format_location_oneliner, DatumSummary,
     DistanceReport, EdgeReport, FaceReport, HoverReport, ListPartsFilter, MassPropertiesReport,
-    MaterialSummary, OrientedBBox, PartProximity, PartReport, PartSummary, TopologyFingerprint,
+    MassPropertiesUnits, MaterialSummary, OrientedBBox, PartProximity, PartReport, PartSummary,
+    TopologyFingerprint,
 };

@@ -34,8 +34,11 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "mass_properties",
-    "Exact mass properties: volume, mass, center of mass, inertia tensor, " +
-      "principal axes (mesh-integrated, accuracy-gated against closed form).",
+    "Exact mass properties: volume (mm^3), mass (kg), center of mass (mm), " +
+      "inertia tensor + principal moments (kg·mm^2), principal axes " +
+      "(mesh-integrated, accuracy-gated against closed form). The response's " +
+      "'units' object carries these same labels per-field — authoritative, " +
+      "not just this description.",
     { part_id: z.number().int() },
     async ({ part_id }) => {
       try {

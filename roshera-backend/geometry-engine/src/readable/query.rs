@@ -472,6 +472,7 @@ impl BRepModel {
                 props.radius_of_gyration.y,
                 props.radius_of_gyration.z,
             ],
+            units: crate::readable::part::MassPropertiesUnits::canonical(),
             method: props.method,
         })
     }
@@ -1552,6 +1553,76 @@ mod tests {
             }
         }
         assert!(mp.principal_moments.iter().all(|m| m.is_finite()));
+    }
+
+    /// Audit finding regression: `mass_properties_for` on a 20×20×20 mm
+    /// (8000 mm³) Steel (7850 kg/m³) cube must return `mass ≈ 0.0628 kg`, not
+    /// the raw `volume_mm3 × density_kg_m3 = 62_800_000` the unconverted bug
+    /// returned (that number is off by 1e9 — it never divided by the
+    /// mm³→m³ factor). The RED evidence for this fix is exactly that stray
+    /// factor of 1e9: before the fix `mp.mass` was ~62_800_000, not ~0.0628.
+    ///
+    /// Also checks the closed-form inertia of a cube about its centroid,
+    /// `I = m·a²/6` for every principal axis (a cube is inertially
+    /// symmetric), which must likewise land in kg·mm² (≈4.19), not the
+    /// unconverted ~4.19e9.
+    #[test]
+    fn mass_properties_for_steel_cube_matches_closed_form_kg() {
+        let mut model = BRepModel::new();
+        let params = BoxParameters {
+            width: 20.0,
+            height: 20.0,
+            depth: 20.0,
+            corner_radius: None,
+            transform: None,
+            tolerance: None,
+        };
+        let id = BoxPrimitive::create(params, &mut model).expect("create 20mm cube");
+        let mp = model.mass_properties_for(id).expect("mass props");
+
+        assert!(
+            (mp.volume - 8000.0).abs() < 1e-6,
+            "cube volume must be 8000 mm^3, got {}",
+            mp.volume
+        );
+        assert!(
+            (mp.mass - 0.0628).abs() < 1e-4,
+            "20mm steel cube must weigh ~0.0628 kg, got {} \
+             (if this is ~62_800_000, the mm3->m3 unit conversion regressed)",
+            mp.mass
+        );
+
+        // I = m * a^2 / 6 for a cube about its centroid, same for all 3 axes.
+        let expected_moment = mp.mass * 20.0 * 20.0 / 6.0;
+        assert!(
+            (expected_moment - 4.19).abs() < 0.01,
+            "sanity: closed-form expectation itself must be ~4.19 kg*mm^2, got {expected_moment}"
+        );
+        for (k, &m) in mp.principal_moments.iter().enumerate() {
+            let rel = (m - expected_moment).abs() / expected_moment;
+            assert!(
+                rel < 1e-2,
+                "principal moment[{k}] must be ~{expected_moment:.4} kg*mm^2, got {m} \
+                 (if this is ~{:.4}e9, the inertia unit conversion regressed)",
+                expected_moment
+            );
+        }
+    }
+
+    /// The wire report must carry explicit, correct unit labels for every
+    /// physical-quantity field — an agent must never have to assume mm vs m,
+    /// or kg vs raw kernel units.
+    #[test]
+    fn mass_properties_report_units_are_explicit() {
+        let (mut model, id) = fresh_model_with_box();
+        let mp = model.mass_properties_for(id).expect("mass props");
+        assert_eq!(mp.units.volume, "mm^3");
+        assert_eq!(mp.units.surface_area, "mm^2");
+        assert_eq!(mp.units.mass, "kg");
+        assert_eq!(mp.units.center_of_mass, "mm");
+        assert_eq!(mp.units.inertia_tensor, "kg·mm^2");
+        assert_eq!(mp.units.principal_moments, "kg·mm^2");
+        assert_eq!(mp.units.radius_of_gyration, "mm");
     }
 
     #[test]

@@ -95,13 +95,48 @@ pub struct MaterialSummary {
     pub density: f64,
 }
 
+/// Explicit per-field unit labels for [`MassPropertiesReport`], carried on
+/// the wire so no consumer has to assume a convention. Every
+/// `MassPropertiesReport` is built with [`MassPropertiesUnits::canonical`] —
+/// this is not user-configurable, it just documents, on every response, the
+/// units the kernel actually computed in (mm for length, kg for mass, since
+/// the working-unit convention is millimetres and every `Material::density`
+/// is kg/m³).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MassPropertiesUnits {
+    pub volume: String,
+    pub surface_area: String,
+    pub mass: String,
+    pub center_of_mass: String,
+    pub inertia_tensor: String,
+    pub principal_moments: String,
+    pub radius_of_gyration: String,
+}
+
+impl MassPropertiesUnits {
+    /// The one true unit set every [`MassPropertiesReport`] is built with.
+    pub fn canonical() -> Self {
+        Self {
+            volume: "mm^3".to_string(),
+            surface_area: "mm^2".to_string(),
+            mass: "kg".to_string(),
+            center_of_mass: "mm".to_string(),
+            inertia_tensor: "kg·mm^2".to_string(),
+            principal_moments: "kg·mm^2".to_string(),
+            radius_of_gyration: "mm".to_string(),
+        }
+    }
+}
+
 /// Mass-properties report for a single solid.
 ///
 /// Returned by `BRepModel::mass_properties_for`. All values are in SI
 /// units assuming the working-unit convention is millimetres for
 /// length: volume in **mm³**, mass in **kg** when density is kg/m³
 /// (the kernel does the cubic-mm-to-cubic-m conversion internally),
-/// center of mass / inertia tensor in working units.
+/// center of mass in **mm**, inertia tensor / principal moments in
+/// **kg·mm²**. See the `units` field for the same labels on the wire —
+/// it is the authoritative, self-certifying source, not this comment.
 ///
 /// `principal_axes` is a column-vector triplet ordered by ascending
 /// eigenvalue (`principal_moments[0]` corresponds to `principal_axes[0]`,
@@ -113,35 +148,42 @@ pub struct MassPropertiesReport {
     /// Stable solid identifier this report describes.
     pub solid_id: SolidId,
     /// Volume integral over the outer shell minus inner shells. Always
-    /// non-negative for well-formed solids.
+    /// non-negative for well-formed solids. Units: `units.volume` (mm³).
     pub volume: f64,
-    /// Outer-shell surface area.
+    /// Outer-shell surface area. Units: `units.surface_area` (mm²).
     pub surface_area: f64,
-    /// Mass = volume × material density. Always populated since the
-    /// kernel guarantees every solid carries a `Material` (defaulting
-    /// to Steel @ 7850 kg/m³).
+    /// Mass = volume × material density, converted from the kernel's
+    /// working units (mm³, kg/m³) to kilograms. Always populated since
+    /// the kernel guarantees every solid carries a `Material` (defaulting
+    /// to Steel @ 7850 kg/m³). Units: `units.mass` (kg).
     pub mass: f64,
     /// Material snapshot used in the mass calculation, surfaced so the
     /// agent can quote back *"this part weighs 1.42 kg in Aluminum
     /// 6061"* without a follow-up query.
     pub material: MaterialSummary,
     /// World-space center of mass (the same point one would attach a
-    /// string to and the part would hang balanced).
+    /// string to and the part would hang balanced). Units: `units.center_of_mass` (mm).
     pub center_of_mass: [f64; 3],
     /// Full 3×3 inertia tensor about the center of mass, in
     /// row-major form. Symmetric — `tensor[i][j] == tensor[j][i]`
-    /// up to floating-point noise.
+    /// up to floating-point noise. Units: `units.inertia_tensor` (kg·mm²).
     pub inertia_tensor: [[f64; 3]; 3],
     /// Principal moments of inertia, sorted ascending. The smallest
-    /// moment corresponds to the long-axis direction.
+    /// moment corresponds to the long-axis direction. Units:
+    /// `units.principal_moments` (kg·mm²).
     pub principal_moments: [f64; 3],
     /// Principal axes — orthonormal eigenvectors of the inertia
     /// tensor, ordered to match `principal_moments`. `principal_axes[0]`
     /// is the direction of smallest moment (i.e. the part's "long
     /// axis"); `principal_axes[2]` is the direction of largest moment.
+    /// Unit vectors — dimensionless, no unit conversion applies.
     pub principal_axes: [[f64; 3]; 3],
     /// Radius of gyration about each principal axis (`sqrt(I/m)`).
+    /// Units: `units.radius_of_gyration` (mm).
     pub radius_of_gyration: [f64; 3],
+    /// Explicit unit label for every physical-quantity field above — see
+    /// [`MassPropertiesUnits`]. Always [`MassPropertiesUnits::canonical`].
+    pub units: MassPropertiesUnits,
     /// Indicator of how this report was computed —
     /// [`MassPropertiesMethod::Analytical`] (closed-form face traversal,
     /// exact to floating-point noise) or

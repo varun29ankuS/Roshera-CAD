@@ -3866,7 +3866,18 @@ impl BRepModel {
         tess_params: &crate::tessellation::TessellationParams,
     ) -> Option<crate::primitives::solid::SolidMassProperties> {
         let solid = self.solids.get(solid_id)?;
-        let density = solid.attributes.material.density;
+        // `Material::density` is in kg/m³ (see `primitives::solid::Material`),
+        // but every length in this integration — mesh vertex coordinates,
+        // hence volume and the second-moment accumulators below — is in the
+        // model's working unit, millimetres. Converting kg/m³ → kg/mm³ here
+        // (× 1e-9, since 1 m³ = 1e9 mm³) makes every downstream product
+        // (`mass = volume_mm3 × density`, `i_origin = density × moment_mm5`)
+        // come out in physically correct kg / kg·mm² directly, instead of
+        // silently returning `volume_mm3 × density_kg_m3` unconverted (off by
+        // 1e9 — audit finding: a 20.6 cm³ steel part reported `mass:
+        // 162055791.9` with no unit, i.e. µg-scale numbers mislabelled as kg).
+        const KG_PER_M3_TO_KG_PER_MM3: f64 = 1e-9;
+        let density = solid.attributes.material.density * KG_PER_M3_TO_KG_PER_MM3;
         let mesh = crate::tessellation::tessellate_solid(solid, self, tess_params);
         if mesh.triangles.is_empty() {
             return None;
