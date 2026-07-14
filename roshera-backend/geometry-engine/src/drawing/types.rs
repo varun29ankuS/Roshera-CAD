@@ -259,6 +259,41 @@ pub struct ProjectedView {
     /// Occluded analytic circles, drawn dashed.
     #[serde(default)]
     pub hidden_circles: Vec<ProjectedCircle>,
+    /// Deterministic shaded-solid raster for a PICTORIAL (isometric) cell.
+    /// When `Some`, the SVG/PDF renderer inks this image over the view's
+    /// sheet-space geometry rect INSTEAD of the wireframe polylines/circles
+    /// (the polylines are still retained for layout extent + DXF wireframe).
+    /// `None` for orthographic views and for wireframe-only drawings.
+    /// `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shaded_raster: Option<ShadedRaster>,
+}
+
+/// A deterministic shaded-solid raster that REPLACES the wireframe line work
+/// for a PICTORIAL (isometric) cell in the SVG / PDF output.
+///
+/// A shop reader needs the isometric to be RECOGNISABLE — a shaded solid, not
+/// see-through HLR line work. The kernel's GPU-free rasterizer
+/// ([`crate::render`]) produces this image at drawing-build time; the SVG/PDF
+/// renderer inks it as an `<image>` covering the view's sheet-space geometry
+/// rect instead of the view's polylines/circles. The view's `polylines` are
+/// RETAINED even when this is `Some` — they still drive the layout extent
+/// (collision policing) and the DXF wireframe fallback (DXF is vector-only, so
+/// the isometric stays line work there).
+///
+/// Determinism: the render uses a fixed isometric camera and the default
+/// tessellation, with no time-based seeds, so the same solid yields byte-
+/// identical pixels — the drawing quality verifier and any downstream cert
+/// fingerprint stay stable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadedRaster {
+    /// PNG bytes, standard-alphabet base64 (no line breaks), ready to drop
+    /// straight into an SVG `<image href="data:image/png;base64,…">`.
+    pub png_base64: String,
+    /// Pixel width of the encoded PNG.
+    pub px_width: usize,
+    /// Pixel height of the encoded PNG.
+    pub px_height: usize,
 }
 
 /// A circular edge projected to a true circle in view-space (mm, pre-scale).

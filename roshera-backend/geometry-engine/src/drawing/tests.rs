@@ -63,6 +63,186 @@ fn right_projection_drops_x() {
     assert!((p[1] - 5.0).abs() < 1e-12);
 }
 
+// ============================================================
+// Shaded-solid isometric pictorial cell
+// ============================================================
+
+/// Decode a base64 PNG and return `(width, height, non_white_fraction)`, where
+/// the fraction is the share of RGB pixels that are NOT the pure-white
+/// (sheet-coloured) background — i.e. inked-by-the-solid coverage.
+fn png_fill_stats(png_base64: &str) -> (u32, u32, f64) {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bytes = STANDARD.decode(png_base64).expect("valid base64 PNG");
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG magic header");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("png header");
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("png frame");
+    assert_eq!(info.color_type, png::ColorType::Rgb, "kernel encodes RGB8");
+    let px = &buf[..info.buffer_size()];
+    let mut non_white = 0usize;
+    let total = (info.width * info.height) as usize;
+    for chunk in px.chunks_exact(3) {
+        if chunk != [255u8, 255, 255] {
+            non_white += 1;
+        }
+    }
+    (info.width, info.height, non_white as f64 / total as f64)
+}
+
+/// Decode a base64 PNG (RGB8, grayscale-valued shading) and return the sorted
+/// distinct GRAY levels of non-background pixels, ignoring rare boundary blends
+/// (a level must own >= 1% of the foreground to count as a face family).
+fn png_distinct_grays(png_base64: &str) -> Vec<u8> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bytes = STANDARD.decode(png_base64).expect("valid base64 PNG");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("png header");
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("png frame");
+    let px = &buf[..info.buffer_size()];
+    let mut counts = [0usize; 256];
+    let mut foreground = 0usize;
+    for chunk in px.chunks_exact(3) {
+        if chunk != [255u8, 255, 255] {
+            counts[chunk[0] as usize] += 1;
+            foreground += 1;
+        }
+    }
+    let min_family = (foreground / 100).max(1);
+    (0..256u32)
+        .filter(|&g| counts[g as usize] >= min_family)
+        .map(|g| g as u8)
+        .collect()
+}
+
+/// The auto four-view sheet's ISOMETRIC cell must carry a SHADED-SOLID raster
+/// that REPLACES the wireframe line work — a shop reader needs a recognizable
+/// solid, not see-through HLR edges.
+///
+/// Teeth: the decoded PNG's interior fill coverage must be far above the sparse
+/// density of line art (a wireframe iso inks well under ~5% of the cell; a
+/// shaded solid inks tens of percent). We assert > 20%.
+#[test]
+fn auto_sheet_isometric_cell_is_shaded_solid() {
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    let mut model = BRepModel::new();
+    let sid = match TopologyBuilder::new(&mut model)
+        .create_box_3d(40.0, 30.0, 20.0)
+        .expect("box")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("{o:?}"),
+    };
+    let drawing =
+        super::dimensioning::standard_drawing_auto(&model, sid, Uuid::nil()).expect("auto sheet");
+
+    let iso = drawing
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Isometric))
+        .expect("auto sheet has an isometric view");
+
+    let raster = iso
+        .shaded_raster
+        .as_ref()
+        .expect("isometric cell must carry a shaded-solid raster");
+    assert!(
+        raster.px_width >= 32 && raster.px_height >= 32,
+        "sane px size"
+    );
+
+    let (w, h, fill) = png_fill_stats(&raster.png_base64);
+    assert_eq!(
+        (w as usize, h as usize),
+        (raster.px_width, raster.px_height),
+        "reported px dims match the encoded PNG"
+    );
+    assert!(
+        fill > 0.20,
+        "shaded-solid fill coverage {fill:.3} must dwarf line-art density (>0.20)"
+    );
+
+    // The SVG must embed the raster as an <image> data-URI.
+    let svg = render_drawing_svg(&drawing);
+    assert!(
+        svg.contains("class=\"view-shaded\"") && svg.contains("data:image/png;base64,"),
+        "SVG must ink the shaded isometric as an embedded raster <image>"
+    );
+    assert!(
+        svg.contains("data-projection=\"Isometric\""),
+        "the shaded cell keeps its projection identity for the frontend"
+    );
+
+    // EDGE OUTLINES over the shading (Varun 2026-07-14: "the iso solid has to
+    // show outlines .. without outlines .. its barely visible"): the iso view's
+    // wireframe polylines must be inked ON TOP of the raster — the SVG must
+    // contain BOTH the <image> AND the iso view's <g> group with polylines.
+    // The <g> tag carries a transform attribute; the <image> tag does not.
+    let iso_group_start = svg
+        .match_indices("data-projection=\"Isometric\"")
+        .find(|(i, _)| svg[*i..(*i + 220).min(svg.len())].contains("transform="))
+        .map(|(i, _)| i)
+        .expect("iso view <g> group must still be emitted (outlines over shading)");
+    let group_tail = &svg[iso_group_start..];
+    let group_end = group_tail.find("</g>").expect("closed group");
+    assert!(
+        group_tail[..group_end].contains("<polyline"),
+        "iso outlines (polylines) must be inked over the shaded raster"
+    );
+    // Paint order: the raster <image> must be emitted BEFORE the outline group
+    // so the line work draws on top (SVG paints in document order).
+    let image_at = svg.find("class=\"view-shaded\"").expect("image present");
+    assert!(
+        image_at < iso_group_start,
+        "raster must be under the outlines (image at {image_at}, group at {iso_group_start})"
+    );
+
+    // LIGHTING (Varun 2026-07-14: "at least lights have to be used properly"):
+    // under a HEADLIGHT lambert every visible face of an iso cube reads the
+    // SAME gray (|n·view| = 1/sqrt(3) for all three). The key-lit render must
+    // make the three visible face families read as clearly distinct values.
+    let grays = png_distinct_grays(&raster.png_base64);
+    assert!(
+        grays.len() >= 3,
+        "iso box faces must read >=3 distinct shading values (got {grays:?})"
+    );
+    let (min_g, max_g) = (grays[0], grays[grays.len() - 1]);
+    assert!(
+        max_g as i32 - min_g as i32 >= 30,
+        "face shading steps must be clearly distinct (spread {min_g}..{max_g})"
+    );
+}
+
+/// The shaded isometric raster must be DETERMINISTIC — the drawing quality
+/// verifier and any downstream cert fingerprint depend on identical bytes for
+/// identical input. No time-based seeds.
+#[test]
+fn shaded_isometric_raster_is_deterministic() {
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    let build = || {
+        let mut model = BRepModel::new();
+        let sid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        super::dimensioning::standard_drawing_auto(&model, sid, Uuid::nil())
+            .expect("auto sheet")
+            .views
+            .into_iter()
+            .find(|v| matches!(v.projection, ProjectionType::Isometric))
+            .and_then(|v| v.shaded_raster)
+            .expect("iso shaded raster")
+            .png_base64
+    };
+    assert_eq!(build(), build(), "same solid → byte-identical shaded PNG");
+}
+
 /// Bottom view = upside-down top.
 #[test]
 fn bottom_projection_flips_y_relative_to_top() {

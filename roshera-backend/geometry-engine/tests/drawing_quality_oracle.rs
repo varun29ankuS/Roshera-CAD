@@ -52,6 +52,7 @@ fn rect_view(
         hidden_polylines: Vec::new(),
         circles: Vec::new(),
         hidden_circles: Vec::new(),
+        shaded_raster: None,
     }
 }
 
@@ -358,11 +359,16 @@ fn six_hole_plate_sheet_is_clean() {
         1,
         "view label 'SECTION A-A' must be inked exactly once on A4 (replaces ISO)"
     );
-    // ISOMETRIC is gone on A4 (replaced by SECTION A-A).
+    // SPEC CHANGE 2026-07-14 (was: "ISOMETRIC must NOT appear on A4"): the
+    // section still takes the ISO's grid slot, but the sheet re-attaches a
+    // compact SHADED isometric pictorial in free space (Varun: "I would add a
+    // shaded solid isometric to the drawing as well ... its important"), so
+    // exactly ONE isometric label is expected — see
+    // a4_section_sheet_keeps_shaded_isometric_pictorial for the full contract.
     assert_eq!(
         svg.matches(">ISOMETRIC (").count(),
-        0,
-        "ISOMETRIC must NOT appear on A4 — it is replaced by SECTION A-A"
+        1,
+        "the compact shaded ISOMETRIC pictorial must be inked exactly once on A4"
     );
     // Task 7: the hole table must be ON this sheet. Six Ø5 THRU bores form
     // one group A with instances A1..A6: six tag CALLOUTS (class="hole-tag")
@@ -2415,6 +2421,131 @@ fn six_hole_plate_orthographic_labels_intact_after_task9() {
         1,
         "SECTION A-A label must be inked exactly once"
     );
+}
+
+/// A4 + section sheets must STILL carry a shaded isometric pictorial.
+///
+/// Varun (2026-07-14): "I would add a shaded solid isometric to the drawing
+/// as well ... I think its important." The ReplaceIso rule (SECTION A-A takes
+/// the ISO slot on A4) previously removed the isometric ENTIRELY on exactly
+/// the parts that matter (anything with interior features). The fix keeps the
+/// section AND re-attaches the shaded iso as a compact pictorial placed
+/// deterministically in genuinely free sheet space, registered as view
+/// geometry so the collision invariants police it like any other ink.
+///
+/// RED evidence (2026-07-14, before attach_pictorial_iso existed): the
+/// bored-flange A4 sheet had zero Isometric views and zero <image> elements —
+/// this test failed at "A4 section sheet must keep an isometric pictorial".
+#[test]
+fn a4_section_sheet_keeps_shaded_isometric_pictorial() {
+    let (m, part) = six_hole_plate();
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    assert_eq!(
+        dwg.sheet_size,
+        SheetSize::A4,
+        "fixture must exercise ReplaceIso"
+    );
+
+    // BOTH the section and the pictorial isometric are on the sheet.
+    assert!(
+        dwg.views.iter().any(|v| v.name == "SECTION A-A"),
+        "A4 sheet keeps SECTION A-A"
+    );
+    let iso = dwg
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Isometric))
+        .expect("A4 section sheet must keep an isometric pictorial");
+    assert!(
+        iso.shaded_raster.is_some(),
+        "the pictorial isometric must carry the shaded-solid raster"
+    );
+
+    // Compact: the pictorial's sheet-space extent stays thumbnail-sized.
+    let ext_w = iso.extent.width() * iso.scale;
+    let ext_h = iso.extent.height() * iso.scale;
+    assert!(
+        ext_w <= 0.35 * dwg.sheet_size.width() && ext_h <= 0.35 * dwg.sheet_size.height(),
+        "pictorial must be compact (got {ext_w:.1}x{ext_h:.1} mm on {})",
+        dwg.sheet_size.label()
+    );
+
+    // The quality oracle must still pass — the pictorial found genuinely free
+    // space and is policed as inked content (no view/label/dim collisions).
+    let report = verify_drawing(&dwg);
+    assert!(
+        report.passed,
+        "quality must pass with the pictorial; issues: {:?}",
+        report.issues
+    );
+    assert!(!report.has(DrawingIssueKind::ViewOverlap));
+    assert!(!report.has(DrawingIssueKind::ViewOutsideFrame));
+    assert!(!report.has(DrawingIssueKind::ViewOverlapsTitleBlock));
+
+    // The SVG inks the shaded raster + exactly one ISOMETRIC label.
+    let svg = render_drawing_svg(&dwg);
+    assert!(
+        svg.contains("class=\"view-shaded\"") && svg.contains("data:image/png;base64,"),
+        "SVG must embed the shaded pictorial as a raster <image>"
+    );
+    assert_eq!(
+        svg.matches(">ISOMETRIC (").count(),
+        1,
+        "ISOMETRIC label inked exactly once"
+    );
+}
+
+/// A3+ (FifthSlot) sheets keep the ISO cell — and it must carry the shaded
+/// raster too (the five-view re-solve mutates scale/position only, never the
+/// raster). Fixture: a 120 mm plate (A3 per pick_sheet) with one through-bore
+/// (hole_sites non-empty → SECTION A-A appended as the fifth view).
+#[test]
+fn a3_fifth_slot_sheet_keeps_shaded_iso_raster() {
+    let mut m = BRepModel::new();
+    let plate = match TopologyBuilder::new(&mut m)
+        .create_box_3d(120.0, 80.0, 10.0)
+        .expect("plate")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let bore = match TopologyBuilder::new(&mut m)
+        .create_cylinder_3d(Point3::new(30.0, 0.0, -6.0), Vector3::Z, 6.0, 12.0)
+        .expect("bore")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let part = boolean_operation(
+        &mut m,
+        plate,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("drill");
+
+    let dwg = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    assert!(
+        dwg.sheet_size != SheetSize::A4,
+        "120 mm part must leave A4 (got {}) so FifthSlot applies",
+        dwg.sheet_size.label()
+    );
+    assert!(
+        dwg.views.iter().any(|v| v.name == "SECTION A-A"),
+        "bored part gets SECTION A-A appended on A3+"
+    );
+    let iso = dwg
+        .views
+        .iter()
+        .find(|v| matches!(v.projection, ProjectionType::Isometric))
+        .expect("A3+ keeps the ISO cell");
+    assert!(
+        iso.shaded_raster.is_some(),
+        "the A3+ iso cell must carry the shaded-solid raster through the five-view re-solve"
+    );
+    let report = verify_drawing(&dwg);
+    assert!(report.passed, "issues: {:?}", report.issues);
 }
 
 /// UNIT TEST — `CuttingPlaneLine` round-trips through the layout.

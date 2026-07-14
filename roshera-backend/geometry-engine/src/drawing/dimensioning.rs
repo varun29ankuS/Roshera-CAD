@@ -645,6 +645,78 @@ fn build_hlr_view(
     Ok(view)
 }
 
+/// Render the deterministic SHADED-SOLID isometric raster for the pictorial
+/// cell. The image REPLACES the wireframe line work in the SVG/PDF output so a
+/// shop reader sees a recognizable solid, not see-through HLR edges.
+///
+/// The camera is the render module's canonical isometric — the SAME
+/// (−1,−1,−1)/√3 direction and up/right basis the wireframe [`ProjectionType::
+/// Isometric`] projection uses (verified: `render::CanonicalView::Isometric`
+/// and `projection::view_matrix_for_projection(Isometric)` share the octant
+/// camera and the (1,−1,0)/√2, (1,1,2)/√6 page axes), so the shaded solid lands
+/// in the same pose the wireframe occupied.
+///
+/// The PNG's pixel aspect ratio is matched to the cell's sheet-space geometry
+/// rect (`iso_extent × scale`) so the placed `<image>` is not stretched; the
+/// rasterizer preserves the part's own aspect and letterboxes onto the white
+/// (sheet-coloured) background, which is invisible on the page.
+///
+/// Deterministic: fixed camera + default tessellation + PNG/base64 encode, no
+/// time-based seeds — the same solid yields byte-identical output.
+fn shaded_iso_raster(
+    model: &BRepModel,
+    solid_id: SolidId,
+    iso_extent: super::types::ViewExtent,
+    scale: f64,
+) -> Option<super::types::ShadedRaster> {
+    use crate::render::{render_solid_lit, CanonicalView, RenderMode, RenderOptions};
+    use crate::tessellation::TessellationParams;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    // Sheet-space cell size (mm). Guard against a degenerate/edge-on extent.
+    let w_mm = (iso_extent.width() * scale).max(1.0);
+    let h_mm = (iso_extent.height() * scale).max(1.0);
+
+    // ~8 px/mm gives a crisp cell (≈200 DPI) without a bloated payload; clamp
+    // the long side so a large sheet's iso cell can't emit a multi-MB PNG.
+    const PX_PER_MM: f64 = 8.0;
+    const MAX_SIDE: usize = 640;
+    const MIN_SIDE: usize = 32;
+    let mut px_w = (w_mm * PX_PER_MM).round() as usize;
+    let mut px_h = (h_mm * PX_PER_MM).round() as usize;
+    let longest = px_w.max(px_h);
+    if longest > MAX_SIDE {
+        let s = MAX_SIDE as f64 / longest as f64;
+        px_w = ((px_w as f64) * s).round() as usize;
+        px_h = ((px_h as f64) * s).round() as usize;
+    }
+    px_w = px_w.max(MIN_SIDE);
+    px_h = px_h.max(MIN_SIDE);
+
+    let opts = RenderOptions {
+        width: px_w,
+        height: px_h,
+        view: CanonicalView::Isometric,
+        mode: RenderMode::Shaded,
+        tessellation: TessellationParams::default(),
+    };
+    // Key light for the pictorial (Varun: "lights have to be used properly").
+    // The default HEADLIGHT lambert collapses an iso cube to one uniform gray
+    // (|n·view| = 1/√3 on all three visible faces). This fixed oblique key —
+    // high and behind-left, unit ≈ (−0.37, −0.56, 0.74) — steps the three
+    // face families to clearly distinct values (top brightest), with the
+    // 0.25 ambient floor keeping every face readable. Deterministic constant;
+    // only this presentation path uses it (render_solid stays headlight).
+    let key_light = Vector3::new(-0.4, -0.6, 0.8).normalize().ok()?;
+    let frame = render_solid_lit(model, solid_id, key_light, &opts)?;
+    let png = frame.to_png().ok()?;
+    Some(super::types::ShadedRaster {
+        png_base64: STANDARD.encode(&png),
+        px_width: frame.width,
+        px_height: frame.height,
+    })
+}
+
 /// Snap a fill scale down to the nearest preferred drafting ratio so the
 /// title block reads a clean "2:1" / "1:2" rather than "2.37:1".
 fn snap_scale(s: f64) -> f64 {
@@ -850,6 +922,15 @@ pub fn standard_drawing_auto(
         if !dimensioned {
             view.dimensions.clear();
         }
+        // The isometric cell is a PICTORIAL reference: replace its wireframe
+        // line work with a deterministic shaded-solid render so a shop reader
+        // sees a recognizable solid. The polylines stay on the view (they drive
+        // the layout extent + the DXF wireframe fallback); only the SVG/PDF
+        // renderers swap in the raster. If the render fails (empty mesh), the
+        // view silently keeps its wireframe — never a broken cell.
+        if matches!(proj, ProjectionType::Isometric) {
+            view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, scale);
+        }
         drawing.add_view(view);
     }
     dedup_dimensions_global(&mut drawing);
@@ -876,7 +957,165 @@ pub fn standard_drawing_auto(
     // per the spec.
     attach_gdt_annotations(model, solid_id, &mut drawing);
 
+    // ── Pictorial isometric coexistence (A4 ReplaceIso) ───────────────────────
+    // On A4, SECTION A-A replaced the ISO cell entirely — but the sheet must
+    // still carry the shaded isometric (Varun 2026-07-14: "I would add a
+    // shaded solid isometric to the drawing as well ... its important"). Re-
+    // attach it as a compact pictorial in genuinely free sheet space. Runs
+    // LAST so its free-space search sees every placed item as an obstacle.
+    attach_pictorial_iso(model, solid_id, source, &mut drawing, extents[3], min_span);
+
     Ok(drawing)
+}
+
+/// Re-attach a compact SHADED isometric pictorial after the A4 ReplaceIso rule
+/// displaced the ISO cell with SECTION A-A.
+///
+/// Placement is a deterministic free-rect search: every layout item bbox on
+/// the finished sheet is an obstacle (ViewGeometry of dimensioned views is
+/// expanded by [`super::verify::DIM_MARGIN_MM`] left+below — the exact
+/// footprint `verify_drawing` polices), and candidate positions are scanned on
+/// a fixed 4 mm grid, RIGHTMOST column first, top-to-bottom (the freed band
+/// under the section / right of the orthographic grid). The pictorial rect
+/// reserves a label band on top so the "ISOMETRIC (scale)" label's preferred
+/// above-left slot is free by construction. Once placed, the view is ordinary
+/// view geometry — `compute_layout` registers its rect, so labels, GD&T
+/// callouts and hole-table placement treat it as inked content and the quality
+/// verifier polices collisions against it like any other view.
+///
+/// The thumbnail is capped at ~30% of the sheet's width (28% height); if no
+/// free rect exists even after shrinking to half that, the sheet is left
+/// section-only rather than forcing a collision (documented degradation —
+/// `verify_drawing` stays the arbiter of what shipped).
+fn attach_pictorial_iso(
+    model: &BRepModel,
+    solid_id: SolidId,
+    source: super::types::ViewSource,
+    drawing: &mut super::types::Drawing,
+    iso_unit_extent: super::types::ViewExtent,
+    min_span: f64,
+) {
+    // Only when the section displaced the ISO cell; sheets that kept their
+    // isometric (no section, or A3+ FifthSlot) need nothing.
+    if drawing
+        .views
+        .iter()
+        .any(|v| matches!(v.projection, ProjectionType::Isometric))
+    {
+        return;
+    }
+    if iso_unit_extent.is_empty() {
+        return;
+    }
+
+    let w = drawing.sheet_size.width();
+    let h = drawing.sheet_size.height();
+    let (ml, mr, mt, mb) = super::svg::frame_margins(&drawing.sheet_size);
+
+    let ew = iso_unit_extent.width().max(1e-9);
+    let eh = iso_unit_extent.height().max(1e-9);
+
+    // Obstacles: every inked bbox on the finished sheet, with dimensioned
+    // views expanded by the verifier's dimension-footprint margin.
+    let layout = super::layout::compute_layout(drawing);
+    let mut obstacles: Vec<super::layout::Rect2> = Vec::with_capacity(layout.items.len());
+    for it in &layout.items {
+        let mut b = it.bbox;
+        if it.kind == super::layout::SheetItemKind::ViewGeometry {
+            let dimensioned = it
+                .owner_view
+                .and_then(|i| drawing.views.get(i))
+                .map(|v| !v.dimensions.is_empty())
+                .unwrap_or(false);
+            if dimensioned {
+                b.x0 -= super::verify::DIM_MARGIN_MM;
+                b.y1 += super::verify::DIM_MARGIN_MM;
+            }
+        }
+        obstacles.push(b);
+    }
+
+    // Clearance around the pictorial (comfortably above the verifier's 0.5 mm
+    // slack) and a reserved band above for the view label.
+    const PAD: f64 = 3.0;
+    const LABEL_BAND: f64 = 7.0;
+    // Deterministic scan pitch.
+    const STEP: f64 = 4.0;
+    // Thumbnail caps: compact pictorial, never a competing fifth "view cell".
+    let cap_w = 0.30 * w;
+    let cap_h = 0.28 * h;
+
+    for shrink in [1.0, 0.8, 0.65, 0.5] {
+        let s = snap_scale(((cap_w * shrink) / ew).min((cap_h * shrink) / eh));
+        if !s.is_finite() || s <= 0.0 {
+            continue;
+        }
+        let pw = ew * s;
+        let ph = eh * s;
+        // Reserved rect: pictorial + side pads + label band on top. Width also
+        // reserves the label's own run ("ISOMETRIC (1:2)" at 3.6 mm ≈ 36 mm)
+        // so the label's preferred above-left slot never pokes into a
+        // neighbour.
+        let bw = (pw + 2.0 * PAD).max(40.0);
+        let bh = ph + PAD + LABEL_BAND;
+
+        let x_lo = ml + 2.0;
+        let x_hi = w - mr - 2.0 - bw;
+        let y_lo = mt + 2.0;
+        let y_hi = h - mb - 2.0 - bh;
+        if x_hi <= x_lo || y_hi <= y_lo {
+            continue;
+        }
+
+        let nx = ((x_hi - x_lo) / STEP).floor() as usize;
+        let ny = ((y_hi - y_lo) / STEP).floor() as usize;
+        for ix in (0..=nx).rev() {
+            let x0 = x_lo + ix as f64 * STEP;
+            for iy in 0..=ny {
+                let y0 = y_lo + iy as f64 * STEP;
+                let cand = super::layout::Rect2 {
+                    x0,
+                    y0,
+                    x1: x0 + bw,
+                    y1: y0 + bh,
+                };
+                if obstacles.iter().any(|o| cand.intersects(o, 0.0)) {
+                    continue;
+                }
+                // Free rect found: centre the pictorial inside it, label band
+                // on top. Invert the render transform (same algebra as
+                // `layout_four_view`'s `place`): sheet_x = pos.x + min_x·s,
+                // sheet_y_top = (h − pos.y) − max_y·s.
+                let geo_x0 = x0 + (bw - pw) * 0.5;
+                let geo_y_top = y0 + LABEL_BAND;
+                let pos = [
+                    geo_x0 - iso_unit_extent.min_x * s,
+                    h - geo_y_top - iso_unit_extent.max_y * s,
+                ];
+                let Ok(mut view) = build_hlr_view(
+                    model,
+                    solid_id,
+                    source,
+                    ProjectionType::Isometric,
+                    "ISOMETRIC",
+                    pos,
+                    s,
+                    min_span,
+                ) else {
+                    return;
+                };
+                // Pictorial: no dimensions (the orthographic views carry all
+                // measurement); shaded raster replaces the wireframe fill and
+                // the polylines ride on top as outlines.
+                view.dimensions.clear();
+                view.shaded_raster = shaded_iso_raster(model, solid_id, view.extent, s);
+                drawing.views.push(view);
+                return;
+            }
+        }
+    }
+    // No free rect even at the smallest thumbnail: leave the sheet section-
+    // only rather than force a collision (the verifier stays green either way).
 }
 
 // ── GD&T sidecar → drawing builder bridge (Task 6 fix wave) ──────────────────

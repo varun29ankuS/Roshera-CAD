@@ -88,6 +88,36 @@ mod tests {
         );
     }
 
+    /// A four-view sheet whose ISOMETRIC cell carries a shaded-solid raster
+    /// must transcode to a valid PDF — this exercises the `<image>` data-URI
+    /// path through `usvg` → `svg2pdf` (the shaded cell "rides along" in PDF).
+    #[test]
+    fn auto_sheet_with_shaded_iso_renders_valid_pdf() {
+        use crate::drawing::dimensioning::standard_drawing_auto;
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+        let mut model = BRepModel::new();
+        let sid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let drawing = standard_drawing_auto(&model, sid, uuid::Uuid::nil()).expect("auto sheet");
+        assert!(
+            drawing.views.iter().any(|v| v.shaded_raster.is_some()),
+            "fixture must carry a shaded isometric raster"
+        );
+        let bytes = render_drawing_pdf(&drawing).expect("pdf render with embedded raster");
+        assert!(bytes.starts_with(b"%PDF-"), "valid PDF header");
+        let tail = &bytes[bytes.len().saturating_sub(64)..];
+        assert!(
+            tail.windows(5).any(|w| w == b"%%EOF"),
+            "PDF terminates with %%EOF"
+        );
+    }
+
     /// The output's last meaningful tokens must contain `%%EOF` —
     /// the PDF spec's end-of-file marker. A truncated transcoding
     /// would drop this and downstream readers (Acrobat, browsers)

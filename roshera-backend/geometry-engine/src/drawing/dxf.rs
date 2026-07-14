@@ -131,6 +131,14 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     emit_sheet_frame(&mut dxf, &drawing.sheet_size);
 
     // -- Views ---------------------------------------------------------
+    // DXF is a VECTOR interchange format: its consumers (AutoCAD, FreeCAD,
+    // CAM post-processors) expect line-work entities, not embedded raster
+    // images. So the shaded-solid ISOMETRIC pictorial that the SVG/PDF path
+    // inks as a `data:image/png` `<image>` is DELIBERATELY NOT emitted here —
+    // `emit_view_polylines` walks `view.polylines` (retained on every view,
+    // including the isometric, precisely for this fallback), so the DXF
+    // isometric stays clean wireframe line work. `view.shaded_raster` is never
+    // consulted in this module.
     let sheet_h = drawing.sheet_size.height();
     for (view, layer) in drawing.views.iter().zip(view_layers.iter()) {
         emit_view_polylines(&mut dxf, view, layer, sheet_h);
@@ -1054,6 +1062,7 @@ mod tests {
                 hidden_polylines: Vec::new(),
                 circles: Vec::new(),
                 hidden_circles: Vec::new(),
+                shaded_raster: None,
             });
         }
         let layers = assign_view_layers(&drawing.views);
@@ -1110,6 +1119,7 @@ mod tests {
                 hidden_polylines: Vec::new(),
                 circles: Vec::new(),
                 hidden_circles: Vec::new(),
+                shaded_raster: None,
             });
         }
 
@@ -1237,6 +1247,7 @@ mod tests {
             hidden_polylines: Vec::new(),
             circles: Vec::new(),
             hidden_circles: Vec::new(),
+            shaded_raster: None,
         });
 
         let layout = compute_layout(&drawing);

@@ -1,8 +1,11 @@
 //! SVG renderer for [`Drawing`] documents.
 //!
 //! The renderer is deliberately self-contained: no external SVG/XML
-//! crate, no DOM building, no embedded raster assets. It writes a
-//! single deterministic SVG string with an engineering-drawing
+//! crate, no DOM building. The one raster it embeds is the deterministic
+//! shaded-solid ISOMETRIC pictorial (a `data:image/png;base64` `<image>`
+//! that replaces the wireframe line work in that cell — see
+//! [`super::types::ShadedRaster`]); everything else is vector ink. It writes
+//! a single deterministic SVG string with an engineering-drawing
 //! template inspired by ISO 7200 / ANSI Y14.1 (the conventions Fusion
 //! 360, Inventor and SolidWorks all share):
 //!
@@ -30,7 +33,9 @@
 
 use std::fmt::Write;
 
-use super::layout::{compute_layout, ArrowSpec, SheetItemKind, SheetLayout, AR_L, AR_W};
+use super::layout::{
+    compute_layout, view_geometry_rect, ArrowSpec, SheetItemKind, SheetLayout, AR_L, AR_W,
+};
 use super::types::{Drawing, ProjectedView, SheetSize};
 
 /// Render a [`Drawing`] to a complete SVG document string.
@@ -350,6 +355,44 @@ pub(crate) fn zone_target_width(sheet: &SheetSize) -> Option<f64> {
 // ---------------------------------------------------------------------
 
 fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
+    // PICTORIAL cell: a shaded-solid raster UNDER the wireframe line work —
+    // the standard "shaded with edges" CAD presentation (a shaded blob with no
+    // outlines is barely readable). The `<image>` is emitted FIRST (SVG paints
+    // in document order) and the view's polylines/circles are then drawn ON
+    // TOP by the normal vector pass below, registered as follows:
+    //
+    // REGISTRATION: the rasterizer auto-frames the solid to fill
+    // `RASTER_FILL_FACTOR` (0.9) of the framebuffer, centred, and the PNG's
+    // pixel aspect was matched to this view's extent aspect at build time —
+    // so the shaded content occupies the central 90% of the image on both
+    // axes. Inflating the placement rect by 1/RASTER_FILL_FACTOR about the
+    // geometry rect's centre maps that content region exactly onto the rect
+    // the polylines occupy (preserveAspectRatio="none": the aspects already
+    // agree up to sub-pixel rounding; "none" removes letterbox reflow).
+    //
+    // PDF rides along (`svg2pdf`/`usvg` embed data-URI rasters natively); DXF
+    // is vector-only and keeps the wireframe (never consults `shaded_raster`).
+    if let Some(raster) = &view.shaded_raster {
+        if let Some(rect) = view_geometry_rect(view, sheet_height_mm) {
+            let fill = crate::render::RASTER_FILL_FACTOR;
+            let img_w = rect.width() / fill;
+            let img_h = rect.height() / fill;
+            let img_x = (rect.x0 + rect.x1 - img_w) * 0.5;
+            let img_y = (rect.y0 + rect.y1 - img_h) * 0.5;
+            let _ = write!(
+                out,
+                "  <image class=\"view-shaded\" data-view-id=\"{}\" data-projection=\"{}\" \
+                 x=\"{img_x:.3}\" y=\"{img_y:.3}\" width=\"{img_w:.3}\" height=\"{img_h:.3}\" \
+                 preserveAspectRatio=\"none\" \
+                 href=\"data:image/png;base64,{}\" />\n",
+                view.id.0,
+                view.projection.label(),
+                raster.png_base64,
+            );
+            // Fall through: the vector pass below inks the outlines on top.
+        }
+    }
+
     let sx = view.scale;
     let tx = view.position_mm[0];
     let ty = sheet_height_mm - view.position_mm[1];

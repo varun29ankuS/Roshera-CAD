@@ -273,6 +273,7 @@ pub fn project_solid_view(
         hidden_polylines: Vec::new(),
         circles: Vec::new(),
         hidden_circles: Vec::new(),
+        shaded_raster: None,
     })
 }
 

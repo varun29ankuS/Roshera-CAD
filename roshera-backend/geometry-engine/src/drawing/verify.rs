@@ -137,7 +137,10 @@ fn rect_contains(outer: &Rect2, inner: &Rect2, tol: f64) -> bool {
 const SLACK_MM: f64 = 0.5;
 /// Dimension band reserved to the left of and below a dimensioned view —
 /// matches the standoff + stacking + text in `svg::render_dimensions`.
-const DIM_MARGIN_MM: f64 = 22.0;
+/// `pub(crate)`: the pictorial-isometric free-space search
+/// (`dimensioning::attach_pictorial_iso`) expands dimensioned views by this
+/// same margin so it clears dimension ink exactly where this verifier polices.
+pub(crate) const DIM_MARGIN_MM: f64 = 22.0;
 /// Centre-alignment tolerance for the third-angle arrangement.
 const ALIGN_TOL_MM: f64 = 2.0;
 /// Below this fraction of the printable area, the sheet reads as empty.

@@ -175,6 +175,13 @@ impl RenderFrame {
 
 const BACKGROUND: &[u8] = &[255, 255, 255];
 
+/// Fraction of the framebuffer the auto-framed content fills (the remaining
+/// margin splits evenly per side — see the window fit in `render_mesh_dir_marks`).
+/// Public because the drawing SVG renderer INVERTS this framing to register the
+/// shaded isometric raster with the vector outline overlay drawn on top of it;
+/// if this factor changes, that registration follows automatically.
+pub const RASTER_FILL_FACTOR: f64 = 0.9;
+
 /// Distinct, stable color for the n-th face: golden-ratio hue stepping at
 /// full saturation, avoiding near-white so no face collides with the
 /// background. Deterministic in the face's POSITION in the solid's sorted
@@ -234,6 +241,41 @@ pub fn render_solid(
     let dir = opts.view.direction();
     let up_hint = opts.view.up_hint();
     render_solid_dir(model, solid_id, dir, up_hint, opts)
+}
+
+/// Render one solid with an EXPLICIT DIRECTIONAL KEY LIGHT instead of the
+/// default headlight lambert.
+///
+/// The default `Shaded` shading is a headlight (`|n·view|`), which collapses
+/// an isometric cube to ONE uniform gray: all three visible faces make the
+/// same angle with the view direction (|n·dir| = 1/√3). For presentation
+/// renders (the engineering-drawing pictorial) that reads as a flat blob, so
+/// this entry point shades with `0.25 + 0.75·|n·key_light|` — an ambient
+/// floor plus a lambert against `key_light` (unit vector pointing TOWARD the
+/// light). Choose a light oblique to all principal face normals and the three
+/// face families of an iso cube read as three clearly distinct values.
+///
+/// DELIBERATELY a separate entry point: `render_solid` / `render_mesh` remain
+/// byte-identical for every existing consumer (perception gates, defect
+/// benchmarks, snapshot diffs). Deterministic: pure function of the mesh and
+/// the fixed light, no time-based seeds.
+pub fn render_solid_lit(
+    model: &BRepModel,
+    solid_id: SolidId,
+    key_light: Vector3,
+    opts: &RenderOptions,
+) -> Option<RenderFrame> {
+    let solid = model.solids.get(solid_id)?;
+    let mesh = tessellate_solid(solid, model, &opts.tessellation);
+    render_mesh_dir_marks(
+        &mesh,
+        opts.view.direction(),
+        opts.view.up_hint(),
+        opts,
+        None,
+        &[],
+        Some(key_light),
+    )
 }
 
 /// Render from an ARBITRARY view direction — the engine behind both the
@@ -313,6 +355,7 @@ pub fn render_solid_with_label_marks(
         opts,
         Some(&tri_colors),
         &callouts,
+        None,
     )
 }
 
@@ -498,12 +541,18 @@ fn render_mesh_dir(
         .iter()
         .map(|(p, s)| (*p, s.clone(), LABEL_COLOR))
         .collect();
-    render_mesh_dir_marks(mesh, dir, up_hint, opts, tri_colors, &colored)
+    render_mesh_dir_marks(mesh, dir, up_hint, opts, tri_colors, &colored, None)
 }
 
 /// Rasterize an already-tessellated mesh, then overlay COLOUR-CODED callouts —
 /// each callout drawn in its own colour (the set-of-marks eye). Shared core of
 /// every label-overlay render path.
+///
+/// `key_light`: `None` = headlight shading (`0.26 + 0.74·|n·view|`, the
+/// long-standing default — byte-identical for all existing consumers).
+/// `Some(l)` = directional key light (`0.25 + 0.75·|n·l|`), used by
+/// [`render_solid_lit`] for presentation renders where distinct face values
+/// matter. Applies to [`RenderMode::Shaded`] only.
 #[allow(clippy::too_many_arguments)]
 fn render_mesh_dir_marks(
     mesh: &TriangleMesh,
@@ -512,6 +561,7 @@ fn render_mesh_dir_marks(
     opts: &RenderOptions,
     tri_colors: Option<&[[u8; 3]]>,
     label_callouts: &[ColoredCallout],
+    key_light: Option<Vector3>,
 ) -> Option<RenderFrame> {
     if mesh.triangles.is_empty() {
         return None;
@@ -599,7 +649,8 @@ fn render_mesh_dir_marks(
     }
     let span_u = (u_max - u_min).max(1e-12);
     let span_v = (v_max - v_min).max(1e-12);
-    let scale = ((opts.width as f64 * 0.9) / span_u).min((opts.height as f64 * 0.9) / span_v);
+    let scale = ((opts.width as f64 * RASTER_FILL_FACTOR) / span_u)
+        .min((opts.height as f64 * RASTER_FILL_FACTOR) / span_v);
     let off_u = (opts.width as f64 - span_u * scale) * 0.5 - u_min * scale;
     let off_v = (opts.height as f64 - span_v * scale) * 0.5 - v_min * scale;
     // Pixel-space points; flip v so +up is toward the top of the image.
@@ -683,10 +734,16 @@ fn render_mesh_dir_marks(
                 [g, g, g]
             }
             RenderMode::Shaded => {
-                // Headlight lambert, orientation-independent via abs(), TINTING
-                // a per-triangle base colour (grey when none supplied).
-                let ndl = tri_normal.dot(&dir).abs();
-                let f = 0.26 + 0.74 * ndl; // ambient + diffuse
+                // Lambert, orientation-independent via abs(), TINTING a
+                // per-triangle base colour (grey when none supplied). Default
+                // is the headlight (light = view direction; byte-identical to
+                // the historical output); a caller-supplied key light shades
+                // against that direction instead with a 0.25 ambient floor so
+                // oblique face families read as distinct values.
+                let f = match key_light {
+                    Some(l) => 0.25 + 0.75 * tri_normal.dot(&l).abs(),
+                    None => 0.26 + 0.74 * tri_normal.dot(&dir).abs(),
+                };
                 let base = tri_colors
                     .and_then(|c| c.get(ti).copied())
                     .unwrap_or([200, 200, 200]);
