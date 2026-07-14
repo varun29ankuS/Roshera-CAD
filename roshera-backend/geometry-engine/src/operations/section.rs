@@ -561,10 +561,23 @@ fn collect_face_fragments(
     // grid. 1% of the bbox side is plenty for tier-1 analytic surfaces.
     let pad_u = ((u_max - u_min) * 0.01).max(1e-6);
     let pad_v = ((v_max - v_min) * 0.01).max(1e-6);
+    // Clamp the padded search rectangle to the surface's OWN parameter
+    // domain. Padding a PERIODIC direction beyond its period — v ∈ [0, 2π]
+    // on a full SurfaceOfRevolution or Cylinder — re-enters the surface past
+    // its seam, so the marching grid detects the seam iso-curve TWICE (once
+    // near v≈0 and once near v≈2π). For an axis-containing (meridian) cut the
+    // seam iso-curve IS one of the two section meridians, so it came back as a
+    // duplicate that then collided with the winding trim and shattered the
+    // clean curve into partial pieces that never chained to a cap
+    // (#section-axial: a Rao-bell nozzle meridian cut returned 0 caps → 404).
+    // Clamping to the surface domain gives a SINGLE seam detection and matches
+    // the exact bounds under which the contour reaches the face's true corner
+    // vertices (where it must weld to the neighbouring rim fragments).
+    let ((su0, su1), (sv0, sv1)) = surface.parameter_bounds();
     let config = SurfacePlaneIntersectionConfig {
         param_bounds_override: Some((
-            (u_min - pad_u, u_max + pad_u),
-            (v_min - pad_v, v_max + pad_v),
+            ((u_min - pad_u).max(su0), (u_max + pad_u).min(su1)),
+            ((v_min - pad_v).max(sv0), (v_max + pad_v).min(sv1)),
         )),
         ..Default::default()
     };
@@ -728,12 +741,35 @@ fn trim_curve_to_face(
     v_max: f64,
     out: &mut Vec<Polyline3D>,
 ) {
-    let in_bbox = |p: &ParametricIntersectionPoint| -> bool {
-        p.u >= u_min && p.u <= u_max && p.v >= v_min && p.v <= v_max
+    // Boundary tolerance for the parameter-domain rectangle. Relative to the
+    // domain span with an absolute floor, so a Newton nudge of a corner sample
+    // (a few ×tol in parameter space) still registers as "on the boundary".
+    let bnd_u = ((u_max - u_min).abs() * 1e-4).max(1e-7);
+    let bnd_v = ((v_max - v_min).abs() * 1e-4).max(1e-7);
+    let in_bbox = |u: f64, v: f64| -> bool {
+        u >= u_min - bnd_u && u <= u_max + bnd_u && v >= v_min - bnd_v && v <= v_max + bnd_v
     };
-    let inside_face = |p: &ParametricIntersectionPoint| -> bool {
-        in_bbox(p) && point_inside_face_uv(p.u, p.v, face, model)
+    // A sample sitting on the parameter-domain boundary rectangle belongs to a
+    // BOUNDARY EDGE of the face — a seam meridian runs the full length of the
+    // v-boundary, and every meridian's rim endpoints land on the u-boundary.
+    // The winding-number test is ambiguous exactly on the boundary (|wn| ≈ 0.5,
+    // which the strict `> 0.5` gate rejects), so it silently clips a meridian
+    // cross-section short of the rim it must weld to AND shreds a seam-coincident
+    // meridian into disjoint pieces. Treat boundary-coincident samples as inside;
+    // the winding test still excludes genuine interior holes (inner loops) and
+    // any non-rectangular outer-trim interior. Over-inclusion at a boundary is
+    // caught downstream (an unwelded spurious fragment fails to chain and is
+    // dropped), whereas under-inclusion here breaks the cap entirely.
+    let on_domain_boundary = |u: f64, v: f64| -> bool {
+        (u - u_min).abs() <= bnd_u
+            || (u_max - u).abs() <= bnd_u
+            || (v - v_min).abs() <= bnd_v
+            || (v_max - v).abs() <= bnd_v
     };
+    let member = |u: f64, v: f64| -> bool {
+        in_bbox(u, v) && (on_domain_boundary(u, v) || point_inside_face_uv(u, v, face, model))
+    };
+    let inside_face = |p: &ParametricIntersectionPoint| -> bool { member(p.u, p.v) };
 
     // Bisection on the parametric line segment between two samples to
     // localise the inside/outside transition. Returns the boundary
@@ -750,11 +786,7 @@ fn trim_curve_to_face(
                 let t_mid = 0.5 * (t_lo + t_hi);
                 let u_mid = a.u + (b.u - a.u) * t_mid;
                 let v_mid = a.v + (b.v - a.v) * t_mid;
-                let mid_inside = u_mid >= u_min
-                    && u_mid <= u_max
-                    && v_mid >= v_min
-                    && v_mid <= v_max
-                    && point_inside_face_uv(u_mid, v_mid, face, model);
+                let mid_inside = member(u_mid, v_mid);
                 if mid_inside == a_inside {
                     t_lo = t_mid;
                 } else {
@@ -1529,7 +1561,134 @@ fn triangulate_cap(
 mod tests {
     use super::*;
     use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use crate::operations::revolve::{revolve_smooth_nozzle, revolve_smooth_solid, RevolveOptions};
     use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    /// Rao-bell nozzle inner flow contour (r, z) from the live #section-404
+    /// dogfood: revolve with wall_thickness=2 → two smooth SurfaceOfRevolution
+    /// walls + 2 planar annular rims.
+    const NOZZLE_INNER: &[(f64, f64)] = &[
+        (16.0, 0.0),
+        (16.0, 15.0),
+        (12.0, 25.0),
+        (10.0, 32.0),
+        (11.5, 40.0),
+        (14.0, 50.0),
+        (17.0, 62.0),
+        (19.0, 72.0),
+        (20.0, 80.0),
+    ];
+
+    /// #section-axial: a Rao-bell nozzle (revolve + wall_thickness=2 → two
+    /// smooth `SurfaceOfRevolution` walls + 2 planar annular rims) MUST section
+    /// with a MERIDIAN (axis-containing) plane — SECTION A-A for every
+    /// axisymmetric aerospace part. The y=0 plane (normal +Y, containing the +Z
+    /// revolve axis) cuts the tube wall in TWO closed C-shaped profiles (the +X
+    /// and −X wall cross-sections). Before the fix this returned ZERO caps —
+    /// the marching contour was clean but the winding-number face trim clipped
+    /// the wall meridians short of the rims (and the over-period search
+    /// duplicated the seam meridian), so nothing chained → `render_section` None
+    /// → HTTP 404.
+    ///
+    /// Analytic area: the outer contour is the inner offset by +wall_thickness
+    /// in radius at every station (same z), so each side's cross-section is a
+    /// constant-width-`t` band along the profile height ⇒ area = t·Δz per side.
+    /// Here t=2, z ∈ [0, 80] ⇒ 160 per side, 320 total.
+    #[test]
+    fn section_nozzle_axial_meridian_yields_two_wall_profiles() {
+        let mut model = BRepModel::new();
+        let s = revolve_smooth_nozzle(&mut model, NOZZLE_INNER, 2.0, RevolveOptions::default())
+            .expect("nozzle build");
+
+        // GUARD: transverse cut (normal +Z, through the throat) still yields the
+        // clean annulus it always did.
+        let transverse = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 0.0, 40.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            Tolerance::default(),
+        )
+        .expect("transverse section");
+        assert_eq!(
+            transverse.len(),
+            1,
+            "transverse cut must stay one annular cap, got {}",
+            transverse.len()
+        );
+
+        // The meridian (axial) cut — the case that 404'd.
+        let axial = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 0.0, 40.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("axial section must not error");
+        assert_eq!(
+            axial.len(),
+            2,
+            "meridian cut of a tube wall must yield 2 wall profiles, got {}",
+            axial.len()
+        );
+        let total: f64 = axial.iter().map(cap_area).sum();
+        let expected = 2.0 * 2.0 * 80.0; // 2 sides × width 2 × height 80
+        let rel = (total - expected).abs() / expected;
+        assert!(
+            rel < 0.03,
+            "axial wall cross-section area {total:.3} vs analytic {expected:.3} (rel {rel})"
+        );
+        // Every cap vertex lies on the cut plane (y = 0).
+        for c in &axial {
+            for vtx in &c.vertices {
+                assert!(
+                    vtx.y.abs() < 1e-4,
+                    "cap vertex off meridian plane: y={}",
+                    vtx.y
+                );
+            }
+        }
+    }
+
+    /// GUARD: a smooth SOLID of revolution (revolve WITHOUT wall_thickness — one
+    /// `SurfaceOfRevolution` wall closing to caps, no bore) sectioned by a
+    /// meridian plane yields ONE closed profile (the filled cross-section spans
+    /// the axis). Exercises the same tier-2 surface∩plane fragment path as the
+    /// nozzle but with a single wall, so it independently covers the
+    /// boundary-inclusive trim without depending on the tube topology.
+    #[test]
+    fn section_solid_of_revolution_axial_meridian_yields_one_profile() {
+        let mut model = BRepModel::new();
+        let s = revolve_smooth_solid(&mut model, NOZZLE_INNER, RevolveOptions::default())
+            .expect("solid vase build");
+        let axial = section_solid_by_plane(
+            &model,
+            s,
+            Point3::new(0.0, 0.0, 40.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Tolerance::default(),
+        )
+        .expect("axial section must not error");
+        assert!(
+            !axial.is_empty(),
+            "solid-of-revolution meridian cut returned EMPTY caps"
+        );
+        let total: f64 = axial.iter().map(cap_area).sum();
+        assert!(
+            total > 1.0,
+            "solid-of-revolution meridian cross-section area {total:.3} implausibly small"
+        );
+        for c in &axial {
+            for vtx in &c.vertices {
+                assert!(
+                    vtx.y.abs() < 1e-4,
+                    "cap vertex off meridian plane: y={}",
+                    vtx.y
+                );
+            }
+        }
+    }
 
     fn sid(g: GeometryId) -> SolidId {
         match g {
