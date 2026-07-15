@@ -884,7 +884,6 @@ mod tests {
     /// documented rather than silently seed-avoided: run with
     /// `cargo test -p geometry-engine --lib -- --ignored` to observe it.
     #[test]
-    #[ignore = "pre-existing boolean coincident-face open-shell defect (reproduces on main @6d9b8d0); tracked, not yet fixed"]
     fn union_repeated_contained_box_after_chamfer_open_shell_pre_existing() {
         let mut m = BRepModel::new();
         TopologyBuilder::new(&mut m)
@@ -906,6 +905,130 @@ mod tests {
             r.is_clean(),
             "union of a chamfered body with a fully-contained coincident box \
              produced an open shell:\n{}",
+            r.render(&m)
+        );
+    }
+
+    /// #44 CONTROL — chamfer-FREE repeated coincident-contained union stays clean,
+    /// AND must remain clean after the 0-loop-preserve fix.
+    ///
+    /// The spec (`2026-07-15-coincident-weld-32-44-design.md` §3) predicted a pure
+    /// box-only repeated contained union would reproduce the same 0-loop open shell
+    /// ("the chamfer is not required by the 0-loop mechanism itself"). Verified
+    /// FALSE on this baseline: without a corner-clip, the second union's re-imprint
+    /// cuts on the pre-split +X caps snap onto the caps' own boundary vertices, so
+    /// every cut is `coincides_with_boundary=true` and the caps are preserved by the
+    /// PRE-arrangement `active_cut_count == 0` short-circuit (`boolean.rs:7403`). The
+    /// buggy post-arrangement 0-loop path is only reached when a topology
+    /// perturbation (the fuzz seed's chamfer clips one +X-frame corner) makes the
+    /// re-imprint cuts diverge in vertex identity so they evade the coincidence
+    /// filter, survive as active cuts, and then walk 0 regions — see the chamfered
+    /// reproduction above. A fillet on the same edge was also checked and does NOT
+    /// reproduce; the corner-CLIP is what defeats the snap.
+    ///
+    /// This case therefore guards the OTHER (already-correct) branch: the fix must
+    /// not disturb the fully-boundary-coincident re-imprint that `:7403` handles.
+    ///
+    /// Op sequence: box 4³ → translate +X 1.0 → union(3³ @ +1.5) → union(3³ @ +1.5).
+    #[test]
+    fn union_repeated_contained_box_no_chamfer_stays_clean() {
+        let mut m = BRepModel::new();
+        TopologyBuilder::new(&mut m)
+            .create_box_3d(4.0, 4.0, 4.0)
+            .ok();
+        let mut s = last(&m);
+        // translate +X by 1.0 (op code 0) so the +1.5-offset 3³ union box lands
+        // fully inside the 4³ body with its +X cap coincident with the body's.
+        let ns = apply_op(&mut m, s, 0).expect("translate runs");
+        s = ns;
+        // union, union (op code 3 twice) — no chamfer anywhere in the sequence.
+        for _ in 0..2 {
+            s = apply_op(&mut m, s, 3).expect("union runs");
+        }
+        let r = brep_integrity(&m, s, 1e-6);
+        assert!(
+            r.is_clean(),
+            "repeated coincident-contained union (chamfer-free control) must stay \
+             a clean closed shell:\n{}",
+            r.render(&m)
+        );
+    }
+
+    /// SLICE 0b — coincident-cap DEDUP AUDIT. After the 0-loop-preserve fix the
+    /// repeated coincident-contained union must emit exactly ONE well-formed +X
+    /// cap (A1's genuine frame + inner-patch pair that tiles it), NOT two stacked
+    /// coincident duplicates. A duplicated cap is impossible to hide from
+    /// `brep_integrity`: a duplicate built on SEPARATE edges surfaces in
+    /// `coincident_edge_groups` (two distinct edges on the same curve span), and a
+    /// duplicate that shares the cap-rim edges pushes those edges to 3+ face
+    /// references (`edges_used_3plus`). Asserting BOTH empty pins the dedup at the
+    /// exact dimension the merge/cull/select pipeline is responsible for — no new
+    /// dedup code is required because the existing `select_faces_for_operation`
+    /// Union rule already drops operand B's coincident `OnBoundary` twin, leaving
+    /// A1's single representative. `edges_used_once` empty proves the cap is
+    /// present (closed shell).
+    #[test]
+    fn union_repeated_contained_box_emits_single_cap_no_duplicate() {
+        let mut m = BRepModel::new();
+        TopologyBuilder::new(&mut m)
+            .create_box_3d(4.0, 4.0, 4.0)
+            .ok();
+        let mut s = last(&m);
+        s = apply_op(&mut m, s, 2).expect("chamfer runs");
+        s = apply_op(&mut m, s, 0).expect("translate runs");
+        for _ in 0..2 {
+            s = apply_op(&mut m, s, 3).expect("union runs");
+        }
+        let r = brep_integrity(&m, s, 1e-6);
+        assert!(
+            r.coincident_edge_groups.is_empty(),
+            "coincident-EQUAL duplicate faces survived the union (stacked cap):\n{}",
+            r.render(&m)
+        );
+        assert!(
+            r.edges_used_3plus.is_empty(),
+            "a duplicate cap over-shares rim edges (edge referenced by 3+ faces):\n{}",
+            r.render(&m)
+        );
+        assert!(
+            r.edges_used_once.is_empty(),
+            "the +X cap is missing (open shell), so no single representative survived:\n{}",
+            r.render(&m)
+        );
+        assert!(
+            r.is_clean(),
+            "result not a clean 2-manifold:\n{}",
+            r.render(&m)
+        );
+    }
+
+    /// SLICE 0b CONTROL — a NON-coincident union is unaffected by the
+    /// 0-loop-preserve fallback. Two boxes that overlap through their INTERIOR
+    /// (no coincident/coplanar cap: the second box straddles the first's +X face
+    /// so the union genuinely grows the body) exercise the normal split path where
+    /// `extract_regions` walks real regions; the `loops.is_empty()` fallback never
+    /// fires. The result must be a single clean closed solid — proving the floor
+    /// fix does not perturb ordinary material-adding unions.
+    #[test]
+    fn union_non_coincident_overlap_unaffected_by_fallback() {
+        let mut m = BRepModel::new();
+        TopologyBuilder::new(&mut m)
+            .create_box_3d(4.0, 4.0, 4.0)
+            .ok();
+        let a = last(&m);
+        // Second 4³ box offset +X by 2.0: overlaps a's +X half (x∈[0,2]) and
+        // extends to x=4 — the caps are NOT coincident, the union grows the body.
+        TopologyBuilder::new(&mut m)
+            .create_box_3d(4.0, 4.0, 4.0)
+            .ok();
+        let b = last(&m);
+        translate(&mut m, vec![b], Vector3::X, 2.0, Default::default()).expect("translate b");
+        let s = boolean_operation(&mut m, a, b, BooleanOp::Union, BooleanOptions::default())
+            .expect("non-coincident union runs");
+        let r = brep_integrity(&m, s, 1e-6);
+        assert!(
+            r.is_clean(),
+            "ordinary non-coincident overlapping union must stay a clean solid:\n{}",
             r.render(&m)
         );
     }

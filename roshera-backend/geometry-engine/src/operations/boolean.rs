@@ -7752,6 +7752,53 @@ fn split_face_by_curves(
         }
     }
 
+    // Post-arrangement 0-loop fallback (#44 coincident-weld floor).
+    //
+    // The pre-arrangement `active_cut_count == 0` short-circuit (above) preserves
+    // a face whose EVERY cut was filtered as boundary-coincident or void. But a
+    // cut can SURVIVE that filter (so `active_cut_count > 0`) and the planar
+    // arrangement still walk NO region: when a coincident cap was already split by
+    // a prior union and is re-imprinted by a coincident-contained operand, the
+    // re-imprint cuts retrace the cap's own boundary / hole ring as duplicate
+    // directed edges whose endpoints did not unify with the boundary vertex ids
+    // (so `coincides_with_boundary` never fired), and `extract_regions` walks 0
+    // cycles. Left unhandled, the split-face creation loop below iterates an EMPTY
+    // `loops` and emits ZERO fragments, so the face is SILENTLY DROPPED — the +X
+    // cap of a repeated coincident-contained union vanishes and the shell opens
+    // (#44, `harness::brep_integrity::union_repeated_contained_box_*`).
+    //
+    // The face carried a real boundary and real (non-void) cuts, but the cuts
+    // added no genuine new topology — they retraced the existing boundary — so the
+    // correct result is the face UNCHANGED. Preserve it UNSPLIT so it participates
+    // in classification as-is, exactly like the pre-arrangement short-circuit. This
+    // is purely topological: no loop orientation is touched, outer and inner loops
+    // are kept SEPARATE via `get_face_outer_and_inner_loops` (never flattened into
+    // one self-contradictory bag), and it fires ONLY on the genuine
+    // 0-loops-with-active-cuts case — a face the arrangement splits into >= 1
+    // region never reaches here, so a legitimately consumed / fully-covered face is
+    // never resurrected. Analytic curved faces return via their dedicated splitters
+    // earlier and never reach this planar path (the closed-surface floor is
+    // untouched).
+    if loops.is_empty() {
+        let (outer_only, inner_loops_original) = get_face_outer_and_inner_loops(model, face_id)?;
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]     split_face_by_curves: face={:?} arrangement walked 0 loops with {} active cut(s) — preserving face unsplit (#44)",
+                face_id, active_cut_count
+            );
+        }
+        return Ok(vec![SplitFace {
+            was_split: true,
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: outer_only,
+            classification: FaceClassification::Outside,
+            from_solid: origin_solid,
+            inner_loops: inner_loops_original,
+            interior_point: None,
+        }]);
+    }
+
     // Pre-existing-hole absorption. When the input face already has
     // inner_loops (e.g. holes from a previous boolean cut), the DCEL
     // arrangement re-emits each hole's boundary as a separate CCW
