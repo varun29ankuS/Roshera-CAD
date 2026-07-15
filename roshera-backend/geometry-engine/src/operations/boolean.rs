@@ -6362,6 +6362,331 @@ fn split_cylinder_lateral_by_sectors(
     Some(faces)
 }
 
+/// #35 Slice-1 Defect A: partition a PERIODIC cylinder lateral carrying the two
+/// closed saddle ELLIPSE loops of an equal-radius perpendicular bicylinder
+/// (Steinmetz) into verified fragments.
+///
+/// The two ellipses cross each other at `center ± r·n̂` (Defect C's shared
+/// crossing vertices), splitting the wall's removed material into TWO bicylinder
+/// LOBES (each a curvilinear lens bounded by one arc-chain from each ellipse,
+/// meeting at the two crossing vertices) plus the complement (the rest of the
+/// wall, carrying the two lobes as inner holes). Neither existing cylinder
+/// splitter accepts this topology — `split_cylinder_lateral_by_window` needs a
+/// full-height vertical wall line and `split_cylinder_lateral_by_sectors` needs
+/// ≥3 full-height generators; a saddle ellipse has neither (spec §2 Defect A) —
+/// and the generic DCEL cannot partition the seam-wrapping periodic lateral.
+/// This handler walks the (already complete, C+D shared) arrangement.
+///
+/// Detection (returns `None` — fall through to the DCEL — unless ALL hold):
+///   * the surface is a `Cylinder` with non-zero height;
+///   * every `Splitting` edge is an `Ellipse` arc, over EXACTLY TWO distinct
+///     ellipse curve_ids (the two saddle ellipses);
+///   * their arcs meet at EXACTLY TWO vertices of degree 4 (the crossings) with
+///     every other arc vertex of degree 2, and EVERY arc vertex lies strictly on
+///     the lateral interior (no rim contact, no full-height vertical).
+///
+/// Fragments carry an explicit, verified `interior_point` from
+/// `curved_fragment_interior_point` (Defect B); orientation is left to the
+/// downstream `orient_face_for_outward` + Difference B-flip (fence 2).
+fn split_cylinder_lateral_by_saddle(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+    boundary_edges: &[(EdgeId, bool)],
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::curve::Ellipse;
+    use crate::primitives::surface::Cylinder;
+
+    let surface = model.surfaces.get(surface_id)?;
+    let cyl = surface.as_any().downcast_ref::<Cylinder>()?;
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let radius = cyl.radius;
+    let height = cyl
+        .height_limits
+        .map(|h| (h[1] - h[0]).abs())
+        .unwrap_or(0.0);
+    if height <= 0.0 {
+        return None;
+    }
+
+    let axial_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        Some((Point3::new(p[0], p[1], p[2]) - origin).dot(&axis))
+    };
+    // Frame ⟂ axis for θ (identical to the sector splitter).
+    let seed = if axis.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u1 = axis.cross(&seed).normalize().ok()?;
+    let u2 = axis.cross(&u1);
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let theta_of = |vid: VertexId| -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        let d = Point3::new(p[0], p[1], p[2]) - origin;
+        Some(d.dot(&u2).atan2(d.dot(&u1)).rem_euclid(two_pi))
+    };
+
+    let v_tol = (height * 1.0e-3).max(1.0e-6);
+
+    // Collect the Splitting edges, separating the two saddle ELLIPSE loops from
+    // any horizontal RING cuts (a raw tool cylinder poking through the box faces
+    // carries entry/exit circles at constant axial height in ADDITION to the
+    // saddle ellipses). `arcs` = ellipse arcs; `ring_arcs` = constant-v circle
+    // arcs. Any OTHER (non-ellipse, non-horizontal) splitting edge → not a
+    // saddle we own → DCEL. (edge_id, curve_id, start_vid, end_vid)
+    let mut arcs: Vec<(EdgeId, CurveId, VertexId, VertexId)> = Vec::new();
+    let mut ring_arcs: Vec<(EdgeId, CurveId, VertexId, VertexId)> = Vec::new();
+    let mut curve_ids: Vec<CurveId> = Vec::new();
+    let mut n_splitting = 0usize;
+    let mut foreign = false;
+    for (&eid, ge) in graph.edges.iter() {
+        if ge.edge_type != EdgeType::Splitting {
+            continue;
+        }
+        n_splitting += 1;
+        let e = model.edges.get(eid)?;
+        let is_ellipse = model
+            .curves
+            .get(e.curve_id)
+            .map(|c| c.as_any().downcast_ref::<Ellipse>().is_some())
+            .unwrap_or(false);
+        if is_ellipse {
+            arcs.push((eid, e.curve_id, e.start_vertex, e.end_vertex));
+            if !curve_ids.contains(&e.curve_id) {
+                curve_ids.push(e.curve_id);
+            }
+        } else {
+            // Only a horizontal (constant-axial) ring arc is tolerated.
+            let (sv, ev) = (axial_of(e.start_vertex)?, axial_of(e.end_vertex)?);
+            if (sv - ev).abs() > v_tol {
+                foreign = true;
+            }
+            ring_arcs.push((eid, e.curve_id, e.start_vertex, e.end_vertex));
+        }
+    }
+
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]   saddle-probe face={face_id:?}: {n_splitting} splitting edges, {} ellipse arcs ({} ellipse curve_ids), {} ring arcs, foreign={foreign}; origin={origin:?} axis={axis:?} r={radius} h={height}",
+            arcs.len(),
+            curve_ids.len(),
+            ring_arcs.len(),
+        );
+        for &(eid, cid, sv, ev) in arcs.iter().chain(ring_arcs.iter()) {
+            eprintln!(
+                "    ARC e{eid} curve={cid} v{sv}(axial={:?},θ={:?}) -> v{ev}(axial={:?},θ={:?})",
+                axial_of(sv),
+                theta_of(sv),
+                axial_of(ev),
+                theta_of(ev),
+            );
+        }
+    }
+
+    // Exactly two saddle ellipses; any foreign (slanted) cut disqualifies.
+    if foreign || curve_ids.len() != 2 || arcs.is_empty() {
+        return None;
+    }
+    curve_ids.sort_unstable();
+
+    // Vertex degree over the ELLIPSE arc set: the two mutual crossings are
+    // degree-4 (two arcs from each ellipse), every other ellipse-arc vertex is
+    // degree-2. This structural signature is the saddle gate.
+    let mut degree: HashMap<VertexId, u32> = HashMap::new();
+    for &(_, _, sv, ev) in &arcs {
+        *degree.entry(sv).or_insert(0) += 1;
+        *degree.entry(ev).or_insert(0) += 1;
+    }
+    for (_, &deg) in &degree {
+        if deg != 2 && deg != 4 {
+            return None;
+        }
+    }
+    let mut crossings: Vec<VertexId> = degree
+        .iter()
+        .filter(|&(_, &d)| d == 4)
+        .map(|(&v, _)| v)
+        .collect();
+    if crossings.len() != 2 {
+        return None;
+    }
+    crossings.sort_unstable();
+    let (x0, x1) = (crossings[0], crossings[1]);
+
+    // Both crossings sit at the SAME axial level (they are `center ± r·n̂` with
+    // n̂ ⟂ the axis), so the removed lens PINCHES to those crossing points at
+    // that level `v_cross`. Rather than emit one complement carrying both lobes
+    // as inner holes — the two holes touch at the crossings, a pinched
+    // face-with-hole the CDT cannot triangulate — split the kept wall at
+    // `v_cross` into a clean UPPER annulus and a LOWER annulus. Each is bounded
+    // by an original rim/ring (outer) and a WAVY ellipse-arc loop (the lens
+    // boundary on that side): a simple 2-rim tube band, no pinch. Together the
+    // two annuli reference every ellipse arc exactly once, so the arc sharing
+    // with the mating wall (C+D) keeps the solid watertight; the lens material
+    // itself is void (never a face) so no lobe fragment is emitted.
+    let v_cross = 0.5 * (axial_of(x0)? + axial_of(x1)?);
+    let is_cross = |v: VertexId| v == x0 || v == x1;
+
+    // Generic single-closed-loop orderer over an edge set.
+    let order_loop = |mut group: Vec<(EdgeId, VertexId, VertexId)>| -> Option<Vec<(EdgeId, bool)>> {
+        if group.is_empty() {
+            return None;
+        }
+        group.sort_by_key(|&(e, _, _)| e); // determinism
+        let (e0, s0, ev0) = group.remove(0);
+        let start_v = s0;
+        let mut cur = ev0;
+        let mut out: Vec<(EdgeId, bool)> = vec![(e0, true)];
+        while !group.is_empty() {
+            let mut sel: Option<(usize, EdgeId, bool, VertexId)> = None;
+            for (i, &(e, s, ev)) in group.iter().enumerate() {
+                if s == cur {
+                    sel = Some((i, e, true, ev));
+                    break;
+                }
+                if ev == cur {
+                    sel = Some((i, e, false, s));
+                    break;
+                }
+            }
+            let (i, e, fwd, next) = sel?;
+            group.remove(i);
+            out.push((e, fwd));
+            cur = next;
+        }
+        if cur != start_v {
+            return None;
+        }
+        Some(out)
+    };
+
+    // Classify each ellipse arc (crossing→major) by its major endpoint's axial:
+    // above `v_cross` → upper wavy loop, below → lower wavy loop.
+    let mut upper_arcs: Vec<(EdgeId, VertexId, VertexId)> = Vec::new();
+    let mut lower_arcs: Vec<(EdgeId, VertexId, VertexId)> = Vec::new();
+    let mut wavy_lower_min = f64::INFINITY;
+    let mut wavy_upper_max = f64::NEG_INFINITY;
+    for &(eid, _c, sv, ev) in &arcs {
+        let major = if is_cross(sv) && !is_cross(ev) {
+            ev
+        } else if is_cross(ev) && !is_cross(sv) {
+            sv
+        } else {
+            return None; // an arc not spanning crossing→major — not this saddle
+        };
+        let mv = axial_of(major)?;
+        if mv >= v_cross {
+            wavy_upper_max = wavy_upper_max.max(mv);
+            upper_arcs.push((eid, sv, ev));
+        } else {
+            wavy_lower_min = wavy_lower_min.min(mv);
+            lower_arcs.push((eid, sv, ev));
+        }
+    }
+    let upper_wavy = order_loop(upper_arcs)?;
+    let lower_wavy = order_loop(lower_arcs)?;
+
+    // Outer rim source: the ring cuts (tool wall) or the face boundary (bore
+    // wall). Partition into the loop below `v_cross` and the loop above it. The
+    // overhang beyond the ring cuts is omitted (it is outside the box and would
+    // be dropped by classification; its cap rims leave with the tool's end
+    // caps).
+    let boundary_src: Vec<(EdgeId, VertexId, VertexId)> = if ring_arcs.is_empty() {
+        let mut v = Vec::with_capacity(boundary_edges.len());
+        for &(eid, _) in boundary_edges {
+            let e = model.edges.get(eid)?;
+            v.push((eid, e.start_vertex, e.end_vertex));
+        }
+        v
+    } else {
+        ring_arcs.iter().map(|&(e, _, s, ev)| (e, s, ev)).collect()
+    };
+    let mut bottom_src: Vec<(EdgeId, VertexId, VertexId)> = Vec::new();
+    let mut top_src: Vec<(EdgeId, VertexId, VertexId)> = Vec::new();
+    for &(eid, sv, ev) in &boundary_src {
+        // Only HORIZONTAL (constant-axial) rim/ring edges bound the annuli; the
+        // parameterisation SEAM edge (spanning axially) is not a real geometric
+        // boundary — the cylinder tessellator wraps periodically — so it is
+        // dropped from the annulus loops. Classify each rim by its axial level.
+        let (a0, a1) = (axial_of(sv)?, axial_of(ev)?);
+        if (a0 - a1).abs() > v_tol {
+            continue; // seam
+        }
+        if 0.5 * (a0 + a1) < v_cross {
+            bottom_src.push((eid, sv, ev));
+        } else {
+            top_src.push((eid, sv, ev));
+        }
+    }
+    if bottom_src.is_empty() || top_src.is_empty() {
+        return None;
+    }
+    let v_bottom = axial_of(bottom_src[0].1)?;
+    let v_top = axial_of(top_src[0].1)?;
+    let bottom_loop = order_loop(bottom_src)?;
+    let top_loop = order_loop(top_src)?;
+
+    // Interior points (Defect B): a verified in-fragment point on the unrolled
+    // (θ, z) chart via `curved_fragment_interior_point` (each annulus is a
+    // full-ring rim with the wavy lens boundary as its one hole). Fall back to a
+    // direct mid-band point (below/above the whole lens, so θ is unconstrained)
+    // if the chart search cannot resolve one.
+    let lower_v = 0.5 * (v_bottom + wavy_lower_min);
+    let upper_v = 0.5 * (v_top + wavy_upper_max);
+    let lower_ip = curved_fragment_interior_point(
+        model,
+        surface_id,
+        &bottom_loop,
+        std::slice::from_ref(&lower_wavy),
+    )
+    .unwrap_or(origin + axis * lower_v + u1 * radius);
+    let upper_ip = curved_fragment_interior_point(
+        model,
+        surface_id,
+        &top_loop,
+        std::slice::from_ref(&upper_wavy),
+    )
+    .unwrap_or(origin + axis * upper_v + u1 * radius);
+
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]   saddle SPLIT face={face_id:?}: crossings=[{x0},{x1}] v_cross={v_cross} rings={}; lower band v_bottom={v_bottom}→wavy_min={wavy_lower_min} ip={lower_ip:?}; upper band v_top={v_top}→wavy_max={wavy_upper_max} ip={upper_ip:?}",
+            ring_arcs.len(),
+        );
+    }
+
+    Some(vec![
+        // Lower annulus: outer = rim below v_cross, inner hole = lower wavy lens
+        // boundary (a cylinder band, represented outer-rim + inner-rim).
+        SplitFace {
+            was_split: true,
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: bottom_loop,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(lower_ip),
+            inner_loops: vec![lower_wavy],
+        },
+        // Upper annulus: outer = rim above v_cross, inner hole = upper wavy.
+        SplitFace {
+            was_split: true,
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: top_loop,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(upper_ip),
+            inner_loops: vec![upper_wavy],
+        },
+    ])
+}
+
 /// CONE analogue of `split_cylinder_lateral_by_sectors` (BOOL #1 cone-radial
 /// conic-cut). A cone lateral cut by ≥3 full-height GENERATOR lines (the two
 /// x=plane generators of a radial cut + the cone's own u-seam) splits into
@@ -7290,6 +7615,30 @@ fn split_face_by_curves(
         if pipeline_trace_enabled() {
             eprintln!(
                 "[bool]   cylinder sector split: face={face_id:?} → {} fragments",
+                cyl_faces.len()
+            );
+        }
+        return Ok(cyl_faces);
+    }
+
+    // #35 Slice-1 Defect A — cylinder lateral carrying the two closed saddle
+    // ELLIPSE loops of an equal-radius perpendicular bicylinder. The window and
+    // sector handlers both returned None (no vertical wall line / no full-height
+    // generators) and the DCEL cannot partition the seam-wrapping periodic
+    // lateral. Emit the two lens lobes + the complement (lobes as holes), each
+    // with a verified (θ,z)-chart interior point. Returns None for any
+    // non-saddle cylinder cut → DCEL.
+    if let Some(cyl_faces) = split_cylinder_lateral_by_saddle(
+        model,
+        surface_id,
+        face_id,
+        origin_solid,
+        &graph,
+        &boundary_edges,
+    ) {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   cylinder saddle split: face={face_id:?} → {} fragments",
                 cyl_faces.len()
             );
         }
@@ -14358,6 +14707,247 @@ fn polygon_interior_point_3d(
             let v = my + f * (centroid_2d.1 - my);
             if strictly_interior(u, v) {
                 return Some(unproject(u, v));
+            }
+        }
+    }
+    None
+}
+
+/// #35 Slice-1 Defect B: a genuine in-fragment interior point for a CURVED
+/// (cylinder) lateral fragment bounded by one or more loops, computed on the
+/// unrolled `(θ, z)` chart of the cylinder rather than by projecting a boundary
+/// centroid onto the surface.
+///
+/// The boundary-centroid-then-`closest_point` path (`get_face_interior_point`'s
+/// curved branch) is ANGULARLY ILL-CONDITIONED for a saddle-bounded lateral
+/// fragment: the two ellipse arcs bounding a bicylinder lobe are near-symmetric
+/// about the axis, so their midpoint centroid sits near the axis where every
+/// generator is nearly equidistant — `closest_point` can resolve to a generator
+/// that is NOT in the fragment (spec §2 Defect B). Unrolling to `(θ, z)` and
+/// running a hole-aware interior search there gives a point provably on the
+/// fragment's own generator.
+///
+/// The frame (`u1`, `u2` ⟂ `axis`) matches `split_cylinder_lateral_by_sectors`.
+/// Each loop is densified (8 samples/edge, arc-following) and its `θ` unwrapped
+/// continuously so a seam-crossing arc does not jump ±2π. A BOUNDED fragment
+/// (a lens lobe, `θ`-span < 2π) uses the `polygon_interior_point_3d` candidate
+/// ladder (centroid → edge-midpoint nudges) in the `(θ, z)` plane with
+/// boundary-clearance rejection. A FULL-RING fragment (outer boundary wraps the
+/// whole lateral — rims of a complement-with-holes) has no closed `(θ, z)`
+/// polygon, so a `z`-band away from every hole is chosen instead.
+///
+/// Returns `None` for a non-cylinder surface (sphere/cone keep the projection
+/// path) or when no clear point is found.
+fn curved_fragment_interior_point(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    boundary_loop: &[(EdgeId, bool)],
+    inner_loops: &[Vec<(EdgeId, bool)>],
+) -> Option<Point3> {
+    use crate::primitives::surface::Cylinder;
+    let surface = model.surfaces.get(surface_id)?;
+    let cyl = surface.as_any().downcast_ref::<Cylinder>()?;
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let radius = cyl.radius;
+    let two_pi = 2.0 * std::f64::consts::PI;
+
+    // Orthonormal frame ⟂ axis (identical to split_cylinder_lateral_by_sectors).
+    let seed = if axis.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u1 = axis.cross(&seed).normalize().ok()?;
+    let u2 = axis.cross(&u1);
+
+    // Unroll a loop to (θ, z) samples, unwrapping θ continuously within the
+    // loop so a seam-crossing arc traces a continuous polyline (no ±2π jump).
+    let unroll = |loop_edges: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
+        const SAMPLES: usize = 8;
+        let mut pts: Vec<(f64, f64)> = Vec::with_capacity(loop_edges.len() * SAMPLES);
+        let mut prev: Option<f64> = None;
+        for &(eid, fwd) in loop_edges {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                let Ok(p) = curve.point_at(t) else {
+                    continue;
+                };
+                let d = p - origin;
+                let mut th = d.dot(&u2).atan2(d.dot(&u1));
+                if let Some(pv) = prev {
+                    while th - pv > std::f64::consts::PI {
+                        th -= two_pi;
+                    }
+                    while th - pv < -std::f64::consts::PI {
+                        th += two_pi;
+                    }
+                }
+                prev = Some(th);
+                pts.push((th, d.dot(&axis)));
+            }
+        }
+        pts
+    };
+
+    let outer = unroll(boundary_loop);
+    if outer.len() < 3 {
+        return None;
+    }
+    let holes: Vec<Vec<(f64, f64)>> = inner_loops
+        .iter()
+        .map(|l| unroll(l))
+        .filter(|v| v.len() >= 3)
+        .collect();
+
+    let wrap = |th: f64, z: f64| -> Point3 {
+        origin + axis * z + (u1 * th.cos() + u2 * th.sin()) * radius
+    };
+
+    let (th_min, th_max) = outer
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(t, _)| {
+            (a.min(t), b.max(t))
+        });
+
+    // A full-ring outer boundary (the two rims of a complement) wraps ~2π and
+    // is NOT a closed (θ, z) polygon; a bounded lens lobe spans < 2π.
+    if (th_max - th_min) >= 1.5 * std::f64::consts::PI {
+        let (z_lo, z_hi) = outer
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(_, z)| {
+                (a.min(z), b.max(z))
+            });
+        // Hole z-extents (each lens lobe occupies a z-band at some θ). Choose a
+        // z-band the holes do not reach, then sample θ where no hole sits.
+        let mut occ: Vec<(f64, f64)> = holes
+            .iter()
+            .map(|h| {
+                h.iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(_, z)| {
+                        (a.min(z), b.max(z))
+                    })
+            })
+            .collect();
+        occ.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Candidate z values: rim-adjacent bands and gaps between hole bands.
+        let mut cand_z: Vec<f64> = Vec::new();
+        if let Some(&(f0, _)) = occ.first() {
+            cand_z.push(0.5 * (z_lo + f0));
+        }
+        for w in occ.windows(2) {
+            cand_z.push(0.5 * (w[0].1 + w[1].0));
+        }
+        if let Some(&(_, l1)) = occ.last() {
+            cand_z.push(0.5 * (l1 + z_hi));
+        }
+        if cand_z.is_empty() {
+            cand_z.push(0.5 * (z_lo + z_hi));
+        }
+        // Sample θ around the ring; accept the first (θ, z) outside every hole.
+        for &z in &cand_z {
+            for i in 0..24 {
+                let th = th_min + (th_max - th_min) * (i as f64 + 0.5) / 24.0;
+                let inside_hole = holes.iter().any(|h| point_in_polygon_2d(th, z, h));
+                if !inside_hole {
+                    return Some(wrap(th, z));
+                }
+            }
+        }
+        return None;
+    }
+
+    // Bounded lens lobe: mirror polygon_interior_point_3d's candidate ladder in
+    // the (θ, z) plane with hole-aware, clearance-tested membership.
+    let is_material = |th: f64, z: f64| -> bool {
+        point_in_polygon_2d(th, z, &outer) && holes.iter().all(|h| !point_in_polygon_2d(th, z, h))
+    };
+    let dist_to_polygon = |th: f64, z: f64, poly: &[(f64, f64)]| -> f64 {
+        let mut best = f64::INFINITY;
+        let m = poly.len();
+        for k in 0..m {
+            let (x1, y1) = poly[k];
+            let (x2, y2) = poly[(k + 1) % m];
+            let (dx, dy) = (x2 - x1, y2 - y1);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 {
+                (((th - x1) * dx + (z - y1) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (px, py) = (x1 + t * dx, y1 + t * dy);
+            let dd = ((th - px).powi(2) + (z - py).powi(2)).sqrt();
+            if dd < best {
+                best = dd;
+            }
+        }
+        best
+    };
+    let extent = {
+        let (mut lo, mut hi) = (
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        );
+        for &(x, y) in &outer {
+            lo.0 = lo.0.min(x);
+            lo.1 = lo.1.min(y);
+            hi.0 = hi.0.max(x);
+            hi.1 = hi.1.max(y);
+        }
+        ((hi.0 - lo.0).max(hi.1 - lo.1)).max(0.0)
+    };
+    let clearance = (extent * 1.0e-3).max(1.0e-9);
+    let strictly_interior = |th: f64, z: f64| -> bool {
+        is_material(th, z)
+            && dist_to_polygon(th, z, &outer) > clearance
+            && holes.iter().all(|h| dist_to_polygon(th, z, h) > clearance)
+    };
+
+    let n = outer.len() as f64;
+    let (cx, cy) = outer
+        .iter()
+        .fold((0.0, 0.0), |(ax, ay), &(x, y)| (ax + x, ay + y));
+    let centroid = (cx / n, cy / n);
+    if strictly_interior(centroid.0, centroid.1) {
+        return Some(wrap(centroid.0, centroid.1));
+    }
+    const FRACTIONS: [f64; 7] = [0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75];
+    for i in 0..outer.len() {
+        let (ax, ay) = outer[i];
+        let (bx, by) = outer[(i + 1) % outer.len()];
+        let mx = 0.5 * (ax + bx);
+        let my = 0.5 * (ay + by);
+        for f in FRACTIONS {
+            let th = mx + f * (centroid.0 - mx);
+            let z = my + f * (centroid.1 - my);
+            if strictly_interior(th, z) {
+                return Some(wrap(th, z));
+            }
+        }
+    }
+    let m = outer.len();
+    for i in 0..m {
+        let (ax, ay) = outer[i];
+        let (bx, by) = outer[(i + 2) % m];
+        let mx = 0.5 * (ax + bx);
+        let my = 0.5 * (ay + by);
+        for f in [0.0f64, 0.05, 0.1, 0.2, 0.35] {
+            let th = mx + f * (centroid.0 - mx);
+            let z = my + f * (centroid.1 - my);
+            if strictly_interior(th, z) {
+                return Some(wrap(th, z));
             }
         }
     }
