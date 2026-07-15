@@ -1,19 +1,18 @@
 /**
- * HONESTY CANARY — the cross-drilled manifold saddle.
+ * THE SADDLE — formerly the honesty canary, now the #35 regression guard.
  *
- * A block with two perpendicular crossing bores forms a cyl-cyl saddle the
- * kernel cannot yet resolve (issue #35). The WIN CONDITION is not a valid
- * solid — it is the kernel telling the TRUTH: it must flag the result UNSOUND
- * (open edges) rather than silently shipping a broken solid. Scoring rewards the
- * honest flag; a "sound:true" here would be a self-certification LIE and FAILS.
- *
- * When #35 lands (analytic cyl-cyl SSI), this expectation flips to sound — at
- * which point this canary should be updated. It is the tripwire for that day.
+ * A block with two perpendicular crossing bores forms the cyl-cyl saddle
+ * (issue #35, THE core CAD bug). Until 2026-07-15 the kernel could not
+ * resolve it and this scenario scored the HONEST refusal (UNSOUND flagged,
+ * never a silent lie). #35 Slice 1 landed (analytic saddle ellipses with
+ * shared crossing vertices + the saddle lateral splitter + the conforming
+ * ring-stitch mesher): the saddle now BUILDS SOUND with the volume matching
+ * the Steinmetz oracle. The tripwire fired; this scenario now guards the fix.
  */
 export default {
   id: "08-saddle-honesty",
-  title: "Cross-bore saddle — HONESTY canary (must flag UNSOUND)",
-  dims: ["honesty", "performance"],
+  title: "Cross-bore saddle — builds SOUND (#35 slice 1 guard)",
+  dims: ["correctness", "soundness", "performance"],
   budgetMs: 30000,
   async run(ctx, t) {
     const { c } = ctx;
@@ -37,11 +36,13 @@ export default {
     const id = await c.newestPartId();
     const per = await ctx.time("certify saddle", () => c.perceive(id));
 
-    // THE honesty check: the kernel must NOT claim this is sound.
-    t.unsound("cross-bore saddle is honestly flagged UNSOUND", per);
-    t.ok("open edges are reported (the honest defect signal)", (per.open_edges ?? 0) > 0, {
-      dim: "honesty",
-      detail: `open_edges=${per.open_edges}`,
+    // #35 Slice 1 (2026-07-15): the saddle builds SOUND. Volume oracle for THIS
+    // recipe (40³ block, two r=8 through-bores of in-block length 40, crossing):
+    // V = 64000 − 2·(π·8²·40) + 16·8³/3 (Steinmetz) ≈ 50645.71.
+    const oracle = 64000 - 2 * (Math.PI * 64 * 40) + (16 * 512) / 3;
+    t.sound("cross-bore saddle builds SOUND (#35 slice 1)", per);
+    t.approxRel("volume matches the Steinmetz oracle", per.volume, oracle, 0.005, {
+      dim: "correctness",
     });
   },
 };
