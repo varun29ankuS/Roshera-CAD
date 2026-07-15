@@ -156,6 +156,139 @@ function convertCADObject(proto: ProtocolCADObject): CADObject {
   }
 }
 
+// ─── WS churn batching ──────────────────────────────────────────────
+//
+// A part-churn flood (rapid ObjectCreated/ObjectUpdated/ObjectDeleted/
+// GeometryUpdate frames — e.g. an eval suite creating/tearing down ~60
+// heavy-mesh parts back to back) used to call `scene.addObject` /
+// `updateObject` / `removeObject` once PER MESSAGE. Each call clones the
+// whole `objects` Map (O(n)) and forces a React commit that re-uploads
+// every touched mesh's GPU buffers — serialized into one synchronous
+// pile of work per animation frame, which froze the tab.
+//
+// Instead, geometry-lifecycle messages are folded into `pendingOps`
+// keyed by object id. A `Map.set` for an id that's already pending
+// simply overwrites the previous entry — this alone implements the two
+// ordering rules: "an update after a create is merged" (the later
+// upsert record replaces the earlier one) and "a delete after a create
+// in the same window is a net no-op" (the id ends up mapped to a
+// delete; if it was never in the real store, `applyObjectBatch` removes
+// nothing). The batch is applied via one `scene.applyObjectBatch` call
+// per flush. Heavy upserts are further capped per flush
+// (`MAX_UPSERTS_PER_FLUSH`) so a 60-part burst spreads its GPU uploads
+// over several frames instead of stalling one; deletes are cheap (no
+// GPU cost) and always drain in full, which is also what collapses a
+// `clear_parts` burst of N `ObjectDeleted` frames into one scene sweep.
+interface PendingUpsert {
+  kind: 'upsert'
+  obj: CADObject
+  /** Mirrors the old per-message side effects: ObjectCreated always
+   *  frames + echoes; GeometryUpdate only when the object is genuinely
+   *  new; ObjectUpdated never. Computed once at receive time. */
+  announceAsNew: boolean
+  echoMessage: string | null
+}
+interface PendingDelete {
+  kind: 'delete'
+}
+type PendingOp = PendingUpsert | PendingDelete
+
+const pendingOps = new Map<string, PendingOp>()
+const MAX_UPSERTS_PER_FLUSH = 4
+const FLUSH_BACKSTOP_MS = 50
+
+let flushRafHandle: number | null = null
+let flushTimerHandle: ReturnType<typeof setTimeout> | null = null
+
+/** The object this id would resolve to right now if the batch were
+ *  flushed — checks still-pending churn before falling back to the
+ *  committed store, so name-preservation logic sees same-window
+ *  create-then-update chains correctly instead of stale committed state. */
+function getEffectiveExisting(id: string): CADObject | undefined {
+  const pending = pendingOps.get(id)
+  if (pending) return pending.kind === 'upsert' ? pending.obj : undefined
+  return useSceneStore.getState().objects.get(id)
+}
+
+function queueUpsert(obj: CADObject, announceAsNew: boolean, echoMessage: string | null) {
+  pendingOps.set(obj.id, { kind: 'upsert', obj, announceAsNew, echoMessage })
+  scheduleFlush()
+}
+
+function queueDelete(id: string) {
+  pendingOps.set(id, { kind: 'delete' })
+  scheduleFlush()
+}
+
+function scheduleFlush() {
+  if (flushRafHandle !== null || flushTimerHandle !== null) return
+  if (typeof requestAnimationFrame === 'function') {
+    flushRafHandle = requestAnimationFrame(() => {
+      flushRafHandle = null
+      if (flushTimerHandle !== null) {
+        clearTimeout(flushTimerHandle)
+        flushTimerHandle = null
+      }
+      flushPendingOps()
+    })
+  }
+  // Backstop: guarantees a flush even when rAF is throttled (a
+  // backgrounded tab — plausible during a headless/unfocused eval run)
+  // or unavailable. Whichever trigger fires first flushes and clears
+  // the other's handle; the loser is simply a stale id, safe to ignore.
+  flushTimerHandle = setTimeout(() => {
+    flushTimerHandle = null
+    flushRafHandle = null
+    flushPendingOps()
+  }, FLUSH_BACKSTOP_MS)
+}
+
+function flushPendingOps() {
+  if (pendingOps.size === 0) return
+  const scene = useSceneStore.getState()
+
+  const deletes: string[] = []
+  const upsertEntries: Array<[string, PendingUpsert]> = []
+  for (const [id, op] of pendingOps) {
+    if (op.kind === 'delete') deletes.push(id)
+    else upsertEntries.push([id, op])
+  }
+
+  // Cap how many heavy upserts land in this commit; the rest stay queued
+  // and ride the next flush. Deletes are cheap (no mesh/GPU cost) and
+  // always apply in full — this is what makes a `clear_parts` burst of
+  // N deletions collapse into one scene sweep.
+  const toApplyNow = upsertEntries.slice(0, MAX_UPSERTS_PER_FLUSH)
+
+  for (const [id] of toApplyNow) pendingOps.delete(id)
+  for (const id of deletes) pendingOps.delete(id)
+
+  if (deletes.length > 0 || toApplyNow.length > 0) {
+    scene.applyObjectBatch({
+      upserts: toApplyNow.map(([, op]) => op.obj),
+      deletes,
+    })
+
+    for (const [, op] of toApplyNow) {
+      if (!op.announceAsNew) continue
+      scene.setPendingFrameObject(op.obj.id)
+      if (op.echoMessage) {
+        useChatStore.getState().addMessage({
+          role: 'system',
+          content: op.echoMessage,
+          objectsAffected: [op.obj.id],
+        })
+      }
+    }
+  }
+
+  // More upserts queued (throttled by MAX_UPSERTS_PER_FLUSH) or new
+  // messages arrived while this flush ran — keep draining.
+  if (pendingOps.size > 0) {
+    scheduleFlush()
+  }
+}
+
 // ─── Message router ─────────────────────────────────────────────────
 
 function handleServerMessage(msg: ServerMessage) {
@@ -192,35 +325,26 @@ function handleServerMessage(msg: ServerMessage) {
     }
 
     case 'GeometryUpdate': {
-      const obj = convertCADObject(msg.payload.object)
-      const existing = scene.objects.get(obj.id)
-      if (existing) {
-        scene.updateObject(obj.id, obj)
-      } else {
-        scene.addObject(obj)
-        // Same rationale as ObjectCreated — backend sometimes ships new
-        // geometry as a Tessellated GeometryUpdate (e.g., REST creates
-        // followed by tessellation). Frame it.
-        scene.setPendingFrameObject(obj.id)
-        const echo = dimensionEchoMessage(msg.payload.object)
-        if (echo) {
-          useChatStore.getState().addMessage({
-            role: 'system',
-            content: echo,
-            objectsAffected: [obj.id],
-          })
-        }
-      }
+      const proto = msg.payload.object
+      const obj = convertCADObject(proto)
+      const existing = getEffectiveExisting(obj.id)
+      const isNew = existing === undefined
+      // Same rationale as ObjectCreated — backend sometimes ships new
+      // geometry as a Tessellated GeometryUpdate (e.g., REST creates
+      // followed by tessellation). Frame it, but only when it's
+      // genuinely new (mirrors the old addObject-vs-updateObject split).
+      queueUpsert(obj, isNew, isNew ? dimensionEchoMessage(proto) : null)
       break
     }
 
     case 'ObjectCreated': {
-      const obj = convertCADObject(msg.payload)
+      const proto = msg.payload
+      const obj = convertCADObject(proto)
       // Diagnostic: surfaces whether the WS path is wired and whether
       // the per-triangle FaceId map reached the bridge. If `faceIds` is
       // 0 here, face-picking will silently fall back to raw triangle
       // indices and the kernel pick query will reject them.
-       
+
       console.log(
         '[WS] ObjectCreated',
         obj.id.slice(0, 8),
@@ -235,24 +359,15 @@ function handleServerMessage(msg: ServerMessage) {
       // otherwise clobber whatever the user named the host ("Box 0",
       // "Bracket A", …). Object identity is the UUID, not the name —
       // when we already know the object, only the geometry is new.
-      const existing = scene.objects.get(obj.id)
+      const existing = getEffectiveExisting(obj.id)
       if (existing) {
         obj.name = existing.name
       }
-      scene.addObject(obj)
       // Auto-frame the viewport on the new object so the user always
       // sees what they just made — backend may place it off-screen
       // (e.g., booleans land at world origin, extrudes shift along the
       // face normal). CameraController consumes & clears this flag.
-      scene.setPendingFrameObject(obj.id)
-      const echo = dimensionEchoMessage(msg.payload)
-      if (echo) {
-        useChatStore.getState().addMessage({
-          role: 'system',
-          content: echo,
-          objectsAffected: [obj.id],
-        })
-      }
+      queueUpsert(obj, true, dimensionEchoMessage(proto))
       break
     }
 
@@ -265,17 +380,19 @@ function handleServerMessage(msg: ServerMessage) {
       // and objectType from the patch so the kernel cannot rename a
       // box to "Fillet 7" just because an edge was rounded.
       const obj = convertCADObject(msg.payload)
-      const existing = scene.objects.get(obj.id)
-      if (existing) {
-        obj.name = existing.name
-        obj.objectType = existing.objectType
-      }
-      scene.updateObject(obj.id, obj)
+      const existing = getEffectiveExisting(obj.id)
+      // Matches the old `updateObject`'s no-op-if-missing guard: an
+      // ObjectUpdated for an id the client has never heard of has
+      // nothing to patch.
+      if (!existing) break
+      obj.name = existing.name
+      obj.objectType = existing.objectType
+      queueUpsert(obj, false, null)
       break
     }
 
     case 'ObjectDeleted': {
-      scene.removeObject(msg.payload.id)
+      queueDelete(msg.payload.id)
       break
     }
 
@@ -288,11 +405,16 @@ function handleServerMessage(msg: ServerMessage) {
     }
 
     case 'SceneSync': {
-      // Full scene sync — replace all objects.
+      // Full scene sync — replace all objects. This is an authoritative
+      // snapshot, so any still-pending churn from the batching queue
+      // above is superseded; drop it rather than let a stale queued
+      // delete/upsert race the sync on the next flush.
+      pendingOps.clear()
       scene.clearScene()
-      for (const proto of msg.payload.objects) {
-        scene.addObject(convertCADObject(proto))
-      }
+      scene.applyObjectBatch({
+        upserts: msg.payload.objects.map(convertCADObject),
+        deletes: [],
+      })
       break
     }
 
@@ -434,8 +556,11 @@ async function resyncSceneFromServer(): Promise<void> {
     // object missing its material, was the "appears then disappears" bug.)
     const converted = (snap.objects ?? []).map(convertCADObject)
     const scene = useSceneStore.getState()
+    // Authoritative snapshot — drop any still-pending churn so a queued
+    // delete/upsert from before the reconnect can't race this rebuild.
+    pendingOps.clear()
     scene.clearScene()
-    for (const obj of converted) scene.addObject(obj)
+    scene.applyObjectBatch({ upserts: converted, deletes: [] })
     sketchesHydrated = false
     hydrateSketchesOnce()
     console.info(
@@ -482,4 +607,16 @@ export function teardownWebSocket() {
   wsClient.disconnect()
   initialized = false
   sketchesHydrated = false
+  // Cancel any in-flight batch flush and drop queued churn — nothing
+  // left to apply it to once the bridge is torn down, and a stray timer
+  // firing after teardown would resurrect stale objects on the next init.
+  pendingOps.clear()
+  if (flushRafHandle !== null && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(flushRafHandle)
+  }
+  flushRafHandle = null
+  if (flushTimerHandle !== null) {
+    clearTimeout(flushTimerHandle)
+    flushTimerHandle = null
+  }
 }

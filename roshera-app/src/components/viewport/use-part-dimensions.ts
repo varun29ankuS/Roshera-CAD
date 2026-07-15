@@ -72,6 +72,8 @@ export function usePartDimensions(
     }
 
     let cancelled = false
+    // Immediate loading flag before the async fetch starts; matches use-part-labels.ts.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true)
 
     fetch(`${API_BASE}/agent/parts/${partId}/dimensions`, {

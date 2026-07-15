@@ -715,6 +715,19 @@ interface SceneState {
   updateObject: (id: string, patch: Partial<CADObject>) => void
   setObjectColor: (id: string, rgb: [number, number, number]) => void
   removeObject: (id: string) => void
+  /**
+   * Apply a burst of upserts + deletes as ONE store commit instead of one
+   * per object. Used by `ws-bridge.ts` to flush a coalesced WS-message
+   * batch (see the "WS churn batching" section there) — a flood of
+   * ObjectCreated/Updated/Deleted/GeometryUpdate frames used to call
+   * `addObject`/`updateObject`/`removeObject` per message, each cloning
+   * the whole `objects` Map and forcing a React commit; under a ~60-part
+   * churn burst that froze the tab. This clones `objects`/`objectOrder`
+   * exactly once and folds in every affected object, replicating
+   * `addObject`'s per-item mesh-change selection invalidation and
+   * `removeObject`'s per-item selection/dimension cleanup.
+   */
+  applyObjectBatch: (batch: { upserts: CADObject[]; deletes: string[] }) => void
   clearScene: () => void
 
   selectObject: (id: string, additive: boolean) => void
@@ -1199,6 +1212,82 @@ const sceneCreator: StateCreator<
           objectOrder: state.objectOrder.filter((oid) => oid !== id),
           selectedIds,
           hoveredId: state.hoveredId === id ? null : state.hoveredId,
+          showDimensions,
+          pinnedMeasurements,
+          dimensionKindFilter,
+        }
+      }),
+
+    applyObjectBatch: (batch) =>
+      set((state) => {
+        if (batch.upserts.length === 0 && batch.deletes.length === 0) return state
+
+        const objects = new Map(state.objects)
+        const deleteSet = new Set(batch.deletes)
+        let objectOrder = state.objectOrder
+        let subElementSelections = state.subElementSelections
+        let hoveredSubElement = state.hoveredSubElement
+        let selectedIds = state.selectedIds
+        let showDimensions = state.showDimensions
+        let pinnedMeasurements = state.pinnedMeasurements
+        let dimensionKindFilter = state.dimensionKindFilter
+        let hoveredId = state.hoveredId
+
+        if (deleteSet.size > 0) {
+          let removedAny = false
+          for (const id of deleteSet) {
+            if (objects.delete(id)) removedAny = true
+          }
+          if (removedAny) {
+            objectOrder = objectOrder.filter((oid) => !deleteSet.has(oid))
+          }
+          selectedIds = new Set(state.selectedIds)
+          showDimensions = new Set(state.showDimensions)
+          for (const id of deleteSet) {
+            selectedIds.delete(id)
+            showDimensions.delete(id)
+          }
+          pinnedMeasurements = state.pinnedMeasurements.filter(
+            (p) => !deleteSet.has(p.a.objectId) && !(p.b && deleteSet.has(p.b.objectId)),
+          )
+          dimensionKindFilter =
+            showDimensions.size === 0
+              ? new Set<string>(ALL_DIMENSION_KINDS)
+              : state.dimensionKindFilter
+          subElementSelections = state.subElementSelections.filter(
+            (s) => !deleteSet.has(s.objectId),
+          )
+          hoveredSubElement =
+            state.hoveredSubElement && deleteSet.has(state.hoveredSubElement.objectId)
+              ? null
+              : state.hoveredSubElement
+          hoveredId = state.hoveredId !== null && deleteSet.has(state.hoveredId) ? null : state.hoveredId
+        }
+
+        const newIds: string[] = []
+        for (const obj of batch.upserts) {
+          const prior = objects.get(obj.id)
+          const existed = prior !== undefined
+          objects.set(obj.id, obj)
+          if (!existed) newIds.push(obj.id)
+
+          const meshChanged = existed && prior !== undefined && prior.mesh !== obj.mesh
+          if (meshChanged) {
+            subElementSelections = subElementSelections.filter((s) => s.objectId !== obj.id)
+            if (hoveredSubElement?.objectId === obj.id) hoveredSubElement = null
+          }
+        }
+        if (newIds.length > 0) {
+          objectOrder = objectOrder === state.objectOrder ? [...objectOrder, ...newIds] : objectOrder.concat(newIds)
+        }
+
+        return {
+          objects,
+          objectOrder,
+          subElementSelections,
+          hoveredSubElement,
+          selectedIds,
+          hoveredId,
           showDimensions,
           pinnedMeasurements,
           dimensionKindFilter,
