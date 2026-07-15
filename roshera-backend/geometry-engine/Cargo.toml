@@ -127,6 +127,12 @@ harness = false
 name = "tessellation_bench"
 harness = false
 
+# SKETCH-DCM #45 Slice 2: constraint-solver scaling baseline
+# (dense vs connected-component-decomposed, 30/100/300 constraints).
+[[bench]]
+name = "sketch_solver"
+harness = false
+
 [[bin]]
 name = "bench_runner"
 path = "src/bin/bench_runner.rs"

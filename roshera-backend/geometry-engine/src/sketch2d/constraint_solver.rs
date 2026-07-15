@@ -141,6 +141,30 @@ pub struct ConstraintSolver {
     constraints: Vec<Constraint>,
     /// Constraint dependencies
     dependency_graph: HashMap<ConstraintId, HashSet<EntityRef>>,
+    /// SKETCH-DCM #45 Slice 2: when `true` (the default), `solve`
+    /// splits the constraint graph into connected components and runs
+    /// the Newton core per component (see [`Self::run_newton_decomposed`]).
+    /// Disable via [`Self::set_decomposition_enabled`] to force the
+    /// pre-slice one-big-system path — a diagnostics/benchmark switch
+    /// (the `sketch_solver` bench uses it for its dense baseline), not
+    /// a correctness knob: both paths must produce equivalent residual
+    /// verdicts.
+    decomposition_enabled: bool,
+}
+
+/// Outcome of one run of the damped Newton-Raphson core (whole-system
+/// or aggregated across components).
+struct NewtonOutcome {
+    /// Iterations executed. For the decomposed path this is the MAX
+    /// over components — the depth of the longest Newton run, which is
+    /// what the count means for latency (components are independent).
+    iterations: usize,
+    /// `‖residual‖₂` over the FULL constraint set at exit — measured
+    /// identically in both paths.
+    final_error: f64,
+    /// True when any linear solve (any component) failed both the
+    /// plain and Tikhonov-regularised attempts.
+    linear_solve_failed: bool,
 }
 
 /// Structural metadata for a spline entity that cannot vary during
@@ -323,6 +347,7 @@ impl ConstraintSolver {
             entity_state: Arc::new(DashMap::new()),
             constraints: Vec::new(),
             dependency_graph: HashMap::new(),
+            decomposition_enabled: true,
         }
     }
 
@@ -353,6 +378,21 @@ impl ConstraintSolver {
     /// Current damping factor (for diagnostics / tests).
     pub fn damping_factor(&self) -> f64 {
         self.damping_factor
+    }
+
+    /// Enable/disable connected-component decomposition (SKETCH-DCM
+    /// #45 Slice 2). ON by default. Turning it off forces the
+    /// pre-slice one-big-system Newton path — useful as a dense
+    /// baseline for benchmarks and for mutation-testing the
+    /// decomposition itself; residual verdicts must be equivalent
+    /// either way (the gate pins this).
+    pub fn set_decomposition_enabled(&mut self, enabled: bool) {
+        self.decomposition_enabled = enabled;
+    }
+
+    /// Whether connected-component decomposition is active.
+    pub fn decomposition_enabled(&self) -> bool {
+        self.decomposition_enabled
     }
 
     /// Add an entity to the solver
@@ -398,13 +438,52 @@ impl ConstraintSolver {
         let start_time = std::time::Instant::now();
 
         // Capture but do not act on the DOF verdict — it is folded
-        // into the final status after Newton-Raphson runs.
+        // into the final status after Newton-Raphson runs. The count
+        // is GLOBAL in both solve paths: the external verdict must be
+        // indistinguishable whether or not decomposition ran.
         let dof_verdict = self.check_constraint_count();
 
         // Sort constraints by priority
         self.constraints.sort_by_key(|c| c.priority);
 
-        // Newton-Raphson iteration
+        // SKETCH-DCM #45 Slice 2: run the Newton core per connected
+        // component of the constraint graph when there is more than
+        // one. Components have block-diagonal Jacobians (zero coupling
+        // by construction), so the per-component steps are the
+        // whole-system steps restricted to each block — at
+        // Σ O(pᵢ³) instead of O((Σpᵢ)³) per iteration.
+        let outcome = self.run_newton_decomposed();
+
+        // Determine final status with the precedence documented above.
+        let status = if outcome.linear_solve_failed {
+            SolverStatus::Unstable
+        } else if let Some(verdict) = dof_verdict {
+            verdict
+        } else if outcome.final_error < self.tolerance {
+            SolverStatus::Converged {
+                iterations: outcome.iterations,
+                final_error: outcome.final_error,
+            }
+        } else {
+            SolverStatus::NotConverged {
+                iterations: outcome.iterations,
+                final_error: outcome.final_error,
+            }
+        };
+
+        SolverResult {
+            status,
+            entity_updates: self.get_entity_updates(),
+            violations: self.get_violations(),
+            solve_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+        }
+    }
+
+    /// The damped Newton-Raphson core, byte-for-byte the pre-Slice-2
+    /// `solve` loop. Operates on whatever entity/constraint set this
+    /// solver instance holds; callers are responsible for having
+    /// sorted `constraints` by priority.
+    fn run_newton(&mut self) -> NewtonOutcome {
         let mut iteration = 0;
         let mut error = f64::INFINITY;
         let mut linear_solve_failed = false;
@@ -442,29 +521,151 @@ impl ConstraintSolver {
             iteration += 1;
         }
 
-        // Determine final status with the precedence documented above.
-        let status = if linear_solve_failed {
-            SolverStatus::Unstable
-        } else if let Some(verdict) = dof_verdict {
-            verdict
-        } else if error < self.tolerance {
-            SolverStatus::Converged {
-                iterations: iteration,
-                final_error: error,
-            }
+        NewtonOutcome {
+            iterations: iteration,
+            final_error: error,
+            linear_solve_failed,
+        }
+    }
+
+    /// Dispatch the Newton core over connected components (SKETCH-DCM
+    /// #45 Slice 2 — decomposition phase 0).
+    ///
+    /// A sketch that is one component (or a solver with decomposition
+    /// disabled) runs the whole-system core unchanged — the split can
+    /// only ever SHRINK the system Newton sees (spec §3.1 step 5).
+    ///
+    /// With k > 1 components, each component gets a sub-solver holding
+    /// clones of exactly its entities and constraints, runs the same
+    /// Newton core, and its solved parameters are written back. The
+    /// aggregate is externally indistinguishable from the whole path:
+    ///
+    /// - `final_error` is re-measured GLOBALLY over the full constraint
+    ///   set at exit — the same quantity the whole-system loop exits
+    ///   with (constraints without any live entity included).
+    /// - `linear_solve_failed` is true if ANY component's linear solve
+    ///   failed, matching the whole path's any-iteration-failure ⇒
+    ///   `Unstable` precedence.
+    /// - `iterations` is the max over components (the longest chain —
+    ///   see `NewtonOutcome::iterations`).
+    ///
+    /// Numerical equivalence note: component Jacobians are exact
+    /// diagonal blocks of the whole-system Jacobian (cross-component
+    /// entries are structurally zero), so per-component Newton steps
+    /// equal the whole-system steps restricted to each block whenever
+    /// the plain normal-equation solve succeeds. The one legitimate
+    /// divergence is the Tikhonov fallback on rank-deficient systems:
+    /// λ scales with the LOCAL trace instead of the joint one, so
+    /// under-constrained components take their own well-scaled
+    /// minimum-norm step instead of one polluted by (or polluting)
+    /// unrelated components. Residual/verdict equivalence is what the
+    /// gate pins, per the campaign contract.
+    fn run_newton_decomposed(&mut self) -> NewtonOutcome {
+        if !self.decomposition_enabled {
+            return self.run_newton();
+        }
+        let components = self.split_components();
+        if components.len() <= 1 {
+            return self.run_newton();
+        }
+
+        // The caller's tolerance bounds the GLOBAL residual norm.
+        // k components that each stop at a local norm just under t
+        // aggregate to a global norm up to √k·t, which would report
+        // `NotConverged` for a solve the whole-system path calls
+        // `Converged`. Tightening each component to t/√k makes the
+        // aggregate provably meet the caller's tolerance:
+        // ‖r‖ = √(Σ‖rᵢ‖²) < √(k·t²/k) = t.
+        let active_components = components
+            .iter()
+            .filter(|component| !component.constraint_indices.is_empty())
+            .count();
+        let component_tolerance = if active_components > 1 {
+            self.tolerance / (active_components as f64).sqrt()
         } else {
-            SolverStatus::NotConverged {
-                iterations: iteration,
-                final_error: error,
-            }
+            self.tolerance
         };
 
-        SolverResult {
-            status,
-            entity_updates: self.get_entity_updates(),
-            violations: self.get_violations(),
-            solve_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+        let mut iterations = 0usize;
+        let mut linear_solve_failed = false;
+        for component in &components {
+            // Entities with no constraint rows anywhere take no Newton
+            // step in either path (their columns are structurally
+            // uninvolved) — skip the sub-solve entirely.
+            if component.constraint_indices.is_empty() {
+                continue;
+            }
+            let mut sub = ConstraintSolver::new();
+            sub.max_iterations = self.max_iterations;
+            sub.tolerance = component_tolerance;
+            sub.damping_factor = self.damping_factor;
+            sub.decomposition_enabled = false;
+            for entity in &component.entities {
+                if let Some(state) = self.entity_state.get(entity) {
+                    sub.entity_state.insert(*entity, state.value().clone());
+                }
+            }
+            sub.constraints = component
+                .constraint_indices
+                .iter()
+                .filter_map(|&i| self.constraints.get(i).cloned())
+                .collect();
+
+            let outcome = sub.run_newton();
+
+            for entity in &component.entities {
+                if let Some(state) = sub.entity_state.get(entity) {
+                    self.entity_state.insert(*entity, state.value().clone());
+                }
+            }
+            iterations = iterations.max(outcome.iterations);
+            linear_solve_failed |= outcome.linear_solve_failed;
         }
+
+        // Exit residual measured globally over the merged state —
+        // exactly the quantity the whole-system loop exits with.
+        let errors = self.compute_constraint_errors();
+        let final_error = errors.iter().map(|e| e * e).sum::<f64>().sqrt();
+        NewtonOutcome {
+            iterations,
+            final_error,
+            linear_solve_failed,
+        }
+    }
+
+    /// Build the connected components of the current constraint graph.
+    ///
+    /// Nodes are the registered entities; edges are (a) every
+    /// constraint's entity set and (b) the Slice-1 shared-variable
+    /// references — a derived segment/arc is structurally coupled to
+    /// its endpoint points, a shared-center circle/arc to its center
+    /// point, so they must solve together even without an explicit
+    /// constraint between them.
+    fn split_components(&self) -> Vec<super::decompose::ConstraintComponent> {
+        let mut nodes: Vec<EntityRef> = Vec::new();
+        let mut shared_ref_edges: Vec<(EntityRef, EntityRef)> = Vec::new();
+        for entry in self.entity_state.iter() {
+            let owner = *entry.key();
+            nodes.push(owner);
+            let state = entry.value();
+            if let Some((start, end)) = state.derived_segment {
+                shared_ref_edges.push((owner, start));
+                shared_ref_edges.push((owner, end));
+            }
+            if let Some((start, end)) = state.derived_arc_endpoints {
+                shared_ref_edges.push((owner, start));
+                shared_ref_edges.push((owner, end));
+            }
+            if let Some(center) = state.derived_center {
+                shared_ref_edges.push((owner, center));
+            }
+        }
+        let constraint_entities: Vec<&[EntityRef]> = self
+            .constraints
+            .iter()
+            .map(|c| c.entities.as_slice())
+            .collect();
+        super::decompose::connected_components(&nodes, &shared_ref_edges, &constraint_entities)
     }
 
     /// Check if system is properly constrained

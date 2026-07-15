@@ -529,6 +529,33 @@ pub fn solve_with_options(
     solve_internal(sketch, options, Vec::new())
 }
 
+/// Build the exact `ConstraintSolver` instance `solve_with_options`
+/// would run — same entity registration, same constraint list, same
+/// tunables — WITHOUT solving and WITHOUT ever writing back to the
+/// sketch.
+///
+/// Diagnostics / benchmarking surface (SKETCH-DCM #45 Slice 2): the
+/// caller can flip solver-level switches the bridge does not expose —
+/// e.g. `ConstraintSolver::set_decomposition_enabled(false)` for a
+/// dense one-big-system baseline — and time `solve()` in isolation.
+/// The `sketch_solver` criterion bench and the Slice-2 equivalence
+/// tests are the intended consumers. Entity updates from a solve on
+/// the returned instance stay inside it; use [`solve_with_options`]
+/// when the sketch should receive the solution.
+pub fn build_solver(
+    sketch: &Sketch,
+    options: SolveOptions,
+) -> Result<ConstraintSolver, SketchSolveError> {
+    validate_options(&options)?;
+    let mut solver = ConstraintSolver::new();
+    solver.set_max_iterations(options.max_iterations);
+    solver.set_tolerance(options.tolerance);
+    solver.set_damping_factor(options.damping_factor);
+    populate_solver(sketch, &solver);
+    solver.set_constraints(sketch.all_constraints());
+    Ok(solver)
+}
+
 /// Drag a single entity toward a target position while honouring
 /// every other constraint in the sketch.
 ///

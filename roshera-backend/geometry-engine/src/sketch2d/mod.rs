@@ -45,6 +45,9 @@ pub mod spline2d;
 // Constraint system
 pub mod constraint_solver;
 pub mod constraints;
+// Constraint-graph decomposition (SKETCH-DCM #45 — phase 0: connected
+// components; Slice 3 grows this into the rigid-cluster DR-plan).
+pub mod decompose;
 pub mod sketch_solver;
 
 // Sketch container and management
