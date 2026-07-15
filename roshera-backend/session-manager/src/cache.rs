@@ -107,8 +107,7 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlLruCache<K, V> {
     /// `capacity` must be non-zero. A zero capacity silently coerces to `1` so
     /// that callers never trigger a panic from an otherwise-valid configuration.
     pub fn new(capacity: usize, max_size_bytes: usize, default_ttl: Option<Duration>) -> Self {
-        let non_zero_capacity = NonZeroUsize::new(capacity)
-            .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is a valid NonZeroUsize"));
+        let non_zero_capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
             cache: RwLock::new(LruCache::new(non_zero_capacity)),
             stats: RwLock::new(CacheStats::default()),

@@ -2,6 +2,13 @@
 //!
 //! A high-performance boundary representation (B-Rep) engine for aerospace CAD applications.
 
+// Reason: the workspace denies unwrap/expect/panic in PRODUCTION code (and that
+// stands — this attribute is inert outside `cfg(test)`). In unit tests, panicking
+// is the test framework's failure mechanism; forcing Result-plumbing into ~270
+// pre-existing assertion sites adds noise, not safety. Enforcement became real
+// when the CI clippy exit code turned authoritative (tasks #43/#53).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 pub mod assembly;
 pub mod drawing;
 pub mod gdt;

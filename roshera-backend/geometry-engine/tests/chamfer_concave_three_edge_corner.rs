@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Task #82 Slice 1 — chamfering the re-entrant (concave degree-3) corner of a
 //! notched box. The planar corner-cap synthesizer (`apply_planar_chamfer_cap`,
 //! reached through `handle_chamfer_vertices` / `identify_chamfer_corners`) is

@@ -24,6 +24,11 @@
 //! re-introduced here, so a verdict commit can be replayed by the
 //! production timeline without identity translation.
 
+// Reason: the workspace denies unwrap/expect/panic in PRODUCTION code (this
+// attribute is inert outside `cfg(test)`). In unit tests, panicking is the
+// test framework's failure mechanism.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 mod resolver;
 mod room;
 mod types;

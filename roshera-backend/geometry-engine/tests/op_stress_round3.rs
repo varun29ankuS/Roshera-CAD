@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! op_stress_round3 — broad-spectrum kernel bug HUNT (round 3).
 //!
 //! Goal: surface NEW corruption classes across op families NOT stressed in the

@@ -703,12 +703,10 @@ pub fn batch_deltas(deltas: Vec<SessionDelta>) -> Option<SessionDelta> {
         return deltas.into_iter().next();
     }
 
-    // SAFETY: the early returns above ensure `deltas.len() >= 2`, so
-    // `last()` is always `Some`. We still use `expect` to surface the
-    // invariant at the call site instead of swallowing it.
-    let last = deltas
-        .last()
-        .expect("batch_deltas invariant: len >= 2 after early returns");
+    // The early returns above ensure `deltas.len() >= 2`, so `last()` is always
+    // `Some`; `?` encodes the (unreachable) None arm in the return type instead
+    // of a lint-escaped panic.
+    let last = deltas.last()?;
     let mut batched = SessionDelta {
         session_id: deltas[0].session_id,
         sequence: last.sequence,

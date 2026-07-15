@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! AGENT-RENDER-α gate (NON-ignored): the software rasterizer produces
 //! valid, deterministic, topology-labeled images.
 //!

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! #32 Slice 1 — UNION embedded analytic-lateral split (REGRESSION GUARD).
 //!
 //! Charter (2026-07-09 #32 spec, Slice 1): when two solids union, an operand

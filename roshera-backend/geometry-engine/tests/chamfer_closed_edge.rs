@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Closed-edge chamfer regression tests (Task #89 — chamfer half).
 //!
 //! Mirror of `tests/fillet_closed_edge.rs` for the chamfer pipeline.

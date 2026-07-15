@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! `NurbsCurve2d::circular_arc` must produce the exact rational circular arc
 //! for sweeps of any size — including full circles and >90° arcs, which the
 //! previous implementation rejected with "Multi-segment circular arcs not

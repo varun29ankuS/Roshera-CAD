@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Advanced rotation/transform invariants: Quaternion interpolation, Euler
 //! round-trips, rotation-between, powers; Matrix4 mirror, scale-about-point,
 //! rotation-about-axis. Pure arithmetic, fast.

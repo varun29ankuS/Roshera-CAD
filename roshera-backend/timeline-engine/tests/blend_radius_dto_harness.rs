@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Wire-shape + backward-compat harness for `BlendRadiusDto`.
 //!
 //! This is the F3-ε.2 Slice B integration guard. It pins the contract

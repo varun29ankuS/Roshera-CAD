@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Invariants for `math::nurbs::NurbsCurve`.
 //!
 //! The deep ones are algorithmic: knot insertion and degree elevation must

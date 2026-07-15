@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Matrix4 composition/transform invariants, remaining Vector3 scalar ops,
 //! and Tolerance round-trips. Pure arithmetic, fast.
 
@@ -142,7 +146,7 @@ translation_ignores_vectors_test!(trans_c, 0.0, 10.0, -3.0);
 
 #[test]
 fn rotation_z_maps_x_axis_onto_circle() {
-    for &ang in &[0.0, 0.5, 1.5707963, 3.1415927] {
+    for &ang in &[0.0, 0.5, std::f64::consts::FRAC_PI_2, std::f64::consts::PI] {
         let m = Matrix4::rotation_z(ang);
         let r = m.transform_point(&pt(1.0, 0.0, 0.0));
         assert!(

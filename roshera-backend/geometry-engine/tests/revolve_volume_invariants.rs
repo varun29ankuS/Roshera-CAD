@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Volume invariants for the revolve operation, via Pappus's theorem.
 //!
 //! Revolving a planar region of area A about an external axis, through angle θ,

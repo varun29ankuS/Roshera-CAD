@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Task #82 Slice 1 — filleting the re-entrant (concave degree-3) corner of a
 //! notched box. The apex-sphere synthesizer (`apply_apex_sphere_corner`) is
 //! generalized from the convex apex to `ConcaveCorner { degree: 3 }`: the

@@ -498,7 +498,7 @@ mod tests {
     /// over-inclusion bug (task #34) is genuinely gone.
     #[test]
     fn rotated_box_booleans_match_mc_truth() {
-        let ang = 0.5236; // 30°
+        let ang = std::f64::consts::FRAC_PI_6; // 30°
         let build = move |m: &mut BRepModel| {
             let a = mkbox(m, 4.0);
             let b = mkbox(m, 4.0);
@@ -523,7 +523,7 @@ mod tests {
     /// Tilted-axis (fully 3D) rotation matches the analytic MC truth.
     #[test]
     fn tilted_box_booleans_match_mc_truth() {
-        let ang = 0.5236;
+        let ang = std::f64::consts::FRAC_PI_6;
         let ax = Vector3::new(1.0, 1.0, 1.0).normalize().unwrap();
         let build = move |m: &mut BRepModel| {
             let a = mkbox(m, 4.0);

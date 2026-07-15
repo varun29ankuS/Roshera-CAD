@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! PILLAR 2 — randomized op-SEQUENCE fuzz, cross-checking PILLAR 1. Build a
 //! random multi-feature part (a box pierced by one or two offset cylinders — the
 //! realistic, well-conditioned union the bearing-housing builds exercise) and

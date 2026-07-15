@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! PILLAR 3 gate — reference-by-description selection with ambiguity-refusal.
 //! The kernel resolves "the +Z planar face" / "the largest +Z planar face" to a
 //! concrete FaceId, and REFUSES (Ambiguous / NotFound) when the description

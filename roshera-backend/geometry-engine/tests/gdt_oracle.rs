@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! GD&T oracle — Task 1 integration tests.
 //!
 //! These are the **RED-first** acceptance tests for the DRF designation and

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! AGENT-RENDER-α.6 — eyes on the diagnostic cells.
 //!
 //! Renders the boolean results of the still-broken cone radial cells

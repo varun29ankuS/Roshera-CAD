@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Probe: cone ∪ cylinder must TERMINATE (no hang) after the march step cap.
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::{boolean_operation, BooleanOp, BooleanOptions};

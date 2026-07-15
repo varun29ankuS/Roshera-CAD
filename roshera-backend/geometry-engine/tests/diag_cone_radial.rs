@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Cone radial-family diagnostic — the post-sphere-campaign worst class.
 //!
 //! The 2026-06-10 full-matrix re-survey (box∘cone: 21 HARD / 30 checks) shows

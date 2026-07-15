@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! KNOWN_BUGS #65 — boolean-result curved face doubled-facet → non-manifold
 //! mesh at fine density. FIXED 2026-06-16 (doubled-facet removal in
 //! `weld_mesh_watertight_range`).

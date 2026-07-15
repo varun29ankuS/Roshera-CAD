@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Git-equivalence harness for the branch / fast-forward model.
 //!
 //! The timeline is git-inspired: branches fork from a parent, accumulate events,

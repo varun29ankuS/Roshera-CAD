@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! CF-γ — face-adjacent seam continuity audit (chamfer ↔ fillet)
 //! integration suite. Task 3C re-pinned to the honest single-patch
 //! cap contract (burndown-diag-cf.md sub-group C, option C-1).

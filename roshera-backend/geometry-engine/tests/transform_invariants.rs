@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Mass-property invariants under affine transforms.
 //!
 //! `transform_solid` mutates a solid's B-Rep in place, so re-querying
@@ -89,7 +93,16 @@ macro_rules! rigid_preserves_volume_box {
 rigid_preserves_volume_box!(rigid_vol_unit, 1.0, 1.0, 1.0, 0.7, 0.0, 0.0, 0.0);
 rigid_preserves_volume_box!(rigid_vol_2_3_4, 2.0, 3.0, 4.0, 1.2, 5.0, -2.0, 1.0);
 rigid_preserves_volume_box!(rigid_vol_flat, 10.0, 1.0, 6.0, 2.0, -3.0, 4.0, 2.0);
-rigid_preserves_volume_box!(rigid_vol_pi, 3.0, 3.0, 3.0, 3.1415927, 1.0, 1.0, 1.0);
+rigid_preserves_volume_box!(
+    rigid_vol_pi,
+    3.0,
+    3.0,
+    3.0,
+    std::f64::consts::PI,
+    1.0,
+    1.0,
+    1.0
+);
 rigid_preserves_volume_box!(rigid_vol_neg, 5.0, 2.0, 7.0, -1.4, -10.0, 0.0, 8.0);
 rigid_preserves_volume_box!(rigid_vol_big, 8.0, 8.0, 2.0, 0.3, 100.0, -50.0, 25.0);
 rigid_preserves_volume_box!(rigid_vol_small_ang, 4.0, 6.0, 1.0, 0.01, 1.0, 2.0, 3.0);

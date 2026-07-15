@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Persistent-id revolve lineage harness (#11 slice 40-E, revolve).
 //!
 //! The analytic-band revolve now threads persistent ids: each band face derives

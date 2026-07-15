@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Algebraic invariants for the core math types (Vector3, Matrix4,
 //! Quaternion).
 //!
@@ -271,10 +275,31 @@ macro_rules! rotation_preserves_length_test {
     };
 }
 
-rotation_preserves_length_test!(rotlen_z_90, (0.0, 0.0, 1.0), 1.5707963, 1.0, 0.0, 0.0);
-rotation_preserves_length_test!(rotlen_x_45, (1.0, 0.0, 0.0), 0.7853982, 0.0, 1.0, 1.0);
+rotation_preserves_length_test!(
+    rotlen_z_90,
+    (0.0, 0.0, 1.0),
+    std::f64::consts::FRAC_PI_2,
+    1.0,
+    0.0,
+    0.0
+);
+rotation_preserves_length_test!(
+    rotlen_x_45,
+    (1.0, 0.0, 0.0),
+    std::f64::consts::FRAC_PI_4,
+    0.0,
+    1.0,
+    1.0
+);
 rotation_preserves_length_test!(rotlen_diag, (1.0, 1.0, 1.0), 2.0, 3.0, -4.0, 5.0);
-rotation_preserves_length_test!(rotlen_y_full, (0.0, 1.0, 0.0), 3.1415927, 2.0, 2.0, 2.0);
+rotation_preserves_length_test!(
+    rotlen_y_full,
+    (0.0, 1.0, 0.0),
+    std::f64::consts::PI,
+    2.0,
+    2.0,
+    2.0
+);
 rotation_preserves_length_test!(rotlen_arb, (2.0, -1.0, 3.0), 1.1, 5.0, 0.0, -2.0);
 rotation_preserves_length_test!(rotlen_neg, (1.0, 2.0, -2.0), -2.3, -1.0, 4.0, 1.0);
 rotation_preserves_length_test!(rotlen_small, (0.0, 0.0, 1.0), 0.01, 7.0, -3.0, 0.0);
@@ -306,8 +331,22 @@ macro_rules! quat_rotation_preserves_length_test {
     };
 }
 
-quat_rotation_preserves_length_test!(qrotlen_z_90, (0.0, 0.0, 1.0), 1.5707963, 1.0, 0.0, 0.0);
-quat_rotation_preserves_length_test!(qrotlen_x_45, (1.0, 0.0, 0.0), 0.7853982, 0.0, 1.0, 1.0);
+quat_rotation_preserves_length_test!(
+    qrotlen_z_90,
+    (0.0, 0.0, 1.0),
+    std::f64::consts::FRAC_PI_2,
+    1.0,
+    0.0,
+    0.0
+);
+quat_rotation_preserves_length_test!(
+    qrotlen_x_45,
+    (1.0, 0.0, 0.0),
+    std::f64::consts::FRAC_PI_4,
+    0.0,
+    1.0,
+    1.0
+);
 quat_rotation_preserves_length_test!(qrotlen_diag, (1.0, 1.0, 1.0), 2.0, 3.0, -4.0, 5.0);
 quat_rotation_preserves_length_test!(qrotlen_arb, (2.0, -1.0, 3.0), 1.1, 5.0, 0.0, -2.0);
 quat_rotation_preserves_length_test!(qrotlen_neg, (1.0, 2.0, -2.0), -2.3, -1.0, 4.0, 1.0);
@@ -465,7 +504,7 @@ proptest! {
     #[test]
     fn prop_rotation_preserves_length(
         ax in -5.0f64..5.0, ay in -5.0f64..5.0, az in -5.0f64..5.0,
-        angle in -6.2831853f64..6.2831853, vec in arb_vec(),
+        angle in -std::f64::consts::TAU..std::f64::consts::TAU, vec in arb_vec(),
     ) {
         let axis = v(ax, ay, az);
         prop_assume!(axis.magnitude() > 1e-3);
@@ -477,7 +516,7 @@ proptest! {
     #[test]
     fn prop_quat_inverse_roundtrips(
         ax in -5.0f64..5.0, ay in -5.0f64..5.0, az in -5.0f64..5.0,
-        angle in -6.2831853f64..6.2831853, vec in arb_vec(),
+        angle in -std::f64::consts::TAU..std::f64::consts::TAU, vec in arb_vec(),
     ) {
         let axis = v(ax, ay, az);
         prop_assume!(axis.magnitude() > 1e-3);
@@ -490,7 +529,7 @@ proptest! {
     #[test]
     fn prop_quat_matrix_agree(
         ax in -5.0f64..5.0, ay in -5.0f64..5.0, az in -5.0f64..5.0,
-        angle in -3.1415927f64..3.1415927, vec in arb_vec(),
+        angle in -std::f64::consts::PI..std::f64::consts::PI, vec in arb_vec(),
     ) {
         let axis = v(ax, ay, az);
         prop_assume!(axis.magnitude() > 1e-3);

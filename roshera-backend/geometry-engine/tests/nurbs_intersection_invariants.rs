@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! NURBS×NURBS curve intersection must actually find intersections, return
 //! points that lie on BOTH curves, and be order-independent.
 //!

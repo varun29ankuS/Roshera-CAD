@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! FIX 1 / FIX 2 gate — cross-entity consistency between a solid and its
 //! linked construction geometry (the source sketch).
 //!

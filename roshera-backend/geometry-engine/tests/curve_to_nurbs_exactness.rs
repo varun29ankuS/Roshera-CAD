@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! `Curve::to_nurbs` must produce the *exact* rational curve for the analytic
 //! conics — `Arc`, `Circle`, and `Ellipse`. These are rational quadratics with
 //! a closed form (Piegl & Tiller, *The NURBS Book* §7.3 / §7.5), so the NURBS

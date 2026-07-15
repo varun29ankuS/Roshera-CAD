@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! F4-α.1 — analytic-when-possible blend surface contract.
 //!
 //! `BlendSurfaceCarrier::dispatch` is unit-tested exhaustively

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Revolve analytic-bands gate (#19).
 //!
 //! A FULL revolution of a closed cylinder/plane line profile must emit ONE

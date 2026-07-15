@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Dogfood finding F2 — `export_part` STEP → HTTP 500 with an EMPTY body
 //! for a weld-neck flange (planes + cylinders + a frustum CONE hub + a
 //! TORUS rim fillet), while STL of the same solid works.

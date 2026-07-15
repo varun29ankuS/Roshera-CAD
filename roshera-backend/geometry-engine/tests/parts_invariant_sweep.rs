@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! HARNESS-1000 (#49): a generative invariant sweep over parts the kernel
 //! builds, asserting the same bundle of structural + geometric invariants on
 //! every case.

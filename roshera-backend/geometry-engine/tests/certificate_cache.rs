@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! STRUCTURALLY-INTRINSIC certification gate — the kernel's validity
 //! certificate is lazily cached on the `Solid` (mirroring `cached_mass_props`)
 //! and CANNOT go stale: every mutating seam dirties it, so any read returns a

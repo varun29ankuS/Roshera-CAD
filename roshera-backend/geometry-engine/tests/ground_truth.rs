@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! PILLAR 1 gate — the kernel reports its OWN ground truth (provenance +
 //! computed validity), so an agent cannot misrepresent a placeholder primitive
 //! as a designed surface or a broken solid as finished. The kernel answers

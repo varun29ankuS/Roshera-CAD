@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Determinism net for the tessellation pipeline (P0 #84).
 //!
 //! The mesh is what ships to export and the viewport, so it must be byte-stable

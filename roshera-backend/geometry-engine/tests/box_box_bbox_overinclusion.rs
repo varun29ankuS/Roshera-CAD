@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! BOX∘BOX bbox over-inclusion (the #34/#80 robustness-ceiling class).
 //!
 //! Discovered by the tier-3 bbox-containment proptest

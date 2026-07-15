@@ -92,8 +92,8 @@ impl TessellationCache {
     /// `max_items` must be non-zero; a misconfigured zero is clamped to 1
     /// rather than panicking.
     pub fn new(max_items: usize, ttl_seconds: u64) -> Self {
-        let capacity = std::num::NonZeroUsize::new(max_items)
-            .unwrap_or_else(|| std::num::NonZeroUsize::new(1).expect("1 is non-zero"));
+        let capacity =
+            std::num::NonZeroUsize::new(max_items).unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
             cache: Arc::new(RwLock::new(LruCache::new(capacity))),
             entity_keys: DashMap::new(),

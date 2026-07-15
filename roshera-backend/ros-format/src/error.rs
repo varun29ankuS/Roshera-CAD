@@ -884,13 +884,12 @@ mod tests {
     #[test]
     fn test_error_helpers() {
         let err = RosFileError::not_found("chunk", "loading file");
-        match err {
-            RosFileError::NotFound { resource, context } => {
-                assert_eq!(resource, "chunk");
-                assert_eq!(context, "loading file");
-            }
-            _ => panic!("Wrong error type"),
-        }
+        let matched = matches!(
+            &err,
+            RosFileError::NotFound { resource, context }
+                if resource == "chunk" && context == "loading file"
+        );
+        assert!(matched, "wrong error variant/fields: {err:?}");
     }
 
     #[test]

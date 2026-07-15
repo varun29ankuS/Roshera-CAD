@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Section-on-revolve ACCEPTANCE gate (campaign task #9) — FIXED 2026-06-16 for
 //! tubes via the analytic-band revolve (#19).
 //!

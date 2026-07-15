@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Slice-2 classifier-lie regression: the CONVEX bore-TOP opening rim of a
 //! boolean-cut blind bore must classify uniformly convex across all co-circular
 //! arcs the boolean split it into.

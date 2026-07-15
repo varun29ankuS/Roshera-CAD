@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Drawing quality verification oracle (the 2D perception/feedback layer).
 //!
 //! Proves `verify_drawing` (a) passes a well-laid-out third-angle sheet,

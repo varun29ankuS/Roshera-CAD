@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! PER-OP SOUNDNESS-VERDICT GATE — the kernel certificate must FLAG the
 //! self-intersecting / non-watertight "housing" part as UNSOUND, and it must do
 //! so on the path the live per-op verdict runs (`certify_solid` → `is_sound()`).

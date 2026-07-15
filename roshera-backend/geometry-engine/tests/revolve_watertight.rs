@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! REVOLVE-TESS watertightness gate (task #63).
 //!
 //! `revolve_profile` made a valid B-Rep but a NON-watertight MESH for any

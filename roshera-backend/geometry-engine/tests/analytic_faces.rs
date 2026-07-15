@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Analytic-face gate (#24 + campaign task #2).
 //!
 //! A sketched/extruded circle must become ONE analytic `Cylinder` lateral

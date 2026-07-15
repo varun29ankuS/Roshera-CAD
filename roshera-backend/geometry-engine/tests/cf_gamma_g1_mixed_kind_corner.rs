@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Task 3C — the mixed-kind corner cap QUALITY CONTRACT
 //! (Varun-approved option C-1, burndown-diag-cf.md sub-group C).
 //!

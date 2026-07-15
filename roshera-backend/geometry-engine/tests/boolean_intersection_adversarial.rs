@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Adversarial boolean-INTERSECTION oracle harness (BOOL-∩-HARNESS, #78).
 //!
 //! The existing volume proptests measure the kernel against its *own* mesh

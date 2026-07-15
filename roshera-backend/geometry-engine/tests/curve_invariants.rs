@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Geometric invariants for the analytic curves (Line, Circle, Arc).
 //!
 //! These hold for every parameter value, so the assertions sample across the
@@ -208,9 +212,20 @@ arc_invariants_test!(
     1.0,
     2.0,
     0.0,
-    1.5707963
+    std::f64::consts::FRAC_PI_2
 );
-arc_invariants_test!(arc_half_z, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 3.0, 0.0, 3.1415927);
+arc_invariants_test!(
+    arc_half_z,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    3.0,
+    0.0,
+    std::f64::consts::PI
+);
 arc_invariants_test!(arc_third, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 5.0, 0.5, 2.0943951);
 arc_invariants_test!(arc_x_normal, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 4.0, 1.0, 1.2);
 arc_invariants_test!(arc_diag, 2.0, 0.0, -1.0, 1.0, 1.0, 0.0, 2.5, -0.5, 2.5);

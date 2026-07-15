@@ -1083,6 +1083,10 @@ pub fn detect_regions(polygons: &[&Vec<[f64; 2]>]) -> Result<Vec<Region>, Region
         .collect();
     for i in 0..n {
         if depth[i] == 1 {
+            // Reason: `depth[i] == 1` implies `parent[i]` was assigned when the
+            // containment depths were computed above — a miss is a construction
+            // bug in this function, not a recoverable runtime state.
+            #[allow(clippy::expect_used)]
             let p = parent[i].expect("depth-1 polygon must have a parent by construction");
             if let Some(r) = regions.iter_mut().find(|r| r.outer_shape_idx == p) {
                 r.hole_shape_idxs.push(i);

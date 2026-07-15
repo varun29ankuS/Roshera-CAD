@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Volume + watertightness + validity invariants for the draft operation.
 //!
 //! Drafting tilts a face about a neutral plane by a pull angle. For the

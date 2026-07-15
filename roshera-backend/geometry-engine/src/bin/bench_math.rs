@@ -1,3 +1,8 @@
+// Reason: benchmark harness binary -- fixtures are compile-time-constant;
+// abort-on-failure is the bench's failure mode. The workspace production
+// deny stands for library code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use geometry_engine::math::{Matrix4, Point3, Vector3};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

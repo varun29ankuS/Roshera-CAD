@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Gate test for kernel-verified GD&T conformance.
 //!
 //! The whole point of "GD&T that can't lie" is that the kernel MEASURES the

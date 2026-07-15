@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Tilted-cylinder UNION diagnostic — the box∘tcyl HARD residue after the
 //! 2026-06-11 cylinder-family fixes (arc-lift, kept-island hole-attachment,
 //! radial-dir). Survey state: 7 HARD / 18 checks, and EVERY failure is

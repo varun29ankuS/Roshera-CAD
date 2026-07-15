@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! #17 WATERTIGHT GATE — the brutal corefinement suite. Every boolean involving
 //! a NURBS-lateral (lofted) solid must produce a result that is SOUND (valid
 //! B-Rep + watertight + manifold + self-intersection-free) AND mesh-leak-free

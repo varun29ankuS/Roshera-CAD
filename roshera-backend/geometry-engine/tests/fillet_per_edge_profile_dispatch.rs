@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! F5-β.5.6 — `FilletType::PerEdgeProfile` end-to-end integration.
 //!
 //! Pins the mixed-kind per-edge dispatcher in the live `fillet_edges`

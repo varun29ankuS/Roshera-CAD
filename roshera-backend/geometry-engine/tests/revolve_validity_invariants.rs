@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Revolve must produce a VALID, watertight-topology B-Rep (not the previous
 //! island-per-quad non-manifold shell). `revolve_profile` validates its result
 //! by default, so a successful return already certifies a manifold solid.

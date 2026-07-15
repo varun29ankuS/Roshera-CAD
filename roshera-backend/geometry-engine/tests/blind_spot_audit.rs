@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Blind-spot audit (#11) — hunts perception lies.
 //!
 //! The dangerous failure class is a solid that one validator calls GOOD and

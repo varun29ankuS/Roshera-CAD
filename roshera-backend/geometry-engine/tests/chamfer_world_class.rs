@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! CHAMFER WORLD-CLASS GATE — every chamfer edge-class must produce a
 //! solid that is simultaneously B-Rep-valid, mesh-watertight + 2-manifold
 //! + consistently ORIENTED, and self-certified SOUND. None of the three

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Live-dogfood regression (2026-07-10): filleting ALL edges of a corner-notched
 //! box must NOT crash with a surgery-bookkeeping error.
 //!

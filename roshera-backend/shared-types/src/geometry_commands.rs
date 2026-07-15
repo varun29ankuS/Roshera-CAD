@@ -1352,9 +1352,7 @@ mod tests {
         assert!(json.contains("1.0"));
 
         let deserialized: Command = serde_json::from_str(&json).unwrap();
-        match deserialized {
-            Command::CreateBox { width, .. } => assert_eq!(width, 1.0),
-            _ => panic!("Wrong command type"),
-        }
+        let matched = matches!(&deserialized, Command::CreateBox { width, .. } if *width == 1.0);
+        assert!(matched, "wrong command variant/width: {deserialized:?}");
     }
 }

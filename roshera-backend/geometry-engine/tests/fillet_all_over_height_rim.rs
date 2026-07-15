@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Live-dogfood regression (confirmed live 2026-07-12): filleting a THROUGH-hole
 //! whose two rims share ONE wall cylinder must not hard-500 with
 //!   `Invalid geometry: Fillet radius 1.5 too large for cylinder rim: exceeds

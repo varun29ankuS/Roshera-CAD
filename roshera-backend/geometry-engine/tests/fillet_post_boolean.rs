@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! POST-BOOLEAN FILLET — `fillet all edges` on a part that has been through a
 //! boolean. Pinned from a live MCP dogfood: a drilled-hole part refused
 //! `fillet_edges` (all edges) though the part was SOUND. It was a SIX-layer

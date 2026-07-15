@@ -616,10 +616,10 @@ mod tests {
 
     #[test]
     fn oneliner_trims_trailing_zeros_on_fractional_values() {
-        let d = descriptor_with("Origin", [3.14, -1.5, 0.0], [2.5, 2.5, 2.5]);
+        let d = descriptor_with("Origin", [3.15, -1.5, 0.0], [2.5, 2.5, 2.5]);
         assert_eq!(
             format_location_oneliner(&d),
-            "Origin, offset (3.14, -1.5, 0), 2.5×2.5×2.5"
+            "Origin, offset (3.15, -1.5, 0), 2.5×2.5×2.5"
         );
     }
 

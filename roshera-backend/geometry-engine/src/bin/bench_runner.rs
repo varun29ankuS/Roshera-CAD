@@ -1,3 +1,8 @@
+// Reason: benchmark/diagnostic harness binary -- fixtures are compile-time-
+// constant; abort-on-failure is the harness's failure mode. The workspace
+// production deny stands for library code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::primitives::topology_builder::TopologyBuilder;
 use geometry_engine::BRepModel;
@@ -107,5 +112,11 @@ fn main() {
 
     // Output JSON in the format expected by github-action-benchmark
     // For 'customSmallerIsBetter' tool, it expects an array at the root level
-    println!("{}", serde_json::to_string_pretty(&results).unwrap());
+    match serde_json::to_string_pretty(&results) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            eprintln!("bench_runner: failed to serialize results: {e}");
+            std::process::exit(1);
+        }
+    }
 }

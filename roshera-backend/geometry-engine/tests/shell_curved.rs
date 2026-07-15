@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! SHELL on CURVED / CLOSED cap rims (cylinder / revolved / NURBS).
 //!
 //! `offset_solid` (the shell op) historically only worked on box-like solids

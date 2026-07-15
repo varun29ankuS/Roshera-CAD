@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Volume invariants for solid-producing operations (extrude, boolean).
 //!
 //! Extrude is the robust core: extruding a planar rectangle of area `w·h`

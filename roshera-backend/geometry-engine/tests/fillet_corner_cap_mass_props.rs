@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Regression: mass-properties on a multi-edge-corner fillet must TERMINATE.
 //!
 //! ## The bug (dogfood 2026-07-09)

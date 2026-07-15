@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! DIAGNOSTIC (not a pass/fail gate) for #82: box ∩ sphere face-straddle.
 //!
 //! Sphere r=1 at (1,0,0) is exactly half inside the box [-1,1]³, so the true

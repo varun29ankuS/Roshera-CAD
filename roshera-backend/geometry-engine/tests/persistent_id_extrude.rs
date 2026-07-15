@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Persistent-id extrude lineage (#11, slice 40-C).
 //!
 //! A fresh extrusion now threads persistent ids: the bottom cap keeps the base

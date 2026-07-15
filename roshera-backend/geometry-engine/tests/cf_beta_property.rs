@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! CF-β.5.3 — property-test sweep for the mixed-kind corner cap.
 //!
 //! Complements [`cf_beta_mixed_kind_corner`] with proptest-driven

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Dimensioning oracle (campaign task #6) — the real measure of "amazing
 //! perception": for a part built with KNOWN dimensions, the analytic dimension
 //! table must recover every built dimension (built == perceived) AND every

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! CONE∘SPHERE boolean characterization (task #7 — analytic cone∘sphere SSI).
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Point3, Tolerance, Vector3};

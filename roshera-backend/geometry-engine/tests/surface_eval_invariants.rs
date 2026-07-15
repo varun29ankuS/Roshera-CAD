@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Geometric invariants for analytic surface evaluation (Plane, Sphere,
 //! Cylinder, Cone, Torus).
 //!
@@ -211,11 +215,11 @@ macro_rules! cone_invariants_test {
     };
 }
 
-cone_invariants_test!(cone_z_30, 0.0, 0.0, 1.0, 0.5235988);
-cone_invariants_test!(cone_z_45, 0.0, 0.0, 1.0, 0.7853982);
-cone_invariants_test!(cone_x_30, 1.0, 0.0, 0.0, 0.5235988);
-cone_invariants_test!(cone_diag_20, 1.0, 1.0, 1.0, 0.3490659);
-cone_invariants_test!(cone_z_60, 0.0, 0.0, 1.0, 1.0471976);
+cone_invariants_test!(cone_z_30, 0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_6);
+cone_invariants_test!(cone_z_45, 0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_4);
+cone_invariants_test!(cone_x_30, 1.0, 0.0, 0.0, std::f64::consts::FRAC_PI_6);
+cone_invariants_test!(cone_diag_20, 1.0, 1.0, 1.0, std::f64::consts::PI / 9.0);
+cone_invariants_test!(cone_z_60, 0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_3);
 
 // =====================================================================
 // Torus: √((ρ − R)² + d²) == r (distance from the centre circle).

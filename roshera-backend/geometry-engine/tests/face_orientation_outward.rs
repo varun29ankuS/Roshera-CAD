@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Kernel-wide outward-normal regression suite.
 //!
 //! Slices 2 & 3 of the comprehensive face-orientation fix establish a

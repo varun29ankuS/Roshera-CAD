@@ -1,3 +1,7 @@
+// Reason: demo binary -- aborting on a failed kernel call IS the demo's
+// failure mode; the workspace production deny stands for library code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Roshera kernel demo — pattern and draft.
 //!
 //! Pattern and draft operate on faces of an existing solid. They don't

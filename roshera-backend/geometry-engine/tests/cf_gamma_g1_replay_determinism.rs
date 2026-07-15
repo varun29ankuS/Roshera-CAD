@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Task 3C — replay-determinism loop for the single-patch mixed-kind
 //! corner cap (re-pinned from the superseded CF-γ.6.2 3-sub-patch
 //! architecture).

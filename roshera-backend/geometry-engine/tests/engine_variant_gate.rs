@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Move 3 gates G1 + G2 for the parametric rocket-engine variant recipe.
 //!
 //! * G1 — one known-good parameter set builds, certifies SOUND on every

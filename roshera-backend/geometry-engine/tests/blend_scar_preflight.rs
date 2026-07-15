@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! D-1 dogfood fixtures — the sequential-adjacent blend-scar honesty chain.
 //!
 //! Authority: `.superpowers/sdd/dogfood-diag-api-blend.md` (BUG 1). Live

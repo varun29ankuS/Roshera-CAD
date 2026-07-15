@@ -4,6 +4,11 @@
 //! for CAD systems, using an event-sourced timeline approach that naturally
 //! supports AI-driven design exploration and real-time collaboration.
 
+// Reason: the workspace denies unwrap/expect/panic in PRODUCTION code (this
+// attribute is inert outside `cfg(test)`). In unit tests, panicking is the
+// test framework's failure mechanism. Enforced since CI clippy exit-code
+// hardening (tasks #43/#53).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

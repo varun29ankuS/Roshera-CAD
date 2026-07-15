@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! CYL∘SPHERE boolean campaign (task #7 — analytic SSI arms: cyl∘sphere).
 //!
 //! Surfaced by a live dogfood: "subtract a sphere from a cylinder of the same

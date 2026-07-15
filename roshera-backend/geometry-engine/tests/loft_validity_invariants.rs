@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Loft must produce a VALID, watertight-topology B-Rep. The end caps are built
 //! from the densified correspondence rings (sharing the lateral ruled faces'
 //! line edges), and the scratch profile faces are removed — so the whole model

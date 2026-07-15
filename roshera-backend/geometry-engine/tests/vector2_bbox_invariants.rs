@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Invariants for 2D vector algebra (`Vector2`) and axis-aligned bounding
 //! boxes (`BBox`). Pure arithmetic — microsecond fast, so kept dense.
 
@@ -89,10 +93,10 @@ macro_rules! v2_rotate_test {
     };
 }
 
-v2_rotate_test!(v2_rot_x_90, 1.0, 0.0, 1.5707963);
-v2_rotate_test!(v2_rot_diag_45, 2.0, 3.0, 0.7853982);
+v2_rotate_test!(v2_rot_x_90, 1.0, 0.0, std::f64::consts::FRAC_PI_2);
+v2_rotate_test!(v2_rot_diag_45, 2.0, 3.0, std::f64::consts::FRAC_PI_4);
 v2_rotate_test!(v2_rot_neg, -4.0, 1.0, -1.2);
-v2_rotate_test!(v2_rot_pi, 5.0, -2.0, 3.1415927);
+v2_rotate_test!(v2_rot_pi, 5.0, -2.0, std::f64::consts::PI);
 v2_rotate_test!(v2_rot_small, 3.0, 3.0, 0.01);
 
 #[test]

@@ -107,8 +107,8 @@ impl OperationCache {
 
         // Get or create branch cache. If `max_items` is misconfigured to zero,
         // fall back to a minimum of 1 rather than panicking.
-        let capacity = std::num::NonZeroUsize::new(self.max_items)
-            .unwrap_or_else(|| std::num::NonZeroUsize::new(1).expect("1 is non-zero"));
+        let capacity =
+            std::num::NonZeroUsize::new(self.max_items).unwrap_or(std::num::NonZeroUsize::MIN);
         let branch_cache = self
             .branch_caches
             .entry(branch_id)

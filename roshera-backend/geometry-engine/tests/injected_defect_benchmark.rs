@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! INJECTED-DEFECT BENCHMARK (Move 2 core) — the flagship proof that Roshera's
 //! certified eye catches SILENT geometric lies that shallow checks wave through.
 //!

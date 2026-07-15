@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Live-dogfood gate — the descriptive edge selector must be able to filter by
 //! CONVEXITY so an agent can say "select the concave edges" and then fillet only
 //! the re-entrant corner.

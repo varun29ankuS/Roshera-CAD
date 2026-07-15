@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! `interpolate_nurbs_curve` must actually *interpolate*: the resulting curve
 //! passes through every data point at its computed parameter. This is the
 //! defining property of interpolation and an oracle-free check (no reference

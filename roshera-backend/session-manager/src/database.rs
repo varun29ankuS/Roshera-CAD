@@ -85,10 +85,9 @@ use uuid::Uuid;
 /// sites infallible for audit-only fields without hiding configuration bugs,
 /// which would still be visible as a 1970-01-01 row rather than a panic.
 fn timestamp_to_datetime(seconds: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(seconds, 0).unwrap_or_else(|| {
-        DateTime::<Utc>::from_timestamp(0, 0)
-            .expect("UNIX epoch (0s, 0ns) is always a valid timestamp")
-    })
+    // `DateTime::<Utc>::default()` IS the UNIX epoch, so the fallback needs no
+    // fallible construction at all.
+    DateTime::<Utc>::from_timestamp(seconds, 0).unwrap_or_default()
 }
 
 /// Database backend type

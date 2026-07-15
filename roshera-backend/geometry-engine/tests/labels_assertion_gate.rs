@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Gate for the ASSERTION-REQUIRED labeller (D4 + D3) — "a name the kernel can
 //! keep proving".
 //!

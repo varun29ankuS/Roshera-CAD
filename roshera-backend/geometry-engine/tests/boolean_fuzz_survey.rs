@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Brutal boolean FUZZ-SURVEY — the engine of the kernel-hardening loop.
 //!
 //! Hand-picked cases find the bugs you thought of. This sweeps the WHOLE
@@ -3755,7 +3759,7 @@ fn sphere_sphere_lens_gate() {
             "REGRESSION: returned a whole sphere (4.19) — #89 whole-operand bug is back"
         );
         assert!(
-            (f.vol - 0.78540).abs() > 0.05 || rel <= 0.02,
+            (f.vol - std::f64::consts::FRAC_PI_4).abs() > 0.05 || rel <= 0.02,
             "REGRESSION: returned π/4 (0.785) — cap mesh winding bug is back"
         );
         assert_eq!(

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Geometric correctness probe for fillet on a 10×10×10 box.
 //!
 //! Tessellates the post-fillet model and reports where the fillet face

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Regression tests for the fillet / chamfer 4-face topology surgery
 //! (`operations::edge_blend_topology::splice_blend_edge`) wired through
 //! `update_adjacent_faces` (fillet) and `update_adjacent_faces_for_chamfer`

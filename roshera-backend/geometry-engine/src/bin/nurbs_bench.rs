@@ -1,3 +1,9 @@
+// Reason: benchmark fixture binary -- NURBS fixtures are built from
+// compile-time-constant control nets; a failure is a kernel regression the
+// bench must abort on loudly. The workspace production deny stands for
+// library code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use geometry_engine::math::{
     nurbs::{NurbsCurve, NurbsSurface},
     Point3,

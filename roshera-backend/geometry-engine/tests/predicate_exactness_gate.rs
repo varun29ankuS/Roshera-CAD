@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! HARSH GATE: an exact predicate's adaptive sign MUST match an exact rational
 //! oracle on adversarial, near-degenerate inputs.
 //!

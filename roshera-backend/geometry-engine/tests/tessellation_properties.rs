@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Tessellation properties for the analytic primitives: every primitive
 //! tessellates to a non-empty, finite, index-valid mesh; finer chord
 //! tolerance never produces fewer triangles; and the mesh's divergence-

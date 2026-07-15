@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! #17 — boolean of a NURBS-lateral solid (the F1 cockpit-cut). Differencing a
 //! box out of a `nurbs_loft` barrel used to NON-TERMINATE: the generic dual-
 //! surface marcher hit its 200k-step cap on the NURBS×plane pair and discarded

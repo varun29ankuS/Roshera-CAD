@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! BOOLEAN-ROBUSTNESS BRACKET CAMPAIGN, iteration 1 — boolean failures pinned
 //! from a live bracket build. Each operand is individually watertight/sound; the
 //! kernel CORRECTLY flagged the broken results (it did not ship them — the

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Closest-point round-trip invariants for analytic surfaces.
 //!
 //! For a point that already lies on the surface, projecting it back through
@@ -135,9 +139,9 @@ macro_rules! cone_roundtrip_test {
     };
 }
 
-cone_roundtrip_test!(cone_rt_z_30, 0.0, 0.0, 1.0, 0.5235988);
-cone_roundtrip_test!(cone_rt_z_45, 0.0, 0.0, 1.0, 0.7853982);
-cone_roundtrip_test!(cone_rt_x_30, 1.0, 0.0, 0.0, 0.5235988);
+cone_roundtrip_test!(cone_rt_z_30, 0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_6);
+cone_roundtrip_test!(cone_rt_z_45, 0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_4);
+cone_roundtrip_test!(cone_rt_x_30, 1.0, 0.0, 0.0, std::f64::consts::FRAC_PI_6);
 
 // =====================================================================
 // Torus.

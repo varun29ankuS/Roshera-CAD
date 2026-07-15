@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Fix A wave-3 — filleting a boolean-derived concave PLANE-PLANE edge must
 //! compute the correct BALL-SIDE. This routes through
 //! `spine_solver::solve_plane_plane` (constant radius, plane∩plane).

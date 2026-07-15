@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Inertia-tensor invariants for the mass-properties pipeline.
 //!
 //! The inertia tensor of any rigid solid is symmetric positive-definite, so

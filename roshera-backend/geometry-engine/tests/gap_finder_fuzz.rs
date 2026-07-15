@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! PILLAR 2 — the GAP-FINDER: an adversarial, deterministic op-SEQUENCE fuzz
 //! harness that asserts the FULL invariant set after every op in diverse random
 //! op-chains, plus TWO new invariant classes (mass-properties physical sanity and

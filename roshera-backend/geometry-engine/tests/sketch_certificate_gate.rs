@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! HARNESS GATE: the sketch-validity certificate — the "can't lie" moat extended
 //! to 2D sketches. The certificate is only as strong as the defect classes it
 //! catches, so this harness constructs a sketch for EACH class and asserts the

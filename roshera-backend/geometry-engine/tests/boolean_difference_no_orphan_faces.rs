@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Regression: a boolean `Difference` must not leave orphan operand faces
 //! behind, and the surviving bore-wall cylinder must carry the LIVE clipped
 //! `height_limits`, not the un-clipped cutter extent.

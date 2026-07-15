@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! AGENT-BUILD EVAL — can the kernel build a correct COMPLEX part end-to-end?
 //!
 //! The real measure of an agent runtime for geometry isn't "does a box union a

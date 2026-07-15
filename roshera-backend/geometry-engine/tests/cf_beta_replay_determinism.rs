@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! CF-β.5.4 — replay-determinism loop for the mixed-kind corner cap.
 //!
 //! Independent-model loop modelled after `kernel_workflow_regression.rs`'s

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Persistent-id sidecar maps on BRepModel (#11, slice 40-A).
 //!
 //! The PID↔entity sidecar maps must round-trip (set → get → inverse), clear with

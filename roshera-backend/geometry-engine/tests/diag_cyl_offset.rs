@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Layer-1 loop diagnostic — the box∘cylinder HARD cells from the 2026-06-10
 //! subprocess-isolated baseline (the honest one): `offset-through` (cylinder
 //! through the box, axis offset from centre: ∩/∪ ERROR + ∖ −36.8% VOLUME that

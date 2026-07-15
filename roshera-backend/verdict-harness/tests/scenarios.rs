@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Scenario integration tests for the verdict harness.
 //!
 //! Each scenario drives a fully-configured [`RoomSimulator`] through a

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Persistent-id boolean lineage harness (#11 slice 40-D).
 //!
 //! Boolean is where lineage is easy to fake and hard to do right. These checks

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Dogfood finding F1 — filleting the bottom (−Z-facing) outer rim of a
 //! cylindrical disk fails validation while the top (+Z) rim of the SAME
 //! cylinder fillets cleanly.

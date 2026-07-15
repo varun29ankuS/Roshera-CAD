@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! PILLAR 2 — golden contract regression. For a set of CANONICAL builds (the
 //! cases that must always work), pin the full invariant contract
 //! (`harness::integration::full_contract`: B-Rep clean + mesh manifold + Euler +

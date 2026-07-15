@@ -1,3 +1,8 @@
+// Reason: benchmark/diagnostic harness binary -- fixtures are compile-time-
+// constant; abort-on-failure is the harness's failure mode. The workspace
+// production deny stands for library code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 // Simple test to verify math module compiles with cargo
 use geometry_engine::math::{Matrix4, Point3, Vector3};
 

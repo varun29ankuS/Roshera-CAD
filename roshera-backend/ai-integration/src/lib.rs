@@ -3,6 +3,11 @@
 //! This crate provides natural language processing capabilities
 //! for the Roshera CAD system.
 
+// Reason: the workspace denies unwrap/expect/panic in PRODUCTION code (this
+// attribute is inert outside `cfg(test)`). In unit tests, panicking is the
+// test framework's failure mechanism. Enforced since CI clippy exit-code
+// hardening (tasks #43/#53).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

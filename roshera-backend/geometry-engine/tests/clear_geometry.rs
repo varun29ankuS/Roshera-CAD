@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! clear_geometry gate (#10).
 //!
 //! Deleting solids one-by-one leaves ORPHANED entities behind when an upstream

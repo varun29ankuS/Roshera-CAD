@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! NURBS-LOFT gate — `operations::nurbs_loft` must build a watertight, valid
 //! solid whose lateral wall is a genuine NURBS surface, skinned (interpolated)
 //! through the cross-section rings and G2 along the loft at the default degree 3.

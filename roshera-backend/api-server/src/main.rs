@@ -7,6 +7,11 @@
 //! - Delta updates for real-time sync
 //! - Full AI integration with session awareness
 
+// Reason: the workspace denies unwrap/expect/panic in PRODUCTION code (this
+// attribute is inert outside `cfg(test)`). In unit tests, panicking is the
+// test framework's failure mechanism.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 mod assembly_instances;
 mod assembly_mgr;
 mod auth_middleware;

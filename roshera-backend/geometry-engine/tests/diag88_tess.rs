@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! #88 poke-through tessellation diagnostic: the interior-offset r=1.05 ∩/∖
 //! main sphere face (lens-complement outer loop + two z-circle holes) must
 //! route to `tessellate_spherical_holed_region`. This serial repro prints the

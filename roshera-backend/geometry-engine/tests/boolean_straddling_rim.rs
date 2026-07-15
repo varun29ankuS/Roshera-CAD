@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! #32 Phase A — STRADDLING-RIM duplicate cuts (the D-2 banked residual).
 //!
 //! The D-2 pair-level void-curve filter (`drop_pair_curves_in_preexisting_holes`,

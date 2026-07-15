@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! #21 repro battery — primitive-face shared-edge watertightness.
 //!
 //! The EdgeSampleCache makes planar + curved-CDT faces sample shared edges

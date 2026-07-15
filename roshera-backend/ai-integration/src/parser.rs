@@ -30,11 +30,20 @@ enum CommandType {
     Extrude,
 }
 
+// Reason: every pattern-table regex is a string literal — a compile failure is
+// a developer error surfaced by the parser tests, and there is no meaningful
+// runtime recovery from a malformed static pattern table. (The allow lives on
+// this helper because lint attributes do not reach into lazy_static expansion.)
+#[allow(clippy::expect_used)]
+fn static_regex(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("static pattern-table regex must compile")
+}
+
 lazy_static! {
     static ref PATTERNS: Vec<Pattern> = vec![
         // Create box patterns
         Pattern {
-            regex: Regex::new(r"(?i)create\s+(?:a\s+)?box\s+(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)").expect("static create-box regex must compile"),
+            regex: static_regex(r"(?i)create\s+(?:a\s+)?box\s+(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)\s*(?:by|x)\s*(\d+(?:\.\d+)?)"),
             command_type: CommandType::CreateBox,
             extractor: Box::new(|caps| {
                 let width = caps.get(1)?.as_str().parse().ok()?;
@@ -56,7 +65,7 @@ lazy_static! {
 
         // Create sphere patterns
         Pattern {
-            regex: Regex::new(r"(?i)create\s+(?:a\s+)?sphere\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)").expect("static create-sphere regex must compile"),
+            regex: static_regex(r"(?i)create\s+(?:a\s+)?sphere\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)"),
             command_type: CommandType::CreateSphere,
             extractor: Box::new(|caps| {
                 let radius = caps.get(1)?.as_str().parse().ok()?;
@@ -74,7 +83,7 @@ lazy_static! {
 
         // Create cylinder patterns
         Pattern {
-            regex: Regex::new(r"(?i)create\s+(?:a\s+)?cylinder\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)\s+(?:and\s+)?height\s+(\d+(?:\.\d+)?)").expect("static create-cylinder regex must compile"),
+            regex: static_regex(r"(?i)create\s+(?:a\s+)?cylinder\s+(?:with\s+)?radius\s+(\d+(?:\.\d+)?)\s+(?:and\s+)?height\s+(\d+(?:\.\d+)?)"),
             command_type: CommandType::CreateCylinder,
             extractor: Box::new(|caps| {
                 let radius = caps.get(1)?.as_str().parse().ok()?;
@@ -94,7 +103,7 @@ lazy_static! {
 
         // Extrude patterns
         Pattern {
-            regex: Regex::new(r"(?i)extrude(?:\s+face)?(?:\s+(\d+))?(?:\s+by\s+(\d+(?:\.\d+)?))?").expect("static extrude regex must compile"),
+            regex: static_regex(r"(?i)extrude(?:\s+face)?(?:\s+(\d+))?(?:\s+by\s+(\d+(?:\.\d+)?))?"),
             command_type: CommandType::Extrude,
             extractor: Box::new(|caps| {
                 let face_index = caps.get(1).and_then(|m| m.as_str().parse().ok());

@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! F4-α.3 — pin the analytic kpart dispatcher in the live fillet path.
 //!
 //! `fillet_surfaces::kpart_tests` unit-tests the `from_analytic_kpart`

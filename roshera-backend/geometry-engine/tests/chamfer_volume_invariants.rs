@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Oracle-free volume + watertightness invariants for the chamfer operation.
 //!
 //! An equal-distance (45°) chamfer of setback `d` on a single straight convex

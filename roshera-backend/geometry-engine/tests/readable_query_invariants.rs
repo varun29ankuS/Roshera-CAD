@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Invariants for the `readable` query layer — the agent-facing surface that
 //! lets an LLM ask "how far apart are these parts", "what's this part's
 //! oriented bounding box", "list the parts". These pin the mathematical

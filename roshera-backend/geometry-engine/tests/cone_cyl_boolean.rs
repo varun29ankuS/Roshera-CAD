@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! CONE∘CYLINDER boolean characterization (task #7 — analytic cyl∘cone SSI).
 //! Currently routes to the step-capped marcher (no analytic arm) → terminates
 //! but geometry is unreliable. Coaxial cases here; both on the +Z axis.

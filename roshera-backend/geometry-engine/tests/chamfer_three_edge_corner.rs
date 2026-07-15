@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Chamfer-α — 3-edge convex corner planar cap integration tests.
 //!
 //! Mirrors the F5-α apex-sphere harness

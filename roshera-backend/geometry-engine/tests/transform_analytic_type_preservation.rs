@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Analytic-type preservation under rigid transforms (regression gate).
 //!
 //! A rigid motion maps a circle→circle, cylinder→cylinder, plane→plane: it

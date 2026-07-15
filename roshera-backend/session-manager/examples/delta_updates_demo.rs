@@ -1,3 +1,7 @@
+// Reason: demo binary -- aborting on a failed call IS the demo's failure
+// mode; the workspace production deny stands for library code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Demo of delta updates for efficient real-time collaboration
 
 use session_manager::{BroadcastConfig, BroadcastManager, SessionManager};

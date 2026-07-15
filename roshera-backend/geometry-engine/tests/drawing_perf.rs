@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Drawing-pipeline performance regression harness (#22).
 //!
 //! A modest high-edge-count shop part (a 293-face / 771-edge involute spur gear,

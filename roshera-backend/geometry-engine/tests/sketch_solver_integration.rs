@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! End-to-end integration tests for the `Sketch ↔ ConstraintSolver` bridge.
 //!
 //! Slice B-1 of the Fusion-grade sketch roadmap. Exercises the

@@ -1,3 +1,7 @@
+// Reason: demo binary -- aborting on a failed kernel call IS the demo's
+// failure mode; the workspace production deny stands for library code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Quick one-shot tessellation timing harness.
 //!
 //! Direct `Instant::now()` timing without Criterion's full pipeline —

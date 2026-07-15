@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Volume + watertightness invariants for fillet/chamfer as *operations on a
 //! solid* (not just topology). Filleting a convex edge removes the square
 //! corner and replaces it with a quarter-round: the material removed along a

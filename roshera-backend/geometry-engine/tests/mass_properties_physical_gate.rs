@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! MUST-FAIL GATE: the mass-properties pipeline must never emit a NON-PHYSICAL
 //! result (the kernel "lying" with numbers a real rigid body cannot have).
 //!
