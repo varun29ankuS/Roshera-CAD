@@ -21655,9 +21655,20 @@ mod tests {
     /// hollowed by a prior bore (two intersecting cylindrical voids) must stay
     /// watertight. A horizontal bore crossing a vertical bore (the engine
     /// crank-tunnel ∩ cylinder-bore case) currently fragments the second cut's
-    /// wall at the saddle intersection → open edges. `#[ignore]` until fixed.
+    /// wall at the saddle intersection → open edges.
+    ///
+    /// FACET twin of `diff_intersecting_analytic_bores_35` (now GREEN): here the
+    /// bores are 24-gon EXTRUDED PRISMS, so the crossing is a facet-vs-facet
+    /// plane–plane arrangement, NOT the analytic `cylinder_cylinder_perpendicular_
+    /// equal_radius` ellipse pair. Slice 1's saddle machinery (C+D shared crossing
+    /// vertices, the saddle-lateral splitter, the saddle-annulus tessellator) is
+    /// keyed on analytic `Ellipse` arcs and never fires on prism facets, so this
+    /// case is untouched by Slice 1. Residual (measured 2026-07-15): open=15,
+    /// nm=3 — a faceted-cutter corefinement leak in the `nurbs-corefinement-17`
+    /// family, not the analytic saddle. `#[ignore]` until the facet corefinement
+    /// path (#17) is fixed.
     #[test]
-    #[ignore = "tracks #35: difference cut intersecting another bore leaves open faces"]
+    #[ignore = "#35 FACET twin (24-gon prisms): facet-vs-facet corefinement leak (#17 family), not the analytic saddle; open=15 nm=3"]
     fn diff_intersecting_bores_35() {
         use crate::harness::watertight::manifold_report;
         use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
@@ -21752,10 +21763,10 @@ mod tests {
     /// #35 (ANALYTIC variant): the same intersecting-bores case but with REAL
     /// analytic-cylinder bores (not 24-gon prisms), so the saddle goes through
     /// the `cylinder_cylinder_intersection` SSI path rather than facet-vs-facet
-    /// plane-plane lines. Diagnostic: does production-style analytic geometry hit
-    /// the same weld failure, a different one, or pass? `#[ignore]` (diagnostic).
+    /// plane-plane lines. GREEN after Slice-1 (C+D+A+B + the saddle-annulus
+    /// tessellator): the two analytic r10 equal-radius perpendicular bores build a
+    /// watertight, brep-valid Steinmetz saddle (open=0, nm=0).
     #[test]
-    #[ignore = "#35 diagnostic: analytic-cylinder intersecting bores"]
     fn diff_intersecting_analytic_bores_35() {
         use crate::harness::watertight::manifold_report;
         use crate::operations::extrude::{extrude_polygon_regions, PolygonRegion};
@@ -21949,31 +21960,28 @@ mod tests {
     /// cases into two analytic ellipses (confirmed via `ROSHERA_BOOL_TRACE`:
     /// the special case matches and no marching fallback runs).
     ///
-    /// CONFIRMED (2026-07-12): there is **no dedicated saddle guard** in the
-    /// boolean core. It does not hang either way (sub-second in every
-    /// configuration tried). What happens instead is GEOMETRY-DEPENDENT and
-    /// incidental:
-    ///   * THIS pair (60×60×60 block, 10mm overhang each side) trips an
-    ///     unrelated, generic shell-integrity check: `classify_split_faces`
-    ///     mis-culls the cylindrical lateral fragments out of
-    ///     `select_faces_for_operation` (trace shows the two bore-wall
-    ///     fragments classified `Inside`/`OnBoundary` and dropped, leaving
-    ///     only planar box-face fragments), so `build_shells_from_faces`
-    ///     later finds a component with 1 face and raises
-    ///     `InvalidBRep("component 1 has only 1 planar face(s); closed
-    ///     polyhedral manifold requires >=4 …")`. That is a downstream
-    ///     sanity check tripping on a broken intermediate result — not a
-    ///     purpose-built saddle detector.
-    ///   * The pre-existing `diff_intersecting_analytic_bores_35` test above
-    ///     (80×40×40 block, 5mm overhang) hits the SAME
-    ///     `cylinder_cylinder_perpendicular_equal_radius` path and the same
-    ///     underlying classification weakness, but for those dimensions
-    ///     `build_shells_from_faces` does NOT trip — it returns `Ok` with a
-    ///     600-open-edge, `brep_valid=false` solid instead (reproduced live:
-    ///     0.44 s, no hang, no error).
-    /// So "refuses vs. ships unsound" is not a designed choice — it is
-    /// whichever downstream check happens to notice the broken
-    /// classification first, and that varies with block/overhang geometry.
+    /// SLICE-1 UPDATE (2026-07-15): the clean equal-radius perpendicular saddle
+    /// now builds SOUND. The r4 live recipe (`diff_intersecting_equal_bores_live_
+    /// 35`) and the analytic r10 case (`diff_intersecting_analytic_bores_35`, 80×
+    /// 40×40, 5mm overhang) both build watertight, brep-valid Steinmetz solids —
+    /// the C+D shared crossing vertices, the saddle-lateral splitter, and the
+    /// saddle-annulus tessellator together close what used to be a 600/1408-open-
+    /// edge wall. Those two tests are the standing sound-`Ok` gate for the r4/
+    /// analytic-r10 class.
+    ///
+    /// THIS specific pair (60×60×60 block, **10mm** overhang each side) still
+    /// honestly REFUSES, and it is a GENUINELY HARDER class, not a saddle
+    /// mis-detection. Trace (2026-07-15): the SECOND tool wall (cylB, the FULL
+    /// un-trimmed h=80 cylinder spanning y∈[-10,70]) carries the two shared saddle
+    /// ellipses PLUS a second pair of real, NON-ellipse, axially-spanning
+    /// intersection curves (the tool wall crossing the pre-existing cylA void as
+    /// it exits — arcs from the saddle level y=30 up/down to the box y-faces).
+    /// `split_cylinder_lateral_by_saddle` correctly flags those as `foreign` and
+    /// declines (they are not saddle arcs — widening the signature to swallow them
+    /// would be a lie), the arrangement routes to the DCEL, and one component ends
+    /// with a single planar face → the honest `InvalidBRep("component … has only 1
+    /// planar face(s) …")` refusal. This is the `nurbs-corefinement-17` /
+    /// tool-wall-through-void family, tracked separately; out of Slice-1 scope.
     ///
     /// The ONLY deliberate refusal in the codebase touching this family is
     /// `harness::engine_variant::build_variant`'s `OverlappingHoles` check
@@ -21986,11 +21994,11 @@ mod tests {
     /// outside `boolean_operation` entirely and never runs for a bare
     /// two-cylinder difference like this one.
     ///
-    /// Kept as a permanent regression probe (not `#[ignore]`d — it passes
-    /// today because it accepts either a typed refusal or a watertight
-    /// `Ok`): if a future fix makes this specific pair succeed, the
-    /// `assert!` below will legitimately catch a regression to an open/
-    /// unsound solid.
+    /// Kept as a permanent regression probe (not `#[ignore]`d). It is TIGHTENED
+    /// post-Slice-1: the two acceptable outcomes are (a) a watertight sound `Ok`
+    /// (if a future fix closes the tool-wall-through-void residual) or (b) the
+    /// SPECIFIC typed `InvalidBRep` refusal above — a silent unsound `Ok`
+    /// (open/non-manifold) or any other error is a regression and fails the probe.
     #[test]
     fn cyl_cyl_saddle_guard_probe_35() {
         use crate::harness::watertight::manifold_report;
@@ -22075,8 +22083,18 @@ mod tests {
 
         match result {
             Err(e) => {
-                // The hoped-for outcome: a typed, fast refusal.
+                // Acceptable ONLY as the specific, designed shell-integrity
+                // refusal for the tool-wall-through-void residual — a typed,
+                // fast `InvalidBRep`. Any other error (e.g. a new panic-to-error
+                // path or a timeout surrogate) is a regression.
                 eprintln!("[#35-guard-probe] REFUSED: {e:?}");
+                let is_invalid_brep = matches!(e, OperationError::InvalidBRep(_));
+                assert!(
+                    is_invalid_brep,
+                    "#35 guard probe: the only accepted refusal is the typed \
+                     InvalidBRep shell-integrity refusal for the residual tool-\
+                     wall-through-void class; got {e:?}"
+                );
             }
             Ok(res) => {
                 let r = manifold_report(&mut m, res, 0.5, 1e-6).expect("manifold report");

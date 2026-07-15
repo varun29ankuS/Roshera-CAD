@@ -128,7 +128,12 @@ pub fn tessellate_face(
         // the circles' t=0 — see create_cylinder_topology.) Empty-mesh-on-Err
         // contract, as for NURBS / generic curved faces.
         "Cylinder" => {
-            if let Err(e) =
+            // SADDLE-35: the full-period annulus fragments (rim ring + full-period
+            // wavy lens boundary) from `split_cylinder_lateral_by_saddle` cannot be
+            // meshed by curved-CDT (neither loop closes in the (θ,z) chart). Stitch
+            // the two cached rims directly; declined for every other cylinder face.
+            if tessellate_cylinder_saddle_annulus(face, model, cache, mesh) {
+            } else if let Err(e) =
                 super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
             {
                 // curved-CDT can fail on a transformed (e.g. rotated) cylinder:
@@ -7349,6 +7354,189 @@ fn emit_outward_triangle(mesh: &mut TriangleMesh, a: u32, b: u32, c: u32) {
     } else {
         mesh.add_triangle(a, c, b);
     }
+}
+
+/// SADDLE-35: mesh a cylinder-lateral ANNULUS emitted by
+/// `split_cylinder_lateral_by_saddle` — its outer loop is a full-period rim ring
+/// and its single inner loop is a full-period WAVY ring of saddle-ellipse arcs
+/// (the Steinmetz lens boundary on this wall). Both loops ENCIRCLE the axis, so
+/// NEITHER closes into a simple polygon in the cylinder's unrolled `(θ, z)` chart;
+/// curved-CDT (which needs a UV-closed boundary) therefore emitted an empty mesh,
+/// leaving the two annuli as open holes — the residual `closed=false` /
+/// 1408-open-edge state on the otherwise brep-valid saddle solid.
+///
+/// Since both loops are full-period cylinder rings, the band between them is meshed
+/// by directly STITCHING the two cached rims — the same conforming closed-ring
+/// stitch the ruled-annular collar (`tessellate_ruled_annular_band`) and the
+/// blend-torus stitcher use. It is watertight BY CONSTRUCTION: every rim sample is
+/// drawn from the shared `EdgeSampleCache` in canonical loop-edge order, so the
+/// wavy ring coincides sample-for-sample with the mating saddle wall's copy (the
+/// C+D shared arcs) and the outer rim with the adjacent planar box face — the weld
+/// then collapses the coincident boundary vertices with no residual crack.
+///
+/// Gated tightly on the saddle signature: a `Cylinder` face with exactly one inner
+/// loop that (a) carries an analytic `Ellipse` arc and (b) encircles the axis. A
+/// plain wall (no hole), a local circular pocket, or a local elliptical (angled-
+/// plane) hole all fail (a) or (b) and keep routing through curved-CDT, so no other
+/// cylinder face is affected.
+fn tessellate_cylinder_saddle_annulus(
+    face: &Face,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::curve::Ellipse;
+    use crate::primitives::surface::Cylinder;
+
+    if face.inner_loops.len() != 1 {
+        return false;
+    }
+    let surface = match model.surfaces.get(face.surface_id) {
+        Some(s) => s,
+        None => return false,
+    };
+    let cyl = match surface.as_any().downcast_ref::<Cylinder>() {
+        Some(c) => c,
+        None => return false,
+    };
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+
+    let outer_loop = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return false,
+    };
+    let inner_loop = match model.loops.get(face.inner_loops[0]) {
+        Some(l) => l,
+        None => return false,
+    };
+
+    // Saddle marker (a): the inner lens-boundary loop carries analytic Ellipse arcs.
+    let inner_has_ellipse = inner_loop.edges.iter().any(|&eid| {
+        model
+            .edges
+            .get(eid)
+            .and_then(|e| model.curves.get(e.curve_id))
+            .map(|c| c.as_any().downcast_ref::<Ellipse>().is_some())
+            .unwrap_or(false)
+    });
+    if !inner_has_ellipse {
+        return false;
+    }
+
+    // Cached rings in canonical loop-edge order — the SAME shared polyline the
+    // mating wall / adjacent planar face sample, so the weld is exact.
+    let mut outer_ring: Vec<Point3> = Vec::new();
+    sample_loop_3d_polygon(outer_loop, model, cache, &mut outer_ring);
+    let mut inner_ring: Vec<Point3> = Vec::new();
+    sample_loop_3d_polygon(inner_loop, model, cache, &mut inner_ring);
+    if outer_ring.len() < 3 || inner_ring.len() < 3 {
+        return false;
+    }
+
+    // θ frame ⟂ axis (identical construction to the saddle splitter).
+    let seed = if axis.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u1 = match axis.cross(&seed).normalize() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let u2 = axis.cross(&u1);
+    let two_pi = std::f64::consts::TAU;
+    let theta_of = |p: &Point3| -> f64 {
+        let d = *p - origin;
+        d.dot(&u2).atan2(d.dot(&u1)).rem_euclid(two_pi)
+    };
+
+    // Marker (b): both rings must ENCIRCLE the axis (full period → no angular gap
+    // ≥ π). A local hole leaves a > π gap and is declined so it keeps routing
+    // through curved-CDT.
+    let encircles = |ring: &[Point3]| -> bool {
+        let mut ths: Vec<f64> = ring.iter().map(theta_of).collect();
+        ths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut max_gap = ths[0] + two_pi - ths[ths.len() - 1];
+        for w in ths.windows(2) {
+            max_gap = max_gap.max(w[1] - w[0]);
+        }
+        max_gap < std::f64::consts::PI
+    };
+    if !encircles(&outer_ring) || !encircles(&inner_ring) {
+        return false;
+    }
+
+    // Wind both rings the SAME angular direction, then rotate the inner ring's
+    // start to the outer ring's start angle. Reversal + cyclic rotation preserve
+    // the UNDIRECTED boundary polyline (weld unaffected); they only re-seed the
+    // fractional stitch so the band is not triangulated with a half-turn twist.
+    let signed_sweep = |ring: &[Point3]| -> f64 {
+        let mut acc = 0.0;
+        for i in 0..ring.len() {
+            let a = theta_of(&ring[i]);
+            let b = theta_of(&ring[(i + 1) % ring.len()]);
+            let mut d = b - a;
+            while d > std::f64::consts::PI {
+                d -= two_pi;
+            }
+            while d < -std::f64::consts::PI {
+                d += two_pi;
+            }
+            acc += d;
+        }
+        acc
+    };
+    if signed_sweep(&outer_ring) * signed_sweep(&inner_ring) < 0.0 {
+        inner_ring.reverse();
+    }
+    let start_theta = theta_of(&outer_ring[0]);
+    let ang_dist = |t: f64| -> f64 {
+        let d = (t - start_theta).rem_euclid(two_pi);
+        d.min(two_pi - d)
+    };
+    if let Some((k, _)) = inner_ring
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, ang_dist(theta_of(p))))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        inner_ring.rotate_left(k);
+    }
+
+    // Per-vertex outward normals from the cylinder surface, oriented by the face.
+    let orient_sign = face.orientation.sign();
+    let ring_row = |mesh: &mut TriangleMesh, ring: &[Point3]| -> Vec<u32> {
+        ring.iter()
+            .map(|p| {
+                let normal = surface
+                    .closest_point(p, Tolerance::default())
+                    .and_then(|(u, v)| surface.normal_at(u, v))
+                    .ok()
+                    .and_then(|n| n.normalize().ok())
+                    .map(|n| n * orient_sign)
+                    .unwrap_or_else(|| {
+                        // Radial-from-axis fallback (ill-conditioned closest_point
+                        // near the axis-symmetric crossing generators).
+                        let d = *p - origin;
+                        let along = d.dot(&axis);
+                        (d - axis * along)
+                            .normalize()
+                            .map(|radial| radial * orient_sign)
+                            .unwrap_or(Vector3::Z)
+                    });
+                mesh.add_vertex(MeshVertex {
+                    position: *p,
+                    normal,
+                    uv: None,
+                })
+            })
+            .collect()
+    };
+    let outer_idx = ring_row(mesh, &outer_ring);
+    let inner_idx = ring_row(mesh, &inner_ring);
+    stitch_closed_rings(&outer_idx, &inner_idx, mesh);
+    true
 }
 
 /// Grid-tessellate a full surface patch over `[u_min,u_max]×[v_min,v_max]`

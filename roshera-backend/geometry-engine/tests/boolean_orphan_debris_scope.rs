@@ -3,15 +3,23 @@
 //!
 //! ## The defect (reproduced live 2026-07-14, root-caused here)
 //!
-//! A cross-drilled manifold hits the OPEN cyl-cyl saddle bug (#35): the second
-//! Difference COMPLETES but the result solid is UNSOUND (open edges). Its
-//! boundary-edge / connectivity errors are stamped `solid_id: None` by the
+//! ORIGINALLY: a cross-drilled manifold hit the OPEN cyl-cyl saddle bug (#35):
+//! the second Difference COMPLETED but the result solid was UNSOUND (open edges).
+//! Its boundary-edge / connectivity errors were stamped `solid_id: None` by the
 //! model-wide `check_topology_gaps` pass (it records only the `face_id`). A
 //! subsequently created PLAIN CYLINDER PRIMITIVE (itself watertight / oriented
-//! / manifold) then certifies `brep_valid = false` with ConnectivityError
+//! / manifold) then certified `brep_valid = false` with ConnectivityError
 //! "Boundary edge N detected" entries located at the OTHER solid's faces —
 //! because `validate_solid_scoped` kept every `solid_id: None` error for every
-//! part (`None => true`). One broken boolean poisons EVERY part's certificate.
+//! part (`None => true`). One broken boolean poisoned EVERY part's certificate.
+//!
+//! UPDATE (#35 Slice-1, 2026-07-15): the analytic equal-radius saddle is now
+//! SOUND, so it no longer produces the `solid_id: None` errors that seeded the
+//! mis-attribution. The attribution fix itself is unchanged and still guarded —
+//! by `model_debris_counted_isolated_and_swept_by_delete`, which synthesizes a
+//! genuine orphan face directly (no dependence on the saddle bug). The
+//! saddle-based tests below now run against the sound saddle as regression
+//! guards (no orphans, per-part soundness, and the saddle staying sound).
 //!
 //! Instrumentation (see the campaign report) confirmed the faithful analytic
 //! saddle leaves NO literal orphan topology — the boolean's Slice-2 prune +
@@ -28,7 +36,8 @@
 //!    but owned by no solid.
 //! 2. Per-part honesty: the independent primitive's own certificate is SOUND
 //!    (`brep_valid = true`), reflecting ITS OWN topology, not the alien errors.
-//! 3. The unsound saddle solid still reports ITS OWN defect (`brep_valid=false`).
+//! 3. The saddle result solid certifies SOUND (`brep_valid=true`) post-#35
+//!    Slice-1 — a regression guard that the saddle stays closed.
 //! 4. Genuine orphan debris is counted at model scope, isolated from clean
 //!    parts, and swept by `delete_part`.
 
@@ -67,9 +76,11 @@ fn orphan_faces(model: &BRepModel) -> Vec<u32> {
         .collect()
 }
 
-/// Build the cross-drilled manifold that trips the #35 saddle: 80×40×40 block,
-/// analytic vertical bore (Ok/sound), then an analytic horizontal bore that
-/// crosses the first at the saddle (Ok but UNSOUND). Returns (model, result).
+/// Build the cross-drilled manifold at the #35 saddle: 80×40×40 block, analytic
+/// vertical bore, then an analytic horizontal bore crossing the first at the
+/// equal-radius perpendicular saddle. Post-Slice-1 the second Difference now
+/// returns an `Ok` SOUND solid (it used to be `Ok` but UNSOUND with open edges);
+/// these tests use it as a clean cross-drilled fixture. Returns (model, result).
 fn build_saddle_manifold() -> (BRepModel, SolidId) {
     let tol = Tolerance::default();
     let mut m = BRepModel::new();
@@ -149,18 +160,27 @@ fn independent_primitive_certifies_sound_after_broken_boolean() {
     );
 }
 
-/// The unsound saddle solid honestly owns ITS OWN defect: its per-part
-/// certificate must reflect `brep_valid = false` (the boundary-edge errors on
-/// its own faces), even though those same errors no longer leak to other parts.
+/// #35 Slice-1 REGRESSION GUARD (updated 2026-07-15): the analytic equal-radius
+/// perpendicular saddle that this file was built around is NO LONGER unsound —
+/// Slice 1 (shared crossing vertices + saddle-lateral splitter + saddle-annulus
+/// tessellator) closed it. The result solid now certifies `brep_valid = true` /
+/// `is_sound()`. This asserts that soundness so a regression back to the open-edge
+/// saddle is caught here. The mis-attribution isolation invariant this file
+/// protects (one part's real defect never leaks into another part's certificate)
+/// no longer relies on the saddle being unsound — it is carried by
+/// `model_debris_counted_isolated_and_swept_by_delete`, which synthesizes a
+/// genuine orphan face directly (no dependency on any kernel bug).
 #[test]
-fn unsound_saddle_solid_still_reports_its_own_defect() {
+fn saddle_solid_certifies_sound_after_35_slice1_fix() {
     let (mut m, res) = build_saddle_manifold();
     let cert = m.certify_solid(res);
     assert!(
-        !cert.brep_valid,
-        "the unsound saddle result solid must still report its OWN brep defect \
-         (boundary edges on its faces); the attribution fix must not hide a \
-         solid's own errors",
+        cert.brep_valid && cert.is_sound(),
+        "#35 Slice-1: the analytic equal-radius saddle result must certify SOUND \
+         (brep_valid + is_sound); a regression to the open-edge saddle would trip \
+         this. brep_valid={}, errors={:?}",
+        cert.brep_valid,
+        cert.errors,
     );
 }
 
