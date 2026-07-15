@@ -1258,8 +1258,10 @@ fn tessellate_spherical_cap(
             }
         }
     }
-    if rim.len() >= 2 && (rim[0] - *rim.last().unwrap()).magnitude() < 1e-9 {
-        rim.pop();
+    if let [first, .., last] = rim.as_slice() {
+        if (*first - *last).magnitude() < 1e-9 {
+            rim.pop();
+        }
     }
     if rim.len() < 3 {
         return false;
@@ -1385,8 +1387,10 @@ fn loop_rim_samples(
             }
         }
     }
-    if rim.len() >= 2 && (rim[0] - *rim.last().unwrap()).magnitude() < 1e-9 {
-        rim.pop();
+    if let [first, .., last] = rim.as_slice() {
+        if (*first - *last).magnitude() < 1e-9 {
+            rim.pop();
+        }
     }
     rim
 }

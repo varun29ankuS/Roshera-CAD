@@ -81,6 +81,10 @@ fn rectangle_xy(model: &mut BRepModel, w: f64, h: f64) -> Vec<EdgeId> {
     ]
 }
 
+// Reason: harness helper -- the vertex ids were returned by add_or_find on
+// this same model moments earlier in the fixture builder; a miss is memory
+// corruption-level breakage the harness must abort on.
+#[allow(clippy::expect_used)]
 fn add_line_edge(model: &mut BRepModel, a: u32, b: u32) -> EdgeId {
     let s = model.vertices.get(a).expect("v").position;
     let e = model.vertices.get(b).expect("v").position;

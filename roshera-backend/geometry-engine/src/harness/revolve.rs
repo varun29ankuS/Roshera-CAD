@@ -94,6 +94,10 @@ fn offset_rectangle(model: &mut BRepModel, x0: f64, x1: f64, z0: f64, z1: f64) -
     ]
 }
 
+// Reason: harness helper -- the vertex ids were returned by add_or_find on
+// this same model moments earlier in the fixture builder; a miss is memory
+// corruption-level breakage the harness must abort on.
+#[allow(clippy::expect_used)]
 fn add_line_edge(model: &mut BRepModel, a: u32, b: u32) -> EdgeId {
     let s = model.vertices.get(a).expect("v").position;
     let e = model.vertices.get(b).expect("v").position;

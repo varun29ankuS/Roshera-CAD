@@ -77,6 +77,10 @@ fn make_rectangle(model: &mut BRepModel, width: f64, height: f64) -> Vec<EdgeId>
     ]
 }
 
+// Reason: harness helper -- the vertex ids were returned by add_or_find on
+// this same model moments earlier in the fixture builder; a miss is memory
+// corruption-level breakage the harness must abort on.
+#[allow(clippy::expect_used)]
 fn add_line_edge(model: &mut BRepModel, v_start: u32, v_end: u32) -> EdgeId {
     let s = model.vertices.get(v_start).expect("start vertex").position;
     let e = model.vertices.get(v_end).expect("end vertex").position;

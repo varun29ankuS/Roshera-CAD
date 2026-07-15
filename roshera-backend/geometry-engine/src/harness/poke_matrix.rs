@@ -162,6 +162,11 @@ pub fn run_case(case: &MatrixCase, vol_tol: f64, chord: f64, mc_n: usize) -> [Ce
 
 // ── operand builders ────────────────────────────────────────────────────────
 
+// Reason: harness fixture builders construct primitives from compile-time-
+// constant valid parameters; a build failure here is a kernel regression the
+// adversarial harness must abort on loudly, not mask with a Result it cannot
+// meaningfully handle.
+#[allow(clippy::expect_used)]
 fn mkbox(m: &mut BRepModel, side: f64) -> SolidId {
     TopologyBuilder::new(m)
         .create_box_3d(side, side, side)
@@ -169,6 +174,9 @@ fn mkbox(m: &mut BRepModel, side: f64) -> SolidId {
     m.solids.iter().last().map(|(id, _)| id).expect("box solid")
 }
 
+// Reason: called immediately after a fixture builder added a solid (see mkbox);
+// an empty solid store here means the builder above silently failed — abort.
+#[allow(clippy::expect_used)]
 fn last_solid(m: &BRepModel) -> SolidId {
     m.solids.iter().last().map(|(id, _)| id).expect("solid")
 }
@@ -179,6 +187,10 @@ fn in_box4(x: f64, y: f64, z: f64) -> bool {
 }
 
 /// The full poke-through matrix: every primitive × pose tested here.
+// Reason: the case-builder closures create primitives from the fixed catalog
+// parameters above each case; failure = kernel regression, abort loudly (the
+// same invariant as mkbox).
+#[allow(clippy::expect_used)]
 pub fn catalog() -> Vec<MatrixCase> {
     let mut cases: Vec<MatrixCase> = Vec::new();
 
@@ -479,6 +491,10 @@ mod tests {
     /// every time; a HashMap/HashSet-iteration-order-dependent weld returns
     /// different volumes/counts run-to-run (the torus/rim-poke cell yielded
     /// 74.79 / 59.42 / 64.81 before the determinism sweep).
+    // Reason: test helper — the case name is a fixed catalog member and the
+    // boolean must succeed for the determinism fingerprint to mean anything;
+    // a panic is the correct test-failure mode.
+    #[allow(clippy::expect_used)]
     fn determinism_fingerprints(
         case_name: &str,
         op: BooleanOp,
@@ -547,6 +563,9 @@ mod tests {
 
     #[test]
     #[ignore = "diag — ROSHERA_BOOL_TRACE=1 to localize the diverging stage"]
+    // Reason: ignored diagnostic — fixed catalog case, and a panic on lookup or
+    // boolean failure is the correct abort for a by-hand trace run.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn diag_torus_determinism_trace() {
         let case = catalog()
             .into_iter()
