@@ -319,55 +319,56 @@ impl EntityHandler for EdgeCurveHandler {
         // carries the per-curve domain so the `Edge` is parameterised
         // consistently with its backing curve.
         let mut edge_param_range = ParameterRange::unit();
-        let curve_box: Box<dyn Curve> =
-            if let Some(line_geom) = ctx.caches.step_lines.get(&geom_ref).copied() {
-                build_line_curve(line_geom, start_pos, end_pos)
-            } else if let Some(circle_geom) = ctx.caches.step_circles.get(&geom_ref).copied() {
-                match build_circle_curve(circle_geom, start_pos, end_pos, instance, ctx) {
-                    Some(c) => c,
-                    None => {
-                        return HandlerOutcome::Failed {
-                            message: "kernel rejected circle/arc".into(),
-                        }
+        let curve_box: Box<dyn Curve> = if let Some(line_geom) =
+            ctx.caches.step_lines.get(&geom_ref).copied()
+        {
+            build_line_curve(line_geom, start_pos, end_pos)
+        } else if let Some(circle_geom) = ctx.caches.step_circles.get(&geom_ref).copied() {
+            match build_circle_curve(circle_geom, start_pos, end_pos, same_sense, instance, ctx) {
+                Some(c) => c,
+                None => {
+                    return HandlerOutcome::Failed {
+                        message: "kernel rejected circle/arc".into(),
                     }
                 }
-            } else if let Some(curve_id) = ctx.caches.curves.get(&geom_ref).copied() {
-                // Free-form edge backed by an already-materialised kernel
-                // curve (B-spline / NURBS). Clone it so this edge owns an
-                // independent curve instance and preserve its native domain.
-                match ctx.model.curves.get(curve_id) {
-                    Some(c) => {
-                        edge_param_range = c.parameter_range();
-                        c.clone_box()
-                    }
-                    None => {
-                        ctx.report.push_warning(Warning {
-                            severity: Severity::Warn,
-                            entity: names::EDGE_CURVE.into(),
-                            instance: Some(instance),
-                            message: format!(
-                                "edge_geometry #{geom_ref} cached a curve id absent from the model"
-                            ),
-                        });
-                        return HandlerOutcome::Failed {
-                            message: "edge curve id dangling".into(),
-                        };
-                    }
+            }
+        } else if let Some(curve_id) = ctx.caches.curves.get(&geom_ref).copied() {
+            // Free-form edge backed by an already-materialised kernel
+            // curve (B-spline / NURBS). Clone it so this edge owns an
+            // independent curve instance and preserve its native domain.
+            match ctx.model.curves.get(curve_id) {
+                Some(c) => {
+                    edge_param_range = c.parameter_range();
+                    c.clone_box()
                 }
-            } else {
-                ctx.report.push_warning(Warning {
-                    severity: Severity::Warn,
-                    entity: names::EDGE_CURVE.into(),
-                    instance: Some(instance),
-                    message: format!(
-                        "edge_geometry #{geom_ref} did not resolve to a supported curve \
+                None => {
+                    ctx.report.push_warning(Warning {
+                        severity: Severity::Warn,
+                        entity: names::EDGE_CURVE.into(),
+                        instance: Some(instance),
+                        message: format!(
+                            "edge_geometry #{geom_ref} cached a curve id absent from the model"
+                        ),
+                    });
+                    return HandlerOutcome::Failed {
+                        message: "edge curve id dangling".into(),
+                    };
+                }
+            }
+        } else {
+            ctx.report.push_warning(Warning {
+                severity: Severity::Warn,
+                entity: names::EDGE_CURVE.into(),
+                instance: Some(instance),
+                message: format!(
+                    "edge_geometry #{geom_ref} did not resolve to a supported curve \
                      (LINE / CIRCLE / B_SPLINE_CURVE_WITH_KNOTS / rational B-spline)"
-                    ),
-                });
-                return HandlerOutcome::Failed {
-                    message: "unsupported edge_geometry".into(),
-                };
+                ),
+            });
+            return HandlerOutcome::Failed {
+                message: "unsupported edge_geometry".into(),
             };
+        };
 
         // Per-edge snap check between the curve's endpoint evaluation
         // and the recorded vertex position. STEP doesn't always emit
@@ -432,6 +433,7 @@ fn build_circle_curve(
     circle: StepCircleGeom,
     start: [f64; 3],
     end: [f64; 3],
+    same_sense: bool,
     instance: u64,
     ctx: &mut ImportContext<'_>,
 ) -> Option<Box<dyn Curve>> {
@@ -440,11 +442,29 @@ fn build_circle_curve(
         circle.placement.origin[1],
         circle.placement.origin[2],
     );
-    let normal = Vector3::new(
-        circle.placement.z[0],
-        circle.placement.z[1],
-        circle.placement.z[2],
-    );
+    // A CIRCLE parameterises COUNTER-CLOCKWISE about its placement normal.
+    // An EDGE_CURVE with `same_sense = .F.` traverses that basis curve in
+    // REVERSE, so the trimmed arc from `start` to `end` is the CW portion, not
+    // the CCW one. The arc reconstruction below always takes the CCW sweep
+    // (`sweep = end − start`, forced positive), which for a reversed-sense arc
+    // yields the COMPLEMENT — a 90° fillet-band end-arc re-imports as a 270°
+    // arc, tearing the band and its adjacent cap faces (#42). Negating the
+    // reconstruction normal for a reversed edge flips CCW↔CW, so the forced-
+    // positive sweep lands on the correct (short) arc while `evaluate(0)` still
+    // sits on `start`. Full-circle seam edges (`start == end`, handled below)
+    // are unaffected — a circle is orientation-symmetric.
+    let normal = {
+        let n = Vector3::new(
+            circle.placement.z[0],
+            circle.placement.z[1],
+            circle.placement.z[2],
+        );
+        if same_sense {
+            n
+        } else {
+            Vector3::new(-n.x, -n.y, -n.z)
+        }
+    };
 
     // Seam edge: start == end → full circle.
     let dx = start[0] - end[0];

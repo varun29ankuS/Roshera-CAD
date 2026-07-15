@@ -275,14 +275,28 @@ async fn bore_vertex_positions_survive() {
 // GEOMETRY — topology counts (vertices / edges / loops / faces / shells / solids)
 // ───────────────────────────────────────────────────────────────────────────
 
+// Count LIVE topology, not raw store capacity. The kernel stores are
+// generational-index Vecs: `remove()` tombstones a slot (stamps it
+// INVALID_*_ID and leaves it in place to keep ids stable) rather than
+// compacting, so `store.len()` reports the allocation high-water mark
+// including dead slots, while `store.iter()` skips tombstones and yields
+// only live entities. Since 2026-07-11 (commit d5633bc, #82 Slice 2) a
+// Difference prunes its operand husks via
+// `prune_boolean_orphan_topology`, which tombstones the operand-only
+// faces/loops/edges/shells. The ROS snapshot serializes via `.iter()`
+// (live only), so a faithful round trip legitimately drops the dead
+// slots and comes back with `len() == live`. Fidelity is a property of
+// the LIVE topology, so we measure it with `.iter().count()` on both
+// sides — comparing raw `len()` would fail purely on the pre-round-trip
+// operand-husk tombstones the format is correct to omit.
 fn topo_counts(m: &BRepModel) -> (usize, usize, usize, usize, usize, usize) {
     (
-        m.vertices.len(),
-        m.edges.len(),
-        m.loops.len(),
-        m.faces.len(),
-        m.shells.len(),
-        m.solids.len(),
+        m.vertices.iter().count(),
+        m.edges.iter().count(),
+        m.loops.iter().count(),
+        m.faces.iter().count(),
+        m.shells.iter().count(),
+        m.solids.iter().count(),
     )
 }
 

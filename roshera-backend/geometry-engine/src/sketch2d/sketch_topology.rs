@@ -1046,6 +1046,54 @@ mod tests {
         assert!(topo.is_valid_for_extrusion());
     }
 
+    /// Regression #41: a sparse 4-corner keyway notch used as a HOLE inside a
+    /// round disc must nest as an inner loop and its area must be SUBTRACTED
+    /// from the region — the eval saw the region collapse to the bare outer
+    /// area (π·10²) as if the notch were dropped. Densifying the notch walls
+    /// must not change the answer. Both configurations are asserted here so the
+    /// containment/nesting path stays honest for sparse re-entrant holes.
+    #[test]
+    fn sparse_keyway_notch_nests_as_a_hole_and_subtracts_its_area() {
+        // keyway rectangle: x∈[-1.5,1.5], y∈[4.77,6.4] ⟹ area = 3·1.63 = 4.89.
+        let keyway_area = 3.0 * (6.4 - 4.77);
+        let expect = std::f64::consts::PI * 100.0 - keyway_area;
+        for (label, extra) in [("sparse", 0usize), ("dense", 4usize)] {
+            let s = sketch();
+            s.add_circle(Point2d::new(0.0, 0.0), 10.0).expect("gear");
+            let base = [
+                Point2d::new(1.5, 4.77),
+                Point2d::new(1.5, 6.4),
+                Point2d::new(-1.5, 6.4),
+                Point2d::new(-1.5, 4.77),
+            ];
+            let mut pts = Vec::new();
+            for i in 0..4 {
+                let a = base[i];
+                let b = base[(i + 1) % 4];
+                for j in 0..=extra {
+                    let t = j as f64 / (extra as f64 + 1.0);
+                    pts.push(Point2d::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+                }
+            }
+            s.add_polyline(pts, true).expect("keyway polyline");
+            let topo = analyze(&s);
+            assert_eq!(topo.regions().len(), 1, "{label}: one region (disc)");
+            let region = &topo.regions()[0];
+            assert_eq!(
+                region.inner_loops.len(),
+                1,
+                "{label}: keyway must nest as a hole, not become a second region"
+            );
+            // Circle area uses the bounds fallback (exact π r²), so the region
+            // area is exactly π·100 − keyway; tolerate only f64 noise.
+            assert!(
+                (region.area - expect).abs() < 1e-6,
+                "{label}: region area {} != {expect} (keyway hole not subtracted)",
+                region.area
+            );
+        }
+    }
+
     #[test]
     fn four_head_to_tail_lines_form_a_loop() {
         let s = sketch();

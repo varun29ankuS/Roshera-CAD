@@ -287,7 +287,17 @@ fn incircle_matches_exact_rational_oracle_on_adversarial_inputs() {
     let mut mismatches = 0u64;
     let mut hard = 0u64;
     let mut first_fail = None;
-    let n = 150_000u64;
+    // 2026-07-15: reduced from 150_000 to 40_000. The in-circle exact oracle is
+    // the most expensive of the four predicate sweeps — its 4×4 determinant is
+    // taken over SQUARED coordinates, so the `BigRational` numerators grow far
+    // larger than the square-free orient2d/orient3d determinants, and in a debug
+    // build the bignum arithmetic dominates. At 150_000 this sweep ran ~281 s
+    // locally and tipped the 300 s CI job timeout; 40_000 (~75 s local) keeps a
+    // wide margin while still throwing tens of thousands of hard, near-degenerate
+    // cases at the predicate (the `hard > 0` guard below proves the adversarial
+    // regime is still reached). Matches the same reasoning that already caps the
+    // insphere sweep at 30_000.
+    let n = 40_000u64;
     use std::f64::consts::TAU;
 
     for _ in 0..n {

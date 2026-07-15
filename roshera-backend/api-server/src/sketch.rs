@@ -3086,6 +3086,51 @@ mod tests {
         ]
     }
 
+    fn circle_poly(r: f64, n: usize) -> Vec<[f64; 2]> {
+        (0..n)
+            .map(|i| {
+                let t = std::f64::consts::TAU * (i as f64) / (n as f64);
+                [r * t.cos(), r * t.sin()]
+            })
+            .collect()
+    }
+
+    /// Regression #41: a sparse 4-corner keyway notch inside a round gear disc
+    /// must classify as a HOLE of the disc (not a second disjoint region).
+    /// Sample density of the notch must not flip the classification.
+    #[test]
+    fn detect_regions_sparse_keyway_notch_nests_in_a_disc() {
+        let gear = circle_poly(10.0, 64);
+        let keyway: Vec<[f64; 2]> = vec![[1.5, 4.77], [1.5, 6.4], [-1.5, 6.4], [-1.5, 4.77]];
+        let dense: Vec<[f64; 2]> = {
+            let mut out = Vec::new();
+            let n = keyway.len();
+            for i in 0..n {
+                let a = keyway[i];
+                let b = keyway[(i + 1) % n];
+                for j in 0..4 {
+                    let t = j as f64 / 4.0;
+                    out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+                }
+            }
+            out
+        };
+        for (label, keyw) in [("sparse", keyway), ("dense", dense)] {
+            let polys = vec![&gear, &keyw];
+            let r = detect_regions(&polys).expect("classify");
+            assert_eq!(r.len(), 1, "{label}: one region (the disc)");
+            let disc = r
+                .iter()
+                .find(|x| x.outer_shape_idx == 0)
+                .expect("disc region");
+            assert_eq!(
+                disc.hole_shape_idxs,
+                vec![1],
+                "{label}: keyway notch must be a hole of the disc"
+            );
+        }
+    }
+
     #[test]
     fn detect_regions_single_outer_no_holes() {
         let p = square(0.0, 0.0, 5.0);

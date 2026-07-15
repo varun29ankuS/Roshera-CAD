@@ -133,6 +133,11 @@ pub fn tessellate_face(
             // meshed by curved-CDT (neither loop closes in the (θ,z) chart). Stitch
             // the two cached rims directly; declined for every other cylinder face.
             if tessellate_cylinder_saddle_annulus(face, model, cache, mesh) {
+            } else if tessellate_cylinder_edge_band_conforming(face, model, surface, cache, mesh) {
+                // #42: imported straight-edge fillet quarter-band — stitched
+                // conforming to the trim loop's cached arcs/rails (curved-CDT
+                // trips PointOnFixedEdge at this band's seam and the grid
+                // fallback ignores the angular trim).
             } else if let Err(e) =
                 super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
             {
@@ -172,18 +177,25 @@ pub fn tessellate_face(
                     .downcast_ref::<crate::primitives::surface::Cylinder>();
                 let (radius, (u_min, u_max), (v_min, v_max)) = match cyl {
                     Some(c) => {
-                        let (u0, u1) = c
-                            .angle_limits
-                            .map_or((0.0, std::f64::consts::TAU), |[a, b]| (a, b));
-                        // height_limits are the v-domain; fall back to the
-                        // face-derived v-range only if the surface is infinite.
-                        let (v0, v1) = c.height_limits.map_or_else(
-                            || {
-                                let (_, _, vlo, vhi) = get_face_parameter_bounds(face, model);
-                                (vlo, vhi)
-                            },
-                            |[a, b]| (a, b),
-                        );
+                        // Prefer the kernel-intrinsic band limits (a kernel-built
+                        // cylinder carries them even when its seam is desynced from
+                        // the boundary edges, where face-derived bounds collapse).
+                        // But a cylinder re-imported from STEP has NEITHER —
+                        // ISO 10303-42's CYLINDRICAL_SURFACE is the infinite
+                        // primitive and the band lives ONLY in the trim loop
+                        // (#42). Defaulting the missing angular limit to the full
+                        // [0, 2π] grids the WHOLE circumference, so a fillet
+                        // quarter-band re-imported as a plain cylinder tessellated
+                        // as a full tube whose grid boundary has no twin on the
+                        // adjacent planar caps → hundreds of open edges. Derive the
+                        // absent axis from `get_face_parameter_bounds`, which
+                        // unwraps the trim loop's (θ, v) span (and only snaps to a
+                        // full period when the loop genuinely closes) — the same
+                        // trim-loop-is-the-source-of-truth discriminator the #25
+                        // torus/cone import fix uses.
+                        let (fu0, fu1, fv0, fv1) = get_face_parameter_bounds(face, model);
+                        let (u0, u1) = c.angle_limits.map_or((fu0, fu1), |[a, b]| (a, b));
+                        let (v0, v1) = c.height_limits.map_or((fv0, fv1), |[a, b]| (a, b));
                         (c.radius, (u0, u1), (v0, v1))
                     }
                     None => {
@@ -7204,6 +7216,122 @@ fn v_of_row(j: usize, jlo: usize, jhi: usize, v_lo: f64, v_hi: f64) -> f64 {
 /// WITHOUT touching `mesh` when the face is not this exact structure (so the
 /// caller falls through to the generic routing); on success, emits the band and
 /// returns `true`.
+/// Boundary-conforming mesher for an IMPORTED cylindrical fillet BAND — the
+/// quarter (or any partial) cylinder swept by a straight-edge fillet, re-imported
+/// from STEP as a plain `Cylinder` (#42).
+///
+/// A kernel-built box-edge fillet is a `CylindricalFillet` and tessellates via
+/// `tessellate_fillet_face`; on export it becomes an ISO 10303-42
+/// `CYLINDRICAL_SURFACE` (the infinite primitive) whose partial extent lives ONLY
+/// in the trim loop, so the re-imported surface carries NO `angle_limits`. Routed
+/// to `curved_cdt` that band trips `PointOnFixedEdge` at its seam, and the grid
+/// fallback — lacking angular limits — meshes the WHOLE circumference, leaving
+/// hundreds of open edges against the adjacent planar caps.
+///
+/// A partial cylinder is RULED along its axis (straight rulings), so its boundary
+/// is two open arcs (at the two axial ends) joined by two straight rails (the
+/// contact seams with the neighbouring planar walls). We stitch a single band of
+/// quads between the two arcs, sampling them from the SAME `EdgeSampleCache` the
+/// caps consume — so the arc seams match the caps and the end rulings match the
+/// rails bit-for-bit (watertight by construction, the way `curved_cdt` would have
+/// been had it not failed at the seam).
+///
+/// TIGHTLY GATED, mirroring the #25 torus/cone import discriminators:
+///   * imported cylinder only (`angle_limits == None`) — a kernel cylinder keeps
+///     its existing path;
+///   * no inner loops;
+///   * boundary is exactly two OPEN arc edges (`> 2` cached samples, distinct
+///     endpoints — NOT a closed full-circle seam) plus one or more straight
+///     rails, and the two arcs carry equal sample counts.
+/// Anything else declines and falls through to `curved_cdt`.
+fn tessellate_cylinder_edge_band_conforming(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    let cyl = match surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Cylinder>()
+    {
+        Some(c) => c,
+        None => return false,
+    };
+    // Kernel-built cylinders carry their angular band; only IMPORTED bands (whose
+    // extent lives solely in the trim loop) take this conforming path.
+    if cyl.angle_limits.is_some() || !face.inner_loops.is_empty() {
+        return false;
+    }
+    let outer = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return false,
+    };
+    let mut arcs: Vec<std::sync::Arc<Vec<Point3>>> = Vec::new();
+    let mut straight = 0usize;
+    for &eid in &outer.edges {
+        let e = match model.edges.get(eid) {
+            Some(e) => e,
+            None => return false,
+        };
+        // A closed edge (full circle seam) means this is a whole-cylinder
+        // lateral, not a partial ruled band — decline.
+        if e.start_vertex == e.end_vertex {
+            return false;
+        }
+        let s = cache.get_or_compute(eid, model);
+        if s.len() > 2 {
+            arcs.push(s);
+        } else {
+            straight += 1;
+        }
+    }
+    if arcs.len() != 2 || straight == 0 {
+        return false;
+    }
+    let a0: Vec<Point3> = (*arcs[0]).clone();
+    let mut a1: Vec<Point3> = (*arcs[1]).clone();
+    if a0.len() != a1.len() || a0.len() < 2 {
+        return false;
+    }
+    // Align a1 to a0's parametric direction: the two arcs sit at opposite axial
+    // ends and are walked in opposite θ senses by the closed loop, so a0[0] pairs
+    // with whichever a1 endpoint the (short) rail connects it to.
+    let d_fwd = a0[0].distance(&a1[0]);
+    let d_rev = a0[0].distance(&a1[a1.len() - 1]);
+    if d_rev < d_fwd {
+        a1.reverse();
+    }
+
+    let orient_sign = face.orientation.sign();
+    let row = |mesh: &mut TriangleMesh, ring: &[Point3]| -> Vec<u32> {
+        ring.iter()
+            .map(|p| {
+                let normal = surface
+                    .closest_point(p, Tolerance::default())
+                    .and_then(|(u, v)| surface.normal_at(u, v))
+                    .ok()
+                    .and_then(|n| n.normalize().ok())
+                    .map(|n| n * orient_sign)
+                    .unwrap_or(Vector3::Z);
+                mesh.add_vertex(MeshVertex {
+                    position: *p,
+                    normal,
+                    uv: None,
+                })
+            })
+            .collect()
+    };
+    let r0 = row(mesh, &a0);
+    let r1 = row(mesh, &a1);
+    // Open-band stitch (no wraparound — the ruled band is not closed in θ).
+    for i in 0..r0.len() - 1 {
+        emit_outward_triangle(mesh, r0[i], r0[i + 1], r1[i + 1]);
+        emit_outward_triangle(mesh, r0[i], r1[i + 1], r1[i]);
+    }
+    true
+}
+
 fn tessellate_ruled_annular_band(
     face: &Face,
     model: &BRepModel,

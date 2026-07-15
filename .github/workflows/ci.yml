@@ -92,7 +92,11 @@ jobs:
       working-directory: ./roshera-backend
     
     - name: Run clippy
-      run: cargo clippy --all-targets --workspace 2>&1 | tee /dev/stderr | (! grep -q 'error\[E')
+      # Clippy's own exit code is authoritative: nonzero on any error-level
+      # lint (incl. the workspace's denied unwrap/expect/panic), zero on
+      # warnings. The old `| tee | (! grep 'error\[E')` pipeline (no pipefail)
+      # swallowed clippy lint failures — only numbered rustc errors tripped it.
+      run: cargo clippy --all-targets --workspace
       working-directory: ./roshera-backend
 
     - name: Install cargo-nextest

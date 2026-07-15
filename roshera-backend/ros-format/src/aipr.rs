@@ -539,6 +539,10 @@ impl AICommandTracker {
     }
 
     /// Anonymize text by removing potential PII
+    // Reason: every regex below is a static string literal proven to compile
+    // by the unit tests exercising this function — a compile failure is a
+    // programming error, not a runtime condition.
+    #[allow(clippy::expect_used)]
     fn anonymize_text(text: &str) -> String {
         use regex::Regex;
 

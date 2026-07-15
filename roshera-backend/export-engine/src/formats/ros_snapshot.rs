@@ -10,6 +10,7 @@ use geometry_engine::primitives::{
     },
     edge::{Edge, EdgeOrientation},
     face::{Face, FaceOrientation},
+    fillet_surfaces::CylindricalFillet,
     r#loop::{Loop, LoopType},
     shell::{Shell, ShellType as GeoShellType},
     solid::Solid,
@@ -706,9 +707,32 @@ fn extract_curve_data(curve: &dyn Curve) -> CurveData {
     }
 
     if let Some(arc) = any.downcast_ref::<Arc>() {
+        // The STEP writer emits an arc as its *unbounded* basis CIRCLE; the
+        // importer re-derives the trimmed extent as the CCW sweep from the edge's
+        // start vertex to its end vertex ABOUT THE EMITTED NORMAL. That guess is
+        // only correct when CCW(eval0 → eval1) about the stored normal follows the
+        // arc's actual direction — but `arc.normal` can point the other way for a
+        // fillet-band end-arc whose sweep the kernel stores CW about it, so a 90°
+        // arc re-imports as its 270° complement (#42). Re-derive the emitted
+        // normal straight from the geometry: `(P0−C) × (Pmid−C)` is the axis about
+        // which the first half of the arc turns CCW, i.e. the orientation for
+        // which CCW(P0 → P1) follows through the midpoint = the actual arc. This
+        // is self-correcting regardless of how the kernel happened to store the
+        // normal, and leaves already-correctly-oriented arcs unchanged. (The
+        // importer additionally negates this for `same_sense = .F.` edges, so both
+        // traversal senses reconstruct the same geometric arc.)
+        let c = arc.center;
+        let emit_normal = match (arc.evaluate(0.0), arc.evaluate(0.5)) {
+            (Ok(p0), Ok(pm)) => {
+                let v0 = p0.position - c;
+                let vm = pm.position - c;
+                v0.cross(&vm).normalize().unwrap_or_else(|_| arc.normal)
+            }
+            _ => arc.normal,
+        };
         return CurveData::Arc {
-            center: [arc.center.x, arc.center.y, arc.center.z],
-            normal: [arc.normal.x, arc.normal.y, arc.normal.z],
+            center: [c.x, c.y, c.z],
+            normal: [emit_normal.x, emit_normal.y, emit_normal.z],
             radius: arc.radius,
             start_angle: arc.start_angle,
             end_angle: arc.start_angle + arc.sweep_angle,
@@ -796,6 +820,42 @@ fn clamped_uniform_knots(n: usize, degree: usize) -> Vec<f64> {
 }
 
 /// Extract surface parameters into serializable SurfaceData
+/// If `fillet`'s spine is a straight line, return `(origin, axis)` for the
+/// exact cylinder it lies on (origin = spine start, a point on the axis; axis =
+/// unit spine direction). Returns `None` for a curved spine (a canal surface,
+/// not a cylinder). Straightness is decided geometrically — every interior
+/// spine sample must lie on the chord through the endpoints — so it is
+/// independent of which concrete `Curve` type backs the spine.
+fn straight_fillet_cylinder_axis(fillet: &CylindricalFillet) -> Option<([f64; 3], [f64; 3])> {
+    let p0 = fillet.spine.evaluate(0.0).ok()?.position;
+    let p1 = fillet.spine.evaluate(1.0).ok()?.position;
+    let ax = [p1.x - p0.x, p1.y - p0.y, p1.z - p0.z];
+    let len = (ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]).sqrt();
+    if len < 1e-9 {
+        return None; // degenerate spine
+    }
+    let axis = [ax[0] / len, ax[1] / len, ax[2] / len];
+    // Scale-relative straightness tolerance: interior samples' perpendicular
+    // offset from the chord must vanish.
+    let tol = 1e-6 * len.max(1.0);
+    for k in 1..8 {
+        let t = k as f64 / 8.0;
+        let p = fillet.spine.evaluate(t).ok()?.position;
+        let d = [p.x - p0.x, p.y - p0.y, p.z - p0.z];
+        let along = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+        let perp = [
+            d[0] - axis[0] * along,
+            d[1] - axis[1] * along,
+            d[2] - axis[2] * along,
+        ];
+        let perp_mag = (perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt();
+        if perp_mag > tol {
+            return None; // curved spine → canal surface, not a cylinder
+        }
+    }
+    Some(([p0.x, p0.y, p0.z], axis))
+}
+
 fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
     let any = surface.as_any();
 
@@ -812,6 +872,32 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
             axis: [cyl.axis.x, cyl.axis.y, cyl.axis.z],
             radius: cyl.radius,
         };
+    }
+
+    // A fillet on a STRAIGHT edge (e.g. a box edge) is an exact circular
+    // CYLINDER: the rolling ball of constant `radius` rolls along a straight
+    // spine (the cylinder centre line), sweeping a quarter-band of a genuine
+    // cylinder. The kernel keeps it as a distinct `CylindricalFillet` (its own
+    // trim frame), which the analytic downcasts above miss — so without this
+    // branch it fell to the degree-1 B-spline grid fallback below and STEP
+    // emitted `B_SPLINE_SURFACE` instead of `CYLINDRICAL_SURFACE`. The band then
+    // re-imported as a NURBS patch that tessellates OPEN (its sampled boundary
+    // has no twin on the adjacent planar caps → T-junctions; #42). Emit the
+    // exact `CYLINDRICAL_SURFACE` here, mirroring how a bore-rim `Torus` fillet
+    // emits `TOROIDAL_SURFACE`; the quarter extent lives in the trim loop, not
+    // the surface, exactly as ISO 10303-42 intends.
+    //
+    // TIGHTLY GATED to a straight spine: a fillet on a CURVED edge is a
+    // canal/pipe surface, NOT a cylinder — it must keep falling through to the
+    // sampled B-spline path, so it is not misdeclared as an infinite cylinder.
+    if let Some(fillet) = any.downcast_ref::<CylindricalFillet>() {
+        if let Some((origin, axis)) = straight_fillet_cylinder_axis(fillet) {
+            return SurfaceData::Cylinder {
+                origin,
+                axis,
+                radius: fillet.radius,
+            };
+        }
     }
 
     if let Some(sph) = any.downcast_ref::<GeoSphere>() {

@@ -142,6 +142,9 @@ lazy_static! {
 }
 
 /// Generate random bytes using the global secure RNG
+// Reason: an OS CSPRNG failure is unrecoverable for any security-bearing
+// caller — proceeding with weak/absent entropy would be worse than aborting.
+#[allow(clippy::expect_used)]
 pub fn random_bytes(len: usize) -> Vec<u8> {
     SECURE_RNG
         .random_bytes(len)
@@ -149,6 +152,8 @@ pub fn random_bytes(len: usize) -> Vec<u8> {
 }
 
 /// Generate a random 16-byte array using the global secure RNG
+// Reason: OS CSPRNG failure is unrecoverable; see random_bytes above.
+#[allow(clippy::expect_used)]
 pub fn random_16() -> [u8; 16] {
     SECURE_RNG
         .random_16()
@@ -156,6 +161,8 @@ pub fn random_16() -> [u8; 16] {
 }
 
 /// Generate a random 32-byte array using the global secure RNG
+// Reason: OS CSPRNG failure is unrecoverable; see random_bytes above.
+#[allow(clippy::expect_used)]
 pub fn random_32() -> [u8; 32] {
     SECURE_RNG
         .random_32()

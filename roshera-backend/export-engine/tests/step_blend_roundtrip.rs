@@ -353,3 +353,48 @@ fn bore_rim_arc_edges(m: &BRepModel, s: SolidId, r_want: f64) -> Vec<EdgeId> {
     }
     out
 }
+
+/// #42: a filleted BOX EDGE is a cylindrical QUARTER-BAND trimmed between two
+/// planar walls. The flange fillet (torus) round-trips sound after the #25 fix,
+/// but the simple box-edge fillet re-imported UNSOUND — the imported trimmed
+/// cylinder band fell through to a tessellation path that could not cap its
+/// partial-band trim. This locks the box-edge fillet round-trip.
+#[tokio::test]
+async fn roundtrip_filleted_box_edge() {
+    use geometry_engine::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    let mut m = BRepModel::new();
+    let s = match TopologyBuilder::new(&mut m)
+        .create_box_3d(20.0, 20.0, 20.0)
+        .expect("box")
+    {
+        GeometryId::Solid(s) => s,
+        o => panic!("unexpected geometry {o:?}"),
+    };
+    // Fillet exactly ONE edge with r2 → one cylindrical quarter-band.
+    let e = m.edges.iter().next().map(|(id, _)| id).expect("box edge");
+    fillet_edges(
+        &mut m,
+        s,
+        vec![e],
+        FilletOptions {
+            fillet_type: FilletType::Constant(2.0),
+            radius: 2.0,
+            propagation: PropagationMode::None,
+            ..Default::default()
+        },
+    )
+    .expect("box edge fillet");
+    assert_eq!(
+        count_surface(&m, s, SurfaceType::Cylinder),
+        1,
+        "source must carry one cylindrical fillet band"
+    );
+    assert!(
+        validate_solid_scoped(&m, s, Tolerance::default(), ValidationLevel::Standard).is_valid,
+        "source filleted box must be valid"
+    );
+
+    let (_text, mut imported) = export_then_import(&m, "rt_fillet_box").await;
+    assert_reimport_sound(&mut imported, "filleted box edge");
+}
