@@ -177,29 +177,43 @@ fn f7_coaxial_control_is_sound() {
 // curve 41 (z=20 rim, its +x arc imprints above the plate). They leave the
 // result manifold-broken (nm/bnd > 0) though genus-correct.
 //
-// Phase C ATTEMPTED (bounded material-extent arc-clip, see 32c report): a
-// per-planar-face clip that trims each transverse rim to its source face's
-// MATERIAL extent (outer boundary minus arc-bounded, non-seam holes; reusing
-// `planar_face_hole_polygons` + exact circle-boundary crossings) DOES remove the
-// planar phantom — nm 248→0 — and the trimmed arcs weld exactly to the SSI
-// verticals. But it does NOT reach full soundness: the CUTTER-WALL imprint is
-// z-dependent (the full z=10 circle is a real cut — plate on +x AND boss on −x
-// both border the bore there — but only the −x arc is real at z=20, where only
-// the boss borders it). Clipping the wall's own circle to the union's z-varying
-// material cross-section is a general solid-classification (GWN / same-domain-
-// unify) problem, not a planar outer/hole clip, so the wall keeps an unpaired
-// +x@z20 rim (bnd rises, euler → −2). Per the STOP bar this is arrangement/
-// classification-core rework and was NOT half-built; reverted. These two pins
-// assert the honest END target and stay ignored until the classification-level
-// wall-extent clip lands. See `.superpowers/sdd/dogfood-task-32c-report.md`.
+// SLICE-2 UPDATE (2026-07-15, verified on `feat/coincident-weld-slice0`): after
+// the embedded-lateral union split (Slice 1) the CUTTER-WALL extent is already
+// correct — the boss lateral is split at z=10/z=20 and the bore wall's z-bands
+// classify cleanly (the old "z-dependent wall / euler −2" residual is GONE; euler
+// is now 0). Today's residual is bnd=302, nm=248 (offset 10) / nm=198 (offset 12).
+//
+// The residual is STRUCTURAL and difference-side-unfixable. The overlapping-boss
+// UNION fragments the coincident-coplanar z=0 bottom into a ring (`square − r15`)
+// plus a SPURIOUS coincident r15 disk. When the bore rim STRADDLES the r15 seam,
+// the ring's DCEL arrangement walks an in-hole phantom region whose r15 seam arcs
+// are ALSO the ring's inner-loop boundary AND the disk fragment's boundary — one
+// seam arc set referenced by ≥3 faces → non-manifold. Two bounded difference-side
+// fixes were gate-proven NON-VIABLE this slice: (a) extending the post-split
+// planar clip-to-face to also drop cut arcs inside a pre-existing hole regressed
+// bnd 302→758, euler 0→−1; (b) dropping the ring's in-hole phantom fragment by its
+// representative interior point regressed bnd 302→1404 (the seam arcs the phantom
+// carries are load-bearing for the ring's own hole — the drop opens the shell).
+// The real fix is UNION-side coincident-coplanar bottom-cap MERGE (same-domain-
+// unify, spec §5 Slice 0b: emit ONE 60×60 bottom, not ring+disk), after which the
+// bore cuts a single clean face. That is a union-side capability, not a planar/
+// hole arc-clip, so these two pins stay ignored until it lands. See the Slice-2
+// report and `.superpowers/sdd/dogfood-task-32c-report.md`.
 
 #[test]
 #[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
-            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on a \
-            classification-level cutter-wall material-extent clip (the wall's \
-            imprint is z-dependent — GWN/same-domain territory). Phase C bounded \
-            arc-clip removes the planar phantom (nm→0) but not the wall rim; see \
-            32c report — STOP, escalated"]
+            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on \
+            SAME-DOMAIN-UNIFY of the overlapping-boss union's fragmented coplanar \
+            bottom (ring `square−r15` + coincident r15 disk). A through-bore rim \
+            that STRADDLES the r15 seam cannot be cleanly cut at the fragment \
+            level: the r15 seam arcs are shared by the ring's inner loop, the \
+            ring's phantom in-hole fragment AND the disk fragment (edge multiplicity \
+            ≥3 → non-manifold). Two bounded difference-side fixes were gate-proven \
+            NON-VIABLE on 2026-07-15 (post-split arc-clip: bnd 302→758, euler 0→−1; \
+            interior-point fragment-drop: bnd 302→1404 — dropping the phantom \
+            removes seam arcs the ring needs). Root fix = union coincident-coplanar \
+            bottom-cap merge (spec §5 Slice 0b / same-domain-unify), a union-side \
+            capability, NOT a difference-side clip; see the Slice-2 report"]
 fn f7_straddling_offset_10_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 10.0);
@@ -215,11 +229,18 @@ fn f7_straddling_offset_10_is_sound() {
 
 #[test]
 #[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
-            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on a \
-            classification-level cutter-wall material-extent clip (the wall's \
-            imprint is z-dependent — GWN/same-domain territory). Phase C bounded \
-            arc-clip removes the planar phantom (nm→0) but not the wall rim; see \
-            32c report — STOP, escalated"]
+            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on \
+            SAME-DOMAIN-UNIFY of the overlapping-boss union's fragmented coplanar \
+            bottom (ring `square−r15` + coincident r15 disk). A through-bore rim \
+            that STRADDLES the r15 seam cannot be cleanly cut at the fragment \
+            level: the r15 seam arcs are shared by the ring's inner loop, the \
+            ring's phantom in-hole fragment AND the disk fragment (edge multiplicity \
+            ≥3 → non-manifold). Two bounded difference-side fixes were gate-proven \
+            NON-VIABLE on 2026-07-15 (post-split arc-clip: bnd 302→758, euler 0→−1; \
+            interior-point fragment-drop: bnd 302→1404 — dropping the phantom \
+            removes seam arcs the ring needs). Root fix = union coincident-coplanar \
+            bottom-cap merge (spec §5 Slice 0b / same-domain-unify), a union-side \
+            capability, NOT a difference-side clip; see the Slice-2 report"]
 fn f7_straddling_offset_12_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 12.0);

@@ -8037,8 +8037,27 @@ fn planar_face_hole_polygons(
 // ring/disk seam of a fragmented coplanar face is NOT filtered here —
 // neither face's hole wholly contains the curve, so BOTH bottom-face
 // pairs emit the full circle and the cutter receives duplicate coincident
-// cuts (same 3-face-fan corruption class, silent). Resolving coincident
-// coplanar fragments as one domain is the #32 campaign's charter.
+// cuts (same 3-face-fan corruption class, silent). Phase-B curve dedup
+// (`curves_geometrically_coincident`) removes the DUPLICATE z=0 rim so the
+// Euler characteristic is restored (χ=0), but a residual survives that this
+// PAIR-level filter cannot reach: the straddling bore leaves the ring face's
+// arrangement with an in-hole phantom fragment whose r15 SEAM arcs are
+// simultaneously the ring's inner-loop boundary, a standalone phantom face,
+// AND the coincident-disk fragment's boundary (edge multiplicity ≥3 →
+// non-manifold; offset 10 → bnd=302 nm=248, offset 12 → bnd=302 nm=198).
+// Two bounded DIFFERENCE-side fixes were gate-proven NON-VIABLE on 2026-07-15
+// (Slice-2 diagnosis): (a) extending the post-split planar clip-to-face to
+// drop cut arcs inside a pre-existing hole regressed bnd 302→758, euler 0→−1;
+// (b) dropping the ring's in-hole phantom FRAGMENT by its interior point
+// regressed bnd 302→1404 — the seam arcs the phantom carries are load-bearing
+// for the ring's own hole, so the drop opens the shell. The residual is
+// STRUCTURAL: the overlapping-boss UNION fragments the coincident-coplanar
+// bottom into ring + spurious r15 disk, and a seam-straddling bore cannot be
+// cut cleanly at the fragment level. The real fix is UNION-side coincident-
+// coplanar-cap merge (same-domain-unify, spec §5 Slice 0b), NOT a difference-
+// side clip. Resolving coincident coplanar fragments as one domain is the #32
+// campaign's charter; the `f7_straddling_offset_{10,12}_is_sound` pins stay
+// `#[ignore]`d until it lands.
 /// Geometric-coincidence test for two intersection curves (#32 Phase B
 /// straddling-rim dedup).
 ///
