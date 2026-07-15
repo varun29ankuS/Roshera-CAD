@@ -6,8 +6,10 @@
 //!
 //! - `dense_*` — the pre-Slice-2 one-big-system damped Newton
 //!   (decomposition disabled via `set_decomposition_enabled(false)`);
-//! - `decomposed_*` — connected-component decomposition (the shipped
-//!   default).
+//! - `decomposed_*` — Slice-2 connected-component decomposition with
+//!   whole-component Newton (`set_dr_plan_enabled(false)`);
+//! - `planned_*` — Slice-3 rigid-cluster DR-plan inside each
+//!   component (the shipped default).
 //!
 //! Solvers are built fresh per iteration (`iter_batched`, setup
 //! untimed) because `solve` converges the instance in place — timing a
@@ -42,8 +44,18 @@ fn bench_sketch_solver(c: &mut Criterion) {
         ("300", PlateSpec::LARGE),
     ];
 
+    // Three solver paths (SKETCH-DCM #45):
+    // - dense: pre-Slice-2 one-big-system Newton;
+    // - decomposed: Slice-2 connected components, whole-component
+    //   Newton per component (DR-plan disabled);
+    // - planned: Slice-3 rigid-cluster DR-plan inside each component
+    //   (the shipped default).
     for (label, spec) in sizes {
-        for (path, decomposed) in [("dense", false), ("decomposed", true)] {
+        for (path, decomposed, planned) in [
+            ("dense", false, false),
+            ("decomposed", true, false),
+            ("planned", true, true),
+        ] {
             group.bench_function(format!("{path}_{label}"), |b| {
                 b.iter_batched(
                     || {
@@ -51,6 +63,7 @@ fn bench_sketch_solver(c: &mut Criterion) {
                         let mut solver = build_solver(&plate.sketch, SolveOptions::default())
                             .expect("default solve options are valid");
                         solver.set_decomposition_enabled(decomposed);
+                        solver.set_dr_plan_enabled(planned);
                         solver
                     },
                     |mut solver| solver.solve(),

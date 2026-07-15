@@ -103,6 +103,37 @@ pub struct ConstraintDiagnosis {
     pub jacobian_rows: usize,
 }
 
+/// Structural participation diagnostics for the most recent
+/// [`ConstraintSolver::solve`] call (SKETCH-DCM #45 Slice 3).
+///
+/// The DR-plan contract requires drag re-solve scoping to be
+/// observable *structurally* — "only the affected cluster chain
+/// re-solves" must be assertable from counters, not inferred from
+/// wall-clock. A "Newton run" here is any invocation of the damped
+/// Newton core: the whole-system loop, one per-component loop, one
+/// per-plan-step mini solve, or one cluster placement solve. A run
+/// **participates** when it executes at least one iteration (a run
+/// whose residual is already under tolerance exits before touching
+/// the Jacobian and moves nothing).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SolveStats {
+    /// Newton runs that executed ≥ 1 iteration.
+    pub newton_runs_iterated: usize,
+    /// Total free parameters across those runs — the participation
+    /// measure. A solve that only had to move one 2-DOF point in a
+    /// 100-parameter sketch reports 2 here, not 100.
+    pub iterated_params: usize,
+    /// Components solved through a completed DR-plan (Slice 3).
+    pub planned_components: usize,
+    /// Components solved by whole-component dense Newton — either
+    /// because no complete DR-plan exists for them or because a plan
+    /// failed verification and fell back.
+    pub dense_components: usize,
+    /// Plan executions that failed post-execution verification and
+    /// were re-solved dense from the pre-plan state.
+    pub plan_fallbacks: usize,
+}
+
 /// Entity position/parameter update
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -150,6 +181,18 @@ pub struct ConstraintSolver {
     /// a correctness knob: both paths must produce equivalent residual
     /// verdicts.
     decomposition_enabled: bool,
+    /// SKETCH-DCM #45 Slice 3: when `true` (the default), each
+    /// connected component is first offered to the rigid-cluster
+    /// DR-planner (`dr_plan`); components the planner cannot fully
+    /// decompose — and planned components that fail post-execution
+    /// verification — solve through the existing whole-component
+    /// Newton core exactly as before. Disable via
+    /// [`Self::set_dr_plan_enabled`] for a Slice-2 baseline
+    /// (component split without cluster planning).
+    dr_plan_enabled: bool,
+    /// Participation diagnostics for the most recent [`Self::solve`]
+    /// call. See [`SolveStats`].
+    last_stats: SolveStats,
 }
 
 /// Outcome of one run of the damped Newton-Raphson core (whole-system
@@ -165,6 +208,36 @@ struct NewtonOutcome {
     /// True when any linear solve (any component) failed both the
     /// plain and Tikhonov-regularised attempts.
     linear_solve_failed: bool,
+}
+
+/// Outcome of offering one component to the DR-planner
+/// (SKETCH-DCM #45 Slice 3). See [`ConstraintSolver::run_plan`].
+enum PlanAttempt {
+    /// No complete plan exists; entity states untouched.
+    NoPlan,
+    /// A plan executed but failed verification (or hit a numerical
+    /// anomaly); entity states restored to the pre-plan snapshot.
+    Fallback,
+    /// Verified success; entity states hold the solution.
+    Executed(PlanRunStats),
+}
+
+/// Participation tally of one executed DR-plan.
+#[derive(Default)]
+struct PlanRunStats {
+    /// Steps whose Newton run executed ≥ 1 iteration.
+    newton_runs_iterated: usize,
+    /// Free parameters across those steps.
+    iterated_params: usize,
+    /// Max iterations over the plan's steps — the latency-relevant
+    /// depth, mirroring `NewtonOutcome::iterations` semantics.
+    max_iterations: usize,
+}
+
+/// One executed plan step's tally.
+struct StepRun {
+    iterations: usize,
+    params: usize,
 }
 
 /// Structural metadata for a spline entity that cannot vary during
@@ -348,6 +421,8 @@ impl ConstraintSolver {
             constraints: Vec::new(),
             dependency_graph: HashMap::new(),
             decomposition_enabled: true,
+            dr_plan_enabled: true,
+            last_stats: SolveStats::default(),
         }
     }
 
@@ -395,6 +470,28 @@ impl ConstraintSolver {
         self.decomposition_enabled
     }
 
+    /// Enable/disable the rigid-cluster DR-plan (SKETCH-DCM #45
+    /// Slice 3). ON by default. Turning it off forces every component
+    /// through the Slice-2 whole-component Newton path — a
+    /// baseline/mutation-testing switch, not a correctness knob:
+    /// residual verdicts must be equivalent either way. Has no effect
+    /// while decomposition itself is disabled.
+    pub fn set_dr_plan_enabled(&mut self, enabled: bool) {
+        self.dr_plan_enabled = enabled;
+    }
+
+    /// Whether the rigid-cluster DR-plan is active.
+    pub fn dr_plan_enabled(&self) -> bool {
+        self.dr_plan_enabled
+    }
+
+    /// Participation diagnostics for the most recent [`Self::solve`]
+    /// call. Zeroed at the start of every solve; a solver that has
+    /// never solved reports all-zero stats.
+    pub fn last_stats(&self) -> SolveStats {
+        self.last_stats
+    }
+
     /// Add an entity to the solver
     pub fn add_entity(&self, entity: EntityRef, initial_state: EntityState) {
         self.entity_state.insert(entity, initial_state);
@@ -436,6 +533,7 @@ impl ConstraintSolver {
     /// 3. `Converged` / `NotConverged` otherwise.
     pub fn solve(&mut self) -> SolverResult {
         let start_time = std::time::Instant::now();
+        self.last_stats = SolveStats::default();
 
         // Capture but do not act on the DOF verdict — it is folded
         // into the final status after Newton-Raphson runs. The count
@@ -562,11 +660,33 @@ impl ConstraintSolver {
     /// gate pins, per the campaign contract.
     fn run_newton_decomposed(&mut self) -> NewtonOutcome {
         if !self.decomposition_enabled {
-            return self.run_newton();
+            return self.run_dense_whole();
         }
         let components = self.split_components();
         if components.len() <= 1 {
-            return self.run_newton();
+            // Single component (SKETCH-DCM #45 Slice 3): offer the
+            // whole system to the DR-planner in place. `run_plan`
+            // snapshots the entity states and restores them on any
+            // miss, so the dense fallback below starts from EXACTLY
+            // the pre-slice state — behaviour on unplannable sketches
+            // is byte-identical to the Slice-2 path.
+            if self.dr_plan_enabled {
+                match self.run_plan() {
+                    PlanAttempt::Executed(stats) => {
+                        self.merge_plan_stats(&stats);
+                        let errors = self.compute_constraint_errors();
+                        let final_error = errors.iter().map(|e| e * e).sum::<f64>().sqrt();
+                        return NewtonOutcome {
+                            iterations: stats.max_iterations,
+                            final_error,
+                            linear_solve_failed: false,
+                        };
+                    }
+                    PlanAttempt::Fallback => self.last_stats.plan_fallbacks += 1,
+                    PlanAttempt::NoPlan => {}
+                }
+            }
+            return self.run_dense_whole();
         }
 
         // The caller's tolerance bounds the GLOBAL residual norm.
@@ -611,15 +731,36 @@ impl ConstraintSolver {
                 .filter_map(|&i| self.constraints.get(i).cloned())
                 .collect();
 
-            let outcome = sub.run_newton();
+            // SKETCH-DCM #45 Slice 3: offer the component to the
+            // DR-planner first. On `Fallback`/`NoPlan` the sub-solver's
+            // state is pristine (`run_plan` restores its snapshot), so
+            // the dense path below is byte-identical to Slice 2.
+            let mut planned = false;
+            if self.dr_plan_enabled {
+                match sub.run_plan() {
+                    PlanAttempt::Executed(stats) => {
+                        self.merge_plan_stats(&stats);
+                        iterations = iterations.max(stats.max_iterations);
+                        planned = true;
+                    }
+                    PlanAttempt::Fallback => self.last_stats.plan_fallbacks += 1,
+                    PlanAttempt::NoPlan => {}
+                }
+            }
+            if !planned {
+                let sub_params = sub.count_degrees_of_freedom();
+                let outcome = sub.run_newton();
+                self.record_run(outcome.iterations, sub_params);
+                self.last_stats.dense_components += 1;
+                iterations = iterations.max(outcome.iterations);
+                linear_solve_failed |= outcome.linear_solve_failed;
+            }
 
             for entity in &component.entities {
                 if let Some(state) = sub.entity_state.get(entity) {
                     self.entity_state.insert(*entity, state.value().clone());
                 }
             }
-            iterations = iterations.max(outcome.iterations);
-            linear_solve_failed |= outcome.linear_solve_failed;
         }
 
         // Exit residual measured globally over the merged state —
@@ -631,6 +772,488 @@ impl ConstraintSolver {
             final_error,
             linear_solve_failed,
         }
+    }
+
+    /// Record one Newton run in [`Self::last_stats`]: a run
+    /// participates only when it executed ≥ 1 iteration (see
+    /// [`SolveStats`]).
+    fn record_run(&mut self, iterations: usize, params: usize) {
+        if iterations >= 1 {
+            self.last_stats.newton_runs_iterated += 1;
+            self.last_stats.iterated_params += params;
+        }
+    }
+
+    /// Fold a planned component's execution stats into
+    /// [`Self::last_stats`].
+    fn merge_plan_stats(&mut self, stats: &PlanRunStats) {
+        self.last_stats.newton_runs_iterated += stats.newton_runs_iterated;
+        self.last_stats.iterated_params += stats.iterated_params;
+        self.last_stats.planned_components += 1;
+    }
+
+    /// Whole-system dense Newton on `self` with stats accounting —
+    /// the pre-Slice-3 path, byte-identical.
+    fn run_dense_whole(&mut self) -> NewtonOutcome {
+        let params = self.count_degrees_of_freedom();
+        let outcome = self.run_newton();
+        self.record_run(outcome.iterations, params);
+        self.last_stats.dense_components += 1;
+        outcome
+    }
+
+    // ── SKETCH-DCM #45 Slice 3: DR-plan execution ───────────────────
+    //
+    // Plan DISCOVERY lives in `dr_plan.rs` (pure, structural,
+    // deterministic). Everything below is EXECUTION: running each
+    // step as a small Newton solve against frozen placed geometry,
+    // placing rigid clusters with an SE(2) transform solve, verifying
+    // the achieved residuals, and restoring the pre-plan state on any
+    // miss so the dense fallback reproduces pre-slice behaviour
+    // exactly.
+
+    /// Attempt DR-planned execution of this solver's system. The
+    /// solver must already be scoped to ONE constraint-graph component
+    /// (the whole system when it is a single component, or a Slice-2
+    /// component sub-solver) with `constraints` priority-sorted.
+    ///
+    /// - [`PlanAttempt::NoPlan`]: no complete plan exists (entity
+    ///   states untouched) — caller runs the dense core.
+    /// - [`PlanAttempt::Fallback`]: a plan executed but failed
+    ///   verification or hit a numerical anomaly; entity states have
+    ///   been RESTORED to the pre-plan snapshot — caller runs the
+    ///   dense core from exactly the state it would have seen before
+    ///   this slice existed.
+    /// - [`PlanAttempt::Executed`]: verified success; entity states
+    ///   hold the solution.
+    ///
+    /// # Verification (the honesty gate)
+    ///
+    /// Plan discovery is generic-rigidity counting and can be lied to
+    /// by degenerate geometry (spec §3.1: counting ⇒ *generically*
+    /// rigid). Every planned solve is therefore verified: the
+    /// unweighted L2 norm over all HARD (Required/High) enforced
+    /// residuals must come in under the solver tolerance, widened by
+    /// a soft-pull allowance when best-effort (Medium/Low) rows are
+    /// present: at the weighted-least-squares stationary point a soft
+    /// row legitimately displaces hard residuals by up to
+    /// ~w²·|r_soft| (gradient norms are O(1) — coordinate rows are
+    /// exactly unit), so demanding plain tolerance would spuriously
+    /// fail every drag. The 10× factor is margin for non-unit
+    /// gradient ratios; a configuration beyond it falls back to dense
+    /// — slower, never wrong.
+    fn run_plan(&mut self) -> PlanAttempt {
+        // Already-satisfied components skip planning entirely: the
+        // dense core exits at iteration 0 after ONE residual
+        // evaluation — exactly what this check costs — so planning
+        // here would only add discovery + per-step overhead to every
+        // untouched component of an interactive drag frame (the
+        // Slice-2 4–5 ms drag frame tripled before this early-out).
+        let errors = self.compute_constraint_errors();
+        let norm = errors.iter().map(|e| e * e).sum::<f64>().sqrt();
+        if norm < self.tolerance {
+            return PlanAttempt::NoPlan;
+        }
+
+        let Some((entities, constraints)) = self.extract_plan_inputs() else {
+            return PlanAttempt::NoPlan;
+        };
+        let Some(plan) = super::dr_plan::plan_component(&entities, &constraints) else {
+            return PlanAttempt::NoPlan;
+        };
+        if plan.steps.is_empty() {
+            return PlanAttempt::NoPlan;
+        }
+
+        let snapshot: Vec<(EntityRef, EntityState)> = self
+            .entity_state
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+
+        // Each step stopping just under the component tolerance would
+        // aggregate to √s·t over s steps; tighten per step so the
+        // component-level norm provably meets `self.tolerance` — the
+        // same argument as the Slice-2 per-component √k tightening.
+        let step_tolerance = self.tolerance / (plan.steps.len() as f64).sqrt();
+
+        let mut stats = PlanRunStats::default();
+        let mut anomaly = false;
+        for step in &plan.steps {
+            let run = match step {
+                super::dr_plan::PlanStep::Extend {
+                    entity,
+                    constraints: hard,
+                    soft,
+                } => self.execute_extend(*entity, hard, soft, step_tolerance),
+                super::dr_plan::PlanStep::PlaceCluster {
+                    entities: cluster,
+                    internal,
+                    boundary,
+                    soft,
+                } => self.execute_place_cluster(cluster, internal, boundary, soft, step_tolerance),
+            };
+            match run {
+                Ok(step_run) => {
+                    if step_run.iterations >= 1 {
+                        stats.newton_runs_iterated += 1;
+                        stats.iterated_params += step_run.params;
+                    }
+                    stats.max_iterations = stats.max_iterations.max(step_run.iterations);
+                }
+                Err(()) => {
+                    anomaly = true;
+                    break;
+                }
+            }
+        }
+
+        if !anomaly {
+            let hard_norm = self.hard_enforced_residual_norm();
+            let threshold = self.tolerance + 10.0 * self.soft_pull_allowance();
+            if hard_norm < threshold {
+                return PlanAttempt::Executed(stats);
+            }
+        }
+
+        for (entity, state) in snapshot {
+            self.entity_state.insert(entity, state);
+        }
+        PlanAttempt::Fallback
+    }
+
+    /// Build the abstract component model the planner consumes:
+    /// entities with their free parameter counts, constraints with
+    /// their variable sets expanded through the shared-variable model.
+    /// Returns `None` when any constraint references an entity with no
+    /// solver state (ghost refs) — the dense path's degrade-to-zero
+    /// residual semantics must be preserved verbatim there.
+    fn extract_plan_inputs(
+        &self,
+    ) -> Option<(
+        Vec<super::dr_plan::PlanEntity>,
+        Vec<super::dr_plan::PlanConstraint>,
+    )> {
+        use std::collections::BTreeSet;
+
+        let mut entities = Vec::new();
+        let mut free_map: HashMap<EntityRef, usize> = HashMap::new();
+        let mut derived_map: HashMap<EntityRef, Vec<EntityRef>> = HashMap::new();
+        for entry in self.entity_state.iter() {
+            let entity = *entry.key();
+            let state = entry.value();
+            let free = state.free_param_count();
+            free_map.insert(entity, free);
+            derived_map.insert(entity, state.derived_refs());
+            entities.push(super::dr_plan::PlanEntity {
+                entity,
+                free_dofs: free,
+                // SE(2) cluster transforms are exact only for plain
+                // 2-DOF points (their parameters ARE plane
+                // coordinates). Everything else still takes Extend
+                // steps, which need no transform.
+                cluster_capable: matches!(entity, EntityRef::Point(_)) && free == 2,
+            });
+        }
+        entities.sort_by_key(|pe| pe.entity);
+
+        let mut constraints = Vec::with_capacity(self.constraints.len());
+        for (index, c) in self.constraints.iter().enumerate() {
+            let mut vars: BTreeSet<EntityRef> = BTreeSet::new();
+            for raw in &c.entities {
+                let free = *free_map.get(raw)?;
+                if free > 0 {
+                    vars.insert(*raw);
+                }
+                for derived in derived_map.get(raw).map(Vec::as_slice).unwrap_or(&[]) {
+                    let dfree = *free_map.get(derived)?;
+                    if dfree > 0 {
+                        vars.insert(*derived);
+                    }
+                }
+            }
+            constraints.push(super::dr_plan::PlanConstraint {
+                index,
+                dof_removed: c.degrees_of_freedom_removed(),
+                hard: super::dr_plan::is_hard_priority(c.priority),
+                enforced: c.constraint_type.is_numerically_enforced(),
+                grounded: super::dr_plan::references_frame(&c.constraint_type),
+                vars: vars.into_iter().collect(),
+            });
+        }
+        Some((entities, constraints))
+    }
+
+    /// Register everything a step's constraints can read into a step
+    /// solver: `free_entities` keep their live state (and fixed
+    /// masks); every other referenced entity — including derived-ref
+    /// targets, which residual accessors reach through — is cloned
+    /// FROZEN so the step cannot move placed geometry.
+    fn register_step_entities(
+        &self,
+        step_solver: &ConstraintSolver,
+        step_constraints: &[Constraint],
+        free_entities: &[EntityRef],
+    ) -> Result<(), ()> {
+        let free_set: HashSet<EntityRef> = free_entities.iter().copied().collect();
+        let mut queue: Vec<EntityRef> = free_entities.to_vec();
+        for c in step_constraints {
+            queue.extend(c.entities.iter().copied());
+        }
+        let mut seen: HashSet<EntityRef> = HashSet::new();
+        while let Some(entity) = queue.pop() {
+            if !seen.insert(entity) {
+                continue;
+            }
+            let Some(state) = self.entity_state.get(&entity) else {
+                return Err(());
+            };
+            queue.extend(state.value().derived_refs());
+            let cloned = if free_set.contains(&entity) {
+                state.value().clone()
+            } else {
+                state.value().frozen()
+            };
+            drop(state);
+            step_solver.entity_state.insert(entity, cloned);
+        }
+        Ok(())
+    }
+
+    /// Build a step solver with this solver's tunables (decomposition
+    /// and planning off — a step IS a leaf).
+    fn step_solver(&self, step_tolerance: f64) -> ConstraintSolver {
+        let mut mini = ConstraintSolver::new();
+        mini.max_iterations = self.max_iterations;
+        mini.tolerance = step_tolerance;
+        mini.damping_factor = self.damping_factor;
+        mini.decomposition_enabled = false;
+        mini.dr_plan_enabled = false;
+        mini
+    }
+
+    /// Clone the constraints at `indices`, priority-sorted (the
+    /// `run_newton` contract).
+    fn step_constraints(&self, indices: &[usize]) -> Result<Vec<Constraint>, ()> {
+        let mut out = Vec::with_capacity(indices.len());
+        for &i in indices {
+            out.push(self.constraints.get(i).ok_or(())?.clone());
+        }
+        out.sort_by_key(|c| c.priority);
+        Ok(out)
+    }
+
+    /// Execute an `Extend` step: solve `target`'s free parameters
+    /// against its consumed constraints (plus soft passengers) with
+    /// all placed geometry frozen, then adopt the solved state.
+    fn execute_extend(
+        &mut self,
+        target: EntityRef,
+        hard_indices: &[usize],
+        soft_indices: &[usize],
+        step_tolerance: f64,
+    ) -> Result<StepRun, ()> {
+        let mut mini = self.step_solver(step_tolerance);
+        let all_indices: Vec<usize> = hard_indices
+            .iter()
+            .chain(soft_indices.iter())
+            .copied()
+            .collect();
+        let constraints = self.step_constraints(&all_indices)?;
+        self.register_step_entities(&mini, &constraints, &[target])?;
+        mini.constraints = constraints;
+
+        let params = mini.count_degrees_of_freedom();
+        let outcome = mini.run_newton();
+        if outcome.linear_solve_failed {
+            return Err(());
+        }
+        let solved = mini.entity_state.get(&target).ok_or(())?.value().clone();
+        self.entity_state.insert(target, solved);
+        Ok(StepRun {
+            iterations: outcome.iterations,
+            params,
+        })
+    }
+
+    /// Execute a `PlaceCluster` step.
+    ///
+    /// Phase 1 — internal shape solve: the cluster's own Newton run
+    /// over its internal (shape) constraints. The system is
+    /// rank-deficient by exactly the 3 rigid-body DOF, so the
+    /// Tikhonov fallback in `solve_linear_system` yields the
+    /// minimum-norm shape solution nearest the current state.
+    ///
+    /// Phase 2 — SE(2) placement: solve the 3 placement unknowns
+    /// `(tx, ty, θ)` (rotation about the cluster centroid for
+    /// conditioning) against the boundary constraints with a damped
+    /// Newton on a finite-difference 3-column Jacobian, reusing
+    /// `solve_linear_system` for the weighted normal equations. The
+    /// rigid transform preserves the internally-solved shape exactly,
+    /// which is the whole point of the decomposition: internal
+    /// residuals cannot regress during placement.
+    fn execute_place_cluster(
+        &mut self,
+        cluster: &[EntityRef],
+        internal_indices: &[usize],
+        boundary_indices: &[usize],
+        soft_indices: &[usize],
+        step_tolerance: f64,
+    ) -> Result<StepRun, ()> {
+        // Phase 1: internal shape.
+        let mut internal_iterations = 0usize;
+        let mut params = 0usize;
+        if !internal_indices.is_empty() {
+            let mut mini = self.step_solver(step_tolerance);
+            let constraints = self.step_constraints(internal_indices)?;
+            self.register_step_entities(&mini, &constraints, cluster)?;
+            mini.constraints = constraints;
+            params = mini.count_degrees_of_freedom();
+            let outcome = mini.run_newton();
+            if outcome.linear_solve_failed {
+                return Err(());
+            }
+            internal_iterations = outcome.iterations;
+            for entity in cluster {
+                let solved = mini.entity_state.get(entity).ok_or(())?.value().clone();
+                self.entity_state.insert(*entity, solved);
+            }
+        }
+
+        // Phase 2: rigid placement.
+        let scratch = self.step_solver(step_tolerance);
+        let all_indices: Vec<usize> = boundary_indices
+            .iter()
+            .chain(soft_indices.iter())
+            .copied()
+            .collect();
+        let constraints = self.step_constraints(&all_indices)?;
+        self.register_step_entities(&scratch, &constraints, cluster)?;
+        let mut scratch = scratch;
+        scratch.constraints = constraints;
+
+        // Base positions after the internal solve. Cluster members
+        // are guaranteed plain 2-DOF points by the planner's
+        // `cluster_capable` gate.
+        let mut base: Vec<(EntityRef, f64, f64)> = Vec::with_capacity(cluster.len());
+        for entity in cluster {
+            let state = self.entity_state.get(entity).ok_or(())?;
+            if state.value().parameters.len() < 2 {
+                return Err(());
+            }
+            base.push((
+                *entity,
+                state.value().parameters[0],
+                state.value().parameters[1],
+            ));
+        }
+        if base.is_empty() {
+            return Err(());
+        }
+        let cx = base.iter().map(|(_, x, _)| x).sum::<f64>() / base.len() as f64;
+        let cy = base.iter().map(|(_, _, y)| y).sum::<f64>() / base.len() as f64;
+
+        let apply = |scratch: &ConstraintSolver, u: &[f64; 3]| {
+            let (sin_t, cos_t) = u[2].sin_cos();
+            for (entity, bx, by) in &base {
+                let dx = bx - cx;
+                let dy = by - cy;
+                if let Some(mut state) = scratch.entity_state.get_mut(entity) {
+                    state.parameters[0] = cx + cos_t * dx - sin_t * dy + u[0];
+                    state.parameters[1] = cy + sin_t * dx + cos_t * dy + u[1];
+                }
+            }
+        };
+
+        let mut u = [0.0f64; 3];
+        let mut placement_iterations = 0usize;
+        let h = 1e-8;
+        while placement_iterations < self.max_iterations {
+            apply(&scratch, &u);
+            let errors = scratch.compute_constraint_errors();
+            let norm = errors.iter().map(|e| e * e).sum::<f64>().sqrt();
+            if norm < step_tolerance {
+                break;
+            }
+            let mut jacobian = vec![vec![0.0; 3]; errors.len()];
+            for k in 0..3 {
+                let mut plus = u;
+                plus[k] += h;
+                apply(&scratch, &plus);
+                let errors_plus = scratch.compute_constraint_errors();
+                let mut minus = u;
+                minus[k] -= h;
+                apply(&scratch, &minus);
+                let errors_minus = scratch.compute_constraint_errors();
+                for (j, (ep, em)) in errors_plus.iter().zip(errors_minus.iter()).enumerate() {
+                    jacobian[j][k] = (ep - em) / (2.0 * h);
+                }
+            }
+            let delta = scratch.solve_linear_system(&jacobian, &errors)?;
+            if delta.len() < 3 {
+                return Err(());
+            }
+            u[0] += self.damping_factor * delta[0];
+            u[1] += self.damping_factor * delta[1];
+            u[2] += self.damping_factor * delta[2];
+            placement_iterations += 1;
+        }
+        apply(&scratch, &u);
+
+        // Adopt the placed positions, preserving each entity's own
+        // fixed mask and derived metadata from the live state.
+        for (entity, _, _) in &base {
+            let placed = scratch.entity_state.get(entity).ok_or(())?;
+            let (px, py) = (placed.value().parameters[0], placed.value().parameters[1]);
+            drop(placed);
+            let Some(mut live) = self.entity_state.get_mut(entity) else {
+                return Err(());
+            };
+            if live.parameters.len() < 2 {
+                return Err(());
+            }
+            live.parameters[0] = px;
+            live.parameters[1] = py;
+        }
+
+        Ok(StepRun {
+            iterations: internal_iterations.max(placement_iterations),
+            params: params.max(3),
+        })
+    }
+
+    /// Unweighted L2 norm over the residuals of every HARD
+    /// (Required/High) numerically-enforced constraint — the plan
+    /// verification quantity.
+    fn hard_enforced_residual_norm(&self) -> f64 {
+        self.constraints
+            .iter()
+            .filter(|c| {
+                super::dr_plan::is_hard_priority(c.priority)
+                    && c.constraint_type.is_numerically_enforced()
+            })
+            .flat_map(|c| self.evaluate_constraint_error(c))
+            .map(|e| e * e)
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// Legitimate hard-residual displacement allowance from soft
+    /// (Medium/Low) rows: Σ w²·‖r_soft‖ over enforced soft
+    /// constraints, evaluated at the current state. See `run_plan`.
+    fn soft_pull_allowance(&self) -> f64 {
+        self.constraints
+            .iter()
+            .filter(|c| {
+                !super::dr_plan::is_hard_priority(c.priority)
+                    && c.constraint_type.is_numerically_enforced()
+            })
+            .map(|c| {
+                let w = priority_weight(c.priority);
+                let errors = self.evaluate_constraint_error(c);
+                w * w * errors.iter().map(|e| e * e).sum::<f64>().sqrt()
+            })
+            .sum()
     }
 
     /// Build the connected components of the current constraint graph.
@@ -2676,6 +3299,40 @@ fn priority_weight(p: ConstraintPriority) -> f64 {
 }
 
 impl EntityState {
+    /// Number of free (non-fixed) parameters.
+    fn free_param_count(&self) -> usize {
+        self.fixed_mask.iter().filter(|&&fixed| !fixed).count()
+    }
+
+    /// Clone with every parameter frozen — placed geometry inside a
+    /// DR-plan step solver (SKETCH-DCM #45 Slice 3): the step can read
+    /// it through the residual accessors but Newton sees zero columns
+    /// from it.
+    fn frozen(&self) -> Self {
+        let mut clone = self.clone();
+        clone.fixed_mask = vec![true; clone.fixed_mask.len()];
+        clone
+    }
+
+    /// Entities this state structurally shares variables with
+    /// (the Slice-1 shared-variable model): a derived segment's or
+    /// endpoint-derived arc's endpoints, a shared center's point.
+    fn derived_refs(&self) -> Vec<EntityRef> {
+        let mut refs = Vec::new();
+        if let Some((start, end)) = self.derived_segment {
+            refs.push(start);
+            refs.push(end);
+        }
+        if let Some((start, end)) = self.derived_arc_endpoints {
+            refs.push(start);
+            refs.push(end);
+        }
+        if let Some(center) = self.derived_center {
+            refs.push(center);
+        }
+        refs
+    }
+
     /// Create state for a point
     pub fn point(pos: Point2d, fixed: bool) -> Self {
         Self {
