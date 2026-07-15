@@ -8033,31 +8033,29 @@ fn planar_face_hole_polygons(
 /// their own containment handling downstream, and a curve merely CROSSING a
 /// hole keeps samples outside it, so it is retained and left to the DCEL
 /// arrangement — same conservative criterion as the cut-level filter.
-// LIMITATION (#32 same-domain-unify): a cutter rim that CROSSES the
-// ring/disk seam of a fragmented coplanar face is NOT filtered here —
-// neither face's hole wholly contains the curve, so BOTH bottom-face
-// pairs emit the full circle and the cutter receives duplicate coincident
-// cuts (same 3-face-fan corruption class, silent). Phase-B curve dedup
-// (`curves_geometrically_coincident`) removes the DUPLICATE z=0 rim so the
-// Euler characteristic is restored (χ=0), but a residual survives that this
-// PAIR-level filter cannot reach: the straddling bore leaves the ring face's
-// arrangement with an in-hole phantom fragment whose r15 SEAM arcs are
-// simultaneously the ring's inner-loop boundary, a standalone phantom face,
-// AND the coincident-disk fragment's boundary (edge multiplicity ≥3 →
-// non-manifold; offset 10 → bnd=302 nm=248, offset 12 → bnd=302 nm=198).
-// Two bounded DIFFERENCE-side fixes were gate-proven NON-VIABLE on 2026-07-15
-// (Slice-2 diagnosis): (a) extending the post-split planar clip-to-face to
-// drop cut arcs inside a pre-existing hole regressed bnd 302→758, euler 0→−1;
-// (b) dropping the ring's in-hole phantom FRAGMENT by its interior point
-// regressed bnd 302→1404 — the seam arcs the phantom carries are load-bearing
-// for the ring's own hole, so the drop opens the shell. The residual is
-// STRUCTURAL: the overlapping-boss UNION fragments the coincident-coplanar
-// bottom into ring + spurious r15 disk, and a seam-straddling bore cannot be
-// cut cleanly at the fragment level. The real fix is UNION-side coincident-
-// coplanar-cap merge (same-domain-unify, spec §5 Slice 0b), NOT a difference-
-// side clip. Resolving coincident coplanar fragments as one domain is the #32
-// campaign's charter; the `f7_straddling_offset_{10,12}_is_sound` pins stay
-// `#[ignore]`d until it lands.
+// RESOLVED (#32 same-domain-unify, 2026-07-15): the z=0 ring/disk seam this
+// pair-level filter could not reach is now removed AT THE SOURCE by the union
+// coincident-coplanar cap MERGE (`coincident_coplanar_cap_merge`, in
+// `merge_same_origin_fragments`): the overlapping-boss union no longer fragments
+// the coincident-coplanar z=0 bottom into ring + coincident r15 disk — it emits
+// ONE seamless 60×60 bottom, so there is no z=0 seam for a later cutter rim to
+// straddle (pinned by `tests/boolean_straddling_rim.rs::
+// f7_union_bottom_is_one_seamless_face`).
+//
+// LIMITATION (still open, but DIFFERENT ROOT than previously recorded): the
+// `f7_straddling_offset_{10,12}_is_sound` pins stay `#[ignore]`d. Their residual
+// was mis-attributed to this z=0 seam; live evidence refutes that — the
+// difference residual is BYTE-IDENTICAL before and after the cap merge (offset
+// 10: bnd=302 nm=248 euler=0; offset 12: bnd=302 nm=198), and a z-histogram of
+// the 302 boundary segments (`f7_leak_zhistogram_offset_10`) places ALL of them
+// at z≈20 (the boss TOP) + z≈15, NONE at z=0. The true residual is the bore rim
+// straddling the boss's OWN REAL boundaries — its r15 top-cap exit at z=20 (the
+// +x arc past r15 is above void, no material to close) and the plate-top annulus
+// (r15 boss-emergence hole) at z=10 (self-overlapping inner loops = the nm
+// class). Those are genuine feature boundaries, not spurious coplanar fragments,
+// so the remedy is a DIFFERENCE-side z-dependent cutter-wall material-extent
+// arc-clip (32c report §"Precise gap"), NOT a further union merge or this
+// pair-level hole filter.
 /// Geometric-coincidence test for two intersection curves (#32 Phase B
 /// straddling-rim dedup).
 ///
@@ -13914,6 +13912,35 @@ fn merge_same_origin_fragments(
                             if uv_polygon_strictly_contains(outer_poly, inner_poly)
                                 && !inner_in_outer_hole(outer_idx, inner_poly)
                             {
+                                // #32 same-domain-unify: coincident-coplanar cap
+                                // MERGE. When the contained inner fragment tiles
+                                // the outer's cut region and BOTH present the
+                                // SAME union boundary (void on one side of their
+                                // shared plane, union material on the other),
+                                // they are ONE face and the seam between them is
+                                // spurious (the overlapping-boss union's z=0
+                                // bottom = ring `square−r` + coincident r-disk).
+                                // Absorb the inner and add NO hole loop so the
+                                // seam edges vanish from the result shell,
+                                // instead of retaining a hole+island pair whose
+                                // seam arcs a later straddling cut cannot resolve
+                                // (edge multiplicity ≥3). The both-kept hole+
+                                // island path below stays for the genuine-island
+                                // case (inner internal / opposite facing), which
+                                // fails the same-domain signature and is left for
+                                // `cull_internal_coincident_faces`.
+                                if coincident_coplanar_cap_merge(
+                                    model,
+                                    operation,
+                                    &faces[outer_idx],
+                                    &faces[inner_idx],
+                                    solid_a,
+                                    solid_b,
+                                    tolerance,
+                                ) {
+                                    absorbed.insert(inner_idx);
+                                    continue;
+                                }
                                 let reversed: Vec<(EdgeId, bool)> = faces[inner_idx]
                                     .boundary_edges
                                     .iter()
@@ -13998,6 +14025,98 @@ fn keep_under_operation(
             FaceClassification::OnBoundary => false,
         },
     }
+}
+
+/// #32 same-domain-unify: decide whether a contained inner fragment and its
+/// containing outer fragment (both KEPT under `Union`, both fragments of the
+/// SAME planar source face) are in fact ONE face of the union whose shared
+/// seam is spurious — so the caller ABSORBS the inner and adds NO hole loop,
+/// dropping the seam edges from the result shell.
+///
+/// The canonical input is the overlapping-boss union's z=0 bottom: the plate's
+/// bottom square is imprinted by the coincident r15 boss-base circle and split
+/// into a ring (`square − r15`, kept `Outside`) plus a coincident r15 disk
+/// (kept `OnBoundary` from A). The true union bottom is ONE 60×60 face; the
+/// r15 seam is interior to it. Keeping the ring's hole + the disk island (the
+/// both-kept default) leaves the seam arcs shared by the ring inner loop, the
+/// disk boundary AND — after a straddling through-bore — an in-hole phantom,
+/// i.e. edge multiplicity ≥3 → non-manifold (`f7_straddling_offset_*`).
+///
+/// Gate (all geometry-derived, orientation-agnostic; no winding read):
+///  * `operation == Union` — scoped to the union path; intersection/difference
+///    coincident handling is unchanged.
+///  * both fragments carry the SAME **planar** surface (guaranteed by the
+///    `(original_face, from_solid)` grouping) — the plane normal is constant,
+///    so each fragment's ±ε probes step along the same direction and the two
+///    signatures are directly comparable.
+///  * each fragment is a CLEAN union boundary: exactly ONE of the two ε-probe
+///    sides (`interior_point ± ε·n`) is union material (inside A **or** inside
+///    B) and the other is void. A fragment with material on both sides is
+///    internal (the flush-cap-on-top island) and is NOT merged — it fails this
+///    test and falls to the hole+island path / `cull_internal_coincident_faces`.
+///  * the two `(plus, minus)` material signatures are EQUAL — both boundaries
+///    face the same way, so their common seam is interior to a single face.
+///
+/// FULLY-TILED ONLY. Containment (`uv_polygon_strictly_contains`, caller) plus
+/// the equal clean-boundary signature restrict this to the coincident-EQUAL
+/// concentric tile (ring + coincident disk). A partial coplanar overlap either
+/// fails containment or yields a mismatched/unclean signature and is left
+/// un-merged. LIMITATION (#32): partial coplanar overlaps and curved coincident
+/// caps are not welded here — only the planar fully-tiled same-domain case.
+fn coincident_coplanar_cap_merge(
+    model: &BRepModel,
+    operation: BooleanOp,
+    outer: &SplitFace,
+    inner: &SplitFace,
+    solid_a: SolidId,
+    solid_b: SolidId,
+    tolerance: &Tolerance,
+) -> bool {
+    if operation != BooleanOp::Union {
+        return false;
+    }
+    // Planar only: the cap-merge is defined for coplanar fragments. Both
+    // fragments share the source face's surface, so testing the outer's
+    // surface suffices.
+    let Some(surface) = model.surfaces.get(outer.surface) else {
+        return false;
+    };
+    if surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Plane>()
+        .is_none()
+    {
+        return false;
+    }
+
+    // (plus-side material, minus-side material) along the fragment's surface
+    // normal at its interior point. `None` when any geometric query fails —
+    // the conservative outcome (no merge, keep the seam).
+    const EPS: f64 = 1.0e-3;
+    let signature = |frag: &SplitFace| -> Option<(bool, bool)> {
+        let p = get_face_interior_point(model, frag).ok()?;
+        let s = model.surfaces.get(frag.surface)?;
+        let (u, v) = s.closest_point(&p, *tolerance).ok()?;
+        let sp = s.evaluate_full(u, v).ok()?;
+        let n = sp.normal.normalize().ok()?;
+        let material = |signed: f64| -> bool {
+            let q = Point3::new(p.x + n.x * signed, p.y + n.y * signed, p.z + n.z * signed);
+            matches!(
+                classify_point_relative_to_solid(model, q, solid_a, tolerance),
+                Ok(FaceClassification::Inside)
+            ) || matches!(
+                classify_point_relative_to_solid(model, q, solid_b, tolerance),
+                Ok(FaceClassification::Inside)
+            )
+        };
+        Some((material(EPS), material(-EPS)))
+    };
+
+    let (Some(sig_outer), Some(sig_inner)) = (signature(outer), signature(inner)) else {
+        return false;
+    };
+    // Clean boundary (exactly one side material) AND same facing.
+    sig_outer.0 != sig_outer.1 && sig_outer == sig_inner
 }
 
 /// Strict polygon-in-polygon test for the merge pass: every vertex of

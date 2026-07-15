@@ -15,10 +15,17 @@
 //! Run:   `cargo test -p geometry-engine --test boolean_straddling_rim`
 //! Trace: `ROSHERA_BOOL_TRACE=1 cargo test ... -- --ignored --nocapture f7_trace_offset_10`
 //!
-//! DIAGNOSIS-ONLY (no production source touched). The straddling cases are
-//! `#[ignore]` pins asserting the HONEST target (certified sound); they flip
-//! green when #32 Phase B lands. See
-//! `.superpowers/sdd/dogfood-diag-straddling-32.md`.
+//! CORRECTION (2026-07-15, #32 same-domain-unify slice): the union-side
+//! coincident-coplanar cap MERGE landed, so the union no longer produces the
+//! z=0 ring/disk seam described above — it emits ONE seamless 60×60 bottom
+//! (`f7_union_bottom_is_one_seamless_face`, GREEN, pins the production merge).
+//! The straddling `_is_sound` pins stay `#[ignore]`d: their residual is NOT the
+//! z=0 seam (removing it moved bnd/nm by ZERO; the 302 boundary segs sit at
+//! z≈20/z≈15 — the boss TOP exit + lateral scallop — see
+//! `f7_leak_zhistogram_offset_10`), but a DIFFERENCE-side straddle of the boss's
+//! own real boundaries. They flip green when the #32 difference-side cutter-wall
+//! arc-clip lands. See `.superpowers/sdd/dogfood-diag-straddling-32.md` and the
+//! `.superpowers/sdd/dogfood-task-32c-report.md`.
 
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Point3, Vector3};
@@ -124,6 +131,79 @@ fn straddling_bore_result(m: &mut BRepModel, offset: f64) -> SolidId {
     diff(m, u, bore)
 }
 
+// ───────────── structural RED/GREEN: seamless coincident-coplanar bottom ───────
+//
+// The overlapping-boss union's z=0 bottom is ONE 60×60 face. Before the #32
+// same-domain-unify coincident-coplanar cap merge, the union fragments it into a
+// ring (`square − r15`, an `Outside` face carrying an r15 inner loop) PLUS a
+// coincident r15 disk (`OnBoundary` from A) — two z=0 −z faces whose shared r15
+// seam arcs are what a later straddling bore cannot cut cleanly. This pins the
+// merged result directly (independent of the difference), so a partial fix that
+// leaves the fragmentation in place cannot pass.
+
+/// Count of the union result's bottom faces (every outer-loop vertex at z≈0) and
+/// the edge ids on the r15 seam (both endpoints at radius 15 on z=0).
+fn bottom_face_and_seam_report(m: &BRepModel, sid: SolidId) -> (usize, Vec<u32>) {
+    let solid = m.solids.get(sid).expect("union solid");
+    let shell = m.shells.get(solid.outer_shell).expect("outer shell");
+    let mut bottom_faces = 0usize;
+    let mut seam_edges: Vec<u32> = Vec::new();
+    let on_seam = |p: [f64; 3]| -> bool {
+        p[2].abs() < 1e-6 && ((p[0] * p[0] + p[1] * p[1]).sqrt() - 15.0).abs() < 1e-4
+    };
+    for &fid in &shell.faces {
+        let face = m.faces.get(fid).expect("face");
+        let lp = m.loops.get(face.outer_loop).expect("outer loop");
+        let mut all_z0 = !lp.edges.is_empty();
+        for &eid in &lp.edges {
+            let e = m.edges.get(eid).expect("edge");
+            let sp = m.vertices.get_position(e.start_vertex).expect("sv");
+            let ep = m.vertices.get_position(e.end_vertex).expect("ev");
+            if sp[2].abs() >= 1e-6 || ep[2].abs() >= 1e-6 {
+                all_z0 = false;
+                break;
+            }
+        }
+        if all_z0 {
+            bottom_faces += 1;
+        }
+        // Seam edges anywhere on the face (outer + inner loops).
+        for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+            let l = m.loops.get(lid).expect("loop");
+            for &eid in &l.edges {
+                let e = m.edges.get(eid).expect("edge");
+                let sp = m.vertices.get_position(e.start_vertex).expect("sv");
+                let ep = m.vertices.get_position(e.end_vertex).expect("ev");
+                if on_seam(sp) && on_seam(ep) && !seam_edges.contains(&eid) {
+                    seam_edges.push(eid);
+                }
+            }
+        }
+    }
+    (bottom_faces, seam_edges)
+}
+
+/// #32 RED A (structural): the overlapping-boss union's z=0 bottom is exactly
+/// ONE face and carries NO r15 coplanar seam. Fails before the merge (ring +
+/// disk survive, 16 r15 seam arcs present).
+#[test]
+fn f7_union_bottom_is_one_seamless_face() {
+    let mut m = BRepModel::new();
+    let u = overlapping_boss_union(&mut m);
+    let (bottom_faces, seam_edges) = bottom_face_and_seam_report(&m, u);
+    assert!(
+        seam_edges.is_empty(),
+        "union bottom must carry NO r15 coplanar seam — found {} seam edge(s) {:?} \
+         (ring/disk fragmentation not merged)",
+        seam_edges.len(),
+        seam_edges,
+    );
+    assert_eq!(
+        bottom_faces, 1,
+        "union bottom must be exactly ONE 60x60 face, found {bottom_faces} (ring + disk)"
+    );
+}
+
 // ───────────────────────── green control (D-2 fix holds) ──────────────────────
 
 /// COAXIAL control (offset=0): the bore rim is concentric with the r15 seam, so
@@ -177,50 +257,47 @@ fn f7_coaxial_control_is_sound() {
 // curve 41 (z=20 rim, its +x arc imprints above the plate). They leave the
 // result manifold-broken (nm/bnd > 0) though genus-correct.
 //
-// SLICE-2 UPDATE (2026-07-15, verified on `feat/coincident-weld-slice0`): after
-// the embedded-lateral union split (Slice 1) the CUTTER-WALL extent is already
-// correct — the boss lateral is split at z=10/z=20 and the bore wall's z-bands
-// classify cleanly (the old "z-dependent wall / euler −2" residual is GONE; euler
-// is now 0). Today's residual is bnd=302, nm=248 (offset 10) / nm=198 (offset 12).
-//
-// The residual is STRUCTURAL and difference-side-unfixable. The overlapping-boss
-// UNION fragments the coincident-coplanar z=0 bottom into a ring (`square − r15`)
-// plus a SPURIOUS coincident r15 disk. When the bore rim STRADDLES the r15 seam,
-// the ring's DCEL arrangement walks an in-hole phantom region whose r15 seam arcs
-// are ALSO the ring's inner-loop boundary AND the disk fragment's boundary — one
-// seam arc set referenced by ≥3 faces → non-manifold. Two bounded difference-side
-// fixes were gate-proven NON-VIABLE this slice: (a) extending the post-split
-// planar clip-to-face to also drop cut arcs inside a pre-existing hole regressed
-// bnd 302→758, euler 0→−1; (b) dropping the ring's in-hole phantom fragment by its
-// representative interior point regressed bnd 302→1404 (the seam arcs the phantom
-// carries are load-bearing for the ring's own hole — the drop opens the shell).
-// The real fix is UNION-side coincident-coplanar bottom-cap MERGE (same-domain-
-// unify, spec §5 Slice 0b: emit ONE 60×60 bottom, not ring+disk), after which the
-// bore cuts a single clean face. That is a union-side capability, not a planar/
-// hole arc-clip, so these two pins stay ignored until it lands. See the Slice-2
-// report and `.superpowers/sdd/dogfood-task-32c-report.md`.
+// SLICE-2 UPDATE (2026-07-15): the union-side coincident-coplanar cap MERGE
+// (`coincident_coplanar_cap_merge`, `operations/boolean.rs`) LANDED — the union
+// no longer fragments the coincident-coplanar z=0 bottom into ring + disk; it
+// emits ONE seamless 60×60 bottom (pinned GREEN by
+// `f7_union_bottom_is_one_seamless_face`). But the earlier claim that this z=0
+// seam was the ROOT of the difference's unsoundness is REFUTED by live evidence:
+// the difference residual is BYTE-IDENTICAL before and after the merge
+// (offset 10: bnd=302 nm=248 euler=0; offset 12: bnd=302 nm=198 euler=0). A
+// change that removes the entire z=0 seam yet moves nm/bnd by ZERO cannot be the
+// cause of nm/bnd. A z-histogram of the 302 boundary segments
+// (`f7_leak_zhistogram_offset_10`) localises them at **z≈20 (300 segs, the boss
+// TOP)** + z≈15 (2), with **NONE at z=0**. The real residual is the bore rim
+// STRADDLING the boss's own emergence/exit boundaries: at z=20 the bore exits the
+// r15 boss-top cap (its +x arc past r15 is above void, no material to close
+// against → open); at z=10 the plate-top annulus (r15 boss-emergence hole) is
+// straddled, yielding self-overlapping inner loops (the nm class). Both are
+// REAL feature boundaries of the union — not spurious coincident fragments — so
+// this is a DIFFERENCE-side z-dependent cutter-wall material-extent problem
+// (exactly the `clip_circle_to_planar_face`-can't-do-it boundary the 32c report
+// §"Why it does NOT close" named), NOT anything the union cap-merge can reach.
+// These two pins therefore STAY `#[ignore]`d; the merge is a correct, orthogonal
+// union-side improvement. See the `.superpowers/sdd/dogfood-task-32c-report.md`.
 
 #[test]
-#[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
-            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on \
-            SAME-DOMAIN-UNIFY of the overlapping-boss union's fragmented coplanar \
-            bottom (ring `square−r15` + coincident r15 disk). A through-bore rim \
-            that STRADDLES the r15 seam cannot be cleanly cut at the fragment \
-            level: the r15 seam arcs are shared by the ring's inner loop, the \
-            ring's phantom in-hole fragment AND the disk fragment (edge multiplicity \
-            ≥3 → non-manifold). Two bounded difference-side fixes were gate-proven \
-            NON-VIABLE on 2026-07-15 (post-split arc-clip: bnd 302→758, euler 0→−1; \
-            interior-point fragment-drop: bnd 302→1404 — dropping the phantom \
-            removes seam arcs the ring needs). Root fix = union coincident-coplanar \
-            bottom-cap merge (spec §5 Slice 0b / same-domain-unify), a union-side \
-            capability, NOT a difference-side clip; see the Slice-2 report"]
+#[ignore = "#32 union coincident-coplanar cap merge LANDED (z=0 bottom now one \
+            seamless face, pinned by f7_union_bottom_is_one_seamless_face) but it \
+            is ORTHOGONAL to this pin: the difference residual is byte-identical \
+            pre/post merge (bnd=302 nm=248 euler=0) and a z-histogram \
+            (f7_leak_zhistogram_offset_10) puts all 302 boundary segs at z≈20 (boss \
+            TOP) + z≈15, NONE at z=0. Real root = the bore straddling the boss's \
+            REAL top-cap exit (z=20) and plate-top annulus (z=10) — a \
+            DIFFERENCE-side z-dependent cutter-wall material-extent clip, not the \
+            union seam the prior diagnosis blamed. Stays blocked on the #32 \
+            difference-side arc-clip (32c report §Precise gap)"]
 fn f7_straddling_offset_10_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 10.0);
     let (sound, bnd, nm, euler) = metrics(&mut m, r, "f7 straddling offset=10");
     assert!(
         sound,
-        "f7: straddling bore (offset=10) must be sound — #32 Phase C material-extent arc-clip"
+        "f7: straddling bore (offset=10) must be sound — #32 union coincident-coplanar cap merge"
     );
     assert_eq!(nm, 0, "f7 straddling@10: no non-manifold edges");
     assert_eq!(bnd, 0, "f7 straddling@10: watertight");
@@ -228,26 +305,20 @@ fn f7_straddling_offset_10_is_sound() {
 }
 
 #[test]
-#[ignore = "#32 Phase B closes the duplicate-fan class (euler −2→0, pinned by \
-            *_no_duplicate_fans); full soundness (nm=bnd=0) blocked on \
-            SAME-DOMAIN-UNIFY of the overlapping-boss union's fragmented coplanar \
-            bottom (ring `square−r15` + coincident r15 disk). A through-bore rim \
-            that STRADDLES the r15 seam cannot be cleanly cut at the fragment \
-            level: the r15 seam arcs are shared by the ring's inner loop, the \
-            ring's phantom in-hole fragment AND the disk fragment (edge multiplicity \
-            ≥3 → non-manifold). Two bounded difference-side fixes were gate-proven \
-            NON-VIABLE on 2026-07-15 (post-split arc-clip: bnd 302→758, euler 0→−1; \
-            interior-point fragment-drop: bnd 302→1404 — dropping the phantom \
-            removes seam arcs the ring needs). Root fix = union coincident-coplanar \
-            bottom-cap merge (spec §5 Slice 0b / same-domain-unify), a union-side \
-            capability, NOT a difference-side clip; see the Slice-2 report"]
+#[ignore = "#32 union coincident-coplanar cap merge LANDED (z=0 bottom seamless) \
+            but ORTHOGONAL: difference residual byte-identical pre/post merge \
+            (bnd=302 nm=198 euler=0), leak localised at z≈20 (boss TOP) / z≈15, \
+            NONE at z=0. Real root = bore straddling the boss's real top-cap exit \
+            + plate-top annulus — DIFFERENCE-side z-dependent cutter-wall \
+            arc-clip, not the union seam. See f7_leak_zhistogram_offset_10 + \
+            `.superpowers/sdd/dogfood-task-32c-report.md`"]
 fn f7_straddling_offset_12_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 12.0);
     let (sound, bnd, nm, euler) = metrics(&mut m, r, "f7 straddling offset=12");
     assert!(
         sound,
-        "f7: straddling bore (offset=12) must be sound — #32 Phase C material-extent arc-clip"
+        "f7: straddling bore (offset=12) must be sound — #32 union coincident-coplanar cap merge"
     );
     assert_eq!(nm, 0, "f7 straddling@12: no non-manifold edges");
     assert_eq!(bnd, 0, "f7 straddling@12: watertight");
@@ -289,6 +360,24 @@ fn f7_straddling_offset_12_no_duplicate_fans() {
         "f7 straddling@12: #32 Phase B dedup must remove the duplicate-coincident-ring \
          fan (euler −2 → 0); a non-zero euler means the coincident z=0 cut was not culled"
     );
+}
+
+#[test]
+#[ignore = "diagnostic: z-histogram of the difference leak"]
+fn f7_leak_zhistogram_offset_10() {
+    use geometry_engine::harness::watertight::boundary_edge_positions;
+    let mut m = BRepModel::new();
+    let r = straddling_bore_result(&mut m, 10.0);
+    let segs = boundary_edge_positions(&m, r, 0.05, 1.0e-5);
+    let mut buckets: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    for s in &segs {
+        let zmid = ((s[0].z + s[1].z) * 0.5 * 2.0).round() as i64; // 0.5mm buckets
+        *buckets.entry(zmid).or_default() += 1;
+    }
+    eprintln!("total boundary segs={}", segs.len());
+    for (zb, c) in &buckets {
+        eprintln!("  z≈{:.1}  count={}", *zb as f64 / 2.0, c);
+    }
 }
 
 // ───────────────────────── diagnostics (on-demand) ────────────────────────────
