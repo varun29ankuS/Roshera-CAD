@@ -1,0 +1,17 @@
+{
+  "name": "roshera-eval",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AGENT-EVAL-alpha — Roshera CAD's certificate-scored CAD benchmark",
+  "type": "module",
+  "bin": {
+    "roshera-eval": "./run.mjs"
+  },
+  "scripts": {
+    "test": "node run.mjs",
+    "eval": "node run.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
