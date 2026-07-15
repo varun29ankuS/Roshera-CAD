@@ -99,7 +99,12 @@ pub use inference::{
 };
 pub use recognize::{recognize_sketch, Recognition, ShapeClass};
 pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
-pub use sketch_certificate::{certify_sketch, SketchConstrainedness, SketchValidityCertificate};
+pub use sketch_certificate::{
+    certify_sketch, CertificateSummary, CompactWitness, ConflictWitness, ConstraintFact,
+    ConstraintRole, DecompositionStats, DofSnapshot, EntityConstrainment, EntityStatus,
+    SketchConstrainedness, SketchValidityCertificate, SolverVerdict, WitnessConstraint,
+    WitnessKind,
+};
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 pub use snap::{SnapCandidate, SnapKind};
 

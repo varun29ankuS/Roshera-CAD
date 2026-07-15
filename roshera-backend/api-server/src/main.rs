@@ -8075,6 +8075,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(csketch::list_constraints),
         )
         .route("/api/csketch/{id}/solve", post(csketch::solve))
+        .route("/api/csketch/{id}/certify", post(csketch::certify))
         .route("/api/csketch/{id}/drag", post(csketch::drag))
         .route("/api/csketch/{id}/dof", get(csketch::dof))
         .route("/api/csketch/{id}/snap", post(csketch::snap))

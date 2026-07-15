@@ -598,6 +598,195 @@ impl Discovery<'_> {
     }
 }
 
+/// Per-entity structural constrainment fact (SKETCH-DCM #45 Slice 4).
+///
+/// Derived by [`analyze_constrainment`] — the certificate's
+/// per-entity D-Cubed-style verdict source. `placed` means the
+/// discovery loop constructed the entity rigidly from the sketch
+/// datum (the "fully defined" green state); `free_dofs` is the
+/// entity's residual structural freedom under the greedy attribution
+/// documented on [`analyze_constrainment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityConstrainmentFact {
+    /// The solver entity.
+    pub entity: EntityRef,
+    /// True when the discovery loop placed the entity (its position is
+    /// rigidly determined relative to the sketch datum), or when the
+    /// entity owns no free parameters at all (fixed points,
+    /// parameter-less derived entities — the caller refines derived
+    /// entities against their parents).
+    pub placed: bool,
+    /// Residual structural freedom attributed to this entity. 0 for
+    /// placed entities. An unplaced entity can legitimately report 0
+    /// (e.g. a radius-dimensioned arc whose endpoints are loose: its
+    /// private DOF is consumed but it still moves with its parents).
+    pub free_dofs: usize,
+    /// When the entity was placed by a `PlaceCluster` step, the
+    /// 0-based index of that cluster among the plan's cluster steps —
+    /// the certificate's cluster-localisation label. `None` for
+    /// sequential extensions and unplaced entities.
+    pub cluster: Option<usize>,
+    /// Constraint DOF the greedy attribution could not absorb into
+    /// this entity's freedom (its constraints remove more DOF than it
+    /// has) — a structural over-constrainment signal, localised.
+    pub overconsumed_dofs: usize,
+}
+
+/// Output of [`analyze_constrainment`].
+#[derive(Debug, Clone)]
+pub struct ConstrainmentAnalysis {
+    /// One fact per component entity, ascending by `EntityRef`.
+    pub facts: Vec<EntityConstrainmentFact>,
+    /// True when the discovery loop placed every free entity and
+    /// consumed every hard constraint (the component is exactly
+    /// constructible). NOTE: weaker than [`plan_component`] returning
+    /// `Some` — the planner additionally refuses unenforced
+    /// constraints; use `plan_component` for the planned/dense stat.
+    pub complete: bool,
+    /// Number of `PlaceCluster` steps the discovery produced.
+    pub cluster_count: usize,
+}
+
+/// Structural per-entity constrainment analysis (SKETCH-DCM #45
+/// Slice 4) — the same bottom-up discovery loop as [`plan_component`],
+/// run WITHOUT the planner's whole-or-nothing refusals, followed by a
+/// deterministic greedy attribution of the residual freedom:
+///
+/// 1. **Discovery** places every entity that is rigidly constructible
+///    from the datum (sequential extension + Fudos-Hoffmann clusters).
+///    Placed entities are fully constrained; entities placed by a
+///    cluster step carry that cluster's index.
+/// 2. **Greedy attribution** walks the remaining free entities in
+///    ascending `EntityRef` order, virtually placing each one: the
+///    unconsumed hard constraints between the entity and everything
+///    (virtually) placed are charged against its own free parameters.
+///    What survives is the entity's reported residual freedom; charge
+///    beyond its freedom is reported as `overconsumed_dofs`.
+///
+/// The attribution is exact whenever each loose entity's constraints
+/// are unambiguous (constraints to placed geometry or the frame). For
+/// constraints BETWEEN two loose entities the shared DOF is charged to
+/// the later entity in the walk — the same documented order-dependence
+/// as the solver's redundancy diagnosis (a relative constraint on a
+/// floating pair has no unique per-entity owner: the 3 DOF of a free
+/// rigid pair are a property of the pair). The per-entity sum always
+/// equals the component's residual DOF count, so the certificate's
+/// per-entity split and its component DOF verdict can never disagree.
+pub fn analyze_constrainment(
+    entities: &[PlanEntity],
+    constraints: &[PlanConstraint],
+) -> ConstrainmentAnalysis {
+    let mut free: BTreeMap<EntityRef, usize> = BTreeMap::new();
+    let mut cluster_capable: BTreeSet<EntityRef> = BTreeSet::new();
+    for e in entities {
+        if e.free_dofs > 0 {
+            free.insert(e.entity, e.free_dofs);
+            if e.cluster_capable {
+                cluster_capable.insert(e.entity);
+            }
+        }
+    }
+
+    let mut discovery = Discovery {
+        constraints,
+        free: free.clone(),
+        cluster_capable,
+        placed: BTreeSet::new(),
+        consumed: vec![false; constraints.len()],
+        steps: Vec::new(),
+    };
+    loop {
+        if discovery.try_extend() {
+            continue;
+        }
+        if discovery.try_place_cluster() {
+            continue;
+        }
+        break;
+    }
+
+    // Cluster labels: k-th PlaceCluster step (in plan order) → k.
+    let mut cluster_of: BTreeMap<EntityRef, usize> = BTreeMap::new();
+    let mut cluster_count = 0usize;
+    for step in &discovery.steps {
+        if let PlanStep::PlaceCluster { entities, .. } = step {
+            for e in entities {
+                cluster_of.insert(*e, cluster_count);
+            }
+            cluster_count += 1;
+        }
+    }
+
+    let complete = discovery.placed.len() == discovery.free.len()
+        && constraints
+            .iter()
+            .enumerate()
+            .all(|(i, c)| !c.hard || discovery.consumed[i]);
+
+    // Greedy attribution over the unplaced free entities, ascending.
+    let mut consumed = discovery.consumed;
+    let mut virtually_placed = discovery.placed.clone();
+    let mut facts = Vec::with_capacity(entities.len());
+    let mut sorted_entities: Vec<&PlanEntity> = entities.iter().collect();
+    sorted_entities.sort_by_key(|e| e.entity);
+    for e in sorted_entities {
+        if e.free_dofs == 0 {
+            // Fixed / parameter-less entities: structurally pinned at
+            // this layer; the caller refines derived entities against
+            // their parent facts.
+            facts.push(EntityConstrainmentFact {
+                entity: e.entity,
+                placed: true,
+                free_dofs: 0,
+                cluster: None,
+                overconsumed_dofs: 0,
+            });
+            continue;
+        }
+        if discovery.placed.contains(&e.entity) {
+            facts.push(EntityConstrainmentFact {
+                entity: e.entity,
+                placed: true,
+                free_dofs: 0,
+                cluster: cluster_of.get(&e.entity).copied(),
+                overconsumed_dofs: 0,
+            });
+            continue;
+        }
+        let mut scope = virtually_placed.clone();
+        scope.insert(e.entity);
+        let mut charged = 0usize;
+        for (i, c) in constraints.iter().enumerate() {
+            if consumed[i] || !c.hard || c.vars.is_empty() {
+                continue;
+            }
+            if !c.vars.contains(&e.entity) {
+                continue;
+            }
+            if !c.vars.iter().all(|v| scope.contains(v)) {
+                continue;
+            }
+            consumed[i] = true;
+            charged += c.dof_removed;
+        }
+        let absorbed = charged.min(e.free_dofs);
+        facts.push(EntityConstrainmentFact {
+            entity: e.entity,
+            placed: false,
+            free_dofs: e.free_dofs - absorbed,
+            cluster: None,
+            overconsumed_dofs: charged - absorbed,
+        });
+        virtually_placed.insert(e.entity);
+    }
+
+    ConstrainmentAnalysis {
+        facts,
+        complete,
+        cluster_count,
+    }
+}
+
 /// Attach every soft (non-hard) constraint to the earliest step at
 /// which all of its variables are placed — it then participates in
 /// that step's weighted least-squares solve, mirroring the dense
@@ -982,6 +1171,72 @@ mod tests {
         let forward = plan_component(&[point(p0), point(p1), point(p2)], &cs).expect("plan");
         let backward = plan_component(&[point(p2), point(p1), point(p0)], &cs).expect("plan");
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn constrainment_analysis_splits_placed_and_loose_entities() {
+        // p0 anchored (placed); p1 held by one Distance to p0 (1 of
+        // its 2 DOF consumed); p2 untouched (2 free).
+        let (p0, p1, p2) = (p(), p(), p());
+        let entities = [point(p0), point(p1), point(p2)];
+        let mut cs = anchor(0, p0).to_vec();
+        cs.push(hard(2, 1, false, vec![p0, p1]));
+
+        let analysis = analyze_constrainment(&entities, &cs);
+        assert!(!analysis.complete);
+        assert_eq!(analysis.cluster_count, 0);
+        let fact_of = |e: EntityRef| {
+            *analysis
+                .facts
+                .iter()
+                .find(|f| f.entity == e)
+                .expect("fact present")
+        };
+        assert!(fact_of(p0).placed);
+        assert_eq!(fact_of(p0).free_dofs, 0);
+        assert!(!fact_of(p1).placed);
+        assert_eq!(fact_of(p1).free_dofs, 1, "distance consumed 1 of 2");
+        assert!(!fact_of(p2).placed);
+        assert_eq!(fact_of(p2).free_dofs, 2);
+        assert_eq!(
+            analysis.facts.iter().map(|f| f.free_dofs).sum::<usize>(),
+            3,
+            "attribution must sum to the component residual (6 free − 3 removed)"
+        );
+    }
+
+    #[test]
+    fn constrainment_analysis_reports_overconsumption_localised() {
+        // p1 carries THREE 1-DOF frame constraints (X + Y + Y) against
+        // 2 free parameters. `matching_hard` is whole-or-nothing, so
+        // extension refuses p1 at EVERY discovery order (all three are
+        // simultaneously available — unlike a mixed anchor+distance
+        // trio, whose outcome would depend on entity id order); the
+        // greedy pass then charges all 3 DOF and the surplus must
+        // surface as overconsumed on p1, not vanish.
+        let (p0, p1) = (p(), p());
+        let entities = [point(p0), point(p1)];
+        let mut cs = anchor(0, p0).to_vec();
+        cs.extend(anchor(2, p1));
+        cs.push(hard(4, 1, true, vec![p1]));
+
+        let analysis = analyze_constrainment(&entities, &cs);
+        assert!(!analysis.complete);
+        let p1_fact = analysis
+            .facts
+            .iter()
+            .find(|f| f.entity == p1)
+            .expect("p1 fact");
+        assert!(!p1_fact.placed);
+        assert_eq!(p1_fact.free_dofs, 0);
+        assert_eq!(p1_fact.overconsumed_dofs, 1);
+        // p0's clean anchor is unaffected by p1's surplus.
+        let p0_fact = analysis
+            .facts
+            .iter()
+            .find(|f| f.entity == p0)
+            .expect("p0 fact");
+        assert!(p0_fact.placed);
     }
 
     #[test]

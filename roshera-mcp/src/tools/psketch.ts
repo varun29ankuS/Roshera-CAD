@@ -87,6 +87,48 @@ export function registerPsketchTools(server: McpServer) {
   );
 
   server.tool(
+    "psketch_certify",
+    "FULL certified-sketch verdict (the kernel can't lie about constraint " +
+      "state): solver verdict, per-constraint satisfied/violated with " +
+      "residuals, per-entity constrainment (fully/under/over + free DOFs, " +
+      "cluster-localised), minimal conflict WITNESSES (QuickXplain — names " +
+      "exactly which constraints fight; `minimal:false` = honestly " +
+      "un-minimised), DOF summary, decomposition stats.",
+    { csketch_id: z.string().uuid() },
+    async ({ csketch_id }) => {
+      try {
+        const cert = await api("POST", `/api/csketch/${csketch_id}/certify`, {});
+        return ok(cert);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "psketch_dof",
+    "DOF summary + per-entity constrainment status: which entities are " +
+      "fully constrained, which still move (and by how many DOFs), which " +
+      "are over-constrained and via which constraint ids. Read this before " +
+      "extruding — 'solved' is not 'fully defined'.",
+    { csketch_id: z.string().uuid() },
+    async ({ csketch_id }) => {
+      try {
+        const cert = await api("POST", `/api/csketch/${csketch_id}/certify`, {});
+        return ok({
+          constrainedness: cert.constrainedness,
+          dof: cert.dof,
+          entity_statuses: cert.entity_statuses,
+          decomposition: cert.decomposition,
+          witnesses: cert.witnesses,
+        });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "psketch_extrude",
     "Extrude the parametric sketch's closed regions into a solid. Hole-aware " +
       "(circles inside an outline become bores). On topology errors the " +

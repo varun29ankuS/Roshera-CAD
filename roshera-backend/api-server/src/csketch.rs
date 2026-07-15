@@ -48,10 +48,11 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::sketch2d::{
-    infer_constraints, Constraint, ConstraintId, ConstraintType, DimensionalConstraint,
-    DimensionalUpdateError, DofReport, DraftEntity, DragTarget, EntityRef, InferenceTolerance,
-    Point2d, Point2dId, ProposedConstraint, Sketch, SketchAnchor, SketchId, SketchSolveError,
-    SketchSolveReport, SnapCandidate, SolveOptions, SolverStatus, Spline2d,
+    infer_constraints, CertificateSummary, Constraint, ConstraintId, ConstraintType,
+    DimensionalConstraint, DimensionalUpdateError, DofReport, DraftEntity, DragTarget, EntityRef,
+    InferenceTolerance, Point2d, Point2dId, ProposedConstraint, Sketch, SketchAnchor, SketchId,
+    SketchSolveError, SketchSolveReport, SketchValidityCertificate, SnapCandidate, SolveOptions,
+    SolverStatus, Spline2d,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -952,20 +953,54 @@ pub async fn list_constraints(
     Ok(Json(sketch.all_constraints()))
 }
 
+/// Response body for `POST /api/csketch/{id}/solve` (SKETCH-DCM #45
+/// Slice 4). `#[serde(flatten)]` keeps every pre-existing
+/// `SketchSolveReport` field at the top level — the `certificate`
+/// summary is a purely ADDITIVE field, so existing clients keep
+/// working unchanged.
+#[derive(Debug, Clone, Serialize)]
+pub struct SolveResponse {
+    /// The solver report, flattened to the top level (wire-compatible
+    /// with the pre-Slice-4 response).
+    #[serde(flatten)]
+    pub report: SketchSolveReport,
+    /// Compact certificate digest for the post-solve sketch state.
+    pub certificate: CertificateSummary,
+}
+
 /// `POST /api/csketch/{id}/solve` — run Newton-Raphson over every
-/// constraint. Returns the full `SketchSolveReport`; the entities'
-/// solved positions are written back in place.
+/// constraint. Returns the full `SketchSolveReport` (top-level fields,
+/// unchanged) plus an additive compact certificate summary; the
+/// entities' solved positions are written back in place.
 pub async fn solve(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     body: Option<Json<SolveRequest>>,
-) -> Result<Json<SketchSolveReport>, ApiError> {
+) -> Result<Json<SolveResponse>, ApiError> {
     let sketch = require_sketch(&state, id)?;
     let options = body.and_then(|Json(b)| b.options).unwrap_or_default();
     let report = sketch
         .solve_constraints_with_options(options)
         .map_err(solver_error_to_api)?;
-    Ok(Json(report))
+    let certificate = sketch.certify().compact();
+    Ok(Json(SolveResponse {
+        report,
+        certificate,
+    }))
+}
+
+/// `POST /api/csketch/{id}/certify` — the full certified-sketch
+/// verdict (SKETCH-DCM #45 Slice 4, spec §3.2): solver verdict,
+/// per-constraint satisfied/violated facts with residuals, per-entity
+/// constrainment statuses, QuickXplain conflict witnesses, DOF
+/// summary, and decomposition stats. Read-only — certification runs
+/// on an isolated diagnostic solver and never mutates the sketch.
+pub async fn certify(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SketchValidityCertificate>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    Ok(Json(sketch.certify()))
 }
 
 /// `POST /api/csketch/{id}/drag` — pull a single entity toward a
@@ -1491,9 +1526,18 @@ pub async fn extrude_csketch(
         [0.0, 0.0, 0.0],
     );
 
+    // Additive certificate digest (SKETCH-DCM #45 Slice 4): the
+    // certified state of the SKETCH that produced this solid, so an
+    // agent can see under/over-constrainment without a second call.
+    // Extrusion does not mutate the sketch, so this is the same
+    // verdict a pre-extrude certify would have returned.
+    let certificate =
+        serde_json::to_value(sketch.certify().compact()).unwrap_or(serde_json::Value::Null);
+
     Ok(Json(serde_json::json!({
         "success":    true,
         "csketch_id": id.to_string(),
+        "certificate": certificate,
         "solid_id":   result_solid_id,
         "object": {
             "id":   result_id_str,
@@ -2297,6 +2341,133 @@ mod tests {
 
         let cands = sketch.find_snap_candidates(Point2d::new(0.0, 0.0), 1.0);
         assert_eq!(cands.len(), 1);
+    }
+
+    // ── Slice 4: certificate surface ────────────────────────────────
+
+    /// The solve response must carry the compact certificate as an
+    /// ADDITIVE field while every pre-Slice-4 `SketchSolveReport`
+    /// field stays at the top level (the `#[serde(flatten)]`
+    /// non-breaking contract). Mirrors the exact construction the
+    /// `/solve` handler performs.
+    #[test]
+    fn solve_response_embeds_certificate_summary_additively() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("get");
+        let p0 = sketch.add_point(Point2d::new(0.0, 0.0));
+        sketch.points().get_mut(&p0).expect("p0").value_mut().fix();
+        let p1 = sketch.add_point(Point2d::new(9.0, 0.5));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(10.0),
+            vec![EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+
+        let report = sketch
+            .solve_constraints_with_options(SolveOptions::default())
+            .expect("solve");
+        let certificate = sketch.certify().compact();
+        let response = SolveResponse {
+            report,
+            certificate,
+        };
+        let body = serde_json::to_value(&response).expect("serialise");
+
+        // Legacy report fields stay top-level (non-breaking).
+        for key in [
+            "status",
+            "violations",
+            "solve_time_ms",
+            "entities_solved",
+            "constraints_solved",
+            "entities_skipped",
+        ] {
+            assert!(
+                body.get(key).is_some(),
+                "legacy report field `{key}` must stay top-level: {body}"
+            );
+        }
+        assert!(
+            body.get("report").is_none(),
+            "flatten must not nest the report"
+        );
+        // The additive certificate digest.
+        let cert = body
+            .get("certificate")
+            .expect("certificate summary must be embedded");
+        assert_eq!(cert["sound"], serde_json::json!(true));
+        assert_eq!(
+            cert["constrainedness"],
+            serde_json::json!("FullyConstrained")
+        );
+        assert!(cert.get("witnesses").is_some());
+        assert!(cert.get("fully_constrained_entities").is_some());
+    }
+
+    /// The `/certify` handler flow (`require_sketch` +
+    /// `Sketch::certify`) must produce the full v2 certificate — with
+    /// a QuickXplain witness naming exactly a planted contradictory
+    /// Distance pair — and must not mutate the sketch.
+    #[test]
+    fn certify_flow_produces_witnessed_certificate() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("get");
+        let p0 = sketch.add_point(Point2d::new(0.0, 0.0));
+        sketch.points().get_mut(&p0).expect("p0").value_mut().fix();
+        let p1 = sketch.add_point(Point2d::new(7.0, 0.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+        let d5 = sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(5.0),
+            vec![EntityRef::Point(p0), EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+        let d9 = sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(9.0),
+            vec![EntityRef::Point(p0), EntityRef::Point(p1)],
+            ConstraintPriority::Required,
+        ));
+
+        let before = sketch.get_point(&p1).expect("p1 before");
+        let cert = sketch.certify();
+        let after = sketch.get_point(&p1).expect("p1 after");
+        assert_eq!(
+            (before.x, before.y),
+            (after.x, after.y),
+            "certify must not mutate the sketch"
+        );
+
+        assert!(!cert.is_sound());
+        let witness = cert.witnesses.first().expect("a witness must exist");
+        assert!(witness.minimal, "3-candidate component must minimise");
+        let mut named: Vec<Uuid> = witness.constraints.iter().map(|c| c.id.0).collect();
+        named.sort();
+        let mut expected = vec![d5.0, d9.0];
+        expected.sort();
+        assert_eq!(named, expected, "witness must name exactly the pair");
+
+        // Full wire shape carries every v2 section.
+        let body = serde_json::to_value(&cert).expect("serialise");
+        for key in [
+            "solver",
+            "dof",
+            "decomposition",
+            "constraint_facts",
+            "entity_statuses",
+            "witnesses",
+        ] {
+            assert!(body.get(key).is_some(), "v2 field `{key}` missing: {body}");
+        }
     }
 
     #[test]

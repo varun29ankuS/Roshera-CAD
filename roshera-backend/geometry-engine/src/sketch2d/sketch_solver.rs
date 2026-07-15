@@ -556,6 +556,26 @@ pub fn build_solver(
     Ok(solver)
 }
 
+/// Build an isolated diagnostic solver over the sketch with the GIVEN
+/// constraint set and default tunables (SKETCH-DCM #45 Slice 4).
+///
+/// Infallible sibling of [`build_solver`]: no caller-supplied options
+/// to validate. The certificate uses it twice — once over the full
+/// constraint set (sorted by id, matching [`analyze_dofs`]'s
+/// deterministic-diagnosis convention) and once per QuickXplain oracle
+/// call over a candidate subset. Solving the returned instance never
+/// writes back to the sketch.
+pub(crate) fn build_diagnostic_solver(
+    sketch: &Sketch,
+    mut constraints: Vec<super::constraints::Constraint>,
+) -> ConstraintSolver {
+    let mut solver = ConstraintSolver::new();
+    populate_solver(sketch, &solver);
+    constraints.sort_by_key(|c| c.id.0);
+    solver.set_constraints(constraints);
+    solver
+}
+
 /// Drag a single entity toward a target position while honouring
 /// every other constraint in the sketch.
 ///

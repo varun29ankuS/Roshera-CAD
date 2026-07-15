@@ -134,6 +134,24 @@ pub struct SolveStats {
     pub plan_fallbacks: usize,
 }
 
+/// One connected component's structural constrainment probe
+/// (SKETCH-DCM #45 Slice 4) — see
+/// [`ConstraintSolver::component_probes`].
+#[derive(Debug, Clone)]
+pub(crate) struct ComponentProbe {
+    /// Ids of the constraints owned by this component, in the
+    /// solver's current constraint order. (The component's entities
+    /// are carried per-entity inside `facts`.)
+    pub constraint_ids: Vec<ConstraintId>,
+    /// True when [`super::dr_plan::plan_component`] produces a
+    /// complete DR-plan for the component.
+    pub complete_plan: bool,
+    /// `PlaceCluster` steps the discovery produced.
+    pub cluster_count: usize,
+    /// Per-entity constrainment facts, ascending by entity.
+    pub facts: Vec<super::dr_plan::EntityConstrainmentFact>,
+}
+
 /// Entity position/parameter update
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
@@ -800,6 +818,127 @@ impl ConstraintSolver {
         self.record_run(outcome.iterations, params);
         self.last_stats.dense_components += 1;
         outcome
+    }
+
+    // ── SKETCH-DCM #45 Slice 4: certificate probes ──────────────────
+
+    /// Post-solve residual magnitude per constraint, in the solver's
+    /// current constraint order. Each entry is `‖r_c‖₂` over the
+    /// constraint's residual rows evaluated against the CURRENT entity
+    /// state — call after [`Self::solve`] for solved-state readings.
+    /// The certificate (SKETCH-DCM #45 Slice 4) surfaces these as
+    /// per-constraint satisfied/violated facts and witness residuals;
+    /// unlike the private violation list this does not threshold.
+    pub fn residuals_by_constraint(&self) -> Vec<(ConstraintId, f64)> {
+        self.constraints
+            .iter()
+            .map(|c| {
+                let errors = self.evaluate_constraint_error(c);
+                let mag = errors.iter().map(|e| e * e).sum::<f64>().sqrt();
+                (c.id, mag)
+            })
+            .collect()
+    }
+
+    /// Per-component structural constrainment probe (SKETCH-DCM #45
+    /// Slice 4). For every connected component of the constraint
+    /// graph: its entities, its constraints (by id), whether the
+    /// DR-planner can plan it completely (the certificate's
+    /// planned-vs-dense stat), the number of rigid clusters the
+    /// discovery produced, and the per-entity constrainment facts from
+    /// [`super::dr_plan::analyze_constrainment`] — refined here so a
+    /// parameter-less derived entity (a segment line) is `placed` only
+    /// when every parent it derives from is placed. Deterministic:
+    /// components ascend by smallest entity, facts by entity.
+    pub(crate) fn component_probes(&self) -> Vec<ComponentProbe> {
+        let components = self.split_components();
+        let mut probes = Vec::with_capacity(components.len());
+        for component in &components {
+            let mut sub = ConstraintSolver::new();
+            for entity in &component.entities {
+                if let Some(state) = self.entity_state.get(entity) {
+                    sub.entity_state.insert(*entity, state.value().clone());
+                }
+            }
+            sub.constraints = component
+                .constraint_indices
+                .iter()
+                .filter_map(|&i| self.constraints.get(i).cloned())
+                .collect();
+            let constraint_ids: Vec<ConstraintId> = sub.constraints.iter().map(|c| c.id).collect();
+
+            let (complete_plan, cluster_count, mut facts) = match sub.extract_plan_inputs() {
+                Some((entities, constraints)) => {
+                    let complete =
+                        super::dr_plan::plan_component(&entities, &constraints).is_some();
+                    let analysis = super::dr_plan::analyze_constrainment(&entities, &constraints);
+                    (complete, analysis.cluster_count, analysis.facts)
+                }
+                // Ghost refs (a constraint pointing at an entity with
+                // no solver state): degrade conservatively — nothing
+                // is claimed placed beyond parameter-less entities,
+                // every free entity keeps its full freedom. The dense
+                // solve path degrades the same constraints to zero
+                // residuals, so no stronger claim would be honest.
+                None => {
+                    let mut facts: Vec<super::dr_plan::EntityConstrainmentFact> = component
+                        .entities
+                        .iter()
+                        .filter_map(|entity| {
+                            let state = self.entity_state.get(entity)?;
+                            let free = state.value().free_param_count();
+                            Some(super::dr_plan::EntityConstrainmentFact {
+                                entity: *entity,
+                                placed: free == 0,
+                                free_dofs: free,
+                                cluster: None,
+                                overconsumed_dofs: 0,
+                            })
+                        })
+                        .collect();
+                    facts.sort_by_key(|f| f.entity);
+                    (false, 0, facts)
+                }
+            };
+
+            // Refine parameter-less DERIVED entities: a segment line
+            // owns no parameters, but it is only "placed" when the
+            // points it derives from are placed — otherwise it moves
+            // with them (D-Cubed would paint it blue, not green).
+            let placed_map: HashMap<EntityRef, bool> =
+                facts.iter().map(|f| (f.entity, f.placed)).collect();
+            for fact in facts.iter_mut() {
+                if !fact.placed {
+                    continue;
+                }
+                let Some(state) = self.entity_state.get(&fact.entity) else {
+                    continue;
+                };
+                if state.value().free_param_count() > 0 {
+                    continue;
+                }
+                let refs = state.value().derived_refs();
+                drop(state);
+                // A dangling ref (parent deleted) contributes no
+                // freedom — treat it as placed, matching the entity's
+                // legacy-degraded solver behaviour.
+                let parents_placed = refs
+                    .iter()
+                    .all(|r| placed_map.get(r).copied().unwrap_or(true));
+                if !parents_placed {
+                    fact.placed = false;
+                    // free_dofs stays 0: it owns no private parameters.
+                }
+            }
+
+            probes.push(ComponentProbe {
+                constraint_ids,
+                complete_plan,
+                cluster_count,
+                facts,
+            });
+        }
+        probes
     }
 
     // ── SKETCH-DCM #45 Slice 3: DR-plan execution ───────────────────
