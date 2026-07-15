@@ -370,6 +370,18 @@ pub struct ParametricCircle2d {
     constraint_count: usize,
     /// Construction geometry flag
     pub is_construction: bool,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 1): the point
+    /// entity this circle's CENTER derives from. `Some` for circles
+    /// built via `Sketch::add_circle_centered(center_id, radius)`; the
+    /// solver then carries only `[radius]` as a private parameter
+    /// (1 DOF) and reads the center from the point's live state — the
+    /// circle's position DOFs live in the referenced point, NOT in a
+    /// detached private copy, so two circles referencing the same
+    /// point are concentric BY CONSTRUCTION (no Concentric residual
+    /// needed, no double-counted center DOFs). `None` for circles
+    /// created from raw geometry (legacy private 3-parameter
+    /// behaviour: cx, cy, r).
+    pub center_point: Option<super::point2d::Point2dId>,
 }
 
 impl ParametricCircle2d {
@@ -380,6 +392,7 @@ impl ParametricCircle2d {
             circle,
             constraint_count: 0,
             is_construction: false,
+            center_point: None,
         }
     }
 
@@ -434,6 +447,10 @@ impl SketchEntity2d for ParametricCircle2d {
             circle: self.circle,
             constraint_count: 0,
             is_construction: self.is_construction,
+            // Shared-point links don't copy (same rationale as
+            // `ParametricLine2d::clone_entity`): a standalone clone
+            // owns its geometry.
+            center_point: None,
         })
     }
 }

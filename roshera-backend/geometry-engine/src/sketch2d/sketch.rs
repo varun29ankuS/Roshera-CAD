@@ -369,6 +369,126 @@ impl Sketch {
         Ok(id)
     }
 
+    /// Add an arc whose endpoints are SHARED point entities
+    /// (shared-variable model, SKETCH-DCM #45 Slice 1).
+    ///
+    /// Mirrors [`Sketch::add_line`]: the arc remembers WHICH points
+    /// bound it, not just where they were at creation time. The
+    /// constraint solver treats such an arc as a one-DOF derived
+    /// entity (its only private parameter is the center's signed
+    /// offset from the chord midpoint); the endpoint coordinates live
+    /// in the referenced points, so a line and an arc sharing a
+    /// `Point2dId` are joined BY CONSTRUCTION — no `Coincident`
+    /// residual, no seam drift after solving, no double-counted DOFs.
+    ///
+    /// Initial geometry is built with [`Arc2d::from_endpoints_radius`]
+    /// from the points' current positions; `radius` must be at least
+    /// half the current chord length, and the endpoints must not be
+    /// coincident.
+    pub fn add_arc(
+        &self,
+        start: Point2dId,
+        end: Point2dId,
+        radius: f64,
+        ccw: bool,
+        large_arc: bool,
+    ) -> Sketch2dResult<Arc2dId> {
+        let start_point = self
+            .get_point(&start)
+            .ok_or_else(|| Sketch2dError::EntityNotFound {
+                entity_type: "Point".to_string(),
+                id: start.to_string(),
+            })?;
+        let end_point = self
+            .get_point(&end)
+            .ok_or_else(|| Sketch2dError::EntityNotFound {
+                entity_type: "Point".to_string(),
+                id: end.to_string(),
+            })?;
+
+        let arc = Arc2d::from_endpoints_radius(&start_point, &end_point, radius, ccw, large_arc)?;
+        let mut param_arc = ParametricArc2d::new(arc);
+        param_arc.endpoints = Some((start, end));
+        let id = param_arc.id;
+
+        let (min, max) = param_arc.bounding_box();
+        self.update_spatial_index(EntityRef::Arc(id), min, max);
+
+        self.arcs.insert(id, param_arc);
+
+        Ok(id)
+    }
+
+    /// Add an arc whose CENTER is a SHARED point entity
+    /// (shared-variable model, SKETCH-DCM #45 Slice 1).
+    ///
+    /// The solver carries only `[radius, start_angle, end_angle]` as
+    /// private parameters and reads the center from the point's live
+    /// state — anything else referencing the same point is concentric
+    /// by construction. The arc is created counter-clockwise,
+    /// matching [`Sketch::add_arc_center_angles`].
+    pub fn add_arc_centered(
+        &self,
+        center: Point2dId,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> Sketch2dResult<Arc2dId> {
+        let center_point =
+            self.get_point(&center)
+                .ok_or_else(|| Sketch2dError::EntityNotFound {
+                    entity_type: "Point".to_string(),
+                    id: center.to_string(),
+                })?;
+
+        let arc = Arc2d::new(center_point, radius, start_angle, end_angle, true)?;
+        let mut param_arc = ParametricArc2d::new(arc);
+        param_arc.center_point = Some(center);
+        let id = param_arc.id;
+
+        let (min, max) = param_arc.bounding_box();
+        self.update_spatial_index(EntityRef::Arc(id), min, max);
+
+        self.arcs.insert(id, param_arc);
+
+        Ok(id)
+    }
+
+    /// Endpoint positions of an arc.
+    ///
+    /// For a shared-endpoint arc (built via [`Sketch::add_arc`]) this
+    /// returns the referenced points' live positions — the EXACT
+    /// coordinates any other entity sharing those points sees, bit for
+    /// bit. For legacy arcs it computes the endpoints from the stored
+    /// geometry (`center + r·(cos θ, sin θ)`). Returns `None` if the
+    /// arc does not exist.
+    pub fn arc_endpoint_positions(&self, id: &Arc2dId) -> Option<(Point2d, Point2d)> {
+        let entry = self.arcs.get(id)?;
+        if let Some((start_id, end_id)) = entry.endpoints {
+            if let (Some(s), Some(e)) = (self.get_point(&start_id), self.get_point(&end_id)) {
+                return Some((s, e));
+            }
+        }
+        Some((entry.arc.start_point(), entry.arc.end_point()))
+    }
+
+    /// Center position of a circle.
+    ///
+    /// For a shared-center circle (built via
+    /// [`Sketch::add_circle_centered`]) this returns the referenced
+    /// point's live position — exact, shared. For legacy circles it
+    /// returns the stored geometric center. `None` if the circle does
+    /// not exist.
+    pub fn circle_center_position(&self, id: &Circle2dId) -> Option<Point2d> {
+        let entry = self.circles.get(id)?;
+        if let Some(center_id) = entry.center_point {
+            if let Some(c) = self.get_point(&center_id) {
+                return Some(c);
+            }
+        }
+        Some(entry.circle.center)
+    }
+
     /// Add an arc by center, radius, and angles
     pub fn add_arc_center_angles(
         &self,
@@ -395,6 +515,40 @@ impl Sketch {
     pub fn add_circle(&self, center: Point2d, radius: f64) -> Sketch2dResult<Circle2dId> {
         let circle = Circle2d::new(center, radius)?;
         let param_circle = ParametricCircle2d::new(circle);
+        let id = param_circle.id;
+
+        let (min, max) = param_circle.bounding_box();
+        self.update_spatial_index(EntityRef::Circle(id), min, max);
+
+        self.circles.insert(id, param_circle);
+
+        Ok(id)
+    }
+
+    /// Add a circle whose CENTER is a SHARED point entity
+    /// (shared-variable model, SKETCH-DCM #45 Slice 1).
+    ///
+    /// Mirrors [`Sketch::add_line`]: the circle remembers WHICH point
+    /// is its center, not just where it was at creation time. The
+    /// solver carries only `[radius]` as a private parameter and reads
+    /// the center from the point's live state — two circles built on
+    /// the same point are concentric BY CONSTRUCTION, and dragging the
+    /// point moves every entity centered on it.
+    pub fn add_circle_centered(
+        &self,
+        center: Point2dId,
+        radius: f64,
+    ) -> Sketch2dResult<Circle2dId> {
+        let center_point =
+            self.get_point(&center)
+                .ok_or_else(|| Sketch2dError::EntityNotFound {
+                    entity_type: "Point".to_string(),
+                    id: center.to_string(),
+                })?;
+
+        let circle = Circle2d::new(center_point, radius)?;
+        let mut param_circle = ParametricCircle2d::new(circle);
+        param_circle.center_point = Some(center);
         let id = param_circle.id;
 
         let (min, max) = param_circle.bounding_box();

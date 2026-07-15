@@ -595,6 +595,38 @@ pub struct ParametricArc2d {
     constraint_count: usize,
     /// Construction geometry flag
     pub is_construction: bool,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 1): the point
+    /// entities this arc's endpoints derive from. `Some` for every arc
+    /// built via `Sketch::add_arc(start_id, end_id, …)`; the solver
+    /// then treats the arc as a ONE-DOF derived entity — its single
+    /// private parameter is the signed offset of the center from the
+    /// chord midpoint along the chord's left-hand perpendicular
+    /// (see `EntityState::arc_between` for the full parameterization
+    /// rationale). All positional DOFs live in the referenced points,
+    /// so an arc endpoint IS a line endpoint when they share the same
+    /// `Point2dId` — the join is structural, not residual-mediated,
+    /// and DOF counting cannot double-book the endpoint coordinates.
+    /// `None` for arcs created from raw geometry (three-point /
+    /// center-angles: legacy private 5-parameter behaviour).
+    pub endpoints: Option<(super::point2d::Point2dId, super::point2d::Point2dId)>,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 1): the point
+    /// entity this arc's CENTER derives from. `Some` for arcs built
+    /// via `Sketch::add_arc_centered(center_id, …)`; the solver then
+    /// carries only `[radius, start_angle, end_angle]` as private
+    /// parameters (3 DOF) and reads the center from the point —
+    /// concentric-by-construction with anything else referencing the
+    /// same point. `None` for legacy arcs.
+    ///
+    /// PRECEDENCE: if both `endpoints` and `center_point` are set
+    /// (impossible through the creation API — each constructor sets
+    /// exactly one — but the fields are public), the solver bridge
+    /// honours `endpoints` and ignores `center_point`. Honouring both
+    /// simultaneously would require an implicit equidistance residual
+    /// (|start−center| = |end−center|), i.e. residual-mediated
+    /// internal consistency — exactly the failure mode the
+    /// shared-variable model exists to remove — so it is refused
+    /// rather than faked. See `arc_solver_mode` in `sketch_solver.rs`.
+    pub center_point: Option<super::point2d::Point2dId>,
 }
 
 impl ParametricArc2d {
@@ -605,6 +637,8 @@ impl ParametricArc2d {
             arc,
             constraint_count: 0,
             is_construction: false,
+            endpoints: None,
+            center_point: None,
         }
     }
 
@@ -696,6 +730,12 @@ impl SketchEntity2d for ParametricArc2d {
             arc: self.arc,
             constraint_count: 0,
             is_construction: self.is_construction,
+            // Shared-point links don't copy (same rationale as
+            // `ParametricLine2d::clone_entity`): a clone referencing
+            // the ORIGINAL points would silently couple two lineages.
+            // A standalone clone owns its geometry.
+            endpoints: None,
+            center_point: None,
         })
     }
 }

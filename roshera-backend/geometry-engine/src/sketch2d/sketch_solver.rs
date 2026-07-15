@@ -20,11 +20,17 @@
 //! entities. Polylines pass through unsolved (slice C-5 lifts the
 //! remaining kind).
 //!
-//! For arcs the bridge solves the 5-parameter state
-//! `[center.x, center.y, radius, start_angle, end_angle]`. The `ccw`
-//! orientation bit is preserved across solve cycles in
-//! [`apply_solver_result`] — it is not a continuously-varying
-//! parameter the solver could differentiate over.
+//! For LEGACY arcs (no shared refs) the bridge solves the 5-parameter
+//! state `[center.x, center.y, radius, start_angle, end_angle]`.
+//! Shared-variable arcs and circles (SKETCH-DCM #45 Slice 1) register
+//! as derived entities instead: an endpoint-derived arc owns one
+//! chord-offset parameter (see `EntityState::arc_between`), a
+//! shared-center arc owns `[r, a0, a1]`, and a shared-center circle
+//! owns `[r]` — the referenced points carry the positional DOFs. In
+//! every case the `ccw` orientation bit is preserved across solve
+//! cycles in [`apply_solver_result`] — it is not a
+//! continuously-varying parameter the solver could differentiate
+//! over.
 //!
 //! # Identity preservation
 //!
@@ -384,9 +390,13 @@ pub struct DofReport {
     /// Total degrees of freedom across all analysable entities.
     ///
     /// Points contribute 2 (x, y), 0 if `is_fixed`.
-    /// Lines contribute 4 (px, py, dx, dy).
-    /// Circles contribute 3 (cx, cy, r).
-    /// Arcs contribute 5 (cx, cy, r, start_angle, end_angle).
+    /// Lines contribute 4 (px, py, dx, dy); endpoint-derived
+    /// segments contribute 0 (their geometry IS their points).
+    /// Circles contribute 3 (cx, cy, r); shared-center circles
+    /// contribute 1 (radius only — the center is the point's).
+    /// Arcs contribute 5 (cx, cy, r, start_angle, end_angle);
+    /// endpoint-derived arcs contribute 1 (chord offset) and
+    /// shared-center arcs 3 (r, a0, a1) — SKETCH-DCM #45 Slice 1.
     /// Rectangles contribute 5 (cx, cy, width, height, rotation).
     /// Ellipses contribute 5 (cx, cy, semi_major, semi_minor, rotation).
     /// Splines (B-Spline and NURBS) contribute 2n where n is the
@@ -595,18 +605,43 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
             total_free_dofs += 4;
         }
     }
-    // Circles: 3 DOFs (cx, cy, r). No per-DOF fix flags today.
-    for _entry in sketch.circles().iter() {
+    // Circles: 3 DOFs (cx, cy, r) for an INDEPENDENT circle. A circle
+    // whose center is a shared point (SKETCH-DCM #45 Slice 1,
+    // `center_point = Some(..)` and the point still exists) owns ONE
+    // private DOF — the radius; its center coordinates are counted
+    // once, in the point, above. The classification is shared with
+    // `populate_solver` (`circle_shared_center`) so the structural
+    // count matches the solver's parameter vector exactly.
+    for entry in sketch.circles().iter() {
         entities_analysed += 1;
-        total_free_dofs += 3;
+        total_free_dofs += if circle_shared_center(sketch, entry.value()).is_some() {
+            1
+        } else {
+            3
+        };
     }
-    // Arcs: 5 DOFs (cx, cy, r, start_angle, end_angle). Matches
-    // `ParametricArc2d::degrees_of_freedom` and the solver-side
-    // `EntityState::arc` parameter layout. `ccw` is not a solver
-    // DOF — orientation is a discrete bit.
-    for _entry in sketch.arcs().iter() {
+    // Arcs: 5 DOFs (cx, cy, r, start_angle, end_angle) for an
+    // INDEPENDENT arc. Shared-variable arcs (SKETCH-DCM #45 Slice 1)
+    // contribute only their PRIVATE parameters — the shared points
+    // are counted above:
+    //   - endpoint-derived arc: 1 DOF (center offset along the
+    //     chord's perpendicular bisector; radius/center/angles all
+    //     derive from the two shared points + that offset);
+    //   - shared-center arc: 3 DOF (r, a0, a1).
+    // Counting a shared arc as 5 would double-book its endpoint /
+    // center coordinates and leave every slot profile permanently
+    // "under-constrained" — the same phantom-DOF bug the derived
+    // segment fix above killed for lines. The classification is
+    // `arc_solver_mode`, shared with `populate_solver`, so the count
+    // matches what Newton-Raphson actually iterates. `ccw` is not a
+    // solver DOF — orientation is a discrete bit.
+    for entry in sketch.arcs().iter() {
         entities_analysed += 1;
-        total_free_dofs += 5;
+        total_free_dofs += match arc_solver_mode(sketch, entry.value()) {
+            ArcSolverMode::SharedEndpoints { .. } => 1,
+            ArcSolverMode::SharedCenter { .. } => 3,
+            ArcSolverMode::Legacy => 5,
+        };
     }
     // Rectangles: 5 DOFs (cx, cy, width, height, rotation). Matches
     // the solver-side `EntityState::rectangle` parameter layout
@@ -904,6 +939,85 @@ fn validate_options(options: &SolveOptions) -> Result<(), SketchSolveError> {
     Ok(())
 }
 
+/// How the solver bridge registers an arc (SKETCH-DCM #45 Slice 1).
+///
+/// The classifier is THE single source of truth shared by
+/// [`populate_solver`] (which parameters the solver iterates) and
+/// [`analyze_dofs`] (how many DOFs the arc contributes) — computing
+/// the mode in one place is what keeps the structural DOF count and
+/// the Jacobian's column count in lock-step.
+enum ArcSolverMode {
+    /// Endpoints are shared points: 1 private DOF (the center's
+    /// signed offset along the chord's perpendicular bisector —
+    /// see `EntityState::arc_between`).
+    SharedEndpoints {
+        start: super::Point2dId,
+        end: super::Point2dId,
+        center_offset: f64,
+    },
+    /// Center is a shared point: 3 private DOF (r, a0, a1).
+    SharedCenter { center: super::Point2dId },
+    /// No shared refs (or refs unusable): private 5-parameter arc,
+    /// byte-identical to pre-Slice-1 behaviour.
+    Legacy,
+}
+
+/// Classify an arc's solver registration mode.
+///
+/// Shared endpoints take PRECEDENCE over a shared center (both set is
+/// unreachable through the creation API; honouring both would need an
+/// implicit equidistance residual — refused, see
+/// `ParametricArc2d::center_point`). A shared ref degrades to the
+/// next mode when its point has been deleted, or — for endpoints —
+/// when the chord is degenerate (points coincident within
+/// `STRICT_TOLERANCE`), because the chord-offset parameterization has
+/// no frame there.
+fn arc_solver_mode(sketch: &Sketch, arc: &ParametricArc2d) -> ArcSolverMode {
+    use crate::math::tolerance::STRICT_TOLERANCE;
+
+    if let Some((start_id, end_id)) = arc.endpoints {
+        if let (Some(s), Some(e)) = (sketch.get_point(&start_id), sketch.get_point(&end_id)) {
+            let chord = Vector2d::new(e.x - s.x, e.y - s.y);
+            let chord_len = chord.magnitude();
+            if chord_len >= STRICT_TOLERANCE.distance() {
+                // Project the CURRENT center onto the chord frame to
+                // seed the offset parameter: t = (C − M) · p̂ with
+                // p̂ the chord's left-hand unit perpendicular. The
+                // round-trip (write-back computes C = M + t·p̂) is the
+                // identity for a center already on the bisector, and
+                // snaps a stale center onto it otherwise — the arc
+                // cannot disagree with its shared points.
+                let u = Vector2d::new(chord.x / chord_len, chord.y / chord_len);
+                let perp = Vector2d::new(-u.y, u.x);
+                let mid_x = (s.x + e.x) / 2.0;
+                let mid_y = (s.y + e.y) / 2.0;
+                let center_offset =
+                    (arc.arc.center.x - mid_x) * perp.x + (arc.arc.center.y - mid_y) * perp.y;
+                return ArcSolverMode::SharedEndpoints {
+                    start: start_id,
+                    end: end_id,
+                    center_offset,
+                };
+            }
+        }
+    }
+    if let Some(center_id) = arc.center_point {
+        if sketch.points().contains_key(&center_id) {
+            return ArcSolverMode::SharedCenter { center: center_id };
+        }
+    }
+    ArcSolverMode::Legacy
+}
+
+/// Shared-center ref of a circle, iff the referenced point still
+/// exists. Shared by [`populate_solver`] and [`analyze_dofs`] — same
+/// lock-step rationale as [`arc_solver_mode`].
+fn circle_shared_center(sketch: &Sketch, circle: &ParametricCircle2d) -> Option<super::Point2dId> {
+    circle
+        .center_point
+        .filter(|id| sketch.points().contains_key(id))
+}
+
 /// Register every supported entity with the solver.
 ///
 /// Returns the count of entities registered. Points, lines, circles,
@@ -961,6 +1075,22 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     for entry in sketch.circles().iter() {
         let id = *entry.key();
         let circle: &ParametricCircle2d = entry.value();
+        // SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 1): a circle
+        // that knows its center point registers as a DERIVED entity —
+        // one private DOF (the radius), center read from the point's
+        // live solver state. This is what makes two circles on the
+        // same point concentric BY CONSTRUCTION, and a drag of the
+        // point move every circle centered on it. A circle whose
+        // center point was deleted degrades to the legacy 3-parameter
+        // path.
+        if let Some(center_id) = circle_shared_center(sketch, circle) {
+            solver.add_entity(
+                EntityRef::Circle(id),
+                EntityState::circle_centered(EntityRef::Point(center_id), circle.circle.radius),
+            );
+            registered += 1;
+            continue;
+        }
         solver.add_entity(
             EntityRef::Circle(id),
             EntityState::circle(circle.circle.center, circle.circle.radius, false, false),
@@ -971,25 +1101,59 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     for entry in sketch.arcs().iter() {
         let id = *entry.key();
         let arc: &ParametricArc2d = entry.value();
-        // Arcs have no per-DOF fix flags today — pass `false` for
-        // every group so the solver treats center/radius/angles as
-        // free unless a dimensional or positional constraint pins
-        // them. `ccw` is not a solver parameter (orientation is a
-        // discrete bit, not a continuously-varying scalar); the
-        // bridge preserves it across solve cycles in
+        // SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 1): arcs with
+        // shared refs register as DERIVED entities — see
+        // [`arc_solver_mode`] for the classification and
+        // `EntityState::arc_between` for the chord-offset
+        // parameterization. `ccw` is never a solver parameter
+        // (orientation is a discrete bit, not a continuously-varying
+        // scalar); the bridge preserves it across solve cycles in
         // [`apply_solver_result`].
-        solver.add_entity(
-            EntityRef::Arc(id),
-            EntityState::arc(
-                arc.arc.center,
-                arc.arc.radius,
-                arc.arc.start_angle,
-                arc.arc.end_angle,
-                false,
-                false,
-                false,
-            ),
-        );
+        match arc_solver_mode(sketch, arc) {
+            ArcSolverMode::SharedEndpoints {
+                start,
+                end,
+                center_offset,
+            } => {
+                solver.add_entity(
+                    EntityRef::Arc(id),
+                    EntityState::arc_between(
+                        EntityRef::Point(start),
+                        EntityRef::Point(end),
+                        center_offset,
+                    ),
+                );
+            }
+            ArcSolverMode::SharedCenter { center } => {
+                solver.add_entity(
+                    EntityRef::Arc(id),
+                    EntityState::arc_centered(
+                        EntityRef::Point(center),
+                        arc.arc.radius,
+                        arc.arc.start_angle,
+                        arc.arc.end_angle,
+                    ),
+                );
+            }
+            ArcSolverMode::Legacy => {
+                // Arcs have no per-DOF fix flags today — pass `false`
+                // for every group so the solver treats
+                // center/radius/angles as free unless a dimensional
+                // or positional constraint pins them.
+                solver.add_entity(
+                    EntityRef::Arc(id),
+                    EntityState::arc(
+                        arc.arc.center,
+                        arc.arc.radius,
+                        arc.arc.start_angle,
+                        arc.arc.end_angle,
+                        false,
+                        false,
+                        false,
+                    ),
+                );
+            }
+        }
         registered += 1;
     }
 
@@ -1141,11 +1305,17 @@ fn line_to_point_direction(geometry: &LineGeometry) -> (Point2d, Vector2d) {
 ///
 /// Entity IDs are preserved; only the geometric fields are updated.
 /// For arcs the `ccw` orientation bit is preserved as well — the
-/// solver does not own it. Updates for kinds the bridge did not
-/// register (polyline) cannot appear here
-/// because we never called `add_entity` for them; defensive matches
-/// are still in place to avoid panics if the solver ever starts
-/// returning them.
+/// solver does not own it. Shared-variable circles/arcs (SKETCH-DCM
+/// #45 Slice 1) arrive through the same `EntityUpdate::Circle` /
+/// `EntityUpdate::Arc` arms, but their payloads were COMPUTED from
+/// the shared points' solved state inside the solver
+/// (`get_entity_updates`), so the written-back geometry agrees with
+/// the points by construction — the same single-source-of-truth
+/// contract the derived-segment sync pass below enforces for lines.
+/// Updates for kinds the bridge did not register (polyline) cannot
+/// appear here because we never called `add_entity` for them;
+/// defensive matches are still in place to avoid panics if the
+/// solver ever starts returning them.
 fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
     for (entity_ref, update) in &result.entity_updates {
         match (entity_ref, update) {

@@ -233,6 +233,29 @@ pub struct EntityState {
     /// came apart (lines detached from their points) and DOF counts
     /// were inflated by 4 per line.
     derived_segment: Option<(EntityRef, EntityRef)>,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 1): when
+    /// `Some((start, end))`, this entity is an ARC derived from two
+    /// endpoint point entities. It owns exactly ONE parameter — see
+    /// [`EntityState::arc_between`] for the parameterization and the
+    /// rationale behind it. Every geometric accessor
+    /// (`get_circle_center` / `get_circle_radius` / `get_arc_angles` /
+    /// `get_point_position`) computes from the endpoint points' live
+    /// state plus that parameter, so a `Radius` dimension on the arc
+    /// and a `Distance` on its endpoints differentiate against the
+    /// SAME unknowns — the line coupling above, extended to arcs.
+    derived_arc_endpoints: Option<(EntityRef, EntityRef)>,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 1): when `Some`,
+    /// this circle/arc entity's CENTER is the referenced point
+    /// entity. The center coordinates are NOT in `parameters`
+    /// (circle: `[radius]`; arc: `[radius, start_angle, end_angle]`)
+    /// — they live in the point, once, so entities referencing the
+    /// same point are concentric by construction and the DOF count
+    /// cannot double-book the center. Mutually exclusive with
+    /// [`Self::derived_arc_endpoints`]: the constructor surface only
+    /// offers one at a time (honouring both simultaneously would need
+    /// an implicit equidistance residual — refused rather than faked,
+    /// see the `ParametricArc2d::center_point` doc).
+    derived_center: Option<EntityRef>,
 }
 
 /// Decode the flat `[x0, y0, x1, y1, …]` spline-control-point pack
@@ -253,6 +276,21 @@ fn control_points_from_parameters(parameters: &[f64]) -> Option<Vec<Point2d>> {
         control_points.push(Point2d::new(parameters[base], parameters[base + 1]));
     }
     Some(control_points)
+}
+
+/// Normalize an angle to `[0, 2π)` — the convention `Arc2d` stores
+/// its `start_angle` / `end_angle` in. Used when deriving arc angles
+/// from shared endpoint points (`atan2` returns `(−π, π]`).
+fn normalize_angle_2pi(angle: f64) -> f64 {
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let normalized = angle.rem_euclid(two_pi);
+    // rem_euclid can return exactly 2π for tiny negative inputs due
+    // to rounding; fold it back to 0.
+    if normalized >= two_pi {
+        0.0
+    } else {
+        normalized
+    }
 }
 
 /// Irreducible residual emitted for a constraint the solver recognises
@@ -937,15 +975,30 @@ impl ConstraintSolver {
         }
     }
 
-    /// Get point position from entity state
+    /// Get point position from entity state.
+    ///
+    /// For circles/arcs with a shared center or shared endpoints
+    /// (SKETCH-DCM #45 Slice 1) the "point position" of the entity is
+    /// its DERIVED center — preserving the legacy semantic where the
+    /// leading two parameters (the center) served as the entity's
+    /// point-like position for `Coincident` / `Distance` /
+    /// `XCoordinate` / `YCoordinate`.
     fn get_point_position(&self, entity: &EntityRef) -> Option<Point2d> {
-        self.entity_state.get(entity).map(|state| {
-            if state.parameters.len() >= 2 {
-                Point2d::new(state.parameters[0], state.parameters[1])
-            } else {
-                Point2d::ORIGIN
-            }
-        })
+        let is_derived_center_like = self
+            .entity_state
+            .get(entity)
+            .map(|s| s.derived_center.is_some() || s.derived_arc_endpoints.is_some());
+        match is_derived_center_like {
+            Some(true) => self.get_circle_center(entity),
+            Some(false) => self.entity_state.get(entity).map(|state| {
+                if state.parameters.len() >= 2 {
+                    Point2d::new(state.parameters[0], state.parameters[1])
+                } else {
+                    Point2d::ORIGIN
+                }
+            }),
+            None => None,
+        }
     }
 
     /// Endpoint refs when `entity` is a derived segment line.
@@ -953,6 +1006,54 @@ impl ConstraintSolver {
         self.entity_state
             .get(entity)
             .and_then(|state| state.derived_segment)
+    }
+
+    /// Center point ref when `entity` carries a shared center
+    /// (circle or arc, SKETCH-DCM #45 Slice 1).
+    fn derived_center_of(&self, entity: &EntityRef) -> Option<EntityRef> {
+        self.entity_state
+            .get(entity)
+            .and_then(|state| state.derived_center)
+    }
+
+    /// `(start, end, center_offset)` when `entity` is an
+    /// endpoint-derived arc (SKETCH-DCM #45 Slice 1).
+    fn derived_arc_endpoints_of(&self, entity: &EntityRef) -> Option<(EntityRef, EntityRef, f64)> {
+        self.entity_state.get(entity).and_then(|state| {
+            let (start, end) = state.derived_arc_endpoints?;
+            let t = *state.parameters.first()?;
+            Some((start, end, t))
+        })
+    }
+
+    /// Full derived geometry `(center, radius, start_angle, end_angle)`
+    /// of an endpoint-derived arc, computed from the shared endpoint
+    /// points' live state and the arc's single chord-offset parameter
+    /// (see [`EntityState::arc_between`]).
+    ///
+    /// Returns `None` when the entity is not an endpoint-derived arc,
+    /// an endpoint state is missing, or the chord is degenerate
+    /// (endpoints coincident within `STRICT_TOLERANCE`) — callers
+    /// degrade the affected residual/update rather than emit NaN.
+    fn derived_arc_geometry(&self, entity: &EntityRef) -> Option<(Point2d, f64, f64, f64)> {
+        let (start, end, t) = self.derived_arc_endpoints_of(entity)?;
+        let s = self.get_point_position(&start)?;
+        let e = self.get_point_position(&end)?;
+        let chord = Vector2d::new(e.x - s.x, e.y - s.y);
+        let chord_len = chord.magnitude();
+        if chord_len < STRICT_TOLERANCE.distance() {
+            return None;
+        }
+        let u = Vector2d::new(chord.x / chord_len, chord.y / chord_len);
+        // Left-hand perpendicular of the chord direction.
+        let perp = Vector2d::new(-u.y, u.x);
+        let mid = Point2d::new((s.x + e.x) / 2.0, (s.y + e.y) / 2.0);
+        let center = Point2d::new(mid.x + t * perp.x, mid.y + t * perp.y);
+        let half_chord = chord_len / 2.0;
+        let radius = (t * t + half_chord * half_chord).sqrt();
+        let start_angle = normalize_angle_2pi(f64::atan2(s.y - center.y, s.x - center.x));
+        let end_angle = normalize_angle_2pi(f64::atan2(e.y - center.y, e.x - center.x));
+        Some((center, radius, start_angle, end_angle))
     }
 
     /// Get line direction from entity state
@@ -1035,6 +1136,20 @@ impl ConstraintSolver {
     fn get_circle_radius(&self, entity: &EntityRef) -> Option<f64> {
         match entity {
             EntityRef::Circle(_) | EntityRef::Arc(_) => {
+                // Shared-variable dispatch (SKETCH-DCM #45 Slice 1):
+                // an endpoint-derived arc's radius is a function of
+                // its shared points + chord offset; a shared-center
+                // entity stores the radius as its FIRST parameter
+                // (circle `[r]`, arc `[r, a0, a1]`).
+                if self.derived_arc_endpoints_of(entity).is_some() {
+                    return self.derived_arc_geometry(entity).map(|(_, r, _, _)| r);
+                }
+                if self.derived_center_of(entity).is_some() {
+                    return self
+                        .entity_state
+                        .get(entity)
+                        .and_then(|state| state.parameters.first().copied());
+                }
                 self.entity_state.get(entity).map(|state| {
                     if state.parameters.len() >= 3 {
                         // Parameters: center.x, center.y, radius
@@ -1061,14 +1176,28 @@ impl ConstraintSolver {
             EntityRef::Circle(_)
             | EntityRef::Arc(_)
             | EntityRef::Rectangle(_)
-            | EntityRef::Ellipse(_) => self.entity_state.get(entity).and_then(|state| {
-                if state.parameters.len() >= 2 {
-                    // Parameters: center.x, center.y, ...
-                    Some(Point2d::new(state.parameters[0], state.parameters[1]))
-                } else {
-                    None
+            | EntityRef::Ellipse(_) => {
+                // Shared-variable dispatch (SKETCH-DCM #45 Slice 1):
+                // a shared center IS the referenced point; an
+                // endpoint-derived arc's center is computed from its
+                // shared points + chord offset. Both terminate — the
+                // referenced entity is a Point, which has neither
+                // derived field.
+                if let Some(center_ref) = self.derived_center_of(entity) {
+                    return self.get_point_position(&center_ref);
                 }
-            }),
+                if self.derived_arc_endpoints_of(entity).is_some() {
+                    return self.derived_arc_geometry(entity).map(|(c, _, _, _)| c);
+                }
+                self.entity_state.get(entity).and_then(|state| {
+                    if state.parameters.len() >= 2 {
+                        // Parameters: center.x, center.y, ...
+                        Some(Point2d::new(state.parameters[0], state.parameters[1]))
+                    } else {
+                        None
+                    }
+                })
+            }
             _ => None,
         }
     }
@@ -1466,47 +1595,81 @@ impl ConstraintSolver {
         // bounds.
         let w_at = |k: usize| weights.get(k).copied().unwrap_or(1.0);
 
-        // Compute J^T * W² * J
-        let mut jtj = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            for j in 0..n {
+        // SKETCH-DCM #45 Slice 1 (drag honesty): restrict the normal
+        // equations to the columns actually touched by at least one
+        // residual row. A parameter with an all-zero Jacobian column
+        // is structurally uninvolved in this iteration and its
+        // minimum-norm step is exactly 0 — solving for it adds
+        // nothing but singularity. Previously the FULL n×n system was
+        // assembled, so J^T·J was singular whenever ANY such column
+        // existed, and the trace-scaled Tikhonov λ (trace/n · 1e-8)
+        // could then land below the Gaussian pivot threshold (1e-9) —
+        // e.g. a Low-priority drag (weight 1e-3, squared to 1e-6 in
+        // the trace) in a sketch containing any other unconstrained
+        // entity — making the fallback fail too: the solver reported
+        // `Unstable` and the dragged point never moved. Reducing
+        // first keeps the solved block at its natural scale and
+        // leaves untouched parameters untouched by construction.
+        // (Central differences produce EXACT 0.0 entries for
+        // uninvolved parameters, so the `!= 0.0` test is not a
+        // tolerance judgement.)
+        let involved: Vec<usize> = (0..n)
+            .filter(|&col| jacobian.iter().any(|row| row[col] != 0.0))
+            .collect();
+        if involved.is_empty() {
+            return Ok(vec![0.0; n]);
+        }
+        let nr = involved.len();
+
+        // Compute J^T * W² * J over the involved columns.
+        let mut jtj = vec![vec![0.0; nr]; nr];
+        for (ri, &ci) in involved.iter().enumerate() {
+            for (rj, &cj) in involved.iter().enumerate() {
                 for k in 0..m {
                     let w2 = w_at(k) * w_at(k);
-                    jtj[i][j] += w2 * jacobian[k][i] * jacobian[k][j];
+                    jtj[ri][rj] += w2 * jacobian[k][ci] * jacobian[k][cj];
                 }
             }
         }
 
-        // Compute -J^T * W² * errors
-        let mut jte = vec![0.0; n];
-        for i in 0..n {
+        // Compute -J^T * W² * errors over the involved columns.
+        let mut jte = vec![0.0; nr];
+        for (ri, &ci) in involved.iter().enumerate() {
             for j in 0..m {
                 let w2 = w_at(j) * w_at(j);
-                jte[i] -= w2 * jacobian[j][i] * errors[j];
+                jte[ri] -= w2 * jacobian[j][ci] * errors[j];
             }
         }
 
         // First attempt: plain Gaussian elimination on J^T·J.
         // For well- and over-determined systems this is numerically
         // ideal — λ would only introduce shrinkage bias.
-        if let Ok(x) = self.gaussian_elimination(jtj.clone(), jte.clone()) {
-            return Ok(x);
-        }
-
-        // Fallback: Tikhonov-regularised solve.
-        // λ is scaled by the trace of J^T·J so it adapts to the
-        // problem magnitude — a constant λ would over-regularise
-        // small-residual systems and under-regularise large ones.
-        let trace: f64 = (0..n).map(|i| jtj[i][i]).sum();
-        let lambda = if trace > 0.0 {
-            (trace / n as f64) * 1e-8
+        let reduced = if let Ok(x) = self.gaussian_elimination(jtj.clone(), jte.clone()) {
+            x
         } else {
-            STRICT_TOLERANCE.distance()
+            // Fallback: Tikhonov-regularised solve.
+            // λ is scaled by the trace of J^T·J so it adapts to the
+            // problem magnitude — a constant λ would over-regularise
+            // small-residual systems and under-regularise large ones.
+            let trace: f64 = (0..nr).map(|i| jtj[i][i]).sum();
+            let lambda = if trace > 0.0 {
+                (trace / nr as f64) * 1e-8
+            } else {
+                STRICT_TOLERANCE.distance()
+            };
+            for (i, row) in jtj.iter_mut().enumerate() {
+                row[i] += lambda;
+            }
+            self.gaussian_elimination(jtj, jte)?
         };
-        for i in 0..n {
-            jtj[i][i] += lambda;
+
+        // Scatter back: uninvolved columns take the exact
+        // minimum-norm step of 0.
+        let mut full = vec![0.0; n];
+        for (ri, &ci) in involved.iter().enumerate() {
+            full[ci] = reduced[ri];
         }
-        self.gaussian_elimination(jtj, jte)
+        Ok(full)
     }
 
     /// Gaussian elimination solver
@@ -1584,6 +1747,12 @@ impl ConstraintSolver {
     /// Get entity updates for result
     fn get_entity_updates(&self) -> HashMap<EntityRef, EntityUpdate> {
         let mut updates = HashMap::new();
+        // Circles/arcs with shared refs (SKETCH-DCM #45 Slice 1) need
+        // accessor calls that re-enter the entity map (to read the
+        // shared points). Collect them during the iteration and
+        // compute their updates AFTER the iterator guard is released
+        // — never take a nested shard read while holding it.
+        let mut derived_curves: Vec<EntityRef> = Vec::new();
 
         for entry in self.entity_state.iter() {
             let entity = *entry.key();
@@ -1607,16 +1776,28 @@ impl ConstraintSolver {
                         Vector2d::new(state.parameters[2], state.parameters[3]),
                     )
                 }
-                EntityRef::Circle(_) => EntityUpdate::Circle(
-                    Point2d::new(state.parameters[0], state.parameters[1]),
-                    state.parameters[2],
-                ),
-                EntityRef::Arc(_) => EntityUpdate::Arc(
-                    Point2d::new(state.parameters[0], state.parameters[1]),
-                    state.parameters[2],
-                    state.parameters[3],
-                    state.parameters[4],
-                ),
+                EntityRef::Circle(_) => {
+                    if state.derived_center.is_some() {
+                        derived_curves.push(entity);
+                        continue;
+                    }
+                    EntityUpdate::Circle(
+                        Point2d::new(state.parameters[0], state.parameters[1]),
+                        state.parameters[2],
+                    )
+                }
+                EntityRef::Arc(_) => {
+                    if state.derived_arc_endpoints.is_some() || state.derived_center.is_some() {
+                        derived_curves.push(entity);
+                        continue;
+                    }
+                    EntityUpdate::Arc(
+                        Point2d::new(state.parameters[0], state.parameters[1]),
+                        state.parameters[2],
+                        state.parameters[3],
+                        state.parameters[4],
+                    )
+                }
                 EntityRef::Rectangle(_) => EntityUpdate::Rectangle(
                     Point2d::new(state.parameters[0], state.parameters[1]),
                     state.parameters[2],
@@ -1634,6 +1815,38 @@ impl ConstraintSolver {
                 }
             };
 
+            updates.insert(entity, update);
+        }
+
+        // Shared-ref circles/arcs: geometry derives from the shared
+        // points' SOLVED state (plus the entity's private scalars), so
+        // by construction the written-back geometry cannot disagree
+        // with the points. Missing point state or a degenerate chord
+        // yields no update — the entity keeps its prior geometry
+        // ("preserve identity, never poison the store").
+        for entity in derived_curves {
+            let update = match entity {
+                EntityRef::Circle(_) => {
+                    let (Some(center), Some(radius)) = (
+                        self.get_circle_center(&entity),
+                        self.get_circle_radius(&entity),
+                    ) else {
+                        continue;
+                    };
+                    EntityUpdate::Circle(center, radius)
+                }
+                EntityRef::Arc(_) => {
+                    let (Some(center), Some(radius), Some((start_angle, end_angle))) = (
+                        self.get_circle_center(&entity),
+                        self.get_circle_radius(&entity),
+                        self.get_arc_angles(&entity),
+                    ) else {
+                        continue;
+                    };
+                    EntityUpdate::Arc(center, radius, start_angle, end_angle)
+                }
+                _ => continue,
+            };
             updates.insert(entity, update);
         }
 
@@ -2146,13 +2359,33 @@ impl ConstraintSolver {
     /// `None` if the entity is not an arc or its state is malformed.
     fn get_arc_angles(&self, entity: &EntityRef) -> Option<(f64, f64)> {
         match entity {
-            EntityRef::Arc(_) => self.entity_state.get(entity).and_then(|state| {
-                if state.parameters.len() >= 5 {
-                    Some((state.parameters[3], state.parameters[4]))
-                } else {
-                    None
+            EntityRef::Arc(_) => {
+                // Shared-variable dispatch (SKETCH-DCM #45 Slice 1):
+                // endpoint-derived arcs compute angles from the shared
+                // points; shared-center arcs store them at
+                // `parameters[1..3]` (`[r, a0, a1]` layout).
+                if self.derived_arc_endpoints_of(entity).is_some() {
+                    return self
+                        .derived_arc_geometry(entity)
+                        .map(|(_, _, a0, a1)| (a0, a1));
                 }
-            }),
+                if self.derived_center_of(entity).is_some() {
+                    return self.entity_state.get(entity).and_then(|state| {
+                        if state.parameters.len() >= 3 {
+                            Some((state.parameters[1], state.parameters[2]))
+                        } else {
+                            None
+                        }
+                    });
+                }
+                self.entity_state.get(entity).and_then(|state| {
+                    if state.parameters.len() >= 5 {
+                        Some((state.parameters[3], state.parameters[4]))
+                    } else {
+                        None
+                    }
+                })
+            }
             _ => None,
         }
     }
@@ -2250,6 +2483,8 @@ impl EntityState {
             spline: None,
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2261,6 +2496,8 @@ impl EntityState {
             spline: None,
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2275,6 +2512,105 @@ impl EntityState {
             spline: None,
             polyline: None,
             derived_segment: Some((start, end)),
+            derived_arc_endpoints: None,
+            derived_center: None,
+        }
+    }
+
+    /// Create state for an arc DERIVED from two shared endpoint point
+    /// entities (shared-variable model, SKETCH-DCM #45 Slice 1).
+    ///
+    /// # Parameterization: chord-frame center offset
+    ///
+    /// The single private parameter is `t = (C − M) · p̂`, the SIGNED
+    /// offset of the arc's center `C` from the chord midpoint
+    /// `M = (S + E) / 2` along the chord's left-hand unit
+    /// perpendicular `p̂ = rot90((E − S) / ‖E − S‖)`. Everything else
+    /// derives:
+    ///
+    /// ```text
+    ///     C  = M + t·p̂
+    ///     r  = √(t² + (‖E − S‖ / 2)²)
+    ///     θ₀ = atan2(S − C),  θ₁ = atan2(E − C)
+    /// ```
+    ///
+    /// Why this variant and not the alternatives named in the Slice-1
+    /// spec:
+    ///
+    /// - **(center point, r) with derived endpoint angles** would keep
+    ///   the arc's center/radius as private (or shared-point) state
+    ///   and require the solver to hold `‖S − C‖ = r = ‖E − C‖` as two
+    ///   IMPLICIT residuals. That is residual-mediated internal
+    ///   consistency — the exact failure mode this slice exists to
+    ///   remove — and it forces implicit-constraint bookkeeping into
+    ///   every DOF count. Refused.
+    /// - **(r, bulge)** (bulge = tan(sweep/4)) is also 1-DOF but blows
+    ///   up as the sweep approaches a full turn and degenerates
+    ///   non-smoothly near zero sweep. The chord offset `t` is smooth
+    ///   and total: every center position on the perpendicular
+    ///   bisector — every radius ≥ half-chord, minor and major arcs,
+    ///   both bulge sides — is exactly one finite `t`. Its only
+    ///   singularity is `S = E` (no chord), which is a degenerate arc
+    ///   the creation API already rejects; if solving drives the
+    ///   points transiently coincident the accessors return `None`
+    ///   and the affected residuals degrade to zero for that
+    ///   iteration instead of emitting NaN.
+    ///
+    /// Structural consequence (the point of the slice): the arc
+    /// contributes exactly 1 DOF; its endpoint coordinates are counted
+    /// once, in the shared points; DOF arithmetic is pure counting
+    /// with zero implicit constraints — decomposition-ready.
+    ///
+    /// The `ccw` orientation bit is NOT solver state (discrete, not
+    /// differentiable) — the sketch bridge preserves it across solve
+    /// cycles exactly as for legacy arcs.
+    pub fn arc_between(start: EntityRef, end: EntityRef, center_offset: f64) -> Self {
+        Self {
+            parameters: vec![center_offset],
+            fixed_mask: vec![false],
+            spline: None,
+            polyline: None,
+            derived_segment: None,
+            derived_arc_endpoints: Some((start, end)),
+            derived_center: None,
+        }
+    }
+
+    /// Create state for an arc whose CENTER is a shared point entity
+    /// (shared-variable model, SKETCH-DCM #45 Slice 1).
+    ///
+    /// Parameter layout is `[radius, start_angle, end_angle]` — the
+    /// center's coordinates live in the referenced point entity and
+    /// are read through [`ConstraintSolver::get_circle_center`]'s
+    /// derived dispatch. 3 private DOF + 2 in the point = the arc's
+    /// full 5, counted once.
+    pub fn arc_centered(center: EntityRef, radius: f64, start_angle: f64, end_angle: f64) -> Self {
+        Self {
+            parameters: vec![radius, start_angle, end_angle],
+            fixed_mask: vec![false, false, false],
+            spline: None,
+            polyline: None,
+            derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: Some(center),
+        }
+    }
+
+    /// Create state for a circle whose CENTER is a shared point entity
+    /// (shared-variable model, SKETCH-DCM #45 Slice 1).
+    ///
+    /// Parameter layout is `[radius]` — the center's coordinates live
+    /// in the referenced point entity, once, so circles referencing
+    /// the same point are concentric by construction.
+    pub fn circle_centered(center: EntityRef, radius: f64) -> Self {
+        Self {
+            parameters: vec![radius],
+            fixed_mask: vec![false],
+            spline: None,
+            polyline: None,
+            derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: Some(center),
         }
     }
 
@@ -2286,6 +2622,8 @@ impl EntityState {
             spline: None,
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2328,6 +2666,8 @@ impl EntityState {
             spline: None,
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2371,6 +2711,8 @@ impl EntityState {
             spline: None,
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2423,6 +2765,8 @@ impl EntityState {
             spline: None,
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2477,6 +2821,8 @@ impl EntityState {
             }),
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2520,6 +2866,8 @@ impl EntityState {
             }),
             polyline: None,
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 
@@ -2558,6 +2906,8 @@ impl EntityState {
             spline: None,
             polyline: Some(PolylineMetadata { is_closed }),
             derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
         }
     }
 }
