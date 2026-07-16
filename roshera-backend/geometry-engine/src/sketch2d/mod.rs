@@ -112,8 +112,8 @@ pub use sketch_certificate::{
 };
 pub use sketch_ops::{
     circular_pattern, curve_pattern, extend, golden_angle_rad, linear_pattern, mirror, offset,
-    phyllotaxis_pattern, trim, EntityProvenance, LineEnd, SketchOpError, SketchOpKind,
-    SketchOpOutcome,
+    phyllotaxis_pattern, trim, EntityProvenance, LineEnd, ReappliedConstraint, SketchOpError,
+    SketchOpKind, SketchOpOutcome,
 };
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 pub use snap::{SnapCandidate, SnapKind};

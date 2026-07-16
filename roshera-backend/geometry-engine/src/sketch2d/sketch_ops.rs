@@ -29,7 +29,7 @@
 //! construction axis and shared-endpoint arcs.
 
 use super::constraints::{
-    Constraint, ConstraintId, ConstraintPriority, DimensionalConstraint, EntityRef,
+    Constraint, ConstraintId, ConstraintPriority, ConstraintType, DimensionalConstraint, EntityRef,
     GeometricConstraint,
 };
 use super::line2d::LineGeometry;
@@ -83,6 +83,22 @@ pub struct EntityProvenance {
     pub instance: Option<usize>,
 }
 
+/// One constraint that survived a trim by RE-APPLICATION (SKETCH-DCM
+/// #45 follow-ups A — Slice-6 residual 9): the original constraint on
+/// the trimmed entity was removed with it, and an equivalent
+/// maintenance clone was minted on a surviving segment because the
+/// relation it encodes pins the CARRIER (infinite line / full
+/// circle), which trim preserves.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ReappliedConstraint {
+    /// The removed original.
+    pub original: ConstraintId,
+    /// The maintenance clone minted in its place.
+    pub minted: ConstraintId,
+    /// The surviving entity the clone now targets.
+    pub entity: EntityRef,
+}
+
 /// Typed result of a sketch operation: everything an agent (or the
 /// timeline event) needs to know about what changed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,8 +113,16 @@ pub struct SketchOpOutcome {
     pub modified: Vec<EntityRef>,
     /// Maintenance constraints minted by the op.
     pub constraints_added: Vec<ConstraintId>,
-    /// Constraints dropped because they referenced a deleted entity.
+    /// Constraints GENUINELY dropped: they referenced a deleted entity
+    /// and their relation is extent-bound (Length, Midpoint, a
+    /// PointOnCurve whose point rode the removed span, …), so no
+    /// honest re-application onto a survivor exists. Carrier-invariant
+    /// constraints are re-applied instead and reported in
+    /// [`Self::constraints_reapplied`] (SKETCH-DCM #45 follow-ups A).
     pub constraints_removed: Vec<ConstraintId>,
+    /// Constraints re-applied onto surviving entities (trim).
+    #[serde(default)]
+    pub constraints_reapplied: Vec<ReappliedConstraint>,
     /// Provenance records minted (mirrors what was stored on the
     /// sketch, so the caller need not re-query).
     pub provenance: Vec<(EntityRef, EntityProvenance)>,
@@ -113,6 +137,7 @@ impl SketchOpOutcome {
             modified: Vec::new(),
             constraints_added: Vec::new(),
             constraints_removed: Vec::new(),
+            constraints_reapplied: Vec::new(),
             provenance: Vec::new(),
         }
     }
@@ -427,6 +452,128 @@ fn point_on_curve(point: Point2dId, curve: EntityRef) -> Constraint {
     )
 }
 
+/// Is `original` (a constraint that referenced the trimmed `target`)
+/// still geometrically meaningful when re-targeted at `survivor`?
+///
+/// The rule is PRINCIPLED, not heuristic (SKETCH-DCM #45 follow-ups A
+/// — Slice-6 residual 9): trim preserves the CARRIER (the infinite
+/// line / full circle) and changes only the EXTENT, so a constraint
+/// survives iff its residual is a function of the carrier alone.
+///
+/// - Line survivors: direction/incidence kinds (Horizontal, Vertical,
+///   Parallel, Perpendicular, Collinear, Tangent, MultiTangent),
+///   Symmetric when the target served as the AXIS, and the
+///   carrier-measured dimensions Slope / Angle / OffsetDistance
+///   (side-agnostic perpendicular distance to the partner carrier).
+///   NOT the geometric `Offset` correspondence — its rows pair the
+///   ENDPOINTS perpendicular, which is extent-bound.
+/// - Arc survivors (from circle or arc targets): Tangent, Concentric,
+///   Equal (radius — including across the circle→arc kind change),
+///   the concentric `Offset`, MultiTangent, and Radius / Diameter /
+///   OffsetDistance / Curvature. Symmetric survives only for CIRCLE
+///   targets (the generic center-reflection arm); the arc-pair
+///   Symmetric carries ANGLE rows, which are extent-bound.
+/// - PointOnCurve: the carrier is preserved, so it re-attaches to the
+///   survivor whose extent contains the point's current position; a
+///   point that rode the removed span is genuinely dropped.
+/// - Everything else (Length, Midpoint, Distance, Area, Perimeter,
+///   ArcLength, continuity joins, inequalities, …) is extent-bound or
+///   join-bound: genuinely dropped and reported.
+fn trim_reapplicable(
+    sketch: &Sketch,
+    original: &Constraint,
+    target: &EntityRef,
+    survivor: &EntityRef,
+) -> bool {
+    use DimensionalConstraint as DC;
+    use GeometricConstraint as GC;
+    let target_is_axis = original.entities.get(2) == Some(target);
+    match (&original.constraint_type, survivor) {
+        (ConstraintType::Geometric(GC::PointOnCurve), _) => {
+            let Some(EntityRef::Point(pid)) = original.entities.first() else {
+                return false;
+            };
+            let Some(pos) = sketch.get_point(pid) else {
+                return false;
+            };
+            let Ok(curve) = op_curve(sketch, survivor, "trim") else {
+                return false;
+            };
+            on_extent(&curve, &pos)
+        }
+        (ConstraintType::Geometric(g), EntityRef::Line(_)) => {
+            matches!(
+                g,
+                GC::Horizontal
+                    | GC::Vertical
+                    | GC::Parallel
+                    | GC::Perpendicular
+                    | GC::Collinear
+                    | GC::Tangent
+                    | GC::MultiTangent
+            ) || (matches!(g, GC::Symmetric) && target_is_axis)
+        }
+        (ConstraintType::Dimensional(d), EntityRef::Line(_)) => {
+            matches!(d, DC::Slope(_) | DC::Angle(_) | DC::OffsetDistance(_))
+        }
+        (ConstraintType::Geometric(g), EntityRef::Arc(_)) => match g {
+            GC::Tangent | GC::Concentric | GC::Equal | GC::Offset | GC::MultiTangent => true,
+            GC::Symmetric => matches!(target, EntityRef::Circle(_)) && !target_is_axis,
+            _ => false,
+        },
+        (ConstraintType::Dimensional(d), EntityRef::Arc(_)) => matches!(
+            d,
+            DC::Radius(_) | DC::Diameter(_) | DC::OffsetDistance(_) | DC::Curvature(_)
+        ),
+        _ => false,
+    }
+}
+
+/// Re-apply the carrier-invariant constraints of a trimmed entity
+/// onto its survivors; report the rest as genuinely dropped.
+/// (`originals` is snapshotted BEFORE the target's deletion removed
+/// them from the store.)
+fn reapply_trim_constraints(
+    sketch: &Sketch,
+    originals: &[Constraint],
+    target: &EntityRef,
+    survivors: &[EntityRef],
+    outcome: &mut SketchOpOutcome,
+) {
+    for original in originals {
+        let mut reapplied = false;
+        for survivor in survivors {
+            if !trim_reapplicable(sketch, original, target, survivor) {
+                continue;
+            }
+            let entities: Vec<EntityRef> = original
+                .entities
+                .iter()
+                .map(|e| if e == target { *survivor } else { *e })
+                .collect();
+            let mut clone = match original.constraint_type {
+                ConstraintType::Geometric(g) => {
+                    Constraint::new_geometric(g, entities, original.priority)
+                }
+                ConstraintType::Dimensional(d) => {
+                    Constraint::new_dimensional(d, entities, original.priority)
+                }
+            };
+            clone.name.clone_from(&original.name);
+            let minted = sketch.add_constraint(clone);
+            outcome.constraints_reapplied.push(ReappliedConstraint {
+                original: original.id,
+                minted,
+                entity: *survivor,
+            });
+            reapplied = true;
+        }
+        if !reapplied {
+            outcome.constraints_removed.push(original.id);
+        }
+    }
+}
+
 // ── trim ────────────────────────────────────────────────────────────
 
 /// Cut away the span of `target` that contains `pick`, bounded by its
@@ -435,8 +582,10 @@ fn point_on_curve(point: Point2dId, curve: EntityRef) -> Constraint {
 /// points where they survive; each new cut point is held ON the
 /// cutter by a minted `PointOnCurve` constraint, so the trim is
 /// maintained under later solves. Constraints referencing the deleted
-/// target are dropped and reported in
-/// [`SketchOpOutcome::constraints_removed`].
+/// target are RE-APPLIED onto the survivors when they pin the carrier
+/// (see [`trim_reapplicable`] for the principled rule; reported in
+/// [`SketchOpOutcome::constraints_reapplied`]) and genuinely dropped
+/// otherwise (reported in [`SketchOpOutcome::constraints_removed`]).
 ///
 /// Supported targets: line segments, arcs, circles (a circle needs at
 /// least two intersections and becomes an arc). Supported cutters:
@@ -499,11 +648,7 @@ pub fn trim(
             drop(entry);
 
             let mut outcome = SketchOpOutcome::new(SketchOpKind::Trim);
-            outcome.constraints_removed = sketch
-                .get_constraints_by_entity(target)
-                .iter()
-                .map(|c| c.id)
-                .collect();
+            let original_constraints = sketch.get_constraints_by_entity(target);
             sketch.delete_line(line_id)?;
             outcome.deleted.push(*target);
 
@@ -539,6 +684,7 @@ pub fn trim(
                 survivors.push((t, 1.0));
             }
             let mut kept_original = [false, false];
+            let mut survivor_refs: Vec<EntityRef> = Vec::new();
             for (t0, t1) in survivors {
                 let start_id = make_end(t0, &mut outcome);
                 let end_id = make_end(t1, &mut outcome);
@@ -549,6 +695,7 @@ pub fn trim(
                     kept_original[1] = true;
                 }
                 let lid = sketch.add_line(start_id, end_id)?;
+                survivor_refs.push(EntityRef::Line(lid));
                 record_created(
                     sketch,
                     EntityRef::Line(lid),
@@ -558,6 +705,13 @@ pub fn trim(
                     &mut outcome,
                 );
             }
+            reapply_trim_constraints(
+                sketch,
+                &original_constraints,
+                target,
+                &survivor_refs,
+                &mut outcome,
+            );
 
             // Prune endpoints the trim orphaned (nothing else uses
             // them and the user never pinned them).
@@ -610,11 +764,7 @@ pub fn trim(
             let center_point = sketch.circles().get(circle_id).and_then(|e| e.center_point);
 
             let mut outcome = SketchOpOutcome::new(SketchOpKind::Trim);
-            outcome.constraints_removed = sketch
-                .get_constraints_by_entity(target)
-                .iter()
-                .map(|c| c.id)
-                .collect();
+            let original_constraints = sketch.get_constraints_by_entity(target);
             sketch.delete_circle(circle_id)?;
             outcome.deleted.push(*target);
 
@@ -644,6 +794,13 @@ pub fn trim(
                 SketchOpKind::Trim,
                 Some(*target),
                 None,
+                &mut outcome,
+            );
+            reapply_trim_constraints(
+                sketch,
+                &original_constraints,
+                target,
+                &[EntityRef::Arc(aid)],
                 &mut outcome,
             );
 
@@ -715,11 +872,7 @@ pub fn trim(
             let endpoint_ids = sketch.arcs().get(arc_id).and_then(|e| e.endpoints);
 
             let mut outcome = SketchOpOutcome::new(SketchOpKind::Trim);
-            outcome.constraints_removed = sketch
-                .get_constraints_by_entity(target)
-                .iter()
-                .map(|c| c.id)
-                .collect();
+            let original_constraints = sketch.get_constraints_by_entity(target);
             sketch.delete_arc(arc_id)?;
             outcome.deleted.push(*target);
 
@@ -767,6 +920,7 @@ pub fn trim(
                 survivors.push((t, 1.0));
             }
             let mut kept_original = [false, false];
+            let mut survivor_refs: Vec<EntityRef> = Vec::new();
             for (t0, t1) in survivors {
                 let start_id = make_end(t0, &mut outcome);
                 let end_id = make_end(t1, &mut outcome);
@@ -778,6 +932,7 @@ pub fn trim(
                 }
                 let sub_sweep = (t1 - t0) * total;
                 let aid = sketch.add_arc(start_id, end_id, arc.radius, arc.ccw, sub_sweep > PI)?;
+                survivor_refs.push(EntityRef::Arc(aid));
                 record_created(
                     sketch,
                     EntityRef::Arc(aid),
@@ -787,6 +942,13 @@ pub fn trim(
                     &mut outcome,
                 );
             }
+            reapply_trim_constraints(
+                sketch,
+                &original_constraints,
+                target,
+                &survivor_refs,
+                &mut outcome,
+            );
             if let Some((sa, sb)) = endpoint_ids {
                 for (kept, pid) in [(kept_original[0], sa), (kept_original[1], sb)] {
                     if !kept && !point_in_use(sketch, &pid) {

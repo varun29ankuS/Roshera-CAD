@@ -1026,3 +1026,194 @@ fn red_offset_refuses_global_self_intersection_typed() {
         .expect("non-colliding offset succeeds");
     assert!(!outcome.created.is_empty());
 }
+
+// ── 7. Trim constraint re-application (Slice-6 residual 9) ──────────
+
+#[test]
+fn red_trim_reapplies_carrier_constraints_and_drops_extent_bound_ones() {
+    // D-Cubed-style rule, principled not heuristic: a constraint
+    // survives a trim iff it pins the CARRIER (infinite line / full
+    // circle), which trim preserves — direction/incidence kinds
+    // re-attach to EVERY survivor; extent-bound kinds (Length,
+    // Midpoint, ...) are genuinely dropped and reported. PointOnCurve
+    // re-attaches to the survivor whose extent contains the point.
+    let s = fresh("followups_trim_reapply_line");
+    let a = s.add_point(Point2d::new(0.0, 0.0));
+    let b = s.add_point(Point2d::new(20.0, 0.0));
+    let line = s.add_line(a, b).expect("target line");
+    let o1 = s.add_point(Point2d::new(0.0, 7.0));
+    let o2 = s.add_point(Point2d::new(20.0, 7.0));
+    let other = s.add_line(o1, o2).expect("other line");
+    let h_id = s.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Horizontal,
+        vec![EntityRef::Line(line)],
+        ConstraintPriority::High,
+    ));
+    let len_id = s.add_constraint(required_dim(
+        DimensionalConstraint::Length(20.0),
+        vec![EntityRef::Line(line)],
+    ));
+    let par_id = s.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Parallel,
+        vec![EntityRef::Line(line), EntityRef::Line(other)],
+        ConstraintPriority::High,
+    ));
+    let p_keep = s.add_point(Point2d::new(2.0, 0.0));
+    let poc_keep = s.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::PointOnCurve,
+        vec![EntityRef::Point(p_keep), EntityRef::Line(line)],
+        ConstraintPriority::High,
+    ));
+    let p_gone = s.add_point(Point2d::new(10.0, 0.0));
+    let poc_gone = s.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::PointOnCurve,
+        vec![EntityRef::Point(p_gone), EntityRef::Line(line)],
+        ConstraintPriority::High,
+    ));
+
+    let cutter = s.add_circle(Point2d::new(10.0, 3.0), 5.0).expect("cutter");
+    let outcome = sketch_ops::trim(
+        &s,
+        &EntityRef::Line(line),
+        &EntityRef::Circle(cutter),
+        Point2d::new(10.0, 0.0),
+    )
+    .expect("trim");
+
+    let survivors: Vec<_> = outcome
+        .created
+        .iter()
+        .filter_map(|e| match e {
+            EntityRef::Line(id) => Some(EntityRef::Line(*id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(survivors.len(), 2);
+
+    // Re-applied: Horizontal x2 (each survivor is an independent
+    // entity), Parallel x2, PointOnCurve(p_keep) x1 (left survivor
+    // only — extent-gated).
+    let reapplied = &outcome.constraints_reapplied;
+    let count_orig = |id| reapplied.iter().filter(|r| r.original == id).count();
+    assert_eq!(count_orig(h_id), 2, "Horizontal onto both survivors");
+    assert_eq!(count_orig(par_id), 2, "Parallel onto both survivors");
+    assert_eq!(
+        count_orig(poc_keep),
+        1,
+        "PointOnCurve re-attaches to the ONE survivor containing the point"
+    );
+    // The re-applied PointOnCurve targets the survivor whose extent
+    // contains x = 2 (the [0, 6] span).
+    let poc_record = reapplied
+        .iter()
+        .find(|r| r.original == poc_keep)
+        .expect("poc record");
+    let EntityRef::Line(sid) = poc_record.entity else {
+        panic!("survivor must be a line");
+    };
+    let (sa, sb) = s
+        .lines()
+        .get(&sid)
+        .expect("survivor")
+        .endpoints
+        .expect("derived");
+    let xs = [
+        s.get_point(&sa).expect("sa").x,
+        s.get_point(&sb).expect("sb").x,
+    ];
+    assert!(
+        xs.iter().any(|x| x.abs() < 1e-9) && xs.iter().any(|x| (x - 6.0).abs() < 1e-9),
+        "p_keep must ride the [0, 6] survivor: {xs:?}"
+    );
+
+    // Genuinely dropped (extent-bound): Length; PointOnCurve whose
+    // point rode the removed span.
+    assert!(outcome.constraints_removed.contains(&len_id));
+    assert!(outcome.constraints_removed.contains(&poc_gone));
+    assert!(
+        !outcome.constraints_removed.contains(&h_id),
+        "re-applied constraints are not reported as dropped"
+    );
+
+    // The re-applied web is live: the sketch solves violation-free
+    // and the survivors stay horizontal.
+    let report = s.solve_constraints().expect("solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    for sref in &survivors {
+        let EntityRef::Line(id) = sref else { continue };
+        let (sa, sb) = s.lines().get(id).expect("line").endpoints.expect("derived");
+        let (pa, pb) = (s.get_point(&sa).expect("sa"), s.get_point(&sb).expect("sb"));
+        assert!(
+            (pa.y - pb.y).abs() < 1e-6,
+            "survivor must stay horizontal: {pa:?} {pb:?}"
+        );
+    }
+}
+
+#[test]
+fn red_trim_circle_to_arc_reapplies_radius_and_equal_maintained() {
+    // Carrier constraints on a trimmed CIRCLE re-target the surviving
+    // ARC: Radius pins and Equal (radius) chains stay maintained —
+    // including across the circle->arc kind change (the solver's
+    // Equal gains the mixed circle/arc radius arm; a silent-zero row
+    // would be a lie).
+    let s = fresh("followups_trim_reapply_circle");
+    let target = s.add_circle(Point2d::new(0.0, 0.0), 6.0).expect("target");
+    let partner = s.add_circle(Point2d::new(20.0, 0.0), 6.0).expect("partner");
+    let r_id = s.add_constraint(required_dim(
+        DimensionalConstraint::Radius(6.0),
+        vec![EntityRef::Circle(target)],
+    ));
+    let eq_id = s.add_constraint(Constraint::new_geometric(
+        GeometricConstraint::Equal,
+        vec![EntityRef::Circle(target), EntityRef::Circle(partner)],
+        ConstraintPriority::High,
+    ));
+    let c1 = s.add_point(Point2d::new(3.0, -10.0));
+    let c2 = s.add_point(Point2d::new(3.0, 10.0));
+    let cutter = s.add_line(c1, c2).expect("cutter");
+
+    let outcome = sketch_ops::trim(
+        &s,
+        &EntityRef::Circle(target),
+        &EntityRef::Line(cutter),
+        Point2d::new(6.0, 0.0),
+    )
+    .expect("trim");
+
+    let arc = outcome
+        .created
+        .iter()
+        .find_map(|e| match e {
+            EntityRef::Arc(id) => Some(*id),
+            _ => None,
+        })
+        .expect("surviving arc");
+    let reapplied = &outcome.constraints_reapplied;
+    let minted_radius = reapplied
+        .iter()
+        .find(|r| r.original == r_id)
+        .expect("Radius re-applied to the surviving arc");
+    assert_eq!(minted_radius.entity, EntityRef::Arc(arc));
+    assert!(
+        reapplied.iter().any(|r| r.original == eq_id),
+        "Equal (radius) re-applied across the circle->arc kind change"
+    );
+    assert!(outcome.constraints_removed.is_empty(), "nothing dropped");
+
+    // MAINTAINED through the kind change: edit the re-minted Radius
+    // pin 6 -> 5 and the Equal chain must pull the partner circle too.
+    let report = s.solve_constraints().expect("solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    s.update_dimensional_value(&minted_radius.minted, 5.0)
+        .expect("edit re-minted radius");
+    let report = s.solve_constraints().expect("re-solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    let arc_r = s.arcs().get(&arc).expect("arc").arc.radius;
+    let partner_r = s.circles().get(&partner).expect("partner").circle.radius;
+    assert!((arc_r - 5.0).abs() < 1e-6, "arc radius follows: {arc_r}");
+    assert!(
+        (partner_r - 5.0).abs() < 1e-6,
+        "Equal must propagate through the mixed arc/circle pair: {partner_r}"
+    );
+}

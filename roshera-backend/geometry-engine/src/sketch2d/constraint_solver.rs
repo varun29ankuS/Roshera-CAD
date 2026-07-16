@@ -3170,8 +3170,14 @@ impl ConstraintSolver {
                 }
             }
             (EntityRef::Circle(_), EntityRef::Circle(_))
-            | (EntityRef::Arc(_), EntityRef::Arc(_)) => {
-                // Equal radii
+            | (EntityRef::Arc(_), EntityRef::Arc(_))
+            | (EntityRef::Circle(_), EntityRef::Arc(_))
+            | (EntityRef::Arc(_), EntityRef::Circle(_)) => {
+                // Equal radii — including MIXED circle/arc pairs
+                // (SKETCH-DCM #45 follow-ups A): trim re-application
+                // retargets a circle's Equal onto the surviving arc,
+                // and a silent-zero row for the mixed pair would fake
+                // a maintained radius chain.
                 if let (Some(r1), Some(r2)) = (
                     self.get_circle_radius(entity1),
                     self.get_circle_radius(entity2),
