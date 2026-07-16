@@ -50,9 +50,9 @@ use dashmap::DashMap;
 use geometry_engine::sketch2d::{
     infer_constraints, CertificateSummary, Constraint, ConstraintId, ConstraintType,
     DimensionalConstraint, DimensionalUpdateError, DofReport, DraftEntity, DragTarget, EntityRef,
-    InferenceTolerance, Point2d, Point2dId, ProposedConstraint, Sketch, SketchAnchor, SketchId,
-    SketchSolveError, SketchSolveReport, SketchValidityCertificate, SnapCandidate, SolveOptions,
-    SolverStatus, Spline2d,
+    InferenceTolerance, LineEnd, Point2d, Point2dId, ProposedConstraint, Sketch, SketchAnchor,
+    SketchId, SketchOpError, SketchOpOutcome, SketchSolveError, SketchSolveReport,
+    SketchValidityCertificate, SnapCandidate, SolveOptions, SolverStatus, Spline2d,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -1061,6 +1061,426 @@ pub async fn infer_constraints_handler(
     let sketch = require_sketch(&state, id)?;
     let tol = req.tolerance.unwrap_or_default();
     Ok(Json(infer_constraints(&sketch, &req.draft, tol)))
+}
+
+// ── Slice-6 sketch ops (SKETCH-DCM #45, spec §3.4) ──────────────────
+//
+// trim / extend / offset / mirror / patterns / construction-flag —
+// kernel `sketch_ops` exposed over REST. Every op response carries the
+// typed `SketchOpOutcome` (created/deleted entities, minted
+// constraints, provenance) PLUS a fresh compact certificate — the op
+// re-certifies, so an agent sees the post-op constrainment verdict
+// without a second call. Each op also records a self-contained
+// `csketch_*` timeline event (design history; the sketch container is
+// api-server state, so the event's model effect is nil by construction
+// — the downstream `sketch_extrude` event carries the materialised
+// profile; the replay arm validates and accepts these events so
+// full-timeline replays stay at zero skips).
+
+/// Response body shared by every sketch-op route.
+#[derive(Debug, Clone, Serialize)]
+pub struct SketchOpResponse {
+    /// What the op created/deleted/modified, which constraints it
+    /// minted or dropped, and the provenance lineage it recorded.
+    pub outcome: SketchOpOutcome,
+    /// Fresh post-op certificate digest (the op re-certifies).
+    pub certificate: CertificateSummary,
+}
+
+/// Request body for `POST /api/csketch/{id}/trim`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrimRequest {
+    /// The entity to cut (line segment, arc, or circle).
+    pub entity: EntityRef,
+    /// The cutting entity (line segment, arc, or circle).
+    pub cutter: EntityRef,
+    /// A point on the span to REMOVE.
+    pub pick: [f64; 2],
+}
+
+/// Request body for `POST /api/csketch/{id}/extend`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtendRequest {
+    /// The line segment to extend.
+    pub line: Uuid,
+    /// Which end moves ("start" | "end").
+    pub end: LineEnd,
+    /// The boundary entity to extend to.
+    pub boundary: EntityRef,
+}
+
+/// Request body for `POST /api/csketch/{id}/offset`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OffsetRequest {
+    /// Any entity of the closed loop to offset.
+    pub entity: EntityRef,
+    /// Signed distance: positive enlarges the loop, negative shrinks.
+    pub distance: f64,
+}
+
+/// Request body for `POST /api/csketch/{id}/mirror`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MirrorRequest {
+    /// Entities to mirror (points, lines, circles, arcs).
+    pub entities: Vec<EntityRef>,
+    /// The construction-line axis id.
+    pub axis: Uuid,
+}
+
+/// Request body for `POST /api/csketch/{id}/pattern/linear`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinearPatternRequest {
+    /// Source entities (points and circles).
+    pub entities: Vec<EntityRef>,
+    /// TOTAL instance count including the source (≥ 2).
+    pub count: usize,
+    /// Step vector between consecutive instances.
+    pub dx: f64,
+    pub dy: f64,
+}
+
+/// Request body for `POST /api/csketch/{id}/pattern/circular`.
+/// Exactly one of `center` (an existing point id) or
+/// `center_position` (coordinates for a new construction point) must
+/// be supplied.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CircularPatternRequest {
+    /// Source entities (points and circles).
+    pub entities: Vec<EntityRef>,
+    /// Existing pattern-center point id.
+    #[serde(default)]
+    pub center: Option<Uuid>,
+    /// Coordinates for a new construction center point.
+    #[serde(default)]
+    pub center_position: Option<[f64; 2]>,
+    /// TOTAL instance count including the source (≥ 2).
+    pub count: usize,
+    /// Signed angular step between consecutive instances (radians).
+    pub angle_step: f64,
+}
+
+/// Request body for `PATCH /api/csketch/{id}/construction`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConstructionRequest {
+    pub entity: EntityRef,
+    pub is_construction: bool,
+}
+
+/// Response body for `PATCH /api/csketch/{id}/construction`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConstructionResponse {
+    pub entity: EntityRef,
+    pub is_construction: bool,
+    /// Fresh post-edit certificate digest.
+    pub certificate: CertificateSummary,
+}
+
+/// Map a typed kernel refusal onto the wire. The `details.kind`
+/// discriminant lets agents branch on the refusal class without
+/// string-matching the message.
+fn op_error_to_api(err: SketchOpError) -> ApiError {
+    let kind = match &err {
+        SketchOpError::EntityNotFound { .. } => "entity_not_found",
+        SketchOpError::Unsupported { .. } => "unsupported",
+        SketchOpError::NoIntersection { .. } => "no_intersection",
+        SketchOpError::InvalidParameter { .. } => "invalid_parameter",
+        SketchOpError::OffsetTooLarge { .. } => "offset_too_large",
+        SketchOpError::AxisNotConstruction { .. } => "axis_not_construction",
+        SketchOpError::Sketch(_) => "sketch",
+    };
+    ApiError::new(ErrorCode::InvalidParameter, err.to_string())
+        .with_details(serde_json::json!({ "kind": kind }))
+}
+
+/// Record the self-contained design-history event for a sketch op.
+/// Failure to record is logged, never fatal — the op itself already
+/// succeeded (same contract as the `sketch_extrude` recording).
+fn record_csketch_op(
+    state: &AppState,
+    kind: &'static str,
+    csketch_id: Uuid,
+    request: serde_json::Value,
+    outcome: &SketchOpOutcome,
+) {
+    use geometry_engine::operations::recorder::OperationRecorder as _;
+    let record = geometry_engine::operations::recorder::RecordedOperation::new(kind)
+        .with_parameters(serde_json::json!({
+            "csketch_id": csketch_id.to_string(),
+            "request": request,
+            "outcome": outcome,
+        }));
+    if let Err(e) = state.timeline_recorder.record(record) {
+        tracing::warn!("{kind} event not recorded: {e}");
+    }
+}
+
+/// `POST /api/csketch/{id}/trim` — cut the picked span of an entity
+/// at its intersections with a cutter; the cut points are held on the
+/// cutter by minted `PointOnCurve` constraints.
+pub async fn trim_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<TrimRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    if !req.pick[0].is_finite() || !req.pick[1].is_finite() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "pick coordinates must be finite",
+        ));
+    }
+    let sketch = require_sketch(&state, id)?;
+    let outcome = geometry_engine::sketch2d::trim(
+        &sketch,
+        &req.entity,
+        &req.cutter,
+        Point2d::new(req.pick[0], req.pick[1]),
+    )
+    .map_err(op_error_to_api)?;
+    record_csketch_op(
+        &state,
+        "csketch_trim",
+        id,
+        serde_json::json!({
+            "entity": req.entity, "cutter": req.cutter, "pick": req.pick,
+        }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// `POST /api/csketch/{id}/extend` — extend a line end to the nearest
+/// forward intersection with a boundary entity.
+pub async fn extend_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ExtendRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    let outcome = geometry_engine::sketch2d::extend(
+        &sketch,
+        &geometry_engine::sketch2d::Line2dId(req.line),
+        req.end,
+        &req.boundary,
+    )
+    .map_err(op_error_to_api)?;
+    record_csketch_op(
+        &state,
+        "csketch_extend",
+        id,
+        serde_json::json!({
+            "line": req.line, "end": req.end, "boundary": req.boundary,
+        }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// `POST /api/csketch/{id}/offset` — offset the closed loop
+/// containing an entity; the result is maintained by the
+/// Slice-6-enforced `Offset`/`OffsetDistance` constraints.
+pub async fn offset_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<OffsetRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    let outcome = geometry_engine::sketch2d::offset(&sketch, &req.entity, req.distance)
+        .map_err(op_error_to_api)?;
+    record_csketch_op(
+        &state,
+        "csketch_offset",
+        id,
+        serde_json::json!({ "entity": req.entity, "distance": req.distance }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// `POST /api/csketch/{id}/mirror` — mirror entities about a
+/// construction line; maintained by minted `Symmetric` constraints.
+pub async fn mirror_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<MirrorRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    let outcome = geometry_engine::sketch2d::mirror(
+        &sketch,
+        &req.entities,
+        &geometry_engine::sketch2d::Line2dId(req.axis),
+    )
+    .map_err(op_error_to_api)?;
+    record_csketch_op(
+        &state,
+        "csketch_mirror",
+        id,
+        serde_json::json!({ "entities": req.entities, "axis": req.axis }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// `POST /api/csketch/{id}/pattern/linear` — n-instance linear
+/// pattern with `Equal`-chain / `Distance`-spacing maintenance.
+pub async fn linear_pattern_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<LinearPatternRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    if !req.dx.is_finite() || !req.dy.is_finite() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "step components must be finite",
+        ));
+    }
+    let sketch = require_sketch(&state, id)?;
+    let outcome = geometry_engine::sketch2d::linear_pattern(
+        &sketch,
+        &req.entities,
+        req.count,
+        req.dx,
+        req.dy,
+    )
+    .map_err(op_error_to_api)?;
+    record_csketch_op(
+        &state,
+        "csketch_pattern_linear",
+        id,
+        serde_json::json!({
+            "entities": req.entities, "count": req.count, "dx": req.dx, "dy": req.dy,
+        }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// `POST /api/csketch/{id}/pattern/circular` — n-instance circular
+/// pattern about a center point with construction-spoke maintenance.
+pub async fn circular_pattern_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CircularPatternRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    if !req.angle_step.is_finite() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "angle_step must be finite",
+        ));
+    }
+    let sketch = require_sketch(&state, id)?;
+    let (center_id, center_created) = match (req.center, req.center_position) {
+        (Some(pid), None) => (Point2dId(pid), false),
+        (None, Some([x, y])) => {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "center_position coordinates must be finite",
+                ));
+            }
+            let pid = sketch.add_point(Point2d::new(x, y));
+            // The minted center is support geometry.
+            sketch
+                .set_construction(&EntityRef::Point(pid), true)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+            (pid, true)
+        }
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "supply exactly one of `center` (existing point id) or \
+                 `center_position` ([x, y] for a new construction point)",
+            ));
+        }
+    };
+    let result = geometry_engine::sketch2d::circular_pattern(
+        &sketch,
+        &req.entities,
+        &center_id,
+        req.count,
+        req.angle_step,
+    );
+    let mut outcome = match result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // Refusals must not leak the just-minted center point.
+            if center_created {
+                let _ = sketch.delete_point(&center_id);
+            }
+            return Err(op_error_to_api(e));
+        }
+    };
+    if center_created {
+        outcome.created.insert(0, EntityRef::Point(center_id));
+    }
+    record_csketch_op(
+        &state,
+        "csketch_pattern_circular",
+        id,
+        serde_json::json!({
+            "entities": req.entities,
+            "center": center_id.0,
+            "count": req.count,
+            "angle_step": req.angle_step,
+        }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// `PATCH /api/csketch/{id}/construction` — mark/clear the
+/// construction (guide) flag on an entity. Construction geometry is
+/// solver-real but invisible to profile extraction and extrude.
+pub async fn set_construction_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<ConstructionRequest>,
+) -> Result<Json<ConstructionResponse>, ApiError> {
+    let sketch = require_sketch(&state, id)?;
+    sketch
+        .set_construction(&req.entity, req.is_construction)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    // Construction edits are design history too — record with the
+    // same self-contained shape as the op events.
+    use geometry_engine::operations::recorder::OperationRecorder as _;
+    let record =
+        geometry_engine::operations::recorder::RecordedOperation::new("csketch_construction")
+            .with_parameters(serde_json::json!({
+                "csketch_id": id.to_string(),
+                "request": { "entity": req.entity, "is_construction": req.is_construction },
+            }));
+    if let Err(e) = state.timeline_recorder.record(record) {
+        tracing::warn!("csketch_construction event not recorded: {e}");
+    }
+    let certificate = sketch.certify().compact();
+    Ok(Json(ConstructionResponse {
+        entity: req.entity,
+        is_construction: req.is_construction,
+        certificate,
+    }))
 }
 
 // ── Phase-A entity routes (SKETCH-DCM campaign) ─────────────────────
@@ -2708,5 +3128,120 @@ mod tests {
             ProfileLoop::Polygon(p) => assert_eq!(p.len(), 64),
             ProfileLoop::Edges(_) => panic!("ellipse loop must fall back to sampling"),
         }
+    }
+
+    // ── Slice-6 sketch ops over the manager (SKETCH-DCM #45) ────────
+
+    /// The trim route's kernel flow through a manager-held sketch:
+    /// op → outcome → re-certify, mirroring `trim_op` without the
+    /// axum wrapper. Pins the response construction the handler ships.
+    #[test]
+    fn slice6_trim_flow_recertifies_and_reports_outcome() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        let b = sketch.add_point(Point2d::new(20.0, 0.0));
+        let line = sketch.add_line(a, b).expect("line");
+        let cutter = sketch
+            .add_circle(Point2d::new(10.0, 3.0), 5.0)
+            .expect("cutter");
+
+        let outcome = geometry_engine::sketch2d::trim(
+            &sketch,
+            &EntityRef::Line(line),
+            &EntityRef::Circle(cutter),
+            Point2d::new(10.0, 0.0),
+        )
+        .expect("trim");
+        let certificate = sketch.certify().compact();
+        let response = SketchOpResponse {
+            outcome,
+            certificate,
+        };
+
+        let body = serde_json::to_value(&response).expect("serialises");
+        assert_eq!(body["outcome"]["op"], "trim");
+        assert!(
+            body["outcome"]["created"]
+                .as_array()
+                .expect("created array")
+                .len()
+                >= 4,
+            "two lines + two cut points"
+        );
+        assert_eq!(
+            body["outcome"]["constraints_added"]
+                .as_array()
+                .expect("constraints array")
+                .len(),
+            2
+        );
+        assert!(body["certificate"]["sound"].is_boolean());
+    }
+
+    /// Typed refusals reach the wire with a machine-branchable
+    /// `details.kind` discriminant.
+    #[test]
+    fn slice6_op_errors_carry_typed_kind_discriminants() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        let b = sketch.add_point(Point2d::new(20.0, 0.0));
+        let line = sketch.add_line(a, b).expect("line");
+        let far = sketch
+            .add_circle(Point2d::new(10.0, 30.0), 2.0)
+            .expect("far circle");
+
+        let err = geometry_engine::sketch2d::trim(
+            &sketch,
+            &EntityRef::Line(line),
+            &EntityRef::Circle(far),
+            Point2d::new(10.0, 0.0),
+        )
+        .expect_err("no intersection");
+        let api = op_error_to_api(err);
+        let body = serde_json::to_value(&api).expect("serialises");
+        assert_eq!(body["error_code"], "invalid_parameter");
+        assert_eq!(body["details"]["kind"], "no_intersection");
+
+        // Mirror about a non-construction axis: the spec-mandated
+        // refusal class.
+        let axis = sketch.add_line(a, b).expect("axis");
+        let err = geometry_engine::sketch2d::mirror(&sketch, &[EntityRef::Point(a)], &axis)
+            .expect_err("axis not construction");
+        let api = op_error_to_api(err);
+        let body = serde_json::to_value(&api).expect("serialises");
+        assert_eq!(body["details"]["kind"], "axis_not_construction");
+    }
+
+    /// The construction route's kernel flow: flag round-trip +
+    /// re-certify, mirroring `set_construction_op`.
+    #[test]
+    fn slice6_construction_flow_roundtrips_and_recertifies() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        let b = sketch.add_point(Point2d::new(10.0, 0.0));
+        let line = sketch.add_line(a, b).expect("line");
+        let lref = EntityRef::Line(line);
+
+        sketch.set_construction(&lref, true).expect("set");
+        let certificate = sketch.certify().compact();
+        let response = ConstructionResponse {
+            entity: lref,
+            is_construction: true,
+            certificate,
+        };
+        let body = serde_json::to_value(&response).expect("serialises");
+        assert_eq!(body["is_construction"], true);
+        assert!(body["certificate"]["sound"].is_boolean());
+        assert_eq!(sketch.is_construction(&lref), Some(true));
+
+        // Missing entity → typed kernel error surfaces as 400.
+        let phantom = EntityRef::Line(geometry_engine::sketch2d::Line2dId::new());
+        assert!(sketch.set_construction(&phantom, true).is_err());
     }
 }

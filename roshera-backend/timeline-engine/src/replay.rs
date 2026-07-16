@@ -819,6 +819,34 @@ fn dispatch_generic(
             Ok(())
         }
 
+        // ----------------------------------------------------------------
+        // Sketch-domain operations (SKETCH-DCM #45 Slice 6): trim /
+        // extend / offset / mirror / patterns / construction-flag edits
+        // on a live csketch. These events are DESIGN-HISTORY records —
+        // the sketch container lives in the api-server, not in the
+        // B-Rep model, so their model effect is nil BY CONSTRUCTION:
+        // the downstream `sketch_extrude` event is fully
+        // self-contained (frame + materialised profile loops) and
+        // rebuilds the identical solid whether or not the sketch ops
+        // that shaped the profile are replayed. Validating the payload
+        // shape (rather than erroring UnknownKind) keeps full-timeline
+        // replays of sketch-op sessions at `events_skipped == 0`.
+        "csketch_trim"
+        | "csketch_extend"
+        | "csketch_offset"
+        | "csketch_mirror"
+        | "csketch_pattern_linear"
+        | "csketch_pattern_circular"
+        | "csketch_construction" => {
+            if inner.get("csketch_id").and_then(|v| v.as_str()).is_none() {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing `csketch_id`".to_string(),
+                });
+            }
+            Ok(())
+        }
+
         unknown => Err(ReplayError::UnknownKind(unknown.to_string())),
     }
 }
@@ -1300,6 +1328,105 @@ mod tests {
             cylinder_face_radii(&model, solid).is_empty(),
             "legacy polygon payloads replay as recorded (planar facets), \
              never silently upgraded to analytic faces"
+        );
+    }
+
+    /// SKETCH-DCM #45 Slice 6: sketch-op events (trim / offset /
+    /// mirror / patterns / construction) are design-history records —
+    /// the sketch lives in the api-server, and the downstream
+    /// `sketch_extrude` event is fully self-contained. A timeline
+    /// carrying them must replay with `events_skipped == 0` and a
+    /// model state identical to the extrude event alone.
+    #[test]
+    fn replay_csketch_op_events_are_design_history_records_with_nil_model_effect() {
+        let op_event = |kind: &str| {
+            mk_event(
+                kind,
+                serde_json::json!({
+                    "params": {
+                        "csketch_id": "6a1f0c9e-2c1e-4b3a-9a53-1de1cbbf0000",
+                        "distance": 5.0,
+                    },
+                    "inputs": [],
+                    "outputs": []
+                }),
+            )
+        };
+        let extrude_event = mk_event(
+            "sketch_extrude",
+            serde_json::json!({
+                "params": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "u_axis": [1.0, 0.0, 0.0],
+                    "v_axis": [0.0, 1.0, 0.0],
+                    "regions": [{
+                        "outer": [[0.0, 0.0], [40.0, 0.0], [40.0, 30.0], [0.0, 30.0]],
+                        "holes": [{ "edges": [
+                            { "kind": "circle", "center": [20.0, 15.0], "radius": 6.0 }
+                        ]}],
+                    }],
+                    "distance": 10.0,
+                    "direction": [0.0, 0.0, 1.0],
+                },
+                "inputs": [],
+                "outputs": [99]
+            }),
+        );
+
+        // Sketch-op events alone leave the model untouched.
+        let mut ops_only = BRepModel::new();
+        let events: Vec<_> = [
+            "csketch_trim",
+            "csketch_extend",
+            "csketch_offset",
+            "csketch_mirror",
+            "csketch_pattern_linear",
+            "csketch_pattern_circular",
+            "csketch_construction",
+        ]
+        .iter()
+        .map(|k| op_event(k))
+        .collect();
+        let outcome = rebuild_model_from_events(&mut ops_only, &events);
+        assert_eq!(outcome.events_applied, 7, "all op kinds must apply");
+        assert_eq!(
+            outcome.events_skipped, 0,
+            "no skips — full-timeline honesty"
+        );
+        assert_eq!(ops_only.solids.len(), 0, "nil model effect by construction");
+
+        // Ops + extrude replay to the SAME state as the extrude alone.
+        let mut with_ops = BRepModel::new();
+        let mut sequence = events;
+        sequence.push(extrude_event.clone());
+        let outcome = rebuild_model_from_events(&mut with_ops, &sequence);
+        assert_eq!(outcome.events_applied, 8);
+        assert_eq!(outcome.events_skipped, 0);
+
+        let mut extrude_only = BRepModel::new();
+        rebuild_model_from_events(&mut extrude_only, &[extrude_event]);
+        let (s1, s2) = (only_solid(&with_ops), only_solid(&extrude_only));
+        assert_eq!(
+            cylinder_face_radii(&with_ops, s1),
+            cylinder_face_radii(&extrude_only, s2),
+            "identical replayed state with or without the sketch-op events"
+        );
+    }
+
+    /// A sketch-op event with no `csketch_id` is malformed and must be
+    /// rejected (skipped with a logged error), not silently accepted.
+    #[test]
+    fn replay_csketch_op_event_without_sketch_id_is_invalid() {
+        let mut model = BRepModel::new();
+        let event = mk_event(
+            "csketch_offset",
+            serde_json::json!({ "params": { "distance": 5.0 }, "inputs": [], "outputs": [] }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(outcome.events_applied, 0);
+        assert_eq!(
+            outcome.events_skipped, 1,
+            "malformed op event must be skipped"
         );
     }
 }

@@ -129,6 +129,53 @@ export function registerPsketchTools(server: McpServer) {
   );
 
   server.tool(
+    "psketch_op",
+    "Sketch operation on a parametric sketch — the result is MAINTAINED by " +
+      "minted constraints, not a one-shot copy. op=trim {entity,cutter " +
+      "(EntityRef like {Line: uuid}), pick:[x,y] on the span to REMOVE}; " +
+      "extend {line: uuid, end:'start'|'end', boundary: EntityRef}; offset " +
+      "{entity: EntityRef on a closed loop, distance (+ enlarges)}; mirror " +
+      "{entities:[EntityRef], axis: uuid of a CONSTRUCTION line}; " +
+      "linear_pattern {entities, count (total incl. source), dx, dy}; " +
+      "circular_pattern {entities, center: uuid | center_position:[x,y], " +
+      "count, angle_step (rad)}; construction {entity: EntityRef, " +
+      "is_construction: bool}. Returns the typed outcome (created/deleted " +
+      "entities, minted constraints, provenance) + a fresh certificate " +
+      "digest. Refusals are typed (details.kind).",
+    {
+      csketch_id: z.string().uuid(),
+      op: z.enum([
+        "trim",
+        "extend",
+        "offset",
+        "mirror",
+        "linear_pattern",
+        "circular_pattern",
+        "construction",
+      ]),
+      params: z.record(z.unknown()),
+    },
+    async ({ csketch_id, op, params }) => {
+      try {
+        const route: Record<string, ["POST" | "PATCH", string]> = {
+          trim: ["POST", "trim"],
+          extend: ["POST", "extend"],
+          offset: ["POST", "offset"],
+          mirror: ["POST", "mirror"],
+          linear_pattern: ["POST", "pattern/linear"],
+          circular_pattern: ["POST", "pattern/circular"],
+          construction: ["PATCH", "construction"],
+        };
+        const [method, path] = route[op];
+        const r = await api(method, `/api/csketch/${csketch_id}/${path}`, params);
+        return ok(r);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "psketch_extrude",
     "Extrude the parametric sketch's closed regions into a solid. Hole-aware " +
       "(circles inside an outline become bores). On topology errors the " +

@@ -8074,6 +8074,23 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/csketch/{id}/constraints",
             get(csketch::list_constraints),
         )
+        // Slice-6 sketch ops (SKETCH-DCM #45, spec §3.4).
+        .route("/api/csketch/{id}/trim", post(csketch::trim_op))
+        .route("/api/csketch/{id}/extend", post(csketch::extend_op))
+        .route("/api/csketch/{id}/offset", post(csketch::offset_op))
+        .route("/api/csketch/{id}/mirror", post(csketch::mirror_op))
+        .route(
+            "/api/csketch/{id}/pattern/linear",
+            post(csketch::linear_pattern_op),
+        )
+        .route(
+            "/api/csketch/{id}/pattern/circular",
+            post(csketch::circular_pattern_op),
+        )
+        .route(
+            "/api/csketch/{id}/construction",
+            axum::routing::patch(csketch::set_construction_op),
+        )
         .route("/api/csketch/{id}/solve", post(csketch::solve))
         .route("/api/csketch/{id}/certify", post(csketch::certify))
         .route("/api/csketch/{id}/drag", post(csketch::drag))
