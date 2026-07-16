@@ -1709,6 +1709,65 @@ mod tests {
         );
     }
 
+    /// SKETCH-DCM #45 follow-ups B (item 6): the payload shape the
+    /// CLICK-DRAFT extrude now records for a circle shape — a typed
+    /// analytic circle OUTER loop — replays to the analytic cylinder
+    /// solid (2 caps + 1 Cylinder lateral at the exact radius), i.e.
+    /// the SAME solid the live click-draft build produced. Pre-item-6
+    /// click-draft events recorded a 64-gon polygon here and replay
+    /// rebuilt a 66-face prism — live-vs-replay drift, now retired
+    /// (old polygon events still replay unchanged: the legacy pin
+    /// above stands).
+    #[test]
+    fn replay_click_draft_circle_event_rebuilds_analytic_cylinder() {
+        let mut model = BRepModel::new();
+        let event = mk_event(
+            "sketch_extrude",
+            serde_json::json!({
+                "params": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "u_axis": [1.0, 0.0, 0.0],
+                    "v_axis": [0.0, 1.0, 0.0],
+                    "regions": [{
+                        "outer": { "edges": [
+                            { "kind": "circle", "center": [12.5, -3.0], "radius": 4.0 }
+                        ]},
+                        "holes": [],
+                    }],
+                    "distance": 6.0,
+                    "direction": [0.0, 0.0, 1.0],
+                },
+                "inputs": [],
+                "outputs": [99]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(
+            outcome.events_applied, 1,
+            "click-draft circle event applies"
+        );
+        assert_eq!(outcome.events_skipped, 0);
+        let solid = only_solid(&model);
+        let radii = cylinder_face_radii(&model, solid);
+        assert_eq!(
+            radii.len(),
+            1,
+            "the replayed boss lateral is ONE analytic cylinder face"
+        );
+        let radius = radii.first().copied().expect("radius");
+        assert!(
+            (radius - 4.0).abs() < 1e-9,
+            "replayed radius must be exact: {radius}"
+        );
+        let face_count = model
+            .solid_outer_face_count(solid)
+            .expect("outer face count");
+        assert_eq!(
+            face_count, 3,
+            "2 caps + 1 cylinder lateral (not a 64-gon prism)"
+        );
+    }
+
     /// A sketch-op event with no `csketch_id` is malformed and must be
     /// rejected (skipped with a logged error), not silently accepted.
     #[test]

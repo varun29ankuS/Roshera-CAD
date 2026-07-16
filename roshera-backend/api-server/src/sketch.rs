@@ -961,6 +961,46 @@ pub(crate) fn build_loop_edges(
     Ok(edges)
 }
 
+/// The `sketch_extrude` event payload for ONE click-draft loop
+/// (SKETCH-DCM #45 follow-ups B, item 6).
+///
+/// A CIRCLE shape extruded along the plane normal records the TYPED
+/// `{"edges": [{"kind": "circle", "center": [u, v], "radius": r}]}`
+/// loop — center/radius re-derived from the materialised polygon
+/// exactly the way the LIVE build's `build_loop_edges` (#24) derives
+/// them (regular-polygon centroid == circle center, `|p0 − center|`
+/// == radius), so the replayed analytic cylinder is the same solid
+/// the live path built, never a re-sampled 64-gon prism (the
+/// live-vs-replay drift this retires). Everything else — straight
+/// shapes, whose polygon IS their exact geometry, and circles under
+/// an OBLIQUE direction, whose live wall is not analytic on this
+/// path — keeps the legacy plain-array payload (additive schema: the
+/// replay arm accepts both, old events replay unchanged).
+pub(crate) fn click_draft_loop_event_payload(
+    tool: SketchTool,
+    polygon_2d: &[[f64; 2]],
+    along_normal: bool,
+) -> serde_json::Value {
+    if tool == SketchTool::Circle && along_normal && polygon_2d.len() >= 3 {
+        if let Some(first) = polygon_2d.first() {
+            let n = polygon_2d.len() as f64;
+            let (mut cu, mut cv) = (0.0, 0.0);
+            for p in polygon_2d {
+                cu += p[0];
+                cv += p[1];
+            }
+            let (cu, cv) = (cu / n, cv / n);
+            let radius = ((first[0] - cu).powi(2) + (first[1] - cv).powi(2)).sqrt();
+            if radius > 1e-12 {
+                return serde_json::json!({
+                    "edges": [{ "kind": "circle", "center": [cu, cv], "radius": radius }]
+                });
+            }
+        }
+    }
+    serde_json::json!(polygon_2d)
+}
+
 // ─── Region detection ───────────────────────────────────────────────
 //
 // Geometric outer/hole classification, industry-standard: the user
@@ -1951,22 +1991,43 @@ pub async fn extrude_sketch(
     }
 
     // Replayable consolidated event — see extrude_csketch for the
-    // rationale; the click-draft path records the identical payload
-    // shape so both sketch systems replay through one arm.
+    // rationale; the click-draft path records the same payload schema
+    // so both sketch systems replay through one arm.
+    //
+    // SKETCH-DCM #45 follow-ups B (item 6): CIRCLE shapes record the
+    // TYPED `{"edges": [{"kind": "circle", ...}]}` loop payload — the
+    // live build's `build_loop_edges` (#24) emits one analytic Circle
+    // edge whose wall collapses to a true Cylinder, and a polygon
+    // event replayed as a 64-gon prism would silently DRIFT from that
+    // live solid. Center/radius are derived from the materialised
+    // polygon exactly as the live edge builder derives them, so live
+    // and replay agree bit-for-bit. Straight shapes (polyline/rect)
+    // keep the polygon payload — it IS their exact geometry — and a
+    // circle under an OBLIQUE direction keeps it too (the live build
+    // has no analytic oblique-circle wall on this path; recording
+    // typed would make replay diverge from live).
     {
         use geometry_engine::operations::recorder::OperationRecorder as _;
         let frame_origin = session.plane.lift(0.0, 0.0);
         let u_pt = session.plane.lift(1.0, 0.0);
         let v_pt = session.plane.lift(0.0, 1.0);
+        let along_normal = {
+            let n = session.plane.normal();
+            match (direction.normalize(), n.normalize()) {
+                (Ok(d), Ok(nn)) => d.dot(&nn).abs() > 1.0 - 1e-9,
+                _ => false,
+            }
+        };
+        let loop_json = |idx: usize| -> serde_json::Value {
+            let (_, tool, polygon_2d, _) = &shape_polygons[idx];
+            click_draft_loop_event_payload(*tool, polygon_2d, along_normal)
+        };
         let regions_json: Vec<serde_json::Value> = regions
             .iter()
             .map(|r| {
-                let outer = &shape_polygons[r.outer_shape_idx].2;
-                let holes: Vec<&Vec<[f64; 2]>> = r
-                    .hole_shape_idxs
-                    .iter()
-                    .map(|&i| &shape_polygons[i].2)
-                    .collect();
+                let outer = loop_json(r.outer_shape_idx);
+                let holes: Vec<serde_json::Value> =
+                    r.hole_shape_idxs.iter().map(|&i| loop_json(i)).collect();
                 serde_json::json!({ "outer": outer, "holes": holes })
             })
             .collect();
@@ -3154,6 +3215,67 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].outer_shape_idx, 0);
         assert_eq!(r[0].hole_shape_idxs, vec![1]);
+    }
+
+    /// SKETCH-DCM #45 follow-ups B (item 6): the click-draft
+    /// `sketch_extrude` event records a CIRCLE loop as the TYPED
+    /// analytic payload (`{"edges": [{"kind": "circle", ...}]}`) with
+    /// center/radius matching the live edge builder's derivation —
+    /// the live-vs-replay drift (live analytic cylinder vs replayed
+    /// 64-gon prism) is retired at the schema.
+    #[test]
+    fn click_draft_circle_event_payload_is_typed_analytic() {
+        // A 64-gon exactly as materialise_circle emits it.
+        let n = 64usize;
+        let (cx, cy, r) = (12.5, -3.0, 4.0);
+        let polygon: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let a = (i as f64 / n as f64) * std::f64::consts::TAU;
+                [cx + r * a.cos(), cy + r * a.sin()]
+            })
+            .collect();
+        let payload = click_draft_loop_event_payload(SketchTool::Circle, &polygon, true);
+        let edges = payload
+            .get("edges")
+            .and_then(|e| e.as_array())
+            .expect("typed edges payload");
+        assert_eq!(edges.len(), 1, "one closed circle edge");
+        assert_eq!(edges[0]["kind"], "circle");
+        let center = edges[0]["center"].as_array().expect("center");
+        let radius = edges[0]["radius"].as_f64().expect("radius");
+        assert!(
+            (center[0].as_f64().expect("cx") - cx).abs() < 1e-9
+                && (center[1].as_f64().expect("cy") - cy).abs() < 1e-9,
+            "center re-derived exactly: {center:?}"
+        );
+        assert!((radius - r).abs() < 1e-9, "radius exact: {radius}");
+    }
+
+    /// Item 6 honesty gates: an OBLIQUE-direction circle and every
+    /// straight shape keep the legacy polygon-array payload (the live
+    /// build is not analytic for those on this path — recording typed
+    /// would make replay diverge from live).
+    #[test]
+    fn click_draft_non_analytic_loops_keep_polygon_payload() {
+        let polygon: Vec<[f64; 2]> = (0..16)
+            .map(|i| {
+                let a = (i as f64 / 16.0) * std::f64::consts::TAU;
+                [a.cos(), a.sin()]
+            })
+            .collect();
+        // Oblique circle → polygon array.
+        let oblique = click_draft_loop_event_payload(SketchTool::Circle, &polygon, false);
+        assert!(
+            oblique.is_array(),
+            "oblique circle stays sampled: {oblique}"
+        );
+        // Rectangle → polygon array even along the normal.
+        let rect = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]];
+        let rect_payload = click_draft_loop_event_payload(SketchTool::Rectangle, &rect, true);
+        assert!(rect_payload.is_array(), "straight shapes stay polygons");
+        // Polyline → polygon array.
+        let poly_payload = click_draft_loop_event_payload(SketchTool::Polyline, &rect, true);
+        assert!(poly_payload.is_array());
     }
 
     #[test]
