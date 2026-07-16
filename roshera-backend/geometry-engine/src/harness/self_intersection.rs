@@ -105,7 +105,13 @@ pub fn mesh_self_intersects_mesh(mesh: &TriangleMesh) -> bool {
 
     // Weld vertices by quantised position so adjacent triangles share canonical
     // indices (and are skipped — they touch, not cross).
-    const Q: f64 = 1.0e5;
+    //
+    // Slice 5 (tolerance authority): the grid spacing is
+    // `authority::SELF_INTERSECTION_WELD_GRID` (= 10·τ_weld = 1e-5) — coarser
+    // than the vertex weld so a pair the kernel welds can never read as a
+    // self-touch here, and derived from the same source scale instead of the
+    // former free-standing `Q = 1e5` reciprocal.
+    const Q: f64 = 1.0 / crate::math::tolerance::authority::SELF_INTERSECTION_WELD_GRID;
     let key = |p: &Point3| -> (i64, i64, i64) {
         (
             (p.x * Q).round() as i64,

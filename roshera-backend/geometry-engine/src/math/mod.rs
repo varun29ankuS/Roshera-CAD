@@ -72,7 +72,7 @@ pub use matrix4::Matrix4;
 pub use plane_math::Plane as MathPlane;
 pub use quaternion::Quaternion;
 pub use ray::Ray;
-pub use tolerance::{Tolerance, ToleranceContext};
+pub use tolerance::{authority, Tolerance, ToleranceContext};
 pub use tolerance::{LOOSE_TOLERANCE, NORMAL_TOLERANCE, STRICT_TOLERANCE};
 pub use vector2::{Point2, Vector2};
 pub use vector3::{Point3, Point4, Vector3};

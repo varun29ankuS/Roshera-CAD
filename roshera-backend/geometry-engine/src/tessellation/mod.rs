@@ -368,12 +368,24 @@ pub fn tessellate_shell(
         // sphere's angle-limited grid), the edge length can be ~`chord_tolerance`
         // itself, so welding at that distance collapses every vertex and deletes
         // the whole mesh (a coarse-LOD sphere came out invisible — found by the
-        // tessellation ablation harness). Cap it well below any realistic edge
-        // spacing; the cap equals the default chord so fine tessellation (the
-        // production path) is byte-for-byte unchanged, and bit-exact seams still
-        // merge at any positive distance.
-        const MAX_WELD_DISTANCE: f64 = 1e-3;
-        let weld_distance = params.chord_tolerance.min(MAX_WELD_DISTANCE);
+        // tessellation ablation harness).
+        //
+        // Slice 5 (tolerance authority): the cap is `authority::MESH_WELD_CAP`
+        // (= 4·τ_weld), NOT the former 1e-3. Seam duplicates are bit-exact by
+        // the EdgeSampleCache contract (plus ≤~1e-9 evaluation noise on the
+        // few non-cache stitched paths), so 4e-6 still welds every genuine
+        // seam — while a REAL sub-millimetre feature (a 1e-4 ledge from a
+        // near-coincident union, a 1e-5 sliver wall) no longer has its
+        // vertices collapsed pairwise, which deleted its triangles and tore a
+        // hole in the certification mesh (`watertight=false` on a VALID
+        // B-Rep — the flush-upstand ε∈[1e-6,1e-4] danger band's mesh half).
+        // Features thinner than MESH_WELD_CAP are below the certification
+        // mesh's resolution; the plane-unification pre-pass (τ_coincide =
+        // 10·τ_weld > this cap) guarantees boolean output cannot carry
+        // cross-operand near-coincidence in that blind zone.
+        let weld_distance = params
+            .chord_tolerance
+            .min(crate::math::tolerance::authority::MESH_WELD_CAP);
         surface::weld_mesh_watertight_range(
             mesh,
             weld_distance,

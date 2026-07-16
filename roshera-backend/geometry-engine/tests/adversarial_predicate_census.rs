@@ -891,11 +891,12 @@ fn assert_sound_rows<F: Fn(&mut BRepModel, f64) -> SolidId>(
 ///   1e-4     FALSE   4    0   1   ← open shell
 ///   1e-3     true    0    0   2
 ///
-/// The danger zone at the modeling tolerance REPRODUCES on this stacked-
+/// The danger zone at the modeling tolerance REPRODUCED on this stacked-
 /// upstand shape (same band the memory's L-bracket f5 found: sound on both
 /// sides, broken in the middle where plane-coincidence and vertex-weld
-/// disagree). This test pins the SOUND rows; the broken band is the
-/// `#[ignore]`d RED below (Slice 5's tolerance-authority deliverable).
+/// disagree). This test pins the always-sound rows; the formerly broken
+/// band (1e-6/1e-4) is the now-GREEN Slice-5 test below — together they
+/// form the spec §3.4 permanent seven-rung ε sweep.
 #[test]
 fn census_flush_upstand_union_epsilon_ladder_sound_rows() {
     assert_sound_rows(
@@ -905,14 +906,19 @@ fn census_flush_upstand_union_epsilon_ladder_sound_rows() {
     );
 }
 
-/// SLICE-5 RED (danger zone): flush-upstand union must be sound at EVERY ε —
-/// no danger zone (spec §3.4: "the L-bracket union must be sound at every ε").
-/// Measured broken 2026-07-16: eps=1e-6 (sound=false) and eps=1e-4
-/// (sound=false, bnd=4, euler=1). Un-ignore when the tolerance authority
-/// (Slice 5) lands; the fix must be mutation-proven by re-splitting the
-/// τ_coincide/τ_weld derivation.
+/// SLICE-5 GREEN (was the danger-zone RED): flush-upstand union is sound at
+/// EVERY ε — no danger zone (spec §3.4: "the L-bracket union must be sound
+/// at every ε"). Measured broken 2026-07-16 pre-Slice-5: eps=1e-6
+/// (sound=false, cracked shell — the 2D coplanar clip absorbed the offset
+/// wall while the 3D vertex weld kept it distinct) and eps=1e-4
+/// (sound=false, bnd=4, euler=1 — the certification-mesh 1e-3 weld ate the
+/// real 1e-4 ledge). Closed by the tolerance authority
+/// (`math::tolerance::authority`): the τ_coincide plane-unification pre-pass
+/// (`unify_near_coincident_planes`) rewrites ≤1e-5 plane pairs to exact
+/// coincidence, and `MESH_WELD_CAP` (4·τ_weld) stops the certification mesh
+/// from collapsing real sub-millimetre features. This sweep is the
+/// PERMANENT ε fixture — a regression at any rung re-opens the danger zone.
 #[test]
-#[ignore = "Slice-5 RED: 1e-6/1e-4 danger zone (plane-coincidence vs vertex-weld disagreement)"]
 fn census_flush_upstand_union_epsilon_ladder_danger_zone() {
     assert_sound_rows(flush_upstand_union, "flush_upstand", &[1e-6, 1e-4]);
 }
@@ -926,13 +932,18 @@ fn census_sliver_wall_union_thickness_ladder_sound_rows() {
     assert_sound_rows(sliver_wall_union, "sliver_wall", &[1e-2]);
 }
 
-/// SLICE-5 RED: sliver walls thinner than ~1e-4 corrupt the union (broken
-/// weld-identity chain across the sliver's near-coincident lateral pair —
-/// census rows #1/#13/#14's uncoordinated scales). Measured broken
-/// 2026-07-16: t=1e-4 → sound=false bnd=7 nm=1 euler=3;
-/// t=1e-5 → sound=false bnd=8 nm=0 euler=4.
+/// SLICE-5 GREEN (was the thin-band RED): sub-1e-4 sliver walls union
+/// soundly. Measured broken 2026-07-16 pre-Slice-5: t=1e-4 → sound=false
+/// bnd=7 nm=1 euler=3 (certification-mesh 1e-3 weld collapsed the wall's
+/// lateral pair into a non-manifold membrane); t=1e-5 → sound=false bnd=8
+/// euler=4 (the cap-merge ±ε probe couldn't resolve a wall thinner than the
+/// classifier's OnBoundary band, read the blindness as "void", merged the
+/// footprint seam away and stranded the wall as an open component). Closed
+/// by `MESH_WELD_CAP` (4·τ_weld) + the tri-state probe honesty in
+/// `coincident_coplanar_cap_merge` / `cull_internal_coincident_faces`
+/// (undecidable probes fall back to symbolic partner-facing evidence, never
+/// silent classification).
 #[test]
-#[ignore = "Slice-5 RED: sub-1e-4 sliver walls break weld identity (bnd/nm > 0)"]
 fn census_sliver_wall_union_thickness_ladder_thin_band() {
     assert_sound_rows(sliver_wall_union, "sliver_wall", &[1e-5, 1e-4]);
 }

@@ -340,6 +340,20 @@ pub fn boolean_operation(
             operation, solid_a, solid_b,
         ));
 
+        // Slice 5 (tolerance authority §3.4): rewrite near-coincident
+        // cross-operand planes to EXACT coincidence before anything reads the
+        // geometry — the identity-first canonical rewrite that closes the
+        // ε≈τ_weld danger zone (see `unify_near_coincident_planes`). Runs
+        // inside the rollback wrapper and before the GWN operand snapshot so
+        // classification sees the canonical coordinates.
+        let unified =
+            unify_near_coincident_planes(model, solid_a, solid_b, &options.common.tolerance)?;
+        if unified > 0 {
+            pipeline_trace(format_args!(
+                "stage=unify_near_coincident_planes snapped_faces={unified}",
+            ));
+        }
+
         // Snapshot each operand's GWN classification triangles NOW, before any
         // face-splitting mutates the operands' edges/loops. Inside/outside
         // classification (`classify_point_relative_to_solid` → GWN) must test
@@ -1121,6 +1135,353 @@ fn get_solid_faces(model: &BRepModel, solid_id: SolidId) -> OperationResult<Vec<
     }
 
     Ok(faces)
+}
+
+/// Slice 5 (tolerance authority, spec §3.4): unify near-coincident
+/// cross-operand PLANES to exact coincidence BEFORE any intersection or
+/// classification runs — "identity first, exactness second"
+/// (boundary-contract rule 1: Regime-T decisions rewrite geometry to
+/// canonical form; everything downstream consumes canonical coordinates).
+///
+/// # The defect class this closes (the ε=1e-6 danger zone)
+///
+/// A face pair whose planes are separated by ~τ_weld sits exactly where the
+/// pipeline's independent identity subsystems DISAGREE: the 2D coplanar clip
+/// (i_overlay + a τ_weld shared-edge band, measured on projected/quantised
+/// coordinates) absorbs the offset as "the same boundary", while the 3D
+/// vertex weld and result-topology canonicalisation (τ_weld ball on raw
+/// coordinates, exclusive float boundary — `6 + 1e-6 − 6` lands one ulp
+/// OVER 1e-6) keep the geometry distinct. The result: the interface is
+/// culled as coincident but the offset wall's edges never mate with the
+/// base's — a cracked shell with stub edges (`coincident-face-tolerance-gap`,
+/// census flush-upstand ε=1e-6: 4 boundary edges, odd Euler).
+///
+/// No threshold juggling can fix this — as long as the offset geometry
+/// EXISTS, some subsystem measures it on a different quantity. The fix is
+/// the spec's τ_coincide unification: any cross-operand planar face pair
+/// whose separation (measured as the max deviation of one face's loop
+/// VERTICES from the other's stored plane — a vertex-set quantity, so
+/// directly comparable with the weld ball) is ≤ τ_coincide (= 10·τ_weld,
+/// strictly above every absorption reach) gets REWRITTEN: operand B's face
+/// vertices are projected onto operand A's stored plane (operand A's
+/// carrier is canonical — deterministic), its incident straight edges are
+/// rebuilt, and its plane carrier is replaced by A's. Downstream, every
+/// subsystem then sees EXACT coincidence — one consistent answer by
+/// construction. Separations > τ_coincide are real geometry, strictly above
+/// every weld/absorb/mesh-weld reach in the authority's ordering, so no
+/// subsystem can half-collapse them either. The danger band is closed from
+/// both sides.
+///
+/// # Honest limits (each guard falls back to "leave the pair as-is", the
+/// pre-Slice-5 behaviour)
+///
+/// * Only exact `Plane`-surface faces participate (planar-by-evaluation
+///   RuledSurfaces are skipped — their carriers cannot be replaced by a
+///   plane without changing their type).
+/// * A vertex shared with operand A is never moved (moving it would drag
+///   A's geometry off A's own stored carriers).
+/// * Every operand-B edge incident to a moved vertex must be a straight
+///   `Line` (arcs/circles cannot be translated endpoint-wise); otherwise
+///   the pair is skipped.
+/// * A vertex already snapped toward a near-parallel plane in this pass is
+///   not snapped again (conflicting targets = a feature thinner than
+///   τ_coincide, e.g. a sub-1e-5 lamina — collapsing it silently would be
+///   wrong; refusing keeps it intact and the mesh-weld cap ordering keeps
+///   it visible). Perpendicular targets (a corner snapping to two walls)
+///   compose fine and are allowed.
+///
+/// Moved vertices get their tolerance stamps WIDENED to the applied
+/// deviation (Parasolid union-of-spheres semantics): the snap is recorded
+/// in the toleranced model, not hidden.
+fn unify_near_coincident_planes(
+    model: &mut BRepModel,
+    solid_a: SolidId,
+    solid_b: SolidId,
+    tolerance: &Tolerance,
+) -> OperationResult<usize> {
+    use crate::math::tolerance::authority::TAU_COINCIDE;
+    use crate::primitives::curve::Line;
+    use crate::primitives::surface::Plane;
+
+    // Collect operand A's plane carriers (canonical side).
+    let faces_a = get_solid_faces(model, solid_a)?;
+    let mut planes_a: Vec<(FaceId, Point3, Vector3)> = Vec::new();
+    for &fa in &faces_a {
+        let Some(face) = model.faces.get(fa) else {
+            continue;
+        };
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if let Some(plane) = surface.as_any().downcast_ref::<Plane>() {
+            planes_a.push((fa, plane.origin, plane.normal));
+        }
+    }
+    if planes_a.is_empty() {
+        return Ok(0);
+    }
+
+    // Vertices referenced by operand A — never moved. Collected LAZILY on
+    // the first candidate pair: the overwhelmingly common boolean has no
+    // near-coincident cross-operand planes, and this pre-pass must cost
+    // nothing there (perf budget §3.7).
+    let mut verts_a: Option<HashSet<VertexId>> = None;
+
+    let faces_b = get_solid_faces(model, solid_b)?;
+
+    // Per-vertex applied snap normals (conflict detection).
+    let mut snapped_normals: HashMap<VertexId, Vec<Vector3>> = HashMap::new();
+    let mut snapped_faces = 0usize;
+
+    for &fb in &faces_b {
+        // Read fb's plane + loop vertices.
+        let (fb_surface_id, fb_origin, fb_normal, fb_bounds) = {
+            let Some(face) = model.faces.get(fb) else {
+                continue;
+            };
+            let Some(surface) = model.surfaces.get(face.surface_id) else {
+                continue;
+            };
+            let Some(plane) = surface.as_any().downcast_ref::<Plane>() else {
+                continue;
+            };
+            (face.surface_id, plane.origin, plane.normal, plane.bounds)
+        };
+        // Cheap pre-filter: any A-plane parallel to fb at all? (Normals only —
+        // no vertex walk on the common no-candidate path.)
+        let parallel_planes: Vec<&(FaceId, Point3, Vector3)> = planes_a
+            .iter()
+            .filter(|(_, _, n_a)| fb_normal.cross(n_a).magnitude() < tolerance.parallel_threshold())
+            .collect();
+        if parallel_planes.is_empty() {
+            continue;
+        }
+        let Some(fb_verts) = face_loop_vertex_ids(model, fb) else {
+            continue;
+        };
+        if fb_verts.is_empty() {
+            continue;
+        }
+
+        // Best (smallest-deviation) coincident A-plane for fb.
+        let mut best: Option<(FaceId, Point3, Vector3, f64)> = None;
+        for &&(fa, o_a, n_a) in &parallel_planes {
+            // Max vertex deviation from A's stored plane (vertex-set metric).
+            let mut dev_max = 0.0_f64;
+            let mut ok = true;
+            for &vid in &fb_verts {
+                let Some(pos) = model.vertices.get_position(vid) else {
+                    ok = false;
+                    break;
+                };
+                let d =
+                    n_a.x * (pos[0] - o_a.x) + n_a.y * (pos[1] - o_a.y) + n_a.z * (pos[2] - o_a.z);
+                dev_max = dev_max.max(d.abs());
+            }
+            if !ok || dev_max == 0.0 || dev_max > TAU_COINCIDE {
+                continue;
+            }
+            if best.map(|(_, _, _, bd)| dev_max < bd).unwrap_or(true) {
+                best = Some((fa, o_a, n_a, dev_max));
+            }
+        }
+        let Some((fa, o_a, n_a, dev_max)) = best else {
+            continue;
+        };
+
+        // Guard: no fb vertex may be shared with operand A, and none may
+        // already be snapped toward a near-parallel target this pass.
+        let verts_a = verts_a.get_or_insert_with(|| {
+            let mut set: HashSet<VertexId> = HashSet::new();
+            for &fa in &faces_a {
+                if let Some(vids) = face_loop_vertex_ids(model, fa) {
+                    set.extend(vids);
+                }
+            }
+            set
+        });
+        let conflict = fb_verts.iter().any(|vid| {
+            verts_a.contains(vid)
+                || snapped_normals
+                    .get(vid)
+                    .map(|ns| ns.iter().any(|n| n.dot(&n_a).abs() > 0.9))
+                    .unwrap_or(false)
+        });
+        if conflict {
+            continue;
+        }
+
+        // Guard: every operand-B edge incident to a to-be-moved vertex must
+        // be a straight Line. Collect (edge, needs_rebuild) across all of B.
+        let moving: HashSet<VertexId> = fb_verts
+            .iter()
+            .copied()
+            .filter(|&vid| {
+                model
+                    .vertices
+                    .get_position(vid)
+                    .map(|p| {
+                        let d = n_a.x * (p[0] - o_a.x)
+                            + n_a.y * (p[1] - o_a.y)
+                            + n_a.z * (p[2] - o_a.z);
+                        d != 0.0
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        if moving.is_empty() {
+            continue;
+        }
+        let mut affected_edges: Vec<EdgeId> = Vec::new();
+        let mut lines_only = true;
+        {
+            let mut seen_edges: HashSet<EdgeId> = HashSet::new();
+            'faces: for &fb2 in &faces_b {
+                let Some(face2) = model.faces.get(fb2) else {
+                    continue;
+                };
+                let mut loop_ids = vec![face2.outer_loop];
+                loop_ids.extend(face2.inner_loops.iter().copied());
+                for lid in loop_ids {
+                    let Some(l) = model.loops.get(lid) else {
+                        continue;
+                    };
+                    for &eid in &l.edges {
+                        if !seen_edges.insert(eid) {
+                            continue;
+                        }
+                        let Some(edge) = model.edges.get(eid) else {
+                            continue;
+                        };
+                        if !moving.contains(&edge.start_vertex)
+                            && !moving.contains(&edge.end_vertex)
+                        {
+                            continue;
+                        }
+                        let is_line = model
+                            .curves
+                            .get(edge.curve_id)
+                            .map(|c| c.as_any().downcast_ref::<Line>().is_some())
+                            .unwrap_or(false);
+                        if !is_line {
+                            lines_only = false;
+                            break 'faces;
+                        }
+                        affected_edges.push(eid);
+                    }
+                }
+            }
+        }
+        if !lines_only {
+            continue;
+        }
+
+        // APPLY. 1) project fb's moving vertices onto A's plane, widening
+        // their tolerance stamps by the applied deviation.
+        for &vid in &moving {
+            let Some(p) = model.vertices.get_position(vid) else {
+                continue;
+            };
+            let d = n_a.x * (p[0] - o_a.x) + n_a.y * (p[1] - o_a.y) + n_a.z * (p[2] - o_a.z);
+            model
+                .vertices
+                .set_position(vid, p[0] - n_a.x * d, p[1] - n_a.y * d, p[2] - n_a.z * d);
+            let widened = model
+                .vertices
+                .get_tolerance(vid)
+                .unwrap_or(crate::math::tolerance::authority::TAU_WELD)
+                .max(d.abs());
+            model.vertices.set_tolerance(vid, widened);
+            snapped_normals.entry(vid).or_default().push(n_a);
+        }
+
+        // 2) rebuild affected straight edges between their (moved) vertices.
+        // A FRESH curve id is minted per edge (never mutate the old curve —
+        // it may be aliased by an edge outside the moved set).
+        for eid in affected_edges {
+            let Some((sv, ev)) = model.edges.get(eid).map(|e| (e.start_vertex, e.end_vertex))
+            else {
+                continue;
+            };
+            let (Some(sp), Some(ep)) = (
+                model.vertices.get_position(sv),
+                model.vertices.get_position(ev),
+            ) else {
+                continue;
+            };
+            let new_curve = model.curves.add(Box::new(Line::new(
+                Point3::new(sp[0], sp[1], sp[2]),
+                Point3::new(ep[0], ep[1], ep[2]),
+            )));
+            if let Some(edge) = model.edges.get_mut(eid) {
+                edge.curve_id = new_curve;
+                edge.param_range = crate::primitives::curve::ParameterRange::unit();
+                edge.invalidate_length_cache();
+            }
+        }
+
+        // 3) replace fb's plane carrier with A's plane (facing preserved).
+        let n_target = if fb_normal.dot(&n_a) >= 0.0 {
+            n_a
+        } else {
+            -n_a
+        };
+        let projected_origin = {
+            let d = n_a.x * (fb_origin.x - o_a.x)
+                + n_a.y * (fb_origin.y - o_a.y)
+                + n_a.z * (fb_origin.z - o_a.z);
+            Point3::new(
+                fb_origin.x - n_a.x * d,
+                fb_origin.y - n_a.y * d,
+                fb_origin.z - n_a.z * d,
+            )
+        };
+        // Keep fb's own u_dir; Plane::new re-orthonormalises it against the
+        // (essentially identical) new normal.
+        let fb_u_dir = model
+            .surfaces
+            .get(fb_surface_id)
+            .and_then(|s| s.as_any().downcast_ref::<Plane>().map(|p| p.u_dir));
+        if let Some(u_dir) = fb_u_dir {
+            if let Ok(mut new_plane) = Plane::new(projected_origin, n_target, u_dir) {
+                new_plane.bounds = fb_bounds;
+                let new_surface_id = model.surfaces.add(Box::new(new_plane));
+                if let Some(face) = model.faces.get_mut(fb) {
+                    face.surface_id = new_surface_id;
+                }
+            }
+        }
+
+        snapped_faces += 1;
+        pipeline_trace(format_args!(
+            "stage=unify_near_coincident_planes face_b={fb} -> plane(face_a={fa}) dev_max={dev_max:.3e}",
+        ));
+    }
+
+    Ok(snapped_faces)
+}
+
+/// All vertex ids referenced by `face_id`'s outer + inner loops (deduped).
+fn face_loop_vertex_ids(model: &BRepModel, face_id: FaceId) -> Option<Vec<VertexId>> {
+    let face = model.faces.get(face_id)?;
+    let mut loop_ids = vec![face.outer_loop];
+    loop_ids.extend(face.inner_loops.iter().copied());
+    let mut out: Vec<VertexId> = Vec::new();
+    for lid in loop_ids {
+        let l = model.loops.get(lid)?;
+        for &eid in &l.edges {
+            let e = model.edges.get(eid)?;
+            if e.start_vertex != crate::primitives::vertex::INVALID_VERTEX_ID {
+                out.push(e.start_vertex);
+            }
+            if e.end_vertex != crate::primitives::vertex::INVALID_VERTEX_ID {
+                out.push(e.end_vertex);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
 }
 
 /// Intersect two faces
@@ -8430,7 +8791,8 @@ fn fragment_is_origin_hole_void(
     let Ok(n) = sp.normal.normalize() else {
         return false;
     };
-    const EPS: f64 = 1.0e-3;
+    // Slice 5 (tolerance authority): ε derives from the authority.
+    const EPS: f64 = crate::math::tolerance::authority::EPS_PROBE;
     let material = |signed: f64| -> bool {
         let q = Point3::new(
             ip.x + n.x * signed,
@@ -11684,14 +12046,17 @@ pub(super) fn create_edge_from_curve(
     let start_point = curve.evaluate(0.0)?.position;
     let end_point = curve.evaluate(1.0)?.position;
 
-    // Create or find vertices
+    // Create or find vertices. Slice 5 (tolerance authority): the weld ball
+    // is τ_weld — the same source scale every other identity site derives
+    // from — replacing two bare 1e-6 hardcodes.
+    let tau_weld = crate::math::tolerance::authority::TAU_WELD;
     let start_vertex =
         model
             .vertices
-            .add_or_find(start_point.x, start_point.y, start_point.z, 1e-6);
+            .add_or_find(start_point.x, start_point.y, start_point.z, tau_weld);
     let end_vertex = model
         .vertices
-        .add_or_find(end_point.x, end_point.y, end_point.z, 1e-6);
+        .add_or_find(end_point.x, end_point.y, end_point.z, tau_weld);
 
     // Create edge. F7-α: boolean intersection edges thread the
     // kernel default tolerance explicitly so the F7-δ sew pass can
@@ -14284,24 +14649,49 @@ fn coincident_coplanar_cap_merge(
     // (plus-side material, minus-side material) along the fragment's surface
     // normal at its interior point. `None` when any geometric query fails —
     // the conservative outcome (no merge, keep the seam).
-    const EPS: f64 = 1.0e-3;
+    //
+    // Slice 5 (tolerance authority): ε derives from the authority
+    // (ε_probe = 1000·τ_weld), and the per-side verdict is TRI-STATE. A
+    // probe that classifies `OnBoundary` against either operand means the
+    // geometry next to the probe is within the classifier's coincidence
+    // band — i.e. there may be a feature THINNER than the band (a 1e-5
+    // sliver wall standing on the seam) that the probe physically cannot
+    // resolve. Treating that blindness as "void" is how the sliver-wall
+    // union got silently flattened (the wall's footprint seam read as a
+    // spurious same-domain seam and was merged away, stranding the wall as
+    // an open component — the census thin-band RED). Undecidable evidence
+    // refuses the merge; the hole+island path + the facing-based cull
+    // handle the fragment correctly downstream.
+    const EPS: f64 = crate::math::tolerance::authority::EPS_PROBE;
     let signature = |frag: &SplitFace| -> Option<(bool, bool)> {
         let p = get_face_interior_point(model, frag).ok()?;
         let s = model.surfaces.get(frag.surface)?;
         let (u, v) = s.closest_point(&p, *tolerance).ok()?;
         let sp = s.evaluate_full(u, v).ok()?;
         let n = sp.normal.normalize().ok()?;
-        let material = |signed: f64| -> bool {
+        let material = |signed: f64| -> Option<bool> {
             let q = Point3::new(p.x + n.x * signed, p.y + n.y * signed, p.z + n.z * signed);
-            matches!(
-                classify_point_relative_to_solid(model, q, solid_a, tolerance),
-                Ok(FaceClassification::Inside)
-            ) || matches!(
-                classify_point_relative_to_solid(model, q, solid_b, tolerance),
-                Ok(FaceClassification::Inside)
-            )
+            let in_a = classify_point_relative_to_solid(model, q, solid_a, tolerance).ok()?;
+            let in_b = classify_point_relative_to_solid(model, q, solid_b, tolerance).ok()?;
+            // Either operand decisively Inside ⇒ material, regardless of the
+            // other verdict (an OnBoundary elsewhere cannot un-make material).
+            if matches!(in_a, FaceClassification::Inside)
+                || matches!(in_b, FaceClassification::Inside)
+            {
+                return Some(true);
+            }
+            // "Void" needs BOTH to be decisively Outside; an OnBoundary means
+            // the probe is inside the classifier's coincidence band of some
+            // face — a feature THINNER than the band (the 1e-5 sliver wall)
+            // is invisible to it, so blindness must not read as void.
+            if matches!(in_a, FaceClassification::Outside)
+                && matches!(in_b, FaceClassification::Outside)
+            {
+                return Some(false);
+            }
+            None // undecidable — refuse the merge (honest, conservative)
         };
-        Some((material(EPS), material(-EPS)))
+        Some((material(EPS)?, material(-EPS)?))
     };
 
     let (Some(sig_outer), Some(sig_inner)) = (signature(outer), signature(inner)) else {
@@ -16574,7 +16964,8 @@ fn cull_internal_coincident_faces(
     solid_b: SolidId,
     tolerance: &Tolerance,
 ) -> Vec<SplitFace> {
-    const EPS: f64 = 1.0e-3;
+    // Slice 5 (tolerance authority): ε derives from the authority.
+    const EPS: f64 = crate::math::tolerance::authority::EPS_PROBE;
     faces
         .into_iter()
         .filter(|face| {
@@ -16597,18 +16988,115 @@ fn cull_internal_coincident_faces(
                 return true;
             };
             let probe = Point3::new(p.x + n.x * EPS, p.y + n.y * EPS, p.z + n.z * EPS);
-            let in_a = matches!(
-                classify_point_relative_to_solid(model, probe, solid_a, tolerance),
-                Ok(FaceClassification::Inside)
-            );
-            let in_b = matches!(
-                classify_point_relative_to_solid(model, probe, solid_b, tolerance),
-                Ok(FaceClassification::Inside)
-            );
-            // Anti-domain (opposite sides) ⇒ internal ⇒ drop. Same-domain ⇒ keep.
-            in_a == in_b
+            let cls_a = classify_point_relative_to_solid(model, probe, solid_a, tolerance);
+            let cls_b = classify_point_relative_to_solid(model, probe, solid_b, tolerance);
+            // Slice 5 probe honesty: an `OnBoundary` (or failed) probe verdict
+            // means the probe sits within the classifier's coincidence band of
+            // some face — a feature THINNER than the band (a 1e-5 sliver wall
+            // standing on this very seam) is invisible to it, so the boolean
+            // in_a==in_b compare would read blindness as "void" and keep an
+            // internal interface (or vice versa). Fall back to SYMBOLIC
+            // evidence: the coincident partner face's own outward facing (no
+            // probe at all — spec §3.4's same-domain pairing direction).
+            match (cls_a, cls_b) {
+                (Ok(a_cls), Ok(b_cls))
+                    if !matches!(a_cls, FaceClassification::OnBoundary)
+                        && !matches!(b_cls, FaceClassification::OnBoundary) =>
+                {
+                    let in_a = matches!(a_cls, FaceClassification::Inside);
+                    let in_b = matches!(b_cls, FaceClassification::Inside);
+                    // Anti-domain (opposite sides) ⇒ internal ⇒ drop.
+                    // Same-domain ⇒ keep.
+                    in_a == in_b
+                }
+                (cls_a, cls_b) => {
+                    match coincident_partner_same_facing(
+                        model, face, solid_a, solid_b, &p, tolerance,
+                    ) {
+                        // Symbolic evidence found: a PARALLEL coincident
+                        // partner face on the other operand. Same facing ⇒
+                        // same-domain seam ⇒ keep; anti ⇒ mating interface ⇒
+                        // internal ⇒ drop.
+                        Some(same_facing) => same_facing,
+                        // No coincident parallel partner: the OnBoundary came
+                        // from unrelated nearby geometry — fall back to the
+                        // legacy compare (OnBoundary counts as not-inside),
+                        // preserving pre-Slice-5 behaviour for every case the
+                        // probe blindness cannot actually corrupt.
+                        None => {
+                            let in_a = matches!(cls_a, Ok(FaceClassification::Inside));
+                            let in_b = matches!(cls_b, Ok(FaceClassification::Inside));
+                            in_a == in_b
+                        }
+                    }
+                }
+            }
         })
         .collect()
+}
+
+/// Symbolic same-domain evidence for a coincident (`OnBoundary`) fragment when
+/// the ±ε material probe is undecidable (Slice 5): find the OTHER operand's
+/// face that geometrically contains the fragment's interior point (the
+/// coincident partner that made the fragment `OnBoundary` in the first place)
+/// and compare OUTWARD FACINGS read from the faces' own stored orientations —
+/// no classifier sampling involved.
+///
+/// * `Some(true)`  — partner faces the SAME way ⇒ the two solids' boundaries
+///   coincide facing one direction (same-domain seam) ⇒ KEEP one copy.
+/// * `Some(false)` — partner faces the OPPOSITE way ⇒ the solids mate across
+///   this interface (material on both sides) ⇒ internal ⇒ DROP.
+/// * `None` — no coincident partner found (the probe's uncertainty came from
+///   unrelated nearby geometry); the caller keeps the fragment (conservative,
+///   pre-Slice-5 behaviour).
+fn coincident_partner_same_facing(
+    model: &BRepModel,
+    frag: &SplitFace,
+    solid_a: SolidId,
+    solid_b: SolidId,
+    p: &Point3,
+    tolerance: &Tolerance,
+) -> Option<bool> {
+    let other = if frag.from_solid == solid_a {
+        solid_b
+    } else {
+        solid_a
+    };
+    let own_normal = face_outward_normal_at(model, frag.original_face, p, tolerance)?;
+    let other_faces = get_solid_faces(model, other).ok()?;
+    for fid in other_faces {
+        if !is_point_in_face(model, fid, p, tolerance).unwrap_or(false) {
+            continue;
+        }
+        let Some(partner_normal) = face_outward_normal_at(model, fid, p, tolerance) else {
+            continue;
+        };
+        // A genuine coincident partner is PARALLEL (or anti-parallel) to the
+        // fragment. A perpendicular face through the interior point (e.g. a
+        // top plane crossing a wall fragment mid-height) is an incidence, not
+        // a partner — matching it produced a spurious "anti-facing ⇒ drop"
+        // (offset-prism chained-union regression, found by the lib fleet).
+        let d = own_normal.dot(&partner_normal);
+        if d.abs() < 1.0 - tolerance.aligned_threshold() {
+            continue;
+        }
+        return Some(d > 0.0);
+    }
+    None
+}
+
+/// The outward (orientation-signed) normal of `face_id` at the surface point
+/// closest to `p`. `None` on any lookup/evaluation failure.
+fn face_outward_normal_at(
+    model: &BRepModel,
+    face_id: FaceId,
+    p: &Point3,
+    tolerance: &Tolerance,
+) -> Option<Vector3> {
+    let face = model.faces.get(face_id)?;
+    let surface = model.surfaces.get(face.surface_id)?;
+    let (u, v) = surface.closest_point(p, *tolerance).ok()?;
+    face.normal_at(u, v, &model.surfaces).ok()?.normalize().ok()
 }
 
 /// Select faces based on boolean operation type
@@ -17222,7 +17710,9 @@ fn canonicalise_face_edges_by_position(
     // VertexId at each geometric position wins. O(N²) where N = unique
     // touched vertices — bounded by a few dozen for typical Boolean
     // outputs, negligible vs. upstream arrangement cost.
-    let position_tol_sq: f64 = 1e-12;
+    // Slice 5 (tolerance authority): the canonicalisation ball is τ_weld²
+    // (formerly a bare 1e-12) — the same identity scale as the vertex weld.
+    let position_tol_sq: f64 = crate::math::tolerance::authority::TAU_WELD_SQ;
     let mut canon_v: HashMap<VertexId, VertexId> = HashMap::new();
     for i in 0..touched_vids.len() {
         let (vid, pos) = touched_vids[i];
@@ -17252,7 +17742,8 @@ fn canonicalise_face_edges_by_position(
         let t = 0.5 * (edge.param_range.start + edge.param_range.end);
         curve.evaluate(t).ok().map(|p| p.position)
     };
-    let mid_tol_sq = 1.0e-12;
+    // Slice 5: same τ_weld² identity scale as the vertex canonicalisation.
+    let mid_tol_sq = crate::math::tolerance::authority::TAU_WELD_SQ;
 
     // Step 3: build the canonical-edge map. Key is the unordered
     // (canonical_vid, canonical_vid) pair; because DISTINCT curves can share a
@@ -18077,7 +18568,9 @@ fn group_faces_by_adjacency(faces: &[SplitFace], model: &BRepModel) -> Vec<Vec<u
     // touched vertices, which is bounded by a few dozen for typical
     // boolean-result face counts — negligible vs. the asymptotic cost
     // of arrangement extraction upstream.
-    let position_tol_sq: f64 = 1e-12;
+    // Slice 5 (tolerance authority): τ_weld² — same identity scale as the
+    // vertex weld and `canonicalise_face_edges_by_position`.
+    let position_tol_sq: f64 = crate::math::tolerance::authority::TAU_WELD_SQ;
     let mut touched_vids: Vec<(VertexId, [f64; 3])> = Vec::new();
     {
         let mut seen: HashSet<VertexId> = HashSet::new();

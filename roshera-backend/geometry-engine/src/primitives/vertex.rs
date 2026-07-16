@@ -13,6 +13,7 @@
 //! numerical-kernel pattern used in nurbs.rs.
 #![allow(clippy::indexing_slicing)]
 
+use crate::math::tolerance::authority::TAU_WELD;
 use crate::math::{Point3, Vector3};
 // Note: Using DashMap globally for timeline architecture compatibility
 use dashmap::DashMap;
@@ -82,7 +83,7 @@ impl Vertex {
             id,
             flags: 0,
             _reserved: [0; 3],
-            tolerance: 1e-6, // Default CAD tolerance
+            tolerance: TAU_WELD, // Default CAD tolerance (tolerance authority, Slice 5)
         }
     }
 
@@ -95,7 +96,7 @@ impl Vertex {
             id,
             flags: VertexFlags::ON_FACE,
             _reserved: [0; 3],
-            tolerance: 1e-6, // Default CAD tolerance
+            tolerance: TAU_WELD, // Default CAD tolerance (tolerance authority, Slice 5)
         }
     }
 
@@ -303,7 +304,7 @@ impl VertexStore {
             let dz = self.z_coords[i] - z;
             let dist_sq = dx * dx + dy * dy + dz * dz;
 
-            let stored = self.tolerances.get(i).copied().unwrap_or(1e-6);
+            let stored = self.tolerances.get(i).copied().unwrap_or(TAU_WELD);
             let merged = stored.max(tolerance);
             let tolerance_sq = merged * merged;
 
@@ -338,7 +339,7 @@ impl VertexStore {
                 let dy = self.y_coords[idx] - y;
                 let dz = self.z_coords[idx] - z;
 
-                let stored = self.tolerances.get(idx).copied().unwrap_or(1e-6);
+                let stored = self.tolerances.get(idx).copied().unwrap_or(TAU_WELD);
                 let merged = stored.max(tolerance);
                 let tolerance_sq = merged * merged;
 
@@ -386,7 +387,7 @@ impl VertexStore {
                     let dy = self.y_coords[idx] - y;
                     let dz = self.z_coords[idx] - z;
 
-                    let stored = self.tolerances.get(idx).copied().unwrap_or(1e-6);
+                    let stored = self.tolerances.get(idx).copied().unwrap_or(TAU_WELD);
                     let merged = stored.max(tolerance);
                     let tolerance_sq = merged * merged;
 
@@ -421,7 +422,7 @@ impl VertexStore {
     /// Add vertex without deduplication check (uses default 1e-6 tolerance)
     #[inline(always)]
     pub fn add_unchecked(&mut self, x: f64, y: f64, z: f64) -> VertexId {
-        self.add_unchecked_with_tolerance(x, y, z, 1e-6)
+        self.add_unchecked_with_tolerance(x, y, z, TAU_WELD)
     }
 
     /// Add vertex without deduplication check, stamping the supplied
@@ -590,7 +591,7 @@ impl VertexStore {
                 id,
                 flags: self.flags[idx],
                 _reserved: [0; 3],
-                tolerance: self.tolerances.get(idx).copied().unwrap_or(1e-6),
+                tolerance: self.tolerances.get(idx).copied().unwrap_or(TAU_WELD),
             })
         } else {
             None
@@ -656,7 +657,7 @@ impl VertexStore {
                     id: idx as VertexId,
                     flags: self.flags[idx],
                     _reserved: [0; 3],
-                    tolerance: self.tolerances.get(idx).copied().unwrap_or(1e-6),
+                    tolerance: self.tolerances.get(idx).copied().unwrap_or(TAU_WELD),
                 };
                 (idx as VertexId, vertex)
             })

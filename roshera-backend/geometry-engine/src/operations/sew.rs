@@ -72,7 +72,9 @@ impl Default for SewOptions {
     fn default() -> Self {
         Self {
             common: CommonOptions::default(),
-            sew_tolerance: 1e-6,
+            // Slice 5 (tolerance authority): the default sew reach IS the
+            // model weld scale (formerly an uncoordinated 1e-6 literal).
+            sew_tolerance: crate::math::tolerance::authority::TAU_WELD,
             create_solid: true,
             merge_all: true,
             non_manifold_mode: NonManifoldMode::Reject,

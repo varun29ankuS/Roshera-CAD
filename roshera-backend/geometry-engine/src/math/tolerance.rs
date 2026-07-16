@@ -283,6 +283,131 @@ impl From<ToleranceEx> for Tolerance {
     }
 }
 
+/// TOLERANCE AUTHORITY — the single derivation for every Regime-T
+/// (toleranced-identity) length scale in the boolean/topology pipeline.
+///
+/// EXACT PREDICATES campaign, Slice 5
+/// (`docs/superpowers/specs/2026-07-16-exact-predicates-design.md` §3.4).
+///
+/// # The problem this closes
+///
+/// Before this module, at least five uncoordinated epsilon scales
+/// (1e-3 … 1e-12) participated in a single union's classification chain:
+/// the vertex weld (1e-6 hardcodes), plane-coincidence bands
+/// (`tolerance.distance()`), the coplanar-clip shared-edge band (1e-6),
+/// result-topology canonicalisation (1e-12 squared), the ±ε material
+/// probes (1e-3), the certification-mesh weld (chord-capped 1e-3), and
+/// the self-intersection oracle grid (1e-5). Each was tuned locally, so
+/// two subsystems could **disagree about identity for the same
+/// configuration** — the `coincident-face-tolerance-gap` ε=1e-6 danger
+/// zone: the 2D coplanar clip absorbed a near-coincident wall as "the
+/// same plane" while the 3D vertex weld (same nominal 1e-6, different
+/// measured quantity, exclusive float boundary) kept it distinct,
+/// tearing the result shell.
+///
+/// # The model
+///
+/// One source scale, strict ordering between derived reaches:
+///
+/// ```text
+/// τ_weld (1e-6, = NORMAL_TOLERANCE.distance())
+///   ├── identity absorption  (≤ τ_weld):   vertex weld, clip shared-band,
+///   │                                       canonicalise, cut-endpoint snap
+///   ├── MESH_WELD_CAP  = 4·τ_weld (4e-6):  certification/render mesh weld —
+///   │                                       strictly ABOVE seam-sample noise
+///   │                                       (bit-exact by the EdgeSampleCache
+///   │                                       contract + ≤1e-9 eval noise),
+///   │                                       strictly BELOW τ_coincide so no
+///   │                                       real feature can be half-eaten
+///   ├── τ_coincide     = 10·τ_weld (1e-5): plane-pair unification — a
+///   │                                       cross-operand planar face pair
+///   │                                       closer than this is REWRITTEN to
+///   │                                       exact coincidence before the
+///   │                                       boolean (identity first,
+///   │                                       boundary-contract rule 1), so
+///   │                                       every downstream subsystem sees
+///   │                                       one consistent answer
+///   └── ε_probe        = 1000·τ_weld (1e-3): same-domain/cap-merge material
+///                                            probe offset (must clear the
+///                                            classifier's OnBoundary band,
+///                                            10·τ_weld, by a wide margin)
+/// ```
+///
+/// The ordering invariants (unit-tested below):
+///   absorption (τ_weld) < MESH_WELD_CAP < τ_coincide < ε_probe.
+///
+/// A feature separation therefore falls in exactly one regime:
+///   * ≤ τ_coincide  → unified exactly upstream (no sliver can exist),
+///   * > τ_coincide  → real geometry, above every weld/absorb reach —
+///     no subsystem may collapse any part of it.
+///
+/// # Documented exemptions (scales that are genuinely independent)
+///
+/// * **Parametric guards** — `ENDPOINT_EPS`/`TERMINAL_EPS` (1e-9) and
+///   `range < 1e-15` in the boolean's split-parameter acceptance are
+///   curve-*parameter*-domain scales (t ∈ [0,1]), not metric lengths;
+///   deriving them from a metric τ would be a category error.
+/// * **Angular gates** — the plane-identity grouping keys
+///   (`dot > 1 − 1e-9` ×3), the analytic-cylinder alignment literals
+///   (`1 − 1e-6` ×2) and the edge-convexity G1 band
+///   (`Tolerance::angle()`) measure angles; the authority governs
+///   lengths. They remain owned by `Tolerance::angle()` and its derived
+///   thresholds (`parallel_threshold` etc.).
+/// * **Relative bands** — `ON_CONTOUR_BAND_FRAC` (1e-9, a fraction of the
+///   per-grid max |distance| in `surface_plane_intersection`) and
+///   `region_sliver_area_gate` (= tol², an *area*) are scale-relative
+///   quantities already derived from their local context.
+/// * **`BOOLEAN_TOLERANCE` (1e-8 tier)** — an opt-in caller tier, not a
+///   pipeline-internal identity reach.
+///
+/// The authority is intentionally CONST (not model-adaptive): the weld
+/// stamps already widen per-vertex (union-of-spheres), and an adaptive τ
+/// would re-open cross-subsystem disagreement between code that read the
+/// scale at different times.
+pub mod authority {
+    /// τ_weld — THE source scale. Equals `NORMAL_TOLERANCE.distance()`
+    /// (the kernel default vertex tolerance; asserted in tests).
+    pub const TAU_WELD: f64 = 1e-6;
+
+    /// τ_weld² — squared form for `dist_sq` comparisons (vertex/edge
+    /// canonicalisation in the boolean result-topology pass).
+    pub const TAU_WELD_SQ: f64 = TAU_WELD * TAU_WELD;
+
+    /// Certification/render mesh weld cap (see module doc for the
+    /// ordering rationale). Replaces the former chord-derived 1e-3 cap
+    /// that silently ate sub-millimetre features out of the
+    /// certification mesh (flush-upstand ε=1e-4 ledge, 1e-4/1e-5 sliver
+    /// walls) and turned VALID B-Reps into `watertight=false` verdicts.
+    pub const MESH_WELD_CAP: f64 = 4.0 * TAU_WELD;
+
+    /// τ_coincide — cross-operand plane-pair unification reach, measured
+    /// as the max deviation of one face's loop vertices from the other
+    /// face's stored plane (a vertex-set quantity, so provably
+    /// consistent with the weld ball by construction). Strictly greater
+    /// than every absorption reach (τ_weld + the coplanar clip's
+    /// i_overlay quantisation ≲ 1e-8·scale + float-boundary ulps), so
+    /// the ε=1e-6 race — clip says "same", weld says "different" —
+    /// cannot occur: anything the clip could absorb has already been
+    /// rewritten to exact coincidence.
+    pub const TAU_COINCIDE: f64 = 10.0 * TAU_WELD;
+
+    /// ε_probe — the ± offset for same-domain / cap-merge material
+    /// probes. Must clear the point classifier's OnBoundary band
+    /// (`tolerance.distance()·10`) by a wide margin so a probe verdict
+    /// is decisive for well-formed features; features THINNER than the
+    /// classifier band are undecidable by probing and must be treated
+    /// as unresolved (honest refuse), never silently classified.
+    pub const EPS_PROBE: f64 = 1000.0 * TAU_WELD;
+
+    /// Self-intersection oracle weld grid (`harness/self_intersection`):
+    /// vertices are quantised at this spacing before the triangle-pair
+    /// scan so shared-edge triangles don't report their own seam.
+    /// 10·τ_weld: coarser than the vertex weld (a pair merged by the
+    /// weld is always merged here too — no false self-touch at welded
+    /// seams), far below feature scale.
+    pub const SELF_INTERSECTION_WELD_GRID: f64 = 10.0 * TAU_WELD;
+}
+
 /// Strict tolerance for critical operations (1 nanometer)
 pub const STRICT_TOLERANCE: Tolerance = Tolerance {
     distance: 1e-9,
@@ -522,6 +647,27 @@ pub mod advanced {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tolerance authority's derivation invariants (Slice 5). If any
+    /// of these fail, two Regime-T subsystems can disagree about identity
+    /// for the same configuration — the ε-danger-zone class.
+    #[test]
+    fn authority_derivation_invariants() {
+        use authority::*;
+        // The source scale IS the kernel default vertex tolerance.
+        assert_eq!(TAU_WELD, NORMAL_TOLERANCE.distance());
+        assert_eq!(TAU_WELD_SQ, TAU_WELD * TAU_WELD);
+        // Strict ordering: absorption < mesh weld < coincide < probe.
+        assert!(TAU_WELD < MESH_WELD_CAP);
+        assert!(MESH_WELD_CAP < TAU_COINCIDE);
+        assert!(TAU_COINCIDE < EPS_PROBE);
+        // The probe must clear the classifier's OnBoundary band (10·τ)
+        // by at least an order of magnitude for decisive verdicts.
+        assert!(EPS_PROBE >= 100.0 * (10.0 * TAU_WELD));
+        // The self-intersection grid must cover the vertex weld (a pair
+        // the weld merges must never read as a self-touch).
+        assert!(SELF_INTERSECTION_WELD_GRID >= TAU_WELD);
+    }
 
     #[test]
     fn test_tolerance_creation() {
