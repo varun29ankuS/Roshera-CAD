@@ -63,6 +63,10 @@ pub mod snap;
 // Constraint inference: draft entity → proposed constraints (D-1-b).
 pub mod inference;
 
+// Sketch operations — trim/extend/offset/mirror/patterns (SKETCH-DCM
+// #45 Slice 6, spec §3.4).
+pub mod sketch_ops;
+
 // Utilities
 pub mod sketch_topology;
 pub mod sketch_validation;
@@ -104,6 +108,10 @@ pub use sketch_certificate::{
     ConstraintRole, DecompositionStats, DofSnapshot, EntityConstrainment, EntityStatus,
     SketchConstrainedness, SketchValidityCertificate, SolverVerdict, WitnessConstraint,
     WitnessKind,
+};
+pub use sketch_ops::{
+    circular_pattern, extend, linear_pattern, mirror, offset, trim, EntityProvenance, LineEnd,
+    SketchOpError, SketchOpKind, SketchOpOutcome,
 };
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 pub use snap::{SnapCandidate, SnapKind};

@@ -539,8 +539,11 @@ fn refuse_constraint_component_falls_back_and_surfaces_the_violation() {
     let q2 = sketch.add_point(Point2d::new(5.0, 0.0));
     anchor(&sketch, q1, 0.0, 0.0);
     anchor(&sketch, q2, 5.0, 0.0);
+    // Fixture migrated from MinDistance when SKETCH-DCM #45 Slice 6
+    // gave the inequalities real residuals — MomentOfInertia is the
+    // surviving refuse exemplar.
     let refuse_id = sketch.add_constraint(required_dim(
-        DimensionalConstraint::MinDistance(2.0),
+        DimensionalConstraint::MomentOfInertia(2.0),
         vec![EntityRef::Point(q1), EntityRef::Point(q2)],
     ));
 

@@ -1667,11 +1667,15 @@ impl ConstraintSolver {
                 }
             }
             GeometricConstraint::CurvatureContinuity => {
-                // G2 continuity between curves
+                // G2 continuity between curves. One row (κ₁ − κ₂ at
+                // the join) — the malformed-arity fallback previously
+                // emitted THREE rows against a 1-row budget, another
+                // instance of the row-budget mismatch fixed in
+                // `constraint_error_count` (SKETCH-DCM #45 Slice 6).
                 if entities.len() == 2 {
                     self.evaluate_g2_continuity(&entities[0], &entities[1])
                 } else {
-                    vec![0.0, 0.0, 0.0]
+                    vec![0.0]
                 }
             }
             GeometricConstraint::IntersectionAngle(target_angle) => {
@@ -1735,14 +1739,17 @@ impl ConstraintSolver {
                     vec![0.0, 0.0]
                 }
             }
+            // Offset-pair correspondence (SKETCH-DCM #45 Slice 6).
+            GeometricConstraint::Offset => self.evaluate_offset_constraint(entities),
+            // One line tangent to N curves (SKETCH-DCM #45 Slice 6).
+            GeometricConstraint::MultiTangent => self.evaluate_multitangent_constraint(entities),
             // Recognised but not yet enforceable with a real equation.
             // Emit an irreducible residual so the solver refuses to claim
             // a solve rather than silently DOF-counting them (they also
             // remove 0 DOF — see `degrees_of_freedom_removed`).
-            GeometricConstraint::Offset
-            | GeometricConstraint::MultiTangent
-            | GeometricConstraint::CurvatureExtremum
-            | GeometricConstraint::ContactConstraint => Self::unsupported_residual(),
+            GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint => {
+                Self::unsupported_residual()
+            }
         }
     }
 
@@ -1926,15 +1933,54 @@ impl ConstraintSolver {
                     vec![0.0, 0.0]
                 }
             }
+            // Offset-gap magnitude (SKETCH-DCM #45 Slice 6): pins the
+            // scalar the `Offset` correspondence leaves free.
+            DimensionalConstraint::OffsetDistance(target_gap) => {
+                self.evaluate_offset_distance_constraint(*target_gap, entities)
+            }
+            // One-sided inequalities (SKETCH-DCM #45 Slice 6), enforced
+            // active-set style: the residual is zero (inactive) while
+            // the bound holds and equals the violation depth otherwise,
+            // so Newton pushes the geometry exactly to the bound and no
+            // further. The residual is C0 (kink at the bound); the
+            // central-difference Jacobian sees a half-slope in the kink
+            // cell, which still points into the feasible region — the
+            // damped update converges onto the boundary from the
+            // violated side. Inequalities remove ZERO DOF by design.
+            DimensionalConstraint::MinDistance(bound) => {
+                if entities.len() == 2 {
+                    if let (Some(p1), Some(p2)) = (
+                        self.get_point_position(&entities[0]),
+                        self.get_point_position(&entities[1]),
+                    ) {
+                        vec![(bound - p1.distance_to(&p2)).max(0.0)]
+                    } else {
+                        vec![0.0]
+                    }
+                } else {
+                    vec![0.0]
+                }
+            }
+            DimensionalConstraint::MaxDistance(bound) => {
+                if entities.len() == 2 {
+                    if let (Some(p1), Some(p2)) = (
+                        self.get_point_position(&entities[0]),
+                        self.get_point_position(&entities[1]),
+                    ) {
+                        vec![(p1.distance_to(&p2) - bound).max(0.0)]
+                    } else {
+                        vec![0.0]
+                    }
+                } else {
+                    vec![0.0]
+                }
+            }
             // Recognised but not yet enforceable with a real equation:
-            // one-sided inequalities (Min/MaxDistance), moment of inertia,
-            // and the ambiguous offset distance. Emit an irreducible
-            // residual so the solver refuses to claim a solve — paired
-            // with `degrees_of_freedom_removed() == 0` for these kinds.
-            DimensionalConstraint::MinDistance(_)
-            | DimensionalConstraint::MaxDistance(_)
-            | DimensionalConstraint::MomentOfInertia(_)
-            | DimensionalConstraint::OffsetDistance(_) => Self::unsupported_residual(),
+            // moment of inertia needs region mass-property residuals
+            // w.r.t. sketch DOFs (exact-mass-properties campaign). Emit
+            // an irreducible residual so the solver refuses to claim a
+            // solve — paired with `degrees_of_freedom_removed() == 0`.
+            DimensionalConstraint::MomentOfInertia(_) => Self::unsupported_residual(),
         }
     }
 
@@ -2455,13 +2501,29 @@ impl ConstraintSolver {
             }
         }
 
+        // One-sided inequalities (SKETCH-DCM #45 Slice 6): a SATISFIED
+        // inequality is inactive — its residual and gradient are
+        // identically zero — so the rank scan always sees a dependent
+        // zero row. That is not redundancy (the standing bound still
+        // carries information); skip classification for inactive
+        // inequalities. A VIOLATED dependent inequality (e.g. between
+        // fully fixed geometry) still classifies as a conflict.
+        let inequality_ids: std::collections::HashSet<ConstraintId> = self
+            .constraints
+            .iter()
+            .filter(|c| c.constraint_type.is_inequality())
+            .map(|c| c.id)
+            .collect();
+
         let mut redundant = Vec::new();
         let mut conflicts = Vec::new();
         for cid in order {
             if all_dependent.get(&cid).copied().unwrap_or(false) {
                 let mag = residual_sq.get(&cid).copied().unwrap_or(0.0).sqrt();
                 if mag <= self.tolerance {
-                    redundant.push(cid);
+                    if !inequality_ids.contains(&cid) {
+                        redundant.push(cid);
+                    }
                 } else {
                     conflicts.push(cid);
                 }
@@ -2509,6 +2571,37 @@ impl ConstraintSolver {
                 GeometricConstraint::IntersectionAngle(_) => 2,
                 // Centroid pins a point to a centre of mass: (Δx, Δy).
                 GeometricConstraint::Centroid => 2,
+                // Two-row residuals whose budgets were latently WRONG
+                // (they fell through to the 1-row default, so the
+                // Jacobian under-allocated and `compute_jacobian`
+                // indexed out of bounds the first time one of these
+                // was actually solved — exposed by the Slice-6 mirror
+                // op minting `Symmetric`). Each matches its evaluator:
+                // Concentric = center delta (Δx, Δy); Symmetric =
+                // reflected-position delta (Δx, Δy); Midpoint =
+                // midpoint delta (Δx, Δy); SmoothTangent = tangency
+                // cross + magnitude match.
+                GeometricConstraint::Concentric
+                | GeometricConstraint::Symmetric
+                | GeometricConstraint::Midpoint
+                | GeometricConstraint::SmoothTangent => 2,
+                // Offset correspondence (SKETCH-DCM #45 Slice 6): 3 rows
+                // for a line pair, 2 (concentric) for a circle/arc pair,
+                // 1 refuse row otherwise — must match
+                // `evaluate_offset_constraint` exactly.
+                GeometricConstraint::Offset => match constraint.entities.as_slice() {
+                    [EntityRef::Line(_), EntityRef::Line(_)] => 3,
+                    [EntityRef::Circle(_) | EntityRef::Arc(_), EntityRef::Circle(_) | EntityRef::Arc(_)] => {
+                        2
+                    }
+                    _ => 1,
+                },
+                // MultiTangent: one tangency row per trailing curve
+                // (refuse rows keep the same budget) — must match
+                // `evaluate_multitangent_constraint` exactly.
+                GeometricConstraint::MultiTangent => {
+                    constraint.entities.len().saturating_sub(1).max(1)
+                }
                 _ => 1,
             },
             // `DimensionalConstraint::Angle` shares the 2-vector angle
@@ -2869,6 +2962,135 @@ impl ConstraintSolver {
         }
     }
 
+    /// Segment endpoints of a shared-endpoint (derived) line, in the
+    /// stored (start, end) order. `None` for legacy point+direction
+    /// lines — they carry no bounded extent, so correspondence-style
+    /// constraints (`Offset`) refuse them.
+    fn get_segment_endpoints(&self, entity: &EntityRef) -> Option<(Point2d, Point2d)> {
+        let (start, end) = self.derived_segment_of(entity)?;
+        Some((
+            self.get_point_position(&start)?,
+            self.get_point_position(&end)?,
+        ))
+    }
+
+    /// Offset-pair correspondence residual (SKETCH-DCM #45 Slice 6).
+    ///
+    /// Line pair `[A, B]` (both shared-endpoint segments): B is the
+    /// parallel-curve of A when each endpoint of B sits perpendicular
+    /// off the matching endpoint of A by one COMMON gap:
+    ///
+    /// ```text
+    ///   r1 = (B.start − A.start) · d̂A      (perpendicular correspondence)
+    ///   r2 = (B.end   − A.end)   · d̂A
+    ///   r3 = ((B.start − A.start) − (B.end − A.end)) · n̂A   (common gap)
+    /// ```
+    ///
+    /// Three rows, removing 3 DOF — the gap magnitude itself stays
+    /// free (that is `OffsetDistance`'s scalar). Circle/arc pair: the
+    /// offset of a circle is the concentric circle, so the residual is
+    /// the center delta (2 rows); the radial gap stays free.
+    ///
+    /// Any other pairing (or a legacy unbounded line) has no defined
+    /// correspondence and emits the irreducible refuse residual in
+    /// EVERY row the constraint budgets — never a silent zero.
+    fn evaluate_offset_constraint(&self, entities: &[EntityRef]) -> Vec<f64> {
+        match entities {
+            [a @ EntityRef::Line(_), b @ EntityRef::Line(_)] => {
+                let (Some((a_start, a_end)), Some((b_start, b_end))) =
+                    (self.get_segment_endpoints(a), self.get_segment_endpoints(b))
+                else {
+                    return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 3];
+                };
+                let dir = Vector2d::from_points(&a_start, &a_end);
+                let Some(d_hat) = dir.normalize().ok() else {
+                    // Degenerate source segment: no direction to
+                    // correspond against — refuse.
+                    return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 3];
+                };
+                let n_hat = Vector2d::new(-d_hat.y, d_hat.x);
+                let ds = Vector2d::from_points(&a_start, &b_start);
+                let de = Vector2d::from_points(&a_end, &b_end);
+                vec![
+                    ds.dot(&d_hat),
+                    de.dot(&d_hat),
+                    ds.dot(&n_hat) - de.dot(&n_hat),
+                ]
+            }
+            [a @ (EntityRef::Circle(_) | EntityRef::Arc(_)), b @ (EntityRef::Circle(_) | EntityRef::Arc(_))] => {
+                if let (Some(c1), Some(c2)) = (self.get_circle_center(a), self.get_circle_center(b))
+                {
+                    vec![c1.x - c2.x, c1.y - c2.y]
+                } else {
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
+                }
+            }
+            _ => Self::unsupported_residual(),
+        }
+    }
+
+    /// Offset-gap magnitude residual (SKETCH-DCM #45 Slice 6): pins
+    /// the one scalar [`Self::evaluate_offset_constraint`] leaves
+    /// free. Line pair: |perpendicular distance from B's midpoint to
+    /// A's carrier| − gap (side-agnostic — the op that minted the
+    /// constraint chose the side; the constraint maintains the
+    /// magnitude). Circle/arc pair: |r_A − r_B| − gap. Unsupported
+    /// pairings refuse.
+    fn evaluate_offset_distance_constraint(
+        &self,
+        target_gap: f64,
+        entities: &[EntityRef],
+    ) -> Vec<f64> {
+        match entities {
+            [a @ EntityRef::Line(_), b @ EntityRef::Line(_)] => {
+                let (Some((a_start, a_end)), Some((b_start, b_end))) =
+                    (self.get_segment_endpoints(a), self.get_segment_endpoints(b))
+                else {
+                    return Self::unsupported_residual();
+                };
+                let dir = Vector2d::from_points(&a_start, &a_end);
+                let Some(d_hat) = dir.normalize().ok() else {
+                    return Self::unsupported_residual();
+                };
+                let mid_b = b_start.midpoint(&b_end);
+                let to_mid = Vector2d::from_points(&a_start, &mid_b);
+                vec![to_mid.cross(&d_hat).abs() - target_gap]
+            }
+            [a @ (EntityRef::Circle(_) | EntityRef::Arc(_)), b @ (EntityRef::Circle(_) | EntityRef::Arc(_))] => {
+                if let (Some(r1), Some(r2)) = (self.get_circle_radius(a), self.get_circle_radius(b))
+                {
+                    vec![(r1 - r2).abs() - target_gap]
+                } else {
+                    Self::unsupported_residual()
+                }
+            }
+            _ => Self::unsupported_residual(),
+        }
+    }
+
+    /// MultiTangent residual (SKETCH-DCM #45 Slice 6): entities are
+    /// `[line, curve1, …, curveN]` — the line is simultaneously
+    /// tangent to every trailing circle/arc (one tangency row per
+    /// curve, each identical in form to [`Self::evaluate_tangent_constraint`]).
+    /// Any other shape (no leading line, non-circular curves, fewer
+    /// than two entities) refuses across the full row budget.
+    fn evaluate_multitangent_constraint(&self, entities: &[EntityRef]) -> Vec<f64> {
+        let rows = entities.len().saturating_sub(1).max(1);
+        match entities {
+            [line @ EntityRef::Line(_), rest @ ..]
+                if !rest.is_empty()
+                    && rest
+                        .iter()
+                        .all(|e| matches!(e, EntityRef::Circle(_) | EntityRef::Arc(_))) =>
+            {
+                rest.iter()
+                    .flat_map(|curve| self.evaluate_tangent_constraint(line, curve))
+                    .collect()
+            }
+            _ => vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; rows],
+        }
+    }
+
     /// Evaluate equal constraint between entities
     fn evaluate_equal_constraint(&self, entity1: &EntityRef, entity2: &EntityRef) -> Vec<f64> {
         // Compare appropriate dimensions based on entity types
@@ -2943,7 +3165,18 @@ impl ConstraintSolver {
         if let (Some(axis_point), Some(axis_dir)) =
             (self.get_line_point(axis), self.get_line_direction(axis))
         {
-            let axis_normal = Vector2d::new(-axis_dir.y, axis_dir.x); // Perpendicular to axis
+            // The reflection formula needs a UNIT normal: with a raw
+            // direction the offset scales by |axis_dir|², which is
+            // silently correct only for legacy unit-direction lines.
+            // A derived-segment axis (direction = end − start, length
+            // = the segment's length) produced reflections scaled by
+            // length² — exposed by the Slice-6 mirror op, which mints
+            // Symmetric against construction segment axes.
+            let Ok(axis_unit) = axis_dir.normalize() else {
+                // Degenerate axis: no defined reflection, no pull.
+                return vec![0.0, 0.0];
+            };
+            let axis_normal = Vector2d::new(-axis_unit.y, axis_unit.x); // Perpendicular to axis
 
             // Get positions of entities to be made symmetric
             if let (Some(p1), Some(p2)) = (
@@ -2987,7 +3220,12 @@ impl ConstraintSolver {
                     vec![0.0]
                 }
             }
-            EntityRef::Circle(_) => {
+            // Circle AND arc carriers (SKETCH-DCM #45 Slice 6 added
+            // the arc arm — trim/extend mint PointOnCurve against
+            // whatever entity the cutter was, and a silent zero row
+            // for arcs would fake the maintained contact): point at
+            // radius distance from the (possibly derived) center.
+            EntityRef::Circle(_) | EntityRef::Arc(_) => {
                 if let (Some(p), Some(center), Some(radius)) = (
                     point,
                     self.get_circle_center(curve_entity),
@@ -4262,17 +4500,174 @@ mod tests {
     }
 
     #[test]
+    fn constraint_error_count_matches_evaluated_rows_for_every_kind() {
+        // THE row-budget contract: `constraint_error_count` must equal
+        // the length `evaluate_constraint_error` actually returns —
+        // `compute_jacobian` allocates rows from the former and writes
+        // rows from the latter, so any mismatch is an out-of-bounds
+        // index (or a silently truncated Jacobian). Five kinds
+        // (Concentric, Symmetric, Midpoint, SmoothTangent,
+        // CurvatureContinuity's malformed-arity arm) shipped with the
+        // budget latently wrong and panicked the first time they were
+        // solved — exposed by the Slice-6 mirror op. This pin covers a
+        // representative constraint of EVERY variant so the contract
+        // cannot regress silently.
+        let mut s = ConstraintSolver::new();
+        let p1 = point_ref();
+        let p2 = point_ref();
+        let p3 = point_ref();
+        let l1 = line_ref();
+        let l2 = line_ref();
+        let c1 = circle_ref();
+        let c2 = circle_ref();
+        let r1 = rect_ref();
+        s.add_entity(p1, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(p2, EntityState::point(Point2d::new(4.0, 0.0), false));
+        s.add_entity(p3, EntityState::point(Point2d::new(2.0, 3.0), false));
+        s.add_entity(
+            l1,
+            EntityState::line(
+                Point2d::new(0.0, 0.0),
+                Vector2d::new(1.0, 0.0),
+                false,
+                false,
+            ),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(
+                Point2d::new(0.0, 5.0),
+                Vector2d::new(1.0, 1.0),
+                false,
+                false,
+            ),
+        );
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(1.0, 1.0), 2.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(6.0, 1.0), 3.0, false, false),
+        );
+        s.add_entity(
+            r1,
+            EntityState::rectangle(
+                Point2d::new(0.0, 0.0),
+                4.0,
+                2.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+
+        use ConstraintPriority::High;
+        let battery: Vec<Constraint> = vec![
+            Constraint::new_geometric(GeometricConstraint::Coincident, vec![p1, p2], High),
+            Constraint::new_geometric(GeometricConstraint::Parallel, vec![l1, l2], High),
+            Constraint::new_geometric(GeometricConstraint::Perpendicular, vec![l1, l2], High),
+            Constraint::new_geometric(GeometricConstraint::Tangent, vec![l1, c1], High),
+            Constraint::new_geometric(GeometricConstraint::Concentric, vec![c1, c2], High),
+            Constraint::new_geometric(GeometricConstraint::Equal, vec![c1, c2], High),
+            Constraint::new_geometric(GeometricConstraint::Horizontal, vec![l1], High),
+            Constraint::new_geometric(GeometricConstraint::Vertical, vec![l1], High),
+            Constraint::new_geometric(GeometricConstraint::Symmetric, vec![p1, p2, l1], High),
+            Constraint::new_geometric(GeometricConstraint::PointOnCurve, vec![p1, l1], High),
+            Constraint::new_geometric(GeometricConstraint::Midpoint, vec![p3, l1], High),
+            Constraint::new_geometric(GeometricConstraint::Collinear, vec![p1, p2, p3], High),
+            Constraint::new_geometric(GeometricConstraint::SmoothTangent, vec![l1, l2], High),
+            Constraint::new_geometric(GeometricConstraint::CurvatureContinuity, vec![c1, c2], High),
+            // Malformed arity — the fallback arm must budget like the
+            // well-formed one.
+            Constraint::new_geometric(GeometricConstraint::CurvatureContinuity, vec![c1], High),
+            Constraint::new_geometric(GeometricConstraint::Offset, vec![l1, l2], High),
+            Constraint::new_geometric(GeometricConstraint::Offset, vec![c1, c2], High),
+            Constraint::new_geometric(GeometricConstraint::Offset, vec![p1, c1], High),
+            Constraint::new_geometric(GeometricConstraint::MultiTangent, vec![l1, c1, c2], High),
+            Constraint::new_geometric(GeometricConstraint::MultiTangent, vec![c1, c2], High),
+            Constraint::new_geometric(GeometricConstraint::EqualArea, vec![c1, c2], High),
+            Constraint::new_geometric(GeometricConstraint::EqualPerimeter, vec![c1, c2], High),
+            Constraint::new_geometric(GeometricConstraint::Centroid, vec![p1, c1], High),
+            Constraint::new_geometric(GeometricConstraint::CurvatureExtremum, vec![c1], High),
+            Constraint::new_geometric(
+                GeometricConstraint::IntersectionAngle(1.0),
+                vec![l1, l2, p1],
+                High,
+            ),
+            Constraint::new_geometric(GeometricConstraint::ContactConstraint, vec![c1, c2], High),
+            Constraint::new_dimensional(DimensionalConstraint::Distance(4.0), vec![p1, p2], High),
+            Constraint::new_dimensional(DimensionalConstraint::Angle(1.0), vec![l1, l2], High),
+            Constraint::new_dimensional(DimensionalConstraint::Radius(2.0), vec![c1], High),
+            Constraint::new_dimensional(DimensionalConstraint::Diameter(4.0), vec![c1], High),
+            Constraint::new_dimensional(DimensionalConstraint::Length(4.0), vec![l1], High),
+            Constraint::new_dimensional(DimensionalConstraint::XCoordinate(0.0), vec![p1], High),
+            Constraint::new_dimensional(DimensionalConstraint::YCoordinate(0.0), vec![p1], High),
+            Constraint::new_dimensional(DimensionalConstraint::Area(4.0), vec![c1], High),
+            Constraint::new_dimensional(DimensionalConstraint::Perimeter(8.0), vec![c1], High),
+            Constraint::new_dimensional(DimensionalConstraint::ArcLength(3.0), vec![c1], High),
+            Constraint::new_dimensional(DimensionalConstraint::Curvature(0.5), vec![c1], High),
+            Constraint::new_dimensional(DimensionalConstraint::Slope(1.0), vec![l1], High),
+            Constraint::new_dimensional(
+                DimensionalConstraint::OffsetDistance(2.0),
+                vec![l1, l2],
+                High,
+            ),
+            Constraint::new_dimensional(
+                DimensionalConstraint::OffsetDistance(2.0),
+                vec![c1, c2],
+                High,
+            ),
+            Constraint::new_dimensional(DimensionalConstraint::AspectRatio(2.0), vec![r1], High),
+            Constraint::new_dimensional(
+                DimensionalConstraint::MinDistance(1.0),
+                vec![p1, p2],
+                High,
+            ),
+            Constraint::new_dimensional(
+                DimensionalConstraint::MaxDistance(9.0),
+                vec![p1, p2],
+                High,
+            ),
+            Constraint::new_dimensional(
+                DimensionalConstraint::MomentOfInertia(1.0),
+                vec![c1],
+                High,
+            ),
+            Constraint::new_dimensional(
+                DimensionalConstraint::CenterOfMass { x: 1.0, y: 1.0 },
+                vec![c1],
+                High,
+            ),
+        ];
+        for con in &battery {
+            let budget = s.constraint_error_count(con);
+            let rows = s.evaluate_constraint_error(con).len();
+            assert_eq!(
+                budget, rows,
+                "row budget must match evaluated rows for {:?} on {:?}",
+                con.constraint_type, con.entities
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_constraint_refuses_solve_and_reports_violation() {
-        // MinDistance is recognised but has no residual equation. It must
-        // NOT be silently reported as satisfied: the solver emits an
+        // MomentOfInertia is recognised but has no residual equation. It
+        // must NOT be silently reported as satisfied: the solver emits an
         // irreducible residual and never converges, and it removes 0 DOF.
+        // (Fixture migrated from MinDistance when SKETCH-DCM #45 Slice 6
+        // gave the inequalities real one-sided residuals — this pin
+        // guards the REMAINING refuse set.)
         let mut s = ConstraintSolver::new();
         let a = point_ref();
         let b = point_ref();
         s.add_entity(a, EntityState::point(Point2d::new(0.0, 0.0), true));
         s.add_entity(b, EntityState::point(Point2d::new(1.0, 0.0), true));
         let con = Constraint::new_dimensional(
-            DimensionalConstraint::MinDistance(5.0),
+            DimensionalConstraint::MomentOfInertia(5.0),
             vec![a, b],
             ConstraintPriority::High,
         );

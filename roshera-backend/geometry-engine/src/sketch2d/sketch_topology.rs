@@ -189,11 +189,20 @@ impl SketchTopology {
         Ok(topology)
     }
 
-    /// Build edges from sketch entities
+    /// Build edges from sketch entities.
+    ///
+    /// Construction (guide) entities are SKIPPED entirely (SKETCH-DCM
+    /// #45 Slice 6): they are solver-real but profile-invisible — a
+    /// construction circle must never nest as a bore, a construction
+    /// guide line must never close or break a loop, and the extrude
+    /// bridge (which consumes these loops) therefore never sees them.
     fn build_edges(&mut self, sketch: &super::Sketch) -> Sketch2dResult<()> {
         // Add line edges
         for entry in sketch.lines().iter() {
             let line = entry.value();
+            if line.is_construction {
+                continue;
+            }
             match &line.geometry {
                 LineGeometry::Infinite(_) => {
                     // Skip infinite lines in topology
@@ -218,6 +227,9 @@ impl SketchTopology {
         // Add arc edges
         for entry in sketch.arcs().iter() {
             let arc = entry.value();
+            if arc.is_construction {
+                continue;
+            }
             let start = arc.arc.start_point();
             let end = arc.arc.end_point();
 
@@ -235,6 +247,9 @@ impl SketchTopology {
         // Add circle edges (closed loops)
         for entry in sketch.circles().iter() {
             let circle = entry.value();
+            if circle.is_construction {
+                continue;
+            }
             let start =
                 circle
                     .circle
@@ -259,6 +274,9 @@ impl SketchTopology {
         // Add rectangle edges (4 segments)
         for entry in sketch.rectangles().iter() {
             let rect = entry.value();
+            if rect.is_construction {
+                continue;
+            }
             let corners = rect.rectangle.corners();
 
             for i in 0..4 {
@@ -278,6 +296,9 @@ impl SketchTopology {
         // Add polyline edges
         for entry in sketch.polylines().iter() {
             let polyline = entry.value();
+            if polyline.is_construction {
+                continue;
+            }
             let vertices = &polyline.polyline.vertices;
 
             let n = if polyline.polyline.is_closed {
@@ -312,6 +333,9 @@ impl SketchTopology {
         // that bulge past their chord.
         for entry in sketch.splines().iter() {
             let spline = entry.value();
+            if spline.is_construction {
+                continue;
+            }
             let (start, end) = match (spline.spline.evaluate(0.0), spline.spline.evaluate(1.0)) {
                 (Ok(s), Ok(e)) => (s, e),
                 _ => continue, // unevaluable spline cannot bound a profile
@@ -332,6 +356,9 @@ impl SketchTopology {
         // (0..2pi); the bounds hint carries the rotated extents.
         for entry in sketch.ellipses().iter() {
             let ellipse = entry.value();
+            if ellipse.is_construction {
+                continue;
+            }
             let start = ellipse.ellipse.evaluate(0.0);
             self.edges.push(TopologyEdge {
                 entity: EntityRef::Ellipse(ellipse.id),

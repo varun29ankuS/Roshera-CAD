@@ -249,10 +249,12 @@ fn solving_one_cluster_leaves_a_disjoint_satisfied_cluster_bitwise_untouched() {
 #[test]
 fn refuse_constraint_in_one_component_still_surfaces_globally() {
     // A hole cluster that solves fine + a disjoint pair carrying a
-    // recognised-but-unenforced constraint (MinDistance — the #19
-    // honest-refuse contract). The decomposed path must surface the
-    // irreducible violation exactly like the whole-system path: the
-    // sketch is never reported clean.
+    // recognised-but-unenforced constraint (MomentOfInertia — the #19
+    // honest-refuse contract; fixture migrated from MinDistance when
+    // SKETCH-DCM #45 Slice 6 gave the inequalities real residuals).
+    // The decomposed path must surface the irreducible violation
+    // exactly like the whole-system path: the sketch is never
+    // reported clean.
     let sketch = fresh();
 
     let hole_center = sketch.add_point(Point2d::new(10.2, 9.7));
@@ -278,7 +280,7 @@ fn refuse_constraint_in_one_component_still_surfaces_globally() {
     let q1 = sketch.add_point(Point2d::new(100.0, 0.0));
     let q2 = sketch.add_point(Point2d::new(105.0, 0.0));
     let refuse_id = sketch.add_constraint(Constraint::new_dimensional(
-        DimensionalConstraint::MinDistance(2.0),
+        DimensionalConstraint::MomentOfInertia(2.0),
         vec![EntityRef::Point(q1), EntityRef::Point(q2)],
         ConstraintPriority::Required,
     ));

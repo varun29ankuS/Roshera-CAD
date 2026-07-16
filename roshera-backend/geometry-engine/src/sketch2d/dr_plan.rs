@@ -210,14 +210,15 @@ pub fn references_frame(constraint_type: &ConstraintType) -> bool {
             | GeometricConstraint::EqualPerimeter
             | GeometricConstraint::Centroid
             | GeometricConstraint::IntersectionAngle(_) => false,
+            // Enforced relations between entities (SKETCH-DCM #45
+            // Slice 6) — invariant under a common rigid motion of
+            // everything involved, like Tangent/Parallel above.
+            GeometricConstraint::Offset | GeometricConstraint::MultiTangent => false,
             // Honest-refuse kinds — the planner refuses components
             // containing them before this classification matters; the
             // conservative answer keeps them out of internal sets if
             // that ever changes.
-            GeometricConstraint::Offset
-            | GeometricConstraint::MultiTangent
-            | GeometricConstraint::CurvatureExtremum
-            | GeometricConstraint::ContactConstraint => true,
+            GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint => true,
         },
         ConstraintType::Dimensional(d) => match d {
             // Absolute coordinates / frame-relative slope.
@@ -236,11 +237,17 @@ pub fn references_frame(constraint_type: &ConstraintType) -> bool {
             | DimensionalConstraint::ArcLength(_)
             | DimensionalConstraint::Curvature(_)
             | DimensionalConstraint::AspectRatio(_) => false,
-            // Honest-refuse kinds — same note as the geometric arm.
+            // Enforced rigid-motion-invariant relations (SKETCH-DCM
+            // #45 Slice 6). The inequalities remove zero DOF, so plan
+            // counting never consumes them toward placement; when one
+            // rides inside a planned step's constraint set the step
+            // Newton still honours its one-sided residual, and the
+            // executor's hard-residual verification catches any miss.
             DimensionalConstraint::OffsetDistance(_)
             | DimensionalConstraint::MinDistance(_)
-            | DimensionalConstraint::MaxDistance(_)
-            | DimensionalConstraint::MomentOfInertia(_) => true,
+            | DimensionalConstraint::MaxDistance(_) => false,
+            // Honest-refuse kind — same note as the geometric arm.
+            DimensionalConstraint::MomentOfInertia(_) => true,
         },
     }
 }

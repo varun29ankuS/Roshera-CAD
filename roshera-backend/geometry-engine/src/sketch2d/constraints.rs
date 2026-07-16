@@ -402,6 +402,37 @@ impl Constraint {
                 GeometricConstraint::Centroid => 2,
                 GeometricConstraint::IntersectionAngle(_) => 1,
 
+                // Offset-pair correspondence (SKETCH-DCM #45 Slice 6).
+                // Line pair: the offset line's endpoints correspond
+                // perpendicular to the source and share one common gap —
+                // 3 DOF (the gap magnitude stays free; `OffsetDistance`
+                // pins it). Circle/arc pair: concentric — 2 DOF (the
+                // radial gap stays free). Any other pairing has no
+                // defined correspondence: 0 DOF + the solver's
+                // irreducible refuse residual.
+                GeometricConstraint::Offset => match self.entities.as_slice() {
+                    [EntityRef::Line(_), EntityRef::Line(_)] => 3,
+                    [EntityRef::Circle(_) | EntityRef::Arc(_), EntityRef::Circle(_) | EntityRef::Arc(_)] => {
+                        2
+                    }
+                    _ => 0,
+                },
+                // One line tangent to each of N trailing circles/arcs
+                // (SKETCH-DCM #45 Slice 6): one tangency DOF per curve.
+                // Malformed shapes (no leading line, non-circular
+                // curves) remove 0 DOF and refuse in the solver.
+                GeometricConstraint::MultiTangent => match self.entities.as_slice() {
+                    [EntityRef::Line(_), rest @ ..]
+                        if !rest.is_empty()
+                            && rest
+                                .iter()
+                                .all(|e| matches!(e, EntityRef::Circle(_) | EntityRef::Arc(_))) =>
+                    {
+                        rest.len()
+                    }
+                    _ => 0,
+                },
+
                 // Recognised but not yet enforceable by the numerical
                 // solver (no real residual equation). These remove ZERO
                 // DOF so they can never fake a "fully constrained"
@@ -409,10 +440,9 @@ impl Constraint {
                 // residual (see `UNSUPPORTED_CONSTRAINT_RESIDUAL`) so a
                 // sketch carrying one is never reported solved. Keep this
                 // set in lock-step with `ConstraintType::is_numerically_enforced`.
-                GeometricConstraint::Offset
-                | GeometricConstraint::MultiTangent
-                | GeometricConstraint::CurvatureExtremum
-                | GeometricConstraint::ContactConstraint => 0,
+                GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint => {
+                    0
+                }
             },
             ConstraintType::Dimensional(d) => match d {
                 DimensionalConstraint::Distance(_) => 1,
@@ -432,14 +462,32 @@ impl Constraint {
                 DimensionalConstraint::AspectRatio(_) => 1,
                 DimensionalConstraint::CenterOfMass { .. } => 2,
 
-                // Not yet enforceable — remove ZERO DOF (see the
-                // geometric note above). One-sided inequalities
-                // (Min/MaxDistance) are not equality residuals at all;
-                // MomentOfInertia and OffsetDistance are deferred.
-                DimensionalConstraint::OffsetDistance(_)
-                | DimensionalConstraint::MinDistance(_)
-                | DimensionalConstraint::MaxDistance(_)
-                | DimensionalConstraint::MomentOfInertia(_) => 0,
+                // Offset-gap magnitude (SKETCH-DCM #45 Slice 6): pins
+                // the one scalar `Offset` leaves free. Only defined for
+                // the pairings `Offset` defines correspondence for;
+                // anything else removes 0 DOF and refuses in the solver.
+                DimensionalConstraint::OffsetDistance(_) => match self.entities.as_slice() {
+                    [EntityRef::Line(_), EntityRef::Line(_)]
+                    | [EntityRef::Circle(_) | EntityRef::Arc(_), EntityRef::Circle(_) | EntityRef::Arc(_)] => {
+                        1
+                    }
+                    _ => 0,
+                },
+
+                // One-sided inequalities (SKETCH-DCM #45 Slice 6):
+                // numerically ENFORCED via an active-set-style residual
+                // (`max(0, bound - d)` / `max(0, d - bound)`) but they
+                // remove ZERO DOF by design — the D-Cubed convention: a
+                // satisfied inequality is inactive and consumes no
+                // freedom, and a one-sided bound never pins a parameter
+                // to a point value.
+                DimensionalConstraint::MinDistance(_) | DimensionalConstraint::MaxDistance(_) => 0,
+
+                // Not yet enforceable — removes ZERO DOF (see the
+                // geometric note above); needs region mass-property
+                // residuals w.r.t. sketch DOFs (exact-mass-properties
+                // campaign, OCCT-parity roadmap #3).
+                DimensionalConstraint::MomentOfInertia(_) => 0,
             },
         }
     }
@@ -456,19 +504,37 @@ impl ConstraintType {
     /// here MUST match the zero-DOF / refusal arms in
     /// [`Constraint::degrees_of_freedom_removed`] and the solver's
     /// `evaluate_geometric_constraint` / `evaluate_dimensional_constraint`.
+    ///
+    /// SKETCH-DCM #45 Slice 6 shrank the refuse set from eight to three:
+    /// `Offset`, `MultiTangent`, `OffsetDistance`, `MinDistance` and
+    /// `MaxDistance` now carry real residuals. Note the distinction:
+    /// this method is TYPE-level. `Offset`/`OffsetDistance`/
+    /// `MultiTangent` still refuse per-SHAPE (an unsupported entity
+    /// pairing emits the irreducible residual and removes 0 DOF), which
+    /// is why [`analyze_dofs`](super::sketch_solver::analyze_dofs)
+    /// forces the numeric diagnosis whenever a constraint removes zero
+    /// structural DOF.
     pub fn is_numerically_enforced(&self) -> bool {
         !matches!(
             self,
             ConstraintType::Geometric(
-                GeometricConstraint::Offset
-                    | GeometricConstraint::MultiTangent
-                    | GeometricConstraint::CurvatureExtremum
-                    | GeometricConstraint::ContactConstraint
-            ) | ConstraintType::Dimensional(
-                DimensionalConstraint::OffsetDistance(_)
-                    | DimensionalConstraint::MinDistance(_)
-                    | DimensionalConstraint::MaxDistance(_)
-                    | DimensionalConstraint::MomentOfInertia(_)
+                GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint
+            ) | ConstraintType::Dimensional(DimensionalConstraint::MomentOfInertia(_))
+        )
+    }
+
+    /// One-sided inequality kinds (`MinDistance` / `MaxDistance`).
+    ///
+    /// Their residual is `max(0, …)` — ZERO with a zero gradient
+    /// whenever the bound is satisfied — so rank analysis must not
+    /// classify a satisfied (inactive) inequality as a redundant
+    /// duplicate: it carries standing information (the bound) even
+    /// while inactive.
+    pub fn is_inequality(&self) -> bool {
+        matches!(
+            self,
+            ConstraintType::Dimensional(
+                DimensionalConstraint::MinDistance(_) | DimensionalConstraint::MaxDistance(_)
             )
         )
     }

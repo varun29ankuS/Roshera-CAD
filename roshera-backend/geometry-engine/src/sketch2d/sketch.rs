@@ -202,6 +202,14 @@ pub struct Sketch {
     spatial_index: Arc<DashMap<(i32, i32), Vec<EntityRef>>>,
     /// Grid size for spatial indexing
     grid_size: f64,
+
+    /// Sketch-op provenance lineage (SKETCH-DCM #45 Slice 6): which
+    /// operation minted an entity and from which source — pattern
+    /// instances, mirror copies, and offset geometry carry lineage
+    /// from day one (persistent-ids campaign #11 note: the 3D pattern
+    /// ops shipped without lineage; the 2D ops must not repeat that
+    /// debt). Cleaned up by the delete paths.
+    provenance: Arc<DashMap<EntityRef, super::sketch_ops::EntityProvenance>>,
 }
 
 impl Sketch {
@@ -226,7 +234,22 @@ impl Sketch {
             constraints: ConstraintStore::new(),
             spatial_index: Arc::new(DashMap::new()),
             grid_size: 10.0, // Default 10mm grid
+            provenance: Arc::new(DashMap::new()),
         }
+    }
+
+    // Provenance lineage (SKETCH-DCM #45 Slice 6)
+
+    /// Record the op lineage of an entity (pattern instance, mirror
+    /// copy, offset geometry). Overwrites any previous record — an
+    /// entity has exactly one minting operation.
+    pub fn set_provenance(&self, entity: EntityRef, prov: super::sketch_ops::EntityProvenance) {
+        self.provenance.insert(entity, prov);
+    }
+
+    /// The op lineage of an entity, if any op minted it.
+    pub fn provenance_of(&self, entity: &EntityRef) -> Option<super::sketch_ops::EntityProvenance> {
+        self.provenance.get(entity).map(|e| e.value().clone())
     }
 
     /// Create a sketch anchored to the given datum. Convenience
@@ -708,6 +731,68 @@ impl Sketch {
         Ok(id)
     }
 
+    // Construction-geometry operations (SKETCH-DCM #45 Slice 6)
+
+    /// Mark an entity as construction (guide) geometry, or clear the
+    /// mark.
+    ///
+    /// Construction entities are SOLVER-REAL — they participate in
+    /// constraints exactly like profile geometry (a mirror axis must
+    /// stay solvable) — but they are invisible to profile extraction:
+    /// `SketchTopology::analyze` contributes no edges for them, so
+    /// they can never close a loop, punch a hole, or break a walk.
+    pub fn set_construction(
+        &self,
+        entity: &EntityRef,
+        is_construction: bool,
+    ) -> Sketch2dResult<()> {
+        let found = match entity {
+            EntityRef::Point(id) => self.points.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+            EntityRef::Line(id) => self.lines.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+            EntityRef::Arc(id) => self.arcs.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+            EntityRef::Circle(id) => self.circles.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+            EntityRef::Rectangle(id) => self.rectangles.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+            EntityRef::Ellipse(id) => self.ellipses.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+            EntityRef::Spline(id) => self.splines.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+            EntityRef::Polyline(id) => self.polylines.get_mut(id).map(|mut e| {
+                e.value_mut().is_construction = is_construction;
+            }),
+        };
+        found.ok_or_else(|| Sketch2dError::EntityNotFound {
+            entity_type: "Entity".to_string(),
+            id: entity.to_string(),
+        })
+    }
+
+    /// Whether an entity is currently marked as construction geometry.
+    /// `None` when the entity does not exist.
+    pub fn is_construction(&self, entity: &EntityRef) -> Option<bool> {
+        match entity {
+            EntityRef::Point(id) => self.points.get(id).map(|e| e.is_construction),
+            EntityRef::Line(id) => self.lines.get(id).map(|e| e.is_construction),
+            EntityRef::Arc(id) => self.arcs.get(id).map(|e| e.is_construction),
+            EntityRef::Circle(id) => self.circles.get(id).map(|e| e.is_construction),
+            EntityRef::Rectangle(id) => self.rectangles.get(id).map(|e| e.is_construction),
+            EntityRef::Ellipse(id) => self.ellipses.get(id).map(|e| e.is_construction),
+            EntityRef::Spline(id) => self.splines.get(id).map(|e| e.is_construction),
+            EntityRef::Polyline(id) => self.polylines.get(id).map(|e| e.is_construction),
+        }
+    }
+
     // Constraint operations
 
     /// Add a constraint to the sketch
@@ -1021,6 +1106,10 @@ impl Sketch {
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
 
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
+
         // Remove the point
         self.points.remove(id);
 
@@ -1044,6 +1133,10 @@ impl Sketch {
 
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
+
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
 
         // Remove the line
         self.lines.remove(id);
@@ -1069,6 +1162,10 @@ impl Sketch {
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
 
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
+
         // Remove the arc
         self.arcs.remove(id);
 
@@ -1092,6 +1189,10 @@ impl Sketch {
 
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
+
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
 
         // Remove the circle
         self.circles.remove(id);
@@ -1117,6 +1218,10 @@ impl Sketch {
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
 
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
+
         // Remove the rectangle
         self.rectangles.remove(id);
 
@@ -1140,6 +1245,10 @@ impl Sketch {
 
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
+
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
 
         // Remove the ellipse
         self.ellipses.remove(id);
@@ -1165,6 +1274,10 @@ impl Sketch {
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
 
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
+
         // Remove the spline
         self.splines.remove(id);
 
@@ -1188,6 +1301,10 @@ impl Sketch {
 
         // Remove from spatial index
         self.remove_from_spatial_index(&entity_ref);
+
+        // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
+        // dangling provenance entry would claim lineage for a dead id.
+        self.provenance.remove(&entity_ref);
 
         // Remove the polyline
         self.polylines.remove(id);
@@ -1270,6 +1387,7 @@ impl Sketch {
         self.ellipses.clear();
         self.splines.clear();
         self.polylines.clear();
+        self.provenance.clear();
 
         // Clear spatial index
         self.spatial_index.clear();

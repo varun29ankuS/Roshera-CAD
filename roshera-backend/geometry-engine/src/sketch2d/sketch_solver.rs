@@ -783,20 +783,23 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // mutable surface; the sketch is never written back. This keeps
     // `analyze_dofs` side-effect-free, matching its documented
     // contract.
-    // A constraint the solver recognises but cannot enforce (e.g.
-    // MinDistance, MomentOfInertia) removes zero DOF, so on its own it
-    // can leave a sketch looking structurally `FullyConstrained` while a
-    // constraint is being silently ignored. Detect any such constraint
-    // on supported entities and force the numerical diagnosis to run —
-    // the solver emits an irreducible residual for it, which surfaces as
-    // a conflict so the certificate refuses to call the sketch
-    // consistent rather than falsely certifying a solve.
-    let has_unenforced = sketch.all_constraints().iter().any(|c| {
-        !c.constraint_type.is_numerically_enforced()
-            && !c.entities.iter().any(|e| skipped_set.contains(e))
+    // A constraint that removes ZERO structural DOF is invisible to
+    // the count above, so on its own it can leave a sketch looking
+    // structurally `FullyConstrained` while a constraint is being
+    // refused (MomentOfInertia, an unsupported-shape Offset/
+    // MultiTangent) or violated without recourse (a one-sided
+    // inequality between fixed geometry — SKETCH-DCM #45 Slice 6).
+    // Detect any structurally-invisible constraint on supported
+    // entities and force the numerical diagnosis to run — refuse
+    // residuals and irreducible violations then surface as conflicts,
+    // so the verdict never hides behind a balanced DOF count. This
+    // subsumes the previous `is_numerically_enforced` check (every
+    // refuse kind removes zero DOF).
+    let has_invisible = sketch.all_constraints().iter().any(|c| {
+        c.degrees_of_freedom_removed() == 0 && !c.entities.iter().any(|e| skipped_set.contains(e))
     });
     let (redundant, conflicts) = match status {
-        DofStatus::FullyConstrained if !has_unenforced => (Vec::new(), Vec::new()),
+        DofStatus::FullyConstrained if !has_invisible => (Vec::new(), Vec::new()),
         _ => diagnose_constraints(sketch, &skipped_set),
     };
 
