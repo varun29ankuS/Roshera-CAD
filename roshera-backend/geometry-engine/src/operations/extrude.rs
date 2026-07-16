@@ -1718,7 +1718,31 @@ fn try_build_cylinder_from_circles(
         (t_center, -signed_height)
     };
 
-    Cylinder::new_finite(origin, b_axis_n, b_radius, height).ok()
+    let mut cyl = Cylinder::new_finite(origin, b_axis_n, b_radius, height).ok()?;
+
+    // SEAM ALIGNMENT (SKETCH-DCM #45 follow-ups C item 3 / Slice-5
+    // residual 9): the closed boundary circle's start==end vertex sits
+    // at the CURVE's parametric origin (t = 0, CDT-γ.3), so the
+    // surface's parametric seam (`ref_dir`, u = 0) must sit there too —
+    // the same invariant `create_cylinder_topology` enforces for the
+    // primitive and `try_build_cylinder_from_arcs` enforces for trimmed
+    // walls. `Cylinder::new_finite` defaults `ref_dir` to
+    // `axis.perpendicular()`, which is π/2 out of phase with the
+    // canonical circle frame (for a +Z axis: −Y vs the circle's +X);
+    // seam-locating consumers — the STEP pcurve builder's iso-u seam
+    // lines (silently dropped when they lift off the true seam curve)
+    // and `cylinder_rim_fillet`'s stored-`ref_dir` fallback — then read
+    // the wrong azimuth. Derive the seam direction from the bottom
+    // curve's own t = 0 point (radial from the axis), which is exact
+    // for both `Circle` and full-sweep `Arc` carriers and translation-
+    // invariant between the coaxial rails.
+    let seam_point = bottom_curve
+        .point_at(bottom_curve.parameter_range().start)
+        .ok()?;
+    let d = seam_point - b_center;
+    let radial = d - b_axis_n * d.dot(&b_axis_n);
+    cyl.ref_dir = radial.normalize().ok()?;
+    Some(cyl)
 }
 
 /// If the bottom and top curves are coaxial equal-radius PARTIAL arcs
@@ -3623,6 +3647,66 @@ mod tests {
         let bottom = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("bottom");
         let top = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("top");
         assert!(try_build_cylinder_from_circles(&bottom, &top).is_none());
+    }
+
+    /// SKETCH-DCM #45 follow-ups C item 3 (Slice-5 residual 9): the
+    /// synthesised cylinder's `ref_dir` (u = 0, the surface's parametric
+    /// seam) must be SEAM-ALIGNED to the boundary circle's own t = 0
+    /// point — where the closed circle edge's start==end vertex sits
+    /// (CDT-γ.3) — exactly as `create_cylinder_topology` enforces for
+    /// the primitive and `try_build_cylinder_from_arcs` enforces for
+    /// trimmed walls. Pre-fix the field kept `Cylinder::new_finite`'s
+    /// default `axis.perpendicular()`, which is π/2 out of phase with
+    /// the canonical circle frame (for a +Z axis: −Y vs the circle's
+    /// +X), so seam-locating consumers (pcurve export, rim-fillet seam
+    /// placement) read the wrong azimuth.
+    #[test]
+    fn try_build_cylinder_ref_dir_is_seam_aligned() {
+        use crate::primitives::curve::Circle;
+        let bottom = Circle::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("bottom");
+        let top = Circle::new(Point3::new(0.0, 0.0, 5.0), Vector3::Z, 2.0).expect("top");
+        let seam = bottom.point_at(0.0).expect("circle t=0 (seam) point");
+        let radial = (seam - Point3::ORIGIN).normalize().expect("seam radial");
+
+        let cyl = try_build_cylinder_from_circles(&bottom, &top).expect("cylinder");
+        assert!(
+            cyl.ref_dir.dot(&radial) > 1.0 - 1e-9,
+            "cylinder ref_dir must be seam-aligned to the boundary circle's \
+             t=0 point: ref_dir = {:?}, circle seam radial = {:?}",
+            cyl.ref_dir,
+            radial
+        );
+        // The surface's u = 0 evaluates ON the seam point.
+        let at_seam = cyl.point_at(0.0, 0.0).expect("surface at (0,0)");
+        assert!(
+            at_seam.distance(&seam) < 1e-9,
+            "surface (u,v)=(0,0) must sit on the circle seam vertex: \
+             {at_seam:?} vs {seam:?}"
+        );
+    }
+
+    /// Seam alignment must survive a NEGATIVE extrusion (origin flips to
+    /// the top circle) and a non-canonical axis — the seam direction is
+    /// translation-invariant between the coaxial rails.
+    #[test]
+    fn try_build_cylinder_ref_dir_seam_aligned_flipped_and_off_axis() {
+        use crate::primitives::curve::Circle;
+        let axis = Vector3::new(1.0, 2.0, 0.5).normalize().expect("axis");
+        let base = Point3::new(3.0, -1.0, 2.0);
+        let bottom = Circle::new(base, axis, 1.5).expect("bottom");
+        // "Top" BELOW the bottom along the axis: signed height < 0.
+        let top = Circle::new(base + (-axis) * 4.0, axis, 1.5).expect("top");
+        let seam = bottom.point_at(0.0).expect("seam point");
+        let radial = (seam - base).normalize().expect("seam radial");
+
+        let cyl = try_build_cylinder_from_circles(&bottom, &top).expect("cylinder");
+        assert!(
+            cyl.ref_dir.dot(&radial) > 1.0 - 1e-9,
+            "flipped/off-axis cylinder ref_dir must stay seam-aligned: \
+             ref_dir = {:?}, seam radial = {:?}",
+            cyl.ref_dir,
+            radial
+        );
     }
 
     // -------------------------------------------------------------------

@@ -269,6 +269,25 @@ async fn gate_step_output_matches_drilled_equivalent() {
     assert_orphan_free(&sketch_step, "sketch bore export");
     assert_orphan_free(&drilled_step, "drilled (boolean-heavy) export");
 
+    // The bore wall's seam edge must export as a SEAM_CURVE carrying
+    // both parameter-space branches (the seam-ambiguity machinery).
+    // Follow-ups C item 3 (Slice-5 residual 9): pre-fix, the sketch
+    // wall's Cylinder kept the default `axis.perpendicular()` ref_dir,
+    // π/2 out of phase with the seam vertex — the pcurve builder's
+    // iso-u seam lines then lifted 2·r·sin(π/4) ≈ 8.5 off the actual
+    // seam curve and were silently DROPPED (zero SEAM_CURVE entities),
+    // so a reader fell back to the ambiguous seam reprojection this
+    // machinery exists to remove.
+    let seam_curves = sketch_step
+        .lines()
+        .filter(|l| l.contains("=SEAM_CURVE"))
+        .count();
+    assert!(
+        seam_curves >= 1,
+        "sketch bore wall must export its seam edge as a SEAM_CURVE \
+         (pre-fix: 0 — misaligned ref_dir made the pcurve lift check drop it)"
+    );
+
     // The bore radius rides in the CYLINDRICAL_SURFACE payload
     // (`CYLINDRICAL_SURFACE('',#n,6);`) — assert it appears with the
     // exact dimension, not a chord-fit value.
