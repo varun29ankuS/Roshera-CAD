@@ -23,13 +23,37 @@
 //! coincident-coplanar cap MERGE landed, so the union no longer produces the
 //! z=0 ring/disk seam described above — it emits ONE seamless 60×60 bottom
 //! (`f7_union_bottom_is_one_seamless_face`, GREEN, pins the production merge).
-//! The straddling `_is_sound` pins stay `#[ignore]`d: their residual is NOT the
-//! z=0 seam (removing it moved bnd/nm by ZERO; the 302 boundary segs sit at
-//! z≈20/z≈15 — the boss TOP exit + lateral scallop — see
-//! `f7_leak_zhistogram_offset_10`), but a DIFFERENCE-side straddle of the boss's
-//! own real boundaries. They flip green when the #32 difference-side cutter-wall
-//! arc-clip lands. See `.superpowers/sdd/dogfood-diag-straddling-32.md` and the
-//! `.superpowers/sdd/dogfood-task-32c-report.md`.
+//!
+//! RESOLVED (2026-07-16, #46): the difference-side residual (flat bnd=302 +
+//! offset-dependent nm, all at z≈20/z≈15) was NOT a cutter-wall clip problem —
+//! on post-cap-merge topology the cutter wall's excess fragments were already
+//! culled correctly by classification. Three BASE-side roots, each fixed at its
+//! own altitude in `operations/boolean.rs`:
+//!   1. `get_face_interior_point`: the boundary-midpoint-centroid → cylinder
+//!      projection landed the ~301° boss-wall complement fragment's probe at
+//!      θ=0, inside its own excluded in-bore sector → whole boss wall culled
+//!      (the 300 z≈20 segs). Now verified via `cylinder_fragment_contains_point`
+//!      on the unrolled (θ, z) chart and repaired with
+//!      `curved_fragment_interior_point` only when off-fragment.
+//!   2. clip-to-face: cut sub-arcs lying inside a PRE-EXISTING hole of the face
+//!      (`is_point_in_face` sees only the outer loop) walked phantom material
+//!      inside the plate-top annulus's r15 hole (the nm class). Now dropped by
+//!      the 5-sample in-hole criterion (#27's test at arc level).
+//!   3. `fragment_is_origin_hole_void` (selection): the composite cell bounded
+//!      by the hole rim's long arcs + the material rim arc survived selection
+//!      whenever its interior fell outside the cutter (offset ≥ 13). A fragment
+//!      whose interior lies in its origin face's pre-existing hole with a
+//!      non-boundary two-sided material signature is void. Root enabler: the
+//!      shared `planar_face_hole_polygons` ignored loop ORIENTATIONS, so a
+//!      3-arc rim scrambled into a self-crossing polygon and even-odd
+//!      containment misfired — the exact pitfall `clip_circle_to_planar_face`
+//!      documents.
+//! The `_is_sound` pins are LIVE (offsets 10 and 12); the whole straddling band
+//! offsets 8..=21.9 measures bnd=0 nm=0 euler=0 sound. Honest residual: a
+//! NEAR-TANGENT straddle (offset 7.5, rim grazing the r15 seam at y≈±3.9)
+//! still leaks (bnd=682) — the #86 near-tangency class, out of #46 scope.
+//! History: `.superpowers/sdd/dogfood-diag-straddling-32.md`,
+//! `dogfood-task-32{b,c}-report.md`.
 
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Point3, Vector3};
@@ -225,26 +249,23 @@ fn f7_coaxial_control_is_sound() {
     assert_eq!(euler, 0, "f7 coaxial: clean through-bore is genus-1");
 }
 
-// ───────────────────────── straddling pins (#32 Phase A) ──────────────────────
+// ─────────────── straddling pins (#32 Phase A → CLOSED by #46) ────────────────
 //
-// Every straddling offset in (7, 22) breaks: the z=0 bore rim is emitted TWICE
-// onto the cutter wall (curves 36 ≡ 37, from the two coincident coplanar bottom
-// faces 9 and 10), plus single-copy z=10/z=20 straddle-phantom arcs whose in-
-// boss halves imprint where no face exists. Signature (captured 2026-07-08):
+// Historic signature (2026-07-08, pre Phase B): every straddling offset in
+// (7, 22) broke with χ=−2 (offset 10: bnd=840 nm=586). Phase B's dedup
+// restored χ=0 leaving a flat bnd=302 + offset-dependent nm. The #46 fixes
+// (2026-07-16) close the class; the measured post-#46 band:
 //
-//   offset  sound  bnd  nm   euler
-//     0     true    0    0    0     ← coaxial control (green above)
-//     9     false  838  614  -2
-//    10     false  840  586  -2
-//    11     false  824  544  -2
-//    12     false  800  496  -2
-//    14     false  762  420  -2
+//   offset  sound  bnd  nm  euler
+//     0     true    0    0   0   ← coaxial control (green above)
+//     8..=21.9      0    0   0   ← whole straddling band SOUND (swept 8, 9, 10,
+//                                  11, 12, 13, 14, 15, 16, 18, 20, 21, 21.9)
+//     7.5   false  682   —   —   ← near-tangent graze of the r15 seam (y≈±3.9):
+//                                  #86 near-tangency class, out of #46 scope
 //
-// bnd/nm shrink as the offset grows (less of the r8 rim sits inside r15 → fewer
-// phantom edges); euler is a stable −2 across the band. The HONEST target is a
-// sound genus-1 through-bore, asserted below; the pins flip green when Phase B
-// lands. Two offsets pinned (mid-band + near-edge) so a partial fix can't sneak
-// through on one geometry.
+// Two offsets pinned live (mid-band 10 + 12) so a partial regression can't
+// sneak through on one geometry; regenerate the table with
+// `f7_straddling_sweep_signatures` / `ROSHERA_F7_OFFSET` when the core moves.
 
 // #32 Phase B lands the per-target-face coincident-curve DEDUP: the straddling
 // z=0 rim circle, routed twice onto the shared cutter wall (curves 36 ≡ 37 from
@@ -265,43 +286,26 @@ fn f7_coaxial_control_is_sound() {
 // (`coincident_coplanar_cap_merge`, `operations/boolean.rs`) LANDED — the union
 // no longer fragments the coincident-coplanar z=0 bottom into ring + disk; it
 // emits ONE seamless 60×60 bottom (pinned GREEN by
-// `f7_union_bottom_is_one_seamless_face`). But the earlier claim that this z=0
-// seam was the ROOT of the difference's unsoundness is REFUTED by live evidence:
-// the difference residual is BYTE-IDENTICAL before and after the merge
-// (offset 10: bnd=302 nm=248 euler=0; offset 12: bnd=302 nm=198 euler=0). A
-// change that removes the entire z=0 seam yet moves nm/bnd by ZERO cannot be the
-// cause of nm/bnd. A z-histogram of the 302 boundary segments
-// (`f7_leak_zhistogram_offset_10`) localises them at **z≈20 (300 segs, the boss
-// TOP)** + z≈15 (2), with **NONE at z=0**. The real residual is the bore rim
-// STRADDLING the boss's own emergence/exit boundaries: at z=20 the bore exits the
-// r15 boss-top cap (its +x arc past r15 is above void, no material to close
-// against → open); at z=10 the plate-top annulus (r15 boss-emergence hole) is
-// straddled, yielding self-overlapping inner loops (the nm class). Both are
-// REAL feature boundaries of the union — not spurious coincident fragments — so
-// this is a DIFFERENCE-side z-dependent cutter-wall material-extent problem
-// (exactly the `clip_circle_to_planar_face`-can't-do-it boundary the 32c report
-// §"Why it does NOT close" named), NOT anything the union cap-merge can reach.
-// These two pins therefore STAY `#[ignore]`d; the merge is a correct, orthogonal
-// union-side improvement. See the `.superpowers/sdd/dogfood-task-32c-report.md`.
+// `f7_union_bottom_is_one_seamless_face`). The z-histogram evidence (all 302
+// boundary segs at z≈20/z≈15, NONE at z=0) refuted the union-seam diagnosis and
+// re-localised the residual to the DIFFERENCE side.
+//
+// #46 (2026-07-16): CLOSED — both `_is_sound` pins are LIVE. See the module doc
+// §RESOLVED for the three base-side roots (mis-located cylinder-fragment
+// interior point; unclipped in-hole cut arcs; origin-hole void cell surviving
+// selection, enabled by the orientation-scrambled hole polygon). The
+// mutation-proof teeth are these two pins plus the two #46 structural pins
+// (`_keeps_boss_lateral_wall`, `_no_phantom_face_in_plate_top_hole`).
 
 #[test]
-#[ignore = "#32 union coincident-coplanar cap merge LANDED (z=0 bottom now one \
-            seamless face, pinned by f7_union_bottom_is_one_seamless_face) but it \
-            is ORTHOGONAL to this pin: the difference residual is byte-identical \
-            pre/post merge (bnd=302 nm=248 euler=0) and a z-histogram \
-            (f7_leak_zhistogram_offset_10) puts all 302 boundary segs at z≈20 (boss \
-            TOP) + z≈15, NONE at z=0. Real root = the bore straddling the boss's \
-            REAL top-cap exit (z=20) and plate-top annulus (z=10) — a \
-            DIFFERENCE-side z-dependent cutter-wall material-extent clip, not the \
-            union seam the prior diagnosis blamed. Stays blocked on the #32 \
-            difference-side arc-clip (32c report §Precise gap)"]
 fn f7_straddling_offset_10_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 10.0);
     let (sound, bnd, nm, euler) = metrics(&mut m, r, "f7 straddling offset=10");
     assert!(
         sound,
-        "f7: straddling bore (offset=10) must be sound — #32 union coincident-coplanar cap merge"
+        "f7: straddling bore (offset=10) must be sound — #46 base-side fixes \
+         (chart interior point + in-hole arc clip + origin-hole void filter)"
     );
     assert_eq!(nm, 0, "f7 straddling@10: no non-manifold edges");
     assert_eq!(bnd, 0, "f7 straddling@10: watertight");
@@ -309,24 +313,39 @@ fn f7_straddling_offset_10_is_sound() {
 }
 
 #[test]
-#[ignore = "#32 union coincident-coplanar cap merge LANDED (z=0 bottom seamless) \
-            but ORTHOGONAL: difference residual byte-identical pre/post merge \
-            (bnd=302 nm=198 euler=0), leak localised at z≈20 (boss TOP) / z≈15, \
-            NONE at z=0. Real root = bore straddling the boss's real top-cap exit \
-            + plate-top annulus — DIFFERENCE-side z-dependent cutter-wall \
-            arc-clip, not the union seam. See f7_leak_zhistogram_offset_10 + \
-            `.superpowers/sdd/dogfood-task-32c-report.md`"]
 fn f7_straddling_offset_12_is_sound() {
     let mut m = BRepModel::new();
     let r = straddling_bore_result(&mut m, 12.0);
     let (sound, bnd, nm, euler) = metrics(&mut m, r, "f7 straddling offset=12");
     assert!(
         sound,
-        "f7: straddling bore (offset=12) must be sound — #32 union coincident-coplanar cap merge"
+        "f7: straddling bore (offset=12) must be sound — #46 base-side fixes \
+         (chart interior point + in-hole arc clip + origin-hole void filter)"
     );
     assert_eq!(nm, 0, "f7 straddling@12: no non-manifold edges");
     assert_eq!(bnd, 0, "f7 straddling@12: watertight");
     assert_eq!(euler, 0, "f7 straddling@12: clean through-bore is genus-1");
+}
+
+/// #46 pin C: offset 14 exercises the SELECTION-level origin-hole void filter
+/// specifically. At offsets ≤ 12 the composite hole-rim cell's interior falls
+/// inside the bore and classification culls it by luck; from offset ≈ 13 the
+/// interior escapes the bore, classifies Outside, and only
+/// `fragment_is_origin_hole_void` (backed by the orientation-faithful
+/// `planar_face_hole_polygons`) removes it. Mutating either regresses THIS pin
+/// while offsets 10/12 stay green.
+#[test]
+fn f7_straddling_offset_14_is_sound() {
+    let mut m = BRepModel::new();
+    let r = straddling_bore_result(&mut m, 14.0);
+    let (sound, bnd, nm, euler) = metrics(&mut m, r, "f7 straddling offset=14");
+    assert!(
+        sound,
+        "f7: straddling bore (offset=14) must be sound — #46 origin-hole void filter"
+    );
+    assert_eq!(nm, 0, "f7 straddling@14: no non-manifold edges");
+    assert_eq!(bnd, 0, "f7 straddling@14: watertight");
+    assert_eq!(euler, 0, "f7 straddling@14: clean through-bore is genus-1");
 }
 
 // ─────────────── Phase B witnesses: duplicate-fan class is closed ──────────────
@@ -479,12 +498,20 @@ fn f7_straddling_offset_10_no_phantom_face_in_plate_top_hole() {
     );
 }
 
+/// Offset for the on-demand diagnostics below: `ROSHERA_F7_OFFSET` (default 10).
+fn diag_offset() -> f64 {
+    std::env::var("ROSHERA_F7_OFFSET")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(10.0)
+}
+
 #[test]
-#[ignore = "diagnostic: z-histogram of the difference leak"]
+#[ignore = "diagnostic: z-histogram of the difference leak (ROSHERA_F7_OFFSET)"]
 fn f7_leak_zhistogram_offset_10() {
     use geometry_engine::harness::watertight::boundary_edge_positions;
     let mut m = BRepModel::new();
-    let r = straddling_bore_result(&mut m, 10.0);
+    let r = straddling_bore_result(&mut m, diag_offset());
     let segs = boundary_edge_positions(&m, r, 0.05, 1.0e-5);
     let mut buckets: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
     for s in &segs {
@@ -516,9 +543,10 @@ fn f7_straddling_sweep_signatures() {
 /// duplicate z=0 circle onto the bore lateral). `#[ignore]` — run with
 /// `--ignored --nocapture` under the env var.
 #[test]
-#[ignore = "diagnostic: ROSHERA_BOOL_TRACE mechanism capture (curves 36 ≡ 37)"]
+#[ignore = "diagnostic: ROSHERA_BOOL_TRACE mechanism capture (ROSHERA_F7_OFFSET)"]
 fn f7_trace_offset_10() {
     let mut m = BRepModel::new();
-    let r = straddling_bore_result(&mut m, 10.0);
-    let _ = metrics(&mut m, r, "f7 trace offset=10");
+    let off = diag_offset();
+    let r = straddling_bore_result(&mut m, off);
+    let _ = metrics(&mut m, r, &format!("f7 trace offset={off}"));
 }

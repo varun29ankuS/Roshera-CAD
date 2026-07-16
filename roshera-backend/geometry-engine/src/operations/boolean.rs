@@ -496,6 +496,55 @@ pub fn boolean_operation(
             merged_faces.len()
         ));
 
+        // #46 origin-hole void filter: a fragment whose interior point lies
+        // inside a PRE-EXISTING hole of its own origin face covers a region
+        // where that face never had material. The straddling bore rim is the
+        // canonical producer: crossing the plate-top annulus's r15 hole rim,
+        // the arrangement walks the composite cell bounded by the rim's long
+        // arcs + the material rim arc — the annulus's true inner boundary —
+        // as a STANDALONE region too. Whether that cell survives selection
+        // then depends on where its interior lands relative to the cutter
+        // (offset 10: inside the bore → culled by luck; offset 14: outside →
+        // kept as a phantom face re-using the annulus's inner-loop edges a
+        // third time, nm=300). Dropping is gated on the two-sided material
+        // probe so a legitimate fragment that genuinely COVERS the origin
+        // hole — the union cap-merge survivor whose coincident tile filled
+        // it — is preserved: a real boundary face has material on exactly ONE
+        // side, while the phantom is buried (material both sides: plate below,
+        // boss above) or pure void (neither side).
+        let merged_faces: Vec<SplitFace> = {
+            let mut hole_cache: HashMap<
+                FaceId,
+                Option<(Point3, Vector3, Vector3, Vec<Vec<(f64, f64)>>)>,
+            > = HashMap::new();
+            merged_faces
+                .into_iter()
+                .filter(|f| {
+                    let filter = hole_cache
+                        .entry(f.original_face)
+                        .or_insert_with(|| planar_face_hole_polygons(model, f.original_face));
+                    let void = fragment_is_origin_hole_void(
+                        model,
+                        f,
+                        filter,
+                        solid_a,
+                        solid_b,
+                        &options.common.tolerance,
+                    );
+                    if void {
+                        pipeline_trace(format_args!(
+                            "  dropping origin-hole void fragment origin={} solid={} edges={} class={:?}",
+                            f.original_face,
+                            f.from_solid,
+                            f.boundary_edges.len(),
+                            f.classification,
+                        ));
+                    }
+                    !void
+                })
+                .collect()
+        };
+
         // Step 4: Select faces based on boolean operation
         let selected_faces = select_faces_for_operation(&merged_faces, operation, solid_a, solid_b);
         pipeline_trace(format_args!(
@@ -7705,6 +7754,48 @@ fn split_face_by_curves(
                 is_point_in_face(model, face_id, &mp.position, &options.common.tolerance)
             {
                 to_drop.push(eid);
+                continue;
+            }
+            // #46 hole-side clip: `is_point_in_face` tests only the OUTER
+            // loop, so a cut sub-arc lying inside a PRE-EXISTING hole of this
+            // face survives the outer clip even though the hole is not face
+            // material. The straddling bore rim is the canonical case: the
+            // z=10 rim circle crosses the plate-top annulus's r15 hole, and
+            // (post `compute_edge_intersections`) its in-hole sub-arcs bound
+            // NOTHING on this face — left in the graph they walk overlapping
+            // cells: a phantom fragment wholly inside the hole plus inner
+            // loops triple-sharing the in-hole edges (the f7 nm=248 class).
+            // Drop a sub-arc when EVERY interior sample projects strictly
+            // inside one hole polygon — the same 5-sample all-inside criterion
+            // as the #27 whole-curve void-cut filter, applied at ARC level now
+            // that the crossings have been materialised as edge endpoints. A
+            // sub-arc that still straddles the rim keeps samples outside and
+            // is retained. The hole polygons are the face's ORIGINAL
+            // (pre-split) inner loops, densified arc-following
+            // (`planar_face_hole_polygons`), so the criterion is geometrically
+            // faithful for arc-bounded holes.
+            if let Some((h_origin, h_e1, h_e2, hole_polys)) = &preexisting_hole_filter {
+                const SAMPLES: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
+                let (a, b) = (edge.param_range.start, edge.param_range.end);
+                let in_hole = hole_polys.iter().any(|poly| {
+                    SAMPLES
+                        .iter()
+                        .all(|&s| match curve.evaluate(a + (b - a) * s) {
+                            Ok(cp) => {
+                                let p = cp.position;
+                                let d = Vector3::new(
+                                    p.x - h_origin.x,
+                                    p.y - h_origin.y,
+                                    p.z - h_origin.z,
+                                );
+                                point_in_polygon_2d(d.dot(h_e1), d.dot(h_e2), poly)
+                            }
+                            Err(_) => false,
+                        })
+                });
+                if in_hole {
+                    to_drop.push(eid);
+                }
             }
         }
         if pipeline_trace_enabled() && !to_drop.is_empty() {
@@ -7938,10 +8029,27 @@ fn planar_face_hole_polygons(
     ) {
         return None;
     }
-    let inner_edge_lists: Vec<Vec<EdgeId>> = face
+    // Edge lists WITH walk orientations. Sampling every edge forward-param
+    // regardless of its loop orientation scrambles a multi-arc hole rim into a
+    // self-crossing polygon (the walk jumps across the hole between arcs), and
+    // even-odd containment then misreports interior sub-regions as OUTSIDE —
+    // e.g. the r15 rim stored as three all-reversed arcs [34, 33, 32] tests
+    // (0, −4.55) with TWO crossings (one genuine arc + one jump chord), so the
+    // origin-hole void filter never fires and the straddling-rim phantom face
+    // survives (f7 offset 14). This is the exact orientation pitfall
+    // `clip_circle_to_planar_face` documents. Walk each edge in loop order.
+    let inner_edge_lists: Vec<Vec<(EdgeId, bool)>> = face
         .inner_loops
         .iter()
-        .filter_map(|&lid| model.loops.get(lid).map(|l| l.edges.clone()))
+        .filter_map(|&lid| {
+            model.loops.get(lid).map(|l| {
+                l.edges
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &eid)| (eid, l.orientations.get(i).copied().unwrap_or(true)))
+                    .collect()
+            })
+        })
         .collect();
     if inner_edge_lists.is_empty() {
         return None;
@@ -7952,7 +8060,10 @@ fn planar_face_hole_polygons(
     // as `partition_outer_and_pre_existing_hole_cycles`).
     let inner_verts_3d: Vec<Vec<Point3>> = inner_edge_lists
         .iter()
-        .map(|edges| extract_cycle_vertices_3d(edges, model))
+        .map(|edges| {
+            let eids: Vec<EdgeId> = edges.iter().map(|&(e, _)| e).collect();
+            extract_cycle_vertices_3d(&eids, model)
+        })
         .collect();
     let (mut sx, mut sy, mut sz, mut cnt) = (0.0f64, 0.0f64, 0.0f64, 0usize);
     for v in inner_verts_3d.iter().flatten() {
@@ -7972,13 +8083,14 @@ fn planar_face_hole_polygons(
     let e2 = dv_perp.normalize().ok()?;
     let origin = sp.position;
 
-    // Densified (arc-following) hole polygons.
+    // Densified (arc-following) hole polygons, each edge swept in its LOOP
+    // orientation so consecutive samples trace the rim continuously.
     const SAMPLES: usize = 8;
     let hole_polys: Vec<Vec<(f64, f64)>> = inner_edge_lists
         .iter()
         .map(|edges| {
             let mut poly: Vec<(f64, f64)> = Vec::with_capacity(edges.len() * SAMPLES);
-            for &eid in edges {
+            for &(eid, fwd) in edges {
                 let Some(edge) = model.edges.get(eid) else {
                     continue;
                 };
@@ -7988,7 +8100,11 @@ fn planar_face_hole_polygons(
                 let (a, b) = (edge.param_range.start, edge.param_range.end);
                 for k in 0..SAMPLES {
                     let f = k as f64 / SAMPLES as f64;
-                    let t = a + (b - a) * f;
+                    let t = if fwd {
+                        a + (b - a) * f
+                    } else {
+                        b - (b - a) * f
+                    };
                     if let Ok(p) = curve.point_at(t) {
                         let d = Vector3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
                         poly.push((d.dot(&e1), d.dot(&e2)));
@@ -8248,6 +8364,77 @@ fn void_fragments_in_preexisting_holes(
         return none;
     }
     drop
+}
+
+/// #46 selection-level origin-hole void test (see the call site ahead of
+/// `select_faces_for_operation` for the full mechanism narrative).
+///
+/// `true` ⇔ the fragment's representative interior point lies inside one of
+/// its ORIGIN face's pre-existing hole polygons (`hole_filter`, the shared
+/// `planar_face_hole_polygons` output) AND the two-sided material probe at
+/// that point is NOT a clean boundary signature. A face of the result must
+/// have union-material on exactly one side; a fragment in its origin's hole
+/// with material on BOTH sides is buried interior surface, with material on
+/// NEITHER side it is pure void — both are phantoms no boolean result may
+/// keep. The one-sided case is preserved because it is exactly the
+/// coincident-coplanar cap-merge survivor: the origin face's hole was TILED
+/// by the other operand's coincident cap, the seam vanished, and the merged
+/// fragment legitimately covers the (former) hole. The probe mirrors
+/// `coincident_coplanar_cap_merge`'s `signature` (same ε, same
+/// classify-both-operands disjunction). Every lookup failure returns `false`
+/// — conservative keep, the pre-#46 behaviour.
+fn fragment_is_origin_hole_void(
+    model: &BRepModel,
+    frag: &SplitFace,
+    hole_filter: &Option<(Point3, Vector3, Vector3, Vec<Vec<(f64, f64)>>)>,
+    solid_a: SolidId,
+    solid_b: SolidId,
+    tolerance: &Tolerance,
+) -> bool {
+    let Some((origin, e1, e2, hole_polys)) = hole_filter else {
+        return false;
+    };
+    let Ok(ip) = get_face_interior_point(model, frag) else {
+        return false;
+    };
+    let d = Vector3::new(ip.x - origin.x, ip.y - origin.y, ip.z - origin.z);
+    let (u, v) = (d.dot(e1), d.dot(e2));
+    if !hole_polys
+        .iter()
+        .any(|poly| point_in_polygon_2d(u, v, poly))
+    {
+        return false;
+    }
+    // Two-sided material probe (mirrors `coincident_coplanar_cap_merge`).
+    let Some(s) = model.surfaces.get(frag.surface) else {
+        return false;
+    };
+    let Ok((su, sv)) = s.closest_point(&ip, *tolerance) else {
+        return false;
+    };
+    let Ok(sp) = s.evaluate_full(su, sv) else {
+        return false;
+    };
+    let Ok(n) = sp.normal.normalize() else {
+        return false;
+    };
+    const EPS: f64 = 1.0e-3;
+    let material = |signed: f64| -> bool {
+        let q = Point3::new(
+            ip.x + n.x * signed,
+            ip.y + n.y * signed,
+            ip.z + n.z * signed,
+        );
+        matches!(
+            classify_point_relative_to_solid(model, q, solid_a, tolerance),
+            Ok(FaceClassification::Inside)
+        ) || matches!(
+            classify_point_relative_to_solid(model, q, solid_b, tolerance),
+            Ok(FaceClassification::Inside)
+        )
+    };
+    // Equal signatures = buried (both) or pure void (neither) → phantom.
+    material(EPS) == material(-EPS)
 }
 
 /// Remove any inner loop (hole) strictly contained within ANOTHER inner
@@ -14708,15 +14895,51 @@ fn face_boundary_samples(model: &BRepModel, face: &SplitFace) -> Vec<Point3> {
 /// centroid — returning the first that is inside the outer polygon and
 /// outside all holes. Mirrors `compute_split_face_interior_points`.
 fn face_with_hole_interior_point(model: &BRepModel, face: &SplitFace) -> Option<Point3> {
-    let outer_eids: Vec<EdgeId> = face.boundary_edges.iter().map(|&(e, _)| e).collect();
-    let outer_3d = extract_cycle_vertices_3d(&outer_eids, model);
+    // Arc-following, orientation-aware densification (8 samples/edge, same
+    // scheme as `get_face_interior_point`'s planar candidate block). The former
+    // VERTEX-ONLY polygons (`extract_cycle_vertices_3d`) reduced an arc-bounded
+    // hole to its inscribed chord polygon — a 3-arc r25 hole becomes a triangle
+    // whose edges pass at HALF the hole radius — so a candidate point up to
+    // r/2 inside the true hole tested "outside the hole" and an annular face's
+    // interior point could land in its own void (the flanged-housing case: the
+    // flange-top annulus reported ip at r=24.5 inside its r25 hole, which the
+    // #46 origin-hole void filter then — correctly, per its contract — read as
+    // a void fragment and dropped the whole face). Densifying makes the hole
+    // clearance test geometrically faithful; straight edges sample to collinear
+    // points (unchanged behaviour for polygonal faces).
+    let densify_3d = |loop_edges: &[(EdgeId, bool)]| -> Vec<Point3> {
+        const SAMPLES: usize = 8;
+        let mut pts: Vec<Point3> = Vec::with_capacity(loop_edges.len() * SAMPLES);
+        for &(eid, fwd) in loop_edges {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                if let Ok(p) = curve.point_at(t) {
+                    pts.push(p);
+                }
+            }
+        }
+        pts
+    };
+    let outer_3d = densify_3d(&face.boundary_edges);
     if outer_3d.len() < 3 {
         return None;
     }
     let hole_3d: Vec<Vec<Point3>> = face
         .inner_loops
         .iter()
-        .map(|lp| extract_cycle_vertices_3d(&lp.iter().map(|&(e, _)| e).collect::<Vec<_>>(), model))
+        .map(|lp| densify_3d(lp))
         .filter(|v| v.len() >= 3)
         .collect();
     if hole_3d.is_empty() {
@@ -14935,7 +15158,6 @@ fn curved_fragment_interior_point(
     let axis = cyl.axis;
     let origin = cyl.origin;
     let radius = cyl.radius;
-    let two_pi = 2.0 * std::f64::consts::PI;
 
     // Orthonormal frame ⟂ axis (identical to split_cylinder_lateral_by_sectors).
     let seed = if axis.x.abs() < 0.9 {
@@ -14946,45 +15168,8 @@ fn curved_fragment_interior_point(
     let u1 = axis.cross(&seed).normalize().ok()?;
     let u2 = axis.cross(&u1);
 
-    // Unroll a loop to (θ, z) samples, unwrapping θ continuously within the
-    // loop so a seam-crossing arc traces a continuous polyline (no ±2π jump).
     let unroll = |loop_edges: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
-        const SAMPLES: usize = 8;
-        let mut pts: Vec<(f64, f64)> = Vec::with_capacity(loop_edges.len() * SAMPLES);
-        let mut prev: Option<f64> = None;
-        for &(eid, fwd) in loop_edges {
-            let Some(edge) = model.edges.get(eid) else {
-                continue;
-            };
-            let Some(curve) = model.curves.get(edge.curve_id) else {
-                continue;
-            };
-            let (a, b) = (edge.param_range.start, edge.param_range.end);
-            for k in 0..SAMPLES {
-                let f = k as f64 / SAMPLES as f64;
-                let t = if fwd {
-                    a + (b - a) * f
-                } else {
-                    b - (b - a) * f
-                };
-                let Ok(p) = curve.point_at(t) else {
-                    continue;
-                };
-                let d = p - origin;
-                let mut th = d.dot(&u2).atan2(d.dot(&u1));
-                if let Some(pv) = prev {
-                    while th - pv > std::f64::consts::PI {
-                        th -= two_pi;
-                    }
-                    while th - pv < -std::f64::consts::PI {
-                        th += two_pi;
-                    }
-                }
-                prev = Some(th);
-                pts.push((th, d.dot(&axis)));
-            }
-        }
-        pts
+        unroll_cylinder_loop_chart(model, origin, axis, u1, u2, loop_edges)
     };
 
     let outer = unroll(boundary_loop);
@@ -15139,6 +15324,144 @@ fn curved_fragment_interior_point(
     None
 }
 
+/// Unroll a cylinder-face loop into the surface's `(θ, z)` chart, `θ`
+/// unwrapped continuously WITHIN the loop so a seam-crossing walk traces a
+/// connected polyline (no ±2π jump). 8 arc-following samples per edge, each
+/// edge swept in loop-traversal order. Shared by
+/// `curved_fragment_interior_point` (the #35 Slice-1 chart search) and
+/// `cylinder_fragment_contains_point` (the #46 candidate-verification test).
+fn unroll_cylinder_loop_chart(
+    model: &BRepModel,
+    origin: Point3,
+    axis: Vector3,
+    u1: Vector3,
+    u2: Vector3,
+    loop_edges: &[(EdgeId, bool)],
+) -> Vec<(f64, f64)> {
+    const SAMPLES: usize = 8;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(loop_edges.len() * SAMPLES);
+    let mut prev: Option<f64> = None;
+    for &(eid, fwd) in loop_edges {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            continue;
+        };
+        let (a, b) = (edge.param_range.start, edge.param_range.end);
+        for k in 0..SAMPLES {
+            let f = k as f64 / SAMPLES as f64;
+            let t = if fwd {
+                a + (b - a) * f
+            } else {
+                b - (b - a) * f
+            };
+            let Ok(p) = curve.point_at(t) else {
+                continue;
+            };
+            let d = p - origin;
+            let mut th = d.dot(&u2).atan2(d.dot(&u1));
+            if let Some(pv) = prev {
+                while th - pv > std::f64::consts::PI {
+                    th -= two_pi;
+                }
+                while th - pv < -std::f64::consts::PI {
+                    th += two_pi;
+                }
+            }
+            prev = Some(th);
+            pts.push((th, d.dot(&axis)));
+        }
+    }
+    pts
+}
+
+/// #46 straddling-rim: does `p` lie ON this cylinder fragment — inside its own
+/// `(θ, z)`-chart region?
+///
+/// `get_face_interior_point`'s curved branch projects the boundary-edge-midpoint
+/// centroid onto the cylinder via `closest_point`. For a fragment whose loop
+/// spans most of the circumference (the ~301° complement left when a bore
+/// swallows a sector of a boss wall), that centroid is ANGULARLY UNFAITHFUL:
+/// the sector-cut verticals' midpoints dominate the average, so the projection
+/// resolves to a generator INSIDE the excluded sector — the fragment then
+/// classifies by a point it does not contain and the whole wall is mis-culled
+/// (f7 straddling: 300 unpaired boundary segs at the boss-top rim).
+///
+/// This test unrolls the fragment's loops to the chart (shared helper with the
+/// #35 Slice-1 interior search) and answers membership there, so the caller can
+/// keep the legacy candidate whenever it is genuinely on the fragment (zero
+/// behaviour change for every case the projection already got right) and
+/// repair only the off-fragment case.
+///
+/// Returns `None` (undecidable — caller keeps the legacy candidate) for a
+/// non-cylinder surface, a degenerate loop, or a WINDING outer loop (a
+/// full-ring band's chart walk does not close into a polygon: it ends ~2π from
+/// its start).
+fn cylinder_fragment_contains_point(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    boundary_loop: &[(EdgeId, bool)],
+    inner_loops: &[Vec<(EdgeId, bool)>],
+    p: &Point3,
+) -> Option<bool> {
+    use crate::primitives::surface::Cylinder;
+    let surface = model.surfaces.get(surface_id)?;
+    let cyl = surface.as_any().downcast_ref::<Cylinder>()?;
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let two_pi = 2.0 * std::f64::consts::PI;
+
+    // Orthonormal frame ⟂ axis — identical to curved_fragment_interior_point /
+    // split_cylinder_lateral_by_sectors, so chart coordinates agree.
+    let seed = if axis.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u1 = axis.cross(&seed).normalize().ok()?;
+    let u2 = axis.cross(&u1);
+
+    let outer = unroll_cylinder_loop_chart(model, origin, axis, u1, u2, boundary_loop);
+    if outer.len() < 3 {
+        return None;
+    }
+    // A closed non-winding loop's chart walk returns near its start (the last
+    // sample is one sample-step short of the first). A full-ring loop winds:
+    // the walk ends ~2π away. Membership on an open polyline is undecidable.
+    #[allow(clippy::indexing_slicing)] // Reason: len >= 3 checked above.
+    let winding = (outer[outer.len() - 1].0 - outer[0].0).abs() > std::f64::consts::PI;
+    if winding {
+        return None;
+    }
+    let holes: Vec<Vec<(f64, f64)>> = inner_loops
+        .iter()
+        .map(|l| unroll_cylinder_loop_chart(model, origin, axis, u1, u2, l))
+        .filter(|v| v.len() >= 3)
+        .collect();
+
+    // Each loop unwraps from its own first sample, so its chart window may sit
+    // a full period away from the test point's principal angle: test all three
+    // 2π-shifted candidates (a loop spans < 2π, so at most one shift can hit).
+    let contains = |poly: &[(f64, f64)], th: f64, z: f64| -> bool {
+        [-two_pi, 0.0, two_pi]
+            .iter()
+            .any(|&s| point_in_polygon_2d(th + s, z, poly))
+    };
+
+    let d = *p - origin;
+    let th_p = d.dot(&u2).atan2(d.dot(&u1));
+    let z_p = d.dot(&axis);
+    if !contains(&outer, th_p, z_p) {
+        return Some(false);
+    }
+    if holes.iter().any(|h| contains(h, th_p, z_p)) {
+        return Some(false);
+    }
+    Some(true)
+}
+
 fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResult<Point3> {
     // Prefer the pre-computed interior point when available. It is set by
     // `split_face_by_curves` in situations where naive boundary-centroid
@@ -15216,6 +15539,34 @@ fn get_face_interior_point(model: &BRepModel, face: &SplitFace) -> OperationResu
                         v
                     };
                     if let Ok(p) = surface.point_at(u, v_used) {
+                        // #46 straddling-rim: VERIFY the projected candidate
+                        // actually lies ON this fragment before trusting it.
+                        // For a wide (seam-adjacent) cylinder sector-complement
+                        // the boundary-midpoint centroid is angularly unfaithful
+                        // — the sector verticals' midpoints dominate it, so the
+                        // projection resolves to a generator inside the EXCLUDED
+                        // sector and the fragment classifies by a point it does
+                        // not contain (f7: the whole boss wall mis-culled).
+                        // When (and only when) the candidate is provably
+                        // off-fragment, repair via the (θ, z)-chart interior
+                        // search; every already-correct case keeps the legacy
+                        // candidate verbatim.
+                        if let Some(false) = cylinder_fragment_contains_point(
+                            model,
+                            face.surface,
+                            &face.boundary_edges,
+                            &face.inner_loops,
+                            &p,
+                        ) {
+                            if let Some(q) = curved_fragment_interior_point(
+                                model,
+                                face.surface,
+                                &face.boundary_edges,
+                                &face.inner_loops,
+                            ) {
+                                return Ok(q);
+                            }
+                        }
                         return Ok(p);
                     }
                 }
