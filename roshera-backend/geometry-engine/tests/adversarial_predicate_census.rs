@@ -412,6 +412,61 @@ fn exact_orient2d_and_shoelace_match_oracle_on_corpus() {
     }
 }
 
+/// SLICE-2 GREEN: the shared exact predicates the production call sites now
+/// delegate to (`math::point_in_polygon_2d`, `segments_properly_intersect_2d`,
+/// `polygon_orientation_2d`) match the rational oracle on the ENTIRE corpus —
+/// zero mismatches, where the float algorithms lie hundreds of times (the
+/// census above). This is the substrate proof for census rows #8/#10/#11.
+#[test]
+fn exact_pip_matches_oracle_on_full_corpus() {
+    use geometry_engine::math::{
+        point_in_polygon_2d, polygon_orientation_2d, segments_properly_intersect_2d, Orientation,
+    };
+
+    let mut checked = 0u64;
+    for case in full_pip_corpus() {
+        let Some(truth) = pip_oracle(case.p, &case.poly) else {
+            continue; // exactly-on-boundary: parity is convention-owned
+        };
+        checked += 1;
+        assert_eq!(
+            point_in_polygon_2d(case.p.0, case.p.1, &case.poly),
+            truth,
+            "exact PIP vs oracle: p={:?} poly={:?} (family {})",
+            case.p,
+            case.poly,
+            case.family
+        );
+    }
+    assert!(
+        checked > 8000,
+        "corpus mostly excluded — generators degenerate"
+    );
+
+    for case in seg_cross_corpus(8000, 0x5E6C_0001) {
+        assert_eq!(
+            segments_properly_intersect_2d(case.a, case.b, case.c, case.d),
+            seg_cross_oracle(&case),
+            "exact proper-crossing vs oracle: {case:?}"
+        );
+    }
+
+    let sign_of = |o: Orientation| match o {
+        Orientation::CounterClockwise => 1,
+        Orientation::Clockwise => -1,
+        Orientation::Collinear => 0,
+    };
+    for case in area_sign_corpus(8000, 0xA5EA_0001) {
+        assert_eq!(
+            sign_of(polygon_orientation_2d(&case.poly)),
+            shoelace_sign_rat(&case.poly),
+            "exact polygon orientation vs oracle: {:?} (family {})",
+            case.poly,
+            case.family
+        );
+    }
+}
+
 // ─────────────────────── solid-level census sweeps ──────────────────────────
 
 use adversarial::{flush_upstand_union, near_tangent_cyl_union, sliver_wall_union};

@@ -10613,42 +10613,31 @@ fn polygon_aabb_2d(poly: &[(f64, f64)]) -> (f64, f64, f64, f64) {
 /// Proper 2D segment intersection (interiors cross). Collinear or
 /// endpoint-touching segments report `false` — by design, see the
 /// caller's comment on edge-sharing.
+///
+/// EXACT (Slice 2 of the exact-predicates campaign): the four orientation
+/// signs are decided by the Shewchuk adaptive `orient2d` cascade instead of
+/// raw f64 cross products, which missed genuine crossings whose quad had a
+/// determinant within ulps of zero (pinned by
+/// `segments_properly_intersect_2d_exact_on_near_collinear_quad`).
 fn segments_properly_intersect_2d(
     p1: (f64, f64),
     p2: (f64, f64),
     p3: (f64, f64),
     p4: (f64, f64),
 ) -> bool {
-    let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| -> f64 {
-        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
-    };
-    let d1 = cross(p3, p4, p1);
-    let d2 = cross(p3, p4, p2);
-    let d3 = cross(p1, p2, p3);
-    let d4 = cross(p1, p2, p4);
-    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    crate::math::segments_properly_intersect_2d(p1, p2, p3, p4)
 }
 
-/// 2D ray-casting point-in-polygon. The polygon is closed implicitly by
+/// 2D even-odd point-in-polygon. The polygon is closed implicitly by
 /// connecting the last vertex back to the first.
+///
+/// EXACT (Slice 2 of the exact-predicates campaign): delegates to the shared
+/// exact ray cast (`math::exact_predicates::point_in_polygon_2d`) — the
+/// crossing side is an exact `orient2d` sign, replacing the `x_cross`
+/// division that rounded across the query point (census row #10; pinned by
+/// `point_in_polygon_2d_exact_on_edge_graze`).
 fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
-    if poly.len() < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let mut j = poly.len() - 1;
-    for i in 0..poly.len() {
-        let (xi, yi) = poly[i];
-        let (xj, yj) = poly[j];
-        // Standard ray-cast with the classic half-open edge convention.
-        let intersects = ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
-        if intersects {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
+    crate::math::point_in_polygon_2d(px, py, poly)
 }
 
 /// Slice E imprint-merge: build a `FaceIntersection` for two coplanar
@@ -14323,29 +14312,18 @@ fn uv_polygon_strictly_contains(outer: &[(f64, f64)], inner: &[(f64, f64)]) -> b
 }
 
 /// 2D point-in-polygon test via horizontal ray-casting in the +u
-/// direction. Mirror of the inline test inside [`is_point_in_face`]
-/// (line ~5679); kept as a standalone helper because
+/// direction. Kept as a standalone helper because
 /// [`merge_same_origin_fragments`] operates on pre-projected
 /// `Vec<(f64, f64)>` polygons rather than face ids, and would
 /// otherwise re-project on every call.
+///
+/// EXACT (Slice 2 of the exact-predicates campaign): delegates to the shared
+/// exact ray cast — the `(v1<=v && v2>v)‖(v2<=v && v1>v)` straddle is the
+/// same predicate as `(v1>v)!=(v2>v)`, and the `u < u_cross` division is
+/// replaced by the exact `orient2d` crossing side (census row #10; pinned by
+/// `uv_point_in_polygon_exact_on_edge_graze`).
 fn uv_point_in_polygon(polygon: &[(f64, f64)], (u, v): (f64, f64)) -> bool {
-    let n = polygon.len();
-    if n < 3 {
-        return false;
-    }
-    let mut crossings = 0u32;
-    for i in 0..n {
-        let (u1, v1) = polygon[i];
-        let (u2, v2) = polygon[(i + 1) % n];
-        if (v1 <= v && v2 > v) || (v2 <= v && v1 > v) {
-            let t = (v - v1) / (v2 - v1);
-            let u_cross = u1 + t * (u2 - u1);
-            if u < u_cross {
-                crossings += 1;
-            }
-        }
-    }
-    crossings % 2 == 1
+    crate::math::point_in_polygon_2d(u, v, polygon)
 }
 
 /// Classify a face relative to a solid using multi-ray majority vote.
@@ -16429,20 +16407,11 @@ fn is_point_in_face(
         }
         let (test_x, test_y) = project(point);
 
-        let mut crossings = 0;
-        let n_p = polygon.len();
-        for i in 0..n_p {
-            let (x1, y1) = polygon[i];
-            let (x2, y2) = polygon[(i + 1) % n_p];
-            if (y1 <= test_y && y2 > test_y) || (y2 <= test_y && y1 > test_y) {
-                let t_cross = (test_y - y1) / (y2 - y1);
-                let x_cross = x1 + t_cross * (x2 - x1);
-                if test_x < x_cross {
-                    crossings += 1;
-                }
-            }
-        }
-        return Ok(crossings % 2 == 1);
+        // EXACT (Slice 2 of the exact-predicates campaign): crossing parity
+        // via the shared exact ray cast — this counter is the inside/outside
+        // verdict for ray-cast classification, where a single miscounted
+        // graze flips a fragment's selection (the #81 petal-drop class).
+        return Ok(crate::math::point_in_polygon_2d(test_x, test_y, &polygon));
     }
 
     // Non-planar path: original closest_point + UV polygon test.
@@ -16538,27 +16507,10 @@ fn is_point_in_face(
         return Ok(true);
     }
 
-    // 2D ray-casting point-in-polygon test
-    let test_u = u;
-    let test_v = v;
-    let mut crossings = 0;
-    let n = uv_polygon.len();
-
-    for i in 0..n {
-        let (u1, v1) = uv_polygon[i];
-        let (u2, v2) = uv_polygon[(i + 1) % n];
-
-        // Check if the horizontal ray from (test_u, test_v) in +u direction crosses this edge
-        if (v1 <= test_v && v2 > test_v) || (v2 <= test_v && v1 > test_v) {
-            let t_cross = (test_v - v1) / (v2 - v1);
-            let u_cross = u1 + t_cross * (u2 - u1);
-            if test_u < u_cross {
-                crossings += 1;
-            }
-        }
-    }
-
-    Ok(crossings % 2 == 1)
+    // 2D even-odd point-in-polygon test in UV space. EXACT (Slice 2 of the
+    // exact-predicates campaign): crossing parity via the shared exact ray
+    // cast (`math::exact_predicates::point_in_polygon_2d`).
+    Ok(crate::math::point_in_polygon_2d(u, v, &uv_polygon))
 }
 
 /// Same-Domain cull (#32 / #27 family): drop ANTI-coincident internal faces.
@@ -21012,18 +20964,16 @@ mod tests {
     // Each case below was found by `tests/adversarial_predicate_census.rs`
     // (seeded corpus vs a BigRational oracle — every finite f64 is an exact
     // dyadic rational, so the recorded truth is ground truth, not opinion).
-    // The raw ray-cast implementations return the WRONG side because the
-    // `x_cross` division rounds across the query point. `#[ignore]`d while
-    // the float implementations stand; Slice 2 migrates these call sites to
-    // the exact core and un-ignores them — after which they are the mutation
-    // proof (reverting a call site to the float compare re-fails them).
+    // The raw ray-cast implementations returned the WRONG side because the
+    // `x_cross` division rounds across the query point. GREEN since the
+    // Slice-2 exact-core migration; these are its mutation proof (reverting
+    // a call site to the float compare re-fails them).
     // =====================================================================
 
     /// Slice-2 RED: `point_in_polygon_2d` lies on an edge-graze query.
     /// Oracle truth: OUTSIDE (the +x ray's crossing parity is even); the
     /// division-based cast counts one crossing too many.
     #[test]
-    #[ignore = "Slice-2 RED: raw f64 ray cast lies here; un-ignore with the exact-core migration"]
     fn point_in_polygon_2d_exact_on_edge_graze() {
         let poly: Vec<(f64, f64)> = vec![
             (7.225625928452673, 2.7768500608312636),
@@ -21044,7 +20994,6 @@ mod tests {
     /// Oracle truth: INSIDE; the t-parameter division rounds the crossing
     /// to the wrong side of the query.
     #[test]
-    #[ignore = "Slice-2 RED: raw f64 ray cast lies here; un-ignore with the exact-core migration"]
     fn uv_point_in_polygon_exact_on_edge_graze() {
         let poly: Vec<(f64, f64)> = vec![
             (-1.239582485255542, 7.479570865958778),
@@ -21065,7 +21014,6 @@ mod tests {
     /// Oracle truth: the four rational orientation signs are strictly
     /// opposite on both quads — a proper crossing.
     #[test]
-    #[ignore = "Slice-2 RED: raw f64 cross products lie here; un-ignore with the exact-core migration"]
     fn segments_properly_intersect_2d_exact_on_near_collinear_quad() {
         let p1 = (0.968691646732285, 0.8609623040483099);
         let p2 = (0.8139453654162878, 0.42924481339292414);

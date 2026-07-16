@@ -971,24 +971,20 @@ pub fn insphere(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3)
     }
 }
 
-/// Exact orientation of a closed polygon from the SIGN of its shoelace signed
-/// area `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)`, computed in exact expansion
-/// arithmetic. `CounterClockwise` = positive area, `Clockwise` = negative,
-/// `Collinear` = exactly zero (degenerate / self-cancelling). Correct for all
-/// finite inputs — the tolerance-free basis for winding/orientation tests that
-/// today compare an f64 signed area against `0.0`.
-pub fn signed_area_2d(points: &[Vector2]) -> Orientation {
-    let n = points.len();
+/// Shared exact-shoelace core: orientation of the closed polygon whose `i`-th
+/// vertex is `at(i)`, from the exact expansion sign of
+/// `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)`.
+fn shoelace_orientation<F: Fn(usize) -> (f64, f64)>(n: usize, at: F) -> Orientation {
     if n < 3 {
         return Orientation::Collinear;
     }
     let mut acc: Vec<f64> = Vec::new();
     for i in 0..n {
-        let p = &points[i];
-        let q = &points[(i + 1) % n];
+        let (px, py) = at(i);
+        let (qx, qy) = at((i + 1) % n);
         // term = x_i·y_{i+1} − x_{i+1}·y_i, exactly (a 4-component expansion).
-        let (h1, l1) = two_product(p.x, q.y);
-        let (h2, l2) = two_product(q.x, p.y);
+        let (h1, l1) = two_product(px, qy);
+        let (h2, l2) = two_product(qx, py);
         let term: Vec<f64> = two_two_diff(h1, l1, h2, l2)
             .into_iter()
             .filter(|&c| c != 0.0)
@@ -1007,6 +1003,105 @@ pub fn signed_area_2d(points: &[Vector2]) -> Orientation {
     } else {
         orientation_of(acc[acc.len() - 1])
     }
+}
+
+/// Exact orientation of a closed polygon from the SIGN of its shoelace signed
+/// area `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)`, computed in exact expansion
+/// arithmetic. `CounterClockwise` = positive area, `Clockwise` = negative,
+/// `Collinear` = exactly zero (degenerate / self-cancelling). Correct for all
+/// finite inputs — the tolerance-free basis for winding/orientation tests that
+/// today compare an f64 signed area against `0.0`.
+pub fn signed_area_2d(points: &[Vector2]) -> Orientation {
+    shoelace_orientation(points.len(), |i| (points[i].x, points[i].y))
+}
+
+/// [`signed_area_2d`] over raw `(x, y)` tuples — the coordinate form the
+/// boolean/section/tessellation pipelines carry their projected polygons in
+/// (EXACT PREDICATES Slice 2; spec §3.6 `signed_area_pairs`).
+pub fn polygon_orientation_2d(pts: &[(f64, f64)]) -> Orientation {
+    shoelace_orientation(pts.len(), |i| pts[i])
+}
+
+/// Shared exact even-odd point-in-polygon core (EXACT PREDICATES Slice 2 —
+/// the single entry point replacing the five raw ray-cast copies of census
+/// row #10; hoisted from `operations/polygon_clip.rs`).
+///
+/// Standard half-open +x ray cast: an edge participates iff it strictly
+/// straddles the ray's y (exact f64 comparisons), and whether it crosses to
+/// the RIGHT of `p` is the exact [`orient2d`] side of `p` against the
+/// directed edge — no `x_cross` division to round across the query point.
+/// An upward edge crosses right iff `p` is strictly left (CCW); a downward
+/// edge iff strictly right (CW). `Collinear` (p exactly on a straddling
+/// edge's carrier) contributes no crossing: boundary points are not
+/// classified as interior, deterministically (Regime-E boundary contract:
+/// exact combinatorics never silently absorbs coincidence — callers that
+/// need an on-boundary verdict test it explicitly, in Regime T).
+pub(crate) fn point_in_polygon_2d_by<F: Fn(usize) -> (f64, f64)>(
+    n: usize,
+    at: F,
+    px: f64,
+    py: f64,
+) -> bool {
+    if n < 3 {
+        return false;
+    }
+    let p = Vector2::new(px, py);
+    let mut inside = false;
+    for i in 0..n {
+        let (ax, ay) = at(i);
+        let (bx, by) = at((i + 1) % n);
+        if (ay > py) != (by > py) {
+            let upward = by > ay;
+            let o = orient2d(&Vector2::new(ax, ay), &Vector2::new(bx, by), &p);
+            let crosses_right = match o {
+                Orientation::CounterClockwise => upward,
+                Orientation::Clockwise => !upward,
+                Orientation::Collinear => false,
+            };
+            if crosses_right {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Exact even-odd point-in-polygon over raw `(x, y)` tuples. See
+/// [`point_in_polygon_2d_by`] for the crossing rule and boundary semantics.
+/// The polygon is closed implicitly (last vertex connects back to the first);
+/// fewer than 3 vertices ⇒ `false`.
+pub fn point_in_polygon_2d(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
+    point_in_polygon_2d_by(poly.len(), |i| poly[i], px, py)
+}
+
+/// Exact proper (interiors-cross) 2D segment intersection test between
+/// `p1→p2` and `p3→p4`, built from four exact [`orient2d`] signs (EXACT
+/// PREDICATES Slice 2; spec §3.6 `segments_intersect_2d`).
+///
+/// `true` iff the endpoints of each segment lie STRICTLY on opposite sides
+/// of the other segment's carrier line. Collinear configurations and
+/// endpoint touches report `false` — by design (they are coincidence
+/// questions, not crossing-existence questions; the caller's edge-sharing
+/// contract in `operations/boolean.rs` depends on this).
+pub fn segments_properly_intersect_2d(
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    p4: (f64, f64),
+) -> bool {
+    let a = Vector2::new(p1.0, p1.1);
+    let b = Vector2::new(p2.0, p2.1);
+    let c = Vector2::new(p3.0, p3.1);
+    let d = Vector2::new(p4.0, p4.1);
+    let strictly_opposite = |u: Orientation, v: Orientation| -> bool {
+        matches!(
+            (u, v),
+            (Orientation::CounterClockwise, Orientation::Clockwise)
+                | (Orientation::Clockwise, Orientation::CounterClockwise)
+        )
+    };
+    strictly_opposite(orient2d(&c, &d, &a), orient2d(&c, &d, &b))
+        && strictly_opposite(orient2d(&a, &b, &c), orient2d(&a, &b, &d))
 }
 
 /// Robust version of orient2d that handles special cases
@@ -1236,6 +1331,134 @@ mod tests {
 
         let result = orient2d(&a, &b, &c);
         assert_eq!(result, Orientation::CounterClockwise);
+    }
+
+    #[test]
+    fn point_in_polygon_2d_basic_square_and_concave() {
+        let square: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        assert!(point_in_polygon_2d(0.5, 0.5, &square));
+        assert!(!point_in_polygon_2d(1.5, 0.5, &square));
+        assert!(!point_in_polygon_2d(-0.5, 0.5, &square));
+        // Degenerate input: < 3 vertices is "no containment".
+        assert!(!point_in_polygon_2d(0.5, 0.5, &[(0.0, 0.0), (1.0, 1.0)]));
+
+        // Concave L-shape (mirrors the boolean.rs regression tests).
+        let l: Vec<(f64, f64)> = vec![
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+        ];
+        assert!(point_in_polygon_2d(0.5, 0.5, &l), "in horizontal leg");
+        assert!(point_in_polygon_2d(0.5, 2.5, &l), "in vertical leg");
+        assert!(!point_in_polygon_2d(2.0, 2.0, &l), "in the notch");
+        assert!(!point_in_polygon_2d(5.0, 5.0, &l), "outside bbox");
+    }
+
+    /// The adversarial-census edge-graze cases (rational-oracle truth; see
+    /// `tests/adversarial_predicate_census.rs`): the raw division-based ray
+    /// casts get BOTH of these wrong — the exact crossing side must not.
+    #[test]
+    fn point_in_polygon_2d_exact_on_census_edge_grazes() {
+        let poly_a: Vec<(f64, f64)> = vec![
+            (7.225625928452673, 2.7768500608312636),
+            (6.072631636028047, 2.672881766295894),
+            (-2.5291854002345886, 4.638069284829017),
+            (-7.650869387878803, 2.918458308232573),
+            (8.586012336985753, -2.444888441654245),
+        ];
+        assert!(
+            !point_in_polygon_2d(2.5467869206826865, -0.45001894902491996, &poly_a),
+            "oracle truth: OUTSIDE"
+        );
+
+        let poly_b: Vec<(f64, f64)> = vec![
+            (-1.239582485255542, 7.479570865958778),
+            (-4.238166112769274, 7.81764288716935),
+            (-5.78909933898001, -5.872542076305808),
+        ];
+        assert!(
+            point_in_polygon_2d(-5.540080621045283, -5.141711495058385, &poly_b),
+            "oracle truth: INSIDE"
+        );
+    }
+
+    #[test]
+    fn polygon_orientation_2d_matches_signed_area_2d() {
+        let ccw: Vec<(f64, f64)> = vec![(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)];
+        assert_eq!(polygon_orientation_2d(&ccw), Orientation::CounterClockwise);
+        let cw: Vec<(f64, f64)> = ccw.iter().rev().copied().collect();
+        assert_eq!(polygon_orientation_2d(&cw), Orientation::Clockwise);
+        // Exactly self-cancelling (zero-area) polygon.
+        let flat: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)];
+        assert_eq!(polygon_orientation_2d(&flat), Orientation::Collinear);
+        // Tuple form must agree with the Vector2 form on a dirty polygon.
+        let dirty: Vec<(f64, f64)> = vec![(0.1, 0.7), (5.3, 0.21), (4.9, 3.33), (1.7, 2.9)];
+        let as_vec: Vec<Vector2> = dirty.iter().map(|&(x, y)| Vector2::new(x, y)).collect();
+        assert_eq!(polygon_orientation_2d(&dirty), signed_area_2d(&as_vec));
+    }
+
+    /// Near-cancelling ulp-quad from the census (raw f64 shoelace reports
+    /// exactly 0.0; the exact expansion sign is positive).
+    #[test]
+    fn polygon_orientation_2d_exact_on_census_ulp_quad() {
+        let quad: Vec<(f64, f64)> = vec![
+            (-2.432547292592431, 5.076801557850267),
+            (-5.027858927402571, -1.3796565715472004),
+            (-5.027858927402571, -1.3796565715472011),
+            (-2.432547292592431, 5.076801557850266),
+        ];
+        assert_eq!(
+            polygon_orientation_2d(&quad),
+            Orientation::CounterClockwise,
+            "rational-oracle truth: positive area; raw f64 shoelace cancels to 0.0"
+        );
+    }
+
+    #[test]
+    fn segments_properly_intersect_2d_basic() {
+        // Clean X crossing.
+        assert!(segments_properly_intersect_2d(
+            (0.0, 0.0),
+            (2.0, 2.0),
+            (0.0, 2.0),
+            (2.0, 0.0)
+        ));
+        // Disjoint.
+        assert!(!segments_properly_intersect_2d(
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 1.0)
+        ));
+        // Endpoint touch is NOT a proper crossing (documented contract).
+        assert!(!segments_properly_intersect_2d(
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (1.0, 1.0),
+            (2.0, 0.0)
+        ));
+        // Collinear overlap is NOT a proper crossing.
+        assert!(!segments_properly_intersect_2d(
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (1.0, 0.0),
+            (3.0, 0.0)
+        ));
+    }
+
+    /// The adversarial-census near-collinear quad (rational-oracle truth: a
+    /// genuine proper crossing the raw f64 cross products miss).
+    #[test]
+    fn segments_properly_intersect_2d_exact_on_census_quad() {
+        assert!(segments_properly_intersect_2d(
+            (0.968691646732285, 0.8609623040483099),
+            (0.8139453654162878, 0.42924481339292414),
+            (1.2341322683967864, 0.5444102712336032),
+            (0.5099263106731315, 0.34591881397829927)
+        ));
     }
 
     #[test]

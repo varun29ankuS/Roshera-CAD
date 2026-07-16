@@ -1444,33 +1444,17 @@ fn classify_loop_nesting(loops: &[Loop2D]) -> LoopNesting {
     LoopNesting { outers }
 }
 
-/// Even-odd point-in-polygon test in 2D.
+/// Even-odd point-in-polygon test in 2D — the section loop-nesting decision.
+///
+/// EXACT (Slice 2 of the exact-predicates campaign): delegates to the shared
+/// exact ray cast (`math::exact_predicates::point_in_polygon_2d`). The
+/// crossing side is an exact `orient2d` sign, which retires this copy's
+/// whole `x_cross` division — including the #85b 1e-18
+/// magnitude-with-sign denominator clamp that previous fix added (the
+/// division no longer exists, so there is no denominator to blow up on
+/// near-horizontal edges). Pinned by `point_in_polygon_exact_on_edge_graze`.
 fn point_in_polygon(p: (f64, f64), poly: &[(f64, f64)]) -> bool {
-    let n = poly.len();
-    if n < 3 {
-        return false;
-    }
-    let (x, y) = p;
-    let mut inside = false;
-    let mut j = n - 1;
-    for i in 0..n {
-        let (xi, yi) = poly[i];
-        let (xj, yj) = poly[j];
-        // Denominator must be `yj - yi` guarded against zero — keep its MAGNITUDE
-        // (floored at 1e-18) AND its sign. The earlier `(yj-yi).max(1e-18)` (no
-        // `.abs()`) clobbered any NEGATIVE dy to 1e-18, so every downward edge got
-        // a ±1e-18 denominator → the x-intersection blew up to ±huge → spurious /
-        // missed crossings. PIP was thus wrong for any polygon with downward edges
-        // (every circle), which mis-classified section loop nesting (#85b: a flange
-        // cap's bolt/centre holes were read as separate solid discs → 20% over-area).
-        let dy = (yj - yi).abs().max(1e-18).copysign(yj - yi);
-        let intersects = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / dy + xi);
-        if intersects {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
+    crate::math::point_in_polygon_2d(p.0, p.1, poly)
 }
 
 // ---------------------------------------------------------------------------
@@ -1498,7 +1482,16 @@ fn triangulate_cap(
     let mut combined_3d: Vec<Point3> = Vec::new();
     let mut loop_boundaries: Vec<(usize, usize, bool)> = Vec::new();
 
-    let outer_ccw = outer_2d.signed_area > 0.0;
+    // EXACT (Slice 2 of the exact-predicates campaign): the CCW/CW DECISION
+    // reads the exact expansion sign of the shoelace over the loop's points
+    // (Regime E — zero epsilons); the f64 `signed_area` field remains for
+    // magnitude uses only (`signatures_match`'s area band, a Regime-T loop-
+    // identity question). `Collinear` (exactly zero area) maps to "not CCW",
+    // matching the old `> 0.0` on an exact zero.
+    let outer_ccw = matches!(
+        crate::math::polygon_orientation_2d(&outer_2d.pts),
+        crate::math::Orientation::CounterClockwise
+    );
     let mut outer_pts_3d: Vec<Point3> = outer_3d.clone();
     if !outer_ccw {
         outer_pts_3d.reverse();
@@ -1522,7 +1515,11 @@ fn triangulate_cap(
         }
         let mut hole_pts_3d = hole_3d.clone();
         // Hole opposite winding from outer: hole CW when outer CCW.
-        let hole_ccw = hole_2d.signed_area > 0.0;
+        // EXACT winding sign, same contract as `outer_ccw` above.
+        let hole_ccw = matches!(
+            crate::math::polygon_orientation_2d(&hole_2d.pts),
+            crate::math::Orientation::CounterClockwise
+        );
         if hole_ccw == outer_ccw {
             hole_pts_3d.reverse();
         }
@@ -1569,12 +1566,10 @@ mod tests {
     /// query. Case found by `tests/adversarial_predicate_census.rs` against a
     /// BigRational oracle (truth: OUTSIDE — even crossing parity); the
     /// division-based cast (even with the #85b 1e-18 denominator clamp)
-    /// counts one crossing too many. `#[ignore]`d while the float
-    /// implementation stands; Slice 2 migrates `point_in_polygon` to the
-    /// exact core and un-ignores it (mutation proof: reverting to the float
-    /// compare re-fails it).
+    /// counted one crossing too many. GREEN since the Slice-2 exact-core
+    /// migration; this is its mutation proof (reverting `point_in_polygon`
+    /// to the float compare re-fails it).
     #[test]
-    #[ignore = "Slice-2 RED: raw f64 ray cast lies here; un-ignore with the exact-core migration"]
     fn point_in_polygon_exact_on_edge_graze() {
         let poly: Vec<(f64, f64)> = vec![
             (7.225625928452673, 2.7768500608312636),

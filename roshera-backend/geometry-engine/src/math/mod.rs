@@ -87,7 +87,8 @@ pub use utils::{
 
 // Re-export exact predicates
 pub use exact_predicates::{
-    incircle, insphere, orient2d, orient3d, signed_area_2d, CircleLocation, Orientation,
+    incircle, insphere, orient2d, orient3d, point_in_polygon_2d, polygon_orientation_2d,
+    segments_properly_intersect_2d, signed_area_2d, CircleLocation, Orientation,
 };
 
 // Use constants module

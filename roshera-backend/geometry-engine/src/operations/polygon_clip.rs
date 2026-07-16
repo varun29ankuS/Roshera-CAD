@@ -286,37 +286,19 @@ fn point_to_segment_distance_sq(p: Point2d, a: Point2d, b: Point2d) -> f64 {
 /// when `p` lies strictly inside the polygon `poly` (boundary points
 /// are not classified — callers should handle on-boundary checks
 /// separately if needed).
+///
+/// This was the campaign's original exact ray cast; Slice 2 hoisted its
+/// algorithm into `math::exact_predicates::point_in_polygon_2d_by` as the
+/// SINGLE exact entry point every pipeline copy now delegates to. The
+/// zero-allocation accessor form is used here because `poly` carries
+/// `Point2d`s, not `(f64, f64)` tuples.
 fn point_in_polygon(p: Point2d, poly: &[Point2d], _eps: f64) -> bool {
-    use crate::math::vector2::Vector2;
-    use crate::math::{orient2d, Orientation};
-
-    let n = poly.len();
-    let mut inside = false;
-    let pv = Vector2::new(p.x, p.y);
-    for i in 0..n {
-        let a = poly[i];
-        let b = poly[(i + 1) % n];
-        // Half-open y-straddle (strict `>` on both ends) so a vertex exactly at
-        // `p.y` is counted by exactly one of its two edges.
-        if (a.y > p.y) != (b.y > p.y) {
-            // The straddling edge crosses the +x ray to the RIGHT of `p` iff `p`
-            // is on the correct side of the directed edge a→b — decided EXACTLY by
-            // orient2d (no `x_cross` division that loses precision near the edge).
-            // Upward edge (b.y > a.y): crosses right when `p` is left of a→b (CCW);
-            // downward edge: when `p` is right (CW).
-            let upward = b.y > a.y;
-            let o = orient2d(&Vector2::new(a.x, a.y), &Vector2::new(b.x, b.y), &pv);
-            let crosses_right = match o {
-                Orientation::CounterClockwise => upward,
-                Orientation::Clockwise => !upward,
-                Orientation::Collinear => false,
-            };
-            if crosses_right {
-                inside = !inside;
-            }
-        }
-    }
-    inside
+    crate::math::exact_predicates::point_in_polygon_2d_by(
+        poly.len(),
+        |i| (poly[i].x, poly[i].y),
+        p.x,
+        p.y,
+    )
 }
 
 // =====================================================================
