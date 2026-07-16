@@ -877,6 +877,142 @@ fn csketch_ellipse_profile_revolves_sound() {
     );
 }
 
+// ── Item 4: oblique-direction circle loops extrude SOUND ─────────────
+
+/// GATE (item 4): a full-circle profile under an OBLIQUE extrude
+/// direction is seam-split into two half-circle arcs whose walls are
+/// exactly-swept ruled surfaces — rails are TRUE circles displaced by
+/// the oblique direction, so together the walls ARE the oblique
+/// (elliptic) cylinder lateral, exactly. The solid is
+/// ground-truth-SOUND with the sheared-prism volume πr²·h·(d̂·n̂).
+///
+/// Pre-fix (RED, run on 496db31): the kernel refused with "analytic
+/// circle profiles extrude only along the sketch plane normal".
+#[test]
+fn gate_oblique_circle_extrudes_sound_with_exact_arc_rails() {
+    use geometry_engine::primitives::curve::Arc as Arc3;
+    use geometry_engine::primitives::surface::RuledSurface;
+
+    let s = fresh("followups_b_oblique_circle");
+    let (cx, cy, r) = (20.0, 15.0, 6.0);
+    s.add_circle(Point2d::new(cx, cy), r).expect("circle");
+    let outer = analytic_outer(&s);
+    assert!(matches!(outer[0], ProfileEdge::Circle { .. }));
+
+    let direction = Vector3::new(0.3, 0.0, 1.0);
+    let distance = 10.0;
+    let mut model = BRepModel::new();
+    let solid = extrude_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        distance,
+        Some(direction),
+        Tolerance::default(),
+    )
+    .expect("oblique circle extrude — the refusal is retired");
+
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+    let face_count = model
+        .solid_outer_face_count(solid)
+        .expect("outer face count");
+    assert_eq!(face_count, 4, "2 caps + 2 seam-split arc-railed walls");
+
+    // The walls are RuledSurfaces whose bottom rails are TRUE circle
+    // arcs at the exact radius — no chord fit anywhere.
+    let solid_ref = model.solids.get(solid).expect("solid").clone();
+    let shell = model.shells.get(solid_ref.outer_shell).expect("shell");
+    let mut arc_walls = 0usize;
+    for &fid in &shell.faces {
+        let face = model.faces.get(fid).expect("face");
+        let surface = model.surfaces.get(face.surface_id).expect("surface");
+        if let Some(ruled) = surface.as_any().downcast_ref::<RuledSurface>() {
+            let rail = ruled
+                .curve1
+                .as_any()
+                .downcast_ref::<Arc3>()
+                .expect("oblique circle wall rail must be a true Arc");
+            assert!(
+                (rail.radius - r).abs() < 1e-9,
+                "rail radius exact: {}",
+                rail.radius
+            );
+            assert!(
+                (rail.sweep_angle.abs() - PI).abs() < 1e-9,
+                "half-circle split: sweep {}",
+                rail.sweep_angle
+            );
+            arc_walls += 1;
+        }
+    }
+    assert_eq!(arc_walls, 2, "two seam-split arc-railed walls");
+
+    // Sheared prism: V = area × (displacement · n̂).
+    let d_unit = Vector3::new(0.3, 0.0, 1.0).normalize().expect("unit");
+    let axial = distance * d_unit.dot(&Vector3::Z);
+    let analytic = PI * r * r * axial;
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 2e-3,
+        "oblique prism volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
+/// Item 4, hole: the gate profile (rectangle + circle hole) under the
+/// SAME oblique direction — both loops analytic, solid SOUND, volume
+/// = (W·H − πr²) · h·(d̂·n̂). This is the fixture the retired kernel
+/// refusal test used.
+#[test]
+fn oblique_rect_with_circle_hole_extrudes_sound() {
+    let s = fresh("followups_b_oblique_gate");
+    s.add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(40.0, 30.0))
+        .expect("rectangle");
+    s.add_circle(Point2d::new(20.0, 15.0), 6.0).expect("circle");
+    let topo = SketchTopology::analyze(&s, &Tolerance2d::default()).expect("topology");
+    let profiles = ProfileExtractor::extract_for_extrusion(&topo).expect("profiles");
+    assert_eq!(profiles.len(), 1);
+    let to_edges = |lp: &geometry_engine::sketch2d::sketch_topology::SketchLoop| {
+        match ProfileExtractor::analytic_loop_edges(&s, &topo, lp).expect("extraction") {
+            AnalyticLoop::Edges(edges) => edges,
+            other => panic!("must lift analytically: {other:?}"),
+        }
+    };
+    let direction = Vector3::new(0.3, 0.0, 1.0);
+    let mut model = BRepModel::new();
+    let solid = extrude_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(to_edges(&profiles[0].outer_boundary)),
+            holes: vec![ProfileLoop::Edges(to_edges(&profiles[0].holes[0]))],
+        }],
+        10.0,
+        Some(direction),
+        Tolerance::default(),
+    )
+    .expect("oblique gate profile extrudes");
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+
+    let d_unit = direction.normalize().expect("unit");
+    let analytic = (40.0 * 30.0 - PI * 36.0) * 10.0 * d_unit.dot(&Vector3::Z);
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 2e-3,
+        "oblique drilled volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
 // ── Item 1: ellipse profiles lift to EXACT rational NURBS ────────────
 
 /// Evaluate a 2D `ProfileEdge::Nurbs` at parameter `t` by lifting it

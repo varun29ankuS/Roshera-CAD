@@ -815,14 +815,24 @@ fn materialise_circle(points: &[[f64; 2]], segments: u32) -> Result<Vec<[f64; 2]
 /// both cases so corner vertices remain snappable for the constraint
 /// solver and the downstream extrusion still produces N partitioned
 /// side faces.
+/// `oblique_split_direction`: the ambient extrude direction, when the
+/// caller has one. A CIRCLE shape whose extrude direction is OBLIQUE
+/// to the circle axis is seam-split into two half-circle `Arc` edges
+/// (SKETCH-DCM #45 follow-ups B, item 4): a single closed circle edge
+/// under an oblique direction would produce a CLOSED generic ruled
+/// wall — the documented zero-triangle tessellation trap (Slice-5
+/// residual 3 named this exact click-draft path). Two open arc-railed
+/// walls are the exact oblique lateral instead. Pass `None` when
+/// there is no extrude direction (revolve).
 pub(crate) fn build_loop_edges(
     model: &mut BRepModel,
     shape_idx: usize,
     tool: SketchTool,
     lifted: &[Point3],
     tolerance: geometry_engine::math::Tolerance,
+    oblique_split_direction: Option<Vector3>,
 ) -> Result<Vec<geometry_engine::primitives::edge::EdgeId>, ApiError> {
-    use geometry_engine::primitives::curve::{Circle, Line, ParameterRange, Polyline};
+    use geometry_engine::primitives::curve::{Arc, Circle, Line, ParameterRange, Polyline};
     use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
 
     let n = lifted.len();
@@ -880,6 +890,54 @@ pub(crate) fn build_loop_edges(
             center.y + ref_dir.y * radius,
             center.z + ref_dir.z * radius,
         );
+        // OBLIQUE extrude direction → seam-split into two half-circle
+        // arcs (see the fn doc): the same construction (and the same
+        // seam/antipode anchors) the kernel's typed-edge path uses, so
+        // the recorded typed-circle event replays to the identical
+        // solid this live build produces.
+        let oblique = oblique_split_direction
+            .and_then(|d| d.normalize().ok())
+            .is_some_and(|d| d.dot(&axis).abs() < 1.0 - 1e-9);
+        if oblique {
+            let anti = Point3::new(
+                center.x - ref_dir.x * radius,
+                center.y - ref_dir.y * radius,
+                center.z - ref_dir.z * radius,
+            );
+            let v0 = model
+                .vertices
+                .add_or_find(seam.x, seam.y, seam.z, tolerance.distance());
+            let v1 = model
+                .vertices
+                .add_or_find(anti.x, anti.y, anti.z, tolerance.distance());
+            if v0 == v1 {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("shape[{shape_idx}] circle degenerate under tolerance"),
+                ));
+            }
+            let half_turn = std::f64::consts::PI;
+            let mut edges = Vec::with_capacity(2);
+            for (start_angle, va, vb) in [(0.0, v0, v1), (half_turn, v1, v0)] {
+                let arc = Arc::with_x_axis(center, axis, ref_dir, radius, start_angle, half_turn)
+                    .map_err(|e| {
+                    ApiError::new(
+                        ErrorCode::InvalidParameter,
+                        format!("shape[{shape_idx}] oblique circle arc: {e:?}"),
+                    )
+                })?;
+                let curve_id = model.curves.add(Box::new(arc));
+                edges.push(model.edges.add(Edge::new(
+                    0,
+                    va,
+                    vb,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                )));
+            }
+            return Ok(edges);
+        }
         let v = model
             .vertices
             .add_or_find(seam.x, seam.y, seam.z, tolerance.distance());
@@ -964,24 +1022,24 @@ pub(crate) fn build_loop_edges(
 /// The `sketch_extrude` event payload for ONE click-draft loop
 /// (SKETCH-DCM #45 follow-ups B, item 6).
 ///
-/// A CIRCLE shape extruded along the plane normal records the TYPED
+/// A CIRCLE shape records the TYPED
 /// `{"edges": [{"kind": "circle", "center": [u, v], "radius": r}]}`
 /// loop — center/radius re-derived from the materialised polygon
 /// exactly the way the LIVE build's `build_loop_edges` (#24) derives
 /// them (regular-polygon centroid == circle center, `|p0 − center|`
-/// == radius), so the replayed analytic cylinder is the same solid
-/// the live path built, never a re-sampled 64-gon prism (the
-/// live-vs-replay drift this retires). Everything else — straight
-/// shapes, whose polygon IS their exact geometry, and circles under
-/// an OBLIQUE direction, whose live wall is not analytic on this
-/// path — keeps the legacy plain-array payload (additive schema: the
-/// replay arm accepts both, old events replay unchanged).
+/// == radius), so the replayed analytic solid is the same one the
+/// live path built, never a re-sampled 64-gon prism (the
+/// live-vs-replay drift this retires). This holds for OBLIQUE extrude
+/// directions too (follow-ups B item 4): live and replay both
+/// seam-split the circle into the same two half-circle arcs.
+/// Straight shapes keep the plain-array payload — the polygon IS
+/// their exact geometry (additive schema: the replay arm accepts
+/// both, old events replay unchanged).
 pub(crate) fn click_draft_loop_event_payload(
     tool: SketchTool,
     polygon_2d: &[[f64; 2]],
-    along_normal: bool,
 ) -> serde_json::Value {
-    if tool == SketchTool::Circle && along_normal && polygon_2d.len() >= 3 {
+    if tool == SketchTool::Circle && polygon_2d.len() >= 3 {
         if let Some(first) = polygon_2d.first() {
             let n = polygon_2d.len() as f64;
             let (mut cu, mut cv) = (0.0, 0.0);
@@ -1873,6 +1931,7 @@ pub async fn extrude_sketch(
                 outer_tool,
                 outer_lifted,
                 tolerance,
+                Some(direction),
             )?;
             // Use the sketch session's known host plane rather than
             // re-deriving it from edge samples. Newell best-fit can
@@ -1897,8 +1956,14 @@ pub async fn extrude_sketch(
             for &hole_idx in &region.hole_shape_idxs {
                 let hole_tool = shape_polygons[hole_idx].1;
                 let hole_lifted = &shape_polygons[hole_idx].3;
-                let hole_edges =
-                    build_loop_edges(&mut model, hole_idx, hole_tool, hole_lifted, tolerance)?;
+                let hole_edges = build_loop_edges(
+                    &mut model,
+                    hole_idx,
+                    hole_tool,
+                    hole_lifted,
+                    tolerance,
+                    Some(direction),
+                )?;
                 let mut inner_loop = Loop::new(0, LoopType::Inner);
                 for edge_id in &hole_edges {
                     inner_loop.add_edge(*edge_id, true);
@@ -1996,31 +2061,23 @@ pub async fn extrude_sketch(
     //
     // SKETCH-DCM #45 follow-ups B (item 6): CIRCLE shapes record the
     // TYPED `{"edges": [{"kind": "circle", ...}]}` loop payload — the
-    // live build's `build_loop_edges` (#24) emits one analytic Circle
-    // edge whose wall collapses to a true Cylinder, and a polygon
-    // event replayed as a 64-gon prism would silently DRIFT from that
-    // live solid. Center/radius are derived from the materialised
-    // polygon exactly as the live edge builder derives them, so live
-    // and replay agree bit-for-bit. Straight shapes (polyline/rect)
-    // keep the polygon payload — it IS their exact geometry — and a
-    // circle under an OBLIQUE direction keeps it too (the live build
-    // has no analytic oblique-circle wall on this path; recording
-    // typed would make replay diverge from live).
+    // live build's `build_loop_edges` (#24) emits analytic circle
+    // geometry (one closed Circle edge along the normal; two exact
+    // half-circle arcs under an OBLIQUE direction, follow-ups B item
+    // 4), and a polygon event replayed as a 64-gon prism would
+    // silently DRIFT from that live solid. Center/radius are derived
+    // from the materialised polygon exactly as the live edge builder
+    // derives them, so live and replay agree. Straight shapes
+    // (polyline/rect) keep the polygon payload — it IS their exact
+    // geometry.
     {
         use geometry_engine::operations::recorder::OperationRecorder as _;
         let frame_origin = session.plane.lift(0.0, 0.0);
         let u_pt = session.plane.lift(1.0, 0.0);
         let v_pt = session.plane.lift(0.0, 1.0);
-        let along_normal = {
-            let n = session.plane.normal();
-            match (direction.normalize(), n.normalize()) {
-                (Ok(d), Ok(nn)) => d.dot(&nn).abs() > 1.0 - 1e-9,
-                _ => false,
-            }
-        };
         let loop_json = |idx: usize| -> serde_json::Value {
             let (_, tool, polygon_2d, _) = &shape_polygons[idx];
-            click_draft_loop_event_payload(*tool, polygon_2d, along_normal)
+            click_draft_loop_event_payload(*tool, polygon_2d)
         };
         let regions_json: Vec<serde_json::Value> = regions
             .iter()
@@ -2292,7 +2349,14 @@ pub async fn extrude_cut_sketch(
         let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
         for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in shape_polygons.iter().enumerate()
         {
-            let profile_edges = build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
+            let profile_edges = build_loop_edges(
+                &mut model,
+                shape_idx,
+                *tool,
+                lifted,
+                tolerance,
+                Some(direction),
+            )?;
             let options = ExtrudeOptions {
                 direction,
                 distance: body.distance,
@@ -2545,7 +2609,8 @@ pub async fn revolve_sketch(
         let mut shape_solids: Vec<u32> = Vec::with_capacity(shape_polygons.len());
         for (shape_idx, (_shape_id, tool, _polygon_2d, lifted)) in shape_polygons.iter().enumerate()
         {
-            let profile_edges = build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance)?;
+            let profile_edges =
+                build_loop_edges(&mut model, shape_idx, *tool, lifted, tolerance, None)?;
             let options = RevolveOptions {
                 axis_origin,
                 axis_direction,
@@ -3234,7 +3299,7 @@ mod tests {
                 [cx + r * a.cos(), cy + r * a.sin()]
             })
             .collect();
-        let payload = click_draft_loop_event_payload(SketchTool::Circle, &polygon, true);
+        let payload = click_draft_loop_event_payload(SketchTool::Circle, &polygon);
         let edges = payload
             .get("edges")
             .and_then(|e| e.as_array())
@@ -3251,30 +3316,77 @@ mod tests {
         assert!((radius - r).abs() < 1e-9, "radius exact: {radius}");
     }
 
-    /// Item 6 honesty gates: an OBLIQUE-direction circle and every
-    /// straight shape keep the legacy polygon-array payload (the live
-    /// build is not analytic for those on this path — recording typed
-    /// would make replay diverge from live).
+    /// SKETCH-DCM #45 follow-ups B (item 4): the LIVE click-draft
+    /// circle edge builder seam-splits under an OBLIQUE extrude
+    /// direction (two half-circle `Arc` edges — the closed-ruled
+    /// zero-triangle trap named by Slice-5 residual 3 never forms)
+    /// and keeps the single closed analytic `Circle` edge along the
+    /// normal (the proven Cylinder-collapse path).
     #[test]
-    fn click_draft_non_analytic_loops_keep_polygon_payload() {
-        let polygon: Vec<[f64; 2]> = (0..16)
+    fn click_draft_circle_edge_builder_splits_oblique_directions() {
+        use geometry_engine::math::Tolerance;
+        use geometry_engine::primitives::curve::Arc as Arc3;
+
+        let n = 64usize;
+        let lifted: Vec<Point3> = (0..n)
             .map(|i| {
-                let a = (i as f64 / 16.0) * std::f64::consts::TAU;
-                [a.cos(), a.sin()]
+                let a = (i as f64 / n as f64) * std::f64::consts::TAU;
+                Point3::new(5.0 + 2.0 * a.cos(), -1.0 + 2.0 * a.sin(), 0.0)
             })
             .collect();
-        // Oblique circle → polygon array.
-        let oblique = click_draft_loop_event_payload(SketchTool::Circle, &polygon, false);
-        assert!(
-            oblique.is_array(),
-            "oblique circle stays sampled: {oblique}"
-        );
-        // Rectangle → polygon array even along the normal.
+
+        // Along the normal: one closed analytic circle edge.
+        let mut model = BRepModel::new();
+        let edges = build_loop_edges(
+            &mut model,
+            0,
+            SketchTool::Circle,
+            &lifted,
+            Tolerance::default(),
+            Some(Vector3::Z),
+        )
+        .expect("normal-direction circle");
+        assert_eq!(edges.len(), 1, "single closed circle edge along normal");
+
+        // Oblique: two half-circle arc edges at the exact radius.
+        let mut model = BRepModel::new();
+        let edges = build_loop_edges(
+            &mut model,
+            0,
+            SketchTool::Circle,
+            &lifted,
+            Tolerance::default(),
+            Some(Vector3::new(0.3, 0.0, 1.0)),
+        )
+        .expect("oblique-direction circle");
+        assert_eq!(edges.len(), 2, "oblique circle seam-splits into two arcs");
+        for &eid in &edges {
+            let edge = model.edges.get(eid).expect("edge");
+            let curve = model.curves.get(edge.curve_id).expect("curve");
+            let arc = curve
+                .as_any()
+                .downcast_ref::<Arc3>()
+                .expect("half-circle Arc curve");
+            assert!((arc.radius - 2.0).abs() < 1e-9, "exact radius");
+            assert!(
+                (arc.sweep_angle.abs() - std::f64::consts::PI).abs() < 1e-9,
+                "half-turn sweep"
+            );
+        }
+    }
+
+    /// Item 6 honesty gate: straight shapes keep the legacy
+    /// polygon-array payload — the polygon IS their exact geometry.
+    #[test]
+    fn click_draft_non_analytic_loops_keep_polygon_payload() {
+        // (The former oblique-circle polygon fallback was retired by
+        // item 4: live and replay both seam-split oblique circles
+        // into the same two half-circle arcs, so circles record
+        // typed unconditionally.)
         let rect = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]];
-        let rect_payload = click_draft_loop_event_payload(SketchTool::Rectangle, &rect, true);
+        let rect_payload = click_draft_loop_event_payload(SketchTool::Rectangle, &rect);
         assert!(rect_payload.is_array(), "straight shapes stay polygons");
-        // Polyline → polygon array.
-        let poly_payload = click_draft_loop_event_payload(SketchTool::Polyline, &rect, true);
+        let poly_payload = click_draft_loop_event_payload(SketchTool::Polyline, &rect);
         assert!(poly_payload.is_array());
     }
 

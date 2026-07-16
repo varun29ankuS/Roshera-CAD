@@ -1943,12 +1943,13 @@ pub fn extrude_polygon_regions(
 /// Frame: `lift(p) = origin + u_axis·p[0] + v_axis·p[1]`; the default
 /// extrude direction is `u_axis × v_axis`.
 ///
-/// Honest refusal (typed, never a silent approximation): an analytic
-/// full-circle loop is only accepted when the extrusion direction is
-/// parallel to the sketch normal — an oblique prism over a circle has
-/// no coaxial-cylinder lateral, and the generic closed ruled wall it
-/// would otherwise get is a known zero-triangle tessellation trap.
-/// Callers that want oblique extrusion sample the circle explicitly.
+/// Analytic full-circle loops extrude along ANY direction (SKETCH-DCM
+/// #45 follow-ups B item 4): parallel to the sketch normal the wall
+/// collapses to a true `Cylinder`; OBLIQUE directions seam-split the
+/// circle into two half-circle arcs whose open exactly-swept ruled
+/// walls are the exact oblique (elliptic-cylinder) lateral — the old
+/// typed refusal (closed ruled wall = the zero-triangle tessellation
+/// trap) is retired by removing the trap's precondition.
 #[allow(clippy::too_many_arguments)] // Reason: mirrors extrude_polygon_regions' established frame+payload signature; bundling would churn every call site (replay, csketch, click-draft) without clarifying.
 pub fn extrude_profile_regions(
     model: &mut BRepModel,
@@ -2114,18 +2115,17 @@ pub(crate) fn build_polygon_loop(
 /// - `Arc` → `Arc` curve with the plane's +u as its angle reference,
 ///   so sketch angles map 1:1. Walls become exactly-swept ruled
 ///   surfaces whose rails are true arcs.
-/// - `Circle` → ONE closed `Circle` edge (start == end at the curve's
-///   parametric-origin seam, the CDT-γ.3 invariant). The extruded wall
-///   collapses to an analytic `Cylinder` via
-///   `try_build_cylinder_from_circles` — the same lateral face
-///   `create_cylinder` emits, so booleans/fillets/STEP inherit every
-///   cylinder-hardened path (incl. `CYLINDRICAL_SURFACE`, f44e6f1).
+/// - `Circle` → along the plane normal, ONE closed `Circle` edge
+///   (start == end at the curve's parametric-origin seam, the CDT-γ.3
+///   invariant) whose extruded wall collapses to an analytic
+///   `Cylinder` via `try_build_cylinder_from_circles` — the same
+///   lateral face `create_cylinder` emits, so booleans/fillets/STEP
+///   inherit every cylinder-hardened path (incl.
+///   `CYLINDRICAL_SURFACE`, f44e6f1). Under an OBLIQUE `direction`
+///   the circle is seam-split into two half-circle arcs (follow-ups B
+///   item 4) — open exactly-swept ruled walls, exact oblique lateral.
 ///
-/// Refusals (typed — callers fall back to sampling EXPLICITLY):
-/// a `Circle` edge must be its own single-edge loop, and (checked
-/// here because this builder feeds `extrude_face`) a circle loop is
-/// only accepted when `direction` is parallel to the plane normal —
-/// see [`extrude_profile_regions`].
+/// Refusal (typed): a `Circle` edge must be its own single-edge loop.
 #[allow(clippy::too_many_arguments)] // Reason: internal helper carrying the full plane frame + extrude direction for the circle/normal refusal; a params struct would be used exactly once.
 pub(crate) fn build_analytic_loop(
     model: &mut BRepModel,
@@ -2150,31 +2150,38 @@ pub(crate) fn build_analytic_loop(
 
     let finite2 = |p: &[f64; 2]| p[0].is_finite() && p[1].is_finite();
 
-    // Full-circle loop preconditions (see doc above).
+    // Full-circle loop precondition (see doc above): a circle is a
+    // closed loop by itself.
     let has_circle = edges2d
         .iter()
         .any(|e| matches!(e, ProfileEdge::Circle { .. }));
-    if has_circle {
-        if edges2d.len() != 1 {
-            return Err(OperationError::InvalidGeometry(
-                "a full-circle profile edge must be the only edge of its loop".to_string(),
-            ));
-        }
+    if has_circle && edges2d.len() != 1 {
+        return Err(OperationError::InvalidGeometry(
+            "a full-circle profile edge must be the only edge of its loop".to_string(),
+        ));
+    }
+    // Is the extrude direction parallel to the plane normal? Decides
+    // the circle construction below: along-normal circles keep the
+    // single-closed-edge form whose wall collapses to an analytic
+    // `Cylinder`; OBLIQUE circles are seam-split into two half-circle
+    // arcs (SKETCH-DCM #45 follow-ups B, item 4) — their walls are
+    // exactly-swept OPEN ruled surfaces with true circle-arc rails
+    // displaced by the oblique direction, which together ARE the
+    // oblique (elliptic-cylinder) lateral, exactly. The old typed
+    // refusal existed because a single closed circle edge under an
+    // oblique direction would produce the CLOSED generic ruled wall —
+    // the zero-triangle tessellation trap; the split (the same cure
+    // as the closed-NURBS item-2 fix) removes the trap's
+    // precondition instead of refusing the input.
+    let direction_along_normal = {
         let d = direction.normalize().map_err(|e| {
             OperationError::NumericalError(format!("extrude direction normalization: {e:?}"))
         })?;
         let n = normal.normalize().map_err(|e| {
             OperationError::NumericalError(format!("plane normal normalization: {e:?}"))
         })?;
-        if d.dot(&n).abs() < 1.0 - 1e-9 {
-            return Err(OperationError::InvalidGeometry(
-                "analytic circle profiles extrude only along the sketch plane normal \
-                 (an oblique prism over a circle has no coaxial-cylinder lateral); \
-                 sample the circle into a polygon for oblique extrusion"
-                    .to_string(),
-            ));
-        }
-    }
+        d.dot(&n).abs() > 1.0 - 1e-9
+    };
 
     let unit_normal = normal.normalize().map_err(|e| {
         OperationError::NumericalError(format!("plane normal normalization: {e:?}"))
@@ -2433,6 +2440,65 @@ pub(crate) fn build_analytic_loop(
                         "analytic loop edge {i}: circle construction failed: {e:?}"
                     ))
                 })?;
+                if !direction_along_normal {
+                    // OBLIQUE direction (follow-ups B item 4): seam-
+                    // split the circle into two half-circle arcs about
+                    // the circle's OWN reference frame (x_axis — the
+                    // same convention the closed-edge form seams at,
+                    // so live click-draft builds and replayed events
+                    // agree). Each arc's translated wall is an OPEN
+                    // exactly-swept ruled surface — no closed ruled
+                    // lateral, no zero-triangle trap, exact geometry.
+                    let ref_dir = circle.x_axis();
+                    let seam = Point3::new(
+                        center3.x + ref_dir.x * radius,
+                        center3.y + ref_dir.y * radius,
+                        center3.z + ref_dir.z * radius,
+                    );
+                    let anti = Point3::new(
+                        center3.x - ref_dir.x * radius,
+                        center3.y - ref_dir.y * radius,
+                        center3.z - ref_dir.z * radius,
+                    );
+                    let v0 = model
+                        .vertices
+                        .add_or_find(seam.x, seam.y, seam.z, tolerance);
+                    let v1 = model
+                        .vertices
+                        .add_or_find(anti.x, anti.y, anti.z, tolerance);
+                    if v0 == v1 {
+                        return Err(OperationError::InvalidGeometry(format!(
+                            "analytic loop edge {i}: circle degenerate — its seam and \
+                             antipode collapse under tolerance {tolerance}"
+                        )));
+                    }
+                    let half_turn = std::f64::consts::PI;
+                    for (start_angle, va, vb) in [(0.0, v0, v1), (half_turn, v1, v0)] {
+                        let arc = Arc::with_x_axis(
+                            center3,
+                            unit_normal,
+                            ref_dir,
+                            *radius,
+                            start_angle,
+                            half_turn,
+                        )
+                        .map_err(|e| {
+                            OperationError::NumericalError(format!(
+                                "analytic loop edge {i}: oblique circle arc split failed: {e:?}"
+                            ))
+                        })?;
+                        let curve_id = model.curves.add(Box::new(arc));
+                        out.push(model.edges.add(Edge::new(
+                            0,
+                            va,
+                            vb,
+                            curve_id,
+                            EdgeOrientation::Forward,
+                            ParameterRange::new(0.0, 1.0),
+                        )));
+                    }
+                    continue;
+                }
                 // Closed-curve seam invariant (CDT-γ.3): the start==end
                 // vertex MUST sit at the curve's parametric origin
                 // (t = 0 ≡ x_axis()), or the lateral face's u-sweep

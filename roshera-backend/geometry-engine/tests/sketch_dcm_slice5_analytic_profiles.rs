@@ -719,19 +719,22 @@ fn slot_extrude_arc_walls_are_exact_and_solid_is_sound() {
     );
 }
 
-// ─── honest refusal at the kernel boundary ───────────────────────────
+// ─── oblique analytic circles (kernel boundary) ──────────────────────
 
-/// An analytic full-circle loop extruded OBLIQUELY cannot become a
-/// coaxial cylinder — the kernel must refuse with a typed error rather
-/// than emit the known-broken closed ruled wall. (The csketch route
-/// pre-checks this and falls back to the sampled polygon, so agents
-/// keep oblique extrudes; this pins the kernel-level contract.)
+/// FLIPPED (SKETCH-DCM #45 follow-ups B, item 4 — Slice-6/7 test-flip
+/// precedent): this test used to pin the TYPED REFUSAL of an oblique
+/// analytic-circle extrusion (the closed ruled wall was the
+/// zero-triangle tessellation trap). The kernel now seam-splits the
+/// circle into two half-circle arcs — open exactly-swept ruled walls,
+/// the exact oblique lateral — so the SAME fixture pins the soundness
+/// of the resulting solid. The pin's semantics survive: the kernel
+/// still never emits a silently broken solid for this input.
 #[test]
 fn oblique_circle_extrusion_refuses_instead_of_emitting_broken_wall() {
     let sketch = gate_sketch();
     let regions = analytic_regions(&sketch);
     let mut model = BRepModel::new();
-    let result = extrude_profile_regions(
+    let solid = extrude_profile_regions(
         &mut model,
         Point3::new(0.0, 0.0, 0.0),
         Vector3::X,
@@ -740,16 +743,12 @@ fn oblique_circle_extrusion_refuses_instead_of_emitting_broken_wall() {
         EXTRUDE_H,
         Some(Vector3::new(0.3, 0.0, 1.0)),
         Tolerance::default(),
-    );
-    let err = match result {
-        Err(e) => format!("{e:?}"),
-        Ok(id) => panic!(
-            "oblique analytic-circle extrusion must refuse (typed error), \
-             but produced solid {id}"
-        ),
-    };
+    )
+    .expect("oblique analytic-circle extrusion builds (seam-split walls)");
+    let gt = model.ground_truth(solid).expect("ground truth");
     assert!(
-        err.contains("normal"),
-        "refusal must explain the sketch-normal requirement, got: {err}"
+        gt.certificate.is_sound(),
+        "oblique gate solid must be SOUND: {}",
+        gt.summary()
     );
 }

@@ -1914,10 +1914,11 @@ pub struct ExtrudeCSketchRequest {
 ///    circle hole extrudes to a TRUE cylindrical bore face (the same
 ///    lateral `create_cylinder` emits — booleans/fillets/STEP inherit
 ///    every cylinder-hardened path); splines AND ellipses lift to
-///    exact NURBS edges (Slice 7 + follow-ups B item 1). Only full
-///    circles under an oblique extrusion direction fall back to the
-///    chord-sampled polygon EXPLICITLY (counted in the response's
-///    `stats.sampled_loops`; never labeled analytic).
+///    exact NURBS edges (Slice 7 + follow-ups B item 1), and OBLIQUE
+///    directions seam-split circles into exact half-circle arcs
+///    (follow-ups B item 4) — every current entity kind extrudes
+///    analytically. `stats.sampled_loops` remains the honest counter
+///    for any future kind without a lift.
 /// 4. `extrude_profile_regions` — the shared kernel implementation
 ///    behind live extrude AND timeline replay, then tessellate +
 ///    broadcast.
@@ -1996,7 +1997,7 @@ pub async fn extrude_csketch(
     // typed edges wherever the entity kinds allow (SKETCH-DCM #45
     // Slice 5); explicit chord-sampled fallback otherwise.
     let (regions, analytic_loops, sampled_loops) =
-        materialise_profile_regions(&sketch, &topology, &profiles, direction, plane.normal())?;
+        materialise_profile_regions(&sketch, &topology, &profiles)?;
 
     // Suppress the kernel's inner events (extrude_face + region
     // Unions) for the duration of the build: they are not replayable
@@ -2153,9 +2154,10 @@ pub async fn extrude_csketch(
             "regions":         regions.len(),
             // Honest profile provenance (SKETCH-DCM #45 Slice 5): how
             // many boundary loops carry TRUE analytic edges vs the
-            // chord-sampled fallback (circles under an oblique
-            // direction). A sampled loop is never silently passed
-            // off as analytic.
+            // chord-sampled fallback. Every current entity kind lifts
+            // analytically (follow-ups B); the counter stays for any
+            // future kind without a lift — a sampled loop is never
+            // silently passed off as analytic.
             "analytic_loops":  analytic_loops,
             "sampled_loops":   sampled_loops,
         }
@@ -2181,19 +2183,15 @@ fn profile_loop_json(lp: &geometry_engine::operations::extrude::ProfileLoop) -> 
 /// Per loop: lines/arcs/circles/splines/ellipses extract as typed
 /// analytic edges via `ProfileExtractor::analytic_loop_edges`; loops
 /// containing entity kinds without an analytic lift fall back
-/// EXPLICITLY to the chord-sampled polygon, as does a full-circle
-/// loop when the extrusion direction is oblique to the sketch normal
-/// (an oblique
-/// prism over a circle has no coaxial-cylinder lateral — the kernel
-/// refuses that combination, so the route samples it up front and the
-/// caller can still extrude obliquely). The counts feed the response's
-/// `stats` so the caller always sees which loops were approximated.
+/// EXPLICITLY to the chord-sampled polygon. Oblique-direction circles
+/// no longer pre-sample (SKETCH-DCM #45 follow-ups B item 4: the
+/// kernel seam-splits them into exact half-circle arcs). The counts
+/// feed the response's `stats` so the caller always sees which loops
+/// were approximated.
 fn materialise_profile_regions(
     sketch: &Sketch,
     topology: &geometry_engine::sketch2d::sketch_topology::SketchTopology,
     profiles: &[geometry_engine::sketch2d::sketch_topology::ExtrusionProfile],
-    direction: geometry_engine::math::Vector3,
-    plane_normal: geometry_engine::math::Vector3,
 ) -> Result<
     (
         Vec<geometry_engine::operations::extrude::ProfileRegion>,
@@ -2212,8 +2210,6 @@ fn materialise_profile_regions(
             sketch,
             topology,
             &profile.outer_boundary,
-            direction,
-            plane_normal,
             &mut analytic_loops,
             &mut sampled_loops,
         )?;
@@ -2223,8 +2219,6 @@ fn materialise_profile_regions(
                 sketch,
                 topology,
                 hole,
-                direction,
-                plane_normal,
                 &mut analytic_loops,
                 &mut sampled_loops,
             )?);
@@ -2241,13 +2235,11 @@ fn materialise_profile_loop(
     sketch: &Sketch,
     topology: &geometry_engine::sketch2d::sketch_topology::SketchTopology,
     sketch_loop: &geometry_engine::sketch2d::sketch_topology::SketchLoop,
-    direction: geometry_engine::math::Vector3,
-    plane_normal: geometry_engine::math::Vector3,
     analytic_loops: &mut usize,
     sampled_loops: &mut usize,
 ) -> Result<geometry_engine::operations::extrude::ProfileLoop, ApiError> {
     use geometry_engine::operations::extrude::ProfileLoop;
-    use geometry_engine::sketch2d::sketch_topology::{AnalyticLoop, ProfileEdge};
+    use geometry_engine::sketch2d::sketch_topology::AnalyticLoop;
 
     let verdict =
         geometry_engine::sketch2d::sketch_topology::ProfileExtractor::analytic_loop_edges(
@@ -2259,33 +2251,15 @@ fn materialise_profile_loop(
 
     match verdict {
         AnalyticLoop::Edges(edges) => {
-            let has_circle = edges
-                .iter()
-                .any(|e| matches!(e, ProfileEdge::Circle { .. }));
-            // Closed NURBS loops no longer pre-sample: the kernel
-            // seam-splits a closed NURBS edge into two open exact
-            // halves (SKETCH-DCM #45 follow-ups B, item 2), so the
-            // zero-triangle closed-ruled trap's precondition never
-            // forms and the loop stays ANALYTIC end to end.
-            //
-            // A degenerate (zero) direction is treated as oblique here
-            // so the loop falls back to sampling and the request fails
-            // downstream with the same direction error as before.
-            let along_normal = match (direction.normalize(), plane_normal.normalize()) {
-                (Ok(d), Ok(n)) => d.dot(&n).abs() > 1.0 - 1e-9,
-                _ => false,
-            };
-            if has_circle && !along_normal {
-                *sampled_loops += 1;
-                Ok(ProfileLoop::Polygon(sample_topology_loop(
-                    sketch,
-                    topology,
-                    sketch_loop,
-                )?))
-            } else {
-                *analytic_loops += 1;
-                Ok(ProfileLoop::Edges(edges))
-            }
+            // Every typed loop stays ANALYTIC end to end: closed NURBS
+            // edges are seam-split by the kernel (SKETCH-DCM #45
+            // follow-ups B item 2), and full circles under an OBLIQUE
+            // direction are seam-split into two half-circle arcs
+            // (item 4) — the zero-triangle closed-ruled trap's
+            // precondition never forms, so the pre-sampling fallbacks
+            // this branch used to apply are retired.
+            *analytic_loops += 1;
+            Ok(ProfileLoop::Edges(edges))
         }
         AnalyticLoop::Unsupported { .. } => {
             *sampled_loops += 1;
@@ -2300,11 +2274,10 @@ fn materialise_profile_loop(
 
 /// Materialise a topology loop into an ordered plane-local polygon —
 /// the EXPLICIT sampled fallback for loops that
-/// [`materialise_profile_loop`] cannot express analytically (a full
-/// circle under an oblique extrusion direction, or any future entity
-/// kind without a lift). Line/arc/circle/spline/ellipse loops
-/// normally take the analytic typed path instead (SKETCH-DCM #45
-/// Slice 5 / Slice 7 / follow-ups B).
+/// [`materialise_profile_loop`] cannot express analytically (any
+/// future entity kind without a lift; every current kind lifts).
+/// Line/arc/circle/spline/ellipse loops take the analytic typed path
+/// instead (SKETCH-DCM #45 Slice 5 / Slice 7 / follow-ups B).
 ///
 /// Each directed edge contributes its samples start-inclusive /
 /// end-exclusive, so concatenating edges closes the polygon without
@@ -3612,8 +3585,7 @@ mod tests {
         let (topo, profiles) = profile_setup(&sketch);
 
         let (regions, analytic, sampled) =
-            materialise_profile_regions(&sketch, &topo, &profiles, Vector3::Z, Vector3::Z)
-                .expect("materialise");
+            materialise_profile_regions(&sketch, &topo, &profiles).expect("materialise");
         assert_eq!((analytic, sampled), (2, 0), "both loops analytic");
         assert_eq!(regions.len(), 1);
         let region = regions.first().expect("one region");
@@ -3638,14 +3610,18 @@ mod tests {
         }
     }
 
-    /// Oblique extrusion direction: the circle loop falls back to the
-    /// EXPLICIT sampled polygon (counted in `sampled_loops`) because
-    /// an oblique prism over a circle has no coaxial-cylinder lateral;
-    /// the straight rectangle loop stays analytic.
+    /// FLIPPED (SKETCH-DCM #45 follow-ups B, item 4 — Slice-6/7
+    /// test-flip precedent): this test used to pin the EXPLICIT
+    /// sampled fallback for a circle loop under an OBLIQUE extrusion
+    /// direction. The kernel now seam-splits oblique circles into two
+    /// exact half-circle arcs, so the materialiser is
+    /// direction-independent and the SAME fixture pins (2, 0)
+    /// counters with the typed circle edge intact. The pin's
+    /// semantics survive: a sampled loop is never labeled analytic.
     #[test]
     fn extrude_oblique_direction_samples_circle_loop_explicitly() {
-        use geometry_engine::math::Vector3;
         use geometry_engine::operations::extrude::ProfileLoop;
+        use geometry_engine::sketch2d::sketch_topology::ProfileEdge;
 
         let sketch = Sketch::new("s5-oblique".to_string(), SketchAnchor::xy());
         sketch
@@ -3656,14 +3632,12 @@ mod tests {
             .expect("circle");
         let (topo, profiles) = profile_setup(&sketch);
 
-        let oblique = Vector3::new(0.3, 0.0, 1.0);
         let (regions, analytic, sampled) =
-            materialise_profile_regions(&sketch, &topo, &profiles, oblique, Vector3::Z)
-                .expect("materialise");
+            materialise_profile_regions(&sketch, &topo, &profiles).expect("materialise");
         assert_eq!(
             (analytic, sampled),
-            (1, 1),
-            "rectangle analytic, circle sampled under oblique direction"
+            (2, 0),
+            "both loops analytic — the oblique pre-sampling fallback is retired"
         );
         match regions
             .first()
@@ -3672,13 +3646,14 @@ mod tests {
             .first()
             .expect("one hole")
         {
-            ProfileLoop::Polygon(p) => assert_eq!(
-                p.len(),
-                64,
-                "sampled circle fallback keeps the 64-seg/turn resolution"
-            ),
-            ProfileLoop::Edges(_) => {
-                panic!("oblique circle loop must fall back to the sampled polygon")
+            ProfileLoop::Edges(edges) => {
+                assert!(
+                    matches!(edges[0], ProfileEdge::Circle { .. }),
+                    "typed circle edge (the kernel splits it under oblique directions)"
+                );
+            }
+            ProfileLoop::Polygon(_) => {
+                panic!("circle loop must stay analytic regardless of direction")
             }
         }
     }
@@ -3703,8 +3678,7 @@ mod tests {
         let (topo, profiles) = profile_setup(&sketch);
 
         let (regions, analytic, sampled) =
-            materialise_profile_regions(&sketch, &topo, &profiles, Vector3::Z, Vector3::Z)
-                .expect("materialise");
+            materialise_profile_regions(&sketch, &topo, &profiles).expect("materialise");
         assert_eq!(
             (analytic, sampled),
             (1, 0),
@@ -3900,8 +3874,7 @@ mod tests {
             .expect("profiles");
         let normal = geometry_engine::math::Vector3::Z;
         let (regions, analytic, sampled) =
-            materialise_profile_regions(&sketch, &topology, &profiles, normal, normal)
-                .expect("materialise");
+            materialise_profile_regions(&sketch, &topology, &profiles).expect("materialise");
         assert_eq!(
             (analytic, sampled),
             (1, 0),
@@ -3962,8 +3935,7 @@ mod tests {
             .expect("profiles");
         let normal = geometry_engine::math::Vector3::Z;
         let (regions, analytic, sampled) =
-            materialise_profile_regions(&sketch, &topology, &profiles, normal, normal)
-                .expect("materialise");
+            materialise_profile_regions(&sketch, &topology, &profiles).expect("materialise");
         assert_eq!(
             (analytic, sampled),
             (1, 0),
