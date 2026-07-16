@@ -22,7 +22,8 @@
 //! Most inputs (>99%) only require the fast test, maintaining performance
 //! while guaranteeing correctness for all inputs.
 
-use crate::math::{vector2::Vector2, Point3};
+use crate::math::{vector2::Vector2, vector3::Vector3, Point3};
+use std::cmp::Ordering as CmpOrdering;
 
 /// Result of an orientation test
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,12 +972,13 @@ pub fn insphere(pa: &Point3, pb: &Point3, pc: &Point3, pd: &Point3, pe: &Point3)
     }
 }
 
-/// Shared exact-shoelace core: orientation of the closed polygon whose `i`-th
-/// vertex is `at(i)`, from the exact expansion sign of
-/// `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)`.
-fn shoelace_orientation<F: Fn(usize) -> (f64, f64)>(n: usize, at: F) -> Orientation {
+/// Shared exact-shoelace core: the EXACT value of the (unhalved) shoelace sum
+/// `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)` of the closed polygon whose `i`-th vertex
+/// is `at(i)`, as a zero-free expansion (low→high). An empty expansion is an
+/// exact zero; fewer than 3 vertices is defined as zero (degenerate polygon).
+fn shoelace_expansion<F: Fn(usize) -> (f64, f64)>(n: usize, at: F) -> Vec<f64> {
     if n < 3 {
-        return Orientation::Collinear;
+        return Vec::new();
     }
     let mut acc: Vec<f64> = Vec::new();
     for i in 0..n {
@@ -998,10 +1000,251 @@ fn shoelace_orientation<F: Fn(usize) -> (f64, f64)>(n: usize, at: F) -> Orientat
             sum_v(&acc, &term)
         };
     }
-    if acc.is_empty() {
-        Orientation::Collinear
+    acc
+}
+
+/// Shared exact-shoelace sign: orientation of the closed polygon whose `i`-th
+/// vertex is `at(i)`, from the exact expansion sign of
+/// `Σ_i (x_i·y_{i+1} − x_{i+1}·y_i)`.
+fn shoelace_orientation<F: Fn(usize) -> (f64, f64)>(n: usize, at: F) -> Orientation {
+    let acc = shoelace_expansion(n, at);
+    match acc.last() {
+        None => Orientation::Collinear,
+        Some(&top) => orientation_of(top),
+    }
+}
+
+/// EXACT comparison of two polygons' ABSOLUTE areas: `|area(a)| ⋚ |area(b)|`
+/// with no subtraction rounding (EXACT PREDICATES Slice 3; spec §2.3 row #8
+/// "exact area comparison via expansion difference").
+///
+/// Both shoelace sums are built as exact expansions, the sign carrier of each
+/// is folded to `|·|` by negating the whole expansion when its most
+/// significant component is negative, and the comparison is the exact sign of
+/// the expansion difference. The ½ factor of the shoelace formula cancels in
+/// the comparison and is not applied. Polygons with fewer than 3 vertices
+/// compare as exact zero area (matching the raw-f64 closures this replaces).
+///
+/// The winding direction of either polygon does not affect the result — this
+/// is a pure magnitude question decided exactly. Callers that need the SIGN
+/// use [`polygon_orientation_2d`]; fusing the two questions into one float
+/// compare is the census row-#7/#8 defect class this predicate retires.
+pub fn polygon_area_cmp_2d(a: &[(f64, f64)], b: &[(f64, f64)]) -> CmpOrdering {
+    let abs_shoelace = |pts: &[(f64, f64)]| -> Vec<f64> {
+        let mut e = shoelace_expansion(pts.len(), |i| pts[i]);
+        // The most significant component carries the sign of the whole
+        // expansion (nonoverlapping property); negating every component
+        // negates the represented value exactly.
+        if e.last().is_some_and(|&top| top < 0.0) {
+            for c in &mut e {
+                *c = -*c;
+            }
+        }
+        e
+    };
+    let ea = abs_shoelace(a);
+    let eb = abs_shoelace(b);
+    expansion_diff_sign(&ea, &eb)
+}
+
+// ── Exact circular (angular) order of direction vectors ─────────────────────
+
+/// Angular half-plane of a direction vector, splitting the CCW circle at the
+/// positive x-axis: `1` for angles in `[0, π)` (upper half, +x axis included),
+/// `2` for `[π, 2π)` (lower half, −x axis included), `0` for the zero vector
+/// (which sorts before every nonzero direction, deterministically). The split
+/// is chosen so that two collinear vectors in the SAME half are necessarily
+/// the SAME direction (opposite directions always land in different halves).
+#[inline]
+fn angular_half(v: &Vector2) -> u8 {
+    if v.x == 0.0 && v.y == 0.0 {
+        0
+    } else if v.y > 0.0 || (v.y == 0.0 && v.x > 0.0) {
+        1
     } else {
-        orientation_of(acc[acc.len() - 1])
+        2
+    }
+}
+
+/// EXACT circular order of two 2D direction vectors: the total order of CCW
+/// angle from the positive x-axis, `Less` when `u`'s angle is strictly
+/// smaller than `v`'s (EXACT PREDICATES Slice 3; spec §3.6 `circular_order`).
+///
+/// No `atan2`, no NaN arm: the coarse comparison is the angular half-plane
+/// ([`angular_half`] — the classical quadrant-split construction for sorting
+/// by polar angle without trigonometry; cf. de Berg et al. 2008 §2 rotational
+/// orders, CGAL `Direction_2` comparison), and within a half the order is the
+/// EXACT sign of the cross product `u × v` via [`orient2d`] (Shewchuk 1997).
+/// `Equal` therefore means the two vectors point in EXACTLY the same
+/// direction (positive scalar multiples) — a true tie the caller resolves
+/// with its own deterministic tie-break — never a rounding artifact and never
+/// a NaN-swallowing fallback, which as a sort comparator violates strict weak
+/// ordering (the `boolean.rs`/`face_arrangement.rs` NaN→`Equal` arm this
+/// replaces).
+///
+/// Magnitudes are irrelevant (only the direction participates), so callers
+/// may pass unnormalized tangents. Zero vectors order before every nonzero
+/// direction and equal to each other. Inputs must be finite (the DCEL callers
+/// filter degenerate tangents before sorting).
+pub fn circular_order(u: &Vector2, v: &Vector2) -> CmpOrdering {
+    let hu = angular_half(u);
+    let hv = angular_half(v);
+    match hu.cmp(&hv) {
+        CmpOrdering::Equal => {
+            // Same half ⇒ the angle difference is within (−π, π), so the
+            // exact cross sign decides: u × v > 0 ⇔ u is angularly before v.
+            match orient2d(&Vector2::ZERO, u, v) {
+                Orientation::CounterClockwise => CmpOrdering::Less,
+                Orientation::Clockwise => CmpOrdering::Greater,
+                Orientation::Collinear => CmpOrdering::Equal,
+            }
+        }
+        other => other,
+    }
+}
+
+// ── Exact 3D point-vs-plane sidedness ────────────────────────────────────────
+
+// A-filters for the plane-evaluation predicates (same construction as the
+// Shewchuk bounds above: a first-order forward-error bound over the term-
+// magnitude sum, with generous slack so the filter is conservative — slack
+// only sends more near-degenerate inputs to the exact expansion path, never
+// lets a wrong f64 sign through).
+//
+// sign_of_plane_eval computes fl(n·p − d): 3 product roundings (each ≤ ε·|tᵢ|)
+// plus 3 additions/subtractions (each ≤ ε·T(1+ε)³ where T = Σ|tᵢ| + |d|), so
+// the true error is < 6εT + O(ε²); (8 + 64ε)ε covers it with margin.
+const PLANE_EVAL_ERRBOUND: f64 = (8.0 + 64.0 * EPS) * EPS;
+// point_plane_sidedness computes fl(Σ nᵢ·fl(pᵢ−oᵢ)): each term carries one
+// difference rounding and one product rounding (≤ 2ε·|tᵢ| + O(ε²)) plus 2
+// additions (≤ ε·T each), so the true error is < 4εT + O(ε²); (6 + 48ε)ε
+// covers it with margin. Both bounds are oracle-gated in
+// `tests/adversarial_predicate_census.rs` (BigRational plane eval).
+const POINT_PLANE_ERRBOUND: f64 = (6.0 + 48.0 * EPS) * EPS;
+
+#[inline]
+fn ordering_of_sign(x: f64) -> CmpOrdering {
+    if x > 0.0 {
+        CmpOrdering::Greater
+    } else if x < 0.0 {
+        CmpOrdering::Less
+    } else {
+        CmpOrdering::Equal
+    }
+}
+
+/// Exact sign of the two-expansion difference `e − f` (both zero-free).
+fn expansion_diff_sign(e: &[f64], f: &[f64]) -> CmpOrdering {
+    let d = diff_v(e, f);
+    match d.last() {
+        None => CmpOrdering::Equal,
+        Some(&top) => ordering_of_sign(top),
+    }
+}
+
+/// EXACT sign of the plane evaluation `n·p − d` (EXACT PREDICATES Slice 4;
+/// spec §3.2 formulation 2): `Greater` ⇔ `p` is strictly on the positive side
+/// of the plane `{x : n·x = d}`, `Equal` ⇔ exactly on it, for all finite
+/// inputs.
+///
+/// The DECISION is exact in the plane's REPRESENTED data `(n, d)` — the
+/// stored normal and offset are taken at face value (an analytic `Plane`
+/// surface's own carrier is authoritative for that face, per the spec's
+/// carrier rule). Staged evaluation: an f64 evaluation guarded by the static
+/// `PLANE_EVAL_ERRBOUND` A-filter, falling back to exact expansion
+/// arithmetic (Shewchuk 1997) when the filter cannot certify the sign.
+pub fn sign_of_plane_eval(n: &Vector3, d: f64, p: &Point3) -> CmpOrdering {
+    let t1 = n.x * p.x;
+    let t2 = n.y * p.y;
+    let t3 = n.z * p.z;
+    let det = (t1 + t2 + t3) - d;
+    let mag = t1.abs() + t2.abs() + t3.abs() + d.abs();
+    let errbound = PLANE_EVAL_ERRBOUND * mag;
+    if det > errbound || -det > errbound {
+        return ordering_of_sign(det);
+    }
+    // Exact path: n·p as a zero-free expansion, compared against d.
+    let mut prod = [[0.0f64; 2]; 3];
+    let mut lens = [0usize; 3];
+    for (k, (nc, pc)) in [(n.x, p.x), (n.y, p.y), (n.z, p.z)].into_iter().enumerate() {
+        let (hi, lo) = two_product(nc, pc);
+        let mut m = 0usize;
+        if lo != 0.0 {
+            prod[k][m] = lo;
+            m += 1;
+        }
+        if hi != 0.0 {
+            prod[k][m] = hi;
+            m += 1;
+        }
+        lens[k] = m;
+    }
+    let mut s12 = [0.0f64; 4];
+    let n12 = sum_exp(&prod[0][..lens[0]], &prod[1][..lens[1]], &mut s12);
+    let mut s123 = [0.0f64; 6];
+    let n123 = sum_exp(&s12[..n12], &prod[2][..lens[2]], &mut s123);
+    let dexp: &[f64] = if d != 0.0 { &[d] } else { &[] };
+    expansion_diff_sign(&s123[..n123], dexp)
+}
+
+/// EXACT sidedness of point `p` against the plane through `o` with normal `n`:
+/// the exact sign of `n·(p − o)` for all finite inputs (EXACT PREDICATES
+/// Slice 4). `Greater` ⇔ strictly on the normal side, `Equal` ⇔ exactly on
+/// the plane.
+///
+/// This is the point-anchored sibling of [`sign_of_plane_eval`] for carriers
+/// stored as (anchor point, normal) — e.g. a trim circle's (centre, axis) —
+/// where forming `d = n·o` in f64 first would itself round. Exact in the
+/// stored `(n, o)`; when `n`/`o` are themselves evaluated from approximate
+/// geometry the answer is exactly the sign of the approximate quantity
+/// (spec §3.0 — the derived-input caveat is the caller's to document).
+pub fn point_plane_sidedness(n: &Vector3, o: &Point3, p: &Point3) -> CmpOrdering {
+    let dx = p.x - o.x;
+    let dy = p.y - o.y;
+    let dz = p.z - o.z;
+    let t1 = n.x * dx;
+    let t2 = n.y * dy;
+    let t3 = n.z * dz;
+    let det = t1 + t2 + t3;
+    let mag = t1.abs() + t2.abs() + t3.abs();
+    let errbound = POINT_PLANE_ERRBOUND * mag;
+    if det > errbound || -det > errbound {
+        return ordering_of_sign(det);
+    }
+    // Exact path: each coordinate difference as a 2-component expansion,
+    // scaled by its normal component, summed — all exact.
+    let (mut dxe, mut dye, mut dze) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+    let dxn = diff_exp(p.x, o.x, &mut dxe);
+    let dyn_ = diff_exp(p.y, o.y, &mut dye);
+    let dzn = diff_exp(p.z, o.z, &mut dze);
+    let mut tx = [0.0f64; 4];
+    let mut ty = [0.0f64; 4];
+    let mut tz = [0.0f64; 4];
+    let txn = scale_nonempty(&dxe[..dxn], n.x, &mut tx);
+    let tyn = scale_nonempty(&dye[..dyn_], n.y, &mut ty);
+    let tzn = scale_nonempty(&dze[..dzn], n.z, &mut tz);
+    let mut sxy = [0.0f64; 8];
+    let nxy = sum_exp(&tx[..txn], &ty[..tyn], &mut sxy);
+    let mut sxyz = [0.0f64; 12];
+    let nxyz = sum_exp(&sxy[..nxy], &tz[..tzn], &mut sxyz);
+    match sxyz[..nxyz].last() {
+        None => CmpOrdering::Equal,
+        Some(&top) => ordering_of_sign(top),
+    }
+}
+
+/// [`scale_expansion_zeroelim`] tolerating empty/zero operands (exact 0).
+fn scale_nonempty(e: &[f64], b: f64, h: &mut [f64]) -> usize {
+    if e.is_empty() || b == 0.0 {
+        return 0;
+    }
+    let n = scale_expansion_zeroelim(e, b, h);
+    // scale_expansion_zeroelim writes q even when zero if nothing else was
+    // emitted; strip a lone exact zero so "empty ⇒ exact 0" stays canonical.
+    if n == 1 && h[0] == 0.0 {
+        0
+    } else {
+        n
     }
 }
 
@@ -1459,6 +1702,171 @@ mod tests {
             (1.2341322683967864, 0.5444102712336032),
             (0.5099263106731315, 0.34591881397829927)
         ));
+    }
+
+    #[test]
+    fn circular_order_matches_atan2_on_clean_fan() {
+        // Directions far from any collision: the exact circular order must
+        // reproduce the atan2 order rebased to start at the +x axis.
+        let dirs: Vec<Vector2> = vec![
+            Vector2::new(1.0, 0.0),
+            Vector2::new(2.0, 1.0),
+            Vector2::new(0.0, 3.0),
+            Vector2::new(-1.0, 1.0),
+            Vector2::new(-2.0, 0.0),
+            Vector2::new(-1.0, -2.0),
+            Vector2::new(0.5, -0.5),
+        ];
+        let mut by_exact: Vec<usize> = (0..dirs.len()).collect();
+        by_exact.sort_by(|&i, &j| circular_order(&dirs[i], &dirs[j]));
+        let mut by_angle: Vec<usize> = (0..dirs.len()).collect();
+        by_angle.sort_by(|&i, &j| {
+            let ai = dirs[i].y.atan2(dirs[i].x).rem_euclid(std::f64::consts::TAU);
+            let aj = dirs[j].y.atan2(dirs[j].x).rem_euclid(std::f64::consts::TAU);
+            ai.total_cmp(&aj)
+        });
+        assert_eq!(by_exact, by_angle);
+    }
+
+    #[test]
+    fn circular_order_equal_only_for_positive_scalar_multiples() {
+        let u = Vector2::new(3.0, 7.0);
+        let v = Vector2::new(1.5, 3.5); // u/2 — same direction
+        assert_eq!(circular_order(&u, &v), CmpOrdering::Equal);
+        // Opposite direction is NOT equal (lands in the other half).
+        let w = Vector2::new(-3.0, -7.0);
+        assert_ne!(circular_order(&u, &w), CmpOrdering::Equal);
+        // Antisymmetry.
+        let a = Vector2::new(1.0, 1e-300);
+        let b = Vector2::new(1.0, 2e-300);
+        assert_eq!(circular_order(&a, &b), CmpOrdering::Less);
+        assert_eq!(circular_order(&b, &a), CmpOrdering::Greater);
+    }
+
+    #[test]
+    fn circular_order_half_plane_boundaries() {
+        // +x axis is the first direction of the order; −x belongs to the
+        // lower half; ties on the axes are direction-exact.
+        let px = Vector2::new(5.0, 0.0);
+        let py = Vector2::new(0.0, 5.0);
+        let nx = Vector2::new(-5.0, 0.0);
+        let ny = Vector2::new(0.0, -5.0);
+        assert_eq!(circular_order(&px, &py), CmpOrdering::Less);
+        assert_eq!(circular_order(&py, &nx), CmpOrdering::Less);
+        assert_eq!(circular_order(&nx, &ny), CmpOrdering::Less);
+        assert_eq!(circular_order(&px, &ny), CmpOrdering::Less);
+        // Zero vector sorts first, and equal to itself.
+        let z = Vector2::ZERO;
+        assert_eq!(circular_order(&z, &px), CmpOrdering::Less);
+        assert_eq!(circular_order(&z, &z), CmpOrdering::Equal);
+    }
+
+    /// Sub-ulp direction pairs: `atan2` collides (identical f64 angles) while
+    /// the exact cross sign still orders them — the census row-#6 lie class
+    /// the DCEL angular sorts inherit from the transcendental sort key.
+    #[test]
+    fn circular_order_resolves_atan2_collisions() {
+        // v = 3·u + (0, 2^-105): cross(u, v) = 1·(3a+δ) − a·3 = δ > 0 exactly
+        // (a = 2^-54 makes 3a exact; 3a + 2^-105 is representable in 53 bits).
+        let a = 2.0_f64.powi(-54);
+        let delta = 2.0_f64.powi(-105);
+        let u = Vector2::new(1.0, a);
+        let v = Vector2::new(3.0, 3.0 * a + delta);
+        // The exact order is Less regardless of whether this platform's atan2
+        // collides — that's what makes the sort key exact.
+        assert_eq!(circular_order(&u, &v), CmpOrdering::Less);
+        assert_eq!(circular_order(&v, &u), CmpOrdering::Greater);
+    }
+
+    #[test]
+    fn polygon_area_cmp_basic_and_winding_independent() {
+        let unit_sq: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let big_sq: Vec<(f64, f64)> = vec![(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)];
+        let big_sq_cw: Vec<(f64, f64)> = big_sq.iter().rev().copied().collect();
+        assert_eq!(polygon_area_cmp_2d(&big_sq, &unit_sq), CmpOrdering::Greater);
+        assert_eq!(polygon_area_cmp_2d(&unit_sq, &big_sq), CmpOrdering::Less);
+        // |area| — winding direction must not matter.
+        assert_eq!(
+            polygon_area_cmp_2d(&big_sq_cw, &unit_sq),
+            CmpOrdering::Greater
+        );
+        // Exactly equal areas: the same square translated by an exactly
+        // representable offset.
+        let moved: Vec<(f64, f64)> = unit_sq.iter().map(|&(x, y)| (x + 0.5, y + 0.25)).collect();
+        assert_eq!(polygon_area_cmp_2d(&unit_sq, &moved), CmpOrdering::Equal);
+        // Degenerate (<3 vertices) compares as exact zero area.
+        let degen: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 1.0)];
+        assert_eq!(polygon_area_cmp_2d(&degen, &unit_sq), CmpOrdering::Less);
+        assert_eq!(polygon_area_cmp_2d(&degen, &degen), CmpOrdering::Equal);
+    }
+
+    /// One-ulp area difference: the f64 shoelace of both polygons evaluates
+    /// IDENTICALLY (the perturbation is below its rounding), but the exact
+    /// comparison still orders them.
+    #[test]
+    fn polygon_area_cmp_resolves_sub_rounding_difference() {
+        let base: Vec<(f64, f64)> = vec![(0.1, 0.1), (7.3, 0.2), (7.4, 5.9), (0.2, 6.1)];
+        // Nudge one vertex outward by one ulp in x: area strictly grows.
+        let mut bigger = base.clone();
+        bigger[2].0 = f64::from_bits(bigger[2].0.to_bits() + 1);
+        assert_eq!(polygon_area_cmp_2d(&bigger, &base), CmpOrdering::Greater);
+        assert_eq!(polygon_area_cmp_2d(&base, &bigger), CmpOrdering::Less);
+        assert_eq!(polygon_area_cmp_2d(&base, &base), CmpOrdering::Equal);
+    }
+
+    #[test]
+    fn sign_of_plane_eval_basic_sides() {
+        let n = Vector3::new(0.0, 0.0, 1.0);
+        assert_eq!(
+            sign_of_plane_eval(&n, 5.0, &Point3::new(2.0, -3.0, 6.0)),
+            CmpOrdering::Greater
+        );
+        assert_eq!(
+            sign_of_plane_eval(&n, 5.0, &Point3::new(2.0, -3.0, 4.0)),
+            CmpOrdering::Less
+        );
+        assert_eq!(
+            sign_of_plane_eval(&n, 5.0, &Point3::new(2.0, -3.0, 5.0)),
+            CmpOrdering::Equal
+        );
+    }
+
+    /// Catastrophic-cancellation plane eval: the naive f64 sum rounds to 0.0
+    /// (1e16 + 1.0 collapses) but the true value is +1.0. The A-filter must
+    /// refuse to certify and the exact path must recover the sign.
+    #[test]
+    fn sign_of_plane_eval_exact_under_cancellation() {
+        let n = Vector3::new(1.0, 1.0, 1.0);
+        let p = Point3::new(1.0e16, 1.0, -1.0e16);
+        // Naive: fl(fl(1e16 + 1.0) + (−1e16)) − 0 = 0.0. Truth: +1.0.
+        assert_eq!(sign_of_plane_eval(&n, 0.0, &p), CmpOrdering::Greater);
+        // Exact zero stays exactly zero (1e16 + 2.0 is representable).
+        let q = Point3::new(1.0e16, 2.0, -1.0e16);
+        assert_eq!(sign_of_plane_eval(&n, 2.0, &q), CmpOrdering::Equal);
+    }
+
+    #[test]
+    fn point_plane_sidedness_basic_and_exact() {
+        let n = Vector3::new(0.0, 1.0, 0.0);
+        let o = Point3::new(3.0, 2.0, -1.0);
+        assert_eq!(
+            point_plane_sidedness(&n, &o, &Point3::new(9.0, 2.5, 4.0)),
+            CmpOrdering::Greater
+        );
+        assert_eq!(
+            point_plane_sidedness(&n, &o, &Point3::new(9.0, 1.5, 4.0)),
+            CmpOrdering::Less
+        );
+        assert_eq!(
+            point_plane_sidedness(&n, &o, &Point3::new(-7.0, 2.0, 0.0)),
+            CmpOrdering::Equal
+        );
+        // Cancellation case: p − o = (1e16, 1.0, −1e16) against n = (1,1,1);
+        // the f64 dot rounds to 0.0, truth is +1.0.
+        let n1 = Vector3::new(1.0, 1.0, 1.0);
+        let o1 = Point3::new(0.0, 0.0, 0.0);
+        let p1 = Point3::new(1.0e16, 1.0, -1.0e16);
+        assert_eq!(point_plane_sidedness(&n1, &o1, &p1), CmpOrdering::Greater);
     }
 
     #[test]

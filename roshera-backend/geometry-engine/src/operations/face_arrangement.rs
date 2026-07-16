@@ -39,7 +39,10 @@
 
 use super::boolean::{GraphEdge, IntersectionGraph};
 use super::{OperationError, OperationResult};
-use crate::math::{Tolerance, Vector3};
+use crate::math::vector2::Vector2;
+use crate::math::{
+    circular_order, orient2d, polygon_orientation_2d, Orientation, Tolerance, Vector3,
+};
 use crate::primitives::{
     edge::EdgeId,
     surface::{Surface, SurfaceId, SurfaceType},
@@ -196,39 +199,45 @@ pub(super) fn build_arrangement(
             }
         };
 
-        // Build (angle, curvature-angle, edge_id, half_edge_id) tuples and sort.
-        let mut keyed: Vec<(f64, f64, EdgeId, HalfEdgeId)> = hes
+        // Build (tangent-dir, offset-dir, edge_id, half_edge_id) tuples and
+        // sort by the EXACT circular order of the tangent directions in the
+        // (e1, e2) frame (EXACT PREDICATES Slice 3, census row #6:
+        // `math::circular_order` — quadrant split + exact orient2d cross
+        // sign; Shewchuk 1997). The former `atan2` sort key could COLLIDE for
+        // sub-ulp-distinct directions (two near-parallel tangents mapping to
+        // the same f64 angle), silently handing the cyclic order to the
+        // id-based tie-break — and its `partial_cmp … NaN→Equal` arm was not
+        // a strict weak order. The exact key ties ONLY for bit-equal
+        // directions; the order is a pure function of the tangent geometry.
+        // (The order starts at the frame's +e1 axis instead of atan2's −e1
+        // branch cut; DCEL `next` wiring below consumes only the CYCLIC
+        // order, which is rotation-invariant.)
+        let mut keyed: Vec<(Vector2, Vector2, EdgeId, HalfEdgeId)> = hes
             .iter()
             .copied()
             .filter_map(|h| {
                 let he = &half_edges[h.index()];
                 let tangent = half_edge_tangent(he, model)?;
-                let a = tangent.dot(&e1);
-                let b = tangent.dot(&e2);
-                // `atan2` is defined for (0, 0) but we filtered zero
-                // tangents above via `curve.tangent_at` failure. If both
-                // components are infinitesimal we still get a finite
-                // angle (atan2(0,0) == 0 on IEEE 754), which is harmless.
-                let angle = b.atan2(a);
+                let dir = Vector2::new(tangent.dot(&e1), tangent.dot(&e2));
                 // Second-order (curvature) tie-break for EXACT tangencies: two
                 // half-edges can leave this vertex with a BIT-IDENTICAL first-
                 // order tangent — e.g. a circle arc inscribed-tangent to a
                 // straight boundary edge at an axis-aligned point, where both
-                // tangents are exactly (0,0,±1) (#82). The primary `angle` is
-                // then equal and the sort would fall through to `edge_id`, which
-                // is assigned in non-deterministic edge-creation order, shuffling
+                // tangents are exactly (0,0,±1) (#82). The primary key is then
+                // Equal and the sort would fall through to `edge_id`, which is
+                // assigned in non-deterministic edge-creation order, shuffling
                 // the ring and the extracted loops run-to-run. Disambiguate by
                 // the direction to a point a small parameter-step INTO the edge:
-                // a straight edge keeps the same angle, a curved one rotates by
-                // its curvature — separating them GEOMETRICALLY and id-invariantly.
-                let angle2 = half_edge_offset_angle(he, model, pos, &e1, &e2).unwrap_or(angle);
-                Some((angle, angle2, he.edge_id, h))
+                // a straight edge keeps the tangent direction, a curved one
+                // rotates by its curvature — separating them GEOMETRICALLY and
+                // id-invariantly.
+                let dir2 = half_edge_offset_dir(he, model, pos, &e1, &e2).unwrap_or(dir);
+                Some((dir, dir2, he.edge_id, h))
             })
             .collect();
         keyed.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            circular_order(&a.0, &b.0)
+                .then_with(|| offset_tie_order(&a.1, &b.1))
                 .then_with(|| a.2.cmp(&b.2))
         });
 
@@ -368,24 +377,39 @@ pub(super) fn extract_regions(
             continue;
         }
 
-        // Compute signed area in the tangent plane of the cycle's
-        // centroid. Outer face (CW under normal) has negative signed
-        // area and is discarded. Zero-area cycles (pure lollipops) are
-        // also discarded. The lune samples its curved edge to recover the
-        // bulge area its two shared vertices alone would report as zero.
-        let signed = if is_lune {
-            densified_cycle_area(&trimmed, arr, model, surface, tol)
+        // Project the cycle into 2D (tangent plane at the cycle's centroid
+        // for planar surfaces, unwrapped (u, v) otherwise; the lune samples
+        // its curved edge to recover the bulge its two shared vertices alone
+        // would report as zero) and DECOMPOSE the former fused
+        // `signed <= tol²` compare into its two owners (EXACT PREDICATES
+        // Slice 3, census row #7; spec §3.1 boundary-contract rule 3):
+        //
+        //   1. Regime E — "is this the outer face?" is the EXACT shoelace
+        //      SIGN of the projected cycle (`math::polygon_orientation_2d`):
+        //      CW-under-normal and exactly-degenerate cycles are discarded
+        //      by sign, zero epsilons.
+        //   2. Regime T — "is this a sliver below modeling significance?" is
+        //      the named REGION_SLIVER_AREA gate on the f64 area magnitude.
+        let poly_2d = if is_lune {
+            densified_cycle_polygon(&trimmed, arr, model, surface, tol)
         } else {
-            signed_area_of_cycle(&trimmed, arr, model, surface, tol)
+            cycle_polygon_2d(&trimmed, arr, model, surface, tol)
         };
+        let Some(poly_2d) = poly_2d else {
+            continue; // unprojectable cycle — matches the former 0.0-area drop
+        };
+        let signed = shoelace_area_f64(&poly_2d);
         tracing::debug!(
             "extract_regions: cycle of {} (trimmed {}) signed_area={:.4}",
             he_cycle.len(),
             trimmed.len(),
             signed
         );
-        if signed <= tol.distance() * tol.distance() {
-            continue;
+        if polygon_orientation_2d(&poly_2d) != Orientation::CounterClockwise {
+            continue; // outer face (CW) or exactly-zero cycle — exact sign
+        }
+        if signed <= region_sliver_area_gate(tol) {
+            continue; // Regime-T sliver gate (named, separate from the sign)
         }
 
         // Collect underlying edge ids + half-edge forward bits in walk
@@ -473,20 +497,20 @@ fn half_edge_tangent(he: &HalfEdge, model: &BRepModel) -> Option<Vector3> {
     }
 }
 
-/// Angle (in the vertex's `(e1, e2)` tangent frame) of the direction from the
-/// vertex to a point a small parameter-step INTO this half-edge. Used as the
-/// second-order tie-break in the angular sort: when two half-edges share a
-/// bit-identical first-order tangent (an exact tangency), this curvature-aware
-/// direction separates them geometrically — a straight edge keeps the tangent
-/// angle, a curved one rotates by its curvature. Deterministic and independent
-/// of edge-id assignment order. `origin` is the vertex position.
-fn half_edge_offset_angle(
+/// Direction (in the vertex's `(e1, e2)` tangent frame) from the vertex to a
+/// point a small parameter-step INTO this half-edge. Used as the second-order
+/// tie-break in the angular sort: when two half-edges share a bit-identical
+/// first-order tangent (an exact tangency), this curvature-aware direction
+/// separates them geometrically — a straight edge keeps the tangent
+/// direction, a curved one rotates by its curvature. Deterministic and
+/// independent of edge-id assignment order. `origin` is the vertex position.
+fn half_edge_offset_dir(
     he: &HalfEdge,
     model: &BRepModel,
     origin: Vector3,
     e1: &Vector3,
     e2: &Vector3,
-) -> Option<f64> {
+) -> Option<Vector2> {
     let edge = model.edges.get(he.edge_id)?;
     let curve = model.curves.get(edge.curve_id)?;
     let (t0, t1) = (edge.param_range.start, edge.param_range.end);
@@ -503,7 +527,26 @@ fn half_edge_offset_angle(
     if a.abs() < 1.0e-15 && b.abs() < 1.0e-15 {
         return None; // offset point coincides with the vertex — no information
     }
-    Some(b.atan2(a))
+    Some(Vector2::new(a, b))
+}
+
+/// EXACT second-order tie order for two half-edges whose first-order tangents
+/// are bit-identical: the local rotation of one offset direction against the
+/// other, via the exact [`orient2d`] cross sign. Both offset directions
+/// deviate from the SHARED tangent direction by less than a quarter turn (a
+/// short parameter-step chord cannot swing past the tangent's normal plane
+/// for any sanely-parameterized edge curve), so within that window
+/// `cross(a, b) > 0` ⇔ `a` sits at the smaller CCW angle ⇔ `a` first.
+/// `Collinear` (bit-equal offset directions too) falls through to the
+/// caller's deterministic `edge_id` fallback. Unlike the former linear
+/// `atan2(offset)` compare this has no branch cut: a tangency pointing along
+/// the frame's −e1 axis orders the same as any other direction.
+fn offset_tie_order(a: &Vector2, b: &Vector2) -> std::cmp::Ordering {
+    match orient2d(&Vector2::ZERO, a, b) {
+        Orientation::CounterClockwise => std::cmp::Ordering::Less,
+        Orientation::Clockwise => std::cmp::Ordering::Greater,
+        Orientation::Collinear => std::cmp::Ordering::Equal,
+    }
 }
 
 /// Remove consecutive dangling-edge pairs (h, twin(h)) from a half-edge
@@ -550,54 +593,57 @@ fn strip_dangling_pairs(cycle: &[HalfEdgeId], arr: &Arrangement) -> Vec<HalfEdge
     v
 }
 
-/// Signed area of a half-edge cycle on the underlying surface.
-///
-/// For planar surfaces the cycle is projected into the tangent plane at
-/// the cycle's 3D centroid (positive ⇒ CCW under the surface normal).
-///
-/// For non-planar surfaces (cylinder, cone, sphere, NURBS, …) a flat
-/// tangent-plane projection is unsound: a closed cycle that wraps a
-/// cylindrical band, for example, has all its vertices on the seam line
-/// (because the angular midpoint of every closed cap-circle is at
-/// `u = π`, which lies on `y = 0` together with `u = 0` itself), so the
-/// projection collapses to zero and every region is incorrectly
-/// rejected as "outer face". Instead, we work in the surface's
-/// parametric `(u, v)` space and apply a 2D shoelace there. This is
-/// exact on parametric surfaces because the cycle's interior in 3D
-/// corresponds (modulo the seam) to a simple polygon in `(u, v)`.
-///
-/// For periodic surfaces the seam introduces an angular ambiguity:
-/// `closest_point` may return either `u = 0` or `u = period` for a
-/// vertex on the seam. We resolve this by **edge-midpoint anchoring**:
-/// each edge's midpoint is sampled, its `(u, v)` is computed, and the
-/// successive vertex's `u` is unwrapped to whichever periodic copy
-/// makes the midpoint lie on the linear path between the two endpoint
-/// `u` values. This walks the cycle continuously around the seam
-/// without ambiguity.
-/// Signed area of a cycle whose edges may be CURVED, computed by sampling each
-/// half-edge's underlying curve (in walk order) into a dense polyline and
-/// shoelacing it in the tangent plane at the centroid. Unlike
-/// [`signed_area_of_cycle`] — which uses only the cycle's corner vertices, so a
-/// 2-edge lune (an arc and its chord share both endpoints) reports zero — this
-/// recovers the bulge area. Used for the 2-edge lune; the ≥3-edge path keeps
-/// the cheaper vertex polygon.
-fn densified_cycle_area(
+/// Regime-T sliver gate of `extract_regions` (EXACT PREDICATES Slice 3; spec
+/// §3.1 boundary-contract rule 3): the area magnitude below which a
+/// positively-oriented region is dropped as modeling-insignificant. Named and
+/// owned separately from the exact orientation SIGN decision — the former
+/// single `signed <= tol²` compare fused both questions. Derived from the
+/// modeling tolerance: the area of a τ×τ square (Slice 5's tolerance
+/// authority owns the derivation rule).
+#[inline]
+fn region_sliver_area_gate(tol: Tolerance) -> f64 {
+    tol.distance() * tol.distance()
+}
+
+/// Plain f64 shoelace signed area of a projected 2D polygon — the MAGNITUDE
+/// companion of the exact sign (`math::polygon_orientation_2d`); consumed
+/// only by the Regime-T sliver gate and the trace output.
+fn shoelace_area_f64(poly: &[(f64, f64)]) -> f64 {
+    let n = poly.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut area2 = 0.0;
+    for i in 0..n {
+        let (ax, ay) = poly[i];
+        let (bx, by) = poly[(i + 1) % n];
+        area2 += ax * by - bx * ay;
+    }
+    0.5 * area2
+}
+
+/// 2D projection of a cycle whose edges may be CURVED, computed by sampling
+/// each half-edge's underlying curve (in walk order) into a dense polyline
+/// projected into the tangent plane at the centroid. Unlike
+/// [`cycle_polygon_2d`] — which uses only the cycle's corner vertices, so a
+/// 2-edge lune (an arc and its chord share both endpoints) collapses to zero
+/// area — this recovers the bulge. Used for the 2-edge lune; the ≥3-edge path
+/// keeps the cheaper vertex polygon. `None` ⇒ the cycle cannot be projected
+/// (missing geometry / degenerate frame), which the caller treats as a
+/// discarded zero-area cycle.
+fn densified_cycle_polygon(
     cycle: &[HalfEdgeId],
     arr: &Arrangement,
     model: &BRepModel,
     surface: &dyn Surface,
     tol: Tolerance,
-) -> f64 {
+) -> Option<Vec<(f64, f64)>> {
     const SAMPLES_PER_EDGE: usize = 8;
     let mut pts: Vec<Vector3> = Vec::new();
     for &h in cycle {
         let he = arr.get(h);
-        let Some(edge) = model.edges.get(he.edge_id) else {
-            return 0.0;
-        };
-        let Some(curve) = model.curves.get(edge.curve_id) else {
-            return 0.0;
-        };
+        let edge = model.edges.get(he.edge_id)?;
+        let curve = model.curves.get(edge.curve_id)?;
         let (t0, t1) = (edge.param_range.start, edge.param_range.end);
         // Walk the edge in the half-edge's direction; drop the final point
         // (shared with the next edge's first sample) to avoid duplicates.
@@ -614,32 +660,56 @@ fn densified_cycle_area(
         }
     }
     if pts.len() < 3 {
-        return 0.0;
+        return None;
     }
     let n = pts.len() as f64;
     let centroid = pts.iter().fold(Vector3::ZERO, |acc, p| acc + *p) / n;
-    let (e1, e2) = match tangent_frame_at(surface, &centroid, tol) {
-        Some(f) => f,
-        None => return 0.0,
-    };
-    let mut area2 = 0.0;
-    for i in 0..pts.len() {
-        let a = pts[i] - centroid;
-        let b = pts[(i + 1) % pts.len()] - centroid;
-        area2 += a.dot(&e1) * b.dot(&e2) - b.dot(&e1) * a.dot(&e2);
-    }
-    0.5 * area2
+    let (e1, e2) = tangent_frame_at(surface, &centroid, tol)?;
+    Some(
+        pts.iter()
+            .map(|p| {
+                let d = *p - centroid;
+                (d.dot(&e1), d.dot(&e2))
+            })
+            .collect(),
+    )
 }
 
-fn signed_area_of_cycle(
+/// 2D projection of a half-edge cycle's corner vertices on the underlying
+/// surface — the polygon whose shoelace sign/area drive region keep/drop.
+///
+/// For planar surfaces the cycle is projected into the tangent plane at
+/// the cycle's 3D centroid (positive shoelace ⇒ CCW under the surface
+/// normal).
+///
+/// For non-planar surfaces (cylinder, cone, sphere, NURBS, …) a flat
+/// tangent-plane projection is unsound: a closed cycle that wraps a
+/// cylindrical band, for example, has all its vertices on the seam line
+/// (because the angular midpoint of every closed cap-circle is at
+/// `u = π`, which lies on `y = 0` together with `u = 0` itself), so the
+/// projection collapses to zero and every region is incorrectly
+/// rejected as "outer face". Instead, we work in the surface's
+/// parametric `(u, v)` space and shoelace there. This is sound on
+/// parametric surfaces because the cycle's interior in 3D corresponds
+/// (modulo the seam) to a simple polygon in `(u, v)`.
+///
+/// For periodic surfaces the seam introduces an angular ambiguity:
+/// `closest_point` may return either `u = 0` or `u = period` for a
+/// vertex on the seam. We resolve this by **edge-midpoint anchoring**:
+/// each edge's midpoint is sampled, its `(u, v)` is computed, and the
+/// successive vertex's `u` is unwrapped to whichever periodic copy
+/// makes the midpoint lie on the linear path between the two endpoint
+/// `u` values. This walks the cycle continuously around the seam
+/// without ambiguity.
+fn cycle_polygon_2d(
     cycle: &[HalfEdgeId],
     arr: &Arrangement,
     model: &BRepModel,
     surface: &dyn Surface,
     tol: Tolerance,
-) -> f64 {
+) -> Option<Vec<(f64, f64)>> {
     if cycle.len() < 3 {
-        return 0.0;
+        return None;
     }
 
     // Collect vertex positions in walk order.
@@ -649,7 +719,7 @@ fn signed_area_of_cycle(
         .map(|p| Vector3::new(p[0], p[1], p[2]))
         .collect();
     if positions.len() < 3 {
-        return 0.0;
+        return None;
     }
 
     // Planar surfaces: use the legacy tangent-plane projection at the
@@ -658,40 +728,24 @@ fn signed_area_of_cycle(
     if surface.surface_type() == SurfaceType::Plane {
         let n = positions.len() as f64;
         let centroid = positions.iter().fold(Vector3::ZERO, |acc, p| acc + *p) / n;
-        let (e1, e2) = match tangent_frame_at(surface, &centroid, tol) {
-            Some(f) => f,
-            None => return 0.0,
-        };
-
-        let mut area2 = 0.0;
-        for i in 0..positions.len() {
-            let a = positions[i] - centroid;
-            let b = positions[(i + 1) % positions.len()] - centroid;
-            let ax = a.dot(&e1);
-            let ay = a.dot(&e2);
-            let bx = b.dot(&e1);
-            let by = b.dot(&e2);
-            area2 += ax * by - bx * ay;
-        }
-        return 0.5 * area2;
+        let (e1, e2) = tangent_frame_at(surface, &centroid, tol)?;
+        return Some(
+            positions
+                .iter()
+                .map(|p| {
+                    let d = *p - centroid;
+                    (d.dot(&e1), d.dot(&e2))
+                })
+                .collect(),
+        );
     }
 
     // Non-planar surfaces: work in parametric (u, v) with seam unwrap.
-    let uvs = match unwrap_cycle_uv(cycle, arr, model, surface, tol) {
-        Some(uvs) => uvs,
-        None => return 0.0,
-    };
+    let uvs = unwrap_cycle_uv(cycle, arr, model, surface, tol)?;
     if uvs.len() < 3 {
-        return 0.0;
+        return None;
     }
-
-    let mut area2 = 0.0;
-    for i in 0..uvs.len() {
-        let (ax, ay) = uvs[i];
-        let (bx, by) = uvs[(i + 1) % uvs.len()];
-        area2 += ax * by - bx * ay;
-    }
-    0.5 * area2
+    Some(uvs)
 }
 
 /// Compute parametric `(u, v)` for every vertex in a cycle, unwrapped
@@ -956,5 +1010,180 @@ mod tests {
     fn half_edge_id_unset_is_distinct() {
         assert_ne!(HalfEdgeId::UNSET, HalfEdgeId(0));
         assert_ne!(HalfEdgeId::UNSET, HalfEdgeId(12345));
+    }
+
+    /// EXACT PREDICATES Slice 3 RED (census row #6): near-parallel edge
+    /// directions at a shared vertex corrupt DCEL loop wiring under the
+    /// former `atan2` sort key.
+    ///
+    /// Construction: two triangles T1 = (O, P1, P2) and T2 = (O, P3, P4)
+    /// sharing only the vertex O, whose adjacent legs O→P2 and O→P3 are
+    /// sub-ulp-separated in angle. The pair is SEARCHED (deterministic seed)
+    /// so that, mirroring the former float sort keys exactly:
+    ///   * `atan2` COLLIDES on the two normalized tangents (identical f64
+    ///     primary keys), while the exact cross sign still orders them
+    ///     (O→P2 strictly before O→P3 in CCW order), and
+    ///   * the former second-order key (`atan2` of the offset-point
+    ///     direction) does NOT rescue the order (it reports ≥, i.e. wrong or
+    ///     tied — and the edge-id fallback is arranged wrong by creating
+    ///     T2's spoke first).
+    /// Under the float sort the ring at O comes out cyclically wrong, `next`
+    /// wiring crosses the two triangles, and the extracted regions are not
+    /// the {T1}, {T2} partition — the module's documented failure class
+    /// (loops spanning regions). The exact `circular_order` key decides the
+    /// pair by the cross sign and never reaches the tie-break.
+    ///
+    /// RED evidence (2026-07-16): with the sort key hand-reverted to
+    /// `atan2` + `partial_cmp`, this test FAILS (mutation proof); with the
+    /// exact key it passes.
+    #[test]
+    fn near_parallel_spokes_extract_correct_regions() {
+        use crate::math::Point3;
+        use crate::primitives::curve::{Curve, Line, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        use crate::primitives::surface::Plane;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::cmp::Ordering as O;
+
+        let origin = Point3::new(0.0, 0.0, 0.0);
+
+        // Mirrors of the FORMER float sort keys at this call site.
+        // Primary: atan2 of the normalized outgoing tangent's frame
+        // components (frame = (X, Y) for the z=0 plane below). The tangent
+        // of the outgoing half-edge toward P is `normalize(P - O)` for a
+        // forward spoke and `-normalize(O - P)` for the reverse half-edge of
+        // an incoming spoke — identical bits either way (negation is exact).
+        let float_primary = |p: Point3| -> f64 {
+            let t = Line::new(origin, p)
+                .tangent_at(0.0)
+                .expect("nonzero spoke tangent");
+            t.y.atan2(t.x)
+        };
+        // Former secondary: atan2 of the direction to the point one
+        // parameter-step (1e-3 of the range) INTO the half-edge.
+        // For the forward spoke O→P3 (edge (O, P3), t = 0 + 1e-3):
+        let float_secondary_fwd = |p: Point3| -> f64 {
+            let q = Line::new(origin, p)
+                .point_at(1.0e-3)
+                .expect("line point_at");
+            (q.y - origin.y).atan2(q.x - origin.x)
+        };
+        // For the reverse half-edge of the incoming spoke (P2, O)
+        // (t = 1 − 1e-3, direction measured from O):
+        let float_secondary_rev = |p: Point3| -> f64 {
+            let q = Line::new(p, origin)
+                .point_at(1.0 - 1.0e-3)
+                .expect("line point_at");
+            (q.y - origin.y).atan2(q.x - origin.x)
+        };
+        let frame_dir = |p: Point3| -> Vector2 {
+            let t = Line::new(origin, p)
+                .tangent_at(0.0)
+                .expect("nonzero spoke tangent");
+            Vector2::new(t.x, t.y)
+        };
+
+        // Deterministic search for the adversarial pair.
+        let mut rng = StdRng::seed_from_u64(0xD0CE_1A11_5117_CE03);
+        let mut found: Option<(Point3, Point3)> = None;
+        for _ in 0..500_000u32 {
+            let theta: f64 = rng.gen_range(0.25..1.25);
+            let r2: f64 = rng.gen_range(5.0..20.0) * rng.gen_range(0.5..1.0);
+            let r3: f64 = rng.gen_range(5.0..20.0) * rng.gen_range(0.5..1.0);
+            // Sub-ulp CCW rotation of the second spoke.
+            let dtheta: f64 = rng.gen_range(1.0e-19_f64..1.2e-16);
+            let p2 = Point3::new(r2 * theta.cos(), r2 * theta.sin(), 0.0);
+            let a3 = theta + dtheta;
+            let p3 = Point3::new(r3 * a3.cos(), r3 * a3.sin(), 0.0);
+
+            let d2 = frame_dir(p2);
+            let d3 = frame_dir(p3);
+            // Truth: O→P2 strictly before O→P3 (exact cross sign).
+            if circular_order(&d2, &d3) != O::Less {
+                continue;
+            }
+            // Former primary must collide (identical f64 angles).
+            if float_primary(p2) != float_primary(p3) {
+                continue;
+            }
+            // Former secondary must not rescue the order: wrong or tied.
+            // (Tied falls to edge_id, which the construction arranges wrong.)
+            if float_secondary_rev(p2) < float_secondary_fwd(p3) {
+                continue;
+            }
+            found = Some((p2, p3));
+            break;
+        }
+        let (p2, p3) = found.expect(
+            "adversarial search exhausted: no atan2-colliding near-parallel \
+             spoke pair found — widen the dtheta window",
+        );
+
+        // Far corners of the two triangle sectors (well clear of the pair).
+        let p1 = Point3::new(10.0, -3.0, 0.0);
+        let p4 = Point3::new(3.0, 10.0, 0.0);
+
+        let mut m = BRepModel::new();
+        let sid = m.surfaces.add(Box::new(
+            Plane::new(origin, Vector3::Z, Vector3::X).expect("plane"),
+        ));
+        let vo = m.vertices.add(origin.x, origin.y, origin.z);
+        let v1 = m.vertices.add(p1.x, p1.y, p1.z);
+        let v2 = m.vertices.add(p2.x, p2.y, p2.z);
+        let v3 = m.vertices.add(p3.x, p3.y, p3.z);
+        let v4 = m.vertices.add(p4.x, p4.y, p4.z);
+
+        let mut add_edge = |m: &mut BRepModel, a: (VertexId, Point3), b: (VertexId, Point3)| {
+            let cid = m.curves.add(Box::new(Line::new(a.1, b.1)));
+            m.edges.add(Edge::new(
+                0,
+                a.0,
+                b.0,
+                cid,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            ))
+        };
+        // Creation order arranges the edge-id tie-break WRONG for the former
+        // float sort: T2's spoke (O, P3) gets the smaller id than T1's
+        // incoming spoke (P2, O).
+        let e_o_p3 = add_edge(&mut m, (vo, origin), (v3, p3)); // id 0
+        let e_p3_p4 = add_edge(&mut m, (v3, p3), (v4, p4)); // id 1
+        let e_p4_o = add_edge(&mut m, (v4, p4), (vo, origin)); // id 2
+        let e_o_p1 = add_edge(&mut m, (vo, origin), (v1, p1)); // id 3
+        let e_p1_p2 = add_edge(&mut m, (v1, p1), (v2, p2)); // id 4
+        let e_p2_o = add_edge(&mut m, (v2, p2), (vo, origin)); // id 5
+
+        let mut graph = IntersectionGraph::new();
+        for &eid in &[e_o_p3, e_p3_p4, e_p4_o, e_o_p1, e_p1_p2, e_p2_o] {
+            graph.add_edge(eid, super::super::boolean::EdgeType::Boundary);
+        }
+        graph.resolve_vertices(&m);
+
+        let arr = build_arrangement(&graph, &m, sid).expect("arrangement builds");
+        let surface = m.surfaces.get(sid).expect("surface stored");
+        let regions = extract_regions(&arr, &m, surface);
+
+        // The correct arrangement of two triangles sharing one vertex is
+        // exactly two interior regions with the triangles' edge sets (the
+        // outer CW face is discarded).
+        let mut sets: Vec<std::collections::BTreeSet<EdgeId>> = regions
+            .iter()
+            .map(|r| r.iter().map(|(e, _)| *e).collect())
+            .collect();
+        sets.sort();
+        let t2: std::collections::BTreeSet<EdgeId> =
+            [e_o_p3, e_p3_p4, e_p4_o].into_iter().collect();
+        let t1: std::collections::BTreeSet<EdgeId> =
+            [e_o_p1, e_p1_p2, e_p2_o].into_iter().collect();
+        let mut want = vec![t1, t2];
+        want.sort();
+        assert_eq!(
+            sets, want,
+            "near-parallel spokes at the shared vertex must extract the two \
+             triangles exactly (p2={p2:?}, p3={p3:?}); a cyclically wrong ring \
+             order at O wires `next` across the triangles"
+        );
     }
 }

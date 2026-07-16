@@ -558,6 +558,15 @@ fn classify_manifold_edge(
     // and in `(0, π)`. For a concave / interior edge the projected
     // angle is negative. A perfectly flat (smooth G1) pair has the
     // two normals aligned, so the projected angle is ≈ 0.
+    //
+    // EXACT PREDICATES disposition (census row #15, recorded Slice 4): the
+    // convexity SIGN consumes EVALUATED face normals and a probe-derived
+    // tangent handedness — derived data, not stored carriers — so per the
+    // spec's derived-input policy (§3.0) an exact predicate here would only
+    // be "exactly the sign of the approximate dihedral": the meaningful
+    // uncertainty lives in the evaluation, which the Regime-T G1 band below
+    // already owns. The sign stays f64 on the banded dihedral by design; the
+    // band constant joins the Slice-5 tolerance authority.
     let angle_tol = tolerance.angle();
     let convexity: i8 = if dihedral.abs() < angle_tol {
         0

@@ -35,9 +35,18 @@
 //! dimensions established at solver entry.
 #![allow(clippy::indexing_slicing)]
 
-use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
+use crate::math::{point_plane_sidedness, MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::surface::Surface;
 use std::collections::HashMap;
+
+/// Regime-T on-contour node band, as a fraction of the grid's maximum
+/// absolute signed distance: a node with `|d| ≤ max_abs · FRAC` is treated as
+/// ON the contour and classified positive by the degeneracy policy (see the
+/// Simulation-of-Simplicity block in [`intersect_surface_plane`]). Named per
+/// the EXACT PREDICATES boundary contract — the band is a tolerance decision
+/// with its own owner, applied BEFORE the exact node sidedness sign, never
+/// fused with it. (Slice 5's tolerance authority owns the derivation rule.)
+const ON_CONTOUR_BAND_FRAC: f64 = 1e-9;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -133,8 +142,22 @@ pub fn intersect_surface_plane(
     let du = (u_max - u_min) / n as f64;
     let dv = (v_max - v_min) / n as f64;
 
-    // Step 1 — signed-distance grid.
+    // Step 1 — signed-distance grid + EXACT node sidedness (EXACT PREDICATES
+    // Slice 4, census row #12). Each node stores:
+    //   * `grid[i][j]` — the f64 signed distance, consumed as a MAGNITUDE
+    //     (crossing interpolation `lerp_t`, saddle disambiguation, the
+    //     on-contour band below) — Regime T;
+    //   * `negative[i][j]` — the node's SIDE of the plane, decided by the
+    //     exact sign of `n·(pos − origin)` (`math::point_plane_sidedness`,
+    //     expansion-exact in the evaluated node position and the stored
+    //     plane) — Regime E. The f64 dot product could return the wrong
+    //     sign for a node whose true distance is below its rounding error
+    //     yet outside the on-contour band (a surface hugging the plane at
+    //     large coordinates), silently moving a crossing to the wrong grid
+    //     edge. The evaluated `pos` is itself derived data (spec §3.0): the
+    //     sign is exactly the sign of the evaluated configuration.
     let mut grid = vec![vec![0.0_f64; n + 1]; n + 1];
+    let mut negative = vec![vec![false; n + 1]; n + 1];
     let mut max_abs = 0.0_f64;
     for i in 0..=n {
         let u = u_min + i as f64 * du;
@@ -143,35 +166,44 @@ pub fn intersect_surface_plane(
             let pos = surface.point_at(u, v)?;
             let d = (pos - plane_origin).dot(&normal);
             grid[i][j] = d;
+            negative[i][j] =
+                point_plane_sidedness(&normal, &plane_origin, &pos) == std::cmp::Ordering::Less;
             max_abs = max_abs.max(d.abs());
         }
     }
 
     // Symbolic perturbation of on-contour grid nodes (Edelsbrunner & Mücke,
-    // *Simulation of Simplicity*, ACM TOG 1990). The marching-squares
-    // `crosses` predicate uses a strict `< 0` sign test, so a node whose
-    // signed distance is exactly (or numerically) zero is classified as
-    // non-negative and contributes NO sign change to either incident grid
-    // edge. When the zero-set runs ALONG a grid line — the canonical case is
-    // an axis-perpendicular cutting plane that coincides with a lofted
-    // surface's iso-parameter section (a horizontal z=const plane slicing a
-    // barrel lofted along z, where the section rings sit on grid rows) — an
-    // entire row/column of nodes is ≈0, every incident edge reports "no
-    // crossing", and the contour is silently dropped (0 branches → the
-    // boolean never imprints the cut → the cap face is left unsplit → a
-    // non-watertight result). Pushing every ≈0 node to a single, consistent
-    // infinitesimal POSITIVE value breaks the tie the same way for all of
-    // them: the contour then crosses cleanly onto the grid edges between the
-    // perturbed row and its strictly-negative neighbour. The shift is far
-    // below the geometric tolerance, so the Newton corrector in `make_node`
-    // re-snaps each node back onto d=0 exactly — the perturbation only
-    // affects the discrete sign topology, never the returned geometry.
+    // *Simulation of Simplicity*, ACM TOG 1990). DEGENERACY POLICY (spec
+    // §3.3): **a node on (or numerically indistinguishable from) the plane
+    // classifies POSITIVE** — one consistent infinitesimal push for every
+    // tied node. The `crosses` predicate is a pure sign test, so a node whose
+    // signed distance is exactly zero contributes no sign change of its own;
+    // when the zero-set runs ALONG a grid line — the canonical case is an
+    // axis-perpendicular cutting plane that coincides with a lofted surface's
+    // iso-parameter section (a horizontal z=const plane slicing a barrel
+    // lofted along z, where the section rings sit on grid rows) — an entire
+    // row of nodes sits within evaluation noise of zero with MIXED float
+    // signs, fragmenting the contour into zigzag pieces (or, exactly on it,
+    // dropping it: 0 branches → the boolean never imprints the cut → the cap
+    // face is left unsplit → a non-watertight result). Pushing every node
+    // inside the ON_CONTOUR_BAND to the same infinitesimal POSITIVE value
+    // breaks the tie the same way for all of them: the contour then crosses
+    // cleanly onto the grid edges between the perturbed row and its
+    // strictly-negative neighbour. The shift is far below the geometric
+    // tolerance, so the Newton corrector in `make_node` re-snaps each node
+    // back onto d=0 exactly — the perturbation only affects the discrete
+    // sign topology, never the returned geometry.
+    //
+    // The band is a named Regime-T gate applied BEFORE the exact sign is
+    // consumed (never fused with it): inside the band the policy answers,
+    // outside it the exact sign answers.
     if max_abs > 0.0 {
-        let zero_eps = max_abs * 1e-9;
-        for row in grid.iter_mut() {
-            for d in row.iter_mut() {
+        let zero_eps = max_abs * ON_CONTOUR_BAND_FRAC;
+        for (row, neg_row) in grid.iter_mut().zip(negative.iter_mut()) {
+            for (d, neg) in row.iter_mut().zip(neg_row.iter_mut()) {
                 if d.abs() <= zero_eps {
                     *d = zero_eps;
+                    *neg = false; // on-contour ⇒ positive, by policy
                 }
             }
         }
@@ -183,6 +215,7 @@ pub fn intersect_surface_plane(
         &normal,
         plane_origin,
         &grid,
+        &negative,
         u_min,
         du,
         v_min,
@@ -212,6 +245,7 @@ fn contour_zero_set(
     normal: &Vector3,
     plane_origin: Point3,
     grid: &[Vec<f64>],
+    negative: &[Vec<bool>],
     u_min: f64,
     du: f64,
     v_min: f64,
@@ -228,11 +262,11 @@ fn contour_zero_set(
     // Horizontal edges: (i,j)->(i+1,j).
     for i in 0..n {
         for j in 0..=n {
-            let da = grid[i][j];
-            let db = grid[i + 1][j];
-            if !crosses(da, db) {
+            if !crosses(negative[i][j], negative[i + 1][j]) {
                 continue;
             }
+            let da = grid[i][j];
+            let db = grid[i + 1][j];
             let (ua, va) = uv(i, j);
             let (ub, _vb) = uv(i + 1, j);
             let t = lerp_t(da, db);
@@ -247,11 +281,11 @@ fn contour_zero_set(
     // Vertical edges: (i,j)->(i,j+1).
     for i in 0..=n {
         for j in 0..n {
-            let da = grid[i][j];
-            let db = grid[i][j + 1];
-            if !crosses(da, db) {
+            if !crosses(negative[i][j], negative[i][j + 1]) {
                 continue;
             }
+            let da = grid[i][j];
+            let db = grid[i][j + 1];
             let (ua, va) = uv(i, j);
             let (_ub, vb) = uv(i, j + 1);
             let t = lerp_t(da, db);
@@ -289,7 +323,11 @@ fn contour_zero_set(
                 0 => {}
                 2 => connect(present[0], present[1], &mut adj),
                 4 => {
-                    // Saddle — disambiguate by the cell-centre sign.
+                    // Saddle — disambiguate by the cell-centre sign. The
+                    // centre value is a four-node AVERAGE (interpolated,
+                    // derived data): a resolution heuristic choosing between
+                    // two topologically valid pairings, not a point-vs-plane
+                    // sidedness decision — it stays f64 by design.
                     let centre =
                         0.25 * (grid[i][j] + grid[i + 1][j] + grid[i][j + 1] + grid[i + 1][j + 1]);
                     // Unwraps guarded: all four are Some here.
@@ -348,9 +386,14 @@ fn contour_zero_set(
     curves
 }
 
-/// A sign change (or a touch where exactly one endpoint is on the plane).
-fn crosses(da: f64, db: f64) -> bool {
-    (da < 0.0) != (db < 0.0)
+/// Cut existence on a grid edge: the two endpoint nodes lie on OPPOSITE sides
+/// of the plane. The inputs are the per-node exact sidedness bits computed at
+/// grid fill (`math::point_plane_sidedness`, with the on-contour band's
+/// nodes already forced positive by the §3.3 degeneracy policy) — the
+/// crossing decision itself is a pure Regime-E sign question with no epsilon
+/// (EXACT PREDICATES Slice 4, census row #12).
+fn crosses(a_negative: bool, b_negative: bool) -> bool {
+    a_negative != b_negative
 }
 
 /// Interpolation parameter of the zero-crossing along an edge `[da, db]`.
@@ -596,6 +639,139 @@ mod tests {
         let config = SurfacePlaneIntersectionConfig::default();
         let result = intersect_surface_plane(&surface, Point3::ZERO, Vector3::ZERO, &config);
         assert!(result.is_err(), "zero normal should produce an error");
+    }
+
+    /// EXACT PREDICATES Slice 4 PIN (census row #12, node sidedness): a
+    /// surface HUGGING the cutting plane at large coordinates. Every node's
+    /// f64 plane-evaluation `(pos − origin)·normal` is a catastrophic
+    /// cancellation of ~1e5-magnitude terms down to a ~1e-9 result — the
+    /// regime where the raw dot's SIGN can be wrong by ±1–2 grid cells of
+    /// true signed distance. The exact node sidedness
+    /// (`math::point_plane_sidedness`) makes the sign a pure function of the
+    /// evaluated node and the stored plane; this test pins the resulting
+    /// clean single-chain contour (9 row crossings + 5 column-change
+    /// crossings for this deterministic construction).
+    ///
+    /// HONEST LIMIT (ledger row #12): a float-revert of the node sign does
+    /// NOT fail this fixture — for an affine surface evaluation the dot's
+    /// rounding error is itself near-affine in (u, v), so the wrong signs
+    /// stay COHERENT and merely shift the reported contour by a
+    /// sub-tolerance distance rather than fragmenting it (measured
+    /// 2026-07-16 across 8 scale/tilt configurations). The lie class is
+    /// proven at predicate level by the adversarial census (BigRational
+    /// oracle); the on-column band test below carries the discriminating
+    /// mutation proof for this call site's other arm.
+    #[test]
+    fn hugging_plane_contour_is_one_clean_chain() {
+        // Horizontal plane surface at huge offset: pos = (x0+u, y0+v, z0).
+        let x0 = 3.0e15;
+        let y0 = -1.5e15;
+        let z0 = 12.345;
+        let surface = SurfacePlane::new_bounded(
+            Point3::new(x0, y0, z0),
+            Vector3::Z,
+            Vector3::X,
+            (-5.0, 5.0),
+            (-5.0, 5.0),
+        )
+        .expect("plane construction should succeed");
+
+        // Cutting plane with a tiny tilt, anchored FAR from the surface patch
+        // (at the world origin) so the plane evaluation's terms are huge and
+        // cancelling. zc re-centres the plane so the zero line crosses the
+        // patch interior.
+        let alpha = 1.0e-10;
+        let beta = 0.7e-10;
+        let zc = z0 + alpha * (x0 + 0.31) + beta * y0;
+        let n = 8usize;
+        let config = SurfacePlaneIntersectionConfig {
+            tolerance: Tolerance::from_distance(1e-8),
+            grid_resolution: n,
+            marching_step: 0.02,
+            max_curves: 16,
+            param_bounds_override: None,
+        };
+        let curves = intersect_surface_plane(
+            &surface,
+            Point3::new(0.0, 0.0, zc),
+            Vector3::new(alpha, beta, 1.0),
+            &config,
+        )
+        .expect("intersection should succeed");
+
+        let total: usize = curves.iter().map(|c| c.points.len()).sum();
+        assert_eq!(
+            curves.len(),
+            1,
+            "one transversal contour expected, got {} chains ({total} points): \
+             node signs must be exact, not f64-dot noise",
+            curves.len()
+        );
+        // One H crossing per grid row (n+1) plus one V crossing per column
+        // change of the tilted line (5 for beta/alpha = 0.7 over 8 rows):
+        // 14 nodes, pinned deterministically.
+        assert_eq!(
+            curves[0].points.len(),
+            14,
+            "clean chain: 9 row crossings + 5 column-change crossings"
+        );
+    }
+
+    /// Degeneracy-policy pin (spec §3.3; the `:158-162` documented failure
+    /// class): the contour runs exactly ALONG a grid column whose nodes carry
+    /// sub-noise mixed-sign distances (the barrel-section configuration: an
+    /// iso-parameter line of the surface on the cutting plane). The
+    /// ON_CONTOUR_BAND forces every such node positive — one consistent
+    /// SoS push — so the contour crosses cleanly onto the adjacent column
+    /// and comes out as ONE chain with one crossing per row.
+    ///
+    /// Mutation evidence (2026-07-16): with the band push removed, the
+    /// mixed-sign column contributes a spurious extra crossing (10 chain
+    /// nodes instead of 9) and this test FAILS; with the band it passes.
+    #[test]
+    fn on_column_contour_survives_via_on_contour_band() {
+        // Tilted plane surface: pos = (s2·u, v, −s2·u); the u = 0 node column
+        // lies exactly on z = 0.
+        let s2 = std::f64::consts::FRAC_1_SQRT_2;
+        let surface = SurfacePlane::new_bounded(
+            Point3::ZERO,
+            Vector3::new(s2, 0.0, s2),
+            Vector3::new(s2, 0.0, -s2),
+            (-5.0, 5.0),
+            (-5.0, 5.0),
+        )
+        .expect("plane construction should succeed");
+
+        // Cutting plane ≈ z = 0 with a 1e-16 y-tilt: the u = 0 column's true
+        // signed distances are ±1e-16·v — mixed signs, far inside the
+        // ON_CONTOUR_BAND (max_abs·1e-9 ≈ 3.5e-9).
+        let eta = 1.0e-16;
+        let n = 8usize;
+        let config = SurfacePlaneIntersectionConfig {
+            tolerance: Tolerance::from_distance(1e-8),
+            grid_resolution: n,
+            marching_step: 0.02,
+            max_curves: 16,
+            param_bounds_override: None,
+        };
+        let curves =
+            intersect_surface_plane(&surface, Point3::ZERO, Vector3::new(0.0, eta, 1.0), &config)
+                .expect("intersection should succeed");
+
+        let total: usize = curves.iter().map(|c| c.points.len()).sum();
+        assert_eq!(
+            curves.len(),
+            1,
+            "the on-column contour must survive as one chain, got {} chains \
+             ({total} points)",
+            curves.len()
+        );
+        assert_eq!(
+            curves[0].points.len(),
+            n + 1,
+            "one crossing per row between the pushed column and its negative \
+             neighbour"
+        );
     }
 
     /// Boundedness guard: a tilted plane fully crossing the cutting plane must

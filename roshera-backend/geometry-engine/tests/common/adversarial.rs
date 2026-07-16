@@ -297,6 +297,200 @@ pub fn seg_cross_corpus(count: usize, seed: u64) -> Vec<SegCrossCase> {
     out
 }
 
+// ───────────── Slice 3 corpus: circular order + area comparison ─────────────
+
+/// One near-parallel direction pair for the angular-sort census (census row
+/// #6): two direction vectors separated by a sub-ulp rotation, the regime
+/// where `atan2` COLLIDES (returns bit-identical f64 angles) while the exact
+/// cross sign still orders them.
+#[derive(Debug, Clone, Copy)]
+pub struct DirPairCase {
+    pub u: (f64, f64),
+    pub v: (f64, f64),
+    pub family: &'static str,
+}
+
+/// Near-parallel direction pairs around a dirty base angle, with DIFFERENT
+/// magnitudes (so the pair samples distinct points of the f64 lattice) and a
+/// log-uniform sub-ulp angular separation.
+pub fn dir_pair_corpus(count: usize, seed: u64) -> Vec<DirPairCase> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let theta: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
+        let r1: f64 = rng.gen_range(0.5..20.0) * rng.gen_range(0.5..1.0);
+        let r2: f64 = rng.gen_range(0.5..20.0) * rng.gen_range(0.5..1.0);
+        // log-uniform separation across the atan2-collision window
+        let exp: f64 = rng.gen_range(-19.0..-15.9);
+        let dtheta = 10.0_f64.powf(exp);
+        let a2 = theta + dtheta;
+        out.push(DirPairCase {
+            u: (r1 * theta.cos(), r1 * theta.sin()),
+            v: (r2 * a2.cos(), r2 * a2.sin()),
+            family: "subulp_dir_pair",
+        });
+    }
+    out
+}
+
+/// One polygon pair for the exact-|area|-comparison census (census row #8's
+/// nesting ties): two polygons whose absolute areas differ by less than the
+/// f64 shoelace can resolve.
+#[derive(Debug, Clone)]
+pub struct AreaPairCase {
+    pub a: Vec<(f64, f64)>,
+    pub b: Vec<(f64, f64)>,
+    pub family: &'static str,
+}
+
+/// Near-equal-|area| polygon pairs: a star polygon against (even) its own
+/// dirty-translated copy — translation preserves area mathematically, but the
+/// translated coordinates round, leaving a truth-nonzero sub-rounding area
+/// difference — or (odd) a copy with one vertex nudged a few ulps.
+pub fn area_pair_corpus(count: usize, seed: u64) -> Vec<AreaPairCase> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        let n_verts = rng.gen_range(4..9);
+        let a = star_polygon(&mut rng, n_verts, 8.0);
+        if a.len() < 3 {
+            continue;
+        }
+        if out.len() % 2 == 0 {
+            let (dx, dy) = (dirty(&mut rng, 3.0), dirty(&mut rng, 3.0));
+            let b: Vec<(f64, f64)> = a.iter().map(|&(x, y)| (x + dx, y + dy)).collect();
+            out.push(AreaPairCase {
+                a,
+                b,
+                family: "translated_twin",
+            });
+        } else {
+            let mut b = a.clone();
+            let k = rng.gen_range(0..b.len());
+            b[k].0 = ulps(b[k].0, rng.gen_range(-3..=3));
+            b[k].1 = ulps(b[k].1, rng.gen_range(-3..=3));
+            out.push(AreaPairCase {
+                a,
+                b,
+                family: "ulp_vertex_twin",
+            });
+        }
+    }
+    out
+}
+
+// ───────────── Slice 4 corpus: 3D plane sidedness + sliver tetrahedra ───────
+
+/// One point-vs-plane probe: a plane carrier `(n, o)` (unit-normalized dirty
+/// normal, dirty anchor), its `(n, d = fl(n·o))` form, and a query point
+/// placed IN the plane's span with a tiny normal offset — the near-coplanar
+/// regime where the raw f64 evaluation `(p − o)·n` (and `n·p − d`) can return
+/// the wrong sign.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaneEvalCase {
+    pub n: (f64, f64, f64),
+    pub o: (f64, f64, f64),
+    pub d: f64,
+    pub p: (f64, f64, f64),
+    pub family: &'static str,
+}
+
+pub fn plane_eval_corpus(count: usize, seed: u64) -> Vec<PlaneEvalCase> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        let nr = [
+            dirty(&mut rng, 1.0),
+            dirty(&mut rng, 1.0),
+            dirty(&mut rng, 1.0),
+        ];
+        let len = (nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]).sqrt();
+        if len < 0.05 {
+            continue;
+        }
+        let n = (nr[0] / len, nr[1] / len, nr[2] / len);
+        let o = (
+            dirty(&mut rng, 5.0),
+            dirty(&mut rng, 5.0),
+            dirty(&mut rng, 5.0),
+        );
+        // In-plane basis (float Gram-Schmidt — construction only).
+        let helper = if n.0.abs() < 0.7 {
+            (1.0, 0.0, 0.0)
+        } else {
+            (0.0, 1.0, 0.0)
+        };
+        let hd = helper.0 * n.0 + helper.1 * n.1 + helper.2 * n.2;
+        let e1r = (
+            helper.0 - hd * n.0,
+            helper.1 - hd * n.1,
+            helper.2 - hd * n.2,
+        );
+        let e1l = (e1r.0 * e1r.0 + e1r.1 * e1r.1 + e1r.2 * e1r.2).sqrt();
+        let e1 = (e1r.0 / e1l, e1r.1 / e1l, e1r.2 / e1l);
+        let e2 = (
+            n.1 * e1.2 - n.2 * e1.1,
+            n.2 * e1.0 - n.0 * e1.2,
+            n.0 * e1.1 - n.1 * e1.0,
+        );
+        let s: f64 = rng.gen_range(-4.0..4.0);
+        let t: f64 = rng.gen_range(-4.0..4.0);
+        let w: f64 = rng.gen_range(-1.0..1.0) * 1e-14;
+        let p = (
+            ulps(o.0 + s * e1.0 + t * e2.0 + w * n.0, rng.gen_range(-2..=2)),
+            ulps(o.1 + s * e1.1 + t * e2.1 + w * n.1, rng.gen_range(-2..=2)),
+            ulps(o.2 + s * e1.2 + t * e2.2 + w * n.2, rng.gen_range(-2..=2)),
+        );
+        let d = n.0 * o.0 + n.1 * o.1 + n.2 * o.2;
+        out.push(PlaneEvalCase {
+            n,
+            o,
+            d,
+            p,
+            family: "near_coplanar_3d",
+        });
+    }
+    out
+}
+
+/// One sliver tetrahedron: `d` an affine combination of (a, b, c) plus a tiny
+/// per-coordinate nudge — the near-coplanar orient3d regime.
+#[derive(Debug, Clone, Copy)]
+pub struct TetraCase {
+    pub a: (f64, f64, f64),
+    pub b: (f64, f64, f64),
+    pub c: (f64, f64, f64),
+    pub d: (f64, f64, f64),
+    pub family: &'static str,
+}
+
+pub fn sliver_tetra_corpus(count: usize, seed: u64) -> Vec<TetraCase> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let pt = |rng: &mut StdRng| (dirty(rng, 2.0), dirty(rng, 2.0), dirty(rng, 2.0));
+        let a = pt(&mut rng);
+        let b = pt(&mut rng);
+        let c = pt(&mut rng);
+        let s: f64 = rng.gen_range(-1.0..2.0);
+        let t: f64 = rng.gen_range(-1.0..2.0);
+        let nudge = 1e-14;
+        let d = (
+            a.0 + s * (b.0 - a.0) + t * (c.0 - a.0) + rng.gen_range(-1.0..1.0) * nudge,
+            a.1 + s * (b.1 - a.1) + t * (c.1 - a.1) + rng.gen_range(-1.0..1.0) * nudge,
+            a.2 + s * (b.2 - a.2) + t * (c.2 - a.2) + rng.gen_range(-1.0..1.0) * nudge,
+        );
+        out.push(TetraCase {
+            a,
+            b,
+            c,
+            d,
+            family: "sliver_tetra",
+        });
+    }
+    out
+}
+
 // ─────────────────────── solid-level builders ───────────────────────────────
 
 use geometry_engine::math::{Point3, Vector3};

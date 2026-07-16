@@ -4721,16 +4721,22 @@ fn sphere_arrangement_faces(
         normal.cross(&(p - cc)).normalize().ok()
     };
 
-    // Each arc contributes two directed half-edges. For a half-edge we record its
-    // start vertex and the angle of its OUTGOING tangent in the start vertex's
-    // tangent frame (frame ⟂ to the outward radial normal there).
+    // Each arc contributes two directed half-edges. For a half-edge we record
+    // its start vertex and its OUTGOING tangent's direction components in the
+    // start vertex's tangent frame (frame ⟂ to the outward radial normal
+    // there) — the ring is ordered by the EXACT circular order of these
+    // directions (EXACT PREDICATES Slice 3, census row #6:
+    // `math::circular_order`, quadrant split + exact orient2d cross sign; no
+    // atan2 key, no `partial_cmp` NaN→Equal arm, which was not a strict weak
+    // order). The face walk below consumes only the CYCLIC order, which is
+    // invariant to where the total order starts.
     #[derive(Clone, Copy)]
     struct HEdge {
         eid: EdgeId,
         fwd: bool,
         start: VertexId,
         end: VertexId,
-        ang: f64,
+        dir: crate::math::vector2::Vector2,
     }
     let frame = |v: Point3| -> (Vector3, Vector3) {
         let n = (v - center).normalize().unwrap_or(Vector3::Z);
@@ -4764,7 +4770,7 @@ fn sphere_arrangement_faces(
                 fwd: true,
                 start: a,
                 end: b,
-                ang: t.dot(&t2).atan2(t.dot(&t1)),
+                dir: crate::math::vector2::Vector2::new(t.dot(&t1), t.dot(&t2)),
             });
         }
         // Backward half-edge b→a: outgoing tangent at b is −circle_tangent(b).
@@ -4776,7 +4782,7 @@ fn sphere_arrangement_faces(
                 fwd: false,
                 start: b,
                 end: a,
-                ang: td.dot(&t2).atan2(td.dot(&t1)),
+                dir: crate::math::vector2::Vector2::new(td.dot(&t1), td.dot(&t2)),
             });
         }
     }
@@ -4784,18 +4790,17 @@ fn sphere_arrangement_faces(
         return Vec::new();
     }
 
-    // Outgoing half-edges per vertex, sorted CCW by angle.
+    // Outgoing half-edges per vertex, sorted CCW by the EXACT circular order
+    // of their tangent-frame directions. Ties (bit-identical directions —
+    // geometrically overlapping arcs) keep the deterministic insertion order
+    // (stable sort over the caller-ordered `arc_edges`), matching the former
+    // behavior for true ties.
     let mut out_by_v: HashMap<VertexId, Vec<usize>> = HashMap::new();
     for (i, h) in hedges.iter().enumerate() {
         out_by_v.entry(h.start).or_default().push(i);
     }
     for v in out_by_v.values_mut() {
-        v.sort_by(|&i, &j| {
-            hedges[i]
-                .ang
-                .partial_cmp(&hedges[j].ang)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        v.sort_by(|&i, &j| crate::math::circular_order(&hedges[i].dir, &hedges[j].dir));
     }
     let half_index = |eid: EdgeId, fwd: bool| -> Option<usize> {
         hedges.iter().position(|h| h.eid == eid && h.fwd == fwd)
@@ -5103,7 +5108,14 @@ fn assemble_multi_component_sphere_regions(
     };
     let point_in_region = |lr: &LoopRegion, p: Point3| -> Option<bool> {
         if let Some((cc, ns)) = lr.single_plane {
-            return Some((p - cc).dot(&ns) > 0.0);
+            // EXACT half-space sign against the stored cut plane (EXACT
+            // PREDICATES Slice 4: `math::point_plane_sidedness`; the former
+            // raw f64 dot could mis-sign a probe that lands within rounding
+            // of the plane). Exactly-on-plane classifies "not inside",
+            // matching the former strict `> 0.0`.
+            return Some(
+                crate::math::point_plane_sidedness(&ns, &cc, &p) == std::cmp::Ordering::Greater,
+            );
         }
         for arc_idx in 0..lr.arcs.len() {
             for &e in &NUDGE {
@@ -8809,33 +8821,27 @@ fn partition_outer_and_pre_existing_hole_cycles(
     // The genuine outer = the outer cycle with the most original-outer edges; if
     // none overlaps (every original outer edge was re-split), fall back to the
     // largest-area projected polygon (the wrap-around boundary dominates any
-    // interior island in tangent-plane extent).
-    let signed_area = |poly: &[(f64, f64)]| -> f64 {
-        if poly.len() < 3 {
-            return 0.0;
-        }
-        let mut a = 0.0;
-        for i in 0..poly.len() {
-            let (x0, y0) = poly[i];
-            let (x1, y1) = poly[(i + 1) % poly.len()];
-            a += x0 * y1 - x1 * y0;
-        }
-        (0.5 * a).abs()
-    };
+    // interior island in tangent-plane extent). Area ties are decided EXACTLY
+    // (EXACT PREDICATES Slice 3, census row #8: `math::polygon_area_cmp_2d` —
+    // the sign of |A₁|−|A₂| by expansion difference, no subtraction rounding;
+    // an f64 area compare could flip for near-equal fragments and hand the
+    // hole to the wrong owner).
     let genuine_outer_pos: Option<usize> = if outer_indices.is_empty() {
         None
     } else {
         let mut best = 0usize;
         let mut best_overlap = outer_overlap(0);
-        let mut best_area = signed_area(&cycle_polys_2d[outer_indices[0]]);
         for pos in 1..outer_indices.len() {
             let ov = outer_overlap(pos);
-            let area = signed_area(&cycle_polys_2d[outer_indices[pos]]);
-            let better = ov > best_overlap || (ov == best_overlap && area > best_area);
+            let better = ov > best_overlap
+                || (ov == best_overlap
+                    && crate::math::polygon_area_cmp_2d(
+                        &cycle_polys_2d[outer_indices[pos]],
+                        &cycle_polys_2d[outer_indices[best]],
+                    ) == std::cmp::Ordering::Greater);
             if better {
                 best = pos;
                 best_overlap = ov;
-                best_area = area;
             }
         }
         Some(best)
@@ -8869,23 +8875,33 @@ fn partition_outer_and_pre_existing_hole_cycles(
             // vs-hole test — so it handles non-concentric cases correctly too:
             // a small-but-non-concentric cut disc would similarly be rejected
             // if it falls inside the hole boundary.
-            let hole_area = signed_area(&cycle_polys_2d[h]);
-            let mut best_area = f64::INFINITY;
+            //
+            // Both the ≤-hole guard and the tightest-outer selection compare
+            // areas EXACTLY (EXACT PREDICATES Slice 3, census row #8:
+            // `math::polygon_area_cmp_2d`, sign of |A₁|−|A₂| via expansion
+            // difference) so near-equal fragments cannot swap owners on
+            // f64 shoelace rounding.
+            use std::cmp::Ordering as AreaOrd;
+            let hole_poly: &[(f64, f64)] = &cycle_polys_2d[h];
+            let mut best_poly: Option<&[(f64, f64)]> = None;
             for (pos, &o) in outer_indices.iter().enumerate() {
-                let o_poly = &cycle_polys_2d[o];
+                let o_poly: &[(f64, f64)] = &cycle_polys_2d[o];
                 if o_poly.len() < 3 || !point_in_polygon_2d(hc.0, hc.1, o_poly) {
                     // Condition (1): outer must contain the hole's centroid.
                     continue;
                 }
-                // Condition (2): outer must be larger than the hole. A
-                // polygon whose area is ≤ the hole's area cannot contain the
-                // hole — it is a void fragment nested inside it.
-                let area = signed_area(o_poly);
-                if area <= hole_area {
+                // Condition (2): outer must be STRICTLY larger than the hole.
+                // A polygon whose area is ≤ the hole's area cannot contain
+                // the hole — it is a void fragment nested inside it.
+                if crate::math::polygon_area_cmp_2d(o_poly, hole_poly) != AreaOrd::Greater {
                     continue;
                 }
-                if area < best_area {
-                    best_area = area;
+                // Tightest containing outer wins; the first candidate wins
+                // exact-area ties (matching the former strict `<` compare).
+                let tighter = best_poly
+                    .is_none_or(|bp| crate::math::polygon_area_cmp_2d(o_poly, bp) == AreaOrd::Less);
+                if tighter {
+                    best_poly = Some(o_poly);
                     chosen = Some(pos);
                 }
             }
@@ -16135,14 +16151,33 @@ pub(crate) fn spherical_circular_membership(
     // `keep_far` = true for an outer cap loop, false for an inner hole loop.
     // The point must lie on the kept side of the circle's plane (on-plane
     // counts as inside / boundary).
+    //
+    // DECOMPOSED per the EXACT PREDICATES boundary contract (Slice 4): the
+    // on-plane band is a Regime-T gate (applied first, unchanged); OUTSIDE
+    // it, which side of the trim circle's stored plane the query point and
+    // the sphere centre occupy is a Regime-E SIGN question, decided exactly
+    // (`math::point_plane_sidedness`, expansion-exact in the stored
+    // (centre, axis) carrier — the circle's own plane is authoritative, spec
+    // §3.2). The former `p * o < 0.0` float product could mis-sign `o` for a
+    // near-great-circle trim (plane almost through the sphere centre), where
+    // `(center − c)·n` is pure cancellation — flipping which CAP the whole
+    // face claims. The centre's projection carries no tolerance band: its
+    // sign is a calibration, not a coincidence question; an exactly-on-plane
+    // centre (a true great circle) has NO far cap and reports `on_far =
+    // false` for every point, matching the former product semantics.
     let on_kept_side = |c: Point3, n: Vector3, keep_far: bool| -> bool {
         let p = (*point - c).dot(&n);
-        let o = (center - c).dot(&n);
         if p.abs() <= tol {
-            return true; // on the cutting plane → boundary
+            return true; // Regime-T band: on the cutting plane → boundary
         }
-        // Far side = opposite sign to the centre's projection.
-        let on_far = p * o < 0.0;
+        let side_point = crate::math::point_plane_sidedness(&n, &c, point);
+        let side_centre = crate::math::point_plane_sidedness(&n, &c, &center);
+        // Far side = strictly opposite sign to the centre's projection.
+        let on_far = matches!(
+            (side_point, side_centre),
+            (std::cmp::Ordering::Greater, std::cmp::Ordering::Less)
+                | (std::cmp::Ordering::Less, std::cmp::Ordering::Greater)
+        );
         if keep_far {
             on_far
         } else {
@@ -18362,6 +18397,142 @@ mod tests {
             cen(Point3::new(2.5, 0.0, 0.0)),
             Some(true),
             "equator in central"
+        );
+    }
+
+    /// EXACT PREDICATES Slice 4 RED (spherical membership, census row #2/#3
+    /// family): a trim circle whose plane passes ALMOST exactly through the
+    /// sphere centre (a near-great-circle cut). The cap-vs-hole calibration
+    /// in `on_kept_side` reads which side of the circle plane the sphere
+    /// CENTRE lies on — a pure cancellation `(center − c)·n` whose f64 sign
+    /// can be wrong, flipping which spherical cap the whole face claims. The
+    /// adversarial (centre, plane) pair is SEARCHED deterministically: the
+    /// raw f64 dot reports one sign while the exact sidedness
+    /// (`math::point_plane_sidedness`, BigRational-oracle-gated in the
+    /// census) reports the opposite.
+    ///
+    /// RED evidence (2026-07-16): with `on_kept_side` hand-reverted to the
+    /// float `p * o < 0.0` product, this test FAILS (the cap face claims the
+    /// wrong side — mutation proof); with the exact signs it passes.
+    #[test]
+    fn spherical_membership_near_great_circle_exact_side() {
+        use crate::primitives::curve::{Circle, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        use crate::primitives::face::{Face, FaceOrientation};
+        use crate::primitives::r#loop::{Loop, LoopType};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::cmp::Ordering as O;
+
+        // Deterministic search: circle plane (c, n) with the sphere centre
+        // s nearly in the circle's plane, such that — ON THE STORED DATA,
+        // i.e. after the circle's own normal storage and `loop_circle`'s
+        // re-normalization — the f64 `(s − c)·n` sign disagrees with the
+        // exact sidedness.
+        let float_sign = |x: f64| {
+            if x > 0.0 {
+                O::Greater
+            } else if x < 0.0 {
+                O::Less
+            } else {
+                O::Equal
+            }
+        };
+        let mut rng = StdRng::seed_from_u64(0x5EA5_1DE5_0FC1_0B00);
+        let mut found: Option<(Circle, Vector3, Point3, O)> = None;
+        for _ in 0..200_000u32 {
+            let c = Point3::new(
+                rng.gen_range(-3.0..3.0),
+                rng.gen_range(-3.0..3.0),
+                rng.gen_range(-3.0..3.0),
+            );
+            let n_raw = Vector3::new(
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-1.0..1.0),
+            );
+            let Ok(n) = n_raw.normalize() else { continue };
+            // In-plane basis (Gram-Schmidt, float — construction only).
+            let helper = if n.x.abs() < 0.7 {
+                Vector3::X
+            } else {
+                Vector3::Y
+            };
+            let Ok(e1) = (helper - n * helper.dot(&n)).normalize() else {
+                continue;
+            };
+            let e2 = n.cross(&e1);
+            // Sphere centre nearly in the circle's plane.
+            let a: f64 = rng.gen_range(0.2..1.5);
+            let b: f64 = rng.gen_range(0.2..1.5);
+            let s = c + e1 * a + e2 * b;
+            // Mirror the production data path exactly: Circle stores the
+            // normal; `loop_circle` re-normalizes what `circle.normal()`
+            // returns.
+            let Ok(circle) = Circle::new(c, n, 1.0) else {
+                continue;
+            };
+            let Ok(n_stored) = circle.normal().normalize() else {
+                continue;
+            };
+            let o_float = (s - c).dot(&n_stored);
+            let o_exact = crate::math::point_plane_sidedness(&n_stored, &c, &s);
+            if o_exact != O::Equal && float_sign(o_float) != o_exact {
+                found = Some((circle, n_stored, s, o_exact));
+                break;
+            }
+        }
+        let (circle, n_stored, s, o_exact) = found.expect(
+            "adversarial search exhausted: no f64-sign lie found for the \
+             near-great-circle centre projection — widen the search",
+        );
+        let c = circle.center();
+
+        let radius = 2.5;
+        let mut m = BRepModel::new();
+        let sid = m
+            .surfaces
+            .add(Box::new(Sphere::new(s, radius).expect("sphere")));
+        let cid = m.curves.add(Box::new(circle));
+        let rim = c + Vector3::new(n_stored.y, -n_stored.x, 0.0) * 0.1; // any vertex; unused by the test
+        let vid = m.vertices.add(rim.x, rim.y, rim.z);
+        let eid = m.edges.add(Edge::new(
+            0,
+            vid,
+            vid,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let mut cap_loop = Loop::new(0, LoopType::Outer);
+        cap_loop.add_edge(eid, true);
+        let cap_loop_id = m.loops.add(cap_loop);
+        let cap_fid = m
+            .faces
+            .add(Face::new(0, sid, cap_loop_id, FaceOrientation::Forward));
+
+        let tol = Tolerance::default();
+        let surf = m.surfaces.get(sid).expect("surface stored");
+        let cap_face = m.faces.get(cap_fid).expect("face stored");
+
+        // Probe far along the normal on the EXACT-far side of the plane
+        // from the centre: for a cap loop (keep_far = true) it must be kept.
+        let far_dir = if o_exact == O::Less {
+            n_stored
+        } else {
+            n_stored * -1.0
+        };
+        let probe = s + far_dir * radius;
+        // Sanity: the probe is unambiguously off the plane (T gate passes).
+        assert!(((probe - c).dot(&n_stored)).abs() > tol.distance() * 10.0);
+
+        let got = spherical_circular_membership(&m, cap_face, surf, &probe, &tol);
+        assert_eq!(
+            got,
+            Some(true),
+            "the cap must keep the exact-far side of a near-great-circle cut \
+             (c={c:?}, n={n_stored:?}, s={s:?}): the f64 centre-projection \
+             sign points at the WRONG cap"
         );
     }
 

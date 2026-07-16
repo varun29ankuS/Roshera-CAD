@@ -467,6 +467,371 @@ fn exact_pip_matches_oracle_on_full_corpus() {
     }
 }
 
+// ───────────── Slice 3 census: circular order + |area| comparison ───────────
+
+use adversarial::{area_pair_corpus, dir_pair_corpus, AreaPairCase, DirPairCase};
+use std::cmp::Ordering as CmpOrd;
+
+/// Ground-truth circular order (CCW from the +x axis) of two direction
+/// vectors: the half-plane split is decided by exact f64 comparisons, the
+/// within-half order by the RATIONAL cross sign.
+fn circular_order_oracle(u: (f64, f64), v: (f64, f64)) -> CmpOrd {
+    let half = |(x, y): (f64, f64)| -> u8 {
+        if x == 0.0 && y == 0.0 {
+            0
+        } else if y > 0.0 || (y == 0.0 && x > 0.0) {
+            1
+        } else {
+            2
+        }
+    };
+    match half(u).cmp(&half(v)) {
+        CmpOrd::Equal => {
+            let cross = rat(u.0) * rat(v.1) - rat(u.1) * rat(v.0);
+            if cross.is_positive() {
+                CmpOrd::Less
+            } else if cross.is_negative() {
+                CmpOrd::Greater
+            } else {
+                CmpOrd::Equal
+            }
+        }
+        o => o,
+    }
+}
+
+/// CENSUS: the former DCEL angular-sort comparator — `atan2` keys compared
+/// with `partial_cmp … NaN→Equal` (mirrored verbatim from the pre-Slice-3
+/// `face_arrangement.rs` sort and the `boolean.rs` sphere-walker sort) —
+/// COLLIDES on sub-ulp-separated direction pairs: it reports `Equal` where
+/// the exact cross sign strictly orders the pair, silently handing the ring
+/// order to an id-based tie-break. The exact `circular_order` must match the
+/// rational oracle on every pair, both argument orders.
+#[test]
+fn census_atan2_angular_sort_collides_on_near_parallel_pairs() {
+    use geometry_engine::math::circular_order;
+    use geometry_engine::math::vector2::Vector2;
+
+    let atan2_cmp = |u: (f64, f64), v: (f64, f64)| -> CmpOrd {
+        let au = u.1.atan2(u.0);
+        let av = v.1.atan2(v.0);
+        au.partial_cmp(&av).unwrap_or(CmpOrd::Equal)
+    };
+
+    let corpus = dir_pair_corpus(20_000, 0xC1C0_1A12_0001);
+    let mut collisions = 0u64;
+    let mut strict = 0u64;
+    let mut first: Option<DirPairCase> = None;
+    for case in &corpus {
+        let truth = circular_order_oracle(case.u, case.v);
+        if truth != CmpOrd::Equal {
+            strict += 1;
+        }
+        if truth != CmpOrd::Equal && atan2_cmp(case.u, case.v) == CmpOrd::Equal {
+            collisions += 1;
+            if first.is_none() {
+                first = Some(*case);
+            }
+        }
+        // The exact predicate must agree with the oracle in both orders.
+        let vu = Vector2::new(case.u.0, case.u.1);
+        let vv = Vector2::new(case.v.0, case.v.1);
+        assert_eq!(
+            circular_order(&vu, &vv),
+            truth,
+            "circular_order vs oracle on {case:?}"
+        );
+        assert_eq!(
+            circular_order(&vv, &vu),
+            truth.reverse(),
+            "circular_order antisymmetry on {case:?}"
+        );
+    }
+    eprintln!(
+        "[census] dir-pair corpus: {} cases ({strict} strictly ordered), \
+         atan2 collisions (float key Equal, truth strict) = {collisions}",
+        corpus.len()
+    );
+    if let Some(case) = first {
+        eprintln!("[census] first atan2 collision: {case:?}");
+    }
+    assert!(
+        collisions > 0,
+        "corpus never reached the atan2-collision regime — tighten dtheta"
+    );
+}
+
+/// Ground-truth |shoelace| comparison via rationals.
+fn abs_area_cmp_oracle(a: &[(f64, f64)], b: &[(f64, f64)]) -> CmpOrd {
+    let abs_shoelace = |poly: &[(f64, f64)]| -> BigRational {
+        let n = poly.len();
+        if n < 3 {
+            return BigRational::from_float(0.0).expect("zero");
+        }
+        let mut acc = BigRational::from_float(0.0).expect("zero");
+        for i in 0..n {
+            let (x0, y0) = poly[i];
+            let (x1, y1) = poly[(i + 1) % n];
+            acc += rat(x0) * rat(y1) - rat(x1) * rat(y0);
+        }
+        if acc.is_negative() {
+            -acc
+        } else {
+            acc
+        }
+    };
+    let (aa, ab) = (abs_shoelace(a), abs_shoelace(b));
+    if aa > ab {
+        CmpOrd::Greater
+    } else if aa < ab {
+        CmpOrd::Less
+    } else {
+        CmpOrd::Equal
+    }
+}
+
+/// CENSUS: the former f64 |area| comparison (mirror of the pre-Slice-3
+/// `boolean.rs` `signed_area` closure feeding the nesting ties, census row
+/// #8) lies on near-equal polygon pairs; the exact `polygon_area_cmp_2d`
+/// must match the rational oracle on every pair.
+#[test]
+fn census_float_abs_area_compare_lies_on_near_equal_pairs() {
+    use geometry_engine::math::polygon_area_cmp_2d;
+
+    let float_abs_area = |poly: &[(f64, f64)]| -> f64 {
+        if poly.len() < 3 {
+            return 0.0;
+        }
+        let mut a = 0.0;
+        for i in 0..poly.len() {
+            let (x0, y0) = poly[i];
+            let (x1, y1) = poly[(i + 1) % poly.len()];
+            a += x0 * y1 - x1 * y0;
+        }
+        (0.5 * a).abs()
+    };
+
+    let corpus = area_pair_corpus(6_000, 0xA2EA_9A12_0002);
+    let mut lies = 0u64;
+    let mut first: Option<&AreaPairCase> = None;
+    for case in &corpus {
+        let truth = abs_area_cmp_oracle(&case.a, &case.b);
+        let float_verdict = float_abs_area(&case.a)
+            .partial_cmp(&float_abs_area(&case.b))
+            .unwrap_or(CmpOrd::Equal);
+        if float_verdict != truth {
+            lies += 1;
+            if first.is_none() {
+                first = Some(case);
+            }
+        }
+        assert_eq!(
+            polygon_area_cmp_2d(&case.a, &case.b),
+            truth,
+            "polygon_area_cmp_2d vs oracle (family {})",
+            case.family
+        );
+    }
+    eprintln!(
+        "[census] area-pair corpus: {} cases, float |area| compare lies = {lies}",
+        corpus.len()
+    );
+    if let Some(case) = first {
+        eprintln!("[census] first area-compare lie (family={})", case.family);
+    }
+    assert!(
+        lies > 0,
+        "corpus never reached the lying regime of the f64 area comparison"
+    );
+}
+
+// ───────────── Slice 4 census: 3D plane sidedness + sliver tetrahedra ───────
+
+use adversarial::{plane_eval_corpus, sliver_tetra_corpus, PlaneEvalCase};
+
+fn sign_to_ord(x: i32) -> CmpOrd {
+    match x {
+        1 => CmpOrd::Greater,
+        -1 => CmpOrd::Less,
+        _ => CmpOrd::Equal,
+    }
+}
+
+/// Rational sign of `n·(p − o)`.
+fn point_plane_oracle(c: &PlaneEvalCase) -> CmpOrd {
+    let s = rat(c.n.0) * (rat(c.p.0) - rat(c.o.0))
+        + rat(c.n.1) * (rat(c.p.1) - rat(c.o.1))
+        + rat(c.n.2) * (rat(c.p.2) - rat(c.o.2));
+    sign_to_ord(if s.is_positive() {
+        1
+    } else if s.is_negative() {
+        -1
+    } else {
+        0
+    })
+}
+
+/// Rational sign of `n·p − d` (the plane's (n, d) form; `d` itself is the
+/// f64-rounded `n·o`, taken at face value as the represented plane).
+fn plane_eval_oracle(c: &PlaneEvalCase) -> CmpOrd {
+    let s = rat(c.n.0) * rat(c.p.0) + rat(c.n.1) * rat(c.p.1) + rat(c.n.2) * rat(c.p.2) - rat(c.d);
+    sign_to_ord(if s.is_positive() {
+        1
+    } else if s.is_negative() {
+        -1
+    } else {
+        0
+    })
+}
+
+/// CENSUS: the raw f64 plane evaluations — `(p − o)·n` (mirror of the
+/// pre-Slice-4 `on_kept_side` / `point_in_region` half-space tests and the
+/// `surface_plane_intersection` grid dot) and `n·p − d` — lie on the
+/// near-coplanar 3D corpus; the exact `point_plane_sidedness` and
+/// `sign_of_plane_eval` must match the rational oracle on every case.
+#[test]
+fn census_float_plane_eval_sign_lies_on_near_coplanar_corpus() {
+    use geometry_engine::math::{point_plane_sidedness, sign_of_plane_eval, Point3, Vector3};
+
+    let corpus = plane_eval_corpus(12_000, 0x91A5_EE7A_0003);
+    let mut lies_po = 0u64;
+    let mut lies_nd = 0u64;
+    let mut first: Option<&PlaneEvalCase> = None;
+    for case in &corpus {
+        let truth_po = point_plane_oracle(case);
+        let truth_nd = plane_eval_oracle(case);
+
+        // float mirrors
+        let fo = case.n.0 * (case.p.0 - case.o.0)
+            + case.n.1 * (case.p.1 - case.o.1)
+            + case.n.2 * (case.p.2 - case.o.2);
+        let fnd = case.n.0 * case.p.0 + case.n.1 * case.p.1 + case.n.2 * case.p.2 - case.d;
+        let fo_ord = fo.partial_cmp(&0.0).unwrap_or(CmpOrd::Equal);
+        let fnd_ord = fnd.partial_cmp(&0.0).unwrap_or(CmpOrd::Equal);
+        if fo_ord != truth_po {
+            lies_po += 1;
+            if first.is_none() {
+                first = Some(case);
+            }
+        }
+        if fnd_ord != truth_nd {
+            lies_nd += 1;
+        }
+
+        let n = Vector3::new(case.n.0, case.n.1, case.n.2);
+        let o = Point3::new(case.o.0, case.o.1, case.o.2);
+        let p = Point3::new(case.p.0, case.p.1, case.p.2);
+        assert_eq!(
+            point_plane_sidedness(&n, &o, &p),
+            truth_po,
+            "point_plane_sidedness vs oracle on {case:?}"
+        );
+        assert_eq!(
+            sign_of_plane_eval(&n, case.d, &p),
+            truth_nd,
+            "sign_of_plane_eval vs oracle on {case:?}"
+        );
+    }
+    eprintln!(
+        "[census] plane-eval corpus: {} cases, float lies: (p−o)·n = {lies_po}, \
+         n·p−d = {lies_nd}",
+        corpus.len()
+    );
+    if let Some(case) = first {
+        eprintln!("[census] first plane-eval lie: {case:?}");
+    }
+    assert!(
+        lies_po + lies_nd > 0,
+        "corpus never reached the lying regime of the raw f64 plane evals"
+    );
+}
+
+/// CENSUS + PIN: sliver tetrahedra (near-coplanar quadruples). The naive f64
+/// orient3d determinant lies; the exact `orient3d` matches the rational
+/// oracle on the whole corpus (the same guarantee the predicate-exactness
+/// gate proves on its own sweep — this row pins it on the census generator).
+#[test]
+fn census_orient3d_exact_on_sliver_tetrahedra() {
+    use geometry_engine::math::{orient3d, Orientation, Point3};
+
+    let corpus = sliver_tetra_corpus(12_000, 0x7E72_A512_0004);
+    let mut naive_lies = 0u64;
+    for case in &corpus {
+        // Rational oracle, matching orient3d's sign convention (the negated
+        // determinant, as in tests/predicate_exactness_gate.rs).
+        let adx = rat(case.a.0) - rat(case.d.0);
+        let ady = rat(case.a.1) - rat(case.d.1);
+        let adz = rat(case.a.2) - rat(case.d.2);
+        let bdx = rat(case.b.0) - rat(case.d.0);
+        let bdy = rat(case.b.1) - rat(case.d.1);
+        let bdz = rat(case.b.2) - rat(case.d.2);
+        let cdx = rat(case.c.0) - rat(case.d.0);
+        let cdy = rat(case.c.1) - rat(case.d.1);
+        let cdz = rat(case.c.2) - rat(case.d.2);
+        let s = &adx * (&bdy * &cdz - &bdz * &cdy)
+            + &ady * (&bdz * &cdx - &bdx * &cdz)
+            + &adz * (&bdx * &cdy - &bdy * &cdx);
+        let truth = if s.is_positive() {
+            -1
+        } else if s.is_negative() {
+            1
+        } else {
+            0
+        };
+
+        let (a, b, c, d) = (
+            Point3::new(case.a.0, case.a.1, case.a.2),
+            Point3::new(case.b.0, case.b.1, case.b.2),
+            Point3::new(case.c.0, case.c.1, case.c.2),
+            Point3::new(case.d.0, case.d.1, case.d.2),
+        );
+        let got = match orient3d(&a, &b, &c, &d) {
+            Orientation::CounterClockwise => 1,
+            Orientation::Clockwise => -1,
+            Orientation::Collinear => 0,
+        };
+        assert_eq!(got, truth, "orient3d vs oracle on {case:?}");
+
+        // Naive f64 mirror.
+        let (fadx, fady, fadz) = (
+            case.a.0 - case.d.0,
+            case.a.1 - case.d.1,
+            case.a.2 - case.d.2,
+        );
+        let (fbdx, fbdy, fbdz) = (
+            case.b.0 - case.d.0,
+            case.b.1 - case.d.1,
+            case.b.2 - case.d.2,
+        );
+        let (fcdx, fcdy, fcdz) = (
+            case.c.0 - case.d.0,
+            case.c.1 - case.d.1,
+            case.c.2 - case.d.2,
+        );
+        let det = -(fadx * (fbdy * fcdz - fbdz * fcdy)
+            + fady * (fbdz * fcdx - fbdx * fcdz)
+            + fadz * (fbdx * fcdy - fbdy * fcdx));
+        let naive = if det > 0.0 {
+            1
+        } else if det < 0.0 {
+            -1
+        } else {
+            0
+        };
+        if naive != truth {
+            naive_lies += 1;
+        }
+    }
+    eprintln!(
+        "[census] sliver-tetra corpus: {} cases, naive f64 orient3d lies = {naive_lies}",
+        corpus.len()
+    );
+    assert!(
+        naive_lies > 0,
+        "corpus never reached the lying regime of the naive orient3d"
+    );
+}
+
 // ─────────────────────── solid-level census sweeps ──────────────────────────
 
 use adversarial::{flush_upstand_union, near_tangent_cyl_union, sliver_wall_union};
