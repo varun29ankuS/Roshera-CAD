@@ -1457,11 +1457,64 @@ impl<W: Write> StepWriter<W> {
         pcurve_export: &crate::formats::step::pcurve::PcurveExport,
     ) -> std::io::Result<usize> {
         let pcurve_map = &pcurve_export.pcurves;
+
+        // ── Face-anchored reachability filter (#43a dead-slot class) ──
+        // The kernel's boolean operand prune deletes orphan faces /
+        // loops / edges / vertices, but SURFACES and CURVES have no
+        // delete path (`operations::delete::EntityType` carries no
+        // Surface/Curve variants), so a pruned operand's geometry stays
+        // live in the store and `BRepSnapshot::from_model` snapshots
+        // every slot. Dumping the raw snapshot therefore exported
+        // shape-inert orphan entities (e.g. a drilled box carried its
+        // pruned cutter's lateral CYLINDRICAL_SURFACE, cap PLANEs and
+        // basis CIRCLEs). Emit only geometry the exported topology
+        // references: faces → surfaces, and faces → loops → edges →
+        // {curves, vertices}.
+        //
+        // The filter is anchored at FACES, so it only applies when the
+        // snapshot HAS faces: a topology-less model (the loose-vertex
+        // debug exports pinned by `step_format_tests`) has nothing to
+        // walk from — and no boolean can have orphaned anything in it —
+        // so it keeps the raw passthrough.
+        use std::collections::HashSet;
+        let filter_active = !snapshot.faces.is_empty();
+        let referenced_surfaces: HashSet<&Uuid> = snapshot
+            .faces
+            .iter()
+            .filter_map(|(_, f)| f.surface.as_ref())
+            .collect();
+        let referenced_loops: HashSet<&Uuid> = snapshot
+            .faces
+            .iter()
+            .flat_map(|(_, f)| f.outer_loop.iter().chain(f.inner_loops.iter()))
+            .collect();
+        let referenced_edges: HashSet<&Uuid> = snapshot
+            .loops
+            .iter()
+            .filter(|(lid, _)| referenced_loops.contains(lid))
+            .flat_map(|(_, l)| l.edges.iter())
+            .collect();
+        let referenced_vertices: HashSet<&Uuid> = snapshot
+            .edges
+            .iter()
+            .filter(|(eid, _)| referenced_edges.contains(eid))
+            .flat_map(|(_, e)| [&e.start_vertex, &e.end_vertex])
+            .collect();
+        let referenced_curves: HashSet<&Uuid> = snapshot
+            .edges
+            .iter()
+            .filter(|(eid, _)| referenced_edges.contains(eid))
+            .filter_map(|(_, e)| e.curve.as_ref())
+            .collect();
+
         // Vertices: one CARTESIAN_POINT + one VERTEX_POINT each, shared
         // by every edge that references the vertex.
         let mut vertex_geom_map: HashMap<&Uuid, StepId> = HashMap::new();
         let mut vertex_point_map: HashMap<&Uuid, StepId> = HashMap::new();
         for (vid, vertex) in &snapshot.vertices {
+            if filter_active && !referenced_vertices.contains(vid) {
+                continue;
+            }
             let pt = self.write_cartesian_point(&vertex.position)?;
             vertex_geom_map.insert(vid, pt);
             let vp = self.next_id();
@@ -1474,6 +1527,9 @@ impl<W: Write> StepWriter<W> {
         // flag set so a reader reads its full parameter range.
         let mut curve_map: HashMap<&Uuid, StepId> = HashMap::new();
         for (cid, curve) in &snapshot.curves {
+            if filter_active && !referenced_curves.contains(cid) {
+                continue;
+            }
             let closed = pcurve_export.closed_curves.contains(cid);
             let step_id = self.write_curve(curve, &vertex_geom_map, closed)?;
             curve_map.insert(cid, step_id);
@@ -1484,6 +1540,9 @@ impl<W: Write> StepWriter<W> {
         // its `u_closed` / `v_closed` flag set so the seam reads correctly.
         let mut surface_map: HashMap<&Uuid, StepId> = HashMap::new();
         for (sid, surface) in &snapshot.surfaces {
+            if filter_active && !referenced_surfaces.contains(sid) {
+                continue;
+            }
             let closed_u = pcurve_export.periodic_u_surfaces.contains(sid);
             let closed_v = pcurve_export.periodic_v_surfaces.contains(sid);
             let step_id = self.write_surface(surface, closed_u, closed_v)?;
@@ -1496,6 +1555,9 @@ impl<W: Write> StepWriter<W> {
         // a reader trims the face without reprojecting onto the seam.
         let mut edge_map: HashMap<&Uuid, StepId> = HashMap::new();
         for (eid, edge) in &snapshot.edges {
+            if filter_active && !referenced_edges.contains(eid) {
+                continue;
+            }
             let step_id = self.write_edge_curve(
                 eid,
                 edge,

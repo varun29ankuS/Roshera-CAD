@@ -137,11 +137,7 @@ fn advanced_face_surface_ids(step: &str) -> Vec<String> {
 }
 
 /// `CYLINDRICAL_SURFACE` entities actually BOUND by a face — the
-/// shape-bearing count. (The raw entity count can include orphan
-/// surfaces: the boolean's operand prune tombstones faces but leaves
-/// the operand's surfaces live in the store, and the STEP writer dumps
-/// every store surface — a pre-existing #43a-class artifact pinned
-/// below, NOT part of the solid's shape.)
+/// shape-bearing count.
 fn face_bound_cylinder_count(step: &str) -> usize {
     let cyl_ids: std::collections::HashSet<String> =
         cylindrical_surface_ids(step).into_iter().collect();
@@ -149,6 +145,83 @@ fn face_bound_cylinder_count(step: &str) -> usize {
         .iter()
         .filter(|id| cyl_ids.contains(*id))
         .count()
+}
+
+/// Every 3D surface entity of the listed simple-form types
+/// (`#id=KEYWORD(...)`), as `(id, keyword)` pairs.
+fn surface_entity_ids(step: &str) -> Vec<(String, &'static str)> {
+    const SURFACE_KEYWORDS: [&str; 7] = [
+        "PLANE",
+        "CYLINDRICAL_SURFACE",
+        "SPHERICAL_SURFACE",
+        "CONICAL_SURFACE",
+        "TOROIDAL_SURFACE",
+        "SURFACE_OF_REVOLUTION",
+        "B_SPLINE_SURFACE_WITH_KNOTS",
+    ];
+    step.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let (id, rest) = l.split_once('=')?;
+            let kw = SURFACE_KEYWORDS
+                .iter()
+                .find(|kw| rest.starts_with(**kw) && rest[kw.len()..].starts_with('('))?;
+            Some((id.trim().to_string(), *kw))
+        })
+        .collect()
+}
+
+/// Assert the export carries NO orphan geometry: every 3D surface
+/// entity is bound by an `ADVANCED_FACE`, and every `CIRCLE` / `LINE`
+/// curve entity is referenced by at least one other entity. The
+/// kernel's boolean operand prune tombstones faces/edges but the store
+/// keeps SURFACES and CURVES alive (`EntityType` has no Surface/Curve
+/// variants), so a writer that dumps the raw store exports the pruned
+/// operand's geometry as shape-inert orphans (the #43a dead-slot class
+/// made visible in the exchange file).
+fn assert_orphan_free(step: &str, label: &str) {
+    let face_bound: std::collections::HashSet<String> =
+        advanced_face_surface_ids(step).into_iter().collect();
+    for (id, kw) in surface_entity_ids(step) {
+        assert!(
+            face_bound.contains(&id),
+            "{label}: orphan {kw} {id} — surface entity bound by no ADVANCED_FACE"
+        );
+    }
+
+    // Curve entities: `CIRCLE` and `LINE` definitions must each be
+    // referenced somewhere else in the file (EDGE_CURVE edge_geometry,
+    // SURFACE_CURVE/SEAM_CURVE 3D carrier, or a SURFACE_OF_REVOLUTION
+    // profile). An unreferenced one is a pruned operand's leftover.
+    for kw in ["CIRCLE", "LINE"] {
+        let ids: Vec<String> = step
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let (id, rest) = l.split_once('=')?;
+                (rest.starts_with(kw) && rest[kw.len()..].starts_with('('))
+                    .then(|| id.trim().to_string())
+            })
+            .collect();
+        for id in ids {
+            let referenced = step.lines().any(|l| {
+                let l = l.trim();
+                if l.starts_with(&format!("{id}=")) {
+                    return false; // its own definition
+                }
+                // Reference with a non-digit delimiter after the id so
+                // #12 does not match #120.
+                l.match_indices(&id).any(|(pos, _)| {
+                    let after = &l[pos + id.len()..];
+                    !after.starts_with(|c: char| c.is_ascii_digit())
+                })
+            });
+            assert!(
+                referenced,
+                "{label}: orphan {kw} {id} — curve entity referenced by nothing"
+            );
+        }
+    }
 }
 
 /// GATE (STEP half): the sketch bore exports the SAME count of
@@ -174,29 +247,27 @@ async fn gate_step_output_matches_drilled_equivalent() {
          as the create_cylinder-drilled equivalent (pre-slice: 0 vs {drilled_cyls})"
     );
 
-    // The sketch-built export is CLEAN: every CYLINDRICAL_SURFACE
-    // entity is face-bound (no orphan geometry).
+    // BOTH exports are CLEAN — the raw entity count IS the face-bound
+    // count (follow-ups C item 1: the writer now emits only
+    // face-referenced geometry, so the boolean-heavy drilled fixture's
+    // pruned-operand surfaces no longer ride into the file; the
+    // Slice-5 one-orphan pin was flipped per its delete-me note).
     assert_eq!(
         cylindrical_surface_ids(&sketch_step).len(),
         sketch_cyls,
         "sketch export must carry no orphan cylindrical surfaces"
     );
-
-    // Pin the pre-existing #43a-class artifact honestly instead of
-    // hiding it: the drilled model's boolean prune leaves the pruned
-    // cylinder OPERAND's lateral surface live in the surface store, and
-    // the STEP writer dumps every store surface — so the drilled export
-    // carries exactly one orphan (never face-bound, shape-inert)
-    // CYLINDRICAL_SURFACE entity. If this assertion starts failing with
-    // 0 orphans, the writer artifact was fixed — delete this pin and
-    // tighten the gate to raw entity counts.
-    let drilled_raw = cylindrical_surface_ids(&drilled_step).len();
     assert_eq!(
-        drilled_raw,
-        drilled_cyls + 1,
-        "expected exactly one orphan operand CYLINDRICAL_SURFACE in the drilled \
-         export (raw {drilled_raw} vs face-bound {drilled_cyls}) — see comment"
+        cylindrical_surface_ids(&drilled_step).len(),
+        drilled_cyls,
+        "drilled export must carry no orphan cylindrical surfaces \
+         (pre-fix: the pruned cutter operand's lateral rode along as +1)"
     );
+
+    // Full orphan sweep on both fixtures: every surface entity
+    // face-bound, every CIRCLE/LINE curve entity referenced.
+    assert_orphan_free(&sketch_step, "sketch bore export");
+    assert_orphan_free(&drilled_step, "drilled (boolean-heavy) export");
 
     // The bore radius rides in the CYLINDRICAL_SURFACE payload
     // (`CYLINDRICAL_SURFACE('',#n,6);`) — assert it appears with the
