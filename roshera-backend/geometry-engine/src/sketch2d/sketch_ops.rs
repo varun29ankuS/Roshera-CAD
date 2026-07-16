@@ -2235,6 +2235,443 @@ fn validate_pattern_sources(
     Ok(())
 }
 
+/// Web points of an entity pattern source: the point entities whose
+/// per-point webs rigidly carry a translated/rotated instance
+/// (SKETCH-DCM #45 follow-ups A — Slice-6 residual 6). Line/arc =
+/// the two shared endpoints; shared-CP spline = every control point.
+/// Legacy representations (unbounded/legacy lines, center-angle arcs,
+/// raw-CP splines) have NO point web and refuse per-shape.
+fn web_points_of(
+    sketch: &Sketch,
+    source: &EntityRef,
+    op: &'static str,
+) -> Result<Vec<Point2dId>, SketchOpError> {
+    match source {
+        EntityRef::Line(id) => {
+            let entry = sketch
+                .lines()
+                .get(id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op,
+                    entity: source.to_string(),
+                })?;
+            match entry.endpoints {
+                Some((a, b)) => Ok(vec![a, b]),
+                None => Err(SketchOpError::Unsupported {
+                    op,
+                    reason: format!(
+                        "{source} is a legacy/unbounded line; pattern sources need \
+                         shared-endpoint segments (no point web to maintain)"
+                    ),
+                }),
+            }
+        }
+        EntityRef::Arc(id) => {
+            let entry = sketch
+                .arcs()
+                .get(id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op,
+                    entity: source.to_string(),
+                })?;
+            match entry.endpoints {
+                Some((a, b)) => Ok(vec![a, b]),
+                None => Err(SketchOpError::Unsupported {
+                    op,
+                    reason: format!(
+                        "{source} is a legacy center-angle arc; pattern sources need \
+                         shared-endpoint arcs (no point web to maintain)"
+                    ),
+                }),
+            }
+        }
+        EntityRef::Spline(id) => {
+            let entry = sketch
+                .splines()
+                .get(id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op,
+                    entity: source.to_string(),
+                })?;
+            entry
+                .control_point_ids
+                .clone()
+                .ok_or_else(|| SketchOpError::Unsupported {
+                    op,
+                    reason: format!(
+                        "{source} is a raw-CP spline; pattern sources need \
+                         shared-control-point splines (no point web to maintain)"
+                    ),
+                })
+        }
+        other => Err(SketchOpError::Unsupported {
+            op,
+            reason: format!("{other} has no pattern point web"),
+        }),
+    }
+}
+
+/// Extended source validation for linear/circular patterns
+/// (SKETCH-DCM #45 follow-ups A): points, circles, shared-endpoint
+/// lines/arcs, shared-CP splines. Curve/phyllotaxis patterns keep the
+/// strict point/circle set ([`validate_pattern_sources`]).
+fn validate_web_pattern_sources(
+    sketch: &Sketch,
+    sources: &[EntityRef],
+    op: &'static str,
+) -> Result<(), SketchOpError> {
+    if sources.is_empty() {
+        return Err(SketchOpError::InvalidParameter {
+            op,
+            parameter: "sources",
+            reason: "at least one source entity is required".to_string(),
+        });
+    }
+    for s in sources {
+        match s {
+            EntityRef::Point(id) => {
+                if sketch.get_point(id).is_none() {
+                    return Err(SketchOpError::EntityNotFound {
+                        op,
+                        entity: s.to_string(),
+                    });
+                }
+            }
+            EntityRef::Circle(id) => {
+                if sketch.circles().get(id).is_none() {
+                    return Err(SketchOpError::EntityNotFound {
+                        op,
+                        entity: s.to_string(),
+                    });
+                }
+            }
+            EntityRef::Line(_) | EntityRef::Arc(_) | EntityRef::Spline(_) => {
+                // Existence + per-shape point-web check.
+                web_points_of(sketch, s, op)?;
+            }
+            other => {
+                return Err(SketchOpError::Unsupported {
+                    op,
+                    reason: format!(
+                        "{other} is not a pattern source (supported: point, circle, \
+                         shared-endpoint line/arc, shared-CP spline)"
+                    ),
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared-CP spline structural metadata needed to mint an instance.
+fn spline_shared_parts(
+    sketch: &Sketch,
+    id: &super::Spline2dId,
+    op: &'static str,
+) -> Result<(usize, Option<Vec<f64>>), SketchOpError> {
+    let entry = sketch
+        .splines()
+        .get(id)
+        .ok_or_else(|| SketchOpError::EntityNotFound {
+            op,
+            entity: EntityRef::Spline(*id).to_string(),
+        })?;
+    Ok(match &entry.spline {
+        super::Spline2d::BSpline(bs) => (bs.degree, None),
+        super::Spline2d::Nurbs(nurbs) => (nurbs.degree, Some(nurbs.weights.clone())),
+    })
+}
+
+/// One source point's LINEAR-pattern web: instances chained by
+/// `Distance(spacing)` along a pinned construction guide (k == 1
+/// mints the guide + its direction pin; later instances ride it with
+/// `PointOnCurve`) — the exact Slice-6 point web, factored so entity
+/// sources (line/arc endpoints, spline control points) reuse the
+/// scheme unchanged rather than forking it.
+struct LinearWeb {
+    anchor: Point2dId,
+    anchor_pos: Point2d,
+    prev: Point2dId,
+    guide: Option<Line2dId>,
+}
+
+impl LinearWeb {
+    fn new(sketch: &Sketch, anchor: Point2dId, op: &'static str) -> Result<Self, SketchOpError> {
+        let anchor_pos =
+            sketch
+                .get_point(&anchor)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op,
+                    entity: anchor.to_string(),
+                })?;
+        Ok(Self {
+            anchor,
+            anchor_pos,
+            prev: anchor,
+            guide: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Reason: the web threads the op's full context (kind, step, spacing, outcome) — a params struct would just rename the arity.
+    fn mint_instance(
+        &mut self,
+        sketch: &Sketch,
+        source: EntityRef,
+        op_kind: SketchOpKind,
+        k: usize,
+        dx: f64,
+        dy: f64,
+        spacing: f64,
+        outcome: &mut SketchOpOutcome,
+    ) -> Result<Point2dId, SketchOpError> {
+        let pos = Point2d::new(
+            self.anchor_pos.x + k as f64 * dx,
+            self.anchor_pos.y + k as f64 * dy,
+        );
+        let pk = mint_point(sketch, pos, op_kind, Some(source), Some(k), outcome);
+        match self.guide {
+            None => {
+                let gid = sketch.add_line(self.anchor, pk)?;
+                sketch.set_construction(&EntityRef::Line(gid), true)?;
+                record_created(
+                    sketch,
+                    EntityRef::Line(gid),
+                    op_kind,
+                    Some(source),
+                    None,
+                    outcome,
+                );
+                let pin = if dy.abs() < OP_EPS {
+                    Constraint::new_geometric(
+                        GeometricConstraint::Horizontal,
+                        vec![EntityRef::Line(gid)],
+                        ConstraintPriority::High,
+                    )
+                } else if dx.abs() < OP_EPS {
+                    Constraint::new_geometric(
+                        GeometricConstraint::Vertical,
+                        vec![EntityRef::Line(gid)],
+                        ConstraintPriority::High,
+                    )
+                } else {
+                    Constraint::new_dimensional(
+                        DimensionalConstraint::Slope(dy / dx),
+                        vec![EntityRef::Line(gid)],
+                        ConstraintPriority::High,
+                    )
+                };
+                mint_constraint(sketch, pin, outcome);
+                self.guide = Some(gid);
+            }
+            Some(gid) => {
+                mint_constraint(sketch, point_on_curve(pk, EntityRef::Line(gid)), outcome);
+            }
+        }
+        mint_constraint(
+            sketch,
+            Constraint::new_dimensional(
+                DimensionalConstraint::Distance(spacing),
+                vec![EntityRef::Point(self.prev), EntityRef::Point(pk)],
+                ConstraintPriority::High,
+            ),
+            outcome,
+        );
+        self.prev = pk;
+        Ok(pk)
+    }
+}
+
+/// One source point's CIRCULAR-pattern web: construction spokes
+/// center→instance chained by `Equal` length + `Angle(step)` — the
+/// exact Slice-6 spoke web, factored for entity sources.
+struct SpokeWeb {
+    anchor_pos: Point2d,
+    prev_spoke: Line2dId,
+}
+
+impl SpokeWeb {
+    fn new(
+        sketch: &Sketch,
+        center: Point2dId,
+        anchor: Point2dId,
+        source: EntityRef,
+        op_kind: SketchOpKind,
+        op: &'static str,
+        outcome: &mut SketchOpOutcome,
+    ) -> Result<Self, SketchOpError> {
+        let anchor_pos =
+            sketch
+                .get_point(&anchor)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op,
+                    entity: anchor.to_string(),
+                })?;
+        let spoke0 = sketch.add_line(center, anchor)?;
+        sketch.set_construction(&EntityRef::Line(spoke0), true)?;
+        record_created(
+            sketch,
+            EntityRef::Line(spoke0),
+            op_kind,
+            Some(source),
+            None,
+            outcome,
+        );
+        Ok(Self {
+            anchor_pos,
+            prev_spoke: spoke0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Reason: the web threads the op's full context — see LinearWeb::mint_instance.
+    fn mint_instance(
+        &mut self,
+        sketch: &Sketch,
+        center: Point2dId,
+        center_pos: Point2d,
+        source: EntityRef,
+        op_kind: SketchOpKind,
+        k: usize,
+        angle_step: f64,
+        outcome: &mut SketchOpOutcome,
+    ) -> Result<Point2dId, SketchOpError> {
+        let angle = k as f64 * angle_step;
+        let (sin, cos) = angle.sin_cos();
+        let (vx, vy) = (
+            self.anchor_pos.x - center_pos.x,
+            self.anchor_pos.y - center_pos.y,
+        );
+        let pos = Point2d::new(
+            center_pos.x + cos * vx - sin * vy,
+            center_pos.y + sin * vx + cos * vy,
+        );
+        let pk = mint_point(sketch, pos, op_kind, Some(source), Some(k), outcome);
+        let spoke = sketch.add_line(center, pk)?;
+        sketch.set_construction(&EntityRef::Line(spoke), true)?;
+        record_created(
+            sketch,
+            EntityRef::Line(spoke),
+            op_kind,
+            Some(source),
+            Some(k),
+            outcome,
+        );
+        mint_constraint(
+            sketch,
+            Constraint::new_geometric(
+                GeometricConstraint::Equal,
+                vec![EntityRef::Line(self.prev_spoke), EntityRef::Line(spoke)],
+                ConstraintPriority::High,
+            ),
+            outcome,
+        );
+        mint_constraint(
+            sketch,
+            Constraint::new_dimensional(
+                DimensionalConstraint::Angle(angle_step),
+                vec![EntityRef::Line(self.prev_spoke), EntityRef::Line(spoke)],
+                ConstraintPriority::High,
+            ),
+            outcome,
+        );
+        self.prev_spoke = spoke;
+        Ok(pk)
+    }
+}
+
+/// Mint one pattern instance ENTITY over freshly minted web points
+/// (line between the two endpoint instances, arc + `Equal`-radius
+/// chain, spline over the instance control points).
+fn mint_web_instance_entity(
+    sketch: &Sketch,
+    source: &EntityRef,
+    instance_points: &[Point2dId],
+    prev_entity: &mut EntityRef,
+    op_kind: SketchOpKind,
+    op: &'static str,
+    k: usize,
+    outcome: &mut SketchOpOutcome,
+) -> Result<(), SketchOpError> {
+    match source {
+        EntityRef::Line(_) => {
+            let [a, b] = instance_points else {
+                return Err(SketchOpError::Unsupported {
+                    op,
+                    reason: "internal: line web must carry exactly two points".to_string(),
+                });
+            };
+            let lid = sketch.add_line(*a, *b)?;
+            record_created(
+                sketch,
+                EntityRef::Line(lid),
+                op_kind,
+                Some(*source),
+                Some(k),
+                outcome,
+            );
+        }
+        EntityRef::Arc(id) => {
+            let [a, b] = instance_points else {
+                return Err(SketchOpError::Unsupported {
+                    op,
+                    reason: "internal: arc web must carry exactly two points".to_string(),
+                });
+            };
+            let arc = sketch
+                .arcs()
+                .get(id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op,
+                    entity: source.to_string(),
+                })?
+                .arc;
+            let sweep = arc.sweep_angle();
+            let aid = sketch.add_arc(*a, *b, arc.radius, arc.ccw, sweep > PI)?;
+            record_created(
+                sketch,
+                EntityRef::Arc(aid),
+                op_kind,
+                Some(*source),
+                Some(k),
+                outcome,
+            );
+            // Equal-radius chain pins the instance's chord-offset DOF
+            // and propagates a source radius edit to every instance.
+            mint_constraint(
+                sketch,
+                Constraint::new_geometric(
+                    GeometricConstraint::Equal,
+                    vec![*prev_entity, EntityRef::Arc(aid)],
+                    ConstraintPriority::High,
+                ),
+                outcome,
+            );
+            *prev_entity = EntityRef::Arc(aid);
+        }
+        EntityRef::Spline(id) => {
+            let (degree, weights) = spline_shared_parts(sketch, id, op)?;
+            let sid = match weights {
+                None => sketch.add_bspline_with_control_points(degree, instance_points)?,
+                Some(w) => sketch.add_nurbs_with_control_points(degree, instance_points, w)?,
+            };
+            record_created(
+                sketch,
+                EntityRef::Spline(sid),
+                op_kind,
+                Some(*source),
+                Some(k),
+                outcome,
+            );
+        }
+        other => {
+            return Err(SketchOpError::Unsupported {
+                op,
+                reason: format!("{other} has no pattern point web"),
+            })
+        }
+    }
+    Ok(())
+}
+
 /// Linear pattern: `count` total instances (source = instance 0) of
 /// each source, stepped by `(dx, dy)`. Maintenance is the
 /// `Equal`-chain form the Slice-2/3 decomposition handles well: a
@@ -2242,6 +2679,14 @@ fn validate_pattern_sources(
 /// direction, `Distance(spacing)` between consecutive instances,
 /// `PointOnCurve` on the guide, and an `Equal`-radius chain for
 /// circles. Every instance records provenance lineage.
+///
+/// Entity sources (SKETCH-DCM #45 follow-ups A — Slice-6 residual 6):
+/// shared-endpoint lines/arcs and shared-CP splines pattern through
+/// one point web PER endpoint / control point (the same guide +
+/// Distance scheme, extended, not forked); arc instances add the
+/// `Equal`-radius chain for their chord-offset DOF. Legacy lines,
+/// center-angle arcs and raw-CP splines refuse per-shape typed (no
+/// point web exists to maintain them).
 pub fn linear_pattern(
     sketch: &Sketch,
     sources: &[EntityRef],
@@ -2265,10 +2710,49 @@ pub fn linear_pattern(
             reason: format!("step vector must be finite and non-zero (got ({dx}, {dy}))"),
         });
     }
-    validate_pattern_sources(sketch, sources, OP)?;
+    validate_web_pattern_sources(sketch, sources, OP)?;
 
     let mut outcome = SketchOpOutcome::new(SketchOpKind::LinearPattern);
     for source in sources {
+        // Entity-web sources (follow-ups A): one linear web per
+        // endpoint / control point, instance entity over the webs.
+        if matches!(
+            source,
+            EntityRef::Line(_) | EntityRef::Arc(_) | EntityRef::Spline(_)
+        ) {
+            let web_pts = web_points_of(sketch, source, OP)?;
+            let mut webs = web_pts
+                .iter()
+                .map(|p| LinearWeb::new(sketch, *p, OP))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut prev_entity = *source;
+            for k in 1..count {
+                let mut instance_points = Vec::with_capacity(webs.len());
+                for web in &mut webs {
+                    instance_points.push(web.mint_instance(
+                        sketch,
+                        *source,
+                        SketchOpKind::LinearPattern,
+                        k,
+                        dx,
+                        dy,
+                        spacing,
+                        &mut outcome,
+                    )?);
+                }
+                mint_web_instance_entity(
+                    sketch,
+                    source,
+                    &instance_points,
+                    &mut prev_entity,
+                    SketchOpKind::LinearPattern,
+                    OP,
+                    k,
+                    &mut outcome,
+                )?;
+            }
+            continue;
+        }
         let (anchor_id, circle_source) = pattern_anchor(
             sketch,
             source,
@@ -2385,6 +2869,13 @@ pub fn linear_pattern(
 /// is the spoke web: construction spokes center→instance with an
 /// `Equal`-length chain and `Angle(angle_step)` between consecutive
 /// spokes, plus the `Equal`-radius chain for circles.
+///
+/// Entity sources (SKETCH-DCM #45 follow-ups A — Slice-6 residual 6):
+/// shared-endpoint lines/arcs and shared-CP splines pattern through
+/// one SPOKE web per endpoint / control point; arc instances add the
+/// `Equal`-radius chain. Every web point must be off-center (a
+/// degenerate spoke has no direction). Legacy lines, center-angle
+/// arcs and raw-CP splines refuse per-shape typed.
 pub fn circular_pattern(
     sketch: &Sketch,
     sources: &[EntityRef],
@@ -2413,31 +2904,95 @@ pub fn circular_pattern(
             op: OP,
             entity: center.to_string(),
         })?;
-    validate_pattern_sources(sketch, sources, OP)?;
-    // Pre-validate radii: every source must be off-center.
+    validate_web_pattern_sources(sketch, sources, OP)?;
+    // Pre-validate radii: every source anchor / web point must be
+    // off-center (a degenerate spoke has no direction to chain).
     for source in sources {
-        let anchor_pos = match source {
-            EntityRef::Point(id) => sketch.get_point(id),
-            EntityRef::Circle(id) => sketch.circle_center_position(id),
-            _ => None,
+        let check_positions: Vec<Point2d> = match source {
+            EntityRef::Point(id) => sketch.get_point(id).into_iter().collect(),
+            EntityRef::Circle(id) => sketch.circle_center_position(id).into_iter().collect(),
+            EntityRef::Line(_) | EntityRef::Arc(_) | EntityRef::Spline(_) => {
+                let mut positions = Vec::new();
+                for pid in web_points_of(sketch, source, OP)? {
+                    let pos =
+                        sketch
+                            .get_point(&pid)
+                            .ok_or_else(|| SketchOpError::EntityNotFound {
+                                op: OP,
+                                entity: pid.to_string(),
+                            })?;
+                    positions.push(pos);
+                }
+                positions
+            }
+            _ => Vec::new(),
         };
-        let Some(pos) = anchor_pos else {
+        if check_positions.is_empty() {
             return Err(SketchOpError::EntityNotFound {
                 op: OP,
                 entity: source.to_string(),
             });
-        };
-        if pos.distance_to(&center_pos) < OP_EPS {
-            return Err(SketchOpError::InvalidParameter {
-                op: OP,
-                parameter: "center",
-                reason: format!("{source} coincides with the pattern center"),
-            });
+        }
+        for pos in check_positions {
+            if pos.distance_to(&center_pos) < OP_EPS {
+                return Err(SketchOpError::InvalidParameter {
+                    op: OP,
+                    parameter: "center",
+                    reason: format!("{source} coincides with the pattern center"),
+                });
+            }
         }
     }
 
     let mut outcome = SketchOpOutcome::new(SketchOpKind::CircularPattern);
     for source in sources {
+        // Entity-web sources (follow-ups A): one spoke web per
+        // endpoint / control point, instance entity over the webs.
+        if matches!(
+            source,
+            EntityRef::Line(_) | EntityRef::Arc(_) | EntityRef::Spline(_)
+        ) {
+            let web_pts = web_points_of(sketch, source, OP)?;
+            let mut webs = Vec::with_capacity(web_pts.len());
+            for p in &web_pts {
+                webs.push(SpokeWeb::new(
+                    sketch,
+                    *center,
+                    *p,
+                    *source,
+                    SketchOpKind::CircularPattern,
+                    OP,
+                    &mut outcome,
+                )?);
+            }
+            let mut prev_entity = *source;
+            for k in 1..count {
+                let mut instance_points = Vec::with_capacity(webs.len());
+                for web in &mut webs {
+                    instance_points.push(web.mint_instance(
+                        sketch,
+                        *center,
+                        center_pos,
+                        *source,
+                        SketchOpKind::CircularPattern,
+                        k,
+                        angle_step,
+                        &mut outcome,
+                    )?);
+                }
+                mint_web_instance_entity(
+                    sketch,
+                    source,
+                    &instance_points,
+                    &mut prev_entity,
+                    SketchOpKind::CircularPattern,
+                    OP,
+                    k,
+                    &mut outcome,
+                )?;
+            }
+            continue;
+        }
         let (anchor_id, circle_source) = pattern_anchor(
             sketch,
             source,

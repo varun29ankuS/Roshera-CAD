@@ -537,3 +537,309 @@ fn symmetric_arc_pair_drives_the_angles_not_just_the_center() {
          {sm:?} vs {dm:?}"
     );
 }
+
+// ── 4. Line / arc / spline pattern sources (Slice-6 residual 6) ─────
+
+use geometry_engine::sketch2d::DofStatus;
+
+fn pin_point(s: &Sketch, id: &geometry_engine::sketch2d::Point2dId, x: f64, y: f64) {
+    s.add_constraint(required_dim(
+        DimensionalConstraint::XCoordinate(x),
+        vec![EntityRef::Point(*id)],
+    ));
+    s.add_constraint(required_dim(
+        DimensionalConstraint::YCoordinate(y),
+        vec![EntityRef::Point(*id)],
+    ));
+}
+
+#[test]
+fn red_linear_pattern_of_lines_is_fully_maintained() {
+    // Slice-6 residual 6: line sources refused ("maintaining a
+    // translated line rigidly needs 2 point-webs per instance").
+    // The follow-up mints exactly those webs — one guide + Distance
+    // chain per ENDPOINT, the Slice-6 scheme extended, not forked.
+    let s = fresh("followups_linear_pattern_lines");
+    let p1 = s.add_point(Point2d::new(0.0, 0.0));
+    let p2 = s.add_point(Point2d::new(0.0, 8.0));
+    let src = s.add_line(p1, p2).expect("source line");
+    pin_point(&s, &p1, 0.0, 0.0);
+    let y_pin = s.add_constraint(required_dim(
+        DimensionalConstraint::YCoordinate(8.0),
+        vec![EntityRef::Point(p2)],
+    ));
+    s.add_constraint(required_dim(
+        DimensionalConstraint::XCoordinate(0.0),
+        vec![EntityRef::Point(p2)],
+    ));
+
+    let outcome = sketch_ops::linear_pattern(&s, &[EntityRef::Line(src)], 3, 12.0, 0.0)
+        .expect("line-source pattern");
+
+    let instance_lines: Vec<_> = outcome
+        .created
+        .iter()
+        .filter_map(|e| match e {
+            EntityRef::Line(id) => Some(*id),
+            _ => None,
+        })
+        .filter(|id| !s.lines().get(id).expect("line").is_construction)
+        .collect();
+    assert_eq!(instance_lines.len(), 2, "count 3 = source + 2 instances");
+    for id in &instance_lines {
+        let prov = s
+            .provenance_of(&EntityRef::Line(*id))
+            .expect("instance line carries provenance");
+        assert_eq!(prov.op, SketchOpKind::LinearPattern);
+        assert_eq!(prov.source, Some(EntityRef::Line(src)));
+        assert!(prov.instance.is_some());
+    }
+    let guides = outcome
+        .created
+        .iter()
+        .filter_map(|e| match e {
+            EntityRef::Line(id) => Some(*id),
+            _ => None,
+        })
+        .filter(|id| s.lines().get(id).expect("line").is_construction)
+        .count();
+    assert_eq!(guides, 2, "one construction guide per endpoint web");
+
+    let dof = s.analyze_dofs();
+    assert_eq!(
+        dof.status,
+        DofStatus::FullyConstrained,
+        "line pattern must be fully maintained: {dof:?}"
+    );
+    let report = s.solve_constraints().expect("solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+
+    // Instance endpoints at x = 12 and 24 (both webs stepped +12).
+    let mut xs: Vec<f64> = instance_lines
+        .iter()
+        .flat_map(|id| {
+            let (a, b) = s.lines().get(id).expect("line").endpoints.expect("derived");
+            [s.get_point(&a).expect("a").x, s.get_point(&b).expect("b").x]
+        })
+        .collect();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!(
+        (xs[0] - 12.0).abs() < 1e-6 && (xs[3] - 24.0).abs() < 1e-6,
+        "{xs:?}"
+    );
+
+    // MAINTAINED: edit the source's top endpoint (y 8 -> 6) — every
+    // instance's top endpoint must follow through its web.
+    s.update_dimensional_value(&y_pin, 6.0).expect("edit");
+    let report = s.solve_constraints().expect("re-solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    for id in &instance_lines {
+        let (a, b) = s.lines().get(id).expect("line").endpoints.expect("derived");
+        let top_y = s
+            .get_point(&a)
+            .expect("a")
+            .y
+            .max(s.get_point(&b).expect("b").y);
+        assert!(
+            (top_y - 6.0).abs() < 1e-6,
+            "instance top endpoint must track the source edit: {top_y}"
+        );
+    }
+}
+
+#[test]
+fn red_circular_pattern_of_arcs_holds_the_ring() {
+    let s = fresh("followups_circular_pattern_arcs");
+    let hub = s.add_point(Point2d::new(0.0, 0.0));
+    s.points().get_mut(&hub).expect("hub").value_mut().fix();
+    let e1 = s.add_point(Point2d::new(10.0, 0.0));
+    let e2 = s.add_point(Point2d::new(0.0, 10.0));
+    let src = s.add_arc(e1, e2, 10.0, true, false).expect("source arc");
+    pin_point(&s, &e1, 10.0, 0.0);
+    pin_point(&s, &e2, 0.0, 10.0);
+    let r_pin = s.add_constraint(required_dim(
+        DimensionalConstraint::Radius(10.0),
+        vec![EntityRef::Arc(src)],
+    ));
+
+    let step = std::f64::consts::FRAC_PI_2;
+    let outcome = sketch_ops::circular_pattern(&s, &[EntityRef::Arc(src)], &hub, 3, step)
+        .expect("arc-source pattern");
+
+    let instance_arcs: Vec<_> = outcome
+        .created
+        .iter()
+        .filter_map(|e| match e {
+            EntityRef::Arc(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(instance_arcs.len(), 2, "count 3 = source + 2 instances");
+
+    let dof = s.analyze_dofs();
+    assert_eq!(
+        dof.status,
+        DofStatus::FullyConstrained,
+        "arc ring must be fully maintained: {dof:?}"
+    );
+    let report = s.solve_constraints().expect("solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+
+    // Instance midpoints are the 90/180-degree rotations of the
+    // source's.
+    let rotated: Vec<(f64, f64)> = instance_arcs
+        .iter()
+        .map(|id| {
+            let m = s.arcs().get(id).expect("arc").arc.midpoint();
+            (m.x, m.y)
+        })
+        .collect();
+    let src_mid = s.arcs().get(&src).expect("src").arc.midpoint();
+    let expect1 = (-src_mid.y, src_mid.x); // +90 deg
+    let expect2 = (-src_mid.x, -src_mid.y); // +180 deg
+    for exp in [expect1, expect2] {
+        assert!(
+            rotated
+                .iter()
+                .any(|(x, y)| (x - exp.0).abs() < 1e-6 && (y - exp.1).abs() < 1e-6),
+            "expected a rotated arc midpoint at {exp:?}, got {rotated:?}"
+        );
+    }
+
+    // Radius edit propagates through the Equal chain.
+    s.update_dimensional_value(&r_pin, 8.0).expect("edit");
+    let report = s.solve_constraints().expect("re-solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    for id in &instance_arcs {
+        let r = s.arcs().get(id).expect("arc").arc.radius;
+        assert!((r - 8.0).abs() < 1e-6, "Equal chain must propagate: {r}");
+    }
+}
+
+#[test]
+fn red_linear_pattern_of_shared_cp_splines() {
+    // Shared-CP splines are point webs (Slice 7): a pattern instance
+    // is a fresh spline over per-CP webs — clean under the same
+    // scheme, so it is IMPLEMENTED (raw-CP splines refuse per-shape).
+    let s = fresh("followups_linear_pattern_spline");
+    let positions = [
+        Point2d::new(0.0, 0.0),
+        Point2d::new(2.0, 5.0),
+        Point2d::new(6.0, 5.0),
+        Point2d::new(8.0, 0.0),
+    ];
+    let cps: Vec<_> = positions.iter().map(|p| s.add_point(*p)).collect();
+    let src = s
+        .add_bspline_with_control_points(3, &cps)
+        .expect("source spline");
+    for (cp, pos) in cps.iter().zip(&positions) {
+        pin_point(&s, cp, pos.x, pos.y);
+    }
+
+    let outcome = sketch_ops::linear_pattern(&s, &[EntityRef::Spline(src)], 2, 15.0, 0.0)
+        .expect("spline-source pattern");
+
+    let instance = outcome
+        .created
+        .iter()
+        .find_map(|e| match e {
+            EntityRef::Spline(id) => Some(*id),
+            _ => None,
+        })
+        .expect("instance spline created");
+    let inst_cps = s
+        .spline_control_point_ids(&instance)
+        .expect("instance is shared-CP");
+    assert_eq!(inst_cps.len(), 4);
+    for (src_cp, dst_cp) in cps.iter().zip(&inst_cps) {
+        let (sp, dp) = (
+            s.get_point(src_cp).expect("src"),
+            s.get_point(dst_cp).expect("dst"),
+        );
+        assert!(
+            (dp.x - sp.x - 15.0).abs() < 1e-9 && (dp.y - sp.y).abs() < 1e-9,
+            "instance CP must be the translated source CP: {sp:?} vs {dp:?}"
+        );
+    }
+    let prov = s
+        .provenance_of(&EntityRef::Spline(instance))
+        .expect("provenance");
+    assert_eq!(prov.op, SketchOpKind::LinearPattern);
+    assert_eq!(prov.source, Some(EntityRef::Spline(src)));
+    assert_eq!(prov.instance, Some(1));
+
+    let dof = s.analyze_dofs();
+    assert_eq!(
+        dof.status,
+        DofStatus::FullyConstrained,
+        "spline pattern must be fully maintained: {dof:?}"
+    );
+    let report = s.solve_constraints().expect("solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}
+
+#[test]
+fn pattern_refuses_legacy_and_raw_shapes_per_shape() {
+    let s = fresh("followups_pattern_per_shape_refuse");
+    // Raw-CP spline: no point web to maintain.
+    let raw = s
+        .add_bspline(
+            3,
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(2.0, 5.0),
+                Point2d::new(6.0, 5.0),
+                Point2d::new(8.0, 0.0),
+            ],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        )
+        .expect("raw spline");
+    let err = sketch_ops::linear_pattern(&s, &[EntityRef::Spline(raw)], 2, 10.0, 0.0)
+        .expect_err("raw spline must refuse");
+    assert!(
+        matches!(&err, SketchOpError::Unsupported { reason, .. } if reason.contains("control")),
+        "per-shape typed refusal expected, got {err:?}"
+    );
+
+    // Legacy center-angle arc: no endpoint web.
+    let legacy = s
+        .add_arc_center_angles(Point2d::new(3.0, 3.0), 2.0, 0.0, 1.0)
+        .expect("legacy arc");
+    let err = sketch_ops::linear_pattern(&s, &[EntityRef::Arc(legacy)], 2, 10.0, 0.0)
+        .expect_err("legacy arc must refuse");
+    assert!(
+        matches!(&err, SketchOpError::Unsupported { reason, .. } if reason.contains("legacy")),
+        "per-shape typed refusal expected, got {err:?}"
+    );
+
+    // Ellipses stay outside every pattern envelope.
+    let ell = s
+        .add_ellipse(Point2d::new(0.0, 0.0), 4.0, 2.0, 0.0)
+        .expect("ellipse");
+    let err = sketch_ops::linear_pattern(&s, &[EntityRef::Ellipse(ell)], 2, 10.0, 0.0)
+        .expect_err("ellipse must refuse");
+    assert!(matches!(err, SketchOpError::Unsupported { .. }));
+
+    // Validate-first: nothing was minted by any refusal.
+    assert_eq!(s.all_constraints().len(), 0);
+    assert_eq!(s.points().len(), 0);
+    assert_eq!(s.lines().len(), 0);
+
+    // curve/phyllotaxis patterns keep the strict point/circle set —
+    // entity webs along a rail are not in this follow-up's envelope.
+    let p1 = s.add_point(Point2d::new(0.0, 0.0));
+    let p2 = s.add_point(Point2d::new(4.0, 0.0));
+    let line = s.add_line(p1, p2).expect("line");
+    let rail = s
+        .add_arc_center_angles(Point2d::new(0.0, -20.0), 25.0, 0.5, 2.0)
+        .expect("rail");
+    let err = sketch_ops::curve_pattern(
+        &s,
+        &[EntityRef::Line(line)],
+        &EntityRef::Arc(rail),
+        3,
+        Some(2.0),
+    )
+    .expect_err("curve_pattern keeps point/circle sources");
+    assert!(matches!(err, SketchOpError::Unsupported { .. }));
+}

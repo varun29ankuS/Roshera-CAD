@@ -1071,18 +1071,34 @@ fn red_circular_pattern_spokes_hold_the_bolt_circle() {
 
 #[test]
 fn pattern_refuses_unsupported_sources_typed() {
+    // Fixture migrated (SKETCH-DCM #45 follow-ups A): shared-endpoint
+    // LINE sources are now a supported pattern class (endpoint webs),
+    // so the refuse exemplar moved to a raw-CP spline — an entity
+    // with no point web to maintain. The pin this test encodes is
+    // unchanged: an unsupported source refuses TYPED and leaves the
+    // sketch untouched (validate-first).
     let s = fresh("slice6_pattern_refuse");
-    let a = s.add_point(Point2d::new(0.0, 0.0));
-    let b = s.add_point(Point2d::new(5.0, 0.0));
-    let line = s.add_line(a, b).expect("line");
-    let err = sketch_ops::linear_pattern(&s, &[EntityRef::Line(line)], 3, 10.0, 0.0)
+    let raw = s
+        .add_bspline(
+            3,
+            vec![
+                Point2d::new(0.0, 0.0),
+                Point2d::new(2.0, 5.0),
+                Point2d::new(4.0, 5.0),
+                Point2d::new(5.0, 0.0),
+            ],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        )
+        .expect("raw spline");
+    let err = sketch_ops::linear_pattern(&s, &[EntityRef::Spline(raw)], 3, 10.0, 0.0)
         .expect_err("must refuse");
     assert!(
         matches!(err, SketchOpError::Unsupported { .. }),
-        "v1 patterns maintain point/circle instances only -- typed refuse, got {err:?}"
+        "sources without a point web refuse typed, got {err:?}"
     );
-    assert_eq!(s.lines().len(), 1, "no partial mutation on refusal");
-    assert_eq!(s.points().len(), 2);
+    assert_eq!(s.splines().len(), 1, "no partial mutation on refusal");
+    assert_eq!(s.points().len(), 0);
+    assert_eq!(s.all_constraints().len(), 0);
 }
 
 #[test]
