@@ -1217,3 +1217,128 @@ fn red_trim_circle_to_arc_reapplies_radius_and_equal_maintained() {
         "Equal must propagate through the mixed arc/circle pair: {partner_r}"
     );
 }
+
+// ── 8. curve_pattern arc rails: arc-length-TRUE spacing ─────────────
+//     (Slice-7 residual 5)
+
+#[test]
+fn red_curve_pattern_on_an_arc_rail_maintains_arc_length_spacing() {
+    // Slice-7 residual 5: curve_pattern maintained ON-RAIL contact +
+    // CHORD distances; arc-length spacing was the placement rule only,
+    // so deforming the rail held the chords, not the arc lengths. For
+    // ARC rails the curve machinery allows the exact residual:
+    // `ArcLength [rail, prev, next] = r x sweep(foot(prev) -> foot(next))`
+    // measured along the rail's traversal — maintained TRUE under rail
+    // deformation. (Spline rails stay chord-maintained, documented.)
+    let s = fresh("followups_curve_pattern_arc_rail");
+    let center = s.add_point(Point2d::new(0.0, 0.0));
+    s.points()
+        .get_mut(&center)
+        .expect("center")
+        .value_mut()
+        .fix();
+    let rail = s
+        .add_arc_centered(center, 10.0, 0.0, 2.4)
+        .expect("arc rail");
+    let r_pin = s.add_constraint(required_dim(
+        DimensionalConstraint::Radius(10.0),
+        vec![EntityRef::Arc(rail)],
+    ));
+    // Seed exactly on the rail start.
+    let seed = s.add_point(Point2d::new(10.0, 0.0));
+    s.points().get_mut(&seed).expect("seed").value_mut().fix();
+
+    let step = 5.0;
+    let outcome = sketch_ops::curve_pattern(
+        &s,
+        &[EntityRef::Point(seed)],
+        &EntityRef::Arc(rail),
+        3,
+        Some(step),
+    )
+    .expect("curve pattern on arc rail");
+
+    let instance_points: Vec<_> = outcome
+        .created
+        .iter()
+        .filter_map(|e| match e {
+            EntityRef::Point(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(instance_points.len(), 2);
+
+    // The maintained spacing is ARC LENGTH, not chords: the op mints
+    // ArcLength [rail, prev, next] links (and no chord Distances).
+    let minted_kinds = |pred: &dyn Fn(&ConstraintType) -> bool| -> usize {
+        outcome
+            .constraints_added
+            .iter()
+            .filter(|id| {
+                s.all_constraints()
+                    .iter()
+                    .any(|c| c.id == **id && pred(&c.constraint_type))
+            })
+            .count()
+    };
+    assert_eq!(
+        minted_kinds(&|t| matches!(
+            t,
+            ConstraintType::Dimensional(DimensionalConstraint::ArcLength(_))
+        )),
+        2,
+        "one maintained ArcLength link per consecutive pair"
+    );
+    assert_eq!(
+        minted_kinds(&|t| matches!(
+            t,
+            ConstraintType::Dimensional(DimensionalConstraint::Distance(_))
+        )),
+        0,
+        "no chord Distance links on an arc rail"
+    );
+
+    // Placement exact: instances at angles 0.5 and 1.0 rad on the R10
+    // carrier (s = r x theta).
+    let report = s.solve_constraints().expect("solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    let angle_of = |pid: &geometry_engine::sketch2d::Point2dId| -> f64 {
+        let p = s.get_point(pid).expect("instance");
+        p.y.atan2(p.x)
+    };
+    let mut angles: Vec<f64> = instance_points.iter().map(|p| angle_of(p)).collect();
+    angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!(
+        (angles[0] - 0.5).abs() < 1e-6 && (angles[1] - 1.0).abs() < 1e-6,
+        "placement at arc-length steps: {angles:?}"
+    );
+
+    // MAINTAINED, arc-length-TRUE: shrink the rail radius 10 -> 8 and
+    // re-solve. Chord-frozen maintenance would keep the placement
+    // chords (2 x 10 x sin(0.25) ~= 4.948); arc-length maintenance
+    // re-spaces the instances so r x delta-theta == 5 EXACTLY
+    // (delta-theta = 0.625 on the r = 8 carrier).
+    s.update_dimensional_value(&r_pin, 8.0).expect("edit");
+    let report = s.solve_constraints().expect("re-solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    let mut angles: Vec<f64> = instance_points.iter().map(|p| angle_of(p)).collect();
+    angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Seed foot stays at angle 0 (the seed is fixed at (10, 0);
+    // its angular foot on the shrunken carrier is still 0).
+    let r_live = 8.0;
+    assert!(
+        (r_live * angles[0] - step).abs() < 1e-6,
+        "first link must hold 8 x theta1 == 5: theta1 = {}",
+        angles[0]
+    );
+    assert!(
+        (r_live * (angles[1] - angles[0]) - step).abs() < 1e-6,
+        "second link must hold 8 x (theta2 - theta1) == 5: {angles:?}"
+    );
+    // And the instances sit ON the shrunken carrier.
+    for pid in &instance_points {
+        let p = s.get_point(pid).expect("instance");
+        let r = (p.x * p.x + p.y * p.y).sqrt();
+        assert!((r - 8.0).abs() < 1e-6, "instance off the live rail: {r}");
+    }
+}

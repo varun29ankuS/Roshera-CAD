@@ -475,7 +475,16 @@ impl Constraint {
                 // Advanced dimensional constraints
                 DimensionalConstraint::Area(_) => 1,
                 DimensionalConstraint::Perimeter(_) => 1,
-                DimensionalConstraint::ArcLength(_) => 1,
+                // ArcLength: `[curve]` = total swept length;
+                // `[arc, p, q]` (SKETCH-DCM #45 follow-ups A) = arc
+                // length between the points' angular feet along the
+                // rail. Other shapes remove ZERO DOF and refuse in the
+                // solver (per-shape convention).
+                DimensionalConstraint::ArcLength(_) => match self.entities.as_slice() {
+                    [_] => 1,
+                    [EntityRef::Arc(_), EntityRef::Point(_), EntityRef::Point(_)] => 1,
+                    _ => 0,
+                },
                 DimensionalConstraint::Curvature(_) => 1,
                 DimensionalConstraint::Slope(_) => 1,
                 DimensionalConstraint::AspectRatio(_) => 1,

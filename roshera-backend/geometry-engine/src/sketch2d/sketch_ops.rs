@@ -3659,10 +3659,18 @@ impl RailTable {
 /// - `spacing = None` — the remaining length is divided evenly.
 ///
 /// Maintenance: every instance gets `PointOnCurve` on the rail plus a
-/// chained `Distance` to its predecessor whose value is the CHORD
-/// measured at placement (documented honestly: arc-length spacing is
-/// the placement rule; the maintained invariant is on-rail contact +
-/// chord distances, which is what the 2D solver can hold exactly).
+/// chained spacing link to its predecessor:
+///
+/// - **Arc rails** (SKETCH-DCM #45 follow-ups A): the link is
+///   `ArcLength [rail, prev, next] = step` — r · sweep between the
+///   points' angular feet on the LIVE carrier, so the spacing is
+///   arc-length-TRUE under rail deformation.
+/// - **Spline rails**: the 2D solver has no spline arc-length
+///   residual, so the link is a `Distance` whose value is the CHORD
+///   measured at placement (documented honestly: arc-length spacing
+///   is the placement rule; the maintained invariant is on-rail
+///   contact + chord distances).
+///
 /// Circle sources add the `Equal`-radius chain. Rails may be
 /// construction geometry (a guide spline that never enters the
 /// profile). Supported rails: splines and arcs — other kinds refuse
@@ -3756,9 +3764,33 @@ pub fn curve_pattern(
             }
         }
     };
-    // Closest arc length of a point on the rail (dense scan over the
-    // same table resolution — placement machinery only).
+    // Closest arc length of a point on the rail. Arc rails resolve
+    // ANALYTICALLY (angular foot about the live center, clamped to
+    // the nearer end when outside the span) so placement is exact and
+    // the maintained ArcLength links below are satisfied bit-for-bit
+    // at mint time; spline rails keep the dense scan over the table
+    // resolution (placement machinery only).
     let closest_arc_length = |p: &Point2d| -> f64 {
+        if let Rail::Arc { arc } = &rail_geom {
+            let theta = norm_angle(arc.center.angle_to(p));
+            let sweep = if arc.ccw {
+                ccw_sweep(arc.start_angle, theta)
+            } else {
+                ccw_sweep(theta, arc.start_angle)
+            };
+            let total = arc.sweep_angle();
+            if sweep <= total {
+                return sweep * arc.radius;
+            }
+            // Outside the span: clamp to the cyclically nearer end.
+            let past_end = sweep - total;
+            let before_start = TAU - sweep;
+            return if past_end < before_start {
+                rail_length
+            } else {
+                0.0
+            };
+        }
         let mut best_s = 0.0;
         let mut best_d = f64::INFINITY;
         let samples = 512;
@@ -3856,16 +3888,42 @@ pub fn curve_pattern(
                 &mut outcome,
             );
             mint_constraint(sketch, point_on_curve(pk, *rail), &mut outcome);
-            let chord = prev_pos.distance_to(&pos);
-            mint_constraint(
-                sketch,
-                Constraint::new_dimensional(
-                    DimensionalConstraint::Distance(chord),
-                    vec![EntityRef::Point(prev_point), EntityRef::Point(pk)],
-                    ConstraintPriority::High,
-                ),
-                &mut outcome,
-            );
+            match rail {
+                // Arc rails: maintained spacing is ARC-LENGTH-TRUE
+                // (SKETCH-DCM #45 follow-ups A — Slice-7 residual 5):
+                // `ArcLength [rail, prev, next] = step` measures
+                // r · sweep between the points' angular feet on the
+                // LIVE carrier, so deforming the rail re-spaces the
+                // instances at the true arc length, not the frozen
+                // placement chord.
+                EntityRef::Arc(_) => {
+                    mint_constraint(
+                        sketch,
+                        Constraint::new_dimensional(
+                            DimensionalConstraint::ArcLength(step),
+                            vec![*rail, EntityRef::Point(prev_point), EntityRef::Point(pk)],
+                            ConstraintPriority::High,
+                        ),
+                        &mut outcome,
+                    );
+                }
+                // Spline rails: the 2D solver has no spline arc-length
+                // residual — the maintained invariant remains ON-RAIL
+                // contact + placement-measured CHORDS (documented on
+                // the op; arc-length spacing is the placement rule).
+                _ => {
+                    let chord = prev_pos.distance_to(&pos);
+                    mint_constraint(
+                        sketch,
+                        Constraint::new_dimensional(
+                            DimensionalConstraint::Distance(chord),
+                            vec![EntityRef::Point(prev_point), EntityRef::Point(pk)],
+                            ConstraintPriority::High,
+                        ),
+                        &mut outcome,
+                    );
+                }
+            }
             if let (Some(prev), Some(r)) = (prev_circle, source_radius) {
                 let ck = sketch.add_circle_centered(pk, r)?;
                 record_created(

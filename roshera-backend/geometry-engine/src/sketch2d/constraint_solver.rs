@@ -1883,14 +1883,43 @@ impl ConstraintSolver {
                 }
             }
             DimensionalConstraint::ArcLength(target_len) => {
-                // Swept length of an arc/circle: L − target.
-                if entities.len() == 1 {
-                    match self.entity_arc_length(&entities[0]) {
+                // Two arities:
+                //  - `[curve]` — swept length of an arc/circle:
+                //    L − target.
+                //  - `[arc, p, q]` (SKETCH-DCM #45 follow-ups A) —
+                //    arc length BETWEEN two points' angular feet along
+                //    the rail's stored traversal:
+                //    r · sweep(foot(p) → foot(q)) − target. Carrier-
+                //    based (feet are pure angles about the live
+                //    center), so the spacing stays arc-length-TRUE
+                //    under rail deformation — the curve_pattern
+                //    maintenance for arc rails.
+                // Unsupported shapes refuse irreducibly.
+                match entities {
+                    [e] => match self.entity_arc_length(e) {
                         Some(len) => vec![len - target_len],
                         None => Self::unsupported_residual(),
+                    },
+                    [rail @ EntityRef::Arc(_), p @ EntityRef::Point(_), q @ EntityRef::Point(_)] => {
+                        let (Some(center), Some(radius), Some(pp), Some(pq)) = (
+                            self.get_circle_center(rail),
+                            self.get_circle_radius(rail),
+                            self.get_point_position(p),
+                            self.get_point_position(q),
+                        ) else {
+                            return Self::unsupported_residual();
+                        };
+                        let tp = (pp.y - center.y).atan2(pp.x - center.x);
+                        let tq = (pq.y - center.y).atan2(pq.x - center.x);
+                        let tau = 2.0 * std::f64::consts::PI;
+                        let sweep = if self.arc_ccw_of(rail) {
+                            (tq - tp).rem_euclid(tau)
+                        } else {
+                            (tp - tq).rem_euclid(tau)
+                        };
+                        vec![radius * sweep - target_len]
                     }
-                } else {
-                    Self::unsupported_residual()
+                    _ => Self::unsupported_residual(),
                 }
             }
             DimensionalConstraint::Curvature(target_k) => {
@@ -5285,6 +5314,12 @@ mod tests {
             Constraint::new_dimensional(DimensionalConstraint::Area(4.0), vec![c1], High),
             Constraint::new_dimensional(DimensionalConstraint::Perimeter(8.0), vec![c1], High),
             Constraint::new_dimensional(DimensionalConstraint::ArcLength(3.0), vec![c1], High),
+            // Foot-to-foot arc length along an arc rail (follow-ups A).
+            Constraint::new_dimensional(
+                DimensionalConstraint::ArcLength(3.0),
+                vec![a1, p1, p2],
+                High,
+            ),
             Constraint::new_dimensional(DimensionalConstraint::Curvature(0.5), vec![c1], High),
             Constraint::new_dimensional(DimensionalConstraint::Slope(1.0), vec![l1], High),
             Constraint::new_dimensional(
