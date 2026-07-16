@@ -8,3 +8,16 @@
 # above the slowest legitimate single test.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# torus_boolean_is_deterministic is the #37 determinism gate: it deliberately
+# re-runs the torus/rim-poke boolean 5× for EACH of 3 ops (15 dense curved
+# welds + 15 manifold reports in one process) and fingerprints every run —
+# repetition IS the assertion, so neither the run count nor the fixture can
+# shrink without weakening the gate (the cell historically returned three
+# different volumes from order-dependent welding). A green CI run measured
+# 289.9 s — 10 s under the 5-min backstop — and a slower runner tipped it
+# over once. Give this single test a 10-min leash (120 s warn × 5) instead
+# of weakening the determinism assertion or the fixture.
+[[profile.default.overrides]]
+filter = 'test(torus_boolean_is_deterministic)'
+slow-timeout = { period = "120s", terminate-after = 5 }
