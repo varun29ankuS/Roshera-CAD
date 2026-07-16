@@ -216,12 +216,26 @@ pub struct AddCircleRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddSplineRequest {
     pub degree: usize,
+    /// Raw control-point coordinates (legacy spline). Mutually
+    /// exclusive with `control_point_ids`.
+    #[serde(default)]
     pub control_points: Vec<[f64; 2]>,
-    pub knots: Vec<f64>,
+    /// SHARED control points (SKETCH-DCM #45 Slice 7): existing point
+    /// entity ids, in control-polygon order. The spline becomes a
+    /// solver citizen whose geometry IS those points — draggable,
+    /// constrainable, zero phantom DOF. Knots are pinned open-uniform
+    /// (clamped) on this path, so `knots` must be omitted.
+    #[serde(default)]
+    pub control_point_ids: Option<Vec<Uuid>>,
+    /// Knot vector — REQUIRED for the raw path, forbidden for the
+    /// shared-control-point path (clamped open-uniform is pinned
+    /// there).
+    #[serde(default)]
+    pub knots: Option<Vec<f64>>,
     /// Per-control-point weights. Omitted (or `None`) selects the
     /// non-rational B-Spline path. Present selects the rational
     /// NURBS path — every weight must be strictly positive and the
-    /// length must equal `control_points.len()`.
+    /// length must equal the control-point count.
     #[serde(default)]
     pub weights: Option<Vec<f64>>,
 }
@@ -640,12 +654,14 @@ pub async fn add_spline(
             ));
         }
     }
-    for (i, k) in req.knots.iter().enumerate() {
-        if !k.is_finite() {
-            return Err(ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("knots[{}] must be finite", i),
-            ));
+    if let Some(knots) = &req.knots {
+        for (i, k) in knots.iter().enumerate() {
+            if !k.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("knots[{}] must be finite", i),
+                ));
+            }
         }
     }
     if let Some(weights) = &req.weights {
@@ -659,19 +675,53 @@ pub async fn add_spline(
         }
     }
 
+    let sketch = require_sketch(&state, id)?;
+
+    // SHARED-CONTROL-POINT path (SKETCH-DCM #45 Slice 7).
+    if let Some(ids) = &req.control_point_ids {
+        if !req.control_points.is_empty() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "supply either `control_points` (raw) or `control_point_ids` (shared), not both",
+            ));
+        }
+        if req.knots.is_some() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "shared-control-point splines pin a clamped open-uniform knot vector; \
+                 omit `knots`",
+            ));
+        }
+        let point_ids: Vec<geometry_engine::sketch2d::Point2dId> =
+            ids.iter().map(|u| Point2dId(*u)).collect();
+        let sid = match req.weights {
+            Some(weights) => sketch
+                .add_nurbs_with_control_points(req.degree, &point_ids, weights)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?,
+            None => sketch
+                .add_bspline_with_control_points(req.degree, &point_ids)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?,
+        };
+        return Ok(Json(EntityIdResponse { id: sid.0 }));
+    }
+
+    let Some(knots) = req.knots else {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "`knots` is required for raw control-point splines",
+        ));
+    };
     let control_points: Vec<Point2d> = req
         .control_points
         .iter()
         .map(|p| Point2d::new(p[0], p[1]))
         .collect();
-
-    let sketch = require_sketch(&state, id)?;
     let sid = match req.weights {
         Some(weights) => sketch
-            .add_nurbs(req.degree, control_points, weights, req.knots)
+            .add_nurbs(req.degree, control_points, weights, knots)
             .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?,
         None => sketch
-            .add_bspline(req.degree, control_points, req.knots)
+            .add_bspline(req.degree, control_points, knots)
             .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?,
     };
     Ok(Json(EntityIdResponse { id: sid.0 }))
@@ -1451,6 +1501,159 @@ pub async fn circular_pattern_op(
     }))
 }
 
+/// Request body for `POST /api/csketch/{id}/pattern/curve`
+/// (SKETCH-DCM #45 Slice 7).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurvePatternRequest {
+    pub entities: Vec<EntityRef>,
+    /// The rail — a spline or arc entity (may be construction
+    /// geometry).
+    pub rail: EntityRef,
+    pub count: usize,
+    /// Arc-length step. Omitted = the remaining rail length is
+    /// divided evenly.
+    #[serde(default)]
+    pub spacing: Option<f64>,
+}
+
+/// Request body for `POST /api/csketch/{id}/pattern/phyllotaxis`
+/// (SKETCH-DCM #45 Slice 7 — biomimicry).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PhyllotaxisPatternRequest {
+    pub entities: Vec<EntityRef>,
+    /// Existing spiral-center point id (exactly one of `center` /
+    /// `center_position`).
+    #[serde(default)]
+    pub center: Option<Uuid>,
+    /// [x, y] for a new construction center point.
+    #[serde(default)]
+    pub center_position: Option<[f64; 2]>,
+    /// Total florets INCLUDING the source (floret 1).
+    pub count: usize,
+    /// The Vogel constant c in r = c·√n.
+    pub spacing: f64,
+}
+
+/// `POST /api/csketch/{id}/pattern/curve` — n instances along a
+/// spline/arc rail at arc-length steps, maintained by `PointOnCurve` +
+/// chained `Distance` (SKETCH-DCM #45 Slice 7).
+pub async fn curve_pattern_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CurvePatternRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    if let Some(d) = req.spacing {
+        if !d.is_finite() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "spacing must be finite",
+            ));
+        }
+    }
+    let sketch = require_sketch(&state, id)?;
+    let outcome = geometry_engine::sketch2d::curve_pattern(
+        &sketch,
+        &req.entities,
+        &req.rail,
+        req.count,
+        req.spacing,
+    )
+    .map_err(op_error_to_api)?;
+    record_csketch_op(
+        &state,
+        "csketch_pattern_curve",
+        id,
+        serde_json::json!({
+            "entities": req.entities,
+            "rail": req.rail,
+            "count": req.count,
+            "spacing": req.spacing,
+        }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
+/// `POST /api/csketch/{id}/pattern/phyllotaxis` — Vogel spiral
+/// florets (r = c·√n, exact golden-angle azimuth steps) with the
+/// spoke-web maintenance scheme (SKETCH-DCM #45 Slice 7 — biomimicry).
+pub async fn phyllotaxis_pattern_op(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PhyllotaxisPatternRequest>,
+) -> Result<Json<SketchOpResponse>, ApiError> {
+    if !req.spacing.is_finite() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "spacing must be finite",
+        ));
+    }
+    let sketch = require_sketch(&state, id)?;
+    let (center_id, center_created) = match (req.center, req.center_position) {
+        (Some(pid), None) => (Point2dId(pid), false),
+        (None, Some([x, y])) => {
+            if !x.is_finite() || !y.is_finite() {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "center_position coordinates must be finite",
+                ));
+            }
+            let pid = sketch.add_point(Point2d::new(x, y));
+            sketch
+                .set_construction(&EntityRef::Point(pid), true)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+            (pid, true)
+        }
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "supply exactly one of `center` (existing point id) or \
+                 `center_position` ([x, y] for a new construction point)",
+            ));
+        }
+    };
+    let result = geometry_engine::sketch2d::phyllotaxis_pattern(
+        &sketch,
+        &req.entities,
+        &center_id,
+        req.count,
+        req.spacing,
+    );
+    let mut outcome = match result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            if center_created {
+                let _ = sketch.delete_point(&center_id);
+            }
+            return Err(op_error_to_api(e));
+        }
+    };
+    if center_created {
+        outcome.created.insert(0, EntityRef::Point(center_id));
+    }
+    record_csketch_op(
+        &state,
+        "csketch_pattern_phyllotaxis",
+        id,
+        serde_json::json!({
+            "entities": req.entities,
+            "center": center_id.0,
+            "count": req.count,
+            "spacing": req.spacing,
+        }),
+        &outcome,
+    );
+    let certificate = sketch.certify().compact();
+    Ok(Json(SketchOpResponse {
+        outcome,
+        certificate,
+    }))
+}
+
 /// `PATCH /api/csketch/{id}/construction` — mark/clear the
 /// construction (guide) flag on an entity. Construction geometry is
 /// solver-real but invisible to profile extraction and extrude.
@@ -2043,6 +2246,22 @@ fn materialise_profile_loop(
             let has_circle = edges
                 .iter()
                 .any(|e| matches!(e, ProfileEdge::Circle { .. }));
+            // A CLOSED NURBS edge (clamped endpoints coincident) is
+            // the documented zero-triangle closed-ruled trap — the
+            // kernel refuses it typed (SKETCH-DCM #45 Slice 7), so
+            // the route samples such loops up front and counts them
+            // honestly in `sampled_loops`.
+            let has_closed_nurbs = edges.iter().any(|e| match e {
+                ProfileEdge::Nurbs { control_points, .. } => {
+                    match (control_points.first(), control_points.last()) {
+                        (Some(a), Some(b)) => {
+                            (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9
+                        }
+                        _ => true,
+                    }
+                }
+                _ => false,
+            });
             // A degenerate (zero) direction is treated as oblique here
             // so the loop falls back to sampling and the request fails
             // downstream with the same direction error as before.
@@ -2050,7 +2269,7 @@ fn materialise_profile_loop(
                 (Ok(d), Ok(n)) => d.dot(&n).abs() > 1.0 - 1e-9,
                 _ => false,
             };
-            if has_circle && !along_normal {
+            if (has_circle && !along_normal) || has_closed_nurbs {
                 *sampled_loops += 1;
                 Ok(ProfileLoop::Polygon(sample_topology_loop(
                     sketch,
@@ -3243,5 +3462,194 @@ mod tests {
         // Missing entity → typed kernel error surfaces as 400.
         let phantom = EntityRef::Line(geometry_engine::sketch2d::Line2dId::new());
         assert!(sketch.set_construction(&phantom, true).is_err());
+    }
+
+    /// SKETCH-DCM #45 Slice 7: `AddSplineRequest` wire shapes — the
+    /// legacy raw form still parses (knots present), the shared-CP
+    /// form parses without knots, and the handler-level exclusivity
+    /// rules are enforceable from the parsed shape.
+    #[test]
+    fn slice7_add_spline_request_wire_shapes() {
+        let legacy: AddSplineRequest = serde_json::from_value(serde_json::json!({
+            "degree": 3,
+            "control_points": [[0.0, 0.0], [1.0, 2.0], [2.0, 2.0], [3.0, 0.0]],
+            "knots": [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        }))
+        .expect("legacy shape parses");
+        assert!(legacy.control_point_ids.is_none());
+        assert!(legacy.knots.is_some());
+
+        let shared: AddSplineRequest = serde_json::from_value(serde_json::json!({
+            "degree": 3,
+            "control_point_ids": [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()],
+        }))
+        .expect("shared-CP shape parses without knots");
+        assert_eq!(shared.control_point_ids.as_ref().map(Vec::len), Some(4));
+        assert!(shared.knots.is_none());
+        assert!(shared.control_points.is_empty());
+    }
+
+    /// SKETCH-DCM #45 Slice 7: a spline+line profile materialises
+    /// ANALYTICALLY (typed NURBS edges, counted in `analytic_loops`)
+    /// — spline profiles no longer take the sampled fallback.
+    #[test]
+    fn slice7_spline_profile_materialises_analytically() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        let b = sketch.add_point(Point2d::new(30.0, 0.0));
+        sketch.add_line(a, b).expect("base");
+        sketch
+            .add_bspline_with_control_points(
+                3,
+                &[
+                    b,
+                    sketch.add_point(Point2d::new(28.0, 12.0)),
+                    sketch.add_point(Point2d::new(2.0, 12.0)),
+                    a,
+                ],
+            )
+            .expect("arch spline");
+
+        let topology = geometry_engine::sketch2d::sketch_topology::SketchTopology::analyze(
+            &sketch,
+            &geometry_engine::sketch2d::Tolerance2d::default(),
+        )
+        .expect("topology");
+        let profiles =
+            geometry_engine::sketch2d::sketch_topology::ProfileExtractor::extract_for_extrusion(
+                &topology,
+            )
+            .expect("profiles");
+        let normal = geometry_engine::math::Vector3::Z;
+        let (regions, analytic, sampled) =
+            materialise_profile_regions(&sketch, &topology, &profiles, normal, normal)
+                .expect("materialise");
+        assert_eq!(
+            (analytic, sampled),
+            (1, 0),
+            "spline loop lifts analytically"
+        );
+        match &regions[0].outer {
+            geometry_engine::operations::extrude::ProfileLoop::Edges(edges) => {
+                assert!(
+                    edges.iter().any(|e| matches!(
+                        e,
+                        geometry_engine::sketch2d::sketch_topology::ProfileEdge::Nurbs { .. }
+                    )),
+                    "typed NURBS edge present: {edges:?}"
+                );
+            }
+            other => panic!("expected typed edges, got {other:?}"),
+        }
+    }
+
+    /// SKETCH-DCM #45 Slice 7: a CLOSED single-edge spline loop takes
+    /// the EXPLICIT sampled fallback (counted honestly) — the kernel's
+    /// typed closed-ruled-trap refusal is pre-empted by the route, so
+    /// the caller can still extrude, with `sampled_loops` telling the
+    /// truth.
+    #[test]
+    fn slice7_closed_spline_loop_samples_explicitly() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        let p0 = Point2d::new(10.0, 0.0);
+        sketch
+            .add_bspline(
+                3,
+                vec![
+                    p0,
+                    Point2d::new(14.0, 9.0),
+                    Point2d::new(-2.0, 12.0),
+                    Point2d::new(-8.0, 2.0),
+                    Point2d::new(2.0, -7.0),
+                    p0,
+                ],
+                vec![0.0, 0.0, 0.0, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0, 1.0, 1.0, 1.0],
+            )
+            .expect("closed spline");
+
+        let topology = geometry_engine::sketch2d::sketch_topology::SketchTopology::analyze(
+            &sketch,
+            &geometry_engine::sketch2d::Tolerance2d::default(),
+        )
+        .expect("topology");
+        let profiles =
+            geometry_engine::sketch2d::sketch_topology::ProfileExtractor::extract_for_extrusion(
+                &topology,
+            )
+            .expect("profiles");
+        let normal = geometry_engine::math::Vector3::Z;
+        let (regions, analytic, sampled) =
+            materialise_profile_regions(&sketch, &topology, &profiles, normal, normal)
+                .expect("materialise");
+        assert_eq!(
+            (analytic, sampled),
+            (0, 1),
+            "closed spline loop must fall back EXPLICITLY"
+        );
+        assert!(
+            matches!(
+                regions[0].outer,
+                geometry_engine::operations::extrude::ProfileLoop::Polygon(_)
+            ),
+            "sampled polygon, honestly counted"
+        );
+    }
+
+    /// SKETCH-DCM #45 Slice 7: pattern-route kernel flows (the same
+    /// calls `curve_pattern_op` / `phyllotaxis_pattern_op` make) —
+    /// typed outcome + re-certify.
+    #[test]
+    fn slice7_pattern_op_flows_produce_certified_outcomes() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        let center = sketch.add_point(Point2d::new(0.0, 0.0));
+        sketch
+            .points()
+            .get_mut(&center)
+            .expect("center")
+            .value_mut()
+            .fix();
+        let seed = sketch.add_point(Point2d::new(2.0, 0.0));
+        let outcome = geometry_engine::sketch2d::phyllotaxis_pattern(
+            &sketch,
+            &[EntityRef::Point(seed)],
+            &center,
+            4,
+            2.0,
+        )
+        .expect("phyllotaxis");
+        assert_eq!(
+            outcome
+                .created
+                .iter()
+                .filter(|e| matches!(e, EntityRef::Point(_)))
+                .count(),
+            3
+        );
+        let response = SketchOpResponse {
+            outcome,
+            certificate: sketch.certify().compact(),
+        };
+        let body = serde_json::to_value(&response).expect("serialises");
+        assert_eq!(body["outcome"]["op"], "phyllotaxis_pattern");
+        assert!(body["certificate"]["sound"].is_boolean());
+
+        // Typed refusal maps to the 400 detail shape.
+        let err = geometry_engine::sketch2d::curve_pattern(
+            &sketch,
+            &[EntityRef::Point(seed)],
+            &EntityRef::Point(center),
+            3,
+            Some(1.0),
+        )
+        .expect_err("a point is not a rail");
+        let api = op_error_to_api(err);
+        let body = serde_json::to_value(&api).expect("serialises");
+        assert_eq!(body["details"]["kind"], "unsupported");
     }
 }

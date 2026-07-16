@@ -1021,6 +1021,18 @@ pub enum ProfileEdge {
         center: [f64; 2],
         radius: f64,
     },
+    /// Exact NURBS/B-spline boundary edge (SKETCH-DCM #45 Slice 7 —
+    /// spline profiles stop chord-sampling). Loop-walk orientation is
+    /// baked in like every other variant: a reversed walk reverses the
+    /// control points (and weights) and mirrors the knot vector
+    /// (`k'ᵢ = k_first + k_last − k_{n−1−i}` — the standard reversal,
+    /// Piegl & Tiller §5.2). `weights: None` = non-rational B-spline.
+    Nurbs {
+        degree: usize,
+        control_points: Vec<[f64; 2]>,
+        weights: Option<Vec<f64>>,
+        knots: Vec<f64>,
+    },
 }
 
 /// Verdict of [`ProfileExtractor::analytic_loop_edges`]: either the
@@ -1053,11 +1065,13 @@ impl ProfileExtractor {
     ///
     /// Coverage audit (every entity kind the walker can put in a loop):
     /// line segments, rectangle sides and polyline segments → `Line`;
-    /// arcs → `Arc`; circles → `Circle`; splines and ellipses have no
-    /// exact analytic lift wired into face construction yet and return
-    /// [`AnalyticLoop::Unsupported`] (never a silent approximation).
-    /// Hard errors are reserved for structural corruption (a loop
-    /// referencing a missing edge or entity).
+    /// arcs → `Arc`; circles → `Circle`; splines → `Nurbs` (exact
+    /// stored control points / weights / knots — SKETCH-DCM #45
+    /// Slice 7); ellipses have no exact analytic lift wired into face
+    /// construction yet and return [`AnalyticLoop::Unsupported`]
+    /// (never a silent approximation). Hard errors are reserved for
+    /// structural corruption (a loop referencing a missing edge or
+    /// entity).
     pub fn analytic_loop_edges(
         sketch: &super::Sketch,
         topology: &SketchTopology,
@@ -1129,6 +1143,64 @@ impl ProfileExtractor {
                     out.push(ProfileEdge::Circle {
                         center: [circle.center.x, circle.center.y],
                         radius: circle.radius,
+                    });
+                }
+                (EdgeType::Spline, EntityRef::Spline(spline_id)) => {
+                    // Exact NURBS lift (SKETCH-DCM #45 Slice 7): the
+                    // stored control points / weights / knots ARE the
+                    // edge — no chord fit. Reversed traversal reverses
+                    // control points (and weights) and mirrors the
+                    // knot vector, which parameterises the identical
+                    // point set in the opposite direction.
+                    let entry = sketch.splines().get(spline_id).ok_or_else(|| {
+                        Sketch2dError::EntityNotFound {
+                            entity_type: "Spline".to_string(),
+                            id: spline_id.to_string(),
+                        }
+                    })?;
+                    let (degree, mut cps, mut weights, mut knots) = match &entry.value().spline {
+                        crate::sketch2d::Spline2d::BSpline(bs) => (
+                            bs.degree,
+                            bs.control_points
+                                .iter()
+                                .map(|p| [p.x, p.y])
+                                .collect::<Vec<_>>(),
+                            None,
+                            bs.knots.clone(),
+                        ),
+                        crate::sketch2d::Spline2d::Nurbs(nurbs) => (
+                            nurbs.degree,
+                            nurbs
+                                .control_points
+                                .iter()
+                                .map(|p| [p.x, p.y])
+                                .collect::<Vec<_>>(),
+                            Some(nurbs.weights.clone()),
+                            nurbs.knots.clone(),
+                        ),
+                    };
+                    if !walk_forward {
+                        cps.reverse();
+                        if let Some(w) = weights.as_mut() {
+                            w.reverse();
+                        }
+                        let (first, last) = match (knots.first(), knots.last()) {
+                            (Some(f), Some(l)) => (*f, *l),
+                            _ => {
+                                return Err(Sketch2dError::InvalidTopology {
+                                    reason: format!("spline {spline_id} has an empty knot vector"),
+                                })
+                            }
+                        };
+                        let mirrored: Vec<f64> =
+                            knots.iter().rev().map(|k| first + last - k).collect();
+                        knots = mirrored;
+                    }
+                    out.push(ProfileEdge::Nurbs {
+                        degree,
+                        control_points: cps,
+                        weights,
+                        knots,
                     });
                 }
                 (edge_type, entity) => {

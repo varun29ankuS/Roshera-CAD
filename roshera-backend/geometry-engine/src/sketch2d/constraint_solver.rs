@@ -3313,27 +3313,25 @@ impl ConstraintSolver {
                     Some(p) => p,
                     None => return vec![0.0],
                 };
-                let tolerance = Tolerance2d::default();
-                let (foot, tangent_res) = if self.is_spline_rational(curve_entity) {
-                    let nurbs = match self.get_nurbs_curve2d(curve_entity) {
-                        Some(c) => c,
+                // Foot precision matters (SKETCH-DCM #45 Slice 7): the
+                // coarse scan + damped refinement inside
+                // `closest_point` can leave the foot ~1e-3 off in
+                // parameter, and a wrong foot makes the SIGNED
+                // perpendicular residual read near-zero for a point
+                // that is visibly off the curve (the offset hides in
+                // the along-tangent component). `spline_foot` polishes
+                // the stationarity condition with exact derivatives.
+                let (foot, tangent_res) = {
+                    let geometry = match self.get_spline2d(curve_entity) {
+                        Some(g) => g,
                         None => return vec![0.0],
                     };
-                    let (foot, u) = match nurbs.closest_point(&p, &tolerance) {
-                        Ok(pair) => pair,
-                        Err(_) => return vec![0.0],
-                    };
-                    (foot, nurbs.tangent(u))
-                } else {
-                    let bspline = match self.get_bspline2d(curve_entity) {
-                        Some(c) => c,
+                    let (foot, u) = match spline_foot(&geometry, &p) {
+                        Some(pair) => pair,
                         None => return vec![0.0],
                     };
-                    let (foot, u) = match bspline.closest_point(&p, &tolerance) {
-                        Ok(pair) => pair,
-                        Err(_) => return vec![0.0],
-                    };
-                    (foot, bspline.tangent(u))
+                    let tangent = geometry.derivatives2(u).map(|(_, d1, _)| d1).map_err(|e| e);
+                    (foot, tangent)
                 };
                 let foot_to_p = Vector2d::from_points(&foot, &p);
                 let tangent = match tangent_res {

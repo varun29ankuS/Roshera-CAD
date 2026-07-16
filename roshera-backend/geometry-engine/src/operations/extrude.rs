@@ -2171,6 +2171,84 @@ fn build_analytic_loop(
                     ParameterRange::new(0.0, 1.0),
                 )));
             }
+            ProfileEdge::Nurbs {
+                degree,
+                control_points,
+                weights,
+                knots,
+            } => {
+                // Exact NURBS boundary edge (SKETCH-DCM #45 Slice 7).
+                // The lateral wall becomes an exactly-swept
+                // `RuledSurface` whose rails are true NURBS curves —
+                // the same class as partial-arc walls (Slice 5). A
+                // CLOSED edge (start vertex == end vertex) refuses
+                // TYPED: its wall would be a closed generic ruled
+                // surface, the documented zero-triangle tessellation
+                // trap that forced full circles onto the `Cylinder`
+                // path (Slice-5 residual 1) — callers sample such
+                // loops explicitly instead of shipping a broken solid.
+                if control_points.iter().any(|p| !finite2(p))
+                    || knots.iter().any(|k| !k.is_finite())
+                {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: non-finite NURBS data"
+                    )));
+                }
+                let lifted: Vec<Point3> = control_points
+                    .iter()
+                    .map(|p| lift_plane_point(origin, u_axis, v_axis, *p))
+                    .collect();
+                let n = lifted.len();
+                let weight_vec = match weights {
+                    Some(w) => w.clone(),
+                    None => vec![1.0; n],
+                };
+                let curve = crate::primitives::curve::NurbsCurve::new(
+                    *degree,
+                    lifted,
+                    weight_vec,
+                    knots.clone(),
+                )
+                .map_err(|e| {
+                    OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: NURBS construction failed: {e:?}"
+                    ))
+                })?;
+                let range = curve.parameter_range();
+                let p_start = curve.point_at(range.start).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "analytic loop edge {i}: NURBS start evaluation: {e:?}"
+                    ))
+                })?;
+                let p_end = curve.point_at(range.end).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "analytic loop edge {i}: NURBS end evaluation: {e:?}"
+                    ))
+                })?;
+                let v0 = model
+                    .vertices
+                    .add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
+                let v1 = model
+                    .vertices
+                    .add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
+                if v0 == v1 {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: closed NURBS profile edge — the extruded \
+                         wall would be a CLOSED generic ruled surface, the documented \
+                         zero-triangle tessellation trap; split the profile with a vertex \
+                         or sample it into a polygon"
+                    )));
+                }
+                let curve_id = model.curves.add(Box::new(curve));
+                out.push(model.edges.add(Edge::new(
+                    0,
+                    v0,
+                    v1,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(range.start, range.end),
+                )));
+            }
             ProfileEdge::Circle { center, radius } => {
                 if !finite2(center) || !radius.is_finite() || *radius <= 0.0 {
                     return Err(OperationError::InvalidGeometry(format!(

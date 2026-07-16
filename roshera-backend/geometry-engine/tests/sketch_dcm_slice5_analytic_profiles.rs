@@ -330,6 +330,9 @@ fn typed_extraction_slot_chains_lines_and_arcs() {
                 [center[0] + radius * a.cos(), center[1] + radius * a.sin()]
             }
             ProfileEdge::Circle { .. } => panic!("no circle in a slot loop"),
+            // Slice 7 added the NURBS variant; slot fixtures are
+            // line/arc-only by construction.
+            ProfileEdge::Nurbs { .. } => panic!("no spline in a slot loop"),
         }
     };
 
@@ -360,6 +363,7 @@ fn typed_extraction_slot_chains_lines_and_arcs() {
                 );
             }
             ProfileEdge::Circle { .. } => panic!("no circle in a slot loop"),
+            ProfileEdge::Nurbs { .. } => panic!("no spline in a slot loop"),
         }
     }
     assert_eq!((lines, arcs), (2, 2), "slot = exactly 2 lines + 2 arcs");
@@ -393,6 +397,13 @@ fn spline_and_ellipse_loops_refuse_analytic_extraction() {
     }
 
     // Closed B-spline (first CP == last CP under clamped knots).
+    // BEHAVIOUR CHANGE (deliberate, SKETCH-DCM #45 Slice 7): splines
+    // now LIFT to a typed `ProfileEdge::Nurbs` instead of refusing —
+    // the Slice-5 residual this test used to pin. The honesty
+    // boundary moved DOWN the stack: the closed-single-edge wall trap
+    // is now refused typed by `extrude_profile_regions` (pinned in
+    // `sketch_dcm_slice7_generative.rs`), and the csketch route
+    // pre-samples such loops with an honest `sampled_loops` count.
     let sketch = Sketch::new("slice5-spline".to_string(), SketchAnchor::xy());
     sketch
         .add_bspline(
@@ -413,12 +424,16 @@ fn spline_and_ellipse_loops_refuse_analytic_extraction() {
     match ProfileExtractor::analytic_loop_edges(&sketch, &topo, &profiles[0].outer_boundary)
         .expect("extraction must not hard-error")
     {
-        AnalyticLoop::Unsupported { edge_type, .. } => {
-            assert_eq!(edge_type, EdgeType::Spline, "verdict names the spline")
+        AnalyticLoop::Edges(edges) => {
+            assert_eq!(edges.len(), 1, "one closed spline edge");
+            assert!(
+                matches!(edges[0], ProfileEdge::Nurbs { .. }),
+                "splines lift to typed NURBS edges since Slice 7: {edges:?}"
+            );
         }
-        AnalyticLoop::Edges(edges) => panic!(
-            "spline loop must refuse analytic extraction this slice, got {} edges",
-            edges.len()
+        AnalyticLoop::Unsupported { entity, edge_type } => panic!(
+            "splines must lift analytically since Slice 7, got refusal on \
+             {entity} ({edge_type:?})"
         ),
     }
 }

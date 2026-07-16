@@ -111,8 +111,9 @@ pub use sketch_certificate::{
     SolverVerdict, WitnessConstraint, WitnessKind,
 };
 pub use sketch_ops::{
-    circular_pattern, extend, linear_pattern, mirror, offset, trim, EntityProvenance, LineEnd,
-    SketchOpError, SketchOpKind, SketchOpOutcome,
+    circular_pattern, curve_pattern, extend, golden_angle_rad, linear_pattern, mirror, offset,
+    phyllotaxis_pattern, trim, EntityProvenance, LineEnd, SketchOpError, SketchOpKind,
+    SketchOpOutcome,
 };
 pub use sketch_plane::{PlaneOrientation, SketchPlane};
 pub use snap::{SnapCandidate, SnapKind};

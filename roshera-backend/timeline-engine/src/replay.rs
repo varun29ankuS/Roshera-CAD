@@ -837,6 +837,8 @@ fn dispatch_generic(
         | "csketch_mirror"
         | "csketch_pattern_linear"
         | "csketch_pattern_circular"
+        | "csketch_pattern_curve"
+        | "csketch_pattern_phyllotaxis"
         | "csketch_construction" => {
             if inner.get("csketch_id").and_then(|v| v.as_str()).is_none() {
                 return Err(ReplayError::InvalidParameters {
@@ -1382,13 +1384,15 @@ mod tests {
             "csketch_mirror",
             "csketch_pattern_linear",
             "csketch_pattern_circular",
+            "csketch_pattern_curve",
+            "csketch_pattern_phyllotaxis",
             "csketch_construction",
         ]
         .iter()
         .map(|k| op_event(k))
         .collect();
         let outcome = rebuild_model_from_events(&mut ops_only, &events);
-        assert_eq!(outcome.events_applied, 7, "all op kinds must apply");
+        assert_eq!(outcome.events_applied, 9, "all op kinds must apply");
         assert_eq!(
             outcome.events_skipped, 0,
             "no skips — full-timeline honesty"
@@ -1400,7 +1404,7 @@ mod tests {
         let mut sequence = events;
         sequence.push(extrude_event.clone());
         let outcome = rebuild_model_from_events(&mut with_ops, &sequence);
-        assert_eq!(outcome.events_applied, 8);
+        assert_eq!(outcome.events_applied, 10);
         assert_eq!(outcome.events_skipped, 0);
 
         let mut extrude_only = BRepModel::new();
@@ -1410,6 +1414,66 @@ mod tests {
             cylinder_face_radii(&with_ops, s1),
             cylinder_face_radii(&extrude_only, s2),
             "identical replayed state with or without the sketch-op events"
+        );
+    }
+
+    /// SKETCH-DCM #45 Slice 7: a `sketch_extrude` event whose outer
+    /// loop carries a typed NURBS edge (`{"kind": "nurbs", ...}`)
+    /// replays through the SAME kernel entry as the live analytic
+    /// build — an organic (spline-walled) profile round-trips through
+    /// the timeline as exact geometry, never a re-sampled polygon.
+    #[test]
+    fn replay_sketch_extrude_typed_nurbs_edges_rebuilds_solid() {
+        let mut model = BRepModel::new();
+        // Base line (0,0)->(30,0) plus a clamped cubic arch back from
+        // (30,0) to (0,0) — a closed two-edge organic profile.
+        let event = mk_event(
+            "sketch_extrude",
+            serde_json::json!({
+                "params": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "u_axis": [1.0, 0.0, 0.0],
+                    "v_axis": [0.0, 1.0, 0.0],
+                    "regions": [{
+                        "outer": { "edges": [
+                            { "kind": "line", "start": [0.0, 0.0], "end": [30.0, 0.0] },
+                            { "kind": "nurbs",
+                              "degree": 3,
+                              "control_points": [[30.0, 0.0], [28.0, 12.0], [2.0, 12.0], [0.0, 0.0]],
+                              "weights": null,
+                              "knots": [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0] }
+                        ]},
+                        "holes": [],
+                    }],
+                    "distance": 5.0,
+                    "direction": [0.0, 0.0, 1.0],
+                },
+                "inputs": [],
+                "outputs": [99]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(outcome.events_applied, 1, "typed NURBS event must apply");
+        assert_eq!(outcome.events_skipped, 0);
+        let solid = only_solid(&model);
+        // 2 caps + 1 planar wall + 1 NURBS ruled wall.
+        let face_count = model
+            .solid_outer_face_count(solid)
+            .expect("outer face count");
+        assert_eq!(face_count, 4, "2 caps + line wall + NURBS wall");
+        let volume = model
+            .calculate_solid_volume(solid)
+            .expect("volume computable");
+        // Green's-theorem area of the arch profile is 208.8 (dense
+        // boundary quadrature over the exact cubic, converged to
+        // 1e-8); the mesh volume oracle tessellates the true NURBS
+        // ruled wall adaptively — 2e-3 relative bounds it well clear
+        // of any sampled-polygon signature.
+        let expected = 208.8 * 5.0;
+        let rel = (volume - expected).abs() / expected;
+        assert!(
+            rel < 2e-3,
+            "replayed organic volume must match the boundary oracle: {volume} vs {expected} (rel {rel})"
         );
     }
 

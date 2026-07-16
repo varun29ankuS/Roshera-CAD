@@ -61,6 +61,11 @@ pub enum SketchOpKind {
     Mirror,
     LinearPattern,
     CircularPattern,
+    /// Instances along a spline/arc rail (SKETCH-DCM #45 Slice 7).
+    CurvePattern,
+    /// Vogel phyllotaxis spiral: r = c·√n, θ stepped by the exact
+    /// golden angle (SKETCH-DCM #45 Slice 7 — biomimicry).
+    PhyllotaxisPattern,
 }
 
 /// Op lineage of one minted entity (stored on the sketch, queryable
@@ -1199,6 +1204,16 @@ pub fn offset(
                 ],
             ),
             ProfileEdge::Circle { .. } => continue, // refused above
+            // Unreachable for offset v1 — spline loop edges refuse at
+            // the entity-kind gate above (NURBS offset approximation
+            // is out of scope; typed refusal). The defensive chord
+            // keeps the shoelace total if that gate ever moves.
+            ProfileEdge::Nurbs { control_points, .. } => {
+                match (control_points.first(), control_points.last()) {
+                    (Some(first), Some(last)) => (*first, *last),
+                    _ => continue,
+                }
+            }
         };
         area2 += s[0] * e[1] - e[0] * s[1];
     }
@@ -1293,6 +1308,17 @@ pub fn offset(
                     reason: "a full circle inside a multi-edge loop is not offsetable".to_string(),
                 })
             }
+            // Unreachable — spline loop edges refuse at the
+            // entity-kind gate above; the typed refusal documents that
+            // NURBS offset approximation stays out of the honest
+            // envelope (SKETCH-DCM #45 Slice 7 directive note).
+            ProfileEdge::Nurbs { .. } => {
+                return Err(SketchOpError::Unsupported {
+                    op: OP,
+                    reason: "NURBS loop edges have no honest analytic offset —                              out of scope, typed refusal"
+                        .to_string(),
+                })
+            }
         }
     }
 
@@ -1316,6 +1342,10 @@ pub fn offset(
                 center[1] + radius * end_angle.sin(),
             ),
             ProfileEdge::Circle { .. } => Point2d::new(0.0, 0.0), // unreachable: refused above
+            ProfileEdge::Nurbs { control_points, .. } => control_points
+                .last()
+                .map(|p| Point2d::new(p[0], p[1]))
+                .unwrap_or(Point2d::new(0.0, 0.0)), // unreachable: refused above
         }
     };
     #[derive(Debug, Clone, Copy)]
@@ -2312,6 +2342,515 @@ pub fn circular_pattern(
                 prev_circle = Some(EntityRef::Circle(ck));
             }
             prev_spoke = spoke;
+        }
+    }
+    Ok(outcome)
+}
+
+// ── generative patterns (SKETCH-DCM #45 Slice 7 — biomimicry) ───────
+
+/// The EXACT golden angle in radians: `2π(1 − 1/φ)` with
+/// `φ = (1 + √5)/2` — Vogel's phyllotaxis constant
+/// (H. Vogel, "A better way to construct the sunflower head",
+/// *Mathematical Biosciences* 44(3-4):179-189, 1979).
+/// ≈ 2.399963229728653 rad ≈ 137.50776405003785°. Computed, never a
+/// rounded literal.
+pub fn golden_angle_rad() -> f64 {
+    let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
+    TAU * (1.0 - 1.0 / phi)
+}
+
+/// Phyllotaxis pattern: `count` florets per source on the Vogel spiral
+/// about `center` — floret n at radius `spacing·√n`, azimuth stepped
+/// by the exact golden angle. The SOURCE is floret 1 (its
+/// `Distance(center, anchor) = spacing·√1` is minted, so the solver
+/// holds it on its own floret radius); florets 2..=count are minted.
+///
+/// Maintenance web (the Slice-6 pattern scheme): construction spokes
+/// center→floret, `Angle(golden angle)` between consecutive spokes,
+/// `Distance(center, floretₙ) = spacing·√n` — each floret is fully
+/// constrained relative to the center and the previous spoke (2 DOF
+/// in, 2 DOF removed; hand-countable). Circle sources add the
+/// `Equal`-radius chain, so dimensioning the source re-sizes every
+/// floret. Provenance records the floret index n on every instance.
+pub fn phyllotaxis_pattern(
+    sketch: &Sketch,
+    sources: &[EntityRef],
+    center: &Point2dId,
+    count: usize,
+    spacing: f64,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "phyllotaxis_pattern";
+    if count < 2 {
+        return Err(SketchOpError::InvalidParameter {
+            op: OP,
+            parameter: "count",
+            reason: format!("need at least 2 florets (got {count})"),
+        });
+    }
+    if !spacing.is_finite() || spacing < OP_EPS {
+        return Err(SketchOpError::InvalidParameter {
+            op: OP,
+            parameter: "spacing",
+            reason: format!("the Vogel constant c must be finite and positive (got {spacing})"),
+        });
+    }
+    let center_pos = sketch
+        .get_point(center)
+        .ok_or_else(|| SketchOpError::EntityNotFound {
+            op: OP,
+            entity: center.to_string(),
+        })?;
+    validate_pattern_sources(sketch, sources, OP)?;
+    // Every source anchor must be off-center: the anchor direction IS
+    // the spiral's phase reference.
+    for source in sources {
+        let anchor_pos = match source {
+            EntityRef::Point(id) => sketch.get_point(id),
+            EntityRef::Circle(id) => sketch.circle_center_position(id),
+            _ => None,
+        };
+        let Some(pos) = anchor_pos else {
+            return Err(SketchOpError::EntityNotFound {
+                op: OP,
+                entity: source.to_string(),
+            });
+        };
+        if pos.distance_to(&center_pos) < OP_EPS {
+            return Err(SketchOpError::InvalidParameter {
+                op: OP,
+                parameter: "center",
+                reason: format!("{source} coincides with the spiral center"),
+            });
+        }
+    }
+
+    let gamma = golden_angle_rad();
+    let mut outcome = SketchOpOutcome::new(SketchOpKind::PhyllotaxisPattern);
+    for source in sources {
+        let (anchor_id, circle_source) = pattern_anchor(
+            sketch,
+            source,
+            SketchOpKind::PhyllotaxisPattern,
+            OP,
+            &mut outcome,
+        )?;
+        let anchor_pos =
+            sketch
+                .get_point(&anchor_id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op: OP,
+                    entity: anchor_id.to_string(),
+                })?;
+        let source_radius = match circle_source {
+            Some(EntityRef::Circle(id)) => sketch.circles().get(&id).map(|e| e.circle.radius),
+            _ => None,
+        };
+        let theta1 = (anchor_pos.y - center_pos.y).atan2(anchor_pos.x - center_pos.x);
+
+        // Floret 1 = the source: hold it on its Vogel radius.
+        mint_constraint(
+            sketch,
+            Constraint::new_dimensional(
+                DimensionalConstraint::Distance(spacing),
+                vec![EntityRef::Point(*center), EntityRef::Point(anchor_id)],
+                ConstraintPriority::High,
+            ),
+            &mut outcome,
+        );
+        let spoke1 = sketch.add_line(*center, anchor_id)?;
+        sketch.set_construction(&EntityRef::Line(spoke1), true)?;
+        record_created(
+            sketch,
+            EntityRef::Line(spoke1),
+            SketchOpKind::PhyllotaxisPattern,
+            Some(*source),
+            None,
+            &mut outcome,
+        );
+
+        let mut prev_spoke = spoke1;
+        let mut prev_circle = circle_source;
+        for n in 2..=count {
+            let n_f = n as f64;
+            let r_n = spacing * n_f.sqrt();
+            let theta_n = theta1 + (n_f - 1.0) * gamma;
+            let pos = Point2d::new(
+                center_pos.x + r_n * theta_n.cos(),
+                center_pos.y + r_n * theta_n.sin(),
+            );
+            let pn = mint_point(
+                sketch,
+                pos,
+                SketchOpKind::PhyllotaxisPattern,
+                Some(*source),
+                Some(n),
+                &mut outcome,
+            );
+            let spoke = sketch.add_line(*center, pn)?;
+            sketch.set_construction(&EntityRef::Line(spoke), true)?;
+            record_created(
+                sketch,
+                EntityRef::Line(spoke),
+                SketchOpKind::PhyllotaxisPattern,
+                Some(*source),
+                Some(n),
+                &mut outcome,
+            );
+            mint_constraint(
+                sketch,
+                Constraint::new_dimensional(
+                    DimensionalConstraint::Distance(r_n),
+                    vec![EntityRef::Point(*center), EntityRef::Point(pn)],
+                    ConstraintPriority::High,
+                ),
+                &mut outcome,
+            );
+            mint_constraint(
+                sketch,
+                Constraint::new_dimensional(
+                    DimensionalConstraint::Angle(gamma),
+                    vec![EntityRef::Line(prev_spoke), EntityRef::Line(spoke)],
+                    ConstraintPriority::High,
+                ),
+                &mut outcome,
+            );
+
+            if let (Some(prev), Some(r)) = (prev_circle, source_radius) {
+                let cn = sketch.add_circle_centered(pn, r)?;
+                record_created(
+                    sketch,
+                    EntityRef::Circle(cn),
+                    SketchOpKind::PhyllotaxisPattern,
+                    Some(*source),
+                    Some(n),
+                    &mut outcome,
+                );
+                mint_constraint(
+                    sketch,
+                    Constraint::new_geometric(
+                        GeometricConstraint::Equal,
+                        vec![prev, EntityRef::Circle(cn)],
+                        ConstraintPriority::High,
+                    ),
+                    &mut outcome,
+                );
+                prev_circle = Some(EntityRef::Circle(cn));
+            }
+            prev_spoke = spoke;
+        }
+    }
+    Ok(outcome)
+}
+
+/// Sampled arc-length parameterisation of a pattern rail: cumulative
+/// chord table over the rail's native parameter. PLACEMENT machinery
+/// only — the maintained truth is the minted constraints
+/// (`PointOnCurve` holds instances exactly on the live rail; the
+/// chained `Distance` values are exact scalars measured at
+/// placement). 512 spans keep the placement error far below solver
+/// tolerance for any rail the constraints can subsequently tighten.
+struct RailTable {
+    /// (cumulative_arc_length, parameter) knots, ascending.
+    knots: Vec<(f64, f64)>,
+    total: f64,
+}
+
+impl RailTable {
+    const SPANS: usize = 512;
+
+    fn for_spline(spline: &super::Spline2d) -> Result<Self, SketchOpError> {
+        const OP: &str = "curve_pattern";
+        let (u0, u1) = spline.parameter_range();
+        let mut knots = Vec::with_capacity(Self::SPANS + 1);
+        let mut total = 0.0;
+        let mut prev = spline
+            .evaluate(u0)
+            .map_err(|e| SketchOpError::Unsupported {
+                op: OP,
+                reason: format!("rail spline does not evaluate: {e}"),
+            })?;
+        knots.push((0.0, u0));
+        for i in 1..=Self::SPANS {
+            let u = u0 + (u1 - u0) * (i as f64) / (Self::SPANS as f64);
+            let p = spline.evaluate(u).map_err(|e| SketchOpError::Unsupported {
+                op: OP,
+                reason: format!("rail spline does not evaluate: {e}"),
+            })?;
+            total += prev.distance_to(&p);
+            knots.push((total, u));
+            prev = p;
+        }
+        Ok(Self { knots, total })
+    }
+
+    /// Parameter at arc length `s` (linear interpolation between
+    /// table knots; `s` must be within `[0, total]`).
+    fn parameter_at(&self, s: f64) -> f64 {
+        let s = s.clamp(0.0, self.total);
+        match self
+            .knots
+            .binary_search_by(|(len, _)| len.partial_cmp(&s).unwrap_or(std::cmp::Ordering::Less))
+        {
+            Ok(i) => self.knots[i].1,
+            Err(i) => {
+                if i == 0 {
+                    return self.knots[0].1;
+                }
+                if i >= self.knots.len() {
+                    return self.knots[self.knots.len() - 1].1;
+                }
+                let (s0, u0) = self.knots[i - 1];
+                let (s1, u1) = self.knots[i];
+                if s1 - s0 < OP_EPS {
+                    u0
+                } else {
+                    u0 + (u1 - u0) * (s - s0) / (s1 - s0)
+                }
+            }
+        }
+    }
+}
+
+/// Pattern along a curve: `count` total instances per source
+/// (source = instance 0) stepped along a spline or arc rail at
+/// arc-length intervals from the source anchor's closest point.
+///
+/// - `spacing = Some(d)` — arc-length step `d`; the run must fit the
+///   rail's remaining length (typed `InvalidParameter` otherwise).
+/// - `spacing = None` — the remaining length is divided evenly.
+///
+/// Maintenance: every instance gets `PointOnCurve` on the rail plus a
+/// chained `Distance` to its predecessor whose value is the CHORD
+/// measured at placement (documented honestly: arc-length spacing is
+/// the placement rule; the maintained invariant is on-rail contact +
+/// chord distances, which is what the 2D solver can hold exactly).
+/// Circle sources add the `Equal`-radius chain. Rails may be
+/// construction geometry (a guide spline that never enters the
+/// profile). Supported rails: splines and arcs — other kinds refuse
+/// typed.
+pub fn curve_pattern(
+    sketch: &Sketch,
+    sources: &[EntityRef],
+    rail: &EntityRef,
+    count: usize,
+    spacing: Option<f64>,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "curve_pattern";
+    if count < 2 {
+        return Err(SketchOpError::InvalidParameter {
+            op: OP,
+            parameter: "count",
+            reason: format!("need at least 2 instances (got {count})"),
+        });
+    }
+    if let Some(d) = spacing {
+        if !d.is_finite() || d < OP_EPS {
+            return Err(SketchOpError::InvalidParameter {
+                op: OP,
+                parameter: "spacing",
+                reason: format!("must be finite and positive (got {d})"),
+            });
+        }
+    }
+    validate_pattern_sources(sketch, sources, OP)?;
+
+    // Rail geometry: a position function over an arc-length domain.
+    enum Rail {
+        Spline(super::Spline2d, RailTable),
+        Arc { arc: Arc2d },
+    }
+    let rail_geom = match rail {
+        EntityRef::Spline(id) => {
+            let entry = sketch
+                .splines()
+                .get(id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op: OP,
+                    entity: rail.to_string(),
+                })?;
+            let spline = entry.value().spline.clone();
+            drop(entry);
+            let table = RailTable::for_spline(&spline)?;
+            Rail::Spline(spline, table)
+        }
+        EntityRef::Arc(id) => {
+            let entry = sketch
+                .arcs()
+                .get(id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op: OP,
+                    entity: rail.to_string(),
+                })?;
+            Rail::Arc {
+                arc: entry.value().arc,
+            }
+        }
+        other => {
+            return Err(SketchOpError::Unsupported {
+                op: OP,
+                reason: format!(
+                    "{other} is not a supported rail — curve patterns run along \
+                     splines and arcs"
+                ),
+            })
+        }
+    };
+    let rail_length = match &rail_geom {
+        Rail::Spline(_, table) => table.total,
+        Rail::Arc { arc } => arc.radius * arc.sweep_angle().abs(),
+    };
+    let position_at = |s: f64| -> Point2d {
+        match &rail_geom {
+            Rail::Spline(spline, table) => {
+                let u = table.parameter_at(s);
+                spline
+                    .evaluate(u)
+                    .unwrap_or(Point2d::new(f64::NAN, f64::NAN))
+            }
+            Rail::Arc { arc } => {
+                let dir = if arc.ccw { 1.0 } else { -1.0 };
+                let angle = arc.start_angle + dir * s / arc.radius;
+                Point2d::new(
+                    arc.center.x + arc.radius * angle.cos(),
+                    arc.center.y + arc.radius * angle.sin(),
+                )
+            }
+        }
+    };
+    // Closest arc length of a point on the rail (dense scan over the
+    // same table resolution — placement machinery only).
+    let closest_arc_length = |p: &Point2d| -> f64 {
+        let mut best_s = 0.0;
+        let mut best_d = f64::INFINITY;
+        let samples = 512;
+        for i in 0..=samples {
+            let s = rail_length * (i as f64) / (samples as f64);
+            let q = position_at(s);
+            let d = (q.x - p.x).powi(2) + (q.y - p.y).powi(2);
+            if d < best_d {
+                best_d = d;
+                best_s = s;
+            }
+        }
+        best_s
+    };
+
+    // Validate the fit for EVERY source before mutating anything.
+    let mut plans: Vec<(EntityRef, f64)> = Vec::with_capacity(sources.len());
+    for source in sources {
+        let anchor_pos = match source {
+            EntityRef::Point(id) => sketch.get_point(id),
+            EntityRef::Circle(id) => sketch.circle_center_position(id),
+            _ => None,
+        };
+        let Some(pos) = anchor_pos else {
+            return Err(SketchOpError::EntityNotFound {
+                op: OP,
+                entity: source.to_string(),
+            });
+        };
+        let s0 = closest_arc_length(&pos);
+        let step = match spacing {
+            Some(d) => d,
+            None => (rail_length - s0) / (count as f64 - 1.0),
+        };
+        let end = s0 + step * (count as f64 - 1.0);
+        if step < OP_EPS || end > rail_length + OP_EPS {
+            return Err(SketchOpError::InvalidParameter {
+                op: OP,
+                parameter: "spacing",
+                reason: format!(
+                    "{count} instances at step {step:.6} from arc length {s0:.6} need \
+                     {end:.6} of rail, but the rail is {rail_length:.6} long"
+                ),
+            });
+        }
+        plans.push((*source, s0));
+    }
+
+    let mut outcome = SketchOpOutcome::new(SketchOpKind::CurvePattern);
+    for (source, s0) in plans {
+        let (anchor_id, circle_source) = pattern_anchor(
+            sketch,
+            &source,
+            SketchOpKind::CurvePattern,
+            OP,
+            &mut outcome,
+        )?;
+        let source_radius = match circle_source {
+            Some(EntityRef::Circle(id)) => sketch.circles().get(&id).map(|e| e.circle.radius),
+            _ => None,
+        };
+        let step = match spacing {
+            Some(d) => d,
+            None => (rail_length - s0) / (count as f64 - 1.0),
+        };
+
+        // The first chord is measured from the anchor's ACTUAL
+        // position (the source is untouched by the op and need not
+        // sit on the rail) so every minted Distance is exactly
+        // satisfied at placement.
+        let anchor_actual =
+            sketch
+                .get_point(&anchor_id)
+                .ok_or_else(|| SketchOpError::EntityNotFound {
+                    op: OP,
+                    entity: anchor_id.to_string(),
+                })?;
+        let mut prev_point = anchor_id;
+        let mut prev_pos = anchor_actual;
+        let mut prev_circle = circle_source;
+        for k in 1..count {
+            let pos = position_at(s0 + step * k as f64);
+            if !pos.x.is_finite() || !pos.y.is_finite() {
+                return Err(SketchOpError::Unsupported {
+                    op: OP,
+                    reason: "rail evaluation failed during placement".to_string(),
+                });
+            }
+            let pk = mint_point(
+                sketch,
+                pos,
+                SketchOpKind::CurvePattern,
+                Some(source),
+                Some(k),
+                &mut outcome,
+            );
+            mint_constraint(sketch, point_on_curve(pk, *rail), &mut outcome);
+            let chord = prev_pos.distance_to(&pos);
+            mint_constraint(
+                sketch,
+                Constraint::new_dimensional(
+                    DimensionalConstraint::Distance(chord),
+                    vec![EntityRef::Point(prev_point), EntityRef::Point(pk)],
+                    ConstraintPriority::High,
+                ),
+                &mut outcome,
+            );
+            if let (Some(prev), Some(r)) = (prev_circle, source_radius) {
+                let ck = sketch.add_circle_centered(pk, r)?;
+                record_created(
+                    sketch,
+                    EntityRef::Circle(ck),
+                    SketchOpKind::CurvePattern,
+                    Some(source),
+                    Some(k),
+                    &mut outcome,
+                );
+                mint_constraint(
+                    sketch,
+                    Constraint::new_geometric(
+                        GeometricConstraint::Equal,
+                        vec![prev, EntityRef::Circle(ck)],
+                        ConstraintPriority::High,
+                    ),
+                    &mut outcome,
+                );
+                prev_circle = Some(EntityRef::Circle(ck));
+            }
+            prev_point = pk;
+            prev_pos = pos;
         }
     }
     Ok(outcome)

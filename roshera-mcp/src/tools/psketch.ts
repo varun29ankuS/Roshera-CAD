@@ -25,11 +25,24 @@ export function registerPsketchTools(server: McpServer) {
     "psketch_add",
     "Add an entity. kind=point {x,y,fixed?}, line {start,end point uuids}, " +
       "circle {cx,cy,radius}, arc {cx,cy,radius,start_angle,end_angle}, " +
-      "rectangle {x1,y1,x2,y2}, polyline {points[[x,y]...],closed}. Returns " +
-      "the entity id.",
+      "rectangle {x1,y1,x2,y2}, polyline {points[[x,y]...],closed}, " +
+      "spline {degree, control_point_ids:[point uuids]} — SHARED control " +
+      "points: the spline is a solver citizen (drag/constrain the points, " +
+      "zero phantom DOF; clamped, interpolates first/last CP — weld organic " +
+      "joins by reusing profile vertices as end CPs; optional weights[] for " +
+      "rational NURBS). Raw form {degree, control_points[[x,y]...], knots[]} " +
+      "also accepted. Returns the entity id.",
     {
       csketch_id: z.string().uuid(),
-      kind: z.enum(["point", "line", "circle", "arc", "rectangle", "polyline"]),
+      kind: z.enum([
+        "point",
+        "line",
+        "circle",
+        "arc",
+        "rectangle",
+        "polyline",
+        "spline",
+      ]),
       params: z.record(z.unknown()),
     },
     async ({ csketch_id, kind, params }) => {
@@ -45,9 +58,16 @@ export function registerPsketchTools(server: McpServer) {
   server.tool(
     "psketch_constrain",
     "Add a constraint. geometric: Horizontal/Vertical/Parallel/Perpendicular/" +
-      "Coincident/Tangent/Concentric/Equal on entities. dimensional: " +
-      "{Distance: 80.0} / {Radius: 6.0} / {Angle: 1.57}. entities = " +
-      "[{Line: uuid}] or [{Point: uuid}, {Point: uuid}] …",
+      "Coincident/Tangent/Concentric/Equal on entities; CONTINUITY (organic): " +
+      "SmoothTangent = G1 (tangent direction) and CurvatureContinuity = G2 " +
+      "(tangent + traversal-signed curvature) between any curve pair at their " +
+      "join — [{Line: uuid}, {Spline: uuid}] etc.; CurvatureExtremum on " +
+      "[{Spline: uuid}, {Point: uuid}] holds the point at stationary " +
+      "curvature (the apex). dimensional: {Distance: 80.0} / {Radius: 6.0} / " +
+      "{Angle: 1.57}; {Curvature: k} on [curve] or at a point's foot on " +
+      "[curve, point]. entities = [{Line: uuid}] or [{Point: uuid}, " +
+      "{Point: uuid}] … The certificate reports MEASURED continuity " +
+      "deviations per join (psketch_certify → continuity).",
     {
       csketch_id: z.string().uuid(),
       constraint_type: z.record(z.unknown()),
@@ -138,7 +158,13 @@ export function registerPsketchTools(server: McpServer) {
       "{entities:[EntityRef], axis: uuid of a CONSTRUCTION line}; " +
       "linear_pattern {entities, count (total incl. source), dx, dy}; " +
       "circular_pattern {entities, center: uuid | center_position:[x,y], " +
-      "count, angle_step (rad)}; construction {entity: EntityRef, " +
+      "count, angle_step (rad)}; curve_pattern {entities, rail: EntityRef " +
+      "(spline/arc, may be construction), count, spacing? (arc-length; " +
+      "omit = fill evenly)} — instances held ON the rail; " +
+      "phyllotaxis_pattern {entities, center: uuid | center_position:[x,y], " +
+      "count (florets incl. source), spacing (c in r=c*sqrt(n))} — Vogel " +
+      "spiral at the EXACT golden angle (137.5078°), the biomimetic seed " +
+      "arrangement; construction {entity: EntityRef, " +
       "is_construction: bool}. Returns the typed outcome (created/deleted " +
       "entities, minted constraints, provenance) + a fresh certificate " +
       "digest. Refusals are typed (details.kind).",
@@ -151,6 +177,8 @@ export function registerPsketchTools(server: McpServer) {
         "mirror",
         "linear_pattern",
         "circular_pattern",
+        "curve_pattern",
+        "phyllotaxis_pattern",
         "construction",
       ]),
       params: z.record(z.unknown()),
@@ -164,6 +192,8 @@ export function registerPsketchTools(server: McpServer) {
           mirror: ["POST", "mirror"],
           linear_pattern: ["POST", "pattern/linear"],
           circular_pattern: ["POST", "pattern/circular"],
+          curve_pattern: ["POST", "pattern/curve"],
+          phyllotaxis_pattern: ["POST", "pattern/phyllotaxis"],
           construction: ["PATCH", "construction"],
         };
         const [method, path] = route[op];

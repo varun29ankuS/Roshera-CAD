@@ -8088,6 +8088,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(csketch::circular_pattern_op),
         )
         .route(
+            "/api/csketch/{id}/pattern/curve",
+            post(csketch::curve_pattern_op),
+        )
+        .route(
+            "/api/csketch/{id}/pattern/phyllotaxis",
+            post(csketch::phyllotaxis_pattern_op),
+        )
+        .route(
             "/api/csketch/{id}/construction",
             axum::routing::patch(csketch::set_construction_op),
         )
