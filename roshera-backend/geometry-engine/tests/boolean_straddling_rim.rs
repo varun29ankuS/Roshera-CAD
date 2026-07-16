@@ -366,6 +366,119 @@ fn f7_straddling_offset_12_no_duplicate_fans() {
     );
 }
 
+// ───────────── #46 structural pins: the two DIFFERENCE-side roots ─────────────
+//
+// A ROSHERA_BOOL_TRACE re-characterization on the post-cap-merge topology
+// (2026-07-16) localized the flat bnd=302 / offset-dependent nm residual to two
+// INDEPENDENT difference-side defects, both pinned here on the REAL fixture:
+//
+//  A. BOSS-LATERAL VANISHES (the 300 bnd segs at z≈20 + 2 at z≈15): the union
+//     now correctly trims the boss lateral to z∈[10,20]; the difference splits
+//     it into the in-bore sector (two seam-halves, correctly culled) plus the
+//     BIG ~301° complement fragment. That fragment's interior point is computed
+//     as boundary-edge-midpoint centroid → `closest_point` projection; the two
+//     SSI-vertical midpoints at x=13.05 dominate the centroid (≈(1.5,0,15)), so
+//     the projection lands at θ=0 → (15,0,15) — INSIDE the culled in-bore
+//     sector. The whole remaining boss wall classifies Inside and is dropped,
+//     leaving the boss-top crescent's outer r15 rim (300 segs) and the two
+//     z∈[10,20] SSI verticals (2 segs) unpaired.
+//
+//  B. PHANTOM MATERIAL INSIDE THE PLATE-TOP HOLE (the nm class): the z=10 bore
+//     rim (curve 37) is imprinted on the plate-top annulus UNCLIPPED. Its −x
+//     sub-arcs lie inside the annulus's r15 hole — not on face material — and
+//     the clip-to-face pass keeps them because `is_point_in_face` tests only
+//     the OUTER loop. The arrangement then walks overlapping cells: a kept
+//     fragment wholly inside the hole (interior point (12,8.4,10), r≈14.65<15)
+//     plus inner loops triple-sharing the in-hole arc edges (the nm=248 class).
+//
+// Both tests are derived from the traced real topology and stay on the real
+// fixture (minimal repro ≠ real topology).
+
+/// #46 pin A: the difference result must still CARRY the boss lateral — at
+/// least one kept face lies on the r15 cylinder about the origin. Before the
+/// interior-point repair the big complement fragment is mis-culled and the
+/// count is ZERO (all three r15 fragments classify Inside).
+#[test]
+fn f7_straddling_offset_10_keeps_boss_lateral_wall() {
+    use geometry_engine::primitives::surface::Cylinder;
+    let mut m = BRepModel::new();
+    let r = straddling_bore_result(&mut m, 10.0);
+    let solid = m.solids.get(r).expect("difference solid");
+    let shell = m.shells.get(solid.outer_shell).expect("outer shell");
+    let mut boss_wall_faces = 0usize;
+    for &fid in &shell.faces {
+        let face = m.faces.get(fid).expect("face");
+        let Some(surf) = m.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if let Some(cyl) = surf.as_any().downcast_ref::<Cylinder>() {
+            // The boss wall: r=15 about the world origin, axis ‖ Z. (The bore
+            // wall is r=8 about (10,0,−3) — excluded by the radius test.)
+            if (cyl.radius - 15.0).abs() < 1e-6
+                && cyl.origin.x.abs() < 1e-6
+                && cyl.origin.y.abs() < 1e-6
+                && cyl.axis.z.abs() > 0.99
+            {
+                boss_wall_faces += 1;
+            }
+        }
+    }
+    assert!(
+        boss_wall_faces >= 1,
+        "difference must keep the boss lateral (r15 wall outside the bore); found 0 — \
+         the ~301° complement fragment was mis-classified Inside (interior-point probe \
+         landed in the culled in-bore sector) and the whole boss wall was dropped"
+    );
+}
+
+/// #46 pin B: no kept z=10 planar face may lie ENTIRELY within the r15 boss
+/// footprint. At z=10 the region inside r15 is the boss INTERIOR (material
+/// continues above) — the plate-top annulus has a hole there, so any face whose
+/// every boundary vertex sits at radius ≤ 15+ε is phantom material manufactured
+/// from the unclipped in-hole bore-rim arcs. The legitimate annulus fragment
+/// always reaches the 60×60 outer square (r≈42) and never trips this.
+#[test]
+fn f7_straddling_offset_10_no_phantom_face_in_plate_top_hole() {
+    let mut m = BRepModel::new();
+    let r = straddling_bore_result(&mut m, 10.0);
+    let solid = m.solids.get(r).expect("difference solid");
+    let shell = m.shells.get(solid.outer_shell).expect("outer shell");
+    let mut phantom: Vec<u32> = Vec::new();
+    for &fid in &shell.faces {
+        let face = m.faces.get(fid).expect("face");
+        let mut all_z10 = true;
+        let mut all_within_r15 = true;
+        let mut any_vertex = false;
+        for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+            let l = m.loops.get(lid).expect("loop");
+            for &eid in &l.edges {
+                let e = m.edges.get(eid).expect("edge");
+                for vid in [e.start_vertex, e.end_vertex] {
+                    let p = m.vertices.get_position(vid).expect("vertex");
+                    any_vertex = true;
+                    if (p[2] - 10.0).abs() > 1e-6 {
+                        all_z10 = false;
+                    }
+                    if (p[0] * p[0] + p[1] * p[1]).sqrt() > 15.0 + 1e-4 {
+                        all_within_r15 = false;
+                    }
+                }
+            }
+        }
+        if any_vertex && all_z10 && all_within_r15 {
+            phantom.push(fid);
+        }
+    }
+    assert!(
+        phantom.is_empty(),
+        "found {} kept z=10 face(s) entirely inside the r15 boss footprint {:?} — \
+         phantom material walked from the unclipped in-hole bore-rim arcs (the \
+         clip-to-face pass must drop cut arcs lying inside a pre-existing hole)",
+        phantom.len(),
+        phantom,
+    );
+}
+
 #[test]
 #[ignore = "diagnostic: z-histogram of the difference leak"]
 fn f7_leak_zhistogram_offset_10() {
