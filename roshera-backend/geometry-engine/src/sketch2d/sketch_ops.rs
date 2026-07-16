@@ -1179,45 +1179,12 @@ pub fn offset(
     // Multi-edge loop. Signed offset along the LEFT of travel: for a
     // CCW walk the interior is left, so outward = −distance to the
     // left; for a CW walk outward = +distance to the left. The walk
-    // winding is computed HERE from the typed edges' chord shoelace —
-    // `SketchLoop::is_ccw` deliberately preserves a legacy
-    // trapezoid-sign convention (positive == clockwise; see
-    // `loop_is_ccw`) and must not be read as geometric winding.
-    let mut area2 = 0.0;
-    for edge in &typed {
-        let (s, e) = match edge {
-            ProfileEdge::Line { start, end } => (*start, *end),
-            ProfileEdge::Arc {
-                center,
-                radius,
-                start_angle,
-                end_angle,
-                ..
-            } => (
-                [
-                    center[0] + radius * start_angle.cos(),
-                    center[1] + radius * start_angle.sin(),
-                ],
-                [
-                    center[0] + radius * end_angle.cos(),
-                    center[1] + radius * end_angle.sin(),
-                ],
-            ),
-            ProfileEdge::Circle { .. } => continue, // refused above
-            // Unreachable for offset v1 — spline loop edges refuse at
-            // the entity-kind gate above (NURBS offset approximation
-            // is out of scope; typed refusal). The defensive chord
-            // keeps the shoelace total if that gate ever moves.
-            ProfileEdge::Nurbs { control_points, .. } => {
-                match (control_points.first(), control_points.last()) {
-                    (Some(first), Some(last)) => (*first, *last),
-                    _ => continue,
-                }
-            }
-        };
-        area2 += s[0] * e[1] - e[0] * s[1];
-    }
-    let walk_ccw = area2 > 0.0;
+    // winding is `SketchLoop::is_ccw` — geometric truth since the
+    // follow-ups-A root fix (exact predicate over the walk polygon
+    // threaded with the curved edges' interior witnesses), so the op
+    // no longer computes its own shoelace to dodge the legacy
+    // inverted convention.
+    let walk_ccw = sketch_loop.is_ccw;
     let delta_left = if walk_ccw { -distance } else { distance };
 
     // 1. Offset every edge along its normal (no corners yet).

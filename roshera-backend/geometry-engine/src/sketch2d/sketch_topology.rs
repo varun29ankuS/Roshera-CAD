@@ -55,6 +55,14 @@ pub struct TopologyEdge {
     /// containment); an arc bulges past its chord by the sagitta.
     /// `None` for line/polyline edges, whose endpoints are exact.
     pub bounds_hint: Option<(Point2d, Point2d)>,
+    /// A point strictly INTERIOR to the edge (arc midpoint, spline
+    /// mid-parameter sample) for curved edge types. Winding
+    /// classification (`loop_is_ccw`) threads it into the loop's
+    /// vertex polygon so all-curved loops — whose chord polygons
+    /// collapse (a two-arc lens has two cancelling chords) — still
+    /// classify exactly. `None` for straight edges, whose endpoints
+    /// already carry the geometry (SKETCH-DCM #45 follow-ups A).
+    pub interior_hint: Option<Point2d>,
 }
 
 /// A vertex in the topology graph
@@ -78,9 +86,19 @@ pub struct SketchLoop {
     /// order alone is not enough to materialise the boundary —
     /// consumers MUST orient each edge's samples by this flag.
     pub orientations: Vec<bool>,
-    /// Whether the loop is oriented counter-clockwise
+    /// Whether the walk is oriented GEOMETRICALLY counter-clockwise.
+    /// This is true winding (SKETCH-DCM #45 follow-ups A fixed the
+    /// legacy inverted trapezoid-sign convention at the root): the
+    /// classification is exact-predicate-based over the walk's vertex
+    /// polygon threaded with the curved edges' interior witnesses, so
+    /// all-arc loops classify correctly too. Single-edge closed loops
+    /// (full circle / ellipse / closed spline) have no walk direction
+    /// of their own and report `true` — kernel curves are
+    /// parameterised CCW.
     pub is_ccw: bool,
-    /// Area enclosed by the loop (positive for CCW)
+    /// ABSOLUTE area enclosed by the loop (chord-polygon measure with
+    /// a bounds fallback for single-edge loops; winding-independent —
+    /// use `is_ccw` for orientation).
     pub area: f64,
     /// Bounding box of the loop
     pub bounds: (Point2d, Point2d),
@@ -219,6 +237,7 @@ impl SketchTopology {
                         forward: true,
                         param_range: Some((0.0, 1.0)),
                         bounds_hint: None,
+                        interior_hint: None,
                     });
                 }
             }
@@ -241,6 +260,7 @@ impl SketchTopology {
                 forward: true,
                 param_range: Some((arc.arc.start_angle, arc.arc.end_angle)),
                 bounds_hint: Some(arc.bounding_box()),
+                interior_hint: Some(arc.arc.midpoint()),
             });
         }
 
@@ -268,6 +288,9 @@ impl SketchTopology {
                 forward: true,
                 param_range: Some((0.0, 2.0 * std::f64::consts::PI)),
                 bounds_hint: Some(circle.bounding_box()),
+                // Single-edge closed loop: winding is set by kernel
+                // convention in `find_loops`, no witness needed.
+                interior_hint: None,
             });
         }
 
@@ -289,6 +312,7 @@ impl SketchTopology {
                     forward: true,
                     param_range: Some((i as f64, next as f64)),
                     bounds_hint: None,
+                    interior_hint: None,
                 });
             }
         }
@@ -318,6 +342,7 @@ impl SketchTopology {
                     forward: true,
                     param_range: Some((i as f64, next as f64)),
                     bounds_hint: None,
+                    interior_hint: None,
                 });
             }
         }
@@ -348,6 +373,7 @@ impl SketchTopology {
                 forward: true,
                 param_range: Some((0.0, 1.0)),
                 bounds_hint: Some(spline.bounding_box()),
+                interior_hint: spline.spline.evaluate(0.5).ok(),
             });
         }
 
@@ -368,6 +394,8 @@ impl SketchTopology {
                 forward: true,
                 param_range: Some((0.0, 2.0 * std::f64::consts::PI)),
                 bounds_hint: Some(ellipse.bounding_box()),
+                // Single-edge closed loop: CCW by kernel convention.
+                interior_hint: None,
             });
         }
 
@@ -435,7 +463,10 @@ impl SketchTopology {
             }
 
             // Single-edge closed loop: a full circle (or closed spline
-            // edge) closes onto itself and needs no walk.
+            // edge) closes onto itself and needs no walk. It has no
+            // walk direction of its own; the kernel parameterises
+            // closed curves CCW, so the loop reports that convention
+            // (pinned by `lone_circle_loop_is_ccw_by_kernel_convention`).
             let e = &self.edges[start_edge];
             if e.start.distance_to(&e.end) < 1e-6 {
                 visited_edges[start_edge] = true;
@@ -443,11 +474,10 @@ impl SketchTopology {
                 let orientations = vec![true];
                 let area = self.calculate_loop_area(&edges, &orientations);
                 let bounds = self.calculate_loop_bounds(&edges);
-                let is_ccw = self.loop_is_ccw(&edges, &orientations, area);
                 loops.push(SketchLoop {
                     edges,
                     orientations,
-                    is_ccw,
+                    is_ccw: true,
                     area: area.abs(),
                     bounds,
                 });
@@ -576,29 +606,43 @@ impl SketchTopology {
         area
     }
 
-    /// Exact loop winding (`is_ccw`), tolerance-free. `calculate_loop_area` uses
-    /// the trapezoidal form `Σ(b.x−a.x)(b.y+a.y) = −2·shoelace`, so its POSITIVE
-    /// sign corresponds to CLOCKWISE standard winding — this preserves the exact
-    /// same `area > 0.0` decision, only making the SIGN exact (robust for thin
-    /// near-degenerate loops). Degenerate loops (e.g. a single full-circle edge,
-    /// whose endpoint polygon collapses to < 3 points) fall back to the f64 area.
+    /// Exact GEOMETRIC loop winding (`is_ccw`), tolerance-free.
+    ///
+    /// The polygon fed to the exact predicate is the walk's vertex
+    /// sequence with each curved edge's `interior_hint` (arc midpoint /
+    /// spline mid-parameter sample) threaded in between its endpoints —
+    /// without the witnesses, an all-curved loop like a two-arc lens
+    /// has a degenerate chord polygon (the chords cancel) and CANNOT be
+    /// classified from vertices alone.
+    ///
+    /// History (SKETCH-DCM #45 follow-ups A): this method used to
+    /// preserve a legacy trapezoid-sign convention — `calculate_loop_area`
+    /// computes `Σ(b.x−a.x)(b.y+a.y)/2 = −shoelace`, whose POSITIVE sign
+    /// is CLOCKWISE, and the old mapping (`Clockwise => true`) kept that
+    /// inverted `area > 0.0` decision alive in a field NAMED `is_ccw`.
+    /// The convention is now geometric truth; the trapezoid fallback for
+    /// exactly-degenerate polygons is sign-corrected to match
+    /// (`area < 0.0` == CCW under the trapezoid form).
     fn loop_is_ccw(&self, loop_edges: &[usize], orientations: &[bool], area: f64) -> bool {
         use crate::math::vector2::Vector2;
         use crate::math::{signed_area_2d, Orientation};
-        let poly: Vec<Vector2> = loop_edges
-            .iter()
-            .enumerate()
-            .map(|(k, &edge_idx)| {
-                let edge = &self.edges[edge_idx];
-                let forward = orientations.get(k).copied().unwrap_or(true);
-                let p = if forward { edge.start } else { edge.end };
-                Vector2::new(p.x, p.y)
-            })
-            .collect();
+        let mut poly: Vec<Vector2> = Vec::with_capacity(loop_edges.len() * 2);
+        for (k, &edge_idx) in loop_edges.iter().enumerate() {
+            let edge = &self.edges[edge_idx];
+            let forward = orientations.get(k).copied().unwrap_or(true);
+            let p = if forward { edge.start } else { edge.end };
+            poly.push(Vector2::new(p.x, p.y));
+            // The witness lies ON the edge's point set, so it sits
+            // between the edge's endpoints in either traversal
+            // direction.
+            if let Some(w) = edge.interior_hint {
+                poly.push(Vector2::new(w.x, w.y));
+            }
+        }
         match signed_area_2d(&poly) {
-            Orientation::Clockwise => true,
-            Orientation::CounterClockwise => false,
-            Orientation::Collinear => area > 0.0,
+            Orientation::CounterClockwise => true,
+            Orientation::Clockwise => false,
+            Orientation::Collinear => area < 0.0,
         }
     }
 
