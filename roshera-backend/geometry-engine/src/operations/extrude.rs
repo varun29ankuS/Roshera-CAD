@@ -1742,30 +1742,6 @@ pub fn create_face_from_profile(
     Ok(face_id)
 }
 
-/// Create a face from a closed wire profile using a **caller-supplied
-/// host plane**.
-///
-/// This is the preferred entry point whenever the host plane is known
-/// up front — sketch sessions carry a `SketchPlane`, face-of-known-
-/// surface flows carry the existing face's surface, datum-anchored
-/// profiles carry the datum frame. In all of those cases the plane
-/// must not be re-derived from edge samples: Newell best-fit can fail
-/// (degenerate / collinear / near-zero-area polygons → `|n| < 1e-12`)
-/// even when the host plane is perfectly well-defined by construction.
-///
-/// `plane_origin` and `plane_normal` are passed verbatim to
-/// `Plane::from_point_normal`. The normal need not be unit length;
-/// the constructor normalises it. The origin can be any point on the
-/// plane (it is used as the surface parameterisation origin and does
-/// not have to coincide with the polygon centroid).
-///
-/// Behaviour is otherwise identical to [`create_face_from_profile`]:
-/// the closed-profile invariant is validated, a single outer
-/// `Loop` is built from `profile_edges` in order, and a `Face` is
-/// stamped at `FaceOrientation::Forward` against the resulting plane.
-/// Inner loops are added separately by the caller via
-/// `Face::add_inner_loop` if needed.
-
 /// One extrusion region in plane-local coordinates: an outer boundary
 /// polygon plus zero or more hole polygons. The polygons are already
 /// materialised (arcs/circles chord-sampled); every vertex is (u, v)
@@ -1776,20 +1752,40 @@ pub struct PolygonRegion {
     pub holes: Vec<Vec<[f64; 2]>>,
 }
 
+/// One boundary loop of an extrusion region, in plane-local (u, v)
+/// coordinates (SKETCH-DCM #45 Slice 5, spec §3.3).
+///
+/// `Polygon` is the materialised chord-sampled form (the legacy path,
+/// and the EXPLICIT fallback for entity kinds without an analytic
+/// lift — splines/ellipses). `Edges` carries typed analytic edges, so
+/// face construction emits TRUE circular geometry: a full-circle loop
+/// becomes one closed `Circle` edge whose extruded wall collapses to
+/// an analytic `Cylinder` (the same face `create_cylinder` emits),
+/// and arcs become true `Arc` boundary edges with exactly-swept
+/// ruled walls.
+#[derive(Debug, Clone)]
+pub enum ProfileLoop {
+    /// Chord-sampled polygon (legacy + explicit sampled fallback).
+    Polygon(Vec<[f64; 2]>),
+    /// Typed analytic edges in loop-walk order.
+    Edges(Vec<crate::sketch2d::sketch_topology::ProfileEdge>),
+}
+
+/// One extrusion region: an outer boundary loop plus zero or more hole
+/// loops, each independently polygonal or analytic.
+#[derive(Debug, Clone)]
+pub struct ProfileRegion {
+    pub outer: ProfileLoop,
+    pub holes: Vec<ProfileLoop>,
+}
+
 /// Build and extrude a set of polygon regions on an arbitrary plane
 /// frame, Union-folding multi-region results into one solid.
 ///
-/// This is the SINGLE implementation behind both the api-server's
-/// sketch→solid bridges and the timeline's `sketch_extrude` replay arm
-/// (2026-06-13): sketch extrudes were unreplayable because the only
-/// recorded event was the kernel's `extrude_face`, whose input face
-/// does not exist in a fresh replay model. Handlers now record a
-/// self-contained `sketch_extrude` event (frame + materialised region
-/// polygons + distance) and replay rebuilds it here — one code path,
-/// no drift between live behaviour and replay.
-///
-/// Frame: `lift(p) = origin + u_axis·p[0] + v_axis·p[1]`; the default
-/// extrude direction is `u_axis × v_axis`.
+/// Thin wrapper over [`extrude_profile_regions`] with every loop in
+/// the chord-sampled `Polygon` form — kept for the legacy
+/// `sketch_extrude` replay payloads and the click-draft bridge, and
+/// byte-identical in behaviour to the pre-Slice-5 implementation.
 pub fn extrude_polygon_regions(
     model: &mut BRepModel,
     origin: Point3,
@@ -1800,87 +1796,92 @@ pub fn extrude_polygon_regions(
     direction: Option<Vector3>,
     tolerance: crate::math::Tolerance,
 ) -> OperationResult<u32> {
-    use crate::primitives::curve::{ParameterRange, Polyline};
-    use crate::primitives::edge::{Edge, EdgeOrientation};
+    let typed: Vec<ProfileRegion> = regions
+        .iter()
+        .map(|r| ProfileRegion {
+            outer: ProfileLoop::Polygon(r.outer.clone()),
+            holes: r.holes.iter().cloned().map(ProfileLoop::Polygon).collect(),
+        })
+        .collect();
+    extrude_profile_regions(
+        model, origin, u_axis, v_axis, &typed, distance, direction, tolerance,
+    )
+}
+
+/// Build and extrude a set of profile regions (polygonal and/or
+/// analytic loops) on an arbitrary plane frame, Union-folding
+/// multi-region results into one solid.
+///
+/// This is the SINGLE implementation behind both the api-server's
+/// sketch→solid bridges and the timeline's `sketch_extrude` replay arm
+/// (2026-06-13): sketch extrudes were unreplayable because the only
+/// recorded event was the kernel's `extrude_face`, whose input face
+/// does not exist in a fresh replay model. Handlers record a
+/// self-contained `sketch_extrude` event (frame + per-loop polygon or
+/// typed-edge payload + distance) and replay rebuilds it here — one
+/// code path, no drift between live behaviour and replay.
+///
+/// Frame: `lift(p) = origin + u_axis·p[0] + v_axis·p[1]`; the default
+/// extrude direction is `u_axis × v_axis`.
+///
+/// Honest refusal (typed, never a silent approximation): an analytic
+/// full-circle loop is only accepted when the extrusion direction is
+/// parallel to the sketch normal — an oblique prism over a circle has
+/// no coaxial-cylinder lateral, and the generic closed ruled wall it
+/// would otherwise get is a known zero-triangle tessellation trap.
+/// Callers that want oblique extrusion sample the circle explicitly.
+#[allow(clippy::too_many_arguments)] // Reason: mirrors extrude_polygon_regions' established frame+payload signature; bundling would churn every call site (replay, csketch, click-draft) without clarifying.
+pub fn extrude_profile_regions(
+    model: &mut BRepModel,
+    origin: Point3,
+    u_axis: Vector3,
+    v_axis: Vector3,
+    regions: &[ProfileRegion],
+    distance: f64,
+    direction: Option<Vector3>,
+    tolerance: crate::math::Tolerance,
+) -> OperationResult<u32> {
     use crate::primitives::r#loop::{Loop, LoopType};
 
     if regions.is_empty() {
         return Err(OperationError::InvalidGeometry(
-            "extrude_polygon_regions: no regions supplied".to_string(),
+            "extrude_profile_regions: no regions supplied".to_string(),
         ));
     }
     let normal = u_axis.cross(&v_axis);
     let direction = direction.unwrap_or(normal);
-    let lift = |p: &[f64; 2]| -> Point3 {
-        Point3::new(
-            origin.x + u_axis.x * p[0] + v_axis.x * p[1],
-            origin.y + u_axis.y * p[0] + v_axis.y * p[1],
-            origin.z + u_axis.z * p[0] + v_axis.z * p[1],
-        )
-    };
 
-    // Closed-loop edge builder, mirroring the api-server's
-    // shared-Polyline-curve construction: one closed Polyline curve
-    // per loop, per-segment edges parameterised onto it, vertices
-    // de-duplicated through add_or_find so adjacent loops weld.
-    fn build_loop(
-        model: &mut BRepModel,
-        lifted: &[Point3],
-        tolerance: f64,
-    ) -> OperationResult<Vec<crate::primitives::edge::EdgeId>> {
-        use crate::primitives::curve::{ParameterRange, Polyline};
-        use crate::primitives::edge::{Edge, EdgeOrientation};
-        let n = lifted.len();
-        if n < 3 {
-            return Err(OperationError::InvalidGeometry(format!(
-                "polygon loop has {n} vertices (need >= 3)"
-            )));
-        }
-        let mut verts = Vec::with_capacity(n + 1);
-        verts.extend_from_slice(lifted);
-        verts.push(lifted[0]);
-        let polyline = Polyline::new(verts)
-            .map_err(|e| OperationError::InvalidGeometry(format!("polyline curve: {e:?}")))?;
-        let curve_id = model.curves.add(Box::new(polyline));
-        let n_f = n as f64;
-        let mut edges = Vec::with_capacity(n);
-        for i in 0..n {
-            let p_start = lifted[i];
-            let p_end = lifted[(i + 1) % n];
-            let v_start = model
-                .vertices
-                .add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
-            let v_end = model
-                .vertices
-                .add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
-            if v_start == v_end {
-                return Err(OperationError::InvalidGeometry(format!(
-                    "polygon vertices {i} and {} collapse under tolerance {tolerance}",
-                    (i + 1) % n
-                )));
+    let build = |model: &mut BRepModel,
+                 lp: &ProfileLoop|
+     -> OperationResult<Vec<crate::primitives::edge::EdgeId>> {
+        match lp {
+            ProfileLoop::Polygon(poly) => {
+                let lifted: Vec<Point3> = poly
+                    .iter()
+                    .map(|p| lift_plane_point(origin, u_axis, v_axis, *p))
+                    .collect();
+                build_polygon_loop(model, &lifted, tolerance.distance())
             }
-            let edge = Edge::new(
-                0,
-                v_start,
-                v_end,
-                curve_id,
-                EdgeOrientation::Forward,
-                ParameterRange::new(i as f64 / n_f, (i as f64 + 1.0) / n_f),
-            );
-            edges.push(model.edges.add(edge));
+            ProfileLoop::Edges(edges) => build_analytic_loop(
+                model,
+                origin,
+                u_axis,
+                v_axis,
+                normal,
+                direction,
+                edges,
+                tolerance.distance(),
+            ),
         }
-        Ok(edges)
-    }
+    };
 
     let mut region_solids: Vec<u32> = Vec::with_capacity(regions.len());
     for region in regions {
-        let outer_lifted: Vec<Point3> = region.outer.iter().map(&lift).collect();
-        let outer_edges = build_loop(model, &outer_lifted, tolerance.distance())?;
+        let outer_edges = build(model, &region.outer)?;
         let face_id = create_face_from_profile_with_plane(model, outer_edges, origin, normal)?;
 
         for hole in &region.holes {
-            let hole_lifted: Vec<Point3> = hole.iter().map(&lift).collect();
-            let hole_edges = build_loop(model, &hole_lifted, tolerance.distance())?;
+            let hole_edges = build(model, hole)?;
             let mut inner_loop = Loop::new(0, LoopType::Inner);
             for edge_id in &hole_edges {
                 inner_loop.add_edge(*edge_id, true);
@@ -1915,6 +1916,324 @@ pub fn extrude_polygon_regions(
     Ok(accumulator)
 }
 
+/// Lift a plane-local (u, v) point into world space:
+/// `origin + u_axis·p[0] + v_axis·p[1]`.
+#[inline]
+fn lift_plane_point(origin: Point3, u_axis: Vector3, v_axis: Vector3, p: [f64; 2]) -> Point3 {
+    Point3::new(
+        origin.x + u_axis.x * p[0] + v_axis.x * p[1],
+        origin.y + u_axis.y * p[0] + v_axis.y * p[1],
+        origin.z + u_axis.z * p[0] + v_axis.z * p[1],
+    )
+}
+
+/// Closed-loop edge builder for materialised polygons, mirroring the
+/// api-server's shared-Polyline-curve construction: one closed
+/// Polyline curve per loop, per-segment edges parameterised onto it,
+/// vertices de-duplicated through add_or_find so adjacent loops weld.
+/// (Byte-identical to the pre-Slice-5 `extrude_polygon_regions` inner
+/// builder — the polygon path's behaviour is deliberately unchanged.)
+fn build_polygon_loop(
+    model: &mut BRepModel,
+    lifted: &[Point3],
+    tolerance: f64,
+) -> OperationResult<Vec<crate::primitives::edge::EdgeId>> {
+    use crate::primitives::curve::{ParameterRange, Polyline};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    let n = lifted.len();
+    if n < 3 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "polygon loop has {n} vertices (need >= 3)"
+        )));
+    }
+    let mut verts = Vec::with_capacity(n + 1);
+    verts.extend_from_slice(lifted);
+    verts.push(lifted[0]);
+    let polyline = Polyline::new(verts)
+        .map_err(|e| OperationError::InvalidGeometry(format!("polyline curve: {e:?}")))?;
+    let curve_id = model.curves.add(Box::new(polyline));
+    let n_f = n as f64;
+    let mut edges = Vec::with_capacity(n);
+    for i in 0..n {
+        let p_start = lifted[i];
+        let p_end = lifted[(i + 1) % n];
+        let v_start = model
+            .vertices
+            .add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
+        let v_end = model
+            .vertices
+            .add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
+        if v_start == v_end {
+            return Err(OperationError::InvalidGeometry(format!(
+                "polygon vertices {i} and {} collapse under tolerance {tolerance}",
+                (i + 1) % n
+            )));
+        }
+        let edge = Edge::new(
+            0,
+            v_start,
+            v_end,
+            curve_id,
+            EdgeOrientation::Forward,
+            ParameterRange::new(i as f64 / n_f, (i as f64 + 1.0) / n_f),
+        );
+        edges.push(model.edges.add(edge));
+    }
+    Ok(edges)
+}
+
+/// Build kernel edges with TRUE analytic geometry from a typed profile
+/// loop (SKETCH-DCM #45 Slice 5, spec §3.3).
+///
+/// - `Line` → per-edge `Line` curve. Straight walls then collapse to
+///   analytic `Plane`s in `create_ruled_surface` (the B-fix path).
+/// - `Arc` → `Arc` curve with the plane's +u as its angle reference,
+///   so sketch angles map 1:1. Walls become exactly-swept ruled
+///   surfaces whose rails are true arcs.
+/// - `Circle` → ONE closed `Circle` edge (start == end at the curve's
+///   parametric-origin seam, the CDT-γ.3 invariant). The extruded wall
+///   collapses to an analytic `Cylinder` via
+///   `try_build_cylinder_from_circles` — the same lateral face
+///   `create_cylinder` emits, so booleans/fillets/STEP inherit every
+///   cylinder-hardened path (incl. `CYLINDRICAL_SURFACE`, f44e6f1).
+///
+/// Refusals (typed — callers fall back to sampling EXPLICITLY):
+/// a `Circle` edge must be its own single-edge loop, and (checked
+/// here because this builder feeds `extrude_face`) a circle loop is
+/// only accepted when `direction` is parallel to the plane normal —
+/// see [`extrude_profile_regions`].
+#[allow(clippy::too_many_arguments)] // Reason: internal helper carrying the full plane frame + extrude direction for the circle/normal refusal; a params struct would be used exactly once.
+fn build_analytic_loop(
+    model: &mut BRepModel,
+    origin: Point3,
+    u_axis: Vector3,
+    v_axis: Vector3,
+    normal: Vector3,
+    direction: Vector3,
+    edges2d: &[crate::sketch2d::sketch_topology::ProfileEdge],
+    tolerance: f64,
+) -> OperationResult<Vec<crate::primitives::edge::EdgeId>> {
+    use crate::math::consts::TWO_PI;
+    use crate::primitives::curve::{Arc, Circle, Line, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::sketch2d::sketch_topology::ProfileEdge;
+
+    if edges2d.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "analytic profile loop has no edges".to_string(),
+        ));
+    }
+
+    let finite2 = |p: &[f64; 2]| p[0].is_finite() && p[1].is_finite();
+
+    // Full-circle loop preconditions (see doc above).
+    let has_circle = edges2d
+        .iter()
+        .any(|e| matches!(e, ProfileEdge::Circle { .. }));
+    if has_circle {
+        if edges2d.len() != 1 {
+            return Err(OperationError::InvalidGeometry(
+                "a full-circle profile edge must be the only edge of its loop".to_string(),
+            ));
+        }
+        let d = direction.normalize().map_err(|e| {
+            OperationError::NumericalError(format!("extrude direction normalization: {e:?}"))
+        })?;
+        let n = normal.normalize().map_err(|e| {
+            OperationError::NumericalError(format!("plane normal normalization: {e:?}"))
+        })?;
+        if d.dot(&n).abs() < 1.0 - 1e-9 {
+            return Err(OperationError::InvalidGeometry(
+                "analytic circle profiles extrude only along the sketch plane normal \
+                 (an oblique prism over a circle has no coaxial-cylinder lateral); \
+                 sample the circle into a polygon for oblique extrusion"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let unit_normal = normal.normalize().map_err(|e| {
+        OperationError::NumericalError(format!("plane normal normalization: {e:?}"))
+    })?;
+    let unit_u = u_axis.normalize().map_err(|e| {
+        OperationError::NumericalError(format!("plane u-axis normalization: {e:?}"))
+    })?;
+
+    let mut out = Vec::with_capacity(edges2d.len());
+    for (i, e2d) in edges2d.iter().enumerate() {
+        match e2d {
+            ProfileEdge::Line { start, end } => {
+                if !finite2(start) || !finite2(end) {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: non-finite line endpoint"
+                    )));
+                }
+                let p0 = lift_plane_point(origin, u_axis, v_axis, *start);
+                let p1 = lift_plane_point(origin, u_axis, v_axis, *end);
+                let v0 = model.vertices.add_or_find(p0.x, p0.y, p0.z, tolerance);
+                let v1 = model.vertices.add_or_find(p1.x, p1.y, p1.z, tolerance);
+                if v0 == v1 {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: line endpoints collapse under tolerance {tolerance}"
+                    )));
+                }
+                let curve_id = model.curves.add(Box::new(Line::new(p0, p1)));
+                out.push(model.edges.add(Edge::new(
+                    0,
+                    v0,
+                    v1,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                )));
+            }
+            ProfileEdge::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+                ccw,
+            } => {
+                if !finite2(center)
+                    || !radius.is_finite()
+                    || *radius <= 0.0
+                    || !start_angle.is_finite()
+                    || !end_angle.is_finite()
+                {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: degenerate arc (center {center:?}, r {radius})"
+                    )));
+                }
+                // Signed sweep about +normal: CCW positive, CW
+                // negative. Equal angles (Δ below 1e-12 rad) denote a
+                // full turn — a genuinely-tiny arc has coincident
+                // endpoints and is rejected by the vertex-collapse
+                // guard below.
+                let delta = if *ccw {
+                    (end_angle - start_angle).rem_euclid(TWO_PI)
+                } else {
+                    (start_angle - end_angle).rem_euclid(TWO_PI)
+                };
+                let delta = if delta < 1e-12 { TWO_PI } else { delta };
+                let sweep = if *ccw { delta } else { -delta };
+
+                let center3 = lift_plane_point(origin, u_axis, v_axis, *center);
+                // Angle reference = the plane's +u axis, so sketch
+                // angles map 1:1 (y_axis = normal × u = +v for a
+                // right-handed orthonormal frame).
+                let arc =
+                    Arc::with_x_axis(center3, unit_normal, unit_u, *radius, *start_angle, sweep)
+                        .map_err(|e| {
+                            OperationError::NumericalError(format!(
+                                "analytic loop edge {i}: arc construction failed: {e:?}"
+                            ))
+                        })?;
+                // Endpoints from the 2D parameterisation, lifted with
+                // the SAME frame map as adjacent lines — so shared
+                // joints weld to the same vertex bit-for-bit.
+                let p_start = lift_plane_point(
+                    origin,
+                    u_axis,
+                    v_axis,
+                    [
+                        center[0] + radius * start_angle.cos(),
+                        center[1] + radius * start_angle.sin(),
+                    ],
+                );
+                let p_end = lift_plane_point(
+                    origin,
+                    u_axis,
+                    v_axis,
+                    [
+                        center[0] + radius * end_angle.cos(),
+                        center[1] + radius * end_angle.sin(),
+                    ],
+                );
+                let v0 = model
+                    .vertices
+                    .add_or_find(p_start.x, p_start.y, p_start.z, tolerance);
+                let v1 = model
+                    .vertices
+                    .add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
+                if v0 == v1 && edges2d.len() > 1 {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: arc endpoints collapse under tolerance \
+                         {tolerance} inside a multi-edge loop"
+                    )));
+                }
+                let curve_id = model.curves.add(Box::new(arc));
+                out.push(model.edges.add(Edge::new(
+                    0,
+                    v0,
+                    v1,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                )));
+            }
+            ProfileEdge::Circle { center, radius } => {
+                if !finite2(center) || !radius.is_finite() || *radius <= 0.0 {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "analytic loop edge {i}: degenerate circle (center {center:?}, r {radius})"
+                    )));
+                }
+                let center3 = lift_plane_point(origin, u_axis, v_axis, *center);
+                let circle = Circle::new(center3, unit_normal, *radius).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "analytic loop edge {i}: circle construction failed: {e:?}"
+                    ))
+                })?;
+                // Closed-curve seam invariant (CDT-γ.3): the start==end
+                // vertex MUST sit at the curve's parametric origin
+                // (t = 0 ≡ x_axis()), or the lateral face's u-sweep
+                // straddles the seam and the curved-CDT path fails.
+                let ref_dir = circle.x_axis();
+                let seam = Point3::new(
+                    center3.x + ref_dir.x * radius,
+                    center3.y + ref_dir.y * radius,
+                    center3.z + ref_dir.z * radius,
+                );
+                let v = model
+                    .vertices
+                    .add_or_find(seam.x, seam.y, seam.z, tolerance);
+                let curve_id = model.curves.add(Box::new(circle));
+                out.push(model.edges.add(Edge::new(
+                    0,
+                    v,
+                    v,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::new(0.0, 1.0),
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Create a face from a closed wire profile using a **caller-supplied
+/// host plane**.
+///
+/// This is the preferred entry point whenever the host plane is known
+/// up front — sketch sessions carry a `SketchPlane`, face-of-known-
+/// surface flows carry the existing face's surface, datum-anchored
+/// profiles carry the datum frame. In all of those cases the plane
+/// must not be re-derived from edge samples: Newell best-fit can fail
+/// (degenerate / collinear / near-zero-area polygons → `|n| < 1e-12`)
+/// even when the host plane is perfectly well-defined by construction.
+///
+/// `plane_origin` and `plane_normal` are passed verbatim to
+/// `Plane::from_point_normal`. The normal need not be unit length;
+/// the constructor normalises it. The origin can be any point on the
+/// plane (it is used as the surface parameterisation origin and does
+/// not have to coincide with the polygon centroid).
+///
+/// Behaviour is otherwise identical to [`create_face_from_profile`]:
+/// the closed-profile invariant is validated, a single outer
+/// `Loop` is built from `profile_edges` in order, and a `Face` is
+/// stamped at `FaceOrientation::Forward` against the resulting plane.
+/// Inner loops are added separately by the caller via
+/// `Face::add_inner_loop` if needed.
 pub fn create_face_from_profile_with_plane(
     model: &mut BRepModel,
     profile_edges: Vec<EdgeId>,

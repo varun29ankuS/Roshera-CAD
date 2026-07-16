@@ -1272,13 +1272,17 @@ pub struct ExtrudeCSketchRequest {
 /// 2. `ProfileExtractor::extract_for_extrusion` — outer loop + holes
 ///    per region. Invalid topology returns 422 with the issue list AND
 ///    the open endpoints, so an agent can fix its sketch surgically.
-/// 3. Each loop is sampled to a plane-local polygon (lines pass
-///    through; arcs/circles/splines/ellipses are chord-sampled at the
-///    click-draft circle resolution). Phase D of the SKETCH-DCM
-///    campaign replaces this sampling with analytic Arc/NURBS edges so
-///    extruded bores become true cylindrical faces.
-/// 4. The same face-construction + `extrude_face` + Union pipeline the
-///    click-draft extrude uses, then tessellate + broadcast.
+/// 3. Each loop is materialised ANALYTICALLY (SKETCH-DCM #45 Slice 5,
+///    spec §3.3): lines/arcs/circles become typed `ProfileEdge`s, so a
+///    circle hole extrudes to a TRUE cylindrical bore face (the same
+///    lateral `create_cylinder` emits — booleans/fillets/STEP inherit
+///    every cylinder-hardened path). Splines/ellipses, and full
+///    circles under an oblique extrusion direction, fall back to the
+///    chord-sampled polygon EXPLICITLY (counted in the response's
+///    `stats.sampled_loops`; never labeled analytic).
+/// 4. `extrude_profile_regions` — the shared kernel implementation
+///    behind live extrude AND timeline replay, then tessellate +
+///    broadcast.
 pub async fn extrude_csketch(
     State(state): State<AppState>,
     crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
@@ -1286,11 +1290,7 @@ pub async fn extrude_csketch(
     Json(req): Json<ExtrudeCSketchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::math::Tolerance;
-    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
-    use geometry_engine::operations::extrude::{
-        create_face_from_profile_with_plane, extrude_face, ExtrudeOptions,
-    };
-    use geometry_engine::primitives::r#loop::{Loop, LoopType};
+    use geometry_engine::operations::extrude::extrude_profile_regions;
     use geometry_engine::sketch2d::sketch_topology::{ProfileExtractor, SketchTopology};
     use geometry_engine::sketch2d::Tolerance2d;
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
@@ -1353,19 +1353,12 @@ pub async fn extrude_csketch(
         ));
     }
 
-    // Sample every region's loops into plane-local polygons up front
-    // (no kernel mutation yet — input errors must not leave orphan
-    // topology behind).
-    let mut regions_2d: Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> =
-        Vec::with_capacity(profiles.len());
-    for profile in &profiles {
-        let outer = sample_topology_loop(&sketch, &topology, &profile.outer_boundary)?;
-        let mut holes = Vec::with_capacity(profile.holes.len());
-        for hole in &profile.holes {
-            holes.push(sample_topology_loop(&sketch, &topology, hole)?);
-        }
-        regions_2d.push((outer, holes));
-    }
+    // Materialise every region loop up front (no kernel mutation yet —
+    // input errors must not leave orphan topology behind). Analytic
+    // typed edges wherever the entity kinds allow (SKETCH-DCM #45
+    // Slice 5); explicit chord-sampled fallback otherwise.
+    let (regions, analytic_loops, sampled_loops) =
+        materialise_profile_regions(&sketch, &topology, &profiles, direction, plane.normal())?;
 
     // Suppress the kernel's inner events (extrude_face + region
     // Unions) for the duration of the build: they are not replayable
@@ -1374,78 +1367,35 @@ pub async fn extrude_csketch(
     // `sketch_extrude` event below instead. `begin_pending` /
     // `abort_pending` share staging state across recorder clones, so
     // the model-attached recorder participates.
+    let frame_origin = plane.lift(0.0, 0.0);
+    let u_pt = plane.lift(1.0, 0.0);
+    let v_pt = plane.lift(0.0, 1.0);
+    let u_axis = geometry_engine::math::Vector3::new(
+        u_pt.x - frame_origin.x,
+        u_pt.y - frame_origin.y,
+        u_pt.z - frame_origin.z,
+    );
+    let v_axis = geometry_engine::math::Vector3::new(
+        v_pt.x - frame_origin.x,
+        v_pt.y - frame_origin.y,
+        v_pt.z - frame_origin.z,
+    );
     let suppress = RecorderSuppressGuard::new(&state.timeline_recorder);
     let build_result = {
         let mut model = model_handle.write().await;
-        let tolerance = Tolerance::default();
-        let plane_origin = plane.lift(0.0, 0.0);
-        let plane_normal = plane.normal();
-
-        let mut region_solids: Vec<u32> = Vec::with_capacity(regions_2d.len());
-        for (region_idx, (outer, holes)) in regions_2d.iter().enumerate() {
-            let outer_lifted: Vec<geometry_engine::math::Point3> =
-                outer.iter().map(|p| plane.lift(p[0], p[1])).collect();
-            let outer_edges = crate::sketch::build_loop_edges(
-                &mut model,
-                region_idx,
-                crate::sketch::SketchTool::Polyline,
-                &outer_lifted,
-                tolerance,
-            )?;
-            let face_id = create_face_from_profile_with_plane(
-                &mut model,
-                outer_edges,
-                plane_origin,
-                plane_normal,
-            )
-            .map_err(ApiError::kernel_error)?;
-
-            for hole in holes {
-                let hole_lifted: Vec<geometry_engine::math::Point3> =
-                    hole.iter().map(|p| plane.lift(p[0], p[1])).collect();
-                let hole_edges = crate::sketch::build_loop_edges(
-                    &mut model,
-                    region_idx,
-                    crate::sketch::SketchTool::Polyline,
-                    &hole_lifted,
-                    tolerance,
-                )?;
-                let mut inner_loop = Loop::new(0, LoopType::Inner);
-                for edge_id in &hole_edges {
-                    inner_loop.add_edge(*edge_id, true);
-                }
-                let inner_loop_id = model.loops.add(inner_loop);
-                let face = model.faces.get_mut(face_id).ok_or_else(|| {
-                    ApiError::new(
-                        ErrorCode::InvalidParameter,
-                        format!("face {face_id} disappeared between create_face_from_profile and add_inner_loop"),
-                    )
-                })?;
-                face.add_inner_loop(inner_loop_id);
-            }
-
-            let options = ExtrudeOptions {
-                direction,
-                distance: req.distance,
-                ..ExtrudeOptions::default()
-            };
-            let region_solid_id =
-                extrude_face(&mut model, face_id, options).map_err(ApiError::kernel_error)?;
-            region_solids.push(region_solid_id);
-        }
-
-        let mut accumulator = region_solids[0];
-        for &sid in &region_solids[1..] {
-            accumulator = boolean_operation(
-                &mut model,
-                accumulator,
-                sid,
-                BooleanOp::Union,
-                BooleanOptions::default(),
-            )
-            .map_err(ApiError::kernel_error)?;
-        }
-        Ok::<u32, ApiError>(accumulator)
+        // The SAME kernel entry the timeline replay arm uses — live
+        // and replayed builds cannot drift.
+        extrude_profile_regions(
+            &mut model,
+            frame_origin,
+            u_axis,
+            v_axis,
+            &regions,
+            req.distance,
+            Some(direction),
+            Tolerance::default(),
+        )
+        .map_err(ApiError::kernel_error)
     };
     // Close the suppression window (drop = abort_pending) before the
     // consolidated event below is recorded for real.
@@ -1453,18 +1403,22 @@ pub async fn extrude_csketch(
     let result_solid_id = build_result?;
 
     // The replayable record: everything needed to rebuild this solid
-    // from an empty model (frame + materialised region polygons),
-    // applied by `replay::dispatch_generic("sketch_extrude")` through
-    // the same kernel path. This is what makes time-scrub, undo
+    // from an empty model (frame + per-loop payloads), applied by
+    // `replay::dispatch_generic("sketch_extrude")` through the same
+    // kernel path. This is what makes time-scrub, undo
     // reconciliation, and branch exploration work for sketch-built
-    // parts.
+    // parts. Loop payloads: a plain vertex array for sampled polygons
+    // (the legacy shape, still replayable), `{"edges": [...]}` for
+    // analytic typed edges.
     use geometry_engine::operations::recorder::OperationRecorder as _;
-    let frame_origin = plane.lift(0.0, 0.0);
-    let u_pt = plane.lift(1.0, 0.0);
-    let v_pt = plane.lift(0.0, 1.0);
-    let regions_json: Vec<serde_json::Value> = regions_2d
+    let regions_json: Vec<serde_json::Value> = regions
         .iter()
-        .map(|(outer, holes)| serde_json::json!({ "outer": outer, "holes": holes }))
+        .map(|r| {
+            serde_json::json!({
+                "outer": profile_loop_json(&r.outer),
+                "holes": r.holes.iter().map(profile_loop_json).collect::<Vec<_>>(),
+            })
+        })
         .collect();
     let record = geometry_engine::operations::recorder::RecordedOperation::new("sketch_extrude")
         .with_parameters(serde_json::json!({
@@ -1509,7 +1463,7 @@ pub async fn extrude_csketch(
 
     let parameters = serde_json::json!({
         "csketch_id": id.to_string(),
-        "regions":    regions_2d.len(),
+        "regions":    regions.len(),
         "distance":   req.distance,
         "direction":  [direction.x, direction.y, direction.z],
     });
@@ -1558,12 +1512,153 @@ pub async fn extrude_csketch(
             "vertex_count":    tri_mesh.vertices.len(),
             "triangle_count":  tri_mesh.triangles.len(),
             "tessellation_ms": tessellation_ms,
-            "regions":         regions_2d.len(),
+            "regions":         regions.len(),
+            // Honest profile provenance (SKETCH-DCM #45 Slice 5): how
+            // many boundary loops carry TRUE analytic edges vs the
+            // chord-sampled fallback (splines/ellipses, or circles
+            // under an oblique direction). A sampled loop is never
+            // silently passed off as analytic.
+            "analytic_loops":  analytic_loops,
+            "sampled_loops":   sampled_loops,
         }
     })))
 }
 
-/// Materialise a topology loop into an ordered plane-local polygon.
+/// Serialise one profile loop for the `sketch_extrude` timeline event:
+/// sampled polygons keep the legacy plain-array shape (old events stay
+/// replayable, old and new readers agree); analytic loops carry
+/// `{"edges": [...]}` with the typed `ProfileEdge` wire format.
+fn profile_loop_json(lp: &geometry_engine::operations::extrude::ProfileLoop) -> serde_json::Value {
+    use geometry_engine::operations::extrude::ProfileLoop;
+    match lp {
+        ProfileLoop::Polygon(poly) => serde_json::json!(poly),
+        ProfileLoop::Edges(edges) => serde_json::json!({ "edges": edges }),
+    }
+}
+
+/// Materialise every region of an extrusion-profile set as
+/// [`ProfileLoop`]s (SKETCH-DCM #45 Slice 5, spec §3.3), returning
+/// `(regions, analytic_loop_count, sampled_loop_count)`.
+///
+/// Per loop: lines/arcs/circles extract as typed analytic edges via
+/// `ProfileExtractor::analytic_loop_edges`; loops containing entities
+/// without an analytic lift (splines/ellipses) fall back EXPLICITLY to
+/// the chord-sampled polygon, as does a full-circle loop when the
+/// extrusion direction is oblique to the sketch normal (an oblique
+/// prism over a circle has no coaxial-cylinder lateral — the kernel
+/// refuses that combination, so the route samples it up front and the
+/// caller can still extrude obliquely). The counts feed the response's
+/// `stats` so the caller always sees which loops were approximated.
+fn materialise_profile_regions(
+    sketch: &Sketch,
+    topology: &geometry_engine::sketch2d::sketch_topology::SketchTopology,
+    profiles: &[geometry_engine::sketch2d::sketch_topology::ExtrusionProfile],
+    direction: geometry_engine::math::Vector3,
+    plane_normal: geometry_engine::math::Vector3,
+) -> Result<
+    (
+        Vec<geometry_engine::operations::extrude::ProfileRegion>,
+        usize,
+        usize,
+    ),
+    ApiError,
+> {
+    use geometry_engine::operations::extrude::ProfileRegion;
+
+    let mut analytic_loops = 0usize;
+    let mut sampled_loops = 0usize;
+    let mut regions = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let outer = materialise_profile_loop(
+            sketch,
+            topology,
+            &profile.outer_boundary,
+            direction,
+            plane_normal,
+            &mut analytic_loops,
+            &mut sampled_loops,
+        )?;
+        let mut holes = Vec::with_capacity(profile.holes.len());
+        for hole in &profile.holes {
+            holes.push(materialise_profile_loop(
+                sketch,
+                topology,
+                hole,
+                direction,
+                plane_normal,
+                &mut analytic_loops,
+                &mut sampled_loops,
+            )?);
+        }
+        regions.push(ProfileRegion { outer, holes });
+    }
+    Ok((regions, analytic_loops, sampled_loops))
+}
+
+/// Materialise ONE topology loop: analytic typed edges when possible,
+/// explicit chord-sampled polygon otherwise. See
+/// [`materialise_profile_regions`] for the fallback policy.
+fn materialise_profile_loop(
+    sketch: &Sketch,
+    topology: &geometry_engine::sketch2d::sketch_topology::SketchTopology,
+    sketch_loop: &geometry_engine::sketch2d::sketch_topology::SketchLoop,
+    direction: geometry_engine::math::Vector3,
+    plane_normal: geometry_engine::math::Vector3,
+    analytic_loops: &mut usize,
+    sampled_loops: &mut usize,
+) -> Result<geometry_engine::operations::extrude::ProfileLoop, ApiError> {
+    use geometry_engine::operations::extrude::ProfileLoop;
+    use geometry_engine::sketch2d::sketch_topology::{AnalyticLoop, ProfileEdge};
+
+    let verdict =
+        geometry_engine::sketch2d::sketch_topology::ProfileExtractor::analytic_loop_edges(
+            sketch,
+            topology,
+            sketch_loop,
+        )
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+
+    match verdict {
+        AnalyticLoop::Edges(edges) => {
+            let has_circle = edges
+                .iter()
+                .any(|e| matches!(e, ProfileEdge::Circle { .. }));
+            // A degenerate (zero) direction is treated as oblique here
+            // so the loop falls back to sampling and the request fails
+            // downstream with the same direction error as before.
+            let along_normal = match (direction.normalize(), plane_normal.normalize()) {
+                (Ok(d), Ok(n)) => d.dot(&n).abs() > 1.0 - 1e-9,
+                _ => false,
+            };
+            if has_circle && !along_normal {
+                *sampled_loops += 1;
+                Ok(ProfileLoop::Polygon(sample_topology_loop(
+                    sketch,
+                    topology,
+                    sketch_loop,
+                )?))
+            } else {
+                *analytic_loops += 1;
+                Ok(ProfileLoop::Edges(edges))
+            }
+        }
+        AnalyticLoop::Unsupported { .. } => {
+            *sampled_loops += 1;
+            Ok(ProfileLoop::Polygon(sample_topology_loop(
+                sketch,
+                topology,
+                sketch_loop,
+            )?))
+        }
+    }
+}
+
+/// Materialise a topology loop into an ordered plane-local polygon —
+/// the EXPLICIT sampled fallback for loops that
+/// [`materialise_profile_loop`] cannot express analytically
+/// (splines/ellipses, or a full circle under an oblique extrusion
+/// direction). Line/arc/circle loops normally take the analytic typed
+/// path instead (SKETCH-DCM #45 Slice 5).
 ///
 /// Each directed edge contributes its samples start-inclusive /
 /// end-exclusive, so concatenating edges closes the polygon without
@@ -2484,5 +2579,134 @@ mod tests {
             p.constraint,
             geometry_engine::sketch2d::GeometricConstraint::Horizontal
         )));
+    }
+
+    // ── SKETCH-DCM #45 Slice 5: analytic profile materialisation ────
+
+    fn profile_setup(
+        sketch: &Sketch,
+    ) -> (
+        geometry_engine::sketch2d::sketch_topology::SketchTopology,
+        Vec<geometry_engine::sketch2d::sketch_topology::ExtrusionProfile>,
+    ) {
+        use geometry_engine::sketch2d::sketch_topology::{ProfileExtractor, SketchTopology};
+        use geometry_engine::sketch2d::Tolerance2d;
+        let topo = SketchTopology::analyze(sketch, &Tolerance2d::default()).expect("topology");
+        let profiles = ProfileExtractor::extract_for_extrusion(&topo).expect("profiles");
+        (topo, profiles)
+    }
+
+    /// Circle-in-rectangle extruded along the sketch normal: BOTH
+    /// loops materialise analytically — the bore hole is one typed
+    /// `Circle` edge, not a 64-gon polygon.
+    #[test]
+    fn extrude_materialises_circle_in_rectangle_analytically() {
+        use geometry_engine::math::Vector3;
+        use geometry_engine::operations::extrude::ProfileLoop;
+        use geometry_engine::sketch2d::sketch_topology::ProfileEdge;
+
+        let sketch = Sketch::new("s5".to_string(), SketchAnchor::xy());
+        sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(40.0, 30.0))
+            .expect("rectangle");
+        sketch
+            .add_circle(Point2d::new(20.0, 15.0), 6.0)
+            .expect("circle");
+        let (topo, profiles) = profile_setup(&sketch);
+
+        let (regions, analytic, sampled) =
+            materialise_profile_regions(&sketch, &topo, &profiles, Vector3::Z, Vector3::Z)
+                .expect("materialise");
+        assert_eq!((analytic, sampled), (2, 0), "both loops analytic");
+        assert_eq!(regions.len(), 1);
+        let region = regions.first().expect("one region");
+        match &region.outer {
+            ProfileLoop::Edges(edges) => assert_eq!(edges.len(), 4, "4 line edges"),
+            ProfileLoop::Polygon(_) => panic!("outer loop must be analytic"),
+        }
+        match region.holes.first().expect("one hole") {
+            ProfileLoop::Edges(edges) => {
+                assert_eq!(edges.len(), 1);
+                match edges.first().expect("one edge") {
+                    ProfileEdge::Circle { center, radius } => {
+                        assert_eq!(*center, [20.0, 15.0], "exact centre");
+                        assert_eq!(*radius, 6.0, "exact radius");
+                    }
+                    other => panic!("bore hole must be ONE exact typed circle, got {other:?}"),
+                }
+            }
+            ProfileLoop::Polygon(p) => {
+                panic!("bore hole must be analytic, got a {}-gon polygon", p.len())
+            }
+        }
+    }
+
+    /// Oblique extrusion direction: the circle loop falls back to the
+    /// EXPLICIT sampled polygon (counted in `sampled_loops`) because
+    /// an oblique prism over a circle has no coaxial-cylinder lateral;
+    /// the straight rectangle loop stays analytic.
+    #[test]
+    fn extrude_oblique_direction_samples_circle_loop_explicitly() {
+        use geometry_engine::math::Vector3;
+        use geometry_engine::operations::extrude::ProfileLoop;
+
+        let sketch = Sketch::new("s5-oblique".to_string(), SketchAnchor::xy());
+        sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(40.0, 30.0))
+            .expect("rectangle");
+        sketch
+            .add_circle(Point2d::new(20.0, 15.0), 6.0)
+            .expect("circle");
+        let (topo, profiles) = profile_setup(&sketch);
+
+        let oblique = Vector3::new(0.3, 0.0, 1.0);
+        let (regions, analytic, sampled) =
+            materialise_profile_regions(&sketch, &topo, &profiles, oblique, Vector3::Z)
+                .expect("materialise");
+        assert_eq!(
+            (analytic, sampled),
+            (1, 1),
+            "rectangle analytic, circle sampled under oblique direction"
+        );
+        match regions
+            .first()
+            .expect("one region")
+            .holes
+            .first()
+            .expect("one hole")
+        {
+            ProfileLoop::Polygon(p) => assert_eq!(
+                p.len(),
+                64,
+                "sampled circle fallback keeps the 64-seg/turn resolution"
+            ),
+            ProfileLoop::Edges(_) => {
+                panic!("oblique circle loop must fall back to the sampled polygon")
+            }
+        }
+    }
+
+    /// Entity kinds without an analytic lift (here: an ellipse) fall
+    /// back to sampling EXPLICITLY — the route keeps working and the
+    /// count is honest.
+    #[test]
+    fn extrude_ellipse_loop_falls_back_to_sampled_polygon() {
+        use geometry_engine::math::Vector3;
+        use geometry_engine::operations::extrude::ProfileLoop;
+
+        let sketch = Sketch::new("s5-ellipse".to_string(), SketchAnchor::xy());
+        sketch
+            .add_ellipse(Point2d::new(0.0, 0.0), 8.0, 5.0, 0.0)
+            .expect("ellipse");
+        let (topo, profiles) = profile_setup(&sketch);
+
+        let (regions, analytic, sampled) =
+            materialise_profile_regions(&sketch, &topo, &profiles, Vector3::Z, Vector3::Z)
+                .expect("materialise");
+        assert_eq!((analytic, sampled), (0, 1), "ellipse loop sampled");
+        match &regions.first().expect("one region").outer {
+            ProfileLoop::Polygon(p) => assert_eq!(p.len(), 64),
+            ProfileLoop::Edges(_) => panic!("ellipse loop must fall back to sampling"),
+        }
     }
 }

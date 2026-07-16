@@ -405,10 +405,17 @@ fn dispatch_generic(
         }
 
         "sketch_extrude" => {
-            // Self-contained sketch extrusion: frame + materialised
-            // region polygons. Replays through the SAME kernel helper
-            // the live api-server bridges use (extrude_polygon_regions),
+            // Self-contained sketch extrusion: frame + per-loop
+            // payloads. Replays through the SAME kernel helper the
+            // live api-server bridges use (extrude_profile_regions),
             // so replay cannot drift from live behaviour.
+            //
+            // Loop payload schema (SKETCH-DCM #45 Slice 5): a plain
+            // vertex array `[[u, v], ...]` is a materialised polygon
+            // (the legacy shape — every pre-slice event replays
+            // unchanged), while `{"edges": [...]}` carries typed
+            // analytic `ProfileEdge`s so replayed bores stay TRUE
+            // cylinders, byte-equivalent to the live build.
             let vec3 = |key: &str| -> Option<geometry_engine::math::Vector3> {
                 let a = inner.get(key)?.as_array()?;
                 Some(geometry_engine::math::Vector3::new(
@@ -434,22 +441,38 @@ fn dispatch_generic(
                     })
                     .collect()
             };
+            let profile_loop =
+                |v: &serde_json::Value| -> Option<geometry_engine::operations::extrude::ProfileLoop> {
+                    if v.is_array() {
+                        return Some(
+                            geometry_engine::operations::extrude::ProfileLoop::Polygon(polygon(v)?),
+                        );
+                    }
+                    let edges = v.get("edges")?.clone();
+                    let edges: Vec<geometry_engine::sketch2d::sketch_topology::ProfileEdge> =
+                        serde_json::from_value(edges).ok()?;
+                    Some(geometry_engine::operations::extrude::ProfileLoop::Edges(edges))
+                };
             let parsed = (|| -> Option<_> {
                 let origin = point3("origin")?;
                 let u_axis = vec3("u_axis")?;
                 let v_axis = vec3("v_axis")?;
                 let distance = inner.get("distance")?.as_f64()?;
                 let direction = vec3("direction");
-                let regions: Option<Vec<geometry_engine::operations::extrude::PolygonRegion>> =
+                let regions: Option<Vec<geometry_engine::operations::extrude::ProfileRegion>> =
                     inner
                         .get("regions")?
                         .as_array()?
                         .iter()
                         .map(|r| {
-                            let outer = polygon(r.get("outer")?)?;
-                            let holes: Option<Vec<_>> =
-                                r.get("holes")?.as_array()?.iter().map(polygon).collect();
-                            Some(geometry_engine::operations::extrude::PolygonRegion {
+                            let outer = profile_loop(r.get("outer")?)?;
+                            let holes: Option<Vec<_>> = r
+                                .get("holes")?
+                                .as_array()?
+                                .iter()
+                                .map(&profile_loop)
+                                .collect();
+                            Some(geometry_engine::operations::extrude::ProfileRegion {
                                 outer,
                                 holes: holes?,
                             })
@@ -459,7 +482,7 @@ fn dispatch_generic(
             })();
             match parsed {
                 Some((origin, u_axis, v_axis, regions, distance, direction)) => {
-                    geometry_engine::operations::extrude::extrude_polygon_regions(
+                    geometry_engine::operations::extrude::extrude_profile_regions(
                         model,
                         origin,
                         u_axis,
@@ -1169,6 +1192,114 @@ mod tests {
         assert!(
             (max_abs_x(&m3) - 12.5).abs() < 1e-6,
             "moulded half-width 12.5"
+        );
+    }
+
+    /// Analytic cylinder faces on the outer shell of `solid`, as radii
+    /// (SKETCH-DCM #45 Slice 5 replay assertions).
+    fn cylinder_face_radii(m: &BRepModel, solid: SolidId) -> Vec<f64> {
+        let solid_ref = m.solids.get(solid).expect("solid");
+        let shell = m.shells.get(solid_ref.outer_shell).expect("shell");
+        let mut radii = Vec::new();
+        for &fid in &shell.faces {
+            let face = m.faces.get(fid).expect("face");
+            let surface = m.surfaces.get(face.surface_id).expect("surface");
+            if let Some(cyl) = surface
+                .as_any()
+                .downcast_ref::<geometry_engine::primitives::surface::Cylinder>()
+            {
+                radii.push(cyl.radius);
+            }
+        }
+        radii
+    }
+
+    /// SKETCH-DCM #45 Slice 5: a `sketch_extrude` event whose hole
+    /// loop carries typed analytic edges (`{"edges": [...]}`) replays
+    /// to a solid with a TRUE cylindrical bore face — byte-equivalent
+    /// to the live analytic build, not a re-sampled 64-gon.
+    #[test]
+    fn replay_sketch_extrude_typed_edges_rebuilds_analytic_bore() {
+        let mut model = BRepModel::new();
+        let event = mk_event(
+            "sketch_extrude",
+            serde_json::json!({
+                "params": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "u_axis": [1.0, 0.0, 0.0],
+                    "v_axis": [0.0, 1.0, 0.0],
+                    "regions": [{
+                        // Mixed schema on purpose: legacy polygon outer
+                        // + typed analytic hole in ONE event.
+                        "outer": [[0.0, 0.0], [40.0, 0.0], [40.0, 30.0], [0.0, 30.0]],
+                        "holes": [{ "edges": [
+                            { "kind": "circle", "center": [20.0, 15.0], "radius": 6.0 }
+                        ]}],
+                    }],
+                    "distance": 10.0,
+                    "direction": [0.0, 0.0, 1.0],
+                },
+                "inputs": [],
+                "outputs": [99]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(outcome.events_applied, 1, "event must apply");
+        assert_eq!(outcome.events_skipped, 0);
+        let solid = only_solid(&model);
+        let radii = cylinder_face_radii(&model, solid);
+        assert_eq!(
+            radii.len(),
+            1,
+            "typed-edge replay must rebuild ONE analytic cylinder bore face"
+        );
+        let radius = radii.first().copied().expect("one bore radius");
+        assert!(
+            (radius - 6.0).abs() < 1e-9,
+            "replayed bore radius must be exact: {radius}"
+        );
+    }
+
+    /// Pre-Slice-5 `sketch_extrude` events (plain polygon arrays) must
+    /// keep replaying — and must reproduce the RECORDED polygonal
+    /// geometry, not be silently upgraded to analytic faces.
+    #[test]
+    fn replay_sketch_extrude_legacy_polygon_payload_unchanged() {
+        let mut model = BRepModel::new();
+        // A coarse 8-gon "circle" hole, exactly as an old event would
+        // have materialised it.
+        let hole: Vec<[f64; 2]> = (0..8)
+            .map(|i| {
+                let a = (i as f64) * std::f64::consts::TAU / 8.0;
+                [20.0 + 6.0 * a.cos(), 15.0 + 6.0 * a.sin()]
+            })
+            .collect();
+        let event = mk_event(
+            "sketch_extrude",
+            serde_json::json!({
+                "params": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "u_axis": [1.0, 0.0, 0.0],
+                    "v_axis": [0.0, 1.0, 0.0],
+                    "regions": [{
+                        "outer": [[0.0, 0.0], [40.0, 0.0], [40.0, 30.0], [0.0, 30.0]],
+                        "holes": [hole],
+                    }],
+                    "distance": 10.0,
+                    "direction": [0.0, 0.0, 1.0],
+                },
+                "inputs": [],
+                "outputs": [99]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(outcome.events_applied, 1, "legacy event must apply");
+        assert_eq!(outcome.events_skipped, 0);
+        let solid = only_solid(&model);
+        assert!(
+            cylinder_face_radii(&model, solid).is_empty(),
+            "legacy polygon payloads replay as recorded (planar facets), \
+             never silently upgraded to analytic faces"
         );
     }
 }

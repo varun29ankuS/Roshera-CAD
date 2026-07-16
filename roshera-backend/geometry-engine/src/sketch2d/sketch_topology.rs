@@ -959,6 +959,163 @@ impl ProfileExtractor {
     }
 }
 
+/// One typed edge of an analytic profile loop, in plane-local (u, v)
+/// coordinates, oriented in LOOP-WALK order (traversal is baked in:
+/// a reversed walk swaps a line's endpoints and flips an arc's angles
+/// and winding, so consumers never re-consult the walk flags).
+///
+/// This is the SKETCH-DCM #45 Slice 5 (spec §3.3 "Phase D") boundary
+/// type: it keeps the entity-level geometry the topology walker used
+/// to discard at the chord-sampling boundary, so downstream face
+/// construction can carry TRUE circular edges instead of a 64-gon.
+/// The serde shape (`{"kind": "line" | "arc" | "circle", …}`) is the
+/// wire format the `sketch_extrude` timeline event records — replay
+/// rebuilds the identical analytic solid from it.
+///
+/// Angles follow the sketch convention: radians from the plane's +u
+/// axis toward +v. `ccw: true` sweeps `start_angle → end_angle`
+/// counter-clockwise (about +normal = u × v); `false` sweeps
+/// clockwise. A full circle is its own single-edge closed loop.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProfileEdge {
+    Line {
+        start: [f64; 2],
+        end: [f64; 2],
+    },
+    Arc {
+        center: [f64; 2],
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+        ccw: bool,
+    },
+    Circle {
+        center: [f64; 2],
+        radius: f64,
+    },
+}
+
+/// Verdict of [`ProfileExtractor::analytic_loop_edges`]: either the
+/// loop's full typed-edge list, or an HONEST refusal naming the first
+/// entity whose exact geometry is not analytically lifted yet
+/// (splines and ellipses this slice). Callers use the refusal as the
+/// fallback signal to keep chord-sampling that loop — a sampled
+/// polygon is never silently labeled analytic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnalyticLoop {
+    /// Every edge of the loop expressed exactly.
+    Edges(Vec<ProfileEdge>),
+    /// The loop contains an entity kind with no analytic lift.
+    Unsupported {
+        entity: EntityRef,
+        edge_type: EdgeType,
+    },
+}
+
+impl ProfileExtractor {
+    /// Express a topology loop as typed analytic edges (SKETCH-DCM #45
+    /// Slice 5, spec §3.3).
+    ///
+    /// Mirrors the walk semantics of the api-server's polygon
+    /// materialiser (`sample_topology_loop`): edges are emitted in loop
+    /// order with the per-edge traversal direction applied, so
+    /// concatenating them yields the closed boundary. Geometry comes
+    /// from the SKETCH ENTITIES (exact stored centers/radii/angles),
+    /// not from re-fitting samples.
+    ///
+    /// Coverage audit (every entity kind the walker can put in a loop):
+    /// line segments, rectangle sides and polyline segments → `Line`;
+    /// arcs → `Arc`; circles → `Circle`; splines and ellipses have no
+    /// exact analytic lift wired into face construction yet and return
+    /// [`AnalyticLoop::Unsupported`] (never a silent approximation).
+    /// Hard errors are reserved for structural corruption (a loop
+    /// referencing a missing edge or entity).
+    pub fn analytic_loop_edges(
+        sketch: &super::Sketch,
+        topology: &SketchTopology,
+        sketch_loop: &SketchLoop,
+    ) -> Sketch2dResult<AnalyticLoop> {
+        let edges = topology.edges();
+        let mut out = Vec::with_capacity(sketch_loop.edges.len());
+        for (k, &edge_idx) in sketch_loop.edges.iter().enumerate() {
+            // Walk orientation from the topology loop (NOT the edge's
+            // entity-relative `forward` flag): the loop walker may
+            // traverse any edge end→start, and emitting it un-reversed
+            // would fold the boundary back on itself.
+            let walk_forward = sketch_loop.orientations.get(k).copied().unwrap_or(true);
+            let edge = edges
+                .get(edge_idx)
+                .ok_or_else(|| Sketch2dError::InvalidTopology {
+                    reason: format!("loop references missing topology edge {edge_idx}"),
+                })?;
+            match (&edge.edge_type, &edge.entity) {
+                (EdgeType::Line, _) | (EdgeType::PolylineSegment(_), _) => {
+                    let (s, e) = if walk_forward {
+                        (edge.start, edge.end)
+                    } else {
+                        (edge.end, edge.start)
+                    };
+                    out.push(ProfileEdge::Line {
+                        start: [s.x, s.y],
+                        end: [e.x, e.y],
+                    });
+                }
+                (EdgeType::Arc, EntityRef::Arc(arc_id)) => {
+                    let entry =
+                        sketch
+                            .arcs()
+                            .get(arc_id)
+                            .ok_or_else(|| Sketch2dError::EntityNotFound {
+                                entity_type: "Arc".to_string(),
+                                id: arc_id.to_string(),
+                            })?;
+                    let arc = entry.value().arc;
+                    // Reversed traversal swaps the angles AND flips the
+                    // winding — the geometric point set is identical,
+                    // only the walk direction changes.
+                    let (start_angle, end_angle, ccw) = if walk_forward {
+                        (arc.start_angle, arc.end_angle, arc.ccw)
+                    } else {
+                        (arc.end_angle, arc.start_angle, !arc.ccw)
+                    };
+                    out.push(ProfileEdge::Arc {
+                        center: [arc.center.x, arc.center.y],
+                        radius: arc.radius,
+                        start_angle,
+                        end_angle,
+                        ccw,
+                    });
+                }
+                (EdgeType::Circle, EntityRef::Circle(circle_id)) => {
+                    let entry = sketch.circles().get(circle_id).ok_or_else(|| {
+                        Sketch2dError::EntityNotFound {
+                            entity_type: "Circle".to_string(),
+                            id: circle_id.to_string(),
+                        }
+                    })?;
+                    let circle = entry.value().circle;
+                    // A circle is a closed point set — traversal
+                    // direction does not change it. The kernel curve is
+                    // parameterised CCW about +normal, matching the
+                    // proven click-draft analytic-circle path.
+                    out.push(ProfileEdge::Circle {
+                        center: [circle.center.x, circle.center.y],
+                        radius: circle.radius,
+                    });
+                }
+                (edge_type, entity) => {
+                    return Ok(AnalyticLoop::Unsupported {
+                        entity: *entity,
+                        edge_type: *edge_type,
+                    });
+                }
+            }
+        }
+        Ok(AnalyticLoop::Edges(out))
+    }
+}
+
 /// Profile ready for extrusion
 #[derive(Debug, Clone)]
 pub struct ExtrusionProfile {
