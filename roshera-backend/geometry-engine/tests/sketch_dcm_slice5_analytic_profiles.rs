@@ -35,7 +35,7 @@ use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::operations::extrude::{extrude_profile_regions, ProfileLoop, ProfileRegion};
 use geometry_engine::primitives::curve::Arc as Arc3;
-use geometry_engine::primitives::surface::{Cylinder, Plane, RuledSurface};
+use geometry_engine::primitives::surface::{Cylinder, Plane};
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::sketch2d::sketch_topology::{
     AnalyticLoop, EdgeType, ProfileEdge, ProfileExtractor, SketchTopology,
@@ -580,10 +580,18 @@ fn gate_bore_volume_matches_analytic_tolerance() {
 
 // ─── partial arcs (slot) ─────────────────────────────────────────────
 
-/// Slot extrude: the two end-cap walls are exact swept-arc surfaces
-/// (RuledSurface whose rails are true `Arc` curves at the exact
-/// radius), the caps carry true `Arc` boundary edges, the solid is
-/// sound, and the volume is the exact stadium prism (2L·2r + πr²)·h.
+/// Slot extrude: the two end-cap walls are exact swept-arc surfaces,
+/// the caps carry true `Arc` boundary edges, the solid is sound, and
+/// the volume is the exact stadium prism (2L·2r + πr²)·h.
+///
+/// UPDATED (SKETCH-DCM #45 follow-ups B, item 3 — Slice-6/7 flip
+/// precedent): the arc walls were exactly-swept generic
+/// `RuledSurface`s with `Arc` rails (Slice-5 residual 2); they are now
+/// promoted to TRUE trimmed `Cylinder` faces (exact radius + axis,
+/// seam-aligned trim), so the wall assertions here moved from
+/// rail-exactness on the ruled carrier to carrier-exactness on the
+/// typed cylinder. Everything else the test pinned (Arc cap edges,
+/// soundness, exact stadium volume) is unchanged.
 #[test]
 fn slot_extrude_arc_walls_are_exact_and_solid_is_sound() {
     let sketch = slot_sketch();
@@ -612,16 +620,22 @@ fn slot_extrude_arc_walls_are_exact_and_solid_is_sound() {
     for &fid in &shell.faces {
         let face = model.faces.get(fid).expect("face");
         let surface = model.surfaces.get(face.surface_id).expect("surface");
-        if let Some(ruled) = surface.as_any().downcast_ref::<RuledSurface>() {
-            let rail = ruled
-                .curve1
-                .as_any()
-                .downcast_ref::<Arc3>()
-                .expect("curved slot wall rail must be a true Arc curve");
+        if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+            // Follow-ups B item 3: the end-cap wall is a TRUE trimmed
+            // Cylinder — exact radius, extrusion axis, and the arc's
+            // own angular span (seam-aligned, never straddling the
+            // carrier's parameterisation seam).
             assert!(
-                (rail.radius - SLOT_R).abs() < 1e-9,
-                "arc wall rail radius must be exact: got {}, want {SLOT_R}",
-                rail.radius
+                (cyl.radius - SLOT_R).abs() < 1e-9,
+                "cylinder wall radius must be exact: got {}, want {SLOT_R}",
+                cyl.radius
+            );
+            let limits = cyl
+                .angle_limits
+                .expect("partial-arc wall carries its trim span");
+            assert!(
+                limits[0].abs() < 1e-12 && (limits[1] - PI).abs() < 1e-9,
+                "semicircle span [0, π], got {limits:?}"
             );
             arc_walls += 1;
         } else if surface.as_any().downcast_ref::<Plane>().is_some() {
@@ -669,14 +683,13 @@ fn slot_extrude_arc_walls_are_exact_and_solid_is_sound() {
     );
     assert!(!mesh.triangles.is_empty(), "slot must tessellate");
 
-    // Mesh-oracle volume (see `measured_volume`). Honest bound: the
-    // arc WALL surfaces are exact (asserted above at 1e-9), but the
-    // generic ruled-wall tessellation is coarser than the cylinder
-    // path — measured 1.39e-4 relative here, vs the 64-seg/turn
-    // sampled-profile signature of ≈ 3.3e-4 (per-semicircle 64-gon
-    // deficit 0.0454 mm² ⇒ +0.73 mm³). The separation is real but
-    // thin, so the volume check is a guard rail; the STRUCTURAL
-    // assertions above (true Arc rails / true Arc cap edges) are this
+    // Mesh-oracle volume (see `measured_volume`). Follow-ups B item 3
+    // moved the arc walls onto the cylinder-hardened tessellation
+    // path (the Slice-5 generic-ruled measurement was 1.39e-4
+    // relative; the 64-seg/turn sampled-profile signature ≈ 3.3e-4 —
+    // per-semicircle 64-gon deficit 0.0454 mm² ⇒ +0.73 mm³). The
+    // volume check is a guard rail; the STRUCTURAL assertions above
+    // (typed trimmed Cylinder walls / true Arc cap edges) are this
     // test's primary teeth.
     let analytic = (2.0 * SLOT_L * 2.0 * SLOT_R + PI * SLOT_R * SLOT_R) * SLOT_H;
     let v = measured_volume(&mut model, solid);

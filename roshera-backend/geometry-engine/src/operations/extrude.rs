@@ -252,15 +252,28 @@ fn create_side_face_shared(
     // have constant normal/tangent, so the model-edge parameter
     // midpoint is equally exact.
     //
-    // Full-circle walls collapsed to an analytic `Cylinder` keep the
+    // FULL-circle walls collapsed to an analytic `Cylinder` keep the
     // centroid-radial test: the Cylinder's own angular parameterisation
     // is seam-shifted relative to the profile curve's (the
     // EXTRUDE-CYL-MESH-INVERTED trap), and for the single-full-circle
-    // loop — the only loop shape that produces a Cylinder wall — the
-    // centroid test is exact (a circle is convex).
+    // loop the centroid test is exact (a circle is convex).
+    //
+    // PARTIAL-arc walls collapsed to a TRIMMED `Cylinder`
+    // (follow-ups B item 3) take the Newell tangent path instead: their
+    // `angle_limits = [0, |sweep|]` with a seam-aligned `ref_dir` make
+    // the surface's parametric midpoint the ARC midpoint, exactly where
+    // the else-branch below samples the bottom edge's curve tangent —
+    // normal and tangent share a footprint, so no seam shift can
+    // misorient them (and the centroid test is WRONG here: a slot's
+    // loop centroid sits far from the arc's own axis, flipping the
+    // radial sign at the anti-podal sample the full-2π midpoint u = π
+    // would pick).
     let mut target: Option<Vector3> = None;
-    let is_cylinder_wall = surface.as_any().downcast_ref::<Cylinder>().is_some();
-    if let (false, Some(newell)) = (is_cylinder_wall, orientation_ctx.newell_normal) {
+    let is_full_cylinder_wall = surface
+        .as_any()
+        .downcast_ref::<Cylinder>()
+        .is_some_and(|c| c.angle_limits.is_none());
+    if let (false, Some(newell)) = (is_full_cylinder_wall, orientation_ctx.newell_normal) {
         let tangent = if let Some(ruled) = surface
             .as_any()
             .downcast_ref::<crate::primitives::surface::RuledSurface>()
@@ -1539,6 +1552,16 @@ fn create_ruled_surface(
         if let Some(cyl) = try_build_cylinder_from_circles(bottom_curve_full, top_curve_full) {
             return Ok(Box::new(cyl));
         }
+        // Partial-arc walls (SKETCH-DCM #45 follow-ups B, item 3):
+        // coaxial equal-radius PARTIAL arcs displaced along their
+        // common normal collapse to a TRUE trimmed `Cylinder` face —
+        // seam-aligned `ref_dir` + `angle_limits` = the arc's own
+        // span, so the face never straddles the carrier's
+        // parameterisation seam (the EXTRUDE-CYL-MESH-INVERTED trap
+        // class) and STEP maps the wall as `CYLINDRICAL_SURFACE`.
+        if let Some(cyl) = try_build_cylinder_from_arcs(bottom_curve_full, top_curve_full) {
+            return Ok(Box::new(cyl));
+        }
     }
 
     // Build a real ruled surface S(u,v) = (1-v)·C1(u) + v·C2(u) using
@@ -1696,6 +1719,102 @@ fn try_build_cylinder_from_circles(
     };
 
     Cylinder::new_finite(origin, b_axis_n, b_radius, height).ok()
+}
+
+/// If the bottom and top curves are coaxial equal-radius PARTIAL arcs
+/// related by a translation along their common normal, build a TRIMMED
+/// finite `Cylinder` (SKETCH-DCM #45 follow-ups B, item 3):
+///
+/// - `ref_dir` is SEAM-ALIGNED to the arc's angular-minimum endpoint,
+///   and `angle_limits = [0, |sweep|]` — the face's u-range is exactly
+///   the arc's own span, so it can never straddle the carrier's 0/2π
+///   parameterisation seam (the EXTRUDE-CYL-MESH-INVERTED trap class)
+///   and the parametric midpoint always lies ON the face (which is
+///   what `orient_face_for_outward` samples).
+/// - The cylinder axis keeps the ARC's normal direction; a negative
+///   extrusion flips the origin to the upper arc so `height_limits`
+///   stays `[0, h]` (mirrors `try_build_cylinder_from_circles`).
+///
+/// Returns `None` when the geometry doesn't match (different radii /
+/// sweeps / non-parallel normals / oblique displacement / misaligned
+/// angular ranges) — the caller falls back to the exactly-swept
+/// generic ruled surface, which remains correct for those cases.
+fn try_build_cylinder_from_arcs(
+    bottom_curve: &dyn Curve,
+    top_curve: &dyn Curve,
+) -> Option<Cylinder> {
+    use crate::math::consts;
+
+    let b = bottom_curve.as_any().downcast_ref::<Arc>()?;
+    let t = top_curve.as_any().downcast_ref::<Arc>()?;
+
+    // Full-sweep arcs are the `try_build_cylinder_from_circles` case
+    // (untrimmed lateral, cap-seam co-location rules of CDT-γ.3) —
+    // never trim those here.
+    if (b.sweep_angle.abs() - consts::TWO_PI).abs() < 1e-9
+        || (t.sweep_angle.abs() - consts::TWO_PI).abs() < 1e-9
+    {
+        return None;
+    }
+
+    if (b.radius - t.radius).abs() > 1e-9 {
+        return None;
+    }
+    if (b.sweep_angle - t.sweep_angle).abs() > 1e-9 {
+        return None;
+    }
+    if (b.start_angle - t.start_angle).abs() > 1e-9 {
+        return None;
+    }
+
+    // Same plane frame: parallel normals AND parallel angle references
+    // (the extrude top curve is a pure translation of the bottom, so
+    // both hold by construction — verified cheaply for safety).
+    let n = b.normal.normalize().ok()?;
+    let tn = t.normal.normalize().ok()?;
+    if n.dot(&tn) < 1.0 - 1e-9 {
+        return None;
+    }
+    let bx = b.x_axis.normalize().ok()?;
+    let tx = t.x_axis.normalize().ok()?;
+    if bx.dot(&tx) < 1.0 - 1e-9 {
+        return None;
+    }
+
+    // The center displacement must be a translation ALONG the arcs'
+    // common normal — an oblique displacement means the wall is a
+    // genuinely oblique swept surface, not a cylinder patch.
+    let centers = t.center - b.center;
+    let centers_len = centers.magnitude();
+    if centers_len < 1e-12 {
+        return None;
+    }
+    let centers_n = centers.normalize().ok()?;
+    if centers_n.dot(&n).abs() < 1.0 - 1e-9 {
+        return None;
+    }
+
+    // Angular-minimum endpoint (the walk may sweep CW: sweep < 0) —
+    // the seam anchor for `ref_dir`, so u ∈ [0, |sweep|].
+    let theta_min = if b.sweep_angle >= 0.0 {
+        b.start_angle
+    } else {
+        b.start_angle + b.sweep_angle
+    };
+    let y_axis = n.cross(&bx);
+    let ref_dir = bx * theta_min.cos() + y_axis * theta_min.sin();
+
+    let signed_height = centers.dot(&n);
+    let (origin, height) = if signed_height >= 0.0 {
+        (b.center, signed_height)
+    } else {
+        (t.center, -signed_height)
+    };
+
+    let mut cyl = Cylinder::new_finite(origin, n, b.radius, height).ok()?;
+    cyl.ref_dir = ref_dir.normalize().ok()?;
+    cyl.angle_limits = Some([0.0, b.sweep_angle.abs()]);
+    Some(cyl)
 }
 
 /// Create a face from a closed wire profile by re-deriving the host

@@ -26,11 +26,14 @@
 
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::extrude::{extrude_profile_regions, ProfileLoop, ProfileRegion};
+use geometry_engine::primitives::face::FaceOrientation;
+use geometry_engine::primitives::surface::Cylinder;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::sketch2d::sketch_topology::{
     AnalyticLoop, ProfileEdge, ProfileExtractor, SketchTopology,
 };
 use geometry_engine::sketch2d::{Point2d, Sketch, SketchAnchor, Tolerance2d};
+use std::f64::consts::PI;
 
 fn fresh(name: &str) -> Sketch {
     Sketch::new(name.to_string(), SketchAnchor::xy())
@@ -324,5 +327,193 @@ fn closed_spline_hole_extrudes_sound() {
     assert!(
         rel < 2e-3,
         "hole volume subtracts: measured {measured}, expected {expected_volume}, rel {rel}"
+    );
+}
+
+// ── Item 3: partial-arc walls → TRUE trimmed Cylinder faces ──────────
+
+const SLOT_L: f64 = 10.0; // arc centers at x = ±SLOT_L
+const SLOT_R: f64 = 5.0;
+const SLOT_H: f64 = 8.0;
+
+/// Stadium/slot profile (the Slice-5 fixture): two horizontal lines
+/// y = ±r for x ∈ [−L, L] plus two semicircular end arcs of radius r
+/// centred at (±L, 0).
+fn slot_sketch() -> Sketch {
+    let sketch = fresh("followups_b_slot");
+    let bl = sketch.add_point(Point2d::new(-SLOT_L, -SLOT_R));
+    let br = sketch.add_point(Point2d::new(SLOT_L, -SLOT_R));
+    let tr = sketch.add_point(Point2d::new(SLOT_L, SLOT_R));
+    let tl = sketch.add_point(Point2d::new(-SLOT_L, SLOT_R));
+    sketch.add_line(bl, br).expect("bottom line");
+    sketch.add_line(tr, tl).expect("top line");
+    sketch
+        .add_arc_center_angles(Point2d::new(SLOT_L, 0.0), SLOT_R, -PI / 2.0, PI / 2.0)
+        .expect("right arc");
+    sketch
+        .add_arc_center_angles(Point2d::new(-SLOT_L, 0.0), SLOT_R, PI / 2.0, 3.0 * PI / 2.0)
+        .expect("left arc");
+    sketch
+}
+
+fn extruded_slot() -> (BRepModel, u32) {
+    let s = slot_sketch();
+    let topo = SketchTopology::analyze(&s, &Tolerance2d::default()).expect("topology");
+    let profiles = ProfileExtractor::extract_for_extrusion(&topo).expect("profiles");
+    assert_eq!(profiles.len(), 1);
+    let outer = match ProfileExtractor::analytic_loop_edges(&s, &topo, &profiles[0].outer_boundary)
+        .expect("extraction")
+    {
+        AnalyticLoop::Edges(edges) => edges,
+        other => panic!("slot loop lifts analytically: {other:?}"),
+    };
+    let mut model = BRepModel::new();
+    let solid = extrude_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        SLOT_H,
+        None,
+        Tolerance::default(),
+    )
+    .expect("slot extrude");
+    (model, solid)
+}
+
+/// GATE (item 3): the slot's two semicircular end-cap walls are TRUE
+/// trimmed `Cylinder` faces — typed carrier, exact radius, extrusion
+/// axis, seam-aligned `ref_dir` with `angle_limits` = the arc's own
+/// span (so the face never straddles the carrier's parameterisation
+/// seam: the EXTRUDE-CYL-MESH-INVERTED trap class).
+///
+/// Pre-fix (RED, run on f97120a): the arc walls were exactly-swept
+/// generic `RuledSurface`s (Slice-5 residual 2) — 0 Cylinder faces.
+#[test]
+fn gate_slot_arc_walls_are_trimmed_cylinder_faces() {
+    let (mut model, solid) = extruded_slot();
+
+    let solid_ref = model.solids.get(solid).expect("solid").clone();
+    let shell = model.shells.get(solid_ref.outer_shell).expect("shell");
+    let mut cylinder_walls = 0usize;
+    for &fid in &shell.faces {
+        let face = model.faces.get(fid).expect("face");
+        let surface = model.surfaces.get(face.surface_id).expect("surface");
+        if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+            cylinder_walls += 1;
+            assert!(
+                (cyl.radius - SLOT_R).abs() < 1e-9,
+                "cylinder wall radius must be exact: {}",
+                cyl.radius
+            );
+            assert!(
+                cyl.axis.cross(&Vector3::Z).magnitude() < 1e-9,
+                "cylinder axis must be the extrusion direction: {:?}",
+                cyl.axis
+            );
+            // Trim = the arc's own span, anchored at u = 0 (seam-
+            // aligned ref_dir): the face NEVER straddles the carrier
+            // seam and the parametric midpoint lies ON the face.
+            let limits = cyl
+                .angle_limits
+                .expect("partial-arc wall must carry angle_limits");
+            assert!(
+                limits[0].abs() < 1e-12 && (limits[1] - PI).abs() < 1e-9,
+                "angle_limits must be [0, π] (the semicircle span), got {limits:?}"
+            );
+            let height = cyl
+                .height_limits
+                .expect("extrude wall must carry height_limits");
+            assert!(
+                (height[1] - height[0] - SLOT_H).abs() < 1e-9,
+                "height span must equal the extrusion distance, got {height:?}"
+            );
+            // Seam anchor: the u = 0 rim point is the arc's angular-
+            // minimum endpoint, which for the slot's end caps sits at
+            // (±L, ∓r) / (±L, ±r) — |x| = L, |y| = r exactly (the
+            // axis is Z, so x/y are height-independent).
+            let seam = cyl.origin + cyl.ref_dir * cyl.radius;
+            assert!(
+                (seam.x.abs() - SLOT_L).abs() < 1e-9 && (seam.y.abs() - SLOT_R).abs() < 1e-9,
+                "seam (u=0) must anchor at the arc's own endpoint, got {seam:?}"
+            );
+        }
+    }
+    assert_eq!(cylinder_walls, 2, "both end-cap walls are typed Cylinders");
+
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(
+        gt.certificate.is_sound(),
+        "slot with cylinder walls must be SOUND: {}",
+        gt.summary()
+    );
+
+    // Volume: the cylinder-hardened tessellation path is denser than
+    // the generic ruled path (Slice-5 measured 1.39e-4 there); the
+    // analytic value is (2L·2r + πr²)·h.
+    let analytic = (2.0 * SLOT_L * 2.0 * SLOT_R + PI * SLOT_R * SLOT_R) * SLOT_H;
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 2e-4,
+        "slot volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
+/// Normals/orientation gate (item 3): the EXTRUDE-CYL-MESH-INVERTED
+/// trap manifests as a wall oriented INTO the material. Assert
+/// analytically (oriented outward normal at the surface's parametric
+/// midpoint points AWAY from the arc's center axis) AND via the mesh
+/// certificate (oriented, zero inconsistent facets, analytic normal
+/// agreement).
+#[test]
+fn slot_cylinder_walls_oriented_outward_no_seam_inversion() {
+    let (mut model, solid) = extruded_slot();
+
+    let solid_ref = model.solids.get(solid).expect("solid").clone();
+    let shell = model.shells.get(solid_ref.outer_shell).expect("shell");
+    let mut checked = 0usize;
+    for &fid in &shell.faces {
+        let face = model.faces.get(fid).expect("face");
+        let surface = model.surfaces.get(face.surface_id).expect("surface");
+        let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() else {
+            continue;
+        };
+        checked += 1;
+        let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+        let (u_mid, v_mid) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+        let sp = surface.point_at(u_mid, v_mid).expect("midpoint");
+        let n = surface.normal_at(u_mid, v_mid).expect("midpoint normal");
+        let sign = match face.orientation {
+            FaceOrientation::Forward => 1.0,
+            FaceOrientation::Backward => -1.0,
+        };
+        let oriented = n * sign;
+        // Outward for a convex end cap = radially away from the arc's
+        // own axis (the slot material is on the axis side).
+        let axis_foot = cyl.origin + cyl.axis * (sp - cyl.origin).dot(&cyl.axis);
+        let radial = sp - axis_foot;
+        assert!(
+            oriented.dot(&radial) > 0.0,
+            "cylinder wall {fid} oriented INTO the material (EXTRUDE-CYL-MESH-INVERTED): \
+             oriented {oriented:?}, radial {radial:?}"
+        );
+    }
+    assert_eq!(checked, 2, "two cylinder walls checked");
+
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.oriented, "mesh must be orientable");
+    assert_eq!(
+        gt.certificate.inconsistent_directed_edges, 0,
+        "no inversion seams in the mesh"
+    );
+    assert!(
+        gt.certificate.tessellation.analytic_normal_agreement > 0.999,
+        "facet normals must agree with the analytic carrier: {}",
+        gt.certificate.tessellation.analytic_normal_agreement
     );
 }
