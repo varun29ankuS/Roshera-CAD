@@ -1477,6 +1477,59 @@ mod tests {
         );
     }
 
+    /// SKETCH-DCM #45 follow-ups B (item 2): a `sketch_extrude` event
+    /// whose outer loop is ONE CLOSED typed NURBS edge (first CP ==
+    /// last CP) replays to a SOUND solid — the kernel seam-splits the
+    /// closed edge into two open exact halves, so the old
+    /// zero-triangle closed-ruled refusal is retired and typed closed
+    /// blobs round-trip through the timeline as exact geometry.
+    #[test]
+    fn replay_sketch_extrude_closed_nurbs_edge_rebuilds_seam_split_solid() {
+        let mut model = BRepModel::new();
+        let event = mk_event(
+            "sketch_extrude",
+            serde_json::json!({
+                "params": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "u_axis": [1.0, 0.0, 0.0],
+                    "v_axis": [0.0, 1.0, 0.0],
+                    "regions": [{
+                        "outer": { "edges": [
+                            { "kind": "nurbs",
+                              "degree": 3,
+                              "control_points": [
+                                  [10.0, 0.0], [14.0, 9.0], [-2.0, 12.0],
+                                  [-8.0, 2.0], [2.0, -7.0], [10.0, 0.0]
+                              ],
+                              "weights": null,
+                              "knots": [0.0, 0.0, 0.0, 0.0, 1.0/3.0, 2.0/3.0,
+                                        1.0, 1.0, 1.0, 1.0] }
+                        ]},
+                        "holes": [],
+                    }],
+                    "distance": 5.0,
+                    "direction": [0.0, 0.0, 1.0],
+                },
+                "inputs": [],
+                "outputs": [99]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(outcome.events_applied, 1, "closed-NURBS event must apply");
+        assert_eq!(outcome.events_skipped, 0);
+        let solid = only_solid(&model);
+        let gt = model.ground_truth(solid).expect("ground truth");
+        assert!(
+            gt.certificate.is_sound(),
+            "replayed closed-blob solid must be SOUND: {:?}",
+            gt.certificate
+        );
+        let face_count = model
+            .solid_outer_face_count(solid)
+            .expect("outer face count");
+        assert_eq!(face_count, 4, "2 caps + 2 seam-split NURBS walls");
+    }
+
     /// A sketch-op event with no `csketch_id` is malformed and must be
     /// rejected (skipped with a logged error), not silently accepted.
     #[test]

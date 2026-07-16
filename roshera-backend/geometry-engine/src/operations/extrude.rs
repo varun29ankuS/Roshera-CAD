@@ -2180,13 +2180,20 @@ fn build_analytic_loop(
                 // Exact NURBS boundary edge (SKETCH-DCM #45 Slice 7).
                 // The lateral wall becomes an exactly-swept
                 // `RuledSurface` whose rails are true NURBS curves —
-                // the same class as partial-arc walls (Slice 5). A
-                // CLOSED edge (start vertex == end vertex) refuses
-                // TYPED: its wall would be a closed generic ruled
-                // surface, the documented zero-triangle tessellation
-                // trap that forced full circles onto the `Cylinder`
-                // path (Slice-5 residual 1) — callers sample such
-                // loops explicitly instead of shipping a broken solid.
+                // the same class as partial-arc walls (Slice 5).
+                //
+                // A CLOSED edge (start vertex == end vertex) is
+                // SEAM-SPLIT into two open halves at its parametric
+                // midpoint (SKETCH-DCM #45 follow-ups B, item 2). The
+                // trap this retires: a closed single-edge loop's wall
+                // would be a CLOSED `RuledSurface`, whose fixed [0,1]²
+                // bounds and `is_closed_u == false` defeat the curved-
+                // CDT seam unwrap — the boundary projection folds in
+                // parameter space and the face tessellates to ZERO
+                // triangles (the Slice-5/7 documented refusal). Two
+                // OPEN ruled walls never form that precondition, and
+                // the halves are exact `subcurve` extractions (knot
+                // split, Piegl & Tiller §5.4) — no chord fit.
                 if control_points.iter().any(|p| !finite2(p))
                     || knots.iter().any(|k| !k.is_finite())
                 {
@@ -2232,12 +2239,53 @@ fn build_analytic_loop(
                     .vertices
                     .add_or_find(p_end.x, p_end.y, p_end.z, tolerance);
                 if v0 == v1 {
-                    return Err(OperationError::InvalidGeometry(format!(
-                        "analytic loop edge {i}: closed NURBS profile edge — the extruded \
-                         wall would be a CLOSED generic ruled surface, the documented \
-                         zero-triangle tessellation trap; split the profile with a vertex \
-                         or sample it into a polygon"
-                    )));
+                    // Seam-split: two exact open halves. NURBS
+                    // `subcurve` returns its result with the knot
+                    // vector NORMALISED to [0, 1] (the math-layer
+                    // contract, `math::nurbs::NurbsCurve::subcurve`)
+                    // — which is load-bearing here: ruled walls feed
+                    // u ∈ [0, 1] RAW to their rails, and a sub-domain
+                    // rail would clamp half the parameter square into
+                    // a degenerate plateau (the documented
+                    // polyline-subcurve hazard in
+                    // `create_ruled_surface`). Pinned structurally by
+                    // `closed_spline_split_walls_carry_exact_nurbs_rails`.
+                    let mid = 0.5 * (range.start + range.end);
+                    let p_mid = curve.point_at(mid).map_err(|e| {
+                        OperationError::NumericalError(format!(
+                            "analytic loop edge {i}: NURBS midpoint evaluation: {e:?}"
+                        ))
+                    })?;
+                    let v_mid = model
+                        .vertices
+                        .add_or_find(p_mid.x, p_mid.y, p_mid.z, tolerance);
+                    if v_mid == v0 {
+                        return Err(OperationError::InvalidGeometry(format!(
+                            "analytic loop edge {i}: closed NURBS edge is degenerate — its \
+                             parametric midpoint collapses onto its seam vertex under \
+                             tolerance {tolerance}"
+                        )));
+                    }
+                    for (t0, t1, va, vb) in
+                        [(range.start, mid, v0, v_mid), (mid, range.end, v_mid, v0)]
+                    {
+                        let half = curve.subcurve(t0, t1).map_err(|e| {
+                            OperationError::NumericalError(format!(
+                                "analytic loop edge {i}: closed-NURBS seam split failed: {e:?}"
+                            ))
+                        })?;
+                        let half_range = half.parameter_range();
+                        let curve_id = model.curves.add(half);
+                        out.push(model.edges.add(Edge::new(
+                            0,
+                            va,
+                            vb,
+                            curve_id,
+                            EdgeOrientation::Forward,
+                            ParameterRange::new(half_range.start, half_range.end),
+                        )));
+                    }
+                    continue;
                 }
                 let curve_id = model.curves.add(Box::new(curve));
                 out.push(model.edges.add(Edge::new(

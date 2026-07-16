@@ -17,8 +17,11 @@
 //!
 //! Stage E — spline profiles become typed NURBS edges
 //! (`ProfileEdge::Nurbs`) and extrude to SOUND solids with exact
-//! NURBS rails; a CLOSED single-edge spline wall stays a typed
-//! refusal (the Slice-5 documented zero-triangle closed-ruled trap).
+//! NURBS rails. A CLOSED single-edge spline wall originally stayed a
+//! typed refusal (the Slice-5 documented zero-triangle closed-ruled
+//! trap); follow-ups B item 2 fixed the trap at the topology root
+//! (kernel seam-split into two open halves) and the refusal pin below
+//! flipped into a soundness pin over the SAME fixture.
 
 use geometry_engine::math::{Point3, Tolerance, Vector3};
 use geometry_engine::operations::extrude::{extrude_profile_regions, ProfileLoop, ProfileRegion};
@@ -575,12 +578,16 @@ fn gate_leaf_profile_extrudes_sound() {
     );
 }
 
-/// The documented refusal: a CLOSED single-edge spline loop's extruded
-/// wall would be a closed generic ruled surface — the Slice-5
-/// zero-triangle tessellation trap. The kernel refuses TYPED; it never
-/// emits a silently broken solid.
+/// FLIPPED (SKETCH-DCM #45 follow-ups B, item 2 — Slice-6/7 test-flip
+/// precedent): this test used to pin the TYPED REFUSAL of a closed
+/// single-edge spline loop (the Slice-5 zero-triangle closed-ruled
+/// trap). The trap is now fixed at the topology root — the kernel
+/// SEAM-SPLITS the closed edge into two open exact NURBS halves — so
+/// the SAME fixture now pins the soundness of the resulting solid.
+/// The pin's semantics survive: the kernel still never emits a
+/// silently broken solid for this input; it emits a SOUND one.
 #[test]
-fn closed_single_edge_spline_loop_refuses_typed() {
+fn closed_single_edge_spline_loop_extrudes_sound() {
     let s = fresh("slice7_closed_spline");
     // Closed clamped cubic: last CP == first CP.
     let p0 = Point2d::new(10.0, 0.0);
@@ -611,7 +618,7 @@ fn closed_single_edge_spline_loop_refuses_typed() {
     assert!(matches!(outer[0], ProfileEdge::Nurbs { .. }));
 
     let mut model = BRepModel::new();
-    let err = extrude_profile_regions(
+    let solid = extrude_profile_regions(
         &mut model,
         Point3::new(0.0, 0.0, 0.0),
         Vector3::X,
@@ -624,10 +631,15 @@ fn closed_single_edge_spline_loop_refuses_typed() {
         None,
         Tolerance::default(),
     )
-    .expect_err("a closed single-edge NURBS wall is the documented closed-ruled trap");
-    let message = err.to_string();
+    .expect("the closed-ruled trap is fixed: a closed NURBS profile extrudes (seam-split)");
+    let gt = model.ground_truth(solid).expect("ground truth");
     assert!(
-        message.contains("closed") && message.to_lowercase().contains("nurbs"),
-        "the refusal must name the trap: {message}"
+        gt.certificate.is_sound(),
+        "the seam-split closed-spline solid must be SOUND: {:?}",
+        gt.certificate
     );
+    let face_count = model
+        .solid_outer_face_count(solid)
+        .expect("outer face count");
+    assert_eq!(face_count, 4, "2 caps + 2 seam-split NURBS walls");
 }

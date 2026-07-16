@@ -2260,22 +2260,12 @@ fn materialise_profile_loop(
             let has_circle = edges
                 .iter()
                 .any(|e| matches!(e, ProfileEdge::Circle { .. }));
-            // A CLOSED NURBS edge (clamped endpoints coincident) is
-            // the documented zero-triangle closed-ruled trap — the
-            // kernel refuses it typed (SKETCH-DCM #45 Slice 7), so
-            // the route samples such loops up front and counts them
-            // honestly in `sampled_loops`.
-            let has_closed_nurbs = edges.iter().any(|e| match e {
-                ProfileEdge::Nurbs { control_points, .. } => {
-                    match (control_points.first(), control_points.last()) {
-                        (Some(a), Some(b)) => {
-                            (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9
-                        }
-                        _ => true,
-                    }
-                }
-                _ => false,
-            });
+            // Closed NURBS loops no longer pre-sample: the kernel
+            // seam-splits a closed NURBS edge into two open exact
+            // halves (SKETCH-DCM #45 follow-ups B, item 2), so the
+            // zero-triangle closed-ruled trap's precondition never
+            // forms and the loop stays ANALYTIC end to end.
+            //
             // A degenerate (zero) direction is treated as oblique here
             // so the loop falls back to sampling and the request fails
             // downstream with the same direction error as before.
@@ -2283,7 +2273,7 @@ fn materialise_profile_loop(
                 (Ok(d), Ok(n)) => d.dot(&n).abs() > 1.0 - 1e-9,
                 _ => false,
             };
-            if (has_circle && !along_normal) || has_closed_nurbs {
+            if has_circle && !along_normal {
                 *sampled_loops += 1;
                 Ok(ProfileLoop::Polygon(sample_topology_loop(
                     sketch,
@@ -3559,13 +3549,16 @@ mod tests {
         }
     }
 
-    /// SKETCH-DCM #45 Slice 7: a CLOSED single-edge spline loop takes
-    /// the EXPLICIT sampled fallback (counted honestly) — the kernel's
-    /// typed closed-ruled-trap refusal is pre-empted by the route, so
-    /// the caller can still extrude, with `sampled_loops` telling the
-    /// truth.
+    /// FLIPPED (SKETCH-DCM #45 follow-ups B, item 2 — Slice-6/7
+    /// test-flip precedent): this test used to pin the EXPLICIT
+    /// sampled fallback for a CLOSED single-edge spline loop (the
+    /// route pre-empting the kernel's closed-ruled-trap refusal). The
+    /// trap is fixed at the topology root (kernel seam-split), so the
+    /// SAME fixture now pins the ANALYTIC path: typed NURBS edges,
+    /// counted in `analytic_loops`. The pin's semantics survive — the
+    /// honesty counters still tell the truth about this loop.
     #[test]
-    fn slice7_closed_spline_loop_samples_explicitly() {
+    fn slice7_closed_spline_loop_materialises_analytically() {
         let m = manager();
         let id = m.create();
         let sketch = m.get(&id).expect("sketch");
@@ -3601,16 +3594,22 @@ mod tests {
                 .expect("materialise");
         assert_eq!(
             (analytic, sampled),
-            (0, 1),
-            "closed spline loop must fall back EXPLICITLY"
+            (1, 0),
+            "closed spline loop lifts analytically (kernel seam-split retired the trap)"
         );
-        assert!(
-            matches!(
-                regions[0].outer,
-                geometry_engine::operations::extrude::ProfileLoop::Polygon(_)
-            ),
-            "sampled polygon, honestly counted"
-        );
+        match &regions[0].outer {
+            geometry_engine::operations::extrude::ProfileLoop::Edges(edges) => {
+                assert_eq!(edges.len(), 1, "one typed closed NURBS edge");
+                assert!(
+                    matches!(
+                        edges[0],
+                        geometry_engine::sketch2d::sketch_topology::ProfileEdge::Nurbs { .. }
+                    ),
+                    "typed NURBS edge: {edges:?}"
+                );
+            }
+            other => panic!("expected typed edges, got {other:?}"),
+        }
     }
 
     /// SKETCH-DCM #45 Slice 7: pattern-route kernel flows (the same
