@@ -211,14 +211,18 @@ pub fn references_frame(constraint_type: &ConstraintType) -> bool {
             | GeometricConstraint::Centroid
             | GeometricConstraint::IntersectionAngle(_) => false,
             // Enforced relations between entities (SKETCH-DCM #45
-            // Slice 6) — invariant under a common rigid motion of
+            // Slices 6-7) — invariant under a common rigid motion of
             // everything involved, like Tangent/Parallel above.
-            GeometricConstraint::Offset | GeometricConstraint::MultiTangent => false,
-            // Honest-refuse kinds — the planner refuses components
-            // containing them before this classification matters; the
-            // conservative answer keeps them out of internal sets if
+            // CurvatureExtremum joined in Slice 7 (∂κ/∂u = 0 is a
+            // relation between the spline and the point's foot).
+            GeometricConstraint::Offset
+            | GeometricConstraint::MultiTangent
+            | GeometricConstraint::CurvatureExtremum => false,
+            // Honest-refuse kind — the planner refuses components
+            // containing it before this classification matters; the
+            // conservative answer keeps it out of internal sets if
             // that ever changes.
-            GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint => true,
+            GeometricConstraint::ContactConstraint => true,
         },
         ConstraintType::Dimensional(d) => match d {
             // Absolute coordinates / frame-relative slope.

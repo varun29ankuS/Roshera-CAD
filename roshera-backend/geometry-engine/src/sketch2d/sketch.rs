@@ -711,6 +711,94 @@ impl Sketch {
         Ok(id)
     }
 
+    /// Add a clamped (open-uniform) B-spline whose control points are
+    /// SHARED point entities (shared-variable model, SKETCH-DCM #45
+    /// Slice 7 — biomimicry).
+    ///
+    /// The solver registers the spline with ZERO private parameters:
+    /// its geometry is derived from the points' live state, so a drag
+    /// or dimension on any control point reshapes the curve, and the
+    /// DOF accounting counts each control point exactly once. Being
+    /// clamped, the curve interpolates its FIRST and LAST control
+    /// points — profile vertices can literally BE the endpoint control
+    /// points, welding organic joins structurally.
+    pub fn add_bspline_with_control_points(
+        &self,
+        degree: usize,
+        control_points: &[Point2dId],
+    ) -> Sketch2dResult<Spline2dId> {
+        let positions = self.resolve_control_points(control_points)?;
+        let bspline = BSpline2d::open_uniform(degree, positions)?;
+        let mut param_spline = ParametricSpline2d::new(Spline2d::BSpline(bspline));
+        param_spline.control_point_ids = Some(control_points.to_vec());
+        let id = param_spline.id;
+
+        let (min, max) = param_spline.bounding_box();
+        self.update_spatial_index(EntityRef::Spline(id), min, max);
+        self.splines.insert(id, param_spline);
+        Ok(id)
+    }
+
+    /// Add a clamped rational NURBS curve whose control points are
+    /// SHARED point entities. Weights are structural metadata (pinned
+    /// across solves — see `SplineMetadata::weights`); only the shared
+    /// points move. Mirrors [`Sketch::add_bspline_with_control_points`]
+    /// for the rational case.
+    pub fn add_nurbs_with_control_points(
+        &self,
+        degree: usize,
+        control_points: &[Point2dId],
+        weights: Vec<f64>,
+    ) -> Sketch2dResult<Spline2dId> {
+        let positions = self.resolve_control_points(control_points)?;
+        let n = positions.len();
+        if n < degree + 1 {
+            return Err(Sketch2dError::InvalidParameter {
+                parameter: "control_points".to_string(),
+                value: format!("{n} points"),
+                constraint: format!(
+                    "at least {} points required for degree {degree}",
+                    degree + 1
+                ),
+            });
+        }
+        let knots = crate::math::bspline::KnotVector::open_uniform(degree, n).to_vec();
+        let nurbs = NurbsCurve2d::new(degree, positions, weights, knots)?;
+        let mut param_spline = ParametricSpline2d::new(Spline2d::Nurbs(nurbs));
+        param_spline.control_point_ids = Some(control_points.to_vec());
+        let id = param_spline.id;
+
+        let (min, max) = param_spline.bounding_box();
+        self.update_spatial_index(EntityRef::Spline(id), min, max);
+        self.splines.insert(id, param_spline);
+        Ok(id)
+    }
+
+    /// The shared control-point ids of a spline, in control-polygon
+    /// order. `None` when the spline does not exist or is a legacy
+    /// (unshared) spline.
+    pub fn spline_control_point_ids(&self, id: &Spline2dId) -> Option<Vec<Point2dId>> {
+        self.splines
+            .get(id)
+            .and_then(|e| e.control_point_ids.clone())
+    }
+
+    /// Resolve shared control-point ids into live positions, failing
+    /// with `EntityNotFound` on the first missing point.
+    fn resolve_control_points(&self, control_points: &[Point2dId]) -> Sketch2dResult<Vec<Point2d>> {
+        let mut positions = Vec::with_capacity(control_points.len());
+        for pid in control_points {
+            positions.push(
+                self.get_point(pid)
+                    .ok_or_else(|| Sketch2dError::EntityNotFound {
+                        entity_type: "Point".to_string(),
+                        id: pid.to_string(),
+                    })?,
+            );
+        }
+        Ok(positions)
+    }
+
     // Polyline operations
 
     /// Add a polyline to the sketch

@@ -433,16 +433,25 @@ impl Constraint {
                     _ => 0,
                 },
 
+                // Stationary curvature at a point's foot (SKETCH-DCM
+                // #45 Slice 7): one row / one DOF for the supported
+                // `[spline, point]` shape (∂κ/∂u = 0 at the foot);
+                // every other shape removes ZERO DOF and refuses in
+                // the solver — the per-shape refusal pattern Offset /
+                // MultiTangent established in Slice 6.
+                GeometricConstraint::CurvatureExtremum => match self.entities.as_slice() {
+                    [EntityRef::Spline(_), EntityRef::Point(_)] => 1,
+                    _ => 0,
+                },
+
                 // Recognised but not yet enforceable by the numerical
-                // solver (no real residual equation). These remove ZERO
-                // DOF so they can never fake a "fully constrained"
+                // solver (no real residual equation). Removes ZERO
+                // DOF so it can never fake a "fully constrained"
                 // verdict; the solver additionally emits an irreducible
                 // residual (see `UNSUPPORTED_CONSTRAINT_RESIDUAL`) so a
                 // sketch carrying one is never reported solved. Keep this
                 // set in lock-step with `ConstraintType::is_numerically_enforced`.
-                GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint => {
-                    0
-                }
+                GeometricConstraint::ContactConstraint => 0,
             },
             ConstraintType::Dimensional(d) => match d {
                 DimensionalConstraint::Distance(_) => 1,
@@ -507,19 +516,21 @@ impl ConstraintType {
     ///
     /// SKETCH-DCM #45 Slice 6 shrank the refuse set from eight to three:
     /// `Offset`, `MultiTangent`, `OffsetDistance`, `MinDistance` and
-    /// `MaxDistance` now carry real residuals. Note the distinction:
+    /// `MaxDistance` now carry real residuals; Slice 7 lifted
+    /// `CurvatureExtremum` (∂κ/∂u = 0 on `[spline, point]`), leaving
+    /// {`ContactConstraint`, `MomentOfInertia`}. Note the distinction:
     /// this method is TYPE-level. `Offset`/`OffsetDistance`/
-    /// `MultiTangent` still refuse per-SHAPE (an unsupported entity
-    /// pairing emits the irreducible residual and removes 0 DOF), which
-    /// is why [`analyze_dofs`](super::sketch_solver::analyze_dofs)
+    /// `MultiTangent`/`CurvatureExtremum` still refuse per-SHAPE (an
+    /// unsupported entity pairing emits the irreducible residual and
+    /// removes 0 DOF), which is why
+    /// [`analyze_dofs`](super::sketch_solver::analyze_dofs)
     /// forces the numeric diagnosis whenever a constraint removes zero
     /// structural DOF.
     pub fn is_numerically_enforced(&self) -> bool {
         !matches!(
             self,
-            ConstraintType::Geometric(
-                GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint
-            ) | ConstraintType::Dimensional(DimensionalConstraint::MomentOfInertia(_))
+            ConstraintType::Geometric(GeometricConstraint::ContactConstraint)
+                | ConstraintType::Dimensional(DimensionalConstraint::MomentOfInertia(_))
         )
     }
 

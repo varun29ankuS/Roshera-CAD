@@ -64,6 +64,21 @@ use super::Sketch;
 /// verdict, and many orders below any geometrically meaningful error.
 const CERT_SATISFIED_TOLERANCE: f64 = 1e-8;
 
+/// Tangent-direction deviation (radians) at or below which a measured
+/// continuity join counts as satisfied. Matches the certificate's
+/// residual tolerance scale: a converged G1/G2 solve leaves the cross
+/// product (≈ the angle, small-angle regime) at ~1e-10; 1e-8 gives
+/// two orders of headroom while staying far below any geometrically
+/// visible kink.
+const CERT_TANGENT_TOLERANCE_RAD: f64 = 1e-8;
+
+/// Curvature deviation (units 1/length) at or below which a measured
+/// continuity join / curvature value counts as satisfied. Looser than
+/// the tangent tolerance because κ compounds two derivative orders
+/// (and the extremum fact differences κ numerically); still orders of
+/// magnitude below any design-relevant curvature step.
+const CERT_CURVATURE_TOLERANCE: f64 = 1e-6;
+
 /// Hard cap on consistency-oracle invocations per witness extraction.
 /// QuickXplain needs O(k·log(n/k)) checks for a size-k core among n
 /// candidates (Junker 2004), so 128 covers every realistic component;
@@ -231,6 +246,58 @@ pub struct ConflictWitness {
     pub oracle_calls: usize,
 }
 
+/// Which continuity relation a [`ContinuityFact`] certifies
+/// (SKETCH-DCM #45 Slice 7 — biomimicry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuityKind {
+    /// `SmoothTangent` — tangent-direction continuity at a join.
+    G1Tangent,
+    /// `CurvatureContinuity` — tangent + traversal-signed curvature
+    /// continuity at a join.
+    G2Curvature,
+    /// `Curvature(κ)` at a curve point (`[curve, point]` arity).
+    CurvatureValue,
+    /// `CurvatureExtremum` — stationary curvature at a point's foot.
+    CurvatureExtremum,
+}
+
+/// One certified continuity fact: the MEASURED deviation at a join,
+/// re-derived from live geometry by the certificate — never copied
+/// from a solver status ("the kernel cannot lie" extended to organic
+/// curves; SKETCH-DCM #45 Slice 7).
+///
+/// Honesty contract: `measured == false` means the constraint's
+/// entity pairing has no supported continuity measurement (the solver
+/// refuses it with an irreducible residual) — deviations are then
+/// `None` and `satisfied` is `false`. Deviations are never fabricated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContinuityFact {
+    /// The continuity constraint this fact certifies.
+    pub constraint: ConstraintId,
+    /// Which relation is being measured.
+    pub kind: ContinuityKind,
+    /// The join location in sketch coordinates (the shared point /
+    /// nearest endpoint pair midpoint / constrained point's foot).
+    /// `None` when unmeasured.
+    pub join: Option<[f64; 2]>,
+    /// Angle between the traversal tangent directions at the join,
+    /// radians in `[0, π]`. `Some` for G1/G2 facts; `None` for
+    /// curvature-value/extremum facts and unmeasured pairings.
+    pub tangent_deviation_rad: Option<f64>,
+    /// Curvature deviation (units 1/length): |κ₁ − κ₂| for G2,
+    /// |κ − target| for a curvature value, |∂κ/∂u| (parameter-scaled)
+    /// for an extremum. `None` for pure-G1 facts and unmeasured
+    /// pairings.
+    pub curvature_deviation: Option<f64>,
+    /// Every present deviation is inside the certificate tolerance
+    /// (`CERT_TANGENT_TOLERANCE_RAD` / `CERT_CURVATURE_TOLERANCE`).
+    /// Always `false` when unmeasured.
+    pub satisfied: bool,
+    /// Whether the kernel could actually measure this pairing.
+    pub measured: bool,
+}
+
 /// Structural DOF tallies backing the constrainedness verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DofSnapshot {
@@ -282,6 +349,11 @@ pub struct CertificateSummary {
     pub under_constrained_entities: usize,
     /// Entities implicated by a conflict set.
     pub over_constrained_entities: usize,
+    /// Continuity facts (G1/G2/curvature) whose measured deviation
+    /// exceeds tolerance, or whose pairing could not be measured
+    /// (Slice 7). Additive — defaults to 0 for pre-Slice-7 payloads.
+    #[serde(default)]
+    pub continuity_violations: usize,
     /// Conflict witnesses, ids only.
     pub witnesses: Vec<CompactWitness>,
 }
@@ -329,6 +401,11 @@ pub struct SketchValidityCertificate {
     pub entity_statuses: Vec<EntityStatus>,
     /// Minimal (or honestly-flagged non-minimal) conflict sets (v2).
     pub witnesses: Vec<ConflictWitness>,
+    /// Measured continuity facts for every G1/G2/curvature constraint,
+    /// ascending by constraint id (Slice 7). Additive — absent from
+    /// pre-Slice-7 payloads deserialises as empty.
+    #[serde(default)]
+    pub continuity: Vec<ContinuityFact>,
 }
 
 impl SketchValidityCertificate {
@@ -395,6 +472,7 @@ impl SketchValidityCertificate {
             fully_constrained_entities: fully,
             under_constrained_entities: under,
             over_constrained_entities: over,
+            continuity_violations: self.continuity.iter().filter(|f| !f.satisfied).count(),
             witnesses: self
                 .witnesses
                 .iter()
@@ -538,7 +616,89 @@ pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
         constraint_facts: system.constraint_facts,
         entity_statuses: system.entity_statuses,
         witnesses: system.witnesses,
+        continuity: continuity_facts(sketch),
     }
+}
+
+/// Measure every continuity-class constraint against the sketch's
+/// CURRENT geometry (SKETCH-DCM #45 Slice 7). Runs on a fresh,
+/// UN-solved diagnostic solver so the deviations describe the sketch
+/// as it stands — never the diagnostic re-solve's compromise state.
+/// Unsupported pairings surface as `measured: false` facts (the
+/// solver refuses their residuals; the certificate refuses to invent
+/// numbers for them).
+fn continuity_facts(sketch: &Sketch) -> Vec<ContinuityFact> {
+    use super::constraints::{DimensionalConstraint, GeometricConstraint};
+
+    let mut constraints = sketch.all_constraints();
+    constraints.sort_by_key(|c| c.id.0);
+    let has_continuity = constraints.iter().any(|c| {
+        matches!(
+            c.constraint_type,
+            ConstraintType::Geometric(
+                GeometricConstraint::SmoothTangent
+                    | GeometricConstraint::CurvatureContinuity
+                    | GeometricConstraint::CurvatureExtremum
+            )
+        ) || matches!(
+            c.constraint_type,
+            ConstraintType::Dimensional(DimensionalConstraint::Curvature(_))
+        ) && c.entities.len() == 2
+    });
+    if !has_continuity {
+        return Vec::new();
+    }
+
+    let measurer = super::sketch_solver::build_diagnostic_solver(sketch, Vec::new());
+    let mut facts = Vec::new();
+    for c in &constraints {
+        let kind = match &c.constraint_type {
+            ConstraintType::Geometric(GeometricConstraint::SmoothTangent) => {
+                ContinuityKind::G1Tangent
+            }
+            ConstraintType::Geometric(GeometricConstraint::CurvatureContinuity) => {
+                ContinuityKind::G2Curvature
+            }
+            ConstraintType::Geometric(GeometricConstraint::CurvatureExtremum) => {
+                ContinuityKind::CurvatureExtremum
+            }
+            ConstraintType::Dimensional(DimensionalConstraint::Curvature(_))
+                if c.entities.len() == 2 =>
+            {
+                ContinuityKind::CurvatureValue
+            }
+            _ => continue,
+        };
+        match measurer.measure_continuity(c) {
+            Some(m) => {
+                let tangent_ok = m
+                    .tangent_deviation_rad
+                    .map_or(true, |d| d <= CERT_TANGENT_TOLERANCE_RAD);
+                let curvature_ok = m
+                    .curvature_deviation
+                    .map_or(true, |d| d <= CERT_CURVATURE_TOLERANCE);
+                facts.push(ContinuityFact {
+                    constraint: c.id,
+                    kind,
+                    join: Some([m.join.x, m.join.y]),
+                    tangent_deviation_rad: m.tangent_deviation_rad,
+                    curvature_deviation: m.curvature_deviation,
+                    satisfied: tangent_ok && curvature_ok,
+                    measured: true,
+                });
+            }
+            None => facts.push(ContinuityFact {
+                constraint: c.id,
+                kind,
+                join: None,
+                tangent_deviation_rad: None,
+                curvature_deviation: None,
+                satisfied: false,
+                measured: false,
+            }),
+        }
+    }
+    facts
 }
 
 /// Run the isolated diagnostic solve and derive every v2 fact.

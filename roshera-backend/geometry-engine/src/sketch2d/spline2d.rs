@@ -92,6 +92,28 @@ impl Spline2d {
             Spline2d::Nurbs(nurbs) => nurbs.control_points.len(),
         }
     }
+
+    /// Position + first/second derivatives at `u` (SKETCH-DCM #45
+    /// Slice 7): dispatches to the exact de Boor (B-Spline) or
+    /// rational quotient-rule (NURBS) evaluators.
+    pub fn derivatives2(&self, u: f64) -> Sketch2dResult<(Point2d, Vector2d, Vector2d)> {
+        match self {
+            Spline2d::BSpline(bs) => bs.derivatives2(u),
+            Spline2d::Nurbs(nurbs) => nurbs.derivatives2(u),
+        }
+    }
+
+    /// Closest-point projection `(foot, u)` of `point` onto the curve.
+    pub fn closest_point(
+        &self,
+        point: &Point2d,
+        tolerance: &Tolerance2d,
+    ) -> Sketch2dResult<(Point2d, f64)> {
+        match self {
+            Spline2d::BSpline(bs) => bs.closest_point(point, tolerance),
+            Spline2d::Nurbs(nurbs) => nurbs.closest_point(point, tolerance),
+        }
+    }
 }
 
 /// A 2D B-Spline curve (non-rational)
@@ -297,6 +319,40 @@ impl BSpline2d {
         } else {
             (0.0, 1.0)
         }
+    }
+
+    /// Position, first and second derivative at `u` (SKETCH-DCM #45
+    /// Slice 7). Delegates to the math-layer de Boor derivative
+    /// evaluator (Piegl & Tiller A3.2); the planar signed curvature
+    /// κ(u) = (x'y'' − y'x'') / |r'|³ derives from these.
+    pub fn derivatives2(&self, u: f64) -> Sketch2dResult<(Point2d, Vector2d, Vector2d)> {
+        let points_3d: Vec<Point3> = self
+            .control_points
+            .iter()
+            .map(|p| Point3::new(p.x, p.y, 0.0))
+            .collect();
+        let curve_3d =
+            BSplineCurve::new(self.degree, points_3d, self.knots.clone()).map_err(|e| {
+                Sketch2dError::NumericalError {
+                    description: format!("Failed to create 3D curve: {:?}", e),
+                }
+            })?;
+        let derivs =
+            curve_3d
+                .evaluate_derivatives(u, 2)
+                .map_err(|e| Sketch2dError::NumericalError {
+                    description: format!("Failed to evaluate derivatives: {:?}", e),
+                })?;
+        if derivs.len() < 3 {
+            return Err(Sketch2dError::NumericalError {
+                description: "B-spline second derivative unavailable".to_string(),
+            });
+        }
+        Ok((
+            Point2d::new(derivs[0].x, derivs[0].y),
+            Vector2d::new(derivs[1].x, derivs[1].y),
+            Vector2d::new(derivs[2].x, derivs[2].y),
+        ))
     }
 
     /// Find the closest point on the curve to a given point
@@ -621,6 +677,39 @@ impl NurbsCurve2d {
         Ok(Vector2d::new(d1.x, d1.y))
     }
 
+    /// Position, first and second derivative at `u` (SKETCH-DCM #45
+    /// Slice 7). Delegates to the math-layer rational evaluator
+    /// (Piegl & Tiller A4.2, quotient rule) so weights are respected —
+    /// projecting them away would give the wrong curvature.
+    pub fn derivatives2(&self, u: f64) -> Sketch2dResult<(Point2d, Vector2d, Vector2d)> {
+        let points_3d: Vec<Point3> = self
+            .control_points
+            .iter()
+            .map(|p| Point3::new(p.x, p.y, 0.0))
+            .collect();
+        let curve_3d = NurbsCurve::new(
+            points_3d,
+            self.weights.clone(),
+            self.knots.clone(),
+            self.degree,
+        )
+        .map_err(|e| Sketch2dError::NumericalError {
+            description: format!("Failed to create 3D NURBS: {:?}", e),
+        })?;
+        let p = curve_3d.evaluate_derivatives(u, 2);
+        let d1 = p.derivative1.ok_or_else(|| Sketch2dError::NumericalError {
+            description: "NURBS first derivative unavailable".to_string(),
+        })?;
+        let d2 = p.derivative2.ok_or_else(|| Sketch2dError::NumericalError {
+            description: "NURBS second derivative unavailable".to_string(),
+        })?;
+        Ok((
+            Point2d::new(p.point.x, p.point.y),
+            Vector2d::new(d1.x, d1.y),
+            Vector2d::new(d2.x, d2.y),
+        ))
+    }
+
     /// Closest-point projection: returns `(foot, u)` minimising the
     /// 2D distance from `point` to the curve.
     ///
@@ -663,6 +752,18 @@ pub struct ParametricSpline2d {
     constraint_count: usize,
     /// Construction geometry flag
     pub is_construction: bool,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 7): when `Some`,
+    /// every control point of this spline IS a shared point entity —
+    /// one id per control point, in control-polygon order. The solver
+    /// then registers the spline as a DERIVED entity with ZERO private
+    /// parameters (its geometry is computed from the points' live
+    /// state), so control points are draggable, constrainable, and
+    /// counted ONCE in the DOF accounting — the segment/arc coupling
+    /// of A.2 / Slice 1 extended to organic curves. `None` = legacy
+    /// spline carrying its own control-point coordinates. If a
+    /// referenced point is deleted the classifier degrades the spline
+    /// to the legacy path (same contract as arcs).
+    pub control_point_ids: Option<Vec<super::Point2dId>>,
 }
 
 impl ParametricSpline2d {
@@ -673,6 +774,7 @@ impl ParametricSpline2d {
             spline,
             constraint_count: 0,
             is_construction: false,
+            control_point_ids: None,
         }
     }
 
@@ -746,11 +848,14 @@ impl SketchEntity2d for ParametricSpline2d {
     }
 
     fn clone_entity(&self) -> Box<dyn SketchEntity2d> {
+        // Clone drops shared-point links (line/arc precedent): the
+        // copy owns plain geometry until re-linked explicitly.
         Box::new(ParametricSpline2d {
             id: Spline2dId::new(),
             spline: self.spline.clone(),
             constraint_count: 0,
             is_construction: self.is_construction,
+            control_point_ids: None,
         })
     }
 }

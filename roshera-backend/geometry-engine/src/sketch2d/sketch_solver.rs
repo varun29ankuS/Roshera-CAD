@@ -713,14 +713,23 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         entities_analysed += 1;
         total_free_dofs += 5;
     }
-    // Splines (B-Spline and NURBS): 2 DOFs per control point.
-    // Mirrors the solver-side `EntityState::spline_{bspline,nurbs}`
-    // parameter pack registered by `populate_solver` — knots and
-    // (for NURBS) weights are pinned in `SplineMetadata` and never
-    // become free DOFs of Newton-Raphson. The 2n count therefore
-    // exactly matches what the solver will iterate.
+    // Splines (B-Spline and NURBS): 2 DOFs per control point for a
+    // LEGACY (parameter-carrying) spline. A shared-CP spline
+    // (SKETCH-DCM #45 Slice 7, `control_point_ids = Some(..)` with
+    // every point alive) owns ZERO private DOF — its geometry IS its
+    // points, already counted above. Counting a shared spline as 2n
+    // would double-book every control point and leave any organic
+    // profile permanently "under-constrained" — the same phantom-DOF
+    // bug the derived-segment (A.2) and shared-arc (Slice 1) fixes
+    // killed. The classification is `spline_shared_control_points`,
+    // shared with `populate_solver`, so the count matches what
+    // Newton-Raphson actually iterates. Knots and (for NURBS)
+    // weights are pinned in `SplineMetadata` either way.
     for entry in sketch.splines().iter() {
         entities_analysed += 1;
+        if spline_shared_control_points(sketch, entry.value()).is_some() {
+            continue;
+        }
         let cp_count = match &entry.value().spline {
             Spline2d::BSpline(bs) => bs.control_points.len(),
             Spline2d::Nurbs(nurbs) => nurbs.control_points.len(),
@@ -1068,6 +1077,27 @@ fn circle_shared_center(sketch: &Sketch, circle: &ParametricCircle2d) -> Option<
         .filter(|id| sketch.points().contains_key(id))
 }
 
+/// Shared control-point ids of a spline, iff EVERY referenced point
+/// still exists and the count matches the stored geometry (SKETCH-DCM
+/// #45 Slice 7). Shared by [`populate_solver`] and [`analyze_dofs`] —
+/// the lock-step classifier keeps the structural DOF count and the
+/// solver's Jacobian columns from ever drifting apart. A spline whose
+/// linkage is broken (deleted point, count mismatch) degrades to the
+/// legacy parameter-carrying path.
+fn spline_shared_control_points(
+    sketch: &Sketch,
+    spline: &ParametricSpline2d,
+) -> Option<Vec<super::Point2dId>> {
+    let ids = spline.control_point_ids.as_ref()?;
+    if ids.len() != spline.spline.control_point_count() {
+        return None;
+    }
+    if !ids.iter().all(|id| sketch.points().contains_key(id)) {
+        return None;
+    }
+    Some(ids.clone())
+}
+
 /// Register every supported entity with the solver.
 ///
 /// Returns the count of entities registered. Points, lines, circles,
@@ -1171,7 +1201,8 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                         EntityRef::Point(start),
                         EntityRef::Point(end),
                         center_offset,
-                    ),
+                    )
+                    .with_arc_ccw(arc.arc.ccw),
                 );
             }
             ArcSolverMode::SharedCenter { center } => {
@@ -1182,7 +1213,8 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                         arc.arc.radius,
                         arc.arc.start_angle,
                         arc.arc.end_angle,
-                    ),
+                    )
+                    .with_arc_ccw(arc.arc.ccw),
                 );
             }
             ArcSolverMode::Legacy => {
@@ -1200,7 +1232,8 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                         false,
                         false,
                         false,
-                    ),
+                    )
+                    .with_arc_ccw(arc.arc.ccw),
                 );
             }
         }
@@ -1262,6 +1295,35 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     for entry in sketch.splines().iter() {
         let id = *entry.key();
         let spline: &ParametricSpline2d = entry.value();
+        // SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 7): a spline
+        // whose control points are shared point entities registers as
+        // a DERIVED entity — zero own DOF, geometry computed from the
+        // points' live solver state. This is what makes a Distance
+        // dimension on a control point and a PointOnCurve residual on
+        // the spline pull on the SAME unknowns, and what lets a
+        // control-point drag reshape the curve. A broken linkage
+        // degrades to the legacy parameter-carrying path below.
+        if let Some(ids) = spline_shared_control_points(sketch, spline) {
+            let (degree, knots, weights) = match &spline.spline {
+                Spline2d::BSpline(bs) => (bs.degree, bs.knots.clone(), None),
+                Spline2d::Nurbs(nurbs) => (
+                    nurbs.degree,
+                    nurbs.knots.clone(),
+                    Some(nurbs.weights.clone()),
+                ),
+            };
+            solver.add_entity(
+                EntityRef::Spline(id),
+                EntityState::spline_shared(
+                    degree,
+                    knots,
+                    weights,
+                    ids.into_iter().map(EntityRef::Point).collect(),
+                ),
+            );
+            registered += 1;
+            continue;
+        }
         // Spline registration (slice C-4-b). The solver's parameter
         // pack is 2n entries regardless of rationality — weights and
         // knots are pinned in `SplineMetadata`, so the solver only
@@ -1571,6 +1633,53 @@ fn apply_solver_result(sketch: &Sketch, result: &SolverResult) {
         };
         if let Ok(segment) = LineSegment2d::new(a, b) {
             entry.value_mut().geometry = LineGeometry::Segment(segment);
+        }
+    }
+
+    // SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 7): rebuild each
+    // shared-CP spline's stored geometry from its points' SOLVED
+    // positions — same single-writer contract as the segment pass
+    // above. Shared splines emit no `EntityUpdate` (they own no
+    // parameters), so this pass is the only writer of their geometry;
+    // the stored control points are BITWISE the shared points'
+    // positions. A broken linkage (deleted point, count mismatch)
+    // leaves the prior geometry intact.
+    for mut entry in sketch.splines().iter_mut() {
+        let Some(ids) = entry.value().control_point_ids.clone() else {
+            continue;
+        };
+        let mut cps = Vec::with_capacity(ids.len());
+        let mut complete = true;
+        for id in &ids {
+            match sketch.points().get(id).map(|p| p.value().position) {
+                Some(p) => cps.push(p),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+        let updated = match &entry.value().spline {
+            Spline2d::BSpline(bs) if cps.len() == bs.control_points.len() => {
+                BSpline2d::new(bs.degree, cps, bs.knots.clone())
+                    .ok()
+                    .map(Spline2d::BSpline)
+            }
+            Spline2d::Nurbs(nurbs) if cps.len() == nurbs.control_points.len() => NurbsCurve2d::new(
+                nurbs.degree,
+                cps,
+                nurbs.weights.clone(),
+                nurbs.knots.clone(),
+            )
+            .ok()
+            .map(Spline2d::Nurbs),
+            _ => None,
+        };
+        if let Some(spline) = updated {
+            entry.value_mut().spline = spline;
         }
     }
 }

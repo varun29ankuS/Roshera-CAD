@@ -20,7 +20,7 @@
 
 use super::constraints::{ConstraintPriority, EntityRef};
 use super::polyline2d::Polyline2d;
-use super::spline2d::{BSpline2d, NurbsCurve2d};
+use super::spline2d::{BSpline2d, NurbsCurve2d, Spline2d};
 use super::{
     Constraint, ConstraintId, ConstraintType, DimensionalConstraint, GeometricConstraint, Point2d,
     Tolerance2d, Vector2d,
@@ -371,6 +371,26 @@ pub struct EntityState {
     /// an implicit equidistance residual — refused rather than faked,
     /// see the `ParametricArc2d::center_point` doc).
     derived_center: Option<EntityRef>,
+    /// SHARED-VARIABLE MODEL (SKETCH-DCM #45 Slice 7 — biomimicry):
+    /// when `Some`, this SPLINE entity's control points ARE the
+    /// referenced point entities, in control-polygon order. It owns
+    /// NO parameters of its own (`parameters` is empty — zero Jacobian
+    /// columns); curve reconstruction reads every control point from
+    /// the points' live state, so a `PointOnCurve` residual on the
+    /// spline and a `Distance` on a control point differentiate
+    /// against the SAME unknowns. Degree/knots/weights stay pinned in
+    /// [`Self::spline`] exactly as for parameter-carrying splines.
+    derived_spline_cps: Option<Vec<EntityRef>>,
+    /// Traversal orientation bit for ARC entities (SKETCH-DCM #45
+    /// Slice 7): `true` = the arc sweeps start→end counter-clockwise.
+    /// Structural metadata, never a solver parameter (discrete);
+    /// needed by the continuity evaluators to compute
+    /// TRAVERSAL-SIGNED curvature (an unsigned 1/r cannot distinguish
+    /// an S-join's inflection from a genuine G2 join). Defaults to
+    /// `true`; `populate_solver` stamps the sketch entity's actual
+    /// bit via [`EntityState::with_arc_ccw`]. Meaningless for
+    /// non-arc kinds.
+    arc_ccw: bool,
 }
 
 /// Decode the flat `[x0, y0, x1, y1, …]` spline-control-point pack
@@ -1409,17 +1429,15 @@ impl ConstraintSolver {
         for entry in self.entity_state.iter() {
             let owner = *entry.key();
             nodes.push(owner);
-            let state = entry.value();
-            if let Some((start, end)) = state.derived_segment {
-                shared_ref_edges.push((owner, start));
-                shared_ref_edges.push((owner, end));
-            }
-            if let Some((start, end)) = state.derived_arc_endpoints {
-                shared_ref_edges.push((owner, start));
-                shared_ref_edges.push((owner, end));
-            }
-            if let Some(center) = state.derived_center {
-                shared_ref_edges.push((owner, center));
+            // Route through `derived_refs` so EVERY derived-entity
+            // kind couples structurally — segments/arcs/centers
+            // (Slice 1) AND shared-CP splines (Slice 7). Building the
+            // edges from the individual fields here previously left a
+            // shared-CP spline's control points in foreign components,
+            // so the component sub-solver could not reconstruct the
+            // curve and every continuity residual refused.
+            for derived in entry.value().derived_refs() {
+                shared_ref_edges.push((owner, derived));
             }
         }
         let constraint_entities: Vec<&[EntityRef]> = self
@@ -1659,24 +1677,19 @@ impl ConstraintSolver {
                 }
             }
             GeometricConstraint::SmoothTangent => {
-                // G1 continuity between curves
-                if entities.len() == 2 {
-                    self.evaluate_g1_continuity(&entities[0], &entities[1])
-                } else {
-                    vec![0.0, 0.0]
-                }
+                // G1 continuity between curves (SKETCH-DCM #45
+                // Slice 7): one tangency row at the join; the
+                // 2-entity and 3-entity ([c1, c2, connection_point])
+                // arities are both real, and unsupported pairings
+                // REFUSE — never a silent zero.
+                self.evaluate_g1_continuity(entities)
             }
             GeometricConstraint::CurvatureContinuity => {
-                // G2 continuity between curves. One row (κ₁ − κ₂ at
-                // the join) — the malformed-arity fallback previously
-                // emitted THREE rows against a 1-row budget, another
-                // instance of the row-budget mismatch fixed in
-                // `constraint_error_count` (SKETCH-DCM #45 Slice 6).
-                if entities.len() == 2 {
-                    self.evaluate_g2_continuity(&entities[0], &entities[1])
-                } else {
-                    vec![0.0]
-                }
+                // G2 continuity (SKETCH-DCM #45 Slice 7): tangency
+                // row + TRAVERSAL-SIGNED curvature row at the join.
+                // The row budget is 2 in `constraint_error_count`;
+                // refusals emit 2 refuse rows to keep it exact.
+                self.evaluate_g2_continuity(entities)
             }
             GeometricConstraint::IntersectionAngle(target_angle) => {
                 // Entities are [line1, line2, intersection_point]; the
@@ -1743,13 +1756,16 @@ impl ConstraintSolver {
             GeometricConstraint::Offset => self.evaluate_offset_constraint(entities),
             // One line tangent to N curves (SKETCH-DCM #45 Slice 6).
             GeometricConstraint::MultiTangent => self.evaluate_multitangent_constraint(entities),
+            // Stationary curvature at a point's foot (SKETCH-DCM #45
+            // Slice 7): ∂κ/∂u = 0 on `[spline, point]`; every other
+            // shape refuses per-shape (the Offset/MultiTangent
+            // precedent).
+            GeometricConstraint::CurvatureExtremum => self.evaluate_curvature_extremum(entities),
             // Recognised but not yet enforceable with a real equation.
             // Emit an irreducible residual so the solver refuses to claim
-            // a solve rather than silently DOF-counting them (they also
-            // remove 0 DOF — see `degrees_of_freedom_removed`).
-            GeometricConstraint::CurvatureExtremum | GeometricConstraint::ContactConstraint => {
-                Self::unsupported_residual()
-            }
+            // a solve rather than silently DOF-counting it (it also
+            // removes 0 DOF — see `degrees_of_freedom_removed`).
+            GeometricConstraint::ContactConstraint => Self::unsupported_residual(),
         }
     }
 
@@ -1878,15 +1894,26 @@ impl ConstraintSolver {
                 }
             }
             DimensionalConstraint::Curvature(target_k) => {
-                // Curvature at the entity: κ − target (κ = 1/r for
-                // circle/arc, 0 for a line).
-                if entities.len() == 1 {
-                    match self.entity_curvature(&entities[0]) {
+                // Two arities (SKETCH-DCM #45 Slice 7):
+                //  - `[curve]` — constant-curvature entities only:
+                //    κ − target with κ = 1/r (circle/arc), 0 (line).
+                //  - `[curve, point]` — curvature AT the point's foot
+                //    on the curve (traversal-signed for splines/arcs):
+                //    the biomimetic "curvature value at a curve point"
+                //    control.
+                // Unsupported shapes refuse irreducibly.
+                match entities {
+                    [e] => match self.entity_curvature(e) {
                         Some(k) => vec![k - target_k],
                         None => Self::unsupported_residual(),
+                    },
+                    [curve, point @ EntityRef::Point(_)] => {
+                        match self.curvature_at_point_foot(curve, point) {
+                            Some((_, k)) => vec![k - target_k],
+                            None => Self::unsupported_residual(),
+                        }
                     }
-                } else {
-                    Self::unsupported_residual()
+                    _ => Self::unsupported_residual(),
                 }
             }
             DimensionalConstraint::Slope(target_slope) => {
@@ -2579,12 +2606,18 @@ impl ConstraintSolver {
                 // op minting `Symmetric`). Each matches its evaluator:
                 // Concentric = center delta (Δx, Δy); Symmetric =
                 // reflected-position delta (Δx, Δy); Midpoint =
-                // midpoint delta (Δx, Δy); SmoothTangent = tangency
-                // cross + magnitude match.
+                // midpoint delta (Δx, Δy); CurvatureContinuity (G2,
+                // SKETCH-DCM #45 Slice 7) = tangency cross +
+                // traversal-signed curvature match, refusals emitting
+                // two refuse rows. SmoothTangent (G1) moved DOWN to
+                // the 1-row default in Slice 7 — it is tangent
+                // DIRECTION continuity only; the old second row
+                // (tangent-magnitude match) was not G1 and reported
+                // phantom violations on unequal segment lengths.
                 GeometricConstraint::Concentric
                 | GeometricConstraint::Symmetric
                 | GeometricConstraint::Midpoint
-                | GeometricConstraint::SmoothTangent => 2,
+                | GeometricConstraint::CurvatureContinuity => 2,
                 // Offset correspondence (SKETCH-DCM #45 Slice 6): 3 rows
                 // for a line pair, 2 (concentric) for a circle/arc pair,
                 // 1 refuse row otherwise — must match
@@ -2707,11 +2740,26 @@ impl ConstraintSolver {
             // λ is scaled by the trace of J^T·J so it adapts to the
             // problem magnitude — a constant λ would over-regularise
             // small-residual systems and under-regularise large ones.
+            //
+            // FLOOR (SKETCH-DCM #45 Slice 7 — mechanism, not tuning):
+            // the Gaussian elimination rejects pivots below
+            // `STRICT_TOLERANCE` (1e-9) in ABSOLUTE terms, so a
+            // trace-scaled λ below that floor makes the regularised
+            // solve fail exactly where regularisation is needed most —
+            // small-gradient rows (curvature-class residuals have
+            // O(1e-2) gradients, giving trace/n·1e-8 ≈ 1e-13) and
+            // low-weight soft rows (the Slice-1 report's documented
+            // residual #5). Clamping λ to 10× the pivot threshold
+            // guarantees the regularised diagonal clears rejection.
+            // Only previously-FAILING solves change behaviour: any
+            // system whose trace-scaled λ already exceeded the floor
+            // takes the identical step it always took.
             let trace: f64 = (0..nr).map(|i| jtj[i][i]).sum();
+            let lambda_floor = STRICT_TOLERANCE.distance() * 10.0;
             let lambda = if trace > 0.0 {
-                (trace / nr as f64) * 1e-8
+                ((trace / nr as f64) * 1e-8).max(lambda_floor)
             } else {
-                STRICT_TOLERANCE.distance()
+                lambda_floor
             };
             for (i, row) in jtj.iter_mut().enumerate() {
                 row[i] += lambda;
@@ -2866,9 +2914,17 @@ impl ConstraintSolver {
                     state.parameters[3],
                     state.parameters[4],
                 ),
-                EntityRef::Spline(_) | EntityRef::Polyline(_) => {
+                EntityRef::Spline(_) => {
+                    if state.derived_spline_cps.is_some() {
+                        // Shared-CP splines own no parameters; the
+                        // sketch bridge re-derives their geometry from
+                        // the points' solved positions (single-writer
+                        // sync, same contract as derived segments).
+                        continue;
+                    }
                     EntityUpdate::Parameters(state.parameters.clone())
                 }
+                EntityRef::Polyline(_) => EntityUpdate::Parameters(state.parameters.clone()),
             };
 
             updates.insert(entity, update);
@@ -3348,13 +3404,14 @@ impl ConstraintSolver {
         if !matches!(entity, EntityRef::Spline(_)) {
             return None;
         }
-        let state = self.entity_state.get(entity)?;
-        let meta = state.spline.as_ref()?;
+        // Clone the pinned metadata out and DROP the guard before the
+        // shared-CP dispatch re-enters the map for the point entities.
+        let meta = self.entity_state.get(entity)?.spline.clone()?;
         if meta.weights.is_some() {
             return None;
         }
-        let control_points = control_points_from_parameters(&state.parameters)?;
-        BSpline2d::new(meta.degree, control_points, meta.knots.clone()).ok()
+        let control_points = self.spline_control_point_positions(entity)?;
+        BSpline2d::new(meta.degree, control_points, meta.knots).ok()
     }
 
     /// Reconstruct a [`NurbsCurve2d`] from the entity state when
@@ -3369,20 +3426,36 @@ impl ConstraintSolver {
         if !matches!(entity, EntityRef::Spline(_)) {
             return None;
         }
-        let state = self.entity_state.get(entity)?;
-        let meta = state.spline.as_ref()?;
-        let weights = meta.weights.as_ref()?;
-        let control_points = control_points_from_parameters(&state.parameters)?;
+        // Same guard discipline as `get_bspline2d`: metadata cloned
+        // out before the shared-CP point reads.
+        let meta = self.entity_state.get(entity)?.spline.clone()?;
+        let weights = meta.weights?;
+        let control_points = self.spline_control_point_positions(entity)?;
         if weights.len() != control_points.len() {
             return None;
         }
-        NurbsCurve2d::new(
-            meta.degree,
-            control_points,
-            weights.clone(),
-            meta.knots.clone(),
-        )
-        .ok()
+        NurbsCurve2d::new(meta.degree, control_points, weights, meta.knots).ok()
+    }
+
+    /// Live control-point positions of a spline entity: the referenced
+    /// points' state for a shared-CP spline (SKETCH-DCM #45 Slice 7),
+    /// the entity's own `[x0, y0, x1, y1, …]` parameter pack otherwise.
+    /// `None` when any shared point is missing (the residual degrades
+    /// to zero for the iteration — "preserve identity, never poison").
+    fn spline_control_point_positions(&self, entity: &EntityRef) -> Option<Vec<Point2d>> {
+        let derived = self
+            .entity_state
+            .get(entity)
+            .and_then(|s| s.derived_spline_cps.clone());
+        if let Some(refs) = derived {
+            let mut cps = Vec::with_capacity(refs.len());
+            for r in &refs {
+                cps.push(self.get_point_position(r)?);
+            }
+            return Some(cps);
+        }
+        let state = self.entity_state.get(entity)?;
+        control_points_from_parameters(&state.parameters)
     }
 
     /// Reconstruct a [`Polyline2d`] from the entity state when
@@ -3467,31 +3540,414 @@ impl ConstraintSolver {
     }
 
     /// Evaluate G1 continuity (tangent continuity)
-    fn evaluate_g1_continuity(&self, curve1: &EntityRef, curve2: &EntityRef) -> Vec<f64> {
-        // Get tangent vectors at connection point
-        if let (Some(t1), Some(t2)) = (
-            self.get_curve_tangent_at_end(curve1),
-            self.get_curve_tangent_at_start(curve2),
-        ) {
-            // Tangents should be parallel (cross product = 0)
-            vec![t1.cross(&t2), (t1.magnitude() - t2.magnitude()) * 0.1] // Also try to match magnitudes
-        } else {
-            vec![0.0, 0.0]
+    /// G1 (tangent-direction) continuity residual — SKETCH-DCM #45
+    /// Slice 7.
+    ///
+    /// One row: the cross product of the two UNIT traversal tangents
+    /// at the join. Direction continuity only — magnitudes are
+    /// parameterisation artifacts and must not enter (the old
+    /// `(|t1|−|t2|)·0.1` row demanded equal segment lengths, a C1-ish
+    /// hack that reported phantom violations). Unsupported pairings /
+    /// arities refuse irreducibly, never a silent zero.
+    ///
+    /// Note the cross-product residual is sign-agnostic between a
+    /// smooth join and a cusp (anti-parallel tangents): both zero it.
+    /// The solve stays in the basin of the initial placement; the
+    /// certificate's measured tangent deviation (in [0, π]) is what
+    /// distinguishes them for the caller.
+    fn evaluate_g1_continuity(&self, entities: &[EntityRef]) -> Vec<f64> {
+        match self.continuity_pair(entities) {
+            Some((f1, f2)) => vec![f1.tangent.cross(&f2.tangent)],
+            None => Self::unsupported_residual(),
         }
     }
 
-    /// Evaluate G2 continuity (curvature continuity).
-    /// Returns the scalar curvature mismatch κ₁ − κ₂ at the join. G2 holds
-    /// when this residual is zero. Higher-order terms (G3, G4...) are out
-    /// of scope for the 2D constraint solver.
-    fn evaluate_g2_continuity(&self, curve1: &EntityRef, curve2: &EntityRef) -> Vec<f64> {
-        if let (Some(k1), Some(k2)) = (
-            self.get_curve_curvature_at_end(curve1),
-            self.get_curve_curvature_at_start(curve2),
-        ) {
-            vec![k1 - k2]
+    /// G2 (curvature) continuity residual — SKETCH-DCM #45 Slice 7.
+    ///
+    /// Two rows: the G1 tangency cross product PLUS the
+    /// TRAVERSAL-SIGNED curvature mismatch κ₁ − κ₂ at the join.
+    /// Signed curvature is `(x'y'' − y'x'') / |r'|³` oriented along
+    /// the walk through the join (reversing a curve's traversal
+    /// flips both its tangent and its κ sign) — an unsigned |κ|
+    /// comparison cannot distinguish an S-join's inflection (κ jump
+    /// of 2/r) from a genuine G2 join, which is exactly the lie the
+    /// Slice-7 gate pins away. Higher-order continuity (G3+) is out
+    /// of scope for the 2D solver. Refusals emit 2 refuse rows.
+    fn evaluate_g2_continuity(&self, entities: &[EntityRef]) -> Vec<f64> {
+        match self.continuity_pair(entities) {
+            Some((f1, f2)) => vec![f1.tangent.cross(&f2.tangent), f1.curvature - f2.curvature],
+            None => vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2],
+        }
+    }
+
+    /// Stationary-curvature residual (`CurvatureExtremum`,
+    /// SKETCH-DCM #45 Slice 7): ∂κ/∂u evaluated at the constrained
+    /// point's foot on the spline — zero exactly where the curvature
+    /// field is stationary (a local min/max, the biomimetic "apex"
+    /// control). Supported shape is `[spline, point]`; everything
+    /// else refuses per-shape with the irreducible residual (and
+    /// removes zero DOF — see `degrees_of_freedom_removed`).
+    fn evaluate_curvature_extremum(&self, entities: &[EntityRef]) -> Vec<f64> {
+        let [curve @ EntityRef::Spline(_), point @ EntityRef::Point(_)] = entities else {
+            return Self::unsupported_residual();
+        };
+        let Some(p) = self.get_point_position(point) else {
+            return Self::unsupported_residual();
+        };
+        let Some(geometry) = self.get_spline2d(curve) else {
+            return Self::unsupported_residual();
+        };
+        let Some((_, u)) = spline_foot(&geometry, &p) else {
+            return Self::unsupported_residual();
+        };
+        match spline_curvature_derivative(&geometry, u) {
+            Some(dk_du) => vec![dk_du],
+            None => Self::unsupported_residual(),
+        }
+    }
+
+    /// Curvature at the foot of `point` on `curve`, traversal-signed
+    /// under the curve's natural parameterisation (increasing u for
+    /// splines, the stored `ccw` orientation for arcs, CCW for full
+    /// circles, zero for lines). Returns `(foot, κ)`.
+    fn curvature_at_point_foot(
+        &self,
+        curve: &EntityRef,
+        point: &EntityRef,
+    ) -> Option<(Point2d, f64)> {
+        let p = self.get_point_position(point)?;
+        match curve {
+            EntityRef::Spline(_) => {
+                let geometry = self.get_spline2d(curve)?;
+                let (foot, u) = spline_foot(&geometry, &p)?;
+                let (_, d1, d2) = geometry.derivatives2(u).ok()?;
+                Some((foot, signed_curvature_2d(d1, d2)?))
+            }
+            EntityRef::Arc(_) | EntityRef::Circle(_) => {
+                let center = self.get_circle_center(curve)?;
+                let radius = self.get_circle_radius(curve)?;
+                if radius <= STRICT_TOLERANCE.distance() {
+                    return None;
+                }
+                let v = Vector2d::from_points(&center, &p);
+                let len = v.magnitude();
+                let foot = if len < STRICT_TOLERANCE.distance() {
+                    Point2d::new(center.x + radius, center.y)
+                } else {
+                    Point2d::new(center.x + v.x / len * radius, center.y + v.y / len * radius)
+                };
+                let ccw = match curve {
+                    EntityRef::Arc(_) => self.arc_ccw_of(curve),
+                    _ => true, // full circle: CCW convention, documented
+                };
+                Some((foot, if ccw { 1.0 / radius } else { -1.0 / radius }))
+            }
+            EntityRef::Line(_) => {
+                let start = self.get_line_start(curve)?;
+                let dir = self.get_line_direction(curve)?;
+                let d_hat = dir.normalize().ok()?;
+                let t = Vector2d::from_points(&start, &p).dot(&d_hat);
+                Some((
+                    Point2d::new(start.x + t * d_hat.x, start.y + t * d_hat.y),
+                    0.0,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The traversal-orientation bit of an arc entity (see
+    /// [`EntityState::arc_ccw`]); defaults to CCW when the entity is
+    /// missing (residuals will already be degrading).
+    fn arc_ccw_of(&self, entity: &EntityRef) -> bool {
+        self.entity_state
+            .get(entity)
+            .map(|s| s.arc_ccw)
+            .unwrap_or(true)
+    }
+
+    /// Reconstruct the full `Spline2d` (rational or not) of a spline
+    /// entity from live solver state.
+    fn get_spline2d(&self, entity: &EntityRef) -> Option<Spline2d> {
+        if self.is_spline_rational(entity) {
+            self.get_nurbs_curve2d(entity).map(Spline2d::Nurbs)
         } else {
-            vec![0.0]
+            self.get_bspline2d(entity).map(Spline2d::BSpline)
+        }
+    }
+
+    /// Resolve the join frames of a continuity constraint's curve pair
+    /// (SKETCH-DCM #45 Slice 7).
+    ///
+    /// Arities: `[c1, c2]` (join = nearest endpoint pair) or
+    /// `[c1, c2, connection_point]` (join = the point's position —
+    /// the `add_smooth_tangent_constraint` shape). Frame 1 is the
+    /// walk INTO the join along c1, frame 2 the walk OUT along c2.
+    /// Full circles have no endpoints, so their traversal is oriented
+    /// to align with the partner's tangent (deterministic; two
+    /// endpoint-less curves with no connection point refuse).
+    fn continuity_pair(&self, entities: &[EntityRef]) -> Option<(CurveJoinFrame, CurveJoinFrame)> {
+        let (c1, c2, join) = match entities {
+            [c1, c2] => {
+                let join = self.nearest_join(c1, c2)?;
+                (c1, c2, join)
+            }
+            [c1, c2, p @ EntityRef::Point(_)] => (c1, c2, self.get_point_position(p)?),
+            _ => return None,
+        };
+        let c1_circle = matches!(c1, EntityRef::Circle(_));
+        let c2_circle = matches!(c2, EntityRef::Circle(_));
+        if c1_circle {
+            let f2 = self.curve_join_frame(c2, join, false, None)?;
+            let f1 = self.curve_join_frame(c1, join, true, Some(f2.tangent))?;
+            Some((f1, f2))
+        } else if c2_circle {
+            let f1 = self.curve_join_frame(c1, join, true, None)?;
+            let f2 = self.curve_join_frame(c2, join, false, Some(f1.tangent))?;
+            Some((f1, f2))
+        } else {
+            let f1 = self.curve_join_frame(c1, join, true, None)?;
+            let f2 = self.curve_join_frame(c2, join, false, None)?;
+            Some((f1, f2))
+        }
+    }
+
+    /// Nearest-endpoint join of two bounded curves: the midpoint of
+    /// the closest endpoint pair. When exactly one curve is
+    /// endpoint-less (full circle), the bounded curve's endpoint
+    /// closest to the circle is the join. `None` when neither curve
+    /// has endpoints (ambiguous — pass a connection point).
+    fn nearest_join(&self, c1: &EntityRef, c2: &EntityRef) -> Option<Point2d> {
+        let e1 = self.curve_endpoints(c1);
+        let e2 = self.curve_endpoints(c2);
+        match (e1, e2) {
+            (Some((a0, a1)), Some((b0, b1))) => {
+                let mut best = (a0, b0);
+                let mut best_d = f64::INFINITY;
+                for a in [a0, a1] {
+                    for b in [b0, b1] {
+                        let d = (a.x - b.x).powi(2) + (a.y - b.y).powi(2);
+                        if d < best_d {
+                            best_d = d;
+                            best = (a, b);
+                        }
+                    }
+                }
+                Some(best.0.midpoint(&best.1))
+            }
+            (Some((a0, a1)), None) => {
+                let center = self.get_circle_center(c2)?;
+                let radius = self.get_circle_radius(c2)?;
+                let gap =
+                    |p: &Point2d| (Vector2d::from_points(&center, p).magnitude() - radius).abs();
+                Some(if gap(&a0) <= gap(&a1) { a0 } else { a1 })
+            }
+            (None, Some((b0, b1))) => {
+                let center = self.get_circle_center(c1)?;
+                let radius = self.get_circle_radius(c1)?;
+                let gap =
+                    |p: &Point2d| (Vector2d::from_points(&center, p).magnitude() - radius).abs();
+                Some(if gap(&b0) <= gap(&b1) { b0 } else { b1 })
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// Endpoints of a bounded curve, in natural-traversal order
+    /// (line start→end, arc start-angle→end-angle, spline u_min→u_max).
+    /// `None` for endpoint-less kinds (full circles) and unsupported
+    /// kinds.
+    fn curve_endpoints(&self, entity: &EntityRef) -> Option<(Point2d, Point2d)> {
+        match entity {
+            EntityRef::Line(_) => Some((self.get_line_start(entity)?, self.get_line_end(entity)?)),
+            EntityRef::Arc(_) => {
+                let center = self.get_circle_center(entity)?;
+                let radius = self.get_circle_radius(entity)?;
+                let (a0, a1) = self.get_arc_angles(entity)?;
+                Some((
+                    Point2d::new(center.x + radius * a0.cos(), center.y + radius * a0.sin()),
+                    Point2d::new(center.x + radius * a1.cos(), center.y + radius * a1.sin()),
+                ))
+            }
+            EntityRef::Spline(_) => {
+                let geometry = self.get_spline2d(entity)?;
+                let (u0, u1) = geometry.parameter_range();
+                Some((geometry.evaluate(u0).ok()?, geometry.evaluate(u1).ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Unit traversal tangent + traversal-signed curvature of `entity`
+    /// where it meets `join` (SKETCH-DCM #45 Slice 7).
+    ///
+    /// `incoming == true` = the walk runs INTO the join along this
+    /// curve; `false` = it leaves the join. The curve's natural
+    /// traversal (see [`Self::curve_endpoints`]) is REVERSED when the
+    /// join sits at the wrong end for that role, which flips both the
+    /// tangent and the signed curvature (planar κ changes sign under
+    /// parameter reversal). `align_hint` orients endpoint-less full
+    /// circles: their traversal is chosen so the tangent aligns with
+    /// the hint (`None` = natural CCW).
+    fn curve_join_frame(
+        &self,
+        entity: &EntityRef,
+        join: Point2d,
+        incoming: bool,
+        align_hint: Option<Vector2d>,
+    ) -> Option<CurveJoinFrame> {
+        let frame = match entity {
+            EntityRef::Line(_) => {
+                let (start, end) = self.curve_endpoints(entity)?;
+                let tangent = Vector2d::from_points(&start, &end).normalize().ok()?;
+                let at_start = distance_sq(&start, &join) <= distance_sq(&end, &join);
+                let reversed = if incoming { at_start } else { !at_start };
+                CurveJoinFrame {
+                    tangent: if reversed {
+                        tangent.scale(-1.0)
+                    } else {
+                        tangent
+                    },
+                    curvature: 0.0,
+                    join,
+                }
+            }
+            EntityRef::Arc(_) => {
+                let center = self.get_circle_center(entity)?;
+                let radius = self.get_circle_radius(entity)?;
+                if radius <= STRICT_TOLERANCE.distance() {
+                    return None;
+                }
+                let (a0, a1) = self.get_arc_angles(entity)?;
+                let ccw = self.arc_ccw_of(entity);
+                let p0 = Point2d::new(center.x + radius * a0.cos(), center.y + radius * a0.sin());
+                let p1 = Point2d::new(center.x + radius * a1.cos(), center.y + radius * a1.sin());
+                let at_start = distance_sq(&p0, &join) <= distance_sq(&p1, &join);
+                let theta = if at_start { a0 } else { a1 };
+                // Natural traversal start→end sweeps CCW when the
+                // stored orientation bit says so; tangent and signed
+                // curvature follow that traversal.
+                let (tangent, curvature) = if ccw {
+                    (Vector2d::new(-theta.sin(), theta.cos()), 1.0 / radius)
+                } else {
+                    (Vector2d::new(theta.sin(), -theta.cos()), -1.0 / radius)
+                };
+                let reversed = if incoming { at_start } else { !at_start };
+                CurveJoinFrame {
+                    tangent: if reversed {
+                        tangent.scale(-1.0)
+                    } else {
+                        tangent
+                    },
+                    curvature: if reversed { -curvature } else { curvature },
+                    join,
+                }
+            }
+            EntityRef::Circle(_) => {
+                let center = self.get_circle_center(entity)?;
+                let radius = self.get_circle_radius(entity)?;
+                if radius <= STRICT_TOLERANCE.distance() {
+                    return None;
+                }
+                let v = Vector2d::from_points(&center, &join);
+                if v.magnitude() < STRICT_TOLERANCE.distance() {
+                    return None;
+                }
+                let theta = v.y.atan2(v.x);
+                let mut tangent = Vector2d::new(-theta.sin(), theta.cos());
+                let mut curvature = 1.0 / radius;
+                if let Some(hint) = align_hint {
+                    if tangent.dot(&hint) < 0.0 {
+                        tangent = tangent.scale(-1.0);
+                        curvature = -curvature;
+                    }
+                }
+                CurveJoinFrame {
+                    tangent,
+                    curvature,
+                    join,
+                }
+            }
+            EntityRef::Spline(_) => {
+                let geometry = self.get_spline2d(entity)?;
+                let (u0, u1) = geometry.parameter_range();
+                let start = geometry.evaluate(u0).ok()?;
+                let end = geometry.evaluate(u1).ok()?;
+                let at_start = distance_sq(&start, &join) <= distance_sq(&end, &join);
+                let u = if at_start { u0 } else { u1 };
+                let (_, d1, d2) = geometry.derivatives2(u).ok()?;
+                let tangent = d1.normalize().ok()?;
+                let curvature = signed_curvature_2d(d1, d2)?;
+                let reversed = if incoming { at_start } else { !at_start };
+                CurveJoinFrame {
+                    tangent: if reversed {
+                        tangent.scale(-1.0)
+                    } else {
+                        tangent
+                    },
+                    curvature: if reversed { -curvature } else { curvature },
+                    join,
+                }
+            }
+            _ => return None,
+        };
+        Some(frame)
+    }
+
+    /// Measure the continuity deviation a constraint certifies, from
+    /// LIVE solver state (SKETCH-DCM #45 Slice 7 — feeds the
+    /// certificate's [`super::sketch_certificate::ContinuityFact`]s).
+    /// `None` = the pairing is unsupported (the residual refuses) —
+    /// the certificate then flags the fact unmeasured rather than
+    /// fabricating numbers.
+    pub(crate) fn measure_continuity(
+        &self,
+        constraint: &Constraint,
+    ) -> Option<ContinuityMeasurement> {
+        match &constraint.constraint_type {
+            ConstraintType::Geometric(GeometricConstraint::SmoothTangent) => {
+                let (f1, f2) = self.continuity_pair(&constraint.entities)?;
+                Some(ContinuityMeasurement {
+                    join: f1.join,
+                    tangent_deviation_rad: Some(tangent_angle_between(f1.tangent, f2.tangent)),
+                    curvature_deviation: None,
+                })
+            }
+            ConstraintType::Geometric(GeometricConstraint::CurvatureContinuity) => {
+                let (f1, f2) = self.continuity_pair(&constraint.entities)?;
+                Some(ContinuityMeasurement {
+                    join: f1.join,
+                    tangent_deviation_rad: Some(tangent_angle_between(f1.tangent, f2.tangent)),
+                    curvature_deviation: Some((f1.curvature - f2.curvature).abs()),
+                })
+            }
+            ConstraintType::Geometric(GeometricConstraint::CurvatureExtremum) => {
+                let [curve @ EntityRef::Spline(_), point @ EntityRef::Point(_)] =
+                    constraint.entities.as_slice()
+                else {
+                    return None;
+                };
+                let p = self.get_point_position(point)?;
+                let geometry = self.get_spline2d(curve)?;
+                let (foot, u) = spline_foot(&geometry, &p)?;
+                Some(ContinuityMeasurement {
+                    join: foot,
+                    tangent_deviation_rad: None,
+                    curvature_deviation: Some(spline_curvature_derivative(&geometry, u)?.abs()),
+                })
+            }
+            ConstraintType::Dimensional(DimensionalConstraint::Curvature(target)) => {
+                let [curve, point @ EntityRef::Point(_)] = constraint.entities.as_slice() else {
+                    return None;
+                };
+                let (foot, k) = self.curvature_at_point_foot(curve, point)?;
+                Some(ContinuityMeasurement {
+                    join: foot,
+                    tangent_deviation_rad: None,
+                    curvature_deviation: Some((k - target).abs()),
+                })
+            }
+            _ => None,
         }
     }
 
@@ -3590,66 +4046,108 @@ impl ConstraintSolver {
             _ => None,
         }
     }
+}
 
-    /// Tangent at the curve's end parameter (CCW orientation).
-    ///
-    /// For a line the tangent is the stored direction. For an arc the
-    /// tangent at angle θ is `(-sin θ, cos θ)`. For a full circle the
-    /// "end" coincides with the "start" at θ = 0 (CCW), giving `(0, 1)`.
-    fn get_curve_tangent_at_end(&self, entity: &EntityRef) -> Option<Vector2d> {
-        match entity {
-            EntityRef::Line(_) => self.get_line_direction(entity),
-            EntityRef::Arc(_) => {
-                let (_, end_angle) = self.get_arc_angles(entity)?;
-                Some(Vector2d::new(-end_angle.sin(), end_angle.cos()))
-            }
-            EntityRef::Circle(_) => {
-                // Closed curve: end parameter at θ = 2π wraps to θ = 0.
-                Some(Vector2d::new(0.0, 1.0))
-            }
-            _ => None,
+/// Tangent + traversal-signed curvature of a curve where it meets a
+/// join (SKETCH-DCM #45 Slice 7). Produced by
+/// [`ConstraintSolver::curve_join_frame`]; consumed by the G1/G2
+/// evaluators and [`ConstraintSolver::measure_continuity`].
+struct CurveJoinFrame {
+    /// Unit tangent oriented ALONG the walk through the join.
+    tangent: Vector2d,
+    /// Signed curvature under that same traversal
+    /// (κ = (x'y'' − y'x'') / |r'|³ — de Boor / Farin planar form).
+    curvature: f64,
+    /// The join location the frame was evaluated at.
+    join: Point2d,
+}
+
+/// One measured continuity deviation, feeding the certificate's
+/// `ContinuityFact` (SKETCH-DCM #45 Slice 7).
+pub(crate) struct ContinuityMeasurement {
+    /// Join / foot location in sketch coordinates.
+    pub join: Point2d,
+    /// Angle between the traversal tangents, radians in `[0, π]`.
+    pub tangent_deviation_rad: Option<f64>,
+    /// Curvature deviation (|κ₁ − κ₂|, |κ − target|, or |∂κ/∂u|).
+    pub curvature_deviation: Option<f64>,
+}
+
+/// Squared distance between two points (join-end classification).
+fn distance_sq(a: &Point2d, b: &Point2d) -> f64 {
+    (a.x - b.x).powi(2) + (a.y - b.y).powi(2)
+}
+
+/// High-precision closest-point foot of `p` on a spline: the curve's
+/// own `closest_point` (coarse scan + damped refinement) SEEDS a full
+/// Newton iteration on the stationarity condition
+/// `f(u) = (C(u) − P) · C'(u) = 0` with the exact derivative
+/// `f'(u) = |C'|² + (C − P) · C''` (Piegl & Tiller §6.1, point
+/// projection). Curvature-class residuals need this: unlike the
+/// perpendicular-distance residual (variational — first-order
+/// INSENSITIVE to foot error), κ at the foot is first-order sensitive,
+/// so a ~1e-3-loose foot would turn the solver's 1e-8
+/// finite-difference Jacobian into noise.
+fn spline_foot(geometry: &Spline2d, p: &Point2d) -> Option<(Point2d, f64)> {
+    let (u0, u1) = geometry.parameter_range();
+    let (_, seed) = geometry.closest_point(p, &Tolerance2d::default()).ok()?;
+    let mut u = seed.clamp(u0, u1);
+    for _ in 0..30 {
+        let (c, d1, d2) = geometry.derivatives2(u).ok()?;
+        let rx = c.x - p.x;
+        let ry = c.y - p.y;
+        let f = rx * d1.x + ry * d1.y;
+        let fp = d1.x * d1.x + d1.y * d1.y + rx * d2.x + ry * d2.y;
+        if fp.abs() < 1e-18 {
+            break;
+        }
+        let step = f / fp;
+        let next = (u - step).clamp(u0, u1);
+        let done = (next - u).abs() < 1e-14;
+        u = next;
+        if done {
+            break;
         }
     }
+    Some((geometry.evaluate(u).ok()?, u))
+}
 
-    /// Tangent at the curve's start parameter (CCW orientation).
-    fn get_curve_tangent_at_start(&self, entity: &EntityRef) -> Option<Vector2d> {
-        match entity {
-            EntityRef::Line(_) => self.get_line_direction(entity),
-            EntityRef::Arc(_) => {
-                let (start_angle, _) = self.get_arc_angles(entity)?;
-                Some(Vector2d::new(-start_angle.sin(), start_angle.cos()))
-            }
-            EntityRef::Circle(_) => Some(Vector2d::new(0.0, 1.0)),
-            _ => None,
-        }
+/// Planar signed curvature from first/second parameter derivatives:
+/// κ = (x'y'' − y'x'') / |r'|³ (Farin, *Curves and Surfaces for CAGD*
+/// §11; sign = left-turning positive along increasing parameter).
+/// `None` when the first derivative degenerates (κ undefined).
+fn signed_curvature_2d(d1: Vector2d, d2: Vector2d) -> Option<f64> {
+    let speed_sq = d1.x * d1.x + d1.y * d1.y;
+    if speed_sq < 1e-18 {
+        return None;
     }
+    Some((d1.x * d2.y - d1.y * d2.x) / speed_sq.powf(1.5))
+}
 
-    /// Signed curvature at the curve's end parameter.
-    ///
-    /// Lines have zero curvature. Circles and arcs traversed CCW have
-    /// curvature `+1/r`; the constraint solver does not currently track
-    /// arc orientation, so the unsigned `1/r` value is returned. Other
-    /// curve types fall through with `None` so callers (G2 evaluators)
-    /// can treat them as unsupported rather than silently mis-classifying.
-    fn get_curve_curvature_at_end(&self, entity: &EntityRef) -> Option<f64> {
-        match entity {
-            EntityRef::Circle(_) | EntityRef::Arc(_) => {
-                self.get_circle_radius(entity).map(|r| 1.0 / r)
-            }
-            EntityRef::Line(_) => Some(0.0),
-            _ => None,
-        }
+/// ∂κ/∂u of a spline at `u` by central differences over the exact
+/// derivative evaluations (h = 1e-4 of the parameter range, clamped
+/// inside it). The differencing is over κ(u) — itself computed from
+/// EXACT de Boor derivatives — so the only approximation is the
+/// third-derivative term, consistent with the solver's own
+/// finite-difference Jacobian.
+fn spline_curvature_derivative(geometry: &Spline2d, u: f64) -> Option<f64> {
+    let (u0, u1) = geometry.parameter_range();
+    let h = (u1 - u0) * 1e-4;
+    if !(h > 0.0) {
+        return None;
     }
+    let uc = u.clamp(u0 + h, u1 - h);
+    let kappa = |uu: f64| -> Option<f64> {
+        let (_, d1, d2) = geometry.derivatives2(uu).ok()?;
+        signed_curvature_2d(d1, d2)
+    };
+    Some((kappa(uc + h)? - kappa(uc - h)?) / (2.0 * h))
+}
 
-    /// Signed curvature at the curve's start parameter.
-    ///
-    /// Circles and arcs have constant curvature, so this matches
-    /// `get_curve_curvature_at_end` exactly. For non-uniform curves
-    /// (splines, ellipses) this would diverge from the end value; those
-    /// kinds currently return `None` from both methods.
-    fn get_curve_curvature_at_start(&self, entity: &EntityRef) -> Option<f64> {
-        self.get_curve_curvature_at_end(entity)
-    }
+/// Angle between two unit tangents, radians in `[0, π]` — the
+/// certificate's measured G1 deviation (0 = smooth, π = cusp).
+fn tangent_angle_between(a: Vector2d, b: Vector2d) -> f64 {
+    a.cross(&b).abs().atan2(a.dot(&b))
 }
 
 /// Map a `ConstraintPriority` to a numerical weight applied to its
@@ -3707,7 +4205,51 @@ impl EntityState {
         if let Some(center) = self.derived_center {
             refs.push(center);
         }
+        if let Some(cps) = &self.derived_spline_cps {
+            refs.extend(cps.iter().copied());
+        }
         refs
+    }
+
+    /// Stamp the arc traversal-orientation bit (see
+    /// [`EntityState::arc_ccw`]). Builder-style so `populate_solver`
+    /// can chain it onto any arc constructor without widening their
+    /// signatures.
+    pub fn with_arc_ccw(mut self, ccw: bool) -> Self {
+        self.arc_ccw = ccw;
+        self
+    }
+
+    /// Create state for a spline whose control points are SHARED point
+    /// entities (shared-variable model, SKETCH-DCM #45 Slice 7).
+    ///
+    /// Zero private parameters: geometry is a pure function of the
+    /// referenced points' live state plus the pinned structural
+    /// metadata (degree, knots, optional rational weights). The DOF
+    /// contract mirrors derived segments — an n-CP shared spline
+    /// contributes 0 DOF; its control points contribute 2 each, once,
+    /// as points.
+    pub fn spline_shared(
+        degree: usize,
+        knots: Vec<f64>,
+        weights: Option<Vec<f64>>,
+        control_points: Vec<EntityRef>,
+    ) -> Self {
+        Self {
+            parameters: Vec::new(),
+            fixed_mask: Vec::new(),
+            spline: Some(SplineMetadata {
+                degree,
+                knots,
+                weights,
+            }),
+            polyline: None,
+            derived_segment: None,
+            derived_arc_endpoints: None,
+            derived_center: None,
+            derived_spline_cps: Some(control_points),
+            arc_ccw: true,
+        }
     }
 
     /// Create state for a point
@@ -3720,6 +4262,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3733,6 +4277,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3749,6 +4295,8 @@ impl EntityState {
             derived_segment: Some((start, end)),
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3808,6 +4356,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: Some((start, end)),
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3828,6 +4378,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: Some(center),
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3846,6 +4398,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: Some(center),
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3859,6 +4413,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3903,6 +4459,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -3948,6 +4506,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -4002,6 +4562,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -4058,6 +4620,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -4103,6 +4667,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 
@@ -4143,6 +4709,8 @@ impl EntityState {
             derived_segment: None,
             derived_arc_endpoints: None,
             derived_center: None,
+            derived_spline_cps: None,
+            arc_ccw: true,
         }
     }
 }

@@ -337,22 +337,21 @@ fn red_multitangent_line_lands_tangent_to_both_circles() {
 
 #[test]
 fn remaining_three_variants_still_refuse_honestly() {
-    // CurvatureExtremum, ContactConstraint, MomentOfInertia stay
-    // honest-refuse (disposition table in the slice-6 report): each
-    // removes zero DOF, is not numerically enforced, and surfaces an
-    // irreducible violation instead of a silent zero.
+    // ContactConstraint and MomentOfInertia stay TYPE-level
+    // honest-refuse; CurvatureExtremum migrated to PER-SHAPE refusal
+    // in Slice 7 (real ∂κ/∂u = 0 residual on `[spline, point]`, the
+    // disposition table's named home for it — the same migration
+    // MultiTangent/Offset made in Slice 6). The pin this test encodes
+    // is UNCHANGED for the shape used here: an unsupported pairing
+    // removes zero DOF and surfaces an irreducible violation instead
+    // of a silent zero.
     let s = fresh("slice6_refuse_survivors");
     let a = s.add_point(Point2d::new(0.0, 0.0));
     let b = s.add_point(Point2d::new(1.0, 0.0));
     fix_point(&s, &a);
     fix_point(&s, &b);
 
-    let refusals = [
-        Constraint::new_geometric(
-            GeometricConstraint::CurvatureExtremum,
-            vec![EntityRef::Point(a), EntityRef::Point(b)],
-            ConstraintPriority::High,
-        ),
+    let type_level_refusals = [
         Constraint::new_geometric(
             GeometricConstraint::ContactConstraint,
             vec![EntityRef::Point(a), EntityRef::Point(b)],
@@ -364,16 +363,44 @@ fn remaining_three_variants_still_refuse_honestly() {
             ConstraintPriority::High,
         ),
     ];
-    for con in refusals {
+    // Per-shape refusal (Slice 7): the point-point shape refuses even
+    // though the TYPE now carries a real residual for [spline, point].
+    let shape_level_refusal = Constraint::new_geometric(
+        GeometricConstraint::CurvatureExtremum,
+        vec![EntityRef::Point(a), EntityRef::Point(b)],
+        ConstraintPriority::High,
+    );
+    assert!(
+        shape_level_refusal
+            .constraint_type
+            .is_numerically_enforced(),
+        "CurvatureExtremum is TYPE-enforced since Slice 7 (per-shape refusals remain)"
+    );
+
+    for con in type_level_refusals {
+        assert!(
+            !con.constraint_type.is_numerically_enforced(),
+            "{:?} must stay refuse-typed",
+            con.constraint_type
+        );
+    }
+    for con in [
+        shape_level_refusal,
+        Constraint::new_geometric(
+            GeometricConstraint::ContactConstraint,
+            vec![EntityRef::Point(a), EntityRef::Point(b)],
+            ConstraintPriority::High,
+        ),
+        Constraint::new_dimensional(
+            DimensionalConstraint::MomentOfInertia(1.0),
+            vec![EntityRef::Point(a)],
+            ConstraintPriority::High,
+        ),
+    ] {
         assert_eq!(
             con.degrees_of_freedom_removed(),
             0,
             "{:?} must remove zero DOF",
-            con.constraint_type
-        );
-        assert!(
-            !con.constraint_type.is_numerically_enforced(),
-            "{:?} must stay refuse-typed",
             con.constraint_type
         );
         let cid = s.add_constraint(con.clone());

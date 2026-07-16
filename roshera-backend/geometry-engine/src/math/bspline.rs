@@ -123,17 +123,30 @@ impl KnotVector {
     ///
     /// Normalized to [0, 1] parameter range
     pub fn open_uniform(degree: usize, num_control_points: usize) -> Self {
-        let n = num_control_points - 1;
         let num_knots = num_control_points + degree + 1;
         let mut knots = Vec::with_capacity(num_knots);
 
         // First degree+1 knots at 0
         knots.resize(degree + 1, 0.0);
 
-        // Interior knots uniformly distributed in (0, 1)
-        let num_interior = n - degree;
-        for i in 1..num_interior {
-            knots.push(i as f64 / num_interior as f64);
+        // Interior knots uniformly distributed in (0, 1): a clamped
+        // curve with n control points has `n − degree` spans, hence
+        // `n − degree − 1` interior knots at i / (n − degree).
+        //
+        // ROOT-CAUSE FIX (SKETCH-DCM #45 Slice 7): the span count was
+        // previously computed as `(n − 1) − degree`, one short, so for
+        // ANY n > degree + 1 the missing interior knot was padded by
+        // the trailing `resize` as an extra 1.0 — an end knot of
+        // multiplicity degree + 2, which `BSplineCurve::new` rightly
+        // rejects ("multiplicity > degree + 1"). The bug was latent
+        // because every in-tree caller used n == degree + 1 (Bézier
+        // shape) until shared-control-point splines arrived. The
+        // sibling `BSplineCurve::open_uniform` always had the correct
+        // count; the unit test documenting `[0,0,0,0, 0.5, 1,1,1,1]`
+        // for (3, 5) now actually holds.
+        let spans = num_control_points - degree;
+        for i in 1..spans {
+            knots.push(i as f64 / spans as f64);
         }
 
         // Last degree+1 knots at 1

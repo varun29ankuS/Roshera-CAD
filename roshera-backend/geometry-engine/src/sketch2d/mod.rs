@@ -95,7 +95,8 @@ pub use constraints::{
     DimensionalConstraint, DimensionalUpdateError, EntityRef, GeometricConstraint,
 };
 pub use sketch_solver::{
-    DofReport, DofStatus, DragTarget, SketchSolveError, SketchSolveReport, SolveOptions,
+    analyze_dofs, DofReport, DofStatus, DragTarget, SketchSolveError, SketchSolveReport,
+    SolveOptions,
 };
 
 pub use inference::{
@@ -105,9 +106,9 @@ pub use recognize::{recognize_sketch, Recognition, ShapeClass};
 pub use sketch::{Sketch, SketchAnchor, SketchGeometrySnapshot, SketchId};
 pub use sketch_certificate::{
     certify_sketch, CertificateSummary, CompactWitness, ConflictWitness, ConstraintFact,
-    ConstraintRole, DecompositionStats, DofSnapshot, EntityConstrainment, EntityStatus,
-    SketchConstrainedness, SketchValidityCertificate, SolverVerdict, WitnessConstraint,
-    WitnessKind,
+    ConstraintRole, ContinuityFact, ContinuityKind, DecompositionStats, DofSnapshot,
+    EntityConstrainment, EntityStatus, SketchConstrainedness, SketchValidityCertificate,
+    SolverVerdict, WitnessConstraint, WitnessKind,
 };
 pub use sketch_ops::{
     circular_pattern, extend, linear_pattern, mirror, offset, trim, EntityProvenance, LineEnd,
