@@ -14993,22 +14993,38 @@ fn solid_gwn_triangles(model: &BRepModel, solid: SolidId) -> Vec<[Point3; 3]> {
 }
 
 /// Classify `test_point` as Inside/Outside `solid` via the generalized
-/// winding number. Returns `None` when the solid yields no triangles, so
-/// the caller can fall back to the ray-cast. Never returns `OnBoundary` —
+/// winding number. Returns `None` when the solid yields no triangles OR
+/// when the winding sits in the §3.5 LOW-CONFIDENCE band (|w| within
+/// `GWN_CONFIDENCE_BAND` of the 0.5 threshold) — in both cases the caller
+/// escalates to the 3-ray vote, whose own tie arm escalates to a typed
+/// `NumericalError`. Slice 6 honesty: a near-0.5 winding means the coarse
+/// classification mesh leaks at this query (gap/flip) or the point is
+/// numerically on the surface; silently rounding it was the last silent
+/// verdict in the classification chain. Never returns `OnBoundary` —
 /// boundary coincidence is detected upstream by the per-face test.
 fn classify_point_gwn(
     model: &BRepModel,
     solid: SolidId,
     test_point: &Point3,
 ) -> Option<FaceClassification> {
+    use crate::math::winding_number::{classify_by_winding, WindingClassification};
     let tris = solid_gwn_triangles_cached(model, solid);
     if tris.is_empty() {
         return None;
     }
-    if crate::math::winding_number::point_is_inside(test_point, &tris) {
-        Some(FaceClassification::Inside)
-    } else {
-        Some(FaceClassification::Outside)
+    match classify_by_winding(test_point, &tris) {
+        WindingClassification::Inside => Some(FaceClassification::Inside),
+        WindingClassification::Outside => Some(FaceClassification::Outside),
+        WindingClassification::LowConfidence { winding } => {
+            if pipeline_trace_enabled() {
+                eprintln!(
+                    "[bool]       gwn: LOW CONFIDENCE |w|={:.4} at ({:.4},{:.4},{:.4}) — \
+                     escalating to ray vote",
+                    winding, test_point.x, test_point.y, test_point.z
+                );
+            }
+            None
+        }
     }
 }
 

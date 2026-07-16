@@ -114,9 +114,66 @@ pub fn generalized_winding_number(p: &Point3, triangles: &[[Point3; 3]]) -> f64 
 /// to a non-zero integer (|w| > 0.5). This is stable for watertight
 /// meshes and degrades gracefully on meshes with small holes — the
 /// property ray-casting lacks.
+///
+/// SILENT-ROUNDING CAVEAT (exact-predicates campaign, spec §3.5): at
+/// `|w| ≈ 0.5` this boolean is a coin flip on accumulated float noise and
+/// mesh-gap leakage — it cannot say "I don't know". Classification
+/// callers should use [`classify_by_winding`], which surfaces the
+/// low-confidence band as a typed verdict instead of rounding it away.
 #[inline]
 pub fn point_is_inside(p: &Point3, triangles: &[[Point3; 3]]) -> bool {
     generalized_winding_number(p, triangles).abs() > 0.5
+}
+
+/// Half-width of the LOW-CONFIDENCE band around the ±0.5 rounding
+/// threshold (exact-predicates campaign Slice 6, spec §3.5).
+///
+/// For a CLOSED consistently-oriented mesh, `w` is an exact integer up to
+/// atan2 accumulation noise (≲ 1e-12·triangles), so honest verdicts sit
+/// hard against 0 or ±1 and never enter this band. `|w|` near 0.5 means
+/// one of the two approximation layers GWN is built on has failed the
+/// query: the tessellation has a gap/flip whose leakage pulls `w` off the
+/// integers, or the point is so close to the coarse surface that the
+/// solid-angle sum is ill-conditioned. 0.05 is orders of magnitude above
+/// the noise floor while leaving verdicts on genuinely-perturbed-but-
+/// decidable meshes (|w| ∈ [0.55, 1.0+]) untouched.
+pub const GWN_CONFIDENCE_BAND: f64 = 0.05;
+
+/// Typed winding-number classification (spec §3.5 honesty band): the
+/// point-in-solid verdict AND the confession when the verdict would be a
+/// silent coin flip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindingClassification {
+    /// `|w| > 0.5 + band` — decisively interior.
+    Inside,
+    /// `|w| < 0.5 − band` — decisively exterior.
+    Outside,
+    /// `|w| ∈ [0.5 − band, 0.5 + band]` — the GWN CANNOT decide this
+    /// query: the mesh leaks (gap/flip) at this point or the point is
+    /// numerically on the coarse surface. Carries the measured winding so
+    /// the caller can log/escalate with evidence.
+    LowConfidence {
+        /// The measured generalized winding number.
+        winding: f64,
+    },
+}
+
+/// Classify `p` against the oriented triangle soup with the §3.5 honesty
+/// band: values of `|w|` within [`GWN_CONFIDENCE_BAND`] of the 0.5
+/// threshold return [`WindingClassification::LowConfidence`] instead of
+/// silently rounding to a verdict. Callers escalate low confidence to an
+/// independent classifier (the boolean's 3-ray vote / analytic
+/// membership) or surface a typed error — never treat it as a verdict.
+pub fn classify_by_winding(p: &Point3, triangles: &[[Point3; 3]]) -> WindingClassification {
+    let w = generalized_winding_number(p, triangles);
+    let dist_to_threshold = (w.abs() - 0.5).abs();
+    if dist_to_threshold <= GWN_CONFIDENCE_BAND {
+        WindingClassification::LowConfidence { winding: w }
+    } else if w.abs() > 0.5 {
+        WindingClassification::Inside
+    } else {
+        WindingClassification::Outside
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +265,65 @@ mod tests {
         assert!(
             w_out.abs() < 0.5,
             "exterior stays outside despite hole, got {w_out}"
+        );
+    }
+
+    /// Slice 6 (spec §3.5): the honesty band. A query where the winding
+    /// genuinely sits near 0.5 — the centre of a face-sized hole, where
+    /// exactly half the closed surface's solid angle is missing — must
+    /// come back LOW CONFIDENCE, not a silent verdict. The same input
+    /// pinned against the raw boolean shows the silent coin flip the band
+    /// replaces: `point_is_inside` quietly answers `false` there.
+    #[test]
+    fn near_half_winding_is_low_confidence_not_a_silent_verdict() {
+        // Remove the ENTIRE +X face (both triangles) of the unit box and
+        // query the hole's centre: from there the missing face subtends
+        // ~2π sr, so w ≈ 1 − 2π/4π = 0.5.
+        let mut tris = unit_box_tris(-1.0, 1.0);
+        // unit_box_tris emits 2 triangles per face; find and drop the two
+        // whose vertices all lie at x = +1.
+        tris.retain(|t| !t.iter().all(|v| (v.x - 1.0).abs() < 1e-12));
+        assert_eq!(tris.len(), 10, "exactly one face (2 tris) removed");
+        let hole_centre = Point3::new(1.0, 0.0, 0.0);
+        let w = generalized_winding_number(&hole_centre, &tris);
+        assert!(
+            (w.abs() - 0.5).abs() <= GWN_CONFIDENCE_BAND,
+            "hole-centre winding must sit in the band, got {w}"
+        );
+        // The typed verdict confesses.
+        match classify_by_winding(&hole_centre, &tris) {
+            WindingClassification::LowConfidence { winding } => {
+                assert!((winding - w).abs() < 1e-12);
+            }
+            other => panic!("expected LowConfidence, got {other:?} (w={w})"),
+        }
+        // PINNED CONTRAST (the pre-Slice-6 silent rounding): the raw
+        // boolean answers `false` on the same undecidable input.
+        assert!(!point_is_inside(&hole_centre, &tris));
+    }
+
+    /// Decisive verdicts are untouched by the band: watertight-box
+    /// queries stay hard against the integers, far outside the band.
+    #[test]
+    fn decisive_windings_classify_outside_the_band() {
+        let tris = unit_box_tris(-1.0, 1.0);
+        assert_eq!(
+            classify_by_winding(&Point3::new(0.2, -0.3, 0.4), &tris),
+            WindingClassification::Inside
+        );
+        assert_eq!(
+            classify_by_winding(&Point3::new(3.0, 0.0, 0.0), &tris),
+            WindingClassification::Outside
+        );
+        // Even NEAR the surface of a closed mesh, w is an integer up to
+        // noise — the band only catches genuinely leaking queries.
+        assert_eq!(
+            classify_by_winding(&Point3::new(0.999, 0.0, 0.0), &tris),
+            WindingClassification::Inside
+        );
+        assert_eq!(
+            classify_by_winding(&Point3::new(1.001, 0.0, 0.0), &tris),
+            WindingClassification::Outside
         );
     }
 
