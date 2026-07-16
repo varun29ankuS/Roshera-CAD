@@ -389,10 +389,20 @@ impl Constraint {
                 GeometricConstraint::Equal => 1,         // Removes one dimension
                 GeometricConstraint::Horizontal => 1,    // Removes Y variation
                 GeometricConstraint::Vertical => 1,      // Removes X variation
-                GeometricConstraint::Symmetric => 2,     // Depends on entities
-                GeometricConstraint::PointOnCurve => 1,  // One parameter
-                GeometricConstraint::Midpoint => 2,      // X and Y
-                GeometricConstraint::Collinear => 1,     // One DOF per entity
+                // Symmetric: 2 (reflected position) generically; an
+                // ARC PAIR removes 4 (reflected center + reflected
+                // traversal-normalized angles — SKETCH-DCM #45
+                // follow-ups A; with the mirror op's Equal radius this
+                // pins all 5 legacy-arc parameters). Keep in lock-step
+                // with the solver's `evaluate_symmetric_arc_pair` /
+                // `constraint_error_count`.
+                GeometricConstraint::Symmetric => match self.entities.as_slice() {
+                    [EntityRef::Arc(_), EntityRef::Arc(_), _] => 4,
+                    _ => 2,
+                },
+                GeometricConstraint::PointOnCurve => 1, // One parameter
+                GeometricConstraint::Midpoint => 2,     // X and Y
+                GeometricConstraint::Collinear => 1,    // One DOF per entity
 
                 // Advanced constraint types
                 GeometricConstraint::SmoothTangent => 1,

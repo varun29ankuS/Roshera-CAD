@@ -1148,11 +1148,17 @@ pub struct TrimRequest {
     pub pick: [f64; 2],
 }
 
-/// Request body for `POST /api/csketch/{id}/extend`.
+/// Request body for `POST /api/csketch/{id}/extend`. Exactly one of
+/// `entity` (line or arc — SKETCH-DCM #45 follow-ups A added arc
+/// extend) or the legacy line-only `line` field must be supplied.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtendRequest {
-    /// The line segment to extend.
-    pub line: Uuid,
+    /// The entity to extend (line segment or arc).
+    #[serde(default)]
+    pub entity: Option<EntityRef>,
+    /// Legacy wire shape: the line segment to extend.
+    #[serde(default)]
+    pub line: Option<Uuid>,
     /// Which end moves ("start" | "end").
     pub end: LineEnd,
     /// The boundary entity to extend to.
@@ -1310,19 +1316,26 @@ pub async fn extend_op(
     Json(req): Json<ExtendRequest>,
 ) -> Result<Json<SketchOpResponse>, ApiError> {
     let sketch = require_sketch(&state, id)?;
-    let outcome = geometry_engine::sketch2d::extend(
-        &sketch,
-        &geometry_engine::sketch2d::Line2dId(req.line),
-        req.end,
-        &req.boundary,
-    )
-    .map_err(op_error_to_api)?;
+    let target = match (&req.entity, &req.line) {
+        (Some(entity), None) => *entity,
+        (None, Some(line)) => {
+            geometry_engine::sketch2d::EntityRef::Line(geometry_engine::sketch2d::Line2dId(*line))
+        }
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "supply exactly one of `entity` (line or arc) or the legacy `line` field",
+            ))
+        }
+    };
+    let outcome = geometry_engine::sketch2d::extend(&sketch, &target, req.end, &req.boundary)
+        .map_err(op_error_to_api)?;
     record_csketch_op(
         &state,
         "csketch_extend",
         id,
         serde_json::json!({
-            "line": req.line, "end": req.end, "boundary": req.boundary,
+            "entity": target, "end": req.end, "boundary": req.boundary,
         }),
         &outcome,
     );

@@ -450,8 +450,13 @@ fn red_extend_line_end_to_boundary_and_maintain_contact() {
     let c2 = s.add_point(Point2d::new(10.0, 5.0));
     let boundary = s.add_line(c1, c2).expect("boundary");
 
-    let outcome =
-        sketch_ops::extend(&s, &line, LineEnd::End, &EntityRef::Line(boundary)).expect("extend");
+    let outcome = sketch_ops::extend(
+        &s,
+        &EntityRef::Line(line),
+        LineEnd::End,
+        &EntityRef::Line(boundary),
+    )
+    .expect("extend");
 
     let moved = s.get_point(&b).expect("b");
     assert!(
@@ -480,8 +485,13 @@ fn extend_refuses_when_nothing_lies_ahead() {
     let c1 = s.add_point(Point2d::new(-10.0, -5.0));
     let c2 = s.add_point(Point2d::new(-10.0, 5.0));
     let boundary = s.add_line(c1, c2).expect("boundary");
-    let err = sketch_ops::extend(&s, &line, LineEnd::End, &EntityRef::Line(boundary))
-        .expect_err("must refuse");
+    let err = sketch_ops::extend(
+        &s,
+        &EntityRef::Line(line),
+        LineEnd::End,
+        &EntityRef::Line(boundary),
+    )
+    .expect_err("must refuse");
     assert!(matches!(err, SketchOpError::NoIntersection { .. }));
     let pos = s.get_point(&b).expect("b");
     assert_eq!((pos.x, pos.y), (5.0, 0.0), "no mutation on refusal");

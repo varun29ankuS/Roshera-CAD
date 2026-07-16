@@ -2615,9 +2615,17 @@ impl ConstraintSolver {
                 // (tangent-magnitude match) was not G1 and reported
                 // phantom violations on unequal segment lengths.
                 GeometricConstraint::Concentric
-                | GeometricConstraint::Symmetric
                 | GeometricConstraint::Midpoint
                 | GeometricConstraint::CurvatureContinuity => 2,
+                // Symmetric: 2 rows (reflected position) for the
+                // generic arm; 4 for an ARC PAIR (reflected center +
+                // reflected traversal-normalized angles — SKETCH-DCM
+                // #45 follow-ups A) — must match
+                // `evaluate_symmetric_arc_pair` exactly.
+                GeometricConstraint::Symmetric => match constraint.entities.as_slice() {
+                    [EntityRef::Arc(_), EntityRef::Arc(_), _] => 4,
+                    _ => 2,
+                },
                 // Offset correspondence (SKETCH-DCM #45 Slice 6): 3 rows
                 // for a line pair, 2 (concentric) for a circle/arc pair,
                 // 1 refuse row otherwise — must match
@@ -3210,6 +3218,80 @@ impl ConstraintSolver {
         }
     }
 
+    /// Arc-pair symmetry (SKETCH-DCM #45 follow-ups A — the
+    /// legacy-arc mirror's maintenance): 4 rows — reflected CENTER
+    /// (Δx, Δy) plus reflected traversal-normalized ANGLE
+    /// correspondence. Reflection about the axis at angle α maps
+    /// θ → 2α − θ and reverses orientation, so the image's
+    /// CCW-normalized start pairs with the source's CCW-normalized
+    /// END:
+    ///
+    /// ```text
+    ///   m_start − (2α − s_end)   ≡ 0   (mod 2π, wrapped to (−π, π])
+    ///   m_end   − (2α − s_start) ≡ 0
+    /// ```
+    ///
+    /// α and α + π describe the same reflection — the wrap absorbs
+    /// the 2π. Together with the `Equal` radius the mirror op mints,
+    /// these rows pin all 5 parameters of a legacy center-angle arc,
+    /// so a legacy-arc mirror is MAINTAINED, not a one-shot copy.
+    /// Missing state degrades to zero rows (standard evaluator
+    /// convention); the row budget is 4
+    /// (`constraint_error_count`).
+    fn evaluate_symmetric_arc_pair(
+        &self,
+        a: &EntityRef,
+        b: &EntityRef,
+        axis: &EntityRef,
+    ) -> Vec<f64> {
+        use std::f64::consts::{PI, TAU};
+        let (Some(axis_point), Some(axis_dir)) =
+            (self.get_line_point(axis), self.get_line_direction(axis))
+        else {
+            return vec![0.0; 4];
+        };
+        let Ok(axis_unit) = axis_dir.normalize() else {
+            return vec![0.0; 4];
+        };
+        let axis_normal = Vector2d::new(-axis_unit.y, axis_unit.x);
+        let (Some(ca), Some(cb)) = (self.get_circle_center(a), self.get_circle_center(b)) else {
+            return vec![0.0; 4];
+        };
+        let d = Vector2d::from_points(&axis_point, &ca).dot(&axis_normal);
+        let reflected = Point2d::new(
+            ca.x - 2.0 * d * axis_normal.x,
+            ca.y - 2.0 * d * axis_normal.y,
+        );
+        let mut rows = vec![cb.x - reflected.x, cb.y - reflected.y];
+        let (Some((a0, a1)), Some((b0, b1))) = (self.get_arc_angles(a), self.get_arc_angles(b))
+        else {
+            rows.extend([0.0, 0.0]);
+            return rows;
+        };
+        let (s_start, s_end) = if self.arc_ccw_of(a) {
+            (a0, a1)
+        } else {
+            (a1, a0)
+        };
+        let (m_start, m_end) = if self.arc_ccw_of(b) {
+            (b0, b1)
+        } else {
+            (b1, b0)
+        };
+        let alpha = axis_unit.y.atan2(axis_unit.x);
+        let wrap = |x: f64| {
+            let r = x.rem_euclid(TAU);
+            if r > PI {
+                r - TAU
+            } else {
+                r
+            }
+        };
+        rows.push(wrap(m_start - (2.0 * alpha - s_end)));
+        rows.push(wrap(m_end - (2.0 * alpha - s_start)));
+        rows
+    }
+
     /// Evaluate symmetric constraint
     fn evaluate_symmetric_constraint(
         &self,
@@ -3217,6 +3299,11 @@ impl ConstraintSolver {
         entity2: &EntityRef,
         axis: &EntityRef,
     ) -> Vec<f64> {
+        // Arc pairs take the 4-row arm (center + angle correspondence)
+        // — see `evaluate_symmetric_arc_pair`.
+        if let (EntityRef::Arc(_), EntityRef::Arc(_)) = (entity1, entity2) {
+            return self.evaluate_symmetric_arc_pair(entity1, entity2, axis);
+        }
         // Get axis line parameters
         if let (Some(axis_point), Some(axis_dir)) =
             (self.get_line_point(axis), self.get_line_direction(axis))
@@ -4766,6 +4853,10 @@ mod tests {
         EntityRef::Rectangle(Rectangle2dId::new())
     }
 
+    fn arc_ref() -> EntityRef {
+        EntityRef::Arc(crate::sketch2d::Arc2dId::new())
+    }
+
     fn ellipse_ref() -> EntityRef {
         EntityRef::Ellipse(Ellipse2dId::new())
     }
@@ -5129,6 +5220,18 @@ mod tests {
                 false,
             ),
         );
+        let a1 = arc_ref();
+        let a2 = arc_ref();
+        s.add_entity(
+            a1,
+            EntityState::arc(Point2d::new(5.0, 2.0), 2.5, 0.5, 2.0, false, false, false)
+                .with_arc_ccw(true),
+        );
+        s.add_entity(
+            a2,
+            EntityState::arc(Point2d::new(-5.0, 2.0), 2.5, 1.1, 2.6, false, false, false)
+                .with_arc_ccw(true),
+        );
 
         use ConstraintPriority::High;
         let battery: Vec<Constraint> = vec![
@@ -5141,6 +5244,8 @@ mod tests {
             Constraint::new_geometric(GeometricConstraint::Horizontal, vec![l1], High),
             Constraint::new_geometric(GeometricConstraint::Vertical, vec![l1], High),
             Constraint::new_geometric(GeometricConstraint::Symmetric, vec![p1, p2, l1], High),
+            // Arc-pair Symmetric: 4 rows (SKETCH-DCM #45 follow-ups A).
+            Constraint::new_geometric(GeometricConstraint::Symmetric, vec![a1, a2, l1], High),
             Constraint::new_geometric(GeometricConstraint::PointOnCurve, vec![p1, l1], High),
             Constraint::new_geometric(GeometricConstraint::Midpoint, vec![p3, l1], High),
             Constraint::new_geometric(GeometricConstraint::Collinear, vec![p1, p2, p3], High),

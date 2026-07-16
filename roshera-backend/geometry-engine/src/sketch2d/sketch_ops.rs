@@ -807,28 +807,56 @@ pub enum LineEnd {
     End,
 }
 
-/// Extend the chosen end of a shared-endpoint line segment along its
-/// own carrier to the NEAREST forward intersection with `boundary`
+/// Extend the chosen end of a shared-endpoint entity along its own
+/// carrier to the NEAREST forward intersection with `boundary`
 /// (respecting the boundary's extent). The moved endpoint is then
-/// held on the boundary by a minted `PointOnCurve` constraint.
+/// held on the boundary by a minted `PointOnCurve` constraint — the
+/// same contact contract for lines and arcs (SKETCH-DCM #45
+/// follow-ups A closed the Slice-6 arc refusal).
 ///
-/// Arcs are not extendable this slice (typed refuse): growing an
-/// arc's angular span against its endpoint-derived representation is
-/// follow-up work.
+/// - **Lines**: the endpoint slides along the segment's carrier line.
+/// - **Arcs**: the endpoint slides along the carrier CIRCLE, growing
+///   the sweep; the stored arc re-syncs its angle. The extension must
+///   fit the remaining sweep (< 2π total — passing the fixed end
+///   would degenerate the arc) or the op refuses `NoIntersection`.
+///
+/// Per-shape typed refusals: legacy center-angle arcs (no endpoint
+/// point exists for the contact constraint to bind), splines (no
+/// analytic carrier), and every non-curve entity kind.
 pub fn extend(
     sketch: &Sketch,
-    line: &Line2dId,
+    target: &EntityRef,
     end: LineEnd,
     boundary: &EntityRef,
 ) -> Result<SketchOpOutcome, SketchOpError> {
     const OP: &str = "extend";
-    if matches!(boundary, EntityRef::Line(id) if id == line) {
+    if boundary == target {
         return Err(SketchOpError::InvalidParameter {
             op: OP,
             parameter: "boundary",
             reason: "boundary and target are the same entity".to_string(),
         });
     }
+    match target {
+        EntityRef::Line(line) => extend_line(sketch, line, end, boundary),
+        EntityRef::Arc(arc) => extend_arc(sketch, arc, end, boundary),
+        other => Err(SketchOpError::Unsupported {
+            op: OP,
+            reason: format!(
+                "{other} is not extendable (supported: shared-endpoint line \
+                 segments and shared-endpoint arcs)"
+            ),
+        }),
+    }
+}
+
+fn extend_line(
+    sketch: &Sketch,
+    line: &Line2dId,
+    end: LineEnd,
+    boundary: &EntityRef,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "extend";
     let entry = sketch
         .lines()
         .get(line)
@@ -925,6 +953,104 @@ pub fn extend(
 
     let mut outcome = SketchOpOutcome::new(SketchOpKind::Extend);
     outcome.modified.push(EntityRef::Line(*line));
+    outcome.modified.push(EntityRef::Point(moving_id));
+    mint_constraint(sketch, point_on_curve(moving_id, *boundary), &mut outcome);
+    Ok(outcome)
+}
+
+/// Arc arm of [`extend`]: grow the arc's sweep along its carrier
+/// circle to the nearest forward boundary intersection (SKETCH-DCM
+/// #45 follow-ups A — closes Slice-6 residual 4). The chosen shared
+/// endpoint moves along the circle, the stored arc re-syncs its angle
+/// (radius and center are untouched — the carrier is preserved), and
+/// the moved endpoint is held on the boundary by `PointOnCurve`.
+fn extend_arc(
+    sketch: &Sketch,
+    arc_id: &super::Arc2dId,
+    end: LineEnd,
+    boundary: &EntityRef,
+) -> Result<SketchOpOutcome, SketchOpError> {
+    const OP: &str = "extend";
+    let entry = sketch
+        .arcs()
+        .get(arc_id)
+        .ok_or_else(|| SketchOpError::EntityNotFound {
+            op: OP,
+            entity: EntityRef::Arc(*arc_id).to_string(),
+        })?;
+    let Some((sa, sb)) = entry.endpoints else {
+        return Err(SketchOpError::Unsupported {
+            op: OP,
+            reason: format!(
+                "{} is a legacy center-angle arc; extend needs a shared-endpoint \
+                 arc (the moved end must be a point the contact constraint can bind)",
+                EntityRef::Arc(*arc_id)
+            ),
+        });
+    };
+    let arc = entry.arc;
+    drop(entry);
+    let moving_id = match end {
+        LineEnd::Start => sa,
+        LineEnd::End => sb,
+    };
+    if sketch.get_point(&moving_id).is_none() {
+        return Err(SketchOpError::EntityNotFound {
+            op: OP,
+            entity: moving_id.to_string(),
+        });
+    }
+    let total = arc.sweep_angle();
+
+    // Carrier circle against the boundary (the boundary's extent is
+    // respected by `intersections`; the carrier is the full circle —
+    // forward filtering below owns the angular extent).
+    let boundary_curve = op_curve(sketch, boundary, OP)?;
+    let carrier = OpCurve::Circle {
+        c: arc.center,
+        r: arc.radius,
+    };
+    let hits = intersections(&carrier, &boundary_curve, OP)?;
+
+    // Forward angular growth beyond the moving end, measured in the
+    // direction that EXTENDS the sweep. The grown arc must stay short
+    // of a full circle: sweeping past the fixed opposite endpoint
+    // would degenerate the arc.
+    let best = hits
+        .into_iter()
+        .filter_map(|p| {
+            let theta = norm_angle(arc.center.angle_to(&p));
+            let delta = match (end, arc.ccw) {
+                (LineEnd::End, true) => ccw_sweep(arc.end_angle, theta),
+                (LineEnd::End, false) => ccw_sweep(theta, arc.end_angle),
+                (LineEnd::Start, true) => ccw_sweep(theta, arc.start_angle),
+                (LineEnd::Start, false) => ccw_sweep(arc.start_angle, theta),
+            };
+            (delta > 1e-9 && total + delta < TAU - 1e-9).then_some((delta, theta, p))
+        })
+        .min_by(|(d1, _, _), (d2, _, _)| d1.partial_cmp(d2).unwrap_or(std::cmp::Ordering::Equal));
+    let Some((_, theta, hit)) = best else {
+        return Err(SketchOpError::NoIntersection {
+            op: OP,
+            reason: format!(
+                "{boundary} has no intersection ahead of the extended arc end \
+                 (within the remaining sweep)"
+            ),
+        });
+    };
+
+    sketch.update_point(&moving_id, hit)?;
+    // Re-sync the stored arc so pre-solve readers (topology, ops) see
+    // the grown sweep immediately — the carrier itself is unchanged.
+    if let Some(mut e) = sketch.arcs().get_mut(arc_id) {
+        match end {
+            LineEnd::Start => e.value_mut().arc.start_angle = theta,
+            LineEnd::End => e.value_mut().arc.end_angle = theta,
+        }
+    }
+
+    let mut outcome = SketchOpOutcome::new(SketchOpKind::Extend);
+    outcome.modified.push(EntityRef::Arc(*arc_id));
     outcome.modified.push(EntityRef::Point(moving_id));
     mint_constraint(sketch, point_on_curve(moving_id, *boundary), &mut outcome);
     Ok(outcome)
@@ -1615,9 +1741,15 @@ fn set_prim_start(prim: &mut OffsetPrim, p: Point2d) {
 /// and the copy follows. Shared points among the selected entities
 /// are mirrored once.
 ///
-/// Supported: points, shared-endpoint lines, circles, shared-endpoint
-/// arcs. The axis must be marked construction (spec §3.4) — a typed
-/// refusal otherwise.
+/// Supported: points, shared-endpoint lines, circles, arcs (both
+/// shared-endpoint and legacy center-angle — the legacy path mints
+/// the 4-row arc-pair `Symmetric` covering center AND angle
+/// correspondence, SKETCH-DCM #45 follow-ups A), and shared-CP
+/// splines (one `Symmetric` per control point — the Slice-7 point-web
+/// model makes spline mirror the line path over n points). Raw-CP
+/// splines refuse per-shape: there are no point entities to bind
+/// `Symmetric` to. The axis must be marked construction (spec §3.4)
+/// — a typed refusal otherwise.
 pub fn mirror(
     sketch: &Sketch,
     entities: &[EntityRef],
@@ -1707,17 +1839,32 @@ pub fn mirror(
                 }
             }
             EntityRef::Arc(id) => {
-                let entry = sketch
-                    .arcs()
-                    .get(id)
-                    .ok_or_else(|| SketchOpError::EntityNotFound {
+                // Both representations mirror: shared-endpoint arcs
+                // through their endpoint points, legacy center-angle
+                // arcs through the 4-row arc-pair Symmetric.
+                if sketch.arcs().get(id).is_none() {
+                    return Err(SketchOpError::EntityNotFound {
                         op: OP,
                         entity: e.to_string(),
-                    })?;
-                if entry.endpoints.is_none() {
+                    });
+                }
+            }
+            EntityRef::Spline(id) => {
+                let entry =
+                    sketch
+                        .splines()
+                        .get(id)
+                        .ok_or_else(|| SketchOpError::EntityNotFound {
+                            op: OP,
+                            entity: e.to_string(),
+                        })?;
+                if entry.control_point_ids.is_none() {
                     return Err(SketchOpError::Unsupported {
                         op: OP,
-                        reason: format!("{e}: mirror needs shared-endpoint arcs"),
+                        reason: format!(
+                            "{e}: mirror needs a shared-control-point spline — a raw-CP \
+                             spline has no point entities to bind Symmetric to"
+                        ),
                     });
                 }
             }
@@ -1725,7 +1872,8 @@ pub fn mirror(
                 return Err(SketchOpError::Unsupported {
                     op: OP,
                     reason: format!(
-                        "{other} is not mirrorable (supported: point, line, circle, arc)"
+                        "{other} is not mirrorable (supported: point, line, circle, arc, \
+                         shared-CP spline)"
                     ),
                 })
             }
@@ -1869,16 +2017,48 @@ pub fn mirror(
                         })?;
                         (entry.endpoints, entry.arc)
                     };
-                let Some((sa, sb)) = endpoints else {
-                    return Err(SketchOpError::Unsupported {
-                        op: OP,
-                        reason: format!("{e}: mirror needs shared-endpoint arcs"),
-                    });
+                let aid = match endpoints {
+                    Some((sa, sb)) => {
+                        let ma = mirror_point!(sa);
+                        let mb = mirror_point!(sb);
+                        let sweep = arc.sweep_angle();
+                        sketch.add_arc(ma, mb, arc.radius, !arc.ccw, sweep > PI)?
+                    }
+                    None => {
+                        // Legacy center-angle arc (SKETCH-DCM #45
+                        // follow-ups A — Slice-6 residual 5): mirror
+                        // the stored geometry directly and maintain it
+                        // with the 4-row arc-pair Symmetric (reflected
+                        // center + reflected traversal-normalized
+                        // angles). Reflection about the axis at angle
+                        // α maps θ → 2α − θ and REVERSES orientation,
+                        // so the image's CCW-normalized span is
+                        // [2α − end, 2α − start] of the source's
+                        // CCW-normalized span.
+                        let (s_start, s_end) = if arc.ccw {
+                            (arc.start_angle, arc.end_angle)
+                        } else {
+                            (arc.end_angle, arc.start_angle)
+                        };
+                        let alpha = d_hat.y.atan2(d_hat.x);
+                        let aid = sketch.add_arc_center_angles(
+                            reflect(&arc.center),
+                            arc.radius,
+                            norm_angle(2.0 * alpha - s_end),
+                            norm_angle(2.0 * alpha - s_start),
+                        )?;
+                        mint_constraint(
+                            sketch,
+                            Constraint::new_geometric(
+                                GeometricConstraint::Symmetric,
+                                vec![e, EntityRef::Arc(aid), axis_ref],
+                                ConstraintPriority::High,
+                            ),
+                            &mut outcome,
+                        );
+                        aid
+                    }
                 };
-                let ma = mirror_point!(sa);
-                let mb = mirror_point!(sb);
-                let sweep = arc.sweep_angle();
-                let aid = sketch.add_arc(ma, mb, arc.radius, !arc.ccw, sweep > PI)?;
                 record_created(
                     sketch,
                     EntityRef::Arc(aid),
@@ -1894,6 +2074,57 @@ pub fn mirror(
                         vec![e, EntityRef::Arc(aid)],
                         ConstraintPriority::High,
                     ),
+                    &mut outcome,
+                );
+            }
+            EntityRef::Spline(id) => {
+                // Shared-CP spline (validated above): mirror every
+                // control point through the shared point web — the
+                // spline itself has ZERO private parameters, so the
+                // per-point Symmetric constraints maintain the whole
+                // curve (SKETCH-DCM #45 follow-ups A; Slice-7
+                // point-web model).
+                let (cp_ids, degree, weights) =
+                    {
+                        let entry = sketch.splines().get(&id).ok_or_else(|| {
+                            SketchOpError::EntityNotFound {
+                                op: OP,
+                                entity: e.to_string(),
+                            }
+                        })?;
+                        let cp_ids = entry.control_point_ids.clone().ok_or_else(|| {
+                            SketchOpError::Unsupported {
+                                op: OP,
+                                reason: format!("{e}: mirror needs a shared-control-point spline"),
+                            }
+                        })?;
+                        let (degree, weights) = match &entry.spline {
+                            super::Spline2d::BSpline(bs) => (bs.degree, None),
+                            super::Spline2d::Nurbs(nurbs) => {
+                                (nurbs.degree, Some(nurbs.weights.clone()))
+                            }
+                        };
+                        (cp_ids, degree, weights)
+                    };
+                let mut mirrored_ids = Vec::with_capacity(cp_ids.len());
+                for cp in &cp_ids {
+                    mirrored_ids.push(mirror_point!(*cp));
+                }
+                // The shared-CP creation paths pin open-uniform knots
+                // (Slice-7 contract), so re-creating with the mirrored
+                // points in the SAME order reproduces the reflected
+                // curve exactly (reflection maps P(u) pointwise; no
+                // reversal is involved).
+                let sid = match weights {
+                    None => sketch.add_bspline_with_control_points(degree, &mirrored_ids)?,
+                    Some(w) => sketch.add_nurbs_with_control_points(degree, &mirrored_ids, w)?,
+                };
+                record_created(
+                    sketch,
+                    EntityRef::Spline(sid),
+                    SketchOpKind::Mirror,
+                    Some(e),
+                    None,
                     &mut outcome,
                 );
             }
