@@ -161,3 +161,17 @@ loops-out/
 
 # Obsidian docs vault (lives in-repo for convenience, not part of the codebase)
 Roshera-vault/
+
+# Private working docs — live in the Roshera-vault private repo, never commit here
+.superpowers/
+docs/superpowers/
+AIRCRAFT_LOOP.md
+ASSEMBLY_LOOP.md
+ASSEMBLY_SOLVE_LOOP.md
+KERNEL_AUDIT_*.md
+KERNEL_IMPROVEMENT_PLAN.md
+SESSION_HANDOFF_*.md
+VERIFICATION_FORT_BLUEPRINT.md
+BENCHMARKS.md
+*_LOOP.md
+EXACT_PREDICATES_CAMPAIGN.md
