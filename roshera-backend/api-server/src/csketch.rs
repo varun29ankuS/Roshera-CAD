@@ -1913,8 +1913,9 @@ pub struct ExtrudeCSketchRequest {
 ///    spec §3.3): lines/arcs/circles become typed `ProfileEdge`s, so a
 ///    circle hole extrudes to a TRUE cylindrical bore face (the same
 ///    lateral `create_cylinder` emits — booleans/fillets/STEP inherit
-///    every cylinder-hardened path). Splines/ellipses, and full
-///    circles under an oblique extrusion direction, fall back to the
+///    every cylinder-hardened path); splines AND ellipses lift to
+///    exact NURBS edges (Slice 7 + follow-ups B item 1). Only full
+///    circles under an oblique extrusion direction fall back to the
 ///    chord-sampled polygon EXPLICITLY (counted in the response's
 ///    `stats.sampled_loops`; never labeled analytic).
 /// 4. `extrude_profile_regions` — the shared kernel implementation
@@ -2152,9 +2153,9 @@ pub async fn extrude_csketch(
             "regions":         regions.len(),
             // Honest profile provenance (SKETCH-DCM #45 Slice 5): how
             // many boundary loops carry TRUE analytic edges vs the
-            // chord-sampled fallback (splines/ellipses, or circles
-            // under an oblique direction). A sampled loop is never
-            // silently passed off as analytic.
+            // chord-sampled fallback (circles under an oblique
+            // direction). A sampled loop is never silently passed
+            // off as analytic.
             "analytic_loops":  analytic_loops,
             "sampled_loops":   sampled_loops,
         }
@@ -2177,11 +2178,12 @@ fn profile_loop_json(lp: &geometry_engine::operations::extrude::ProfileLoop) -> 
 /// [`ProfileLoop`]s (SKETCH-DCM #45 Slice 5, spec §3.3), returning
 /// `(regions, analytic_loop_count, sampled_loop_count)`.
 ///
-/// Per loop: lines/arcs/circles extract as typed analytic edges via
-/// `ProfileExtractor::analytic_loop_edges`; loops containing entities
-/// without an analytic lift (splines/ellipses) fall back EXPLICITLY to
-/// the chord-sampled polygon, as does a full-circle loop when the
-/// extrusion direction is oblique to the sketch normal (an oblique
+/// Per loop: lines/arcs/circles/splines/ellipses extract as typed
+/// analytic edges via `ProfileExtractor::analytic_loop_edges`; loops
+/// containing entity kinds without an analytic lift fall back
+/// EXPLICITLY to the chord-sampled polygon, as does a full-circle
+/// loop when the extrusion direction is oblique to the sketch normal
+/// (an oblique
 /// prism over a circle has no coaxial-cylinder lateral — the kernel
 /// refuses that combination, so the route samples it up front and the
 /// caller can still extrude obliquely). The counts feed the response's
@@ -2298,10 +2300,11 @@ fn materialise_profile_loop(
 
 /// Materialise a topology loop into an ordered plane-local polygon —
 /// the EXPLICIT sampled fallback for loops that
-/// [`materialise_profile_loop`] cannot express analytically
-/// (splines/ellipses, or a full circle under an oblique extrusion
-/// direction). Line/arc/circle loops normally take the analytic typed
-/// path instead (SKETCH-DCM #45 Slice 5).
+/// [`materialise_profile_loop`] cannot express analytically (a full
+/// circle under an oblique extrusion direction, or any future entity
+/// kind without a lift). Line/arc/circle/spline/ellipse loops
+/// normally take the analytic typed path instead (SKETCH-DCM #45
+/// Slice 5 / Slice 7 / follow-ups B).
 ///
 /// Each directed edge contributes its samples start-inclusive /
 /// end-exclusive, so concatenating edges closes the polygon without
@@ -3680,11 +3683,16 @@ mod tests {
         }
     }
 
-    /// Entity kinds without an analytic lift (here: an ellipse) fall
-    /// back to sampling EXPLICITLY — the route keeps working and the
-    /// count is honest.
+    /// FLIPPED (SKETCH-DCM #45 follow-ups B, item 1 — Slice-6/7
+    /// test-flip precedent): this test used to pin the EXPLICIT
+    /// sampled fallback for an ellipse loop (no exact lift existed).
+    /// Ellipses now lift to EXACT rational-quadratic NURBS edges, so
+    /// the SAME fixture pins the ANALYTIC path — typed edges, counted
+    /// in `analytic_loops`. The pin's semantics survive: the counters
+    /// still tell the truth, and a sampled loop is never labeled
+    /// analytic.
     #[test]
-    fn extrude_ellipse_loop_falls_back_to_sampled_polygon() {
+    fn extrude_ellipse_loop_materialises_analytically() {
         use geometry_engine::math::Vector3;
         use geometry_engine::operations::extrude::ProfileLoop;
 
@@ -3697,10 +3705,23 @@ mod tests {
         let (regions, analytic, sampled) =
             materialise_profile_regions(&sketch, &topo, &profiles, Vector3::Z, Vector3::Z)
                 .expect("materialise");
-        assert_eq!((analytic, sampled), (0, 1), "ellipse loop sampled");
+        assert_eq!(
+            (analytic, sampled),
+            (1, 0),
+            "ellipse loop lifts analytically (exact rational NURBS)"
+        );
         match &regions.first().expect("one region").outer {
-            ProfileLoop::Polygon(p) => assert_eq!(p.len(), 64),
-            ProfileLoop::Edges(_) => panic!("ellipse loop must fall back to sampling"),
+            ProfileLoop::Edges(edges) => {
+                assert_eq!(edges.len(), 1, "one closed rational NURBS edge");
+                assert!(matches!(
+                    edges[0],
+                    geometry_engine::sketch2d::sketch_topology::ProfileEdge::Nurbs {
+                        degree: 2,
+                        ..
+                    }
+                ));
+            }
+            ProfileLoop::Polygon(_) => panic!("ellipse loop must lift analytically"),
         }
     }
 

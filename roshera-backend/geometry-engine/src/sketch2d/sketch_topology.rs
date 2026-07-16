@@ -1111,9 +1111,11 @@ impl ProfileExtractor {
     /// line segments, rectangle sides and polyline segments → `Line`;
     /// arcs → `Arc`; circles → `Circle`; splines → `Nurbs` (exact
     /// stored control points / weights / knots — SKETCH-DCM #45
-    /// Slice 7); ellipses have no exact analytic lift wired into face
-    /// construction yet and return [`AnalyticLoop::Unsupported`]
-    /// (never a silent approximation). Hard errors are reserved for
+    /// Slice 7); ellipses → `Nurbs` (EXACT rational quadratic, the
+    /// affine image of the unit-circle 9-point net — SKETCH-DCM #45
+    /// follow-ups B item 1). Every walker edge kind now lifts exactly;
+    /// [`AnalyticLoop::Unsupported`] remains the honest verdict for
+    /// any future kind without a lift. Hard errors are reserved for
     /// structural corruption (a loop referencing a missing edge or
     /// entity).
     pub fn analytic_loop_edges(
@@ -1244,6 +1246,69 @@ impl ProfileExtractor {
                         degree,
                         control_points: cps,
                         weights,
+                        knots,
+                    });
+                }
+                (EdgeType::Ellipse, EntityRef::Ellipse(ellipse_id)) => {
+                    // EXACT rational-quadratic ellipse lift (SKETCH-DCM
+                    // #45 follow-ups B, item 1): the ellipse is the
+                    // affine image of the unit circle, and the unit
+                    // circle IS a degree-2 rational NURBS — the
+                    // canonical 9-control-point net with mid-weights
+                    // √2/2 and knots [0,0,0,¼,¼,½,½,¾,¾,1,1,1]
+                    // (Piegl & Tiller §7.5; same construction as the
+                    // exactness-tested `primitives::curve::Ellipse::
+                    // to_nurbs`). Affine maps preserve NURBS with
+                    // UNCHANGED weights/knots, so mapping the net
+                    // through center + R(rotation)·diag(a, b) yields
+                    // the ellipse EXACTLY — no chord fit, no 64-gon.
+                    // Parameterised CCW from the +major-axis point,
+                    // matching `Ellipse2d::evaluate`'s orientation.
+                    let entry = sketch.ellipses().get(ellipse_id).ok_or_else(|| {
+                        Sketch2dError::EntityNotFound {
+                            entity_type: "Ellipse".to_string(),
+                            id: ellipse_id.to_string(),
+                        }
+                    })?;
+                    let ellipse = entry.value().ellipse;
+                    let (a, b) = (ellipse.semi_major, ellipse.semi_minor);
+                    let (sin_r, cos_r) = ellipse.rotation.sin_cos();
+                    let map = |x: f64, y: f64| -> [f64; 2] {
+                        let (ex, ey) = (a * x, b * y);
+                        [
+                            ellipse.center.x + ex * cos_r - ey * sin_r,
+                            ellipse.center.y + ex * sin_r + ey * cos_r,
+                        ]
+                    };
+                    let unit_net: [(f64, f64); 9] = [
+                        (1.0, 0.0),
+                        (1.0, 1.0),
+                        (0.0, 1.0),
+                        (-1.0, 1.0),
+                        (-1.0, 0.0),
+                        (-1.0, -1.0),
+                        (0.0, -1.0),
+                        (1.0, -1.0),
+                        (1.0, 0.0),
+                    ];
+                    let mut cps: Vec<[f64; 2]> = unit_net.iter().map(|&(x, y)| map(x, y)).collect();
+                    const W: f64 = std::f64::consts::FRAC_1_SQRT_2;
+                    let mut weights = vec![1.0, W, 1.0, W, 1.0, W, 1.0, W, 1.0];
+                    let mut knots = vec![
+                        0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+                    ];
+                    // Single-edge closed loops always walk forward, but
+                    // mirror the spline arm's reversal handling so the
+                    // baked-orientation contract holds unconditionally.
+                    if !walk_forward {
+                        cps.reverse();
+                        weights.reverse();
+                        knots = knots.iter().rev().map(|k| 1.0 - k).collect();
+                    }
+                    out.push(ProfileEdge::Nurbs {
+                        degree: 2,
+                        control_points: cps,
+                        weights: Some(weights),
                         knots,
                     });
                 }

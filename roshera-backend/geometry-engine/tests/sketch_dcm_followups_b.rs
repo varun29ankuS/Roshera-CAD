@@ -825,3 +825,236 @@ fn csketch_revolve_hole_subtracts() {
         "annular volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
     );
 }
+
+/// Cross-item gate (items 1 + 5): an ELLIPSE profile revolved about
+/// an off-profile in-plane axis routes through the typed NURBS path
+/// (kernel seam-split → two curved profile edges → two
+/// `SurfaceOfRevolution` faces) and builds SOUND with the Pappus
+/// volume (torus-of-ellipse: V = 2π·R·πab).
+#[test]
+fn csketch_ellipse_profile_revolves_sound() {
+    let s = fresh("followups_b_ellipse_revolve");
+    // Ellipse centred at u = 10, clear of the axis u = 0.
+    s.add_ellipse(Point2d::new(10.0, 0.0), 3.0, 2.0, 0.0)
+        .expect("ellipse");
+    let outer = analytic_outer(&s);
+    assert!(matches!(outer[0], ProfileEdge::Nurbs { .. }));
+
+    let mut model = BRepModel::new();
+    let solid = revolve_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        [0.0, 0.0],
+        [0.0, 1.0],
+        std::f64::consts::TAU,
+        48,
+        Tolerance::default(),
+    )
+    .expect("elliptic torus revolve");
+
+    let k = face_kinds(&model, solid);
+    assert_eq!(
+        kind_count(&k, SurfaceType::SurfaceOfRevolution),
+        2,
+        "two seam-split revolved NURBS walls, got {k:?}"
+    );
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+
+    // Pappus: V = 2π·R̄·A = 2π·10·(π·3·2).
+    let analytic = 2.0 * PI * 10.0 * (PI * 3.0 * 2.0);
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 2e-3,
+        "elliptic torus volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
+// ── Item 1: ellipse profiles lift to EXACT rational NURBS ────────────
+
+/// Evaluate a 2D `ProfileEdge::Nurbs` at parameter `t` by lifting it
+/// through the kernel NURBS evaluator (z = 0).
+fn eval_nurbs_edge_2d(edge: &ProfileEdge, t: f64) -> [f64; 2] {
+    use geometry_engine::primitives::curve::{Curve, NurbsCurve};
+    let ProfileEdge::Nurbs {
+        degree,
+        control_points,
+        weights,
+        knots,
+    } = edge
+    else {
+        panic!("expected a NURBS edge, got {edge:?}");
+    };
+    let cps: Vec<Point3> = control_points
+        .iter()
+        .map(|p| Point3::new(p[0], p[1], 0.0))
+        .collect();
+    let w = weights
+        .clone()
+        .unwrap_or_else(|| vec![1.0; control_points.len()]);
+    let curve = NurbsCurve::new(*degree, cps, w, knots.clone()).expect("valid NURBS");
+    let r = curve.parameter_range();
+    let p = curve
+        .point_at(r.start + t * (r.end - r.start))
+        .expect("evaluate");
+    [p.x, p.y]
+}
+
+/// GATE (item 1, exactness): an ellipse entity lifts to ONE closed
+/// rational-quadratic `ProfileEdge::Nurbs` (the affine image of the
+/// unit circle, P&T §7.5) whose EVERY point satisfies the ellipse's
+/// implicit equation to 1e-9 — including under rotation. No chord fit,
+/// no 64-gon.
+///
+/// Pre-fix (RED, run on dab4d8c): `analytic_loop_edges` returned
+/// `AnalyticLoop::Unsupported { edge_type: Ellipse }` (the Slice-5
+/// residual-1 refusal).
+#[test]
+fn gate_ellipse_lifts_to_exact_rational_nurbs() {
+    for (label, rot) in [("axis-aligned", 0.0_f64), ("rotated", PI / 6.0)] {
+        let s = fresh("followups_b_ellipse_exact");
+        let (cx, cy, a, b) = (3.0, -2.0, 8.0, 5.0);
+        s.add_ellipse(Point2d::new(cx, cy), a, b, rot)
+            .expect("ellipse");
+        let outer = analytic_outer(&s);
+        assert_eq!(outer.len(), 1, "{label}: one closed NURBS edge");
+        let edge = &outer[0];
+        match edge {
+            ProfileEdge::Nurbs {
+                degree,
+                control_points,
+                weights,
+                knots,
+            } => {
+                assert_eq!(*degree, 2, "{label}: rational quadratic");
+                assert_eq!(control_points.len(), 9, "{label}: 9-point net");
+                assert_eq!(knots.len(), 12, "{label}: [0,0,0,¼,¼,½,½,¾,¾,1,1,1]");
+                let w = weights.as_ref().expect("rational weights");
+                assert!(
+                    (w[1] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-15,
+                    "{label}: mid-weight √2/2, got {}",
+                    w[1]
+                );
+            }
+            other => panic!("{label}: expected NURBS lift, got {other:?}"),
+        }
+        // Implicit-equation residual at dense parameters (the
+        // curve_to_nurbs_exactness discipline): rotate back, scale,
+        // must sit on the unit circle.
+        let (sin_r, cos_r) = rot.sin_cos();
+        for i in 0..=256 {
+            let t = i as f64 / 256.0;
+            let [px, py] = eval_nurbs_edge_2d(edge, t);
+            let (dx, dy) = (px - cx, py - cy);
+            let xl = (dx * cos_r + dy * sin_r) / a;
+            let yl = (-dx * sin_r + dy * cos_r) / b;
+            let residual = (xl * xl + yl * yl - 1.0).abs();
+            assert!(
+                residual < 1e-9,
+                "{label}: lifted NURBS must lie ON the ellipse: t={t}, residual {residual:.3e}"
+            );
+        }
+    }
+}
+
+/// GATE (item 1, solid): a lone ellipse profile extrudes to a
+/// ground-truth-SOUND solid (2 caps + 2 seam-split exact NURBS walls)
+/// with volume πab·h — and an ellipse HOLE subtracts exactly.
+#[test]
+fn gate_ellipse_profile_extrudes_sound_with_exact_volume() {
+    let s = fresh("followups_b_ellipse_solid");
+    s.add_ellipse(Point2d::new(0.0, 0.0), 8.0, 5.0, 0.0)
+        .expect("ellipse");
+    let outer = analytic_outer(&s);
+    let mut model = BRepModel::new();
+    let solid = extrude_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        6.0,
+        None,
+        Tolerance::default(),
+    )
+    .expect("ellipse extrude");
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+    let face_count = model
+        .solid_outer_face_count(solid)
+        .expect("outer face count");
+    assert_eq!(face_count, 4, "2 caps + 2 seam-split NURBS walls");
+    let analytic = PI * 8.0 * 5.0 * 6.0;
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    // 64-gon signature for an inscribed polygon is ≈ 1.6e-3 relative;
+    // the primary sampled-vs-analytic teeth are STRUCTURAL (typed
+    // 9-CP net + 4-face census + the 1e-9 implicit residual above).
+    assert!(
+        rel < 2e-3,
+        "ellipse prism volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
+/// Item 1, hole: an elliptic bore inside a rectangle — sound, area
+/// subtracts, and the cap carries the hole loop.
+#[test]
+fn ellipse_hole_extrudes_sound() {
+    let s = fresh("followups_b_ellipse_hole");
+    s.add_polyline(
+        vec![
+            Point2d::new(-50.0, -30.0),
+            Point2d::new(50.0, -30.0),
+            Point2d::new(50.0, 30.0),
+            Point2d::new(-50.0, 30.0),
+        ],
+        true,
+    )
+    .expect("rect");
+    s.add_ellipse(Point2d::new(0.0, 0.0), 20.0, 10.0, 0.0)
+        .expect("ellipse hole");
+    let topo = SketchTopology::analyze(&s, &Tolerance2d::default()).expect("topology");
+    let profiles = ProfileExtractor::extract_for_extrusion(&topo).expect("profiles");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].holes.len(), 1);
+    let to_edges = |lp: &geometry_engine::sketch2d::sketch_topology::SketchLoop| {
+        match ProfileExtractor::analytic_loop_edges(&s, &topo, lp).expect("extraction") {
+            AnalyticLoop::Edges(edges) => edges,
+            other => panic!("must lift analytically: {other:?}"),
+        }
+    };
+    let mut model = BRepModel::new();
+    let solid = extrude_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(to_edges(&profiles[0].outer_boundary)),
+            holes: vec![ProfileLoop::Edges(to_edges(&profiles[0].holes[0]))],
+        }],
+        4.0,
+        None,
+        Tolerance::default(),
+    )
+    .expect("rect-with-elliptic-bore extrude");
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+    let analytic = (100.0 * 60.0 - PI * 20.0 * 10.0) * 4.0;
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 2e-3,
+        "elliptic-bore volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}

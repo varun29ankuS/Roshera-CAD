@@ -38,7 +38,7 @@ use geometry_engine::primitives::curve::Arc as Arc3;
 use geometry_engine::primitives::surface::{Cylinder, Plane};
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::sketch2d::sketch_topology::{
-    AnalyticLoop, EdgeType, ProfileEdge, ProfileExtractor, SketchTopology,
+    AnalyticLoop, ProfileEdge, ProfileExtractor, SketchTopology,
 };
 use geometry_engine::sketch2d::{Point2d, Sketch, SketchAnchor, Tolerance2d};
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
@@ -376,6 +376,13 @@ fn typed_extraction_slot_chains_lines_and_arcs() {
 #[test]
 fn spline_and_ellipse_loops_refuse_analytic_extraction() {
     // Closed ellipse: one single-edge loop.
+    // BEHAVIOUR CHANGE (deliberate, SKETCH-DCM #45 follow-ups B item
+    // 1): ellipses now LIFT to an EXACT rational-quadratic
+    // `ProfileEdge::Nurbs` (the affine image of the unit-circle
+    // 9-point net) instead of refusing — the Slice-5 residual-1 half
+    // this test used to pin. Exactness and soundness gates live in
+    // `sketch_dcm_followups_b.rs`; the pin here is that extraction is
+    // typed, never a silent approximation.
     let sketch = Sketch::new("slice5-ellipse".to_string(), SketchAnchor::xy());
     sketch
         .add_ellipse(Point2d::new(0.0, 0.0), 8.0, 5.0, 0.0)
@@ -386,13 +393,23 @@ fn spline_and_ellipse_loops_refuse_analytic_extraction() {
     match ProfileExtractor::analytic_loop_edges(&sketch, &topo, &profiles[0].outer_boundary)
         .expect("extraction must not hard-error")
     {
-        AnalyticLoop::Unsupported { edge_type, .. } => {
-            assert_eq!(edge_type, EdgeType::Ellipse, "verdict names the ellipse")
+        AnalyticLoop::Edges(edges) => {
+            assert_eq!(edges.len(), 1, "one closed rational NURBS edge");
+            assert!(
+                matches!(
+                    &edges[0],
+                    ProfileEdge::Nurbs {
+                        degree: 2,
+                        weights: Some(_),
+                        ..
+                    }
+                ),
+                "ellipses lift to exact rational quadratics since follow-ups B: {edges:?}"
+            );
         }
-        AnalyticLoop::Edges(edges) => panic!(
-            "ellipse loop must refuse analytic extraction (no exact ellipse \
-             lift is wired yet), got {} edges",
-            edges.len()
+        AnalyticLoop::Unsupported { entity, edge_type } => panic!(
+            "ellipses must lift analytically since follow-ups B, got refusal on \
+             {entity} ({edge_type:?})"
         ),
     }
 
