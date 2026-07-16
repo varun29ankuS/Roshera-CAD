@@ -843,3 +843,186 @@ fn pattern_refuses_legacy_and_raw_shapes_per_shape() {
     .expect_err("curve_pattern keeps point/circle sources");
     assert!(matches!(err, SketchOpError::Unsupported { .. }));
 }
+
+// ── 5. All-arc offset loops (Slice-6 residual 2) ────────────────────
+
+#[test]
+fn red_all_arc_offset_loop_is_fully_maintained() {
+    // Slice-6 residual 2: arc offsets minted only the radial-gap
+    // OffsetDistance, so a loop with arc-arc junctions reported
+    // UnderConstrained (honestly). The follow-up mints per-junction:
+    // the concentric Offset for source arcs whose junctions have no
+    // adjacent offset-line rows to pin them, and a G1 SmoothTangent at
+    // every arc-arc junction (radial ties are first-order degenerate
+    // there: the carriers are mutually tangent). Lens hand-count:
+    // 4 junctions (8) + 4 chords (4) = 12 free;
+    // 2x(Offset 2 + OffsetDistance 1) + 2xRadius + 4xSmoothTangent = 12.
+    let s = fresh("followups_offset_lens");
+    let a = s.add_point(Point2d::new(-6.0, 0.0));
+    let b = s.add_point(Point2d::new(6.0, 0.0));
+    let arc1 = s.add_arc(a, b, 10.0, true, false).expect("bottom arc");
+    let arc2 = s.add_arc(b, a, 10.0, true, false).expect("top arc");
+    for id in [a, b] {
+        s.points().get_mut(&id).expect("point").value_mut().fix();
+    }
+    let r1_pin = s.add_constraint(required_dim(
+        DimensionalConstraint::Radius(10.0),
+        vec![EntityRef::Arc(arc1)],
+    ));
+    s.add_constraint(required_dim(
+        DimensionalConstraint::Radius(10.0),
+        vec![EntityRef::Arc(arc2)],
+    ));
+
+    let d = 3.0;
+    let outcome = sketch_ops::offset(&s, &EntityRef::Arc(arc1), d).expect("lens offset");
+
+    let new_arcs: Vec<_> = outcome
+        .created
+        .iter()
+        .filter_map(|e| match e {
+            EntityRef::Arc(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(new_arcs.len(), 4, "two offset arcs + two corner arcs");
+    let radii: Vec<f64> = new_arcs
+        .iter()
+        .map(|id| s.arcs().get(id).expect("arc").arc.radius)
+        .collect();
+    assert_eq!(
+        radii.iter().filter(|r| (**r - 13.0).abs() < 1e-9).count(),
+        2,
+        "offset arcs grow to r + d: {radii:?}"
+    );
+    assert_eq!(
+        radii.iter().filter(|r| (**r - d).abs() < 1e-9).count(),
+        2,
+        "corner arcs have radius |d|: {radii:?}"
+    );
+
+    // Per-junction maintenance web.
+    let minted_kinds = |pred: &dyn Fn(&ConstraintType) -> bool| -> usize {
+        outcome
+            .constraints_added
+            .iter()
+            .filter(|id| {
+                s.all_constraints()
+                    .iter()
+                    .any(|c| c.id == **id && pred(&c.constraint_type))
+            })
+            .count()
+    };
+    assert_eq!(
+        minted_kinds(&|t| matches!(t, ConstraintType::Geometric(GeometricConstraint::Offset))),
+        2,
+        "one concentric Offset per source arc pair (arc-arc junctions on both sides)"
+    );
+    assert_eq!(
+        minted_kinds(&|t| matches!(
+            t,
+            ConstraintType::Dimensional(DimensionalConstraint::OffsetDistance(_))
+        )),
+        2
+    );
+    assert_eq!(
+        minted_kinds(&|t| matches!(
+            t,
+            ConstraintType::Dimensional(DimensionalConstraint::Radius(_))
+        )),
+        2,
+        "corner arc radius pins"
+    );
+    assert_eq!(
+        minted_kinds(&|t| matches!(
+            t,
+            ConstraintType::Geometric(GeometricConstraint::SmoothTangent)
+        )),
+        4,
+        "every arc-arc junction carries a G1 SmoothTangent maintenance row"
+    );
+
+    let dof = s.analyze_dofs();
+    assert_eq!(
+        dof.status,
+        DofStatus::FullyConstrained,
+        "the all-arc offset loop must be fully maintained: {dof:?}"
+    );
+    let report = s.solve_constraints().expect("solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+
+    // MAINTAINED: shrink the bottom source arc's radius 10 -> 9; its
+    // offset partner must re-solve to 12 through the radial gap while
+    // the concentric rows keep the carriers locked.
+    s.update_dimensional_value(&r1_pin, 9.0).expect("edit");
+    let report = s.solve_constraints().expect("re-solve");
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+    let radii_after: Vec<f64> = new_arcs
+        .iter()
+        .map(|id| s.arcs().get(id).expect("arc").arc.radius)
+        .collect();
+    assert!(
+        radii_after.iter().any(|r| (r - 12.0).abs() < 1e-6),
+        "the offset arc must track the source radius edit: {radii_after:?}"
+    );
+}
+
+// ── 6. Offset global self-intersection (Slice-6 residual 3) ─────────
+
+#[test]
+fn red_offset_refuses_global_self_intersection_typed() {
+    // T-slot block: a narrow neck (width 10) opening into a wider
+    // cavity. Offsetting the loop OUTWARD by 6 keeps every edge
+    // locally valid (no inversion, all closing trims fit), but the
+    // two neck-top corner arcs — far apart in the ring — collide.
+    // Slice-6 residual 3: this used to solve and certify as a
+    // silently self-intersecting loop; it must now refuse typed,
+    // naming the colliding segments, leaving the sketch untouched.
+    let s = fresh("followups_offset_self_intersect");
+    let pts = [
+        Point2d::new(0.0, 0.0),
+        Point2d::new(50.0, 0.0),
+        Point2d::new(50.0, 40.0),
+        Point2d::new(30.0, 40.0),
+        Point2d::new(30.0, 20.0),
+        Point2d::new(45.0, 20.0),
+        Point2d::new(45.0, 5.0),
+        Point2d::new(5.0, 5.0),
+        Point2d::new(5.0, 20.0),
+        Point2d::new(20.0, 20.0),
+        Point2d::new(20.0, 40.0),
+        Point2d::new(0.0, 40.0),
+    ];
+    let ids: Vec<_> = pts.iter().map(|p| s.add_point(*p)).collect();
+    let mut first_line = None;
+    for i in 0..ids.len() {
+        let lid = s
+            .add_line(ids[i], ids[(i + 1) % ids.len()])
+            .expect("outline line");
+        first_line.get_or_insert(lid);
+    }
+    let points_before = s.points().len();
+    let lines_before = s.lines().len();
+    let arcs_before = s.arcs().len();
+    let constraints_before = s.all_constraints().len();
+
+    let err = sketch_ops::offset(&s, &EntityRef::Line(first_line.expect("line")), 6.0)
+        .expect_err("globally colliding offset must refuse");
+    assert!(
+        matches!(&err, SketchOpError::SelfIntersecting { first, second }
+            if !first.is_empty() && !second.is_empty()),
+        "typed SelfIntersecting refusal naming the colliding segments, got {err:?}"
+    );
+
+    // Validate-first: the refusal left the sketch byte-identical.
+    assert_eq!(s.points().len(), points_before);
+    assert_eq!(s.lines().len(), lines_before);
+    assert_eq!(s.arcs().len(), arcs_before);
+    assert_eq!(s.all_constraints().len(), constraints_before);
+
+    // A smaller offset that does NOT collide still succeeds (the neck
+    // walls stop 2 apart at d = 4).
+    let outcome = sketch_ops::offset(&s, &EntityRef::Line(first_line.expect("line")), 4.0)
+        .expect("non-colliding offset succeeds");
+    assert!(!outcome.created.is_empty());
+}

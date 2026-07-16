@@ -1241,6 +1241,7 @@ fn op_error_to_api(err: SketchOpError) -> ApiError {
         SketchOpError::NoIntersection { .. } => "no_intersection",
         SketchOpError::InvalidParameter { .. } => "invalid_parameter",
         SketchOpError::OffsetTooLarge { .. } => "offset_too_large",
+        SketchOpError::SelfIntersecting { .. } => "self_intersecting",
         SketchOpError::AxisNotConstruction { .. } => "axis_not_construction",
         SketchOpError::Sketch(_) => "sketch",
     };

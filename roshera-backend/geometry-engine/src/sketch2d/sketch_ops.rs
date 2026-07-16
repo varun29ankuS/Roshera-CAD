@@ -146,6 +146,13 @@ pub enum SketchOpError {
     /// Mirror requires a construction-line axis (spec §3.4).
     #[error("{op}: the axis must be a construction line")]
     AxisNotConstruction { op: &'static str },
+    /// The offset result would self-intersect: two NON-ADJACENT result
+    /// segments cross (SKETCH-DCM #45 follow-ups A — the edge-level
+    /// inversion/vanish checks are local; this is the global guard
+    /// closing Slice-6 residual 3). Never emitted for adjacent
+    /// segments, which share a junction by construction.
+    #[error("offset: result self-intersects: {first} crosses {second}")]
+    SelfIntersecting { first: String, second: String },
     /// A kernel-level failure while materialising the result.
     #[error(transparent)]
     Sketch(#[from] Sketch2dError),
@@ -1595,6 +1602,60 @@ pub fn offset(
         }
     }
 
+    // Global self-intersection guard (SKETCH-DCM #45 follow-ups A —
+    // Slice-6 residual 3): the edge-level checks above are LOCAL
+    // (inversion, degenerate sweep, missing closing intersection); a
+    // large offset whose DISTANT features collide passed them and
+    // produced a silently self-intersecting loop. Every non-adjacent
+    // pair of final primitives must be disjoint — adjacent pairs share
+    // a junction by construction and are excluded. Extent-respecting
+    // intersections via the shared op table; typed refusal NAMES the
+    // colliding segments. Still before any sketch mutation.
+    let prim_curve = |prim: &OffsetPrim| -> Result<OpCurve, SketchOpError> {
+        match prim {
+            OffsetPrim::Line { start, end, .. } => Ok(OpCurve::Segment { a: *start, b: *end }),
+            OffsetPrim::Arc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+                ccw,
+                ..
+            } => Arc2d::new(*center, *radius, *start_angle, *end_angle, *ccw)
+                .map(OpCurve::Arc)
+                .map_err(SketchOpError::from),
+        }
+    };
+    let prim_name = |prim: &OffsetPrim| -> String {
+        match prim {
+            OffsetPrim::Line { source, .. } => format!("offset of {}", EntityRef::Line(*source)),
+            OffsetPrim::Arc {
+                source: Some(id),
+                corner: false,
+                ..
+            } => format!("offset of {}", EntityRef::Arc(*id)),
+            OffsetPrim::Arc { center, .. } => {
+                format!("corner arc at ({:.6}, {:.6})", center.x, center.y)
+            }
+        }
+    };
+    let m_final = finals.len();
+    for i in 0..m_final {
+        for j in (i + 1)..m_final {
+            let adjacent = j == i + 1 || (i == 0 && j == m_final - 1);
+            if adjacent {
+                continue;
+            }
+            let (ci, cj) = (prim_curve(&finals[i])?, prim_curve(&finals[j])?);
+            if !intersections(&ci, &cj, OP)?.is_empty() {
+                return Err(SketchOpError::SelfIntersecting {
+                    first: prim_name(&finals[i]),
+                    second: prim_name(&finals[j]),
+                });
+            }
+        }
+    }
+
     // 3. Materialise: junction points are shared between consecutive
     //    primitives; entities + maintenance constraints + provenance.
     let mut outcome = SketchOpOutcome::new(SketchOpKind::Offset);
@@ -1619,8 +1680,21 @@ pub fn offset(
         // Prim k starts at the junction AFTER prim k−1.
         junction_ids[(k + m - 1) % m]
     };
+    // Per-junction pinning map (follow-ups A): junction j (between
+    // prim j and prim j+1) is pinned by the offset-line correspondence
+    // rows when either neighbor is a line pair. Junctions with NO line
+    // neighbor need the arc-side minting below (concentric Offset on
+    // source arcs, vertex Distance rows on corner arcs) — that closes
+    // Slice-6 residual 2 for all-arc loops without over-counting the
+    // proven line-arc classes.
+    let is_line_prim = |k: usize| matches!(finals[k], OffsetPrim::Line { .. });
+    let junction_line_pinned = |j: usize| -> bool { is_line_prim(j) || is_line_prim((j + 1) % m) };
+    let mut prim_entities: Vec<EntityRef> = Vec::with_capacity(m);
     for (k, prim) in finals.iter().enumerate() {
         let (p_start, p_end) = (start_id(k), junction_ids[k]);
+        // Junction indices flanking prim k: start junction = (k-1),
+        // end junction = k.
+        let (j_start, j_end) = ((k + m - 1) % m, k);
         match prim {
             OffsetPrim::Line {
                 source, reversed, ..
@@ -1630,6 +1704,7 @@ pub fn offset(
                 } else {
                     sketch.add_line(p_start, p_end)?
                 };
+                prim_entities.push(EntityRef::Line(lid));
                 record_created(
                     sketch,
                     EntityRef::Line(lid),
@@ -1666,6 +1741,7 @@ pub fn offset(
             } => {
                 let sweep = prim.sweep();
                 let aid = sketch.add_arc(p_start, p_end, *radius, *ccw, sweep > PI)?;
+                prim_entities.push(EntityRef::Arc(aid));
                 let source_ref = source.map(EntityRef::Arc);
                 record_created(
                     sketch,
@@ -1689,14 +1765,7 @@ pub fn offset(
                         &mut outcome,
                     );
                 } else if let Some(src) = source_ref {
-                    // Radial gap to the source arc. Concentricity is
-                    // NOT double-minted: for the line-arc loop class
-                    // the arc's endpoints are already pinned by the
-                    // adjacent line pairs, and adding the 2-row
-                    // concentric `Offset` would over-count the DOF
-                    // arithmetic (documented in the slice report;
-                    // all-arc loops therefore keep residual freedom,
-                    // reported honestly by the certificate).
+                    // Radial gap to the source arc.
                     mint_constraint(
                         sketch,
                         Constraint::new_dimensional(
@@ -1706,9 +1775,63 @@ pub fn offset(
                         ),
                         &mut outcome,
                     );
+                    // Concentric correspondence (follow-ups A —
+                    // Slice-6 residual 2): minted ONLY when neither
+                    // neighbor is an offset line pair. For the proven
+                    // line-arc classes (rectangle/slot) the arc's
+                    // junctions are already pinned by the adjacent
+                    // line correspondence rows and the 2-row Offset
+                    // would over-count; in all-arc rings it is exactly
+                    // the missing carrier pinning (per-junction rule:
+                    // both flanking junctions are arc-arc).
+                    if !junction_line_pinned(j_start) && !junction_line_pinned(j_end) {
+                        mint_constraint(
+                            sketch,
+                            Constraint::new_geometric(
+                                GeometricConstraint::Offset,
+                                vec![src, EntityRef::Arc(aid)],
+                                ConstraintPriority::High,
+                            ),
+                            &mut outcome,
+                        );
+                    }
                 }
             }
         }
+    }
+    // Per-junction tangency maintenance (follow-ups A — the second
+    // half of closing Slice-6 residual 2): every junction with NO
+    // offset-line correspondence rows gets a G1 `SmoothTangent`
+    // constraint between its two arc neighbors AT the junction point.
+    // The offset construction is tangent-continuous at gap corners by
+    // definition, so the row is exactly satisfied at placement.
+    //
+    // WHY G1 and not a radial tie (e.g. Distance(junction, vertex)):
+    // at a gap junction the offset-arc carrier and the corner-arc
+    // carrier are mutually TANGENT — every radial constraint's
+    // gradient there is parallel to the carrier rows', leaving the
+    // junction's tangential direction pinned only at second order
+    // (Newton stalls at ~1e-9, observed). The tangency cross-product
+    // is first-order TRANSVERSE, giving the per-junction system full
+    // rank — and it needs no vertex point entity, so legacy sources
+    // are covered too.
+    for j in 0..m {
+        if junction_line_pinned(j) {
+            continue;
+        }
+        mint_constraint(
+            sketch,
+            Constraint::new_geometric(
+                GeometricConstraint::SmoothTangent,
+                vec![
+                    prim_entities[j],
+                    prim_entities[(j + 1) % m],
+                    EntityRef::Point(junction_ids[j]),
+                ],
+                ConstraintPriority::High,
+            ),
+            &mut outcome,
+        );
     }
     Ok(outcome)
 }
