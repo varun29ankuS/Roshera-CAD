@@ -16,7 +16,7 @@ use geometry_engine::primitives::{
     solid::Solid,
     surface::{
         Cone as GeoCone, Cylinder as GeoCylinder, GeneralNurbsSurface, Plane as GeoPlane,
-        Sphere as GeoSphere, Surface, SurfaceOfRevolution as GeoSurfaceOfRevolution,
+        RuledSurface, Sphere as GeoSphere, Surface, SurfaceOfRevolution as GeoSurfaceOfRevolution,
         Torus as GeoTorus,
     },
     topology_builder::BRepModel,
@@ -856,6 +856,140 @@ fn straight_fillet_cylinder_axis(fillet: &CylindricalFillet) -> Option<([f64; 3]
     Some(([p0.x, p0.y, p0.z], axis))
 }
 
+/// If `ruled` is an EXACT translational sweep of a NURBS rail, return the
+/// equivalent exact `SurfaceData::BSpline` / `SurfaceData::Nurbs`.
+///
+/// Preconditions verified (any failure → `None`, caller falls back to the
+/// sampled grid):
+///
+/// 1. **Shared basis** — both rails' `to_nurbs()` forms agree in degree,
+///    knot vector and weights (a ruled surface between rails with
+///    different bases is not a tensor-product surface on either basis).
+/// 2. **Knot domain [0, 1]** — `RuledSurface` feeds its `u ∈ [0, 1]`
+///    RAW to the rails, and a STEP reader evaluates the written surface
+///    on its knot domain; the two parameterisations coincide only when
+///    the knot vector spans exactly [0, 1] (which the extrude path
+///    guarantees: profile-edge NURBS and `subcurve` halves are
+///    [0, 1]-normalised). Emitting a different domain would silently
+///    invalidate every exported pcurve on the face.
+/// 3. **Constant displacement** — every top CP is the matching bottom CP
+///    plus one shared vector `d` (the extrusion sweep).
+/// 4. **Parameterisation identity** — the rails evaluate identically to
+///    their NURBS forms at sampled parameters. Exact (0-distance) for
+///    true `NurbsCurve` rails; REJECTS rails whose `to_nurbs()`
+///    re-parameterises (an `Arc`'s rational-Bézier form is angle-
+///    nonlinear), because the written surface would disagree with the
+///    live surface's (u, v) frame and distort every projected pcurve.
+///
+/// With 1–4 satisfied, `S(u,v) = (1−v)·C_b(u) + v·C_t(u)` equals the
+/// degree-(p, 1) NURBS surface with rows `[P_b_i, P_b_i + d]` and per-row
+/// duplicated weights: the v-linear combination happens in homogeneous
+/// space with identical row weights, so the rational denominator is
+/// v-independent and the surface is pointwise identical, not fitted.
+fn exact_swept_ruled_surface(ruled: &RuledSurface) -> Option<SurfaceData> {
+    let b = ruled.curve1.to_nurbs();
+    let t = ruled.curve2.to_nurbs();
+
+    // 1. Shared basis.
+    if b.degree != t.degree
+        || b.control_points.len() != t.control_points.len()
+        || b.knots.len() != t.knots.len()
+    {
+        return None;
+    }
+    if !b
+        .knots
+        .iter()
+        .zip(t.knots.iter())
+        .all(|(x, y)| (x - y).abs() < 1e-12)
+    {
+        return None;
+    }
+    if !b
+        .weights
+        .iter()
+        .zip(t.weights.iter())
+        .all(|(x, y)| (x - y).abs() < 1e-12)
+    {
+        return None;
+    }
+
+    // 2. Knot domain [0, 1].
+    let (first, last) = (b.knots.first()?, b.knots.last()?);
+    if first.abs() > 1e-12 || (last - 1.0).abs() > 1e-12 {
+        return None;
+    }
+
+    // 3. Constant displacement between the control nets.
+    let p0b = b.control_points.first()?;
+    let p0t = t.control_points.first()?;
+    let d = *p0t - *p0b;
+    let scale = b
+        .control_points
+        .iter()
+        .chain(t.control_points.iter())
+        .map(|p| p.x.abs().max(p.y.abs()).max(p.z.abs()))
+        .fold(1.0_f64, f64::max);
+    let tol = 1e-9 * scale;
+    if !b
+        .control_points
+        .iter()
+        .zip(t.control_points.iter())
+        .all(|(pb, pt)| (*pt - (*pb + d)).magnitude() <= tol)
+    {
+        return None;
+    }
+
+    // 4. Parameterisation identity of each rail with its NURBS form.
+    for u in [0.0, 0.17, 0.5, 0.83, 1.0] {
+        let rb = ruled.curve1.point_at(u).ok()?;
+        let nb = b.point_at(u).ok()?;
+        if rb.distance(&nb) > tol {
+            return None;
+        }
+        let rt = ruled.curve2.point_at(u).ok()?;
+        let nt = t.point_at(u).ok()?;
+        if rt.distance(&nt) > tol {
+            return None;
+        }
+    }
+
+    // Control net: rows in [u][v] order, v-degree 1 over knots
+    // [0, 0, 1, 1] (domain [0, 1] — matches the ruled v exactly). The
+    // top row uses the STORED top CPs (exact), not `pb + d`.
+    let control_points: Vec<Vec<[f64; 3]>> = b
+        .control_points
+        .iter()
+        .zip(t.control_points.iter())
+        .map(|(pb, pt)| vec![[pb.x, pb.y, pb.z], [pt.x, pt.y, pt.z]])
+        .collect();
+    let knots_u = b.knots.clone();
+    let knots_v = vec![0.0, 0.0, 1.0, 1.0];
+    let degree_u = b.degree as u32;
+    let degree_v = 1u32;
+
+    let rational = b.weights.iter().any(|w| (w - 1.0).abs() > 1e-12);
+    if rational {
+        let weights: Vec<Vec<f64>> = b.weights.iter().map(|&w| vec![w, w]).collect();
+        Some(SurfaceData::Nurbs {
+            control_points,
+            weights,
+            knots_u,
+            knots_v,
+            degree_u,
+            degree_v,
+        })
+    } else {
+        Some(SurfaceData::BSpline {
+            control_points,
+            knots_u,
+            knots_v,
+            degree_u,
+            degree_v,
+        })
+    }
+}
+
 fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
     let any = surface.as_any();
 
@@ -953,6 +1087,22 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
             degree_u: nurbs_surf.nurbs.degree_u as u32,
             degree_v: nurbs_surf.nurbs.degree_v as u32,
         };
+    }
+
+    // An EXACTLY-SWEPT ruled lateral (SKETCH-DCM #45 follow-ups C item 2):
+    // both rails share one NURBS basis (same degree / knots / weights) and
+    // the top rail is the bottom rail translated by a constant vector —
+    // the extrude walls of NURBS/ellipse/oblique-spline profiles. Such a
+    // surface IS a NURBS surface: control net = rail CPs swept along the
+    // displacement (v-degree 1), weights preserved per row. Emitting it
+    // exactly maps the wall to a proper `B_SPLINE_SURFACE_WITH_KNOTS`
+    // (rational complex form for rational rails) instead of the degree-1
+    // sampled grid below. Non-swept / re-parameterised ruled surfaces
+    // fall through to the sampled fallback unchanged.
+    if let Some(ruled) = any.downcast_ref::<RuledSurface>() {
+        if let Some(exact) = exact_swept_ruled_surface(ruled) {
+            return exact;
+        }
     }
 
     if let Some(sor) = any.downcast_ref::<GeoSurfaceOfRevolution>() {

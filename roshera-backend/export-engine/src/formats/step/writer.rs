@@ -1695,11 +1695,20 @@ impl<W: Write> StepWriter<W> {
     }
 }
 
-/// Format a list of real numbers for STEP
+/// Format a list of real numbers for STEP.
+///
+/// 12 decimal places (was 6): coordinates, knots and rational weights
+/// are geometry-bearing, and 6-decimal quantisation (1e-6 absolute)
+/// EXCEEDED the file's own declared model-space uncertainty (1e-7) —
+/// measured as a 2.7e-6 round-trip deviation on exact NURBS walls whose
+/// knots (1/3) and seam-split control points are not 6-decimal-exact.
+/// 12 places keeps the emission well inside the declared uncertainty
+/// while remaining a plain ISO 10303-21 REAL (always carries the
+/// decimal point; never scientific notation).
 fn format_real_list(values: &[f64]) -> String {
     values
         .iter()
-        .map(|v| format!("{:.6}", v))
+        .map(|v| format!("{:.12}", v))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -2172,19 +2181,19 @@ mod tests {
             w.write_cartesian_point(&[1.0, 2.0, 3.0])?;
             Ok(())
         });
-        assert!(out.contains("CARTESIAN_POINT('',(1.000000,2.000000,3.000000))"));
+        assert!(out.contains("CARTESIAN_POINT('',(1.000000000000,2.000000000000,3.000000000000))"));
         assert!(out.contains("#1="));
     }
 
     #[test]
-    fn write_cartesian_point_negative_coords_six_decimals() {
+    fn write_cartesian_point_negative_coords_twelve_decimals() {
         let out = write_into(|w| {
             w.write_cartesian_point(&[-1.5, 0.0, -2.25])?;
             Ok(())
         });
-        assert!(out.contains("-1.500000"));
-        assert!(out.contains("0.000000"));
-        assert!(out.contains("-2.250000"));
+        assert!(out.contains("-1.500000000000"));
+        assert!(out.contains("0.000000000000"));
+        assert!(out.contains("-2.250000000000"));
     }
 
     #[test]
@@ -2206,7 +2215,7 @@ mod tests {
             w.write_direction(&[0.0, 0.0, 1.0])?;
             Ok(())
         });
-        assert!(out.contains("DIRECTION('',(0.000000,0.000000,1.000000))"));
+        assert!(out.contains("DIRECTION('',(0.000000000000,0.000000000000,1.000000000000))"));
     }
 
     #[test]
@@ -2491,9 +2500,16 @@ mod tests {
     // ─── G. Format helpers ─────────────────────────────────────────
 
     #[test]
-    fn format_real_list_six_decimals() {
-        assert_eq!(format_real_list(&[1.0]), "1.000000");
-        assert_eq!(format_real_list(&[1.0, 2.5]), "1.000000,2.500000");
+    fn format_real_list_twelve_decimals() {
+        assert_eq!(format_real_list(&[1.0]), "1.000000000000");
+        assert_eq!(
+            format_real_list(&[1.0, 2.5]),
+            "1.000000000000,2.500000000000"
+        );
+        // Geometry-bearing precision: 1/3 must not quantise at 1e-6
+        // (the pre-fix 6-decimal form measurably deformed NURBS walls
+        // whose knots/CPs are not 6-decimal-exact).
+        assert_eq!(format_real_list(&[1.0 / 3.0]), "0.333333333333");
     }
 
     #[test]
@@ -2503,7 +2519,10 @@ mod tests {
 
     #[test]
     fn format_real_list_negatives() {
-        assert_eq!(format_real_list(&[-1.0, 0.0]), "-1.000000,0.000000");
+        assert_eq!(
+            format_real_list(&[-1.0, 0.0]),
+            "-1.000000000000,0.000000000000"
+        );
     }
 
     #[test]
