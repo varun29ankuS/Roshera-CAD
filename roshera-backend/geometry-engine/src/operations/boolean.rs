@@ -21007,6 +21007,78 @@ mod tests {
     }
 
     // =====================================================================
+    // EXACT PREDICATES Slice-1 REDs (spec 2026-07-16, census §2.3 row #10).
+    //
+    // Each case below was found by `tests/adversarial_predicate_census.rs`
+    // (seeded corpus vs a BigRational oracle — every finite f64 is an exact
+    // dyadic rational, so the recorded truth is ground truth, not opinion).
+    // The raw ray-cast implementations return the WRONG side because the
+    // `x_cross` division rounds across the query point. `#[ignore]`d while
+    // the float implementations stand; Slice 2 migrates these call sites to
+    // the exact core and un-ignores them — after which they are the mutation
+    // proof (reverting a call site to the float compare re-fails them).
+    // =====================================================================
+
+    /// Slice-2 RED: `point_in_polygon_2d` lies on an edge-graze query.
+    /// Oracle truth: OUTSIDE (the +x ray's crossing parity is even); the
+    /// division-based cast counts one crossing too many.
+    #[test]
+    #[ignore = "Slice-2 RED: raw f64 ray cast lies here; un-ignore with the exact-core migration"]
+    fn point_in_polygon_2d_exact_on_edge_graze() {
+        let poly: Vec<(f64, f64)> = vec![
+            (7.225625928452673, 2.7768500608312636),
+            (6.072631636028047, 2.672881766295894),
+            (-2.5291854002345886, 4.638069284829017),
+            (-7.650869387878803, 2.918458308232573),
+            (8.586012336985753, -2.444888441654245),
+        ];
+        let p = (2.5467869206826865, -0.45001894902491996);
+        assert!(
+            !point_in_polygon_2d(p.0, p.1, &poly),
+            "rational-oracle truth is OUTSIDE (census first v1 lie); \
+             the raw f64 ray cast reports inside"
+        );
+    }
+
+    /// Slice-2 RED: `uv_point_in_polygon` lies on an edge-graze query.
+    /// Oracle truth: INSIDE; the t-parameter division rounds the crossing
+    /// to the wrong side of the query.
+    #[test]
+    #[ignore = "Slice-2 RED: raw f64 ray cast lies here; un-ignore with the exact-core migration"]
+    fn uv_point_in_polygon_exact_on_edge_graze() {
+        let poly: Vec<(f64, f64)> = vec![
+            (-1.239582485255542, 7.479570865958778),
+            (-4.238166112769274, 7.81764288716935),
+            (-5.78909933898001, -5.872542076305808),
+        ];
+        let p = (-5.540080621045283, -5.141711495058385);
+        assert!(
+            uv_point_in_polygon(&poly, p),
+            "rational-oracle truth is INSIDE (census first v2 lie); \
+             the raw f64 ray cast reports outside"
+        );
+    }
+
+    /// Slice-2 RED: `segments_properly_intersect_2d` misses a genuine proper
+    /// crossing whose orientation quad has one determinant within ulps of
+    /// zero (an endpoint almost on the other segment's carrier line).
+    /// Oracle truth: the four rational orientation signs are strictly
+    /// opposite on both quads — a proper crossing.
+    #[test]
+    #[ignore = "Slice-2 RED: raw f64 cross products lie here; un-ignore with the exact-core migration"]
+    fn segments_properly_intersect_2d_exact_on_near_collinear_quad() {
+        let p1 = (0.968691646732285, 0.8609623040483099);
+        let p2 = (0.8139453654162878, 0.42924481339292414);
+        let p3 = (1.2341322683967864, 0.5444102712336032);
+        let p4 = (0.5099263106731315, 0.34591881397829927);
+        assert!(
+            segments_properly_intersect_2d(p1, p2, p3, p4),
+            "rational-oracle truth is a PROPER CROSSING (census first \
+             crossing lie); the raw f64 cross products miss it"
+        );
+    }
+
+    // =====================================================================
     // Task #36 Slice 2 — extended hardening gauntlet for the merge pass
     // and `uv_polygon_strictly_contains` helper.
     //

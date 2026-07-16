@@ -133,6 +133,13 @@ harness = false
 name = "sketch_solver"
 harness = false
 
+# EXACT PREDICATES Slice 1: classification-heavy boolean fixture baseline
+# (spec 2026-07-16 §3.7 — the ≤5% per-slice migration budget is measured
+# against this bench's recorded numbers).
+[[bench]]
+name = "boolean_classification"
+harness = false
+
 [[bin]]
 name = "bench_runner"
 path = "src/bin/bench_runner.rs"

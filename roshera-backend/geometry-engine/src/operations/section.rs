@@ -1564,6 +1564,33 @@ mod tests {
     use crate::operations::revolve::{revolve_smooth_nozzle, revolve_smooth_solid, RevolveOptions};
     use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 
+    /// EXACT PREDICATES Slice-2 RED (spec 2026-07-16, census §2.3 rows
+    /// #10/#11): the section loop-nesting ray cast lies on an edge-graze
+    /// query. Case found by `tests/adversarial_predicate_census.rs` against a
+    /// BigRational oracle (truth: OUTSIDE — even crossing parity); the
+    /// division-based cast (even with the #85b 1e-18 denominator clamp)
+    /// counts one crossing too many. `#[ignore]`d while the float
+    /// implementation stands; Slice 2 migrates `point_in_polygon` to the
+    /// exact core and un-ignores it (mutation proof: reverting to the float
+    /// compare re-fails it).
+    #[test]
+    #[ignore = "Slice-2 RED: raw f64 ray cast lies here; un-ignore with the exact-core migration"]
+    fn point_in_polygon_exact_on_edge_graze() {
+        let poly: Vec<(f64, f64)> = vec![
+            (7.225625928452673, 2.7768500608312636),
+            (6.072631636028047, 2.672881766295894),
+            (-2.5291854002345886, 4.638069284829017),
+            (-7.650869387878803, 2.918458308232573),
+            (8.586012336985753, -2.444888441654245),
+        ];
+        let p = (2.5467869206826865, -0.45001894902491996);
+        assert!(
+            !point_in_polygon(p, &poly),
+            "rational-oracle truth is OUTSIDE (census first v3 lie); \
+             the raw f64 ray cast reports inside"
+        );
+    }
+
     /// Rao-bell nozzle inner flow contour (r, z) from the live #section-404
     /// dogfood: revolve with wall_thickness=2 → two smooth SurfaceOfRevolution
     /// walls + 2 planar annular rims.
