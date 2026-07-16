@@ -152,15 +152,27 @@ export function registerPsketchTools(server: McpServer) {
     "psketch_op",
     "Sketch operation on a parametric sketch — the result is MAINTAINED by " +
       "minted constraints, not a one-shot copy. op=trim {entity,cutter " +
-      "(EntityRef like {Line: uuid}), pick:[x,y] on the span to REMOVE}; " +
-      "extend {line: uuid, end:'start'|'end', boundary: EntityRef}; offset " +
-      "{entity: EntityRef on a closed loop, distance (+ enlarges)}; mirror " +
-      "{entities:[EntityRef], axis: uuid of a CONSTRUCTION line}; " +
+      "(EntityRef like {Line: uuid}), pick:[x,y] on the span to REMOVE} — " +
+      "carrier-invariant constraints on the trimmed entity are RE-APPLIED " +
+      "onto the survivors (outcome.constraints_reapplied); extent-bound " +
+      "ones are dropped (outcome.constraints_removed); " +
+      "extend {entity: EntityRef (line or arc — arcs grow their sweep " +
+      "along the carrier), end:'start'|'end', boundary: EntityRef}; offset " +
+      "{entity: EntityRef on a closed loop, distance (+ enlarges)} — " +
+      "all-arc loops are fully maintained (per-junction G1 + concentric " +
+      "webs) and a globally self-intersecting result refuses typed " +
+      "(details.kind=self_intersecting, names the colliding segments); " +
+      "mirror {entities:[EntityRef], axis: uuid of a CONSTRUCTION line} — " +
+      "supports legacy center-angle arcs and shared-CP splines; " +
       "linear_pattern {entities, count (total incl. source), dx, dy}; " +
       "circular_pattern {entities, center: uuid | center_position:[x,y], " +
-      "count, angle_step (rad)}; curve_pattern {entities, rail: EntityRef " +
-      "(spline/arc, may be construction), count, spacing? (arc-length; " +
-      "omit = fill evenly)} — instances held ON the rail; " +
+      "count, angle_step (rad)} — pattern sources: points, circles, " +
+      "shared-endpoint lines/arcs, shared-CP splines (entity webs, fully " +
+      "maintained); curve_pattern {entities (points/circles), rail: " +
+      "EntityRef (spline/arc, may be construction), count, spacing? " +
+      "(arc-length; omit = fill evenly)} — instances held ON the rail; " +
+      "arc rails maintain TRUE arc-length spacing (ArcLength links), " +
+      "spline rails maintain placement chords; " +
       "phyllotaxis_pattern {entities, center: uuid | center_position:[x,y], " +
       "count (florets incl. source), spacing (c in r=c*sqrt(n))} — Vogel " +
       "spiral at the EXACT golden angle (137.5078°), the biomimetic seed " +
