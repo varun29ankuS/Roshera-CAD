@@ -249,4 +249,49 @@ export function registerPsketchTools(server: McpServer) {
       }
     },
   );
+
+  server.tool(
+    "psketch_revolve",
+    "Revolve the parametric sketch's closed regions about an IN-PLANE axis " +
+      "(a point + direction in sketch coordinates). Typed-analytic where " +
+      "honest: lines revolve to exact cylinder/cone bands and planar " +
+      "annuli, arcs/splines to exact revolved surfaces; full-circle loops " +
+      "fall back to explicit sampling (stats.sampled_loops counts them — a " +
+      "revolved circle's torus lateral has no analytic path yet). Profiles " +
+      "must not cross the axis. angle defaults to 2*pi (full revolution).",
+    {
+      csketch_id: z.string().uuid(),
+      axis_origin: z.tuple([z.number(), z.number()]),
+      axis_direction: z.tuple([z.number(), z.number()]),
+      angle: z.number().optional(),
+      segments: z.number().int().min(3).max(512).optional(),
+      name: z.string().optional(),
+    },
+    async ({ csketch_id, axis_origin, axis_direction, angle, segments, name }) => {
+      try {
+        const r = await api("POST", `/api/csketch/${csketch_id}/revolve`, {
+          axis_origin,
+          axis_direction,
+          angle: angle ?? undefined,
+          segments: segments ?? undefined,
+          name: name ?? null,
+        });
+        const part_id = await newestPartId();
+        return await okp(
+          {
+            object_uuid: r.object?.id ?? null,
+            part_id,
+            solid_id: r.solid_id,
+            triangles: r.stats?.triangle_count,
+            regions: r.stats?.regions,
+            analytic_loops: r.stats?.analytic_loops,
+            sampled_loops: r.stats?.sampled_loops,
+          },
+          part_id,
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
 }

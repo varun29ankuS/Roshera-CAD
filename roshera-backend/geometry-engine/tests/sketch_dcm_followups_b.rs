@@ -517,3 +517,311 @@ fn slot_cylinder_walls_oriented_outward_no_seam_inversion() {
         gt.certificate.tessellation.analytic_normal_agreement
     );
 }
+
+// ── Item 5: csketch profiles revolve on TYPED edges ──────────────────
+
+use geometry_engine::operations::revolve::revolve_profile_regions;
+use geometry_engine::primitives::surface::SurfaceType;
+
+/// Face kinds of the (single-shell) solid.
+fn face_kinds(m: &BRepModel, sid: u32) -> Vec<SurfaceType> {
+    let solid = m.solids.get(sid).expect("solid");
+    let shell = m.shells.get(solid.outer_shell).expect("shell");
+    let mut out = Vec::new();
+    for &fid in &shell.faces {
+        let f = m.faces.get(fid).expect("face");
+        let s = m.surfaces.get(f.surface_id).expect("surface");
+        out.push(s.surface_type());
+    }
+    out
+}
+
+fn kind_count(k: &[SurfaceType], want: SurfaceType) -> usize {
+    k.iter().filter(|&&x| x == want).count()
+}
+
+/// GATE (item 5, washer): a csketch rectangle profile (typed `Line`
+/// edges from the topology extractor) revolves through the shared
+/// kernel entry into the 4-analytic-face washer — axis-parallel lines
+/// → Cylinder bands, axis-perpendicular lines → planar annuli. The
+/// #19/#21 analytic-band machinery engages on TYPED edges, no
+/// band explosion, no sampling.
+#[test]
+fn gate_csketch_rect_profile_revolves_to_analytic_washer() {
+    let s = fresh("followups_b_washer");
+    s.add_polyline(
+        vec![
+            Point2d::new(5.0, 0.0),
+            Point2d::new(8.0, 0.0),
+            Point2d::new(8.0, 2.0),
+            Point2d::new(5.0, 2.0),
+        ],
+        true,
+    )
+    .expect("rect profile");
+    let outer = analytic_outer(&s);
+    assert_eq!(outer.len(), 4, "four typed Line edges");
+
+    let mut model = BRepModel::new();
+    let solid = revolve_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        [0.0, 0.0],
+        [0.0, 1.0],
+        std::f64::consts::TAU,
+        48,
+        Tolerance::default(),
+    )
+    .expect("washer revolve");
+
+    let k = face_kinds(&model, solid);
+    assert_eq!(k.len(), 4, "washer = 4 analytic faces, got {k:?}");
+    assert_eq!(kind_count(&k, SurfaceType::Cylinder), 2, "2 cylinder bands");
+    assert_eq!(kind_count(&k, SurfaceType::Plane), 2, "2 planar annuli");
+
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "washer SOUND: {}", gt.summary());
+
+    // Pappus: V = 2π·r̄·A = 2π·6.5·6 = π·(8²−5²)·2.
+    let analytic = PI * (64.0 - 25.0) * 2.0;
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 2e-4,
+        "washer volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
+/// GATE (item 5, cone band): a general (sloped) typed line revolves to
+/// a `Cone` band; the mixed trapezoid profile yields exactly
+/// {annulus Plane, Cylinder ×2, Cone} with the Pappus volume.
+#[test]
+fn csketch_trapezoid_profile_revolves_with_cone_band() {
+    let s = fresh("followups_b_trapezoid");
+    s.add_polyline(
+        vec![
+            Point2d::new(5.0, 0.0),
+            Point2d::new(8.0, 0.0),
+            Point2d::new(8.0, 1.0),
+            Point2d::new(5.0, 3.0),
+        ],
+        true,
+    )
+    .expect("trapezoid profile");
+    let outer = analytic_outer(&s);
+
+    let mut model = BRepModel::new();
+    let solid = revolve_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        [0.0, 0.0],
+        [0.0, 1.0],
+        std::f64::consts::TAU,
+        48,
+        Tolerance::default(),
+    )
+    .expect("trapezoid revolve");
+
+    let k = face_kinds(&model, solid);
+    assert_eq!(k.len(), 4, "4 analytic faces, got {k:?}");
+    assert_eq!(
+        kind_count(&k, SurfaceType::Cone),
+        1,
+        "sloped line → cone band"
+    );
+    assert_eq!(
+        kind_count(&k, SurfaceType::Cylinder),
+        2,
+        "vertical lines → cylinders"
+    );
+    assert_eq!(kind_count(&k, SurfaceType::Plane), 1, "bottom annulus");
+
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+
+    // Pappus: A = 6, ∫r dA = 37.5 (rect 3·6.5 + triangle 3·6).
+    let analytic = 2.0 * PI * 37.5;
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 1e-3,
+        "trapezoid volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
+/// Item 5, arc band: a typed `Arc` profile edge revolves to exactly
+/// ONE `SurfaceOfRevolution` face (the #21 one-face contract) — never
+/// a per-segment patch explosion, never a chord fan.
+#[test]
+fn csketch_arc_profile_revolves_to_one_surface_of_revolution() {
+    let s = fresh("followups_b_flask");
+    let a = s.add_point(Point2d::new(2.0, 0.0));
+    let b = s.add_point(Point2d::new(5.0, 0.0));
+    let c = s.add_point(Point2d::new(5.0, 4.0));
+    let d = s.add_point(Point2d::new(2.0, 4.0));
+    s.add_line(a, b).expect("bottom");
+    // Arc from (5,0) to (5,4) about (5,2), bulging outward to (7,2).
+    s.add_arc_center_angles(Point2d::new(5.0, 2.0), 2.0, -PI / 2.0, PI / 2.0)
+        .expect("bulge arc");
+    s.add_line(c, d).expect("top");
+    s.add_line(d, a).expect("left");
+    let outer = analytic_outer(&s);
+    assert!(
+        outer.iter().any(|e| matches!(e, ProfileEdge::Arc { .. })),
+        "typed Arc edge present: {outer:?}"
+    );
+
+    let mut model = BRepModel::new();
+    let solid = revolve_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        [0.0, 0.0],
+        [0.0, 1.0],
+        std::f64::consts::TAU,
+        48,
+        Tolerance::default(),
+    )
+    .expect("flask revolve");
+
+    let k = face_kinds(&model, solid);
+    assert_eq!(
+        kind_count(&k, SurfaceType::SurfaceOfRevolution),
+        1,
+        "the arc wall is ONE analytic revolved face, got {k:?}"
+    );
+
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+
+    // Pappus: rect (2..5 × 0..4) A=12 r̄=3.5; outward half-disc r=2 at
+    // (5,2): A = 2π, ∫r dA = 10π + 16/3.
+    let analytic = 2.0 * PI * (42.0 + 10.0 * PI + 16.0 / 3.0);
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 1e-3,
+        "flask volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}
+
+/// Item 5, honest refusal: a full-circle typed loop revolved about an
+/// external axis is a TORUS lateral, which the revolve builder has no
+/// analytic path for — the kernel refuses TYPED (callers sample the
+/// circle explicitly, counted in `sampled_loops`), never a silently
+/// broken solid.
+#[test]
+fn csketch_circle_profile_revolve_refuses_typed() {
+    let s = fresh("followups_b_torus_refuse");
+    s.add_circle(Point2d::new(6.0, 0.0), 1.5).expect("circle");
+    let outer = analytic_outer(&s);
+    assert!(matches!(outer[0], ProfileEdge::Circle { .. }));
+
+    let mut model = BRepModel::new();
+    let err = revolve_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(outer),
+            holes: Vec::new(),
+        }],
+        [0.0, 0.0],
+        [0.0, 1.0],
+        std::f64::consts::TAU,
+        48,
+        Tolerance::default(),
+    )
+    .expect_err("torus lateral must refuse typed");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("circle") && msg.contains("torus"),
+        "refusal names the trap: {msg}"
+    );
+}
+
+/// Item 5, holes: an annular region (outer rectangle + inner
+/// rectangular hole) revolves to outer-minus-hole (hole revolved and
+/// SUBTRACTED, mirroring the proven click-draft region scheme).
+#[test]
+fn csketch_revolve_hole_subtracts() {
+    let s = fresh("followups_b_revolve_hole");
+    s.add_polyline(
+        vec![
+            Point2d::new(4.0, 0.0),
+            Point2d::new(9.0, 0.0),
+            Point2d::new(9.0, 6.0),
+            Point2d::new(4.0, 6.0),
+        ],
+        true,
+    )
+    .expect("outer profile");
+    s.add_polyline(
+        vec![
+            Point2d::new(5.0, 2.0),
+            Point2d::new(8.0, 2.0),
+            Point2d::new(8.0, 4.0),
+            Point2d::new(5.0, 4.0),
+        ],
+        true,
+    )
+    .expect("hole profile");
+    let topo = SketchTopology::analyze(&s, &Tolerance2d::default()).expect("topology");
+    let profiles = ProfileExtractor::extract_for_extrusion(&topo).expect("profiles");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].holes.len(), 1);
+    let to_edges = |lp: &geometry_engine::sketch2d::sketch_topology::SketchLoop| {
+        match ProfileExtractor::analytic_loop_edges(&s, &topo, lp).expect("extraction") {
+            AnalyticLoop::Edges(edges) => edges,
+            other => panic!("must lift analytically: {other:?}"),
+        }
+    };
+
+    let mut model = BRepModel::new();
+    let solid = revolve_profile_regions(
+        &mut model,
+        Point3::new(0.0, 0.0, 0.0),
+        Vector3::X,
+        Vector3::Y,
+        &[ProfileRegion {
+            outer: ProfileLoop::Edges(to_edges(&profiles[0].outer_boundary)),
+            holes: vec![ProfileLoop::Edges(to_edges(&profiles[0].holes[0]))],
+        }],
+        [0.0, 0.0],
+        [0.0, 1.0],
+        std::f64::consts::TAU,
+        48,
+        Tolerance::default(),
+    )
+    .expect("annular revolve");
+
+    let gt = model.ground_truth(solid).expect("ground truth");
+    assert!(gt.certificate.is_sound(), "SOUND: {}", gt.summary());
+
+    // Pappus, outer minus hole: 2π·(6.5·30 − 6.5·6) = 2π·6.5·24.
+    let analytic = 2.0 * PI * 6.5 * 24.0;
+    let v = model.calculate_solid_volume(solid).expect("volume");
+    let rel = (v - analytic).abs() / analytic;
+    assert!(
+        rel < 1e-3,
+        "annular volume: got {v:.9}, analytic {analytic:.9}, rel {rel:.3e}"
+    );
+}

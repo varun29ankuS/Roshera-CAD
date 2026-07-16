@@ -502,6 +502,124 @@ fn dispatch_generic(
             }
         }
 
+        "sketch_revolve" => {
+            // Self-contained sketch revolution (SKETCH-DCM #45
+            // follow-ups B, item 5): frame + per-loop payloads + the
+            // IN-PLANE axis. Same loop payload schema as
+            // `sketch_extrude` (legacy polygon arrays and typed
+            // `{"edges": [...]}` both accepted); replays through the
+            // SAME kernel entry the live csketch route uses
+            // (`revolve_profile_regions`) — no live/replay drift.
+            let vec3 = |key: &str| -> Option<geometry_engine::math::Vector3> {
+                let a = inner.get(key)?.as_array()?;
+                Some(geometry_engine::math::Vector3::new(
+                    a.first()?.as_f64()?,
+                    a.get(1)?.as_f64()?,
+                    a.get(2)?.as_f64()?,
+                ))
+            };
+            let point3 = |key: &str| -> Option<geometry_engine::math::Point3> {
+                let a = inner.get(key)?.as_array()?;
+                Some(geometry_engine::math::Point3::new(
+                    a.first()?.as_f64()?,
+                    a.get(1)?.as_f64()?,
+                    a.get(2)?.as_f64()?,
+                ))
+            };
+            let vec2 = |key: &str| -> Option<[f64; 2]> {
+                let a = inner.get(key)?.as_array()?;
+                Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
+            };
+            let polygon = |v: &serde_json::Value| -> Option<Vec<[f64; 2]>> {
+                v.as_array()?
+                    .iter()
+                    .map(|p| {
+                        let pa = p.as_array()?;
+                        Some([pa.first()?.as_f64()?, pa.get(1)?.as_f64()?])
+                    })
+                    .collect()
+            };
+            let profile_loop =
+                |v: &serde_json::Value| -> Option<geometry_engine::operations::extrude::ProfileLoop> {
+                    if v.is_array() {
+                        return Some(
+                            geometry_engine::operations::extrude::ProfileLoop::Polygon(polygon(v)?),
+                        );
+                    }
+                    let edges = v.get("edges")?.clone();
+                    let edges: Vec<geometry_engine::sketch2d::sketch_topology::ProfileEdge> =
+                        serde_json::from_value(edges).ok()?;
+                    Some(geometry_engine::operations::extrude::ProfileLoop::Edges(edges))
+                };
+            let parsed = (|| -> Option<_> {
+                let origin = point3("origin")?;
+                let u_axis = vec3("u_axis")?;
+                let v_axis = vec3("v_axis")?;
+                let axis_origin = vec2("axis_origin")?;
+                let axis_direction = vec2("axis_direction")?;
+                let angle = inner.get("angle")?.as_f64()?;
+                let segments = inner.get("segments").and_then(|v| v.as_u64()).unwrap_or(48) as u32;
+                let regions: Option<Vec<geometry_engine::operations::extrude::ProfileRegion>> =
+                    inner
+                        .get("regions")?
+                        .as_array()?
+                        .iter()
+                        .map(|r| {
+                            let outer = profile_loop(r.get("outer")?)?;
+                            let holes: Option<Vec<_>> = r
+                                .get("holes")?
+                                .as_array()?
+                                .iter()
+                                .map(&profile_loop)
+                                .collect();
+                            Some(geometry_engine::operations::extrude::ProfileRegion {
+                                outer,
+                                holes: holes?,
+                            })
+                        })
+                        .collect();
+                Some((
+                    origin,
+                    u_axis,
+                    v_axis,
+                    regions?,
+                    axis_origin,
+                    axis_direction,
+                    angle,
+                    segments,
+                ))
+            })();
+            match parsed {
+                Some((
+                    origin,
+                    u_axis,
+                    v_axis,
+                    regions,
+                    axis_origin,
+                    axis_direction,
+                    angle,
+                    segments,
+                )) => geometry_engine::operations::revolve::revolve_profile_regions(
+                    model,
+                    origin,
+                    u_axis,
+                    v_axis,
+                    &regions,
+                    axis_origin,
+                    axis_direction,
+                    angle,
+                    segments,
+                    geometry_engine::math::Tolerance::default(),
+                )
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e)),
+                None => Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing/malformed sketch_revolve payload".to_string(),
+                }),
+            }
+        }
+
         "boolean_union" | "boolean_intersection" | "boolean_difference" => {
             let op = match kind {
                 "boolean_union" => BooleanOp::Union,
@@ -1528,6 +1646,67 @@ mod tests {
             .solid_outer_face_count(solid)
             .expect("outer face count");
         assert_eq!(face_count, 4, "2 caps + 2 seam-split NURBS walls");
+    }
+
+    /// SKETCH-DCM #45 follow-ups B (item 5): a `sketch_revolve` event
+    /// with typed Line edges replays through the SAME kernel entry the
+    /// live csketch route uses — the washer rebuilds as 4 analytic
+    /// faces (2 Cylinder bands at the exact radii + 2 planar annuli),
+    /// never a band explosion or a sampled ring.
+    #[test]
+    fn replay_sketch_revolve_typed_edges_rebuilds_analytic_washer() {
+        let mut model = BRepModel::new();
+        let event = mk_event(
+            "sketch_revolve",
+            serde_json::json!({
+                "params": {
+                    "origin": [0.0, 0.0, 0.0],
+                    "u_axis": [1.0, 0.0, 0.0],
+                    "v_axis": [0.0, 1.0, 0.0],
+                    "regions": [{
+                        "outer": { "edges": [
+                            { "kind": "line", "start": [5.0, 0.0], "end": [8.0, 0.0] },
+                            { "kind": "line", "start": [8.0, 0.0], "end": [8.0, 2.0] },
+                            { "kind": "line", "start": [8.0, 2.0], "end": [5.0, 2.0] },
+                            { "kind": "line", "start": [5.0, 2.0], "end": [5.0, 0.0] }
+                        ]},
+                        "holes": [],
+                    }],
+                    "axis_origin": [0.0, 0.0],
+                    "axis_direction": [0.0, 1.0],
+                    "angle": std::f64::consts::TAU,
+                    "segments": 48,
+                },
+                "inputs": [],
+                "outputs": [99]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(outcome.events_applied, 1, "revolve event must apply");
+        assert_eq!(outcome.events_skipped, 0);
+        let solid = only_solid(&model);
+        let radii = cylinder_face_radii(&model, solid);
+        assert_eq!(
+            radii.len(),
+            2,
+            "washer replay must rebuild TWO analytic cylinder bands, got {radii:?}"
+        );
+        let mut sorted = radii.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        assert!(
+            (sorted[0] - 5.0).abs() < 1e-9 && (sorted[1] - 8.0).abs() < 1e-9,
+            "replayed band radii must be exact: {sorted:?}"
+        );
+        let face_count = model
+            .solid_outer_face_count(solid)
+            .expect("outer face count");
+        assert_eq!(face_count, 4, "2 cylinder bands + 2 planar annuli");
+        let gt = model.ground_truth(solid).expect("ground truth");
+        assert!(
+            gt.certificate.is_sound(),
+            "replayed washer must be SOUND: {:?}",
+            gt.certificate
+        );
     }
 
     /// A sketch-op event with no `csketch_id` is malformed and must be

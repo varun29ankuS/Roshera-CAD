@@ -2437,6 +2437,357 @@ fn sample_topology_loop(
     Ok(polygon)
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct RevolveCSketchRequest {
+    /// Revolution axis in SKETCH-PLANE coordinates: a point on the
+    /// axis plus its in-plane direction.
+    pub axis_origin: [f64; 2],
+    pub axis_direction: [f64; 2],
+    /// Revolution angle in radians (default 2π = full revolution).
+    #[serde(default = "default_revolve_angle")]
+    pub angle: f64,
+    /// Angular segments for the (partial-revolution) grid path.
+    #[serde(default = "default_revolve_segments")]
+    pub segments: u32,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub plane: Option<crate::sketch::SketchPlane>,
+}
+
+fn default_revolve_angle() -> f64 {
+    std::f64::consts::TAU
+}
+
+fn default_revolve_segments() -> u32 {
+    48
+}
+
+/// `POST /api/csketch/{id}/revolve` — materialise the sketch's closed
+/// regions and revolve them about an in-plane axis (SKETCH-DCM #45
+/// follow-ups B, item 5 — the revolve twin of `extrude_csketch`).
+///
+/// Loops route through TYPED analytic edges wherever honest:
+/// lines/arcs/splines revolve exactly (axis-parallel lines → Cylinder
+/// bands, perpendicular → planar annuli, sloped → Cone bands, curved →
+/// ONE `SurfaceOfRevolution` face each). Full-circle loops fall back
+/// EXPLICITLY to the chord-sampled polygon (a revolved circle's
+/// lateral is a torus band the analytic-band builder does not emit —
+/// the kernel refuses it typed), counted in `stats.sampled_loops`
+/// exactly like extrude's sampled loops. The timeline records ONE
+/// self-contained `sketch_revolve` event replayed through the SAME
+/// kernel entry (`revolve_profile_regions`) — live and replay cannot
+/// drift.
+pub async fn revolve_csketch(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RevolveCSketchRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use geometry_engine::math::Tolerance;
+    use geometry_engine::operations::revolve::revolve_profile_regions;
+    use geometry_engine::sketch2d::sketch_topology::{ProfileExtractor, SketchTopology};
+    use geometry_engine::sketch2d::{Point2d, Tolerance2d, Vector2d};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use std::time::Instant;
+
+    if !req.angle.is_finite() || req.angle.abs() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("angle must be non-zero and finite (got {})", req.angle),
+        ));
+    }
+    let [ax, ay] = req.axis_origin;
+    let [dx, dy] = req.axis_direction;
+    if !(ax.is_finite() && ay.is_finite() && dx.is_finite() && dy.is_finite()) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "axis_origin/axis_direction components must all be finite",
+        ));
+    }
+    if (dx * dx + dy * dy).sqrt() < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "axis_direction must be non-zero",
+        ));
+    }
+    let plane = req.plane.unwrap_or(crate::sketch::SketchPlane::XY);
+
+    let sketch = require_sketch(&state, id)?;
+    let tol2d = Tolerance2d::default();
+    let topology = SketchTopology::analyze(&sketch, &tol2d)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    if !topology.is_valid_for_extrusion() {
+        let issues: Vec<String> = topology.issues().iter().map(|i| format!("{i:?}")).collect();
+        let open: Vec<[f64; 2]> = topology
+            .open_endpoints()
+            .iter()
+            .map(|p| [p.x, p.y])
+            .collect();
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch topology is not valid for revolve (profiles must be closed, non-self-intersecting regions)",
+        )
+        .with_details(serde_json::json!({
+            "profile_type": format!("{:?}", topology.profile_type()),
+            "issues": issues,
+            "open_endpoints": open,
+        })));
+    }
+    // extract_for_revolution additionally rejects profiles CROSSING
+    // the axis (they would self-intersect when revolved).
+    let revolution_profiles = ProfileExtractor::extract_for_revolution(
+        &topology,
+        &Point2d::new(ax, ay),
+        &Vector2d::new(dx, dy),
+    )
+    .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+    if revolution_profiles.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "sketch contains no closed regions to revolve",
+        ));
+    }
+    let profiles: Vec<geometry_engine::sketch2d::sketch_topology::ExtrusionProfile> =
+        revolution_profiles.into_iter().map(|p| p.profile).collect();
+
+    let (regions, analytic_loops, sampled_loops) =
+        materialise_revolve_profile_regions(&sketch, &topology, &profiles)?;
+
+    let frame_origin = plane.lift(0.0, 0.0);
+    let u_pt = plane.lift(1.0, 0.0);
+    let v_pt = plane.lift(0.0, 1.0);
+    let u_axis = geometry_engine::math::Vector3::new(
+        u_pt.x - frame_origin.x,
+        u_pt.y - frame_origin.y,
+        u_pt.z - frame_origin.z,
+    );
+    let v_axis = geometry_engine::math::Vector3::new(
+        v_pt.x - frame_origin.x,
+        v_pt.y - frame_origin.y,
+        v_pt.z - frame_origin.z,
+    );
+    let suppress = RecorderSuppressGuard::new(&state.timeline_recorder);
+    let build_result = {
+        let mut model = model_handle.write().await;
+        // The SAME kernel entry the timeline replay arm uses.
+        revolve_profile_regions(
+            &mut model,
+            frame_origin,
+            u_axis,
+            v_axis,
+            &regions,
+            req.axis_origin,
+            req.axis_direction,
+            req.angle,
+            req.segments,
+            Tolerance::default(),
+        )
+        .map_err(ApiError::kernel_error)
+    };
+    drop(suppress);
+    let result_solid_id = build_result?;
+
+    // The replayable record — everything needed to rebuild this solid
+    // from an empty model, applied through the same kernel path.
+    use geometry_engine::operations::recorder::OperationRecorder as _;
+    let regions_json: Vec<serde_json::Value> = regions
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "outer": profile_loop_json(&r.outer),
+                "holes": r.holes.iter().map(profile_loop_json).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let record = geometry_engine::operations::recorder::RecordedOperation::new("sketch_revolve")
+        .with_parameters(serde_json::json!({
+            "origin": [frame_origin.x, frame_origin.y, frame_origin.z],
+            "u_axis": [u_axis.x, u_axis.y, u_axis.z],
+            "v_axis": [v_axis.x, v_axis.y, v_axis.z],
+            "regions": regions_json,
+            "axis_origin": req.axis_origin,
+            "axis_direction": req.axis_direction,
+            "angle": req.angle,
+            "segments": req.segments,
+        }))
+        .with_output_solids([result_solid_id as u64]);
+    if let Err(e) = state.timeline_recorder.record(record) {
+        tracing::warn!("sketch_revolve event not recorded: {e}");
+    }
+
+    let (tri_mesh, tessellation_ms) = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(result_solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(result_solid_id))?;
+        let tess_start = Instant::now();
+        let mesh = tessellate_solid(solid, &model, &TessellationParams::default());
+        let elapsed = tess_start.elapsed().as_millis() as u64;
+        (mesh, elapsed)
+    };
+    if tri_mesh.triangles.is_empty() {
+        return Err(ApiError::tessellation_empty(
+            result_solid_id,
+            tri_mesh.vertices.len(),
+        ));
+    }
+    let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&tri_mesh);
+
+    let result_uuid = Uuid::new_v4();
+    let result_id_str = result_uuid.to_string();
+    state.register_id_mapping(result_uuid, result_solid_id);
+    let display_name = req
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("CSketch revolve {result_solid_id}"));
+
+    let parameters = serde_json::json!({
+        "csketch_id":     id.to_string(),
+        "regions":        regions.len(),
+        "axis_origin":    req.axis_origin,
+        "axis_direction": req.axis_direction,
+        "angle":          req.angle,
+        "segments":       req.segments,
+    });
+    crate::broadcast_object_created(
+        &result_id_str,
+        &display_name,
+        result_solid_id,
+        "revolve",
+        &parameters,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    let certificate =
+        serde_json::to_value(sketch.certify().compact()).unwrap_or(serde_json::Value::Null);
+
+    Ok(Json(serde_json::json!({
+        "success":    true,
+        "csketch_id": id.to_string(),
+        "certificate": certificate,
+        "solid_id":   result_solid_id,
+        "object": {
+            "id":   result_id_str,
+            "name": display_name,
+            "objectType": "revolve",
+            "mesh": {
+                "vertices": vertices,
+                "indices":  indices,
+                "normals":  normals,
+                "face_ids": face_ids,
+            },
+            "analyticalGeometry": serde_json::Value::Null,
+            "position": [0.0_f32, 0.0, 0.0],
+            "rotation": [0.0_f32, 0.0, 0.0],
+            "scale":    [1.0_f32, 1.0, 1.0],
+        },
+        "stats": {
+            "vertex_count":    tri_mesh.vertices.len(),
+            "triangle_count":  tri_mesh.triangles.len(),
+            "tessellation_ms": tessellation_ms,
+            "regions":         regions.len(),
+            // Honest profile provenance, exactly like extrude:
+            // full-circle loops sample explicitly (torus lateral has
+            // no typed revolve path); everything else stays analytic.
+            "analytic_loops":  analytic_loops,
+            "sampled_loops":   sampled_loops,
+        }
+    })))
+}
+
+/// Materialise every revolution-profile loop (SKETCH-DCM #45
+/// follow-ups B, item 5), returning
+/// `(regions, analytic_loop_count, sampled_loop_count)`.
+///
+/// Policy: typed analytic edges for every loop EXCEPT loops containing
+/// a full-circle edge — a revolved circle's lateral is a TORUS band
+/// the analytic-band builder does not emit, so the kernel refuses it
+/// typed and the route pre-samples such loops explicitly (counted in
+/// `sampled_loops`, mirroring extrude's oblique-circle policy).
+/// `AnalyticLoop::Unsupported` entity kinds sample as before.
+fn materialise_revolve_profile_regions(
+    sketch: &Sketch,
+    topology: &geometry_engine::sketch2d::sketch_topology::SketchTopology,
+    profiles: &[geometry_engine::sketch2d::sketch_topology::ExtrusionProfile],
+) -> Result<
+    (
+        Vec<geometry_engine::operations::extrude::ProfileRegion>,
+        usize,
+        usize,
+    ),
+    ApiError,
+> {
+    use geometry_engine::operations::extrude::{ProfileLoop, ProfileRegion};
+    use geometry_engine::sketch2d::sketch_topology::{AnalyticLoop, ProfileEdge};
+
+    let mut analytic_loops = 0usize;
+    let mut sampled_loops = 0usize;
+    let mut materialise_one =
+        |sketch_loop: &geometry_engine::sketch2d::sketch_topology::SketchLoop,
+         analytic_loops: &mut usize,
+         sampled_loops: &mut usize|
+         -> Result<ProfileLoop, ApiError> {
+            let verdict =
+                geometry_engine::sketch2d::sketch_topology::ProfileExtractor::analytic_loop_edges(
+                    sketch,
+                    topology,
+                    sketch_loop,
+                )
+                .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
+            match verdict {
+                AnalyticLoop::Edges(edges) => {
+                    let has_circle = edges
+                        .iter()
+                        .any(|e| matches!(e, ProfileEdge::Circle { .. }));
+                    if has_circle {
+                        *sampled_loops += 1;
+                        Ok(ProfileLoop::Polygon(sample_topology_loop(
+                            sketch,
+                            topology,
+                            sketch_loop,
+                        )?))
+                    } else {
+                        *analytic_loops += 1;
+                        Ok(ProfileLoop::Edges(edges))
+                    }
+                }
+                AnalyticLoop::Unsupported { .. } => {
+                    *sampled_loops += 1;
+                    Ok(ProfileLoop::Polygon(sample_topology_loop(
+                        sketch,
+                        topology,
+                        sketch_loop,
+                    )?))
+                }
+            }
+        };
+
+    let mut regions = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let outer = materialise_one(
+            &profile.outer_boundary,
+            &mut analytic_loops,
+            &mut sampled_loops,
+        )?;
+        let mut holes = Vec::with_capacity(profile.holes.len());
+        for hole in &profile.holes {
+            holes.push(materialise_one(
+                hole,
+                &mut analytic_loops,
+                &mut sampled_loops,
+            )?);
+        }
+        regions.push(ProfileRegion { outer, holes });
+    }
+    Ok((regions, analytic_loops, sampled_loops))
+}
+
 /// Suppress kernel-recorded events for a scope. `begin_pending` on
 /// construction, `abort_pending` on drop — the suppression window
 /// closes on EVERY exit path, including `?` early returns. A leaked
@@ -3610,6 +3961,84 @@ mod tests {
             }
             other => panic!("expected typed edges, got {other:?}"),
         }
+    }
+
+    /// SKETCH-DCM #45 follow-ups B (item 5): the revolve materialiser
+    /// lifts line/arc loops as TYPED analytic edges (counted in
+    /// `analytic_loops`) — the same honesty scheme as extrude.
+    #[test]
+    fn followups_b5_revolve_line_arc_loop_materialises_analytically() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        sketch
+            .add_polyline(
+                vec![
+                    Point2d::new(5.0, 0.0),
+                    Point2d::new(8.0, 0.0),
+                    Point2d::new(8.0, 2.0),
+                    Point2d::new(5.0, 2.0),
+                ],
+                true,
+            )
+            .expect("rect profile");
+        let topology = geometry_engine::sketch2d::sketch_topology::SketchTopology::analyze(
+            &sketch,
+            &geometry_engine::sketch2d::Tolerance2d::default(),
+        )
+        .expect("topology");
+        let profiles =
+            geometry_engine::sketch2d::sketch_topology::ProfileExtractor::extract_for_extrusion(
+                &topology,
+            )
+            .expect("profiles");
+        let (regions, analytic, sampled) =
+            materialise_revolve_profile_regions(&sketch, &topology, &profiles)
+                .expect("materialise");
+        assert_eq!((analytic, sampled), (1, 0), "line loop lifts analytically");
+        assert!(matches!(
+            regions[0].outer,
+            geometry_engine::operations::extrude::ProfileLoop::Edges(_)
+        ));
+    }
+
+    /// SKETCH-DCM #45 follow-ups B (item 5): a full-circle loop takes
+    /// the EXPLICIT sampled fallback for revolve (its lateral is a
+    /// torus band the analytic-band builder does not emit; the kernel
+    /// refuses it typed) — counted honestly in `sampled_loops`.
+    #[test]
+    fn followups_b5_revolve_circle_loop_samples_explicitly() {
+        let m = manager();
+        let id = m.create();
+        let sketch = m.get(&id).expect("sketch");
+        sketch
+            .add_circle(Point2d::new(6.0, 0.0), 1.5)
+            .expect("circle profile");
+        let topology = geometry_engine::sketch2d::sketch_topology::SketchTopology::analyze(
+            &sketch,
+            &geometry_engine::sketch2d::Tolerance2d::default(),
+        )
+        .expect("topology");
+        let profiles =
+            geometry_engine::sketch2d::sketch_topology::ProfileExtractor::extract_for_extrusion(
+                &topology,
+            )
+            .expect("profiles");
+        let (regions, analytic, sampled) =
+            materialise_revolve_profile_regions(&sketch, &topology, &profiles)
+                .expect("materialise");
+        assert_eq!(
+            (analytic, sampled),
+            (0, 1),
+            "circle loop must fall back EXPLICITLY for revolve"
+        );
+        assert!(
+            matches!(
+                regions[0].outer,
+                geometry_engine::operations::extrude::ProfileLoop::Polygon(_)
+            ),
+            "sampled polygon, honestly counted"
+        );
     }
 
     /// SKETCH-DCM #45 Slice 7: pattern-route kernel flows (the same

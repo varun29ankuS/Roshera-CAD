@@ -2038,7 +2038,12 @@ pub fn extrude_profile_regions(
 /// Lift a plane-local (u, v) point into world space:
 /// `origin + u_axis·p[0] + v_axis·p[1]`.
 #[inline]
-fn lift_plane_point(origin: Point3, u_axis: Vector3, v_axis: Vector3, p: [f64; 2]) -> Point3 {
+pub(crate) fn lift_plane_point(
+    origin: Point3,
+    u_axis: Vector3,
+    v_axis: Vector3,
+    p: [f64; 2],
+) -> Point3 {
     Point3::new(
         origin.x + u_axis.x * p[0] + v_axis.x * p[1],
         origin.y + u_axis.y * p[0] + v_axis.y * p[1],
@@ -2052,7 +2057,7 @@ fn lift_plane_point(origin: Point3, u_axis: Vector3, v_axis: Vector3, p: [f64; 2
 /// vertices de-duplicated through add_or_find so adjacent loops weld.
 /// (Byte-identical to the pre-Slice-5 `extrude_polygon_regions` inner
 /// builder — the polygon path's behaviour is deliberately unchanged.)
-fn build_polygon_loop(
+pub(crate) fn build_polygon_loop(
     model: &mut BRepModel,
     lifted: &[Point3],
     tolerance: f64,
@@ -2122,7 +2127,7 @@ fn build_polygon_loop(
 /// only accepted when `direction` is parallel to the plane normal —
 /// see [`extrude_profile_regions`].
 #[allow(clippy::too_many_arguments)] // Reason: internal helper carrying the full plane frame + extrude direction for the circle/normal refusal; a params struct would be used exactly once.
-fn build_analytic_loop(
+pub(crate) fn build_analytic_loop(
     model: &mut BRepModel,
     origin: Point3,
     u_axis: Vector3,

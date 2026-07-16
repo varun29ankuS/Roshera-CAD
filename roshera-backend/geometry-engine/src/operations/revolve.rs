@@ -161,6 +161,169 @@ pub fn revolve_profile(
     })
 }
 
+/// Revolve a set of sketch-plane profile regions (typed analytic loops
+/// and/or chord-sampled polygons) about an IN-PLANE axis — the csketch
+/// route's kernel entry AND the timeline `sketch_revolve` replay arm
+/// (SKETCH-DCM #45 follow-ups B, item 5). One code path, no
+/// live-vs-replay drift — mirrors `extrude_profile_regions`.
+///
+/// Frame: `lift(p) = origin + u_axis·p[0] + v_axis·p[1]`; the axis is
+/// given in the SAME plane coordinates (`axis_origin_2d` +
+/// `axis_direction_2d`) and lifted through the same map, so the whole
+/// event payload stays 2D and self-contained.
+///
+/// Loop payloads route through the SAME builders as extrude:
+/// typed `Line`/`Arc`/`Nurbs` edges become exact kernel curves (the
+/// closed-NURBS seam split included), so the analytic-band revolve
+/// path (#19/#21) sees true geometry — axis-parallel lines → Cylinder
+/// bands, axis-perpendicular → planar annuli, sloped → Cone bands,
+/// curved edges → ONE `SurfaceOfRevolution` face each.
+///
+/// Honest refusal (typed): a full-circle profile edge revolved about
+/// an external axis is a TORUS lateral, which the revolve builder has
+/// no analytic band for — callers sample such loops explicitly
+/// (counted, never silently approximated).
+///
+/// Holes are revolved separately and SUBTRACTED (the proven
+/// click-draft region scheme); disjoint regions are Union-folded.
+#[allow(clippy::too_many_arguments)] // Reason: mirrors extrude_profile_regions' established frame+payload signature (plus the in-plane axis pair); bundling would diverge the two shared kernel entries for no clarity gain.
+pub fn revolve_profile_regions(
+    model: &mut BRepModel,
+    origin: Point3,
+    u_axis: Vector3,
+    v_axis: Vector3,
+    regions: &[crate::operations::extrude::ProfileRegion],
+    axis_origin_2d: [f64; 2],
+    axis_direction_2d: [f64; 2],
+    angle: f64,
+    segments: u32,
+    tolerance: crate::math::Tolerance,
+) -> OperationResult<SolidId> {
+    use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use crate::operations::extrude::{
+        build_analytic_loop, build_polygon_loop, create_face_from_profile_with_plane,
+        lift_plane_point, ProfileLoop,
+    };
+    use crate::sketch2d::sketch_topology::ProfileEdge;
+
+    if regions.is_empty() {
+        return Err(OperationError::InvalidGeometry(
+            "revolve_profile_regions: no regions supplied".to_string(),
+        ));
+    }
+    if !angle.is_finite() || angle.abs() < 1e-9 {
+        return Err(OperationError::InvalidGeometry(format!(
+            "revolve angle must be non-zero and finite (got {angle})"
+        )));
+    }
+    let normal = u_axis.cross(&v_axis);
+
+    // Lift the in-plane axis through the SAME frame map as the profile
+    // points, so axis and profile can never disagree about the plane.
+    let axis_origin = lift_plane_point(origin, u_axis, v_axis, axis_origin_2d);
+    let axis_direction = u_axis * axis_direction_2d[0] + v_axis * axis_direction_2d[1];
+    let axis_direction = axis_direction.normalize().map_err(|e| {
+        OperationError::NumericalError(format!("revolve axis normalization: {e:?}"))
+    })?;
+
+    // Typed refusal BEFORE any kernel mutation: a full-circle profile
+    // edge would revolve to a torus lateral.
+    for region in regions {
+        for lp in std::iter::once(&region.outer).chain(region.holes.iter()) {
+            if let ProfileLoop::Edges(edges) = lp {
+                if edges
+                    .iter()
+                    .any(|e| matches!(e, ProfileEdge::Circle { .. }))
+                {
+                    return Err(OperationError::InvalidGeometry(
+                        "analytic full-circle profiles have no typed revolve path yet \
+                         (a revolved circle's lateral is a TORUS band the analytic-band \
+                         builder does not emit); sample the circle into a polygon"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let build = |model: &mut BRepModel, lp: &ProfileLoop| -> OperationResult<Vec<EdgeId>> {
+        match lp {
+            ProfileLoop::Polygon(poly) => {
+                let lifted: Vec<Point3> = poly
+                    .iter()
+                    .map(|p| lift_plane_point(origin, u_axis, v_axis, *p))
+                    .collect();
+                build_polygon_loop(model, &lifted, tolerance.distance())
+            }
+            ProfileLoop::Edges(edges) => build_analytic_loop(
+                model,
+                origin,
+                u_axis,
+                v_axis,
+                normal,
+                // The circle/oblique guard inside `build_analytic_loop`
+                // keys on the extrude direction; revolve has none, and
+                // circle edges were already refused above — pass the
+                // plane normal so the guard is inert.
+                normal,
+                edges,
+                tolerance.distance(),
+            ),
+        }
+    };
+
+    let options = RevolveOptions {
+        axis_origin,
+        axis_direction,
+        angle,
+        segments,
+        ..RevolveOptions::default()
+    };
+
+    let mut region_solids: Vec<SolidId> = Vec::with_capacity(regions.len());
+    for region in regions {
+        let outer_edges = build(model, &region.outer)?;
+        let outer_face = create_face_from_profile_with_plane(model, outer_edges, origin, normal)?;
+        let mut region_solid = revolve_face(model, outer_face, options.clone())?;
+
+        // Holes: revolve the hole profile about the SAME axis and
+        // subtract — the annular void is exactly the hole's solid of
+        // revolution (the proven click-draft scheme; the analytic-band
+        // revolve consumes single-loop faces, so cap-hole topology is
+        // expressed through the boolean, not inner loops).
+        for hole in &region.holes {
+            let hole_edges = build(model, hole)?;
+            let hole_face = create_face_from_profile_with_plane(model, hole_edges, origin, normal)?;
+            let hole_solid = revolve_face(model, hole_face, options.clone())?;
+            region_solid = boolean_operation(
+                model,
+                region_solid,
+                hole_solid,
+                BooleanOp::Difference,
+                BooleanOptions::default(),
+            )?;
+        }
+        region_solids.push(region_solid);
+    }
+
+    let mut region_iter = region_solids.into_iter();
+    let mut accumulator = region_iter.next().ok_or_else(|| {
+        OperationError::InvalidGeometry(
+            "revolve_profile_regions: no region solids built".to_string(),
+        )
+    })?;
+    for sid in region_iter {
+        accumulator = boolean_operation(
+            model,
+            accumulator,
+            sid,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )?;
+    }
+    Ok(accumulator)
+}
+
 /// Orthonormal `(â, ê1, ê2)` frame of a revolution axis, with `ê1` the canonical
 /// radial reference direction at which a `(r, z)` meridian's `r` is laid out.
 ///
@@ -1287,6 +1450,25 @@ fn build_analytic_bands(
         } else {
             axis
         };
+        // Azimuth of the PROFILE (where outward0 is evaluated) measured
+        // from the canonical ring ref_dir. The band surfaces are all
+        // anchored at ref_dir with u ∈ [0, 2π], so
+        // `orient_face_for_outward` samples their normal at azimuth π
+        // FROM REF_DIR — the historical rotate-by-π target below was
+        // only correct for profiles lying in the ref_dir half-plane
+        // (θ_p = 0), which every meridian builder guarantees by
+        // construction. Sketch-plane profiles (`revolve_profile_regions`,
+        // SKETCH-DCM #45 follow-ups B item 5) sit at arbitrary azimuth;
+        // the correct rotation is (π − θ_p), which reduces to π exactly
+        // when θ_p = 0 — zero behaviour change for existing callers.
+        let theta_p = if rhat.magnitude_squared() > 1e-20 {
+            let rn = rhat.normalize()?;
+            let cos_t = ref_dir.dot(&rn).clamp(-1.0, 1.0);
+            let sin_t = axis.dot(&ref_dir.cross(&rn));
+            sin_t.atan2(cos_t)
+        } else {
+            0.0
+        };
 
         let vertical = (r0 - r1).abs() < eps;
         let horizontal = (t0 - t1).abs() < eps;
@@ -1366,7 +1548,9 @@ fn build_analytic_bands(
                 model.loops.add(lp)
             };
 
-            let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
+            // The SoR is anchored at ref_dir; the outward sample point
+            // (u_mid = π) sits at azimuth π − θ_p from the profile.
+            let target = Matrix4::from_axis_angle(&axis, PI - theta_p)?.transform_vector(&outward0);
             let surf = model
                 .surfaces
                 .get(surf_id)
@@ -1483,8 +1667,10 @@ fn build_analytic_bands(
                 model.loops.add(lp)
             };
 
-            // orient_face_for_outward samples u=π; rotate outward0 (at angle 0) there.
-            let target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&outward0);
+            // orient_face_for_outward samples u = π from ref_dir; the
+            // profile (where outward0 lives) sits at azimuth θ_p, so
+            // rotate by π − θ_p (= π for the historical θ_p = 0 case).
+            let target = Matrix4::from_axis_angle(&axis, PI - theta_p)?.transform_vector(&outward0);
             let surf = model
                 .surfaces
                 .get(surf_id)
