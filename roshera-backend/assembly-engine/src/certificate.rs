@@ -21,7 +21,7 @@ use crate::constrainedness::{
 use crate::decompose::{DecompositionStats, StructuralDofReport};
 use crate::joint::Joint;
 use crate::solver::Mobility;
-use crate::sweep::swept_clearance;
+use crate::sweep::SweptFact;
 use crate::types::{Assembly, InstanceId};
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +92,15 @@ pub struct AssemblyCertificate {
     /// (kernel floor / caller request) — the ε=0 default lie is dead.
     #[serde(default)]
     pub epsilon: Option<EpsilonFact>,
+    // ── Slice 5 (spec §3.6) — also ADDITIVE: ──────────────────────────
+    /// Every motion this assembly was certified over: the joints DERIVED
+    /// from its own mates, plus any authored mechanism (each re-checked
+    /// against the constraint manifold). Carries the method, the ε, the
+    /// motion-stamped contacts/interferences, and any typed refusal — so
+    /// `swept_clearance_ok` is never a bare boolean whose provenance the
+    /// caller has to trust.
+    #[serde(default)]
+    pub sweeps: Vec<SweptFact>,
 }
 
 fn default_true() -> bool {
@@ -180,19 +189,25 @@ impl Assembly {
             .mate_contact_report(MATE_CONTACT_TOL)
             .all_in_contact();
 
-        let swept_clearance_ok = mechanisms.iter().all(|m| {
-            !swept_clearance(
-                &solved,
-                m.moving,
-                &m.joint,
-                &m.base_translation,
-                &m.base_rotation,
-                m.range,
-                m.samples,
-                epsilon,
-            )
-            .collides
-        });
+        // Slice 5 (spec §3.6): the swept dimension now runs on CONTINUOUS
+        // time-of-impact over joints DERIVED from the mates, plus the
+        // manifold re-check on any authored mechanism.
+        //
+        // Two §2 defects die here. Dense sampling could not see between
+        // its samples, so a thin blade tunnelled through a "certified"
+        // sweep; and an authored joint was never checked against the mates
+        // it moved, so a mechanism declared about the wrong axis certified
+        // a motion its own assembly forbids. Deriving the joints removes
+        // the second failure mode at the root — an assembly's mates ARE
+        // its mechanism — and the re-check catches the authored ones the
+        // stateless surface still accepts.
+        let mut sweeps = solved.derived_sweeps(epsilon);
+        sweeps.extend(
+            mechanisms
+                .iter()
+                .map(|m| solved.sweep_mechanism_checked(m, epsilon)),
+        );
+        let swept_clearance_ok = sweeps.iter().all(|s| s.clear);
 
         AssemblyCertificate {
             mates_consistent,
@@ -212,6 +227,7 @@ impl Assembly {
             structural: Some(analysis.structural),
             decomposition: Some(analysis.decomposition),
             epsilon: Some(epsilon_fact),
+            sweeps,
         }
     }
 }

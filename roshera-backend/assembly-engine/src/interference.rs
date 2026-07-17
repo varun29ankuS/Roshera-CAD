@@ -55,7 +55,7 @@ pub(crate) fn instance_isometry(instance: &Instance) -> Isometry3<f64> {
 
 /// Build the instance's mesh as a Parry `TriMesh` (local frame). `None` when the
 /// mesh is empty or Parry rejects it as degenerate.
-fn instance_trimesh(instance: &Instance) -> Option<TriMesh> {
+pub(crate) fn instance_trimesh(instance: &Instance) -> Option<TriMesh> {
     if instance.mesh.vertices.is_empty() || instance.mesh.triangles.is_empty() {
         return None;
     }
@@ -246,7 +246,7 @@ fn is_convex(points: &[Point3<f64>], mesh_indices: &[[u32; 3]]) -> bool {
 /// Falls back to the single convex hull when the mesh is too small to voxelize
 /// or VHACD yields no usable piece, so a degenerate part behaves exactly as
 /// before (never a silent empty set that would hide a real overlap).
-fn instance_convex_pieces(instance: &Instance) -> Vec<ConvexPolyhedron> {
+pub(crate) fn instance_convex_pieces(instance: &Instance) -> Vec<ConvexPolyhedron> {
     if instance.mesh.vertices.len() < 4 || instance.mesh.triangles.is_empty() {
         return instance_convex(instance).into_iter().collect();
     }

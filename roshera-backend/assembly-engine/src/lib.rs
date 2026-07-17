@@ -53,5 +53,8 @@ pub use motion::{
 pub use report::AssemblyReport;
 pub use solve_input::{InputPose, SolveInput};
 pub use solver::{DofReport, Mobility, SolveReport, SolvedPose};
-pub use sweep::{swept_clearance, SweptClearance};
+pub use sweep::{
+    swept_clearance, InterferenceFact, ManifoldViolation, MotionStamp, SweepMethod, SweepRefusal,
+    SweepSource, SweptClearance, SweptFact,
+};
 pub use types::{Assembly, FeatureRef, Instance, InstanceId, Mate, MateKind, Mesh};

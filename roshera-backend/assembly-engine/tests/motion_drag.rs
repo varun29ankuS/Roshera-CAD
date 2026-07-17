@@ -14,7 +14,7 @@
 
 mod common;
 
-use assembly_engine::{Assembly, DriveParam, DriveRefusal, FeatureRef, InstanceId, MateKind};
+use assembly_engine::{Assembly, DriveParam, DriveRefusal, InstanceId, MateKind};
 use common::{frame, mate, part, revolute_at};
 use std::f64::consts::{PI, TAU};
 

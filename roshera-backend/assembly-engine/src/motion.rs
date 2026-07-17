@@ -304,6 +304,31 @@ pub(crate) fn turns_of_angle(unwrapped: f64) -> i32 {
 }
 
 impl Assembly {
+    /// The limits of mate `index`'s `param` freedom, or `None` when the
+    /// mate exposes no such driveable parameter (unknown, unenforced,
+    /// frameless, or a kind whose freedom (θ, s) cannot span — see
+    /// [`MateKind::drive_limits`]).
+    ///
+    /// This is the single question "is this a joint parameter, and what
+    /// bounds it" — the derived-sweep builder reads joints out of the
+    /// mates through it, so the sweep surface and the drag surface can
+    /// never disagree about what is driveable.
+    pub(crate) fn driveable_limits(
+        &self,
+        index: u32,
+        param: DriveParam,
+    ) -> Option<Option<(f64, f64)>> {
+        let mate = self.mates.get(index as usize)?;
+        if !mate.kind.is_numerically_enforced() {
+            return None;
+        }
+        let limits = mate.kind.drive_limits(param)?;
+        // A joint whose frames cannot be resolved has no readable
+        // parameter, whatever its kind claims.
+        self.joint_parameters_of(index)?;
+        Some(limits)
+    }
+
     /// Read the driven parameter's CURRENT value — unwrapped for rotation,
     /// so a stroke starting from a wound joint continues from where the
     /// last one left it rather than from its wrapped shadow.
