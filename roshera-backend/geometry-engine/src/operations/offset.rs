@@ -290,19 +290,71 @@ fn offset_solid_body(
         &options,
     )?;
 
-    // Combine original exterior (minus removed faces) with new interior
-    let shell_faces =
-        combine_shell_faces(model, &solid, &faces_to_remove, interior_faces, wall_faces)?;
+    // Assemble the result solid's shells.
+    //
+    // A shell with NO opening (`faces_to_remove` empty ⇒ no walls) hollows the
+    // body into a fully-enclosed cavity: the interior offset faces form a
+    // CLOSED surface disconnected from the exterior. In ISO 10303-42 (and
+    // Parasolid / ACIS / Mäntylä §Euler operators) a solid with a cavity is a
+    // single lump bounded by one PERIPHERAL (outer) shell plus one INNER (void)
+    // shell per cavity — NOT one shell holding both boundaries. Filing the
+    // cavity faces into the outer shell (the historical behaviour) made the
+    // generalized Euler–Poincaré count read S=1 for a body that has two
+    // boundary shells, so V−E+F−R = 4 forced genus = S − 4/2 = −1 and the
+    // validator correctly rejected the malformed topology (negative genus is
+    // impossible for a closed orientable solid). Splitting the cavity into its
+    // own inner shell restores S=2 ⇒ genus 0 (see
+    // `validation::validate_euler_characteristic_for_solid`).
+    //
+    // An OPEN shell (≥1 face removed) DOES bridge interior to exterior through
+    // the rim walls, so its interior and exterior faces belong to ONE connected
+    // 2-manifold shell (a tray/cup: genus 0, χ=2, S=1). That case stays a
+    // single shell.
+    let hollow_id = if faces_to_remove.is_empty() {
+        // Peripheral (outer) shell: the original exterior faces, untouched.
+        let original_faces: Vec<FaceId> = model
+            .shells
+            .get(solid.outer_shell)
+            .ok_or_else(|| OperationError::InvalidGeometry("Outer shell not found".to_string()))?
+            .faces
+            .clone();
+        let mut outer = Shell::new(0, ShellType::Closed);
+        for face_id in original_faces {
+            outer.add_face(face_id);
+        }
+        let outer_id = model.shells.add(outer);
 
-    // Create new shell and solid
-    let mut shell = Shell::new(0, ShellType::Closed); // ID will be assigned by store
-    for face_id in shell_faces {
-        shell.add_face(face_id);
-    }
-    let shell_id = model.shells.add(shell);
+        // Void (inner) shell: the interior offset faces, already oriented to
+        // face the cavity (see `create_interior_offset_faces`). Walls are empty
+        // here by construction (no removed faces), so they are not appended.
+        debug_assert!(
+            wall_faces.is_empty(),
+            "a fully-closed hollow has no opening and therefore no rim walls"
+        );
+        let mut void = Shell::new(0, ShellType::Closed);
+        for face_id in interior_faces {
+            void.add_face(face_id);
+        }
+        let void_id = model.shells.add(void);
 
-    let hollow_solid = Solid::new(0, shell_id); // ID will be assigned by store
-    let hollow_id = model.solids.add(hollow_solid);
+        let mut hollow_solid = Solid::new(0, outer_id); // ID assigned by store
+        hollow_solid.add_inner_shell(void_id);
+        model.solids.add(hollow_solid)
+    } else {
+        // Combine original exterior (minus removed faces) with new interior
+        // and the rim walls into one connected manifold shell.
+        let shell_faces =
+            combine_shell_faces(model, &solid, &faces_to_remove, interior_faces, wall_faces)?;
+
+        let mut shell = Shell::new(0, ShellType::Closed); // ID assigned by store
+        for face_id in shell_faces {
+            shell.add_face(face_id);
+        }
+        let shell_id = model.shells.add(shell);
+
+        let hollow_solid = Solid::new(0, shell_id); // ID assigned by store
+        model.solids.add(hollow_solid)
+    };
 
     // Validate result if requested
     if options.common.validate_result {
@@ -3434,7 +3486,85 @@ fn validate_shell_inputs(
         }
     }
 
+    // Honest-refuse a geometrically-impossible shell: the inner offset insets
+    // the cavity by |t| from BOTH sides of every two-sided axis, so a wall
+    // thickness ≥ half the body's smallest extent collapses (or inverts) the
+    // cavity along that axis — a self-intersecting inner shell that no valid
+    // B-Rep can represent. `min_dim − 2|t| > 0` is the necessary condition for
+    // the cavity to keep positive extent on its tightest axis; failing it is a
+    // hard, provable impossibility rather than a numerical edge case, so we
+    // refuse loudly with a typed error instead of emitting torn geometry.
+    // (Conservative on the tightest overall extent; the per-edge curvature fold
+    // guard in `create_offset_edge` catches the remaining curved-wall cases.)
+    if let Some(min_dim) = solid_min_extent(model, solid_id) {
+        if 2.0 * thickness.abs() >= min_dim {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Shell thickness {:.6} is too large: 2·|t| = {:.6} ≥ smallest body extent \
+                 {:.6}; the inner shell would self-intersect (wall thicker than half the part)",
+                thickness.abs(),
+                2.0 * thickness.abs(),
+                min_dim
+            )));
+        }
+    }
+
     Ok(())
+}
+
+/// Smallest axis-aligned bounding-box extent of a solid's outer shell.
+///
+/// Walks faces → loops → edges and SAMPLES each edge's curve (not just its two
+/// endpoint vertices) so a curved solid's true extent is captured. A cylinder's
+/// cap-rim circle carries B-Rep vertices only at the seam, so an endpoint-only
+/// bbox would read a zero X/Y extent and spuriously trip the too-thick guard;
+/// sampling the arc around its parameter range recovers the real ±R span.
+/// Returns `None` if the shell resolves to no sampleable geometry (a
+/// degenerate/empty solid), in which case the caller skips the guard.
+fn solid_min_extent(model: &BRepModel, solid_id: SolidId) -> Option<f64> {
+    const SAMPLES: usize = 8;
+    let solid = model.solids.get(solid_id)?;
+    let shell = model.shells.get(solid.outer_shell)?;
+    let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut seen_any = false;
+    let mut absorb = |p: Point3, min: &mut Point3, max: &mut Point3, seen: &mut bool| {
+        *min = min.min(&p);
+        *max = max.max(&p);
+        *seen = true;
+    };
+    for &face_id in &shell.faces {
+        let Some(face) = model.faces.get(face_id) else {
+            continue;
+        };
+        for lid in face.all_loops() {
+            let Some(lp) = model.loops.get(lid) else {
+                continue;
+            };
+            for &eid in &lp.edges {
+                let Some(edge) = model.edges.get(eid) else {
+                    continue;
+                };
+                // Endpoint vertices (exact positions), plus interior curve
+                // samples so curved edges contribute their real extent.
+                for vid in [edge.start_vertex, edge.end_vertex] {
+                    if let Some(v) = model.vertices.get(vid) {
+                        absorb(v.point(), &mut min, &mut max, &mut seen_any);
+                    }
+                }
+                for i in 1..SAMPLES {
+                    let t = i as f64 / SAMPLES as f64;
+                    if let Ok(p) = edge.evaluate(t, &model.curves) {
+                        absorb(p, &mut min, &mut max, &mut seen_any);
+                    }
+                }
+            }
+        }
+    }
+    if !seen_any {
+        return None;
+    }
+    let ext = max - min;
+    Some(ext.x.min(ext.y).min(ext.z))
 }
 
 /// Validate shell solid by running the full B-Rep validation suite.
