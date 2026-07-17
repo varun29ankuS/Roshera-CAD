@@ -184,7 +184,7 @@ fn dev_auth_info() -> AuthInfo {
 ///   `/api/auth/logout` is deliberately *not* here: revoking a session
 ///   requires presenting that session's token, which the middleware
 ///   validates like any other request.
-fn path_is_exempt(path: &str) -> bool {
+pub(crate) fn path_is_exempt(path: &str) -> bool {
     matches!(
         path,
         "/" | "/health" | "/api/auth/login" | "/api/auth/register" | "/api/auth/refresh"

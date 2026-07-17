@@ -580,3 +580,178 @@ async fn dev_bypass_admits_websocket_geometry_command() {
          auth-refused. Frames received: {frames:#?}"
     );
 }
+
+// =====================================================================
+// RED/RATCHET — the unprotected-route census
+// =====================================================================
+//
+// This is the slice's most durable artifact. It is the security analogue
+// of the geometry side's red-burndown ratchet: it enumerates every route
+// the server mounts, partitions them by whether they are reachable
+// WITHOUT a credential (the real `path_is_exempt` predicate decides —
+// the test calls the production function, it does not reimplement it),
+// and asserts the credential-free set equals an explicit, reviewed
+// allowlist.
+//
+// Why this is the anti-regression lock: under `AuthPosture::Required`
+// the global `auth_middleware` demands a valid credential for every
+// non-exempt path, so a newly added route is credential-gated by
+// default — the only way to ship an unauthenticated route is to add it
+// to `path_is_exempt` (or to a `/ws/`-prefixed path). Either move
+// changes the set this test computes, so it fails until a human updates
+// EXPECTED_PUBLIC_ROUTES with a justification. That is exactly the
+// #44-family failure this slice exists to prevent: a route silently
+// becoming public without anyone deciding it should be.
+
+/// Every route path declared in the api-server router, extracted from
+/// `main.rs` source. Routes are declared as `.route("<path>", ...)`;
+/// the capture tolerates the multi-line `.route(\n  "<path>",` form
+/// rustfmt produces.
+fn declared_route_paths() -> Vec<String> {
+    let source = include_str!("main.rs");
+    let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#)
+        .expect("route-extraction regex is a compile-time constant");
+    re.captures_iter(source).map(|c| c[1].to_string()).collect()
+}
+
+/// The reviewed set of routes intentionally reachable without a
+/// credential. Each entry is here because it must be: a health probe,
+/// the WS upgrade (authenticated in-band), or a credential-issuing
+/// route. Changing this set is a security decision and must be
+/// deliberate — that is the whole point of pinning it.
+const EXPECTED_PUBLIC_ROUTES: &[&str] = &[
+    "/",                   // root / liveness
+    "/health",             // readiness probe
+    "/ws",                 // WebSocket upgrade — authenticated in-band
+    "/ws/viewport-bridge", // debug viewport, mounted only under ROSHERA_DEV_BRIDGE
+    "/api/auth/login",     // credential issue
+    "/api/auth/register",  // credential issue
+    "/api/auth/refresh",   // credential rotation
+];
+
+#[test]
+fn unprotected_route_census_matches_reviewed_allowlist() {
+    use std::collections::BTreeSet;
+
+    let all = declared_route_paths();
+
+    // Sanity floor: if the parse silently returned nothing (a refactor
+    // of the router shape, a renamed macro), the census would vacuously
+    // pass. Pin a conservative lower bound on the route count so the
+    // enumeration cannot quietly become empty.
+    assert!(
+        all.len() >= 200,
+        "route census parsed only {} routes from main.rs — expected 200+. The \
+         extraction likely broke; the ratchet is not meaningfully guarding \
+         anything until it is fixed.",
+        all.len()
+    );
+
+    // Partition by the *production* predicate.
+    let public: BTreeSet<String> = all
+        .iter()
+        .filter(|p| crate::auth_middleware::path_is_exempt(p))
+        .cloned()
+        .collect();
+
+    let expected: BTreeSet<String> = EXPECTED_PUBLIC_ROUTES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let newly_public: Vec<&String> = public.difference(&expected).collect();
+    assert!(
+        newly_public.is_empty(),
+        "these routes are reachable WITHOUT a credential but are not in the \
+         reviewed allowlist: {newly_public:?}. A route became public without \
+         review. If that is intended, add it to EXPECTED_PUBLIC_ROUTES with a \
+         justification; otherwise remove it from path_is_exempt."
+    );
+
+    let removed_from_surface: Vec<&String> = expected.difference(&public).collect();
+    assert!(
+        removed_from_surface.is_empty(),
+        "these allowlisted public routes are no longer declared/exempt: \
+         {removed_from_surface:?}. If a public route was removed or renamed, \
+         update EXPECTED_PUBLIC_ROUTES so the ratchet keeps matching reality."
+    );
+}
+
+/// Companion behavioural assertion: representative destructive routes
+/// that carry no per-route permission layer are nonetheless refused
+/// without a credential, because the global front door gates them. This
+/// pins the property the census depends on — "non-exempt ⇒ credential
+/// required" — as observable behaviour, not just an argument about
+/// middleware ordering.
+#[tokio::test]
+async fn unlayered_destructive_routes_still_require_a_credential() {
+    let state = secure_state().await;
+
+    // These routes have NO `.route_layer(require_*)` in the router; the
+    // audit called them out as unprotected. Under the default posture
+    // the front door refuses them anyway.
+    let cases: &[(Method, String)] = &[
+        (Method::DELETE, format!("/api/sketch/{}", Uuid::new_v4())),
+        (Method::DELETE, format!("/api/parts/{}", Uuid::new_v4())),
+        (Method::DELETE, format!("/api/drawings/{}", Uuid::new_v4())),
+        (Method::POST, "/api/viewport/clear".to_string()),
+    ];
+
+    for (method, path) in cases {
+        let (status, _) = dispatch(&state, anon(method.clone(), path, None)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unlayered destructive route {method} {path} must still be refused \
+             without a credential (front-door enforcement) — got {status}"
+        );
+    }
+}
+
+// =====================================================================
+// RED — the rate limiter must be layered
+// =====================================================================
+
+/// The built-but-unlayered rate limiter (`AuthManager::check_rate_limit`,
+/// 100 requests/minute per client) must actually be on the router.
+///
+/// Fires more than the per-minute budget at a single client within the
+/// window and asserts the surplus is throttled with 429. Fails if the
+/// limiter is not layered (every request would return its normal
+/// status). The fixture's `AuthManager` is fresh per test, so the
+/// window starts empty and this cannot leak into or out of other tests.
+#[tokio::test]
+async fn rate_limiter_is_layered_and_throttles_a_flooding_client() {
+    // InsecureDevBypass so requests are admitted and keyed on a stable
+    // client id; /health is exempt from auth but still passes through
+    // the rate limiter (which is layered inner to auth).
+    let state = make_test_state().await;
+
+    // Budget is 100/min. Fire 130 and confirm the surplus is throttled.
+    let mut statuses = Vec::with_capacity(130);
+    for _ in 0..130 {
+        let (status, _) = dispatch(&state, anon(Method::GET, "/health", None)).await;
+        statuses.push(status);
+    }
+
+    let throttled = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    let ok = statuses.iter().filter(|s| s.is_success()).count();
+
+    assert!(
+        throttled > 0,
+        "the rate limiter must throttle a client that exceeds 100 req/min with \
+         429 — none of {} requests were throttled, so the limiter is not \
+         layered onto the router",
+        statuses.len()
+    );
+    // Sanity: the first batch (within budget) is admitted, so this is a
+    // limiter, not a blanket rejection.
+    assert!(
+        ok >= 100,
+        "requests within the per-minute budget must be admitted — only {ok} \
+         succeeded, which looks like a blanket failure rather than throttling"
+    );
+}

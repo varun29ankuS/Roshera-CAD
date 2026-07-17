@@ -8737,18 +8737,30 @@ pub(crate) fn build_router(state: AppState) -> Router {
         posture: state.auth_posture,
     };
 
-    // Add state, idempotency, auth, and CORS. axum applies layers from
-    // innermost outward, so CORS sees every request first (including
-    // preflight OPTIONS, which auth + idempotency would otherwise
-    // pass through trivially), then `auth_middleware` enforces
-    // credentials (or, in soft mode, injects an anonymous AuthInfo),
-    // then idempotency intercepts mutating verbs, then the inner
-    // router dispatches to the handler.
+    // The rate limiter (`AuthManager::check_rate_limit`, 100 req/min per
+    // client) was built but never layered. Wire it here, keyed on the
+    // authenticated identity when present and the peer IP
+    // (`x-forwarded-for`) otherwise — so it also throttles the public
+    // credential-issuing routes (login/register) by source, which is the
+    // brute-force protection that matters most for them.
+    let rate_limit_manager = state.session_manager.auth_manager_arc();
+
+    // Add state and the middleware stack. axum applies layers from
+    // innermost outward, so on the request path CORS runs first
+    // (including preflight OPTIONS), then `auth_middleware` enforces
+    // credentials (or, under the dev bypass, injects a permissive
+    // identity), then the rate limiter throttles admitted requests
+    // keyed on that identity, then idempotency intercepts mutating
+    // verbs, then the inner router dispatches to the handler.
     app.with_state(state)
         .layer(axum::middleware::from_fn(agent_author_layer))
         .layer(axum::middleware::from_fn_with_state(
             idempotency_store,
             idempotency::idempotency_layer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limit_manager,
+            auth_middleware::rate_limit_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
             auth_layer_state,
