@@ -13,6 +13,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod assembly_instances;
+mod assembly_mates;
 mod assembly_mgr;
 mod auth_middleware;
 mod blackboard;
@@ -8140,6 +8141,22 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/assembly/{id}/view",
             get(assembly_instances::view_assembly),
         )
+        // Mate connectors + mates + solve on the instanced document
+        // (kinematic-assembly campaign, Slice 2). See assembly_mates.rs.
+        .route(
+            "/api/assembly/{id}/connector",
+            post(assembly_mates::create_connector),
+        )
+        .route(
+            "/api/assembly/{id}/connector/{cid}",
+            delete(assembly_mates::delete_connector),
+        )
+        .route("/api/assembly/{id}/mate", post(assembly_mates::create_mate))
+        .route(
+            "/api/assembly/{id}/mate/{mid}",
+            axum::routing::patch(assembly_mates::patch_mate).delete(assembly_mates::delete_mate),
+        )
+        .route("/api/assembly/{id}/solve", post(assembly_mates::solve))
         // Kernel assemblies — multi-part scenes, mates, solver,
         // exploded views, interference reports. Distinct from the
         // `/api/hierarchy/...` project-tree surface; see

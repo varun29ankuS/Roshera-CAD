@@ -412,6 +412,151 @@ fn dispatch_assembly(
             }
             Ok(())
         }
+        // ── Mate connectors + mates + solve (campaign Slice 2) ─────────
+        // Payloads carry the full serde form of the document types, so
+        // replay re-inserts EXACTLY what the session stored (ids included).
+        "assembly.connector_add" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let connector: geometry_engine::assembly::mates::MateConnector =
+                serde_json::from_value(
+                    inner
+                        .get("connector")
+                        .cloned()
+                        .ok_or_else(|| missing("connector"))?,
+                )
+                .map_err(|e| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("connector payload: {e}"),
+                })?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.add_connector(connector) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "document refused the connector (duplicate id / unknown instance)"
+                        .to_string(),
+                });
+            }
+            Ok(())
+        }
+        "assembly.connector_remove" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let cid = param_uuid("connector_id").ok_or_else(|| missing("connector_id"))?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.remove_connector(geometry_engine::assembly::mates::MateConnectorId(cid)) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("connector {cid} unknown or still referenced"),
+                });
+            }
+            Ok(())
+        }
+        "assembly.mate_add" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let mate: geometry_engine::assembly::mates::DocMate =
+                serde_json::from_value(inner.get("mate").cloned().ok_or_else(|| missing("mate"))?)
+                    .map_err(|e| ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("mate payload: {e}"),
+                    })?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.add_mate(mate) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "document refused the mate (validation failed)".to_string(),
+                });
+            }
+            Ok(())
+        }
+        "assembly.mate_edit" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let mid = param_uuid("mate_id").ok_or_else(|| missing("mate_id"))?;
+            let new_kind: geometry_engine::assembly::mates::DocMateKind =
+                serde_json::from_value(inner.get("kind").cloned().ok_or_else(|| missing("kind"))?)
+                    .map_err(|e| ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("kind payload: {e}"),
+                    })?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.set_mate_kind(geometry_engine::assembly::mates::DocMateId(mid), new_kind) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("mate {mid} unknown"),
+                });
+            }
+            Ok(())
+        }
+        "assembly.mate_remove" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let mid = param_uuid("mate_id").ok_or_else(|| missing("mate_id"))?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.remove_mate(geometry_engine::assembly::mates::DocMateId(mid)) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("mate {mid} unknown or referenced by a coupling"),
+                });
+            }
+            Ok(())
+        }
+        // Solve events record their EFFECT (the solved poses) so replay is
+        // deterministic and dependency-free — the timeline never re-runs
+        // the solver.
+        "assembly.solve" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let poses = inner
+                .get("poses")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| missing("poses"))?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            for pose in poses {
+                let iid = pose
+                    .get("instance_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    .ok_or_else(|| missing("poses[].instance_id"))?;
+                let raw = pose
+                    .get("transform")
+                    .cloned()
+                    .ok_or_else(|| missing("poses[].transform"))?;
+                let a: [[f64; 4]; 4] =
+                    serde_json::from_value(raw).map_err(|e| ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("poses[].transform: {e}"),
+                    })?;
+                let mut m = Matrix4::IDENTITY;
+                for (r, row) in a.iter().enumerate() {
+                    for (c, v) in row.iter().enumerate() {
+                        m[(r, c)] = *v;
+                    }
+                }
+                if !doc
+                    .transform_instance(geometry_engine::assembly::instancing::InstanceId(iid), m)
+                {
+                    return Err(ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("unknown instance id {iid}"),
+                    });
+                }
+            }
+            Ok(())
+        }
         // Legacy mate-centric surface kinds — no rebuildable payload (see
         // the function doc). Honest skip, never a silent wrong answer.
         unknown => Err(ReplayError::UnknownKind(unknown.to_string())),

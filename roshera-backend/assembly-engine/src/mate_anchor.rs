@@ -140,6 +140,25 @@ impl Assembly {
                 // Anchored if EITHER holds; a fabricated axis satisfies neither.
                 Some(through.min(graze))
             }
+            // A connector FRAME is anchored if either its origin sits on the
+            // part (a planar-face frame — origin on the face) OR its z line
+            // behaves like an anchored axis (a bore frame — origin ON the
+            // axis, off the surface). Reuse both probes and take the best;
+            // a fabricated frame satisfies neither.
+            FeatureRef::Frame { origin, z_axis, .. } => {
+                let on_surface = {
+                    let p = Point3::new(origin[0], origin[1], origin[2]);
+                    mesh.distance_to_local_point(&p, false)
+                };
+                let as_axis = self.feature_offset(
+                    part,
+                    &FeatureRef::Axis {
+                        origin: *origin,
+                        direction: *z_axis,
+                    },
+                )?;
+                Some(on_surface.min(as_axis))
+            }
         }
     }
 }

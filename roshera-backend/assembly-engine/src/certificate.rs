@@ -51,6 +51,17 @@ pub struct AssemblyCertificate {
     /// Every mated pair actually touches — no part is joined to another only on
     /// paper, sitting coaxial-but-floating with a gap between them.
     pub mates_in_contact: bool,
+    /// Every mate is NUMERICALLY ENFORCED by the solver. A typed-but-
+    /// unenforced mate (the honest-refuse set: Cam/Path/Symmetric, feature
+    /// mismatches, broken coupling references) contributes zero residual
+    /// rows — it must block soundness, never silently ride a `sound`
+    /// verdict. Serde-defaults to `true` so pre-Slice-2 payloads parse.
+    #[serde(default = "default_true")]
+    pub mates_enforced: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl AssemblyCertificate {
@@ -63,6 +74,7 @@ impl AssemblyCertificate {
             && self.swept_clearance_ok
             && self.mates_anchored
             && self.mates_in_contact
+            && self.mates_enforced
     }
 }
 
@@ -82,6 +94,9 @@ impl Assembly {
         // Anchoring is pose-independent (features are local), so it reads the
         // assembly as declared — before the solve can paper over a fake joint.
         let mates_anchored = self.mate_anchor_report(MATE_ANCHOR_TOL).all_anchored();
+        // Enforcement is declaration-level too: a refused mate contributes no
+        // residual rows, so it is judged before any solve can hide it.
+        let mates_enforced = self.mate_enforcement_report().all_enforced();
 
         let mut solved = self.clone();
         let mates_consistent = solved.solve().converged;
@@ -117,6 +132,7 @@ impl Assembly {
             swept_clearance_ok,
             mates_anchored,
             mates_in_contact,
+            mates_enforced,
         }
     }
 }
