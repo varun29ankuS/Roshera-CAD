@@ -232,6 +232,31 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let user_id = Uuid::new_v4().to_string();
     let mut current_session_id: Option<String> = None;
+
+    // In-band WebSocket authentication state.
+    //
+    // The `/ws` upgrade is exempt from the HTTP auth layer (a header 401
+    // would abort the handshake before the client can present a token —
+    // browsers cannot attach an Authorization header to a WebSocket
+    // upgrade). Authentication therefore happens in-band: the client
+    // sends a `ClientMessage::Authenticate` frame carrying a JWT, and
+    // only after that token verifies may it drive the command surface
+    // (GeometryCommand, AICommand, TimelineCommand, ExportCommand).
+    //
+    // Before this gate the `Authenticate` handler verified the token but
+    // used the claims only to build a reply — it set no connection state
+    // and no other arm checked anything, so a client could connect and
+    // send GeometryCommand without ever authenticating (in strict mode
+    // too). This flag is that missing state. Under
+    // `AuthPosture::InsecureDevBypass` it starts `true` so Varun's local
+    // dev loop needs no token, exactly mirroring the REST bypass; under
+    // `AuthPosture::Required` it starts `false` and only a verified
+    // `Authenticate` frame flips it.
+    let mut ws_authenticated = matches!(
+        state.auth_posture,
+        crate::auth_middleware::AuthPosture::InsecureDevBypass
+    );
+
     info!("New WebSocket connection: user={}", user_id);
     crate::broadcast_log(
         "INFO",
@@ -291,6 +316,42 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     // Per-connection DoS guard (AUDIT-C6). See module constants above
     // for the policy rationale.
     let mut rate_limiter = WsTokenBucket::new(WS_RATE_LIMIT_BURST, WS_RATE_LIMIT_REFILL_PER_SEC);
+
+    // In-band auth gate for the command surface. Invoked at the top of
+    // every command arm that mutates state or spends budget
+    // (GeometryCommand, AICommand, TimelineCommand, ExportCommand). When
+    // the connection has not authenticated, it replies with an
+    // `auth_required` error carrying the client's `request_id` and
+    // `continue`s the receive loop — the command is never dispatched.
+    // `Ping`, `Authenticate`, and the subscription/query frames are
+    // deliberately not gated: a client must be able to ping and to
+    // authenticate, and read-only subscription bookkeeping carries no
+    // mutation or budget. Expands in place so it borrows `sender`,
+    // `ws_authenticated`, and `user_id` from this scope and its
+    // `continue` targets the receive loop.
+    macro_rules! require_ws_auth {
+        ($request_id:expr) => {
+            if !ws_authenticated {
+                warn!(
+                    "WS command refused: connection={} is not authenticated \
+                     (send an Authenticate frame with a valid token first)",
+                    user_id
+                );
+                let refusal = ServerMessage::Error {
+                    error_code: "auth_required".to_string(),
+                    message: "authentication required: send an Authenticate \
+                              frame with a valid token before issuing commands"
+                        .to_string(),
+                    details: None,
+                    request_id: $request_id.clone(),
+                };
+                if let Ok(refusal_json) = serde_json::to_string(&refusal) {
+                    let _ = sender.send(Message::Text(refusal_json.into())).await;
+                }
+                continue;
+            }
+        };
+    }
 
     // Handle incoming messages
     loop {
@@ -366,6 +427,14 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             "WebSocket auth ok: connection={} sub={}",
                                             user_id, claims.sub
                                         );
+                                        // Flip the connection into the
+                                        // authenticated state. This is
+                                        // the load-bearing side effect
+                                        // the pre-gate handler was
+                                        // missing: a verified token now
+                                        // actually unlocks the command
+                                        // surface, not just the reply.
+                                        ws_authenticated = true;
                                         ServerMessage::Authenticated {
                                             user_id: claims.sub,
                                             permissions: claims.roles,
@@ -391,6 +460,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                 command,
                                 request_id,
                             } => {
+                                require_ws_auth!(request_id);
                                 crate::broadcast_log(
                                     "INFO",
                                     &format!("Creating geometry: {:?}", command),
@@ -496,6 +566,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                 command,
                                 request_id,
                             } => {
+                                require_ws_auth!(request_id);
                                 // Handle AI commands - convert natural language to geometry
                                 match command {
                                     super::protocol::AIWSCommand::ProcessCommand {
@@ -1230,6 +1301,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                 command,
                                 request_id,
                             } => {
+                                require_ws_auth!(request_id);
                                 info!("Processing timeline command: {:?}", command);
 
                                 // Use the actual timeline engine
@@ -1405,6 +1477,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                 command,
                                 request_id,
                             } => {
+                                require_ws_auth!(request_id);
                                 info!("Processing export command: {:?}", command);
 
                                 // Use the actual export engine

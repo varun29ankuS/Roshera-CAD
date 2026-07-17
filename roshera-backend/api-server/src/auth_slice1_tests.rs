@@ -282,3 +282,301 @@ fn main_does_not_construct_an_auth_manager_with_a_literal_key() {
          succeeds and every subsequent request 401s."
     );
 }
+
+// =====================================================================
+// RED 7-8 — the WebSocket command surface must require authentication
+// =====================================================================
+//
+// This is the slice's most important gate. The WS carries the full
+// geometry command surface (GeometryCommand, AICommand, TimelineCommand,
+// ExportCommand); AICommand additionally spends the operator's LLM
+// budget. Before this slice the `/ws` upgrade was exempt from the HTTP
+// auth layer AND no message arm required authentication — the in-band
+// `Authenticate` handler verified a token but used its claims only to
+// build a reply, setting no connection state. A client could connect and
+// send GeometryCommand without ever authenticating, in strict mode too.
+//
+// These tests drive a real server over a real socket, because the hole
+// is precisely in the upgrade/connection path that `oneshot` cannot
+// reach.
+
+use futures::{SinkExt, StreamExt};
+use std::net::SocketAddr;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+/// Serve `state`'s router on an ephemeral loopback port and return the
+/// bound address plus the serving task's handle (dropped by the caller
+/// to shut the server down).
+async fn serve(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("must bind an ephemeral loopback port");
+    let addr = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    let router = build_router(state);
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (addr, handle)
+}
+
+/// Connect a WebSocket to `/ws`, send `command_json`, and collect every
+/// text frame the server emits for a bounded window. Returns the parsed
+/// frames. The bounded window is what makes the "command was executed
+/// vs refused" distinction observable without hanging: a refused command
+/// yields an `auth_required` error promptly; an executed command yields
+/// geometry frames; either way the collection ends when the socket goes
+/// idle.
+async fn ws_send_and_collect(addr: SocketAddr, command_json: Value) -> Vec<Value> {
+    let url = format!("ws://{addr}/ws");
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WebSocket upgrade must succeed (the /ws upgrade is public)");
+
+    socket
+        .send(WsMessage::Text(command_json.to_string().into()))
+        .await
+        .expect("must send the command frame");
+
+    let frames = collect_ws_frames(&mut socket).await;
+    let _ = socket.close(None).await;
+    frames
+}
+
+/// Drain text frames from a socket until a *decisive* frame arrives (an
+/// auth refusal, an authentication failure, or an executed-command
+/// frame) or an overall deadline passes.
+///
+/// Breaking on a decisive frame — rather than on a fixed idle window —
+/// is what makes these tests robust when the whole suite runs in
+/// parallel: dozens of ephemeral servers contend for the runtime, so a
+/// starved server task may be slow to emit the first frame. A short idle
+/// window would then time out with an empty buffer and fail
+/// spuriously. The generous per-recv timeout plus early decisive break
+/// tolerate the scheduling jitter without ever waiting on a response
+/// that has already arrived.
+async fn collect_ws_frames<S>(socket: &mut S) -> Vec<Value>
+where
+    S: futures::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut frames = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let recv = tokio::time::timeout(
+            remaining.min(std::time::Duration::from_millis(2500)),
+            socket.next(),
+        )
+        .await;
+        match recv {
+            Ok(Some(Ok(WsMessage::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                    let decisive = is_auth_refusal_frame(&v)
+                        || is_geometry_effect_frame(&v)
+                        || v.get("type").and_then(|t| t.as_str()) == Some("AuthenticationFailed");
+                    frames.push(v);
+                    if decisive {
+                        break;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}                 // ignore non-text
+            Ok(Some(Err(_))) | Ok(None) => break, // socket closed
+            Err(_) => break,                      // overall/idle deadline
+        }
+    }
+    frames
+}
+
+/// A well-formed `ClientMessage::GeometryCommand` that creates a box.
+///
+/// The wire shape is load-bearing for the negative assertion: the frame
+/// must deserialize into the real `GeometryCommand` arm so that, absent
+/// the gate, it would actually execute and broadcast geometry. A frame
+/// that failed to parse would trivially "not execute" and make the test
+/// vacuous. `ClientMessage` is `tag="type", content="data"`;
+/// `GeometryWSCommand` and its inner `ShapeParameters` follow
+/// `shared-types::geometry`.
+fn geometry_create_box_frame(request_id: &str) -> Value {
+    json!({
+        "type": "GeometryCommand",
+        "data": {
+            "command": {
+                "cmd": "CreatePrimitive",
+                "primitive_type": "Box",
+                "parameters": { "params": { "width": 10.0, "height": 10.0, "depth": 10.0 } }
+            },
+            "request_id": request_id
+        }
+    })
+}
+
+/// True if a single frame is a `ServerMessage::Error` whose
+/// `error_code` marks an authentication refusal. `ServerMessage` is
+/// `tag="type", content="data"`, so `error_code` sits under `data`.
+fn is_auth_refusal_frame(f: &Value) -> bool {
+    f.get("type").and_then(|t| t.as_str()) == Some("Error")
+        && f.get("data")
+            .and_then(|d| d.get("error_code"))
+            .and_then(|c| c.as_str())
+            == Some("auth_required")
+}
+
+/// True if a single frame looks like an *executed* command — the
+/// `ObjectCreated` scene broadcast (a hand-built frame with a top-level
+/// `type`) or a `ServerMessage::Success`.
+fn is_geometry_effect_frame(f: &Value) -> bool {
+    matches!(
+        f.get("type").and_then(|t| t.as_str()),
+        Some("ObjectCreated") | Some("Success")
+    )
+}
+
+/// True if any collected frame is an authentication refusal.
+fn has_auth_refusal(frames: &[Value]) -> bool {
+    frames.iter().any(is_auth_refusal_frame)
+}
+
+/// True if any collected frame indicates the command executed. Used to
+/// prove the negative: an unauthenticated command must produce none.
+fn has_geometry_effect(frames: &[Value]) -> bool {
+    frames.iter().any(is_geometry_effect_frame)
+}
+
+/// Connect to `/ws` and send a `GeometryCommand` without ever
+/// authenticating. The server must refuse it and must not execute it.
+///
+/// **Fails against the stage-1 tree:** the WS command surface is not yet
+/// gated, so the primitive is created and an `ObjectCreated`-class frame
+/// is broadcast instead of an `auth_required` error.
+#[tokio::test]
+async fn unauthenticated_websocket_geometry_command_is_rejected() {
+    let state = secure_state().await;
+    let (addr, server) = serve(state).await;
+
+    let frames = ws_send_and_collect(addr, geometry_create_box_frame("ws-geo-1")).await;
+    server.abort();
+
+    assert!(
+        has_auth_refusal(&frames),
+        "an unauthenticated WebSocket GeometryCommand must be refused with an \
+         `auth_required` error before it touches the kernel. Frames received: {frames:#?}"
+    );
+    assert!(
+        !has_geometry_effect(&frames),
+        "an unauthenticated WebSocket GeometryCommand must NOT execute — no \
+         geometry frame may be emitted. Frames received: {frames:#?}"
+    );
+}
+
+/// The same protection for `AICommand`, which additionally spends the
+/// operator's LLM budget. An unauthenticated client must not be able to
+/// drive the AI provider.
+#[tokio::test]
+async fn unauthenticated_websocket_ai_command_is_rejected() {
+    let state = secure_state().await;
+    let (addr, server) = serve(state).await;
+
+    // ClientMessage is `tag="type", content="data"`; AIWSCommand is
+    // internally tagged on `cmd`.
+    let command = json!({
+        "type": "AICommand",
+        "data": {
+            "command": { "cmd": "ProcessCommand", "text": "create a box", "context": null },
+            "request_id": "ws-ai-1"
+        }
+    });
+
+    let frames = ws_send_and_collect(addr, command).await;
+    server.abort();
+
+    assert!(
+        has_auth_refusal(&frames),
+        "an unauthenticated WebSocket AICommand must be refused with an \
+         `auth_required` error before it reaches the LLM provider (budget \
+         protection). Frames received: {frames:#?}"
+    );
+}
+
+/// Positive path: a client that authenticates in-band with a valid JWT
+/// may then drive the command surface. Proves the gate *opens* — a gate
+/// that never opened would pass every negative test above while making
+/// the WebSocket unusable.
+#[tokio::test]
+async fn websocket_geometry_command_after_authenticate_executes() {
+    let state = secure_state().await;
+
+    // Mint a token from the process's single AuthManager — the same one
+    // the WS `Authenticate` handler verifies against, which only works
+    // because the two managers were collapsed into one.
+    let token = state
+        .session_manager
+        .auth_manager()
+        .create_token("user_ws_positive", None, vec!["user".to_string()])
+        .expect("token minting must succeed")
+        .token;
+
+    let (addr, server) = serve(state).await;
+    let url = format!("ws://{addr}/ws");
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WebSocket upgrade must succeed");
+
+    // Authenticate, then issue the command on the same connection.
+    let authenticate = json!({
+        "type": "Authenticate",
+        "data": { "token": token, "request_id": "ws-auth-1" }
+    });
+    socket
+        .send(WsMessage::Text(authenticate.to_string().into()))
+        .await
+        .expect("must send Authenticate");
+    socket
+        .send(WsMessage::Text(
+            geometry_create_box_frame("ws-geo-authed")
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("must send GeometryCommand");
+
+    let frames = collect_ws_frames(&mut socket).await;
+    let _ = socket.close(None).await;
+    server.abort();
+
+    assert!(
+        !has_auth_refusal(&frames),
+        "an authenticated WebSocket GeometryCommand must not be auth-refused. \
+         Frames received: {frames:#?}"
+    );
+    assert!(
+        has_geometry_effect(&frames),
+        "after a valid Authenticate frame, the GeometryCommand must execute and \
+         emit a geometry frame. Frames received: {frames:#?}"
+    );
+}
+
+/// Positive control: under the `InsecureDevBypass` posture the same
+/// GeometryCommand is admitted without a credential. This proves the
+/// gate keys on posture rather than refusing unconditionally — a gate
+/// that refused everything would pass the two tests above while breaking
+/// local development.
+#[tokio::test]
+async fn dev_bypass_admits_websocket_geometry_command() {
+    // make_test_state defaults to InsecureDevBypass.
+    let state = make_test_state().await;
+    let (addr, server) = serve(state).await;
+
+    let frames = ws_send_and_collect(addr, geometry_create_box_frame("ws-geo-dev")).await;
+    server.abort();
+
+    assert!(
+        !has_auth_refusal(&frames),
+        "under InsecureDevBypass a WebSocket GeometryCommand must not be \
+         auth-refused. Frames received: {frames:#?}"
+    );
+}

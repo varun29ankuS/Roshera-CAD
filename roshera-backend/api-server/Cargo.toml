@@ -50,6 +50,10 @@ png = "0.17"
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 hyper = "1.0"
+# WebSocket client for the in-band auth-gate integration tests. Already
+# resolved in Cargo.lock (0.26.2) transitively via axum's `ws` feature,
+# so this adds no new dependency to the build graph.
+tokio-tungstenite = "0.26"
 
 [lints]
 workspace = true
