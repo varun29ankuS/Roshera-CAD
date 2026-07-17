@@ -148,6 +148,14 @@ fn loft_profiles_body(
     // the result solid) so the model is a clean manifold.
     remove_scratch_profile_faces(model, &scratch_profile_faces, solid_id);
 
+    // Persistent-id lineage (#11, slice 40-E): loft was outside the minting set,
+    // so its cap + lateral faces had no PID and forced assembly anchoring to
+    // degrade to a Fingerprint. Mint a root for the solid (seeded from the event
+    // key, so replay re-derives it) and a derived PID per face, keyed by the
+    // solid's now-stable face order. Assigned AFTER scratch-face removal so the
+    // face set is exactly the result solid's.
+    assign_loft_pids(model, solid_id);
+
     // Validate result if requested
     if options.common.validate_result {
         validate_lofted_solid(model, solid_id)?;
@@ -172,6 +180,51 @@ fn loft_profiles_body(
     );
 
     Ok(solid_id)
+}
+
+/// Assign persistent-id lineage to a lofted solid (#11, slice 40-E).
+///
+/// Loft synthesizes cap + lateral faces through several interpolation paths
+/// (linear / cubic / minimal-twist / guided), each feeding one `shell_faces`
+/// list in a fixed construction order. Rather than thread a specialized role
+/// through every path, this mints — exactly as `assign_primitive_pids` does for
+/// primitives — a ROOT PID for the solid (seeded from the event key via
+/// `next_root_seed`, so a timeline replay re-derives it and a MOULD that keeps
+/// the profile structure keeps the identity) and a derived `Generic` PID per
+/// face keyed by the solid's face order. Every lofted face is therefore
+/// addressable and replay-stable, which is what lets an assembly mate / label
+/// anchored to a lofted face resolve by PID instead of degrading to a
+/// Fingerprint. A deeper per-face lineage (caps from the profile ring, laterals
+/// from the profile edges) is a future refinement; this is the honest,
+/// total-coverage floor.
+fn assign_loft_pids(model: &mut BRepModel, solid_id: SolidId) {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+
+    let seed = model.next_root_seed("loft_profiles");
+    let solid_pid = PersistentId::root(&seed);
+    model.set_solid_pid(solid_id, solid_pid);
+
+    let face_ids: Vec<FaceId> = {
+        let mut fs = Vec::new();
+        if let Some(solid) = model.solids.get(solid_id) {
+            let mut shells = vec![solid.outer_shell];
+            shells.extend_from_slice(&solid.inner_shells);
+            for sh in shells {
+                if let Some(shell) = model.shells.get(sh) {
+                    fs.extend_from_slice(&shell.faces);
+                }
+            }
+        }
+        fs
+    };
+    for (i, fid) in face_ids.iter().enumerate() {
+        let role = Role::Generic {
+            source_pid: solid_pid,
+            label: format!("loft_face{i}"),
+        };
+        let fpid = PersistentId::derive(&[solid_pid], "loft_profiles", &role);
+        model.set_face_pid(*fid, fpid);
+    }
 }
 
 /// Create a linear loft (ruled surfaces between profiles)

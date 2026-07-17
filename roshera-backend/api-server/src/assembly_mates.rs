@@ -2173,15 +2173,18 @@ mod tests {
     }
 
     #[test]
-    fn blend_face_anchor_degrades_to_fingerprint_and_is_reported() {
-        // Anchor-provenance degradation RED (spec Slice 2 gate): faces of
-        // ops that don't mint PID lineage yet (#11 slices 40-E/F —
-        // fillet/chamfer/PATTERN) force the anchor to degrade to a
-        // FINGERPRINT and say so — never silently pretend PID durability.
-        // The carrier is a PATTERN-copied planar face (analytic frame
-        // exists, no PID); fillet/chamfer blends are additionally
-        // non-analytic surfaces and are asserted below as the honest
-        // REFUSAL case.
+    fn loft_cap_now_anchors_by_pid_stripped_face_still_degrades() {
+        // Anchor-provenance ladder after the #11 40-E/F landing. Loft was the
+        // last modelling op outside the PID-minting set; its planar caps used to
+        // force the anchor to degrade to a Fingerprint. 40-E now mints loft
+        // lineage, so a lofted cap anchors by PID — the Fingerprint->Pid FLIP
+        // the assembly campaign predicted (slice 1-2 report, residual §8).
+        //
+        // The Fingerprint DEGRADATION path is real code that must stay under
+        // test even though every modelling op now mints. It is exercised here by
+        // a deliberately PID-STRIPPED analytic face: a face with an analytic
+        // frame but no persistent id still degrades to a Fingerprint, REPORTED,
+        // never a silent pretend-durability.
         let mut model = BRepModel::new();
         let boxed = {
             let mut b = TopologyBuilder::new(&mut model);
@@ -2238,8 +2241,8 @@ mod tests {
         let Ok(lofted) = lofted else {
             unreachable!("square loft builds: {lofted:?}");
         };
-        let _ = lofted;
-        // Find a PID-less planar face and the solid that owns it.
+        // Collect the lofted solid's planar faces; after 40-E they all carry a
+        // PID (this used to be the PID-less degradation carrier).
         let is_planar = |m: &BRepModel, f: geometry_engine::primitives::face::FaceId| {
             m.faces.get(f).is_some_and(|face| {
                 m.surfaces.get(face.surface_id).is_some_and(|surf| {
@@ -2249,73 +2252,108 @@ mod tests {
                 })
             })
         };
-        let mut found: Option<(u32, FaceId)> = None;
-        let solid_ids: Vec<u32> = model.solids.iter().map(|(sid, _)| sid).collect();
-        'outer: for sid in solid_ids {
-            let Some(s) = model.solids.get(sid) else {
-                continue;
-            };
-            let mut shells = vec![s.outer_shell];
-            shells.extend_from_slice(&s.inner_shells);
-            for sh in shells {
-                let Some(shell) = model.shells.get(sh) else {
-                    continue;
-                };
-                for &f in &shell.faces {
-                    if model.face_pid(f).is_none() && is_planar(&model, f) {
-                        found = Some((sid, f));
-                        break 'outer;
-                    }
-                }
-            }
-        }
-        let Some((owner, copied)) = found else {
-            let n_solids = model.solids.iter().count();
-            let n_faces = model.faces.iter().count();
-            let n_pidless = model
-                .faces
-                .iter()
-                .filter(|(f, _)| model.face_pid(*f).is_none())
-                .count();
-            unreachable!(
-                "the lofted solid carries PID-less planar caps today (loft is outside \
-                 the #11 minting set) — when this starts failing, loft PID minting \
-                 landed and this test should assert Pid provenance instead \
-                 [probe: solids={n_solids} faces={n_faces} pidless={n_pidless}]"
-            );
-        };
+        let lofted_planar: Vec<FaceId> = model
+            .solids
+            .get(lofted)
+            .and_then(|s| model.shells.get(s.outer_shell))
+            .map(|shell| {
+                shell
+                    .faces
+                    .iter()
+                    .copied()
+                    .filter(|&f| is_planar(&model, f))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cap = *lofted_planar.first().unwrap_or_else(|| {
+            unreachable!("lofted solid has planar cap faces");
+        });
+        assert!(
+            model.face_pid(cap).is_some(),
+            "40-E: a lofted planar cap now carries a PID"
+        );
 
         let part = Uuid::new_v4();
-        let mut doc = InstancedAssembly::new("degradation-rig");
+        let mut doc = InstancedAssembly::new("ladder-rig");
         let inst = doc.add_instance(part, Matrix4::IDENTITY, None).0;
-        let connector = create_connector_core(
+
+        // FLIP: the lofted cap anchors by PID (was Fingerprint pre-40-E).
+        let cap_connector = create_connector_core(
             &mut model,
-            |p| if p == part { Some(owner) } else { None },
+            |p| if p == part { Some(lofted) } else { None },
             &mut doc,
             &CreateConnectorRequest {
                 instance_id: inst,
                 face: Some(FaceSelector {
                     label: None,
                     pid: None,
-                    face_id: Some(copied),
+                    face_id: Some(cap),
                 }),
                 frame: None,
             },
         );
-        let Ok(connector) = connector else {
-            unreachable!("pattern-face connector must be accepted: {connector:?}");
+        let Ok(cap_connector) = cap_connector else {
+            unreachable!("lofted-cap connector must be accepted: {cap_connector:?}");
         };
         assert_eq!(
-            connector.anchor.provenance(),
+            cap_connector.anchor.provenance(),
+            AnchorProvenance::Pid,
+            "lofted cap anchors by PID after 40-E (the predicted Fingerprint->Pid flip)"
+        );
+
+        // Two distinct box planar faces: one kept (Pid), one PID-stripped
+        // (Fingerprint) — the degradation path stays under test.
+        let box_planar: Vec<FaceId> = model
+            .solids
+            .get(solid)
+            .and_then(|s| model.shells.get(s.outer_shell))
+            .map(|shell| {
+                shell
+                    .faces
+                    .iter()
+                    .copied()
+                    .filter(|&f| is_planar(&model, f))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(box_planar.len() >= 2, "a box has >= 2 planar faces");
+        let plain = box_planar[0];
+        let stripped = box_planar[1];
+
+        // DEGRADATION: strip the PID off an analytic face — anchor must degrade
+        // to a Fingerprint and REPORT it.
+        if let Some(pid) = model.face_pid(stripped) {
+            model.face_pids.remove(&stripped);
+            model.pid_to_face.remove(&pid);
+        }
+        assert!(
+            model.face_pid(stripped).is_none(),
+            "the stripped face is genuinely PID-less"
+        );
+        let fp_connector = create_connector_core(
+            &mut model,
+            |p| if p == part { Some(solid) } else { None },
+            &mut doc,
+            &CreateConnectorRequest {
+                instance_id: inst,
+                face: Some(FaceSelector {
+                    label: None,
+                    pid: None,
+                    face_id: Some(stripped),
+                }),
+                frame: None,
+            },
+        );
+        let Ok(fp_connector) = fp_connector else {
+            unreachable!("stripped-face connector must be accepted: {fp_connector:?}");
+        };
+        assert_eq!(
+            fp_connector.anchor.provenance(),
             AnchorProvenance::Fingerprint,
-            "degraded provenance must be REPORTED, not hidden"
+            "a PID-less analytic face degrades to a Fingerprint, REPORTED, not hidden"
         );
 
         // Contrast: a pristine box face carries a PID → Pid provenance.
-        let plain = planar_face(&model, solid);
-        let Some(plain) = plain else {
-            unreachable!("box has planar faces");
-        };
         let pid_connector = create_connector_core(
             &mut model,
             |p| if p == part { Some(solid) } else { None },
