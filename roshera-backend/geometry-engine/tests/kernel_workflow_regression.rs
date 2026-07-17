@@ -885,29 +885,29 @@ fn principal_axes_and_moments_satisfy_eigenequation() {
 fn mass_props_method_discriminates_analytical_vs_tessellated() {
     use geometry_engine::primitives::solid::MassPropertiesMethod;
 
-    // Current contract (see `compute_solid_mass_properties` docs):
-    // **every** solid routes through the Tonon (2004) mesh pipeline
-    // because the analytical face-by-face traversal's inertia tensor
-    // is a documented "lie" (shell-level box-approximation, wrong by
-    // O(1) for curved geometry and by `density` for every solid). The
-    // wire-visible `MassPropertiesMethod::Analytical` discriminator is
-    // reserved for the future slice that fixes the shell-level inertia.
-    //
-    // Both primitives below therefore advertise `Tessellated`. The
-    // discriminator field still earns its keep: it forward-declares
-    // the variant agents will see once the analytical pipeline is
-    // promoted, and it surfaces the achieved tessellation tolerance
-    // to clients that need to decide whether to re-request at finer
-    // resolution.
+    // Contract (mass-properties HONESTY campaign): the entry point serves the
+    // EXACT analytic path for a solid it can integrate exactly — an untrimmed
+    // polyhedron (all faces planar full-parameter rectangles) — and the honest
+    // mesh (Tonon 2004) estimate for everything else. A centred box is the
+    // canonical untrimmed polyhedron, so it now advertises `Analytical` (its
+    // provenance is `Exact` throughout). A sphere is curved (trimmed/periodic
+    // faces the analytic path cannot yet integrate exactly) so it stays
+    // `Tessellated`, honestly labelled `Approximate`. The discriminator field
+    // still surfaces the achieved tessellation tolerance for the mesh path.
     let mut model = BRepModel::new();
     let box_id = make_box(&mut model, 2.0, 2.0, 2.0);
     let box_mp = model
         .mass_properties_for(box_id)
         .expect("box mass props must resolve");
     assert!(
-        matches!(box_mp.method, MassPropertiesMethod::Tessellated { .. }),
-        "box must use the tessellated path (analytical inertia broken upstream), got {:?}",
+        matches!(box_mp.method, MassPropertiesMethod::Analytical),
+        "an untrimmed-polyhedron box must use the EXACT analytic path, got {:?}",
         box_mp.method
+    );
+    assert_eq!(
+        box_mp.provenance.inertia,
+        geometry_engine::primitives::solid::Exactness::Exact,
+        "box inertia provenance must be Exact"
     );
 
     let mut model = BRepModel::new();

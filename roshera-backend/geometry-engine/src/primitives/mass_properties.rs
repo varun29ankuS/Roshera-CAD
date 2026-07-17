@@ -12,9 +12,10 @@
 use crate::math::{MathResult, Point3, Vector3};
 use crate::primitives::face::Face;
 use crate::primitives::solid::{
-    compute_principal_inertia, MassPropertiesMethod, SolidMassProperties,
+    compute_principal_inertia, Exactness, MassPropMethod, MassPropertiesMethod,
+    MassPropertiesProvenance, SolidMassProperties,
 };
-use crate::primitives::surface::Surface;
+use crate::primitives::surface::{Surface, SurfaceType};
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::surface::{get_face_parameter_bounds, is_point_inside_face};
 
@@ -175,6 +176,34 @@ fn classify(face: &Face, model: &BRepModel, u0: f64, u1: f64, v0: f64, v1: f64) 
         0 => Cls::Out,
         _ => Cls::Straddle,
     }
+}
+
+/// True iff `face` is a PLANAR face that fully fills its own parameter
+/// rectangle (untrimmed): its surface is a plane, it has no inner (hole) loops,
+/// and its UV bounding cell classifies entirely `In`. For such a face the
+/// 8-point Gauss quadrature is ALGEBRAICALLY EXACT — the divergence-theorem
+/// integrands are polynomials of degree ≤ 5 in (u,v) on a plane, well within
+/// the rule's degree-15 exactness — and no trim recursion runs. A solid whose
+/// every outer-shell face satisfies this (and which has no inner shells) is
+/// therefore integrated exactly AND fast, so its mass properties may be served
+/// with `Exactness::Exact`. Curved or trimmed faces fail this test and keep the
+/// honest mesh estimate.
+pub fn face_is_untrimmed_planar(face: &Face, model: &BRepModel) -> bool {
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    match model.surfaces.get(face.surface_id) {
+        Some(s) if matches!(s.surface_type(), SurfaceType::Plane) => {}
+        _ => return false,
+    }
+    let (u0, u1, v0, v1) = get_face_parameter_bounds(face, model);
+    if !(u0.is_finite() && u1.is_finite() && v0.is_finite() && v1.is_finite())
+        || u1 <= u0
+        || v1 <= v0
+    {
+        return false;
+    }
+    matches!(classify(face, model, u0, u1, v0, v1), Cls::In)
 }
 
 /// Gauss quadrature over a cell, but each node kept only if inside the trim.
@@ -364,6 +393,22 @@ pub fn assemble(m: FaceMoments, density: f64) -> SolidMassProperties {
         Vector3::ZERO
     };
 
+    // Default provenance: a self-certified analytic-quadrature estimate whose
+    // relative bound is the accumulated trim-masking error (0 for untrimmed
+    // faces), floored at 1e-9 to acknowledge Gauss truncation on curved
+    // integrands. `assemble` alone NEVER claims `Exact` — only the
+    // untrimmed-polyhedron entry point in `topology_builder`, which has proven
+    // the faces are planar full-parameter rectangles (algebraically exact
+    // quadrature), promotes the verdict to `Exact`.
+    let rel_bound = if vol > EPS {
+        (m.achieved_err / vol).max(1e-9)
+    } else {
+        1.0
+    };
+    let est = Exactness::Approximate {
+        method: MassPropMethod::AnalyticQuadrature,
+        rel_error_bound: rel_bound,
+    };
     SolidMassProperties {
         volume: vol,
         surface_area: m.area,
@@ -374,5 +419,10 @@ pub fn assemble(m: FaceMoments, density: f64) -> SolidMassProperties {
         principal_axes,
         radius_of_gyration,
         method: MassPropertiesMethod::Analytical,
+        provenance: MassPropertiesProvenance {
+            volume: est,
+            center_of_mass: est,
+            inertia: est,
+        },
     }
 }

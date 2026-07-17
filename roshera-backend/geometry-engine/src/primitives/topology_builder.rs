@@ -3735,10 +3735,90 @@ impl BRepModel {
                 return Some(cached.clone());
             }
         }
-        let props = self.mesh_based_mass_properties(solid_id)?;
+        // The robust workhorse: mesh Tonon over the fine tessellation, valid
+        // for arbitrary curved/trimmed geometry. It is both the fallback and
+        // the independent oracle the exact upgrade cross-checks against.
+        let mesh = self.mesh_based_mass_properties(solid_id)?;
+
+        // HONESTY UPGRADE — compute the truth where we soundly can. An
+        // untrimmed polyhedron (every outer-shell face a planar full-parameter
+        // rectangle, no inner shells) is integrated ALGEBRAICALLY EXACTLY and
+        // fast by the analytic divergence-theorem quadrature: no trim recursion
+        // runs, so there is none of the curved-boundary slowdown that keeps the
+        // analytic path off the hot route for trimmed/curved solids. Trimmed or
+        // curved solids do NOT qualify and keep the honest mesh estimate — the
+        // kernel refuses to claim an exactness it cannot back.
+        let props = self
+            .try_exact_polyhedron_mass_properties(solid_id, &mesh)
+            .unwrap_or(mesh);
+
         if let Some(solid) = self.solids.get_mut(solid_id) {
             solid.install_mass_props_cache(props.clone());
         }
+        Some(props)
+    }
+
+    /// Attempt an EXACT analytic mass-properties result for an untrimmed
+    /// polyhedron. Returns `None` (caller keeps the honest mesh estimate)
+    /// unless the solid qualifies STRUCTURALLY (no inner shells; every
+    /// outer-shell face a planar full-parameter rectangle, so the analytic
+    /// Gauss quadrature is algebraically exact with no trim recursion) AND the
+    /// analytic result both passes the physical-validity contract and agrees
+    /// with the mesh oracle within the mesh's own error band (a garbage guard
+    /// against a structurally-qualifying but malformed/leaky solid). On success
+    /// every quantity is stamped `Exactness::Exact`.
+    fn try_exact_polyhedron_mass_properties(
+        &self,
+        solid_id: u32,
+        mesh: &crate::primitives::solid::SolidMassProperties,
+    ) -> Option<crate::primitives::solid::SolidMassProperties> {
+        let solid = self.solids.get(solid_id)?;
+        if !solid.inner_shells.is_empty() {
+            return None;
+        }
+        let shell = self.shells.get(solid.outer_shell)?;
+        if shell.faces.is_empty() {
+            return None;
+        }
+        for &fid in &shell.faces {
+            let face = self.faces.get(fid)?;
+            if !crate::primitives::mass_properties::face_is_untrimmed_planar(face, self) {
+                return None;
+            }
+        }
+
+        // Same unit convention as the mesh path (kg/m³ → kg/mm³) so mass and
+        // inertia come out in kg / kg·mm² directly.
+        const KG_PER_M3_TO_KG_PER_MM3: f64 = 1e-9;
+        let density = solid.attributes.material.density * KG_PER_M3_TO_KG_PER_MM3;
+        let mut props =
+            crate::primitives::mass_properties::integrate_solid(solid_id, self, density, 1e-12)?;
+
+        // Physical-validity contract (identical to the mesh path): a malformed
+        // solid that slipped the structural gate must not yield a bogus tensor.
+        check_mass_properties_physical(
+            props.volume,
+            props.surface_area,
+            &props.inertia_tensor,
+            props.principal_moments,
+        )
+        .ok()?;
+
+        // Garbage guard: agree with the independent mesh oracle within the
+        // mesh's own error band (loose, because the MESH is the coarse one).
+        // Disagreement ⇒ the "polyhedron" is degenerate/leaky ⇒ refuse Exact.
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-12);
+        if rel(props.volume, mesh.volume) > 1e-2 {
+            return None;
+        }
+        for k in 0..3 {
+            if rel(props.inertia_tensor[k][k], mesh.inertia_tensor[k][k]) > 5e-2 {
+                return None;
+            }
+        }
+
+        props.method = crate::primitives::solid::MassPropertiesMethod::Analytical;
+        props.provenance = crate::primitives::solid::MassPropertiesProvenance::all_exact();
         Some(props)
     }
 
@@ -4079,6 +4159,18 @@ impl BRepModel {
             return None;
         }
 
+        // Empirical relative-error bound at `TessellationParams::fine()`:
+        // matches analytical formulas to ~5e-3 relative on curved primitives
+        // (sphere/cylinder/cone) per the kernel_workflow_regression /
+        // mass_inertia_gate suites. The coarser internal AUDIT quality
+        // (`audit_volume`) tessellates with a looser chord, so we report a
+        // tolerance honestly scaled by the requested chord rather than
+        // claiming the fine-mesh 5e-3 for a coarse integration.
+        let rel_tolerance = if tess_params.chord_tolerance <= 1e-3 {
+            5e-3
+        } else {
+            (tess_params.chord_tolerance * 0.5).max(5e-3)
+        };
         Some(crate::primitives::solid::SolidMassProperties {
             volume,
             surface_area,
@@ -4088,21 +4180,12 @@ impl BRepModel {
             principal_moments,
             principal_axes,
             radius_of_gyration,
-            method: crate::primitives::solid::MassPropertiesMethod::Tessellated {
-                // Empirical bound at `TessellationParams::fine()`: matches
-                // analytical formulas to ~5e-3 relative on curved primitives
-                // (sphere/cylinder/cone) per the kernel_workflow_regression
-                // suite. The coarser internal AUDIT quality (`audit_volume`)
-                // tessellates with a looser chord, so we report a tolerance
-                // honestly scaled by the requested chord rather than claiming
-                // the fine-mesh 5e-3 for a coarse integration — the audit only
-                // reads `.volume` and checks it within a few-percent band.
-                rel_tolerance: if tess_params.chord_tolerance <= 1e-3 {
-                    5e-3
-                } else {
-                    (tess_params.chord_tolerance * 0.5).max(5e-3)
-                },
-            },
+            method: crate::primitives::solid::MassPropertiesMethod::Tessellated { rel_tolerance },
+            // HONESTY CONTRACT: the mesh path is a numerical estimate for EVERY
+            // quantity — none is exact. Each carries the same Tonon-mesh method
+            // and the empirical `rel_tolerance` bound so a caller learns the
+            // inertia tensor is a ~5e-3 approximation, never a truth.
+            provenance: crate::primitives::solid::MassPropertiesProvenance::all_mesh(rel_tolerance),
         })
     }
 

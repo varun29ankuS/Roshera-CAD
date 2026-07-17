@@ -164,6 +164,92 @@ pub enum MassPropertiesMethod {
     },
 }
 
+/// The numerical METHOD a mass-property value was produced by. Part of the
+/// honesty contract: an approximate value states HOW it was estimated, not
+/// merely that it is approximate, so an agent can reason about the error
+/// source (mesh resolution vs. a coarse box guess).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MassPropMethod {
+    /// Closed-form divergence-theorem Gauss quadrature over the analytic B-rep
+    /// faces (`primitives::mass_properties`). Algebraically exact for untrimmed
+    /// planar faces; a high-order estimate for curved/trimmed faces.
+    AnalyticQuadrature,
+    /// Tonon (2004) per-tetrahedron integration over the `fine()`
+    /// tessellation. The robust workhorse for arbitrary curved/trimmed
+    /// geometry; accurate to the tessellation chord.
+    MeshTonon,
+    /// Rigid-body bounding-box approximation. A coarse guess — never exact and
+    /// carrying no tight bound; used only by the legacy store-based
+    /// `Shell`/`Solid` analytical path, which is off the served route.
+    BoundingBox,
+}
+
+/// Per-quantity exactness provenance for a single mass-property value.
+///
+/// A self-certifying metrology kernel states its accuracy the way
+/// `PK_TOPOL_eval_mass_props` returns an achieved accuracy — it never hands
+/// back a bare number presented as truth. Every served quantity is exactly one
+/// of these three verdicts.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "exactness", rename_all = "snake_case")]
+pub enum Exactness {
+    /// Exact to floating-point noise — a closed-form / algebraically exact
+    /// integral (e.g. the untrimmed-planar divergence theorem).
+    Exact,
+    /// A numerical estimate with a stated RELATIVE error bound and the method
+    /// that produced it. `rel_error_bound` is an honest self-certified ceiling
+    /// on the relative error — a caller may trust the value to within it — NOT
+    /// a decorative constant.
+    Approximate {
+        method: MassPropMethod,
+        rel_error_bound: f64,
+    },
+    /// The kernel cannot compute this quantity for this solid; it refuses
+    /// rather than fabricate a number.
+    Unavailable,
+}
+
+/// The exactness provenance of a whole [`SolidMassProperties`] report — one
+/// verdict per physical quantity. Volume can be known exactly while inertia is
+/// only a mesh estimate, so the provenance is PER QUANTITY, never per report.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MassPropertiesProvenance {
+    /// Provenance of `volume` (and, transitively, `mass = volume × density`).
+    pub volume: Exactness,
+    /// Provenance of `center_of_mass`.
+    pub center_of_mass: Exactness,
+    /// Provenance of `inertia_tensor` / `principal_moments` /
+    /// `principal_axes` / `radius_of_gyration` (all derived from the second
+    /// moments, so they share one verdict).
+    pub inertia: Exactness,
+}
+
+impl MassPropertiesProvenance {
+    /// Every quantity approximated by the same mesh (Tonon) method + bound.
+    pub fn all_mesh(rel_error_bound: f64) -> Self {
+        let e = Exactness::Approximate {
+            method: MassPropMethod::MeshTonon,
+            rel_error_bound,
+        };
+        Self {
+            volume: e,
+            center_of_mass: e,
+            inertia: e,
+        }
+    }
+
+    /// Every quantity exact — reserved for the untrimmed-planar analytic path,
+    /// where the Gauss quadrature is algebraically exact.
+    pub fn all_exact() -> Self {
+        Self {
+            volume: Exactness::Exact,
+            center_of_mass: Exactness::Exact,
+            inertia: Exactness::Exact,
+        }
+    }
+}
+
 /// Mass properties for solid
 #[derive(Debug, Clone)]
 pub struct SolidMassProperties {
@@ -189,6 +275,12 @@ pub struct SolidMassProperties {
     /// numerical mesh integration. Surfaced on the wire so agents
     /// can decide whether to trust the tail digits.
     pub method: MassPropertiesMethod,
+    /// Per-quantity exactness provenance (`Exact` / `Approximate{method,
+    /// bound}` / `Unavailable`). The load-bearing honesty contract: a caller
+    /// learns, for volume, centroid and inertia SEPARATELY, whether the number
+    /// is exact or an estimate and — if an estimate — its method and relative
+    /// error bound. The kernel never serves a mass-property number without it.
+    pub provenance: MassPropertiesProvenance,
 }
 
 /// Solid statistics
@@ -1145,6 +1237,29 @@ impl Solid {
                 principal_axes,
                 radius_of_gyration,
                 method: MassPropertiesMethod::Analytical,
+                // HONEST provenance for the legacy store-based path (off the
+                // served route): volume/COM come from a one-point-per-face
+                // divergence sum (exact only for planar faces, O(curvature)
+                // wrong otherwise); the inertia tensor is the shell-level
+                // BOUNDING-BOX rigid-body approximation (`Shell::compute_mass_
+                // properties`). It must NEVER be labelled Exact — that was the
+                // latent mislabel this campaign closed. The bound is 1.0 (up to
+                // 100% relative error) because a box guess for non-box geometry
+                // has no meaningful tight ceiling.
+                provenance: MassPropertiesProvenance {
+                    volume: Exactness::Approximate {
+                        method: MassPropMethod::AnalyticQuadrature,
+                        rel_error_bound: 1.0,
+                    },
+                    center_of_mass: Exactness::Approximate {
+                        method: MassPropMethod::AnalyticQuadrature,
+                        rel_error_bound: 1.0,
+                    },
+                    inertia: Exactness::Approximate {
+                        method: MassPropMethod::BoundingBox,
+                        rel_error_bound: 1.0,
+                    },
+                },
             });
         }
 

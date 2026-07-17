@@ -474,6 +474,7 @@ impl BRepModel {
             ],
             units: crate::readable::part::MassPropertiesUnits::canonical(),
             method: props.method,
+            provenance: props.provenance,
         })
     }
 

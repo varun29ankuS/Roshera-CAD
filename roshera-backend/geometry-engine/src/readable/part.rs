@@ -193,6 +193,16 @@ pub struct MassPropertiesReport {
     /// carries an empirical relative-tolerance bound the agent can use
     /// to decide whether to trust the tail digits.
     pub method: MassPropertiesMethod,
+    /// Per-quantity exactness provenance — the honesty contract. For volume,
+    /// centroid and inertia SEPARATELY, states whether the number is
+    /// [`crate::primitives::solid::Exactness::Exact`],
+    /// [`crate::primitives::solid::Exactness::Approximate`] (with the method
+    /// and a relative-error bound the agent can trust the value to within), or
+    /// [`crate::primitives::solid::Exactness::Unavailable`]. An untrimmed
+    /// polyhedron reports `Exact` throughout; a curved/trimmed solid reports
+    /// the mesh estimate honestly as `Approximate`. The kernel never serves a
+    /// mass-property number stripped of this verdict.
+    pub provenance: crate::primitives::solid::MassPropertiesProvenance,
 }
 
 /// Oriented bounding box returned by `BRepModel::oriented_bbox_for`.

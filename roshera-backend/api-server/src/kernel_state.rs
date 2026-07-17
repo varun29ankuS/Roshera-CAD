@@ -273,6 +273,16 @@ pub struct PropertiesResponse {
     pub radius_of_gyration: [f64; 3],
     /// Axis-aligned bounding box `[min, max]`.
     pub bounding_box: [[f64; 3]; 2],
+    /// How this report was computed (analytical face traversal vs. mesh
+    /// integration). Surfaced so a REST caller — like an MCP agent — can decide
+    /// whether to trust the tail digits, instead of receiving a bare tensor.
+    pub method: geometry_engine::primitives::solid::MassPropertiesMethod,
+    /// Per-quantity exactness provenance — the honesty contract. States, for
+    /// volume / centroid / inertia SEPARATELY, whether the value is `Exact`,
+    /// `Approximate { method, rel_error_bound }`, or `Unavailable`. Previously
+    /// the REST endpoint stripped this entirely and served the inertia tensor
+    /// as if it were truth; it is now always present.
+    pub provenance: geometry_engine::primitives::solid::MassPropertiesProvenance,
 }
 
 /// `GET /api/geometry/{id}/properties` — real mass properties via the
@@ -400,6 +410,8 @@ pub async fn solid_properties(
         principal_axes: props.principal_axes,
         radius_of_gyration: props.radius_of_gyration,
         bounding_box: bbox,
+        method: props.method,
+        provenance: props.provenance,
     }))
 }
 
