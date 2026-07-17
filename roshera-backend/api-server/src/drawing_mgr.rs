@@ -33,9 +33,10 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::drawing::{
-    project_solid_view, render_drawing_dxf, render_drawing_pdf, render_drawing_svg,
-    standard_drawing_auto, standard_drawing_hlr, verify_drawing, Drawing, DrawingId,
-    DrawingQualityReport, ProjectedViewId, ProjectionType, SheetSize, TitleBlock, ViewSource,
+    certify_drawing, project_solid_view, render_drawing_dxf, render_drawing_pdf,
+    render_drawing_svg, standard_drawing_auto, standard_drawing_hlr, verify_drawing, Drawing,
+    DrawingQualityReport, ProjectedViewId, ProjectionType, SheetReadbackCertificate, SheetSize,
+    TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use geometry_engine::primitives::snapshot::ModelSnapshot;
@@ -710,6 +711,87 @@ pub async fn drawing_quality(
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
     let guard = handle.read().await;
     Ok(Json(verify_drawing(&guard)))
+}
+
+// ── Semantic readback (campaign #55 Slice 2) ────────────────────────
+
+/// Response for `GET /api/drawings/{id}/semantic`: the queryable sheet MODEL
+/// (every provenance field restored in Slice 1) plus the readback certificate.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticDrawingResponse {
+    /// The full sheet model — views with provenance-bearing dimensions, hole
+    /// table with datum descriptors, section semantics, GD&T blocks with
+    /// `feature_pid`, and the structured notes.
+    pub drawing: Drawing,
+    /// The sheet readback certificate: per-fact provenance + live-checked
+    /// verdicts, and the embedded layout quality report.
+    pub certificate: SheetReadbackCertificate,
+}
+
+/// Re-certify a drawing against the LIVE model, off the model lock.
+///
+/// A drawing is a snapshot; the certificate re-measures the model NOW so a
+/// dimension whose feature moved reports `stale` and a consumed datum reports
+/// `dangling`. Mirrors `build_standard_drawing_off_lock`: take a brief read
+/// lock, deep-copy into a [`ModelSnapshot`], drop the guard, then run the
+/// (analytic, bounded) certification on a blocking thread so no lock is held
+/// and no async worker is starved.
+async fn certify_off_lock(
+    model_handle: Arc<RwLock<BRepModel>>,
+    drawing: Drawing,
+) -> Result<SheetReadbackCertificate, ApiError> {
+    let snap = {
+        let model = model_handle.read().await;
+        ModelSnapshot::take(&model)
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut owned = BRepModel::new();
+        snap.restore(&mut owned);
+        certify_drawing(&owned, &drawing)
+    })
+    .await
+    .map_err(|_| ApiError::new(ErrorCode::KernelError, "sheet certification task failed"))
+}
+
+/// `GET /api/drawings/{id}/certificate` — the sheet readback certificate only
+/// (a cheap poll): per-fact live-checked verdicts + the layout quality report,
+/// re-measured against the active model.
+pub async fn drawing_certificate(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SheetReadbackCertificate>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let drawing = {
+        let guard = handle.read().await;
+        guard.clone()
+    };
+    let cert = certify_off_lock(model_handle, drawing).await?;
+    Ok(Json(cert))
+}
+
+/// `GET /api/drawings/{id}/semantic` — the queryable sheet model + certificate.
+///
+/// This is the agent's certified readback surface for a Roshera sheet: the full
+/// provenance-bearing `Drawing` (so answers name PIDs / face ids / datums that
+/// feed straight back into `measure_faces` / `gdt_fcf` / `label_resolve`) plus
+/// the live-checked certificate. Never pixel inference — the sheet MODEL is the
+/// truth, and every numeric fact carries a re-measured verdict.
+pub async fn drawing_semantic(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SemanticDrawingResponse>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let drawing = {
+        let guard = handle.read().await;
+        guard.clone()
+    };
+    let certificate = certify_off_lock(model_handle, drawing.clone()).await?;
+    Ok(Json(SemanticDrawingResponse {
+        drawing,
+        certificate,
+    }))
 }
 
 /// Build a content-disposition value with a sanitised filename based on

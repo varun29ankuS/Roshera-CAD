@@ -8297,6 +8297,16 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/drawings/{id}/quality",
             get(drawing_mgr::drawing_quality),
         )
+        // Semantic readback (campaign #55 Slice 2): the queryable sheet model +
+        // live-checked certificate, and the certificate-only cheap poll.
+        .route(
+            "/api/drawings/{id}/semantic",
+            get(drawing_mgr::drawing_semantic),
+        )
+        .route(
+            "/api/drawings/{id}/certificate",
+            get(drawing_mgr::drawing_certificate),
+        )
         // Part documents — one per frontend tab. CRUD on the registry;
         // geometry/sketch endpoints continue to route through the
         // legacy `state.model` until P.2 wires per-part extraction.

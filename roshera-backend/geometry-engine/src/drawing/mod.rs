@@ -31,6 +31,7 @@ pub mod layout;
 pub mod pdf;
 pub mod projection;
 pub mod section_view;
+pub mod sheet_certificate;
 pub mod svg;
 pub mod types;
 pub mod verify;
@@ -48,10 +49,15 @@ pub use projection::{
     project_solid_edges, project_solid_view, view_matrix_for_projection, ProjectionError,
 };
 pub use section_view::section_view;
+pub use sheet_certificate::{
+    certify_drawing, LiveCheck, SheetFact, SheetFactKind, SheetReadbackCertificate, SheetVerdict,
+    VerdictCounts,
+};
 pub use svg::render_drawing_svg;
 pub use types::{
-    Drawing, DrawingId, PlacedDatumSymbol, PlacedFcfBlock, Polyline2d, ProjectedView,
-    ProjectedViewId, ProjectionType, ShadedRaster, SheetSize, TitleBlock, ViewExtent, ViewSource,
+    Drawing, DrawingId, GeneralTolerance, PlacedDatumSymbol, PlacedFcfBlock, Polyline2d,
+    ProjectedView, ProjectedViewId, ProjectionType, SectionSemantics, ShadedRaster, SheetSize,
+    TitleBlock, ViewExtent, ViewSource,
 };
 pub use verify::{verify_drawing, DrawingIssue, DrawingIssueKind, DrawingQualityReport, Severity};
 pub use visibility::{is_point_hidden, project_solid_edges_visibility, ViewEdges};
