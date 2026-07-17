@@ -27,23 +27,51 @@ integration). Nothing here is graded by an LLM.
 | `honesty`     | geometry the kernel *can't* build is flagged UNSOUND — no lie slips through  |
 | `performance` | wall-clock budgets (per scenario, and health-liveness under a heavy drawing) |
 
-## Corpus (v1)
+## Corpus
 
-| # | Scenario | Key oracles |
-|---|----------|-------------|
-| 01 | Spur gear m=2 z=16 + keyed bore | sound · χ=0 · 293 faces · vol≈5555.8 (shoelace cross-check) · mass≈0.0436 kg |
-| 02 | Rao-bell nozzle (revolve + wall 2) | sound · 4 faces · χ=0 · vol≈16309.7 · meridian section 320 mm² |
-| 03 | Injector plate (disk + 36 bores) | sound · χ=−70 (genus 36) · volume == analytic oracle |
-| 04 | Bulkhead (100×80×10 − 4 pockets) + fillet-all | pre-fillet vol=51200 exact · fillet-all graceful + sound |
-| 05 | Pocketed + bored block + fillet-all | pocket vol=56000 exact · χ=−6 · fillet-all sound |
-| 06 | Hub flange + GD&T + drawing | sound · χ=−12 · flatness/perp/position IN SPEC 0.00 · drawing quality passed |
-| 07 | STEP round-trip of the blended flange | re-import sound:true (blend surfaces survive AP242) |
-| 08 | Cross-bore saddle — **honesty canary** | kernel flags UNSOUND (a `sound:true` here would be a lie → FAIL) |
-| 09 | Gear four-view drawing | completes < 90 s · /health stays live under load · quality passed |
+| # | Scenario | Key oracles | Honesty probe |
+|---|----------|-------------|---------------|
+| 01 | Spur gear m=2 z=16 + keyed bore | sound · χ=0 · 293 faces · vol≈5555.8 (shoelace cross-check) · mass≈0.0436 kg | — |
+| 02 | Rao-bell nozzle (revolve + wall 2) | sound · 4 faces · χ=0 · vol≈16309.7 · meridian section 320 mm² | — |
+| 03 | Injector plate (disk + 36 bores) | sound · χ=−70 (genus 36) · volume == analytic oracle | — |
+| 04 | Bulkhead (100×80×10 − 4 pockets) + fillet-all | pre-fillet vol=51200 exact · fillet-all graceful + sound | — |
+| 05 | Pocketed + bored block + fillet-all | pocket vol=56000 exact · χ=−6 · fillet-all sound | — |
+| 06 | Hub flange + GD&T + drawing | sound · χ=−12 · flatness/perp/position IN SPEC 0.00 · drawing quality passed | — |
+| 07 | STEP round-trip of the blended flange | re-import sound:true (blend surfaces survive AP242) | — |
+| 08 | Cross-bore saddle (#35 slice-1 guard) | sound · volume == Steinmetz oracle | was the honesty canary; now a soundness tripwire |
+| 09 | Gear four-view drawing | completes < 90 s · /health stays live under load · quality passed | — |
+| 10 | Kinematic assembly — hinge + slider | solve · certify · drive · motion-stamped interference | floating part named · conflict WITNESSED · unbounded sweep REFUSES |
+| 11 | Certified sketch → TRUE cylindrical bore (#45) | converged · fully-constrained (0 DOF) · sound · χ=0 · analytic bore (0 sampled loops) · vol oracle | over-constrained sketch reported `Conflicting` with a witness, never silently "solved" |
+| 12 | Mass-properties provenance | box volume == closed form · cylinder vol == πr²h | a mesh estimate labelled `Approximate` (never `Exact`); the self-certified error bound must HOLD |
+| 13 | ε=1e-6 coincident-face union | χ=2 · vol == merged-block oracle · sound | `sound:true` may never mask open/non-manifold edges or orphan sliver faces |
+| 14 | Quadric SSI — cyl∘sphere bite + near-tangency | volume physically bounded · sound ⟹ genus-0 | unsound must NAME its defect; the near-tangency case REFUSES rather than faking a clean solid |
 
-The **saddle canary (08)** scores PASS by being honestly unsound — issue #35.
-When the analytic cyl∘cyl SSI lands, its expectation flips to `sound`; the
-scenario is the tripwire for that day (see the note in `scenarios/08-*.mjs`).
+### The honesty through-line
+
+Every honesty-bearing scenario ships a **pure oracle** (`export function
+oracle`) separated from its `run`, plus a dry-validation harness under
+`test/oracle-<nn>.mjs` that feeds the oracle an honest transcript and a set
+of single-mutation LIES and proves the oracle passes the truth and catches
+every lie — WITHOUT a live backend. A scenario that cannot be shown to catch
+a lie is not evidence. Run them all with `npm run test:oracle` (no server
+needed).
+
+The **saddle (08)** was the original honesty canary; #35 Slice 1 landed and
+it now guards the fix (sound + Steinmetz volume) — the tripwire fired. The
+**quadric-SSI scenario (14)** plays that role for the harder quadric cases:
+it does not hard-assert a magic volume the kernel may not yet produce, but it
+catches any FABRICATED verdict (impossible volume, `sound` over a broken
+shell, an unsound verdict that names no defect) and flips to a strict guard
+the day general cyl∘sphere SSI lands.
+
+### A note on scenario numbering
+
+Slot **10** is the kinematic-assembly scenario. The #55 drawing-comprehension
+scenario (certified semantic sheet readback) also reserved "scenario 10" in
+its spec — a latent collision. It is resolved here by assembly owning 10 (it
+shipped) and drawing-comprehension taking the next free slot when it is built;
+this wave's additions are appended cleanly at 11–14, with no two files sharing
+a number.
 
 ## Run it
 
@@ -77,9 +105,14 @@ roshera-eval/
     geom.mjs               deterministic profile generators + shoelace oracle
     builders.mjs           shared build recipes (extrude, drill, fillet-all, flange)
   scenarios/
-    01-gear.mjs ... 09-drawing-perf.mjs
+    01-gear.mjs ... 14-quadric-ssi-honesty.mjs
     index.mjs              the ordered corpus
+  test/
+    oracle-10.mjs ... oracle-14.mjs   dry validation of each honesty oracle
 ```
+
+`npm run test:oracle` runs every dry-validation harness (10–14) with no
+backend; `npm run eval` runs the live corpus.
 
 ## v2 direction
 
