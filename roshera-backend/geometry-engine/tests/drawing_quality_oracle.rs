@@ -57,6 +57,7 @@ fn rect_view(
         circles: Vec::new(),
         hidden_circles: Vec::new(),
         shaded_raster: None,
+        hatch_polylines: Vec::new(),
     }
 }
 
@@ -72,6 +73,8 @@ fn dim(label: &str, a: [f64; 2], b: [f64; 2]) -> Dimension2d {
         entities: Vec::new(),
         axis3: None,
         dir3: None,
+        pid: None,
+        datum: None,
     }
 }
 
@@ -96,6 +99,8 @@ fn dim_with_entities(
         entities,
         axis3: None,
         dir3: None,
+        pid: None,
+        datum: None,
     }
 }
 
@@ -574,6 +579,8 @@ fn dimension_label_collision_flagged() {
                 entities: Vec::new(),
                 axis3: None,
                 dir3: None,
+                pid: None,
+                datum: None,
             },
             Dimension2d {
                 id: "angle_b".to_string(),
@@ -586,6 +593,8 @@ fn dimension_label_collision_flagged() {
                 entities: Vec::new(),
                 axis3: None,
                 dir3: None,
+                pid: None,
+                datum: None,
             },
         ],
     ));
@@ -643,6 +652,8 @@ fn dimension_on_geometry_flagged() {
             entities: Vec::new(),
             axis3: None,
             dir3: None,
+            pid: None,
+            datum: None,
         }],
     ));
     let report = verify_drawing(&d);
@@ -1155,6 +1166,8 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         entities: Vec::new(),
         axis3: None,
         dir3: None,
+        pid: None,
+        datum: None,
     };
 
     let mut d = Drawing::new("TagCollision", SheetSize::A3);
@@ -1192,6 +1205,7 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         // View-space centre (60, −30) → sheet (160, 177).
         axial_centre: Some([60.0, -30.0]),
         face_entities: vec![99],
+        datum: None,
     }];
 
     let report = verify_drawing(&d);
@@ -1759,10 +1773,13 @@ fn ring_plate_section_shows_bore_voids() {
     );
     let mid = 0.5 * (sv.extent.min_x + sv.extent.max_x);
 
-    // Segment classification: outline = axis-parallel, hatch = 45°.
+    // Segment classification: outline = axis-parallel, hatch = 45°. Since
+    // campaign #55 Slice 1 the hatch lives in its own `hatch_polylines` vec
+    // (separated from the cut outline in `polylines`); chain both so this
+    // pre-existing classification still sees every section segment.
     let mut hatch_intervals: Vec<(f64, f64)> = Vec::new();
     let mut vertical_edges_x: Vec<f64> = Vec::new();
-    for pl in &sv.polylines {
+    for pl in sv.polylines.iter().chain(sv.hatch_polylines.iter()) {
         for pts in pl.points.windows(2) {
             let dx = pts[1][0] - pts[0][0];
             let dy = pts[1][1] - pts[0][1];
@@ -1914,6 +1931,8 @@ fn hole_table_on_dimension_text_fires_collision() {
         entities: Vec::new(),
         axis3: None,
         dir3: None,
+        pid: None,
+        datum: None,
     };
 
     let mut d = Drawing::new("TableCollision", SheetSize::A4);
@@ -1949,6 +1968,7 @@ fn hole_table_on_dimension_text_fires_collision() {
         is_through: true,
         axial_centre: Some([10.0, 10.0]),
         face_entities: vec![7],
+        datum: None,
     }];
 
     let report = verify_drawing(&d);
@@ -2981,6 +3001,7 @@ fn datum_symbol_colliding_with_view_label_flagged() {
         label: "A".to_string(),
         anchor: [187.0, 117.0],
         owner_view: 0,
+        feature_pid: None,
     });
 
     // ── Assert: verify_drawing must fire ViewLabelCollision ──────────────────
@@ -3198,6 +3219,7 @@ fn gdt_items_overlapping_each_other_without_view_label_flagged() {
         label: "A".to_string(),
         anchor: [180.0, 100.0],
         owner_view: 0,
+        feature_pid: None,
     });
 
     // Sym B: anchor=[180,100].  Candidate 1 collides with Sym A; candidates 2-5
@@ -3208,6 +3230,7 @@ fn gdt_items_overlapping_each_other_without_view_label_flagged() {
         label: "B".to_string(),
         anchor: [180.0, 100.0],
         owner_view: 0,
+        feature_pid: None,
     });
 
     let report = verify_drawing(&d);

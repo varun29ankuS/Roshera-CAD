@@ -37,7 +37,7 @@
 //! The SVG/DXF renderers ink those items directly; the quality verifier
 //! checks them like any other layout item.
 
-use crate::readable::DimensionRecord;
+use crate::readable::{DatumDescriptor, DimensionRecord};
 use serde::{Deserialize, Serialize};
 
 // ── Group tag letters ─────────────────────────────────────────────────────────
@@ -97,6 +97,13 @@ pub struct HoleSite {
     /// in the general dimension stack (`place_dimensions` tabled-position suppression).
     #[serde(default)]
     pub face_entities: Vec<u32>,
+    /// Reference datum the X/Y columns are measured from (campaign #55 Slice 1),
+    /// carried from the bore's `"position"` dimension records — pre-#55 the
+    /// corner the columns measured from existed on the sheet only as a
+    /// `DatumMarker` layout item, so a readback could not name it. `None` when
+    /// no position record carried a datum (e.g. a diagonal-axis bore).
+    #[serde(default)]
+    pub datum: Option<DatumDescriptor>,
 }
 
 // ── Group key ─────────────────────────────────────────────────────────────────
@@ -180,6 +187,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
         is_through: bool,
         depth_label: String,
         face_entities: Vec<u32>,
+        datum: Option<DatumDescriptor>,
     }
 
     let mut raw: Vec<RawSite> = Vec::new();
@@ -276,6 +284,11 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
         // placement filter can suppress tabled position dims.
         let face_entities = ents.clone();
 
+        // Reference datum for the X/Y columns (campaign #55 Slice 1): carried
+        // from any position record that names one. Position records emitted by
+        // `extract_dimensions` always carry a `part_corner` descriptor.
+        let datum = positions.iter().find_map(|p| p.datum.clone());
+
         raw.push(RawSite {
             key,
             diameter_mm,
@@ -287,6 +300,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             is_through,
             depth_label,
             face_entities,
+            datum,
         });
     }
 
@@ -348,6 +362,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             is_through: s.is_through,
             axial_centre: None, // filled by the drawing layer
             face_entities: s.face_entities.clone(),
+            datum: s.datum.clone(),
         });
     }
 
@@ -584,6 +599,8 @@ mod tests {
             entities: vec![1],
             axis3: None,
             dir3: None,
+            pid: None,
+            datum: None,
         }
     }
 

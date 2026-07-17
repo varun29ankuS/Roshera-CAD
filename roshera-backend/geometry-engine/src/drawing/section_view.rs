@@ -99,7 +99,12 @@ pub fn section_view(
         return None;
     }
 
+    // The cut OUTLINE (boundary of sectioned material) and the 45° HATCH
+    // (material texture) are kept in SEPARATE vecs (campaign #55 Slice 1): the
+    // outline is geometry a readback can answer about; the hatch is *evidence
+    // of material*, answered as such, never as geometry.
     let mut polylines: Vec<Polyline2d> = Vec::new();
+    let mut hatch: Vec<Polyline2d> = Vec::new();
     // Outline = edges used by exactly one triangle (the section boundary).
     for (a, b, c) in edge_count.values() {
         if *c == 1 {
@@ -140,14 +145,14 @@ pub fn section_view(
                     cur = Some((b0, e1.max(s1)));
                 }
                 Some((b0, b1)) => {
-                    polylines.push(Polyline2d::from_points(vec![[b0, b0 + c], [b1, b1 + c]]));
+                    hatch.push(Polyline2d::from_points(vec![[b0, b0 + c], [b1, b1 + c]]));
                     cur = Some((s0, s1));
                 }
                 None => cur = Some((s0, s1)),
             }
         }
         if let Some((b0, b1)) = cur {
-            polylines.push(Polyline2d::from_points(vec![[b0, b0 + c], [b1, b1 + c]]));
+            hatch.push(Polyline2d::from_points(vec![[b0, b0 + c], [b1, b1 + c]]));
         }
         c += HATCH_SPACING;
     }
@@ -174,6 +179,7 @@ pub fn section_view(
         circles: Vec::new(),
         hidden_circles: Vec::new(),
         shaded_raster: None,
+        hatch_polylines: hatch,
     })
 }
 

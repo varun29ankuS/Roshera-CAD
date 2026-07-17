@@ -278,7 +278,10 @@ fn emit_view_polylines(
     let s = view.scale;
     let tx = view.position_mm[0];
     let ty = view.position_mm[1];
-    for poly in &view.polylines {
+    // Cut outline + section hatch (campaign #55 Slice 1): the hatch now lives in
+    // its own vec but is still emitted to the DXF wireframe, so the DXF output is
+    // unchanged by the outline/hatch split.
+    for poly in view.polylines.iter().chain(view.hatch_polylines.iter()) {
         if poly.points.len() < 2 {
             continue;
         }
@@ -1063,6 +1066,7 @@ mod tests {
                 circles: Vec::new(),
                 hidden_circles: Vec::new(),
                 shaded_raster: None,
+                hatch_polylines: Vec::new(),
             });
         }
         let layers = assign_view_layers(&drawing.views);
@@ -1120,6 +1124,7 @@ mod tests {
                 circles: Vec::new(),
                 hidden_circles: Vec::new(),
                 shaded_raster: None,
+                hatch_polylines: Vec::new(),
             });
         }
 
@@ -1229,6 +1234,8 @@ mod tests {
                     entities: Vec::new(),
                     axis3: None,
                     dir3: None,
+                    pid: None,
+                    datum: None,
                 },
                 Dimension2d {
                     id: "h".to_string(),
@@ -1241,6 +1248,8 @@ mod tests {
                     entities: Vec::new(),
                     axis3: None,
                     dir3: None,
+                    pid: None,
+                    datum: None,
                 },
             ],
             centerlines: Vec::new(),
@@ -1248,6 +1257,7 @@ mod tests {
             circles: Vec::new(),
             hidden_circles: Vec::new(),
             shaded_raster: None,
+            hatch_polylines: Vec::new(),
         });
 
         let layout = compute_layout(&drawing);

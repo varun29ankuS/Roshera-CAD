@@ -274,6 +274,7 @@ pub fn project_solid_view(
         circles: Vec::new(),
         hidden_circles: Vec::new(),
         shaded_raster: None,
+        hatch_polylines: Vec::new(),
     })
 }
 

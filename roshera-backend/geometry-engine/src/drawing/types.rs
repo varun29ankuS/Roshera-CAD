@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::primitives::solid::SolidId;
+use crate::units::LengthUnit;
 
 /// Identifier for a top-level [`Drawing`] document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -267,6 +268,16 @@ pub struct ProjectedView {
     /// `#[serde(default)]` keeps older serialized drawings parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shaded_raster: Option<ShadedRaster>,
+    /// Section HATCH polylines in view-space mm (the 45° ISO 128 material
+    /// texture), kept SEPARATE from the cut OUTLINE which stays in
+    /// [`Self::polylines`]. Populated only for a SECTION view; empty for every
+    /// other view. This split (campaign #55 Slice 1) lets a semantic readback
+    /// distinguish "boundary of cut material" from "hatch texture" — a hatch
+    /// line answers as *evidence of material*, never as geometry.
+    /// `#[serde(default)]` keeps older serialized drawings (hatch merged into
+    /// `polylines`) parsing.
+    #[serde(default)]
+    pub hatch_polylines: Vec<Polyline2d>,
 }
 
 /// A deterministic shaded-solid raster that REPLACES the wireframe line work
@@ -438,6 +449,15 @@ pub struct PlacedDatumSymbol {
     pub anchor: [f64; 2],
     /// Index into `Drawing.views` of the view this annotation belongs to.
     pub owner_view: usize,
+    /// Hex-encoded `PersistentId` (`{:032x}`) of the datum FEATURE this symbol
+    /// designates — the durable link from the sheet ink back to the model
+    /// datum. Resolved at build time from the DRF's `Datum::feature` and kept
+    /// (campaign #55 Slice 1) so a semantic readback can re-resolve the datum
+    /// live (`consistent` when the PID still maps to a face, `dangling` when
+    /// the face was consumed). `None` on pre-#55 sheets. `#[serde(default)]`
+    /// keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub feature_pid: Option<String>,
 }
 
 /// A Feature Control Frame (FCF) placed on a drawing sheet.
@@ -470,6 +490,19 @@ pub struct PlacedFcfBlock {
     pub leader_to: Option<[f64; 2]>,
     /// Index into `Drawing.views` of the view this annotation belongs to.
     pub owner_view: usize,
+    /// Hex-encoded `PersistentId` (`{:032x}`) of the toleranced FEATURE this
+    /// FCF controls — same encoding as `AnnotationWire.feature_pid`. Resolved
+    /// at build time from the GD&T sidecar key and kept (campaign #55 Slice 1)
+    /// so a semantic readback can trace the ink back to its sidecar annotation
+    /// and the kernel's live GD&T verdict. `None` on pre-#55 sheets.
+    #[serde(default)]
+    pub feature_pid: Option<String>,
+    /// Index of this FCF's annotation within its feature's sidecar annotation
+    /// list (`GdtSidecar::annotations(feature)`), so a readback can address the
+    /// exact annotation when a feature carries several. `None` on pre-#55
+    /// sheets. `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub annotation_index: Option<usize>,
 }
 
 impl PlacedFcfBlock {
@@ -483,6 +516,80 @@ impl PlacedFcfBlock {
             s.push_str(d);
         }
         s
+    }
+}
+
+/// World-space cutting-plane semantics for a SECTION view (campaign #55
+/// Slice 1).
+///
+/// `attach_section_view` computes the world `(origin, normal)` of the cut and,
+/// pre-#55, discarded them — only the view-space `CuttingPlaneLine` ink and the
+/// `ProjectionType::Custom { rotation }` (rotation only, no origin) survived, so
+/// "what does SECTION A-A cut through?" was unanswerable. Storing the world
+/// plane lets a semantic readback re-derive the cut-through list against the
+/// LIVE model (analytic plane∩face classification) — and detect staleness when
+/// the model changed after the sheet was built.
+///
+/// Orientation invariant (shared with `section_view`): `normal` points OUT of
+/// the drawn section toward its viewer, so SECTION A-A is what you see looking
+/// along `−normal`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SectionSemantics {
+    /// World-space point ON the cutting plane.
+    pub origin: [f64; 3],
+    /// World-space cutting-plane normal (unit).
+    pub normal: [f64; 3],
+    /// Index into [`Drawing::views`] of the SECTION view this plane produced.
+    pub section_view_idx: usize,
+}
+
+/// Structured general-tolerance record (campaign #55 Slice 1).
+///
+/// The prose `tolerance_note` remains the render source; THIS record is the
+/// readback source — a structured tolerance a semantic query can APPLY to an
+/// otherwise-untoleranced dimension, explicitly labelled as *general* (never as
+/// a feature-specific tolerance). Linear tolerance is always carried in kernel
+/// millimetres regardless of the document unit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneralTolerance {
+    /// General linear tolerance in millimetres (± this value).
+    pub linear_mm: f64,
+    /// General angular tolerance in degrees (± this value).
+    pub angular_deg: f64,
+    /// The governing standard, e.g. `"ISO 2768-m"`. Empty when no standard
+    /// applies (the imperial convention carries no ISO 2768 class).
+    pub standard: String,
+}
+
+impl Default for GeneralTolerance {
+    fn default() -> Self {
+        Self {
+            linear_mm: 0.1,
+            angular_deg: 0.5,
+            standard: "ISO 2768-m".to_string(),
+        }
+    }
+}
+
+impl GeneralTolerance {
+    /// The general tolerance matching the prose built by [`Drawing::set_unit_notes`]
+    /// for a given document unit. Metric units carry the ISO 2768-m class
+    /// (±0.1 mm linear); imperial units carry ±0.004 in (≈0.1016 mm) with no
+    /// ISO 2768 class.
+    pub fn for_unit(unit: LengthUnit) -> Self {
+        match unit {
+            LengthUnit::Millimetre | LengthUnit::Centimetre | LengthUnit::Metre => Self {
+                linear_mm: 0.1,
+                angular_deg: 0.5,
+                standard: "ISO 2768-m".to_string(),
+            },
+            LengthUnit::Inch | LengthUnit::Foot => Self {
+                // 0.004 in expressed in kernel mm.
+                linear_mm: 0.004 * 25.4,
+                angular_deg: 0.5,
+                standard: String::new(),
+            },
+        }
     }
 }
 
@@ -550,6 +657,24 @@ pub struct Drawing {
     /// SKIPPED (no live feature → no sheet ink).
     #[serde(default)]
     pub fcf_blocks: Vec<PlacedFcfBlock>,
+    /// World cutting-plane semantics for the SECTION view (campaign #55
+    /// Slice 1). `Some` when a SECTION A-A was attached; `None` otherwise (and
+    /// on pre-#55 sheets, which stored only the view-space cutting-plane ink).
+    /// `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub section: Option<SectionSemantics>,
+    /// The document length unit this sheet was built in (campaign #55 Slice 1).
+    /// The prose `unit_note` remains the render source; this enum is the
+    /// readback source (the note strings do not parse cleanly). Defaults to
+    /// millimetres for pre-#55 sheets.
+    #[serde(default)]
+    pub document_unit: LengthUnit,
+    /// Structured general tolerance (campaign #55 Slice 1). The prose
+    /// `tolerance_note` remains the render source; this record is what a
+    /// semantic readback applies to untoleranced dimensions, explicitly as a
+    /// *general* tolerance. Defaults to ISO 2768-m (±0.1 mm) for pre-#55 sheets.
+    #[serde(default)]
+    pub general_tolerance: GeneralTolerance,
 }
 
 impl Drawing {
@@ -576,6 +701,9 @@ impl Drawing {
             cutting_plane_line: None,
             datum_symbols: Vec::new(),
             fcf_blocks: Vec::new(),
+            section: None,
+            document_unit: LengthUnit::default(),
+            general_tolerance: GeneralTolerance::default(),
         }
     }
 
@@ -614,7 +742,10 @@ impl Drawing {
     /// - cm: ±0.01 CM  (0.1 mm ÷ 10)
     /// - m:  ±0.0001 M (0.1 mm ÷ 1000)
     pub fn set_unit_notes(&mut self, unit: crate::units::LengthUnit) {
-        use crate::units::LengthUnit;
+        // Structured readback sources (campaign #55 Slice 1) kept in lock-step
+        // with the prose notes below.
+        self.document_unit = unit;
+        self.general_tolerance = GeneralTolerance::for_unit(unit);
         let unit_name = match unit {
             LengthUnit::Millimetre => "MILLIMETRES",
             LengthUnit::Centimetre => "CENTIMETRES",
@@ -645,5 +776,79 @@ impl Drawing {
                     .to_string()
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh drawing carries the campaign #55 structured readback sources with
+    /// sensible defaults.
+    #[test]
+    fn new_drawing_has_slice1_defaults() {
+        let d = Drawing::new("t", SheetSize::A3);
+        assert!(d.section.is_none());
+        assert_eq!(d.document_unit, LengthUnit::Millimetre);
+        assert_eq!(d.general_tolerance, GeneralTolerance::default());
+        assert!((d.general_tolerance.linear_mm - 0.1).abs() < 1e-12);
+    }
+
+    /// ADDITIVE SERDE GATE (campaign #55 Slice 1): a pre-#55 serialized drawing
+    /// — a wire payload with NONE of the new keys (`section`, `document_unit`,
+    /// `general_tolerance` on the drawing; `hatch_polylines` on the view; `pid`
+    /// / `datum` on the dimension) — must still deserialize, with every new
+    /// field defaulted. Old sheets must keep loading. The payload is hand-written
+    /// to exactly the pre-#55 shape rather than round-tripped, so it genuinely
+    /// exercises the missing-key path.
+    #[test]
+    fn pre_55_drawing_deserializes_with_defaults() {
+        let legacy_json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "legacy",
+            "sheet_size": "A3",
+            "views": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "FRONT",
+                "projection": { "kind": "front" },
+                "source": { "kind": "part", "part_id": "00000000-0000-0000-0000-000000000002", "solid_id": 0 },
+                "position_mm": [10.0, 10.0],
+                "scale": 1.0,
+                "polylines": [{ "points": [[0.0, 0.0], [1.0, 1.0]] }],
+                "extent": { "min_x": 0.0, "min_y": 0.0, "max_x": 1.0, "max_y": 1.0 },
+                "dimensions": [{
+                    "id": "d0", "kind": "length", "value": 40.0, "unit": "mm",
+                    "label": "40.00", "a": [0.0, 0.0], "b": [40.0, 0.0], "entities": [3]
+                }]
+            }]
+        }"#;
+
+        let back: Drawing =
+            serde_json::from_str(legacy_json).expect("pre-#55 drawing must deserialize");
+        assert!(back.section.is_none(), "section defaults to None");
+        assert_eq!(
+            back.document_unit,
+            LengthUnit::Millimetre,
+            "document_unit defaults to mm"
+        );
+        assert_eq!(
+            back.general_tolerance,
+            GeneralTolerance::default(),
+            "general_tolerance defaults to ISO 2768-m"
+        );
+        assert_eq!(back.views.len(), 1);
+        assert!(
+            back.views[0].hatch_polylines.is_empty(),
+            "hatch_polylines defaults to empty"
+        );
+        assert_eq!(back.views[0].dimensions.len(), 1);
+        assert!(
+            back.views[0].dimensions[0].pid.is_none(),
+            "dimension pid defaults to None"
+        );
+        assert!(
+            back.views[0].dimensions[0].datum.is_none(),
+            "dimension datum defaults to None"
+        );
     }
 }

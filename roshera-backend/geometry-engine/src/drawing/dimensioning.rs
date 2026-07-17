@@ -14,7 +14,7 @@ use super::types::ProjectionType;
 use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
-use crate::readable::extract_dimensions;
+use crate::readable::{extract_dimensions, DatumDescriptor};
 use serde::{Deserialize, Serialize};
 
 /// Per-phase drawing-build profiling, opt-in via the `ROSHERA_DRAW_PROFILE`
@@ -53,6 +53,19 @@ pub struct Dimension2d {
     /// (e.g. X 40.00 vs Y 40.00 on a cube).
     #[serde(default)]
     pub dir3: Option<[f64; 3]>,
+    /// Durable cross-session identity carried from `DimensionRecord::pid`
+    /// (campaign #55 Slice 1). `None` when the spanned entities have no
+    /// PersistentId (pre-PID solids, or ops that do not yet mint PID lineage) —
+    /// a semantic readback reports those as `unprovenanced`, never a fabricated
+    /// identity. `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub pid: Option<String>,
+    /// Reference datum carried from `DimensionRecord::datum` (campaign #55
+    /// Slice 1). `Some` only for `"position"` callouts, whose number is
+    /// meaningless without knowing what it is measured from. `None` for every
+    /// other kind. `#[serde(default)]` keeps older serialized drawings parsing.
+    #[serde(default)]
+    pub datum: Option<DatumDescriptor>,
 }
 
 impl Dimension2d {
@@ -114,6 +127,10 @@ pub fn auto_dimensions(
             // the cross-view dedup quantises components (×100), so a non-unit
             // vector would silently change hash keys.
             dir3: Some(unit3_or_zero(d.direction)),
+            // Provenance carried straight from the analytic record (campaign #55
+            // Slice 1) — previously discarded at this view boundary.
+            pid: d.pid,
+            datum: d.datum,
         });
     }
     out
@@ -1301,6 +1318,10 @@ pub(crate) fn attach_gdt_annotations(
                 label: datum.label.clone(),
                 anchor,
                 owner_view: view_idx,
+                // Durable link back to the datum feature (campaign #55 Slice 1):
+                // the same hex encoding as `AnnotationWire.feature_pid`. Lets a
+                // readback re-resolve the datum live instead of trusting the ink.
+                feature_pid: Some(format!("{:032x}", datum.feature.as_u128())),
             });
         }
     }
@@ -1387,7 +1408,7 @@ pub(crate) fn attach_gdt_annotations(
         let leader_to = view_to_sheet(vp[0], vp[1], view.position_mm, view.scale, sheet_h);
 
         // Build one PlacedFcfBlock per annotation on this feature.
-        for ann in annotations {
+        for (annotation_index, ann) in annotations.iter().enumerate() {
             let (glyph, tol_text, datum_labels) = match ann {
                 Annotation::Geometric(fcf) => {
                     let glyph = fcf.characteristic.iso_glyph().to_string();
@@ -1449,6 +1470,12 @@ pub(crate) fn attach_gdt_annotations(
                 anchor,
                 leader_to: Some(leader_to),
                 owner_view: view_idx,
+                // Durable link back to the toleranced feature + the exact
+                // sidecar annotation (campaign #55 Slice 1): the resolved
+                // identity `attach_gdt_annotations` previously discarded, so a
+                // readback can trace the ink to the kernel's live GD&T verdict.
+                feature_pid: Some(format!("{:032x}", feature_pid.as_u128())),
+                annotation_index: Some(annotation_index),
             });
         }
     }
@@ -2287,19 +2314,34 @@ pub(crate) fn attach_section_view(
     }
 
     // Add the section view (replace ISO on A4, append on A3+).
-    match rule {
+    let section_view_idx = match rule {
         SectionSlotRule::ReplaceIso => {
             // Replace index 3 (ISO) with the section.
             if drawing.views.len() > 3 {
                 drawing.views[3] = section_placed;
+                3
             } else {
                 drawing.views.push(section_placed);
+                drawing.views.len() - 1
             }
         }
         SectionSlotRule::FifthSlot => {
             drawing.views.push(section_placed);
+            drawing.views.len() - 1
         }
-    }
+    };
+
+    // Store the WORLD cutting plane (campaign #55 Slice 1). Pre-#55 the plane
+    // origin was computed here and thrown away — only the view-space
+    // `CuttingPlaneLine` ink and the `Custom { rotation }` (rotation only)
+    // survived, so "what does SECTION A-A cut through?" was unanswerable. With
+    // the plane stored, a readback derives the cut-through list against the LIVE
+    // model and detects staleness.
+    drawing.section = Some(super::types::SectionSemantics {
+        origin: [plane_origin.x, plane_origin.y, plane_origin.z],
+        normal: [cut_normal.x, cut_normal.y, cut_normal.z],
+        section_view_idx,
+    });
 }
 
 /// A cutting-plane line stored on the Drawing for the axial view.
@@ -2480,6 +2522,70 @@ mod tests {
         )
         .expect("drill");
         (m, part)
+    }
+
+    /// SLICE 1 GATE (campaign #55): a fully-built standard sheet of a bored
+    /// plate must carry the restored provenance — the world SECTION plane, a
+    /// hatch/outline SPLIT on the section view, and the reference datum on
+    /// position callouts. Pre-#55 all three were computed then discarded.
+    ///
+    /// Mutation proof: reverting `attach_section_view`'s `drawing.section = …`
+    /// write drops the plane (→ RED on `section.is_some()`); reverting the
+    /// section_view outline/hatch split leaves `hatch_polylines` empty (→ RED).
+    #[test]
+    fn built_sheet_carries_section_hatch_and_datum_provenance() {
+        let (m, part) = bored_plate_5mm();
+        let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("auto sheet");
+
+        // Section semantics: the world cutting plane is stored (not just the
+        // view-space ink), with a valid section-view index.
+        let sec = drawing
+            .section
+            .expect("SECTION A-A world plane must be stored");
+        assert!(
+            sec.section_view_idx < drawing.views.len(),
+            "section_view_idx must index a real view"
+        );
+        assert!(
+            sec.normal.iter().any(|c| c.abs() > 0.5),
+            "cutting-plane normal must be a real direction: {:?}",
+            sec.normal
+        );
+
+        // Outline / hatch split: the section view carries hatch polylines in the
+        // dedicated vec, separate from the cut outline in `polylines`.
+        let sec_view = &drawing.views[sec.section_view_idx];
+        assert!(
+            !sec_view.hatch_polylines.is_empty(),
+            "section view must carry a separated hatch"
+        );
+        assert!(
+            !sec_view.polylines.is_empty(),
+            "section view must still carry the cut outline in polylines"
+        );
+
+        // Datum provenance: the bore's position callouts carry their reference
+        // datum (the part-corner), no longer only a layout marker.
+        let has_datum_position = drawing.views.iter().any(|v| {
+            v.dimensions
+                .iter()
+                .any(|d| d.kind == "position" && d.datum.is_some())
+        });
+        assert!(
+            has_datum_position,
+            "a position callout must carry its reference datum"
+        );
+
+        // Structured readback sources exist on the sheet.
+        assert_eq!(
+            drawing.document_unit,
+            m.document_unit(),
+            "sheet document_unit mirrors the model"
+        );
+        assert!(
+            drawing.general_tolerance.linear_mm > 0.0,
+            "structured general tolerance populated"
+        );
     }
 
     #[test]

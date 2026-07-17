@@ -423,6 +423,25 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
         out.push_str("\" />\n");
     }
 
+    // Section HATCH (campaign #55 Slice 1): the 45° material texture, now kept
+    // in a vec separate from the cut outline. Rendered with the same stroke it
+    // had when it lived in `polylines`; the `hatch` class is attached for
+    // optional thinner styling and falls back to the default polyline stroke
+    // when no CSS rule matches, so the rendered output is unchanged.
+    for pl in &view.hatch_polylines {
+        if pl.points.len() < 2 {
+            continue;
+        }
+        out.push_str("    <polyline class=\"hatch\" points=\"");
+        for (i, p) in pl.points.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let _ = write!(out, "{:.4},{:.4}", p[0], p[1]);
+        }
+        out.push_str("\" />\n");
+    }
+
     // Analytic circles — true SVG circles (a circular edge facing the camera),
     // not faceted polylines. Drawn in the same scaled/flipped view group as the
     // polylines so the radius and centre scale identically.

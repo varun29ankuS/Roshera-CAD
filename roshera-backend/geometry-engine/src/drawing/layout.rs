@@ -1825,6 +1825,7 @@ mod tests {
             circles: Vec::new(),
             hidden_circles: Vec::new(),
             shaded_raster: None,
+            hatch_polylines: Vec::new(),
         }
     }
 
@@ -1919,6 +1920,8 @@ mod tests {
             entities: vec![9],
             axis3: None,
             dir3: None,
+            pid: None,
+            datum: None,
         }
     }
 
