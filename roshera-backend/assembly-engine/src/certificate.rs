@@ -14,6 +14,11 @@
 //! The kernel cannot return a `sound` assembly that doesn't assemble, self-
 //! collides through its motion, or is held together by joints that aren't there.
 
+use crate::constrainedness::{
+    analyze_at, AssemblyConstrainedness, ConflictWitness, EpsilonFact, EpsilonSpec, InstanceStatus,
+    MateFact, SolverVerdict,
+};
+use crate::decompose::{DecompositionStats, StructuralDofReport};
 use crate::joint::Joint;
 use crate::solver::Mobility;
 use crate::sweep::swept_clearance;
@@ -58,6 +63,35 @@ pub struct AssemblyCertificate {
     /// verdict. Serde-defaults to `true` so pre-Slice-2 payloads parse.
     #[serde(default = "default_true")]
     pub mates_enforced: bool,
+    // ── Certificate v2 (Slice 4, spec §3.5) — ADDITIVE wire fields: ────
+    // every field serde-defaults so pre-Slice-4 payloads keep parsing,
+    // and old clients simply ignore the new keys.
+    /// DOF verdict (fully / mobile / over-constrained / conflicting).
+    #[serde(default)]
+    pub constrainedness: Option<AssemblyConstrainedness>,
+    /// Diagnostic-solve verdict with the re-measured final residual.
+    #[serde(default)]
+    pub solver: Option<SolverVerdict>,
+    /// Per-mate facts (index = declaration order), ascending.
+    #[serde(default)]
+    pub mate_facts: Vec<MateFact>,
+    /// Per-instance constrainment with twist-decoded free motions.
+    #[serde(default)]
+    pub instance_statuses: Vec<InstanceStatus>,
+    /// Minimal (or honestly-flagged non-minimal) conflict witnesses.
+    #[serde(default)]
+    pub witnesses: Vec<ConflictWitness>,
+    /// Structural (Kutzbach) vs numeric (rank) DOF, dual-reported;
+    /// disagreement = `special_geometry`.
+    #[serde(default)]
+    pub structural: Option<StructuralDofReport>,
+    /// How the Slice-3 planner saw the certificate's solve.
+    #[serde(default)]
+    pub decomposition: Option<DecompositionStats>,
+    /// The ε the collision dimensions actually ran at, with provenance
+    /// (kernel floor / caller request) — the ε=0 default lie is dead.
+    #[serde(default)]
+    pub epsilon: Option<EpsilonFact>,
 }
 
 fn default_true() -> bool {
@@ -79,16 +113,40 @@ impl AssemblyCertificate {
 }
 
 impl Assembly {
-    /// Certify the assembly. The mate solve runs on a clone, and the static +
-    /// swept checks then run at that solved configuration — the pose the mates
-    /// actually produce, not the raw authored coordinates.
+    /// Legacy entry point: `epsilon` plays the kernel floor with no
+    /// separate caller request — byte-compatible behaviour for existing
+    /// callers, now with the v2 facts filled in.
     pub fn certify(&self, mechanisms: &[Mechanism], epsilon: f64) -> AssemblyCertificate {
+        self.certify_v2(
+            mechanisms,
+            EpsilonSpec {
+                kernel_floor: epsilon,
+                requested: None,
+            },
+        )
+    }
+
+    /// Certify the assembly (certificate v2, spec §3.5). The mate solve runs
+    /// on a clone through the Slice-3 decomposed pipeline, and the static +
+    /// swept checks then run at that solved configuration — the pose the mates
+    /// actually produce, not the raw authored coordinates. The collision
+    /// dimensions run at `max(kernel_floor, requested)` — ε is only ever
+    /// RAISABLE above the kernel-derived deviation bound, and the resolved
+    /// [`EpsilonFact`] rides the certificate.
+    pub fn certify_v2(
+        &self,
+        mechanisms: &[Mechanism],
+        epsilon: EpsilonSpec,
+    ) -> AssemblyCertificate {
         // A mate feature may float at most this far off its part before the
         // joint is judged fabricated (a constraint to a coordinate, not a part).
         const MATE_ANCHOR_TOL: f64 = 0.5;
         // A mated pair must close to within this gap or the joint is judged a
         // paper joint (parts coaxial-but-floating, not actually touching).
         const MATE_CONTACT_TOL: f64 = 0.25;
+
+        let epsilon_fact = epsilon.resolve();
+        let epsilon = epsilon_fact.effective;
 
         let fully_grounded = self.grounding_report().fully_grounded();
         // Anchoring is pose-independent (features are local), so it reads the
@@ -102,8 +160,17 @@ impl Assembly {
         // pipeline (condensation / DR-plan / verified dense fallback) —
         // same verdict contract, near-linear work on tree-like assemblies.
         let mut solved = self.clone();
-        let (solve_report, _decomposition) = solved.solve_decomposed();
+        let (solve_report, decomposition) = solved.solve_decomposed();
         let mates_consistent = solve_report.converged;
+
+        // Certificate v2: the full constrainedness analysis at the SAME
+        // diagnostic solve (witness oracle re-solves from the declared poses).
+        let analysis = analyze_at(
+            self,
+            &solved,
+            solve_report.final_residual_norm,
+            decomposition,
+        );
 
         let dof_report = solved.dof_analysis();
         let no_static_interference = solved.interference_report().no_static_interference();
@@ -137,6 +204,14 @@ impl Assembly {
             mates_anchored,
             mates_in_contact,
             mates_enforced,
+            constrainedness: Some(analysis.constrainedness),
+            solver: Some(analysis.solver),
+            mate_facts: analysis.mate_facts,
+            instance_statuses: analysis.instance_statuses,
+            witnesses: analysis.witnesses,
+            structural: Some(analysis.structural),
+            decomposition: Some(analysis.decomposition),
+            epsilon: Some(epsilon_fact),
         }
     }
 }

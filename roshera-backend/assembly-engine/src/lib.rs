@@ -18,6 +18,7 @@
 //! commodity collision/CCD engine underneath.
 
 pub mod certificate;
+pub mod constrainedness;
 pub mod decompose;
 pub mod grounding;
 pub mod interference;
@@ -33,6 +34,11 @@ pub mod sweep;
 pub mod types;
 
 pub use certificate::{AssemblyCertificate, Mechanism};
+pub use constrainedness::{
+    AssemblyConstrainedness, ConflictWitness, ConstrainednessAnalysis, EpsilonFact, EpsilonSpec,
+    InstanceConstrainment, InstanceStatus, MateFact, MateRole, SolverVerdict, TwistMotion,
+    WitnessKind, WitnessMate,
+};
 pub use decompose::{DecompositionStats, StructuralDofReport};
 pub use grounding::GroundingReport;
 pub use interference::{InterferencePair, InterferenceReport};

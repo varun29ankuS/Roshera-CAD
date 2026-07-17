@@ -1364,12 +1364,20 @@ async fn assembly_verify(
             .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, format!("mechanisms: {e}")))?,
         None => Vec::new(),
     };
-    let epsilon = payload
-        .get("epsilon")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let cert = assembly.certify(&mechanisms, epsilon);
+    // ε honesty (Slice 4, spec §2.5/§3.5): the collision dimensions run
+    // at max(kernel floor, request) — the floor is derived from the
+    // ACTUAL tessellation parameters used above (each mesh deviates
+    // ≤ chord_tolerance from its true surface). The old
+    // default-to-0.0 lie is dead; a caller may only RAISE ε, and the
+    // certificate records the resolved EpsilonFact.
+    let requested_epsilon = payload.get("epsilon").and_then(|v| v.as_f64());
+    let cert = assembly.certify_v2(
+        &mechanisms,
+        assembly_engine::EpsilonSpec {
+            kernel_floor: assembly_mates::kernel_epsilon_floor(&TessellationParams::default()),
+            requested: requested_epsilon,
+        },
+    );
     let grounding = assembly.grounding_report();
     // Where the constraint solve actually PLACES each part: the fixed ground
     // instance stays put, every other part is positioned by its mates relative
@@ -8157,6 +8165,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
             axum::routing::patch(assembly_mates::patch_mate).delete(assembly_mates::delete_mate),
         )
         .route("/api/assembly/{id}/solve", post(assembly_mates::solve))
+        .route("/api/assembly/{id}/certify", post(assembly_mates::certify))
+        .route("/api/assembly/{id}/dof", get(assembly_mates::dof))
         // Kernel assemblies — multi-part scenes, mates, solver,
         // exploded views, interference reports. Distinct from the
         // `/api/hierarchy/...` project-tree surface; see

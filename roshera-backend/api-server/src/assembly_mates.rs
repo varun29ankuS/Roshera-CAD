@@ -139,6 +139,11 @@ pub struct SolveResponse {
     pub mates: Vec<MateFact>,
     /// Solved world transform per instance (written back to the document).
     pub poses: Vec<PoseOut>,
+    /// Compact certificate verdict embedded in every solve response
+    /// (spec §3.7 — the agent never mutates blind). Additive fields.
+    pub constrainedness: Option<assembly_engine::AssemblyConstrainedness>,
+    /// Conflict witnesses by DOCUMENT mate id (empty when consistent).
+    pub witnesses: Vec<CertifyWitness>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -802,6 +807,8 @@ pub(crate) fn solve_core(
             rank: None,
             mates,
             poses: Vec::new(),
+            constrainedness: None,
+            witnesses: Vec::new(),
         });
     }
 
@@ -831,6 +838,12 @@ pub(crate) fn solve_core(
     }
     let enforcement = solved_engine.mate_enforcement_report();
     let dof = solved_engine.dof_analysis();
+    // The compact certificate verdict (spec §3.7): constrainedness +
+    // witnesses at the solved configuration, mapped onto document ids.
+    let analysis = solved_engine.analyze_constrainedness();
+    let doc_mate_ids: Vec<Uuid> = doc.mates().iter().map(|m| m.id.0).collect();
+    let compact_constrainedness = Some(analysis.constrainedness);
+    let compact_witnesses = wire_witnesses(&analysis.witnesses, &doc_mate_ids);
 
     let mates: Vec<MateFact> = doc
         .mates()
@@ -900,7 +913,399 @@ pub(crate) fn solve_core(
         rank: Some(dof.rank),
         mates,
         poses: poses_out,
+        constrainedness: compact_constrainedness,
+        witnesses: compact_witnesses,
     })
+}
+
+// ── Certificate v2 surface (Slice 4, spec §3.5/§3.7) ────────────────
+
+/// Kernel-derived ε floor for a tessellated mesh PAIR: each mesh's
+/// chords deviate at most `chord_tolerance` from the true surface, so a
+/// pairwise Parry distance can over-report true clearance by at most
+/// the SUM of the two bounds. Derived from the ACTUAL tessellation
+/// parameters in use — no free constants; callers may only RAISE ε
+/// above this (the ε=0 default lie of spec §2.5 is dead).
+pub(crate) fn kernel_epsilon_floor(
+    params: &geometry_engine::tessellation::TessellationParams,
+) -> f64 {
+    2.0 * params.chord_tolerance
+}
+
+/// Per-instance constrainment on the wire: the engine verdict with the
+/// over-constraining mates named by DOCUMENT id.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WireConstrainment {
+    FullyConstrained,
+    Mobile {
+        dof: usize,
+        /// Twist-decoded free motions ("rotates about axis A", "slides
+        /// along Z") — the agent's no-render DOF perception.
+        motions: Vec<assembly_engine::TwistMotion>,
+    },
+    OverConstrained {
+        via: Vec<Uuid>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CertifyInstanceStatus {
+    pub instance_id: Uuid,
+    pub constrainment: WireConstrainment,
+}
+
+/// A conflict witness on the wire: DOCUMENT mate ids + the honest
+/// minimality flag (QuickXplain contract — never fabricated).
+#[derive(Debug, Clone, Serialize)]
+pub struct CertifyWitness {
+    pub mates: Vec<Uuid>,
+    pub kind: assembly_engine::WitnessKind,
+    pub minimal: bool,
+    pub oracle_calls: usize,
+}
+
+/// Per-mate certified fact with anchor provenance (the durability rung
+/// each connector resolved through).
+#[derive(Debug, Clone, Serialize)]
+pub struct CertifyMateFact {
+    pub mate_id: Uuid,
+    pub kind: DocMateKind,
+    pub enforced: bool,
+    pub satisfied: bool,
+    pub residual: f64,
+    pub role: assembly_engine::MateRole,
+    pub provenance: [AnchorProvenance; 2],
+}
+
+#[derive(Debug, Serialize)]
+pub struct CertifyResponse {
+    /// False when the certificate REFUSED to run (stale anchors).
+    pub certified: bool,
+    pub refused_reason: Option<String>,
+    pub stale: Vec<StaleConnector>,
+    /// `certificate.is_sound()` — the single verdict.
+    pub sound: Option<bool>,
+    pub constrainedness: Option<assembly_engine::AssemblyConstrainedness>,
+    /// The ε the collision dimensions ran at, with provenance.
+    pub epsilon: Option<assembly_engine::EpsilonFact>,
+    /// The full engine certificate (v2 fields included).
+    pub certificate: Option<assembly_engine::AssemblyCertificate>,
+    pub mates: Vec<CertifyMateFact>,
+    pub instances: Vec<CertifyInstanceStatus>,
+    pub witnesses: Vec<CertifyWitness>,
+}
+
+/// The agent-readable DOF surface (GET …/dof): constrainedness +
+/// per-instance statuses, meshless — no collision dimensions.
+#[derive(Debug, Serialize)]
+pub struct DofResponse {
+    pub computed: bool,
+    pub refused_reason: Option<String>,
+    pub stale: Vec<StaleConnector>,
+    pub constrainedness: Option<assembly_engine::AssemblyConstrainedness>,
+    pub solver: Option<assembly_engine::SolverVerdict>,
+    pub structural: Option<assembly_engine::StructuralDofReport>,
+    pub decomposition: Option<assembly_engine::DecompositionStats>,
+    pub instances: Vec<CertifyInstanceStatus>,
+    pub witnesses: Vec<CertifyWitness>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CertifyRequest {
+    /// The grounded instance (defaults to the first instance).
+    pub ground: Option<Uuid>,
+    /// Requested ε — only honoured ABOVE the kernel floor.
+    pub epsilon: Option<f64>,
+}
+
+fn wire_witnesses(
+    witnesses: &[assembly_engine::ConflictWitness],
+    mate_ids: &[Uuid],
+) -> Vec<CertifyWitness> {
+    witnesses
+        .iter()
+        .map(|w| CertifyWitness {
+            mates: w
+                .mates
+                .iter()
+                .filter_map(|m| mate_ids.get(m.index).copied())
+                .collect(),
+            kind: w.kind,
+            minimal: w.minimal,
+            oracle_calls: w.oracle_calls,
+        })
+        .collect()
+}
+
+fn wire_instances(
+    statuses: &[assembly_engine::InstanceStatus],
+    instance_ids: &[Uuid],
+    mate_ids: &[Uuid],
+) -> Vec<CertifyInstanceStatus> {
+    statuses
+        .iter()
+        .filter_map(|s| {
+            let instance_id = instance_ids.get(s.instance.0 as usize).copied()?;
+            let constrainment = match &s.constrainment {
+                assembly_engine::InstanceConstrainment::FullyConstrained => {
+                    WireConstrainment::FullyConstrained
+                }
+                assembly_engine::InstanceConstrainment::Mobile { dof, motions } => {
+                    WireConstrainment::Mobile {
+                        dof: *dof,
+                        motions: motions.clone(),
+                    }
+                }
+                assembly_engine::InstanceConstrainment::OverConstrained { via } => {
+                    WireConstrainment::OverConstrained {
+                        via: via
+                            .iter()
+                            .filter_map(|&mi| mate_ids.get(mi).copied())
+                            .collect(),
+                    }
+                }
+            };
+            Some(CertifyInstanceStatus {
+                instance_id,
+                constrainment,
+            })
+        })
+        .collect()
+}
+
+/// Everything `finish_certify` needs, resolved UNDER the locks so the
+/// heavy certificate itself runs on an owned snapshot afterwards (the
+/// standing `autocert-perf-regression` rule: never certify sync under
+/// the write lock).
+pub(crate) struct PreparedCertify {
+    pub assembly: assembly_engine::Assembly,
+    pub instance_ids: Vec<Uuid>,
+    pub mate_ids: Vec<Uuid>,
+    pub kinds: Vec<DocMateKind>,
+    pub provenance: Vec<[AnchorProvenance; 2]>,
+}
+
+pub(crate) enum PrepareOutcome {
+    Ready(Box<PreparedCertify>),
+    /// Stale anchors — the certificate refuses (Holds|Stale contract).
+    Refused(Box<CertifyResponse>),
+}
+
+/// Resolve connectors, map mates, decompose poses, and (when
+/// `with_meshes`) tessellate each instance's part into its LOCAL-frame
+/// collision mesh.
+pub(crate) fn prepare_certify<F>(
+    model: &mut BRepModel,
+    resolve_part: F,
+    doc: &mut InstancedAssembly,
+    ground: Option<Uuid>,
+    with_meshes: bool,
+) -> Result<PrepareOutcome, ApiError>
+where
+    F: Fn(Uuid) -> Option<u32>,
+{
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let view = build_engine_view(model, doc, ground)?;
+    let provenance: Vec<[AnchorProvenance; 2]> = doc
+        .mates()
+        .iter()
+        .map(|m| {
+            let of = |cid| {
+                doc.connector(cid)
+                    .map(|c| c.anchor.provenance())
+                    .unwrap_or(AnchorProvenance::Raw)
+            };
+            [of(m.a), of(m.b)]
+        })
+        .collect();
+    let mate_ids: Vec<Uuid> = doc.mates().iter().map(|m| m.id.0).collect();
+    let kinds: Vec<DocMateKind> = doc.mates().iter().map(|m| m.kind.clone()).collect();
+
+    if !view.stale.is_empty() {
+        return Ok(PrepareOutcome::Refused(Box::new(CertifyResponse {
+            certified: false,
+            refused_reason: Some(format!(
+                "{} connector anchor(s) no longer resolve — a mate is never silently \
+                 re-anchored (Holds|Stale contract); re-anchor or delete the stale \
+                 connectors",
+                view.stale.len()
+            )),
+            stale: view.stale,
+            sound: None,
+            constrainedness: None,
+            epsilon: None,
+            certificate: None,
+            mates: Vec::new(),
+            instances: Vec::new(),
+            witnesses: Vec::new(),
+        })));
+    }
+
+    let params = TessellationParams::default();
+    let mut assembly = assembly_engine::Assembly::new(view.ground);
+    for (idx, pose) in view.poses.iter().enumerate() {
+        let mesh = if with_meshes {
+            let inst = doc
+                .instances()
+                .get(idx)
+                .ok_or_else(|| bad("instance list changed while preparing the certificate"))?;
+            let solid_id = resolve_part(inst.part_id).ok_or_else(|| {
+                bad(format!(
+                    "instance part {} does not resolve to a live solid",
+                    inst.part_id
+                ))
+            })?;
+            let solid = model
+                .solids
+                .get(solid_id)
+                .ok_or_else(|| bad(format!("kernel solid {solid_id} missing from the model")))?;
+            let tri = tessellate_solid(solid, model, &params);
+            assembly_engine::Mesh {
+                vertices: tri
+                    .vertices
+                    .iter()
+                    .map(|v| [v.position.x, v.position.y, v.position.z])
+                    .collect(),
+                triangles: tri.triangles.clone(),
+            }
+        } else {
+            assembly_engine::Mesh::default()
+        };
+        let mut instance = assembly_engine::Instance::new(pose.id, format!("i{}", pose.id.0), mesh);
+        instance.translation = pose.translation;
+        instance.rotation = pose.rotation;
+        assembly.add_instance(instance);
+    }
+    for m in &view.mates {
+        assembly.add_mate(m.clone());
+    }
+    Ok(PrepareOutcome::Ready(Box::new(PreparedCertify {
+        assembly,
+        instance_ids: view.instance_ids,
+        mate_ids,
+        kinds,
+        provenance,
+    })))
+}
+
+/// The heavy half: run certificate v2 on the prepared snapshot (no
+/// locks held) and map every fact onto document ids.
+pub(crate) fn finish_certify(
+    prepared: PreparedCertify,
+    requested_epsilon: Option<f64>,
+) -> CertifyResponse {
+    use geometry_engine::tessellation::TessellationParams;
+    let cert = prepared.assembly.certify_v2(
+        &[],
+        assembly_engine::EpsilonSpec {
+            kernel_floor: kernel_epsilon_floor(&TessellationParams::default()),
+            requested: requested_epsilon,
+        },
+    );
+    let mates: Vec<CertifyMateFact> = cert
+        .mate_facts
+        .iter()
+        .filter_map(|f| {
+            Some(CertifyMateFact {
+                mate_id: prepared.mate_ids.get(f.index).copied()?,
+                kind: prepared.kinds.get(f.index).cloned()?,
+                enforced: f.enforced,
+                satisfied: f.satisfied,
+                residual: f.residual,
+                role: f.role,
+                provenance: prepared
+                    .provenance
+                    .get(f.index)
+                    .copied()
+                    .unwrap_or([AnchorProvenance::Raw, AnchorProvenance::Raw]),
+            })
+        })
+        .collect();
+    let instances = wire_instances(
+        &cert.instance_statuses,
+        &prepared.instance_ids,
+        &prepared.mate_ids,
+    );
+    let witnesses = wire_witnesses(&cert.witnesses, &prepared.mate_ids);
+    CertifyResponse {
+        certified: true,
+        refused_reason: None,
+        stale: Vec::new(),
+        sound: Some(cert.is_sound()),
+        constrainedness: cert.constrainedness,
+        epsilon: cert.epsilon,
+        certificate: Some(cert),
+        mates,
+        instances,
+        witnesses,
+    }
+}
+
+/// Certify core (sync, testable without AppState): prepare + finish.
+pub(crate) fn certify_core<F>(
+    model: &mut BRepModel,
+    resolve_part: F,
+    doc: &mut InstancedAssembly,
+    ground: Option<Uuid>,
+    requested_epsilon: Option<f64>,
+) -> Result<CertifyResponse, ApiError>
+where
+    F: Fn(Uuid) -> Option<u32>,
+{
+    match prepare_certify(model, resolve_part, doc, ground, true)? {
+        PrepareOutcome::Refused(response) => Ok(*response),
+        PrepareOutcome::Ready(prepared) => Ok(finish_certify(*prepared, requested_epsilon)),
+    }
+}
+
+/// A stale-anchor refusal mapped onto the DOF surface.
+fn refused_dof(response: CertifyResponse) -> DofResponse {
+    DofResponse {
+        computed: false,
+        refused_reason: response.refused_reason,
+        stale: response.stale,
+        constrainedness: None,
+        solver: None,
+        structural: None,
+        decomposition: None,
+        instances: Vec::new(),
+        witnesses: Vec::new(),
+    }
+}
+
+/// The meshless constrainedness analysis on a prepared snapshot (no
+/// collision dimensions), mapped onto document ids.
+fn finish_dof(prepared: PreparedCertify) -> DofResponse {
+    let analysis = prepared.assembly.analyze_constrainedness();
+    DofResponse {
+        computed: true,
+        refused_reason: None,
+        stale: Vec::new(),
+        constrainedness: Some(analysis.constrainedness),
+        solver: Some(analysis.solver),
+        structural: Some(analysis.structural),
+        decomposition: Some(analysis.decomposition),
+        instances: wire_instances(
+            &analysis.instance_statuses,
+            &prepared.instance_ids,
+            &prepared.mate_ids,
+        ),
+        witnesses: wire_witnesses(&analysis.witnesses, &prepared.mate_ids),
+    }
+}
+
+/// DOF core (sync, testable without AppState): prepare + finish.
+pub(crate) fn dof_core(
+    model: &mut BRepModel,
+    doc: &mut InstancedAssembly,
+    ground: Option<Uuid>,
+) -> Result<DofResponse, ApiError> {
+    match prepare_certify(model, |_| None, doc, ground, false)? {
+        PrepareOutcome::Refused(response) => Ok(refused_dof(*response)),
+        PrepareOutcome::Ready(prepared) => Ok(finish_dof(*prepared)),
+    }
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -1063,6 +1468,60 @@ pub async fn solve(
             .record_event(op_solve(id, &response.poses));
     }
     Ok(Json(response))
+}
+
+/// `POST /api/assembly/{id}/certify` — assembly certificate v2 on the
+/// document (Slice 4). Read-only (no events); the connector resolution
+/// and tessellation happen under the locks, the HEAVY certificate runs
+/// afterwards on the owned snapshot (standing `autocert-perf` rule).
+pub async fn certify(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
+    Path(id): Path<Uuid>,
+    body: Option<Json<CertifyRequest>>,
+) -> Result<Json<CertifyResponse>, ApiError> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let handle = state
+        .instanced_assemblies
+        .get(&id)
+        .ok_or_else(|| assembly_not_found(id))?;
+    let prepared = {
+        let mut doc = handle.write().await;
+        let mut model = model_handle.write().await;
+        prepare_certify(
+            &mut model,
+            |part| state.get_local_id(&part),
+            &mut doc,
+            req.ground,
+            true,
+        )?
+    }; // locks dropped — certify runs on the snapshot
+    match prepared {
+        PrepareOutcome::Refused(response) => Ok(Json(*response)),
+        PrepareOutcome::Ready(prepared) => Ok(Json(finish_certify(*prepared, req.epsilon))),
+    }
+}
+
+/// `GET /api/assembly/{id}/dof` — the agent-readable constrainedness
+/// surface: verdict + per-instance twist-decoded motions, meshless.
+pub async fn dof(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
+    Path(id): Path<Uuid>,
+) -> Result<Json<DofResponse>, ApiError> {
+    let handle = state
+        .instanced_assemblies
+        .get(&id)
+        .ok_or_else(|| assembly_not_found(id))?;
+    let prepared = {
+        let mut doc = handle.write().await;
+        let mut model = model_handle.write().await;
+        prepare_certify(&mut model, |_| None, &mut doc, None, false)?
+    }; // locks dropped — the analysis runs on the snapshot
+    match prepared {
+        PrepareOutcome::Refused(response) => Ok(Json(refused_dof(*response))),
+        PrepareOutcome::Ready(prepared) => Ok(Json(finish_dof(*prepared))),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1741,5 +2200,241 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Certificate v2 surface (Slice 4) ────────────────────────────
+
+    /// Boss + bracket, with the bracket mated to the host by TWO
+    /// raw-frame Fastened mates implying DIFFERENT seats (z=+4 and
+    /// z=+9) — a planted contradiction at the document level.
+    fn conflicted_rig() -> (Rig, Uuid, Uuid) {
+        let mut rig = boss_and_bracket();
+        let parts = rig.parts.clone();
+        let mut mk_frame = |rig: &mut Rig, instance: Uuid, origin: [f64; 3]| {
+            let conn = create_connector_core(
+                &mut rig.model,
+                |p| parts.get(&p).copied(),
+                &mut rig.doc,
+                &CreateConnectorRequest {
+                    instance_id: instance,
+                    face: None,
+                    frame: Some(FrameSpec {
+                        origin,
+                        z_axis: [0.0, 0.0, 1.0],
+                        x_axis: [1.0, 0.0, 0.0],
+                    }),
+                },
+            );
+            match conn {
+                Ok(c) => c.id.0,
+                Err(e) => {
+                    assert!(false, "raw connector must be accepted: {e:?}");
+                    Uuid::nil()
+                }
+            }
+        };
+        let host = rig.host_instance;
+        let bracket = rig.bracket_instance;
+        let h1 = mk_frame(&mut rig, host, [0.0, 0.0, 4.0]);
+        let b1 = mk_frame(&mut rig, bracket, [0.0, 0.0, 0.0]);
+        let h2 = mk_frame(&mut rig, host, [0.0, 0.0, 9.0]);
+        let b2 = mk_frame(&mut rig, bracket, [0.0, 0.0, 0.0]);
+        let mut mk_mate = |rig: &mut Rig, a: Uuid, b: Uuid| -> Uuid {
+            let mate = create_mate_core(
+                &mut rig.model,
+                &mut rig.doc,
+                &CreateMateRequest {
+                    kind: DocMateKind::Fastened,
+                    a,
+                    b,
+                    couples: None,
+                },
+            );
+            match mate {
+                Ok(m) => m.id.0,
+                Err(e) => {
+                    assert!(false, "fastened mate must be accepted: {e:?}");
+                    Uuid::nil()
+                }
+            }
+        };
+        let m1 = mk_mate(&mut rig, h1, b1);
+        let m2 = mk_mate(&mut rig, h2, b2);
+        (rig, m1, m2)
+    }
+
+    #[test]
+    fn certify_core_names_the_minimal_conflict_witness_by_mate_id() {
+        // Slice-4 gate: the planted contradictory pair must come back as
+        // a MINIMAL 2-mate witness carrying DOCUMENT mate ids — the
+        // agent's actionable fact ("suppress one of THESE two"), never a
+        // bare "residual stayed high" shrug.
+        let (mut rig, m1, m2) = conflicted_rig();
+        let parts = rig.parts.clone();
+        let host = rig.host_instance;
+        let response = certify_core(
+            &mut rig.model,
+            |p| parts.get(&p).copied(),
+            &mut rig.doc,
+            Some(host),
+            None,
+        );
+        let Ok(response) = response else {
+            unreachable!("certify must run: {response:?}");
+        };
+        assert!(response.certified, "{response:?}");
+        assert_eq!(
+            response.sound,
+            Some(false),
+            "a conflicted assembly is UNSOUND"
+        );
+        assert_eq!(response.witnesses.len(), 1, "{:?}", response.witnesses);
+        let w = &response.witnesses[0];
+        assert_eq!(w.mates, vec![m1, m2], "witness names the DOC mates");
+        assert!(w.minimal, "QuickXplain completed: {w:?}");
+        assert!(w.oracle_calls <= 128);
+        let cert = response.certificate.as_ref();
+        let Some(cert) = cert else {
+            unreachable!("certificate rides the response");
+        };
+        assert!(matches!(
+            cert.constrainedness,
+            Some(assembly_engine::AssemblyConstrainedness::Conflicting { .. })
+        ));
+        // Per-mate facts carry roles + anchor provenance.
+        assert_eq!(response.mates.len(), 2);
+        for fact in &response.mates {
+            assert_eq!(fact.role, assembly_engine::MateRole::Conflicting);
+            assert_eq!(
+                fact.provenance,
+                [AnchorProvenance::Raw, AnchorProvenance::Raw]
+            );
+        }
+    }
+
+    #[test]
+    fn certify_epsilon_is_kernel_derived_never_zero() {
+        // Slice-4 gate: the ε=0 interference default DIES. With no caller
+        // ε the certificate runs at the kernel floor derived from the
+        // ACTUAL tessellation parameters; a below-floor request clamps UP.
+        let floor =
+            kernel_epsilon_floor(&geometry_engine::tessellation::TessellationParams::default());
+        assert!(floor > 0.0, "the floor is a real deviation bound");
+
+        let mut rig = boss_and_bracket();
+        label_and_mate(&mut rig);
+        let parts = rig.parts.clone();
+        let host = rig.host_instance;
+        let response = certify_core(
+            &mut rig.model,
+            |p| parts.get(&p).copied(),
+            &mut rig.doc,
+            Some(host),
+            None,
+        );
+        let Ok(response) = response else {
+            unreachable!("certify must run: {response:?}");
+        };
+        let eps = response.epsilon;
+        let Some(eps) = eps else {
+            unreachable!("ε fact must ride the response");
+        };
+        assert_eq!(eps.effective, floor, "no request → the kernel floor");
+        assert_eq!(eps.requested, None);
+        assert!(!eps.raised_by_caller);
+
+        // A below-floor request is clamped UP and recorded verbatim.
+        let clamped = certify_core(
+            &mut rig.model,
+            |p| parts.get(&p).copied(),
+            &mut rig.doc,
+            Some(host),
+            Some(floor / 10.0),
+        );
+        let Ok(clamped) = clamped else {
+            unreachable!("certify must run: {clamped:?}");
+        };
+        let eps = clamped.epsilon;
+        let Some(eps) = eps else {
+            unreachable!("ε fact must ride the response");
+        };
+        assert_eq!(eps.effective, floor, "sub-floor request clamped UP");
+        assert_eq!(eps.requested, Some(floor / 10.0));
+        assert!(!eps.raised_by_caller);
+    }
+
+    #[test]
+    fn dof_core_reports_twist_decoded_instance_motions() {
+        // The agent-readable DOF surface: the bracket on a cylindrical
+        // mate reports Mobile{2} with a rotation about the boss axis and
+        // a slide along it — named motions, no rendering required.
+        let mut rig = boss_and_bracket();
+        label_and_mate(&mut rig);
+        let host = rig.host_instance;
+        let solved = solve_core(&mut rig.model, &mut rig.doc, Some(host));
+        assert!(solved.is_ok(), "{solved:?}");
+        let response = dof_core(&mut rig.model, &mut rig.doc, Some(host));
+        let Ok(response) = response else {
+            unreachable!("dof must run: {response:?}");
+        };
+        assert!(response.computed, "{response:?}");
+        assert!(matches!(
+            response.constrainedness,
+            Some(assembly_engine::AssemblyConstrainedness::Mobile { dof: 2 })
+        ));
+        let bracket = response
+            .instances
+            .iter()
+            .find(|s| s.instance_id == rig.bracket_instance)
+            .cloned();
+        let Some(bracket) = bracket else {
+            unreachable!("bracket status present");
+        };
+        let WireConstrainment::Mobile { dof, motions } = &bracket.constrainment else {
+            unreachable!("bracket is the mobile side: {bracket:?}");
+        };
+        assert_eq!(*dof, 2);
+        let has_rotation = motions.iter().any(|m| {
+            matches!(m, assembly_engine::TwistMotion::RotationAbout { axis, .. }
+                if axis[2].abs() > 1.0 - 1e-6)
+        });
+        let has_slide = motions.iter().any(|m| {
+            matches!(m, assembly_engine::TwistMotion::TranslationAlong { direction }
+                if direction[2].abs() > 1.0 - 1e-6)
+        });
+        assert!(
+            has_rotation && has_slide,
+            "cylindrical = spin about z + slide along z: {motions:?}"
+        );
+    }
+
+    #[test]
+    fn solve_response_embeds_the_compact_certificate() {
+        // Spec §3.7: every solve response carries the compact verdict —
+        // the agent can never mutate blind.
+        let mut rig = boss_and_bracket();
+        label_and_mate(&mut rig);
+        let host = rig.host_instance;
+        let response = solve_core(&mut rig.model, &mut rig.doc, Some(host));
+        let Ok(response) = response else {
+            unreachable!("solve must run: {response:?}");
+        };
+        assert!(matches!(
+            response.constrainedness,
+            Some(assembly_engine::AssemblyConstrainedness::Mobile { dof: 2 })
+        ));
+        assert!(response.witnesses.is_empty(), "healthy mate, no conflicts");
+
+        // And a conflicted document carries its witness right in the
+        // solve response.
+        let (mut conflicted, m1, m2) = conflicted_rig();
+        let chost = conflicted.host_instance;
+        let response = solve_core(&mut conflicted.model, &mut conflicted.doc, Some(chost));
+        let Ok(response) = response else {
+            unreachable!("solve must run: {response:?}");
+        };
+        assert_eq!(response.converged, Some(false));
+        assert_eq!(response.witnesses.len(), 1);
+        assert_eq!(response.witnesses[0].mates, vec![m1, m2]);
     }
 }
