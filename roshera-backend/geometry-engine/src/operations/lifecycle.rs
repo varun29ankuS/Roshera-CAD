@@ -882,6 +882,28 @@ fn validate_corner_compatibility(
                       value is recorded for this vertex kind)"
                     .to_string(),
             };
+            // A `Mixed` (mixed-CONVEXITY) vertex — a convex blend edge and a
+            // concave blend edge meeting — is the N-sided Gregory case, and a
+            // *feasible* setback does not make it synthesizable: no single
+            // sphere/plane is tangent to both convexities. It must NOT be
+            // advised toward the `partial_corner_vertices` route, which is the
+            // mixed-KIND (fillet+chamfer, same convexity) opt-in and does not
+            // apply here. Route it to the Gregory/S-patch remainder message so
+            // the honest refusal is also an *accurate* one.
+            if matches!(vertex_kind, Some(BlendVertexKind::Mixed)) {
+                return Err(OperationError::NotImplemented(format!(
+                    "Edges {} and {} share corner vertex {} with MIXED convexity \
+                     (a convex blend edge and a concave blend edge meet here). {}, \
+                     but a feasible setback does not make this corner synthesizable: \
+                     no single sphere/plane is tangent to both convexities. \
+                     Mixed-convexity corners require an N-sided Gregory / GB-patch \
+                     corner blend (Charrot-Gregory 1984; Vaitkus-Várady-Salvi \
+                     GB-patches, CAGD 2018) — not yet implemented (Task #82 / F5) — \
+                     and the `partial_corner_vertices` mixed-KIND route does NOT \
+                     apply to a mixed-convexity corner.",
+                    ei, ej, vertex, feasibility
+                )));
+            }
             // D-1 (dogfood-diag-api-blend, divergence site #1): this
             // message previously advised "apply each edge in a separate
             // fillet/chamfer call" — which is EXACTLY the corrupting
