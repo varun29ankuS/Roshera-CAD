@@ -325,8 +325,18 @@ async fn replay_session_to_model(
         branch = %branch_id,
         events_applied = outcome.events_applied,
         events_skipped = outcome.events_skipped,
+        assemblies_rebuilt = outcome.assemblies.len(),
         "BRepModel reconciled with session timeline position"
     );
+
+    // 4b. Assemblies are event-sourced too (kinematic-assembly campaign,
+    //     Slice 1): the replayed `assembly.*` events rebuilt the
+    //     instanced-assembly documents into `outcome.assemblies`. The live
+    //     registry is reconciled to exactly that state — the event log is
+    //     the source of truth for assemblies just as it is for the model.
+    state
+        .instanced_assemblies
+        .replace_all(outcome.assemblies.assemblies.clone());
 
     // 5. Build the resurrection table from skipped events' tombstones.
     //
@@ -1812,6 +1822,24 @@ pub async fn scrub_timeline(
         }));
     }
 
+    // Assembly documents as of this event — replay rebuilds them alongside
+    // the scratch model (assemblies are event-sourced, kinematic-assembly
+    // campaign Slice 1). Compact projection; the full assembly scrub
+    // surface is campaign Slice 6.
+    let assemblies: Vec<serde_json::Value> = outcome
+        .assemblies
+        .assemblies
+        .values()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "name": a.name,
+                "instance_count": a.instance_count(),
+                "unique_part_count": a.unique_part_count(),
+            })
+        })
+        .collect();
+
     Ok(Json(serde_json::json!({
         "branch": branch_ref,
         "at_sequence": sequence,
@@ -1819,5 +1847,6 @@ pub async fn scrub_timeline(
         "events_applied": outcome.events_applied,
         "events_skipped": outcome.events_skipped,
         "objects": objects,
+        "assemblies": assemblies,
     })))
 }

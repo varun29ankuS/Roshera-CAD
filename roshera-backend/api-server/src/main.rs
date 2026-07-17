@@ -7702,10 +7702,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>,
         )),
         // Positioned-instance assemblies (#19). Reference-only, no
-        // geometry copy, no recorder bridge needed — the instance list
-        // is pure scene data composited against the active model at
-        // render time. See assembly_instances.rs.
-        instanced_assemblies: Arc::new(assembly_instances::InstancedAssemblyManager::new()),
+        // geometry copy. Shares the same `TimelineRecorder` as the
+        // BRepModel so `assembly.*` events land on the active branch and
+        // timeline replay rebuilds the documents (assemblies are
+        // event-sourced — kinematic-assembly campaign, Slice 1). See
+        // assembly_instances.rs.
+        instanced_assemblies: Arc::new(
+            assembly_instances::InstancedAssemblyManager::with_recorder(timeline_recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>),
+        ),
         // Drawings share the same timeline recorder so view-add /
         // view-remove events land on the active branch alongside
         // every other kernel mutation. See drawing_mgr.rs.

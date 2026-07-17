@@ -40,6 +40,15 @@ use uuid::Uuid;
 pub mod instancing;
 pub use instancing::{Instance, InstanceId, InstancedAssembly};
 
+/// Mate connectors + the document-level mate taxonomy (kinematic-assembly
+/// campaign): frames bound to PLACES via the PID/label/fingerprint/raw
+/// durability ladder, and one-mate-per-joint declarations over them.
+pub mod mates;
+pub use mates::{
+    AnchorProvenance, ConnectorAnchor, ConnectorFrame, DocMate, DocMateId, DocMateKind,
+    MateConnector, MateConnectorId,
+};
+
 /// Unique identifier for assembly components
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComponentId(pub Uuid);
@@ -731,27 +740,14 @@ impl Assembly {
         }
     }
 
-    /// Check for interferences between components
-    pub fn check_interferences(&self) -> Vec<(ComponentId, ComponentId)> {
-        let mut interferences = Vec::new();
-        let components: Vec<_> = self.components.iter().map(|c| c.clone()).collect();
-
-        for i in 0..components.len() {
-            for j in (i + 1)..components.len() {
-                if self.components_interfere(&components[i], &components[j]) {
-                    interferences.push((components[i].id, components[j].id));
-                }
-            }
-        }
-
-        interferences
-    }
-
-    /// Check if two components interfere
-    fn components_interfere(&self, _comp1: &Component, _comp2: &Component) -> bool {
-        // Not yet implemented — requires bounding box computation + boolean intersection
-        false
-    }
+    // NOTE (kinematic-assembly campaign, Slice 1): `check_interferences` /
+    // `components_interfere` were REMOVED from this legacy surface. The pair
+    // was a stub that could never report an interference (the #44 silent-0
+    // lie class); the REST route `/api/assemblies/{id}/interferences` now
+    // delegates to the assembly-engine's certified interference machinery
+    // (see api-server `assembly_mgr::interference_pairs`). This whole
+    // mate-centric assembly retires once the instanced surface reaches mate
+    // parity (spec 2026-07-16 §3.1).
 
     /// Get iterator over components
     pub fn components(
@@ -3224,18 +3220,10 @@ mod tests {
         );
     }
 
-    // ---------- Interferences / bounding box ----------
-
-    #[test]
-    fn check_interferences_returns_empty_for_isolated_parts() {
-        // The current implementation stubs `components_interfere` to
-        // false; pin the contract so we'll catch a real impl regression.
-        let mut a = Assembly::new("int");
-        a.add_part(Arc::new(BRepModel::new()), "p1");
-        a.add_part(Arc::new(BRepModel::new()), "p2");
-        let v = a.check_interferences();
-        assert!(v.is_empty());
-    }
+    // ---------- Bounding box ----------
+    // (The `check_interferences` stub and its pin were removed with the
+    // Slice-1 lie fix — real interference lives in the assembly-engine,
+    // reached via the api-server route.)
 
     #[test]
     fn get_bounding_box_none_for_empty_assembly() {

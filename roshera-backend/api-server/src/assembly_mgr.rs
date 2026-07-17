@@ -1,5 +1,18 @@
 //! Assembly module — kernel `Assembly` exposed over REST.
 //!
+//! # DEPRECATED SURFACE (kinematic-assembly campaign, 2026-07-16 spec §3.1)
+//!
+//! This mate-centric surface (`/api/assemblies/*`) RETIRES once the
+//! instanced document (`/api/assembly/*`, `assembly_instances.rs`) reaches
+//! mate parity: it copies geometry per component, its Gauss-Seidel solver
+//! has no rank analysis, and its 12-mate taxonomy is subsumed by the
+//! connector-frame taxonomy (`geometry_engine::assembly::mates`). Parity
+//! notes: interference already delegates to the assembly-engine (the
+//! Slice-1 lie fix — see [`interference_pairs`]); mates/solve land on the
+//! B surface in Slice 2; `ExplodedViewConfig` is the one piece worth
+//! porting as a *view* op. Until then the routes stay live for existing
+//! clients; do not grow this surface.
+//!
 //! # Why this lives in api-server, not session-manager
 //!
 //! `session-manager::HierarchyManager` already owns the project-tree
@@ -871,17 +884,80 @@ pub async fn explode(
     Ok(Json(cfg))
 }
 
+/// Pairwise component interference for the legacy assembly surface —
+/// delegated to the assembly-engine's certified machinery (convexity gate →
+/// VHACD convex decomposition → exact-hull EPA contact, with winding-
+/// independent ray-parity enclosure so a peg seated in a through-bore stays
+/// clear). This replaced the kernel-side `components_interfere` stub that
+/// could NEVER report an interference (the #44 silent-0 lie class; killed
+/// in the kinematic-assembly campaign, Slice 1).
+///
+/// Each component's solids are tessellated at default quality and BAKED to
+/// world by the component transform (identity engine poses), so a general
+/// affine component transform is honoured exactly as placed.
+pub(crate) fn interference_pairs(assembly: &Assembly) -> Vec<(Uuid, Uuid)> {
+    use assembly_engine as ae;
+
+    // Deterministic order: components sorted by UUID (DashMap iteration is
+    // arbitrary; the wire report should be stable).
+    let mut components: Vec<_> = assembly.components().map(|c| c.clone()).collect();
+    components.sort_by_key(|c| c.id.0);
+
+    let mut ids: Vec<Uuid> = Vec::new();
+    let mut engine = ae::Assembly::new(ae::InstanceId(0));
+    let params = TessellationParams::default();
+    for comp in &components {
+        let mut vertices: Vec<[f64; 3]> = Vec::new();
+        let mut triangles: Vec<[u32; 3]> = Vec::new();
+        for (_, solid) in comp.part.solids.iter() {
+            let mesh = tessellate_solid(solid, &comp.part, &params);
+            let base = vertices.len() as u32;
+            vertices.extend(mesh.vertices.iter().map(|v| {
+                let p = comp.transform.transform_point(&v.position);
+                [p.x, p.y, p.z]
+            }));
+            triangles.extend(
+                mesh.triangles
+                    .iter()
+                    .map(|t| [t[0] + base, t[1] + base, t[2] + base]),
+            );
+        }
+        if triangles.is_empty() {
+            // A geometry-free component carries no material — it cannot
+            // interfere, and the engine would reject an empty TriMesh.
+            continue;
+        }
+        let engine_id = ae::InstanceId(ids.len() as u32);
+        ids.push(comp.id.0);
+        engine.add_instance(ae::Instance::new(
+            engine_id,
+            comp.name.clone(),
+            ae::Mesh {
+                vertices,
+                triangles,
+            },
+        ));
+    }
+
+    engine
+        .interference_report()
+        .interfering
+        .into_iter()
+        .filter_map(|pair| {
+            let a = ids.get(pair.a.0 as usize)?;
+            let b = ids.get(pair.b.0 as usize)?;
+            Some((*a, *b))
+        })
+        .collect()
+}
+
 pub async fn interferences(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<InterferenceReport>, ApiError> {
     let handle = state.assemblies.get(&id).ok_or_else(|| not_found(id))?;
     let guard = handle.read().await;
-    let pairs = guard
-        .check_interferences()
-        .into_iter()
-        .map(|(a, b)| (a.0, b.0))
-        .collect();
+    let pairs = interference_pairs(&guard);
     Ok(Json(InterferenceReport { pairs }))
 }
 
@@ -1339,22 +1415,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_interferences_returns_empty_for_default_components() {
-        // The default `components_interfere` implementation returns
-        // false (not yet implemented in the kernel). Pin that
-        // behaviour so callers know to expect an empty list until
-        // the proper bounding-box check lands.
+    async fn interferences_stay_empty_for_geometry_free_components() {
+        // Components seeded with EMPTY BRepModels carry no material — they
+        // genuinely cannot interfere, so the report must stay empty (a
+        // degenerate-input guard, not the old stub pin).
         let (mgr, id) = make_assembly();
         let _ = add_part(&mgr, id, "a").await;
         let _ = add_part(&mgr, id, "b").await;
         let handle = mgr.get(&id).unwrap();
         let guard = handle.read().await;
-        let report: Vec<(Uuid, Uuid)> = guard
-            .check_interferences()
-            .into_iter()
-            .map(|(a, b)| (a.0, b.0))
-            .collect();
-        assert!(report.is_empty());
+        assert!(interference_pairs(&guard).is_empty());
+    }
+
+    /// A 10mm cube centred at the origin, as a component-seed model.
+    fn box_model(side: f64) -> BRepModel {
+        let mut m = BRepModel::new();
+        let built = TopologyBuilder::new(&mut m).create_box_3d(side, side, side);
+        assert!(built.is_ok(), "box primitive must build: {built:?}");
+        m
+    }
+
+    fn translate(x: f64, y: f64, z: f64) -> Matrix4 {
+        let mut t = Matrix4::IDENTITY;
+        t[(0, 3)] = x;
+        t[(1, 3)] = y;
+        t[(2, 3)] = z;
+        t
+    }
+
+    #[tokio::test]
+    async fn interferences_reports_overlapping_components() {
+        // RED → GREEN for the §2.3.1 silent-lie surface (kinematic-assembly
+        // campaign, Slice 1, defect a): `/api/assemblies/{id}/interferences`
+        // could NEVER report an interference because the kernel-side
+        // `components_interfere` was a stub returning `false`.
+        //
+        // Pre-fix signature (captured 2026-07-17, HEAD 45d8ffee): two 10mm
+        // cubes overlapping by 5mm → `pairs == []`.
+        let (mgr, id) = make_assembly();
+        let handle = mgr.get(&id).expect("assembly just created");
+        let (ca, cb, cc) = {
+            let mut a = handle.write().await;
+            let ca = a.add_part(Arc::new(box_model(10.0)), "hub");
+            let cb = a.add_part(Arc::new(box_model(10.0)), "overlapping");
+            let cc = a.add_part(Arc::new(box_model(10.0)), "clear");
+            a.set_component_transform(cb, translate(5.0, 0.0, 0.0))
+                .expect("cb exists");
+            a.set_component_transform(cc, translate(100.0, 0.0, 0.0))
+                .expect("cc exists");
+            (ca, cb, cc)
+        };
+        let guard = handle.read().await;
+        let pairs = interference_pairs(&guard);
+        let has = |x: ComponentId, y: ComponentId| {
+            pairs
+                .iter()
+                .any(|&(p, q)| (p == x.0 && q == y.0) || (p == y.0 && q == x.0))
+        };
+        assert!(
+            has(ca, cb),
+            "cubes overlapping by 5mm MUST be reported; got {pairs:?}"
+        );
+        assert!(
+            !has(ca, cc) && !has(cb, cc),
+            "the far cube is clear of both; got {pairs:?}"
+        );
     }
 
     // ── Recorder integration (A.3) ──────────────────────────────────

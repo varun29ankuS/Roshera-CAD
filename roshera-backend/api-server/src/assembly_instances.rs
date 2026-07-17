@@ -39,8 +39,9 @@ use axum::{
     response::Json,
 };
 use dashmap::DashMap;
-use geometry_engine::assembly::instancing::{InstanceId, InstancedAssembly};
+use geometry_engine::assembly::instancing::{Instance, InstanceId, InstancedAssembly};
 use geometry_engine::math::Matrix4;
+use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -52,11 +53,38 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct InstancedAssemblyManager {
     assemblies: DashMap<Uuid, Arc<RwLock<InstancedAssembly>>>,
+    /// Sink for `assembly.*` mutation events (kinematic-assembly campaign,
+    /// Slice 1, defect c: this surface emitted NOTHING, so assemblies were
+    /// not event-sourced). Wired to the same `TimelineRecorder` the
+    /// `BRepModel` uses, so assembly events land on the active branch and
+    /// `timeline_engine::replay` can rebuild the documents. `None` is a
+    /// hard no-op for unit tests.
+    recorder: Option<Arc<dyn OperationRecorder>>,
 }
 
 impl InstancedAssemblyManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a manager that emits `assembly.*` events into the given
+    /// recorder — the production constructor (see `main.rs`).
+    pub fn with_recorder(recorder: Arc<dyn OperationRecorder>) -> Self {
+        Self {
+            assemblies: DashMap::new(),
+            recorder: Some(recorder),
+        }
+    }
+
+    /// Emit one event through the attached recorder. Failures are logged,
+    /// never propagated — the mutation has already succeeded (the same
+    /// contract as the kernel recorder and `AssemblyManager`).
+    pub fn record_event(&self, op: RecordedOperation) {
+        if let Some(r) = self.recorder.as_ref() {
+            if let Err(e) = r.record(op) {
+                tracing::warn!(error = %e, "InstancedAssemblyManager: recorder rejected event");
+            }
+        }
     }
 
     /// Allocate a fresh, empty assembly. Returns the kernel-assigned UUID
@@ -66,6 +94,19 @@ impl InstancedAssemblyManager {
         let id = assembly.id;
         self.assemblies.insert(id, Arc::new(RwLock::new(assembly)));
         id
+    }
+
+    /// Replace the ENTIRE registry with documents rebuilt by a timeline
+    /// replay. The event log is the source of truth: after a rebuild the
+    /// live registry must equal exactly what the replayed prefix produced —
+    /// assemblies created after the replay point disappear, earlier states
+    /// come back. Mirrors what `replay_session_to_model` does to the
+    /// `BRepModel` itself.
+    pub fn replace_all(&self, rebuilt: std::collections::HashMap<Uuid, InstancedAssembly>) {
+        self.assemblies.clear();
+        for (id, doc) in rebuilt {
+            self.assemblies.insert(id, Arc::new(RwLock::new(doc)));
+        }
     }
 
     /// Cloned handle to the assembly lock. `None` for unknown ids.
@@ -208,6 +249,63 @@ pub struct ViewResponse {
     pub nonmanifold_edges: usize,
 }
 
+// ── Event builders ──────────────────────────────────────────────────
+//
+// Every mutating handler on this surface emits one of these
+// SELF-CONTAINED `assembly.*` events: the payload carries the assembly
+// UUID plus everything `timeline_engine::replay::dispatch_assembly`
+// needs to re-execute the mutation (instance UUID, part UUID, full
+// transform). The round-trip is pinned by
+// `emitted_events_replay_into_identical_documents` below.
+
+pub(crate) fn op_create(id: Uuid, name: &str) -> RecordedOperation {
+    RecordedOperation::new("assembly.create")
+        .with_parameters(serde_json::json!({ "name": name, "assembly_id": id }))
+        .with_output_assembly(id)
+}
+
+pub(crate) fn op_delete(id: Uuid) -> RecordedOperation {
+    RecordedOperation::new("assembly.delete")
+        .with_parameters(serde_json::json!({ "assembly_id": id }))
+        .with_input_assembly(id)
+}
+
+pub(crate) fn op_add_instance(assembly_id: Uuid, inst: &Instance) -> RecordedOperation {
+    RecordedOperation::new("assembly.add_instance")
+        .with_parameters(serde_json::json!({
+            "assembly_id": assembly_id,
+            "instance_id": inst.id.0,
+            "part_id": inst.part_id,
+            "transform": matrix_to_array(inst.transform),
+            "name": inst.name,
+            "color": inst.color,
+        }))
+        .with_input_assembly(assembly_id)
+}
+
+pub(crate) fn op_transform_instance(
+    assembly_id: Uuid,
+    instance_id: Uuid,
+    transform: [[f64; 4]; 4],
+) -> RecordedOperation {
+    RecordedOperation::new("assembly.transform_instance")
+        .with_parameters(serde_json::json!({
+            "assembly_id": assembly_id,
+            "instance_id": instance_id,
+            "transform": transform,
+        }))
+        .with_input_assembly(assembly_id)
+}
+
+pub(crate) fn op_remove_instance(assembly_id: Uuid, instance_id: Uuid) -> RecordedOperation {
+    RecordedOperation::new("assembly.remove_instance")
+        .with_parameters(serde_json::json!({
+            "assembly_id": assembly_id,
+            "instance_id": instance_id,
+        }))
+        .with_input_assembly(assembly_id)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn not_found(id: Uuid) -> ApiError {
@@ -298,7 +396,11 @@ pub async fn create_assembly(
             "name must not be empty",
         ));
     }
+    let name = req.name.clone();
     let id = state.instanced_assemblies.create(req.name);
+    state
+        .instanced_assemblies
+        .record_event(op_create(id, &name));
     Ok(Json(CreateAssemblyResponse { id }))
 }
 
@@ -331,6 +433,7 @@ pub async fn delete_assembly(
         .instanced_assemblies
         .delete(&id)
         .ok_or_else(|| not_found(id))?;
+    state.instanced_assemblies.record_event(op_delete(id));
     Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 
@@ -365,6 +468,13 @@ pub async fn add_instance(
         if let Some(c) = req.color {
             guard.set_instance_color(iid, Some(c));
         }
+        // Emit the SELF-CONTAINED add event from the stored instance
+        // snapshot (id, part, transform, name, colour all replay-stable).
+        if let Some(inst) = guard.instance(iid) {
+            state
+                .instanced_assemblies
+                .record_event(op_add_instance(id, inst));
+        }
         let mut model = model_handle.write().await;
         let summary = build_summary(&guard, &state, &mut model);
         (iid, summary)
@@ -390,6 +500,9 @@ pub async fn transform_instance(
     if !guard.transform_instance(InstanceId(iid), array_to_matrix(req.transform)) {
         return Err(instance_not_found(iid));
     }
+    state
+        .instanced_assemblies
+        .record_event(op_transform_instance(id, iid, req.transform));
     let mut model = model_handle.write().await;
     Ok(Json(build_summary(&guard, &state, &mut model)))
 }
@@ -408,6 +521,9 @@ pub async fn remove_instance(
     if !guard.remove_instance(InstanceId(iid)) {
         return Err(instance_not_found(iid));
     }
+    state
+        .instanced_assemblies
+        .record_event(op_remove_instance(id, iid));
     let mut model = model_handle.write().await;
     Ok(Json(build_summary(&guard, &state, &mut model)))
 }
@@ -606,5 +722,119 @@ mod tests {
     fn not_found_uses_solid_not_found_code() {
         let err = not_found(Uuid::nil());
         assert_eq!(err.code, ErrorCode::SolidNotFound);
+    }
+
+    // ── Event sourcing (kinematic-assembly campaign, Slice 1) ────────
+
+    /// Wrap a `RecordedOperation` exactly the way the production
+    /// `TimelineRecorder` bridge does (`recorder_bridge::to_timeline_operation`:
+    /// `{params, inputs, outputs}` under `Operation::Generic`), so this test
+    /// exercises the REAL wire shape end-to-end.
+    fn bridge_event(
+        seq: u64,
+        op: &geometry_engine::operations::recorder::RecordedOperation,
+    ) -> timeline_engine::TimelineEvent {
+        timeline_engine::TimelineEvent {
+            id: timeline_engine::EventId(Uuid::new_v4()),
+            sequence_number: seq,
+            timestamp: chrono::Utc::now(),
+            author: timeline_engine::Author::System,
+            operation: timeline_engine::Operation::Generic {
+                command_type: op.kind.clone(),
+                parameters: serde_json::json!({
+                    "params": op.parameters,
+                    "inputs": op.inputs,
+                    "outputs": op.outputs,
+                }),
+            },
+            inputs: Default::default(),
+            outputs: Default::default(),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn emitted_events_replay_into_identical_documents() {
+        // THE defect-c round-trip pin: the exact events this surface emits
+        // must rebuild the exact document state through timeline replay.
+        // Emission (this module) and dispatch (timeline-engine) are two
+        // halves of one contract — this test welds them together.
+        let mut doc = InstancedAssembly::new("rig");
+        let assembly_id = doc.id;
+        let part = Uuid::new_v4();
+        let iid_keep = doc.add_instance(part, Matrix4::IDENTITY, Some("keep".into()));
+        doc.set_instance_color(iid_keep, Some([1, 2, 3]));
+        let iid_drop = doc.add_instance(part, Matrix4::IDENTITY, None);
+        let mut moved = Matrix4::IDENTITY;
+        moved[(0, 3)] = 42.0;
+
+        let keep_snapshot = doc.instance(iid_keep).cloned();
+        let drop_snapshot = doc.instance(iid_drop).cloned();
+        let (Some(keep_inst), Some(drop_inst)) = (keep_snapshot, drop_snapshot) else {
+            unreachable!("instances just added");
+        };
+
+        let ops = vec![
+            op_create(assembly_id, "rig"),
+            op_add_instance(assembly_id, &keep_inst),
+            op_add_instance(assembly_id, &drop_inst),
+            op_transform_instance(assembly_id, iid_keep.0, matrix_to_array(moved)),
+            op_remove_instance(assembly_id, iid_drop.0),
+        ];
+        let events: Vec<_> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| bridge_event(i as u64, op))
+            .collect();
+
+        let mut scratch = geometry_engine::primitives::topology_builder::BRepModel::new();
+        let outcome = timeline_engine::rebuild_model_from_events(&mut scratch, &events);
+        assert_eq!(
+            outcome.events_skipped, 0,
+            "every emitted assembly event must replay"
+        );
+        assert_eq!(outcome.events_applied, 5);
+
+        let rebuilt = outcome
+            .assemblies
+            .get(&assembly_id)
+            .cloned()
+            .unwrap_or_else(|| InstancedAssembly::new("MISSING"));
+        assert_eq!(rebuilt.name, "rig");
+        assert_eq!(
+            rebuilt.instance_count(),
+            1,
+            "removed instance stays removed"
+        );
+        let inst = &rebuilt.instances()[0];
+        assert_eq!(inst.id, iid_keep, "instance id replay-stable");
+        assert_eq!(inst.part_id, part);
+        assert_eq!(inst.name.as_deref(), Some("keep"));
+        assert_eq!(inst.color, Some([1, 2, 3]));
+        assert!((inst.transform[(0, 3)] - 42.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn replace_all_reconciles_registry_to_replayed_state() {
+        let mgr = InstancedAssemblyManager::new();
+        let stale = mgr.create("stale");
+        let mut rebuilt = std::collections::HashMap::new();
+        let doc = InstancedAssembly::new("from-replay");
+        let doc_id = doc.id;
+        rebuilt.insert(doc_id, doc);
+        mgr.replace_all(rebuilt);
+        assert!(
+            mgr.get(&stale).is_none(),
+            "pre-replay state must not survive"
+        );
+        assert!(mgr.get(&doc_id).is_some());
+        assert_eq!(mgr.len(), 1);
+    }
+
+    #[test]
+    fn manager_without_recorder_drops_events_silently() {
+        let mgr = InstancedAssemblyManager::new();
+        mgr.record_event(op_create(Uuid::nil(), "noop"));
+        assert_eq!(mgr.len(), 0); // reached ⇒ no panic, hard no-op
     }
 }

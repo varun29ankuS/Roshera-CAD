@@ -70,11 +70,8 @@ impl Assembly {
                     direction: db,
                 },
             ) => concentric_residual(oa, unit(da), ob, unit(db)),
-            // Coincident — and, in Phase 1, Fixed — lock the mating faces flush
-            // (the dominant constraint). Fixed's remaining in-plane lock arrives
-            // with mate GROUPS in S6; here it reduces to the face-flush residual.
             (
-                MateKind::Coincident | MateKind::Fixed,
+                MateKind::Coincident,
                 WorldFeature::Plane {
                     point: pa,
                     normal: na,
@@ -84,6 +81,36 @@ impl Assembly {
                     normal: nb,
                 },
             ) => coincident_residual(pa, unit(na), pb, unit(nb)),
+            // Fixed = the TRUE rigid lock (a bolt pattern): the two declared
+            // face frames are welded — points coincide, normals antiparallel
+            // (flush), and the deterministically derived in-plane tangents
+            // align. Rank 6: no in-plane slide, no spin. This replaces the
+            // Phase-1 face-flush reduction that silently left 3 DOF free
+            // (the §2.2 "Fixed is not rigid" lie, killed Slice 1).
+            (MateKind::Fixed, _, _) => {
+                if let (
+                    FeatureRef::Face {
+                        point: pa,
+                        normal: na,
+                    },
+                    FeatureRef::Face {
+                        point: pb,
+                        normal: nb,
+                    },
+                ) = (&mate.feature_a, &mate.feature_b)
+                {
+                    fixed_residual(
+                        &instance_isometry(ia),
+                        pa,
+                        na,
+                        &instance_isometry(ib),
+                        pb,
+                        nb,
+                    )
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
         }
     }
@@ -111,6 +138,58 @@ fn concentric_residual(
     let delta = origin_b - origin_a;
     let perp = delta - dir_a * delta.dot(&dir_a); // translational: offset off the line
     vec![cross.x, cross.y, cross.z, perp.x, perp.y, perp.z]
+}
+
+/// Deterministic in-plane tangent for a face feature, derived from the LOCAL
+/// normal. The local feature never changes during a solve (only the pose
+/// does), so the derived tangent is a rigid part of the feature frame and the
+/// residual stays smooth in the pose. Construction: take the global axis
+/// LEAST aligned with the normal (ties break x → y → z) and project it into
+/// the plane. Both sides of a Fixed mate derive their tangent the same way,
+/// so "tangents aligned" is a well-defined, repeatable spin lock.
+fn local_tangent(normal: &[f64; 3]) -> Vector3<f64> {
+    let n = unit(Vector3::new(normal[0], normal[1], normal[2]));
+    let axes = [Vector3::x(), Vector3::y(), Vector3::z()];
+    let mut best = axes[0];
+    let mut best_dot = f64::INFINITY;
+    for e in axes {
+        let d = n.dot(&e).abs();
+        if d < best_dot {
+            best_dot = d;
+            best = e;
+        }
+    }
+    unit(best - n * best.dot(&n))
+}
+
+/// The full rigid lock between two face frames (Fixed / bolt pattern). Nine
+/// components, rank 6 — zero exactly when:
+///   * the declared points coincide            (3: no translation freedom)
+///   * the normals are ANTIPARALLEL (flush)    (n_a + n_b → 0; rank 2)
+///   * the derived in-plane tangents align     (t_b − t_a → 0; rank 1 = spin)
+/// The tangents are derived from the LOCAL normals (see [`local_tangent`]) and
+/// carried to world by each instance's rotation, so the lock is rigid in the
+/// features, not in any world coordinate.
+fn fixed_residual(
+    iso_a: &Isometry3<f64>,
+    point_a: &[f64; 3],
+    normal_a: &[f64; 3],
+    iso_b: &Isometry3<f64>,
+    point_b: &[f64; 3],
+    normal_b: &[f64; 3],
+) -> Vec<f64> {
+    let pa = iso_a.transform_point(&Point3::new(point_a[0], point_a[1], point_a[2]));
+    let pb = iso_b.transform_point(&Point3::new(point_b[0], point_b[1], point_b[2]));
+    let na = unit(iso_a.transform_vector(&Vector3::new(normal_a[0], normal_a[1], normal_a[2])));
+    let nb = unit(iso_b.transform_vector(&Vector3::new(normal_b[0], normal_b[1], normal_b[2])));
+    let ta = iso_a.transform_vector(&local_tangent(normal_a));
+    let tb = iso_b.transform_vector(&local_tangent(normal_b));
+    let d = pb - pa;
+    let flush = na + nb;
+    let spin = tb - ta;
+    vec![
+        d.x, d.y, d.z, flush.x, flush.y, flush.z, spin.x, spin.y, spin.z,
+    ]
 }
 
 /// Two planar faces flush: coplanar (signed distance of `point_b` to plane_a → 0)

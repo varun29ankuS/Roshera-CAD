@@ -50,6 +50,7 @@
 
 use std::collections::HashMap;
 
+use geometry_engine::assembly::instancing::InstancedAssembly;
 use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::operations::{
     boolean::{boolean_operation, BooleanOp, BooleanOptions},
@@ -104,6 +105,32 @@ pub enum ReplayError {
     },
 }
 
+/// Assembly documents rebuilt by replay (kinematic-assembly campaign,
+/// Slice 1, defect c). `assembly.*` events dispatch here instead of hitting
+/// `UnknownKind` — assemblies are event-sourced like everything else, so a
+/// timeline replay reconstructs the instanced-assembly documents alongside
+/// the B-Rep model. Keyed by the assembly's document UUID (replay-stable:
+/// assembly events reference parts and instances by UUID, never by kernel
+/// counter).
+#[derive(Debug, Clone, Default)]
+pub struct AssemblyStore {
+    pub assemblies: HashMap<uuid::Uuid, InstancedAssembly>,
+}
+
+impl AssemblyStore {
+    pub fn get(&self, id: &uuid::Uuid) -> Option<&InstancedAssembly> {
+        self.assemblies.get(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.assemblies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.assemblies.is_empty()
+    }
+}
+
 /// Outcome of a [`rebuild_model_from_events`] run.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayOutcome {
@@ -116,6 +143,11 @@ pub struct ReplayOutcome {
     /// entity IDs. Useful for callers who want to translate event-log
     /// references (e.g. an event's `outputs.created`) into live IDs.
     pub id_remap: HashMap<u64, u64>,
+    /// The instanced-assembly documents the replayed events rebuilt.
+    /// Callers that own an assembly registry (the api-server's
+    /// `InstancedAssemblyManager`) reconcile it from this store after a
+    /// rebuild; callers that only care about the B-Rep model may ignore it.
+    pub assemblies: AssemblyStore,
 }
 
 /// Replay a chronologically ordered slice of events into the given model.
@@ -140,7 +172,7 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
     let mut outcome = ReplayOutcome::default();
 
     for event in events {
-        match apply_event(model, event, &mut outcome.id_remap) {
+        match apply_event(model, &mut outcome.assemblies, event, &mut outcome.id_remap) {
             Ok(()) => outcome.events_applied += 1,
             Err(err) => {
                 tracing::warn!(
@@ -162,7 +194,8 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
     outcome
 }
 
-/// Apply a single event to the model, threading the entity-ID remap.
+/// Apply a single event to the model (kernel kinds) or the assembly store
+/// (`assembly.*` kinds), threading the entity-ID remap.
 ///
 /// Only `Operation::Generic` is dispatched — that is the canonical
 /// envelope the kernel's recorder bridge emits. Other `Operation`
@@ -170,6 +203,7 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
 /// no replay path here.
 pub fn apply_event(
     model: &mut BRepModel,
+    assemblies: &mut AssemblyStore,
     event: &TimelineEvent,
     id_remap: &mut HashMap<u64, u64>,
 ) -> Result<(), ReplayError> {
@@ -184,7 +218,13 @@ pub fn apply_event(
         Operation::Generic {
             command_type,
             parameters,
-        } => dispatch_generic(model, command_type, parameters, id_remap),
+        } => {
+            if command_type.starts_with("assembly.") {
+                dispatch_assembly(assemblies, command_type, parameters)
+            } else {
+                dispatch_generic(model, command_type, parameters, id_remap)
+            }
+        }
         other => Err(ReplayError::UnknownKind(format!(
             "non-Generic operation variant: {:?}",
             std::mem::discriminant(other)
@@ -192,6 +232,190 @@ pub fn apply_event(
     };
     model.set_event_key(None);
     result
+}
+
+/// Dispatch an `assembly.*` event into the [`AssemblyStore`] (kinematic-
+/// assembly campaign, Slice 1, defect c — assemblies are event-sourced).
+///
+/// The instanced-assembly surface records SELF-CONTAINED payloads: every
+/// event carries the assembly UUID plus everything needed to re-execute the
+/// mutation (instance UUID, part UUID, full transform), so no id-remap is
+/// needed — assembly identifiers are UUIDs, replay-stable by construction.
+///
+/// Backwards compatibility: legacy `assembly.create` / `assembly.delete`
+/// events from the retiring mate-centric surface carried the assembly id
+/// only as an `assembly:<uuid>` entity ref; the id falls back to that ref.
+/// The other legacy kinds (`assembly.add_component`,
+/// `assembly.set_component_transform`, …) recorded snapshots of a surface
+/// whose per-component geometry copies cannot be reconstructed from their
+/// payloads (no part reference was recorded); they replay as an explicit
+/// no-op skip via [`ReplayError::UnknownKind`] exactly as before — old
+/// timelines keep replaying, honestly counted.
+fn dispatch_assembly(
+    assemblies: &mut AssemblyStore,
+    kind: &str,
+    parameters: &Value,
+) -> Result<(), ReplayError> {
+    let inner = parameters.get("params").unwrap_or(parameters);
+
+    let param_uuid = |key: &str| -> Option<uuid::Uuid> {
+        inner
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    };
+    // `assembly:<uuid>` entity ref inside the bridge-wrapped `inputs` /
+    // `outputs` lists — the legacy id fallback.
+    let ref_uuid = |list: &str| -> Option<uuid::Uuid> {
+        parameters.get(list)?.as_array()?.iter().find_map(|v| {
+            let (k, id) = v.as_str()?.split_once(':')?;
+            if k == "assembly" {
+                uuid::Uuid::parse_str(id).ok()
+            } else {
+                None
+            }
+        })
+    };
+    let missing = |what: &str| ReplayError::InvalidParameters {
+        kind: kind.to_string(),
+        reason: format!("missing/invalid `{what}`"),
+    };
+    let param_matrix = |key: &str| -> Result<Matrix4, ReplayError> {
+        let raw = inner.get(key).cloned().ok_or_else(|| missing(key))?;
+        let a: [[f64; 4]; 4] =
+            serde_json::from_value(raw).map_err(|e| ReplayError::InvalidParameters {
+                kind: kind.to_string(),
+                reason: format!("`{key}` is not a 4x4 matrix: {e}"),
+            })?;
+        let mut m = Matrix4::IDENTITY;
+        for (r, row) in a.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                m[(r, c)] = *v;
+            }
+        }
+        Ok(m)
+    };
+
+    match kind {
+        "assembly.create" => {
+            let id = param_uuid("assembly_id")
+                .or_else(|| ref_uuid("outputs"))
+                .ok_or_else(|| missing("assembly_id"))?;
+            let name = inner
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("assembly");
+            let mut doc = InstancedAssembly::new(name);
+            doc.id = id;
+            assemblies.assemblies.insert(id, doc);
+            Ok(())
+        }
+        "assembly.delete" => {
+            let id = param_uuid("assembly_id")
+                .or_else(|| ref_uuid("inputs"))
+                .ok_or_else(|| missing("assembly_id"))?;
+            // Removing an id that never replayed (e.g. created before the
+            // replayed prefix) is a clean no-op — deletion is idempotent.
+            assemblies.assemblies.remove(&id);
+            Ok(())
+        }
+        "assembly.add_instance" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let iid = param_uuid("instance_id").ok_or_else(|| missing("instance_id"))?;
+            let part = param_uuid("part_id").ok_or_else(|| missing("part_id"))?;
+            let transform = param_matrix("transform")?;
+            let name = inner
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let color: Option<[u8; 3]> = inner
+                .get("color")
+                .filter(|v| !v.is_null())
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            let inserted = doc.add_instance_with_id(
+                geometry_engine::assembly::instancing::InstanceId(iid),
+                part,
+                transform,
+                name,
+            );
+            if !inserted {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("duplicate instance id {iid}"),
+                });
+            }
+            if let Some(c) = color {
+                doc.set_instance_color(
+                    geometry_engine::assembly::instancing::InstanceId(iid),
+                    Some(c),
+                );
+            }
+            Ok(())
+        }
+        "assembly.transform_instance" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let iid = param_uuid("instance_id").ok_or_else(|| missing("instance_id"))?;
+            let transform = param_matrix("transform")?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.transform_instance(
+                geometry_engine::assembly::instancing::InstanceId(iid),
+                transform,
+            ) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("unknown instance id {iid}"),
+                });
+            }
+            Ok(())
+        }
+        "assembly.remove_instance" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let iid = param_uuid("instance_id").ok_or_else(|| missing("instance_id"))?;
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.remove_instance(geometry_engine::assembly::instancing::InstanceId(iid)) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("unknown instance id {iid}"),
+                });
+            }
+            Ok(())
+        }
+        "assembly.set_instance_color" => {
+            let aid = param_uuid("assembly_id").ok_or_else(|| missing("assembly_id"))?;
+            let iid = param_uuid("instance_id").ok_or_else(|| missing("instance_id"))?;
+            let color: Option<[u8; 3]> = inner
+                .get("color")
+                .filter(|v| !v.is_null())
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let doc = assemblies
+                .assemblies
+                .get_mut(&aid)
+                .ok_or_else(|| missing("assembly_id (unknown assembly)"))?;
+            if !doc.set_instance_color(
+                geometry_engine::assembly::instancing::InstanceId(iid),
+                color,
+            ) {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!("unknown instance id {iid}"),
+                });
+            }
+            Ok(())
+        }
+        // Legacy mate-centric surface kinds — no rebuildable payload (see
+        // the function doc). Honest skip, never a silent wrong answer.
+        unknown => Err(ReplayError::UnknownKind(unknown.to_string())),
+    }
 }
 
 /// Dispatch on the kernel-side `kind` string emitted by the recorder
@@ -1240,6 +1464,162 @@ mod tests {
         let outcome = rebuild_model_from_events(&mut model, &events);
         assert_eq!(outcome.events_applied, 2);
         assert!(model.solids.len() >= 2);
+    }
+
+    #[test]
+    fn assembly_events_rebuild_documents() {
+        // RED → GREEN for the §2.3.2 replay lie (kinematic-assembly campaign,
+        // Slice 1, defect c): `assembly.*` events were recorded into the same
+        // timeline as kernel ops but replay dispatched only BRep kinds — every
+        // assembly event died as `UnknownKind` and NO assembly state was ever
+        // reconstructed. Assemblies were not event-sourced.
+        //
+        // Pre-fix signature (captured 2026-07-17, HEAD 45d8ffee):
+        //   events_applied = 0, events_skipped = 3, assemblies empty.
+        let mut model = BRepModel::new();
+        let assembly_id = Uuid::new_v4();
+        let instance_id = Uuid::new_v4();
+        let part_id = Uuid::new_v4();
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let moved = [
+            [1.0, 0.0, 0.0, 7.0],
+            [0.0, 1.0, 0.0, 8.0],
+            [0.0, 0.0, 1.0, 9.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let events = vec![
+            mk_event(
+                "assembly.create",
+                serde_json::json!({
+                    "params": { "name": "rig", "assembly_id": assembly_id },
+                    "inputs": [], "outputs": [format!("assembly:{assembly_id}")]
+                }),
+            ),
+            mk_event(
+                "assembly.add_instance",
+                serde_json::json!({
+                    "params": {
+                        "assembly_id": assembly_id,
+                        "instance_id": instance_id,
+                        "part_id": part_id,
+                        "transform": identity,
+                        "name": "wheel",
+                        "color": [10, 20, 30]
+                    },
+                    "inputs": [], "outputs": []
+                }),
+            ),
+            mk_event(
+                "assembly.transform_instance",
+                serde_json::json!({
+                    "params": {
+                        "assembly_id": assembly_id,
+                        "instance_id": instance_id,
+                        "transform": moved
+                    },
+                    "inputs": [], "outputs": []
+                }),
+            ),
+        ];
+        let outcome = rebuild_model_from_events(&mut model, &events);
+        assert_eq!(
+            outcome.events_skipped, 0,
+            "assembly events must REPLAY, not die as UnknownKind"
+        );
+        assert_eq!(outcome.events_applied, 3);
+        let rebuilt = outcome
+            .assemblies
+            .get(&assembly_id)
+            .unwrap_or_else(|| panic!("assembly {assembly_id} must be reconstructed"));
+        assert_eq!(rebuilt.name, "rig");
+        assert_eq!(rebuilt.instance_count(), 1);
+        let inst = &rebuilt.instances()[0];
+        assert_eq!(inst.id.0, instance_id, "instance id must be replay-stable");
+        assert_eq!(inst.part_id, part_id);
+        assert_eq!(inst.name.as_deref(), Some("wheel"));
+        assert_eq!(inst.color, Some([10, 20, 30]));
+        assert!((inst.transform[(0, 3)] - 7.0).abs() < 1e-12);
+        assert!((inst.transform[(1, 3)] - 8.0).abs() < 1e-12);
+        assert!((inst.transform[(2, 3)] - 9.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn assembly_remove_and_delete_replay() {
+        // Companion coverage for the defect-c fix: instance removal and
+        // assembly deletion are part of the event-sourced lifecycle too.
+        let mut model = BRepModel::new();
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let inst = Uuid::new_v4();
+        let part = Uuid::new_v4();
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let events = vec![
+            mk_event(
+                "assembly.create",
+                serde_json::json!({ "params": { "name": "keep", "assembly_id": a1 } }),
+            ),
+            mk_event(
+                "assembly.create",
+                serde_json::json!({ "params": { "name": "drop", "assembly_id": a2 } }),
+            ),
+            mk_event(
+                "assembly.add_instance",
+                serde_json::json!({ "params": {
+                    "assembly_id": a1, "instance_id": inst, "part_id": part,
+                    "transform": identity, "name": null, "color": null
+                } }),
+            ),
+            mk_event(
+                "assembly.remove_instance",
+                serde_json::json!({ "params": { "assembly_id": a1, "instance_id": inst } }),
+            ),
+            mk_event(
+                "assembly.delete",
+                serde_json::json!({ "params": { "assembly_id": a2 } }),
+            ),
+        ];
+        let outcome = rebuild_model_from_events(&mut model, &events);
+        assert_eq!(outcome.events_skipped, 0);
+        assert_eq!(outcome.events_applied, 5);
+        let kept = outcome.assemblies.get(&a1);
+        assert!(kept.is_some_and(|a| a.instance_count() == 0));
+        assert!(
+            outcome.assemblies.get(&a2).is_none(),
+            "deleted assembly stays deleted"
+        );
+    }
+
+    #[test]
+    fn legacy_assembly_create_from_outputs_ref() {
+        // Backwards compatibility: pre-slice-1 `assembly.create` events (the
+        // legacy mate-centric surface) carried only `{name}` in params, with
+        // the id in the outputs ref. Old timelines must keep replaying — the
+        // shell document is reconstructed from the outputs fallback.
+        let mut model = BRepModel::new();
+        let id = Uuid::new_v4();
+        let event = mk_event(
+            "assembly.create",
+            serde_json::json!({
+                "params": { "name": "legacy" },
+                "inputs": [], "outputs": [format!("assembly:{id}")]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[event]);
+        assert_eq!(outcome.events_skipped, 0);
+        assert!(outcome
+            .assemblies
+            .get(&id)
+            .is_some_and(|a| a.name == "legacy"));
     }
 
     #[test]

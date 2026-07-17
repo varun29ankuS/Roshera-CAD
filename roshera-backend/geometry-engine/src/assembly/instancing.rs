@@ -96,6 +96,16 @@ pub struct InstancedAssembly {
     pub id: Uuid,
     pub name: String,
     instances: Vec<Instance>,
+    /// Mate connectors — frames bound to PLACES on instances (kinematic-
+    /// assembly campaign; see [`super::mates`]). Serde-default so documents
+    /// serialized before the mate slice keep deserializing.
+    #[serde(default)]
+    connectors: Vec<super::mates::MateConnector>,
+    /// Mates over connector pairs. Pure description — the assembly-engine
+    /// solves them over a borrowed view; this document never carries solver
+    /// state (the `instancing.rs` header promise, kept).
+    #[serde(default)]
+    mates: Vec<super::mates::DocMate>,
 }
 
 impl InstancedAssembly {
@@ -105,6 +115,8 @@ impl InstancedAssembly {
             id: Uuid::new_v4(),
             name: name.into(),
             instances: Vec::new(),
+            connectors: Vec::new(),
+            mates: Vec::new(),
         }
     }
 
@@ -121,6 +133,32 @@ impl InstancedAssembly {
         let id = inst.id;
         self.instances.push(inst);
         id
+    }
+
+    /// Insert an instance with a CALLER-SUPPLIED id — the timeline-replay
+    /// path, which must reconstruct the exact ids the original session
+    /// minted so later events (`transform_instance`, `remove_instance`)
+    /// resolve against the rebuilt document. Returns `false` (and inserts
+    /// nothing) when the id is already present — a duplicate would make the
+    /// id ambiguous for every later event.
+    pub fn add_instance_with_id(
+        &mut self,
+        id: InstanceId,
+        part_id: Uuid,
+        transform: Matrix4,
+        name: Option<String>,
+    ) -> bool {
+        if self.instances.iter().any(|i| i.id == id) {
+            return false;
+        }
+        self.instances.push(Instance {
+            id,
+            part_id,
+            transform,
+            name,
+            color: None,
+        });
+        true
     }
 
     /// All instances in stable insertion order.
@@ -173,10 +211,157 @@ impl InstancedAssembly {
     }
 
     /// Remove an instance by id. Returns `true` if one was removed.
+    ///
+    /// CASCADES: connectors anchored on the instance are dropped, and so is
+    /// every mate referencing a dropped connector (a mate to a place that no
+    /// longer exists is not "stale", it is meaningless). The cascade is part
+    /// of the document method so a timeline replay of `remove_instance`
+    /// reproduces it deterministically.
     pub fn remove_instance(&mut self, id: InstanceId) -> bool {
         let before = self.instances.len();
         self.instances.retain(|i| i.id != id);
-        self.instances.len() != before
+        let removed = self.instances.len() != before;
+        if removed {
+            let dropped: std::collections::BTreeSet<super::mates::MateConnectorId> = self
+                .connectors
+                .iter()
+                .filter(|c| c.instance == id)
+                .map(|c| c.id)
+                .collect();
+            if !dropped.is_empty() {
+                self.connectors.retain(|c| c.instance != id);
+                self.mates
+                    .retain(|m| !dropped.contains(&m.a) && !dropped.contains(&m.b));
+            }
+        }
+        removed
+    }
+
+    // ── Mate connectors + mates (document only; see super::mates) ──────
+
+    /// All connectors in stable insertion order.
+    pub fn connectors(&self) -> &[super::mates::MateConnector] {
+        &self.connectors
+    }
+
+    /// Borrow one connector by id.
+    pub fn connector(
+        &self,
+        id: super::mates::MateConnectorId,
+    ) -> Option<&super::mates::MateConnector> {
+        self.connectors.iter().find(|c| c.id == id)
+    }
+
+    /// Add a connector. Refused (`false`, nothing stored) when its id is
+    /// already present or its instance does not exist in this assembly.
+    pub fn add_connector(&mut self, connector: super::mates::MateConnector) -> bool {
+        if self.connectors.iter().any(|c| c.id == connector.id) {
+            return false;
+        }
+        if !self.instances.iter().any(|i| i.id == connector.instance) {
+            return false;
+        }
+        self.connectors.push(connector);
+        true
+    }
+
+    /// Replace a connector's stored frame (+ feature radius) — the resolve
+    /// path re-deriving from the anchored feature. Returns `false` for an
+    /// unknown id.
+    pub fn set_connector_frame(
+        &mut self,
+        id: super::mates::MateConnectorId,
+        frame: super::mates::ConnectorFrame,
+        radius: Option<f64>,
+    ) -> bool {
+        match self.connectors.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                c.frame = frame;
+                c.radius = radius;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove a connector. Refused (`false`) when unknown OR still
+    /// referenced by a mate — delete the mate first (no silent cascades on
+    /// explicit connector deletion; only instance removal cascades).
+    pub fn remove_connector(&mut self, id: super::mates::MateConnectorId) -> bool {
+        if !self.connectors.iter().any(|c| c.id == id) {
+            return false;
+        }
+        if self.mates.iter().any(|m| m.a == id || m.b == id) {
+            return false;
+        }
+        self.connectors.retain(|c| c.id != id);
+        true
+    }
+
+    /// All mates in stable insertion order.
+    pub fn mates(&self) -> &[super::mates::DocMate] {
+        &self.mates
+    }
+
+    /// Borrow one mate by id.
+    pub fn mate(&self, id: super::mates::DocMateId) -> Option<&super::mates::DocMate> {
+        self.mates.iter().find(|m| m.id == id)
+    }
+
+    /// Add a mate. Refused (`false`) when its id already exists, either
+    /// connector is unknown, both connectors sit on the SAME instance (a
+    /// mate is a relationship between two bodies), or a coupling reference
+    /// names an unknown mate.
+    pub fn add_mate(&mut self, mate: super::mates::DocMate) -> bool {
+        if self.mates.iter().any(|m| m.id == mate.id) {
+            return false;
+        }
+        let (Some(ca), Some(cb)) = (self.connector(mate.a), self.connector(mate.b)) else {
+            return false;
+        };
+        if ca.instance == cb.instance {
+            return false;
+        }
+        if !mate
+            .couples
+            .iter()
+            .all(|cid| self.mates.iter().any(|m| m.id == *cid))
+        {
+            return false;
+        }
+        self.mates.push(mate);
+        true
+    }
+
+    /// Replace a mate's kind/parameters in place (PATCH semantics — value,
+    /// limits, driven flags all live on the kind). Returns `false` for an
+    /// unknown id.
+    pub fn set_mate_kind(
+        &mut self,
+        id: super::mates::DocMateId,
+        kind: super::mates::DocMateKind,
+    ) -> bool {
+        match self.mates.iter_mut().find(|m| m.id == id) {
+            Some(m) => {
+                m.kind = kind;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove a mate. Refused (`false`) when unknown or when another mate
+    /// COUPLES onto it (gear/rack-pinion/screw reference it) — remove the
+    /// coupling first.
+    pub fn remove_mate(&mut self, id: super::mates::DocMateId) -> bool {
+        if !self.mates.iter().any(|m| m.id == id) {
+            return false;
+        }
+        if self.mates.iter().any(|m| m.couples.contains(&id)) {
+            return false;
+        }
+        self.mates.retain(|m| m.id != id);
+        true
     }
 
     /// Combined world bounding box over every instance, given a resolver
@@ -328,5 +513,128 @@ mod tests {
         let id = a.add_instance(Uuid::new_v4(), Matrix4::IDENTITY, None);
         assert!(a.set_instance_color(id, Some([10, 20, 30])));
         assert_eq!(a.instance(id).unwrap().color, Some([10, 20, 30]));
+    }
+
+    // ── Connectors + mates (document; kinematic-assembly campaign) ─────
+
+    use crate::assembly::mates::{
+        ConnectorAnchor, ConnectorFrame, DocMate, DocMateId, DocMateKind, MateConnector,
+        MateConnectorId,
+    };
+
+    fn raw_connector(instance: InstanceId) -> MateConnector {
+        MateConnector {
+            id: MateConnectorId::new(),
+            instance,
+            anchor: ConnectorAnchor::RawFrame,
+            frame: ConnectorFrame {
+                origin: [0.0; 3],
+                z_axis: [0.0, 0.0, 1.0],
+                x_axis: [1.0, 0.0, 0.0],
+            },
+            radius: None,
+        }
+    }
+
+    fn mate_between(a: MateConnectorId, b: MateConnectorId) -> DocMate {
+        DocMate {
+            id: DocMateId::new(),
+            kind: DocMateKind::Fastened,
+            a,
+            b,
+            couples: Vec::new(),
+            at: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn connector_requires_live_instance() {
+        let mut a = InstancedAssembly::new("rig");
+        assert!(
+            !a.add_connector(raw_connector(InstanceId::new())),
+            "a connector on a nonexistent instance must be refused"
+        );
+        let iid = a.add_instance(Uuid::new_v4(), Matrix4::IDENTITY, None);
+        assert!(a.add_connector(raw_connector(iid)));
+        assert_eq!(a.connectors().len(), 1);
+    }
+
+    #[test]
+    fn mate_requires_two_distinct_instances() {
+        let mut a = InstancedAssembly::new("rig");
+        let part = Uuid::new_v4();
+        let i1 = a.add_instance(part, Matrix4::IDENTITY, None);
+        let i2 = a.add_instance(part, Matrix4::IDENTITY, None);
+        let c1 = raw_connector(i1);
+        let c1b = raw_connector(i1);
+        let c2 = raw_connector(i2);
+        let (id1, id1b, id2) = (c1.id, c1b.id, c2.id);
+        assert!(a.add_connector(c1) && a.add_connector(c1b) && a.add_connector(c2));
+        assert!(
+            !a.add_mate(mate_between(id1, id1b)),
+            "both connectors on ONE instance is not a mate"
+        );
+        assert!(a.add_mate(mate_between(id1, id2)));
+        assert_eq!(a.mates().len(), 1);
+    }
+
+    #[test]
+    fn connector_referenced_by_mate_cannot_be_removed() {
+        let mut a = InstancedAssembly::new("rig");
+        let part = Uuid::new_v4();
+        let i1 = a.add_instance(part, Matrix4::IDENTITY, None);
+        let i2 = a.add_instance(part, Matrix4::IDENTITY, None);
+        let c1 = raw_connector(i1);
+        let c2 = raw_connector(i2);
+        let (id1, id2) = (c1.id, c2.id);
+        a.add_connector(c1);
+        a.add_connector(c2);
+        let m = mate_between(id1, id2);
+        let mid = m.id;
+        assert!(a.add_mate(m));
+        assert!(!a.remove_connector(id1), "still referenced by the mate");
+        assert!(a.remove_mate(mid));
+        assert!(a.remove_connector(id1), "free after the mate is gone");
+    }
+
+    #[test]
+    fn removing_an_instance_cascades_its_connectors_and_mates() {
+        let mut a = InstancedAssembly::new("rig");
+        let part = Uuid::new_v4();
+        let i1 = a.add_instance(part, Matrix4::IDENTITY, None);
+        let i2 = a.add_instance(part, Matrix4::IDENTITY, None);
+        let c1 = raw_connector(i1);
+        let c2 = raw_connector(i2);
+        let (id1, id2) = (c1.id, c2.id);
+        a.add_connector(c1);
+        a.add_connector(c2);
+        assert!(a.add_mate(mate_between(id1, id2)));
+        assert!(a.remove_instance(i1));
+        assert!(
+            a.connector(id1).is_none(),
+            "connector on the removed instance dropped"
+        );
+        assert!(a.connector(id2).is_some(), "the other side survives");
+        assert!(
+            a.mates().is_empty(),
+            "the mate to the vanished place is dropped"
+        );
+    }
+
+    #[test]
+    fn pre_mate_documents_still_deserialize() {
+        // Additive-serde contract: a document serialized BEFORE the mate
+        // fields existed must keep loading (connectors/mates default empty).
+        let raw = serde_json::json!({
+            "id": Uuid::nil(),
+            "name": "old",
+            "instances": [],
+        });
+        let doc: Result<InstancedAssembly, _> = serde_json::from_value(raw);
+        assert!(
+            doc.as_ref()
+                .is_ok_and(|d| d.connectors().is_empty() && d.mates().is_empty()),
+            "old document must parse: {doc:?}"
+        );
     }
 }

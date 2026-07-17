@@ -65,7 +65,10 @@ pub enum MateKind {
     Coincident,
     /// Two axes collinear (concentric).
     Concentric,
-    /// Fully rigid — a bolt pattern (concentric + coincident + one angular lock).
+    /// Fully rigid — a bolt pattern. Consumes all 6 DOF: the declared face
+    /// points coincide, the faces sit flush (antiparallel normals), and the
+    /// deterministically derived in-plane tangents align (spin locked). See
+    /// `mate_residual::fixed_residual`.
     Fixed,
 }
 
