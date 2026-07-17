@@ -9,7 +9,8 @@
   },
   "scripts": {
     "test": "node run.mjs",
-    "eval": "node run.mjs"
+    "eval": "node run.mjs",
+    "test:oracle": "node test/oracle-10.mjs"
   },
   "engines": {
     "node": ">=18"

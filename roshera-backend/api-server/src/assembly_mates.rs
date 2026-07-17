@@ -21,7 +21,7 @@
 use crate::error_catalog::{ApiError, ErrorCode};
 use crate::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Json,
 };
 use geometry_engine::assembly::instancing::{InstanceId, InstancedAssembly};
@@ -1873,9 +1873,8 @@ pub async fn interference(
     State(state): State<AppState>,
     crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
     Path(id): Path<Uuid>,
-    body: Option<Json<CertifyRequest>>,
+    Query(req): Query<CertifyRequest>,
 ) -> Result<Json<InterferenceResponse>, ApiError> {
-    let req = body.map(|Json(b)| b).unwrap_or_default();
     let handle = state
         .instanced_assemblies
         .get(&id)

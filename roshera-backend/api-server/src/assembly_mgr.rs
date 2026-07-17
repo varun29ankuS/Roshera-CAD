@@ -961,6 +961,27 @@ pub async fn interferences(
     Ok(Json(InterferenceReport { pairs }))
 }
 
+/// `POST /api/assemblies/{id}/simulate` — **DEPRECATED** (legacy C surface;
+/// kinematic-assembly campaign, Slice 5, spec §3.1.3 C-retirement path).
+///
+/// This applies a rigid delta to one component and returns the new summary.
+/// It is NOT a kinematic drive and it certifies NOTHING: the motion is not
+/// solved against the mates, no joint parameter is driven, no clearance is
+/// swept, and the response carries no verdict at all. "Simulate" here means
+/// "move it and hope".
+///
+/// The certified equivalent is `POST /api/assembly/{id}/drag` on the
+/// instanced document: it DRIVES a joint parameter, re-solves the affected
+/// chain against the mates, clamps to the joint's declared limits with an
+/// at-limit fact, restores every pose if the drive proves unreachable, and
+/// embeds the constrainedness verdict — with `GET
+/// /api/assembly/{id}/interference` supplying the motion-stamped table the
+/// drive should be judged against.
+///
+/// Retained only because the C surface's own document type has no migration
+/// path yet (it copies geometry per component; B reference-instances). It is
+/// HTTP-only — deliberately never exposed to MCP — so no agent can reach it.
+/// Prefer the B surface for anything that must be true.
 pub async fn simulate_motion(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

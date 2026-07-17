@@ -8,6 +8,7 @@ import hubFlangeGdt from "./06-hub-flange-gdt.mjs";
 import stepRoundtrip from "./07-step-roundtrip.mjs";
 import saddleHonesty from "./08-saddle-honesty.mjs";
 import drawingPerf from "./09-drawing-perf.mjs";
+import assemblyKinematics from "./10-assembly-kinematics.mjs";
 
 export const scenarios = [
   gear,
@@ -19,4 +20,5 @@ export const scenarios = [
   stepRoundtrip,
   saddleHonesty,
   drawingPerf,
+  assemblyKinematics,
 ];
