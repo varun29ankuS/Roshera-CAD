@@ -27,6 +27,7 @@ pub mod joint;
 pub mod mate_anchor;
 pub mod mate_contact;
 pub mod mate_residual;
+pub mod motion;
 pub mod report;
 pub mod solve_input;
 pub mod solver;
@@ -46,6 +47,9 @@ pub use jacobian::JacobianProbe;
 pub use joint::Joint;
 pub use mate_anchor::{MateAnchorReport, UnanchoredFeature};
 pub use mate_contact::{DisconnectedMate, MateContactReport};
+pub use motion::{
+    DragOutcome, DragScope, DriveParam, DriveRefusal, LimitFact, RankTransition, WindingFact,
+};
 pub use report::AssemblyReport;
 pub use solve_input::{InputPose, SolveInput};
 pub use solver::{DofReport, Mobility, SolveReport, SolvedPose};

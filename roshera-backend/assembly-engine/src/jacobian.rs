@@ -57,6 +57,7 @@
 // for invariant-guarded escapes).
 #![allow(clippy::indexing_slicing)]
 
+use crate::motion::DriveParam;
 use crate::types::{Assembly, FeatureRef, Mate, MateKind};
 use parry3d_f64::na::{DMatrix, Matrix3, Point3, Quaternion, UnitQuaternion, Vector3};
 
@@ -163,13 +164,90 @@ impl ColumnLayout {
 /// The stacked residual over a mate subset (in subset order) — the
 /// row-order contract shared with [`analytic_jacobian`]/[`fd_jacobian`].
 pub(crate) fn residual_for(assembly: &Assembly, mate_indices: &[usize]) -> Vec<f64> {
+    residual_for_driven(assembly, mate_indices, &[])
+}
+
+/// The stacked residual over a mate subset FOLLOWED BY the driven-joint
+/// rows (Slice 5, spec §3.4 "Driven vs driving"): a driven parameter is
+/// not a special solver mode, it is one more residual row the joint
+/// contributes — `param(q) − target = 0`. Row order (mates in subset
+/// order, then drives in slice order) is the contract shared with
+/// [`analytic_jacobian_driven`].
+pub(crate) fn residual_for_driven(
+    assembly: &Assembly,
+    mate_indices: &[usize],
+    drives: &[DriveRow],
+) -> Vec<f64> {
     let mut g = Vec::new();
     for &mi in mate_indices {
         if let Some(mate) = assembly.mates.get(mi) {
             g.extend(assembly.mate_residual(mate));
         }
     }
+    for drive in drives {
+        g.extend(drive_residual(assembly, drive));
+    }
     g
+}
+
+/// One driven joint parameter: the residual row `param(q) − target = 0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DriveRow {
+    /// Index into `Assembly::mates` of the frame-pair mate being driven.
+    pub mate_index: u32,
+    pub param: DriveParam,
+    /// The value the parameter is locked to. For [`DriveParam::Rotation`]
+    /// this is an UNWRAPPED angle; the residual compares it against the
+    /// wrapped measurement through [`wrap_to_pi`], which is exact as long
+    /// as the caller steps by less than half a turn at a time (the
+    /// contract [`crate::motion::MAX_DRIVE_STEP`] enforces).
+    pub target: f64,
+}
+
+/// Wrap an angle into (−π, π]. The drive residual compares angles through
+/// this so that "θ is at the target" means θ ≡ target (mod 2π) — the only
+/// statement a pose can support — while staying smooth in the pose (wrap
+/// is locally the identity away from the ±π seam, and a drive step never
+/// reaches the seam because it is bounded below half a turn).
+pub(crate) fn wrap_to_pi(angle: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    let wrapped = angle % TAU;
+    if wrapped > PI {
+        wrapped - TAU
+    } else if wrapped <= -PI {
+        wrapped + TAU
+    } else {
+        wrapped
+    }
+}
+
+/// The drive's residual rows — one row, or NONE when the target mate has
+/// no readable frame pair (kept exactly in step with
+/// [`drive_row_grads`], so residual and Jacobian rows never desynchronise).
+fn drive_residual(assembly: &Assembly, drive: &DriveRow) -> Vec<f64> {
+    let Some((theta, s)) = assembly.joint_parameters_of(drive.mate_index) else {
+        return Vec::new();
+    };
+    match drive.param {
+        DriveParam::Rotation => vec![wrap_to_pi(theta - drive.target)],
+        DriveParam::Translation => vec![s - drive.target],
+    }
+}
+
+/// The drive's row gradients. `∂/∂q wrap(θ − target) = ∂θ/∂q` (wrap is
+/// locally the identity) and `∂/∂q (s − target) = ∂s/∂q` — exactly the
+/// joint-parameter gradients the coupling rows already differentiate.
+fn drive_row_grads(assembly: &Assembly, drive: &DriveRow) -> Vec<RowGrad> {
+    let Some((theta, slide)) = joint_parameter_grads(assembly, drive.mate_index) else {
+        return Vec::new();
+    };
+    if assembly.joint_parameters_of(drive.mate_index).is_none() {
+        return Vec::new();
+    }
+    match drive.param {
+        DriveParam::Rotation => vec![theta],
+        DriveParam::Translation => vec![slide],
+    }
 }
 
 // ── Gradient accumulation ───────────────────────────────────────────────
@@ -609,11 +687,27 @@ pub(crate) fn analytic_jacobian(
     layout: &ColumnLayout,
     mate_indices: &[usize],
 ) -> DMatrix<f64> {
+    analytic_jacobian_driven(assembly, layout, mate_indices, &[])
+}
+
+/// The analytic Jacobian over `mate_indices` FOLLOWED BY the driven-joint
+/// rows — the row-order contract of [`residual_for_driven`]. With an empty
+/// `drives` this is bit-for-bit [`analytic_jacobian`], so every pre-Slice-5
+/// path is unchanged by construction.
+pub(crate) fn analytic_jacobian_driven(
+    assembly: &Assembly,
+    layout: &ColumnLayout,
+    mate_indices: &[usize],
+    drives: &[DriveRow],
+) -> DMatrix<f64> {
     let mut all_rows: Vec<RowGrad> = Vec::new();
     for &mi in mate_indices {
         if let Some(mate) = assembly.mates.get(mi) {
             all_rows.extend(mate_row_grads(assembly, mate));
         }
+    }
+    for drive in drives {
+        all_rows.extend(drive_row_grads(assembly, drive));
     }
     let mut jac = DMatrix::<f64>::zeros(all_rows.len(), layout.cols);
     for (r, row) in all_rows.iter().enumerate() {

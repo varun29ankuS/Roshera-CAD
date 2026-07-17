@@ -199,8 +199,8 @@ impl Assembly {
         match mate.kind {
             MateKind::GearRatio { ratio, at, couples } => {
                 let (Some((theta1, _)), Some((theta2, _))) = (
-                    self.joint_parameters_of(couples[0]),
-                    self.joint_parameters_of(couples[1]),
+                    self.joint_parameters_unwrapped(couples[0]),
+                    self.joint_parameters_unwrapped(couples[1]),
                 ) else {
                     return Vec::new();
                 };
@@ -212,15 +212,15 @@ impl Assembly {
                 couples,
             } => {
                 let (Some((theta, _)), Some((_, s))) = (
-                    self.joint_parameters_of(couples[0]),
-                    self.joint_parameters_of(couples[1]),
+                    self.joint_parameters_unwrapped(couples[0]),
+                    self.joint_parameters_unwrapped(couples[1]),
                 ) else {
                     return Vec::new();
                 };
                 return vec![pinion_radius * (theta - at[0]) - (s - at[1])];
             }
             MateKind::Screw { lead, at, couples } => {
-                let Some((theta, s)) = self.joint_parameters_of(couples) else {
+                let Some((theta, s)) = self.joint_parameters_unwrapped(couples) else {
                     return Vec::new();
                 };
                 return vec![(s - at[1]) - lead * (theta - at[0]) / std::f64::consts::TAU];
@@ -332,6 +332,25 @@ impl Assembly {
         let theta = (xa.cross(&xb).dot(&za)).atan2(xa.dot(&xb));
         let s = (ob - oa).dot(&za);
         Some((theta, s))
+    }
+
+    /// Joint parameters of mate `index` with θ UNWRAPPED by the mate's
+    /// recorded winding: `θ_unwrapped = θ_wrapped + turns·2π`
+    /// (`s` is already unbounded and needs no unwinding).
+    ///
+    /// This is the form every COUPLING residual reads. `atan2` can only
+    /// ever report the wrapped angle, so a coupling driven through
+    /// multiple turns would otherwise see θ snap from +π to −π every
+    /// half-turn and haul its coupled parameter back with it — the
+    /// premise-#5 corruption. The winding is written by
+    /// [`Assembly::drag`], which walks the path and therefore knows it;
+    /// with no winding recorded this is exactly `joint_parameters_of`.
+    pub fn joint_parameters_unwrapped(&self, index: u32) -> Option<(f64, f64)> {
+        let (theta, s) = self.joint_parameters_of(index)?;
+        Some((
+            theta + f64::from(self.turns_of(index)) * std::f64::consts::TAU,
+            s,
+        ))
     }
 
     /// L2 norm of a mate's residual — 0 iff the mate holds.

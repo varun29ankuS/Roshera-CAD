@@ -19,7 +19,8 @@
 //! system path is the special case of singleton blocks over every mate.
 
 use crate::jacobian::{
-    analytic_jacobian, apply_block_step, residual_for, singleton_blocks, BodyBlock, ColumnLayout,
+    analytic_jacobian, analytic_jacobian_driven, apply_block_step, residual_for_driven,
+    singleton_blocks, BodyBlock, ColumnLayout, DriveRow,
 };
 use crate::types::{Assembly, InstanceId};
 use parry3d_f64::na::{DMatrix, DVector};
@@ -84,6 +85,18 @@ pub(crate) fn production_jacobian(
     analytic_jacobian(assembly, &layout, mate_indices)
 }
 
+/// [`production_jacobian`] with the Slice-5 driven-joint rows appended.
+/// With an empty `drives` this IS `production_jacobian`.
+pub(crate) fn production_jacobian_driven(
+    assembly: &Assembly,
+    blocks: &[BodyBlock],
+    mate_indices: &[usize],
+    drives: &[DriveRow],
+) -> DMatrix<f64> {
+    let layout = ColumnLayout::build(assembly, blocks);
+    analytic_jacobian_driven(assembly, &layout, mate_indices, drives)
+}
+
 /// Convergence tolerance on `‖g‖` — shared by the dense solve, the
 /// decomposition executor's verification, and the seated-condensation
 /// gate so "satisfied" means one thing everywhere.
@@ -100,16 +113,30 @@ pub(crate) fn gauss_newton(
     blocks: &[BodyBlock],
     mate_indices: &[usize],
 ) -> SolveReport {
+    gauss_newton_driven(assembly, blocks, mate_indices, &[])
+}
+
+/// [`gauss_newton`] with driven-joint rows stacked under the mate rows
+/// (Slice 5). A drive is just more residual — the SAME core drives it to
+/// zero, so a driven re-solve has exactly the solve's honesty contract
+/// (`converged` re-measured, never asserted). With an empty `drives` this
+/// is byte-for-byte [`gauss_newton`].
+pub(crate) fn gauss_newton_driven(
+    assembly: &mut Assembly,
+    blocks: &[BodyBlock],
+    mate_indices: &[usize],
+    drives: &[DriveRow],
+) -> SolveReport {
     const MAX_ITERS: usize = 200;
     const STEP_TOL: f64 = 1e-13;
     let mut iterations = 0;
-    let mut norm = residual_norm(&residual_for(assembly, mate_indices));
+    let mut norm = residual_norm(&residual_for_driven(assembly, mate_indices, drives));
     while iterations < MAX_ITERS && norm > SOLVE_TOL {
-        let g = residual_for(assembly, mate_indices);
+        let g = residual_for_driven(assembly, mate_indices, drives);
         if g.is_empty() {
             break;
         }
-        let jac = production_jacobian(assembly, blocks, mate_indices);
+        let jac = production_jacobian_driven(assembly, blocks, mate_indices, drives);
         let pinv = match jac.pseudo_inverse(1e-9) {
             Ok(p) => p,
             Err(_) => break,
@@ -127,7 +154,7 @@ pub(crate) fn gauss_newton(
             apply_block_step(assembly, block, &s);
         }
         iterations += 1;
-        norm = residual_norm(&residual_for(assembly, mate_indices));
+        norm = residual_norm(&residual_for_driven(assembly, mate_indices, drives));
         if step_norm < STEP_TOL {
             break;
         }

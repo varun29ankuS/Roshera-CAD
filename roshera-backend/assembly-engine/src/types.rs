@@ -2,6 +2,7 @@
 //! mate references.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Stable identifier of an instance within an assembly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -224,6 +225,28 @@ pub struct Assembly {
     pub instances: Vec<Instance>,
     pub mates: Vec<Mate>,
     pub ground: InstanceId,
+    /// Accumulated FULL TURNS of each frame-pair mate's rotational joint
+    /// parameter, keyed by mate index (kinematic-assembly campaign, Slice
+    /// 5; spec §3.4 driven parameters).
+    ///
+    /// # Why this exists
+    ///
+    /// [`Assembly::joint_parameters_of`] reads θ through `atan2`, so it is
+    /// WRAPPED to (−π, π] — the only thing a pose can tell you. A pose
+    /// alone genuinely cannot distinguish "θ = 0" from "θ = 4π": the
+    /// winding is a property of the PATH taken, not of the configuration.
+    /// [`Assembly::drag`] walks a continuous path, so it knows the winding
+    /// and records it here; the coupling residuals (Screw / GearRatio /
+    /// RackPinion) then read the UNWRAPPED angle
+    /// ([`Assembly::joint_parameters_unwrapped`]) and a two-turn screw
+    /// advances its nut by two leads instead of snapping home every
+    /// half-turn (slice-3/4 report, premise #5).
+    ///
+    /// Absent entry = zero turns, so a freshly declared assembly (and every
+    /// pre-Slice-5 payload — the field serde-defaults) behaves exactly as
+    /// before: unwrapped ≡ wrapped.
+    #[serde(default)]
+    pub windings: BTreeMap<u32, i32>,
 }
 
 impl Assembly {
@@ -233,7 +256,14 @@ impl Assembly {
             instances: Vec::new(),
             mates: Vec::new(),
             ground,
+            windings: BTreeMap::new(),
         }
+    }
+
+    /// Accumulated full turns of mate `index`'s rotational joint parameter
+    /// (0 when the mate has never been wound). See [`Self::windings`].
+    pub fn turns_of(&self, index: u32) -> i32 {
+        self.windings.get(&index).copied().unwrap_or(0)
     }
 
     /// Look up an instance by id.

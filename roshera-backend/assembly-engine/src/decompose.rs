@@ -73,6 +73,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use crate::jacobian::{residual_for, BodyBlock};
+use crate::motion::DragScope;
 use crate::solver::{gauss_newton, residual_norm, SolveReport, SolvedPose, SOLVE_TOL};
 use crate::types::{Assembly, MateKind};
 use serde::{Deserialize, Serialize};
@@ -218,54 +219,117 @@ struct Body {
     members: Vec<usize>,
 }
 
-impl Assembly {
-    /// Structural-vs-numeric dual DOF report (module doc). Pure — reads
-    /// the assembly at its current poses.
-    pub fn dual_dof_report(&self) -> StructuralDofReport {
-        let numeric = self.dof_analysis();
-        let enforcement = self.mate_enforcement_report();
-        let structural_rank_sum: usize = self
-            .mates
+/// The mate graph's structure after condensation + component splitting
+/// (module-doc steps 1-2) — the shared front half of the pipeline.
+///
+/// Extracted so the Slice-5 kinematic drag can SCOPE its re-solve to the
+/// driven mate's component using exactly the partition the solver plans
+/// over: "only the affected chain moves" is then the same statement as
+/// "only that component is handed to Newton", not a parallel notion of
+/// adjacency that could drift out of step with the planner.
+pub(crate) struct Decomposition {
+    /// Per-mate: does the solver numerically enforce it.
+    enforced: Vec<bool>,
+    /// Per-mate: the instance indices its residual can touch.
+    supports: Vec<Vec<usize>>,
+    /// Rigid bodies after seated-fastened condensation.
+    bodies: Vec<Body>,
+    /// Instance index → body index.
+    body_of: Vec<usize>,
+    /// Connected components over the NON-ground bodies, each a list of
+    /// body indices; deterministically ordered by smallest instance.
+    components: Vec<Vec<usize>>,
+    /// Instances absorbed into a larger rigid body by condensation.
+    condensation_merges: usize,
+}
+
+impl Decomposition {
+    /// The instance indices of a component's bodies (ascending).
+    fn instances_of(&self, comp: &[usize]) -> Vec<usize> {
+        let mut instances: Vec<usize> = comp
             .iter()
-            .enumerate()
-            .filter(|(idx, _)| {
-                enforcement
-                    .mates
-                    .get(*idx)
-                    .is_some_and(|verdict| verdict.enforced)
-            })
-            .map(|(_, mate)| mate.kind.structural_rank())
-            .sum();
-        let structural_dof = numeric.config_dim as i64 - structural_rank_sum as i64;
-        StructuralDofReport {
-            config_dim: numeric.config_dim,
-            structural_rank_sum,
-            structural_dof,
-            numeric_rank: numeric.rank,
-            numeric_dof: numeric.dof,
-            special_geometry: structural_dof != numeric.dof as i64,
-        }
+            .flat_map(|&b| self.bodies[b].members.iter().copied())
+            .collect();
+        instances.sort_unstable();
+        instances
     }
 
-    /// Decomposed solve (module doc pipeline). Semantics match
-    /// [`Assembly::solve`] — poses written in place, honest
-    /// `converged`/`final_residual_norm` re-measured over EVERY mate at
-    /// exit — with near-linear work on tree-like assemblies.
-    pub fn solve_decomposed(&mut self) -> (SolveReport, DecompositionStats) {
-        let mut stats = DecompositionStats::default();
-        let n = self.instances.len();
-        let all_mates: Vec<usize> = (0..self.mates.len()).collect();
-        if n == 0 {
-            let norm = residual_norm(&residual_for(self, &all_mates));
-            return (
-                SolveReport {
-                    converged: norm <= SOLVE_TOL,
-                    iterations: 0,
-                    final_residual_norm: norm,
-                },
-                stats,
-            );
+    /// The enforced mates whose support touches any of `instances`
+    /// (ascending declaration order).
+    fn mates_touching(&self, instances: &BTreeSet<usize>) -> Vec<usize> {
+        (0..self.supports.len())
+            .filter(|&mi| {
+                self.enforced[mi] && self.supports[mi].iter().any(|i| instances.contains(i))
+            })
+            .collect()
+    }
+
+    /// The component (as body indices) whose instances the given mate's
+    /// residual touches — the drag's re-solve scope. `None` when the mate
+    /// is unenforced or touches only ground.
+    fn component_of_mate(&self, mate_idx: usize) -> Option<&Vec<usize>> {
+        if !self.enforced.get(mate_idx).copied().unwrap_or(false) {
+            return None;
         }
+        let support = self.supports.get(mate_idx)?;
+        self.components.iter().find(|comp| {
+            comp.iter()
+                .any(|&b| support.iter().any(|&i| self.body_of[i] == b))
+        })
+    }
+
+    /// The Slice-5 drag scope for a driven mate: the condensed blocks the
+    /// re-solve may move, the instrumented [`DragScope`], and the mate
+    /// subset whose residuals enter the system.
+    ///
+    /// An EMPTY block list is a meaningful answer, not a failure: it says
+    /// both sides of the driven mate condensed into the ground body — the
+    /// joint is welded shut by a seated `Fastened` elsewhere in the stack,
+    /// so no column exists to move it. The drag reports the drive residual
+    /// rather than inventing motion.
+    pub(crate) fn drag_scope(
+        &self,
+        assembly: &Assembly,
+        mate_idx: usize,
+    ) -> (Vec<BodyBlock>, DragScope, Vec<usize>) {
+        let Some(comp) = self.component_of_mate(mate_idx) else {
+            // No component: report the driven mate's own rows so the
+            // residual measured is the honest one for this joint.
+            let mates = if self.enforced.get(mate_idx).copied().unwrap_or(false) {
+                vec![mate_idx]
+            } else {
+                Vec::new()
+            };
+            return (Vec::new(), DragScope::default(), mates);
+        };
+        let comp_instances = self.instances_of(comp);
+        let instance_set: BTreeSet<usize> = comp_instances.iter().copied().collect();
+        let comp_mates = self.mates_touching(&instance_set);
+        let blocks: Vec<BodyBlock> = comp
+            .iter()
+            .map(|&b| BodyBlock {
+                members: self.bodies[b].members.clone(),
+            })
+            .collect();
+        let scope = DragScope {
+            instances: comp_instances
+                .iter()
+                .filter_map(|&i| assembly.instances.get(i).map(|inst| inst.id))
+                .filter(|&id| id != assembly.ground)
+                .collect(),
+            mates: comp_mates
+                .iter()
+                .filter_map(|&mi| u32::try_from(mi).ok())
+                .collect(),
+        };
+        (blocks, scope, comp_mates)
+    }
+}
+
+impl Assembly {
+    /// Condense + split the mate graph (module-doc steps 1-2). Pure.
+    pub(crate) fn decomposition(&self) -> Decomposition {
+        let n = self.instances.len();
         let enforcement = self.mate_enforcement_report();
         let enforced: Vec<bool> = (0..self.mates.len())
             .map(|idx| {
@@ -281,6 +345,7 @@ impl Assembly {
         let ground_idx = self.instances.iter().position(|i| i.id == self.ground);
 
         // 1. Seated-fastened condensation.
+        let mut condensation_merges = 0usize;
         let mut uf = UnionFind::new(n);
         for (mi, mate) in self.mates.iter().enumerate() {
             if !enforced[mi] || !matches!(mate.kind, MateKind::Fastened | MateKind::Fixed) {
@@ -296,7 +361,7 @@ impl Assembly {
                 continue;
             };
             if uf.union(ia, ib) {
-                stats.condensation_merges += 1;
+                condensation_merges += 1;
             }
         }
         let mut body_of = vec![usize::MAX; n];
@@ -321,7 +386,6 @@ impl Assembly {
         for body in &mut bodies {
             body.members.sort_unstable();
         }
-        stats.condensed_bodies = bodies.len();
         let ground_body = ground_idx.map(|g| body_of[g]);
 
         // 2. Connected components over NON-ground bodies.
@@ -379,6 +443,76 @@ impl Assembly {
                 .and_then(|&b| bodies[b].members.first().copied())
                 .unwrap_or(usize::MAX)
         });
+
+        Decomposition {
+            enforced,
+            supports,
+            bodies,
+            body_of,
+            components,
+            condensation_merges,
+        }
+    }
+}
+
+impl Assembly {
+    /// Structural-vs-numeric dual DOF report (module doc). Pure — reads
+    /// the assembly at its current poses.
+    pub fn dual_dof_report(&self) -> StructuralDofReport {
+        let numeric = self.dof_analysis();
+        let enforcement = self.mate_enforcement_report();
+        let structural_rank_sum: usize = self
+            .mates
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| {
+                enforcement
+                    .mates
+                    .get(*idx)
+                    .is_some_and(|verdict| verdict.enforced)
+            })
+            .map(|(_, mate)| mate.kind.structural_rank())
+            .sum();
+        let structural_dof = numeric.config_dim as i64 - structural_rank_sum as i64;
+        StructuralDofReport {
+            config_dim: numeric.config_dim,
+            structural_rank_sum,
+            structural_dof,
+            numeric_rank: numeric.rank,
+            numeric_dof: numeric.dof,
+            special_geometry: structural_dof != numeric.dof as i64,
+        }
+    }
+
+    /// Decomposed solve (module doc pipeline). Semantics match
+    /// [`Assembly::solve`] — poses written in place, honest
+    /// `converged`/`final_residual_norm` re-measured over EVERY mate at
+    /// exit — with near-linear work on tree-like assemblies.
+    pub fn solve_decomposed(&mut self) -> (SolveReport, DecompositionStats) {
+        let mut stats = DecompositionStats::default();
+        let n = self.instances.len();
+        let all_mates: Vec<usize> = (0..self.mates.len()).collect();
+        if n == 0 {
+            let norm = residual_norm(&residual_for(self, &all_mates));
+            return (
+                SolveReport {
+                    converged: norm <= SOLVE_TOL,
+                    iterations: 0,
+                    final_residual_norm: norm,
+                },
+                stats,
+            );
+        }
+        let Decomposition {
+            enforced,
+            supports,
+            bodies,
+            body_of,
+            components,
+            condensation_merges,
+        } = self.decomposition();
+        stats.condensation_merges = condensation_merges;
+        stats.condensed_bodies = bodies.len();
         stats.components = components.len();
 
         // 3–5. Per-component plan + execute + verify (deterministic order).
