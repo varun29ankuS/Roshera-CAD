@@ -922,6 +922,36 @@ impl BRepModel {
         pid
     }
 
+    /// Canonical persistent-id of the EDGE shared by two faces, for blend
+    /// (fillet / chamfer) lineage (#11, slice 40-E). Derived from the two
+    /// neighbour face PIDs ordered canonically (min, max) so it is independent
+    /// of edge-store index churn and stable under a MOULD — the neighbour
+    /// identities do not move when a blend radius / setback is edited. A
+    /// neighbour lacking a PID is minted one first (via
+    /// [`Self::ensure_face_annotation_key`]) so the derivation is always total.
+    pub fn blend_edge_source_pid(
+        &mut self,
+        face_a: FaceId,
+        face_b: FaceId,
+    ) -> crate::primitives::persistent_id::PersistentId {
+        use crate::primitives::persistent_id::{PersistentId, Role};
+        let pa = self.ensure_face_annotation_key(face_a);
+        let pb = self.ensure_face_annotation_key(face_b);
+        let (lo, hi) = if pa.as_u128() <= pb.as_u128() {
+            (pa, pb)
+        } else {
+            (pb, pa)
+        };
+        PersistentId::derive(
+            &[lo, hi],
+            "blend_edge",
+            &Role::Generic {
+                source_pid: lo,
+                label: "shared".to_string(),
+            },
+        )
+    }
+
     /// Attach a GD&T annotation to a FACE by its (resolved) persistent id.
     /// Returns the persistent key so the caller can re-query the feature later.
     pub fn attach_face_annotation(

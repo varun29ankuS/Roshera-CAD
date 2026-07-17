@@ -1093,6 +1093,19 @@ pub fn fillet_edges(
         )?;
         fillet_faces.extend(corner_faces);
 
+        // Persistent-id lineage (#11, slice 40-E): each roll face derives from
+        // its source edge (via the two faces it bordered), corner patches from
+        // the host solid PID. The re-trimmed neighbour faces keep their FaceId
+        // and pre-fillet PID, so an agent's "the fillet on edge e" and a mate /
+        // label anchored to a filleted-and-adjacent face both survive.
+        assign_fillet_pids(
+            model,
+            solid_id,
+            &edge_to_face,
+            &edge_face_map,
+            &fillet_faces,
+        );
+
         // Task 3A (3B review finding M2) — pending registration now
         // happens BEFORE the dispatch above, so a vertex marked
         // pending and then consumed by this same call's transitions
@@ -9060,6 +9073,76 @@ fn update_adjacent_faces(
     }
 
     Ok(())
+}
+
+/// Assign persistent-id lineage to a fillet's output faces (#11, slice 40-E).
+///
+/// Each roll face derives from its source EDGE's canonical identity via
+/// [`Role::FilletRoll`]; the edge identity in turn derives (via
+/// [`BRepModel::blend_edge_source_pid`]) from the two faces it bordered, ordered
+/// by PID. So the roll PID is stable across a radius MOULD — the neighbour face
+/// PIDs do not move — and distinct per filleted edge. Corner patch faces,
+/// synthesized at shared vertices with no single source edge, take a
+/// deterministic [`Role::Generic`] PID from the host solid PID + an ordinal, so
+/// replay reproduces them. The re-trimmed adjacent faces keep their FaceId
+/// (splice mutates loops in place), so their pre-fillet PIDs survive untouched
+/// and are intentionally NOT reassigned — that is what lets a mate or label
+/// anchored to a filleted-and-adjacent face survive the operation.
+fn assign_fillet_pids(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    edge_to_face: &HashMap<EdgeId, FaceId>,
+    edge_face_map: &HashMap<EdgeId, (FaceId, FaceId)>,
+    fillet_faces: &[FaceId],
+) {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+
+    let mut roll_faces: HashSet<FaceId> = HashSet::with_capacity(edge_to_face.len());
+    // Deterministic order over the filleted edges so any incidental minting
+    // (a neighbour face without a prior PID) is replay-stable.
+    let mut edges: Vec<(EdgeId, FaceId)> = edge_to_face.iter().map(|(&e, &f)| (e, f)).collect();
+    edges.sort_unstable_by_key(|&(e, _)| e);
+    for (edge_id, roll_face) in edges {
+        let edge_pid = match edge_face_map.get(&edge_id) {
+            Some(&(fa, fb)) => model.blend_edge_source_pid(fa, fb),
+            None => {
+                // No resolved neighbour pair (grounded edges always have one;
+                // this is a defensive fallback) — a face-keyed root still gives
+                // the roll a durable, distinct id.
+                let seed = model.next_root_seed(&format!("fillet_edge:{edge_id}"));
+                PersistentId::root(&seed)
+            }
+        };
+        let fpid = PersistentId::derive(
+            &[edge_pid],
+            "fillet_edges",
+            &Role::FilletRoll {
+                source_edge_pid: edge_pid,
+            },
+        );
+        model.set_face_pid(roll_face, fpid);
+        roll_faces.insert(roll_face);
+    }
+
+    // Corner patch faces: no single source edge. Derive from the solid PID + a
+    // stable ordinal (fillet_faces is built in a fixed construction order).
+    let solid_pid = model.solid_pid(solid_id).unwrap_or_else(|| {
+        let seed = model.next_root_seed("fillet_solid");
+        PersistentId::root(&seed)
+    });
+    let mut ordinal = 0u32;
+    for &f in fillet_faces {
+        if roll_faces.contains(&f) || model.face_pid(f).is_some() {
+            continue;
+        }
+        let role = Role::Generic {
+            source_pid: solid_pid,
+            label: format!("fillet_corner{ordinal}"),
+        };
+        let fpid = PersistentId::derive(&[solid_pid], "fillet_edges", &role);
+        model.set_face_pid(f, fpid);
+        ordinal += 1;
+    }
 }
 
 /// Propagate edge selection based on mode
