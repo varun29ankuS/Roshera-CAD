@@ -375,6 +375,55 @@ pub fn catalog() -> Vec<MatrixCase> {
         half: 3.5,
     });
 
+    // ----- cylinder × sphere (bool7 general-position QSIC cells) -----
+    // SIDE-BITE: host cylinder r1.5 (axis Z, z∈[−2,2]) bitten laterally by
+    // an off-axis sphere r1.0 centred at (1.97, 0.3, 0): radial offset
+    // d ≈ 1.993 → |r_c−d| ≈ 0.49 < r_s = 1 < r_c+d ≈ 3.49, the PARTIAL-BITE
+    // regime (one closed QSIC loop; window on the wall, lens on the sphere).
+    cases.push(MatrixCase {
+        name: "cylsphere/side-bite",
+        build: Box::new(|m: &mut BRepModel| {
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Vector3::new(0.0, 0.0, -2.0), Vector3::Z, 1.5, 4.0)
+                .expect("host cylinder");
+            let a = last_solid(m);
+            TopologyBuilder::new(m)
+                .create_sphere_3d(Vector3::new(1.97, 0.3, 0.0), 1.0)
+                .expect("tool sphere");
+            (a, last_solid(m))
+        }),
+        in_a: Box::new(|x, y, z| x * x + y * y <= 1.5 * 1.5 && z.abs() <= 2.0),
+        in_b: Box::new(|x, y, z| {
+            let (dx, dy) = (x - 1.97, y - 0.3);
+            dx * dx + dy * dy + z * z <= 1.0
+        }),
+        half: 3.5,
+    });
+    // THROUGH-PIERCE: host sphere r1.5 drilled clean through by an off-axis
+    // tool cylinder r0.6 (axis Z through (0.4, 0), z∈[−2.5, 2.5]):
+    // r_s = 1.5 > r_c + d = 1.0, the FULL-PIERCE regime (two QSIC ovals;
+    // encircling rings on the tool wall, two caps + an annular barrel on
+    // the sphere; the difference is a genus-1 drilled ball).
+    cases.push(MatrixCase {
+        name: "cylsphere/through-pierce",
+        build: Box::new(|m: &mut BRepModel| {
+            TopologyBuilder::new(m)
+                .create_sphere_3d(Vector3::ZERO, 1.5)
+                .expect("host sphere");
+            let a = last_solid(m);
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Vector3::new(0.4, 0.0, -2.5), Vector3::Z, 0.6, 5.0)
+                .expect("tool cylinder");
+            (a, last_solid(m))
+        }),
+        in_a: Box::new(|x, y, z| x * x + y * y + z * z <= 1.5 * 1.5),
+        in_b: Box::new(|x, y, z| {
+            let dx = x - 0.4;
+            dx * dx + y * y <= 0.6 * 0.6 && z.abs() <= 2.5
+        }),
+        half: 3.0,
+    });
+
     cases
 }
 
@@ -432,6 +481,18 @@ mod tests {
         ("cylcyl/cross-bore", 0),
         ("cylcyl/cross-bore", 1),
         ("cylcyl/cross-bore", 2),
+        // bool7 general-position cyl×sphere QSIC (partial bite + full
+        // pierce): union (composite hull), intersection (lens / capped bore
+        // core) and difference (side bite / genus-1 drilled ball) all hold
+        // both oracles (verified 2026-07-17: side-bite vol 31.83/31.90,
+        // 0.55/0.57, 27.66/27.72; through-pierce 16.65/16.82, 3.11/3.11,
+        // 11.00/11.22; all closed/manifold/oriented).
+        ("cylsphere/side-bite", 0),
+        ("cylsphere/side-bite", 1),
+        ("cylsphere/side-bite", 2),
+        ("cylsphere/through-pierce", 0),
+        ("cylsphere/through-pierce", 1),
+        ("cylsphere/through-pierce", 2),
     ];
 
     /// Cells KNOWN to be broken (a pre-existing regression, NOT a green cell).

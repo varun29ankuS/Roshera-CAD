@@ -2778,8 +2778,8 @@ fn cylinder_cylinder_intersection(
 /// 1994 taxonomy).
 ///
 /// Parameterization: Levin's pencil method with the SMALLER cylinder as the
-/// ruled carrier (`primitives::qsic_curve::CylCylQuartic` module docs cite
-/// Levin 1976/1979 and Wang–Goldman–Tu 2003). `CylCylQuartic::full_oval`
+/// ruled carrier (`primitives::qsic_curve::QsicCurve` module docs cite
+/// Levin 1976/1979 and Wang–Goldman–Tu 2003). `QsicCurve::full_oval`
 /// validates strict transversality (Δ(θ) > 0 for every carrier generator);
 /// on refusal — grazing, tangency (#86 class), or non-piercing — this
 /// producer returns `Ok(None)` and the marching fallback keeps ownership
@@ -2811,7 +2811,7 @@ fn cylinder_cylinder_transversal_quartic(
     cyl_b: &crate::primitives::surface::Cylinder,
     tolerance: &Tolerance,
 ) -> OperationResult<Option<Vec<SurfaceIntersectionCurve>>> {
-    use crate::primitives::qsic_curve::CylCylQuartic;
+    use crate::primitives::qsic_curve::QsicCurve;
 
     let trace = std::env::var("ROSHERA_BOOL_TRACE").is_ok();
     // UNEQUAL radius? Equal-radius pairs are owned by the two-ellipse path
@@ -2833,7 +2833,7 @@ fn cylinder_cylinder_transversal_quartic(
 
     let mut curves = Vec::with_capacity(2);
     for branch in [1.0f64, -1.0f64] {
-        let quartic = match CylCylQuartic::full_oval(
+        let quartic = match QsicCurve::full_oval(
             resolved.origin,
             resolved.axis,
             resolved.radius,
@@ -2896,10 +2896,10 @@ fn cylinder_cylinder_transversal_quartic(
     Ok(Some(curves))
 }
 
-/// UV samples of a [`CylCylQuartic`] on a cylinder it lies on (mirror of
+/// UV samples of a [`QsicCurve`] on a cylinder it lies on (mirror of
 /// `compute_ellipse_cylinder_parameters`; 64 samples for the wavier quartic).
 fn compute_quartic_cylinder_parameters(
-    quartic: &crate::primitives::qsic_curve::CylCylQuartic,
+    quartic: &crate::primitives::qsic_curve::QsicCurve,
     cylinder: &crate::primitives::surface::Cylinder,
 ) -> OperationResult<Vec<(f64, f64)>> {
     let mut params = Vec::new();
@@ -3612,9 +3612,14 @@ fn cylinder_sphere_intersection(
     let s_axial = rel.dot(&axis);
     let d = (rel - axis * s_axial).magnitude(); // radial offset from the axis
 
-    // Off-axis → general quartic; no closed form. Marching (step-capped) handles
-    // it without hanging.
+    // Off-axis → general-position QSIC (bool7 residual): one bite loop or
+    // two pierce ovals, exact on both surfaces (`qsic_curve` module docs).
+    // Refusals — near-tangency (#86 class), rim-straddling loops — return
+    // `None` and the step-capped marching fallback keeps ownership.
     if d > tol {
+        if let Some(curves) = cylinder_sphere_general_quartic(cyl, sphere, cyl_is_a, tolerance)? {
+            return Ok(curves);
+        }
         return march_surface_intersection(surface_a, surface_b, tolerance);
     }
 
@@ -3657,6 +3662,245 @@ fn cylinder_sphere_intersection(
         });
     }
     Ok(curves)
+}
+
+/// GENERAL-POSITION cylinder×sphere intersection (the bool7 residual): the
+/// sphere centre is OFF the cylinder axis (`d > τ`), so the intersection is a
+/// genuine spatial quartic — no circle special case applies. The regime is
+/// CLOSED FORM in the sphere case (`qsic_curve` module docs: the resolvent
+/// discriminant is the pure cosine `Δ/4 = α + β·cos(θ−θ_m)`, `α = r_s²−r_c²−d²`,
+/// `β = 2 r_c d`):
+///
+///   * `r_s > r_c + d`   — FULL PIERCE: the cylinder passes completely through
+///     the sphere → two closed ovals ([`QsicCurve::full_oval_on_sphere`]),
+///     encircling rings on the cylinder wall, two caps + a two-hole barrel on
+///     the sphere;
+///   * `|r_c − d| < r_s < r_c + d` — PARTIAL BITE: one closed loop on the
+///     exact branch-point-regularized φ-chart
+///     ([`QsicCurve::sphere_bite_loop`]) — a window on the cylinder wall, a
+///     lens cap on the sphere;
+///   * `r_s < |r_c − d|` or `d > r_c + r_s` — NON-REACHING: the sphere never
+///     touches the (infinite) lateral → analytically EMPTY (`Some(vec![])`),
+///     the same typed no-curve outcome the coaxial path returns for enclosed
+///     spheres.
+///
+/// HONESTY FENCES (→ `Ok(None)`, marching fallback keeps ownership — the #86
+/// near-tangency class stays typed-refused, never approximated):
+///
+///   * tangency clearance: both `|r_s − (r_c + d)|` and `|r_s − |r_c − d||`
+///     must exceed `authority::TAU_COINCIDE` (1e-5). The tangency-adjacent
+///     features scale as `√(clearance·R)` ≥ ~3e-3 for unit-scale radii —
+///     REAL geometry above every weld/absorb reach per the two-regime model
+///     (the derivation the authority requires for a new gate; this is a
+///     derived reach, not a fresh constant);
+///   * axial containment: a loop/oval that crosses the cylinder's finite rim
+///     is refused (the band/window splitters own only rim-clear loops; a
+///     straddler would need cap-edge co-splitting that does not exist yet).
+///     Ovals falling ENTIRELY beyond the extent are skipped (no cut on this
+///     face — mirrors the coaxial circle path's extent check).
+///
+/// Each emitted loop carries FOUR exact quarter-point pre-split crossings —
+/// the same `presplit_cyl_cyl_quartic_loops` shared-arc mechanism the cyl-cyl
+/// ovals use (manifold by construction across both operand walls).
+fn cylinder_sphere_general_quartic(
+    cyl: &crate::primitives::surface::Cylinder,
+    sphere: &crate::primitives::surface::Sphere,
+    cyl_is_a: bool,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<Vec<SurfaceIntersectionCurve>>> {
+    use crate::primitives::qsic_curve::QsicCurve;
+
+    let trace = std::env::var("ROSHERA_BOOL_TRACE").is_ok();
+    let axis = cyl.axis;
+    let origin = cyl.origin;
+    let rc = cyl.radius;
+    let rs = sphere.radius;
+    let tol = tolerance.distance();
+
+    let rel = sphere.center - origin;
+    let s_axial = rel.dot(&axis);
+    let d = (rel - axis * s_axial).magnitude();
+
+    // Tangency clearances (module doc): positive outer = bite side of the
+    // outer tangency; positive inner = the sphere genuinely reaches the wall.
+    let margin = crate::math::authority::TAU_COINCIDE;
+    let outer_clearance = (rc + d) - rs; // < 0 → full pierce
+    let inner_clearance = rs - (rc - d).abs();
+
+    if inner_clearance < -margin {
+        // Non-reaching: analytically no lateral curve.
+        if trace {
+            eprintln!(
+                "[bool]     cyl_sphere_general: NON-REACHING (inner clearance {inner_clearance:.3e}) → empty"
+            );
+        }
+        return Ok(Some(vec![]));
+    }
+    if inner_clearance.abs() <= margin || outer_clearance.abs() <= margin {
+        // #86 near-tangency band — typed refusal, marcher keeps ownership.
+        if trace {
+            eprintln!(
+                "[bool]     cyl_sphere_general: NEAR-TANGENT (outer {outer_clearance:.3e}, \
+                 inner {inner_clearance:.3e}, margin {margin:.1e}) → marcher"
+            );
+        }
+        return Ok(None);
+    }
+
+    let (h_lo, h_hi) = match cyl.height_limits {
+        Some([a, b]) => (a.min(b), a.max(b)),
+        None => (f64::NEG_INFINITY, f64::INFINITY),
+    };
+    // Extent classification for a loop spanning [lo, hi] axially.
+    #[derive(PartialEq)]
+    enum Extent {
+        Inside,
+        Outside,
+        Straddles,
+    }
+    let classify_extent = |lo: f64, hi: f64| -> Extent {
+        if hi < h_lo - tol || lo > h_hi + tol {
+            Extent::Outside
+        } else if lo > h_lo + tol && hi < h_hi - tol {
+            Extent::Inside
+        } else {
+            Extent::Straddles
+        }
+    };
+
+    let emit = |quartic: QsicCurve| -> OperationResult<SurfaceIntersectionCurve> {
+        // Four exact quarter-point pre-split crossings (Defect-C/D shared-arc
+        // machinery; both operand walls resolve the SAME VertexId per point).
+        let mut crossings = Vec::with_capacity(4);
+        for k in 0..4 {
+            let t = k as f64 * 0.25;
+            let p = quartic.point_at(t).map_err(|e| {
+                OperationError::InvalidGeometry(format!(
+                    "cyl-sphere quartic pre-split point eval (t={t}): {e:?}"
+                ))
+            })?;
+            crossings.push(p);
+        }
+        let params_cyl = compute_quartic_cylinder_parameters(&quartic, cyl)?;
+        let params_sph = compute_quartic_sphere_parameters(&quartic, sphere)?;
+        let (on_surface_a, on_surface_b) = if cyl_is_a {
+            (
+                create_parametric_curve(&params_cyl),
+                create_parametric_curve(&params_sph),
+            )
+        } else {
+            (
+                create_parametric_curve(&params_sph),
+                create_parametric_curve(&params_cyl),
+            )
+        };
+        Ok(SurfaceIntersectionCurve {
+            curve: Box::new(quartic),
+            on_surface_a,
+            on_surface_b,
+            crossings,
+        })
+    };
+
+    if outer_clearance < 0.0 {
+        // FULL PIERCE — two ovals, closed-form axial extents
+        // s±(θ) = s_axial ± √(α + β·cosψ) ∈ s_axial ± [√(α−β), √(α+β)].
+        let alpha = rs * rs - rc * rc - d * d;
+        let beta = 2.0 * rc * d;
+        // outer_clearance < −margin ⟹ α − β = (r_s−(r_c+d))(r_s+r_c+d) > 0.
+        let lo_off = (alpha - beta).max(0.0).sqrt();
+        let hi_off = (alpha + beta).sqrt();
+        let mut curves = Vec::with_capacity(2);
+        for branch in [1.0f64, -1.0f64] {
+            let (ext_lo, ext_hi) = if branch > 0.0 {
+                (s_axial + lo_off, s_axial + hi_off)
+            } else {
+                (s_axial - hi_off, s_axial - lo_off)
+            };
+            match classify_extent(ext_lo, ext_hi) {
+                Extent::Outside => continue, // beyond the finite wall — no cut
+                Extent::Straddles => {
+                    if trace {
+                        eprintln!(
+                            "[bool]     cyl_sphere_general: pierce oval (branch {branch}) \
+                             straddles a rim [{ext_lo:.4},{ext_hi:.4}] vs [{h_lo:.4},{h_hi:.4}] → marcher"
+                        );
+                    }
+                    return Ok(None);
+                }
+                Extent::Inside => {}
+            }
+            let quartic =
+                match QsicCurve::full_oval_on_sphere(sphere.center, rs, origin, axis, rc, branch) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        if trace {
+                            eprintln!(
+                                "[bool]     cyl_sphere_general: full_oval_on_sphere declined \
+                             (branch {branch}): {e:?} → marcher"
+                            );
+                        }
+                        return Ok(None);
+                    }
+                };
+            curves.push(emit(quartic)?);
+        }
+        if trace {
+            eprintln!(
+                "[bool]     cyl_sphere_general: FULL PIERCE — {} oval(s) (rc={rc} rs={rs} d={d:.4})",
+                curves.len()
+            );
+        }
+        return Ok(Some(curves));
+    }
+
+    // PARTIAL BITE — one closed loop, axial extent s_axial ± w.
+    let w = (rs * rs - (rc - d) * (rc - d)).max(0.0).sqrt();
+    if classify_extent(s_axial - w, s_axial + w) != Extent::Inside {
+        if trace {
+            eprintln!(
+                "[bool]     cyl_sphere_general: bite loop not strictly inside the wall extent \
+                 [{:.4},{:.4}] vs [{h_lo:.4},{h_hi:.4}] → marcher",
+                s_axial - w,
+                s_axial + w
+            );
+        }
+        return Ok(None);
+    }
+    let quartic = match QsicCurve::sphere_bite_loop(sphere.center, rs, origin, axis, rc, margin) {
+        Ok(q) => q,
+        Err(e) => {
+            if trace {
+                eprintln!(
+                    "[bool]     cyl_sphere_general: sphere_bite_loop declined: {e:?} → marcher"
+                );
+            }
+            return Ok(None);
+        }
+    };
+    if trace {
+        eprintln!(
+            "[bool]     cyl_sphere_general: PARTIAL BITE — one loop (rc={rc} rs={rs} d={d:.4} w={w:.4})"
+        );
+    }
+    Ok(Some(vec![emit(quartic)?]))
+}
+
+/// UV samples of a [`QsicCurve`] on a sphere it lies on (mirror of
+/// [`compute_quartic_cylinder_parameters`]; 64 samples).
+fn compute_quartic_sphere_parameters(
+    quartic: &crate::primitives::qsic_curve::QsicCurve,
+    sphere: &crate::primitives::surface::Sphere,
+) -> OperationResult<Vec<(f64, f64)>> {
+    let mut params = Vec::new();
+    const NUM_SAMPLES: usize = 64;
+    for i in 0..NUM_SAMPLES {
+        let t = (i as f64) / (NUM_SAMPLES as f64);
+        let point = quartic.point_at(t)?;
+        let (u, v) = sphere.closest_point(&point, Tolerance::default())?;
+        params.push((u, v));
+    }
+    Ok(params)
 }
 
 /// Closed-form cone(lateral)–cylinder(lateral) intersection for a COAXIAL pair
@@ -6344,6 +6588,265 @@ fn split_sphere_face_by_circles(
     Some(result)
 }
 
+/// QSIC analogue of [`split_sphere_face_by_circles`] — bool7 residual: an
+/// untrimmed sphere cut by the closed cylinder×sphere QSIC loop(s) of a
+/// GENERAL-POSITION bore. The circle splitter cannot see these (its
+/// `by_curve` filter is Circle/Arc-only), and the generic DCEL cannot
+/// partition a closed sphere (no outer boundary, seam-wrapping UV cycles) —
+/// same degeneracy the circle splitter documents.
+///
+/// The partition is CLOSED FORM from the QSIC's own carrier geometry (the
+/// curve carries the bore cylinder in its `b_*` fields):
+///
+///   * ONE loop (partial bite): the lens toward the bore — interior point at
+///     the sphere point RADIALLY DEEPEST into the bore,
+///     `C − (radial/d)·r_s`, whose axis distance `|d − r_s| < r_c` is
+///     guaranteed by the bite regime — plus the complement as the SAME loop
+///     REVERSED with the antipodal interior `C + (radial/d)·r_s` (axis
+///     distance `d + r_s > r_c`). The #82 great-circle lesson applies
+///     verbatim: a two-region sphere split must be two proper caps, never an
+///     empty-outer + hole complement.
+///   * TWO loops (full pierce): one cap per oval — interior points are the
+///     two AXIS∩SPHERE points `O_b + (s_ax ± √(r_s²−d²))·b̂` (inside the
+///     bore by construction), paired to the ovals by axial coordinate — plus
+///     the two-hole BARREL (empty outer loop + both ovals as holes,
+///     interior at the radially-farthest sphere point, axis distance
+///     `d + r_s > r_c`).
+///
+/// Every Splitting edge must be a QSIC arc resolved on THIS sphere with ONE
+/// consistent carrier; anything else → `None` (→ next handler / DCEL).
+/// Mixed circle+QSIC cuts on one sphere face (a sphere biting a composite's
+/// bore AND its planar walls at once) are not owned here — refused to the
+/// generic path, documented residual.
+fn split_sphere_face_by_qsic_ovals(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+    boundary_empty: bool,
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::qsic_curve::{QsicCurve, ResolvedQuadric};
+    use crate::primitives::surface::Sphere;
+
+    if !boundary_empty {
+        return None;
+    }
+    let surface = model.surfaces.get(surface_id)?;
+    let sphere = surface.as_any().downcast_ref::<Sphere>()?;
+    let center = sphere.center;
+    let radius = sphere.radius;
+    let match_tol = crate::math::authority::TAU_COINCIDE;
+
+    // EVERY Splitting edge must be a QSIC arc on THIS sphere, all sharing one
+    // carrier bore. BTreeMap for determinism.
+    let mut by_curve: std::collections::BTreeMap<CurveId, Vec<(EdgeId, VertexId, VertexId)>> =
+        std::collections::BTreeMap::new();
+    let mut carrier: Option<(Point3, Vector3, f64)> = None;
+    for (&eid, ge) in graph.edges.iter() {
+        if ge.edge_type != EdgeType::Splitting {
+            continue;
+        }
+        let e = model.edges.get(eid)?;
+        let curve = model.curves.get(e.curve_id)?;
+        let Some(q) = curve.as_any().downcast_ref::<QsicCurve>() else {
+            return None; // foreign cut — not this splitter's topology
+        };
+        let ResolvedQuadric::Sphere {
+            center: qc,
+            radius: qr,
+        } = q.resolved
+        else {
+            return None; // a cyl-cyl quartic landing on a sphere face is foreign
+        };
+        if (qc - center).magnitude() > match_tol || (qr - radius).abs() > match_tol {
+            return None;
+        }
+        match carrier {
+            None => carrier = Some((q.b_origin, q.b_axis, q.b_radius)),
+            Some((bo, ba, br)) => {
+                // One bore per boolean pair: axes must be the same line and
+                // the radii equal (both ovals come from the same producer).
+                let same_dir = ba.cross(&q.b_axis).magnitude() <= 1.0e-9;
+                let off = q.b_origin - bo;
+                let on_line = (off - ba * off.dot(&ba)).magnitude() <= match_tol;
+                if !same_dir || !on_line || (br - q.b_radius).abs() > match_tol {
+                    return None;
+                }
+            }
+        }
+        by_curve
+            .entry(e.curve_id)
+            .or_default()
+            .push((eid, e.start_vertex, e.end_vertex));
+    }
+    if by_curve.is_empty() || by_curve.len() > 2 {
+        return None;
+    }
+    let (b_origin, b_axis, b_radius) = carrier?;
+
+    // Deterministic single-closed-loop orderer (identical rule to the
+    // cylinder quartic splitters: sort by EdgeId, walk shared endpoints).
+    let order_loop = |mut group: Vec<(EdgeId, VertexId, VertexId)>| -> Option<Vec<(EdgeId, bool)>> {
+        if group.is_empty() {
+            return None;
+        }
+        group.sort_by_key(|&(e, _, _)| e);
+        let (e0, s0, ev0) = group.remove(0);
+        let start_v = s0;
+        let mut cur = ev0;
+        let mut out: Vec<(EdgeId, bool)> = vec![(e0, true)];
+        while !group.is_empty() {
+            let mut sel: Option<(usize, EdgeId, bool, VertexId)> = None;
+            for (i, &(e, s, ev)) in group.iter().enumerate() {
+                if s == cur {
+                    sel = Some((i, e, true, ev));
+                    break;
+                }
+                if ev == cur {
+                    sel = Some((i, e, false, s));
+                    break;
+                }
+            }
+            let (i, e, fwd, next) = sel?;
+            group.remove(i);
+            out.push((e, fwd));
+            cur = next;
+        }
+        if cur != start_v {
+            return None;
+        }
+        Some(out)
+    };
+
+    // Sphere centre in the bore's axial/radial frame.
+    let rel = center - b_origin;
+    let s_ax = rel.dot(&b_axis);
+    let radial = rel - b_axis * s_ax;
+    let d = radial.magnitude();
+
+    let mut loops: Vec<(f64, Vec<(EdgeId, bool)>)> = Vec::new(); // (mean axial, loop)
+    for (_cid, group) in by_curve {
+        let lp = order_loop(group)?;
+        // Mean axial coordinate of the loop's edge endpoints (for cap pairing).
+        let mut acc = 0.0_f64;
+        let mut cnt = 0.0_f64;
+        for &(eid, _) in &lp {
+            let e = model.edges.get(eid)?;
+            for vid in [e.start_vertex, e.end_vertex] {
+                let p = model.vertices.get_position(vid)?;
+                acc += (Point3::new(p[0], p[1], p[2]) - b_origin).dot(&b_axis);
+                cnt += 1.0;
+            }
+        }
+        loops.push((acc / cnt.max(1.0), lp));
+    }
+
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]   sphere qsic split: face={face_id:?} loops={} d={d:.4} rc={b_radius}",
+            loops.len()
+        );
+    }
+
+    if loops.len() == 1 {
+        // PARTIAL BITE: lens + reversed-complement (#82 two-proper-caps rule).
+        if d <= 1.0e-12 {
+            return None; // bite loops are never coaxial — foreign geometry
+        }
+        let dir = radial * (1.0 / d);
+        let lens_interior = center - dir * radius; // axis distance |d − r_s| < r_c
+        let complement_interior = center + dir * radius; // axis distance d + r_s > r_c
+        let (_, lp) = loops.remove(0);
+        let reversed: Vec<(EdgeId, bool)> = lp.iter().rev().map(|&(e, f)| (e, !f)).collect();
+        return Some(vec![
+            SplitFace {
+                was_split: true,
+                original_face: face_id,
+                surface: surface_id,
+                boundary_edges: lp,
+                classification: FaceClassification::OnBoundary,
+                from_solid: origin_solid,
+                interior_point: Some(lens_interior),
+                inner_loops: Vec::new(),
+            },
+            SplitFace {
+                was_split: true,
+                original_face: face_id,
+                surface: surface_id,
+                boundary_edges: reversed,
+                classification: FaceClassification::OnBoundary,
+                from_solid: origin_solid,
+                interior_point: Some(complement_interior),
+                inner_loops: Vec::new(),
+            },
+        ]);
+    }
+
+    // FULL PIERCE: two caps + the barrel. The axis pierces the sphere
+    // (d < r_s strictly — the pierce regime has r_s > r_c + d).
+    let root_sq = radius * radius - d * d;
+    if root_sq <= 0.0 {
+        return None;
+    }
+    let root = root_sq.sqrt();
+    // Pair each loop (by mean axial) with its axis∩sphere cap point.
+    loops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let cap_pts = [
+        b_origin + b_axis * (s_ax - root),
+        b_origin + b_axis * (s_ax + root),
+    ];
+    let mut out = Vec::with_capacity(3);
+    let mut oval_loops = Vec::with_capacity(2);
+    for (i, (_, lp)) in loops.into_iter().enumerate() {
+        out.push(SplitFace {
+            was_split: true,
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: lp.clone(),
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(cap_pts[i]),
+            inner_loops: Vec::new(),
+        });
+        oval_loops.push(lp);
+    }
+    // Barrel interior: radially farthest from the bore (axis distance d+r_s);
+    // for a near-coaxial pierce (d → 0) any direction ⟂ the axis works.
+    let barrel_dir = if d > 1.0e-9 {
+        radial * (1.0 / d)
+    } else {
+        let seed = if b_axis.x.abs() < 0.9 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        b_axis.cross(&seed).normalize().ok()?
+    };
+    // The barrel is genuinely an ANNULUS (sphere minus two disks): give it
+    // the lower oval as a REAL outer boundary and the upper as its one ring
+    // — never an empty outer + two holes. Structural reasons, both measured:
+    // the Euler–Poincaré validator counts an outer-less face as a
+    // disk-with-rings (χ = 1−R = −1, odd → "invalid characteristic" on the
+    // genus-1 drilled ball), and the #82 hemisphere lesson forbids
+    // empty-outer sphere complements outright. Reversed so the annulus
+    // material lies on the loop's LEFT (mirror of the lens/complement pair).
+    let upper = oval_loops.pop()?;
+    let lower = oval_loops.pop()?;
+    let lower_rev: Vec<(EdgeId, bool)> = lower.iter().rev().map(|&(e, f)| (e, !f)).collect();
+    out.push(SplitFace {
+        was_split: true,
+        original_face: face_id,
+        surface: surface_id,
+        boundary_edges: lower_rev,
+        classification: FaceClassification::OnBoundary,
+        from_solid: origin_solid,
+        interior_point: Some(center + barrel_dir * radius),
+        inner_loops: vec![upper],
+    });
+    Some(out)
+}
+
 /// Cone analogue of [`split_sphere_face_by_circles`]: a cone lateral cut by
 /// axis-perpendicular circles is partitioned into AXIAL BANDS. The DCEL walker
 /// drops them (iso-parametric circles have zero `(u, v)` area, and an apex cone
@@ -7324,7 +7827,7 @@ fn quartic_loop_profile(
 }
 
 /// #35 Slice-2 Defect-A analogue, CARRIER/tool wall: a cylinder lateral
-/// carrying the closed [`CylCylQuartic`] ovals of an unequal-radius
+/// carrying the closed [`QsicCurve`] ovals of an unequal-radius
 /// cross-bore, each ENCIRCLING this cylinder's axis (the smaller bore's
 /// wall — every generator pierces the larger bore, so both quartic branches
 /// wrap the wall as wavy rings), plus optional constant-axial entry/exit
@@ -7357,7 +7860,7 @@ fn split_cylinder_lateral_by_quartic_rings(
     graph: &IntersectionGraph,
     boundary_edges: &[(EdgeId, bool)],
 ) -> Option<Vec<SplitFace>> {
-    use crate::primitives::qsic_curve::CylCylQuartic;
+    use crate::primitives::qsic_curve::QsicCurve;
     use crate::primitives::surface::Cylinder;
 
     let surface = model.surfaces.get(surface_id)?;
@@ -7400,7 +7903,7 @@ fn split_cylinder_lateral_by_quartic_rings(
         let is_quartic = model
             .curves
             .get(e.curve_id)
-            .map(|c| c.as_any().downcast_ref::<CylCylQuartic>().is_some())
+            .map(|c| c.as_any().downcast_ref::<QsicCurve>().is_some())
             .unwrap_or(false);
         if is_quartic {
             quartic_groups
@@ -7581,7 +8084,7 @@ fn split_cylinder_lateral_by_quartic_rings(
 }
 
 /// #35 Slice-2 Defect-A analogue, PIERCED/bore wall: a cylinder lateral
-/// carrying closed [`CylCylQuartic`] WINDOW loops (winding ≈ 0 — the
+/// carrying closed [`QsicCurve`] WINDOW loops (winding ≈ 0 — the
 /// smaller cross-bore punches through this larger wall, leaving one oval
 /// hole where it enters and one where it exits). The torus rim-poke
 /// splitter (`split_torus_face_by_ovals`) is the direct precedent: emit one
@@ -7605,7 +8108,7 @@ fn split_cylinder_lateral_by_interior_ovals(
     graph: &IntersectionGraph,
     boundary_edges: &[(EdgeId, bool)],
 ) -> Option<Vec<SplitFace>> {
-    use crate::primitives::qsic_curve::CylCylQuartic;
+    use crate::primitives::qsic_curve::QsicCurve;
     use crate::primitives::surface::Cylinder;
 
     let surface = model.surfaces.get(surface_id)?;
@@ -7642,7 +8145,7 @@ fn split_cylinder_lateral_by_interior_ovals(
         let is_quartic = model
             .curves
             .get(e.curve_id)
-            .map(|c| c.as_any().downcast_ref::<CylCylQuartic>().is_some())
+            .map(|c| c.as_any().downcast_ref::<QsicCurve>().is_some())
             .unwrap_or(false);
         if !is_quartic {
             return None;
@@ -9046,6 +9549,26 @@ fn split_face_by_curves(
         if pipeline_trace_enabled() {
             eprintln!(
                 "[bool]   sphere closed-surface split: face={face_id:?} → {} fragments",
+                sphere_faces.len()
+            );
+        }
+        return Ok(sphere_faces);
+    }
+
+    // Sphere cut by general-position cylinder×sphere QSIC loop(s) — bool7
+    // residual: lens+complement (bite) or caps+barrel (pierce). Inert (None)
+    // for every non-QSIC sphere cut.
+    if let Some(sphere_faces) = split_sphere_face_by_qsic_ovals(
+        model,
+        surface_id,
+        face_id,
+        origin_solid,
+        &graph,
+        boundary_edges.is_empty(),
+    ) {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   sphere qsic split: face={face_id:?} → {} fragments",
                 sphere_faces.len()
             );
         }
@@ -13435,7 +13958,7 @@ fn presplit_saddle_ellipse_crossings(
 }
 
 /// #35 Slice-2 Defect C/D analogue for the UNEQUAL-radius quartic ovals:
-/// pre-split each closed [`CylCylQuartic`] cut loop at its four producer-
+/// pre-split each closed [`QsicCurve`] cut loop at its four producer-
 /// supplied quarter points into four shared-vertex arcs, minting ONE
 /// canonical arc `EdgeId` per `(curve_id, arc_index)` reused by both
 /// operand walls (the same registry the saddle pre-split uses — curve_ids
@@ -13456,7 +13979,7 @@ fn presplit_saddle_ellipse_crossings(
 /// sub-intervals (spec §3.3: keep the exact curve, never down-convert).
 ///
 /// Inert (early `Ok`) for every non-quartic boolean: only curves that
-/// carry exactly FOUR crossings AND downcast to `CylCylQuartic` are
+/// carry exactly FOUR crossings AND downcast to `QsicCurve` are
 /// claimed (saddle ellipses carry two → skipped here, handled above).
 fn presplit_cyl_cyl_quartic_loops(
     graph: &mut IntersectionGraph,
@@ -13465,7 +13988,7 @@ fn presplit_cyl_cyl_quartic_loops(
     shared_arc_edges: &mut HashMap<(CurveId, u8), EdgeId>,
     tolerance: &Tolerance,
 ) -> OperationResult<()> {
-    use crate::primitives::qsic_curve::CylCylQuartic;
+    use crate::primitives::qsic_curve::QsicCurve;
 
     if curve_crossings.is_empty() {
         return Ok(());
@@ -13487,7 +14010,7 @@ fn presplit_cyl_cyl_quartic_loops(
             let is_quartic = model
                 .curves
                 .get(edge.curve_id)
-                .map(|c| c.as_any().downcast_ref::<CylCylQuartic>().is_some())
+                .map(|c| c.as_any().downcast_ref::<QsicCurve>().is_some())
                 .unwrap_or(false);
             match curve_crossings.get(&edge.curve_id) {
                 Some(cross) if cross.len() == 4 && is_quartic => {
@@ -18562,7 +19085,7 @@ fn weld_imprint_residual_vertices(
         return;
     }
 
-    // #35 Slice-2 immunization: vertices on a `CylCylQuartic` cut arc are
+    // #35 Slice-2 immunization: vertices on a `QsicCurve` cut arc are
     // minted EXACTLY (shared analytic quarter-point evaluations on both
     // operand walls) — they carry no fit residual by construction, and the
     // near-tangent unequal-bore configuration puts the two quartic ovals a
@@ -18587,7 +19110,7 @@ fn weld_imprint_residual_vertices(
                         .get(edge.curve_id)
                         .map(|c| {
                             c.as_any()
-                                .downcast_ref::<crate::primitives::qsic_curve::CylCylQuartic>()
+                                .downcast_ref::<crate::primitives::qsic_curve::QsicCurve>()
                                 .is_some()
                         })
                         .unwrap_or(false);
@@ -25964,7 +26487,7 @@ mod tests {
                                     .and_then(|e| m.curves.get(e.curve_id))
                                     .map(|c| {
                                         c.as_any()
-                                            .downcast_ref::<crate::primitives::qsic_curve::CylCylQuartic>()
+                                            .downcast_ref::<crate::primitives::qsic_curve::QsicCurve>()
                                             .is_some()
                                     })
                                     .unwrap_or(false)
@@ -26939,6 +27462,129 @@ mod tests {
                         "rs={rs}: point {p:?} off sphere (dist {dr})"
                     );
                 }
+            }
+        }
+    }
+
+    /// GENERAL-POSITION cyl×sphere SSI WHITE-BOX (bool7 residual): an
+    /// OFF-AXIS sphere centre gives a genuine spatial quartic —
+    /// `surface_surface_intersection` must return it ANALYTIC (QsicCurve),
+    /// with on-both-surfaces residuals ≤1e-9 and 4 producer pre-split
+    /// crossings per loop; near-tangency must stay marcher-owned (#86
+    /// honesty fence, clearance margin = authority::TAU_COINCIDE).
+    ///
+    /// RED baseline (pre-producer, recorded 2026-07-17, marching fallback):
+    ///   * bite SSI (r5 cyl × r4 sphere at d≈6.58): marcher returned
+    ///     0 curves — end-to-end the boolean then mis-treated the sphere as
+    ///     FULLY ENCLOSED and silently subtracted a whole spherical void
+    ///     (bite-7 fixture: open=0 closed=true brep_valid=true but
+    ///     vol_dense rel 2.99e-1, live vol NaN — a clean-LOOKING wrong
+    ///     solid);
+    ///   * pierce e2e (drilled-ball-7, r3 bore × r8 sphere at d=2):
+    ///     open=200, closed=false, brep_valid=false, vol rel 1.87e-2.
+    #[test]
+    fn cylinder_sphere_offaxis_ssi_returns_analytic_quartic_7() {
+        use crate::primitives::qsic_curve::QsicCurve;
+        use crate::primitives::surface::{Cylinder, Sphere};
+        let tol = Tolerance::default();
+
+        let on_surfaces_residual =
+            |sic: &SurfaceIntersectionCurve, cyl: &Cylinder, sph: &Sphere| -> (f64, f64) {
+                let mut max_c = 0.0_f64;
+                let mut max_s = 0.0_f64;
+                for i in 0..=512 {
+                    let t = i as f64 / 512.0;
+                    let p = sic.curve.point_at(t).expect("curve point");
+                    let rel = p - cyl.origin;
+                    let radial = (rel - cyl.axis * rel.dot(&cyl.axis)).magnitude();
+                    max_c = max_c.max((radial - cyl.radius).abs());
+                    max_s = max_s.max(((p - sph.center).magnitude() - sph.radius).abs());
+                }
+                (max_c, max_s)
+            };
+
+        // PARTIAL BITE: one analytic closed loop, 4 crossings.
+        {
+            let cyl = Cylinder::new_finite(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 5.0, 10.0)
+                .expect("cyl");
+            let sph = Sphere::new(Point3::new(6.5, 1.0, 5.0), 4.0).expect("sphere");
+            let curves = surface_surface_intersection(&cyl, &sph, &tol).expect("SSI");
+            eprintln!(
+                "[cyl-sphere SSI #7] bite: {} curve(s): {:?}",
+                curves.len(),
+                curves
+                    .iter()
+                    .map(|c| c.curve.type_name())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(curves.len(), 1, "bite: expected ONE closed loop");
+            let sic = &curves[0];
+            assert!(
+                sic.curve.as_any().downcast_ref::<QsicCurve>().is_some(),
+                "bite: curve must be the analytic QsicCurve, got {}",
+                sic.curve.type_name()
+            );
+            assert_eq!(sic.crossings.len(), 4, "bite: 4 pre-split crossings");
+            let (rc_res, rs_res) = on_surfaces_residual(sic, &cyl, &sph);
+            assert!(
+                rc_res < 1.0e-9 && rs_res < 1.0e-9,
+                "bite: residuals cyl={rc_res:.3e} sphere={rs_res:.3e}"
+            );
+        }
+
+        // FULL PIERCE: two analytic closed ovals.
+        {
+            let cyl = Cylinder::new_finite(Point3::new(2.0, 0.0, -12.0), Vector3::Z, 3.0, 24.0)
+                .expect("cyl");
+            let sph = Sphere::new(Point3::ORIGIN, 8.0).expect("sphere");
+            // Operand order flipped vs the bite case to cover (Sphere, Cylinder).
+            let curves = surface_surface_intersection(&sph, &cyl, &tol).expect("SSI");
+            eprintln!(
+                "[cyl-sphere SSI #7] pierce: {} curve(s): {:?}",
+                curves.len(),
+                curves
+                    .iter()
+                    .map(|c| c.curve.type_name())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(curves.len(), 2, "pierce: expected TWO ovals");
+            for (i, sic) in curves.iter().enumerate() {
+                assert!(
+                    sic.curve.as_any().downcast_ref::<QsicCurve>().is_some(),
+                    "pierce oval {i}: curve must be the analytic QsicCurve, got {}",
+                    sic.curve.type_name()
+                );
+                assert_eq!(sic.crossings.len(), 4, "pierce oval {i}: 4 crossings");
+                let (rc_res, rs_res) = on_surfaces_residual(sic, &cyl, &sph);
+                assert!(
+                    rc_res < 1.0e-9 && rs_res < 1.0e-9,
+                    "pierce oval {i}: residuals cyl={rc_res:.3e} sphere={rs_res:.3e}"
+                );
+            }
+        }
+
+        // NEAR-TANGENCY (outer graze, clearance 1e-7 < TAU_COINCIDE = 1e-5):
+        // must NOT be claimed analytically — marching keeps ownership.
+        {
+            let cyl = Cylinder::new_finite(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 5.0, 10.0)
+                .expect("cyl");
+            let d = 6.5_f64;
+            let sph = Sphere::new(Point3::new(d, 0.0, 5.0), (5.0 + d) - 1.0e-7).expect("sphere");
+            let curves = surface_surface_intersection(&cyl, &sph, &tol).expect("SSI");
+            eprintln!(
+                "[cyl-sphere SSI #7] near-tangent: {} curve(s): {:?}",
+                curves.len(),
+                curves
+                    .iter()
+                    .map(|c| c.curve.type_name())
+                    .collect::<Vec<_>>()
+            );
+            for sic in &curves {
+                assert!(
+                    sic.curve.as_any().downcast_ref::<QsicCurve>().is_none(),
+                    "near-tangency must stay marcher-owned (#86 fence), got analytic {}",
+                    sic.curve.type_name()
+                );
             }
         }
     }

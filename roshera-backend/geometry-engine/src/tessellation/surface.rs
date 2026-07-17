@@ -1203,6 +1203,49 @@ fn loop_cut_circle(
     plane
 }
 
+/// If every edge of `loop_data` is a cylinder×sphere QSIC arc resolved on the
+/// sphere `(o, r)` (one consistent carrier bore), return the bore
+/// `(origin, axis, radius)` — the analytic membership/frame the spherical
+/// QSIC tessellation paths need. `None` for any other loop (circles, mixed
+/// cuts, foreign curves), so callers fall through unchanged.
+fn loop_qsic_bore(
+    loop_data: &crate::primitives::r#loop::Loop,
+    model: &BRepModel,
+    o: Point3,
+    r: f64,
+) -> Option<(Point3, Vector3, f64)> {
+    use crate::primitives::qsic_curve::{QsicCurve, ResolvedQuadric};
+    let match_tol = crate::math::authority::TAU_COINCIDE;
+    if loop_data.edges.is_empty() {
+        return None;
+    }
+    let mut bore: Option<(Point3, Vector3, f64)> = None;
+    for &eid in &loop_data.edges {
+        let edge = model.edges.get(eid)?;
+        let curve = model.curves.get(edge.curve_id)?;
+        let q = curve.as_any().downcast_ref::<QsicCurve>()?;
+        let ResolvedQuadric::Sphere { center, radius } = q.resolved else {
+            return None;
+        };
+        if (center - o).magnitude() > match_tol || (radius - r).abs() > match_tol {
+            return None;
+        }
+        match bore {
+            None => bore = Some((q.b_origin, q.b_axis, q.b_radius)),
+            Some((bo, ba, br)) => {
+                let off = q.b_origin - bo;
+                if ba.cross(&q.b_axis).magnitude() > 1.0e-9
+                    || (off - ba * off.dot(&ba)).magnitude() > match_tol
+                    || (br - q.b_radius).abs() > match_tol
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    bore
+}
+
 /// Boundary-conforming tessellation of a spherical CAP: a sphere region bounded
 /// by a single cut circle, filled from the rim to the cap apex.
 ///
@@ -1213,6 +1256,14 @@ fn loop_cut_circle(
 /// the rim toward the cap apex (the far pole on the circle's axis), so the cap
 /// is watertight by construction — unlike the analytic grid, whose
 /// membership-gated boundary is an open stair-step.
+///
+/// A single-loop QSIC cap (bool7 cyl×sphere lens/complement/pierce cap)
+/// deliberately does NOT route here: those loops are 3D-rim star-shaped
+/// regions the `tessellate_spherical_polygon` / `tessellate_spherical_
+/// large_region` cascade already meshes boundary-conformally from 3D rim
+/// samples + spherical centroid (chart-free — mutation-tested 2026-07-17
+/// incl. a seam-straddling lens: disabling a slerp-ring QSIC branch here
+/// changed NOTHING, so the branch was removed as unproven code).
 ///
 /// Returns `true` when it handled the face (single circular outer loop, no
 /// inner loops, on a sphere); `false` to fall through to the grid path.
@@ -1753,27 +1804,75 @@ fn tessellate_spherical_central(
     // central consistently with the adjoining planar disks.
     let forward = !face.orientation.is_forward();
 
-    // Holes: plane (centre, axis), an in-plane frame, and the rim verts already
-    // added to the mesh (positions kept for angular sort).
+    // Holes: a membership predicate + a frame for the stitch's angular sort,
+    // and the rim verts already added to the mesh (positions kept for the
+    // angular sort). Two kinds: a cut CIRCLE (plane half-space membership,
+    // sphere-centre side) or a cylinder×sphere QSIC oval (bool7 barrel: the
+    // hole is the bore window, membership = OUTSIDE the bore radially —
+    // exact, from the curve's own carrier geometry).
+    enum HoleKind {
+        Circle,
+        QsicBore { origin: Point3, radius: f64 },
+    }
     struct Hole {
+        kind: HoleKind,
         center: Point3,
         axis: Vector3,
         e1: Vector3,
         e2: Vector3,
         rim: Vec<(f64, u32, Point3)>, // (angle, mesh id, pos)
     }
+    // Boundaries to stitch: every inner-loop hole, PLUS the outer loop when
+    // it is a QSIC oval on this sphere — the bool7 barrel is an ANNULUS
+    // (one oval outer, one oval ring; Euler validator + #82 forbid the
+    // empty-outer representation), so its outer boundary must be gridded
+    // around and stitched exactly like a hole. A non-empty NON-QSIC outer
+    // keeps the historical behavior (ignored here; outer-aware circle cases
+    // are owned by `tessellate_spherical_holed_region` upstream).
+    let mut loop_ids: Vec<_> = face.inner_loops.clone();
+    if let Some(outer) = model.loops.get(face.outer_loop) {
+        if !outer.edges.is_empty() && loop_qsic_bore(outer, model, o, r).is_some() {
+            loop_ids.push(face.outer_loop);
+        }
+    }
+
     let mut holes: Vec<Hole> = Vec::new();
-    for &lid in &face.inner_loops {
+    for &lid in &loop_ids {
         let Some(lp) = model.loops.get(lid) else {
             return false;
         };
-        let Some((c, n)) = loop_cut_circle(lp, model) else {
+        let (kind, c, n) = if let Some((c, n)) = loop_cut_circle(lp, model) {
+            (HoleKind::Circle, c, n)
+        } else if let Some((b_origin, b_axis, b_radius)) = loop_qsic_bore(lp, model, o, r) {
+            // Frame centre = the bore-axis foot at this oval's mean axial
+            // level (computed below from the rim); provisional at the axis
+            // foot of the sphere centre — refined after sampling.
+            let rel = o - b_origin;
+            let foot = b_origin + b_axis * rel.dot(&b_axis);
+            (
+                HoleKind::QsicBore {
+                    origin: b_origin,
+                    radius: b_radius,
+                },
+                foot,
+                b_axis,
+            )
+        } else {
             return false;
         };
         let rim_pos = loop_rim_samples(lp, model, cache);
         if rim_pos.len() < 3 {
             return false;
         }
+        // For a QSIC hole, re-centre the frame at the rim's own mean axial
+        // level so the stitch's hole-matching axial distance is meaningful.
+        let c = if let HoleKind::QsicBore { origin, .. } = kind {
+            let mean_ax =
+                rim_pos.iter().map(|&p| (p - origin).dot(&n)).sum::<f64>() / rim_pos.len() as f64;
+            origin + n * mean_ax
+        } else {
+            c
+        };
         let helper = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
             Vector3::X
         } else if n.y.abs() <= n.z.abs() {
@@ -1801,6 +1900,7 @@ fn tessellate_spherical_central(
             .collect();
         rim.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         holes.push(Hole {
+            kind,
             center: c,
             axis: n,
             e1,
@@ -1810,10 +1910,16 @@ fn tessellate_spherical_central(
     }
 
     let in_central = |p: Point3| -> bool {
-        holes.iter().all(|h| {
-            let pp = (p - h.center).dot(&h.axis);
-            let oo = (o - h.center).dot(&h.axis);
-            pp * oo >= 0.0
+        holes.iter().all(|h| match h.kind {
+            HoleKind::Circle => {
+                let pp = (p - h.center).dot(&h.axis);
+                let oo = (o - h.center).dot(&h.axis);
+                pp * oo >= 0.0
+            }
+            HoleKind::QsicBore { origin, radius } => {
+                let rel = p - origin;
+                (rel - h.axis * rel.dot(&h.axis)).magnitude() >= radius
+            }
         })
     };
 
@@ -1889,10 +1995,16 @@ fn tessellate_spherical_central(
         (gid[i][j].unwrap_or(0), gpos[i][j])
     };
 
-    // Walk boundary loops.
+    // Walk boundary loops. SORTED starts: `next` is a HashMap, and the walk's
+    // start key decides each chain's phase, which decides the greedy stitch
+    // alignment and therefore the exact triangulation — iterating raw keys
+    // made the drilled-ball volume flicker in its last digits run-to-run
+    // (measured: fingerprint 1723.681417 vs …419 at the 1e-6 grain).
+    let mut starts: Vec<u32> = next.keys().copied().collect();
+    starts.sort_unstable();
     let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut loops: Vec<Vec<u32>> = Vec::new();
-    for &start in next.keys() {
+    for start in starts {
         if visited.contains(&start) {
             continue;
         }
@@ -7518,7 +7630,7 @@ fn tessellate_cylinder_saddle_annulus(
     mesh: &mut TriangleMesh,
 ) -> bool {
     use crate::primitives::curve::Ellipse;
-    use crate::primitives::qsic_curve::CylCylQuartic;
+    use crate::primitives::qsic_curve::QsicCurve;
     use crate::primitives::surface::Cylinder;
 
     if face.inner_loops.len() != 1 {
@@ -7545,7 +7657,7 @@ fn tessellate_cylinder_saddle_annulus(
     };
 
     // Band marker (a): EITHER boundary loop carries an analytic saddle
-    // `Ellipse` arc (Slice-1 equal-radius lens) OR a `CylCylQuartic` arc
+    // `Ellipse` arc (Slice-1 equal-radius lens) OR a `QsicCurve` arc
     // (Slice-2 unequal-radius oval ring — same encircling-band topology,
     // wavy quartic instead of ellipse). The wavy ring may land as the
     // face's OUTER loop after reconstruction (the middle-to-rim band of the
@@ -7561,7 +7673,7 @@ fn tessellate_cylinder_saddle_annulus(
                 .and_then(|e| model.curves.get(e.curve_id))
                 .map(|c| {
                     c.as_any().downcast_ref::<Ellipse>().is_some()
-                        || c.as_any().downcast_ref::<CylCylQuartic>().is_some()
+                        || c.as_any().downcast_ref::<QsicCurve>().is_some()
                 })
                 .unwrap_or(false)
         })
