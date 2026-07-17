@@ -570,6 +570,26 @@ fn current_timestamp() -> u64 {
 
 /// Build the `Arc<AuthManager>` used by [`SessionManager::new`].
 ///
+/// This is the **only** `AuthManager` in the process. The api-server
+/// previously constructed a second one with a hardcoded `"secret_key"`
+/// literal and handed it to `handlers::auth::{login, register, refresh,
+/// logout}` via `AppState.auth_manager`, while the auth middleware and
+/// the WebSocket `Authenticate` handler verified against *this* one.
+/// The two never agreed on a key, so `/api/auth/login` — routed since
+/// the initial commit — minted tokens that the middleware rejected:
+/// login reported success and the next request 401'd. `AppState` no
+/// longer carries an `AuthManager` field at all, which makes that
+/// divergence unrepresentable rather than merely fixed.
+///
+/// Config is sourced from the environment (AUDIT-M5) rather than
+/// `AuthConfig::default()`. Every field of `AuthConfig::from_env` falls
+/// back to the corresponding `default()` value when its variable is
+/// absent, so this is a strict superset of the previous behaviour: an
+/// unset environment yields exactly the old config, and the `ROSHERA_*`
+/// knobs (issuer, audience, expiry, lockout, password rules) now reach
+/// the manager that actually signs and verifies tokens. Before this
+/// change those variables configured only the dead manager.
+///
 /// Separated into a free function so the `#[allow(clippy::expect_used)]`
 /// invariant comment lives at statement scope (Rust does not allow
 /// inner attributes on method-call expressions).
@@ -583,7 +603,7 @@ fn build_auth_manager() -> Arc<crate::auth::AuthManager> {
     // explicitly screens out.
     #[allow(clippy::expect_used)]
     // Reason: invariant proved above — secret is non-empty by construction.
-    let mgr = crate::auth::AuthManager::new(crate::auth::AuthConfig::default(), &secret)
+    let mgr = crate::auth::AuthManager::new(crate::auth::AuthConfig::from_env(), &secret)
         .expect("load_jwt_secret returns a non-empty HMAC key");
     Arc::new(mgr)
 }

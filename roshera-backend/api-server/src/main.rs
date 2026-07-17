@@ -16,6 +16,7 @@ mod assembly_instances;
 mod assembly_mates;
 mod assembly_mgr;
 mod auth_middleware;
+mod auth_slice1_tests;
 mod blackboard;
 #[cfg(test)]
 mod blend_failed_harness;
@@ -71,8 +72,8 @@ use ai_integration::{
 
 // Import enhanced session management
 use session_manager::{
-    AuthManager, BroadcastManager, CacheManager, DatabasePersistence, HierarchyManager, Permission,
-    PermissionManager, PostgresDatabase, SessionManager,
+    CacheManager, DatabasePersistence, HierarchyManager, Permission, PermissionManager,
+    PostgresDatabase, SessionManager,
 };
 
 // Import timeline
@@ -156,11 +157,28 @@ pub struct AppState {
     // Vision pipeline (not yet implemented)
     // smart_router: Option<Arc<SmartRouter>>,
 
-    // Enhanced session management
+    // Enhanced session management.
+    //
+    // There is deliberately no `auth_manager` field here. The process's
+    // single `AuthManager` lives inside `SessionManager` and is reached
+    // via `session_manager.auth_manager()` / `auth_manager_arc()`. This
+    // state used to carry a second, independently-constructed manager
+    // keyed with a hardcoded literal; `handlers::auth::*` signed tokens
+    // with it while the middleware verified with SessionManager's, so
+    // login minted credentials that were rejected on the next request.
+    // Keeping one manager reachable from one place makes that class of
+    // divergence unrepresentable.
     session_manager: Arc<SessionManager>,
-    auth_manager: Arc<AuthManager>,
     permission_manager: Arc<PermissionManager>,
     cache_manager: Arc<CacheManager>,
+
+    /// The process's authentication posture, resolved once from the
+    /// environment at startup (`AuthPosture::from_env`) and baked into
+    /// the router by `build_router`. Threaded through state rather than
+    /// read per-request so enforcement is deterministic and cannot be
+    /// changed by mid-flight env mutation. Default is
+    /// `AuthPosture::Required`.
+    auth_posture: auth_middleware::AuthPosture,
 
     // Timeline and collaboration
     timeline: Arc<RwLock<Timeline>>,
@@ -7531,20 +7549,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize session management components
     let broadcast_manager = session_manager::broadcast::BroadcastManager::new();
     let session_manager = Arc::new(SessionManager::new(broadcast_manager));
-    // AUDIT-M5: every field of `AuthConfig` is now sourced from
-    // `ROSHERA_*` environment variables with the prior hardcoded
-    // values preserved as `AuthConfig::default()` fallbacks. See
-    // `session_manager::auth::AuthConfig::from_env` for the full
-    // variable list. Subsumes the AUDIT-H8
-    // `ROSHERA_IDLE_TIMEOUT_SECONDS` knob.
-    let auth_config = session_manager::auth::AuthConfig::from_env();
-    // JWT signing key. `AuthManager::new` is fallible (rejects empty
-    // keys); we propagate any error out of `main` so a misconfigured
-    // operator gets a typed startup failure rather than a panic.
-    let auth_manager = Arc::new(
-        AuthManager::new(auth_config, "secret_key")
-            .map_err(|e| format!("AuthManager init failed: {e}"))?,
-    );
+    // The process's only `AuthManager` is the one `SessionManager`
+    // built (see `session_manager::manager::build_auth_manager`): keyed
+    // from `ROSHERA_JWT_SECRET` or a per-process random secret, and
+    // configured from `ROSHERA_*` via `AuthConfig::from_env` (AUDIT-M5).
+    //
+    // A second manager used to be constructed here with a hardcoded
+    // `"secret_key"` literal and stored in `AppState.auth_manager`.
+    // `handlers::auth::{login, register, refresh_token, logout}` — all
+    // routed since the initial commit — signed and verified with that
+    // literal, while `auth_middleware` and the WebSocket `Authenticate`
+    // handler used SessionManager's. The keys never matched, so login
+    // issued tokens the middleware rejected. Both the literal and the
+    // field are gone; `handlers::auth::*` now reaches this manager
+    // through `state.session_manager.auth_manager()`.
     let permission_manager = Arc::new(PermissionManager::new());
     let cache_config = session_manager::cache::CacheConfig {
         session_capacity: 1000,
@@ -7686,8 +7704,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ai_configured,
         // smart_router: not yet implemented,
         session_manager,
-        auth_manager,
         permission_manager,
+        auth_posture: auth_middleware::AuthPosture::from_env(),
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),
@@ -8706,14 +8724,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // when its state is its own.
     let idempotency_store = Arc::new(idempotency::IdempotencyStore::new());
 
-    // AUDIT-C7: wire the canonical `auth_middleware` as a global
-    // layer. The middleware exempts `/`, `/health`, and `/ws*`
-    // internally (WS uses an in-band Authenticate handler per
-    // AUDIT-C2). Strict enforcement is gated by `ROSHERA_REQUIRE_AUTH`;
-    // when unset, missing / invalid credentials log a warn and the
-    // request proceeds as anonymous. See `auth_middleware.rs` for the
-    // mode matrix.
-    let auth_manager_arc = state.session_manager.auth_manager_arc();
+    // Wire the canonical `auth_middleware` as a global layer. The
+    // middleware exempts `/`, `/health`, and the `/ws` upgrade
+    // internally (the WebSocket enforces auth in-band, per connection,
+    // in `protocol::message_handlers`). Enforcement is on by default:
+    // the posture is resolved from the environment at startup and
+    // carried on `AppState`, so `build_router` bakes it into the layer
+    // rather than reading the environment on every request. See
+    // `auth_middleware::AuthPosture`.
+    let auth_layer_state = auth_middleware::AuthLayerState {
+        auth_manager: state.session_manager.auth_manager_arc(),
+        posture: state.auth_posture,
+    };
 
     // Add state, idempotency, auth, and CORS. axum applies layers from
     // innermost outward, so CORS sees every request first (including
@@ -8729,7 +8751,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             idempotency::idempotency_layer,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            auth_manager_arc,
+            auth_layer_state,
             auth_middleware::auth_middleware,
         ))
         .layer(build_cors_layer())

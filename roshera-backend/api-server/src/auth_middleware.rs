@@ -43,46 +43,111 @@ pub struct AuthInfo {
     pub is_api_key: bool,
 }
 
-/// Returns true when the api-server is running in local dev mode and
-/// should accept unauthenticated requests with full permissions. Gated
-/// by `ROSHERA_DEV_BRIDGE=1`, the same flag that exposes the viewport
-/// debug bridge — both are dev-only conveniences and the env-gate
-/// makes accidental production exposure impossible.
-fn dev_mode_enabled() -> bool {
-    std::env::var("ROSHERA_DEV_BRIDGE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// Returns true when the api-server should enforce a valid
-/// Authorization header on `/api/*` requests (AUDIT-C7). Gated by
-/// `ROSHERA_REQUIRE_AUTH=1`. When unset, the middleware logs missing
-/// auth as a `tracing::warn!` but passes the request through with an
-/// anonymous `AuthInfo` so existing development frontends that do not
-/// yet emit Authorization headers continue to function. Set in
-/// production deployments.
-fn require_auth_enabled() -> bool {
-    std::env::var("ROSHERA_REQUIRE_AUTH")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-/// Build a permissive AuthInfo for dev-mode requests. Every permission
-/// is granted; user_id is a stable sentinel so audit logs are still
-/// distinguishable from real users.
+/// The api-server's authentication posture, resolved once at startup
+/// from the environment and threaded through [`AppState`] so it is a
+/// property of the running process rather than a per-request
+/// environment read.
 ///
-/// AUDIT-C7: every invocation emits a loud audit log so an operator
-/// running with `ROSHERA_DEV_BRIDGE=1` in production gets an unmissable
-/// signal in the journal. The fallback only fires when the env-var is
-/// explicitly set — never in default deployment.
+/// # Secure by default
+///
+/// The default — an empty environment — is [`AuthPosture::Required`].
+/// This is the launch-gate invariant: a server that nobody configured
+/// enforces authentication. The previous design defaulted to a soft
+/// pass-through mode (`ROSHERA_REQUIRE_AUTH` unset ⇒ anonymous requests
+/// accepted), which meant the default and only-reachable configuration
+/// was open. That is inverted here.
+///
+/// # The insecure opt-out is explicit and loud
+///
+/// [`AuthPosture::InsecureDevBypass`] is selected *only* by
+/// `ROSHERA_DEV_INSECURE` set to `1`/`true`. It exists so Varun's local
+/// dev loop — a frontend that does not yet emit `Authorization` headers
+/// — keeps working without a credential. It is impossible to enable by
+/// accident: no other variable selects it, a merely-present variable
+/// (`ROSHERA_DEV_INSECURE=0`) does not, and every resolution that lands
+/// on it logs an unmissable warning (see [`AuthPosture::from_env`]).
+///
+/// # Decoupled from `ROSHERA_DEV_BRIDGE`
+///
+/// `ROSHERA_DEV_BRIDGE` mounts the viewport debug bridge. Previously it
+/// *also* silently granted full permissions without a credential check,
+/// so enabling a debug viewport disabled authentication as a side
+/// effect. Those two concerns are now separate: `ROSHERA_DEV_BRIDGE`
+/// mounts routes and nothing more; only `ROSHERA_DEV_INSECURE` moves the
+/// auth posture. Overloading a convenience flag with an auth bypass is
+/// exactly how a bypass gets shipped by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPosture {
+    /// Enforce a valid credential on every non-exempt request. Missing
+    /// or invalid credentials are rejected with 401 at the middleware
+    /// boundary before any handler runs. The default.
+    Required,
+    /// Local-development bypass: inject a permissive `AuthInfo` (every
+    /// geometry permission) without checking any credential. Selected
+    /// only by `ROSHERA_DEV_INSECURE=1`. Never a default.
+    InsecureDevBypass,
+}
+
+impl AuthPosture {
+    /// Resolve the posture from the process environment. Logs loudly
+    /// when it lands on [`AuthPosture::InsecureDevBypass`] so an
+    /// operator who set the flag — or inherited it from a shell profile
+    /// — sees it on every boot.
+    pub fn from_env() -> Self {
+        let posture = Self::from_env_with(|k| std::env::var(k).ok());
+        if posture == AuthPosture::InsecureDevBypass {
+            tracing::warn!(
+                target: "api_server.auth.insecure",
+                "ROSHERA_DEV_INSECURE is set — authentication is DISABLED. Every \
+                 request is granted full permissions without a credential. This \
+                 is a local-development convenience and MUST NOT be set in any \
+                 deployment that fronts real users or is reachable from a network."
+            );
+        }
+        posture
+    }
+
+    /// Environment-getter seam for [`AuthPosture::from_env`]. Callers
+    /// (and tests) supply the lookup closure so resolution is
+    /// deterministic and does not race the process-global environment.
+    pub fn from_env_with<F>(get: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let truthy = get("ROSHERA_DEV_INSECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if truthy {
+            AuthPosture::InsecureDevBypass
+        } else {
+            AuthPosture::Required
+        }
+    }
+}
+
+/// State handed to the global [`auth_middleware`] layer: the process's
+/// single `AuthManager` plus the resolved [`AuthPosture`]. Bundled so
+/// the posture is baked into the router at build time rather than read
+/// from the environment on every request — which makes the enforcement
+/// path deterministic under test and immune to mid-flight env mutation.
+#[derive(Clone)]
+pub struct AuthLayerState {
+    pub auth_manager: Arc<AuthManager>,
+    pub posture: AuthPosture,
+}
+
+/// Build a permissive AuthInfo for the `ROSHERA_DEV_INSECURE` bypass.
+/// Every permission is granted; user_id is a stable sentinel so audit
+/// logs are still distinguishable from real users.
+///
+/// This is reached only when the resolved [`AuthPosture`] is
+/// [`AuthPosture::InsecureDevBypass`], which itself logs a loud warning
+/// once at startup ([`AuthPosture::from_env`]). Full permissions —
+/// including `DeleteGeometry` — so a local dev frontend can exercise the
+/// whole surface without a credential.
 fn dev_auth_info() -> AuthInfo {
-    tracing::warn!(
-        target: "api_server.auth.dev_bridge",
-        "ROSHERA_DEV_BRIDGE active — granting full permissions without \
-         credential check. NEVER set this in production deployments."
-    );
     AuthInfo {
-        user_id: "dev-bridge".to_string(),
+        user_id: "dev-insecure".to_string(),
         session_id: Some("dev-session".to_string()),
         permissions: vec![
             Permission::CreateGeometry,
@@ -97,73 +162,63 @@ fn dev_auth_info() -> AuthInfo {
     }
 }
 
-/// Build an anonymous AuthInfo for un-credentialed requests when
-/// `ROSHERA_REQUIRE_AUTH` is not set. No permissions are granted; the
-/// `is_api_key: false` flag combined with an empty permission list
-/// keeps `require_permission` failing closed on any protected handler.
-/// This is the transitional state — the audit recommends flipping
-/// `ROSHERA_REQUIRE_AUTH=1` and removing this path once every client
-/// emits Authorization headers (tracked under AUDIT-H7).
-fn anonymous_auth_info() -> AuthInfo {
-    AuthInfo {
-        user_id: "anonymous".to_string(),
-        session_id: None,
-        permissions: Vec::new(),
-        roles: Vec::new(),
-        is_api_key: false,
-    }
-}
-
-/// Returns true when `auth_middleware` should skip authentication for
-/// this path: liveness probes, the root handler, and the WebSocket
-/// upgrade. The WS path enforces auth in-band via
-/// `ClientMessage::Authenticate` (AUDIT-C2), not via a request header,
-/// so a `.layer()` would incorrectly 401 the upgrade handshake.
+/// Returns true when `auth_middleware` should admit this path without a
+/// credential. This is the authentication surface's public allowlist —
+/// the exact set of routes reachable before you hold a credential — and
+/// it is deliberately tiny and enumerated (no prefix wildcards beyond
+/// the two that are load-bearing) so a new route cannot fall into it by
+/// accident:
+///
+/// * `/` and `/health` — liveness/readiness probes. An orchestrator
+///   must be able to health-check the container without a credential.
+/// * `/ws` — the WebSocket *upgrade*. The socket carries the full
+///   geometry command surface and is authenticated in-band, per
+///   connection, in `protocol::message_handlers`: a header-based 401
+///   here would abort the upgrade before the client can send its
+///   `Authenticate` frame. The in-band gate refuses every command frame
+///   until authentication succeeds, so exempting the upgrade does not
+///   expose the command surface.
+/// * `/api/auth/login`, `/api/auth/register`, `/api/auth/refresh` — the
+///   credential-issuing routes. Requiring a credential to reach the
+///   only routes that mint one would make authentication unreachable.
+///   `/api/auth/logout` is deliberately *not* here: revoking a session
+///   requires presenting that session's token, which the middleware
+///   validates like any other request.
 fn path_is_exempt(path: &str) -> bool {
-    path == "/" || path == "/health" || path.starts_with("/ws")
-}
-
-/// Tower middleware that injects a permissive `AuthInfo` extension on
-/// every request when `ROSHERA_DEV_BRIDGE=1`. This lets handlers using
-/// the built-in `Extension<AuthInfo>` extractor succeed in local dev
-/// without a real session, mirroring the dev-mode bypass in the
-/// canonical `auth_middleware` (which is not currently layered onto
-/// the router globally).
-pub async fn dev_auth_layer(mut request: Request, next: Next) -> Response {
-    if dev_mode_enabled() && request.extensions().get::<AuthInfo>().is_none() {
-        request.extensions_mut().insert(dev_auth_info());
-    }
-    next.run(request).await
+    matches!(
+        path,
+        "/" | "/health" | "/api/auth/login" | "/api/auth/register" | "/api/auth/refresh"
+    ) || path == "/ws"
+        || path.starts_with("/ws/")
 }
 
 /// Authentication middleware that validates JWT tokens or API keys.
 ///
-/// Layered globally onto the router (AUDIT-C7). Path-based exemptions
-/// (`path_is_exempt`) skip `/`, `/health`, and `/ws*` — the WebSocket
-/// upgrade has its own in-band `Authenticate` handler (AUDIT-C2) and a
-/// header-based 401 would break the handshake before the client can
-/// present its token.
+/// Layered globally onto the router with an [`AuthLayerState`] carrying
+/// the process's single `AuthManager` and the resolved [`AuthPosture`].
 ///
-/// Modes:
+/// Path-based exemptions (`path_is_exempt`) skip `/` and `/health` so
+/// liveness probes need no credential. **`/ws` is no longer exempt at
+/// this layer for anything but the upgrade handshake** — the WebSocket
+/// carries the full geometry command surface and is gated in-band per
+/// connection in `protocol::message_handlers` (a header-based 401 here
+/// would break the upgrade before the client can send its
+/// `Authenticate` frame; see that module for the in-band gate).
 ///
-/// * `ROSHERA_DEV_BRIDGE=1` — inject a permissive dev `AuthInfo` and
-///   skip header validation. Loud audit log on every use (see
-///   `dev_auth_info`).
-/// * `ROSHERA_REQUIRE_AUTH=1` — strict mode. A missing or malformed
-///   Authorization header returns 401 immediately. JWT and API-key
-///   validation failures also return 401.
-/// * Neither set (default) — soft mode for the transitional period:
-///   a missing header is logged as `tracing::warn!` once per request,
-///   and the request proceeds with an anonymous `AuthInfo`. Protected
-///   handlers fail closed because the anonymous identity holds no
-///   permissions. This default keeps existing dev frontends working
-///   while making missing auth observable in the journal.
+/// Posture:
+///
+/// * [`AuthPosture::Required`] (default) — a missing, malformed, or
+///   invalid `Authorization` header returns 401 immediately. There is
+///   no anonymous pass-through: the previous soft mode is gone.
+/// * [`AuthPosture::InsecureDevBypass`] (`ROSHERA_DEV_INSECURE=1`) —
+///   inject a permissive dev `AuthInfo` and skip credential validation.
+///   The posture logs a loud warning once at startup.
 pub async fn auth_middleware(
-    State(auth_manager): State<Arc<AuthManager>>,
+    State(layer): State<AuthLayerState>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    match auth_middleware_inner(auth_manager, &mut request).await {
+    match auth_middleware_inner(&layer, &mut request).await {
         Ok(()) => next.run(request).await,
         Err(e) => e.into_response(),
     }
@@ -179,7 +234,7 @@ pub async fn auth_middleware(
 /// `FromFn` extractor-tuple resolver in axum 0.8 when mixed with the
 /// `State` extractor.
 async fn auth_middleware_inner(
-    auth_manager: Arc<AuthManager>,
+    layer: &AuthLayerState,
     request: &mut Request,
 ) -> Result<(), AuthError> {
     // Exempt the public surface (health checks, WS upgrade, root).
@@ -187,91 +242,33 @@ async fn auth_middleware_inner(
         return Ok(());
     }
 
-    if dev_mode_enabled() {
+    if layer.posture == AuthPosture::InsecureDevBypass {
         request.extensions_mut().insert(dev_auth_info());
         return Ok(());
     }
 
-    let strict = require_auth_enabled();
-
-    // Extract authorization header. In strict mode a missing header is
-    // a 401; in soft mode we log + proceed with an anonymous AuthInfo.
-    let auth_header_opt = request
+    // AuthPosture::Required — a valid credential is mandatory.
+    let auth_header = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .ok_or_else(|| AuthError {
+            error: "Missing authorization header".to_string(),
+            code: "AUTH_MISSING".to_string(),
+            status: 401,
+        })?;
 
-    let auth_header = match auth_header_opt {
-        Some(h) => h,
-        None => {
-            if strict {
-                return Err(AuthError {
-                    error: "Missing authorization header".to_string(),
-                    code: "AUTH_MISSING".to_string(),
-                    status: 401,
-                });
-            }
-            tracing::warn!(
-                target: "api_server.auth.missing",
-                "Request to {} has no Authorization header; \
-                 proceeding as anonymous (set ROSHERA_REQUIRE_AUTH=1 \
-                 to reject)",
-                request.uri().path()
-            );
-            request.extensions_mut().insert(anonymous_auth_info());
-            return Ok(());
-        }
-    };
-
-    // Parse authorization header
     let auth_info = if let Some(token) = auth_header.strip_prefix("Bearer ") {
-        // JWT token authentication
-        match validate_jwt(auth_manager.as_ref(), token).await {
-            Ok(info) => info,
-            Err(e) => {
-                if strict {
-                    return Err(e);
-                }
-                tracing::warn!(
-                    target: "api_server.auth.invalid",
-                    "JWT validation failed in soft mode; proceeding as \
-                     anonymous: {}",
-                    e.error
-                );
-                anonymous_auth_info()
-            }
-        }
+        validate_jwt(layer.auth_manager.as_ref(), token).await?
     } else if let Some(api_key) = auth_header.strip_prefix("ApiKey ") {
-        // API key authentication
-        match validate_api_key(auth_manager.as_ref(), api_key).await {
-            Ok(info) => info,
-            Err(e) => {
-                if strict {
-                    return Err(e);
-                }
-                tracing::warn!(
-                    target: "api_server.auth.invalid",
-                    "API-key validation failed in soft mode; proceeding \
-                     as anonymous: {}",
-                    e.error
-                );
-                anonymous_auth_info()
-            }
-        }
-    } else if strict {
+        validate_api_key(layer.auth_manager.as_ref(), api_key).await?
+    } else {
         return Err(AuthError {
             error: "Invalid authorization format".to_string(),
             code: "AUTH_INVALID_FORMAT".to_string(),
             status: 401,
         });
-    } else {
-        tracing::warn!(
-            target: "api_server.auth.invalid",
-            "Authorization header format unrecognised in soft mode; \
-             proceeding as anonymous"
-        );
-        anonymous_auth_info()
     };
 
     // Insert auth info into request extensions
@@ -364,22 +361,16 @@ async fn enforce_permission_layer(
     request: Request,
     next: Next,
 ) -> Response {
-    // Soft mode: preserve compat with dev frontends that have not yet
-    // wired Authorization headers. The audit recommends flipping
-    // `ROSHERA_REQUIRE_AUTH=1` in any deployment that fronts real
-    // users — at which point this branch is dead and every mutation
-    // is gated.
-    if !require_auth_enabled() {
-        return next.run(request).await;
-    }
-
-    let has_auth = request.extensions().get::<AuthInfo>().cloned();
-    let auth_info = match has_auth {
+    // The global `auth_middleware` runs before this per-route layer and
+    // always injects an `AuthInfo`: a validated credential under
+    // `AuthPosture::Required`, or a full-permission dev identity under
+    // `AuthPosture::InsecureDevBypass`. This layer therefore only has to
+    // refine the check to scope. A missing extension is unreachable in
+    // normal operation (it would mean the front door was bypassed); we
+    // fail closed on it regardless.
+    let auth_info = match request.extensions().get::<AuthInfo>().cloned() {
         Some(info) => info,
         None => {
-            // auth_middleware should always inject AuthInfo (anonymous
-            // in soft mode, real in strict mode). If we ever observe
-            // a missing extension in strict mode, fail closed.
             return crate::error_catalog::ApiError::permission_denied(name).into_response();
         }
     };
@@ -403,18 +394,18 @@ async fn enforce_permission_layer(
 /// Returns `Ok(())` to proceed, `Err(ApiError)` to short-circuit with
 /// a 403.
 ///
-/// Mode matrix mirrors [`enforce_permission_layer`]: soft mode is a
-/// no-op; strict mode enforces. Use the route-layer form when
-/// possible — it keeps the policy at the router definition site
-/// rather than buried in handler bodies.
+/// The caller reaches this only after the global `auth_middleware` has
+/// admitted the request, so `auth` is either a validated credential
+/// (`AuthPosture::Required`) or the full-permission dev identity
+/// (`AuthPosture::InsecureDevBypass`). The check is therefore an
+/// unconditional scope test. Use the route-layer form when possible —
+/// it keeps the policy at the router definition site rather than buried
+/// in handler bodies.
 pub fn enforce_permission(
     auth: &AuthInfo,
     required: Permission,
     name: &'static str,
 ) -> Result<(), crate::error_catalog::ApiError> {
-    if !require_auth_enabled() {
-        return Ok(());
-    }
     if auth.permissions.contains(&required) {
         return Ok(());
     }
@@ -523,11 +514,20 @@ async fn validate_api_key(
     }
 }
 
-/// Get default permissions for authenticated users
+/// Get default permissions for authenticated users.
+///
+/// Includes `DeleteGeometry`: a logged-in human driving the frontend
+/// must be able to delete a solid. Omitting it (as an earlier revision
+/// did) meant that under `AuthPosture::Required` a valid JWT user was
+/// silently 403'd on every delete while creates and modifies succeeded
+/// — an inconsistency that only surfaces once auth is actually enforced.
+/// Scoped-down credentials (API keys) still carry exactly the
+/// permissions minted into them; this default applies to JWT sessions.
 fn get_default_user_permissions() -> Vec<Permission> {
     vec![
         Permission::CreateGeometry,
         Permission::ModifyGeometry,
+        Permission::DeleteGeometry,
         Permission::ViewGeometry,
         Permission::ExportGeometry,
         Permission::RecordSession,
@@ -571,11 +571,14 @@ pub fn get_auth_info(request: &Request) -> Option<&AuthInfo> {
 
 /// Implement FromRequestParts for AuthInfo to allow it as a handler parameter.
 ///
-/// When `ROSHERA_DEV_BRIDGE=1` and no extension is present, fall back to a
-/// permissive dev `AuthInfo`. The auth middleware is the canonical injector
-/// when wired as a layer; the dev fallback exists because the router
-/// currently doesn't apply the layer globally and we still want every
-/// AuthInfo-extracting handler to work in local development.
+/// The global `auth_middleware` is the canonical injector: under
+/// `AuthPosture::Required` it has already validated a credential and
+/// inserted the `AuthInfo`; under `AuthPosture::InsecureDevBypass` it
+/// inserted the permissive dev identity. This extractor therefore reads
+/// the extension the middleware placed. If the extension is absent — a
+/// handler reached without passing the front door — it fails closed with
+/// 401 rather than fabricating an identity, so a routing mistake cannot
+/// silently grant access.
 impl<S> axum::extract::FromRequestParts<S> for AuthInfo
 where
     S: Send + Sync,
@@ -588,9 +591,6 @@ where
     ) -> Result<Self, Self::Rejection> {
         if let Some(info) = parts.extensions.get::<AuthInfo>().cloned() {
             return Ok(info);
-        }
-        if dev_mode_enabled() {
-            return Ok(dev_auth_info());
         }
         Err(AuthError {
             error: "Authentication required".to_string(),
@@ -609,18 +609,15 @@ mod tests {
         // Test implementation
     }
 
-    /// Mode/permission matrix for `enforce_permission`. Env-var
-    /// mutation is racy across the whole test process, so the
-    /// matrix is collapsed into one test that toggles
-    /// `ROSHERA_REQUIRE_AUTH` deterministically and asserts every
-    /// arm before restoring the prior state.
+    /// Permission matrix for `enforce_permission`.
+    ///
+    /// Since the soft/strict env toggle was removed (authentication is
+    /// enforced by default; the only bypass is the whole-process
+    /// `AuthPosture::InsecureDevBypass`, which injects a full-permission
+    /// identity upstream), `enforce_permission` is an unconditional
+    /// scope test. No env mutation, so this is fully deterministic.
     #[test]
-    fn enforce_permission_mode_matrix() {
-        // Snapshot + clear the env so the test is hermetic regardless
-        // of what the surrounding harness or other tests left behind.
-        let prior = std::env::var("ROSHERA_REQUIRE_AUTH").ok();
-        std::env::remove_var("ROSHERA_REQUIRE_AUTH");
-
+    fn enforce_permission_is_an_unconditional_scope_check() {
         let granted = AuthInfo {
             user_id: "alice".into(),
             session_id: None,
@@ -636,36 +633,65 @@ mod tests {
             is_api_key: false,
         };
 
-        // Soft mode (REQUIRE_AUTH unset): always permitted, even
-        // for anonymous identities. Preserves dev-frontend compat.
+        // Holding the required scope permits.
         assert!(
             enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok()
         );
-        assert!(enforce_permission(&anon, Permission::ModifyGeometry, "modify_geometry").is_ok());
 
-        // Strict mode (REQUIRE_AUTH=1): permission must be present.
-        std::env::set_var("ROSHERA_REQUIRE_AUTH", "1");
+        // An empty permission list is always rejected — there is no
+        // longer a mode in which a scopeless identity passes.
         assert!(
-            enforce_permission(&granted, Permission::ModifyGeometry, "modify_geometry").is_ok()
-        );
-        let denied = enforce_permission(&anon, Permission::ModifyGeometry, "modify_geometry");
-        assert!(
-            denied.is_err(),
-            "strict mode must reject anonymous mutation"
-        );
-        // Mismatched permission also rejects: holding ModifyGeometry
-        // does not grant DeleteGeometry.
-        let mismatched =
-            enforce_permission(&granted, Permission::DeleteGeometry, "delete_geometry");
-        assert!(
-            mismatched.is_err(),
-            "strict mode must reject when the held scope differs from the required scope"
+            enforce_permission(&anon, Permission::ModifyGeometry, "modify_geometry").is_err(),
+            "an identity holding no permissions must never be admitted to a mutation"
         );
 
-        // Restore env so neighbouring tests see the original state.
-        match prior {
-            Some(v) => std::env::set_var("ROSHERA_REQUIRE_AUTH", v),
-            None => std::env::remove_var("ROSHERA_REQUIRE_AUTH"),
+        // Holding one scope does not grant another.
+        assert!(
+            enforce_permission(&granted, Permission::DeleteGeometry, "delete_geometry").is_err(),
+            "holding ModifyGeometry must not grant DeleteGeometry"
+        );
+    }
+
+    /// The posture default is secure, and the insecure opt-out is
+    /// explicit, single-valued, and decoupled from `ROSHERA_DEV_BRIDGE`.
+    #[test]
+    fn auth_posture_defaults_secure_and_opt_out_is_explicit() {
+        // Empty environment → Required.
+        assert_eq!(
+            AuthPosture::from_env_with(|_| None),
+            AuthPosture::Required,
+            "a server with no ROSHERA_* variables must enforce authentication"
+        );
+
+        // The opt-out fires only on its own variable, set truthy.
+        for value in ["1", "true", "TRUE"] {
+            assert_eq!(
+                AuthPosture::from_env_with(
+                    |k| (k == "ROSHERA_DEV_INSECURE").then(|| value.to_string())
+                ),
+                AuthPosture::InsecureDevBypass,
+                "ROSHERA_DEV_INSECURE={value} must select the dev bypass"
+            );
         }
+
+        // A merely-present or falsey value is not an opt-out.
+        for value in ["0", "false", "", "yes", "no"] {
+            assert_eq!(
+                AuthPosture::from_env_with(
+                    |k| (k == "ROSHERA_DEV_INSECURE").then(|| value.to_string())
+                ),
+                AuthPosture::Required,
+                "ROSHERA_DEV_INSECURE={value:?} must NOT disable authentication"
+            );
+        }
+
+        // ROSHERA_DEV_BRIDGE mounts a debug viewport; it must not move
+        // the auth posture. Overloading it with a bypass is how a bypass
+        // ships by accident.
+        assert_eq!(
+            AuthPosture::from_env_with(|k| (k == "ROSHERA_DEV_BRIDGE").then(|| "1".to_string())),
+            AuthPosture::Required,
+            "ROSHERA_DEV_BRIDGE must not disable authentication"
+        );
     }
 }

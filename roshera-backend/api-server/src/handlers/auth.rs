@@ -8,7 +8,6 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use session_manager::{AuthManager, Permission};
 use tracing::{error, info, warn};
 
 /// Response payload for the logout endpoint.
@@ -81,7 +80,7 @@ pub async fn login(
 ) -> Result<Json<LoginResponse>> {
     info!("Login attempt for user: {}", payload.username);
 
-    let auth_manager = &state.auth_manager;
+    let auth_manager = state.session_manager.auth_manager();
 
     // Derive the canonical user_id from the username (consistent with registration).
     let user_id = format!("user_{}", payload.username);
@@ -175,7 +174,7 @@ pub async fn register(
 ) -> Result<Json<RegisterResponse>> {
     info!("Registration attempt for user: {}", payload.username);
 
-    let auth_manager = &state.auth_manager;
+    let auth_manager = state.session_manager.auth_manager();
 
     if payload.username.len() < 3 {
         return Ok(Json(RegisterResponse {
@@ -292,7 +291,7 @@ pub async fn refresh_token(
 ) -> Result<Json<RefreshResponse>> {
     info!("Token refresh attempt");
 
-    let auth_manager = &state.auth_manager;
+    let auth_manager = state.session_manager.auth_manager();
 
     // Validate the refresh token as a JWT. verify_token checks signature, expiry,
     // and revocation list, so a bare UUID or tampered token is rejected here.
@@ -342,7 +341,7 @@ pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<LogoutResponse>> {
-    let auth_manager = &state.auth_manager;
+    let auth_manager = state.session_manager.auth_manager();
 
     // Extract the Bearer token from the Authorization header.
     let raw_token = match headers

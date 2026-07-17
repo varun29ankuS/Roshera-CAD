@@ -45,9 +45,8 @@ use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, Topol
 use geometry_engine::primitives::vertex::VertexId;
 use serde_json::{json, Value};
 use session_manager::{
-    AuthConfig, AuthManager, BroadcastManager, CacheConfig, CacheManager, DatabaseConfig,
-    DatabasePersistence, DatabaseType, HierarchyManager, PasswordRequirements, PermissionManager,
-    SessionManager, SqliteDatabase,
+    BroadcastManager, CacheConfig, CacheManager, DatabaseConfig, DatabasePersistence, DatabaseType,
+    HierarchyManager, PermissionManager, SessionManager, SqliteDatabase,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,7 +74,7 @@ use uuid::Uuid;
 /// none of the tests in this module exercise the AI surface, and
 /// surfacing a real LLM client from a unit-test build would tie
 /// the suite to network availability.
-async fn make_test_state() -> AppState {
+pub(crate) async fn make_test_state() -> AppState {
     let model = Arc::new(RwLock::new(BRepModel::new()));
 
     let db_config = DatabaseConfig {
@@ -93,28 +92,14 @@ async fn make_test_state() -> AppState {
     let broadcast_manager = BroadcastManager::new();
     let session_manager = Arc::new(SessionManager::new(broadcast_manager));
 
-    let auth_config = AuthConfig {
-        issuer: "roshera-cad-test".to_string(),
-        audience: vec!["roshera-api-test".to_string()],
-        token_expiry_seconds: 3600,
-        refresh_expiry_seconds: 86400,
-        idle_timeout_seconds: 1800,
-        max_failed_attempts: 5,
-        lockout_duration_seconds: 300,
-        require_2fa_for_sensitive: false,
-        api_key_prefix: "test_".to_string(),
-        password_requirements: PasswordRequirements {
-            min_length: 8,
-            require_uppercase: true,
-            require_lowercase: true,
-            require_numbers: true,
-            require_special: false,
-        },
-    };
-    let auth_manager = Arc::new(
-        AuthManager::new(auth_config, "test_secret_key")
-            .expect("AuthManager must accept non-empty signing key"),
-    );
+    // No `AuthManager` is constructed here. The fixture deliberately
+    // mirrors production: the process's only manager is the one inside
+    // `SessionManager`, reached via `session_manager.auth_manager()`.
+    //
+    // This fixture used to build its own with a `"test_secret_key"`
+    // literal — faithfully reproducing the production bug it was meant
+    // to guard against, and guaranteeing that a token minted by
+    // `login` could never be verified by the middleware under test.
     let permission_manager = Arc::new(PermissionManager::new());
 
     let cache_config = CacheConfig {
@@ -189,8 +174,13 @@ async fn make_test_state() -> AppState {
         provider_manager,
         ai_configured: false,
         session_manager,
-        auth_manager,
         permission_manager,
+        // Router integration tests exercise the enforced posture by
+        // default; the fillet/CORS wire-shape tests here send no
+        // credential, so they select the dev bypass to keep asserting
+        // handler behaviour rather than the 401 boundary. Auth-specific
+        // behaviour is pinned separately in `auth_slice1_tests`.
+        auth_posture: crate::auth_middleware::AuthPosture::InsecureDevBypass,
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),
