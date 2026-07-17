@@ -501,6 +501,31 @@ pub enum BlendFailure {
         /// The setback threshold `distance` was compared against.
         setback: f64,
     },
+    /// #70 — a chamfer rail chain terminates against an existing
+    /// fillet's cylindrical surface (the chamfer *crosses* the fillet),
+    /// and the crossing termination is geometrically infeasible or
+    /// degenerate at this endpoint. The supported crossing is analytic
+    /// — the chamfer wall plane cuts the fillet cylinder in an
+    /// elliptical arc that closes the wall against the fillet — but it
+    /// only exists when each chamfer rail intersects the fillet's live
+    /// boundary transversally. Typical obstructions carried in
+    /// `reason`: the setback reaches or exceeds the fillet's tangency
+    /// zone (`d ≥ r` — the rail clears the fillet boundary arc
+    /// entirely), tangential grazing (`d == r` — the crossing arc
+    /// degenerates to a point), or a wall plane parallel to the fillet
+    /// axis (the conic degenerates to line pairs).
+    ///
+    /// Recovery: retry with a smaller chamfer distance (strictly less
+    /// than the fillet radius), or re-order the features so the
+    /// chamfer no longer terminates inside the fillet zone.
+    FilletCrossingInfeasible {
+        /// The chamfered edge's endpoint vertex at the fillet boundary.
+        vertex: VertexId,
+        /// The existing fillet face the chamfer chain crosses into.
+        fillet_face: FaceId,
+        /// Specific geometric obstruction.
+        reason: String,
+    },
     /// Catch-all for irreducible failures not yet classified. The
     /// `detail` string is freeform; when a recurring `detail` pattern
     /// emerges in production telemetry, promote it to a structured
@@ -637,6 +662,16 @@ impl std::fmt::Display for BlendFailure {
                  [{vertex}]` on a single call carrying ALL same-kind edges at this corner, \
                  then apply the opposite kind in a second call"
             ),
+            BlendFailure::FilletCrossingInfeasible {
+                vertex,
+                fillet_face,
+                reason,
+            } => write!(
+                f,
+                "chamfer chain terminates against existing fillet face {fillet_face} at \
+                 vertex {vertex}, but the crossing termination is infeasible: {reason}. \
+                 Retry with a chamfer distance strictly smaller than the fillet radius"
+            ),
             BlendFailure::TopologyViolation { detail } => {
                 write!(f, "topology violation: {}", detail)
             }
@@ -707,6 +742,14 @@ impl From<BlendFailure> for OperationError {
             // `partial_corner_vertices` two-call protocol — typed
             // BlendFailed, same rationale as MixedKindUnsupported.
             BlendFailure::AdjacentSameKindBlendScar { .. } => {
+                OperationError::BlendFailed(Box::new(failure))
+            }
+            // #70: FilletCrossingInfeasible carries the typed payload
+            // (endpoint vertex, fillet face, geometric obstruction)
+            // agents need to shrink the chamfer distance below the
+            // fillet radius or re-order the features — typed
+            // BlendFailed, same rationale as AdjacentSameKindBlendScar.
+            BlendFailure::FilletCrossingInfeasible { .. } => {
                 OperationError::BlendFailed(Box::new(failure))
             }
             BlendFailure::RadiusExceedsCurvature { .. }

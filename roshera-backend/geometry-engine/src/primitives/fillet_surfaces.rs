@@ -408,6 +408,53 @@ impl CylindricalFillet {
         let idx = idx.min(self.angle_span.len() - 1);
         self.angle_span[idx]
     }
+
+    /// EXACT chart inversion for STRAIGHT-spine fillets (#70). A straight
+    /// spine carries a constant frame, so the cylindrical chart
+    /// (`u` = axial fraction along the spine, `v` = angular fraction across
+    /// the blend arc) inverts in closed form — the classical cylinder
+    /// inverse mapping (axial projection + `atan2` in the frame plane),
+    /// clamped to the `[0,1]²` domain. `None` for curved spines or
+    /// degenerate inputs (callers fall back to the trait's iterative
+    /// `closest_point`).
+    ///
+    /// Deliberately a SEPARATE method from the `Surface::closest_point`
+    /// trait impl: the orientation validator's edge-midpoint normal probe
+    /// (`primitives::validation::outward_walk_is_forward`) is calibrated
+    /// against the iterative projection's interior-biased convergence at
+    /// tangent contact rails — feeding it the exact boundary parameter
+    /// makes its sidedness test degenerate exactly at G1 seams (verified
+    /// live: the square-prism single-edge fillet false-positives
+    /// "same orientation" when the trait method is made exact). The exact
+    /// chart is consumed where exactness is REQUIRED and boundary-safe:
+    /// the curved-CDT trim-loop projection for crossing-notched fillet
+    /// faces and the #70 crossing planner's live-patch branch check.
+    pub fn closest_point_analytic(&self, point: &Point3) -> Option<(f64, f64)> {
+        let line = self
+            .spine
+            .as_any()
+            .downcast_ref::<crate::primitives::curve::Line>()?;
+        let dir = line.direction();
+        let len2 = dir.magnitude_squared();
+        if len2 <= 1e-20 {
+            return None;
+        }
+        let u = ((*point - line.start).dot(&dir) / len2).clamp(0.0, 1.0);
+        let spine_point = line.start + dir * u;
+        let z = self.axis_at(u).ok()?.normalize().ok()?;
+        let x = self.frame_x_at(u);
+        let y = self.frame_y_at(u);
+        let rel = *point - spine_point;
+        let radial = rel - z * rel.dot(&z);
+        let (a0, a1) = self.angles_at(u);
+        let span = a1 - a0;
+        if radial.magnitude_squared() <= 1e-20 || span.abs() <= 1e-12 {
+            return None;
+        }
+        let angle = radial.dot(&y).atan2(radial.dot(&x));
+        let v = ((angle - a0) / span).clamp(0.0, 1.0);
+        Some((u, v))
+    }
 }
 
 impl Surface for CylindricalFillet {

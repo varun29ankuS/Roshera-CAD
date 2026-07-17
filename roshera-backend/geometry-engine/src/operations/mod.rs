@@ -100,6 +100,10 @@ pub(crate) mod polygon_clip;
 // face so the resulting B-Rep is watertight.
 pub(crate) mod edge_blend_topology;
 
+// #70 — analytic termination of a chamfer chain against an existing
+// fillet's cylindrical surface (rail retrims + plane×cylinder ellipse cap).
+pub(crate) mod chamfer_fillet_crossing;
+
 // Shared face-orientation helpers. Every face-construction site that
 // builds a lateral / side-wall / blend surface must call
 // `orient_face_for_outward` to pick the `FaceOrientation` flag that

@@ -779,101 +779,107 @@ fn create_edge_chamfer(
     match &options.chamfer_type {
         ChamferType::EqualDistance(dist) => create_equal_distance_chamfer(
             model,
+            solid_id,
             edge_id,
             face1_id,
             face2_id,
             *dist,
             miter_overrides,
+            &options.partial_corner_vertices,
         )
         .map(|(f, s)| (f, Some(s))),
         ChamferType::TwoDistances(dist1, dist2) => create_two_distance_chamfer(
             model,
+            solid_id,
             edge_id,
             face1_id,
             face2_id,
             *dist1,
             *dist2,
             miter_overrides,
+            &options.partial_corner_vertices,
         )
         .map(|(f, s)| (f, Some(s))),
         ChamferType::DistanceAngle(dist, angle) => create_distance_angle_chamfer(
             model,
+            solid_id,
             edge_id,
             face1_id,
             face2_id,
             *dist,
             *angle,
             miter_overrides,
+            &options.partial_corner_vertices,
         )
         .map(|(f, s)| (f, Some(s))),
-        ChamferType::Angle(angle) => {
-            create_angle_chamfer(model, edge_id, face1_id, face2_id, *angle, miter_overrides)
-                .map(|(f, s)| (f, Some(s)))
-        }
+        ChamferType::Angle(angle) => create_angle_chamfer(
+            model,
+            solid_id,
+            edge_id,
+            face1_id,
+            face2_id,
+            *angle,
+            miter_overrides,
+            &options.partial_corner_vertices,
+        )
+        .map(|(f, s)| (f, Some(s))),
     }
 }
 
 /// Create equal distance chamfer
+#[allow(clippy::too_many_arguments)]
 fn create_equal_distance_chamfer(
     model: &mut BRepModel,
+    solid_id: SolidId,
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     distance: f64,
     miter_overrides: Option<&MiterOverrideMap>,
+    partial_corner_vertices: &[VertexId],
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
-    // Get edge geometry
-    let edge = model
-        .edges
-        .get(edge_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
-        .clone();
-
-    // Compute chamfer offsets along edge
-    let chamfer_data = compute_chamfer_offsets(
+    create_two_distance_chamfer(
         model,
-        &edge,
+        solid_id,
         edge_id,
         face1_id,
         face2_id,
         distance,
         distance,
         miter_overrides,
-    )?;
-
-    // Create chamfer surface (ruled surface between offset curves)
-    let chamfer_surface = create_ruled_chamfer_surface(model, &chamfer_data)?;
-    let surface_id = model.surfaces.add(chamfer_surface);
-
-    // Create chamfer face with proper boundaries
-    create_chamfer_face(
-        model,
-        surface_id,
-        edge_id,
-        face1_id,
-        face2_id,
-        &chamfer_data,
+        partial_corner_vertices,
     )
 }
 
-/// Create two-distance chamfer
+/// Create two-distance chamfer — the shared open-edge pipeline every
+/// [`ChamferType`] funnels into (equal-distance is `d1 == d2`;
+/// distance-angle / angle resolve their second distance first).
+///
+/// Pipeline: perpendicular rail offsets → #70 fillet-crossing planning
+/// (analytic rail retrims onto an adjacent fillet's boundary, when a
+/// chain endpoint terminates against a fillet cylinder) → ruled wall
+/// surface → wall face + surgery → crossing cap swap (straight V-side
+/// chord → exact plane×cylinder [`crate::primitives::curve::Ellipse`]
+/// arc). See `operations::chamfer_fillet_crossing`.
+#[allow(clippy::too_many_arguments)]
 fn create_two_distance_chamfer(
     model: &mut BRepModel,
+    solid_id: SolidId,
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     distance1: f64,
     distance2: f64,
     miter_overrides: Option<&MiterOverrideMap>,
+    partial_corner_vertices: &[VertexId],
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
-    // Similar to equal distance but with different offsets
     let edge = model
         .edges
         .get(edge_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
         .clone();
 
-    let chamfer_data = compute_chamfer_offsets(
+    let mut chamfer_data = compute_chamfer_offsets(
         model,
         &edge,
         edge_id,
@@ -884,28 +890,56 @@ fn create_two_distance_chamfer(
         miter_overrides,
     )?;
 
+    // #70 — fillet-crossing terminations. Detects chain endpoints that
+    // terminate against an existing straight-spine cylindrical fillet,
+    // retrims the rail endpoints onto the fillet's boundary curves
+    // (mutating `chamfer_data` in place), and returns the planned
+    // elliptical caps. Non-crossing endpoints are untouched; infeasible
+    // crossings refuse typed (`BlendFailure::FilletCrossingInfeasible`)
+    // before any model mutation.
+    let crossing_plans = super::chamfer_fillet_crossing::plan_fillet_crossings(
+        model,
+        solid_id,
+        edge_id,
+        face1_id,
+        face2_id,
+        &mut chamfer_data.offset_points1,
+        &mut chamfer_data.offset_points2,
+        partial_corner_vertices,
+    )?;
+
     let chamfer_surface = create_ruled_chamfer_surface(model, &chamfer_data)?;
     let surface_id = model.surfaces.add(chamfer_surface);
 
-    create_chamfer_face(
+    let (face_id, surgery) = create_chamfer_face(
         model,
         surface_id,
         edge_id,
         face1_id,
         face2_id,
         &chamfer_data,
-    )
+    )?;
+
+    // #70 — swap each planned crossing's straight V-side cap chord for
+    // the exact wall-plane × fillet-cylinder elliptical arc. Must run
+    // before `splice_blend_edge` consumes the surgery.
+    super::chamfer_fillet_crossing::apply_crossing_caps(model, &surgery, &crossing_plans)?;
+
+    Ok((face_id, surgery))
 }
 
 /// Create distance-angle chamfer
+#[allow(clippy::too_many_arguments)]
 fn create_distance_angle_chamfer(
     model: &mut BRepModel,
+    solid_id: SolidId,
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     distance: f64,
     angle: f64,
     miter_overrides: Option<&MiterOverrideMap>,
+    partial_corner_vertices: &[VertexId],
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     // Compute second distance from angle
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
@@ -913,12 +947,14 @@ fn create_distance_angle_chamfer(
 
     create_two_distance_chamfer(
         model,
+        solid_id,
         edge_id,
         face1_id,
         face2_id,
         distance,
         distance2,
         miter_overrides,
+        partial_corner_vertices,
     )
 }
 
@@ -933,13 +969,16 @@ fn create_distance_angle_chamfer(
 ///
 /// where `face_angle` is the dihedral angle between the two adjacent
 /// faces.
+#[allow(clippy::too_many_arguments)]
 fn create_angle_chamfer(
     model: &mut BRepModel,
+    solid_id: SolidId,
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
     angle: f64,
     miter_overrides: Option<&MiterOverrideMap>,
+    partial_corner_vertices: &[VertexId],
 ) -> OperationResult<(FaceId, BlendEdgeSurgery)> {
     let face_angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
     if angle <= 0.0 || angle >= face_angle {
@@ -975,12 +1014,14 @@ fn create_angle_chamfer(
 
     create_two_distance_chamfer(
         model,
+        solid_id,
         edge_id,
         face1_id,
         face2_id,
         distance1,
         distance2,
         miter_overrides,
+        partial_corner_vertices,
     )
 }
 

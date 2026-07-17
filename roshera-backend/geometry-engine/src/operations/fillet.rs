@@ -9988,6 +9988,7 @@ fn validate_fillet_parameters(
     let start_v = edge.start_vertex;
     let end_v = edge.end_vertex;
     let mut min_neighbor = f64::INFINITY;
+    let mut min_neighbor_id: Option<EdgeId> = None;
     for (other_id, other) in model.edges.iter() {
         if other_id == edge_id {
             continue;
@@ -10002,6 +10003,7 @@ fn validate_fillet_parameters(
         if let Ok(len) = other.compute_arc_length(&model.curves, *tolerance) {
             if len < min_neighbor {
                 min_neighbor = len;
+                min_neighbor_id = Some(other_id);
             }
         }
     }
@@ -10011,6 +10013,41 @@ fn validate_fillet_parameters(
     // edge has no adjacent-face room to reason about, so the upper bound is
     // left to the downstream blend construction + validation.
     if min_neighbor.is_finite() && radius > min_neighbor {
+        // #70 (reverse order) — when the too-short neighbour is an edge
+        // of an existing CHAMFER blend face (a wall rail or V-side cap
+        // chord), the real obstruction is not the radius magnitude: the
+        // requested fillet chain terminates inside an existing chamfer
+        // scar (the mirror of chamfer-crosses-fillet). `InvalidRadius`
+        // would misdirect the caller toward shrinking a perfectly
+        // reasonable radius; refuse with the typed cross-kind conflict
+        // instead so agents get the honest reason (re-order the
+        // features, or keep the fillet chain clear of the chamfer zone —
+        // fillet-crosses-chamfer termination is not implemented).
+        if let Some(nid) = min_neighbor_id {
+            let neighbor_in_chamfer_face = model.solids.iter().any(|(_, solid)| {
+                solid
+                    .blend_faces_by_kind
+                    .iter()
+                    .filter(|(_, kind)| **kind == crate::primitives::solid::BlendKind::Chamfer)
+                    .any(|(&fid, _)| {
+                        model
+                            .faces
+                            .get(fid)
+                            .and_then(|f| model.loops.get(f.outer_loop))
+                            .map(|lp| lp.edges.contains(&nid))
+                            .unwrap_or(false)
+                    })
+            });
+            if neighbor_in_chamfer_face {
+                return Err(OperationError::BlendFailed(Box::new(
+                    super::diagnostics::BlendFailure::ConflictingBlendKind {
+                        edge: edge_id,
+                        existing_kind: crate::primitives::solid::BlendKind::Chamfer,
+                        requested_kind: crate::primitives::solid::BlendKind::Fillet,
+                    },
+                )));
+            }
+        }
         return Err(OperationError::InvalidRadius(radius));
     }
 

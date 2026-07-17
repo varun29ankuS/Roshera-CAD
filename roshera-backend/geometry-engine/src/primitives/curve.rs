@@ -1284,13 +1284,31 @@ impl Curve for Arc {
         let y = to_projected.dot(&y_axis);
         let angle = y.atan2(x);
 
-        // Map angle to parameter range
+        // Map angle to parameter range. The angular offset must be
+        // wrapped INTO the sweep's own direction: a negative-sweep arc
+        // (start_angle sweeping clockwise, e.g. the fillet cap arcs)
+        // covers angles in [start + sweep, start], so the offset is
+        // normalised into (−2π, 0] there. The historical unconditional
+        // wrap into [0, 2π] divided a positive offset by the negative
+        // sweep, went negative, and clamped EVERY projection onto a
+        // negative-sweep arc to t = 0 (the arc's start point) — the
+        // defect that broke rail∩arc acceptance in the #70
+        // chamfer-crosses-fillet planner.
         let mut param_angle = angle - self.start_angle;
-        while param_angle < 0.0 {
-            param_angle += consts::TWO_PI;
-        }
-        while param_angle > consts::TWO_PI {
-            param_angle -= consts::TWO_PI;
+        if self.sweep_angle >= 0.0 {
+            while param_angle < 0.0 {
+                param_angle += consts::TWO_PI;
+            }
+            while param_angle > consts::TWO_PI {
+                param_angle -= consts::TWO_PI;
+            }
+        } else {
+            while param_angle > 0.0 {
+                param_angle -= consts::TWO_PI;
+            }
+            while param_angle < -consts::TWO_PI {
+                param_angle += consts::TWO_PI;
+            }
         }
 
         let t = (param_angle / self.sweep_angle).clamp(0.0, 1.0);

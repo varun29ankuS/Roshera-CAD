@@ -271,9 +271,22 @@ pub(crate) fn project_loop_to_uv(
 
         for idx in emit_indices {
             let p_3d = samples[idx];
-            let (mut u, mut v) = match surface.closest_point(&p_3d, Tolerance::default()) {
-                Ok(uv) => uv,
-                Err(_) => return Err(CurvedCdtError::ProjectionFailed),
+            // #70 — straight-spine cylindrical fillets invert their chart
+            // in closed form. The trait's iterative `closest_point` is
+            // seeded at (0.5, 0.5) with a damped 20-iteration budget and
+            // is unreliable near the domain corners a crossing-notched
+            // trim loop must hit exactly; the exact inversion keeps the
+            // projected boundary consistent with the cached 3D stream.
+            let analytic = surface
+                .as_any()
+                .downcast_ref::<crate::primitives::fillet_surfaces::CylindricalFillet>()
+                .and_then(|cf| cf.closest_point_analytic(&p_3d));
+            let (mut u, mut v) = match analytic {
+                Some(uv) => uv,
+                None => match surface.closest_point(&p_3d, Tolerance::default()) {
+                    Ok(uv) => uv,
+                    Err(_) => return Err(CurvedCdtError::ProjectionFailed),
+                },
             };
 
             // Periodicity unwrap against the previous sample. Mirrors

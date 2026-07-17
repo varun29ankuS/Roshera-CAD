@@ -7972,6 +7972,44 @@ fn tessellate_fillet_face(
     };
 
     if outer_loop.edges.len() != 4 {
+        // #70 — a straight-spine cylindrical fillet face NOTCHED by a
+        // crossing chamfer carries a ≥5-edge loop (retrimmed cap arc +
+        // wall∩cylinder elliptical arc + retrimmed contact seam + the
+        // untouched rails). The rectangular cache-grid above cannot
+        // represent the notch and the grid fallback ignores the trim
+        // entirely (it would re-cover the cut-away corner and leave the
+        // ellipse seam open). Route through the constraint-aware
+        // curved-CDT path: it consumes the EdgeSampleCache for boundary
+        // 3D (bit-exact seam sharing with the planar/wall neighbours)
+        // and projects via the fillet's analytic straight-spine
+        // `closest_point` inversion. Only fired for the straight-spine
+        // cylindrical case that inversion covers; every other loop
+        // count keeps the historical grid fallback.
+        let straight_spine_cyl = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::fillet_surfaces::CylindricalFillet>()
+            .map(|cf| {
+                cf.spine
+                    .as_any()
+                    .downcast_ref::<crate::primitives::curve::Line>()
+                    .is_some()
+            })
+            .unwrap_or(false);
+        if outer_loop.edges.len() >= 5 && straight_spine_cyl {
+            match super::curved_cdt::tessellate_curved_cdt(
+                surface, face, model, params, cache, mesh,
+            ) {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        "curved_cdt failed for crossing-trimmed fillet face {:?}: {:?}; \
+                         falling back to untrimmed grid (covers the notch)",
+                        face.id,
+                        e
+                    );
+                }
+            }
+        }
         if outer_loop.edges.len() != 3 {
             tracing::warn!(
                 edge_count = outer_loop.edges.len(),

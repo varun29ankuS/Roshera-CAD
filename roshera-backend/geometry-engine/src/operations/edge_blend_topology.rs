@@ -384,7 +384,7 @@ pub(crate) fn splice_blend_edge(
 /// match to close a single-edge fillet cap) and
 /// [`third_face_candidate_count`] (the read-only pre-flight the all-edges
 /// graceful skip uses to detect a termination surgery could not close).
-fn outer_shell_faces_at_vertex(
+pub(crate) fn outer_shell_faces_at_vertex(
     model: &BRepModel,
     solid_id: SolidId,
     vertex: VertexId,
