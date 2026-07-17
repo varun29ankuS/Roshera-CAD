@@ -8167,6 +8167,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/assembly/{id}/solve", post(assembly_mates::solve))
         .route("/api/assembly/{id}/certify", post(assembly_mates::certify))
         .route("/api/assembly/{id}/dof", get(assembly_mates::dof))
+        // Slice 5 — the motion surface: drive a joint, and read the
+        // motion-stamped interference table the drive is judged against.
+        .route("/api/assembly/{id}/drag", post(assembly_mates::drag))
+        .route(
+            "/api/assembly/{id}/interference",
+            get(assembly_mates::interference),
+        )
         // Kernel assemblies — multi-part scenes, mates, solver,
         // exploded views, interference reports. Distinct from the
         // `/api/hierarchy/...` project-tree surface; see

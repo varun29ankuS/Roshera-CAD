@@ -1524,6 +1524,376 @@ pub async fn dof(
     }
 }
 
+// ── Motion surface (Slice 5, spec §3.6/§3.7) ────────────────────────
+
+/// `POST /api/assembly/{id}/drag` — drive a joint parameter.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DragRequest {
+    /// The mate whose joint parameter is driven.
+    pub mate_id: Uuid,
+    /// Which parameter: `"rotation"` (θ) or `"translation"` (s).
+    pub param: assembly_engine::DriveParam,
+    /// The value to drive it to (clamped to the joint's limits).
+    pub value: f64,
+    /// The grounded instance (defaults to the first).
+    pub ground: Option<Uuid>,
+}
+
+/// What the re-solve was allowed to touch, in DOCUMENT ids — the
+/// instrumented proof that a drag stayed scoped to the affected chain.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DragScopeOut {
+    pub instances: Vec<Uuid>,
+    pub mates: Vec<Uuid>,
+}
+
+/// A coupling carrying a winding after the stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct WindingOut {
+    pub mate_id: Uuid,
+    pub turns: i32,
+}
+
+/// A mobility change observed along the stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct RankTransitionOut {
+    pub param: f64,
+    pub dof_before: usize,
+    pub dof_after: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DragResponse {
+    /// The drive was expressible and ran (it may still not have CONVERGED).
+    pub dragged: bool,
+    /// Present ⇒ the request was refused, and this says why.
+    pub refused_reason: Option<String>,
+    pub stale: Vec<StaleConnector>,
+    /// The value actually driven to (the request, clamped to limits).
+    pub applied: Option<f64>,
+    /// Re-measured at the achieved pose — never asserted.
+    pub converged: bool,
+    pub final_residual: f64,
+    /// Present iff the request was clamped by the joint's limits.
+    pub limit: Option<assembly_engine::LimitFact>,
+    pub scope: DragScopeOut,
+    pub windings: Vec<WindingOut>,
+    /// Mobility changes along the stroke (empty on a generic one).
+    pub rank_transitions: Vec<RankTransitionOut>,
+    /// The poses written back to the document.
+    pub poses: Vec<PoseOut>,
+    /// The compact verdict — an agent can never mutate blind.
+    pub constrainedness: Option<assembly_engine::AssemblyConstrainedness>,
+}
+
+/// A refused drag: nothing ran, nothing moved, the reason carried.
+fn refused_drag(reason: String, stale: Vec<StaleConnector>) -> DragResponse {
+    DragResponse {
+        dragged: false,
+        refused_reason: Some(reason),
+        stale,
+        applied: None,
+        converged: false,
+        final_residual: f64::NAN,
+        limit: None,
+        scope: DragScopeOut {
+            instances: Vec::new(),
+            mates: Vec::new(),
+        },
+        windings: Vec::new(),
+        rank_transitions: Vec::new(),
+        poses: Vec::new(),
+        constrainedness: None,
+    }
+}
+
+/// Drag core (sync, testable without AppState).
+///
+/// The drive runs MESHLESS: driving a joint is a mate re-solve, and the
+/// collision dimensions are `/interference`'s and `/certify`'s business —
+/// so an interactive drag never pays for tessellation or VHACD.
+pub(crate) fn drag_core(
+    model: &mut BRepModel,
+    doc: &mut InstancedAssembly,
+    req: &DragRequest,
+) -> Result<DragResponse, ApiError> {
+    let view = build_engine_view(model, doc, req.ground)?;
+    if !view.stale.is_empty() {
+        return Ok(refused_drag(
+            format!(
+                "{} connector anchor(s) no longer resolve — a mate is never silently \
+                 re-anchored (Holds|Stale contract); re-anchor or delete the stale \
+                 connectors",
+                view.stale.len()
+            ),
+            view.stale,
+        ));
+    }
+    let doc_mate_ids: Vec<Uuid> = doc.mates().iter().map(|m| m.id.0).collect();
+    let Some(index) = doc_mate_ids.iter().position(|id| *id == req.mate_id) else {
+        return Ok(refused_drag(
+            format!("no mate {} in this assembly", req.mate_id),
+            Vec::new(),
+        ));
+    };
+    let Ok(index) = u32::try_from(index) else {
+        return Ok(refused_drag(
+            "mate index out of range".to_string(),
+            Vec::new(),
+        ));
+    };
+
+    // Build the meshless engine assembly at the document poses.
+    let mut engine = assembly_engine::Assembly::new(view.ground);
+    for pose in &view.poses {
+        let mut inst = assembly_engine::Instance::new(
+            pose.id,
+            format!("i{}", pose.id.0),
+            assembly_engine::Mesh::default(),
+        );
+        inst.translation = pose.translation;
+        inst.rotation = pose.rotation;
+        engine.add_instance(inst);
+    }
+    for m in &view.mates {
+        engine.add_mate(m.clone());
+    }
+
+    let outcome = match engine.drag(index, req.param, req.value) {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            // The engine's typed refusal, surfaced VERBATIM: the agent
+            // learns why the joint has no such parameter, not merely that
+            // something went wrong.
+            return Ok(refused_drag(
+                match &refusal {
+                    assembly_engine::DriveRefusal::UnknownMate { mate_index } => {
+                        format!("mate index {mate_index} is not in the solved view")
+                    }
+                    assembly_engine::DriveRefusal::NotEnforced { reason, .. }
+                    | assembly_engine::DriveRefusal::NotDriveable { reason, .. } => reason.clone(),
+                },
+                Vec::new(),
+            ));
+        }
+    };
+
+    let uuid_of = |i: assembly_engine::InstanceId| view.instance_ids.get(i.0 as usize).copied();
+    let mate_uuid_of = |i: u32| doc_mate_ids.get(i as usize).copied();
+
+    // Write the dragged poses back into the document — but ONLY when the
+    // drive converged. A failed drag restored the engine's poses already;
+    // the document must see the same nothing.
+    let mut poses_out = Vec::new();
+    if outcome.report.converged {
+        for inst in &engine.instances {
+            let Some(uuid) = uuid_of(inst.id) else {
+                continue;
+            };
+            let q = Quaternion::new(
+                inst.rotation[3],
+                inst.rotation[0],
+                inst.rotation[1],
+                inst.rotation[2],
+            );
+            let mut m = q.to_matrix4();
+            m[(0, 3)] = inst.translation[0];
+            m[(1, 3)] = inst.translation[1];
+            m[(2, 3)] = inst.translation[2];
+            doc.transform_instance(InstanceId(uuid), m);
+            let mut arr = [[0.0_f64; 4]; 4];
+            for r in 0..4 {
+                for c in 0..4 {
+                    arr[r][c] = m[(r, c)];
+                }
+            }
+            poses_out.push(PoseOut {
+                instance_id: uuid,
+                transform: arr,
+            });
+        }
+    }
+
+    let analysis = engine.analyze_constrainedness();
+    Ok(DragResponse {
+        dragged: true,
+        refused_reason: None,
+        stale: Vec::new(),
+        applied: Some(outcome.applied),
+        converged: outcome.report.converged,
+        final_residual: outcome.report.final_residual_norm,
+        limit: outcome.limit,
+        scope: DragScopeOut {
+            instances: outcome
+                .scope
+                .instances
+                .iter()
+                .filter_map(|i| uuid_of(*i))
+                .collect(),
+            mates: outcome
+                .scope
+                .mates
+                .iter()
+                .filter_map(|i| mate_uuid_of(*i))
+                .collect(),
+        },
+        windings: outcome
+            .windings
+            .iter()
+            .filter_map(|w| {
+                Some(WindingOut {
+                    mate_id: mate_uuid_of(w.mate_index)?,
+                    turns: w.turns,
+                })
+            })
+            .collect(),
+        rank_transitions: outcome
+            .rank_transitions
+            .iter()
+            .map(|t| RankTransitionOut {
+                param: t.param,
+                dof_before: t.dof_before,
+                dof_after: t.dof_after,
+            })
+            .collect(),
+        poses: poses_out,
+        constrainedness: Some(analysis.constrainedness),
+    })
+}
+
+/// Two instances overlapping at the solved pose, in document ids.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct StaticInterference {
+    pub a: Uuid,
+    pub b: Uuid,
+    /// Penetration depth (positive = how far they overlap).
+    pub depth: f64,
+}
+
+/// `GET /api/assembly/{id}/interference` — the interference table.
+#[derive(Debug, Clone, Serialize)]
+pub struct InterferenceResponse {
+    pub computed: bool,
+    pub refused_reason: Option<String>,
+    pub stale: Vec<StaleConnector>,
+    /// Overlaps at the solved pose.
+    pub static_pairs: Vec<StaticInterference>,
+    /// One per motion this assembly has: the joints DERIVED from its own
+    /// mates, each swept over its range by continuous TOI, carrying
+    /// motion-stamped interferences ("they interpenetrate by X at θ=42°").
+    pub sweeps: Vec<assembly_engine::SweptFact>,
+    pub epsilon: Option<assembly_engine::EpsilonFact>,
+}
+
+/// Interference core (sync, testable without AppState).
+///
+/// A projection of the SAME certificate `/certify` returns — one solve/cert
+/// authority, so the interference table and the certificate can never
+/// disagree about what touches.
+pub(crate) fn interference_core<F>(
+    model: &mut BRepModel,
+    resolve_part: F,
+    doc: &mut InstancedAssembly,
+    ground: Option<Uuid>,
+    requested_epsilon: Option<f64>,
+) -> Result<InterferenceResponse, ApiError>
+where
+    F: Fn(Uuid) -> Option<u32>,
+{
+    match prepare_certify(model, resolve_part, doc, ground, true)? {
+        PrepareOutcome::Refused(response) => Ok(InterferenceResponse {
+            computed: false,
+            refused_reason: response.refused_reason,
+            stale: response.stale,
+            static_pairs: Vec::new(),
+            sweeps: Vec::new(),
+            epsilon: None,
+        }),
+        PrepareOutcome::Ready(prepared) => {
+            let instance_ids = prepared.instance_ids.clone();
+            let mut solved = prepared.assembly.clone();
+            let _ = solved.solve_decomposed();
+            let statics = solved.interference_report();
+            let cert = finish_certify(*prepared, requested_epsilon);
+            let uuid_of = |i: assembly_engine::InstanceId| instance_ids.get(i.0 as usize).copied();
+            Ok(InterferenceResponse {
+                computed: true,
+                refused_reason: None,
+                stale: Vec::new(),
+                static_pairs: statics
+                    .interfering
+                    .iter()
+                    .filter_map(|p| {
+                        Some(StaticInterference {
+                            a: uuid_of(p.a)?,
+                            b: uuid_of(p.b)?,
+                            depth: -p.clearance.unwrap_or(0.0),
+                        })
+                    })
+                    .collect(),
+                sweeps: cert
+                    .certificate
+                    .as_ref()
+                    .map(|c| c.sweeps.clone())
+                    .unwrap_or_default(),
+                epsilon: cert.epsilon,
+            })
+        }
+    }
+}
+
+/// `POST /api/assembly/{id}/drag` — the agent's kinematic hand.
+pub async fn drag(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
+    Path(id): Path<Uuid>,
+    Json(req): Json<DragRequest>,
+) -> Result<Json<DragResponse>, ApiError> {
+    let handle = state
+        .instanced_assemblies
+        .get(&id)
+        .ok_or_else(|| assembly_not_found(id))?;
+    let response = {
+        let mut doc = handle.write().await;
+        let mut model = model_handle.write().await;
+        drag_core(&mut model, &mut doc, &req)?
+    };
+    if response.dragged && response.converged {
+        state
+            .instanced_assemblies
+            .record_event(op_solve(id, &response.poses));
+    }
+    Ok(Json(response))
+}
+
+/// `GET /api/assembly/{id}/interference` — the motion-stamped
+/// interference table. Read-only; the heavy work runs on the snapshot
+/// after the locks drop (standing `autocert-perf` rule).
+pub async fn interference(
+    State(state): State<AppState>,
+    crate::part_mgr::ActiveModel(model_handle): crate::part_mgr::ActiveModel,
+    Path(id): Path<Uuid>,
+    body: Option<Json<CertifyRequest>>,
+) -> Result<Json<InterferenceResponse>, ApiError> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let handle = state
+        .instanced_assemblies
+        .get(&id)
+        .ok_or_else(|| assembly_not_found(id))?;
+    let response = {
+        let mut doc = handle.write().await;
+        let mut model = model_handle.write().await;
+        interference_core(
+            &mut model,
+            |part| state.get_local_id(&part),
+            &mut doc,
+            req.ground,
+            req.epsilon,
+        )?
+    };
+    Ok(Json(response))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2361,6 +2731,213 @@ mod tests {
         assert_eq!(eps.effective, floor, "sub-floor request clamped UP");
         assert_eq!(eps.requested, Some(floor / 10.0));
         assert!(!eps.raised_by_caller);
+    }
+
+    // ── Slice 5: the motion surface ────────────────────────────────
+    //
+    // Pre-implementation RED signatures (recorded 2026-07-17, at f9afc946):
+    // `cargo test -p api-server` failed to COMPILE with 9 errors —
+    // E0425 (`drag_core`, `interference_core` not found), E0422
+    // (`DragRequest` undefined), E0282. No motion surface existed on the
+    // document at all: `/certify` passed `&[]` mechanisms and no route
+    // could drive a joint (slice-3/4 report, residual #6).
+
+    #[test]
+    fn drag_core_drives_a_joint_and_reports_the_scope() {
+        // The agent's kinematic hand over REST: drive the bracket's
+        // cylindrical joint 0.6 rad and get back the moved poses, the
+        // scope that moved, and a compact verdict — never a blind mutation.
+        let mut rig = boss_and_bracket();
+        let (_conn, mate_id) = label_and_mate(&mut rig);
+        let parts = rig.parts.clone();
+        let host = rig.host_instance;
+        let response = drag_core(
+            &mut rig.model,
+            &mut rig.doc,
+            &DragRequest {
+                mate_id,
+                param: assembly_engine::DriveParam::Rotation,
+                value: 0.6,
+                ground: Some(host),
+            },
+        );
+        let Ok(response) = response else {
+            unreachable!("a cylindrical joint drives: {response:?}");
+        };
+        assert!(response.dragged, "{response:?}");
+        assert!(response.converged, "{response:?}");
+        assert_eq!(response.applied, Some(0.6));
+        assert!(response.limit.is_none(), "no limits declared: {response:?}");
+        // The scope is reported in DOCUMENT ids — the instrumented proof
+        // that only the affected chain moved.
+        assert_eq!(
+            response.scope.instances,
+            vec![rig.bracket_instance],
+            "only the bracket moves: {:?}",
+            response.scope
+        );
+        assert_eq!(response.scope.mates, vec![mate_id], "{:?}", response.scope);
+        // The compact certificate rides the response (never mutate blind).
+        assert!(
+            response.constrainedness.is_some(),
+            "a drag response carries its verdict: {response:?}"
+        );
+        // And the document actually MOVED: the poses are written back.
+        assert!(!response.poses.is_empty(), "{response:?}");
+    }
+
+    #[test]
+    fn drag_core_refuses_an_undriveable_request_typed() {
+        // A drag the taxonomy cannot express refuses with a REASON, never
+        // a silent no-op and never a 500.
+        let mut rig = boss_and_bracket();
+        let (_conn, mate_id) = label_and_mate(&mut rig);
+        let parts = rig.parts.clone();
+        let host = rig.host_instance;
+
+        // An unknown mate id.
+        let unknown = drag_core(
+            &mut rig.model,
+            &mut rig.doc,
+            &DragRequest {
+                mate_id: Uuid::new_v4(),
+                param: assembly_engine::DriveParam::Rotation,
+                value: 0.3,
+                ground: Some(host),
+            },
+        );
+        let Ok(unknown) = unknown else {
+            unreachable!("an unknown mate REFUSES, it does not error: {unknown:?}");
+        };
+        assert!(!unknown.dragged);
+        assert!(
+            unknown
+                .refused_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("mate")),
+            "{unknown:?}"
+        );
+        assert!(unknown.poses.is_empty(), "a refusal moves nothing");
+
+        // A real mate, but the joint has no such parameter is covered by
+        // the engine's own gate; here the id resolves and the drive runs.
+        let ok = drag_core(
+            &mut rig.model,
+            &mut rig.doc,
+            &DragRequest {
+                mate_id,
+                param: assembly_engine::DriveParam::Translation,
+                value: 1.5,
+                ground: Some(host),
+            },
+        );
+        assert!(ok.map(|r| r.dragged).unwrap_or(false));
+    }
+
+    #[test]
+    fn a_failed_drag_leaves_the_document_exactly_as_it_found_it() {
+        // The write-back guard, pinned. The bracket is BOTH cylindrical and
+        // fastened to the boss, so driving θ fights the rigid lock and the
+        // drive is unreachable. The engine restores its own poses; the
+        // DOCUMENT must see the same nothing — a half-finished stroke
+        // written back would be a silently corrupted assembly.
+        let mut rig = boss_and_bracket();
+        let (conn_host, _mate) = label_and_mate(&mut rig);
+        // The bracket connector is the second one on the document.
+        let bracket_conn = rig
+            .doc
+            .connectors()
+            .iter()
+            .map(|c| c.id.0)
+            .find(|id| *id != conn_host);
+        let Some(bracket_conn) = bracket_conn else {
+            unreachable!("label_and_mate created both connectors");
+        };
+        let fastened = create_mate_core(
+            &mut rig.model,
+            &mut rig.doc,
+            &CreateMateRequest {
+                kind: DocMateKind::Fastened,
+                a: conn_host,
+                b: bracket_conn,
+                couples: None,
+            },
+        );
+        assert!(fastened.is_ok(), "a second mate is accepted: {fastened:?}");
+
+        let before = bracket_xy(&rig);
+        let host = rig.host_instance;
+        let response = drag_core(
+            &mut rig.model,
+            &mut rig.doc,
+            &DragRequest {
+                mate_id: _mate,
+                param: assembly_engine::DriveParam::Rotation,
+                value: 0.5,
+                ground: Some(host),
+            },
+        );
+        let Ok(response) = response else {
+            unreachable!("an unreachable drive REPORTS, it does not error: {response:?}");
+        };
+        // The request was expressible, so it RAN — and honestly failed.
+        assert!(response.dragged, "{response:?}");
+        assert!(
+            !response.converged,
+            "a fastened lock makes the drive unreachable: {response:?}"
+        );
+        assert!(
+            response.final_residual > 1e-6,
+            "and the residual says so: {response:?}"
+        );
+        assert!(
+            response.poses.is_empty(),
+            "a failed drag writes NO poses back: {response:?}"
+        );
+        let after = bracket_xy(&rig);
+        assert_eq!(
+            before, after,
+            "the document is byte-identical after a failed drag"
+        );
+    }
+
+    #[test]
+    fn interference_core_reports_motion_stamped_facts() {
+        // The perception an agent needs without rendering: what touches,
+        // and AT WHAT ANGLE.
+        let mut rig = boss_and_bracket();
+        let (_conn, _mate) = label_and_mate(&mut rig);
+        let parts = rig.parts.clone();
+        let host = rig.host_instance;
+        let response = interference_core(
+            &mut rig.model,
+            |p| parts.get(&p).copied(),
+            &mut rig.doc,
+            Some(host),
+            None,
+        );
+        let Ok(response) = response else {
+            unreachable!("interference must run: {response:?}");
+        };
+        assert!(response.computed, "{response:?}");
+        // ε is kernel-derived and recorded — never the ε=0 lie.
+        let eps = response.epsilon;
+        let Some(eps) = eps else {
+            unreachable!("ε fact rides the response");
+        };
+        assert!(eps.effective > 0.0, "{eps:?}");
+        // The cylindrical joint is DERIVED and swept: its rotational
+        // parameter is unbounded-but-compact, so a full turn is certified;
+        // its translation is unbounded, so it REFUSES honestly.
+        assert!(
+            !response.sweeps.is_empty(),
+            "the derived joints are swept: {response:?}"
+        );
+        assert!(
+            response.sweeps.iter().any(|s| s.refusal.is_some()),
+            "unbounded slider travel refuses typed rather than inventing a range: {:?}",
+            response.sweeps
+        );
     }
 
     #[test]
