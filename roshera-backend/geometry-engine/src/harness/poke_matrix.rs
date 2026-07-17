@@ -352,6 +352,29 @@ pub fn catalog() -> Vec<MatrixCase> {
         half: 4.0,
     });
 
+    // ----- cylinder × cylinder (#35 transversal QSIC cell) -----
+    // Bore r1.5 (axis Z, capped z∈[−2,2]) crossed clean through by a tool
+    // r1.0 (axis X, x∈[−3,3]): the unequal-radius perpendicular
+    // intersecting-axes quartic regime (Levin-pencil ovals). Closes the
+    // "no cyl-cyl cell exists" gap (spec 2026-07-15 §4 Slice 3 /
+    // Modeling-Operations §2.10) so #35 has a standing dual-oracle guard.
+    cases.push(MatrixCase {
+        name: "cylcyl/cross-bore",
+        build: Box::new(|m: &mut BRepModel| {
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Vector3::new(0.0, 0.0, -2.0), Vector3::Z, 1.5, 4.0)
+                .expect("host cylinder");
+            let a = last_solid(m);
+            TopologyBuilder::new(m)
+                .create_cylinder_3d(Vector3::new(-3.0, 0.0, 0.0), Vector3::X, 1.0, 6.0)
+                .expect("tool cylinder");
+            (a, last_solid(m))
+        }),
+        in_a: Box::new(|x, y, z| x * x + y * y <= 1.5 * 1.5 && z.abs() <= 2.0),
+        in_b: Box::new(|x, y, z| y * y + z * z <= 1.0 && x.abs() <= 3.0),
+        half: 3.5,
+    });
+
     cases
 }
 
@@ -401,6 +424,14 @@ mod tests {
         ("sphere/corner-poke", 0),
         ("sphere/corner-poke", 1),
         ("sphere/corner-poke", 2),
+        // #35 Slices 2-3: the transversal cyl-cyl quartic (Levin-pencil
+        // ovals) — union (side bands + caps), intersection (window patches
+        // + middle band lens) and difference (through-tunnel) all hold both
+        // oracles (verified 2026-07-17: vol 38.22/38.49, 8.85/8.96,
+        // 19.40/19.34; all closed/manifold/oriented).
+        ("cylcyl/cross-bore", 0),
+        ("cylcyl/cross-bore", 1),
+        ("cylcyl/cross-bore", 2),
     ];
 
     /// Cells KNOWN to be broken (a pre-existing regression, NOT a green cell).

@@ -102,11 +102,11 @@ impl std::fmt::Display for CurvedCdtError {
 /// by `project_loop_to_uv`; downstream consumers index both arrays
 /// with the same `i`.
 #[derive(Debug, Clone)]
-struct ProjectedLoop {
+pub(crate) struct ProjectedLoop {
     /// Cached 3D positions, in the order the loop was walked.
-    points_3d: Vec<Point3>,
+    pub(crate) points_3d: Vec<Point3>,
     /// UV inverses, parallel to `points_3d`.
-    points_uv: Vec<(f64, f64)>,
+    pub(crate) points_uv: Vec<(f64, f64)>,
     /// Loop classification — interior-vs-exterior membership is
     /// resolved downstream by indexing into outer/inner ranges, so
     /// the discriminant is preserved here for debug-trace / future
@@ -233,7 +233,7 @@ fn seam_closes_in_v_tess(
 ///
 /// Returns `Err(ProjectionFailed)` if any sample's `closest_point`
 /// fails.
-fn project_loop_to_uv(
+pub(crate) fn project_loop_to_uv(
     loop_data: &Loop,
     model: &BRepModel,
     cache: &EdgeSampleCache,
@@ -385,7 +385,7 @@ fn validate_loop(
 /// - outer has ≥ 3 samples, non-zero signed area;
 /// - every inner has ≥ 3 samples, non-zero signed area, and its
 ///   bbox is contained in the outer's bbox.
-fn run_boundary_projection(
+pub(crate) fn run_boundary_projection(
     face: &Face,
     model: &BRepModel,
     cache: &EdgeSampleCache,
@@ -407,7 +407,47 @@ fn run_boundary_projection(
             Some(l) => l,
             None => continue,
         };
-        let inner = project_loop_to_uv(inner_loop, model, cache, surface)?;
+        let mut inner = project_loop_to_uv(inner_loop, model, cache, surface)?;
+        // PERIODIC CHART ALIGNMENT (#35 Slices 2-3, hole-carrying laterals):
+        // each loop unwraps independently, so on a periodic surface the
+        // outer may span e.g. u ∈ [−2π, 0] (walked in the −u direction)
+        // while an interior hole's principal projection lands in [0, 2π] —
+        // a whole-period offset that fails bbox containment and forfeited
+        // the face to the untrimmed-grid fallback (bore covered, hundreds
+        // of open mesh edges). Shifting the hole by an integer number of
+        // periods maps to the SAME 3D points (boundary 3D comes from the
+        // cached samples by index, untouched); only the chart coordinates
+        // move, which is exactly what the CDT needs. Align each inner's
+        // bbox centre to the outer's by whole periods before validating.
+        for (period_opt, pick) in [
+            (effective_period_u_tess(surface), 0usize),
+            (effective_period_v_tess(surface), 1usize),
+        ] {
+            let Some(period) = period_opt else { continue };
+            if inner.points_uv.is_empty() {
+                continue;
+            }
+            let (o_lo, o_hi, ov_lo, ov_hi) = outer_bbox;
+            let (outer_c, i_c) = if pick == 0 {
+                let i_c =
+                    inner.points_uv.iter().map(|p| p.0).sum::<f64>() / inner.points_uv.len() as f64;
+                (0.5 * (o_lo + o_hi), i_c)
+            } else {
+                let i_c =
+                    inner.points_uv.iter().map(|p| p.1).sum::<f64>() / inner.points_uv.len() as f64;
+                (0.5 * (ov_lo + ov_hi), i_c)
+            };
+            let k = ((outer_c - i_c) / period).round();
+            if k != 0.0 {
+                for p in &mut inner.points_uv {
+                    if pick == 0 {
+                        p.0 += k * period;
+                    } else {
+                        p.1 += k * period;
+                    }
+                }
+            }
+        }
         validate_loop(&inner, Some(outer_bbox))?;
         inners.push(inner);
     }
@@ -631,6 +671,11 @@ fn generate_steiner_candidates(
     let nv_chord = chord_segments(surface, params, false, v_lo, v_hi, &[u_lo, u_mid, u_hi]);
     nu = nu.max(nu_chord).min(params.max_segments);
     nv = nv.max(nv_chord).min(params.max_segments);
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+        eprintln!(
+            "[curved-cdt]   steiner grid: bbox=({u_lo:.3},{u_hi:.3},{v_lo:.3},{v_hi:.3}) nu={nu} (chord {nu_chord}) nv={nv} (chord {nv_chord})"
+        );
+    }
 
     // Developable-direction collapse (TESS-PERF / BOOL #86). `nu`/`nv` above
     // are driven by raw 3D arc length (`d*_3d / max_edge_length`), so a
@@ -672,6 +717,12 @@ fn generate_steiner_candidates(
     }
     if v_straight {
         nv = params.min_segments;
+    }
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+        eprintln!(
+            "[curved-cdt]   collapse: u_straight={u_straight} v_straight={v_straight} → nu={nu} nv={nv}; probe pos(u_mid,v_lo)={:?}",
+            pos(u_mid, v_lo)
+        );
     }
 
     // Keep-out band around every constraint edge: a Steiner point that lands
@@ -785,6 +836,35 @@ fn generate_steiner_candidates(
                 trim_vs.push(v);
             }
         }
+    }
+    // TRIM-ROW BUDGET (#35 Slices 2-3). The rows above were designed for
+    // FLAT trim features — a slot/pocket introduces a handful of distinct
+    // heights. A CURVED trim boundary (the cyl-cyl quartic ovals; any wavy
+    // marched trim) has a distinct height at nearly EVERY boundary sample,
+    // so the unbounded per-height row seeding degenerated into an
+    // O(boundary × nu) Steiner flood (measured: a cross-drilled r30 wall at
+    // display quality seeded 3992 Steiner points → 8684 triangles vs the
+    // 798-clean contract of `trimmed_full_wrap_cylinder_has_no_refinement_
+    // explosion`). Thin dense height sets to an evenly-spaced budget: the
+    // rows' purpose — breaking diameter-spanning bridge triangles — needs
+    // rows at the SCALE of the trim feature, not at boundary-sample pitch.
+    // Slots/pockets (≤ budget heights) are untouched; on developables the
+    // ruled v-direction makes enclosed volume insensitive to row thinning,
+    // and doubly-curved surfaces still run Ruppert refinement, which
+    // re-adds interior points wherever fidelity demands them.
+    // Budget scales with the angular grid (rows cost ~nu candidates each,
+    // and the useful row pitch tracks the u-resolution): display-quality
+    // params (nu ≈ 100) keep ≤16 rows — the measured 798-clean regime —
+    // while dense verification meshes (nu 200-800) retain proportional
+    // v-resolution along curved trims.
+    let trim_row_budget = (nu / 6).max(16);
+    if trim_vs.len() > trim_row_budget {
+        trim_vs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = trim_vs.len();
+        trim_vs = (0..trim_row_budget)
+            .map(|k| trim_vs[k * (n - 1) / (trim_row_budget - 1)])
+            .collect();
+        trim_vs.dedup_by(|a, b| (*a - *b).abs() < v_eps);
     }
     for &v in &trim_vs {
         for i in 1..nu {
@@ -1809,6 +1889,18 @@ pub(crate) fn tessellate_curved_cdt(
         &inner_polygons,
         params,
     );
+
+    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+        eprintln!(
+            "[curved-cdt] face {} kind={}: outer={}pts inners={} ({:?} pts) steiner={}",
+            face.id,
+            surface.type_name(),
+            outer.points_uv.len(),
+            inner_polygons.len(),
+            inner_polygons.iter().map(Vec::len).collect::<Vec<_>>(),
+            steiner.len()
+        );
+    }
 
     // Step 3 — first CDT run.
     let (pts2d, triangles) = match run_cdt(&outer.points_uv, &inner_polygons, &steiner) {

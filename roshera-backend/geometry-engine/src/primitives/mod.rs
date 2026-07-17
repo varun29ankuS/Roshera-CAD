@@ -10,6 +10,7 @@ pub mod mass_properties;
 pub mod p_curve;
 pub mod persistent_id;
 pub mod provenance;
+pub mod qsic_curve;
 pub mod shell;
 pub mod snapshot;
 pub mod solid;

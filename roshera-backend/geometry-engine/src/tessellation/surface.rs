@@ -7518,6 +7518,7 @@ fn tessellate_cylinder_saddle_annulus(
     mesh: &mut TriangleMesh,
 ) -> bool {
     use crate::primitives::curve::Ellipse;
+    use crate::primitives::qsic_curve::CylCylQuartic;
     use crate::primitives::surface::Cylinder;
 
     if face.inner_loops.len() != 1 {
@@ -7543,16 +7544,29 @@ fn tessellate_cylinder_saddle_annulus(
         None => return false,
     };
 
-    // Saddle marker (a): the inner lens-boundary loop carries analytic Ellipse arcs.
-    let inner_has_ellipse = inner_loop.edges.iter().any(|&eid| {
-        model
-            .edges
-            .get(eid)
-            .and_then(|e| model.curves.get(e.curve_id))
-            .map(|c| c.as_any().downcast_ref::<Ellipse>().is_some())
-            .unwrap_or(false)
-    });
-    if !inner_has_ellipse {
+    // Band marker (a): EITHER boundary loop carries an analytic saddle
+    // `Ellipse` arc (Slice-1 equal-radius lens) OR a `CylCylQuartic` arc
+    // (Slice-2 unequal-radius oval ring — same encircling-band topology,
+    // wavy quartic instead of ellipse). The wavy ring may land as the
+    // face's OUTER loop after reconstruction (the middle-to-rim band of the
+    // unequal-bore tool wall carries the quartic as its outer boundary), so
+    // both loops are checked. Marker (b) below then requires BOTH loops to
+    // encircle the axis, so bore-wall WINDOW ovals (non-encircling) still
+    // decline and route through curved-CDT.
+    let loop_has_band_arc = |lp: &crate::primitives::r#loop::Loop| -> bool {
+        lp.edges.iter().any(|&eid| {
+            model
+                .edges
+                .get(eid)
+                .and_then(|e| model.curves.get(e.curve_id))
+                .map(|c| {
+                    c.as_any().downcast_ref::<Ellipse>().is_some()
+                        || c.as_any().downcast_ref::<CylCylQuartic>().is_some()
+                })
+                .unwrap_or(false)
+        })
+    };
+    if !loop_has_band_arc(inner_loop) && !loop_has_band_arc(outer_loop) {
         return false;
     }
 
