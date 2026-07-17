@@ -21,17 +21,3 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(torus_boolean_is_deterministic)'
 slow-timeout = { period = "120s", terminate-after = 5 }
-
-# boolean_volume_proptest's containment properties (union==big, intersection==
-# small) run many randomized dense curved-boolean cases per invocation; on a
-# loaded CI runner the batch tipped over the 5-min backstop (both hit 300 s in
-# run 29598613512) though each individual case is fast. Same treatment as the
-# torus gate: a 10-min leash rather than shrinking the proptest case count,
-# which would thin the randomized coverage that is the point of the property.
-[[profile.default.overrides]]
-filter = 'test(prop_containment_union_equals_big)'
-slow-timeout = { period = "120s", terminate-after = 5 }
-
-[[profile.default.overrides]]
-filter = 'test(prop_containment_intersection_equals_small)'
-slow-timeout = { period = "120s", terminate-after = 5 }
