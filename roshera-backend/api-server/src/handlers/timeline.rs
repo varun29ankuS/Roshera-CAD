@@ -2,7 +2,7 @@
 
 use crate::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -1034,6 +1034,116 @@ fn assemble_subtree(
     }
     node.children.sort_by_key(|n| n.event.sequence_number);
     Some(node)
+}
+
+/// One node of the read-only dependency-graph projection.
+#[derive(Serialize)]
+pub struct DepGraphNode {
+    /// Event UUID.
+    pub id: String,
+    /// Branch sequence number.
+    pub sequence_number: u64,
+    /// Kernel operation kind (`create_box_3d`, `fillet_edges`, …).
+    pub operation_type: String,
+}
+
+/// One producer→consumer edge of the dependency-graph projection.
+#[derive(Serialize)]
+pub struct DepGraphEdge {
+    /// Producer event UUID (the dependency).
+    pub from: String,
+    /// Consumer event UUID (depends on `from`).
+    pub to: String,
+    /// Whether the dependency is non-substitutable (a hard data requirement).
+    pub critical: bool,
+}
+
+/// Read-only dependency-graph projection response.
+#[derive(Serialize)]
+pub struct DependencyGraphResponse {
+    /// Every recorded event in the window, as graph nodes.
+    pub nodes: Vec<DepGraphNode>,
+    /// Producer→consumer edges inferred from recorded entity lineage.
+    pub edges: Vec<DepGraphEdge>,
+    /// Present only when `rebuild_from` is supplied: the topologically-ordered
+    /// downstream events an edit at that event would dirty. This is a
+    /// READ-ONLY query — no rebuild is executed (execution is #64 Slice 2,
+    /// which appends override events and is founder-gated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_plan: Option<Vec<String>>,
+}
+
+/// Query string for [`get_dependency_graph`].
+#[derive(Deserialize)]
+pub struct DependencyGraphQuery {
+    /// Optional event UUID to compute a rebuild plan from.
+    pub rebuild_from: Option<String>,
+}
+
+/// `GET /api/timeline/dependency-graph/{branch_id}` — read-only feature-DAG
+/// projection of the branch's recorded operations (#64 Parametric-DAG,
+/// Slice 1).
+///
+/// Unlike `feature-tree` (a single-parent hierarchy for display), this is the
+/// full producer→consumer DAG: a multi-operand boolean carries one in-edge per
+/// operand, and `?rebuild_from={event_id}` returns the topologically-ordered
+/// set of downstream events an edit there would dirty
+/// (`DependencyGraph::compute_rebuild_plan`). No geometry is rebuilt — this is
+/// purely a query over the immutable event log.
+pub async fn get_dependency_graph(
+    State(state): State<AppState>,
+    Path(branch_id): Path<String>,
+    Query(query): Query<DependencyGraphQuery>,
+) -> Result<Json<DependencyGraphResponse>, StatusCode> {
+    let _ = state.timeline_recorder.flush().await;
+    let timeline = state.timeline.read().await;
+    let branch_id = resolve_branch_ref(&branch_id)?;
+
+    let events = timeline
+        .get_branch_events(&branch_id, Some(0), Some(100))
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let graph = timeline_engine::build_dependency_graph(&events);
+
+    let nodes: Vec<DepGraphNode> = events
+        .iter()
+        .map(|e| DepGraphNode {
+            id: e.id.to_string(),
+            sequence_number: e.sequence_number,
+            operation_type: operation_kind(&e.operation),
+        })
+        .collect();
+
+    let mut edges: Vec<DepGraphEdge> = Vec::new();
+    for event in &events {
+        if let Ok(dependents) = graph.get_dependents(event.id) {
+            for (to, edge) in dependents {
+                edges.push(DepGraphEdge {
+                    from: event.id.to_string(),
+                    to: to.to_string(),
+                    critical: edge.is_critical,
+                });
+            }
+        }
+    }
+
+    let rebuild_plan = match query.rebuild_from {
+        Some(raw) => {
+            let uuid = Uuid::parse_str(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let event_id = EventId(uuid);
+            let plan = graph
+                .compute_rebuild_plan(event_id)
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+            Some(plan.into_iter().map(|id| id.to_string()).collect())
+        }
+        None => None,
+    };
+
+    Ok(Json(DependencyGraphResponse {
+        nodes,
+        edges,
+        rebuild_plan,
+    }))
 }
 
 /// Checkpoint/tag a specific state

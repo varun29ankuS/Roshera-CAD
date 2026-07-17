@@ -23,6 +23,7 @@ pub mod branch;
 pub mod brep_serialization;
 pub mod cache;
 pub mod dependency_graph;
+pub mod dependency_projection;
 pub mod entity_mapping;
 pub mod execution;
 pub mod operations;
@@ -36,6 +37,7 @@ pub use branch::{
 };
 pub use cache::{CacheConfig, CacheManager};
 pub use dependency_graph::DependencyGraph;
+pub use dependency_projection::build_dependency_graph;
 pub use error::{TimelineError, TimelineResult};
 pub use execution::{ExecutionConfig, ExecutionEngine, OperationImpl};
 pub use recorder_bridge::{SharedTimeline, TimelineRecorder};

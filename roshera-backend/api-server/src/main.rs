@@ -8645,6 +8645,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/feature-tree/{branch_id}",
             get(crate::handlers::timeline::get_feature_tree),
         )
+        // Read-only feature-DAG projection (#64 Parametric-DAG, Slice 1):
+        // the full producer→consumer dependency graph plus an optional
+        // `?rebuild_from={event_id}` topologically-ordered dirty-set query.
+        // No geometry is rebuilt — pure projection over the immutable log.
+        .route(
+            "/api/timeline/dependency-graph/{branch_id}",
+            get(crate::handlers::timeline::get_dependency_graph),
+        )
         // Disambiguate against the session-scoped undo/redo also re-
         // exported via `handlers::*` (handlers/session.rs). The
         // timeline-scoped variant takes `Json<Value>` carrying a
