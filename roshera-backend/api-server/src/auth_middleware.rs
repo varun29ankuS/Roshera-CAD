@@ -10,10 +10,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use session_manager::{AuthManager, Permission};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Authentication error response
 #[derive(Debug, Serialize)]
