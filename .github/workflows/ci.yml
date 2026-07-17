@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Debuginfo for the 190+ test binaries exceeds runner disk (killed run 29547226449
+  # with "No space left on device"); same no-debuginfo discipline as local dev.
+  CARGO_PROFILE_DEV_DEBUG: "false"
+  CARGO_PROFILE_TEST_DEBUG: "false"
 
 jobs:
   test:
