@@ -18,8 +18,10 @@
 //! commodity collision/CCD engine underneath.
 
 pub mod certificate;
+pub mod decompose;
 pub mod grounding;
 pub mod interference;
+pub mod jacobian;
 pub mod joint;
 pub mod mate_anchor;
 pub mod mate_contact;
@@ -31,8 +33,10 @@ pub mod sweep;
 pub mod types;
 
 pub use certificate::{AssemblyCertificate, Mechanism};
+pub use decompose::{DecompositionStats, StructuralDofReport};
 pub use grounding::GroundingReport;
 pub use interference::{InterferencePair, InterferenceReport};
+pub use jacobian::JacobianProbe;
 pub use joint::Joint;
 pub use mate_anchor::{MateAnchorReport, UnanchoredFeature};
 pub use mate_contact::{DisconnectedMate, MateContactReport};

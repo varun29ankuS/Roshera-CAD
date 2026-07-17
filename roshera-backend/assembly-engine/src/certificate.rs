@@ -98,8 +98,12 @@ impl Assembly {
         // residual rows, so it is judged before any solve can hide it.
         let mates_enforced = self.mate_enforcement_report().all_enforced();
 
+        // Slice 3: the certificate's internal solve rides the decomposed
+        // pipeline (condensation / DR-plan / verified dense fallback) —
+        // same verdict contract, near-linear work on tree-like assemblies.
         let mut solved = self.clone();
-        let mates_consistent = solved.solve().converged;
+        let (solve_report, _decomposition) = solved.solve_decomposed();
+        let mates_consistent = solve_report.converged;
 
         let dof_report = solved.dof_analysis();
         let no_static_interference = solved.interference_report().no_static_interference();

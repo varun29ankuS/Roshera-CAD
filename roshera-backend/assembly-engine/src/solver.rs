@@ -4,17 +4,25 @@
 //! space of its constraint Jacobian: `DOF = 6·M − rank(J)`, where `M` is the
 //! number of non-ground instances and `J = ∂g/∂q` is the Jacobian of the stacked
 //! mate residuals `g` with respect to each non-ground instance's 6-DOF pose
-//! tangent (3 translation + 3 rotation about the world axes). `J` is built by
-//! **central** finite differences so the null directions land near machine zero
-//! and the rank separates cleanly.
+//! tangent (3 translation + 3 rotation about the world axes). Since Slice 3 of
+//! the kinematic-assembly campaign, `J` is the **analytic** screw-calculus
+//! Jacobian (`jacobian.rs`); central finite differences are retained there as
+//! the debug oracle (`tests/jacobian_gate.rs` pins ≤1e-6 agreement).
 //!
 //! **Gauss-Newton solve (S5b).** `solve()` drives `g → 0` by stepping each
 //! non-ground pose along `−J⁺·g` (the SVD pseudo-inverse) until the residual is
 //! within tolerance or the step stagnates. A conflicting (over-constrained) mate
 //! set is detected as a stagnated step whose residual stays above tolerance.
+//! The core ([`gauss_newton`]) is generic over rigid-body BLOCKS (fastened
+//! condensation) and mate subsets — the Slice-3 decomposition planner
+//! (`decompose.rs`) only ever SHRINKS what this core sees; the dense whole-
+//! system path is the special case of singleton blocks over every mate.
 
-use crate::types::{Assembly, Instance, InstanceId};
-use parry3d_f64::na::{DMatrix, DVector, Quaternion, UnitQuaternion, Vector3};
+use crate::jacobian::{
+    analytic_jacobian, apply_block_step, residual_for, singleton_blocks, BodyBlock, ColumnLayout,
+};
+use crate::types::{Assembly, InstanceId};
+use parry3d_f64::na::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 
 /// How constrained an assembly's mate graph leaves it.
@@ -57,88 +65,89 @@ pub struct SolvedPose {
     pub rotation: [f64; 4],
 }
 
-/// Indices (into `instances`) of the non-ground instances; each carries 6 DOF.
-fn nonground(assembly: &Assembly) -> Vec<usize> {
-    assembly
-        .instances
-        .iter()
-        .enumerate()
-        .filter(|(_, instance)| instance.id != assembly.ground)
-        .map(|(idx, _)| idx)
-        .collect()
-}
-
-/// The stacked residual `g(q)` over every mate.
-fn residual_vector(assembly: &Assembly) -> Vec<f64> {
-    let mut g = Vec::new();
-    for mate in &assembly.mates {
-        g.extend(assembly.mate_residual(mate));
-    }
-    g
-}
-
 /// Euclidean norm of a residual vector.
-fn residual_norm(v: &[f64]) -> f64 {
+pub(crate) fn residual_norm(v: &[f64]) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
-/// Apply a 6-DOF tangent step to an instance pose IN PLACE: `translation +=
-/// step[0..3]`; `rotation = exp(step[3..6]) · rotation` (a world-frame rotation
-/// increment). Shared by the finite-difference Jacobian and the solve.
-fn apply_tangent_step(instance: &mut Instance, step: &[f64; 6]) {
-    instance.translation[0] += step[0];
-    instance.translation[1] += step[1];
-    instance.translation[2] += step[2];
-    let delta = UnitQuaternion::from_scaled_axis(Vector3::new(step[3], step[4], step[5]));
-    let current = UnitQuaternion::from_quaternion(Quaternion::new(
-        instance.rotation[3],
-        instance.rotation[0],
-        instance.rotation[1],
-        instance.rotation[2],
-    ));
-    let updated = (delta * current).quaternion().to_owned();
-    instance.rotation = [updated.i, updated.j, updated.k, updated.w];
+/// The Jacobian the PRODUCTION solve/DOF path consumes: the analytic
+/// screw-calculus Jacobian (`jacobian.rs`). This function is the single
+/// switch point — `Assembly::jacobian_probe` verifies bitwise that
+/// production output IS the analytic matrix (and the FD oracle stays a
+/// debug-only comparison).
+pub(crate) fn production_jacobian(
+    assembly: &Assembly,
+    blocks: &[BodyBlock],
+    mate_indices: &[usize],
+) -> DMatrix<f64> {
+    let layout = ColumnLayout::build(assembly, blocks);
+    analytic_jacobian(assembly, &layout, mate_indices)
 }
 
-/// Perturb instance `inst_idx`'s pose by `eps` along tangent component `k`
-/// (0..3 = translation x/y/z, 3..6 = rotation about world x/y/z), on a clone.
-fn perturbed(assembly: &Assembly, inst_idx: usize, k: usize, eps: f64) -> Assembly {
-    let mut clone = assembly.clone();
-    if let Some(instance) = clone.instances.get_mut(inst_idx) {
-        let mut step = [0.0_f64; 6];
-        step[k] = eps;
-        apply_tangent_step(instance, &step);
+/// Convergence tolerance on `‖g‖` — shared by the dense solve, the
+/// decomposition executor's verification, and the seated-condensation
+/// gate so "satisfied" means one thing everywhere.
+pub(crate) const SOLVE_TOL: f64 = 1e-9;
+
+/// Gauss-Newton over rigid-body BLOCKS and a mate subset: drive the
+/// subset residuals to zero by stepping each block's 6-DOF tangent along
+/// `−J⁺·g` until `‖g‖ < tol` or the step stagnates. The dense whole-
+/// system solve is the special case (singleton blocks × all mates); the
+/// Slice-3 planner calls the same core on shrunken systems, so its
+/// fallback path is BYTE-IDENTICAL to dense by construction.
+pub(crate) fn gauss_newton(
+    assembly: &mut Assembly,
+    blocks: &[BodyBlock],
+    mate_indices: &[usize],
+) -> SolveReport {
+    const MAX_ITERS: usize = 200;
+    const STEP_TOL: f64 = 1e-13;
+    let mut iterations = 0;
+    let mut norm = residual_norm(&residual_for(assembly, mate_indices));
+    while iterations < MAX_ITERS && norm > SOLVE_TOL {
+        let g = residual_for(assembly, mate_indices);
+        if g.is_empty() {
+            break;
+        }
+        let jac = production_jacobian(assembly, blocks, mate_indices);
+        let pinv = match jac.pseudo_inverse(1e-9) {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        if pinv.ncols() != g.len() {
+            break;
+        }
+        let step = -(pinv * DVector::from_vec(g));
+        let step_norm = step.norm();
+        for (block_idx, block) in blocks.iter().enumerate() {
+            let mut s = [0.0_f64; 6];
+            for (k, slot) in s.iter_mut().enumerate() {
+                *slot = step.get(6 * block_idx + k).copied().unwrap_or(0.0);
+            }
+            apply_block_step(assembly, block, &s);
+        }
+        iterations += 1;
+        norm = residual_norm(&residual_for(assembly, mate_indices));
+        if step_norm < STEP_TOL {
+            break;
+        }
     }
-    clone
+    SolveReport {
+        converged: norm <= SOLVE_TOL,
+        iterations,
+        final_residual_norm: norm,
+    }
 }
 
 impl Assembly {
-    /// Numerical constraint Jacobian `J = ∂g/∂q` by central differences. Rows =
-    /// the stacked residual dimension; columns = 6 × non-ground instances.
-    fn constraint_jacobian(&self) -> DMatrix<f64> {
-        const EPS: f64 = 1e-6;
-        let ng = nonground(self);
-        let rows = residual_vector(self).len();
-        let cols = 6 * ng.len();
-        let mut jac = DMatrix::<f64>::zeros(rows, cols);
-        for (block, &inst_idx) in ng.iter().enumerate() {
-            for k in 0..6 {
-                let plus = residual_vector(&perturbed(self, inst_idx, k, EPS));
-                let minus = residual_vector(&perturbed(self, inst_idx, k, -EPS));
-                for r in 0..rows.min(plus.len()).min(minus.len()) {
-                    jac[(r, 6 * block + k)] = (plus[r] - minus[r]) / (2.0 * EPS);
-                }
-            }
-        }
-        jac
-    }
-
     /// Degrees-of-freedom analysis: `DOF = config_dim − rank(J)`. Rank counts the
-    /// singular values above a relative tolerance (null directions sit near
-    /// machine zero under central differencing).
+    /// singular values above a relative tolerance; `J` is the analytic Jacobian
+    /// (null directions are exact, not FD-noise-limited).
     pub fn dof_analysis(&self) -> DofReport {
-        let config_dim = 6 * nonground(self).len();
-        let jac = self.constraint_jacobian();
+        let blocks = singleton_blocks(self);
+        let config_dim = 6 * blocks.len();
+        let all: Vec<usize> = (0..self.mates.len()).collect();
+        let jac = production_jacobian(self, &blocks, &all);
         let rank = if jac.nrows() == 0 || jac.ncols() == 0 {
             0
         } else {
@@ -165,65 +174,22 @@ impl Assembly {
     /// non-ground instance's pose along `−J⁺·g` until `‖g‖ < tol` or the step
     /// stagnates, writing the solved poses back. A conflicting (over-constrained)
     /// mate set leaves `final_residual_norm > tol` with `converged == false`.
+    /// This is the DENSE whole-system path; [`Assembly::solve_decomposed`]
+    /// puts the Slice-3 planner in front of the same core.
     pub fn solve(&mut self) -> SolveReport {
-        const TOL: f64 = 1e-9;
-        const MAX_ITERS: usize = 200;
-        const STEP_TOL: f64 = 1e-13;
-        let ng = nonground(self);
-        let mut iterations = 0;
-        let mut norm = residual_norm(&residual_vector(self));
-        while iterations < MAX_ITERS && norm > TOL {
-            let g = residual_vector(self);
-            if g.is_empty() {
-                break;
-            }
-            let jac = self.constraint_jacobian();
-            let pinv = match jac.pseudo_inverse(1e-9) {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            if pinv.ncols() != g.len() {
-                break;
-            }
-            let step = -(pinv * DVector::from_vec(g));
-            let step_norm = step.norm();
-            for (block, &inst_idx) in ng.iter().enumerate() {
-                let mut s = [0.0_f64; 6];
-                for (k, slot) in s.iter_mut().enumerate() {
-                    *slot = step.get(6 * block + k).copied().unwrap_or(0.0);
-                }
-                if let Some(instance) = self.instances.get_mut(inst_idx) {
-                    apply_tangent_step(instance, &s);
-                }
-            }
-            iterations += 1;
-            norm = residual_norm(&residual_vector(self));
-            if step_norm < STEP_TOL {
-                break;
-            }
-        }
-        SolveReport {
-            converged: norm <= TOL,
-            iterations,
-            final_residual_norm: norm,
-        }
+        let blocks = singleton_blocks(self);
+        let all: Vec<usize> = (0..self.mates.len()).collect();
+        gauss_newton(self, &blocks, &all)
     }
 
     /// Solve the mate system and report where each instance ends up. The fixed
     /// (ground) instance never moves; every other instance is POSITIONED by the
     /// solve relative to it. Runs on a clone, so `self` is left unchanged.
+    /// Routes through the Slice-3 decomposed pipeline
+    /// ([`Assembly::solve_decomposed`]) — use
+    /// [`Assembly::solved_poses_with_stats`] to also see the planner's stats.
     pub fn solved_poses(&self) -> (SolveReport, Vec<SolvedPose>) {
-        let mut work = self.clone();
-        let report = work.solve();
-        let poses = work
-            .instances
-            .iter()
-            .map(|instance| SolvedPose {
-                instance: instance.id,
-                translation: instance.translation,
-                rotation: instance.rotation,
-            })
-            .collect();
+        let (report, _stats, poses) = self.solved_poses_with_stats();
         (report, poses)
     }
 }

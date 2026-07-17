@@ -22,5 +22,9 @@ serde_json = "1.0"
 name = "interference"
 harness = false
 
+[[bench]]
+name = "assembly_solver"
+harness = false
+
 [lints]
 workspace = true
