@@ -3821,8 +3821,19 @@ impl BRepModel {
         // inertia come out in kg / kg·mm² directly.
         const KG_PER_M3_TO_KG_PER_MM3: f64 = 1e-9;
         let density = solid.attributes.material.density * KG_PER_M3_TO_KG_PER_MM3;
-        let mut props =
-            crate::primitives::mass_properties::integrate_solid(solid_id, self, density, 1e-12)?;
+        // The structural gate above proved every outer-shell face is a planar
+        // full-parameter rectangle, so the fast exact integrator (a single
+        // Gauss cell per face — algebraically exact for the degree-≤3 planar
+        // integrands) yields the SAME value as the general `integrate_solid`
+        // without its per-cell trim classification. Using `integrate_solid`
+        // here re-ran an O(SUBDIV²·point_in_face) winding test on every cell of
+        // every already-known-untrimmed face — ~14.6 ms on a 6-face box versus
+        // a few µs — which put a 78× slowdown on `calculate_solid_volume` for
+        // every planar-polyhedron result (the boolean containment proptests
+        // amplified it ~12k× via their nested `proptest!` and timed out).
+        let mut props = crate::primitives::mass_properties::integrate_untrimmed_polyhedron(
+            solid_id, self, density,
+        )?;
 
         // Physical-validity contract (identical to the mesh path): a malformed
         // solid that slipped the structural gate must not yield a bogus tensor.
