@@ -1868,6 +1868,89 @@ mod tests {
         );
     }
 
+    // ---- #64 Slice 0: live-path vs replay-path persistent-id parity ----
+
+    fn solid_of_geo(g: GeometryId) -> SolidId {
+        match g {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected a solid, got {other:?}"),
+        }
+    }
+
+    /// GAP CHARACTERIZATION (#64 Slice 0 / #11 40-G open gap): a kernel op
+    /// invoked with NO event key — exactly what today's api-server live
+    /// handlers do — seeds its root persistent-ids from the model-local
+    /// `__local:{root_counter}` fallback, which does NOT match the
+    /// `evt:{sequence_number}` seed a replay of the same operation uses. So a
+    /// reference grabbed against the LIVE model would not resolve after a
+    /// rebuild. This asserts the divergence exists (it is a stable property of
+    /// the no-event-key path, not a transient bug).
+    #[test]
+    fn live_path_without_event_key_diverges_from_replay_pids() {
+        // LIVE path today: op runs with `current_event_key == None`.
+        let mut live = BRepModel::new();
+        let g = TopologyBuilder::new(&mut live)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("live box builds");
+        let live_pid = live
+            .solid_pid(solid_of_geo(g))
+            .expect("live solid has a persistent id");
+
+        // REPLAY path: rebuild the same op from the event log at sequence 0,
+        // which seeds `evt:0` (apply_event).
+        let mut replayed = BRepModel::new();
+        rebuild_model_from_events(&mut replayed, &[box_event(10.0, 0)]);
+        let replay_pid = replayed
+            .solid_pid(only_solid(&replayed))
+            .expect("replayed solid has a persistent id");
+
+        assert_ne!(
+            live_pid, replay_pid,
+            "no-event-key live path (__local seed) must diverge from replay (evt:seq seed) — this is the gap Slice 0 closes"
+        );
+    }
+
+    /// FIX MECHANISM (#64 Slice 0): seeding the live event key from
+    /// `Timeline::next_sequence_number()` BEFORE the kernel op makes the
+    /// live-created persistent-ids identical to the ones a subsequent replay
+    /// of that event re-derives. This proves the decision-independent seam:
+    /// no mould, no log mutation — only aligning the root-pid seed the live
+    /// path uses with the one replay already uses.
+    #[test]
+    fn event_key_from_next_sequence_achieves_live_replay_parity() {
+        use crate::timeline::Timeline;
+        use crate::types::TimelineConfig;
+
+        // A fresh timeline: the next appended event will get sequence 0.
+        let timeline = Timeline::new(TimelineConfig::default());
+        let next = timeline.next_sequence_number();
+        assert_eq!(next, 0, "fresh timeline's next sequence number is 0");
+
+        // WIRED live path: set the event key from the peeked sequence number
+        // before invoking the kernel, exactly as a fixed live handler would.
+        let mut live = BRepModel::new();
+        live.set_event_key(Some(format!("evt:{next}")));
+        let g = TopologyBuilder::new(&mut live)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("live box builds");
+        live.set_event_key(None);
+        let live_pid = live
+            .solid_pid(solid_of_geo(g))
+            .expect("live solid has a persistent id");
+
+        // REPLAY the equivalent event at the same sequence number.
+        let mut replayed = BRepModel::new();
+        rebuild_model_from_events(&mut replayed, &[box_event(10.0, next)]);
+        let replay_pid = replayed
+            .solid_pid(only_solid(&replayed))
+            .expect("replayed solid has a persistent id");
+
+        assert_eq!(
+            live_pid, replay_pid,
+            "seeding the live event key from next_sequence_number() closes the live/replay PID gap"
+        );
+    }
+
     /// Analytic cylinder faces on the outer shell of `solid`, as radii
     /// (SKETCH-DCM #45 Slice 5 replay assertions).
     fn cylinder_face_radii(m: &BRepModel, solid: SolidId) -> Vec<f64> {

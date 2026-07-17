@@ -159,6 +159,34 @@ impl Timeline {
         }
     }
 
+    /// Peek the sequence number the next successfully-appended event will
+    /// receive on this timeline.
+    ///
+    /// This is the value `add_operation` will hand to
+    /// `event_counter.fetch_add(1, SeqCst)` for the next event that passes
+    /// validation. Replay seeds each event's persistent-id lineage from
+    /// `format!("evt:{sequence_number}")` (`replay::apply_event`), so a live
+    /// operation that sets `model.set_event_key(Some(format!("evt:{}", next)))`
+    /// with this value *before* invoking the kernel mints the SAME root
+    /// persistent-ids a subsequent replay of that event will re-derive
+    /// (#11 slice 40-G live-path parity). This is the decision-independent
+    /// seam the parametric-DAG campaign (#64) builds references on.
+    ///
+    /// # Async-recorder caveat
+    ///
+    /// The counter advances only when an event is actually appended, which —
+    /// on the live api-server path — happens asynchronously as the recorder
+    /// bridge's background worker drains the MPSC channel
+    /// (`recorder_bridge`). This peek is therefore exact only when there are
+    /// no un-drained records ahead of the next append (the common serial,
+    /// one-op-per-record case, and every synchronous test). A correct
+    /// live-path closure that tolerates un-drained records must reserve the
+    /// sequence number synchronously at op time rather than peeking — see the
+    /// Slice-0 disposition notes in the campaign report.
+    pub fn next_sequence_number(&self) -> u64 {
+        self.event_counter.load(Ordering::SeqCst)
+    }
+
     /// Append a new operation event to a branch.
     ///
     /// # Validation (all performed *before* any state mutation)
