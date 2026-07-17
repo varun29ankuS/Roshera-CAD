@@ -418,6 +418,22 @@ pub fn chamfer_edges(
             Some(&miter_map)
         };
 
+        // Persistent-id lineage (#11, slice 40-E): resolve each selected edge's
+        // two adjacent faces on the PRE-surgery topology, so a bevel face can
+        // derive its PID from its source edge's canonical identity even after
+        // `create_edge_chamfer` consumes the edge. `get_adjacent_faces` may
+        // legitimately fail for an orphan edge; those are simply absent from the
+        // map and fall back to a face-keyed root in `assign_chamfer_pids`.
+        let chamfer_edge_face_map: HashMap<EdgeId, (FaceId, FaceId)> = {
+            let mut map = HashMap::with_capacity(selected_edges.len());
+            for &e in &selected_edges {
+                if let Ok(faces) = get_adjacent_faces(model, solid_id, e) {
+                    map.insert(e, faces);
+                }
+            }
+            map
+        };
+
         // Create chamfer faces for each edge. Closed-edge (rim) chamfers
         // perform their topology surgery inline and return `None`; open
         // edges return `Some(surgery)` for the 4-face splice below.
@@ -488,6 +504,18 @@ pub fn chamfer_edges(
             )?;
             chamfer_faces.extend(cap_faces);
         }
+
+        // Persistent-id lineage (#11, slice 40-E): the first `selected_edges`
+        // faces in `chamfer_faces` are the per-edge bevels (one pushed per edge,
+        // in order); any faces beyond that are corner caps. Assign now, after
+        // all faces exist and before the validate gate.
+        assign_chamfer_pids(
+            model,
+            solid_id,
+            &selected_edges,
+            &chamfer_edge_face_map,
+            &chamfer_faces,
+        );
 
         // Task 3A — FIRST-CALL partial retraction (chamfer-first
         // ordering, burndown-diag-cf.md sub-group A; the mirror of the
@@ -2298,6 +2326,66 @@ fn create_straight_edge(
     let edge_id = model.edges.add(edge);
 
     Ok(edge_id)
+}
+
+/// Assign persistent-id lineage to a chamfer's output faces (#11, slice 40-E).
+///
+/// Mirrors `fillet::assign_fillet_pids`. Each bevel face derives from its source
+/// EDGE via [`Role::ChamferBevel`]; the edge identity derives (via
+/// [`BRepModel::blend_edge_source_pid`]) from the two faces it bordered, ordered
+/// by PID, so the bevel PID is stable across a setback MOULD and distinct per
+/// edge. `chamfer_faces[0..selected_edges.len()]` are the per-edge bevels (one
+/// pushed per edge, in order); anything beyond is a corner cap and takes a
+/// deterministic [`Role::Generic`] PID from the host solid PID + an ordinal. The
+/// re-trimmed neighbour faces keep their FaceId and pre-chamfer PID — a
+/// mate/label anchored to a chamfered-and-adjacent face survives.
+fn assign_chamfer_pids(
+    model: &mut BRepModel,
+    solid_id: SolidId,
+    selected_edges: &[EdgeId],
+    edge_face_map: &HashMap<EdgeId, (FaceId, FaceId)>,
+    chamfer_faces: &[FaceId],
+) {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+
+    let n_bevels = selected_edges.len().min(chamfer_faces.len());
+    for (i, &edge_id) in selected_edges.iter().enumerate().take(n_bevels) {
+        let bevel_face = chamfer_faces[i];
+        let edge_pid = match edge_face_map.get(&edge_id) {
+            Some(&(fa, fb)) => model.blend_edge_source_pid(fa, fb),
+            None => {
+                let seed = model.next_root_seed(&format!("chamfer_edge:{edge_id}"));
+                PersistentId::root(&seed)
+            }
+        };
+        let fpid = PersistentId::derive(
+            &[edge_pid],
+            "chamfer_edges",
+            &Role::ChamferBevel {
+                source_edge_pid: edge_pid,
+            },
+        );
+        model.set_face_pid(bevel_face, fpid);
+    }
+
+    // Corner cap faces (indices >= n_bevels): no single source edge.
+    let solid_pid = model.solid_pid(solid_id).unwrap_or_else(|| {
+        let seed = model.next_root_seed("chamfer_solid");
+        PersistentId::root(&seed)
+    });
+    let mut ordinal = 0u32;
+    for &f in chamfer_faces.iter().skip(n_bevels) {
+        if model.face_pid(f).is_some() {
+            continue;
+        }
+        let role = Role::Generic {
+            source_pid: solid_pid,
+            label: format!("chamfer_corner{ordinal}"),
+        };
+        let fpid = PersistentId::derive(&[solid_pid], "chamfer_edges", &role);
+        model.set_face_pid(f, fpid);
+        ordinal += 1;
+    }
 }
 
 /// Re-stitch the topology around freshly created chamfer faces.
