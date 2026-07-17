@@ -176,6 +176,11 @@ fn intersect_plane_plane(
 }
 
 /// Predictor–corrector marching from grid-found seeds.
+///
+/// Each connected intersection branch is traced once: after a seed is traced,
+/// every remaining seed lying on the traced polyline is consumed so the same
+/// branch is not re-traced from every grid seed that landed on it. This is
+/// what turns the (deduplicated) seed *cloud* into one curve per component.
 fn intersect_surfaces_marching(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
@@ -184,13 +189,41 @@ fn intersect_surfaces_marching(
     let mut curves = Vec::new();
 
     let seeds = find_intersection_seeds(surface1, surface2, tolerance)?;
+    let mut consumed = vec![false; seeds.len()];
 
-    for seed in seeds {
-        if let Ok(curve) = trace_intersection_curve(surface1, surface2, seed, tolerance) {
-            if curve.points.len() >= 2 {
-                curves.push(curve);
+    // Coverage radius for consuming seeds that fall on an already-traced
+    // branch. Generous relative to the nominal chord so a seed sitting
+    // between two traced samples is still absorbed.
+    const NOMINAL_STEP: f64 = 0.01;
+    let coverage = (NOMINAL_STEP * 4.0).max(tolerance.distance() * 100.0);
+    let coverage_sq = coverage * coverage;
+
+    for i in 0..seeds.len() {
+        if consumed[i] {
+            continue;
+        }
+        consumed[i] = true;
+
+        let curve = match trace_intersection_curve(surface1, surface2, seeds[i], tolerance) {
+            Ok(c) if c.points.len() >= 2 => c,
+            _ => continue,
+        };
+
+        // Consume every remaining seed that lies on this traced branch.
+        for (j, seed) in seeds.iter().enumerate() {
+            if consumed[j] {
+                continue;
+            }
+            let on_curve = curve
+                .points
+                .iter()
+                .any(|p| (*p - seed.position).magnitude_squared() < coverage_sq);
+            if on_curve {
+                consumed[j] = true;
             }
         }
+
+        curves.push(curve);
     }
 
     deduplicate_curves(&mut curves, tolerance);
@@ -341,6 +374,22 @@ struct ClosestPoint {
     uv: (f64, f64),
 }
 
+/// Fold a parameter into `[lo, hi]`. On a *periodic* parameter the value wraps
+/// modulo the span (so a Newton step or a predicted point that crosses the
+/// seam of a closed surface — a cylinder's or sphere's longitude — continues
+/// on the far side instead of being pinned at the boundary). On a
+/// non-periodic parameter it clamps. Wrapping is exact because a periodic
+/// surface satisfies `S(x + span) = S(x)`.
+#[inline]
+fn fold_param(x: f64, lo: f64, hi: f64, periodic: bool) -> f64 {
+    if periodic && hi > lo && x.is_finite() {
+        let span = hi - lo;
+        lo + (x - lo).rem_euclid(span)
+    } else {
+        x.clamp(lo, hi)
+    }
+}
+
 /// Newton minimization of `||S(u,v) - target||²` over `(u, v)` with damping
 /// and box-constraint clamping to the surface's parameter bounds. Starts
 /// from the midpoint of the (clamped) parameter domain.
@@ -384,8 +433,13 @@ fn find_closest_point_on_surface_from(
     } else {
         INF_CLAMP
     };
+    let periodic_u = surface.is_periodic_u();
+    let periodic_v = surface.is_periodic_v();
     let (mut u, mut v) = match initial_guess {
-        Some((gu, gv)) => (gu.clamp(u_lo, u_hi), gv.clamp(v_lo, v_hi)),
+        Some((gu, gv)) => (
+            fold_param(gu, u_lo, u_hi, periodic_u),
+            fold_param(gv, v_lo, v_hi, periodic_v),
+        ),
         None => ((u_lo + u_hi) * 0.5, (v_lo + v_hi) * 0.5),
     };
     let bounds = ((u_lo, u_hi), (v_lo, v_hi));
@@ -419,8 +473,8 @@ fn find_closest_point_on_surface_from(
         u += du * 0.7;
         v += dv * 0.7;
 
-        u = u.clamp(bounds.0 .0, bounds.0 .1);
-        v = v.clamp(bounds.1 .0, bounds.1 .1);
+        u = fold_param(u, bounds.0 .0, bounds.0 .1, periodic_u);
+        v = fold_param(v, bounds.1 .0, bounds.1 .1, periodic_v);
     }
 
     let position = surface.evaluate_full(u, v)?.position;
@@ -471,17 +525,61 @@ fn deduplicate_seeds(seeds: &mut Vec<IntersectionPoint>, tolerance: &Tolerance) 
     }
 }
 
-/// Drop curves whose first sample coincides (within tolerance) with the
-/// first sample of a curve already retained.
+/// Drop curves that re-trace an already-retained branch. Two traces started
+/// from different seeds on the same connected component cover the same point
+/// set (with different starting samples), so a first-sample comparison misses
+/// them; instead a curve is a duplicate when a large fraction of its samples
+/// lie on a retained curve. The richer (longer) curve is kept.
 fn deduplicate_curves(curves: &mut Vec<IntersectionCurve>, tolerance: &Tolerance) {
-    let tol_sq = tolerance.distance_squared();
+    // Keep the point-richest curves first so a coarse re-trace is dropped in
+    // favour of the dense one.
+    curves.sort_by(|a, b| b.points.len().cmp(&a.points.len()));
+
+    /// Fraction of a curve's samples that must lie on another for it to count
+    /// as a re-trace. Below 1.0 so that two branches merely *crossing* at
+    /// isolated points are not mistaken for duplicates.
+    const OVERLAP_FRACTION: f64 = 0.7;
+
     let mut i = 0;
     while i < curves.len() {
+        // Coverage radius: a re-trace of the same branch samples within about
+        // one chord of the retained curve's samples. Size it from the retained
+        // curve's mean chord, with a tolerance-scaled floor.
+        let mean_chord = {
+            let pts = &curves[i].points;
+            if pts.len() < 2 {
+                tolerance.distance() * 10.0
+            } else {
+                let mut total = 0.0;
+                for k in 1..pts.len() {
+                    total += (pts[k] - pts[k - 1]).magnitude();
+                }
+                total / (pts.len() - 1) as f64
+            }
+        };
+        let cover_sq = (mean_chord * 1.5).max(tolerance.distance() * 10.0).powi(2);
+
         let mut j = i + 1;
         while j < curves.len() {
-            let dup = match (curves[i].points.first(), curves[j].points.first()) {
-                (Some(a), Some(b)) => (*a - *b).magnitude_squared() < tol_sq,
-                _ => false,
+            let (retained, candidate) = {
+                let (head, tail) = curves.split_at(j);
+                (&head[i], &tail[0])
+            };
+            let total = candidate.points.len();
+            let dup = if total == 0 {
+                true
+            } else {
+                let on = candidate
+                    .points
+                    .iter()
+                    .filter(|p| {
+                        retained
+                            .points
+                            .iter()
+                            .any(|q| (**p - *q).magnitude_squared() < cover_sq)
+                    })
+                    .count();
+                (on as f64) >= OVERLAP_FRACTION * total as f64
             };
             if dup {
                 curves.remove(j);
@@ -555,16 +653,27 @@ fn trace_intersection_curve(
     Ok(curve)
 }
 
-/// Single-direction predictor–corrector tracing.
+/// Single-direction predictor–corrector tracing with curvature-adaptive step
+/// control and tangent-consistent loop closure.
 ///
-/// When the corrector declares divergence (see
-/// [`correct_to_intersection`]) the trace halves the prediction step
-/// and retries, down to `MIN_STEP_FACTOR` of the nominal step. If the
-/// corrector still cannot lock on, the trace terminates cleanly —
-/// returning the partial curve. This replaces the previous behaviour
-/// of absorbing the best-so-far corrector output into the curve, which
-/// could spin the predictor for the full 1000-step budget along
-/// tangent or near-tangent contact lines.
+/// **Step control.** The chord (prediction step) is sized so the intersection
+/// curve turns by no more than `TURN_TARGET` radians between consecutive
+/// samples: after each accepted point the step is scaled by
+/// `TURN_TARGET / turn`, clamped to `[MIN_STEP_FACTOR, MAX_STEP_FACTOR]` of
+/// nominal. A step that turns more than `2·TURN_TARGET` is rejected and retried
+/// at half size from the same anchor. This keeps chord (sagitta) error bounded
+/// in high-curvature regions and lets the trace stride across gentle ones —
+/// the arc-length / curvature step law of Patrikalakis & Maekawa (2002) §5.8.
+///
+/// **Divergence.** When the corrector declares divergence (near-tangency, or
+/// a predicted point in the wrong basin) the step is halved and retried down
+/// to `MIN_STEP_FACTOR`; below that the trace terminates cleanly and returns
+/// the partial curve — never a runaway noise polyline.
+///
+/// **Closure.** A loop is closed when a sample returns within a chord-scaled
+/// radius of the seed *and* the local tangent is aligned with the seed
+/// tangent (Euclidean-plus-directional test), preventing a spurious close
+/// where an open branch merely passes near the seed.
 #[allow(clippy::too_many_arguments)]
 fn trace_direction(
     surface1: &dyn Surface,
@@ -575,13 +684,24 @@ fn trace_direction(
     tolerance: &Tolerance,
     closed_out: &mut bool,
 ) -> MathResult<()> {
-    const MAX_STEPS: usize = 1000;
+    const MAX_STEPS: usize = 4000;
     const NOMINAL_STEP: f64 = 0.01;
     /// Floor on subdivision: when the prediction step has been halved
     /// to this fraction of nominal and the corrector still diverges,
     /// give up cleanly. Six halvings ≈ 1/64 of nominal = 1.5e-4 in
     /// world units, well below any meaningful chord-tolerance.
     const MIN_STEP_FACTOR: f64 = 1.0 / 64.0;
+    /// Ceiling on step growth over gentle (near-flat) curve regions so the
+    /// trace covers length efficiently without under-sampling. Kept modest so
+    /// the chord-scaled closure radius stays tight enough to close a loop near
+    /// its true seed rather than a step early.
+    const MAX_STEP_FACTOR: f64 = 8.0;
+    /// Target curve turning per sample (radians). ~11.5°: keeps a circle's
+    /// chord-sagitta error near 0.5 % of the radius.
+    const TURN_TARGET: f64 = 0.20;
+
+    let seed_pos = curve.points.first().copied().unwrap_or(current.position);
+    let seed_tangent = current.tangent * direction;
 
     let mut step_factor = 1.0_f64;
     let mut total_steps = 0usize;
@@ -621,53 +741,106 @@ fn trace_direction(
             break;
         }
 
-        if curve.points.len() > 10 {
-            if let Some(start) = curve.points.first() {
-                let dist_to_start = (corrected.position - *start).magnitude_squared();
-                if dist_to_start < tolerance.distance_squared() {
-                    *closed_out = true;
-                    break;
-                }
+        // Orient the corrected tangent to point along the direction of travel
+        // so the turning angle is measured consistently.
+        let travel = corrected.position - current.position;
+        let travel_len = travel.magnitude();
+        if travel_len < tolerance.distance() {
+            // The corrector fell back onto (essentially) the anchor — no
+            // forward progress. Shrink and retry; give up at the floor so a
+            // stationary corrector can never spin the full step budget.
+            step_factor *= 0.5;
+            if step_factor < MIN_STEP_FACTOR {
+                break;
+            }
+            continue;
+        }
+        let oriented_tangent = if corrected.tangent.dot(&travel) < 0.0 {
+            -corrected.tangent
+        } else {
+            corrected.tangent
+        };
+
+        // Curvature estimate via the turning angle over this chord.
+        let cos_turn = (current.tangent * direction)
+            .dot(&oriented_tangent)
+            .clamp(-1.0, 1.0);
+        let turn = cos_turn.acos();
+
+        // Reject an over-large turn (chord skipped a high-curvature bend) and
+        // retry at half step from the same anchor.
+        if turn > 2.0 * TURN_TARGET && step_factor > MIN_STEP_FACTOR {
+            step_factor *= 0.5;
+            continue;
+        }
+
+        // Loop closure: near the seed in position AND aligned in tangent.
+        // The radius tracks the just-travelled chord so it closes within a
+        // step of the true seed, not a large step early.
+        if curve.points.len() > 8 {
+            let close_radius = (travel_len * 1.5).max(tolerance.distance() * 10.0);
+            let dist_to_seed = (corrected.position - seed_pos).magnitude();
+            let tangent_aligned = oriented_tangent.dot(&seed_tangent) > 0.5;
+            if dist_to_seed < close_radius && tangent_aligned {
+                *closed_out = true;
+                break;
             }
         }
 
         curve.points.push(corrected.position);
         curve.params1.push(corrected.uv1);
         curve.params2.push(corrected.uv2);
-        curve.tangents.push(corrected.tangent);
+        curve.tangents.push(oriented_tangent);
 
-        current = corrected;
+        current = IntersectionPoint {
+            tangent: oriented_tangent,
+            ..corrected
+        };
         total_steps += 1;
-        // Successful step — relax the step factor back toward nominal
-        // so the trace doesn't crawl through the rest of the curve at
-        // 1/64 chord just because one earlier seed needed help.
-        step_factor = (step_factor * 2.0).min(1.0);
+
+        // Curvature-adaptive step update: scale toward the turning target.
+        let scale = if turn > 1e-9 {
+            (TURN_TARGET / turn).clamp(0.5, 2.0)
+        } else {
+            2.0
+        };
+        step_factor = (step_factor * scale).clamp(MIN_STEP_FACTOR, MAX_STEP_FACTOR);
     }
 
     Ok(())
 }
 
-/// Alternating-projection corrector: project onto surface 1, then onto
-/// surface 2, until the 3-D gap drops below distance tolerance or the
-/// iteration budget is exhausted.
+/// Corrector: pull the *predicted* point back onto the intersection curve.
+///
+/// The predictor advances the last accepted point a small chord along the
+/// curve tangent, landing `predicted` slightly off the intersection. This
+/// corrector projects `predicted` onto each surface (seeded at the anchor
+/// parameters `uv{1,2}_init` so the Newton stays on the local branch), then
+/// runs von-Neumann alternating projection between the two surfaces until the
+/// inter-surface gap collapses — the standard relaxation corrector of
+/// Patrikalakis & Maekawa (2002) §5.8.2 and Barnhill, Farin, Jordan & Piper
+/// (1987).
+///
+/// **Advance is essential.** A prior revision took `predicted` but ignored it,
+/// re-projecting from the *anchor's own* parameters; since the anchor already
+/// lies on the intersection, the corrector returned the anchor unchanged and
+/// the trace never moved — every "curve" collapsed to a single repeated point.
+/// Seeding the projection from `predicted` is what makes each step move the
+/// solution forward by one chord.
 ///
 /// Returns:
 /// - `Ok(Some(point))` when the corrector converged (gap below
 ///   `tolerance.distance()`).
-/// - `Ok(None)` when the corrector *diverged* — the inter-surface gap
-///   failed to monotonically decrease for `DIVERGENCE_PATIENCE`
-///   consecutive iterations, signalling that the seed pair did not
-///   admit refinement. The caller is expected to react (subdivide the
-///   prediction step, reseed, or terminate the trace cleanly) rather
-///   than treat the best-so-far as a valid intersection point — a
-///   stale corrector output dragged through the predictor produces
-///   the runaway "1000 steps of noise" failure mode this slice closes.
-/// - `Err(_)` for evaluation / closest-point errors that the caller
-///   cannot recover from.
+/// - `Ok(None)` when the corrector *diverged* — the inter-surface gap failed
+///   to monotonically decrease for `DIVERGENCE_PATIENCE` consecutive
+///   iterations, or the budget was exhausted. The caller subdivides the
+///   prediction step and retries, or terminates the trace cleanly.
+/// - `Err(_)` for evaluation / closest-point errors the caller cannot recover
+///   from.
 fn correct_to_intersection(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
-    _predicted: &Point3,
+    predicted: &Point3,
     uv1_init: (f64, f64),
     uv2_init: (f64, f64),
     tolerance: &Tolerance,
@@ -677,15 +850,21 @@ fn correct_to_intersection(
     /// corrector path; three in a row is a clean "the seed pair is in
     /// the wrong basin" signal.
     const DIVERGENCE_PATIENCE: usize = 3;
-    /// Hard iteration cap. The corrector is alternating projection
-    /// (linearly convergent in the worst case); 32 iterations is a
-    /// generous upper bound for any pair of well-conditioned smooth
-    /// surfaces. Hitting the cap without converging is treated as
-    /// divergence — the caller subdivides and retries.
-    const MAX_ITERATIONS: usize = 32;
+    /// Hard iteration cap. Alternating projection is linearly convergent in
+    /// the worst case; 40 iterations is a generous upper bound for a pair of
+    /// well-conditioned smooth surfaces. Hitting the cap without converging is
+    /// treated as divergence — the caller subdivides and retries.
+    const MAX_ITERATIONS: usize = 40;
 
-    let mut uv1 = uv1_init;
-    let mut uv2 = uv2_init;
+    // Seed the corrector by projecting the PREDICTED point onto each surface,
+    // starting the Newton from the anchor parameters so the foot-point stays
+    // on the local branch (critical on periodic / unbounded domains). This is
+    // what advances the trace by one chord.
+    let mut uv1 =
+        find_closest_point_on_surface_from(surface1, predicted, Some(uv1_init), tolerance)?.uv;
+    let mut uv2 =
+        find_closest_point_on_surface_from(surface2, predicted, Some(uv2_init), tolerance)?.uv;
+
     let mut prev_gap_sq = f64::INFINITY;
     let mut non_decreasing_streak: usize = 0;
     let tol_sq = tolerance.distance_squared();
@@ -721,12 +900,13 @@ fn correct_to_intersection(
         }
         prev_gap_sq = gap_sq;
 
-        let closest1 = find_closest_point_on_surface(surface1, &p2, tolerance)?;
-        uv1 = closest1.uv;
-
+        // Von-Neumann alternating projection with anchor-local Newton seeds:
+        // project surface-2's point onto surface 1, then that onto surface 2.
+        // For transversal intersections this converges to the shared point
+        // nearest the current iterate.
+        uv1 = find_closest_point_on_surface_from(surface1, &p2, Some(uv1), tolerance)?.uv;
         let p1_new = surface1.evaluate_full(uv1.0, uv1.1)?.position;
-        let closest2 = find_closest_point_on_surface(surface2, &p1_new, tolerance)?;
-        uv2 = closest2.uv;
+        uv2 = find_closest_point_on_surface_from(surface2, &p1_new, Some(uv2), tolerance)?.uv;
     }
 
     // Budget exhausted without converging. Treat as divergence so the
@@ -735,10 +915,14 @@ fn correct_to_intersection(
     Ok(None)
 }
 
-/// `true` when `uv` lies strictly outside the surface's parameter bounds.
+/// `true` when `uv` lies strictly outside the surface's parameter bounds. A
+/// *periodic* parameter is never out of bounds — it wraps — so a trace that
+/// crosses a closed surface's seam continues instead of terminating there.
 fn is_out_of_bounds(surface: &dyn Surface, uv: (f64, f64)) -> bool {
     let bounds = surface.parameter_bounds();
-    uv.0 < bounds.0 .0 || uv.0 > bounds.0 .1 || uv.1 < bounds.1 .0 || uv.1 > bounds.1 .1
+    let u_out = !surface.is_periodic_u() && (uv.0 < bounds.0 .0 || uv.0 > bounds.0 .1);
+    let v_out = !surface.is_periodic_v() && (uv.1 < bounds.1 .0 || uv.1 > bounds.1 .1);
+    u_out || v_out
 }
 
 /// Convert a traced intersection curve into a NURBS curve by interpolating
