@@ -2,7 +2,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { api, ok, fail, BASE, ApiError, setDocumentUnitCache } from "../core.js";
+import { api, ok, fail, BASE, ApiError, setDocumentUnitCache, AUTH_HEADERS } from "../core.js";
 
 export function registerInspectTools(server: McpServer) {
   server.tool(
@@ -192,7 +192,7 @@ export function registerInspectTools(server: McpServer) {
         // are the kernel's meaningful REFUSALS, not transport errors.
         const res = await fetch(`${BASE}/api/agent/parts/${part_id}/select-face`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
           body: JSON.stringify({
             kind,
             normal_dir: normal_dir ?? null,
@@ -230,7 +230,7 @@ export function registerInspectTools(server: McpServer) {
       try {
         const res = await fetch(`${BASE}/api/agent/parts/${part_id}/select-edge`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
           body: JSON.stringify({
             curve_kind,
             blend,

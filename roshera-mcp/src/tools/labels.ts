@@ -6,7 +6,7 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { api, ok, fail, BASE } from "../core.js";
+import { api, ok, fail, BASE, AUTH_HEADERS } from "../core.js";
 
 export function registerLabelTools(server: McpServer) {
   server.tool(
@@ -56,7 +56,7 @@ export function registerLabelTools(server: McpServer) {
         // / ambiguous selector), surfaced as structured JSON, not transport errors.
         const res = await fetch(`${BASE}/api/agent/parts/${part_id}/labels`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-Roshera-Agent": "Claude" },
+          headers: { "Content-Type": "application/json", "X-Roshera-Agent": "Claude", ...AUTH_HEADERS },
           body: JSON.stringify({
             name,
             kind,
@@ -102,7 +102,7 @@ export function registerLabelTools(server: McpServer) {
       try {
         const res = await fetch(
           `${BASE}/api/agent/parts/${part_id}/labels/${encodeURIComponent(name)}/resolve`,
-          { headers: { "X-Roshera-Agent": "Claude" } },
+          { headers: { "X-Roshera-Agent": "Claude", ...AUTH_HEADERS } },
         );
         return ok(await res.json());
       } catch (e) {

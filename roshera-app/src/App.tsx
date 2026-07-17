@@ -13,6 +13,7 @@ import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { AssemblyWorkspace } from '@/components/panels/AssemblyWorkspace'
 import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
 import { CommandPalette } from '@/components/CommandPalette'
+import { LoginDialog } from '@/components/LoginDialog'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
@@ -132,6 +133,10 @@ export function App() {
           the keybinding works the moment the app loads, not after
           the first interaction. */}
       <CommandPalette />
+      {/* Sign-in dialog — mounted unconditionally but only opens when a
+          backend request returns 401 (auth-required signal). Invisible
+          against a local insecure-bypass backend. */}
+      <LoginDialog />
     </div>
   )
 }

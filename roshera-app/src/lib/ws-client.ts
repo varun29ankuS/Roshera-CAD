@@ -1,4 +1,5 @@
 import { useWSStore } from '@/stores/ws-store'
+import { currentToken } from './auth'
 import { parseServerMessage, type ServerMessage } from './ws-schemas'
 
 type MessageHandler = (msg: ServerMessage) => void
@@ -64,6 +65,16 @@ class WSClient {
       const s = useWSStore.getState()
       s.setStatus('connected')
       s.resetReconnect()
+      // Authenticate in-band before anything else. The WS command surface
+      // (geometry/AI/timeline/export) is gated per connection on the
+      // backend; a browser cannot attach an Authorization header to the
+      // upgrade, so the token travels in this frame. When no token is
+      // stored (local dev against an insecure-bypass backend), the frame
+      // is skipped and the connection proceeds unauthenticated.
+      const token = currentToken()
+      if (token) {
+        ws.send(JSON.stringify({ type: 'Authenticate', data: { token } }))
+      }
       this.startHeartbeat()
       // Resync the whole scene from the server snapshot on EVERY connect.
       // The FIRST connect needs it too: a fresh page load (or refresh) must

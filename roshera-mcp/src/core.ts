@@ -10,6 +10,24 @@ import { z } from "zod";
 
 export const BASE = process.env.ROSHERA_URL ?? "http://localhost:8081";
 
+// Backend credential. The MCP authorization spec directs stdio servers
+// (which this is) AWAY from OAuth and toward reading a credential from
+// the environment, so the API key is taken from ROSHERA_API_KEY and sent
+// as `Authorization: ApiKey <key>` — the scheme the backend's
+// auth_middleware parses (session-manager verify_api_key).
+//
+// When ROSHERA_API_KEY is unset, no Authorization header is sent. That
+// still works against a backend running the local insecure bypass
+// (ROSHERA_DEV_INSECURE=1), but a default (secure) backend will reject
+// every request with 401 — set ROSHERA_API_KEY when driving any backend
+// that enforces authentication. Computed once at module load; changing
+// the key requires an MCP reconnect (`/mcp`), which restarts this
+// process and re-reads the environment.
+const API_KEY = process.env.ROSHERA_API_KEY;
+export const AUTH_HEADERS: Record<string, string> = API_KEY
+  ? { Authorization: `ApiKey ${API_KEY}` }
+  : {};
+
 // ─── HTTP helpers ──────────────────────────────────────────────────────
 
 export class ApiError extends Error {
@@ -57,6 +75,8 @@ export async function api(
         // every kernel op from this request as Author::AIAgent("Claude"),
         // so agent-built features show amber Ⓒ in the Timeline strip.
         "X-Roshera-Agent": "Claude",
+        // Credential (empty object when ROSHERA_API_KEY is unset).
+        ...AUTH_HEADERS,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -353,7 +373,7 @@ export async function uuidForPart(partId: number): Promise<string> {
 export async function allEdgeIds(partId: number): Promise<number[]> {
   const res = await fetch(`${BASE}/api/agent/parts/${partId}/select-edge`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
     body: JSON.stringify({ curve_kind: "any", blend: "any", extremal: "none" }),
   });
   const j: any = await res.json().catch(() => null);
@@ -688,7 +708,7 @@ export const unit3 = (a: number[]) => {
 
 /** Save raw bytes fetched from a backend path to an absolute file on disk. */
 export async function saveBinary(urlPath: string, savePath: string): Promise<number> {
-  const res = await fetch(`${BASE}${urlPath}`);
+  const res = await fetch(`${BASE}${urlPath}`, { headers: { ...AUTH_HEADERS } });
   if (!res.ok) {
     throw new Error(`GET ${urlPath} → ${res.status}`);
   }
