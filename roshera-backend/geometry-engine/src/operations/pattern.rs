@@ -228,12 +228,67 @@ fn create_pattern_body(
         )?;
     }
 
+    // Persistent-id lineage (#11, slice 40-F): each copied instance face
+    // derives from its SEED face's PID + the instance index. Assigned after the
+    // (vertex-only) merge, which leaves FaceIds — and thus the positional
+    // seed<->copy correspondence — intact.
+    assign_pattern_pids(model, &source_features, &pattern_instances);
+
     // Validate result if requested
     if options.common.validate_result {
         validate_pattern_result(model, &pattern_instances)?;
     }
 
     Ok(pattern_instances)
+}
+
+/// Assign persistent-id lineage to a pattern's copied faces (#11, slice 40-F).
+///
+/// `instances[0]` is the seed (the original faces, left untouched); every later
+/// group is a transformed copy whose faces align POSITIONALLY with
+/// `source_features`. Each copy face at position `j` in instance `i` derives
+/// from `source_features[j]`'s PID via `Role::PatternInstance { source_pid,
+/// index: i }`, so "the bore on instance 3" is a stable, deterministic name and
+/// the SEED face + instance index recover it exactly. A seed face lacking a PID
+/// is minted a root first, so the derivation is always total. Instances whose
+/// length does not match the seed set (e.g. a self-interference skip that left
+/// an empty group) are left unassigned rather than mislabelled.
+fn assign_pattern_pids(
+    model: &mut BRepModel,
+    source_features: &[FaceId],
+    instances: &[Vec<FaceId>],
+) {
+    use crate::primitives::persistent_id::{PersistentId, Role};
+
+    // Resolve (minting if needed) each seed face's PID once.
+    let seed_pids: Vec<PersistentId> = source_features
+        .iter()
+        .map(|&f| model.ensure_face_annotation_key(f))
+        .collect();
+
+    for (index, group) in instances.iter().enumerate() {
+        if index == 0 {
+            // Seed group: originals keep their identity, nothing to derive.
+            continue;
+        }
+        if group.len() != seed_pids.len() {
+            // Positional correspondence broken (skipped/degenerate instance) —
+            // do not fabricate lineage.
+            continue;
+        }
+        for (j, &copy_face) in group.iter().enumerate() {
+            let source_pid = seed_pids[j];
+            let fpid = PersistentId::derive(
+                &[source_pid],
+                "pattern",
+                &Role::PatternInstance {
+                    source_pid,
+                    index: index as u32,
+                },
+            );
+            model.set_face_pid(copy_face, fpid);
+        }
+    }
 }
 
 /// Generate transformation matrices for pattern
