@@ -80,12 +80,101 @@ fn nurbs_minus_box_completes_and_imprints() {
     );
 }
 
-/// DESIRED end state (pinned, currently RED → #[ignore]): the notch difference is
-/// a sound, watertight solid. The remaining #17 work is corefinement — sharing
-/// the cut edges between the NURBS-wall fragments and the box-face fragments so
-/// no boundary edges (gaps) remain. Un-ignore when watertight.
+/// #17 WELD GUARD (the mission's reported symptom, pinned GREEN): when a NURBS
+/// lateral wall and a box (planar) face are cut by the SAME intersection curve,
+/// the two cut edges must merge into ONE shared B-Rep edge used by exactly two
+/// face-loops — never two coincident-but-distinct edges (a duplicate) or an
+/// unmated boundary edge (a gap).
+///
+/// This is the corefinement identity discipline the shared-corner registry
+/// (`build_shared_corner_endpoints` + the per-`curve_id` shared-edge map in
+/// `split_faces_along_curves`) enforces. The assertion is stronger and more
+/// targeted than `is_sound()`: it inspects the B-Rep directly and requires
+///   * `coincident_edge_groups == 0` — no two distinct edges share endpoints
+///     (the exact "cut edges don't merge" failure #17 was opened for), and
+///   * `duplicate_vertex_groups == 0` — no unmerged coincident vertices,
+/// on a clean seam-free +Y blind pocket (the well-posed reported case). If a
+/// future change reintroduces per-face cut-edge creation without sharing, this
+/// goes red at the weld level immediately, independent of mesh cleanliness.
 #[test]
-#[ignore = "#17: NURBS-cut not yet watertight — cut edges not shared between operands (corefinement)"]
+fn nurbs_box_cut_edges_are_shared_not_coincident() {
+    use geometry_engine::harness::brep_integrity::brep_integrity;
+    use geometry_engine::math::Vector3;
+    use geometry_engine::operations::transform::{translate, TransformOptions};
+
+    let mut m = BRepModel::new();
+    let b = barrel(&mut m);
+    // Seam-free +Y wall, mid-height blind pocket — the well-posed reported case.
+    let cutter = boxs(&mut m, 2.0, 2.0, 2.0);
+    translate(
+        &mut m,
+        vec![cutter],
+        Vector3::Y,
+        4.0,
+        TransformOptions::default(),
+    )
+    .expect("ty");
+    translate(
+        &mut m,
+        vec![cutter],
+        Vector3::Z,
+        3.0,
+        TransformOptions::default(),
+    )
+    .expect("tz");
+    let result = boolean_operation(
+        &mut m,
+        b,
+        cutter,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("#17: NURBS∖box blind pocket must complete");
+
+    let rep = brep_integrity(&m, result, 1.0e-6);
+    assert!(
+        rep.coincident_edge_groups.is_empty(),
+        "#17 WELD: NURBS-cut and box-cut edges must merge, found {} coincident-but-distinct edge group(s): {:?}",
+        rep.coincident_edge_groups.len(),
+        rep.coincident_edge_groups,
+    );
+    assert!(
+        rep.duplicate_vertex_groups.is_empty(),
+        "#17 WELD: cut endpoints must be shared, found {} unmerged duplicate-vertex group(s)",
+        rep.duplicate_vertex_groups.len(),
+    );
+    // The pocket is a well-posed cut: it must also close (no open seam) and be
+    // Euler-balanced — the shared cut edges are each used by exactly two faces.
+    assert!(
+        rep.edges_used_once.is_empty(),
+        "#17 WELD: shared cut edges must each be used by two faces, found {} boundary edge(s): {:?}",
+        rep.edges_used_once.len(),
+        rep.edges_used_once,
+    );
+    assert_eq!(
+        rep.euler_poincare_genus0_residual(),
+        0,
+        "#17 WELD: welded genus-0 pocket must be Euler-balanced (V−E+2F−L−2S=0)"
+    );
+}
+
+/// DESIRED end state (pinned, currently RED → #[ignore]): this NASTY cutter
+/// (3×8×3 straddling the base cap at z=0 and poking fully through BOTH ±Y walls)
+/// must difference to a sound, watertight solid.
+///
+/// FAILURE CLASS (measured 2026-07-18, branch feat/sketch-dcm-45): NOT a weld/
+/// corefinement gap. `brep_integrity` reports `coincident_edge_groups=0` and
+/// `duplicate_vertex_groups=0` — the cut edges ARE shared (the shared-corner
+/// registry works). The result is an OPEN SHELL: 16 edges-used-once, euler=-2.
+/// The box x-wall fragments are mis-classified — the parts OUTSIDE the barrel
+/// (|y|≈4, beyond radius) are kept while the INSIDE notch-wall fragments (which
+/// should mate with the NURBS cut edges e17–e20) are dropped. This is a fragment
+/// inside/outside classification / arrangement-completeness problem on the
+/// base-cap-straddling through-cut (the GWN-against-a-tapered-NURBS-tessellation
+/// family), tracked distinctly from the (now-resolved) corefinement weld — see
+/// `nurbs_box_cut_edges_are_shared_not_coincident` for the weld guard.
+#[test]
+#[ignore = "#17: base-cap-straddle through-cut — open shell from mis-classified box-wall notch fragments (fragment classification, NOT weld: coincident_edge_groups=0)"]
 fn nurbs_minus_box_should_be_watertight() {
     let mut m = BRepModel::new();
     let b = barrel(&mut m);
@@ -106,15 +195,17 @@ fn nurbs_minus_box_should_be_watertight() {
     );
 }
 
-/// EXPLORATION (#[ignore]): is a CLEAN single-wall blind pocket watertight? The
-/// `should_be_watertight` cutter is a nasty partial overlap (pokes through both
-/// walls + sits below the base cap). This isolates whether corefinement already
-/// works for a WELL-POSED cut — a small box driven into the +X wall at mid-height
-/// (away from the caps and the far wall). Run with `--ignored --nocapture` to see
-/// the certificate summary; the result tells us if #17 is "works for clean cuts,
-/// degenerate cases pending" vs "fundamentally unshared".
+/// EXPLORATION (#[ignore]): a clean blind pocket driven into the +X PERIODIC
+/// SEAM wall at mid-height. The corefinement/weld is SOUND here — measured
+/// 2026-07-18: `brep_valid=true watertight=true manifold=true euler=2`. The
+/// ONLY reason `is_sound()` is false is MESH QUALITY on the seam wall
+/// (`mesh_clean=false`, worst_aspect≈60, min_angle≈0.5°) — a tessellation
+/// (seam-wall facet aspect) issue, NOT corefinement. The seam-free +Y variant
+/// of exactly this cut is `nurbs_boolean_watertight::w01_clean_blind_pocket`,
+/// which is fully GREEN. Un-ignore once the seam-wall tessellation quality
+/// clears the mesh-cleanliness bar.
 #[test]
-#[ignore = "#17 exploration: clean single-wall blind pocket watertightness"]
+#[ignore = "#17: topology is watertight (euler=2); fails is_sound only on SEAM-WALL MESH QUALITY (tessellation, not corefinement)"]
 fn nurbs_clean_blind_pocket() {
     use geometry_engine::math::Vector3;
     use geometry_engine::operations::transform::{translate, TransformOptions};
