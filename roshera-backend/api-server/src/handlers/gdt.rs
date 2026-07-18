@@ -42,7 +42,7 @@ use axum::{
     Json,
 };
 use geometry_engine::gdt::model::{
-    Annotation, DatumRef, FeatureControlFrame, GeometricCharacteristic,
+    Annotation, DatumRef, DimensionalTolerance, FeatureControlFrame, GeometricCharacteristic,
 };
 use geometry_engine::gdt::{
     designate_datum, evaluate, resolve_datum, DatumReferenceFrame, DatumResolution, GdtError,
@@ -783,6 +783,129 @@ pub async fn author_fcf_handler(
         part_id: id,
         annotation_pid: pid_str,
         verdict,
+        persistence: "session",
+    }))
+}
+
+/// Request body for `POST /api/agent/parts/{id}/size-tolerance`.
+///
+/// Exactly one bound must be specified, in priority order: `fit` (an ISO 286
+/// designation — the numeric envelope is NOT fabricated), else `lower`+`upper`
+/// (explicit limits), else `plus`+`minus` (asymmetric), else `plus_minus`
+/// (symmetric ±). Targets a feature face by `face_id` or `selector`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SizeToleranceRequest {
+    /// Nominal (basic) size in millimetres.
+    pub nominal: f64,
+    #[serde(default)]
+    pub plus_minus: Option<f64>,
+    #[serde(default)]
+    pub plus: Option<f64>,
+    #[serde(default)]
+    pub minus: Option<f64>,
+    #[serde(default)]
+    pub lower: Option<f64>,
+    #[serde(default)]
+    pub upper: Option<f64>,
+    #[serde(default)]
+    pub fit: Option<String>,
+    #[serde(default)]
+    pub face_id: Option<u32>,
+    #[serde(default)]
+    pub selector: Option<serde_json::Value>,
+}
+
+/// Response for `POST /api/agent/parts/{id}/size-tolerance`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SizeToleranceResponse {
+    pub part_id: u32,
+    /// Hex-encoded PersistentId of the toleranced feature.
+    pub annotation_pid: String,
+    /// `plus_minus` | `limits` | `fit`.
+    pub kind: String,
+    /// Resolved `[lower, upper]` limits, or `None` for an unresolved fit class
+    /// (never fabricated).
+    pub limits: Option<[f64; 2]>,
+    pub persistence: &'static str,
+}
+
+/// `POST /api/agent/parts/{id}/size-tolerance` — attach a DIMENSIONAL (size)
+/// tolerance to a feature face's PersistentId in the GD&T sidecar. This is what
+/// campaign #55 Slice 4 joins to the sheet's diameter callouts + hole rows, so a
+/// certified drawing readback answers "the toleranced diameter" with limits +
+/// provenance (or an honest fit-designation-without-limits).
+///
+/// - 200 OK: tolerance stored.
+/// - 404: solid not found.
+/// - 422: no bound specified, face has no PID, or selector not found.
+pub async fn author_size_tolerance_handler(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(req): Json<SizeToleranceRequest>,
+) -> Result<Json<SizeToleranceResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let solid = id as SolidId;
+
+    // Build the tolerance bound from whichever fields were supplied.
+    let (tol, kind) = if let Some(fit) = req.fit.as_ref() {
+        (DimensionalTolerance::fit(req.nominal, fit.clone()), "fit")
+    } else if let (Some(lower), Some(upper)) = (req.lower, req.upper) {
+        (
+            DimensionalTolerance::limits(req.nominal, lower, upper),
+            "limits",
+        )
+    } else if let (Some(plus), Some(minus)) = (req.plus, req.minus) {
+        (
+            DimensionalTolerance::plus_minus(req.nominal, plus, minus),
+            "plus_minus",
+        )
+    } else if let Some(pm) = req.plus_minus {
+        (
+            DimensionalTolerance::symmetric(req.nominal, pm),
+            "plus_minus",
+        )
+    } else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "no_bound_specified",
+                "message": "specify one of: fit, (lower+upper), (plus+minus), or plus_minus",
+            })),
+        ));
+    };
+
+    let mut model = model_handle.write().await;
+    if model.solids.get(solid).is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "solid_not_found",
+                "message": format!("part {id} does not exist"),
+            })),
+        ));
+    }
+
+    let face_id = resolve_target_face(&mut model, solid, req.face_id, req.selector.as_ref())?;
+    let pid = model.face_pid(face_id).ok_or_else(|| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "face_has_no_persistent_id",
+                "message": format!(
+                    "face {face_id} has no PersistentId — the tolerance cannot be durably keyed"
+                ),
+            })),
+        )
+    })?;
+
+    let limits = tol.limit_range().map(|(lo, hi)| [lo, hi]);
+    model.gdt.attach(pid, Annotation::Dimensional(tol));
+
+    Ok(Json(SizeToleranceResponse {
+        part_id: id,
+        annotation_pid: format!("{:032x}", pid.as_u128()),
+        kind: kind.to_string(),
+        limits,
         persistence: "session",
     }))
 }

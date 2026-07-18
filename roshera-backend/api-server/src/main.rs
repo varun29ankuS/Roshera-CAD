@@ -8561,6 +8561,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/parts/{id}/fcf",
             post(handlers::gdt::author_fcf_handler),
         )
+        // Dimensional (size) tolerance authoring (campaign #55 Slice 4): binds a
+        // ±/limits/fit tolerance to a feature so the sheet readback answers "the
+        // toleranced diameter" with limits + provenance.
+        .route(
+            "/api/agent/parts/{id}/size-tolerance",
+            post(handlers::gdt::author_size_tolerance_handler),
+        )
         .route(
             "/api/agent/parts/{id}/gdt",
             get(handlers::gdt::get_gdt_handler),
