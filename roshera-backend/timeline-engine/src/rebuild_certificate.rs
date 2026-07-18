@@ -28,6 +28,11 @@
 //! - `Blocked{by_sequence}` — transitively downstream of a `Failed`/`Dangling`
 //!   feature (Fusion's error-propagates-downstream semantics), computed from the
 //!   same dependency DAG.
+//! - `Stale{reason}` — a non-geometry, document-level event (`drawing.*`,
+//!   `gdt.*`, `label.*`, `export.*`, `part.*`, legacy `assembly.*`) with no
+//!   B-Rep replay arm (#31). It is skipped honestly — the geometry rebuild is
+//!   untouched by it, so it is NOT a break and does NOT taint `is_sound` — but
+//!   the record it produced now reflects an OLDER part and is surfaced as stale.
 //!
 //! The global `is_sound()` is true iff every feature is `Rebuilt`/`Unaffected`,
 //! no reference dangled, and the re-measured B-Rep validates — else the mould is
@@ -64,12 +69,31 @@ pub enum FeatureStatus {
         /// The sequence number of the first upstream feature that broke.
         by_sequence: u64,
     },
+    /// A non-geometry, document-level event (`drawing.*`, `gdt.*`, `label.*`,
+    /// `export.*`, `part.*`, legacy `assembly.*`) that has no B-Rep replay arm
+    /// (#31). It was SKIPPED honestly — the geometry rebuild is untouched by it,
+    /// so it is NOT a soundness break — but the record it produced (a drawing,
+    /// an annotation) now reflects an OLDER part after the edit and is therefore
+    /// STALE. Regenerating it is a separate product concern (banked); the
+    /// certificate surfaces the staleness honestly rather than lying that the
+    /// geometry is unsound. Distinct from `Failed`, which is a real geometry
+    /// rebuild failure.
+    Stale {
+        /// Why the event was skipped (no B-Rep replay arm; geometry unaffected).
+        reason: String,
+    },
 }
 
 impl FeatureStatus {
-    /// A break is anything that is not a clean rebuild/unaffected.
+    /// A break is anything that is not a clean rebuild/unaffected — a geometry
+    /// failure, a dangling reference, or a blocked downstream. A `Stale`
+    /// non-geometry skip is NOT a break: the geometry rebuilt fine, only a
+    /// dependent document (a drawing) is now out of date (#31).
     pub fn is_break(&self) -> bool {
-        !matches!(self, FeatureStatus::Rebuilt | FeatureStatus::Unaffected)
+        !matches!(
+            self,
+            FeatureStatus::Rebuilt | FeatureStatus::Unaffected | FeatureStatus::Stale { .. }
+        )
     }
 }
 
@@ -120,6 +144,9 @@ enum EventResult {
     Ok,
     Failed(String),
     Dangling(String),
+    /// A non-geometry event with no B-Rep replay arm — skipped honestly, does not
+    /// taint geometry soundness (#31).
+    Stale(String),
 }
 
 /// Replay `events` into `model`, folding overrides, and capture a per-sequence
@@ -150,19 +177,36 @@ fn replay_with_report(
                 per_event.insert(event.sequence_number, EventResult::Ok);
             }
             Err(err) => {
-                outcome.events_skipped += 1;
                 let result = match &err {
                     ReplayError::DanglingReference { entity, .. } => {
                         EventResult::Dangling(entity.clone())
                     }
+                    // #31: a non-geometry, document-level event (a drawing, an
+                    // annotation) has no B-Rep replay arm. It is SKIPPED honestly
+                    // and does NOT increment `events_skipped` — that counter gates
+                    // `measure_is_sound`, which reflects the GEOMETRY's soundness.
+                    // A stale drawing must not drag the geometry verdict to unsound.
+                    ReplayError::NonGeometryStale { reason, .. } => {
+                        EventResult::Stale(reason.clone())
+                    }
                     other => EventResult::Failed(other.to_string()),
                 };
-                tracing::warn!(
-                    target: "timeline.rebuild_certificate",
-                    sequence = event.sequence_number,
-                    error = %err,
-                    "feature failed to rebuild"
-                );
+                if matches!(result, EventResult::Stale(_)) {
+                    tracing::debug!(
+                        target: "timeline.rebuild_certificate",
+                        sequence = event.sequence_number,
+                        error = %err,
+                        "non-geometry event skipped; geometry unaffected, record is stale"
+                    );
+                } else {
+                    outcome.events_skipped += 1;
+                    tracing::warn!(
+                        target: "timeline.rebuild_certificate",
+                        sequence = event.sequence_number,
+                        error = %err,
+                        "feature failed to rebuild"
+                    );
+                }
                 per_event.insert(event.sequence_number, result);
             }
         }
@@ -252,6 +296,10 @@ pub fn certify_rebuild(
             Some(EventResult::Dangling(entity)) => FeatureStatus::Dangling {
                 entity: entity.clone(),
             },
+            // #31: a non-geometry document event — stale, not a break.
+            Some(EventResult::Stale(reason)) => FeatureStatus::Stale {
+                reason: reason.clone(),
+            },
             Some(EventResult::Ok) | None => {
                 if target_sequence.is_some() && !dirty.contains(&e.sequence_number) {
                     FeatureStatus::Unaffected
@@ -302,6 +350,14 @@ pub fn certify_rebuild(
     for v in verdicts.iter_mut() {
         if v.status.is_break() {
             continue; // a direct break keeps its specific status
+        }
+        // #31: a non-geometry, document-level event has no B-Rep replay arm — it
+        // is STALE by nature (a drawing derived from a part that broke is still a
+        // stale drawing, and regenerating it is a separate concern), never
+        // "Blocked". Keeping it Stale holds the honest distinction: only GEOMETRY
+        // features participate in error-propagates-downstream blocking.
+        if matches!(v.status, FeatureStatus::Stale { .. }) {
+            continue;
         }
         if let Some(&by) = blocked_by.get(&v.sequence) {
             v.status = FeatureStatus::Blocked { by_sequence: by };
@@ -461,6 +517,19 @@ mod tests {
                 "params": { "radius": radius, "edge_pids": [pid_dec] },
                 "inputs": [format!("solid:{solid}"), format!("edge:{edge}")],
                 "outputs": [format!("solid:{solid}")]
+            }),
+        )
+    }
+
+    /// A non-geometry, document-level event (`drawing.create_from_part`) — the
+    /// exact LIVE-bug kind. It has no B-Rep replay arm.
+    fn drawing_from_part(seq: u64, source_solid: u64) -> TimelineEvent {
+        generic(
+            "drawing.create_from_part",
+            seq,
+            json!({
+                "params": { "drawing_id": "d1", "source": format!("solid:{source_solid}") },
+                "inputs": [format!("solid:{source_solid}")], "outputs": []
             }),
         )
     }
@@ -681,6 +750,83 @@ mod tests {
             other => panic!("expected Blocked, got {other:?}"),
         }
         assert!(!cert.is_sound());
+    }
+
+    /// LIVE BUG (#31, found 2026-07-18 against :8081) — a full workflow
+    /// box → cylinder → boolean → **drawing**, then mould the cylinder radius.
+    /// The mould re-derives the geometry cleanly, but the timeline's non-geometry
+    /// `drawing.create_from_part` event has no B-Rep replay arm.
+    ///
+    /// Pre-fix signature (captured live):
+    ///   {"sequence":N,"kind":"drawing.create_from_part","status":"failed",
+    ///    "reason":"unknown operation kind: drawing.create_from_part"}, is_sound:false.
+    ///
+    /// The fix: that event is reported as a typed `Stale` verdict (the drawing now
+    /// reflects an OLDER part — a separate regen concern), and it must NOT drag
+    /// `is_sound` to false — the geometry (box/cylinder/boolean) is sound.
+    ///
+    /// Mutation proof (hand-revert 2026-07-18): in `replay.rs`, make the
+    /// dotted-namespace dispatch fallback return `UnknownKind` again (drop the
+    /// `non_geometry_stale` branch) — the drawing verdict reverts to `Failed` and
+    /// `is_sound` reverts to false; both assertions below fire. Restored → green.
+    #[test]
+    fn nongeometry_drawing_event_is_stale_not_failed_and_stays_sound() {
+        let events = vec![
+            box20(0, 1),
+            drill(1, 2, 3.0),
+            difference(2, 1, 2, 3),
+            drawing_from_part(3, 3),
+            mould(1, "radius", 4.0, 4),
+        ];
+        let (_m, cert) = certify_rebuild(&events, Some(1));
+        // The geometry is sound — the mould re-derived the boolean cleanly, and a
+        // stale drawing does not taint the re-measured B-Rep soundness.
+        assert!(
+            cert.is_sound(),
+            "a geometrically-fine mould stays sound despite a stale drawing: {:?}",
+            cert.first_break()
+        );
+        // The drawing event is typed STALE, never Failed.
+        match status_at(&cert, 3) {
+            FeatureStatus::Stale { .. } => {}
+            other => panic!("expected Stale for the non-geometry drawing event, got {other:?}"),
+        }
+        // A Stale verdict is not a break.
+        assert!(
+            cert.first_break().is_none(),
+            "a stale drawing is not a break"
+        );
+        // The geometry features still rebuilt.
+        assert_eq!(status_at(&cert, 1), &FeatureStatus::Rebuilt);
+        assert_eq!(status_at(&cert, 2), &FeatureStatus::Rebuilt);
+    }
+
+    /// HONESTY BOUNDARY (#31) — a genuinely-failing GEOMETRY event and a
+    /// non-replayable DRAWING event land in DIFFERENT verdict buckets: the
+    /// collapsed box is `Failed` (a real bad model → unsound), the drawing is
+    /// `Stale` (geometry-independent). The skip-and-mark-stale path must NOT
+    /// swallow real geometry failures.
+    #[test]
+    fn geometry_failure_and_nongeometry_drawing_land_in_different_buckets() {
+        let events = vec![
+            box20(0, 1),
+            drawing_from_part(1, 1),
+            // Collapse the box to a zero width → a real geometry rebuild failure.
+            mould(0, "width", 0.0, 2),
+        ];
+        let (_m, cert) = certify_rebuild(&events, Some(0));
+        // The collapsed box is a real geometry failure (Failed bucket).
+        match status_at(&cert, 0) {
+            FeatureStatus::Failed { .. } => {}
+            other => panic!("expected Failed for the collapsed box, got {other:?}"),
+        }
+        // The drawing is Stale, NOT Failed — the OTHER bucket.
+        match status_at(&cert, 1) {
+            FeatureStatus::Stale { .. } => {}
+            other => panic!("expected Stale for the drawing, got {other:?}"),
+        }
+        // A real geometry failure is still unsound — the skip did not paper over it.
+        assert!(!cert.is_sound(), "a collapsed box is not sound");
     }
 
     /// The certificate serialises to JSON for the REST/MCP surface with the

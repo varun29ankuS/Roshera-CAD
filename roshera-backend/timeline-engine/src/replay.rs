@@ -39,6 +39,11 @@
 //!   skipped with a structured error because the kernel currently records
 //!   profile *edges*, not the parent profile *face* — which is what the
 //!   replay would need. Tracking this as a future kernel-side fix.
+//! - Non-geometry, document-level events (dotted namespaces: `drawing.*`,
+//!   `gdt.*`, `label.*`, `export.*`, `part.*`, legacy `assembly.*` snapshots)
+//!   carry no B-Rep replay arm — they are classified as
+//!   [`ReplayError::NonGeometryStale`] (#31) so the rebuild certificate skips
+//!   them honestly (a `Stale` verdict) instead of failing soundness.
 //! - Anything else is logged via `tracing::warn!` and counted as
 //!   `events_skipped`. Replay never panics on an unknown kind.
 //!
@@ -117,6 +122,24 @@ pub enum ReplayError {
         kind: String,
         /// The reference that failed to resolve (e.g. `edge:7` or its PID).
         entity: String,
+    },
+
+    /// A non-geometry, document-level event — a dotted-namespace record such as
+    /// `drawing.*`, `gdt.*`, `label.*`, `export.*`, `part.*`, or a legacy
+    /// `assembly.*` snapshot — that carries NO B-Rep replay arm (#31). It is not
+    /// a geometry rebuild at all: the kernel state is untouched by it, so replay
+    /// SKIPS it honestly rather than counting it as a soundness `Failed`. In the
+    /// [`crate::rebuild_certificate`] this surfaces as a typed `Stale` verdict —
+    /// a drawing/annotation that now reflects an OLDER part after a mould is
+    /// STALE (regenerating it is a separate product concern, banked), NOT a
+    /// soundness failure of the geometry. Kept DISTINCT from [`Self::UnknownKind`],
+    /// which is an unrecognised GEOMETRY kind and IS a genuine replay failure.
+    #[error("non-geometry event skipped ({kind}): {reason}")]
+    NonGeometryStale {
+        /// The dotted event kind with no replay arm (e.g. `drawing.create_from_part`).
+        kind: String,
+        /// Why it was skipped (no B-Rep replay arm; the geometry is unaffected).
+        reason: String,
     },
 }
 
@@ -603,8 +626,11 @@ fn dispatch_assembly(
             Ok(())
         }
         // Legacy mate-centric surface kinds — no rebuildable payload (see
-        // the function doc). Honest skip, never a silent wrong answer.
-        unknown => Err(ReplayError::UnknownKind(unknown.to_string())),
+        // the function doc). Honest skip, never a silent wrong answer. These are
+        // dotted `assembly.*` kinds, so `fallback_error` classifies them as the
+        // non-geometry `NonGeometryStale` (#31) — a legacy assembly snapshot does
+        // not taint the geometry soundness of a rebuild certificate either.
+        unknown => Err(fallback_error(unknown)),
     }
 }
 
@@ -1397,7 +1423,7 @@ fn dispatch_generic(
             Ok(())
         }
 
-        unknown => Err(ReplayError::UnknownKind(unknown.to_string())),
+        unknown => Err(fallback_error(unknown)),
     }
 }
 
@@ -1468,6 +1494,30 @@ fn kernel_err<E: std::fmt::Display>(kind: &str, e: &E) -> ReplayError {
     ReplayError::KernelError {
         kind: kind.to_string(),
         message: e.to_string(),
+    }
+}
+
+/// Classify a kind that reached a dispatch fallback (#31). Document-level events
+/// live in a dotted namespace (`drawing.*`, `gdt.*`, `label.*`, `export.*`,
+/// `part.*`, legacy `assembly.*` snapshots), while every geometry kernel
+/// operation kind is underscore-cased and contains no `.` (`create_box_3d`,
+/// `boolean_difference`, `fillet_edges`, `sketch_extrude`, …). A dotted kind at
+/// a fallback is therefore a non-geometry event with no B-Rep replay arm —
+/// returned as a typed [`ReplayError::NonGeometryStale`] so the rebuild
+/// certificate can skip it honestly (a `Stale` verdict, not a soundness
+/// `Failed`). A non-dotted unknown is a genuine geometry replay failure and
+/// falls through to [`ReplayError::UnknownKind`]. (`param.*` metadata kinds
+/// never reach a fallback — they are folded out before dispatch by
+/// [`crate::mould::is_param_meta`].)
+fn fallback_error(kind: &str) -> ReplayError {
+    if kind.contains('.') {
+        ReplayError::NonGeometryStale {
+            kind: kind.to_string(),
+            reason: "no B-Rep replay arm; the geometry is unaffected, the document record is stale"
+                .to_string(),
+        }
+    } else {
+        ReplayError::UnknownKind(kind.to_string())
     }
 }
 
@@ -1898,6 +1948,37 @@ mod tests {
             .assemblies
             .get(&id)
             .is_some_and(|a| a.name == "legacy"));
+    }
+
+    #[test]
+    fn dotted_nongeometry_kind_is_nongeometrystale_not_unknown() {
+        // A non-geometry, document-level event (the LIVE-bug kind) has no B-Rep
+        // replay arm — it must surface as the typed `NonGeometryStale`, NOT the
+        // `UnknownKind` that a genuinely-unrecognised GEOMETRY op gets.
+        let mut model = BRepModel::new();
+        let mut assemblies = AssemblyStore::default();
+        let mut remap = HashMap::new();
+        let drawing = mk_event(
+            "drawing.create_from_part",
+            serde_json::json!({"params": {}, "inputs": [], "outputs": []}),
+        );
+        match apply_event(&mut model, &mut assemblies, &drawing, &mut remap) {
+            Err(ReplayError::NonGeometryStale { kind, .. }) => {
+                assert_eq!(kind, "drawing.create_from_part");
+            }
+            other => {
+                panic!("expected NonGeometryStale for a dotted non-geometry kind, got {other:?}")
+            }
+        }
+        // A non-dotted unrecognised kind is a genuine geometry replay failure.
+        let bogus = mk_event(
+            "totally_made_up_kind",
+            serde_json::json!({"params": {}, "inputs": [], "outputs": []}),
+        );
+        match apply_event(&mut model, &mut assemblies, &bogus, &mut remap) {
+            Err(ReplayError::UnknownKind(_)) => {}
+            other => panic!("expected UnknownKind for a non-dotted unknown kind, got {other:?}"),
+        }
     }
 
     #[test]
