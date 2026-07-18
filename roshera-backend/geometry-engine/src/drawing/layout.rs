@@ -1922,6 +1922,7 @@ mod tests {
             dir3: None,
             pid: None,
             datum: None,
+            tolerance: None,
         }
     }
 

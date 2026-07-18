@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
-use crate::primitives::surface::{Cylinder, Plane};
+use crate::primitives::surface::Plane;
 use crate::primitives::topology_builder::BRepModel;
 use crate::readable::bore_face_ids;
 

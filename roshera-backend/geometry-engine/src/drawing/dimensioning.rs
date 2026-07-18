@@ -66,6 +66,14 @@ pub struct Dimension2d {
     /// other kind. `#[serde(default)]` keeps older serialized drawings parsing.
     #[serde(default)]
     pub datum: Option<DatumDescriptor>,
+    /// Bound GD&T dimensional tolerance (campaign #55 Slice 4), joined from the
+    /// `GdtSidecar` by feature PID / face-set at build time. `Some` when a size
+    /// tolerance was authored on this dimension's feature; `None` for an
+    /// untoleranced dimension (readback then answers with the *general*
+    /// tolerance, explicitly labelled). `#[serde(default)]` keeps older
+    /// serialized drawings parsing.
+    #[serde(default)]
+    pub tolerance: Option<super::types::ToleranceRef>,
 }
 
 impl Dimension2d {
@@ -131,6 +139,8 @@ pub fn auto_dimensions(
             // Slice 1) — previously discarded at this view boundary.
             pid: d.pid,
             datum: d.datum,
+            // Tolerance is joined later by `attach_tolerances` (Slice 4).
+            tolerance: None,
         });
     }
     out
@@ -1009,6 +1019,13 @@ pub fn standard_drawing_auto(
     // per the spec.
     attach_gdt_annotations(model, solid_id, &mut drawing);
 
+    // ── Tolerance binding (campaign #55 Slice 4) ──────────────────────────────
+    // Join GD&T sidecar dimensional tolerances to the diameter callouts + hole
+    // rows by face-set, so a readback can answer "the toleranced diameter of the
+    // bore pattern" with limits + provenance (and honestly refuse fabricated
+    // limits for an unresolved ISO 286 fit class).
+    attach_tolerances(model, solid_id, &mut drawing);
+
     // ── Pictorial isometric coexistence (A4 ReplaceIso) ───────────────────────
     // On A4, SECTION A-A replaced the ISO cell entirely — but the sheet must
     // still carry the shaded isometric (Varun 2026-07-14: "I would add a
@@ -1477,6 +1494,86 @@ pub(crate) fn attach_gdt_annotations(
                 feature_pid: Some(format!("{:032x}", feature_pid.as_u128())),
                 annotation_index: Some(annotation_index),
             });
+        }
+    }
+}
+
+/// Join GD&T sidecar DIMENSIONAL tolerances to the sheet's diameter callouts and
+/// hole-table rows by PID / face-set (campaign #55 Slice 4).
+///
+/// A `GdtSidecar` `Annotation::Dimensional` is authored on a FEATURE persistent
+/// id; this resolves that PID to a live face and attaches the tolerance to every
+/// diameter dimension and hole row that names that face — the same face-set
+/// scoping [`attach_gdt_annotations`] uses. So "the toleranced diameter of the
+/// bore pattern" is answerable with limits + provenance.
+///
+/// Honesty: the limits come from
+/// [`DimensionalTolerance::limit_range`](crate::gdt::model::DimensionalTolerance::limit_range)
+/// — an unresolved ISO 286 `Fit` yields `limits: None` + `designation:
+/// Some("H7")`, never a fabricated numeric envelope.
+pub(crate) fn attach_tolerances(
+    model: &crate::primitives::topology_builder::BRepModel,
+    solid_id: crate::primitives::solid::SolidId,
+    drawing: &mut super::types::Drawing,
+) {
+    use super::types::ToleranceRef;
+    use crate::gdt::model::{Annotation, ToleranceBound};
+
+    // The drawn solid's face set (skip foreign-solid annotations, same as the
+    // GD&T bridge).
+    let drawn_faces: std::collections::HashSet<crate::primitives::face::FaceId> = {
+        let mut set = std::collections::HashSet::new();
+        if let Some(solid_data) = model.solids.get(solid_id) {
+            let mut shell_ids = vec![solid_data.outer_shell];
+            shell_ids.extend(solid_data.inner_shells.iter().copied());
+            for sid in shell_ids {
+                if let Some(shell) = model.shells.get(sid) {
+                    set.extend(shell.faces.iter().copied());
+                }
+            }
+        }
+        set
+    };
+
+    for (feature_pid, annotations) in model.gdt.iter() {
+        // Resolve the feature PID to a live face; dangling → nothing to join.
+        let Some(face_id) = model.face_by_pid(feature_pid) else {
+            continue;
+        };
+        if !drawn_faces.contains(&face_id) {
+            continue;
+        }
+        for (annotation_index, ann) in annotations.iter().enumerate() {
+            let Annotation::Dimensional(dt) = ann else {
+                continue;
+            };
+            let (kind, designation) = match &dt.bound {
+                ToleranceBound::PlusMinus { .. } => ("plus_minus", None),
+                ToleranceBound::Limits { .. } => ("limits", None),
+                ToleranceBound::Fit(fc) => ("fit", Some(fc.designation.clone())),
+            };
+            let tref = ToleranceRef {
+                feature_pid: Some(format!("{:032x}", feature_pid.as_u128())),
+                annotation_index,
+                kind: kind.to_string(),
+                nominal: dt.nominal,
+                limits: dt.limit_range().map(|(lo, hi)| [lo, hi]),
+                designation,
+            };
+            // Diameter callouts naming this face.
+            for view in &mut drawing.views {
+                for dim in &mut view.dimensions {
+                    if dim.kind == "diameter" && dim.entities.contains(&face_id) {
+                        dim.tolerance = Some(tref.clone());
+                    }
+                }
+            }
+            // Hole-table rows naming this face.
+            for hole in &mut drawing.hole_sites {
+                if hole.face_entities.contains(&face_id) {
+                    hole.tolerance = Some(tref.clone());
+                }
+            }
         }
     }
 }

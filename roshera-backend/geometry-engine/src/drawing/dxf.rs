@@ -1236,6 +1236,7 @@ mod tests {
                     dir3: None,
                     pid: None,
                     datum: None,
+                    tolerance: None,
                 },
                 Dimension2d {
                     id: "h".to_string(),
@@ -1250,6 +1251,7 @@ mod tests {
                     dir3: None,
                     pid: None,
                     datum: None,
+                    tolerance: None,
                 },
             ],
             centerlines: Vec::new(),

@@ -75,6 +75,7 @@ fn dim(label: &str, a: [f64; 2], b: [f64; 2]) -> Dimension2d {
         dir3: None,
         pid: None,
         datum: None,
+        tolerance: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn dim_with_entities(
         dir3: None,
         pid: None,
         datum: None,
+        tolerance: None,
     }
 }
 
@@ -581,6 +583,7 @@ fn dimension_label_collision_flagged() {
                 dir3: None,
                 pid: None,
                 datum: None,
+                tolerance: None,
             },
             Dimension2d {
                 id: "angle_b".to_string(),
@@ -595,6 +598,7 @@ fn dimension_label_collision_flagged() {
                 dir3: None,
                 pid: None,
                 datum: None,
+                tolerance: None,
             },
         ],
     ));
@@ -654,6 +658,7 @@ fn dimension_on_geometry_flagged() {
             dir3: None,
             pid: None,
             datum: None,
+            tolerance: None,
         }],
     ));
     let report = verify_drawing(&d);
@@ -1168,6 +1173,7 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         dir3: None,
         pid: None,
         datum: None,
+        tolerance: None,
     };
 
     let mut d = Drawing::new("TagCollision", SheetSize::A3);
@@ -1206,6 +1212,7 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         axial_centre: Some([60.0, -30.0]),
         face_entities: vec![99],
         datum: None,
+        tolerance: None,
     }];
 
     let report = verify_drawing(&d);
@@ -1933,6 +1940,7 @@ fn hole_table_on_dimension_text_fires_collision() {
         dir3: None,
         pid: None,
         datum: None,
+        tolerance: None,
     };
 
     let mut d = Drawing::new("TableCollision", SheetSize::A4);
@@ -1969,6 +1977,7 @@ fn hole_table_on_dimension_text_fires_collision() {
         axial_centre: Some([10.0, 10.0]),
         face_entities: vec![7],
         datum: None,
+        tolerance: None,
     }];
 
     let report = verify_drawing(&d);

@@ -593,6 +593,40 @@ impl GeneralTolerance {
     }
 }
 
+/// A reference from a sheet dimension / hole-table row to the GD&T sidecar
+/// dimensional tolerance bound to its feature (campaign #55 Slice 4).
+///
+/// The join is by PID/face-set intersection at build time (the same face
+/// scoping `attach_gdt_annotations` does): a `GdtSidecar`
+/// `Annotation::Dimensional` authored on a bore face is attached to the sheet's
+/// diameter callout and hole-table row for that bore, so "the toleranced
+/// diameter of the bore pattern" is answerable with limits + provenance.
+///
+/// **Honesty (inherited from `DimensionalTolerance::limit_range`):** an
+/// unresolved ISO 286 `Fit` class yields `limits: None` with `designation:
+/// Some("H7")` — the numeric envelope is NOT fabricated; readback reports the
+/// designation and refuses to invent limits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToleranceRef {
+    /// Hex-encoded `PersistentId` of the toleranced feature (same encoding as
+    /// `PlacedFcfBlock::feature_pid`), so a readback can re-resolve it live.
+    #[serde(default)]
+    pub feature_pid: Option<String>,
+    /// Index of this tolerance within the feature's sidecar annotation list.
+    pub annotation_index: usize,
+    /// The authored bound kind: `"plus_minus"`, `"limits"`, or `"fit"`.
+    pub kind: String,
+    /// The nominal (basic) size in millimetres.
+    pub nominal: f64,
+    /// Resolved absolute `[lower, upper]` size limits in millimetres. `None`
+    /// ONLY for an unresolved ISO 286 fit class — never a fabricated envelope.
+    #[serde(default)]
+    pub limits: Option<[f64; 2]>,
+    /// Fit designation (e.g. `"H7"`, `"g6"`) when `kind == "fit"`; else `None`.
+    #[serde(default)]
+    pub designation: Option<String>,
+}
+
 /// A drawing document — a collection of [`ProjectedView`]s on a single
 /// sheet.
 #[derive(Debug, Clone, Serialize, Deserialize)]

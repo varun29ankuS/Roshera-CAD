@@ -46,7 +46,7 @@ use crate::readable::{extract_dimensions, DatumDescriptor, DimensionRecord};
 
 use super::hole_table::HoleSite;
 use super::section_comprehension::{section_cut_through, SectionCutKind, SectionCutThrough};
-use super::types::{Drawing, SectionSemantics, ViewSource};
+use super::types::{Drawing, ViewSource};
 use super::verify::{verify_drawing, DrawingQualityReport};
 
 /// Consistency oracle for a sheet dimension's live re-measurement, in kernel
@@ -152,6 +152,13 @@ pub struct SheetFact {
     pub face_ids: Vec<u32>,
     /// Reference datum, when the fact carries one (position dims, hole rows).
     pub datum: Option<DatumDescriptor>,
+    /// Bound GD&T dimensional tolerance (campaign #55 Slice 4), when this fact's
+    /// feature carries one — the join that makes "the toleranced diameter" a
+    /// certified answer. `None` for an untoleranced fact (readback falls back to
+    /// the sheet's general tolerance, explicitly labelled). `#[serde(default)]`
+    /// keeps Slice-2 certificates deserializing.
+    #[serde(default)]
+    pub tolerance: Option<super::types::ToleranceRef>,
     /// The live re-measurement + verdict.
     pub live: LiveCheck,
 }
@@ -449,6 +456,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                 pid: dim.pid.clone(),
                 face_ids: dim.entities.clone(),
                 datum: dim.datum.clone(),
+                tolerance: dim.tolerance.clone(),
                 live,
             });
         }
@@ -463,6 +471,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                 pid: None,
                 face_ids: Vec::new(),
                 datum: None,
+                tolerance: None,
                 live: LiveCheck {
                     measured: None,
                     deviation: None,
@@ -481,6 +490,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                 pid: None,
                 face_ids: Vec::new(),
                 datum: None,
+                tolerance: None,
                 live: LiveCheck {
                     measured: None,
                     deviation: None,
@@ -502,6 +512,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
             pid: None,
             face_ids: hole.face_entities.clone(),
             datum: hole.datum.clone(),
+            tolerance: hole.tolerance.clone(),
             live,
         });
     }
@@ -518,6 +529,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
             pid: fcf.feature_pid.clone(),
             face_ids: Vec::new(),
             datum: None,
+            tolerance: None,
             live,
         });
     }
@@ -534,6 +546,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
             pid: ds.feature_pid.clone(),
             face_ids: Vec::new(),
             datum: None,
+            tolerance: None,
             live,
         });
     }
@@ -561,6 +574,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
             pid: None,
             face_ids: Vec::new(),
             datum: None,
+            tolerance: None,
             live,
         });
         section_cuts = ct;
@@ -586,6 +600,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
             pid: None,
             face_ids: Vec::new(),
             datum: None,
+            tolerance: None,
             live: LiveCheck {
                 measured: None,
                 deviation: None,
@@ -883,6 +898,116 @@ mod tests {
             "a re-drilled bore must make the section stale: {sec_b:?}"
         );
         assert!(!cert_b.sound, "a stale section makes the sheet unsound");
+    }
+
+    // ── Slice 4: tolerance binding ────────────────────────────────────────────
+
+    /// Build a 40×40×20 plate with a Ø10 THROUGH bore, ensure the bore face
+    /// carries a PID, and return `(model, part, bore_face_id, bore_pid)`.
+    fn bored_plate_with_bore_pid() -> (BRepModel, SolidId, u32, PersistentId) {
+        use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+        use crate::readable::bore_face_ids;
+        let mut m = BRepModel::new();
+        let plate = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 40.0, 20.0)
+            .expect("plate"));
+        let bore = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -20.0), Vector3::Z, 5.0, 80.0)
+            .expect("bore"));
+        let part = boolean_operation(
+            &mut m,
+            plate,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("difference");
+        let bore_fid = *bore_face_ids(&m, part).iter().next().expect("a bore face");
+        // Ensure the bore face resolves by PID (seed one if the boolean did not
+        // mint lineage) so an annotation can be authored on it.
+        let pid = m.face_pids.get(&bore_fid).copied().unwrap_or_else(|| {
+            let p = PersistentId::root(b"slice4-bore-face");
+            m.face_pids.insert(bore_fid, p);
+            m.pid_to_face.insert(p, bore_fid);
+            p
+        });
+        (m, part, bore_fid, pid)
+    }
+
+    /// A Ø±0.05 size tolerance authored on the bore face is JOINED to the sheet's
+    /// hole row — "the toleranced diameter of the bore" answers with resolved
+    /// limits + provenance.
+    #[test]
+    fn bore_diameter_carries_authored_tolerance_limits() {
+        use crate::drawing::dimensioning::standard_drawing_auto;
+        use crate::gdt::model::{Annotation, DimensionalTolerance};
+
+        let (mut m, part, _bore_fid, pid) = bored_plate_with_bore_pid();
+        m.gdt.attach(
+            pid,
+            Annotation::Dimensional(DimensionalTolerance::symmetric(10.0, 0.05)),
+        );
+        let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+
+        // The hole row must now carry the tolerance with resolved limits.
+        let hole = drawing
+            .hole_sites
+            .iter()
+            .find(|h| h.tolerance.is_some())
+            .expect("a hole row must carry the authored tolerance");
+        let tref = hole.tolerance.as_ref().expect("tolerance");
+        assert_eq!(tref.kind, "plus_minus");
+        assert!(
+            tref.feature_pid.is_some(),
+            "tolerance names its feature PID"
+        );
+        let [lo, hi] = tref.limits.expect("plus_minus resolves numeric limits");
+        assert!(
+            (lo - 9.95).abs() < 1e-6 && (hi - 10.05).abs() < 1e-6,
+            "Ø10 ±0.05 must resolve to [9.95, 10.05]: {tref:?}"
+        );
+
+        // And the certificate's Hole fact surfaces it.
+        let cert = certify_drawing(&m, &drawing);
+        let hole_fact = cert
+            .facts
+            .iter()
+            .find(|f| f.kind == SheetFactKind::Hole && f.tolerance.is_some())
+            .expect("hole fact carries tolerance");
+        assert!(hole_fact.tolerance.as_ref().unwrap().limits.is_some());
+    }
+
+    /// An ISO 286 `H7` FIT class must answer *designation without limits* — the
+    /// numeric envelope is NOT fabricated (the honesty pass-through of
+    /// `DimensionalTolerance::limit_range`).
+    #[test]
+    fn fit_class_tolerance_refuses_fabricated_limits() {
+        use crate::drawing::dimensioning::standard_drawing_auto;
+        use crate::gdt::model::{Annotation, DimensionalTolerance};
+
+        let (mut m, part, _bore_fid, pid) = bored_plate_with_bore_pid();
+        m.gdt.attach(
+            pid,
+            Annotation::Dimensional(DimensionalTolerance::fit(10.0, "H7")),
+        );
+        let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+
+        let hole = drawing
+            .hole_sites
+            .iter()
+            .find(|h| h.tolerance.is_some())
+            .expect("hole row carries the fit tolerance");
+        let tref = hole.tolerance.as_ref().expect("tolerance");
+        assert_eq!(tref.kind, "fit");
+        assert_eq!(
+            tref.designation.as_deref(),
+            Some("H7"),
+            "fit designation is disclosed: {tref:?}"
+        );
+        assert!(
+            tref.limits.is_none(),
+            "an unresolved fit must NOT fabricate numeric limits: {tref:?}"
+        );
     }
 
     /// The raster pictorial is refused (`render_only`) — the certificate never

@@ -104,6 +104,14 @@ pub struct HoleSite {
     /// no position record carried a datum (e.g. a diagonal-axis bore).
     #[serde(default)]
     pub datum: Option<DatumDescriptor>,
+    /// Bound GD&T dimensional tolerance (campaign #55 Slice 4), joined from the
+    /// `GdtSidecar` by feature PID / face-set at build time, so "the toleranced
+    /// diameter of the bore pattern" is answerable with limits + provenance.
+    /// `None` for an untoleranced bore (readback then answers with the general
+    /// tolerance, explicitly labelled). `#[serde(default)]` keeps older
+    /// serialized drawings parsing.
+    #[serde(default)]
+    pub tolerance: Option<crate::drawing::types::ToleranceRef>,
 }
 
 // ── Group key ─────────────────────────────────────────────────────────────────
@@ -363,6 +371,8 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             axial_centre: None, // filled by the drawing layer
             face_entities: s.face_entities.clone(),
             datum: s.datum.clone(),
+            // Bound GD&T dimensional tolerance joined later by `attach_tolerances`.
+            tolerance: None,
         });
     }
 
@@ -601,6 +611,7 @@ mod tests {
             dir3: None,
             pid: None,
             datum: None,
+            tolerance: None,
         }
     }
 
