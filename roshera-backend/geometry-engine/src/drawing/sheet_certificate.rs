@@ -39,13 +39,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::math::{Point3, Tolerance, Vector3};
-use crate::operations::section::section_solid_by_plane;
 use crate::primitives::persistent_id::PersistentId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::readable::{extract_dimensions, DatumDescriptor, DimensionRecord};
 
+use super::hole_table::HoleSite;
+use super::section_comprehension::{section_cut_through, SectionCutKind, SectionCutThrough};
 use super::types::{Drawing, SectionSemantics, ViewSource};
 use super::verify::{verify_drawing, DrawingQualityReport};
 
@@ -203,6 +203,13 @@ pub struct SheetReadbackCertificate {
     /// The layout-quality report (the existing 2D perception oracle), embedded
     /// so one certificate covers readability + truth.
     pub quality: DrawingQualityReport,
+    /// The ordered SECTION A-A cut-through list (campaign #55 Slice 3), derived
+    /// live against the model: what the section plane passes through (bores with
+    /// their tags, outer walls, interior webs) in reading order. `None` when the
+    /// sheet carries no section. `#[serde(default)]` keeps Slice-2 certificates
+    /// (no cut-through) deserializing.
+    #[serde(default)]
+    pub section_cuts: Option<SectionCutThrough>,
 }
 
 impl SheetReadbackCertificate {
@@ -324,35 +331,80 @@ fn pid_resolve_check(model: &BRepModel, feature_pid: &Option<String>) -> LiveChe
     }
 }
 
-/// Live-check the SECTION cutting plane: does it still cut material on the live
-/// model? An empty section means the plane no longer intersects the solid — the
-/// geometry moved out from under the sheet (`stale`).
+/// Live diameter of a bore from its (analytic) cylindrical face — `2·radius`,
+/// read straight off the surface, never the span or the mesh. `None` when no
+/// face id resolves to a cylinder.
+fn live_bore_diameter(model: &BRepModel, face_ids: &[u32]) -> Option<f64> {
+    use crate::primitives::surface::Cylinder;
+    for &fid in face_ids {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
+            return Some(cyl.radius * 2.0);
+        }
+    }
+    None
+}
+
+/// Live-check the SECTION cutting plane against the derived cut-through list
+/// (campaign #55 Slice 3). Three ways a section goes stale:
+/// - the solid id no longer resolves (`dangling`);
+/// - the plane no longer passes through ANY material — the geometry moved out
+///   from under the sheet (`stale`);
+/// - a bore the plane crosses re-measures to a diameter that no longer matches
+///   the sheet's hole table — the bore was re-drilled after the sheet was built
+///   (`stale`).
+///
+/// Otherwise `consistent`. The `measured` field carries the count of cut faces
+/// so a reader sees the section is non-empty.
 fn section_live_check(
     model: &BRepModel,
     solid_id: Option<SolidId>,
-    sec: &SectionSemantics,
+    cut_through: &SectionCutThrough,
+    hole_sites: &[HoleSite],
 ) -> LiveCheck {
-    let Some(solid) = solid_id else {
+    if solid_id.is_none() {
         return LiveCheck {
             measured: None,
             deviation: None,
             verdict: SheetVerdict::Dangling,
         };
-    };
-    let origin = Point3::new(sec.origin[0], sec.origin[1], sec.origin[2]);
-    let normal = Vector3::new(sec.normal[0], sec.normal[1], sec.normal[2]);
-    let hits = matches!(
-        section_solid_by_plane(model, solid, origin, normal, Tolerance::default()),
-        Ok(ref caps) if !caps.is_empty()
-    );
+    }
+    if cut_through.is_empty() {
+        return LiveCheck {
+            measured: Some(0.0),
+            deviation: None,
+            verdict: SheetVerdict::Stale,
+        };
+    }
+    // Re-drill detection: every tagged bore the plane crosses must still match
+    // the sheet's hole-table diameter within the dimensioning oracle.
+    for cut in &cut_through.cuts {
+        if cut.kind != SectionCutKind::Bore {
+            continue;
+        }
+        let Some(tag) = &cut.hole_tag else { continue };
+        let Some(site) = hole_sites.iter().find(|h| &h.tag == tag) else {
+            continue;
+        };
+        if let Some(live_dia) = live_bore_diameter(model, &cut.face_ids) {
+            if (live_dia - site.diameter_mm).abs() > CERT_DIM_ORACLE_MM {
+                return LiveCheck {
+                    measured: Some(live_dia),
+                    deviation: Some((live_dia - site.diameter_mm).abs()),
+                    verdict: SheetVerdict::Stale,
+                };
+            }
+        }
+    }
     LiveCheck {
-        measured: None,
+        measured: Some(cut_through.cuts.len() as f64),
         deviation: None,
-        verdict: if hits {
-            SheetVerdict::Consistent
-        } else {
-            SheetVerdict::Stale
-        },
+        verdict: SheetVerdict::Consistent,
     }
 }
 
@@ -486,9 +538,20 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
         });
     }
 
-    // ── Section plane ─────────────────────────────────────────────────────────
+    // ── Section plane + cut-through (Slice 3) ─────────────────────────────────
+    let mut section_cuts: Option<SectionCutThrough> = None;
     if let Some(sec) = &drawing.section {
-        let live = section_live_check(model, solid_id, sec);
+        let ct = solid_id.map(|s| section_cut_through(model, s, sec, &drawing.hole_sites));
+        let live = match &ct {
+            Some(cut_through) => {
+                section_live_check(model, solid_id, cut_through, &drawing.hole_sites)
+            }
+            None => LiveCheck {
+                measured: None,
+                deviation: None,
+                verdict: SheetVerdict::Dangling,
+            },
+        };
         facts.push(SheetFact {
             kind: SheetFactKind::Section,
             owner_view: Some(sec.section_view_idx),
@@ -500,6 +563,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
             datum: None,
             live,
         });
+        section_cuts = ct;
     }
 
     // ── Structured note: document unit + general tolerance ────────────────────
@@ -541,6 +605,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
         counts,
         sound,
         quality,
+        section_cuts,
     }
 }
 
@@ -551,6 +616,7 @@ mod tests {
     use crate::drawing::types::{
         Drawing, ProjectedView, ProjectedViewId, ProjectionType, SheetSize, ViewExtent,
     };
+    use crate::math::{Point3, Vector3};
     use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
 
     fn sid(g: GeometryId) -> SolidId {
@@ -741,6 +807,82 @@ mod tests {
             .expect("Ø20 fact");
         assert!(dia.pid.is_none(), "PID-less feature has no PID");
         assert_eq!(dia.live.verdict, SheetVerdict::Unprovenanced);
+    }
+
+    /// SLICE 3: a sheet's SECTION certifies its cut-through list, and a bore
+    /// RE-DRILLED larger after the sheet was built flips the Section fact to
+    /// `stale` (the plane still cuts material, but the bore diameter moved).
+    #[test]
+    fn re_drilled_bore_makes_section_stale() {
+        use crate::drawing::dimensioning::standard_drawing_auto;
+        use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+
+        // Build a plate with a Ø10 THROUGH bore, then its standard sheet — this
+        // populates the hole table AND attaches SECTION A-A through the bore.
+        fn bored_plate(radius: f64) -> (BRepModel, SolidId) {
+            let mut m = BRepModel::new();
+            m.set_event_key(Some("plate-bore".to_string()));
+            let plate = sid(TopologyBuilder::new(&mut m)
+                .create_box_3d(40.0, 40.0, 20.0)
+                .expect("plate"));
+            let bore = sid(TopologyBuilder::new(&mut m)
+                .create_cylinder_3d(Point3::new(0.0, 0.0, -20.0), Vector3::Z, radius, 80.0)
+                .expect("bore"));
+            let part = boolean_operation(
+                &mut m,
+                plate,
+                bore,
+                BooleanOp::Difference,
+                BooleanOptions::default(),
+            )
+            .expect("difference");
+            m.set_event_key(None);
+            (m, part)
+        }
+
+        let (m_a, s_a) = bored_plate(5.0);
+        let drawing = standard_drawing_auto(&m_a, s_a, uuid::Uuid::nil()).expect("sheet");
+        assert!(
+            drawing.section.is_some(),
+            "a bored plate must carry SECTION A-A"
+        );
+
+        // Fresh: section consistent, cut-through lists the bore.
+        let cert_a = certify_drawing(&m_a, &drawing);
+        let sec_a = cert_a
+            .facts
+            .iter()
+            .find(|f| f.kind == SheetFactKind::Section)
+            .expect("section fact");
+        assert_eq!(
+            sec_a.live.verdict,
+            SheetVerdict::Consistent,
+            "fresh section must be consistent: {sec_a:?}"
+        );
+        let ct = cert_a
+            .section_cuts
+            .as_ref()
+            .expect("cut-through present on a sectioned sheet");
+        assert!(
+            ct.cuts.iter().any(|c| c.kind == SectionCutKind::Bore),
+            "cut-through must list the bore: {ct:?}"
+        );
+
+        // Re-drill: same construction/lineage, bore now Ø16. Certify the ORIGINAL
+        // sheet (still says Ø10) against the widened model.
+        let (m_b, _s_b) = bored_plate(8.0);
+        let cert_b = certify_drawing(&m_b, &drawing);
+        let sec_b = cert_b
+            .facts
+            .iter()
+            .find(|f| f.kind == SheetFactKind::Section)
+            .expect("section fact");
+        assert_eq!(
+            sec_b.live.verdict,
+            SheetVerdict::Stale,
+            "a re-drilled bore must make the section stale: {sec_b:?}"
+        );
+        assert!(!cert_b.sound, "a stale section makes the sheet unsound");
     }
 
     /// The raster pictorial is refused (`render_only`) — the certificate never
