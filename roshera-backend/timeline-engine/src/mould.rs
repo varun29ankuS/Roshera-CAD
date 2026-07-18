@@ -269,6 +269,14 @@ impl OverrideSet {
         self.resolved.is_empty()
     }
 
+    /// The earliest event sequence any override targets — the incremental
+    /// rebuild's dirty-prefix boundary (#64 Slice 4). Every event strictly
+    /// below this cannot observe any override (producers precede consumers), so
+    /// its replayed state is reusable. `None` when no override is present.
+    pub fn min_target_sequence(&self) -> Option<u64> {
+        self.resolved.keys().map(|(seq, _)| *seq).min()
+    }
+
     /// The overriding value for a specific `(sequence, parameter)`, if any.
     pub fn value_for(&self, sequence: u64, parameter: &str) -> Option<f64> {
         self.resolved

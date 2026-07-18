@@ -26,6 +26,7 @@ pub mod dependency_graph;
 pub mod dependency_projection;
 pub mod entity_mapping;
 pub mod execution;
+pub mod incremental;
 pub mod mould;
 pub mod operations;
 pub mod recorder_bridge;
@@ -41,6 +42,9 @@ pub use dependency_graph::DependencyGraph;
 pub use dependency_projection::build_dependency_graph;
 pub use error::{TimelineError, TimelineResult};
 pub use execution::{ExecutionConfig, ExecutionEngine, OperationImpl};
+pub use incremental::{
+    incremental_rebuild, incremental_rebuild_verified, IncrementalStats, ModelDigest, PrefixCache,
+};
 pub use mould::{
     is_param_meta, mould_operation, name_binding_operation, params_have_numeric, NameBindings,
     OverrideSet, MOULD_COMMAND, NAME_COMMAND,
