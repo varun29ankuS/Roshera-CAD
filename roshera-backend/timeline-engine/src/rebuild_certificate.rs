@@ -427,6 +427,44 @@ mod tests {
         id
     }
 
+    /// The first open box edge id AND its canonical persistent-id, read from a
+    /// replay of `events`. Proves #27's primitive edge-PID minting reaches the
+    /// timeline replay path (a box edge carries a PID after `rebuild_model_from_
+    /// events`, which it did NOT before this campaign).
+    fn a_box_edge_with_pid(events: &[TimelineEvent]) -> (u32, String) {
+        let mut m = BRepModel::new();
+        rebuild_model_from_events(&mut m, events);
+        let (id, _) = m
+            .edges
+            .iter()
+            .find(|(_, e)| !e.is_loop())
+            .expect("box has open edges");
+        let pid = m
+            .edge_pid(id)
+            .expect("#27: a primitive box edge carries a PID after replay");
+        (id, pid.as_u128().to_string())
+    }
+
+    /// A fillet event that records the durable edge PID (`edge_pids`), the #27
+    /// shape the kernel now emits — so replay binds the edge by PID.
+    fn fillet_with_pid(
+        seq: u64,
+        solid: u64,
+        edge: u32,
+        pid_dec: &str,
+        radius: f64,
+    ) -> TimelineEvent {
+        generic(
+            "fillet_edges",
+            seq,
+            json!({
+                "params": { "radius": radius, "edge_pids": [pid_dec] },
+                "inputs": [format!("solid:{solid}"), format!("edge:{edge}")],
+                "outputs": [format!("solid:{solid}")]
+            }),
+        )
+    }
+
     fn status_at(cert: &RebuildCertificate, seq: u64) -> &FeatureStatus {
         &cert
             .verdicts
@@ -512,12 +550,13 @@ mod tests {
     /// consumed (no longer resolves) surfaces a TYPED `Dangling` verdict, not a
     /// silent wrong-edge fillet nor an opaque failure, and the model is unsound.
     ///
-    /// Mutation proof (hand-reverted 2026-07-18): delete the `check_edges_resolve`
-    /// call from the `fillet_edges` replay dispatch — the fillet then dies as a
-    /// generic kernel error and this feature's status becomes `Failed{..}`
-    /// instead of `Dangling{edge:…}`; the `Dangling` assertion fires. Restored →
-    /// green. (This is exactly the silent-retarget hole the slice-2-3 report
-    /// flagged: transient-id blend binding with no dangling surfacing.)
+    /// Mutation proof (hand-reverted 2026-07-18): drop the `bind_blend_edges`
+    /// call from the `fillet_edges` replay dispatch (pass the raw remapped edge
+    /// ids straight to `fillet_edges`) — the fillet then dies as a generic kernel
+    /// error and this feature's status becomes `Failed{..}` instead of
+    /// `Dangling{edge:…}`; the `Dangling` assertion fires. Restored → green.
+    /// (This is exactly the silent-retarget hole the slice-2-3 report flagged:
+    /// transient-id blend binding with no dangling surfacing.)
     #[test]
     fn decision_d_consumed_edge_reference_is_reported_dangling() {
         // A box, then a fillet naming an edge id that does not exist (stands in
@@ -534,6 +573,84 @@ mod tests {
             other => panic!("expected Dangling, got {other:?}"),
         }
         assert!(!cert.is_sound(), "a dangling reference is not sound");
+    }
+
+    /// #27 CLOSING GATE (follow-by-PID) — the #64 mould case slice 5 could NOT
+    /// cover: a fillet on a PRIMITIVE box edge, recorded WITH the edge's durable
+    /// persistent-id, FOLLOWS the edge by PID across a box-WIDTH mould and
+    /// re-measures sound. Distinct from Gate A: there the edge was bound by its
+    /// transient id (which happens to be replay-stable for a width mould); here
+    /// the fillet binds through `edge_by_pid` on the recorded PID — the box edge
+    /// only carries a PID because #27 mints primitive edge PIDs.
+    #[test]
+    fn edge_pid_closing_gate_fillet_follows_a_primitive_box_edge_by_pid() {
+        let base = vec![box20(0, 1)];
+        let (edge, pid) = a_box_edge_with_pid(&base);
+        let events = vec![
+            box20(0, 1),
+            fillet_with_pid(1, 1, edge, &pid, 1.0),
+            mould(0, "width", 30.0, 2),
+        ];
+        // Sanity: the PID-bound fillet builds before the mould.
+        let (_m0, cert0) = certify_rebuild(&events[..2], None);
+        assert!(
+            cert0.is_sound(),
+            "box→(PID-bound fillet) is sound before the mould: {:?}",
+            cert0.first_break()
+        );
+        // After the width mould the box rebuilds under the same event key → the
+        // box edge re-derives the SAME canonical PID → `edge_by_pid` resolves →
+        // the fillet follows the widened edge and re-measures sound.
+        let (_m, cert) = certify_rebuild(&events, Some(0));
+        assert!(
+            cert.is_sound(),
+            "the PID-bound fillet follows the widened box edge and re-measures sound: {:?}",
+            cert.first_break()
+        );
+        assert_eq!(
+            status_at(&cert, 1),
+            &FeatureStatus::Rebuilt,
+            "the fillet rebuilt on the PID-resolved edge"
+        );
+    }
+
+    /// #27 CLOSING GATE (silent-renumber caught by PID) — a fillet references a
+    /// LIVE box edge by its transient id BUT records a persistent-id that no
+    /// longer resolves (standing in for a topology-changing mould that silently
+    /// RENUMBERED the edge — the transient id now names a *different* live edge).
+    /// With #27 PID binding this is caught as a typed `Dangling{edge-pid:…}`
+    /// verdict + unsound, instead of the fillet silently binding the WRONG live
+    /// edge (which transient-only binding would have done — a lie the whole-model
+    /// soundness backstop only sometimes catches).
+    ///
+    /// Mutation proof (hand-reverted 2026-07-18): replace the `bind_blend_edges`
+    /// call in the `fillet_edges` replay dispatch with the raw remapped edge ids —
+    /// the transient edge is LIVE, so the fillet proceeds on the wrong edge and
+    /// the status is `Rebuilt`, not `Dangling`; this assertion fires. Restored →
+    /// green.
+    #[test]
+    fn edge_pid_closing_gate_silent_renumber_is_caught_by_pid_mismatch() {
+        let base = vec![box20(0, 1)];
+        // A genuinely LIVE box edge — transient-only binding would fillet it.
+        let edge = a_box_edge(&base);
+        // …but the recorded durable name does not resolve (a PID no real edge
+        // carries), the signature of an edge that was renumbered out from under
+        // the reference.
+        let events = vec![box20(0, 1), fillet_with_pid(1, 1, edge, "1", 1.0)];
+        let (_m, cert) = certify_rebuild(&events, Some(0));
+        match status_at(&cert, 1) {
+            FeatureStatus::Dangling { entity } => {
+                assert!(
+                    entity.contains("edge-pid:1"),
+                    "names the dangling durable PID, not a wrong live edge: {entity}"
+                );
+            }
+            other => panic!("expected Dangling by PID mismatch, got {other:?}"),
+        }
+        assert!(
+            !cert.is_sound(),
+            "a PID-mismatch dangling reference is not sound"
+        );
     }
 
     /// Blocked propagation — a feature downstream of a broken/dangling feature is

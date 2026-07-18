@@ -1077,15 +1077,17 @@ fn dispatch_generic(
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let solid = remap_id(solid_raw, id_remap) as SolidId;
-            // #64 Slice 5 (Decision d): PID-through-the-ladder reference binding.
-            // Before filleting, confirm every referenced edge still resolves to a
-            // live entity. An upstream parameter edit that changed topology can
-            // consume/renumber the edge this fillet named; if the remapped id no
-            // longer exists, surface a TYPED DanglingReference (enriched with the
-            // edge's PID when it carries one — extrude/revolve side edges do) so
-            // the rebuild certificate reports `Dangling` rather than filleting a
-            // wrong edge silently or dying as an opaque kernel error.
-            check_edges_resolve(model, kind, &edge_ids)?;
+            // #64 Slice 5 (Decision d) + #27 edge-PID close-out: bind each
+            // referenced edge to a live entity by its DURABLE persistent-id (the
+            // Kripac name recorded at authoring time), preferring it over the
+            // transient remap. Primitive + boolean edges now carry PIDs, so a
+            // blend on such an edge FOLLOWS it by PID across a mould, and a
+            // topology-changing mould that renumbered/consumed the named edge is
+            // caught as a typed DanglingReference (its PID no longer resolves)
+            // instead of filleting a wrong edge silently. Edges without a
+            // recorded PID fall back to the transient-remap liveness check.
+            let recorded_pids = parse_recorded_edge_pids(inner);
+            let edge_ids = bind_blend_edges(model, kind, &edge_ids, &recorded_pids)?;
             // Prefer the structured `radius` field added in 2026-05-10;
             // fall back to parsing the Debug-formatted `fillet_type`
             // string for events recorded by older builds. Final fallback
@@ -1132,9 +1134,11 @@ fn dispatch_generic(
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let solid = remap_id(solid_raw, id_remap) as SolidId;
-            // #64 Slice 5 (Decision d): typed DanglingReference if a referenced
-            // edge no longer resolves after an upstream mould (see fillet_edges).
-            check_edges_resolve(model, kind, &edge_ids)?;
+            // #64 Slice 5 (Decision d) + #27: bind by durable edge-PID, following
+            // the edge across a mould and reporting a typed DanglingReference when
+            // it was renumbered/consumed (see fillet_edges above).
+            let recorded_pids = parse_recorded_edge_pids(inner);
+            let edge_ids = bind_blend_edges(model, kind, &edge_ids, &recorded_pids)?;
             let distance = inner
                 .get("distance1")
                 .and_then(|v| v.as_f64())
@@ -1545,31 +1549,6 @@ fn geometry_id_to_u64(id: GeometryId) -> u64 {
 /// `filter_map` to drop entries of the wrong kind silently — useful
 /// when `inputs[]` interleaves multiple kinds and only one is wanted
 /// (e.g. fillet recording `[solid, edge, edge, ...]`).
-/// #64 Slice 5 (Decision d) — verify every edge a blend references still
-/// resolves to a live entity in `model`, binding through the persistent-id
-/// ladder. Returns [`ReplayError::DanglingReference`] naming the first edge that
-/// no longer exists (enriched with its PID when the edge carried one — the
-/// durable Kripac lineage name), so an upstream mould that consumed the edge is
-/// reported honestly rather than filleting a wrong edge or dying opaquely.
-fn check_edges_resolve(
-    model: &BRepModel,
-    kind: &str,
-    edge_ids: &[EdgeId],
-) -> Result<(), ReplayError> {
-    for &eid in edge_ids {
-        if model.edges.get(eid).is_none() {
-            // The edge vanished. If a sibling still holds this transient id's
-            // PID we cannot recover it (it is gone), so name the recorded id;
-            // callers with the pre-mould PID map can cross-reference.
-            return Err(ReplayError::DanglingReference {
-                kind: kind.to_string(),
-                entity: format!("edge:{eid}"),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn parse_entity_ref(v: &Value, expected_kind: &str) -> Option<u64> {
     if let Some(s) = v.as_str() {
         let (kind, id) = s.split_once(':')?;
@@ -1593,6 +1572,78 @@ fn parse_any_entity_ref(v: &Value) -> Option<u64> {
     } else {
         v.as_u64()
     }
+}
+
+/// Parse the recorded `edge_pids` array (aligned 1:1 with the fillet/chamfer
+/// `inputs[1..]` edge list) into optional persistent-ids. #27: the kernel records
+/// each referenced edge's PID (a decimal `u128` string) at authoring time; a
+/// `null` marks an edge that had no PID (an older op output), for which replay
+/// falls back to the transient remap. An unparseable entry is treated as `null`.
+fn parse_recorded_edge_pids(
+    inner: &Value,
+) -> Vec<Option<geometry_engine::primitives::persistent_id::PersistentId>> {
+    use geometry_engine::primitives::persistent_id::PersistentId;
+    inner
+        .get("edge_pids")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    e.as_str()
+                        .and_then(|s| s.parse::<u128>().ok())
+                        .map(PersistentId)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Bind each edge a blend (fillet / chamfer) references to a LIVE `EdgeId`,
+/// preferring the durable persistent-id recorded at authoring time (the Kripac
+/// name) over the transient remap. #27 — closes the #64 slice-5 residual:
+///
+/// * When a recorded PID resolves via [`BRepModel::edge_by_pid`], that live edge
+///   is used — so the blend FOLLOWS its edge by PID across a mould even if the
+///   transient id would have named a different edge (primitive + boolean edges
+///   now carry PIDs, which is what makes this reachable).
+/// * When a recorded PID no longer resolves — the edge vanished OR a
+///   topology-changing upstream mould silently RENUMBERED it (its neighbour
+///   faces changed → a different canonical PID) — a typed
+///   [`ReplayError::DanglingReference`] is raised naming the PID, so the rebuild
+///   certificate reports `Dangling` instead of the blend binding a wrong edge
+///   (a silent lie the whole-model soundness backstop only sometimes catches).
+/// * An edge recorded WITHOUT a PID falls back to the transient remap + a
+///   liveness check (the pre-#27 behaviour), preserving replay of older events.
+fn bind_blend_edges(
+    model: &BRepModel,
+    kind: &str,
+    remapped_edges: &[EdgeId],
+    recorded_pids: &[Option<geometry_engine::primitives::persistent_id::PersistentId>],
+) -> Result<Vec<EdgeId>, ReplayError> {
+    let mut out = Vec::with_capacity(remapped_edges.len());
+    for (i, &eid) in remapped_edges.iter().enumerate() {
+        match recorded_pids.get(i).copied().flatten() {
+            Some(pid) => match model.edge_by_pid(pid) {
+                Some(live) => out.push(live),
+                None => {
+                    return Err(ReplayError::DanglingReference {
+                        kind: kind.to_string(),
+                        entity: format!("edge-pid:{}", pid.as_u128()),
+                    });
+                }
+            },
+            None => {
+                if model.edges.get(eid).is_none() {
+                    return Err(ReplayError::DanglingReference {
+                        kind: kind.to_string(),
+                        entity: format!("edge:{eid}"),
+                    });
+                }
+                out.push(eid);
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

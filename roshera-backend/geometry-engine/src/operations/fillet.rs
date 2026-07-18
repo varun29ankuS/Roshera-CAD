@@ -556,6 +556,20 @@ pub fn fillet_edges(
         // Capture input edges before `edges` is consumed by the
         // propagation step below — needed for the recorder payload.
         let input_edges_for_record: Vec<u32> = edges.clone();
+        // Capture each referenced edge's persistent-id (if any) at the SAME
+        // pre-mutation point, aligned 1:1 with `input_edges_for_record`. #27:
+        // replay binds the fillet to its edge by this durable PID (Kripac name),
+        // so a topology-changing upstream mould that renumbers or consumes the
+        // named edge is caught as a typed DanglingReference instead of silently
+        // filleting a different edge. `null` for an edge with no PID (older
+        // op outputs) — replay falls back to transient-id remap there.
+        let input_edge_pids_for_record: Vec<serde_json::Value> = input_edges_for_record
+            .iter()
+            .map(|&e| match model.edge_pid(e) {
+                Some(p) => serde_json::Value::String(p.as_u128().to_string()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
 
         // CF-α: snapshot endpoint vertex IDs of every requested edge
         // *before* `splice_blend_edge` destroys the edge (and, when
@@ -1216,6 +1230,7 @@ pub fn fillet_edges(
                     "quality": format!("{:?}", options.quality),
                     "pending_mixed_kind_corners": pending_after_call,
                     "partial_corner_vertices": partial_corner_vertices_payload,
+                    "edge_pids": input_edge_pids_for_record,
                 }))
                 .with_input_solids([solid_id as u64])
                 .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))

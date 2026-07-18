@@ -206,6 +206,18 @@ pub fn chamfer_edges(
 
         // Capture input edges before the Vec is consumed by propagation.
         let input_edges_for_record: Vec<u32> = edges.clone();
+        // Capture each referenced edge's persistent-id (if any), aligned 1:1 with
+        // `input_edges_for_record`. #27: replay binds the chamfer to its edge by
+        // this durable PID so a topology-changing upstream mould that renumbers /
+        // consumes the named edge is caught as a typed DanglingReference rather
+        // than chamfering a wrong edge. `null` when the edge carries no PID.
+        let input_edge_pids_for_record: Vec<serde_json::Value> = input_edges_for_record
+            .iter()
+            .map(|&e| match model.edge_pid(e) {
+                Some(p) => serde_json::Value::String(p.as_u128().to_string()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
 
         // CF-α: snapshot endpoint vertex IDs of every requested edge
         // *before* `splice_blend_edge` destroys the edge. After
@@ -728,6 +740,7 @@ pub fn chamfer_edges(
                     "preserve_edges": options.preserve_edges,
                     "pending_mixed_kind_corners": pending_after_call,
                     "partial_corner_vertices": partial_corner_vertices_payload,
+                    "edge_pids": input_edge_pids_for_record,
                 }))
                 .with_input_solids([solid_id as u64])
                 .with_input_edges(input_edges_for_record.iter().map(|&e| e as u64))
