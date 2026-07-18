@@ -223,6 +223,65 @@ impl Timeline {
         author: Author,
         branch_id: BranchId,
     ) -> TimelineResult<EventId> {
+        // Reserve `None` — the sequence number is burned internally *after*
+        // validation, so a rejected append leaves no gap in the sequence space.
+        self.append_internal(operation, author, branch_id, None)
+    }
+
+    /// Atomically reserve the next sequence number (the write-half of the
+    /// live-path persistent-id parity seam, #64 Parametric-DAG Slice 2).
+    ///
+    /// [`next_sequence_number`](Self::next_sequence_number) is the *read* half:
+    /// it only peeks the counter and is exact merely when nothing is in flight.
+    /// This is the *write* half — it `fetch_add`s the counter and returns the
+    /// value the reserving caller now owns. A caller that wants live-created
+    /// persistent-ids to match a later replay's must:
+    ///
+    /// 1. `let seq = timeline.reserve_sequence_number();`
+    /// 2. `model.set_event_key(Some(format!("evt:{seq}")))` *before* the kernel op,
+    /// 3. append the recorded operation via
+    ///    [`add_operation_reserved`](Self::add_operation_reserved) with `seq`,
+    ///
+    /// so the event lands at exactly the sequence its persistent-ids were seeded
+    /// from. Because the reservation happens before the op runs, a reserved
+    /// sequence whose op ultimately fails leaves a hole in the sequence space —
+    /// the deliberate trade for synchronous, race-free parity (contrast
+    /// `add_operation`, which reserves after validation).
+    pub fn reserve_sequence_number(&self) -> u64 {
+        self.event_counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Append an operation at a **pre-reserved** sequence number (see
+    /// [`reserve_sequence_number`](Self::reserve_sequence_number)).
+    ///
+    /// The event's `sequence_number` is the reserved value rather than a freshly
+    /// burned one, so a live persistent-id lineage seeded from
+    /// `format!("evt:{sequence_number}")` before the op ran matches the id a
+    /// subsequent replay re-derives. Validation is identical to
+    /// [`add_operation`](Self::add_operation); on rejection the reserved
+    /// sequence is not reused (the caller already spent it).
+    pub async fn add_operation_reserved(
+        &self,
+        operation: Operation,
+        author: Author,
+        branch_id: BranchId,
+        sequence_number: u64,
+    ) -> TimelineResult<EventId> {
+        self.append_internal(operation, author, branch_id, Some(sequence_number))
+    }
+
+    /// Shared validate-then-insert core for the append paths. `reserved`:
+    /// `None` burns a fresh sequence after validation (the `add_operation`
+    /// contract); `Some(seq)` uses a pre-reserved sequence (the
+    /// `add_operation_reserved` contract). No `.await` occurs — every store is
+    /// interior-mutable — so both async wrappers delegate here synchronously.
+    fn append_internal(
+        &self,
+        operation: Operation,
+        author: Author,
+        branch_id: BranchId,
+        reserved: Option<u64>,
+    ) -> TimelineResult<EventId> {
         // ---- Validation phase (no mutation) ---------------------------
         let branch_ref = self
             .branches
@@ -264,7 +323,8 @@ impl Timeline {
         // a rejected append no longer creates a gap in the global
         // sequence space, which keeps `validate()`'s contiguity check
         // (within a single branch) tight.
-        let sequence_number = self.event_counter.fetch_add(1, Ordering::SeqCst);
+        let sequence_number =
+            reserved.unwrap_or_else(|| self.event_counter.fetch_add(1, Ordering::SeqCst));
         let event_id = EventId::new();
 
         let event = TimelineEvent {
@@ -1732,6 +1792,42 @@ mod tests {
             primitive_type: crate::PrimitiveType::Box,
             parameters: serde_json::json!({}),
         }
+    }
+
+    /// #64 Slice 2 — the sequence-reservation write-half: a reserved sequence
+    /// number is exactly the one the appended event lands at, so a live
+    /// persistent-id lineage seeded from `evt:{reserved}` matches the event's
+    /// own `sequence_number` (and hence a later replay's re-derivation).
+    #[tokio::test]
+    async fn reserved_sequence_is_the_events_sequence() {
+        let timeline = Timeline::new(TimelineConfig::default());
+
+        // Burn one ordinary append so the counter is non-zero.
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+
+        // Reserve synchronously, then append at the reserved sequence.
+        let reserved = timeline.reserve_sequence_number();
+        let event_id = timeline
+            .add_operation_reserved(
+                dummy_create_op(),
+                Author::System,
+                BranchId::main(),
+                reserved,
+            )
+            .await
+            .expect("reserved append succeeds");
+
+        let event = timeline.get_event(event_id).expect("event exists");
+        assert_eq!(
+            event.sequence_number, reserved,
+            "the event lands at exactly the reserved sequence — evt:{{reserved}} == the replay key"
+        );
+        timeline
+            .validate()
+            .expect("reserved append keeps the timeline consistent");
     }
 
     /// `validate()` returns Ok on a freshly constructed timeline.

@@ -171,8 +171,38 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
 
     let mut outcome = ReplayOutcome::default();
 
+    // #64 Parametric-DAG (Slice 2, Decision A1): fold every appended
+    // `param.mould` override event into an override map in a pre-pass, then
+    // apply the overrides as the log is replayed. A mould is an APPENDED
+    // correcting event — the targeted event is never mutated — so every replay
+    // path (scrub, undo/redo, live reconcile) honours moulds by construction,
+    // and a log with no mould events replays byte-identically to before.
+    let overrides = crate::mould::OverrideSet::collect(events);
+
     for event in events {
-        match apply_event(model, &mut outcome.assemblies, event, &mut outcome.id_remap) {
+        // Metadata events (`param.mould` / `param.name`) were folded in the
+        // pre-pass above; they carry no geometry and must not be dispatched as
+        // kernel operations. They are counted as applied — the override/binding
+        // they carry took effect on the projection.
+        if let Operation::Generic { command_type, .. } = &event.operation {
+            if crate::mould::is_param_meta(command_type) {
+                outcome.events_applied += 1;
+                continue;
+            }
+        }
+
+        // If a mould targets this event's sequence, replay an OVERRIDDEN clone
+        // (same id / sequence / lineage, new dimensional value). Otherwise the
+        // original event is replayed unchanged (borrowed, no clone).
+        let overridden = overrides.overridden_event(event);
+        let dispatched = overridden.as_ref().unwrap_or(event);
+
+        match apply_event(
+            model,
+            &mut outcome.assemblies,
+            dispatched,
+            &mut outcome.id_remap,
+        ) {
             Ok(()) => outcome.events_applied += 1,
             Err(err) => {
                 tracing::warn!(
@@ -1865,6 +1895,227 @@ mod tests {
         assert!(
             (max_abs_x(&m3) - 12.5).abs() < 1e-6,
             "moulded half-width 12.5"
+        );
+    }
+
+    // ---- #64 Slice 2: mould on the REAL timeline via an appended override ----
+
+    /// Box(20³) → cylinder drill (r, through +Z) → boolean difference. Returns
+    /// the ordered event log (seq 0,1,2). The cylinder is the mould target
+    /// (sequence 1, parameter "radius").
+    fn box_drill_events(drill_radius: f64) -> Vec<TimelineEvent> {
+        let mut boxx = mk_event(
+            "create_box_3d",
+            serde_json::json!({
+                "params": { "Create3D": {
+                    "primitive_type": "box",
+                    "parameters": { "width": 20.0, "height": 20.0, "depth": 20.0 },
+                    "timestamp": 0
+                }},
+                "inputs": [], "outputs": ["solid:1"]
+            }),
+        );
+        boxx.sequence_number = 0;
+        let mut cyl = mk_event(
+            "create_cylinder_3d",
+            serde_json::json!({
+                "params": { "Create3D": {
+                    "primitive_type": "cylinder",
+                    "parameters": {
+                        "base_x": 0.0, "base_y": 0.0, "base_z": -20.0,
+                        "axis_x": 0.0, "axis_y": 0.0, "axis_z": 1.0,
+                        "radius": drill_radius, "height": 40.0
+                    },
+                    "timestamp": 0
+                }},
+                "inputs": [], "outputs": ["solid:2"]
+            }),
+        );
+        cyl.sequence_number = 1;
+        let mut diff = mk_event(
+            "boolean_difference",
+            serde_json::json!({
+                "params": { "solid_a": 1, "solid_b": 2 },
+                "inputs": ["solid:1", "solid:2"],
+                "outputs": ["solid:3"]
+            }),
+        );
+        diff.sequence_number = 2;
+        vec![boxx, cyl, diff]
+    }
+
+    /// The bore's radius: the smallest-radius cylindrical face of `solid`
+    /// (the drilled inner wall), plus its face id.
+    fn bore_face(m: &BRepModel, solid: SolidId) -> Option<(FaceId, f64)> {
+        use geometry_engine::primitives::surface::Cylinder;
+        let s = m.solids.get(solid)?;
+        let mut faces: Vec<FaceId> = Vec::new();
+        for shid in std::iter::once(s.outer_shell).chain(s.inner_shells.iter().copied()) {
+            if let Some(sh) = m.shells.get(shid) {
+                faces.extend(sh.faces.iter().copied());
+            }
+        }
+        let mut best: Option<(FaceId, f64)> = None;
+        for fid in faces {
+            let Some(face) = m.faces.get(fid) else {
+                continue;
+            };
+            let Some(surf) = m.surfaces.get(face.surface_id) else {
+                continue;
+            };
+            if let Some(cyl) = surf.as_any().downcast_ref::<Cylinder>() {
+                if best.is_none_or(|(_, r)| cyl.radius < r) {
+                    best = Some((fid, cyl.radius));
+                }
+            }
+        }
+        best
+    }
+
+    /// A planar box SIDE face (|normal·X| ≈ 1) — unpierced by the +Z bore, so
+    /// its identity and geometry are radius-independent.
+    fn box_side_face(m: &BRepModel, solid: SolidId) -> Option<FaceId> {
+        use geometry_engine::primitives::surface::Plane;
+        let s = m.solids.get(solid)?;
+        let shell = m.shells.get(s.outer_shell)?;
+        for &fid in &shell.faces {
+            let Some(face) = m.faces.get(fid) else {
+                continue;
+            };
+            let Some(surf) = m.surfaces.get(face.surface_id) else {
+                continue;
+            };
+            if let Some(p) = surf.as_any().downcast_ref::<Plane>() {
+                if p.normal
+                    .normalize()
+                    .unwrap_or(Vector3::Z)
+                    .dot(&Vector3::X)
+                    .abs()
+                    > 0.99
+                {
+                    return Some(fid);
+                }
+            }
+        }
+        None
+    }
+
+    /// #64 Slice 2 GATE — mould a box→drill chain's drill diameter through an
+    /// APPENDED `param.mould` override event; the boolean re-derives, the bore
+    /// is the new diameter, the model stays SOUND, PID references survive, and
+    /// the original event is unchanged in the log (append-only preserved).
+    #[test]
+    fn mould_drill_diameter_rederives_downstream_and_preserves_references() {
+        // Baseline: drill radius 3.
+        let base_events = box_drill_events(3.0);
+        let mut m1 = BRepModel::new();
+        let o1 = rebuild_model_from_events(&mut m1, &base_events);
+        assert_eq!(o1.events_skipped, 0, "baseline chain replays cleanly");
+        let diff_solid = *o1.id_remap.get(&3).expect("difference output remapped") as SolidId;
+
+        let (bore1, r1) = bore_face(&m1, diff_solid).expect("a drilled bore face");
+        assert!(
+            (r1 - 3.0).abs() < 1e-6,
+            "baseline bore radius is 3, got {r1}"
+        );
+        let bore_pid = m1.face_pid(bore1).expect("bore face has a persistent id");
+        let side1 = box_side_face(&m1, diff_solid).expect("a box side face");
+        let side_pid = m1.face_pid(side1).expect("side face has a persistent id");
+        let faces1 = m1
+            .solids
+            .get(diff_solid)
+            .and_then(|s| m1.shells.get(s.outer_shell))
+            .map(|sh| sh.faces.len())
+            .unwrap_or(0);
+
+        // MOULD: append a `param.mould` override event (Decision A1) targeting
+        // the cylinder (sequence 1), radius 3 → 8. The targeted event is NOT
+        // mutated — the override is appended as its own event.
+        let mut moulded_events = base_events.clone();
+        let mut mould = mk_event("placeholder", serde_json::json!({}));
+        mould.operation = crate::mould::mould_operation(1, None, "radius", 8.0);
+        mould.sequence_number = 3;
+        moulded_events.push(mould);
+
+        let mut m2 = BRepModel::new();
+        let o2 = rebuild_model_from_events(&mut m2, &moulded_events);
+        assert_eq!(
+            o2.events_skipped, 0,
+            "the moulded chain re-derives cleanly (boolean re-runs on the wider drill)"
+        );
+        let diff_solid2 = *o2.id_remap.get(&3).expect("difference output remapped") as SolidId;
+
+        // (i) The bore is the NEW diameter — the downstream boolean re-derived.
+        let (bore2, r2) = bore_face(&m2, diff_solid2).expect("a drilled bore face after mould");
+        assert!(
+            (r2 - 8.0).abs() < 1e-6,
+            "the mould took effect: bore radius is now 8, got {r2}"
+        );
+
+        // (ii) References survive the dimensional edit (PID lineage excludes
+        // dimensions): both the bore face and an unpierced box side face still
+        // resolve by their pre-mould persistent ids.
+        assert_eq!(
+            m2.face_by_pid(bore_pid),
+            Some(bore2),
+            "the bore's PID still names the bore after the diameter edit"
+        );
+        assert!(
+            m2.face_by_pid(side_pid).is_some(),
+            "the box side face PID survives the mould"
+        );
+
+        // (iii) The model stays SOUND — topology preserved (same face count),
+        // exactly one drilled solid, volume dropped because the bore grew.
+        let faces2 = m2
+            .solids
+            .get(diff_solid2)
+            .and_then(|s| m2.shells.get(s.outer_shell))
+            .map(|sh| sh.faces.len())
+            .unwrap_or(0);
+        assert_eq!(faces1, faces2, "topology preserved across the mould");
+        let vol1 = geometry_engine::primitives::mass_properties::integrate_solid(
+            diff_solid, &m1, 1.0, 1e-6,
+        )
+        .map(|p| p.volume)
+        .expect("baseline volume");
+        let vol2 = geometry_engine::primitives::mass_properties::integrate_solid(
+            diff_solid2,
+            &m2,
+            1.0,
+            1e-6,
+        )
+        .map(|p| p.volume)
+        .expect("moulded volume");
+        assert!(
+            vol2 < vol1 - 1.0,
+            "the bigger bore removes more material: {vol2} should be well below {vol1}"
+        );
+
+        // (iv) APPEND-ONLY preserved — the original cylinder event in the log
+        // still carries radius 3.0 verbatim; the mould is a separate event.
+        let Operation::Generic { parameters, .. } = &moulded_events[1].operation else {
+            panic!("cylinder is a generic op");
+        };
+        assert_eq!(
+            parameters["params"]["Create3D"]["parameters"]["radius"],
+            serde_json::json!(3.0),
+            "the targeted event is never mutated — its recorded radius is still 3"
+        );
+        assert_eq!(
+            moulded_events.len(),
+            4,
+            "the log grew by exactly one appended override event"
+        );
+
+        // (v) Determinism — replay the same moulded log again → identical PIDs.
+        let mut m3 = BRepModel::new();
+        let o3 = rebuild_model_from_events(&mut m3, &moulded_events);
+        let diff_solid3 = *o3.id_remap.get(&3).expect("remap") as SolidId;
+        assert_eq!(
+            m3.solid_pid(diff_solid3),
+            m2.solid_pid(diff_solid2),
+            "replaying the same moulded log re-derives the same solid PID"
         );
     }
 
