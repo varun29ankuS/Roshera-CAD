@@ -952,6 +952,159 @@ impl BRepModel {
         )
     }
 
+    /// Mint canonical EDGE persistent-ids for every edge bounding the given set
+    /// of `faces`, deriving each edge PID from its two neighbour FACE PIDs (#11,
+    /// slice 40-F — the primitive + boolean edge-coverage close-out that #64
+    /// slice 5 surfaced as the residual).
+    ///
+    /// # Canonical edge identity (Kripac neighbour-face naming)
+    ///
+    /// An edge has no intrinsic durable name — its transient `EdgeId` is a dense
+    /// store index reallocated on every op. The *stable* name of a manifold edge
+    /// is the unordered pair of faces it borders (Kripac & Peters, *Persistent
+    /// Naming*, CAD 2001; the same principle already underlies
+    /// [`Self::blend_edge_source_pid`] used by fillet/chamfer). Two neighbour
+    /// faces carry stable PIDs, so the edge PID derived from them is stable too —
+    /// it survives a MOULD exactly when its neighbour face PIDs do. This makes
+    /// every edge PID a pure function of its two neighbour face PIDs, which is
+    /// what lets a blend that names an edge bind by PID: the fillet path recovers
+    /// the identical PID via `blend_edge_source_pid(fa, fb)`.
+    ///
+    /// * A two-face edge (the norm — every box edge, every rim, every bore rim)
+    ///   takes the identity `blend_edge_source_pid(fa, fb)`, byte-identical to
+    ///   what the blend path derives, so `edge_by_pid` round-trips the fillet
+    ///   reference.
+    /// * A seam edge bordered by a single face on both sides (cylinder / cone /
+    ///   sphere seam) takes `blend_edge_source_pid(f, f)` — a well-defined self
+    ///   pair, still unique among the primitive's edges.
+    /// * When one face pair genuinely shares MORE THAN ONE edge (possible only
+    ///   for some boolean results, never for a primitive — each adjacent
+    ///   primitive-face pair shares exactly one edge), the pair-derived identity
+    ///   would collide. To keep `pid_to_edge` injective (a colliding PID is a
+    ///   silent lie — one edge shadows the other), the extra edges are ordered by
+    ///   a geometric key (edge midpoint) and given an ordinal-folded derivation.
+    ///   That ordinal is stable under a structure-preserving mould but only
+    ///   best-effort under an edit that reorders the shared set — the SAME
+    ///   stability class the boolean FACE-fragment ordering already documents.
+    ///   Blend-bind-by-PID is exact for the ordinal-0 member of such a set and
+    ///   best-effort for the rest (documented honest residual, never a wrong
+    ///   resolve).
+    ///
+    /// Idempotent per call; deterministic (group order does not affect any
+    /// individual assignment, and multi-edge groups are midpoint-sorted).
+    pub fn assign_canonical_edge_pids(&mut self, faces: &[FaceId]) {
+        use crate::primitives::persistent_id::{PersistentId, Role};
+        use std::collections::HashMap;
+
+        // Edge -> distinct neighbour faces (a manifold edge has two; a seam edge
+        // has one). Insertion is de-duplicated so a seam edge referenced twice by
+        // the same face's loop still records a single neighbour.
+        let mut edge_faces: HashMap<EdgeId, Vec<FaceId>> = HashMap::new();
+        for &f in faces {
+            let mut loop_ids: Vec<LoopId> = Vec::new();
+            if let Some(face) = self.faces.get(f) {
+                loop_ids.push(face.outer_loop);
+                loop_ids.extend_from_slice(&face.inner_loops);
+            }
+            for lid in loop_ids {
+                if let Some(lp) = self.loops.get(lid) {
+                    for &e in &lp.edges {
+                        let entry = edge_faces.entry(e).or_default();
+                        if !entry.contains(&f) {
+                            entry.push(f);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Group edges by their canonical neighbour-face-PID pair. Faces already
+        // carry PIDs (callers assign them first); a missing one is minted so the
+        // derivation is total.
+        let mut groups: HashMap<(u128, u128), Vec<EdgeId>> = HashMap::new();
+        for (&edge, neighbours) in &edge_faces {
+            let (fa, fb) = match neighbours.as_slice() {
+                [a] => (*a, *a),
+                [a, b, ..] => (*a, *b),
+                [] => continue,
+            };
+            let pa = self.ensure_face_annotation_key(fa);
+            let pb = self.ensure_face_annotation_key(fb);
+            let key = if pa.as_u128() <= pb.as_u128() {
+                (pa.as_u128(), pb.as_u128())
+            } else {
+                (pb.as_u128(), pa.as_u128())
+            };
+            groups.entry(key).or_default().push(edge);
+        }
+
+        for (_pair, mut edges) in groups {
+            if edges.len() == 1 {
+                let edge = edges[0];
+                let (fa, fb) = match edge_faces.get(&edge).map(|v| v.as_slice()) {
+                    Some([a]) => (*a, *a),
+                    Some([a, b, ..]) => (*a, *b),
+                    _ => continue,
+                };
+                // Byte-identical to the fillet/chamfer blend path so a blend that
+                // names this edge binds by PID.
+                let pid = self.blend_edge_source_pid(fa, fb);
+                self.set_edge_pid(edge, pid);
+            } else {
+                // Rare: a face pair sharing several edges. Keep pid_to_edge
+                // injective via a midpoint-ordered ordinal (see doc-comment).
+                edges.sort_by(|&a, &b| {
+                    let ma = self.edge_midpoint_key(a);
+                    let mb = self.edge_midpoint_key(b);
+                    ma.partial_cmp(&mb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let base = {
+                    let edge = edges[0];
+                    let (fa, fb) = match edge_faces.get(&edge).map(|v| v.as_slice()) {
+                        Some([a]) => (*a, *a),
+                        Some([a, b, ..]) => (*a, *b),
+                        _ => continue,
+                    };
+                    self.blend_edge_source_pid(fa, fb)
+                };
+                for (i, &edge) in edges.iter().enumerate() {
+                    let pid = if i == 0 {
+                        base
+                    } else {
+                        PersistentId::derive(
+                            &[base],
+                            "canonical_edge",
+                            &Role::Generic {
+                                source_pid: base,
+                                label: format!("shared#{i}"),
+                            },
+                        )
+                    };
+                    self.set_edge_pid(edge, pid);
+                }
+            }
+        }
+    }
+
+    /// A deterministic geometric ordering key for an edge — the midpoint of its
+    /// two endpoints (lexicographic x,y,z). Used only to order the members of a
+    /// face pair that shares several edges (see
+    /// [`Self::assign_canonical_edge_pids`]).
+    fn edge_midpoint_key(&self, edge: EdgeId) -> [f64; 3] {
+        if let Some(e) = self.edges.get(edge) {
+            let a = self.vertices.get_position(e.start_vertex);
+            let b = self.vertices.get_position(e.end_vertex);
+            if let (Some(a), Some(b)) = (a, b) {
+                return [
+                    0.5 * (a[0] + b[0]),
+                    0.5 * (a[1] + b[1]),
+                    0.5 * (a[2] + b[2]),
+                ];
+            }
+        }
+        [0.0, 0.0, 0.0]
+    }
+
     /// Attach a GD&T annotation to a FACE by its (resolved) persistent id.
     /// Returns the persistent key so the caller can re-query the feature later.
     pub fn attach_face_annotation(
@@ -4900,6 +5053,12 @@ impl<'a> TopologyBuilder<'a> {
             let fpid = PersistentId::derive(&[solid_pid], "primitive_face", &role);
             self.model.set_face_pid(*fid, fpid);
         }
+
+        // EDGE PIDs (#11, slice 40-F): every primitive edge takes a canonical
+        // identity derived from its two neighbour face PIDs, so a fillet / chamfer
+        // / GD&T reference to a primitive edge has a durable name to bind by. Runs
+        // after all face PIDs are assigned (the derivation reads them).
+        self.model.assign_canonical_edge_pids(&face_ids);
     }
 
     /// Push a `TimelineOperation` to the builder's internal timeline **and**

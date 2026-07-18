@@ -20109,6 +20109,17 @@ fn build_shells_from_faces(
 
     assign_boolean_face_pids(model, &face_lineage, operation, solid_b);
 
+    // EDGE PIDs (#11, slice 40-F): boolean outputs previously minted FACE PIDs
+    // only; every result edge — surviving-from-operand and NEW intersection edges
+    // alike — now takes a canonical identity derived from its two neighbour
+    // (boolean-output) face PIDs. A surviving edge whose neighbours are both
+    // passthrough faces keeps a stable identity (its inherited neighbour PIDs do
+    // not move); an intersection edge is named by the two result faces it
+    // separates. This is what lets a fillet reference a bore rim by PID. Runs
+    // after the face PIDs are assigned (the derivation reads them).
+    let result_faces: Vec<FaceId> = face_lineage.iter().map(|&(f, _, _, _)| f).collect();
+    model.assign_canonical_edge_pids(&result_faces);
+
     Ok(shell_ids)
 }
 
