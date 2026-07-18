@@ -534,12 +534,43 @@ fn get_default_user_permissions() -> Vec<Permission> {
     ]
 }
 
-/// Rate limiting middleware
+/// Rate limiting middleware (`AuthManager::check_rate_limit`, 100
+/// req/min per client).
+///
+/// Shares [`AuthLayerState`] with [`auth_middleware`] so the layer knows
+/// the process's resolved [`AuthPosture`] as well as its `AuthManager`.
+/// The posture is load-bearing here:
+///
+/// * [`AuthPosture::Required`] (default) — the limit is per authenticated
+///   identity (the `AuthInfo.user_id` the front door validated), falling
+///   back to the peer IP (`x-forwarded-for`) for the auth-exempt public
+///   surface. This is the real, enforced limit and MUST stay on.
+///
+/// * [`AuthPosture::InsecureDevBypass`] (`ROSHERA_DEV_INSECURE=1`) — the
+///   limiter is bypassed. Under this posture authentication is fully
+///   disabled and every credential-free request collapses to the single
+///   permissive sentinel identity (`dev_auth_info`, `user_id =
+///   "dev-insecure"`). A per-client limit keyed on that one sentinel
+///   degenerates to a *single shared bucket for the entire process*:
+///   meaningless (it cannot distinguish clients) and actively harmful —
+///   a local frontend viewport that polls the backend continuously alone
+///   exhausts the 100/min budget and drives the whole API to 429 with no
+///   recovery. Bypassing it here is consistent with the dev-insecure
+///   posture already disabling the auth gates this layer sits beside; the
+///   posture is loud (warn-on-every-boot in [`AuthPosture::from_env`])
+///   and local-only, so no additional warning is emitted here.
 pub async fn rate_limit_middleware(
-    State(auth_manager): State<Arc<AuthManager>>,
+    State(layer): State<AuthLayerState>,
     request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
+    // Dev-insecure posture: auth is disabled and every request is the
+    // same sentinel, so the per-client limit is one shared bucket. Skip
+    // it (see the doc comment). The strict posture below is unaffected.
+    if layer.posture == AuthPosture::InsecureDevBypass {
+        return Ok(next.run(request).await);
+    }
+
     // Get client identifier (user ID or IP)
     let client_id = if let Some(auth_info) = request.extensions().get::<AuthInfo>() {
         auth_info.user_id.clone()
@@ -554,7 +585,7 @@ pub async fn rate_limit_middleware(
     };
 
     // Check rate limit
-    match auth_manager.check_rate_limit(&client_id) {
+    match layer.auth_manager.check_rate_limit(&client_id) {
         Ok(_) => Ok(next.run(request).await),
         Err(_) => Err(AuthError {
             error: "Rate limit exceeded".to_string(),

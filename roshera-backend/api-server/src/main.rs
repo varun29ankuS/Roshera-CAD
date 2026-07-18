@@ -8796,8 +8796,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // authenticated identity when present and the peer IP
     // (`x-forwarded-for`) otherwise — so it also throttles the public
     // credential-issuing routes (login/register) by source, which is the
-    // brute-force protection that matters most for them.
-    let rate_limit_manager = state.session_manager.auth_manager_arc();
+    // brute-force protection that matters most for them. It shares
+    // `AuthLayerState` with `auth_middleware` because it needs the same
+    // resolved posture: under `AuthPosture::InsecureDevBypass` every
+    // request collapses to one sentinel identity, so a per-client limit
+    // becomes a single shared bucket that a polling dev frontend alone
+    // exhausts — the limiter bypasses in that posture (see
+    // `rate_limit_middleware`). In `AuthPosture::Required` it stays on.
+    let rate_limit_layer_state = auth_layer_state.clone();
 
     // Add state and the middleware stack. axum applies layers from
     // innermost outward, so on the request path CORS runs first
@@ -8813,7 +8819,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             idempotency::idempotency_layer,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            rate_limit_manager,
+            rate_limit_layer_state,
             auth_middleware::rate_limit_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(

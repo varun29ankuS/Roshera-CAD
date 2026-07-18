@@ -713,19 +713,27 @@ async fn unlayered_destructive_routes_still_require_a_credential() {
 // =====================================================================
 
 /// The built-but-unlayered rate limiter (`AuthManager::check_rate_limit`,
-/// 100 requests/minute per client) must actually be on the router.
+/// 100 requests/minute per client) must actually be on the router — and
+/// must stay on under the strict/authenticated posture, where the limit
+/// is meaningful (per-identity, IP fallback for the auth-exempt surface).
 ///
 /// Fires more than the per-minute budget at a single client within the
 /// window and asserts the surplus is throttled with 429. Fails if the
 /// limiter is not layered (every request would return its normal
 /// status). The fixture's `AuthManager` is fresh per test, so the
 /// window starts empty and this cannot leak into or out of other tests.
+///
+/// Runs under [`AuthPosture::Required`] deliberately: this is the posture
+/// in which rate-limiting is enforced. `/health` is auth-exempt so it
+/// answers without a credential, but it still passes through the rate
+/// limiter (layered inner to auth on the request path), keyed on the peer
+/// IP — a stable client id here. The companion
+/// [`rate_limiter_is_bypassed_under_the_dev_insecure_posture`] pins the
+/// other half of the matrix: under the dev bypass this same flood is
+/// NOT throttled.
 #[tokio::test]
 async fn rate_limiter_is_layered_and_throttles_a_flooding_client() {
-    // InsecureDevBypass so requests are admitted and keyed on a stable
-    // client id; /health is exempt from auth but still passes through
-    // the rate limiter (which is layered inner to auth).
-    let state = make_test_state().await;
+    let state = secure_state().await;
 
     // Budget is 100/min. Fire 130 and confirm the surplus is throttled.
     let mut statuses = Vec::with_capacity(130);
@@ -753,5 +761,70 @@ async fn rate_limiter_is_layered_and_throttles_a_flooding_client() {
         ok >= 100,
         "requests within the per-minute budget must be admitted — only {ok} \
          succeeded, which looks like a blanket failure rather than throttling"
+    );
+}
+
+/// Under the dev-insecure posture the per-sentinel rate limit must be
+/// bypassed — a flood far past the 100/min budget is admitted in full.
+///
+/// This pins the fix for a live starvation bug: under
+/// [`AuthPosture::InsecureDevBypass`] authentication is fully disabled and
+/// every credential-free request collapses to the single permissive
+/// sentinel identity (`user_id = "dev-insecure"`). A per-client limit
+/// keyed on that one sentinel is a single shared bucket for the whole
+/// process, so a frontend viewport that polls the backend continuously
+/// alone exhausts it and drives the entire API to 429 with no recovery.
+///
+/// The flood targets `GET /api/parts` — a *non-exempt* route, so under
+/// the dev bypass it is admitted with the sentinel `AuthInfo` injected
+/// and would be keyed on that shared sentinel bucket were the limiter
+/// active. With the bypass in place all 130 requests succeed.
+///
+/// Mutation proof: remove the `InsecureDevBypass` early-return in
+/// `rate_limit_middleware` and this test fails — the surplus over 100
+/// throttles on the shared sentinel bucket. Its strict-posture companion
+/// [`rate_limiter_is_layered_and_throttles_a_flooding_client`] stays
+/// green either way, so the two together prove the distinction is real
+/// and posture-scoped, not a blanket weakening of rate-limiting.
+#[tokio::test]
+async fn rate_limiter_is_bypassed_under_the_dev_insecure_posture() {
+    // make_test_state() resolves to AuthPosture::InsecureDevBypass.
+    let state = make_test_state().await;
+    assert_eq!(
+        state.auth_posture,
+        AuthPosture::InsecureDevBypass,
+        "this test must run under the dev-insecure posture to exercise the bypass"
+    );
+
+    // Fire 130 — well past the 100/min budget — at a non-exempt route
+    // that, absent the bypass, would be keyed on the shared sentinel.
+    let mut statuses = Vec::with_capacity(130);
+    for _ in 0..130 {
+        let (status, _) = dispatch(&state, anon(Method::GET, "/api/parts", None)).await;
+        statuses.push(status);
+    }
+
+    let throttled = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+
+    assert_eq!(
+        throttled,
+        0,
+        "under the dev-insecure posture the per-sentinel rate limit must be \
+         bypassed — a shared-bucket limit starves the whole API when the dev \
+         frontend polls; {throttled} of {} requests were throttled",
+        statuses.len()
+    );
+    // Every request must have been admitted (not blanket-rejected): the
+    // route answers 2xx for all 130.
+    let ok = statuses.iter().filter(|s| s.is_success()).count();
+    assert_eq!(
+        ok,
+        statuses.len(),
+        "all requests under the dev bypass must be admitted — only {ok} of {} \
+         succeeded",
+        statuses.len()
     );
 }
