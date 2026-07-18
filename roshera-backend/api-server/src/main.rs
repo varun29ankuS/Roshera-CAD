@@ -8668,6 +8668,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/timeline/parameter-name",
             post(crate::handlers::timeline::bind_parameter_name),
         )
+        // #64 Slice 5: the honest per-feature rebuild certificate for the
+        // branch's current (moulds folded) state — Rebuilt/Unaffected/Failed/
+        // Dangling/Blocked verdicts + a re-measured is_sound.
+        .route(
+            "/api/timeline/rebuild-certificate/{branch_id}",
+            get(crate::handlers::timeline::get_rebuild_certificate),
+        )
         // Disambiguate against the session-scoped undo/redo also re-
         // exported via `handlers::*` (handlers/session.rs). The
         // timeline-scoped variant takes `Json<Value>` carrying a

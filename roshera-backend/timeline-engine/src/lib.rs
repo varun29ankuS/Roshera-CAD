@@ -29,6 +29,7 @@ pub mod execution;
 pub mod incremental;
 pub mod mould;
 pub mod operations;
+pub mod rebuild_certificate;
 pub mod recorder_bridge;
 pub mod replay;
 pub mod storage;
@@ -49,6 +50,7 @@ pub use mould::{
     is_param_meta, mould_operation, name_binding_operation, params_have_numeric, NameBindings,
     OverrideSet, MOULD_COMMAND, NAME_COMMAND,
 };
+pub use rebuild_certificate::{certify_rebuild, FeatureStatus, FeatureVerdict, RebuildCertificate};
 pub use recorder_bridge::{SharedTimeline, TimelineRecorder};
 pub use replay::{apply_event, rebuild_model_from_events, ReplayError, ReplayOutcome};
 pub use timeline::Timeline;

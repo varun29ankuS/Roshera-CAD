@@ -103,6 +103,21 @@ pub enum ReplayError {
         /// String form of the kernel-side error.
         message: String,
     },
+
+    /// A cross-feature reference (an edge/face a downstream op consumes) no
+    /// longer resolves to a live entity after an upstream parameter edit
+    /// (#64 Parametric-DAG, Slice 5, Decision d — the persistent-naming hard
+    /// case). Surfaced as a *typed* verdict so the [`crate::rebuild_certificate`]
+    /// reports `Dangling` for that feature instead of a silent wrong-entity
+    /// rebind or an opaque kernel error. Distinct from `KernelError`: this is a
+    /// reference-durability failure, not a numeric/geometric one.
+    #[error("dangling reference in {kind}: {entity} no longer resolves")]
+    DanglingReference {
+        /// The operation kind whose reference dangled.
+        kind: String,
+        /// The reference that failed to resolve (e.g. `edge:7` or its PID).
+        entity: String,
+    },
 }
 
 /// Assembly documents rebuilt by replay (kinematic-assembly campaign,
@@ -1062,6 +1077,15 @@ fn dispatch_generic(
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let solid = remap_id(solid_raw, id_remap) as SolidId;
+            // #64 Slice 5 (Decision d): PID-through-the-ladder reference binding.
+            // Before filleting, confirm every referenced edge still resolves to a
+            // live entity. An upstream parameter edit that changed topology can
+            // consume/renumber the edge this fillet named; if the remapped id no
+            // longer exists, surface a TYPED DanglingReference (enriched with the
+            // edge's PID when it carries one — extrude/revolve side edges do) so
+            // the rebuild certificate reports `Dangling` rather than filleting a
+            // wrong edge silently or dying as an opaque kernel error.
+            check_edges_resolve(model, kind, &edge_ids)?;
             // Prefer the structured `radius` field added in 2026-05-10;
             // fall back to parsing the Debug-formatted `fillet_type`
             // string for events recorded by older builds. Final fallback
@@ -1108,6 +1132,9 @@ fn dispatch_generic(
                 .map(|id| remap_id(id, id_remap) as EdgeId)
                 .collect();
             let solid = remap_id(solid_raw, id_remap) as SolidId;
+            // #64 Slice 5 (Decision d): typed DanglingReference if a referenced
+            // edge no longer resolves after an upstream mould (see fillet_edges).
+            check_edges_resolve(model, kind, &edge_ids)?;
             let distance = inner
                 .get("distance1")
                 .and_then(|v| v.as_f64())
@@ -1518,6 +1545,31 @@ fn geometry_id_to_u64(id: GeometryId) -> u64 {
 /// `filter_map` to drop entries of the wrong kind silently — useful
 /// when `inputs[]` interleaves multiple kinds and only one is wanted
 /// (e.g. fillet recording `[solid, edge, edge, ...]`).
+/// #64 Slice 5 (Decision d) — verify every edge a blend references still
+/// resolves to a live entity in `model`, binding through the persistent-id
+/// ladder. Returns [`ReplayError::DanglingReference`] naming the first edge that
+/// no longer exists (enriched with its PID when the edge carried one — the
+/// durable Kripac lineage name), so an upstream mould that consumed the edge is
+/// reported honestly rather than filleting a wrong edge or dying opaquely.
+fn check_edges_resolve(
+    model: &BRepModel,
+    kind: &str,
+    edge_ids: &[EdgeId],
+) -> Result<(), ReplayError> {
+    for &eid in edge_ids {
+        if model.edges.get(eid).is_none() {
+            // The edge vanished. If a sibling still holds this transient id's
+            // PID we cannot recover it (it is gone), so name the recorded id;
+            // callers with the pre-mould PID map can cross-reference.
+            return Err(ReplayError::DanglingReference {
+                kind: kind.to_string(),
+                entity: format!("edge:{eid}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn parse_entity_ref(v: &Value, expected_kind: &str) -> Option<u64> {
     if let Some(s) = v.as_str() {
         let (kind, id) = s.split_once(':')?;

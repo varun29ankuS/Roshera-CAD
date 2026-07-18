@@ -14,9 +14,10 @@ use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use timeline_engine::{
-    mould_operation, name_binding_operation, params_have_numeric, rebuild_model_from_events,
-    Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId, EventMetadata, NameBindings,
-    Operation, OperationInputs, ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent,
+    certify_rebuild, mould_operation, name_binding_operation, params_have_numeric,
+    rebuild_model_from_events, Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId,
+    EventMetadata, NameBindings, Operation, OperationInputs, RebuildCertificate, ReplayOutcome,
+    SessionId, Timeline, TimelineError, TimelineEvent,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -1213,22 +1214,6 @@ fn summarize_solids(model: &BRepModel) -> Vec<MouldObjectSummary> {
     out
 }
 
-/// Re-measured soundness of a replayed model: replay must have skipped no
-/// event, produced at least one solid, and the B-Rep must validate. Honest
-/// (recomputed from geometry), never asserted.
-fn measure_soundness(model: &BRepModel, events_skipped: usize) -> bool {
-    if events_skipped > 0 || model.solids.is_empty() {
-        return false;
-    }
-    let tol = geometry_engine::math::Tolerance::default();
-    geometry_engine::primitives::validation::validate_model_enhanced(
-        model,
-        tol,
-        geometry_engine::primitives::validation::ValidationLevel::Standard,
-    )
-    .is_valid
-}
-
 /// `POST /api/timeline/mould` — edit a recorded parameter and re-derive
 /// (#64 Parametric-DAG, Slices 2-3).
 ///
@@ -1330,12 +1315,14 @@ pub async fn mould_parameter(
         ));
     }
 
-    // ── Honesty pre-check: trial the edit on a scratch model ──────────
+    // ── Honesty pre-check: CERTIFY the edit on a scratch model ────────
     // Build the candidate log (current events + the proposed override) and a
-    // baseline (current events). If the override introduces a NEW replay
-    // failure (a downstream op that no longer rebuilds) or an unsound solid
-    // that the baseline did not have, the mould is refused — nothing is
-    // appended, honouring append-only and "never a silent bad model".
+    // baseline (current events), and certify each rebuild (#64 Slice 5,
+    // Decision e). If the override REGRESSES soundness — the baseline certified
+    // sound but the candidate does not — the mould is refused with the full
+    // typed certificate naming the first broken feature; nothing is appended,
+    // honouring append-only and "never a silent bad model". The certificate
+    // re-measures `is_sound` from the resulting B-Rep, never asserts it.
     let mut mould_event = TimelineEvent {
         id: EventId::new(),
         sequence_number: events.last().map(|e| e.sequence_number + 1).unwrap_or(0),
@@ -1349,29 +1336,25 @@ pub async fn mould_parameter(
     let mut candidate_events = events.clone();
     candidate_events.push(mould_event.clone());
 
-    let mut base_model = BRepModel::new();
-    let base_outcome = rebuild_model_from_events(&mut base_model, &events);
-    let base_sound = measure_soundness(&base_model, base_outcome.events_skipped);
+    let (_base_model, base_cert) = certify_rebuild(&events, None);
+    let (cand_model, cand_cert) = certify_rebuild(&candidate_events, Some(target_sequence));
 
-    let mut cand_model = BRepModel::new();
-    let cand_outcome = rebuild_model_from_events(&mut cand_model, &candidate_events);
-    let cand_sound = measure_soundness(&cand_model, cand_outcome.events_skipped);
-
-    let breaks_downstream = cand_outcome.events_skipped > base_outcome.events_skipped;
-    let collapses = cand_model.solids.is_empty() && !base_model.solids.is_empty();
-    let regresses_soundness = base_sound && !cand_sound;
-
-    if breaks_downstream || collapses || regresses_soundness {
-        let reason = if breaks_downstream {
-            format!(
-                "the edit breaks a downstream feature: {} event(s) fail to rebuild (baseline {})",
-                cand_outcome.events_skipped, base_outcome.events_skipped
-            )
-        } else if collapses {
-            "the edit collapses the model to no solids".to_string()
-        } else {
-            "the edit produces an unsound solid (baseline was sound)".to_string()
-        };
+    // Refuse only a REGRESSION: a sound baseline broken by the edit (a NEW
+    // downstream failure, a dangling reference, a collapse, or a self-
+    // intersection). If the baseline was already unsound the mould is not the
+    // cause and is not blocked here.
+    if base_cert.is_sound() && !cand_cert.is_sound() {
+        let reason = cand_cert
+            .first_break()
+            .map(|v| {
+                format!(
+                    "the edit breaks feature at sequence {} ({}): {}",
+                    v.sequence,
+                    v.kind,
+                    serde_json::to_string(&v.status).unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| "the edit produces an unsound model".to_string());
         return Ok((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1381,12 +1364,11 @@ pub async fn mould_parameter(
                 "target_sequence": target_sequence,
                 "parameter": parameter,
                 "value": request.value,
-                "events_applied": cand_outcome.events_applied,
-                "events_skipped": cand_outcome.events_skipped,
-                "baseline_events_skipped": base_outcome.events_skipped,
+                "certificate": cand_cert,
             })),
         ));
     }
+    let cand_sound = cand_cert.is_sound();
 
     // ── Commit: append the override at a reserved sequence, reconcile ─
     let appended_seq = {
@@ -1416,13 +1398,20 @@ pub async fn mould_parameter(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     let reconcile = replay_session_to_model(&state, session_uuid).await;
+    // Broken (Failed/Dangling/Blocked) feature count from the certificate — the
+    // fallback when the live reconcile replay itself errors.
+    let cand_broken = cand_cert
+        .verdicts
+        .iter()
+        .filter(|v| v.status.is_break())
+        .count();
     let (events_applied, events_skipped, reconciled) = match &reconcile {
         Ok(o) => (o.events_applied, o.events_skipped, true),
         Err(err) => {
             error!(target: "timeline.mould", session = %session_uuid, error = %err, "live reconcile failed");
             (
-                cand_outcome.events_applied,
-                cand_outcome.events_skipped,
+                cand_cert.verdicts.len().saturating_sub(cand_broken),
+                cand_broken,
                 false,
             )
         }
@@ -1463,8 +1452,41 @@ pub async fn mould_parameter(
             // separate, appended correcting event.
             "original_event_preserved": true,
             "objects": objects,
+            // #64 Slice 5: the full honest per-feature rebuild certificate.
+            "certificate": cand_cert,
         })),
     ))
+}
+
+/// `GET /api/timeline/rebuild-certificate/{branch_id}` — the honest per-feature
+/// rebuild certificate for the branch's CURRENT (moulds folded) state
+/// (#64 Parametric-DAG, Slice 5, Decision e).
+///
+/// Replays the branch, roots the dirty sub-DAG at the earliest active mould
+/// target (widest affected set), and returns per-feature verdicts (Rebuilt /
+/// Unaffected / Failed / Dangling / Blocked), the dirty sequences, and a
+/// re-measured `is_sound` — recomputed from the resulting B-Rep, never asserted.
+/// No geometry is committed; this is a query over the immutable log.
+pub async fn get_rebuild_certificate(
+    State(state): State<AppState>,
+    Path(branch_id): Path<String>,
+) -> Result<Json<RebuildCertificate>, StatusCode> {
+    let _ = state.timeline_recorder.flush().await;
+    let branch_id = resolve_branch_ref(&branch_id)?;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        all
+    };
+
+    // Root the dirty sub-DAG at the earliest active mould target (its downstream
+    // set is the widest). No mould → a plain current-state certificate.
+    let target = timeline_engine::OverrideSet::collect(&events).min_target_sequence();
+    let (_model, cert) = certify_rebuild(&events, target);
+    Ok(Json(cert))
 }
 
 /// Request body for `POST /api/timeline/parameter-name` (#64 Slice 3).

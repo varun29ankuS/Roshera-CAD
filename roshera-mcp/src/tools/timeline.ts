@@ -96,6 +96,28 @@ export function registerTimelineTools(server: McpServer) {
   );
 
   server.tool(
+    "rebuild_certificate",
+    "The honest per-feature rebuild certificate for a branch's CURRENT state " +
+      "(#64 Slice 5). For every feature: Rebuilt / Unaffected / Failed{reason} / " +
+      "Dangling{entity} (a reference that no longer resolves) / Blocked{by} " +
+      "(downstream of a break), plus the dirty sequences and a re-measured " +
+      "`is_sound` recomputed from the B-Rep (never asserted). Use after a mould " +
+      "to see exactly what the edit did to every dependent.",
+    { branch: z.string().default("main") },
+    async ({ branch }) => {
+      try {
+        const r = await api(
+          "GET",
+          `/api/timeline/rebuild-certificate/${branch}`,
+        );
+        return ok(r);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "timeline_scrub",
     "Look at the scene AS OF a past event — non-destructive (live scene " +
       "untouched). Returns object count + mesh stats at that moment.",
