@@ -15800,6 +15800,80 @@ fn find_curve_curve_intersections(
         refined.push((best_t_a, best_t_b, best_dist));
     }
 
+    // Boundary-minimum polish (corefinement endpoint T-junctions). The
+    // coupled pattern search converges cleanly for an INTERIOR transversal
+    // crossing, but stalls at a BOUNDARY minimum — where one curve's ENDPOINT
+    // lies on the interior of the other (an SSI cut arc TERMINATING on a
+    // coplanar cut line). There the search cannot resolve the final fraction
+    // of a grid cell in the terminal parameter against a long opposite edge,
+    // so a genuine endpoint incidence refines to a residual (~1e-6…1e-5) that
+    // the crossing tolerance gate below then rejects: the arc's base end never
+    // splits the line, the arc dangles, and the planar-face arrangement drops
+    // it. This is the #17 base-cap-straddle open shell — the box side-wall ×
+    // NURBS-lateral cut arcs whose base endpoint sits on the base-cap cut line
+    // (t_a≈6e-5 stall at dist 3.2e-6 > 1e-6, while the arc's short-edge top
+    // endpoint resolves to 6e-8 and survives).
+    //
+    // Fix: when a refined parameter lands within ~2 grid cells of a curve
+    // terminal, snap it to the EXACT endpoint and re-project that endpoint
+    // onto the opposite curve with the proper closest-point solve
+    // (`Curve::project_point`). The endpoint incidence then resolves to its
+    // true (sub-tolerance) distance. This only SHARPENS minima the grid
+    // already seeded near a terminal (a real near-approach); `project_point`
+    // reports the genuine closest distance, so two curves that truly MISS near
+    // an endpoint keep their real gap and are still gated out — no crossing is
+    // manufactured, and analytic arrangements that carry no endpoint incidence
+    // are untouched.
+    let cell = 1.0 / N as f64;
+    for entry in refined.iter_mut() {
+        let snap_a = if entry.0 <= 2.0 * cell {
+            Some(0.0)
+        } else if entry.0 >= 1.0 - 2.0 * cell {
+            Some(1.0)
+        } else {
+            None
+        };
+        if let Some(t_snap) = snap_a {
+            if let Ok(p) = curve_a.point_at(t_snap) {
+                if let Some((t_o, dist)) = curve_b
+                    .project_point(&p, *tolerance)
+                    .into_iter()
+                    .map(|(t, q)| (t, (q - p).magnitude()))
+                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    if dist < entry.2 {
+                        entry.0 = t_snap;
+                        entry.1 = t_o;
+                        entry.2 = dist;
+                    }
+                }
+            }
+        }
+        let snap_b = if entry.1 <= 2.0 * cell {
+            Some(0.0)
+        } else if entry.1 >= 1.0 - 2.0 * cell {
+            Some(1.0)
+        } else {
+            None
+        };
+        if let Some(t_snap) = snap_b {
+            if let Ok(p) = curve_b.point_at(t_snap) {
+                if let Some((t_o, dist)) = curve_a
+                    .project_point(&p, *tolerance)
+                    .into_iter()
+                    .map(|(t, q)| (t, (q - p).magnitude()))
+                    .min_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    if dist < entry.2 {
+                        entry.1 = t_snap;
+                        entry.0 = t_o;
+                        entry.2 = dist;
+                    }
+                }
+            }
+        }
+    }
+
     // Tolerance gate: only true crossings survive. Sub-tolerance local
     // minima that aren't actually crossings (e.g. nearest-approach pairs
     // of skew lines that miss by 1 µm with a 1 nm tolerance) drop out.

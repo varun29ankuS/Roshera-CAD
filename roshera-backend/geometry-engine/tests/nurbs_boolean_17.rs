@@ -158,23 +158,28 @@ fn nurbs_box_cut_edges_are_shared_not_coincident() {
     );
 }
 
-/// DESIRED end state (pinned, currently RED → #[ignore]): this NASTY cutter
-/// (3×8×3 straddling the base cap at z=0 and poking fully through BOTH ±Y walls)
-/// must difference to a sound, watertight solid.
+/// #17 base-cap-straddle through-cut — the NASTY cutter (3×8×3 straddling the
+/// base cap at z=0 and poking fully through BOTH ±Y walls) differences to a
+/// sound, watertight solid. GREEN as of the #17-classification fix.
 ///
-/// FAILURE CLASS (measured 2026-07-18, branch feat/sketch-dcm-45): NOT a weld/
-/// corefinement gap. `brep_integrity` reports `coincident_edge_groups=0` and
-/// `duplicate_vertex_groups=0` — the cut edges ARE shared (the shared-corner
-/// registry works). The result is an OPEN SHELL: 16 edges-used-once, euler=-2.
-/// The box x-wall fragments are mis-classified — the parts OUTSIDE the barrel
-/// (|y|≈4, beyond radius) are kept while the INSIDE notch-wall fragments (which
-/// should mate with the NURBS cut edges e17–e20) are dropped. This is a fragment
-/// inside/outside classification / arrangement-completeness problem on the
-/// base-cap-straddling through-cut (the GWN-against-a-tapered-NURBS-tessellation
-/// family), tracked distinctly from the (now-resolved) corefinement weld — see
-/// `nurbs_box_cut_edges_are_shared_not_coincident` for the weld guard.
+/// FAILURE CLASS THAT WAS FIXED (diagnosed 2026-07-18, branch feat/sketch-dcm-45):
+/// NOT classification and NOT a weld gap — an ARRANGEMENT-COMPLETENESS defect in
+/// planar-face splitting. The box side-wall × NURBS-lateral SSI cut arcs (e17–e20)
+/// were imprinted on the freeform wall but DROPPED from the box side walls: each
+/// arc's base endpoint sits on the INTERIOR of the coplanar base-cap cut line, an
+/// endpoint-on-curve T-junction. `find_curve_curve_intersections`' coupled
+/// pattern search STALLED at that boundary minimum (t_a≈6e-5, residual 3.2e-6 >
+/// the 1e-6 crossing tolerance), so the base-cap line was never split at the arc
+/// endpoint, the arc dangled, and the DCEL walker dropped it — leaving the box
+/// side wall a single unsplit fragment spanning the full ±Y extent (16
+/// edges-used-once, euler=−2, coincident_edge_groups=0). The classification was
+/// correct throughout (crisp GWN 0/1). Fix: a boundary-minimum polish in
+/// `find_curve_curve_intersections` that snaps a near-terminal refined parameter
+/// to the exact endpoint and re-projects it onto the opposite curve
+/// (`Curve::project_point`), resolving the endpoint incidence to its true
+/// sub-tolerance distance. See `nurbs_box_cut_edges_are_shared_not_coincident`
+/// for the weld guard.
 #[test]
-#[ignore = "#17: base-cap-straddle through-cut — open shell from mis-classified box-wall notch fragments (fragment classification, NOT weld: coincident_edge_groups=0)"]
 fn nurbs_minus_box_should_be_watertight() {
     let mut m = BRepModel::new();
     let b = barrel(&mut m);
@@ -187,6 +192,24 @@ fn nurbs_minus_box_should_be_watertight() {
         BooleanOptions::default(),
     )
     .expect("#17: NURBS∖box should succeed");
+    // Structural guard: the base-cap-straddle arrangement must close — every cut
+    // edge shared by exactly two faces (no open shell), Euler-balanced. This goes
+    // red immediately if the box-wall × NURBS-lateral T-junction split regresses.
+    {
+        use geometry_engine::harness::brep_integrity::brep_integrity;
+        let rep = brep_integrity(&m, result, 1.0e-6);
+        assert!(
+            rep.edges_used_once.is_empty(),
+            "#17: base-cap-straddle must close (no open shell), found {} boundary edge(s): {:?}",
+            rep.edges_used_once.len(),
+            rep.edges_used_once,
+        );
+        assert_eq!(
+            rep.euler_poincare_genus0_residual(),
+            0,
+            "#17: welded genus-0 result must be Euler-balanced",
+        );
+    }
     let gt = m.ground_truth(result).expect("gt");
     assert!(
         gt.certificate.is_sound(),
