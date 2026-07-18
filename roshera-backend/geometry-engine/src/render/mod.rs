@@ -72,6 +72,34 @@ impl CanonicalView {
             _ => Vector3::new(0.0, 0.0, 1.0),
         }
     }
+
+    /// Orthonormal SCREEN basis `(right, up)` for this canonical view — the
+    /// same basis [`camera_basis`] derives from `direction()`/`up_hint()`.
+    /// Returns `None` only for a degenerate (parallel) pair, which the
+    /// canonical directions never produce.
+    pub(crate) fn camera_basis(self) -> Option<(Vector3, Vector3)> {
+        camera_basis(self.direction(), self.up_hint())
+    }
+}
+
+/// Orthonormal SCREEN basis `(right, up)` in world space for a camera looking
+/// along `dir` (camera→scene) with world-space `up_hint`: `right` → +pixel-x,
+/// `up` → +pixel-top (the rasterizer flips v so +up is the top image row).
+/// Returns `None` when `up_hint ∥ dir` (a pole degeneracy the caller resolves).
+///
+/// THE single source of truth for the render camera basis. [`render_mesh_dir`]
+/// rasterizes through exactly this basis, and the drawing HLR vector projection
+/// (`crate::drawing::projection::view_matrix_for_projection`, `Isometric` arm)
+/// derives its page axes from this same function. Sharing one definition is
+/// what keeps the isometric cell's shaded-solid raster and its HLR wireframe
+/// overlay in ONE pose: they can no longer disagree on iso orientation because
+/// there is only one iso camera. Standard engineering isometric is the
+/// `CanonicalView::Isometric` case — camera at (1,1,1) (az +45°, el +35.264°),
+/// world-Z up — giving `right = (1,−1,0)/√2`, `up = (−1,−1,2)/√6`.
+pub(crate) fn camera_basis(dir: Vector3, up_hint: Vector3) -> Option<(Vector3, Vector3)> {
+    let right = up_hint.cross(&dir).normalize().ok()?;
+    let up = dir.cross(&right).normalize().ok()?;
+    Some((right, up))
 }
 
 /// What the rasterizer paints per face.
@@ -619,14 +647,12 @@ fn render_mesh_dir_marks(
     let open_edges = defect_open.len();
     let nonmanifold_edges = defect_nonmanifold.len();
 
-    // Camera basis: right/up orthonormal to the view direction.
-    let right = match up_hint.cross(&dir).normalize() {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    let up = match dir.cross(&right).normalize() {
-        Ok(v) => v,
-        Err(_) => return None,
+    // Camera basis: right/up orthonormal to the view direction. Single source
+    // of truth (also consumed by the drawing HLR iso projection so the shaded
+    // raster and the wireframe overlay share one pose) — see `camera_basis`.
+    let (right, up) = match camera_basis(dir, up_hint) {
+        Some(b) => b,
+        None => return None,
     };
 
     // Project every vertex into camera coordinates (u = right, v = up,

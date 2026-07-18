@@ -83,25 +83,29 @@ fn hlr_visible_plus_hidden_covers_the_wireframe() {
         !e.hidden.is_empty(),
         "iso box has hidden edges (the far corner)"
     );
-    // The iso view axis is w=(1,1,−1)/√3, so the camera sits on the (−1,−1,1)
-    // octant: the −X face is NEAR (visible), the +X face is FAR (hidden).
-    assert!(
-        is_point_hidden(
-            &m,
-            b,
-            ProjectionType::Isometric,
-            Point3::new(12.0, 6.0, 6.0)
-        ),
-        "the far (+X) face is hidden in iso"
-    );
+    // The iso view direction is now the standard-engineering-iso camera shared
+    // with the shaded raster: w = dir = (−1,−1,−1)/√3, camera on the (1,1,1)
+    // octant (drawing-iso-mismatch fix — the arm previously hand-rolled
+    // w=(1,1,−1)/√3, an OPPOSITE octant that disagreed with the shaded raster).
+    // So the +X face is now NEAR (visible) and the −X face is FAR (hidden) —
+    // the two assertions below flip accordingly.
     assert!(
         !is_point_hidden(
             &m,
             b,
             ProjectionType::Isometric,
+            Point3::new(12.0, 6.0, 6.0)
+        ),
+        "the near (+X) face is visible in the standard iso (camera at (1,1,1))"
+    );
+    assert!(
+        is_point_hidden(
+            &m,
+            b,
+            ProjectionType::Isometric,
             Point3::new(-12.0, -6.0, -6.0)
         ),
-        "the near (−X) face is visible in iso"
+        "the far (−X) face is hidden in the standard iso (camera at (1,1,1))"
     );
 }
 

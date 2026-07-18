@@ -690,11 +690,13 @@ fn build_hlr_view(
 /// shop reader sees a recognizable solid, not see-through HLR edges.
 ///
 /// The camera is the render module's canonical isometric — the SAME
-/// (−1,−1,−1)/√3 direction and up/right basis the wireframe [`ProjectionType::
-/// Isometric`] projection uses (verified: `render::CanonicalView::Isometric`
-/// and `projection::view_matrix_for_projection(Isometric)` share the octant
-/// camera and the (1,−1,0)/√2, (1,1,2)/√6 page axes), so the shaded solid lands
-/// in the same pose the wireframe occupied.
+/// (−1,−1,−1)/√3 direction and right/up basis the wireframe [`ProjectionType::
+/// Isometric`] projection uses. Both are now derived from the one shared
+/// definition `render::camera_basis(CanonicalView::Isometric)`, so they share
+/// the octant camera and the page axes `right = (1,−1,0)/√2`,
+/// `up = (−1,−1,2)/√6` exactly — the shaded solid lands in the same pose the
+/// wireframe occupies (drawing-iso-mismatch fix: the arms previously used
+/// independent iso bases and disagreed by an octant).
 ///
 /// The PNG's pixel aspect ratio is matched to the cell's sheet-space geometry
 /// rect (`iso_extent × scale`) so the placed `<image>` is not stretched; the

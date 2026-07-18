@@ -88,17 +88,28 @@ pub fn view_matrix_for_projection(projection: ProjectionType) -> Matrix4 {
             Vector3::new(1.0, 0.0, 0.0),
         ),
         ProjectionType::Isometric => {
-            // Standard ISO axonometric: camera at (1,1,1)/√3, looking
-            // toward the origin. The view-space u axis projects world
-            // +X-and-+Y components, view-space v lifts +Z and tilts.
-            let s = 1.0_f64 / 2.0_f64.sqrt();
-            let t = 1.0_f64 / 6.0_f64.sqrt();
-            let r = 1.0_f64 / 3.0_f64.sqrt();
-            (
-                Vector3::new(s, -s, 0.0),
-                Vector3::new(t, t, 2.0 * t),
-                Vector3::new(r, r, -r),
-            )
+            // SINGLE SOURCE OF TRUTH for the isometric camera: derive the page
+            // axes from the SAME basis the shaded-solid pictorial raster renders
+            // through (`render::CanonicalView::Isometric` via `render::
+            // camera_basis`). Standard engineering isometric — camera at (1,1,1)
+            // (azimuth +45°, elevation +35.264° = asin(1/√3)), world-Z up,
+            // looking along (−1,−1,−1)/√3 toward the origin. This yields
+            //   u (page-X, screen right) = right = ( 1,−1, 0)/√2
+            //   v (page-Y, screen up)    = up    = (−1,−1, 2)/√6
+            //   w (view depth, dropped)  = dir   = (−1,−1,−1)/√3.
+            // Historically this arm hand-rolled a DIFFERENT basis
+            // (v = (1,1,2)/√6, w = (1,1,−1)/√3 — camera on the (−1,−1,1) octant),
+            // so the HLR wireframe overlay and the shaded raster disagreed by an
+            // iso octant (the bore landed in a different corner). Deriving both
+            // from `render::camera_basis` makes that mismatch unrepresentable.
+            let iso = crate::render::CanonicalView::Isometric;
+            let dir = iso.direction();
+            // Invariant: the iso view direction (−1,−1,−1)/√3 is never parallel
+            // to its up-hint (0,0,1), so `camera_basis` is always `Some`.
+            #[allow(clippy::expect_used)]
+            let (u, v) = crate::render::camera_basis(dir, iso.up_hint())
+                .expect("iso camera basis: (−1,−1,−1) is not parallel to (0,0,1)");
+            (u, v, dir)
         }
         ProjectionType::Custom { rotation } => {
             return Matrix4::new(

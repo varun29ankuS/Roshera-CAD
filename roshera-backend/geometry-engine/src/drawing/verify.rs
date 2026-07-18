@@ -76,6 +76,13 @@ pub enum DrawingIssueKind {
     /// measured interval) appears more than once on the sheet, making the
     /// drawing redundant and potentially misleading.
     RedundantDimension,
+    /// The isometric cell's shaded-solid raster and its HLR vector wireframe
+    /// are drawn through DIFFERENT iso cameras, so the two representations of
+    /// the same part disagree on orientation (an asymmetric feature — e.g. a
+    /// bore — lands in a different screen corner in the wireframe than in the
+    /// shaded overlay). Both must derive from the one shared iso camera
+    /// (`render::camera_basis(CanonicalView::Isometric)`).
+    IsoOrientationMismatch,
 }
 
 /// A single quality finding.
@@ -410,6 +417,9 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
 
     // ── UndimensionedView detection ───────────────────────────────────────
     check_undimensioned_views(drawing, &mut issues);
+
+    // ── IsoOrientationMismatch detection ──────────────────────────────────
+    check_iso_orientation_agreement(drawing, &mut issues);
 
     finalize(issues, utilization)
 }
@@ -779,6 +789,109 @@ fn check_undimensioned_views(drawing: &super::types::Drawing, issues: &mut Vec<D
     }
 }
 
+/// The isometric cell overlays a shaded-solid raster with an HLR vector
+/// wireframe. Those two representations are produced by two independent code
+/// paths — the raster by `render::CanonicalView::Isometric` (via
+/// `render::camera_basis`), the wireframe by
+/// `projection::view_matrix_for_projection(Isometric)`. If those two iso
+/// cameras ever drift apart, the SAME part is drawn in two orientations and the
+/// reader sees it doubled and rotated. This invariant catches that drift.
+///
+/// **Why this closes the gap, not just the instance:** the semantic checks
+/// above (labels, dimensions, sheet fit) never look at whether the raster and
+/// the wireframe of the iso cell agree, which is exactly how a rotated-double
+/// iso shipped. Here we PROJECT a set of asymmetric world markers (the three
+/// world axes — a bore/boss offset from the part centre projects like these)
+/// through BOTH iso cameras and require each marker to land in the same screen
+/// QUADRANT (same corner) in both. Screen mapping: for the wireframe the SVG
+/// group applies `scale(sx, −sx)`, so a larger page-Y (`v·m`) is HIGHER on the
+/// sheet; the raster is rendered with +up as its top row and placed un-flipped,
+/// so a larger `up·m` is likewise HIGHER — hence both map "larger vertical dot
+/// ⇒ screen-up", and agreement is a per-axis sign match of
+/// `(u·m, v·m)` against `(right·m, up·m)`.
+///
+/// Only runs when the drawing actually carries an isometric view with a shaded
+/// raster (the exact configuration where the doubling is visible); a drawing
+/// with no shaded iso cell has nothing to disagree.
+fn check_iso_orientation_agreement(drawing: &Drawing, issues: &mut Vec<DrawingIssue>) {
+    let has_shaded_iso = drawing
+        .views
+        .iter()
+        .any(|v| matches!(v.projection, ProjectionType::Isometric) && v.shaded_raster.is_some());
+    if !has_shaded_iso {
+        return;
+    }
+
+    // Wireframe (HLR) iso page axes: u = page-X, v = page-Y (rows of the
+    // world→view matrix; the third row / view depth is dropped).
+    let vm = super::projection::view_matrix_for_projection(ProjectionType::Isometric);
+
+    // Shaded raster iso camera SCREEN axes (right, up). Derived from the shared
+    // single source. If the render module could not build a basis (it always
+    // can for the canonical iso), we cannot compare — skip rather than misfire.
+    let Some((right, up)) = crate::render::CanonicalView::Isometric.camera_basis() else {
+        return;
+    };
+
+    if let Some((m, w, s, axis)) = iso_marker_disagreement(&vm, right, up) {
+        let which = if axis == 0 { "horizontal" } else { "vertical" };
+        issues.push(error(
+            DrawingIssueKind::IsoOrientationMismatch,
+            format!(
+                "isometric cell: the shaded raster and the HLR wireframe use different iso \
+                 cameras — marker ({:.0},{:.0},{:.0}) lands on opposite {which} sides \
+                 (wireframe {w:+.3} vs shaded {s:+.3}); both must derive from \
+                 render::camera_basis(CanonicalView::Isometric)",
+                m.x, m.y, m.z
+            ),
+            None,
+        ));
+    }
+}
+
+/// First asymmetric-marker screen-QUADRANT disagreement between a wireframe
+/// page basis (the rows of `vm`) and a shaded-raster screen basis `(right,
+/// up)`, or `None` when every marker lands in the same corner in both. Returns
+/// `(marker, wireframe_component, shaded_component, axis)` where `axis` is 0
+/// (horizontal) or 1 (vertical).
+///
+/// Probes the three world axes: an off-centre feature (bore/boss) projects with
+/// the same signs as these unit markers, so a per-axis sign mismatch means the
+/// feature is in a different screen corner in the two representations.
+///
+/// Factored out of [`check_iso_orientation_agreement`] so the invariant is
+/// directly unit-testable against a deliberately-wrong basis — proving it FIRES
+/// on a mismatch without having to revert the production camera unification.
+fn iso_marker_disagreement(
+    vm: &crate::math::Matrix4,
+    right: crate::math::Vector3,
+    up: crate::math::Vector3,
+) -> Option<(crate::math::Vector3, f64, f64, usize)> {
+    use crate::math::{Point3, Vector3};
+    // Deadzone: a projection component this close to zero carries no corner
+    // information (the marker sits on that screen axis), so it cannot disagree.
+    const EPS: f64 = 1e-6;
+    let markers = [
+        Vector3::new(1.0, 0.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+    ];
+    for m in markers {
+        let page = vm.transform_point(&Point3::new(m.x, m.y, m.z));
+        let wire = [page.x, page.y]; // (u·m, v·m)
+        let shaded = [right.dot(&m), up.dot(&m)]; // (right·m, up·m)
+        for (axis, (&w, &s)) in wire.iter().zip(shaded.iter()).enumerate() {
+            if w.abs() <= EPS || s.abs() <= EPS {
+                continue;
+            }
+            if w.signum() != s.signum() {
+                return Some((m, w, s, axis));
+            }
+        }
+    }
+    None
+}
+
 fn error(kind: DrawingIssueKind, message: String, view: Option<String>) -> DrawingIssue {
     DrawingIssue {
         severity: Severity::Error,
@@ -803,5 +916,115 @@ fn finalize(issues: Vec<DrawingIssue>, utilization: f64) -> DrawingQualityReport
         passed,
         sheet_utilization: utilization,
         issues,
+    }
+}
+
+#[cfg(test)]
+mod iso_orientation_tests {
+    use super::*;
+    use crate::math::Matrix4;
+
+    /// The LEGACY (pre-fix) hand-rolled iso wireframe basis: page-Y = (1,1,2)/√6
+    /// and view depth = (1,1,−1)/√3 — a DIFFERENT octant than the shaded raster.
+    /// Kept here only to prove the invariant catches exactly this drift.
+    fn legacy_wireframe_matrix() -> Matrix4 {
+        let s = 1.0_f64 / 2.0_f64.sqrt();
+        let t = 1.0_f64 / 6.0_f64.sqrt();
+        let r = 1.0_f64 / 3.0_f64.sqrt();
+        Matrix4::new(
+            s,
+            -s,
+            0.0,
+            0.0, // u (page-X)
+            t,
+            t,
+            2.0 * t,
+            0.0, // v (page-Y) — the defect: (1,1,2)/√6
+            r,
+            r,
+            -r,
+            0.0, // w (view depth) — the defect: (1,1,−1)/√3
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        )
+    }
+
+    /// GREEN: the SHIPPED (unified) iso wireframe basis agrees with the shaded
+    /// raster camera on every marker's screen corner — no disagreement.
+    #[test]
+    fn unified_iso_bases_agree() {
+        let vm = super::super::projection::view_matrix_for_projection(ProjectionType::Isometric);
+        let (right, up) = crate::render::CanonicalView::Isometric
+            .camera_basis()
+            .expect("canonical iso basis exists");
+        assert!(
+            iso_marker_disagreement(&vm, right, up).is_none(),
+            "the unified iso wireframe and shaded-raster cameras must place every \
+             marker in the same screen corner"
+        );
+    }
+
+    /// RED / mutation proof (self-contained): feed the invariant the LEGACY
+    /// wireframe basis and it must fire — the disagreement is on the VERTICAL
+    /// axis (a +X marker projects UP in the legacy wireframe but DOWN in the
+    /// shaded raster). This is the exact doubled/rotated-iso defect.
+    #[test]
+    fn legacy_iso_basis_is_caught() {
+        let (right, up) = crate::render::CanonicalView::Isometric
+            .camera_basis()
+            .expect("canonical iso basis exists");
+        let disagreement = iso_marker_disagreement(&legacy_wireframe_matrix(), right, up)
+            .expect("legacy iso basis MUST be caught as a mismatch");
+        let (_marker, wire, shaded, axis) = disagreement;
+        assert_eq!(axis, 1, "the legacy defect is a vertical (screen-Y) flip");
+        assert!(
+            wire.signum() != shaded.signum(),
+            "the marker lands on opposite vertical sides ({wire:+.3} vs {shaded:+.3})"
+        );
+    }
+
+    /// End-to-end: an auto sheet's shaded isometric cell passes the orientation
+    /// invariant, and the report carries no IsoOrientationMismatch.
+    #[test]
+    fn auto_sheet_iso_cell_orientation_agrees() {
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+        let mut model = BRepModel::new();
+        let sid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(40.0, 30.0, 20.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let drawing =
+            super::super::dimensioning::standard_drawing_auto(&model, sid, uuid::Uuid::nil())
+                .expect("auto sheet");
+        assert!(
+            drawing
+                .views
+                .iter()
+                .any(|v| matches!(v.projection, ProjectionType::Isometric)
+                    && v.shaded_raster.is_some()),
+            "fixture must carry a shaded iso cell (else the invariant is vacuous)"
+        );
+
+        let report = verify_drawing(&drawing);
+        assert!(
+            !report.has(DrawingIssueKind::IsoOrientationMismatch),
+            "shipped pipeline must not report an iso-orientation mismatch: {:?}",
+            report.issues
+        );
+    }
+
+    /// The invariant is silent when there is no shaded iso cell to disagree.
+    #[test]
+    fn no_shaded_iso_no_check() {
+        let mut issues = Vec::new();
+        let drawing = Drawing::new("t", super::super::types::SheetSize::A3);
+        check_iso_orientation_agreement(&drawing, &mut issues);
+        assert!(issues.is_empty(), "no iso cell ⇒ nothing to check");
     }
 }
