@@ -8653,6 +8653,21 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/timeline/dependency-graph/{branch_id}",
             get(crate::handlers::timeline::get_dependency_graph),
         )
+        // #64 Parametric-DAG Slices 2-3: edit a recorded parameter ("mould").
+        // Appends a `param.mould` override event and full-replays the branch
+        // with the override folded in (Decision A1 + C1); the original event is
+        // never mutated. Broken-downstream edits are refused with a typed
+        // verdict (409). Also targets by stable parameter NAME (Slice 3).
+        .route(
+            "/api/timeline/mould",
+            post(crate::handlers::timeline::mould_parameter),
+        )
+        // #64 Slice 3: bind a stable NAME to a recorded (event, parameter) so a
+        // mould can target it by name. Appended `param.name` event, latest-wins.
+        .route(
+            "/api/timeline/parameter-name",
+            post(crate::handlers::timeline::bind_parameter_name),
+        )
         // Disambiguate against the session-scoped undo/redo also re-
         // exported via `handlers::*` (handlers/session.rs). The
         // timeline-scoped variant takes `Json<Value>` carrying a

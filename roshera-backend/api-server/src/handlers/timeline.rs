@@ -14,9 +14,9 @@ use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use timeline_engine::{
-    rebuild_model_from_events, Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId,
-    EventMetadata, Operation, OperationInputs, ReplayOutcome, SessionId, Timeline, TimelineError,
-    TimelineEvent,
+    mould_operation, name_binding_operation, params_have_numeric, rebuild_model_from_events,
+    Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId, EventMetadata, NameBindings,
+    Operation, OperationInputs, ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -1144,6 +1144,423 @@ pub async fn get_dependency_graph(
         edges,
         rebuild_plan,
     }))
+}
+
+// ── Parameter edit ("mould") on the real timeline ─────────────────
+//
+// #64 Parametric-DAG, Slices 2-3. A mould is an APPENDED `param.mould`
+// override event (Decision A1 — the event-sourcing correcting-event
+// pattern); the targeted event is NEVER mutated. On success the branch is
+// full-replayed with the override folded in (Decision C1 — the correctness
+// oracle) so every downstream feature re-derives, and the live model is
+// reconciled to the rebuilt state. Broken-downstream edits surface as a
+// TYPED refusal (409), never a silent bad model.
+
+/// Request body for `POST /api/timeline/mould`.
+#[derive(Deserialize)]
+pub struct MouldRequest {
+    /// Session whose live model is reconciled after the edit.
+    pub session_id: String,
+    /// Branch to mould; defaults to `main`.
+    #[serde(default)]
+    pub branch_id: Option<String>,
+    /// Target by event UUID + raw parameter key (Slice 2). Mutually
+    /// exclusive with `name`.
+    #[serde(default)]
+    pub target_event_id: Option<String>,
+    /// Raw parameter key on the target event (e.g. `"radius"`, `"width"`).
+    #[serde(default)]
+    pub parameter: Option<String>,
+    /// Target by stable parameter NAME (Slice 3) — resolved through the
+    /// `param.name` bindings in the log.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The new dimensional value.
+    pub value: f64,
+}
+
+/// Compact per-solid summary of the rebuilt scene returned by a mould.
+#[derive(Serialize)]
+pub struct MouldObjectSummary {
+    pub id: String,
+    pub name: String,
+    pub triangles: usize,
+}
+
+/// Extract the recorded parameter payload of a `Operation::Generic` event.
+fn generic_parameters(op: &Operation) -> Option<&serde_json::Value> {
+    match op {
+        Operation::Generic { parameters, .. } => Some(parameters),
+        _ => None,
+    }
+}
+
+/// Tessellate the solids of a rebuilt model into compact summaries.
+fn summarize_solids(model: &BRepModel) -> Vec<MouldObjectSummary> {
+    let tess = geometry_engine::tessellation::TessellationParams::default();
+    let mut out = Vec::new();
+    for (solid_id, solid) in model.solids.iter() {
+        let mesh = geometry_engine::tessellation::tessellate_solid(solid, model, &tess);
+        if mesh.triangles.is_empty() {
+            continue;
+        }
+        out.push(MouldObjectSummary {
+            id: format!("solid:{}", solid_id),
+            name: format!("solid {}", solid_id),
+            triangles: mesh.triangles.len(),
+        });
+    }
+    out
+}
+
+/// Re-measured soundness of a replayed model: replay must have skipped no
+/// event, produced at least one solid, and the B-Rep must validate. Honest
+/// (recomputed from geometry), never asserted.
+fn measure_soundness(model: &BRepModel, events_skipped: usize) -> bool {
+    if events_skipped > 0 || model.solids.is_empty() {
+        return false;
+    }
+    let tol = geometry_engine::math::Tolerance::default();
+    geometry_engine::primitives::validation::validate_model_enhanced(
+        model,
+        tol,
+        geometry_engine::primitives::validation::ValidationLevel::Standard,
+    )
+    .is_valid
+}
+
+/// `POST /api/timeline/mould` — edit a recorded parameter and re-derive
+/// (#64 Parametric-DAG, Slices 2-3).
+///
+/// The edit is applied by APPENDING a `param.mould` override event and
+/// full-replaying the branch with the override folded in — the original
+/// event is never mutated (append-only preserved). Before appending, the
+/// edit is trialled on a scratch model: if it breaks a downstream feature
+/// (an op that no longer rebuilds) or yields an unsound solid, the mould is
+/// REFUSED with a typed verdict and nothing is appended. On success the live
+/// model is reconciled to the rebuilt state.
+pub async fn mould_parameter(
+    State(state): State<AppState>,
+    Json(request): Json<MouldRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let branch_id = match request.branch_id.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+
+    // Snapshot the branch log (drained), sorted by sequence.
+    let _ = state.timeline_recorder.flush().await;
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        all
+    };
+
+    // ── Resolve the target (target_sequence, parameter) ──────────────
+    let (target_sequence, target_event_id, parameter) = if let Some(name) = request.name.as_deref()
+    {
+        // Slice 3: resolve a stable NAME through the param.name bindings.
+        match NameBindings::collect(&events).resolve(name) {
+            Some((seq, param)) => (seq, None, param),
+            None => {
+                return Ok((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "status": "MouldRejected",
+                        "reason": format!("parameter name '{}' does not resolve to any bound (event, parameter)", name),
+                        "kind": "UnknownParameterName",
+                        "name": name,
+                    })),
+                ));
+            }
+        }
+    } else {
+        // Slice 2: target by event UUID + raw parameter key.
+        let (Some(raw_id), Some(param)) = (
+            request.target_event_id.as_deref(),
+            request.parameter.as_deref(),
+        ) else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        let target_uuid = Uuid::parse_str(raw_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let Some(target) = events.iter().find(|e| e.id.0 == target_uuid) else {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "MouldRejected",
+                    "reason": format!("no event {} on this branch", raw_id),
+                    "kind": "UnknownTargetEvent",
+                })),
+            ));
+        };
+        (target.sequence_number, Some(target_uuid), param.to_string())
+    };
+
+    // ── Validate the parameter is an editable numeric dimension ───────
+    let Some(target) = events.iter().find(|e| e.sequence_number == target_sequence) else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "MouldRejected",
+                "reason": format!("target sequence {} not present on branch", target_sequence),
+                "kind": "UnknownTargetEvent",
+            })),
+        ));
+    };
+    let params_ok = generic_parameters(&target.operation)
+        .map(|p| params_have_numeric(p, &parameter))
+        .unwrap_or(false);
+    if !params_ok {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "status": "MouldRejected",
+                "reason": format!(
+                    "'{}' is not a numeric dimension of event at sequence {}",
+                    parameter, target_sequence
+                ),
+                "kind": "UnknownParameter",
+                "target_sequence": target_sequence,
+                "parameter": parameter,
+            })),
+        ));
+    }
+
+    // ── Honesty pre-check: trial the edit on a scratch model ──────────
+    // Build the candidate log (current events + the proposed override) and a
+    // baseline (current events). If the override introduces a NEW replay
+    // failure (a downstream op that no longer rebuilds) or an unsound solid
+    // that the baseline did not have, the mould is refused — nothing is
+    // appended, honouring append-only and "never a silent bad model".
+    let mut mould_event = TimelineEvent {
+        id: EventId::new(),
+        sequence_number: events.last().map(|e| e.sequence_number + 1).unwrap_or(0),
+        timestamp: chrono::Utc::now(),
+        author: Author::System,
+        operation: mould_operation(target_sequence, target_event_id, &parameter, request.value),
+        inputs: OperationInputs::default(),
+        outputs: Default::default(),
+        metadata: EventMetadata::default(),
+    };
+    let mut candidate_events = events.clone();
+    candidate_events.push(mould_event.clone());
+
+    let mut base_model = BRepModel::new();
+    let base_outcome = rebuild_model_from_events(&mut base_model, &events);
+    let base_sound = measure_soundness(&base_model, base_outcome.events_skipped);
+
+    let mut cand_model = BRepModel::new();
+    let cand_outcome = rebuild_model_from_events(&mut cand_model, &candidate_events);
+    let cand_sound = measure_soundness(&cand_model, cand_outcome.events_skipped);
+
+    let breaks_downstream = cand_outcome.events_skipped > base_outcome.events_skipped;
+    let collapses = cand_model.solids.is_empty() && !base_model.solids.is_empty();
+    let regresses_soundness = base_sound && !cand_sound;
+
+    if breaks_downstream || collapses || regresses_soundness {
+        let reason = if breaks_downstream {
+            format!(
+                "the edit breaks a downstream feature: {} event(s) fail to rebuild (baseline {})",
+                cand_outcome.events_skipped, base_outcome.events_skipped
+            )
+        } else if collapses {
+            "the edit collapses the model to no solids".to_string()
+        } else {
+            "the edit produces an unsound solid (baseline was sound)".to_string()
+        };
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "MouldRejected",
+                "reason": reason,
+                "kind": "BrokenDownstream",
+                "target_sequence": target_sequence,
+                "parameter": parameter,
+                "value": request.value,
+                "events_applied": cand_outcome.events_applied,
+                "events_skipped": cand_outcome.events_skipped,
+                "baseline_events_skipped": base_outcome.events_skipped,
+            })),
+        ));
+    }
+
+    // ── Commit: append the override at a reserved sequence, reconcile ─
+    let appended_seq = {
+        let timeline = state.timeline.write().await;
+        let seq = timeline.reserve_sequence_number();
+        mould_event.sequence_number = seq;
+        timeline
+            .add_operation_reserved(
+                mould_event.operation.clone(),
+                Author::System,
+                branch_id,
+                seq,
+            )
+            .await
+            .map_err(|e| {
+                error!(target: "timeline.mould", error = %e, "mould append failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        seq
+    };
+
+    // Advance the session position to include the appended override, then
+    // reconcile the live model by replaying the branch (which now folds the
+    // mould in automatically — moulds are in-log events).
+    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
+        error!(target: "timeline.mould", session = %session_uuid, error = %err, "session seed failed");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let reconcile = replay_session_to_model(&state, session_uuid).await;
+    let (events_applied, events_skipped, reconciled) = match &reconcile {
+        Ok(o) => (o.events_applied, o.events_skipped, true),
+        Err(err) => {
+            error!(target: "timeline.mould", session = %session_uuid, error = %err, "live reconcile failed");
+            (
+                cand_outcome.events_applied,
+                cand_outcome.events_skipped,
+                false,
+            )
+        }
+    };
+
+    let _ = state
+        .session_manager
+        .broadcast_manager()
+        .broadcast_to_session(
+            &request.session_id,
+            BroadcastMessage::TimelineUpdate {
+                session_id: session_uuid,
+                event_id: mould_event.id.to_string(),
+                operation: "mould".to_string(),
+                user_id: "system".to_string(),
+            },
+        )
+        .await;
+
+    // Summaries come from the trial candidate model (equal to the reconciled
+    // state — same events, same deterministic replay).
+    let objects = summarize_solids(&cand_model);
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "MouldApplied",
+            "override_event_id": mould_event.id.to_string(),
+            "override_sequence": appended_seq,
+            "target_sequence": target_sequence,
+            "parameter": parameter,
+            "value": request.value,
+            "events_applied": events_applied,
+            "events_skipped": events_skipped,
+            "is_sound": cand_sound,
+            "model_reconciled": reconciled,
+            // Append-only: the targeted event is never mutated — this mould is a
+            // separate, appended correcting event.
+            "original_event_preserved": true,
+            "objects": objects,
+        })),
+    ))
+}
+
+/// Request body for `POST /api/timeline/parameter-name` (#64 Slice 3).
+#[derive(Deserialize)]
+pub struct BindParameterNameRequest {
+    #[serde(default)]
+    pub branch_id: Option<String>,
+    /// The stable, agent-friendly name to bind (e.g. `"bore_diameter"`).
+    pub name: String,
+    /// Event UUID whose parameter the name binds to.
+    pub target_event_id: String,
+    /// The raw numeric parameter key on that event.
+    pub parameter: String,
+}
+
+/// `POST /api/timeline/parameter-name` — bind a stable NAME to a recorded
+/// `(event, parameter)` so a mould can target it by name (#64 Slice 3).
+///
+/// The binding is an appended `param.name` event (append-only, latest-wins:
+/// re-binding a name later supersedes the earlier binding, and both survive
+/// replay). The parameter must be an editable numeric dimension of the target
+/// event, else the bind is refused with a typed verdict.
+pub async fn bind_parameter_name(
+    State(state): State<AppState>,
+    Json(request): Json<BindParameterNameRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let branch_id = match request.branch_id.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+    let target_uuid =
+        Uuid::parse_str(&request.target_event_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let _ = state.timeline_recorder.flush().await;
+    let (target_sequence, params_ok) = {
+        let timeline = state.timeline.read().await;
+        let events = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        let Some(target) = events.iter().find(|e| e.id.0 == target_uuid) else {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "BindRejected",
+                    "reason": format!("no event {} on this branch", request.target_event_id),
+                    "kind": "UnknownTargetEvent",
+                })),
+            ));
+        };
+        let ok = generic_parameters(&target.operation)
+            .map(|p| params_have_numeric(p, &request.parameter))
+            .unwrap_or(false);
+        (target.sequence_number, ok)
+    };
+
+    if !params_ok {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "status": "BindRejected",
+                "reason": format!(
+                    "'{}' is not a numeric dimension of event {}",
+                    request.parameter, request.target_event_id
+                ),
+                "kind": "UnknownParameter",
+            })),
+        ));
+    }
+
+    let op = name_binding_operation(
+        &request.name,
+        target_sequence,
+        Some(target_uuid),
+        &request.parameter,
+    );
+    let event_id = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .add_operation(op, Author::System, branch_id)
+            .await
+            .map_err(|e| {
+                error!(target: "timeline.mould", error = %e, "name binding append failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "Bound",
+            "binding_event_id": event_id.to_string(),
+            "name": request.name,
+            "target_sequence": target_sequence,
+            "parameter": request.parameter,
+        })),
+    ))
 }
 
 /// Checkpoint/tag a specific state
