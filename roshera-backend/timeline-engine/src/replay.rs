@@ -2119,6 +2119,42 @@ mod tests {
         );
     }
 
+    /// #64 Slice 2 HONESTY signal — a mould that DRIVES A DOWNSTREAM OP TO FAIL
+    /// is detectable: replaying the moulded log skips more events than the
+    /// baseline. This is exactly the signal the `POST /api/timeline/mould`
+    /// endpoint keys on to REFUSE a broken edit (typed verdict) rather than
+    /// return a silent bad model. A box whose width is moulded to a degenerate
+    /// (non-positive) value can no longer be created — the kernel rejects it.
+    #[test]
+    fn mould_to_degenerate_dimension_surfaces_as_a_replay_skip() {
+        let base = vec![box_event(10.0, 0)];
+        let mut m_base = BRepModel::new();
+        let o_base = rebuild_model_from_events(&mut m_base, &base);
+        assert_eq!(o_base.events_skipped, 0, "the healthy box builds");
+        assert_eq!(m_base.solids.len(), 1);
+
+        // MOULD the width to a degenerate 0.0 → create_box_3d must reject it.
+        let mut moulded = base.clone();
+        let mut mould = mk_event("placeholder", serde_json::json!({}));
+        mould.operation = crate::mould::mould_operation(0, None, "width", 0.0);
+        mould.sequence_number = 1;
+        moulded.push(mould);
+
+        let mut m_bad = BRepModel::new();
+        let o_bad = rebuild_model_from_events(&mut m_bad, &moulded);
+        assert!(
+            o_bad.events_skipped > o_base.events_skipped,
+            "the degenerate mould breaks the downstream op — replay skips it \
+             (baseline {}, moulded {})",
+            o_base.events_skipped,
+            o_bad.events_skipped
+        );
+        assert!(
+            m_bad.solids.is_empty(),
+            "no solid is produced — the endpoint refuses this as a broken model"
+        );
+    }
+
     // ---- #64 Slice 0: live-path vs replay-path persistent-id parity ----
 
     fn solid_of_geo(g: GeometryId) -> SolidId {
