@@ -225,7 +225,11 @@ async fn force_session_position_at_head(
         .map(|events| events.len() as u64)
         .unwrap_or(0);
     timeline
-        .update_session_position(SessionId::new(session_uuid.to_string()), *branch, head_count)
+        .update_session_position(
+            SessionId::new(session_uuid.to_string()),
+            *branch,
+            head_count,
+        )
         .map_err(|e| format!("force session position: {}", e))
 }
 

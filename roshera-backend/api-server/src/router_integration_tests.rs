@@ -4395,7 +4395,11 @@ async fn seed_bored_box_live(state: &AppState) -> String {
     // Discover the drill event UUID exactly as an agent would — through the
     // dependency-graph projection over the live-recorded branch.
     let (ds, dbody) = dispatch(state, json_get("/api/timeline/dependency-graph/main")).await;
-    assert_eq!(ds, StatusCode::OK, "dep-graph/main must 200; body = {dbody}");
+    assert_eq!(
+        ds,
+        StatusCode::OK,
+        "dep-graph/main must 200; body = {dbody}"
+    );
     dbody["nodes"]
         .as_array()
         .expect("nodes array")
@@ -4502,7 +4506,11 @@ async fn mould_a_live_created_part_by_branch_end_to_end() {
         StatusCode::OK,
         "#29: a branch-addressed mould of a live part must apply; body = {mbody}"
     );
-    assert_eq!(mbody["status"].as_str(), Some("MouldApplied"), "body = {mbody}");
+    assert_eq!(
+        mbody["status"].as_str(),
+        Some("MouldApplied"),
+        "body = {mbody}"
+    );
     assert_eq!(
         mbody["is_sound"].as_bool(),
         Some(true),
