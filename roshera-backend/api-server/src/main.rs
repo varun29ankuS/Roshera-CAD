@@ -8307,6 +8307,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/drawings/{id}/certificate",
             get(drawing_mgr::drawing_certificate),
         )
+        // Typed query surface (campaign #55 Slice 5): scoped, certified answers
+        // (toleranced diameter, FCF datum, section cut-through, entity-at) with
+        // provenance + live-check + honest render_only/unprovenanced refusals.
+        .route(
+            "/api/drawings/{id}/query",
+            post(drawing_mgr::drawing_query_handler),
+        )
         // Part documents — one per frontend tab. CRUD on the registry;
         // geometry/sketch endpoints continue to route through the
         // legacy `state.model` until P.2 wires per-part extraction.

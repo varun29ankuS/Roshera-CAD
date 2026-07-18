@@ -30,6 +30,7 @@ pub mod hole_table;
 pub mod layout;
 pub mod pdf;
 pub mod projection;
+pub mod query;
 pub mod section_comprehension;
 pub mod section_view;
 pub mod sheet_certificate;
@@ -48,6 +49,10 @@ pub use hole_table::{build_hole_table, qualifies_for_baseline, tag_letter, HoleS
 pub use pdf::{render_drawing_pdf, PdfRenderError};
 pub use projection::{
     project_solid_edges, project_solid_view, view_matrix_for_projection, ProjectionError,
+};
+pub use query::{
+    answer_query, DatumStatus, DrawingAnswer, DrawingQuery, EntityAtAnswer, FcfAnswer,
+    TolerancedDiameterAnswer,
 };
 pub use section_comprehension::{
     section_cut_through, SectionCut, SectionCutKind, SectionCutThrough,

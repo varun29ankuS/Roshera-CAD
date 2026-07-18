@@ -35,6 +35,7 @@ import { registerBlackboardTools } from "./tools/blackboard.js";
 import { registerLabelTools } from "./tools/labels.js";
 import { registerAssemblyTools } from "./tools/assembly.js";
 import { registerGdtTools } from "./tools/gdt.js";
+import { registerDrawingTools } from "./tools/drawing.js";
 
 // The Roshera mark (roshera-app/public/favicon.svg, inlined as a data URI so the
 // server stays self-contained). MCP clients that render server icons (per the MCP
@@ -63,6 +64,7 @@ registerBlackboardTools(server);
 registerLabelTools(server);
 registerAssemblyTools(server);
 registerGdtTools(server);
+registerDrawingTools(server);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

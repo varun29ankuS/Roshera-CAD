@@ -33,10 +33,10 @@ use axum::{
 };
 use dashmap::DashMap;
 use geometry_engine::drawing::{
-    certify_drawing, project_solid_view, render_drawing_dxf, render_drawing_pdf,
+    answer_query, certify_drawing, project_solid_view, render_drawing_dxf, render_drawing_pdf,
     render_drawing_svg, standard_drawing_auto, standard_drawing_hlr, verify_drawing, Drawing,
-    DrawingQualityReport, ProjectedViewId, ProjectionType, SheetReadbackCertificate, SheetSize,
-    TitleBlock, ViewSource,
+    DrawingAnswer, DrawingQualityReport, DrawingQuery, ProjectedViewId, ProjectionType,
+    SheetReadbackCertificate, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
 use geometry_engine::primitives::snapshot::ModelSnapshot;
@@ -793,6 +793,29 @@ pub async fn drawing_semantic(
         certificate,
     }))
 }
+
+/// `POST /api/drawings/{id}/query` — answer a typed, scoped question against the
+/// sheet, certified live. The agent's certified readback verb: each answer
+/// carries provenance (PIDs / face ids / datums) + a live-check verdict, and
+/// honest-refuses (render_only / unprovenanced) rather than fabricate.
+pub async fn drawing_query_handler(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<Uuid>,
+    Json(query): Json<DrawingQuery>,
+) -> Result<Json<DrawingAnswer>, ApiError> {
+    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let drawing = {
+        let guard = handle.read().await;
+        guard.clone()
+    };
+    let cert = certify_off_lock(model_handle, drawing.clone()).await?;
+    Ok(Json(answer_query(&drawing, &cert, &query)))
+}
+
+// The query types + answer logic live in the kernel
+// (`geometry_engine::drawing::query`) — the api-server orchestrates, it holds
+// no geometric logic. Re-exported here for the route signature.
 
 /// Build a content-disposition value with a sanitised filename based on
 /// the drawing name. Falls back to the drawing UUID if the name is
