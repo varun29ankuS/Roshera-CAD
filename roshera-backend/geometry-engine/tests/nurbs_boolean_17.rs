@@ -219,16 +219,37 @@ fn nurbs_minus_box_should_be_watertight() {
 }
 
 /// EXPLORATION (#[ignore]): a clean blind pocket driven into the +X PERIODIC
-/// SEAM wall at mid-height. The corefinement/weld is SOUND here — measured
-/// 2026-07-18: `brep_valid=true watertight=true manifold=true euler=2`. The
-/// ONLY reason `is_sound()` is false is MESH QUALITY on the seam wall
-/// (`mesh_clean=false`, worst_aspect≈60, min_angle≈0.5°) — a tessellation
-/// (seam-wall facet aspect) issue, NOT corefinement. The seam-free +Y variant
-/// of exactly this cut is `nurbs_boolean_watertight::w01_clean_blind_pocket`,
-/// which is fully GREEN. Un-ignore once the seam-wall tessellation quality
-/// clears the mesh-cleanliness bar.
+/// SEAM wall at mid-height. The corefinement/weld is fully SOUND here —
+/// measured 2026-07-18: `brep_valid=true watertight=true manifold=true
+/// euler=2`. `is_sound()` is false ONLY on `mesh_clean=false`, a TESSELLATION
+/// quality issue, NOT corefinement. The seam-free +Y variant of exactly this
+/// cut (`nurbs_boolean_watertight::w01_clean_blind_pocket`) is fully GREEN.
+///
+/// PRECISE ROOT CAUSE (diagnosed 2026-07-18, #17-classification campaign): the
+/// gate that actually trips is `max_normal_dev = 75.9° > 40°` — NOT aspect /
+/// min-angle (those are non-gating readouts by design, see
+/// `MeshQuality::evaluate`). The offending facet is on the NURBS lateral (f9):
+/// a near-degenerate "ear" sliver (min interior angle 0.52°) whose three
+/// vertices are ALL edge-cache samples at z=2.000000004 — the box-bottom
+/// (z=2) pocket-opening boundary, which coincides with the barrel's z=2 loft
+/// ring (a v-knot). Both edge vectors lie in that constant-z plane, so the
+/// facet's winding normal is forced to ±Z while the true wall normal is
+/// radial → a ~76° deviation. The seam unwrap kinks the pocket-bottom boundary
+/// in UV near u=0, seeding this ear; the +Y twin, away from the seam, does not.
+///
+/// This is NOT geometrically unavoidable (the +Y twin proves a clean
+/// tessellation exists), so it is a real research-grade seam-CDT limitation,
+/// not a case for loosening the gate: the tessellator's own refinement pass
+/// (`collect_refinement_centroids`) structurally cannot reach it — its
+/// ⊥-chord error is ~0 (facet flat in z, surface centroid also at z≈2) and
+/// its corner-normal spread is small (all corners on-wall, radial), so neither
+/// criterion fires; and a boundary "ear" cannot be broken by Steiner insertion
+/// (circumcenter lands outside the trim / centroid on the boundary). Loosening
+/// `max_normal_dev` to pass this would also blind genuine off-surface WING /
+/// bore-bridge detection (a wing is itself a high-aspect sliver caught by the
+/// same winding-normal gate). Banked as a seam-CDT ear-flip follow-up.
 #[test]
-#[ignore = "#17: topology is watertight (euler=2); fails is_sound only on SEAM-WALL MESH QUALITY (tessellation, not corefinement)"]
+#[ignore = "#17: topology watertight+sound (euler=2); fails is_sound only on mesh_clean — a seam-induced degenerate ear sliver on the NURBS lateral (max_normal_dev 75.9°>40°, winding normal forced to ±Z on a z=2 ring-line ear). Research-grade seam-CDT ear-flip; NOT corefinement, NOT a gate-loosen candidate (would blind wing detection)"]
 fn nurbs_clean_blind_pocket() {
     use geometry_engine::math::Vector3;
     use geometry_engine::operations::transform::{translate, TransformOptions};
