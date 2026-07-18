@@ -53,8 +53,12 @@ export function registerTimelineTools(server: McpServer) {
     },
     async ({ value, target_event_id, parameter, name, branch }) => {
       try {
+        // #29 — address the branch's LIVE session directly (no session_id):
+        // the mould reconciles the live/active model on `branch` the same way
+        // dependency-graph/{branch} and rebuild-certificate/{branch} address it.
+        // A part built purely through the live geometry tools is mouldable
+        // end-to-end without discovering a session UUID.
         const r = await api("POST", "/api/timeline/mould", {
-          session_id: randomUUID(),
           branch_id: branch,
           target_event_id,
           parameter,

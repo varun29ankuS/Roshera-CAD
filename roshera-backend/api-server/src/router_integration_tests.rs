@@ -4332,3 +4332,267 @@ async fn import_step_path_missing_file_is_typed_error() {
         "#34: missing-file path import must carry the invalid_parameter code; body = {body}"
     );
 }
+
+// =====================================================================
+// #29 — mould a LIVE-created part end-to-end (diagnostic + gate)
+// =====================================================================
+
+/// Helper: POST a JSON body to a URI through the live router.
+fn json_post(uri: &str, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri.to_string())
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+fn json_get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri.to_string())
+        .body(Body::empty())
+        .expect("static request must build")
+}
+
+/// Build a bored box **purely through the live geometry handlers** (the
+/// ActiveModel path the MCP/REST agent tools flow through): box − cylinder,
+/// recorded onto branch `main` by the attached `TimelineRecorder`. Returns the
+/// `create_cylinder_3d` event UUID (the drill), whose `radius` a mould targets.
+async fn seed_bored_box_live(state: &AppState) -> String {
+    let (bs, bbody) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 20.0, "depth": 20.0, "height": 20.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "box create must 200; body = {bbody}");
+    let box_uuid = bbody["object"]["id"].as_str().expect("box id").to_string();
+
+    let (cs, cbody) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({"center": [0.0, 0.0, -1.0], "axis": [0.0, 0.0, 1.0], "radius": 3.0, "height": 22.0}),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "cyl create must 200; body = {cbody}");
+    let cyl_uuid = cbody["object"]["id"].as_str().expect("cyl id").to_string();
+
+    let (os, obody) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/boolean",
+            json!({"operation": "difference", "object_a": box_uuid, "object_b": cyl_uuid}),
+        ),
+    )
+    .await;
+    assert_eq!(os, StatusCode::OK, "boolean must 200; body = {obody}");
+
+    // Discover the drill event UUID exactly as an agent would — through the
+    // dependency-graph projection over the live-recorded branch.
+    let (ds, dbody) = dispatch(state, json_get("/api/timeline/dependency-graph/main")).await;
+    assert_eq!(ds, StatusCode::OK, "dep-graph/main must 200; body = {dbody}");
+    dbody["nodes"]
+        .as_array()
+        .expect("nodes array")
+        .iter()
+        .find(|n| n["operation_type"].as_str() == Some("create_cylinder_3d"))
+        .and_then(|n| n["id"].as_str())
+        .expect("the live-recorded drill event must be addressable")
+        .to_string()
+}
+
+/// The smallest-radius cylindrical face of the live `state.model` — the drilled
+/// bore's inner wall. Measured off the analytic `Cylinder` surface, not from the
+/// mould response, so it proves the LIVE model (not a scratch model) re-derived.
+async fn live_bore_radius(state: &AppState) -> Option<f64> {
+    use geometry_engine::primitives::surface::Cylinder;
+    let model = state.model.read().await;
+    let mut best: Option<f64> = None;
+    for (fid, _face) in model.faces.iter() {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(surf) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if let Some(cyl) = surf.as_any().downcast_ref::<Cylinder>() {
+            if best.is_none_or(|r| cyl.radius < r) {
+                best = Some(cyl.radius);
+            }
+        }
+    }
+    best
+}
+
+/// #29 RED→GREEN — `GET /api/timeline/sessions` must list the LIVE session that
+/// backs a part built purely through the live geometry tools. Before the wiring
+/// there was no such route (404) and no session for the live path ("sessions is
+/// empty while parts exist"); an agent could not discover a handle to mould.
+#[tokio::test]
+async fn sessions_endpoint_lists_the_live_session_for_a_live_created_part() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+
+    let (ss, sbody) = dispatch(&state, json_get("/api/timeline/sessions")).await;
+    assert_eq!(
+        ss,
+        StatusCode::OK,
+        "#29: GET /api/timeline/sessions must be a real route; body = {sbody}"
+    );
+    assert!(
+        sbody["count"].as_u64().unwrap_or(0) >= 1,
+        "#29: a live-created part must surface at least one addressable session; body = {sbody}"
+    );
+    let live = sbody["sessions"]
+        .as_array()
+        .expect("sessions array")
+        .iter()
+        .find(|s| s["kind"].as_str() == Some("live") && s["branch_id"].as_str() == Some("main"))
+        .expect("#29: the live session backing branch main must be listed");
+    // The listed id must be the stable, deterministic live-session id for main.
+    let expected =
+        crate::handlers::timeline::live_session_id(&timeline_engine::BranchId::main()).to_string();
+    assert_eq!(
+        live["session_id"].as_str(),
+        Some(expected.as_str()),
+        "#29: the live session id must be the stable derived id for the branch; body = {sbody}"
+    );
+}
+
+/// #29 RED→GREEN — the payoff the live smoke test could NOT do: a part created
+/// via the live tools is moulded END-TO-END addressing it BY BRANCH (no session
+/// UUID to discover — the same way dependency-graph/main + rebuild-certificate/
+/// main address it). The bore re-derives in the LIVE model, stays sound, the
+/// original event is append-only unchanged, and the certificate reports the
+/// dependents.
+#[tokio::test]
+async fn mould_a_live_created_part_by_branch_end_to_end() {
+    let state = make_test_state().await;
+    let drill_id = seed_bored_box_live(&state).await;
+
+    // Baseline: the live bore is the 3.0-radius drill.
+    let r0 = live_bore_radius(&state).await.expect("a drilled bore face");
+    assert!(
+        (r0 - 3.0).abs() < 1e-6,
+        "baseline live bore radius must be 3.0, got {r0}"
+    );
+
+    // Mould the drill radius 3 -> 8 addressing the live part BY BRANCH — no
+    // `session_id`. Pre-#29 this was rejected (session_id was required).
+    let (ms, mbody) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/mould",
+            json!({
+                "branch_id": "main",
+                "target_event_id": drill_id,
+                "parameter": "radius",
+                "value": 8.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ms,
+        StatusCode::OK,
+        "#29: a branch-addressed mould of a live part must apply; body = {mbody}"
+    );
+    assert_eq!(mbody["status"].as_str(), Some("MouldApplied"), "body = {mbody}");
+    assert_eq!(
+        mbody["is_sound"].as_bool(),
+        Some(true),
+        "#29: the re-derived model must be sound; body = {mbody}"
+    );
+    assert_eq!(
+        mbody["model_reconciled"].as_bool(),
+        Some(true),
+        "#29: the LIVE model must be reconciled by the mould; body = {mbody}"
+    );
+    assert_eq!(
+        mbody["original_event_preserved"].as_bool(),
+        Some(true),
+        "#29: append-only — the targeted event must be unchanged; body = {mbody}"
+    );
+
+    // The certificate must report the downstream re-derivation: the drill
+    // rebuilt and the boolean rebuilt.
+    let verdicts = mbody["certificate"]["verdicts"]
+        .as_array()
+        .expect("certificate verdicts");
+    let cyl_rebuilt = verdicts.iter().any(|v| {
+        v["kind"].as_str() == Some("create_cylinder_3d") && v["status"].as_str() == Some("rebuilt")
+    });
+    let bool_rebuilt = verdicts.iter().any(|v| {
+        v["kind"].as_str() == Some("boolean_difference") && v["status"].as_str() == Some("rebuilt")
+    });
+    assert!(
+        cyl_rebuilt && bool_rebuilt,
+        "#29: certificate must report the drill + boolean rebuilt; verdicts = {verdicts:?}"
+    );
+
+    // THE PAYOFF: the LIVE model's bore re-derived to the new 8.0 radius.
+    let r1 = live_bore_radius(&state)
+        .await
+        .expect("a drilled bore face after mould");
+    assert!(
+        (r1 - 8.0).abs() < 1e-6,
+        "#29: the live bore must re-derive to radius 8, got {r1}"
+    );
+
+    // Append-only, verified at the log: the original drill event still records
+    // radius 3.0 (the mould is a separate appended correcting event). Also the
+    // rebuild-certificate/main and mould now agree on the SAME live state.
+    let (hs, hbody) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(hs, StatusCode::OK, "history must 200; body = {hbody}");
+    let drill_still_3 = hbody.as_array().expect("history array").iter().any(|e| {
+        e["id"].as_str() == Some(drill_id.as_str())
+            && serde_json::to_string(e).unwrap_or_default().contains("3.0")
+    });
+    assert!(
+        drill_still_3,
+        "#29: the original drill event must be unchanged (radius 3.0) — append-only; \
+         history = {hbody}"
+    );
+}
+
+/// #29 back-compat — an explicit `session_id` (a real UI session, and what the
+/// MCP tool sends per-call) still moulds the live part. The join adds the
+/// no-session branch path without breaking the existing session-keyed path.
+#[tokio::test]
+async fn mould_a_live_created_part_explicit_session_still_works() {
+    let state = make_test_state().await;
+    let drill_id = seed_bored_box_live(&state).await;
+
+    let (ms, mbody) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/mould",
+            json!({
+                "session_id": Uuid::new_v4().to_string(),
+                "branch_id": "main",
+                "target_event_id": drill_id,
+                "parameter": "radius",
+                "value": 8.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ms,
+        StatusCode::OK,
+        "#29: an explicit-session mould must still apply; body = {mbody}"
+    );
+    assert_eq!(mbody["is_sound"].as_bool(), Some(true), "body = {mbody}");
+    let r1 = live_bore_radius(&state)
+        .await
+        .expect("a drilled bore face after mould");
+    assert!(
+        (r1 - 8.0).abs() < 1e-6,
+        "#29: explicit-session mould must also re-derive the live bore to 8, got {r1}"
+    );
+}

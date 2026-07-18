@@ -138,6 +138,97 @@ pub struct ReplayEventsResponse {
 ///
 /// `event_index` is a *count of applied events* (see `Timeline::undo`'s
 /// docstring), so head = `events.len()`.
+/// The stable, well-known timeline **session UUID** that backs the live/active
+/// state of a given branch (#29 — join the live ActiveModel path to an
+/// addressable timeline session).
+///
+/// The kernel's live recording path (`TimelineRecorder`, attached at startup)
+/// appends every op under `Author::System` straight onto a *branch* — it never
+/// opens a per-session pointer. So a part built purely through the live geometry
+/// tools (`create_box` → `create_cylinder` → `boolean` → …) has a full recorded
+/// event log on branch `main`, yet no `session_positions` entry the mould /
+/// undo / redo / replay endpoints can address by — the "sessions is empty while
+/// parts exist" gap the #64 slice-0 report flagged as a bounded follow-up.
+///
+/// This derives a DETERMINISTIC session id from the branch id (UUIDv5, URL
+/// namespace) so the live session is:
+///   * **stable** — the same branch always maps to the same session id, so the
+///     mould/certificate/dependency-graph endpoints all address the SAME live
+///     session consistently (they already address branch `main`);
+///   * **enumerable** — `GET /api/timeline/sessions` lists it (see
+///     [`list_timeline_sessions`]) so an agent can discover the handle;
+///   * **collision-free** — a v5 hash never aliases a real UI session's v4 id.
+///
+/// Reference: event-sourcing read-model / "one addressable projection per
+/// stream" (Fowler, *Event Sourcing*; Young, *CQRS Documents*). The branch is
+/// the stream; this session id is its live read-model handle.
+pub fn live_session_id(branch: &BranchId) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("roshera-live-session:{}", branch.0).as_bytes(),
+    )
+}
+
+/// Resolve the `session_id` a mould reconciles its live model through, from an
+/// optional request field (#29).
+///
+/// Returns `(session_uuid, is_live)`:
+///   * `None`, `"main"`, `"active"`, or `"live"` → the branch's stable
+///     [`live_session_id`], with `is_live = true`. This is the natural agent
+///     addressing: the mould targets the live branch the same way
+///     `dependency-graph/{branch}` and `rebuild-certificate/{branch}` do, with
+///     no session UUID to discover.
+///   * an explicit UUID string → that session, `is_live = false` (a real UI
+///     session carrying its own undo/redo position — back-compat with the
+///     existing surface, incl. the MCP tool's per-call random id).
+///
+/// `is_live` tells the caller to FORCE the session position to the branch head
+/// before reconciling (a live session always reflects head — it has no undo
+/// cursor), whereas an explicit UI session's existing position is respected.
+fn resolve_reconcile_session(
+    session_field: Option<&str>,
+    branch: &BranchId,
+) -> Result<(Uuid, bool), StatusCode> {
+    match session_field.map(str::trim) {
+        None | Some("") => Ok((live_session_id(branch), true)),
+        Some(s)
+            if s.eq_ignore_ascii_case("main")
+                || s.eq_ignore_ascii_case("active")
+                || s.eq_ignore_ascii_case("live") =>
+        {
+            Ok((live_session_id(branch), true))
+        }
+        Some(s) => Uuid::parse_str(s)
+            .map(|u| (u, false))
+            .map_err(|_| StatusCode::BAD_REQUEST),
+    }
+}
+
+/// Force a session's timeline position to the current head of `branch` — always
+/// updating, unlike [`ensure_session_position_at_head`] which no-ops when a
+/// position already exists.
+///
+/// The live session ([`live_session_id`]) must always reflect the branch head:
+/// it has no undo cursor, and across repeated moulds (or interleaved live ops)
+/// a once-planted position would go stale, so an ensure-if-absent plant would
+/// silently reconcile against a truncated prefix. Forcing to head keeps the
+/// live model == full branch replay by construction.
+async fn force_session_position_at_head(
+    state: &AppState,
+    session_uuid: Uuid,
+    branch: &BranchId,
+) -> Result<(), String> {
+    let _ = state.timeline_recorder.flush().await;
+    let timeline = state.timeline.read().await;
+    let head_count = timeline
+        .get_branch_events(branch, None, None)
+        .map(|events| events.len() as u64)
+        .unwrap_or(0);
+    timeline
+        .update_session_position(SessionId::new(session_uuid.to_string()), *branch, head_count)
+        .map_err(|e| format!("force session position: {}", e))
+}
+
 async fn ensure_session_position_at_head(
     state: &AppState,
     session_uuid: Uuid,
@@ -1161,7 +1252,15 @@ pub async fn get_dependency_graph(
 #[derive(Deserialize)]
 pub struct MouldRequest {
     /// Session whose live model is reconciled after the edit.
-    pub session_id: String,
+    ///
+    /// **Optional (#29).** Omit it — or pass `"main"` / `"active"` / `"live"` —
+    /// to reconcile the live/active model on the target branch, addressing the
+    /// same live session that `dependency-graph/{branch}` and
+    /// `rebuild-certificate/{branch}` do (the branch's stable
+    /// [`live_session_id`]). Pass an explicit UUID to reconcile a specific UI
+    /// session that carries its own undo/redo position.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// Branch to mould; defaults to `main`.
     #[serde(default)]
     pub branch_id: Option<String>,
@@ -1228,11 +1327,16 @@ pub async fn mould_parameter(
     State(state): State<AppState>,
     Json(request): Json<MouldRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
-    let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let branch_id = match request.branch_id.as_deref() {
         Some(b) => resolve_branch_ref(b)?,
         None => BranchId::main(),
     };
+    // #29 — resolve the session whose live model is reconciled. When the caller
+    // omits `session_id` (or passes "main"/"active"/"live") the mould addresses
+    // the branch's stable live session, so a part built purely through the live
+    // geometry tools is mouldable end-to-end without discovering a session UUID.
+    let (session_uuid, session_is_live) =
+        resolve_reconcile_session(request.session_id.as_deref(), &branch_id)?;
 
     // Snapshot the branch log (drained), sorted by sequence.
     let _ = state.timeline_recorder.flush().await;
@@ -1393,7 +1497,16 @@ pub async fn mould_parameter(
     // Advance the session position to include the appended override, then
     // reconcile the live model by replaying the branch (which now folds the
     // mould in automatically — moulds are in-log events).
-    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
+    //
+    // #29 — the live session always reflects the branch head (it has no undo
+    // cursor), so its position is FORCED to head; an explicit UI session's
+    // existing undo/redo position is respected (ensure-if-absent).
+    let seed = if session_is_live {
+        force_session_position_at_head(&state, session_uuid, &branch_id).await
+    } else {
+        ensure_session_position_at_head(&state, session_uuid).await
+    };
+    if let Err(err) = seed {
         error!(target: "timeline.mould", session = %session_uuid, error = %err, "session seed failed");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -1417,11 +1530,12 @@ pub async fn mould_parameter(
         }
     };
 
+    let session_key = session_uuid.to_string();
     let _ = state
         .session_manager
         .broadcast_manager()
         .broadcast_to_session(
-            &request.session_id,
+            &session_key,
             BroadcastMessage::TimelineUpdate {
                 session_id: session_uuid,
                 event_id: mould_event.id.to_string(),
@@ -1487,6 +1601,106 @@ pub async fn get_rebuild_certificate(
     let target = timeline_engine::OverrideSet::collect(&events).min_target_sequence();
     let (_model, cert) = certify_rebuild(&events, target);
     Ok(Json(cert))
+}
+
+/// One addressable timeline session in the `GET /api/timeline/sessions` list.
+#[derive(Serialize)]
+pub struct TimelineSessionInfo {
+    /// The session UUID to pass to `POST /api/timeline/mould` (or omit and pass
+    /// the branch — a `live` session is the branch's default).
+    pub session_id: String,
+    /// The branch this session addresses (`"main"` for the trunk).
+    pub branch_id: String,
+    /// `"live"` — the branch's default read-model handle, always at head, backing
+    /// the live/active model (parts built through the live geometry tools land
+    /// here); or `"positioned"` — a real UI/undo session with its own cursor.
+    pub kind: String,
+    /// Count of applied events this session currently reflects (head for a live
+    /// session; the undo cursor for a positioned one).
+    pub event_index: u64,
+    /// Total events on the branch (head).
+    pub branch_event_count: u64,
+}
+
+/// `GET /api/timeline/sessions` — enumerate the addressable timeline sessions
+/// (#29 — join the live ActiveModel path to an addressable timeline session).
+///
+/// The kernel's live recording path appends every op straight onto a *branch*
+/// without opening a per-session pointer, so a part built purely through the
+/// live geometry tools (`create_box` → `boolean` → …) previously left this list
+/// empty even though the branch carried a full event log — "sessions is empty
+/// while parts exist". This composes:
+///   * a **live** session for every branch that has events — the branch's stable
+///     [`live_session_id`], always at head — so the live/active part is
+///     discoverable and mouldable (address it by omitting `session_id`, by
+///     passing `"main"`, or by the listed UUID); and
+///   * every **positioned** session actually registered in the timeline (real
+///     UI/undo/redo cursors).
+///
+/// This makes `dependency-graph/{branch}`, `rebuild-certificate/{branch}`, and
+/// `mould` all address the SAME live session consistently.
+pub async fn list_timeline_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let _ = state.timeline_recorder.flush().await;
+    let timeline = state.timeline.read().await;
+
+    let mut sessions: Vec<TimelineSessionInfo> = Vec::new();
+
+    // Live sessions: one per branch that has recorded events.
+    for branch in timeline.list_branches() {
+        let count = match timeline.get_branch_events(&branch, None, None) {
+            Ok(events) => events.len() as u64,
+            Err(_) => 0,
+        };
+        if count == 0 {
+            continue;
+        }
+        let branch_label = if branch.is_main() {
+            "main".to_string()
+        } else {
+            branch.to_string()
+        };
+        sessions.push(TimelineSessionInfo {
+            session_id: live_session_id(&branch).to_string(),
+            branch_id: branch_label,
+            kind: "live".to_string(),
+            event_index: count,
+            branch_event_count: count,
+        });
+    }
+
+    // Positioned sessions: real registered undo/redo cursors. Skip any that
+    // coincide with a live session id (already listed as `live`).
+    let live_ids: std::collections::HashSet<String> =
+        sessions.iter().map(|s| s.session_id.clone()).collect();
+    for (sid, pos) in timeline.list_session_positions() {
+        if live_ids.contains(&sid) {
+            continue;
+        }
+        let branch_label = if pos.branch_id.is_main() {
+            "main".to_string()
+        } else {
+            pos.branch_id.to_string()
+        };
+        let branch_count = timeline
+            .get_branch_events(&pos.branch_id, None, None)
+            .map(|e| e.len() as u64)
+            .unwrap_or(0);
+        sessions.push(TimelineSessionInfo {
+            session_id: sid,
+            branch_id: branch_label,
+            kind: "positioned".to_string(),
+            event_index: pos.event_index,
+            branch_event_count: branch_count,
+        });
+    }
+
+    let count = sessions.len();
+    Ok(Json(serde_json::json!({
+        "sessions": sessions,
+        "count": count,
+    })))
 }
 
 /// Request body for `POST /api/timeline/parameter-name` (#64 Slice 3).

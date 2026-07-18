@@ -1147,6 +1147,25 @@ impl Timeline {
             .map(|pos| pos.clone())
     }
 
+    /// List every registered session position as `(session id string,
+    /// position)`.
+    ///
+    /// A *session position* is the per-session pointer into a branch's event
+    /// log — the read-model handle the mould / undo / redo / replay endpoints
+    /// address. The kernel's live recording path (`TimelineRecorder`) appends
+    /// events under `Author::System` via [`Self::add_operation`] and does NOT
+    /// register a session position, so the live/active branch state is not
+    /// enumerable through `session_positions` alone. `GET /api/timeline/sessions`
+    /// composes this list with the live branch heads (see
+    /// `handlers::timeline::list_timeline_sessions`) to expose the live session
+    /// that backs a live-created part — the addressable handle a mould targets.
+    pub fn list_session_positions(&self) -> Vec<(String, SessionPosition)> {
+        self.session_positions
+            .iter()
+            .map(|entry| (entry.key().0.clone(), entry.value().clone()))
+            .collect()
+    }
+
     /// Get branch events map
     pub fn get_branch_events_map(
         &self,

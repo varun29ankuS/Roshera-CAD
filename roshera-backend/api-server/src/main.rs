@@ -8667,6 +8667,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/timeline/dependency-graph/{branch_id}",
             get(crate::handlers::timeline::get_dependency_graph),
         )
+        // #29: enumerate the addressable timeline sessions — a `live` session
+        // per branch that has events (the branch's stable read-model handle,
+        // backing a part built through the live geometry tools) plus every
+        // registered UI/undo cursor. Makes the live-created part discoverable
+        // and mouldable (previously `sessions` was empty while parts existed).
+        .route(
+            "/api/timeline/sessions",
+            get(crate::handlers::timeline::list_timeline_sessions),
+        )
         // #64 Parametric-DAG Slices 2-3: edit a recorded parameter ("mould").
         // Appends a `param.mould` override event and full-replays the branch
         // with the override folded in (Decision A1 + C1); the original event is
