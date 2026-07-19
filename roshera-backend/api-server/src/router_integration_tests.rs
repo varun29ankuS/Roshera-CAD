@@ -214,6 +214,10 @@ pub(crate) async fn make_test_state() -> AppState {
         reconcile_limiter: Arc::new(tokio::sync::Semaphore::new(
             crate::reconcile_task::MAX_CONCURRENT_RECONCILES,
         )),
+        // Bounded-executor budgets default to the generous compiled-in
+        // values; tests that exercise the timeout path overwrite
+        // `state.op_budgets` with a tiny budget before dispatching.
+        op_budgets: crate::bounded_exec::OpBudgets::default(),
     }
 }
 
@@ -5282,5 +5286,149 @@ async fn boolean_id_mapping_flip_is_atomic_with_kernel_mutation() {
          visible, uuid_a resolved to {resolved:?}, which is NOT present in \
          model.solids — a concurrent UUID-addressed request would 404 \
          SolidNotFound against a live part (consumed solid_a was {solid_a})"
+    );
+}
+
+// =====================================================================
+// Task #41 — bounded execution for heavy mutating kernel ops.
+//
+// The routed `POST /api/geometry/boolean` handler runs the kernel
+// corefinement through `bounded_exec::bounded_model_op`: on a deep
+// clone, off the model write lock, under a per-class wall-clock budget.
+// These pin the two invariants the slice guarantees.
+// =====================================================================
+
+fn union_request(a: &str, b: &str) -> Request<Body> {
+    json_post(
+        "/api/geometry/boolean",
+        json!({"operation": "union", "object_a": a, "object_b": b}),
+    )
+}
+
+/// RED (a): a boolean that blows a TINY budget returns the typed
+/// `op_timeout` refusal AND leaves the instance healthy — the model is
+/// intact (both operands still present, volumes unchanged) and a
+/// subsequent simple mutation (create a box) succeeds because the write
+/// lock was never pinned by the abandoned computation.
+///
+/// Mutation proof: route the boolean inline under the write lock again
+/// (drop the `bounded_model_op` wrapper) and the union completes well
+/// within any budget → this returns 200 with `consumed: [B]`, so the
+/// `op_timeout` assertion below fails RED. The wrapper is load-bearing.
+#[tokio::test]
+async fn boolean_over_budget_returns_op_timeout_and_leaves_model_healthy() {
+    let mut state = make_test_state().await;
+    // A 1 ns budget cannot be met by any real corefinement (a two-box
+    // union is single-digit-ms), so the timeout is deterministic — no
+    // dependency on the flaky live-hang fixture.
+    state.op_budgets = crate::bounded_exec::OpBudgets::from_durations(
+        std::time::Duration::from_nanos(1),
+        std::time::Duration::from_nanos(1),
+        std::time::Duration::from_nanos(1),
+    );
+
+    let (uuid_a, _sa, uuid_b, _sb) = seed_two_overlapping_boxes(&state).await;
+    let (a, b) = (uuid_a.to_string(), uuid_b.to_string());
+    let va0 = part_volume_by_uuid(&state, &a).await;
+    let vb0 = part_volume_by_uuid(&state, &b).await;
+
+    // The whole request must return promptly even though the abandoned
+    // compute keeps running on the discarded clone — bound the await so a
+    // regression that pins the lock trips CI instead of hanging it.
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        dispatch(&state, union_request(&a, &b)),
+    )
+    .await
+    .expect(
+        "bounded boolean must RETURN within 30 s (a hang here means the \
+             write lock was pinned by the runaway op — the exact #41 defect)",
+    );
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "an over-budget boolean must surface HTTP 504; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], "op_timeout",
+        "typed refusal must carry the stable op_timeout code; body = {body}"
+    );
+    assert_eq!(
+        body["retryable"], false,
+        "op_timeout is non-retryable (same inputs hang again); body = {body}"
+    );
+    assert_eq!(
+        body["details"]["op_kind"], "boolean",
+        "details must name the op class; body = {body}"
+    );
+    assert!(
+        body["details"]["operands"].is_array(),
+        "details must carry the operand ids; body = {body}"
+    );
+
+    // Model intact: a SUCCESSFUL union would have consumed operand B.
+    // After a timeout both operands must still be present and unchanged.
+    let va1 = part_volume_by_uuid(&state, &a).await;
+    let vb1 = part_volume_by_uuid(&state, &b).await;
+    assert!(
+        (va1 - va0).abs() < 1e-6 && (vb1 - vb0).abs() < 1e-6,
+        "both operands must survive an aborted boolean unchanged \
+         (A {va0}->{va1}, B {vb0}->{vb1}) — the op ran on a discarded clone"
+    );
+
+    // Server healthy: the write lock is free, so a fresh mutation lands.
+    let (cs, cbody) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        dispatch(
+            &state,
+            json_post(
+                "/api/geometry/box",
+                json!({"width": 4.0, "depth": 4.0, "height": 4.0, "name": "post"}),
+            ),
+        ),
+    )
+    .await
+    .expect("post-timeout create_box must RETURN (lock not held by zombie op)");
+    assert_eq!(
+        cs,
+        StatusCode::OK,
+        "a simple mutation after the timeout must succeed; body = {cbody}"
+    );
+}
+
+/// GREEN (b): the SAME fixture under a generous budget succeeds exactly
+/// as before — union returns 200, consumes operand B, and yields a
+/// result solid. This is the regression bookend: the bounded wrapper is
+/// transparent on the happy path (the swap applies the op faithfully).
+#[tokio::test]
+async fn boolean_within_budget_succeeds_and_consumes_operand() {
+    let state = make_test_state().await; // default budgets (60 s boolean)
+    let (uuid_a, _sa, uuid_b, _sb) = seed_two_overlapping_boxes(&state).await;
+    let (a, b) = (uuid_a.to_string(), uuid_b.to_string());
+
+    let (status, body) = dispatch(&state, union_request(&a, &b)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a within-budget union must succeed; body = {body}"
+    );
+    assert_eq!(body["success"], true, "body = {body}");
+    assert!(
+        body["solid_id"].as_u64().is_some(),
+        "a successful union must return a result solid id; body = {body}"
+    );
+    assert_eq!(
+        body["consumed"][0], b,
+        "the union must consume operand B (a feature ON operand A); body = {body}"
+    );
+
+    // The result persists under operand A's UUID and is queryable — the
+    // clone-swap applied the mutation to the live model.
+    let vresult = part_volume_by_uuid(&state, &a).await;
+    assert!(
+        vresult > 1000.0,
+        "the union of two overlapping 10³ boxes must exceed one box's \
+         1000 volume; got {vresult}"
     );
 }

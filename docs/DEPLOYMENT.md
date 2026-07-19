@@ -50,6 +50,7 @@ Copy `.env.partner.example` to `.env` beside the compose file and fill it in.
 | `ROSHERA_CORS_ALLOWED_ORIGINS` | `api-server/src/main.rs:9392` | Empty. Not needed same-origin (nginx proxy). Comma-separated origins; `*` opens CORS to any origin and logs a warning (`main.rs:9424`). |
 | `PUBLIC_WS_URL` (build arg `VITE_WS_URL`) | `roshera-app/src/lib/ws-client.ts:185` | `/ws` (root-relative; the browser resolves it to `ws://`/`wss://` same-origin). Set an absolute `ws(s)://host/ws` only for a split-origin deployment. |
 | `HTTP_PORT` / `API_PORT` | compose port maps | `8080` (UI) / `8081` (direct REST/WS). |
+| `ROSHERA_OP_TIMEOUT_SECS` (+ per-class `ROSHERA_OP_TIMEOUT_{BOOLEAN,BLEND,OTHER}_SECS`) | `api-server/src/bounded_exec.rs` (`OpBudgets::from_env`, resolved once at startup) | Wall-clock budget for heavy mutating kernel ops (Task #41). Defaults **ON** and generous: boolean/blend 60 s, other 120 s. An op that exceeds its budget runs on a discarded clone and the request returns `504 op_timeout` (non-retryable) while the live model and its write lock stay untouched — a runaway corefinement can no longer pin the instance. Precedence per class: per-class var → global `ROSHERA_OP_TIMEOUT_SECS` → compiled default. A value of `0`/unparseable is ignored (the guard cannot be disabled). |
 
 ### Auth posture — secure by default (important)
 

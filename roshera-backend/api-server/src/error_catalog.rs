@@ -92,6 +92,18 @@ pub enum ErrorCode {
     /// Non-retryable — the caller must re-position the tool (fix the
     /// pattern `center` / `axis`) before retrying.
     BooleanDisjoint,
+    /// A heavy mutating kernel op (boolean, and any op routed through
+    /// the bounded executor) ran past its per-class wall-clock budget
+    /// and was abandoned. Task #41: a Rust compute loop cannot be
+    /// cancelled, so the op runs on a deep CLONE off the model write
+    /// lock; on timeout the request returns THIS code promptly, the
+    /// live model is left untouched, and the write lock is free (the
+    /// runaway thread finishes on the discarded clone). Non-retryable:
+    /// the same inputs will exceed the same budget again — the caller
+    /// must simplify / reposition the geometry, or an operator must
+    /// raise the `ROSHERA_OP_TIMEOUT*` budget. `details` carries
+    /// `op_kind`, `budget_secs`, and the operand solid ids.
+    OpTimeout,
     /// The kernel succeeded but tessellation produced no triangles —
     /// almost always a kernel defect, never a client bug.
     TessellationEmpty,
@@ -212,6 +224,12 @@ impl ErrorCode {
 
             ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
 
+            // A bounded op that blew its budget is a server-side time
+            // limit, surfaced as 504 Gateway Timeout — the request was
+            // accepted and computed, but the computation did not finish
+            // in time and was abandoned.
+            ErrorCode::OpTimeout => StatusCode::GATEWAY_TIMEOUT,
+
             ErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
             ErrorCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         }
@@ -244,6 +262,13 @@ impl ErrorCode {
             | ErrorCode::BranchMergeConflict
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::AiNotConfigured
+            // A budget overrun is deterministic in its inputs: retrying
+            // the identical request re-runs the identical corefinement
+            // and blows the identical budget. The caller must change the
+            // geometry (or an operator must raise the budget), so this is
+            // non-retryable by the same rule as a caller-supplied
+            // infeasibility.
+            | ErrorCode::OpTimeout
             | ErrorCode::PermissionDenied
             | ErrorCode::MethodNotAllowed => false,
 
@@ -270,6 +295,7 @@ impl ErrorCode {
             ErrorCode::KernelError => "kernel_error",
             ErrorCode::BlendFailed => "blend_failed",
             ErrorCode::BooleanDisjoint => "boolean_disjoint",
+            ErrorCode::OpTimeout => "op_timeout",
             ErrorCode::TessellationEmpty => "tessellation_empty",
             ErrorCode::SolidNotFound => "solid_not_found",
             ErrorCode::PartNotFound => "part_not_found",
@@ -305,6 +331,7 @@ impl ErrorCode {
             ErrorCode::KernelError,
             ErrorCode::BlendFailed,
             ErrorCode::BooleanDisjoint,
+            ErrorCode::OpTimeout,
             ErrorCode::TessellationEmpty,
             ErrorCode::SolidNotFound,
             ErrorCode::PartNotFound,
@@ -473,6 +500,35 @@ impl ApiError {
             .with_details(serde_json::json!({ "failure": payload }))
     }
 
+    /// A bounded mutating op exceeded its wall-clock budget and was
+    /// abandoned (Task #41). Carries the op kind, the budget it blew,
+    /// and the operand solid ids so an agent can branch on
+    /// `details.op_kind` and report which geometry was too heavy. The
+    /// live model is unchanged — the op ran on a discarded clone — so
+    /// the hint steers the caller at the two real levers: simpler
+    /// geometry, or a larger operator-set budget.
+    pub fn op_timeout(op_kind: &str, budget_secs: f64, operands: &[u32]) -> Self {
+        Self::new(
+            ErrorCode::OpTimeout,
+            format!(
+                "operation '{op_kind}' exceeded its {budget_secs}s time budget \
+                 and was aborted; the model is unchanged"
+            ),
+        )
+        .with_hint(
+            "The corefinement did not converge in the allotted time. Simplify \
+             or reposition the operands (fewer faces, avoid near-tangential \
+             coincident faces / thin walls sharing a seam), or have an operator \
+             raise the ROSHERA_OP_TIMEOUT_SECS budget and retry."
+                .to_string(),
+        )
+        .with_details(serde_json::json!({
+            "op_kind": op_kind,
+            "budget_secs": budget_secs,
+            "operands": operands,
+        }))
+    }
+
     /// Kernel returned a handle of an unexpected variant.
     pub fn kernel_returned_wrong_type(detail: impl std::fmt::Display) -> Self {
         Self::new(
@@ -627,6 +683,23 @@ mod tests {
         assert_eq!(v["error_code"], "unknown_shape_type");
         assert_eq!(v["details"]["shape_type"], "dodecahedron");
         assert_eq!(v["retryable"], false);
+    }
+
+    #[test]
+    fn op_timeout_wire_shape_is_504_non_retryable_with_details() {
+        let e = ApiError::op_timeout("boolean", 60.0, &[7, 9]);
+        assert_eq!(e.code, ErrorCode::OpTimeout);
+        assert_eq!(e.code.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!e.retryable, "same inputs blow the same budget again");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["error_code"], "op_timeout");
+        assert_eq!(v["retryable"], false);
+        assert_eq!(v["details"]["op_kind"], "boolean");
+        assert_eq!(v["details"]["budget_secs"], 60.0);
+        assert_eq!(v["details"]["operands"][0], 7);
+        assert_eq!(v["details"]["operands"][1], 9);
+        assert!(v["hint"].is_string());
     }
 
     #[test]

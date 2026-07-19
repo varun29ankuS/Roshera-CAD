@@ -20,6 +20,7 @@ mod auth_slice1_tests;
 mod blackboard;
 #[cfg(test)]
 mod blend_failed_harness;
+mod bounded_exec;
 mod branches;
 mod csketch;
 mod drawing_mgr;
@@ -269,6 +270,14 @@ pub struct AppState {
     /// (`MAX_CONCURRENT_RECONCILES`). Machine-safety: concurrent multi-
     /// viewpoint renders are the burst hazard this bounds.
     pub reconcile_limiter: reconcile_task::ReconcileLimiter,
+
+    /// Per-op-class wall-clock budgets for the bounded executor (Task #41).
+    /// Resolved once from the environment at startup (`OpBudgets::from_env`)
+    /// and baked in so enforcement is deterministic. Default ON with
+    /// generous budgets — a heavy mutating op that blows its budget returns
+    /// `504 op_timeout` promptly instead of pinning the model write lock
+    /// forever. See `bounded_exec.rs`.
+    pub op_budgets: bounded_exec::OpBudgets,
 }
 
 impl AppState {
@@ -1494,69 +1503,81 @@ async fn boolean_operation(
         ));
     }
 
-    // Hold the model write lock only for the kernel boolean. Tessellation
-    // — read-only and potentially expensive — runs under a read lock so
-    // concurrent writers aren't blocked on geometry that's already built.
-    // The base operand's kernel name is captured under the same guard,
-    // BEFORE the boolean consumes it: the result is upserted under A's
-    // UUID (a cut is a feature ON the part, not a new part), so the
-    // result solid inherits A's name — persisting the generated
-    // "Difference N" label instead would rename the part on reload.
-    let result_solid_id = {
-        let mut model = model_handle.write().await;
-        let base_kernel_name = model.solids.get(solid_a).and_then(|s| s.name.clone());
-        let id = kernel_boolean(
-            &mut model,
-            solid_a,
-            solid_b,
-            operation,
-            BooleanOptions::default(),
-        )
-        .map_err(|e| match e {
-            // Honesty gate: a difference whose tool never touches the
-            // target is a caller positioning error, not a kernel fault —
-            // surface the typed refusal (400, non-retryable) instead of
-            // the generic 500 kernel_error. Both operands are rolled
-            // back intact and keep their UUID mappings.
-            geometry_engine::operations::OperationError::DisjointDifference => ApiError::new(
-                ErrorCode::BooleanDisjoint,
-                format!(
-                    "difference removed nothing: tool {uuid_b} does not \
-                     intersect target {uuid_a} — the cut misses the part \
-                     entirely, so no hole was drilled"
-                ),
+    // Task #41 — BOUNDED execution. The kernel boolean runs arbitrary
+    // corefinement and has spun >120 s under the write lock on a
+    // thin-wall coincident-throat union, pinning the whole instance. Route
+    // it through the bounded executor: the op runs on a deep CLONE off the
+    // write lock inside `spawn_blocking` under a per-class time budget; on
+    // overrun the request returns `504 op_timeout` promptly, the live model
+    // is untouched, and the write lock stays free. On success the mutated
+    // clone is swapped into the live model under a brief write lock, and the
+    // id-mapping flip runs in the `commit` hook UNDER THAT SAME GUARD so the
+    // {kernel mutation, UUID remap} pair is still observed atomically (a cut
+    // is a feature ON operand A: A's UUID re-points at the result, B's
+    // mapping is dropped). The base operand's kernel name is captured and
+    // re-applied inside the op closure — on the clone — BEFORE the swap, so
+    // the result inherits A's name instead of the generated "Difference N"
+    // label (which would rename the part on reload).
+    let state_for_commit = state.clone();
+    let result_solid_id = bounded_exec::bounded_model_op(
+        Arc::clone(&model_handle),
+        bounded_exec::OpClass::Boolean,
+        state.op_budgets,
+        vec![solid_a, solid_b],
+        move |model| {
+            let base_kernel_name = model.solids.get(solid_a).and_then(|s| s.name.clone());
+            let id = kernel_boolean(
+                model,
+                solid_a,
+                solid_b,
+                operation,
+                BooleanOptions::default(),
             )
-            .with_hint(
-                "Re-position the tool so it overlaps the target (check the \
-                 pattern center / axis against the part's actual location), \
-                 then retry."
-                    .to_string(),
-            )
-            .with_details(serde_json::json!({
-                "object_a": uuid_a.to_string(),
-                "object_b": uuid_b.to_string(),
-            })),
-            other => ApiError::kernel_error(other),
-        })?;
-        if let (Some(name), Some(result)) = (base_kernel_name, model.solids.get_mut(id)) {
-            result.name = Some(name);
-        }
-        // Flip the id-mapping while the model write lock is STILL held, so
-        // the {kernel mutation, UUID remap} pair is observed atomically by
-        // any concurrent reader. Operand B is consumed → its mapping is
-        // dropped; operand A persists as the result → its UUID is
-        // re-pointed at the new solid. Done outside the lock (after
-        // tessellation, as it used to be), a window opened where `uuid_a`
-        // still resolved to the just-deleted `solid_a`, so a concurrent
-        // UUID-addressed request (e.g. rename_part_by_uuid) 404'd
-        // SolidNotFound against a part that is live before and after.
-        // `solid_a`/`solid_b`/`uuid_a`/`uuid_b` are captured locals, so the
-        // later `tombstone_consumed_uuids` call is unaffected by moving this.
-        state.unregister_id_mapping(&uuid_b);
-        state.register_id_mapping(uuid_a, id);
-        id
-        // model write guard drops here
-    };
+            .map_err(|e| match e {
+                // Honesty gate: a difference whose tool never touches the
+                // target is a caller positioning error, not a kernel fault —
+                // surface the typed refusal (400, non-retryable) instead of
+                // the generic 500 kernel_error. Both operands are rolled
+                // back intact (on the clone) and keep their UUID mappings —
+                // the live model was never touched.
+                geometry_engine::operations::OperationError::DisjointDifference => ApiError::new(
+                    ErrorCode::BooleanDisjoint,
+                    format!(
+                        "difference removed nothing: tool {uuid_b} does not \
+                         intersect target {uuid_a} — the cut misses the part \
+                         entirely, so no hole was drilled"
+                    ),
+                )
+                .with_hint(
+                    "Re-position the tool so it overlaps the target (check the \
+                     pattern center / axis against the part's actual location), \
+                     then retry."
+                        .to_string(),
+                )
+                .with_details(serde_json::json!({
+                    "object_a": uuid_a.to_string(),
+                    "object_b": uuid_b.to_string(),
+                })),
+                other => ApiError::kernel_error(other),
+            })?;
+            if let (Some(name), Some(result)) = (base_kernel_name, model.solids.get_mut(id)) {
+                result.name = Some(name);
+            }
+            Ok(id)
+        },
+        // Runs under the swap write guard, atomic with the model swap:
+        // operand B is consumed → its mapping is dropped; operand A persists
+        // as the result → its UUID is re-pointed at the new solid. Done
+        // outside the lock, a window opened where `uuid_a` still resolved to
+        // the just-deleted `solid_a`, so a concurrent UUID-addressed request
+        // (e.g. rename_part_by_uuid) 404'd SolidNotFound against a part that
+        // is live before and after.
+        |id: &geometry_engine::primitives::solid::SolidId| {
+            state_for_commit.unregister_id_mapping(&uuid_b);
+            state_for_commit.register_id_mapping(uuid_a, *id);
+        },
+    )
+    .await?;
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;
@@ -8256,6 +8277,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconcile_limiter: Arc::new(tokio::sync::Semaphore::new(
             reconcile_task::MAX_CONCURRENT_RECONCILES,
         )),
+        // Bounded-executor budgets (Task #41): default ON, generous, env-
+        // overridable via ROSHERA_OP_TIMEOUT*_SECS. Resolved once here.
+        op_budgets: bounded_exec::OpBudgets::from_env(),
     };
 
     // Background sweeper for expired transactions. The TX_TTL inside
