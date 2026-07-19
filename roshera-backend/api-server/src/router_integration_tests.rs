@@ -4604,3 +4604,315 @@ async fn mould_a_live_created_part_explicit_session_still_works() {
         "#29: explicit-session mould must also re-derive the live bore to 8, got {r1}"
     );
 }
+
+// =====================================================================
+// Tests — piecewise-analytic revolve (typed profile_segments, spec
+// 2026-07-19 Slice B) through the live router
+// =====================================================================
+
+/// The mixed nozzle-style typed profile (closed after auto-close; axis at
+/// r = 0): bottom cap line, chamber wall line, off-axis throat arc,
+/// converging cone line, NURBS bell, top cap line, axis closure line.
+fn typed_nozzle_segments() -> Value {
+    json!([
+        {"type": "line", "start": [0.0, 0.0], "end": [5.0, 0.0]},
+        {"type": "line", "start": [5.0, 0.0], "end": [5.0, 3.0]},
+        {"type": "arc", "center": [6.0, 3.0], "radius": 1.0,
+         "start_angle": std::f64::consts::PI,
+         "end_angle": std::f64::consts::FRAC_PI_2, "ccw": false},
+        {"type": "line", "start": [6.0, 4.0], "end": [4.0, 6.0]},
+        {"type": "nurbs", "degree": 3,
+         "control_points": [[4.0, 6.0], [3.5, 6.8], [2.6, 6.2], [2.0, 7.0]],
+         "knots": [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]},
+        {"type": "line", "start": [2.0, 7.0], "end": [0.0, 7.0]},
+        // No axis-closure segment: the loop auto-closes (0,7) → (0,0).
+    ])
+}
+
+/// Slice B wire gate: a typed `profile_segments` POST routes to the STRICT
+/// piecewise-analytic kernel path and the resulting solid carries the exact
+/// per-segment face census — one Cylinder, one Cone, one Torus, one
+/// SurfaceOfRevolution, two Plane caps — never `segments`× faceted bands.
+#[tokio::test]
+async fn revolve_typed_segments_routes_to_exact_face_census() {
+    use geometry_engine::primitives::surface::SurfaceType;
+
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile_segments": typed_nozzle_segments(),
+                "segments": 48,
+                "name": "typed nozzle",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "typed profile_segments revolve must succeed; body = {body}"
+    );
+    assert_eq!(body["success"], true, "body = {body}");
+    let solid_id = body["solid_id"]
+        .as_u64()
+        .expect("solid_id must be a number") as u32;
+
+    let model = state.model.read().await;
+    let solid = model.solids.get(solid_id).expect("revolved solid exists");
+    let shell = model.shells.get(solid.outer_shell).expect("shell");
+    let mut kinds: Vec<SurfaceType> = Vec::new();
+    for &fid in &shell.faces {
+        let f = model.faces.get(fid).expect("face");
+        let s = model.surfaces.get(f.surface_id).expect("surface");
+        kinds.push(s.surface_type());
+    }
+    let count = |want: SurfaceType| kinds.iter().filter(|&&k| k == want).count();
+    assert_eq!(
+        count(SurfaceType::Torus),
+        1,
+        "arc segment → exactly one exact Torus band; got {kinds:?}"
+    );
+    assert_eq!(
+        count(SurfaceType::Cylinder),
+        1,
+        "vertical line → one Cylinder band; got {kinds:?}"
+    );
+    assert_eq!(
+        count(SurfaceType::Cone),
+        1,
+        "sloped line → one Cone band; got {kinds:?}"
+    );
+    assert_eq!(
+        count(SurfaceType::SurfaceOfRevolution),
+        1,
+        "NURBS segment → one smooth revolved wall; got {kinds:?}"
+    );
+    assert_eq!(count(SurfaceType::Plane), 2, "two cap discs; got {kinds:?}");
+    assert_eq!(
+        kinds.len(),
+        6,
+        "one face per non-axis segment, not ×48 angular patches; got {kinds:?}"
+    );
+}
+
+/// Slice B honest refusal: typed segments at a partial angle refuse loudly
+/// (analytic bands are full-revolve-only) — never a silent facet fallback
+/// for a profile the caller declared analytic.
+#[tokio::test]
+async fn revolve_typed_segments_partial_angle_refuses_400() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile_segments": typed_nozzle_segments(),
+                "angle_deg": 180.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "typed + partial angle must refuse; body = {body}"
+    );
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("full-360"),
+        "refusal must NAME the full-revolve-only limitation; error = {err:?}"
+    );
+}
+
+/// Slice B honest refusal: typed segments are mutually exclusive with the
+/// smooth/bore/wall fitting modes (which consume the sampled polyline).
+#[tokio::test]
+async fn revolve_typed_segments_with_smooth_refuses_400() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile_segments": typed_nozzle_segments(),
+                "smooth": true,
+                "bore_radius": 1.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "typed + smooth must refuse; body = {body}"
+    );
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("mutually exclusive"),
+        "refusal must name the exclusivity; error = {err:?}"
+    );
+}
+
+// =====================================================================
+// Tests — display-name durability (certified-timeline follow-up)
+// =====================================================================
+
+/// Collect the `name` of every object in `/api/scene/snapshot` — the
+/// payload a (re)connecting client hydrates from. If a name is only in
+/// the live `ObjectCreated` push and not here, it evaporates on reload.
+async fn snapshot_names(state: &AppState) -> Vec<String> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/scene/snapshot")
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, snap) = dispatch(state, request).await;
+    assert_eq!(status, StatusCode::OK, "snapshot must serve; body = {snap}");
+    snap["objects"]
+        .as_array()
+        .map(|objs| {
+            objs.iter()
+                .filter_map(|o| o["name"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A display name given at create must be written into the kernel solid
+/// (`Solid::name`), not just carried on the WS push: `/api/scene/snapshot`
+/// derives names from the kernel and previously fell back to `solid_{id}`,
+/// so the given name evaporated on every reload (two name universes).
+#[tokio::test]
+async fn create_with_name_persists_into_kernel_snapshot() {
+    let state = make_test_state().await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/cylinder")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "center": [0.0, 0.0, 0.0],
+                "axis":   [0.0, 0.0, 1.0],
+                "radius": 5.0,
+                "height": 10.0,
+                "name":   "brake_disc",
+            })
+            .to_string(),
+        ))
+        .expect("request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "create must succeed; body = {body}");
+
+    let names = snapshot_names(&state).await;
+    assert!(
+        names.iter().any(|n| n == "brake_disc"),
+        "the display name given at create must be durable in the kernel — \
+         reload hydration must return it, not the solid_N fallback; got {names:?}"
+    );
+}
+
+/// Renaming a part must persist into the kernel, not just the local
+/// frontend store (previously rename was frontend-local only and a
+/// reload reverted it).
+#[tokio::test]
+async fn rename_endpoint_persists_name_into_kernel_snapshot() {
+    let state = make_test_state().await;
+    let (uuid, _solid_id, _edges) = seed_box(&state, 10.0).await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(&format!("/api/parts/uuid/{uuid}/name"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "name": "mount_plate" }).to_string()))
+        .expect("request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rename endpoint must exist and succeed; body = {body}"
+    );
+
+    let names = snapshot_names(&state).await;
+    assert!(
+        names.iter().any(|n| n == "mount_plate"),
+        "a rename must be durable in the kernel snapshot; got {names:?}"
+    );
+}
+
+/// A boolean upserts the result under the base operand's UUID and the
+/// frontend keeps the part's original name (a cut is a feature ON the
+/// part). The KERNEL name must follow the same rule: the result solid
+/// inherits the base operand's name — never the generated
+/// "Difference N" label, which would rename the part on reload.
+#[tokio::test]
+async fn boolean_result_inherits_base_operand_kernel_name() {
+    let state = make_test_state().await;
+
+    // Base part, explicitly named.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/box")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "center": [0.0, 0.0, 0.0],
+                "width": 20.0, "depth": 20.0, "height": 20.0,
+                "name": "manifold_block",
+            })
+            .to_string(),
+        ))
+        .expect("request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "box create failed; body = {body}");
+    let base_uuid = body["object"]["id"].as_str().expect("box uuid").to_string();
+
+    // Tool part.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/cylinder")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "center": [0.0, 0.0, -15.0],
+                "axis":   [0.0, 0.0, 1.0],
+                "radius": 4.0,
+                "height": 30.0,
+            })
+            .to_string(),
+        ))
+        .expect("request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "cyl create failed; body = {body}");
+    let tool_uuid = body["object"]["id"].as_str().expect("cyl uuid").to_string();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/boolean")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "operation": "difference",
+                "object_a": base_uuid,
+                "object_b": tool_uuid,
+            })
+            .to_string(),
+        ))
+        .expect("request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "boolean failed; body = {body}");
+
+    let names = snapshot_names(&state).await;
+    assert!(
+        names.iter().any(|n| n == "manifold_block"),
+        "the boolean result must inherit the base operand's kernel name \
+         (same-UUID upsert keeps part identity); got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("Difference")),
+        "the generated boolean label must NOT be persisted as the part \
+         name; got {names:?}"
+    );
+}

@@ -2133,6 +2133,7 @@ pub async fn extrude_sketch(
         .name
         .clone()
         .unwrap_or_else(|| format!("Sketch {result_solid_id}"));
+    crate::persist_display_name(&model_handle, result_solid_id, &display_name).await;
 
     // Build the multi-shape descriptor that powers the frontend's
     // "what is being extruded" hover tooltip. Each entry carries the
@@ -2397,14 +2398,25 @@ pub async fn extrude_cut_sketch(
         // Now subtract the cutter from the target. The kernel's
         // boolean_operation consumes both operands; the target's
         // public UUID is re-pointed below to the result solid id.
-        boolean_operation(
+        // Identity-preserving: the result inherits the HOST's kernel
+        // name (a cut is a feature ON the part) — captured before the
+        // boolean consumes the host, so the name survives reload.
+        let host_name = model
+            .solids
+            .get(target_solid_id)
+            .and_then(|s| s.name.clone());
+        let cut_id = boolean_operation(
             &mut model,
             target_solid_id,
             cutter,
             BooleanOp::Difference,
             BooleanOptions::default(),
         )
-        .map_err(ApiError::kernel_error)?
+        .map_err(ApiError::kernel_error)?;
+        if let (Some(name), Some(result)) = (host_name, model.solids.get_mut(cut_id)) {
+            result.name = Some(name);
+        }
+        cut_id
     };
 
     let (tri_mesh, tessellation_ms) = {
@@ -2681,6 +2693,7 @@ pub async fn revolve_sketch(
         .name
         .clone()
         .unwrap_or_else(|| format!("Revolve {result_solid_id}"));
+    crate::persist_display_name(&model_handle, result_solid_id, &display_name).await;
 
     let shapes_descriptor: Vec<serde_json::Value> = shape_polygons
         .iter()

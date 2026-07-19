@@ -712,6 +712,7 @@ async fn create_geometry(
     let object_uuid = Uuid::new_v4();
     let object_id = object_uuid.to_string();
     let display_name = format!("{} {}", capitalize(&shape_type), solid_id);
+    persist_display_name(&model_handle, solid_id, &display_name).await;
 
     state.register_id_mapping(object_uuid, solid_id);
 
@@ -1496,16 +1497,26 @@ async fn boolean_operation(
     // Hold the model write lock only for the kernel boolean. Tessellation
     // — read-only and potentially expensive — runs under a read lock so
     // concurrent writers aren't blocked on geometry that's already built.
+    // The base operand's kernel name is captured under the same guard,
+    // BEFORE the boolean consumes it: the result is upserted under A's
+    // UUID (a cut is a feature ON the part, not a new part), so the
+    // result solid inherits A's name — persisting the generated
+    // "Difference N" label instead would rename the part on reload.
     let result_solid_id = {
         let mut model = model_handle.write().await;
-        kernel_boolean(
+        let base_kernel_name = model.solids.get(solid_a).and_then(|s| s.name.clone());
+        let id = kernel_boolean(
             &mut model,
             solid_a,
             solid_b,
             operation,
             BooleanOptions::default(),
         )
-        .map_err(ApiError::kernel_error)?
+        .map_err(ApiError::kernel_error)?;
+        if let (Some(name), Some(result)) = (base_kernel_name, model.solids.get_mut(id)) {
+            result.name = Some(name);
+        }
+        id
         // model write guard drops here
     };
 
@@ -3092,6 +3103,7 @@ async fn pattern_linear_endpoint(
         state.register_id_mapping(result_uuid, new_solid_id);
 
         let display_name = format!("Linear Pattern {} #{}", solid_id, i);
+        persist_display_name(&model_handle, new_solid_id, &display_name).await;
         let parameters = serde_json::json!({
             "source": object_uuid.to_string(),
             "instance": i,
@@ -3268,6 +3280,7 @@ async fn pattern_circular_endpoint(
         state.register_id_mapping(result_uuid, new_solid_id);
 
         let display_name = format!("Circular Pattern {} #{}", solid_id, i);
+        persist_display_name(&model_handle, new_solid_id, &display_name).await;
         let parameters = serde_json::json!({
             "source": object_uuid.to_string(),
             "instance": i,
@@ -3483,6 +3496,7 @@ async fn create_extrude(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Extrude {result_solid_id}"));
+    persist_display_name(&model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "profile":   profile_arr,
         "direction": [direction.x, direction.y, direction.z],
@@ -3646,6 +3660,7 @@ async fn create_cylinder_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Cylinder {result_solid_id}"));
+    persist_display_name(&model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "center": c, "axis": ax, "radius": radius, "height": height,
     });
@@ -3843,6 +3858,7 @@ async fn create_box_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Box {result_solid_id}"));
+    persist_display_name(&model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "center": center, "u_axis": u, "v_axis": v,
         "width": width, "depth": depth, "height": height,
@@ -4021,6 +4037,7 @@ async fn create_cone_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Cone {result_solid_id}"));
+    persist_display_name(&model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "center": c, "axis": ax,
         "base_radius": base_radius, "top_radius": top_radius, "height": height,
@@ -4076,6 +4093,215 @@ async fn create_cone_primitive(
     })))
 }
 
+/// Parse the typed `profile_segments` wire array (piecewise-analytic revolve,
+/// spec 2026-07-19 Slice B) into kernel `ProfileEdge`s. Entries, in loop-walk
+/// order in the `[r, z]` meridian half-plane (axis at r = 0):
+///
+/// * `{"type":"line",  "start":[r,z], "end":[r,z]}`
+/// * `{"type":"arc",   "center":[r,z], "radius", "start_angle", "end_angle", "ccw"}`
+/// * `{"type":"nurbs", "degree", "control_points":[[r,z]…], "weights"?, "knots"}`
+///
+/// The loop auto-closes: a straight segment is appended when the last
+/// endpoint differs from the first start (the same rule as the sampled
+/// polyline profile; NURBS endpoints are taken from the clamped control
+/// polygon ends). Geometric validity — segment continuity, closure of
+/// unclamped NURBS, axis crossings — is enforced by the kernel, whose typed
+/// errors the endpoint surfaces as 400s.
+fn parse_revolve_profile_segments(
+    raw: &[serde_json::Value],
+) -> Result<Vec<geometry_engine::sketch2d::sketch_topology::ProfileEdge>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::sketch2d::sketch_topology::ProfileEdge;
+
+    let bad = |i: usize, msg: String| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("profile_segments[{i}]: {msg}"),
+        )
+    };
+    if raw.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "profile_segments must contain at least one segment".to_string(),
+        ));
+    }
+
+    let pair = |v: &serde_json::Value| -> Option<[f64; 2]> {
+        let a = v.as_array()?;
+        if a.len() != 2 {
+            return None;
+        }
+        let x = a[0].as_f64()?;
+        let y = a[1].as_f64()?;
+        (x.is_finite() && y.is_finite()).then_some([x, y])
+    };
+    let num = |seg: &serde_json::Value, key: &str| -> Option<f64> {
+        seg.get(key)
+            .and_then(|v| v.as_f64())
+            .filter(|x| x.is_finite())
+    };
+
+    let mut edges: Vec<ProfileEdge> = Vec::with_capacity(raw.len() + 1);
+    let mut endpoints: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(raw.len());
+    for (i, seg) in raw.iter().enumerate() {
+        let ty = seg
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| bad(i, "missing 'type' (one of: line, arc, nurbs)".to_string()))?;
+        match ty {
+            "line" => {
+                let start = seg
+                    .get("start")
+                    .and_then(pair)
+                    .ok_or_else(|| bad(i, "line needs finite 'start': [r, z]".to_string()))?;
+                let end = seg
+                    .get("end")
+                    .and_then(pair)
+                    .ok_or_else(|| bad(i, "line needs finite 'end': [r, z]".to_string()))?;
+                endpoints.push((start, end));
+                edges.push(ProfileEdge::Line { start, end });
+            }
+            "arc" => {
+                let center = seg
+                    .get("center")
+                    .and_then(pair)
+                    .ok_or_else(|| bad(i, "arc needs finite 'center': [r, z]".to_string()))?;
+                let radius = num(seg, "radius")
+                    .filter(|r| *r > 0.0)
+                    .ok_or_else(|| bad(i, "arc needs finite 'radius' > 0".to_string()))?;
+                let start_angle = num(seg, "start_angle").ok_or_else(|| {
+                    bad(i, "arc needs finite 'start_angle' (radians)".to_string())
+                })?;
+                let end_angle = num(seg, "end_angle")
+                    .ok_or_else(|| bad(i, "arc needs finite 'end_angle' (radians)".to_string()))?;
+                let ccw = seg
+                    .get("ccw")
+                    .and_then(|v| v.as_bool())
+                    .ok_or_else(|| bad(i, "arc needs boolean 'ccw'".to_string()))?;
+                endpoints.push((
+                    [
+                        center[0] + radius * start_angle.cos(),
+                        center[1] + radius * start_angle.sin(),
+                    ],
+                    [
+                        center[0] + radius * end_angle.cos(),
+                        center[1] + radius * end_angle.sin(),
+                    ],
+                ));
+                edges.push(ProfileEdge::Arc {
+                    center,
+                    radius,
+                    start_angle,
+                    end_angle,
+                    ccw,
+                });
+            }
+            "nurbs" => {
+                let degree = seg
+                    .get("degree")
+                    .and_then(|v| v.as_u64())
+                    .filter(|d| (1..=7).contains(d))
+                    .ok_or_else(|| bad(i, "nurbs needs integer 'degree' in 1..=7".to_string()))?
+                    as usize;
+                let cps_raw = seg
+                    .get("control_points")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        bad(i, "nurbs needs 'control_points': [[r, z], …]".to_string())
+                    })?;
+                let mut control_points = Vec::with_capacity(cps_raw.len());
+                for p in cps_raw {
+                    control_points.push(pair(p).ok_or_else(|| {
+                        bad(
+                            i,
+                            "each nurbs control point must be finite [r, z]".to_string(),
+                        )
+                    })?);
+                }
+                if control_points.len() < degree + 1 {
+                    return Err(bad(
+                        i,
+                        format!(
+                            "nurbs of degree {degree} needs at least {} control points, got {}",
+                            degree + 1,
+                            control_points.len()
+                        ),
+                    ));
+                }
+                let weights = match seg.get("weights") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => {
+                        let arr = v.as_array().ok_or_else(|| {
+                            bad(i, "nurbs 'weights' must be an array of numbers".to_string())
+                        })?;
+                        let mut w = Vec::with_capacity(arr.len());
+                        for x in arr {
+                            let x = x
+                                .as_f64()
+                                .filter(|x| x.is_finite() && *x > 0.0)
+                                .ok_or_else(|| {
+                                    bad(i, "nurbs weights must be finite and > 0".to_string())
+                                })?;
+                            w.push(x);
+                        }
+                        if w.len() != control_points.len() {
+                            return Err(bad(
+                                i,
+                                format!(
+                                    "nurbs weights count {} must equal control point count {}",
+                                    w.len(),
+                                    control_points.len()
+                                ),
+                            ));
+                        }
+                        Some(w)
+                    }
+                };
+                let knots_raw = seg
+                    .get("knots")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| bad(i, "nurbs needs 'knots': [f64, …]".to_string()))?;
+                let mut knots = Vec::with_capacity(knots_raw.len());
+                for k in knots_raw {
+                    knots.push(
+                        k.as_f64().filter(|k| k.is_finite()).ok_or_else(|| {
+                            bad(i, "nurbs knots must be finite numbers".to_string())
+                        })?,
+                    );
+                }
+                let first = control_points[0];
+                let last = control_points[control_points.len() - 1];
+                endpoints.push((first, last));
+                edges.push(ProfileEdge::Nurbs {
+                    degree,
+                    control_points,
+                    weights,
+                    knots,
+                });
+            }
+            other => {
+                return Err(bad(
+                    i,
+                    format!("unknown segment type '{other}' (expected line, arc or nurbs)"),
+                ));
+            }
+        }
+    }
+
+    // Auto-close (same rule as the sampled polyline profile).
+    if let (Some(&(first_start, _)), Some(&(_, last_end))) = (endpoints.first(), endpoints.last()) {
+        let gap = ((first_start[0] - last_end[0]).powi(2) + (first_start[1] - last_end[1]).powi(2))
+            .sqrt();
+        if gap > 1e-9 {
+            edges.push(ProfileEdge::Line {
+                start: last_end,
+                end: first_start,
+            });
+        }
+    }
+    Ok(edges)
+}
+
 /// POST /api/geometry/revolve — build a SOLID OF REVOLUTION from a closed
 /// meridian profile. This is the correct primitive for any axisymmetric part
 /// (nozzles, pulleys, bottles, rocket engines): one profile revolved 360°
@@ -4086,6 +4312,14 @@ async fn create_cone_primitive(
 /// Request: `{ "profile": [[r,z], …], "axis_origin"?:[x,y,z],
 ///             "axis_direction"?:[x,y,z], "angle_deg"?:f64, "segments"?:u32,
 ///             "name"?:s }`
+///
+/// OR (piecewise-analytic, spec 2026-07-19): `{ "profile_segments":
+/// [{type:"line"|"arc"|"nurbs", …}, …], … }` — typed segments revolve to
+/// EXACT per-segment surfaces (line → cylinder/cone/plane, arc →
+/// torus/sphere, nurbs → one smooth revolved wall). Full-360° only;
+/// mutually exclusive with `profile` / `smooth` / `bore_radius` /
+/// `wall_thickness` (typed refusals name the limitation). See
+/// [`parse_revolve_profile_segments`] for the exact wire shape.
 /// The profile is a closed polygon in the meridian half-plane: each `[r,z]` is
 /// (radius-from-axis, height-along-axis). Points are placed at `(r,0,z)` and
 /// revolved about the axis (default +Z through the origin, full 360°). The loop
@@ -4099,8 +4333,8 @@ async fn create_revolve_primitive(
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
     use geometry_engine::operations::revolve::{
-        revolve_meridian, revolve_smooth_nozzle, revolve_smooth_solid, revolve_spline_meridian,
-        RevolveOptions,
+        axis_frame, revolve_meridian, revolve_profile_regions_strict, revolve_smooth_nozzle,
+        revolve_smooth_solid, revolve_spline_meridian, RevolveOptions,
     };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
@@ -4124,34 +4358,64 @@ async fn create_revolve_primitive(
         }
     };
 
-    let profile_raw = payload
-        .get("profile")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| ApiError::missing_field("profile"))?;
-    if profile_raw.len() < 3 {
+    // Typed piecewise-analytic profile (spec 2026-07-19 Slice B): each
+    // segment revolves to its EXACT surface (line → cylinder/cone/plane,
+    // arc → torus/sphere, nurbs → smooth revolved wall). Mutually
+    // exclusive with the sampled `profile` polyline.
+    let profile_segments = match payload.get("profile_segments") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "'profile_segments' must be an array of typed segment objects".to_string(),
+                )
+            })?;
+            Some(parse_revolve_profile_segments(arr)?)
+        }
+    };
+    if profile_segments.is_some() && payload.get("profile").is_some_and(|v| !v.is_null()) {
         return Err(ApiError::new(
             ErrorCode::InvalidParameter,
-            "profile needs at least 3 [r,z] points".to_string(),
+            "give exactly one of 'profile' (sampled [r,z] polyline) or \
+             'profile_segments' (typed analytic segments), not both"
+                .to_string(),
         ));
     }
-    let mut profile: Vec<(f64, f64)> = Vec::with_capacity(profile_raw.len());
-    for p in profile_raw {
-        let pair = p.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
-            ApiError::new(
-                ErrorCode::InvalidParameter,
-                "each profile point must be [r, z]".to_string(),
-            )
-        })?;
-        let r = pair[0].as_f64().unwrap_or(f64::NAN);
-        let z = pair[1].as_f64().unwrap_or(f64::NAN);
-        if !r.is_finite() || !z.is_finite() || r < -1e-9 {
+
+    let profile: Option<Vec<(f64, f64)>> = if profile_segments.is_some() {
+        None
+    } else {
+        let profile_raw = payload
+            .get("profile")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| ApiError::missing_field("profile"))?;
+        if profile_raw.len() < 3 {
             return Err(ApiError::new(
                 ErrorCode::InvalidParameter,
-                format!("profile point [{r}, {z}] invalid (r must be finite and >= 0)"),
+                "profile needs at least 3 [r,z] points".to_string(),
             ));
         }
-        profile.push((r, z));
-    }
+        let mut profile: Vec<(f64, f64)> = Vec::with_capacity(profile_raw.len());
+        for p in profile_raw {
+            let pair = p.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    "each profile point must be [r, z]".to_string(),
+                )
+            })?;
+            let r = pair[0].as_f64().unwrap_or(f64::NAN);
+            let z = pair[1].as_f64().unwrap_or(f64::NAN);
+            if !r.is_finite() || !z.is_finite() || r < -1e-9 {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("profile point [{r}, {z}] invalid (r must be finite and >= 0)"),
+                ));
+            }
+            profile.push((r, z));
+        }
+        Some(profile)
+    };
 
     let axis_origin = arr3("axis_origin", [0.0, 0.0, 0.0])?;
     let axis_dir = arr3("axis_direction", [0.0, 0.0, 1.0])?;
@@ -4188,7 +4452,70 @@ async fn create_revolve_primitive(
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
-    let result_solid_id = {
+    // Typed-profile refusals (honest, BEFORE any kernel mutation): the
+    // analytic-band builder is full-revolution-only, and the smooth /
+    // bore / wall fitting modes consume the sampled polyline form.
+    if profile_segments.is_some() {
+        if smooth || bore_radius > 0.0 || wall_thickness > 0.0 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                "'profile_segments' is mutually exclusive with 'smooth' / \
+                 'bore_radius' / 'wall_thickness': typed segments already carry \
+                 exact per-segment geometry (use a 'nurbs' segment for a smooth \
+                 wall)"
+                    .to_string(),
+            ));
+        }
+        if (angle_deg - 360.0).abs() > 1e-9 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "typed 'profile_segments' revolve full-360° only: the exact \
+                     analytic bands (cylinder/cone/torus/sphere/revolved-spline) \
+                     have no partial-angle form yet, got angle_deg = {angle_deg}; \
+                     use the sampled 'profile' polyline for partial revolves"
+                ),
+            ));
+        }
+    }
+
+    let result_solid_id = if let Some(edges) = &profile_segments {
+        // Piecewise-analytic revolve (spec 2026-07-19 Slice B): lift the
+        // [r,z] segments through the SAME axis frame as revolve_meridian
+        // (r along ê1, z along the axis; axis at r = 0) and dispatch to the
+        // STRICT typed kernel entry — a failed analytic build surfaces its
+        // error, never a silent facet fallback.
+        let (axis, e1, _e2) = axis_frame(Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]))
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("revolve axis_direction invalid: {e:?}"),
+                )
+            })?;
+        let region = geometry_engine::operations::extrude::ProfileRegion {
+            outer: geometry_engine::operations::extrude::ProfileLoop::Edges(edges.clone()),
+            holes: Vec::new(),
+        };
+        let mut model = model_handle.write().await;
+        revolve_profile_regions_strict(
+            &mut model,
+            Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
+            e1,
+            axis,
+            &[region],
+            [0.0, 0.0],
+            [0.0, 1.0],
+            std::f64::consts::TAU,
+            segments,
+            geometry_engine::math::Tolerance::default(),
+        )
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("typed analytic revolve failed: {e:?}"),
+            )
+        })?
+    } else if let Some(profile) = &profile {
         let mut model = model_handle.write().await;
         // Parametric revolve: revolve the (r, z) meridian AND retain it as the
         // part's construction geometry, so the part remembers how it was made and
@@ -4201,14 +4528,14 @@ async fn create_revolve_primitive(
             ..Default::default()
         };
         if wall_thickness > 0.0 {
-            revolve_smooth_nozzle(&mut model, &profile, wall_thickness, opts).map_err(|e| {
+            revolve_smooth_nozzle(&mut model, profile, wall_thickness, opts).map_err(|e| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
                     format!("smooth nozzle revolve failed: {e:?}"),
                 )
             })?
         } else if smooth && bore_radius > 0.0 {
-            revolve_spline_meridian(&mut model, &profile, bore_radius, opts).map_err(|e| {
+            revolve_spline_meridian(&mut model, profile, bore_radius, opts).map_err(|e| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
                     format!("smooth revolve failed: {e:?}"),
@@ -4218,28 +4545,37 @@ async fn create_revolve_primitive(
             // Smooth SOLID of revolution (no bore): fit ONE NURBS wall → one
             // SurfaceOfRevolution face that closes to the apex (nose cone / dome /
             // teardrop) — zero meridian band rings.
-            revolve_smooth_solid(&mut model, &profile, opts).map_err(|e| {
+            revolve_smooth_solid(&mut model, profile, opts).map_err(|e| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
                     format!("smooth solid revolve failed: {e:?}"),
                 )
             })?
         } else {
-            revolve_meridian(&mut model, &profile, opts).map_err(|e| {
+            revolve_meridian(&mut model, profile, opts).map_err(|e| {
                 ApiError::new(
                     ErrorCode::InvalidParameter,
                     format!("revolve failed: {e:?}"),
                 )
             })?
         }
+    } else {
+        // Unreachable by construction (`profile` is Some exactly when
+        // `profile_segments` is None), kept as an honest typed error
+        // rather than a panic path.
+        return Err(ApiError::missing_field("profile"));
     };
 
     // Persist the generating profile (replay-proof) so it is always recoverable
-    // via GET /api/agent/parts/{id}/profile for the edit→regenerate loop.
-    state.solid_profiles.insert(
-        result_solid_id,
-        profile.iter().map(|&(r, z)| [r, z]).collect(),
-    );
+    // via GET /api/agent/parts/{id}/profile for the edit→regenerate loop. A
+    // typed-segment part carries no sampled polyline — persisting a fake one
+    // would misrepresent the part, so only the polyline path registers here.
+    if let Some(profile) = &profile {
+        state.solid_profiles.insert(
+            result_solid_id,
+            profile.iter().map(|&(r, z)| [r, z]).collect(),
+        );
+    }
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;
@@ -4264,8 +4600,11 @@ async fn create_revolve_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Revolve {result_solid_id}"));
+    persist_display_name(&model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
-        "profile": profile, "axis_origin": axis_origin, "axis_direction": axis_dir,
+        "profile": profile,
+        "profile_segments": profile_segments,
+        "axis_origin": axis_origin, "axis_direction": axis_dir,
         "angle_deg": angle_deg, "segments": segments,
     });
     broadcast_object_created(
@@ -4451,6 +4790,7 @@ async fn import_step_geometry(
             Some(b) => format!("{b} {}", i + 1),
             None => format!("Imported {solid_id}"),
         };
+        persist_display_name(&model_handle, solid_id, &name).await;
         let parameters = serde_json::json!({ "source": "step_import", "index": i });
         broadcast_object_created(
             &id_str,
@@ -4618,6 +4958,7 @@ async fn create_nurbs_loft_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("NURBS Loft {result_solid_id}"));
+    persist_display_name(&model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "sections": n_sections, "ring_points": ring_points,
         "degree_u": degree_u, "degree_v": degree_v,
@@ -5891,6 +6232,89 @@ async fn scene_snapshot(
     Json(serde_json::json!({ "objects": objects }))
 }
 
+/// `POST /api/parts/uuid/{uuid}/name` — rename a part, durably.
+///
+/// Writes the new name into the kernel solid (`Solid::name`) — the single
+/// source every name reader derives from (`/api/scene/snapshot` reload
+/// hydration, the readable layer, `/api/agent/parts`) — then rebroadcasts
+/// the object under its existing UUID so every connected client's tree
+/// updates live. Renames were previously frontend-local only, so a reload
+/// reverted them to the `solid_{id}` fallback.
+async fn rename_part_by_uuid(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(uuid): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    let uuid = Uuid::parse_str(&uuid).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("not a valid UUID: {uuid}"),
+        )
+    })?;
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::missing_field("name"))?;
+    if name.chars().count() > 200 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "name too long (max 200 characters)".to_string(),
+        ));
+    }
+    let solid_id = state.get_local_id(&uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("no kernel solid registered for {uuid}"),
+        )
+    })?;
+
+    {
+        let mut model = model_handle.write().await;
+        let solid = model
+            .solids
+            .get_mut(solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(solid_id))?;
+        solid.name = Some(name.to_string());
+    }
+
+    // Rebroadcast under the same UUID (same-UUID upsert replaces in place)
+    // so other connected clients pick the rename up live.
+    let tri_mesh = {
+        let model = model_handle.read().await;
+        let solid = model
+            .solids
+            .get(solid_id)
+            .ok_or_else(|| ApiError::solid_not_found(solid_id))?;
+        tessellate_solid(solid, &model, &TessellationParams::default())
+    };
+    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
+    let params = serde_json::json!({ "renamed": true });
+    broadcast_object_updated(
+        &uuid.to_string(),
+        name,
+        solid_id,
+        "rename",
+        &params,
+        &vertices,
+        &indices,
+        &normals,
+        &face_ids,
+        [0.0, 0.0, 0.0],
+    );
+
+    Ok(Json(serde_json::json!({
+        "success":  true,
+        "solid_id": solid_id,
+        "name":     name,
+    })))
+}
+
 async fn process_enhanced_ai_command(
     Extension(auth_info): Extension<auth_middleware::AuthInfo>,
     State(state): State<AppState>,
@@ -6798,6 +7222,27 @@ pub(crate) async fn current_scene_frames(state: &AppState) -> Vec<String> {
 /// and surface area remain zero until the kernel exposes a per-solid
 /// query for them.
 #[allow(clippy::too_many_arguments)]
+/// Persist the user-visible display name into the kernel solid.
+///
+/// The WS `ObjectCreated` push and the kernel previously disagreed about a
+/// part's name: the push carried the display name while `Solid::name` stayed
+/// `None`, so every kernel-derived surface (`/api/scene/snapshot` reload
+/// hydration, the readable layer, `/api/agent/parts`) fell back to
+/// `solid_{id}` and the given name evaporated on reload. One name, minted
+/// once at the endpoint, stored where every reader derives from. Feature
+/// upserts (booleans) must NOT call this with their generated label — the
+/// result inherits the base operand's name instead (same-UUID identity).
+pub(crate) async fn persist_display_name(
+    model_handle: &reconcile_task::ModelHandle,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    name: &str,
+) {
+    let mut model = model_handle.write().await;
+    if let Some(solid) = model.solids.get_mut(solid_id) {
+        solid.name = Some(name.to_string());
+    }
+}
+
 pub(crate) fn broadcast_object_created(
     object_id: &str,
     name: &str,
@@ -8290,6 +8735,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/parts/uuid/{uuid}/drawing",
             post(drawing_mgr::create_part_drawing_by_uuid),
+        )
+        // Durable rename: writes Solid::name (the single name source every
+        // reader derives from) and rebroadcasts under the same UUID.
+        .route(
+            "/api/parts/uuid/{uuid}/name",
+            post(rename_part_by_uuid).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_geometry,
+            )),
         )
         // Drawing quality oracle (2D perception layer): re-check any
         // registered drawing's layout/annotation quality.

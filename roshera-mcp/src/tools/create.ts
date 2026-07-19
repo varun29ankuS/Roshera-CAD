@@ -320,12 +320,58 @@ export function registerCreateTools(server: McpServer) {
       "for any axisymmetric part (nozzles, vessels, a rocket engine in one " +
       "op). Revolved about the axis (default +Z, 360°); one op, watertight. " +
       "Profile must be a simple loop, all r ≥ 0, not crossing the axis. Hollow " +
-      "part = trace the wall cross-section.",
+      "part = trace the wall cross-section. PREFER `profile_segments` (typed " +
+      "line/arc/nurbs segments) for nozzles/vessels: each segment becomes its " +
+      "EXACT surface — line → cylinder/cone/plane, arc → torus/sphere, nurbs " +
+      "spline → one smooth revolved wall — distinct exact faces in one op, no " +
+      "faceting, no booleans. Typed segments are full-360° only and exclusive " +
+      "with profile/smooth/bore_radius/wall_thickness.",
     {
       profile: z
         .array(z.tuple([z.number(), z.number()]))
         .min(3)
-        .describe("closed [r,z] meridian profile (auto-closes last→first)"),
+        .optional()
+        .describe(
+          "closed [r,z] meridian profile, chord-sampled (auto-closes " +
+            "last→first); give exactly one of profile | profile_segments",
+        ),
+      profile_segments: z
+        .array(
+          z.discriminatedUnion("type", [
+            z.object({
+              type: z.literal("line"),
+              start: z.tuple([z.number(), z.number()]),
+              end: z.tuple([z.number(), z.number()]),
+            }),
+            z.object({
+              type: z.literal("arc"),
+              center: z.tuple([z.number(), z.number()]),
+              radius: z.number().positive(),
+              start_angle: z.number().describe("radians, from +r toward +z"),
+              end_angle: z.number(),
+              ccw: z.boolean().describe("sweep direction start_angle → end_angle"),
+            }),
+            z.object({
+              type: z.literal("nurbs"),
+              degree: z.number().int().min(1).max(7),
+              control_points: z.array(z.tuple([z.number(), z.number()])).min(2),
+              weights: z.array(z.number()).optional(),
+              knots: z.array(z.number()),
+            }),
+          ]),
+        )
+        .min(1)
+        .optional()
+        .describe(
+          "TYPED [r,z] meridian segments in loop order (auto-closes with a " +
+            "line): exact per-segment surfaces — vertical line → cylinder, " +
+            "sloped → cone, horizontal → planar cap, arc → exact torus " +
+            "(off-axis) or sphere (on-axis center), nurbs → one smooth " +
+            "revolved wall. The right mode for nozzles/pressure vessels " +
+            "(chamber cylinder + converging cone + throat arcs + bell " +
+            "spline in ONE part). Full-360° only; on-axis/spindle arcs and " +
+            "circles crossing the axis are refused with a typed error.",
+        ),
       axis_origin: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
       axis_direction: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
       angle_deg: z.number().default(360),
@@ -353,6 +399,7 @@ export function registerCreateTools(server: McpServer) {
     },
     async ({
       profile,
+      profile_segments,
       axis_origin,
       axis_direction,
       angle_deg,
@@ -364,7 +411,10 @@ export function registerCreateTools(server: McpServer) {
     }) => {
       try {
         const r = await api("POST", "/api/geometry/revolve", {
-          profile,
+          // The server refuses profile+profile_segments together; forward
+          // only the mode the caller chose.
+          ...(profile !== undefined ? { profile } : {}),
+          ...(profile_segments !== undefined ? { profile_segments } : {}),
           axis_origin,
           axis_direction,
           angle_deg,

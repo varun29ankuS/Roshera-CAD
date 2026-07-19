@@ -45,6 +45,15 @@ pub struct RevolveOptions {
 
     /// Whether to create end caps for partial revolutions
     pub cap_ends: bool,
+
+    /// Strict analytic mode (piecewise-analytic revolve, spec 2026-07-19):
+    /// the caller DECLARED a typed analytic profile, so a failed
+    /// analytic-band build must surface its error instead of silently
+    /// falling back to the faceted grid path — silently faceting a profile
+    /// the caller declared analytic is the lie class the spec forbids.
+    /// `false` (the default) keeps the proven rollback-to-grid behaviour
+    /// for every existing caller.
+    pub strict_analytic: bool,
 }
 
 impl Default for RevolveOptions {
@@ -58,6 +67,7 @@ impl Default for RevolveOptions {
             segments: 32,
             pitch: 0.0,
             cap_ends: true,
+            strict_analytic: false,
         }
     }
 }
@@ -177,12 +187,19 @@ pub fn revolve_profile(
 /// closed-NURBS seam split included), so the analytic-band revolve
 /// path (#19/#21) sees true geometry — axis-parallel lines → Cylinder
 /// bands, axis-perpendicular → planar annuli, sloped → Cone bands,
-/// curved edges → ONE `SurfaceOfRevolution` face each.
+/// circular arcs → exact `Torus` (off-axis) / `Sphere` (on-axis)
+/// bands (piecewise-analytic revolve, spec 2026-07-19), off-axis full
+/// circles → one full ring-`Torus` face, and every other curved edge
+/// → ONE `SurfaceOfRevolution` face.
 ///
 /// Honest refusal (typed): a full-circle profile edge revolved about
-/// an external axis is a TORUS lateral, which the revolve builder has
-/// no analytic band for — callers sample such loops explicitly
-/// (counted, never silently approximated).
+/// an in-plane axis is exact ONLY for the ring-torus class (circle
+/// center off the axis, radius strictly smaller than its axis
+/// distance — the piecewise-analytic revolve emits a true `Torus`
+/// lateral for it). On-axis, axis-crossing and spindle (ρ ≥ R)
+/// circles have NO exact torus representation and keep the typed
+/// refusal — callers sample such loops explicitly (counted, never
+/// silently approximated).
 ///
 /// Holes are revolved separately and SUBTRACTED (the proven
 /// click-draft region scheme); disjoint regions are Union-folded.
@@ -198,6 +215,71 @@ pub fn revolve_profile_regions(
     angle: f64,
     segments: u32,
     tolerance: crate::math::Tolerance,
+) -> OperationResult<SolidId> {
+    revolve_profile_regions_impl(
+        model,
+        origin,
+        u_axis,
+        v_axis,
+        regions,
+        axis_origin_2d,
+        axis_direction_2d,
+        angle,
+        segments,
+        tolerance,
+        false,
+    )
+}
+
+/// Strict variant of [`revolve_profile_regions`] for callers whose
+/// profile was DECLARED analytic on the wire (the api-server
+/// `profile_segments` route — piecewise-analytic revolve Slice B):
+/// a failed analytic-band build surfaces its error as a typed
+/// refusal instead of silently rolling back to the faceted grid
+/// path. Analytic bands are full-revolution-only, so a partial
+/// `angle` refuses loudly too (the caller names the limitation to
+/// its own client).
+#[allow(clippy::too_many_arguments)] // Reason: same established signature as revolve_profile_regions.
+pub fn revolve_profile_regions_strict(
+    model: &mut BRepModel,
+    origin: Point3,
+    u_axis: Vector3,
+    v_axis: Vector3,
+    regions: &[crate::operations::extrude::ProfileRegion],
+    axis_origin_2d: [f64; 2],
+    axis_direction_2d: [f64; 2],
+    angle: f64,
+    segments: u32,
+    tolerance: crate::math::Tolerance,
+) -> OperationResult<SolidId> {
+    revolve_profile_regions_impl(
+        model,
+        origin,
+        u_axis,
+        v_axis,
+        regions,
+        axis_origin_2d,
+        axis_direction_2d,
+        angle,
+        segments,
+        tolerance,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Reason: same established signature as revolve_profile_regions plus the strict flag.
+fn revolve_profile_regions_impl(
+    model: &mut BRepModel,
+    origin: Point3,
+    u_axis: Vector3,
+    v_axis: Vector3,
+    regions: &[crate::operations::extrude::ProfileRegion],
+    axis_origin_2d: [f64; 2],
+    axis_direction_2d: [f64; 2],
+    angle: f64,
+    segments: u32,
+    tolerance: crate::math::Tolerance,
+    strict_analytic: bool,
 ) -> OperationResult<SolidId> {
     use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
     use crate::operations::extrude::{
@@ -226,21 +308,43 @@ pub fn revolve_profile_regions(
         OperationError::NumericalError(format!("revolve axis normalization: {e:?}"))
     })?;
 
-    // Typed refusal BEFORE any kernel mutation: a full-circle profile
-    // edge would revolve to a torus lateral.
-    for region in regions {
-        for lp in std::iter::once(&region.outer).chain(region.holes.iter()) {
-            if let ProfileLoop::Edges(edges) = lp {
-                if edges
-                    .iter()
-                    .any(|e| matches!(e, ProfileEdge::Circle { .. }))
-                {
-                    return Err(OperationError::InvalidGeometry(
-                        "analytic full-circle profiles have no typed revolve path yet \
-                         (a revolved circle's lateral is a TORUS band the analytic-band \
-                         builder does not emit); sample the circle into a polygon"
-                            .to_string(),
-                    ));
+    // Typed refusal BEFORE any kernel mutation (piecewise-analytic
+    // revolve, spec 2026-07-19): a full-circle profile edge revolves to
+    // an exact ring-TORUS lateral ONLY when its center sits off the
+    // axis with ρ strictly inside the ring (R − ρ above the pole
+    // tolerance, the same 1e-4 the band builder uses). On-axis,
+    // axis-crossing and spindle (ρ ≥ R) circles have no exact torus
+    // representation — refuse honestly rather than mistag or
+    // approximate.
+    {
+        let d2_mag = (axis_direction_2d[0].powi(2) + axis_direction_2d[1].powi(2)).sqrt();
+        if d2_mag < 1e-12 {
+            return Err(OperationError::InvalidGeometry(
+                "revolve axis direction is degenerate (zero length)".to_string(),
+            ));
+        }
+        let d2 = [axis_direction_2d[0] / d2_mag, axis_direction_2d[1] / d2_mag];
+        for region in regions {
+            for lp in std::iter::once(&region.outer).chain(region.holes.iter()) {
+                if let ProfileLoop::Edges(edges) = lp {
+                    for e in edges {
+                        if let ProfileEdge::Circle { center, radius } = e {
+                            let rel =
+                                [center[0] - axis_origin_2d[0], center[1] - axis_origin_2d[1]];
+                            // Perpendicular distance from the circle center
+                            // to the in-plane axis line = the ring (major)
+                            // radius of the candidate torus.
+                            let ring_r = (rel[0] * d2[1] - rel[1] * d2[0]).abs();
+                            if !(radius.is_finite() && *radius > 0.0) || ring_r - radius < 1e-4 {
+                                return Err(OperationError::InvalidGeometry(format!(
+                                    "full-circle profile edge (center distance {ring_r:.6} from \
+                                     the axis, radius {radius:.6}) is not the ring-torus class: \
+                                     an on-axis / axis-crossing / spindle circle has no exact \
+                                     TORUS representation; sample the circle into a polygon"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -277,6 +381,7 @@ pub fn revolve_profile_regions(
         axis_direction,
         angle,
         segments,
+        strict_analytic,
         ..RevolveOptions::default()
     };
 
@@ -341,7 +446,12 @@ pub fn revolve_profile_regions(
 /// height-along-axis) in THIS frame, never world coordinates — so `axis_origin`
 /// translates the whole solid and `r` stays a pure radius, instead of the axis
 /// offset leaking into the radius/bbox.
-fn axis_frame(axis_direction: Vector3) -> OperationResult<(Vector3, Vector3, Vector3)> {
+///
+/// Public because the api-server's typed `profile_segments` route
+/// (piecewise-analytic revolve Slice B) must lift its `[r, z]` profile through
+/// the SAME frame as [`revolve_meridian`] — a second frame construction would
+/// be a drift point between the two wire paths.
+pub fn axis_frame(axis_direction: Vector3) -> OperationResult<(Vector3, Vector3, Vector3)> {
     let a = axis_direction.normalize()?;
     const AXIS_EPS: f64 = 1e-10;
     let e1 = if (a - Vector3::Z).magnitude() < AXIS_EPS || (a + Vector3::Z).magnitude() < AXIS_EPS {
@@ -921,6 +1031,27 @@ fn create_revolution(
         if let Some(sid) = try_analytic_band_revolution(model, base_face, base_face_id, options)? {
             return Ok(sid);
         }
+        // Strict analytic mode: the caller declared a typed analytic
+        // profile — an ineligible profile must refuse, never silently
+        // facet (build FAILURES already propagated as Err above).
+        if options.strict_analytic {
+            return Err(OperationError::InvalidGeometry(
+                "strict analytic revolve: this profile is not eligible for the \
+                 analytic-band builder (e.g. a profile face with inner loops); \
+                 no exact piecewise-analytic solid can be emitted"
+                    .to_string(),
+            ));
+        }
+    } else if options.strict_analytic {
+        // Analytic bands are full-revolution-only; a typed profile at a
+        // partial angle refuses loudly instead of silently falling to the
+        // faceted grid path (honest refusal over silent approximation).
+        return Err(OperationError::InvalidGeometry(format!(
+            "typed analytic profiles revolve full-360° only (analytic bands \
+             have no partial-angle form yet); got angle {:.6} rad — use the \
+             sampled profile path for partial revolves",
+            options.angle
+        )));
     }
 
     let base_loop = model
@@ -1256,6 +1387,223 @@ fn ring_geometry(
     Ok((Point3::new(center.x, center.y, center.z), radius, axial))
 }
 
+/// Exact surface class of a curved analytic revolve band (piecewise-analytic
+/// revolve, spec 2026-07-19 Slice A).
+enum CurvedBandSurface {
+    /// Off-axis circular arc, ρ < R (ring class) → exact partial/full torus.
+    Torus(crate::primitives::surface::Torus),
+    /// On-axis circular arc → exact spherical zone/cap.
+    Sphere(crate::primitives::surface::Sphere),
+    /// Not an exact quadric class — keep the (geometrically true)
+    /// `SurfaceOfRevolution`.
+    Revolution,
+}
+
+/// The circular geometry of a seam curve, when it IS exactly circular:
+/// `(center, plane normal, radius, closed)`. Downcast only — never
+/// curve-fitting — so a band is tagged quadric ONLY for a true arc/circle
+/// profile edge (the spec's honesty rule).
+fn circular_seam_geometry(
+    curve: &dyn crate::primitives::curve::Curve,
+) -> Option<(Point3, Vector3, f64, bool)> {
+    use crate::primitives::curve::{Arc, Circle, Curve as _};
+    let any = curve.as_any();
+    if let Some(a) = any.downcast_ref::<Arc>() {
+        Some((a.center, a.normal, a.radius, a.is_closed()))
+    } else {
+        any.downcast_ref::<Circle>()
+            .map(|c| (c.center(), c.normal(), c.radius(), true))
+    }
+}
+
+/// Classify a curved band's seam curve (already rotated onto the canonical
+/// `ref_dir` meridian and oriented start→end) into its EXACT revolved
+/// surface class:
+///
+/// * arc center OFF the axis with ρ < R (tube clear of the axis by the
+///   band builder's pole tolerance) → `Torus` with `param_limits`
+///   `[0, τ, v_lo, v_hi]` mapping the arc's angular extent into torus
+///   v-parameterisation (v = 0 at the outer equator, increasing toward
+///   +axis — `Torus::evaluate_full`'s convention);
+/// * arc center ON the axis → `Sphere` zone with polar-angle v-limits
+///   (v = 0 at the +axis pole — `Sphere::evaluate_full`'s convention);
+/// * anything else — non-circular curve, spindle arc (ρ ≥ R),
+///   axis-crossing arc, non-meridian plane, or a v-interval that would
+///   fold under the surface's periodic-seam normalisation — stays
+///   `Revolution` (the current, geometrically-true emission; upgrading
+///   its tag would be a lie, refusing it a regression).
+fn classify_curved_band(
+    seam_curve: &dyn crate::primitives::curve::Curve,
+    axis_origin: Point3,
+    axis: Vector3,
+    ref_dir: Vector3,
+) -> CurvedBandSurface {
+    use crate::primitives::surface::{Sphere, Torus};
+    use std::f64::consts::{PI, TAU};
+
+    // Same pole tolerance the band builder uses for ring-vertex collapse.
+    const APEX_EPS: f64 = 1e-4;
+
+    let Some((q, normal, rho, closed)) = circular_seam_geometry(seam_curve) else {
+        return CurvedBandSurface::Revolution;
+    };
+    if !(rho.is_finite() && rho > 0.0) {
+        return CurvedBandSurface::Revolution;
+    }
+    // The arc's supporting plane must contain the revolve axis direction
+    // (a meridian-plane arc) — otherwise the revolved surface is not a
+    // torus/sphere of these parameters.
+    let Ok(n_hat) = normal.normalize() else {
+        return CurvedBandSurface::Revolution;
+    };
+    if n_hat.dot(&axis).abs() > 1e-7 {
+        return CurvedBandSurface::Revolution;
+    }
+
+    let rel = q - axis_origin;
+    let axial = rel.dot(&axis);
+    let radial = rel - axis * axial;
+    let big_r = radial.magnitude();
+    let center_on_axis = axis_origin + axis * axial;
+
+    // Sample the seam at its endpoints and parametric midpoint (owned
+    // positions; the curve is only read).
+    let range = seam_curve.parameter_range();
+    let eval = |t: f64| seam_curve.evaluate(t).map(|cp| cp.position);
+    let (Ok(p0), Ok(p1), Ok(pm)) = (
+        eval(range.start),
+        eval(range.end),
+        eval(0.5 * (range.start + range.end)),
+    ) else {
+        return CurvedBandSurface::Revolution;
+    };
+
+    if big_r < APEX_EPS {
+        // ── Sphere zone: arc centered on the axis. ──────────────────────
+        // A CLOSED on-axis circle is the spindle class (refused upstream);
+        // never tag it.
+        if closed {
+            return CurvedBandSurface::Revolution;
+        }
+        // Polar angle from the +axis pole; the rotated seam lies in the
+        // ref_dir/axis meridian half-plane, so a negative ref_dir component
+        // means the arc crosses the axis → not a single spherical zone.
+        let polar = |p: Point3| -> Option<f64> {
+            let d = p - center_on_axis;
+            let r_c = d.dot(&ref_dir);
+            if r_c < -1e-6 * rho {
+                return None;
+            }
+            Some(r_c.atan2(d.dot(&axis)))
+        };
+        let (Some(v0), Some(v1), Some(vm)) = (polar(p0), polar(p1), polar(pm)) else {
+            return CurvedBandSurface::Revolution;
+        };
+        let (lo, hi) = (v0.min(v1), v0.max(v1));
+        // The arc must sweep monotonically between its endpoint polar
+        // angles (an arc doubling back through a pole is not a zone).
+        if vm < lo - 1e-9 || vm > hi + 1e-9 || hi - lo < 1e-9 {
+            return CurvedBandSurface::Revolution;
+        }
+        let (lo, hi) = (lo.max(0.0), hi.min(PI));
+        let Ok(mut sphere) = Sphere::with_orientation(center_on_axis, rho, ref_dir, axis) else {
+            return CurvedBandSurface::Revolution;
+        };
+        sphere.param_limits = Some([0.0, TAU, lo, hi]);
+        return CurvedBandSurface::Sphere(sphere);
+    }
+
+    // ── Torus band: arc centered off the axis. ──────────────────────────
+    // Ring class only: the tube must stay clear of the axis by the pole
+    // tolerance. Spindle (ρ ≥ R) and axis-touching arcs stay SoR.
+    if big_r - rho < APEX_EPS {
+        return CurvedBandSurface::Revolution;
+    }
+    // The rotated seam's center must sit on the +ref_dir meridian ray
+    // (seam canonicalisation puts a band VERTEX at azimuth 0; a center at
+    // azimuth π would mean the arc reaches around the axis).
+    let perp = radial - ref_dir * radial.dot(&ref_dir);
+    if radial.dot(&ref_dir) <= 0.0 || perp.magnitude() > 1e-7 * big_r.max(1.0) {
+        return CurvedBandSurface::Revolution;
+    }
+
+    // Tube angle in the torus frame: 0 at the outer equator (+ref_dir),
+    // increasing toward +axis — exactly `Torus::evaluate_full`'s v.
+    let tube_v = |p: Point3| -> f64 {
+        let d = p - q;
+        d.dot(&axis).atan2(d.dot(&ref_dir))
+    };
+
+    let limits = if closed {
+        // Full-circle profile edge → full ring torus. The seam's parametric
+        // origin must sit on the outer equator (v = 0) so both surface
+        // seams land on the domain boundary of the FULL parameterisation
+        // ([0,2π]², `param_limits: None`) — the same layout
+        // `TorusPrimitive` builds. Any other seam phase would fold under
+        // `Torus::closest_point`'s v-normalisation.
+        if tube_v(p0).abs() > 1e-7 {
+            return CurvedBandSurface::Revolution;
+        }
+        None
+    } else {
+        let (v0, v1, vm) = (tube_v(p0), tube_v(p1), tube_v(pm));
+        let (a, b) = (v0.min(v1), v0.max(v1));
+        // Two candidate v-intervals join the endpoints; the parametric
+        // midpoint picks the one the arc actually sweeps.
+        let direct = vm >= a - 1e-9 && vm <= b + 1e-9;
+        let (lo, hi) = if direct { (a, b) } else { (b, a + TAU) };
+        if hi - lo < 1e-9 {
+            return CurvedBandSurface::Revolution;
+        }
+        // Fold-free domains of `Torus::closest_point`: entirely inside
+        // [0, 2π), or straddling the outer-equator seam within (−π, π]
+        // (the signed-v convention for `v_min < 0` patches).
+        let safe = (lo >= 0.0 && hi < TAU) || (lo > -PI && lo < 0.0 && hi <= PI);
+        if !safe {
+            return CurvedBandSurface::Revolution;
+        }
+        Some([0.0, TAU, lo, hi])
+    };
+
+    CurvedBandSurface::Torus(Torus {
+        center: center_on_axis,
+        axis,
+        major_radius: big_r,
+        minor_radius: rho,
+        ref_dir,
+        param_limits: limits,
+    })
+}
+
+/// Full-sphere classification for a CURVED pole-to-pole profile edge (both
+/// endpoints on the axis): a true `Arc` whose supporting plane contains the
+/// axis and whose center sits on it revolves to the complete sphere.
+/// Returns `None` for anything else (the caller keeps the old skip →
+/// self-check → grid-rollback behaviour).
+fn classify_full_sphere_band(
+    curve: &dyn crate::primitives::curve::Curve,
+    axis_origin: Point3,
+    axis: Vector3,
+    ref_dir: Vector3,
+) -> Option<crate::primitives::surface::Sphere> {
+    use crate::primitives::curve::{Arc, Curve as _};
+    let a = curve.as_any().downcast_ref::<Arc>()?;
+    if a.is_closed() || !(a.radius.is_finite() && a.radius > 0.0) {
+        return None;
+    }
+    let n = a.normal.normalize().ok()?;
+    if n.dot(&axis).abs() > 1e-7 {
+        return None;
+    }
+    let rel = a.center - axis_origin;
+    let axial = rel.dot(&axis);
+    if (rel - axis * axial).magnitude() >= 1e-4 {
+        return None;
+    }
+    let center = axis_origin + axis * axial;
+    crate::primitives::surface::Sphere::with_orientation(center, a.radius, ref_dir, axis).ok()
+}
+
 /// #19 analytic-band revolve (v1: Cylinder walls + annular Plane caps).
 ///
 /// Returns `Some(solid)` when the profile is a full-revolution rectilinear
@@ -1320,7 +1668,11 @@ fn try_analytic_band_revolution(
     // profile the analytic path can't yet seal never regresses a working revolve.
 
     // Build + self-check inside a rollback: Err restores the model so the grid
-    // path runs clean.
+    // path runs clean. In strict analytic mode (typed wire profiles) the
+    // error PROPAGATES after the rollback instead of being swallowed — the
+    // caller declared the profile analytic, so a silent grid fallback would
+    // facet a profile the caller was promised exact surfaces for.
+    let strict = options.strict_analytic;
     let attempt = lifecycle::with_rollback(model, move |model| {
         build_analytic_bands(
             model,
@@ -1332,7 +1684,11 @@ fn try_analytic_band_revolution(
             axis,
         )
     });
-    Ok(attempt.ok())
+    match attempt {
+        Ok(sid) => Ok(Some(sid)),
+        Err(e) if strict => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Emit the analytic band faces (shared ring-circle edges), clean up the scratch
@@ -1422,9 +1778,84 @@ fn build_analytic_bands(
     for &(s, en, curve_id, is_linear) in prof {
         let apex_s = is_apex.get(&s).copied().unwrap_or(false);
         let apex_en = is_apex.get(&en).copied().unwrap_or(false);
-        // A profile edge running ALONG the axis (both endpoints poles) bounds no
-        // surface — the adjacent bands' seams already meet at the shared apex.
         if apex_s && apex_en {
+            // A LINEAR profile edge running ALONG the axis (both endpoints
+            // poles) bounds no surface — the adjacent bands' seams already
+            // meet at the shared apex.
+            if is_linear {
+                continue;
+            }
+            // PIECEWISE-ANALYTIC REVOLVE (spec 2026-07-19 Slice A): a CURVED
+            // pole-to-pole profile edge whose supporting circle is centered
+            // ON the axis revolves to the FULL sphere — one face with a
+            // degenerate (empty) boundary loop and real uv-bounds, exactly
+            // the `create_sphere_3d` layout (whose comment documents why the
+            // bounds must be set on a boundary-less face). A curved
+            // pole-to-pole edge that is NOT an on-axis circular arc keeps
+            // the old behaviour: no band is emitted, the shell fails the
+            // watertight self-check below and rolls back to the grid path —
+            // never a silently mistagged surface.
+            let mut built: Option<(crate::primitives::surface::Sphere, Vector3)> = None;
+            if let Some(curve) = model.curves.get(curve_id) {
+                if let Some(sphere) = classify_full_sphere_band(curve, axis_origin, axis, ref_dir) {
+                    // Solid-outward at the arc's parametric midpoint, from
+                    // the LOOP-ORIENTED tangent (the chord rule degenerates:
+                    // a pole-to-pole chord is purely axial). Mirrors the
+                    // n_p × d construction the linear bands use, with the
+                    // true tangent in place of the chord.
+                    let rg = curve.parameter_range();
+                    let cp = curve.evaluate(0.5 * (rg.start + rg.end)).map_err(|e| {
+                        OperationError::NumericalError(format!("revolve sphere band mid: {e}"))
+                    })?;
+                    let start_p = curve
+                        .evaluate(rg.start)
+                        .map_err(|e| {
+                            OperationError::NumericalError(format!(
+                                "revolve sphere band start: {e}"
+                            ))
+                        })?
+                        .position;
+                    let sp = model.vertices.get_position(s).ok_or_else(|| {
+                        OperationError::InvalidGeometry("revolve: sphere band start vertex".into())
+                    })?;
+                    let sp = Vector3::new(sp[0], sp[1], sp[2]);
+                    let mut tang = cp.derivative1;
+                    if (start_p - sp).magnitude() > tol.distance() {
+                        tang = -tang;
+                    }
+                    let relm = cp.position - axis_origin;
+                    let radm = relm - axis * relm.dot(&axis);
+                    let rhat_m = radm.normalize()?;
+                    let n_p = axis.cross(&rhat_m);
+                    let out0 = n_p.cross(&tang).normalize()?;
+                    let theta_m = {
+                        let cos_t = ref_dir.dot(&rhat_m).clamp(-1.0, 1.0);
+                        let sin_t = axis.dot(&ref_dir.cross(&rhat_m));
+                        sin_t.atan2(cos_t)
+                    };
+                    let target =
+                        Matrix4::from_axis_angle(&axis, PI - theta_m)?.transform_vector(&out0);
+                    built = Some((sphere, target));
+                }
+            }
+            let Some((sphere, target)) = built else {
+                continue;
+            };
+            let ((u0, u1), (v0, v1)) = {
+                use crate::primitives::surface::Surface;
+                sphere.parameter_bounds()
+            };
+            let surf_id = model.surfaces.add(Box::new(sphere));
+            let lp_id = model.loops.add(Loop::new(0, LoopType::Outer));
+            let surf = model
+                .surfaces
+                .get(surf_id)
+                .ok_or_else(|| OperationError::InvalidGeometry("revolve: sphere surface".into()))?;
+            let orient = orient_face_for_outward(surf, target)?;
+            let mut f = Face::new(0, surf_id, lp_id, orient);
+            f.outer_loop = lp_id;
+            f.set_uv_bounds(u0, u1, v0, v1);
+            faces.push(model.faces.add(f));
             continue;
         }
         let (c0, r0, t0) = ring_geo[&s];
@@ -1512,14 +1943,62 @@ fn build_analytic_bands(
                 seam_curve = seam_curve.reversed();
             }
 
-            let sor = crate::primitives::surface::SurfaceOfRevolution::new(
-                axis_origin,
-                axis,
-                seam_curve.clone_box(),
-                std::f64::consts::TAU,
-            )
-            .map_err(|e| OperationError::NumericalError(format!("revolve sor: {e}")))?;
-            let surf_id = model.surfaces.add(Box::new(sor));
+            // PIECEWISE-ANALYTIC REVOLVE (spec 2026-07-19 Slice A): a
+            // circular-arc profile edge is an exact quadric band — Torus for
+            // an off-axis arc center with ρ < R (ring class), Sphere for an
+            // on-axis center. The classification DOWNCASTS the seam curve
+            // (never curve-fits); non-circular curves, spindle arcs (ρ ≥ R)
+            // and axis-crossing arcs keep the geometrically-true
+            // SurfaceOfRevolution — upgrading those tags would be a lie,
+            // refusing them a regression. Loop topology, seam handling and
+            // the outward check below are IDENTICAL for all three classes.
+            let band_surface =
+                classify_curved_band(seam_curve.as_ref(), axis_origin, axis, ref_dir);
+            let surf_box: Box<dyn crate::primitives::surface::Surface> = match band_surface {
+                CurvedBandSurface::Torus(t) => Box::new(t),
+                CurvedBandSurface::Sphere(sp) => Box::new(sp),
+                CurvedBandSurface::Revolution => Box::new(
+                    crate::primitives::surface::SurfaceOfRevolution::new(
+                        axis_origin,
+                        axis,
+                        seam_curve.clone_box(),
+                        std::f64::consts::TAU,
+                    )
+                    .map_err(|e| OperationError::NumericalError(format!("revolve sor: {e}")))?,
+                ),
+            };
+            let surf_id = model.surfaces.add(surf_box);
+
+            // The band surface is anchored at ref_dir; the outward sample
+            // point (u_mid = π) sits at azimuth π − θ_p from the profile.
+            // (Computed BEFORE the loop assembly below consumes the seam
+            // curve.)
+            let mut target =
+                Matrix4::from_axis_angle(&axis, PI - theta_p)?.transform_vector(&outward0);
+            if s == en {
+                // CLOSED profile curve (full-circle → full ring-torus band):
+                // the chord degenerated (d = 0) and outward0 fell back to the
+                // radial at the SEAM vertex (outer equator) — but the outward
+                // check samples the surface at its parametric v-midpoint, the
+                // tube ANTIPODE (inner equator), where solid-outward is the
+                // opposite tube-radial. Evaluate the true outward there: a
+                // revolved closed profile fills its tube, so outward = away
+                // from the tube center. The seam sits on the ref_dir meridian
+                // (azimuth 0), so the sample azimuth offset is exactly π.
+                if let Some((q, _, _, true)) = circular_seam_geometry(seam_curve.as_ref()) {
+                    let rg = seam_curve.parameter_range();
+                    let pm = seam_curve
+                        .evaluate(0.5 * (rg.start + rg.end))
+                        .map_err(|e| {
+                            OperationError::NumericalError(format!("revolve closed band mid: {e}"))
+                        })?
+                        .position;
+                    let out_mid = (pm - q).normalize()?;
+                    target = Matrix4::from_axis_angle(&axis, PI)?.transform_vector(&out_mid);
+                }
+            }
+            let target = target;
+
             // Lateral loop. A pole end → the revolution surface closes to its
             // apex: the ONLY boundary is the rim circle (the apex is the surface's
             // singularity, not topology — mirrors ConePrimitive's single-edge apex
@@ -1548,9 +2027,6 @@ fn build_analytic_bands(
                 model.loops.add(lp)
             };
 
-            // The SoR is anchored at ref_dir; the outward sample point
-            // (u_mid = π) sits at azimuth π − θ_p from the profile.
-            let target = Matrix4::from_axis_angle(&axis, PI - theta_p)?.transform_vector(&outward0);
             let surf = model
                 .surfaces
                 .get(surf_id)

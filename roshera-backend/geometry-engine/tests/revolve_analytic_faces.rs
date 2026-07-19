@@ -200,14 +200,16 @@ fn revolved_washer_bore_is_not_filled() {
     );
 }
 
-/// #21 — a CURVED meridian edge revolves to ONE `SurfaceOfRevolution` face for
-/// the whole 360°, not `segments` patches. An annular barrel: the outer wall is
-/// an ARC (r bulges 8→13→8 over z 0→10), inner wall straight (r=5), annular caps
-/// — all radii > 0 so the analytic-band path is eligible. Proves the curved arm
-/// engaged: a grid fallback would emit 48 SurfaceOfRevolution patches just for
-/// the outer wall.
+/// #21 — a CURVED meridian edge revolves to ONE analytic face for the whole
+/// 360°, not `segments` patches. An annular barrel: the outer wall is an ARC
+/// (r bulges 8→13→8 over z 0→10), inner wall straight (r=5), annular caps —
+/// all radii > 0 so the analytic-band path is eligible. Proves the curved arm
+/// engaged: a grid fallback would emit 48 patches just for the outer wall.
+/// Since the piecewise-analytic revolve (spec 2026-07-19) the one face is the
+/// EXACT quadric: a true off-axis arc (R = 8, ρ = 5) tags `Torus`, never a
+/// generic `SurfaceOfRevolution`.
 #[test]
-fn curved_meridian_revolves_to_one_surface_of_revolution() {
+fn curved_meridian_revolves_to_one_exact_torus_band() {
     let mut m = BRepModel::new();
     let v_bo = m.vertices.add(8.0, 0.0, 0.0); // bottom outer
     let v_to = m.vertices.add(8.0, 0.0, 10.0); // top outer
@@ -261,9 +263,14 @@ fn curved_meridian_revolves_to_one_surface_of_revolution() {
 
     let kinds = face_kinds(&m, sid);
     assert_eq!(
-        count(&kinds, SurfaceType::SurfaceOfRevolution),
+        count(&kinds, SurfaceType::Torus),
         1,
-        "curved outer wall must be ONE SurfaceOfRevolution face (analytic path), got {kinds:?}"
+        "curved outer wall must be ONE exact Torus band (analytic path), got {kinds:?}"
+    );
+    assert_eq!(
+        count(&kinds, SurfaceType::SurfaceOfRevolution),
+        0,
+        "a true circular arc wall carries the exact quadric tag, got {kinds:?}"
     );
     assert!(
         kinds.len() <= 6,

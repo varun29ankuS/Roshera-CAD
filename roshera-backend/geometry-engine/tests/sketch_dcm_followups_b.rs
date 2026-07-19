@@ -662,10 +662,13 @@ fn csketch_trapezoid_profile_revolves_with_cone_band() {
 }
 
 /// Item 5, arc band: a typed `Arc` profile edge revolves to exactly
-/// ONE `SurfaceOfRevolution` face (the #21 one-face contract) — never
-/// a per-segment patch explosion, never a chord fan.
+/// ONE analytic face (the #21 one-face contract) — never a
+/// per-segment patch explosion, never a chord fan. Since the
+/// piecewise-analytic revolve (spec 2026-07-19) that one face is the
+/// EXACT quadric: an off-axis arc (center distance R = 5, ρ = 2)
+/// carries a `Torus` tag, not a generic `SurfaceOfRevolution`.
 #[test]
-fn csketch_arc_profile_revolves_to_one_surface_of_revolution() {
+fn csketch_arc_profile_revolves_to_one_exact_torus_band() {
     let s = fresh("followups_b_flask");
     let a = s.add_point(Point2d::new(2.0, 0.0));
     let b = s.add_point(Point2d::new(5.0, 0.0));
@@ -703,9 +706,15 @@ fn csketch_arc_profile_revolves_to_one_surface_of_revolution() {
 
     let k = face_kinds(&model, solid);
     assert_eq!(
-        kind_count(&k, SurfaceType::SurfaceOfRevolution),
+        kind_count(&k, SurfaceType::Torus),
         1,
-        "the arc wall is ONE analytic revolved face, got {k:?}"
+        "the arc wall is ONE exact Torus band, got {k:?}"
+    );
+    assert_eq!(
+        kind_count(&k, SurfaceType::SurfaceOfRevolution),
+        0,
+        "a true circular arc must carry the exact quadric tag, not a \
+         generic SurfaceOfRevolution, got {k:?}"
     );
 
     let gt = model.ground_truth(solid).expect("ground truth");
@@ -722,15 +731,18 @@ fn csketch_arc_profile_revolves_to_one_surface_of_revolution() {
     );
 }
 
-/// Item 5, honest refusal: a full-circle typed loop revolved about an
-/// external axis is a TORUS lateral, which the revolve builder has no
-/// analytic path for — the kernel refuses TYPED (callers sample the
+/// Item 5, honest refusal (narrowed by the piecewise-analytic revolve,
+/// spec 2026-07-19): an OFF-AXIS full-circle loop now revolves to an
+/// exact ring-`Torus` lateral, but a circle that is on-axis, crosses
+/// the axis, or is spindle-class (ρ ≥ R) has NO exact torus
+/// representation — the kernel still refuses TYPED (callers sample the
 /// circle explicitly, counted in `sampled_loops`), never a silently
-/// broken solid.
+/// broken or mistagged solid. Fixture: center distance 1.0 < ρ = 1.5
+/// (axis-crossing).
 #[test]
 fn csketch_circle_profile_revolve_refuses_typed() {
     let s = fresh("followups_b_torus_refuse");
-    s.add_circle(Point2d::new(6.0, 0.0), 1.5).expect("circle");
+    s.add_circle(Point2d::new(1.0, 0.0), 1.5).expect("circle");
     let outer = analytic_outer(&s);
     assert!(matches!(outer[0], ProfileEdge::Circle { .. }));
 

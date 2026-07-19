@@ -981,6 +981,7 @@ impl OperationsRegistry {
             segments: 32,
             pitch: 0.0,
             cap_ends: true,
+            strict_analytic: false,
         };
 
         let result = crate::operations::revolve::revolve_face(model, face_id, options)?;

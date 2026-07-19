@@ -1023,7 +1023,28 @@ function TreeContextMenu({
     if (!localObj) return
     const next = window.prompt('Rename', localObj.name)?.trim()
     if (!next || next === localObj.name) return
+    // Optimistic local update; the backend write is what makes the rename
+    // DURABLE — the kernel solid's name is the single source every reload
+    // (scene snapshot), the timeline lanes, and the agent surface derive
+    // from. Without it a refresh reverted the rename to solid_N.
     updateObject(localObj.id, { name: next })
+    void (async () => {
+      try {
+        const resp = await fetch(
+          `/api/parts/uuid/${encodeURIComponent(localObj.id)}/name`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: next }),
+          },
+        )
+        if (!resp.ok) {
+          console.error('[browser] rename persist failed:', resp.status)
+        }
+      } catch (err) {
+        console.error('[browser] rename persist error:', err)
+      }
+    })()
   }, [localObj, updateObject, onClose])
 
   const handleEditSketch = useCallback(() => {
