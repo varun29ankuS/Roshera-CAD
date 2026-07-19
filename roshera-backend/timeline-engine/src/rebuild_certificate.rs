@@ -40,7 +40,10 @@
 
 use crate::dependency_projection::build_dependency_graph;
 use crate::mould::{is_param_meta, OverrideSet};
-use crate::replay::{apply_event, AssemblyStore, ReplayError, ReplayOutcome};
+use crate::replay::{
+    apply_event, rederive_part_drawing, AssemblyStore, DrawingRederive, DrawingStore, ReplayError,
+    ReplayOutcome,
+};
 use crate::types::{Operation, TimelineEvent};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::Serialize;
@@ -132,11 +135,31 @@ impl RebuildCertificate {
         self.is_sound
     }
 
-    /// The first feature that broke (a `Failed`/`Dangling`/`Blocked`), in
-    /// sequence order, if any — what a refusal names.
+    /// The first GEOMETRY feature that broke (a `Failed`/`Dangling`/`Blocked`),
+    /// in sequence order, if any — what a mould refusal names. A non-geometry
+    /// DOCUMENT feature (a `drawing.*` #32 sheet) is excluded: its break never
+    /// drives the soundness verdict a refusal is gated on, so naming it would
+    /// misattribute the refusal. Its own verdict still appears in `verdicts`.
     pub fn first_break(&self) -> Option<&FeatureVerdict> {
-        self.verdicts.iter().find(|v| v.status.is_break())
+        self.verdicts
+            .iter()
+            .find(|v| v.status.is_break() && !v.kind.starts_with("drawing."))
     }
+}
+
+/// The one non-geometry document kind that gains a real replay arm (#32): a
+/// `drawing.create_from_part` RE-DERIVES its sheet from the rebuilt geometry.
+/// Every OTHER dotted kind keeps the honest-skip → `Stale` behaviour (#31).
+const DRAWING_FROM_PART_KIND: &str = "drawing.create_from_part";
+
+/// A drawing (`drawing.*`) event is a non-geometry DOCUMENT feature. It gets a
+/// real, honest per-feature verdict (`Rebuilt`/`Failed`/`Dangling`), but — like
+/// a `Stale` document (#31) — it never gates GEOMETRY soundness: a broken sheet
+/// means the drawing needs attention, not that the re-measured B-Rep is unsound.
+/// So its verdict is excluded from the geometry `no_break` gate and its failure
+/// does not increment `events_skipped` (which reflects the geometry rebuild).
+fn is_document_feature(kind: &str) -> bool {
+    kind.starts_with("drawing.")
 }
 
 /// Per-event replay outcome captured while building the certificate.
@@ -155,11 +178,12 @@ enum EventResult {
 fn replay_with_report(
     model: &mut BRepModel,
     events: &[TimelineEvent],
-) -> (ReplayOutcome, HashMap<u64, EventResult>) {
+) -> (ReplayOutcome, HashMap<u64, EventResult>, DrawingStore) {
     let saved = model.attach_recorder(None);
     let overrides = OverrideSet::collect(events);
     let mut outcome = ReplayOutcome::default();
     let mut assemblies = AssemblyStore::default();
+    let mut drawings = DrawingStore::default();
     let mut per_event: HashMap<u64, EventResult> = HashMap::new();
 
     for event in events {
@@ -171,6 +195,46 @@ fn replay_with_report(
         }
         let overridden = overrides.overridden_event(event);
         let dispatched = overridden.as_ref().unwrap_or(event);
+
+        // #32: a `drawing.create_from_part` is a non-geometry DOCUMENT event —
+        // it owns no B-Rep, so it is NOT dispatched into the model. Instead it
+        // RE-DERIVES its sheet from the geometry as it stands at this position in
+        // the (moulded) log (option a). Its outcome becomes a real per-feature
+        // verdict; a Failed/Dangling drawing does NOT taint geometry soundness
+        // (it never increments `events_skipped`) — a broken sheet is a document
+        // concern, not an unsound B-Rep.
+        if let Operation::Generic { command_type, .. } = &dispatched.operation {
+            if command_type == DRAWING_FROM_PART_KIND {
+                let result = match rederive_part_drawing(model, dispatched, &outcome.id_remap) {
+                    DrawingRederive::Rebuilt(id, sheet) => {
+                        drawings.drawings.insert(id, *sheet);
+                        outcome.events_applied += 1;
+                        EventResult::Ok
+                    }
+                    DrawingRederive::Dangling(entity) => {
+                        tracing::debug!(
+                            target: "timeline.rebuild_certificate",
+                            sequence = event.sequence_number,
+                            entity = %entity,
+                            "drawing source solid dangled; geometry unaffected"
+                        );
+                        EventResult::Dangling(entity)
+                    }
+                    DrawingRederive::Failed(reason) => {
+                        tracing::debug!(
+                            target: "timeline.rebuild_certificate",
+                            sequence = event.sequence_number,
+                            reason = %reason,
+                            "drawing re-derivation failed; geometry unaffected, sheet needs attention"
+                        );
+                        EventResult::Failed(reason)
+                    }
+                };
+                per_event.insert(event.sequence_number, result);
+                continue;
+            }
+        }
+
         match apply_event(model, &mut assemblies, dispatched, &mut outcome.id_remap) {
             Ok(()) => {
                 outcome.events_applied += 1;
@@ -213,7 +277,7 @@ fn replay_with_report(
     }
     outcome.assemblies = assemblies;
     let _ = model.attach_recorder(saved);
-    (outcome, per_event)
+    (outcome, per_event, drawings)
 }
 
 /// Re-measured soundness: replay skipped nothing, produced at least one solid,
@@ -243,8 +307,22 @@ pub fn certify_rebuild(
     events: &[TimelineEvent],
     target_sequence: Option<u64>,
 ) -> (BRepModel, RebuildCertificate) {
+    let (model, cert, _drawings) = certify_rebuild_with_drawings(events, target_sequence);
+    (model, cert)
+}
+
+/// [`certify_rebuild`] plus the sheets RE-DERIVED from the rebuilt geometry
+/// (#32). The extra [`DrawingStore`] carries every `drawing.create_from_part`
+/// whose verdict is `Rebuilt`, keyed by its preserved UUID, so a caller (the
+/// live mould endpoint) can reconcile its drawing registry to the post-mould
+/// sheets in the SAME slots. Computed off any live lock — this is where the
+/// heavier sheet re-derivation runs, never under the model write lock.
+pub fn certify_rebuild_with_drawings(
+    events: &[TimelineEvent],
+    target_sequence: Option<u64>,
+) -> (BRepModel, RebuildCertificate, DrawingStore) {
     let mut model = BRepModel::new();
-    let (outcome, per_event) = replay_with_report(&mut model, events);
+    let (outcome, per_event, drawings) = replay_with_report(&mut model, events);
 
     // Feature DAG projection — dirty set and Blocked propagation both read it.
     let graph = build_dependency_graph(events);
@@ -366,8 +444,17 @@ pub fn certify_rebuild(
 
     verdicts.sort_by_key(|v| v.sequence);
 
-    let no_break = verdicts.iter().all(|v| !v.status.is_break());
-    let is_sound = no_break && measure_is_sound(&model, outcome.events_skipped);
+    // Geometry soundness is measured over GEOMETRY features only. A drawing
+    // (#32) is a non-geometry DOCUMENT feature: its `Failed`/`Dangling` verdict
+    // is reported honestly but must not drag the re-measured B-Rep to unsound —
+    // exactly as a `Stale` document (#31) never did. `events_skipped` already
+    // excludes drawing failures (see `replay_with_report`), so both halves of
+    // the verdict agree.
+    let no_geometry_break = verdicts
+        .iter()
+        .filter(|v| !is_document_feature(&v.kind))
+        .all(|v| !v.status.is_break());
+    let is_sound = no_geometry_break && measure_is_sound(&model, outcome.events_skipped);
 
     (
         model,
@@ -377,6 +464,7 @@ pub fn certify_rebuild(
             dirty_sequences,
             is_sound,
         },
+        drawings,
     )
 }
 
@@ -521,17 +609,52 @@ mod tests {
         )
     }
 
-    /// A non-geometry, document-level event (`drawing.create_from_part`) — the
-    /// exact LIVE-bug kind. It has no B-Rep replay arm.
-    fn drawing_from_part(seq: u64, source_solid: u64) -> TimelineEvent {
+    /// A `drawing.create_from_part` event in the shape the live api-server
+    /// records it (verified against a live event): `params` carry `solid_id` /
+    /// `part_uuid` / `sheet_size`, the source solid is an `inputs` ref, and the
+    /// drawing's stable UUID is the `drawing:<uuid>` output. #32 re-derives its
+    /// sheet from the rebuilt geometry under that same UUID.
+    fn drawing_from_part(seq: u64, source_solid: u64, drawing_id: Uuid) -> TimelineEvent {
         generic(
             "drawing.create_from_part",
             seq,
             json!({
-                "params": { "drawing_id": "d1", "source": format!("solid:{source_solid}") },
-                "inputs": [format!("solid:{source_solid}")], "outputs": []
+                "params": {
+                    "solid_id": source_solid,
+                    "part_uuid": Uuid::nil().to_string(),
+                    "sheet_size": "A3"
+                },
+                "inputs": [format!("solid:{source_solid}")],
+                "outputs": [format!("drawing:{drawing_id}")]
             }),
         )
+    }
+
+    /// A non-geometry DOCUMENT event that is NOT a drawing (`gdt.add_datum`) —
+    /// it has no B-Rep replay arm and gains none under #32, so it must keep the
+    /// honest-skip → `Stale` behaviour (#31). Used by the regression gate.
+    fn gdt_annotation(seq: u64, source_solid: u64) -> TimelineEvent {
+        generic(
+            "gdt.add_datum",
+            seq,
+            json!({
+                "params": { "datum": "A", "solid_id": source_solid },
+                "inputs": [format!("solid:{source_solid}")],
+                "outputs": []
+            }),
+        )
+    }
+
+    /// The largest dimension callout value on a re-derived sheet — the readback
+    /// that proves the sheet reflects the CURRENT geometry (a moulded box's
+    /// widened extent), not a cached older sheet.
+    fn max_sheet_dimension(drawing: &geometry_engine::drawing::Drawing) -> f64 {
+        drawing
+            .views
+            .iter()
+            .flat_map(|v| &v.dimensions)
+            .map(|d| d.value)
+            .fold(0.0_f64, f64::max)
     }
 
     fn status_at(cert: &RebuildCertificate, seq: u64) -> &FeatureStatus {
@@ -752,66 +875,163 @@ mod tests {
         assert!(!cert.is_sound());
     }
 
-    /// LIVE BUG (#31, found 2026-07-18 against :8081) — a full workflow
-    /// box → cylinder → boolean → **drawing**, then mould the cylinder radius.
-    /// The mould re-derives the geometry cleanly, but the timeline's non-geometry
-    /// `drawing.create_from_part` event has no B-Rep replay arm.
+    /// #32 GATE A (the headline: drawings follow the part on a mould) — a
+    /// box → **drawing** → mould-the-box-width. The drawing is RE-DERIVED from
+    /// the widened geometry: its verdict is `Rebuilt` (not the pre-#32 `Stale`),
+    /// the mould stays sound, AND the re-derived sheet's largest dimension callout
+    /// reflects the NEW width (30), proving it was re-derived from the rebuilt
+    /// B-Rep and not a cached older sheet relabeled.
     ///
-    /// Pre-fix signature (captured live):
-    ///   {"sequence":N,"kind":"drawing.create_from_part","status":"failed",
-    ///    "reason":"unknown operation kind: drawing.create_from_part"}, is_sound:false.
+    /// Pre-#32 signature (the banked #31 honest-skip): the drawing verdict was
+    /// `Stale` and the sheet reflected the OLD 20 mm part.
     ///
-    /// The fix: that event is reported as a typed `Stale` verdict (the drawing now
-    /// reflects an OLDER part — a separate regen concern), and it must NOT drag
-    /// `is_sound` to false — the geometry (box/cylinder/boolean) is sound.
-    ///
-    /// Mutation proof (hand-revert 2026-07-18): in `replay.rs`, make the
-    /// dotted-namespace dispatch fallback return `UnknownKind` again (drop the
-    /// `non_geometry_stale` branch) — the drawing verdict reverts to `Failed` and
-    /// `is_sound` reverts to false; both assertions below fire. Restored → green.
+    /// Mutation proof (hand-revert): in `rederive_part_drawing` (replay.rs),
+    /// re-derive from a CACHED old model instead of the passed `model` (e.g. a
+    /// fresh `BRepModel` rebuilt from `box20(0,1)` alone) — the sheet's largest
+    /// dimension reverts to ~20 and the `max_dim ≈ 30` assertion fires. Restored
+    /// → green. (Alternate mutation: make the drawing dispatch a `Stale` skip
+    /// again — the `Rebuilt` verdict assertion fires.)
     #[test]
-    fn nongeometry_drawing_event_is_stale_not_failed_and_stays_sound() {
+    fn moulded_drawing_rederives_its_sheet_from_the_rebuilt_geometry() {
+        let did = Uuid::new_v4();
+        // box20 is a 20³ cube; mould its width to 30.
+        let events = vec![
+            box20(0, 1),
+            drawing_from_part(1, 1, did),
+            mould(0, "width", 30.0, 2),
+        ];
+
+        // Verdict + soundness via the certificate.
+        let (_m, cert) = certify_rebuild(&events, Some(0));
+        assert!(
+            cert.is_sound(),
+            "a geometrically-fine box-width mould stays sound and re-derives the sheet: {:?}",
+            cert.first_break()
+        );
+        assert_eq!(
+            status_at(&cert, 1),
+            &FeatureStatus::Rebuilt,
+            "the drawing FOLLOWS the moulded box (Rebuilt), not the pre-#32 Stale"
+        );
+        assert!(
+            cert.first_break().is_none(),
+            "a cleanly re-derived drawing is not a break"
+        );
+        assert_eq!(status_at(&cert, 0), &FeatureStatus::Rebuilt);
+
+        // Semantic readback: the re-derived sheet's largest dimension is the NEW
+        // width (30), not the old 20 — the sheet came from the rebuilt geometry.
+        let (_m2, _cert2, drawings) = certify_rebuild_with_drawings(&events, Some(0));
+        let sheet = drawings
+            .get(&did)
+            .expect("the re-derived sheet is stored under its preserved UUID");
+        let max_dim = max_sheet_dimension(sheet);
+        assert!(
+            (max_dim - 30.0).abs() < 0.5,
+            "the re-derived sheet's largest dimension reflects the moulded width 30, got {max_dim}"
+        );
+        // Identity preserved: same registry slot / UUID survives the mould.
+        assert_eq!(
+            sheet.id,
+            geometry_engine::drawing::DrawingId(did),
+            "the re-derived sheet keeps its drawing id so references survive"
+        );
+    }
+
+    /// #32 GATE B (honest dangle) — a mould-scene whose drawing names a source
+    /// solid that no longer resolves in the rebuilt model (stands in for a solid
+    /// an upstream topology-changing mould consumed, exactly as the blend
+    /// Decision-d gate uses a non-existent edge). The drawing verdict is a typed
+    /// `Dangling` naming the reference — NOT a silent drop, NOT a wrong sheet —
+    /// AND, because a drawing is a non-geometry document, the honest dangle does
+    /// not lie about GEOMETRY soundness: the box rebuilt fine, so `is_sound` is
+    /// TRUE. (Contrast the blend-edge dangle, which IS geometry → unsound.)
+    ///
+    /// Mutation proof (hand-revert): in `rederive_part_drawing`, drop the
+    /// `model.solids.get(...).is_none()` guard and fall through to
+    /// `standard_drawing_auto` — the missing solid then surfaces as a `Failed`
+    /// derivation error rather than the typed `Dangling`, and the `Dangling`
+    /// assertion fires. Restored → green.
+    #[test]
+    fn moulded_drawing_with_a_consumed_source_solid_is_dangling_but_geometry_stays_sound() {
+        let did = Uuid::new_v4();
+        // A box (sound) + a drawing naming solid:99999 (never produced — the
+        // stand-in for a solid an upstream topology-changing mould consumed),
+        // then a clean box-width mould.
+        let events = vec![
+            box20(0, 1),
+            drawing_from_part(1, 99_999, did),
+            mould(0, "width", 30.0, 2),
+        ];
+        let (_m, cert) = certify_rebuild(&events, Some(0));
+        match status_at(&cert, 1) {
+            FeatureStatus::Dangling { entity } => {
+                assert!(
+                    entity.contains("99999"),
+                    "names the dangling source solid: {entity}"
+                );
+            }
+            other => panic!("expected Dangling for the drawing, got {other:?}"),
+        }
+        assert!(
+            cert.is_sound(),
+            "an honest dangling DRAWING does not lie about geometry soundness — the box rebuilt fine: {:?}",
+            cert.first_break()
+        );
+        // The dangling sheet is NOT stored (only cleanly-rebuilt sheets are).
+        let (_m2, _cert2, drawings) = certify_rebuild_with_drawings(&events, Some(0));
+        assert!(
+            drawings.get(&did).is_none(),
+            "a dangling drawing is not filed into the re-derived store"
+        );
+    }
+
+    /// #32 GATE C (regression: the honest-skip is preserved for OTHER document
+    /// kinds) — a non-drawing, non-geometry event (`gdt.add_datum`) still has NO
+    /// B-Rep replay arm and still replays as the honest #31 `Stale` skip: it does
+    /// not taint geometry soundness and is never a break. Only
+    /// `drawing.create_from_part` gained a replay arm; the rest of the
+    /// non-geometry namespace is untouched.
+    #[test]
+    fn nondrawing_document_event_still_replays_as_the_honest_stale_skip() {
         let events = vec![
             box20(0, 1),
             drill(1, 2, 3.0),
             difference(2, 1, 2, 3),
-            drawing_from_part(3, 3),
+            gdt_annotation(3, 3),
             mould(1, "radius", 4.0, 4),
         ];
         let (_m, cert) = certify_rebuild(&events, Some(1));
-        // The geometry is sound — the mould re-derived the boolean cleanly, and a
-        // stale drawing does not taint the re-measured B-Rep soundness.
         assert!(
             cert.is_sound(),
-            "a geometrically-fine mould stays sound despite a stale drawing: {:?}",
+            "a geometrically-fine mould stays sound despite a stale annotation: {:?}",
             cert.first_break()
         );
-        // The drawing event is typed STALE, never Failed.
         match status_at(&cert, 3) {
             FeatureStatus::Stale { .. } => {}
-            other => panic!("expected Stale for the non-geometry drawing event, got {other:?}"),
+            other => panic!("expected Stale for the non-drawing gdt event, got {other:?}"),
         }
-        // A Stale verdict is not a break.
         assert!(
             cert.first_break().is_none(),
-            "a stale drawing is not a break"
+            "a stale annotation is not a break"
         );
-        // The geometry features still rebuilt.
         assert_eq!(status_at(&cert, 1), &FeatureStatus::Rebuilt);
         assert_eq!(status_at(&cert, 2), &FeatureStatus::Rebuilt);
     }
 
-    /// HONESTY BOUNDARY (#31) — a genuinely-failing GEOMETRY event and a
-    /// non-replayable DRAWING event land in DIFFERENT verdict buckets: the
-    /// collapsed box is `Failed` (a real bad model → unsound), the drawing is
-    /// `Stale` (geometry-independent). The skip-and-mark-stale path must NOT
-    /// swallow real geometry failures.
+    /// HONESTY BOUNDARY — a genuinely-failing GEOMETRY event and a
+    /// non-re-derivable DRAWING event land in DIFFERENT verdict buckets: the
+    /// collapsed box is `Failed` (a real bad model → unsound), the drawing whose
+    /// source solid the collapse destroyed is `Dangling` (a document concern).
+    /// Re-deriving drawings must NOT swallow real geometry failures.
     #[test]
-    fn geometry_failure_and_nongeometry_drawing_land_in_different_buckets() {
+    fn geometry_failure_and_a_dangling_drawing_land_in_different_buckets() {
+        let did = Uuid::new_v4();
         let events = vec![
             box20(0, 1),
-            drawing_from_part(1, 1),
-            // Collapse the box to a zero width → a real geometry rebuild failure.
+            drawing_from_part(1, 1, did),
+            // Collapse the box to a zero width → a real geometry rebuild failure,
+            // which also destroys the drawing's source solid.
             mould(0, "width", 0.0, 2),
         ];
         let (_m, cert) = certify_rebuild(&events, Some(0));
@@ -820,12 +1040,13 @@ mod tests {
             FeatureStatus::Failed { .. } => {}
             other => panic!("expected Failed for the collapsed box, got {other:?}"),
         }
-        // The drawing is Stale, NOT Failed — the OTHER bucket.
+        // The drawing is Dangling (its source solid never built), NOT swallowed.
         match status_at(&cert, 1) {
-            FeatureStatus::Stale { .. } => {}
-            other => panic!("expected Stale for the drawing, got {other:?}"),
+            FeatureStatus::Dangling { .. } => {}
+            other => panic!("expected Dangling for the drawing, got {other:?}"),
         }
-        // A real geometry failure is still unsound — the skip did not paper over it.
+        // A real geometry failure is still unsound — the drawing arm did not
+        // paper over it.
         assert!(!cert.is_sound(), "a collapsed box is not sound");
     }
 

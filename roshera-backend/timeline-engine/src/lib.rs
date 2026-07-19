@@ -50,9 +50,15 @@ pub use mould::{
     is_param_meta, mould_operation, name_binding_operation, params_have_numeric, NameBindings,
     OverrideSet, MOULD_COMMAND, NAME_COMMAND,
 };
-pub use rebuild_certificate::{certify_rebuild, FeatureStatus, FeatureVerdict, RebuildCertificate};
+pub use rebuild_certificate::{
+    certify_rebuild, certify_rebuild_with_drawings, FeatureStatus, FeatureVerdict,
+    RebuildCertificate,
+};
 pub use recorder_bridge::{SharedTimeline, TimelineRecorder};
-pub use replay::{apply_event, rebuild_model_from_events, ReplayError, ReplayOutcome};
+pub use replay::{
+    apply_event, rebuild_model_from_events, rederive_part_drawing, DrawingRederive, DrawingStore,
+    ReplayError, ReplayOutcome,
+};
 pub use timeline::Timeline;
 pub use types::*;
 

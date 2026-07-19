@@ -14,10 +14,10 @@ use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use timeline_engine::{
-    certify_rebuild, mould_operation, name_binding_operation, params_have_numeric,
-    rebuild_model_from_events, Author, BranchId, BranchManager, BranchPurpose, EntityId, EventId,
-    EventMetadata, NameBindings, Operation, OperationInputs, RebuildCertificate, ReplayOutcome,
-    SessionId, Timeline, TimelineError, TimelineEvent,
+    certify_rebuild, certify_rebuild_with_drawings, mould_operation, name_binding_operation,
+    params_have_numeric, rebuild_model_from_events, Author, BranchId, BranchManager, BranchPurpose,
+    EntityId, EventId, EventMetadata, NameBindings, Operation, OperationInputs, RebuildCertificate,
+    ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -1487,7 +1487,12 @@ pub async fn mould_parameter(
     candidate_events.push(mould_event.clone());
 
     let (_base_model, base_cert) = certify_rebuild(&events, None);
-    let (cand_model, cand_cert) = certify_rebuild(&candidate_events, Some(target_sequence));
+    // #32: `certify_rebuild_with_drawings` also RE-DERIVES every
+    // `drawing.create_from_part` sheet from the moulded geometry (option a) —
+    // off any live lock, so the heavy HLR pipeline never runs under the model
+    // write lock. The re-derived sheets reconcile the drawing registry below.
+    let (cand_model, cand_cert, cand_drawings) =
+        certify_rebuild_with_drawings(&candidate_events, Some(target_sequence));
 
     // Refuse only a REGRESSION: a sound baseline broken by the edit (a NEW
     // downstream failure, a dangling reference, a collapse, or a self-
@@ -1575,6 +1580,17 @@ pub async fn mould_parameter(
             )
         }
     };
+
+    // #32: reconcile the drawing registry to the sheets re-derived from the
+    // moulded geometry. The sheets were already computed off the model lock
+    // (inside `certify_rebuild_with_drawings`); reconciling is DashMap upserts
+    // keyed by each drawing's preserved UUID, so a moulded part's sheet updates
+    // IN PLACE and every reference (frontend, agents) survives. Only cleanly
+    // re-derived sheets are present; a dangling/failed sheet keeps its old slot
+    // and is reported in the certificate verdict, never silently wiped.
+    if reconciled {
+        state.drawings.reconcile_from_replay(cand_drawings.drawings);
+    }
 
     let session_key = session_uuid.to_string();
     let _ = state

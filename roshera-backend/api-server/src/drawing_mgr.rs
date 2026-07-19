@@ -105,6 +105,18 @@ impl DrawingManager {
         id
     }
 
+    /// Reconcile the registry from a rebuild's re-derived from-part drawings
+    /// (#32, drawings-follow-the-part). Each sheet is upserted under its existing
+    /// UUID, so a mould updates the registered sheet IN PLACE and every reference
+    /// (frontend, agents) keeps resolving to the same slot — now showing the
+    /// post-mould geometry. Drawings NOT produced by the rebuild (empty `create`d
+    /// sheets, manually composed views) are left untouched.
+    pub fn reconcile_from_replay(&self, rebuilt: std::collections::HashMap<Uuid, Drawing>) {
+        for (id, drawing) in rebuilt {
+            self.drawings.insert(id, Arc::new(RwLock::new(drawing)));
+        }
+    }
+
     pub fn get(&self, id: &Uuid) -> Option<Arc<RwLock<Drawing>>> {
         self.drawings.get(id).map(|e| Arc::clone(e.value()))
     }
@@ -692,6 +704,12 @@ async fn create_part_drawing_inner(
                 "quality_passed": quality.passed,
                 "quality_issues": quality.issues.len(),
             }))
+            // #32: record the source solid as an INPUT so the feature-DAG
+            // projection links the sheet downstream of its part. A mould on the
+            // part then marks the drawing dirty and RE-DERIVES it (option a);
+            // without this edge the sheet would read as `Unaffected` and never
+            // follow the geometry.
+            .with_input_solids(std::iter::once(solid_id as u64))
             .with_output_drawing(drawing_id),
     );
 

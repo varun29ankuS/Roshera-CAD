@@ -169,6 +169,148 @@ impl AssemblyStore {
     }
 }
 
+/// Drawings RE-DERIVED by a rebuild from the post-mould geometry (#32,
+/// drawings-follow-the-part, founder-approved "option a").
+///
+/// A `drawing.create_from_part` event is a non-geometry DOCUMENT feature: it
+/// owns no B-Rep, so it is NOT dispatched into the [`BRepModel`]. But — unlike
+/// the honest-skip (#31) that left the sheet reflecting an OLDER part — a
+/// rebuild now RE-DERIVES the sheet from the geometry as it stands at the
+/// drawing's own position in the log (all upstream moulds folded), exactly the
+/// way a moulded fillet follows its edge. Keyed by the drawing's stable UUID
+/// (recorded as the event's `drawing:<uuid>` output), so the re-derived sheet
+/// lands back in the SAME registry slot and every reference (frontend, agents)
+/// survives the mould. Only cleanly re-derived sheets are stored; a sheet whose
+/// source solid vanished (Dangling) or whose derivation/quality failed (Failed)
+/// is reported in the [`crate::rebuild_certificate`] verdict and NOT stored.
+#[derive(Debug, Clone, Default)]
+pub struct DrawingStore {
+    /// Re-derived sheets keyed by their preserved drawing UUID.
+    pub drawings: HashMap<uuid::Uuid, geometry_engine::drawing::Drawing>,
+}
+
+impl DrawingStore {
+    /// The re-derived sheet for `id`, if one rebuilt cleanly.
+    pub fn get(&self, id: &uuid::Uuid) -> Option<&geometry_engine::drawing::Drawing> {
+        self.drawings.get(id)
+    }
+
+    /// Number of cleanly re-derived sheets.
+    pub fn len(&self) -> usize {
+        self.drawings.len()
+    }
+
+    /// True when no sheet was re-derived.
+    pub fn is_empty(&self) -> bool {
+        self.drawings.is_empty()
+    }
+}
+
+/// Outcome of re-deriving a `drawing.create_from_part` event against a rebuilt
+/// model (#32). Consumed by [`crate::rebuild_certificate`], which maps it to a
+/// typed per-feature `FeatureStatus` and (for `Rebuilt`) files the sheet into a
+/// [`DrawingStore`].
+#[derive(Debug)]
+pub enum DrawingRederive {
+    /// The sheet re-derived cleanly AND passed its layout/annotation quality
+    /// oracle; carries the preserved drawing UUID and the fresh sheet.
+    Rebuilt(uuid::Uuid, Box<geometry_engine::drawing::Drawing>),
+    /// The source solid no longer resolves in the rebuilt model (consumed or
+    /// deleted by the moulded history), or the drawing's identity was not
+    /// recorded — a typed dangle naming the reference, never a silent drop.
+    Dangling(String),
+    /// The sheet derivation failed on the rebuilt geometry, or the re-derived
+    /// sheet failed its quality oracle — honest, never silently blessed.
+    Failed(String),
+}
+
+/// Re-derive a `drawing.create_from_part` event's sheet from `model` — the
+/// geometry as it stands at the drawing's position in the (moulded) log (#32,
+/// option a).
+///
+/// Honesty contract:
+/// * The sheet is DERIVED FROM `model` via the same `standard_drawing_auto`
+///   pipeline the live `POST /api/parts/{id}/drawing` uses — never a cached
+///   sheet relabeled. Its quality oracle (`verify_drawing`) is re-run.
+/// * The recorded `solid_id` is resolved through the replay `id_remap` to the
+///   live entity; if it no longer exists post-rebuild the result is
+///   [`DrawingRederive::Dangling`] (constraint 3).
+/// * The drawing's identity (its `drawing:<uuid>` output ref) is preserved on
+///   the re-derived sheet, so it updates the SAME registry slot (constraint 2);
+///   if the id was not recorded the result is `Dangling` rather than a silent
+///   fresh id.
+/// * A derivation error or a quality-oracle failure yields
+///   [`DrawingRederive::Failed`] (constraint 1) — never a silently-dropped or
+///   blessed sheet.
+pub fn rederive_part_drawing(
+    model: &BRepModel,
+    event: &TimelineEvent,
+    id_remap: &HashMap<u64, u64>,
+) -> DrawingRederive {
+    let Operation::Generic { parameters, .. } = &event.operation else {
+        return DrawingRederive::Failed("non-Generic drawing operation".to_string());
+    };
+    let inner = parameters.get("params").unwrap_or(parameters);
+
+    // Identity: the recorded `drawing:<uuid>` output ref — the registry slot the
+    // re-derived sheet must land back in. Fall back to a `drawing_id` param for
+    // payloads that carry it there.
+    let drawing_id = parameters
+        .get("outputs")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.iter().find_map(parse_drawing_ref))
+        .or_else(|| {
+            inner
+                .get("drawing_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        });
+    let Some(drawing_id) = drawing_id else {
+        return DrawingRederive::Dangling("drawing:<unrecorded-id>".to_string());
+    };
+
+    // The source solid, resolved through the replay remap to the live entity.
+    let Some(recorded_solid) = inner.get("solid_id").and_then(|v| v.as_u64()) else {
+        return DrawingRederive::Failed("missing `solid_id`".to_string());
+    };
+    let solid_id = *id_remap.get(&recorded_solid).unwrap_or(&recorded_solid) as SolidId;
+
+    // Constraint 3: source solid gone post-rebuild → typed Dangling.
+    if model.solids.get(solid_id).is_none() {
+        return DrawingRederive::Dangling(format!("solid:{recorded_solid}"));
+    }
+
+    let part_uuid = inner
+        .get("part_uuid")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(uuid::Uuid::nil);
+
+    // Constraint 1: re-derive FROM THE REBUILT GEOMETRY — the same pipeline the
+    // live endpoint uses, never a cached sheet.
+    let mut drawing =
+        match geometry_engine::drawing::standard_drawing_auto(model, solid_id, part_uuid) {
+            Ok(d) => d,
+            Err(e) => {
+                return DrawingRederive::Failed(format!("sheet derivation failed: {e}"));
+            }
+        };
+    // Constraint 2: preserve the drawing's identity (same registry slot).
+    drawing.id = geometry_engine::drawing::DrawingId(drawing_id);
+
+    // Constraint 1: the quality oracle must re-run; a re-derived sheet the oracle
+    // rejects is reported honestly, never silently blessed as Rebuilt.
+    let quality = geometry_engine::drawing::verify_drawing(&drawing);
+    if !quality.passed {
+        return DrawingRederive::Failed(format!(
+            "re-derived sheet failed the quality oracle: {} error issue(s)",
+            quality.error_count()
+        ));
+    }
+
+    DrawingRederive::Rebuilt(drawing_id, Box::new(drawing))
+}
+
 /// Outcome of a [`rebuild_model_from_events`] run.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayOutcome {
@@ -1609,6 +1751,15 @@ fn parse_entity_ref(v: &Value, expected_kind: &str) -> Option<u64> {
     } else {
         v.as_u64()
     }
+}
+
+/// Parse a recorded `drawing:<uuid>` output reference into its UUID (#32). The
+/// drawing registry keys on UUID, not the numeric kernel-id namespace the other
+/// entity refs use, so it gets its own parser.
+fn parse_drawing_ref(v: &Value) -> Option<uuid::Uuid> {
+    let s = v.as_str()?;
+    let id = s.strip_prefix("drawing:")?;
+    uuid::Uuid::parse_str(id).ok()
 }
 
 /// Extract the numeric id from any recorded entity reference, ignoring
