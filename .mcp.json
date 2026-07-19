@@ -2,10 +2,21 @@
   "mcpServers": {
     "roshera": {
       "command": "node",
-      "args": ["roshera-mcp/dist/index.js"],
+      "args": [
+        "roshera-mcp/dist/index.js"
+      ],
       "env": {
         "ROSHERA_URL": "http://localhost:8081"
       }
+    },
+    "code-review-graph": {
+      "command": "uvx",
+      "args": [
+        "code-review-graph",
+        "serve"
+      ],
+      "cwd": "C:\\Users\\Varun Sharma\\Roshera-CAD",
+      "type": "stdio"
     }
   }
 }
