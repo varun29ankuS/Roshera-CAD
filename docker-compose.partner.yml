@@ -1,0 +1,117 @@
+# Roshera CAD — single-tenant partner instance.
+#
+# Target architecture: instance-per-partner silo. One container stack per design
+# partner; NO tenancy code, no shared database. Everything here belongs to one
+# partner and one partner only.
+#
+#   postgres  — auth/session persistence (users, sessions).
+#   backend   — api-server (REST + WebSocket), the geometry kernel host.
+#   frontend  — nginx serving the Vite SPA + reverse-proxying /api and /ws.
+#
+# Copy .env.partner.example -> .env, fill in the secrets, then:
+#   docker compose -f docker-compose.partner.yml up -d
+#
+# See docs/DEPLOYMENT.md for the full runbook, the verified env-var table, and
+# the honest durability gap (geometry/timeline do NOT survive a restart yet).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # The api-server connects as this user/db via DATABASE_URL below.
+      POSTGRES_USER: roshera
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: roshera
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # backend waits on this: PostgresDatabase::new() runs at boot and the
+      # process exits if the DB is unreachable (main.rs: `.await?`).
+      test: ["CMD-SHELL", "pg_isready -U roshera -d roshera"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - roshera
+
+  backend:
+    build:
+      context: ./roshera-backend
+      dockerfile: Dockerfile
+    image: ghcr.io/varun29ankus/roshera-cad:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- Required ---
+      # api-server/src/main.rs:8005 — std::env::var("DATABASE_URL").
+      # Host is the compose service name; default port 5432; db `roshera`.
+      DATABASE_URL: postgresql://roshera:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/roshera
+      # session-manager/src/manager.rs:632 — std::env::var("ROSHERA_JWT_SECRET").
+      # MUST be set and stable: an unset/empty secret makes the server mint a
+      # random per-process secret, invalidating every issued JWT on restart.
+      ROSHERA_JWT_SECRET: ${ROSHERA_JWT_SECRET:?set ROSHERA_JWT_SECRET in .env}
+      # --- Optional ---
+      # api-server/src/main.rs:8069 — std::env::var("ANTHROPIC_API_KEY").
+      # Absent => AI routes return 503 ai_not_configured (loud, not silent).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # session-manager RUST_LOG filter.
+      RUST_LOG: ${RUST_LOG:-info}
+      # api-server/src/main.rs:9392 — std::env::var("ROSHERA_CORS_ALLOWED_ORIGINS").
+      # Not needed when the browser reaches the backend same-origin through the
+      # frontend's nginx proxy. Set (comma-separated origins) only if agents /
+      # tools call the backend cross-origin from a browser context.
+      ROSHERA_CORS_ALLOWED_ORIGINS: ${ROSHERA_CORS_ALLOWED_ORIGINS:-}
+      #
+      # AUTH POSTURE — secure by default, verified in code.
+      # auth_middleware::AuthPosture::from_env() defaults to Required (enforce a
+      # credential on every non-exempt request). The ONLY opt-out is
+      # ROSHERA_DEV_INSECURE=1, which we deliberately DO NOT set here. NOTE:
+      # ROSHERA_REQUIRE_AUTH (mentioned in stale code comments) is dead — it is
+      # never read via env::var; do not rely on it. A partner instance is
+      # authenticated purely by NOT enabling the dev bypass.
+    volumes:
+      # Export output (STL/OBJ/STEP/ROS) written by export-engine.
+      - exports:/app/exports
+      # Reserved mount point for the durability slice (future snapshot +
+      # event-log storage). Nothing is written here yet — see DEPLOYMENT.md.
+      - roshera-data:/app/data
+    ports:
+      # Direct REST/WebSocket access for agents (MCP/REST is the primary
+      # client). The frontend also proxies these internally over the network.
+      - "${API_PORT:-8081}:8081"
+    networks:
+      - roshera
+
+  frontend:
+    build:
+      context: ./roshera-app
+      dockerfile: Dockerfile
+      args:
+        # Empty => SPA uses relative "/api", proxied same-origin by nginx.
+        VITE_API_URL: ""
+        # Root-relative "/ws": the browser resolves it against the page origin
+        # (ws:// on http, wss:// on https), so one build works on any host and
+        # behind TLS. nginx proxies /ws to the backend. Override with an
+        # absolute ws(s):// URL only for a split-origin deployment.
+        VITE_WS_URL: ${PUBLIC_WS_URL:-/ws}
+    image: ghcr.io/varun29ankus/roshera-cad-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    networks:
+      - roshera
+
+volumes:
+  pgdata:
+  exports:
+  roshera-data:
+
+networks:
+  roshera:
+    driver: bridge

@@ -1,0 +1,11 @@
+# Keep the build context small. `target/` has hit 85 GB locally; sending it to
+# the daemon would be catastrophic. The build stage compiles from source inside
+# the image, so no local build artifacts are needed.
+target/
+**/target/
+exports/
+*.log
+.git/
+.gitignore
+Dockerfile
+.dockerignore

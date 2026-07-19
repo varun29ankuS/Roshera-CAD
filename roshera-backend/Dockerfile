@@ -1,63 +1,80 @@
-# Build stage
-FROM rust:1.75 as builder
+# syntax=docker/dockerfile:1
+#
+# Roshera CAD — api-server production image.
+#
+# Two stages: a Rust release build stage, then a slim Debian runtime that
+# carries only the single `api-server` binary plus its shared-library deps.
+#
+# The server binds 0.0.0.0:8081 (api-server/src/main.rs: `let addr =
+# "0.0.0.0:8081"`), exposes an unauthenticated liveness probe at GET /health
+# (auth_middleware::path_is_exempt allowlists "/" and "/health"), and requires
+# a reachable PostgreSQL at boot (main.rs reads DATABASE_URL and calls
+# PostgresDatabase::new(..).await? before it starts listening).
 
-RUN apt-get update && apt-get install -y \
+# ---------------------------------------------------------------------------
+# Build stage
+# ---------------------------------------------------------------------------
+# Edition 2021 across the workspace (api-server/Cargo.toml: edition = "2021");
+# a current stable toolchain on bookworm keeps the builder glibc aligned with
+# the bookworm-slim runtime below.
+FROM rust:1.84-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/roshera
 
-# Copy manifests for dependency caching
-COPY Cargo.toml Cargo.lock ./
-COPY shared-types/Cargo.toml shared-types/
-COPY geometry-engine/Cargo.toml geometry-engine/
-COPY session-manager/Cargo.toml session-manager/
-COPY timeline-engine/Cargo.toml timeline-engine/
-COPY api-server/Cargo.toml api-server/
-COPY ai-integration/Cargo.toml ai-integration/
-COPY export-engine/Cargo.toml export-engine/
-COPY rag-engine/Cargo.toml rag-engine/
-
-# Build dependencies (cached layer)
-RUN mkdir -p shared-types/src && echo "pub fn stub() {}" > shared-types/src/lib.rs && \
-    mkdir -p geometry-engine/src && echo "pub fn stub() {}" > geometry-engine/src/lib.rs && \
-    mkdir -p session-manager/src && echo "pub fn stub() {}" > session-manager/src/lib.rs && \
-    mkdir -p timeline-engine/src && echo "pub fn stub() {}" > timeline-engine/src/lib.rs && \
-    mkdir -p api-server/src && echo "fn main() {}" > api-server/src/main.rs && \
-    mkdir -p ai-integration/src && echo "pub fn stub() {}" > ai-integration/src/lib.rs && \
-    mkdir -p export-engine/src && echo "pub fn stub() {}" > export-engine/src/lib.rs && \
-    mkdir -p rag-engine/src && echo "pub fn stub() {}" > rag-engine/src/lib.rs && \
-    cargo build --release 2>/dev/null || true && \
-    find . -name "*.rs" -path "*/src/*" -delete
-
-# Copy source code
+# Copy the whole workspace. We deliberately do NOT hand-enumerate crate
+# manifests for a dependency-cache layer: the workspace membership drifts
+# (members are shared-types, geometry-engine, session-manager, timeline-engine,
+# api-server, ai-integration, export-engine, ros-format, verdict-harness,
+# assembly-engine — the previous Dockerfile still listed a non-existent
+# rag-engine), and a stale manifest list silently breaks the cache layer.
+# BuildKit cache mounts below give us dependency caching without that fragility.
 COPY . .
 
-# Build application
-RUN cargo build --release
+# Build only the server binary (and exactly its dependency graph) in release.
+# --mount=type=cache keeps the cargo registry and the target dir warm across
+# builds without baking them into the image layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/src/roshera/target \
+    cargo build --release -p api-server && \
+    cp target/release/api-server /usr/local/bin/api-server
 
+# ---------------------------------------------------------------------------
 # Runtime stage
+# ---------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Non-root runtime user.
 RUN useradd -m -u 1001 -s /bin/bash roshera
 
-COPY --from=builder /usr/src/roshera/target/release/api-server /usr/local/bin/
+COPY --from=builder /usr/local/bin/api-server /usr/local/bin/api-server
 
-RUN mkdir -p /app/exports && chown -R roshera:roshera /app
+# /app/exports  — export-engine output (STL/OBJ/STEP/ROS).
+# /app/data      — mount point reserved for the durability slice (future
+#                  snapshot + event-log storage). Nothing is written here yet;
+#                  see docs/DEPLOYMENT.md "What does NOT survive a restart".
+RUN mkdir -p /app/exports /app/data && chown -R roshera:roshera /app
 
 USER roshera
 WORKDIR /app
 
-EXPOSE 3000 9090
+# The process binds one port: 0.0.0.0:8081 (main.rs). Metrics are served on
+# the same listener at GET /api/metrics — there is no separate 9090 listener,
+# so the previous `EXPOSE 3000 9090` was doubly wrong.
+EXPOSE 8081
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD wget -q --spider http://localhost:3000/health || exit 1
+# Liveness probe against the real bind port and the real, auth-exempt route.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+    CMD wget -q --spider http://localhost:8081/health || exit 1
 
 CMD ["api-server"]

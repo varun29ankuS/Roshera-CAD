@@ -1,0 +1,10 @@
+# The build stage runs `npm ci` and `vite build` inside the image; local
+# node_modules / dist must not clobber those or bloat the context.
+node_modules/
+dist/
+.vite/
+*.log
+.git/
+.gitignore
+Dockerfile
+.dockerignore
